@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
 use eframe::egui;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use wasmtime::*;
 
@@ -21,7 +23,8 @@ mod marching_cubes_tables;
 
 /// Application state for the volumetric renderer
 struct VolumetricApp {
-    wasm_path: String,
+    wasm_path: Option<PathBuf>,
+    demo_choice: DemoChoice,
     resolution: usize,
     bounds_min: (f32, f32, f32),
     bounds_max: (f32, f32, f32),
@@ -40,8 +43,66 @@ struct VolumetricApp {
     error_message: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DemoChoice {
+    None,
+    Sphere,
+    Torus,
+    RoundedBox,
+    GyroidLattice,
+    Mandelbulb,
+}
+
+impl DemoChoice {
+    fn label(self) -> &'static str {
+        match self {
+            DemoChoice::None => "(none)",
+            DemoChoice::Sphere => "Sphere",
+            DemoChoice::Torus => "Torus",
+            DemoChoice::RoundedBox => "Rounded box",
+            DemoChoice::GyroidLattice => "Gyroid lattice",
+            DemoChoice::Mandelbulb => "Mandelbulb fractal",
+        }
+    }
+
+    fn crate_name(self) -> Option<&'static str> {
+        match self {
+            DemoChoice::None => None,
+            DemoChoice::Sphere => Some("simple_sphere_model"),
+            DemoChoice::Torus => Some("simple_torus_model"),
+            DemoChoice::RoundedBox => Some("rounded_box_model"),
+            DemoChoice::GyroidLattice => Some("gyroid_lattice_model"),
+            DemoChoice::Mandelbulb => Some("mandelbulb_model"),
+        }
+    }
+}
+
+fn demo_wasm_path(crate_name: &str) -> Option<PathBuf> {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+    let release = root
+        .join("target")
+        .join("wasm32-unknown-unknown")
+        .join("release")
+        .join(format!("{crate_name}.wasm"));
+    if fs::metadata(&release).is_ok() {
+        return Some(release);
+    }
+
+    let debug = root
+        .join("target")
+        .join("wasm32-unknown-unknown")
+        .join("debug")
+        .join(format!("{crate_name}.wasm"));
+    if fs::metadata(&debug).is_ok() {
+        return Some(debug);
+    }
+
+    None
+}
+
 impl VolumetricApp {
-    fn new(cc: &eframe::CreationContext<'_>, wasm_path: String) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, wasm_path: Option<PathBuf>) -> Self {
         let wgpu_target_format = cc
             .wgpu_render_state
             .as_ref()
@@ -50,6 +111,7 @@ impl VolumetricApp {
 
         Self {
             wasm_path,
+            demo_choice: DemoChoice::None,
             resolution: 20,
             bounds_min: (0.0, 0.0, 0.0),
             bounds_max: (0.0, 0.0, 0.0),
@@ -68,9 +130,19 @@ impl VolumetricApp {
     }
 
     fn resample_model(&mut self) {
+        let Some(wasm_path) = self.wasm_path.as_deref() else {
+            self.bounds_min = (0.0, 0.0, 0.0);
+            self.bounds_max = (0.0, 0.0, 0.0);
+            self.points = Arc::new(Vec::new());
+            self.triangles.clear();
+            self.mesh_vertices = Arc::new(Vec::new());
+            self.error_message = None;
+            return;
+        };
+
         match self.render_mode {
             RenderMode::PointCloud => {
-                match sample_model(&self.wasm_path, self.resolution) {
+                match sample_model(wasm_path, self.resolution) {
                     Ok((points, bounds_min, bounds_max)) => {
                         self.bounds_min = bounds_min;
                         self.bounds_max = bounds_max;
@@ -85,7 +157,7 @@ impl VolumetricApp {
                 }
             }
             RenderMode::MarchingCubes => {
-                match generate_marching_cubes_mesh(&self.wasm_path, self.resolution) {
+                match generate_marching_cubes_mesh(wasm_path, self.resolution) {
                     Ok((triangles, bounds_min, bounds_max)) => {
                         self.bounds_min = bounds_min;
                         self.bounds_max = bounds_max;
@@ -179,6 +251,88 @@ impl eframe::App for VolumetricApp {
             .show(ctx, |ui| {
                 ui.heading("Volumetric Renderer");
                 ui.separator();
+
+                ui.label("WASM Model");
+                ui.horizontal(|ui| {
+                    let label = match &self.wasm_path {
+                        Some(p) => p.display().to_string(),
+                        None => "(none loaded)".to_string(),
+                    };
+                    ui.label(label);
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Demo:");
+                    egui::ComboBox::from_id_salt("demo_choice")
+                        .selected_text(self.demo_choice.label())
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.demo_choice, DemoChoice::None, DemoChoice::None.label());
+                            ui.selectable_value(&mut self.demo_choice, DemoChoice::Sphere, DemoChoice::Sphere.label());
+                            ui.selectable_value(&mut self.demo_choice, DemoChoice::Torus, DemoChoice::Torus.label());
+                            ui.selectable_value(
+                                &mut self.demo_choice,
+                                DemoChoice::RoundedBox,
+                                DemoChoice::RoundedBox.label(),
+                            );
+                            ui.selectable_value(
+                                &mut self.demo_choice,
+                                DemoChoice::GyroidLattice,
+                                DemoChoice::GyroidLattice.label(),
+                            );
+                            ui.selectable_value(
+                                &mut self.demo_choice,
+                                DemoChoice::Mandelbulb,
+                                DemoChoice::Mandelbulb.label(),
+                            );
+                        });
+
+                    let can_load_demo = self.demo_choice.crate_name().is_some();
+                    if ui
+                        .add_enabled(can_load_demo, egui::Button::new("Load demo"))
+                        .clicked()
+                    {
+                        if let Some(crate_name) = self.demo_choice.crate_name() {
+                            match demo_wasm_path(crate_name) {
+                                Some(path) => {
+                                    self.wasm_path = Some(path);
+                                    self.error_message = None;
+                                    self.needs_resample = true;
+                                }
+                                None => {
+                                    self.error_message = Some(format!(
+                                        "Demo WASM not found for '{crate_name}'. Build it first with: cargo build --release --target wasm32-unknown-unknown -p {crate_name}"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    if ui.button("Load WASM…").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("WASM", &["wasm"])
+                            .pick_file()
+                        {
+                            self.wasm_path = Some(path);
+                            self.demo_choice = DemoChoice::None;
+                            self.error_message = None;
+                            self.needs_resample = true;
+                        }
+                    }
+
+                    let can_unload = self.wasm_path.is_some();
+                    if ui
+                        .add_enabled(can_unload, egui::Button::new("Unload"))
+                        .clicked()
+                    {
+                        self.wasm_path = None;
+                        self.demo_choice = DemoChoice::None;
+                        self.error_message = None;
+                        self.needs_resample = true;
+                    }
+                });
+
                 
                 ui.label("Model Controls");
                 ui.horizontal(|ui| {
@@ -194,6 +348,9 @@ impl eframe::App for VolumetricApp {
                 
                 ui.separator();
                 ui.label("Model Info");
+                if self.wasm_path.is_none() {
+                    ui.weak("No model loaded. Click 'Load WASM…' to select a .wasm volumetric model.");
+                }
                 match self.render_mode {
                     RenderMode::PointCloud => {
                         ui.label(format!("Points: {}", self.points.len()));
@@ -372,10 +529,10 @@ impl eframe::App for VolumetricApp {
 }
 
 /// Sample points from the WASM volumetric model
-fn sample_model(wasm_path: &str, resolution: usize) -> Result<(Vec<(f32, f32, f32)>, (f32, f32, f32), (f32, f32, f32))> {
+fn sample_model(wasm_path: &Path, resolution: usize) -> Result<(Vec<(f32, f32, f32)>, (f32, f32, f32), (f32, f32, f32))> {
     let engine = Engine::default();
     let module = Module::from_file(&engine, wasm_path)
-        .with_context(|| format!("Failed to load WASM module from {}", wasm_path))?;
+        .with_context(|| format!("Failed to load WASM module from {}", wasm_path.display()))?;
     
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[])
@@ -422,12 +579,12 @@ fn sample_model(wasm_path: &str, resolution: usize) -> Result<(Vec<(f32, f32, f3
 }
 
 /// Generate a mesh using marching cubes algorithm from the WASM volumetric model
-fn generate_marching_cubes_mesh(wasm_path: &str, resolution: usize) -> Result<(Vec<Triangle>, (f32, f32, f32), (f32, f32, f32))> {
+fn generate_marching_cubes_mesh(wasm_path: &Path, resolution: usize) -> Result<(Vec<Triangle>, (f32, f32, f32), (f32, f32, f32))> {
     use marching_cubes_tables::{EDGE_TABLE, TRI_TABLE};
     
     let engine = Engine::default();
     let module = Module::from_file(&engine, wasm_path)
-        .with_context(|| format!("Failed to load WASM module from {}", wasm_path))?;
+        .with_context(|| format!("Failed to load WASM module from {}", wasm_path.display()))?;
     
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[])
@@ -625,14 +782,17 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     
     let wasm_path = if args.len() > 1 {
-        args[1].clone()
+        Some(PathBuf::from(&args[1]))
     } else {
-        "target/wasm32-unknown-unknown/release/test_model.wasm".to_string()
+        None
     };
     
     println!("Volumetric Model Renderer (eframe/egui)");
     println!("=======================================");
-    println!("Loading WASM model from: {}", wasm_path);
+    match &wasm_path {
+        Some(p) => println!("Loading WASM model from: {}", p.display()),
+        None => println!("No WASM model provided on CLI; start by clicking 'Load WASM…' in the UI."),
+    }
     println!();
     
     let options = eframe::NativeOptions {
@@ -647,7 +807,7 @@ fn main() -> Result<()> {
     eframe::run_native(
         "Volumetric Renderer",
         options,
-        Box::new(|cc| Ok(Box::new(VolumetricApp::new(cc, wasm_path)))),
+        Box::new(|cc| Ok(Box::new(VolumetricApp::new(cc, wasm_path.clone())))),
     ).map_err(|e| anyhow::anyhow!("Failed to run eframe: {}", e))?;
     
     Ok(())

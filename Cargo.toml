@@ -4,7 +4,13 @@ version = "0.1.0"
 edition = "2021"
 
 [workspace]
-members = ["crates/test_model"]
+members = [
+    "crates/simple_sphere_model",
+    "crates/simple_torus_model",
+    "crates/rounded_box_model",
+    "crates/gyroid_lattice_model",
+    "crates/mandelbulb_model",
+]
 
 [dependencies]
 wasmtime = "27"
@@ -23,3 +29,6 @@ wgpu = { version = "22.1.0", default-features = false, features = ["wgsl"] }
 # Utilities
 env_logger = "0.11"
 log = "0.4"
+
+# Native file dialog (runtime WASM selection)
+rfd = "0.14"
