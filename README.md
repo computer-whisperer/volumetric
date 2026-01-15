@@ -1,59 +1,75 @@
-Here is the basic idea:
+# Volumetric
 
-Suppose we define a physical 3d model as a simple wasm function. This function will take in a 3d point and return a simple boolean indicating whether the point is inside the model or not.
+A high-performance volumetric modeling engine where models and operations are defined as portable WebAssembly (WASM) modules.
 
-This is attractive for a few reasons, but the main potential flaw is that sampling the model will be expensive. The question is, how slow? Given the reality of many projects that could benefit from a simpler model definition paradigm, and how cheap compute is in reality, is this viable?
+## Core Concept
 
+The project explores a "model-as-code" paradigm where a 3D physical model is defined by a simple function: `is_inside(x, y, z) -> bool`. By leveraging WebAssembly, we can define complex, parametric models that are:
+- **Portable**: Run anywhere with a WASM runtime.
+- **Fast**: Near-native execution speed.
+- **Composable**: Models can be transformed and combined using Operator modules that manipulate WASM bytecode.
 
-Therefore, here we will be creating the MVP. We will need to divide this into two parts: a wasm module that defines the model (see `crates/models/*`) and a root module that will a) render the model and b) convert the model to various other 3d formats.
+## Project Structure
 
-The workspace is organized as:
+- `src/`: The host application (Orchestrator). Built with Rust, `wasmtime` for execution, and `egui` for the UI.
+- `crates/models/`: Example model definitions (Sphere, Torus, Mandelbulb, etc.).
+- `crates/operators/`: Modules that transform or combine models (Translate, Boolean Union/Subtract/Intersect).
 
-- `crates/models/*` — demo model WASM crates
-- `crates/operators/*` — operator WASM crates (take one or more model assets as input and produce outputs)
+## Architecture
 
-## Demo models
+The system is divided into three main components:
 
-This repo includes a few small WASM demo model crates (one crate per demo), each exporting:
+### 1. Model WASM Modules
+A Model module is a WASM artifact that exports:
+- `is_inside(x: f32, y: f32, z: f32) -> i32`: Returns `1` if the point is inside the model, `0` otherwise.
+- `get_bounds_min_x/y/z() -> f32` & `get_bounds_max_x/y/z() -> f32`: Defines the axis-aligned bounding box.
 
-- `is_inside(x: f32, y: f32, z: f32) -> i32` (1 = inside, 0 = outside)
-- `get_bounds_min_x/y/z() -> f32`
-- `get_bounds_max_x/y/z() -> f32`
+### 2. Operator WASM Modules
+Operators are the "compilers" of the volumetric world. They take existing models or configurations as input and produce a new Model WASM as output. 
 
-Current demos:
+Operators export:
+- `get_metadata() -> i64`: Returns a pointer/length to a CBOR-encoded `OperatorMetadata` struct, describing inputs (e.g., Model WASM, CDDL-schema-defined configurations).
+- `run()`: The execution entry point where it pulls inputs via host imports and pushes results.
 
-- `simple_sphere_model` (sphere)
-- `simple_torus_model` (torus)
-- `rounded_box_model` (rounded box)
-- `gyroid_lattice_model` (gyroid lattice shell)
-- `mandelbulb_model` (3D fractal / mandelbulb)
+### 3. The Orchestrator (Host)
+The host application manages the lifecycle of models and operators:
+- **Project DAG**: Manages a sequence of operations to build complex scenes.
+- **Rendering**: Implements both Point Cloud sampling and Marching Cubes (CPU-based) to visualize the WASM-defined volumes.
+- **Bytecode Manipulation**: Orchestrates the execution of Operators to generate new model bytecode on the fly.
 
-### Building demo WASM artifacts
+## Getting Started
 
-You need the WASM target installed:
+### Prerequisites
 
+You need the Rust toolchain and the WASM target:
 ```bash
 rustup target add wasm32-unknown-unknown
 ```
 
-Build all demos (release):
+### Building
 
+Build the host application:
+```bash
+cargo build --release
+```
+
+Build all WASM demo models and operators:
 ```bash
 cargo build-wasm
 ```
+*(This uses a Cargo alias defined in `.cargo/config.toml`)*
 
-This uses a Cargo alias defined in `.cargo/config.toml` and rebuilds all WASM payload crates (both models and operators).
+### Running
 
-The app looks for demo outputs at:
+```bash
+cargo run --release
+```
 
-- `target/wasm32-unknown-unknown/release/<crate>.wasm` (preferred)
-- `target/wasm32-unknown-unknown/debug/<crate>.wasm` (fallback)
+In the UI:
+1.  **Demos**: Load pre-built models from the "Demo" panel.
+2.  **Operations**: Apply operators like "Translate" or "Boolean" to transform your models.
+3.  **Visualization**: Toggle between Point Cloud and Marching Cubes rendering modes.
 
-### Using demos in the UI
+## Performance Note
 
-Run the app, then in the left panel:
-
-1. Pick a demo under "Demo"
-2. Click "Load demo"
-
-You can still load any external `.wasm` file via "Load WASM…".
+While sampling a function via WASM for every voxel in a grid is computationally intensive, this project demonstrates that with efficient runtimes (like `wasmtime`) and optimized sampling strategies, it is a highly viable approach for flexible 3D modeling.
