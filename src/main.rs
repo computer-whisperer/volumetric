@@ -20,6 +20,7 @@ type Triangle = [(f32, f32, f32); 3];
 
 // Marching cubes lookup tables
 mod marching_cubes_tables;
+mod marching_cubes_cpu;
 
 /// Application state for the volumetric renderer
 struct VolumetricApp {
@@ -580,7 +581,6 @@ fn sample_model(wasm_path: &Path, resolution: usize) -> Result<(Vec<(f32, f32, f
 
 /// Generate a mesh using marching cubes algorithm from the WASM volumetric model
 fn generate_marching_cubes_mesh(wasm_path: &Path, resolution: usize) -> Result<(Vec<Triangle>, (f32, f32, f32), (f32, f32, f32))> {
-    use marching_cubes_tables::{EDGE_TABLE, TRI_TABLE};
     
     let engine = Engine::default();
     let module = Module::from_file(&engine, wasm_path)
@@ -610,123 +610,12 @@ fn generate_marching_cubes_mesh(wasm_path: &Path, resolution: usize) -> Result<(
     
     let bounds_min = (min_x, min_y, min_z);
     let bounds_max = (max_x, max_y, max_z);
-    
-    let step_x = (max_x - min_x) / resolution as f32;
-    let step_y = (max_y - min_y) / resolution as f32;
-    let step_z = (max_z - min_z) / resolution as f32;
-    
-    let mut triangles = Vec::new();
-    
-    // Iterate through each cube in the grid
-    for z_idx in 0..resolution {
-        for y_idx in 0..resolution {
-            for x_idx in 0..resolution {
-                let x = min_x + x_idx as f32 * step_x;
-                let y = min_y + y_idx as f32 * step_y;
-                let z = min_z + z_idx as f32 * step_z;
-                
-                // Get the 8 corners of the cube
-                let corners = [
-                    (x, y, z),
-                    (x + step_x, y, z),
-                    (x + step_x, y + step_y, z),
-                    (x, y + step_y, z),
-                    (x, y, z + step_z),
-                    (x + step_x, y, z + step_z),
-                    (x + step_x, y + step_y, z + step_z),
-                    (x, y + step_y, z + step_z),
-                ];
-                
-                // Determine which corners are inside
-                let mut cube_index = 0u8;
-                for (i, &corner) in corners.iter().enumerate() {
-                    if is_inside.call(&mut store, corner)? != 0 {
-                        cube_index |= 1 << i;
-                    }
-                }
-                
-                // Skip if cube is entirely inside or outside
-                if EDGE_TABLE[cube_index as usize] == 0 {
-                    continue;
-                }
-                
-                // Find the vertices where the surface intersects the cube edges
-                let mut vert_list = [(0.0f32, 0.0f32, 0.0f32); 12];
-                let edges = EDGE_TABLE[cube_index as usize];
-                
-                // Edge 0: between corners 0 and 1
-                if edges & 1 != 0 {
-                    vert_list[0] = interpolate_vertex(corners[0], corners[1]);
-                }
-                // Edge 1: between corners 1 and 2
-                if edges & 2 != 0 {
-                    vert_list[1] = interpolate_vertex(corners[1], corners[2]);
-                }
-                // Edge 2: between corners 2 and 3
-                if edges & 4 != 0 {
-                    vert_list[2] = interpolate_vertex(corners[2], corners[3]);
-                }
-                // Edge 3: between corners 3 and 0
-                if edges & 8 != 0 {
-                    vert_list[3] = interpolate_vertex(corners[3], corners[0]);
-                }
-                // Edge 4: between corners 4 and 5
-                if edges & 16 != 0 {
-                    vert_list[4] = interpolate_vertex(corners[4], corners[5]);
-                }
-                // Edge 5: between corners 5 and 6
-                if edges & 32 != 0 {
-                    vert_list[5] = interpolate_vertex(corners[5], corners[6]);
-                }
-                // Edge 6: between corners 6 and 7
-                if edges & 64 != 0 {
-                    vert_list[6] = interpolate_vertex(corners[6], corners[7]);
-                }
-                // Edge 7: between corners 7 and 4
-                if edges & 128 != 0 {
-                    vert_list[7] = interpolate_vertex(corners[7], corners[4]);
-                }
-                // Edge 8: between corners 0 and 4
-                if edges & 256 != 0 {
-                    vert_list[8] = interpolate_vertex(corners[0], corners[4]);
-                }
-                // Edge 9: between corners 1 and 5
-                if edges & 512 != 0 {
-                    vert_list[9] = interpolate_vertex(corners[1], corners[5]);
-                }
-                // Edge 10: between corners 2 and 6
-                if edges & 1024 != 0 {
-                    vert_list[10] = interpolate_vertex(corners[2], corners[6]);
-                }
-                // Edge 11: between corners 3 and 7
-                if edges & 2048 != 0 {
-                    vert_list[11] = interpolate_vertex(corners[3], corners[7]);
-                }
-                
-                // Create triangles from the triangle table
-                let tri_row = &TRI_TABLE[cube_index as usize];
-                let mut i = 0;
-                while i < 16 && tri_row[i] != -1 {
-                    let v0 = vert_list[tri_row[i] as usize];
-                    let v1 = vert_list[tri_row[i + 1] as usize];
-                    let v2 = vert_list[tri_row[i + 2] as usize];
-                    triangles.push([v0, v1, v2]);
-                    i += 3;
-                }
-            }
-        }
-    }
-    
-    Ok((triangles, bounds_min, bounds_max))
-}
 
-/// Interpolate vertex position on an edge (simple midpoint for binary inside/outside)
-fn interpolate_vertex(p1: (f32, f32, f32), p2: (f32, f32, f32)) -> (f32, f32, f32) {
-    (
-        (p1.0 + p2.0) * 0.5,
-        (p1.1 + p2.1) * 0.5,
-        (p1.2 + p2.2) * 0.5,
-    )
+    let triangles = marching_cubes_cpu::marching_cubes_mesh(bounds_min, bounds_max, resolution, |p| {
+        Ok(is_inside.call(&mut store, p)? != 0)
+    })?;
+
+    Ok((triangles, bounds_min, bounds_max))
 }
 
 fn triangles_to_mesh_vertices(triangles: &[Triangle]) -> Vec<marching_cubes_wgpu::MeshVertex> {

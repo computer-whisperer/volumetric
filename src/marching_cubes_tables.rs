@@ -21,3 +21,92 @@ pub const EDGE_TABLE: [u16; 256] = [
 ];
 
 include!("marching_cubes_tri_table.rs");
+
+#[cfg(test)]
+mod tests {
+    use super::{EDGE_TABLE, TRI_TABLE};
+
+    #[test]
+    fn tri_table_entries_are_well_formed() {
+        for (case_idx, row) in TRI_TABLE.iter().enumerate() {
+            // Rows are sequences of edge indices (0..12) in groups of 3, terminated by -1.
+            // After the first -1, everything must be -1.
+            let mut terminated = false;
+            let mut count = 0usize;
+            for &v in row.iter() {
+                if v == -1 {
+                    terminated = true;
+                } else {
+                    assert!(
+                        !terminated,
+                        "TRI_TABLE[{case_idx}] has values after terminator"
+                    );
+                    assert!(
+                        (0..=11).contains(&v),
+                        "TRI_TABLE[{case_idx}] contains invalid edge index {v}"
+                    );
+                    count += 1;
+                }
+            }
+
+            assert!(
+                count % 3 == 0,
+                "TRI_TABLE[{case_idx}] has {count} non-terminator entries (not a multiple of 3)"
+            );
+        }
+    }
+
+    #[test]
+    fn tri_table_only_references_edges_present_in_edge_table_mask() {
+        for (case_idx, row) in TRI_TABLE.iter().enumerate() {
+            let mask = EDGE_TABLE[case_idx];
+            for &v in row.iter() {
+                if v == -1 {
+                    break;
+                }
+                let edge = v as u16;
+                assert!(
+                    (mask & (1u16 << edge)) != 0,
+                    "TRI_TABLE[{case_idx}] references edge {edge} not present in EDGE_TABLE mask {mask:#x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn complement_cases_reference_same_edges() {
+        // For standard marching cubes tables, case c and its complement (255-c)
+        // should reference the same *set* of intersected edges (triangle winding and triangle
+        // count may differ).
+        for case_idx in 0usize..256 {
+            let comp_idx = 255usize - case_idx;
+
+            let mut a = Vec::new();
+            for &v in TRI_TABLE[case_idx].iter() {
+                if v == -1 {
+                    break;
+                }
+                a.push(v);
+            }
+
+            let mut b = Vec::new();
+            for &v in TRI_TABLE[comp_idx].iter() {
+                if v == -1 {
+                    break;
+                }
+                b.push(v);
+            }
+
+            a.sort_unstable();
+            b.sort_unstable();
+
+            a.dedup();
+            b.dedup();
+
+            assert_eq!(
+                a, b,
+                "complement cases TRI_TABLE[{case_idx}] and TRI_TABLE[{comp_idx}] do not reference the same edges"
+            );
+        }
+    }
+}
