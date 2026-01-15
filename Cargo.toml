@@ -11,7 +11,14 @@ wasmtime = "27"
 anyhow = "1"
 
 # GUI
-eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow"] }
+eframe = { version = "0.29", default-features = false, features = ["default_fonts", "wgpu", "x11", "wayland"] }
+
+# GPU point renderer helpers
+bytemuck = { version = "1", features = ["derive"] }
+glam = "0.27"
+
+# Direct wgpu dependency (used by the custom renderer module)
+wgpu = { version = "22.1.0", default-features = false, features = ["wgsl"] }
 
 # Utilities
 env_logger = "0.11"

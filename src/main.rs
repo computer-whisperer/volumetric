@@ -1,6 +1,10 @@
 use anyhow::{Context, Result};
 use eframe::egui;
+use std::sync::Arc;
 use wasmtime::*;
+
+mod point_cloud_wgpu;
+mod marching_cubes_wgpu;
 
 /// Rendering mode selection
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,10 +25,12 @@ struct VolumetricApp {
     resolution: usize,
     bounds_min: (f32, f32, f32),
     bounds_max: (f32, f32, f32),
-    points: Vec<(f32, f32, f32)>,
+    points: Arc<Vec<(f32, f32, f32)>>,
     triangles: Vec<Triangle>,
+    mesh_vertices: Arc<Vec<marching_cubes_wgpu::MeshVertex>>,
     needs_resample: bool,
     render_mode: RenderMode,
+    wgpu_target_format: wgpu::TextureFormat,
     // Camera state
     camera_theta: f32,
     camera_phi: f32,
@@ -35,16 +41,24 @@ struct VolumetricApp {
 }
 
 impl VolumetricApp {
-    fn new(wasm_path: String) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, wasm_path: String) -> Self {
+        let wgpu_target_format = cc
+            .wgpu_render_state
+            .as_ref()
+            .map(|rs| rs.target_format)
+            .unwrap_or(wgpu::TextureFormat::Bgra8UnormSrgb);
+
         Self {
             wasm_path,
             resolution: 20,
             bounds_min: (0.0, 0.0, 0.0),
             bounds_max: (0.0, 0.0, 0.0),
-            points: Vec::new(),
+            points: Arc::new(Vec::new()),
             triangles: Vec::new(),
+            mesh_vertices: Arc::new(Vec::new()),
             needs_resample: true,
             render_mode: RenderMode::PointCloud,
+            wgpu_target_format,
             camera_theta: std::f32::consts::FRAC_PI_4,
             camera_phi: std::f32::consts::FRAC_PI_4,
             camera_radius: 4.0,
@@ -60,8 +74,9 @@ impl VolumetricApp {
                     Ok((points, bounds_min, bounds_max)) => {
                         self.bounds_min = bounds_min;
                         self.bounds_max = bounds_max;
-                        self.points = points;
+                        self.points = Arc::new(points);
                         self.triangles.clear();
+                        self.mesh_vertices = Arc::new(Vec::new());
                         self.error_message = None;
                     }
                     Err(e) => {
@@ -75,11 +90,12 @@ impl VolumetricApp {
                         self.bounds_min = bounds_min;
                         self.bounds_max = bounds_max;
                         self.triangles = triangles;
-                        self.points.clear();
+                        self.mesh_vertices = Arc::new(triangles_to_mesh_vertices(&self.triangles));
+                        self.points = Arc::new(Vec::new());
                         self.error_message = None;
                     }
                     Err(e) => {
-                        self.error_message = Some(format!("Failed to generate mesh: {}", e));
+                        self.error_message = Some(format!("Failed to generate marching cubes mesh: {e}"));
                     }
                 }
             }
@@ -167,7 +183,7 @@ impl eframe::App for VolumetricApp {
                 ui.label("Model Controls");
                 ui.horizontal(|ui| {
                     ui.label("Resolution:");
-                    if ui.add(egui::Slider::new(&mut self.resolution, 5..=50)).changed() {
+                    if ui.add(egui::Slider::new(&mut self.resolution, 5..=100)).changed() {
                         self.needs_resample = true;
                     }
                 });
@@ -207,10 +223,18 @@ impl eframe::App for VolumetricApp {
                 
                 ui.separator();
                 ui.label("Render Mode");
-                let prev_mode = self.render_mode;
-                ui.radio_value(&mut self.render_mode, RenderMode::PointCloud, "Point Cloud");
-                ui.radio_value(&mut self.render_mode, RenderMode::MarchingCubes, "Marching Cubes");
-                if self.render_mode != prev_mode {
+                let mut changed = false;
+                changed |= ui
+                    .selectable_value(&mut self.render_mode, RenderMode::PointCloud, "Point Cloud (wgpu)")
+                    .changed();
+                changed |= ui
+                    .selectable_value(
+                        &mut self.render_mode,
+                        RenderMode::MarchingCubes,
+                        "Marching Cubes (wgpu mesh)",
+                    )
+                    .changed();
+                if changed {
                     self.needs_resample = true;
                 }
                 
@@ -277,106 +301,54 @@ impl eframe::App for VolumetricApp {
             
             match self.render_mode {
                 RenderMode::PointCloud => {
-                    // Sort points by depth for proper rendering
-                    let mut points_with_depth: Vec<_> = self.points.iter()
-                        .filter_map(|&p| {
-                            let dx = p.0 - camera_pos.0;
-                            let dy = p.1 - camera_pos.1;
-                            let dz = p.2 - camera_pos.2;
-                            let depth = dx * dx + dy * dy + dz * dz;
-                            self.project_point(p, &rect).map(|screen_pos| (p, screen_pos, depth))
-                        })
-                        .collect();
-                    
-                    // Sort back to front
-                    points_with_depth.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-                    
-                    // Draw points
-                    for (point, screen_pos, depth) in points_with_depth {
-                        // Color based on position (simple gradient)
-                        let r = ((point.0 + 1.0) * 0.5 * 255.0) as u8;
-                        let g = ((point.1 + 1.0) * 0.5 * 255.0) as u8;
-                        let b = ((point.2 + 1.0) * 0.5 * 255.0) as u8;
-                        
-                        // Size based on depth
-                        let size = (3.0 / depth.sqrt()).clamp(1.0, 4.0);
-                        
-                        painter.circle_filled(
-                            screen_pos,
-                            size,
-                            egui::Color32::from_rgb(r, g, b),
-                        );
-                    }
+                    let aspect = rect.width() / rect.height().max(1.0);
+                    let view_proj = point_cloud_wgpu::view_proj_from_camera(
+                        camera_pos,
+                        (0.0, 0.0, 0.0),
+                        60.0_f32.to_radians(),
+                        aspect,
+                        0.1,
+                        100.0,
+                    );
+
+                    let cb = eframe::egui_wgpu::Callback::new_paint_callback(
+                        rect,
+                        point_cloud_wgpu::PointCloudCallback {
+                            data: point_cloud_wgpu::PointCloudDrawData {
+                                points: self.points.clone(),
+                                camera_pos,
+                                view_proj,
+                                point_size_px: 3.0,
+                                target_format: self.wgpu_target_format,
+                            },
+                        },
+                    );
+
+                    painter.add(egui::Shape::Callback(cb));
                 }
                 RenderMode::MarchingCubes => {
-                    // Sort triangles by depth (using centroid)
-                    let mut triangles_with_depth: Vec<_> = self.triangles.iter()
-                        .filter_map(|tri| {
-                            // Calculate centroid
-                            let cx = (tri[0].0 + tri[1].0 + tri[2].0) / 3.0;
-                            let cy = (tri[0].1 + tri[1].1 + tri[2].1) / 3.0;
-                            let cz = (tri[0].2 + tri[1].2 + tri[2].2) / 3.0;
-                            
-                            let dx = cx - camera_pos.0;
-                            let dy = cy - camera_pos.1;
-                            let dz = cz - camera_pos.2;
-                            let depth = dx * dx + dy * dy + dz * dz;
-                            
-                            // Project all three vertices
-                            let p0 = self.project_point(tri[0], &rect)?;
-                            let p1 = self.project_point(tri[1], &rect)?;
-                            let p2 = self.project_point(tri[2], &rect)?;
-                            
-                            // Calculate normal for lighting
-                            let v1 = (tri[1].0 - tri[0].0, tri[1].1 - tri[0].1, tri[1].2 - tri[0].2);
-                            let v2 = (tri[2].0 - tri[0].0, tri[2].1 - tri[0].1, tri[2].2 - tri[0].2);
-                            let normal = (
-                                v1.1 * v2.2 - v1.2 * v2.1,
-                                v1.2 * v2.0 - v1.0 * v2.2,
-                                v1.0 * v2.1 - v1.1 * v2.0,
-                            );
-                            let normal_len = (normal.0 * normal.0 + normal.1 * normal.1 + normal.2 * normal.2).sqrt();
-                            let normal = if normal_len > 0.0001 {
-                                (normal.0 / normal_len, normal.1 / normal_len, normal.2 / normal_len)
-                            } else {
-                                (0.0, 1.0, 0.0)
-                            };
-                            
-                            Some((tri, [p0, p1, p2], depth, normal))
-                        })
-                        .collect();
-                    
-                    // Sort back to front
-                    triangles_with_depth.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-                    
-                    // Draw triangles
-                    for (tri, screen_pts, _depth, normal) in triangles_with_depth {
-                        // Simple lighting based on normal direction
-                        let light_dir = (0.5f32, 0.7, 0.5);
-                        let light_len = (light_dir.0 * light_dir.0 + light_dir.1 * light_dir.1 + light_dir.2 * light_dir.2).sqrt();
-                        let light_dir = (light_dir.0 / light_len, light_dir.1 / light_len, light_dir.2 / light_len);
-                        
-                        let dot = (normal.0 * light_dir.0 + normal.1 * light_dir.1 + normal.2 * light_dir.2).abs();
-                        let brightness = 0.3 + 0.7 * dot;
-                        
-                        // Color based on centroid position
-                        let cx = (tri[0].0 + tri[1].0 + tri[2].0) / 3.0;
-                        let cy = (tri[0].1 + tri[1].1 + tri[2].1) / 3.0;
-                        let cz = (tri[0].2 + tri[1].2 + tri[2].2) / 3.0;
-                        
-                        let r = (((cx + 1.0) * 0.5 * 255.0) * brightness) as u8;
-                        let g = (((cy + 1.0) * 0.5 * 255.0) * brightness) as u8;
-                        let b = (((cz + 1.0) * 0.5 * 255.0) * brightness) as u8;
-                        
-                        let color = egui::Color32::from_rgb(r, g, b);
-                        
-                        // Draw filled triangle
-                        painter.add(egui::Shape::convex_polygon(
-                            vec![screen_pts[0], screen_pts[1], screen_pts[2]],
-                            color,
-                            egui::Stroke::NONE,
-                        ));
-                    }
+                    let aspect = rect.width() / rect.height().max(1.0);
+                    let view_proj = point_cloud_wgpu::view_proj_from_camera(
+                        camera_pos,
+                        (0.0, 0.0, 0.0),
+                        60.0_f32.to_radians(),
+                        aspect,
+                        0.1,
+                        100.0,
+                    );
+
+                    let cb = eframe::egui_wgpu::Callback::new_paint_callback(
+                        rect,
+                        marching_cubes_wgpu::MarchingCubesCallback {
+                            data: marching_cubes_wgpu::MarchingCubesDrawData {
+                                vertices: self.mesh_vertices.clone(),
+                                view_proj,
+                                target_format: self.wgpu_target_format,
+                            },
+                        },
+                    );
+
+                    painter.add(egui::Shape::Callback(cb));
                 }
             }
             
@@ -600,6 +572,53 @@ fn interpolate_vertex(p1: (f32, f32, f32), p2: (f32, f32, f32)) -> (f32, f32, f3
     )
 }
 
+fn triangles_to_mesh_vertices(triangles: &[Triangle]) -> Vec<marching_cubes_wgpu::MeshVertex> {
+    let mut out = Vec::with_capacity(triangles.len() * 3);
+
+    for tri in triangles {
+        let a = tri[0];
+        let b = tri[1];
+        let c = tri[2];
+
+        let ab = (b.0 - a.0, b.1 - a.1, b.2 - a.2);
+        let ac = (c.0 - a.0, c.1 - a.1, c.2 - a.2);
+        let n = (
+            ab.1 * ac.2 - ab.2 * ac.1,
+            ab.2 * ac.0 - ab.0 * ac.2,
+            ab.0 * ac.1 - ab.1 * ac.0,
+        );
+        let len = (n.0 * n.0 + n.1 * n.1 + n.2 * n.2).sqrt();
+        let n = if len > 1.0e-12 {
+            (n.0 / len, n.1 / len, n.2 / len)
+        } else {
+            (0.0, 1.0, 0.0)
+        };
+
+        let normal = [n.0, n.1, n.2];
+
+        out.push(marching_cubes_wgpu::MeshVertex {
+            position: [a.0, a.1, a.2],
+            _pad0: 0.0,
+            normal,
+            _pad1: 0.0,
+        });
+        out.push(marching_cubes_wgpu::MeshVertex {
+            position: [b.0, b.1, b.2],
+            _pad0: 0.0,
+            normal,
+            _pad1: 0.0,
+        });
+        out.push(marching_cubes_wgpu::MeshVertex {
+            position: [c.0, c.1, c.2],
+            _pad0: 0.0,
+            normal,
+            _pad1: 0.0,
+        });
+    }
+
+    out
+}
+
 fn main() -> Result<()> {
     env_logger::init();
     
@@ -620,13 +639,15 @@ fn main() -> Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 720.0])
             .with_title("Volumetric Renderer"),
+        // Needed for correct 3D triangle rendering (occlusion) in the wgpu callbacks.
+        depth_buffer: 24,
         ..Default::default()
     };
     
     eframe::run_native(
         "Volumetric Renderer",
         options,
-        Box::new(|_cc| Ok(Box::new(VolumetricApp::new(wasm_path)))),
+        Box::new(|cc| Ok(Box::new(VolumetricApp::new(cc, wasm_path)))),
     ).map_err(|e| anyhow::anyhow!("Failed to run eframe: {}", e))?;
     
     Ok(())
