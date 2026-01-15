@@ -184,6 +184,19 @@ mod cddl_config_tests {
     }
 }
 
+#[cfg(test)]
+mod wasm_error_reporting_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_wasm_bytes_produce_informative_error_chain() {
+        let wasm_bytes = vec![0x01, 0x02, 0x03, 0x04];
+        let err = sample_model_from_bytes(&wasm_bytes, 4).unwrap_err();
+        let msg = format_anyhow_error_chain(&err);
+        assert!(msg.contains("Failed to load WASM module from bytes"), "{msg}");
+    }
+}
+
 /// Rendering mode selection for an exported asset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExportRenderMode {
@@ -229,6 +242,9 @@ struct AssetRenderData {
     mesh_vertices: Arc<Vec<marching_cubes_wgpu::MeshVertex>>,
     /// Whether this asset needs resampling
     needs_resample: bool,
+
+    /// Last sampling/meshing error for this asset (shown in the GUI)
+    last_error: Option<String>,
 }
 
 impl AssetRenderData {
@@ -242,8 +258,24 @@ impl AssetRenderData {
             triangles: Vec::new(),
             mesh_vertices: Arc::new(Vec::new()),
             needs_resample: true,
+            last_error: None,
         }
     }
+}
+
+fn format_anyhow_error_chain(e: &anyhow::Error) -> String {
+    // `anyhow::Error` implements `Error` but its `Display` often only shows the top message.
+    // For GUI reporting, include the causal chain so users can diagnose invalid WASM, missing
+    // exports, etc.
+    let mut parts = Vec::new();
+    for (idx, cause) in e.chain().enumerate() {
+        if idx == 0 {
+            parts.push(cause.to_string());
+        } else {
+            parts.push(format!("Caused by: {cause}"));
+        }
+    }
+    parts.join("\n")
 }
 
 /// Application state for the volumetric renderer
@@ -475,6 +507,7 @@ impl VolumetricApp {
                     if data.mode != mode {
                         data.mode = mode;
                         data.needs_resample = true;
+                        data.last_error = None;
                     }
                 } else {
                     self.asset_render_data.insert(
@@ -527,6 +560,7 @@ impl VolumetricApp {
                             if let Some(wasm_bytes) = asset.as_model_wasm() {
                                 render_data.wasm_bytes = wasm_bytes.to_vec();
                                 render_data.needs_resample = true;
+                                render_data.last_error = None;
                             }
                         }
                     }
@@ -558,7 +592,7 @@ impl VolumetricApp {
     fn resample_all_assets(&mut self) {
         let resolution = self.resolution;
         
-        for (_asset_id, render_data) in self.asset_render_data.iter_mut() {
+        for (asset_id, render_data) in self.asset_render_data.iter_mut() {
             if !render_data.needs_resample {
                 continue;
             }
@@ -581,9 +615,19 @@ impl VolumetricApp {
                             render_data.points = Arc::new(points);
                             render_data.triangles.clear();
                             render_data.mesh_vertices = Arc::new(Vec::new());
+                            render_data.last_error = None;
                         }
                         Err(e) => {
-                            log::error!("Failed to sample model: {}", e);
+                            let msg = format!(
+                                "Export '{asset_id}' failed to sample ({}):\n{}",
+                                render_data.mode.label(),
+                                format_anyhow_error_chain(&e)
+                            );
+                            render_data.last_error = Some(msg.clone());
+                            if self.error_message.is_none() {
+                                self.error_message = Some(msg);
+                            }
+                            log::error!("Failed to sample model for export '{asset_id}': {e}");
                         }
                     }
                 }
@@ -595,9 +639,19 @@ impl VolumetricApp {
                             render_data.triangles = triangles;
                             render_data.mesh_vertices = Arc::new(triangles_to_mesh_vertices(&render_data.triangles));
                             render_data.points = Arc::new(Vec::new());
+                            render_data.last_error = None;
                         }
                         Err(e) => {
-                            log::error!("Failed to generate marching cubes mesh: {e}");
+                            let msg = format!(
+                                "Export '{asset_id}' failed to mesh ({}):\n{}",
+                                render_data.mode.label(),
+                                format_anyhow_error_chain(&e)
+                            );
+                            render_data.last_error = Some(msg.clone());
+                            if self.error_message.is_none() {
+                                self.error_message = Some(msg);
+                            }
+                            log::error!("Failed to generate marching cubes mesh for export '{asset_id}': {e}");
                         }
                     }
                 }
@@ -691,118 +745,123 @@ impl eframe::App for VolumetricApp {
         egui::SidePanel::left("controls")
             .default_width(250.0)
             .show(ctx, |ui| {
-                ui.heading("Volumetric Renderer");
-                ui.separator();
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false; 2])
+                    .show(ui, |ui| {
+                        ui.heading("Volumetric Renderer");
+                        ui.separator();
 
-                ui.label("Project");
-                ui.horizontal(|ui| {
-                    let label = match &self.project_path {
-                        Some(p) => p.display().to_string(),
-                        None => match &self.project {
-                            Some(_) => "(unsaved project)".to_string(),
-                            None => "(none loaded)".to_string(),
-                        },
-                    };
-                    ui.label(label);
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Demo:");
-                    egui::ComboBox::from_id_salt("demo_choice")
-                        .selected_text(self.demo_choice.label())
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.demo_choice, DemoChoice::None, DemoChoice::None.label());
-                            ui.selectable_value(&mut self.demo_choice, DemoChoice::Sphere, DemoChoice::Sphere.label());
-                            ui.selectable_value(&mut self.demo_choice, DemoChoice::Torus, DemoChoice::Torus.label());
-                            ui.selectable_value(
-                                &mut self.demo_choice,
-                                DemoChoice::RoundedBox,
-                                DemoChoice::RoundedBox.label(),
-                            );
-                            ui.selectable_value(
-                                &mut self.demo_choice,
-                                DemoChoice::GyroidLattice,
-                                DemoChoice::GyroidLattice.label(),
-                            );
-                            ui.selectable_value(
-                                &mut self.demo_choice,
-                                DemoChoice::Mandelbulb,
-                                DemoChoice::Mandelbulb.label(),
-                            );
+                        ui.label("Project");
+                        ui.horizontal(|ui| {
+                            let label = match &self.project_path {
+                                Some(p) => p.display().to_string(),
+                                None => match &self.project {
+                                    Some(_) => "(unsaved project)".to_string(),
+                                    None => "(none loaded)".to_string(),
+                                },
+                            };
+                            ui.label(label);
                         });
 
-                    let can_load_demo = self.demo_choice.crate_name().is_some();
-                    if ui
-                        .add_enabled(can_load_demo, egui::Button::new("Load demo"))
-                        .clicked()
-                    {
-                        if let Some(crate_name) = self.demo_choice.crate_name() {
-                            match demo_wasm_path(crate_name) {
-                                Some(path) => {
-                                    // Load WASM file and create a project from it
+                        ui.horizontal(|ui| {
+                            ui.label("Demo:");
+                            egui::ComboBox::from_id_salt("demo_choice")
+                                .selected_text(self.demo_choice.label())
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut self.demo_choice, DemoChoice::None, DemoChoice::None.label());
+                                    ui.selectable_value(&mut self.demo_choice, DemoChoice::Sphere, DemoChoice::Sphere.label());
+                                    ui.selectable_value(&mut self.demo_choice, DemoChoice::Torus, DemoChoice::Torus.label());
+                                    ui.selectable_value(
+                                        &mut self.demo_choice,
+                                        DemoChoice::RoundedBox,
+                                        DemoChoice::RoundedBox.label(),
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.demo_choice,
+                                        DemoChoice::GyroidLattice,
+                                        DemoChoice::GyroidLattice.label(),
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.demo_choice,
+                                        DemoChoice::Mandelbulb,
+                                        DemoChoice::Mandelbulb.label(),
+                                    );
+                                });
+
+                            let can_load_demo = self.demo_choice.crate_name().is_some();
+                            if ui
+                                .add_enabled(can_load_demo, egui::Button::new("Load demo"))
+                                .clicked()
+                            {
+                                if let Some(crate_name) = self.demo_choice.crate_name() {
+                                    match demo_wasm_path(crate_name) {
+                                        Some(path) => {
+                                            // Load WASM file and create a project from it
+                                            match fs::read(&path) {
+                                                Ok(wasm_bytes) => {
+                                                    let asset_id = path.file_stem()
+                                                        .and_then(|s| s.to_str())
+                                                        .unwrap_or("model")
+                                                        .to_string();
+                                                    self.project = Some(Project::from_model_wasm(asset_id, wasm_bytes));
+                                                    self.project_path = None;
+                                                    self.run_project();
+                                                }
+                                                Err(e) => {
+                                                    self.error_message = Some(format!("Failed to read WASM file: {}", e));
+                                                }
+                                            }
+                                        }
+                                        None => {
+                                            self.error_message = Some(format!(
+                                                "Demo WASM not found for '{crate_name}'. Build it first with: cargo build --release --target wasm32-unknown-unknown -p {crate_name}"
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        });
+
+                        ui.horizontal(|ui| {
+                            // Import a raw WASM file as a new project
+                            if ui.button("Import WASM…").clicked() {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("WASM", &["wasm"])
+                                    .pick_file()
+                                {
                                     match fs::read(&path) {
                                         Ok(wasm_bytes) => {
-                                            let asset_id = path.file_stem()
+                                            let asset_id = path
+                                                .file_stem()
                                                 .and_then(|s| s.to_str())
                                                 .unwrap_or("model")
                                                 .to_string();
                                             self.project = Some(Project::from_model_wasm(asset_id, wasm_bytes));
                                             self.project_path = None;
                                             self.run_project();
+                                            self.demo_choice = DemoChoice::None;
                                         }
                                         Err(e) => {
-                                            self.error_message = Some(format!("Failed to read WASM file: {}", e));
+                                            self.error_message =
+                                                Some(format!("Failed to read WASM file: {}", e));
                                         }
                                     }
                                 }
-                                None => {
-                                    self.error_message = Some(format!(
-                                        "Demo WASM not found for '{crate_name}'. Build it first with: cargo build --release --target wasm32-unknown-unknown -p {crate_name}"
-                                    ));
-                                }
                             }
-                        }
-                    }
-                });
 
-                ui.horizontal(|ui| {
-                    // Import a raw WASM file as a new project
-                    if ui.button("Import WASM…").clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("WASM", &["wasm"])
-                            .pick_file()
-                        {
-                            match fs::read(&path) {
-                                Ok(wasm_bytes) => {
-                                    let asset_id = path.file_stem()
-                                        .and_then(|s| s.to_str())
-                                        .unwrap_or("model")
-                                        .to_string();
-                                    self.project = Some(Project::from_model_wasm(asset_id, wasm_bytes));
-                                    self.project_path = None;
-                                    self.run_project();
-                                    self.demo_choice = DemoChoice::None;
-                                }
-                                Err(e) => {
-                                    self.error_message = Some(format!("Failed to read WASM file: {}", e));
-                                }
+                            let can_unload = self.project.is_some();
+                            if ui
+                                .add_enabled(can_unload, egui::Button::new("Unload"))
+                                .clicked()
+                            {
+                                self.project = None;
+                                self.project_path = None;
+                                self.asset_render_data.clear();
+                                self.exported_assets.clear();
+                                self.demo_choice = DemoChoice::None;
+                                self.error_message = None;
                             }
-                        }
-                    }
-
-                    let can_unload = self.project.is_some();
-                    if ui
-                        .add_enabled(can_unload, egui::Button::new("Unload"))
-                        .clicked()
-                    {
-                        self.project = None;
-                        self.project_path = None;
-                        self.asset_render_data.clear();
-                        self.exported_assets.clear();
-                        self.demo_choice = DemoChoice::None;
-                        self.error_message = None;
-                    }
-                });
+                        });
 
                 // Project file operations
                 ui.horizontal(|ui| {
@@ -849,15 +908,21 @@ impl eframe::App for VolumetricApp {
                 ui.separator();
                 ui.label("Operations");
 
+                // Populate input dropdowns from all assets declared by the project (including
+                // outputs of earlier operation steps), filtering by the type required for model
+                // inputs.
                 let input_asset_ids: Vec<String> = self
                     .project
                     .as_ref()
                     .map(|p| {
-                        p.entries()
-                            .iter()
-                            .filter_map(|e| match e {
-                                ProjectEntry::LoadAsset(a) => Some(a.asset_id().to_string()),
-                                _ => None,
+                        p.declared_assets()
+                            .into_iter()
+                            .filter_map(|(id, ty)| {
+                                if ty == AssetType::ModelWASM {
+                                    Some(id)
+                                } else {
+                                    None
+                                }
                             })
                             .collect::<Vec<_>>()
                     })
@@ -1170,197 +1235,214 @@ impl eframe::App for VolumetricApp {
                     }
                 }
 
-                ui.label("Model Controls");
-                ui.horizontal(|ui| {
-                    ui.label("Resolution:");
-                    if ui.add(egui::Slider::new(&mut self.resolution, 5..=100)).changed() {
-                        self.mark_all_needs_resample();
-                    }
-                });
-                
-                if ui.button("Resample All").clicked() {
-                    self.mark_all_needs_resample();
-                }
-                
-                ui.separator();
-                ui.label("Render Info");
-                if self.asset_render_data.is_empty() {
-                    ui.weak("No models being rendered. Import a WASM file or open a project.");
-                } else {
-                    // Show info for all rendered assets
-                    let total_points: usize = self.asset_render_data.values()
-                        .map(|d| d.points.len())
-                        .sum();
-                    let total_triangles: usize = self.asset_render_data.values()
-                        .map(|d| d.triangles.len())
-                        .sum();
-                    ui.label(format!("Rendering {} asset(s)", self.asset_render_data.len()));
-                    if total_points > 0 {
-                        ui.label(format!("Total points: {}", total_points));
-                    }
-                    if total_triangles > 0 {
-                        ui.label(format!("Total triangles: {}", total_triangles));
-                    }
-                }
-                
-                ui.separator();
-                ui.label("Camera Controls");
-                ui.label("• Left-drag to rotate");
-                ui.label("• Scroll to zoom");
-                
-                ui.horizontal(|ui| {
-                    ui.label("Zoom:");
-                    ui.add(egui::Slider::new(&mut self.camera_radius, 1.0..=20.0));
-                });
-                
-                ui.separator();
-                ui.label("Export");
-                // Check if any asset has triangles for STL export
-                let has_triangles = self.asset_render_data.values().any(|d| !d.triangles.is_empty());
-                if ui
-                    .add_enabled(has_triangles, egui::Button::new("Export STL…"))
-                    .clicked()
-                {
-                    // Collect all triangles from all assets
-                    let all_triangles: Vec<Triangle> = self.asset_render_data.values()
-                        .flat_map(|d| d.triangles.iter().cloned())
-                        .collect();
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("STL", &["stl"])
-                        .set_file_name("mesh.stl")
-                        .save_file()
-                    {
-                        match stl::write_binary_stl(&path, &all_triangles, "volumetric") {
-                            Ok(()) => self.error_message = None,
-                            Err(e) => self.error_message = Some(format!("Failed to export STL: {e}")),
+                        ui.label("Model Controls");
+                        ui.horizontal(|ui| {
+                            ui.label("Resolution:");
+                            if ui.add(egui::Slider::new(&mut self.resolution, 5..=100)).changed() {
+                                self.mark_all_needs_resample();
+                            }
+                        });
+
+                        if ui.button("Resample All").clicked() {
+                            self.mark_all_needs_resample();
                         }
-                    }
-                }
-                
-                // Project Timeline - shows all project entries
+
+                        ui.separator();
+                        ui.label("Export");
+                        // Check if any asset has triangles for STL export
+                        let has_triangles = self
+                            .asset_render_data
+                            .values()
+                            .any(|d| !d.triangles.is_empty());
+                        if ui
+                            .add_enabled(has_triangles, egui::Button::new("Export STL…"))
+                            .clicked()
+                        {
+                            // Collect all triangles from all assets
+                            let all_triangles: Vec<Triangle> = self
+                                .asset_render_data
+                                .values()
+                                .flat_map(|d| d.triangles.iter().cloned())
+                                .collect();
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("STL", &["stl"])
+                                .set_file_name("mesh.stl")
+                                .save_file()
+                            {
+                                match stl::write_binary_stl(&path, &all_triangles, "volumetric") {
+                                    Ok(()) => self.error_message = None,
+                                    Err(e) => {
+                                        self.error_message = Some(format!("Failed to export STL: {e}"))
+                                    }
+                                }
+                            }
+                        }
+
                 ui.separator();
-                ui.heading("Project Timeline");
-                
-                if let Some(ref project) = self.project {
-                    let entries = project.entries();
-                    if entries.is_empty() {
-                        ui.weak("No entries in project");
-                    } else {
-                        egui::ScrollArea::vertical()
-                            .max_height(200.0)
-                            .show(ui, |ui| {
-                                for (idx, entry) in entries.iter().enumerate() {
-                                    ui.horizontal(|ui| {
-                                        // Step number indicator
-                                        ui.label(format!("{}.", idx + 1));
-                                        
-                                        match entry {
-                                            lib::ProjectEntry::LoadAsset(load_entry) => {
-                                                let icon = match load_entry.asset_type() {
-                                                    lib::AssetType::ModelWASM => "📦",
-                                                    lib::AssetType::OperationWASM => "⚙️",
-                                                };
-                                                ui.label(format!("{} Load: {}", icon, load_entry.asset_id()));
-                                            }
-                                            lib::ProjectEntry::ExecuteWASM(exec_entry) => {
-                                                ui.vertical(|ui| {
-                                                    ui.label(format!("▶ Execute: {}", exec_entry.asset_id()));
-                                                    // Show inputs
-                                                    let inputs = exec_entry.inputs();
-                                                    if !inputs.is_empty() {
-                                                        ui.indent("inputs", |ui| {
-                                                            for input in inputs {
-                                                                ui.weak(format!("← {}", input.display()));
+                egui::CollapsingHeader::new("Project Timeline")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        if let Some(ref project) = self.project {
+                            let entries = project.entries();
+                            if entries.is_empty() {
+                                ui.weak("No entries in project");
+                            } else {
+                                egui::ScrollArea::vertical()
+                                    .max_height(200.0)
+                                    .show(ui, |ui| {
+                                        for (idx, entry) in entries.iter().enumerate() {
+                                            ui.horizontal(|ui| {
+                                                // Step number indicator
+                                                ui.label(format!("{}.", idx + 1));
+
+                                                match entry {
+                                                    lib::ProjectEntry::LoadAsset(load_entry) => {
+                                                        let icon = match load_entry.asset_type() {
+                                                            lib::AssetType::ModelWASM => "📦",
+                                                            lib::AssetType::OperationWASM => "⚙️",
+                                                        };
+                                                        ui.label(format!(
+                                                            "{} Load: {}",
+                                                            icon,
+                                                            load_entry.asset_id()
+                                                        ));
+                                                    }
+                                                    lib::ProjectEntry::ExecuteWASM(exec_entry) => {
+                                                        ui.vertical(|ui| {
+                                                            ui.label(format!(
+                                                                "▶ Execute: {}",
+                                                                exec_entry.asset_id()
+                                                            ));
+                                                            // Show inputs
+                                                            let inputs = exec_entry.inputs();
+                                                            if !inputs.is_empty() {
+                                                                ui.indent("inputs", |ui| {
+                                                                    for input in inputs {
+                                                                        ui.weak(format!(
+                                                                            "← {}",
+                                                                            input.display()
+                                                                        ));
+                                                                    }
+                                                                });
+                                                            }
+                                                            // Show output count
+                                                            let output_count = exec_entry.output_count();
+                                                            if output_count > 0 {
+                                                                ui.indent("outputs", |ui| {
+                                                                    ui.weak(format!(
+                                                                        "→ {} output(s)",
+                                                                        output_count
+                                                                    ));
+                                                                });
                                                             }
                                                         });
                                                     }
-                                                    // Show output count
-                                                    let output_count = exec_entry.output_count();
-                                                    if output_count > 0 {
-                                                        ui.indent("outputs", |ui| {
-                                                            ui.weak(format!("→ {} output(s)", output_count));
-                                                        });
+                                                    lib::ProjectEntry::ExportAsset(asset_id) => {
+                                                        ui.label(format!(
+                                                            "📤 Export: {}",
+                                                            asset_id
+                                                        ));
                                                     }
-                                                });
-                                            }
-                                            lib::ProjectEntry::ExportAsset(asset_id) => {
-                                                ui.label(format!("📤 Export: {}", asset_id));
-                                            }
+                                                }
+                                            });
+                                            ui.add_space(2.0);
                                         }
                                     });
-                                    ui.add_space(2.0);
-                                }
-                            });
-                    }
-                } else {
-                    ui.weak("No project loaded");
-                }
-
-                // Project Exports - shown below the timeline
-                // Each export can be independently enabled for rendering with its own mode
-                ui.separator();
-                ui.heading("Project Exports (last run)");
-                if self.exported_assets.is_empty() {
-                    ui.weak("(no exported assets)");
-                } else {
-                    // Clone to avoid borrow conflicts when UI callbacks mutate `self`.
-                    let exported_assets = self.exported_assets.clone();
-                    for asset in exported_assets {
-                        let asset_id = asset.asset_id().to_string();
-                        let is_rendering = self.asset_render_data.contains_key(&asset_id);
-
-                        ui.group(|ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(format!(
-                                    "{}: {} ({} bytes)",
-                                    asset.asset_id(),
-                                    asset.asset().asset_type(),
-                                    asset.asset().bytes().len(),
-                                ));
-                                if is_rendering {
-                                    ui.weak("(rendering)");
-                                }
-                            });
-
-                            if !asset.precursor_asset_ids().is_empty() {
-                                ui.label(format!(
-                                    "precursors: {}",
-                                    asset.precursor_asset_ids().join(", ")
-                                ));
                             }
+                        } else {
+                            ui.weak("No project loaded");
+                        }
+                    });
 
-                            let is_renderable = asset.as_model_wasm().is_some();
-                            let current_mode = self.get_asset_render_mode(&asset_id);
+                ui.separator();
+                egui::CollapsingHeader::new("Project Exports (last run)")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        if self.exported_assets.is_empty() {
+                            ui.weak("(no exported assets)");
+                            return;
+                        }
 
-                            ui.horizontal(|ui| {
-                                ui.label("Render:");
+                        // Clone to avoid borrow conflicts when UI callbacks mutate `self`.
+                        let exported_assets = self.exported_assets.clone();
+                        for asset in exported_assets {
+                            let asset_id = asset.asset_id().to_string();
+                            let is_rendering = self.asset_render_data.contains_key(&asset_id);
 
-                                if !is_renderable {
-                                    ui.weak("(not renderable)");
-                                    return;
+                            ui.group(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(format!(
+                                        "{}: {} ({} bytes)",
+                                        asset.asset_id(),
+                                        asset.asset().asset_type(),
+                                        asset.asset().bytes().len(),
+                                    ));
+                                    if is_rendering {
+                                        ui.weak("(rendering)");
+                                    }
+                                });
+
+                                if !asset.precursor_asset_ids().is_empty() {
+                                    ui.label(format!(
+                                        "precursors: {}",
+                                        asset.precursor_asset_ids().join(", ")
+                                    ));
                                 }
 
-                                let mut mode = current_mode;
-                                egui::ComboBox::from_id_salt(format!("render_{asset_id}"))
-                                    .selected_text(mode.label())
-                                    .show_ui(ui, |ui| {
-                                        ui.selectable_value(&mut mode, ExportRenderMode::None, ExportRenderMode::None.label());
-                                        ui.selectable_value(&mut mode, ExportRenderMode::PointCloud, ExportRenderMode::PointCloud.label());
-                                        ui.selectable_value(&mut mode, ExportRenderMode::MarchingCubes, ExportRenderMode::MarchingCubes.label());
-                                    });
+                                let is_renderable = asset.as_model_wasm().is_some();
+                                let current_mode = self.get_asset_render_mode(&asset_id);
 
-                                if mode != current_mode {
-                                    self.set_asset_render_mode(&asset_id, mode);
+                                ui.horizontal(|ui| {
+                                    ui.label("Render:");
+
+                                    if !is_renderable {
+                                        ui.weak("(not renderable)");
+                                        return;
+                                    }
+
+                                    let mut mode = current_mode;
+                                    egui::ComboBox::from_id_salt(format!("render_{asset_id}"))
+                                        .selected_text(mode.label())
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(
+                                                &mut mode,
+                                                ExportRenderMode::None,
+                                                ExportRenderMode::None.label(),
+                                            );
+                                            ui.selectable_value(
+                                                &mut mode,
+                                                ExportRenderMode::PointCloud,
+                                                ExportRenderMode::PointCloud.label(),
+                                            );
+                                            ui.selectable_value(
+                                                &mut mode,
+                                                ExportRenderMode::MarchingCubes,
+                                                ExportRenderMode::MarchingCubes.label(),
+                                            );
+                                        });
+
+                                    if mode != current_mode {
+                                        self.set_asset_render_mode(&asset_id, mode);
+                                    }
+                                });
+
+                                if let Some(err) = self
+                                    .asset_render_data
+                                    .get(&asset_id)
+                                    .and_then(|d| d.last_error.as_ref())
+                                {
+                                    ui.add_space(4.0);
+                                    ui.colored_label(egui::Color32::RED, err);
                                 }
                             });
-                        });
-                    }
-                }
+                        }
+                    });
 
                 if let Some(ref error) = self.error_message {
                     ui.separator();
                     ui.colored_label(egui::Color32::RED, error);
                 }
+                    });
             });
 
         // Central panel with 3D view

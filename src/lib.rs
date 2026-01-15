@@ -109,7 +109,7 @@ pub fn operator_metadata_from_wasm_bytes(wasm_bin: &[u8]) -> Result<OperatorMeta
         .map_err(|e| ExecutionError::Wasmtime(format!("Failed to decode operator metadata CBOR: {e}")))
 }
 
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, serde::Deserialize, serde::Serialize)]
 pub enum AssetType {
     ModelWASM,
     OperationWASM,
@@ -522,6 +522,45 @@ impl Project {
         &self.entries
     }
 
+    /// Returns all asset IDs that are declared by this project, along with their `AssetType`.
+    ///
+    /// This includes both explicitly loaded assets (`ProjectEntry::LoadAsset`) and assets
+    /// produced by operation steps (`ProjectEntry::ExecuteWASM` outputs).
+    pub fn declared_assets(&self) -> Vec<(String, AssetType)> {
+        let mut out: Vec<(String, AssetType)> = Vec::new();
+        let mut index_by_id: HashMap<String, usize> = HashMap::new();
+
+        for entry in &self.entries {
+            match entry {
+                ProjectEntry::LoadAsset(a) => {
+                    let id = a.asset_id().to_string();
+                    let ty = a.asset_type();
+                    if let Some(idx) = index_by_id.get(&id).copied() {
+                        out[idx].1 = ty;
+                    } else {
+                        index_by_id.insert(id.clone(), out.len());
+                        out.push((id, ty));
+                    }
+                }
+                ProjectEntry::ExecuteWASM(e) => {
+                    for o in &e.outputs {
+                        let id = o.asset_id.clone();
+                        let ty = o.asset_type;
+                        if let Some(idx) = index_by_id.get(&id).copied() {
+                            out[idx].1 = ty;
+                        } else {
+                            index_by_id.insert(id.clone(), out.len());
+                            out.push((id, ty));
+                        }
+                    }
+                }
+                ProjectEntry::ExportAsset(_) => {}
+            }
+        }
+
+        out
+    }
+
     /// Returns a mutable reference to the project entries.
     ///
     /// This is primarily intended for UI code to insert new operations into an existing project.
@@ -586,5 +625,31 @@ mod tests {
             ExecutionError::NoSuchAssetId(id) => assert_eq!(id, "a"),
             other => panic!("expected NoSuchAssetId, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn project_declared_assets_includes_execute_outputs_and_types() {
+        let project = Project::new(vec![
+            ProjectEntry::LoadAsset(LoadAssetEntry::new(
+                "model_a".to_string(),
+                Asset::ModelWASM(vec![1, 2, 3]),
+            )),
+            ProjectEntry::ExecuteWASM(ExecuteWasmEntry::new(
+                "op_identity".to_string(),
+                vec![ExecuteWasmInput::AssetByID("model_a".to_string())],
+                vec![ExecuteWasmOutput::new(
+                    "model_b".to_string(),
+                    AssetType::ModelWASM,
+                )],
+            )),
+        ]);
+
+        let assets = project.declared_assets();
+        assert!(assets
+            .iter()
+            .any(|(id, ty)| id == "model_a" && *ty == AssetType::ModelWASM));
+        assert!(assets
+            .iter()
+            .any(|(id, ty)| id == "model_b" && *ty == AssetType::ModelWASM));
     }
 }
