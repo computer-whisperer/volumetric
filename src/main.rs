@@ -2,6 +2,19 @@ use anyhow::{Context, Result};
 use eframe::egui;
 use wasmtime::*;
 
+/// Rendering mode selection
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenderMode {
+    PointCloud,
+    MarchingCubes,
+}
+
+/// A triangle in 3D space
+type Triangle = [(f32, f32, f32); 3];
+
+// Marching cubes lookup tables
+mod marching_cubes_tables;
+
 /// Application state for the volumetric renderer
 struct VolumetricApp {
     wasm_path: String,
@@ -9,7 +22,9 @@ struct VolumetricApp {
     bounds_min: (f32, f32, f32),
     bounds_max: (f32, f32, f32),
     points: Vec<(f32, f32, f32)>,
+    triangles: Vec<Triangle>,
     needs_resample: bool,
+    render_mode: RenderMode,
     // Camera state
     camera_theta: f32,
     camera_phi: f32,
@@ -27,7 +42,9 @@ impl VolumetricApp {
             bounds_min: (0.0, 0.0, 0.0),
             bounds_max: (0.0, 0.0, 0.0),
             points: Vec::new(),
+            triangles: Vec::new(),
             needs_resample: true,
+            render_mode: RenderMode::PointCloud,
             camera_theta: std::f32::consts::FRAC_PI_4,
             camera_phi: std::f32::consts::FRAC_PI_4,
             camera_radius: 4.0,
@@ -37,15 +54,34 @@ impl VolumetricApp {
     }
 
     fn resample_model(&mut self) {
-        match sample_model(&self.wasm_path, self.resolution) {
-            Ok((points, bounds_min, bounds_max)) => {
-                self.bounds_min = bounds_min;
-                self.bounds_max = bounds_max;
-                self.points = points;
-                self.error_message = None;
+        match self.render_mode {
+            RenderMode::PointCloud => {
+                match sample_model(&self.wasm_path, self.resolution) {
+                    Ok((points, bounds_min, bounds_max)) => {
+                        self.bounds_min = bounds_min;
+                        self.bounds_max = bounds_max;
+                        self.points = points;
+                        self.triangles.clear();
+                        self.error_message = None;
+                    }
+                    Err(e) => {
+                        self.error_message = Some(format!("Failed to sample model: {}", e));
+                    }
+                }
             }
-            Err(e) => {
-                self.error_message = Some(format!("Failed to sample model: {}", e));
+            RenderMode::MarchingCubes => {
+                match generate_marching_cubes_mesh(&self.wasm_path, self.resolution) {
+                    Ok((triangles, bounds_min, bounds_max)) => {
+                        self.bounds_min = bounds_min;
+                        self.bounds_max = bounds_max;
+                        self.triangles = triangles;
+                        self.points.clear();
+                        self.error_message = None;
+                    }
+                    Err(e) => {
+                        self.error_message = Some(format!("Failed to generate mesh: {}", e));
+                    }
+                }
             }
         }
     }
@@ -142,7 +178,14 @@ impl eframe::App for VolumetricApp {
                 
                 ui.separator();
                 ui.label("Model Info");
-                ui.label(format!("Points: {}", self.points.len()));
+                match self.render_mode {
+                    RenderMode::PointCloud => {
+                        ui.label(format!("Points: {}", self.points.len()));
+                    }
+                    RenderMode::MarchingCubes => {
+                        ui.label(format!("Triangles: {}", self.triangles.len()));
+                    }
+                }
                 ui.label(format!(
                     "Bounds: ({:.2}, {:.2}, {:.2})",
                     self.bounds_min.0, self.bounds_min.1, self.bounds_min.2
@@ -163,12 +206,13 @@ impl eframe::App for VolumetricApp {
                 });
                 
                 ui.separator();
-                ui.collapsing("Future Options", |ui| {
-                    ui.label("• Marching cubes mesh");
-                    ui.label("• Ray marching");
-                    ui.label("• Export to STL/OBJ");
-                    ui.label("• Custom shaders");
-                });
+                ui.label("Render Mode");
+                let prev_mode = self.render_mode;
+                ui.radio_value(&mut self.render_mode, RenderMode::PointCloud, "Point Cloud");
+                ui.radio_value(&mut self.render_mode, RenderMode::MarchingCubes, "Marching Cubes");
+                if self.render_mode != prev_mode {
+                    self.needs_resample = true;
+                }
                 
                 if let Some(ref error) = self.error_message {
                     ui.separator();
@@ -229,43 +273,122 @@ impl eframe::App for VolumetricApp {
                 }
             }
             
-            // Sort points by depth for proper rendering
             let camera_pos = self.camera_position();
-            let mut points_with_depth: Vec<_> = self.points.iter()
-                .filter_map(|&p| {
-                    let dx = p.0 - camera_pos.0;
-                    let dy = p.1 - camera_pos.1;
-                    let dz = p.2 - camera_pos.2;
-                    let depth = dx * dx + dy * dy + dz * dz;
-                    self.project_point(p, &rect).map(|screen_pos| (p, screen_pos, depth))
-                })
-                .collect();
             
-            // Sort back to front
-            points_with_depth.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-            
-            // Draw points
-            for (point, screen_pos, depth) in points_with_depth {
-                // Color based on position (simple gradient)
-                let r = ((point.0 + 1.0) * 0.5 * 255.0) as u8;
-                let g = ((point.1 + 1.0) * 0.5 * 255.0) as u8;
-                let b = ((point.2 + 1.0) * 0.5 * 255.0) as u8;
-                
-                // Size based on depth
-                let size = (3.0 / depth.sqrt()).clamp(1.0, 4.0);
-                
-                painter.circle_filled(
-                    screen_pos,
-                    size,
-                    egui::Color32::from_rgb(r, g, b),
-                );
+            match self.render_mode {
+                RenderMode::PointCloud => {
+                    // Sort points by depth for proper rendering
+                    let mut points_with_depth: Vec<_> = self.points.iter()
+                        .filter_map(|&p| {
+                            let dx = p.0 - camera_pos.0;
+                            let dy = p.1 - camera_pos.1;
+                            let dz = p.2 - camera_pos.2;
+                            let depth = dx * dx + dy * dy + dz * dz;
+                            self.project_point(p, &rect).map(|screen_pos| (p, screen_pos, depth))
+                        })
+                        .collect();
+                    
+                    // Sort back to front
+                    points_with_depth.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+                    
+                    // Draw points
+                    for (point, screen_pos, depth) in points_with_depth {
+                        // Color based on position (simple gradient)
+                        let r = ((point.0 + 1.0) * 0.5 * 255.0) as u8;
+                        let g = ((point.1 + 1.0) * 0.5 * 255.0) as u8;
+                        let b = ((point.2 + 1.0) * 0.5 * 255.0) as u8;
+                        
+                        // Size based on depth
+                        let size = (3.0 / depth.sqrt()).clamp(1.0, 4.0);
+                        
+                        painter.circle_filled(
+                            screen_pos,
+                            size,
+                            egui::Color32::from_rgb(r, g, b),
+                        );
+                    }
+                }
+                RenderMode::MarchingCubes => {
+                    // Sort triangles by depth (using centroid)
+                    let mut triangles_with_depth: Vec<_> = self.triangles.iter()
+                        .filter_map(|tri| {
+                            // Calculate centroid
+                            let cx = (tri[0].0 + tri[1].0 + tri[2].0) / 3.0;
+                            let cy = (tri[0].1 + tri[1].1 + tri[2].1) / 3.0;
+                            let cz = (tri[0].2 + tri[1].2 + tri[2].2) / 3.0;
+                            
+                            let dx = cx - camera_pos.0;
+                            let dy = cy - camera_pos.1;
+                            let dz = cz - camera_pos.2;
+                            let depth = dx * dx + dy * dy + dz * dz;
+                            
+                            // Project all three vertices
+                            let p0 = self.project_point(tri[0], &rect)?;
+                            let p1 = self.project_point(tri[1], &rect)?;
+                            let p2 = self.project_point(tri[2], &rect)?;
+                            
+                            // Calculate normal for lighting
+                            let v1 = (tri[1].0 - tri[0].0, tri[1].1 - tri[0].1, tri[1].2 - tri[0].2);
+                            let v2 = (tri[2].0 - tri[0].0, tri[2].1 - tri[0].1, tri[2].2 - tri[0].2);
+                            let normal = (
+                                v1.1 * v2.2 - v1.2 * v2.1,
+                                v1.2 * v2.0 - v1.0 * v2.2,
+                                v1.0 * v2.1 - v1.1 * v2.0,
+                            );
+                            let normal_len = (normal.0 * normal.0 + normal.1 * normal.1 + normal.2 * normal.2).sqrt();
+                            let normal = if normal_len > 0.0001 {
+                                (normal.0 / normal_len, normal.1 / normal_len, normal.2 / normal_len)
+                            } else {
+                                (0.0, 1.0, 0.0)
+                            };
+                            
+                            Some((tri, [p0, p1, p2], depth, normal))
+                        })
+                        .collect();
+                    
+                    // Sort back to front
+                    triangles_with_depth.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+                    
+                    // Draw triangles
+                    for (tri, screen_pts, _depth, normal) in triangles_with_depth {
+                        // Simple lighting based on normal direction
+                        let light_dir = (0.5f32, 0.7, 0.5);
+                        let light_len = (light_dir.0 * light_dir.0 + light_dir.1 * light_dir.1 + light_dir.2 * light_dir.2).sqrt();
+                        let light_dir = (light_dir.0 / light_len, light_dir.1 / light_len, light_dir.2 / light_len);
+                        
+                        let dot = (normal.0 * light_dir.0 + normal.1 * light_dir.1 + normal.2 * light_dir.2).abs();
+                        let brightness = 0.3 + 0.7 * dot;
+                        
+                        // Color based on centroid position
+                        let cx = (tri[0].0 + tri[1].0 + tri[2].0) / 3.0;
+                        let cy = (tri[0].1 + tri[1].1 + tri[2].1) / 3.0;
+                        let cz = (tri[0].2 + tri[1].2 + tri[2].2) / 3.0;
+                        
+                        let r = (((cx + 1.0) * 0.5 * 255.0) * brightness) as u8;
+                        let g = (((cy + 1.0) * 0.5 * 255.0) * brightness) as u8;
+                        let b = (((cz + 1.0) * 0.5 * 255.0) * brightness) as u8;
+                        
+                        let color = egui::Color32::from_rgb(r, g, b);
+                        
+                        // Draw filled triangle
+                        painter.add(egui::Shape::convex_polygon(
+                            vec![screen_pts[0], screen_pts[1], screen_pts[2]],
+                            color,
+                            egui::Stroke::NONE,
+                        ));
+                    }
+                }
             }
             
             // Draw info text
+            let info_text = match self.render_mode {
+                RenderMode::PointCloud => format!("Points: {} | Drag to rotate, scroll to zoom", self.points.len()),
+                RenderMode::MarchingCubes => format!("Triangles: {} | Drag to rotate, scroll to zoom", self.triangles.len()),
+            };
             painter.text(
                 rect.left_top() + egui::vec2(10.0, 10.0),
                 egui::Align2::LEFT_TOP,
-                format!("Points: {} | Drag to rotate, scroll to zoom", self.points.len()),
+                info_text,
                 egui::FontId::default(),
                 egui::Color32::WHITE,
             );
@@ -324,6 +447,157 @@ fn sample_model(wasm_path: &str, resolution: usize) -> Result<(Vec<(f32, f32, f3
     }
     
     Ok((points, bounds_min, bounds_max))
+}
+
+/// Generate a mesh using marching cubes algorithm from the WASM volumetric model
+fn generate_marching_cubes_mesh(wasm_path: &str, resolution: usize) -> Result<(Vec<Triangle>, (f32, f32, f32), (f32, f32, f32))> {
+    use marching_cubes_tables::{EDGE_TABLE, TRI_TABLE};
+    
+    let engine = Engine::default();
+    let module = Module::from_file(&engine, wasm_path)
+        .with_context(|| format!("Failed to load WASM module from {}", wasm_path))?;
+    
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[])
+        .context("Failed to instantiate WASM module")?;
+    
+    let is_inside = instance
+        .get_typed_func::<(f32, f32, f32), i32>(&mut store, "is_inside")
+        .context("Failed to get 'is_inside' function")?;
+    
+    let get_bounds_min_x = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_min_x")?;
+    let get_bounds_min_y = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_min_y")?;
+    let get_bounds_min_z = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_min_z")?;
+    let get_bounds_max_x = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_max_x")?;
+    let get_bounds_max_y = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_max_y")?;
+    let get_bounds_max_z = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_max_z")?;
+    
+    let min_x = get_bounds_min_x.call(&mut store, ())?;
+    let min_y = get_bounds_min_y.call(&mut store, ())?;
+    let min_z = get_bounds_min_z.call(&mut store, ())?;
+    let max_x = get_bounds_max_x.call(&mut store, ())?;
+    let max_y = get_bounds_max_y.call(&mut store, ())?;
+    let max_z = get_bounds_max_z.call(&mut store, ())?;
+    
+    let bounds_min = (min_x, min_y, min_z);
+    let bounds_max = (max_x, max_y, max_z);
+    
+    let step_x = (max_x - min_x) / resolution as f32;
+    let step_y = (max_y - min_y) / resolution as f32;
+    let step_z = (max_z - min_z) / resolution as f32;
+    
+    let mut triangles = Vec::new();
+    
+    // Iterate through each cube in the grid
+    for z_idx in 0..resolution {
+        for y_idx in 0..resolution {
+            for x_idx in 0..resolution {
+                let x = min_x + x_idx as f32 * step_x;
+                let y = min_y + y_idx as f32 * step_y;
+                let z = min_z + z_idx as f32 * step_z;
+                
+                // Get the 8 corners of the cube
+                let corners = [
+                    (x, y, z),
+                    (x + step_x, y, z),
+                    (x + step_x, y + step_y, z),
+                    (x, y + step_y, z),
+                    (x, y, z + step_z),
+                    (x + step_x, y, z + step_z),
+                    (x + step_x, y + step_y, z + step_z),
+                    (x, y + step_y, z + step_z),
+                ];
+                
+                // Determine which corners are inside
+                let mut cube_index = 0u8;
+                for (i, &corner) in corners.iter().enumerate() {
+                    if is_inside.call(&mut store, corner)? != 0 {
+                        cube_index |= 1 << i;
+                    }
+                }
+                
+                // Skip if cube is entirely inside or outside
+                if EDGE_TABLE[cube_index as usize] == 0 {
+                    continue;
+                }
+                
+                // Find the vertices where the surface intersects the cube edges
+                let mut vert_list = [(0.0f32, 0.0f32, 0.0f32); 12];
+                let edges = EDGE_TABLE[cube_index as usize];
+                
+                // Edge 0: between corners 0 and 1
+                if edges & 1 != 0 {
+                    vert_list[0] = interpolate_vertex(corners[0], corners[1]);
+                }
+                // Edge 1: between corners 1 and 2
+                if edges & 2 != 0 {
+                    vert_list[1] = interpolate_vertex(corners[1], corners[2]);
+                }
+                // Edge 2: between corners 2 and 3
+                if edges & 4 != 0 {
+                    vert_list[2] = interpolate_vertex(corners[2], corners[3]);
+                }
+                // Edge 3: between corners 3 and 0
+                if edges & 8 != 0 {
+                    vert_list[3] = interpolate_vertex(corners[3], corners[0]);
+                }
+                // Edge 4: between corners 4 and 5
+                if edges & 16 != 0 {
+                    vert_list[4] = interpolate_vertex(corners[4], corners[5]);
+                }
+                // Edge 5: between corners 5 and 6
+                if edges & 32 != 0 {
+                    vert_list[5] = interpolate_vertex(corners[5], corners[6]);
+                }
+                // Edge 6: between corners 6 and 7
+                if edges & 64 != 0 {
+                    vert_list[6] = interpolate_vertex(corners[6], corners[7]);
+                }
+                // Edge 7: between corners 7 and 4
+                if edges & 128 != 0 {
+                    vert_list[7] = interpolate_vertex(corners[7], corners[4]);
+                }
+                // Edge 8: between corners 0 and 4
+                if edges & 256 != 0 {
+                    vert_list[8] = interpolate_vertex(corners[0], corners[4]);
+                }
+                // Edge 9: between corners 1 and 5
+                if edges & 512 != 0 {
+                    vert_list[9] = interpolate_vertex(corners[1], corners[5]);
+                }
+                // Edge 10: between corners 2 and 6
+                if edges & 1024 != 0 {
+                    vert_list[10] = interpolate_vertex(corners[2], corners[6]);
+                }
+                // Edge 11: between corners 3 and 7
+                if edges & 2048 != 0 {
+                    vert_list[11] = interpolate_vertex(corners[3], corners[7]);
+                }
+                
+                // Create triangles from the triangle table
+                let tri_row = &TRI_TABLE[cube_index as usize];
+                let mut i = 0;
+                while i < 16 && tri_row[i] != -1 {
+                    let v0 = vert_list[tri_row[i] as usize];
+                    let v1 = vert_list[tri_row[i + 1] as usize];
+                    let v2 = vert_list[tri_row[i + 2] as usize];
+                    triangles.push([v0, v1, v2]);
+                    i += 3;
+                }
+            }
+        }
+    }
+    
+    Ok((triangles, bounds_min, bounds_max))
+}
+
+/// Interpolate vertex position on an edge (simple midpoint for binary inside/outside)
+fn interpolate_vertex(p1: (f32, f32, f32), p2: (f32, f32, f32)) -> (f32, f32, f32) {
+    (
+        (p1.0 + p2.0) * 0.5,
+        (p1.1 + p2.1) * 0.5,
+        (p1.2 + p2.2) * 0.5,
+    )
 }
 
 fn main() -> Result<()> {
