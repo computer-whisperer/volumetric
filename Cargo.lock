@@ -3633,6 +3633,8 @@ dependencies = [
  "glam",
  "log",
  "rfd",
+ "serde",
+ "thiserror 1.0.69",
  "wasmtime",
  "wgpu",
 ]

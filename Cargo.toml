@@ -15,6 +15,7 @@ members = [
 [dependencies]
 wasmtime = "27"
 anyhow = "1"
+serde = { version="1.0.228", features = ["derive"] }
 
 # GUI
 eframe = { version = "0.29", default-features = false, features = ["default_fonts", "wgpu", "x11", "wayland"] }
@@ -32,3 +33,4 @@ log = "0.4"
 
 # Native file dialog (runtime WASM selection)
 rfd = "0.14"
+thiserror = "1.0.69"

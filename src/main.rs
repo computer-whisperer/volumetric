@@ -554,7 +554,7 @@ fn sample_model(wasm_path: &Path, resolution: usize) -> Result<(Vec<(f32, f32, f
     let engine = Engine::default();
     let module = Module::from_file(&engine, wasm_path)
         .with_context(|| format!("Failed to load WASM module from {}", wasm_path.display()))?;
-    
+
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[])
         .context("Failed to instantiate WASM module")?;
