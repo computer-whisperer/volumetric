@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
 use eframe::egui;
+use ciborium::value::Value as CborValue;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 use std::sync::Arc;
 use wasmtime::*;
 
@@ -22,7 +24,138 @@ use lib::{
     LoadedAsset,
     Project,
     ProjectEntry,
+    OperatorMetadata,
+    OperatorMetadataInput,
+    OperatorMetadataOutput,
+    operator_metadata_from_wasm_bytes,
 };
+
+#[derive(Clone, Debug)]
+enum ConfigFieldType {
+    Bool,
+    Int,
+    Float,
+    Text,
+}
+
+#[derive(Clone, Debug)]
+enum ConfigValue {
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Text(String),
+}
+
+fn parse_cddl_record_schema(cddl: &str) -> Result<Vec<(String, ConfigFieldType)>> {
+    // v0 subset: a single CDDL record/map like: `{ dx: float, dy: float, dz: float }`
+    // Supported leaf types: `bool`, `int`, `float`, `tstr`
+    let mut s = cddl.trim();
+    if s.starts_with('{') {
+        s = s.strip_prefix('{').unwrap().trim();
+    }
+    if s.ends_with('}') {
+        s = s.strip_suffix('}').unwrap().trim();
+    }
+
+    if s.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut out = Vec::new();
+    for part in s.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (name, ty) = part
+            .split_once(':')
+            .ok_or_else(|| anyhow::anyhow!("Invalid CDDL field (expected `name: type`): `{part}`"))?;
+        let name = name.trim();
+        let ty = ty.trim();
+
+        let field_ty = match ty {
+            "bool" => ConfigFieldType::Bool,
+            "int" => ConfigFieldType::Int,
+            "float" => ConfigFieldType::Float,
+            "tstr" => ConfigFieldType::Text,
+            other => {
+                return Err(anyhow::anyhow!(
+                    "Unsupported CDDL type `{other}` (supported: bool, int, float, tstr)"
+                ));
+            }
+        };
+
+        if name.is_empty() {
+            return Err(anyhow::anyhow!("Empty field name in CDDL: `{part}`"));
+        }
+
+        out.push((name.to_string(), field_ty));
+    }
+
+    Ok(out)
+}
+
+fn encode_config_map_to_cbor(fields: &[(String, ConfigFieldType)], values: &HashMap<String, ConfigValue>) -> Result<Vec<u8>> {
+    let mut map_entries: Vec<(CborValue, CborValue)> = Vec::with_capacity(fields.len());
+    for (name, ty) in fields {
+        let value = values.get(name);
+        let cbor_value = match (ty, value) {
+            (ConfigFieldType::Bool, Some(ConfigValue::Bool(b))) => CborValue::Bool(*b),
+            (ConfigFieldType::Int, Some(ConfigValue::Int(i))) => CborValue::Integer((*i).into()),
+            (ConfigFieldType::Float, Some(ConfigValue::Float(f))) => CborValue::Float(*f),
+            (ConfigFieldType::Text, Some(ConfigValue::Text(t))) => CborValue::Text(t.clone()),
+            // If unset or mismatched, use a sensible default for now.
+            (ConfigFieldType::Bool, _) => CborValue::Bool(false),
+            (ConfigFieldType::Int, _) => CborValue::Integer(0.into()),
+            (ConfigFieldType::Float, _) => CborValue::Float(0.0),
+            (ConfigFieldType::Text, _) => CborValue::Text(String::new()),
+        };
+
+        map_entries.push((CborValue::Text(name.clone()), cbor_value));
+    }
+
+    let value = CborValue::Map(map_entries);
+    let mut out = Vec::new();
+    ciborium::ser::into_writer(&value, &mut out)
+        .context("Failed to encode configuration CBOR")?;
+    Ok(out)
+}
+
+#[cfg(test)]
+mod cddl_config_tests {
+    use super::*;
+
+    #[derive(Debug, serde::Deserialize, PartialEq)]
+    struct TranslateConfig {
+        dx: f32,
+        dy: f32,
+        dz: f32,
+    }
+
+    #[test]
+    fn parse_and_encode_config_produces_cbor_map_decodable_as_struct() {
+        let fields = parse_cddl_record_schema("{ dx: float, dy: float, dz: float }").unwrap();
+
+        let mut values = HashMap::new();
+        values.insert("dx".to_string(), ConfigValue::Float(2.5));
+        values.insert("dy".to_string(), ConfigValue::Float(-1.0));
+        values.insert("dz".to_string(), ConfigValue::Float(0.125));
+
+        let bytes = encode_config_map_to_cbor(&fields, &values).unwrap();
+
+        let mut cursor = std::io::Cursor::new(&bytes);
+        let decoded: TranslateConfig = ciborium::de::from_reader(&mut cursor).unwrap();
+
+        assert_eq!(
+            decoded,
+            TranslateConfig {
+                dx: 2.5,
+                dy: -1.0,
+                dz: 0.125
+            }
+        );
+    }
+}
 
 /// Rendering mode selection for an exported asset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +233,9 @@ struct VolumetricApp {
     operation_choice: OperationChoice,
     operation_input_asset_id: Option<String>,
     operation_output_asset_id: String,
+    operation_config_last_cddl: Option<String>,
+    operation_config_values: HashMap<String, ConfigValue>,
+    operator_metadata_cache: HashMap<String, CachedOperatorMetadata>,
     resolution: usize,
     wgpu_target_format: wgpu::TextureFormat,
     // Camera state
@@ -109,6 +245,13 @@ struct VolumetricApp {
     last_mouse_pos: Option<egui::Pos2>,
     // Error message
     error_message: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct CachedOperatorMetadata {
+    wasm_len: u64,
+    wasm_modified: Option<SystemTime>,
+    metadata: Option<OperatorMetadata>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -228,6 +371,9 @@ impl VolumetricApp {
             operation_choice: OperationChoice::Identity,
             operation_input_asset_id: None,
             operation_output_asset_id: "identity_out".to_string(),
+            operation_config_last_cddl: None,
+            operation_config_values: HashMap::new(),
+            operator_metadata_cache: HashMap::new(),
             resolution: 20,
             wgpu_target_format,
             camera_theta: std::f32::consts::FRAC_PI_4,
@@ -236,6 +382,42 @@ impl VolumetricApp {
             last_mouse_pos: None,
             error_message: None,
         }
+    }
+
+    fn operator_metadata_cached(&mut self, crate_name: &str) -> Option<OperatorMetadata> {
+        let path = operation_wasm_path(crate_name)?;
+        let path_str = path.to_string_lossy().to_string();
+
+        let (wasm_len, wasm_modified) = match fs::metadata(&path) {
+            Ok(m) => (m.len(), m.modified().ok()),
+            Err(_) => {
+                self.operator_metadata_cache.remove(&path_str);
+                return None;
+            }
+        };
+
+        let is_fresh = self
+            .operator_metadata_cache
+            .get(&path_str)
+            .is_some_and(|c| c.wasm_len == wasm_len && c.wasm_modified == wasm_modified);
+
+        if !is_fresh {
+            let metadata = fs::read(&path)
+                .ok()
+                .and_then(|wasm_bytes| operator_metadata_from_wasm_bytes(&wasm_bytes).ok());
+            self.operator_metadata_cache.insert(
+                path_str.clone(),
+                CachedOperatorMetadata {
+                    wasm_len,
+                    wasm_modified,
+                    metadata,
+                },
+            );
+        }
+
+        self.operator_metadata_cache
+            .get(&path_str)
+            .and_then(|c| c.metadata.clone())
     }
 
     /// Sets the render mode for a specific asset. If mode is None, removes the asset from rendering.
@@ -293,6 +475,8 @@ impl VolumetricApp {
             let mut env = Environment::new();
             match project.run(&mut env) {
                 Ok(assets) => {
+                    // Clear any previous error now that the project ran successfully.
+                    self.error_message = None;
                     // Retain full exports for UX/testing
                     self.exported_assets = assets.clone();
 
@@ -533,7 +717,6 @@ impl eframe::App for VolumetricApp {
                                             self.project = Some(Project::from_model_wasm(asset_id, wasm_bytes));
                                             self.project_path = None;
                                             self.run_project();
-                                            self.error_message = None;
                                         }
                                         Err(e) => {
                                             self.error_message = Some(format!("Failed to read WASM file: {}", e));
@@ -567,7 +750,6 @@ impl eframe::App for VolumetricApp {
                                     self.project_path = None;
                                     self.run_project();
                                     self.demo_choice = DemoChoice::None;
-                                    self.error_message = None;
                                 }
                                 Err(e) => {
                                     self.error_message = Some(format!("Failed to read WASM file: {}", e));
@@ -603,7 +785,6 @@ impl eframe::App for VolumetricApp {
                                     self.project_path = Some(path);
                                     self.run_project();
                                     self.demo_choice = DemoChoice::None;
-                                    self.error_message = None;
                                 }
                                 Err(e) => {
                                     self.error_message = Some(format!("Failed to load project: {}", e));
@@ -676,6 +857,87 @@ impl eframe::App for VolumetricApp {
                         });
                 });
 
+                // If the selected operator declares configuration inputs, render widgets for them.
+                // The encoded CBOR bytes will be inserted into `ExecuteWasmInput::Data` when adding the operation.
+                let crate_name = self.operation_choice.crate_name();
+                let operator_metadata = self.operator_metadata_cached(crate_name);
+
+                if let Some(metadata) = operator_metadata {
+                    for (input_idx, input) in metadata.inputs.iter().enumerate() {
+                        if let OperatorMetadataInput::CBORConfiguration(cddl) = input {
+                            let cddl_trimmed = cddl.trim().to_string();
+                            if self.operation_config_last_cddl.as_deref() != Some(cddl_trimmed.as_str()) {
+                                self.operation_config_last_cddl = Some(cddl_trimmed.clone());
+                                self.operation_config_values.clear();
+                            }
+
+                            ui.separator();
+                            ui.label(format!("Configuration (input {input_idx})"));
+
+                            match parse_cddl_record_schema(&cddl_trimmed) {
+                                Ok(fields) => {
+                                    for (field_name, field_ty) in &fields {
+                                        ui.horizontal(|ui| {
+                                            ui.label(field_name);
+                                            match field_ty {
+                                                ConfigFieldType::Bool => {
+                                                    let entry = self
+                                                        .operation_config_values
+                                                        .entry(field_name.clone())
+                                                        .or_insert(ConfigValue::Bool(false));
+                                                    if let ConfigValue::Bool(b) = entry {
+                                                        ui.checkbox(b, "");
+                                                    }
+                                                }
+                                                ConfigFieldType::Int => {
+                                                    let entry = self
+                                                        .operation_config_values
+                                                        .entry(field_name.clone())
+                                                        .or_insert(ConfigValue::Int(0));
+                                                    if let ConfigValue::Int(i) = entry {
+                                                        ui.add(egui::DragValue::new(i));
+                                                    }
+                                                }
+                                                ConfigFieldType::Float => {
+                                                    let entry = self
+                                                        .operation_config_values
+                                                        .entry(field_name.clone())
+                                                        .or_insert(ConfigValue::Float(0.0));
+                                                    if let ConfigValue::Float(f) = entry {
+                                                        ui.add(egui::DragValue::new(f));
+                                                    }
+                                                }
+                                                ConfigFieldType::Text => {
+                                                    let entry = self
+                                                        .operation_config_values
+                                                        .entry(field_name.clone())
+                                                        .or_insert_with(|| ConfigValue::Text(String::new()));
+                                                    if let ConfigValue::Text(t) = entry {
+                                                        ui.text_edit_singleline(t);
+                                                    }
+                                                }
+                                            }
+                                        });
+                                    }
+
+                                    if ui
+                                        .add(egui::Button::new("Reset config"))
+                                        .clicked()
+                                    {
+                                        self.operation_config_values.clear();
+                                    }
+                                }
+                                Err(e) => {
+                                    ui.colored_label(egui::Color32::YELLOW, format!(
+                                        "Unsupported configuration schema: {e}"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    ui.separator();
+                }
+
                 ui.horizontal(|ui| {
                     ui.label("Input asset:");
                     let selected = self
@@ -715,6 +977,50 @@ impl eframe::App for VolumetricApp {
                                 let output_id = self.operation_output_asset_id.trim().to_string();
                                 let op_asset_id = format!("op_{crate_name}");
 
+                                let (inputs, outputs) = match self.operator_metadata_cached(crate_name) {
+                                    Some(metadata) => {
+                                        // Current UI only allows selecting a single input asset id.
+                                        // Use operator metadata to decide how many inputs/outputs to declare.
+                                        let mut inputs = Vec::with_capacity(metadata.inputs.len());
+                                        for (idx, input) in metadata.inputs.iter().enumerate() {
+                                            match input {
+                                                OperatorMetadataInput::ModelWASM => {
+                                                    if idx == 0 {
+                                                        inputs.push(ExecuteWasmInput::AssetByID(input_id.clone()));
+                                                    } else {
+                                                        inputs.push(ExecuteWasmInput::AssetByID(input_id.clone()));
+                                                    }
+                                                }
+                                                OperatorMetadataInput::CBORConfiguration(cddl) => {
+                                                    let fields = parse_cddl_record_schema(cddl.as_str()).unwrap_or_default();
+                                                    let bytes = encode_config_map_to_cbor(&fields, &self.operation_config_values)
+                                                        .unwrap_or_default();
+                                                    inputs.push(ExecuteWasmInput::Data(bytes));
+                                                }
+                                            }
+                                        }
+
+                                        let mut outputs = Vec::with_capacity(metadata.outputs.len());
+                                        for (idx, output) in metadata.outputs.iter().enumerate() {
+                                            let asset_type = match output {
+                                                OperatorMetadataOutput::ModelWASM => AssetType::ModelWASM,
+                                            };
+                                            let out_id = if idx == 0 {
+                                                output_id.clone()
+                                            } else {
+                                                format!("{output_id}_{idx}")
+                                            };
+                                            outputs.push(ExecuteWasmOutput::new(out_id, asset_type));
+                                        }
+
+                                        (inputs, outputs)
+                                    }
+                                    None => (
+                                        vec![ExecuteWasmInput::AssetByID(input_id.clone())],
+                                        vec![ExecuteWasmOutput::new(output_id.clone(), AssetType::ModelWASM)],
+                                    ),
+                                };
+
                                 if let Some(ref mut project) = self.project {
                                     let insert_at = project
                                         .entries()
@@ -734,11 +1040,8 @@ impl eframe::App for VolumetricApp {
                                         insert_at + 1,
                                         ProjectEntry::ExecuteWASM(ExecuteWasmEntry::new(
                                             op_asset_id,
-                                            vec![ExecuteWasmInput::AssetByID(input_id)],
-                                            vec![ExecuteWasmOutput::new(
-                                                output_id.clone(),
-                                                AssetType::ModelWASM,
-                                            )],
+                                            inputs,
+                                            outputs,
                                         )),
                                     );
                                     entries.insert(
@@ -748,7 +1051,6 @@ impl eframe::App for VolumetricApp {
                                 }
 
                                 self.run_project();
-                                self.error_message = None;
                             }
                             Err(e) => {
                                 self.error_message =

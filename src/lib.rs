@@ -18,6 +18,98 @@ pub enum ExecutionError {
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub enum OperatorMetadataInput {
+    ModelWASM,
+    /// A CBOR-encoded configuration blob.
+    ///
+    /// The `String` is a CDDL snippet describing the expected CBOR structure.
+    ///
+    /// v0 convention (current host support): a single record/map like:
+    /// `{ dx: float, dy: float, dz: float }`.
+    ///
+    /// The host UI uses this to generate widgets and encodes a CBOR map from field names to
+    /// primitive values.
+    CBORConfiguration(String),
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub enum OperatorMetadataOutput {
+    ModelWASM,
+}
+
+// TODO: The operators should emit this as a cbor-encoded response to get_metadata()
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub struct OperatorMetadata {
+    pub name: String,
+    pub version: String,
+    pub inputs: Vec<OperatorMetadataInput>,
+    pub outputs: Vec<OperatorMetadataOutput>,
+}
+
+/// Load `OperatorMetadata` from an operator WASM module via its `get_metadata()` export.
+///
+/// ABI contract:
+/// - The operator exports `get_metadata() -> i64` (or `u64`) where the return value packs
+///   `(ptr: u32, len: u32)` as `ptr | (len << 32)`.
+/// - The referenced bytes are CBOR encoded and match `OperatorMetadata`.
+pub fn operator_metadata_from_wasm_bytes(wasm_bin: &[u8]) -> Result<OperatorMetadata, ExecutionError> {
+    let engine = wasmtime::Engine::new(wasmtime::Config::new().debug_info(true))
+        .map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
+    let module = wasmtime::Module::new(&engine, wasm_bin)
+        .map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
+
+    let mut linker = wasmtime::Linker::new(&engine);
+
+    // The operator module may import the host IO functions even if `get_metadata()` doesn't use them.
+    // Provide stubs so instantiation succeeds.
+    linker.func_wrap("host", "get_input_len", |_caller: Caller<'_, ()>, _arg: i32| -> u32 { 0 })
+        .map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
+    linker.func_wrap(
+        "host",
+        "get_input_data",
+        |_caller: Caller<'_, ()>, _arg: i32, _ptr: i32, _len: i32| {},
+    )
+    .map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
+    linker.func_wrap(
+        "host",
+        "post_output",
+        |_caller: Caller<'_, ()>, _output_idx: i32, _ptr: i32, _len: i32| {},
+    )
+    .map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
+
+    let mut store = Store::new(&engine, ());
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
+
+    let metadata_func = instance
+        .get_typed_func::<(), i64>(&mut store, "get_metadata")
+        .map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
+
+    let packed = metadata_func
+        .call(&mut store, ())
+        .map_err(|e| ExecutionError::Wasmtime(e.to_string()))? as u64;
+    let ptr = (packed & 0xFFFF_FFFF) as usize;
+    let len = (packed >> 32) as usize;
+
+    let memory = instance
+        .get_memory(&mut store, "memory")
+        .ok_or_else(|| ExecutionError::Wasmtime("Operator module does not export `memory`".to_string()))?;
+    let mem_data = memory.data(&store);
+    let end = ptr
+        .checked_add(len)
+        .ok_or_else(|| ExecutionError::Wasmtime("Operator metadata pointer overflow".to_string()))?;
+    if end > mem_data.len() {
+        return Err(ExecutionError::Wasmtime("Operator metadata points outside of linear memory".to_string()));
+    }
+    let bytes = &mem_data[ptr..end];
+
+    let mut cursor = std::io::Cursor::new(bytes);
+    ciborium::de::from_reader(&mut cursor)
+        .map_err(|e| ExecutionError::Wasmtime(format!("Failed to decode operator metadata CBOR: {e}")))
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub enum AssetType {
     ModelWASM,
     OperationWASM,
@@ -82,6 +174,7 @@ impl LoadAssetEntry {
 pub enum ExecuteWasmInput {
     AssetByID(String),
     String(String),
+    Data(Vec<u8>)
 }
 
 impl ExecuteWasmInput {
@@ -96,6 +189,7 @@ impl ExecuteWasmInput {
                     format!("\"{}\"", s)
                 }
             }
+            ExecuteWasmInput::Data(_) => "Data".to_string(),
         }
     }
 }
@@ -213,6 +307,7 @@ impl ExecuteWasmEntry {
                     }
                 },
                 Some(ExecuteWasmInput::String(s)) => s.len() as u32,
+                Some(ExecuteWasmInput::Data(d)) => d.len() as u32,
                 None => 0,
             }
         }).map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
@@ -231,6 +326,7 @@ impl ExecuteWasmEntry {
                     })
                 },
                 Some(ExecuteWasmInput::String(s)) => Some(s.as_bytes().to_vec()),
+                Some(ExecuteWasmInput::Data(d)) => Some(d.clone()),
                 None => None,
             };
 
@@ -466,5 +562,29 @@ impl Project {
     pub fn load_from_file(path: &std::path::Path) -> Result<Self, std::io::Error> {
         let bytes = std::fs::read(path)?;
         Self::from_cbor(&bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exporting_same_asset_twice_is_an_error() {
+        let project = Project::new(vec![
+            ProjectEntry::LoadAsset(LoadAssetEntry::new(
+                "a".to_string(),
+                Asset::ModelWASM(vec![1, 2, 3]),
+            )),
+            ProjectEntry::ExportAsset("a".to_string()),
+            ProjectEntry::ExportAsset("a".to_string()),
+        ]);
+
+        let mut env = Environment::new();
+        let err = project.run(&mut env).unwrap_err();
+        match err {
+            ExecutionError::NoSuchAssetId(id) => assert_eq!(id, "a"),
+            other => panic!("expected NoSuchAssetId, got: {other:?}"),
+        }
     }
 }

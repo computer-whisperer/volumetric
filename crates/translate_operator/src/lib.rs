@@ -5,13 +5,49 @@
 //! - `host.get_input_data(i32, ptr, len)`
 //! - `host.post_output(i32, ptr, len)`
 //!
+//! Operator ABI:
+//! - `get_metadata() -> i64` returning `(ptr: u32, len: u32)` packed as `ptr | (len << 32)`
+//!
 //! Behavior:
 //! - Reads WASM model bytes from input 0
+//! - Reads CBOR configuration from input 1 (schema declared in metadata)
 //! - Renames existing ABI functions with a hex suffix
-//! - Emits new wrapper functions that apply +1 x translation
+//! - Emits new wrapper functions that apply configurable translation (dx/dy/dz)
 //! - Outputs the modified WASM to output 0
 
 use walrus::{FunctionBuilder, FunctionId, Module, ModuleConfig, ValType};
+
+#[derive(Clone, Debug, serde::Serialize)]
+enum OperatorMetadataInput {
+    ModelWASM,
+    CBORConfiguration(String),
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+enum OperatorMetadataOutput {
+    ModelWASM,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct OperatorMetadata {
+    name: String,
+    version: String,
+    inputs: Vec<OperatorMetadataInput>,
+    outputs: Vec<OperatorMetadataOutput>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct TranslateConfig {
+    dx: f32,
+    dy: f32,
+    dz: f32,
+}
+
+impl Default for TranslateConfig {
+    fn default() -> Self {
+        Self { dx: 1.0, dy: 0.0, dz: 0.0 }
+    }
+}
 
 #[link(wasm_import_module = "host")]
 extern "C" {
@@ -45,8 +81,8 @@ fn generate_hex_suffix() -> String {
     result
 }
 
-/// Transform the input WASM module to apply +1 x translation
-fn transform_wasm(input_bytes: &[u8]) -> Result<Vec<u8>, String> {
+/// Transform the input WASM module to apply translation by (dx, dy, dz).
+fn transform_wasm(input_bytes: &[u8], cfg: TranslateConfig) -> Result<Vec<u8>, String> {
     let config = ModuleConfig::new();
     let mut module = Module::from_buffer_with_config(input_bytes, &config)
         .map_err(|e| format!("Failed to parse WASM: {}", e))?;
@@ -88,7 +124,7 @@ fn transform_wasm(input_bytes: &[u8]) -> Result<Vec<u8>, String> {
             match *original_name {
                 "is_inside" => {
                     // is_inside(x, y, z) -> i32
-                    // Wrapper: is_inside(x, y, z) calls original_is_inside(x - 1.0, y, z)
+                    // Wrapper: is_inside(x, y, z) calls original_is_inside(x - dx, y - dy, z - dz)
                     let mut builder = FunctionBuilder::new(
                         &mut module.types,
                         &[ValType::F32, ValType::F32, ValType::F32],
@@ -102,10 +138,14 @@ fn transform_wasm(input_bytes: &[u8]) -> Result<Vec<u8>, String> {
                     builder
                         .func_body()
                         .local_get(x)
-                        .f32_const(-1.0) // Subtract 1 from x (equivalent to translating +1)
+                        .f32_const(-cfg.dx)
                         .binop(walrus::ir::BinaryOp::F32Add)
                         .local_get(y)
+                        .f32_const(-cfg.dy)
+                        .binop(walrus::ir::BinaryOp::F32Add)
                         .local_get(z)
+                        .f32_const(-cfg.dz)
+                        .binop(walrus::ir::BinaryOp::F32Add)
                         .call(original_func_id);
 
                     let wrapper_id = builder.finish(vec![x, y, z], &mut module.funcs);
@@ -113,7 +153,7 @@ fn transform_wasm(input_bytes: &[u8]) -> Result<Vec<u8>, String> {
                 }
                 "get_bounds_min_x" => {
                     // get_bounds_min_x() -> f32
-                    // Wrapper: returns original + 1.0
+                    // Wrapper: returns original + dx
                     let mut builder = FunctionBuilder::new(
                         &mut module.types,
                         &[],
@@ -123,7 +163,7 @@ fn transform_wasm(input_bytes: &[u8]) -> Result<Vec<u8>, String> {
                     builder
                         .func_body()
                         .call(original_func_id)
-                        .f32_const(1.0)
+                        .f32_const(cfg.dx)
                         .binop(walrus::ir::BinaryOp::F32Add);
 
                     let wrapper_id = builder.finish(vec![], &mut module.funcs);
@@ -131,7 +171,7 @@ fn transform_wasm(input_bytes: &[u8]) -> Result<Vec<u8>, String> {
                 }
                 "get_bounds_max_x" => {
                     // get_bounds_max_x() -> f32
-                    // Wrapper: returns original + 1.0
+                    // Wrapper: returns original + dx
                     let mut builder = FunctionBuilder::new(
                         &mut module.types,
                         &[],
@@ -141,14 +181,14 @@ fn transform_wasm(input_bytes: &[u8]) -> Result<Vec<u8>, String> {
                     builder
                         .func_body()
                         .call(original_func_id)
-                        .f32_const(1.0)
+                        .f32_const(cfg.dx)
                         .binop(walrus::ir::BinaryOp::F32Add);
 
                     let wrapper_id = builder.finish(vec![], &mut module.funcs);
                     module.exports.add("get_bounds_max_x", wrapper_id);
                 }
-                "get_bounds_min_y" | "get_bounds_max_y" | "get_bounds_min_z" | "get_bounds_max_z" => {
-                    // These just pass through unchanged
+                "get_bounds_min_y" => {
+                    // Wrapper: returns original + dy
                     let mut builder = FunctionBuilder::new(
                         &mut module.types,
                         &[],
@@ -157,10 +197,63 @@ fn transform_wasm(input_bytes: &[u8]) -> Result<Vec<u8>, String> {
 
                     builder
                         .func_body()
-                        .call(original_func_id);
+                        .call(original_func_id)
+                        .f32_const(cfg.dy)
+                        .binop(walrus::ir::BinaryOp::F32Add);
 
                     let wrapper_id = builder.finish(vec![], &mut module.funcs);
-                    module.exports.add(*original_name, wrapper_id);
+                    module.exports.add("get_bounds_min_y", wrapper_id);
+                }
+                "get_bounds_max_y" => {
+                    // Wrapper: returns original + dy
+                    let mut builder = FunctionBuilder::new(
+                        &mut module.types,
+                        &[],
+                        &[ValType::F32],
+                    );
+
+                    builder
+                        .func_body()
+                        .call(original_func_id)
+                        .f32_const(cfg.dy)
+                        .binop(walrus::ir::BinaryOp::F32Add);
+
+                    let wrapper_id = builder.finish(vec![], &mut module.funcs);
+                    module.exports.add("get_bounds_max_y", wrapper_id);
+                }
+                "get_bounds_min_z" => {
+                    // Wrapper: returns original + dz
+                    let mut builder = FunctionBuilder::new(
+                        &mut module.types,
+                        &[],
+                        &[ValType::F32],
+                    );
+
+                    builder
+                        .func_body()
+                        .call(original_func_id)
+                        .f32_const(cfg.dz)
+                        .binop(walrus::ir::BinaryOp::F32Add);
+
+                    let wrapper_id = builder.finish(vec![], &mut module.funcs);
+                    module.exports.add("get_bounds_min_z", wrapper_id);
+                }
+                "get_bounds_max_z" => {
+                    // Wrapper: returns original + dz
+                    let mut builder = FunctionBuilder::new(
+                        &mut module.types,
+                        &[],
+                        &[ValType::F32],
+                    );
+
+                    builder
+                        .func_body()
+                        .call(original_func_id)
+                        .f32_const(cfg.dz)
+                        .binop(walrus::ir::BinaryOp::F32Add);
+
+                    let wrapper_id = builder.finish(vec![], &mut module.funcs);
+                    module.exports.add("get_bounds_max_z", wrapper_id);
                 }
                 _ => {}
             }
@@ -181,8 +274,23 @@ pub extern "C" fn run() {
         }
     }
 
+    let cfg = {
+        let cfg_len = unsafe { get_input_len(1) } as usize;
+        if cfg_len == 0 {
+            TranslateConfig::default()
+        } else {
+            let mut cfg_buf = vec![0u8; cfg_len];
+            unsafe {
+                get_input_data(1, cfg_buf.as_mut_ptr() as i32, cfg_len as i32);
+            }
+            let mut cursor = std::io::Cursor::new(&cfg_buf);
+            // Accept either a typed struct or a CBOR map compatible with it.
+            ciborium::de::from_reader::<TranslateConfig, _>(&mut cursor).unwrap_or_default()
+        }
+    };
+
     // Transform the WASM
-    let output = match transform_wasm(&buf) {
+    let output = match transform_wasm(&buf, cfg) {
         Ok(transformed) => transformed,
         Err(_) => {
             // On error, pass through unchanged (like identity)
@@ -193,4 +301,30 @@ pub extern "C" fn run() {
     unsafe {
         post_output(0, output.as_ptr() as i32, output.len() as i32);
     }
+}
+
+#[no_mangle]
+pub extern "C" fn get_metadata() -> i64 {
+    static METADATA: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    let bytes = METADATA.get_or_init(|| {
+        let schema = "{ dx: float, dy: float, dz: float }".to_string();
+        let metadata = OperatorMetadata {
+            name: "translate_operator".to_string(),
+            version: "0.1.0".to_string(),
+            inputs: vec![
+                OperatorMetadataInput::ModelWASM,
+                OperatorMetadataInput::CBORConfiguration(schema),
+            ],
+            outputs: vec![OperatorMetadataOutput::ModelWASM],
+        };
+
+        let mut out = Vec::new();
+        ciborium::ser::into_writer(&metadata, &mut out)
+            .expect("translate_operator metadata CBOR serialization should not fail");
+        out
+    });
+
+    let ptr = bytes.as_ptr() as u32;
+    let len = bytes.len() as u32;
+    (ptr as u64 | ((len as u64) << 32)) as i64
 }
