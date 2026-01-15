@@ -3752,6 +3752,7 @@ dependencies = [
  "rfd",
  "serde",
  "thiserror 1.0.69",
+ "wasmparser 0.219.2",
  "wasmtime",
  "wgpu",
 ]
