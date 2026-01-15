@@ -299,10 +299,11 @@ impl PointCloudGpu {
             },
             // When eframe is configured with a depth buffer, the main render pass includes a
             // depth attachment. Pipelines used inside egui paint callbacks must be compatible.
+            // Enable depth testing so points are properly occluded by other geometry and each other.
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth24Plus,
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::Always,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::LessEqual,
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
