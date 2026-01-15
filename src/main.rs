@@ -21,6 +21,7 @@ type Triangle = [(f32, f32, f32); 3];
 // Marching cubes lookup tables
 mod marching_cubes_tables;
 mod marching_cubes_cpu;
+mod stl;
 
 /// Application state for the volumetric renderer
 struct VolumetricApp {
@@ -394,6 +395,25 @@ impl eframe::App for VolumetricApp {
                     .changed();
                 if changed {
                     self.needs_resample = true;
+                }
+
+                ui.separator();
+                ui.label("Export");
+                let can_export_stl = self.render_mode == RenderMode::MarchingCubes && !self.triangles.is_empty();
+                if ui
+                    .add_enabled(can_export_stl, egui::Button::new("Export STL…"))
+                    .clicked()
+                {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("STL", &["stl"])
+                        .set_file_name("mesh.stl")
+                        .save_file()
+                    {
+                        match stl::write_binary_stl(&path, &self.triangles, "volumetric") {
+                            Ok(()) => self.error_message = None,
+                            Err(e) => self.error_message = Some(format!("Failed to export STL: {e}")),
+                        }
+                    }
                 }
                 
                 if let Some(ref error) = self.error_message {
