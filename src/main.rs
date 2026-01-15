@@ -796,14 +796,20 @@ impl eframe::App for VolumetricApp {
                                 if let Some(crate_name) = self.demo_choice.crate_name() {
                                     match demo_wasm_path(crate_name) {
                                         Some(path) => {
-                                            // Load WASM file and create a project from it
+                                            // Load WASM file and append it to the currently open project.
                                             match fs::read(&path) {
                                                 Ok(wasm_bytes) => {
                                                     let asset_id = path.file_stem()
                                                         .and_then(|s| s.to_str())
                                                         .unwrap_or("model")
                                                         .to_string();
-                                                    self.project = Some(Project::from_model_wasm(asset_id, wasm_bytes));
+                                                    if self.project.is_none() {
+                                                        self.project = Some(Project::new(vec![]));
+                                                    }
+                                                    if let Some(ref mut project) = self.project {
+                                                        project.insert_model_wasm(asset_id.as_str(), wasm_bytes);
+                                                    }
+                                                    // Mutating the project invalidates the persisted path association.
                                                     self.project_path = None;
                                                     self.run_project();
                                                 }
@@ -823,7 +829,7 @@ impl eframe::App for VolumetricApp {
                         });
 
                         ui.horizontal(|ui| {
-                            // Import a raw WASM file as a new project
+                            // Import a raw WASM file into the currently open project
                             if ui.button("Import WASM…").clicked() {
                                 if let Some(path) = rfd::FileDialog::new()
                                     .add_filter("WASM", &["wasm"])
@@ -836,7 +842,13 @@ impl eframe::App for VolumetricApp {
                                                 .and_then(|s| s.to_str())
                                                 .unwrap_or("model")
                                                 .to_string();
-                                            self.project = Some(Project::from_model_wasm(asset_id, wasm_bytes));
+                                            if self.project.is_none() {
+                                                self.project = Some(Project::new(vec![]));
+                                            }
+                                            if let Some(ref mut project) = self.project {
+                                                project.insert_model_wasm(asset_id.as_str(), wasm_bytes);
+                                            }
+                                            // Mutating the project invalidates the persisted path association.
                                             self.project_path = None;
                                             self.run_project();
                                             self.demo_choice = DemoChoice::None;
@@ -1192,31 +1204,12 @@ impl eframe::App for VolumetricApp {
                                 };
 
                                 if let Some(ref mut project) = self.project {
-                                    let insert_at = project
-                                        .entries()
-                                        .iter()
-                                        .position(|e| matches!(e, ProjectEntry::ExportAsset(_)))
-                                        .unwrap_or(project.entries().len());
-
-                                    let entries = project.entries_mut();
-                                    entries.insert(
-                                        insert_at,
-                                        ProjectEntry::LoadAsset(LoadAssetEntry::new(
-                                            op_asset_id.clone(),
-                                            Asset::OperationWASM(wasm_bytes),
-                                        )),
-                                    );
-                                    entries.insert(
-                                        insert_at + 1,
-                                        ProjectEntry::ExecuteWASM(ExecuteWasmEntry::new(
-                                            op_asset_id,
-                                            inputs,
-                                            outputs,
-                                        )),
-                                    );
-                                    entries.insert(
-                                        insert_at + 2,
-                                        ProjectEntry::ExportAsset(output_id),
+                                    project.insert_operation(
+                                        op_asset_id.as_str(),
+                                        wasm_bytes,
+                                        inputs,
+                                        outputs,
+                                        output_id,
                                     );
                                 }
 
@@ -1837,7 +1830,7 @@ fn main() -> Result<()> {
                 }
             }
             "wasm" => {
-                // Import WASM file as a new project
+                // Import WASM file into a new empty project
                 match fs::read(&path) {
                     Ok(wasm_bytes) => {
                         let asset_id = path.file_stem()
@@ -1845,7 +1838,9 @@ fn main() -> Result<()> {
                             .unwrap_or("model")
                             .to_string();
                         println!("Importing WASM model from: {}", path.display());
-                        Some(Project::from_model_wasm(asset_id, wasm_bytes))
+                        let mut project = Project::new(vec![]);
+                        project.insert_model_wasm(asset_id.as_str(), wasm_bytes);
+                        Some(project)
                     }
                     Err(e) => {
                         eprintln!("Failed to read WASM file: {}", e);
@@ -1859,14 +1854,13 @@ fn main() -> Result<()> {
             }
         }
     } else {
-        None
+        Some(Project::new(vec![]))
     };
     
     println!("Volumetric Model Renderer (eframe/egui)");
     println!("=======================================");
-    if initial_project.is_none() {
-        println!("No model provided on CLI; start by importing a WASM file or opening a project in the UI.");
-    }
+    // Note: the UI can still tolerate an explicit no-project state via the "Unload" button.
+    println!("Tip: import a WASM file or open a project in the UI to add models and operations.");
     println!();
     
     let options = eframe::NativeOptions {

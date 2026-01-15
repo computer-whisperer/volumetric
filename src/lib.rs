@@ -517,6 +517,122 @@ impl Project {
         }
     }
 
+    fn first_export_index(&self) -> usize {
+        self.entries
+            .iter()
+            .position(|e| matches!(e, ProjectEntry::ExportAsset(_)))
+            .unwrap_or(self.entries.len())
+    }
+
+    fn last_declaration_index_for_asset_id(&self, asset_id: &str) -> Option<usize> {
+        let mut last: Option<usize> = None;
+        for (idx, entry) in self.entries.iter().enumerate() {
+            match entry {
+                ProjectEntry::LoadAsset(a) => {
+                    if a.asset_id() == asset_id {
+                        last = Some(idx);
+                    }
+                }
+                ProjectEntry::ExecuteWASM(e) => {
+                    if e.outputs.iter().any(|o| o.asset_id == asset_id) {
+                        last = Some(idx);
+                    }
+                }
+                ProjectEntry::ExportAsset(_) => {}
+            }
+        }
+        last
+    }
+
+    fn unique_asset_id(&self, base: &str) -> String {
+        let declared: std::collections::HashSet<String> = self
+            .declared_assets()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+
+        if !declared.contains(base) {
+            return base.to_string();
+        }
+
+        for i in 2..=10_000 {
+            let candidate = format!("{base}_{i}");
+            if !declared.contains(&candidate) {
+                return candidate;
+            }
+        }
+
+        // Extremely unlikely; fall back to a timestamp-ish suffix.
+        format!("{base}_{}", declared.len() + 1)
+    }
+
+    /// Inserts a new `ModelWASM` into this project without replacing existing entries.
+    ///
+    /// The new `LoadAsset` entry will be inserted before the first `ExportAsset` entry (if any),
+    /// so that exports remain at the end of the timeline. A corresponding `ExportAsset` is also
+    /// inserted so the model will render.
+    ///
+    /// Returns the final asset id used (may differ from `asset_id_base` if it collided).
+    pub fn insert_model_wasm(&mut self, asset_id_base: &str, wasm_bytes: Vec<u8>) -> String {
+        let asset_id = self.unique_asset_id(asset_id_base);
+        let insert_at = self.first_export_index();
+        self.entries.insert(
+            insert_at,
+            ProjectEntry::LoadAsset(LoadAssetEntry::new(
+                asset_id.clone(),
+                Asset::ModelWASM(wasm_bytes),
+            )),
+        );
+        self.entries
+            .insert(insert_at + 1, ProjectEntry::ExportAsset(asset_id.clone()));
+        asset_id
+    }
+
+    /// Inserts a new operator into this project, placing it after all declared input dependencies.
+    ///
+    /// The operator's `LoadAsset` and `ExecuteWASM` entries are inserted together, followed by an
+    /// `ExportAsset` for the primary output.
+    pub fn insert_operation(
+        &mut self,
+        op_asset_id_base: &str,
+        wasm_bytes: Vec<u8>,
+        inputs: Vec<ExecuteWasmInput>,
+        outputs: Vec<ExecuteWasmOutput>,
+        export_asset_id: String,
+    ) {
+        let op_asset_id = self.unique_asset_id(op_asset_id_base);
+
+        let mut dep_after = 0usize;
+        for input in &inputs {
+            if let ExecuteWasmInput::AssetByID(id) = input {
+                if let Some(idx) = self.last_declaration_index_for_asset_id(id.as_str()) {
+                    dep_after = dep_after.max(idx + 1);
+                }
+            }
+        }
+
+        let first_export = self.first_export_index();
+        let insert_at = first_export.max(dep_after);
+
+        self.entries.insert(
+            insert_at,
+            ProjectEntry::LoadAsset(LoadAssetEntry::new(
+                op_asset_id.clone(),
+                Asset::OperationWASM(wasm_bytes),
+            )),
+        );
+        self.entries.insert(
+            insert_at + 1,
+            ProjectEntry::ExecuteWASM(ExecuteWasmEntry::new(
+                op_asset_id,
+                inputs,
+                outputs,
+            )),
+        );
+        self.entries
+            .insert(insert_at + 2, ProjectEntry::ExportAsset(export_asset_id));
+    }
+
     /// Returns the project entries
     pub fn entries(&self) -> &[ProjectEntry] {
         &self.entries
@@ -651,5 +767,55 @@ mod tests {
         assert!(assets
             .iter()
             .any(|(id, ty)| id == "model_b" && *ty == AssetType::ModelWASM));
+    }
+
+    #[test]
+    fn insert_model_wasm_appends_without_replacing_and_makes_ids_unique() {
+        let mut p = Project::new(vec![]);
+        let id1 = p.insert_model_wasm("model", vec![1, 2, 3]);
+        let id2 = p.insert_model_wasm("model", vec![4, 5, 6]);
+
+        assert_eq!(id1, "model");
+        assert_eq!(id2, "model_2");
+        assert!(p.entries().len() >= 4);
+
+        let declared: Vec<String> = p.declared_assets().into_iter().map(|(id, _)| id).collect();
+        assert!(declared.contains(&"model".to_string()));
+        assert!(declared.contains(&"model_2".to_string()));
+    }
+
+    #[test]
+    fn insert_operation_is_placed_after_input_dependencies() {
+        let mut p = Project::new(vec![]);
+        let a = p.insert_model_wasm("a", vec![1]);
+        let b = p.insert_model_wasm("b", vec![2]);
+
+        // Insert an operation that depends on `b`.
+        p.insert_operation(
+            "op_identity_operator",
+            vec![9, 9, 9],
+            vec![ExecuteWasmInput::AssetByID(b.clone())],
+            vec![ExecuteWasmOutput::new("out".to_string(), AssetType::ModelWASM)],
+            "out".to_string(),
+        );
+
+        let mut idx_load_b = None;
+        let mut idx_exec = None;
+        for (idx, e) in p.entries().iter().enumerate() {
+            match e {
+                ProjectEntry::LoadAsset(le) if le.asset_id() == b => idx_load_b = Some(idx),
+                ProjectEntry::ExecuteWASM(_) => idx_exec = Some(idx),
+                _ => {}
+            }
+        }
+
+        assert!(idx_load_b.is_some());
+        assert!(idx_exec.is_some());
+        assert!(idx_exec.unwrap() > idx_load_b.unwrap());
+
+        // Sanity: earlier model still present.
+        let declared: Vec<String> = p.declared_assets().into_iter().map(|(id, _)| id).collect();
+        assert!(declared.contains(&a));
+        assert!(declared.contains(&b));
     }
 }
