@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::sync::Arc;
-use wasmtime::{Caller, Instance, Store};
+use wasmtime::{Caller, Store};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExecutionError {
@@ -9,6 +9,12 @@ pub enum ExecutionError {
     NoSuchAssetId(String),
     #[error("Asset with id {0} is not of type {1}, but {2}")]
     WrongAssetType(String, AssetType, AssetType),
+    #[error("Invalid input index: {0}")]
+    InvalidInputIndex(usize),
+    #[error("Invalid output index: {0}")]
+    InvalidOutputIndex(usize),
+    #[error("Wasmtime error: {0}")]
+    Wasmtime(String),
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -33,10 +39,19 @@ pub enum Asset {
 }
 
 impl Asset {
+    /// Returns the type of this asset
     pub fn asset_type(&self) -> AssetType {
         match self {
             Asset::ModelWASM(_) => AssetType::ModelWASM,
             Asset::OperationWASM(_) => AssetType::OperationWASM,
+        }
+    }
+
+    /// Returns the raw WASM bytes
+    pub fn bytes(&self) -> &[u8] {
+        match self {
+            Asset::ModelWASM(bytes) => bytes,
+            Asset::OperationWASM(bytes) => bytes,
         }
     }
 }
@@ -66,73 +81,155 @@ pub struct ExecuteWasmEntry {
     outputs: Vec<ExecuteWasmOutput>
 }
 
+/// Runtime state for WASM execution, holding inputs and collecting outputs
+struct WasmExecutionState {
+    /// The input specifications
+    inputs: Vec<ExecuteWasmInput>,
+    /// Pre-fetched assets needed for inputs
+    input_assets: HashMap<String, LoadedAsset>,
+    /// Output specifications (asset_id, asset_type)
+    output_specs: Vec<ExecuteWasmOutput>,
+    /// Collected output data (index -> bytes)
+    output_data: HashMap<usize, Vec<u8>>,
+    /// Precursor asset IDs for tracking lineage
+    precursor_asset_ids: Vec<String>,
+}
+
 impl ExecuteWasmEntry {
     pub fn run(&self, environment: &mut Environment) -> Result<(), ExecutionError> {
-        let wasm_asset = environment.loaded_assets.get(&self.asset_id).ok_or(ExecutionError::NoSuchAssetId(self.asset_id.clone()))?;
+        let wasm_asset = environment.loaded_assets.get(&self.asset_id)
+            .ok_or(ExecutionError::NoSuchAssetId(self.asset_id.clone()))?;
 
         // Pre-fetch needed assets
-        let mut needed_assets = HashMap::new();
+        let mut input_assets = HashMap::new();
         let mut precursor_asset_ids = vec![];
         for input in &self.inputs {
-            match input {
-                ExecuteWasmInput::AssetByID(asset_id) => {
-                    needed_assets.insert(
-                        asset_id.clone(),
-                        environment.loaded_assets.get(asset_id).ok_or(ExecutionError::NoSuchAssetId(asset_id.clone()))?.clone()
-                    );
-                    precursor_asset_ids.push(asset_id.clone());
-                },
-                ExecuteWasmInput::String(_) => (),
+            if let ExecuteWasmInput::AssetByID(asset_id) = input {
+                input_assets.insert(
+                    asset_id.clone(),
+                    environment.loaded_assets.get(asset_id)
+                        .ok_or(ExecutionError::NoSuchAssetId(asset_id.clone()))?.clone()
+                );
+                precursor_asset_ids.push(asset_id.clone());
             }
         }
 
-        let wasm_bin = if let Asset::OperationWASM(wasm_bin) = wasm_asset.asset.as_ref() { wasm_bin } else { return Err(ExecutionError::NoSuchAssetId(self.asset_id.clone())) };
-        let engine = wasmtime::Engine::new(wasmtime::Config::new().debug_info(true)).unwrap();
-        let module = wasmtime::Module::new(&engine, &wasm_bin).unwrap();
+        let wasm_bin = match wasm_asset.asset.as_ref() {
+            Asset::OperationWASM(wasm_bin) => wasm_bin,
+            other => return Err(ExecutionError::WrongAssetType(
+                self.asset_id.clone(),
+                AssetType::OperationWASM,
+                other.asset_type(),
+            )),
+        };
+
+        let engine = wasmtime::Engine::new(wasmtime::Config::new().debug_info(true))
+            .map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
+        let module = wasmtime::Module::new(&engine, wasm_bin)
+            .map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
 
         let mut linker = wasmtime::Linker::new(&engine);
-        let mut store = Store::new(&engine, (&self.inputs, needed_assets, vec![]));
+        
+        let state = WasmExecutionState {
+            inputs: self.inputs.clone(),
+            input_assets,
+            output_specs: self.outputs.clone(),
+            output_data: HashMap::new(),
+            precursor_asset_ids: precursor_asset_ids.clone(),
+        };
+        let mut store = Store::new(&engine, state);
 
-
-        linker.func_wrap("host", "get_input_len", |caller: Caller<'_, (&Vec<ExecuteWasmInput>, HashMap<String, LoadedAsset>, Vec<()>)>, arg: i32|{
-            match caller.data().0.get(arg as usize) {
+        // Host function: get the length of an input
+        linker.func_wrap("host", "get_input_len", |caller: Caller<'_, WasmExecutionState>, arg: i32| -> u32 {
+            let idx = arg as usize;
+            match caller.data().inputs.get(idx) {
                 Some(ExecuteWasmInput::AssetByID(asset_id)) => {
-                    let asset = caller.data().1.get(asset_id).ok_or(ExecutionError::NoSuchAssetId(asset_id.clone()))?;
-                    match asset.asset.as_ref() {
-                        Asset::ModelWASM(wasm) => {
-                            wasm.len() as u32
+                    if let Some(asset) = caller.data().input_assets.get(asset_id) {
+                        match asset.asset.as_ref() {
+                            Asset::ModelWASM(wasm) => wasm.len() as u32,
+                            Asset::OperationWASM(wasm) => wasm.len() as u32,
                         }
-                        Asset::OperationWASM(wasm) => {
-                            wasm.len() as u32
-                        }
+                    } else {
+                        0
                     }
                 },
-                Some(ExecuteWasmInput::String(arg_str)) => arg_str.len() as u32,
-                None => panic!("Invalid argument index"),
+                Some(ExecuteWasmInput::String(s)) => s.len() as u32,
+                None => 0,
             }
-        }).unwrap();
+        }).map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
 
-        linker.func_wrap("host", "get_input_data", |caller: Caller<'_, (&Vec<ExecuteWasmInput>, HashMap<String, LoadedAsset>, Vec<()>)>, arg: i32, ptr: i32, len: i32|{
-            // Copy data from input into the indicated location
-            match caller.data().0.get(arg as usize) {
+        // Host function: copy input data into WASM memory
+        linker.func_wrap("host", "get_input_data", |mut caller: Caller<'_, WasmExecutionState>, arg: i32, ptr: i32, len: i32| {
+            let idx = arg as usize;
+            // First, copy the data we need to avoid borrow conflicts
+            let data: Option<Vec<u8>> = match caller.data().inputs.get(idx) {
                 Some(ExecuteWasmInput::AssetByID(asset_id)) => {
-                    todo!();
+                    caller.data().input_assets.get(asset_id).map(|asset| {
+                        match asset.asset.as_ref() {
+                            Asset::ModelWASM(wasm) => wasm.clone(),
+                            Asset::OperationWASM(wasm) => wasm.clone(),
+                        }
+                    })
                 },
-                Some(ExecuteWasmInput::String(arg_str)) => arg_str,
-                None => panic!("Invalid argument index"),
+                Some(ExecuteWasmInput::String(s)) => Some(s.as_bytes().to_vec()),
+                None => None,
             };
-            // TODO
-        }).unwrap();
 
-        linker.func_wrap("host", "post_output", |caller: Caller<'_, (&Vec<ExecuteWasmInput>, HashMap<String, LoadedAsset>, Vec<()>)>, arg: i32, ptr: i32, len: i32|{
-            // Copy from the indicated location into a new LoadedAsset
-            todo!();
-        }).unwrap();
+            if let Some(src_data) = data {
+                let copy_len = (len as usize).min(src_data.len());
+                if let Some(memory) = caller.get_export("memory").and_then(|e| e.into_memory()) {
+                    let mem_data = memory.data_mut(&mut caller);
+                    let dest_start = ptr as usize;
+                    let dest_end = dest_start + copy_len;
+                    if dest_end <= mem_data.len() {
+                        mem_data[dest_start..dest_end].copy_from_slice(&src_data[..copy_len]);
+                    }
+                }
+            }
+        }).map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
 
-        let instance = linker.instantiate(&mut store, &module).unwrap();
+        // Host function: post output data from WASM memory
+        linker.func_wrap("host", "post_output", |mut caller: Caller<'_, WasmExecutionState>, output_idx: i32, ptr: i32, len: i32| {
+            let idx = output_idx as usize;
+            if idx >= caller.data().output_specs.len() {
+                return;
+            }
 
-        let run_func = instance.get_typed_func::<(), ()>(&mut store, "run").unwrap();
-        run_func.call(&mut store, ()).unwrap();
+            if let Some(memory) = caller.get_export("memory").and_then(|e| e.into_memory()) {
+                let mem_data = memory.data(&caller);
+                let src_start = ptr as usize;
+                let src_end = src_start + len as usize;
+                if src_end <= mem_data.len() {
+                    let output_bytes = mem_data[src_start..src_end].to_vec();
+                    caller.data_mut().output_data.insert(idx, output_bytes);
+                }
+            }
+        }).map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
+
+        let instance = linker.instantiate(&mut store, &module)
+            .map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
+
+        let run_func = instance.get_typed_func::<(), ()>(&mut store, "run")
+            .map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
+        run_func.call(&mut store, ())
+            .map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
+
+        // Collect outputs and add them to the environment
+        let state = store.into_data();
+        for (idx, output_spec) in self.outputs.iter().enumerate() {
+            if let Some(output_bytes) = state.output_data.get(&idx) {
+                let asset = match output_spec.asset_type {
+                    AssetType::ModelWASM => Asset::ModelWASM(output_bytes.clone()),
+                    AssetType::OperationWASM => Asset::OperationWASM(output_bytes.clone()),
+                };
+                environment.loaded_assets.insert(output_spec.asset_id.clone(), LoadedAsset {
+                    asset_id: output_spec.asset_id.clone(),
+                    asset: Arc::new(asset),
+                    precursor_asset_ids: precursor_asset_ids.clone(),
+                });
+            }
+        }
+
         Ok(())
     }
 }
@@ -150,12 +247,13 @@ impl ProjectEntry {
             ProjectEntry::LoadAsset(entry) => {
                 environment.loaded_assets.insert(entry.asset_id.clone(), LoadedAsset {
                     asset_id: entry.asset_id.clone(),
-                    asset: entry.asset.clone(),
+                    asset: Arc::new(entry.asset.clone()),
                     precursor_asset_ids: vec![],
                 });
                 Ok(vec![])
             }
             ProjectEntry::ExecuteWASM(entry) => {
+                entry.run(environment)?;
                 Ok(vec![])
             }
             ProjectEntry::ExportAsset(asset_id) => {
@@ -177,16 +275,130 @@ pub struct LoadedAsset {
     precursor_asset_ids: Vec<String>,
 }
 
+impl LoadedAsset {
+    /// Returns the asset ID
+    pub fn asset_id(&self) -> &str {
+        &self.asset_id
+    }
+
+    /// Returns a reference to the asset
+    pub fn asset(&self) -> &Asset {
+        &self.asset
+    }
+
+    /// Returns the asset wrapped in Arc
+    pub fn asset_arc(&self) -> Arc<Asset> {
+        Arc::clone(&self.asset)
+    }
+
+    /// Returns the IDs of assets that were used to create this asset
+    pub fn precursor_asset_ids(&self) -> &[String] {
+        &self.precursor_asset_ids
+    }
+
+    /// Returns the raw WASM bytes if this is a ModelWASM asset
+    pub fn as_model_wasm(&self) -> Option<&[u8]> {
+        match self.asset.as_ref() {
+            Asset::ModelWASM(bytes) => Some(bytes),
+            _ => None,
+        }
+    }
+
+    /// Returns the raw WASM bytes if this is an OperationWASM asset
+    pub fn as_operation_wasm(&self) -> Option<&[u8]> {
+        match self.asset.as_ref() {
+            Asset::OperationWASM(bytes) => Some(bytes),
+            _ => None,
+        }
+    }
+}
+
 pub struct Environment {
     loaded_assets: HashMap<String, LoadedAsset>,
 }
 
+impl Environment {
+    /// Creates a new empty environment
+    pub fn new() -> Self {
+        Self {
+            loaded_assets: HashMap::new(),
+        }
+    }
+
+    /// Returns a reference to a loaded asset by ID
+    pub fn get_asset(&self, asset_id: &str) -> Option<&LoadedAsset> {
+        self.loaded_assets.get(asset_id)
+    }
+
+    /// Returns all loaded asset IDs
+    pub fn asset_ids(&self) -> impl Iterator<Item = &str> {
+        self.loaded_assets.keys().map(|s| s.as_str())
+    }
+}
+
+impl Default for Environment {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Project {
+    /// Creates a new project from a list of entries
+    pub fn new(entries: Vec<ProjectEntry>) -> Self {
+        Self { entries }
+    }
+
+    /// Creates a simple project that loads a ModelWASM and exports it
+    /// This is the standard way to import a raw WASM binary into the project system
+    pub fn from_model_wasm(asset_id: String, wasm_bytes: Vec<u8>) -> Self {
+        Self {
+            entries: vec![
+                ProjectEntry::LoadAsset(LoadAssetEntry {
+                    asset_id: asset_id.clone(),
+                    asset: Asset::ModelWASM(wasm_bytes),
+                }),
+                ProjectEntry::ExportAsset(asset_id),
+            ],
+        }
+    }
+
+    /// Returns the project entries
+    pub fn entries(&self) -> &[ProjectEntry] {
+        &self.entries
+    }
+
+    /// Runs the project, executing all entries in order
     pub fn run(&self, environment: &mut Environment) -> Result<Vec<LoadedAsset>, ExecutionError> {
         let mut exported_assets = vec![];
         for entry in &self.entries {
             exported_assets.extend(entry.run(environment)?);
         }
-        Ok(vec![])
+        Ok(exported_assets)
+    }
+
+    /// Serializes the project to CBOR format
+    pub fn to_cbor(&self) -> Result<Vec<u8>, std::io::Error> {
+        let mut bytes = Vec::new();
+        ciborium::into_writer(self, &mut bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        Ok(bytes)
+    }
+
+    /// Deserializes a project from CBOR format
+    pub fn from_cbor(bytes: &[u8]) -> Result<Self, std::io::Error> {
+        ciborium::from_reader(bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+    }
+
+    /// Saves the project to a file in CBOR format
+    pub fn save_to_file(&self, path: &std::path::Path) -> Result<(), std::io::Error> {
+        let bytes = self.to_cbor()?;
+        std::fs::write(path, bytes)
+    }
+
+    /// Loads a project from a CBOR file
+    pub fn load_from_file(path: &std::path::Path) -> Result<Self, std::io::Error> {
+        let bytes = std::fs::read(path)?;
+        Self::from_cbor(&bytes)
     }
 }

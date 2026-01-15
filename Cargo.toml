@@ -34,3 +34,6 @@ log = "0.4"
 # Native file dialog (runtime WASM selection)
 rfd = "0.14"
 thiserror = "1.0.69"
+
+# CBOR serialization for project files
+ciborium = "0.2"

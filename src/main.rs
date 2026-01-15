@@ -8,6 +8,10 @@ use wasmtime::*;
 mod point_cloud_wgpu;
 mod marching_cubes_wgpu;
 
+// Project system
+mod lib;
+use lib::{Project, Environment};
+
 /// Rendering mode selection
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RenderMode {
@@ -25,7 +29,12 @@ mod stl;
 
 /// Application state for the volumetric renderer
 struct VolumetricApp {
-    wasm_path: Option<PathBuf>,
+    /// The current project (contains the model pipeline)
+    project: Option<Project>,
+    /// Path to the current project file (for save operations)
+    project_path: Option<PathBuf>,
+    /// Cached model WASM bytes (extracted from running the project)
+    model_wasm: Option<Vec<u8>>,
     demo_choice: DemoChoice,
     resolution: usize,
     bounds_min: (f32, f32, f32),
@@ -104,15 +113,25 @@ fn demo_wasm_path(crate_name: &str) -> Option<PathBuf> {
 }
 
 impl VolumetricApp {
-    fn new(cc: &eframe::CreationContext<'_>, wasm_path: Option<PathBuf>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, initial_project: Option<Project>) -> Self {
         let wgpu_target_format = cc
             .wgpu_render_state
             .as_ref()
             .map(|rs| rs.target_format)
             .unwrap_or(wgpu::TextureFormat::Bgra8UnormSrgb);
 
+        // If we have an initial project, run it to extract the model WASM
+        let model_wasm = initial_project.as_ref().and_then(|proj| {
+            let mut env = Environment::new();
+            proj.run(&mut env).ok().and_then(|assets| {
+                assets.into_iter().find_map(|asset| asset.as_model_wasm().map(|b| b.to_vec()))
+            })
+        });
+
         Self {
-            wasm_path,
+            project: initial_project,
+            project_path: None,
+            model_wasm,
             demo_choice: DemoChoice::None,
             resolution: 20,
             bounds_min: (0.0, 0.0, 0.0),
@@ -131,8 +150,29 @@ impl VolumetricApp {
         }
     }
 
+    /// Runs the current project and extracts the model WASM bytes
+    fn run_project(&mut self) {
+        self.model_wasm = None;
+        if let Some(ref project) = self.project {
+            let mut env = Environment::new();
+            match project.run(&mut env) {
+                Ok(assets) => {
+                    // Find the first ModelWASM asset in the exports
+                    self.model_wasm = assets.into_iter()
+                        .find_map(|asset| asset.as_model_wasm().map(|b| b.to_vec()));
+                    if self.model_wasm.is_none() {
+                        self.error_message = Some("Project produced no ModelWASM output".to_string());
+                    }
+                }
+                Err(e) => {
+                    self.error_message = Some(format!("Failed to run project: {}", e));
+                }
+            }
+        }
+    }
+
     fn resample_model(&mut self) {
-        let Some(wasm_path) = self.wasm_path.as_deref() else {
+        let Some(ref wasm_bytes) = self.model_wasm else {
             self.bounds_min = (0.0, 0.0, 0.0);
             self.bounds_max = (0.0, 0.0, 0.0);
             self.points = Arc::new(Vec::new());
@@ -144,7 +184,7 @@ impl VolumetricApp {
 
         match self.render_mode {
             RenderMode::PointCloud => {
-                match sample_model(wasm_path, self.resolution) {
+                match sample_model_from_bytes(wasm_bytes, self.resolution) {
                     Ok((points, bounds_min, bounds_max)) => {
                         self.bounds_min = bounds_min;
                         self.bounds_max = bounds_max;
@@ -159,7 +199,7 @@ impl VolumetricApp {
                 }
             }
             RenderMode::MarchingCubes => {
-                match generate_marching_cubes_mesh(wasm_path, self.resolution) {
+                match generate_marching_cubes_mesh_from_bytes(wasm_bytes, self.resolution) {
                     Ok((triangles, bounds_min, bounds_max)) => {
                         self.bounds_min = bounds_min;
                         self.bounds_max = bounds_max;
@@ -254,11 +294,14 @@ impl eframe::App for VolumetricApp {
                 ui.heading("Volumetric Renderer");
                 ui.separator();
 
-                ui.label("WASM Model");
+                ui.label("Project");
                 ui.horizontal(|ui| {
-                    let label = match &self.wasm_path {
+                    let label = match &self.project_path {
                         Some(p) => p.display().to_string(),
-                        None => "(none loaded)".to_string(),
+                        None => match &self.project {
+                            Some(_) => "(unsaved project)".to_string(),
+                            None => "(none loaded)".to_string(),
+                        },
                     };
                     ui.label(label);
                 });
@@ -296,9 +339,23 @@ impl eframe::App for VolumetricApp {
                         if let Some(crate_name) = self.demo_choice.crate_name() {
                             match demo_wasm_path(crate_name) {
                                 Some(path) => {
-                                    self.wasm_path = Some(path);
-                                    self.error_message = None;
-                                    self.needs_resample = true;
+                                    // Load WASM file and create a project from it
+                                    match fs::read(&path) {
+                                        Ok(wasm_bytes) => {
+                                            let asset_id = path.file_stem()
+                                                .and_then(|s| s.to_str())
+                                                .unwrap_or("model")
+                                                .to_string();
+                                            self.project = Some(Project::from_model_wasm(asset_id, wasm_bytes));
+                                            self.project_path = None;
+                                            self.run_project();
+                                            self.error_message = None;
+                                            self.needs_resample = true;
+                                        }
+                                        Err(e) => {
+                                            self.error_message = Some(format!("Failed to read WASM file: {}", e));
+                                        }
+                                    }
                                 }
                                 None => {
                                     self.error_message = Some(format!(
@@ -311,27 +368,87 @@ impl eframe::App for VolumetricApp {
                 });
 
                 ui.horizontal(|ui| {
-                    if ui.button("Load WASM…").clicked() {
+                    // Import a raw WASM file as a new project
+                    if ui.button("Import WASM…").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("WASM", &["wasm"])
                             .pick_file()
                         {
-                            self.wasm_path = Some(path);
-                            self.demo_choice = DemoChoice::None;
-                            self.error_message = None;
-                            self.needs_resample = true;
+                            match fs::read(&path) {
+                                Ok(wasm_bytes) => {
+                                    let asset_id = path.file_stem()
+                                        .and_then(|s| s.to_str())
+                                        .unwrap_or("model")
+                                        .to_string();
+                                    self.project = Some(Project::from_model_wasm(asset_id, wasm_bytes));
+                                    self.project_path = None;
+                                    self.run_project();
+                                    self.demo_choice = DemoChoice::None;
+                                    self.error_message = None;
+                                    self.needs_resample = true;
+                                }
+                                Err(e) => {
+                                    self.error_message = Some(format!("Failed to read WASM file: {}", e));
+                                }
+                            }
                         }
                     }
 
-                    let can_unload = self.wasm_path.is_some();
+                    let can_unload = self.project.is_some();
                     if ui
                         .add_enabled(can_unload, egui::Button::new("Unload"))
                         .clicked()
                     {
-                        self.wasm_path = None;
+                        self.project = None;
+                        self.project_path = None;
+                        self.model_wasm = None;
                         self.demo_choice = DemoChoice::None;
                         self.error_message = None;
                         self.needs_resample = true;
+                    }
+                });
+
+                // Project file operations
+                ui.horizontal(|ui| {
+                    if ui.button("Open Project…").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Project", &["vproj"])
+                            .pick_file()
+                        {
+                            match Project::load_from_file(&path) {
+                                Ok(project) => {
+                                    self.project = Some(project);
+                                    self.project_path = Some(path);
+                                    self.run_project();
+                                    self.demo_choice = DemoChoice::None;
+                                    self.error_message = None;
+                                    self.needs_resample = true;
+                                }
+                                Err(e) => {
+                                    self.error_message = Some(format!("Failed to load project: {}", e));
+                                }
+                            }
+                        }
+                    }
+
+                    let can_save = self.project.is_some();
+                    if ui.add_enabled(can_save, egui::Button::new("Save Project…")).clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Project", &["vproj"])
+                            .save_file()
+                        {
+                            if let Some(ref project) = self.project {
+                                match project.save_to_file(&path) {
+                                    Ok(()) => {
+                                        self.project_path = Some(path);
+                                        self.error_message = None;
+                                    }
+                                    Err(e) => {
+                                        self.error_message = Some(format!("Failed to save project: {}", e));
+                                    }
+                                }
+                            }
+                        }
                     }
                 });
 
@@ -350,8 +467,8 @@ impl eframe::App for VolumetricApp {
                 
                 ui.separator();
                 ui.label("Model Info");
-                if self.wasm_path.is_none() {
-                    ui.weak("No model loaded. Click 'Load WASM…' to select a .wasm volumetric model.");
+                if self.model_wasm.is_none() {
+                    ui.weak("No model loaded. Import a WASM file or open a project.");
                 }
                 match self.render_mode {
                     RenderMode::PointCloud => {
@@ -638,6 +755,94 @@ fn generate_marching_cubes_mesh(wasm_path: &Path, resolution: usize) -> Result<(
     Ok((triangles, bounds_min, bounds_max))
 }
 
+/// Sample points from WASM bytes (in-memory model)
+fn sample_model_from_bytes(wasm_bytes: &[u8], resolution: usize) -> Result<(Vec<(f32, f32, f32)>, (f32, f32, f32), (f32, f32, f32))> {
+    let engine = Engine::default();
+    let module = Module::new(&engine, wasm_bytes)
+        .context("Failed to load WASM module from bytes")?;
+
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[])
+        .context("Failed to instantiate WASM module")?;
+    
+    let is_inside = instance
+        .get_typed_func::<(f32, f32, f32), i32>(&mut store, "is_inside")
+        .context("Failed to get 'is_inside' function")?;
+    
+    let get_bounds_min_x = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_min_x")?;
+    let get_bounds_min_y = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_min_y")?;
+    let get_bounds_min_z = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_min_z")?;
+    let get_bounds_max_x = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_max_x")?;
+    let get_bounds_max_y = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_max_y")?;
+    let get_bounds_max_z = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_max_z")?;
+    
+    let min_x = get_bounds_min_x.call(&mut store, ())?;
+    let min_y = get_bounds_min_y.call(&mut store, ())?;
+    let min_z = get_bounds_min_z.call(&mut store, ())?;
+    let max_x = get_bounds_max_x.call(&mut store, ())?;
+    let max_y = get_bounds_max_y.call(&mut store, ())?;
+    let max_z = get_bounds_max_z.call(&mut store, ())?;
+    
+    let bounds_min = (min_x, min_y, min_z);
+    let bounds_max = (max_x, max_y, max_z);
+    
+    let mut points = Vec::new();
+    
+    for z_idx in 0..resolution {
+        let z = min_z + (max_z - min_z) * (z_idx as f32 / (resolution - 1) as f32);
+        for y_idx in 0..resolution {
+            let y = min_y + (max_y - min_y) * (y_idx as f32 / (resolution - 1) as f32);
+            for x_idx in 0..resolution {
+                let x = min_x + (max_x - min_x) * (x_idx as f32 / (resolution - 1) as f32);
+                let inside = is_inside.call(&mut store, (x, y, z))?;
+                if inside != 0 {
+                    points.push((x, y, z));
+                }
+            }
+        }
+    }
+    
+    Ok((points, bounds_min, bounds_max))
+}
+
+/// Generate a mesh using marching cubes algorithm from WASM bytes (in-memory model)
+fn generate_marching_cubes_mesh_from_bytes(wasm_bytes: &[u8], resolution: usize) -> Result<(Vec<Triangle>, (f32, f32, f32), (f32, f32, f32))> {
+    let engine = Engine::default();
+    let module = Module::new(&engine, wasm_bytes)
+        .context("Failed to load WASM module from bytes")?;
+    
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[])
+        .context("Failed to instantiate WASM module")?;
+    
+    let is_inside = instance
+        .get_typed_func::<(f32, f32, f32), i32>(&mut store, "is_inside")
+        .context("Failed to get 'is_inside' function")?;
+    
+    let get_bounds_min_x = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_min_x")?;
+    let get_bounds_min_y = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_min_y")?;
+    let get_bounds_min_z = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_min_z")?;
+    let get_bounds_max_x = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_max_x")?;
+    let get_bounds_max_y = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_max_y")?;
+    let get_bounds_max_z = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_max_z")?;
+    
+    let min_x = get_bounds_min_x.call(&mut store, ())?;
+    let min_y = get_bounds_min_y.call(&mut store, ())?;
+    let min_z = get_bounds_min_z.call(&mut store, ())?;
+    let max_x = get_bounds_max_x.call(&mut store, ())?;
+    let max_y = get_bounds_max_y.call(&mut store, ())?;
+    let max_z = get_bounds_max_z.call(&mut store, ())?;
+    
+    let bounds_min = (min_x, min_y, min_z);
+    let bounds_max = (max_x, max_y, max_z);
+
+    let triangles = marching_cubes_cpu::marching_cubes_mesh(bounds_min, bounds_max, resolution, |p| {
+        Ok(is_inside.call(&mut store, p)? != 0)
+    })?;
+
+    Ok((triangles, bounds_min, bounds_max))
+}
+
 fn triangles_to_mesh_vertices(triangles: &[Triangle]) -> Vec<marching_cubes_wgpu::MeshVertex> {
     let mut out = Vec::with_capacity(triangles.len() * 3);
 
@@ -690,17 +895,55 @@ fn main() -> Result<()> {
     
     let args: Vec<String> = std::env::args().collect();
     
-    let wasm_path = if args.len() > 1 {
-        Some(PathBuf::from(&args[1]))
+    // Load initial project from CLI argument (can be .wasm or .vproj)
+    let initial_project = if args.len() > 1 {
+        let path = PathBuf::from(&args[1]);
+        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+        
+        match ext {
+            "vproj" => {
+                // Load project file
+                match Project::load_from_file(&path) {
+                    Ok(project) => {
+                        println!("Loaded project from: {}", path.display());
+                        Some(project)
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to load project: {}", e);
+                        None
+                    }
+                }
+            }
+            "wasm" => {
+                // Import WASM file as a new project
+                match fs::read(&path) {
+                    Ok(wasm_bytes) => {
+                        let asset_id = path.file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("model")
+                            .to_string();
+                        println!("Importing WASM model from: {}", path.display());
+                        Some(Project::from_model_wasm(asset_id, wasm_bytes))
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to read WASM file: {}", e);
+                        None
+                    }
+                }
+            }
+            _ => {
+                eprintln!("Unknown file type: {}. Expected .wasm or .vproj", path.display());
+                None
+            }
+        }
     } else {
         None
     };
     
     println!("Volumetric Model Renderer (eframe/egui)");
     println!("=======================================");
-    match &wasm_path {
-        Some(p) => println!("Loading WASM model from: {}", p.display()),
-        None => println!("No WASM model provided on CLI; start by clicking 'Load WASM…' in the UI."),
+    if initial_project.is_none() {
+        println!("No model provided on CLI; start by importing a WASM file or opening a project in the UI.");
     }
     println!();
     
@@ -716,7 +959,7 @@ fn main() -> Result<()> {
     eframe::run_native(
         "Volumetric Renderer",
         options,
-        Box::new(|cc| Ok(Box::new(VolumetricApp::new(cc, wasm_path.clone())))),
+        Box::new(|cc| Ok(Box::new(VolumetricApp::new(cc, initial_project)))),
     ).map_err(|e| anyhow::anyhow!("Failed to run eframe: {}", e))?;
     
     Ok(())
