@@ -1,4 +1,3 @@
-//! Demo model: Rounded box centered at origin.
 //!
 //! Uses a standard signed-distance formula and treats SDF <= 0 as inside.
 

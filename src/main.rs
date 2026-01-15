@@ -36,6 +36,7 @@ enum ConfigFieldType {
     Int,
     Float,
     Text,
+    Enum(Vec<String>),
 }
 
 #[derive(Clone, Debug)]
@@ -49,6 +50,7 @@ enum ConfigValue {
 fn parse_cddl_record_schema(cddl: &str) -> Result<Vec<(String, ConfigFieldType)>> {
     // v0 subset: a single CDDL record/map like: `{ dx: float, dy: float, dz: float }`
     // Supported leaf types: `bool`, `int`, `float`, `tstr`
+    // Plus a small enum subset: `"a" / "b" / "c"` (tstr unions).
     let mut s = cddl.trim();
     if s.starts_with('{') {
         s = s.strip_prefix('{').unwrap().trim();
@@ -78,9 +80,30 @@ fn parse_cddl_record_schema(cddl: &str) -> Result<Vec<(String, ConfigFieldType)>
             "int" => ConfigFieldType::Int,
             "float" => ConfigFieldType::Float,
             "tstr" => ConfigFieldType::Text,
+            other if other.contains('"') && other.contains('/') => {
+                // Very small subset for string enums:
+                //   op: "union" / "subtract" / "intersect"
+                // Also tolerates surrounding parentheses.
+                let trimmed = other.trim().trim_start_matches('(').trim_end_matches(')').trim();
+                let mut options = Vec::new();
+                for opt in trimmed.split('/') {
+                    let opt = opt.trim();
+                    if let Some(stripped) = opt.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+                        if !stripped.is_empty() {
+                            options.push(stripped.to_string());
+                        }
+                    }
+                }
+                if options.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "Unsupported enum CDDL type `{other}` (expected something like `\"a\" / \"b\"`)"
+                    ));
+                }
+                ConfigFieldType::Enum(options)
+            }
             other => {
                 return Err(anyhow::anyhow!(
-                    "Unsupported CDDL type `{other}` (supported: bool, int, float, tstr)"
+                    "Unsupported CDDL type `{other}` (supported: bool, int, float, tstr, and string enums like `\"a\" / \"b\"`)"
                 ));
             }
         };
@@ -104,11 +127,15 @@ fn encode_config_map_to_cbor(fields: &[(String, ConfigFieldType)], values: &Hash
             (ConfigFieldType::Int, Some(ConfigValue::Int(i))) => CborValue::Integer((*i).into()),
             (ConfigFieldType::Float, Some(ConfigValue::Float(f))) => CborValue::Float(*f),
             (ConfigFieldType::Text, Some(ConfigValue::Text(t))) => CborValue::Text(t.clone()),
+            (ConfigFieldType::Enum(_), Some(ConfigValue::Text(t))) => CborValue::Text(t.clone()),
             // If unset or mismatched, use a sensible default for now.
             (ConfigFieldType::Bool, _) => CborValue::Bool(false),
             (ConfigFieldType::Int, _) => CborValue::Integer(0.into()),
             (ConfigFieldType::Float, _) => CborValue::Float(0.0),
             (ConfigFieldType::Text, _) => CborValue::Text(String::new()),
+            (ConfigFieldType::Enum(options), _) => {
+                CborValue::Text(options.first().cloned().unwrap_or_default())
+            }
         };
 
         map_entries.push((CborValue::Text(name.clone()), cbor_value));
@@ -232,6 +259,7 @@ struct VolumetricApp {
     demo_choice: DemoChoice,
     operation_choice: OperationChoice,
     operation_input_asset_id: Option<String>,
+    operation_input_asset_id_b: Option<String>,
     operation_output_asset_id: String,
     operation_config_last_cddl: Option<String>,
     operation_config_values: HashMap<String, ConfigValue>,
@@ -258,6 +286,7 @@ struct CachedOperatorMetadata {
 enum OperationChoice {
     Identity,
     Translate,
+    Boolean,
 }
 
 impl OperationChoice {
@@ -265,6 +294,7 @@ impl OperationChoice {
         match self {
             OperationChoice::Identity => "Identity (WASM passthrough)",
             OperationChoice::Translate => "Translate (+1 X)",
+            OperationChoice::Boolean => "Boolean (union/subtract/intersect)",
         }
     }
 
@@ -272,6 +302,7 @@ impl OperationChoice {
         match self {
             OperationChoice::Identity => "identity_operator",
             OperationChoice::Translate => "translate_operator",
+            OperationChoice::Boolean => "boolean_operator",
         }
     }
 }
@@ -370,6 +401,7 @@ impl VolumetricApp {
             demo_choice: DemoChoice::None,
             operation_choice: OperationChoice::Identity,
             operation_input_asset_id: None,
+            operation_input_asset_id_b: None,
             operation_output_asset_id: "identity_out".to_string(),
             operation_config_last_cddl: None,
             operation_config_values: HashMap::new(),
@@ -839,6 +871,18 @@ impl eframe::App for VolumetricApp {
                     self.operation_input_asset_id = input_asset_ids.first().cloned();
                 }
 
+                let needs_default_input_b = match self.operation_input_asset_id_b.as_deref() {
+                    Some(id) => !input_asset_ids.iter().any(|x| x == id),
+                    None => true,
+                };
+                if needs_default_input_b {
+                    // Default B to the second asset if possible, else fall back to A.
+                    self.operation_input_asset_id_b = input_asset_ids
+                        .get(1)
+                        .cloned()
+                        .or_else(|| self.operation_input_asset_id.clone());
+                }
+
                 ui.horizontal(|ui| {
                     ui.label("Operation:");
                     egui::ComboBox::from_id_salt("operation_choice")
@@ -854,6 +898,11 @@ impl eframe::App for VolumetricApp {
                                 OperationChoice::Translate,
                                 OperationChoice::Translate.label(),
                             );
+                            ui.selectable_value(
+                                &mut self.operation_choice,
+                                OperationChoice::Boolean,
+                                OperationChoice::Boolean.label(),
+                            );
                         });
                 });
 
@@ -862,7 +911,7 @@ impl eframe::App for VolumetricApp {
                 let crate_name = self.operation_choice.crate_name();
                 let operator_metadata = self.operator_metadata_cached(crate_name);
 
-                if let Some(metadata) = operator_metadata {
+                if let Some(ref metadata) = operator_metadata {
                     for (input_idx, input) in metadata.inputs.iter().enumerate() {
                         if let OperatorMetadataInput::CBORConfiguration(cddl) = input {
                             let cddl_trimmed = cddl.trim().to_string();
@@ -916,6 +965,24 @@ impl eframe::App for VolumetricApp {
                                                         ui.text_edit_singleline(t);
                                                     }
                                                 }
+                                                ConfigFieldType::Enum(options) => {
+                                                    let entry = self
+                                                        .operation_config_values
+                                                        .entry(field_name.clone())
+                                                        .or_insert_with(|| {
+                                                            ConfigValue::Text(options.first().cloned().unwrap_or_default())
+                                                        });
+
+                                                    if let ConfigValue::Text(selected) = entry {
+                                                        egui::ComboBox::from_id_salt(format!("cfg_enum_{field_name}"))
+                                                            .selected_text(selected.as_str())
+                                                            .show_ui(ui, |ui| {
+                                                                for opt in options {
+                                                                    ui.selectable_value(selected, opt.clone(), opt);
+                                                                }
+                                                            });
+                                                    }
+                                                }
                                             }
                                         });
                                     }
@@ -938,13 +1005,25 @@ impl eframe::App for VolumetricApp {
                     ui.separator();
                 }
 
+                // Render input pickers. If the operator expects 2+ model inputs, show A/B.
+                let model_input_count = operator_metadata
+                    .as_ref()
+                    .map(|m| {
+                        m.inputs
+                            .iter()
+                            .filter(|i| matches!(i, OperatorMetadataInput::ModelWASM))
+                            .count()
+                    })
+                    .unwrap_or(1);
+
                 ui.horizontal(|ui| {
-                    ui.label("Input asset:");
-                    let selected = self
-                        .operation_input_asset_id
-                        .as_deref()
-                        .unwrap_or("(none)");
-                    egui::ComboBox::from_id_salt("operation_input_asset")
+                    ui.label(if model_input_count >= 2 {
+                        "Input asset A:"
+                    } else {
+                        "Input asset:"
+                    });
+                    let selected = self.operation_input_asset_id.as_deref().unwrap_or("(none)");
+                    egui::ComboBox::from_id_salt("operation_input_asset_a")
                         .selected_text(selected)
                         .show_ui(ui, |ui| {
                             for id in &input_asset_ids {
@@ -957,13 +1036,36 @@ impl eframe::App for VolumetricApp {
                         });
                 });
 
+                if model_input_count >= 2 {
+                    ui.horizontal(|ui| {
+                        ui.label("Input asset B:");
+                        let selected = self.operation_input_asset_id_b.as_deref().unwrap_or("(none)");
+                        egui::ComboBox::from_id_salt("operation_input_asset_b")
+                            .selected_text(selected)
+                            .show_ui(ui, |ui| {
+                                for id in &input_asset_ids {
+                                    ui.selectable_value(
+                                        &mut self.operation_input_asset_id_b,
+                                        Some(id.clone()),
+                                        id,
+                                    );
+                                }
+                            });
+                    });
+                }
+
                 ui.horizontal(|ui| {
                     ui.label("Output asset id:");
                     ui.text_edit_singleline(&mut self.operation_output_asset_id);
                 });
 
+                let has_required_inputs = if model_input_count >= 2 {
+                    self.operation_input_asset_id.is_some() && self.operation_input_asset_id_b.is_some()
+                } else {
+                    self.operation_input_asset_id.is_some()
+                };
                 let can_add_op = self.project.is_some()
-                    && self.operation_input_asset_id.is_some()
+                    && has_required_inputs
                     && !self.operation_output_asset_id.trim().is_empty();
                 if ui
                     .add_enabled(can_add_op, egui::Button::new("Add New Operation"))
@@ -973,23 +1075,26 @@ impl eframe::App for VolumetricApp {
                     match operation_wasm_path(crate_name) {
                         Some(path) => match fs::read(&path) {
                             Ok(wasm_bytes) => {
-                                let input_id = self.operation_input_asset_id.clone().unwrap();
+                                let input_id_a = self.operation_input_asset_id.clone().unwrap();
+                                let input_id_b = self
+                                    .operation_input_asset_id_b
+                                    .clone()
+                                    .unwrap_or_else(|| input_id_a.clone());
                                 let output_id = self.operation_output_asset_id.trim().to_string();
                                 let op_asset_id = format!("op_{crate_name}");
 
                                 let (inputs, outputs) = match self.operator_metadata_cached(crate_name) {
                                     Some(metadata) => {
-                                        // Current UI only allows selecting a single input asset id.
                                         // Use operator metadata to decide how many inputs/outputs to declare.
                                         let mut inputs = Vec::with_capacity(metadata.inputs.len());
-                                        for (idx, input) in metadata.inputs.iter().enumerate() {
+                                        let mut model_inputs_iter = [input_id_a.clone(), input_id_b.clone()].into_iter();
+                                        for (_idx, input) in metadata.inputs.iter().enumerate() {
                                             match input {
                                                 OperatorMetadataInput::ModelWASM => {
-                                                    if idx == 0 {
-                                                        inputs.push(ExecuteWasmInput::AssetByID(input_id.clone()));
-                                                    } else {
-                                                        inputs.push(ExecuteWasmInput::AssetByID(input_id.clone()));
-                                                    }
+                                                    let id = model_inputs_iter
+                                                        .next()
+                                                        .unwrap_or_else(|| input_id_a.clone());
+                                                    inputs.push(ExecuteWasmInput::AssetByID(id));
                                                 }
                                                 OperatorMetadataInput::CBORConfiguration(cddl) => {
                                                     let fields = parse_cddl_record_schema(cddl.as_str()).unwrap_or_default();
@@ -1016,7 +1121,7 @@ impl eframe::App for VolumetricApp {
                                         (inputs, outputs)
                                     }
                                     None => (
-                                        vec![ExecuteWasmInput::AssetByID(input_id.clone())],
+                                        vec![ExecuteWasmInput::AssetByID(input_id_a.clone())],
                                         vec![ExecuteWasmOutput::new(output_id.clone(), AssetType::ModelWASM)],
                                     ),
                                 };

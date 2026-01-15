@@ -1,6 +1,21 @@
+#![no_std]
+
 //! Demo model: Torus (ring) centered at origin.
 //!
 //! Exports `is_inside(x,y,z) -> i32` and bounding-box getter functions.
+
+use core::panic::PanicInfo;
+
+#[panic_handler]
+fn panic(_info: &PanicInfo) -> ! {
+    #[cfg(target_arch = "wasm32")]
+    unsafe {
+        core::arch::wasm32::unreachable();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    loop {}
+}
 
 #[inline]
 fn inside_torus(x: f32, y: f32, z: f32) -> bool {
@@ -8,7 +23,7 @@ fn inside_torus(x: f32, y: f32, z: f32) -> bool {
     // R: major radius, r: minor radius
     let r_major = 1.0;
     let r_minor = 0.35;
-    let q = (x * x + z * z).sqrt() - r_major;
+    let q = libm::sqrtf(x * x + z * z) - r_major;
     q * q + y * y <= r_minor * r_minor
 }
 

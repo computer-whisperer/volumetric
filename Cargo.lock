@@ -454,6 +454,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "boolean_operator"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "serde",
+ "wasm-encoder 0.219.2",
+ "wasmparser 0.219.2",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1636,6 +1646,9 @@ dependencies = [
 [[package]]
 name = "gyroid_lattice_model"
 version = "0.1.0"
+dependencies = [
+ "libm",
+]
 
 [[package]]
 name = "half"
@@ -2098,6 +2111,9 @@ dependencies = [
 [[package]]
 name = "mandelbulb_model"
 version = "0.1.0"
+dependencies = [
+ "libm",
+]
 
 [[package]]
 name = "memchr"
@@ -3058,6 +3074,9 @@ dependencies = [
 [[package]]
 name = "rounded_box_model"
 version = "0.1.0"
+dependencies = [
+ "libm",
+]
 
 [[package]]
 name = "rustc-demangle"
@@ -3254,6 +3273,9 @@ version = "0.1.0"
 [[package]]
 name = "simple_torus_model"
 version = "0.1.0"
+dependencies = [
+ "libm",
+]
 
 [[package]]
 name = "slab"

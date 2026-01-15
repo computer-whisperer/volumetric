@@ -1,12 +1,27 @@
+#![no_std]
+
 //! Demo model: Mandelbulb fractal (3D Mandelbrot-like set).
 //!
 //! We treat a point `c` as inside if the iterative sequence
 //!   z_{n+1} = z_n^p + c,  z_0 = 0
 //! does not escape past a bailout radius within a fixed iteration count.
 
+use core::panic::PanicInfo;
+
+#[panic_handler]
+fn panic(_info: &PanicInfo) -> ! {
+    #[cfg(target_arch = "wasm32")]
+    unsafe {
+        core::arch::wasm32::unreachable();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    loop {}
+}
+
 #[inline]
 fn length3(x: f32, y: f32, z: f32) -> f32 {
-    (x * x + y * y + z * z).sqrt()
+    libm::sqrtf(x * x + y * y + z * z)
 }
 
 #[inline]
@@ -31,17 +46,17 @@ fn mandelbulb_inside(cx: f32, cy: f32, cz: f32) -> bool {
             continue;
         }
 
-        let theta = (z / r).clamp(-1.0, 1.0).acos();
-        let phi = y.atan2(x);
+        let theta = libm::acosf((z / r).clamp(-1.0, 1.0));
+        let phi = libm::atan2f(y, x);
 
-        let rp = r.powf(power);
+        let rp = libm::powf(r, power);
         let thetap = theta * power;
         let phip = phi * power;
 
-        let sin_t = thetap.sin();
-        let nx = rp * sin_t * phip.cos();
-        let ny = rp * sin_t * phip.sin();
-        let nz = rp * thetap.cos();
+        let sin_t = libm::sinf(thetap);
+        let nx = rp * sin_t * libm::cosf(phip);
+        let ny = rp * sin_t * libm::sinf(phip);
+        let nz = rp * libm::cosf(thetap);
 
         x = nx + cx;
         y = ny + cy;

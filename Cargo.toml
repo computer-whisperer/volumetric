@@ -12,6 +12,7 @@ members = [
     "crates/mandelbulb_model",
     "crates/identity_operator",
     "crates/translate_operator",
+    "crates/boolean_operator",
 ]
 
 [dependencies]

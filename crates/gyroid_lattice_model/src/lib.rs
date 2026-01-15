@@ -1,12 +1,27 @@
+#![no_std]
+
 //! Demo model: Gyroid lattice (finite chunk).
 //!
 //! The gyroid is an implicit surface:
 //!   g(x,y,z) = sin(x)*cos(y) + sin(y)*cos(z) + sin(z)*cos(x)
 //! We create a "thickened" shell by taking |g| < thickness inside a bounded box.
 
+use core::panic::PanicInfo;
+
+#[panic_handler]
+fn panic(_info: &PanicInfo) -> ! {
+    #[cfg(target_arch = "wasm32")]
+    unsafe {
+        core::arch::wasm32::unreachable();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    loop {}
+}
+
 #[inline]
 fn gyroid(x: f32, y: f32, z: f32) -> f32 {
-    x.sin() * y.cos() + y.sin() * z.cos() + z.sin() * x.cos()
+    libm::sinf(x) * libm::cosf(y) + libm::sinf(y) * libm::cosf(z) + libm::sinf(z) * libm::cosf(x)
 }
 
 #[inline]
