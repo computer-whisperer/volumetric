@@ -11,6 +11,7 @@ members = [
     "crates/gyroid_lattice_model",
     "crates/mandelbulb_model",
     "crates/identity_operator",
+    "crates/translate_operator",
 ]
 
 [dependencies]

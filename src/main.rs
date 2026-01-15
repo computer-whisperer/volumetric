@@ -90,18 +90,21 @@ struct VolumetricApp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OperationChoice {
     Identity,
+    Translate,
 }
 
 impl OperationChoice {
     fn label(self) -> &'static str {
         match self {
             OperationChoice::Identity => "Identity (WASM passthrough)",
+            OperationChoice::Translate => "Translate (+1 X)",
         }
     }
 
     fn crate_name(self) -> &'static str {
         match self {
             OperationChoice::Identity => "identity_operator",
+            OperationChoice::Translate => "translate_operator",
         }
     }
 }
@@ -635,6 +638,11 @@ impl eframe::App for VolumetricApp {
                                 &mut self.operation_choice,
                                 OperationChoice::Identity,
                                 OperationChoice::Identity.label(),
+                            );
+                            ui.selectable_value(
+                                &mut self.operation_choice,
+                                OperationChoice::Translate,
+                                OperationChoice::Translate.label(),
                             );
                         });
                 });

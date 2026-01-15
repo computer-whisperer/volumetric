@@ -1,0 +1,10 @@
+[package]
+name = "translate_operator"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+walrus = "0.23"
