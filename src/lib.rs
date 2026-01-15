@@ -62,16 +62,54 @@ pub struct LoadAssetEntry {
     asset: Asset,
 }
 
+impl LoadAssetEntry {
+    pub fn new(asset_id: String, asset: Asset) -> Self {
+        Self { asset_id, asset }
+    }
+
+    /// Returns the asset ID
+    pub fn asset_id(&self) -> &str {
+        &self.asset_id
+    }
+
+    /// Returns the asset type
+    pub fn asset_type(&self) -> AssetType {
+        self.asset.asset_type()
+    }
+}
+
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub enum ExecuteWasmInput {
     AssetByID(String),
     String(String),
 }
 
+impl ExecuteWasmInput {
+    /// Returns a display-friendly description of this input
+    pub fn display(&self) -> String {
+        match self {
+            ExecuteWasmInput::AssetByID(id) => format!("Asset: {}", id),
+            ExecuteWasmInput::String(s) => {
+                if s.len() > 20 {
+                    format!("\"{}...\"", &s[..17])
+                } else {
+                    format!("\"{}\"", s)
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-struct ExecuteWasmOutput {
-    asset_id: String,
-    asset_type: AssetType,
+pub struct ExecuteWasmOutput {
+    pub asset_id: String,
+    pub asset_type: AssetType,
+}
+
+impl ExecuteWasmOutput {
+    pub fn new(asset_id: String, asset_type: AssetType) -> Self {
+        Self { asset_id, asset_type }
+    }
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -79,6 +117,27 @@ pub struct ExecuteWasmEntry {
     asset_id: String,
     inputs: Vec<ExecuteWasmInput>,
     outputs: Vec<ExecuteWasmOutput>
+}
+
+impl ExecuteWasmEntry {
+    pub fn new(asset_id: String, inputs: Vec<ExecuteWasmInput>, outputs: Vec<ExecuteWasmOutput>) -> Self {
+        Self { asset_id, inputs, outputs }
+    }
+
+    /// Returns the asset ID of the WASM operation to execute
+    pub fn asset_id(&self) -> &str {
+        &self.asset_id
+    }
+
+    /// Returns the inputs for this operation
+    pub fn inputs(&self) -> &[ExecuteWasmInput] {
+        &self.inputs
+    }
+
+    /// Returns the number of outputs this operation produces
+    pub fn output_count(&self) -> usize {
+        self.outputs.len()
+    }
 }
 
 /// Runtime state for WASM execution, holding inputs and collecting outputs
@@ -365,6 +424,13 @@ impl Project {
     /// Returns the project entries
     pub fn entries(&self) -> &[ProjectEntry] {
         &self.entries
+    }
+
+    /// Returns a mutable reference to the project entries.
+    ///
+    /// This is primarily intended for UI code to insert new operations into an existing project.
+    pub fn entries_mut(&mut self) -> &mut Vec<ProjectEntry> {
+        &mut self.entries
     }
 
     /// Runs the project, executing all entries in order

@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use eframe::egui;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -10,13 +11,35 @@ mod marching_cubes_wgpu;
 
 // Project system
 mod lib;
-use lib::{Project, Environment};
+use lib::{
+    Asset,
+    AssetType,
+    Environment,
+    ExecuteWasmEntry,
+    ExecuteWasmInput,
+    ExecuteWasmOutput,
+    LoadAssetEntry,
+    LoadedAsset,
+    Project,
+    ProjectEntry,
+};
 
-/// Rendering mode selection
+/// Rendering mode selection for an exported asset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RenderMode {
+enum ExportRenderMode {
+    None,
     PointCloud,
     MarchingCubes,
+}
+
+impl ExportRenderMode {
+    fn label(self) -> &'static str {
+        match self {
+            ExportRenderMode::None => "None",
+            ExportRenderMode::PointCloud => "Point Cloud",
+            ExportRenderMode::MarchingCubes => "Marching Cubes",
+        }
+    }
 }
 
 /// A triangle in 3D space
@@ -35,7 +58,18 @@ struct VolumetricApp {
     project_path: Option<PathBuf>,
     /// Cached model WASM bytes (extracted from running the project)
     model_wasm: Option<Vec<u8>>,
+    /// Exported assets from the last project run (used for UX/testing)
+    exported_assets: Vec<LoadedAsset>,
+    /// Per-export rendering selection (keyed by exported asset id)
+    export_render_modes: HashMap<String, ExportRenderMode>,
+    /// The exported asset currently used for rendering (if any)
+    active_render_asset_id: Option<String>,
+    /// The render mode currently used for the active render asset
+    active_render_mode: ExportRenderMode,
     demo_choice: DemoChoice,
+    operation_choice: OperationChoice,
+    operation_input_asset_id: Option<String>,
+    operation_output_asset_id: String,
     resolution: usize,
     bounds_min: (f32, f32, f32),
     bounds_max: (f32, f32, f32),
@@ -43,7 +77,6 @@ struct VolumetricApp {
     triangles: Vec<Triangle>,
     mesh_vertices: Arc<Vec<marching_cubes_wgpu::MeshVertex>>,
     needs_resample: bool,
-    render_mode: RenderMode,
     wgpu_target_format: wgpu::TextureFormat,
     // Camera state
     camera_theta: f32,
@@ -52,6 +85,25 @@ struct VolumetricApp {
     last_mouse_pos: Option<egui::Pos2>,
     // Error message
     error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OperationChoice {
+    Identity,
+}
+
+impl OperationChoice {
+    fn label(self) -> &'static str {
+        match self {
+            OperationChoice::Identity => "Identity (WASM passthrough)",
+        }
+    }
+
+    fn crate_name(self) -> &'static str {
+        match self {
+            OperationChoice::Identity => "identity_operator",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +164,11 @@ fn demo_wasm_path(crate_name: &str) -> Option<PathBuf> {
     None
 }
 
+fn operation_wasm_path(crate_name: &str) -> Option<PathBuf> {
+    // For now operations are built the same way as demo models: a cdylib .wasm in target/{debug|release}.
+    demo_wasm_path(crate_name)
+}
+
 impl VolumetricApp {
     fn new(cc: &eframe::CreationContext<'_>, initial_project: Option<Project>) -> Self {
         let wgpu_target_format = cc
@@ -120,19 +177,28 @@ impl VolumetricApp {
             .map(|rs| rs.target_format)
             .unwrap_or(wgpu::TextureFormat::Bgra8UnormSrgb);
 
-        // If we have an initial project, run it to extract the model WASM
-        let model_wasm = initial_project.as_ref().and_then(|proj| {
+        // If we have an initial project, run it to extract exports (and a default model WASM)
+        let (exported_assets, model_wasm) = initial_project.as_ref().map_or((vec![], None), |proj| {
             let mut env = Environment::new();
-            proj.run(&mut env).ok().and_then(|assets| {
-                assets.into_iter().find_map(|asset| asset.as_model_wasm().map(|b| b.to_vec()))
-            })
+            let assets = proj.run(&mut env).unwrap_or_default();
+            let model = assets
+                .iter()
+                .find_map(|asset| asset.as_model_wasm().map(|b| b.to_vec()));
+            (assets, model)
         });
 
         Self {
             project: initial_project,
             project_path: None,
             model_wasm,
+            exported_assets,
+            export_render_modes: HashMap::new(),
+            active_render_asset_id: None,
+            active_render_mode: ExportRenderMode::PointCloud,
             demo_choice: DemoChoice::None,
+            operation_choice: OperationChoice::Identity,
+            operation_input_asset_id: None,
+            operation_output_asset_id: "identity_out".to_string(),
             resolution: 20,
             bounds_min: (0.0, 0.0, 0.0),
             bounds_max: (0.0, 0.0, 0.0),
@@ -140,7 +206,6 @@ impl VolumetricApp {
             triangles: Vec::new(),
             mesh_vertices: Arc::new(Vec::new()),
             needs_resample: true,
-            render_mode: RenderMode::PointCloud,
             wgpu_target_format,
             camera_theta: std::f32::consts::FRAC_PI_4,
             camera_phi: std::f32::consts::FRAC_PI_4,
@@ -150,18 +215,94 @@ impl VolumetricApp {
         }
     }
 
+    fn set_active_render(&mut self, asset_id: Option<String>, mode: ExportRenderMode) {
+        self.active_render_asset_id = asset_id;
+        self.active_render_mode = mode;
+
+        if self.active_render_mode == ExportRenderMode::None {
+            self.model_wasm = None;
+            self.needs_resample = true;
+            return;
+        }
+
+        let Some(ref id) = self.active_render_asset_id else {
+            self.model_wasm = None;
+            self.needs_resample = true;
+            return;
+        };
+
+        match self
+            .exported_assets
+            .iter()
+            .find(|a| a.asset_id() == id)
+            .and_then(|a| a.as_model_wasm())
+        {
+            Some(bytes) => {
+                self.model_wasm = Some(bytes.to_vec());
+                self.error_message = None;
+                self.needs_resample = true;
+            }
+            None => {
+                self.model_wasm = None;
+                self.error_message = Some(format!(
+                    "Export '{id}' is not a renderable ModelWASM asset"
+                ));
+                self.needs_resample = true;
+            }
+        }
+    }
+
     /// Runs the current project and extracts the model WASM bytes
     fn run_project(&mut self) {
         self.model_wasm = None;
+        self.exported_assets.clear();
         if let Some(ref project) = self.project {
             let mut env = Environment::new();
             match project.run(&mut env) {
                 Ok(assets) => {
-                    // Find the first ModelWASM asset in the exports
-                    self.model_wasm = assets.into_iter()
-                        .find_map(|asset| asset.as_model_wasm().map(|b| b.to_vec()));
-                    if self.model_wasm.is_none() {
-                        self.error_message = Some("Project produced no ModelWASM output".to_string());
+                    // Retain full exports for UX/testing
+                    self.exported_assets = assets.clone();
+
+                    // Prune render settings for exports that no longer exist
+                    let exported_ids: std::collections::HashSet<String> = self
+                        .exported_assets
+                        .iter()
+                        .map(|a| a.asset_id().to_string())
+                        .collect();
+                    self.export_render_modes
+                        .retain(|id, _| exported_ids.contains(id));
+
+                    // If the currently active render asset disappeared, clear it.
+                    if self
+                        .active_render_asset_id
+                        .as_deref()
+                        .is_some_and(|id| !exported_ids.contains(id))
+                    {
+                        self.active_render_asset_id = None;
+                        self.active_render_mode = ExportRenderMode::None;
+                    }
+
+                    // If we don't have an active render target, pick the first ModelWASM export.
+                    if self.active_render_asset_id.is_none() {
+                        if let Some(first_model) = self
+                            .exported_assets
+                            .iter()
+                            .find(|a| a.as_model_wasm().is_some())
+                        {
+                            let id = first_model.asset_id().to_string();
+                            let mode = self
+                                .export_render_modes
+                                .get(&id)
+                                .copied()
+                                .unwrap_or(ExportRenderMode::PointCloud);
+                            self.export_render_modes.insert(id.clone(), mode);
+                            self.set_active_render(Some(id), mode);
+                        }
+                    } else {
+                        // Refresh model bytes from the active export.
+                        let id = self.active_render_asset_id.clone();
+                        let mode = self.active_render_mode;
+                        self.set_active_render(id, mode);
                     }
                 }
                 Err(e) => {
@@ -182,8 +323,16 @@ impl VolumetricApp {
             return;
         };
 
-        match self.render_mode {
-            RenderMode::PointCloud => {
+        match self.active_render_mode {
+            ExportRenderMode::None => {
+                self.bounds_min = (0.0, 0.0, 0.0);
+                self.bounds_max = (0.0, 0.0, 0.0);
+                self.points = Arc::new(Vec::new());
+                self.triangles.clear();
+                self.mesh_vertices = Arc::new(Vec::new());
+                self.error_message = None;
+            }
+            ExportRenderMode::PointCloud => {
                 match sample_model_from_bytes(wasm_bytes, self.resolution) {
                     Ok((points, bounds_min, bounds_max)) => {
                         self.bounds_min = bounds_min;
@@ -198,7 +347,7 @@ impl VolumetricApp {
                     }
                 }
             }
-            RenderMode::MarchingCubes => {
+            ExportRenderMode::MarchingCubes => {
                 match generate_marching_cubes_mesh_from_bytes(wasm_bytes, self.resolution) {
                     Ok((triangles, bounds_min, bounds_max)) => {
                         self.bounds_min = bounds_min;
@@ -452,7 +601,132 @@ impl eframe::App for VolumetricApp {
                     }
                 });
 
-                
+                ui.separator();
+                ui.label("Operations");
+
+                let input_asset_ids: Vec<String> = self
+                    .project
+                    .as_ref()
+                    .map(|p| {
+                        p.entries()
+                            .iter()
+                            .filter_map(|e| match e {
+                                ProjectEntry::LoadAsset(a) => Some(a.asset_id().to_string()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+
+                let needs_default_input = match self.operation_input_asset_id.as_deref() {
+                    Some(id) => !input_asset_ids.iter().any(|x| x == id),
+                    None => true,
+                };
+                if needs_default_input {
+                    self.operation_input_asset_id = input_asset_ids.first().cloned();
+                }
+
+                ui.horizontal(|ui| {
+                    ui.label("Operation:");
+                    egui::ComboBox::from_id_salt("operation_choice")
+                        .selected_text(self.operation_choice.label())
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.operation_choice,
+                                OperationChoice::Identity,
+                                OperationChoice::Identity.label(),
+                            );
+                        });
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Input asset:");
+                    let selected = self
+                        .operation_input_asset_id
+                        .as_deref()
+                        .unwrap_or("(none)");
+                    egui::ComboBox::from_id_salt("operation_input_asset")
+                        .selected_text(selected)
+                        .show_ui(ui, |ui| {
+                            for id in &input_asset_ids {
+                                ui.selectable_value(
+                                    &mut self.operation_input_asset_id,
+                                    Some(id.clone()),
+                                    id,
+                                );
+                            }
+                        });
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Output asset id:");
+                    ui.text_edit_singleline(&mut self.operation_output_asset_id);
+                });
+
+                let can_add_op = self.project.is_some()
+                    && self.operation_input_asset_id.is_some()
+                    && !self.operation_output_asset_id.trim().is_empty();
+                if ui
+                    .add_enabled(can_add_op, egui::Button::new("Add New Operation"))
+                    .clicked()
+                {
+                    let crate_name = self.operation_choice.crate_name();
+                    match operation_wasm_path(crate_name) {
+                        Some(path) => match fs::read(&path) {
+                            Ok(wasm_bytes) => {
+                                let input_id = self.operation_input_asset_id.clone().unwrap();
+                                let output_id = self.operation_output_asset_id.trim().to_string();
+                                let op_asset_id = format!("op_{crate_name}");
+
+                                if let Some(ref mut project) = self.project {
+                                    let insert_at = project
+                                        .entries()
+                                        .iter()
+                                        .position(|e| matches!(e, ProjectEntry::ExportAsset(_)))
+                                        .unwrap_or(project.entries().len());
+
+                                    let entries = project.entries_mut();
+                                    entries.insert(
+                                        insert_at,
+                                        ProjectEntry::LoadAsset(LoadAssetEntry::new(
+                                            op_asset_id.clone(),
+                                            Asset::OperationWASM(wasm_bytes),
+                                        )),
+                                    );
+                                    entries.insert(
+                                        insert_at + 1,
+                                        ProjectEntry::ExecuteWASM(ExecuteWasmEntry::new(
+                                            op_asset_id,
+                                            vec![ExecuteWasmInput::AssetByID(input_id)],
+                                            vec![ExecuteWasmOutput::new(
+                                                output_id.clone(),
+                                                AssetType::ModelWASM,
+                                            )],
+                                        )),
+                                    );
+                                    entries.insert(
+                                        insert_at + 2,
+                                        ProjectEntry::ExportAsset(output_id),
+                                    );
+                                }
+
+                                self.run_project();
+                                self.error_message = None;
+                                self.needs_resample = true;
+                            }
+                            Err(e) => {
+                                self.error_message =
+                                    Some(format!("Failed to read operation WASM file: {e}"));
+                            }
+                        },
+                        None => {
+                            self.error_message = Some(format!(
+                                "Operation WASM not found for '{crate_name}'. Build it first with: cargo build --release --target wasm32-unknown-unknown -p {crate_name}"
+                            ));
+                        }
+                    }
+                }
+
                 ui.label("Model Controls");
                 ui.horizontal(|ui| {
                     ui.label("Resolution:");
@@ -470,11 +744,14 @@ impl eframe::App for VolumetricApp {
                 if self.model_wasm.is_none() {
                     ui.weak("No model loaded. Import a WASM file or open a project.");
                 }
-                match self.render_mode {
-                    RenderMode::PointCloud => {
+                match self.active_render_mode {
+                    ExportRenderMode::None => {
+                        ui.weak("Render: None");
+                    }
+                    ExportRenderMode::PointCloud => {
                         ui.label(format!("Points: {}", self.points.len()));
                     }
-                    RenderMode::MarchingCubes => {
+                    ExportRenderMode::MarchingCubes => {
                         ui.label(format!("Triangles: {}", self.triangles.len()));
                     }
                 }
@@ -498,25 +775,8 @@ impl eframe::App for VolumetricApp {
                 });
                 
                 ui.separator();
-                ui.label("Render Mode");
-                let mut changed = false;
-                changed |= ui
-                    .selectable_value(&mut self.render_mode, RenderMode::PointCloud, "Point Cloud (wgpu)")
-                    .changed();
-                changed |= ui
-                    .selectable_value(
-                        &mut self.render_mode,
-                        RenderMode::MarchingCubes,
-                        "Marching Cubes (wgpu mesh)",
-                    )
-                    .changed();
-                if changed {
-                    self.needs_resample = true;
-                }
-
-                ui.separator();
                 ui.label("Export");
-                let can_export_stl = self.render_mode == RenderMode::MarchingCubes && !self.triangles.is_empty();
+                let can_export_stl = self.active_render_mode == ExportRenderMode::MarchingCubes && !self.triangles.is_empty();
                 if ui
                     .add_enabled(can_export_stl, egui::Button::new("Export STL…"))
                     .clicked()
@@ -533,6 +793,139 @@ impl eframe::App for VolumetricApp {
                     }
                 }
                 
+                // Project Timeline - shows all project entries
+                ui.separator();
+                ui.heading("Project Timeline");
+                
+                if let Some(ref project) = self.project {
+                    let entries = project.entries();
+                    if entries.is_empty() {
+                        ui.weak("No entries in project");
+                    } else {
+                        egui::ScrollArea::vertical()
+                            .max_height(200.0)
+                            .show(ui, |ui| {
+                                for (idx, entry) in entries.iter().enumerate() {
+                                    ui.horizontal(|ui| {
+                                        // Step number indicator
+                                        ui.label(format!("{}.", idx + 1));
+                                        
+                                        match entry {
+                                            lib::ProjectEntry::LoadAsset(load_entry) => {
+                                                let icon = match load_entry.asset_type() {
+                                                    lib::AssetType::ModelWASM => "📦",
+                                                    lib::AssetType::OperationWASM => "⚙️",
+                                                };
+                                                ui.label(format!("{} Load: {}", icon, load_entry.asset_id()));
+                                            }
+                                            lib::ProjectEntry::ExecuteWASM(exec_entry) => {
+                                                ui.vertical(|ui| {
+                                                    ui.label(format!("▶ Execute: {}", exec_entry.asset_id()));
+                                                    // Show inputs
+                                                    let inputs = exec_entry.inputs();
+                                                    if !inputs.is_empty() {
+                                                        ui.indent("inputs", |ui| {
+                                                            for input in inputs {
+                                                                ui.weak(format!("← {}", input.display()));
+                                                            }
+                                                        });
+                                                    }
+                                                    // Show output count
+                                                    let output_count = exec_entry.output_count();
+                                                    if output_count > 0 {
+                                                        ui.indent("outputs", |ui| {
+                                                            ui.weak(format!("→ {} output(s)", output_count));
+                                                        });
+                                                    }
+                                                });
+                                            }
+                                            lib::ProjectEntry::ExportAsset(asset_id) => {
+                                                ui.label(format!("📤 Export: {}", asset_id));
+                                            }
+                                        }
+                                    });
+                                    ui.add_space(2.0);
+                                }
+                            });
+                    }
+                } else {
+                    ui.weak("No project loaded");
+                }
+
+                // Project Exports - shown below the timeline
+                ui.separator();
+                ui.heading("Project Exports (last run)");
+                if self.exported_assets.is_empty() {
+                    ui.weak("(no exported assets)");
+                } else {
+                    // Clone to avoid borrow conflicts when UI callbacks mutate `self`.
+                    let exported_assets = self.exported_assets.clone();
+                    for asset in exported_assets {
+                        let asset_id = asset.asset_id().to_string();
+                        let is_active = self
+                            .active_render_asset_id
+                            .as_deref()
+                            .is_some_and(|id| id == asset_id);
+
+                        ui.group(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(format!(
+                                    "{}: {} ({} bytes)",
+                                    asset.asset_id(),
+                                    asset.asset().asset_type(),
+                                    asset.asset().bytes().len(),
+                                ));
+                                if is_active {
+                                    ui.weak("(active)");
+                                }
+                            });
+
+                            if !asset.precursor_asset_ids().is_empty() {
+                                ui.label(format!(
+                                    "precursors: {}",
+                                    asset.precursor_asset_ids().join(", ")
+                                ));
+                            }
+
+                            let is_renderable = asset.as_model_wasm().is_some();
+                            let current_mode = self
+                                .export_render_modes
+                                .get(&asset_id)
+                                .copied()
+                                .unwrap_or(ExportRenderMode::None);
+
+                            ui.horizontal(|ui| {
+                                ui.label("Render:");
+
+                                if !is_renderable {
+                                    ui.weak("(not renderable)");
+                                    return;
+                                }
+
+                                let mut mode = current_mode;
+                                egui::ComboBox::from_id_salt(format!("render_{asset_id}"))
+                                    .selected_text(mode.label())
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut mode, ExportRenderMode::None, ExportRenderMode::None.label());
+                                        ui.selectable_value(&mut mode, ExportRenderMode::PointCloud, ExportRenderMode::PointCloud.label());
+                                        ui.selectable_value(&mut mode, ExportRenderMode::MarchingCubes, ExportRenderMode::MarchingCubes.label());
+                                    });
+
+                                if mode != current_mode {
+                                    self.export_render_modes.insert(asset_id.clone(), mode);
+                                    if mode == ExportRenderMode::None {
+                                        if is_active {
+                                            self.set_active_render(None, ExportRenderMode::None);
+                                        }
+                                    } else {
+                                        self.set_active_render(Some(asset_id.clone()), mode);
+                                    }
+                                }
+                            });
+                        });
+                    }
+                }
+
                 if let Some(ref error) = self.error_message {
                     ui.separator();
                     ui.colored_label(egui::Color32::RED, error);
@@ -594,8 +987,11 @@ impl eframe::App for VolumetricApp {
             
             let camera_pos = self.camera_position();
             
-            match self.render_mode {
-                RenderMode::PointCloud => {
+            match self.active_render_mode {
+                ExportRenderMode::None => {
+                    // Nothing to draw (still show axes + background)
+                }
+                ExportRenderMode::PointCloud => {
                     let aspect = rect.width() / rect.height().max(1.0);
                     let view_proj = point_cloud_wgpu::view_proj_from_camera(
                         camera_pos,
@@ -621,7 +1017,7 @@ impl eframe::App for VolumetricApp {
 
                     painter.add(egui::Shape::Callback(cb));
                 }
-                RenderMode::MarchingCubes => {
+                ExportRenderMode::MarchingCubes => {
                     let aspect = rect.width() / rect.height().max(1.0);
                     let view_proj = point_cloud_wgpu::view_proj_from_camera(
                         camera_pos,
@@ -648,9 +1044,14 @@ impl eframe::App for VolumetricApp {
             }
             
             // Draw info text
-            let info_text = match self.render_mode {
-                RenderMode::PointCloud => format!("Points: {} | Drag to rotate, scroll to zoom", self.points.len()),
-                RenderMode::MarchingCubes => format!("Triangles: {} | Drag to rotate, scroll to zoom", self.triangles.len()),
+            let info_text = match self.active_render_mode {
+                ExportRenderMode::None => "Render: None | Drag to rotate, scroll to zoom".to_string(),
+                ExportRenderMode::PointCloud => {
+                    format!("Points: {} | Drag to rotate, scroll to zoom", self.points.len())
+                }
+                ExportRenderMode::MarchingCubes => {
+                    format!("Triangles: {} | Drag to rotate, scroll to zoom", self.triangles.len())
+                }
             };
             painter.text(
                 rect.left_top() + egui::vec2(10.0, 10.0),
