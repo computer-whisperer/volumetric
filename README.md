@@ -5,7 +5,12 @@ Suppose we define a physical 3d model as a simple wasm function. This function w
 This is attractive for a few reasons, but the main potential flaw is that sampling the model will be expensive. The question is, how slow? Given the reality of many projects that could benefit from a simpler model definition paradigm, and how cheap compute is in reality, is this viable?
 
 
-Therefore, here we will be creating the MVP. We will need to divide this into two parts: a wasm module that defines the model (currently should be defined in crates/test_model) and a root module that will a) render the model and b) convert the model to various other 3d formats.
+Therefore, here we will be creating the MVP. We will need to divide this into two parts: a wasm module that defines the model (see `crates/models/*`) and a root module that will a) render the model and b) convert the model to various other 3d formats.
+
+The workspace is organized as:
+
+- `crates/models/*` — demo model WASM crates
+- `crates/operators/*` — operator WASM crates (take one or more model assets as input and produce outputs)
 
 ## Demo models
 
@@ -34,8 +39,10 @@ rustup target add wasm32-unknown-unknown
 Build all demos (release):
 
 ```bash
-cargo build --release --target wasm32-unknown-unknown -p simple_sphere_model -p simple_torus_model -p rounded_box_model -p gyroid_lattice_model -p mandelbulb_model
+cargo build-wasm
 ```
+
+This uses a Cargo alias defined in `.cargo/config.toml` and rebuilds all WASM payload crates (both models and operators).
 
 The app looks for demo outputs at:
 

@@ -5,14 +5,14 @@ edition = "2021"
 
 [workspace]
 members = [
-    "crates/simple_sphere_model",
-    "crates/simple_torus_model",
-    "crates/rounded_box_model",
-    "crates/gyroid_lattice_model",
-    "crates/mandelbulb_model",
-    "crates/identity_operator",
-    "crates/translate_operator",
-    "crates/boolean_operator",
+    "crates/models/simple_sphere_model",
+    "crates/models/simple_torus_model",
+    "crates/models/rounded_box_model",
+    "crates/models/gyroid_lattice_model",
+    "crates/models/mandelbulb_model",
+    "crates/operators/identity_operator",
+    "crates/operators/translate_operator",
+    "crates/operators/boolean_operator",
 ]
 
 [dependencies]

@@ -1,21 +1,17 @@
-#![no_std]
+#![cfg_attr(target_arch = "wasm32", no_std)]
 
 //! Test model: A simple sphere centered at origin with radius 1.0
 //!
 //! This WASM module exports a function that determines whether a given
 //! 3D point is inside the model or not.
 
+#[cfg(target_arch = "wasm32")]
 use core::panic::PanicInfo;
 
+#[cfg(target_arch = "wasm32")]
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
-    #[cfg(target_arch = "wasm32")]
-    unsafe {
-        core::arch::wasm32::unreachable();
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    loop {}
+    unsafe { core::arch::wasm32::unreachable() }
 }
 
 /// Check if a point (x, y, z) is inside the model.

@@ -1,4 +1,4 @@
-#![no_std]
+#![cfg_attr(target_arch = "wasm32", no_std)]
 
 //! Demo model: Mandelbulb fractal (3D Mandelbrot-like set).
 //!
@@ -6,17 +6,13 @@
 //!   z_{n+1} = z_n^p + c,  z_0 = 0
 //! does not escape past a bailout radius within a fixed iteration count.
 
+#[cfg(target_arch = "wasm32")]
 use core::panic::PanicInfo;
 
+#[cfg(target_arch = "wasm32")]
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
-    #[cfg(target_arch = "wasm32")]
-    unsafe {
-        core::arch::wasm32::unreachable();
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    loop {}
+    unsafe { core::arch::wasm32::unreachable() }
 }
 
 #[inline]

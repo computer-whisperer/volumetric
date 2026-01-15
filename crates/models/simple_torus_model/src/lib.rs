@@ -1,20 +1,16 @@
-#![no_std]
+#![cfg_attr(target_arch = "wasm32", no_std)]
 
 //! Demo model: Torus (ring) centered at origin.
 //!
 //! Exports `is_inside(x,y,z) -> i32` and bounding-box getter functions.
 
+#[cfg(target_arch = "wasm32")]
 use core::panic::PanicInfo;
 
+#[cfg(target_arch = "wasm32")]
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
-    #[cfg(target_arch = "wasm32")]
-    unsafe {
-        core::arch::wasm32::unreachable();
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    loop {}
+    unsafe { core::arch::wasm32::unreachable() }
 }
 
 #[inline]

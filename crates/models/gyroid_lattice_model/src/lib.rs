@@ -1,4 +1,4 @@
-#![no_std]
+#![cfg_attr(target_arch = "wasm32", no_std)]
 
 //! Demo model: Gyroid lattice (finite chunk).
 //!
@@ -6,17 +6,13 @@
 //!   g(x,y,z) = sin(x)*cos(y) + sin(y)*cos(z) + sin(z)*cos(x)
 //! We create a "thickened" shell by taking |g| < thickness inside a bounded box.
 
+#[cfg(target_arch = "wasm32")]
 use core::panic::PanicInfo;
 
+#[cfg(target_arch = "wasm32")]
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
-    #[cfg(target_arch = "wasm32")]
-    unsafe {
-        core::arch::wasm32::unreachable();
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    loop {}
+    unsafe { core::arch::wasm32::unreachable() }
 }
 
 #[inline]
