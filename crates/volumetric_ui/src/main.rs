@@ -14,6 +14,7 @@ mod marching_cubes_wgpu;
 use volumetric::{
     AssetType,
     Environment,
+    ExecuteWasmEntry,
     ExecuteWasmInput,
     ExecuteWasmOutput,
     LoadedAsset,
@@ -319,6 +320,16 @@ struct VolumetricApp {
     last_evaluation_time: Option<f32>,
     // Error message
     error_message: Option<String>,
+    /// Index of the project entry currently being edited (None if edit panel is closed)
+    editing_entry_index: Option<usize>,
+    /// Configuration values for the entry being edited
+    edit_config_values: HashMap<String, ConfigValue>,
+    /// Lua script for the entry being edited
+    edit_lua_script: String,
+    /// Input asset IDs for the entry being edited
+    edit_input_asset_ids: Vec<Option<String>>,
+    /// Output asset ID for the entry being edited
+    edit_output_asset_id: String,
 }
 
 #[derive(Clone, Debug)]
@@ -470,6 +481,11 @@ impl VolumetricApp {
             last_mouse_pos: None,
             last_evaluation_time: None,
             error_message: None,
+            editing_entry_index: None,
+            edit_config_values: HashMap::new(),
+            edit_lua_script: String::new(),
+            edit_input_asset_ids: Vec::new(),
+            edit_output_asset_id: String::new(),
         }
     }
 
@@ -806,6 +822,444 @@ impl VolumetricApp {
             None
         }
     }
+    
+    /// Start editing a project entry at the given index
+    fn start_editing_entry(&mut self, idx: usize) {
+        // First, extract all needed data from the project to avoid borrow conflicts
+        let entry_data = self.project.as_ref().and_then(|project| {
+            project.entries().get(idx).and_then(|entry| {
+                if let ProjectEntry::ExecuteWASM(exec_entry) = entry {
+                    Some((
+                        exec_entry.asset_id().to_string(),
+                        exec_entry.inputs().to_vec(),
+                    ))
+                } else {
+                    None
+                }
+            })
+        });
+        
+        let Some((asset_id, inputs)) = entry_data else { return };
+        
+        self.editing_entry_index = Some(idx);
+        self.edit_config_values.clear();
+        self.edit_lua_script.clear();
+        self.edit_input_asset_ids.clear();
+        self.edit_output_asset_id.clear();
+        
+        // Get operator metadata to understand input types
+        let crate_name = asset_id.strip_prefix("op_").unwrap_or(&asset_id);
+        let operator_metadata = self.operator_metadata_cached(crate_name);
+        
+        if let Some(ref metadata) = operator_metadata {
+            // Use metadata to properly decode each input
+            for (input_idx, input_meta) in metadata.inputs.iter().enumerate() {
+                let input = inputs.get(input_idx);
+                match input_meta {
+                    OperatorMetadataInput::ModelWASM => {
+                        if let Some(ExecuteWasmInput::AssetByID(id)) = input {
+                            self.edit_input_asset_ids.push(Some(id.clone()));
+                        } else {
+                            self.edit_input_asset_ids.push(None);
+                        }
+                    }
+                    OperatorMetadataInput::CBORConfiguration(cddl) => {
+                        self.edit_input_asset_ids.push(None); // Placeholder for data inputs
+                        // Decode CBOR data to populate config values
+                        if let Some(ExecuteWasmInput::Data(data)) = input {
+                            if let Ok(fields) = parse_cddl_record_schema(cddl.as_str()) {
+                                if let Ok(cbor_value) = ciborium::from_reader::<CborValue, _>(data.as_slice()) {
+                                    if let CborValue::Map(map) = cbor_value {
+                                        for (field_name, field_ty) in &fields {
+                                            // Find the value in the CBOR map
+                                            for (key, value) in &map {
+                                                if let CborValue::Text(key_str) = key {
+                                                    if key_str == field_name {
+                                                        let config_value = match (field_ty, value) {
+                                                            (ConfigFieldType::Bool, CborValue::Bool(b)) => {
+                                                                Some(ConfigValue::Bool(*b))
+                                                            }
+                                                            (ConfigFieldType::Int, CborValue::Integer(i)) => {
+                                                                Some(ConfigValue::Int(i128::from(*i) as i64))
+                                                            }
+                                                            (ConfigFieldType::Float, CborValue::Float(f)) => {
+                                                                Some(ConfigValue::Float(*f))
+                                                            }
+                                                            (ConfigFieldType::Float, CborValue::Integer(i)) => {
+                                                                Some(ConfigValue::Float(i128::from(*i) as f64))
+                                                            }
+                                                            (ConfigFieldType::Text, CborValue::Text(t)) => {
+                                                                Some(ConfigValue::Text(t.clone()))
+                                                            }
+                                                            (ConfigFieldType::Enum(_), CborValue::Text(t)) => {
+                                                                Some(ConfigValue::Text(t.clone()))
+                                                            }
+                                                            _ => None,
+                                                        };
+                                                        if let Some(cv) = config_value {
+                                                            self.edit_config_values.insert(field_name.clone(), cv);
+                                                        }
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    OperatorMetadataInput::LuaSource(_) => {
+                        self.edit_input_asset_ids.push(None); // Placeholder for data inputs
+                        // Extract Lua script from data
+                        if let Some(ExecuteWasmInput::Data(data)) = input {
+                            if let Ok(script) = std::str::from_utf8(data) {
+                                if !script.is_empty() {
+                                    self.edit_lua_script = script.to_string();
+                                }
+                            }
+                        } else if let Some(ExecuteWasmInput::String(s)) = input {
+                            self.edit_lua_script = s.clone();
+                        }
+                    }
+                }
+            }
+        } else {
+            // Fallback: no metadata available, use simple extraction
+            for input in &inputs {
+                match input {
+                    ExecuteWasmInput::AssetByID(id) => {
+                        self.edit_input_asset_ids.push(Some(id.clone()));
+                    }
+                    ExecuteWasmInput::Data(data) => {
+                        // Try to interpret as UTF-8 string (Lua script)
+                        if let Ok(script) = std::str::from_utf8(data) {
+                            if !script.is_empty() && self.edit_lua_script.is_empty() {
+                                self.edit_lua_script = script.to_string();
+                            }
+                        }
+                        self.edit_input_asset_ids.push(None);
+                    }
+                    ExecuteWasmInput::String(s) => {
+                        self.edit_input_asset_ids.push(None);
+                        if self.edit_lua_script.is_empty() {
+                            self.edit_lua_script = s.clone();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    /// Close the edit panel
+    fn close_edit_panel(&mut self) {
+        self.editing_entry_index = None;
+        self.edit_config_values.clear();
+        self.edit_lua_script.clear();
+        self.edit_input_asset_ids.clear();
+        self.edit_output_asset_id.clear();
+    }
+    
+    /// Show the edit panel UI for the currently selected entry
+    fn show_edit_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(idx) = self.editing_entry_index else { return };
+        
+        ui.heading("Edit Entry");
+        ui.separator();
+        
+        // Get entry info (we need to be careful about borrowing)
+        let entry_info = self.project.as_ref().and_then(|p| {
+            p.entries().get(idx).map(|entry| {
+                match entry {
+                    ProjectEntry::ExecuteWASM(exec_entry) => {
+                        Some((exec_entry.asset_id().to_string(), exec_entry.inputs().to_vec()))
+                    }
+                    _ => None
+                }
+            }).flatten()
+        });
+        
+        let Some((asset_id, inputs)) = entry_info else {
+            ui.label("Entry not found or not editable");
+            if ui.button("Close").clicked() {
+                self.close_edit_panel();
+            }
+            return;
+        };
+        
+        ui.label(format!("Editing: {}", asset_id));
+        ui.add_space(8.0);
+        
+        // Get available input assets for dropdowns
+        let input_asset_ids: Vec<String> = self
+            .project
+            .as_ref()
+            .map(|p| {
+                p.declared_assets()
+                    .into_iter()
+                    .filter_map(|(id, ty)| {
+                        if ty == AssetType::ModelWASM {
+                            Some(id)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        
+        // Try to get operator metadata for this operation
+        // Extract crate name from asset_id (e.g., "op_translate_operator" -> "translate_operator")
+        let crate_name = asset_id.strip_prefix("op_").unwrap_or(&asset_id);
+        let operator_metadata = self.operator_metadata_cached(crate_name);
+        
+        ui.label("Inputs:");
+        ui.indent("edit_inputs", |ui| {
+            // Show input editors based on operator metadata or existing inputs
+            if let Some(ref metadata) = operator_metadata {
+                let mut model_input_idx = 0;
+                for (input_idx, input_meta) in metadata.inputs.iter().enumerate() {
+                    match input_meta {
+                        OperatorMetadataInput::ModelWASM => {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("Model {}:", model_input_idx + 1));
+                                
+                                // Ensure we have enough slots
+                                while self.edit_input_asset_ids.len() <= input_idx {
+                                    self.edit_input_asset_ids.push(None);
+                                }
+                                
+                                // Initialize from existing input if not set
+                                if self.edit_input_asset_ids[input_idx].is_none() {
+                                    if let Some(ExecuteWasmInput::AssetByID(id)) = inputs.get(input_idx) {
+                                        self.edit_input_asset_ids[input_idx] = Some(id.clone());
+                                    }
+                                }
+                                
+                                let selected = self.edit_input_asset_ids[input_idx]
+                                    .as_deref()
+                                    .unwrap_or("(none)");
+                                egui::ComboBox::from_id_salt(format!("edit_input_{input_idx}"))
+                                    .selected_text(selected)
+                                    .show_ui(ui, |ui| {
+                                        for id in &input_asset_ids {
+                                            ui.selectable_value(
+                                                &mut self.edit_input_asset_ids[input_idx],
+                                                Some(id.clone()),
+                                                id,
+                                            );
+                                        }
+                                    });
+                            });
+                            model_input_idx += 1;
+                        }
+                        OperatorMetadataInput::CBORConfiguration(cddl) => {
+                            ui.separator();
+                            ui.label("Configuration:");
+                            
+                            match parse_cddl_record_schema(cddl.as_str()) {
+                                Ok(fields) => {
+                                    for (field_name, field_ty) in &fields {
+                                        ui.horizontal(|ui| {
+                                            ui.label(field_name);
+                                            match field_ty {
+                                                ConfigFieldType::Bool => {
+                                                    let entry = self
+                                                        .edit_config_values
+                                                        .entry(field_name.clone())
+                                                        .or_insert(ConfigValue::Bool(false));
+                                                    if let ConfigValue::Bool(b) = entry {
+                                                        ui.checkbox(b, "");
+                                                    }
+                                                }
+                                                ConfigFieldType::Int => {
+                                                    let entry = self
+                                                        .edit_config_values
+                                                        .entry(field_name.clone())
+                                                        .or_insert(ConfigValue::Int(0));
+                                                    if let ConfigValue::Int(i) = entry {
+                                                        ui.add(egui::DragValue::new(i));
+                                                    }
+                                                }
+                                                ConfigFieldType::Float => {
+                                                    let entry = self
+                                                        .edit_config_values
+                                                        .entry(field_name.clone())
+                                                        .or_insert(ConfigValue::Float(0.0));
+                                                    if let ConfigValue::Float(f) = entry {
+                                                        ui.add(egui::DragValue::new(f));
+                                                    }
+                                                }
+                                                ConfigFieldType::Text => {
+                                                    let entry = self
+                                                        .edit_config_values
+                                                        .entry(field_name.clone())
+                                                        .or_insert_with(|| ConfigValue::Text(String::new()));
+                                                    if let ConfigValue::Text(t) = entry {
+                                                        ui.text_edit_singleline(t);
+                                                    }
+                                                }
+                                                ConfigFieldType::Enum(options) => {
+                                                    let entry = self
+                                                        .edit_config_values
+                                                        .entry(field_name.clone())
+                                                        .or_insert_with(|| {
+                                                            ConfigValue::Text(options.first().cloned().unwrap_or_default())
+                                                        });
+
+                                                    if let ConfigValue::Text(selected) = entry {
+                                                        egui::ComboBox::from_id_salt(format!("edit_cfg_enum_{field_name}"))
+                                                            .selected_text(selected.as_str())
+                                                            .show_ui(ui, |ui| {
+                                                                for opt in options {
+                                                                    ui.selectable_value(selected, opt.clone(), opt);
+                                                                }
+                                                            });
+                                                    }
+                                                }
+                                            }
+                                        });
+                                    }
+                                }
+                                Err(e) => {
+                                    ui.colored_label(egui::Color32::YELLOW, format!(
+                                        "Unsupported configuration schema: {e}"
+                                    ));
+                                }
+                            }
+                        }
+                        OperatorMetadataInput::LuaSource(template) => {
+                            ui.separator();
+                            ui.label("Lua Script:");
+                            
+                            // Initialize with existing script or template
+                            if self.edit_lua_script.is_empty() {
+                                // Try to get from existing input
+                                for input in &inputs {
+                                    if let ExecuteWasmInput::Data(data) = input {
+                                        if let Ok(script) = std::str::from_utf8(data) {
+                                            if !script.is_empty() {
+                                                self.edit_lua_script = script.to_string();
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                // Fall back to template
+                                if self.edit_lua_script.is_empty() {
+                                    self.edit_lua_script = template.clone();
+                                }
+                            }
+                            
+                            egui::ScrollArea::vertical()
+                                .max_height(200.0)
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::TextEdit::multiline(&mut self.edit_lua_script)
+                                            .code_editor()
+                                            .desired_width(f32::INFINITY)
+                                            .desired_rows(10),
+                                    );
+                                });
+                            
+                            if ui.button("Reset to template").clicked() {
+                                self.edit_lua_script = template.clone();
+                            }
+                        }
+                    }
+                }
+            } else {
+                // No metadata available, show basic input display
+                for (i, input) in inputs.iter().enumerate() {
+                    ui.label(format!("{}: {}", i + 1, input.display()));
+                }
+            }
+        });
+        
+        ui.add_space(16.0);
+        ui.separator();
+        
+        // Action buttons
+        ui.horizontal(|ui| {
+            if ui.button("Apply Changes").clicked() {
+                self.apply_edit_changes();
+            }
+            if ui.button("Cancel").clicked() {
+                self.close_edit_panel();
+            }
+        });
+    }
+    
+    /// Apply the changes from the edit panel to the project entry
+    fn apply_edit_changes(&mut self) {
+        let Some(idx) = self.editing_entry_index else { return };
+        
+        // Get operator metadata for building new inputs
+        let entry_info = self.project.as_ref().and_then(|p| {
+            p.entries().get(idx).and_then(|entry| {
+                if let ProjectEntry::ExecuteWASM(exec_entry) = entry {
+                    Some(exec_entry.asset_id().to_string())
+                } else {
+                    None
+                }
+            })
+        });
+        
+        let Some(asset_id) = entry_info else { return };
+        let crate_name = asset_id.strip_prefix("op_").unwrap_or(&asset_id);
+        let operator_metadata = self.operator_metadata_cached(crate_name);
+        
+        // Build new inputs based on edit state
+        let new_inputs: Vec<ExecuteWasmInput> = if let Some(ref metadata) = operator_metadata {
+            let mut inputs = Vec::new();
+            let mut model_input_idx = 0;
+            
+            for input_meta in &metadata.inputs {
+                match input_meta {
+                    OperatorMetadataInput::ModelWASM => {
+                        let asset_id = self.edit_input_asset_ids
+                            .get(model_input_idx)
+                            .and_then(|o| o.clone())
+                            .unwrap_or_default();
+                        inputs.push(ExecuteWasmInput::AssetByID(asset_id));
+                        model_input_idx += 1;
+                    }
+                    OperatorMetadataInput::CBORConfiguration(cddl) => {
+                        let fields = parse_cddl_record_schema(cddl.as_str()).unwrap_or_default();
+                        let bytes = encode_config_map_to_cbor(&fields, &self.edit_config_values)
+                            .unwrap_or_default();
+                        inputs.push(ExecuteWasmInput::Data(bytes));
+                    }
+                    OperatorMetadataInput::LuaSource(_) => {
+                        let script_bytes = self.edit_lua_script.as_bytes().to_vec();
+                        inputs.push(ExecuteWasmInput::Data(script_bytes));
+                    }
+                }
+            }
+            inputs
+        } else {
+            // No metadata, keep existing inputs
+            return;
+        };
+        
+        // Update the project entry
+        if let Some(ref mut project) = self.project {
+            if let Some(ProjectEntry::ExecuteWASM(exec_entry)) = project.entries_mut().get_mut(idx) {
+                // We need to create a new ExecuteWasmEntry with updated inputs
+                // but keep the same outputs
+                let new_entry = ExecuteWasmEntry::new(
+                    exec_entry.asset_id().to_string(),
+                    new_inputs,
+                    exec_entry.outputs().to_vec(),
+                );
+                *exec_entry = new_entry;
+            }
+        }
+        
+        self.project_path = None; // Mark as modified
+        self.run_project();
+        self.close_edit_panel();
+    }
 }
 
 impl eframe::App for VolumetricApp {
@@ -1073,127 +1527,9 @@ impl eframe::App for VolumetricApp {
                         });
                 });
 
-                // If the selected operator declares configuration inputs, render widgets for them.
-                // The encoded CBOR bytes will be inserted into `ExecuteWasmInput::Data` when adding the operation.
+                // Get operator metadata to determine input requirements
                 let crate_name = self.operation_choice.crate_name();
                 let operator_metadata = self.operator_metadata_cached(crate_name);
-
-                if let Some(ref metadata) = operator_metadata {
-                    for (input_idx, input) in metadata.inputs.iter().enumerate() {
-                        if let OperatorMetadataInput::CBORConfiguration(cddl) = input {
-                            let cddl_trimmed = cddl.trim().to_string();
-                            if self.operation_config_last_cddl.as_deref() != Some(cddl_trimmed.as_str()) {
-                                self.operation_config_last_cddl = Some(cddl_trimmed.clone());
-                                self.operation_config_values.clear();
-                            }
-
-                            ui.separator();
-                            ui.label(format!("Configuration (input {input_idx})"));
-
-                            match parse_cddl_record_schema(&cddl_trimmed) {
-                                Ok(fields) => {
-                                    for (field_name, field_ty) in &fields {
-                                        ui.horizontal(|ui| {
-                                            ui.label(field_name);
-                                            match field_ty {
-                                                ConfigFieldType::Bool => {
-                                                    let entry = self
-                                                        .operation_config_values
-                                                        .entry(field_name.clone())
-                                                        .or_insert(ConfigValue::Bool(false));
-                                                    if let ConfigValue::Bool(b) = entry {
-                                                        ui.checkbox(b, "");
-                                                    }
-                                                }
-                                                ConfigFieldType::Int => {
-                                                    let entry = self
-                                                        .operation_config_values
-                                                        .entry(field_name.clone())
-                                                        .or_insert(ConfigValue::Int(0));
-                                                    if let ConfigValue::Int(i) = entry {
-                                                        ui.add(egui::DragValue::new(i));
-                                                    }
-                                                }
-                                                ConfigFieldType::Float => {
-                                                    let entry = self
-                                                        .operation_config_values
-                                                        .entry(field_name.clone())
-                                                        .or_insert(ConfigValue::Float(0.0));
-                                                    if let ConfigValue::Float(f) = entry {
-                                                        ui.add(egui::DragValue::new(f));
-                                                    }
-                                                }
-                                                ConfigFieldType::Text => {
-                                                    let entry = self
-                                                        .operation_config_values
-                                                        .entry(field_name.clone())
-                                                        .or_insert_with(|| ConfigValue::Text(String::new()));
-                                                    if let ConfigValue::Text(t) = entry {
-                                                        ui.text_edit_singleline(t);
-                                                    }
-                                                }
-                                                ConfigFieldType::Enum(options) => {
-                                                    let entry = self
-                                                        .operation_config_values
-                                                        .entry(field_name.clone())
-                                                        .or_insert_with(|| {
-                                                            ConfigValue::Text(options.first().cloned().unwrap_or_default())
-                                                        });
-
-                                                    if let ConfigValue::Text(selected) = entry {
-                                                        egui::ComboBox::from_id_salt(format!("cfg_enum_{field_name}"))
-                                                            .selected_text(selected.as_str())
-                                                            .show_ui(ui, |ui| {
-                                                                for opt in options {
-                                                                    ui.selectable_value(selected, opt.clone(), opt);
-                                                                }
-                                                            });
-                                                    }
-                                                }
-                                            }
-                                        });
-                                    }
-
-                                    if ui
-                                        .add(egui::Button::new("Reset config"))
-                                        .clicked()
-                                    {
-                                        self.operation_config_values.clear();
-                                    }
-                                }
-                                Err(e) => {
-                                    ui.colored_label(egui::Color32::YELLOW, format!(
-                                        "Unsupported configuration schema: {e}"
-                                    ));
-                                }
-                            }
-                        } else if let OperatorMetadataInput::LuaSource(template) = input {
-                            // Initialize script with template if empty
-                            if self.operation_lua_script.is_empty() {
-                                self.operation_lua_script = template.clone();
-                            }
-
-                            ui.separator();
-                            ui.label(format!("Lua Script (input {input_idx})"));
-                            
-                            egui::ScrollArea::vertical()
-                                .max_height(300.0)
-                                .show(ui, |ui| {
-                                    ui.add(
-                                        egui::TextEdit::multiline(&mut self.operation_lua_script)
-                                            .code_editor()
-                                            .desired_width(f32::INFINITY)
-                                            .desired_rows(15),
-                                    );
-                                });
-
-                            if ui.add(egui::Button::new("Reset to template")).clicked() {
-                                self.operation_lua_script = template.clone();
-                            }
-                        }
-                    }
-                    ui.separator();
-                }
 
                 // Render input pickers. If the operator expects 2+ model inputs, show A/B.
                 let model_input_count = operator_metadata
@@ -1325,7 +1661,11 @@ impl eframe::App for VolumetricApp {
                                     ),
                                 };
 
+                                let mut new_entry_idx: Option<usize> = None;
                                 if let Some(ref mut project) = self.project {
+                                    // Track entry count before insertion
+                                    let count_before = project.entries().len();
+                                    
                                     project.insert_operation(
                                         op_asset_id.as_str(),
                                         wasm_bytes,
@@ -1333,9 +1673,24 @@ impl eframe::App for VolumetricApp {
                                         outputs,
                                         output_id,
                                     );
+                                    
+                                    // Find the newly added ExecuteWASM entry
+                                    for (idx, entry) in project.entries().iter().enumerate().rev() {
+                                        if idx >= count_before.saturating_sub(1) {
+                                            if matches!(entry, ProjectEntry::ExecuteWASM(_)) {
+                                                new_entry_idx = Some(idx);
+                                                break;
+                                            }
+                                        }
+                                    }
                                 }
 
                                 self.run_project();
+                                
+                                // Open edit panel for the newly added operation
+                                if let Some(idx) = new_entry_idx {
+                                    self.start_editing_entry(idx);
+                                }
                             }
                             Err(e) => {
                                 self.error_message =
@@ -1363,6 +1718,10 @@ impl eframe::App for VolumetricApp {
                         }
 
                 ui.separator();
+                // Track actions to perform after the UI loop (to avoid borrow conflicts)
+                let mut entry_to_edit: Option<usize> = None;
+                let mut entry_to_delete: Option<usize> = None;
+                
                 egui::CollapsingHeader::new("Project Timeline")
                     .default_open(true)
                     .show(ui, |ui| {
@@ -1372,62 +1731,77 @@ impl eframe::App for VolumetricApp {
                                 ui.weak("No entries in project");
                             } else {
                                 egui::ScrollArea::vertical()
-                                    .max_height(200.0)
+                                    .max_height(300.0)
                                     .show(ui, |ui| {
                                         for (idx, entry) in entries.iter().enumerate() {
-                                            ui.horizontal(|ui| {
-                                                // Step number indicator
-                                                ui.label(format!("{}.", idx + 1));
+                                            ui.group(|ui| {
+                                                ui.horizontal(|ui| {
+                                                    // Step number indicator
+                                                    ui.label(format!("{}.", idx + 1));
 
-                                                match entry {
-                                                    ProjectEntry::LoadAsset(load_entry) => {
-                                                        let icon = match load_entry.asset_type() {
-                                                            AssetType::ModelWASM => "📦",
-                                                            AssetType::OperationWASM => "⚙️",
-                                                        };
-                                                        ui.label(format!(
-                                                            "{} Load: {}",
-                                                            icon,
-                                                            load_entry.asset_id()
-                                                        ));
-                                                    }
-                                                    ProjectEntry::ExecuteWASM(exec_entry) => {
-                                                        ui.vertical(|ui| {
+                                                    match entry {
+                                                        ProjectEntry::LoadAsset(load_entry) => {
+                                                            let icon = match load_entry.asset_type() {
+                                                                AssetType::ModelWASM => "📦",
+                                                                AssetType::OperationWASM => "⚙️",
+                                                            };
                                                             ui.label(format!(
-                                                                "▶ Execute: {}",
-                                                                exec_entry.asset_id()
+                                                                "{} Load: {}",
+                                                                icon,
+                                                                load_entry.asset_id()
                                                             ));
-                                                            // Show inputs
-                                                            let inputs = exec_entry.inputs();
-                                                            if !inputs.is_empty() {
-                                                                ui.indent("inputs", |ui| {
-                                                                    for input in inputs {
+                                                        }
+                                                        ProjectEntry::ExecuteWASM(exec_entry) => {
+                                                            ui.vertical(|ui| {
+                                                                ui.label(format!(
+                                                                    "▶ Execute: {}",
+                                                                    exec_entry.asset_id()
+                                                                ));
+                                                                // Show inputs
+                                                                let inputs = exec_entry.inputs();
+                                                                if !inputs.is_empty() {
+                                                                    ui.indent("inputs", |ui| {
+                                                                        for input in inputs {
+                                                                            ui.weak(format!(
+                                                                                "← {}",
+                                                                                input.display()
+                                                                            ));
+                                                                        }
+                                                                    });
+                                                                }
+                                                                // Show output count
+                                                                let output_count = exec_entry.output_count();
+                                                                if output_count > 0 {
+                                                                    ui.indent("outputs", |ui| {
                                                                         ui.weak(format!(
-                                                                            "← {}",
-                                                                            input.display()
+                                                                            "→ {} output(s)",
+                                                                            output_count
                                                                         ));
-                                                                    }
-                                                                });
-                                                            }
-                                                            // Show output count
-                                                            let output_count = exec_entry.output_count();
-                                                            if output_count > 0 {
-                                                                ui.indent("outputs", |ui| {
-                                                                    ui.weak(format!(
-                                                                        "→ {} output(s)",
-                                                                        output_count
-                                                                    ));
-                                                                });
-                                                            }
-                                                        });
+                                                                    });
+                                                                }
+                                                            });
+                                                        }
+                                                        ProjectEntry::ExportAsset(asset_id) => {
+                                                            ui.label(format!(
+                                                                "📤 Export: {}",
+                                                                asset_id
+                                                            ));
+                                                        }
                                                     }
-                                                    ProjectEntry::ExportAsset(asset_id) => {
-                                                        ui.label(format!(
-                                                            "📤 Export: {}",
-                                                            asset_id
-                                                        ));
-                                                    }
-                                                }
+                                                    
+                                                    // Add Edit and Delete buttons
+                                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                        if ui.small_button("🗑").on_hover_text("Delete entry").clicked() {
+                                                            entry_to_delete = Some(idx);
+                                                        }
+                                                        // Only show Edit for ExecuteWASM entries
+                                                        if matches!(entry, ProjectEntry::ExecuteWASM(_)) {
+                                                            if ui.small_button("✏").on_hover_text("Edit entry").clicked() {
+                                                                entry_to_edit = Some(idx);
+                                                            }
+                                                        }
+                                                    });
+                                                });
                                             });
                                             ui.add_space(2.0);
                                         }
@@ -1437,6 +1811,29 @@ impl eframe::App for VolumetricApp {
                             ui.weak("No project loaded");
                         }
                     });
+                
+                // Handle edit action
+                if let Some(idx) = entry_to_edit {
+                    self.start_editing_entry(idx);
+                }
+                
+                // Handle delete action
+                if let Some(idx) = entry_to_delete {
+                    if let Some(ref mut project) = self.project {
+                        project.entries_mut().remove(idx);
+                        self.project_path = None; // Mark as modified
+                        self.run_project();
+                    }
+                    // Close edit panel if we deleted the entry being edited
+                    if self.editing_entry_index == Some(idx) {
+                        self.editing_entry_index = None;
+                    } else if let Some(edit_idx) = self.editing_entry_index {
+                        // Adjust edit index if we deleted an entry before it
+                        if idx < edit_idx {
+                            self.editing_entry_index = Some(edit_idx - 1);
+                        }
+                    }
+                }
 
                 ui.separator();
                 egui::CollapsingHeader::new("Project Exports (last run)")
@@ -1624,6 +2021,15 @@ impl eframe::App for VolumetricApp {
                 }
                     });
             });
+
+        // Right panel for editing project entries (shown when editing_entry_index is Some)
+        if self.editing_entry_index.is_some() {
+            egui::SidePanel::right("edit_panel")
+                .default_width(300.0)
+                .show(ctx, |ui| {
+                    self.show_edit_panel(ui);
+                });
+        }
 
         // Central panel with 3D view
         egui::CentralPanel::default().show(ctx, |ui| {

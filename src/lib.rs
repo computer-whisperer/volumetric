@@ -437,6 +437,11 @@ impl ExecuteWasmEntry {
     pub fn output_count(&self) -> usize {
         self.outputs.len()
     }
+    
+    /// Returns the outputs for this operation
+    pub fn outputs(&self) -> &[ExecuteWasmOutput] {
+        &self.outputs
+    }
 }
 
 /// Runtime state for WASM execution, holding inputs and collecting outputs
