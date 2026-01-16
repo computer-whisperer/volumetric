@@ -660,7 +660,7 @@ fn phase3_extract_mesh(octree: &AdaptiveOctree) -> Result<Vec<Triangle>> {
                 EdgeAxis::Y => (line_key.perp1 as f32 / scale, seg_mid, line_key.perp2 as f32 / scale),
                 EdgeAxis::Z => (line_key.perp1 as f32 / scale, line_key.perp2 as f32 / scale, seg_mid),
             };
-            
+
             // Edge direction along the axis
             let edge_dir = match line_key.axis {
                 EdgeAxis::X => (1.0, 0.0, 0.0),
@@ -976,6 +976,111 @@ mod tests {
                 *mixed += 1;
             }
         }
+    }
+
+    fn boundary_edge_count(triangles: &[Triangle]) -> usize {
+        // Quantize vertices so that shared edges compare reliably
+        let scale = 1_000_000.0f32;
+        let mut edges: HashMap<((i64, i64, i64), (i64, i64, i64)), usize> = HashMap::new();
+
+        for tri in triangles {
+            let verts = [tri[0], tri[1], tri[2]];
+            let tri_edges = [(0, 1), (1, 2), (2, 0)];
+
+            for &(ia, ib) in &tri_edges {
+                let a = verts[ia];
+                let b = verts[ib];
+
+                let qa = (
+                    (a.0 * scale).round() as i64,
+                    (a.1 * scale).round() as i64,
+                    (a.2 * scale).round() as i64,
+                );
+                let qb = (
+                    (b.0 * scale).round() as i64,
+                    (b.1 * scale).round() as i64,
+                    (b.2 * scale).round() as i64,
+                );
+
+                let key = if qa <= qb { (qa, qb) } else { (qb, qa) };
+                *edges.entry(key).or_default() += 1;
+            }
+        }
+
+        edges.values().filter(|&&count| count != 2).count()
+    }
+
+    fn edge_incidence_histogram(triangles: &[Triangle]) -> HashMap<usize, usize> {
+        let scale = 1_000_000.0f32;
+        let mut edges: HashMap<((i64, i64, i64), (i64, i64, i64)), usize> = HashMap::new();
+
+        for tri in triangles {
+            let verts = [tri[0], tri[1], tri[2]];
+            let tri_edges = [(0, 1), (1, 2), (2, 0)];
+
+            for &(ia, ib) in &tri_edges {
+                let a = verts[ia];
+                let b = verts[ib];
+
+                let qa = (
+                    (a.0 * scale).round() as i64,
+                    (a.1 * scale).round() as i64,
+                    (a.2 * scale).round() as i64,
+                );
+                let qb = (
+                    (b.0 * scale).round() as i64,
+                    (b.1 * scale).round() as i64,
+                    (b.2 * scale).round() as i64,
+                );
+
+                let key = if qa <= qb { (qa, qb) } else { (qb, qa) };
+                *edges.entry(key).or_default() += 1;
+            }
+        }
+
+        let mut hist = HashMap::new();
+        for count in edges.values() {
+            *hist.entry(*count).or_default() += 1;
+        }
+        hist
+    }
+
+    #[test]
+    fn test_torus_mesh_is_manifold() {
+        let wasm_path = std::path::Path::new("target/wasm32-unknown-unknown/release/simple_torus_model.wasm");
+
+        if !wasm_path.exists() {
+            eprintln!("Skipping test: torus wasm not found at {:?}", wasm_path);
+            return;
+        }
+
+        let wasm_bytes = std::fs::read(wasm_path).expect("Failed to read wasm file");
+
+        let config = AdaptiveMeshConfig {
+            base_resolution: 6,
+            max_refinement_depth: 3,
+        };
+
+        let bounds_min = (-1.35, -0.35, -1.35);
+        let bounds_max = (1.35, 0.35, 1.35);
+
+        let triangles = adaptive_surface_nets_mesh(&wasm_bytes, bounds_min, bounds_max, &config)
+            .expect("Mesh generation failed");
+
+        eprintln!("Triangles: {}", triangles.len());
+
+        let boundary_edges = boundary_edge_count(&triangles);
+
+        if boundary_edges != 0 {
+            let hist = edge_incidence_histogram(&triangles);
+            eprintln!("Edge incidence histogram: {:?}", hist);
+        }
+
+        assert_eq!(
+            boundary_edges, 0,
+            "Expected manifold mesh (no boundary edges), found {} boundary edges",
+            boundary_edges
+        );
     }
 
     #[test]
