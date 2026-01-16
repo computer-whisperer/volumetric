@@ -30,6 +30,12 @@ pub enum OperatorMetadataInput {
     /// The host UI uses this to generate widgets and encodes a CBOR map from field names to
     /// primitive values.
     CBORConfiguration(String),
+    /// A Lua script source input.
+    ///
+    /// The `String` is a template/stub script showing the required function signatures.
+    /// The host UI displays a multiline text editor pre-populated with this template.
+    /// The script is passed as UTF-8 bytes to the operator.
+    LuaSource(String),
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]

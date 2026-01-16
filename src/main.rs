@@ -312,6 +312,8 @@ struct VolumetricApp {
     operation_output_asset_id: String,
     operation_config_last_cddl: Option<String>,
     operation_config_values: HashMap<String, ConfigValue>,
+    /// Lua script source text for LuaSource inputs
+    operation_lua_script: String,
     operator_metadata_cache: HashMap<String, CachedOperatorMetadata>,
     resolution: usize,
     wgpu_target_format: wgpu::TextureFormat,
@@ -339,6 +341,7 @@ enum OperationChoice {
     Rotate,
     Scale,
     Boolean,
+    LuaScript,
 }
 
 impl OperationChoice {
@@ -348,6 +351,7 @@ impl OperationChoice {
             OperationChoice::Rotate => "Rotate (Euler degrees)",
             OperationChoice::Scale => "Scale (sx, sy, sz)",
             OperationChoice::Boolean => "Boolean (union/subtract/intersect)",
+            OperationChoice::LuaScript => "Lua Script (custom density field)",
         }
     }
 
@@ -357,6 +361,7 @@ impl OperationChoice {
             OperationChoice::Rotate => "rotation_operator",
             OperationChoice::Scale => "scale_operator",
             OperationChoice::Boolean => "boolean_operator",
+            OperationChoice::LuaScript => "lua_script_operator",
         }
     }
 }
@@ -459,6 +464,7 @@ impl VolumetricApp {
             operation_output_asset_id: "op_out".to_string(),
             operation_config_last_cddl: None,
             operation_config_values: HashMap::new(),
+            operation_lua_script: String::new(),
             operator_metadata_cache: HashMap::new(),
             resolution: 20,
             wgpu_target_format,
@@ -1063,6 +1069,11 @@ impl eframe::App for VolumetricApp {
                                 OperationChoice::Boolean,
                                 OperationChoice::Boolean.label(),
                             );
+                            ui.selectable_value(
+                                &mut self.operation_choice,
+                                OperationChoice::LuaScript,
+                                OperationChoice::LuaScript.label(),
+                            );
                         });
                 });
 
@@ -1160,6 +1171,29 @@ impl eframe::App for VolumetricApp {
                                     ));
                                 }
                             }
+                        } else if let OperatorMetadataInput::LuaSource(template) = input {
+                            // Initialize script with template if empty
+                            if self.operation_lua_script.is_empty() {
+                                self.operation_lua_script = template.clone();
+                            }
+
+                            ui.separator();
+                            ui.label(format!("Lua Script (input {input_idx})"));
+                            
+                            egui::ScrollArea::vertical()
+                                .max_height(300.0)
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::TextEdit::multiline(&mut self.operation_lua_script)
+                                            .code_editor()
+                                            .desired_width(f32::INFINITY)
+                                            .desired_rows(15),
+                                    );
+                                });
+
+                            if ui.add(egui::Button::new("Reset to template")).clicked() {
+                                self.operation_lua_script = template.clone();
+                            }
                         }
                     }
                     ui.separator();
@@ -1176,25 +1210,27 @@ impl eframe::App for VolumetricApp {
                     })
                     .unwrap_or(1);
 
-                ui.horizontal(|ui| {
-                    ui.label(if model_input_count >= 2 {
-                        "Input asset A:"
-                    } else {
-                        "Input asset:"
-                    });
-                    let selected = self.operation_input_asset_id.as_deref().unwrap_or("(none)");
-                    egui::ComboBox::from_id_salt("operation_input_asset_a")
-                        .selected_text(selected)
-                        .show_ui(ui, |ui| {
-                            for id in &input_asset_ids {
-                                ui.selectable_value(
-                                    &mut self.operation_input_asset_id,
-                                    Some(id.clone()),
-                                    id,
-                                );
-                            }
+                if model_input_count >= 1 {
+                    ui.horizontal(|ui| {
+                        ui.label(if model_input_count >= 2 {
+                            "Input asset A:"
+                        } else {
+                            "Input asset:"
                         });
-                });
+                        let selected = self.operation_input_asset_id.as_deref().unwrap_or("(none)");
+                        egui::ComboBox::from_id_salt("operation_input_asset_a")
+                            .selected_text(selected)
+                            .show_ui(ui, |ui| {
+                                for id in &input_asset_ids {
+                                    ui.selectable_value(
+                                        &mut self.operation_input_asset_id,
+                                        Some(id.clone()),
+                                        id,
+                                    );
+                                }
+                            });
+                    });
+                }
 
                 if model_input_count >= 2 {
                     ui.horizontal(|ui| {
@@ -1221,8 +1257,11 @@ impl eframe::App for VolumetricApp {
 
                 let has_required_inputs = if model_input_count >= 2 {
                     self.operation_input_asset_id.is_some() && self.operation_input_asset_id_b.is_some()
-                } else {
+                } else if model_input_count == 1 {
                     self.operation_input_asset_id.is_some()
+                } else {
+                    // model_input_count == 0: no model inputs required
+                    true
                 };
                 let can_add_op = self.project.is_some()
                     && has_required_inputs
@@ -1235,7 +1274,7 @@ impl eframe::App for VolumetricApp {
                     match operation_wasm_path(crate_name) {
                         Some(path) => match fs::read(&path) {
                             Ok(wasm_bytes) => {
-                                let input_id_a = self.operation_input_asset_id.clone().unwrap();
+                                let input_id_a = self.operation_input_asset_id.clone().unwrap_or_default();
                                 let input_id_b = self
                                     .operation_input_asset_id_b
                                     .clone()
@@ -1261,6 +1300,10 @@ impl eframe::App for VolumetricApp {
                                                     let bytes = encode_config_map_to_cbor(&fields, &self.operation_config_values)
                                                         .unwrap_or_default();
                                                     inputs.push(ExecuteWasmInput::Data(bytes));
+                                                }
+                                                OperatorMetadataInput::LuaSource(_) => {
+                                                    let script_bytes = self.operation_lua_script.as_bytes().to_vec();
+                                                    inputs.push(ExecuteWasmInput::Data(script_bytes));
                                                 }
                                             }
                                         }
