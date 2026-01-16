@@ -960,6 +960,28 @@ impl Project {
         let bytes = std::fs::read(path)?;
         Self::from_cbor(&bytes)
     }
+
+    /// Moves the entry at the given index up by one position (swaps with the previous entry).
+    ///
+    /// Returns `true` if the move was performed, `false` if the index is 0 or out of bounds.
+    pub fn move_entry_up(&mut self, index: usize) -> bool {
+        if index == 0 || index >= self.entries.len() {
+            return false;
+        }
+        self.entries.swap(index, index - 1);
+        true
+    }
+
+    /// Moves the entry at the given index down by one position (swaps with the next entry).
+    ///
+    /// Returns `true` if the move was performed, `false` if the index is the last element or out of bounds.
+    pub fn move_entry_down(&mut self, index: usize) -> bool {
+        if index >= self.entries.len() - 1 {
+            return false;
+        }
+        self.entries.swap(index, index + 1);
+        true
+    }
 }
 
 #[cfg(test)]

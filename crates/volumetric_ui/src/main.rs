@@ -1633,6 +1633,8 @@ impl eframe::App for VolumetricApp {
                 // Track actions to perform after the UI loop (to avoid borrow conflicts)
                 let mut entry_to_edit: Option<usize> = None;
                 let mut entry_to_delete: Option<usize> = None;
+                let mut entry_to_move_up: Option<usize> = None;
+                let mut entry_to_move_down: Option<usize> = None;
                 
                 egui::CollapsingHeader::new("Project Timeline")
                     .default_open(true)
@@ -1712,7 +1714,7 @@ impl eframe::App for VolumetricApp {
                                                         }
                                                     }
                                                     
-                                                    // Add Edit and Delete buttons
+                                                    // Add Edit, Delete, and Move buttons
                                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                                         if ui.small_button("🗑").on_hover_text("Delete entry").clicked() {
                                                             entry_to_delete = Some(idx);
@@ -1722,6 +1724,21 @@ impl eframe::App for VolumetricApp {
                                                             if ui.small_button("✏").on_hover_text("Edit entry").clicked() {
                                                                 entry_to_edit = Some(idx);
                                                             }
+                                                        }
+                                                        // Move down button (disabled for last entry)
+                                                        let is_last = idx == entries.len() - 1;
+                                                        if ui.add_enabled(!is_last, egui::Button::new("▼").small())
+                                                            .on_hover_text("Move down")
+                                                            .clicked()
+                                                        {
+                                                            entry_to_move_down = Some(idx);
+                                                        }
+                                                        // Move up button (disabled for first entry)
+                                                        if ui.add_enabled(idx > 0, egui::Button::new("▲").small())
+                                                            .on_hover_text("Move up")
+                                                            .clicked()
+                                                        {
+                                                            entry_to_move_up = Some(idx);
                                                         }
                                                     });
                                                 });
@@ -1754,6 +1771,42 @@ impl eframe::App for VolumetricApp {
                         // Adjust edit index if we deleted an entry before it
                         if idx < edit_idx {
                             self.editing_entry_index = Some(edit_idx - 1);
+                        }
+                    }
+                }
+                
+                // Handle move up action
+                if let Some(idx) = entry_to_move_up {
+                    if let Some(ref mut project) = self.project {
+                        if project.move_entry_up(idx) {
+                            self.project_path = None; // Mark as modified
+                            self.run_project();
+                            // Adjust edit index if needed
+                            if let Some(edit_idx) = self.editing_entry_index {
+                                if edit_idx == idx {
+                                    self.editing_entry_index = Some(idx - 1);
+                                } else if edit_idx == idx - 1 {
+                                    self.editing_entry_index = Some(idx);
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // Handle move down action
+                if let Some(idx) = entry_to_move_down {
+                    if let Some(ref mut project) = self.project {
+                        if project.move_entry_down(idx) {
+                            self.project_path = None; // Mark as modified
+                            self.run_project();
+                            // Adjust edit index if needed
+                            if let Some(edit_idx) = self.editing_entry_index {
+                                if edit_idx == idx {
+                                    self.editing_entry_index = Some(idx + 1);
+                                } else if edit_idx == idx + 1 {
+                                    self.editing_entry_index = Some(idx);
+                                }
+                            }
                         }
                     }
                 }
