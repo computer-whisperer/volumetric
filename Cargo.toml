@@ -3,6 +3,9 @@ name = "volumetric"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+path = "src/lib.rs"
+
 [workspace]
 members = [
     "crates/models/simple_sphere_model",
@@ -15,6 +18,7 @@ members = [
     "crates/operators/rotation_operator",
     "crates/operators/scale_operator",
     "crates/operators/lua_script_operator",
+    "crates/volumetric_ui",
 ]
 
 [dependencies]
@@ -22,27 +26,8 @@ wasmtime = "27"
 anyhow = "1"
 serde = { version="1.0.228", features = ["derive"] }
 wasmparser = "0.219"
-
-# GUI
-eframe = { version = "0.29", default-features = false, features = ["default_fonts", "wgpu", "x11", "wayland"] }
-
-# GPU point renderer helpers
-bytemuck = { version = "1", features = ["derive"] }
-glam = "0.27"
-
-# Direct wgpu dependency (used by the custom renderer module)
-wgpu = { version = "22.1.0", default-features = false, features = ["wgsl"] }
-
-# Utilities
-env_logger = "0.11"
-log = "0.4"
-
-# Native file dialog (runtime WASM selection)
-rfd = "0.14"
 thiserror = "1.0.69"
-
-# CBOR serialization for project files
 ciborium = "0.2"
-
-# Parallel processing
+log = "0.4"
+glam = "0.27"
 rayon = "1.10"

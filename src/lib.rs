@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 use std::fmt::Display;
+use std::path::Path;
 use std::sync::Arc;
-use wasmtime::{Caller, Store};
+use wasmtime::{Caller, Engine, Instance, Module, Store};
+
+pub type Triangle = [(f32, f32, f32); 3];
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExecutionError {
@@ -113,6 +116,202 @@ pub fn operator_metadata_from_wasm_bytes(wasm_bin: &[u8]) -> Result<OperatorMeta
     let mut cursor = std::io::Cursor::new(bytes);
     ciborium::de::from_reader(&mut cursor)
         .map_err(|e| ExecutionError::Wasmtime(format!("Failed to decode operator metadata CBOR: {e}")))
+}
+
+pub mod stl;
+pub mod marching_cubes_cpu;
+pub mod adaptive_surface_nets;
+
+/// Sample points from the WASM volumetric model
+pub fn sample_model(wasm_path: &Path, resolution: usize) -> anyhow::Result<(Vec<(f32, f32, f32)>, (f32, f32, f32), (f32, f32, f32))> {
+    let engine = Engine::default();
+    let module = Module::from_file(&engine, wasm_path)?;
+
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[])?;
+
+    let is_inside = instance.get_typed_func::<(f64, f64, f64), f32>(&mut store, "is_inside")?;
+
+    let get_bounds_min_x = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_x")?;
+    let get_bounds_min_y = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_y")?;
+    let get_bounds_min_z = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_z")?;
+    let get_bounds_max_x = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_x")?;
+    let get_bounds_max_y = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_y")?;
+    let get_bounds_max_z = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_z")?;
+
+    let min_x = get_bounds_min_x.call(&mut store, ())? as f32;
+    let min_y = get_bounds_min_y.call(&mut store, ())? as f32;
+    let min_z = get_bounds_min_z.call(&mut store, ())? as f32;
+    let max_x = get_bounds_max_x.call(&mut store, ())? as f32;
+    let max_y = get_bounds_max_y.call(&mut store, ())? as f32;
+    let max_z = get_bounds_max_z.call(&mut store, ())? as f32;
+
+    let bounds_min = (min_x, min_y, min_z);
+    let bounds_max = (max_x, max_y, max_z);
+
+    let mut points = Vec::new();
+
+    for z_idx in 0..resolution {
+        let z = min_z + (max_z - min_z) * (z_idx as f32 / (resolution - 1).max(1) as f32);
+        for y_idx in 0..resolution {
+            let y = min_y + (max_y - min_y) * (y_idx as f32 / (resolution - 1).max(1) as f32);
+            for x_idx in 0..resolution {
+                let x = min_x + (max_x - min_x) * (x_idx as f32 / (resolution - 1).max(1) as f32);
+                let density = is_inside.call(&mut store, (x as f64, y as f64, z as f64))?;
+                if density > 0.5 {
+                    points.push((x, y, z));
+                }
+            }
+        }
+    }
+
+    Ok((points, bounds_min, bounds_max))
+}
+
+/// Sample points from WASM bytes (in-memory model)
+pub fn sample_model_from_bytes(wasm_bytes: &[u8], resolution: usize) -> anyhow::Result<(Vec<(f32, f32, f32)>, (f32, f32, f32), (f32, f32, f32))> {
+    let engine = Engine::default();
+    let module = Module::new(&engine, wasm_bytes)?;
+
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[])?;
+
+    let is_inside = instance.get_typed_func::<(f64, f64, f64), f32>(&mut store, "is_inside")?;
+
+    let get_bounds_min_x = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_x")?;
+    let get_bounds_min_y = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_y")?;
+    let get_bounds_min_z = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_z")?;
+    let get_bounds_max_x = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_x")?;
+    let get_bounds_max_y = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_y")?;
+    let get_bounds_max_z = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_z")?;
+
+    let min_x = get_bounds_min_x.call(&mut store, ())? as f32;
+    let min_y = get_bounds_min_y.call(&mut store, ())? as f32;
+    let min_z = get_bounds_min_z.call(&mut store, ())? as f32;
+    let max_x = get_bounds_max_x.call(&mut store, ())? as f32;
+    let max_y = get_bounds_max_y.call(&mut store, ())? as f32;
+    let max_z = get_bounds_max_z.call(&mut store, ())? as f32;
+
+    let bounds_min = (min_x, min_y, min_z);
+    let bounds_max = (max_x, max_y, max_z);
+
+    let mut points = Vec::new();
+
+    for z_idx in 0..resolution {
+        let z = min_z + (max_z - min_z) * (z_idx as f32 / (resolution - 1).max(1) as f32);
+        for y_idx in 0..resolution {
+            let y = min_y + (max_y - min_y) * (y_idx as f32 / (resolution - 1).max(1) as f32);
+            for x_idx in 0..resolution {
+                let x = min_x + (max_x - min_x) * (x_idx as f32 / (resolution - 1).max(1) as f32);
+                let density = is_inside.call(&mut store, (x as f64, y as f64, z as f64))?;
+                if density > 0.5 {
+                    points.push((x, y, z));
+                }
+            }
+        }
+    }
+
+    Ok((points, bounds_min, bounds_max))
+}
+
+/// Generate a mesh using marching cubes algorithm from the WASM volumetric model
+pub fn generate_marching_cubes_mesh(wasm_path: &Path, resolution: usize) -> anyhow::Result<(Vec<Triangle>, (f32, f32, f32), (f32, f32, f32))> {
+    let engine = Engine::default();
+    let module = Module::from_file(&engine, wasm_path)?;
+
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[])?;
+
+    let is_inside = instance.get_typed_func::<(f64, f64, f64), f32>(&mut store, "is_inside")?;
+
+    let get_bounds_min_x = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_x")?;
+    let get_bounds_min_y = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_y")?;
+    let get_bounds_min_z = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_z")?;
+    let get_bounds_max_x = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_x")?;
+    let get_bounds_max_y = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_y")?;
+    let get_bounds_max_z = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_z")?;
+
+    let min_x = get_bounds_min_x.call(&mut store, ())? as f32;
+    let min_y = get_bounds_min_y.call(&mut store, ())? as f32;
+    let min_z = get_bounds_min_z.call(&mut store, ())? as f32;
+    let max_x = get_bounds_max_x.call(&mut store, ())? as f32;
+    let max_y = get_bounds_max_y.call(&mut store, ())? as f32;
+    let max_z = get_bounds_max_z.call(&mut store, ())? as f32;
+
+    let bounds_min = (min_x, min_y, min_z);
+    let bounds_max = (max_x, max_y, max_z);
+
+    let triangles = marching_cubes_cpu::marching_cubes_mesh(bounds_min, bounds_max, resolution, |p| {
+        let d = is_inside.call(&mut store, (p.0 as f64, p.1 as f64, p.2 as f64))?;
+        Ok(d)
+    })?;
+
+    Ok((triangles, bounds_min, bounds_max))
+}
+
+/// Generate a mesh using marching cubes from WASM bytes
+pub fn generate_marching_cubes_mesh_from_bytes(wasm_bytes: &[u8], resolution: usize) -> anyhow::Result<(Vec<Triangle>, (f32, f32, f32), (f32, f32, f32))> {
+    let engine = Engine::default();
+    let module = Module::new(&engine, wasm_bytes)?;
+
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[])?;
+
+    let is_inside = instance.get_typed_func::<(f64, f64, f64), f32>(&mut store, "is_inside")?;
+
+    let get_bounds_min_x = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_x")?;
+    let get_bounds_min_y = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_y")?;
+    let get_bounds_min_z = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_z")?;
+    let get_bounds_max_x = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_x")?;
+    let get_bounds_max_y = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_y")?;
+    let get_bounds_max_z = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_z")?;
+
+    let min_x = get_bounds_min_x.call(&mut store, ())? as f32;
+    let min_y = get_bounds_min_y.call(&mut store, ())? as f32;
+    let min_z = get_bounds_min_z.call(&mut store, ())? as f32;
+    let max_x = get_bounds_max_x.call(&mut store, ())? as f32;
+    let max_y = get_bounds_max_y.call(&mut store, ())? as f32;
+    let max_z = get_bounds_max_z.call(&mut store, ())? as f32;
+
+    let bounds_min = (min_x, min_y, min_z);
+    let bounds_max = (max_x, max_y, max_z);
+
+    let triangles = marching_cubes_cpu::marching_cubes_mesh(bounds_min, bounds_max, resolution, |p| {
+        let d = is_inside.call(&mut store, (p.0 as f64, p.1 as f64, p.2 as f64))?;
+        Ok(d)
+    })?;
+
+    Ok((triangles, bounds_min, bounds_max))
+}
+
+/// Generate an adaptive mesh from WASM bytes
+pub fn generate_adaptive_mesh_from_bytes(wasm_bytes: &[u8], config: &adaptive_surface_nets::AdaptiveMeshConfig) -> anyhow::Result<(Vec<Triangle>, (f32, f32, f32), (f32, f32, f32))> {
+    let engine = Engine::default();
+    let module = Module::new(&engine, wasm_bytes)?;
+
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[])?;
+
+    let get_bounds_min_x = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_x")?;
+    let get_bounds_min_y = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_y")?;
+    let get_bounds_min_z = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_z")?;
+    let get_bounds_max_x = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_x")?;
+    let get_bounds_max_y = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_y")?;
+    let get_bounds_max_z = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_z")?;
+
+    let min_x = get_bounds_min_x.call(&mut store, ())? as f32;
+    let min_y = get_bounds_min_y.call(&mut store, ())? as f32;
+    let min_z = get_bounds_min_z.call(&mut store, ())? as f32;
+    let max_x = get_bounds_max_x.call(&mut store, ())? as f32;
+    let max_y = get_bounds_max_y.call(&mut store, ())? as f32;
+    let max_z = get_bounds_max_z.call(&mut store, ())? as f32;
+
+    let bounds_min = (min_x, min_y, min_z);
+    let bounds_max = (max_x, max_y, max_z);
+
+    let triangles = adaptive_surface_nets::adaptive_surface_nets_mesh(wasm_bytes, bounds_min, bounds_max, config)?;
+
+    Ok((triangles, bounds_min, bounds_max))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, serde::Deserialize, serde::Serialize)]

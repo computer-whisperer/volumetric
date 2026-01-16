@@ -1,9 +1,5 @@
 use anyhow::Result;
 
-// Keep the old marching-cubes tables around for now (they are still useful for comparison,
-// and may be re-used later). Surface Nets is used for robustness on boolean fields.
-#[allow(unused_imports)]
-use crate::marching_cubes_tables::{EDGE_TABLE, TRI_TABLE};
 use crate::Triangle;
 
 /// CPU mesh generation.
@@ -458,14 +454,17 @@ mod tests {
         let resolution = 8;
 
         let tris = marching_cubes_mesh(bounds_min, bounds_max, resolution, |p| {
-            Ok(
-                p.0 >= bounds_min.0
+              Ok(if p.0 >= bounds_min.0
                     && p.0 <= bounds_max.0
                     && p.1 >= bounds_min.1
                     && p.1 <= bounds_max.1
                     && p.2 >= bounds_min.2
-                    && p.2 <= bounds_max.2,
-            )
+                    && p.2 <= bounds_max.2
+                {
+                    1.0
+                } else {
+                    0.0
+                })
         })
         .unwrap();
 
@@ -505,7 +504,7 @@ mod tests {
 
         let tris = marching_cubes_mesh(bounds_min, bounds_max, resolution, |p| {
             let r2 = p.0 * p.0 + p.1 * p.1 + p.2 * p.2;
-            Ok(r2 <= 0.75f32 * 0.75f32)
+            Ok(if r2 <= 0.75f32 * 0.75f32 { 1.0 } else { 0.0 })
         })
         .unwrap();
 
@@ -540,7 +539,7 @@ mod tests {
 
         let tris = marching_cubes_mesh(bounds_min, bounds_max, resolution, |p| {
             let r2 = p.0 * p.0 + p.1 * p.1 + p.2 * p.2;
-            Ok(r2 <= 0.75f32 * 0.75f32)
+            Ok(if r2 <= 0.75f32 * 0.75f32 { 1.0 } else { 0.0 })
         })
         .unwrap();
         assert!(!tris.is_empty());
@@ -591,7 +590,7 @@ mod tests {
             let xy = (p.0 * p.0 + p.1 * p.1).sqrt();
             let qx = xy - r_major;
             let qy = p.2;
-            Ok(qx * qx + qy * qy <= r_minor * r_minor)
+            Ok(if qx * qx + qy * qy <= r_minor * r_minor { 1.0 } else { 0.0 })
         })
         .unwrap();
         assert!(!tris.is_empty());

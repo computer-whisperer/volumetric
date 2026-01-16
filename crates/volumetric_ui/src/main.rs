@@ -3,25 +3,19 @@ use eframe::egui;
 use ciborium::value::Value as CborValue;
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::SystemTime;
 use std::sync::Arc;
-use wasmtime::*;
 
 mod point_cloud_wgpu;
 mod marching_cubes_wgpu;
-mod adaptive_surface_nets;
 
 // Project system
-mod lib;
-use lib::{
-    Asset,
+use volumetric::{
     AssetType,
     Environment,
-    ExecuteWasmEntry,
     ExecuteWasmInput,
     ExecuteWasmOutput,
-    LoadAssetEntry,
     LoadedAsset,
     Project,
     ProjectEntry,
@@ -29,9 +23,14 @@ use lib::{
     OperatorMetadataInput,
     OperatorMetadataOutput,
     operator_metadata_from_wasm_bytes,
+    Triangle,
+    adaptive_surface_nets,
+    stl,
+    sample_model_from_bytes,
+    generate_marching_cubes_mesh_from_bytes,
+    generate_adaptive_mesh_from_bytes,
 };
 
-#[derive(Clone, Debug)]
 enum ConfigFieldType {
     Bool,
     Int,
@@ -219,12 +218,6 @@ impl ExportRenderMode {
 }
 
 /// A triangle in 3D space
-type Triangle = [(f32, f32, f32); 3];
-
-// Marching cubes lookup tables
-mod marching_cubes_tables;
-mod marching_cubes_cpu;
-mod stl;
 
 /// Per-asset render data for multi-entity rendering support.
 /// Each exported asset can have its own render mode and cached geometry.
@@ -401,9 +394,12 @@ impl DemoChoice {
 }
 
 fn demo_wasm_path(crate_name: &str) -> Option<PathBuf> {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // We are in crates/volumetric_ui, so the workspace target directory is two levels up.
+    path.pop();
+    path.pop();
 
-    let release = root
+    let release = path
         .join("target")
         .join("wasm32-unknown-unknown")
         .join("release")
@@ -412,7 +408,7 @@ fn demo_wasm_path(crate_name: &str) -> Option<PathBuf> {
         return Some(release);
     }
 
-    let debug = root
+    let debug = path
         .join("target")
         .join("wasm32-unknown-unknown")
         .join("debug")
@@ -1384,10 +1380,10 @@ impl eframe::App for VolumetricApp {
                                                 ui.label(format!("{}.", idx + 1));
 
                                                 match entry {
-                                                    lib::ProjectEntry::LoadAsset(load_entry) => {
+                                                    ProjectEntry::LoadAsset(load_entry) => {
                                                         let icon = match load_entry.asset_type() {
-                                                            lib::AssetType::ModelWASM => "📦",
-                                                            lib::AssetType::OperationWASM => "⚙️",
+                                                            AssetType::ModelWASM => "📦",
+                                                            AssetType::OperationWASM => "⚙️",
                                                         };
                                                         ui.label(format!(
                                                             "{} Load: {}",
@@ -1395,7 +1391,7 @@ impl eframe::App for VolumetricApp {
                                                             load_entry.asset_id()
                                                         ));
                                                     }
-                                                    lib::ProjectEntry::ExecuteWASM(exec_entry) => {
+                                                    ProjectEntry::ExecuteWASM(exec_entry) => {
                                                         ui.vertical(|ui| {
                                                             ui.label(format!(
                                                                 "▶ Execute: {}",
@@ -1425,7 +1421,7 @@ impl eframe::App for VolumetricApp {
                                                             }
                                                         });
                                                     }
-                                                    lib::ProjectEntry::ExportAsset(asset_id) => {
+                                                    ProjectEntry::ExportAsset(asset_id) => {
                                                         ui.label(format!(
                                                             "📤 Export: {}",
                                                             asset_id
@@ -1770,224 +1766,6 @@ impl eframe::App for VolumetricApp {
         // Request continuous repaints for smooth interaction
         ctx.request_repaint();
     }
-}
-
-/// Sample points from the WASM volumetric model
-fn sample_model(wasm_path: &Path, resolution: usize) -> Result<(Vec<(f32, f32, f32)>, (f32, f32, f32), (f32, f32, f32))> {
-    let engine = Engine::default();
-    let module = Module::from_file(&engine, wasm_path)
-        .with_context(|| format!("Failed to load WASM module from {}", wasm_path.display()))?;
-
-    let mut store = Store::new(&engine, ());
-    let instance = Instance::new(&mut store, &module, &[])
-        .context("Failed to instantiate WASM module")?;
-    
-    let is_inside = instance
-        .get_typed_func::<(f64, f64, f64), f32>(&mut store, "is_inside")
-        .context("Failed to get 'is_inside' function")?;
-    
-    let get_bounds_min_x = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_x")?;
-    let get_bounds_min_y = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_y")?;
-    let get_bounds_min_z = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_z")?;
-    let get_bounds_max_x = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_x")?;
-    let get_bounds_max_y = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_y")?;
-    let get_bounds_max_z = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_z")?;
-    
-    let min_x = get_bounds_min_x.call(&mut store, ())? as f32;
-    let min_y = get_bounds_min_y.call(&mut store, ())? as f32;
-    let min_z = get_bounds_min_z.call(&mut store, ())? as f32;
-    let max_x = get_bounds_max_x.call(&mut store, ())? as f32;
-    let max_y = get_bounds_max_y.call(&mut store, ())? as f32;
-    let max_z = get_bounds_max_z.call(&mut store, ())? as f32;
-    
-    let bounds_min = (min_x, min_y, min_z);
-    let bounds_max = (max_x, max_y, max_z);
-    
-    let mut points = Vec::new();
-    
-    for z_idx in 0..resolution {
-        let z = min_z + (max_z - min_z) * (z_idx as f32 / (resolution - 1) as f32);
-        for y_idx in 0..resolution {
-            let y = min_y + (max_y - min_y) * (y_idx as f32 / (resolution - 1) as f32);
-            for x_idx in 0..resolution {
-                let x = min_x + (max_x - min_x) * (x_idx as f32 / (resolution - 1) as f32);
-                let density = is_inside.call(&mut store, (x as f64, y as f64, z as f64))?;
-                if density > 0.5 {
-                    points.push((x, y, z));
-                }
-            }
-        }
-    }
-    
-    Ok((points, bounds_min, bounds_max))
-}
-
-/// Generate a mesh using marching cubes algorithm from the WASM volumetric model
-fn generate_marching_cubes_mesh(wasm_path: &Path, resolution: usize) -> Result<(Vec<Triangle>, (f32, f32, f32), (f32, f32, f32))> {
-    
-    let engine = Engine::default();
-    let module = Module::from_file(&engine, wasm_path)
-        .with_context(|| format!("Failed to load WASM module from {}", wasm_path.display()))?;
-    
-    let mut store = Store::new(&engine, ());
-    let instance = Instance::new(&mut store, &module, &[])
-        .context("Failed to instantiate WASM module")?;
-    
-    let is_inside = instance
-        .get_typed_func::<(f64, f64, f64), f32>(&mut store, "is_inside")
-        .context("Failed to get 'is_inside' function")?;
-    
-    let get_bounds_min_x = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_x")?;
-    let get_bounds_min_y = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_y")?;
-    let get_bounds_min_z = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_z")?;
-    let get_bounds_max_x = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_x")?;
-    let get_bounds_max_y = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_y")?;
-    let get_bounds_max_z = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_z")?;
-    
-    let min_x = get_bounds_min_x.call(&mut store, ())? as f32;
-    let min_y = get_bounds_min_y.call(&mut store, ())? as f32;
-    let min_z = get_bounds_min_z.call(&mut store, ())? as f32;
-    let max_x = get_bounds_max_x.call(&mut store, ())? as f32;
-    let max_y = get_bounds_max_y.call(&mut store, ())? as f32;
-    let max_z = get_bounds_max_z.call(&mut store, ())? as f32;
-    
-    let bounds_min = (min_x, min_y, min_z);
-    let bounds_max = (max_x, max_y, max_z);
-
-    let triangles = marching_cubes_cpu::marching_cubes_mesh(bounds_min, bounds_max, resolution, |p| {
-        let d = is_inside.call(&mut store, (p.0 as f64, p.1 as f64, p.2 as f64))?;
-        Ok(d)
-    })?;
-
-    Ok((triangles, bounds_min, bounds_max))
-}
-
-/// Sample points from WASM bytes (in-memory model)
-fn sample_model_from_bytes(wasm_bytes: &[u8], resolution: usize) -> Result<(Vec<(f32, f32, f32)>, (f32, f32, f32), (f32, f32, f32))> {
-    let engine = Engine::default();
-    let module = Module::new(&engine, wasm_bytes)
-        .context("Failed to load WASM module from bytes")?;
-
-    let mut store = Store::new(&engine, ());
-    let instance = Instance::new(&mut store, &module, &[])
-        .context("Failed to instantiate WASM module")?;
-    
-    let is_inside = instance
-        .get_typed_func::<(f64, f64, f64), f32>(&mut store, "is_inside")
-        .context("Failed to get 'is_inside' function")?;
-    
-    let get_bounds_min_x = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_x")?;
-    let get_bounds_min_y = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_y")?;
-    let get_bounds_min_z = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_z")?;
-    let get_bounds_max_x = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_x")?;
-    let get_bounds_max_y = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_y")?;
-    let get_bounds_max_z = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_z")?;
-    
-    let min_x = get_bounds_min_x.call(&mut store, ())? as f32;
-    let min_y = get_bounds_min_y.call(&mut store, ())? as f32;
-    let min_z = get_bounds_min_z.call(&mut store, ())? as f32;
-    let max_x = get_bounds_max_x.call(&mut store, ())? as f32;
-    let max_y = get_bounds_max_y.call(&mut store, ())? as f32;
-    let max_z = get_bounds_max_z.call(&mut store, ())? as f32;
-    
-    let bounds_min = (min_x, min_y, min_z);
-    let bounds_max = (max_x, max_y, max_z);
-    
-    let mut points = Vec::new();
-    
-    for z_idx in 0..resolution {
-        let z = min_z + (max_z - min_z) * (z_idx as f32 / (resolution - 1) as f32);
-        for y_idx in 0..resolution {
-            let y = min_y + (max_y - min_y) * (y_idx as f32 / (resolution - 1) as f32);
-            for x_idx in 0..resolution {
-                let x = min_x + (max_x - min_x) * (x_idx as f32 / (resolution - 1) as f32);
-                let density = is_inside.call(&mut store, (x as f64, y as f64, z as f64))?;
-                if density > 0.5 {
-                    points.push((x, y, z));
-                }
-            }
-        }
-    }
-    
-    Ok((points, bounds_min, bounds_max))
-}
-
-/// Generate a mesh using marching cubes algorithm from WASM bytes (in-memory model)
-fn generate_marching_cubes_mesh_from_bytes(wasm_bytes: &[u8], resolution: usize) -> Result<(Vec<Triangle>, (f32, f32, f32), (f32, f32, f32))> {
-    let engine = Engine::default();
-    let module = Module::new(&engine, wasm_bytes)
-        .context("Failed to load WASM module from bytes")?;
-    
-    let mut store = Store::new(&engine, ());
-    let instance = Instance::new(&mut store, &module, &[])
-        .context("Failed to instantiate WASM module")?;
-    
-    let is_inside = instance
-        .get_typed_func::<(f64, f64, f64), f32>(&mut store, "is_inside")
-        .context("Failed to get 'is_inside' function")?;
-    
-    let get_bounds_min_x = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_x")?;
-    let get_bounds_min_y = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_y")?;
-    let get_bounds_min_z = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_z")?;
-    let get_bounds_max_x = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_x")?;
-    let get_bounds_max_y = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_y")?;
-    let get_bounds_max_z = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_z")?;
-    
-    let min_x = get_bounds_min_x.call(&mut store, ())? as f32;
-    let min_y = get_bounds_min_y.call(&mut store, ())? as f32;
-    let min_z = get_bounds_min_z.call(&mut store, ())? as f32;
-    let max_x = get_bounds_max_x.call(&mut store, ())? as f32;
-    let max_y = get_bounds_max_y.call(&mut store, ())? as f32;
-    let max_z = get_bounds_max_z.call(&mut store, ())? as f32;
-    
-    let bounds_min = (min_x, min_y, min_z);
-    let bounds_max = (max_x, max_y, max_z);
-
-    let triangles = marching_cubes_cpu::marching_cubes_mesh(bounds_min, bounds_max, resolution, |p| {
-        Ok(is_inside.call(&mut store, (p.0 as f64, p.1 as f64, p.2 as f64))?)
-    })?;
-
-    Ok((triangles, bounds_min, bounds_max))
-}
-
-/// Generate a mesh using adaptive surface nets algorithm from WASM bytes (in-memory model)
-fn generate_adaptive_mesh_from_bytes(
-    wasm_bytes: &[u8],
-    config: &adaptive_surface_nets::AdaptiveMeshConfig,
-) -> Result<(Vec<Triangle>, (f32, f32, f32), (f32, f32, f32))> {
-    let engine = Engine::default();
-    let module = Module::new(&engine, wasm_bytes)
-        .context("Failed to load WASM module from bytes")?;
-    
-    let mut store = Store::new(&engine, ());
-    let instance = Instance::new(&mut store, &module, &[])
-        .context("Failed to instantiate WASM module")?;
-    
-    let get_bounds_min_x = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_min_x")?;
-    let get_bounds_min_y = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_min_y")?;
-    let get_bounds_min_z = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_min_z")?;
-    let get_bounds_max_x = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_max_x")?;
-    let get_bounds_max_y = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_max_y")?;
-    let get_bounds_max_z = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_max_z")?;
-    
-    let min_x = get_bounds_min_x.call(&mut store, ())?;
-    let min_y = get_bounds_min_y.call(&mut store, ())?;
-    let min_z = get_bounds_min_z.call(&mut store, ())?;
-    let max_x = get_bounds_max_x.call(&mut store, ())?;
-    let max_y = get_bounds_max_y.call(&mut store, ())?;
-    let max_z = get_bounds_max_z.call(&mut store, ())?;
-    
-    let bounds_min = (min_x, min_y, min_z);
-    let bounds_max = (max_x, max_y, max_z);
-
-    let triangles = adaptive_surface_nets::adaptive_surface_nets_mesh(
-        wasm_bytes,
-        bounds_min,
-        bounds_max,
-        config,
-    )?;
-
-    Ok((triangles, bounds_min, bounds_max))
 }
 
 fn triangles_to_mesh_vertices(triangles: &[Triangle]) -> Vec<marching_cubes_wgpu::MeshVertex> {

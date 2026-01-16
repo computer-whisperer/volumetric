@@ -3838,6 +3838,21 @@ name = "volumetric"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ciborium",
+ "glam",
+ "log",
+ "rayon",
+ "serde",
+ "thiserror 1.0.69",
+ "wasmparser 0.219.2",
+ "wasmtime",
+]
+
+[[package]]
+name = "volumetric_ui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
  "bytemuck",
  "ciborium",
  "eframe",
@@ -3848,6 +3863,7 @@ dependencies = [
  "rfd",
  "serde",
  "thiserror 1.0.69",
+ "volumetric",
  "wasmparser 0.219.2",
  "wasmtime",
  "wgpu",
