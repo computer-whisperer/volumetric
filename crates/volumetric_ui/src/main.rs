@@ -303,8 +303,6 @@ struct VolumetricApp {
     operation_choice: OperationChoice,
     operation_input_asset_id: Option<String>,
     operation_input_asset_id_b: Option<String>,
-    operation_output_asset_id: String,
-    operation_config_last_cddl: Option<String>,
     operation_config_values: HashMap<String, ConfigValue>,
     /// Lua script source text for LuaSource inputs
     operation_lua_script: String,
@@ -468,8 +466,6 @@ impl VolumetricApp {
             operation_choice: OperationChoice::Translate,
             operation_input_asset_id: None,
             operation_input_asset_id_b: None,
-            operation_output_asset_id: "op_out".to_string(),
-            operation_config_last_cddl: None,
             operation_config_values: HashMap::new(),
             operation_lua_script: String::new(),
             operator_metadata_cache: HashMap::new(),
@@ -832,6 +828,7 @@ impl VolumetricApp {
                     Some((
                         exec_entry.asset_id().to_string(),
                         exec_entry.inputs().to_vec(),
+                        exec_entry.outputs().to_vec(),
                     ))
                 } else {
                     None
@@ -839,13 +836,17 @@ impl VolumetricApp {
             })
         });
         
-        let Some((asset_id, inputs)) = entry_data else { return };
+        let Some((asset_id, inputs, outputs)) = entry_data else { return };
         
         self.editing_entry_index = Some(idx);
         self.edit_config_values.clear();
         self.edit_lua_script.clear();
         self.edit_input_asset_ids.clear();
-        self.edit_output_asset_id.clear();
+        
+        // Populate output asset ID from the first output (primary output)
+        self.edit_output_asset_id = outputs.first()
+            .map(|o| o.asset_id.clone())
+            .unwrap_or_default();
         
         // Get operator metadata to understand input types
         let crate_name = asset_id.strip_prefix("op_").unwrap_or(&asset_id);
@@ -1176,12 +1177,25 @@ impl VolumetricApp {
             }
         });
         
+        ui.add_space(8.0);
+        ui.separator();
+        
+        // Output name editing
+        ui.label("Output:");
+        ui.indent("edit_output", |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Output asset name:");
+                ui.text_edit_singleline(&mut self.edit_output_asset_id);
+            });
+        });
+        
         ui.add_space(16.0);
         ui.separator();
         
         // Action buttons
+        let can_apply = !self.edit_output_asset_id.trim().is_empty();
         ui.horizontal(|ui| {
-            if ui.button("Apply Changes").clicked() {
+            if ui.add_enabled(can_apply, egui::Button::new("Apply Changes")).clicked() {
                 self.apply_edit_changes();
             }
             if ui.button("Cancel").clicked() {
@@ -1244,15 +1258,49 @@ impl VolumetricApp {
         
         // Update the project entry
         if let Some(ref mut project) = self.project {
+            // Get the old output asset ID to find and update the corresponding ExportAsset
+            let old_output_id = project.entries().get(idx).and_then(|entry| {
+                if let ProjectEntry::ExecuteWASM(exec_entry) = entry {
+                    exec_entry.outputs().first().map(|o| o.asset_id.clone())
+                } else {
+                    None
+                }
+            });
+            
+            let new_output_id = self.edit_output_asset_id.trim().to_string();
+            
             if let Some(ProjectEntry::ExecuteWASM(exec_entry)) = project.entries_mut().get_mut(idx) {
-                // We need to create a new ExecuteWasmEntry with updated inputs
-                // but keep the same outputs
+                // Build new outputs with the edited output name
+                let new_outputs: Vec<ExecuteWasmOutput> = exec_entry.outputs().iter().enumerate().map(|(i, old_out)| {
+                    if i == 0 {
+                        // Primary output uses the edited name
+                        ExecuteWasmOutput::new(new_output_id.clone(), old_out.asset_type)
+                    } else {
+                        // Secondary outputs get a suffix
+                        ExecuteWasmOutput::new(format!("{}_{}", new_output_id, i), old_out.asset_type)
+                    }
+                }).collect();
+                
                 let new_entry = ExecuteWasmEntry::new(
                     exec_entry.asset_id().to_string(),
                     new_inputs,
-                    exec_entry.outputs().to_vec(),
+                    new_outputs,
                 );
                 *exec_entry = new_entry;
+            }
+            
+            // Update the corresponding ExportAsset entry if the output name changed
+            if let Some(old_id) = old_output_id {
+                if old_id != new_output_id {
+                    for entry in project.entries_mut().iter_mut() {
+                        if let ProjectEntry::ExportAsset(export_id) = entry {
+                            if *export_id == old_id {
+                                *export_id = new_output_id.clone();
+                                break;
+                            }
+                        }
+                    }
+                }
             }
         }
         
@@ -1531,7 +1579,7 @@ impl eframe::App for VolumetricApp {
                 let crate_name = self.operation_choice.crate_name();
                 let operator_metadata = self.operator_metadata_cached(crate_name);
 
-                // Render input pickers. If the operator expects 2+ model inputs, show A/B.
+                // Determine how many model inputs this operator needs
                 let model_input_count = operator_metadata
                     .as_ref()
                     .map(|m| {
@@ -1542,51 +1590,7 @@ impl eframe::App for VolumetricApp {
                     })
                     .unwrap_or(1);
 
-                if model_input_count >= 1 {
-                    ui.horizontal(|ui| {
-                        ui.label(if model_input_count >= 2 {
-                            "Input asset A:"
-                        } else {
-                            "Input asset:"
-                        });
-                        let selected = self.operation_input_asset_id.as_deref().unwrap_or("(none)");
-                        egui::ComboBox::from_id_salt("operation_input_asset_a")
-                            .selected_text(selected)
-                            .show_ui(ui, |ui| {
-                                for id in &input_asset_ids {
-                                    ui.selectable_value(
-                                        &mut self.operation_input_asset_id,
-                                        Some(id.clone()),
-                                        id,
-                                    );
-                                }
-                            });
-                    });
-                }
-
-                if model_input_count >= 2 {
-                    ui.horizontal(|ui| {
-                        ui.label("Input asset B:");
-                        let selected = self.operation_input_asset_id_b.as_deref().unwrap_or("(none)");
-                        egui::ComboBox::from_id_salt("operation_input_asset_b")
-                            .selected_text(selected)
-                            .show_ui(ui, |ui| {
-                                for id in &input_asset_ids {
-                                    ui.selectable_value(
-                                        &mut self.operation_input_asset_id_b,
-                                        Some(id.clone()),
-                                        id,
-                                    );
-                                }
-                            });
-                    });
-                }
-
-                ui.horizontal(|ui| {
-                    ui.label("Output asset id:");
-                    ui.text_edit_singleline(&mut self.operation_output_asset_id);
-                });
-
+                // Check if we have enough inputs available (defaults are auto-selected above)
                 let has_required_inputs = if model_input_count >= 2 {
                     self.operation_input_asset_id.is_some() && self.operation_input_asset_id_b.is_some()
                 } else if model_input_count == 1 {
@@ -1595,9 +1599,7 @@ impl eframe::App for VolumetricApp {
                     // model_input_count == 0: no model inputs required
                     true
                 };
-                let can_add_op = self.project.is_some()
-                    && has_required_inputs
-                    && !self.operation_output_asset_id.trim().is_empty();
+                let can_add_op = self.project.is_some() && has_required_inputs;
                 if ui
                     .add_enabled(can_add_op, egui::Button::new("Add New Operation"))
                     .clicked()
@@ -1611,7 +1613,10 @@ impl eframe::App for VolumetricApp {
                                     .operation_input_asset_id_b
                                     .clone()
                                     .unwrap_or_else(|| input_id_a.clone());
-                                let output_id = self.operation_output_asset_id.trim().to_string();
+                                // Auto-generate a unique output name based on operator type and primary input
+                                let output_id = self.project.as_ref()
+                                    .map(|p| p.default_output_name(crate_name, Some(&input_id_a)))
+                                    .unwrap_or_else(|| format!("{}_output", crate_name));
                                 let op_asset_id = format!("op_{crate_name}");
 
                                 let (inputs, outputs) = match self.operator_metadata_cached(crate_name) {

@@ -754,7 +754,39 @@ impl Project {
         last
     }
 
-    fn unique_asset_id(&self, base: &str) -> String {
+    /// Generates a reasonable default output name for an operator based on its type and primary input.
+    ///
+    /// The name is derived from the operator crate name (e.g., "translate_operator" -> "translated")
+    /// and the primary input asset ID. The result is then made unique via `unique_asset_id`.
+    pub fn default_output_name(&self, operator_crate_name: &str, primary_input: Option<&str>) -> String {
+        // Map operator crate names to descriptive past-tense suffixes
+        let suffix = match operator_crate_name {
+            "translate_operator" => "translated",
+            "rotation_operator" => "rotated",
+            "scale_operator" => "scaled",
+            "boolean_operator" => "boolean_result",
+            "lua_script_operator" => "scripted",
+            _ => {
+                // For unknown operators, use the crate name with "_output" suffix
+                let base = operator_crate_name.strip_suffix("_operator").unwrap_or(operator_crate_name);
+                return self.unique_asset_id(&format!("{}_output", base));
+            }
+        };
+
+        // If we have a primary input, combine it with the suffix
+        let base = match primary_input {
+            Some(input) => format!("{}_{}", input, suffix),
+            None => suffix.to_string(),
+        };
+
+        self.unique_asset_id(&base)
+    }
+
+    /// Generates a unique asset ID based on the given base name.
+    ///
+    /// If `base` is not already declared, it is returned as-is. Otherwise, a numeric suffix
+    /// (`_2`, `_3`, etc.) is appended until a unique name is found.
+    pub fn unique_asset_id(&self, base: &str) -> String {
         let declared: std::collections::HashSet<String> = self
             .declared_assets()
             .into_iter()
