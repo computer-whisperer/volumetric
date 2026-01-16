@@ -123,29 +123,29 @@ fn transform_wasm(input_bytes: &[u8], cfg: TranslateConfig) -> Result<Vec<u8>, S
 
             match *original_name {
                 "is_inside" => {
-                    // is_inside(x, y, z) -> i32
+                    // is_inside(x, y, z) -> f32 (density)
                     // Wrapper: is_inside(x, y, z) calls original_is_inside(x - dx, y - dy, z - dz)
                     let mut builder = FunctionBuilder::new(
                         &mut module.types,
-                        &[ValType::F32, ValType::F32, ValType::F32],
-                        &[ValType::I32],
+                        &[ValType::F64, ValType::F64, ValType::F64],
+                        &[ValType::F32],
                     );
 
-                    let x = module.locals.add(ValType::F32);
-                    let y = module.locals.add(ValType::F32);
-                    let z = module.locals.add(ValType::F32);
+                    let x = module.locals.add(ValType::F64);
+                    let y = module.locals.add(ValType::F64);
+                    let z = module.locals.add(ValType::F64);
 
                     builder
                         .func_body()
                         .local_get(x)
-                        .f32_const(-cfg.dx)
-                        .binop(walrus::ir::BinaryOp::F32Add)
+                        .f64_const(-(cfg.dx as f64))
+                        .binop(walrus::ir::BinaryOp::F64Add)
                         .local_get(y)
-                        .f32_const(-cfg.dy)
-                        .binop(walrus::ir::BinaryOp::F32Add)
+                        .f64_const(-(cfg.dy as f64))
+                        .binop(walrus::ir::BinaryOp::F64Add)
                         .local_get(z)
-                        .f32_const(-cfg.dz)
-                        .binop(walrus::ir::BinaryOp::F32Add)
+                        .f64_const(-(cfg.dz as f64))
+                        .binop(walrus::ir::BinaryOp::F64Add)
                         .call(original_func_id);
 
                     let wrapper_id = builder.finish(vec![x, y, z], &mut module.funcs);

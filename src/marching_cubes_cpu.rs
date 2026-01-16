@@ -25,7 +25,8 @@ pub fn marching_cubes_mesh<F>(
     mut is_inside: F,
 ) -> Result<Vec<Triangle>>
 where
-    F: FnMut((f32, f32, f32)) -> Result<bool>,
+    // Returns density in [0,1]; current callers typically return 0.0/1.0
+    F: FnMut((f32, f32, f32)) -> Result<f32>,
 {
     if resolution == 0 {
         return Ok(Vec::new());
@@ -70,7 +71,8 @@ where
         for y in min_corner..=max_corner {
             for x in min_corner..=max_corner {
                 let p = corner_pos(x, y, z);
-                corner_inside[corner_idx3(x, y, z)] = is_inside(p)?;
+                // Convert density to boolean occupancy
+                corner_inside[corner_idx3(x, y, z)] = is_inside(p)? > 0.5;
             }
         }
     }
@@ -355,8 +357,8 @@ where
                     centroid.2 - nu.2 * d,
                 );
 
-                let inside_plus = is_inside(probe_plus)?;
-                let inside_minus = is_inside(probe_minus)?;
+                let inside_plus = is_inside(probe_plus)? > 0.5;
+                let inside_minus = is_inside(probe_minus)? > 0.5;
                 if inside_plus != inside_minus {
                     decided = true;
                     // If moving along the current normal goes inside and the opposite direction
@@ -385,10 +387,10 @@ where
                         centroid.1 - nu.1 * d,
                         centroid.2 - nu.2 * d,
                     );
-                    if is_inside(probe_plus)? {
+                    if is_inside(probe_plus)? > 0.5 {
                         plus_inside_hits += 1;
                     }
-                    if is_inside(probe_minus)? {
+                    if is_inside(probe_minus)? > 0.5 {
                         minus_inside_hits += 1;
                     }
                 }

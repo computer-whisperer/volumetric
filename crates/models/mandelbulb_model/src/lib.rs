@@ -16,19 +16,19 @@ fn panic(_info: &PanicInfo) -> ! {
 }
 
 #[inline]
-fn length3(x: f32, y: f32, z: f32) -> f32 {
-    libm::sqrtf(x * x + y * y + z * z)
+fn length3(x: f64, y: f64, z: f64) -> f64 {
+    libm::sqrt(x * x + y * y + z * z)
 }
 
 #[inline]
-fn mandelbulb_inside(cx: f32, cy: f32, cz: f32) -> bool {
-    let power: f32 = 8.0;
+fn mandelbulb_inside(cx: f64, cy: f64, cz: f64) -> bool {
+    let power: f64 = 8.0;
     let max_iter: u32 = 18;
-    let bailout: f32 = 2.0;
+    let bailout: f64 = 2.0;
 
-    let mut x = 0.0f32;
-    let mut y = 0.0f32;
-    let mut z = 0.0f32;
+    let mut x = 0.0f64;
+    let mut y = 0.0f64;
+    let mut z = 0.0f64;
 
     for _ in 0..max_iter {
         let r = length3(x, y, z);
@@ -42,17 +42,17 @@ fn mandelbulb_inside(cx: f32, cy: f32, cz: f32) -> bool {
             continue;
         }
 
-        let theta = libm::acosf((z / r).clamp(-1.0, 1.0));
-        let phi = libm::atan2f(y, x);
+        let theta = libm::acos((z / r).clamp(-1.0, 1.0));
+        let phi = libm::atan2(y, x);
 
-        let rp = libm::powf(r, power);
+        let rp = libm::pow(r, power);
         let thetap = theta * power;
         let phip = phi * power;
 
-        let sin_t = libm::sinf(thetap);
-        let nx = rp * sin_t * libm::cosf(phip);
-        let ny = rp * sin_t * libm::sinf(phip);
-        let nz = rp * libm::cosf(thetap);
+        let sin_t = libm::sin(thetap);
+        let nx = rp * sin_t * libm::cos(phip);
+        let ny = rp * sin_t * libm::sin(phip);
+        let nz = rp * libm::cos(thetap);
 
         x = nx + cx;
         y = ny + cy;
@@ -63,10 +63,10 @@ fn mandelbulb_inside(cx: f32, cy: f32, cz: f32) -> bool {
 }
 
 #[no_mangle]
-pub extern "C" fn is_inside(x: f32, y: f32, z: f32) -> i32 {
+pub extern "C" fn is_inside(x: f64, y: f64, z: f64) -> f32 {
     // Slight scale so the interesting structure fills the bounds better.
-    let s = 0.9;
-    mandelbulb_inside(x * s, y * s, z * s) as i32
+    let s = 0.9f64;
+    if mandelbulb_inside(x * s, y * s, z * s) { 1.0 } else { 0.0 }
 }
 
 #[no_mangle]

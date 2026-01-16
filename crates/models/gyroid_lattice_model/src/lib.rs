@@ -16,24 +16,24 @@ fn panic(_info: &PanicInfo) -> ! {
 }
 
 #[inline]
-fn gyroid(x: f32, y: f32, z: f32) -> f32 {
-    libm::sinf(x) * libm::cosf(y) + libm::sinf(y) * libm::cosf(z) + libm::sinf(z) * libm::cosf(x)
+fn gyroid(x: f64, y: f64, z: f64) -> f64 {
+    libm::sin(x) * libm::cos(y) + libm::sin(y) * libm::cos(z) + libm::sin(z) * libm::cos(x)
 }
 
 #[inline]
-fn in_bounds(x: f32, y: f32, z: f32, b: f32) -> bool {
+fn in_bounds(x: f64, y: f64, z: f64, b: f64) -> bool {
     x >= -b && x <= b && y >= -b && y <= b && z >= -b && z <= b
 }
 
 #[no_mangle]
-pub extern "C" fn is_inside(x: f32, y: f32, z: f32) -> i32 {
-    let bound = 3.14159265; // ~pi
+pub extern "C" fn is_inside(x: f64, y: f64, z: f64) -> f32 {
+    let bound = 3.14159265f64; // ~pi
     if !in_bounds(x, y, z, bound) {
-        return 0;
+        return 0.0;
     }
 
-    let thickness = 0.28;
-    (gyroid(x, y, z).abs() < thickness) as i32
+    let thickness = 0.28f64;
+    if gyroid(x, y, z).abs() < thickness { 1.0 } else { 0.0 }
 }
 
 #[no_mangle]

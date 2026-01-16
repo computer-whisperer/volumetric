@@ -2,7 +2,7 @@
 
 //! Demo model: Torus (ring) centered at origin.
 //!
-//! Exports `is_inside(x,y,z) -> i32` and bounding-box getter functions.
+//! Exports `is_inside(x,y,z) -> f32` (density) and bounding-box getter functions.
 
 #[cfg(target_arch = "wasm32")]
 use core::panic::PanicInfo;
@@ -14,18 +14,18 @@ fn panic(_info: &PanicInfo) -> ! {
 }
 
 #[inline]
-fn inside_torus(x: f32, y: f32, z: f32) -> bool {
+fn inside_torus(x: f64, y: f64, z: f64) -> bool {
     // Implicit torus: (sqrt(x^2+z^2) - R)^2 + y^2 <= r^2
     // R: major radius, r: minor radius
     let r_major = 1.0;
     let r_minor = 0.35;
-    let q = libm::sqrtf(x * x + z * z) - r_major;
+    let q = libm::sqrt(x * x + z * z) - r_major;
     q * q + y * y <= r_minor * r_minor
 }
 
 #[no_mangle]
-pub extern "C" fn is_inside(x: f32, y: f32, z: f32) -> i32 {
-    inside_torus(x, y, z) as i32
+pub extern "C" fn is_inside(x: f64, y: f64, z: f64) -> f32 {
+    if inside_torus(x, y, z) { 1.0 } else { 0.0 }
 }
 
 // Bounds: x/z in [-R-r, R+r], y in [-r, r]

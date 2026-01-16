@@ -334,26 +334,27 @@ fn add_is_inside_wrapper(
     op: BooleanOp,
 ) {
     let ty = types.len();
-    types.ty().function([ValType::F32, ValType::F32, ValType::F32], [ValType::I32]);
+    // New ABI: (f64,f64,f64) -> f32 (density). We keep boolean semantics by thresholding at 0.5
+    types.ty().function([ValType::F64, ValType::F64, ValType::F64], [ValType::F32]);
     funcs.function(ty);
 
     let mut f = Function::new([]);
-    // a = (a_is_inside(x,y,z) != 0)
+    // a_bool = (a_density(x,y,z) > 0.5)
     f.instruction(&Instruction::LocalGet(0));
     f.instruction(&Instruction::LocalGet(1));
     f.instruction(&Instruction::LocalGet(2));
     f.instruction(&Instruction::Call(a_idx));
-    f.instruction(&Instruction::I32Const(0));
-    f.instruction(&Instruction::I32Ne);
+    f.instruction(&Instruction::F32Const(0.5));
+    f.instruction(&Instruction::F32Gt);
 
     if op == BooleanOp::Subtract {
-        // b = (b_is_inside != 0)
+        // b_bool = (b_density > 0.5)
         f.instruction(&Instruction::LocalGet(0));
         f.instruction(&Instruction::LocalGet(1));
         f.instruction(&Instruction::LocalGet(2));
         f.instruction(&Instruction::Call(b_idx));
-        f.instruction(&Instruction::I32Const(0));
-        f.instruction(&Instruction::I32Ne);
+        f.instruction(&Instruction::F32Const(0.5));
+        f.instruction(&Instruction::F32Gt);
         // a && !b
         f.instruction(&Instruction::I32Eqz);
         f.instruction(&Instruction::I32And);
@@ -362,8 +363,8 @@ fn add_is_inside_wrapper(
         f.instruction(&Instruction::LocalGet(1));
         f.instruction(&Instruction::LocalGet(2));
         f.instruction(&Instruction::Call(b_idx));
-        f.instruction(&Instruction::I32Const(0));
-        f.instruction(&Instruction::I32Ne);
+        f.instruction(&Instruction::F32Const(0.5));
+        f.instruction(&Instruction::F32Gt);
         f.instruction(&Instruction::I32Or);
     } else {
         // intersect
@@ -371,14 +372,13 @@ fn add_is_inside_wrapper(
         f.instruction(&Instruction::LocalGet(1));
         f.instruction(&Instruction::LocalGet(2));
         f.instruction(&Instruction::Call(b_idx));
-        f.instruction(&Instruction::I32Const(0));
-        f.instruction(&Instruction::I32Ne);
+        f.instruction(&Instruction::F32Const(0.5));
+        f.instruction(&Instruction::F32Gt);
         f.instruction(&Instruction::I32And);
     }
 
-    // convert boolean to 0/1
-    f.instruction(&Instruction::I32Const(0));
-    f.instruction(&Instruction::I32Ne);
+    // convert boolean i32 to f32 0.0/1.0
+    f.instruction(&Instruction::F32ConvertI32S);
     f.instruction(&Instruction::End);
     code.function(&f);
 

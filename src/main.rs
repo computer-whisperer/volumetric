@@ -1732,7 +1732,7 @@ fn sample_model(wasm_path: &Path, resolution: usize) -> Result<(Vec<(f32, f32, f
         .context("Failed to instantiate WASM module")?;
     
     let is_inside = instance
-        .get_typed_func::<(f32, f32, f32), i32>(&mut store, "is_inside")
+        .get_typed_func::<(f64, f64, f64), f32>(&mut store, "is_inside")
         .context("Failed to get 'is_inside' function")?;
     
     let get_bounds_min_x = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_min_x")?;
@@ -1760,8 +1760,8 @@ fn sample_model(wasm_path: &Path, resolution: usize) -> Result<(Vec<(f32, f32, f
             let y = min_y + (max_y - min_y) * (y_idx as f32 / (resolution - 1) as f32);
             for x_idx in 0..resolution {
                 let x = min_x + (max_x - min_x) * (x_idx as f32 / (resolution - 1) as f32);
-                let inside = is_inside.call(&mut store, (x, y, z))?;
-                if inside != 0 {
+                let density = is_inside.call(&mut store, (x as f64, y as f64, z as f64))?;
+                if density > 0.5 {
                     points.push((x, y, z));
                 }
             }
@@ -1783,7 +1783,7 @@ fn generate_marching_cubes_mesh(wasm_path: &Path, resolution: usize) -> Result<(
         .context("Failed to instantiate WASM module")?;
     
     let is_inside = instance
-        .get_typed_func::<(f32, f32, f32), i32>(&mut store, "is_inside")
+        .get_typed_func::<(f64, f64, f64), f32>(&mut store, "is_inside")
         .context("Failed to get 'is_inside' function")?;
     
     let get_bounds_min_x = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_min_x")?;
@@ -1804,7 +1804,8 @@ fn generate_marching_cubes_mesh(wasm_path: &Path, resolution: usize) -> Result<(
     let bounds_max = (max_x, max_y, max_z);
 
     let triangles = marching_cubes_cpu::marching_cubes_mesh(bounds_min, bounds_max, resolution, |p| {
-        Ok(is_inside.call(&mut store, p)? != 0)
+        let d = is_inside.call(&mut store, (p.0 as f64, p.1 as f64, p.2 as f64))?;
+        Ok(d)
     })?;
 
     Ok((triangles, bounds_min, bounds_max))
@@ -1821,7 +1822,7 @@ fn sample_model_from_bytes(wasm_bytes: &[u8], resolution: usize) -> Result<(Vec<
         .context("Failed to instantiate WASM module")?;
     
     let is_inside = instance
-        .get_typed_func::<(f32, f32, f32), i32>(&mut store, "is_inside")
+        .get_typed_func::<(f64, f64, f64), f32>(&mut store, "is_inside")
         .context("Failed to get 'is_inside' function")?;
     
     let get_bounds_min_x = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_min_x")?;
@@ -1849,8 +1850,8 @@ fn sample_model_from_bytes(wasm_bytes: &[u8], resolution: usize) -> Result<(Vec<
             let y = min_y + (max_y - min_y) * (y_idx as f32 / (resolution - 1) as f32);
             for x_idx in 0..resolution {
                 let x = min_x + (max_x - min_x) * (x_idx as f32 / (resolution - 1) as f32);
-                let inside = is_inside.call(&mut store, (x, y, z))?;
-                if inside != 0 {
+                let density = is_inside.call(&mut store, (x as f64, y as f64, z as f64))?;
+                if density > 0.5 {
                     points.push((x, y, z));
                 }
             }
@@ -1871,7 +1872,7 @@ fn generate_marching_cubes_mesh_from_bytes(wasm_bytes: &[u8], resolution: usize)
         .context("Failed to instantiate WASM module")?;
     
     let is_inside = instance
-        .get_typed_func::<(f32, f32, f32), i32>(&mut store, "is_inside")
+        .get_typed_func::<(f64, f64, f64), f32>(&mut store, "is_inside")
         .context("Failed to get 'is_inside' function")?;
     
     let get_bounds_min_x = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_min_x")?;
@@ -1892,7 +1893,7 @@ fn generate_marching_cubes_mesh_from_bytes(wasm_bytes: &[u8], resolution: usize)
     let bounds_max = (max_x, max_y, max_z);
 
     let triangles = marching_cubes_cpu::marching_cubes_mesh(bounds_min, bounds_max, resolution, |p| {
-        Ok(is_inside.call(&mut store, p)? != 0)
+        Ok(is_inside.call(&mut store, (p.0 as f64, p.1 as f64, p.2 as f64))?)
     })?;
 
     Ok((triangles, bounds_min, bounds_max))

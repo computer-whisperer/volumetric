@@ -2,27 +2,27 @@
 //! Uses a standard signed-distance formula and treats SDF <= 0 as inside.
 
 #[inline]
-fn abs3(x: f32, y: f32, z: f32) -> (f32, f32, f32) {
+fn abs3(x: f64, y: f64, z: f64) -> (f64, f64, f64) {
     (x.abs(), y.abs(), z.abs())
 }
 
 #[inline]
-fn max_f32(a: f32, b: f32) -> f32 {
+fn max_f32(a: f64, b: f64) -> f64 {
     if a > b { a } else { b }
 }
 
 #[inline]
-fn min_f32(a: f32, b: f32) -> f32 {
+fn min_f32(a: f64, b: f64) -> f64 {
     if a < b { a } else { b }
 }
 
 #[inline]
-fn length3(x: f32, y: f32, z: f32) -> f32 {
-    (x * x + y * y + z * z).sqrt()
+fn length3(x: f64, y: f64, z: f64) -> f64 {
+    libm::sqrt(x * x + y * y + z * z)
 }
 
 #[inline]
-fn sdf_rounded_box(x: f32, y: f32, z: f32, bx: f32, by: f32, bz: f32, r: f32) -> f32 {
+fn sdf_rounded_box(x: f64, y: f64, z: f64, bx: f64, by: f64, bz: f64, r: f64) -> f64 {
     // Quilez: sdRoundBox(p, b, r)
     let (ax, ay, az) = abs3(x, y, z);
     let qx = ax - bx;
@@ -39,10 +39,10 @@ fn sdf_rounded_box(x: f32, y: f32, z: f32, bx: f32, by: f32, bz: f32, r: f32) ->
 }
 
 #[no_mangle]
-pub extern "C" fn is_inside(x: f32, y: f32, z: f32) -> i32 {
+pub extern "C" fn is_inside(x: f64, y: f64, z: f64) -> f32 {
     let b = (0.9, 0.6, 0.4);
     let r = 0.2;
-    (sdf_rounded_box(x, y, z, b.0, b.1, b.2, r) <= 0.0) as i32
+    if sdf_rounded_box(x, y, z, b.0, b.1, b.2, r) <= 0.0 { 1.0 } else { 0.0 }
 }
 
 #[no_mangle]

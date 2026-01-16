@@ -19,12 +19,12 @@ fn panic(_info: &PanicInfo) -> ! {
 /// For this test model, we define a unit sphere centered at the origin.
 /// A point is inside if x² + y² + z² <= 1.0
 #[no_mangle]
-pub extern "C" fn is_inside(x: f32, y: f32, z: f32) -> i32 {
+pub extern "C" fn is_inside(x: f64, y: f64, z: f64) -> f32 {
     let distance_squared = x * x + y * y + z * z;
     if distance_squared <= 1.0 {
-        1 // true - inside
+        1.0 // inside density
     } else {
-        0 // false - outside
+        0.0 // outside density
     }
 }
 

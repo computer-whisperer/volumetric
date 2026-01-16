@@ -141,10 +141,10 @@ fn main() -> Result<()> {
     let merged_module = Module::new(&engine, merged)?;
     let merged_instance = Instance::new(&mut store, &merged_module, &[])?;
     let is_inside =
-        merged_instance.get_typed_func::<(f32, f32, f32), i32>(&mut store, "is_inside")?;
+        merged_instance.get_typed_func::<(f64, f64, f64), f32>(&mut store, "is_inside")?;
     let v0 = is_inside.call(&mut store, (0.0, 0.0, 0.0))?;
     let v1 = is_inside.call(&mut store, (5.0, 5.0, 5.0))?;
-    println!("is_inside(0,0,0) = {v0}, is_inside(5,5,5) = {v1}");
+    println!("density(0,0,0) = {v0}, density(5,5,5) = {v1}");
 
     Ok(())
 }

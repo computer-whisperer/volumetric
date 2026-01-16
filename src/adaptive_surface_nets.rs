@@ -165,7 +165,8 @@ impl WasmSampler {
 /// Per-thread sampling context with its own WASM instance.
 struct SamplingContext {
     store: wasmtime::Store<()>,
-    is_inside_func: wasmtime::TypedFunc<(f32, f32, f32), i32>,
+    // New ABI: (f64,f64,f64) -> f32 density
+    is_inside_func: wasmtime::TypedFunc<(f64, f64, f64), f32>,
 }
 
 impl SamplingContext {
@@ -176,7 +177,7 @@ impl SamplingContext {
         let instance = wasmtime::Instance::new(&mut store, &module, &[])?;
 
         let is_inside_func = instance
-            .get_typed_func::<(f32, f32, f32), i32>(&mut store, "is_inside")?;
+            .get_typed_func::<(f64, f64, f64), f32>(&mut store, "is_inside")?;
 
         Ok(Self {
             store,
@@ -184,8 +185,10 @@ impl SamplingContext {
         })
     }
 
-    fn is_inside(&mut self, p: (f32, f32, f32)) -> Result<bool> {
-        Ok(self.is_inside_func.call(&mut self.store, p)? != 0)
+    fn is_inside(&mut self, p: (f32, f32, f32)) -> Result<f32> {
+        // Pass as f64s to WASM, receive f32 density
+        let args = (p.0 as f64, p.1 as f64, p.2 as f64);
+        Ok(self.is_inside_func.call(&mut self.store, args)?)
     }
 }
 
@@ -311,7 +314,7 @@ fn phase1_coarse_discovery(sampler: &WasmSampler, octree: &mut AdaptiveOctree) -
                     bounds_min.1 + y as f32 * base_step.1,
                     bounds_min.2 + z as f32 * base_step.2,
                 );
-                let inside = ctx.is_inside(pos).unwrap_or(false);
+                let inside = (ctx.is_inside(pos).unwrap_or(0.0)) > 0.5;
                 ((x, y, z), inside)
             },
         )
@@ -448,7 +451,7 @@ fn refine_node_recursive(
             let inside = if let Some(&cached) = corner_cache.get(&key) {
                 cached
             } else {
-                let value = ctx.is_inside(pos)?;
+                let value = ctx.is_inside(pos)? > 0.5;
                 corner_cache.insert(key, value);
                 value
             };

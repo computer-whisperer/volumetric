@@ -4,7 +4,7 @@ A high-performance volumetric modeling engine where models and operations are de
 
 ## Core Concept
 
-The project explores a "model-as-code" paradigm where a 3D physical model is defined by a simple function: `is_inside(x, y, z) -> bool`. By leveraging WebAssembly, we can define complex, parametric models that are:
+The project explores a "model-as-code" paradigm where a 3D physical model is defined by a simple function: `is_inside(x: f64, y: f64, z: f64) -> f32` returning a density value. By leveraging WebAssembly, we can define complex, parametric models that are:
 - **Portable**: Run anywhere with a WASM runtime.
 - **Fast**: Near-native execution speed.
 - **Composable**: Models can be transformed and combined using Operator modules that manipulate WASM bytecode.
@@ -21,7 +21,7 @@ The system is divided into three main components:
 
 ### 1. Model WASM Modules
 A Model module is a WASM artifact that exports:
-- `is_inside(x: f32, y: f32, z: f32) -> i32`: Returns `1` if the point is inside the model, `0` otherwise.
+- `is_inside(x: f64, y: f64, z: f64) -> f32`: Returns a density value (current demo models output `1.0` for inside and `0.0` for outside; future models may use continuous densities).
 - `get_bounds_min_x/y/z() -> f32` & `get_bounds_max_x/y/z() -> f32`: Defines the axis-aligned bounding box.
 
 ### 2. Operator WASM Modules
