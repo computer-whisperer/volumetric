@@ -145,24 +145,38 @@ impl CellId {
 }
 
 /// Thread-safe sampler that can create per-thread WASM instances.
+/// 
+/// The WASM module is compiled once and shared across all threads.
+/// Each thread gets its own Store and Instance, but they all share
+/// the same compiled module, avoiding expensive recompilation.
 pub struct WasmSampler {
-    wasm_bytes: Arc<Vec<u8>>,
+    engine: Arc<wasmtime::Engine>,
+    module: Arc<wasmtime::Module>,
 }
 
 impl WasmSampler {
-    pub fn new(wasm_bytes: Vec<u8>) -> Self {
-        Self {
-            wasm_bytes: Arc::new(wasm_bytes),
-        }
+    pub fn new(wasm_bytes: Vec<u8>) -> Result<Self> {
+        let engine = wasmtime::Engine::default();
+        let module = wasmtime::Module::new(&engine, &wasm_bytes)?;
+        Ok(Self {
+            engine: Arc::new(engine),
+            module: Arc::new(module),
+        })
     }
 
     /// Create a thread-local sampling context.
+    /// 
+    /// This creates a new Store and Instance for the calling thread,
+    /// but reuses the pre-compiled module (which is the expensive part).
     fn create_context(&self) -> Result<SamplingContext> {
-        SamplingContext::new(&self.wasm_bytes)
+        SamplingContext::new(&self.engine, &self.module)
     }
 }
 
 /// Per-thread sampling context with its own WASM instance.
+/// 
+/// Each thread needs its own Store and Instance because wasmtime's
+/// Store is not thread-safe. However, the Module can be shared.
 struct SamplingContext {
     store: wasmtime::Store<()>,
     // New ABI: (f64,f64,f64) -> f32 density
@@ -170,11 +184,9 @@ struct SamplingContext {
 }
 
 impl SamplingContext {
-    fn new(wasm_bytes: &[u8]) -> Result<Self> {
-        let engine = wasmtime::Engine::default();
-        let module = wasmtime::Module::new(&engine, wasm_bytes)?;
-        let mut store = wasmtime::Store::new(&engine, ());
-        let instance = wasmtime::Instance::new(&mut store, &module, &[])?;
+    fn new(engine: &wasmtime::Engine, module: &wasmtime::Module) -> Result<Self> {
+        let mut store = wasmtime::Store::new(engine, ());
+        let instance = wasmtime::Instance::new(&mut store, module, &[])?;
 
         let is_inside_func = instance
             .get_typed_func::<(f64, f64, f64), f32>(&mut store, "is_inside")?;
@@ -207,8 +219,12 @@ struct AdaptiveOctree {
     /// Key: base grid cell index
     roots: HashMap<CellIndex, OctreeNode>,
     /// Corner sample cache at base level for sharing between cells
-    /// Key: corner index (can be negative due to padding)
-    base_corners: HashMap<(i32, i32, i32), bool>,
+    /// Stored as a flat Vec for performance (avoids HashMap overhead)
+    /// Indices range from -1 to base_resolution+1 (padded by 1 on each side)
+    /// Size: (base_resolution + 3)^3
+    base_corners: Vec<bool>,
+    /// Number of corners per axis (base_resolution + 3)
+    corner_n: usize,
 }
 
 impl AdaptiveOctree {
@@ -223,6 +239,9 @@ impl AdaptiveOctree {
             (bounds_max.1 - bounds_min.1) / base_resolution as f32,
             (bounds_max.2 - bounds_min.2) / base_resolution as f32,
         );
+        
+        // Corner lattice is (base_resolution + 3)^3 to accommodate padding of -1 to base_resolution+1
+        let corner_n = base_resolution + 3;
 
         Self {
             bounds_min,
@@ -231,8 +250,20 @@ impl AdaptiveOctree {
             max_depth: config.max_refinement_depth,
             base_step,
             roots: HashMap::new(),
-            base_corners: HashMap::new(),
+            base_corners: vec![false; corner_n * corner_n * corner_n],
+            corner_n,
         }
+    }
+
+    /// Convert corner coordinates to flat array index.
+    /// Coordinates range from -1 to base_resolution+1.
+    #[inline]
+    fn corner_idx(&self, x: i32, y: i32, z: i32) -> usize {
+        // Offset by 1 to map -1 -> 0
+        let xi = (x + 1) as usize;
+        let yi = (y + 1) as usize;
+        let zi = (z + 1) as usize;
+        (zi * self.corner_n + yi) * self.corner_n + xi
     }
 
     /// Get the world position of a base grid corner.
@@ -268,7 +299,7 @@ pub fn adaptive_surface_nets_mesh(
     bounds_max: (f32, f32, f32),
     config: &AdaptiveMeshConfig,
 ) -> Result<Vec<Triangle>> {
-    let sampler = WasmSampler::new(wasm_bytes.to_vec());
+    let sampler = WasmSampler::new(wasm_bytes.to_vec())?;
 
     // Phase 1: Coarse discovery - sample base grid corners
     let mut octree = AdaptiveOctree::new(bounds_min, bounds_max, config);
@@ -300,14 +331,18 @@ fn phase1_coarse_discovery(sampler: &WasmSampler, octree: &mut AdaptiveOctree) -
         .collect();
 
     // Sample corners in parallel using rayon
-    let wasm_bytes = sampler.wasm_bytes.clone();
+    // Clone Arc references for use in parallel iterator
+    let engine = sampler.engine.clone();
+    let module = sampler.module.clone();
     let bounds_min = octree.bounds_min;
     let base_step = octree.base_step;
+    let corner_n = octree.corner_n;
 
-    let corner_samples: Vec<((i32, i32, i32), bool)> = corner_positions
+    // Sample directly into indexed results for efficient storage
+    let corner_samples: Vec<(usize, bool)> = corner_positions
         .par_iter()
         .map_init(
-            || SamplingContext::new(&wasm_bytes).expect("Failed to create sampling context"),
+            || SamplingContext::new(&engine, &module).expect("Failed to create sampling context"),
             |ctx, &(x, y, z)| {
                 let pos = (
                     bounds_min.0 + x as f32 * base_step.0,
@@ -315,14 +350,19 @@ fn phase1_coarse_discovery(sampler: &WasmSampler, octree: &mut AdaptiveOctree) -
                     bounds_min.2 + z as f32 * base_step.2,
                 );
                 let inside = (ctx.is_inside(pos).unwrap_or(0.0)) > 0.5;
-                ((x, y, z), inside)
+                // Compute flat index inline (offset by 1 to map -1 -> 0)
+                let xi = (x + 1) as usize;
+                let yi = (y + 1) as usize;
+                let zi = (z + 1) as usize;
+                let idx = (zi * corner_n + yi) * corner_n + xi;
+                (idx, inside)
             },
         )
         .collect();
 
-    // Store corner samples
-    for ((x, y, z), inside) in corner_samples {
-        octree.base_corners.insert((x, y, z), inside);
+    // Store corner samples using direct indexing (faster than HashMap)
+    for (idx, inside) in corner_samples {
+        octree.base_corners[idx] = inside;
     }
 
     // Create root nodes for MIXED cells
@@ -335,16 +375,16 @@ fn phase1_coarse_discovery(sampler: &WasmSampler, octree: &mut AdaptiveOctree) -
                 let idx = CellIndex { x, y, z };
                 let (cell_min, cell_max) = octree.base_cell_bounds(idx);
 
-                // Get corner samples for this cell
+                // Get corner samples for this cell using direct indexing
                 let corners = [
-                    octree.base_corners[&(x, y, z)],
-                    octree.base_corners[&(x + 1, y, z)],
-                    octree.base_corners[&(x, y + 1, z)],
-                    octree.base_corners[&(x + 1, y + 1, z)],
-                    octree.base_corners[&(x, y, z + 1)],
-                    octree.base_corners[&(x + 1, y, z + 1)],
-                    octree.base_corners[&(x, y + 1, z + 1)],
-                    octree.base_corners[&(x + 1, y + 1, z + 1)],
+                    octree.base_corners[octree.corner_idx(x, y, z)],
+                    octree.base_corners[octree.corner_idx(x + 1, y, z)],
+                    octree.base_corners[octree.corner_idx(x, y + 1, z)],
+                    octree.base_corners[octree.corner_idx(x + 1, y + 1, z)],
+                    octree.base_corners[octree.corner_idx(x, y, z + 1)],
+                    octree.base_corners[octree.corner_idx(x + 1, y, z + 1)],
+                    octree.base_corners[octree.corner_idx(x, y + 1, z + 1)],
+                    octree.base_corners[octree.corner_idx(x + 1, y + 1, z + 1)],
                 ];
 
                 let node = OctreeNode {
@@ -367,33 +407,57 @@ fn phase1_coarse_discovery(sampler: &WasmSampler, octree: &mut AdaptiveOctree) -
 }
 
 /// Phase 2: Adaptively refine MIXED cells to the target depth.
+/// 
+/// This phase is parallelized at the root cell level using rayon.
+/// Each root cell is refined independently in parallel, with each thread
+/// getting its own WASM sampling context from the shared pre-compiled module.
 fn phase2_adaptive_refinement(sampler: &WasmSampler, octree: &mut AdaptiveOctree) -> Result<()> {
     if octree.max_depth == 0 {
         return Ok(());
     }
 
-    let wasm_bytes = sampler.wasm_bytes.clone();
     let max_depth = octree.max_depth;
 
-    // Collect cells that need refinement
-    let cells_to_refine: Vec<CellIndex> = octree.roots.keys().copied().collect();
+    // Collect cells that need refinement along with their nodes
+    let cells_to_refine: Vec<(CellIndex, OctreeNode)> = octree
+        .roots
+        .drain()
+        .collect();
 
-    // Process each root cell (can be parallelized at this level)
-    // For now, we refine each root sequentially but sample in parallel within
-    for cell_idx in cells_to_refine {
-        if let Some(root) = octree.roots.get_mut(&cell_idx) {
-            refine_node_recursive(root, max_depth, &wasm_bytes)?;
-        }
+    // Clone Arc references for use in parallel iterator
+    let engine = sampler.engine.clone();
+    let module = sampler.module.clone();
+
+    // Process root cells in parallel using rayon
+    // Each thread gets its own sampling context via map_init
+    let refined_roots: Vec<Result<(CellIndex, OctreeNode)>> = cells_to_refine
+        .into_par_iter()
+        .map_init(
+            || SamplingContext::new(&engine, &module).expect("Failed to create sampling context"),
+            |ctx, (cell_idx, mut node)| {
+                refine_node_recursive(&mut node, max_depth, ctx)?;
+                Ok((cell_idx, node))
+            },
+        )
+        .collect();
+
+    // Collect results back into the octree, propagating any errors
+    for result in refined_roots {
+        let (cell_idx, node) = result?;
+        octree.roots.insert(cell_idx, node);
     }
 
     Ok(())
 }
 
 /// Recursively refine a node if it's MIXED and below max depth.
+/// 
+/// Uses a thread-local sampling context to avoid creating new WASM instances.
+/// The context is reused across all recursive calls within the same thread.
 fn refine_node_recursive(
     node: &mut OctreeNode,
     max_depth: usize,
-    wasm_bytes: &[u8],
+    ctx: &mut SamplingContext,
 ) -> Result<()> {
     if node.depth >= max_depth {
         return Ok(());
@@ -425,10 +489,6 @@ fn refine_node_recursive(
         }
     });
 
-    // Sample new corner positions needed for children
-    // We need to sample: center, face centers, edge centers
-    let mut ctx = SamplingContext::new(wasm_bytes)?;
-
     // Sample all unique corner positions for children
     // Children share corners, so we sample each unique position once
     // Use high-precision integer keys to avoid floating point issues
@@ -437,7 +497,7 @@ fn refine_node_recursive(
     // Scale factor for quantizing positions to avoid floating point comparison issues
     let scale = 1_000_000.0;
 
-    for (child_idx, child) in children.iter_mut().enumerate() {
+    for (_child_idx, child) in children.iter_mut().enumerate() {
         for corner_idx in 0..8 {
             let pos = child.corner_pos(corner_idx);
 
@@ -463,7 +523,7 @@ fn refine_node_recursive(
     // Recursively refine children that are MIXED
     for child in children.iter_mut() {
         if child.cell_type() == CellType::Mixed {
-            refine_node_recursive(child, max_depth, wasm_bytes)?;
+            refine_node_recursive(child, max_depth, ctx)?;
         }
     }
 
@@ -930,7 +990,7 @@ mod tests {
         bounds_max: (f32, f32, f32),
         config: &AdaptiveMeshConfig,
     ) -> anyhow::Result<Vec<crate::Triangle>> {
-        let sampler = WasmSampler::new(wasm_bytes.to_vec());
+        let sampler = WasmSampler::new(wasm_bytes.to_vec())?;
 
         // Phase 1: Coarse discovery
         let mut octree = AdaptiveOctree::new(bounds_min, bounds_max, config);
