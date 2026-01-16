@@ -1,0 +1,3 @@
+[alias]
+# Build all model/operator wasm payloads that the app can load from `target/wasm32-unknown-unknown/{release|debug}/<crate>.wasm`.
+build-wasm = "build --release --target wasm32-unknown-unknown -p simple_sphere_model -p simple_torus_model -p rounded_box_model -p gyroid_lattice_model -p mandelbulb_model -p identity_operator -p translate_operator -p boolean_operator"
