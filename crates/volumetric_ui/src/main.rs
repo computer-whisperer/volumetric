@@ -248,6 +248,11 @@ struct AssetRenderData {
     /// Last sampling/meshing error for this asset (shown in the GUI)
     last_error: Option<String>,
 
+    /// Resolution for PointCloud and MarchingCubes modes (samples per axis)
+    resolution: usize,
+    /// Whether to automatically resample when parameters change
+    auto_resample: bool,
+
     /// Adaptive Surface Nets: base resolution (cells per axis for initial discovery)
     adaptive_base_resolution: usize,
     /// Adaptive Surface Nets: maximum refinement depth
@@ -268,6 +273,8 @@ impl AssetRenderData {
             last_sample_time: None,
             last_sample_count: None,
             last_error: None,
+            resolution: 20,
+            auto_resample: true,
             adaptive_base_resolution: 8,
             adaptive_max_depth: 4,
         }
@@ -299,15 +306,12 @@ struct VolumetricApp {
     exported_assets: Vec<LoadedAsset>,
     /// Per-asset render data (keyed by asset id) - supports multiple entities rendering together
     asset_render_data: HashMap<String, AssetRenderData>,
-    demo_choice: DemoChoice,
-    operation_choice: OperationChoice,
     operation_input_asset_id: Option<String>,
     operation_input_asset_id_b: Option<String>,
     operation_config_values: HashMap<String, ConfigValue>,
     /// Lua script source text for LuaSource inputs
     operation_lua_script: String,
     operator_metadata_cache: HashMap<String, CachedOperatorMetadata>,
-    resolution: usize,
     wgpu_target_format: wgpu::TextureFormat,
     // Camera state
     camera_theta: f32,
@@ -328,6 +332,8 @@ struct VolumetricApp {
     edit_input_asset_ids: Vec<Option<String>>,
     /// Output asset ID for the entry being edited
     edit_output_asset_id: String,
+    /// Whether to automatically rebuild the project when entries change
+    auto_rebuild: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -337,70 +343,6 @@ struct CachedOperatorMetadata {
     metadata: Option<OperatorMetadata>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OperationChoice {
-    Translate,
-    Rotate,
-    Scale,
-    Boolean,
-    LuaScript,
-}
-
-impl OperationChoice {
-    fn label(self) -> &'static str {
-        match self {
-            OperationChoice::Translate => "Translate",
-            OperationChoice::Rotate => "Rotate (Euler degrees)",
-            OperationChoice::Scale => "Scale (sx, sy, sz)",
-            OperationChoice::Boolean => "Boolean (union/subtract/intersect)",
-            OperationChoice::LuaScript => "Lua Script (custom density field)",
-        }
-    }
-
-    fn crate_name(self) -> &'static str {
-        match self {
-            OperationChoice::Translate => "translate_operator",
-            OperationChoice::Rotate => "rotation_operator",
-            OperationChoice::Scale => "scale_operator",
-            OperationChoice::Boolean => "boolean_operator",
-            OperationChoice::LuaScript => "lua_script_operator",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DemoChoice {
-    None,
-    Sphere,
-    Torus,
-    RoundedBox,
-    GyroidLattice,
-    Mandelbulb,
-}
-
-impl DemoChoice {
-    fn label(self) -> &'static str {
-        match self {
-            DemoChoice::None => "(none)",
-            DemoChoice::Sphere => "Sphere",
-            DemoChoice::Torus => "Torus",
-            DemoChoice::RoundedBox => "Rounded box",
-            DemoChoice::GyroidLattice => "Gyroid lattice",
-            DemoChoice::Mandelbulb => "Mandelbulb fractal",
-        }
-    }
-
-    fn crate_name(self) -> Option<&'static str> {
-        match self {
-            DemoChoice::None => None,
-            DemoChoice::Sphere => Some("simple_sphere_model"),
-            DemoChoice::Torus => Some("simple_torus_model"),
-            DemoChoice::RoundedBox => Some("rounded_box_model"),
-            DemoChoice::GyroidLattice => Some("gyroid_lattice_model"),
-            DemoChoice::Mandelbulb => Some("mandelbulb_model"),
-        }
-    }
-}
 
 fn demo_wasm_path(crate_name: &str) -> Option<PathBuf> {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -462,14 +404,11 @@ impl VolumetricApp {
             project_path: None,
             exported_assets,
             asset_render_data,
-            demo_choice: DemoChoice::None,
-            operation_choice: OperationChoice::Translate,
             operation_input_asset_id: None,
             operation_input_asset_id_b: None,
             operation_config_values: HashMap::new(),
             operation_lua_script: String::new(),
             operator_metadata_cache: HashMap::new(),
-            resolution: 20,
             wgpu_target_format,
             camera_theta: std::f32::consts::FRAC_PI_4,
             camera_phi: std::f32::consts::FRAC_PI_4,
@@ -482,6 +421,7 @@ impl VolumetricApp {
             edit_lua_script: String::new(),
             edit_input_asset_ids: Vec::new(),
             edit_output_asset_id: String::new(),
+            auto_rebuild: true,
         }
     }
 
@@ -632,13 +572,12 @@ impl VolumetricApp {
 
     /// Resamples all assets that need resampling
     fn resample_all_assets(&mut self) {
-        let resolution = self.resolution;
-        
         for (asset_id, render_data) in self.asset_render_data.iter_mut() {
             if !render_data.needs_resample {
                 continue;
             }
             render_data.needs_resample = false;
+            let resolution = render_data.resolution;
             
             match render_data.mode {
                 ExportRenderMode::None => {
@@ -748,13 +687,6 @@ impl VolumetricApp {
     /// Check if any asset needs resampling
     fn any_needs_resample(&self) -> bool {
         self.asset_render_data.values().any(|d| d.needs_resample)
-    }
-    
-    /// Mark all assets as needing resample (e.g., when resolution changes)
-    fn mark_all_needs_resample(&mut self) {
-        for render_data in self.asset_render_data.values_mut() {
-            render_data.needs_resample = true;
-        }
     }
 
     fn camera_position(&self) -> (f32, f32, f32) {
@@ -1353,7 +1285,6 @@ impl eframe::App for VolumetricApp {
                                 self.project_path = None;
                                 self.asset_render_data.clear();
                                 self.exported_assets.clear();
-                                self.demo_choice = DemoChoice::None;
                                 self.error_message = None;
                             }
                         });
@@ -1370,7 +1301,6 @@ impl eframe::App for VolumetricApp {
                                             self.project = Some(project);
                                             self.project_path = Some(path);
                                             self.run_project();
-                                            self.demo_choice = DemoChoice::None;
                                         }
                                         Err(e) => {
                                             self.error_message = Some(format!("Failed to load project: {}", e));
@@ -1401,11 +1331,75 @@ impl eframe::App for VolumetricApp {
                         });
 
                         ui.separator();
-                        ui.label("Models");
-
-                        ui.horizontal(|ui| {
-                            // Import a raw WASM file into the currently open project
-                            if ui.button("Import WASM…").clicked() {
+                        
+                        // ═══════════════════════════════════════════════════════════════
+                        // TOOLBOX PANEL - Models Section
+                        // ═══════════════════════════════════════════════════════════════
+                        ui.collapsing("📦 Models", |ui| {
+                            ui.add_space(4.0);
+                            
+                            // Track which model to add (if any)
+                            let mut model_to_add: Option<&str> = None;
+                            let btn_width = ui.available_width();
+                            
+                            // Primitive shapes
+                            ui.label("Primitives");
+                            if ui.add(egui::Button::new("● Sphere").min_size(egui::vec2(btn_width, 28.0))).clicked() {
+                                model_to_add = Some("simple_sphere_model");
+                            }
+                            if ui.add(egui::Button::new("◎ Torus").min_size(egui::vec2(btn_width, 28.0))).clicked() {
+                                model_to_add = Some("simple_torus_model");
+                            }
+                            if ui.add(egui::Button::new("▢ Rounded Box").min_size(egui::vec2(btn_width, 28.0))).clicked() {
+                                model_to_add = Some("rounded_box_model");
+                            }
+                            
+                            ui.add_space(8.0);
+                            ui.label("Complex");
+                            if ui.add(egui::Button::new("✦ Gyroid Lattice").min_size(egui::vec2(btn_width, 28.0))).clicked() {
+                                model_to_add = Some("gyroid_lattice_model");
+                            }
+                            if ui.add(egui::Button::new("❋ Mandelbulb").min_size(egui::vec2(btn_width, 28.0))).clicked() {
+                                model_to_add = Some("mandelbulb_model");
+                            }
+                            
+                            // Handle model addition
+                            if let Some(crate_name) = model_to_add {
+                                match demo_wasm_path(crate_name) {
+                                    Some(path) => {
+                                        match fs::read(&path) {
+                                            Ok(wasm_bytes) => {
+                                                let asset_id = path.file_stem()
+                                                    .and_then(|s| s.to_str())
+                                                    .unwrap_or("model")
+                                                    .to_string();
+                                                if self.project.is_none() {
+                                                    self.project = Some(Project::new(vec![]));
+                                                }
+                                                if let Some(ref mut project) = self.project {
+                                                    project.insert_model_wasm(asset_id.as_str(), wasm_bytes);
+                                                }
+                                                self.project_path = None;
+                                                self.run_project();
+                                            }
+                                            Err(e) => {
+                                                self.error_message = Some(format!("Failed to read WASM file: {}", e));
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        self.error_message = Some(format!(
+                                            "Model WASM not found for '{crate_name}'. Build it first with: cargo build --release --target wasm32-unknown-unknown -p {crate_name}"
+                                        ));
+                                    }
+                                }
+                            }
+                            
+                            ui.add_space(8.0);
+                            ui.separator();
+                            
+                            // Import custom WASM
+                            if ui.add(egui::Button::new("📁 Import WASM…").min_size(egui::vec2(btn_width, 28.0))).clicked() {
                                 if let Some(path) = rfd::FileDialog::new()
                                     .add_filter("WASM", &["wasm"])
                                     .pick_file()
@@ -1423,10 +1417,8 @@ impl eframe::App for VolumetricApp {
                                             if let Some(ref mut project) = self.project {
                                                 project.insert_model_wasm(asset_id.as_str(), wasm_bytes);
                                             }
-                                            // Mutating the project invalidates the persisted path association.
                                             self.project_path = None;
                                             self.run_project();
-                                            self.demo_choice = DemoChoice::None;
                                         }
                                         Err(e) => {
                                             self.error_message =
@@ -1435,292 +1427,207 @@ impl eframe::App for VolumetricApp {
                                     }
                                 }
                             }
-
-                            ui.label("Demo:");
-                            egui::ComboBox::from_id_salt("demo_choice")
-                                .selected_text(self.demo_choice.label())
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut self.demo_choice, DemoChoice::None, DemoChoice::None.label());
-                                    ui.selectable_value(&mut self.demo_choice, DemoChoice::Sphere, DemoChoice::Sphere.label());
-                                    ui.selectable_value(&mut self.demo_choice, DemoChoice::Torus, DemoChoice::Torus.label());
-                                    ui.selectable_value(
-                                        &mut self.demo_choice,
-                                        DemoChoice::RoundedBox,
-                                        DemoChoice::RoundedBox.label(),
-                                    );
-                                    ui.selectable_value(
-                                        &mut self.demo_choice,
-                                        DemoChoice::GyroidLattice,
-                                        DemoChoice::GyroidLattice.label(),
-                                    );
-                                    ui.selectable_value(
-                                        &mut self.demo_choice,
-                                        DemoChoice::Mandelbulb,
-                                        DemoChoice::Mandelbulb.label(),
-                                    );
-                                });
-
-                            let can_load_demo = self.demo_choice.crate_name().is_some();
-                            if ui
-                                .add_enabled(can_load_demo, egui::Button::new("Load demo"))
-                                .clicked()
-                            {
-                                if let Some(crate_name) = self.demo_choice.crate_name() {
-                                    match demo_wasm_path(crate_name) {
-                                        Some(path) => {
-                                            // Load WASM file and append it to the currently open project.
-                                            match fs::read(&path) {
-                                                Ok(wasm_bytes) => {
-                                                    let asset_id = path.file_stem()
-                                                        .and_then(|s| s.to_str())
-                                                        .unwrap_or("model")
-                                                        .to_string();
-                                                    if self.project.is_none() {
-                                                        self.project = Some(Project::new(vec![]));
-                                                    }
-                                                    if let Some(ref mut project) = self.project {
-                                                        project.insert_model_wasm(asset_id.as_str(), wasm_bytes);
-                                                    }
-                                                    // Mutating the project invalidates the persisted path association.
-                                                    self.project_path = None;
-                                                    self.run_project();
-                                                }
-                                                Err(e) => {
-                                                    self.error_message = Some(format!("Failed to read WASM file: {}", e));
-                                                }
-                                            }
-                                        }
-                                        None => {
-                                            self.error_message = Some(format!(
-                                                "Demo WASM not found for '{crate_name}'. Build it first with: cargo build --release --target wasm32-unknown-unknown -p {crate_name}"
-                                            ));
-                                        }
-                                    }
-                                }
-                            }
                         });
-                ui.separator();
-                ui.label("Operations");
-
-                // Populate input dropdowns from all assets declared by the project (including
-                // outputs of earlier operation steps), filtering by the type required for model
-                // inputs.
-                let input_asset_ids: Vec<String> = self
-                    .project
-                    .as_ref()
-                    .map(|p| {
-                        p.declared_assets()
-                            .into_iter()
-                            .filter_map(|(id, ty)| {
-                                if ty == AssetType::ModelWASM {
-                                    Some(id)
-                                } else {
-                                    None
-                                }
+                // ═══════════════════════════════════════════════════════════════
+                // TOOLBOX PANEL - Operators Section
+                // ═══════════════════════════════════════════════════════════════
+                ui.collapsing("⚙ Operators", |ui| {
+                    ui.add_space(4.0);
+                    
+                    // Get available input assets for operators
+                    let input_asset_ids: Vec<String> = self
+                        .project
+                        .as_ref()
+                        .map(|p| {
+                            p.declared_assets()
+                                .into_iter()
+                                .filter_map(|(id, ty)| {
+                                    if ty == AssetType::ModelWASM {
+                                        Some(id)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    
+                    // Update default inputs
+                    let needs_default_input = match self.operation_input_asset_id.as_deref() {
+                        Some(id) => !input_asset_ids.iter().any(|x| x == id),
+                        None => true,
+                    };
+                    if needs_default_input {
+                        self.operation_input_asset_id = input_asset_ids.first().cloned();
+                    }
+                    
+                    let needs_default_input_b = match self.operation_input_asset_id_b.as_deref() {
+                        Some(id) => !input_asset_ids.iter().any(|x| x == id),
+                        None => true,
+                    };
+                    if needs_default_input_b {
+                        self.operation_input_asset_id_b = input_asset_ids
+                            .get(1)
+                            .cloned()
+                            .or_else(|| self.operation_input_asset_id.clone());
+                    }
+                    
+                    // Track which operator to add (if any)
+                    let mut operator_to_add: Option<&str> = None;
+                    let btn_width = ui.available_width();
+                    
+                    // Transform operators
+                    ui.label("Transform");
+                    if ui.add(egui::Button::new("↔ Translate").min_size(egui::vec2(btn_width, 28.0))).clicked() {
+                        operator_to_add = Some("translate_operator");
+                    }
+                    if ui.add(egui::Button::new("⟳ Rotate").min_size(egui::vec2(btn_width, 28.0))).clicked() {
+                        operator_to_add = Some("rotation_operator");
+                    }
+                    if ui.add(egui::Button::new("⤢ Scale").min_size(egui::vec2(btn_width, 28.0))).clicked() {
+                        operator_to_add = Some("scale_operator");
+                    }
+                    
+                    ui.add_space(8.0);
+                    ui.label("Combine");
+                    if ui.add(egui::Button::new("⊕ Boolean").min_size(egui::vec2(btn_width, 28.0))).clicked() {
+                        operator_to_add = Some("boolean_operator");
+                    }
+                    
+                    ui.add_space(8.0);
+                    ui.label("Advanced");
+                    if ui.add(egui::Button::new("📜 Lua Script").min_size(egui::vec2(btn_width, 28.0))).clicked() {
+                        operator_to_add = Some("lua_script_operator");
+                    }
+                    
+                    // Handle operator addition
+                    if let Some(crate_name) = operator_to_add {
+                        // Check if we have a project and required inputs
+                        let operator_metadata = self.operator_metadata_cached(crate_name);
+                        let model_input_count = operator_metadata
+                            .as_ref()
+                            .map(|m| {
+                                m.inputs
+                                    .iter()
+                                    .filter(|i| matches!(i, OperatorMetadataInput::ModelWASM))
+                                    .count()
                             })
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
+                            .unwrap_or(1);
+                        
+                        let has_required_inputs = if model_input_count >= 2 {
+                            self.operation_input_asset_id.is_some() && self.operation_input_asset_id_b.is_some()
+                        } else if model_input_count == 1 {
+                            self.operation_input_asset_id.is_some()
+                        } else {
+                            true
+                        };
+                        
+                        if self.project.is_none() {
+                            self.error_message = Some("Please add a model first before adding operators.".to_string());
+                        } else if !has_required_inputs {
+                            self.error_message = Some("Not enough input models available for this operator.".to_string());
+                        } else {
+                            match operation_wasm_path(crate_name) {
+                                Some(path) => match fs::read(&path) {
+                                    Ok(wasm_bytes) => {
+                                        let input_id_a = self.operation_input_asset_id.clone().unwrap_or_default();
+                                        let input_id_b = self
+                                            .operation_input_asset_id_b
+                                            .clone()
+                                            .unwrap_or_else(|| input_id_a.clone());
+                                        let output_id = self.project.as_ref()
+                                            .map(|p| p.default_output_name(crate_name, Some(&input_id_a)))
+                                            .unwrap_or_else(|| format!("{}_output", crate_name));
+                                        let op_asset_id = format!("op_{crate_name}");
 
-                let needs_default_input = match self.operation_input_asset_id.as_deref() {
-                    Some(id) => !input_asset_ids.iter().any(|x| x == id),
-                    None => true,
-                };
-                if needs_default_input {
-                    self.operation_input_asset_id = input_asset_ids.first().cloned();
-                }
-
-                let needs_default_input_b = match self.operation_input_asset_id_b.as_deref() {
-                    Some(id) => !input_asset_ids.iter().any(|x| x == id),
-                    None => true,
-                };
-                if needs_default_input_b {
-                    // Default B to the second asset if possible, else fall back to A.
-                    self.operation_input_asset_id_b = input_asset_ids
-                        .get(1)
-                        .cloned()
-                        .or_else(|| self.operation_input_asset_id.clone());
-                }
-
-                ui.horizontal(|ui| {
-                    ui.label("Operation:");
-                    egui::ComboBox::from_id_salt("operation_choice")
-                        .selected_text(self.operation_choice.label())
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut self.operation_choice,
-                                OperationChoice::Translate,
-                                OperationChoice::Translate.label(),
-                            );
-                            ui.selectable_value(
-                                &mut self.operation_choice,
-                                OperationChoice::Rotate,
-                                OperationChoice::Rotate.label(),
-                            );
-                            ui.selectable_value(
-                                &mut self.operation_choice,
-                                OperationChoice::Scale,
-                                OperationChoice::Scale.label(),
-                            );
-                            ui.selectable_value(
-                                &mut self.operation_choice,
-                                OperationChoice::Boolean,
-                                OperationChoice::Boolean.label(),
-                            );
-                            ui.selectable_value(
-                                &mut self.operation_choice,
-                                OperationChoice::LuaScript,
-                                OperationChoice::LuaScript.label(),
-                            );
-                        });
-                });
-
-                // Get operator metadata to determine input requirements
-                let crate_name = self.operation_choice.crate_name();
-                let operator_metadata = self.operator_metadata_cached(crate_name);
-
-                // Determine how many model inputs this operator needs
-                let model_input_count = operator_metadata
-                    .as_ref()
-                    .map(|m| {
-                        m.inputs
-                            .iter()
-                            .filter(|i| matches!(i, OperatorMetadataInput::ModelWASM))
-                            .count()
-                    })
-                    .unwrap_or(1);
-
-                // Check if we have enough inputs available (defaults are auto-selected above)
-                let has_required_inputs = if model_input_count >= 2 {
-                    self.operation_input_asset_id.is_some() && self.operation_input_asset_id_b.is_some()
-                } else if model_input_count == 1 {
-                    self.operation_input_asset_id.is_some()
-                } else {
-                    // model_input_count == 0: no model inputs required
-                    true
-                };
-                let can_add_op = self.project.is_some() && has_required_inputs;
-                if ui
-                    .add_enabled(can_add_op, egui::Button::new("Add New Operation"))
-                    .clicked()
-                {
-                    let crate_name = self.operation_choice.crate_name();
-                    match operation_wasm_path(crate_name) {
-                        Some(path) => match fs::read(&path) {
-                            Ok(wasm_bytes) => {
-                                let input_id_a = self.operation_input_asset_id.clone().unwrap_or_default();
-                                let input_id_b = self
-                                    .operation_input_asset_id_b
-                                    .clone()
-                                    .unwrap_or_else(|| input_id_a.clone());
-                                // Auto-generate a unique output name based on operator type and primary input
-                                let output_id = self.project.as_ref()
-                                    .map(|p| p.default_output_name(crate_name, Some(&input_id_a)))
-                                    .unwrap_or_else(|| format!("{}_output", crate_name));
-                                let op_asset_id = format!("op_{crate_name}");
-
-                                let (inputs, outputs) = match self.operator_metadata_cached(crate_name) {
-                                    Some(metadata) => {
-                                        // Use operator metadata to decide how many inputs/outputs to declare.
-                                        let mut inputs = Vec::with_capacity(metadata.inputs.len());
-                                        let mut model_inputs_iter = [input_id_a.clone(), input_id_b.clone()].into_iter();
-                                        for (_idx, input) in metadata.inputs.iter().enumerate() {
-                                            match input {
-                                                OperatorMetadataInput::ModelWASM => {
-                                                    let id = model_inputs_iter
-                                                        .next()
-                                                        .unwrap_or_else(|| input_id_a.clone());
-                                                    inputs.push(ExecuteWasmInput::AssetByID(id));
+                                        let (inputs, outputs) = match self.operator_metadata_cached(crate_name) {
+                                            Some(metadata) => {
+                                                let mut inputs = Vec::with_capacity(metadata.inputs.len());
+                                                let mut model_inputs_iter = [input_id_a.clone(), input_id_b.clone()].into_iter();
+                                                for (_idx, input) in metadata.inputs.iter().enumerate() {
+                                                    match input {
+                                                        OperatorMetadataInput::ModelWASM => {
+                                                            let id = model_inputs_iter
+                                                                .next()
+                                                                .unwrap_or_else(|| input_id_a.clone());
+                                                            inputs.push(ExecuteWasmInput::AssetByID(id));
+                                                        }
+                                                        OperatorMetadataInput::CBORConfiguration(cddl) => {
+                                                            let fields = parse_cddl_record_schema(cddl.as_str()).unwrap_or_default();
+                                                            let bytes = encode_config_map_to_cbor(&fields, &self.operation_config_values)
+                                                                .unwrap_or_default();
+                                                            inputs.push(ExecuteWasmInput::Data(bytes));
+                                                        }
+                                                        OperatorMetadataInput::LuaSource(_) => {
+                                                            let script_bytes = self.operation_lua_script.as_bytes().to_vec();
+                                                            inputs.push(ExecuteWasmInput::Data(script_bytes));
+                                                        }
+                                                    }
                                                 }
-                                                OperatorMetadataInput::CBORConfiguration(cddl) => {
-                                                    let fields = parse_cddl_record_schema(cddl.as_str()).unwrap_or_default();
-                                                    let bytes = encode_config_map_to_cbor(&fields, &self.operation_config_values)
-                                                        .unwrap_or_default();
-                                                    inputs.push(ExecuteWasmInput::Data(bytes));
+
+                                                let mut outputs = Vec::with_capacity(metadata.outputs.len());
+                                                for (idx, output) in metadata.outputs.iter().enumerate() {
+                                                    let asset_type = match output {
+                                                        OperatorMetadataOutput::ModelWASM => AssetType::ModelWASM,
+                                                    };
+                                                    let out_id = if idx == 0 {
+                                                        output_id.clone()
+                                                    } else {
+                                                        format!("{output_id}_{idx}")
+                                                    };
+                                                    outputs.push(ExecuteWasmOutput::new(out_id, asset_type));
                                                 }
-                                                OperatorMetadataInput::LuaSource(_) => {
-                                                    let script_bytes = self.operation_lua_script.as_bytes().to_vec();
-                                                    inputs.push(ExecuteWasmInput::Data(script_bytes));
+
+                                                (inputs, outputs)
+                                            }
+                                            None => (
+                                                vec![ExecuteWasmInput::AssetByID(input_id_a.clone())],
+                                                vec![ExecuteWasmOutput::new(output_id.clone(), AssetType::ModelWASM)],
+                                            ),
+                                        };
+
+                                        let mut new_entry_idx: Option<usize> = None;
+                                        if let Some(ref mut project) = self.project {
+                                            let count_before = project.entries().len();
+                                            
+                                            project.insert_operation(
+                                                op_asset_id.as_str(),
+                                                wasm_bytes,
+                                                inputs,
+                                                outputs,
+                                                output_id,
+                                            );
+                                            
+                                            for (idx, entry) in project.entries().iter().enumerate().rev() {
+                                                if idx >= count_before.saturating_sub(1) {
+                                                    if matches!(entry, ProjectEntry::ExecuteWASM(_)) {
+                                                        new_entry_idx = Some(idx);
+                                                        break;
+                                                    }
                                                 }
                                             }
                                         }
 
-                                        let mut outputs = Vec::with_capacity(metadata.outputs.len());
-                                        for (idx, output) in metadata.outputs.iter().enumerate() {
-                                            let asset_type = match output {
-                                                OperatorMetadataOutput::ModelWASM => AssetType::ModelWASM,
-                                            };
-                                            let out_id = if idx == 0 {
-                                                output_id.clone()
-                                            } else {
-                                                format!("{output_id}_{idx}")
-                                            };
-                                            outputs.push(ExecuteWasmOutput::new(out_id, asset_type));
-                                        }
-
-                                        (inputs, outputs)
-                                    }
-                                    None => (
-                                        vec![ExecuteWasmInput::AssetByID(input_id_a.clone())],
-                                        vec![ExecuteWasmOutput::new(output_id.clone(), AssetType::ModelWASM)],
-                                    ),
-                                };
-
-                                let mut new_entry_idx: Option<usize> = None;
-                                if let Some(ref mut project) = self.project {
-                                    // Track entry count before insertion
-                                    let count_before = project.entries().len();
-                                    
-                                    project.insert_operation(
-                                        op_asset_id.as_str(),
-                                        wasm_bytes,
-                                        inputs,
-                                        outputs,
-                                        output_id,
-                                    );
-                                    
-                                    // Find the newly added ExecuteWASM entry
-                                    for (idx, entry) in project.entries().iter().enumerate().rev() {
-                                        if idx >= count_before.saturating_sub(1) {
-                                            if matches!(entry, ProjectEntry::ExecuteWASM(_)) {
-                                                new_entry_idx = Some(idx);
-                                                break;
-                                            }
+                                        self.run_project();
+                                        
+                                        if let Some(idx) = new_entry_idx {
+                                            self.start_editing_entry(idx);
                                         }
                                     }
-                                }
-
-                                self.run_project();
-                                
-                                // Open edit panel for the newly added operation
-                                if let Some(idx) = new_entry_idx {
-                                    self.start_editing_entry(idx);
+                                    Err(e) => {
+                                        self.error_message =
+                                            Some(format!("Failed to read operation WASM file: {e}"));
+                                    }
+                                },
+                                None => {
+                                    self.error_message = Some(format!(
+                                        "Operator WASM not found for '{crate_name}'. Build it first with: cargo build --release --target wasm32-unknown-unknown -p {crate_name}"
+                                    ));
                                 }
                             }
-                            Err(e) => {
-                                self.error_message =
-                                    Some(format!("Failed to read operation WASM file: {e}"));
-                            }
-                        },
-                        None => {
-                            self.error_message = Some(format!(
-                                "Operation WASM not found for '{crate_name}'. Build it first with: cargo build --release --target wasm32-unknown-unknown -p {crate_name}"
-                            ));
                         }
                     }
-                }
-
-                        ui.label("Model Controls");
-                        ui.horizontal(|ui| {
-                            ui.label("Resolution:");
-                            if ui.add(egui::Slider::new(&mut self.resolution, 5..=300)).changed() {
-                                self.mark_all_needs_resample();
-                            }
-                        });
-
-                        if ui.button("Resample All").clicked() {
-                            self.mark_all_needs_resample();
-                        }
+                });
 
                 ui.separator();
                 // Track actions to perform after the UI loop (to avoid borrow conflicts)
@@ -1730,6 +1637,17 @@ impl eframe::App for VolumetricApp {
                 egui::CollapsingHeader::new("Project Timeline")
                     .default_open(true)
                     .show(ui, |ui| {
+                        // Auto-rebuild controls
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.auto_rebuild, "Auto Rebuild");
+                            if !self.auto_rebuild {
+                                if ui.button("⟳ Rebuild").clicked() {
+                                    self.run_project();
+                                }
+                            }
+                        });
+                        ui.add_space(4.0);
+                        
                         if let Some(ref project) = self.project {
                             let entries = project.entries();
                             if entries.is_empty() {
@@ -1917,17 +1835,49 @@ impl eframe::App for VolumetricApp {
                                     }
                                 });
 
+                                // Show config options for PointCloud and MarchingCubes modes
+                                if current_mode == ExportRenderMode::PointCloud || current_mode == ExportRenderMode::MarchingCubes {
+                                    if let Some(render_data) = self.asset_render_data.get_mut(&asset_id) {
+                                        let mut resolution = render_data.resolution;
+                                        let mut auto_resample = render_data.auto_resample;
+                                        
+                                        ui.horizontal(|ui| {
+                                            ui.label("Resolution:");
+                                            if ui.add(egui::Slider::new(&mut resolution, 5..=300)).changed() {
+                                                render_data.resolution = resolution;
+                                                if auto_resample {
+                                                    render_data.needs_resample = true;
+                                                }
+                                            }
+                                        });
+                                        
+                                        ui.horizontal(|ui| {
+                                            if ui.checkbox(&mut auto_resample, "Auto Resample").changed() {
+                                                render_data.auto_resample = auto_resample;
+                                            }
+                                            if !auto_resample {
+                                                if ui.button("⟳ Resample").clicked() {
+                                                    render_data.needs_resample = true;
+                                                }
+                                            }
+                                        });
+                                    }
+                                }
+
                                 // Show adaptive config options when AdaptiveSurfaceNets is selected
                                 if current_mode == ExportRenderMode::AdaptiveSurfaceNets {
                                     if let Some(render_data) = self.asset_render_data.get_mut(&asset_id) {
                                         let mut base_res = render_data.adaptive_base_resolution;
                                         let mut max_depth = render_data.adaptive_max_depth;
+                                        let mut auto_resample = render_data.auto_resample;
                                         
                                         ui.horizontal(|ui| {
                                             ui.label("Base Resolution:");
                                             if ui.add(egui::DragValue::new(&mut base_res).range(2..=32)).changed() {
                                                 render_data.adaptive_base_resolution = base_res;
-                                                render_data.needs_resample = true;
+                                                if auto_resample {
+                                                    render_data.needs_resample = true;
+                                                }
                                             }
                                         });
                                         
@@ -1935,12 +1885,25 @@ impl eframe::App for VolumetricApp {
                                             ui.label("Max Depth:");
                                             if ui.add(egui::DragValue::new(&mut max_depth).range(0..=6)).changed() {
                                                 render_data.adaptive_max_depth = max_depth;
-                                                render_data.needs_resample = true;
+                                                if auto_resample {
+                                                    render_data.needs_resample = true;
+                                                }
                                             }
                                         });
                                         
                                         let effective_res = base_res * (1 << max_depth);
                                         ui.weak(format!("Effective resolution: {}³", effective_res));
+                                        
+                                        ui.horizontal(|ui| {
+                                            if ui.checkbox(&mut auto_resample, "Auto Resample").changed() {
+                                                render_data.auto_resample = auto_resample;
+                                            }
+                                            if !auto_resample {
+                                                if ui.button("⟳ Resample").clicked() {
+                                                    render_data.needs_resample = true;
+                                                }
+                                            }
+                                        });
                                     }
                                 }
 
@@ -1955,57 +1918,58 @@ impl eframe::App for VolumetricApp {
                                         });
                                     }
 
-                                    ui.horizontal(|ui| {
-                                        if ui.button("Export STL…").clicked() {
-                                            if let Some(path) = rfd::FileDialog::new()
-                                                .add_filter("STL", &["stl"])
-                                                .set_file_name(format!("{}.stl", asset_id))
-                                                .save_file()
-                                            {
-                                                // If we have triangles cached, use them. 
-                                                // Otherwise we might need to trigger marching cubes.
-                                                // The requirement says "assume marching cubes for now".
-                                                // If current mode is PointCloud, we might need to mesh it once.
-                                                
-                                                let triangles = if !render_data.triangles.is_empty() {
-                                                    render_data.triangles.clone()
-                                                } else {
-                                                    // Fallback: run marching cubes just for export if not already meshed
-                                                    match generate_marching_cubes_mesh_from_bytes(&render_data.wasm_bytes, self.resolution) {
-                                                        Ok((t, _, _)) => t,
-                                                        Err(e) => {
-                                                            self.error_message = Some(format!("Failed to generate mesh for export: {e}"));
-                                                            Vec::new()
-                                                        }
-                                                    }
-                                                };
-
-                                                if !triangles.is_empty() {
-                                                    match stl::write_binary_stl(&path, &triangles, "volumetric") {
-                                                        Ok(()) => self.error_message = None,
-                                                        Err(e) => {
-                                                            self.error_message = Some(format!("Failed to export STL: {e}"))
-                                                        }
+                                    if ui.button("Export STL…").clicked() {
+                                        if let Some(path) = rfd::FileDialog::new()
+                                            .add_filter("STL", &["stl"])
+                                            .set_file_name(format!("{}.stl", asset_id))
+                                            .save_file()
+                                        {
+                                            // If we have triangles cached, use them. 
+                                            // Otherwise we might need to trigger marching cubes.
+                                            // The requirement says "assume marching cubes for now".
+                                            // If current mode is PointCloud, we might need to mesh it once.
+                                            
+                                            let triangles = if !render_data.triangles.is_empty() {
+                                                render_data.triangles.clone()
+                                            } else {
+                                                // Fallback: run marching cubes just for export if not already meshed
+                                                match generate_marching_cubes_mesh_from_bytes(&render_data.wasm_bytes, render_data.resolution) {
+                                                    Ok((t, _, _)) => t,
+                                                    Err(e) => {
+                                                        self.error_message = Some(format!("Failed to generate mesh for export: {e}"));
+                                                        Vec::new()
                                                     }
                                                 }
-                                            }
-                                        }
+                                            };
 
-                                        if ui.button("Export WASM…").clicked() {
-                                            if let Some(path) = rfd::FileDialog::new()
-                                                .add_filter("WASM", &["wasm"])
-                                                .set_file_name(format!("{}.wasm", asset_id))
-                                                .save_file()
-                                            {
-                                                match fs::write(&path, &render_data.wasm_bytes) {
+                                            if !triangles.is_empty() {
+                                                match stl::write_binary_stl(&path, &triangles, "volumetric") {
                                                     Ok(()) => self.error_message = None,
                                                     Err(e) => {
-                                                        self.error_message = Some(format!("Failed to export WASM: {e}"))
+                                                        self.error_message = Some(format!("Failed to export STL: {e}"))
                                                     }
                                                 }
                                             }
                                         }
-                                    });
+                                    }
+                                }
+
+                                // Export WASM button - always available for model exports (doesn't depend on sampling)
+                                if let Some(wasm_bytes) = asset.as_model_wasm() {
+                                    if ui.button("Export WASM…").clicked() {
+                                        if let Some(path) = rfd::FileDialog::new()
+                                            .add_filter("WASM", &["wasm"])
+                                            .set_file_name(format!("{}.wasm", asset_id))
+                                            .save_file()
+                                        {
+                                            match fs::write(&path, wasm_bytes) {
+                                                Ok(()) => self.error_message = None,
+                                                Err(e) => {
+                                                    self.error_message = Some(format!("Failed to export WASM: {e}"))
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
 
                                 if let Some(err) = self
