@@ -4,7 +4,49 @@ use std::path::Path;
 use std::sync::Arc;
 use wasmtime::{Caller, Engine, Instance, Module, Store};
 
-pub type Triangle = [(f32, f32, f32); 3];
+/// A triangle in 3D space with vertices and a normal vector.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Triangle {
+    /// The three vertices of the triangle.
+    pub vertices: [(f32, f32, f32); 3],
+    /// The normal vector of the triangle (should be unit length).
+    pub normal: (f32, f32, f32),
+}
+
+impl Triangle {
+    /// Create a new triangle with the given vertices and compute the normal automatically.
+    pub fn new(vertices: [(f32, f32, f32); 3]) -> Self {
+        let normal = Self::compute_normal(&vertices);
+        Self { vertices, normal }
+    }
+
+    /// Create a new triangle with explicit vertices and normal.
+    pub fn with_normal(vertices: [(f32, f32, f32); 3], normal: (f32, f32, f32)) -> Self {
+        Self { vertices, normal }
+    }
+
+    /// Compute the unit normal for a triangle from its vertices using the right-hand rule.
+    pub fn compute_normal(vertices: &[(f32, f32, f32); 3]) -> (f32, f32, f32) {
+        let (ax, ay, az) = vertices[0];
+        let (bx, by, bz) = vertices[1];
+        let (cx, cy, cz) = vertices[2];
+
+        let ab = (bx - ax, by - ay, bz - az);
+        let ac = (cx - ax, cy - ay, cz - az);
+        let n = (
+            ab.1 * ac.2 - ab.2 * ac.1,
+            ab.2 * ac.0 - ab.0 * ac.2,
+            ab.0 * ac.1 - ab.1 * ac.0,
+        );
+        let len2 = n.0 * n.0 + n.1 * n.1 + n.2 * n.2;
+        // Use 1e-24 threshold (equivalent to len > 1e-12 in original code)
+        if len2 <= 1.0e-24 {
+            return (0.0, 0.0, 0.0);
+        }
+        let inv_len = 1.0 / len2.sqrt();
+        (n.0 * inv_len, n.1 * inv_len, n.2 * inv_len)
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExecutionError {

@@ -2200,25 +2200,18 @@ fn triangles_to_mesh_vertices(triangles: &[Triangle]) -> Vec<marching_cubes_wgpu
     let mut out = Vec::with_capacity(triangles.len() * 3);
 
     for tri in triangles {
-        let a = tri[0];
-        let b = tri[1];
-        let c = tri[2];
+        let a = tri.vertices[0];
+        let b = tri.vertices[1];
+        let c = tri.vertices[2];
 
-        let ab = (b.0 - a.0, b.1 - a.1, b.2 - a.2);
-        let ac = (c.0 - a.0, c.1 - a.1, c.2 - a.2);
-        let n = (
-            ab.1 * ac.2 - ab.2 * ac.1,
-            ab.2 * ac.0 - ab.0 * ac.2,
-            ab.0 * ac.1 - ab.1 * ac.0,
-        );
-        let len = (n.0 * n.0 + n.1 * n.1 + n.2 * n.2).sqrt();
-        let n = if len > 1.0e-12 {
-            (n.0 / len, n.1 / len, n.2 / len)
+        // Use the normal stored in the triangle
+        let n = tri.normal;
+        // Fallback to up vector if normal is degenerate
+        let normal = if n.0 == 0.0 && n.1 == 0.0 && n.2 == 0.0 {
+            [0.0, 1.0, 0.0]
         } else {
-            (0.0, 1.0, 0.0)
+            [n.0, n.1, n.2]
         };
-
-        let normal = [n.0, n.1, n.2];
 
         out.push(marching_cubes_wgpu::MeshVertex {
             position: [a.0, a.1, a.2],

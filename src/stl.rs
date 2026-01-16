@@ -4,26 +4,6 @@ use std::path::Path;
 
 use crate::Triangle;
 
-fn triangle_normal(tri: &Triangle) -> (f32, f32, f32) {
-    let (ax, ay, az) = tri[0];
-    let (bx, by, bz) = tri[1];
-    let (cx, cy, cz) = tri[2];
-
-    let ab = (bx - ax, by - ay, bz - az);
-    let ac = (cx - ax, cy - ay, cz - az);
-    let n = (
-        ab.1 * ac.2 - ab.2 * ac.1,
-        ab.2 * ac.0 - ab.0 * ac.2,
-        ab.0 * ac.1 - ab.1 * ac.0,
-    );
-    let len2 = n.0 * n.0 + n.1 * n.1 + n.2 * n.2;
-    if len2 <= f32::EPSILON {
-        return (0.0, 0.0, 0.0);
-    }
-    let inv_len = 1.0 / len2.sqrt();
-    (n.0 * inv_len, n.1 * inv_len, n.2 * inv_len)
-}
-
 pub fn triangles_to_binary_stl_bytes(triangles: &[Triangle], header_name: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(84 + triangles.len() * 50);
 
@@ -36,13 +16,14 @@ pub fn triangles_to_binary_stl_bytes(triangles: &[Triangle], header_name: &str) 
     out.extend_from_slice(&(triangles.len() as u32).to_le_bytes());
 
     for tri in triangles {
-        let (nx, ny, nz) = triangle_normal(tri);
+        // Use the normal stored in the triangle
+        let (nx, ny, nz) = tri.normal;
 
         out.extend_from_slice(&nx.to_le_bytes());
         out.extend_from_slice(&ny.to_le_bytes());
         out.extend_from_slice(&nz.to_le_bytes());
 
-        for (x, y, z) in tri {
+        for (x, y, z) in &tri.vertices {
             out.extend_from_slice(&x.to_le_bytes());
             out.extend_from_slice(&y.to_le_bytes());
             out.extend_from_slice(&z.to_le_bytes());
@@ -67,8 +48,8 @@ mod tests {
     #[test]
     fn binary_stl_has_expected_size_and_triangle_count() {
         let tris: Vec<Triangle> = vec![
-            [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
-            [(0.0, 0.0, 1.0), (0.0, 1.0, 1.0), (1.0, 0.0, 1.0)],
+            Triangle::new([(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)]),
+            Triangle::new([(0.0, 0.0, 1.0), (0.0, 1.0, 1.0), (1.0, 0.0, 1.0)]),
         ];
         let bytes = triangles_to_binary_stl_bytes(&tris, "test");
 
@@ -79,8 +60,8 @@ mod tests {
 
     #[test]
     fn normal_is_right_hand_rule() {
-        let tri: Triangle = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)];
-        let n = triangle_normal(&tri);
+        let tri = Triangle::new([(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)]);
+        let n = tri.normal;
         assert!((n.0 - 0.0).abs() < 1e-6);
         assert!((n.1 - 0.0).abs() < 1e-6);
         assert!((n.2 - 1.0).abs() < 1e-6);

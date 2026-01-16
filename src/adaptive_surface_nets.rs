@@ -934,7 +934,7 @@ fn emit_triangles_for_quad(
         let mut key = [quantize(tri[0]), quantize(tri[1]), quantize(tri[2])];
         key.sort();
         if emitted.insert(key) {
-            triangles.push(tri);
+            triangles.push(Triangle::new(tri));
         }
     };
     
@@ -1210,7 +1210,7 @@ mod tests {
         
         // All triangle vertices should be within or near the bounds
         for tri in &triangles {
-            for v in tri {
+            for v in &tri.vertices {
                 assert!(v.0 >= -1.5 && v.0 <= 1.5, "Vertex x out of bounds: {}", v.0);
                 assert!(v.1 >= -1.5 && v.1 <= 1.5, "Vertex y out of bounds: {}", v.1);
                 assert!(v.2 >= -1.5 && v.2 <= 1.5, "Vertex z out of bounds: {}", v.2);
@@ -1273,7 +1273,7 @@ mod tests {
         let mut edges: HashMap<((i64, i64, i64), (i64, i64, i64)), usize> = HashMap::new();
 
         for tri in triangles {
-            let verts = [tri[0], tri[1], tri[2]];
+            let verts = tri.vertices;
             let tri_edges = [(0, 1), (1, 2), (2, 0)];
 
             for &(ia, ib) in &tri_edges {
@@ -1304,7 +1304,7 @@ mod tests {
         let mut edges: HashMap<((i64, i64, i64), (i64, i64, i64)), usize> = HashMap::new();
 
         for tri in triangles {
-            let verts = [tri[0], tri[1], tri[2]];
+            let verts = tri.vertices;
             let tri_edges = [(0, 1), (1, 2), (2, 0)];
 
             for &(ia, ib) in &tri_edges {
@@ -1444,7 +1444,7 @@ mod tests {
             let scale = 1_000_000.0f32;
             let mut edges: HashMap<((i64, i64, i64), (i64, i64, i64)), usize> = HashMap::new();
             for tri in &triangles {
-                let verts = [tri[0], tri[1], tri[2]];
+                let verts = tri.vertices;
                 let tri_edges = [(0, 1), (1, 2), (2, 0)];
                 for &(ia, ib) in &tri_edges {
                     let a = verts[ia];

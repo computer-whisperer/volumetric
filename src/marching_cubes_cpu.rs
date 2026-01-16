@@ -178,8 +178,8 @@ where
         let d = cell_vertices[i3 as usize];
         // Use consistent winding order with adaptive surface nets:
         // Reverse the triangle winding to produce outward-facing normals.
-        triangles.push([a, c, b]);
-        triangles.push([a, d, c]);
+        triangles.push(Triangle::new([a, c, b]));
+        triangles.push(Triangle::new([a, d, c]));
     };
 
     // Helper to fetch a cell vertex index; returns None if the cell is inactive or out of range.
@@ -308,23 +308,15 @@ where
             1.0f32, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0,
         ];
         for tri in &mut triangles {
-            let a = tri[0];
-            let b = tri[1];
-            let c = tri[2];
+            let a = tri.vertices[0];
+            let b = tri.vertices[1];
+            let c = tri.vertices[2];
 
-            let ab = (b.0 - a.0, b.1 - a.1, b.2 - a.2);
-            let ac = (c.0 - a.0, c.1 - a.1, c.2 - a.2);
-            let n = (
-                ab.1 * ac.2 - ab.2 * ac.1,
-                ab.2 * ac.0 - ab.0 * ac.2,
-                ab.0 * ac.1 - ab.1 * ac.0,
-            );
-            let len2 = n.0 * n.0 + n.1 * n.1 + n.2 * n.2;
-            if len2 <= f32::EPSILON {
+            // Use the already-computed normal from the triangle
+            let nu = tri.normal;
+            if nu.0 == 0.0 && nu.1 == 0.0 && nu.2 == 0.0 {
                 continue;
             }
-            let inv_len = 1.0 / len2.sqrt();
-            let nu = (n.0 * inv_len, n.1 * inv_len, n.2 * inv_len);
 
             let centroid = (
                 (a.0 + b.0 + c.0) / 3.0,
@@ -399,7 +391,9 @@ where
             }
 
             if decided && flip {
-                tri.swap(1, 2);
+                // Swap vertices and recompute normal
+                tri.vertices.swap(1, 2);
+                tri.normal = Triangle::compute_normal(&tri.vertices);
             }
         }
     }
@@ -418,28 +412,17 @@ mod tests {
     use super::*;
 
     fn triangle_unit_normal(tri: &Triangle) -> Option<(f32, f32, f32)> {
-        let a = tri[0];
-        let b = tri[1];
-        let c = tri[2];
-        let ab = (b.0 - a.0, b.1 - a.1, b.2 - a.2);
-        let ac = (c.0 - a.0, c.1 - a.1, c.2 - a.2);
-        let n = (
-            ab.1 * ac.2 - ab.2 * ac.1,
-            ab.2 * ac.0 - ab.0 * ac.2,
-            ab.0 * ac.1 - ab.1 * ac.0,
-        );
-        let len2 = n.0 * n.0 + n.1 * n.1 + n.2 * n.2;
-        if len2 <= 1e-12 {
+        let n = tri.normal;
+        if n.0 == 0.0 && n.1 == 0.0 && n.2 == 0.0 {
             return None;
         }
-        let inv_len = 1.0 / len2.sqrt();
-        Some((n.0 * inv_len, n.1 * inv_len, n.2 * inv_len))
+        Some(n)
     }
 
     fn triangle_centroid(tri: &Triangle) -> (f32, f32, f32) {
-        let a = tri[0];
-        let b = tri[1];
-        let c = tri[2];
+        let a = tri.vertices[0];
+        let b = tri.vertices[1];
+        let c = tri.vertices[2];
         ((a.0 + b.0 + c.0) / 3.0, (a.1 + b.1 + c.1) / 3.0, (a.2 + b.2 + c.2) / 3.0)
     }
 
@@ -483,7 +466,7 @@ mod tests {
 
         let mut saw_outside = false;
         'outer: for tri in &tris {
-            for v in tri {
+            for v in &tri.vertices {
                 if v.0 < min_expected || v.0 > max_expected || v.1 < min_expected || v.1 > max_expected || v.2 < min_expected || v.2 > max_expected {
                     saw_outside = true;
                     break 'outer;
@@ -514,7 +497,7 @@ mod tests {
         let step = (bounds_max.0 - bounds_min.0) / resolution as f32;
         let margin = step * 2.0;
         for tri in &tris {
-            for v in tri {
+            for v in &tri.vertices {
                 assert!(
                     v.0 >= bounds_min.0 - margin && v.0 <= bounds_max.0 + margin,
                     "x out of expected range: {v:?}"
@@ -547,25 +530,11 @@ mod tests {
         let mut ok = 0usize;
         let mut total = 0usize;
         for tri in &tris {
-            let a = tri[0];
-            let b = tri[1];
-            let c = tri[2];
-            let ab = (b.0 - a.0, b.1 - a.1, b.2 - a.2);
-            let ac = (c.0 - a.0, c.1 - a.1, c.2 - a.2);
-            let n = (
-                ab.1 * ac.2 - ab.2 * ac.1,
-                ab.2 * ac.0 - ab.0 * ac.2,
-                ab.0 * ac.1 - ab.1 * ac.0,
-            );
-            let len2 = n.0 * n.0 + n.1 * n.1 + n.2 * n.2;
-            if len2 <= 1e-12 {
+            let n = tri.normal;
+            if n.0 == 0.0 && n.1 == 0.0 && n.2 == 0.0 {
                 continue;
             }
-            let centroid = (
-                (a.0 + b.0 + c.0) / 3.0,
-                (a.1 + b.1 + c.1) / 3.0,
-                (a.2 + b.2 + c.2) / 3.0,
-            );
+            let centroid = triangle_centroid(tri);
             let dot = n.0 * centroid.0 + n.1 * centroid.1 + n.2 * centroid.2;
             total += 1;
             if dot > 0.0 {
