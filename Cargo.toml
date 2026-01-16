@@ -10,9 +10,10 @@ members = [
     "crates/models/rounded_box_model",
     "crates/models/gyroid_lattice_model",
     "crates/models/mandelbulb_model",
-    "crates/operators/identity_operator",
     "crates/operators/translate_operator",
     "crates/operators/boolean_operator",
+    "crates/operators/rotation_operator",
+    "crates/operators/scale_operator",
 ]
 
 [dependencies]

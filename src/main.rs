@@ -335,24 +335,27 @@ struct CachedOperatorMetadata {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OperationChoice {
-    Identity,
     Translate,
+    Rotate,
+    Scale,
     Boolean,
 }
 
 impl OperationChoice {
     fn label(self) -> &'static str {
         match self {
-            OperationChoice::Identity => "Identity (WASM passthrough)",
-            OperationChoice::Translate => "Translate (+1 X)",
+            OperationChoice::Translate => "Translate",
+            OperationChoice::Rotate => "Rotate (Euler degrees)",
+            OperationChoice::Scale => "Scale (sx, sy, sz)",
             OperationChoice::Boolean => "Boolean (union/subtract/intersect)",
         }
     }
 
     fn crate_name(self) -> &'static str {
         match self {
-            OperationChoice::Identity => "identity_operator",
             OperationChoice::Translate => "translate_operator",
+            OperationChoice::Rotate => "rotation_operator",
+            OperationChoice::Scale => "scale_operator",
             OperationChoice::Boolean => "boolean_operator",
         }
     }
@@ -450,10 +453,10 @@ impl VolumetricApp {
             exported_assets,
             asset_render_data,
             demo_choice: DemoChoice::None,
-            operation_choice: OperationChoice::Identity,
+            operation_choice: OperationChoice::Translate,
             operation_input_asset_id: None,
             operation_input_asset_id_b: None,
-            operation_output_asset_id: "identity_out".to_string(),
+            operation_output_asset_id: "op_out".to_string(),
             operation_config_last_cddl: None,
             operation_config_values: HashMap::new(),
             operator_metadata_cache: HashMap::new(),
@@ -1042,13 +1045,18 @@ impl eframe::App for VolumetricApp {
                         .show_ui(ui, |ui| {
                             ui.selectable_value(
                                 &mut self.operation_choice,
-                                OperationChoice::Identity,
-                                OperationChoice::Identity.label(),
+                                OperationChoice::Translate,
+                                OperationChoice::Translate.label(),
                             );
                             ui.selectable_value(
                                 &mut self.operation_choice,
-                                OperationChoice::Translate,
-                                OperationChoice::Translate.label(),
+                                OperationChoice::Rotate,
+                                OperationChoice::Rotate.label(),
+                            );
+                            ui.selectable_value(
+                                &mut self.operation_choice,
+                                OperationChoice::Scale,
+                                OperationChoice::Scale.label(),
                             );
                             ui.selectable_value(
                                 &mut self.operation_choice,

@@ -1,5 +1,5 @@
 [package]
-name = "identity_operator"
+name = "scale_operator"
 version = "0.1.0"
 edition = "2021"
 
@@ -9,3 +9,4 @@ crate-type = ["cdylib"]
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 ciborium = "0.2"
+walrus = "0.23"
