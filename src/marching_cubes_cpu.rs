@@ -178,8 +178,10 @@ where
         let b = cell_vertices[i1 as usize];
         let c = cell_vertices[i2 as usize];
         let d = cell_vertices[i3 as usize];
-        triangles.push([a, b, c]);
-        triangles.push([a, c, d]);
+        // Use consistent winding order with adaptive surface nets:
+        // Reverse the triangle winding to produce outward-facing normals.
+        triangles.push([a, c, b]);
+        triangles.push([a, d, c]);
     };
 
     // Helper to fetch a cell vertex index; returns None if the cell is inactive or out of range.

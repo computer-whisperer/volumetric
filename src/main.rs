@@ -1306,7 +1306,7 @@ impl eframe::App for VolumetricApp {
                         ui.label("Model Controls");
                         ui.horizontal(|ui| {
                             ui.label("Resolution:");
-                            if ui.add(egui::Slider::new(&mut self.resolution, 5..=100)).changed() {
+                            if ui.add(egui::Slider::new(&mut self.resolution, 5..=300)).changed() {
                                 self.mark_all_needs_resample();
                             }
                         });

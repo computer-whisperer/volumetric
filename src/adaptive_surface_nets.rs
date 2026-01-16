@@ -428,38 +428,27 @@ fn refine_node_recursive(
 
     // Sample all unique corner positions for children
     // Children share corners, so we sample each unique position once
-    let mut corner_cache: HashMap<(i32, i32, i32), bool> = HashMap::new();
-
-    // Discretize positions to integer grid at this level for caching
-    let step = node.size() * 0.5;
+    // Use high-precision integer keys to avoid floating point issues
+    let mut corner_cache: HashMap<(i64, i64, i64), bool> = HashMap::new();
+    
+    // Scale factor for quantizing positions to avoid floating point comparison issues
+    let scale = 1_000_000.0;
 
     for (child_idx, child) in children.iter_mut().enumerate() {
         for corner_idx in 0..8 {
             let pos = child.corner_pos(corner_idx);
 
-            // Quantize position for cache key (relative to node.min)
-            let qx = ((pos.0 - node.min.0) / step).round() as i32;
-            let qy = ((pos.1 - node.min.1) / step).round() as i32;
-            let qz = ((pos.2 - node.min.2) / step).round() as i32;
-            let key = (qx, qy, qz);
+            // Use absolute position with high precision as cache key
+            let key = (
+                (pos.0 * scale).round() as i64,
+                (pos.1 * scale).round() as i64,
+                (pos.2 * scale).round() as i64,
+            );
 
             let inside = if let Some(&cached) = corner_cache.get(&key) {
                 cached
             } else {
-                // Check if this is a corner of the parent (reuse parent's sample)
-                let is_parent_corner = (qx == 0 || qx == 2)
-                    && (qy == 0 || qy == 2)
-                    && (qz == 0 || qz == 2);
-
-                let value = if is_parent_corner {
-                    let parent_corner_idx = ((qx / 2) as usize)
-                        | (((qy / 2) as usize) << 1)
-                        | (((qz / 2) as usize) << 2);
-                    node.corners[parent_corner_idx]
-                } else {
-                    ctx.is_inside(pos)?
-                };
-
+                let value = ctx.is_inside(pos)?;
                 corner_cache.insert(key, value);
                 value
             };
