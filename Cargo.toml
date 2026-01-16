@@ -41,3 +41,6 @@ thiserror = "1.0.69"
 
 # CBOR serialization for project files
 ciborium = "0.2"
+
+# Parallel processing
+rayon = "1.10"

@@ -3749,6 +3749,7 @@ dependencies = [
  "env_logger",
  "glam",
  "log",
+ "rayon",
  "rfd",
  "serde",
  "thiserror 1.0.69",

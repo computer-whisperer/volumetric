@@ -10,6 +10,7 @@ use wasmtime::*;
 
 mod point_cloud_wgpu;
 mod marching_cubes_wgpu;
+mod adaptive_surface_nets;
 
 // Project system
 mod lib;
@@ -203,6 +204,7 @@ enum ExportRenderMode {
     None,
     PointCloud,
     MarchingCubes,
+    AdaptiveSurfaceNets,
 }
 
 impl ExportRenderMode {
@@ -211,6 +213,7 @@ impl ExportRenderMode {
             ExportRenderMode::None => "None",
             ExportRenderMode::PointCloud => "Point Cloud",
             ExportRenderMode::MarchingCubes => "Marching Cubes",
+            ExportRenderMode::AdaptiveSurfaceNets => "Adaptive Surface Nets",
         }
     }
 }
@@ -243,8 +246,18 @@ struct AssetRenderData {
     /// Whether this asset needs resampling
     needs_resample: bool,
 
+    /// Time taken for the last sampling/meshing (in seconds)
+    last_sample_time: Option<f32>,
+    /// Number of samples taken during the last sampling/meshing
+    last_sample_count: Option<usize>,
+
     /// Last sampling/meshing error for this asset (shown in the GUI)
     last_error: Option<String>,
+
+    /// Adaptive Surface Nets: base resolution (cells per axis for initial discovery)
+    adaptive_base_resolution: usize,
+    /// Adaptive Surface Nets: maximum refinement depth
+    adaptive_max_depth: usize,
 }
 
 impl AssetRenderData {
@@ -258,7 +271,11 @@ impl AssetRenderData {
             triangles: Vec::new(),
             mesh_vertices: Arc::new(Vec::new()),
             needs_resample: true,
+            last_sample_time: None,
+            last_sample_count: None,
             last_error: None,
+            adaptive_base_resolution: 8,
+            adaptive_max_depth: 4,
         }
     }
 }
@@ -303,6 +320,8 @@ struct VolumetricApp {
     camera_phi: f32,
     camera_radius: f32,
     last_mouse_pos: Option<egui::Pos2>,
+    /// Last project evaluation time (in seconds)
+    last_evaluation_time: Option<f32>,
     // Error message
     error_message: Option<String>,
 }
@@ -444,6 +463,7 @@ impl VolumetricApp {
             camera_phi: std::f32::consts::FRAC_PI_4,
             camera_radius: 4.0,
             last_mouse_pos: None,
+            last_evaluation_time: None,
             error_message: None,
         }
     }
@@ -538,8 +558,10 @@ impl VolumetricApp {
         self.exported_assets.clear();
         if let Some(ref project) = self.project {
             let mut env = Environment::new();
+            let start_time = std::time::Instant::now();
             match project.run(&mut env) {
                 Ok(assets) => {
+                    self.last_evaluation_time = Some(start_time.elapsed().as_secs_f32());
                     // Clear any previous error now that the project ran successfully.
                     self.error_message = None;
                     // Retain full exports for UX/testing
@@ -582,9 +604,12 @@ impl VolumetricApp {
                     }
                 }
                 Err(e) => {
+                    self.last_evaluation_time = None;
                     self.error_message = Some(format!("Failed to run project: {}", e));
                 }
             }
+        } else {
+            self.last_evaluation_time = None;
         }
     }
 
@@ -608,8 +633,11 @@ impl VolumetricApp {
                     render_data.mesh_vertices = Arc::new(Vec::new());
                 }
                 ExportRenderMode::PointCloud => {
+                    let start_time = std::time::Instant::now();
                     match sample_model_from_bytes(&render_data.wasm_bytes, resolution) {
                         Ok((points, bounds_min, bounds_max)) => {
+                            render_data.last_sample_time = Some(start_time.elapsed().as_secs_f32());
+                            render_data.last_sample_count = Some(resolution * resolution * resolution);
                             render_data.bounds_min = bounds_min;
                             render_data.bounds_max = bounds_max;
                             render_data.points = Arc::new(points);
@@ -618,6 +646,8 @@ impl VolumetricApp {
                             render_data.last_error = None;
                         }
                         Err(e) => {
+                            render_data.last_sample_time = None;
+                            render_data.last_sample_count = None;
                             let msg = format!(
                                 "Export '{asset_id}' failed to sample ({}):\n{}",
                                 render_data.mode.label(),
@@ -632,8 +662,11 @@ impl VolumetricApp {
                     }
                 }
                 ExportRenderMode::MarchingCubes => {
+                    let start_time = std::time::Instant::now();
                     match generate_marching_cubes_mesh_from_bytes(&render_data.wasm_bytes, resolution) {
                         Ok((triangles, bounds_min, bounds_max)) => {
+                            render_data.last_sample_time = Some(start_time.elapsed().as_secs_f32());
+                            render_data.last_sample_count = Some(resolution * resolution * resolution);
                             render_data.bounds_min = bounds_min;
                             render_data.bounds_max = bounds_max;
                             render_data.triangles = triangles;
@@ -642,6 +675,8 @@ impl VolumetricApp {
                             render_data.last_error = None;
                         }
                         Err(e) => {
+                            render_data.last_sample_time = None;
+                            render_data.last_sample_count = None;
                             let msg = format!(
                                 "Export '{asset_id}' failed to mesh ({}):\n{}",
                                 render_data.mode.label(),
@@ -652,6 +687,40 @@ impl VolumetricApp {
                                 self.error_message = Some(msg);
                             }
                             log::error!("Failed to generate marching cubes mesh for export '{asset_id}': {e}");
+                        }
+                    }
+                }
+                ExportRenderMode::AdaptiveSurfaceNets => {
+                    let start_time = std::time::Instant::now();
+                    let config = adaptive_surface_nets::AdaptiveMeshConfig {
+                        base_resolution: render_data.adaptive_base_resolution,
+                        max_refinement_depth: render_data.adaptive_max_depth,
+                    };
+                    match generate_adaptive_mesh_from_bytes(&render_data.wasm_bytes, &config) {
+                        Ok((triangles, bounds_min, bounds_max)) => {
+                            let effective_res = config.base_resolution * (1 << config.max_refinement_depth);
+                            render_data.last_sample_time = Some(start_time.elapsed().as_secs_f32());
+                            render_data.last_sample_count = Some(effective_res * effective_res * effective_res);
+                            render_data.bounds_min = bounds_min;
+                            render_data.bounds_max = bounds_max;
+                            render_data.triangles = triangles;
+                            render_data.mesh_vertices = Arc::new(triangles_to_mesh_vertices(&render_data.triangles));
+                            render_data.points = Arc::new(Vec::new());
+                            render_data.last_error = None;
+                        }
+                        Err(e) => {
+                            render_data.last_sample_time = None;
+                            render_data.last_sample_count = None;
+                            let msg = format!(
+                                "Export '{asset_id}' failed to mesh ({}):\n{}",
+                                render_data.mode.label(),
+                                format_anyhow_error_chain(&e)
+                            );
+                            render_data.last_error = Some(msg.clone());
+                            if self.error_message.is_none() {
+                                self.error_message = Some(msg);
+                            }
+                            log::error!("Failed to generate adaptive mesh for export '{asset_id}': {e}");
                         }
                     }
                 }
@@ -752,6 +821,9 @@ impl eframe::App for VolumetricApp {
                         ui.separator();
 
                         ui.label("Project");
+                        if let Some(time) = self.last_evaluation_time {
+                            ui.weak(format!("Evaluated in {:.2}ms", time * 1000.0));
+                        }
                         ui.horizontal(|ui| {
                             let label = match &self.project_path {
                                 Some(p) => p.display().to_string(),
@@ -763,7 +835,100 @@ impl eframe::App for VolumetricApp {
                             ui.label(label);
                         });
 
+
                         ui.horizontal(|ui| {
+                            let can_unload = self.project.is_some();
+                            if ui
+                                .add_enabled(can_unload, egui::Button::new("Unload Project"))
+                                .clicked()
+                            {
+                                self.project = None;
+                                self.project_path = None;
+                                self.asset_render_data.clear();
+                                self.exported_assets.clear();
+                                self.demo_choice = DemoChoice::None;
+                                self.error_message = None;
+                            }
+                        });
+
+                        // Project file operations
+                        ui.horizontal(|ui| {
+                            if ui.button("Open Project…").clicked() {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("Project", &["vproj"])
+                                    .pick_file()
+                                {
+                                    match Project::load_from_file(&path) {
+                                        Ok(project) => {
+                                            self.project = Some(project);
+                                            self.project_path = Some(path);
+                                            self.run_project();
+                                            self.demo_choice = DemoChoice::None;
+                                        }
+                                        Err(e) => {
+                                            self.error_message = Some(format!("Failed to load project: {}", e));
+                                        }
+                                    }
+                                }
+                            }
+
+                            let can_save = self.project.is_some();
+                            if ui.add_enabled(can_save, egui::Button::new("Save Project…")).clicked() {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("Project", &["vproj"])
+                                    .save_file()
+                                {
+                                    if let Some(ref project) = self.project {
+                                        match project.save_to_file(&path) {
+                                            Ok(()) => {
+                                                self.project_path = Some(path);
+                                                self.error_message = None;
+                                            }
+                                            Err(e) => {
+                                                self.error_message = Some(format!("Failed to save project: {}", e));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        });
+
+                        ui.separator();
+                        ui.label("Models");
+
+                        ui.horizontal(|ui| {
+                            // Import a raw WASM file into the currently open project
+                            if ui.button("Import WASM…").clicked() {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("WASM", &["wasm"])
+                                    .pick_file()
+                                {
+                                    match fs::read(&path) {
+                                        Ok(wasm_bytes) => {
+                                            let asset_id = path
+                                                .file_stem()
+                                                .and_then(|s| s.to_str())
+                                                .unwrap_or("model")
+                                                .to_string();
+                                            if self.project.is_none() {
+                                                self.project = Some(Project::new(vec![]));
+                                            }
+                                            if let Some(ref mut project) = self.project {
+                                                project.insert_model_wasm(asset_id.as_str(), wasm_bytes);
+                                            }
+                                            // Mutating the project invalidates the persisted path association.
+                                            self.project_path = None;
+                                            self.run_project();
+                                            self.demo_choice = DemoChoice::None;
+                                        }
+                                        Err(e) => {
+                                            self.error_message =
+                                                Some(format!("Failed to read WASM file: {}", e));
+                                        }
+                                    }
+                                }
+                            }
+
                             ui.label("Demo:");
                             egui::ComboBox::from_id_salt("demo_choice")
                                 .selected_text(self.demo_choice.label())
@@ -827,96 +992,6 @@ impl eframe::App for VolumetricApp {
                                 }
                             }
                         });
-
-                        ui.horizontal(|ui| {
-                            // Import a raw WASM file into the currently open project
-                            if ui.button("Import WASM…").clicked() {
-                                if let Some(path) = rfd::FileDialog::new()
-                                    .add_filter("WASM", &["wasm"])
-                                    .pick_file()
-                                {
-                                    match fs::read(&path) {
-                                        Ok(wasm_bytes) => {
-                                            let asset_id = path
-                                                .file_stem()
-                                                .and_then(|s| s.to_str())
-                                                .unwrap_or("model")
-                                                .to_string();
-                                            if self.project.is_none() {
-                                                self.project = Some(Project::new(vec![]));
-                                            }
-                                            if let Some(ref mut project) = self.project {
-                                                project.insert_model_wasm(asset_id.as_str(), wasm_bytes);
-                                            }
-                                            // Mutating the project invalidates the persisted path association.
-                                            self.project_path = None;
-                                            self.run_project();
-                                            self.demo_choice = DemoChoice::None;
-                                        }
-                                        Err(e) => {
-                                            self.error_message =
-                                                Some(format!("Failed to read WASM file: {}", e));
-                                        }
-                                    }
-                                }
-                            }
-
-                            let can_unload = self.project.is_some();
-                            if ui
-                                .add_enabled(can_unload, egui::Button::new("Unload"))
-                                .clicked()
-                            {
-                                self.project = None;
-                                self.project_path = None;
-                                self.asset_render_data.clear();
-                                self.exported_assets.clear();
-                                self.demo_choice = DemoChoice::None;
-                                self.error_message = None;
-                            }
-                        });
-
-                // Project file operations
-                ui.horizontal(|ui| {
-                    if ui.button("Open Project…").clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Project", &["vproj"])
-                            .pick_file()
-                        {
-                            match Project::load_from_file(&path) {
-                                Ok(project) => {
-                                    self.project = Some(project);
-                                    self.project_path = Some(path);
-                                    self.run_project();
-                                    self.demo_choice = DemoChoice::None;
-                                }
-                                Err(e) => {
-                                    self.error_message = Some(format!("Failed to load project: {}", e));
-                                }
-                            }
-                        }
-                    }
-
-                    let can_save = self.project.is_some();
-                    if ui.add_enabled(can_save, egui::Button::new("Save Project…")).clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Project", &["vproj"])
-                            .save_file()
-                        {
-                            if let Some(ref project) = self.project {
-                                match project.save_to_file(&path) {
-                                    Ok(()) => {
-                                        self.project_path = Some(path);
-                                        self.error_message = None;
-                                    }
-                                    Err(e) => {
-                                        self.error_message = Some(format!("Failed to save project: {}", e));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                });
-
                 ui.separator();
                 ui.label("Operations");
 
@@ -1240,37 +1315,6 @@ impl eframe::App for VolumetricApp {
                             self.mark_all_needs_resample();
                         }
 
-                        ui.separator();
-                        ui.label("Export");
-                        // Check if any asset has triangles for STL export
-                        let has_triangles = self
-                            .asset_render_data
-                            .values()
-                            .any(|d| !d.triangles.is_empty());
-                        if ui
-                            .add_enabled(has_triangles, egui::Button::new("Export STL…"))
-                            .clicked()
-                        {
-                            // Collect all triangles from all assets
-                            let all_triangles: Vec<Triangle> = self
-                                .asset_render_data
-                                .values()
-                                .flat_map(|d| d.triangles.iter().cloned())
-                                .collect();
-                            if let Some(path) = rfd::FileDialog::new()
-                                .add_filter("STL", &["stl"])
-                                .set_file_name("mesh.stl")
-                                .save_file()
-                            {
-                                match stl::write_binary_stl(&path, &all_triangles, "volumetric") {
-                                    Ok(()) => self.error_message = None,
-                                    Err(e) => {
-                                        self.error_message = Some(format!("Failed to export STL: {e}"))
-                                    }
-                                }
-                            }
-                        }
-
                 ui.separator();
                 egui::CollapsingHeader::new("Project Timeline")
                     .default_open(true)
@@ -1412,12 +1456,108 @@ impl eframe::App for VolumetricApp {
                                                 ExportRenderMode::MarchingCubes,
                                                 ExportRenderMode::MarchingCubes.label(),
                                             );
+                                            ui.selectable_value(
+                                                &mut mode,
+                                                ExportRenderMode::AdaptiveSurfaceNets,
+                                                ExportRenderMode::AdaptiveSurfaceNets.label(),
+                                            );
                                         });
 
                                     if mode != current_mode {
                                         self.set_asset_render_mode(&asset_id, mode);
                                     }
                                 });
+
+                                // Show adaptive config options when AdaptiveSurfaceNets is selected
+                                if current_mode == ExportRenderMode::AdaptiveSurfaceNets {
+                                    if let Some(render_data) = self.asset_render_data.get_mut(&asset_id) {
+                                        let mut base_res = render_data.adaptive_base_resolution;
+                                        let mut max_depth = render_data.adaptive_max_depth;
+                                        
+                                        ui.horizontal(|ui| {
+                                            ui.label("Base Resolution:");
+                                            if ui.add(egui::DragValue::new(&mut base_res).range(2..=32)).changed() {
+                                                render_data.adaptive_base_resolution = base_res;
+                                                render_data.needs_resample = true;
+                                            }
+                                        });
+                                        
+                                        ui.horizontal(|ui| {
+                                            ui.label("Max Depth:");
+                                            if ui.add(egui::DragValue::new(&mut max_depth).range(0..=6)).changed() {
+                                                render_data.adaptive_max_depth = max_depth;
+                                                render_data.needs_resample = true;
+                                            }
+                                        });
+                                        
+                                        let effective_res = base_res * (1 << max_depth);
+                                        ui.weak(format!("Effective resolution: {}³", effective_res));
+                                    }
+                                }
+
+                                if let Some(render_data) = self.asset_render_data.get(&asset_id) {
+                                    if let Some(time) = render_data.last_sample_time {
+                                        ui.horizontal(|ui| {
+                                            ui.weak(format!("Sampled in {:.2}ms", time * 1000.0));
+                                            if let Some(count) = render_data.last_sample_count {
+                                                let avg = (time * 1000_000.0) / (count as f32);
+                                                ui.weak(format!("({:.2}µs/sample)", avg));
+                                            }
+                                        });
+                                    }
+
+                                    ui.horizontal(|ui| {
+                                        if ui.button("Export STL…").clicked() {
+                                            if let Some(path) = rfd::FileDialog::new()
+                                                .add_filter("STL", &["stl"])
+                                                .set_file_name(format!("{}.stl", asset_id))
+                                                .save_file()
+                                            {
+                                                // If we have triangles cached, use them. 
+                                                // Otherwise we might need to trigger marching cubes.
+                                                // The requirement says "assume marching cubes for now".
+                                                // If current mode is PointCloud, we might need to mesh it once.
+                                                
+                                                let triangles = if !render_data.triangles.is_empty() {
+                                                    render_data.triangles.clone()
+                                                } else {
+                                                    // Fallback: run marching cubes just for export if not already meshed
+                                                    match generate_marching_cubes_mesh_from_bytes(&render_data.wasm_bytes, self.resolution) {
+                                                        Ok((t, _, _)) => t,
+                                                        Err(e) => {
+                                                            self.error_message = Some(format!("Failed to generate mesh for export: {e}"));
+                                                            Vec::new()
+                                                        }
+                                                    }
+                                                };
+
+                                                if !triangles.is_empty() {
+                                                    match stl::write_binary_stl(&path, &triangles, "volumetric") {
+                                                        Ok(()) => self.error_message = None,
+                                                        Err(e) => {
+                                                            self.error_message = Some(format!("Failed to export STL: {e}"))
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        if ui.button("Export WASM…").clicked() {
+                                            if let Some(path) = rfd::FileDialog::new()
+                                                .add_filter("WASM", &["wasm"])
+                                                .set_file_name(format!("{}.wasm", asset_id))
+                                                .save_file()
+                                            {
+                                                match fs::write(&path, &render_data.wasm_bytes) {
+                                                    Ok(()) => self.error_message = None,
+                                                    Err(e) => {
+                                                        self.error_message = Some(format!("Failed to export WASM: {e}"))
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    });
+                                }
 
                                 if let Some(err) = self
                                     .asset_render_data
@@ -1506,9 +1646,9 @@ impl eframe::App for VolumetricApp {
                 painter.add(egui::Shape::Callback(cb));
             }
             
-            // Collect all mesh vertices from assets using MarchingCubes mode
+            // Collect all mesh vertices from assets using MarchingCubes or AdaptiveSurfaceNets mode
             let all_vertices: Vec<marching_cubes_wgpu::MeshVertex> = self.asset_render_data.values()
-                .filter(|d| d.mode == ExportRenderMode::MarchingCubes)
+                .filter(|d| d.mode == ExportRenderMode::MarchingCubes || d.mode == ExportRenderMode::AdaptiveSurfaceNets)
                 .flat_map(|d| d.mesh_vertices.iter().cloned())
                 .collect();
             
@@ -1549,7 +1689,7 @@ impl eframe::App for VolumetricApp {
             // Draw info text showing totals across all rendered assets
             let total_points = all_points.len();
             let total_triangles: usize = self.asset_render_data.values()
-                .filter(|d| d.mode == ExportRenderMode::MarchingCubes)
+                .filter(|d| d.mode == ExportRenderMode::MarchingCubes || d.mode == ExportRenderMode::AdaptiveSurfaceNets)
                 .map(|d| d.triangles.len())
                 .sum();
             let num_assets = self.asset_render_data.len();
@@ -1754,6 +1894,46 @@ fn generate_marching_cubes_mesh_from_bytes(wasm_bytes: &[u8], resolution: usize)
     let triangles = marching_cubes_cpu::marching_cubes_mesh(bounds_min, bounds_max, resolution, |p| {
         Ok(is_inside.call(&mut store, p)? != 0)
     })?;
+
+    Ok((triangles, bounds_min, bounds_max))
+}
+
+/// Generate a mesh using adaptive surface nets algorithm from WASM bytes (in-memory model)
+fn generate_adaptive_mesh_from_bytes(
+    wasm_bytes: &[u8],
+    config: &adaptive_surface_nets::AdaptiveMeshConfig,
+) -> Result<(Vec<Triangle>, (f32, f32, f32), (f32, f32, f32))> {
+    let engine = Engine::default();
+    let module = Module::new(&engine, wasm_bytes)
+        .context("Failed to load WASM module from bytes")?;
+    
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[])
+        .context("Failed to instantiate WASM module")?;
+    
+    let get_bounds_min_x = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_min_x")?;
+    let get_bounds_min_y = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_min_y")?;
+    let get_bounds_min_z = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_min_z")?;
+    let get_bounds_max_x = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_max_x")?;
+    let get_bounds_max_y = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_max_y")?;
+    let get_bounds_max_z = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_max_z")?;
+    
+    let min_x = get_bounds_min_x.call(&mut store, ())?;
+    let min_y = get_bounds_min_y.call(&mut store, ())?;
+    let min_z = get_bounds_min_z.call(&mut store, ())?;
+    let max_x = get_bounds_max_x.call(&mut store, ())?;
+    let max_y = get_bounds_max_y.call(&mut store, ())?;
+    let max_z = get_bounds_max_z.call(&mut store, ())?;
+    
+    let bounds_min = (min_x, min_y, min_z);
+    let bounds_max = (max_x, max_y, max_z);
+
+    let triangles = adaptive_surface_nets::adaptive_surface_nets_mesh(
+        wasm_bytes,
+        bounds_min,
+        bounds_max,
+        config,
+    )?;
 
     Ok((triangles, bounds_min, bounds_max))
 }
