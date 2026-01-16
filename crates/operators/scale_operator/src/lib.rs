@@ -115,25 +115,25 @@ fn transform_wasm(input_bytes: &[u8], cfg: ScaleConfig) -> Result<Vec<u8>, Strin
         module.exports.add("is_inside", fid);
     }
 
-    // Bounds: new min_x = min(sx*min_x, sx*max_x), new max_x = max(sx*min_x, sx*max_x), similarly for y,z
-    use walrus::ir::BinaryOp::{F32Mul, F32Min, F32Max};
-    let axes = [("x", cfg.sx), ("y", cfg.sy), ("z", cfg.sz)];
+    // Bounds (f64): new min = min(s*min, s*max), new max = max(s*min, s*max)
+    use walrus::ir::BinaryOp::{F64Mul, F64Min, F64Max};
+    let axes = [("x", cfg.sx as f64), ("y", cfg.sy as f64), ("z", cfg.sz as f64)];
     for (i, (axis, s)) in axes.iter().enumerate() {
         let (min_name, max_name) = match i { 0 => ("get_bounds_min_x", "get_bounds_max_x"), 1 => ("get_bounds_min_y", "get_bounds_max_y"), _ => ("get_bounds_min_z", "get_bounds_max_z") };
         if let (Some(&min_orig), Some(&max_orig)) = (renamed.get(min_name), renamed.get(max_name)) {
             // min
-            let mut bmin = FunctionBuilder::new(&mut module.types, &[], &[ValType::F32]);
-            bmin.func_body().call(min_orig).f32_const(*s).binop(F32Mul);
-            bmin.func_body().call(max_orig).f32_const(*s).binop(F32Mul);
-            bmin.func_body().binop(F32Min);
+            let mut bmin = FunctionBuilder::new(&mut module.types, &[], &[ValType::F64]);
+            bmin.func_body().call(min_orig).f64_const(*s).binop(F64Mul);
+            bmin.func_body().call(max_orig).f64_const(*s).binop(F64Mul);
+            bmin.func_body().binop(F64Min);
             let fid_min = bmin.finish(vec![], &mut module.funcs);
             module.exports.add(min_name, fid_min);
 
             // max
-            let mut bmax = FunctionBuilder::new(&mut module.types, &[], &[ValType::F32]);
-            bmax.func_body().call(min_orig).f32_const(*s).binop(F32Mul);
-            bmax.func_body().call(max_orig).f32_const(*s).binop(F32Mul);
-            bmax.func_body().binop(F32Max);
+            let mut bmax = FunctionBuilder::new(&mut module.types, &[], &[ValType::F64]);
+            bmax.func_body().call(min_orig).f64_const(*s).binop(F64Mul);
+            bmax.func_body().call(max_orig).f64_const(*s).binop(F64Mul);
+            bmax.func_body().binop(F64Max);
             let fid_max = bmax.finish(vec![], &mut module.funcs);
             module.exports.add(max_name, fid_max);
         }

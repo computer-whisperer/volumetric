@@ -287,7 +287,7 @@ fn add_bounds_wrapper(
     is_min: bool,
 ) -> u32 {
     let ty = types.len();
-    types.ty().function([], [ValType::F32]);
+    types.ty().function([], [ValType::F64]);
     funcs.function(ty);
 
     let mut f = Function::new([]);
@@ -299,19 +299,19 @@ fn add_bounds_wrapper(
         match (op, is_min) {
             (BooleanOp::Union, true) => {
                 // min(a, b)
-                f.instruction(&Instruction::F32Min);
+                f.instruction(&Instruction::F64Min);
             }
             (BooleanOp::Union, false) => {
                 // max(a, b)
-                f.instruction(&Instruction::F32Max);
+                f.instruction(&Instruction::F64Max);
             }
             (BooleanOp::Intersect, true) => {
                 // max(min_a, min_b)
-                f.instruction(&Instruction::F32Max);
+                f.instruction(&Instruction::F64Max);
             }
             (BooleanOp::Intersect, false) => {
                 // min(max_a, max_b)
-                f.instruction(&Instruction::F32Min);
+                f.instruction(&Instruction::F64Min);
             }
             (BooleanOp::Subtract, _) => unreachable!(),
         }

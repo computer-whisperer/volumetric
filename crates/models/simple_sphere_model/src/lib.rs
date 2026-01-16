@@ -32,14 +32,14 @@ pub extern "C" fn is_inside(x: f64, y: f64, z: f64) -> f32 {
 /// Returns the bounds as 6 floats: min_x, min_y, min_z, max_x, max_y, max_z
 /// For a unit sphere, this is (-1, -1, -1) to (1, 1, 1)
 #[no_mangle]
-pub extern "C" fn get_bounds_min_x() -> f32 { -1.0 }
+pub extern "C" fn get_bounds_min_x() -> f64 { -1.0f64 }
 #[no_mangle]
-pub extern "C" fn get_bounds_min_y() -> f32 { -1.0 }
+pub extern "C" fn get_bounds_min_y() -> f64 { -1.0f64 }
 #[no_mangle]
-pub extern "C" fn get_bounds_min_z() -> f32 { -1.0 }
+pub extern "C" fn get_bounds_min_z() -> f64 { -1.0f64 }
 #[no_mangle]
-pub extern "C" fn get_bounds_max_x() -> f32 { 1.0 }
+pub extern "C" fn get_bounds_max_x() -> f64 { 1.0f64 }
 #[no_mangle]
-pub extern "C" fn get_bounds_max_y() -> f32 { 1.0 }
+pub extern "C" fn get_bounds_max_y() -> f64 { 1.0f64 }
 #[no_mangle]
-pub extern "C" fn get_bounds_max_z() -> f32 { 1.0 }
+pub extern "C" fn get_bounds_max_z() -> f64 { 1.0f64 }

@@ -152,37 +152,37 @@ fn transform_wasm(input_bytes: &[u8], cfg: TranslateConfig) -> Result<Vec<u8>, S
                     module.exports.add("is_inside", wrapper_id);
                 }
                 "get_bounds_min_x" => {
-                    // get_bounds_min_x() -> f32
+                    // get_bounds_min_x() -> f64
                     // Wrapper: returns original + dx
                     let mut builder = FunctionBuilder::new(
                         &mut module.types,
                         &[],
-                        &[ValType::F32],
+                        &[ValType::F64],
                     );
 
                     builder
                         .func_body()
                         .call(original_func_id)
-                        .f32_const(cfg.dx)
-                        .binop(walrus::ir::BinaryOp::F32Add);
+                        .f64_const(cfg.dx as f64)
+                        .binop(walrus::ir::BinaryOp::F64Add);
 
                     let wrapper_id = builder.finish(vec![], &mut module.funcs);
                     module.exports.add("get_bounds_min_x", wrapper_id);
                 }
                 "get_bounds_max_x" => {
-                    // get_bounds_max_x() -> f32
+                    // get_bounds_max_x() -> f64
                     // Wrapper: returns original + dx
                     let mut builder = FunctionBuilder::new(
                         &mut module.types,
                         &[],
-                        &[ValType::F32],
+                        &[ValType::F64],
                     );
 
                     builder
                         .func_body()
                         .call(original_func_id)
-                        .f32_const(cfg.dx)
-                        .binop(walrus::ir::BinaryOp::F32Add);
+                        .f64_const(cfg.dx as f64)
+                        .binop(walrus::ir::BinaryOp::F64Add);
 
                     let wrapper_id = builder.finish(vec![], &mut module.funcs);
                     module.exports.add("get_bounds_max_x", wrapper_id);
@@ -192,14 +192,14 @@ fn transform_wasm(input_bytes: &[u8], cfg: TranslateConfig) -> Result<Vec<u8>, S
                     let mut builder = FunctionBuilder::new(
                         &mut module.types,
                         &[],
-                        &[ValType::F32],
+                        &[ValType::F64],
                     );
 
                     builder
                         .func_body()
                         .call(original_func_id)
-                        .f32_const(cfg.dy)
-                        .binop(walrus::ir::BinaryOp::F32Add);
+                        .f64_const(cfg.dy as f64)
+                        .binop(walrus::ir::BinaryOp::F64Add);
 
                     let wrapper_id = builder.finish(vec![], &mut module.funcs);
                     module.exports.add("get_bounds_min_y", wrapper_id);
@@ -209,14 +209,14 @@ fn transform_wasm(input_bytes: &[u8], cfg: TranslateConfig) -> Result<Vec<u8>, S
                     let mut builder = FunctionBuilder::new(
                         &mut module.types,
                         &[],
-                        &[ValType::F32],
+                        &[ValType::F64],
                     );
 
                     builder
                         .func_body()
                         .call(original_func_id)
-                        .f32_const(cfg.dy)
-                        .binop(walrus::ir::BinaryOp::F32Add);
+                        .f64_const(cfg.dy as f64)
+                        .binop(walrus::ir::BinaryOp::F64Add);
 
                     let wrapper_id = builder.finish(vec![], &mut module.funcs);
                     module.exports.add("get_bounds_max_y", wrapper_id);
@@ -226,14 +226,14 @@ fn transform_wasm(input_bytes: &[u8], cfg: TranslateConfig) -> Result<Vec<u8>, S
                     let mut builder = FunctionBuilder::new(
                         &mut module.types,
                         &[],
-                        &[ValType::F32],
+                        &[ValType::F64],
                     );
 
                     builder
                         .func_body()
                         .call(original_func_id)
-                        .f32_const(cfg.dz)
-                        .binop(walrus::ir::BinaryOp::F32Add);
+                        .f64_const(cfg.dz as f64)
+                        .binop(walrus::ir::BinaryOp::F64Add);
 
                     let wrapper_id = builder.finish(vec![], &mut module.funcs);
                     module.exports.add("get_bounds_min_z", wrapper_id);
@@ -243,14 +243,14 @@ fn transform_wasm(input_bytes: &[u8], cfg: TranslateConfig) -> Result<Vec<u8>, S
                     let mut builder = FunctionBuilder::new(
                         &mut module.types,
                         &[],
-                        &[ValType::F32],
+                        &[ValType::F64],
                     );
 
                     builder
                         .func_body()
                         .call(original_func_id)
-                        .f32_const(cfg.dz)
-                        .binop(walrus::ir::BinaryOp::F32Add);
+                        .f64_const(cfg.dz as f64)
+                        .binop(walrus::ir::BinaryOp::F64Add);
 
                     let wrapper_id = builder.finish(vec![], &mut module.funcs);
                     module.exports.add("get_bounds_max_z", wrapper_id);

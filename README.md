@@ -22,7 +22,7 @@ The system is divided into three main components:
 ### 1. Model WASM Modules
 A Model module is a WASM artifact that exports:
 - `is_inside(x: f64, y: f64, z: f64) -> f32`: Returns a density value (current demo models output `1.0` for inside and `0.0` for outside; future models may use continuous densities).
-- `get_bounds_min_x/y/z() -> f32` & `get_bounds_max_x/y/z() -> f32`: Defines the axis-aligned bounding box.
+- `get_bounds_min_x/y/z() -> f64` & `get_bounds_max_x/y/z() -> f64`: Defines the axis-aligned bounding box.
 
 ### 2. Operator WASM Modules
 Operators are the "compilers" of the volumetric world. They take existing models or configurations as input and produce a new Model WASM as output. 

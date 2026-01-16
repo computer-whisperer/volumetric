@@ -175,10 +175,9 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
             }
             _ => {
                 if !params.is_empty() { return Err(CompileError::Type("bounds getters must have 0 params")); }
-                let mut fb = FunctionBuilder::new(&mut module.types, &[], &[ValType::F32]);
+                let mut fb = FunctionBuilder::new(&mut module.types, &[], &[ValType::F64]);
                 let mut ib = fb.func_body();
                 emit_expr_str(&mut ib, &expr_str, &params, &[])?;
-                ib.unop(walrus::ir::UnaryOp::F32DemoteF64);
                 let fid = fb.finish(vec![], &mut module.funcs);
                 module.exports.add(fname, fid);
             }

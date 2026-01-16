@@ -1743,19 +1743,19 @@ fn sample_model(wasm_path: &Path, resolution: usize) -> Result<(Vec<(f32, f32, f
         .get_typed_func::<(f64, f64, f64), f32>(&mut store, "is_inside")
         .context("Failed to get 'is_inside' function")?;
     
-    let get_bounds_min_x = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_min_x")?;
-    let get_bounds_min_y = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_min_y")?;
-    let get_bounds_min_z = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_min_z")?;
-    let get_bounds_max_x = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_max_x")?;
-    let get_bounds_max_y = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_max_y")?;
-    let get_bounds_max_z = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_max_z")?;
+    let get_bounds_min_x = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_x")?;
+    let get_bounds_min_y = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_y")?;
+    let get_bounds_min_z = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_z")?;
+    let get_bounds_max_x = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_x")?;
+    let get_bounds_max_y = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_y")?;
+    let get_bounds_max_z = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_z")?;
     
-    let min_x = get_bounds_min_x.call(&mut store, ())?;
-    let min_y = get_bounds_min_y.call(&mut store, ())?;
-    let min_z = get_bounds_min_z.call(&mut store, ())?;
-    let max_x = get_bounds_max_x.call(&mut store, ())?;
-    let max_y = get_bounds_max_y.call(&mut store, ())?;
-    let max_z = get_bounds_max_z.call(&mut store, ())?;
+    let min_x = get_bounds_min_x.call(&mut store, ())? as f32;
+    let min_y = get_bounds_min_y.call(&mut store, ())? as f32;
+    let min_z = get_bounds_min_z.call(&mut store, ())? as f32;
+    let max_x = get_bounds_max_x.call(&mut store, ())? as f32;
+    let max_y = get_bounds_max_y.call(&mut store, ())? as f32;
+    let max_z = get_bounds_max_z.call(&mut store, ())? as f32;
     
     let bounds_min = (min_x, min_y, min_z);
     let bounds_max = (max_x, max_y, max_z);
@@ -1794,19 +1794,19 @@ fn generate_marching_cubes_mesh(wasm_path: &Path, resolution: usize) -> Result<(
         .get_typed_func::<(f64, f64, f64), f32>(&mut store, "is_inside")
         .context("Failed to get 'is_inside' function")?;
     
-    let get_bounds_min_x = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_min_x")?;
-    let get_bounds_min_y = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_min_y")?;
-    let get_bounds_min_z = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_min_z")?;
-    let get_bounds_max_x = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_max_x")?;
-    let get_bounds_max_y = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_max_y")?;
-    let get_bounds_max_z = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_max_z")?;
+    let get_bounds_min_x = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_x")?;
+    let get_bounds_min_y = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_y")?;
+    let get_bounds_min_z = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_z")?;
+    let get_bounds_max_x = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_x")?;
+    let get_bounds_max_y = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_y")?;
+    let get_bounds_max_z = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_z")?;
     
-    let min_x = get_bounds_min_x.call(&mut store, ())?;
-    let min_y = get_bounds_min_y.call(&mut store, ())?;
-    let min_z = get_bounds_min_z.call(&mut store, ())?;
-    let max_x = get_bounds_max_x.call(&mut store, ())?;
-    let max_y = get_bounds_max_y.call(&mut store, ())?;
-    let max_z = get_bounds_max_z.call(&mut store, ())?;
+    let min_x = get_bounds_min_x.call(&mut store, ())? as f32;
+    let min_y = get_bounds_min_y.call(&mut store, ())? as f32;
+    let min_z = get_bounds_min_z.call(&mut store, ())? as f32;
+    let max_x = get_bounds_max_x.call(&mut store, ())? as f32;
+    let max_y = get_bounds_max_y.call(&mut store, ())? as f32;
+    let max_z = get_bounds_max_z.call(&mut store, ())? as f32;
     
     let bounds_min = (min_x, min_y, min_z);
     let bounds_max = (max_x, max_y, max_z);
@@ -1833,19 +1833,19 @@ fn sample_model_from_bytes(wasm_bytes: &[u8], resolution: usize) -> Result<(Vec<
         .get_typed_func::<(f64, f64, f64), f32>(&mut store, "is_inside")
         .context("Failed to get 'is_inside' function")?;
     
-    let get_bounds_min_x = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_min_x")?;
-    let get_bounds_min_y = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_min_y")?;
-    let get_bounds_min_z = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_min_z")?;
-    let get_bounds_max_x = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_max_x")?;
-    let get_bounds_max_y = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_max_y")?;
-    let get_bounds_max_z = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_max_z")?;
+    let get_bounds_min_x = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_x")?;
+    let get_bounds_min_y = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_y")?;
+    let get_bounds_min_z = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_z")?;
+    let get_bounds_max_x = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_x")?;
+    let get_bounds_max_y = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_y")?;
+    let get_bounds_max_z = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_z")?;
     
-    let min_x = get_bounds_min_x.call(&mut store, ())?;
-    let min_y = get_bounds_min_y.call(&mut store, ())?;
-    let min_z = get_bounds_min_z.call(&mut store, ())?;
-    let max_x = get_bounds_max_x.call(&mut store, ())?;
-    let max_y = get_bounds_max_y.call(&mut store, ())?;
-    let max_z = get_bounds_max_z.call(&mut store, ())?;
+    let min_x = get_bounds_min_x.call(&mut store, ())? as f32;
+    let min_y = get_bounds_min_y.call(&mut store, ())? as f32;
+    let min_z = get_bounds_min_z.call(&mut store, ())? as f32;
+    let max_x = get_bounds_max_x.call(&mut store, ())? as f32;
+    let max_y = get_bounds_max_y.call(&mut store, ())? as f32;
+    let max_z = get_bounds_max_z.call(&mut store, ())? as f32;
     
     let bounds_min = (min_x, min_y, min_z);
     let bounds_max = (max_x, max_y, max_z);
@@ -1883,19 +1883,19 @@ fn generate_marching_cubes_mesh_from_bytes(wasm_bytes: &[u8], resolution: usize)
         .get_typed_func::<(f64, f64, f64), f32>(&mut store, "is_inside")
         .context("Failed to get 'is_inside' function")?;
     
-    let get_bounds_min_x = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_min_x")?;
-    let get_bounds_min_y = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_min_y")?;
-    let get_bounds_min_z = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_min_z")?;
-    let get_bounds_max_x = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_max_x")?;
-    let get_bounds_max_y = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_max_y")?;
-    let get_bounds_max_z = instance.get_typed_func::<(), f32>(&mut store, "get_bounds_max_z")?;
+    let get_bounds_min_x = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_x")?;
+    let get_bounds_min_y = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_y")?;
+    let get_bounds_min_z = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_z")?;
+    let get_bounds_max_x = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_x")?;
+    let get_bounds_max_y = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_y")?;
+    let get_bounds_max_z = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_z")?;
     
-    let min_x = get_bounds_min_x.call(&mut store, ())?;
-    let min_y = get_bounds_min_y.call(&mut store, ())?;
-    let min_z = get_bounds_min_z.call(&mut store, ())?;
-    let max_x = get_bounds_max_x.call(&mut store, ())?;
-    let max_y = get_bounds_max_y.call(&mut store, ())?;
-    let max_z = get_bounds_max_z.call(&mut store, ())?;
+    let min_x = get_bounds_min_x.call(&mut store, ())? as f32;
+    let min_y = get_bounds_min_y.call(&mut store, ())? as f32;
+    let min_z = get_bounds_min_z.call(&mut store, ())? as f32;
+    let max_x = get_bounds_max_x.call(&mut store, ())? as f32;
+    let max_y = get_bounds_max_y.call(&mut store, ())? as f32;
+    let max_z = get_bounds_max_z.call(&mut store, ())? as f32;
     
     let bounds_min = (min_x, min_y, min_z);
     let bounds_max = (max_x, max_y, max_z);

@@ -174,80 +174,74 @@ fn transform_wasm(input_bytes: &[u8], cfg: RotationConfig) -> Result<Vec<u8>, St
     // We'll build helpers to compute min/max via calls to original getters.
     fn build_bounds_component(module: &mut Module, renamed: &std::collections::HashMap<String, FunctionId>, r: [[f64;3];3], r_abs: [[f64;3];3], axis: usize, name: &str) {
         use walrus::ir::BinaryOp::*;
-        use walrus::ir::UnaryOp::{F64PromoteF32, F32DemoteF64};
-        let mut b = FunctionBuilder::new(&mut module.types, &[], &[ValType::F32]);
+        let mut b = FunctionBuilder::new(&mut module.types, &[], &[ValType::F64]);
 
-        // Compute c'_axis = row(axis) · c, where c = (min+max)/2 per axis
-        // We'll do this by computing each contribution inline and summing in f64, then demoting to f32.
+        // Compute c'_axis = row(axis) · c, where c = (min+max)/2 per axis, all in f64
         // term_x = r[axis][0] * (min_x + max_x) * 0.5
         b.func_body()
             .call(*renamed.get("get_bounds_min_x").unwrap())
             .call(*renamed.get("get_bounds_max_x").unwrap())
-            .binop(F32Add)
-            .f32_const(0.5)
-            .binop(F32Mul)
-            .unop(F64PromoteF32)
+            .binop(F64Add)
+            .f64_const(0.5)
+            .binop(F64Mul)
             .f64_const(r[axis][0])
-            .binop(walrus::ir::BinaryOp::F64Mul);
+            .binop(F64Mul);
         // + term_y
         b.func_body()
             .call(*renamed.get("get_bounds_min_y").unwrap())
             .call(*renamed.get("get_bounds_max_y").unwrap())
-            .binop(F32Add)
-            .f32_const(0.5)
-            .binop(F32Mul)
-            .unop(F64PromoteF32)
+            .binop(F64Add)
+            .f64_const(0.5)
+            .binop(F64Mul)
             .f64_const(r[axis][1])
-            .binop(walrus::ir::BinaryOp::F64Mul)
-            .binop(walrus::ir::BinaryOp::F64Add);
+            .binop(F64Mul)
+            .binop(F64Add);
         // + term_z
         b.func_body()
             .call(*renamed.get("get_bounds_min_z").unwrap())
             .call(*renamed.get("get_bounds_max_z").unwrap())
-            .binop(F32Add)
-            .f32_const(0.5)
-            .binop(F32Mul)
-            .unop(F64PromoteF32)
+            .binop(F64Add)
+            .f64_const(0.5)
+            .binop(F64Mul)
             .f64_const(r[axis][2])
-            .binop(walrus::ir::BinaryOp::F64Mul)
-            .binop(walrus::ir::BinaryOp::F64Add)
-            .unop(F32DemoteF64);
+            .binop(F64Mul)
+            .binop(F64Add);
 
-        // Compute h'_axis = |row(axis)| · h, where h = (max-min)/2 per axis, all in f32
+        // Compute h'_axis = |row(axis)| · h, where h = (max-min)/2 per axis, all in f64
         // term_x
         b.func_body()
             .call(*renamed.get("get_bounds_max_x").unwrap())
             .call(*renamed.get("get_bounds_min_x").unwrap())
-            .binop(F32Sub)
-            .f32_const(0.5)
-            .binop(F32Mul)
-            .f32_const(r_abs[axis][0] as f32)
-            .binop(F32Mul);
+            .binop(F64Sub)
+            .f64_const(0.5)
+            .binop(F64Mul)
+            .f64_const(r_abs[axis][0])
+            .binop(F64Mul);
         // + term_y
         b.func_body()
             .call(*renamed.get("get_bounds_max_y").unwrap())
             .call(*renamed.get("get_bounds_min_y").unwrap())
-            .binop(F32Sub)
-            .f32_const(0.5)
-            .binop(F32Mul)
-            .f32_const(r_abs[axis][1] as f32)
-            .binop(F32Mul)
-            .binop(F32Add);
+            .binop(F64Sub)
+            .f64_const(0.5)
+            .binop(F64Mul)
+            .f64_const(r_abs[axis][1])
+            .binop(F64Mul)
+            .binop(F64Add);
         // + term_z
         b.func_body()
             .call(*renamed.get("get_bounds_max_z").unwrap())
             .call(*renamed.get("get_bounds_min_z").unwrap())
-            .binop(F32Sub)
-            .f32_const(0.5)
-            .binop(F32Mul)
-            .f32_const(r_abs[axis][2] as f32)
-            .binop(F32Mul)
-            .binop(F32Add);
+            .binop(F64Sub)
+            .f64_const(0.5)
+            .binop(F64Mul)
+            .f64_const(r_abs[axis][2])
+            .binop(F64Mul)
+            .binop(F64Add);
 
-        // Now stack: c'_axis (f32), h'_axis (f32). For min or max, compute c' -/+ h'
+        // Now stack: c'_axis (f64), h'_axis (f64). For min or max, compute c' -/+ h'
         match name {
-            "min" => { b.func_body().binop(F32Sub); },
-            _ => { b.func_body().binop(F32Add); },
+            "min" => { b.func_body().binop(F64Sub); },
+            _ => { b.func_body().binop(F64Add); },
         }
 
         let fid = b.finish(vec![], &mut module.funcs);

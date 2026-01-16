@@ -37,26 +37,26 @@ pub extern "C" fn is_inside(x: f64, y: f64, z: f64) -> f32 {
 }
 
 #[no_mangle]
-pub extern "C" fn get_bounds_min_x() -> f32 {
-    -3.14159265
+pub extern "C" fn get_bounds_min_x() -> f64 {
+    -3.14159265f64
 }
 #[no_mangle]
-pub extern "C" fn get_bounds_min_y() -> f32 {
-    -3.14159265
+pub extern "C" fn get_bounds_min_y() -> f64 {
+    -3.14159265f64
 }
 #[no_mangle]
-pub extern "C" fn get_bounds_min_z() -> f32 {
-    -3.14159265
+pub extern "C" fn get_bounds_min_z() -> f64 {
+    -3.14159265f64
 }
 #[no_mangle]
-pub extern "C" fn get_bounds_max_x() -> f32 {
-    3.14159265
+pub extern "C" fn get_bounds_max_x() -> f64 {
+    3.14159265f64
 }
 #[no_mangle]
-pub extern "C" fn get_bounds_max_y() -> f32 {
-    3.14159265
+pub extern "C" fn get_bounds_max_y() -> f64 {
+    3.14159265f64
 }
 #[no_mangle]
-pub extern "C" fn get_bounds_max_z() -> f32 {
-    3.14159265
+pub extern "C" fn get_bounds_max_z() -> f64 {
+    3.14159265f64
 }
