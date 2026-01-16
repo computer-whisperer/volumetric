@@ -56,13 +56,362 @@ enum CompileError {
     #[error("Missing required function: {0}")]
     MissingFunc(&'static str),
     #[error("Unsupported Lua construct: {0}")]
-    Unsupported(&'static str),
+    Unsupported(String),
     #[error("Type error: {0}")]
-    Type(&'static str),
+    Type(String),
 }
 
+// ============================================================================
+// Intermediate Representation (IR)
+// ============================================================================
+
+/// Binary operators in the IR
+#[derive(Clone, Debug)]
+enum IrBinOp {
+    Add, Sub, Mul, Div,
+    Lt, Le, Gt, Ge, Eq, Ne,
+    And, Or,
+}
+
+/// Unary operators in the IR
+#[derive(Clone, Debug)]
+enum IrUnaryOp {
+    Neg,
+    Not,
+}
+
+/// Built-in math functions
+#[derive(Clone, Debug)]
+enum IrMathFunc {
+    Abs, Sqrt, Floor, Ceil, Trunc, Nearest,
+    Min, Max,
+}
+
+/// IR Expression - decoupled from the AST
+#[derive(Clone, Debug)]
+enum IrExpr {
+    Number(f64),
+    Var(String),
+    BinOp { op: IrBinOp, lhs: Box<IrExpr>, rhs: Box<IrExpr> },
+    UnaryOp { op: IrUnaryOp, expr: Box<IrExpr> },
+    MathCall { func: IrMathFunc, args: Vec<IrExpr> },
+    FuncCall { name: String, args: Vec<IrExpr> },
+    IfThenElse { cond: Box<IrExpr>, then_expr: Box<IrExpr>, else_expr: Box<IrExpr> },
+}
+
+/// IR Statement
+#[derive(Clone, Debug)]
+enum IrStmt {
+    LocalAssign { name: String, value: IrExpr },
+    Assign { name: String, value: IrExpr },
+    If { cond: IrExpr, then_body: Vec<IrStmt>, else_body: Vec<IrStmt> },
+    Return(IrExpr),
+}
+
+/// IR Function definition
+#[derive(Clone, Debug)]
+struct IrFunc {
+    params: Vec<String>,
+    body: Vec<IrStmt>,
+}
+
+// ============================================================================
+// AST to IR Conversion
+// ============================================================================
+
+/// Convert a Lua AST expression to IR
+fn ast_expr_to_ir(expr: &full_moon::ast::Expression) -> Result<IrExpr, CompileError> {
+    use full_moon::ast::{Expression, BinOp, UnOp, Var, Prefix, Suffix, Call, FunctionArgs, Index};
+    
+    match expr {
+        Expression::Number(token) => {
+            let num_str = token.token().to_string();
+            let v: f64 = num_str.parse()
+                .map_err(|_| CompileError::Parse(format!("invalid number: {}", num_str)))?;
+            Ok(IrExpr::Number(v))
+        }
+        Expression::Var(var) => {
+            match var {
+                Var::Name(token) => {
+                    Ok(IrExpr::Var(token.token().to_string()))
+                }
+                Var::Expression(_) => {
+                    Err(CompileError::Unsupported("complex variable expressions not supported".into()))
+                }
+                _ => Err(CompileError::Unsupported("unsupported variable type".into())),
+            }
+        }
+        Expression::Parentheses { expression, .. } => {
+            ast_expr_to_ir(expression)
+        }
+        Expression::UnaryOperator { unop, expression } => {
+            let inner = ast_expr_to_ir(expression)?;
+            match unop {
+                UnOp::Minus(_) => Ok(IrExpr::UnaryOp { op: IrUnaryOp::Neg, expr: Box::new(inner) }),
+                UnOp::Not(_) => Ok(IrExpr::UnaryOp { op: IrUnaryOp::Not, expr: Box::new(inner) }),
+                UnOp::Hash(_) => Err(CompileError::Unsupported("length operator".into())),
+                _ => Err(CompileError::Unsupported("unsupported unary operator".into())),
+            }
+        }
+        Expression::BinaryOperator { lhs, binop, rhs } => {
+            let left = ast_expr_to_ir(lhs)?;
+            let right = ast_expr_to_ir(rhs)?;
+            let op = match binop {
+                BinOp::Plus(_) => IrBinOp::Add,
+                BinOp::Minus(_) => IrBinOp::Sub,
+                BinOp::Star(_) => IrBinOp::Mul,
+                BinOp::Slash(_) => IrBinOp::Div,
+                BinOp::LessThan(_) => IrBinOp::Lt,
+                BinOp::LessThanEqual(_) => IrBinOp::Le,
+                BinOp::GreaterThan(_) => IrBinOp::Gt,
+                BinOp::GreaterThanEqual(_) => IrBinOp::Ge,
+                BinOp::TwoEqual(_) => IrBinOp::Eq,
+                BinOp::TildeEqual(_) => IrBinOp::Ne,
+                BinOp::And(_) => IrBinOp::And,
+                BinOp::Or(_) => IrBinOp::Or,
+                BinOp::Caret(_) => return Err(CompileError::Unsupported("exponentiation operator (use math.pow if available)".into())),
+                BinOp::Percent(_) => return Err(CompileError::Unsupported("modulo operator".into())),
+                BinOp::TwoDots(_) => return Err(CompileError::Unsupported("string concatenation".into())),
+                _ => return Err(CompileError::Unsupported("unsupported binary operator".into())),
+            };
+            Ok(IrExpr::BinOp { op, lhs: Box::new(left), rhs: Box::new(right) })
+        }
+        Expression::FunctionCall(call) => {
+            ast_func_call_to_ir(call)
+        }
+        Expression::Symbol(token) => {
+            let sym = token.token().to_string();
+            match sym.as_str() {
+                "true" => Ok(IrExpr::Number(1.0)),
+                "false" => Ok(IrExpr::Number(0.0)),
+                _ => Err(CompileError::Unsupported(format!("unsupported symbol: {}", sym))),
+            }
+        }
+        _ => Err(CompileError::Unsupported("unsupported expression type".into())),
+    }
+}
+
+/// Convert a function call AST to IR
+fn ast_func_call_to_ir(call: &full_moon::ast::FunctionCall) -> Result<IrExpr, CompileError> {
+    use full_moon::ast::{Prefix, Suffix, Call, FunctionArgs, Index};
+    
+    let prefix = call.prefix();
+    let suffixes: Vec<_> = call.suffixes().collect();
+    
+    // Pattern: math.abs(x) -> prefix=Name("math"), suffixes=[Index::Dot("abs"), Call(...)]
+    // Pattern: helper(x) -> prefix=Name("helper"), suffixes=[Call(...)]
+    
+    if let Prefix::Name(obj_token) = prefix {
+        let obj_name = obj_token.token().to_string();
+        
+        // Check for math.func pattern
+        if suffixes.len() >= 2 {
+            if let Suffix::Index(Index::Dot { name, .. }) = &suffixes[0] {
+                let method_name = name.token().to_string();
+                let args = extract_call_args_from_suffixes(&suffixes[1..])?;
+                
+                if obj_name == "math" {
+                    let func = match method_name.as_str() {
+                        "abs" => IrMathFunc::Abs,
+                        "sqrt" => IrMathFunc::Sqrt,
+                        "floor" => IrMathFunc::Floor,
+                        "ceil" => IrMathFunc::Ceil,
+                        "trunc" => IrMathFunc::Trunc,
+                        "nearest" => IrMathFunc::Nearest,
+                        "min" => IrMathFunc::Min,
+                        "max" => IrMathFunc::Max,
+                        _ => return Err(CompileError::Unsupported(format!("unsupported math function: math.{}", method_name))),
+                    };
+                    return Ok(IrExpr::MathCall { func, args });
+                } else {
+                    return Err(CompileError::Unsupported(format!("unsupported module: {}", obj_name)));
+                }
+            }
+        }
+        
+        // Check for simple function call pattern: func(args)
+        if suffixes.len() == 1 {
+            let args = extract_call_args_from_suffixes(&suffixes)?;
+            return Ok(IrExpr::FuncCall { name: obj_name, args });
+        }
+    }
+    
+    Err(CompileError::Unsupported("unsupported function call pattern".into()))
+}
+
+/// Extract arguments from call suffixes
+fn extract_call_args_from_suffixes(suffixes: &[&full_moon::ast::Suffix]) -> Result<Vec<IrExpr>, CompileError> {
+    use full_moon::ast::{Suffix, Call, FunctionArgs};
+    
+    for suffix in suffixes.iter() {
+        if let Suffix::Call(call_suffix) = suffix {
+            match call_suffix {
+                Call::AnonymousCall(func_args) => {
+                    match func_args {
+                        FunctionArgs::Parentheses { arguments, .. } => {
+                            return arguments.iter()
+                                .map(|arg| ast_expr_to_ir(arg))
+                                .collect();
+                        }
+                        _ => {}
+                    }
+                }
+                Call::MethodCall(_) => {
+                    return Err(CompileError::Unsupported("method call syntax not supported".into()));
+                }
+                _ => {}
+            }
+        }
+    }
+    Err(CompileError::Unsupported("could not extract function arguments".into()))
+}
+
+/// Convert a Lua block to IR statements
+fn ast_block_to_ir(block: &full_moon::ast::Block) -> Result<Vec<IrStmt>, CompileError> {
+    use full_moon::ast::{Stmt, LastStmt};
+    
+    let mut stmts = Vec::new();
+    
+    for stmt in block.stmts() {
+        match stmt {
+            Stmt::LocalAssignment(local_assign) => {
+                // Handle: local x = expr
+                let names: Vec<_> = local_assign.names().iter().collect();
+                let exprs: Vec<_> = local_assign.expressions().iter().collect();
+                
+                for (i, name_token) in names.iter().enumerate() {
+                    let name = name_token.token().to_string();
+                    let value = if i < exprs.len() {
+                        ast_expr_to_ir(exprs[i])?
+                    } else {
+                        IrExpr::Number(0.0) // Default to nil/0
+                    };
+                    stmts.push(IrStmt::LocalAssign { name, value });
+                }
+            }
+            Stmt::Assignment(assign) => {
+                // Handle: x = expr
+                let vars: Vec<_> = assign.variables().iter().collect();
+                let exprs: Vec<_> = assign.expressions().iter().collect();
+                
+                for (i, var) in vars.iter().enumerate() {
+                    if let full_moon::ast::Var::Name(name_token) = var {
+                        let name = name_token.token().to_string();
+                        let value = if i < exprs.len() {
+                            ast_expr_to_ir(exprs[i])?
+                        } else {
+                            IrExpr::Number(0.0)
+                        };
+                        stmts.push(IrStmt::Assign { name, value });
+                    } else {
+                        return Err(CompileError::Unsupported("complex assignment target".into()));
+                    }
+                }
+            }
+            Stmt::If(if_stmt) => {
+                let ir_if = ast_if_to_ir(if_stmt)?;
+                stmts.push(ir_if);
+            }
+            _ => {
+                return Err(CompileError::Unsupported("unsupported statement type".into()));
+            }
+        }
+    }
+    
+    // Handle last statement (return)
+    if let Some(last_stmt) = block.last_stmt() {
+        match last_stmt {
+            LastStmt::Return(ret) => {
+                let mut returns_iter = ret.returns().iter();
+                if let Some(expr) = returns_iter.next() {
+                    if returns_iter.next().is_none() {
+                        stmts.push(IrStmt::Return(ast_expr_to_ir(expr)?));
+                    } else {
+                        return Err(CompileError::Unsupported("multiple return values".into()));
+                    }
+                } else {
+                    // Empty return
+                    stmts.push(IrStmt::Return(IrExpr::Number(0.0)));
+                }
+            }
+            LastStmt::Break(_) => {
+                return Err(CompileError::Unsupported("break statement".into()));
+            }
+            _ => {
+                return Err(CompileError::Unsupported("unsupported last statement".into()));
+            }
+        }
+    }
+    
+    Ok(stmts)
+}
+
+/// Convert an if statement to IR
+fn ast_if_to_ir(if_stmt: &full_moon::ast::If) -> Result<IrStmt, CompileError> {
+    let cond = ast_expr_to_ir(if_stmt.condition())?;
+    let then_body = ast_block_to_ir(if_stmt.block())?;
+    
+    // Handle elseif chains by converting to nested if-else
+    let mut else_body = Vec::new();
+    
+    if let Some(else_ifs) = if_stmt.else_if() {
+        // Build nested if-else from elseif chain
+        let else_ifs: Vec<_> = else_ifs.iter().collect();
+        if !else_ifs.is_empty() {
+            else_body = build_elseif_chain(&else_ifs, if_stmt.else_block())?;
+        } else if let Some(else_block) = if_stmt.else_block() {
+            else_body = ast_block_to_ir(else_block)?;
+        }
+    } else if let Some(else_block) = if_stmt.else_block() {
+        else_body = ast_block_to_ir(else_block)?;
+    }
+    
+    Ok(IrStmt::If { cond, then_body, else_body })
+}
+
+/// Build nested if-else from elseif chain
+fn build_elseif_chain(
+    else_ifs: &[&full_moon::ast::ElseIf],
+    final_else: Option<&full_moon::ast::Block>,
+) -> Result<Vec<IrStmt>, CompileError> {
+    if else_ifs.is_empty() {
+        if let Some(else_block) = final_else {
+            return ast_block_to_ir(else_block);
+        }
+        return Ok(Vec::new());
+    }
+    
+    let first = else_ifs[0];
+    let cond = ast_expr_to_ir(first.condition())?;
+    let then_body = ast_block_to_ir(first.block())?;
+    let else_body = build_elseif_chain(&else_ifs[1..], final_else)?;
+    
+    Ok(vec![IrStmt::If { cond, then_body, else_body }])
+}
+
+/// Convert a function declaration to IR
+fn ast_func_to_ir(func_decl: &full_moon::ast::FunctionDeclaration) -> Result<IrFunc, CompileError> {
+    use full_moon::ast::Parameter;
+    
+    let params: Vec<String> = func_decl.body().parameters().iter()
+        .filter_map(|p| match p {
+            Parameter::Name(token) => Some(token.token().to_string()),
+            Parameter::Ellipsis(_) => None,
+            _ => None,
+        })
+        .collect();
+    
+    let body = ast_block_to_ir(func_decl.body().block())?;
+    
+    Ok(IrFunc { params, body })
+}
+
+// ============================================================================
+// Lua to WASM Compilation
+// ============================================================================
+
 fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
-    use full_moon::ast::{self, Stmt, LastStmt, Expression, BinOp, UnOp, Var, Parameter, Prefix, Suffix, Call, FunctionArgs, Index};
+    use full_moon::ast::Stmt;
     use std::collections::HashMap;
     use walrus::InstrSeqBuilder;
     use walrus::ir::{BinaryOp, UnaryOp};
@@ -73,9 +422,26 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
         CompileError::Parse(msg)
     })?;
 
+    // Helper function to extract a single return expression from a block
+    fn extract_return_expr(block: &Block) -> Option<Expression> {
+        // Block should have no statements (or only comments) and a return as last_stmt
+        if block.stmts().next().is_some() {
+            return None; // Has statements other than return
+        }
+        if let Some(LastStmt::Return(ret)) = block.last_stmt() {
+            let mut returns_iter = ret.returns().iter();
+            if let Some(expr) = returns_iter.next() {
+                if returns_iter.next().is_none() {
+                    return Some(expr.clone());
+                }
+            }
+        }
+        None
+    }
+
     // Extract function declarations from the AST
-    // Maps function name -> (parameter names, return expression)
-    let mut functions: HashMap<String, (Vec<String>, Expression)> = HashMap::new();
+    // Maps function name -> (parameter names, function body)
+    let mut functions: HashMap<String, (Vec<String>, FunctionBody)> = HashMap::new();
 
     for stmt in ast.nodes().stmts() {
         if let Stmt::FunctionDeclaration(func_decl) = stmt {
@@ -94,14 +460,39 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                 })
                 .collect();
 
-            // Get return expression from the function body
+            // Get function body - either a simple return or an if-then-else
             let block = func_decl.body().block();
-            if let Some(LastStmt::Return(ret)) = block.last_stmt() {
-                // We expect exactly one return expression for our simple functions
-                let mut returns_iter = ret.returns().iter();
-                if let Some(expr) = returns_iter.next() {
-                    if returns_iter.next().is_none() {
-                        functions.insert(name, (params, expr.clone()));
+            
+            // First, try to extract a simple return expression
+            if let Some(expr) = extract_return_expr(block) {
+                functions.insert(name, (params, FunctionBody::SimpleReturn(expr)));
+                continue;
+            }
+            
+            // Next, try to handle if-then-else with returns in each branch
+            let mut stmts_iter = block.stmts();
+            if let Some(first_stmt) = stmts_iter.next() {
+                if stmts_iter.next().is_none() && block.last_stmt().is_none() {
+                    // Single statement, no last_stmt - check if it's an if statement
+                    if let Stmt::If(if_stmt) = first_stmt {
+                        // We support: if condition then return X else return Y end
+                        // No elseif support for now
+                        if if_stmt.else_if().is_none() || if_stmt.else_if().map(|v| v.is_empty()).unwrap_or(true) {
+                            if let (Some(then_expr), Some(else_block)) = (
+                                extract_return_expr(if_stmt.block()),
+                                if_stmt.else_block()
+                            ) {
+                                if let Some(else_expr) = extract_return_expr(else_block) {
+                                    let condition = if_stmt.condition().clone();
+                                    functions.insert(name, (params, FunctionBody::IfThenElse {
+                                        condition,
+                                        then_expr,
+                                        else_expr,
+                                    }));
+                                    continue;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -333,9 +724,105 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
         Err(CompileError::Unsupported("could not extract function arguments"))
     }
 
+    // Emit a condition expression that produces an i32 (0 or 1) for use in if/select
+    fn emit_condition(
+        b: &mut InstrSeqBuilder,
+        expr: &Expression,
+        params: &[String],
+        locals: &[walrus::LocalId],
+    ) -> Result<(), CompileError> {
+        // Handle comparison expressions specially - they produce i32 results
+        if let Expression::BinaryOperator { lhs, binop, rhs } = expr {
+            match binop {
+                BinOp::LessThan(_) => {
+                    emit_expr(b, lhs, params, locals)?;
+                    emit_expr(b, rhs, params, locals)?;
+                    b.binop(BinaryOp::F64Lt);
+                    return Ok(());
+                }
+                BinOp::LessThanEqual(_) => {
+                    emit_expr(b, lhs, params, locals)?;
+                    emit_expr(b, rhs, params, locals)?;
+                    b.binop(BinaryOp::F64Le);
+                    return Ok(());
+                }
+                BinOp::GreaterThan(_) => {
+                    emit_expr(b, lhs, params, locals)?;
+                    emit_expr(b, rhs, params, locals)?;
+                    b.binop(BinaryOp::F64Gt);
+                    return Ok(());
+                }
+                BinOp::GreaterThanEqual(_) => {
+                    emit_expr(b, lhs, params, locals)?;
+                    emit_expr(b, rhs, params, locals)?;
+                    b.binop(BinaryOp::F64Ge);
+                    return Ok(());
+                }
+                BinOp::TwoEqual(_) => {
+                    emit_expr(b, lhs, params, locals)?;
+                    emit_expr(b, rhs, params, locals)?;
+                    b.binop(BinaryOp::F64Eq);
+                    return Ok(());
+                }
+                BinOp::TildeEqual(_) => {
+                    emit_expr(b, lhs, params, locals)?;
+                    emit_expr(b, rhs, params, locals)?;
+                    b.binop(BinaryOp::F64Ne);
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+        // Handle parenthesized conditions
+        if let Expression::Parentheses { expression, .. } = expr {
+            return emit_condition(b, expression, params, locals);
+        }
+        // For non-comparison expressions, emit as f64 and convert to i32 (non-zero = true)
+        emit_expr(b, expr, params, locals)?;
+        b.f64_const(0.0);
+        b.binop(BinaryOp::F64Ne);
+        Ok(())
+    }
+
+    // Emit code for a function body (either simple return or if-then-else)
+    fn emit_function_body(
+        b: &mut InstrSeqBuilder,
+        body: &FunctionBody,
+        params: &[String],
+        locals: &[walrus::LocalId],
+    ) -> Result<(), CompileError> {
+        match body {
+            FunctionBody::SimpleReturn(expr) => {
+                emit_expr(b, expr, params, locals)?;
+            }
+            FunctionBody::IfThenElse { condition, then_expr, else_expr } => {
+                // Emit: if condition then return then_expr else return else_expr end
+                // Using WASM if-else block structure
+                emit_condition(b, condition, params, locals)?;
+                // Clone expressions for use in closures
+                let then_expr = then_expr.clone();
+                let else_expr = else_expr.clone();
+                let params_vec: Vec<String> = params.to_vec();
+                let locals_vec: Vec<walrus::LocalId> = locals.to_vec();
+                b.if_else(
+                    ValType::F64,
+                    |then_block| {
+                        emit_expr(then_block, &then_expr, &params_vec, &locals_vec)
+                            .expect("emit_expr in then branch failed");
+                    },
+                    |else_block| {
+                        emit_expr(else_block, &else_expr, &params_vec, &locals_vec)
+                            .expect("emit_expr in else branch failed");
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
     // Generate WASM functions for each required Lua function
     for &fname in REQUIRED_FUNCS {
-        let (params, expr) = functions.get(fname).unwrap();
+        let (params, body) = functions.get(fname).unwrap();
         match fname {
             "is_inside" => {
                 if params.len() != 3 {
@@ -350,7 +837,7 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                 let l_y = module.locals.add(ValType::F64);
                 let l_z = module.locals.add(ValType::F64);
                 let mut ib = fb.func_body();
-                emit_expr(&mut ib, expr, params, &[l_x, l_y, l_z])?;
+                emit_function_body(&mut ib, body, params, &[l_x, l_y, l_z])?;
                 ib.unop(UnaryOp::F32DemoteF64);
                 let fid = fb.finish(vec![l_x, l_y, l_z], &mut module.funcs);
                 module.exports.add("is_inside", fid);
@@ -361,7 +848,7 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                 }
                 let mut fb = FunctionBuilder::new(&mut module.types, &[], &[ValType::F64]);
                 let mut ib = fb.func_body();
-                emit_expr(&mut ib, expr, params, &[])?;
+                emit_function_body(&mut ib, body, params, &[])?;
                 let fid = fb.finish(vec![], &mut module.funcs);
                 module.exports.add(fname, fid);
             }
@@ -580,5 +1067,50 @@ end
         } else {
             panic!("Expected Parse error, got: {:?}", result);
         }
+    }
+
+    #[test]
+    fn test_compile_with_if_then_else() {
+        // This is the exact script from the issue description
+        let lua_src = r#"
+function is_inside(x, y, z)
+    -- Example: unit sphere centered at origin
+    if (x*x + y*y + z*z - 1.0) < 0.0 then
+       return 1.0
+    else
+       return 0.0
+    end
+end
+
+function get_bounds_min_x()
+    return -1.5
+end
+
+function get_bounds_min_y()
+    return -1.5
+end
+
+function get_bounds_min_z()
+    return -1.5
+end
+
+function get_bounds_max_x()
+    return 1.5
+end
+
+function get_bounds_max_y()
+    return 1.5
+end
+
+function get_bounds_max_z()
+    return 1.5
+end
+"#;
+        let result = compile_lua_to_wasm(lua_src);
+        assert!(result.is_ok(), "Failed to compile with if-then-else: {:?}", result.err());
+        let wasm = result.unwrap();
+        // Check that we got valid WASM (starts with magic number)
+        assert!(wasm.len() > 8, "WASM output too short");
+        assert_eq!(&wasm[0..4], b"\0asm", "Invalid WASM magic number");
     }
 }
