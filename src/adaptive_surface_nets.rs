@@ -13,6 +13,14 @@ use std::sync::Arc;
 
 use crate::Triangle;
 
+fn quantize_round(v: (f32, f32, f32), scale: f32) -> (i64, i64, i64) {
+    (
+        (v.0 * scale).round() as i64,
+        (v.1 * scale).round() as i64,
+        (v.2 * scale).round() as i64,
+    )
+}
+
 // ==================== TEST-ONLY SANITY CHECKS ====================
 // These checks are compiled ONLY in test builds and are intended to catch
 // invariant violations earlier in the pipeline than the final mesh validators.
@@ -212,6 +220,17 @@ struct CellId {
     path: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct LeafIndex {
+    /// Global integer coordinates in the finest grid (effective_res = base_res << max_depth).
+    /// This identifies the minimum corner of the leaf cell in that finest grid.
+    x: i32,
+    y: i32,
+    z: i32,
+    /// Leaf size in finest-grid cells (power of two).
+    size: i32,
+}
+
 impl CellId {
     fn new(base: CellIndex) -> Self {
         Self {
@@ -231,6 +250,36 @@ impl CellId {
 
     fn depth(&self) -> usize {
         self.path.len()
+    }
+
+    fn leaf_index(&self, max_depth: usize) -> LeafIndex {
+        // Compute the leaf's (x,y,z) and size in the finest grid.
+        // Within a base cell, each path step halves the cell; the child index encodes the
+        // octant via bits: x=(i&1), y=(i&2), z=(i&4).
+        let mut lx: i32 = 0;
+        let mut ly: i32 = 0;
+        let mut lz: i32 = 0;
+        for &c in &self.path {
+            lx = (lx << 1) | ((c & 1) as i32);
+            ly = (ly << 1) | (((c >> 1) & 1) as i32);
+            lz = (lz << 1) | (((c >> 2) & 1) as i32);
+        }
+        let depth = self.path.len();
+        let shift = (max_depth.saturating_sub(depth)) as i32;
+        let size = 1i32 << shift;
+
+        // Base cell origin in finest grid.
+        let base_mul = 1i32 << (max_depth as i32);
+        let bx = self.base.x * base_mul;
+        let by = self.base.y * base_mul;
+        let bz = self.base.z * base_mul;
+
+        LeafIndex {
+            x: bx + (lx << shift),
+            y: by + (ly << shift),
+            z: bz + (lz << shift),
+            size,
+        }
     }
 }
 
@@ -692,15 +741,26 @@ fn phase2_adaptive_refinement(sampler: &WasmSampler, octree: &mut AdaptiveOctree
     let engine = sampler.engine.clone();
     let module = sampler.module.clone();
 
-    // Process root cells in parallel using rayon
-    // Each thread gets its own sampling context via map_init
-    // Refine ALL roots uniformly to ensure consistent depth across boundaries
+    // Process root cells in parallel using rayon.
+    // Each thread gets its own sampling context via map_init.
+    //
+    // NOTE: With true adaptive refinement, Phase 3 must be able to stitch across mixed
+    // refinement levels. Our current Phase 3 is not yet robust enough to do that across all
+    // models (Gyroid/Mandelbulb), leading to missing quads (boundary edges).
+    //
+    // For now we use a robust “surface-adjacent equal depth” strategy: every root cell that
+    // participates in the octree (the MIXED band discovered in Phase 1, plus neighbors) is
+    // refined uniformly to `max_depth`. This keeps the overall algorithm adaptive at the root
+    // selection level (we still avoid refining the entire volume), while ensuring Phase 3 sees
+    // a locally uniform grid around the surface.
+    //
+    // Future work: implement true 2:1 balancing + stitching so we can use `refine_node_recursive`
+    // everywhere.
     let refined_roots: Vec<Result<(CellIndex, OctreeNode)>> = cells_to_refine
         .into_par_iter()
         .map_init(
             || SamplingContext::new(&engine, &module).expect("Failed to create sampling context"),
             |ctx, (cell_idx, mut node)| {
-                // Refine all roots uniformly to avoid T-junctions at root boundaries
                 refine_node_uniform(&mut node, max_depth, ctx)?;
                 Ok((cell_idx, node))
             },
@@ -721,20 +781,32 @@ fn phase2_adaptive_refinement(sampler: &WasmSampler, octree: &mut AdaptiveOctree
 /// Uses a thread-local sampling context to avoid creating new WASM instances.
 /// The context is reused across all recursive calls within the same thread.
 /// 
-/// This uses uniform refinement within each root cell to avoid T-junctions:
-/// all children are refined to the same depth regardless of whether they're MIXED.
+/// This refines only where needed (MIXED cells) up to `max_depth`.
 fn refine_node_recursive(
     node: &mut OctreeNode,
     max_depth: usize,
     ctx: &mut SamplingContext,
 ) -> Result<()> {
+    refine_node_recursive_band(node, max_depth, ctx, false)
+}
+
+/// Adaptive refinement with a narrow neighbor band.
+///
+/// If `force` is true, the node is refined regardless of its cell type. This is used to
+/// refine a small band of neighbors around MIXED regions so that Phase 3 has the 4 incident
+/// cells it expects around sign-changing edges.
+fn refine_node_recursive_band(
+    node: &mut OctreeNode,
+    max_depth: usize,
+    ctx: &mut SamplingContext,
+    force: bool,
+) -> Result<()> {
     if node.depth >= max_depth {
         return Ok(());
     }
 
-    // Only refine if this node is MIXED (contains surface)
-    // But once we decide to refine, we refine uniformly
-    if node.cell_type() != CellType::Mixed {
+    // Only refine if this node is MIXED (contains surface), unless forced by the neighbor band.
+    if !force && node.cell_type() != CellType::Mixed {
         return Ok(());
     }
 
@@ -794,11 +866,25 @@ fn refine_node_recursive(
         }
     }
 
-    // Recursively refine ALL children uniformly to avoid T-junctions
-    // This ensures all cells within a root are at the same refinement level
-    for child in children.iter_mut() {
-        // Refine all children, not just MIXED ones, to maintain uniform depth
-        refine_node_uniform(child, max_depth, ctx)?;
+    // Recursively refine only where needed.
+    // Compute which children should be forced refined as part of the neighbor band.
+    // Mark all MIXED children, plus their face- and edge-adjacent siblings.
+    let mut force_child = [false; 8];
+    for i in 0..8 {
+        if children[i].cell_type() == CellType::Mixed {
+            force_child[i] = true;
+            for j in 0..8 {
+                let diff = (i ^ j) & 0b111;
+                let hamming = (diff & 1 != 0) as u8 + (diff & 2 != 0) as u8 + (diff & 4 != 0) as u8;
+                if hamming == 1 || hamming == 2 || hamming == 3 {
+                    force_child[j] = true;
+                }
+            }
+        }
+    }
+
+    for i in 0..8 {
+        refine_node_recursive_band(&mut children[i], max_depth, ctx, force_child[i])?;
     }
 
     node.children = Some(Box::new(children));
@@ -907,6 +993,16 @@ enum EdgeAxis {
     Z,
 }
 
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SegKey {
+    axis: EdgeAxis,
+    perp1: i64,
+    perp2: i64,
+    seg_min: i64,
+    seg_max: i64,
+}
+
 /// Key for grouping edges that lie on the same axis-aligned line.
 /// Edges on the same line will have the same LineKey regardless of their length.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -984,6 +1080,15 @@ fn phase3_extract_mesh(
         let cell_id = CellId::new(base_idx);
         collect_leaf_cells(root, cell_id, &mut leaf_cells);
     }
+
+    // Build a finest-grid ownership map for MIXED leaves. This provides a discrete coordinate
+    // system for neighbor queries in Phase 3 under adaptive refinement.
+    let max_depth = octree.max_depth;
+    let effective_res_i32 = (octree.base_resolution as i32) * (1i32 << (max_depth as i32));
+    let eff = effective_res_i32 as usize;
+    let owner_len = eff * eff * eff;
+    let mut owner: Vec<u32> = vec![u32::MAX; owner_len];
+    let mut leaf_vertices: Vec<(f32, f32, f32)> = Vec::new();
     
     // Create sampling context for binary search edge refinement if enabled.
     // (Vertex relaxation runs as a welded post-pass after extraction.)
@@ -998,6 +1103,22 @@ fn phase3_extract_mesh(
     // Value: list of edges on that line
     let mut line_to_edges: HashMap<LineKey, Vec<EdgeOnLine>> = HashMap::new();
 
+    // Finest-grid step (corner spacing) used to convert world coordinates to fine integer corner indices.
+    // This should be exact for our subdivision scheme; we still use rounding to be robust.
+    let fine_step = (
+        octree.base_step.0 / (1u32 << max_depth) as f32,
+        octree.base_step.1 / (1u32 << max_depth) as f32,
+        octree.base_step.2 / (1u32 << max_depth) as f32,
+    );
+    let world_to_fine_corner = |p: f32, axis: EdgeAxis| -> i32 {
+        let (bmin, step) = match axis {
+            EdgeAxis::X => (octree.bounds_min.0, fine_step.0),
+            EdgeAxis::Y => (octree.bounds_min.1, fine_step.1),
+            EdgeAxis::Z => (octree.bounds_min.2, fine_step.2),
+        };
+        ((p - bmin) / step).round() as i32
+    };
+
     // Edge definitions: 12 edges of a cube
     const EDGES: [(usize, usize); 12] = [
         (0, 1), (2, 3), (4, 5), (6, 7), // X-aligned
@@ -1005,11 +1126,11 @@ fn phase3_extract_mesh(
         (0, 4), (1, 5), (2, 6), (3, 7), // Z-aligned
     ];
 
-    for (_cell_id, node) in &leaf_cells {
+    for (cell_id, node) in &leaf_cells {
         if node.cell_type() != CellType::Mixed {
             continue;
         }
-        
+
         // Compute vertex with optional binary search refinement and relaxation
         let vertex = compute_surface_nets_vertex_refined(
             node,
@@ -1017,6 +1138,28 @@ fn phase3_extract_mesh(
             config.edge_refinement_iterations,
             config.vertex_relaxation_iterations,
         )?;
+
+        // Register the MIXED leaf in the finest-grid ownership map.
+        // Note: We intentionally fill the whole leaf volume in the finest grid.
+        // This lets Phase 3 query "which leaf owns this fine cell" cheaply.
+        // Topology decisions still come from local neighbor configurations.
+        let leaf_idx = cell_id.leaf_index(max_depth);
+        let vid = leaf_vertices.len() as u32;
+        leaf_vertices.push(vertex);
+        let x0 = leaf_idx.x.max(0) as usize;
+        let y0 = leaf_idx.y.max(0) as usize;
+        let z0 = leaf_idx.z.max(0) as usize;
+        let x1 = (leaf_idx.x + leaf_idx.size).min(effective_res_i32) as usize;
+        let y1 = (leaf_idx.y + leaf_idx.size).min(effective_res_i32) as usize;
+        let z1 = (leaf_idx.z + leaf_idx.size).min(effective_res_i32) as usize;
+        for z in z0..z1 {
+            for y in y0..y1 {
+                let row = (z * eff + y) * eff;
+                for x in x0..x1 {
+                    owner[row + x] = vid;
+                }
+            }
+        }
         
         for &(ca, cb) in &EDGES {
             // Check for sign change using corner_inside helper (negative distance = inside)
@@ -1074,6 +1217,15 @@ fn phase3_extract_mesh(
     // Track emitted triangles to avoid duplicates
     let mut emitted_triangles: HashSet<[(i64, i64, i64); 3]> = HashSet::new();
 
+    #[cfg(test)]
+    let mut tri_to_seg: HashMap<[(i64, i64, i64); 3], SegKey> = HashMap::new();
+
+    #[cfg(test)]
+    let mut sanity_seg_cell_count_hist: HashMap<usize, usize> = HashMap::new();
+
+    #[cfg(test)]
+    let mut sanity_mixed_size_segments: usize = 0;
+
     // For each line, find all unique edge endpoints and emit quads
     for (line_key, edges) in &line_to_edges {
         // Collect all unique axis coordinates where edges start or end
@@ -1086,177 +1238,344 @@ fn phase3_extract_mesh(
         axis_points.sort();
         axis_points.dedup();
         
-        // For each segment between consecutive points, find cells that span it
+        // For each segment between consecutive points, emit fine-grid quads by querying the
+        // owning MIXED leaf around each finest-grid edge step.
         for i in 0..axis_points.len().saturating_sub(1) {
-            let seg_min = axis_points[i] as f32 / scale;
-            let seg_max = axis_points[i + 1] as f32 / scale;
-            let seg_mid = (seg_min + seg_max) * 0.5;
-            
-            // Find all edges that contain this segment
-            let mut cells_for_segment: Vec<(
-                (f32, f32, f32),  // vertex
-                f32,              // edge_length
-                (f32, f32, f32),  // cell_min
-                (f32, f32, f32),  // cell_max
-            )> = Vec::new();
-            let mut inside_at_min = true; // Will be set by first edge found
-            let mut first = true;
-            #[cfg(test)]
-            let mut sanity_inside_at_min: Option<bool> = None;
-            
-            for edge in edges {
-                // Check if this edge contains the segment
-                // Use small epsilon for floating point comparison
-                let eps = (seg_max - seg_min) * 0.01;
-                if edge.axis_min <= seg_min + eps && edge.axis_max >= seg_max - eps {
-                    cells_for_segment.push((
-                        edge.vertex,
-                        edge.edge_length,
-                        edge.cell_min,
-                        edge.cell_max,
-                    ));
-                    if first {
-                        inside_at_min = edge.inside_at_min;
-                        first = false;
-                    }
+            let seg_min_q = axis_points[i];
+            let seg_max_q = axis_points[i + 1];
+            let seg_min = seg_min_q as f32 / scale;
+            let seg_max = seg_max_q as f32 / scale;
 
+            // Convert segment endpoints (world) to finest-grid corner indices.
+            let a0 = world_to_fine_corner(seg_min, line_key.axis);
+            let a1 = world_to_fine_corner(seg_max, line_key.axis);
+
+            // Perpendicular coordinates are world corner coords; convert to finest-grid corner indices.
+            let (p1_world, p2_world) = (line_key.perp1 as f32 / scale, line_key.perp2 as f32 / scale);
+            let (p1_axis, p2_axis) = match line_key.axis {
+                EdgeAxis::X => (EdgeAxis::Y, EdgeAxis::Z),
+                EdgeAxis::Y => (EdgeAxis::X, EdgeAxis::Z),
+                EdgeAxis::Z => (EdgeAxis::X, EdgeAxis::Y),
+            };
+            let c1 = world_to_fine_corner(p1_world, p1_axis);
+            let c2 = world_to_fine_corner(p2_world, p2_axis);
+
+            // Emit for each finest-grid step along the segment.
+            for a in a0..a1 {
+                // Only emit if this finest-grid edge step is actually covered by at least one
+                // sign-changing leaf edge on this line. This keeps emission driven by the
+                // original sign-change detection rather than by ownership alone.
+                let a_world_min = match line_key.axis {
+                    EdgeAxis::X => octree.bounds_min.0 + (a as f32) * fine_step.0,
+                    EdgeAxis::Y => octree.bounds_min.1 + (a as f32) * fine_step.1,
+                    EdgeAxis::Z => octree.bounds_min.2 + (a as f32) * fine_step.2,
+                };
+                let a_world_max = match line_key.axis {
+                    EdgeAxis::X => octree.bounds_min.0 + ((a + 1) as f32) * fine_step.0,
+                    EdgeAxis::Y => octree.bounds_min.1 + ((a + 1) as f32) * fine_step.1,
+                    EdgeAxis::Z => octree.bounds_min.2 + ((a + 1) as f32) * fine_step.2,
+                };
+
+                let mut covered_by_edge: Option<bool> = None;
+                for e in edges {
+                    if e.axis_min <= a_world_min + 1.0e-6 && e.axis_max >= a_world_max - 1.0e-6 {
+                        covered_by_edge = Some(e.inside_at_min);
+                        break;
+                    }
+                }
+                let Some(inside_at_min) = covered_by_edge else {
+                    continue;
+                };
+
+                let (cx, cy, cz) = match line_key.axis {
+                    EdgeAxis::X => (a, c1, c2),
+                    EdgeAxis::Y => (c1, a, c2),
+                    EdgeAxis::Z => (c1, c2, a),
+                };
+
+                // Gather the 4 surrounding fine-grid cells around this edge.
+                let mut vids: [u32; 4] = [u32::MAX; 4];
+                let mut ok = true;
+                let cell_coords: [(i32, i32, i32); 4] = match line_key.axis {
+                    EdgeAxis::X => [(cx, cy, cz), (cx, cy - 1, cz), (cx, cy, cz - 1), (cx, cy - 1, cz - 1)],
+                    EdgeAxis::Y => [(cx, cy, cz), (cx - 1, cy, cz), (cx, cy, cz - 1), (cx - 1, cy, cz - 1)],
+                    EdgeAxis::Z => [(cx, cy, cz), (cx - 1, cy, cz), (cx, cy - 1, cz), (cx - 1, cy - 1, cz)],
+                };
+                for (i4, (ix, iy, iz)) in cell_coords.iter().enumerate() {
+                    if *ix < 0 || *iy < 0 || *iz < 0 || *ix >= effective_res_i32 || *iy >= effective_res_i32 || *iz >= effective_res_i32 {
+                        ok = false;
+                        break;
+                    }
+                    let idx = ((*iz as usize) * eff + (*iy as usize)) * eff + (*ix as usize);
+                    let v = owner[idx];
+                    if v == u32::MAX {
+                        ok = false;
+                        break;
+                    }
+                    vids[i4] = v;
+                }
+                if !ok {
                     #[cfg(test)]
                     {
                         if sanity_enabled() {
-                            match sanity_inside_at_min {
-                                None => sanity_inside_at_min = Some(edge.inside_at_min),
-                                Some(v) => sanity_assert!(
-                                    v == edge.inside_at_min,
-                                    "inconsistent inside_at_min on segment: axis={:?} perp=({},{}) seg=({:.6},{:.6}) first={v:?} saw={:?}",
-                                    line_key.axis,
-                                    line_key.perp1,
-                                    line_key.perp2,
-                                    seg_min,
-                                    seg_max,
-                                    edge.inside_at_min
-                                ),
-                            }
+                            *sanity_seg_cell_count_hist.entry(0).or_default() += 1;
                         }
                     }
+                    continue;
+                }
+
+                let mut cell_verts: Vec<CellData> = Vec::with_capacity(4);
+                for v in vids {
+                    let p = leaf_vertices[v as usize];
+                    cell_verts.push((p, 0.0, (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)));
+                }
+
+                // Compute edge midpoint in 3D from fine corner coords.
+                let edge_mid = match line_key.axis {
+                    EdgeAxis::X => (
+                        octree.bounds_min.0 + (cx as f32 + 0.5) * fine_step.0,
+                        octree.bounds_min.1 + (cy as f32) * fine_step.1,
+                        octree.bounds_min.2 + (cz as f32) * fine_step.2,
+                    ),
+                    EdgeAxis::Y => (
+                        octree.bounds_min.0 + (cx as f32) * fine_step.0,
+                        octree.bounds_min.1 + (cy as f32 + 0.5) * fine_step.1,
+                        octree.bounds_min.2 + (cz as f32) * fine_step.2,
+                    ),
+                    EdgeAxis::Z => (
+                        octree.bounds_min.0 + (cx as f32) * fine_step.0,
+                        octree.bounds_min.1 + (cy as f32) * fine_step.1,
+                        octree.bounds_min.2 + (cz as f32 + 0.5) * fine_step.2,
+                    ),
+                };
+                let edge_dir = match line_key.axis {
+                    EdgeAxis::X => (1.0, 0.0, 0.0),
+                    EdgeAxis::Y => (0.0, 1.0, 0.0),
+                    EdgeAxis::Z => (0.0, 0.0, 1.0),
+                };
+
+                // Deduplicate at quad level.
+                let vert_scale = 1_000_000.0f32;
+                let mut quad_key: [(i64, i64, i64); 4] = [
+                    quantize_round(cell_verts[0].0, vert_scale),
+                    quantize_round(cell_verts[1].0, vert_scale),
+                    quantize_round(cell_verts[2].0, vert_scale),
+                    quantize_round(cell_verts[3].0, vert_scale),
+                ];
+                quad_key.sort();
+                if !processed_quads.insert(quad_key) {
+                    continue;
+                }
+
+                #[cfg(test)]
+                {
+                    if sanity_enabled() {
+                        let seg_key_dbg = SegKey {
+                            axis: line_key.axis,
+                            perp1: line_key.perp1,
+                            perp2: line_key.perp2,
+                            seg_min: seg_min_q,
+                            seg_max: seg_max_q,
+                        };
+                        emit_triangles_for_quad_dbg(
+                            &cell_verts,
+                            inside_at_min,
+                            edge_mid,
+                            edge_dir,
+                            &seg_key_dbg,
+                            &mut triangles,
+                            &mut emitted_triangles,
+                            &mut tri_to_seg,
+                        );
+                        continue;
+                    }
+                }
+
+                emit_triangles_for_quad(&cell_verts, inside_at_min, edge_mid, edge_dir, &mut triangles, &mut emitted_triangles);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    {
+        if sanity_enabled() {
+            eprintln!("SANITY segment cell-count histogram (after vertex dedup): {:?}", sanity_seg_cell_count_hist);
+            eprintln!("SANITY mixed-size segments skipped: {sanity_mixed_size_segments}");
+
+            // Attribute non-manifold edges back to the segment(s) that emitted their triangles.
+            let scale = 1_000_000.0f32;
+            let mut edge_to_tris: HashMap<((i64, i64, i64), (i64, i64, i64)), Vec<usize>> = HashMap::new();
+            for (ti, tri) in triangles.iter().enumerate() {
+                let v = tri.vertices;
+                let qs = [
+                    quantize_round(v[0], scale),
+                    quantize_round(v[1], scale),
+                    quantize_round(v[2], scale),
+                ];
+                let edges = [(0usize, 1usize), (1, 2), (2, 0)];
+                for (ia, ib) in edges {
+                    let a = qs[ia];
+                    let b = qs[ib];
+                    let key = if a <= b { (a, b) } else { (b, a) };
+                    edge_to_tris.entry(key).or_default().push(ti);
                 }
             }
-            
-            // Deduplicate vertices (same cell may contribute multiple edges on same line)
-            let vert_scale = 1_000_000.0f32;
-            cells_for_segment.sort_by(|a, b| {
-                let qa = ((a.0.0 * vert_scale) as i64, (a.0.1 * vert_scale) as i64, (a.0.2 * vert_scale) as i64);
-                let qb = ((b.0.0 * vert_scale) as i64, (b.0.1 * vert_scale) as i64, (b.0.2 * vert_scale) as i64);
-                qa.cmp(&qb)
-            });
-            cells_for_segment.dedup_by(|a, b| {
-                let qa = ((a.0.0 * vert_scale) as i64, (a.0.1 * vert_scale) as i64, (a.0.2 * vert_scale) as i64);
-                let qb = ((b.0.0 * vert_scale) as i64, (b.0.1 * vert_scale) as i64, (b.0.2 * vert_scale) as i64);
-                qa == qb
-            });
 
-            #[cfg(test)]
-            {
-                if sanity_enabled() {
-                    // This is a hot spot for topology issues. Make quantization behavior explicit.
-                    // (We do not change behavior here; we only detect potential instability.)
-                    let mut uniq_round = HashSet::new();
-                    let mut uniq_trunc = HashSet::new();
-                    for (v, _len, _cmin, _cmax) in &cells_for_segment {
-                        uniq_round.insert(q_round(*v, vert_scale));
-                        uniq_trunc.insert(q_trunc(*v, vert_scale));
-                    }
-                    sanity_assert!(
-                        uniq_round.len() == uniq_trunc.len(),
-                        "round vs trunc quantization disagree on uniqueness: axis={:?} perp=({},{}) seg=({:.6},{:.6}) round={} trunc={}",
-                        line_key.axis,
-                        line_key.perp1,
-                        line_key.perp2,
-                        seg_min,
-                        seg_max,
-                        uniq_round.len(),
-                        uniq_trunc.len()
+            let mut printed = 0;
+            for (edge, tis) in &edge_to_tris {
+                if tis.len() > 2 {
+                    let (a, b) = edge;
+                    eprintln!(
+                        "SANITY non-manifold edge (count={}): ({:.6},{:.6},{:.6}) -> ({:.6},{:.6},{:.6})",
+                        tis.len(),
+                        a.0 as f32 / scale,
+                        a.1 as f32 / scale,
+                        a.2 as f32 / scale,
+                        b.0 as f32 / scale,
+                        b.1 as f32 / scale,
+                        b.2 as f32 / scale
                     );
-                }
-            }
-            
-            if cells_for_segment.len() != 4 {
-                // Surface nets requires exactly 4 cells around each edge.
-                // Skip segments that don't have exactly 4 cells.
-                continue;
-            }
-
-            #[cfg(test)]
-            {
-                if sanity_enabled() {
-                    let mut uniq = HashSet::new();
-                    for (v, _len, _cmin, _cmax) in &cells_for_segment {
-                        uniq.insert(q_round(*v, vert_scale));
+                    for &ti in tis {
+                        let tri = &triangles[ti];
+                        let mut tkey = [
+                            quantize_round(tri.vertices[0], scale),
+                            quantize_round(tri.vertices[1], scale),
+                            quantize_round(tri.vertices[2], scale),
+                        ];
+                        tkey.sort();
+                        let src = tri_to_seg.get(&tkey);
+                        eprintln!(
+                            "  tri {ti} src={:?} verts=({:.6},{:.6},{:.6}) ({:.6},{:.6},{:.6}) ({:.6},{:.6},{:.6})",
+                            src,
+                            tri.vertices[0].0,
+                            tri.vertices[0].1,
+                            tri.vertices[0].2,
+                            tri.vertices[1].0,
+                            tri.vertices[1].1,
+                            tri.vertices[1].2,
+                            tri.vertices[2].0,
+                            tri.vertices[2].1,
+                            tri.vertices[2].2
+                        );
                     }
-                    sanity_assert!(uniq.len() == 4, "quad has duplicate vertices after dedup: axis={:?} perp=({},{}) seg=({:.6},{:.6})", line_key.axis, line_key.perp1, line_key.perp2, seg_min, seg_max);
+                    printed += 1;
+                    if printed >= 3 {
+                        break;
+                    }
                 }
             }
-            
-            // Check if all cells have the same edge length (same refinement level)
-            // This avoids T-junction issues where cells of different sizes meet
-            let first_len = cells_for_segment[0].1;
-            let length_eps = first_len * 0.01;
-            let all_same_size = cells_for_segment.iter().all(|(_, len, _, _)| {
-                (*len - first_len).abs() < length_eps
-            });
-            
-            if !all_same_size {
-                // Skip segments with mixed cell sizes - the coarser cell will cover this area
-                continue;
-            }
-            
-            // Check if this segment was already processed (avoid duplicate quads)
-            let seg_key = (
-                line_key.axis,
-                line_key.perp1,
-                line_key.perp2,
-                axis_points[i],
-                axis_points[i + 1],
-            );
-            if !processed_segments.insert(seg_key) {
-                // Already processed this segment
-                continue;
-            }
-            
-            // Deduplicate at quad level: the same 4 vertices can form a quad
-            // that gets discovered from multiple different edge directions.
-            // Use sorted vertex positions as a canonical key.
-            let vert_scale = 1_000_000.0f32;
-            let mut quad_key: [(i64, i64, i64); 4] = [
-                ((cells_for_segment[0].0.0 * vert_scale) as i64, (cells_for_segment[0].0.1 * vert_scale) as i64, (cells_for_segment[0].0.2 * vert_scale) as i64),
-                ((cells_for_segment[1].0.0 * vert_scale) as i64, (cells_for_segment[1].0.1 * vert_scale) as i64, (cells_for_segment[1].0.2 * vert_scale) as i64),
-                ((cells_for_segment[2].0.0 * vert_scale) as i64, (cells_for_segment[2].0.1 * vert_scale) as i64, (cells_for_segment[2].0.2 * vert_scale) as i64),
-                ((cells_for_segment[3].0.0 * vert_scale) as i64, (cells_for_segment[3].0.1 * vert_scale) as i64, (cells_for_segment[3].0.2 * vert_scale) as i64),
-            ];
-            quad_key.sort();
-            if !processed_quads.insert(quad_key) {
-                // Already emitted this quad from a different edge direction
-                continue;
-            }
-            
-            // Compute edge midpoint in 3D
-            let edge_mid = match line_key.axis {
-                EdgeAxis::X => (seg_mid, line_key.perp1 as f32 / scale, line_key.perp2 as f32 / scale),
-                EdgeAxis::Y => (line_key.perp1 as f32 / scale, seg_mid, line_key.perp2 as f32 / scale),
-                EdgeAxis::Z => (line_key.perp1 as f32 / scale, line_key.perp2 as f32 / scale, seg_mid),
-            };
-
-            // Edge direction along the axis
-            let edge_dir = match line_key.axis {
-                EdgeAxis::X => (1.0, 0.0, 0.0),
-                EdgeAxis::Y => (0.0, 1.0, 0.0),
-                EdgeAxis::Z => (0.0, 0.0, 1.0),
-            };
-            
-            emit_triangles_for_quad(&cells_for_segment, inside_at_min, edge_mid, edge_dir, &mut triangles, &mut emitted_triangles);
         }
     }
 
     Ok(triangles)
+}
+
+#[cfg(test)]
+fn emit_triangles_for_quad_dbg(
+    cells: &[CellData],
+    inside_first: bool,
+    edge_mid: (f32, f32, f32),
+    edge_dir: (f32, f32, f32),
+    seg_key: &SegKey,
+    triangles: &mut Vec<Triangle>,
+    emitted: &mut HashSet<[(i64, i64, i64); 3]>,
+    tri_to_seg: &mut HashMap<[(i64, i64, i64); 3], SegKey>,
+) {
+    if cells.len() < 3 {
+        return;
+    }
+
+    let scale = 1_000_000.0f32;
+    let quantize = |v: (f32, f32, f32)| -> (i64, i64, i64) { quantize_round(v, scale) };
+
+    let mut try_emit = |tri: [(f32, f32, f32); 3], triangles: &mut Vec<Triangle>, emitted: &mut HashSet<[(i64, i64, i64); 3]>, tri_to_seg: &mut HashMap<[(i64, i64, i64); 3], SegKey>| {
+        let mut key = [quantize(tri[0]), quantize(tri[1]), quantize(tri[2])];
+        key.sort();
+        if emitted.insert(key) {
+            tri_to_seg.insert(key, seg_key.clone());
+            let face_normal = Triangle::compute_face_normal(&tri);
+            triangles.push(Triangle::with_vertex_normals(tri, [face_normal; 3]));
+        }
+    };
+
+    // Reuse the same ordering/triangulation logic as the main emitter.
+    let mut sorted_cells: Vec<&CellData> = cells.iter().collect();
+    let arbitrary = if edge_dir.0.abs() < 0.9 { (1.0, 0.0, 0.0) } else { (0.0, 1.0, 0.0) };
+    let basis_u = (
+        arbitrary.1 * edge_dir.2 - arbitrary.2 * edge_dir.1,
+        arbitrary.2 * edge_dir.0 - arbitrary.0 * edge_dir.2,
+        arbitrary.0 * edge_dir.1 - arbitrary.1 * edge_dir.0,
+    );
+    let len_u = (basis_u.0 * basis_u.0 + basis_u.1 * basis_u.1 + basis_u.2 * basis_u.2).sqrt();
+    let basis_u = (basis_u.0 / len_u, basis_u.1 / len_u, basis_u.2 / len_u);
+    let basis_v = (
+        edge_dir.1 * basis_u.2 - edge_dir.2 * basis_u.1,
+        edge_dir.2 * basis_u.0 - edge_dir.0 * basis_u.2,
+        edge_dir.0 * basis_u.1 - edge_dir.1 * basis_u.0,
+    );
+
+    sorted_cells.sort_by(|a, b| {
+        let va = a.0;
+        let vb = b.0;
+        let da = (va.0 - edge_mid.0, va.1 - edge_mid.1, va.2 - edge_mid.2);
+        let db = (vb.0 - edge_mid.0, vb.1 - edge_mid.1, vb.2 - edge_mid.2);
+        let ua = da.0 * basis_u.0 + da.1 * basis_u.1 + da.2 * basis_u.2;
+        let va_proj = da.0 * basis_v.0 + da.1 * basis_v.1 + da.2 * basis_v.2;
+        let ub = db.0 * basis_u.0 + db.1 * basis_u.1 + db.2 * basis_u.2;
+        let vb_proj = db.0 * basis_v.0 + db.1 * basis_v.1 + db.2 * basis_v.2;
+        let angle_a = va_proj.atan2(ua);
+        let angle_b = vb_proj.atan2(ub);
+        angle_a.partial_cmp(&angle_b).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let sorted_verts: Vec<(f32, f32, f32)> = sorted_cells.iter().map(|c| c.0).collect();
+    let n = sorted_verts.len();
+
+    if n == 3 {
+        if inside_first {
+            try_emit([sorted_verts[0], sorted_verts[1], sorted_verts[2]], triangles, emitted, tri_to_seg);
+        } else {
+            try_emit([sorted_verts[0], sorted_verts[2], sorted_verts[1]], triangles, emitted, tri_to_seg);
+        }
+    } else if n == 4 {
+        let v0 = sorted_verts[0];
+        let v1 = sorted_verts[1];
+        let v2 = sorted_verts[2];
+        let v3 = sorted_verts[3];
+        let q0 = quantize(v0);
+        let q1 = quantize(v1);
+        let q2 = quantize(v2);
+        let q3 = quantize(v3);
+        let flip = ((q0.0 ^ q0.1 ^ q0.2) ^ (q1.0 ^ q1.1 ^ q1.2) ^ (q2.0 ^ q2.1 ^ q2.2) ^ (q3.0 ^ q3.1 ^ q3.2)) & 1 != 0;
+        if !flip {
+            if inside_first {
+                try_emit([v0, v1, v2], triangles, emitted, tri_to_seg);
+                try_emit([v0, v2, v3], triangles, emitted, tri_to_seg);
+            } else {
+                try_emit([v0, v2, v1], triangles, emitted, tri_to_seg);
+                try_emit([v0, v3, v2], triangles, emitted, tri_to_seg);
+            }
+        } else {
+            if inside_first {
+                try_emit([v1, v2, v3], triangles, emitted, tri_to_seg);
+                try_emit([v1, v3, v0], triangles, emitted, tri_to_seg);
+            } else {
+                try_emit([v1, v3, v2], triangles, emitted, tri_to_seg);
+                try_emit([v1, v0, v3], triangles, emitted, tri_to_seg);
+            }
+        }
+    } else if n > 4 {
+        for i in 1..(n - 1) {
+            let v0 = sorted_verts[0];
+            let v1 = sorted_verts[i];
+            let v2 = sorted_verts[i + 1];
+            if inside_first {
+                try_emit([v0, v1, v2], triangles, emitted, tri_to_seg);
+            } else {
+                try_emit([v0, v2, v1], triangles, emitted, tri_to_seg);
+            }
+        }
+    }
 }
 
 /// Cell data for triangle emission: (vertex, edge_length, cell_min, cell_max)
@@ -1278,7 +1597,7 @@ fn emit_triangles_for_quad(
     
     let scale = 1_000_000.0f32;
     let quantize = |v: (f32, f32, f32)| -> (i64, i64, i64) {
-        ((v.0 * scale) as i64, (v.1 * scale) as i64, (v.2 * scale) as i64)
+        quantize_round(v, scale)
     };
     
     let try_emit = |tri: [(f32, f32, f32); 3], triangles: &mut Vec<Triangle>, emitted: &mut HashSet<[(i64, i64, i64); 3]>| {
@@ -1367,13 +1686,35 @@ fn emit_triangles_for_quad(
         let v2 = sorted_verts[2];
         let v3 = sorted_verts[3];
         
-        // Always split along 0-2 diagonal for consistency
-        if inside_first {
-            try_emit([v0, v1, v2], triangles, emitted);
-            try_emit([v0, v2, v3], triangles, emitted);
+        // Choose diagonal deterministically based on quantized vertex positions.
+        //
+        // A fixed diagonal (always 0-2) can still create shared-diagonal conflicts when adjacent
+        // quads end up with the same angular ordering. By varying the diagonal in a stable way,
+        // we reduce the chance that two adjacent quads both pick their shared edge as the diagonal,
+        // which is exactly the "edge shared by 4 triangles" failure mode.
+        let q0 = quantize(v0);
+        let q1 = quantize(v1);
+        let q2 = quantize(v2);
+        let q3 = quantize(v3);
+        let flip = ((q0.0 ^ q0.1 ^ q0.2) ^ (q1.0 ^ q1.1 ^ q1.2) ^ (q2.0 ^ q2.1 ^ q2.2) ^ (q3.0 ^ q3.1 ^ q3.2)) & 1 != 0;
+
+        // If `flip` is false: split along 0-2. If true: split along 1-3.
+        if !flip {
+            if inside_first {
+                try_emit([v0, v1, v2], triangles, emitted);
+                try_emit([v0, v2, v3], triangles, emitted);
+            } else {
+                try_emit([v0, v2, v1], triangles, emitted);
+                try_emit([v0, v3, v2], triangles, emitted);
+            }
         } else {
-            try_emit([v0, v2, v1], triangles, emitted);
-            try_emit([v0, v3, v2], triangles, emitted);
+            if inside_first {
+                try_emit([v1, v2, v3], triangles, emitted);
+                try_emit([v1, v3, v0], triangles, emitted);
+            } else {
+                try_emit([v1, v3, v2], triangles, emitted);
+                try_emit([v1, v0, v3], triangles, emitted);
+            }
         }
     } else if n > 4 {
         // For n > 4, use fan triangulation (rare case with adaptive refinement)
@@ -1428,7 +1769,7 @@ impl WeldedTopology {
     fn build(triangles: &[Triangle]) -> Self {
         let scale = 1_000_000.0f32;
         let quantize = |v: (f32, f32, f32)| -> (i64, i64, i64) {
-            ((v.0 * scale) as i64, (v.1 * scale) as i64, (v.2 * scale) as i64)
+            quantize_round(v, scale)
         };
 
         let mut key_to_vid: HashMap<(i64, i64, i64), usize> = HashMap::new();
