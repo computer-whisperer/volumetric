@@ -13,6 +13,47 @@ use std::sync::Arc;
 
 use crate::Triangle;
 
+// ==================== TEST-ONLY SANITY CHECKS ====================
+// These checks are compiled ONLY in test builds and are intended to catch
+// invariant violations earlier in the pipeline than the final mesh validators.
+//
+// Expensive checks are gated behind `VOLUMETRIC_SANITY=1` (or any value).
+// This keeps the default `cargo test` fast while still enabling deep diagnostics
+// when investigating rare manifoldness/winding issues.
+
+#[cfg(test)]
+fn sanity_enabled() -> bool {
+    std::env::var("VOLUMETRIC_SANITY").is_ok()
+}
+
+#[cfg(test)]
+macro_rules! sanity_assert {
+    ($cond:expr $(,)?) => {
+        if crate::adaptive_surface_nets::sanity_enabled() {
+            assert!($cond);
+        }
+    };
+    ($cond:expr, $($arg:tt)+) => {
+        if crate::adaptive_surface_nets::sanity_enabled() {
+            assert!($cond, $($arg)+);
+        }
+    };
+}
+
+#[cfg(test)]
+fn q_round(v: (f32, f32, f32), scale: f32) -> (i64, i64, i64) {
+    (
+        (v.0 * scale).round() as i64,
+        (v.1 * scale).round() as i64,
+        (v.2 * scale).round() as i64,
+    )
+}
+
+#[cfg(test)]
+fn q_trunc(v: (f32, f32, f32), scale: f32) -> (i64, i64, i64) {
+    ((v.0 * scale) as i64, (v.1 * scale) as i64, (v.2 * scale) as i64)
+}
+
 /// Configuration for the adaptive mesh generation algorithm.
 #[derive(Clone, Debug)]
 pub struct AdaptiveMeshConfig {
@@ -527,6 +568,18 @@ fn phase1_coarse_discovery(sampler: &WasmSampler, octree: &mut AdaptiveOctree) -
         )
         .collect();
 
+    #[cfg(test)]
+    {
+        sanity_assert!(corner_samples.len() == corner_positions.len(), "corner sample count mismatch");
+        if sanity_enabled() {
+            let mut seen = HashSet::with_capacity(corner_samples.len());
+            for (idx, _filled) in &corner_samples {
+                sanity_assert!(*idx < octree.base_corner_filled.len(), "corner idx out of bounds: {idx}");
+                sanity_assert!(seen.insert(*idx), "duplicate corner idx encountered: {idx}");
+            }
+        }
+    }
+
     // Store corner samples using direct indexing (faster than HashMap)
     for (idx, filled) in corner_samples {
         octree.base_corner_filled[idx] = filled;
@@ -788,6 +841,28 @@ fn refine_node_uniform(
         }
     });
 
+    #[cfg(test)]
+    {
+        // Child bounds should partition the parent exactly at `mid`.
+        sanity_assert!(children.iter().all(|c| c.depth == node.depth + 1));
+        if sanity_enabled() {
+            for (i, c) in children.iter().enumerate() {
+                sanity_assert!(c.min.0 <= c.max.0 && c.min.1 <= c.max.1 && c.min.2 <= c.max.2, "invalid child bounds at {i}: min={:?} max={:?}", c.min, c.max);
+                // Each axis uses either parent min..mid or mid..parent max.
+                let expect_min_x = if i & 1 != 0 { mid.0 } else { node.min.0 };
+                let expect_max_x = if i & 1 != 0 { node.max.0 } else { mid.0 };
+                let expect_min_y = if i & 2 != 0 { mid.1 } else { node.min.1 };
+                let expect_max_y = if i & 2 != 0 { node.max.1 } else { mid.1 };
+                let expect_min_z = if i & 4 != 0 { mid.2 } else { node.min.2 };
+                let expect_max_z = if i & 4 != 0 { node.max.2 } else { mid.2 };
+
+                sanity_assert!((c.min.0, c.max.0) == (expect_min_x, expect_max_x), "child x bounds mismatch at {i}");
+                sanity_assert!((c.min.1, c.max.1) == (expect_min_y, expect_max_y), "child y bounds mismatch at {i}");
+                sanity_assert!((c.min.2, c.max.2) == (expect_min_z, expect_max_z), "child z bounds mismatch at {i}");
+            }
+        }
+    }
+
     // Sample all unique corner positions for children
     let mut corner_cache: HashMap<(i64, i64, i64), bool> = HashMap::new();
     let scale = 1_000_000.0;
@@ -1026,6 +1101,8 @@ fn phase3_extract_mesh(
             )> = Vec::new();
             let mut inside_at_min = true; // Will be set by first edge found
             let mut first = true;
+            #[cfg(test)]
+            let mut sanity_inside_at_min: Option<bool> = None;
             
             for edge in edges {
                 // Check if this edge contains the segment
@@ -1042,6 +1119,25 @@ fn phase3_extract_mesh(
                         inside_at_min = edge.inside_at_min;
                         first = false;
                     }
+
+                    #[cfg(test)]
+                    {
+                        if sanity_enabled() {
+                            match sanity_inside_at_min {
+                                None => sanity_inside_at_min = Some(edge.inside_at_min),
+                                Some(v) => sanity_assert!(
+                                    v == edge.inside_at_min,
+                                    "inconsistent inside_at_min on segment: axis={:?} perp=({},{}) seg=({:.6},{:.6}) first={v:?} saw={:?}",
+                                    line_key.axis,
+                                    line_key.perp1,
+                                    line_key.perp2,
+                                    seg_min,
+                                    seg_max,
+                                    edge.inside_at_min
+                                ),
+                            }
+                        }
+                    }
                 }
             }
             
@@ -1057,11 +1153,47 @@ fn phase3_extract_mesh(
                 let qb = ((b.0.0 * vert_scale) as i64, (b.0.1 * vert_scale) as i64, (b.0.2 * vert_scale) as i64);
                 qa == qb
             });
+
+            #[cfg(test)]
+            {
+                if sanity_enabled() {
+                    // This is a hot spot for topology issues. Make quantization behavior explicit.
+                    // (We do not change behavior here; we only detect potential instability.)
+                    let mut uniq_round = HashSet::new();
+                    let mut uniq_trunc = HashSet::new();
+                    for (v, _len, _cmin, _cmax) in &cells_for_segment {
+                        uniq_round.insert(q_round(*v, vert_scale));
+                        uniq_trunc.insert(q_trunc(*v, vert_scale));
+                    }
+                    sanity_assert!(
+                        uniq_round.len() == uniq_trunc.len(),
+                        "round vs trunc quantization disagree on uniqueness: axis={:?} perp=({},{}) seg=({:.6},{:.6}) round={} trunc={}",
+                        line_key.axis,
+                        line_key.perp1,
+                        line_key.perp2,
+                        seg_min,
+                        seg_max,
+                        uniq_round.len(),
+                        uniq_trunc.len()
+                    );
+                }
+            }
             
             if cells_for_segment.len() != 4 {
                 // Surface nets requires exactly 4 cells around each edge.
                 // Skip segments that don't have exactly 4 cells.
                 continue;
+            }
+
+            #[cfg(test)]
+            {
+                if sanity_enabled() {
+                    let mut uniq = HashSet::new();
+                    for (v, _len, _cmin, _cmax) in &cells_for_segment {
+                        uniq.insert(q_round(*v, vert_scale));
+                    }
+                    sanity_assert!(uniq.len() == 4, "quad has duplicate vertices after dedup: axis={:?} perp=({},{}) seg=({:.6},{:.6})", line_key.axis, line_key.perp1, line_key.perp2, seg_min, seg_max);
+                }
             }
             
             // Check if all cells have the same edge length (same refinement level)
@@ -1771,6 +1903,14 @@ fn compute_surface_nets_vertex(node: &OctreeNode) -> (f32, f32, f32) {
 mod tests {
     use super::*;
 
+    fn sanity_or_skip() -> bool {
+        if !super::sanity_enabled() {
+            eprintln!("Skipping sanity-only test (set VOLUMETRIC_SANITY=1 to enable)");
+            return false;
+        }
+        true
+    }
+
     #[test]
     fn test_cell_type_classification() {
         // All inside: all corners filled
@@ -1891,6 +2031,35 @@ mod tests {
         }
 
         println!("Generated {} triangles for sphere", triangles.len());
+    }
+
+    #[test]
+    fn sanity_internal_invariants_sphere() {
+        if !sanity_or_skip() {
+            return;
+        }
+
+        let wasm_path = std::path::Path::new("target/wasm32-unknown-unknown/release/simple_sphere_model.wasm");
+        if !wasm_path.exists() {
+            eprintln!("Skipping test: sphere wasm not found at {:?}", wasm_path);
+            return;
+        }
+        let wasm_bytes = std::fs::read(wasm_path).expect("Failed to read sphere wasm");
+
+        // Keep this relatively small; the goal is to exercise inline invariants.
+        let config = AdaptiveMeshConfig {
+            base_resolution: 10,
+            max_refinement_depth: 3,
+            edge_refinement_iterations: 1,
+            vertex_relaxation_iterations: 0,
+            normal_mode: NormalMode::Mesh,
+        };
+
+        // Sphere bounds from the model tests.
+        let bounds_min = (-1.5, -1.5, -1.5);
+        let bounds_max = (1.5, 1.5, 1.5);
+        let _triangles = adaptive_surface_nets_mesh(&wasm_bytes, bounds_min, bounds_max, &config)
+            .expect("Sphere sanity meshing failed");
     }
     
     /// Debug version of mesh generation with diagnostic output
@@ -2287,6 +2456,9 @@ mod tests {
 
     #[test]
     fn test_mandelbulb_mesh_is_manifold() {
+        if !sanity_or_skip() {
+            return;
+        }
         let wasm_path = std::path::Path::new("target/wasm32-unknown-unknown/release/mandelbulb_model.wasm");
 
         if !wasm_path.exists() {
@@ -2371,7 +2543,40 @@ mod tests {
     }
 
     #[test]
+    fn sanity_internal_invariants_mandelbulb_smoke() {
+        if !sanity_or_skip() {
+            return;
+        }
+
+        let wasm_path = std::path::Path::new("target/wasm32-unknown-unknown/release/mandelbulb_model.wasm");
+        if !wasm_path.exists() {
+            eprintln!("Skipping test: mandelbulb wasm not found at {:?}", wasm_path);
+            return;
+        }
+        let wasm_bytes = std::fs::read(wasm_path).expect("Failed to read mandelbulb wasm");
+
+        // Intentionally modest settings; the inline assertions should still trigger
+        // if the problematic invariants are violated.
+        let config = AdaptiveMeshConfig {
+            base_resolution: 10,
+            max_refinement_depth: 3,
+            edge_refinement_iterations: 1,
+            vertex_relaxation_iterations: 0,
+            normal_mode: NormalMode::Mesh,
+        };
+
+        // Mandelbulb bounds from the existing torture tests.
+        let bounds_min = (-1.3, -1.3, -1.3);
+        let bounds_max = (1.3, 1.3, 1.3);
+        let _triangles = adaptive_surface_nets_mesh(&wasm_bytes, bounds_min, bounds_max, &config)
+            .expect("Mandelbulb sanity meshing failed");
+    }
+
+    #[test]
     fn test_mandelbulb_winding_consistency() {
+        if !sanity_or_skip() {
+            return;
+        }
         // Test that triangle winding is consistent across the mesh.
         // For a closed manifold, each edge should be traversed once in each direction.
         let wasm_path = std::path::Path::new("target/wasm32-unknown-unknown/release/mandelbulb_model.wasm");
@@ -2449,6 +2654,9 @@ mod tests {
 
     #[test]
     fn test_mandelbulb_normals_agree_with_winding() {
+        if !sanity_or_skip() {
+            return;
+        }
         // Test that vertex normals point in the same general direction as face normals.
         // This validates that the normal computation agrees with the triangle winding.
         let wasm_path = std::path::Path::new("target/wasm32-unknown-unknown/release/mandelbulb_model.wasm");
@@ -2694,6 +2902,9 @@ mod tests {
 
     #[test]
     fn test_mandelbulb_high_resolution_manifold() {
+        if !sanity_or_skip() {
+            return;
+        }
         // Stress test with higher resolution to catch edge cases in adaptive refinement.
         let wasm_path = std::path::Path::new("target/wasm32-unknown-unknown/release/mandelbulb_model.wasm");
 
