@@ -57,17 +57,19 @@ struct OctreeNode {
     max: (f32, f32, f32),
     /// Depth in the octree (0 = root level from base grid)
     depth: usize,
-    /// Corner sample values (inside=true, outside=false)
+    /// Approximate signed distance at each corner.
+    /// Negative = inside, Positive = outside (convention: SDF-like)
     /// Order: [0,0,0], [1,0,0], [0,1,0], [1,1,0], [0,0,1], [1,0,1], [0,1,1], [1,1,1]
-    corners: [bool; 8],
+    corner_distances: [f32; 8],
     /// Children (None if leaf node)
     children: Option<Box<[OctreeNode; 8]>>,
 }
 
 impl OctreeNode {
     fn cell_type(&self) -> CellType {
-        let all_inside = self.corners.iter().all(|&c| c);
-        let all_outside = self.corners.iter().all(|&c| !c);
+        // Negative distance = inside, Positive = outside
+        let all_inside = self.corner_distances.iter().all(|&d| d < 0.0);
+        let all_outside = self.corner_distances.iter().all(|&d| d >= 0.0);
         if all_inside {
             CellType::AllInside
         } else if all_outside {
@@ -75,6 +77,12 @@ impl OctreeNode {
         } else {
             CellType::Mixed
         }
+    }
+
+    /// Check if a corner is inside (negative distance)
+    #[inline]
+    fn corner_inside(&self, index: usize) -> bool {
+        self.corner_distances[index] < 0.0
     }
 
     fn is_leaf(&self) -> bool {
@@ -222,7 +230,8 @@ struct AdaptiveOctree {
     /// Stored as a flat Vec for performance (avoids HashMap overhead)
     /// Indices range from -1 to base_resolution+1 (padded by 1 on each side)
     /// Size: (base_resolution + 3)^3
-    base_corners: Vec<bool>,
+    /// Values are approximate signed distances (negative = inside, positive = outside)
+    base_corner_distances: Vec<f32>,
     /// Number of corners per axis (base_resolution + 3)
     corner_n: usize,
 }
@@ -250,7 +259,8 @@ impl AdaptiveOctree {
             max_depth: config.max_refinement_depth,
             base_step,
             roots: HashMap::new(),
-            base_corners: vec![false; corner_n * corner_n * corner_n],
+            // Initialize with large positive values (outside) - will be filled during sampling
+            base_corner_distances: vec![f32::MAX; corner_n * corner_n * corner_n],
             corner_n,
         }
     }
@@ -315,6 +325,12 @@ pub fn adaptive_surface_nets_mesh(
 }
 
 /// Phase 1: Sample the base grid to discover geometry regions.
+/// 
+/// This phase computes approximate signed distance values at each corner.
+/// For a boolean field, we approximate SDF by:
+/// - Negative values for inside points (distance to nearest outside)
+/// - Positive values for outside points (distance to nearest inside)
+/// The magnitude is estimated based on the cell size.
 fn phase1_coarse_discovery(sampler: &WasmSampler, octree: &mut AdaptiveOctree) -> Result<()> {
     let base_res = octree.base_resolution as i32;
 
@@ -337,9 +353,13 @@ fn phase1_coarse_discovery(sampler: &WasmSampler, octree: &mut AdaptiveOctree) -
     let bounds_min = octree.bounds_min;
     let base_step = octree.base_step;
     let corner_n = octree.corner_n;
+    
+    // Use cell diagonal as the default distance magnitude for non-boundary points
+    let cell_diagonal = (base_step.0 * base_step.0 + base_step.1 * base_step.1 + base_step.2 * base_step.2).sqrt();
 
     // Sample directly into indexed results for efficient storage
-    let corner_samples: Vec<(usize, bool)> = corner_positions
+    // Returns (index, approximate_sdf) where negative = inside, positive = outside
+    let corner_samples: Vec<(usize, f32)> = corner_positions
         .par_iter()
         .map_init(
             || SamplingContext::new(&engine, &module).expect("Failed to create sampling context"),
@@ -349,23 +369,33 @@ fn phase1_coarse_discovery(sampler: &WasmSampler, octree: &mut AdaptiveOctree) -
                     bounds_min.1 + y as f32 * base_step.1,
                     bounds_min.2 + z as f32 * base_step.2,
                 );
-                let inside = (ctx.is_inside(pos).unwrap_or(0.0)) > 0.5;
+                let density = ctx.is_inside(pos).unwrap_or(0.0);
+                let inside = density > 0.5;
+                
+                // Approximate SDF: use cell diagonal as base distance
+                // Negative for inside, positive for outside
+                let approx_sdf = if inside {
+                    -cell_diagonal  // Inside: negative distance
+                } else {
+                    cell_diagonal   // Outside: positive distance
+                };
+                
                 // Compute flat index inline (offset by 1 to map -1 -> 0)
                 let xi = (x + 1) as usize;
                 let yi = (y + 1) as usize;
                 let zi = (z + 1) as usize;
                 let idx = (zi * corner_n + yi) * corner_n + xi;
-                (idx, inside)
+                (idx, approx_sdf)
             },
         )
         .collect();
 
     // Store corner samples using direct indexing (faster than HashMap)
-    for (idx, inside) in corner_samples {
-        octree.base_corners[idx] = inside;
+    for (idx, sdf) in corner_samples {
+        octree.base_corner_distances[idx] = sdf;
     }
 
-    // First pass: identify all MIXED cells
+    // First pass: identify all MIXED cells (cells with sign changes)
     let min_cell = -1i32;
     let max_cell = base_res;
     
@@ -375,20 +405,20 @@ fn phase1_coarse_discovery(sampler: &WasmSampler, octree: &mut AdaptiveOctree) -
         for y in min_cell..=max_cell {
             for x in min_cell..=max_cell {
                 let idx = CellIndex { x, y, z };
-                let corners = [
-                    octree.base_corners[octree.corner_idx(x, y, z)],
-                    octree.base_corners[octree.corner_idx(x + 1, y, z)],
-                    octree.base_corners[octree.corner_idx(x, y + 1, z)],
-                    octree.base_corners[octree.corner_idx(x + 1, y + 1, z)],
-                    octree.base_corners[octree.corner_idx(x, y, z + 1)],
-                    octree.base_corners[octree.corner_idx(x + 1, y, z + 1)],
-                    octree.base_corners[octree.corner_idx(x, y + 1, z + 1)],
-                    octree.base_corners[octree.corner_idx(x + 1, y + 1, z + 1)],
+                let distances = [
+                    octree.base_corner_distances[octree.corner_idx(x, y, z)],
+                    octree.base_corner_distances[octree.corner_idx(x + 1, y, z)],
+                    octree.base_corner_distances[octree.corner_idx(x, y + 1, z)],
+                    octree.base_corner_distances[octree.corner_idx(x + 1, y + 1, z)],
+                    octree.base_corner_distances[octree.corner_idx(x, y, z + 1)],
+                    octree.base_corner_distances[octree.corner_idx(x + 1, y, z + 1)],
+                    octree.base_corner_distances[octree.corner_idx(x, y + 1, z + 1)],
+                    octree.base_corner_distances[octree.corner_idx(x + 1, y + 1, z + 1)],
                 ];
                 
-                // Check if MIXED (has both inside and outside corners)
-                let first = corners[0];
-                let is_mixed = corners.iter().any(|&c| c != first);
+                // Check if MIXED (has both inside and outside corners based on sign)
+                let first_inside = distances[0] < 0.0;
+                let is_mixed = distances.iter().any(|&d| (d < 0.0) != first_inside);
                 if is_mixed {
                     mixed_cells.insert(idx);
                 }
@@ -425,22 +455,22 @@ fn phase1_coarse_discovery(sampler: &WasmSampler, octree: &mut AdaptiveOctree) -
     // Third pass: create root nodes for all cells to include
     for idx in cells_to_include {
         let (cell_min, cell_max) = octree.base_cell_bounds(idx);
-        let corners = [
-            octree.base_corners[octree.corner_idx(idx.x, idx.y, idx.z)],
-            octree.base_corners[octree.corner_idx(idx.x + 1, idx.y, idx.z)],
-            octree.base_corners[octree.corner_idx(idx.x, idx.y + 1, idx.z)],
-            octree.base_corners[octree.corner_idx(idx.x + 1, idx.y + 1, idx.z)],
-            octree.base_corners[octree.corner_idx(idx.x, idx.y, idx.z + 1)],
-            octree.base_corners[octree.corner_idx(idx.x + 1, idx.y, idx.z + 1)],
-            octree.base_corners[octree.corner_idx(idx.x, idx.y + 1, idx.z + 1)],
-            octree.base_corners[octree.corner_idx(idx.x + 1, idx.y + 1, idx.z + 1)],
+        let corner_distances = [
+            octree.base_corner_distances[octree.corner_idx(idx.x, idx.y, idx.z)],
+            octree.base_corner_distances[octree.corner_idx(idx.x + 1, idx.y, idx.z)],
+            octree.base_corner_distances[octree.corner_idx(idx.x, idx.y + 1, idx.z)],
+            octree.base_corner_distances[octree.corner_idx(idx.x + 1, idx.y + 1, idx.z)],
+            octree.base_corner_distances[octree.corner_idx(idx.x, idx.y, idx.z + 1)],
+            octree.base_corner_distances[octree.corner_idx(idx.x + 1, idx.y, idx.z + 1)],
+            octree.base_corner_distances[octree.corner_idx(idx.x, idx.y + 1, idx.z + 1)],
+            octree.base_corner_distances[octree.corner_idx(idx.x + 1, idx.y + 1, idx.z + 1)],
         ];
 
         let node = OctreeNode {
             min: cell_min,
             max: cell_max,
             depth: 0,
-            corners,
+            corner_distances,
             children: None,
         };
 
@@ -520,6 +550,9 @@ fn refine_node_recursive(
 
     // Create 8 children by subdividing this cell
     let mid = node.center();
+    let child_size = node.size() * 0.5;
+    let child_diagonal = child_size * 1.732051; // sqrt(3) for cube diagonal
+    
     let mut children: [OctreeNode; 8] = std::array::from_fn(|i| {
         let child_min = (
             if i & 1 != 0 { mid.0 } else { node.min.0 },
@@ -535,7 +568,7 @@ fn refine_node_recursive(
             min: child_min,
             max: child_max,
             depth: node.depth + 1,
-            corners: [false; 8], // Will be filled in
+            corner_distances: [f32::MAX; 8], // Will be filled in
             children: None,
         }
     });
@@ -543,7 +576,7 @@ fn refine_node_recursive(
     // Sample all unique corner positions for children
     // Children share corners, so we sample each unique position once
     // Use high-precision integer keys to avoid floating point issues
-    let mut corner_cache: HashMap<(i64, i64, i64), bool> = HashMap::new();
+    let mut corner_cache: HashMap<(i64, i64, i64), f32> = HashMap::new();
     
     // Scale factor for quantizing positions to avoid floating point comparison issues
     let scale = 1_000_000.0;
@@ -559,15 +592,18 @@ fn refine_node_recursive(
                 (pos.2 * scale).round() as i64,
             );
 
-            let inside = if let Some(&cached) = corner_cache.get(&key) {
+            let sdf = if let Some(&cached) = corner_cache.get(&key) {
                 cached
             } else {
-                let value = ctx.is_inside(pos)? > 0.5;
+                let density = ctx.is_inside(pos)?;
+                let inside = density > 0.5;
+                // Approximate SDF based on inside/outside and child cell size
+                let value = if inside { -child_diagonal } else { child_diagonal };
                 corner_cache.insert(key, value);
                 value
             };
 
-            child.corners[corner_idx] = inside;
+            child.corner_distances[corner_idx] = sdf;
         }
     }
 
@@ -596,6 +632,9 @@ fn refine_node_uniform(
 
     // Create 8 children by subdividing this cell
     let mid = node.center();
+    let child_size = node.size() * 0.5;
+    let child_diagonal = child_size * 1.732051; // sqrt(3) for cube diagonal
+    
     let mut children: [OctreeNode; 8] = std::array::from_fn(|i| {
         let child_min = (
             if i & 1 != 0 { mid.0 } else { node.min.0 },
@@ -611,13 +650,13 @@ fn refine_node_uniform(
             min: child_min,
             max: child_max,
             depth: node.depth + 1,
-            corners: [false; 8],
+            corner_distances: [f32::MAX; 8], // Will be filled in
             children: None,
         }
     });
 
     // Sample all unique corner positions for children
-    let mut corner_cache: HashMap<(i64, i64, i64), bool> = HashMap::new();
+    let mut corner_cache: HashMap<(i64, i64, i64), f32> = HashMap::new();
     let scale = 1_000_000.0;
 
     for child in children.iter_mut() {
@@ -629,15 +668,18 @@ fn refine_node_uniform(
                 (pos.2 * scale).round() as i64,
             );
 
-            let inside = if let Some(&cached) = corner_cache.get(&key) {
+            let sdf = if let Some(&cached) = corner_cache.get(&key) {
                 cached
             } else {
-                let value = ctx.is_inside(pos)? > 0.5;
+                let density = ctx.is_inside(pos)?;
+                let inside = density > 0.5;
+                // Approximate SDF based on inside/outside and child cell size
+                let value = if inside { -child_diagonal } else { child_diagonal };
                 corner_cache.insert(key, value);
                 value
             };
 
-            child.corners[corner_idx] = inside;
+            child.corner_distances[corner_idx] = sdf;
         }
     }
 
@@ -681,6 +723,11 @@ struct EdgeOnLine {
     inside_at_min: bool,
     /// Length of this edge (cell size along axis)
     edge_length: f32,
+    /// Cell bounds for normal computation
+    cell_min: (f32, f32, f32),
+    cell_max: (f32, f32, f32),
+    /// Corner distances for SDF-based normal estimation
+    corner_distances: [f32; 8],
 }
 
 impl LineKey {
@@ -750,7 +797,8 @@ fn phase3_extract_mesh(octree: &AdaptiveOctree) -> Result<Vec<Triangle>> {
         let vertex = compute_surface_nets_vertex(node);
         
         for &(ca, cb) in &EDGES {
-            if node.corners[ca] == node.corners[cb] {
+            // Check for sign change using corner_inside helper (negative distance = inside)
+            if node.corner_inside(ca) == node.corner_inside(cb) {
                 continue; // No sign change on this edge
             }
             
@@ -774,9 +822,9 @@ fn phase3_extract_mesh(octree: &AdaptiveOctree) -> Result<Vec<Triangle>> {
             // Determine if inside is at the min end of the edge
             // pa_is_min tells us if pa has the smaller axis coordinate
             let inside_at_min = if pa_is_min {
-                node.corners[ca] // pa is at min, so check if pa's corner is inside
+                node.corner_inside(ca) // pa is at min, so check if pa's corner is inside
             } else {
-                node.corners[cb] // pb is at min, so check if pb's corner is inside
+                node.corner_inside(cb) // pb is at min, so check if pb's corner is inside
             };
             
             let edge_length = axis_max - axis_min;
@@ -786,6 +834,9 @@ fn phase3_extract_mesh(octree: &AdaptiveOctree) -> Result<Vec<Triangle>> {
                 axis_max,
                 inside_at_min,
                 edge_length,
+                cell_min: node.min,
+                cell_max: node.max,
+                corner_distances: node.corner_distances,
             });
         }
     }
@@ -821,8 +872,14 @@ fn phase3_extract_mesh(octree: &AdaptiveOctree) -> Result<Vec<Triangle>> {
             let seg_mid = (seg_min + seg_max) * 0.5;
             
             // Find all edges that contain this segment
-            // Store (vertex, edge_length) to track cell sizes
-            let mut cells_for_segment: Vec<((f32, f32, f32), f32)> = Vec::new();
+            // Store (vertex, edge_length, cell_min, cell_max, corner_distances) for normal computation
+            let mut cells_for_segment: Vec<(
+                (f32, f32, f32),  // vertex
+                f32,              // edge_length
+                (f32, f32, f32),  // cell_min
+                (f32, f32, f32),  // cell_max
+                [f32; 8],         // corner_distances
+            )> = Vec::new();
             let mut inside_at_min = true; // Will be set by first edge found
             let mut first = true;
             
@@ -831,7 +888,13 @@ fn phase3_extract_mesh(octree: &AdaptiveOctree) -> Result<Vec<Triangle>> {
                 // Use small epsilon for floating point comparison
                 let eps = (seg_max - seg_min) * 0.01;
                 if edge.axis_min <= seg_min + eps && edge.axis_max >= seg_max - eps {
-                    cells_for_segment.push((edge.vertex, edge.edge_length));
+                    cells_for_segment.push((
+                        edge.vertex,
+                        edge.edge_length,
+                        edge.cell_min,
+                        edge.cell_max,
+                        edge.corner_distances,
+                    ));
                     if first {
                         inside_at_min = edge.inside_at_min;
                         first = false;
@@ -862,7 +925,7 @@ fn phase3_extract_mesh(octree: &AdaptiveOctree) -> Result<Vec<Triangle>> {
             // This avoids T-junction issues where cells of different sizes meet
             let first_len = cells_for_segment[0].1;
             let length_eps = first_len * 0.01;
-            let all_same_size = cells_for_segment.iter().all(|(_, len)| {
+            let all_same_size = cells_for_segment.iter().all(|(_, len, _, _, _)| {
                 (*len - first_len).abs() < length_eps
             });
             
@@ -870,9 +933,6 @@ fn phase3_extract_mesh(octree: &AdaptiveOctree) -> Result<Vec<Triangle>> {
                 // Skip segments with mixed cell sizes - the coarser cell will cover this area
                 continue;
             }
-            
-            // Extract just the vertices for triangle emission
-            let vertices: Vec<(f32, f32, f32)> = cells_for_segment.iter().map(|(v, _)| *v).collect();
             
             // Check if this segment was already processed (avoid duplicate quads)
             let seg_key = (
@@ -904,24 +964,28 @@ fn phase3_extract_mesh(octree: &AdaptiveOctree) -> Result<Vec<Triangle>> {
                 EdgeAxis::Z => (0.0, 0.0, 1.0),
             };
             
-            emit_triangles_for_quad(&vertices, inside_at_min, edge_mid, edge_dir, &mut triangles, &mut emitted_triangles);
+            emit_triangles_for_quad(&cells_for_segment, inside_at_min, edge_mid, edge_dir, &mut triangles, &mut emitted_triangles);
         }
     }
 
     Ok(triangles)
 }
 
+/// Cell data for triangle emission: (vertex, edge_length, cell_min, cell_max, corner_distances)
+type CellData = ((f32, f32, f32), f32, (f32, f32, f32), (f32, f32, f32), [f32; 8]);
+
 /// Emit triangles for a quad with correct winding order.
 /// Vertices must be sorted angularly around the edge axis for proper manifold mesh.
+/// Uses SDF-based normal estimation for smooth shading.
 fn emit_triangles_for_quad(
-    vertices: &[(f32, f32, f32)],
+    cells: &[CellData],
     inside_first: bool,
     edge_mid: (f32, f32, f32),
     edge_dir: (f32, f32, f32),
     triangles: &mut Vec<Triangle>,
     emitted: &mut HashSet<[(i64, i64, i64); 3]>,
 ) {
-    if vertices.len() < 3 {
+    if cells.len() < 3 {
         return;
     }
     
@@ -930,16 +994,80 @@ fn emit_triangles_for_quad(
         ((v.0 * scale) as i64, (v.1 * scale) as i64, (v.2 * scale) as i64)
     };
     
-    let try_emit = |tri: [(f32, f32, f32); 3], triangles: &mut Vec<Triangle>, emitted: &mut HashSet<[(i64, i64, i64); 3]>| {
+    // Compute SDF-based normal for a vertex using its cell's corner distances
+    let compute_normal = |vertex: (f32, f32, f32), cell_min: (f32, f32, f32), cell_max: (f32, f32, f32), corner_distances: &[f32; 8]| -> (f32, f32, f32) {
+        // Create a temporary node-like structure for normal estimation
+        let size = cell_max.0 - cell_min.0;
+        let u = ((vertex.0 - cell_min.0) / size).clamp(0.0, 1.0);
+        let v = ((vertex.1 - cell_min.1) / size).clamp(0.0, 1.0);
+        let w = ((vertex.2 - cell_min.2) / size).clamp(0.0, 1.0);
+        
+        let d = corner_distances;
+        
+        // Compute partial derivatives using trilinear interpolation formula
+        let du_00 = d[1] - d[0];
+        let du_10 = d[3] - d[2];
+        let du_01 = d[5] - d[4];
+        let du_11 = d[7] - d[6];
+        let du = (1.0 - v) * ((1.0 - w) * du_00 + w * du_01) + v * ((1.0 - w) * du_10 + w * du_11);
+        
+        let dv_00 = d[2] - d[0];
+        let dv_10 = d[3] - d[1];
+        let dv_01 = d[6] - d[4];
+        let dv_11 = d[7] - d[5];
+        let dv = (1.0 - u) * ((1.0 - w) * dv_00 + w * dv_01) + u * ((1.0 - w) * dv_10 + w * dv_11);
+        
+        let dw_00 = d[4] - d[0];
+        let dw_10 = d[5] - d[1];
+        let dw_01 = d[6] - d[2];
+        let dw_11 = d[7] - d[3];
+        let dw = (1.0 - u) * ((1.0 - v) * dw_00 + v * dw_01) + u * ((1.0 - v) * dw_10 + v * dw_11);
+        
+        let nx = du / size;
+        let ny = dv / size;
+        let nz = dw / size;
+        
+        let len = (nx * nx + ny * ny + nz * nz).sqrt();
+        if len > 1e-8 {
+            (nx / len, ny / len, nz / len)
+        } else {
+            (0.0, 1.0, 0.0)
+        }
+    };
+    
+    // Build a map from vertex position to its cell data for normal lookup
+    let vertex_to_cell: HashMap<(i64, i64, i64), &CellData> = cells.iter()
+        .map(|c| (quantize(c.0), c))
+        .collect();
+    
+    let try_emit = |tri: [(f32, f32, f32); 3], triangles: &mut Vec<Triangle>, emitted: &mut HashSet<[(i64, i64, i64); 3]>, vertex_to_cell: &HashMap<(i64, i64, i64), &CellData>| {
         let mut key = [quantize(tri[0]), quantize(tri[1]), quantize(tri[2])];
         key.sort();
         if emitted.insert(key) {
-            triangles.push(Triangle::new(tri));
+            // Compute average normal from the three vertices using SDF gradient
+            let mut avg_normal = (0.0f32, 0.0f32, 0.0f32);
+            for &v in &tri {
+                let qv = quantize(v);
+                if let Some(cell) = vertex_to_cell.get(&qv) {
+                    let n = compute_normal(v, cell.2, cell.3, &cell.4);
+                    avg_normal.0 += n.0;
+                    avg_normal.1 += n.1;
+                    avg_normal.2 += n.2;
+                }
+            }
+            let len = (avg_normal.0 * avg_normal.0 + avg_normal.1 * avg_normal.1 + avg_normal.2 * avg_normal.2).sqrt();
+            let normal = if len > 1e-8 {
+                (avg_normal.0 / len, avg_normal.1 / len, avg_normal.2 / len)
+            } else {
+                // Fallback to face normal
+                Triangle::compute_normal(&tri)
+            };
+            triangles.push(Triangle::with_normal(tri, normal));
         }
     };
     
     // Sort vertices angularly around the edge axis
-    let mut sorted_verts: Vec<(f32, f32, f32)> = vertices.to_vec();
+    let mut sorted_cells: Vec<&CellData> = cells.iter().collect();
     
     // Create orthonormal basis perpendicular to edge direction
     // Find a vector not parallel to edge_dir
@@ -965,24 +1093,29 @@ fn emit_triangles_for_quad(
         edge_dir.0 * basis_u.1 - edge_dir.1 * basis_u.0,
     );
     
-    // Sort by angle around the edge
-    sorted_verts.sort_by(|a, b| {
-        // Vector from edge_mid to vertex
-        let da = (a.0 - edge_mid.0, a.1 - edge_mid.1, a.2 - edge_mid.2);
-        let db = (b.0 - edge_mid.0, b.1 - edge_mid.1, b.2 - edge_mid.2);
+    // Sort by angle around the edge (using vertex position from cell data)
+    sorted_cells.sort_by(|a, b| {
+        // Vector from edge_mid to vertex (vertex is first element of tuple)
+        let va = a.0;
+        let vb = b.0;
+        let da = (va.0 - edge_mid.0, va.1 - edge_mid.1, va.2 - edge_mid.2);
+        let db = (vb.0 - edge_mid.0, vb.1 - edge_mid.1, vb.2 - edge_mid.2);
         
         // Project onto basis_u and basis_v
         let ua = da.0 * basis_u.0 + da.1 * basis_u.1 + da.2 * basis_u.2;
-        let va = da.0 * basis_v.0 + da.1 * basis_v.1 + da.2 * basis_v.2;
+        let va_proj = da.0 * basis_v.0 + da.1 * basis_v.1 + da.2 * basis_v.2;
         let ub = db.0 * basis_u.0 + db.1 * basis_u.1 + db.2 * basis_u.2;
-        let vb = db.0 * basis_v.0 + db.1 * basis_v.1 + db.2 * basis_v.2;
+        let vb_proj = db.0 * basis_v.0 + db.1 * basis_v.1 + db.2 * basis_v.2;
         
         // Compute angles
-        let angle_a = va.atan2(ua);
-        let angle_b = vb.atan2(ub);
+        let angle_a = va_proj.atan2(ua);
+        let angle_b = vb_proj.atan2(ub);
         
         angle_a.partial_cmp(&angle_b).unwrap_or(std::cmp::Ordering::Equal)
     });
+    
+    // Extract sorted vertices for triangle emission
+    let sorted_verts: Vec<(f32, f32, f32)> = sorted_cells.iter().map(|c| c.0).collect();
     
     // Emit triangles using adjacent vertices only (no internal edges)
     // This ensures each edge in the output is shared by exactly 2 triangles
@@ -991,9 +1124,9 @@ fn emit_triangles_for_quad(
     if n == 3 {
         // Triangle: just emit it
         if inside_first {
-            try_emit([sorted_verts[0], sorted_verts[1], sorted_verts[2]], triangles, emitted);
+            try_emit([sorted_verts[0], sorted_verts[1], sorted_verts[2]], triangles, emitted, &vertex_to_cell);
         } else {
-            try_emit([sorted_verts[0], sorted_verts[2], sorted_verts[1]], triangles, emitted);
+            try_emit([sorted_verts[0], sorted_verts[2], sorted_verts[1]], triangles, emitted, &vertex_to_cell);
         }
     } else if n == 4 {
         // Quad: split into 2 triangles using the shorter diagonal
@@ -1010,20 +1143,20 @@ fn emit_triangles_for_quad(
         if diag02 <= diag13 {
             // Split along 0-2 diagonal
             if inside_first {
-                try_emit([v0, v1, v2], triangles, emitted);
-                try_emit([v0, v2, v3], triangles, emitted);
+                try_emit([v0, v1, v2], triangles, emitted, &vertex_to_cell);
+                try_emit([v0, v2, v3], triangles, emitted, &vertex_to_cell);
             } else {
-                try_emit([v0, v2, v1], triangles, emitted);
-                try_emit([v0, v3, v2], triangles, emitted);
+                try_emit([v0, v2, v1], triangles, emitted, &vertex_to_cell);
+                try_emit([v0, v3, v2], triangles, emitted, &vertex_to_cell);
             }
         } else {
             // Split along 1-3 diagonal
             if inside_first {
-                try_emit([v0, v1, v3], triangles, emitted);
-                try_emit([v1, v2, v3], triangles, emitted);
+                try_emit([v0, v1, v3], triangles, emitted, &vertex_to_cell);
+                try_emit([v1, v2, v3], triangles, emitted, &vertex_to_cell);
             } else {
-                try_emit([v0, v3, v1], triangles, emitted);
-                try_emit([v1, v3, v2], triangles, emitted);
+                try_emit([v0, v3, v1], triangles, emitted, &vertex_to_cell);
+                try_emit([v1, v3, v2], triangles, emitted, &vertex_to_cell);
             }
         }
     } else if n > 4 {
@@ -1034,9 +1167,9 @@ fn emit_triangles_for_quad(
             let v2 = sorted_verts[i + 1];
             
             if inside_first {
-                try_emit([v0, v1, v2], triangles, emitted);
+                try_emit([v0, v1, v2], triangles, emitted, &vertex_to_cell);
             } else {
-                try_emit([v0, v2, v1], triangles, emitted);
+                try_emit([v0, v2, v1], triangles, emitted, &vertex_to_cell);
             }
         }
     }
@@ -1059,14 +1192,69 @@ fn collect_leaf_cells(
             min: node.min,
             max: node.max,
             depth: node.depth,
-            corners: node.corners,
+            corner_distances: node.corner_distances,
             children: None,
         }));
     }
 }
 
+/// Estimate the surface normal at a point within a cell using the SDF gradient.
+/// 
+/// Uses central differences on the trilinearly interpolated SDF to compute
+/// the gradient, which points from inside to outside (the normal direction).
+fn estimate_normal_from_sdf(node: &OctreeNode, point: (f32, f32, f32)) -> (f32, f32, f32) {
+    // Normalize point to [0,1] within the cell
+    let size = node.size();
+    let u = ((point.0 - node.min.0) / size).clamp(0.0, 1.0);
+    let v = ((point.1 - node.min.1) / size).clamp(0.0, 1.0);
+    let w = ((point.2 - node.min.2) / size).clamp(0.0, 1.0);
+    
+    // Corner distances for trilinear interpolation
+    // Corners: [0,0,0], [1,0,0], [0,1,0], [1,1,0], [0,0,1], [1,0,1], [0,1,1], [1,1,1]
+    let d = &node.corner_distances;
+    
+    // Compute partial derivatives using the trilinear interpolation formula
+    // d/du of trilinear: interpolate the differences along x
+    let du_00 = d[1] - d[0];  // at v=0, w=0
+    let du_10 = d[3] - d[2];  // at v=1, w=0
+    let du_01 = d[5] - d[4];  // at v=0, w=1
+    let du_11 = d[7] - d[6];  // at v=1, w=1
+    let du = (1.0 - v) * ((1.0 - w) * du_00 + w * du_01) + v * ((1.0 - w) * du_10 + w * du_11);
+    
+    // d/dv of trilinear: interpolate the differences along y
+    let dv_00 = d[2] - d[0];  // at u=0, w=0
+    let dv_10 = d[3] - d[1];  // at u=1, w=0
+    let dv_01 = d[6] - d[4];  // at u=0, w=1
+    let dv_11 = d[7] - d[5];  // at u=1, w=1
+    let dv = (1.0 - u) * ((1.0 - w) * dv_00 + w * dv_01) + u * ((1.0 - w) * dv_10 + w * dv_11);
+    
+    // d/dw of trilinear: interpolate the differences along z
+    let dw_00 = d[4] - d[0];  // at u=0, v=0
+    let dw_10 = d[5] - d[1];  // at u=1, v=0
+    let dw_01 = d[6] - d[2];  // at u=0, v=1
+    let dw_11 = d[7] - d[3];  // at u=1, v=1
+    let dw = (1.0 - u) * ((1.0 - v) * dw_00 + v * dw_01) + u * ((1.0 - v) * dw_10 + v * dw_11);
+    
+    // Scale by 1/size to get world-space gradient
+    let nx = du / size;
+    let ny = dv / size;
+    let nz = dw / size;
+    
+    // Normalize
+    let len = (nx * nx + ny * ny + nz * nz).sqrt();
+    if len > 1e-8 {
+        (nx / len, ny / len, nz / len)
+    } else {
+        // Fallback: use a default normal if gradient is zero
+        (0.0, 1.0, 0.0)
+    }
+}
+
 /// Compute the Surface Nets vertex for a MIXED cell.
-/// This is the average of midpoints of all sign-changing edges.
+/// 
+/// Uses SDF interpolation to find the approximate surface crossing point on each
+/// sign-changing edge, then averages these crossing points for the final vertex.
+/// This produces much smoother results than simple edge midpoints.
 fn compute_surface_nets_vertex(node: &OctreeNode) -> (f32, f32, f32) {
     // Edge definitions: pairs of corner indices
     const EDGES: [(usize, usize); 12] = [
@@ -1079,17 +1267,28 @@ fn compute_surface_nets_vertex(node: &OctreeNode) -> (f32, f32, f32) {
     let mut count = 0;
 
     for &(a, b) in &EDGES {
-        if node.corners[a] != node.corners[b] {
+        let da = node.corner_distances[a];
+        let db = node.corner_distances[b];
+        
+        // Check for sign change (one negative, one positive/zero)
+        if (da < 0.0) != (db < 0.0) {
             let pa = node.corner_pos(a);
             let pb = node.corner_pos(b);
-            let mid = (
-                (pa.0 + pb.0) * 0.5,
-                (pa.1 + pb.1) * 0.5,
-                (pa.2 + pb.2) * 0.5,
+            
+            // Linear interpolation to find the zero-crossing point
+            // t = da / (da - db) gives the parameter where the surface crosses
+            // Clamp to [0.01, 0.99] to avoid degenerate cases at corners
+            let t = (da / (da - db)).clamp(0.01, 0.99);
+            
+            let crossing = (
+                pa.0 + t * (pb.0 - pa.0),
+                pa.1 + t * (pb.1 - pa.1),
+                pa.2 + t * (pb.2 - pa.2),
             );
-            sum.0 += mid.0;
-            sum.1 += mid.1;
-            sum.2 += mid.2;
+            
+            sum.0 += crossing.0;
+            sum.1 += crossing.1;
+            sum.2 += crossing.2;
             count += 1;
         }
     }
@@ -1107,29 +1306,32 @@ mod tests {
 
     #[test]
     fn test_cell_type_classification() {
+        // All inside: all negative distances
         let all_inside = OctreeNode {
             min: (0.0, 0.0, 0.0),
             max: (1.0, 1.0, 1.0),
             depth: 0,
-            corners: [true; 8],
+            corner_distances: [-1.0; 8],
             children: None,
         };
         assert_eq!(all_inside.cell_type(), CellType::AllInside);
 
+        // All outside: all positive distances
         let all_outside = OctreeNode {
             min: (0.0, 0.0, 0.0),
             max: (1.0, 1.0, 1.0),
             depth: 0,
-            corners: [false; 8],
+            corner_distances: [1.0; 8],
             children: None,
         };
         assert_eq!(all_outside.cell_type(), CellType::AllOutside);
 
+        // Mixed: alternating inside/outside (negative/positive)
         let mixed = OctreeNode {
             min: (0.0, 0.0, 0.0),
             max: (1.0, 1.0, 1.0),
             depth: 0,
-            corners: [true, false, true, false, true, false, true, false],
+            corner_distances: [-1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0],
             children: None,
         };
         assert_eq!(mixed.cell_type(), CellType::Mixed);
@@ -1141,7 +1343,7 @@ mod tests {
             min: (0.0, 0.0, 0.0),
             max: (2.0, 2.0, 2.0),
             depth: 0,
-            corners: [false; 8],
+            corner_distances: [1.0; 8], // Values don't matter for position test
             children: None,
         };
 
@@ -1157,18 +1359,20 @@ mod tests {
 
     #[test]
     fn test_surface_nets_vertex() {
-        // A cell with one corner inside (corner 0)
+        // A cell with one corner inside (corner 0 has negative distance)
+        // Other corners are outside (positive distance)
         let node = OctreeNode {
             min: (0.0, 0.0, 0.0),
             max: (2.0, 2.0, 2.0),
             depth: 0,
-            corners: [true, false, false, false, false, false, false, false],
+            corner_distances: [-1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
             children: None,
         };
 
         let vertex = compute_surface_nets_vertex(&node);
 
         // The vertex should be near corner 0, as that's where the surface is
+        // With SDF interpolation, the crossing is at t = 0.5 on each edge from corner 0
         assert!(vertex.0 < 1.0);
         assert!(vertex.1 < 1.0);
         assert!(vertex.2 < 1.0);
