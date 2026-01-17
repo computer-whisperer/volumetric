@@ -261,6 +261,9 @@ struct AssetRenderData {
     adaptive_edge_refinement_iterations: usize,
     /// Adaptive Surface Nets: vertex relaxation iterations to project vertices onto surface (0 = disabled)
     adaptive_vertex_relaxation_iterations: usize,
+
+    /// Adaptive Surface Nets: enable high-quality (bisection-based) normals.
+    adaptive_hq_normals: bool,
 }
 
 impl AssetRenderData {
@@ -283,6 +286,7 @@ impl AssetRenderData {
             adaptive_max_depth: 4,
             adaptive_edge_refinement_iterations: 4,
             adaptive_vertex_relaxation_iterations: 2,
+            adaptive_hq_normals: false,
         }
     }
 }
@@ -659,6 +663,15 @@ impl VolumetricApp {
                         max_refinement_depth: render_data.adaptive_max_depth,
                         edge_refinement_iterations: render_data.adaptive_edge_refinement_iterations,
                         vertex_relaxation_iterations: render_data.adaptive_vertex_relaxation_iterations,
+                        normal_mode: if render_data.adaptive_hq_normals {
+                            adaptive_surface_nets::NormalMode::HqBisection {
+                                eps_frac: 0.05,
+                                bracket_frac: 0.5,
+                                iterations: 10,
+                            }
+                        } else {
+                            adaptive_surface_nets::NormalMode::Mesh
+                        },
                     };
                     match generate_adaptive_mesh_from_bytes(&render_data.wasm_bytes, &config) {
                         Ok((triangles, bounds_min, bounds_max)) => {
@@ -1931,6 +1944,7 @@ impl eframe::App for VolumetricApp {
                                         let mut base_res = render_data.adaptive_base_resolution;
                                         let mut max_depth = render_data.adaptive_max_depth;
                                         let mut auto_resample = render_data.auto_resample;
+                                        let mut hq_normals = render_data.adaptive_hq_normals;
                                         
                                         ui.horizontal(|ui| {
                                             ui.label("Base Resolution:");
@@ -1972,6 +1986,15 @@ impl eframe::App for VolumetricApp {
                                             ui.label("Vertex Relaxation:");
                                             if ui.add(egui::DragValue::new(&mut vertex_relax).range(0..=8)).changed() {
                                                 render_data.adaptive_vertex_relaxation_iterations = vertex_relax;
+                                                if auto_resample {
+                                                    render_data.needs_resample = true;
+                                                }
+                                            }
+                                        });
+
+                                        ui.horizontal(|ui| {
+                                            if ui.checkbox(&mut hq_normals, "HQ Normals").changed() {
+                                                render_data.adaptive_hq_normals = hq_normals;
                                                 if auto_resample {
                                                     render_data.needs_resample = true;
                                                 }

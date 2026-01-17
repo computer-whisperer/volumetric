@@ -38,6 +38,32 @@ pub struct AdaptiveMeshConfig {
     /// 0 = disabled
     /// Default: 2
     pub vertex_relaxation_iterations: usize,
+
+    /// How to compute per-vertex normals for shading.
+    ///
+    /// `Mesh` is fast and stable (derived from triangle geometry).
+    /// `HqBisection` performs additional occupancy-based sampling to fit a higher-quality normal.
+    pub normal_mode: NormalMode,
+}
+
+/// Normal computation strategy.
+#[derive(Clone, Copy, Debug)]
+pub enum NormalMode {
+    /// Compute normals from the extracted mesh (area-weighted vertex normals).
+    Mesh,
+    /// High-quality normals using occupancy-only sampling:
+    /// - Start from a mesh-normal guess
+    /// - Offset by `eps_frac * cell_size` in two tangent directions
+    /// - Re-project each offset point to the surface by bisection along the normal line
+    /// - Use the resulting local patch to estimate the normal
+    HqBisection {
+        /// Offset distance as a fraction of the estimated minimum cell size.
+        eps_frac: f32,
+        /// Initial bracketing distance along the normal line as a fraction of cell size.
+        bracket_frac: f32,
+        /// Number of bisection iterations used during re-projection.
+        iterations: usize,
+    },
 }
 
 impl Default for AdaptiveMeshConfig {
@@ -47,6 +73,7 @@ impl Default for AdaptiveMeshConfig {
             max_refinement_depth: 4,
             edge_refinement_iterations: 4,
             vertex_relaxation_iterations: 2,
+            normal_mode: NormalMode::Mesh,
         }
     }
 }
@@ -335,10 +362,166 @@ pub fn adaptive_surface_nets_mesh(
     // Phase 3: Extract waterproof mesh using Surface Nets
     let mut triangles = phase3_extract_mesh(&octree, &sampler, config)?;
 
-    // Phase 4: Smooth vertex normals by averaging at shared positions
-    smooth_vertex_normals(&mut triangles);
+    // Ensure a globally consistent winding direction.
+    // The extraction step attempts to orient triangles based on local corner occupancy,
+    // but small inconsistencies can still occur and show up as lighting seams.
+    // For closed meshes, a robust fallback is to enforce that face normals point away
+    // from the bounds center.
+    enforce_outward_winding(&mut triangles, bounds_min, bounds_max);
+
+    // Optional post-pass: project welded vertices closer to the implicit surface.
+    // This must happen AFTER extraction so it cannot affect connectivity / topology.
+    if config.vertex_relaxation_iterations > 0 {
+        relax_welded_vertices_to_surface(
+            &mut triangles,
+            &sampler,
+            bounds_min,
+            bounds_max,
+            config.vertex_relaxation_iterations,
+            config.base_resolution,
+            config.max_refinement_depth,
+        )?;
+    }
+
+    // Phase 4: Compute per-vertex normals.
+    // Under occupancy-only sampling, normals must come from mesh geometry and/or additional
+    // occupancy probes (HQ mode). Do not derive normals from any fake SDF field.
+    apply_normals(&mut triangles, &sampler, bounds_min, bounds_max, config)?;
 
     Ok(triangles)
+}
+
+fn apply_normals(
+    triangles: &mut [Triangle],
+    sampler: &WasmSampler,
+    bounds_min: (f32, f32, f32),
+    bounds_max: (f32, f32, f32),
+    config: &AdaptiveMeshConfig,
+) -> Result<()> {
+    let topology = WeldedTopology::build(triangles);
+    let mut normals = compute_mesh_vertex_normals(&topology, triangles);
+
+    match config.normal_mode {
+        NormalMode::Mesh => {
+            write_vertex_normals(&topology, triangles, &normals);
+            Ok(())
+        }
+        NormalMode::HqBisection {
+            eps_frac,
+            bracket_frac,
+            iterations,
+        } => {
+            // Compute HQ normals per welded vertex.
+            let min_extent = (bounds_max.0 - bounds_min.0)
+                .min(bounds_max.1 - bounds_min.1)
+                .min(bounds_max.2 - bounds_min.2);
+            let effective_res = (config.base_resolution * (1usize << config.max_refinement_depth)) as f32;
+            let cell_size = if effective_res > 0.0 { min_extent / effective_res } else { min_extent };
+
+            let eps = (cell_size * eps_frac).max(1.0e-6);
+            let bracket = (cell_size * bracket_frac).max(eps * 2.0);
+
+            let mut ctx = SamplingContext::new(&sampler.engine, &sampler.module)?;
+            for (vid, p) in topology.vertex_pos.iter().copied().enumerate() {
+                let n0 = normals[vid];
+                if let Some(n) = hq_normal_at_point(&mut ctx, p, n0, eps, bracket, iterations)? {
+                    normals[vid] = n;
+                }
+            }
+
+            write_vertex_normals(&topology, triangles, &normals);
+            Ok(())
+        }
+    }
+}
+
+fn relax_welded_vertices_to_surface(
+    triangles: &mut [Triangle],
+    sampler: &WasmSampler,
+    bounds_min: (f32, f32, f32),
+    bounds_max: (f32, f32, f32),
+    outer_iterations: usize,
+    base_resolution: usize,
+    max_refinement_depth: usize,
+) -> Result<()> {
+    if triangles.is_empty() {
+        return Ok(());
+    }
+
+    let topology = WeldedTopology::build(triangles);
+    let normals = compute_mesh_vertex_normals(&topology, triangles);
+
+    let min_extent = (bounds_max.0 - bounds_min.0)
+        .min(bounds_max.1 - bounds_min.1)
+        .min(bounds_max.2 - bounds_min.2);
+    let effective_res = (base_resolution * (1usize << max_refinement_depth)) as f32;
+    let cell_size = if effective_res > 0.0 { min_extent / effective_res } else { min_extent };
+
+    // Project within a small neighborhood to avoid jumping across thin features.
+    let bracket = (cell_size * 0.5).max(1.0e-4);
+    let bisect_iters = 10usize;
+
+    let mut ctx = SamplingContext::new(&sampler.engine, &sampler.module)?;
+
+    let mut new_pos = topology.vertex_pos.clone();
+    for (vid, p0) in topology.vertex_pos.iter().copied().enumerate() {
+        let Some(dir) = normalize_or_none(normals[vid]) else {
+            continue;
+        };
+        let mut p = p0;
+        for _ in 0..outer_iterations {
+            let Some(p_new) = project_to_surface_on_line(&mut ctx, p, dir, bracket, bisect_iters)? else {
+                break;
+            };
+            p = p_new;
+        }
+        new_pos[vid] = p;
+    }
+
+    write_vertex_positions(&topology, triangles, &new_pos);
+    Ok(())
+}
+
+fn enforce_outward_winding(
+    triangles: &mut [Triangle],
+    bounds_min: (f32, f32, f32),
+    bounds_max: (f32, f32, f32),
+) {
+    if triangles.is_empty() {
+        return;
+    }
+
+    let center = (
+        (bounds_min.0 + bounds_max.0) * 0.5,
+        (bounds_min.1 + bounds_max.1) * 0.5,
+        (bounds_min.2 + bounds_max.2) * 0.5,
+    );
+
+    for tri in triangles.iter_mut() {
+        let n = Triangle::compute_face_normal(&tri.vertices);
+        // If degenerate, skip.
+        let len2 = n.0 * n.0 + n.1 * n.1 + n.2 * n.2;
+        if len2 <= 1.0e-24 {
+            continue;
+        }
+
+        let centroid = (
+            (tri.vertices[0].0 + tri.vertices[1].0 + tri.vertices[2].0) / 3.0,
+            (tri.vertices[0].1 + tri.vertices[1].1 + tri.vertices[2].1) / 3.0,
+            (tri.vertices[0].2 + tri.vertices[1].2 + tri.vertices[2].2) / 3.0,
+        );
+        let to_outside = (centroid.0 - center.0, centroid.1 - center.1, centroid.2 - center.2);
+        let dp = n.0 * to_outside.0 + n.1 * to_outside.1 + n.2 * to_outside.2;
+
+        if dp < 0.0 {
+            // Flip winding (swap v1/v2) and flip per-vertex normals accordingly.
+            tri.vertices.swap(1, 2);
+            tri.normals.swap(1, 2);
+            tri.normals[0] = (-tri.normals[0].0, -tri.normals[0].1, -tri.normals[0].2);
+            tri.normals[1] = (-tri.normals[1].0, -tri.normals[1].1, -tri.normals[1].2);
+            tri.normals[2] = (-tri.normals[2].0, -tri.normals[2].1, -tri.normals[2].2);
+        }
+    }
 }
 
 /// Phase 1: Sample the base grid to discover geometry regions.
@@ -776,7 +959,8 @@ fn phase3_extract_mesh(
         collect_leaf_cells(root, cell_id, &mut leaf_cells);
     }
     
-    // Create sampling context for binary search refinement if enabled
+    // Create sampling context for binary search edge refinement if enabled.
+    // (Vertex relaxation runs as a welded post-pass after extraction.)
     let mut sampling_ctx = if config.edge_refinement_iterations > 0 {
         Some(SamplingContext::new(&sampler.engine, &sampler.module)?)
     } else {
@@ -1142,68 +1326,216 @@ fn collect_leaf_cells(
     }
 }
 
-/// Smooth vertex normals by averaging normals at shared vertex positions.
-/// 
-/// This post-processing pass collects all normals at each unique vertex position
-/// across all triangles, averages them, and applies the averaged normal back.
-/// This eliminates discontinuities at cell boundaries where the same vertex
-/// appears in multiple triangles with different per-cell computed normals.
-fn smooth_vertex_normals(triangles: &mut [Triangle]) {
-    if triangles.is_empty() {
-        return;
+/// A welded view of a triangle soup.
+///
+/// Many triangles share the same conceptual vertex position. In order to compute smooth
+/// per-vertex normals (and to support HQ normal fitting), we weld vertices by quantized
+/// position and keep an explicit vertex id for each triangle corner.
+struct WeldedTopology {
+    vertex_pos: Vec<(f32, f32, f32)>,
+    tri_vids: Vec<[usize; 3]>,
+}
+
+impl WeldedTopology {
+    fn build(triangles: &[Triangle]) -> Self {
+        let scale = 1_000_000.0f32;
+        let quantize = |v: (f32, f32, f32)| -> (i64, i64, i64) {
+            ((v.0 * scale) as i64, (v.1 * scale) as i64, (v.2 * scale) as i64)
+        };
+
+        let mut key_to_vid: HashMap<(i64, i64, i64), usize> = HashMap::new();
+        let mut vertex_pos: Vec<(f32, f32, f32)> = Vec::new();
+        let mut tri_vids: Vec<[usize; 3]> = Vec::with_capacity(triangles.len());
+
+        for tri in triangles {
+            let mut vids = [0usize; 3];
+            for i in 0..3 {
+                let v = tri.vertices[i];
+                let key = quantize(v);
+                let vid = *key_to_vid.entry(key).or_insert_with(|| {
+                    let id = vertex_pos.len();
+                    vertex_pos.push(v);
+                    id
+                });
+                vids[i] = vid;
+            }
+            tri_vids.push(vids);
+        }
+
+        Self { vertex_pos, tri_vids }
     }
-    
-    // Quantization scale for vertex position matching
-    let scale = 1_000_000.0f32;
-    let quantize = |v: (f32, f32, f32)| -> (i64, i64, i64) {
-        ((v.0 * scale) as i64, (v.1 * scale) as i64, (v.2 * scale) as i64)
+}
+
+fn compute_mesh_vertex_normals(topology: &WeldedTopology, triangles: &[Triangle]) -> Vec<(f32, f32, f32)> {
+    let mut acc = vec![(0.0f32, 0.0f32, 0.0f32); topology.vertex_pos.len()];
+
+    for (ti, tri) in triangles.iter().enumerate() {
+        let vids = topology.tri_vids[ti];
+        let a = tri.vertices[0];
+        let b = tri.vertices[1];
+        let c = tri.vertices[2];
+        let ab = (b.0 - a.0, b.1 - a.1, b.2 - a.2);
+        let ac = (c.0 - a.0, c.1 - a.1, c.2 - a.2);
+        // Unnormalized face normal (area-weighted).
+        let n = (
+            ab.1 * ac.2 - ab.2 * ac.1,
+            ab.2 * ac.0 - ab.0 * ac.2,
+            ab.0 * ac.1 - ab.1 * ac.0,
+        );
+        let len2 = n.0 * n.0 + n.1 * n.1 + n.2 * n.2;
+        if len2 <= 1.0e-24 {
+            continue;
+        }
+        for &vid in &vids {
+            acc[vid].0 += n.0;
+            acc[vid].1 += n.1;
+            acc[vid].2 += n.2;
+        }
+    }
+
+    for n in &mut acc {
+        let len2 = n.0 * n.0 + n.1 * n.1 + n.2 * n.2;
+        if len2 > 1.0e-24 {
+            let inv = 1.0 / len2.sqrt();
+            n.0 *= inv;
+            n.1 *= inv;
+            n.2 *= inv;
+        } else {
+            *n = (0.0, 1.0, 0.0);
+        }
+    }
+
+    acc
+}
+
+fn write_vertex_normals(topology: &WeldedTopology, triangles: &mut [Triangle], normals: &[(f32, f32, f32)]) {
+    for (ti, tri) in triangles.iter_mut().enumerate() {
+        let vids = topology.tri_vids[ti];
+        tri.normals[0] = normals[vids[0]];
+        tri.normals[1] = normals[vids[1]];
+        tri.normals[2] = normals[vids[2]];
+    }
+}
+
+fn write_vertex_positions(topology: &WeldedTopology, triangles: &mut [Triangle], positions: &[(f32, f32, f32)]) {
+    for (ti, tri) in triangles.iter_mut().enumerate() {
+        let vids = topology.tri_vids[ti];
+        tri.vertices[0] = positions[vids[0]];
+        tri.vertices[1] = positions[vids[1]];
+        tri.vertices[2] = positions[vids[2]];
+    }
+}
+
+fn normalize_or_none(v: (f32, f32, f32)) -> Option<(f32, f32, f32)> {
+    let len2 = v.0 * v.0 + v.1 * v.1 + v.2 * v.2;
+    if len2 <= 1.0e-24 {
+        None
+    } else {
+        let inv = 1.0 / len2.sqrt();
+        Some((v.0 * inv, v.1 * inv, v.2 * inv))
+    }
+}
+
+fn dot(a: (f32, f32, f32), b: (f32, f32, f32)) -> f32 {
+    a.0 * b.0 + a.1 * b.1 + a.2 * b.2
+}
+
+fn cross(a: (f32, f32, f32), b: (f32, f32, f32)) -> (f32, f32, f32) {
+    (a.1 * b.2 - a.2 * b.1, a.2 * b.0 - a.0 * b.2, a.0 * b.1 - a.1 * b.0)
+}
+
+fn project_to_surface_on_line(
+    ctx: &mut SamplingContext,
+    p: (f32, f32, f32),
+    dir_unit: (f32, f32, f32),
+    mut half_range: f32,
+    iterations: usize,
+) -> Result<Option<(f32, f32, f32)>> {
+    if half_range <= 0.0 {
+        return Ok(None);
+    }
+
+    for _ in 0..4 {
+        let a = (
+            p.0 - dir_unit.0 * half_range,
+            p.1 - dir_unit.1 * half_range,
+            p.2 - dir_unit.2 * half_range,
+        );
+        let b = (
+            p.0 + dir_unit.0 * half_range,
+            p.1 + dir_unit.1 * half_range,
+            p.2 + dir_unit.2 * half_range,
+        );
+        let fa = ctx.is_inside(a)? != 0.0;
+        let fb = ctx.is_inside(b)? != 0.0;
+
+        if fa != fb {
+            let (p_inside, p_outside) = if fa { (a, b) } else { (b, a) };
+            return Ok(Some(binary_search_edge_crossing(
+                ctx,
+                p_inside,
+                p_outside,
+                iterations,
+            )?));
+        }
+
+        // Expand search window, but keep it local-ish.
+        half_range *= 2.0;
+        if half_range.is_infinite() || half_range > 1.0e6 {
+            break;
+        }
+    }
+
+    Ok(None)
+}
+
+fn hq_normal_at_point(
+    ctx: &mut SamplingContext,
+    p: (f32, f32, f32),
+    n0: (f32, f32, f32),
+    eps: f32,
+    bracket: f32,
+    iterations: usize,
+) -> Result<Option<(f32, f32, f32)>> {
+    let n0 = match normalize_or_none(n0) {
+        Some(n) => n,
+        None => return Ok(None),
     };
-    
-    // Collect all normals at each unique vertex position
-    let mut vertex_normals: HashMap<(i64, i64, i64), Vec<(f32, f32, f32)>> = HashMap::new();
-    
-    for tri in triangles.iter() {
-        for i in 0..3 {
-            let key = quantize(tri.vertices[i]);
-            let normal = tri.normals[i];
-            // Only collect non-degenerate normals
-            let len2 = normal.0 * normal.0 + normal.1 * normal.1 + normal.2 * normal.2;
-            if len2 > 1e-12 {
-                vertex_normals.entry(key).or_default().push(normal);
-            }
-        }
+
+    // Build a tangent frame.
+    let arbitrary = if n0.0.abs() < 0.9 { (1.0, 0.0, 0.0) } else { (0.0, 1.0, 0.0) };
+    let t1 = match normalize_or_none(cross(arbitrary, n0)) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    let t2 = cross(n0, t1);
+
+    let p1 = (p.0 + t1.0 * eps, p.1 + t1.1 * eps, p.2 + t1.2 * eps);
+    let p2 = (p.0 + t2.0 * eps, p.1 + t2.1 * eps, p.2 + t2.2 * eps);
+
+    let q1 = match project_to_surface_on_line(ctx, p1, n0, bracket, iterations)? {
+        Some(q) => q,
+        None => return Ok(None),
+    };
+    let q2 = match project_to_surface_on_line(ctx, p2, n0, bracket, iterations)? {
+        Some(q) => q,
+        None => return Ok(None),
+    };
+
+    let v1 = (q1.0 - p.0, q1.1 - p.1, q1.2 - p.2);
+    let v2 = (q2.0 - p.0, q2.1 - p.1, q2.2 - p.2);
+    let mut n = cross(v1, v2);
+    n = match normalize_or_none(n) {
+        Some(nn) => nn,
+        None => return Ok(None),
+    };
+
+    // Orient to match the mesh normal guess.
+    if dot(n, n0) < 0.0 {
+        n = (-n.0, -n.1, -n.2);
     }
-    
-    // Compute averaged normals for each vertex
-    let averaged_normals: HashMap<(i64, i64, i64), (f32, f32, f32)> = vertex_normals
-        .into_iter()
-        .map(|(key, normals)| {
-            let mut sum = (0.0f32, 0.0f32, 0.0f32);
-            for n in &normals {
-                sum.0 += n.0;
-                sum.1 += n.1;
-                sum.2 += n.2;
-            }
-            let len = (sum.0 * sum.0 + sum.1 * sum.1 + sum.2 * sum.2).sqrt();
-            let avg = if len > 1e-8 {
-                (sum.0 / len, sum.1 / len, sum.2 / len)
-            } else {
-                // Fallback: use first normal if average is degenerate
-                normals.first().copied().unwrap_or((0.0, 1.0, 0.0))
-            };
-            (key, avg)
-        })
-        .collect();
-    
-    // Apply averaged normals back to all triangles
-    for tri in triangles.iter_mut() {
-        for i in 0..3 {
-            let key = quantize(tri.vertices[i]);
-            if let Some(&avg_normal) = averaged_normals.get(&key) {
-                tri.normals[i] = avg_normal;
-            }
-        }
-    }
+
+    Ok(Some(n))
 }
 
 /// Estimate the surface normal at a point within a cell using the SDF gradient.
@@ -1282,14 +1614,82 @@ fn binary_search_edge_crossing(
 /// The relaxed vertex position, clamped to stay within the cell.
 fn relax_vertex_to_surface(
     vertex: (f32, f32, f32),
-    _node: &OctreeNode,
-    _ctx: Option<&mut SamplingContext>,
-    _iterations: usize,
+    node: &OctreeNode,
+    mut ctx: Option<&mut SamplingContext>,
+    iterations: usize,
 ) -> Result<(f32, f32, f32)> {
-    // NOTE: Occupancy-only sampling does not provide an SDF, so SDF-gradient-based relaxation
-    // is not theoretically valid. This is intentionally a no-op until an occupancy-based
-    // projection method is implemented.
-    Ok(vertex)
+    let Some(ctx) = ctx.as_deref_mut() else {
+        return Ok(vertex);
+    };
+
+    // Estimate an "inside -> outside" direction from corner occupancy.
+    let mut inside_sum = (0.0f32, 0.0f32, 0.0f32);
+    let mut outside_sum = (0.0f32, 0.0f32, 0.0f32);
+    let mut inside_n = 0usize;
+    let mut outside_n = 0usize;
+    for i in 0..8 {
+        let p = node.corner_pos(i);
+        if node.corner_inside(i) {
+            inside_sum.0 += p.0;
+            inside_sum.1 += p.1;
+            inside_sum.2 += p.2;
+            inside_n += 1;
+        } else {
+            outside_sum.0 += p.0;
+            outside_sum.1 += p.1;
+            outside_sum.2 += p.2;
+            outside_n += 1;
+        }
+    }
+
+    if inside_n == 0 || outside_n == 0 {
+        // Not a mixed cell.
+        return Ok(vertex);
+    }
+
+    let inside_center = (
+        inside_sum.0 / inside_n as f32,
+        inside_sum.1 / inside_n as f32,
+        inside_sum.2 / inside_n as f32,
+    );
+    let outside_center = (
+        outside_sum.0 / outside_n as f32,
+        outside_sum.1 / outside_n as f32,
+        outside_sum.2 / outside_n as f32,
+    );
+    let dir = (
+        outside_center.0 - inside_center.0,
+        outside_center.1 - inside_center.1,
+        outside_center.2 - inside_center.2,
+    );
+    let Some(dir_unit) = normalize_or_none(dir) else {
+        return Ok(vertex);
+    };
+
+    let clamp_to_cell = |p: (f32, f32, f32)| -> (f32, f32, f32) {
+        (
+            p.0.clamp(node.min.0, node.max.0),
+            p.1.clamp(node.min.1, node.max.1),
+            p.2.clamp(node.min.2, node.max.2),
+        )
+    };
+
+    // Keep the projection local to this cell.
+    let half_range = node.size() * 0.5;
+    let mut v = vertex;
+
+    // Bisection iterations per relaxation step.
+    // Tied loosely to edge refinement precision; this is still bounded by the cell size range.
+    let bisect_iters = 8usize;
+
+    for _ in 0..iterations {
+        let Some(p_new) = project_to_surface_on_line(ctx, v, dir_unit, half_range, bisect_iters)? else {
+            break;
+        };
+        v = clamp_to_cell(p_new);
+    }
+
+    Ok(v)
 }
 
 /// Compute the Surface Nets vertex for a MIXED cell with optional binary search refinement
@@ -1360,12 +1760,10 @@ fn compute_surface_nets_vertex_refined(
         node.center()
     };
     
-    // Apply vertex relaxation if enabled
-    if relax_iterations > 0 {
-        relax_vertex_to_surface(initial_vertex, node, ctx, relax_iterations)
-    } else {
-        Ok(initial_vertex)
-    }
+    // Vertex relaxation is applied as a welded post-pass after extraction.
+    // Doing it here (per-cell) can interfere with topology decisions during extraction.
+    let _ = relax_iterations;
+    Ok(initial_vertex)
 }
 
 /// Compute the Surface Nets vertex for a MIXED cell.
@@ -1515,6 +1913,7 @@ mod tests {
             max_refinement_depth: 2,
             edge_refinement_iterations: 4,
             vertex_relaxation_iterations: 2,
+            normal_mode: NormalMode::Mesh,
         };
 
         let bounds_min = (-1.0, -1.0, -1.0);
@@ -1617,6 +2016,40 @@ mod tests {
         edges.values().filter(|&&count| count != 2).count()
     }
 
+    fn inward_facing_triangle_count(
+        triangles: &[Triangle],
+        bounds_min: (f32, f32, f32),
+        bounds_max: (f32, f32, f32),
+    ) -> usize {
+        let center = (
+            (bounds_min.0 + bounds_max.0) * 0.5,
+            (bounds_min.1 + bounds_max.1) * 0.5,
+            (bounds_min.2 + bounds_max.2) * 0.5,
+        );
+        triangles
+            .iter()
+            .filter(|tri| {
+                let n = Triangle::compute_face_normal(&tri.vertices);
+                let len2 = n.0 * n.0 + n.1 * n.1 + n.2 * n.2;
+                if len2 <= 1.0e-24 {
+                    return false;
+                }
+                let centroid = (
+                    (tri.vertices[0].0 + tri.vertices[1].0 + tri.vertices[2].0) / 3.0,
+                    (tri.vertices[0].1 + tri.vertices[1].1 + tri.vertices[2].1) / 3.0,
+                    (tri.vertices[0].2 + tri.vertices[1].2 + tri.vertices[2].2) / 3.0,
+                );
+                let to_outside = (
+                    centroid.0 - center.0,
+                    centroid.1 - center.1,
+                    centroid.2 - center.2,
+                );
+                let dp = n.0 * to_outside.0 + n.1 * to_outside.1 + n.2 * to_outside.2;
+                dp < 0.0
+            })
+            .count()
+    }
+
     fn edge_incidence_histogram(triangles: &[Triangle]) -> HashMap<usize, usize> {
         let scale = 1_000_000.0f32;
         let mut edges: HashMap<((i64, i64, i64), (i64, i64, i64)), usize> = HashMap::new();
@@ -1668,6 +2101,7 @@ mod tests {
             max_refinement_depth: 3,
             edge_refinement_iterations: 4,
             vertex_relaxation_iterations: 2,
+            normal_mode: NormalMode::Mesh,
         };
 
         let bounds_min = (-1.35, -0.35, -1.35);
@@ -1693,6 +2127,83 @@ mod tests {
     }
 
     #[test]
+    fn test_sphere_mesh_winding_is_consistent() {
+        let wasm_path = std::path::Path::new("target/wasm32-unknown-unknown/release/simple_sphere_model.wasm");
+
+        if !wasm_path.exists() {
+            eprintln!("Skipping test: sphere wasm not found");
+            return;
+        }
+
+        let wasm_bytes = std::fs::read(wasm_path).expect("Failed to read wasm file");
+
+        let config = AdaptiveMeshConfig {
+            base_resolution: 6,
+            max_refinement_depth: 2,
+            edge_refinement_iterations: 4,
+            vertex_relaxation_iterations: 0,
+            normal_mode: NormalMode::Mesh,
+        };
+
+        let bounds_min = (-1.0, -1.0, -1.0);
+        let bounds_max = (1.0, 1.0, 1.0);
+
+        let triangles = adaptive_surface_nets_mesh(&wasm_bytes, bounds_min, bounds_max, &config)
+            .expect("Mesh generation failed");
+
+        let inward = inward_facing_triangle_count(&triangles, bounds_min, bounds_max);
+        assert_eq!(
+            inward, 0,
+            "Expected all sphere triangles to face outward after winding enforcement, found {inward} inward triangles"
+        );
+    }
+
+    #[test]
+    fn test_sphere_hq_normals_are_reasonable() {
+        let wasm_path = std::path::Path::new("target/wasm32-unknown-unknown/release/simple_sphere_model.wasm");
+
+        if !wasm_path.exists() {
+            eprintln!("Skipping test: sphere wasm not found");
+            return;
+        }
+
+        let wasm_bytes = std::fs::read(wasm_path).expect("Failed to read wasm file");
+
+        let config = AdaptiveMeshConfig {
+            base_resolution: 6,
+            max_refinement_depth: 2,
+            edge_refinement_iterations: 4,
+            vertex_relaxation_iterations: 1,
+            normal_mode: NormalMode::HqBisection {
+                eps_frac: 0.05,
+                bracket_frac: 0.5,
+                iterations: 10,
+            },
+        };
+
+        let bounds_min = (-1.0, -1.0, -1.0);
+        let bounds_max = (1.0, 1.0, 1.0);
+        let center = (0.0f32, 0.0f32, 0.0f32);
+
+        let triangles = adaptive_surface_nets_mesh(&wasm_bytes, bounds_min, bounds_max, &config)
+            .expect("Mesh generation failed");
+        assert!(!triangles.is_empty());
+
+        for tri in &triangles {
+            for i in 0..3 {
+                let v = tri.vertices[i];
+                let n = tri.normals[i];
+                let len2 = n.0 * n.0 + n.1 * n.1 + n.2 * n.2;
+                assert!(len2 > 0.5, "Expected near-unit normal, got len2={len2}");
+
+                let to_outside = (v.0 - center.0, v.1 - center.1, v.2 - center.2);
+                let dp = n.0 * to_outside.0 + n.1 * to_outside.1 + n.2 * to_outside.2;
+                assert!(dp > 0.0, "Expected outward-ish normal on sphere (dp={dp})");
+            }
+        }
+    }
+
+    #[test]
     fn test_adaptive_refinement_reduces_samples() {
         // This test verifies that adaptive sampling uses fewer samples than uniform
         // for a simple sphere (most of the volume is empty or solid)
@@ -1713,6 +2224,7 @@ mod tests {
             max_refinement_depth: 3,
             edge_refinement_iterations: 4,
             vertex_relaxation_iterations: 2,
+            normal_mode: NormalMode::Mesh,
         };
 
         let bounds_min = (-1.0, -1.0, -1.0);
@@ -1747,6 +2259,7 @@ mod tests {
             max_refinement_depth: 2,
             edge_refinement_iterations: 4,
             vertex_relaxation_iterations: 2,
+            normal_mode: NormalMode::Mesh,
         };
 
         let pi = std::f32::consts::PI;
