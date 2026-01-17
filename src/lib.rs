@@ -194,6 +194,7 @@ pub fn operator_metadata_from_wasm_bytes(wasm_bin: &[u8]) -> Result<OperatorMeta
 pub mod stl;
 pub mod marching_cubes_cpu;
 pub mod adaptive_surface_nets;
+pub mod adaptive_surface_nets_2;
 
 /// Sample points from the WASM volumetric model
 pub fn sample_model(wasm_path: &Path, resolution: usize) -> anyhow::Result<(Vec<(f32, f32, f32)>, (f32, f32, f32), (f32, f32, f32))> {

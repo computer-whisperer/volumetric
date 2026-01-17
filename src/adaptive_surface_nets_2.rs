@@ -186,9 +186,8 @@
 //!
 //! ## Data Structures
 
-use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use dashmap::DashSet;
 
 /// Configuration for the adaptive surface nets algorithm.
 #[derive(Clone, Debug)]
@@ -592,34 +591,959 @@ pub struct IndexedMesh2 {
 //   that samples along edges of coarse cells even if corners are all same state.
 
 // =============================================================================
-// PLACEHOLDER IMPLEMENTATIONS (to be filled in)
+// STAGE 1: COARSE GRID DISCOVERY
+// =============================================================================
+
+/// Sample a single point and return whether it's inside (density > 0).
+#[inline]
+fn sample_is_inside<F>(sampler: &F, x: f64, y: f64, z: f64, stats: &SamplingStats) -> bool
+where
+    F: Fn(f64, f64, f64) -> f32,
+{
+    stats.total_samples.fetch_add(1, Ordering::Relaxed);
+    sampler(x, y, z) > 0.0
+}
+
+/// Stage 1: Coarse Grid Discovery
+///
+/// Samples the volume at low resolution (`base_resolution³` cells) to find
+/// regions containing the surface. Returns a work queue of mixed cells with
+/// their corner samples pre-filled.
+///
+/// # Algorithm
+/// 1. Create a grid of (base_resolution + 1)³ sample points (corners)
+/// 2. Sample all corner points to determine inside/outside state
+/// 3. For each cell, check if corners have mixed states (surface crosses cell)
+/// 4. Return WorkQueueEntry for each mixed cell with all 8 corners known
+fn stage1_coarse_discovery<F>(
+    sampler: &F,
+    bounds_min: (f64, f64, f64),
+    bounds_max: (f64, f64, f64),
+    config: &AdaptiveMeshConfig2,
+    stats: &SamplingStats,
+) -> Vec<WorkQueueEntry>
+where
+    F: Fn(f64, f64, f64) -> f32 + Send + Sync,
+{
+    let res = config.base_resolution;
+    let num_corners = res + 1;
+
+    // Cell size at depth 0 (coarsest level)
+    let cell_size = (
+        (bounds_max.0 - bounds_min.0) / res as f64,
+        (bounds_max.1 - bounds_min.1) / res as f64,
+        (bounds_max.2 - bounds_min.2) / res as f64,
+    );
+
+    // Sample all corner points into a 3D array
+    // Layout: corners[z][y][x] for cache-friendly Z-slice iteration
+    let mut corners = vec![vec![vec![false; num_corners]; num_corners]; num_corners];
+
+    for iz in 0..num_corners {
+        for iy in 0..num_corners {
+            for ix in 0..num_corners {
+                let x = bounds_min.0 + ix as f64 * cell_size.0;
+                let y = bounds_min.1 + iy as f64 * cell_size.1;
+                let z = bounds_min.2 + iz as f64 * cell_size.2;
+                corners[iz][iy][ix] = sample_is_inside(sampler, x, y, z, stats);
+            }
+        }
+    }
+
+    // Find mixed cells and create work queue entries
+    let mut work_queue = Vec::new();
+
+    for iz in 0..res {
+        for iy in 0..res {
+            for ix in 0..res {
+                // Gather the 8 corner samples for this cell using canonical corner ordering
+                let cell_corners: [bool; 8] = [
+                    corners[iz][iy][ix],         // corner 0: (0,0,0)
+                    corners[iz][iy][ix + 1],     // corner 1: (1,0,0)
+                    corners[iz][iy + 1][ix],     // corner 2: (0,1,0)
+                    corners[iz][iy + 1][ix + 1], // corner 3: (1,1,0)
+                    corners[iz + 1][iy][ix],     // corner 4: (0,0,1)
+                    corners[iz + 1][iy][ix + 1], // corner 5: (1,0,1)
+                    corners[iz + 1][iy + 1][ix], // corner 6: (0,1,1)
+                    corners[iz + 1][iy + 1][ix + 1], // corner 7: (1,1,1)
+                ];
+
+                let mask = CornerMask::from_bools(cell_corners);
+
+                if mask.is_mixed() {
+                    let cuboid = CuboidId::new(ix as i32, iy as i32, iz as i32, 0);
+                    let known_corners = cell_corners.map(Some);
+                    work_queue.push(WorkQueueEntry::with_corners(cuboid, known_corners));
+                }
+            }
+        }
+    }
+
+    work_queue
+}
+
+// =============================================================================
+// STAGE 2: PARALLEL SUBDIVISION & TRIANGLE EMISSION
+// =============================================================================
+
+/// Compute the world-space position of a cell corner.
+///
+/// # Arguments
+/// * `cell` - The cell ID
+/// * `corner_index` - Corner index (0-7)
+/// * `bounds_min` - World-space minimum bounds
+/// * `cell_size` - Size of a cell at the finest level
+/// * `max_depth` - Maximum refinement depth
+#[inline]
+fn corner_world_position(
+    cell: &CuboidId,
+    corner_index: usize,
+    bounds_min: (f64, f64, f64),
+    cell_size: f64,
+    max_depth: u8,
+) -> (f64, f64, f64) {
+    let (fx, fy, fz) = cell.to_finest_level(max_depth);
+    let (dx, dy, dz) = CORNER_OFFSETS[corner_index];
+
+    // Scale factor: how many finest-level cells does this cell span?
+    let scale = 1i32 << (max_depth - cell.depth);
+
+    (
+        bounds_min.0 + (fx + dx * scale) as f64 * cell_size,
+        bounds_min.1 + (fy + dy * scale) as f64 * cell_size,
+        bounds_min.2 + (fz + dz * scale) as f64 * cell_size,
+    )
+}
+
+/// Complete corner samples for a work queue entry.
+/// Only samples corners that are not already known.
+///
+/// Returns the completed corner states as a CornerMask.
+fn complete_corner_samples<F>(
+    entry: &mut WorkQueueEntry,
+    sampler: &F,
+    bounds_min: (f64, f64, f64),
+    cell_size: f64,
+    max_depth: u8,
+    stats: &SamplingStats,
+) -> CornerMask
+where
+    F: Fn(f64, f64, f64) -> f32,
+{
+    for corner_idx in 0..8 {
+        if entry.known_corners[corner_idx].is_none() {
+            let (x, y, z) = corner_world_position(
+                &entry.cuboid,
+                corner_idx,
+                bounds_min,
+                cell_size,
+                max_depth,
+            );
+            entry.known_corners[corner_idx] = Some(sample_is_inside(sampler, x, y, z, stats));
+        }
+    }
+    entry.to_corner_mask()
+}
+
+/// Subdivide a parent cell, sampling all child corners at once.
+///
+/// This function samples all 27 positions in the 3x3x3 grid of child corners,
+/// reusing the 8 parent corners that are already known. Then it determines
+/// which of the 8 children are mixed, and returns only those with all corners
+/// fully populated.
+///
+/// This is more efficient than sampling each child independently because:
+/// - Each position is sampled exactly once (siblings share 19 interior points)
+/// - Non-mixed children are filtered out before entering the work queue
+fn subdivide_and_filter_mixed<F>(
+    parent: &WorkQueueEntry,
+    sampler: &F,
+    bounds_min: (f64, f64, f64),
+    cell_size: f64,
+    max_depth: u8,
+    stats: &SamplingStats,
+) -> Vec<WorkQueueEntry>
+where
+    F: Fn(f64, f64, f64) -> f32,
+{
+    let children = parent.cuboid.subdivide();
+
+    // The children form a 2x2x2 grid. Their corners form a 3x3x3 grid.
+    // samples[iz][iy][ix] where ix, iy, iz ∈ {0, 1, 2}
+    //
+    // The parent's 8 corners map to the 8 "even" positions:
+    // - Parent corner 0 (0,0,0) -> samples[0][0][0]
+    // - Parent corner 1 (1,0,0) -> samples[0][0][2]
+    // - Parent corner 2 (0,1,0) -> samples[0][2][0]
+    // - Parent corner 3 (1,1,0) -> samples[0][2][2]
+    // - Parent corner 4 (0,0,1) -> samples[2][0][0]
+    // - Parent corner 5 (1,0,1) -> samples[2][0][2]
+    // - Parent corner 6 (0,1,1) -> samples[2][2][0]
+    // - Parent corner 7 (1,1,1) -> samples[2][2][2]
+
+    let mut samples = [[[false; 3]; 3]; 3];
+
+    // Copy parent corners to the appropriate positions
+    // Parent corner index = (z << 2) | (y << 1) | x maps to samples[z*2][y*2][x*2]
+    for parent_corner in 0..8 {
+        let px = parent_corner & 1;
+        let py = (parent_corner >> 1) & 1;
+        let pz = (parent_corner >> 2) & 1;
+        samples[pz * 2][py * 2][px * 2] = parent.known_corners[parent_corner]
+            .expect("Parent corners should all be known at subdivision time");
+    }
+
+    // Sample the 19 new positions (the "odd" positions in the 3x3x3 grid)
+    // These are: 12 edge midpoints + 6 face centers + 1 cell center
+    let (fx, fy, fz) = parent.cuboid.to_finest_level(max_depth);
+    let parent_scale = 1i32 << (max_depth - parent.cuboid.depth);
+    let child_scale = parent_scale / 2; // Scale for child cells
+
+    for iz in 0..3 {
+        for iy in 0..3 {
+            for ix in 0..3 {
+                // Skip even positions (already have parent corners)
+                if ix % 2 == 0 && iy % 2 == 0 && iz % 2 == 0 {
+                    continue;
+                }
+
+                // Position in finest-level units
+                let px = fx + ix as i32 * child_scale;
+                let py = fy + iy as i32 * child_scale;
+                let pz = fz + iz as i32 * child_scale;
+
+                let world_x = bounds_min.0 + px as f64 * cell_size;
+                let world_y = bounds_min.1 + py as f64 * cell_size;
+                let world_z = bounds_min.2 + pz as f64 * cell_size;
+
+                samples[iz][iy][ix] = sample_is_inside(sampler, world_x, world_y, world_z, stats);
+            }
+        }
+    }
+
+    // Now extract corners for each child and filter for mixed ones
+    let mut result = Vec::with_capacity(8);
+
+    for (child_idx, child_cuboid) in children.iter().enumerate() {
+        // Child index = (cz << 2) | (cy << 1) | cx where cx, cy, cz ∈ {0, 1}
+        let cx = child_idx & 1;
+        let cy = (child_idx >> 1) & 1;
+        let cz = (child_idx >> 2) & 1;
+
+        // Extract the 8 corners for this child
+        let mut child_corners = [Some(false); 8];
+        for corner_idx in 0..8 {
+            // Corner offset within child
+            let dx = corner_idx & 1;
+            let dy = (corner_idx >> 1) & 1;
+            let dz = (corner_idx >> 2) & 1;
+
+            // Position in the 3x3x3 samples grid
+            let sx = cx + dx;
+            let sy = cy + dy;
+            let sz = cz + dz;
+
+            child_corners[corner_idx] = Some(samples[sz][sy][sx]);
+        }
+
+        // Check if this child is mixed
+        let mask = CornerMask::from_bools([
+            child_corners[0].unwrap(),
+            child_corners[1].unwrap(),
+            child_corners[2].unwrap(),
+            child_corners[3].unwrap(),
+            child_corners[4].unwrap(),
+            child_corners[5].unwrap(),
+            child_corners[6].unwrap(),
+            child_corners[7].unwrap(),
+        ]);
+
+        if mask.is_mixed() {
+            result.push(WorkQueueEntry::with_corners(*child_cuboid, child_corners));
+        }
+    }
+
+    result
+}
+
+/// Neighbor direction to shared corner mapping.
+/// When we have a cell and want to add its neighbor in direction (dx, dy, dz),
+/// we can propagate 4 corner samples that are shared between them.
+///
+/// Returns: [(our_corner, neighbor_corner); 4] pairs
+fn shared_corners_with_neighbor(dx: i32, dy: i32, dz: i32) -> [(usize, usize); 4] {
+    match (dx, dy, dz) {
+        // -X neighbor: our corners 0,2,4,6 are their corners 1,3,5,7
+        (-1, 0, 0) => [(0, 1), (2, 3), (4, 5), (6, 7)],
+        // +X neighbor: our corners 1,3,5,7 are their corners 0,2,4,6
+        (1, 0, 0) => [(1, 0), (3, 2), (5, 4), (7, 6)],
+        // -Y neighbor: our corners 0,1,4,5 are their corners 2,3,6,7
+        (0, -1, 0) => [(0, 2), (1, 3), (4, 6), (5, 7)],
+        // +Y neighbor: our corners 2,3,6,7 are their corners 0,1,4,5
+        (0, 1, 0) => [(2, 0), (3, 1), (6, 4), (7, 5)],
+        // -Z neighbor: our corners 0,1,2,3 are their corners 4,5,6,7
+        (0, 0, -1) => [(0, 4), (1, 5), (2, 6), (3, 7)],
+        // +Z neighbor: our corners 4,5,6,7 are their corners 0,1,2,3
+        (0, 0, 1) => [(4, 0), (5, 1), (6, 2), (7, 3)],
+        _ => panic!("Invalid neighbor direction: ({}, {}, {})", dx, dy, dz),
+    }
+}
+
+/// Create a work queue entry for a neighbor cell, propagating shared corners.
+fn create_neighbor_entry(
+    current: &WorkQueueEntry,
+    dx: i32,
+    dy: i32,
+    dz: i32,
+    max_cells: i32,
+) -> Option<WorkQueueEntry> {
+    let neighbor_cuboid = current.cuboid.neighbor(dx, dy, dz, max_cells)?;
+    let mut neighbor = WorkQueueEntry::new(neighbor_cuboid);
+
+    // Propagate shared corners
+    for (our_corner, their_corner) in shared_corners_with_neighbor(dx, dy, dz) {
+        neighbor.known_corners[their_corner] = current.known_corners[our_corner];
+    }
+
+    Some(neighbor)
+}
+
+/// Check if the shared face with a neighbor is mixed (has surface crossing).
+///
+/// If the 4 shared corners have mixed states (some inside, some outside),
+/// the face definitely crosses the surface, and the neighbor is guaranteed
+/// to be mixed. If all 4 shared corners are the same state, the face doesn't
+/// cross the surface, and we don't need to explore this neighbor from this
+/// direction (if it's mixed, another neighbor with a mixed shared face will
+/// discover it).
+///
+/// Returns true if the shared face is mixed (should explore this neighbor).
+fn shared_face_is_mixed(current_corners: &[Option<bool>; 8], dx: i32, dy: i32, dz: i32) -> bool {
+    let shared = shared_corners_with_neighbor(dx, dy, dz);
+
+    // Get the states of our shared corners
+    let mut has_inside = false;
+    let mut has_outside = false;
+
+    for (our_corner, _) in shared {
+        match current_corners[our_corner] {
+            Some(true) => has_inside = true,
+            Some(false) => has_outside = true,
+            None => {
+                // Unknown corner - be conservative and explore
+                return true;
+            }
+        }
+        // Early exit if we've found both states
+        if has_inside && has_outside {
+            return true;
+        }
+    }
+
+    // Face is mixed only if we have both inside and outside corners
+    has_inside && has_outside
+}
+
+/// Emit triangles for a cell at maximum depth using the Marching Cubes lookup table.
+fn emit_triangles_for_cell(
+    cell: &CuboidId,
+    corner_mask: CornerMask,
+    max_depth: u8,
+    triangles: &mut Vec<SparseTriangle>,
+    stats: &SamplingStats,
+) {
+    let tri_config = &MC_TRI_TABLE[corner_mask.0 as usize];
+
+    let mut i = 0;
+    while i < 16 && tri_config[i] >= 0 {
+        let e0 = tri_config[i] as usize;
+        let e1 = tri_config[i + 1] as usize;
+        let e2 = tri_config[i + 2] as usize;
+
+        let edge_id_0 = cell.edge_id(e0, max_depth);
+        let edge_id_1 = cell.edge_id(e1, max_depth);
+        let edge_id_2 = cell.edge_id(e2, max_depth);
+
+        triangles.push(SparseTriangle::new(edge_id_0, edge_id_1, edge_id_2));
+        stats.triangles_emitted.fetch_add(1, Ordering::Relaxed);
+
+        i += 3;
+    }
+}
+
+/// Stage 2: Parallel Subdivision & Triangle Emission
+///
+/// Processes the work queue from Stage 1, recursively subdividing mixed cells
+/// until reaching max_depth, then emitting triangles using the MC lookup table.
+///
+/// # Algorithm
+/// 1. Process each work queue entry
+/// 2. Complete corner samples (only sample unknown corners)
+/// 3. If mixed and depth < max_depth: subdivide into 8 children
+/// 4. If mixed and depth == max_depth: emit triangles, expand to neighbors
+/// 5. Use deduplication set to avoid processing same cell twice
+///
+/// # Returns
+/// Vector of SparseTriangles with EdgeId-based vertex references
+fn stage2_subdivision_and_emission<F>(
+    initial_queue: Vec<WorkQueueEntry>,
+    sampler: &F,
+    bounds_min: (f64, f64, f64),
+    cell_size: f64,
+    config: &AdaptiveMeshConfig2,
+    stats: &SamplingStats,
+) -> Vec<SparseTriangle>
+where
+    F: Fn(f64, f64, f64) -> f32 + Send + Sync,
+{
+    let max_depth = config.max_depth as u8;
+    let base_res = config.base_resolution as i32;
+
+    // Deduplication set: tracks CuboidIds we've already processed or queued
+    let visited: DashSet<CuboidId> = DashSet::new();
+
+    // Output triangles
+    let mut triangles: Vec<SparseTriangle> = Vec::new();
+
+    // Work queue (using VecDeque for efficient pop_front)
+    let mut work_queue: std::collections::VecDeque<WorkQueueEntry> =
+        initial_queue.into_iter().collect();
+
+    // Mark initial entries as visited
+    for entry in work_queue.iter() {
+        visited.insert(entry.cuboid);
+    }
+
+    while let Some(mut entry) = work_queue.pop_front() {
+        stats.cuboids_processed.fetch_add(1, Ordering::Relaxed);
+
+        // Complete corner samples
+        let corner_mask = complete_corner_samples(
+            &mut entry,
+            sampler,
+            bounds_min,
+            cell_size,
+            max_depth,
+            stats,
+        );
+
+        // Skip if not mixed (all inside or all outside)
+        if !corner_mask.is_mixed() {
+            continue;
+        }
+
+        let current_depth = entry.cuboid.depth;
+
+        if current_depth < max_depth {
+            // Subdivide and get only mixed children (with all corners sampled)
+            let mixed_children = subdivide_and_filter_mixed(
+                &entry,
+                sampler,
+                bounds_min,
+                cell_size,
+                max_depth,
+                stats,
+            );
+
+            for child in mixed_children {
+                // Dedup check (child might have been queued from a different path)
+                if visited.insert(child.cuboid) {
+                    work_queue.push_back(child);
+                }
+            }
+        } else {
+            // At max depth: emit triangles and expand frontier
+            emit_triangles_for_cell(
+                &entry.cuboid,
+                corner_mask,
+                max_depth,
+                &mut triangles,
+                stats,
+            );
+
+            // Expand to neighbors (frontier expansion)
+            // Number of cells at this depth level
+            let cells_at_depth = base_res * (1i32 << current_depth);
+
+            // Check all 6 face neighbors
+            const NEIGHBOR_DIRS: [(i32, i32, i32); 6] = [
+                (-1, 0, 0), (1, 0, 0),
+                (0, -1, 0), (0, 1, 0),
+                (0, 0, -1), (0, 0, 1),
+            ];
+
+            for (dx, dy, dz) in NEIGHBOR_DIRS {
+                // Only explore neighbors where the shared face is mixed
+                if !shared_face_is_mixed(&entry.known_corners, dx, dy, dz) {
+                    continue;
+                }
+
+                // Create neighbor entry with propagated corners
+                if let Some(neighbor) = create_neighbor_entry(&entry, dx, dy, dz, cells_at_depth) {
+                    // Only add if not already visited
+                    if visited.insert(neighbor.cuboid) {
+                        work_queue.push_back(neighbor);
+                    }
+                }
+            }
+        }
+    }
+
+    triangles
+}
+
+// =============================================================================
+// STAGE 3: TOPOLOGY FINALIZATION
+// =============================================================================
+
+/// Intermediate result from Stage 3 before vertex refinement.
+/// Contains indexed mesh with accumulated (non-normalized) face normals.
+pub struct Stage3Result {
+    /// Vertex positions (edge midpoints, not yet refined)
+    pub vertices: Vec<(f64, f64, f64)>,
+    /// Accumulated face normals per vertex (not yet normalized)
+    pub accumulated_normals: Vec<(f64, f64, f64)>,
+    /// Triangle indices (groups of 3)
+    pub indices: Vec<u32>,
+    /// Mapping from EdgeId to vertex index (for debugging/verification)
+    pub edge_to_vertex: std::collections::HashMap<EdgeId, u32>,
+}
+
+/// Compute the face normal for a triangle (not normalized).
+/// Returns the cross product of two edges, with magnitude proportional to area.
+fn compute_face_normal(v0: (f64, f64, f64), v1: (f64, f64, f64), v2: (f64, f64, f64)) -> (f64, f64, f64) {
+    // Edge vectors
+    let e1 = (v1.0 - v0.0, v1.1 - v0.1, v1.2 - v0.2);
+    let e2 = (v2.0 - v0.0, v2.1 - v0.1, v2.2 - v0.2);
+
+    // Cross product
+    (
+        e1.1 * e2.2 - e1.2 * e2.1,
+        e1.2 * e2.0 - e1.0 * e2.2,
+        e1.0 * e2.1 - e1.1 * e2.0,
+    )
+}
+
+/// Stage 3: Topology Finalization
+///
+/// Converts sparse EdgeId-based triangles to an indexed mesh with proper
+/// vertex indices and accumulated face normals.
+///
+/// # Algorithm
+/// 1. Collect all unique EdgeIds and assign monotonic vertex indices
+/// 2. Compute initial vertex positions from edge midpoints
+/// 3. Rewrite triangle indices from EdgeIds to vertex indices
+/// 4. Compute and accumulate face normals per vertex
+fn stage3_topology_finalization(
+    sparse_triangles: Vec<SparseTriangle>,
+    bounds_min: (f64, f64, f64),
+    cell_size: f64,
+) -> Stage3Result {
+    use std::collections::HashMap;
+
+    // Step 1: Collect unique EdgeIds and assign monotonic indices
+    let mut edge_to_vertex: HashMap<EdgeId, u32> = HashMap::new();
+    let mut next_vertex_idx = 0u32;
+
+    for tri in &sparse_triangles {
+        for edge_id in &tri.vertices {
+            edge_to_vertex.entry(*edge_id).or_insert_with(|| {
+                let idx = next_vertex_idx;
+                next_vertex_idx += 1;
+                idx
+            });
+        }
+    }
+
+    let vertex_count = next_vertex_idx as usize;
+
+    // Step 2: Compute initial vertex positions from edge midpoints
+    let mut vertices: Vec<(f64, f64, f64)> = vec![(0.0, 0.0, 0.0); vertex_count];
+
+    for (edge_id, &vertex_idx) in &edge_to_vertex {
+        let pos = edge_id.midpoint_world_pos(bounds_min, cell_size);
+        vertices[vertex_idx as usize] = pos;
+    }
+
+    // Step 3: Rewrite triangle indices
+    let mut indices: Vec<u32> = Vec::with_capacity(sparse_triangles.len() * 3);
+
+    for tri in &sparse_triangles {
+        indices.push(edge_to_vertex[&tri.vertices[0]]);
+        indices.push(edge_to_vertex[&tri.vertices[1]]);
+        indices.push(edge_to_vertex[&tri.vertices[2]]);
+    }
+
+    // Step 4: Compute and accumulate face normals per vertex
+    let mut accumulated_normals: Vec<(f64, f64, f64)> = vec![(0.0, 0.0, 0.0); vertex_count];
+
+    for tri_idx in 0..(indices.len() / 3) {
+        let i0 = indices[tri_idx * 3] as usize;
+        let i1 = indices[tri_idx * 3 + 1] as usize;
+        let i2 = indices[tri_idx * 3 + 2] as usize;
+
+        let v0 = vertices[i0];
+        let v1 = vertices[i1];
+        let v2 = vertices[i2];
+
+        let face_normal = compute_face_normal(v0, v1, v2);
+
+        // Accumulate to each vertex (area-weighted by virtue of unnormalized cross product)
+        accumulated_normals[i0].0 += face_normal.0;
+        accumulated_normals[i0].1 += face_normal.1;
+        accumulated_normals[i0].2 += face_normal.2;
+
+        accumulated_normals[i1].0 += face_normal.0;
+        accumulated_normals[i1].1 += face_normal.1;
+        accumulated_normals[i1].2 += face_normal.2;
+
+        accumulated_normals[i2].0 += face_normal.0;
+        accumulated_normals[i2].1 += face_normal.1;
+        accumulated_normals[i2].2 += face_normal.2;
+    }
+
+    Stage3Result {
+        vertices,
+        accumulated_normals,
+        indices,
+        edge_to_vertex,
+    }
+}
+
+/// Normalize a vector, returning (0,1,0) if the vector is too small.
+fn normalize_or_default(v: (f64, f64, f64)) -> (f32, f32, f32) {
+    let len_sq = v.0 * v.0 + v.1 * v.1 + v.2 * v.2;
+    if len_sq > 1e-12 {
+        let inv_len = 1.0 / len_sq.sqrt();
+        (
+            (v.0 * inv_len) as f32,
+            (v.1 * inv_len) as f32,
+            (v.2 * inv_len) as f32,
+        )
+    } else {
+        (0.0, 1.0, 0.0) // Default up vector
+    }
+}
+
+/// Convert Stage3Result to final IndexedMesh2 (without refinement).
+/// Normalizes the accumulated normals and converts to f32.
+#[allow(dead_code)]
+fn stage3_to_indexed_mesh(result: Stage3Result) -> IndexedMesh2 {
+    let vertices: Vec<(f32, f32, f32)> = result
+        .vertices
+        .iter()
+        .map(|v| (v.0 as f32, v.1 as f32, v.2 as f32))
+        .collect();
+
+    let normals: Vec<(f32, f32, f32)> = result
+        .accumulated_normals
+        .iter()
+        .map(|n| normalize_or_default(*n))
+        .collect();
+
+    IndexedMesh2 {
+        vertices,
+        normals,
+        indices: result.indices,
+    }
+}
+
+// =============================================================================
+// STAGE 4: VERTEX REFINEMENT & NORMAL ESTIMATION
+// =============================================================================
+
+/// Refine a single vertex position using binary search along the accumulated normal.
+///
+/// # Algorithm
+/// 1. Start at edge midpoint position
+/// 2. Use accumulated normal as search direction
+/// 3. Search ±search_distance along normal for surface crossing
+/// 4. Binary search to refine the crossing position
+///
+/// # Returns
+/// The refined position, or the original position if refinement fails
+fn refine_vertex_position<F>(
+    initial_pos: (f64, f64, f64),
+    search_direction: (f64, f64, f64),
+    search_distance: f64,
+    iterations: usize,
+    sampler: &F,
+    stats: &SamplingStats,
+) -> (f64, f64, f64)
+where
+    F: Fn(f64, f64, f64) -> f32,
+{
+    // If direction is too small, can't refine - return original
+    let dir_len_sq = search_direction.0 * search_direction.0
+        + search_direction.1 * search_direction.1
+        + search_direction.2 * search_direction.2;
+
+    if dir_len_sq < 1e-12 {
+        return initial_pos;
+    }
+
+    // Normalize direction
+    let inv_len = 1.0 / dir_len_sq.sqrt();
+    let dir = (
+        search_direction.0 * inv_len,
+        search_direction.1 * inv_len,
+        search_direction.2 * inv_len,
+    );
+
+    // Sample at the initial position to determine which side we're on
+    let initial_inside = sample_is_inside(sampler, initial_pos.0, initial_pos.1, initial_pos.2, stats);
+
+    // Compute positions at +distance and -distance along normal
+    let pos_plus = (
+        initial_pos.0 + dir.0 * search_distance,
+        initial_pos.1 + dir.1 * search_distance,
+        initial_pos.2 + dir.2 * search_distance,
+    );
+    let pos_minus = (
+        initial_pos.0 - dir.0 * search_distance,
+        initial_pos.1 - dir.1 * search_distance,
+        initial_pos.2 - dir.2 * search_distance,
+    );
+
+    let inside_plus = sample_is_inside(sampler, pos_plus.0, pos_plus.1, pos_plus.2, stats);
+    let inside_minus = sample_is_inside(sampler, pos_minus.0, pos_minus.1, pos_minus.2, stats);
+
+    // Determine which direction has a crossing
+    // We want to find an interval [a, b] where inside(a) != inside(b)
+    let (mut a, mut b, mut inside_a) = if initial_inside != inside_plus {
+        // Crossing between initial and +direction
+        (initial_pos, pos_plus, initial_inside)
+    } else if initial_inside != inside_minus {
+        // Crossing between initial and -direction
+        (initial_pos, pos_minus, initial_inside)
+    } else if inside_plus != inside_minus {
+        // Crossing between +direction and -direction (surface passed through)
+        (pos_minus, pos_plus, inside_minus)
+    } else {
+        // No crossing found - surface might be tangent or far away
+        // Keep original position
+        return initial_pos;
+    };
+
+    // Binary search to refine the crossing position
+    for _ in 0..iterations {
+        let mid = (
+            (a.0 + b.0) * 0.5,
+            (a.1 + b.1) * 0.5,
+            (a.2 + b.2) * 0.5,
+        );
+
+        let inside_mid = sample_is_inside(sampler, mid.0, mid.1, mid.2, stats);
+
+        if inside_mid == inside_a {
+            a = mid;
+            inside_a = inside_mid;
+        } else {
+            b = mid;
+        }
+    }
+
+    // Return midpoint of final interval
+    (
+        (a.0 + b.0) * 0.5,
+        (a.1 + b.1) * 0.5,
+        (a.2 + b.2) * 0.5,
+    )
+}
+
+/// Estimate the surface normal at a position using central differences.
+///
+/// Samples 6 points around the position (±epsilon in each axis) and
+/// computes the gradient direction, which is perpendicular to the surface.
+fn estimate_normal_at_position<F>(
+    pos: (f64, f64, f64),
+    epsilon: f64,
+    sampler: &F,
+    stats: &SamplingStats,
+) -> (f64, f64, f64)
+where
+    F: Fn(f64, f64, f64) -> f32,
+{
+    // Sample ±epsilon in each direction
+    // Note: We're not using an SDF, so we use is_inside as a proxy
+    // The gradient points from inside toward outside
+
+    let sample_x_plus = sampler(pos.0 + epsilon, pos.1, pos.2);
+    let sample_x_minus = sampler(pos.0 - epsilon, pos.1, pos.2);
+    let sample_y_plus = sampler(pos.0, pos.1 + epsilon, pos.2);
+    let sample_y_minus = sampler(pos.0, pos.1 - epsilon, pos.2);
+    let sample_z_plus = sampler(pos.0, pos.1, pos.2 + epsilon);
+    let sample_z_minus = sampler(pos.0, pos.1, pos.2 - epsilon);
+
+    stats.total_samples.fetch_add(6, Ordering::Relaxed);
+
+    // Gradient points from low density (outside) to high density (inside)
+    // We want normals pointing outward (from inside to outside), so negate
+    let grad = (
+        -((sample_x_plus - sample_x_minus) as f64),
+        -((sample_y_plus - sample_y_minus) as f64),
+        -((sample_z_plus - sample_z_minus) as f64),
+    );
+
+    grad
+}
+
+/// Stage 4: Vertex Refinement & Normal Estimation
+///
+/// Refines vertex positions using binary search along the accumulated normals,
+/// then optionally re-estimates normals at the refined positions.
+///
+/// # Algorithm
+/// 1. For each vertex, normalize the accumulated face normal
+/// 2. Binary search along that direction to find the surface crossing
+/// 3. If normal_sample_iterations > 0, re-estimate normal at refined position
+/// 4. Otherwise, keep the accumulated normal (normalized)
+fn stage4_vertex_refinement<F>(
+    stage3: Stage3Result,
+    sampler: &F,
+    cell_size: f64,
+    config: &AdaptiveMeshConfig2,
+    stats: &SamplingStats,
+) -> IndexedMesh2
+where
+    F: Fn(f64, f64, f64) -> f32,
+{
+    let vertex_count = stage3.vertices.len();
+
+    // Search distance: a fraction of the cell size
+    // Vertices are on edges, so searching ±cell_size should be sufficient
+    let search_distance = cell_size * 0.5;
+
+    // Epsilon for normal estimation
+    let normal_epsilon = cell_size * config.normal_epsilon_frac as f64;
+
+    let mut refined_vertices: Vec<(f32, f32, f32)> = Vec::with_capacity(vertex_count);
+    let mut refined_normals: Vec<(f32, f32, f32)> = Vec::with_capacity(vertex_count);
+
+    for i in 0..vertex_count {
+        let initial_pos = stage3.vertices[i];
+        let accumulated_normal = stage3.accumulated_normals[i];
+
+        // Refine vertex position
+        let refined_pos = if config.vertex_refinement_iterations > 0 {
+            refine_vertex_position(
+                initial_pos,
+                accumulated_normal,
+                search_distance,
+                config.vertex_refinement_iterations,
+                sampler,
+                stats,
+            )
+        } else {
+            initial_pos
+        };
+
+        // Estimate or normalize normal
+        let final_normal = if config.normal_sample_iterations > 0 {
+            // Re-estimate normal at refined position
+            let estimated = estimate_normal_at_position(
+                refined_pos,
+                normal_epsilon,
+                sampler,
+                stats,
+            );
+            normalize_or_default(estimated)
+        } else {
+            // Just normalize the accumulated normal
+            normalize_or_default(accumulated_normal)
+        };
+
+        refined_vertices.push((
+            refined_pos.0 as f32,
+            refined_pos.1 as f32,
+            refined_pos.2 as f32,
+        ));
+        refined_normals.push(final_normal);
+    }
+
+    IndexedMesh2 {
+        vertices: refined_vertices,
+        normals: refined_normals,
+        indices: stage3.indices,
+    }
+}
+
+// =============================================================================
+// MAIN ENTRY POINT
 // =============================================================================
 
 /// Main entry point for adaptive surface nets meshing.
-/// 
+///
 /// # Arguments
-/// * `sampler` - Function that returns true if point is inside the model
+/// * `sampler` - Function that returns > 0.0 if point is inside the model
 /// * `bounds_min` - Minimum corner of bounding box
-/// * `bounds_max` - Maximum corner of bounding box  
+/// * `bounds_max` - Maximum corner of bounding box
 /// * `config` - Algorithm configuration
 ///
 /// # Returns
 /// An indexed mesh with vertices, normals, and triangle indices
 pub fn adaptive_surface_nets_2<F>(
-    _sampler: F,
-    _bounds_min: (f32, f32, f32),
-    _bounds_max: (f32, f32, f32),
-    _config: &AdaptiveMeshConfig2,
+    sampler: F,
+    bounds_min: (f32, f32, f32),
+    bounds_max: (f32, f32, f32),
+    config: &AdaptiveMeshConfig2,
 ) -> IndexedMesh2
 where
     F: Fn(f64, f64, f64) -> f32 + Send + Sync,
 {
-    // TODO: Implement the algorithm
-    IndexedMesh2 {
-        vertices: Vec::new(),
-        normals: Vec::new(),
-        indices: Vec::new(),
-    }
+    let stats = SamplingStats::default();
+
+    // Convert bounds to f64 for internal calculations
+    let bounds_min_f64 = (
+        bounds_min.0 as f64,
+        bounds_min.1 as f64,
+        bounds_min.2 as f64,
+    );
+    let bounds_max_f64 = (
+        bounds_max.0 as f64,
+        bounds_max.1 as f64,
+        bounds_max.2 as f64,
+    );
+
+    // Calculate cell size at finest level
+    // Total cells at finest level = base_resolution * 2^max_depth
+    let finest_cells_per_axis = config.base_resolution * (1 << config.max_depth);
+    let cell_size = (bounds_max_f64.0 - bounds_min_f64.0) / finest_cells_per_axis as f64;
+
+    // Stage 1: Coarse grid discovery
+    let initial_work_queue = stage1_coarse_discovery(
+        &sampler,
+        bounds_min_f64,
+        bounds_max_f64,
+        config,
+        &stats,
+    );
+
+    // Stage 2: Subdivision and triangle emission
+    let sparse_triangles = stage2_subdivision_and_emission(
+        initial_work_queue,
+        &sampler,
+        bounds_min_f64,
+        cell_size,
+        config,
+        &stats,
+    );
+
+    // Stage 3: Topology finalization
+    let stage3_result = stage3_topology_finalization(
+        sparse_triangles,
+        bounds_min_f64,
+        cell_size,
+    );
+
+    // Stage 4: Vertex refinement & normal estimation
+    stage4_vertex_refinement(
+        stage3_result,
+        &sampler,
+        cell_size,
+        config,
+        &stats,
+    )
 }
 
 #[cfg(test)]
@@ -646,5 +1570,756 @@ mod tests {
         let config = AdaptiveMeshConfig2::default();
         assert_eq!(config.base_resolution, 8);
         assert_eq!(config.max_depth, 4);
+    }
+
+    // =========================================================================
+    // Stage 1 Tests
+    // =========================================================================
+
+    /// Helper: Unit sphere centered at origin (radius 1)
+    fn sphere_sampler(x: f64, y: f64, z: f64) -> f32 {
+        let r2 = x * x + y * y + z * z;
+        if r2 < 1.0 { 1.0 } else { 0.0 }
+    }
+
+    #[test]
+    fn test_stage1_sample_count() {
+        // With base_resolution=4, we should sample 5³ = 125 corner points
+        let config = AdaptiveMeshConfig2 {
+            base_resolution: 4,
+            ..Default::default()
+        };
+        let stats = SamplingStats::default();
+
+        let _ = stage1_coarse_discovery(
+            &sphere_sampler,
+            (-2.0, -2.0, -2.0),
+            (2.0, 2.0, 2.0),
+            &config,
+            &stats,
+        );
+
+        let expected_samples = 5 * 5 * 5; // (base_resolution + 1)³
+        assert_eq!(
+            stats.total_samples.load(Ordering::Relaxed),
+            expected_samples,
+            "Should sample exactly (base_resolution + 1)³ corner points"
+        );
+    }
+
+    #[test]
+    fn test_stage1_finds_mixed_cells() {
+        // Sphere of radius 1 in a [-2, 2]³ box with resolution 4
+        // Cell size = 4/4 = 1, so cells at the surface should be detected
+        let config = AdaptiveMeshConfig2 {
+            base_resolution: 4,
+            ..Default::default()
+        };
+        let stats = SamplingStats::default();
+
+        let work_queue = stage1_coarse_discovery(
+            &sphere_sampler,
+            (-2.0, -2.0, -2.0),
+            (2.0, 2.0, 2.0),
+            &config,
+            &stats,
+        );
+
+        // Should find some mixed cells (sphere surface crosses the grid)
+        assert!(
+            !work_queue.is_empty(),
+            "Should find mixed cells where sphere surface crosses grid"
+        );
+
+        // All returned entries should have all corners known
+        for entry in &work_queue {
+            assert!(
+                entry.all_corners_known(),
+                "All work queue entries should have all corners pre-sampled"
+            );
+
+            // The entry should be mixed
+            let mask = entry.to_corner_mask();
+            assert!(mask.is_mixed(), "All entries should be mixed cells");
+        }
+    }
+
+    #[test]
+    fn test_stage1_empty_for_fully_inside() {
+        // Tiny sphere that fits entirely within a single cell
+        // Box is [-1, 1]³, resolution 2, so cell size = 1
+        // Sphere radius 0.1 centered at (0.5, 0.5, 0.5) fits in one cell
+        let tiny_sphere = |x: f64, y: f64, z: f64| -> f32 {
+            let dx = x - 0.5;
+            let dy = y - 0.5;
+            let dz = z - 0.5;
+            if dx * dx + dy * dy + dz * dz < 0.01 { 1.0 } else { 0.0 }
+        };
+
+        let config = AdaptiveMeshConfig2 {
+            base_resolution: 2,
+            ..Default::default()
+        };
+        let stats = SamplingStats::default();
+
+        let work_queue = stage1_coarse_discovery(
+            &tiny_sphere,
+            (-1.0, -1.0, -1.0),
+            (1.0, 1.0, 1.0),
+            &config,
+            &stats,
+        );
+
+        // The sphere is so small that no coarse grid corner will hit it
+        // All cells should be fully outside, hence no mixed cells
+        assert!(
+            work_queue.is_empty(),
+            "Tiny sphere should not create mixed cells at coarse resolution"
+        );
+    }
+
+    #[test]
+    fn test_stage1_corner_ordering() {
+        // Verify that corner ordering matches CORNER_OFFSETS
+        // Create a sampler that returns different values based on position
+        // to verify the corners are correctly indexed
+        let config = AdaptiveMeshConfig2 {
+            base_resolution: 1, // Single cell
+            ..Default::default()
+        };
+        let stats = SamplingStats::default();
+
+        // Sampler: inside only if x > 0.5 (so corners 1, 3, 5, 7 are inside)
+        let half_space = |x: f64, _y: f64, _z: f64| -> f32 {
+            if x > 0.5 { 1.0 } else { 0.0 }
+        };
+
+        let work_queue = stage1_coarse_discovery(
+            &half_space,
+            (0.0, 0.0, 0.0),
+            (1.0, 1.0, 1.0),
+            &config,
+            &stats,
+        );
+
+        assert_eq!(work_queue.len(), 1, "Should find exactly one mixed cell");
+
+        let entry = &work_queue[0];
+        let corners = entry.known_corners;
+
+        // Corners with x=1 should be inside (corners 1, 3, 5, 7)
+        assert_eq!(corners[0], Some(false), "Corner 0 (0,0,0) should be outside");
+        assert_eq!(corners[1], Some(true), "Corner 1 (1,0,0) should be inside");
+        assert_eq!(corners[2], Some(false), "Corner 2 (0,1,0) should be outside");
+        assert_eq!(corners[3], Some(true), "Corner 3 (1,1,0) should be inside");
+        assert_eq!(corners[4], Some(false), "Corner 4 (0,0,1) should be outside");
+        assert_eq!(corners[5], Some(true), "Corner 5 (1,0,1) should be inside");
+        assert_eq!(corners[6], Some(false), "Corner 6 (0,1,1) should be outside");
+        assert_eq!(corners[7], Some(true), "Corner 7 (1,1,1) should be inside");
+    }
+
+    #[test]
+    fn test_cuboid_id_to_finest_level() {
+        // At depth 0 with max_depth 3, scale = 2^3 = 8
+        let cuboid = CuboidId::new(1, 2, 3, 0);
+        let (fx, fy, fz) = cuboid.to_finest_level(3);
+        assert_eq!((fx, fy, fz), (8, 16, 24));
+
+        // At depth 2 with max_depth 3, scale = 2^1 = 2
+        let cuboid = CuboidId::new(5, 6, 7, 2);
+        let (fx, fy, fz) = cuboid.to_finest_level(3);
+        assert_eq!((fx, fy, fz), (10, 12, 14));
+
+        // At max depth, scale = 1
+        let cuboid = CuboidId::new(5, 6, 7, 3);
+        let (fx, fy, fz) = cuboid.to_finest_level(3);
+        assert_eq!((fx, fy, fz), (5, 6, 7));
+    }
+
+    #[test]
+    fn test_cuboid_subdivide() {
+        let parent = CuboidId::new(1, 2, 3, 0);
+        let children = parent.subdivide();
+
+        // Check that children are at depth 1
+        for child in &children {
+            assert_eq!(child.depth, 1);
+        }
+
+        // Check child positions follow canonical corner ordering
+        assert_eq!((children[0].x, children[0].y, children[0].z), (2, 4, 6)); // (0,0,0)
+        assert_eq!((children[1].x, children[1].y, children[1].z), (3, 4, 6)); // (1,0,0)
+        assert_eq!((children[2].x, children[2].y, children[2].z), (2, 5, 6)); // (0,1,0)
+        assert_eq!((children[3].x, children[3].y, children[3].z), (3, 5, 6)); // (1,1,0)
+        assert_eq!((children[4].x, children[4].y, children[4].z), (2, 4, 7)); // (0,0,1)
+        assert_eq!((children[5].x, children[5].y, children[5].z), (3, 4, 7)); // (1,0,1)
+        assert_eq!((children[6].x, children[6].y, children[6].z), (2, 5, 7)); // (0,1,1)
+        assert_eq!((children[7].x, children[7].y, children[7].z), (3, 5, 7)); // (1,1,1)
+    }
+
+    #[test]
+    fn test_edge_id_computation() {
+        // Test that edge IDs are computed correctly from cell coordinates
+        let cell = CuboidId::new(1, 2, 3, 2); // At depth 2
+        let max_depth = 4;
+
+        // At depth 2 with max_depth 4, scale = 2^2 = 4
+        // So finest-level coords are (4, 8, 12)
+
+        // Edge 0: X-axis at (0,0,0) offset -> (4, 8, 12, axis=0)
+        let e0 = cell.edge_id(0, max_depth);
+        assert_eq!((e0.x, e0.y, e0.z, e0.axis), (4, 8, 12, 0));
+
+        // Edge 5: Y-axis at (1,0,0) offset -> (5, 8, 12, axis=1)
+        let e5 = cell.edge_id(5, max_depth);
+        assert_eq!((e5.x, e5.y, e5.z, e5.axis), (5, 8, 12, 1));
+
+        // Edge 11: Z-axis at (1,1,0) offset -> (5, 9, 12, axis=2)
+        let e11 = cell.edge_id(11, max_depth);
+        assert_eq!((e11.x, e11.y, e11.z, e11.axis), (5, 9, 12, 2));
+    }
+
+    // =========================================================================
+    // Stage 2 Tests
+    // =========================================================================
+
+    #[test]
+    fn test_stage2_emits_triangles_for_sphere() {
+        // Unit sphere in [-2, 2]³ box
+        let config = AdaptiveMeshConfig2 {
+            base_resolution: 4,
+            max_depth: 2,
+            ..Default::default()
+        };
+        let stats = SamplingStats::default();
+        let bounds_min = (-2.0, -2.0, -2.0);
+        let bounds_max = (2.0, 2.0, 2.0);
+
+        // Calculate cell size at finest level
+        let finest_cells = config.base_resolution * (1 << config.max_depth);
+        let cell_size = (bounds_max.0 - bounds_min.0) / finest_cells as f64;
+
+        let initial_queue = stage1_coarse_discovery(
+            &sphere_sampler,
+            bounds_min,
+            bounds_max,
+            &config,
+            &stats,
+        );
+
+        let triangles = stage2_subdivision_and_emission(
+            initial_queue,
+            &sphere_sampler,
+            bounds_min,
+            cell_size,
+            &config,
+            &stats,
+        );
+
+        // Should produce triangles for a sphere
+        assert!(
+            !triangles.is_empty(),
+            "Stage 2 should emit triangles for sphere surface"
+        );
+
+        // A sphere should produce a reasonable number of triangles
+        // At resolution 4 * 2^2 = 16 cells per axis, we expect ~hundreds of triangles
+        assert!(
+            triangles.len() > 10,
+            "Should have more than 10 triangles, got {}",
+            triangles.len()
+        );
+    }
+
+    #[test]
+    fn test_stage2_shared_corners_neighbor_propagation() {
+        // Test that shared_corners_with_neighbor returns correct mappings
+        // +X neighbor: our corners 1,3,5,7 -> their corners 0,2,4,6
+        let mapping = shared_corners_with_neighbor(1, 0, 0);
+        assert_eq!(mapping, [(1, 0), (3, 2), (5, 4), (7, 6)]);
+
+        // -X neighbor: our corners 0,2,4,6 -> their corners 1,3,5,7
+        let mapping = shared_corners_with_neighbor(-1, 0, 0);
+        assert_eq!(mapping, [(0, 1), (2, 3), (4, 5), (6, 7)]);
+
+        // +Y neighbor: our corners 2,3,6,7 -> their corners 0,1,4,5
+        let mapping = shared_corners_with_neighbor(0, 1, 0);
+        assert_eq!(mapping, [(2, 0), (3, 1), (6, 4), (7, 5)]);
+
+        // +Z neighbor: our corners 4,5,6,7 -> their corners 0,1,2,3
+        let mapping = shared_corners_with_neighbor(0, 0, 1);
+        assert_eq!(mapping, [(4, 0), (5, 1), (6, 2), (7, 3)]);
+    }
+
+    #[test]
+    fn test_shared_face_is_mixed() {
+        // All corners known, +X face is mixed (corners 1,3,5,7 have different states)
+        let corners_mixed_x = [
+            Some(true),  // 0
+            Some(true),  // 1 - +X face
+            Some(true),  // 2
+            Some(false), // 3 - +X face (different!)
+            Some(true),  // 4
+            Some(true),  // 5 - +X face
+            Some(true),  // 6
+            Some(true),  // 7 - +X face
+        ];
+        assert!(
+            shared_face_is_mixed(&corners_mixed_x, 1, 0, 0),
+            "+X face should be mixed (corner 3 differs)"
+        );
+
+        // All corners same state on +X face
+        let corners_uniform_x = [
+            Some(false), // 0
+            Some(true),  // 1 - +X face
+            Some(false), // 2
+            Some(true),  // 3 - +X face
+            Some(false), // 4
+            Some(true),  // 5 - +X face
+            Some(false), // 6
+            Some(true),  // 7 - +X face
+        ];
+        assert!(
+            !shared_face_is_mixed(&corners_uniform_x, 1, 0, 0),
+            "+X face should NOT be mixed (all +X corners are true)"
+        );
+
+        // -Z face: corners 0,1,2,3
+        let corners_mixed_neg_z = [
+            Some(true),  // 0 - -Z face
+            Some(false), // 1 - -Z face (different!)
+            Some(true),  // 2 - -Z face
+            Some(true),  // 3 - -Z face
+            Some(true),  // 4
+            Some(true),  // 5
+            Some(true),  // 6
+            Some(true),  // 7
+        ];
+        assert!(
+            shared_face_is_mixed(&corners_mixed_neg_z, 0, 0, -1),
+            "-Z face should be mixed"
+        );
+
+        // Unknown corner should be conservative (return true)
+        let corners_with_unknown = [
+            Some(true),
+            None, // unknown
+            Some(true),
+            Some(true),
+            Some(true),
+            Some(true),
+            Some(true),
+            Some(true),
+        ];
+        assert!(
+            shared_face_is_mixed(&corners_with_unknown, 1, 0, 0),
+            "Unknown corner should trigger conservative exploration"
+        );
+    }
+
+    #[test]
+    fn test_subdivide_and_filter_mixed() {
+        // Test that subdivide_and_filter_mixed correctly:
+        // 1. Samples all 27 child corner positions
+        // 2. Returns only mixed children
+        // 3. All returned children have all corners filled in
+
+        // Create a parent with mixed corners (half inside, half outside based on X)
+        let parent_cuboid = CuboidId::new(0, 0, 0, 0);
+        let parent_corners = [
+            Some(false), // corner 0 (0,0,0) - x=0, outside
+            Some(true),  // corner 1 (1,0,0) - x=1, inside
+            Some(false), // corner 2 (0,1,0) - x=0, outside
+            Some(true),  // corner 3 (1,1,0) - x=1, inside
+            Some(false), // corner 4 (0,0,1) - x=0, outside
+            Some(true),  // corner 5 (1,0,1) - x=1, inside
+            Some(false), // corner 6 (0,1,1) - x=0, outside
+            Some(true),  // corner 7 (1,1,1) - x=1, inside
+        ];
+        let parent = WorkQueueEntry::with_corners(parent_cuboid, parent_corners);
+
+        // Sampler: inside if x > 0.25 (in [0,1] bounds)
+        // This means the -X children (cx=0) will have surface crossing them
+        // and the +X children (cx=1) will be fully inside
+        let half_space = |x: f64, _y: f64, _z: f64| -> f32 {
+            if x > 0.25 { 1.0 } else { 0.0 }
+        };
+
+        let stats = SamplingStats::default();
+        let bounds_min = (0.0, 0.0, 0.0);
+        let cell_size = 0.5; // Finest cell size (at max_depth=1, parent spans 2 finest cells)
+        let max_depth = 1;
+
+        let mixed_children = subdivide_and_filter_mixed(
+            &parent,
+            &half_space,
+            bounds_min,
+            cell_size,
+            max_depth,
+            &stats,
+        );
+
+        // All returned children should have all corners known
+        for child in &mixed_children {
+            assert!(
+                child.all_corners_known(),
+                "All returned children should have all corners filled in"
+            );
+
+            // And they should be mixed
+            let mask = child.to_corner_mask();
+            assert!(mask.is_mixed(), "All returned children should be mixed");
+        }
+
+        // We should have sampled exactly 19 new positions (27 - 8 parent corners)
+        assert_eq!(
+            stats.total_samples.load(Ordering::Relaxed),
+            19,
+            "Should sample exactly 19 new positions (27 total - 8 reused parent corners)"
+        );
+    }
+
+    #[test]
+    fn test_stage2_edge_welding() {
+        // Two adjacent cells should produce the same EdgeId for their shared edge
+        let cell_a = CuboidId::new(0, 0, 0, 2);
+        let cell_b = CuboidId::new(1, 0, 0, 2); // +X neighbor
+        let max_depth = 2;
+
+        // Cell A's edge 5 (Y-axis at +X face) should equal cell B's edge 4 (Y-axis at origin)
+        // Edge 5: corners 1-3, offset (1, 0, 0)
+        // Edge 4: corners 0-2, offset (0, 0, 0)
+        // For cell A at (0,0,0): edge 5 is at (0+1, 0+0, 0+0) = (1, 0, 0)
+        // For cell B at (1,0,0): edge 4 is at (1+0, 0+0, 0+0) = (1, 0, 0)
+
+        let edge_a = cell_a.edge_id(5, max_depth);
+        let edge_b = cell_b.edge_id(4, max_depth);
+
+        assert_eq!(
+            edge_a, edge_b,
+            "Adjacent cells should produce identical EdgeIds for shared edges"
+        );
+    }
+
+    #[test]
+    fn test_stage2_triangle_count_consistency() {
+        // Run twice with same input, should get same triangle count
+        let config = AdaptiveMeshConfig2 {
+            base_resolution: 2,
+            max_depth: 2,
+            ..Default::default()
+        };
+
+        let bounds_min = (-1.5, -1.5, -1.5);
+        let bounds_max = (1.5, 1.5, 1.5);
+        let finest_cells = config.base_resolution * (1 << config.max_depth);
+        let cell_size = (bounds_max.0 - bounds_min.0) / finest_cells as f64;
+
+        let stats1 = SamplingStats::default();
+        let initial_queue1 = stage1_coarse_discovery(
+            &sphere_sampler,
+            bounds_min,
+            bounds_max,
+            &config,
+            &stats1,
+        );
+        let triangles1 = stage2_subdivision_and_emission(
+            initial_queue1,
+            &sphere_sampler,
+            bounds_min,
+            cell_size,
+            &config,
+            &stats1,
+        );
+
+        let stats2 = SamplingStats::default();
+        let initial_queue2 = stage1_coarse_discovery(
+            &sphere_sampler,
+            bounds_min,
+            bounds_max,
+            &config,
+            &stats2,
+        );
+        let triangles2 = stage2_subdivision_and_emission(
+            initial_queue2,
+            &sphere_sampler,
+            bounds_min,
+            cell_size,
+            &config,
+            &stats2,
+        );
+
+        assert_eq!(
+            triangles1.len(),
+            triangles2.len(),
+            "Repeated runs should produce same triangle count"
+        );
+    }
+
+    #[test]
+    fn test_stage2_no_triangles_for_empty_space() {
+        // Sampler that returns nothing inside
+        let empty_sampler = |_x: f64, _y: f64, _z: f64| -> f32 { 0.0 };
+
+        let config = AdaptiveMeshConfig2 {
+            base_resolution: 4,
+            max_depth: 2,
+            ..Default::default()
+        };
+        let stats = SamplingStats::default();
+        let bounds_min = (-1.0, -1.0, -1.0);
+        let bounds_max = (1.0, 1.0, 1.0);
+        let finest_cells = config.base_resolution * (1 << config.max_depth);
+        let cell_size = (bounds_max.0 - bounds_min.0) / finest_cells as f64;
+
+        let initial_queue = stage1_coarse_discovery(
+            &empty_sampler,
+            bounds_min,
+            bounds_max,
+            &config,
+            &stats,
+        );
+
+        // Empty space should produce no mixed cells
+        assert!(initial_queue.is_empty(), "Empty space should have no mixed cells");
+
+        let triangles = stage2_subdivision_and_emission(
+            initial_queue,
+            &empty_sampler,
+            bounds_min,
+            cell_size,
+            &config,
+            &stats,
+        );
+
+        assert!(triangles.is_empty(), "Empty space should produce no triangles");
+    }
+
+    #[test]
+    fn test_corner_world_position() {
+        let cell = CuboidId::new(0, 0, 0, 0);
+        let bounds_min = (0.0, 0.0, 0.0);
+        let cell_size = 1.0;
+        let max_depth = 2;
+
+        // At depth 0, max_depth 2: cell spans 4 finest-level cells
+        // Corner 0 (0,0,0) should be at (0, 0, 0)
+        let c0 = corner_world_position(&cell, 0, bounds_min, cell_size, max_depth);
+        assert_eq!(c0, (0.0, 0.0, 0.0));
+
+        // Corner 7 (1,1,1) should be at (4, 4, 4) since scale = 2^2 = 4
+        let c7 = corner_world_position(&cell, 7, bounds_min, cell_size, max_depth);
+        assert_eq!(c7, (4.0, 4.0, 4.0));
+
+        // A cell at depth 2 (finest level) should have corners 1 unit apart
+        let fine_cell = CuboidId::new(2, 3, 4, 2);
+        let c0_fine = corner_world_position(&fine_cell, 0, bounds_min, cell_size, max_depth);
+        let c7_fine = corner_world_position(&fine_cell, 7, bounds_min, cell_size, max_depth);
+        assert_eq!(c0_fine, (2.0, 3.0, 4.0));
+        assert_eq!(c7_fine, (3.0, 4.0, 5.0));
+    }
+
+    // =========================================================================
+    // Stage 4 Tests
+    // =========================================================================
+
+    #[test]
+    fn test_refine_vertex_position_finds_surface() {
+        // Simple half-space: inside if x < 0.3
+        let half_space = |x: f64, _y: f64, _z: f64| -> f32 {
+            if x < 0.3 { 1.0 } else { 0.0 }
+        };
+        let stats = SamplingStats::default();
+
+        // Start at x=0.5 (outside), search toward -x (normal points outward from inside)
+        // Surface is at x=0.3
+        let initial_pos = (0.5, 0.0, 0.0);
+        let search_dir = (-1.0, 0.0, 0.0); // Points toward inside
+        let search_distance = 0.5;
+        let iterations = 10;
+
+        let refined = refine_vertex_position(
+            initial_pos,
+            search_dir,
+            search_distance,
+            iterations,
+            &half_space,
+            &stats,
+        );
+
+        // Should be close to x=0.3
+        assert!(
+            (refined.0 - 0.3).abs() < 0.01,
+            "Refined x should be close to 0.3, got {}",
+            refined.0
+        );
+        assert_eq!(refined.1, 0.0, "Y should be unchanged");
+        assert_eq!(refined.2, 0.0, "Z should be unchanged");
+    }
+
+    #[test]
+    fn test_refine_vertex_position_no_crossing() {
+        // All outside
+        let all_outside = |_x: f64, _y: f64, _z: f64| -> f32 { 0.0 };
+        let stats = SamplingStats::default();
+
+        let initial_pos = (0.5, 0.5, 0.5);
+        let search_dir = (1.0, 0.0, 0.0);
+        let search_distance = 1.0;
+        let iterations = 5;
+
+        let refined = refine_vertex_position(
+            initial_pos,
+            search_dir,
+            search_distance,
+            iterations,
+            &all_outside,
+            &stats,
+        );
+
+        // Should return original position since no crossing found
+        assert_eq!(refined, initial_pos, "Should return original when no crossing");
+    }
+
+    #[test]
+    fn test_refine_vertex_position_zero_direction() {
+        let sphere = |x: f64, y: f64, z: f64| -> f32 {
+            if x * x + y * y + z * z < 1.0 { 1.0 } else { 0.0 }
+        };
+        let stats = SamplingStats::default();
+
+        let initial_pos = (0.5, 0.0, 0.0);
+        let search_dir = (0.0, 0.0, 0.0); // Zero direction
+        let search_distance = 0.5;
+        let iterations = 5;
+
+        let refined = refine_vertex_position(
+            initial_pos,
+            search_dir,
+            search_distance,
+            iterations,
+            &sphere,
+            &stats,
+        );
+
+        // Should return original position since direction is zero
+        assert_eq!(refined, initial_pos, "Should return original with zero direction");
+    }
+
+    #[test]
+    fn test_estimate_normal_points_outward() {
+        // Sphere: normal should point radially outward
+        let sphere = |x: f64, y: f64, z: f64| -> f32 {
+            let r2 = x * x + y * y + z * z;
+            if r2 < 1.0 { 1.0 } else { 0.0 }
+        };
+        let stats = SamplingStats::default();
+
+        // Point on +X axis of sphere surface
+        let pos = (1.0, 0.0, 0.0);
+        let epsilon = 0.1;
+
+        let normal = estimate_normal_at_position(pos, epsilon, &sphere, &stats);
+
+        // Normal should point in +X direction (outward)
+        assert!(
+            normal.0 > 0.0,
+            "Normal X component should be positive (pointing outward), got {}",
+            normal.0
+        );
+        // Y and Z should be near zero for a point on the X axis
+        assert!(
+            normal.1.abs() < 0.01,
+            "Normal Y component should be near zero, got {}",
+            normal.1
+        );
+        assert!(
+            normal.2.abs() < 0.01,
+            "Normal Z component should be near zero, got {}",
+            normal.2
+        );
+    }
+
+    #[test]
+    fn test_stage4_full_pipeline() {
+        // Run the full pipeline with refinement enabled
+        let config = AdaptiveMeshConfig2 {
+            base_resolution: 4,
+            max_depth: 2,
+            vertex_refinement_iterations: 4,
+            normal_sample_iterations: 1,
+            normal_epsilon_frac: 0.1,
+            ..Default::default()
+        };
+
+        let mesh = adaptive_surface_nets_2(
+            sphere_sampler,
+            (-1.5, -1.5, -1.5),
+            (1.5, 1.5, 1.5),
+            &config,
+        );
+
+        // Should produce a mesh
+        assert!(!mesh.vertices.is_empty(), "Should have vertices");
+        assert!(!mesh.normals.is_empty(), "Should have normals");
+        assert!(!mesh.indices.is_empty(), "Should have indices");
+
+        // Vertices and normals should have same count
+        assert_eq!(
+            mesh.vertices.len(),
+            mesh.normals.len(),
+            "Vertex and normal counts should match"
+        );
+
+        // All normals should be unit length (approximately)
+        for (i, n) in mesh.normals.iter().enumerate() {
+            let len = (n.0 * n.0 + n.1 * n.1 + n.2 * n.2).sqrt();
+            assert!(
+                (len - 1.0).abs() < 0.01,
+                "Normal {} should be unit length, got {}",
+                i,
+                len
+            );
+        }
+
+        // Vertices should be roughly on the unit sphere surface
+        // (with some tolerance for mesh approximation)
+        for (i, v) in mesh.vertices.iter().enumerate() {
+            let r = (v.0 * v.0 + v.1 * v.1 + v.2 * v.2).sqrt();
+            assert!(
+                (r - 1.0).abs() < 0.3, // Allow 30% tolerance for low-res mesh
+                "Vertex {} should be near sphere surface, got r={}",
+                i,
+                r
+            );
+        }
+    }
+
+    #[test]
+    fn test_stage4_without_refinement() {
+        // Run with refinement disabled
+        let config = AdaptiveMeshConfig2 {
+            base_resolution: 4,
+            max_depth: 2,
+            vertex_refinement_iterations: 0, // Disabled
+            normal_sample_iterations: 0,     // Disabled
+            ..Default::default()
+        };
+
+        let mesh = adaptive_surface_nets_2(
+            sphere_sampler,
+            (-1.5, -1.5, -1.5),
+            (1.5, 1.5, 1.5),
+            &config,
+        );
+
+        // Should still produce a valid mesh
+        assert!(!mesh.vertices.is_empty(), "Should have vertices");
+        assert_eq!(
+            mesh.vertices.len(),
+            mesh.normals.len(),
+            "Vertex and normal counts should match"
+        );
     }
 }
