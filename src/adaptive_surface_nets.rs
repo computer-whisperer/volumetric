@@ -362,13 +362,6 @@ pub fn adaptive_surface_nets_mesh(
     // Phase 3: Extract waterproof mesh using Surface Nets
     let mut triangles = phase3_extract_mesh(&octree, &sampler, config)?;
 
-    // Ensure a globally consistent winding direction.
-    // The extraction step attempts to orient triangles based on local corner occupancy,
-    // but small inconsistencies can still occur and show up as lighting seams.
-    // For closed meshes, a robust fallback is to enforce that face normals point away
-    // from the bounds center.
-    enforce_outward_winding(&mut triangles, bounds_min, bounds_max);
-
     // Optional post-pass: project welded vertices closer to the implicit surface.
     // This must happen AFTER extraction so it cannot affect connectivity / topology.
     if config.vertex_relaxation_iterations > 0 {
@@ -480,48 +473,6 @@ fn relax_welded_vertices_to_surface(
 
     write_vertex_positions(&topology, triangles, &new_pos);
     Ok(())
-}
-
-fn enforce_outward_winding(
-    triangles: &mut [Triangle],
-    bounds_min: (f32, f32, f32),
-    bounds_max: (f32, f32, f32),
-) {
-    if triangles.is_empty() {
-        return;
-    }
-
-    let center = (
-        (bounds_min.0 + bounds_max.0) * 0.5,
-        (bounds_min.1 + bounds_max.1) * 0.5,
-        (bounds_min.2 + bounds_max.2) * 0.5,
-    );
-
-    for tri in triangles.iter_mut() {
-        let n = Triangle::compute_face_normal(&tri.vertices);
-        // If degenerate, skip.
-        let len2 = n.0 * n.0 + n.1 * n.1 + n.2 * n.2;
-        if len2 <= 1.0e-24 {
-            continue;
-        }
-
-        let centroid = (
-            (tri.vertices[0].0 + tri.vertices[1].0 + tri.vertices[2].0) / 3.0,
-            (tri.vertices[0].1 + tri.vertices[1].1 + tri.vertices[2].1) / 3.0,
-            (tri.vertices[0].2 + tri.vertices[1].2 + tri.vertices[2].2) / 3.0,
-        );
-        let to_outside = (centroid.0 - center.0, centroid.1 - center.1, centroid.2 - center.2);
-        let dp = n.0 * to_outside.0 + n.1 * to_outside.1 + n.2 * to_outside.2;
-
-        if dp < 0.0 {
-            // Flip winding (swap v1/v2) and flip per-vertex normals accordingly.
-            tri.vertices.swap(1, 2);
-            tri.normals.swap(1, 2);
-            tri.normals[0] = (-tri.normals[0].0, -tri.normals[0].1, -tri.normals[0].2);
-            tri.normals[1] = (-tri.normals[1].0, -tri.normals[1].1, -tri.normals[1].2);
-            tri.normals[2] = (-tri.normals[2].0, -tri.normals[2].1, -tri.normals[2].2);
-        }
-    }
 }
 
 /// Phase 1: Sample the base grid to discover geometry regions.
@@ -1043,7 +994,7 @@ fn phase3_extract_mesh(
     let mut processed_segments: HashSet<(EdgeAxis, i64, i64, i64, i64)> = HashSet::new();
     
     // Track processed quads by their sorted vertex positions to avoid duplicate quads from different lines
-    let _processed_quads: HashSet<[(i64, i64, i64); 4]> = HashSet::new();
+    let mut processed_quads: HashSet<[(i64, i64, i64); 4]> = HashSet::new();
     
     // Track emitted triangles to avoid duplicates
     let mut emitted_triangles: HashSet<[(i64, i64, i64); 3]> = HashSet::new();
@@ -1139,8 +1090,21 @@ fn phase3_extract_mesh(
                 continue;
             }
             
-            // Note: We rely on triangle-level deduplication instead of quad-level
-            // since quads can have 3 or 4 vertices with adaptive refinement.
+            // Deduplicate at quad level: the same 4 vertices can form a quad
+            // that gets discovered from multiple different edge directions.
+            // Use sorted vertex positions as a canonical key.
+            let vert_scale = 1_000_000.0f32;
+            let mut quad_key: [(i64, i64, i64); 4] = [
+                ((cells_for_segment[0].0.0 * vert_scale) as i64, (cells_for_segment[0].0.1 * vert_scale) as i64, (cells_for_segment[0].0.2 * vert_scale) as i64),
+                ((cells_for_segment[1].0.0 * vert_scale) as i64, (cells_for_segment[1].0.1 * vert_scale) as i64, (cells_for_segment[1].0.2 * vert_scale) as i64),
+                ((cells_for_segment[2].0.0 * vert_scale) as i64, (cells_for_segment[2].0.1 * vert_scale) as i64, (cells_for_segment[2].0.2 * vert_scale) as i64),
+                ((cells_for_segment[3].0.0 * vert_scale) as i64, (cells_for_segment[3].0.1 * vert_scale) as i64, (cells_for_segment[3].0.2 * vert_scale) as i64),
+            ];
+            quad_key.sort();
+            if !processed_quads.insert(quad_key) {
+                // Already emitted this quad from a different edge direction
+                continue;
+            }
             
             // Compute edge midpoint in 3D
             let edge_mid = match line_key.axis {
@@ -1257,35 +1221,27 @@ fn emit_triangles_for_quad(
             try_emit([sorted_verts[0], sorted_verts[2], sorted_verts[1]], triangles, emitted);
         }
     } else if n == 4 {
-        // Quad: split into 2 triangles using the shorter diagonal
-        // This avoids creating long internal edges that might overlap with adjacent quads
+        // Quad: split into 2 triangles.
+        // IMPORTANT: We must use a consistent triangulation rule to avoid creating
+        // shared diagonals between adjacent quads. If two adjacent quads both use
+        // their shared edge as a diagonal, we get 4 triangles sharing that edge.
+        //
+        // Solution: Always split along the 0-2 diagonal (connecting first and third
+        // vertices in angular order). Since vertices are sorted angularly around the
+        // edge axis, adjacent quads will have different vertex orderings and won't
+        // both choose the same diagonal.
         let v0 = sorted_verts[0];
         let v1 = sorted_verts[1];
         let v2 = sorted_verts[2];
         let v3 = sorted_verts[3];
         
-        // Compute diagonal lengths
-        let diag02 = (v0.0 - v2.0).powi(2) + (v0.1 - v2.1).powi(2) + (v0.2 - v2.2).powi(2);
-        let diag13 = (v1.0 - v3.0).powi(2) + (v1.1 - v3.1).powi(2) + (v1.2 - v3.2).powi(2);
-        
-        if diag02 <= diag13 {
-            // Split along 0-2 diagonal
-            if inside_first {
-                try_emit([v0, v1, v2], triangles, emitted);
-                try_emit([v0, v2, v3], triangles, emitted);
-            } else {
-                try_emit([v0, v2, v1], triangles, emitted);
-                try_emit([v0, v3, v2], triangles, emitted);
-            }
+        // Always split along 0-2 diagonal for consistency
+        if inside_first {
+            try_emit([v0, v1, v2], triangles, emitted);
+            try_emit([v0, v2, v3], triangles, emitted);
         } else {
-            // Split along 1-3 diagonal
-            if inside_first {
-                try_emit([v0, v1, v3], triangles, emitted);
-                try_emit([v1, v2, v3], triangles, emitted);
-            } else {
-                try_emit([v0, v3, v1], triangles, emitted);
-                try_emit([v1, v3, v2], triangles, emitted);
-            }
+            try_emit([v0, v2, v1], triangles, emitted);
+            try_emit([v0, v3, v2], triangles, emitted);
         }
     } else if n > 4 {
         // For n > 4, use fan triangulation (rare case with adaptive refinement)
@@ -2363,6 +2319,48 @@ mod tests {
         if boundary_edges != 0 {
             let hist = edge_incidence_histogram(&triangles);
             eprintln!("Edge incidence histogram: {:?}", hist);
+            
+            // Debug: find edges shared by 4 triangles and print the triangles
+            let scale = 1_000_000.0f32;
+            let mut edge_to_tris: HashMap<((i64, i64, i64), (i64, i64, i64)), Vec<usize>> = HashMap::new();
+            for (ti, tri) in triangles.iter().enumerate() {
+                let verts = tri.vertices;
+                let tri_edges = [(0, 1), (1, 2), (2, 0)];
+                for &(ia, ib) in &tri_edges {
+                    let a = verts[ia];
+                    let b = verts[ib];
+                    let qa = (
+                        (a.0 * scale).round() as i64,
+                        (a.1 * scale).round() as i64,
+                        (a.2 * scale).round() as i64,
+                    );
+                    let qb = (
+                        (b.0 * scale).round() as i64,
+                        (b.1 * scale).round() as i64,
+                        (b.2 * scale).round() as i64,
+                    );
+                    let key = if qa <= qb { (qa, qb) } else { (qb, qa) };
+                    edge_to_tris.entry(key).or_default().push(ti);
+                }
+            }
+            
+            let mut printed = 0;
+            for ((qa, qb), tris) in &edge_to_tris {
+                if tris.len() == 4 && printed < 3 {
+                    eprintln!("Edge shared by 4 triangles: ({:.6}, {:.6}, {:.6}) -> ({:.6}, {:.6}, {:.6})",
+                        qa.0 as f32 / scale, qa.1 as f32 / scale, qa.2 as f32 / scale,
+                        qb.0 as f32 / scale, qb.1 as f32 / scale, qb.2 as f32 / scale);
+                    for &ti in tris {
+                        let tri = &triangles[ti];
+                        eprintln!("  Triangle {}: ({:.6}, {:.6}, {:.6}), ({:.6}, {:.6}, {:.6}), ({:.6}, {:.6}, {:.6})",
+                            ti,
+                            tri.vertices[0].0, tri.vertices[0].1, tri.vertices[0].2,
+                            tri.vertices[1].0, tri.vertices[1].1, tri.vertices[1].2,
+                            tri.vertices[2].0, tri.vertices[2].1, tri.vertices[2].2);
+                    }
+                    printed += 1;
+                }
+            }
         }
 
         assert_eq!(
