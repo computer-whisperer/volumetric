@@ -25,6 +25,19 @@ pub struct AdaptiveMeshConfig {
     /// Effective max resolution = base_resolution * 2^max_refinement_depth
     /// Default: 4 (so base=8 gives effective 128³)
     pub max_refinement_depth: usize,
+
+    /// Number of binary search iterations for edge crossing refinement.
+    /// Higher values give more accurate vertex placement at the cost of more samples.
+    /// 0 = disabled (use SDF linear interpolation only)
+    /// 4-8 iterations gives 16-256x better precision than cell size.
+    /// Default: 4
+    pub edge_refinement_iterations: usize,
+
+    /// Number of vertex relaxation iterations to project vertices onto the surface.
+    /// Each iteration moves the vertex along the SDF gradient toward the surface.
+    /// 0 = disabled
+    /// Default: 2
+    pub vertex_relaxation_iterations: usize,
 }
 
 impl Default for AdaptiveMeshConfig {
@@ -32,6 +45,8 @@ impl Default for AdaptiveMeshConfig {
         Self {
             base_resolution: 8,
             max_refinement_depth: 4,
+            edge_refinement_iterations: 4,
+            vertex_relaxation_iterations: 2,
         }
     }
 }
@@ -319,7 +334,7 @@ pub fn adaptive_surface_nets_mesh(
     phase2_adaptive_refinement(&sampler, &mut octree)?;
 
     // Phase 3: Extract waterproof mesh using Surface Nets
-    let triangles = phase3_extract_mesh(&octree)?;
+    let triangles = phase3_extract_mesh(&octree, &sampler, config)?;
 
     Ok(triangles)
 }
@@ -769,13 +784,24 @@ impl LineKey {
 /// This groups edges by the axis-aligned line they lie on, then for each unique
 /// point along that line where edges meet, emits quads connecting the cells.
 /// This handles T-junctions where cells of different sizes meet.
-fn phase3_extract_mesh(octree: &AdaptiveOctree) -> Result<Vec<Triangle>> {
+fn phase3_extract_mesh(
+    octree: &AdaptiveOctree,
+    sampler: &WasmSampler,
+    config: &AdaptiveMeshConfig,
+) -> Result<Vec<Triangle>> {
     // Collect all leaf cells
     let mut leaf_cells: Vec<(CellId, OctreeNode)> = Vec::new();
     for (&base_idx, root) in &octree.roots {
         let cell_id = CellId::new(base_idx);
         collect_leaf_cells(root, cell_id, &mut leaf_cells);
     }
+    
+    // Create sampling context for binary search refinement if enabled
+    let mut sampling_ctx = if config.edge_refinement_iterations > 0 {
+        Some(SamplingContext::new(&sampler.engine, &sampler.module)?)
+    } else {
+        None
+    };
 
     // Group edges by the line they lie on
     // Key: LineKey (axis + perpendicular coordinates)
@@ -794,7 +820,13 @@ fn phase3_extract_mesh(octree: &AdaptiveOctree) -> Result<Vec<Triangle>> {
             continue;
         }
         
-        let vertex = compute_surface_nets_vertex(node);
+        // Compute vertex with optional binary search refinement and relaxation
+        let vertex = compute_surface_nets_vertex_refined(
+            node,
+            sampling_ctx.as_mut(),
+            config.edge_refinement_iterations,
+            config.vertex_relaxation_iterations,
+        )?;
         
         for &(ca, cb) in &EDGES {
             // Check for sign change using corner_inside helper (negative distance = inside)
@@ -1250,6 +1282,222 @@ fn estimate_normal_from_sdf(node: &OctreeNode, point: (f32, f32, f32)) -> (f32, 
     }
 }
 
+/// Find the surface crossing point on an edge using binary search.
+/// 
+/// Given two points where one is inside and one is outside, performs binary search
+/// to find the approximate location where the surface crosses the edge.
+/// 
+/// # Arguments
+/// * `ctx` - Sampling context for querying the model
+/// * `p_inside` - Point that is inside the model
+/// * `p_outside` - Point that is outside the model
+/// * `iterations` - Number of binary search iterations (4-8 recommended)
+/// 
+/// # Returns
+/// The approximate crossing point on the edge.
+fn binary_search_edge_crossing(
+    ctx: &mut SamplingContext,
+    p_inside: (f32, f32, f32),
+    p_outside: (f32, f32, f32),
+    iterations: usize,
+) -> Result<(f32, f32, f32)> {
+    let mut t_min = 0.0f32;  // t=0 is p_inside
+    let mut t_max = 1.0f32;  // t=1 is p_outside
+    
+    for _ in 0..iterations {
+        let t_mid = (t_min + t_max) * 0.5;
+        let p_mid = (
+            p_inside.0 + t_mid * (p_outside.0 - p_inside.0),
+            p_inside.1 + t_mid * (p_outside.1 - p_inside.1),
+            p_inside.2 + t_mid * (p_outside.2 - p_inside.2),
+        );
+        
+        let density = ctx.is_inside(p_mid)?;
+        if density > 0.5 {
+            // p_mid is inside, so crossing is in upper half [t_mid, t_max]
+            t_min = t_mid;
+        } else {
+            // p_mid is outside, so crossing is in lower half [t_min, t_mid]
+            t_max = t_mid;
+        }
+    }
+    
+    // Return the midpoint of the final interval
+    let t_final = (t_min + t_max) * 0.5;
+    Ok((
+        p_inside.0 + t_final * (p_outside.0 - p_inside.0),
+        p_inside.1 + t_final * (p_outside.1 - p_inside.1),
+        p_inside.2 + t_final * (p_outside.2 - p_inside.2),
+    ))
+}
+
+/// Relax a vertex toward the surface using the SDF gradient.
+/// 
+/// Iteratively moves the vertex along the estimated surface normal direction
+/// to project it closer to the actual surface. Uses the trilinearly interpolated
+/// SDF within the cell to estimate the distance and gradient.
+/// 
+/// # Arguments
+/// * `vertex` - Initial vertex position
+/// * `node` - The cell containing the vertex (for SDF interpolation)
+/// * `ctx` - Optional sampling context for more accurate SDF estimation
+/// * `iterations` - Number of relaxation iterations
+/// 
+/// # Returns
+/// The relaxed vertex position, clamped to stay within the cell.
+fn relax_vertex_to_surface(
+    vertex: (f32, f32, f32),
+    node: &OctreeNode,
+    mut ctx: Option<&mut SamplingContext>,
+    iterations: usize,
+) -> Result<(f32, f32, f32)> {
+    if iterations == 0 {
+        return Ok(vertex);
+    }
+    
+    let mut pos = vertex;
+    let size = node.size();
+    
+    // Relaxation step size - start with a fraction of cell size
+    let base_step = size * 0.25;
+    
+    for i in 0..iterations {
+        // Estimate SDF at current position using trilinear interpolation
+        let u = ((pos.0 - node.min.0) / size).clamp(0.0, 1.0);
+        let v = ((pos.1 - node.min.1) / size).clamp(0.0, 1.0);
+        let w = ((pos.2 - node.min.2) / size).clamp(0.0, 1.0);
+        
+        let d = &node.corner_distances;
+        
+        // Trilinear interpolation of SDF
+        let sdf = 
+            (1.0 - u) * (1.0 - v) * (1.0 - w) * d[0] +
+            u * (1.0 - v) * (1.0 - w) * d[1] +
+            (1.0 - u) * v * (1.0 - w) * d[2] +
+            u * v * (1.0 - w) * d[3] +
+            (1.0 - u) * (1.0 - v) * w * d[4] +
+            u * (1.0 - v) * w * d[5] +
+            (1.0 - u) * v * w * d[6] +
+            u * v * w * d[7];
+        
+        // Get gradient (normal direction) at current position
+        let normal = estimate_normal_from_sdf(node, pos);
+        
+        // If we have a sampling context, we can get a more accurate SDF estimate
+        let actual_sdf = if let Some(ref mut sampling_ctx) = ctx.as_deref_mut() {
+            let density = sampling_ctx.is_inside(pos)?;
+            // Convert density to approximate SDF sign
+            // If inside (density > 0.5), we want negative SDF
+            // Use the interpolated magnitude but correct the sign
+            if density > 0.5 {
+                -sdf.abs()
+            } else {
+                sdf.abs()
+            }
+        } else {
+            sdf
+        };
+        
+        // Decrease step size with each iteration for convergence
+        let step = base_step / (1.0 + i as f32);
+        
+        // Move along the negative gradient (toward surface) by the SDF value
+        // Clamp the movement to avoid overshooting
+        let move_dist = actual_sdf.clamp(-step, step);
+        
+        pos.0 -= move_dist * normal.0;
+        pos.1 -= move_dist * normal.1;
+        pos.2 -= move_dist * normal.2;
+        
+        // Clamp to cell bounds with small margin
+        let margin = size * 0.01;
+        pos.0 = pos.0.clamp(node.min.0 + margin, node.max.0 - margin);
+        pos.1 = pos.1.clamp(node.min.1 + margin, node.max.1 - margin);
+        pos.2 = pos.2.clamp(node.min.2 + margin, node.max.2 - margin);
+    }
+    
+    Ok(pos)
+}
+
+/// Compute the Surface Nets vertex for a MIXED cell with optional binary search refinement
+/// and vertex relaxation.
+/// 
+/// When `ctx` is provided and `edge_iterations > 0`, uses binary search to find accurate
+/// edge crossing points. When `relax_iterations > 0`, applies vertex relaxation to
+/// project the vertex closer to the actual surface.
+fn compute_surface_nets_vertex_refined(
+    node: &OctreeNode,
+    mut ctx: Option<&mut SamplingContext>,
+    edge_iterations: usize,
+    relax_iterations: usize,
+) -> Result<(f32, f32, f32)> {
+    const EDGES: [(usize, usize); 12] = [
+        (0, 1), (2, 3), (4, 5), (6, 7), // X-aligned edges
+        (0, 2), (1, 3), (4, 6), (5, 7), // Y-aligned edges
+        (0, 4), (1, 5), (2, 6), (3, 7), // Z-aligned edges
+    ];
+
+    let mut sum = (0.0f32, 0.0f32, 0.0f32);
+    let mut count = 0;
+
+    for &(a, b) in &EDGES {
+        let da = node.corner_distances[a];
+        let db = node.corner_distances[b];
+        
+        // Check for sign change (one negative, one positive/zero)
+        if (da < 0.0) != (db < 0.0) {
+            let pa = node.corner_pos(a);
+            let pb = node.corner_pos(b);
+            
+            let crossing = if let Some(ref mut sampling_ctx) = ctx.as_deref_mut() {
+                if edge_iterations > 0 {
+                    // Use binary search for accurate crossing
+                    let (p_inside, p_outside) = if da < 0.0 {
+                        (pa, pb)  // pa is inside (negative), pb is outside
+                    } else {
+                        (pb, pa)  // pb is inside, pa is outside
+                    };
+                    binary_search_edge_crossing(*sampling_ctx, p_inside, p_outside, edge_iterations)?
+                } else {
+                    // Fall back to SDF interpolation
+                    let t = (da / (da - db)).clamp(0.01, 0.99);
+                    (
+                        pa.0 + t * (pb.0 - pa.0),
+                        pa.1 + t * (pb.1 - pa.1),
+                        pa.2 + t * (pb.2 - pa.2),
+                    )
+                }
+            } else {
+                // No sampling context, use SDF interpolation
+                let t = (da / (da - db)).clamp(0.01, 0.99);
+                (
+                    pa.0 + t * (pb.0 - pa.0),
+                    pa.1 + t * (pb.1 - pa.1),
+                    pa.2 + t * (pb.2 - pa.2),
+                )
+            };
+            
+            sum.0 += crossing.0;
+            sum.1 += crossing.1;
+            sum.2 += crossing.2;
+            count += 1;
+        }
+    }
+
+    let initial_vertex = if count > 0 {
+        (sum.0 / count as f32, sum.1 / count as f32, sum.2 / count as f32)
+    } else {
+        node.center()
+    };
+    
+    // Apply vertex relaxation if enabled
+    if relax_iterations > 0 {
+        relax_vertex_to_surface(initial_vertex, node, ctx, relax_iterations)
+    } else {
+        Ok(initial_vertex)
+    }
+}
+
 /// Compute the Surface Nets vertex for a MIXED cell.
 /// 
 /// Uses SDF interpolation to find the approximate surface crossing point on each
@@ -1401,6 +1649,8 @@ mod tests {
         let config = AdaptiveMeshConfig {
             base_resolution: 4,
             max_refinement_depth: 2,
+            edge_refinement_iterations: 4,
+            vertex_relaxation_iterations: 2,
         };
 
         let bounds_min = (-1.0, -1.0, -1.0);
@@ -1451,7 +1701,7 @@ mod tests {
         println!("Phase 2 complete: {} leaf cells, {} MIXED", leaf_count, mixed_leaf_count);
 
         // Phase 3: Extract mesh
-        let triangles = super::phase3_extract_mesh(&octree)?;
+        let triangles = super::phase3_extract_mesh(&octree, &sampler, config)?;
         
         println!("Phase 3 complete: {} triangles", triangles.len());
 
@@ -1552,6 +1802,8 @@ mod tests {
         let config = AdaptiveMeshConfig {
             base_resolution: 6,
             max_refinement_depth: 3,
+            edge_refinement_iterations: 4,
+            vertex_relaxation_iterations: 2,
         };
 
         let bounds_min = (-1.35, -0.35, -1.35);
@@ -1595,6 +1847,8 @@ mod tests {
         let config = AdaptiveMeshConfig {
             base_resolution: 8,
             max_refinement_depth: 3,
+            edge_refinement_iterations: 4,
+            vertex_relaxation_iterations: 2,
         };
 
         let bounds_min = (-1.0, -1.0, -1.0);
@@ -1627,6 +1881,8 @@ mod tests {
         let config = AdaptiveMeshConfig {
             base_resolution: 8,
             max_refinement_depth: 2,
+            edge_refinement_iterations: 4,
+            vertex_relaxation_iterations: 2,
         };
 
         let pi = std::f32::consts::PI;

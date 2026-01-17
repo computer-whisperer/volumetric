@@ -257,6 +257,10 @@ struct AssetRenderData {
     adaptive_base_resolution: usize,
     /// Adaptive Surface Nets: maximum refinement depth
     adaptive_max_depth: usize,
+    /// Adaptive Surface Nets: binary search iterations for edge crossing refinement (0 = disabled)
+    adaptive_edge_refinement_iterations: usize,
+    /// Adaptive Surface Nets: vertex relaxation iterations to project vertices onto surface (0 = disabled)
+    adaptive_vertex_relaxation_iterations: usize,
 }
 
 impl AssetRenderData {
@@ -277,6 +281,8 @@ impl AssetRenderData {
             auto_resample: true,
             adaptive_base_resolution: 8,
             adaptive_max_depth: 4,
+            adaptive_edge_refinement_iterations: 4,
+            adaptive_vertex_relaxation_iterations: 2,
         }
     }
 }
@@ -651,6 +657,8 @@ impl VolumetricApp {
                     let config = adaptive_surface_nets::AdaptiveMeshConfig {
                         base_resolution: render_data.adaptive_base_resolution,
                         max_refinement_depth: render_data.adaptive_max_depth,
+                        edge_refinement_iterations: render_data.adaptive_edge_refinement_iterations,
+                        vertex_relaxation_iterations: render_data.adaptive_vertex_relaxation_iterations,
                     };
                     match generate_adaptive_mesh_from_bytes(&render_data.wasm_bytes, &config) {
                         Ok((triangles, bounds_min, bounds_max)) => {
@@ -1946,6 +1954,29 @@ impl eframe::App for VolumetricApp {
                                         
                                         let effective_res = base_res * (1 << max_depth);
                                         ui.weak(format!("Effective resolution: {}³", effective_res));
+                                        
+                                        let mut edge_refine = render_data.adaptive_edge_refinement_iterations;
+                                        let mut vertex_relax = render_data.adaptive_vertex_relaxation_iterations;
+                                        
+                                        ui.horizontal(|ui| {
+                                            ui.label("Edge Refinement:");
+                                            if ui.add(egui::DragValue::new(&mut edge_refine).range(0..=8)).changed() {
+                                                render_data.adaptive_edge_refinement_iterations = edge_refine;
+                                                if auto_resample {
+                                                    render_data.needs_resample = true;
+                                                }
+                                            }
+                                        });
+                                        
+                                        ui.horizontal(|ui| {
+                                            ui.label("Vertex Relaxation:");
+                                            if ui.add(egui::DragValue::new(&mut vertex_relax).range(0..=8)).changed() {
+                                                render_data.adaptive_vertex_relaxation_iterations = vertex_relax;
+                                                if auto_resample {
+                                                    render_data.needs_resample = true;
+                                                }
+                                            }
+                                        });
                                         
                                         ui.horizontal(|ui| {
                                             if ui.checkbox(&mut auto_resample, "Auto Resample").changed() {
