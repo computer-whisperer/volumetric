@@ -2320,4 +2320,434 @@ mod tests {
             boundary_edges
         );
     }
+
+    // ==================== MANDELBULB TORTURE TESTS ====================
+    // The Mandelbulb is a particularly challenging model for surface extraction:
+    // - Highly non-convex with deep concavities
+    // - Fractal surface with detail at all scales
+    // - Multiple disconnected components possible
+    // - Sharp features and thin structures
+    // These tests are designed to stress-test manifoldness and winding consistency.
+
+    #[test]
+    fn test_mandelbulb_mesh_is_manifold() {
+        let wasm_path = std::path::Path::new("target/wasm32-unknown-unknown/release/mandelbulb_model.wasm");
+
+        if !wasm_path.exists() {
+            eprintln!("Skipping test: mandelbulb wasm not found at {:?}", wasm_path);
+            return;
+        }
+
+        let wasm_bytes = std::fs::read(wasm_path).expect("Failed to read wasm file");
+
+        // Use moderate resolution to capture the fractal detail
+        let config = AdaptiveMeshConfig {
+            base_resolution: 8,
+            max_refinement_depth: 3,
+            edge_refinement_iterations: 4,
+            vertex_relaxation_iterations: 2,
+            normal_mode: NormalMode::Mesh,
+        };
+
+        // Mandelbulb bounds from the model
+        let bounds_min = (-1.35, -1.35, -1.35);
+        let bounds_max = (1.35, 1.35, 1.35);
+
+        let triangles = adaptive_surface_nets_mesh(&wasm_bytes, bounds_min, bounds_max, &config)
+            .expect("Mesh generation failed");
+
+        eprintln!("Mandelbulb triangles: {}", triangles.len());
+
+        let boundary_edges = boundary_edge_count(&triangles);
+
+        if boundary_edges != 0 {
+            let hist = edge_incidence_histogram(&triangles);
+            eprintln!("Edge incidence histogram: {:?}", hist);
+        }
+
+        assert_eq!(
+            boundary_edges, 0,
+            "Expected manifold mesh (no boundary edges), found {} boundary edges",
+            boundary_edges
+        );
+    }
+
+    #[test]
+    fn test_mandelbulb_winding_consistency() {
+        // Test that triangle winding is consistent across the mesh.
+        // For a closed manifold, each edge should be traversed once in each direction.
+        let wasm_path = std::path::Path::new("target/wasm32-unknown-unknown/release/mandelbulb_model.wasm");
+
+        if !wasm_path.exists() {
+            eprintln!("Skipping test: mandelbulb wasm not found at {:?}", wasm_path);
+            return;
+        }
+
+        let wasm_bytes = std::fs::read(wasm_path).expect("Failed to read wasm file");
+
+        let config = AdaptiveMeshConfig {
+            base_resolution: 8,
+            max_refinement_depth: 2,
+            edge_refinement_iterations: 4,
+            vertex_relaxation_iterations: 2,
+            normal_mode: NormalMode::Mesh,
+        };
+
+        let bounds_min = (-1.35, -1.35, -1.35);
+        let bounds_max = (1.35, 1.35, 1.35);
+
+        let triangles = adaptive_surface_nets_mesh(&wasm_bytes, bounds_min, bounds_max, &config)
+            .expect("Mesh generation failed");
+
+        // Check oriented edge consistency: for a consistently wound mesh,
+        // each directed edge (a->b) should appear exactly once, and its
+        // reverse (b->a) should also appear exactly once.
+        let scale = 1_000_000.0f32;
+        let mut directed_edges: HashMap<((i64, i64, i64), (i64, i64, i64)), usize> = HashMap::new();
+
+        for tri in &triangles {
+            let verts = tri.vertices;
+            let edges = [(0, 1), (1, 2), (2, 0)];
+            for &(ia, ib) in &edges {
+                let a = verts[ia];
+                let b = verts[ib];
+                let qa = (
+                    (a.0 * scale).round() as i64,
+                    (a.1 * scale).round() as i64,
+                    (a.2 * scale).round() as i64,
+                );
+                let qb = (
+                    (b.0 * scale).round() as i64,
+                    (b.1 * scale).round() as i64,
+                    (b.2 * scale).round() as i64,
+                );
+                *directed_edges.entry((qa, qb)).or_default() += 1;
+            }
+        }
+
+        // Count edges that don't have a matching reverse edge or appear multiple times
+        let mut inconsistent_count = 0;
+        for ((qa, qb), count) in &directed_edges {
+            let reverse_count = directed_edges.get(&(*qb, *qa)).copied().unwrap_or(0);
+            if *count != 1 || reverse_count != 1 {
+                inconsistent_count += 1;
+                if inconsistent_count <= 5 {
+                    eprintln!(
+                        "Inconsistent edge: ({:.4}, {:.4}, {:.4}) -> ({:.4}, {:.4}, {:.4}), count={}, reverse={}",
+                        qa.0 as f32 / scale, qa.1 as f32 / scale, qa.2 as f32 / scale,
+                        qb.0 as f32 / scale, qb.1 as f32 / scale, qb.2 as f32 / scale,
+                        count, reverse_count
+                    );
+                }
+            }
+        }
+
+        assert_eq!(
+            inconsistent_count, 0,
+            "Expected consistent winding (each edge traversed once in each direction), found {} inconsistent edges",
+            inconsistent_count
+        );
+    }
+
+    #[test]
+    fn test_mandelbulb_normals_agree_with_winding() {
+        // Test that vertex normals point in the same general direction as face normals.
+        // This validates that the normal computation agrees with the triangle winding.
+        let wasm_path = std::path::Path::new("target/wasm32-unknown-unknown/release/mandelbulb_model.wasm");
+
+        if !wasm_path.exists() {
+            eprintln!("Skipping test: mandelbulb wasm not found at {:?}", wasm_path);
+            return;
+        }
+
+        let wasm_bytes = std::fs::read(wasm_path).expect("Failed to read wasm file");
+
+        let config = AdaptiveMeshConfig {
+            base_resolution: 6,
+            max_refinement_depth: 2,
+            edge_refinement_iterations: 4,
+            vertex_relaxation_iterations: 2,
+            normal_mode: NormalMode::Mesh,
+        };
+
+        let bounds_min = (-1.35, -1.35, -1.35);
+        let bounds_max = (1.35, 1.35, 1.35);
+
+        let triangles = adaptive_surface_nets_mesh(&wasm_bytes, bounds_min, bounds_max, &config)
+            .expect("Mesh generation failed");
+
+        let mut disagreement_count = 0;
+        let mut total_checked = 0;
+
+        for tri in &triangles {
+            let face_normal = Triangle::compute_face_normal(&tri.vertices);
+            let face_len2 = face_normal.0 * face_normal.0 + face_normal.1 * face_normal.1 + face_normal.2 * face_normal.2;
+            
+            // Skip degenerate triangles
+            if face_len2 <= 1.0e-12 {
+                continue;
+            }
+
+            for i in 0..3 {
+                let vn = tri.normals[i];
+                let vn_len2 = vn.0 * vn.0 + vn.1 * vn.1 + vn.2 * vn.2;
+                
+                // Skip zero normals
+                if vn_len2 <= 1.0e-12 {
+                    continue;
+                }
+
+                total_checked += 1;
+                let dp = face_normal.0 * vn.0 + face_normal.1 * vn.1 + face_normal.2 * vn.2;
+                
+                // Vertex normal should generally agree with face normal (positive dot product)
+                // Allow some tolerance for smooth shading across edges
+                if dp < -0.1 * face_len2.sqrt() * vn_len2.sqrt() {
+                    disagreement_count += 1;
+                    if disagreement_count <= 5 {
+                        eprintln!(
+                            "Normal disagreement at vertex {}: face_n=({:.3}, {:.3}, {:.3}), vertex_n=({:.3}, {:.3}, {:.3}), dp={:.4}",
+                            i, face_normal.0, face_normal.1, face_normal.2,
+                            vn.0, vn.1, vn.2, dp
+                        );
+                    }
+                }
+            }
+        }
+
+        let disagreement_ratio = if total_checked > 0 {
+            disagreement_count as f64 / total_checked as f64
+        } else {
+            0.0
+        };
+
+        eprintln!(
+            "Normal-winding agreement: {}/{} checked, {} disagreements ({:.2}%)",
+            total_checked, triangles.len() * 3, disagreement_count, disagreement_ratio * 100.0
+        );
+
+        // Allow a small percentage of disagreements due to sharp features
+        assert!(
+            disagreement_ratio < 0.05,
+            "Too many normal-winding disagreements: {:.2}% (expected < 5%)",
+            disagreement_ratio * 100.0
+        );
+    }
+
+    #[test]
+    fn test_mandelbulb_normals_point_outward() {
+        // Test that normals generally point away from the model interior.
+        // For the Mandelbulb, we use a heuristic: normals should point away from
+        // the bounding box center more often than toward it.
+        let wasm_path = std::path::Path::new("target/wasm32-unknown-unknown/release/mandelbulb_model.wasm");
+
+        if !wasm_path.exists() {
+            eprintln!("Skipping test: mandelbulb wasm not found at {:?}", wasm_path);
+            return;
+        }
+
+        let wasm_bytes = std::fs::read(wasm_path).expect("Failed to read wasm file");
+
+        let config = AdaptiveMeshConfig {
+            base_resolution: 6,
+            max_refinement_depth: 2,
+            edge_refinement_iterations: 4,
+            vertex_relaxation_iterations: 2,
+            normal_mode: NormalMode::Mesh,
+        };
+
+        let bounds_min = (-1.35, -1.35, -1.35);
+        let bounds_max = (1.35, 1.35, 1.35);
+        let center = (
+            (bounds_min.0 + bounds_max.0) * 0.5,
+            (bounds_min.1 + bounds_max.1) * 0.5,
+            (bounds_min.2 + bounds_max.2) * 0.5,
+        );
+
+        let triangles = adaptive_surface_nets_mesh(&wasm_bytes, bounds_min, bounds_max, &config)
+            .expect("Mesh generation failed");
+
+        let mut outward_count = 0;
+        let mut inward_count = 0;
+
+        for tri in &triangles {
+            let face_normal = Triangle::compute_face_normal(&tri.vertices);
+            let face_len2 = face_normal.0 * face_normal.0 + face_normal.1 * face_normal.1 + face_normal.2 * face_normal.2;
+            
+            if face_len2 <= 1.0e-12 {
+                continue;
+            }
+
+            let centroid = (
+                (tri.vertices[0].0 + tri.vertices[1].0 + tri.vertices[2].0) / 3.0,
+                (tri.vertices[0].1 + tri.vertices[1].1 + tri.vertices[2].1) / 3.0,
+                (tri.vertices[0].2 + tri.vertices[1].2 + tri.vertices[2].2) / 3.0,
+            );
+
+            let to_outside = (
+                centroid.0 - center.0,
+                centroid.1 - center.1,
+                centroid.2 - center.2,
+            );
+
+            let dp = face_normal.0 * to_outside.0 + face_normal.1 * to_outside.1 + face_normal.2 * to_outside.2;
+
+            if dp > 0.0 {
+                outward_count += 1;
+            } else {
+                inward_count += 1;
+            }
+        }
+
+        let total = outward_count + inward_count;
+        let outward_ratio = if total > 0 {
+            outward_count as f64 / total as f64
+        } else {
+            0.0
+        };
+
+        eprintln!(
+            "Outward-facing triangles: {}/{} ({:.2}%)",
+            outward_count, total, outward_ratio * 100.0
+        );
+
+        // Note: For the Mandelbulb, this heuristic may not work well due to
+        // deep concavities. The enforce_outward_winding function uses the same
+        // heuristic, which may cause issues for non-convex models.
+        // This test documents the current behavior.
+        assert!(
+            outward_ratio > 0.5,
+            "Expected majority of triangles to face outward from center, got {:.2}%",
+            outward_ratio * 100.0
+        );
+    }
+
+    #[test]
+    fn test_mandelbulb_hq_normals_are_valid() {
+        // Test that HQ bisection normals are unit length and reasonable.
+        let wasm_path = std::path::Path::new("target/wasm32-unknown-unknown/release/mandelbulb_model.wasm");
+
+        if !wasm_path.exists() {
+            eprintln!("Skipping test: mandelbulb wasm not found at {:?}", wasm_path);
+            return;
+        }
+
+        let wasm_bytes = std::fs::read(wasm_path).expect("Failed to read wasm file");
+
+        let config = AdaptiveMeshConfig {
+            base_resolution: 6,
+            max_refinement_depth: 2,
+            edge_refinement_iterations: 4,
+            vertex_relaxation_iterations: 1,
+            normal_mode: NormalMode::HqBisection {
+                eps_frac: 0.05,
+                bracket_frac: 0.5,
+                iterations: 10,
+            },
+        };
+
+        let bounds_min = (-1.35, -1.35, -1.35);
+        let bounds_max = (1.35, 1.35, 1.35);
+
+        let triangles = adaptive_surface_nets_mesh(&wasm_bytes, bounds_min, bounds_max, &config)
+            .expect("Mesh generation failed");
+
+        assert!(!triangles.is_empty(), "Should generate triangles");
+
+        let mut invalid_normal_count = 0;
+        let mut total_normals = 0;
+
+        for tri in &triangles {
+            for i in 0..3 {
+                let n = tri.normals[i];
+                let len2 = n.0 * n.0 + n.1 * n.1 + n.2 * n.2;
+                total_normals += 1;
+
+                // Check that normal is approximately unit length
+                if len2 < 0.5 || len2 > 2.0 {
+                    invalid_normal_count += 1;
+                    if invalid_normal_count <= 5 {
+                        eprintln!(
+                            "Invalid normal length at vertex {}: ({:.3}, {:.3}, {:.3}), len2={:.4}",
+                            i, n.0, n.1, n.2, len2
+                        );
+                    }
+                }
+            }
+        }
+
+        let invalid_ratio = if total_normals > 0 {
+            invalid_normal_count as f64 / total_normals as f64
+        } else {
+            0.0
+        };
+
+        eprintln!(
+            "HQ normals: {}/{} valid ({:.2}% invalid)",
+            total_normals - invalid_normal_count, total_normals, invalid_ratio * 100.0
+        );
+
+        assert!(
+            invalid_ratio < 0.01,
+            "Too many invalid HQ normals: {:.2}% (expected < 1%)",
+            invalid_ratio * 100.0
+        );
+    }
+
+    #[test]
+    fn test_mandelbulb_high_resolution_manifold() {
+        // Stress test with higher resolution to catch edge cases in adaptive refinement.
+        let wasm_path = std::path::Path::new("target/wasm32-unknown-unknown/release/mandelbulb_model.wasm");
+
+        if !wasm_path.exists() {
+            eprintln!("Skipping test: mandelbulb wasm not found at {:?}", wasm_path);
+            return;
+        }
+
+        let wasm_bytes = std::fs::read(wasm_path).expect("Failed to read wasm file");
+
+        // Higher resolution for more thorough testing
+        let config = AdaptiveMeshConfig {
+            base_resolution: 12,
+            max_refinement_depth: 3,
+            edge_refinement_iterations: 6,
+            vertex_relaxation_iterations: 2,
+            normal_mode: NormalMode::Mesh,
+        };
+
+        let bounds_min = (-1.35, -1.35, -1.35);
+        let bounds_max = (1.35, 1.35, 1.35);
+
+        let triangles = adaptive_surface_nets_mesh(&wasm_bytes, bounds_min, bounds_max, &config)
+            .expect("Mesh generation failed");
+
+        eprintln!("High-res Mandelbulb triangles: {}", triangles.len());
+
+        let boundary_edges = boundary_edge_count(&triangles);
+        let hist = edge_incidence_histogram(&triangles);
+
+        eprintln!("Edge incidence histogram: {:?}", hist);
+
+        // Check for non-manifold edges (more than 2 triangles sharing an edge)
+        let non_manifold_edges: usize = hist.iter()
+            .filter(|(&count, _)| count > 2)
+            .map(|(_, &num)| num)
+            .sum();
+
+        if non_manifold_edges > 0 {
+            eprintln!("Found {} non-manifold edges (shared by >2 triangles)", non_manifold_edges);
+        }
+
+        assert_eq!(
+            boundary_edges, 0,
+            "Expected manifold mesh (no boundary edges), found {} boundary edges",
+            boundary_edges
+        );
+
+        assert_eq!(
+            non_manifold_edges, 0,
+            "Expected manifold mesh (no non-manifold edges), found {} non-manifold edges",
+            non_manifold_edges
+        );
+    }
 }
