@@ -4,29 +4,52 @@ use std::path::Path;
 use std::sync::Arc;
 use wasmtime::{Caller, Engine, Instance, Module, Store};
 
-/// A triangle in 3D space with vertices and a normal vector.
+/// A triangle in 3D space with vertices and per-vertex normal vectors.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Triangle {
     /// The three vertices of the triangle.
     pub vertices: [(f32, f32, f32); 3],
-    /// The normal vector of the triangle (should be unit length).
-    pub normal: (f32, f32, f32),
+    /// Per-vertex normal vectors (should be unit length).
+    /// Each normal corresponds to the vertex at the same index.
+    pub normals: [(f32, f32, f32); 3],
 }
 
 impl Triangle {
-    /// Create a new triangle with the given vertices and compute the normal automatically.
+    /// Create a new triangle with the given vertices and compute the face normal automatically.
+    /// The same face normal is assigned to all three vertices.
     pub fn new(vertices: [(f32, f32, f32); 3]) -> Self {
-        let normal = Self::compute_normal(&vertices);
-        Self { vertices, normal }
+        let normal = Self::compute_face_normal(&vertices);
+        Self { vertices, normals: [normal, normal, normal] }
     }
 
-    /// Create a new triangle with explicit vertices and normal.
+    /// Create a new triangle with explicit vertices and a single normal for all vertices.
     pub fn with_normal(vertices: [(f32, f32, f32); 3], normal: (f32, f32, f32)) -> Self {
-        Self { vertices, normal }
+        Self { vertices, normals: [normal, normal, normal] }
     }
 
-    /// Compute the unit normal for a triangle from its vertices using the right-hand rule.
-    pub fn compute_normal(vertices: &[(f32, f32, f32); 3]) -> (f32, f32, f32) {
+    /// Create a new triangle with explicit per-vertex normals.
+    pub fn with_vertex_normals(vertices: [(f32, f32, f32); 3], normals: [(f32, f32, f32); 3]) -> Self {
+        Self { vertices, normals }
+    }
+
+    /// Get the face normal (average of vertex normals, or computed from geometry if degenerate).
+    pub fn face_normal(&self) -> (f32, f32, f32) {
+        let avg = (
+            self.normals[0].0 + self.normals[1].0 + self.normals[2].0,
+            self.normals[0].1 + self.normals[1].1 + self.normals[2].1,
+            self.normals[0].2 + self.normals[1].2 + self.normals[2].2,
+        );
+        let len2 = avg.0 * avg.0 + avg.1 * avg.1 + avg.2 * avg.2;
+        if len2 > 1.0e-24 {
+            let inv_len = 1.0 / len2.sqrt();
+            (avg.0 * inv_len, avg.1 * inv_len, avg.2 * inv_len)
+        } else {
+            Self::compute_face_normal(&self.vertices)
+        }
+    }
+
+    /// Compute the unit face normal for a triangle from its vertices using the right-hand rule.
+    pub fn compute_face_normal(vertices: &[(f32, f32, f32); 3]) -> (f32, f32, f32) {
         let (ax, ay, az) = vertices[0];
         let (bx, by, bz) = vertices[1];
         let (cx, cy, cz) = vertices[2];
@@ -45,6 +68,12 @@ impl Triangle {
         }
         let inv_len = 1.0 / len2.sqrt();
         (n.0 * inv_len, n.1 * inv_len, n.2 * inv_len)
+    }
+
+    /// Legacy method for compatibility - returns the face normal.
+    #[deprecated(note = "Use face_normal() or access normals directly for per-vertex normals")]
+    pub fn compute_normal(vertices: &[(f32, f32, f32); 3]) -> (f32, f32, f32) {
+        Self::compute_face_normal(vertices)
     }
 }
 

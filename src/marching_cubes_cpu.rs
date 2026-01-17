@@ -312,8 +312,8 @@ where
             let b = tri.vertices[1];
             let c = tri.vertices[2];
 
-            // Use the already-computed normal from the triangle
-            let nu = tri.normal;
+            // Use the face normal from the triangle for orientation check
+            let nu = tri.face_normal();
             if nu.0 == 0.0 && nu.1 == 0.0 && nu.2 == 0.0 {
                 continue;
             }
@@ -391,9 +391,12 @@ where
             }
 
             if decided && flip {
-                // Swap vertices and recompute normal
+                // Swap vertices and recompute normals
                 tri.vertices.swap(1, 2);
-                tri.normal = Triangle::compute_normal(&tri.vertices);
+                tri.normals.swap(1, 2);
+                // Recompute face normal and apply to all vertices
+                let new_normal = Triangle::compute_face_normal(&tri.vertices);
+                tri.normals = [new_normal, new_normal, new_normal];
             }
         }
     }
@@ -412,7 +415,7 @@ mod tests {
     use super::*;
 
     fn triangle_unit_normal(tri: &Triangle) -> Option<(f32, f32, f32)> {
-        let n = tri.normal;
+        let n = tri.face_normal();
         if n.0 == 0.0 && n.1 == 0.0 && n.2 == 0.0 {
             return None;
         }
@@ -530,7 +533,7 @@ mod tests {
         let mut ok = 0usize;
         let mut total = 0usize;
         for tri in &tris {
-            let n = tri.normal;
+            let n = tri.face_normal();
             if n.0 == 0.0 && n.1 == 0.0 && n.2 == 0.0 {
                 continue;
             }

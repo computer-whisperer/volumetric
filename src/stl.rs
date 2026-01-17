@@ -16,8 +16,8 @@ pub fn triangles_to_binary_stl_bytes(triangles: &[Triangle], header_name: &str) 
     out.extend_from_slice(&(triangles.len() as u32).to_le_bytes());
 
     for tri in triangles {
-        // Use the normal stored in the triangle
-        let (nx, ny, nz) = tri.normal;
+        // Use the face normal for STL export (STL format uses face normals)
+        let (nx, ny, nz) = tri.face_normal();
 
         out.extend_from_slice(&nx.to_le_bytes());
         out.extend_from_slice(&ny.to_le_bytes());
@@ -61,7 +61,7 @@ mod tests {
     #[test]
     fn normal_is_right_hand_rule() {
         let tri = Triangle::new([(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)]);
-        let n = tri.normal;
+        let n = tri.face_normal();
         assert!((n.0 - 0.0).abs() < 1e-6);
         assert!((n.1 - 0.0).abs() < 1e-6);
         assert!((n.2 - 1.0).abs() < 1e-6);

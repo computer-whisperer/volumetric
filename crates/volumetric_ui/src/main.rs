@@ -2231,37 +2231,25 @@ fn triangles_to_mesh_vertices(triangles: &[Triangle]) -> Vec<marching_cubes_wgpu
     let mut out = Vec::with_capacity(triangles.len() * 3);
 
     for tri in triangles {
-        let a = tri.vertices[0];
-        let b = tri.vertices[1];
-        let c = tri.vertices[2];
+        // Use per-vertex normals for smooth shading
+        for i in 0..3 {
+            let v = tri.vertices[i];
+            let n = tri.normals[i];
+            
+            // Fallback to up vector if normal is degenerate
+            let normal = if n.0 == 0.0 && n.1 == 0.0 && n.2 == 0.0 {
+                [0.0, 1.0, 0.0]
+            } else {
+                [n.0, n.1, n.2]
+            };
 
-        // Use the normal stored in the triangle
-        let n = tri.normal;
-        // Fallback to up vector if normal is degenerate
-        let normal = if n.0 == 0.0 && n.1 == 0.0 && n.2 == 0.0 {
-            [0.0, 1.0, 0.0]
-        } else {
-            [n.0, n.1, n.2]
-        };
-
-        out.push(marching_cubes_wgpu::MeshVertex {
-            position: [a.0, a.1, a.2],
-            _pad0: 0.0,
-            normal,
-            _pad1: 0.0,
-        });
-        out.push(marching_cubes_wgpu::MeshVertex {
-            position: [b.0, b.1, b.2],
-            _pad0: 0.0,
-            normal,
-            _pad1: 0.0,
-        });
-        out.push(marching_cubes_wgpu::MeshVertex {
-            position: [c.0, c.1, c.2],
-            _pad0: 0.0,
-            normal,
-            _pad1: 0.0,
-        });
+            out.push(marching_cubes_wgpu::MeshVertex {
+                position: [v.0, v.1, v.2],
+                _pad0: 0.0,
+                normal,
+                _pad1: 0.0,
+            });
+        }
     }
 
     out

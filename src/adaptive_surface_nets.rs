@@ -334,7 +334,10 @@ pub fn adaptive_surface_nets_mesh(
     phase2_adaptive_refinement(&sampler, &mut octree)?;
 
     // Phase 3: Extract waterproof mesh using Surface Nets
-    let triangles = phase3_extract_mesh(&octree, &sampler, config)?;
+    let mut triangles = phase3_extract_mesh(&octree, &sampler, config)?;
+
+    // Phase 4: Smooth vertex normals by averaging at shared positions
+    smooth_vertex_normals(&mut triangles);
 
     Ok(triangles)
 }
@@ -1076,25 +1079,29 @@ fn emit_triangles_for_quad(
         let mut key = [quantize(tri[0]), quantize(tri[1]), quantize(tri[2])];
         key.sort();
         if emitted.insert(key) {
-            // Compute average normal from the three vertices using SDF gradient
-            let mut avg_normal = (0.0f32, 0.0f32, 0.0f32);
-            for &v in &tri {
+            // Compute per-vertex normals using SDF gradient from each vertex's cell
+            let face_normal = Triangle::compute_face_normal(&tri);
+            let mut vertex_normals = [(0.0f32, 0.0f32, 0.0f32); 3];
+            
+            for (i, &v) in tri.iter().enumerate() {
                 let qv = quantize(v);
                 if let Some(cell) = vertex_to_cell.get(&qv) {
                     let n = compute_normal(v, cell.2, cell.3, &cell.4);
-                    avg_normal.0 += n.0;
-                    avg_normal.1 += n.1;
-                    avg_normal.2 += n.2;
+                    // Validate the normal is reasonable (not zero length)
+                    let len = (n.0 * n.0 + n.1 * n.1 + n.2 * n.2).sqrt();
+                    if len > 1e-8 {
+                        vertex_normals[i] = n;
+                    } else {
+                        // Fallback to face normal for this vertex
+                        vertex_normals[i] = face_normal;
+                    }
+                } else {
+                    // No cell data found, use face normal
+                    vertex_normals[i] = face_normal;
                 }
             }
-            let len = (avg_normal.0 * avg_normal.0 + avg_normal.1 * avg_normal.1 + avg_normal.2 * avg_normal.2).sqrt();
-            let normal = if len > 1e-8 {
-                (avg_normal.0 / len, avg_normal.1 / len, avg_normal.2 / len)
-            } else {
-                // Fallback to face normal
-                Triangle::compute_normal(&tri)
-            };
-            triangles.push(Triangle::with_normal(tri, normal));
+            
+            triangles.push(Triangle::with_vertex_normals(tri, vertex_normals));
         }
     };
     
@@ -1227,6 +1234,70 @@ fn collect_leaf_cells(
             corner_distances: node.corner_distances,
             children: None,
         }));
+    }
+}
+
+/// Smooth vertex normals by averaging normals at shared vertex positions.
+/// 
+/// This post-processing pass collects all normals at each unique vertex position
+/// across all triangles, averages them, and applies the averaged normal back.
+/// This eliminates discontinuities at cell boundaries where the same vertex
+/// appears in multiple triangles with different per-cell computed normals.
+fn smooth_vertex_normals(triangles: &mut [Triangle]) {
+    if triangles.is_empty() {
+        return;
+    }
+    
+    // Quantization scale for vertex position matching
+    let scale = 1_000_000.0f32;
+    let quantize = |v: (f32, f32, f32)| -> (i64, i64, i64) {
+        ((v.0 * scale) as i64, (v.1 * scale) as i64, (v.2 * scale) as i64)
+    };
+    
+    // Collect all normals at each unique vertex position
+    let mut vertex_normals: HashMap<(i64, i64, i64), Vec<(f32, f32, f32)>> = HashMap::new();
+    
+    for tri in triangles.iter() {
+        for i in 0..3 {
+            let key = quantize(tri.vertices[i]);
+            let normal = tri.normals[i];
+            // Only collect non-degenerate normals
+            let len2 = normal.0 * normal.0 + normal.1 * normal.1 + normal.2 * normal.2;
+            if len2 > 1e-12 {
+                vertex_normals.entry(key).or_default().push(normal);
+            }
+        }
+    }
+    
+    // Compute averaged normals for each vertex
+    let averaged_normals: HashMap<(i64, i64, i64), (f32, f32, f32)> = vertex_normals
+        .into_iter()
+        .map(|(key, normals)| {
+            let mut sum = (0.0f32, 0.0f32, 0.0f32);
+            for n in &normals {
+                sum.0 += n.0;
+                sum.1 += n.1;
+                sum.2 += n.2;
+            }
+            let len = (sum.0 * sum.0 + sum.1 * sum.1 + sum.2 * sum.2).sqrt();
+            let avg = if len > 1e-8 {
+                (sum.0 / len, sum.1 / len, sum.2 / len)
+            } else {
+                // Fallback: use first normal if average is degenerate
+                normals.first().copied().unwrap_or((0.0, 1.0, 0.0))
+            };
+            (key, avg)
+        })
+        .collect();
+    
+    // Apply averaged normals back to all triangles
+    for tri in triangles.iter_mut() {
+        for i in 0..3 {
+            let key = quantize(tri.vertices[i]);
+            if let Some(&avg_normal) = averaged_normals.get(&key) {
+                tri.normals[i] = avg_normal;
+            }
+        }
     }
 }
 
