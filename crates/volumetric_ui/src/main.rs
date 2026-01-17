@@ -26,10 +26,12 @@ use volumetric::{
     operator_metadata_from_wasm_bytes,
     Triangle,
     adaptive_surface_nets,
+    adaptive_surface_nets_2,
     stl,
     sample_model_from_bytes,
     generate_marching_cubes_mesh_from_bytes,
     generate_adaptive_mesh_from_bytes,
+    generate_adaptive_mesh_v2_from_bytes,
 };
 
 enum ConfigFieldType {
@@ -205,6 +207,7 @@ enum ExportRenderMode {
     PointCloud,
     MarchingCubes,
     AdaptiveSurfaceNets,
+    AdaptiveSurfaceNets2,
 }
 
 impl ExportRenderMode {
@@ -214,6 +217,7 @@ impl ExportRenderMode {
             ExportRenderMode::PointCloud => "Point Cloud",
             ExportRenderMode::MarchingCubes => "Marching Cubes",
             ExportRenderMode::AdaptiveSurfaceNets => "Adaptive Surface Nets",
+            ExportRenderMode::AdaptiveSurfaceNets2 => "ASN v2 (Indexed)",
         }
     }
 }
@@ -233,10 +237,12 @@ struct AssetRenderData {
     bounds_max: (f32, f32, f32),
     /// Point cloud data (for PointCloud mode)
     points: Arc<Vec<(f32, f32, f32)>>,
-    /// Triangle data (for MarchingCubes mode)
+    /// Triangle data (for MarchingCubes and AdaptiveSurfaceNets modes)
     triangles: Vec<Triangle>,
-    /// Mesh vertices (for MarchingCubes mode)
+    /// Mesh vertices (for non-indexed mesh modes)
     mesh_vertices: Arc<Vec<marching_cubes_wgpu::MeshVertex>>,
+    /// Index buffer (for indexed mesh modes like ASN2)
+    mesh_indices: Option<Arc<Vec<u32>>>,
     /// Whether this asset needs resampling
     needs_resample: bool,
 
@@ -253,17 +259,27 @@ struct AssetRenderData {
     /// Whether to automatically resample when parameters change
     auto_resample: bool,
 
-    /// Adaptive Surface Nets: base resolution (cells per axis for initial discovery)
+    /// Adaptive Surface Nets v1: base resolution (cells per axis for initial discovery)
     adaptive_base_resolution: usize,
-    /// Adaptive Surface Nets: maximum refinement depth
+    /// Adaptive Surface Nets v1: maximum refinement depth
     adaptive_max_depth: usize,
-    /// Adaptive Surface Nets: binary search iterations for edge crossing refinement (0 = disabled)
+    /// Adaptive Surface Nets v1: binary search iterations for edge crossing refinement (0 = disabled)
     adaptive_edge_refinement_iterations: usize,
-    /// Adaptive Surface Nets: vertex relaxation iterations to project vertices onto surface (0 = disabled)
+    /// Adaptive Surface Nets v1: vertex relaxation iterations to project vertices onto surface (0 = disabled)
     adaptive_vertex_relaxation_iterations: usize,
-
-    /// Adaptive Surface Nets: enable high-quality (bisection-based) normals.
+    /// Adaptive Surface Nets v1: enable high-quality (bisection-based) normals.
     adaptive_hq_normals: bool,
+
+    /// Adaptive Surface Nets v2: base resolution (cells per axis for initial discovery)
+    asn2_base_resolution: usize,
+    /// Adaptive Surface Nets v2: maximum refinement depth
+    asn2_max_depth: usize,
+    /// Adaptive Surface Nets v2: binary search iterations for vertex position refinement
+    asn2_vertex_refinement_iterations: usize,
+    /// Adaptive Surface Nets v2: iterations for normal re-estimation at refined positions (0 = use mesh normals)
+    asn2_normal_sample_iterations: usize,
+    /// Adaptive Surface Nets v2: epsilon fraction for normal estimation
+    asn2_normal_epsilon_frac: f32,
 }
 
 impl AssetRenderData {
@@ -276,17 +292,25 @@ impl AssetRenderData {
             points: Arc::new(Vec::new()),
             triangles: Vec::new(),
             mesh_vertices: Arc::new(Vec::new()),
+            mesh_indices: None,
             needs_resample: true,
             last_sample_time: None,
             last_sample_count: None,
             last_error: None,
             resolution: 20,
             auto_resample: true,
+            // ASN v1 config
             adaptive_base_resolution: 8,
             adaptive_max_depth: 4,
             adaptive_edge_refinement_iterations: 4,
             adaptive_vertex_relaxation_iterations: 2,
             adaptive_hq_normals: false,
+            // ASN v2 config
+            asn2_base_resolution: 8,
+            asn2_max_depth: 4,
+            asn2_vertex_refinement_iterations: 8,
+            asn2_normal_sample_iterations: 6,
+            asn2_normal_epsilon_frac: 0.1,
         }
     }
 }
@@ -712,10 +736,62 @@ impl VolumetricApp {
                         }
                     }
                 }
+                ExportRenderMode::AdaptiveSurfaceNets2 => {
+                    let start_time = std::time::Instant::now();
+                    let config = adaptive_surface_nets_2::AdaptiveMeshConfig2 {
+                        base_resolution: render_data.asn2_base_resolution,
+                        max_depth: render_data.asn2_max_depth,
+                        vertex_refinement_iterations: render_data.asn2_vertex_refinement_iterations,
+                        normal_sample_iterations: render_data.asn2_normal_sample_iterations,
+                        normal_epsilon_frac: render_data.asn2_normal_epsilon_frac,
+                        num_threads: 0, // Use default parallelism
+                    };
+                    match generate_adaptive_mesh_v2_from_bytes(&render_data.wasm_bytes, &config) {
+                        Ok((vertices, normals, indices, bounds_min, bounds_max)) => {
+                            let effective_res = config.base_resolution * (1 << config.max_depth);
+                            render_data.last_sample_time = Some(start_time.elapsed().as_secs_f32());
+                            render_data.last_sample_count = Some(effective_res * effective_res * effective_res);
+                            render_data.bounds_min = bounds_min;
+                            render_data.bounds_max = bounds_max;
+                            render_data.triangles.clear(); // No raw triangles for indexed mesh
+
+                            // Convert indexed mesh to MeshVertex format
+                            let mesh_vertices: Vec<marching_cubes_wgpu::MeshVertex> = vertices
+                                .iter()
+                                .zip(normals.iter())
+                                .map(|(pos, norm)| marching_cubes_wgpu::MeshVertex {
+                                    position: [pos.0, pos.1, pos.2],
+                                    _pad0: 0.0,
+                                    normal: [norm.0, norm.1, norm.2],
+                                    _pad1: 0.0,
+                                })
+                                .collect();
+
+                            render_data.mesh_vertices = Arc::new(mesh_vertices);
+                            render_data.mesh_indices = Some(Arc::new(indices));
+                            render_data.points = Arc::new(Vec::new());
+                            render_data.last_error = None;
+                        }
+                        Err(e) => {
+                            render_data.last_sample_time = None;
+                            render_data.last_sample_count = None;
+                            let msg = format!(
+                                "Export '{asset_id}' failed to mesh ({}):\n{}",
+                                render_data.mode.label(),
+                                format_anyhow_error_chain(&e)
+                            );
+                            render_data.last_error = Some(msg.clone());
+                            if self.error_message.is_none() {
+                                self.error_message = Some(msg);
+                            }
+                            log::error!("Failed to generate ASN2 mesh for export '{asset_id}': {e}");
+                        }
+                    }
+                }
             }
         }
     }
-    
+
     /// Check if any asset needs resampling
     fn any_needs_resample(&self) -> bool {
         self.asset_render_data.values().any(|d| d.needs_resample)
@@ -1934,6 +2010,11 @@ impl eframe::App for VolumetricApp {
                                                 ExportRenderMode::AdaptiveSurfaceNets,
                                                 ExportRenderMode::AdaptiveSurfaceNets.label(),
                                             );
+                                            ui.selectable_value(
+                                                &mut mode,
+                                                ExportRenderMode::AdaptiveSurfaceNets2,
+                                                ExportRenderMode::AdaptiveSurfaceNets2.label(),
+                                            );
                                         });
 
                                     if mode != current_mode {
@@ -2033,6 +2114,72 @@ impl eframe::App for VolumetricApp {
                                             }
                                         });
                                         
+                                        ui.horizontal(|ui| {
+                                            if ui.checkbox(&mut auto_resample, "Auto Resample").changed() {
+                                                render_data.auto_resample = auto_resample;
+                                            }
+                                            if !auto_resample {
+                                                if ui.button("⟳ Resample").clicked() {
+                                                    render_data.needs_resample = true;
+                                                }
+                                            }
+                                        });
+                                    }
+                                }
+
+                                // Show ASN2 config options when AdaptiveSurfaceNets2 is selected
+                                if current_mode == ExportRenderMode::AdaptiveSurfaceNets2 {
+                                    if let Some(render_data) = self.asset_render_data.get_mut(&asset_id) {
+                                        let mut base_res = render_data.asn2_base_resolution;
+                                        let mut max_depth = render_data.asn2_max_depth;
+                                        let mut auto_resample = render_data.auto_resample;
+
+                                        ui.horizontal(|ui| {
+                                            ui.label("Base Resolution:");
+                                            if ui.add(egui::DragValue::new(&mut base_res).range(2..=32)).changed() {
+                                                render_data.asn2_base_resolution = base_res;
+                                                if auto_resample {
+                                                    render_data.needs_resample = true;
+                                                }
+                                            }
+                                        });
+
+                                        ui.horizontal(|ui| {
+                                            ui.label("Max Depth:");
+                                            if ui.add(egui::DragValue::new(&mut max_depth).range(0..=6)).changed() {
+                                                render_data.asn2_max_depth = max_depth;
+                                                if auto_resample {
+                                                    render_data.needs_resample = true;
+                                                }
+                                            }
+                                        });
+
+                                        let effective_res = base_res * (1 << max_depth);
+                                        ui.weak(format!("Effective resolution: {}³", effective_res));
+
+                                        let mut vertex_refine = render_data.asn2_vertex_refinement_iterations;
+                                        let mut normal_iters = render_data.asn2_normal_sample_iterations;
+
+                                        ui.horizontal(|ui| {
+                                            ui.label("Vertex Refinement:");
+                                            if ui.add(egui::DragValue::new(&mut vertex_refine).range(0..=16)).changed() {
+                                                render_data.asn2_vertex_refinement_iterations = vertex_refine;
+                                                if auto_resample {
+                                                    render_data.needs_resample = true;
+                                                }
+                                            }
+                                        });
+
+                                        ui.horizontal(|ui| {
+                                            ui.label("Normal Sampling:");
+                                            if ui.add(egui::DragValue::new(&mut normal_iters).range(0..=16)).changed() {
+                                                render_data.asn2_normal_sample_iterations = normal_iters;
+                                                if auto_resample {
+                                                    render_data.needs_resample = true;
+                                                }
+                                            }
+                                        });
+
                                         ui.horizontal(|ui| {
                                             if ui.checkbox(&mut auto_resample, "Auto Resample").changed() {
                                                 render_data.auto_resample = auto_resample;
@@ -2207,12 +2354,45 @@ impl eframe::App for VolumetricApp {
                 painter.add(egui::Shape::Callback(cb));
             }
             
-            // Collect all mesh vertices from assets using MarchingCubes or AdaptiveSurfaceNets mode
-            let all_vertices: Vec<marching_cubes_wgpu::MeshVertex> = self.asset_render_data.values()
-                .filter(|d| d.mode == ExportRenderMode::MarchingCubes || d.mode == ExportRenderMode::AdaptiveSurfaceNets)
-                .flat_map(|d| d.mesh_vertices.iter().cloned())
+            // Collect all mesh data from assets using mesh modes
+            // For indexed meshes (ASN2), we can use indexed rendering if there's only one such asset
+            let mesh_assets: Vec<&AssetRenderData> = self.asset_render_data.values()
+                .filter(|d| matches!(d.mode,
+                    ExportRenderMode::MarchingCubes |
+                    ExportRenderMode::AdaptiveSurfaceNets |
+                    ExportRenderMode::AdaptiveSurfaceNets2))
                 .collect();
-            
+
+            // Determine if we can use indexed rendering (single ASN2 asset)
+            let single_indexed_asset = mesh_assets.len() == 1
+                && mesh_assets[0].mode == ExportRenderMode::AdaptiveSurfaceNets2
+                && mesh_assets[0].mesh_indices.is_some();
+
+            let (all_vertices, all_indices): (Vec<marching_cubes_wgpu::MeshVertex>, Option<Arc<Vec<u32>>>) =
+                if single_indexed_asset {
+                    // Use indexed rendering for single ASN2 asset
+                    let asset = mesh_assets[0];
+                    (asset.mesh_vertices.iter().cloned().collect(), asset.mesh_indices.clone())
+                } else {
+                    // Combine all meshes as non-indexed
+                    // For indexed meshes, expand them using indices
+                    let mut combined_vertices = Vec::new();
+                    for asset in &mesh_assets {
+                        if let Some(ref indices) = asset.mesh_indices {
+                            // Expand indexed mesh
+                            for &idx in indices.iter() {
+                                if let Some(v) = asset.mesh_vertices.get(idx as usize) {
+                                    combined_vertices.push(*v);
+                                }
+                            }
+                        } else {
+                            // Non-indexed mesh - add directly
+                            combined_vertices.extend(asset.mesh_vertices.iter().cloned());
+                        }
+                    }
+                    (combined_vertices, None)
+                };
+
             if !all_vertices.is_empty() {
                 let pixels_per_point = ui.ctx().pixels_per_point();
                 let viewport_size_px = [
@@ -2224,6 +2404,7 @@ impl eframe::App for VolumetricApp {
                     marching_cubes_wgpu::MarchingCubesCallback {
                         data: marching_cubes_wgpu::MarchingCubesDrawData {
                             vertices: Arc::new(all_vertices.clone()),
+                            indices: all_indices,
                             view_proj,
                             viewport_size_px,
                             ssao_enabled: self.ssao_enabled,
@@ -2260,8 +2441,18 @@ impl eframe::App for VolumetricApp {
             // Draw info text showing totals across all rendered assets
             let total_points = all_points.len();
             let total_triangles: usize = self.asset_render_data.values()
-                .filter(|d| d.mode == ExportRenderMode::MarchingCubes || d.mode == ExportRenderMode::AdaptiveSurfaceNets)
-                .map(|d| d.triangles.len())
+                .filter(|d| matches!(d.mode,
+                    ExportRenderMode::MarchingCubes |
+                    ExportRenderMode::AdaptiveSurfaceNets |
+                    ExportRenderMode::AdaptiveSurfaceNets2))
+                .map(|d| {
+                    // For ASN2, count triangles from indices
+                    if let Some(ref indices) = d.mesh_indices {
+                        indices.len() / 3
+                    } else {
+                        d.triangles.len()
+                    }
+                })
                 .sum();
             let num_assets = self.asset_render_data.len();
             

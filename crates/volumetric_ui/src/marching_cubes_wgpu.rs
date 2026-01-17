@@ -28,6 +28,8 @@ struct MeshUniforms {
 #[derive(Clone)]
 pub struct MarchingCubesDrawData {
     pub vertices: Arc<Vec<MeshVertex>>,
+    /// Optional index buffer for indexed rendering
+    pub indices: Option<Arc<Vec<u32>>>,
     pub view_proj: Mat4,
     pub viewport_size_px: [u32; 2],
     pub ssao_enabled: bool,
@@ -64,6 +66,7 @@ impl egui_wgpu::CallbackTrait for MarchingCubesCallback {
             self.data.ssao_strength,
         );
         gpu.update_vertices(device, queue, &self.data.vertices);
+        gpu.update_indices(device, queue, &self.data.indices);
         gpu.encode_gbuffer_and_ssao(egui_encoder, self.data.ssao_enabled);
 
         Vec::new()
@@ -150,8 +153,14 @@ struct MarchingCubesGpu {
     vertex_capacity: usize,
     vertex_count: u32,
 
+    index_buffer: Option<wgpu::Buffer>,
+    index_capacity: usize,
+    index_count: u32,
+
     last_vertices_ptr: usize,
     last_vertices_len: usize,
+    last_indices_ptr: usize,
+    last_indices_len: usize,
     last_view_proj: Mat4,
     last_ssao_enabled: bool,
     last_ssao_radius: f32,
@@ -213,8 +222,13 @@ impl MarchingCubesGpu {
             vertex_buffer,
             vertex_capacity,
             vertex_count: 0,
+            index_buffer: None,
+            index_capacity: 0,
+            index_count: 0,
             last_vertices_ptr: 0,
             last_vertices_len: 0,
+            last_indices_ptr: 0,
+            last_indices_len: 0,
             last_view_proj: Mat4::IDENTITY,
             last_ssao_enabled: true,
             last_ssao_radius: -1.0,
@@ -773,7 +787,15 @@ impl MarchingCubesGpu {
             pass.set_pipeline(&self.gbuffer_pipeline);
             pass.set_bind_group(0, &self.mesh_uniform_bind_group, &[]);
             pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            pass.draw(0..self.vertex_count, 0..1);
+
+            if let Some(ref index_buffer) = self.index_buffer {
+                // Indexed rendering
+                pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..self.index_count, 0, 0..1);
+            } else {
+                // Non-indexed rendering
+                pass.draw(0..self.vertex_count, 0..1);
+            }
         }
 
         // SSAO pass (optional)
@@ -844,6 +866,54 @@ impl MarchingCubesGpu {
         }
 
         queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(vertices));
+    }
+
+    fn update_indices(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        indices: &Option<Arc<Vec<u32>>>,
+    ) {
+        match indices {
+            None => {
+                // No index buffer - use non-indexed rendering
+                self.index_buffer = None;
+                self.index_count = 0;
+                self.last_indices_ptr = 0;
+                self.last_indices_len = 0;
+            }
+            Some(indices) => {
+                self.index_count = indices.len() as u32;
+
+                if indices.is_empty() {
+                    self.index_buffer = None;
+                    self.last_indices_ptr = 0;
+                    self.last_indices_len = 0;
+                    return;
+                }
+
+                let ptr = Arc::as_ptr(indices) as usize;
+                if ptr == self.last_indices_ptr && indices.len() == self.last_indices_len {
+                    return;
+                }
+                self.last_indices_ptr = ptr;
+                self.last_indices_len = indices.len();
+
+                if indices.len() > self.index_capacity {
+                    self.index_capacity = indices.len().next_power_of_two().max(1);
+                    self.index_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("marching_cubes_index_buffer"),
+                        size: (std::mem::size_of::<u32>() * self.index_capacity) as u64,
+                        usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    }));
+                }
+
+                if let Some(ref buffer) = self.index_buffer {
+                    queue.write_buffer(buffer, 0, bytemuck::cast_slice(indices));
+                }
+            }
+        }
     }
 
     fn update_uniforms(
