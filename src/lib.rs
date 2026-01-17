@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::fmt::Display;
 use std::path::Path;
 use std::sync::Arc;
+
+use anyhow::Context;
 use wasmtime::{Caller, Engine, Instance, Module, Store};
 
 /// A triangle in 3D space with vertices and per-vertex normal vectors.
@@ -242,7 +244,7 @@ pub fn sample_model(wasm_path: &Path, resolution: usize) -> anyhow::Result<(Vec<
 /// Sample points from WASM bytes (in-memory model)
 pub fn sample_model_from_bytes(wasm_bytes: &[u8], resolution: usize) -> anyhow::Result<(Vec<(f32, f32, f32)>, (f32, f32, f32), (f32, f32, f32))> {
     let engine = Engine::default();
-    let module = Module::new(&engine, wasm_bytes)?;
+    let module = Module::new(&engine, wasm_bytes).context("Failed to load WASM module from bytes")?;
 
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[])?;
@@ -323,7 +325,7 @@ pub fn generate_marching_cubes_mesh(wasm_path: &Path, resolution: usize) -> anyh
 /// Generate a mesh using marching cubes from WASM bytes
 pub fn generate_marching_cubes_mesh_from_bytes(wasm_bytes: &[u8], resolution: usize) -> anyhow::Result<(Vec<Triangle>, (f32, f32, f32), (f32, f32, f32))> {
     let engine = Engine::default();
-    let module = Module::new(&engine, wasm_bytes)?;
+    let module = Module::new(&engine, wasm_bytes).context("Failed to load WASM module from bytes")?;
 
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[])?;

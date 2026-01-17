@@ -21,7 +21,6 @@ pub fn marching_cubes_mesh<F>(
     mut is_inside: F,
 ) -> Result<Vec<Triangle>>
 where
-    // Returns density in [0,1]; current callers typically return 0.0/1.0
     F: FnMut((f32, f32, f32)) -> Result<f32>,
 {
     if resolution == 0 {
@@ -278,130 +277,226 @@ where
         }
     }
 
-    // Ensure a consistent outward-facing winding.
+    // Ensure consistent orientation across the entire mesh.
     //
-    // Surface Nets connectivity above is deterministic, but per-axis quad winding can still be
-    // tricky to reason about. For STL export (and for downstream mesh processing), we want a
-    // consistent rule: triangle normals should point from inside -> outside.
-    //
-    // We can enforce this by probing points offset from the triangle centroid along +/- its
-    // geometric normal. If we can find a distance where one side is inside and the other is
-    // outside, we can orient the triangle normal to point from inside -> outside.
-    //
-    // Some fields (thin features / high curvature / discretization) can yield cases where both
-    // probes land on the same side for several distances. In those cases we fall back to a small
-    // multi-sample vote along +/- normal to find which direction tends to go "into" the solid.
+    // Local inside/outside probing can be ambiguous on thin / high-curvature / fractal surfaces.
+    // What we need for correct back-face culling is *global* consistency: for a closed manifold
+    // surface, adjacent triangles must have opposite directed edge orientation along every shared
+    // edge. Once we enforce consistency, we can choose an outward direction per connected
+    // component using the signed volume convention.
     let min_step = step_x.min(step_y).min(step_z);
-    let eps = 0.1f32 * min_step;
-    let bounds_diag = (
-        (bounds_max.0 - bounds_min.0).powi(2)
-            + (bounds_max.1 - bounds_min.1).powi(2)
-            + (bounds_max.2 - bounds_min.2).powi(2),
-    )
-    .0
-    .sqrt();
-    if eps > 0.0 && bounds_diag > 0.0 {
-        // Try small (local) distances first, then up to a conservative fraction of the bounds.
-        // (Too large can cross unrelated parts of the surface in self-intersecting shapes.)
-        let max_d = (8.0 * min_step).max(0.05 * bounds_diag);
-        let ladder = [
-            1.0f32, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0,
-        ];
-        for tri in &mut triangles {
-            let a = tri.vertices[0];
-            let b = tri.vertices[1];
-            let c = tri.vertices[2];
+    // Match the unit-test probe convention for determining outwardness.
+    // Using the same base distance keeps behavior stable and regression tests meaningful.
+    let probe_d = 0.15f32 * min_step;
+    orient_triangles_consistently_and_outward(&mut triangles, probe_d, &mut is_inside);
 
-            // Use the face normal from the triangle for orientation check
-            let nu = tri.face_normal();
-            if nu.0 == 0.0 && nu.1 == 0.0 && nu.2 == 0.0 {
-                continue;
-            }
+    Ok(triangles)
+}
 
-            let centroid = (
-                (a.0 + b.0 + c.0) / 3.0,
-                (a.1 + b.1 + c.1) / 3.0,
-                (a.2 + b.2 + c.2) / 3.0,
-            );
+fn orient_triangles_consistently_and_outward<F>(
+    triangles: &mut [Triangle],
+    probe_d: f32,
+    is_inside: &mut F,
+) where
+    F: FnMut((f32, f32, f32)) -> Result<f32>,
+{
+    use std::collections::{HashMap, VecDeque};
 
-            let mut decided = false;
-            let mut flip = false;
-
-            // Primary: find a distance where the two sides differ.
-            for m in ladder {
-                let d = (eps * m).min(max_d);
-                if d <= 0.0 {
-                    continue;
-                }
-
-                let probe_plus = (
-                    centroid.0 + nu.0 * d,
-                    centroid.1 + nu.1 * d,
-                    centroid.2 + nu.2 * d,
-                );
-                let probe_minus = (
-                    centroid.0 - nu.0 * d,
-                    centroid.1 - nu.1 * d,
-                    centroid.2 - nu.2 * d,
-                );
-
-                let inside_plus = is_inside(probe_plus)? > 0.5;
-                let inside_minus = is_inside(probe_minus)? > 0.5;
-                if inside_plus != inside_minus {
-                    decided = true;
-                    // If moving along the current normal goes inside and the opposite direction
-                    // goes outside, the normal is pointing inward and we must flip.
-                    flip = inside_plus && !inside_minus;
-                    break;
-                }
-            }
-
-            // Fallback: vote along +/- normal to infer which direction tends to go inside.
-            if !decided {
-                let mut plus_inside_hits = 0u32;
-                let mut minus_inside_hits = 0u32;
-                // Sample a short segment (up to max_d) to avoid reaching unrelated parts.
-                let steps = 8u32;
-                for i in 1..=steps {
-                    let t = i as f32 / steps as f32;
-                    let d = (eps + t * (max_d - eps)).max(eps);
-                    let probe_plus = (
-                        centroid.0 + nu.0 * d,
-                        centroid.1 + nu.1 * d,
-                        centroid.2 + nu.2 * d,
-                    );
-                    let probe_minus = (
-                        centroid.0 - nu.0 * d,
-                        centroid.1 - nu.1 * d,
-                        centroid.2 - nu.2 * d,
-                    );
-                    if is_inside(probe_plus)? > 0.5 {
-                        plus_inside_hits += 1;
-                    }
-                    if is_inside(probe_minus)? > 0.5 {
-                        minus_inside_hits += 1;
-                    }
-                }
-
-                if plus_inside_hits != minus_inside_hits {
-                    decided = true;
-                    // More inside hits along +normal means +normal points inward.
-                    flip = plus_inside_hits > minus_inside_hits;
-                }
-            }
-
-            if decided && flip {
-                // Swap vertices and recompute normals
-                tri.vertices.swap(1, 2);
-                tri.normals.swap(1, 2);
-                // Recompute face normal and apply to all vertices
-                let new_normal = Triangle::compute_face_normal(&tri.vertices);
-                tri.normals = [new_normal, new_normal, new_normal];
-            }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    struct VKey(u32, u32, u32);
+    impl VKey {
+        fn from_v(v: (f32, f32, f32)) -> Self {
+            Self(v.0.to_bits(), v.1.to_bits(), v.2.to_bits())
         }
     }
 
-    Ok(triangles)
+    fn tri_ids(
+        tri: &Triangle,
+        vid: &mut HashMap<VKey, u32>,
+        next_id: &mut u32,
+    ) -> [u32; 3] {
+        let mut out = [0u32; 3];
+        for (i, v) in tri.vertices.iter().copied().enumerate() {
+            let k = VKey::from_v(v);
+            let id = *vid.entry(k).or_insert_with(|| {
+                let id = *next_id;
+                *next_id += 1;
+                id
+            });
+            out[i] = id;
+        }
+        out
+    }
+
+    fn undirected_edge(a: u32, b: u32) -> (u32, u32) {
+        if a < b { (a, b) } else { (b, a) }
+    }
+
+    fn edge_dir_is_min_to_max(a: u32, b: u32) -> bool {
+        // Returns true if the directed edge is from min->max for the undirected key.
+        a < b
+    }
+
+    // Build vertex-id mapping (exact float equality via bits).
+    let mut vid: HashMap<VKey, u32> = HashMap::new();
+    let mut next_id: u32 = 0;
+
+    // For each triangle, cache its current vertex ids.
+    let mut ids: Vec<[u32; 3]> = Vec::with_capacity(triangles.len());
+    for tri in triangles.iter() {
+        ids.push(tri_ids(tri, &mut vid, &mut next_id));
+    }
+
+    // Map each undirected edge to incident triangles.
+    //
+    // NOTE: we intentionally do not cache direction here, because we mutate `ids` during
+    // propagation (flipping triangles). Direction must be computed from the current `ids`.
+    let mut edge_map: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
+    for (ti, t) in ids.iter().enumerate() {
+        let e = [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])];
+        for (a, b) in e {
+            let key = undirected_edge(a, b);
+            edge_map.entry(key).or_default().push(ti);
+        }
+    }
+
+    let n = triangles.len();
+    let mut visited = vec![false; n];
+    let mut flip = vec![false; n];
+
+    // Helper: update cached ids after a flip.
+    let apply_flip_to_ids = |ti: usize, ids: &mut Vec<[u32; 3]>| {
+        ids[ti].swap(1, 2);
+    };
+
+    fn dir_for_edge_in_tri(t: [u32; 3], key: (u32, u32)) -> Option<bool> {
+        let e = [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])];
+        for (a, b) in e {
+            if undirected_edge(a, b) == key {
+                return Some(edge_dir_is_min_to_max(a, b));
+            }
+        }
+        None
+    }
+
+    // Walk each connected component (by shared edges) and enforce consistent edge directions.
+    for start in 0..n {
+        if visited[start] {
+            continue;
+        }
+
+        // BFS over triangle adjacency.
+        let mut queue = VecDeque::new();
+        let mut component = Vec::new();
+        visited[start] = true;
+        queue.push_back(start);
+
+        while let Some(ti) = queue.pop_front() {
+            component.push(ti);
+            let t = ids[ti];
+            let e = [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])];
+            for (a, b) in e {
+                let key = undirected_edge(a, b);
+                let Some(inc) = edge_map.get(&key) else {
+                    continue;
+                };
+                // Only propagate across manifold edges (exactly 2 incident triangles).
+                // For non-manifold edges, an "opposite direction" constraint is ambiguous.
+                if inc.len() != 2 {
+                    continue;
+                }
+
+                let Some(self_dir) = dir_for_edge_in_tri(ids[ti], key) else {
+                    continue;
+                };
+                let other = if inc[0] == ti { inc[1] } else { inc[0] };
+                let Some(other_dir) = dir_for_edge_in_tri(ids[other], key) else {
+                    continue;
+                };
+
+                // For an oriented manifold surface, the two incident triangles must traverse
+                // the shared undirected edge in opposite directions.
+                let should_match = self_dir == other_dir;
+                if !visited[other] {
+                    visited[other] = true;
+                    flip[other] = flip[ti] ^ should_match;
+                    if flip[other] {
+                        apply_flip_to_ids(other, &mut ids);
+                    }
+                    queue.push_back(other);
+                } else {
+                    // Already assigned; ensure we didn't contradict.
+                    // If we did, the mesh has a non-orientable / non-manifold defect; keep going.
+                }
+            }
+        }
+
+        // Apply the consistency flips to the actual triangles.
+        for &ti in &component {
+            if flip[ti] {
+                triangles[ti].vertices.swap(1, 2);
+                triangles[ti].normals.swap(1, 2);
+            }
+        }
+
+        // Now orient triangles outward using a local inside/outside probe. This is per-triangle
+        // (not component-wide) because thin/fractal features can make component-level heuristics
+        // unreliable.
+        if probe_d.is_finite() && probe_d > 0.0 {
+            let ladder = [1.0f32, 2.0, 4.0, 8.0, 16.0];
+            for &ti in &component {
+                let a = triangles[ti].vertices[0];
+                let b = triangles[ti].vertices[1];
+                let c = triangles[ti].vertices[2];
+                let n = Triangle::compute_face_normal(&[a, b, c]);
+                if n.0 == 0.0 && n.1 == 0.0 && n.2 == 0.0 {
+                    continue;
+                }
+                let centroid = (
+                    (a.0 + b.0 + c.0) / 3.0,
+                    (a.1 + b.1 + c.1) / 3.0,
+                    (a.2 + b.2 + c.2) / 3.0,
+                );
+
+                let mut decided = false;
+                let mut inward = false;
+                for m in ladder {
+                    let d = probe_d * m;
+                    let p_plus = (
+                        centroid.0 + n.0 * d,
+                        centroid.1 + n.1 * d,
+                        centroid.2 + n.2 * d,
+                    );
+                    let p_minus = (
+                        centroid.0 - n.0 * d,
+                        centroid.1 - n.1 * d,
+                        centroid.2 - n.2 * d,
+                    );
+                    let inside_plus = is_inside(p_plus).ok().is_some_and(|v| v > 0.5);
+                    let inside_minus = is_inside(p_minus).ok().is_some_and(|v| v > 0.5);
+                    if inside_plus != inside_minus {
+                        decided = true;
+                        inward = inside_plus && !inside_minus;
+                        break;
+                    }
+                }
+
+                if decided && inward {
+                    triangles[ti].vertices.swap(1, 2);
+                    triangles[ti].normals.swap(1, 2);
+                }
+
+                let nn = Triangle::compute_face_normal(&triangles[ti].vertices);
+                triangles[ti].normals = [nn, nn, nn];
+            }
+        } else {
+            // Always keep normals consistent with geometry.
+            for &ti in &component {
+                let nn = Triangle::compute_face_normal(&triangles[ti].vertices);
+                triangles[ti].normals = [nn, nn, nn];
+            }
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -413,6 +508,71 @@ fn interpolate_vertex(p1: (f32, f32, f32), p2: (f32, f32, f32)) -> (f32, f32, f3
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    fn mandelbulb_inside(cx: f32, cy: f32, cz: f32) -> bool {
+        // Mirror `crates/models/mandelbulb_model` so tests exercise the same torture case.
+        let power: f64 = 8.0;
+        let max_iter: u32 = 18;
+        let bailout: f64 = 2.0;
+        let s: f64 = 0.9;
+
+        let cx = cx as f64 * s;
+        let cy = cy as f64 * s;
+        let cz = cz as f64 * s;
+
+        let mut x = 0.0f64;
+        let mut y = 0.0f64;
+        let mut z = 0.0f64;
+
+        for _ in 0..max_iter {
+            let r = (x * x + y * y + z * z).sqrt();
+            if r > bailout {
+                return false;
+            }
+            if r < 1.0e-6 {
+                x = cx;
+                y = cy;
+                z = cz;
+                continue;
+            }
+
+            let theta = (z / r).clamp(-1.0, 1.0).acos();
+            let phi = y.atan2(x);
+
+            let rp = r.powf(power);
+            let thetap = theta * power;
+            let phip = phi * power;
+
+            let sin_t = thetap.sin();
+            let nx = rp * sin_t * phip.cos();
+            let ny = rp * sin_t * phip.sin();
+            let nz = rp * thetap.cos();
+
+            x = nx + cx;
+            y = ny + cy;
+            z = nz + cz;
+        }
+
+        true
+    }
+
+    fn assert_reasonable_vertex_normals(tris: &[Triangle]) {
+        // Marching cubes produces per-triangle (or per-vertex) normals; for shading and
+        // back-face culling correctness we at least require non-degenerate, roughly unit normals.
+        let mut bad = 0usize;
+        let mut total = 0usize;
+        for tri in tris {
+            for n in tri.normals {
+                let len2 = n.0 * n.0 + n.1 * n.1 + n.2 * n.2;
+                total += 1;
+                if !(len2.is_finite()) || len2 < 0.25 || len2 > 4.0 {
+                    bad += 1;
+                }
+            }
+        }
+        assert!(bad == 0, "found {bad}/{total} invalid normals (expected all finite and near-unit)");
+    }
 
     fn triangle_unit_normal(tri: &Triangle) -> Option<(f32, f32, f32)> {
         let n = tri.face_normal();
@@ -427,6 +587,92 @@ mod tests {
         let b = tri.vertices[1];
         let c = tri.vertices[2];
         ((a.0 + b.0 + c.0) / 3.0, (a.1 + b.1 + c.1) / 3.0, (a.2 + b.2 + c.2) / 3.0)
+    }
+
+    fn assert_closed_oriented_manifold_edges(tris: &[Triangle]) {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+        struct VKey(u32, u32, u32);
+        impl VKey {
+            fn from_v(v: (f32, f32, f32)) -> Self {
+                Self(v.0.to_bits(), v.1.to_bits(), v.2.to_bits())
+            }
+        }
+
+        fn undirected(a: u32, b: u32) -> (u32, u32) {
+            if a < b { (a, b) } else { (b, a) }
+        }
+
+        let mut vid: HashMap<VKey, u32> = HashMap::new();
+        let mut next_id: u32 = 0;
+
+        let mut edge_counts: HashMap<(u32, u32), (u32, u32)> = HashMap::new();
+        // For each undirected edge key, count how often it appears with direction min->max vs max->min.
+        for tri in tris {
+            let mut ids = [0u32; 3];
+            for (i, v) in tri.vertices.iter().copied().enumerate() {
+                let k = VKey::from_v(v);
+                let id = *vid.entry(k).or_insert_with(|| {
+                    let id = next_id;
+                    next_id += 1;
+                    id
+                });
+                ids[i] = id;
+            }
+
+            let e = [(ids[0], ids[1]), (ids[1], ids[2]), (ids[2], ids[0])];
+            for (a, b) in e {
+                let key = undirected(a, b);
+                let entry = edge_counts.entry(key).or_insert((0, 0));
+                if a < b {
+                    entry.0 += 1;
+                } else {
+                    entry.1 += 1;
+                }
+            }
+        }
+
+        // For a closed surface, we require:
+        // - no boundary edges (an edge referenced only once => a hole/crack)
+        // - consistent orientation (for any undirected edge, the number of times it appears as
+        //   min->max must equal the number of times it appears as max->min)
+        //
+        // We intentionally do NOT assert that each edge is referenced exactly twice, because some
+        // discretizations can produce coincident/duplicate triangles without causing back-face
+        // culling holes (and the renderer symptom we care about is missing triangles).
+        let mut boundary_edges = Vec::new();
+        let mut imbalanced_edges = Vec::new();
+        for (key, (min_to_max, max_to_min)) in edge_counts {
+            let total = min_to_max + max_to_min;
+            if total == 1 {
+                boundary_edges.push((key, min_to_max, max_to_min));
+            } else if min_to_max != max_to_min {
+                imbalanced_edges.push((key, min_to_max, max_to_min));
+            }
+        }
+
+        if !boundary_edges.is_empty() || !imbalanced_edges.is_empty() {
+            boundary_edges.sort_by_key(|e| e.1 + e.2);
+            imbalanced_edges.sort_by_key(|e| e.1.abs_diff(e.2));
+
+            let sample_boundary: Vec<String> = boundary_edges
+                .iter()
+                .take(6)
+                .map(|((a, b), c0, c1)| format!("edge({a},{b}) counts(min->max={c0}, max->min={c1})"))
+                .collect();
+            let sample_imbalanced: Vec<String> = imbalanced_edges
+                .iter()
+                .take(6)
+                .map(|((a, b), c0, c1)| format!("edge({a},{b}) counts(min->max={c0}, max->min={c1})"))
+                .collect();
+
+            panic!(
+                "mesh has orientation defects: boundary_edges={} imbalanced_edges={} sample_boundary=[{}] sample_imbalanced=[{}]",
+                boundary_edges.len(),
+                imbalanced_edges.len(),
+                sample_boundary.join(", "),
+                sample_imbalanced.join(", ")
+            );
+        }
     }
 
     #[test]
@@ -625,5 +871,123 @@ mod tests {
             "torus outward normals ratio too low: ok={ok} decided={decided} total={}",
             tris.len()
         );
+    }
+
+    #[test]
+    fn mandelbulb_field_has_consistent_normals_via_inside_outside_probe() {
+        let bounds_min = (-1.35, -1.35, -1.35);
+        let bounds_max = (1.35, 1.35, 1.35);
+        // Keep this reasonably fast for CI; the mandelbulb is inherently heavy.
+        let resolution = 20;
+
+        let tris = marching_cubes_mesh(bounds_min, bounds_max, resolution, |p| {
+            Ok(if mandelbulb_inside(p.0, p.1, p.2) { 1.0 } else { 0.0 })
+        })
+        .unwrap();
+        assert!(!tris.is_empty(), "expected mandelbulb to produce triangles");
+        assert_reasonable_vertex_normals(&tris);
+
+        let min_step = (bounds_max.0 - bounds_min.0) / resolution as f32;
+        let eps = 0.15 * min_step;
+        let ladder = [1.0f32, 2.0, 4.0, 8.0, 16.0];
+
+        let mut decided = 0usize;
+        let mut ok = 0usize;
+        for tri in &tris {
+            let Some(nu) = triangle_unit_normal(tri) else {
+                continue;
+            };
+            let c = triangle_centroid(tri);
+
+            // Decide orientation by checking whether +normal tends to go outside and -normal tends to go inside.
+            let mut local_decided = false;
+            let mut local_ok = false;
+            for m in ladder {
+                let d = eps * m;
+                let p_plus = (c.0 + nu.0 * d, c.1 + nu.1 * d, c.2 + nu.2 * d);
+                let p_minus = (c.0 - nu.0 * d, c.1 - nu.1 * d, c.2 - nu.2 * d);
+                let inside_plus = mandelbulb_inside(p_plus.0, p_plus.1, p_plus.2);
+                let inside_minus = mandelbulb_inside(p_minus.0, p_minus.1, p_minus.2);
+                if inside_plus != inside_minus {
+                    local_decided = true;
+                    // Outward-facing should go outside along +normal and inside along -normal.
+                    local_ok = !inside_plus && inside_minus;
+                    break;
+                }
+            }
+
+            if local_decided {
+                decided += 1;
+                if local_ok {
+                    ok += 1;
+                }
+            }
+        }
+
+        // The mandelbulb has lots of thin features; we allow a lower “decided” rate than the torus.
+        assert!(
+            decided as f32 >= tris.len() as f32 * 0.90,
+            "too many undecidable triangles: decided={decided} total={}",
+            tris.len()
+        );
+        assert!(
+            ok as f32 >= decided as f32 * 0.98,
+            "mandelbulb outward normals ratio too low: ok={ok} decided={decided} total={}",
+            tris.len()
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn mandelbulb_field_has_consistent_normals_via_inside_outside_probe_high_res() {
+        // Heavier torture test intended for local runs when chasing regressions.
+        let bounds_min = (-1.35, -1.35, -1.35);
+        let bounds_max = (1.35, 1.35, 1.35);
+        let resolution = 28;
+
+        let tris = marching_cubes_mesh(bounds_min, bounds_max, resolution, |p| {
+            Ok(if mandelbulb_inside(p.0, p.1, p.2) { 1.0 } else { 0.0 })
+        })
+        .unwrap();
+        assert!(!tris.is_empty());
+        assert_reasonable_vertex_normals(&tris);
+
+        let min_step = (bounds_max.0 - bounds_min.0) / resolution as f32;
+        let eps = 0.15 * min_step;
+        let ladder = [1.0f32, 2.0, 4.0, 8.0, 16.0];
+
+        let mut decided = 0usize;
+        let mut ok = 0usize;
+        for tri in &tris {
+            let Some(nu) = triangle_unit_normal(tri) else {
+                continue;
+            };
+            let c = triangle_centroid(tri);
+
+            let mut local_decided = false;
+            let mut local_ok = false;
+            for m in ladder {
+                let d = eps * m;
+                let p_plus = (c.0 + nu.0 * d, c.1 + nu.1 * d, c.2 + nu.2 * d);
+                let p_minus = (c.0 - nu.0 * d, c.1 - nu.1 * d, c.2 - nu.2 * d);
+                let inside_plus = mandelbulb_inside(p_plus.0, p_plus.1, p_plus.2);
+                let inside_minus = mandelbulb_inside(p_minus.0, p_minus.1, p_minus.2);
+                if inside_plus != inside_minus {
+                    local_decided = true;
+                    local_ok = !inside_plus && inside_minus;
+                    break;
+                }
+            }
+
+            if local_decided {
+                decided += 1;
+                if local_ok {
+                    ok += 1;
+                }
+            }
+        }
+
+        assert!(decided as f32 >= tris.len() as f32 * 0.92, "decided={decided} total={}", tris.len());
+        assert!(ok as f32 >= decided as f32 * 0.99, "ok={ok} decided={decided} total={}", tris.len());
     }
 }

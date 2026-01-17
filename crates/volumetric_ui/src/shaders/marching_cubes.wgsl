@@ -16,26 +16,40 @@ struct VsIn {
 
 struct VsOut {
     @builtin(position) position: vec4<f32>,
-    @location(0) normal: vec3<f32>,
+    @location(0) normal_world: vec3<f32>,
 };
 
 @vertex
 fn vs_main(in: VsIn) -> VsOut {
     var out: VsOut;
     out.position = uniforms.view_proj * vec4<f32>(in.position, 1.0);
-    out.normal = in.normal;
+    out.normal_world = in.normal;
     return out;
 }
 
+struct FsOut {
+    @location(0) color: vec4<f32>,
+    // Encoded normal in 0..1 for sampling
+    @location(1) normal_enc: vec4<f32>,
+    // Store fragment depth (0..1, wgpu NDC Z range) for SSAO sampling
+    @location(2) depth: f32,
+};
+
 @fragment
-fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let n = normalize(in.normal);
+fn fs_gbuffer(in: VsOut) -> FsOut {
+    let n = normalize(in.normal_world);
     let l = normalize(uniforms.light_dir_world);
 
-    let ndotl = abs(dot(n, l));
-    let ambient = 0.25;
-    let diffuse = 0.75 * ndotl;
+    // Manifold meshes: use one-sided lighting and rely on back-face culling.
+    let ndotl = max(dot(n, l), 0.0);
+    let ambient = 0.22;
+    let diffuse = 0.78 * ndotl;
     let color = uniforms.base_color * (ambient + diffuse);
 
-    return vec4<f32>(color, 1.0);
+    var out: FsOut;
+    out.color = vec4<f32>(color, 1.0);
+    out.normal_enc = vec4<f32>(n * 0.5 + vec3<f32>(0.5), 1.0);
+    // `in.position` is clip-space; convert to wgpu NDC depth in [0,1].
+    out.depth = in.position.z / in.position.w;
+    return out;
 }

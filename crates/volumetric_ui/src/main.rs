@@ -344,6 +344,12 @@ struct VolumetricApp {
     edit_output_asset_id: String,
     /// Whether to automatically rebuild the project when entries change
     auto_rebuild: bool,
+
+    // Shading
+    ssao_enabled: bool,
+    ssao_radius: f32,
+    ssao_bias: f32,
+    ssao_strength: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -432,6 +438,11 @@ impl VolumetricApp {
             edit_input_asset_ids: Vec::new(),
             edit_output_asset_id: String::new(),
             auto_rebuild: true,
+
+            ssao_enabled: true,
+            ssao_radius: 0.08,
+            ssao_bias: 0.002,
+            ssao_strength: 1.6,
         }
     }
 
@@ -1310,6 +1321,27 @@ impl eframe::App for VolumetricApp {
                             }
                         });
 
+                        ui.separator();
+                        ui.label("Shading");
+                        ui.checkbox(&mut self.ssao_enabled, "SSAO");
+                        ui.add_enabled(
+                            self.ssao_enabled,
+                            egui::Slider::new(&mut self.ssao_radius, 0.005..=0.5)
+                                .logarithmic(true)
+                                .text("SSAO radius"),
+                        );
+                        ui.add_enabled(
+                            self.ssao_enabled,
+                            egui::Slider::new(&mut self.ssao_bias, 0.0001..=0.02)
+                                .logarithmic(true)
+                                .text("SSAO bias"),
+                        );
+                        ui.add_enabled(
+                            self.ssao_enabled,
+                            egui::Slider::new(&mut self.ssao_strength, 0.5..=4.0)
+                                .text("SSAO strength"),
+                        );
+
                         // Project file operations
                         ui.horizontal(|ui| {
                             if ui.button("Open Project…").clicked() {
@@ -2182,12 +2214,22 @@ impl eframe::App for VolumetricApp {
                 .collect();
             
             if !all_vertices.is_empty() {
+                let pixels_per_point = ui.ctx().pixels_per_point();
+                let viewport_size_px = [
+                    (rect.width() * pixels_per_point).round().max(1.0) as u32,
+                    (rect.height() * pixels_per_point).round().max(1.0) as u32,
+                ];
                 let cb = eframe::egui_wgpu::Callback::new_paint_callback(
                     rect,
                     marching_cubes_wgpu::MarchingCubesCallback {
                         data: marching_cubes_wgpu::MarchingCubesDrawData {
                             vertices: Arc::new(all_vertices.clone()),
                             view_proj,
+                            viewport_size_px,
+                            ssao_enabled: self.ssao_enabled,
+                            ssao_radius: self.ssao_radius,
+                            ssao_bias: self.ssao_bias,
+                            ssao_strength: self.ssao_strength,
                             target_format: self.wgpu_target_format,
                         },
                     },
@@ -2254,8 +2296,34 @@ fn triangles_to_mesh_vertices(triangles: &[Triangle]) -> Vec<marching_cubes_wgpu
     let mut out = Vec::with_capacity(triangles.len() * 3);
 
     for tri in triangles {
-        // Use per-vertex normals for smooth shading
-        for i in 0..3 {
+        // With back-face culling enabled, inconsistent triangle winding will show up as
+        // apparent "holes". Some mesh sources can produce triangles whose vertex order is
+        // flipped relative to their normals.
+        //
+        // Fix this robustly by ensuring the geometric face normal points in the same general
+        // direction as the average of the provided vertex normals.
+        let (ax, ay, az) = tri.vertices[0];
+        let (bx, by, bz) = tri.vertices[1];
+        let (cx, cy, cz) = tri.vertices[2];
+        let ab = (bx - ax, by - ay, bz - az);
+        let ac = (cx - ax, cy - ay, cz - az);
+        let face_n = (
+            ab.1 * ac.2 - ab.2 * ac.1,
+            ab.2 * ac.0 - ab.0 * ac.2,
+            ab.0 * ac.1 - ab.1 * ac.0,
+        );
+        let avg_n = (
+            tri.normals[0].0 + tri.normals[1].0 + tri.normals[2].0,
+            tri.normals[0].1 + tri.normals[1].1 + tri.normals[2].1,
+            tri.normals[0].2 + tri.normals[1].2 + tri.normals[2].2,
+        );
+        let dot = face_n.0 * avg_n.0 + face_n.1 * avg_n.1 + face_n.2 * avg_n.2;
+        let flip_winding = dot < 0.0;
+
+        // Use per-vertex normals for smooth shading.
+        // If winding is flipped, swap indices 1 and 2 (and their normals) to restore CCW.
+        let idxs: [usize; 3] = if flip_winding { [0, 2, 1] } else { [0, 1, 2] };
+        for i in idxs {
             let v = tri.vertices[i];
             let n = tri.normals[i];
             
