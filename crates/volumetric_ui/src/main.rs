@@ -309,7 +309,8 @@ impl AssetRenderData {
             asn2_base_resolution: 8,
             asn2_max_depth: 4,
             asn2_vertex_refinement_iterations: 8,
-            asn2_normal_sample_iterations: 6,
+            // Normal refinement via tangent probing - works well with binary samplers
+            asn2_normal_sample_iterations: 4,
             asn2_normal_epsilon_frac: 0.1,
         }
     }
@@ -2171,7 +2172,7 @@ impl eframe::App for VolumetricApp {
                                         });
 
                                         ui.horizontal(|ui| {
-                                            ui.label("Normal Sampling:");
+                                            ui.label("Normal Refinement:");
                                             if ui.add(egui::DragValue::new(&mut normal_iters).range(0..=16)).changed() {
                                                 render_data.asn2_normal_sample_iterations = normal_iters;
                                                 if auto_resample {
@@ -2179,6 +2180,11 @@ impl eframe::App for VolumetricApp {
                                                 }
                                             }
                                         });
+                                        if normal_iters == 0 {
+                                            ui.weak("Using accumulated face normals (fast)");
+                                        } else {
+                                            ui.weak(format!("Probing surface with {} iterations per direction", normal_iters));
+                                        }
 
                                         ui.horizontal(|ui| {
                                             if ui.checkbox(&mut auto_resample, "Auto Resample").changed() {

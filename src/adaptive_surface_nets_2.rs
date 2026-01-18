@@ -195,19 +195,35 @@ use dashmap::DashSet;
 pub struct AdaptiveMeshConfig2 {
     /// Base grid resolution for initial discovery (e.g., 8 means 8³ coarse cells)
     pub base_resolution: usize,
-    
+
     /// Maximum refinement depth (total resolution = base_resolution * 2^max_depth)
     pub max_depth: usize,
-    
+
     /// Number of binary search iterations for vertex position refinement
     pub vertex_refinement_iterations: usize,
-    
-    /// Number of samples for normal estimation per vertex
+
+    /// Number of binary search iterations for normal refinement probing.
+    ///
+    /// When set to 0, accumulated face normals are used directly (fast, good for
+    /// most cases).
+    ///
+    /// When set to > 0, normals are refined by probing the surface in tangent
+    /// directions and fitting a plane to the discovered surface points. This
+    /// provides smoother normals, especially on curved surfaces. Each probe uses
+    /// this many binary search iterations to find the surface crossing.
+    ///
+    /// Typical values: 0 (disabled), 4-8 (good quality).
+    /// Higher values give more precise surface point locations but cost more samples.
     pub normal_sample_iterations: usize,
-    
-    /// Epsilon for normal sampling (fraction of cell size)
+
+    /// Probe distance for normal refinement (fraction of cell size).
+    ///
+    /// Controls how far apart the tangent probes are spaced relative to the
+    /// finest-level cell size. Larger values capture more surface curvature.
+    ///
+    /// Typical values: 0.1 - 0.5
     pub normal_epsilon_frac: f32,
-    
+
     /// Number of worker threads (0 = use available parallelism)
     pub num_threads: usize,
 }
@@ -218,7 +234,8 @@ impl Default for AdaptiveMeshConfig2 {
             base_resolution: 8,
             max_depth: 4,
             vertex_refinement_iterations: 8,
-            normal_sample_iterations: 6,
+            // Enable normal refinement by default - probing works well with binary samplers
+            normal_sample_iterations: 4,
             normal_epsilon_frac: 0.1,
             num_threads: 0,
         }
@@ -1438,52 +1455,438 @@ where
     )
 }
 
-/// Estimate the surface normal at a position using central differences.
+// =============================================================================
+// NORMAL REFINEMENT VIA TANGENT PLANE PROBING
+// =============================================================================
+
+/// Compute an orthonormal basis (T1, T2) perpendicular to the given normal vector.
 ///
-/// Samples 6 points around the position (±epsilon in each axis) and
-/// computes the gradient direction, which is perpendicular to the surface.
-fn estimate_normal_at_position<F>(
-    pos: (f64, f64, f64),
-    epsilon: f64,
+/// Uses the "Hughes-Möller" method to avoid numerical instability when the normal
+/// is aligned with a coordinate axis.
+fn orthonormal_basis_perpendicular_to(n: (f64, f64, f64)) -> ((f64, f64, f64), (f64, f64, f64)) {
+    // Normalize input
+    let len_sq = n.0 * n.0 + n.1 * n.1 + n.2 * n.2;
+    if len_sq < 1e-12 {
+        // Degenerate - return arbitrary basis
+        return ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0));
+    }
+    let inv_len = 1.0 / len_sq.sqrt();
+    let n = (n.0 * inv_len, n.1 * inv_len, n.2 * inv_len);
+
+    // Choose the axis that n is least aligned with
+    let abs_x = n.0.abs();
+    let abs_y = n.1.abs();
+    let abs_z = n.2.abs();
+
+    let reference = if abs_x <= abs_y && abs_x <= abs_z {
+        (1.0, 0.0, 0.0) // n is least aligned with X
+    } else if abs_y <= abs_z {
+        (0.0, 1.0, 0.0) // n is least aligned with Y
+    } else {
+        (0.0, 0.0, 1.0) // n is least aligned with Z
+    };
+
+    // T1 = normalize(reference × n)
+    let t1_raw = (
+        reference.1 * n.2 - reference.2 * n.1,
+        reference.2 * n.0 - reference.0 * n.2,
+        reference.0 * n.1 - reference.1 * n.0,
+    );
+    let t1_len = (t1_raw.0 * t1_raw.0 + t1_raw.1 * t1_raw.1 + t1_raw.2 * t1_raw.2).sqrt();
+    let t1 = (t1_raw.0 / t1_len, t1_raw.1 / t1_len, t1_raw.2 / t1_len);
+
+    // T2 = n × T1 (already normalized since n and T1 are unit vectors and perpendicular)
+    let t2 = (
+        n.1 * t1.2 - n.2 * t1.1,
+        n.2 * t1.0 - n.0 * t1.2,
+        n.0 * t1.1 - n.1 * t1.0,
+    );
+
+    (t1, t2)
+}
+
+/// Find a surface crossing point by binary search starting from a given position,
+/// searching along the specified direction.
+///
+/// Returns Some(surface_point) if a crossing is found, None otherwise.
+fn find_surface_point_along_direction<F>(
+    start_pos: (f64, f64, f64),
+    search_dir: (f64, f64, f64),
+    search_distance: f64,
+    iterations: usize,
+    sampler: &F,
+    stats: &SamplingStats,
+) -> Option<(f64, f64, f64)>
+where
+    F: Fn(f64, f64, f64) -> f32,
+{
+    // Sample at start position
+    let start_inside = sample_is_inside(sampler, start_pos.0, start_pos.1, start_pos.2, stats);
+
+    // Sample at +distance and -distance along search direction
+    let pos_plus = (
+        start_pos.0 + search_dir.0 * search_distance,
+        start_pos.1 + search_dir.1 * search_distance,
+        start_pos.2 + search_dir.2 * search_distance,
+    );
+    let pos_minus = (
+        start_pos.0 - search_dir.0 * search_distance,
+        start_pos.1 - search_dir.1 * search_distance,
+        start_pos.2 - search_dir.2 * search_distance,
+    );
+
+    let inside_plus = sample_is_inside(sampler, pos_plus.0, pos_plus.1, pos_plus.2, stats);
+    let inside_minus = sample_is_inside(sampler, pos_minus.0, pos_minus.1, pos_minus.2, stats);
+
+    // Find an interval with a crossing
+    let (mut a, mut b, mut inside_a) = if start_inside != inside_plus {
+        (start_pos, pos_plus, start_inside)
+    } else if start_inside != inside_minus {
+        (start_pos, pos_minus, start_inside)
+    } else if inside_plus != inside_minus {
+        (pos_minus, pos_plus, inside_minus)
+    } else {
+        // No crossing found
+        return None;
+    };
+
+    // Binary search to refine
+    for _ in 0..iterations {
+        let mid = (
+            (a.0 + b.0) * 0.5,
+            (a.1 + b.1) * 0.5,
+            (a.2 + b.2) * 0.5,
+        );
+        let inside_mid = sample_is_inside(sampler, mid.0, mid.1, mid.2, stats);
+
+        if inside_mid == inside_a {
+            a = mid;
+            inside_a = inside_mid;
+        } else {
+            b = mid;
+        }
+    }
+
+    Some((
+        (a.0 + b.0) * 0.5,
+        (a.1 + b.1) * 0.5,
+        (a.2 + b.2) * 0.5,
+    ))
+}
+
+/// Fit a plane to a set of 3D points using PCA (Principal Component Analysis).
+///
+/// Returns (normal, residual) where:
+/// - normal: the direction perpendicular to the best-fit plane
+/// - residual: sum of squared distances from points to the plane (indicates fit quality)
+///
+/// For edge/corner detection: low residual = smooth surface, high residual = edge/corner
+fn fit_plane_to_points(points: &[(f64, f64, f64)]) -> ((f64, f64, f64), f64) {
+    let n = points.len();
+    if n < 3 {
+        // Not enough points - return arbitrary normal
+        return ((0.0, 1.0, 0.0), f64::MAX);
+    }
+
+    // Compute centroid
+    let mut cx = 0.0;
+    let mut cy = 0.0;
+    let mut cz = 0.0;
+    for p in points {
+        cx += p.0;
+        cy += p.1;
+        cz += p.2;
+    }
+    let inv_n = 1.0 / n as f64;
+    cx *= inv_n;
+    cy *= inv_n;
+    cz *= inv_n;
+
+    // For small point sets (up to 5 points), use cross-product averaging approach.
+    // This is more numerically stable than matrix inversion when points lie on a plane.
+    //
+    // Approach: form triangles from centroid to pairs of points, compute each triangle's
+    // normal via cross product, and average them.
+    if n <= 5 {
+        let mut sum_normal = (0.0, 0.0, 0.0);
+
+        for i in 0..n {
+            let j = (i + 1) % n;
+            let v1 = (
+                points[i].0 - cx,
+                points[i].1 - cy,
+                points[i].2 - cz,
+            );
+            let v2 = (
+                points[j].0 - cx,
+                points[j].1 - cy,
+                points[j].2 - cz,
+            );
+            // Cross product v1 × v2
+            let normal = (
+                v1.1 * v2.2 - v1.2 * v2.1,
+                v1.2 * v2.0 - v1.0 * v2.2,
+                v1.0 * v2.1 - v1.1 * v2.0,
+            );
+            sum_normal.0 += normal.0;
+            sum_normal.1 += normal.1;
+            sum_normal.2 += normal.2;
+        }
+
+        let len = (sum_normal.0 * sum_normal.0 + sum_normal.1 * sum_normal.1 + sum_normal.2 * sum_normal.2).sqrt();
+        if len < 1e-12 {
+            // Degenerate - all points collinear
+            return ((0.0, 1.0, 0.0), f64::MAX);
+        }
+
+        let fitted_normal = (sum_normal.0 / len, sum_normal.1 / len, sum_normal.2 / len);
+
+        // Compute residual: sum of squared distances from each point to the fitted plane
+        let mut residual = 0.0;
+        for p in points {
+            let d = (p.0 - cx) * fitted_normal.0 + (p.1 - cy) * fitted_normal.1 + (p.2 - cz) * fitted_normal.2;
+            residual += d * d;
+        }
+
+        return (fitted_normal, residual);
+    }
+
+    // For larger point sets, use covariance matrix approach with deflation-based PCA
+    // Build covariance matrix (symmetric 3x3)
+    // M = Σ (p - c)(p - c)^T
+    let mut m00 = 0.0;
+    let mut m01 = 0.0;
+    let mut m02 = 0.0;
+    let mut m11 = 0.0;
+    let mut m12 = 0.0;
+    let mut m22 = 0.0;
+
+    for p in points {
+        let dx = p.0 - cx;
+        let dy = p.1 - cy;
+        let dz = p.2 - cz;
+        m00 += dx * dx;
+        m01 += dx * dy;
+        m02 += dx * dz;
+        m11 += dy * dy;
+        m12 += dy * dz;
+        m22 += dz * dz;
+    }
+
+    // Find eigenvector with smallest eigenvalue using deflation:
+    // 1. Find largest eigenvector via power iteration on M
+    // 2. Deflate: M' = M - λ1 * v1 * v1^T
+    // 3. Find largest eigenvector of M' (= second eigenvector of M)
+    // 4. Normal = v1 × v2 (perpendicular to both in-plane directions)
+
+    // Power iteration to find largest eigenvector
+    let mut v1: (f64, f64, f64) = (1.0, 0.0, 0.0);
+    for _ in 0..10 {
+        let new_v = (
+            m00 * v1.0 + m01 * v1.1 + m02 * v1.2,
+            m01 * v1.0 + m11 * v1.1 + m12 * v1.2,
+            m02 * v1.0 + m12 * v1.1 + m22 * v1.2,
+        );
+        let len = (new_v.0 * new_v.0 + new_v.1 * new_v.1 + new_v.2 * new_v.2).sqrt();
+        if len < 1e-12 {
+            break;
+        }
+        v1 = (new_v.0 / len, new_v.1 / len, new_v.2 / len);
+    }
+
+    // Deflate: M2 = M - λ1 * v1 * v1^T where λ1 = v1^T * M * v1
+    let lambda1 = m00 * v1.0 * v1.0 + m11 * v1.1 * v1.1 + m22 * v1.2 * v1.2
+        + 2.0 * m01 * v1.0 * v1.1 + 2.0 * m02 * v1.0 * v1.2 + 2.0 * m12 * v1.1 * v1.2;
+
+    let d00 = m00 - lambda1 * v1.0 * v1.0;
+    let d01 = m01 - lambda1 * v1.0 * v1.1;
+    let d02 = m02 - lambda1 * v1.0 * v1.2;
+    let d11 = m11 - lambda1 * v1.1 * v1.1;
+    let d12 = m12 - lambda1 * v1.1 * v1.2;
+    let d22 = m22 - lambda1 * v1.2 * v1.2;
+
+    // Find largest eigenvector of deflated matrix (= second eigenvector of M)
+    // Start with vector orthogonal to v1
+    let mut v2 = if v1.0.abs() < 0.9 {
+        (1.0 - v1.0 * v1.0, -v1.0 * v1.1, -v1.0 * v1.2)
+    } else {
+        (-v1.1 * v1.0, 1.0 - v1.1 * v1.1, -v1.1 * v1.2)
+    };
+    let len2 = (v2.0 * v2.0 + v2.1 * v2.1 + v2.2 * v2.2).sqrt();
+    if len2 > 1e-12 {
+        v2 = (v2.0 / len2, v2.1 / len2, v2.2 / len2);
+    }
+
+    for _ in 0..10 {
+        let new_v = (
+            d00 * v2.0 + d01 * v2.1 + d02 * v2.2,
+            d01 * v2.0 + d11 * v2.1 + d12 * v2.2,
+            d02 * v2.0 + d12 * v2.1 + d22 * v2.2,
+        );
+        let len = (new_v.0 * new_v.0 + new_v.1 * new_v.1 + new_v.2 * new_v.2).sqrt();
+        if len < 1e-12 {
+            break;
+        }
+        v2 = (new_v.0 / len, new_v.1 / len, new_v.2 / len);
+        // Orthogonalize against v1
+        let dot = v2.0 * v1.0 + v2.1 * v1.1 + v2.2 * v1.2;
+        v2 = (v2.0 - dot * v1.0, v2.1 - dot * v1.1, v2.2 - dot * v1.2);
+        let len = (v2.0 * v2.0 + v2.1 * v2.1 + v2.2 * v2.2).sqrt();
+        if len < 1e-12 {
+            break;
+        }
+        v2 = (v2.0 / len, v2.1 / len, v2.2 / len);
+    }
+
+    // The normal is perpendicular to both v1 and v2
+    let normal = (
+        v1.1 * v2.2 - v1.2 * v2.1,
+        v1.2 * v2.0 - v1.0 * v2.2,
+        v1.0 * v2.1 - v1.1 * v2.0,
+    );
+    let len = (normal.0 * normal.0 + normal.1 * normal.1 + normal.2 * normal.2).sqrt();
+    if len < 1e-12 {
+        return ((0.0, 1.0, 0.0), f64::MAX);
+    }
+    let v = (normal.0 / len, normal.1 / len, normal.2 / len);
+
+    // Compute residual: sum of squared distances to the fitted plane
+    let mut residual = 0.0;
+    for p in points {
+        let d = (p.0 - cx) * v.0 + (p.1 - cy) * v.1 + (p.2 - cz) * v.2;
+        residual += d * d;
+    }
+
+    (v, residual)
+}
+
+/// Refine a surface normal by probing the surface in tangent directions.
+///
+/// # Algorithm
+/// 1. Start at refined vertex position P with initial normal estimate N
+/// 2. Compute tangent basis (T1, T2) perpendicular to N
+/// 3. Probe at P ± epsilon * T1 and P ± epsilon * T2
+/// 4. At each probe point, binary search along N to find surface crossing
+/// 5. Fit plane to all surface points found
+/// 6. If fit is good (low residual), use fitted normal; otherwise fall back to N
+///
+/// # Arguments
+/// * `surface_pos` - The refined vertex position (known to be on surface)
+/// * `initial_normal` - Initial normal estimate (accumulated face normal)
+/// * `probe_epsilon` - Distance to step in tangent directions
+/// * `search_distance` - Distance to search along normal for surface crossings
+/// * `binary_search_iterations` - Iterations for each binary search
+/// * `sampler` - The density sampling function
+/// * `stats` - Sampling statistics
+///
+/// # Returns
+/// The refined normal vector (normalized), pointing outward from the surface.
+fn refine_normal_via_probing<F>(
+    surface_pos: (f64, f64, f64),
+    initial_normal: (f64, f64, f64),
+    probe_epsilon: f64,
+    search_distance: f64,
+    binary_search_iterations: usize,
     sampler: &F,
     stats: &SamplingStats,
 ) -> (f64, f64, f64)
 where
     F: Fn(f64, f64, f64) -> f32,
 {
-    // Sample ±epsilon in each direction
-    // Note: We're not using an SDF, so we use is_inside as a proxy
-    // The gradient points from inside toward outside
-
-    let sample_x_plus = sampler(pos.0 + epsilon, pos.1, pos.2);
-    let sample_x_minus = sampler(pos.0 - epsilon, pos.1, pos.2);
-    let sample_y_plus = sampler(pos.0, pos.1 + epsilon, pos.2);
-    let sample_y_minus = sampler(pos.0, pos.1 - epsilon, pos.2);
-    let sample_z_plus = sampler(pos.0, pos.1, pos.2 + epsilon);
-    let sample_z_minus = sampler(pos.0, pos.1, pos.2 - epsilon);
-
-    stats.total_samples.fetch_add(6, Ordering::Relaxed);
-
-    // Gradient points from low density (outside) to high density (inside)
-    // We want normals pointing outward (from inside to outside), so negate
-    let grad = (
-        -((sample_x_plus - sample_x_minus) as f64),
-        -((sample_y_plus - sample_y_minus) as f64),
-        -((sample_z_plus - sample_z_minus) as f64),
+    // Normalize initial normal
+    let n_len_sq = initial_normal.0 * initial_normal.0
+        + initial_normal.1 * initial_normal.1
+        + initial_normal.2 * initial_normal.2;
+    if n_len_sq < 1e-12 {
+        return (0.0, 1.0, 0.0); // Degenerate - return up
+    }
+    let n_inv_len = 1.0 / n_len_sq.sqrt();
+    let n = (
+        initial_normal.0 * n_inv_len,
+        initial_normal.1 * n_inv_len,
+        initial_normal.2 * n_inv_len,
     );
 
-    grad
+    // Compute tangent basis
+    let (t1, t2) = orthonormal_basis_perpendicular_to(n);
+
+    // Collect surface points (start with the known surface position)
+    let mut surface_points: Vec<(f64, f64, f64)> = vec![surface_pos];
+
+    // Probe directions: ±T1, ±T2
+    let probe_dirs = [
+        (t1.0, t1.1, t1.2),
+        (-t1.0, -t1.1, -t1.2),
+        (t2.0, t2.1, t2.2),
+        (-t2.0, -t2.1, -t2.2),
+    ];
+
+    for dir in probe_dirs.iter() {
+        // Step in tangent direction
+        let probe_pos = (
+            surface_pos.0 + dir.0 * probe_epsilon,
+            surface_pos.1 + dir.1 * probe_epsilon,
+            surface_pos.2 + dir.2 * probe_epsilon,
+        );
+
+        // Binary search along the normal direction to find surface
+        if let Some(found_pos) = find_surface_point_along_direction(
+            probe_pos,
+            n,
+            search_distance,
+            binary_search_iterations,
+            sampler,
+            stats,
+        ) {
+            surface_points.push(found_pos);
+        }
+    }
+
+    // Need at least 3 points to fit a plane
+    if surface_points.len() < 3 {
+        return n;
+    }
+
+    // Fit plane to surface points
+    let (fitted_normal, residual) = fit_plane_to_points(&surface_points);
+
+    // Check if the fitted normal is pointing in the same general direction as initial
+    // (it might be flipped)
+    let dot = fitted_normal.0 * n.0 + fitted_normal.1 * n.1 + fitted_normal.2 * n.2;
+    let oriented_normal = if dot < 0.0 {
+        (-fitted_normal.0, -fitted_normal.1, -fitted_normal.2)
+    } else {
+        fitted_normal
+    };
+
+    // Check residual to detect edge/corner cases
+    // Threshold scales with:
+    // - probe_epsilon² (expected deviation due to surface curvature)
+    // - number of points (residual is sum of squared distances)
+    // - a generous multiplier (we're on curved surfaces, not planes)
+    let num_points = surface_points.len() as f64;
+    let residual_threshold = probe_epsilon * probe_epsilon * num_points * 4.0;
+
+    if residual > residual_threshold {
+        return n;
+    }
+
+    oriented_normal
 }
 
 /// Stage 4: Vertex Refinement & Normal Estimation
 ///
 /// Refines vertex positions using binary search along the accumulated normals,
-/// then optionally re-estimates normals at the refined positions.
+/// then optionally re-estimates normals by probing the surface in tangent directions.
 ///
 /// # Algorithm
 /// 1. For each vertex, normalize the accumulated face normal
 /// 2. Binary search along that direction to find the surface crossing
-/// 3. If normal_sample_iterations > 0, re-estimate normal at refined position
+/// 3. If normal_sample_iterations > 0, refine normal by:
+///    a. Probing at ±epsilon in tangent directions
+///    b. Binary searching to find surface points at each probe
+///    c. Fitting a plane to the surface points
+///    d. Using the plane normal (or falling back if edge/corner detected)
 /// 4. Otherwise, keep the accumulated normal (normalized)
 fn stage4_vertex_refinement<F>(
     stage3: Stage3Result,
@@ -1497,12 +1900,12 @@ where
 {
     let vertex_count = stage3.vertices.len();
 
-    // Search distance: a fraction of the cell size
+    // Search distance for vertex refinement: a fraction of the cell size
     // Vertices are on edges, so searching ±cell_size should be sufficient
     let search_distance = cell_size * 0.5;
 
-    // Epsilon for normal estimation
-    let normal_epsilon = cell_size * config.normal_epsilon_frac as f64;
+    // Probe epsilon for normal refinement: how far to step in tangent directions
+    let probe_epsilon = cell_size * config.normal_epsilon_frac as f64;
 
     let mut refined_vertices: Vec<(f32, f32, f32)> = Vec::with_capacity(vertex_count);
     let mut refined_normals: Vec<(f32, f32, f32)> = Vec::with_capacity(vertex_count);
@@ -1525,16 +1928,21 @@ where
             initial_pos
         };
 
-        // Estimate or normalize normal
+        // Refine normal via tangent plane probing, or just normalize accumulated
         let final_normal = if config.normal_sample_iterations > 0 {
-            // Re-estimate normal at refined position
-            let estimated = estimate_normal_at_position(
+            // Refine normal by probing surface in tangent directions
+            let normal_search_distance = search_distance * 2.0;
+
+            let refined = refine_normal_via_probing(
                 refined_pos,
-                normal_epsilon,
+                accumulated_normal,
+                probe_epsilon,
+                normal_search_distance,
+                config.normal_sample_iterations,
                 sampler,
                 stats,
             );
-            normalize_or_default(estimated)
+            normalize_or_default(refined)
         } else {
             // Just normalize the accumulated normal
             normalize_or_default(accumulated_normal)
@@ -2295,7 +2703,7 @@ mod tests {
     }
 
     #[test]
-    fn test_estimate_normal_points_outward() {
+    fn test_refine_normal_points_outward() {
         // Sphere: normal should point radially outward
         let sphere = |x: f64, y: f64, z: f64| -> f32 {
             let r2 = x * x + y * y + z * z;
@@ -2304,25 +2712,37 @@ mod tests {
         let stats = SamplingStats::default();
 
         // Point on +X axis of sphere surface
-        let pos = (1.0, 0.0, 0.0);
-        let epsilon = 0.1;
+        let surface_pos = (1.0, 0.0, 0.0);
+        // Initial normal estimate (pointing outward in +X)
+        let initial_normal = (1.0, 0.0, 0.0);
+        let probe_epsilon = 0.1;
+        let search_distance = 0.2;
+        let iterations = 4;
 
-        let normal = estimate_normal_at_position(pos, epsilon, &sphere, &stats);
+        let normal = refine_normal_via_probing(
+            surface_pos,
+            initial_normal,
+            probe_epsilon,
+            search_distance,
+            iterations,
+            &sphere,
+            &stats,
+        );
 
         // Normal should point in +X direction (outward)
         assert!(
-            normal.0 > 0.0,
-            "Normal X component should be positive (pointing outward), got {}",
+            normal.0 > 0.9,
+            "Normal X component should be close to 1.0 (pointing outward), got {}",
             normal.0
         );
         // Y and Z should be near zero for a point on the X axis
         assert!(
-            normal.1.abs() < 0.01,
+            normal.1.abs() < 0.1,
             "Normal Y component should be near zero, got {}",
             normal.1
         );
         assert!(
-            normal.2.abs() < 0.01,
+            normal.2.abs() < 0.1,
             "Normal Z component should be near zero, got {}",
             normal.2
         );
