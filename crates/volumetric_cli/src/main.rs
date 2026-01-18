@@ -1,23 +1,40 @@
-//! Volumetric CLI - Command-line mesh generation tool
+//! Volumetric CLI - Command-line mesh generation and rendering tool
 //!
-//! Accepts either a model WASM file or a .vproj project file,
-//! meshes it using Adaptive Surface Nets v2, and exports an STL.
+//! Provides two subcommands:
+//! - `mesh`: Generate STL files from volumetric models
+//! - `render`: Generate PNG images using headless wgpu rendering
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 use volumetric::{
     adaptive_surface_nets_2::{AdaptiveMeshConfig2, MeshingStats2},
-    generate_adaptive_mesh_v2_from_bytes,
-    stl,
-    Environment, Project, Triangle,
+    generate_adaptive_mesh_v2_from_bytes, stl, Environment, Project, Triangle,
 };
+
+mod camera;
+mod headless_renderer;
+mod render;
 
 #[derive(Parser, Debug)]
 #[command(name = "volumetric_cli")]
-#[command(about = "Generate meshes from volumetric models", long_about = None)]
-struct Args {
+#[command(about = "Generate meshes and renders from volumetric models", long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Generate an STL mesh from a volumetric model
+    Mesh(MeshArgs),
+    /// Render a volumetric model to PNG image(s)
+    Render(render::RenderArgs),
+}
+
+#[derive(Parser, Debug)]
+pub struct MeshArgs {
     /// Input file: either a .wasm model or a .vproj project file
     #[arg(short, long)]
     input: PathBuf,
@@ -51,7 +68,7 @@ struct Args {
     quiet: bool,
 }
 
-fn load_wasm_bytes(path: &PathBuf) -> Result<Vec<u8>> {
+pub fn load_wasm_bytes(path: &PathBuf) -> Result<Vec<u8>> {
     let extension = path
         .extension()
         .and_then(|e| e.to_str())
@@ -202,22 +219,36 @@ fn print_stats_summary(stats: &MeshingStats2) {
     println!("==========================");
 }
 
-fn main() -> Result<()> {
-    let args = Args::parse();
+pub fn build_mesh_config(
+    base_resolution: usize,
+    max_depth: usize,
+    vertex_refinement: usize,
+    normal_refinement: usize,
+    normal_epsilon: f32,
+) -> AdaptiveMeshConfig2 {
+    AdaptiveMeshConfig2 {
+        base_resolution,
+        max_depth,
+        vertex_refinement_iterations: vertex_refinement,
+        normal_sample_iterations: normal_refinement,
+        normal_epsilon_frac: normal_epsilon,
+        num_threads: 0,
+    }
+}
 
+fn run_mesh(args: MeshArgs) -> Result<()> {
     // Load WASM bytes
     let wasm_bytes = load_wasm_bytes(&args.input)?;
     println!("Loaded {} bytes", wasm_bytes.len());
 
     // Configure meshing
-    let config = AdaptiveMeshConfig2 {
-        base_resolution: args.base_resolution,
-        max_depth: args.max_depth,
-        vertex_refinement_iterations: args.vertex_refinement,
-        normal_sample_iterations: args.normal_refinement,
-        normal_epsilon_frac: args.normal_epsilon,
-        num_threads: 0, // Use default parallelism
-    };
+    let config = build_mesh_config(
+        args.base_resolution,
+        args.max_depth,
+        args.vertex_refinement,
+        args.normal_refinement,
+        args.normal_epsilon,
+    );
 
     let effective_res = config.base_resolution * (1 << config.max_depth);
     println!(
@@ -237,10 +268,23 @@ fn main() -> Result<()> {
     // Convert to triangles and export STL
     let triangles = indexed_mesh_to_triangles(&result.vertices, &result.normals, &result.indices);
 
-    println!("Exporting {} triangles to {:?}", triangles.len(), args.output);
+    println!(
+        "Exporting {} triangles to {:?}",
+        triangles.len(),
+        args.output
+    );
     stl::write_binary_stl(&args.output, &triangles, "volumetric_cli")
         .context("Failed to write STL file")?;
 
     println!("Done!");
     Ok(())
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Mesh(args) => run_mesh(args),
+        Commands::Render(args) => render::run_render(args),
+    }
 }

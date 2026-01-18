@@ -80,7 +80,15 @@ In the UI:
 For batch processing and profiling, use the command-line tool:
 
 ```bash
-cargo run -p volumetric_cli --release -- --input <file> --output <output.stl>
+cargo run -p volumetric_cli --release -- <COMMAND>
+```
+
+#### Mesh Command
+
+Generate STL meshes from volumetric models:
+
+```bash
+volumetric_cli mesh -i <file> -o <output.stl>
 ```
 
 **Arguments:**
@@ -98,13 +106,49 @@ cargo run -p volumetric_cli --release -- --input <file> --output <output.stl>
 **Examples:**
 ```bash
 # Mesh a WASM model with default settings (128³ effective resolution)
-volumetric_cli -i simple_torus_model.wasm -o torus.stl
+volumetric_cli mesh -i simple_torus_model.wasm -o torus.stl
 
 # Faster meshing with lower resolution and no normal refinement
-volumetric_cli -i model.wasm -o output.stl --max-depth 3 --normal-refinement 0
+volumetric_cli mesh -i model.wasm -o output.stl --max-depth 3 --normal-refinement 0
 
 # Mesh a project file
-volumetric_cli -i scene.vproj -o scene.stl
+volumetric_cli mesh -i scene.vproj -o scene.stl
+```
+
+#### Render Command
+
+Generate PNG images from volumetric models using headless wgpu rendering:
+
+```bash
+volumetric_cli render -i <file> -o <output.png>
+```
+
+**Arguments:**
+- `-i, --input <file>` - Input file: either a `.wasm` model or a `.vproj` project file
+- `-o, --output <file>` - Output PNG file path (view suffix added for multiple views)
+
+**Options:**
+- `--width <n>` - Image width in pixels (default: 1024)
+- `--height <n>` - Image height in pixels (default: 1024)
+- `--views <views>` - Comma-separated views: front, back, left, right, top, bottom, iso, iso-back, all (default: iso)
+- `--background <hex>` - Background color as hex, e.g., f0f0f0 (default: f0f0f0)
+- `--color <hex>` - Mesh base color as hex, e.g., 6699cc (default: 6699cc)
+- `--base-resolution <n>`, `--max-depth <n>`, etc. - Same meshing options as the mesh command
+- `-q, --quiet` - Suppress profiling output
+
+**Examples:**
+```bash
+# Single isometric view
+volumetric_cli render -i model.wasm -o render.png
+
+# Multiple views
+volumetric_cli render -i model.wasm -o render.png --views front,iso,top
+
+# All views at high resolution
+volumetric_cli render -i model.wasm -o render.png --views all --width 2048 --height 2048
+
+# Custom colors
+volumetric_cli render -i model.wasm -o out.png --background ffffff --color 4488aa
 ```
 
 The CLI outputs detailed profiling statistics showing per-stage timing and sample counts, useful for performance analysis.
