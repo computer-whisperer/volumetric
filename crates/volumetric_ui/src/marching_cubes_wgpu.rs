@@ -878,6 +878,7 @@ impl MarchingCubesGpu {
             None => {
                 // No index buffer - use non-indexed rendering
                 self.index_buffer = None;
+                self.index_capacity = 0; // Reset capacity so next indexed use creates a new buffer
                 self.index_count = 0;
                 self.last_indices_ptr = 0;
                 self.last_indices_len = 0;
