@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use volumetric::generate_adaptive_mesh_v2_from_bytes;
 
 use crate::camera::{parse_views, CameraSetup, ViewAngle};
-use crate::headless_renderer::{HeadlessRenderer, MeshVertex, Uniforms};
+use crate::headless_renderer::{GridVertex, HeadlessRenderer, MeshVertex, Uniforms};
 use crate::{build_mesh_config, load_wasm_bytes};
 
 #[derive(Parser, Debug)]
@@ -64,6 +64,14 @@ pub struct RenderArgs {
     /// Suppress profiling output
     #[arg(short, long)]
     pub quiet: bool,
+
+    /// Reference grid spacing in meters (0 to disable)
+    #[arg(long, default_value = "1.0")]
+    pub grid: f32,
+
+    /// Grid color as hex (e.g., 555555)
+    #[arg(long, default_value = "555555")]
+    pub grid_color: String,
 }
 
 fn parse_hex_color(hex: &str) -> Result<[f32; 3]> {
@@ -87,6 +95,77 @@ fn compute_bounds(vertices: &[(f32, f32, f32)]) -> (Vec3, Vec3) {
     }
 
     (min, max)
+}
+
+/// Generate grid line vertices on the XZ plane at y=0
+fn generate_grid_vertices(
+    bounds_min: Vec3,
+    bounds_max: Vec3,
+    spacing: f32,
+    color: [f32; 3],
+) -> Vec<GridVertex> {
+    let mut vertices = Vec::new();
+
+    // Extend grid slightly beyond model bounds, snapped to grid spacing
+    let margin = spacing;
+    let x_min = ((bounds_min.x - margin) / spacing).floor() * spacing;
+    let x_max = ((bounds_max.x + margin) / spacing).ceil() * spacing;
+    let z_min = ((bounds_min.z - margin) / spacing).floor() * spacing;
+    let z_max = ((bounds_max.z + margin) / spacing).ceil() * spacing;
+
+    // Place grid at y=0 or at the bottom of model bounds if model is above y=0
+    let y = 0.0_f32.min(bounds_min.y);
+
+    // Determine which lines are major (every 5 units) vs minor
+    let major_spacing = spacing * 5.0;
+    let major_color = color;
+    let minor_color = [color[0] * 0.6, color[1] * 0.6, color[2] * 0.6];
+
+    // Generate lines parallel to Z axis (varying X)
+    let mut x = x_min;
+    while x <= x_max + 0.001 {
+        let is_major = (x / major_spacing).abs().fract() < 0.01 || (x / major_spacing).abs().fract() > 0.99;
+        let line_color = if is_major { major_color } else { minor_color };
+
+        vertices.push(GridVertex {
+            position: [x, y, z_min],
+            _pad0: 0.0,
+            color: line_color,
+            _pad1: 0.0,
+        });
+        vertices.push(GridVertex {
+            position: [x, y, z_max],
+            _pad0: 0.0,
+            color: line_color,
+            _pad1: 0.0,
+        });
+
+        x += spacing;
+    }
+
+    // Generate lines parallel to X axis (varying Z)
+    let mut z = z_min;
+    while z <= z_max + 0.001 {
+        let is_major = (z / major_spacing).abs().fract() < 0.01 || (z / major_spacing).abs().fract() > 0.99;
+        let line_color = if is_major { major_color } else { minor_color };
+
+        vertices.push(GridVertex {
+            position: [x_min, y, z],
+            _pad0: 0.0,
+            color: line_color,
+            _pad1: 0.0,
+        });
+        vertices.push(GridVertex {
+            position: [x_max, y, z],
+            _pad0: 0.0,
+            color: line_color,
+            _pad1: 0.0,
+        });
+
+        z += spacing;
+    }
+
+    vertices
 }
 
 fn convert_to_gpu_vertices(
@@ -131,6 +210,7 @@ pub fn run_render(args: RenderArgs) -> Result<()> {
     // Parse colors
     let background_color = parse_hex_color(&args.background).context("Invalid background color")?;
     let base_color = parse_hex_color(&args.color).context("Invalid mesh color")?;
+    let grid_color = parse_hex_color(&args.grid_color).context("Invalid grid color")?;
 
     // Parse views
     let views = parse_views(&args.views);
@@ -180,6 +260,17 @@ pub fn run_render(args: RenderArgs) -> Result<()> {
         );
     }
 
+    // Generate grid vertices if grid spacing > 0
+    let grid_vertices = if args.grid > 0.0 {
+        let gv = generate_grid_vertices(bounds_min, bounds_max, args.grid, grid_color);
+        if !args.quiet {
+            println!("Generated {} grid line segments", gv.len() / 2);
+        }
+        Some(gv)
+    } else {
+        None
+    };
+
     // Initialize renderer
     println!("Initializing headless renderer ({}x{})", args.width, args.height);
     let renderer = HeadlessRenderer::new(args.width, args.height)?;
@@ -220,6 +311,7 @@ pub fn run_render(args: RenderArgs) -> Result<()> {
             &mesh_result.indices,
             &uniforms,
             background_color,
+            grid_vertices.as_deref(),
             &output_path,
         )?;
     }

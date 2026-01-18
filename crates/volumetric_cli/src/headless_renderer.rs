@@ -16,6 +16,16 @@ pub struct MeshVertex {
     pub _pad1: f32,
 }
 
+/// Vertex format for grid lines (32 bytes for alignment)
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct GridVertex {
+    pub position: [f32; 3],
+    pub _pad0: f32,
+    pub color: [f32; 3],
+    pub _pad1: f32,
+}
+
 /// Uniform buffer layout (must match shader)
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -55,7 +65,8 @@ impl Default for Uniforms {
 pub struct HeadlessRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    pipeline: wgpu::RenderPipeline,
+    mesh_pipeline: wgpu::RenderPipeline,
+    grid_pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     width: u32,
     height: u32,
@@ -87,11 +98,18 @@ impl HeadlessRenderer {
         ))
         .context("Failed to create device")?;
 
-        // Load shader
-        let shader_source = include_str!("shaders/headless_mesh.wgsl");
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        // Load mesh shader
+        let mesh_shader_source = include_str!("shaders/headless_mesh.wgsl");
+        let mesh_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Headless Mesh Shader"),
-            source: wgpu::ShaderSource::Wgsl(shader_source.into()),
+            source: wgpu::ShaderSource::Wgsl(mesh_shader_source.into()),
+        });
+
+        // Load grid shader
+        let grid_shader_source = include_str!("shaders/grid.wgsl");
+        let grid_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Grid Shader"),
+            source: wgpu::ShaderSource::Wgsl(grid_shader_source.into()),
         });
 
         // Bind group layout for uniforms
@@ -115,8 +133,8 @@ impl HeadlessRenderer {
             push_constant_ranges: &[],
         });
 
-        // Vertex buffer layout
-        let vertex_layout = wgpu::VertexBufferLayout {
+        // Mesh vertex buffer layout
+        let mesh_vertex_layout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<MeshVertex>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &[
@@ -133,17 +151,17 @@ impl HeadlessRenderer {
             ],
         };
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Headless Render Pipeline"),
+        let mesh_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Mesh Render Pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
-                module: &shader,
+                module: &mesh_shader,
                 entry_point: "vs_main",
-                buffers: &[vertex_layout],
+                buffers: &[mesh_vertex_layout],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
-                module: &shader,
+                module: &mesh_shader,
                 entry_point: "fs_main",
                 targets: &[Some(wgpu::ColorTargetState {
                     format: wgpu::TextureFormat::Rgba8UnormSrgb,
@@ -177,30 +195,94 @@ impl HeadlessRenderer {
             cache: None,
         });
 
+        // Grid vertex buffer layout (same structure, different semantics)
+        let grid_vertex_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<GridVertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x3,
+                },
+                wgpu::VertexAttribute {
+                    offset: 16,
+                    shader_location: 1,
+                    format: wgpu::VertexFormat::Float32x3,
+                },
+            ],
+        };
+
+        let grid_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Grid Render Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &grid_shader,
+                entry_point: "vs_main",
+                buffers: &[grid_vertex_layout],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &grid_shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth24Plus,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+            cache: None,
+        });
+
         Ok(Self {
             device,
             queue,
-            pipeline,
+            mesh_pipeline,
+            grid_pipeline,
             bind_group_layout,
             width,
             height,
         })
     }
 
-    /// Render mesh to PNG
+    /// Render mesh to PNG with optional grid overlay
     pub fn render_to_png(
         &self,
         vertices: &[MeshVertex],
         indices: &[u32],
         uniforms: &Uniforms,
         background_color: [f32; 3],
+        grid_vertices: Option<&[GridVertex]>,
         output_path: &Path,
     ) -> Result<()> {
-        // Create vertex and index buffers
+        // Create mesh vertex and index buffers
         let vertex_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Vertex Buffer"),
+                label: Some("Mesh Vertex Buffer"),
                 contents: bytemuck::cast_slice(vertices),
                 usage: wgpu::BufferUsages::VERTEX,
             });
@@ -208,10 +290,21 @@ impl HeadlessRenderer {
         let index_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Index Buffer"),
+                label: Some("Mesh Index Buffer"),
                 contents: bytemuck::cast_slice(indices),
                 usage: wgpu::BufferUsages::INDEX,
             });
+
+        // Create grid vertex buffer if grid is provided
+        let grid_buffer = grid_vertices.map(|gv| {
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Grid Vertex Buffer"),
+                    contents: bytemuck::cast_slice(gv),
+                    usage: wgpu::BufferUsages::VERTEX,
+                })
+        });
+        let grid_vertex_count = grid_vertices.map(|gv| gv.len() as u32).unwrap_or(0);
 
         // Create uniform buffer
         let uniform_buffer = self
@@ -316,7 +409,16 @@ impl HeadlessRenderer {
                 occlusion_query_set: None,
             });
 
-            render_pass.set_pipeline(&self.pipeline);
+            // Draw grid first (so mesh renders on top)
+            if let Some(ref gb) = grid_buffer {
+                render_pass.set_pipeline(&self.grid_pipeline);
+                render_pass.set_bind_group(0, &bind_group, &[]);
+                render_pass.set_vertex_buffer(0, gb.slice(..));
+                render_pass.draw(0..grid_vertex_count, 0..1);
+            }
+
+            // Draw mesh
+            render_pass.set_pipeline(&self.mesh_pipeline);
             render_pass.set_bind_group(0, &bind_group, &[]);
             render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
             render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);

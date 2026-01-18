@@ -131,8 +131,10 @@ volumetric_cli render -i <file> -o <output.png>
 - `--width <n>` - Image width in pixels (default: 1024)
 - `--height <n>` - Image height in pixels (default: 1024)
 - `--views <views>` - Comma-separated views: front, back, left, right, top, bottom, iso, iso-back, all (default: iso)
-- `--background <hex>` - Background color as hex, e.g., f0f0f0 (default: f0f0f0)
+- `--background <hex>` - Background color as hex, e.g., 2d2d2d (default: 2d2d2d)
 - `--color <hex>` - Mesh base color as hex, e.g., 6699cc (default: 6699cc)
+- `--grid <spacing>` - Reference grid spacing in meters, 0 to disable (default: 1.0)
+- `--grid-color <hex>` - Grid color as hex, e.g., 555555 (default: 555555)
 - `--base-resolution <n>`, `--max-depth <n>`, etc. - Same meshing options as the mesh command
 - `-q, --quiet` - Suppress profiling output
 
@@ -149,9 +151,36 @@ volumetric_cli render -i model.wasm -o render.png --views all --width 2048 --hei
 
 # Custom colors
 volumetric_cli render -i model.wasm -o out.png --background ffffff --color 4488aa
+
+# With 0.5m reference grid
+volumetric_cli render -i model.wasm -o out.png --grid 0.5
+
+# Without grid
+volumetric_cli render -i model.wasm -o out.png --grid 0
 ```
 
 The CLI outputs detailed profiling statistics showing per-stage timing and sample counts, useful for performance analysis.
+
+## Coordinate System and Units
+
+The volumetric engine uses a **right-handed** coordinate system with the following conventions:
+
+### Unit Scale
+- **1 unit = 1 meter** - All coordinates in the `is_inside(x, y, z)` function are interpreted as meters
+- The reference grid in the renderer defaults to 1-meter spacing
+- When designing models, dimensions should be specified in meters (e.g., a 2-meter sphere has bounds from -1 to +1)
+
+### Axis Orientation
+- **+X**: Right
+- **+Y**: Up
+- **+Z**: Forward (toward camera in default view)
+
+### Reference Grid
+The CLI renderer includes an optional reference grid on the XZ plane at y=0 (or at the model's minimum Y if below zero):
+- **Major lines**: Every 5 grid units (brighter)
+- **Minor lines**: At the specified grid spacing (dimmer)
+- Use `--grid 0` to disable the grid
+- Default grid spacing is 1.0 meter
 
 ## Mesh Conventions
 
