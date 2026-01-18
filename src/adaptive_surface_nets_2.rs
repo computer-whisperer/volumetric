@@ -668,6 +668,29 @@ pub struct MeshingStats2 {
     pub effective_resolution: usize,
 }
 
+// =============================================================================
+// NORMAL DIAGNOSTIC TYPES (only available with "normal-diagnostic" feature)
+// =============================================================================
+
+/// A single entry in the normal diagnostic results.
+/// Compares normals computed with a specific iteration count against high-precision reference.
+#[cfg(feature = "normal-diagnostic")]
+#[derive(Clone, Debug, Default)]
+pub struct NormalDiagnosticEntry {
+    /// Number of binary search iterations used (0 = topology-only normals)
+    pub iterations: usize,
+    /// Mean angular error in degrees
+    pub mean_error_degrees: f64,
+    /// Median (P50) angular error in degrees
+    pub p50_error_degrees: f64,
+    /// 95th percentile angular error in degrees
+    pub p95_error_degrees: f64,
+    /// Maximum angular error in degrees
+    pub max_error_degrees: f64,
+    /// Number of extra samples used (beyond topology-only)
+    pub extra_samples: u64,
+}
+
 impl MeshingStats2 {
     /// Print a human-readable profiling report to stdout
     pub fn print_report(&self) {
@@ -2014,27 +2037,33 @@ fn fit_plane_to_points(points: &[(f64, f64, f64)]) -> ((f64, f64, f64), f64) {
     (v, residual)
 }
 
-/// Refine a surface normal by probing the surface in tangent directions.
+/// Refine a surface normal using Bayesian inference with plane-fitting.
 ///
 /// # Algorithm
-/// 1. Start at refined vertex position P with initial normal estimate N
-/// 2. Compute tangent basis (T1, T2) perpendicular to N
-/// 3. Probe at P ± epsilon * T1 and P ± epsilon * T2
-/// 4. At each probe point, binary search along N to find surface crossing
-/// 5. Fit plane to all surface points found
-/// 6. If fit is good (low residual), use fitted normal; otherwise fall back to N
+/// This treats normal refinement as a Bayesian update problem:
+/// 1. **Prior**: The topology-derived normal with estimated uncertainty (~1°)
+/// 2. **Measurement**: Plane-fitting to probed surface points gives a normal estimate
+/// 3. **Update**: Blend prior and measurement using inverse-variance weighting
+///
+/// The measurement uncertainty depends on binary search precision:
+/// - Position error ≈ search_distance / 2^iterations
+/// - This translates to angular uncertainty in the fitted normal
+///
+/// This means:
+/// - Low iterations → high uncertainty → measurements barely affect the prior
+/// - High iterations → low uncertainty → measurements dominate
 ///
 /// # Arguments
 /// * `surface_pos` - The refined vertex position (known to be on surface)
 /// * `initial_normal` - Initial normal estimate (accumulated face normal)
 /// * `probe_epsilon` - Distance to step in tangent directions
 /// * `search_distance` - Distance to search along normal for surface crossings
-/// * `binary_search_iterations` - Iterations for each binary search
+/// * `binary_search_iterations` - Iterations for each binary search (affects measurement precision)
 /// * `sampler` - The density sampling function
 /// * `stats` - Sampling statistics
 ///
 /// # Returns
-/// The refined normal vector (normalized), pointing outward from the surface.
+/// The refined normal vector (unnormalized), pointing outward from the surface.
 fn refine_normal_via_probing<F>(
     surface_pos: (f64, f64, f64),
     initial_normal: (f64, f64, f64),
@@ -2047,14 +2076,7 @@ fn refine_normal_via_probing<F>(
 where
     F: Fn(f64, f64, f64) -> f32,
 {
-    // Ensure adequate binary search precision for surface point finding.
-    // With fewer iterations, the found surface points are imprecise and
-    // plane fitting produces noisy normals. 8 iterations gives ~1/256
-    // precision relative to search_distance, which is adequate for
-    // accurate plane fitting.
-    let iterations = binary_search_iterations.max(8);
-
-    // Normalize initial normal
+    // Normalize initial normal (our prior)
     let n_len_sq = initial_normal.0 * initial_normal.0
         + initial_normal.1 * initial_normal.1
         + initial_normal.2 * initial_normal.2;
@@ -2071,7 +2093,18 @@ where
     // Compute tangent basis
     let (t1, t2) = orthonormal_basis_perpendicular_to(n);
 
-    // Collect surface points (start with the known surface position)
+    // Prior uncertainty: topology normals have roughly 0.5-1° error empirically.
+    // We use 1° as a conservative estimate.
+    let prior_sigma: f64 = 1.0_f64.to_radians(); // 1 degree in radians
+
+    // Measurement uncertainty: position error from binary search divided by probe distance
+    // gives angular uncertainty in the fitted plane normal.
+    // Position error ≈ search_distance / 2^iterations
+    // Angular error ≈ position_error / probe_epsilon (for small angles)
+    let position_error = search_distance / (1u64 << binary_search_iterations) as f64;
+    let measurement_sigma = position_error / probe_epsilon;
+
+    // Collect surface points for plane fitting
     let mut surface_points: Vec<(f64, f64, f64)> = vec![surface_pos];
 
     // Probe directions: ±T1, ±T2
@@ -2083,23 +2116,21 @@ where
     ];
 
     for dir in probe_dirs.iter() {
-        // Step in tangent direction
         let probe_pos = (
             surface_pos.0 + dir.0 * probe_epsilon,
             surface_pos.1 + dir.1 * probe_epsilon,
             surface_pos.2 + dir.2 * probe_epsilon,
         );
 
-        // Binary search along the normal direction to find surface
-        if let Some(found_pos) = find_surface_point_along_direction(
+        if let Some(found) = find_surface_point_along_direction(
             probe_pos,
             n,
             search_distance,
-            iterations,
+            binary_search_iterations,
             sampler,
             stats,
         ) {
-            surface_points.push(found_pos);
+            surface_points.push(found);
         }
     }
 
@@ -2108,32 +2139,168 @@ where
         return n;
     }
 
-    // Fit plane to surface points
+    // Fit plane to get measurement normal
     let (fitted_normal, residual) = fit_plane_to_points(&surface_points);
 
-    // Check if the fitted normal is pointing in the same general direction as initial
-    // (it might be flipped)
+    // Orient fitted normal to match prior direction
     let dot = fitted_normal.0 * n.0 + fitted_normal.1 * n.1 + fitted_normal.2 * n.2;
-    let oriented_normal = if dot < 0.0 {
+    let measured = if dot < 0.0 {
         (-fitted_normal.0, -fitted_normal.1, -fitted_normal.2)
     } else {
         fitted_normal
     };
 
-    // Check residual to detect edge/corner cases
-    // Threshold scales with:
-    // - probe_epsilon² (expected deviation due to surface curvature)
-    // - number of points (residual is sum of squared distances)
-    // - a generous multiplier (we're on curved surfaces, not planes)
+    // Check residual - high residual indicates edge/corner, trust prior more
     let num_points = surface_points.len() as f64;
     let residual_threshold = probe_epsilon * probe_epsilon * num_points * 4.0;
+    let residual_factor = if residual > residual_threshold {
+        // High residual: increase measurement uncertainty significantly
+        // This makes us fall back toward the prior
+        10.0
+    } else {
+        1.0
+    };
 
-    if residual > residual_threshold {
+    let adjusted_measurement_sigma = measurement_sigma * residual_factor;
+
+    // Bayesian blending using inverse-variance weighting
+    // weight = 1 / sigma²
+    let prior_weight = 1.0 / (prior_sigma * prior_sigma);
+    let measurement_weight = 1.0 / (adjusted_measurement_sigma * adjusted_measurement_sigma);
+    let total_weight = prior_weight + measurement_weight;
+
+    // Blend in tangent space to avoid issues with vector averaging
+    // Project measured normal deviation onto tangent plane
+    let measured_dev_t1 = measured.0 * t1.0 + measured.1 * t1.1 + measured.2 * t1.2;
+    let measured_dev_t2 = measured.0 * t2.0 + measured.1 * t2.1 + measured.2 * t2.2;
+
+    // Prior deviation is 0 by definition (n is our prior)
+    // Weighted average of deviations
+    let blended_dev_t1 = (measurement_weight * measured_dev_t1) / total_weight;
+    let blended_dev_t2 = (measurement_weight * measured_dev_t2) / total_weight;
+
+    // Reconstruct normal from blended deviation
+    // For the prior: n = 1*n + 0*t1 + 0*t2 (no deviation)
+    // For measurement: measured ≈ dot*n + measured_dev_t1*t1 + measured_dev_t2*t2
+    // Blended: we interpolate the t1/t2 components
+    let blended = (
+        n.0 + blended_dev_t1 * t1.0 + blended_dev_t2 * t2.0,
+        n.1 + blended_dev_t1 * t1.1 + blended_dev_t2 * t2.1,
+        n.2 + blended_dev_t1 * t1.2 + blended_dev_t2 * t2.2,
+    );
+
+    blended
+}
+
+// =============================================================================
+// NORMAL DIAGNOSTIC FUNCTIONS (only available with "normal-diagnostic" feature)
+// =============================================================================
+
+/// Compute a high-precision reference normal using plane fitting.
+///
+/// This uses 32 binary search iterations for maximum accuracy.
+/// Used as ground truth for diagnostic comparison only.
+#[cfg(feature = "normal-diagnostic")]
+fn compute_reference_normal<F>(
+    surface_pos: (f64, f64, f64),
+    initial_normal: (f64, f64, f64),
+    probe_epsilon: f64,
+    search_distance: f64,
+    sampler: &F,
+    stats: &SamplingStats,
+) -> (f64, f64, f64)
+where
+    F: Fn(f64, f64, f64) -> f32,
+{
+    // Normalize initial normal
+    let n_len_sq = initial_normal.0 * initial_normal.0
+        + initial_normal.1 * initial_normal.1
+        + initial_normal.2 * initial_normal.2;
+    if n_len_sq < 1e-12 {
+        return (0.0, 1.0, 0.0);
+    }
+    let n_inv_len = 1.0 / n_len_sq.sqrt();
+    let n = (
+        initial_normal.0 * n_inv_len,
+        initial_normal.1 * n_inv_len,
+        initial_normal.2 * n_inv_len,
+    );
+
+    // Compute tangent basis
+    let (t1, t2) = orthonormal_basis_perpendicular_to(n);
+
+    // Collect surface points
+    let mut surface_points: Vec<(f64, f64, f64)> = vec![surface_pos];
+
+    // Probe all 4 directions with high precision (32 iterations)
+    let probe_dirs = [
+        (t1.0, t1.1, t1.2),
+        (-t1.0, -t1.1, -t1.2),
+        (t2.0, t2.1, t2.2),
+        (-t2.0, -t2.1, -t2.2),
+    ];
+
+    for dir in probe_dirs.iter() {
+        let probe_pos = (
+            surface_pos.0 + dir.0 * probe_epsilon,
+            surface_pos.1 + dir.1 * probe_epsilon,
+            surface_pos.2 + dir.2 * probe_epsilon,
+        );
+
+        if let Some(found_pos) = find_surface_point_along_direction(
+            probe_pos,
+            n,
+            search_distance,
+            32, // High precision
+            sampler,
+            stats,
+        ) {
+            surface_points.push(found_pos);
+        }
+    }
+
+    if surface_points.len() < 3 {
         return n;
     }
 
-    oriented_normal
+    let (fitted_normal, _residual) = fit_plane_to_points(&surface_points);
+
+    // Orient to match initial
+    let dot = fitted_normal.0 * n.0 + fitted_normal.1 * n.1 + fitted_normal.2 * n.2;
+    if dot < 0.0 {
+        (-fitted_normal.0, -fitted_normal.1, -fitted_normal.2)
+    } else {
+        fitted_normal
+    }
 }
+
+/// Compute angular error in degrees between two unit vectors.
+#[cfg(feature = "normal-diagnostic")]
+fn angular_error_degrees(a: (f32, f32, f32), b: (f64, f64, f64)) -> f64 {
+    let dot = (a.0 as f64) * b.0 + (a.1 as f64) * b.1 + (a.2 as f64) * b.2;
+    // Clamp to [-1, 1] to handle numerical errors
+    let clamped = dot.clamp(-1.0, 1.0);
+    clamped.acos().to_degrees()
+}
+
+/// Compute error statistics for a set of angular errors.
+#[cfg(feature = "normal-diagnostic")]
+fn compute_error_stats(errors: &mut [f64]) -> (f64, f64, f64, f64) {
+    if errors.is_empty() {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+
+    errors.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mean = errors.iter().sum::<f64>() / errors.len() as f64;
+    let max = errors.last().copied().unwrap_or(0.0);
+    let p50 = errors[errors.len() / 2];
+    let p95 = errors[errors.len() * 95 / 100];
+
+    (mean, p50, p95, max)
+}
+
+// =============================================================================
 
 /// Recompute accumulated face normals from vertex positions.
 ///
@@ -2308,6 +2475,108 @@ where
         normals: final_normals,
         indices: stage3.indices,
     }
+}
+
+/// Run normal diagnostics: compute reference normals and compare various iteration levels.
+///
+/// Tests iteration counts: 0 (topology only), 4, 8, 12, 16, 24
+/// Returns error statistics for each level compared to high-precision (32-iter) reference.
+#[cfg(feature = "normal-diagnostic")]
+pub fn run_normal_diagnostics<F>(
+    refined_positions: &[(f64, f64, f64)],
+    recomputed_normals: &[(f64, f64, f64)],
+    probe_epsilon: f64,
+    search_distance: f64,
+    sampler: &F,
+    stats: &SamplingStats,
+) -> Vec<NormalDiagnosticEntry>
+where
+    F: Fn(f64, f64, f64) -> f32 + Send + Sync,
+{
+    let vertex_count = refined_positions.len();
+    eprintln!("Running normal diagnostics on {} vertices...", vertex_count);
+
+    // First, compute high-precision reference normals (32 iterations)
+    eprintln!("  Computing reference normals (32 iterations)...");
+    let samples_before_ref = stats.total_samples.load(Ordering::Relaxed);
+
+    let reference_normals: Vec<(f64, f64, f64)> = (0..vertex_count)
+        .into_par_iter()
+        .map(|i| {
+            compute_reference_normal(
+                refined_positions[i],
+                recomputed_normals[i],
+                probe_epsilon,
+                search_distance,
+                sampler,
+                stats,
+            )
+        })
+        .collect();
+
+    let samples_for_ref = stats.total_samples.load(Ordering::Relaxed) - samples_before_ref;
+    eprintln!("  Reference normals computed ({} samples)", samples_for_ref);
+
+    // Test iteration levels: 0 (topology-only), 4, 8, 12, 16, 24
+    let test_iterations = [0usize, 4, 8, 12, 16, 24];
+    let mut results = Vec::new();
+
+    for &iterations in &test_iterations {
+        let samples_before = stats.total_samples.load(Ordering::Relaxed);
+
+        // Compute normals at this iteration level
+        let test_normals: Vec<(f32, f32, f32)> = if iterations == 0 {
+            // Topology-only: just normalize recomputed normals
+            recomputed_normals
+                .iter()
+                .map(|n| normalize_or_default(*n))
+                .collect()
+        } else {
+            // Probe-based refinement at this iteration count
+            (0..vertex_count)
+                .into_par_iter()
+                .map(|i| {
+                    let refined = refine_normal_via_probing(
+                        refined_positions[i],
+                        recomputed_normals[i],
+                        probe_epsilon,
+                        search_distance,
+                        iterations,
+                        sampler,
+                        stats,
+                    );
+                    normalize_or_default(refined)
+                })
+                .collect()
+        };
+
+        let samples_used = stats.total_samples.load(Ordering::Relaxed) - samples_before;
+
+        // Compute errors vs reference
+        let mut errors: Vec<f64> = test_normals
+            .iter()
+            .zip(reference_normals.iter())
+            .map(|(test, reference)| angular_error_degrees(*test, *reference))
+            .collect();
+
+        let (mean, p50, p95, max) = compute_error_stats(&mut errors);
+
+        eprintln!(
+            "  iterations={:>2}: mean={:>6.2}°  p50={:>6.2}°  p95={:>6.2}°  max={:>6.2}°  samples={}",
+            iterations, mean, p50, p95, max, samples_used
+        );
+
+        results.push(NormalDiagnosticEntry {
+            iterations,
+            mean_error_degrees: mean,
+            p50_error_degrees: p50,
+            p95_error_degrees: p95,
+            max_error_degrees: max,
+            extra_samples: samples_used,
+        });
+    }
+
+    results
 }
 
 // =============================================================================

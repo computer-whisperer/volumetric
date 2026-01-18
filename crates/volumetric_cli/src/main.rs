@@ -198,6 +198,7 @@ fn print_stats_summary(stats: &MeshingStats2) {
             stats.stage4_refine_miss as f64 / total_refine as f64 * 100.0
         );
     }
+
     println!("==========================");
 }
 

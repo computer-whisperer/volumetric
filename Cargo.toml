@@ -22,6 +22,11 @@ members = [
     "crates/volumetric_cli",
 ]
 
+[features]
+default = []
+# Enable normal refinement diagnostics (expensive, for benchmarking only)
+normal-diagnostic = []
+
 [dependencies]
 wasmtime = "27"
 anyhow = "1"
