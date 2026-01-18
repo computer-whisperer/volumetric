@@ -449,27 +449,133 @@ fn execute_resample(
 #[cfg(target_arch = "wasm32")]
 fn execute_resample(
     asset_id: String,
-    _wasm_bytes: Vec<u8>,
-    _mode: ExportRenderMode,
-    _config: ResampleConfig,
-    _cancel_token: &CancellationToken,
+    wasm_bytes: Vec<u8>,
+    mode: ExportRenderMode,
+    config: ResampleConfig,
+    cancel_token: &CancellationToken,
 ) -> BackgroundTaskResult {
-    // WASM execution not available in web build
-    BackgroundTaskResult::ResampleComplete {
-        asset_id,
-        result: ResampleResult {
-            bounds_min: (0.0, 0.0, 0.0),
-            bounds_max: (0.0, 0.0, 0.0),
-            points: Arc::new(Vec::new()),
-            triangles: Vec::new(),
-            mesh_vertices: Arc::new(Vec::new()),
-            mesh_indices: None,
-            sample_time: 0.0,
-            sample_count: 0,
-            error: Some("WASM execution not available in web build".to_string()),
-            asn2_stats: None,
-        },
+    if cancel_token.is_cancelled() {
+        return BackgroundTaskResult::Cancelled {
+            description: format!("Resample of {} cancelled", asset_id),
+        };
     }
+
+    let start_time = web_time::Instant::now();
+    let mut result = ResampleResult {
+        bounds_min: (0.0, 0.0, 0.0),
+        bounds_max: (0.0, 0.0, 0.0),
+        points: Arc::new(Vec::new()),
+        triangles: Vec::new(),
+        mesh_vertices: Arc::new(Vec::new()),
+        mesh_indices: None,
+        sample_time: 0.0,
+        sample_count: 0,
+        error: None,
+        asn2_stats: None,
+    };
+
+    match mode {
+        ExportRenderMode::None => {
+            // Nothing to do
+        }
+        ExportRenderMode::PointCloud => {
+            match sample_model_from_bytes(&wasm_bytes, config.resolution) {
+                Ok((pts, bounds_min, bounds_max)) => {
+                    result.bounds_min = bounds_min;
+                    result.bounds_max = bounds_max;
+                    result.sample_count = pts.len();
+                    result.points = Arc::new(pts);
+                }
+                Err(e) => {
+                    result.error = Some(format!("{}", e));
+                }
+            }
+        }
+        ExportRenderMode::MarchingCubes => {
+            match generate_marching_cubes_mesh_from_bytes(&wasm_bytes, config.resolution) {
+                Ok((tris, bounds_min, bounds_max)) => {
+                    result.bounds_min = bounds_min;
+                    result.bounds_max = bounds_max;
+                    result.sample_count = tris.len();
+                    result.mesh_vertices = Arc::new(
+                        tris.iter()
+                            .flat_map(|t| {
+                                [
+                                    marching_cubes_wgpu::MeshVertex {
+                                        position: t.vertices[0].into(),
+                                        _pad0: 0.0,
+                                        normal: t.normals[0].into(),
+                                        _pad1: 0.0,
+                                    },
+                                    marching_cubes_wgpu::MeshVertex {
+                                        position: t.vertices[1].into(),
+                                        _pad0: 0.0,
+                                        normal: t.normals[1].into(),
+                                        _pad1: 0.0,
+                                    },
+                                    marching_cubes_wgpu::MeshVertex {
+                                        position: t.vertices[2].into(),
+                                        _pad0: 0.0,
+                                        normal: t.normals[2].into(),
+                                        _pad1: 0.0,
+                                    },
+                                ]
+                            })
+                            .collect(),
+                    );
+                    result.triangles = tris;
+                }
+                Err(e) => {
+                    result.error = Some(format!("{}", e));
+                }
+            }
+        }
+        ExportRenderMode::AdaptiveSurfaceNets | ExportRenderMode::AdaptiveSurfaceNets2 => {
+            // Adaptive meshing requires wasmtime's parallel sampler, not available on web
+            // Fall back to marching cubes
+            match generate_marching_cubes_mesh_from_bytes(&wasm_bytes, config.resolution) {
+                Ok((tris, bounds_min, bounds_max)) => {
+                    result.bounds_min = bounds_min;
+                    result.bounds_max = bounds_max;
+                    result.sample_count = tris.len();
+                    result.mesh_vertices = Arc::new(
+                        tris.iter()
+                            .flat_map(|t| {
+                                [
+                                    marching_cubes_wgpu::MeshVertex {
+                                        position: t.vertices[0].into(),
+                                        _pad0: 0.0,
+                                        normal: t.normals[0].into(),
+                                        _pad1: 0.0,
+                                    },
+                                    marching_cubes_wgpu::MeshVertex {
+                                        position: t.vertices[1].into(),
+                                        _pad0: 0.0,
+                                        normal: t.normals[1].into(),
+                                        _pad1: 0.0,
+                                    },
+                                    marching_cubes_wgpu::MeshVertex {
+                                        position: t.vertices[2].into(),
+                                        _pad0: 0.0,
+                                        normal: t.normals[2].into(),
+                                        _pad1: 0.0,
+                                    },
+                                ]
+                            })
+                            .collect(),
+                    );
+                    result.triangles = tris;
+                }
+                Err(e) => {
+                    result.error = Some(format!("Adaptive mesh not available on web, marching cubes fallback failed: {}", e));
+                }
+            }
+        }
+    }
+
+    result.sample_time = start_time.elapsed().as_secs_f32();
+
+    BackgroundTaskResult::ResampleComplete { asset_id, result }
 }
 
 /// Tracks the state of an in-progress background operation
@@ -489,12 +595,14 @@ use volumetric::{
     OperatorMetadataOutput, Project, ProjectEntry, Triangle,
 };
 
-// Native-only: WASM execution functions (require wasmtime)
+// WASM execution functions available on both native and web
+use volumetric::{generate_marching_cubes_mesh_from_bytes, sample_model_from_bytes};
+
+// Native-only: Advanced WASM execution functions (require wasmtime directly)
 #[cfg(not(target_arch = "wasm32"))]
 use volumetric::{
     generate_adaptive_mesh_from_bytes, generate_adaptive_mesh_v2_from_bytes,
-    generate_marching_cubes_mesh_from_bytes, operator_metadata_from_wasm_bytes,
-    sample_model_from_bytes, stl,
+    operator_metadata_from_wasm_bytes, stl,
 };
 
 enum ConfigFieldType {

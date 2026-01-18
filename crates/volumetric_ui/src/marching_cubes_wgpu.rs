@@ -520,8 +520,9 @@ impl MarchingCubesGpu {
                 compilation_options: Default::default(),
             }),
             primitive: wgpu::PrimitiveState::default(),
-            // egui's main render pass typically has a depth attachment (Depth24Plus).
-            // Pipelines used inside that pass must declare a compatible depth-stencil state.
+            // On native, egui's main render pass has a depth attachment (Depth24Plus).
+            // On WebGL2, the render pass may not have a depth attachment.
+            #[cfg(not(target_arch = "wasm32"))]
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth24Plus,
                 depth_write_enabled: false,
@@ -529,6 +530,8 @@ impl MarchingCubesGpu {
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
+            #[cfg(target_arch = "wasm32")]
+            depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
             cache: None,

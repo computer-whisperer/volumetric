@@ -59,6 +59,12 @@
 
     <canvas id="volumetric_canvas"></canvas>
 
+    <!-- Build the Rust WASM binary with web feature -->
+    <link data-trunk rel="rust" data-wasm-opt="z" data-cargo-no-default-features data-cargo-features="web" />
+
+    <!-- WASM helper for nested model instantiation -->
+    <script data-trunk src="wasm_helper.js"></script>
+
     <script type="module">
         // Import and initialize the WASM module
         import init from './volumetric_ui.js';

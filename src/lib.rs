@@ -166,7 +166,7 @@ pub fn sample_model(wasm_path: &Path, resolution: usize) -> anyhow::Result<(Vec<
 }
 
 /// Sample points from WASM bytes (in-memory model)
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "web"))]
 pub fn sample_model_from_bytes(wasm_bytes: &[u8], resolution: usize) -> anyhow::Result<(Vec<(f32, f32, f32)>, (f32, f32, f32), (f32, f32, f32))> {
     use wasm::ModelExecutor;
 
@@ -206,7 +206,7 @@ pub fn generate_marching_cubes_mesh(wasm_path: &Path, resolution: usize) -> anyh
 }
 
 /// Generate a mesh using marching cubes from WASM bytes
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "web"))]
 pub fn generate_marching_cubes_mesh_from_bytes(wasm_bytes: &[u8], resolution: usize) -> anyhow::Result<(Vec<Triangle>, (f32, f32, f32), (f32, f32, f32))> {
     use wasm::ModelExecutor;
 
@@ -479,9 +479,70 @@ impl ExecuteWasmEntry {
         Ok(())
     }
 
-    #[cfg(not(feature = "native"))]
+    #[cfg(all(feature = "web", not(feature = "native")))]
+    pub fn run(&self, environment: &mut Environment) -> Result<(), ExecutionError> {
+        use wasm::{OperatorExecutor, OperatorIo};
+
+        // Extract the operator WASM binary (clone to release borrow)
+        let wasm_bin = {
+            let wasm_asset = environment.loaded_assets.get(&self.asset_id)
+                .ok_or(ExecutionError::NoSuchAssetId(self.asset_id.clone()))?;
+            match wasm_asset.asset.as_ref() {
+                Asset::OperationWASM(wasm_bin) => wasm_bin.clone(),
+                other => return Err(ExecutionError::WrongAssetType(
+                    self.asset_id.clone(),
+                    AssetType::OperationWASM,
+                    other.asset_type(),
+                )),
+            }
+        };
+
+        // Resolve inputs to raw bytes
+        let mut input_bytes = Vec::new();
+        let mut precursor_asset_ids = Vec::new();
+
+        for input in &self.inputs {
+            let bytes = match input {
+                ExecuteWasmInput::AssetByID(asset_id) => {
+                    let asset = environment.loaded_assets.get(asset_id)
+                        .ok_or(ExecutionError::NoSuchAssetId(asset_id.clone()))?;
+                    precursor_asset_ids.push(asset_id.clone());
+                    asset.asset.bytes().to_vec()
+                },
+                ExecuteWasmInput::String(s) => s.as_bytes().to_vec(),
+                ExecuteWasmInput::Data(d) => d.clone(),
+            };
+            input_bytes.push(bytes);
+        }
+
+        let mut executor = wasm::create_operator_executor(&wasm_bin)
+            .map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
+
+        let io = OperatorIo::new(input_bytes);
+        let result = executor.run(io)
+            .map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
+
+        // Collect outputs and add them to the environment
+        for (idx, output_spec) in self.outputs.iter().enumerate() {
+            if let Some(output_bytes) = result.outputs.get(&idx) {
+                let asset = match output_spec.asset_type {
+                    AssetType::ModelWASM => Asset::ModelWASM(output_bytes.clone()),
+                    AssetType::OperationWASM => Asset::OperationWASM(output_bytes.clone()),
+                };
+                environment.loaded_assets.insert(output_spec.asset_id.clone(), LoadedAsset {
+                    asset_id: output_spec.asset_id.clone(),
+                    asset: Arc::new(asset),
+                    precursor_asset_ids: precursor_asset_ids.clone(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(any(feature = "native", feature = "web")))]
     pub fn run(&self, _environment: &mut Environment) -> Result<(), ExecutionError> {
-        Err(ExecutionError::Wasmtime("WASM execution requires the 'native' feature".to_string()))
+        Err(ExecutionError::Wasmtime("WASM execution requires the 'native' or 'web' feature".to_string()))
     }
 }
 

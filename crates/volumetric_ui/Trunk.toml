@@ -2,8 +2,14 @@
 target = "index.html"
 dist = "dist"
 
+# Build with web feature, disable default (native) feature
+[tools.cargo]
+no_default_features = true
+features = ["web"]
+
 [watch]
-watch = ["src", "index.html"]
+# Watch both the UI crate and the core volumetric library
+watch = ["src", "index.html", "../../src"]
 ignore = []
 
 [serve]

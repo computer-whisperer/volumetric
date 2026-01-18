@@ -1,16 +1,22 @@
 //! JavaScript bindings for web WASM execution.
 //!
 //! This module provides the wasm-bindgen extern declarations for calling
-//! JavaScript functions that execute WASM modules in the browser.
+//! JavaScript functions that execute nested WASM modules in the browser.
 //!
-//! The companion JavaScript file should implement:
-//! - `wasmModelCreate(bytes: Uint8Array): number` - Create a model instance
+//! The companion JavaScript file (wasm_helper.js) implements:
+//!
+//! ## Model Functions
+//! - `wasmModelCreateSync(bytes: Uint8Array): number` - Create a model instance synchronously
 //! - `wasmModelGetBounds(handle: number): Float64Array` - Get [minX, minY, minZ, maxX, maxY, maxZ]
 //! - `wasmModelIsInside(handle: number, x: f64, y: f64, z: f64): f32` - Sample density
 //! - `wasmModelDestroy(handle: number)` - Free the model instance
-//! - `wasmOperatorCreate(bytes: Uint8Array): number` - Create an operator instance
-//! - `wasmOperatorRun(handle: number, inputs: Array<Uint8Array>): Array<Uint8Array>` - Run operator
-//! - `wasmOperatorGetMetadata(handle: number): Uint8Array` - Get CBOR metadata
+//!
+//! ## Operator Functions
+//! - `wasmOperatorCreate(bytes: Uint8Array, inputs: Array<Uint8Array>): number` - Create operator
+//! - `wasmOperatorRun(handle: number): boolean` - Run the operator
+//! - `wasmOperatorGetOutput(handle: number, idx: number): Uint8Array | null` - Get output data
+//! - `wasmOperatorGetOutputIndices(handle: number): number[]` - Get indices of outputs
+//! - `wasmOperatorGetMetadata(handle: number): Uint8Array | null` - Get metadata
 //! - `wasmOperatorDestroy(handle: number)` - Free the operator instance
 
 #![allow(dead_code)]
@@ -22,18 +28,24 @@ use wasm_bindgen::prelude::*;
 #[cfg(feature = "web")]
 pub type JsWasmHandle = u32;
 
+// ============================================================================
+// Model bindings
+// ============================================================================
+
 #[cfg(feature = "web")]
 #[wasm_bindgen]
 extern "C" {
-    /// Create a model WASM instance from bytes.
+    /// Create a model WASM instance from bytes (synchronous).
     /// Returns a handle that can be used with other model functions.
-    #[wasm_bindgen(js_name = wasmModelCreate)]
-    pub fn wasm_model_create(bytes: &[u8]) -> JsWasmHandle;
+    /// Returns 0 on error.
+    #[wasm_bindgen(js_name = wasmModelCreateSync)]
+    pub fn wasm_model_create_sync(bytes: &[u8]) -> JsWasmHandle;
 
     /// Get the bounding box of a model.
     /// Returns a Float64Array with [minX, minY, minZ, maxX, maxY, maxZ].
+    /// Returns null/undefined on error.
     #[wasm_bindgen(js_name = wasmModelGetBounds)]
-    pub fn wasm_model_get_bounds(handle: JsWasmHandle) -> Vec<f64>;
+    pub fn wasm_model_get_bounds(handle: JsWasmHandle) -> Option<Vec<f64>>;
 
     /// Sample the density at a point.
     /// Returns the density value (> 0 means inside).
@@ -43,19 +55,40 @@ extern "C" {
     /// Destroy a model instance and free resources.
     #[wasm_bindgen(js_name = wasmModelDestroy)]
     pub fn wasm_model_destroy(handle: JsWasmHandle);
+}
 
-    /// Create an operator WASM instance from bytes.
+// ============================================================================
+// Operator bindings
+// ============================================================================
+
+#[cfg(feature = "web")]
+#[wasm_bindgen]
+extern "C" {
+    /// Create an operator WASM instance with input data.
+    /// inputs: Array of Uint8Array (input data for each slot)
+    /// Returns a handle or 0 on error.
     #[wasm_bindgen(js_name = wasmOperatorCreate)]
-    pub fn wasm_operator_create(bytes: &[u8]) -> JsWasmHandle;
+    pub fn wasm_operator_create(bytes: &[u8], inputs: js_sys::Array) -> JsWasmHandle;
 
-    /// Run an operator with the given inputs.
-    /// Returns an array of output byte arrays.
+    /// Run the operator.
+    /// Returns true on success, false on error.
     #[wasm_bindgen(js_name = wasmOperatorRun)]
-    pub fn wasm_operator_run(handle: JsWasmHandle, inputs: Vec<js_sys::Uint8Array>) -> Vec<js_sys::Uint8Array>;
+    pub fn wasm_operator_run(handle: JsWasmHandle) -> bool;
 
-    /// Get the operator's CBOR metadata.
+    /// Get the output data at the given index.
+    /// Returns the output bytes or None if no output at that index.
+    #[wasm_bindgen(js_name = wasmOperatorGetOutput)]
+    pub fn wasm_operator_get_output(handle: JsWasmHandle, idx: u32) -> Option<Vec<u8>>;
+
+    /// Get all output indices that have data.
+    /// Returns an array of indices.
+    #[wasm_bindgen(js_name = wasmOperatorGetOutputIndices)]
+    pub fn wasm_operator_get_output_indices(handle: JsWasmHandle) -> Vec<u32>;
+
+    /// Get the operator's metadata.
+    /// Returns the metadata bytes or None on error.
     #[wasm_bindgen(js_name = wasmOperatorGetMetadata)]
-    pub fn wasm_operator_get_metadata(handle: JsWasmHandle) -> Vec<u8>;
+    pub fn wasm_operator_get_metadata(handle: JsWasmHandle) -> Option<Vec<u8>>;
 
     /// Destroy an operator instance and free resources.
     #[wasm_bindgen(js_name = wasmOperatorDestroy)]
