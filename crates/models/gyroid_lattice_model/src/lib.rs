@@ -25,7 +25,7 @@ fn in_bounds(x: f64, y: f64, z: f64, b: f64) -> bool {
     x >= -b && x <= b && y >= -b && y <= b && z >= -b && z <= b
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn is_inside(x: f64, y: f64, z: f64) -> f32 {
     let bound = 3.14159265f64; // ~pi
     if !in_bounds(x, y, z, bound) {
@@ -36,27 +36,27 @@ pub extern "C" fn is_inside(x: f64, y: f64, z: f64) -> f32 {
     if gyroid(x, y, z).abs() < thickness { 1.0 } else { 0.0 }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn get_bounds_min_x() -> f64 {
     -3.14159265f64
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn get_bounds_min_y() -> f64 {
     -3.14159265f64
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn get_bounds_min_z() -> f64 {
     -3.14159265f64
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn get_bounds_max_x() -> f64 {
     3.14159265f64
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn get_bounds_max_y() -> f64 {
     3.14159265f64
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn get_bounds_max_z() -> f64 {
     3.14159265f64
 }

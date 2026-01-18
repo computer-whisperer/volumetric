@@ -406,7 +406,7 @@ impl MarchingCubesGpu {
             layout: Some(&mesh_layout),
             vertex: wgpu::VertexState {
                 module: &mesh_shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
                 buffers: &[wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<MeshVertex>() as u64,
                     step_mode: wgpu::VertexStepMode::Vertex,
@@ -427,7 +427,7 @@ impl MarchingCubesGpu {
             },
             fragment: Some(wgpu::FragmentState {
                 module: &mesh_shader,
-                entry_point: "fs_gbuffer",
+                entry_point: Some("fs_gbuffer"),
                 targets: &[
                     Some(wgpu::ColorTargetState {
                         format: target_format,
@@ -479,13 +479,13 @@ impl MarchingCubesGpu {
             layout: Some(&ssao_layout),
             vertex: wgpu::VertexState {
                 module: &ssao_shader,
-                entry_point: "vs_fullscreen",
+                entry_point: Some("vs_fullscreen"),
                 buffers: &[],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: &ssao_shader,
-                entry_point: "fs_ssao",
+                entry_point: Some("fs_ssao"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: wgpu::TextureFormat::R8Unorm,
                     blend: None,
@@ -505,13 +505,13 @@ impl MarchingCubesGpu {
             layout: Some(&ssao_layout),
             vertex: wgpu::VertexState {
                 module: &ssao_shader,
-                entry_point: "vs_fullscreen",
+                entry_point: Some("vs_fullscreen"),
                 buffers: &[],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: &ssao_shader,
-                entry_point: "fs_composite",
+                entry_point: Some("fs_composite"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: target_format,
                     blend: None,
@@ -755,6 +755,7 @@ impl MarchingCubesGpu {
                             load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                             store: wgpu::StoreOp::Store,
                         },
+                        depth_slice: None,
                     }),
                     Some(wgpu::RenderPassColorAttachment {
                         view: &self.g_normal_view,
@@ -763,6 +764,7 @@ impl MarchingCubesGpu {
                             load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                             store: wgpu::StoreOp::Store,
                         },
+                        depth_slice: None,
                     }),
                     Some(wgpu::RenderPassColorAttachment {
                         view: &self.g_depth_view,
@@ -771,6 +773,7 @@ impl MarchingCubesGpu {
                             load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
                             store: wgpu::StoreOp::Store,
                         },
+                        depth_slice: None,
                     }),
                 ],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
@@ -809,6 +812,7 @@ impl MarchingCubesGpu {
                         load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
                         store: wgpu::StoreOp::Store,
                     },
+                    depth_slice: None,
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
@@ -828,6 +832,7 @@ impl MarchingCubesGpu {
                         load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
                         store: wgpu::StoreOp::Store,
                     },
+                    depth_slice: None,
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,

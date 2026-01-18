@@ -38,34 +38,34 @@ fn sdf_rounded_box(x: f64, y: f64, z: f64, bx: f64, by: f64, bz: f64, r: f64) ->
     outside + inside - r
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn is_inside(x: f64, y: f64, z: f64) -> f32 {
     let b = (0.9, 0.6, 0.4);
     let r = 0.2;
     if sdf_rounded_box(x, y, z, b.0, b.1, b.2, r) <= 0.0 { 1.0 } else { 0.0 }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn get_bounds_min_x() -> f64 {
     -(0.9 + 0.2)
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn get_bounds_min_y() -> f64 {
     -(0.6 + 0.2)
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn get_bounds_min_z() -> f64 {
     -(0.4 + 0.2)
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn get_bounds_max_x() -> f64 {
     0.9 + 0.2
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn get_bounds_max_y() -> f64 {
     0.6 + 0.2
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn get_bounds_max_z() -> f64 {
     0.4 + 0.2
 }

@@ -2535,7 +2535,7 @@ mod tests {
         let hist = edge_incidence_histogram(triangles);
         let non_manifold_edges: usize = hist
             .iter()
-            .filter(|(&count, _)| count > 2)
+            .filter(|&(&count, _)| count > 2)
             .map(|(_, &num)| num)
             .sum();
 
@@ -3600,7 +3600,7 @@ mod tests {
 
         // Check for non-manifold edges (more than 2 triangles sharing an edge)
         let non_manifold_edges: usize = hist.iter()
-            .filter(|(&count, _)| count > 2)
+            .filter(|&(&count, _)| count > 2)
             .map(|(_, &num)| num)
             .sum();
 

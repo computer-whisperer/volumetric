@@ -18,7 +18,7 @@ fn panic(_info: &PanicInfo) -> ! {
 ///
 /// For this test model, we define a unit sphere centered at the origin.
 /// A point is inside if x² + y² + z² <= 1.0
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn is_inside(x: f64, y: f64, z: f64) -> f32 {
     let distance_squared = x * x + y * y + z * z;
     if distance_squared <= 1.0 {
@@ -31,15 +31,15 @@ pub extern "C" fn is_inside(x: f64, y: f64, z: f64) -> f32 {
 /// Get the bounding box of the model.
 /// Returns the bounds as 6 floats: min_x, min_y, min_z, max_x, max_y, max_z
 /// For a unit sphere, this is (-1, -1, -1) to (1, 1, 1)
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn get_bounds_min_x() -> f64 { -1.0f64 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn get_bounds_min_y() -> f64 { -1.0f64 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn get_bounds_min_z() -> f64 { -1.0f64 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn get_bounds_max_x() -> f64 { 1.0f64 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn get_bounds_max_y() -> f64 { 1.0f64 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn get_bounds_max_z() -> f64 { 1.0f64 }

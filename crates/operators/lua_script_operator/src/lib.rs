@@ -84,7 +84,7 @@ struct OperatorMetadata {
 }
 
 #[link(wasm_import_module = "host")]
-extern "C" {
+unsafe extern "C" {
     fn get_input_len(arg: i32) -> u32;
     fn get_input_data(arg: i32, ptr: i32, len: i32);
     fn post_output(output_idx: i32, ptr: i32, len: i32);
@@ -1393,7 +1393,7 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
     Ok(module.emit_wasm())
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn run() {
     let len = unsafe { get_input_len(0) } as usize;
     let mut buf = vec![0u8; len];
@@ -1444,7 +1444,7 @@ function get_bounds_max_z()
 end
 "#;
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn get_metadata() -> i64 {
     static METADATA: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     let bytes = METADATA.get_or_init(|| {

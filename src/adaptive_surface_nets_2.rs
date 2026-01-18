@@ -3329,13 +3329,14 @@ mod tests {
         );
 
         // Should be close to x=0.3
+        let (pos, _outcome) = refined;
         assert!(
-            (refined.0 - 0.3).abs() < 0.01,
+            (pos.0 - 0.3).abs() < 0.01,
             "Refined x should be close to 0.3, got {}",
-            refined.0
+            pos.0
         );
-        assert_eq!(refined.1, 0.0, "Y should be unchanged");
-        assert_eq!(refined.2, 0.0, "Z should be unchanged");
+        assert_eq!(pos.1, 0.0, "Y should be unchanged");
+        assert_eq!(pos.2, 0.0, "Z should be unchanged");
     }
 
     #[test]
@@ -3359,11 +3360,13 @@ mod tests {
         );
 
         // Should return original position since no crossing found
-        assert_eq!(refined, initial_pos, "Should return original when no crossing");
+        let (pos, _outcome) = refined;
+        assert_eq!(pos, initial_pos, "Should return original when no crossing");
     }
 
     #[test]
     fn test_refine_vertex_position_zero_direction() {
+        // When primary direction is zero, the function uses fallback directions (+X, +Y, +Z)
         let sphere = |x: f64, y: f64, z: f64| -> f32 {
             if x * x + y * y + z * z < 1.0 { 1.0 } else { 0.0 }
         };
@@ -3383,8 +3386,17 @@ mod tests {
             &stats,
         );
 
-        // Should return original position since direction is zero
-        assert_eq!(refined, initial_pos, "Should return original with zero direction");
+        // With zero primary direction, fallback +X finds sphere surface near x=1.0
+        // The point (0.5, 0, 0) is inside, so +X searches toward surface at x=1.0
+        let (pos, outcome) = refined;
+        assert!(
+            (pos.0 - 1.0).abs() < 0.02,
+            "X should be near 1.0 (sphere surface), got {}",
+            pos.0
+        );
+        assert_eq!(pos.1, 0.0, "Y should be unchanged");
+        assert_eq!(pos.2, 0.0, "Z should be unchanged");
+        assert_eq!(outcome, RefineOutcome::FallbackX, "Should use X fallback");
     }
 
     #[test]

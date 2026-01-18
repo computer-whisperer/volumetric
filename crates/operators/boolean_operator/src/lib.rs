@@ -72,7 +72,7 @@ impl From<BooleanOpConfig> for BooleanOp {
 }
 
 #[link(wasm_import_module = "host")]
-extern "C" {
+unsafe extern "C" {
     fn get_input_len(arg: i32) -> u32;
     fn get_input_data(arg: i32, ptr: i32, len: i32);
     fn post_output(output_idx: i32, ptr: i32, len: i32);
@@ -498,7 +498,7 @@ fn merge_models(a_wasm: &[u8], b_wasm: &[u8], op: BooleanOp) -> Result<Vec<u8>, 
     Ok(out.finish())
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn run() {
     let len_a = unsafe { get_input_len(0) } as usize;
     let mut a_buf = vec![0u8; len_a];
@@ -531,7 +531,7 @@ pub extern "C" fn run() {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn get_metadata() -> i64 {
     static METADATA: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     let bytes = METADATA.get_or_init(|| {

@@ -62,22 +62,22 @@ fn mandelbulb_inside(cx: f64, cy: f64, cz: f64) -> bool {
     true
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn is_inside(x: f64, y: f64, z: f64) -> f32 {
     // Slight scale so the interesting structure fills the bounds better.
     let s = 0.9f64;
     if mandelbulb_inside(x * s, y * s, z * s) { 1.0 } else { 0.0 }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn get_bounds_min_x() -> f64 { -1.35f64 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn get_bounds_min_y() -> f64 { -1.35f64 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn get_bounds_min_z() -> f64 { -1.35f64 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn get_bounds_max_x() -> f64 { 1.35f64 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn get_bounds_max_y() -> f64 { 1.35f64 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn get_bounds_max_z() -> f64 { 1.35f64 }
