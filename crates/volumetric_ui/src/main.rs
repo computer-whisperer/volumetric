@@ -6,9 +6,386 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::SystemTime;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Sender, Receiver};
+use std::thread::{self, JoinHandle};
 
 mod point_cloud_wgpu;
 mod marching_cubes_wgpu;
+
+// =============================================================================
+// Background Task System
+// =============================================================================
+
+/// A cancellation token that can be shared between the UI and background worker.
+#[derive(Clone)]
+struct CancellationToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl CancellationToken {
+    fn new() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+}
+
+/// A task to be executed in the background.
+enum BackgroundTask {
+    /// Execute a project pipeline
+    RunProject {
+        project: Project,
+    },
+    /// Resample a single asset
+    ResampleAsset {
+        asset_id: String,
+        wasm_bytes: Vec<u8>,
+        mode: ExportRenderMode,
+        config: ResampleConfig,
+    },
+}
+
+/// Configuration for a resample operation (captures all the parameters needed)
+#[derive(Clone)]
+struct ResampleConfig {
+    resolution: usize,
+    // ASN v1
+    adaptive_base_resolution: usize,
+    adaptive_max_depth: usize,
+    adaptive_edge_refinement_iterations: usize,
+    adaptive_vertex_relaxation_iterations: usize,
+    adaptive_hq_normals: bool,
+    // ASN v2
+    asn2_base_resolution: usize,
+    asn2_max_depth: usize,
+    asn2_vertex_refinement_iterations: usize,
+    asn2_normal_sample_iterations: usize,
+    asn2_normal_epsilon_frac: f32,
+}
+
+/// Result from a background task.
+enum BackgroundTaskResult {
+    /// Project execution completed
+    ProjectComplete {
+        assets: Result<Vec<LoadedAsset>, String>,
+        elapsed_secs: f32,
+    },
+    /// Asset resampling completed
+    ResampleComplete {
+        asset_id: String,
+        result: ResampleResult,
+    },
+    /// Task was cancelled
+    Cancelled {
+        description: String,
+    },
+}
+
+/// Result of a resample operation
+struct ResampleResult {
+    bounds_min: (f32, f32, f32),
+    bounds_max: (f32, f32, f32),
+    points: Arc<Vec<(f32, f32, f32)>>,
+    triangles: Vec<Triangle>,
+    mesh_vertices: Arc<Vec<marching_cubes_wgpu::MeshVertex>>,
+    mesh_indices: Option<Arc<Vec<u32>>>,
+    sample_time: f32,
+    sample_count: usize,
+    error: Option<String>,
+    asn2_stats: Option<adaptive_surface_nets_2::MeshingStats2>,
+}
+
+/// State of the background worker
+struct BackgroundWorker {
+    /// Channel to send tasks to the worker
+    task_sender: Sender<(BackgroundTask, CancellationToken)>,
+    /// Channel to receive results from the worker
+    result_receiver: Receiver<BackgroundTaskResult>,
+    /// Handle to the worker thread
+    _thread_handle: JoinHandle<()>,
+}
+
+impl BackgroundWorker {
+    fn new() -> Self {
+        let (task_sender, task_receiver) = mpsc::channel::<(BackgroundTask, CancellationToken)>();
+        let (result_sender, result_receiver) = mpsc::channel::<BackgroundTaskResult>();
+
+        let thread_handle = thread::spawn(move || {
+            Self::worker_loop(task_receiver, result_sender);
+        });
+
+        Self {
+            task_sender,
+            result_receiver,
+            _thread_handle: thread_handle,
+        }
+    }
+
+    fn send_task(&self, task: BackgroundTask, cancel_token: CancellationToken) {
+        // Ignore send errors - if the worker is dead, we'll notice when we try to receive
+        let _ = self.task_sender.send((task, cancel_token));
+    }
+
+    fn try_recv_result(&self) -> Option<BackgroundTaskResult> {
+        self.result_receiver.try_recv().ok()
+    }
+
+    fn worker_loop(
+        task_receiver: Receiver<(BackgroundTask, CancellationToken)>,
+        result_sender: Sender<BackgroundTaskResult>,
+    ) {
+        while let Ok((task, cancel_token)) = task_receiver.recv() {
+            if cancel_token.is_cancelled() {
+                let _ = result_sender.send(BackgroundTaskResult::Cancelled {
+                    description: "Task cancelled before starting".to_string(),
+                });
+                continue;
+            }
+
+            let result = match task {
+                BackgroundTask::RunProject { project } => {
+                    Self::execute_project(project, &cancel_token)
+                }
+                BackgroundTask::ResampleAsset { asset_id, wasm_bytes, mode, config } => {
+                    Self::execute_resample(asset_id, wasm_bytes, mode, config, &cancel_token)
+                }
+            };
+
+            let _ = result_sender.send(result);
+        }
+    }
+
+    fn execute_project(project: Project, cancel_token: &CancellationToken) -> BackgroundTaskResult {
+        let start_time = std::time::Instant::now();
+        let mut env = Environment::new();
+
+        // Check cancellation before starting
+        if cancel_token.is_cancelled() {
+            return BackgroundTaskResult::Cancelled {
+                description: "Project execution cancelled".to_string(),
+            };
+        }
+
+        match project.run(&mut env) {
+            Ok(assets) => {
+                BackgroundTaskResult::ProjectComplete {
+                    assets: Ok(assets),
+                    elapsed_secs: start_time.elapsed().as_secs_f32(),
+                }
+            }
+            Err(e) => {
+                BackgroundTaskResult::ProjectComplete {
+                    assets: Err(format!("Failed to run project: {}", e)),
+                    elapsed_secs: start_time.elapsed().as_secs_f32(),
+                }
+            }
+        }
+    }
+
+    fn execute_resample(
+        asset_id: String,
+        wasm_bytes: Vec<u8>,
+        mode: ExportRenderMode,
+        config: ResampleConfig,
+        cancel_token: &CancellationToken,
+    ) -> BackgroundTaskResult {
+        if cancel_token.is_cancelled() {
+            return BackgroundTaskResult::Cancelled {
+                description: format!("Resample of {} cancelled", asset_id),
+            };
+        }
+
+        let start_time = std::time::Instant::now();
+        let mut result = ResampleResult {
+            bounds_min: (0.0, 0.0, 0.0),
+            bounds_max: (0.0, 0.0, 0.0),
+            points: Arc::new(Vec::new()),
+            triangles: Vec::new(),
+            mesh_vertices: Arc::new(Vec::new()),
+            mesh_indices: None,
+            sample_time: 0.0,
+            sample_count: 0,
+            error: None,
+            asn2_stats: None,
+        };
+
+        match mode {
+            ExportRenderMode::None => {
+                // Nothing to do
+            }
+            ExportRenderMode::PointCloud => {
+                match sample_model_from_bytes(&wasm_bytes, config.resolution) {
+                    Ok((pts, bounds_min, bounds_max)) => {
+                        result.bounds_min = bounds_min;
+                        result.bounds_max = bounds_max;
+                        result.sample_count = pts.len();
+                        result.points = Arc::new(pts);
+                    }
+                    Err(e) => {
+                        result.error = Some(format_anyhow_error_chain(&e));
+                    }
+                }
+            }
+            ExportRenderMode::MarchingCubes => {
+                match generate_marching_cubes_mesh_from_bytes(&wasm_bytes, config.resolution) {
+                    Ok((tris, bounds_min, bounds_max)) => {
+                        result.bounds_min = bounds_min;
+                        result.bounds_max = bounds_max;
+                        result.sample_count = tris.len();
+                        result.mesh_vertices = Arc::new(
+                            tris.iter()
+                                .flat_map(|t| {
+                                    [
+                                        marching_cubes_wgpu::MeshVertex {
+                                            position: t.vertices[0].into(),
+                                            _pad0: 0.0,
+                                            normal: t.normals[0].into(),
+                                            _pad1: 0.0,
+                                        },
+                                        marching_cubes_wgpu::MeshVertex {
+                                            position: t.vertices[1].into(),
+                                            _pad0: 0.0,
+                                            normal: t.normals[1].into(),
+                                            _pad1: 0.0,
+                                        },
+                                        marching_cubes_wgpu::MeshVertex {
+                                            position: t.vertices[2].into(),
+                                            _pad0: 0.0,
+                                            normal: t.normals[2].into(),
+                                            _pad1: 0.0,
+                                        },
+                                    ]
+                                })
+                                .collect(),
+                        );
+                        result.triangles = tris;
+                    }
+                    Err(e) => {
+                        result.error = Some(format_anyhow_error_chain(&e));
+                    }
+                }
+            }
+            ExportRenderMode::AdaptiveSurfaceNets => {
+                let normal_mode = if config.adaptive_hq_normals {
+                    adaptive_surface_nets::NormalMode::HqBisection {
+                        eps_frac: 0.1,
+                        bracket_frac: 1.0,
+                        iterations: 8,
+                    }
+                } else {
+                    adaptive_surface_nets::NormalMode::Mesh
+                };
+                let asn_config = adaptive_surface_nets::AdaptiveMeshConfig {
+                    base_resolution: config.adaptive_base_resolution,
+                    max_refinement_depth: config.adaptive_max_depth,
+                    edge_refinement_iterations: config.adaptive_edge_refinement_iterations,
+                    vertex_relaxation_iterations: config.adaptive_vertex_relaxation_iterations,
+                    normal_mode,
+                };
+                match generate_adaptive_mesh_from_bytes(&wasm_bytes, &asn_config) {
+                    Ok((tris, bounds_min, bounds_max)) => {
+                        result.bounds_min = bounds_min;
+                        result.bounds_max = bounds_max;
+                        result.sample_count = tris.len();
+                        result.mesh_vertices = Arc::new(
+                            tris.iter()
+                                .flat_map(|t| {
+                                    [
+                                        marching_cubes_wgpu::MeshVertex {
+                                            position: t.vertices[0].into(),
+                                            _pad0: 0.0,
+                                            normal: t.normals[0].into(),
+                                            _pad1: 0.0,
+                                        },
+                                        marching_cubes_wgpu::MeshVertex {
+                                            position: t.vertices[1].into(),
+                                            _pad0: 0.0,
+                                            normal: t.normals[1].into(),
+                                            _pad1: 0.0,
+                                        },
+                                        marching_cubes_wgpu::MeshVertex {
+                                            position: t.vertices[2].into(),
+                                            _pad0: 0.0,
+                                            normal: t.normals[2].into(),
+                                            _pad1: 0.0,
+                                        },
+                                    ]
+                                })
+                                .collect(),
+                        );
+                        result.triangles = tris;
+                    }
+                    Err(e) => {
+                        result.error = Some(format_anyhow_error_chain(&e));
+                    }
+                }
+            }
+            ExportRenderMode::AdaptiveSurfaceNets2 => {
+                let asn2_config = adaptive_surface_nets_2::AdaptiveMeshConfig2 {
+                    base_resolution: config.asn2_base_resolution,
+                    max_depth: config.asn2_max_depth,
+                    vertex_refinement_iterations: config.asn2_vertex_refinement_iterations,
+                    normal_sample_iterations: config.asn2_normal_sample_iterations,
+                    normal_epsilon_frac: config.asn2_normal_epsilon_frac,
+                    num_threads: 0,
+                };
+                match generate_adaptive_mesh_v2_from_bytes(&wasm_bytes, &asn2_config) {
+                    Ok(meshing_result) => {
+                        result.bounds_min = meshing_result.bounds_min;
+                        result.bounds_max = meshing_result.bounds_max;
+                        result.sample_count = meshing_result.stats.total_samples as usize;
+                        result.asn2_stats = Some(meshing_result.stats);
+
+                        // Build indexed mesh data
+                        let vertices: Vec<marching_cubes_wgpu::MeshVertex> = meshing_result
+                            .vertices
+                            .iter()
+                            .zip(meshing_result.normals.iter())
+                            .map(|(pos, norm)| marching_cubes_wgpu::MeshVertex {
+                                position: (*pos).into(),
+                                _pad0: 0.0,
+                                normal: (*norm).into(),
+                                _pad1: 0.0,
+                            })
+                            .collect();
+
+                        result.mesh_vertices = Arc::new(vertices);
+                        result.mesh_indices = Some(Arc::new(meshing_result.indices));
+                    }
+                    Err(e) => {
+                        result.error = Some(format_anyhow_error_chain(&e));
+                    }
+                }
+            }
+        }
+
+        result.sample_time = start_time.elapsed().as_secs_f32();
+
+        BackgroundTaskResult::ResampleComplete {
+            asset_id,
+            result,
+        }
+    }
+}
+
+/// Tracks the state of an in-progress background operation
+struct InProgressOperation {
+    /// Description of what's being done
+    description: String,
+    /// When the operation started
+    start_time: std::time::Instant,
+    /// Cancellation token for this operation
+    cancel_token: CancellationToken,
+}
 
 // Project system
 use volumetric::{
@@ -379,6 +756,14 @@ struct VolumetricApp {
     ssao_radius: f32,
     ssao_bias: f32,
     ssao_strength: f32,
+
+    // Background processing
+    /// The background worker for long-running operations
+    background_worker: BackgroundWorker,
+    /// Currently in-progress operation (if any)
+    in_progress_operation: Option<InProgressOperation>,
+    /// Assets currently being resampled in the background
+    pending_resample_assets: std::collections::HashSet<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -472,7 +857,108 @@ impl VolumetricApp {
             ssao_radius: 0.08,
             ssao_bias: 0.002,
             ssao_strength: 1.6,
+
+            background_worker: BackgroundWorker::new(),
+            in_progress_operation: None,
+            pending_resample_assets: std::collections::HashSet::new(),
         }
+    }
+
+    /// Poll for completed background tasks and apply their results
+    fn poll_background_tasks(&mut self) {
+        while let Some(result) = self.background_worker.try_recv_result() {
+            match result {
+                BackgroundTaskResult::ProjectComplete { assets, elapsed_secs } => {
+                    self.in_progress_operation = None;
+                    match assets {
+                        Ok(assets) => {
+                            self.last_evaluation_time = Some(elapsed_secs);
+                            self.error_message = None;
+                            self.exported_assets = assets.clone();
+
+                            // Prune render data for exports that no longer exist
+                            let exported_ids: std::collections::HashSet<String> = self
+                                .exported_assets
+                                .iter()
+                                .map(|a| a.asset_id().to_string())
+                                .collect();
+                            self.asset_render_data
+                                .retain(|id, _| exported_ids.contains(id));
+
+                            // Update WASM bytes for existing render data entries
+                            for (asset_id, render_data) in self.asset_render_data.iter_mut() {
+                                if let Some(asset) = self.exported_assets.iter().find(|a| a.asset_id() == asset_id) {
+                                    if let Some(wasm_bytes) = asset.as_model_wasm() {
+                                        render_data.wasm_bytes = wasm_bytes.to_vec();
+                                        render_data.needs_resample = true;
+                                        render_data.last_error = None;
+                                    }
+                                }
+                            }
+
+                            // If no assets are being rendered, pick the first ModelWASM export
+                            if self.asset_render_data.is_empty() {
+                                if let Some(first_model) = self
+                                    .exported_assets
+                                    .iter()
+                                    .find(|a| a.as_model_wasm().is_some())
+                                {
+                                    let id = first_model.asset_id().to_string();
+                                    let wasm_bytes = first_model.as_model_wasm().unwrap().to_vec();
+                                    self.asset_render_data.insert(
+                                        id,
+                                        AssetRenderData::new(wasm_bytes, ExportRenderMode::AdaptiveSurfaceNets2),
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            self.last_evaluation_time = None;
+                            self.error_message = Some(e);
+                        }
+                    }
+                }
+                BackgroundTaskResult::ResampleComplete { asset_id, result } => {
+                    self.pending_resample_assets.remove(&asset_id);
+                    if self.pending_resample_assets.is_empty() {
+                        self.in_progress_operation = None;
+                    }
+
+                    if let Some(render_data) = self.asset_render_data.get_mut(&asset_id) {
+                        render_data.bounds_min = result.bounds_min;
+                        render_data.bounds_max = result.bounds_max;
+                        render_data.points = result.points;
+                        render_data.triangles = result.triangles;
+                        render_data.mesh_vertices = result.mesh_vertices;
+                        render_data.mesh_indices = result.mesh_indices;
+                        render_data.last_sample_time = Some(result.sample_time);
+                        render_data.last_sample_count = Some(result.sample_count);
+                        render_data.last_error = result.error;
+                        render_data.asn2_stats = result.asn2_stats;
+                    }
+                }
+                BackgroundTaskResult::Cancelled { description } => {
+                    log::info!("Background task cancelled: {}", description);
+                    // Clear relevant state
+                    self.pending_resample_assets.clear();
+                    self.in_progress_operation = None;
+                }
+            }
+        }
+    }
+
+    /// Cancel any in-progress background operation
+    fn cancel_background_operation(&mut self) {
+        if let Some(ref op) = self.in_progress_operation {
+            op.cancel_token.cancel();
+        }
+        self.in_progress_operation = None;
+        self.pending_resample_assets.clear();
+    }
+
+    /// Check if a background operation is in progress
+    fn is_busy(&self) -> bool {
+        self.in_progress_operation.is_some()
     }
 
     fn operator_metadata_cached(&mut self, crate_name: &str) -> Option<OperatorMetadata> {
@@ -560,246 +1046,119 @@ impl VolumetricApp {
             .unwrap_or(ExportRenderMode::None)
     }
 
-    /// Runs the current project and updates exported assets
+    /// Runs the current project in the background
     fn run_project(&mut self) {
-        self.exported_assets.clear();
+        if self.is_busy() {
+            // Cancel existing operation first
+            self.cancel_background_operation();
+        }
+
         if let Some(ref project) = self.project {
-            let mut env = Environment::new();
-            let start_time = std::time::Instant::now();
-            match project.run(&mut env) {
-                Ok(assets) => {
-                    self.last_evaluation_time = Some(start_time.elapsed().as_secs_f32());
-                    // Clear any previous error now that the project ran successfully.
-                    self.error_message = None;
-                    // Retain full exports for UX/testing
-                    self.exported_assets = assets.clone();
+            self.exported_assets.clear();
 
-                    // Prune render data for exports that no longer exist
-                    let exported_ids: std::collections::HashSet<String> = self
-                        .exported_assets
-                        .iter()
-                        .map(|a| a.asset_id().to_string())
-                        .collect();
-                    self.asset_render_data
-                        .retain(|id, _| exported_ids.contains(id));
+            let cancel_token = CancellationToken::new();
+            self.in_progress_operation = Some(InProgressOperation {
+                description: "Running project...".to_string(),
+                start_time: std::time::Instant::now(),
+                cancel_token: cancel_token.clone(),
+            });
 
-                    // Update WASM bytes for existing render data entries
-                    for (asset_id, render_data) in self.asset_render_data.iter_mut() {
-                        if let Some(asset) = self.exported_assets.iter().find(|a| a.asset_id() == asset_id) {
-                            if let Some(wasm_bytes) = asset.as_model_wasm() {
-                                render_data.wasm_bytes = wasm_bytes.to_vec();
-                                render_data.needs_resample = true;
-                                render_data.last_error = None;
-                            }
-                        }
-                    }
-
-                    // If no assets are being rendered, pick the first ModelWASM export
-                    if self.asset_render_data.is_empty() {
-                        if let Some(first_model) = self
-                            .exported_assets
-                            .iter()
-                            .find(|a| a.as_model_wasm().is_some())
-                        {
-                            let id = first_model.asset_id().to_string();
-                            let wasm_bytes = first_model.as_model_wasm().unwrap().to_vec();
-                            self.asset_render_data.insert(
-                                id,
-                                AssetRenderData::new(wasm_bytes, ExportRenderMode::AdaptiveSurfaceNets2),
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    self.last_evaluation_time = None;
-                    self.error_message = Some(format!("Failed to run project: {}", e));
-                }
-            }
+            self.background_worker.send_task(
+                BackgroundTask::RunProject {
+                    project: project.clone(),
+                },
+                cancel_token,
+            );
         } else {
             self.last_evaluation_time = None;
         }
     }
 
-    /// Resamples all assets that need resampling
+    /// Resamples all assets that need resampling (in background)
     fn resample_all_assets(&mut self) {
+        // Collect assets that need resampling
+        let mut assets_to_resample: Vec<(String, Vec<u8>, ExportRenderMode, ResampleConfig)> = Vec::new();
+
         for (asset_id, render_data) in self.asset_render_data.iter_mut() {
             if !render_data.needs_resample {
                 continue;
             }
-            render_data.needs_resample = false;
-            let resolution = render_data.resolution;
-            
-            match render_data.mode {
-                ExportRenderMode::None => {
-                    // Should not happen - None mode assets are removed from the map
-                    render_data.bounds_min = (0.0, 0.0, 0.0);
-                    render_data.bounds_max = (0.0, 0.0, 0.0);
-                    render_data.points = Arc::new(Vec::new());
-                    render_data.triangles.clear();
-                    render_data.mesh_vertices = Arc::new(Vec::new());
-                }
-                ExportRenderMode::PointCloud => {
-                    let start_time = std::time::Instant::now();
-                    match sample_model_from_bytes(&render_data.wasm_bytes, resolution) {
-                        Ok((points, bounds_min, bounds_max)) => {
-                            render_data.last_sample_time = Some(start_time.elapsed().as_secs_f32());
-                            render_data.last_sample_count = Some(resolution * resolution * resolution);
-                            render_data.bounds_min = bounds_min;
-                            render_data.bounds_max = bounds_max;
-                            render_data.points = Arc::new(points);
-                            render_data.triangles.clear();
-                            render_data.mesh_vertices = Arc::new(Vec::new());
-                            render_data.last_error = None;
-                        }
-                        Err(e) => {
-                            render_data.last_sample_time = None;
-                            render_data.last_sample_count = None;
-                            let msg = format!(
-                                "Export '{asset_id}' failed to sample ({}):\n{}",
-                                render_data.mode.label(),
-                                format_anyhow_error_chain(&e)
-                            );
-                            render_data.last_error = Some(msg.clone());
-                            if self.error_message.is_none() {
-                                self.error_message = Some(msg);
-                            }
-                            log::error!("Failed to sample model for export '{asset_id}': {e}");
-                        }
-                    }
-                }
-                ExportRenderMode::MarchingCubes => {
-                    let start_time = std::time::Instant::now();
-                    match generate_marching_cubes_mesh_from_bytes(&render_data.wasm_bytes, resolution) {
-                        Ok((triangles, bounds_min, bounds_max)) => {
-                            render_data.last_sample_time = Some(start_time.elapsed().as_secs_f32());
-                            render_data.last_sample_count = Some(resolution * resolution * resolution);
-                            render_data.bounds_min = bounds_min;
-                            render_data.bounds_max = bounds_max;
-                            render_data.triangles = triangles;
-                            render_data.mesh_vertices = Arc::new(triangles_to_mesh_vertices(&render_data.triangles));
-                            render_data.points = Arc::new(Vec::new());
-                            render_data.last_error = None;
-                        }
-                        Err(e) => {
-                            render_data.last_sample_time = None;
-                            render_data.last_sample_count = None;
-                            let msg = format!(
-                                "Export '{asset_id}' failed to mesh ({}):\n{}",
-                                render_data.mode.label(),
-                                format_anyhow_error_chain(&e)
-                            );
-                            render_data.last_error = Some(msg.clone());
-                            if self.error_message.is_none() {
-                                self.error_message = Some(msg);
-                            }
-                            log::error!("Failed to generate marching cubes mesh for export '{asset_id}': {e}");
-                        }
-                    }
-                }
-                ExportRenderMode::AdaptiveSurfaceNets => {
-                    let start_time = std::time::Instant::now();
-                    let config = adaptive_surface_nets::AdaptiveMeshConfig {
-                        base_resolution: render_data.adaptive_base_resolution,
-                        max_refinement_depth: render_data.adaptive_max_depth,
-                        edge_refinement_iterations: render_data.adaptive_edge_refinement_iterations,
-                        vertex_relaxation_iterations: render_data.adaptive_vertex_relaxation_iterations,
-                        normal_mode: if render_data.adaptive_hq_normals {
-                            adaptive_surface_nets::NormalMode::HqBisection {
-                                eps_frac: 0.05,
-                                bracket_frac: 0.5,
-                                iterations: 10,
-                            }
-                        } else {
-                            adaptive_surface_nets::NormalMode::Mesh
-                        },
-                    };
-                    match generate_adaptive_mesh_from_bytes(&render_data.wasm_bytes, &config) {
-                        Ok((triangles, bounds_min, bounds_max)) => {
-                            let effective_res = config.base_resolution * (1 << config.max_refinement_depth);
-                            render_data.last_sample_time = Some(start_time.elapsed().as_secs_f32());
-                            render_data.last_sample_count = Some(effective_res * effective_res * effective_res);
-                            render_data.bounds_min = bounds_min;
-                            render_data.bounds_max = bounds_max;
-                            render_data.triangles = triangles;
-                            render_data.mesh_vertices = Arc::new(triangles_to_mesh_vertices(&render_data.triangles));
-                            render_data.points = Arc::new(Vec::new());
-                            render_data.last_error = None;
-                        }
-                        Err(e) => {
-                            render_data.last_sample_time = None;
-                            render_data.last_sample_count = None;
-                            let msg = format!(
-                                "Export '{asset_id}' failed to mesh ({}):\n{}",
-                                render_data.mode.label(),
-                                format_anyhow_error_chain(&e)
-                            );
-                            render_data.last_error = Some(msg.clone());
-                            if self.error_message.is_none() {
-                                self.error_message = Some(msg);
-                            }
-                            log::error!("Failed to generate adaptive mesh for export '{asset_id}': {e}");
-                        }
-                    }
-                }
-                ExportRenderMode::AdaptiveSurfaceNets2 => {
-                    let config = adaptive_surface_nets_2::AdaptiveMeshConfig2 {
-                        base_resolution: render_data.asn2_base_resolution,
-                        max_depth: render_data.asn2_max_depth,
-                        vertex_refinement_iterations: render_data.asn2_vertex_refinement_iterations,
-                        normal_sample_iterations: render_data.asn2_normal_sample_iterations,
-                        normal_epsilon_frac: render_data.asn2_normal_epsilon_frac,
-                        num_threads: 0, // Use default parallelism
-                    };
-                    match generate_adaptive_mesh_v2_from_bytes(&render_data.wasm_bytes, &config) {
-                        Ok(result) => {
-                            // Print profiling report to stdout
-                            println!();
-                            println!("ASN2 Meshing completed for '{}'", asset_id);
-                            result.stats.print_report();
-
-                            // Store stats for UI display
-                            render_data.last_sample_time = Some(result.stats.total_time_secs as f32);
-                            render_data.last_sample_count = Some(result.stats.total_samples as usize);
-                            render_data.asn2_stats = Some(result.stats);
-                            render_data.bounds_min = result.bounds_min;
-                            render_data.bounds_max = result.bounds_max;
-                            render_data.triangles.clear(); // No raw triangles for indexed mesh
-
-                            // Convert indexed mesh to MeshVertex format
-                            let mesh_vertices: Vec<marching_cubes_wgpu::MeshVertex> = result.vertices
-                                .iter()
-                                .zip(result.normals.iter())
-                                .map(|(pos, norm)| marching_cubes_wgpu::MeshVertex {
-                                    position: [pos.0, pos.1, pos.2],
-                                    _pad0: 0.0,
-                                    normal: [norm.0, norm.1, norm.2],
-                                    _pad1: 0.0,
-                                })
-                                .collect();
-
-                            render_data.mesh_vertices = Arc::new(mesh_vertices);
-                            render_data.mesh_indices = Some(Arc::new(result.indices));
-                            render_data.points = Arc::new(Vec::new());
-                            render_data.last_error = None;
-                        }
-                        Err(e) => {
-                            render_data.last_sample_time = None;
-                            render_data.last_sample_count = None;
-                            render_data.asn2_stats = None;
-                            let msg = format!(
-                                "Export '{asset_id}' failed to mesh ({}):\n{}",
-                                render_data.mode.label(),
-                                format_anyhow_error_chain(&e)
-                            );
-                            render_data.last_error = Some(msg.clone());
-                            if self.error_message.is_none() {
-                                self.error_message = Some(msg);
-                            }
-                            log::error!("Failed to generate ASN2 mesh for export '{asset_id}': {e}");
-                        }
-                    }
-                }
+            // Don't start new resample if this asset is already being resampled
+            if self.pending_resample_assets.contains(asset_id) {
+                continue;
             }
+            render_data.needs_resample = false;
+
+            if render_data.mode == ExportRenderMode::None {
+                // Handle None mode synchronously - it's trivial
+                render_data.bounds_min = (0.0, 0.0, 0.0);
+                render_data.bounds_max = (0.0, 0.0, 0.0);
+                render_data.points = Arc::new(Vec::new());
+                render_data.triangles.clear();
+                render_data.mesh_vertices = Arc::new(Vec::new());
+                continue;
+            }
+
+            let config = ResampleConfig {
+                resolution: render_data.resolution,
+                adaptive_base_resolution: render_data.adaptive_base_resolution,
+                adaptive_max_depth: render_data.adaptive_max_depth,
+                adaptive_edge_refinement_iterations: render_data.adaptive_edge_refinement_iterations,
+                adaptive_vertex_relaxation_iterations: render_data.adaptive_vertex_relaxation_iterations,
+                adaptive_hq_normals: render_data.adaptive_hq_normals,
+                asn2_base_resolution: render_data.asn2_base_resolution,
+                asn2_max_depth: render_data.asn2_max_depth,
+                asn2_vertex_refinement_iterations: render_data.asn2_vertex_refinement_iterations,
+                asn2_normal_sample_iterations: render_data.asn2_normal_sample_iterations,
+                asn2_normal_epsilon_frac: render_data.asn2_normal_epsilon_frac,
+            };
+
+            assets_to_resample.push((
+                asset_id.clone(),
+                render_data.wasm_bytes.clone(),
+                render_data.mode,
+                config,
+            ));
+        }
+
+        if assets_to_resample.is_empty() {
+            return;
+        }
+
+        // Cancel any existing operation if we're starting new resamples
+        if self.is_busy() && !self.pending_resample_assets.is_empty() {
+            // Already resampling, just add to the queue
+        } else if self.is_busy() {
+            self.cancel_background_operation();
+        }
+
+        // Create cancellation token for this batch
+        let cancel_token = CancellationToken::new();
+
+        // Update in-progress operation
+        let asset_count = assets_to_resample.len();
+        self.in_progress_operation = Some(InProgressOperation {
+            description: if asset_count == 1 {
+                format!("Meshing {}...", assets_to_resample[0].0)
+            } else {
+                format!("Meshing {} assets...", asset_count)
+            },
+            start_time: std::time::Instant::now(),
+            cancel_token: cancel_token.clone(),
+        });
+
+        // Queue all resample tasks
+        for (asset_id, wasm_bytes, mode, config) in assets_to_resample {
+            self.pending_resample_assets.insert(asset_id.clone());
+            self.background_worker.send_task(
+                BackgroundTask::ResampleAsset {
+                    asset_id,
+                    wasm_bytes,
+                    mode,
+                    config,
+                },
+                cancel_token.clone(),
+            );
         }
     }
 
@@ -1363,6 +1722,14 @@ impl VolumetricApp {
 
 impl eframe::App for VolumetricApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Poll for completed background tasks
+        self.poll_background_tasks();
+
+        // Request continuous repaints while background tasks are running
+        if self.is_busy() {
+            ctx.request_repaint();
+        }
+
         // Check if any assets need resampling
         if self.any_needs_resample() {
             self.resample_all_assets();
@@ -1407,6 +1774,24 @@ impl eframe::App for VolumetricApp {
                                 self.error_message = None;
                             }
                         });
+
+                        // Show progress indicator when busy
+                        let mut should_cancel = false;
+                        if let Some(ref op) = self.in_progress_operation {
+                            ui.separator();
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(&op.description);
+                            });
+                            let elapsed = op.start_time.elapsed().as_secs_f32();
+                            ui.weak(format!("{:.1}s elapsed", elapsed));
+                            if ui.button("Cancel").clicked() {
+                                should_cancel = true;
+                            }
+                        }
+                        if should_cancel {
+                            self.cancel_background_operation();
+                        }
 
                         ui.separator();
                         ui.label("Shading");
