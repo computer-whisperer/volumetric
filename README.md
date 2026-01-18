@@ -70,6 +70,24 @@ In the UI:
 2.  **Operations**: Apply operators like "Translate" or "Boolean" to transform your models.
 3.  **Visualization**: Toggle between Point Cloud and Marching Cubes rendering modes.
 
+## Mesh Conventions
+
+All mesh generation algorithms in this project follow these conventions:
+
+### Winding Order
+- **Counter-clockwise (CCW)** when viewed from outside the surface
+- For a triangle with vertices A, B, C in CCW order, the face normal points outward
+- Face normal is computed as: `normal = (B - A) × (C - A)`
+
+### Normals
+- All normals point **outward** from the solid (from inside toward outside)
+- Per-vertex normals are used for smooth shading
+- The `is_inside()` function returns `> 0` for inside, so the gradient of the density field points inward; normals are the negated gradient
+
+### Renderer Expectations
+- The GPU renderer uses `FrontFace::Ccw` with backface culling
+- Triangles wound clockwise when viewed from outside will be culled (not rendered)
+
 ## Performance Note
 
 While sampling a function via WASM for every voxel in a grid is computationally intensive, this project demonstrates that with efficient runtimes (like `wasmtime`) and optimized sampling strategies, it is a highly viable approach for flexible 3D modeling.

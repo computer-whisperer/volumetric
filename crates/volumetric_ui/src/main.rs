@@ -2210,12 +2210,42 @@ impl eframe::App for VolumetricApp {
                                             .set_file_name(format!("{}.stl", asset_id))
                                             .save_file()
                                         {
-                                            // If we have triangles cached, use them. 
-                                            // Otherwise we might need to trigger marching cubes.
-                                            // The requirement says "assume marching cubes for now".
-                                            // If current mode is PointCloud, we might need to mesh it once.
-                                            
-                                            let triangles = if !render_data.triangles.is_empty() {
+                                            // Export the currently rendered mesh
+                                            // Priority: indexed mesh (ASN2) > triangles > fallback to marching cubes
+
+                                            let triangles = if let Some(ref indices) = render_data.mesh_indices {
+                                                // Convert indexed mesh to triangles for STL export
+                                                let vertices = &render_data.mesh_vertices;
+                                                let normals_from_vertices: Vec<Triangle> = indices
+                                                    .chunks(3)
+                                                    .filter_map(|tri| {
+                                                        if tri.len() != 3 {
+                                                            return None;
+                                                        }
+                                                        let i0 = tri[0] as usize;
+                                                        let i1 = tri[1] as usize;
+                                                        let i2 = tri[2] as usize;
+
+                                                        let v0 = vertices.get(i0)?;
+                                                        let v1 = vertices.get(i1)?;
+                                                        let v2 = vertices.get(i2)?;
+
+                                                        Some(Triangle {
+                                                            vertices: [
+                                                                (v0.position[0], v0.position[1], v0.position[2]),
+                                                                (v1.position[0], v1.position[1], v1.position[2]),
+                                                                (v2.position[0], v2.position[1], v2.position[2]),
+                                                            ],
+                                                            normals: [
+                                                                (v0.normal[0], v0.normal[1], v0.normal[2]),
+                                                                (v1.normal[0], v1.normal[1], v1.normal[2]),
+                                                                (v2.normal[0], v2.normal[1], v2.normal[2]),
+                                                            ],
+                                                        })
+                                                    })
+                                                    .collect();
+                                                normals_from_vertices
+                                            } else if !render_data.triangles.is_empty() {
                                                 render_data.triangles.clone()
                                             } else {
                                                 // Fallback: run marching cubes just for export if not already meshed
@@ -2235,6 +2265,8 @@ impl eframe::App for VolumetricApp {
                                                         self.error_message = Some(format!("Failed to export STL: {e}"))
                                                     }
                                                 }
+                                            } else {
+                                                self.error_message = Some("No mesh data to export".to_string());
                                             }
                                         }
                                     }

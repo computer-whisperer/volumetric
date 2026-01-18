@@ -145,9 +145,10 @@
 //! We use a lookup table approach similar to Marching Cubes, indexed by the 8-bit CornerMask.
 //! This gives us 256 possible configurations.
 //!
-//! **Winding Rule**: Triangles are wound so that the normal points from inside→outside
-//! (i.e., from the "inside" corners toward the "outside" corners). We use the right-hand
-//! rule: vertices ordered counter-clockwise when viewed from outside.
+//! **Winding Rule**: Triangles use CCW winding when viewed from outside the surface,
+//! matching the project-wide convention documented in README.md. The face normal
+//! (computed as cross(AB, AC)) points outward from the solid. This is achieved by
+//! reversing the vertex order from the standard MC tables.
 //!
 //! **Ambiguous Cases**: Some CornerMask values (e.g., 0x3C, 0x69, 0x96, 0xC3) have
 //! topologically ambiguous configurations where the surface could be connected in
@@ -278,11 +279,19 @@ impl CuboidId {
     
     /// Get a neighbor cell at the same depth level.
     /// Returns None if the neighbor would be outside the valid range.
-    pub fn neighbor(&self, dx: i32, dy: i32, dz: i32, max_cells: i32) -> Option<CuboidId> {
+    ///
+    /// # Arguments
+    /// * `dx, dy, dz` - Direction offset (-1, 0, or 1)
+    /// * `max_cells` - Number of cells at this depth level (original grid)
+    /// * `boundary_expansion` - Number of extra cells to allow beyond the grid on each side
+    ///   (e.g., 1 means allow cells from -1 to max_cells inclusive)
+    pub fn neighbor(&self, dx: i32, dy: i32, dz: i32, max_cells: i32, boundary_expansion: i32) -> Option<CuboidId> {
         let nx = self.x + dx;
         let ny = self.y + dy;
         let nz = self.z + dz;
-        if nx >= 0 && nx < max_cells && ny >= 0 && ny < max_cells && nz >= 0 && nz < max_cells {
+        let min_valid = -boundary_expansion;
+        let max_valid = max_cells + boundary_expansion;
+        if nx >= min_valid && nx < max_valid && ny >= min_valid && ny < max_valid && nz >= min_valid && nz < max_valid {
             Some(CuboidId::new(nx, ny, nz, self.depth))
         } else {
             None
@@ -412,6 +421,63 @@ pub const EDGE_TABLE: [(usize, usize, u8, i32, i32, i32); 12] = [
     (1, 5, 2, 1, 0, 0), // edge 9: corners 1-5
     (2, 6, 2, 0, 1, 0), // edge 10: corners 2-6
     (3, 7, 2, 1, 1, 0), // edge 11: corners 3-7
+];
+
+// =============================================================================
+// MARCHING CUBES CONVENTION TRANSLATION
+// =============================================================================
+//
+// Our corner numbering uses: index = (z << 2) | (y << 1) | x
+//   0:(0,0,0) 1:(1,0,0) 2:(0,1,0) 3:(1,1,0) 4:(0,0,1) 5:(1,0,1) 6:(0,1,1) 7:(1,1,1)
+//
+// Standard MC corner numbering (Paul Bourke):
+//   0:(0,0,0) 1:(1,0,0) 2:(1,1,0) 3:(0,1,0) 4:(0,0,1) 5:(1,0,1) 6:(1,1,1) 7:(0,1,1)
+//
+// Mapping: MC corner N corresponds to our corner:
+//   MC 0 -> Our 0, MC 1 -> Our 1, MC 2 -> Our 3, MC 3 -> Our 2
+//   MC 4 -> Our 4, MC 5 -> Our 5, MC 6 -> Our 7, MC 7 -> Our 6
+//
+// Similarly for edges (MC edge -> Our edge):
+//   0->0, 1->5, 2->1, 3->4, 4->2, 5->7, 6->3, 7->6, 8->8, 9->9, 10->11, 11->10
+
+/// Convert our corner mask to standard MC corner mask for table lookup.
+/// Our bits: 7 6 5 4 3 2 1 0 (our corners 7,6,5,4,3,2,1,0)
+/// MC bits:  7 6 5 4 3 2 1 0 (MC corners 7,6,5,4,3,2,1,0)
+///
+/// Mapping: MC bit N should contain our corner that maps to MC corner N
+///   MC bit 0 <- our bit 0 (our corner 0 -> MC corner 0)
+///   MC bit 1 <- our bit 1 (our corner 1 -> MC corner 1)
+///   MC bit 2 <- our bit 3 (our corner 3 -> MC corner 2)
+///   MC bit 3 <- our bit 2 (our corner 2 -> MC corner 3)
+///   MC bit 4 <- our bit 4 (our corner 4 -> MC corner 4)
+///   MC bit 5 <- our bit 5 (our corner 5 -> MC corner 5)
+///   MC bit 6 <- our bit 7 (our corner 7 -> MC corner 6)
+///   MC bit 7 <- our bit 6 (our corner 6 -> MC corner 7)
+#[inline]
+fn our_mask_to_mc_mask(our_mask: u8) -> u8 {
+    (our_mask & 0b00000011) |           // bits 0,1 stay
+    ((our_mask & 0b00000100) << 1) |    // our bit 2 -> MC bit 3
+    ((our_mask & 0b00001000) >> 1) |    // our bit 3 -> MC bit 2
+    (our_mask & 0b00110000) |           // bits 4,5 stay
+    ((our_mask & 0b01000000) << 1) |    // our bit 6 -> MC bit 7
+    ((our_mask & 0b10000000) >> 1)      // our bit 7 -> MC bit 6
+}
+
+/// Convert MC edge index to our edge index.
+/// Standard MC edges connect MC corners, we need to map to our edge numbering.
+const MC_EDGE_TO_OUR_EDGE: [usize; 12] = [
+    0,  // MC edge 0 (MC corners 0-1) -> our edge 0 (our corners 0-1)
+    5,  // MC edge 1 (MC corners 1-2) -> our edge 5 (our corners 1-3)
+    1,  // MC edge 2 (MC corners 2-3) -> our edge 1 (our corners 2-3, but MC 2=our 3, MC 3=our 2)
+    4,  // MC edge 3 (MC corners 3-0) -> our edge 4 (our corners 0-2)
+    2,  // MC edge 4 (MC corners 4-5) -> our edge 2 (our corners 4-5)
+    7,  // MC edge 5 (MC corners 5-6) -> our edge 7 (our corners 5-7)
+    3,  // MC edge 6 (MC corners 6-7) -> our edge 3 (our corners 6-7, but MC 6=our 7, MC 7=our 6)
+    6,  // MC edge 7 (MC corners 7-4) -> our edge 6 (our corners 4-6)
+    8,  // MC edge 8 (MC corners 0-4) -> our edge 8 (our corners 0-4)
+    9,  // MC edge 9 (MC corners 1-5) -> our edge 9 (our corners 1-5)
+    11, // MC edge 10 (MC corners 2-6) -> our edge 11 (MC 2=our 3, MC 6=our 7 -> corners 3-7)
+    10, // MC edge 11 (MC corners 3-7) -> our edge 10 (MC 3=our 2, MC 7=our 6 -> corners 2-6)
 ];
 
 /// Marching Cubes edge flags: MC_EDGE_FLAGS[corner_mask] = bitmask of active edges
@@ -890,14 +956,21 @@ fn shared_corners_with_neighbor(dx: i32, dy: i32, dz: i32) -> [(usize, usize); 4
 }
 
 /// Create a work queue entry for a neighbor cell, propagating shared corners.
+///
+/// # Arguments
+/// * `current` - The current work queue entry
+/// * `dx, dy, dz` - Direction to the neighbor
+/// * `max_cells` - Number of cells at this depth level (original grid)
+/// * `boundary_expansion` - Number of extra cells to allow beyond the grid on each side
 fn create_neighbor_entry(
     current: &WorkQueueEntry,
     dx: i32,
     dy: i32,
     dz: i32,
     max_cells: i32,
+    boundary_expansion: i32,
 ) -> Option<WorkQueueEntry> {
-    let neighbor_cuboid = current.cuboid.neighbor(dx, dy, dz, max_cells)?;
+    let neighbor_cuboid = current.cuboid.neighbor(dx, dy, dz, max_cells, boundary_expansion)?;
     let mut neighbor = WorkQueueEntry::new(neighbor_cuboid);
 
     // Propagate shared corners
@@ -952,19 +1025,30 @@ fn emit_triangles_for_cell(
     triangles: &mut Vec<SparseTriangle>,
     stats: &SamplingStats,
 ) {
-    let tri_config = &MC_TRI_TABLE[corner_mask.0 as usize];
+    // Convert our corner mask to MC corner mask for table lookup
+    let mc_mask = our_mask_to_mc_mask(corner_mask.0);
+    let tri_config = &MC_TRI_TABLE[mc_mask as usize];
 
     let mut i = 0;
     while i < 16 && tri_config[i] >= 0 {
-        let e0 = tri_config[i] as usize;
-        let e1 = tri_config[i + 1] as usize;
-        let e2 = tri_config[i + 2] as usize;
+        // MC edge indices from the table
+        let mc_e0 = tri_config[i] as usize;
+        let mc_e1 = tri_config[i + 1] as usize;
+        let mc_e2 = tri_config[i + 2] as usize;
+
+        // Convert MC edge indices to our edge indices
+        let e0 = MC_EDGE_TO_OUR_EDGE[mc_e0];
+        let e1 = MC_EDGE_TO_OUR_EDGE[mc_e1];
+        let e2 = MC_EDGE_TO_OUR_EDGE[mc_e2];
 
         let edge_id_0 = cell.edge_id(e0, max_depth);
         let edge_id_1 = cell.edge_id(e1, max_depth);
         let edge_id_2 = cell.edge_id(e2, max_depth);
 
-        triangles.push(SparseTriangle::new(edge_id_0, edge_id_1, edge_id_2));
+        // Reverse winding order (e0, e2, e1) instead of (e0, e1, e2) to produce
+        // CCW winding when viewed from outside, matching project conventions.
+        // The standard MC tables produce CW winding for our "inside = positive" convention.
+        triangles.push(SparseTriangle::new(edge_id_0, edge_id_2, edge_id_1));
         stats.triangles_emitted.fetch_add(1, Ordering::Relaxed);
 
         i += 3;
@@ -1079,7 +1163,10 @@ where
                 }
 
                 // Create neighbor entry with propagated corners
-                if let Some(neighbor) = create_neighbor_entry(&entry, dx, dy, dz, cells_at_depth) {
+                // Allow expansion by 1 cell beyond the original bounds to prevent
+                // boundary clipping (the sampler will return "outside" for points
+                // beyond the actual model bounds)
+                if let Some(neighbor) = create_neighbor_entry(&entry, dx, dy, dz, cells_at_depth, 1) {
                     // Only add if not already visited
                     if visited.insert(neighbor.cuboid) {
                         work_queue.push_back(neighbor);
