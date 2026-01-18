@@ -429,12 +429,22 @@ impl Asn2WasmSampler {
     }
 }
 
+/// Result from adaptive mesh v2 generation including mesh data, bounds, and profiling stats.
+pub struct AdaptiveMeshV2Result {
+    pub vertices: Vec<(f32, f32, f32)>,
+    pub normals: Vec<(f32, f32, f32)>,
+    pub indices: Vec<u32>,
+    pub bounds_min: (f32, f32, f32),
+    pub bounds_max: (f32, f32, f32),
+    pub stats: adaptive_surface_nets_2::MeshingStats2,
+}
+
 /// Generate an indexed mesh using the new Adaptive Surface Nets v2 algorithm.
-/// Returns (vertices, normals, indices, bounds_min, bounds_max).
+/// Returns a result struct containing mesh data, bounds, and detailed profiling statistics.
 pub fn generate_adaptive_mesh_v2_from_bytes(
     wasm_bytes: &[u8],
     config: &adaptive_surface_nets_2::AdaptiveMeshConfig2,
-) -> anyhow::Result<(Vec<(f32, f32, f32)>, Vec<(f32, f32, f32)>, Vec<u32>, (f32, f32, f32), (f32, f32, f32))> {
+) -> anyhow::Result<AdaptiveMeshV2Result> {
     let engine = Engine::default();
     let module = Module::new(&engine, wasm_bytes)?;
 
@@ -464,9 +474,16 @@ pub fn generate_adaptive_mesh_v2_from_bytes(
         wasm_sampler.sample(x, y, z)
     };
 
-    let mesh = adaptive_surface_nets_2::adaptive_surface_nets_2(sampler, bounds_min, bounds_max, config);
+    let result = adaptive_surface_nets_2::adaptive_surface_nets_2(sampler, bounds_min, bounds_max, config);
 
-    Ok((mesh.vertices, mesh.normals, mesh.indices, bounds_min, bounds_max))
+    Ok(AdaptiveMeshV2Result {
+        vertices: result.mesh.vertices,
+        normals: result.mesh.normals,
+        indices: result.mesh.indices,
+        bounds_min,
+        bounds_max,
+        stats: result.stats,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, serde::Deserialize, serde::Serialize)]

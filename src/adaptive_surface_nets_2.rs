@@ -188,6 +188,7 @@
 //! ## Data Structures
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 use dashmap::DashSet;
 
 /// Configuration for the adaptive surface nets algorithm.
@@ -605,12 +606,95 @@ impl SparseTriangle {
     }
 }
 
-/// Statistics for monitoring algorithm performance
+/// Statistics for monitoring algorithm performance (atomic counters for concurrent use)
 #[derive(Default)]
 pub struct SamplingStats {
     pub total_samples: AtomicU64,
     pub cuboids_processed: AtomicU64,
     pub triangles_emitted: AtomicU64,
+}
+
+/// Per-stage timing and statistics for profiling
+#[derive(Clone, Debug, Default)]
+pub struct MeshingStats2 {
+    /// Total time for the entire meshing operation (seconds)
+    pub total_time_secs: f64,
+
+    /// Stage 1: Coarse grid discovery
+    pub stage1_time_secs: f64,
+    pub stage1_samples: u64,
+    pub stage1_mixed_cells: usize,
+
+    /// Stage 2: Subdivision & triangle emission
+    pub stage2_time_secs: f64,
+    pub stage2_samples: u64,
+    pub stage2_cuboids_processed: u64,
+    pub stage2_triangles_emitted: u64,
+
+    /// Stage 3: Topology finalization
+    pub stage3_time_secs: f64,
+    pub stage3_unique_vertices: usize,
+
+    /// Stage 4: Vertex refinement & normal estimation
+    pub stage4_time_secs: f64,
+    pub stage4_samples: u64,
+
+    /// Summary statistics
+    pub total_samples: u64,
+    pub total_vertices: usize,
+    pub total_triangles: usize,
+
+    /// Configuration used
+    pub effective_resolution: usize,
+}
+
+impl MeshingStats2 {
+    /// Print a human-readable profiling report to stdout
+    pub fn print_report(&self) {
+        println!("=== Adaptive Surface Nets v2 Profiling Report ===");
+        println!("Total time: {:.2}ms", self.total_time_secs * 1000.0);
+        println!();
+        println!("Stage 1 (Coarse Discovery): {:.2}ms ({:.1}%)",
+            self.stage1_time_secs * 1000.0,
+            self.stage1_time_secs / self.total_time_secs * 100.0);
+        println!("  Samples: {}", self.stage1_samples);
+        println!("  Mixed cells found: {}", self.stage1_mixed_cells);
+        println!();
+        println!("Stage 2 (Subdivision & Emission): {:.2}ms ({:.1}%)",
+            self.stage2_time_secs * 1000.0,
+            self.stage2_time_secs / self.total_time_secs * 100.0);
+        println!("  Samples: {}", self.stage2_samples);
+        println!("  Cuboids processed: {}", self.stage2_cuboids_processed);
+        println!("  Triangles emitted: {}", self.stage2_triangles_emitted);
+        println!();
+        println!("Stage 3 (Topology Finalization): {:.2}ms ({:.1}%)",
+            self.stage3_time_secs * 1000.0,
+            self.stage3_time_secs / self.total_time_secs * 100.0);
+        println!("  Unique vertices: {}", self.stage3_unique_vertices);
+        println!();
+        println!("Stage 4 (Vertex Refinement): {:.2}ms ({:.1}%)",
+            self.stage4_time_secs * 1000.0,
+            self.stage4_time_secs / self.total_time_secs * 100.0);
+        println!("  Samples: {}", self.stage4_samples);
+        println!();
+        println!("Summary:");
+        println!("  Total samples: {}", self.total_samples);
+        println!("  Avg sample time: {:.2}µs",
+            self.total_time_secs * 1_000_000.0 / self.total_samples as f64);
+        println!("  Total vertices: {}", self.total_vertices);
+        println!("  Total triangles: {}", self.total_triangles);
+        println!("  Effective resolution: {}³", self.effective_resolution);
+        println!("================================================");
+    }
+}
+
+/// Result of the adaptive surface nets meshing operation
+#[derive(Clone, Debug)]
+pub struct MeshingResult2 {
+    /// The generated indexed mesh
+    pub mesh: IndexedMesh2,
+    /// Profiling statistics
+    pub stats: MeshingStats2,
 }
 
 /// The indexed mesh output format
@@ -1976,16 +2060,17 @@ where
 /// * `config` - Algorithm configuration
 ///
 /// # Returns
-/// An indexed mesh with vertices, normals, and triangle indices
+/// A MeshingResult2 containing the indexed mesh and detailed profiling statistics
 pub fn adaptive_surface_nets_2<F>(
     sampler: F,
     bounds_min: (f32, f32, f32),
     bounds_max: (f32, f32, f32),
     config: &AdaptiveMeshConfig2,
-) -> IndexedMesh2
+) -> MeshingResult2
 where
     F: Fn(f64, f64, f64) -> f32 + Send + Sync,
 {
+    let total_start = Instant::now();
     let stats = SamplingStats::default();
 
     // Convert bounds to f64 for internal calculations
@@ -2006,6 +2091,8 @@ where
     let cell_size = (bounds_max_f64.0 - bounds_min_f64.0) / finest_cells_per_axis as f64;
 
     // Stage 1: Coarse grid discovery
+    let stage1_start = Instant::now();
+    let samples_before_stage1 = stats.total_samples.load(Ordering::Relaxed);
     let initial_work_queue = stage1_coarse_discovery(
         &sampler,
         bounds_min_f64,
@@ -2013,8 +2100,15 @@ where
         config,
         &stats,
     );
+    let stage1_time = stage1_start.elapsed().as_secs_f64();
+    let stage1_samples = stats.total_samples.load(Ordering::Relaxed) - samples_before_stage1;
+    let stage1_mixed_cells = initial_work_queue.len();
 
     // Stage 2: Subdivision and triangle emission
+    let stage2_start = Instant::now();
+    let samples_before_stage2 = stats.total_samples.load(Ordering::Relaxed);
+    let cuboids_before_stage2 = stats.cuboids_processed.load(Ordering::Relaxed);
+    let triangles_before_stage2 = stats.triangles_emitted.load(Ordering::Relaxed);
     let sparse_triangles = stage2_subdivision_and_emission(
         initial_work_queue,
         &sampler,
@@ -2023,22 +2117,60 @@ where
         config,
         &stats,
     );
+    let stage2_time = stage2_start.elapsed().as_secs_f64();
+    let stage2_samples = stats.total_samples.load(Ordering::Relaxed) - samples_before_stage2;
+    let stage2_cuboids = stats.cuboids_processed.load(Ordering::Relaxed) - cuboids_before_stage2;
+    let stage2_triangles = stats.triangles_emitted.load(Ordering::Relaxed) - triangles_before_stage2;
 
     // Stage 3: Topology finalization
+    let stage3_start = Instant::now();
     let stage3_result = stage3_topology_finalization(
         sparse_triangles,
         bounds_min_f64,
         cell_size,
     );
+    let stage3_time = stage3_start.elapsed().as_secs_f64();
+    let stage3_unique_vertices = stage3_result.vertices.len();
 
     // Stage 4: Vertex refinement & normal estimation
-    stage4_vertex_refinement(
+    let stage4_start = Instant::now();
+    let samples_before_stage4 = stats.total_samples.load(Ordering::Relaxed);
+    let mesh = stage4_vertex_refinement(
         stage3_result,
         &sampler,
         cell_size,
         config,
         &stats,
-    )
+    );
+    let stage4_time = stage4_start.elapsed().as_secs_f64();
+    let stage4_samples = stats.total_samples.load(Ordering::Relaxed) - samples_before_stage4;
+
+    let total_time = total_start.elapsed().as_secs_f64();
+    let total_samples = stats.total_samples.load(Ordering::Relaxed);
+
+    let meshing_stats = MeshingStats2 {
+        total_time_secs: total_time,
+        stage1_time_secs: stage1_time,
+        stage1_samples,
+        stage1_mixed_cells,
+        stage2_time_secs: stage2_time,
+        stage2_samples,
+        stage2_cuboids_processed: stage2_cuboids,
+        stage2_triangles_emitted: stage2_triangles,
+        stage3_time_secs: stage3_time,
+        stage3_unique_vertices,
+        stage4_time_secs: stage4_time,
+        stage4_samples,
+        total_samples,
+        total_vertices: mesh.vertices.len(),
+        total_triangles: mesh.indices.len() / 3,
+        effective_resolution: finest_cells_per_axis,
+    };
+
+    MeshingResult2 {
+        mesh,
+        stats: meshing_stats,
+    }
 }
 
 #[cfg(test)]

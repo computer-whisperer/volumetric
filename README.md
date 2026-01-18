@@ -59,16 +59,50 @@ cargo build-wasm
 ```
 *(This uses a Cargo alias defined in `.cargo/config.toml`)*
 
-### Running
+### Running the GUI
 
 ```bash
-cargo run --release
+cargo run -p volumetric_ui --release
 ```
 
 In the UI:
 1.  **Demos**: Load pre-built models from the "Demo" panel.
 2.  **Operations**: Apply operators like "Translate" or "Boolean" to transform your models.
 3.  **Visualization**: Toggle between Point Cloud and Marching Cubes rendering modes.
+
+### Running the CLI
+
+For batch processing and profiling, use the command-line tool:
+
+```bash
+cargo run -p volumetric_cli --release -- --input <file> --output <output.stl>
+```
+
+**Arguments:**
+- `-i, --input <file>` - Input file: either a `.wasm` model or a `.vproj` project file
+- `-o, --output <file>` - Output STL file path
+
+**Options:**
+- `--base-resolution <n>` - Coarse grid resolution (default: 8)
+- `--max-depth <n>` - Refinement depth (default: 4). Effective resolution = base × 2^depth
+- `--vertex-refinement <n>` - Vertex position refinement iterations (default: 8)
+- `--normal-refinement <n>` - Normal estimation iterations (default: 4, use 0 to disable)
+- `--normal-epsilon <f>` - Normal probe distance as fraction of cell size (default: 0.1)
+- `-q, --quiet` - Suppress profiling output
+
+**Examples:**
+```bash
+# Mesh a WASM model with default settings (128³ effective resolution)
+volumetric_cli -i simple_torus_model.wasm -o torus.stl
+
+# Faster meshing with lower resolution and no normal refinement
+volumetric_cli -i model.wasm -o output.stl --max-depth 3 --normal-refinement 0
+
+# Mesh a project file
+volumetric_cli -i scene.vproj -o scene.stl
+```
+
+The CLI outputs detailed profiling statistics showing per-stage timing and sample counts, useful for performance analysis.
 
 ## Mesh Conventions
 

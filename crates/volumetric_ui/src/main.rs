@@ -280,6 +280,9 @@ struct AssetRenderData {
     asn2_normal_sample_iterations: usize,
     /// Adaptive Surface Nets v2: epsilon fraction for normal estimation
     asn2_normal_epsilon_frac: f32,
+
+    /// Detailed profiling stats from the last ASN2 meshing operation
+    asn2_stats: Option<adaptive_surface_nets_2::MeshingStats2>,
 }
 
 impl AssetRenderData {
@@ -312,6 +315,7 @@ impl AssetRenderData {
             // Normal refinement via tangent probing - works well with binary samplers
             asn2_normal_sample_iterations: 4,
             asn2_normal_epsilon_frac: 0.1,
+            asn2_stats: None,
         }
     }
 }
@@ -738,7 +742,6 @@ impl VolumetricApp {
                     }
                 }
                 ExportRenderMode::AdaptiveSurfaceNets2 => {
-                    let start_time = std::time::Instant::now();
                     let config = adaptive_surface_nets_2::AdaptiveMeshConfig2 {
                         base_resolution: render_data.asn2_base_resolution,
                         max_depth: render_data.asn2_max_depth,
@@ -748,18 +751,24 @@ impl VolumetricApp {
                         num_threads: 0, // Use default parallelism
                     };
                     match generate_adaptive_mesh_v2_from_bytes(&render_data.wasm_bytes, &config) {
-                        Ok((vertices, normals, indices, bounds_min, bounds_max)) => {
-                            let effective_res = config.base_resolution * (1 << config.max_depth);
-                            render_data.last_sample_time = Some(start_time.elapsed().as_secs_f32());
-                            render_data.last_sample_count = Some(effective_res * effective_res * effective_res);
-                            render_data.bounds_min = bounds_min;
-                            render_data.bounds_max = bounds_max;
+                        Ok(result) => {
+                            // Print profiling report to stdout
+                            println!();
+                            println!("ASN2 Meshing completed for '{}'", asset_id);
+                            result.stats.print_report();
+
+                            // Store stats for UI display
+                            render_data.last_sample_time = Some(result.stats.total_time_secs as f32);
+                            render_data.last_sample_count = Some(result.stats.total_samples as usize);
+                            render_data.asn2_stats = Some(result.stats);
+                            render_data.bounds_min = result.bounds_min;
+                            render_data.bounds_max = result.bounds_max;
                             render_data.triangles.clear(); // No raw triangles for indexed mesh
 
                             // Convert indexed mesh to MeshVertex format
-                            let mesh_vertices: Vec<marching_cubes_wgpu::MeshVertex> = vertices
+                            let mesh_vertices: Vec<marching_cubes_wgpu::MeshVertex> = result.vertices
                                 .iter()
-                                .zip(normals.iter())
+                                .zip(result.normals.iter())
                                 .map(|(pos, norm)| marching_cubes_wgpu::MeshVertex {
                                     position: [pos.0, pos.1, pos.2],
                                     _pad0: 0.0,
@@ -769,13 +778,14 @@ impl VolumetricApp {
                                 .collect();
 
                             render_data.mesh_vertices = Arc::new(mesh_vertices);
-                            render_data.mesh_indices = Some(Arc::new(indices));
+                            render_data.mesh_indices = Some(Arc::new(result.indices));
                             render_data.points = Arc::new(Vec::new());
                             render_data.last_error = None;
                         }
                         Err(e) => {
                             render_data.last_sample_time = None;
                             render_data.last_sample_count = None;
+                            render_data.asn2_stats = None;
                             let msg = format!(
                                 "Export '{asset_id}' failed to mesh ({}):\n{}",
                                 render_data.mode.label(),
@@ -2202,11 +2212,57 @@ impl eframe::App for VolumetricApp {
                                 if let Some(render_data) = self.asset_render_data.get(&asset_id) {
                                     if let Some(time) = render_data.last_sample_time {
                                         ui.horizontal(|ui| {
-                                            ui.weak(format!("Sampled in {:.2}ms", time * 1000.0));
+                                            ui.weak(format!("Meshed in {:.2}ms", time * 1000.0));
                                             if let Some(count) = render_data.last_sample_count {
                                                 let avg = (time * 1000_000.0) / (count as f32);
-                                                ui.weak(format!("({:.2}µs/sample)", avg));
+                                                ui.weak(format!("({:.2}µs/sample avg)", avg));
                                             }
+                                        });
+                                    }
+
+                                    // Show detailed ASN2 profiling stats in a collapsible section
+                                    if let Some(ref stats) = render_data.asn2_stats {
+                                        ui.collapsing("Profiling Details", |ui| {
+                                            ui.horizontal(|ui| {
+                                                ui.weak(format!("Total samples: {}", stats.total_samples));
+                                                ui.weak(format!("| Vertices: {}", stats.total_vertices));
+                                                ui.weak(format!("| Triangles: {}", stats.total_triangles));
+                                            });
+                                            ui.separator();
+
+                                            ui.horizontal(|ui| {
+                                                ui.weak("Stage 1 (Discovery):");
+                                                ui.weak(format!("{:.2}ms ({:.1}%)",
+                                                    stats.stage1_time_secs * 1000.0,
+                                                    stats.stage1_time_secs / stats.total_time_secs * 100.0));
+                                            });
+                                            ui.weak(format!("  {} samples, {} mixed cells",
+                                                stats.stage1_samples, stats.stage1_mixed_cells));
+
+                                            ui.horizontal(|ui| {
+                                                ui.weak("Stage 2 (Subdivision):");
+                                                ui.weak(format!("{:.2}ms ({:.1}%)",
+                                                    stats.stage2_time_secs * 1000.0,
+                                                    stats.stage2_time_secs / stats.total_time_secs * 100.0));
+                                            });
+                                            ui.weak(format!("  {} samples, {} cuboids, {} triangles",
+                                                stats.stage2_samples, stats.stage2_cuboids_processed, stats.stage2_triangles_emitted));
+
+                                            ui.horizontal(|ui| {
+                                                ui.weak("Stage 3 (Topology):");
+                                                ui.weak(format!("{:.2}ms ({:.1}%)",
+                                                    stats.stage3_time_secs * 1000.0,
+                                                    stats.stage3_time_secs / stats.total_time_secs * 100.0));
+                                            });
+                                            ui.weak(format!("  {} unique vertices", stats.stage3_unique_vertices));
+
+                                            ui.horizontal(|ui| {
+                                                ui.weak("Stage 4 (Refinement):");
+                                                ui.weak(format!("{:.2}ms ({:.1}%)",
+                                                    stats.stage4_time_secs * 1000.0,
+                                                    stats.stage4_time_secs / stats.total_time_secs * 100.0));
+                                            });
+                                            ui.weak(format!("  {} samples", stats.stage4_samples));
                                         });
                                     }
 
