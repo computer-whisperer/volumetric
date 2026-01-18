@@ -311,9 +311,9 @@ impl AssetRenderData {
             // ASN v2 config
             asn2_base_resolution: 8,
             asn2_max_depth: 4,
-            asn2_vertex_refinement_iterations: 8,
+            asn2_vertex_refinement_iterations: 12,
             // Normal refinement via tangent probing - works well with binary samplers
-            asn2_normal_sample_iterations: 4,
+            asn2_normal_sample_iterations: 12,
             asn2_normal_epsilon_frac: 0.1,
             asn2_stats: None,
         }
@@ -439,7 +439,7 @@ impl VolumetricApp {
             if let Some(first_model) = assets.iter().find(|a| a.as_model_wasm().is_some()) {
                 let id = first_model.asset_id().to_string();
                 let wasm_bytes = first_model.as_model_wasm().unwrap().to_vec();
-                render_data.insert(id, AssetRenderData::new(wasm_bytes, ExportRenderMode::PointCloud));
+                render_data.insert(id, AssetRenderData::new(wasm_bytes, ExportRenderMode::AdaptiveSurfaceNets2));
             }
             (assets, render_data)
         });
@@ -605,7 +605,7 @@ impl VolumetricApp {
                             let wasm_bytes = first_model.as_model_wasm().unwrap().to_vec();
                             self.asset_render_data.insert(
                                 id,
-                                AssetRenderData::new(wasm_bytes, ExportRenderMode::PointCloud),
+                                AssetRenderData::new(wasm_bytes, ExportRenderMode::AdaptiveSurfaceNets2),
                             );
                         }
                     }

@@ -190,6 +190,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use dashmap::DashSet;
+use rayon::prelude::*;
 
 /// Configuration for the adaptive surface nets algorithm.
 #[derive(Clone, Debug)]
@@ -234,9 +235,9 @@ impl Default for AdaptiveMeshConfig2 {
         Self {
             base_resolution: 8,
             max_depth: 4,
-            vertex_refinement_iterations: 8,
+            vertex_refinement_iterations: 12,
             // Enable normal refinement by default - probing works well with binary samplers
-            normal_sample_iterations: 4,
+            normal_sample_iterations: 12,
             normal_epsilon_frac: 0.1,
             num_threads: 0,
         }
@@ -1170,6 +1171,108 @@ fn emit_triangles_for_cell(
 ///
 /// # Returns
 /// Vector of SparseTriangles with EdgeId-based vertex references
+/// Result of processing a single work queue entry
+struct ProcessedEntry {
+    /// New work items to add to the queue
+    new_work: Vec<WorkQueueEntry>,
+    /// Triangles emitted (only at max depth)
+    triangles: Vec<SparseTriangle>,
+}
+
+/// Process a single work queue entry, returning new work items and triangles
+fn process_work_entry<F>(
+    mut entry: WorkQueueEntry,
+    sampler: &F,
+    bounds_min: (f64, f64, f64),
+    cell_size: f64,
+    max_depth: u8,
+    base_res: i32,
+    visited: &DashSet<CuboidId>,
+    stats: &SamplingStats,
+) -> ProcessedEntry
+where
+    F: Fn(f64, f64, f64) -> f32 + Send + Sync,
+{
+    stats.cuboids_processed.fetch_add(1, Ordering::Relaxed);
+
+    // Complete corner samples
+    let corner_mask = complete_corner_samples(
+        &mut entry,
+        sampler,
+        bounds_min,
+        cell_size,
+        max_depth,
+        stats,
+    );
+
+    // Skip if not mixed (all inside or all outside)
+    if !corner_mask.is_mixed() {
+        return ProcessedEntry {
+            new_work: Vec::new(),
+            triangles: Vec::new(),
+        };
+    }
+
+    let current_depth = entry.cuboid.depth;
+
+    if current_depth < max_depth {
+        // Subdivide and get only mixed children (with all corners sampled)
+        let mixed_children = subdivide_and_filter_mixed(
+            &entry,
+            sampler,
+            bounds_min,
+            cell_size,
+            max_depth,
+            stats,
+        );
+
+        // Filter to only new (unvisited) children
+        let new_work: Vec<WorkQueueEntry> = mixed_children
+            .into_iter()
+            .filter(|child| visited.insert(child.cuboid))
+            .collect();
+
+        ProcessedEntry {
+            new_work,
+            triangles: Vec::new(),
+        }
+    } else {
+        // At max depth: emit triangles and expand frontier
+        let mut triangles = Vec::new();
+        emit_triangles_for_cell(
+            &entry.cuboid,
+            corner_mask,
+            max_depth,
+            &mut triangles,
+            stats,
+        );
+
+        // Expand to neighbors (frontier expansion)
+        let cells_at_depth = base_res * (1i32 << current_depth);
+
+        const NEIGHBOR_DIRS: [(i32, i32, i32); 6] = [
+            (-1, 0, 0), (1, 0, 0),
+            (0, -1, 0), (0, 1, 0),
+            (0, 0, -1), (0, 0, 1),
+        ];
+
+        let mut new_work = Vec::new();
+        for (dx, dy, dz) in NEIGHBOR_DIRS {
+            if !shared_face_is_mixed(&entry.known_corners, dx, dy, dz) {
+                continue;
+            }
+
+            if let Some(neighbor) = create_neighbor_entry(&entry, dx, dy, dz, cells_at_depth, 1) {
+                if visited.insert(neighbor.cuboid) {
+                    new_work.push(neighbor);
+                }
+            }
+        }
+
+        ProcessedEntry { new_work, triangles }
+    }
+}
+
 fn stage2_subdivision_and_emission<F>(
     initial_queue: Vec<WorkQueueEntry>,
     sampler: &F,
@@ -1187,97 +1290,50 @@ where
     // Deduplication set: tracks CuboidIds we've already processed or queued
     let visited: DashSet<CuboidId> = DashSet::new();
 
-    // Output triangles
-    let mut triangles: Vec<SparseTriangle> = Vec::new();
+    // Output triangles (thread-safe collection)
+    let all_triangles: std::sync::Mutex<Vec<SparseTriangle>> = std::sync::Mutex::new(Vec::new());
 
-    // Work queue (using VecDeque for efficient pop_front)
-    let mut work_queue: std::collections::VecDeque<WorkQueueEntry> =
-        initial_queue.into_iter().collect();
+    // Current batch of work items
+    let mut current_batch: Vec<WorkQueueEntry> = initial_queue;
 
     // Mark initial entries as visited
-    for entry in work_queue.iter() {
+    for entry in &current_batch {
         visited.insert(entry.cuboid);
     }
 
-    while let Some(mut entry) = work_queue.pop_front() {
-        stats.cuboids_processed.fetch_add(1, Ordering::Relaxed);
+    // Process in parallel batches until no more work
+    while !current_batch.is_empty() {
+        // Process current batch in parallel
+        let results: Vec<ProcessedEntry> = current_batch
+            .into_par_iter()
+            .map(|entry| {
+                process_work_entry(
+                    entry,
+                    sampler,
+                    bounds_min,
+                    cell_size,
+                    max_depth,
+                    base_res,
+                    &visited,
+                    stats,
+                )
+            })
+            .collect();
 
-        // Complete corner samples
-        let corner_mask = complete_corner_samples(
-            &mut entry,
-            sampler,
-            bounds_min,
-            cell_size,
-            max_depth,
-            stats,
-        );
-
-        // Skip if not mixed (all inside or all outside)
-        if !corner_mask.is_mixed() {
-            continue;
-        }
-
-        let current_depth = entry.cuboid.depth;
-
-        if current_depth < max_depth {
-            // Subdivide and get only mixed children (with all corners sampled)
-            let mixed_children = subdivide_and_filter_mixed(
-                &entry,
-                sampler,
-                bounds_min,
-                cell_size,
-                max_depth,
-                stats,
-            );
-
-            for child in mixed_children {
-                // Dedup check (child might have been queued from a different path)
-                if visited.insert(child.cuboid) {
-                    work_queue.push_back(child);
-                }
-            }
-        } else {
-            // At max depth: emit triangles and expand frontier
-            emit_triangles_for_cell(
-                &entry.cuboid,
-                corner_mask,
-                max_depth,
-                &mut triangles,
-                stats,
-            );
-
-            // Expand to neighbors (frontier expansion)
-            // Number of cells at this depth level
-            let cells_at_depth = base_res * (1i32 << current_depth);
-
-            // Check all 6 face neighbors
-            const NEIGHBOR_DIRS: [(i32, i32, i32); 6] = [
-                (-1, 0, 0), (1, 0, 0),
-                (0, -1, 0), (0, 1, 0),
-                (0, 0, -1), (0, 0, 1),
-            ];
-
-            for (dx, dy, dz) in NEIGHBOR_DIRS {
-                // Only explore neighbors where the shared face is mixed
-                if !shared_face_is_mixed(&entry.known_corners, dx, dy, dz) {
-                    continue;
-                }
-
-                // Create neighbor entry with propagated corners
-                // Allow expansion by 1 cell beyond the original bounds to prevent
-                // boundary clipping (the sampler will return "outside" for points
-                // beyond the actual model bounds)
-                if let Some(neighbor) = create_neighbor_entry(&entry, dx, dy, dz, cells_at_depth, 1) {
-                    // Only add if not already visited
-                    if visited.insert(neighbor.cuboid) {
-                        work_queue.push_back(neighbor);
-                    }
-                }
+        // Collect new work and triangles from results
+        let mut next_batch = Vec::new();
+        {
+            let mut triangles_guard = all_triangles.lock().unwrap();
+            for result in results {
+                next_batch.extend(result.new_work);
+                triangles_guard.extend(result.triangles);
             }
         }
+
+        current_batch = next_batch;
     }
 
-    triangles
+    all_triangles.into_inner().unwrap()
 }
 
 // =============================================================================
@@ -1980,7 +2036,7 @@ fn stage4_vertex_refinement<F>(
     stats: &SamplingStats,
 ) -> IndexedMesh2
 where
-    F: Fn(f64, f64, f64) -> f32,
+    F: Fn(f64, f64, f64) -> f32 + Send + Sync,
 {
     let vertex_count = stage3.vertices.len();
 
@@ -1991,54 +2047,58 @@ where
     // Probe epsilon for normal refinement: how far to step in tangent directions
     let probe_epsilon = cell_size * config.normal_epsilon_frac as f64;
 
-    let mut refined_vertices: Vec<(f32, f32, f32)> = Vec::with_capacity(vertex_count);
-    let mut refined_normals: Vec<(f32, f32, f32)> = Vec::with_capacity(vertex_count);
+    // Process all vertices in parallel
+    let results: Vec<((f32, f32, f32), (f32, f32, f32))> = (0..vertex_count)
+        .into_par_iter()
+        .map(|i| {
+            let initial_pos = stage3.vertices[i];
+            let accumulated_normal = stage3.accumulated_normals[i];
 
-    for i in 0..vertex_count {
-        let initial_pos = stage3.vertices[i];
-        let accumulated_normal = stage3.accumulated_normals[i];
+            // Refine vertex position
+            let refined_pos = if config.vertex_refinement_iterations > 0 {
+                refine_vertex_position(
+                    initial_pos,
+                    accumulated_normal,
+                    search_distance,
+                    config.vertex_refinement_iterations,
+                    sampler,
+                    stats,
+                )
+            } else {
+                initial_pos
+            };
 
-        // Refine vertex position
-        let refined_pos = if config.vertex_refinement_iterations > 0 {
-            refine_vertex_position(
-                initial_pos,
-                accumulated_normal,
-                search_distance,
-                config.vertex_refinement_iterations,
-                sampler,
-                stats,
-            )
-        } else {
-            initial_pos
-        };
+            // Refine normal via tangent plane probing, or just normalize accumulated
+            let final_normal = if config.normal_sample_iterations > 0 {
+                // Refine normal by probing surface in tangent directions
+                let normal_search_distance = search_distance * 2.0;
 
-        // Refine normal via tangent plane probing, or just normalize accumulated
-        let final_normal = if config.normal_sample_iterations > 0 {
-            // Refine normal by probing surface in tangent directions
-            let normal_search_distance = search_distance * 2.0;
+                let refined = refine_normal_via_probing(
+                    refined_pos,
+                    accumulated_normal,
+                    probe_epsilon,
+                    normal_search_distance,
+                    config.normal_sample_iterations,
+                    sampler,
+                    stats,
+                );
+                normalize_or_default(refined)
+            } else {
+                // Just normalize the accumulated normal
+                normalize_or_default(accumulated_normal)
+            };
 
-            let refined = refine_normal_via_probing(
-                refined_pos,
-                accumulated_normal,
-                probe_epsilon,
-                normal_search_distance,
-                config.normal_sample_iterations,
-                sampler,
-                stats,
+            let vertex = (
+                refined_pos.0 as f32,
+                refined_pos.1 as f32,
+                refined_pos.2 as f32,
             );
-            normalize_or_default(refined)
-        } else {
-            // Just normalize the accumulated normal
-            normalize_or_default(accumulated_normal)
-        };
+            (vertex, final_normal)
+        })
+        .collect();
 
-        refined_vertices.push((
-            refined_pos.0 as f32,
-            refined_pos.1 as f32,
-            refined_pos.2 as f32,
-        ));
-        refined_normals.push(final_normal);
-    }
+    // Unzip results into separate vectors
+    let (refined_vertices, refined_normals): (Vec<_>, Vec<_>) = results.into_iter().unzip();
 
     IndexedMesh2 {
         vertices: refined_vertices,

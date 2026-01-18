@@ -34,12 +34,12 @@ struct Args {
     #[arg(long, default_value = "4")]
     max_depth: usize,
 
-    /// Vertex refinement iterations (default: 8)
-    #[arg(long, default_value = "8")]
+    /// Vertex refinement iterations (default: 12)
+    #[arg(long, default_value = "12")]
     vertex_refinement: usize,
 
-    /// Normal refinement iterations (default: 4, 0 to disable)
-    #[arg(long, default_value = "4")]
+    /// Normal refinement iterations (default: 12, 0 to disable)
+    #[arg(long, default_value = "12")]
     normal_refinement: usize,
 
     /// Normal epsilon fraction (default: 0.1)
