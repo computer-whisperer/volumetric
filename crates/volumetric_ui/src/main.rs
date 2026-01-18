@@ -1,17 +1,32 @@
 use anyhow::{Context, Result};
-use eframe::egui;
 use ciborium::value::Value as CborValue;
+use eframe::egui;
 use std::collections::HashMap;
-use std::fs;
-use std::path::PathBuf;
-use std::time::SystemTime;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Sender, Receiver};
-use std::thread::{self, JoinHandle};
+use std::sync::Arc;
 
-mod point_cloud_wgpu;
+#[cfg(not(target_arch = "wasm32"))]
+use std::fs;
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::PathBuf;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::mpsc::{self, Receiver, Sender};
+#[cfg(not(target_arch = "wasm32"))]
+use std::thread::{self, JoinHandle};
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::SystemTime;
+
+// Web-specific imports
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::prelude::*;
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::JsCast;
+#[cfg(target_arch = "wasm32")]
+use poll_promise::Promise;
+
 mod marching_cubes_wgpu;
+mod platform;
+mod point_cloud_wgpu;
 
 // =============================================================================
 // Background Task System
@@ -19,23 +34,29 @@ mod marching_cubes_wgpu;
 
 /// A cancellation token that can be shared between the UI and background worker.
 #[derive(Clone)]
-struct CancellationToken {
+pub struct CancellationToken {
     cancelled: Arc<AtomicBool>,
 }
 
 impl CancellationToken {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    fn cancel(&self) {
+    pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
     }
 
-    fn is_cancelled(&self) -> bool {
+    pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
+    }
+}
+
+impl Default for CancellationToken {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -104,7 +125,11 @@ struct ResampleResult {
     asn2_stats: Option<adaptive_surface_nets_2::MeshingStats2>,
 }
 
-/// State of the background worker
+// =============================================================================
+// Native Background Worker (Thread-based)
+// =============================================================================
+
+#[cfg(not(target_arch = "wasm32"))]
 struct BackgroundWorker {
     /// Channel to send tasks to the worker
     task_sender: Sender<(BackgroundTask, CancellationToken)>,
@@ -114,6 +139,7 @@ struct BackgroundWorker {
     _thread_handle: JoinHandle<()>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl BackgroundWorker {
     fn new() -> Self {
         let (task_sender, task_receiver) = mpsc::channel::<(BackgroundTask, CancellationToken)>();
@@ -153,59 +179,285 @@ impl BackgroundWorker {
 
             let result = match task {
                 BackgroundTask::RunProject { project } => {
-                    Self::execute_project(project, &cancel_token)
+                    execute_project(project, &cancel_token)
                 }
                 BackgroundTask::ResampleAsset { asset_id, wasm_bytes, mode, config } => {
-                    Self::execute_resample(asset_id, wasm_bytes, mode, config, &cancel_token)
+                    execute_resample(asset_id, wasm_bytes, mode, config, &cancel_token)
                 }
             };
 
             let _ = result_sender.send(result);
         }
     }
+}
 
-    fn execute_project(project: Project, cancel_token: &CancellationToken) -> BackgroundTaskResult {
-        let start_time = std::time::Instant::now();
-        let mut env = Environment::new();
+// =============================================================================
+// Web Background Worker (Synchronous execution in main thread)
+// =============================================================================
 
-        // Check cancellation before starting
+#[cfg(target_arch = "wasm32")]
+struct BackgroundWorker {
+    /// Pending task to execute
+    pending_task: Option<(BackgroundTask, CancellationToken)>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl BackgroundWorker {
+    fn new() -> Self {
+        Self { pending_task: None }
+    }
+
+    fn send_task(&mut self, task: BackgroundTask, cancel_token: CancellationToken) {
+        self.pending_task = Some((task, cancel_token));
+    }
+
+    /// On web, execute tasks synchronously when polled.
+    /// This may cause brief UI freezes for long operations.
+    fn try_recv_result(&mut self) -> Option<BackgroundTaskResult> {
+        let (task, cancel_token) = self.pending_task.take()?;
+
         if cancel_token.is_cancelled() {
-            return BackgroundTaskResult::Cancelled {
-                description: "Project execution cancelled".to_string(),
-            };
+            return Some(BackgroundTaskResult::Cancelled {
+                description: "Task cancelled before starting".to_string(),
+            });
         }
 
-        match project.run(&mut env) {
-            Ok(assets) => {
-                BackgroundTaskResult::ProjectComplete {
-                    assets: Ok(assets),
-                    elapsed_secs: start_time.elapsed().as_secs_f32(),
+        let result = match task {
+            BackgroundTask::RunProject { project } => execute_project(project, &cancel_token),
+            BackgroundTask::ResampleAsset {
+                asset_id,
+                wasm_bytes,
+                mode,
+                config,
+            } => execute_resample(asset_id, wasm_bytes, mode, config, &cancel_token),
+        };
+
+        Some(result)
+    }
+}
+
+// =============================================================================
+// Task Execution Functions (shared between native and web)
+// =============================================================================
+
+fn execute_project(project: Project, cancel_token: &CancellationToken) -> BackgroundTaskResult {
+    let start_time = web_time::Instant::now();
+    let mut env = Environment::new();
+
+    // Check cancellation before starting
+    if cancel_token.is_cancelled() {
+        return BackgroundTaskResult::Cancelled {
+            description: "Project execution cancelled".to_string(),
+        };
+    }
+
+    match project.run(&mut env) {
+        Ok(assets) => BackgroundTaskResult::ProjectComplete {
+            assets: Ok(assets),
+            elapsed_secs: start_time.elapsed().as_secs_f32(),
+        },
+        Err(e) => BackgroundTaskResult::ProjectComplete {
+            assets: Err(format!("Failed to run project: {}", e)),
+            elapsed_secs: start_time.elapsed().as_secs_f32(),
+        },
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn execute_resample(
+    asset_id: String,
+    wasm_bytes: Vec<u8>,
+    mode: ExportRenderMode,
+    config: ResampleConfig,
+    cancel_token: &CancellationToken,
+) -> BackgroundTaskResult {
+    if cancel_token.is_cancelled() {
+        return BackgroundTaskResult::Cancelled {
+            description: format!("Resample of {} cancelled", asset_id),
+        };
+    }
+
+    let start_time = web_time::Instant::now();
+    let mut result = ResampleResult {
+        bounds_min: (0.0, 0.0, 0.0),
+        bounds_max: (0.0, 0.0, 0.0),
+        points: Arc::new(Vec::new()),
+        triangles: Vec::new(),
+        mesh_vertices: Arc::new(Vec::new()),
+        mesh_indices: None,
+        sample_time: 0.0,
+        sample_count: 0,
+        error: None,
+        asn2_stats: None,
+    };
+
+    match mode {
+        ExportRenderMode::None => {
+            // Nothing to do
+        }
+        ExportRenderMode::PointCloud => {
+            match sample_model_from_bytes(&wasm_bytes, config.resolution) {
+                Ok((pts, bounds_min, bounds_max)) => {
+                    result.bounds_min = bounds_min;
+                    result.bounds_max = bounds_max;
+                    result.sample_count = pts.len();
+                    result.points = Arc::new(pts);
+                }
+                Err(e) => {
+                    result.error = Some(format_anyhow_error_chain(&e));
                 }
             }
-            Err(e) => {
-                BackgroundTaskResult::ProjectComplete {
-                    assets: Err(format!("Failed to run project: {}", e)),
-                    elapsed_secs: start_time.elapsed().as_secs_f32(),
+        }
+        ExportRenderMode::MarchingCubes => {
+            match generate_marching_cubes_mesh_from_bytes(&wasm_bytes, config.resolution) {
+                Ok((tris, bounds_min, bounds_max)) => {
+                    result.bounds_min = bounds_min;
+                    result.bounds_max = bounds_max;
+                    result.sample_count = tris.len();
+                    result.mesh_vertices = Arc::new(
+                        tris.iter()
+                            .flat_map(|t| {
+                                [
+                                    marching_cubes_wgpu::MeshVertex {
+                                        position: t.vertices[0].into(),
+                                        _pad0: 0.0,
+                                        normal: t.normals[0].into(),
+                                        _pad1: 0.0,
+                                    },
+                                    marching_cubes_wgpu::MeshVertex {
+                                        position: t.vertices[1].into(),
+                                        _pad0: 0.0,
+                                        normal: t.normals[1].into(),
+                                        _pad1: 0.0,
+                                    },
+                                    marching_cubes_wgpu::MeshVertex {
+                                        position: t.vertices[2].into(),
+                                        _pad0: 0.0,
+                                        normal: t.normals[2].into(),
+                                        _pad1: 0.0,
+                                    },
+                                ]
+                            })
+                            .collect(),
+                    );
+                    result.triangles = tris;
+                }
+                Err(e) => {
+                    result.error = Some(format_anyhow_error_chain(&e));
+                }
+            }
+        }
+        ExportRenderMode::AdaptiveSurfaceNets => {
+            let normal_mode = if config.adaptive_hq_normals {
+                adaptive_surface_nets::NormalMode::HqBisection {
+                    eps_frac: 0.1,
+                    bracket_frac: 1.0,
+                    iterations: 8,
+                }
+            } else {
+                adaptive_surface_nets::NormalMode::Mesh
+            };
+            let asn_config = adaptive_surface_nets::AdaptiveMeshConfig {
+                base_resolution: config.adaptive_base_resolution,
+                max_refinement_depth: config.adaptive_max_depth,
+                edge_refinement_iterations: config.adaptive_edge_refinement_iterations,
+                vertex_relaxation_iterations: config.adaptive_vertex_relaxation_iterations,
+                normal_mode,
+            };
+            match generate_adaptive_mesh_from_bytes(&wasm_bytes, &asn_config) {
+                Ok((tris, bounds_min, bounds_max)) => {
+                    result.bounds_min = bounds_min;
+                    result.bounds_max = bounds_max;
+                    result.sample_count = tris.len();
+                    result.mesh_vertices = Arc::new(
+                        tris.iter()
+                            .flat_map(|t| {
+                                [
+                                    marching_cubes_wgpu::MeshVertex {
+                                        position: t.vertices[0].into(),
+                                        _pad0: 0.0,
+                                        normal: t.normals[0].into(),
+                                        _pad1: 0.0,
+                                    },
+                                    marching_cubes_wgpu::MeshVertex {
+                                        position: t.vertices[1].into(),
+                                        _pad0: 0.0,
+                                        normal: t.normals[1].into(),
+                                        _pad1: 0.0,
+                                    },
+                                    marching_cubes_wgpu::MeshVertex {
+                                        position: t.vertices[2].into(),
+                                        _pad0: 0.0,
+                                        normal: t.normals[2].into(),
+                                        _pad1: 0.0,
+                                    },
+                                ]
+                            })
+                            .collect(),
+                    );
+                    result.triangles = tris;
+                }
+                Err(e) => {
+                    result.error = Some(format_anyhow_error_chain(&e));
+                }
+            }
+        }
+        ExportRenderMode::AdaptiveSurfaceNets2 => {
+            let asn2_config = adaptive_surface_nets_2::AdaptiveMeshConfig2 {
+                base_resolution: config.asn2_base_resolution,
+                max_depth: config.asn2_max_depth,
+                vertex_refinement_iterations: config.asn2_vertex_refinement_iterations,
+                normal_sample_iterations: config.asn2_normal_sample_iterations,
+                normal_epsilon_frac: config.asn2_normal_epsilon_frac,
+                num_threads: 0,
+            };
+            match generate_adaptive_mesh_v2_from_bytes(&wasm_bytes, &asn2_config) {
+                Ok(meshing_result) => {
+                    result.bounds_min = meshing_result.bounds_min;
+                    result.bounds_max = meshing_result.bounds_max;
+                    result.sample_count = meshing_result.stats.total_samples as usize;
+                    result.asn2_stats = Some(meshing_result.stats);
+
+                    // Build indexed mesh data
+                    let vertices: Vec<marching_cubes_wgpu::MeshVertex> = meshing_result
+                        .vertices
+                        .iter()
+                        .zip(meshing_result.normals.iter())
+                        .map(|(pos, norm)| marching_cubes_wgpu::MeshVertex {
+                            position: (*pos).into(),
+                            _pad0: 0.0,
+                            normal: (*norm).into(),
+                            _pad1: 0.0,
+                        })
+                        .collect();
+
+                    result.mesh_vertices = Arc::new(vertices);
+                    result.mesh_indices = Some(Arc::new(meshing_result.indices));
+                }
+                Err(e) => {
+                    result.error = Some(format_anyhow_error_chain(&e));
                 }
             }
         }
     }
 
-    fn execute_resample(
-        asset_id: String,
-        wasm_bytes: Vec<u8>,
-        mode: ExportRenderMode,
-        config: ResampleConfig,
-        cancel_token: &CancellationToken,
-    ) -> BackgroundTaskResult {
-        if cancel_token.is_cancelled() {
-            return BackgroundTaskResult::Cancelled {
-                description: format!("Resample of {} cancelled", asset_id),
-            };
-        }
+    result.sample_time = start_time.elapsed().as_secs_f32();
 
-        let start_time = std::time::Instant::now();
-        let mut result = ResampleResult {
+    BackgroundTaskResult::ResampleComplete { asset_id, result }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn execute_resample(
+    asset_id: String,
+    _wasm_bytes: Vec<u8>,
+    _mode: ExportRenderMode,
+    _config: ResampleConfig,
+    _cancel_token: &CancellationToken,
+) -> BackgroundTaskResult {
+    // WASM execution not available in web build
+    BackgroundTaskResult::ResampleComplete {
+        asset_id,
+        result: ResampleResult {
             bounds_min: (0.0, 0.0, 0.0),
             bounds_max: (0.0, 0.0, 0.0),
             points: Arc::new(Vec::new()),
@@ -214,166 +466,9 @@ impl BackgroundWorker {
             mesh_indices: None,
             sample_time: 0.0,
             sample_count: 0,
-            error: None,
+            error: Some("WASM execution not available in web build".to_string()),
             asn2_stats: None,
-        };
-
-        match mode {
-            ExportRenderMode::None => {
-                // Nothing to do
-            }
-            ExportRenderMode::PointCloud => {
-                match sample_model_from_bytes(&wasm_bytes, config.resolution) {
-                    Ok((pts, bounds_min, bounds_max)) => {
-                        result.bounds_min = bounds_min;
-                        result.bounds_max = bounds_max;
-                        result.sample_count = pts.len();
-                        result.points = Arc::new(pts);
-                    }
-                    Err(e) => {
-                        result.error = Some(format_anyhow_error_chain(&e));
-                    }
-                }
-            }
-            ExportRenderMode::MarchingCubes => {
-                match generate_marching_cubes_mesh_from_bytes(&wasm_bytes, config.resolution) {
-                    Ok((tris, bounds_min, bounds_max)) => {
-                        result.bounds_min = bounds_min;
-                        result.bounds_max = bounds_max;
-                        result.sample_count = tris.len();
-                        result.mesh_vertices = Arc::new(
-                            tris.iter()
-                                .flat_map(|t| {
-                                    [
-                                        marching_cubes_wgpu::MeshVertex {
-                                            position: t.vertices[0].into(),
-                                            _pad0: 0.0,
-                                            normal: t.normals[0].into(),
-                                            _pad1: 0.0,
-                                        },
-                                        marching_cubes_wgpu::MeshVertex {
-                                            position: t.vertices[1].into(),
-                                            _pad0: 0.0,
-                                            normal: t.normals[1].into(),
-                                            _pad1: 0.0,
-                                        },
-                                        marching_cubes_wgpu::MeshVertex {
-                                            position: t.vertices[2].into(),
-                                            _pad0: 0.0,
-                                            normal: t.normals[2].into(),
-                                            _pad1: 0.0,
-                                        },
-                                    ]
-                                })
-                                .collect(),
-                        );
-                        result.triangles = tris;
-                    }
-                    Err(e) => {
-                        result.error = Some(format_anyhow_error_chain(&e));
-                    }
-                }
-            }
-            ExportRenderMode::AdaptiveSurfaceNets => {
-                let normal_mode = if config.adaptive_hq_normals {
-                    adaptive_surface_nets::NormalMode::HqBisection {
-                        eps_frac: 0.1,
-                        bracket_frac: 1.0,
-                        iterations: 8,
-                    }
-                } else {
-                    adaptive_surface_nets::NormalMode::Mesh
-                };
-                let asn_config = adaptive_surface_nets::AdaptiveMeshConfig {
-                    base_resolution: config.adaptive_base_resolution,
-                    max_refinement_depth: config.adaptive_max_depth,
-                    edge_refinement_iterations: config.adaptive_edge_refinement_iterations,
-                    vertex_relaxation_iterations: config.adaptive_vertex_relaxation_iterations,
-                    normal_mode,
-                };
-                match generate_adaptive_mesh_from_bytes(&wasm_bytes, &asn_config) {
-                    Ok((tris, bounds_min, bounds_max)) => {
-                        result.bounds_min = bounds_min;
-                        result.bounds_max = bounds_max;
-                        result.sample_count = tris.len();
-                        result.mesh_vertices = Arc::new(
-                            tris.iter()
-                                .flat_map(|t| {
-                                    [
-                                        marching_cubes_wgpu::MeshVertex {
-                                            position: t.vertices[0].into(),
-                                            _pad0: 0.0,
-                                            normal: t.normals[0].into(),
-                                            _pad1: 0.0,
-                                        },
-                                        marching_cubes_wgpu::MeshVertex {
-                                            position: t.vertices[1].into(),
-                                            _pad0: 0.0,
-                                            normal: t.normals[1].into(),
-                                            _pad1: 0.0,
-                                        },
-                                        marching_cubes_wgpu::MeshVertex {
-                                            position: t.vertices[2].into(),
-                                            _pad0: 0.0,
-                                            normal: t.normals[2].into(),
-                                            _pad1: 0.0,
-                                        },
-                                    ]
-                                })
-                                .collect(),
-                        );
-                        result.triangles = tris;
-                    }
-                    Err(e) => {
-                        result.error = Some(format_anyhow_error_chain(&e));
-                    }
-                }
-            }
-            ExportRenderMode::AdaptiveSurfaceNets2 => {
-                let asn2_config = adaptive_surface_nets_2::AdaptiveMeshConfig2 {
-                    base_resolution: config.asn2_base_resolution,
-                    max_depth: config.asn2_max_depth,
-                    vertex_refinement_iterations: config.asn2_vertex_refinement_iterations,
-                    normal_sample_iterations: config.asn2_normal_sample_iterations,
-                    normal_epsilon_frac: config.asn2_normal_epsilon_frac,
-                    num_threads: 0,
-                };
-                match generate_adaptive_mesh_v2_from_bytes(&wasm_bytes, &asn2_config) {
-                    Ok(meshing_result) => {
-                        result.bounds_min = meshing_result.bounds_min;
-                        result.bounds_max = meshing_result.bounds_max;
-                        result.sample_count = meshing_result.stats.total_samples as usize;
-                        result.asn2_stats = Some(meshing_result.stats);
-
-                        // Build indexed mesh data
-                        let vertices: Vec<marching_cubes_wgpu::MeshVertex> = meshing_result
-                            .vertices
-                            .iter()
-                            .zip(meshing_result.normals.iter())
-                            .map(|(pos, norm)| marching_cubes_wgpu::MeshVertex {
-                                position: (*pos).into(),
-                                _pad0: 0.0,
-                                normal: (*norm).into(),
-                                _pad1: 0.0,
-                            })
-                            .collect();
-
-                        result.mesh_vertices = Arc::new(vertices);
-                        result.mesh_indices = Some(Arc::new(meshing_result.indices));
-                    }
-                    Err(e) => {
-                        result.error = Some(format_anyhow_error_chain(&e));
-                    }
-                }
-            }
-        }
-
-        result.sample_time = start_time.elapsed().as_secs_f32();
-
-        BackgroundTaskResult::ResampleComplete {
-            asset_id,
-            result,
-        }
+        },
     }
 }
 
@@ -382,33 +477,24 @@ struct InProgressOperation {
     /// Description of what's being done
     description: String,
     /// When the operation started
-    start_time: std::time::Instant,
+    start_time: web_time::Instant,
     /// Cancellation token for this operation
     cancel_token: CancellationToken,
 }
 
-// Project system
+// Project system - common types
 use volumetric::{
-    AssetType,
-    Environment,
-    ExecuteWasmEntry,
-    ExecuteWasmInput,
-    ExecuteWasmOutput,
-    LoadedAsset,
-    Project,
-    ProjectEntry,
-    OperatorMetadata,
-    OperatorMetadataInput,
-    OperatorMetadataOutput,
-    operator_metadata_from_wasm_bytes,
-    Triangle,
-    adaptive_surface_nets,
-    adaptive_surface_nets_2,
-    stl,
-    sample_model_from_bytes,
-    generate_marching_cubes_mesh_from_bytes,
-    generate_adaptive_mesh_from_bytes,
-    generate_adaptive_mesh_v2_from_bytes,
+    adaptive_surface_nets, adaptive_surface_nets_2, AssetType, Environment, ExecuteWasmEntry,
+    ExecuteWasmInput, ExecuteWasmOutput, LoadedAsset, OperatorMetadata, OperatorMetadataInput,
+    OperatorMetadataOutput, Project, ProjectEntry, Triangle,
+};
+
+// Native-only: WASM execution functions (require wasmtime)
+#[cfg(not(target_arch = "wasm32"))]
+use volumetric::{
+    generate_adaptive_mesh_from_bytes, generate_adaptive_mesh_v2_from_bytes,
+    generate_marching_cubes_mesh_from_bytes, operator_metadata_from_wasm_bytes,
+    sample_model_from_bytes, stl,
 };
 
 enum ConfigFieldType {
@@ -713,10 +799,11 @@ fn format_anyhow_error_chain(e: &anyhow::Error) -> String {
 }
 
 /// Application state for the volumetric renderer
-struct VolumetricApp {
+pub struct VolumetricApp {
     /// The current project (contains the model pipeline)
     project: Option<Project>,
-    /// Path to the current project file (for save operations)
+    /// Path to the current project file (for save operations) - native only
+    #[cfg(not(target_arch = "wasm32"))]
     project_path: Option<PathBuf>,
     /// Exported assets from the last project run (used for UX/testing)
     exported_assets: Vec<LoadedAsset>,
@@ -727,6 +814,8 @@ struct VolumetricApp {
     operation_config_values: HashMap<String, ConfigValue>,
     /// Lua script source text for LuaSource inputs
     operation_lua_script: String,
+    /// Operator metadata cache - native only (uses filesystem)
+    #[cfg(not(target_arch = "wasm32"))]
     operator_metadata_cache: HashMap<String, CachedOperatorMetadata>,
     wgpu_target_format: wgpu::TextureFormat,
     // Camera state
@@ -764,8 +853,20 @@ struct VolumetricApp {
     in_progress_operation: Option<InProgressOperation>,
     /// Assets currently being resampled in the background
     pending_resample_assets: std::collections::HashSet<String>,
+
+    // Web-specific state
+    /// Whether the loading spinner has been hidden (web only)
+    #[cfg(target_arch = "wasm32")]
+    loading_hidden: bool,
+    /// Pending WASM file import (web only)
+    #[cfg(target_arch = "wasm32")]
+    pending_wasm_import: Option<Promise<Option<(String, Vec<u8>)>>>,
+    /// Pending project load (web only)
+    #[cfg(target_arch = "wasm32")]
+    pending_project_load: Option<Promise<Option<Vec<u8>>>>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Debug)]
 struct CachedOperatorMetadata {
     wasm_len: u64,
@@ -774,6 +875,7 @@ struct CachedOperatorMetadata {
 }
 
 
+#[cfg(not(target_arch = "wasm32"))]
 fn demo_wasm_path(crate_name: &str) -> Option<PathBuf> {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     // We are in crates/volumetric_ui, so the workspace target directory is two levels up.
@@ -801,13 +903,14 @@ fn demo_wasm_path(crate_name: &str) -> Option<PathBuf> {
     None
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn operation_wasm_path(crate_name: &str) -> Option<PathBuf> {
     // For now operations are built the same way as demo models: a cdylib .wasm in target/{debug|release}.
     demo_wasm_path(crate_name)
 }
 
 impl VolumetricApp {
-    fn new(cc: &eframe::CreationContext<'_>, initial_project: Option<Project>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, initial_project: Option<Project>) -> Self {
         let wgpu_target_format = cc
             .wgpu_render_state
             .as_ref()
@@ -818,7 +921,7 @@ impl VolumetricApp {
         let (exported_assets, asset_render_data) = initial_project.as_ref().map_or((vec![], HashMap::new()), |proj| {
             let mut env = Environment::new();
             let assets = proj.run(&mut env).unwrap_or_default();
-            
+
             // Create render data for the first model asset with PointCloud mode
             let mut render_data = HashMap::new();
             if let Some(first_model) = assets.iter().find(|a| a.as_model_wasm().is_some()) {
@@ -831,6 +934,7 @@ impl VolumetricApp {
 
         Self {
             project: initial_project,
+            #[cfg(not(target_arch = "wasm32"))]
             project_path: None,
             exported_assets,
             asset_render_data,
@@ -838,6 +942,7 @@ impl VolumetricApp {
             operation_input_asset_id_b: None,
             operation_config_values: HashMap::new(),
             operation_lua_script: String::new(),
+            #[cfg(not(target_arch = "wasm32"))]
             operator_metadata_cache: HashMap::new(),
             wgpu_target_format,
             camera_theta: std::f32::consts::FRAC_PI_4,
@@ -861,6 +966,13 @@ impl VolumetricApp {
             background_worker: BackgroundWorker::new(),
             in_progress_operation: None,
             pending_resample_assets: std::collections::HashSet::new(),
+
+            #[cfg(target_arch = "wasm32")]
+            loading_hidden: false,
+            #[cfg(target_arch = "wasm32")]
+            pending_wasm_import: None,
+            #[cfg(target_arch = "wasm32")]
+            pending_project_load: None,
         }
     }
 
@@ -961,6 +1073,7 @@ impl VolumetricApp {
         self.in_progress_operation.is_some()
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn operator_metadata_cached(&mut self, crate_name: &str) -> Option<OperatorMetadata> {
         let path = operation_wasm_path(crate_name)?;
         let path_str = path.to_string_lossy().to_string();
@@ -995,6 +1108,12 @@ impl VolumetricApp {
         self.operator_metadata_cache
             .get(&path_str)
             .and_then(|c| c.metadata.clone())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn operator_metadata_cached(&mut self, _crate_name: &str) -> Option<OperatorMetadata> {
+        // Operator metadata caching not available on web (requires filesystem)
+        None
     }
 
     /// Sets the render mode for a specific asset. If mode is None, removes the asset from rendering.
@@ -1059,7 +1178,7 @@ impl VolumetricApp {
             let cancel_token = CancellationToken::new();
             self.in_progress_operation = Some(InProgressOperation {
                 description: "Running project...".to_string(),
-                start_time: std::time::Instant::now(),
+                start_time: web_time::Instant::now(),
                 cancel_token: cancel_token.clone(),
             });
 
@@ -1143,7 +1262,7 @@ impl VolumetricApp {
             } else {
                 format!("Meshing {} assets...", asset_count)
             },
-            start_time: std::time::Instant::now(),
+            start_time: web_time::Instant::now(),
             cancel_token: cancel_token.clone(),
         });
 
@@ -1714,7 +1833,10 @@ impl VolumetricApp {
             }
         }
         
-        self.project_path = None; // Mark as modified
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.project_path = None; // Mark as modified
+        }
         self.run_project();
         self.close_edit_panel();
     }
@@ -1724,6 +1846,64 @@ impl eframe::App for VolumetricApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Poll for completed background tasks
         self.poll_background_tasks();
+
+        // Web-specific: hide loading spinner and poll async file operations
+        #[cfg(target_arch = "wasm32")]
+        {
+            // Hide the loading spinner on first frame
+            if !self.loading_hidden {
+                self.loading_hidden = true;
+                if let Some(window) = web_sys::window() {
+                    if let Some(document) = window.document() {
+                        if let Some(body) = document.body() {
+                            let _ = body.class_list().add_1("loaded");
+                        }
+                    }
+                }
+            }
+
+            // Poll pending WASM import
+            if let Some(ref promise) = self.pending_wasm_import {
+                if let Some(result) = promise.ready() {
+                    let result = result.clone();
+                    self.pending_wasm_import = None;
+                    if let Some((name, wasm_bytes)) = result {
+                        let asset_id = name.trim_end_matches(".wasm").to_string();
+                        if self.project.is_none() {
+                            self.project = Some(Project::new(vec![]));
+                        }
+                        if let Some(ref mut project) = self.project {
+                            project.insert_model_wasm(&asset_id, wasm_bytes);
+                        }
+                        self.run_project();
+                    }
+                }
+            }
+
+            // Poll pending project load
+            if let Some(ref promise) = self.pending_project_load {
+                if let Some(result) = promise.ready() {
+                    let result = result.clone();
+                    self.pending_project_load = None;
+                    if let Some(bytes) = result {
+                        match Project::from_cbor(&bytes) {
+                            Ok(project) => {
+                                self.project = Some(project);
+                                self.run_project();
+                            }
+                            Err(e) => {
+                                self.error_message = Some(format!("Failed to load project: {}", e));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Request repaint while async operations are pending
+            if self.pending_wasm_import.is_some() || self.pending_project_load.is_some() {
+                ctx.request_repaint();
+            }
+        }
 
         // Request continuous repaints while background tasks are running
         if self.is_busy() {
@@ -1750,12 +1930,18 @@ impl eframe::App for VolumetricApp {
                             ui.weak(format!("Evaluated in {:.2}ms", time * 1000.0));
                         }
                         ui.horizontal(|ui| {
+                            #[cfg(not(target_arch = "wasm32"))]
                             let label = match &self.project_path {
                                 Some(p) => p.display().to_string(),
                                 None => match &self.project {
                                     Some(_) => "(unsaved project)".to_string(),
                                     None => "(none loaded)".to_string(),
                                 },
+                            };
+                            #[cfg(target_arch = "wasm32")]
+                            let label = match &self.project {
+                                Some(_) => "(in-memory project)".to_string(),
+                                None => "(none loaded)".to_string(),
                             };
                             ui.label(label);
                         });
@@ -1768,7 +1954,10 @@ impl eframe::App for VolumetricApp {
                                 .clicked()
                             {
                                 self.project = None;
-                                self.project_path = None;
+                                #[cfg(not(target_arch = "wasm32"))]
+                                {
+                                    self.project_path = None;
+                                }
                                 self.asset_render_data.clear();
                                 self.exported_assets.clear();
                                 self.error_message = None;
@@ -1814,7 +2003,8 @@ impl eframe::App for VolumetricApp {
                                 .text("SSAO strength"),
                         );
 
-                        // Project file operations
+                        // Project file operations (native only - uses filesystem)
+                        #[cfg(not(target_arch = "wasm32"))]
                         ui.horizontal(|ui| {
                             if ui.button("Open Project…").clicked() {
                                 if let Some(path) = rfd::FileDialog::new()
@@ -1828,14 +2018,18 @@ impl eframe::App for VolumetricApp {
                                             self.run_project();
                                         }
                                         Err(e) => {
-                                            self.error_message = Some(format!("Failed to load project: {}", e));
+                                            self.error_message =
+                                                Some(format!("Failed to load project: {}", e));
                                         }
                                     }
                                 }
                             }
 
                             let can_save = self.project.is_some();
-                            if ui.add_enabled(can_save, egui::Button::new("Save Project…")).clicked() {
+                            if ui
+                                .add_enabled(can_save, egui::Button::new("Save Project…"))
+                                .clicked()
+                            {
                                 if let Some(path) = rfd::FileDialog::new()
                                     .add_filter("Project", &["vproj"])
                                     .save_file()
@@ -1847,7 +2041,8 @@ impl eframe::App for VolumetricApp {
                                                 self.error_message = None;
                                             }
                                             Err(e) => {
-                                                self.error_message = Some(format!("Failed to save project: {}", e));
+                                                self.error_message =
+                                                    Some(format!("Failed to save project: {}", e));
                                             }
                                         }
                                     }
@@ -1855,8 +2050,57 @@ impl eframe::App for VolumetricApp {
                             }
                         });
 
+                        // Project file operations (web version - uses async file picker)
+                        #[cfg(target_arch = "wasm32")]
+                        ui.horizontal(|ui| {
+                            let is_loading = self.pending_project_load.is_some();
+                            if ui.add_enabled(!is_loading, egui::Button::new(if is_loading { "⏳ Loading…" } else { "Open Project…" })).clicked() {
+                                self.pending_project_load = Some(Promise::spawn_local(async {
+                                    let file = rfd::AsyncFileDialog::new()
+                                        .add_filter("Project", &["vproj"])
+                                        .pick_file()
+                                        .await?;
+                                    Some(file.read().await)
+                                }));
+                            }
+
+                            let can_save = self.project.is_some();
+                            if ui.add_enabled(can_save, egui::Button::new("Save Project…")).clicked() {
+                                if let Some(ref project) = self.project {
+                                    match project.to_cbor() {
+                                        Ok(bytes) => {
+                                            // Trigger browser download
+                                            if let Some(window) = web_sys::window() {
+                                                if let Some(document) = window.document() {
+                                                    let uint8_array = js_sys::Uint8Array::new_with_length(bytes.len() as u32);
+                                                    uint8_array.copy_from(&bytes);
+                                                    let array = js_sys::Array::new();
+                                                    array.push(&uint8_array.buffer());
+                                                    if let Ok(blob) = web_sys::Blob::new_with_u8_array_sequence(&array) {
+                                                        if let Ok(url) = web_sys::Url::create_object_url_with_blob(&blob) {
+                                                            if let Ok(elem) = document.create_element("a") {
+                                                                if let Ok(anchor) = elem.dyn_into::<web_sys::HtmlAnchorElement>() {
+                                                                    anchor.set_href(&url);
+                                                                    anchor.set_download("project.vproj");
+                                                                    anchor.click();
+                                                                    let _ = web_sys::Url::revoke_object_url(&url);
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            self.error_message = Some(format!("Failed to save project: {}", e));
+                                        }
+                                    }
+                                }
+                            }
+                        });
+
                         ui.separator();
-                        
+
                         // ═══════════════════════════════════════════════════════════════
                         // TOOLBOX PANEL - Models Section
                         // ═══════════════════════════════════════════════════════════════
@@ -1888,13 +2132,15 @@ impl eframe::App for VolumetricApp {
                                 model_to_add = Some("mandelbulb_model");
                             }
                             
-                            // Handle model addition
+                            // Handle model addition (native only - uses filesystem to load pre-built WASM)
+                            #[cfg(not(target_arch = "wasm32"))]
                             if let Some(crate_name) = model_to_add {
                                 match demo_wasm_path(crate_name) {
                                     Some(path) => {
                                         match fs::read(&path) {
                                             Ok(wasm_bytes) => {
-                                                let asset_id = path.file_stem()
+                                                let asset_id = path
+                                                    .file_stem()
                                                     .and_then(|s| s.to_str())
                                                     .unwrap_or("model")
                                                     .to_string();
@@ -1908,7 +2154,8 @@ impl eframe::App for VolumetricApp {
                                                 self.run_project();
                                             }
                                             Err(e) => {
-                                                self.error_message = Some(format!("Failed to read WASM file: {}", e));
+                                                self.error_message =
+                                                    Some(format!("Failed to read WASM file: {}", e));
                                             }
                                         }
                                     }
@@ -1919,12 +2166,22 @@ impl eframe::App for VolumetricApp {
                                     }
                                 }
                             }
+                            #[cfg(target_arch = "wasm32")]
+                            if model_to_add.is_some() {
+                                self.error_message = Some(
+                                    "Built-in models not available in web version. Import a WASM file instead.".to_string()
+                                );
+                            }
                             
                             ui.add_space(8.0);
                             ui.separator();
-                            
-                            // Import custom WASM
-                            if ui.add(egui::Button::new("📁 Import WASM…").min_size(egui::vec2(btn_width, 28.0))).clicked() {
+
+                            // Import custom WASM (native only for now)
+                            #[cfg(not(target_arch = "wasm32"))]
+                            if ui
+                                .add(egui::Button::new("📁 Import WASM…").min_size(egui::vec2(btn_width, 28.0)))
+                                .clicked()
+                            {
                                 if let Some(path) = rfd::FileDialog::new()
                                     .add_filter("WASM", &["wasm"])
                                     .pick_file()
@@ -1950,6 +2207,26 @@ impl eframe::App for VolumetricApp {
                                                 Some(format!("Failed to read WASM file: {}", e));
                                         }
                                     }
+                                }
+                            }
+
+                            // Import custom WASM (web version using async file picker)
+                            #[cfg(target_arch = "wasm32")]
+                            {
+                                let is_picking = self.pending_wasm_import.is_some();
+                                if ui
+                                    .add_enabled(!is_picking, egui::Button::new(if is_picking { "⏳ Picking…" } else { "📁 Import WASM…" }).min_size(egui::vec2(btn_width, 28.0)))
+                                    .clicked()
+                                {
+                                    self.pending_wasm_import = Some(Promise::spawn_local(async {
+                                        let file = rfd::AsyncFileDialog::new()
+                                            .add_filter("WASM", &["wasm"])
+                                            .pick_file()
+                                            .await?;
+                                        let data = file.read().await;
+                                        let name = file.file_name();
+                                        Some((name, data))
+                                    }));
                                 }
                             }
                         });
@@ -2052,6 +2329,7 @@ impl eframe::App for VolumetricApp {
                         } else if !has_required_inputs {
                             self.error_message = Some("Not enough input models available for this operator.".to_string());
                         } else {
+                            #[cfg(not(target_arch = "wasm32"))]
                             match operation_wasm_path(crate_name) {
                                 Some(path) => match fs::read(&path) {
                                     Ok(wasm_bytes) => {
@@ -2149,6 +2427,13 @@ impl eframe::App for VolumetricApp {
                                         "Operator WASM not found for '{crate_name}'. Build it first with: cargo build --release --target wasm32-unknown-unknown -p {crate_name}"
                                     ));
                                 }
+                            }
+
+                            #[cfg(target_arch = "wasm32")]
+                            {
+                                self.error_message = Some(
+                                    "Operators not yet available in web version.".to_string(),
+                                );
                             }
                         }
                     }
@@ -2286,7 +2571,10 @@ impl eframe::App for VolumetricApp {
                 if let Some(idx) = entry_to_delete {
                     if let Some(ref mut project) = self.project {
                         project.entries_mut().remove(idx);
-                        self.project_path = None; // Mark as modified
+                        #[cfg(not(target_arch = "wasm32"))]
+                        {
+                            self.project_path = None; // Mark as modified
+                        }
                         self.run_project();
                     }
                     // Close edit panel if we deleted the entry being edited
@@ -2304,7 +2592,10 @@ impl eframe::App for VolumetricApp {
                 if let Some(idx) = entry_to_move_up {
                     if let Some(ref mut project) = self.project {
                         if project.move_entry_up(idx) {
-                            self.project_path = None; // Mark as modified
+                            #[cfg(not(target_arch = "wasm32"))]
+                            {
+                                self.project_path = None; // Mark as modified
+                            }
                             self.run_project();
                             // Adjust edit index if needed
                             if let Some(edit_idx) = self.editing_entry_index {
@@ -2322,7 +2613,10 @@ impl eframe::App for VolumetricApp {
                 if let Some(idx) = entry_to_move_down {
                     if let Some(ref mut project) = self.project {
                         if project.move_entry_down(idx) {
-                            self.project_path = None; // Mark as modified
+                            #[cfg(not(target_arch = "wasm32"))]
+                            {
+                                self.project_path = None; // Mark as modified
+                            }
                             self.run_project();
                             // Adjust edit index if needed
                             if let Some(edit_idx) = self.editing_entry_index {
@@ -2651,6 +2945,7 @@ impl eframe::App for VolumetricApp {
                                         });
                                     }
 
+                                    #[cfg(not(target_arch = "wasm32"))]
                                     if ui.button("Export STL…").clicked() {
                                         if let Some(path) = rfd::FileDialog::new()
                                             .add_filter("STL", &["stl"])
@@ -2720,6 +3015,7 @@ impl eframe::App for VolumetricApp {
                                 }
 
                                 // Export WASM button - always available for model exports (doesn't depend on sampling)
+                                #[cfg(not(target_arch = "wasm32"))]
                                 if let Some(wasm_bytes) = asset.as_model_wasm() {
                                     if ui.button("Export WASM…").clicked() {
                                         if let Some(path) = rfd::FileDialog::new()
@@ -3016,16 +3312,21 @@ fn triangles_to_mesh_vertices(triangles: &[Triangle]) -> Vec<marching_cubes_wgpu
     out
 }
 
+// =============================================================================
+// Native Entry Point
+// =============================================================================
+
+#[cfg(not(target_arch = "wasm32"))]
 fn main() -> Result<()> {
     env_logger::init();
-    
+
     let args: Vec<String> = std::env::args().collect();
-    
+
     // Load initial project from CLI argument (can be .wasm or .vproj)
     let initial_project = if args.len() > 1 {
         let path = PathBuf::from(&args[1]);
         let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-        
+
         match ext {
             "vproj" => {
                 // Load project file
@@ -3044,7 +3345,8 @@ fn main() -> Result<()> {
                 // Import WASM file into a new empty project
                 match fs::read(&path) {
                     Ok(wasm_bytes) => {
-                        let asset_id = path.file_stem()
+                        let asset_id = path
+                            .file_stem()
                             .and_then(|s| s.to_str())
                             .unwrap_or("model")
                             .to_string();
@@ -3060,20 +3362,23 @@ fn main() -> Result<()> {
                 }
             }
             _ => {
-                eprintln!("Unknown file type: {}. Expected .wasm or .vproj", path.display());
+                eprintln!(
+                    "Unknown file type: {}. Expected .wasm or .vproj",
+                    path.display()
+                );
                 None
             }
         }
     } else {
         Some(Project::new(vec![]))
     };
-    
+
     println!("Volumetric Model Renderer (eframe/egui)");
     println!("=======================================");
     // Note: the UI can still tolerate an explicit no-project state via the "Unload" button.
     println!("Tip: import a WASM file or open a project in the UI to add models and operations.");
     println!();
-    
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 720.0])
@@ -3082,12 +3387,79 @@ fn main() -> Result<()> {
         depth_buffer: 24,
         ..Default::default()
     };
-    
+
     eframe::run_native(
         "Volumetric Renderer",
         options,
         Box::new(|cc| Ok(Box::new(VolumetricApp::new(cc, initial_project)))),
-    ).map_err(|e| anyhow::anyhow!("Failed to run eframe: {}", e))?;
-    
+    )
+    .map_err(|e| anyhow::anyhow!("Failed to run eframe: {}", e))?;
+
+    Ok(())
+}
+
+// WASM builds need a main function (even though wasm_bindgen(start) is the real entry)
+#[cfg(target_arch = "wasm32")]
+fn main() {
+    // The actual entry point is the `start` function below with #[wasm_bindgen(start)]
+}
+
+// =============================================================================
+// Web Entry Point
+// =============================================================================
+
+/// Web entry point for WASM builds
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen(start)]
+pub fn start() -> Result<(), JsValue> {
+    use wasm_bindgen::JsCast;
+
+    // Set up panic hook for better error messages
+    console_error_panic_hook::set_once();
+
+    // Initialize logging to browser console
+    console_log::init_with_level(log::Level::Debug)
+        .map_err(|e| JsValue::from_str(&format!("Failed to init logger: {}", e)))?;
+
+    log::info!("Volumetric UI starting in web mode...");
+
+    // Get the canvas element
+    let document = web_sys::window()
+        .ok_or_else(|| JsValue::from_str("No window"))?
+        .document()
+        .ok_or_else(|| JsValue::from_str("No document"))?;
+
+    let canvas = document
+        .get_element_by_id("volumetric_canvas")
+        .ok_or_else(|| JsValue::from_str("Canvas element not found"))?
+        .dyn_into::<web_sys::HtmlCanvasElement>()
+        .map_err(|_| JsValue::from_str("Element is not a canvas"))?;
+
+    // Force WebGL2 backend instead of WebGPU to avoid memory issues
+    let web_options = eframe::WebOptions {
+        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(eframe::egui_wgpu::WgpuSetupCreateNew {
+                instance_descriptor: wgpu::InstanceDescriptor {
+                    backends: wgpu::Backends::GL,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    wasm_bindgen_futures::spawn_local(async move {
+        eframe::WebRunner::new()
+            .start(
+                canvas,
+                web_options,
+                Box::new(|cc| Ok(Box::new(VolumetricApp::new(cc, None)))),
+            )
+            .await
+            .expect("Failed to start eframe");
+    });
+
     Ok(())
 }
