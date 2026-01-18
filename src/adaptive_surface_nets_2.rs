@@ -2047,6 +2047,13 @@ fn refine_normal_via_probing<F>(
 where
     F: Fn(f64, f64, f64) -> f32,
 {
+    // Ensure adequate binary search precision for surface point finding.
+    // With fewer iterations, the found surface points are imprecise and
+    // plane fitting produces noisy normals. 8 iterations gives ~1/256
+    // precision relative to search_distance, which is adequate for
+    // accurate plane fitting.
+    let iterations = binary_search_iterations.max(8);
+
     // Normalize initial normal
     let n_len_sq = initial_normal.0 * initial_normal.0
         + initial_normal.1 * initial_normal.1
@@ -2088,7 +2095,7 @@ where
             probe_pos,
             n,
             search_distance,
-            binary_search_iterations,
+            iterations,
             sampler,
             stats,
         ) {
@@ -2128,20 +2135,61 @@ where
     oriented_normal
 }
 
+/// Recompute accumulated face normals from vertex positions.
+///
+/// Given refined vertex positions, recomputes face normals for each triangle
+/// and accumulates them per vertex. This gives better normal estimates than
+/// using the original normals computed from unrefined edge midpoints.
+fn recompute_accumulated_normals(
+    vertices: &[(f64, f64, f64)],
+    indices: &[u32],
+) -> Vec<(f64, f64, f64)> {
+    let vertex_count = vertices.len();
+    let mut accumulated_normals: Vec<(f64, f64, f64)> = vec![(0.0, 0.0, 0.0); vertex_count];
+
+    // Iterate over triangles and accumulate face normals
+    for tri_idx in 0..(indices.len() / 3) {
+        let i0 = indices[tri_idx * 3] as usize;
+        let i1 = indices[tri_idx * 3 + 1] as usize;
+        let i2 = indices[tri_idx * 3 + 2] as usize;
+
+        let v0 = vertices[i0];
+        let v1 = vertices[i1];
+        let v2 = vertices[i2];
+
+        let face_normal = compute_face_normal(v0, v1, v2);
+
+        // Accumulate to each vertex (area-weighted by virtue of unnormalized cross product)
+        accumulated_normals[i0].0 += face_normal.0;
+        accumulated_normals[i0].1 += face_normal.1;
+        accumulated_normals[i0].2 += face_normal.2;
+
+        accumulated_normals[i1].0 += face_normal.0;
+        accumulated_normals[i1].1 += face_normal.1;
+        accumulated_normals[i1].2 += face_normal.2;
+
+        accumulated_normals[i2].0 += face_normal.0;
+        accumulated_normals[i2].1 += face_normal.1;
+        accumulated_normals[i2].2 += face_normal.2;
+    }
+
+    accumulated_normals
+}
+
 /// Stage 4: Vertex Refinement & Normal Estimation
 ///
 /// Refines vertex positions using binary search along the accumulated normals,
-/// then optionally re-estimates normals by probing the surface in tangent directions.
+/// then recomputes normals from the refined mesh topology, and optionally
+/// further refines normals by probing the surface.
 ///
 /// # Algorithm
-/// 1. For each vertex, normalize the accumulated face normal
-/// 2. Binary search along that direction to find the surface crossing
-/// 3. If normal_sample_iterations > 0, refine normal by:
-///    a. Probing at ±epsilon in tangent directions
-///    b. Binary searching to find surface points at each probe
-///    c. Fitting a plane to the surface points
-///    d. Using the plane normal (or falling back if edge/corner detected)
-/// 4. Otherwise, keep the accumulated normal (normalized)
+/// 1. **Phase 4a - Vertex Refinement**: For each vertex, binary search along
+///    multiple candidate directions to find the nearest surface crossing
+/// 2. **Phase 4b - Normal Recomputation**: Recompute face normals from the
+///    refined vertex positions and accumulate per vertex. This gives much
+///    better initial normal estimates than the original unrefined positions.
+/// 3. **Phase 4c - Normal Refinement** (optional): If normal_sample_iterations > 0,
+///    further refine normals by probing the surface in tangent directions
 fn stage4_vertex_refinement<F>(
     stage3: Stage3Result,
     sampler: &F,
@@ -2155,28 +2203,25 @@ where
     let vertex_count = stage3.vertices.len();
 
     // Use maximum cell size for search distance to handle non-cubic bounds.
-    // The search direction is the accumulated normal which can point in any direction,
-    // so we need to be able to reach the surface even along the longest axis.
     let max_cell_size = cell_size.0.max(cell_size.1).max(cell_size.2);
     let min_cell_size = cell_size.0.min(cell_size.1).min(cell_size.2);
 
-    // Search distance for vertex refinement: full cell size to handle vertices
-    // that may be positioned at cell corners (up to sqrt(3)/2 ≈ 0.87 * cell_size
-    // from the true surface in the worst case)
+    // Search distance for vertex refinement
     let search_distance = max_cell_size;
 
-    // Probe epsilon for normal refinement: use min cell size for finer probing
+    // Probe epsilon for normal refinement
     let probe_epsilon = min_cell_size * config.normal_epsilon_frac as f64;
 
-    // Process all vertices in parallel
-    let results: Vec<((f32, f32, f32), (f32, f32, f32))> = (0..vertex_count)
-        .into_par_iter()
-        .map(|i| {
-            let initial_pos = stage3.vertices[i];
-            let accumulated_normal = stage3.accumulated_normals[i];
+    // =========================================================================
+    // Phase 4a: Vertex Position Refinement
+    // =========================================================================
+    let refined_positions: Vec<(f64, f64, f64)> = if config.vertex_refinement_iterations > 0 {
+        (0..vertex_count)
+            .into_par_iter()
+            .map(|i| {
+                let initial_pos = stage3.vertices[i];
+                let accumulated_normal = stage3.accumulated_normals[i];
 
-            // Refine vertex position
-            let refined_pos = if config.vertex_refinement_iterations > 0 {
                 let (pos, outcome) = refine_vertex_position(
                     initial_pos,
                     accumulated_normal,
@@ -2206,18 +2251,35 @@ where
                 }
 
                 pos
-            } else {
-                initial_pos
-            };
+            })
+            .collect()
+    } else {
+        stage3.vertices.clone()
+    };
 
-            // Refine normal via tangent plane probing, or just normalize accumulated
-            let final_normal = if config.normal_sample_iterations > 0 {
-                // Refine normal by probing surface in tangent directions
-                let normal_search_distance = search_distance * 2.0;
+    // =========================================================================
+    // Phase 4b: Recompute Accumulated Normals from Refined Positions
+    // =========================================================================
+    // This gives much better normal estimates than the original normals
+    // computed from unrefined edge midpoints.
+    let recomputed_normals = recompute_accumulated_normals(&refined_positions, &stage3.indices);
+
+    // =========================================================================
+    // Phase 4c: Normal Refinement (optional) or Direct Use
+    // =========================================================================
+    let final_normals: Vec<(f32, f32, f32)> = if config.normal_sample_iterations > 0 {
+        // Further refine normals via tangent plane probing
+        let normal_search_distance = search_distance * 2.0;
+
+        (0..vertex_count)
+            .into_par_iter()
+            .map(|i| {
+                let refined_pos = refined_positions[i];
+                let recomputed_normal = recomputed_normals[i];
 
                 let refined = refine_normal_via_probing(
                     refined_pos,
-                    accumulated_normal,
+                    recomputed_normal,
                     probe_epsilon,
                     normal_search_distance,
                     config.normal_sample_iterations,
@@ -2225,26 +2287,25 @@ where
                     stats,
                 );
                 normalize_or_default(refined)
-            } else {
-                // Just normalize the accumulated normal
-                normalize_or_default(accumulated_normal)
-            };
+            })
+            .collect()
+    } else {
+        // Just normalize the recomputed normals
+        recomputed_normals
+            .iter()
+            .map(|n| normalize_or_default(*n))
+            .collect()
+    };
 
-            let vertex = (
-                refined_pos.0 as f32,
-                refined_pos.1 as f32,
-                refined_pos.2 as f32,
-            );
-            (vertex, final_normal)
-        })
+    // Convert positions to f32
+    let final_vertices: Vec<(f32, f32, f32)> = refined_positions
+        .iter()
+        .map(|p| (p.0 as f32, p.1 as f32, p.2 as f32))
         .collect();
 
-    // Unzip results into separate vectors
-    let (refined_vertices, refined_normals): (Vec<_>, Vec<_>) = results.into_iter().unzip();
-
     IndexedMesh2 {
-        vertices: refined_vertices,
-        normals: refined_normals,
+        vertices: final_vertices,
+        normals: final_normals,
         indices: stage3.indices,
     }
 }
