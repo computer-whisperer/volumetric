@@ -357,7 +357,7 @@ impl EdgeId {
     pub fn midpoint_world_pos(
         &self,
         bounds_min: (f64, f64, f64),
-        cell_size: f64,
+        cell_size: (f64, f64, f64),
     ) -> (f64, f64, f64) {
         // Edge midpoint is at (x + 0.5, y, z) for X-axis edge, etc.
         let (mx, my, mz) = match self.axis {
@@ -367,9 +367,9 @@ impl EdgeId {
             _ => unreachable!(),
         };
         (
-            bounds_min.0 + mx * cell_size,
-            bounds_min.1 + my * cell_size,
-            bounds_min.2 + mz * cell_size,
+            bounds_min.0 + mx * cell_size.0,
+            bounds_min.1 + my * cell_size.1,
+            bounds_min.2 + mz * cell_size.2,
         )
     }
 }
@@ -860,14 +860,14 @@ where
 /// * `cell` - The cell ID
 /// * `corner_index` - Corner index (0-7)
 /// * `bounds_min` - World-space minimum bounds
-/// * `cell_size` - Size of a cell at the finest level
+/// * `cell_size` - Size of a cell at the finest level (per-axis)
 /// * `max_depth` - Maximum refinement depth
 #[inline]
 fn corner_world_position(
     cell: &CuboidId,
     corner_index: usize,
     bounds_min: (f64, f64, f64),
-    cell_size: f64,
+    cell_size: (f64, f64, f64),
     max_depth: u8,
 ) -> (f64, f64, f64) {
     let (fx, fy, fz) = cell.to_finest_level(max_depth);
@@ -877,9 +877,9 @@ fn corner_world_position(
     let scale = 1i32 << (max_depth - cell.depth);
 
     (
-        bounds_min.0 + (fx + dx * scale) as f64 * cell_size,
-        bounds_min.1 + (fy + dy * scale) as f64 * cell_size,
-        bounds_min.2 + (fz + dz * scale) as f64 * cell_size,
+        bounds_min.0 + (fx + dx * scale) as f64 * cell_size.0,
+        bounds_min.1 + (fy + dy * scale) as f64 * cell_size.1,
+        bounds_min.2 + (fz + dz * scale) as f64 * cell_size.2,
     )
 }
 
@@ -891,7 +891,7 @@ fn complete_corner_samples<F>(
     entry: &mut WorkQueueEntry,
     sampler: &F,
     bounds_min: (f64, f64, f64),
-    cell_size: f64,
+    cell_size: (f64, f64, f64),
     max_depth: u8,
     stats: &SamplingStats,
 ) -> CornerMask
@@ -927,7 +927,7 @@ fn subdivide_and_filter_mixed<F>(
     parent: &WorkQueueEntry,
     sampler: &F,
     bounds_min: (f64, f64, f64),
-    cell_size: f64,
+    cell_size: (f64, f64, f64),
     max_depth: u8,
     stats: &SamplingStats,
 ) -> Vec<WorkQueueEntry>
@@ -980,9 +980,9 @@ where
                 let py = fy + iy as i32 * child_scale;
                 let pz = fz + iz as i32 * child_scale;
 
-                let world_x = bounds_min.0 + px as f64 * cell_size;
-                let world_y = bounds_min.1 + py as f64 * cell_size;
-                let world_z = bounds_min.2 + pz as f64 * cell_size;
+                let world_x = bounds_min.0 + px as f64 * cell_size.0;
+                let world_y = bounds_min.1 + py as f64 * cell_size.1;
+                let world_z = bounds_min.2 + pz as f64 * cell_size.2;
 
                 samples[iz][iy][ix] = sample_is_inside(sampler, world_x, world_y, world_z, stats);
             }
@@ -1184,7 +1184,7 @@ fn process_work_entry<F>(
     mut entry: WorkQueueEntry,
     sampler: &F,
     bounds_min: (f64, f64, f64),
-    cell_size: f64,
+    cell_size: (f64, f64, f64),
     max_depth: u8,
     base_res: i32,
     visited: &DashSet<CuboidId>,
@@ -1277,7 +1277,7 @@ fn stage2_subdivision_and_emission<F>(
     initial_queue: Vec<WorkQueueEntry>,
     sampler: &F,
     bounds_min: (f64, f64, f64),
-    cell_size: f64,
+    cell_size: (f64, f64, f64),
     config: &AdaptiveMeshConfig2,
     stats: &SamplingStats,
 ) -> Vec<SparseTriangle>
@@ -1381,7 +1381,7 @@ fn compute_face_normal(v0: (f64, f64, f64), v1: (f64, f64, f64), v2: (f64, f64, 
 fn stage3_topology_finalization(
     sparse_triangles: Vec<SparseTriangle>,
     bounds_min: (f64, f64, f64),
-    cell_size: f64,
+    cell_size: (f64, f64, f64),
 ) -> Stage3Result {
     use std::collections::HashMap;
 
@@ -2054,7 +2054,7 @@ where
 fn stage4_vertex_refinement<F>(
     stage3: Stage3Result,
     sampler: &F,
-    cell_size: f64,
+    cell_size: (f64, f64, f64),
     config: &AdaptiveMeshConfig2,
     stats: &SamplingStats,
 ) -> IndexedMesh2
@@ -2063,13 +2063,16 @@ where
 {
     let vertex_count = stage3.vertices.len();
 
+    // Use minimum cell size for search distance (conservative for non-cubic bounds)
+    let min_cell_size = cell_size.0.min(cell_size.1).min(cell_size.2);
+
     // Search distance for vertex refinement: full cell size to handle vertices
     // that may be positioned at cell corners (up to sqrt(3)/2 ≈ 0.87 * cell_size
     // from the true surface in the worst case)
-    let search_distance = cell_size;
+    let search_distance = min_cell_size;
 
     // Probe epsilon for normal refinement: how far to step in tangent directions
-    let probe_epsilon = cell_size * config.normal_epsilon_frac as f64;
+    let probe_epsilon = min_cell_size * config.normal_epsilon_frac as f64;
 
     // Process all vertices in parallel
     let results: Vec<((f32, f32, f32), (f32, f32, f32))> = (0..vertex_count)
@@ -2169,10 +2172,14 @@ where
         bounds_max.2 as f64,
     );
 
-    // Calculate cell size at finest level
+    // Calculate cell size at finest level (per-axis for non-cubic bounds)
     // Total cells at finest level = base_resolution * 2^max_depth
     let finest_cells_per_axis = config.base_resolution * (1 << config.max_depth);
-    let cell_size = (bounds_max_f64.0 - bounds_min_f64.0) / finest_cells_per_axis as f64;
+    let cell_size = (
+        (bounds_max_f64.0 - bounds_min_f64.0) / finest_cells_per_axis as f64,
+        (bounds_max_f64.1 - bounds_min_f64.1) / finest_cells_per_axis as f64,
+        (bounds_max_f64.2 - bounds_min_f64.2) / finest_cells_per_axis as f64,
+    );
 
     // Stage 1: Coarse grid discovery
     let stage1_start = Instant::now();
@@ -2506,9 +2513,13 @@ mod tests {
         let bounds_min = (-2.0, -2.0, -2.0);
         let bounds_max = (2.0, 2.0, 2.0);
 
-        // Calculate cell size at finest level
+        // Calculate cell size at finest level (per-axis)
         let finest_cells = config.base_resolution * (1 << config.max_depth);
-        let cell_size = (bounds_max.0 - bounds_min.0) / finest_cells as f64;
+        let cell_size = (
+            (bounds_max.0 - bounds_min.0) / finest_cells as f64,
+            (bounds_max.1 - bounds_min.1) / finest_cells as f64,
+            (bounds_max.2 - bounds_min.2) / finest_cells as f64,
+        );
 
         let initial_queue = stage1_coarse_discovery(
             &sphere_sampler,
@@ -2659,7 +2670,7 @@ mod tests {
 
         let stats = SamplingStats::default();
         let bounds_min = (0.0, 0.0, 0.0);
-        let cell_size = 0.5; // Finest cell size (at max_depth=1, parent spans 2 finest cells)
+        let cell_size = (0.5, 0.5, 0.5); // Finest cell size (at max_depth=1, parent spans 2 finest cells)
         let max_depth = 1;
 
         let mixed_children = subdivide_and_filter_mixed(
@@ -2725,7 +2736,11 @@ mod tests {
         let bounds_min = (-1.5, -1.5, -1.5);
         let bounds_max = (1.5, 1.5, 1.5);
         let finest_cells = config.base_resolution * (1 << config.max_depth);
-        let cell_size = (bounds_max.0 - bounds_min.0) / finest_cells as f64;
+        let cell_size = (
+            (bounds_max.0 - bounds_min.0) / finest_cells as f64,
+            (bounds_max.1 - bounds_min.1) / finest_cells as f64,
+            (bounds_max.2 - bounds_min.2) / finest_cells as f64,
+        );
 
         let stats1 = SamplingStats::default();
         let initial_queue1 = stage1_coarse_discovery(
@@ -2782,7 +2797,11 @@ mod tests {
         let bounds_min = (-1.0, -1.0, -1.0);
         let bounds_max = (1.0, 1.0, 1.0);
         let finest_cells = config.base_resolution * (1 << config.max_depth);
-        let cell_size = (bounds_max.0 - bounds_min.0) / finest_cells as f64;
+        let cell_size = (
+            (bounds_max.0 - bounds_min.0) / finest_cells as f64,
+            (bounds_max.1 - bounds_min.1) / finest_cells as f64,
+            (bounds_max.2 - bounds_min.2) / finest_cells as f64,
+        );
 
         let initial_queue = stage1_coarse_discovery(
             &empty_sampler,
@@ -2811,7 +2830,7 @@ mod tests {
     fn test_corner_world_position() {
         let cell = CuboidId::new(0, 0, 0, 0);
         let bounds_min = (0.0, 0.0, 0.0);
-        let cell_size = 1.0;
+        let cell_size = (1.0, 1.0, 1.0);
         let max_depth = 2;
 
         // At depth 0, max_depth 2: cell spans 4 finest-level cells
