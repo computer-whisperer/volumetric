@@ -2,6 +2,8 @@
 //!
 //! Provides a resizable buffer that grows as needed to accommodate data uploads.
 
+#![allow(dead_code)]
+
 use bytemuck::{Pod, Zeroable};
 use std::marker::PhantomData;
 use wgpu::util::DeviceExt;

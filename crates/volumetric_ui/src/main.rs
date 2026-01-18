@@ -24,9 +24,7 @@ use wasm_bindgen::JsCast;
 #[cfg(target_arch = "wasm32")]
 use poll_promise::Promise;
 
-mod marching_cubes_wgpu;
 mod platform;
-mod point_cloud_wgpu;
 mod renderer;
 
 // =============================================================================
@@ -80,12 +78,6 @@ enum BackgroundTask {
 #[derive(Clone)]
 struct ResampleConfig {
     resolution: usize,
-    // ASN v1
-    adaptive_base_resolution: usize,
-    adaptive_max_depth: usize,
-    adaptive_edge_refinement_iterations: usize,
-    adaptive_vertex_relaxation_iterations: usize,
-    adaptive_hq_normals: bool,
     // ASN v2
     asn2_base_resolution: usize,
     asn2_max_depth: usize,
@@ -118,7 +110,7 @@ struct ResampleResult {
     bounds_max: (f32, f32, f32),
     points: Arc<Vec<(f32, f32, f32)>>,
     triangles: Vec<Triangle>,
-    mesh_vertices: Arc<Vec<marching_cubes_wgpu::MeshVertex>>,
+    mesh_vertices: Arc<Vec<renderer::MeshVertex>>,
     mesh_indices: Option<Arc<Vec<u32>>>,
     sample_time: f32,
     sample_count: usize,
@@ -319,74 +311,19 @@ fn execute_resample(
                         tris.iter()
                             .flat_map(|t| {
                                 [
-                                    marching_cubes_wgpu::MeshVertex {
+                                    renderer::MeshVertex {
                                         position: t.vertices[0].into(),
                                         _pad0: 0.0,
                                         normal: t.normals[0].into(),
                                         _pad1: 0.0,
                                     },
-                                    marching_cubes_wgpu::MeshVertex {
+                                    renderer::MeshVertex {
                                         position: t.vertices[1].into(),
                                         _pad0: 0.0,
                                         normal: t.normals[1].into(),
                                         _pad1: 0.0,
                                     },
-                                    marching_cubes_wgpu::MeshVertex {
-                                        position: t.vertices[2].into(),
-                                        _pad0: 0.0,
-                                        normal: t.normals[2].into(),
-                                        _pad1: 0.0,
-                                    },
-                                ]
-                            })
-                            .collect(),
-                    );
-                    result.triangles = tris;
-                }
-                Err(e) => {
-                    result.error = Some(format_anyhow_error_chain(&e));
-                }
-            }
-        }
-        ExportRenderMode::AdaptiveSurfaceNets => {
-            let normal_mode = if config.adaptive_hq_normals {
-                adaptive_surface_nets::NormalMode::HqBisection {
-                    eps_frac: 0.1,
-                    bracket_frac: 1.0,
-                    iterations: 8,
-                }
-            } else {
-                adaptive_surface_nets::NormalMode::Mesh
-            };
-            let asn_config = adaptive_surface_nets::AdaptiveMeshConfig {
-                base_resolution: config.adaptive_base_resolution,
-                max_refinement_depth: config.adaptive_max_depth,
-                edge_refinement_iterations: config.adaptive_edge_refinement_iterations,
-                vertex_relaxation_iterations: config.adaptive_vertex_relaxation_iterations,
-                normal_mode,
-            };
-            match generate_adaptive_mesh_from_bytes(&wasm_bytes, &asn_config) {
-                Ok((tris, bounds_min, bounds_max)) => {
-                    result.bounds_min = bounds_min;
-                    result.bounds_max = bounds_max;
-                    result.sample_count = tris.len();
-                    result.mesh_vertices = Arc::new(
-                        tris.iter()
-                            .flat_map(|t| {
-                                [
-                                    marching_cubes_wgpu::MeshVertex {
-                                        position: t.vertices[0].into(),
-                                        _pad0: 0.0,
-                                        normal: t.normals[0].into(),
-                                        _pad1: 0.0,
-                                    },
-                                    marching_cubes_wgpu::MeshVertex {
-                                        position: t.vertices[1].into(),
-                                        _pad0: 0.0,
-                                        normal: t.normals[1].into(),
-                                        _pad1: 0.0,
-                                    },
-                                    marching_cubes_wgpu::MeshVertex {
+                                    renderer::MeshVertex {
                                         position: t.vertices[2].into(),
                                         _pad0: 0.0,
                                         normal: t.normals[2].into(),
@@ -420,11 +357,11 @@ fn execute_resample(
                     result.asn2_stats = Some(meshing_result.stats);
 
                     // Build indexed mesh data
-                    let vertices: Vec<marching_cubes_wgpu::MeshVertex> = meshing_result
+                    let vertices: Vec<renderer::MeshVertex> = meshing_result
                         .vertices
                         .iter()
                         .zip(meshing_result.normals.iter())
-                        .map(|(pos, norm)| marching_cubes_wgpu::MeshVertex {
+                        .map(|(pos, norm)| renderer::MeshVertex {
                             position: (*pos).into(),
                             _pad0: 0.0,
                             normal: (*norm).into(),
@@ -502,19 +439,19 @@ fn execute_resample(
                         tris.iter()
                             .flat_map(|t| {
                                 [
-                                    marching_cubes_wgpu::MeshVertex {
+                                    renderer::MeshVertex {
                                         position: t.vertices[0].into(),
                                         _pad0: 0.0,
                                         normal: t.normals[0].into(),
                                         _pad1: 0.0,
                                     },
-                                    marching_cubes_wgpu::MeshVertex {
+                                    renderer::MeshVertex {
                                         position: t.vertices[1].into(),
                                         _pad0: 0.0,
                                         normal: t.normals[1].into(),
                                         _pad1: 0.0,
                                     },
-                                    marching_cubes_wgpu::MeshVertex {
+                                    renderer::MeshVertex {
                                         position: t.vertices[2].into(),
                                         _pad0: 0.0,
                                         normal: t.normals[2].into(),
@@ -528,46 +465,6 @@ fn execute_resample(
                 }
                 Err(e) => {
                     result.error = Some(format!("{}", e));
-                }
-            }
-        }
-        ExportRenderMode::AdaptiveSurfaceNets => {
-            // ASN v1 uses native-only parallel sampler features, fall back to marching cubes
-            match generate_marching_cubes_mesh_from_bytes(&wasm_bytes, config.resolution) {
-                Ok((tris, bounds_min, bounds_max)) => {
-                    result.bounds_min = bounds_min;
-                    result.bounds_max = bounds_max;
-                    result.sample_count = tris.len();
-                    result.mesh_vertices = Arc::new(
-                        tris.iter()
-                            .flat_map(|t| {
-                                [
-                                    marching_cubes_wgpu::MeshVertex {
-                                        position: t.vertices[0].into(),
-                                        _pad0: 0.0,
-                                        normal: t.normals[0].into(),
-                                        _pad1: 0.0,
-                                    },
-                                    marching_cubes_wgpu::MeshVertex {
-                                        position: t.vertices[1].into(),
-                                        _pad0: 0.0,
-                                        normal: t.normals[1].into(),
-                                        _pad1: 0.0,
-                                    },
-                                    marching_cubes_wgpu::MeshVertex {
-                                        position: t.vertices[2].into(),
-                                        _pad0: 0.0,
-                                        normal: t.normals[2].into(),
-                                        _pad1: 0.0,
-                                    },
-                                ]
-                            })
-                            .collect(),
-                    );
-                    result.triangles = tris;
-                }
-                Err(e) => {
-                    result.error = Some(format!("ASN v1 not available on web, marching cubes fallback failed: {}", e));
                 }
             }
         }
@@ -588,11 +485,11 @@ fn execute_resample(
                     result.asn2_stats = Some(meshing_result.stats);
 
                     // Build indexed mesh data
-                    let vertices: Vec<marching_cubes_wgpu::MeshVertex> = meshing_result
+                    let vertices: Vec<renderer::MeshVertex> = meshing_result
                         .vertices
                         .iter()
                         .zip(meshing_result.normals.iter())
-                        .map(|(pos, norm)| marching_cubes_wgpu::MeshVertex {
+                        .map(|(pos, norm)| renderer::MeshVertex {
                             position: (*pos).into(),
                             _pad0: 0.0,
                             normal: (*norm).into(),
@@ -627,8 +524,8 @@ struct InProgressOperation {
 
 // Project system - common types
 use volumetric::{
-    adaptive_surface_nets, adaptive_surface_nets_2, AssetType, Environment, ExecuteWasmEntry,
-    ExecuteWasmInput, ExecuteWasmOutput, LoadedAsset, OperatorMetadata, OperatorMetadataInput,
+    adaptive_surface_nets_2, AssetType, Environment, ExecuteWasmEntry, ExecuteWasmInput,
+    ExecuteWasmOutput, LoadedAsset, OperatorMetadata, OperatorMetadataInput,
     OperatorMetadataOutput, Project, ProjectEntry, Triangle,
 };
 
@@ -637,9 +534,7 @@ use volumetric::{generate_marching_cubes_mesh_from_bytes, generate_adaptive_mesh
 
 // Native-only: Advanced WASM execution functions (require wasmtime directly)
 #[cfg(not(target_arch = "wasm32"))]
-use volumetric::{
-    generate_adaptive_mesh_from_bytes, stl,
-};
+use volumetric::stl;
 
 enum ConfigFieldType {
     Bool,
@@ -813,7 +708,6 @@ enum ExportRenderMode {
     None,
     PointCloud,
     MarchingCubes,
-    AdaptiveSurfaceNets,
     AdaptiveSurfaceNets2,
 }
 
@@ -823,7 +717,6 @@ impl ExportRenderMode {
             ExportRenderMode::None => "None",
             ExportRenderMode::PointCloud => "Point Cloud",
             ExportRenderMode::MarchingCubes => "Marching Cubes",
-            ExportRenderMode::AdaptiveSurfaceNets => "Adaptive Surface Nets",
             ExportRenderMode::AdaptiveSurfaceNets2 => "ASN v2 (Indexed)",
         }
     }
@@ -844,10 +737,10 @@ struct AssetRenderData {
     bounds_max: (f32, f32, f32),
     /// Point cloud data (for PointCloud mode)
     points: Arc<Vec<(f32, f32, f32)>>,
-    /// Triangle data (for MarchingCubes and AdaptiveSurfaceNets modes)
+    /// Triangle data (for MarchingCubes mode)
     triangles: Vec<Triangle>,
     /// Mesh vertices (for non-indexed mesh modes)
-    mesh_vertices: Arc<Vec<marching_cubes_wgpu::MeshVertex>>,
+    mesh_vertices: Arc<Vec<renderer::MeshVertex>>,
     /// Index buffer (for indexed mesh modes like ASN2)
     mesh_indices: Option<Arc<Vec<u32>>>,
     /// Whether this asset needs resampling
@@ -865,17 +758,6 @@ struct AssetRenderData {
     resolution: usize,
     /// Whether to automatically resample when parameters change
     auto_resample: bool,
-
-    /// Adaptive Surface Nets v1: base resolution (cells per axis for initial discovery)
-    adaptive_base_resolution: usize,
-    /// Adaptive Surface Nets v1: maximum refinement depth
-    adaptive_max_depth: usize,
-    /// Adaptive Surface Nets v1: binary search iterations for edge crossing refinement (0 = disabled)
-    adaptive_edge_refinement_iterations: usize,
-    /// Adaptive Surface Nets v1: vertex relaxation iterations to project vertices onto surface (0 = disabled)
-    adaptive_vertex_relaxation_iterations: usize,
-    /// Adaptive Surface Nets v1: enable high-quality (bisection-based) normals.
-    adaptive_hq_normals: bool,
 
     /// Adaptive Surface Nets v2: base resolution (cells per axis for initial discovery)
     asn2_base_resolution: usize,
@@ -909,12 +791,6 @@ impl AssetRenderData {
             last_error: None,
             resolution: 20,
             auto_resample: true,
-            // ASN v1 config
-            adaptive_base_resolution: 8,
-            adaptive_max_depth: 4,
-            adaptive_edge_refinement_iterations: 4,
-            adaptive_vertex_relaxation_iterations: 2,
-            adaptive_hq_normals: false,
             // ASN v2 config
             asn2_base_resolution: 8,
             asn2_max_depth: 4,
@@ -1403,11 +1279,6 @@ impl VolumetricApp {
 
             let config = ResampleConfig {
                 resolution: render_data.resolution,
-                adaptive_base_resolution: render_data.adaptive_base_resolution,
-                adaptive_max_depth: render_data.adaptive_max_depth,
-                adaptive_edge_refinement_iterations: render_data.adaptive_edge_refinement_iterations,
-                adaptive_vertex_relaxation_iterations: render_data.adaptive_vertex_relaxation_iterations,
-                adaptive_hq_normals: render_data.adaptive_hq_normals,
                 asn2_base_resolution: render_data.asn2_base_resolution,
                 asn2_max_depth: render_data.asn2_max_depth,
                 asn2_vertex_refinement_iterations: render_data.asn2_vertex_refinement_iterations,
@@ -1469,6 +1340,7 @@ impl VolumetricApp {
         self.asset_render_data.values().any(|d| d.needs_resample)
     }
 
+    #[allow(dead_code)]
     fn camera_position(&self) -> (f32, f32, f32) {
         let x = self.camera_radius * self.camera_phi.sin() * self.camera_theta.cos();
         let y = self.camera_radius * self.camera_phi.cos();
@@ -1476,6 +1348,7 @@ impl VolumetricApp {
         (x, y, z)
     }
 
+    #[allow(dead_code)]
     fn project_point(&self, point: (f32, f32, f32), rect: &egui::Rect) -> Option<egui::Pos2> {
         let (cx, cy, cz) = self.camera_position();
         
@@ -2929,11 +2802,6 @@ impl eframe::App for VolumetricApp {
                                             );
                                             ui.selectable_value(
                                                 &mut mode,
-                                                ExportRenderMode::AdaptiveSurfaceNets,
-                                                ExportRenderMode::AdaptiveSurfaceNets.label(),
-                                            );
-                                            ui.selectable_value(
-                                                &mut mode,
                                                 ExportRenderMode::AdaptiveSurfaceNets2,
                                                 ExportRenderMode::AdaptiveSurfaceNets2.label(),
                                             );
@@ -2954,82 +2822,6 @@ impl eframe::App for VolumetricApp {
                                             ui.label("Resolution:");
                                             if ui.add(egui::Slider::new(&mut resolution, 5..=300)).changed() {
                                                 render_data.resolution = resolution;
-                                                if auto_resample {
-                                                    render_data.needs_resample = true;
-                                                }
-                                            }
-                                        });
-                                        
-                                        ui.horizontal(|ui| {
-                                            if ui.checkbox(&mut auto_resample, "Auto Resample").changed() {
-                                                render_data.auto_resample = auto_resample;
-                                            }
-                                            if !auto_resample {
-                                                if ui.button("⟳ Resample").clicked() {
-                                                    render_data.needs_resample = true;
-                                                }
-                                            }
-                                        });
-                                    }
-                                }
-
-                                // Show adaptive config options when AdaptiveSurfaceNets is selected
-                                if current_mode == ExportRenderMode::AdaptiveSurfaceNets {
-                                    if let Some(render_data) = self.asset_render_data.get_mut(&asset_id) {
-                                        let mut base_res = render_data.adaptive_base_resolution;
-                                        let mut max_depth = render_data.adaptive_max_depth;
-                                        let mut auto_resample = render_data.auto_resample;
-                                        let mut hq_normals = render_data.adaptive_hq_normals;
-                                        
-                                        ui.horizontal(|ui| {
-                                            ui.label("Base Resolution:");
-                                            if ui.add(egui::DragValue::new(&mut base_res).range(2..=32)).changed() {
-                                                render_data.adaptive_base_resolution = base_res;
-                                                if auto_resample {
-                                                    render_data.needs_resample = true;
-                                                }
-                                            }
-                                        });
-                                        
-                                        ui.horizontal(|ui| {
-                                            ui.label("Max Depth:");
-                                            if ui.add(egui::DragValue::new(&mut max_depth).range(0..=6)).changed() {
-                                                render_data.adaptive_max_depth = max_depth;
-                                                if auto_resample {
-                                                    render_data.needs_resample = true;
-                                                }
-                                            }
-                                        });
-                                        
-                                        let effective_res = base_res * (1 << max_depth);
-                                        ui.weak(format!("Effective resolution: {}³", effective_res));
-                                        
-                                        let mut edge_refine = render_data.adaptive_edge_refinement_iterations;
-                                        let mut vertex_relax = render_data.adaptive_vertex_relaxation_iterations;
-                                        
-                                        ui.horizontal(|ui| {
-                                            ui.label("Edge Refinement:");
-                                            if ui.add(egui::DragValue::new(&mut edge_refine).range(0..=8)).changed() {
-                                                render_data.adaptive_edge_refinement_iterations = edge_refine;
-                                                if auto_resample {
-                                                    render_data.needs_resample = true;
-                                                }
-                                            }
-                                        });
-                                        
-                                        ui.horizontal(|ui| {
-                                            ui.label("Vertex Relaxation:");
-                                            if ui.add(egui::DragValue::new(&mut vertex_relax).range(0..=8)).changed() {
-                                                render_data.adaptive_vertex_relaxation_iterations = vertex_relax;
-                                                if auto_resample {
-                                                    render_data.needs_resample = true;
-                                                }
-                                            }
-                                        });
-
-                                        ui.horizontal(|ui| {
-                                            if ui.checkbox(&mut hq_normals, "HQ Normals").changed() {
-                                                render_data.adaptive_hq_normals = hq_normals;
                                                 if auto_resample {
                                                     render_data.needs_resample = true;
                                                 }
@@ -3408,7 +3200,6 @@ impl eframe::App for VolumetricApp {
             for asset_data in self.asset_render_data.values() {
                 if matches!(asset_data.mode,
                     ExportRenderMode::MarchingCubes |
-                    ExportRenderMode::AdaptiveSurfaceNets |
                     ExportRenderMode::AdaptiveSurfaceNets2
                 ) && !asset_data.mesh_vertices.is_empty() {
                     scene.add_mesh(
@@ -3468,7 +3259,6 @@ impl eframe::App for VolumetricApp {
             let total_triangles: usize = self.asset_render_data.values()
                 .filter(|d| matches!(d.mode,
                     ExportRenderMode::MarchingCubes |
-                    ExportRenderMode::AdaptiveSurfaceNets |
                     ExportRenderMode::AdaptiveSurfaceNets2))
                 .map(|d| {
                     // For ASN2, count triangles from indices
@@ -3508,7 +3298,8 @@ impl eframe::App for VolumetricApp {
     }
 }
 
-fn triangles_to_mesh_vertices(triangles: &[Triangle]) -> Vec<marching_cubes_wgpu::MeshVertex> {
+#[allow(dead_code)]
+fn triangles_to_mesh_vertices(triangles: &[Triangle]) -> Vec<renderer::MeshVertex> {
     let mut out = Vec::with_capacity(triangles.len() * 3);
 
     for tri in triangles {
@@ -3550,7 +3341,7 @@ fn triangles_to_mesh_vertices(triangles: &[Triangle]) -> Vec<marching_cubes_wgpu
                 [n.0, n.1, n.2]
             };
 
-            out.push(marching_cubes_wgpu::MeshVertex {
+            out.push(renderer::MeshVertex {
                 position: [v.0, v.1, v.2],
                 _pad0: 0.0,
                 normal,

@@ -157,7 +157,6 @@ pub fn operator_metadata_from_wasm_bytes(wasm_bin: &[u8]) -> Result<OperatorMeta
 
 pub mod stl;
 pub mod marching_cubes_cpu;
-pub mod adaptive_surface_nets;
 pub mod adaptive_surface_nets_2;
 
 /// Sample points from the WASM volumetric model
@@ -225,24 +224,6 @@ pub fn generate_marching_cubes_mesh_from_bytes(wasm_bytes: &[u8], resolution: us
         let d = executor.borrow_mut().is_inside(p.0 as f64, p.1 as f64, p.2 as f64)?;
         Ok(d)
     })?;
-
-    Ok((triangles, bounds_min, bounds_max))
-}
-
-/// Generate an adaptive mesh from WASM bytes
-#[cfg(feature = "native")]
-pub fn generate_adaptive_mesh_from_bytes(wasm_bytes: &[u8], config: &adaptive_surface_nets::AdaptiveMeshConfig) -> anyhow::Result<(Vec<Triangle>, (f32, f32, f32), (f32, f32, f32))> {
-    use wasm::ParallelModelSampler;
-
-    let sampler = wasm::create_parallel_sampler(wasm_bytes)
-        .context("Failed to create parallel sampler")?;
-
-    let bounds = sampler.get_bounds()?;
-    let (bounds_min, bounds_max) = bounds.as_f32();
-
-    // Note: adaptive_surface_nets_mesh creates its own internal sampler from wasm_bytes
-    // This will be refactored in Phase 3 to accept a sampler trait
-    let triangles = adaptive_surface_nets::adaptive_surface_nets_mesh(wasm_bytes, bounds_min, bounds_max, config)?;
 
     Ok((triangles, bounds_min, bounds_max))
 }

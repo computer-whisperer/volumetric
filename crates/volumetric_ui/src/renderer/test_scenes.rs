@@ -2,6 +2,8 @@
 //!
 //! Provides sample geometry for verifying the renderer works correctly.
 
+#![allow(dead_code)]
+
 use super::{
     Camera, DepthMode, LineData, LineSegment, LineStyle, MaterialId, MeshData, MeshVertex,
     PointData, PointInstance, PointShape, PointStyle, RenderSettings, SceneData, WidthMode,
@@ -15,35 +17,35 @@ pub fn create_test_cube(size: f32) -> MeshData {
     // Cube vertices with normals
     let vertices = vec![
         // Front face (+Z)
-        MeshVertex { position: [-h, -h, h], normal: [0.0, 0.0, 1.0] },
-        MeshVertex { position: [h, -h, h], normal: [0.0, 0.0, 1.0] },
-        MeshVertex { position: [h, h, h], normal: [0.0, 0.0, 1.0] },
-        MeshVertex { position: [-h, h, h], normal: [0.0, 0.0, 1.0] },
+        MeshVertex::new([-h, -h, h], [0.0, 0.0, 1.0]),
+        MeshVertex::new([h, -h, h], [0.0, 0.0, 1.0]),
+        MeshVertex::new([h, h, h], [0.0, 0.0, 1.0]),
+        MeshVertex::new([-h, h, h], [0.0, 0.0, 1.0]),
         // Back face (-Z)
-        MeshVertex { position: [h, -h, -h], normal: [0.0, 0.0, -1.0] },
-        MeshVertex { position: [-h, -h, -h], normal: [0.0, 0.0, -1.0] },
-        MeshVertex { position: [-h, h, -h], normal: [0.0, 0.0, -1.0] },
-        MeshVertex { position: [h, h, -h], normal: [0.0, 0.0, -1.0] },
+        MeshVertex::new([h, -h, -h], [0.0, 0.0, -1.0]),
+        MeshVertex::new([-h, -h, -h], [0.0, 0.0, -1.0]),
+        MeshVertex::new([-h, h, -h], [0.0, 0.0, -1.0]),
+        MeshVertex::new([h, h, -h], [0.0, 0.0, -1.0]),
         // Top face (+Y)
-        MeshVertex { position: [-h, h, h], normal: [0.0, 1.0, 0.0] },
-        MeshVertex { position: [h, h, h], normal: [0.0, 1.0, 0.0] },
-        MeshVertex { position: [h, h, -h], normal: [0.0, 1.0, 0.0] },
-        MeshVertex { position: [-h, h, -h], normal: [0.0, 1.0, 0.0] },
+        MeshVertex::new([-h, h, h], [0.0, 1.0, 0.0]),
+        MeshVertex::new([h, h, h], [0.0, 1.0, 0.0]),
+        MeshVertex::new([h, h, -h], [0.0, 1.0, 0.0]),
+        MeshVertex::new([-h, h, -h], [0.0, 1.0, 0.0]),
         // Bottom face (-Y)
-        MeshVertex { position: [-h, -h, -h], normal: [0.0, -1.0, 0.0] },
-        MeshVertex { position: [h, -h, -h], normal: [0.0, -1.0, 0.0] },
-        MeshVertex { position: [h, -h, h], normal: [0.0, -1.0, 0.0] },
-        MeshVertex { position: [-h, -h, h], normal: [0.0, -1.0, 0.0] },
+        MeshVertex::new([-h, -h, -h], [0.0, -1.0, 0.0]),
+        MeshVertex::new([h, -h, -h], [0.0, -1.0, 0.0]),
+        MeshVertex::new([h, -h, h], [0.0, -1.0, 0.0]),
+        MeshVertex::new([-h, -h, h], [0.0, -1.0, 0.0]),
         // Right face (+X)
-        MeshVertex { position: [h, -h, h], normal: [1.0, 0.0, 0.0] },
-        MeshVertex { position: [h, -h, -h], normal: [1.0, 0.0, 0.0] },
-        MeshVertex { position: [h, h, -h], normal: [1.0, 0.0, 0.0] },
-        MeshVertex { position: [h, h, h], normal: [1.0, 0.0, 0.0] },
+        MeshVertex::new([h, -h, h], [1.0, 0.0, 0.0]),
+        MeshVertex::new([h, -h, -h], [1.0, 0.0, 0.0]),
+        MeshVertex::new([h, h, -h], [1.0, 0.0, 0.0]),
+        MeshVertex::new([h, h, h], [1.0, 0.0, 0.0]),
         // Left face (-X)
-        MeshVertex { position: [-h, -h, -h], normal: [-1.0, 0.0, 0.0] },
-        MeshVertex { position: [-h, -h, h], normal: [-1.0, 0.0, 0.0] },
-        MeshVertex { position: [-h, h, h], normal: [-1.0, 0.0, 0.0] },
-        MeshVertex { position: [-h, h, -h], normal: [-1.0, 0.0, 0.0] },
+        MeshVertex::new([-h, -h, -h], [-1.0, 0.0, 0.0]),
+        MeshVertex::new([-h, -h, h], [-1.0, 0.0, 0.0]),
+        MeshVertex::new([-h, h, h], [-1.0, 0.0, 0.0]),
+        MeshVertex::new([-h, h, -h], [-1.0, 0.0, 0.0]),
     ];
 
     let indices = vec![

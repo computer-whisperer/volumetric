@@ -2,6 +2,8 @@
 //!
 //! Defines render primitives (mesh, line, point data) and their associated styles.
 
+#![allow(dead_code)]
+
 use bytemuck::{Pod, Zeroable};
 
 // ============================================================================
@@ -16,11 +18,26 @@ pub struct MeshData {
 }
 
 /// A single mesh vertex with position and normal.
+/// Padded for GPU alignment (32 bytes total).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct MeshVertex {
     pub position: [f32; 3],
+    pub _pad0: f32,
     pub normal: [f32; 3],
+    pub _pad1: f32,
+}
+
+impl MeshVertex {
+    /// Create a new mesh vertex with the given position and normal.
+    pub fn new(position: [f32; 3], normal: [f32; 3]) -> Self {
+        Self {
+            position,
+            _pad0: 0.0,
+            normal,
+            _pad1: 0.0,
+        }
+    }
 }
 
 /// Material identifier for meshes.

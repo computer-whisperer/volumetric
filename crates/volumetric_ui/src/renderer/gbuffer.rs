@@ -5,6 +5,8 @@
 //! - Normal: World-space normals encoded to [0,1]
 //! - Depth: Linear depth for SSAO sampling
 
+#![allow(dead_code)]
+
 /// G-buffer textures for deferred rendering.
 pub struct GBuffer {
     pub color_texture: wgpu::Texture,

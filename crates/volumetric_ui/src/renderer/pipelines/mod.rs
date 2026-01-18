@@ -7,6 +7,8 @@
 //! - Line rendering
 //! - Point rendering
 
+#![allow(dead_code)]
+
 mod composite;
 mod line;
 mod mesh;
@@ -14,7 +16,7 @@ mod point;
 mod ssao;
 
 pub use composite::CompositePipeline;
-pub use line::{LinePipeline, LineUniforms};
+pub use line::LinePipeline;
 pub use mesh::{MeshPipeline, MeshUniforms};
-pub use point::{GpuPointInstance, PointPipeline, PointUniforms};
+pub use point::PointPipeline;
 pub use ssao::{SsaoPipeline, SsaoUniforms};

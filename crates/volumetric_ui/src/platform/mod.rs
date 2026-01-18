@@ -3,16 +3,15 @@
 //! This module provides abstractions for:
 //! - Background task execution
 //! - File I/O operations (open/save dialogs, file downloads)
+//!
+//! Note: This module is currently unused scaffolding - main.rs has its own implementations.
+
+#![allow(dead_code)]
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native;
 #[cfg(target_arch = "wasm32")]
 mod web;
-
-#[cfg(not(target_arch = "wasm32"))]
-pub use native::*;
-#[cfg(target_arch = "wasm32")]
-pub use web::*;
 
 /// Result type alias for file operations
 pub type FileResult<T> = Result<T, FileError>;

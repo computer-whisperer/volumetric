@@ -118,7 +118,7 @@ fn transform_wasm(input_bytes: &[u8], cfg: ScaleConfig) -> Result<Vec<u8>, Strin
     // Bounds (f64): new min = min(s*min, s*max), new max = max(s*min, s*max)
     use walrus::ir::BinaryOp::{F64Mul, F64Min, F64Max};
     let axes = [("x", cfg.sx as f64), ("y", cfg.sy as f64), ("z", cfg.sz as f64)];
-    for (i, (axis, s)) in axes.iter().enumerate() {
+    for (i, (_axis, s)) in axes.iter().enumerate() {
         let (min_name, max_name) = match i { 0 => ("get_bounds_min_x", "get_bounds_max_x"), 1 => ("get_bounds_min_y", "get_bounds_max_y"), _ => ("get_bounds_min_z", "get_bounds_max_z") };
         if let (Some(&min_orig), Some(&max_orig)) = (renamed.get(min_name), renamed.get(max_name)) {
             // min

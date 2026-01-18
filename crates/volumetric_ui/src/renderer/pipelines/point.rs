@@ -8,8 +8,8 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
 use crate::renderer::{
-    DepthMode, PointInstance, PointShape, PointStyle, QuadVertex, StaticBuffer,
-    WidthMode, DynamicBuffer, QUAD_INDICES, QUAD_VERTICES,
+    DepthMode, DynamicBuffer, PointInstance, PointStyle, QuadVertex, StaticBuffer, WidthMode,
+    QUAD_INDICES, QUAD_VERTICES,
 };
 
 /// GPU-compatible point instance (with padding for alignment).

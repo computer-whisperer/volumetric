@@ -3,14 +3,14 @@
 //! Provides a callback that can be used with egui's paint callback system
 //! to render 3D content within an egui panel.
 
-use std::sync::{Arc, Mutex};
+#![allow(dead_code)]
 
 use eframe::egui;
 use eframe::egui_wgpu;
 
 use super::{
-    Camera, DepthMode, LineData, LineStyle, MaterialId, MeshData, PointData, PointStyle,
-    RenderSettings, Renderer,
+    Camera, LineData, LineStyle, MaterialId, MeshData, PointData, PointStyle, RenderSettings,
+    Renderer,
 };
 use glam::Mat4;
 

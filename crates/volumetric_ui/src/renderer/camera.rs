@@ -2,6 +2,8 @@
 //!
 //! Uses spherical coordinates for intuitive 3D navigation around a target point.
 
+#![allow(dead_code)]
+
 use glam::{Mat4, Vec2, Vec3};
 
 /// A camera that orbits around a target point.

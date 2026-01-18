@@ -30,6 +30,8 @@
 //! renderer.end_frame();
 //! ```
 
+#![allow(dead_code)]
+
 mod buffer;
 mod callback;
 mod camera;
@@ -41,18 +43,18 @@ mod types;
 
 pub use conversions::{convert_mesh_data, convert_points_to_point_data};
 
-pub use buffer::{DynamicBuffer, QuadVertex, StaticBuffer, UniformBuffer, QUAD_INDICES, QUAD_VERTICES};
+pub use buffer::{DynamicBuffer, QuadVertex, StaticBuffer, QUAD_INDICES, QUAD_VERTICES};
 pub use callback::{SceneCallback, SceneData, SceneDrawData};
-pub use camera::{Camera, CameraAction, CameraControlScheme, CameraInputState, CameraUniforms, ViewDirection};
+pub use camera::{Camera, CameraAction, CameraControlScheme, CameraInputState};
 pub use gbuffer::{AoTexture, GBuffer};
 pub use pipelines::{
-    CompositePipeline, GpuPointInstance, LinePipeline, LineUniforms, MeshPipeline, MeshUniforms,
-    PointPipeline, PointUniforms, SsaoPipeline, SsaoUniforms,
+    CompositePipeline, LinePipeline, MeshPipeline, MeshUniforms, PointPipeline, SsaoPipeline,
+    SsaoUniforms,
 };
 pub use types::{
-    AxisIndicator, DepthMode, GridPlanes, GridSettings, LineData, LineInstance, LinePattern,
-    LineSegment, LineStyle, MaterialId, MeshData, MeshVertex, PointData, PointInstance,
-    PointShape, PointStyle, RenderSettings, WidthMode,
+    AxisIndicator, DepthMode, GridSettings, LineData, LineInstance, LinePattern, LineSegment,
+    LineStyle, MaterialId, MeshData, MeshVertex, PointData, PointInstance, PointShape,
+    PointStyle, RenderSettings, WidthMode,
 };
 
 use glam::{Mat4, Vec3};
@@ -354,10 +356,7 @@ impl Renderer {
                 for v in &submitted.data.vertices {
                     let pos = submitted.transform.transform_point3(Vec3::from(v.position));
                     let normal = submitted.transform.transform_vector3(Vec3::from(v.normal)).normalize();
-                    all_vertices.push(MeshVertex {
-                        position: pos.into(),
-                        normal: normal.into(),
-                    });
+                    all_vertices.push(MeshVertex::new(pos.into(), normal.into()));
                 }
 
                 // Handle indices
