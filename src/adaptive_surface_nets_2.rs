@@ -613,6 +613,18 @@ pub struct SamplingStats {
     pub total_samples: AtomicU64,
     pub cuboids_processed: AtomicU64,
     pub triangles_emitted: AtomicU64,
+
+    // Vertex refinement diagnostics
+    /// Vertices refined using primary direction (accumulated normal)
+    pub refine_primary_hit: AtomicU64,
+    /// Vertices refined using fallback X direction
+    pub refine_fallback_x_hit: AtomicU64,
+    /// Vertices refined using fallback Y direction
+    pub refine_fallback_y_hit: AtomicU64,
+    /// Vertices refined using fallback Z direction
+    pub refine_fallback_z_hit: AtomicU64,
+    /// Vertices where no direction found a crossing (kept original position)
+    pub refine_miss: AtomicU64,
 }
 
 /// Per-stage timing and statistics for profiling
@@ -639,6 +651,13 @@ pub struct MeshingStats2 {
     /// Stage 4: Vertex refinement & normal estimation
     pub stage4_time_secs: f64,
     pub stage4_samples: u64,
+
+    /// Vertex refinement diagnostics
+    pub stage4_refine_primary_hit: u64,
+    pub stage4_refine_fallback_x_hit: u64,
+    pub stage4_refine_fallback_y_hit: u64,
+    pub stage4_refine_fallback_z_hit: u64,
+    pub stage4_refine_miss: u64,
 
     /// Summary statistics
     pub total_samples: u64,
@@ -677,6 +696,29 @@ impl MeshingStats2 {
             self.stage4_time_secs * 1000.0,
             self.stage4_time_secs / self.total_time_secs * 100.0);
         println!("  Samples: {}", self.stage4_samples);
+        let total_refined = self.stage4_refine_primary_hit
+            + self.stage4_refine_fallback_x_hit
+            + self.stage4_refine_fallback_y_hit
+            + self.stage4_refine_fallback_z_hit
+            + self.stage4_refine_miss;
+        if total_refined > 0 {
+            println!("  Refinement outcomes:");
+            println!("    Primary hit:    {:>8} ({:>5.1}%)",
+                self.stage4_refine_primary_hit,
+                self.stage4_refine_primary_hit as f64 / total_refined as f64 * 100.0);
+            println!("    Fallback X hit: {:>8} ({:>5.1}%)",
+                self.stage4_refine_fallback_x_hit,
+                self.stage4_refine_fallback_x_hit as f64 / total_refined as f64 * 100.0);
+            println!("    Fallback Y hit: {:>8} ({:>5.1}%)",
+                self.stage4_refine_fallback_y_hit,
+                self.stage4_refine_fallback_y_hit as f64 / total_refined as f64 * 100.0);
+            println!("    Fallback Z hit: {:>8} ({:>5.1}%)",
+                self.stage4_refine_fallback_z_hit,
+                self.stage4_refine_fallback_z_hit as f64 / total_refined as f64 * 100.0);
+            println!("    MISS (no crossing): {:>8} ({:>5.1}%)",
+                self.stage4_refine_miss,
+                self.stage4_refine_miss as f64 / total_refined as f64 * 100.0);
+        }
         println!();
         println!("Summary:");
         println!("  Total samples: {}", self.total_samples);
@@ -1496,50 +1538,20 @@ fn stage3_to_indexed_mesh(result: Stage3Result) -> IndexedMesh2 {
 // STAGE 4: VERTEX REFINEMENT & NORMAL ESTIMATION
 // =============================================================================
 
-/// Refine a single vertex position using binary search along the accumulated normal.
-///
-/// # Algorithm
-/// 1. Start at edge midpoint position
-/// 2. Use accumulated normal as search direction
-/// 3. Search ±search_distance along normal for surface crossing
-/// 4. Binary search to refine the crossing position
-///
-/// # Returns
-/// The refined position, or the original position if refinement fails.
-/// The result is clamped to stay within max_displacement of the initial position
-/// to prevent vertices from being pulled to distant surface locations at tangent edges.
-fn refine_vertex_position<F>(
+/// Try to find a surface crossing along a given direction from initial_pos.
+/// Returns Some((a, b, inside_a)) if a crossing is found, where [a, b] brackets the surface.
+/// Returns None if no crossing is found along this direction.
+fn find_crossing_along_direction<F>(
     initial_pos: (f64, f64, f64),
-    search_direction: (f64, f64, f64),
+    dir: (f64, f64, f64),
     search_distance: f64,
-    iterations: usize,
     sampler: &F,
     stats: &SamplingStats,
-) -> (f64, f64, f64)
+    initial_inside: bool,
+) -> Option<((f64, f64, f64), (f64, f64, f64), bool)>
 where
     F: Fn(f64, f64, f64) -> f32,
 {
-    // If direction is too small, can't refine - return original
-    let dir_len_sq = search_direction.0 * search_direction.0
-        + search_direction.1 * search_direction.1
-        + search_direction.2 * search_direction.2;
-
-    if dir_len_sq < 1e-12 {
-        return initial_pos;
-    }
-
-    // Normalize direction
-    let inv_len = 1.0 / dir_len_sq.sqrt();
-    let dir = (
-        search_direction.0 * inv_len,
-        search_direction.1 * inv_len,
-        search_direction.2 * inv_len,
-    );
-
-    // Sample at the initial position to determine which side we're on
-    let initial_inside = sample_is_inside(sampler, initial_pos.0, initial_pos.1, initial_pos.2, stats);
-
-    // Compute positions at +distance and -distance along normal
     let pos_plus = (
         initial_pos.0 + dir.0 * search_distance,
         initial_pos.1 + dir.1 * search_distance,
@@ -1554,24 +1566,47 @@ where
     let inside_plus = sample_is_inside(sampler, pos_plus.0, pos_plus.1, pos_plus.2, stats);
     let inside_minus = sample_is_inside(sampler, pos_minus.0, pos_minus.1, pos_minus.2, stats);
 
-    // Determine which direction has a crossing
-    // We want to find an interval [a, b] where inside(a) != inside(b)
-    let (mut a, mut b, mut inside_a) = if initial_inside != inside_plus {
+    if initial_inside != inside_plus {
         // Crossing between initial and +direction
-        (initial_pos, pos_plus, initial_inside)
+        Some((initial_pos, pos_plus, initial_inside))
     } else if initial_inside != inside_minus {
         // Crossing between initial and -direction
-        (initial_pos, pos_minus, initial_inside)
+        Some((initial_pos, pos_minus, initial_inside))
     } else if inside_plus != inside_minus {
         // Crossing between +direction and -direction (surface passed through)
-        (pos_minus, pos_plus, inside_minus)
+        Some((pos_minus, pos_plus, inside_minus))
     } else {
-        // No crossing found - surface might be tangent or far away
-        // Keep original position
-        return initial_pos;
-    };
+        None
+    }
+}
 
-    // Binary search to refine the crossing position
+/// Which direction succeeded in vertex refinement
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RefineOutcome {
+    /// Primary direction (accumulated normal) found a crossing
+    Primary,
+    /// Fallback X axis found a crossing
+    FallbackX,
+    /// Fallback Y axis found a crossing
+    FallbackY,
+    /// Fallback Z axis found a crossing
+    FallbackZ,
+    /// No direction found a crossing
+    Miss,
+}
+
+/// Perform binary search to refine a crossing and return the refined position.
+fn binary_search_crossing<F>(
+    mut a: (f64, f64, f64),
+    mut b: (f64, f64, f64),
+    mut inside_a: bool,
+    iterations: usize,
+    sampler: &F,
+    stats: &SamplingStats,
+) -> (f64, f64, f64)
+where
+    F: Fn(f64, f64, f64) -> f32,
+{
     for _ in 0..iterations {
         let mid = (
             (a.0 + b.0) * 0.5,
@@ -1589,33 +1624,106 @@ where
         }
     }
 
-    // Compute refined position (midpoint of final interval)
-    let refined = (
+    // Return midpoint of final interval
+    (
         (a.0 + b.0) * 0.5,
         (a.1 + b.1) * 0.5,
         (a.2 + b.2) * 0.5,
-    );
+    )
+}
 
-    // Clamp displacement to half the search distance to prevent vertices from
-    // being pulled to distant surface locations. This allows searching over a
-    // larger range while limiting how far vertices can actually move.
-    let max_displacement = search_distance * 0.5;
-    let dx = refined.0 - initial_pos.0;
-    let dy = refined.1 - initial_pos.1;
-    let dz = refined.2 - initial_pos.2;
-    let displacement_sq = dx * dx + dy * dy + dz * dz;
+/// Compute squared distance between two points.
+#[inline]
+fn dist_sq(p1: (f64, f64, f64), p2: (f64, f64, f64)) -> f64 {
+    let dx = p1.0 - p2.0;
+    let dy = p1.1 - p2.1;
+    let dz = p1.2 - p2.2;
+    dx * dx + dy * dy + dz * dz
+}
 
-    if displacement_sq > max_displacement * max_displacement {
-        // Clamp to max displacement
-        let scale = max_displacement / displacement_sq.sqrt();
-        (
-            initial_pos.0 + dx * scale,
-            initial_pos.1 + dy * scale,
-            initial_pos.2 + dz * scale,
-        )
-    } else {
-        refined
+/// Refine a single vertex position using binary search along multiple directions.
+///
+/// # Algorithm
+/// 1. Start at edge midpoint position
+/// 2. Try accumulated normal AND all three cardinal axes
+/// 3. For each direction that finds a crossing, refine it with binary search
+/// 4. Pick the crossing that is NEAREST to the initial position
+///
+/// # Returns
+/// A tuple of (refined_position, outcome) where outcome indicates which direction was used.
+fn refine_vertex_position<F>(
+    initial_pos: (f64, f64, f64),
+    search_direction: (f64, f64, f64),
+    search_distance: f64,
+    iterations: usize,
+    sampler: &F,
+    stats: &SamplingStats,
+) -> ((f64, f64, f64), RefineOutcome)
+where
+    F: Fn(f64, f64, f64) -> f32,
+{
+    // Sample at the initial position to determine which side we're on
+    let initial_inside = sample_is_inside(sampler, initial_pos.0, initial_pos.1, initial_pos.2, stats);
+
+    // Build list of candidate directions with their outcome labels
+    let mut candidates: Vec<((f64, f64, f64), RefineOutcome)> = Vec::with_capacity(4);
+
+    // Primary direction: accumulated normal (if valid)
+    let dir_len_sq = search_direction.0 * search_direction.0
+        + search_direction.1 * search_direction.1
+        + search_direction.2 * search_direction.2;
+
+    if dir_len_sq >= 1e-12 {
+        let inv_len = 1.0 / dir_len_sq.sqrt();
+        candidates.push((
+            (
+                search_direction.0 * inv_len,
+                search_direction.1 * inv_len,
+                search_direction.2 * inv_len,
+            ),
+            RefineOutcome::Primary,
+        ));
     }
+
+    // Cardinal axis fallbacks
+    candidates.push(((1.0, 0.0, 0.0), RefineOutcome::FallbackX));
+    candidates.push(((0.0, 1.0, 0.0), RefineOutcome::FallbackY));
+    candidates.push(((0.0, 0.0, 1.0), RefineOutcome::FallbackZ));
+
+    // Try all directions and collect crossings that succeed
+    let mut best_result: Option<((f64, f64, f64), RefineOutcome, f64)> = None; // (pos, outcome, dist_sq)
+
+    for (dir, outcome) in &candidates {
+        if let Some((a, b, inside_a)) = find_crossing_along_direction(
+            initial_pos, *dir, search_distance, sampler, stats, initial_inside,
+        ) {
+            // Refine this crossing with binary search
+            let refined = binary_search_crossing(a, b, inside_a, iterations, sampler, stats);
+            let d_sq = dist_sq(initial_pos, refined);
+
+            // Keep the nearest crossing
+            match &best_result {
+                None => {
+                    best_result = Some((refined, *outcome, d_sq));
+                }
+                Some((_, _, best_dist_sq)) if d_sq < *best_dist_sq => {
+                    best_result = Some((refined, *outcome, d_sq));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let (refined, outcome) = match best_result {
+        Some((pos, outcome, _)) => (pos, outcome),
+        None => {
+            // No crossing found in any direction - keep original position
+            return (initial_pos, RefineOutcome::Miss);
+        }
+    };
+
+    // No displacement clamping needed - we already picked the nearest crossing
+    (refined, outcome)
 }
 
 // =============================================================================
@@ -1672,6 +1780,12 @@ fn orthonormal_basis_perpendicular_to(n: (f64, f64, f64)) -> ((f64, f64, f64), (
 /// searching along the specified direction.
 ///
 /// Returns Some(surface_point) if a crossing is found, None otherwise.
+/// Find a surface point by searching along a specific direction from start_pos.
+///
+/// This function intentionally searches ONLY along the given direction, not fallbacks.
+/// For normal refinement, we need consistent search directions across all tangent probes
+/// to get a coherent plane fit. Using different directions for different probes would
+/// create inconsistent surface point sets.
 fn find_surface_point_along_direction<F>(
     start_pos: (f64, f64, f64),
     search_dir: (f64, f64, f64),
@@ -1683,58 +1797,35 @@ fn find_surface_point_along_direction<F>(
 where
     F: Fn(f64, f64, f64) -> f32,
 {
+    // Normalize direction
+    let dir_len_sq = search_dir.0 * search_dir.0
+        + search_dir.1 * search_dir.1
+        + search_dir.2 * search_dir.2;
+
+    if dir_len_sq < 1e-12 {
+        return None;
+    }
+
+    let inv_len = 1.0 / dir_len_sq.sqrt();
+    let dir = (
+        search_dir.0 * inv_len,
+        search_dir.1 * inv_len,
+        search_dir.2 * inv_len,
+    );
+
     // Sample at start position
     let start_inside = sample_is_inside(sampler, start_pos.0, start_pos.1, start_pos.2, stats);
 
-    // Sample at +distance and -distance along search direction
-    let pos_plus = (
-        start_pos.0 + search_dir.0 * search_distance,
-        start_pos.1 + search_dir.1 * search_distance,
-        start_pos.2 + search_dir.2 * search_distance,
-    );
-    let pos_minus = (
-        start_pos.0 - search_dir.0 * search_distance,
-        start_pos.1 - search_dir.1 * search_distance,
-        start_pos.2 - search_dir.2 * search_distance,
-    );
-
-    let inside_plus = sample_is_inside(sampler, pos_plus.0, pos_plus.1, pos_plus.2, stats);
-    let inside_minus = sample_is_inside(sampler, pos_minus.0, pos_minus.1, pos_minus.2, stats);
-
-    // Find an interval with a crossing
-    let (mut a, mut b, mut inside_a) = if start_inside != inside_plus {
-        (start_pos, pos_plus, start_inside)
-    } else if start_inside != inside_minus {
-        (start_pos, pos_minus, start_inside)
-    } else if inside_plus != inside_minus {
-        (pos_minus, pos_plus, inside_minus)
+    // Try to find crossing along this direction
+    if let Some((a, b, inside_a)) = find_crossing_along_direction(
+        start_pos, dir, search_distance, sampler, stats, start_inside,
+    ) {
+        // Refine with binary search
+        let refined = binary_search_crossing(a, b, inside_a, iterations, sampler, stats);
+        Some(refined)
     } else {
-        // No crossing found
-        return None;
-    };
-
-    // Binary search to refine
-    for _ in 0..iterations {
-        let mid = (
-            (a.0 + b.0) * 0.5,
-            (a.1 + b.1) * 0.5,
-            (a.2 + b.2) * 0.5,
-        );
-        let inside_mid = sample_is_inside(sampler, mid.0, mid.1, mid.2, stats);
-
-        if inside_mid == inside_a {
-            a = mid;
-            inside_a = inside_mid;
-        } else {
-            b = mid;
-        }
+        None
     }
-
-    Some((
-        (a.0 + b.0) * 0.5,
-        (a.1 + b.1) * 0.5,
-        (a.2 + b.2) * 0.5,
-    ))
 }
 
 /// Fit a plane to a set of 3D points using PCA (Principal Component Analysis).
@@ -2063,15 +2154,18 @@ where
 {
     let vertex_count = stage3.vertices.len();
 
-    // Use minimum cell size for search distance (conservative for non-cubic bounds)
+    // Use maximum cell size for search distance to handle non-cubic bounds.
+    // The search direction is the accumulated normal which can point in any direction,
+    // so we need to be able to reach the surface even along the longest axis.
+    let max_cell_size = cell_size.0.max(cell_size.1).max(cell_size.2);
     let min_cell_size = cell_size.0.min(cell_size.1).min(cell_size.2);
 
     // Search distance for vertex refinement: full cell size to handle vertices
     // that may be positioned at cell corners (up to sqrt(3)/2 ≈ 0.87 * cell_size
     // from the true surface in the worst case)
-    let search_distance = min_cell_size;
+    let search_distance = max_cell_size;
 
-    // Probe epsilon for normal refinement: how far to step in tangent directions
+    // Probe epsilon for normal refinement: use min cell size for finer probing
     let probe_epsilon = min_cell_size * config.normal_epsilon_frac as f64;
 
     // Process all vertices in parallel
@@ -2083,14 +2177,35 @@ where
 
             // Refine vertex position
             let refined_pos = if config.vertex_refinement_iterations > 0 {
-                refine_vertex_position(
+                let (pos, outcome) = refine_vertex_position(
                     initial_pos,
                     accumulated_normal,
                     search_distance,
                     config.vertex_refinement_iterations,
                     sampler,
                     stats,
-                )
+                );
+
+                // Track refinement outcome
+                match outcome {
+                    RefineOutcome::Primary => {
+                        stats.refine_primary_hit.fetch_add(1, Ordering::Relaxed);
+                    }
+                    RefineOutcome::FallbackX => {
+                        stats.refine_fallback_x_hit.fetch_add(1, Ordering::Relaxed);
+                    }
+                    RefineOutcome::FallbackY => {
+                        stats.refine_fallback_y_hit.fetch_add(1, Ordering::Relaxed);
+                    }
+                    RefineOutcome::FallbackZ => {
+                        stats.refine_fallback_z_hit.fetch_add(1, Ordering::Relaxed);
+                    }
+                    RefineOutcome::Miss => {
+                        stats.refine_miss.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+
+                pos
             } else {
                 initial_pos
             };
@@ -2252,6 +2367,11 @@ where
         stage3_unique_vertices,
         stage4_time_secs: stage4_time,
         stage4_samples,
+        stage4_refine_primary_hit: stats.refine_primary_hit.load(Ordering::Relaxed),
+        stage4_refine_fallback_x_hit: stats.refine_fallback_x_hit.load(Ordering::Relaxed),
+        stage4_refine_fallback_y_hit: stats.refine_fallback_y_hit.load(Ordering::Relaxed),
+        stage4_refine_fallback_z_hit: stats.refine_fallback_z_hit.load(Ordering::Relaxed),
+        stage4_refine_miss: stats.refine_miss.load(Ordering::Relaxed),
         total_samples,
         total_vertices: mesh.vertices.len(),
         total_triangles: mesh.indices.len() / 3,

@@ -161,6 +161,43 @@ fn print_stats_summary(stats: &MeshingStats2) {
         stats.stage4_time_secs / stats.total_time_secs * 100.0,
         stats.stage4_samples
     );
+
+    // Print refinement diagnostics if available
+    let total_refine = stats.stage4_refine_primary_hit
+        + stats.stage4_refine_fallback_x_hit
+        + stats.stage4_refine_fallback_y_hit
+        + stats.stage4_refine_fallback_z_hit
+        + stats.stage4_refine_miss;
+
+    if total_refine > 0 {
+        println!();
+        println!("Vertex refinement outcomes:");
+        println!(
+            "  Primary hit:    {:>10} ({:>5.2}%)",
+            stats.stage4_refine_primary_hit,
+            stats.stage4_refine_primary_hit as f64 / total_refine as f64 * 100.0
+        );
+        println!(
+            "  Fallback X:     {:>10} ({:>5.2}%)",
+            stats.stage4_refine_fallback_x_hit,
+            stats.stage4_refine_fallback_x_hit as f64 / total_refine as f64 * 100.0
+        );
+        println!(
+            "  Fallback Y:     {:>10} ({:>5.2}%)",
+            stats.stage4_refine_fallback_y_hit,
+            stats.stage4_refine_fallback_y_hit as f64 / total_refine as f64 * 100.0
+        );
+        println!(
+            "  Fallback Z:     {:>10} ({:>5.2}%)",
+            stats.stage4_refine_fallback_z_hit,
+            stats.stage4_refine_fallback_z_hit as f64 / total_refine as f64 * 100.0
+        );
+        println!(
+            "  MISS:           {:>10} ({:>5.2}%)",
+            stats.stage4_refine_miss,
+            stats.stage4_refine_miss as f64 / total_refine as f64 * 100.0
+        );
+    }
     println!("==========================");
 }
 
