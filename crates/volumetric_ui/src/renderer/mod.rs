@@ -43,7 +43,7 @@ pub use conversions::{convert_mesh_data, convert_points_to_point_data};
 
 pub use buffer::{DynamicBuffer, QuadVertex, StaticBuffer, UniformBuffer, QUAD_INDICES, QUAD_VERTICES};
 pub use callback::{SceneCallback, SceneData, SceneDrawData};
-pub use camera::{Camera, CameraUniforms, ViewDirection};
+pub use camera::{Camera, CameraAction, CameraControlScheme, CameraInputState, CameraUniforms, ViewDirection};
 pub use gbuffer::{AoTexture, GBuffer};
 pub use pipelines::{
     CompositePipeline, GpuPointInstance, LinePipeline, LineUniforms, MeshPipeline, MeshUniforms,

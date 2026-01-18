@@ -965,6 +965,8 @@ pub struct VolumetricApp {
     camera_theta: f32,
     camera_phi: f32,
     camera_radius: f32,
+    camera_target: glam::Vec3,
+    camera_control_scheme: renderer::CameraControlScheme,
     last_mouse_pos: Option<egui::Pos2>,
     /// Last project evaluation time (in seconds)
     last_evaluation_time: Option<f32>,
@@ -1106,6 +1108,8 @@ impl VolumetricApp {
             camera_theta: std::f32::consts::FRAC_PI_4,
             camera_phi: std::f32::consts::FRAC_PI_4,
             camera_radius: 4.0,
+            camera_target: glam::Vec3::ZERO,
+            camera_control_scheme: renderer::CameraControlScheme::default(),
             last_mouse_pos: None,
             last_evaluation_time: None,
             error_message: None,
@@ -2181,6 +2185,26 @@ impl eframe::App for VolumetricApp {
                             egui::Slider::new(&mut self.ssao_strength, 0.5..=4.0)
                                 .text("SSAO strength"),
                         );
+
+                        ui.separator();
+                        ui.label("Camera");
+                        egui::ComboBox::from_label("Control Scheme")
+                            .selected_text(self.camera_control_scheme.name())
+                            .show_ui(ui, |ui| {
+                                for &scheme in renderer::CameraControlScheme::ALL {
+                                    ui.selectable_value(
+                                        &mut self.camera_control_scheme,
+                                        scheme,
+                                        scheme.name(),
+                                    );
+                                }
+                            });
+                        if ui.button("Reset Camera").clicked() {
+                            self.camera_theta = std::f32::consts::FRAC_PI_4;
+                            self.camera_phi = std::f32::consts::FRAC_PI_4;
+                            self.camera_radius = 4.0;
+                            self.camera_target = glam::Vec3::ZERO;
+                        }
 
                         // Project file operations (native only - uses filesystem)
                         #[cfg(not(target_arch = "wasm32"))]
@@ -3277,26 +3301,79 @@ impl eframe::App for VolumetricApp {
             );
             
             let rect = response.rect;
-            
-            // Handle mouse interaction
-            if response.dragged_by(egui::PointerButton::Primary) {
-                if let Some(pos) = response.interact_pointer_pos() {
+
+            // Gather input state for camera control
+            let scroll = ui.input(|i| i.raw_scroll_delta.y);
+            let modifiers = ui.input(|i| i.modifiers);
+
+            let input_state = renderer::CameraInputState {
+                left_down: response.dragged_by(egui::PointerButton::Primary),
+                middle_down: response.dragged_by(egui::PointerButton::Middle),
+                right_down: response.dragged_by(egui::PointerButton::Secondary),
+                shift_down: modifiers.shift,
+                ctrl_down: modifiers.ctrl,
+                alt_down: modifiers.alt,
+                mouse_delta: if let Some(pos) = response.interact_pointer_pos() {
                     if let Some(last_pos) = self.last_mouse_pos {
                         let delta = pos - last_pos;
-                        self.camera_theta += delta.x * 0.01;
-                        self.camera_phi = (self.camera_phi - delta.y * 0.01)
-                            .clamp(0.1, std::f32::consts::PI - 0.1);
+                        glam::Vec2::new(delta.x, delta.y)
+                    } else {
+                        glam::Vec2::ZERO
                     }
+                } else {
+                    glam::Vec2::ZERO
+                },
+                scroll_delta: scroll,
+            };
+
+            // Update last mouse position for drag tracking
+            if response.dragged_by(egui::PointerButton::Primary)
+                || response.dragged_by(egui::PointerButton::Middle)
+                || response.dragged_by(egui::PointerButton::Secondary)
+            {
+                if let Some(pos) = response.interact_pointer_pos() {
                     self.last_mouse_pos = Some(pos);
                 }
             } else {
                 self.last_mouse_pos = None;
             }
-            
-            // Handle scroll for zoom
-            let scroll = ui.input(|i| i.raw_scroll_delta.y);
-            if scroll != 0.0 {
-                self.camera_radius = (self.camera_radius - scroll * 0.01).clamp(1.0, 20.0);
+
+            // Determine and apply camera action based on control scheme
+            let action = self.camera_control_scheme.determine_action(&input_state);
+            match action {
+                renderer::CameraAction::Orbit => {
+                    self.camera_theta -= input_state.mouse_delta.x * 0.01;
+                    self.camera_phi = (self.camera_phi - input_state.mouse_delta.y * 0.01)
+                        .clamp(0.1, std::f32::consts::PI - 0.1);
+                }
+                renderer::CameraAction::Pan => {
+                    // Create temporary camera to compute pan in view plane
+                    let temp_camera = renderer::Camera {
+                        target: self.camera_target,
+                        radius: self.camera_radius,
+                        theta: self.camera_theta,
+                        phi: self.camera_phi,
+                        fov_y: 60.0_f32.to_radians(),
+                        near: 0.1,
+                        far: 100.0,
+                    };
+                    let right = temp_camera.right();
+                    let up = temp_camera.up();
+                    let scale = self.camera_radius * 0.002;
+                    self.camera_target -= right * (input_state.mouse_delta.x * scale);
+                    self.camera_target += up * (input_state.mouse_delta.y * scale);
+                }
+                renderer::CameraAction::Zoom => {
+                    // For Maya alt+right drag, use mouse delta; otherwise use scroll
+                    let zoom_delta = if input_state.scroll_delta != 0.0 {
+                        input_state.scroll_delta * 0.01
+                    } else {
+                        // For drag zoom (Maya style), use horizontal mouse movement
+                        input_state.mouse_delta.x * 0.02
+                    };
+                    self.camera_radius = (self.camera_radius - zoom_delta).clamp(0.1, 100.0);
+                }
+                renderer::CameraAction::None => {}
             }
             
             // Draw background
@@ -3347,7 +3424,7 @@ impl eframe::App for VolumetricApp {
 
             // Create camera from existing spherical coords
             let camera = renderer::Camera {
-                target: glam::Vec3::ZERO,
+                target: self.camera_target,
                 radius: self.camera_radius,
                 theta: self.camera_theta,
                 phi: self.camera_phi,

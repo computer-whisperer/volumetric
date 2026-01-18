@@ -120,21 +120,17 @@ impl Camera {
     /// Pan the camera (translate target in the view plane).
     ///
     /// - `delta_screen`: Mouse delta in screen pixels
-    /// - `viewport_size`: Viewport dimensions in pixels
-    pub fn pan(&mut self, delta_screen: Vec2, viewport_size: Vec2) {
-        // Get camera coordinate axes
-        let view = self.view_matrix();
-
-        // Extract right and up vectors from view matrix
-        // View matrix rows are: right, up, -forward (in camera space)
-        let right = Vec3::new(view.x_axis.x, view.y_axis.x, view.z_axis.x);
-        let up = Vec3::new(view.x_axis.y, view.y_axis.y, view.z_axis.y);
+    /// - `_viewport_size`: Viewport dimensions in pixels (unused)
+    pub fn pan(&mut self, delta_screen: Vec2, _viewport_size: Vec2) {
+        // Use camera's own coordinate axes
+        let right = self.right();
+        let up = self.up();
 
         // Scale movement by distance for consistent feel at any zoom level
         // The 0.002 factor provides reasonable sensitivity
         let scale = self.radius * 0.002;
 
-        // Move target in the view plane
+        // Move target opposite to drag direction (scene follows mouse)
         self.target -= right * (delta_screen.x * scale);
         self.target += up * (delta_screen.y * scale);
     }
@@ -236,6 +232,143 @@ pub enum ViewDirection {
     Bottom,
     /// Isometric view (45 degrees)
     Isometric,
+}
+
+/// Camera control schemes matching popular 3D applications.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum CameraControlScheme {
+    /// Blender-style: Middle-drag orbits, Shift+Middle pans, Scroll zooms
+    #[default]
+    Blender,
+    /// OnShape-style: Right-drag orbits, Middle-drag pans, Scroll zooms
+    OnShape,
+    /// Fusion 360-style: Middle-drag orbits, Shift+Middle pans, Scroll zooms (same as Blender)
+    Fusion360,
+    /// SolidWorks-style: Middle-drag orbits, Ctrl+Middle pans, Scroll zooms
+    SolidWorks,
+    /// Maya-style: Alt+Left orbits, Alt+Middle pans, Alt+Right or Scroll zooms
+    Maya,
+}
+
+impl CameraControlScheme {
+    /// All available control schemes.
+    pub const ALL: &'static [CameraControlScheme] = &[
+        CameraControlScheme::Blender,
+        CameraControlScheme::OnShape,
+        CameraControlScheme::Fusion360,
+        CameraControlScheme::SolidWorks,
+        CameraControlScheme::Maya,
+    ];
+
+    /// Human-readable name for the control scheme.
+    pub fn name(&self) -> &'static str {
+        match self {
+            CameraControlScheme::Blender => "Blender",
+            CameraControlScheme::OnShape => "OnShape",
+            CameraControlScheme::Fusion360 => "Fusion 360",
+            CameraControlScheme::SolidWorks => "SolidWorks",
+            CameraControlScheme::Maya => "Maya",
+        }
+    }
+
+    /// Determine the camera action based on input state.
+    pub fn determine_action(&self, input: &CameraInputState) -> CameraAction {
+        match self {
+            CameraControlScheme::Blender | CameraControlScheme::Fusion360 => {
+                // Middle-drag orbits, Shift+Middle pans, Scroll zooms
+                if input.middle_down {
+                    if input.shift_down {
+                        CameraAction::Pan
+                    } else {
+                        CameraAction::Orbit
+                    }
+                } else if input.scroll_delta != 0.0 {
+                    CameraAction::Zoom
+                } else {
+                    CameraAction::None
+                }
+            }
+            CameraControlScheme::OnShape => {
+                // Right-drag orbits, Middle-drag pans, Scroll zooms
+                if input.right_down {
+                    CameraAction::Orbit
+                } else if input.middle_down {
+                    CameraAction::Pan
+                } else if input.scroll_delta != 0.0 {
+                    CameraAction::Zoom
+                } else {
+                    CameraAction::None
+                }
+            }
+            CameraControlScheme::SolidWorks => {
+                // Middle-drag orbits, Ctrl+Middle pans, Scroll zooms
+                if input.middle_down {
+                    if input.ctrl_down {
+                        CameraAction::Pan
+                    } else {
+                        CameraAction::Orbit
+                    }
+                } else if input.scroll_delta != 0.0 {
+                    CameraAction::Zoom
+                } else {
+                    CameraAction::None
+                }
+            }
+            CameraControlScheme::Maya => {
+                // Alt+Left orbits, Alt+Middle pans, Alt+Right or Scroll zooms
+                if input.alt_down {
+                    if input.left_down {
+                        CameraAction::Orbit
+                    } else if input.middle_down {
+                        CameraAction::Pan
+                    } else if input.right_down {
+                        CameraAction::Zoom
+                    } else {
+                        CameraAction::None
+                    }
+                } else if input.scroll_delta != 0.0 {
+                    CameraAction::Zoom
+                } else {
+                    CameraAction::None
+                }
+            }
+        }
+    }
+}
+
+/// Camera action to perform based on input.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum CameraAction {
+    /// No camera action
+    #[default]
+    None,
+    /// Orbit around the target
+    Orbit,
+    /// Pan in the view plane
+    Pan,
+    /// Zoom in/out
+    Zoom,
+}
+
+/// Input state for determining camera action.
+#[derive(Clone, Debug, Default)]
+pub struct CameraInputState {
+    /// Left mouse button is down
+    pub left_down: bool,
+    /// Middle mouse button is down
+    pub middle_down: bool,
+    /// Right mouse button is down
+    pub right_down: bool,
+    /// Shift modifier is held
+    pub shift_down: bool,
+    /// Ctrl modifier is held
+    pub ctrl_down: bool,
+    /// Alt modifier is held
+    pub alt_down: bool,
+    /// Mouse delta since last frame
+    pub mouse_delta: Vec2,
+    /// Scroll wheel delta (positive = zoom in)
+    pub scroll_delta: f32,
 }
 
 /// Camera uniform data for GPU upload.
