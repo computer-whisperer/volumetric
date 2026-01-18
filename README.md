@@ -21,8 +21,13 @@ The system is divided into three main components:
 
 ### 1. Model WASM Modules
 A Model module is a WASM artifact that exports:
-- `is_inside(x: f64, y: f64, z: f64) -> f32`: Returns a density value (current demo models output `1.0` for inside and `0.0` for outside; future models may use continuous densities).
+- `is_inside(x: f64, y: f64, z: f64) -> f32`: Returns a density value indicating whether the point is inside the model.
 - `get_bounds_min_x/y/z() -> f64` & `get_bounds_max_x/y/z() -> f64`: Defines the axis-aligned bounding box.
+
+**Important: `is_inside` is NOT a Signed Distance Function (SDF).** Current demo models return binary values (`1.0` for inside, `0.0` for outside). Future models may use continuous densities for effects like soft blending, but the return value represents *occupancy/density*, not distance to the surface. This means:
+- You cannot compute surface normals via gradient (central differences yield zero almost everywhere)
+- The meshing algorithm uses binary classification and edge-crossing detection, not gradient descent
+- Vertex refinement uses binary search along candidate directions, not gradient-based optimization
 
 ### 2. Operator WASM Modules
 Operators are the "compilers" of the volumetric world. They take existing models or configurations as input and produce a new Model WASM as output. 
@@ -85,8 +90,8 @@ cargo run -p volumetric_cli --release -- --input <file> --output <output.stl>
 **Options:**
 - `--base-resolution <n>` - Coarse grid resolution (default: 8)
 - `--max-depth <n>` - Refinement depth (default: 4). Effective resolution = base × 2^depth
-- `--vertex-refinement <n>` - Vertex position refinement iterations (default: 8)
-- `--normal-refinement <n>` - Normal estimation iterations (default: 4, use 0 to disable)
+- `--vertex-refinement <n>` - Vertex position refinement iterations (default: 12)
+- `--normal-refinement <n>` - Normal estimation iterations (default: 12, use 0 to disable)
 - `--normal-epsilon <f>` - Normal probe distance as fraction of cell size (default: 0.1)
 - `-q, --quiet` - Suppress profiling output
 
@@ -116,7 +121,7 @@ All mesh generation algorithms in this project follow these conventions:
 ### Normals
 - All normals point **outward** from the solid (from inside toward outside)
 - Per-vertex normals are used for smooth shading
-- The `is_inside()` function returns `> 0` for inside, so the gradient of the density field points inward; normals are the negated gradient
+- Since `is_inside()` is binary (not an SDF), normals are estimated by accumulating face normals from the mesh topology, then optionally refined via tangent-plane probing
 
 ### Renderer Expectations
 - The GPU renderer uses `FrontFace::Ccw` with backface culling

@@ -1505,7 +1505,9 @@ fn stage3_to_indexed_mesh(result: Stage3Result) -> IndexedMesh2 {
 /// 4. Binary search to refine the crossing position
 ///
 /// # Returns
-/// The refined position, or the original position if refinement fails
+/// The refined position, or the original position if refinement fails.
+/// The result is clamped to stay within max_displacement of the initial position
+/// to prevent vertices from being pulled to distant surface locations at tangent edges.
 fn refine_vertex_position<F>(
     initial_pos: (f64, f64, f64),
     search_direction: (f64, f64, f64),
@@ -1587,12 +1589,33 @@ where
         }
     }
 
-    // Return midpoint of final interval
-    (
+    // Compute refined position (midpoint of final interval)
+    let refined = (
         (a.0 + b.0) * 0.5,
         (a.1 + b.1) * 0.5,
         (a.2 + b.2) * 0.5,
-    )
+    );
+
+    // Clamp displacement to half the search distance to prevent vertices from
+    // being pulled to distant surface locations. This allows searching over a
+    // larger range while limiting how far vertices can actually move.
+    let max_displacement = search_distance * 0.5;
+    let dx = refined.0 - initial_pos.0;
+    let dy = refined.1 - initial_pos.1;
+    let dz = refined.2 - initial_pos.2;
+    let displacement_sq = dx * dx + dy * dy + dz * dz;
+
+    if displacement_sq > max_displacement * max_displacement {
+        // Clamp to max displacement
+        let scale = max_displacement / displacement_sq.sqrt();
+        (
+            initial_pos.0 + dx * scale,
+            initial_pos.1 + dy * scale,
+            initial_pos.2 + dz * scale,
+        )
+    } else {
+        refined
+    }
 }
 
 // =============================================================================
@@ -2040,9 +2063,10 @@ where
 {
     let vertex_count = stage3.vertices.len();
 
-    // Search distance for vertex refinement: a fraction of the cell size
-    // Vertices are on edges, so searching ±cell_size should be sufficient
-    let search_distance = cell_size * 0.5;
+    // Search distance for vertex refinement: full cell size to handle vertices
+    // that may be positioned at cell corners (up to sqrt(3)/2 ≈ 0.87 * cell_size
+    // from the true surface in the worst case)
+    let search_distance = cell_size;
 
     // Probe epsilon for normal refinement: how far to step in tangent directions
     let probe_epsilon = cell_size * config.normal_epsilon_frac as f64;
@@ -2952,12 +2976,13 @@ mod tests {
             ..Default::default()
         };
 
-        let mesh = adaptive_surface_nets_2(
+        let result = adaptive_surface_nets_2(
             sphere_sampler,
             (-1.5, -1.5, -1.5),
             (1.5, 1.5, 1.5),
             &config,
         );
+        let mesh = &result.mesh;
 
         // Should produce a mesh
         assert!(!mesh.vertices.is_empty(), "Should have vertices");
@@ -3006,12 +3031,13 @@ mod tests {
             ..Default::default()
         };
 
-        let mesh = adaptive_surface_nets_2(
+        let result = adaptive_surface_nets_2(
             sphere_sampler,
             (-1.5, -1.5, -1.5),
             (1.5, 1.5, 1.5),
             &config,
         );
+        let mesh = &result.mesh;
 
         // Should still produce a valid mesh
         assert!(!mesh.vertices.is_empty(), "Should have vertices");
