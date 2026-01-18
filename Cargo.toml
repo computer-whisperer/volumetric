@@ -6,6 +6,11 @@ edition = "2024"
 [lib]
 path = "src/lib.rs"
 
+[[bin]]
+name = "boolean_smoke"
+path = "src/bin/boolean_smoke.rs"
+required-features = ["native"]
+
 [workspace]
 members = [
     "crates/models/simple_sphere_model",
@@ -23,12 +28,16 @@ members = [
 ]
 
 [features]
-default = []
+default = ["native"]
+# Native WASM backend using wasmtime (desktop)
+native = ["dep:wasmtime", "dep:rayon"]
+# Web WASM backend using JavaScript bridge (future)
+web = ["dep:wasm-bindgen", "dep:js-sys"]
 # Enable normal refinement diagnostics (expensive, for benchmarking only)
 normal-diagnostic = []
 
 [dependencies]
-wasmtime = "27"
+wasmtime = { version = "27", optional = true }
 anyhow = "1"
 serde = { version="1.0.228", features = ["derive"] }
 wasmparser = "0.219"
@@ -36,5 +45,9 @@ thiserror = "2"
 ciborium = "0.2"
 log = "0.4"
 glam = "0.29"
-rayon = "1.10"
+rayon = { version = "1.10", optional = true }
 dashmap = "6"
+
+# Web backend dependencies (future)
+wasm-bindgen = { version = "0.2", optional = true }
+js-sys = { version = "0.3", optional = true }

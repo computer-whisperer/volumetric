@@ -3866,10 +3866,12 @@ dependencies = [
  "ciborium",
  "dashmap",
  "glam",
+ "js-sys",
  "log",
  "rayon",
  "serde",
  "thiserror 2.0.17",
+ "wasm-bindgen",
  "wasmparser 0.219.2",
  "wasmtime",
 ]

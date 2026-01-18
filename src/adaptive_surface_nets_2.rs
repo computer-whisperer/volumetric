@@ -190,6 +190,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use dashmap::DashSet;
+#[cfg(feature = "native")]
 use rayon::prelude::*;
 
 /// Configuration for the adaptive surface nets algorithm.
@@ -1338,6 +1339,7 @@ where
     }
 }
 
+#[cfg(feature = "native")]
 fn stage2_subdivision_and_emission<F>(
     initial_queue: Vec<WorkQueueEntry>,
     sampler: &F,
@@ -2357,6 +2359,7 @@ fn recompute_accumulated_normals(
 ///    better initial normal estimates than the original unrefined positions.
 /// 3. **Phase 4c - Normal Refinement** (optional): If normal_sample_iterations > 0,
 ///    further refine normals by probing the surface in tangent directions
+#[cfg(feature = "native")]
 fn stage4_vertex_refinement<F>(
     stage3: Stage3Result,
     sampler: &F,
@@ -2593,6 +2596,7 @@ where
 ///
 /// # Returns
 /// A MeshingResult2 containing the indexed mesh and detailed profiling statistics
+#[cfg(feature = "native")]
 pub fn adaptive_surface_nets_2<F>(
     sampler: F,
     bounds_min: (f32, f32, f32),

@@ -5,8 +5,11 @@
 //! - Adaptively refines only cells containing surface transitions
 //! - Supports multithreaded sampling with independent WASM instances
 //! - Produces waterproof (manifold) triangle meshes
+//!
+//! This module requires the `native` feature for WASM execution via wasmtime.
 
 use anyhow::Result;
+#[cfg(feature = "native")]
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -284,15 +287,17 @@ impl CellId {
 }
 
 /// Thread-safe sampler that can create per-thread WASM instances.
-/// 
+///
 /// The WASM module is compiled once and shared across all threads.
 /// Each thread gets its own Store and Instance, but they all share
 /// the same compiled module, avoiding expensive recompilation.
+#[cfg(feature = "native")]
 pub struct WasmSampler {
     engine: Arc<wasmtime::Engine>,
     module: Arc<wasmtime::Module>,
 }
 
+#[cfg(feature = "native")]
 impl WasmSampler {
     pub fn new(wasm_bytes: Vec<u8>) -> Result<Self> {
         let engine = wasmtime::Engine::default();
@@ -304,7 +309,7 @@ impl WasmSampler {
     }
 
     /// Create a thread-local sampling context.
-    /// 
+    ///
     /// This creates a new Store and Instance for the calling thread,
     /// but reuses the pre-compiled module (which is the expensive part).
     fn create_context(&self) -> Result<SamplingContext> {
@@ -313,15 +318,17 @@ impl WasmSampler {
 }
 
 /// Per-thread sampling context with its own WASM instance.
-/// 
+///
 /// Each thread needs its own Store and Instance because wasmtime's
 /// Store is not thread-safe. However, the Module can be shared.
+#[cfg(feature = "native")]
 struct SamplingContext {
     store: wasmtime::Store<()>,
     // New ABI: (f64,f64,f64) -> f32 density
     is_inside_func: wasmtime::TypedFunc<(f64, f64, f64), f32>,
 }
 
+#[cfg(feature = "native")]
 impl SamplingContext {
     fn new(engine: &wasmtime::Engine, module: &wasmtime::Module) -> Result<Self> {
         let mut store = wasmtime::Store::new(engine, ());
@@ -434,6 +441,7 @@ impl AdaptiveOctree {
 ///
 /// # Returns
 /// A vector of triangles forming a waterproof mesh.
+#[cfg(feature = "native")]
 pub fn adaptive_surface_nets_mesh(
     wasm_bytes: &[u8],
     bounds_min: (f32, f32, f32),
@@ -491,6 +499,7 @@ struct IndexedMesh {
     tri_witness: Vec<(f32, f32, f32)>,
 }
 
+#[cfg(feature = "native")]
 fn orient_indexed_mesh(
     mesh: &mut IndexedMesh,
     sampler: &WasmSampler,
@@ -622,6 +631,7 @@ fn flip_triangle(tri: &mut [u32; 3]) {
     tri.swap(1, 2);
 }
 
+#[cfg(feature = "native")]
 fn choose_component_outward(
     mesh: &mut IndexedMesh,
     sampler: &WasmSampler,
@@ -732,6 +742,7 @@ fn compute_indexed_mesh_vertex_normals(mesh: &IndexedMesh) -> Vec<(f32, f32, f32
     acc
 }
 
+#[cfg(feature = "native")]
 fn compute_indexed_normals(
     mesh: &IndexedMesh,
     sampler: &WasmSampler,
@@ -770,6 +781,7 @@ fn compute_indexed_normals(
     }
 }
 
+#[cfg(feature = "native")]
 fn relax_indexed_vertices_to_surface(
     mesh: &mut IndexedMesh,
     sampler: &WasmSampler,
@@ -820,6 +832,7 @@ fn relax_indexed_vertices_to_surface(
 ///
 /// The sampling pipeline provides an occupancy-like value (`is_inside(p) != 0.0` means filled).
 /// For meshing we only cache corner occupancy and classify cells as inside/outside/mixed.
+#[cfg(feature = "native")]
 fn phase1_coarse_discovery(sampler: &WasmSampler, octree: &mut AdaptiveOctree) -> Result<()> {
     let base_res = octree.base_resolution as i32;
 
@@ -971,10 +984,11 @@ fn phase1_coarse_discovery(sampler: &WasmSampler, octree: &mut AdaptiveOctree) -
 }
 
 /// Phase 2: Adaptively refine MIXED cells to the target depth.
-/// 
+///
 /// This phase is parallelized at the root cell level using rayon.
 /// Each root cell is refined independently in parallel, with each thread
 /// getting its own WASM sampling context from the shared pre-compiled module.
+#[cfg(feature = "native")]
 fn phase2_adaptive_refinement(sampler: &WasmSampler, octree: &mut AdaptiveOctree) -> Result<()> {
     if octree.max_depth == 0 {
         return Ok(());
@@ -1028,11 +1042,12 @@ fn phase2_adaptive_refinement(sampler: &WasmSampler, octree: &mut AdaptiveOctree
 }
 
 /// Recursively refine a node if it's MIXED and below max depth.
-/// 
+///
 /// Uses a thread-local sampling context to avoid creating new WASM instances.
 /// The context is reused across all recursive calls within the same thread.
-/// 
+///
 /// This refines only where needed (MIXED cells) up to `max_depth`.
+#[cfg(feature = "native")]
 fn refine_node_recursive(
     node: &mut OctreeNode,
     max_depth: usize,
@@ -1046,6 +1061,7 @@ fn refine_node_recursive(
 /// If `force` is true, the node is refined regardless of its cell type. This is used to
 /// refine a small band of neighbors around MIXED regions so that Phase 3 has the 4 incident
 /// cells it expects around sign-changing edges.
+#[cfg(feature = "native")]
 fn refine_node_recursive_band(
     node: &mut OctreeNode,
     max_depth: usize,
@@ -1145,6 +1161,7 @@ fn refine_node_recursive_band(
 
 /// Uniformly refine a node to max_depth regardless of cell type.
 /// This ensures all cells within a root reach the same depth to avoid T-junctions.
+#[cfg(feature = "native")]
 fn refine_node_uniform(
     node: &mut OctreeNode,
     max_depth: usize,
@@ -1316,10 +1333,11 @@ impl LineKey {
 }
 
 /// Phase 3: Extract a waterproof mesh from the octree using Surface Nets.
-/// 
+///
 /// This groups edges by the axis-aligned line they lie on, then for each unique
 /// point along that line where edges meet, emits quads connecting the cells.
 /// This handles T-junctions where cells of different sizes meet.
+#[cfg(feature = "native")]
 fn phase3_extract_mesh(
     octree: &AdaptiveOctree,
     sampler: &WasmSampler,
@@ -2144,6 +2162,7 @@ fn cross(a: (f32, f32, f32), b: (f32, f32, f32)) -> (f32, f32, f32) {
     (a.1 * b.2 - a.2 * b.1, a.2 * b.0 - a.0 * b.2, a.0 * b.1 - a.1 * b.0)
 }
 
+#[cfg(feature = "native")]
 fn project_to_surface_on_line(
     ctx: &mut SamplingContext,
     p: (f32, f32, f32),
@@ -2189,6 +2208,7 @@ fn project_to_surface_on_line(
     Ok(None)
 }
 
+#[cfg(feature = "native")]
 fn hq_normal_at_point(
     ctx: &mut SamplingContext,
     p: (f32, f32, f32),
@@ -2250,18 +2270,19 @@ fn estimate_normal_from_sdf(_node: &OctreeNode, _point: (f32, f32, f32)) -> (f32
 }
 
 /// Find the surface crossing point on an edge using binary search.
-/// 
+///
 /// Given two points where one is inside and one is outside, performs binary search
 /// to find the approximate location where the surface crosses the edge.
-/// 
+///
 /// # Arguments
 /// * `ctx` - Sampling context for querying the model
 /// * `p_inside` - Point that is inside the model
 /// * `p_outside` - Point that is outside the model
 /// * `iterations` - Number of binary search iterations (4-8 recommended)
-/// 
+///
 /// # Returns
 /// The approximate crossing point on the edge.
+#[cfg(feature = "native")]
 fn binary_search_edge_crossing(
     ctx: &mut SamplingContext,
     p_inside: (f32, f32, f32),
@@ -2299,19 +2320,20 @@ fn binary_search_edge_crossing(
 }
 
 /// Relax a vertex toward the surface using the SDF gradient.
-/// 
+///
 /// Iteratively moves the vertex along the estimated surface normal direction
 /// to project it closer to the actual surface. Uses the trilinearly interpolated
 /// SDF within the cell to estimate the distance and gradient.
-/// 
+///
 /// # Arguments
 /// * `vertex` - Initial vertex position
 /// * `node` - The cell containing the vertex (for SDF interpolation)
 /// * `ctx` - Optional sampling context for more accurate SDF estimation
 /// * `iterations` - Number of relaxation iterations
-/// 
+///
 /// # Returns
 /// The relaxed vertex position, clamped to stay within the cell.
+#[cfg(feature = "native")]
 fn relax_vertex_to_surface(
     vertex: (f32, f32, f32),
     node: &OctreeNode,
@@ -2394,10 +2416,11 @@ fn relax_vertex_to_surface(
 
 /// Compute the Surface Nets vertex for a MIXED cell with optional binary search refinement
 /// and vertex relaxation.
-/// 
+///
 /// When `ctx` is provided and `edge_iterations > 0`, uses binary search to find accurate
 /// edge crossing points. When `relax_iterations > 0`, applies vertex relaxation to
 /// project the vertex closer to the actual surface.
+#[cfg(feature = "native")]
 fn compute_surface_nets_vertex_refined(
     node: &OctreeNode,
     mut ctx: Option<&mut SamplingContext>,

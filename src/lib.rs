@@ -4,7 +4,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context;
-use wasmtime::{Caller, Engine, Instance, Module, Store};
+
+// wasmtime imports are now used through the wasm module
+
+pub mod wasm;
 
 /// A triangle in 3D space with vertices and per-vertex normal vectors.
 #[derive(Clone, Debug, PartialEq)]
@@ -134,57 +137,16 @@ pub struct OperatorMetadata {
 /// - The operator exports `get_metadata() -> i64` (or `u64`) where the return value packs
 ///   `(ptr: u32, len: u32)` as `ptr | (len << 32)`.
 /// - The referenced bytes are CBOR encoded and match `OperatorMetadata`.
+#[cfg(feature = "native")]
 pub fn operator_metadata_from_wasm_bytes(wasm_bin: &[u8]) -> Result<OperatorMetadata, ExecutionError> {
-    let engine = wasmtime::Engine::new(wasmtime::Config::new().debug_info(true))
-        .map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
-    let module = wasmtime::Module::new(&engine, wasm_bin)
-        .map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
+    use wasm::OperatorExecutor;
 
-    let mut linker = wasmtime::Linker::new(&engine);
-
-    // The operator module may import the host IO functions even if `get_metadata()` doesn't use them.
-    // Provide stubs so instantiation succeeds.
-    linker.func_wrap("host", "get_input_len", |_caller: Caller<'_, ()>, _arg: i32| -> u32 { 0 })
-        .map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
-    linker.func_wrap(
-        "host",
-        "get_input_data",
-        |_caller: Caller<'_, ()>, _arg: i32, _ptr: i32, _len: i32| {},
-    )
-    .map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
-    linker.func_wrap(
-        "host",
-        "post_output",
-        |_caller: Caller<'_, ()>, _output_idx: i32, _ptr: i32, _len: i32| {},
-    )
-    .map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
-
-    let mut store = Store::new(&engine, ());
-    let instance = linker
-        .instantiate(&mut store, &module)
+    let mut executor = wasm::create_operator_executor(wasm_bin)
         .map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
 
-    let metadata_func = instance
-        .get_typed_func::<(), i64>(&mut store, "get_metadata")
+    let bytes = executor
+        .get_metadata()
         .map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
-
-    let packed = metadata_func
-        .call(&mut store, ())
-        .map_err(|e| ExecutionError::Wasmtime(e.to_string()))? as u64;
-    let ptr = (packed & 0xFFFF_FFFF) as usize;
-    let len = (packed >> 32) as usize;
-
-    let memory = instance
-        .get_memory(&mut store, "memory")
-        .ok_or_else(|| ExecutionError::Wasmtime("Operator module does not export `memory`".to_string()))?;
-    let mem_data = memory.data(&store);
-    let end = ptr
-        .checked_add(len)
-        .ok_or_else(|| ExecutionError::Wasmtime("Operator metadata pointer overflow".to_string()))?;
-    if end > mem_data.len() {
-        return Err(ExecutionError::Wasmtime("Operator metadata points outside of linear memory".to_string()));
-    }
-    let bytes = &mem_data[ptr..end];
 
     let mut cursor = std::io::Cursor::new(bytes);
     ciborium::de::from_reader(&mut cursor)
@@ -197,77 +159,25 @@ pub mod adaptive_surface_nets;
 pub mod adaptive_surface_nets_2;
 
 /// Sample points from the WASM volumetric model
+#[cfg(feature = "native")]
 pub fn sample_model(wasm_path: &Path, resolution: usize) -> anyhow::Result<(Vec<(f32, f32, f32)>, (f32, f32, f32), (f32, f32, f32))> {
-    let engine = Engine::default();
-    let module = Module::from_file(&engine, wasm_path)?;
-
-    let mut store = Store::new(&engine, ());
-    let instance = Instance::new(&mut store, &module, &[])?;
-
-    let is_inside = instance.get_typed_func::<(f64, f64, f64), f32>(&mut store, "is_inside")?;
-
-    let get_bounds_min_x = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_x")?;
-    let get_bounds_min_y = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_y")?;
-    let get_bounds_min_z = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_z")?;
-    let get_bounds_max_x = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_x")?;
-    let get_bounds_max_y = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_y")?;
-    let get_bounds_max_z = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_z")?;
-
-    let min_x = get_bounds_min_x.call(&mut store, ())? as f32;
-    let min_y = get_bounds_min_y.call(&mut store, ())? as f32;
-    let min_z = get_bounds_min_z.call(&mut store, ())? as f32;
-    let max_x = get_bounds_max_x.call(&mut store, ())? as f32;
-    let max_y = get_bounds_max_y.call(&mut store, ())? as f32;
-    let max_z = get_bounds_max_z.call(&mut store, ())? as f32;
-
-    let bounds_min = (min_x, min_y, min_z);
-    let bounds_max = (max_x, max_y, max_z);
-
-    let mut points = Vec::new();
-
-    for z_idx in 0..resolution {
-        let z = min_z + (max_z - min_z) * (z_idx as f32 / (resolution - 1).max(1) as f32);
-        for y_idx in 0..resolution {
-            let y = min_y + (max_y - min_y) * (y_idx as f32 / (resolution - 1).max(1) as f32);
-            for x_idx in 0..resolution {
-                let x = min_x + (max_x - min_x) * (x_idx as f32 / (resolution - 1).max(1) as f32);
-                let density = is_inside.call(&mut store, (x as f64, y as f64, z as f64))?;
-                if density > 0.5 {
-                    points.push((x, y, z));
-                }
-            }
-        }
-    }
-
-    Ok((points, bounds_min, bounds_max))
+    let wasm_bytes = std::fs::read(wasm_path)?;
+    sample_model_from_bytes(&wasm_bytes, resolution)
 }
 
 /// Sample points from WASM bytes (in-memory model)
+#[cfg(feature = "native")]
 pub fn sample_model_from_bytes(wasm_bytes: &[u8], resolution: usize) -> anyhow::Result<(Vec<(f32, f32, f32)>, (f32, f32, f32), (f32, f32, f32))> {
-    let engine = Engine::default();
-    let module = Module::new(&engine, wasm_bytes).context("Failed to load WASM module from bytes")?;
+    use wasm::ModelExecutor;
 
-    let mut store = Store::new(&engine, ());
-    let instance = Instance::new(&mut store, &module, &[])?;
+    let mut executor = wasm::create_model_executor(wasm_bytes)
+        .context("Failed to create model executor")?;
 
-    let is_inside = instance.get_typed_func::<(f64, f64, f64), f32>(&mut store, "is_inside")?;
+    let bounds = executor.get_bounds()?;
+    let (bounds_min, bounds_max) = bounds.as_f32();
 
-    let get_bounds_min_x = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_x")?;
-    let get_bounds_min_y = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_y")?;
-    let get_bounds_min_z = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_z")?;
-    let get_bounds_max_x = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_x")?;
-    let get_bounds_max_y = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_y")?;
-    let get_bounds_max_z = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_z")?;
-
-    let min_x = get_bounds_min_x.call(&mut store, ())? as f32;
-    let min_y = get_bounds_min_y.call(&mut store, ())? as f32;
-    let min_z = get_bounds_min_z.call(&mut store, ())? as f32;
-    let max_x = get_bounds_max_x.call(&mut store, ())? as f32;
-    let max_y = get_bounds_max_y.call(&mut store, ())? as f32;
-    let max_z = get_bounds_max_z.call(&mut store, ())? as f32;
-
-    let bounds_min = (min_x, min_y, min_z);
-    let bounds_max = (max_x, max_y, max_z);
+    let (min_x, min_y, min_z) = bounds_min;
+    let (max_x, max_y, max_z) = bounds_max;
 
     let mut points = Vec::new();
 
@@ -277,7 +187,7 @@ pub fn sample_model_from_bytes(wasm_bytes: &[u8], resolution: usize) -> anyhow::
             let y = min_y + (max_y - min_y) * (y_idx as f32 / (resolution - 1).max(1) as f32);
             for x_idx in 0..resolution {
                 let x = min_x + (max_x - min_x) * (x_idx as f32 / (resolution - 1).max(1) as f32);
-                let density = is_inside.call(&mut store, (x as f64, y as f64, z as f64))?;
+                let density = executor.is_inside(x as f64, y as f64, z as f64)?;
                 if density > 0.5 {
                     points.push((x, y, z));
                 }
@@ -289,69 +199,28 @@ pub fn sample_model_from_bytes(wasm_bytes: &[u8], resolution: usize) -> anyhow::
 }
 
 /// Generate a mesh using marching cubes algorithm from the WASM volumetric model
+#[cfg(feature = "native")]
 pub fn generate_marching_cubes_mesh(wasm_path: &Path, resolution: usize) -> anyhow::Result<(Vec<Triangle>, (f32, f32, f32), (f32, f32, f32))> {
-    let engine = Engine::default();
-    let module = Module::from_file(&engine, wasm_path)?;
-
-    let mut store = Store::new(&engine, ());
-    let instance = Instance::new(&mut store, &module, &[])?;
-
-    let is_inside = instance.get_typed_func::<(f64, f64, f64), f32>(&mut store, "is_inside")?;
-
-    let get_bounds_min_x = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_x")?;
-    let get_bounds_min_y = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_y")?;
-    let get_bounds_min_z = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_z")?;
-    let get_bounds_max_x = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_x")?;
-    let get_bounds_max_y = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_y")?;
-    let get_bounds_max_z = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_z")?;
-
-    let min_x = get_bounds_min_x.call(&mut store, ())? as f32;
-    let min_y = get_bounds_min_y.call(&mut store, ())? as f32;
-    let min_z = get_bounds_min_z.call(&mut store, ())? as f32;
-    let max_x = get_bounds_max_x.call(&mut store, ())? as f32;
-    let max_y = get_bounds_max_y.call(&mut store, ())? as f32;
-    let max_z = get_bounds_max_z.call(&mut store, ())? as f32;
-
-    let bounds_min = (min_x, min_y, min_z);
-    let bounds_max = (max_x, max_y, max_z);
-
-    let triangles = marching_cubes_cpu::marching_cubes_mesh(bounds_min, bounds_max, resolution, |p| {
-        let d = is_inside.call(&mut store, (p.0 as f64, p.1 as f64, p.2 as f64))?;
-        Ok(d)
-    })?;
-
-    Ok((triangles, bounds_min, bounds_max))
+    let wasm_bytes = std::fs::read(wasm_path)?;
+    generate_marching_cubes_mesh_from_bytes(&wasm_bytes, resolution)
 }
 
 /// Generate a mesh using marching cubes from WASM bytes
+#[cfg(feature = "native")]
 pub fn generate_marching_cubes_mesh_from_bytes(wasm_bytes: &[u8], resolution: usize) -> anyhow::Result<(Vec<Triangle>, (f32, f32, f32), (f32, f32, f32))> {
-    let engine = Engine::default();
-    let module = Module::new(&engine, wasm_bytes).context("Failed to load WASM module from bytes")?;
+    use wasm::ModelExecutor;
 
-    let mut store = Store::new(&engine, ());
-    let instance = Instance::new(&mut store, &module, &[])?;
+    let mut executor = wasm::create_model_executor(wasm_bytes)
+        .context("Failed to create model executor")?;
 
-    let is_inside = instance.get_typed_func::<(f64, f64, f64), f32>(&mut store, "is_inside")?;
+    let bounds = executor.get_bounds()?;
+    let (bounds_min, bounds_max) = bounds.as_f32();
 
-    let get_bounds_min_x = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_x")?;
-    let get_bounds_min_y = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_y")?;
-    let get_bounds_min_z = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_z")?;
-    let get_bounds_max_x = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_x")?;
-    let get_bounds_max_y = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_y")?;
-    let get_bounds_max_z = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_z")?;
-
-    let min_x = get_bounds_min_x.call(&mut store, ())? as f32;
-    let min_y = get_bounds_min_y.call(&mut store, ())? as f32;
-    let min_z = get_bounds_min_z.call(&mut store, ())? as f32;
-    let max_x = get_bounds_max_x.call(&mut store, ())? as f32;
-    let max_y = get_bounds_max_y.call(&mut store, ())? as f32;
-    let max_z = get_bounds_max_z.call(&mut store, ())? as f32;
-
-    let bounds_min = (min_x, min_y, min_z);
-    let bounds_max = (max_x, max_y, max_z);
+    // Wrap executor in RefCell for interior mutability in the closure
+    let executor = std::cell::RefCell::new(executor);
 
     let triangles = marching_cubes_cpu::marching_cubes_mesh(bounds_min, bounds_max, resolution, |p| {
-        let d = is_inside.call(&mut store, (p.0 as f64, p.1 as f64, p.2 as f64))?;
+        let d = executor.borrow_mut().is_inside(p.0 as f64, p.1 as f64, p.2 as f64)?;
         Ok(d)
     })?;
 
@@ -359,122 +228,21 @@ pub fn generate_marching_cubes_mesh_from_bytes(wasm_bytes: &[u8], resolution: us
 }
 
 /// Generate an adaptive mesh from WASM bytes
+#[cfg(feature = "native")]
 pub fn generate_adaptive_mesh_from_bytes(wasm_bytes: &[u8], config: &adaptive_surface_nets::AdaptiveMeshConfig) -> anyhow::Result<(Vec<Triangle>, (f32, f32, f32), (f32, f32, f32))> {
-    let engine = Engine::default();
-    let module = Module::new(&engine, wasm_bytes)?;
+    use wasm::ParallelModelSampler;
 
-    let mut store = Store::new(&engine, ());
-    let instance = Instance::new(&mut store, &module, &[])?;
+    let sampler = wasm::create_parallel_sampler(wasm_bytes)
+        .context("Failed to create parallel sampler")?;
 
-    let get_bounds_min_x = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_x")?;
-    let get_bounds_min_y = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_y")?;
-    let get_bounds_min_z = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_z")?;
-    let get_bounds_max_x = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_x")?;
-    let get_bounds_max_y = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_y")?;
-    let get_bounds_max_z = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_z")?;
+    let bounds = sampler.get_bounds()?;
+    let (bounds_min, bounds_max) = bounds.as_f32();
 
-    let min_x = get_bounds_min_x.call(&mut store, ())? as f32;
-    let min_y = get_bounds_min_y.call(&mut store, ())? as f32;
-    let min_z = get_bounds_min_z.call(&mut store, ())? as f32;
-    let max_x = get_bounds_max_x.call(&mut store, ())? as f32;
-    let max_y = get_bounds_max_y.call(&mut store, ())? as f32;
-    let max_z = get_bounds_max_z.call(&mut store, ())? as f32;
-
-    let bounds_min = (min_x, min_y, min_z);
-    let bounds_max = (max_x, max_y, max_z);
-
+    // Note: adaptive_surface_nets_mesh creates its own internal sampler from wasm_bytes
+    // This will be refactored in Phase 3 to accept a sampler trait
     let triangles = adaptive_surface_nets::adaptive_surface_nets_mesh(wasm_bytes, bounds_min, bounds_max, config)?;
 
     Ok((triangles, bounds_min, bounds_max))
-}
-
-/// Thread-local WASM execution context for efficient repeated sampling.
-/// Each thread gets its own Store and Instance, initialized lazily on first use.
-struct ThreadLocalWasmContext {
-    store: Store<()>,
-    is_inside: wasmtime::TypedFunc<(f64, f64, f64), f32>,
-}
-
-impl ThreadLocalWasmContext {
-    fn new(engine: &Engine, module: &Module) -> Option<Self> {
-        let mut store = Store::new(engine, ());
-        let instance = Instance::new(&mut store, module, &[]).ok()?;
-        let is_inside = instance
-            .get_typed_func::<(f64, f64, f64), f32>(&mut store, "is_inside")
-            .ok()?;
-        Some(Self { store, is_inside })
-    }
-
-    fn sample(&mut self, x: f64, y: f64, z: f64) -> f32 {
-        self.is_inside
-            .call(&mut self.store, (x, y, z))
-            .unwrap_or(0.0)
-    }
-}
-
-/// Global counter for assigning unique IDs to samplers.
-static SAMPLER_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// WASM sampler for ASN2 with thread-local instance caching.
-///
-/// Each thread maintains its own WASM Store and Instance, initialized lazily
-/// on first sample call. This avoids the overhead of creating a new instance
-/// for every sample while still allowing the `Fn` interface required by ASN2.
-///
-/// The sampler uses a unique ID to detect when a new sampler is created,
-/// ensuring thread-locals are re-initialized when switching between different
-/// WASM modules.
-struct Asn2WasmSampler {
-    id: u64,
-    engine: Arc<Engine>,
-    module: Arc<Module>,
-}
-
-impl Asn2WasmSampler {
-    fn new(wasm_bytes: &[u8]) -> anyhow::Result<Self> {
-        let engine = Engine::default();
-        let module = Module::new(&engine, wasm_bytes)?;
-        let id = SAMPLER_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(Self {
-            id,
-            engine: Arc::new(engine),
-            module: Arc::new(module),
-        })
-    }
-
-    fn sample(&self, x: f64, y: f64, z: f64) -> f32 {
-        // Thread-local storage for the WASM context.
-        // Stores (sampler_id, context) so we can detect when to reinitialize.
-        thread_local! {
-            static CONTEXT: std::cell::RefCell<Option<(u64, ThreadLocalWasmContext)>> =
-                const { std::cell::RefCell::new(None) };
-        }
-
-        CONTEXT.with(|cell| {
-            let mut opt = cell.borrow_mut();
-
-            // Check if we need to (re)initialize the context
-            let needs_init = match &*opt {
-                Some((cached_id, _)) => *cached_id != self.id,
-                None => true,
-            };
-
-            if needs_init {
-                // Initialize new context for this sampler
-                match ThreadLocalWasmContext::new(&self.engine, &self.module) {
-                    Some(ctx) => *opt = Some((self.id, ctx)),
-                    None => return 0.0,
-                }
-            }
-
-            // Use the cached context
-            if let Some((_, ctx)) = opt.as_mut() {
-                ctx.sample(x, y, z)
-            } else {
-                0.0
-            }
-        })
-    }
 }
 
 /// Result from adaptive mesh v2 generation including mesh data, bounds, and profiling stats.
@@ -489,35 +257,20 @@ pub struct AdaptiveMeshV2Result {
 
 /// Generate an indexed mesh using the new Adaptive Surface Nets v2 algorithm.
 /// Returns a result struct containing mesh data, bounds, and detailed profiling statistics.
+#[cfg(feature = "native")]
 pub fn generate_adaptive_mesh_v2_from_bytes(
     wasm_bytes: &[u8],
     config: &adaptive_surface_nets_2::AdaptiveMeshConfig2,
 ) -> anyhow::Result<AdaptiveMeshV2Result> {
-    let engine = Engine::default();
-    let module = Module::new(&engine, wasm_bytes)?;
+    use wasm::ParallelModelSampler;
 
-    let mut store = Store::new(&engine, ());
-    let instance = Instance::new(&mut store, &module, &[])?;
+    let wasm_sampler = wasm::create_parallel_sampler(wasm_bytes)
+        .context("Failed to create parallel sampler")?;
 
-    let get_bounds_min_x = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_x")?;
-    let get_bounds_min_y = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_y")?;
-    let get_bounds_min_z = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_min_z")?;
-    let get_bounds_max_x = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_x")?;
-    let get_bounds_max_y = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_y")?;
-    let get_bounds_max_z = instance.get_typed_func::<(), f64>(&mut store, "get_bounds_max_z")?;
+    let bounds = wasm_sampler.get_bounds()?;
+    let (bounds_min, bounds_max) = bounds.as_f32();
 
-    let min_x = get_bounds_min_x.call(&mut store, ())? as f32;
-    let min_y = get_bounds_min_y.call(&mut store, ())? as f32;
-    let min_z = get_bounds_min_z.call(&mut store, ())? as f32;
-    let max_x = get_bounds_max_x.call(&mut store, ())? as f32;
-    let max_y = get_bounds_max_y.call(&mut store, ())? as f32;
-    let max_z = get_bounds_max_z.call(&mut store, ())? as f32;
-
-    let bounds_min = (min_x, min_y, min_z);
-    let bounds_max = (max_x, max_y, max_z);
-
-    // Create sampler using thread-local caching approach
-    let wasm_sampler = Asn2WasmSampler::new(wasm_bytes)?;
+    // Create a closure-based sampler that wraps the ParallelModelSampler
     let sampler = move |x: f64, y: f64, z: f64| -> f32 {
         wasm_sampler.sample(x, y, z)
     };
@@ -664,145 +417,53 @@ impl ExecuteWasmEntry {
     }
 }
 
-/// Runtime state for WASM execution, holding inputs and collecting outputs
-struct WasmExecutionState {
-    /// The input specifications
-    inputs: Vec<ExecuteWasmInput>,
-    /// Pre-fetched assets needed for inputs
-    input_assets: HashMap<String, LoadedAsset>,
-    /// Output specifications (asset_id, asset_type)
-    output_specs: Vec<ExecuteWasmOutput>,
-    /// Collected output data (index -> bytes)
-    output_data: HashMap<usize, Vec<u8>>,
-    /// Precursor asset IDs for tracking lineage
-    precursor_asset_ids: Vec<String>,
-}
-
 impl ExecuteWasmEntry {
+    #[cfg(feature = "native")]
     pub fn run(&self, environment: &mut Environment) -> Result<(), ExecutionError> {
-        let wasm_asset = environment.loaded_assets.get(&self.asset_id)
-            .ok_or(ExecutionError::NoSuchAssetId(self.asset_id.clone()))?;
+        use wasm::{OperatorExecutor, OperatorIo};
 
-        // Pre-fetch needed assets
-        let mut input_assets = HashMap::new();
-        let mut precursor_asset_ids = vec![];
-        for input in &self.inputs {
-            if let ExecuteWasmInput::AssetByID(asset_id) = input {
-                input_assets.insert(
-                    asset_id.clone(),
-                    environment.loaded_assets.get(asset_id)
-                        .ok_or(ExecutionError::NoSuchAssetId(asset_id.clone()))?.clone()
-                );
-                precursor_asset_ids.push(asset_id.clone());
+        // Extract the operator WASM binary (clone to release borrow)
+        let wasm_bin = {
+            let wasm_asset = environment.loaded_assets.get(&self.asset_id)
+                .ok_or(ExecutionError::NoSuchAssetId(self.asset_id.clone()))?;
+            match wasm_asset.asset.as_ref() {
+                Asset::OperationWASM(wasm_bin) => wasm_bin.clone(),
+                other => return Err(ExecutionError::WrongAssetType(
+                    self.asset_id.clone(),
+                    AssetType::OperationWASM,
+                    other.asset_type(),
+                )),
             }
+        };
+
+        // Resolve inputs to raw bytes
+        let mut input_bytes = Vec::new();
+        let mut precursor_asset_ids = Vec::new();
+
+        for input in &self.inputs {
+            let bytes = match input {
+                ExecuteWasmInput::AssetByID(asset_id) => {
+                    let asset = environment.loaded_assets.get(asset_id)
+                        .ok_or(ExecutionError::NoSuchAssetId(asset_id.clone()))?;
+                    precursor_asset_ids.push(asset_id.clone());
+                    asset.asset.bytes().to_vec()
+                },
+                ExecuteWasmInput::String(s) => s.as_bytes().to_vec(),
+                ExecuteWasmInput::Data(d) => d.clone(),
+            };
+            input_bytes.push(bytes);
         }
 
-        let wasm_bin = match wasm_asset.asset.as_ref() {
-            Asset::OperationWASM(wasm_bin) => wasm_bin,
-            other => return Err(ExecutionError::WrongAssetType(
-                self.asset_id.clone(),
-                AssetType::OperationWASM,
-                other.asset_type(),
-            )),
-        };
-
-        let engine = wasmtime::Engine::new(wasmtime::Config::new().debug_info(true))
-            .map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
-        let module = wasmtime::Module::new(&engine, wasm_bin)
+        let mut executor = wasm::create_operator_executor(&wasm_bin)
             .map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
 
-        let mut linker = wasmtime::Linker::new(&engine);
-        
-        let state = WasmExecutionState {
-            inputs: self.inputs.clone(),
-            input_assets,
-            output_specs: self.outputs.clone(),
-            output_data: HashMap::new(),
-            precursor_asset_ids: precursor_asset_ids.clone(),
-        };
-        let mut store = Store::new(&engine, state);
-
-        // Host function: get the length of an input
-        linker.func_wrap("host", "get_input_len", |caller: Caller<'_, WasmExecutionState>, arg: i32| -> u32 {
-            let idx = arg as usize;
-            match caller.data().inputs.get(idx) {
-                Some(ExecuteWasmInput::AssetByID(asset_id)) => {
-                    if let Some(asset) = caller.data().input_assets.get(asset_id) {
-                        match asset.asset.as_ref() {
-                            Asset::ModelWASM(wasm) => wasm.len() as u32,
-                            Asset::OperationWASM(wasm) => wasm.len() as u32,
-                        }
-                    } else {
-                        0
-                    }
-                },
-                Some(ExecuteWasmInput::String(s)) => s.len() as u32,
-                Some(ExecuteWasmInput::Data(d)) => d.len() as u32,
-                None => 0,
-            }
-        }).map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
-
-        // Host function: copy input data into WASM memory
-        linker.func_wrap("host", "get_input_data", |mut caller: Caller<'_, WasmExecutionState>, arg: i32, ptr: i32, len: i32| {
-            let idx = arg as usize;
-            // First, copy the data we need to avoid borrow conflicts
-            let data: Option<Vec<u8>> = match caller.data().inputs.get(idx) {
-                Some(ExecuteWasmInput::AssetByID(asset_id)) => {
-                    caller.data().input_assets.get(asset_id).map(|asset| {
-                        match asset.asset.as_ref() {
-                            Asset::ModelWASM(wasm) => wasm.clone(),
-                            Asset::OperationWASM(wasm) => wasm.clone(),
-                        }
-                    })
-                },
-                Some(ExecuteWasmInput::String(s)) => Some(s.as_bytes().to_vec()),
-                Some(ExecuteWasmInput::Data(d)) => Some(d.clone()),
-                None => None,
-            };
-
-            if let Some(src_data) = data {
-                let copy_len = (len as usize).min(src_data.len());
-                if let Some(memory) = caller.get_export("memory").and_then(|e| e.into_memory()) {
-                    let mem_data = memory.data_mut(&mut caller);
-                    let dest_start = ptr as usize;
-                    let dest_end = dest_start + copy_len;
-                    if dest_end <= mem_data.len() {
-                        mem_data[dest_start..dest_end].copy_from_slice(&src_data[..copy_len]);
-                    }
-                }
-            }
-        }).map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
-
-        // Host function: post output data from WASM memory
-        linker.func_wrap("host", "post_output", |mut caller: Caller<'_, WasmExecutionState>, output_idx: i32, ptr: i32, len: i32| {
-            let idx = output_idx as usize;
-            if idx >= caller.data().output_specs.len() {
-                return;
-            }
-
-            if let Some(memory) = caller.get_export("memory").and_then(|e| e.into_memory()) {
-                let mem_data = memory.data(&caller);
-                let src_start = ptr as usize;
-                let src_end = src_start + len as usize;
-                if src_end <= mem_data.len() {
-                    let output_bytes = mem_data[src_start..src_end].to_vec();
-                    caller.data_mut().output_data.insert(idx, output_bytes);
-                }
-            }
-        }).map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
-
-        let instance = linker.instantiate(&mut store, &module)
-            .map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
-
-        let run_func = instance.get_typed_func::<(), ()>(&mut store, "run")
-            .map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
-        run_func.call(&mut store, ())
+        let io = OperatorIo::new(input_bytes);
+        let result = executor.run(io)
             .map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
 
         // Collect outputs and add them to the environment
-        let state = store.into_data();
         for (idx, output_spec) in self.outputs.iter().enumerate() {
-            if let Some(output_bytes) = state.output_data.get(&idx) {
+            if let Some(output_bytes) = result.outputs.get(&idx) {
                 let asset = match output_spec.asset_type {
                     AssetType::ModelWASM => Asset::ModelWASM(output_bytes.clone()),
                     AssetType::OperationWASM => Asset::OperationWASM(output_bytes.clone()),
@@ -816,6 +477,11 @@ impl ExecuteWasmEntry {
         }
 
         Ok(())
+    }
+
+    #[cfg(not(feature = "native"))]
+    pub fn run(&self, _environment: &mut Environment) -> Result<(), ExecutionError> {
+        Err(ExecutionError::Wasmtime("WASM execution requires the 'native' feature".to_string()))
     }
 }
 
