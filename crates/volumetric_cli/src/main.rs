@@ -1,8 +1,12 @@
 //! Volumetric CLI - Command-line mesh generation and rendering tool
 //!
-//! Provides two subcommands:
+//! Provides subcommands for:
 //! - `mesh`: Generate STL files from volumetric models
 //! - `render`: Generate PNG images using headless wgpu rendering
+//! - `info`: Inspect WASM models, operators, and projects
+//! - `bounds`: Query bounding box of a model
+//! - `sample`: Sample is_inside values at points
+//! - `project-*`: Create and manipulate .vproj project files
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -15,6 +19,8 @@ use volumetric::{
 
 mod camera;
 mod headless_renderer;
+mod info;
+mod project;
 mod render;
 
 #[derive(Parser, Debug)]
@@ -31,6 +37,30 @@ enum Commands {
     Mesh(MeshArgs),
     /// Render a volumetric model to PNG image(s)
     Render(render::RenderArgs),
+    /// Get information about a WASM model, operator, or project
+    Info(info::InfoArgs),
+    /// Query the bounding box of a model
+    Bounds(info::BoundsArgs),
+    /// Sample is_inside values at specified points
+    Sample(info::SampleArgs),
+    /// Create a new project from a model WASM
+    #[command(name = "project-new")]
+    ProjectNew(project::ProjectNewArgs),
+    /// Add a model to an existing project
+    #[command(name = "project-add-model")]
+    ProjectAddModel(project::ProjectAddModelArgs),
+    /// Add an operator execution to a project
+    #[command(name = "project-add-op")]
+    ProjectAddOp(project::ProjectAddOpArgs),
+    /// Export assets from a project to WASM files
+    #[command(name = "project-export")]
+    ProjectExport(project::ProjectExportArgs),
+    /// Run a project and show exported assets
+    #[command(name = "project-run")]
+    ProjectRun(project::ProjectRunArgs),
+    /// List assets in a project
+    #[command(name = "project-list")]
+    ProjectList(project::ProjectListArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -286,5 +316,14 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Mesh(args) => run_mesh(args),
         Commands::Render(args) => render::run_render(args),
+        Commands::Info(args) => info::run_info(args),
+        Commands::Bounds(args) => info::run_bounds(args),
+        Commands::Sample(args) => info::run_sample(args),
+        Commands::ProjectNew(args) => project::run_project_new(args),
+        Commands::ProjectAddModel(args) => project::run_project_add_model(args),
+        Commands::ProjectAddOp(args) => project::run_project_add_op(args),
+        Commands::ProjectExport(args) => project::run_project_export(args),
+        Commands::ProjectRun(args) => project::run_project_run(args),
+        Commands::ProjectList(args) => project::run_project_list(args),
     }
 }

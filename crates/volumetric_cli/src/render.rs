@@ -33,8 +33,8 @@ pub struct RenderArgs {
     #[arg(long, default_value = "iso")]
     pub views: String,
 
-    /// Background color as hex (e.g., f0f0f0)
-    #[arg(long, default_value = "f0f0f0")]
+    /// Background color as hex (e.g., 2d2d2d)
+    #[arg(long, default_value = "2d2d2d")]
     pub background: String,
 
     /// Mesh base color as hex (e.g., 6699cc)
