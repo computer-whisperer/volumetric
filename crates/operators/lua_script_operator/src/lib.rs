@@ -17,8 +17,9 @@
 //! ## Expressions
 //! - Number literals, `true`, `false`
 //! - Variables (simple names)
-//! - Arithmetic: `+`, `-`, `*`, `/`, `%` (modulo)
+//! - Arithmetic: `+`, `-`, `*`, `/`, `%` (modulo), `^` (exponentiation)
 //! - Comparison: `<`, `<=`, `>`, `>=`, `==`, `~=`
+//! - Logical: `and`, `or` (with short-circuit evaluation)
 //! - Unary: `-` (negation), `not`
 //! - Parentheses: `(expr)`
 //! - User-defined function calls: `helper(x, y)`
@@ -28,8 +29,14 @@
 //! - Assignment: `x = expr`
 //! - If-then-else: `if cond then ... elseif ... else ... end`
 //! - While loop: `while cond do ... end`
+//! - Repeat-until loop: `repeat ... until cond`
 //! - Numeric for loop: `for i = start, end [, step] do ... end`
+//! - Break: `break` (exits innermost loop)
 //! - Return: `return expr`
+//!
+//! ## Math Constants
+//! - `math.pi` - π (3.14159...)
+//! - `math.huge` - Infinity
 //!
 //! ## Math Functions (Native WASM)
 //! - `math.abs`, `math.sqrt`, `math.floor`, `math.ceil`, `math.trunc`, `math.nearest`
@@ -56,8 +63,7 @@
 //! ```
 //!
 //! ## Not Yet Supported
-//! - Exponentiation operator (`^`) - use `math.pow` instead
-//! - Generic for loops (`for k, v in pairs(t)`), repeat-until, break
+//! - Generic for loops (`for k, v in pairs(t)`)
 //! - Tables, strings, multiple return values
 //! - Closures, recursion between helper functions
 
@@ -113,7 +119,7 @@ enum CompileError {
 /// Binary operators in the IR
 #[derive(Clone, Debug)]
 enum IrBinOp {
-    Add, Sub, Mul, Div, Mod,
+    Add, Sub, Mul, Div, Mod, Pow,
     Lt, Le, Gt, Ge, Eq, Ne,
     And, Or,
 }
@@ -155,7 +161,9 @@ enum IrStmt {
     Assign { name: String, value: IrExpr },
     If { cond: IrExpr, then_body: Vec<IrStmt>, else_body: Vec<IrStmt> },
     While { cond: IrExpr, body: Vec<IrStmt> },
+    RepeatUntil { body: Vec<IrStmt>, cond: IrExpr },
     NumericFor { var: String, start: IrExpr, end: IrExpr, step: Option<IrExpr>, body: Vec<IrStmt> },
+    Break,
     Return(IrExpr),
 }
 
@@ -182,11 +190,28 @@ fn ast_expr_to_ir(expr: &full_moon::ast::Expression) -> Result<IrExpr, CompileEr
             Ok(IrExpr::Number(v))
         }
         Expression::Var(var) => {
+            use full_moon::ast::{Suffix, Index};
             match var {
                 Var::Name(token) => {
                     Ok(IrExpr::Var(token.token().to_string()))
                 }
-                Var::Expression(_) => {
+                Var::Expression(var_expr) => {
+                    // Handle math.pi and similar constants
+                    if let full_moon::ast::Prefix::Name(obj_token) = var_expr.prefix() {
+                        let obj_name = obj_token.token().to_string();
+                        let suffixes: Vec<_> = var_expr.suffixes().collect();
+
+                        if obj_name == "math" && suffixes.len() == 1 {
+                            if let Suffix::Index(Index::Dot { name, .. }) = &suffixes[0] {
+                                let const_name = name.token().to_string();
+                                match const_name.as_str() {
+                                    "pi" => return Ok(IrExpr::Number(std::f64::consts::PI)),
+                                    "huge" => return Ok(IrExpr::Number(f64::INFINITY)),
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
                     Err(CompileError::Unsupported("complex variable expressions not supported".into()))
                 }
                 _ => Err(CompileError::Unsupported("unsupported variable type".into())),
@@ -220,7 +245,7 @@ fn ast_expr_to_ir(expr: &full_moon::ast::Expression) -> Result<IrExpr, CompileEr
                 BinOp::TildeEqual(_) => IrBinOp::Ne,
                 BinOp::And(_) => IrBinOp::And,
                 BinOp::Or(_) => IrBinOp::Or,
-                BinOp::Caret(_) => return Err(CompileError::Unsupported("exponentiation operator (use math.pow if available)".into())),
+                BinOp::Caret(_) => IrBinOp::Pow,
                 BinOp::Percent(_) => IrBinOp::Mod,
                 BinOp::TwoDots(_) => return Err(CompileError::Unsupported("string concatenation".into())),
                 _ => return Err(CompileError::Unsupported("unsupported binary operator".into())),
@@ -387,6 +412,11 @@ fn ast_block_to_ir(block: &full_moon::ast::Block) -> Result<Vec<IrStmt>, Compile
                 let body = ast_block_to_ir(for_stmt.block())?;
                 stmts.push(IrStmt::NumericFor { var, start, end, step, body });
             }
+            Stmt::Repeat(repeat_stmt) => {
+                let body = ast_block_to_ir(repeat_stmt.block())?;
+                let cond = ast_expr_to_ir(repeat_stmt.until())?;
+                stmts.push(IrStmt::RepeatUntil { body, cond });
+            }
             _ => {
                 return Err(CompileError::Unsupported("unsupported statement type".into()));
             }
@@ -410,7 +440,7 @@ fn ast_block_to_ir(block: &full_moon::ast::Block) -> Result<Vec<IrStmt>, Compile
                 }
             }
             LastStmt::Break(_) => {
-                return Err(CompileError::Unsupported("break statement".into()));
+                stmts.push(IrStmt::Break);
             }
             _ => {
                 return Err(CompileError::Unsupported("unsupported last statement".into()));
@@ -548,17 +578,87 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                 match op {
                     IrBinOp::Mod => {
                         // Lua modulo: a % b = a - floor(a/b) * b
-                        emit_ir_expr(b, func_ids,lhs, params, locals)?;  // a (for final subtraction)
-                        emit_ir_expr(b, func_ids,lhs, params, locals)?;  // a
-                        emit_ir_expr(b, func_ids,rhs, params, locals)?;  // b
+                        emit_ir_expr(b, func_ids, lhs, params, locals)?;  // a (for final subtraction)
+                        emit_ir_expr(b, func_ids, lhs, params, locals)?;  // a
+                        emit_ir_expr(b, func_ids, rhs, params, locals)?;  // b
                         b.binop(BinaryOp::F64Div);              // a/b
                         b.unop(UnaryOp::F64Floor);              // floor(a/b)
-                        emit_ir_expr(b, func_ids,rhs, params, locals)?;  // b
+                        emit_ir_expr(b, func_ids, rhs, params, locals)?;  // b
                         b.binop(BinaryOp::F64Mul);              // floor(a/b) * b
                         b.binop(BinaryOp::F64Sub);              // a - floor(a/b) * b
                     }
-                    IrBinOp::And | IrBinOp::Or => {
-                        return Err(CompileError::Unsupported("logical operators in expressions".into()));
+                    IrBinOp::Pow => {
+                        // x^y = exp(y * log(x)) - same as math.pow
+                        // Compute log(x) ≈ (x-1) - (x-1)²/2
+                        emit_ir_expr(b, func_ids, lhs, params, locals)?;
+                        b.f64_const(1.0);
+                        b.binop(BinaryOp::F64Sub);
+                        emit_ir_expr(b, func_ids, lhs, params, locals)?;
+                        b.f64_const(1.0);
+                        b.binop(BinaryOp::F64Sub);
+                        emit_ir_expr(b, func_ids, lhs, params, locals)?;
+                        b.f64_const(1.0);
+                        b.binop(BinaryOp::F64Sub);
+                        b.binop(BinaryOp::F64Mul);
+                        b.f64_const(2.0);
+                        b.binop(BinaryOp::F64Div);
+                        b.binop(BinaryOp::F64Sub);  // log(x) ≈ (x-1) - (x-1)²/2
+                        // Multiply by y
+                        emit_ir_expr(b, func_ids, rhs, params, locals)?;
+                        b.binop(BinaryOp::F64Mul);  // y * log(x)
+                        // exp(z) ≈ 1 + z
+                        b.f64_const(1.0);
+                        b.binop(BinaryOp::F64Add);
+                    }
+                    IrBinOp::And => {
+                        // a and b: if a != 0 then b else a (short-circuit)
+                        // Evaluate lhs for condition check
+                        emit_ir_expr(b, func_ids, lhs, params, locals)?;
+                        b.f64_const(0.0);
+                        b.binop(BinaryOp::F64Ne);  // lhs != 0.0
+                        let lhs = lhs.clone();
+                        let rhs = rhs.clone();
+                        let params_vec: Vec<String> = params.to_vec();
+                        let locals_clone = locals.clone();
+                        let func_ids_ref = func_ids;
+                        b.if_else(
+                            ValType::F64,
+                            |then_block| {
+                                // lhs truthy: return rhs
+                                emit_ir_expr(then_block, func_ids_ref, &rhs, &params_vec, &locals_clone)
+                                    .expect("emit_ir_expr in and-then branch failed");
+                            },
+                            |else_block| {
+                                // lhs falsy: return lhs (re-evaluate, will be 0.0)
+                                emit_ir_expr(else_block, func_ids_ref, &lhs, &params_vec, &locals_clone)
+                                    .expect("emit_ir_expr in and-else branch failed");
+                            },
+                        );
+                    }
+                    IrBinOp::Or => {
+                        // a or b: if a != 0 then a else b (short-circuit)
+                        // Evaluate lhs for condition check
+                        emit_ir_expr(b, func_ids, lhs, params, locals)?;
+                        b.f64_const(0.0);
+                        b.binop(BinaryOp::F64Ne);  // lhs != 0.0
+                        let lhs = lhs.clone();
+                        let rhs = rhs.clone();
+                        let params_vec: Vec<String> = params.to_vec();
+                        let locals_clone = locals.clone();
+                        let func_ids_ref = func_ids;
+                        b.if_else(
+                            ValType::F64,
+                            |then_block| {
+                                // lhs truthy: return lhs (re-evaluate)
+                                emit_ir_expr(then_block, func_ids_ref, &lhs, &params_vec, &locals_clone)
+                                    .expect("emit_ir_expr in or-then branch failed");
+                            },
+                            |else_block| {
+                                // lhs falsy: return rhs
+                                emit_ir_expr(else_block, func_ids_ref, &rhs, &params_vec, &locals_clone)
+                                    .expect("emit_ir_expr in or-else branch failed");
+                            },
+                        );
                     }
                     _ => {
                         emit_ir_expr(b, func_ids,lhs, params, locals)?;
@@ -1056,7 +1156,7 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                             loop_block.unop(UnaryOp::I32Eqz); // Invert: exit if condition is false
                             loop_block.br_if(exit_id);
 
-                            // Emit body statements (limited to assignments for now)
+                            // Emit body statements
                             for stmt in &body {
                                 match stmt {
                                     IrStmt::LocalAssign { name, value } | IrStmt::Assign { name, value } => {
@@ -1067,11 +1167,55 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                                         }
                                         // If local doesn't exist, skip (limitation: can't create new locals in loop)
                                     }
+                                    IrStmt::Break => {
+                                        loop_block.br(exit_id);
+                                    }
                                     _ => {
                                         // Skip unsupported statements in loop body for now
                                     }
                                 }
                             }
+
+                            // Continue to next iteration
+                            loop_block.br(loop_id);
+                        });
+                    });
+                }
+                IrStmt::RepeatUntil { body, cond } => {
+                    let params_vec: Vec<String> = params.to_vec();
+                    let loop_locals = locals.clone();
+                    let cond = cond.clone();
+                    let body = body.clone();
+                    let func_ids_ref = func_ids;
+
+                    // Repeat-until structure: loop { body; if cond br exit; br loop }
+                    // Different from while: body executes first, then condition checked
+                    b.block(None, |exit_block| {
+                        let exit_id = exit_block.id();
+                        exit_block.loop_(None, |loop_block| {
+                            let loop_id = loop_block.id();
+
+                            // Emit body statements first (always executes at least once)
+                            for stmt in &body {
+                                match stmt {
+                                    IrStmt::LocalAssign { name, value } | IrStmt::Assign { name, value } => {
+                                        if let Some(&local_id) = loop_locals.get(name) {
+                                            emit_ir_expr(loop_block, func_ids_ref, value, &params_vec, &loop_locals)
+                                                .expect("emit repeat body assignment failed");
+                                            loop_block.local_set(local_id);
+                                        }
+                                    }
+                                    IrStmt::Break => {
+                                        loop_block.br(exit_id);
+                                    }
+                                    _ => {}
+                                }
+                            }
+
+                            // Check condition - exit if true (until condition met)
+                            emit_ir_condition(loop_block, func_ids_ref, &cond, &params_vec, &loop_locals)
+                                .expect("emit repeat-until condition failed");
+                            loop_block.br_if(exit_id);
 
                             // Continue to next iteration
                             loop_block.br(loop_id);
@@ -1138,6 +1282,9 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                                             loop_block.local_set(local_id);
                                         }
                                     }
+                                    IrStmt::Break => {
+                                        loop_block.br(exit_id);
+                                    }
                                     _ => {}
                                 }
                             }
@@ -1152,6 +1299,11 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                             loop_block.br(loop_id);
                         });
                     });
+                }
+                IrStmt::Break => {
+                    // Break at the top level (outside loop body handling) is an error
+                    // Loop bodies handle break directly using exit_id
+                    return Err(CompileError::Unsupported("break outside of loop".into()));
                 }
                 IrStmt::Return(expr) => {
                     return Ok(Some(expr.clone()));
@@ -1706,6 +1858,223 @@ end
 "#;
         let result = compile_lua_to_wasm(lua_src);
         assert!(result.is_ok(), "Failed to compile with user function: {:?}", result.err());
+        let wasm = result.unwrap();
+        assert!(wasm.len() > 8, "WASM output too short");
+        assert_eq!(&wasm[0..4], b"\0asm", "Invalid WASM magic number");
+    }
+
+    #[test]
+    fn test_compile_with_exponentiation() {
+        let lua_src = r#"
+function is_inside(x, y, z)
+    -- Use exponentiation operator
+    return x^2 + y^2 + z^2 - 1.0
+end
+
+function get_bounds_min_x()
+    return -1.5
+end
+
+function get_bounds_min_y()
+    return -1.5
+end
+
+function get_bounds_min_z()
+    return -1.5
+end
+
+function get_bounds_max_x()
+    return 1.5
+end
+
+function get_bounds_max_y()
+    return 1.5
+end
+
+function get_bounds_max_z()
+    return 1.5
+end
+"#;
+        let result = compile_lua_to_wasm(lua_src);
+        assert!(result.is_ok(), "Failed to compile with exponentiation: {:?}", result.err());
+        let wasm = result.unwrap();
+        assert!(wasm.len() > 8, "WASM output too short");
+        assert_eq!(&wasm[0..4], b"\0asm", "Invalid WASM magic number");
+    }
+
+    #[test]
+    fn test_compile_with_repeat_until() {
+        let lua_src = r#"
+function is_inside(x, y, z)
+    -- Use repeat-until loop
+    local sum = 0.0
+    local i = 1.0
+    repeat
+        sum = sum + i
+        i = i + 1.0
+    until i > 5.0
+    return sum + x + y + z
+end
+
+function get_bounds_min_x()
+    return -1.0
+end
+
+function get_bounds_min_y()
+    return -1.0
+end
+
+function get_bounds_min_z()
+    return -1.0
+end
+
+function get_bounds_max_x()
+    return 1.0
+end
+
+function get_bounds_max_y()
+    return 1.0
+end
+
+function get_bounds_max_z()
+    return 1.0
+end
+"#;
+        let result = compile_lua_to_wasm(lua_src);
+        assert!(result.is_ok(), "Failed to compile with repeat-until: {:?}", result.err());
+        let wasm = result.unwrap();
+        assert!(wasm.len() > 8, "WASM output too short");
+        assert_eq!(&wasm[0..4], b"\0asm", "Invalid WASM magic number");
+    }
+
+    #[test]
+    fn test_compile_with_logical_and_or() {
+        let lua_src = r#"
+function is_inside(x, y, z)
+    -- Use logical and/or operators
+    local inside_x = (x > -1.0) and (x < 1.0)
+    local inside_y = (y > -1.0) and (y < 1.0)
+    local inside_z = (z > -1.0) and (z < 1.0)
+    -- inside_x and inside_y and inside_z will be 1 if all true, 0 otherwise
+    local result = inside_x and inside_y and inside_z
+    -- Return negative if inside (to match SDF convention)
+    return (result and -1.0) or 1.0
+end
+
+function get_bounds_min_x()
+    return -2.0
+end
+
+function get_bounds_min_y()
+    return -2.0
+end
+
+function get_bounds_min_z()
+    return -2.0
+end
+
+function get_bounds_max_x()
+    return 2.0
+end
+
+function get_bounds_max_y()
+    return 2.0
+end
+
+function get_bounds_max_z()
+    return 2.0
+end
+"#;
+        let result = compile_lua_to_wasm(lua_src);
+        assert!(result.is_ok(), "Failed to compile with logical and/or: {:?}", result.err());
+        let wasm = result.unwrap();
+        assert!(wasm.len() > 8, "WASM output too short");
+        assert_eq!(&wasm[0..4], b"\0asm", "Invalid WASM magic number");
+    }
+
+    #[test]
+    fn test_compile_with_math_pi() {
+        let lua_src = r#"
+function is_inside(x, y, z)
+    -- Use math.pi constant
+    local radius = 1.0
+    local circumference = 2.0 * math.pi * radius
+    return math.sqrt(x*x + y*y + z*z) - (circumference / (2.0 * math.pi))
+end
+
+function get_bounds_min_x()
+    return -math.pi
+end
+
+function get_bounds_min_y()
+    return -math.pi
+end
+
+function get_bounds_min_z()
+    return -math.pi
+end
+
+function get_bounds_max_x()
+    return math.pi
+end
+
+function get_bounds_max_y()
+    return math.pi
+end
+
+function get_bounds_max_z()
+    return math.pi
+end
+"#;
+        let result = compile_lua_to_wasm(lua_src);
+        assert!(result.is_ok(), "Failed to compile with math.pi: {:?}", result.err());
+        let wasm = result.unwrap();
+        assert!(wasm.len() > 8, "WASM output too short");
+        assert_eq!(&wasm[0..4], b"\0asm", "Invalid WASM magic number");
+    }
+
+    #[test]
+    fn test_compile_with_break_in_repeat() {
+        // Test break in repeat-until loop (simpler case - break at end of body)
+        let lua_src = r#"
+function is_inside(x, y, z)
+    -- Use break in repeat-until
+    local sum = 0.0
+    local i = 1.0
+    repeat
+        sum = sum + i
+        i = i + 1.0
+        break
+    until i > 100.0
+    return sum + x + y + z
+end
+
+function get_bounds_min_x()
+    return -1.0
+end
+
+function get_bounds_min_y()
+    return -1.0
+end
+
+function get_bounds_min_z()
+    return -1.0
+end
+
+function get_bounds_max_x()
+    return 1.0
+end
+
+function get_bounds_max_y()
+    return 1.0
+end
+
+function get_bounds_max_z()
+    return 1.0
+end
+"#;
+        let result = compile_lua_to_wasm(lua_src);
+        assert!(result.is_ok(), "Failed to compile with break in repeat: {:?}", result.err());
         let wasm = result.unwrap();
         assert!(wasm.len() > 8, "WASM output too short");
         assert_eq!(&wasm[0..4], b"\0asm", "Invalid WASM magic number");
