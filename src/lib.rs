@@ -94,6 +94,8 @@ pub enum ExecutionError {
     InvalidOutputIndex(usize),
     #[error("Wasmtime error: {0}")]
     Wasmtime(String),
+    #[error("WASM backend error: {0}")]
+    WasmBackend(String),
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -137,20 +139,20 @@ pub struct OperatorMetadata {
 /// - The operator exports `get_metadata() -> i64` (or `u64`) where the return value packs
 ///   `(ptr: u32, len: u32)` as `ptr | (len << 32)`.
 /// - The referenced bytes are CBOR encoded and match `OperatorMetadata`.
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "web"))]
 pub fn operator_metadata_from_wasm_bytes(wasm_bin: &[u8]) -> Result<OperatorMetadata, ExecutionError> {
     use wasm::OperatorExecutor;
 
     let mut executor = wasm::create_operator_executor(wasm_bin)
-        .map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
+        .map_err(|e| ExecutionError::WasmBackend(e.to_string()))?;
 
     let bytes = executor
         .get_metadata()
-        .map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
+        .map_err(|e| ExecutionError::WasmBackend(e.to_string()))?;
 
     let mut cursor = std::io::Cursor::new(bytes);
     ciborium::de::from_reader(&mut cursor)
-        .map_err(|e| ExecutionError::Wasmtime(format!("Failed to decode operator metadata CBOR: {e}")))
+        .map_err(|e| ExecutionError::WasmBackend(format!("Failed to decode operator metadata CBOR: {e}")))
 }
 
 pub mod stl;

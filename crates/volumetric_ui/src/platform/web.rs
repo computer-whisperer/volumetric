@@ -43,8 +43,7 @@ impl Default for CancellationToken {
 /// within the event loop using poll-promise. This may cause brief UI freezes
 /// for long-running operations, but it's the simplest approach without Web Workers.
 pub struct BackgroundWorker<Task, Result> {
-    pending_task: Option<(Task, CancellationToken)>,
-    pending_result: Option<Result>,
+    pending_tasks: std::collections::VecDeque<(Task, CancellationToken)>,
     worker_fn: Box<dyn Fn(Task, &CancellationToken) -> Result>,
 }
 
@@ -62,25 +61,19 @@ where
         F: Fn(Task, &CancellationToken) -> Result + 'static,
     {
         Self {
-            pending_task: None,
-            pending_result: None,
+            pending_tasks: std::collections::VecDeque::new(),
             worker_fn: Box::new(executor),
         }
     }
 
     pub fn send_task(&mut self, task: Task, cancel_token: CancellationToken) {
-        self.pending_task = Some((task, cancel_token));
+        self.pending_tasks.push_back((task, cancel_token));
     }
 
-    /// Poll for results. On web, this executes the task synchronously if one is pending.
+    /// Poll for results. On web, this executes the next pending task synchronously.
     pub fn try_recv_result(&mut self) -> Option<Result> {
-        // First check if we have a buffered result
-        if self.pending_result.is_some() {
-            return self.pending_result.take();
-        }
-
-        // Execute any pending task synchronously
-        if let Some((task, cancel_token)) = self.pending_task.take() {
+        // Execute the next pending task synchronously
+        if let Some((task, cancel_token)) = self.pending_tasks.pop_front() {
             let result = (self.worker_fn)(task, &cancel_token);
             return Some(result);
         }
@@ -205,11 +198,13 @@ pub fn file_exists(_path: &std::path::Path) -> bool {
 // =============================================================================
 
 /// Get an embedded demo model by name.
-/// On web, demo models must be embedded at compile time or fetched from a server.
+/// Uses the volumetric_assets crate which bundles WASM at build time.
 pub fn get_embedded_demo_model(name: &str) -> Option<&'static [u8]> {
-    match name {
-        // These would be populated if we embed models at compile time
-        // "simple_sphere_model" => Some(include_bytes!("../../../models/simple_sphere_model.wasm")),
-        _ => None,
-    }
+    volumetric_assets::get_model(name).map(|asset| asset.bytes)
+}
+
+/// Get an embedded operator by name.
+/// Uses the volumetric_assets crate which bundles WASM at build time.
+pub fn get_embedded_operator(name: &str) -> Option<&'static [u8]> {
+    volumetric_assets::get_operator(name).map(|asset| asset.bytes)
 }

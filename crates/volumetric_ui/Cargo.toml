@@ -10,6 +10,7 @@ web = ["volumetric/web", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:we
 
 [dependencies]
 volumetric = { path = "../../", default-features = false }
+volumetric_assets = { path = "../volumetric_assets" }
 anyhow = "1"
 serde = { version = "1.0.228", features = ["derive"] }
 wasmparser = "0.219"

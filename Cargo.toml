@@ -23,6 +23,7 @@ members = [
     "crates/operators/rotation_operator",
     "crates/operators/scale_operator",
     "crates/operators/lua_script_operator",
+    "crates/volumetric_assets",
     "crates/volumetric_ui",
     "crates/volumetric_cli",
 ]

@@ -198,24 +198,24 @@ impl BackgroundWorker {
 
 #[cfg(target_arch = "wasm32")]
 struct BackgroundWorker {
-    /// Pending task to execute
-    pending_task: Option<(BackgroundTask, CancellationToken)>,
+    /// Queue of pending tasks to execute
+    pending_tasks: std::collections::VecDeque<(BackgroundTask, CancellationToken)>,
 }
 
 #[cfg(target_arch = "wasm32")]
 impl BackgroundWorker {
     fn new() -> Self {
-        Self { pending_task: None }
+        Self { pending_tasks: std::collections::VecDeque::new() }
     }
 
     fn send_task(&mut self, task: BackgroundTask, cancel_token: CancellationToken) {
-        self.pending_task = Some((task, cancel_token));
+        self.pending_tasks.push_back((task, cancel_token));
     }
 
-    /// On web, execute tasks synchronously when polled.
+    /// On web, execute the next pending task synchronously when polled.
     /// This may cause brief UI freezes for long operations.
     fn try_recv_result(&mut self) -> Option<BackgroundTaskResult> {
-        let (task, cancel_token) = self.pending_task.take()?;
+        let (task, cancel_token) = self.pending_tasks.pop_front()?;
 
         if cancel_token.is_cancelled() {
             return Some(BackgroundTaskResult::Cancelled {
@@ -633,13 +633,12 @@ use volumetric::{
 };
 
 // WASM execution functions available on both native and web
-use volumetric::{generate_marching_cubes_mesh_from_bytes, generate_adaptive_mesh_v2_from_bytes, sample_model_from_bytes};
+use volumetric::{generate_marching_cubes_mesh_from_bytes, generate_adaptive_mesh_v2_from_bytes, sample_model_from_bytes, operator_metadata_from_wasm_bytes};
 
 // Native-only: Advanced WASM execution functions (require wasmtime directly)
 #[cfg(not(target_arch = "wasm32"))]
 use volumetric::{
-    generate_adaptive_mesh_from_bytes,
-    operator_metadata_from_wasm_bytes, stl,
+    generate_adaptive_mesh_from_bytes, stl,
 };
 
 enum ConfigFieldType {
@@ -959,8 +958,7 @@ pub struct VolumetricApp {
     operation_config_values: HashMap<String, ConfigValue>,
     /// Lua script source text for LuaSource inputs
     operation_lua_script: String,
-    /// Operator metadata cache - native only (uses filesystem)
-    #[cfg(not(target_arch = "wasm32"))]
+    /// Operator metadata cache (for bundled assets on all platforms)
     operator_metadata_cache: HashMap<String, CachedOperatorMetadata>,
     wgpu_target_format: wgpu::TextureFormat,
     // Camera state
@@ -1011,38 +1009,54 @@ pub struct VolumetricApp {
     pending_project_load: Option<Promise<Option<Vec<u8>>>>,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Debug)]
 struct CachedOperatorMetadata {
     wasm_len: u64,
+    #[cfg(not(target_arch = "wasm32"))]
     wasm_modified: Option<SystemTime>,
     metadata: Option<OperatorMetadata>,
 }
 
 
+/// Get bundled model WASM bytes by crate name.
+/// Uses the asset registry which embeds WASM at compile time.
+fn get_bundled_model(crate_name: &str) -> Option<&'static [u8]> {
+    volumetric_assets::get_model(crate_name).map(|asset| asset.bytes)
+}
+
+/// Get bundled operator WASM bytes by crate name.
+/// Uses the asset registry which embeds WASM at compile time.
+fn get_bundled_operator(crate_name: &str) -> Option<&'static [u8]> {
+    volumetric_assets::get_operator(crate_name).map(|asset| asset.bytes)
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn demo_wasm_path(crate_name: &str) -> Option<PathBuf> {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    // We are in crates/volumetric_ui, so the workspace target directory is two levels up.
-    path.pop();
-    path.pop();
+    // In debug builds, allow filesystem fallback for development convenience
+    #[cfg(debug_assertions)]
+    {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        // We are in crates/volumetric_ui, so the workspace target directory is two levels up.
+        path.pop();
+        path.pop();
 
-    let release = path
-        .join("target")
-        .join("wasm32-unknown-unknown")
-        .join("release")
-        .join(format!("{crate_name}.wasm"));
-    if fs::metadata(&release).is_ok() {
-        return Some(release);
-    }
+        let release = path
+            .join("target")
+            .join("wasm32-unknown-unknown")
+            .join("release")
+            .join(format!("{crate_name}.wasm"));
+        if fs::metadata(&release).is_ok() {
+            return Some(release);
+        }
 
-    let debug = path
-        .join("target")
-        .join("wasm32-unknown-unknown")
-        .join("debug")
-        .join(format!("{crate_name}.wasm"));
-    if fs::metadata(&debug).is_ok() {
-        return Some(debug);
+        let debug = path
+            .join("target")
+            .join("wasm32-unknown-unknown")
+            .join("debug")
+            .join(format!("{crate_name}.wasm"));
+        if fs::metadata(&debug).is_ok() {
+            return Some(debug);
+        }
     }
 
     None
@@ -1087,7 +1101,6 @@ impl VolumetricApp {
             operation_input_asset_id_b: None,
             operation_config_values: HashMap::new(),
             operation_lua_script: String::new(),
-            #[cfg(not(target_arch = "wasm32"))]
             operator_metadata_cache: HashMap::new(),
             wgpu_target_format,
             camera_theta: std::f32::consts::FRAC_PI_4,
@@ -1142,30 +1155,22 @@ impl VolumetricApp {
                             self.asset_render_data
                                 .retain(|id, _| exported_ids.contains(id));
 
-                            // Update WASM bytes for existing render data entries
-                            for (asset_id, render_data) in self.asset_render_data.iter_mut() {
-                                if let Some(asset) = self.exported_assets.iter().find(|a| a.asset_id() == asset_id) {
-                                    if let Some(wasm_bytes) = asset.as_model_wasm() {
+                            // Update WASM bytes for existing render data entries, and add new exports
+                            for asset in &self.exported_assets {
+                                if let Some(wasm_bytes) = asset.as_model_wasm() {
+                                    let asset_id = asset.asset_id();
+                                    if let Some(render_data) = self.asset_render_data.get_mut(asset_id) {
+                                        // Update existing entry
                                         render_data.wasm_bytes = wasm_bytes.to_vec();
                                         render_data.needs_resample = true;
                                         render_data.last_error = None;
+                                    } else {
+                                        // New export - initialize with ASNv2 render mode
+                                        self.asset_render_data.insert(
+                                            asset_id.to_string(),
+                                            AssetRenderData::new(wasm_bytes.to_vec(), ExportRenderMode::AdaptiveSurfaceNets2),
+                                        );
                                     }
-                                }
-                            }
-
-                            // If no assets are being rendered, pick the first ModelWASM export
-                            if self.asset_render_data.is_empty() {
-                                if let Some(first_model) = self
-                                    .exported_assets
-                                    .iter()
-                                    .find(|a| a.as_model_wasm().is_some())
-                                {
-                                    let id = first_model.asset_id().to_string();
-                                    let wasm_bytes = first_model.as_model_wasm().unwrap().to_vec();
-                                    self.asset_render_data.insert(
-                                        id,
-                                        AssetRenderData::new(wasm_bytes, ExportRenderMode::AdaptiveSurfaceNets2),
-                                    );
                                 }
                             }
                         }
@@ -1218,46 +1223,75 @@ impl VolumetricApp {
         self.in_progress_operation.is_some()
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     fn operator_metadata_cached(&mut self, crate_name: &str) -> Option<OperatorMetadata> {
-        let path = operation_wasm_path(crate_name)?;
-        let path_str = path.to_string_lossy().to_string();
+        // First check bundled operators (works on both native and web)
+        if let Some(wasm_bytes) = get_bundled_operator(crate_name) {
+            let cache_key = format!("bundled:{}", crate_name);
+            let wasm_len = wasm_bytes.len() as u64;
 
-        let (wasm_len, wasm_modified) = match fs::metadata(&path) {
-            Ok(m) => (m.len(), m.modified().ok()),
-            Err(_) => {
-                self.operator_metadata_cache.remove(&path_str);
-                return None;
+            let is_fresh = self
+                .operator_metadata_cache
+                .get(&cache_key)
+                .is_some_and(|c| c.wasm_len == wasm_len);
+
+            if !is_fresh {
+                let metadata = operator_metadata_from_wasm_bytes(wasm_bytes).ok();
+
+                self.operator_metadata_cache.insert(
+                    cache_key.clone(),
+                    CachedOperatorMetadata {
+                        wasm_len,
+                        #[cfg(not(target_arch = "wasm32"))]
+                        wasm_modified: None,
+                        metadata,
+                    },
+                );
             }
-        };
 
-        let is_fresh = self
-            .operator_metadata_cache
-            .get(&path_str)
-            .is_some_and(|c| c.wasm_len == wasm_len && c.wasm_modified == wasm_modified);
-
-        if !is_fresh {
-            let metadata = fs::read(&path)
-                .ok()
-                .and_then(|wasm_bytes| operator_metadata_from_wasm_bytes(&wasm_bytes).ok());
-            self.operator_metadata_cache.insert(
-                path_str.clone(),
-                CachedOperatorMetadata {
-                    wasm_len,
-                    wasm_modified,
-                    metadata,
-                },
-            );
+            return self.operator_metadata_cache
+                .get(&cache_key)
+                .and_then(|c| c.metadata.clone());
         }
 
-        self.operator_metadata_cache
-            .get(&path_str)
-            .and_then(|c| c.metadata.clone())
-    }
+        // Filesystem fallback for native debug builds
+        #[cfg(all(not(target_arch = "wasm32"), debug_assertions))]
+        {
+            if let Some(path) = operation_wasm_path(crate_name) {
+                let path_str = path.to_string_lossy().to_string();
 
-    #[cfg(target_arch = "wasm32")]
-    fn operator_metadata_cached(&mut self, _crate_name: &str) -> Option<OperatorMetadata> {
-        // Operator metadata caching not available on web (requires filesystem)
+                let (wasm_len, wasm_modified) = match fs::metadata(&path) {
+                    Ok(m) => (m.len(), m.modified().ok()),
+                    Err(_) => {
+                        self.operator_metadata_cache.remove(&path_str);
+                        return None;
+                    }
+                };
+
+                let is_fresh = self
+                    .operator_metadata_cache
+                    .get(&path_str)
+                    .is_some_and(|c| c.wasm_len == wasm_len && c.wasm_modified == wasm_modified);
+
+                if !is_fresh {
+                    let metadata = fs::read(&path)
+                        .ok()
+                        .and_then(|wasm_bytes| operator_metadata_from_wasm_bytes(&wasm_bytes).ok());
+                    self.operator_metadata_cache.insert(
+                        path_str.clone(),
+                        CachedOperatorMetadata {
+                            wasm_len,
+                            wasm_modified,
+                            metadata,
+                        },
+                    );
+                }
+
+                return self.operator_metadata_cache
+                    .get(&path_str)
+                    .and_then(|c| c.metadata.clone());
+            }
+        }
+
         None
     }
 
@@ -2277,45 +2311,62 @@ impl eframe::App for VolumetricApp {
                                 model_to_add = Some("mandelbulb_model");
                             }
                             
-                            // Handle model addition (native only - uses filesystem to load pre-built WASM)
-                            #[cfg(not(target_arch = "wasm32"))]
+                            // Handle model addition - uses bundled assets with optional filesystem fallback in debug
                             if let Some(crate_name) = model_to_add {
-                                match demo_wasm_path(crate_name) {
-                                    Some(path) => {
-                                        match fs::read(&path) {
-                                            Ok(wasm_bytes) => {
-                                                let asset_id = path
-                                                    .file_stem()
-                                                    .and_then(|s| s.to_str())
-                                                    .unwrap_or("model")
-                                                    .to_string();
-                                                if self.project.is_none() {
-                                                    self.project = Some(Project::new(vec![]));
+                                // First try bundled assets (works on both native and web)
+                                if let Some(wasm_bytes) = get_bundled_model(crate_name) {
+                                    if self.project.is_none() {
+                                        self.project = Some(Project::new(vec![]));
+                                    }
+                                    if let Some(ref mut project) = self.project {
+                                        project.insert_model_wasm(crate_name, wasm_bytes.to_vec());
+                                    }
+                                    #[cfg(not(target_arch = "wasm32"))]
+                                    { self.project_path = None; }
+                                    self.run_project();
+                                } else {
+                                    // Filesystem fallback for native debug builds only
+                                    #[cfg(all(not(target_arch = "wasm32"), debug_assertions))]
+                                    {
+                                        match demo_wasm_path(crate_name) {
+                                            Some(path) => {
+                                                match fs::read(&path) {
+                                                    Ok(wasm_bytes) => {
+                                                        let asset_id = path
+                                                            .file_stem()
+                                                            .and_then(|s| s.to_str())
+                                                            .unwrap_or("model")
+                                                            .to_string();
+                                                        if self.project.is_none() {
+                                                            self.project = Some(Project::new(vec![]));
+                                                        }
+                                                        if let Some(ref mut project) = self.project {
+                                                            project.insert_model_wasm(asset_id.as_str(), wasm_bytes);
+                                                        }
+                                                        self.project_path = None;
+                                                        self.run_project();
+                                                    }
+                                                    Err(e) => {
+                                                        self.error_message =
+                                                            Some(format!("Failed to read WASM file: {}", e));
+                                                    }
                                                 }
-                                                if let Some(ref mut project) = self.project {
-                                                    project.insert_model_wasm(asset_id.as_str(), wasm_bytes);
-                                                }
-                                                self.project_path = None;
-                                                self.run_project();
                                             }
-                                            Err(e) => {
-                                                self.error_message =
-                                                    Some(format!("Failed to read WASM file: {}", e));
+                                            None => {
+                                                self.error_message = Some(format!(
+                                                    "Model WASM not found for '{crate_name}'. Build it first with: cargo build --release --target wasm32-unknown-unknown -p {crate_name}"
+                                                ));
                                             }
                                         }
                                     }
-                                    None => {
+                                    #[cfg(any(target_arch = "wasm32", not(debug_assertions)))]
+                                    {
                                         self.error_message = Some(format!(
-                                            "Model WASM not found for '{crate_name}'. Build it first with: cargo build --release --target wasm32-unknown-unknown -p {crate_name}"
+                                            "Model '{}' not bundled. Rebuild with WASM assets available.",
+                                            crate_name
                                         ));
                                     }
                                 }
-                            }
-                            #[cfg(target_arch = "wasm32")]
-                            if model_to_add.is_some() {
-                                self.error_message = Some(
-                                    "Built-in models not available in web version. Import a WASM file instead.".to_string()
-                                );
                             }
                             
                             ui.add_space(8.0);
@@ -2474,111 +2525,123 @@ impl eframe::App for VolumetricApp {
                         } else if !has_required_inputs {
                             self.error_message = Some("Not enough input models available for this operator.".to_string());
                         } else {
-                            #[cfg(not(target_arch = "wasm32"))]
-                            match operation_wasm_path(crate_name) {
-                                Some(path) => match fs::read(&path) {
-                                    Ok(wasm_bytes) => {
-                                        let input_id_a = self.operation_input_asset_id.clone().unwrap_or_default();
-                                        let input_id_b = self
-                                            .operation_input_asset_id_b
-                                            .clone()
-                                            .unwrap_or_else(|| input_id_a.clone());
-                                        let output_id = self.project.as_ref()
-                                            .map(|p| p.default_output_name(crate_name, Some(&input_id_a)))
-                                            .unwrap_or_else(|| format!("{}_output", crate_name));
-                                        let op_asset_id = format!("op_{crate_name}");
+                            // Helper closure to add operator with given WASM bytes
+                            let add_operator = |app: &mut VolumetricApp, wasm_bytes: Vec<u8>| {
+                                let input_id_a = app.operation_input_asset_id.clone().unwrap_or_default();
+                                let input_id_b = app
+                                    .operation_input_asset_id_b
+                                    .clone()
+                                    .unwrap_or_else(|| input_id_a.clone());
+                                let output_id = app.project.as_ref()
+                                    .map(|p| p.default_output_name(crate_name, Some(&input_id_a)))
+                                    .unwrap_or_else(|| format!("{}_output", crate_name));
+                                let op_asset_id = format!("op_{crate_name}");
 
-                                        let (inputs, outputs) = match self.operator_metadata_cached(crate_name) {
-                                            Some(metadata) => {
-                                                let mut inputs = Vec::with_capacity(metadata.inputs.len());
-                                                let mut model_inputs_iter = [input_id_a.clone(), input_id_b.clone()].into_iter();
-                                                for (_idx, input) in metadata.inputs.iter().enumerate() {
-                                                    match input {
-                                                        OperatorMetadataInput::ModelWASM => {
-                                                            let id = model_inputs_iter
-                                                                .next()
-                                                                .unwrap_or_else(|| input_id_a.clone());
-                                                            inputs.push(ExecuteWasmInput::AssetByID(id));
-                                                        }
-                                                        OperatorMetadataInput::CBORConfiguration(cddl) => {
-                                                            let fields = parse_cddl_record_schema(cddl.as_str()).unwrap_or_default();
-                                                            let bytes = encode_config_map_to_cbor(&fields, &self.operation_config_values)
-                                                                .unwrap_or_default();
-                                                            inputs.push(ExecuteWasmInput::Data(bytes));
-                                                        }
-                                                        OperatorMetadataInput::LuaSource(_) => {
-                                                            let script_bytes = self.operation_lua_script.as_bytes().to_vec();
-                                                            inputs.push(ExecuteWasmInput::Data(script_bytes));
-                                                        }
-                                                    }
+                                let (inputs, outputs) = match app.operator_metadata_cached(crate_name) {
+                                    Some(metadata) => {
+                                        let mut inputs = Vec::with_capacity(metadata.inputs.len());
+                                        let mut model_inputs_iter = [input_id_a.clone(), input_id_b.clone()].into_iter();
+                                        for (_idx, input) in metadata.inputs.iter().enumerate() {
+                                            match input {
+                                                OperatorMetadataInput::ModelWASM => {
+                                                    let id = model_inputs_iter
+                                                        .next()
+                                                        .unwrap_or_else(|| input_id_a.clone());
+                                                    inputs.push(ExecuteWasmInput::AssetByID(id));
                                                 }
-
-                                                let mut outputs = Vec::with_capacity(metadata.outputs.len());
-                                                for (idx, output) in metadata.outputs.iter().enumerate() {
-                                                    let asset_type = match output {
-                                                        OperatorMetadataOutput::ModelWASM => AssetType::ModelWASM,
-                                                    };
-                                                    let out_id = if idx == 0 {
-                                                        output_id.clone()
-                                                    } else {
-                                                        format!("{output_id}_{idx}")
-                                                    };
-                                                    outputs.push(ExecuteWasmOutput::new(out_id, asset_type));
+                                                OperatorMetadataInput::CBORConfiguration(cddl) => {
+                                                    let fields = parse_cddl_record_schema(cddl.as_str()).unwrap_or_default();
+                                                    let bytes = encode_config_map_to_cbor(&fields, &app.operation_config_values)
+                                                        .unwrap_or_default();
+                                                    inputs.push(ExecuteWasmInput::Data(bytes));
                                                 }
-
-                                                (inputs, outputs)
-                                            }
-                                            None => (
-                                                vec![ExecuteWasmInput::AssetByID(input_id_a.clone())],
-                                                vec![ExecuteWasmOutput::new(output_id.clone(), AssetType::ModelWASM)],
-                                            ),
-                                        };
-
-                                        let mut new_entry_idx: Option<usize> = None;
-                                        if let Some(ref mut project) = self.project {
-                                            let count_before = project.entries().len();
-                                            
-                                            project.insert_operation(
-                                                op_asset_id.as_str(),
-                                                wasm_bytes,
-                                                inputs,
-                                                outputs,
-                                                output_id,
-                                            );
-                                            
-                                            for (idx, entry) in project.entries().iter().enumerate().rev() {
-                                                if idx >= count_before.saturating_sub(1) {
-                                                    if matches!(entry, ProjectEntry::ExecuteWASM(_)) {
-                                                        new_entry_idx = Some(idx);
-                                                        break;
-                                                    }
+                                                OperatorMetadataInput::LuaSource(_) => {
+                                                    let script_bytes = app.operation_lua_script.as_bytes().to_vec();
+                                                    inputs.push(ExecuteWasmInput::Data(script_bytes));
                                                 }
                                             }
                                         }
 
-                                        self.run_project();
-                                        
-                                        if let Some(idx) = new_entry_idx {
-                                            self.start_editing_entry(idx);
+                                        let mut outputs = Vec::with_capacity(metadata.outputs.len());
+                                        for (idx, output) in metadata.outputs.iter().enumerate() {
+                                            let asset_type = match output {
+                                                OperatorMetadataOutput::ModelWASM => AssetType::ModelWASM,
+                                            };
+                                            let out_id = if idx == 0 {
+                                                output_id.clone()
+                                            } else {
+                                                format!("{output_id}_{idx}")
+                                            };
+                                            outputs.push(ExecuteWasmOutput::new(out_id, asset_type));
+                                        }
+
+                                        (inputs, outputs)
+                                    }
+                                    None => (
+                                        vec![ExecuteWasmInput::AssetByID(input_id_a.clone())],
+                                        vec![ExecuteWasmOutput::new(output_id.clone(), AssetType::ModelWASM)],
+                                    ),
+                                };
+
+                                let mut new_entry_idx: Option<usize> = None;
+                                if let Some(ref mut project) = app.project {
+                                    let count_before = project.entries().len();
+
+                                    project.insert_operation(
+                                        op_asset_id.as_str(),
+                                        wasm_bytes,
+                                        inputs,
+                                        outputs,
+                                        output_id,
+                                    );
+
+                                    for (idx, entry) in project.entries().iter().enumerate().rev() {
+                                        if idx >= count_before.saturating_sub(1) {
+                                            if matches!(entry, ProjectEntry::ExecuteWASM(_)) {
+                                                new_entry_idx = Some(idx);
+                                                break;
+                                            }
                                         }
                                     }
-                                    Err(e) => {
-                                        self.error_message =
-                                            Some(format!("Failed to read operation WASM file: {e}"));
+                                }
+
+                                app.run_project();
+
+                                if let Some(idx) = new_entry_idx {
+                                    app.start_editing_entry(idx);
+                                }
+                            };
+
+                            // First try bundled operators (works on both native and web)
+                            if let Some(wasm_bytes) = get_bundled_operator(crate_name) {
+                                add_operator(self, wasm_bytes.to_vec());
+                            } else {
+                                // Filesystem fallback for native debug builds only
+                                #[cfg(all(not(target_arch = "wasm32"), debug_assertions))]
+                                match operation_wasm_path(crate_name) {
+                                    Some(path) => match fs::read(&path) {
+                                        Ok(wasm_bytes) => {
+                                            add_operator(self, wasm_bytes);
+                                        }
+                                        Err(e) => {
+                                            self.error_message =
+                                                Some(format!("Failed to read operation WASM file: {e}"));
+                                        }
+                                    },
+                                    None => {
+                                        self.error_message = Some(format!(
+                                            "Operator WASM not found for '{crate_name}'. Build it first with: cargo build --release --target wasm32-unknown-unknown -p {crate_name}"
+                                        ));
                                     }
-                                },
-                                None => {
+                                }
+
+                                #[cfg(any(target_arch = "wasm32", not(debug_assertions)))]
+                                {
                                     self.error_message = Some(format!(
-                                        "Operator WASM not found for '{crate_name}'. Build it first with: cargo build --release --target wasm32-unknown-unknown -p {crate_name}"
+                                        "Operator '{}' not bundled. Rebuild with WASM assets available.",
+                                        crate_name
                                     ));
                                 }
-                            }
-
-                            #[cfg(target_arch = "wasm32")]
-                            {
-                                self.error_message = Some(
-                                    "Operators not yet available in web version.".to_string(),
-                                );
                             }
                         }
                     }

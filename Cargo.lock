@@ -3941,6 +3941,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "volumetric_assets"
+version = "0.1.0"
+
+[[package]]
 name = "volumetric_cli"
 version = "0.1.0"
 dependencies = [
@@ -3969,6 +3973,7 @@ dependencies = [
  "serde",
  "thiserror 2.0.17",
  "volumetric",
+ "volumetric_assets",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasmparser 0.219.2",

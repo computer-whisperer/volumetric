@@ -1,0 +1,10 @@
+[package]
+name = "volumetric_assets"
+version = "0.1.0"
+edition = "2024"
+description = "Bundled WASM assets for volumetric (models and operators)"
+
+[features]
+default = ["models", "operators"]
+models = []
+operators = []
