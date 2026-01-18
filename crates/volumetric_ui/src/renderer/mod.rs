@@ -477,6 +477,14 @@ impl Renderer {
         // Pass 3: Composite to final target
         // =================================================================
         {
+            // When there are no meshes, the depth buffer was never initialized.
+            // We need to clear it in that case for subsequent passes (lines/points).
+            let depth_load_op = if self.frame_meshes.is_empty() {
+                wgpu::LoadOp::Clear(1.0) // Clear to far plane
+            } else {
+                wgpu::LoadOp::Load // Keep depth from mesh pass
+            };
+
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("composite_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -496,7 +504,7 @@ impl Renderer {
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &gpu.gbuffer.depth_stencil_view,
                     depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Load, // Keep depth from mesh pass
+                        load: depth_load_op,
                         store: wgpu::StoreOp::Store,
                     }),
                     stencil_ops: None,

@@ -51,3 +51,6 @@ dashmap = "6"
 # Web backend dependencies (future)
 wasm-bindgen = { version = "0.2", optional = true }
 js-sys = { version = "0.3", optional = true }
+
+# Cross-platform time (works on both native and wasm)
+web-time = "1"

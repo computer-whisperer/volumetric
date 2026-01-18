@@ -39,7 +39,8 @@ struct FsOut {
     // Encoded normal in 0..1 for sampling
     @location(1) normal_enc: vec4<f32>,
     // Store fragment depth (0..1, wgpu NDC Z range) for SSAO sampling
-    @location(2) depth: f32,
+    // Output as vec4 for compatibility with both R32Float and Rgba16Float formats
+    @location(2) depth: vec4<f32>,
 };
 
 @fragment
@@ -57,6 +58,7 @@ fn fs_gbuffer(in: VsOut) -> FsOut {
     out.color = vec4<f32>(color, 1.0);
     out.normal_enc = vec4<f32>(n * 0.5 + vec3<f32>(0.5), 1.0);
     // `in.position` is clip-space; z/w gives NDC depth in [0,1].
-    out.depth = in.position.z / in.position.w;
+    let depth_value = in.position.z / in.position.w;
+    out.depth = vec4<f32>(depth_value, 0.0, 0.0, 1.0);
     return out;
 }

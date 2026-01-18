@@ -127,7 +127,11 @@ impl MeshPipeline {
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
                     // Depth output (for SSAO)
+                    // Use Rgba16Float on web for better compatibility
                     Some(wgpu::ColorTargetState {
+                        #[cfg(target_arch = "wasm32")]
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        #[cfg(not(target_arch = "wasm32"))]
                         format: wgpu::TextureFormat::R32Float,
                         blend: None,
                         write_mask: wgpu::ColorWrites::ALL,

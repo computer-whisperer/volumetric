@@ -188,10 +188,68 @@
 //! ## Data Structures
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use web_time::Instant;
 use dashmap::DashSet;
+
+/// Conditional parallel iteration helpers.
+///
+/// These functions provide parallel iteration when the `native` feature is enabled
+/// (using rayon), and fall back to sequential iteration on web (wasm32).
+mod parallel_iter {
+    #[cfg(feature = "native")]
+    use rayon::prelude::*;
+
+    /// Process a Vec in parallel (native) or sequentially (web), returning results.
+    #[cfg(feature = "native")]
+    pub fn map_vec<T, R, F>(items: Vec<T>, f: F) -> Vec<R>
+    where
+        T: Send,
+        R: Send,
+        F: Fn(T) -> R + Sync + Send,
+    {
+        items.into_par_iter().map(f).collect()
+    }
+
+    #[cfg(not(feature = "native"))]
+    pub fn map_vec<T, R, F>(items: Vec<T>, f: F) -> Vec<R>
+    where
+        F: Fn(T) -> R,
+    {
+        items.into_iter().map(f).collect()
+    }
+
+    /// Process a range in parallel (native) or sequentially (web), returning results.
+    #[cfg(feature = "native")]
+    pub fn map_range<R, F>(range: std::ops::Range<usize>, f: F) -> Vec<R>
+    where
+        R: Send,
+        F: Fn(usize) -> R + Sync + Send,
+    {
+        range.into_par_iter().map(f).collect()
+    }
+
+    #[cfg(not(feature = "native"))]
+    pub fn map_range<R, F>(range: std::ops::Range<usize>, f: F) -> Vec<R>
+    where
+        F: Fn(usize) -> R,
+    {
+        range.into_iter().map(f).collect()
+    }
+}
+
+/// Marker trait for sampler functions used in adaptive surface nets.
+///
+/// On native builds, samplers must be Send + Sync for parallel iteration.
+/// On web builds, only Fn is required since iteration is sequential.
 #[cfg(feature = "native")]
-use rayon::prelude::*;
+pub trait SamplerFn: Fn(f64, f64, f64) -> f32 + Send + Sync {}
+#[cfg(feature = "native")]
+impl<F> SamplerFn for F where F: Fn(f64, f64, f64) -> f32 + Send + Sync {}
+
+#[cfg(not(feature = "native"))]
+pub trait SamplerFn: Fn(f64, f64, f64) -> f32 {}
+#[cfg(not(feature = "native"))]
+impl<F> SamplerFn for F where F: Fn(f64, f64, f64) -> f32 {}
 
 /// Configuration for the adaptive surface nets algorithm.
 #[derive(Clone, Debug)]
@@ -832,7 +890,7 @@ pub struct IndexedMesh2 {
 #[inline]
 fn sample_is_inside<F>(sampler: &F, x: f64, y: f64, z: f64, stats: &SamplingStats) -> bool
 where
-    F: Fn(f64, f64, f64) -> f32,
+    F: SamplerFn,
 {
     stats.total_samples.fetch_add(1, Ordering::Relaxed);
     sampler(x, y, z) > 0.0
@@ -857,7 +915,7 @@ fn stage1_coarse_discovery<F>(
     stats: &SamplingStats,
 ) -> Vec<WorkQueueEntry>
 where
-    F: Fn(f64, f64, f64) -> f32 + Send + Sync,
+    F: SamplerFn,
 {
     let res = config.base_resolution;
     let num_corners = res + 1;
@@ -962,7 +1020,7 @@ fn complete_corner_samples<F>(
     stats: &SamplingStats,
 ) -> CornerMask
 where
-    F: Fn(f64, f64, f64) -> f32,
+    F: SamplerFn,
 {
     for corner_idx in 0..8 {
         if entry.known_corners[corner_idx].is_none() {
@@ -998,7 +1056,7 @@ fn subdivide_and_filter_mixed<F>(
     stats: &SamplingStats,
 ) -> Vec<WorkQueueEntry>
 where
-    F: Fn(f64, f64, f64) -> f32,
+    F: SamplerFn,
 {
     let children = parent.cuboid.subdivide();
 
@@ -1257,7 +1315,7 @@ fn process_work_entry<F>(
     stats: &SamplingStats,
 ) -> ProcessedEntry
 where
-    F: Fn(f64, f64, f64) -> f32 + Send + Sync,
+    F: SamplerFn,
 {
     stats.cuboids_processed.fetch_add(1, Ordering::Relaxed);
 
@@ -1339,7 +1397,6 @@ where
     }
 }
 
-#[cfg(feature = "native")]
 fn stage2_subdivision_and_emission<F>(
     initial_queue: Vec<WorkQueueEntry>,
     sampler: &F,
@@ -1349,7 +1406,7 @@ fn stage2_subdivision_and_emission<F>(
     stats: &SamplingStats,
 ) -> Vec<SparseTriangle>
 where
-    F: Fn(f64, f64, f64) -> f32 + Send + Sync,
+    F: SamplerFn,
 {
     let max_depth = config.max_depth as u8;
     let base_res = config.base_resolution as i32;
@@ -1370,22 +1427,19 @@ where
 
     // Process in parallel batches until no more work
     while !current_batch.is_empty() {
-        // Process current batch in parallel
-        let results: Vec<ProcessedEntry> = current_batch
-            .into_par_iter()
-            .map(|entry| {
-                process_work_entry(
-                    entry,
-                    sampler,
-                    bounds_min,
-                    cell_size,
-                    max_depth,
-                    base_res,
-                    &visited,
-                    stats,
-                )
-            })
-            .collect();
+        // Process current batch in parallel (or sequentially on web)
+        let results: Vec<ProcessedEntry> = parallel_iter::map_vec(current_batch, |entry| {
+            process_work_entry(
+                entry,
+                sampler,
+                bounds_min,
+                cell_size,
+                max_depth,
+                base_res,
+                &visited,
+                stats,
+            )
+        });
 
         // Collect new work and triangles from results
         let mut next_batch = Vec::new();
@@ -1575,7 +1629,7 @@ fn find_crossing_along_direction<F>(
     initial_inside: bool,
 ) -> Option<((f64, f64, f64), (f64, f64, f64), bool)>
 where
-    F: Fn(f64, f64, f64) -> f32,
+    F: SamplerFn,
 {
     let pos_plus = (
         initial_pos.0 + dir.0 * search_distance,
@@ -1630,7 +1684,7 @@ fn binary_search_crossing<F>(
     stats: &SamplingStats,
 ) -> (f64, f64, f64)
 where
-    F: Fn(f64, f64, f64) -> f32,
+    F: SamplerFn,
 {
     for _ in 0..iterations {
         let mid = (
@@ -1685,7 +1739,7 @@ fn refine_vertex_position<F>(
     stats: &SamplingStats,
 ) -> ((f64, f64, f64), RefineOutcome)
 where
-    F: Fn(f64, f64, f64) -> f32,
+    F: SamplerFn,
 {
     // Sample at the initial position to determine which side we're on
     let initial_inside = sample_is_inside(sampler, initial_pos.0, initial_pos.1, initial_pos.2, stats);
@@ -1820,7 +1874,7 @@ fn find_surface_point_along_direction<F>(
     stats: &SamplingStats,
 ) -> Option<(f64, f64, f64)>
 where
-    F: Fn(f64, f64, f64) -> f32,
+    F: SamplerFn,
 {
     // Normalize direction
     let dir_len_sq = search_dir.0 * search_dir.0
@@ -2076,7 +2130,7 @@ fn refine_normal_via_probing<F>(
     stats: &SamplingStats,
 ) -> (f64, f64, f64)
 where
-    F: Fn(f64, f64, f64) -> f32,
+    F: SamplerFn,
 {
     // Normalize initial normal (our prior)
     let n_len_sq = initial_normal.0 * initial_normal.0
@@ -2212,7 +2266,7 @@ fn compute_reference_normal<F>(
     stats: &SamplingStats,
 ) -> (f64, f64, f64)
 where
-    F: Fn(f64, f64, f64) -> f32,
+    F: SamplerFn,
 {
     // Normalize initial normal
     let n_len_sq = initial_normal.0 * initial_normal.0
@@ -2359,7 +2413,6 @@ fn recompute_accumulated_normals(
 ///    better initial normal estimates than the original unrefined positions.
 /// 3. **Phase 4c - Normal Refinement** (optional): If normal_sample_iterations > 0,
 ///    further refine normals by probing the surface in tangent directions
-#[cfg(feature = "native")]
 fn stage4_vertex_refinement<F>(
     stage3: Stage3Result,
     sampler: &F,
@@ -2368,7 +2421,7 @@ fn stage4_vertex_refinement<F>(
     stats: &SamplingStats,
 ) -> IndexedMesh2
 where
-    F: Fn(f64, f64, f64) -> f32 + Send + Sync,
+    F: SamplerFn,
 {
     let vertex_count = stage3.vertices.len();
 
@@ -2386,43 +2439,40 @@ where
     // Phase 4a: Vertex Position Refinement
     // =========================================================================
     let refined_positions: Vec<(f64, f64, f64)> = if config.vertex_refinement_iterations > 0 {
-        (0..vertex_count)
-            .into_par_iter()
-            .map(|i| {
-                let initial_pos = stage3.vertices[i];
-                let accumulated_normal = stage3.accumulated_normals[i];
+        parallel_iter::map_range(0..vertex_count, |i| {
+            let initial_pos = stage3.vertices[i];
+            let accumulated_normal = stage3.accumulated_normals[i];
 
-                let (pos, outcome) = refine_vertex_position(
-                    initial_pos,
-                    accumulated_normal,
-                    search_distance,
-                    config.vertex_refinement_iterations,
-                    sampler,
-                    stats,
-                );
+            let (pos, outcome) = refine_vertex_position(
+                initial_pos,
+                accumulated_normal,
+                search_distance,
+                config.vertex_refinement_iterations,
+                sampler,
+                stats,
+            );
 
-                // Track refinement outcome
-                match outcome {
-                    RefineOutcome::Primary => {
-                        stats.refine_primary_hit.fetch_add(1, Ordering::Relaxed);
-                    }
-                    RefineOutcome::FallbackX => {
-                        stats.refine_fallback_x_hit.fetch_add(1, Ordering::Relaxed);
-                    }
-                    RefineOutcome::FallbackY => {
-                        stats.refine_fallback_y_hit.fetch_add(1, Ordering::Relaxed);
-                    }
-                    RefineOutcome::FallbackZ => {
-                        stats.refine_fallback_z_hit.fetch_add(1, Ordering::Relaxed);
-                    }
-                    RefineOutcome::Miss => {
-                        stats.refine_miss.fetch_add(1, Ordering::Relaxed);
-                    }
+            // Track refinement outcome
+            match outcome {
+                RefineOutcome::Primary => {
+                    stats.refine_primary_hit.fetch_add(1, Ordering::Relaxed);
                 }
+                RefineOutcome::FallbackX => {
+                    stats.refine_fallback_x_hit.fetch_add(1, Ordering::Relaxed);
+                }
+                RefineOutcome::FallbackY => {
+                    stats.refine_fallback_y_hit.fetch_add(1, Ordering::Relaxed);
+                }
+                RefineOutcome::FallbackZ => {
+                    stats.refine_fallback_z_hit.fetch_add(1, Ordering::Relaxed);
+                }
+                RefineOutcome::Miss => {
+                    stats.refine_miss.fetch_add(1, Ordering::Relaxed);
+                }
+            }
 
-                pos
-            })
-            .collect()
+            pos
+        })
     } else {
         stage3.vertices.clone()
     };
@@ -2441,24 +2491,21 @@ where
         // Further refine normals via tangent plane probing
         let normal_search_distance = search_distance * 2.0;
 
-        (0..vertex_count)
-            .into_par_iter()
-            .map(|i| {
-                let refined_pos = refined_positions[i];
-                let recomputed_normal = recomputed_normals[i];
+        parallel_iter::map_range(0..vertex_count, |i| {
+            let refined_pos = refined_positions[i];
+            let recomputed_normal = recomputed_normals[i];
 
-                let refined = refine_normal_via_probing(
-                    refined_pos,
-                    recomputed_normal,
-                    probe_epsilon,
-                    normal_search_distance,
-                    config.normal_sample_iterations,
-                    sampler,
-                    stats,
-                );
-                normalize_or_default(refined)
-            })
-            .collect()
+            let refined = refine_normal_via_probing(
+                refined_pos,
+                recomputed_normal,
+                probe_epsilon,
+                normal_search_distance,
+                config.normal_sample_iterations,
+                sampler,
+                stats,
+            );
+            normalize_or_default(refined)
+        })
     } else {
         // Just normalize the recomputed normals
         recomputed_normals
@@ -2484,7 +2531,9 @@ where
 ///
 /// Tests iteration counts: 0 (topology only), 4, 8, 12, 16, 24
 /// Returns error statistics for each level compared to high-precision (32-iter) reference.
-#[cfg(feature = "normal-diagnostic")]
+///
+/// Note: This diagnostic feature requires the `native` feature for parallel iteration.
+#[cfg(all(feature = "normal-diagnostic", feature = "native"))]
 pub fn run_normal_diagnostics<F>(
     refined_positions: &[(f64, f64, f64)],
     recomputed_normals: &[(f64, f64, f64)],
@@ -2494,7 +2543,7 @@ pub fn run_normal_diagnostics<F>(
     stats: &SamplingStats,
 ) -> Vec<NormalDiagnosticEntry>
 where
-    F: Fn(f64, f64, f64) -> f32 + Send + Sync,
+    F: SamplerFn,
 {
     let vertex_count = refined_positions.len();
     eprintln!("Running normal diagnostics on {} vertices...", vertex_count);
@@ -2604,7 +2653,133 @@ pub fn adaptive_surface_nets_2<F>(
     config: &AdaptiveMeshConfig2,
 ) -> MeshingResult2
 where
-    F: Fn(f64, f64, f64) -> f32 + Send + Sync,
+    F: SamplerFn,
+{
+    let total_start = Instant::now();
+    let stats = SamplingStats::default();
+
+    // Convert bounds to f64 for internal calculations
+    let bounds_min_f64 = (
+        bounds_min.0 as f64,
+        bounds_min.1 as f64,
+        bounds_min.2 as f64,
+    );
+    let bounds_max_f64 = (
+        bounds_max.0 as f64,
+        bounds_max.1 as f64,
+        bounds_max.2 as f64,
+    );
+
+    // Calculate cell size at finest level (per-axis for non-cubic bounds)
+    // Total cells at finest level = base_resolution * 2^max_depth
+    let finest_cells_per_axis = config.base_resolution * (1 << config.max_depth);
+    let cell_size = (
+        (bounds_max_f64.0 - bounds_min_f64.0) / finest_cells_per_axis as f64,
+        (bounds_max_f64.1 - bounds_min_f64.1) / finest_cells_per_axis as f64,
+        (bounds_max_f64.2 - bounds_min_f64.2) / finest_cells_per_axis as f64,
+    );
+
+    // Stage 1: Coarse grid discovery
+    let stage1_start = Instant::now();
+    let samples_before_stage1 = stats.total_samples.load(Ordering::Relaxed);
+    let initial_work_queue = stage1_coarse_discovery(
+        &sampler,
+        bounds_min_f64,
+        bounds_max_f64,
+        config,
+        &stats,
+    );
+    let stage1_time = stage1_start.elapsed().as_secs_f64();
+    let stage1_samples = stats.total_samples.load(Ordering::Relaxed) - samples_before_stage1;
+    let stage1_mixed_cells = initial_work_queue.len();
+
+    // Stage 2: Subdivision and triangle emission
+    let stage2_start = Instant::now();
+    let samples_before_stage2 = stats.total_samples.load(Ordering::Relaxed);
+    let cuboids_before_stage2 = stats.cuboids_processed.load(Ordering::Relaxed);
+    let triangles_before_stage2 = stats.triangles_emitted.load(Ordering::Relaxed);
+    let sparse_triangles = stage2_subdivision_and_emission(
+        initial_work_queue,
+        &sampler,
+        bounds_min_f64,
+        cell_size,
+        config,
+        &stats,
+    );
+    let stage2_time = stage2_start.elapsed().as_secs_f64();
+    let stage2_samples = stats.total_samples.load(Ordering::Relaxed) - samples_before_stage2;
+    let stage2_cuboids = stats.cuboids_processed.load(Ordering::Relaxed) - cuboids_before_stage2;
+    let stage2_triangles = stats.triangles_emitted.load(Ordering::Relaxed) - triangles_before_stage2;
+
+    // Stage 3: Topology finalization
+    let stage3_start = Instant::now();
+    let stage3_result = stage3_topology_finalization(
+        sparse_triangles,
+        bounds_min_f64,
+        cell_size,
+    );
+    let stage3_time = stage3_start.elapsed().as_secs_f64();
+    let stage3_unique_vertices = stage3_result.vertices.len();
+
+    // Stage 4: Vertex refinement & normal estimation
+    let stage4_start = Instant::now();
+    let samples_before_stage4 = stats.total_samples.load(Ordering::Relaxed);
+    let mesh = stage4_vertex_refinement(
+        stage3_result,
+        &sampler,
+        cell_size,
+        config,
+        &stats,
+    );
+    let stage4_time = stage4_start.elapsed().as_secs_f64();
+    let stage4_samples = stats.total_samples.load(Ordering::Relaxed) - samples_before_stage4;
+
+    let total_time = total_start.elapsed().as_secs_f64();
+    let total_samples = stats.total_samples.load(Ordering::Relaxed);
+
+    let meshing_stats = MeshingStats2 {
+        total_time_secs: total_time,
+        stage1_time_secs: stage1_time,
+        stage1_samples,
+        stage1_mixed_cells,
+        stage2_time_secs: stage2_time,
+        stage2_samples,
+        stage2_cuboids_processed: stage2_cuboids,
+        stage2_triangles_emitted: stage2_triangles,
+        stage3_time_secs: stage3_time,
+        stage3_unique_vertices,
+        stage4_time_secs: stage4_time,
+        stage4_samples,
+        stage4_refine_primary_hit: stats.refine_primary_hit.load(Ordering::Relaxed),
+        stage4_refine_fallback_x_hit: stats.refine_fallback_x_hit.load(Ordering::Relaxed),
+        stage4_refine_fallback_y_hit: stats.refine_fallback_y_hit.load(Ordering::Relaxed),
+        stage4_refine_fallback_z_hit: stats.refine_fallback_z_hit.load(Ordering::Relaxed),
+        stage4_refine_miss: stats.refine_miss.load(Ordering::Relaxed),
+        total_samples,
+        total_vertices: mesh.vertices.len(),
+        total_triangles: mesh.indices.len() / 3,
+        effective_resolution: finest_cells_per_axis,
+    };
+
+    MeshingResult2 {
+        mesh,
+        stats: meshing_stats,
+    }
+}
+
+/// Main entry point for adaptive surface nets meshing (web/sequential version).
+///
+/// This version does not require Send + Sync bounds since web is single-threaded.
+/// Uses sequential iteration instead of parallel iteration.
+#[cfg(not(feature = "native"))]
+pub fn adaptive_surface_nets_2<F>(
+    sampler: F,
+    bounds_min: (f32, f32, f32),
+    bounds_max: (f32, f32, f32),
+    config: &AdaptiveMeshConfig2,
+) -> MeshingResult2
+where
+    F: SamplerFn,
 {
     let total_start = Instant::now();
     let stats = SamplingStats::default();

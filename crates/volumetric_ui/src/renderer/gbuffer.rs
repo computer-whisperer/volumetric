@@ -63,14 +63,21 @@ impl GBuffer {
         });
         let normal_view = normal_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // Depth texture (linear depth for SSAO, R32Float is not filterable)
+        // Depth texture (linear depth for SSAO)
+        // On web, R32Float as render target may not be supported, so use Rgba16Float
+        // which has better compatibility while still providing good precision.
+        #[cfg(target_arch = "wasm32")]
+        let depth_format = wgpu::TextureFormat::Rgba16Float;
+        #[cfg(not(target_arch = "wasm32"))]
+        let depth_format = wgpu::TextureFormat::R32Float;
+
         let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("gbuffer_depth"),
             size: extent,
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R32Float,
+            format: depth_format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });

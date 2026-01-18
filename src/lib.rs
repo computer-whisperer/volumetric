@@ -287,6 +287,38 @@ pub fn generate_adaptive_mesh_v2_from_bytes(
     })
 }
 
+/// Generate an indexed mesh using Adaptive Surface Nets v2 (web version).
+/// Uses the WebParallelSampler for single-threaded web execution.
+#[cfg(all(feature = "web", not(feature = "native")))]
+pub fn generate_adaptive_mesh_v2_from_bytes(
+    wasm_bytes: &[u8],
+    config: &adaptive_surface_nets_2::AdaptiveMeshConfig2,
+) -> anyhow::Result<AdaptiveMeshV2Result> {
+    use wasm::ParallelModelSampler;
+
+    let wasm_sampler = wasm::create_parallel_sampler(wasm_bytes)
+        .context("Failed to create parallel sampler")?;
+
+    let bounds = wasm_sampler.get_bounds()?;
+    let (bounds_min, bounds_max) = bounds.as_f32();
+
+    // Create a closure-based sampler that wraps the WebParallelSampler
+    let sampler = move |x: f64, y: f64, z: f64| -> f32 {
+        wasm_sampler.sample(x, y, z)
+    };
+
+    let result = adaptive_surface_nets_2::adaptive_surface_nets_2(sampler, bounds_min, bounds_max, config);
+
+    Ok(AdaptiveMeshV2Result {
+        vertices: result.mesh.vertices,
+        normals: result.mesh.normals,
+        indices: result.mesh.indices,
+        bounds_min,
+        bounds_max,
+        stats: result.stats,
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, serde::Deserialize, serde::Serialize)]
 pub enum AssetType {
     ModelWASM,

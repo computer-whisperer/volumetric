@@ -531,9 +531,8 @@ fn execute_resample(
                 }
             }
         }
-        ExportRenderMode::AdaptiveSurfaceNets | ExportRenderMode::AdaptiveSurfaceNets2 => {
-            // Adaptive meshing requires wasmtime's parallel sampler, not available on web
-            // Fall back to marching cubes
+        ExportRenderMode::AdaptiveSurfaceNets => {
+            // ASN v1 uses native-only parallel sampler features, fall back to marching cubes
             match generate_marching_cubes_mesh_from_bytes(&wasm_bytes, config.resolution) {
                 Ok((tris, bounds_min, bounds_max)) => {
                     result.bounds_min = bounds_min;
@@ -568,7 +567,44 @@ fn execute_resample(
                     result.triangles = tris;
                 }
                 Err(e) => {
-                    result.error = Some(format!("Adaptive mesh not available on web, marching cubes fallback failed: {}", e));
+                    result.error = Some(format!("ASN v1 not available on web, marching cubes fallback failed: {}", e));
+                }
+            }
+        }
+        ExportRenderMode::AdaptiveSurfaceNets2 => {
+            let asn2_config = adaptive_surface_nets_2::AdaptiveMeshConfig2 {
+                base_resolution: config.asn2_base_resolution,
+                max_depth: config.asn2_max_depth,
+                vertex_refinement_iterations: config.asn2_vertex_refinement_iterations,
+                normal_sample_iterations: config.asn2_normal_sample_iterations,
+                normal_epsilon_frac: config.asn2_normal_epsilon_frac,
+                num_threads: 0, // Web is single-threaded
+            };
+            match generate_adaptive_mesh_v2_from_bytes(&wasm_bytes, &asn2_config) {
+                Ok(meshing_result) => {
+                    result.bounds_min = meshing_result.bounds_min;
+                    result.bounds_max = meshing_result.bounds_max;
+                    result.sample_count = meshing_result.stats.total_samples as usize;
+                    result.asn2_stats = Some(meshing_result.stats);
+
+                    // Build indexed mesh data
+                    let vertices: Vec<marching_cubes_wgpu::MeshVertex> = meshing_result
+                        .vertices
+                        .iter()
+                        .zip(meshing_result.normals.iter())
+                        .map(|(pos, norm)| marching_cubes_wgpu::MeshVertex {
+                            position: (*pos).into(),
+                            _pad0: 0.0,
+                            normal: (*norm).into(),
+                            _pad1: 0.0,
+                        })
+                        .collect();
+
+                    result.mesh_vertices = Arc::new(vertices);
+                    result.mesh_indices = Some(Arc::new(meshing_result.indices));
+                }
+                Err(e) => {
+                    result.error = Some(format!("{}", e));
                 }
             }
         }
@@ -597,12 +633,12 @@ use volumetric::{
 };
 
 // WASM execution functions available on both native and web
-use volumetric::{generate_marching_cubes_mesh_from_bytes, sample_model_from_bytes};
+use volumetric::{generate_marching_cubes_mesh_from_bytes, generate_adaptive_mesh_v2_from_bytes, sample_model_from_bytes};
 
 // Native-only: Advanced WASM execution functions (require wasmtime directly)
 #[cfg(not(target_arch = "wasm32"))]
 use volumetric::{
-    generate_adaptive_mesh_from_bytes, generate_adaptive_mesh_v2_from_bytes,
+    generate_adaptive_mesh_from_bytes,
     operator_metadata_from_wasm_bytes, stl,
 };
 
@@ -3269,22 +3305,20 @@ impl eframe::App for VolumetricApp {
                 background_color: [0.098, 0.098, 0.149, 1.0], // rgb(25,25,38)
             };
 
-            // Render scene if not empty
-            if !scene.meshes.is_empty() || !scene.points.is_empty() {
-                let cb = eframe::egui_wgpu::Callback::new_paint_callback(
-                    rect,
-                    renderer::SceneCallback {
-                        data: renderer::SceneDrawData {
-                            scene: scene.clone(),
-                            camera,
-                            settings,
-                            viewport_size: viewport_size_px,
-                            target_format: self.wgpu_target_format,
-                        },
+            // Always render the scene (grid, axis indicator render even with no models)
+            let cb = eframe::egui_wgpu::Callback::new_paint_callback(
+                rect,
+                renderer::SceneCallback {
+                    data: renderer::SceneDrawData {
+                        scene: scene.clone(),
+                        camera,
+                        settings,
+                        viewport_size: viewport_size_px,
+                        target_format: self.wgpu_target_format,
                     },
-                );
-                painter.add(egui::Shape::Callback(cb));
-            }
+                },
+            );
+            painter.add(egui::Shape::Callback(cb));
 
             // Draw info text showing totals across all rendered assets
             let total_points: usize = self.asset_render_data.values()
