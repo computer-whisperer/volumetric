@@ -27,6 +27,7 @@ use poll_promise::Promise;
 mod marching_cubes_wgpu;
 mod platform;
 mod point_cloud_wgpu;
+mod renderer;
 
 // =============================================================================
 // Background Task System
@@ -3201,128 +3202,95 @@ impl eframe::App for VolumetricApp {
             
             // Draw background
             painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(25, 25, 38));
-            
-            let camera_pos = self.camera_position();
-            
-            // Render all assets in asset_render_data - supports multiple entities in the same frame
-            let aspect = rect.width() / rect.height().max(1.0);
-            let view_proj = point_cloud_wgpu::view_proj_from_camera(
-                camera_pos,
-                (0.0, 0.0, 0.0),
-                60.0_f32.to_radians(),
-                aspect,
-                0.1,
-                100.0,
-            );
-            
-            // Collect all point cloud data from assets using PointCloud mode
-            let all_points: Vec<(f32, f32, f32)> = self.asset_render_data.values()
-                .filter(|d| d.mode == ExportRenderMode::PointCloud)
-                .flat_map(|d| d.points.iter().cloned())
-                .collect();
-            
-            if !all_points.is_empty() {
-                let cb = eframe::egui_wgpu::Callback::new_paint_callback(
-                    rect,
-                    point_cloud_wgpu::PointCloudCallback {
-                        data: point_cloud_wgpu::PointCloudDrawData {
-                            points: Arc::new(all_points.clone()),
-                            camera_pos,
-                            view_proj,
-                            point_size_px: 3.0,
-                            target_format: self.wgpu_target_format,
-                        },
-                    },
-                );
-                painter.add(egui::Shape::Callback(cb));
-            }
-            
-            // Collect all mesh data from assets using mesh modes
-            // For indexed meshes (ASN2), we can use indexed rendering if there's only one such asset
-            let mesh_assets: Vec<&AssetRenderData> = self.asset_render_data.values()
-                .filter(|d| matches!(d.mode,
-                    ExportRenderMode::MarchingCubes |
-                    ExportRenderMode::AdaptiveSurfaceNets |
-                    ExportRenderMode::AdaptiveSurfaceNets2))
-                .collect();
 
-            // Determine if we can use indexed rendering (single ASN2 asset)
-            let single_indexed_asset = mesh_assets.len() == 1
-                && mesh_assets[0].mode == ExportRenderMode::AdaptiveSurfaceNets2
-                && mesh_assets[0].mesh_indices.is_some();
-
-            let (all_vertices, all_indices): (Vec<marching_cubes_wgpu::MeshVertex>, Option<Arc<Vec<u32>>>) =
-                if single_indexed_asset {
-                    // Use indexed rendering for single ASN2 asset
-                    let asset = mesh_assets[0];
-                    (asset.mesh_vertices.iter().cloned().collect(), asset.mesh_indices.clone())
-                } else {
-                    // Combine all meshes as non-indexed
-                    // For indexed meshes, expand them using indices
-                    let mut combined_vertices = Vec::new();
-                    for asset in &mesh_assets {
-                        if let Some(ref indices) = asset.mesh_indices {
-                            // Expand indexed mesh
-                            for &idx in indices.iter() {
-                                if let Some(v) = asset.mesh_vertices.get(idx as usize) {
-                                    combined_vertices.push(*v);
-                                }
-                            }
-                        } else {
-                            // Non-indexed mesh - add directly
-                            combined_vertices.extend(asset.mesh_vertices.iter().cloned());
-                        }
-                    }
-                    (combined_vertices, None)
-                };
-
-            if !all_vertices.is_empty() {
-                let pixels_per_point = ui.ctx().pixels_per_point();
-                let viewport_size_px = [
-                    (rect.width() * pixels_per_point).round().max(1.0) as u32,
-                    (rect.height() * pixels_per_point).round().max(1.0) as u32,
-                ];
-                let cb = eframe::egui_wgpu::Callback::new_paint_callback(
-                    rect,
-                    marching_cubes_wgpu::MarchingCubesCallback {
-                        data: marching_cubes_wgpu::MarchingCubesDrawData {
-                            vertices: Arc::new(all_vertices.clone()),
-                            indices: all_indices,
-                            view_proj,
-                            viewport_size_px,
-                            ssao_enabled: self.ssao_enabled,
-                            ssao_radius: self.ssao_radius,
-                            ssao_bias: self.ssao_bias,
-                            ssao_strength: self.ssao_strength,
-                            target_format: self.wgpu_target_format,
-                        },
-                    },
-                );
-                painter.add(egui::Shape::Callback(cb));
-            }
-            
-            // Draw coordinate axes as overlay (after 3D content so they appear on top)
-            let origin = (0.0, 0.0, 0.0);
-            let axis_len = 0.5;
-            let axes = [
-                ((axis_len, 0.0, 0.0), egui::Color32::RED),
-                ((0.0, axis_len, 0.0), egui::Color32::GREEN),
-                ((0.0, 0.0, axis_len), egui::Color32::BLUE),
+            // Build scene from asset data
+            let pixels_per_point = ui.ctx().pixels_per_point();
+            let viewport_size_px = [
+                (rect.width() * pixels_per_point).round().max(1.0) as u32,
+                (rect.height() * pixels_per_point).round().max(1.0) as u32,
             ];
-            
-            if let Some(origin_screen) = self.project_point(origin, &rect) {
-                for (axis_end, color) in axes {
-                    if let Some(end_screen) = self.project_point(axis_end, &rect) {
-                        painter.line_segment(
-                            [origin_screen, end_screen],
-                            egui::Stroke::new(2.0, color),
-                        );
-                    }
+
+            let mut scene = renderer::SceneData::new();
+
+            // Add point clouds from assets
+            for asset_data in self.asset_render_data.values() {
+                if asset_data.mode == ExportRenderMode::PointCloud && !asset_data.points.is_empty() {
+                    scene.add_points(
+                        renderer::convert_points_to_point_data(&asset_data.points),
+                        glam::Mat4::IDENTITY,
+                        renderer::PointStyle {
+                            size: 3.0,
+                            size_mode: renderer::WidthMode::ScreenSpace,
+                            shape: renderer::PointShape::Circle,
+                            depth_mode: renderer::DepthMode::Normal,
+                        },
+                    );
                 }
             }
-            
+
+            // Add meshes from assets
+            for asset_data in self.asset_render_data.values() {
+                if matches!(asset_data.mode,
+                    ExportRenderMode::MarchingCubes |
+                    ExportRenderMode::AdaptiveSurfaceNets |
+                    ExportRenderMode::AdaptiveSurfaceNets2
+                ) && !asset_data.mesh_vertices.is_empty() {
+                    scene.add_mesh(
+                        renderer::convert_mesh_data(
+                            &asset_data.mesh_vertices,
+                            asset_data.mesh_indices.as_ref().map(|v| v.as_slice()),
+                        ),
+                        glam::Mat4::IDENTITY,
+                        renderer::MaterialId(0),
+                    );
+                }
+            }
+
+            // Create camera from existing spherical coords
+            let camera = renderer::Camera {
+                target: glam::Vec3::ZERO,
+                radius: self.camera_radius,
+                theta: self.camera_theta,
+                phi: self.camera_phi,
+                fov_y: 60.0_f32.to_radians(),
+                near: 0.1,
+                far: 100.0,
+            };
+
+            let settings = renderer::RenderSettings {
+                ssao_enabled: self.ssao_enabled,
+                ssao_samples: 16,
+                ssao_radius: self.ssao_radius,
+                ssao_bias: self.ssao_bias,
+                ssao_strength: self.ssao_strength,
+                grid: renderer::GridSettings::default(),
+                axis_indicator: renderer::AxisIndicator::default(),
+                show_axis_indicator: false,
+                background_color: [0.098, 0.098, 0.149, 1.0], // rgb(25,25,38)
+            };
+
+            // Render scene if not empty
+            if !scene.meshes.is_empty() || !scene.points.is_empty() {
+                let cb = eframe::egui_wgpu::Callback::new_paint_callback(
+                    rect,
+                    renderer::SceneCallback {
+                        data: renderer::SceneDrawData {
+                            scene: scene.clone(),
+                            camera,
+                            settings,
+                            viewport_size: viewport_size_px,
+                            target_format: self.wgpu_target_format,
+                        },
+                    },
+                );
+                painter.add(egui::Shape::Callback(cb));
+            }
+
             // Draw info text showing totals across all rendered assets
-            let total_points = all_points.len();
+            let total_points: usize = self.asset_render_data.values()
+                .filter(|d| d.mode == ExportRenderMode::PointCloud)
+                .map(|d| d.points.len())
+                .sum();
             let total_triangles: usize = self.asset_render_data.values()
                 .filter(|d| matches!(d.mode,
                     ExportRenderMode::MarchingCubes |
@@ -3338,7 +3306,7 @@ impl eframe::App for VolumetricApp {
                 })
                 .sum();
             let num_assets = self.asset_render_data.len();
-            
+
             let info_text = if num_assets == 0 {
                 "No models | Drag to rotate, scroll to zoom".to_string()
             } else {
