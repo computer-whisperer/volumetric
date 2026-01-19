@@ -10,7 +10,13 @@
 //!
 //! Input/Output:
 //! - Input 0: UTF-8 Lua source containing the required functions
-//! - Output 0: WASM bytes of a model module that exports the model ABI
+//! - Output 0: WASM bytes of a model module that exports the N-dimensional model ABI
+//!
+//! Generated Model ABI:
+//! - `get_dimensions() -> u32`: Returns 3 (always 3D)
+//! - `get_bounds(out_ptr: i32)`: Writes 6 f64 values (min_x, max_x, min_y, max_y, min_z, max_z)
+//! - `sample(pos_ptr: i32) -> f32`: Reads position from memory, returns density
+//! - `memory`: Exported memory for position/bounds I/O
 //!
 //! # Supported Lua Subset
 //!
@@ -90,6 +96,8 @@ unsafe extern "C" {
     fn post_output(output_idx: i32, ptr: i32, len: i32);
 }
 
+/// Required Lua functions that must be defined in the script.
+/// These are compiled to internal WASM functions and wrapped by the ABI exports.
 const REQUIRED_FUNCS: &[&str] = &[
     "is_inside",
     "get_bounds_min_x",
@@ -1344,7 +1352,15 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
         func_ids.insert(fname.clone(), fid);
     }
 
-    // Generate WASM functions for each required Lua function
+    // Create memory for I/O buffers and export it
+    // add_local(shared, shared64, initial_pages, max_pages, page_size_log2)
+    let memory_id = module.memories.add_local(false, false, 1, None, None);
+    module.exports.add("memory", memory_id);
+
+    // Generate internal WASM functions for each required Lua function (not exported directly)
+    // These will be called by the ABI wrapper functions
+    let mut internal_func_ids: HashMap<String, walrus::FunctionId> = HashMap::new();
+
     for &fname in REQUIRED_FUNCS {
         let ir_func = functions.get(fname).unwrap();
         match fname {
@@ -1352,10 +1368,11 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                 if ir_func.params.len() != 3 {
                     return Err(CompileError::Type("is_inside must take 3 params".into()));
                 }
+                // Internal is_inside: (f64, f64, f64) -> f64 (not demoted to f32 yet)
                 let mut fb = FunctionBuilder::new(
                     &mut module.types,
                     &[ValType::F64, ValType::F64, ValType::F64],
-                    &[ValType::F32],
+                    &[ValType::F64],
                 );
                 let l_x = module.locals.add(ValType::F64);
                 let l_y = module.locals.add(ValType::F64);
@@ -1369,11 +1386,11 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                 if let Some(expr) = ret_expr {
                     emit_ir_expr(&mut ib, &func_ids, &expr, &ir_func.params, &locals_map)?;
                 }
-                ib.unop(UnaryOp::F32DemoteF64);
                 let fid = fb.finish(vec![l_x, l_y, l_z], &mut module.funcs);
-                module.exports.add("is_inside", fid);
+                internal_func_ids.insert(fname.to_string(), fid);
             }
             _ => {
+                // Bounds getter: () -> f64
                 if !ir_func.params.is_empty() {
                     return Err(CompileError::Type("bounds getters must have 0 params".into()));
                 }
@@ -1385,9 +1402,80 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                     emit_ir_expr(&mut ib, &func_ids, &expr, &ir_func.params, &locals_map)?;
                 }
                 let fid = fb.finish(vec![], &mut module.funcs);
-                module.exports.add(fname, fid);
+                internal_func_ids.insert(fname.to_string(), fid);
             }
         }
+    }
+
+    // Generate and export get_dimensions() -> u32
+    {
+        let mut fb = FunctionBuilder::new(&mut module.types, &[], &[ValType::I32]);
+        let mut ib = fb.func_body();
+        ib.i32_const(3); // Always 3 dimensions
+        let fid = fb.finish(vec![], &mut module.funcs);
+        module.exports.add("get_dimensions", fid);
+    }
+
+    // Generate and export get_bounds(out_ptr: i32)
+    // Writes 6 f64 values: min_x, max_x, min_y, max_y, min_z, max_z
+    {
+        let mut fb = FunctionBuilder::new(&mut module.types, &[ValType::I32], &[]);
+        let out_ptr = module.locals.add(ValType::I32);
+        let mut ib = fb.func_body();
+
+        let bounds_funcs = [
+            ("get_bounds_min_x", 0),
+            ("get_bounds_max_x", 8),
+            ("get_bounds_min_y", 16),
+            ("get_bounds_max_y", 24),
+            ("get_bounds_min_z", 32),
+            ("get_bounds_max_z", 40),
+        ];
+
+        for (func_name, offset) in bounds_funcs {
+            let func_id = *internal_func_ids.get(func_name).unwrap();
+            let mem_arg = walrus::ir::MemArg { align: 3, offset };
+            ib.local_get(out_ptr);
+            ib.call(func_id);
+            ib.store(memory_id, walrus::ir::StoreKind::F64, mem_arg);
+        }
+
+        let fid = fb.finish(vec![out_ptr], &mut module.funcs);
+        module.exports.add("get_bounds", fid);
+    }
+
+    // Generate and export sample(pos_ptr: i32) -> f32
+    // Reads 3 f64 values from pos_ptr, calls internal is_inside, returns f32
+    {
+        let mut fb = FunctionBuilder::new(&mut module.types, &[ValType::I32], &[ValType::F32]);
+        let pos_ptr = module.locals.add(ValType::I32);
+        let mut ib = fb.func_body();
+
+        let is_inside_id = *internal_func_ids.get("is_inside").unwrap();
+
+        // Load x from pos_ptr + 0
+        let mem_arg_x = walrus::ir::MemArg { align: 3, offset: 0 };
+        ib.local_get(pos_ptr);
+        ib.load(memory_id, walrus::ir::LoadKind::F64, mem_arg_x);
+
+        // Load y from pos_ptr + 8
+        let mem_arg_y = walrus::ir::MemArg { align: 3, offset: 8 };
+        ib.local_get(pos_ptr);
+        ib.load(memory_id, walrus::ir::LoadKind::F64, mem_arg_y);
+
+        // Load z from pos_ptr + 16
+        let mem_arg_z = walrus::ir::MemArg { align: 3, offset: 16 };
+        ib.local_get(pos_ptr);
+        ib.load(memory_id, walrus::ir::LoadKind::F64, mem_arg_z);
+
+        // Call internal is_inside(x, y, z) -> f64
+        ib.call(is_inside_id);
+
+        // Convert f64 to f32
+        ib.unop(UnaryOp::F32DemoteF64);
+
+        let fid = fb.finish(vec![pos_ptr], &mut module.funcs);
+        module.exports.add("sample", fid);
     }
 
     Ok(module.emit_wasm())

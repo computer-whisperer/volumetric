@@ -8,6 +8,12 @@
 //! Operator ABI:
 //! - `get_metadata() -> i64` returning `(ptr: u32, len: u32)` packed as `ptr | (len << 32)`
 //!
+//! Generated Model ABI (N-dimensional):
+//! - `get_dimensions() -> u32`: Returns 3
+//! - `get_bounds(out_ptr: i32)`: Writes interleaved min/max bounds
+//! - `sample(pos_ptr: i32) -> f32`: Reads position from memory, returns density
+//! - `memory`: Linear memory export
+//!
 //! Behavior:
 //! - Reads CBOR configuration from input 0 (width, depth, height, clip)
 //! - Reads PNG/JPEG/BMP/GIF image data from input 1 (16-bit grayscale supported)
@@ -15,13 +21,14 @@
 //! - Pixels with normalized height < clip threshold produce no geometry
 //!
 //! Memory Layout in Generated WASM:
-//! - Offset 0-3:   width_pixels: u32
-//! - Offset 4-7:   height_pixels: u32
-//! - Offset 8-15:  config.width: f64 (model width in meters)
-//! - Offset 16-23: config.depth: f64 (model depth in meters)
-//! - Offset 24-31: config.height: f64 (max height for full white)
-//! - Offset 32-39: config.clip: f64 (clip threshold, 0.0-1.0)
-//! - Offset 40+:   Height data (width_pixels * height_pixels * f32, row-major, normalized 0-1)
+//! - Offset 0-255: I/O buffer reserved for position/bounds
+//! - Offset 256-259: width_pixels: u32
+//! - Offset 260-263: height_pixels: u32
+//! - Offset 264-271: config.width: f64 (model width in meters)
+//! - Offset 272-279: config.depth: f64 (model depth in meters)
+//! - Offset 280-287: config.height: f64 (max height for full white)
+//! - Offset 288-295: config.clip: f64 (clip threshold, 0.0-1.0)
+//! - Offset 296+:   Height data (width_pixels * height_pixels * f32, row-major, normalized 0-1)
 
 use wasm_encoder::{
     CodeSection, ConstExpr, DataSection, ExportKind, ExportSection, Function, FunctionSection,
@@ -135,38 +142,40 @@ fn parse_image_to_heightmap(image_data: &[u8]) -> Result<Heightmap, &'static str
 // ============================================================================
 
 // Memory layout constants
+// I/O buffer: 256 bytes reserved at start
 // Header: 2 × u32 (8) + 4 × f64 (32) = 40 bytes
-// - Offset 0-3: width_pixels (u32)
-// - Offset 4-7: height_pixels (u32)
-// - Offset 8-15: config.width (f64)
-// - Offset 16-23: config.depth (f64)
-// - Offset 24-31: config.height (f64)
-// - Offset 32-39: config.clip (f64)
+const IO_BUFFER_SIZE: u32 = 256;
+const HEADER_OFFSET: u32 = IO_BUFFER_SIZE;
 const HEADER_SIZE: u32 = 40;
-const DATA_OFFSET: u32 = HEADER_SIZE;
+const DATA_OFFSET: u32 = HEADER_OFFSET + HEADER_SIZE; // 296
+
+// Header field offsets (relative to HEADER_OFFSET)
+const WIDTH_PIXELS_OFFSET: u32 = HEADER_OFFSET;       // 256
+const HEIGHT_PIXELS_OFFSET: u32 = HEADER_OFFSET + 4;  // 260
+const CONFIG_WIDTH_OFFSET: u32 = HEADER_OFFSET + 8;   // 264
+const CONFIG_DEPTH_OFFSET: u32 = HEADER_OFFSET + 16;  // 272
+const CONFIG_HEIGHT_OFFSET: u32 = HEADER_OFFSET + 24; // 280
+const CONFIG_CLIP_OFFSET: u32 = HEADER_OFFSET + 32;   // 288
 
 // Function indices
-const FN_IS_INSIDE: u32 = 0;
-const FN_BOUNDS_MIN_X: u32 = 1;
-const FN_BOUNDS_MIN_Y: u32 = 2;
-const FN_BOUNDS_MIN_Z: u32 = 3;
-const FN_BOUNDS_MAX_X: u32 = 4;
-const FN_BOUNDS_MAX_Y: u32 = 5;
-const FN_BOUNDS_MAX_Z: u32 = 6;
+const FN_GET_DIMENSIONS: u32 = 0;
+const FN_GET_BOUNDS: u32 = 1;
+const FN_SAMPLE: u32 = 2;
 
 // Type indices
-const TYPE_IS_INSIDE: u32 = 0; // (f64, f64, f64) -> f32
-const TYPE_BOUNDS: u32 = 1; // () -> f64
+const TYPE_GET_DIMENSIONS: u32 = 0; // () -> i32
+const TYPE_GET_BOUNDS: u32 = 1;     // (i32) -> ()
+const TYPE_SAMPLE: u32 = 2;         // (i32) -> f32
 
 fn generate_wasm(heightmap: &Heightmap, config: &HeightmapConfig) -> Vec<u8> {
     let pixel_count = heightmap.width * heightmap.height;
     let data_size = pixel_count * 4; // f32 per pixel
-    let total_data_size = HEADER_SIZE + data_size;
+    let total_data_size = IO_BUFFER_SIZE + HEADER_SIZE + data_size;
 
     // Calculate required memory pages (64KB each)
     let memory_pages = ((total_data_size + 65535) / 65536) as u64;
 
-    // Serialize data section
+    // Serialize data section (starts at HEADER_OFFSET)
     let data_bytes = serialize_data(heightmap, config);
 
     // Build WASM module
@@ -174,23 +183,19 @@ fn generate_wasm(heightmap: &Heightmap, config: &HeightmapConfig) -> Vec<u8> {
 
     // Type section
     let mut types = TypeSection::new();
-    // Type 0: is_inside(f64, f64, f64) -> f32
-    types
-        .ty()
-        .function([ValType::F64, ValType::F64, ValType::F64], [ValType::F32]);
-    // Type 1: bounds() -> f64
-    types.ty().function([], [ValType::F64]);
+    // Type 0: get_dimensions() -> i32
+    types.ty().function([], [ValType::I32]);
+    // Type 1: get_bounds(out_ptr: i32) -> ()
+    types.ty().function([ValType::I32], []);
+    // Type 2: sample(pos_ptr: i32) -> f32
+    types.ty().function([ValType::I32], [ValType::F32]);
     module.section(&types);
 
     // Function section
     let mut funcs = FunctionSection::new();
-    funcs.function(TYPE_IS_INSIDE); // is_inside
-    funcs.function(TYPE_BOUNDS); // get_bounds_min_x
-    funcs.function(TYPE_BOUNDS); // get_bounds_min_y
-    funcs.function(TYPE_BOUNDS); // get_bounds_min_z
-    funcs.function(TYPE_BOUNDS); // get_bounds_max_x
-    funcs.function(TYPE_BOUNDS); // get_bounds_max_y
-    funcs.function(TYPE_BOUNDS); // get_bounds_max_z
+    funcs.function(TYPE_GET_DIMENSIONS);
+    funcs.function(TYPE_GET_BOUNDS);
+    funcs.function(TYPE_SAMPLE);
     module.section(&funcs);
 
     // Memory section
@@ -206,35 +211,30 @@ fn generate_wasm(heightmap: &Heightmap, config: &HeightmapConfig) -> Vec<u8> {
 
     // Export section
     let mut exports = ExportSection::new();
-    exports.export("is_inside", ExportKind::Func, FN_IS_INSIDE);
-    exports.export("get_bounds_min_x", ExportKind::Func, FN_BOUNDS_MIN_X);
-    exports.export("get_bounds_min_y", ExportKind::Func, FN_BOUNDS_MIN_Y);
-    exports.export("get_bounds_min_z", ExportKind::Func, FN_BOUNDS_MIN_Z);
-    exports.export("get_bounds_max_x", ExportKind::Func, FN_BOUNDS_MAX_X);
-    exports.export("get_bounds_max_y", ExportKind::Func, FN_BOUNDS_MAX_Y);
-    exports.export("get_bounds_max_z", ExportKind::Func, FN_BOUNDS_MAX_Z);
+    exports.export("memory", ExportKind::Memory, 0);
+    exports.export("get_dimensions", ExportKind::Func, FN_GET_DIMENSIONS);
+    exports.export("get_bounds", ExportKind::Func, FN_GET_BOUNDS);
+    exports.export("sample", ExportKind::Func, FN_SAMPLE);
     module.section(&exports);
 
     // Code section
     let mut code = CodeSection::new();
 
-    // is_inside function with bilinear interpolation
-    code.function(&generate_is_inside_function(heightmap.width, heightmap.height));
+    // get_dimensions() -> 3
+    code.function(&generate_get_dimensions_function());
 
-    // Bounds getter functions
+    // get_bounds(out_ptr) - writes interleaved min/max
     // Centered origin: x spans [-width/2, +width/2], z spans [-depth/2, +depth/2]
-    code.function(&generate_bounds_const(-config.width / 2.0)); // min_x
-    code.function(&generate_bounds_const(0.0)); // min_y
-    code.function(&generate_bounds_const(-config.depth / 2.0)); // min_z
-    code.function(&generate_bounds_const(config.width / 2.0)); // max_x
-    code.function(&generate_bounds_const(config.height)); // max_y
-    code.function(&generate_bounds_const(config.depth / 2.0)); // max_z
+    code.function(&generate_get_bounds_function(config));
+
+    // sample(pos_ptr) -> f32 with bilinear interpolation
+    code.function(&generate_sample_function(heightmap.width, heightmap.height));
 
     module.section(&code);
 
-    // Data section
+    // Data section (placed at HEADER_OFFSET, leaving I/O buffer space)
     let mut data = DataSection::new();
-    data.active(0, &ConstExpr::i32_const(0), data_bytes);
+    data.active(0, &ConstExpr::i32_const(HEADER_OFFSET as i32), data_bytes);
     module.section(&data);
 
     module.finish()
@@ -245,7 +245,7 @@ fn serialize_data(heightmap: &Heightmap, config: &HeightmapConfig) -> Vec<u8> {
     let total_size = (HEADER_SIZE + pixel_count * 4) as usize;
     let mut data = vec![0u8; total_size];
 
-    // Write header
+    // Write header (offsets are relative to start of data section, which is at HEADER_OFFSET in memory)
     // Offset 0-3: width_pixels (u32)
     data[0..4].copy_from_slice(&heightmap.width.to_le_bytes());
     // Offset 4-7: height_pixels (u32)
@@ -260,46 +260,91 @@ fn serialize_data(heightmap: &Heightmap, config: &HeightmapConfig) -> Vec<u8> {
     data[32..40].copy_from_slice(&config.clip.to_le_bytes());
 
     // Write heightmap data (row-major, f32)
+    // Data starts at HEADER_SIZE offset within this data section
     for (i, &h) in heightmap.data.iter().enumerate() {
-        let offset = DATA_OFFSET as usize + i * 4;
+        let offset = HEADER_SIZE as usize + i * 4;
         data[offset..offset + 4].copy_from_slice(&h.to_le_bytes());
     }
 
     data
 }
 
-fn generate_bounds_const(value: f64) -> Function {
+fn generate_get_dimensions_function() -> Function {
     let mut f = Function::new([]);
-    f.instruction(&Instruction::F64Const(value));
+    f.instruction(&Instruction::I32Const(3));
     f.instruction(&Instruction::End);
     f
 }
 
-fn generate_is_inside_function(width_pixels: u32, height_pixels: u32) -> Function {
-    // Parameters: x (0), y (1), z (2)
+fn generate_get_bounds_function(config: &HeightmapConfig) -> Function {
+    // Writes interleaved bounds: [min_x, max_x, min_y, max_y, min_z, max_z] as f64
+    // Centered origin: x spans [-width/2, +width/2], z spans [-depth/2, +depth/2], y spans [0, height]
+    let mut f = Function::new([]);
+    let out_ptr: u32 = 0; // parameter
+
+    // Store min_x at out_ptr + 0
+    f.instruction(&Instruction::LocalGet(out_ptr));
+    f.instruction(&Instruction::F64Const(-config.width / 2.0));
+    f.instruction(&Instruction::F64Store(wasm_encoder::MemArg { offset: 0, align: 3, memory_index: 0 }));
+
+    // Store max_x at out_ptr + 8
+    f.instruction(&Instruction::LocalGet(out_ptr));
+    f.instruction(&Instruction::F64Const(config.width / 2.0));
+    f.instruction(&Instruction::F64Store(wasm_encoder::MemArg { offset: 8, align: 3, memory_index: 0 }));
+
+    // Store min_y at out_ptr + 16
+    f.instruction(&Instruction::LocalGet(out_ptr));
+    f.instruction(&Instruction::F64Const(0.0));
+    f.instruction(&Instruction::F64Store(wasm_encoder::MemArg { offset: 16, align: 3, memory_index: 0 }));
+
+    // Store max_y at out_ptr + 24
+    f.instruction(&Instruction::LocalGet(out_ptr));
+    f.instruction(&Instruction::F64Const(config.height));
+    f.instruction(&Instruction::F64Store(wasm_encoder::MemArg { offset: 24, align: 3, memory_index: 0 }));
+
+    // Store min_z at out_ptr + 32
+    f.instruction(&Instruction::LocalGet(out_ptr));
+    f.instruction(&Instruction::F64Const(-config.depth / 2.0));
+    f.instruction(&Instruction::F64Store(wasm_encoder::MemArg { offset: 32, align: 3, memory_index: 0 }));
+
+    // Store max_z at out_ptr + 40
+    f.instruction(&Instruction::LocalGet(out_ptr));
+    f.instruction(&Instruction::F64Const(config.depth / 2.0));
+    f.instruction(&Instruction::F64Store(wasm_encoder::MemArg { offset: 40, align: 3, memory_index: 0 }));
+
+    f.instruction(&Instruction::End);
+    f
+}
+
+fn generate_sample_function(width_pixels: u32, height_pixels: u32) -> Function {
+    // Parameter: pos_ptr (0) - pointer to position buffer [x, y, z] as f64
     // Local variables:
-    // 3: config_width (f64)
-    // 4: config_depth (f64)
-    // 5: config_height (f64)
-    // 6: config_clip (f64)
-    // 7: nx (f64) - normalized x coordinate [0, 1]
-    // 8: nz (f64) - normalized z coordinate [0, 1]
-    // 9: px (f64) - pixel x coordinate (floating point)
-    // 10: pz (f64) - pixel z coordinate (floating point)
-    // 11: px_floor (i32) - integer part of px
-    // 12: pz_floor (i32) - integer part of pz
-    // 13: px_frac (f64) - fractional part of px
-    // 14: pz_frac (f64) - fractional part of pz
-    // 15: px1 (i32) - clamped px_floor + 1
-    // 16: pz1 (i32) - clamped pz_floor + 1
-    // 17: h00 (f64) - height at (px_floor, pz_floor)
-    // 18: h10 (f64) - height at (px1, pz_floor)
-    // 19: h01 (f64) - height at (px_floor, pz1)
-    // 20: h11 (f64) - height at (px1, pz1)
-    // 21: h_interp (f64) - bilinearly interpolated height
-    // 22: surface_height (f64) - scaled interpolated height
+    // 1: x (f64)
+    // 2: y (f64)
+    // 3: z (f64)
+    // 4: config_width (f64)
+    // 5: config_depth (f64)
+    // 6: config_height (f64)
+    // 7: config_clip (f64)
+    // 8: nx (f64) - normalized x coordinate [0, 1]
+    // 9: nz (f64) - normalized z coordinate [0, 1]
+    // 10: px (f64) - pixel x coordinate (floating point)
+    // 11: pz (f64) - pixel z coordinate (floating point)
+    // 12: px_floor (i32) - integer part of px
+    // 13: pz_floor (i32) - integer part of pz
+    // 14: px_frac (f64) - fractional part of px
+    // 15: pz_frac (f64) - fractional part of pz
+    // 16: px1 (i32) - clamped px_floor + 1
+    // 17: pz1 (i32) - clamped pz_floor + 1
+    // 18: h00 (f64) - height at (px_floor, pz_floor)
+    // 19: h10 (f64) - height at (px1, pz_floor)
+    // 20: h01 (f64) - height at (px_floor, pz1)
+    // 21: h11 (f64) - height at (px1, pz1)
+    // 22: h_interp (f64) - bilinearly interpolated height
+    // 23: surface_height (f64) - scaled interpolated height
 
     let locals = vec![
+        (3, ValType::F64), // x, y, z (read from memory)
         (4, ValType::F64), // config_width, config_depth, config_height, config_clip
         (2, ValType::F64), // nx, nz
         (2, ValType::F64), // px, pz
@@ -312,66 +357,67 @@ fn generate_is_inside_function(width_pixels: u32, height_pixels: u32) -> Functio
 
     let mut f = Function::new(locals);
 
-    // Local indices
-    let x: u32 = 0;
-    let y: u32 = 1;
-    let z: u32 = 2;
-    let config_width: u32 = 3;
-    let config_depth: u32 = 4;
-    let config_height: u32 = 5;
-    let config_clip: u32 = 6;
-    let nx: u32 = 7;
-    let nz: u32 = 8;
-    let px: u32 = 9;
-    let pz: u32 = 10;
-    let px_floor: u32 = 11;
-    let pz_floor: u32 = 12;
-    let px_frac: u32 = 13;
-    let pz_frac: u32 = 14;
-    let px1: u32 = 15;
-    let pz1: u32 = 16;
-    let h00: u32 = 17;
-    let h10: u32 = 18;
-    let h01: u32 = 19;
-    let h11: u32 = 20;
-    let h_interp: u32 = 21;
-    let surface_height: u32 = 22;
+    // Local indices (parameter is 0, locals start at 1)
+    let pos_ptr: u32 = 0;
+    let x: u32 = 1;
+    let y: u32 = 2;
+    let z: u32 = 3;
+    let config_width: u32 = 4;
+    let config_depth: u32 = 5;
+    let config_height: u32 = 6;
+    let config_clip: u32 = 7;
+    let nx: u32 = 8;
+    let nz: u32 = 9;
+    let px: u32 = 10;
+    let pz: u32 = 11;
+    let px_floor: u32 = 12;
+    let pz_floor: u32 = 13;
+    let px_frac: u32 = 14;
+    let pz_frac: u32 = 15;
+    let px1: u32 = 16;
+    let pz1: u32 = 17;
+    let h00: u32 = 18;
+    let h10: u32 = 19;
+    let h01: u32 = 20;
+    let h11: u32 = 21;
+    let h_interp: u32 = 22;
+    let surface_height: u32 = 23;
 
-    // Load config from memory
-    // config_width at offset 8
-    f.instruction(&Instruction::I32Const(8));
-    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
-        offset: 0,
-        align: 3,
-        memory_index: 0,
-    }));
+    // Load position from memory at pos_ptr
+    // x at pos_ptr + 0
+    f.instruction(&Instruction::LocalGet(pos_ptr));
+    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg { offset: 0, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::LocalSet(x));
+
+    // y at pos_ptr + 8
+    f.instruction(&Instruction::LocalGet(pos_ptr));
+    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg { offset: 8, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::LocalSet(y));
+
+    // z at pos_ptr + 16
+    f.instruction(&Instruction::LocalGet(pos_ptr));
+    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg { offset: 16, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::LocalSet(z));
+
+    // Load config from memory (at HEADER_OFFSET + field offset)
+    // config_width at CONFIG_WIDTH_OFFSET (264)
+    f.instruction(&Instruction::I32Const(CONFIG_WIDTH_OFFSET as i32));
+    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg { offset: 0, align: 3, memory_index: 0 }));
     f.instruction(&Instruction::LocalSet(config_width));
 
-    // config_depth at offset 16
-    f.instruction(&Instruction::I32Const(16));
-    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
-        offset: 0,
-        align: 3,
-        memory_index: 0,
-    }));
+    // config_depth at CONFIG_DEPTH_OFFSET (272)
+    f.instruction(&Instruction::I32Const(CONFIG_DEPTH_OFFSET as i32));
+    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg { offset: 0, align: 3, memory_index: 0 }));
     f.instruction(&Instruction::LocalSet(config_depth));
 
-    // config_height at offset 24
-    f.instruction(&Instruction::I32Const(24));
-    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
-        offset: 0,
-        align: 3,
-        memory_index: 0,
-    }));
+    // config_height at CONFIG_HEIGHT_OFFSET (280)
+    f.instruction(&Instruction::I32Const(CONFIG_HEIGHT_OFFSET as i32));
+    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg { offset: 0, align: 3, memory_index: 0 }));
     f.instruction(&Instruction::LocalSet(config_height));
 
-    // config_clip at offset 32
-    f.instruction(&Instruction::I32Const(32));
-    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
-        offset: 0,
-        align: 3,
-        memory_index: 0,
-    }));
+    // config_clip at CONFIG_CLIP_OFFSET (288)
+    f.instruction(&Instruction::I32Const(CONFIG_CLIP_OFFSET as i32));
+    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg { offset: 0, align: 3, memory_index: 0 }));
     f.instruction(&Instruction::LocalSet(config_clip));
 
     // Check if y < 0: return 0 (below model)

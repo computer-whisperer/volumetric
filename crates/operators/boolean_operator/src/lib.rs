@@ -8,11 +8,17 @@
 //! Operator ABI:
 //! - `get_metadata() -> i64` returning `(ptr: u32, len: u32)` packed as `ptr | (len << 32)`
 //!
+//! Generated Model ABI (N-dimensional):
+//! - `get_dimensions() -> u32`: Passed through from model A
+//! - `get_bounds(out_ptr: i32)`: Combines bounds from both models based on operation
+//! - `sample(pos_ptr: i32) -> f32`: Combines densities from both models
+//! - `memory`: First memory from merged modules
+//!
 //! Behavior:
 //! - Reads WASM model A bytes from input 0
 //! - Reads WASM model B bytes from input 1
 //! - Reads CBOR configuration from input 2 (schema declared in metadata)
-//! - Produces a merged WASM model with `is_inside`/bounds implementing union/subtract/intersect
+//! - Produces a merged WASM model with sample/bounds implementing union/subtract/intersect
 
 use wasm_encoder::{CodeSection, ExportKind, ExportSection, Function, FunctionSection, Instruction, Module, TypeSection, ValType};
 
@@ -78,29 +84,18 @@ unsafe extern "C" {
     fn post_output(output_idx: i32, ptr: i32, len: i32);
 }
 
-const ABI_FUNCTIONS: &[&str] = &[
-    "is_inside",
-    "get_bounds_min_x",
-    "get_bounds_min_y",
-    "get_bounds_min_z",
-    "get_bounds_max_x",
-    "get_bounds_max_y",
-    "get_bounds_max_z",
-];
+const ABI_FUNCTIONS_ND: &[&str] = &["get_dimensions", "get_bounds", "sample"];
 
 #[derive(Debug)]
-struct AbiExports {
-    is_inside: u32,
-    bmin_x: u32,
-    bmin_y: u32,
-    bmin_z: u32,
-    bmax_x: u32,
-    bmax_y: u32,
-    bmax_z: u32,
+struct AbiExportsNd {
+    get_dimensions: u32,
+    get_bounds: u32,
+    sample: u32,
+    memory: u32,
 }
 
-fn parse_abi_exports(wasm: &[u8]) -> Result<AbiExports, String> {
-    let mut map: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+fn parse_abi_exports_nd(wasm: &[u8]) -> Result<AbiExportsNd, String> {
+    let mut map: std::collections::HashMap<String, (wasmparser::ExternalKind, u32)> = std::collections::HashMap::new();
     for payload in wasmparser::Parser::new(0).parse_all(wasm) {
         match payload.map_err(|e| e.to_string())? {
             wasmparser::Payload::ImportSection(s) => {
@@ -111,8 +106,8 @@ fn parse_abi_exports(wasm: &[u8]) -> Result<AbiExports, String> {
             wasmparser::Payload::ExportSection(s) => {
                 for e in s {
                     let e = e.map_err(|e| e.to_string())?;
-                    if e.kind == wasmparser::ExternalKind::Func && ABI_FUNCTIONS.contains(&e.name) {
-                        map.insert(e.name.to_string(), e.index);
+                    if ABI_FUNCTIONS_ND.contains(&e.name) || e.name == "memory" {
+                        map.insert(e.name.to_string(), (e.kind, e.index));
                     }
                 }
             }
@@ -120,15 +115,24 @@ fn parse_abi_exports(wasm: &[u8]) -> Result<AbiExports, String> {
         }
     }
 
-    let get = |name: &str| map.get(name).copied().ok_or_else(|| format!("Model missing export `{name}`"));
-    Ok(AbiExports {
-        is_inside: get("is_inside")?,
-        bmin_x: get("get_bounds_min_x")?,
-        bmin_y: get("get_bounds_min_y")?,
-        bmin_z: get("get_bounds_min_z")?,
-        bmax_x: get("get_bounds_max_x")?,
-        bmax_y: get("get_bounds_max_y")?,
-        bmax_z: get("get_bounds_max_z")?,
+    let get_func = |name: &str| -> Result<u32, String> {
+        map.get(name)
+            .filter(|(k, _)| *k == wasmparser::ExternalKind::Func)
+            .map(|(_, i)| *i)
+            .ok_or_else(|| format!("Model missing function export `{name}`"))
+    };
+    let get_mem = |name: &str| -> Result<u32, String> {
+        map.get(name)
+            .filter(|(k, _)| *k == wasmparser::ExternalKind::Memory)
+            .map(|(_, i)| *i)
+            .ok_or_else(|| format!("Model missing memory export `{name}`"))
+    };
+
+    Ok(AbiExportsNd {
+        get_dimensions: get_func("get_dimensions")?,
+        get_bounds: get_func("get_bounds")?,
+        sample: get_func("sample")?,
+        memory: get_mem("memory")?,
     })
 }
 
@@ -264,9 +268,7 @@ fn append_module_sections(
             wasmparser::Payload::ExportSection(_)
             | wasmparser::Payload::DataCountSection { .. }
             | wasmparser::Payload::StartSection { .. }
-            | wasmparser::Payload::CustomSection(_) => {
-                // Strictly ignore: exports are replaced; data_count is recreated; start/custom are not supported.
-            }
+            | wasmparser::Payload::CustomSection(_) => {}
             wasmparser::Payload::End(_) => break,
             _ => {}
         }
@@ -275,56 +277,127 @@ fn append_module_sections(
     Ok(())
 }
 
-fn add_bounds_wrapper(
+/// Add get_dimensions wrapper that passes through from model A
+fn add_get_dimensions_wrapper(
     types: &mut TypeSection,
     funcs: &mut FunctionSection,
     code: &mut CodeSection,
     exports: &mut ExportSection,
-    export_name: &str,
     a_idx: u32,
-    b_idx: u32,
-    op: BooleanOp,
-    is_min: bool,
-) -> u32 {
+) {
     let ty = types.len();
-    types.ty().function([], [ValType::F64]);
+    types.ty().function([], [ValType::I32]);
     funcs.function(ty);
 
     let mut f = Function::new([]);
     f.instruction(&Instruction::Call(a_idx));
-    if op == BooleanOp::Subtract {
-        // keep A only
-    } else {
-        f.instruction(&Instruction::Call(b_idx));
-        match (op, is_min) {
-            (BooleanOp::Union, true) => {
-                // min(a, b)
-                f.instruction(&Instruction::F64Min);
-            }
-            (BooleanOp::Union, false) => {
-                // max(a, b)
-                f.instruction(&Instruction::F64Max);
-            }
-            (BooleanOp::Intersect, true) => {
-                // max(min_a, min_b)
-                f.instruction(&Instruction::F64Max);
-            }
-            (BooleanOp::Intersect, false) => {
-                // min(max_a, max_b)
-                f.instruction(&Instruction::F64Min);
-            }
-            (BooleanOp::Subtract, _) => unreachable!(),
-        }
-    }
     f.instruction(&Instruction::End);
     code.function(&f);
 
     let func_index = (funcs.len() - 1) as u32;
-    exports.export(export_name, ExportKind::Func, func_index);
-    func_index
+    exports.export("get_dimensions", ExportKind::Func, func_index);
 }
 
-fn add_is_inside_wrapper(
+/// Scratch buffer offset for temporary bounds storage
+const SCRATCH_BOUNDS_OFFSET: i32 = 768;
+
+/// Add get_bounds wrapper that combines bounds from both models
+fn add_get_bounds_wrapper(
+    types: &mut TypeSection,
+    funcs: &mut FunctionSection,
+    code: &mut CodeSection,
+    exports: &mut ExportSection,
+    a_idx: u32,
+    b_idx: u32,
+    op: BooleanOp,
+    mem_idx: u32,
+) {
+    let ty = types.len();
+    types.ty().function([ValType::I32], []);
+    funcs.function(ty);
+
+    // Locals: out_ptr (param), min/max values for combining
+    let locals = vec![
+        (6, ValType::F64), // a_min_x, a_max_x, a_min_y, a_max_y, a_min_z, a_max_z
+        (6, ValType::F64), // b_min_x, b_max_x, b_min_y, b_max_y, b_min_z, b_max_z
+    ];
+    let mut f = Function::new(locals);
+
+    // Call A's get_bounds to scratch area
+    f.instruction(&Instruction::I32Const(SCRATCH_BOUNDS_OFFSET));
+    f.instruction(&Instruction::Call(a_idx));
+
+    // Load A's bounds from scratch
+    for i in 0..6 {
+        f.instruction(&Instruction::I32Const(SCRATCH_BOUNDS_OFFSET));
+        f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
+            offset: (i * 8) as u64,
+            align: 3,
+            memory_index: mem_idx,
+        }));
+        f.instruction(&Instruction::LocalSet(1 + i)); // locals 1-6 are A's bounds
+    }
+
+    if op == BooleanOp::Subtract {
+        // For subtract, use A's bounds only
+        for i in 0..6 {
+            f.instruction(&Instruction::LocalGet(0)); // out_ptr
+            f.instruction(&Instruction::LocalGet(1 + i)); // A's bound
+            f.instruction(&Instruction::F64Store(wasm_encoder::MemArg {
+                offset: (i * 8) as u64,
+                align: 3,
+                memory_index: mem_idx,
+            }));
+        }
+    } else {
+        // Call B's get_bounds to scratch area
+        f.instruction(&Instruction::I32Const(SCRATCH_BOUNDS_OFFSET));
+        f.instruction(&Instruction::Call(b_idx));
+
+        // Load B's bounds from scratch
+        for i in 0..6 {
+            f.instruction(&Instruction::I32Const(SCRATCH_BOUNDS_OFFSET));
+            f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
+                offset: (i * 8) as u64,
+                align: 3,
+                memory_index: mem_idx,
+            }));
+            f.instruction(&Instruction::LocalSet(7 + i)); // locals 7-12 are B's bounds
+        }
+
+        // Combine bounds based on operation
+        // Format: min_x(0), max_x(1), min_y(2), max_y(3), min_z(4), max_z(5)
+        for i in 0..6 {
+            let is_min = i % 2 == 0;
+            f.instruction(&Instruction::LocalGet(0)); // out_ptr
+            f.instruction(&Instruction::LocalGet(1 + i)); // A's bound
+            f.instruction(&Instruction::LocalGet(7 + i)); // B's bound
+
+            match (op, is_min) {
+                (BooleanOp::Union, true) => f.instruction(&Instruction::F64Min), // min of mins
+                (BooleanOp::Union, false) => f.instruction(&Instruction::F64Max), // max of maxs
+                (BooleanOp::Intersect, true) => f.instruction(&Instruction::F64Max), // max of mins
+                (BooleanOp::Intersect, false) => f.instruction(&Instruction::F64Min), // min of maxs
+                (BooleanOp::Subtract, _) => unreachable!(),
+            };
+
+            f.instruction(&Instruction::F64Store(wasm_encoder::MemArg {
+                offset: (i * 8) as u64,
+                align: 3,
+                memory_index: mem_idx,
+            }));
+        }
+    }
+
+    f.instruction(&Instruction::End);
+    code.function(&f);
+
+    let func_index = (funcs.len() - 1) as u32;
+    exports.export("get_bounds", ExportKind::Func, func_index);
+}
+
+/// Add sample wrapper that combines densities from both models
+fn add_sample_wrapper(
     types: &mut TypeSection,
     funcs: &mut FunctionSection,
     code: &mut CodeSection,
@@ -334,24 +407,21 @@ fn add_is_inside_wrapper(
     op: BooleanOp,
 ) {
     let ty = types.len();
-    // New ABI: (f64,f64,f64) -> f32 (density). We keep boolean semantics by thresholding at 0.5
-    types.ty().function([ValType::F64, ValType::F64, ValType::F64], [ValType::F32]);
+    types.ty().function([ValType::I32], [ValType::F32]);
     funcs.function(ty);
 
     let mut f = Function::new([]);
-    // a_bool = (a_density(x,y,z) > 0.5)
+
+    // Call A's sample with pos_ptr
     f.instruction(&Instruction::LocalGet(0));
-    f.instruction(&Instruction::LocalGet(1));
-    f.instruction(&Instruction::LocalGet(2));
     f.instruction(&Instruction::Call(a_idx));
+    // Convert to boolean: a_bool = (a_density > 0.5)
     f.instruction(&Instruction::F32Const(0.5));
     f.instruction(&Instruction::F32Gt);
 
     if op == BooleanOp::Subtract {
-        // b_bool = (b_density > 0.5)
+        // Call B's sample
         f.instruction(&Instruction::LocalGet(0));
-        f.instruction(&Instruction::LocalGet(1));
-        f.instruction(&Instruction::LocalGet(2));
         f.instruction(&Instruction::Call(b_idx));
         f.instruction(&Instruction::F32Const(0.5));
         f.instruction(&Instruction::F32Gt);
@@ -359,39 +429,37 @@ fn add_is_inside_wrapper(
         f.instruction(&Instruction::I32Eqz);
         f.instruction(&Instruction::I32And);
     } else if op == BooleanOp::Union {
+        // Call B's sample
         f.instruction(&Instruction::LocalGet(0));
-        f.instruction(&Instruction::LocalGet(1));
-        f.instruction(&Instruction::LocalGet(2));
         f.instruction(&Instruction::Call(b_idx));
         f.instruction(&Instruction::F32Const(0.5));
         f.instruction(&Instruction::F32Gt);
+        // a || b
         f.instruction(&Instruction::I32Or);
     } else {
-        // intersect
+        // Intersect: a && b
         f.instruction(&Instruction::LocalGet(0));
-        f.instruction(&Instruction::LocalGet(1));
-        f.instruction(&Instruction::LocalGet(2));
         f.instruction(&Instruction::Call(b_idx));
         f.instruction(&Instruction::F32Const(0.5));
         f.instruction(&Instruction::F32Gt);
         f.instruction(&Instruction::I32And);
     }
 
-    // convert boolean i32 to f32 0.0/1.0
+    // Convert boolean i32 to f32 0.0/1.0
     f.instruction(&Instruction::F32ConvertI32S);
     f.instruction(&Instruction::End);
     code.function(&f);
 
     let func_index = (funcs.len() - 1) as u32;
-    exports.export("is_inside", ExportKind::Func, func_index);
+    exports.export("sample", ExportKind::Func, func_index);
 }
 
 fn merge_models(a_wasm: &[u8], b_wasm: &[u8], op: BooleanOp) -> Result<Vec<u8>, String> {
     let a_counts = count_sections(a_wasm)?;
     let b_counts = count_sections(b_wasm)?;
 
-    let a_exports = parse_abi_exports(a_wasm)?;
-    let b_exports = parse_abi_exports(b_wasm)?;
+    let a_exports = parse_abi_exports_nd(a_wasm)?;
+    let b_exports = parse_abi_exports_nd(b_wasm)?;
 
     let mut types = TypeSection::new();
     let mut funcs = FunctionSection::new();
@@ -447,22 +515,37 @@ fn merge_models(a_wasm: &[u8], b_wasm: &[u8], op: BooleanOp) -> Result<Vec<u8>, 
     // Build exports with wrappers.
     let mut exports = ExportSection::new();
 
-    add_is_inside_wrapper(
+    // Export memory from model A
+    exports.export("memory", ExportKind::Memory, a_exports.memory);
+
+    add_get_dimensions_wrapper(
         &mut types,
         &mut funcs,
         &mut code,
         &mut exports,
-        a_exports.is_inside,
-        b_exports.is_inside + a_counts.funcs,
-        op,
+        a_exports.get_dimensions,
     );
 
-    add_bounds_wrapper(&mut types, &mut funcs, &mut code, &mut exports, "get_bounds_min_x", a_exports.bmin_x, b_exports.bmin_x + a_counts.funcs, op, true);
-    add_bounds_wrapper(&mut types, &mut funcs, &mut code, &mut exports, "get_bounds_min_y", a_exports.bmin_y, b_exports.bmin_y + a_counts.funcs, op, true);
-    add_bounds_wrapper(&mut types, &mut funcs, &mut code, &mut exports, "get_bounds_min_z", a_exports.bmin_z, b_exports.bmin_z + a_counts.funcs, op, true);
-    add_bounds_wrapper(&mut types, &mut funcs, &mut code, &mut exports, "get_bounds_max_x", a_exports.bmax_x, b_exports.bmax_x + a_counts.funcs, op, false);
-    add_bounds_wrapper(&mut types, &mut funcs, &mut code, &mut exports, "get_bounds_max_y", a_exports.bmax_y, b_exports.bmax_y + a_counts.funcs, op, false);
-    add_bounds_wrapper(&mut types, &mut funcs, &mut code, &mut exports, "get_bounds_max_z", a_exports.bmax_z, b_exports.bmax_z + a_counts.funcs, op, false);
+    add_get_bounds_wrapper(
+        &mut types,
+        &mut funcs,
+        &mut code,
+        &mut exports,
+        a_exports.get_bounds,
+        b_exports.get_bounds + a_counts.funcs,
+        op,
+        a_exports.memory,
+    );
+
+    add_sample_wrapper(
+        &mut types,
+        &mut funcs,
+        &mut code,
+        &mut exports,
+        a_exports.sample,
+        b_exports.sample + a_counts.funcs,
+        op,
+    );
 
     let mut out = Module::new();
     if types.len() > 0 {

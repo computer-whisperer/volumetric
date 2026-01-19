@@ -1,6 +1,6 @@
 //! Rectangular Prism Operator.
 //!
-//! Emitter operator that generates a volumetric box model.
+//! Emitter operator that generates a volumetric box model using the N-dimensional ABI.
 //!
 //! Host ABI:
 //! - `host.get_input_len(i32) -> u32`
@@ -9,6 +9,12 @@
 //!
 //! Operator ABI:
 //! - `get_metadata() -> i64` returning `(ptr: u32, len: u32)` packed as `ptr | (len << 32)`
+//!
+//! Generated Model ABI:
+//! - `get_dimensions() -> u32`: Returns 3
+//! - `get_bounds(out_ptr: i32)`: Writes interleaved min/max bounds
+//! - `sample(pos_ptr: i32) -> f32`: Reads position from memory, returns density
+//! - `memory`: Linear memory export
 //!
 //! Inputs:
 //! - Input 0: CBOR configuration with mode selector
@@ -19,7 +25,7 @@
 //! - opposite_corners: vector_a = corner min, vector_b = corner max
 //! - position_size: vector_a = center position, vector_b = dimensions (width, height, depth)
 
-use walrus::{FunctionBuilder, Module, ValType};
+use walrus::{FunctionBuilder, MemoryId, Module, ValType};
 
 #[derive(Clone, Debug, serde::Serialize)]
 enum OperatorMetadataInput {
@@ -121,24 +127,112 @@ fn generate_wasm(mode: &str, vector_a: [f64; 3], vector_b: [f64; 3]) -> Result<V
 
     let mut module = Module::default();
 
-    // Create is_inside(x: f64, y: f64, z: f64) -> f32
-    // Returns 1.0 if point is inside the box, 0.0 otherwise
+    // Add memory (1 page = 64KB, more than enough for I/O buffers)
+    // add_local(shared, memory64, initial_pages, maximum_pages, page_size_log2)
+    let memory_id: MemoryId = module.memories.add_local(false, false, 1, None, None);
+    module.exports.add("memory", memory_id);
+
+    // Create get_dimensions() -> u32
     {
-        let mut builder = FunctionBuilder::new(
-            &mut module.types,
-            &[ValType::F64, ValType::F64, ValType::F64],
-            &[ValType::F32],
-        );
+        let mut builder = FunctionBuilder::new(&mut module.types, &[], &[ValType::I32]);
+        builder.func_body().i32_const(3);
+        let func_id = builder.finish(vec![], &mut module.funcs);
+        module.exports.add("get_dimensions", func_id);
+    }
+
+    // Create get_bounds(out_ptr: i32)
+    // Writes interleaved min/max: [min_x, max_x, min_y, max_y, min_z, max_z] as f64
+    {
+        let mut builder = FunctionBuilder::new(&mut module.types, &[ValType::I32], &[]);
+        let out_ptr = module.locals.add(ValType::I32);
+
+        let mem_arg = walrus::ir::MemArg {
+            align: 3, // 2^3 = 8 byte alignment
+            offset: 0,
+        };
+
+        // Store min_x at out_ptr + 0
+        builder.func_body()
+            .local_get(out_ptr)
+            .f64_const(min_x)
+            .store(memory_id, walrus::ir::StoreKind::F64, mem_arg);
+
+        // Store max_x at out_ptr + 8
+        let mem_arg_8 = walrus::ir::MemArg { align: 3, offset: 8 };
+        builder.func_body()
+            .local_get(out_ptr)
+            .f64_const(max_x)
+            .store(memory_id, walrus::ir::StoreKind::F64, mem_arg_8);
+
+        // Store min_y at out_ptr + 16
+        let mem_arg_16 = walrus::ir::MemArg { align: 3, offset: 16 };
+        builder.func_body()
+            .local_get(out_ptr)
+            .f64_const(min_y)
+            .store(memory_id, walrus::ir::StoreKind::F64, mem_arg_16);
+
+        // Store max_y at out_ptr + 24
+        let mem_arg_24 = walrus::ir::MemArg { align: 3, offset: 24 };
+        builder.func_body()
+            .local_get(out_ptr)
+            .f64_const(max_y)
+            .store(memory_id, walrus::ir::StoreKind::F64, mem_arg_24);
+
+        // Store min_z at out_ptr + 32
+        let mem_arg_32 = walrus::ir::MemArg { align: 3, offset: 32 };
+        builder.func_body()
+            .local_get(out_ptr)
+            .f64_const(min_z)
+            .store(memory_id, walrus::ir::StoreKind::F64, mem_arg_32);
+
+        // Store max_z at out_ptr + 40
+        let mem_arg_40 = walrus::ir::MemArg { align: 3, offset: 40 };
+        builder.func_body()
+            .local_get(out_ptr)
+            .f64_const(max_z)
+            .store(memory_id, walrus::ir::StoreKind::F64, mem_arg_40);
+
+        let func_id = builder.finish(vec![out_ptr], &mut module.funcs);
+        module.exports.add("get_bounds", func_id);
+    }
+
+    // Create sample(pos_ptr: i32) -> f32
+    // Reads position from memory: [x, y, z] as f64 at pos_ptr
+    // Returns 1.0 if inside the box, 0.0 otherwise
+    {
+        let mut builder = FunctionBuilder::new(&mut module.types, &[ValType::I32], &[ValType::F32]);
+        let pos_ptr = module.locals.add(ValType::I32);
         let x = module.locals.add(ValType::F64);
         let y = module.locals.add(ValType::F64);
         let z = module.locals.add(ValType::F64);
+
+        let mem_arg = walrus::ir::MemArg { align: 3, offset: 0 };
+        let mem_arg_8 = walrus::ir::MemArg { align: 3, offset: 8 };
+        let mem_arg_16 = walrus::ir::MemArg { align: 3, offset: 16 };
+
+        // Load x from pos_ptr + 0
+        builder.func_body()
+            .local_get(pos_ptr)
+            .load(memory_id, walrus::ir::LoadKind::F64, mem_arg)
+            .local_set(x);
+
+        // Load y from pos_ptr + 8
+        builder.func_body()
+            .local_get(pos_ptr)
+            .load(memory_id, walrus::ir::LoadKind::F64, mem_arg_8)
+            .local_set(y);
+
+        // Load z from pos_ptr + 16
+        builder.func_body()
+            .local_get(pos_ptr)
+            .load(memory_id, walrus::ir::LoadKind::F64, mem_arg_16)
+            .local_set(z);
 
         use walrus::ir::BinaryOp::{F64Ge, F64Le, I32And};
         use walrus::ir::UnaryOp::F32ConvertSI32;
 
         // Check: (x >= min_x) && (x <= max_x) && (y >= min_y) && (y <= max_y) && (z >= min_z) && (z <= max_z)
-        builder
-            .func_body()
+        builder.func_body()
             // x >= min_x
             .local_get(x)
             .f64_const(min_x)
@@ -176,57 +270,8 @@ fn generate_wasm(mode: &str, vector_a: [f64; 3], vector_b: [f64; 3]) -> Result<V
             // Convert i32 (0 or 1) to f32
             .unop(F32ConvertSI32);
 
-        let func_id = builder.finish(vec![x, y, z], &mut module.funcs);
-        module.exports.add("is_inside", func_id);
-    }
-
-    // Create bounds functions
-    // get_bounds_min_x() -> f64
-    {
-        let mut builder = FunctionBuilder::new(&mut module.types, &[], &[ValType::F64]);
-        builder.func_body().f64_const(min_x);
-        let func_id = builder.finish(vec![], &mut module.funcs);
-        module.exports.add("get_bounds_min_x", func_id);
-    }
-
-    // get_bounds_min_y() -> f64
-    {
-        let mut builder = FunctionBuilder::new(&mut module.types, &[], &[ValType::F64]);
-        builder.func_body().f64_const(min_y);
-        let func_id = builder.finish(vec![], &mut module.funcs);
-        module.exports.add("get_bounds_min_y", func_id);
-    }
-
-    // get_bounds_min_z() -> f64
-    {
-        let mut builder = FunctionBuilder::new(&mut module.types, &[], &[ValType::F64]);
-        builder.func_body().f64_const(min_z);
-        let func_id = builder.finish(vec![], &mut module.funcs);
-        module.exports.add("get_bounds_min_z", func_id);
-    }
-
-    // get_bounds_max_x() -> f64
-    {
-        let mut builder = FunctionBuilder::new(&mut module.types, &[], &[ValType::F64]);
-        builder.func_body().f64_const(max_x);
-        let func_id = builder.finish(vec![], &mut module.funcs);
-        module.exports.add("get_bounds_max_x", func_id);
-    }
-
-    // get_bounds_max_y() -> f64
-    {
-        let mut builder = FunctionBuilder::new(&mut module.types, &[], &[ValType::F64]);
-        builder.func_body().f64_const(max_y);
-        let func_id = builder.finish(vec![], &mut module.funcs);
-        module.exports.add("get_bounds_max_y", func_id);
-    }
-
-    // get_bounds_max_z() -> f64
-    {
-        let mut builder = FunctionBuilder::new(&mut module.types, &[], &[ValType::F64]);
-        builder.func_body().f64_const(max_z);
-        let func_id = builder.finish(vec![], &mut module.funcs);
-        module.exports.add("get_bounds_max_z", func_id);
+        let func_id = builder.finish(vec![pos_ptr], &mut module.funcs);
+        module.exports.add("sample", func_id);
     }
 
     Ok(module.emit_wasm())

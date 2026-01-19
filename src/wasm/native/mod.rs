@@ -7,6 +7,6 @@ mod model_executor;
 mod operator_executor;
 mod parallel_sampler;
 
-pub use model_executor::NativeModelExecutor;
+pub use model_executor::{NativeModelExecutor, NativeModelExecutorNd};
 pub use operator_executor::NativeOperatorExecutor;
-pub use parallel_sampler::NativeParallelSampler;
+pub use parallel_sampler::{NativeParallelSampler, NativeParallelSamplerNd};

@@ -577,30 +577,31 @@ fn partition_by_axis(indices: &mut [u32], centroids: &[[f64; 3]], axis: usize, s
 // ============================================================================
 
 // Memory layout constants
+// First 256 bytes reserved for I/O buffers (position input at 0, bounds output at 256)
+const IO_BUFFER_SIZE: u32 = 256;
+const BOUNDS_BUFFER_OFFSET: u32 = 256;
+const HEADER_OFFSET: u32 = IO_BUFFER_SIZE + 48; // After I/O buffers (48 bytes for bounds)
 const HEADER_SIZE: u32 = 16;
 const NODE_SIZE: u32 = 56; // 6 × f64 (48) + 2 × u32 (8)
 const TRIANGLE_SIZE: u32 = 72; // 9 × f64
 const STACK_SIZE: u32 = 256; // 64 × u32
 
 // Function indices (these must match the order we add functions)
-const FN_IS_INSIDE: u32 = 0;
-const FN_BOUNDS_MIN_X: u32 = 1;
-const FN_BOUNDS_MIN_Y: u32 = 2;
-const FN_BOUNDS_MIN_Z: u32 = 3;
-const FN_BOUNDS_MAX_X: u32 = 4;
-const FN_BOUNDS_MAX_Y: u32 = 5;
-const FN_BOUNDS_MAX_Z: u32 = 6;
+const FN_GET_DIMENSIONS: u32 = 0;
+const FN_GET_BOUNDS: u32 = 1;
+const FN_SAMPLE: u32 = 2;
 
 // Type indices
-const TYPE_IS_INSIDE: u32 = 0; // (f64, f64, f64) -> f32
-const TYPE_BOUNDS: u32 = 1; // () -> f64
+const TYPE_GET_DIMENSIONS: u32 = 0; // () -> u32
+const TYPE_GET_BOUNDS: u32 = 1; // (i32) -> ()
+const TYPE_SAMPLE: u32 = 2; // (i32) -> f32
 
 fn generate_wasm(mesh: &ParsedMesh, bvh: &Bvh) -> Vec<u8> {
     let node_count = bvh.nodes.len() as u32;
     let triangle_count = mesh.triangles.len() as u32;
 
-    // Calculate offsets
-    let nodes_offset = HEADER_SIZE;
+    // Calculate offsets (after I/O buffer space)
+    let nodes_offset = HEADER_OFFSET + HEADER_SIZE;
     let triangles_offset = nodes_offset + node_count * NODE_SIZE;
     let stack_offset = triangles_offset + triangle_count * TRIANGLE_SIZE;
     let total_data_size = stack_offset + STACK_SIZE;
@@ -608,7 +609,7 @@ fn generate_wasm(mesh: &ParsedMesh, bvh: &Bvh) -> Vec<u8> {
     // Calculate required memory pages (64KB each)
     let memory_pages = ((total_data_size + 65535) / 65536) as u64;
 
-    // Serialize data section
+    // Serialize data section (starting at HEADER_OFFSET)
     let data_bytes = serialize_data(mesh, bvh, nodes_offset, triangles_offset);
 
     // Build WASM module
@@ -616,21 +617,19 @@ fn generate_wasm(mesh: &ParsedMesh, bvh: &Bvh) -> Vec<u8> {
 
     // Type section
     let mut types = TypeSection::new();
-    // Type 0: is_inside(f64, f64, f64) -> f32
-    types.ty().function([ValType::F64, ValType::F64, ValType::F64], [ValType::F32]);
-    // Type 1: bounds() -> f64
-    types.ty().function([], [ValType::F64]);
+    // Type 0: get_dimensions() -> u32
+    types.ty().function([], [ValType::I32]);
+    // Type 1: get_bounds(out_ptr: i32) -> ()
+    types.ty().function([ValType::I32], []);
+    // Type 2: sample(pos_ptr: i32) -> f32
+    types.ty().function([ValType::I32], [ValType::F32]);
     module.section(&types);
 
     // Function section
     let mut funcs = FunctionSection::new();
-    funcs.function(TYPE_IS_INSIDE); // is_inside
-    funcs.function(TYPE_BOUNDS); // get_bounds_min_x
-    funcs.function(TYPE_BOUNDS); // get_bounds_min_y
-    funcs.function(TYPE_BOUNDS); // get_bounds_min_z
-    funcs.function(TYPE_BOUNDS); // get_bounds_max_x
-    funcs.function(TYPE_BOUNDS); // get_bounds_max_y
-    funcs.function(TYPE_BOUNDS); // get_bounds_max_z
+    funcs.function(TYPE_GET_DIMENSIONS); // get_dimensions
+    funcs.function(TYPE_GET_BOUNDS); // get_bounds
+    funcs.function(TYPE_SAMPLE); // sample
     module.section(&funcs);
 
     // Memory section
@@ -646,40 +645,33 @@ fn generate_wasm(mesh: &ParsedMesh, bvh: &Bvh) -> Vec<u8> {
 
     // Export section
     let mut exports = ExportSection::new();
-    exports.export("is_inside", ExportKind::Func, FN_IS_INSIDE);
-    exports.export("get_bounds_min_x", ExportKind::Func, FN_BOUNDS_MIN_X);
-    exports.export("get_bounds_min_y", ExportKind::Func, FN_BOUNDS_MIN_Y);
-    exports.export("get_bounds_min_z", ExportKind::Func, FN_BOUNDS_MIN_Z);
-    exports.export("get_bounds_max_x", ExportKind::Func, FN_BOUNDS_MAX_X);
-    exports.export("get_bounds_max_y", ExportKind::Func, FN_BOUNDS_MAX_Y);
-    exports.export("get_bounds_max_z", ExportKind::Func, FN_BOUNDS_MAX_Z);
+    exports.export("memory", ExportKind::Memory, 0);
+    exports.export("get_dimensions", ExportKind::Func, FN_GET_DIMENSIONS);
+    exports.export("get_bounds", ExportKind::Func, FN_GET_BOUNDS);
+    exports.export("sample", ExportKind::Func, FN_SAMPLE);
     module.section(&exports);
 
     // Code section
     let mut code = CodeSection::new();
 
-    // is_inside function
-    code.function(&generate_is_inside_function(
+    // get_dimensions() -> u32 - returns 3
+    code.function(&generate_get_dimensions_function());
+
+    // get_bounds(out_ptr: i32) - writes interleaved min/max bounds
+    code.function(&generate_get_bounds_function(nodes_offset));
+
+    // sample(pos_ptr: i32) -> f32 - ray casting from memory position
+    code.function(&generate_sample_function(
         nodes_offset,
         triangles_offset,
         stack_offset,
-        &bvh.triangle_indices,
     ));
-
-    // Bounds getter functions - read from root node AABB
-    // Root node is at nodes_offset, AABB min is at offset 0, max at offset 24
-    code.function(&generate_bounds_getter(nodes_offset, 0)); // min_x
-    code.function(&generate_bounds_getter(nodes_offset, 8)); // min_y
-    code.function(&generate_bounds_getter(nodes_offset, 16)); // min_z
-    code.function(&generate_bounds_getter(nodes_offset, 24)); // max_x
-    code.function(&generate_bounds_getter(nodes_offset, 32)); // max_y
-    code.function(&generate_bounds_getter(nodes_offset, 40)); // max_z
 
     module.section(&code);
 
-    // Data section
+    // Data section (starting at HEADER_OFFSET)
     let mut data = DataSection::new();
-    data.active(0, &ConstExpr::i32_const(0), data_bytes);
+    data.active(0, &ConstExpr::i32_const(HEADER_OFFSET as i32), data_bytes);
     module.section(&data);
 
     module.finish()
@@ -745,49 +737,96 @@ fn serialize_data(
     data
 }
 
-fn generate_bounds_getter(nodes_offset: u32, field_offset: u32) -> Function {
+/// Generate get_dimensions() -> u32 function
+fn generate_get_dimensions_function() -> Function {
     let mut f = Function::new([]);
-    // Load f64 from memory at nodes_offset + field_offset
-    f.instruction(&Instruction::I32Const((nodes_offset + field_offset) as i32));
-    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
-        offset: 0,
-        align: 3, // 2^3 = 8 byte alignment
-        memory_index: 0,
-    }));
+    f.instruction(&Instruction::I32Const(3)); // 3 dimensions
     f.instruction(&Instruction::End);
     f
 }
 
-fn generate_is_inside_function(
+/// Generate get_bounds(out_ptr: i32) function
+/// Writes interleaved min/max bounds: [min_x, max_x, min_y, max_y, min_z, max_z]
+fn generate_get_bounds_function(nodes_offset: u32) -> Function {
+    // Local 0 is the out_ptr parameter
+    let mut f = Function::new([]);
+
+    // Root node is at nodes_offset, AABB min is at offset 0, max at offset 24
+    // Copy bounds from root node to out_ptr in interleaved format
+
+    // min_x -> out_ptr + 0
+    f.instruction(&Instruction::LocalGet(0)); // out_ptr
+    f.instruction(&Instruction::I32Const(nodes_offset as i32));
+    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg { offset: 0, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::F64Store(wasm_encoder::MemArg { offset: 0, align: 3, memory_index: 0 }));
+
+    // max_x -> out_ptr + 8
+    f.instruction(&Instruction::LocalGet(0));
+    f.instruction(&Instruction::I32Const(nodes_offset as i32));
+    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg { offset: 24, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::F64Store(wasm_encoder::MemArg { offset: 8, align: 3, memory_index: 0 }));
+
+    // min_y -> out_ptr + 16
+    f.instruction(&Instruction::LocalGet(0));
+    f.instruction(&Instruction::I32Const(nodes_offset as i32));
+    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg { offset: 8, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::F64Store(wasm_encoder::MemArg { offset: 16, align: 3, memory_index: 0 }));
+
+    // max_y -> out_ptr + 24
+    f.instruction(&Instruction::LocalGet(0));
+    f.instruction(&Instruction::I32Const(nodes_offset as i32));
+    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg { offset: 32, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::F64Store(wasm_encoder::MemArg { offset: 24, align: 3, memory_index: 0 }));
+
+    // min_z -> out_ptr + 32
+    f.instruction(&Instruction::LocalGet(0));
+    f.instruction(&Instruction::I32Const(nodes_offset as i32));
+    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg { offset: 16, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::F64Store(wasm_encoder::MemArg { offset: 32, align: 3, memory_index: 0 }));
+
+    // max_z -> out_ptr + 40
+    f.instruction(&Instruction::LocalGet(0));
+    f.instruction(&Instruction::I32Const(nodes_offset as i32));
+    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg { offset: 40, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::F64Store(wasm_encoder::MemArg { offset: 40, align: 3, memory_index: 0 }));
+
+    f.instruction(&Instruction::End);
+    f
+}
+
+/// Generate sample(pos_ptr: i32) -> f32 function
+/// Reads position from memory at pos_ptr, returns density via ray casting
+fn generate_sample_function(
     nodes_offset: u32,
     triangles_offset: u32,
     stack_offset: u32,
-    _triangle_indices: &[u32],
 ) -> Function {
     // Local variables:
-    // 0-2: x, y, z (parameters)
-    // 3: hit_count (i32)
-    // 4: stack_ptr (i32) - index into stack
-    // 5: current_node_idx (i32)
-    // 6: node_offset (i32)
-    // 7-12: node AABB (f64) - min_x, min_y, min_z, max_x, max_y, max_z
-    // 13: left_or_start (i32)
-    // 14: right_or_count (i32)
-    // 15: tri_idx (i32)
-    // 16: tri_offset (i32)
-    // 17-25: triangle vertices (f64) - v0x, v0y, v0z, v1x, v1y, v1z, v2x, v2y, v2z
-    // 26-28: edge1 (f64)
-    // 29-31: edge2 (f64)
-    // 32-34: h (f64) - cross product result
-    // 35: a (f64)
-    // 36: f (f64)
-    // 37-39: s (f64)
-    // 40: u (f64)
-    // 41-43: q (f64)
-    // 44: v_param (f64)
-    // 45: t (f64)
+    // 0: pos_ptr (parameter)
+    // 1-3: x, y, z (loaded from memory)
+    // 4: hit_count (i32)
+    // 5: stack_ptr (i32) - index into stack
+    // 6: current_node_idx (i32)
+    // 7: node_offset (i32)
+    // 8-13: node AABB (f64) - min_x, min_y, min_z, max_x, max_y, max_z
+    // 14: left_or_start (i32)
+    // 15: right_or_count (i32)
+    // 16: tri_idx (i32)
+    // 17: tri_offset (i32)
+    // 18-26: triangle vertices (f64) - v0x, v0y, v0z, v1x, v1y, v1z, v2x, v2y, v2z
+    // 27-29: edge1 (f64)
+    // 30-32: edge2 (f64)
+    // 33-35: h (f64) - cross product result
+    // 36: a (f64)
+    // 37: f (f64)
+    // 38-40: s (f64)
+    // 41: u (f64)
+    // 42-44: q (f64)
+    // 45: v_param (f64)
+    // 46: t (f64)
 
     let locals = vec![
+        (3, ValType::F64),  // x, y, z
         (1, ValType::I32),  // hit_count
         (1, ValType::I32),  // stack_ptr
         (1, ValType::I32),  // current_node_idx
@@ -812,50 +851,67 @@ fn generate_is_inside_function(
 
     let mut f = Function::new(locals);
 
-    // Local indices (after parameters x=0, y=1, z=2)
-    let hit_count: u32 = 3;
-    let stack_ptr: u32 = 4;
-    let current_node_idx: u32 = 5;
-    let node_offset: u32 = 6;
-    let node_min_x: u32 = 7;
-    let node_min_y: u32 = 8;
-    let node_min_z: u32 = 9;
-    let node_max_x: u32 = 10;
-    let node_max_y: u32 = 11;
-    let node_max_z: u32 = 12;
-    let left_or_start: u32 = 13;
-    let right_or_count: u32 = 14;
-    let tri_idx: u32 = 15;
-    let tri_offset: u32 = 16;
-    let v0x: u32 = 17;
-    let v0y: u32 = 18;
-    let v0z: u32 = 19;
-    let v1x: u32 = 20;
-    let v1y: u32 = 21;
-    let v1z: u32 = 22;
-    let v2x: u32 = 23;
-    let v2y: u32 = 24;
-    let v2z: u32 = 25;
-    let edge1_x: u32 = 26;
-    let edge1_y: u32 = 27;
-    let edge1_z: u32 = 28;
-    let edge2_x: u32 = 29;
-    let edge2_y: u32 = 30;
-    let edge2_z: u32 = 31;
-    let h_x: u32 = 32;
-    let h_y: u32 = 33;
-    let h_z: u32 = 34;
-    let a: u32 = 35;
-    let ff: u32 = 36;
-    let s_x: u32 = 37;
-    let s_y: u32 = 38;
-    let s_z: u32 = 39;
-    let u: u32 = 40;
-    let q_x: u32 = 41;
-    let q_y: u32 = 42;
-    let q_z: u32 = 43;
-    let v_param: u32 = 44;
-    let t: u32 = 45;
+    // Local indices (pos_ptr=0, then x=1, y=2, z=3)
+    let pos_ptr: u32 = 0;
+    let x: u32 = 1;
+    let y: u32 = 2;
+    let z: u32 = 3;
+    let hit_count: u32 = 4;
+    let stack_ptr: u32 = 5;
+    let current_node_idx: u32 = 6;
+    let node_offset: u32 = 7;
+    let node_min_x: u32 = 8;
+    let node_min_y: u32 = 9;
+    let node_min_z: u32 = 10;
+    let node_max_x: u32 = 11;
+    let node_max_y: u32 = 12;
+    let node_max_z: u32 = 13;
+    let left_or_start: u32 = 14;
+    let right_or_count: u32 = 15;
+    let tri_idx: u32 = 16;
+    let tri_offset: u32 = 17;
+    let v0x: u32 = 18;
+    let v0y: u32 = 19;
+    let v0z: u32 = 20;
+    let v1x: u32 = 21;
+    let v1y: u32 = 22;
+    let v1z: u32 = 23;
+    let v2x: u32 = 24;
+    let v2y: u32 = 25;
+    let v2z: u32 = 26;
+    let edge1_x: u32 = 27;
+    let edge1_y: u32 = 28;
+    let edge1_z: u32 = 29;
+    let edge2_x: u32 = 30;
+    let edge2_y: u32 = 31;
+    let edge2_z: u32 = 32;
+    let h_x: u32 = 33;
+    let h_y: u32 = 34;
+    let h_z: u32 = 35;
+    let a: u32 = 36;
+    let ff: u32 = 37;
+    let s_x: u32 = 38;
+    let s_y: u32 = 39;
+    let s_z: u32 = 40;
+    let u: u32 = 41;
+    let q_x: u32 = 42;
+    let q_y: u32 = 43;
+    let q_z: u32 = 44;
+    let v_param: u32 = 45;
+    let t: u32 = 46;
+
+    // Load position from memory at pos_ptr
+    f.instruction(&Instruction::LocalGet(pos_ptr));
+    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg { offset: 0, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::LocalSet(x));
+
+    f.instruction(&Instruction::LocalGet(pos_ptr));
+    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg { offset: 8, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::LocalSet(y));
+
+    f.instruction(&Instruction::LocalGet(pos_ptr));
+    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg { offset: 16, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::LocalSet(z));
 
     // Add small jitter to Y and Z to avoid axis-aligned edge intersections
     // This prevents the ray from passing exactly through mesh edges where
@@ -866,15 +922,15 @@ fn generate_is_inside_function(
     // coincidence at triangle edges.
     const RAY_JITTER_Y: f64 = 1.234567e-9;
     const RAY_JITTER_Z: f64 = 2.345678e-9;
-    f.instruction(&Instruction::LocalGet(1)); // y
+    f.instruction(&Instruction::LocalGet(y));
     f.instruction(&Instruction::F64Const(RAY_JITTER_Y));
     f.instruction(&Instruction::F64Add);
-    f.instruction(&Instruction::LocalSet(1)); // y = y + jitter_y
+    f.instruction(&Instruction::LocalSet(y)); // y = y + jitter_y
 
-    f.instruction(&Instruction::LocalGet(2)); // z
+    f.instruction(&Instruction::LocalGet(z));
     f.instruction(&Instruction::F64Const(RAY_JITTER_Z));
     f.instruction(&Instruction::F64Add);
-    f.instruction(&Instruction::LocalSet(2)); // z = z + jitter_z
+    f.instruction(&Instruction::LocalSet(z)); // z = z + jitter_z
 
     // Initialize hit_count = 0
     f.instruction(&Instruction::I32Const(0));
@@ -1001,23 +1057,23 @@ fn generate_is_inside_function(
     // Ray-AABB test for ray in +X direction from (x, y, z)
     // For +X ray: check if y in [min_y, max_y] and z in [min_z, max_z] and max_x >= x
     // (y >= min_y) && (y <= max_y) && (z >= min_z) && (z <= max_z) && (max_x >= x)
-    f.instruction(&Instruction::LocalGet(1)); // y
+    f.instruction(&Instruction::LocalGet(y));
     f.instruction(&Instruction::LocalGet(node_min_y));
     f.instruction(&Instruction::F64Ge);
-    f.instruction(&Instruction::LocalGet(1)); // y
+    f.instruction(&Instruction::LocalGet(y));
     f.instruction(&Instruction::LocalGet(node_max_y));
     f.instruction(&Instruction::F64Le);
     f.instruction(&Instruction::I32And);
-    f.instruction(&Instruction::LocalGet(2)); // z
+    f.instruction(&Instruction::LocalGet(z));
     f.instruction(&Instruction::LocalGet(node_min_z));
     f.instruction(&Instruction::F64Ge);
     f.instruction(&Instruction::I32And);
-    f.instruction(&Instruction::LocalGet(2)); // z
+    f.instruction(&Instruction::LocalGet(z));
     f.instruction(&Instruction::LocalGet(node_max_z));
     f.instruction(&Instruction::F64Le);
     f.instruction(&Instruction::I32And);
     f.instruction(&Instruction::LocalGet(node_max_x));
-    f.instruction(&Instruction::LocalGet(0)); // x
+    f.instruction(&Instruction::LocalGet(x));
     f.instruction(&Instruction::F64Ge);
     f.instruction(&Instruction::I32And);
 
@@ -1212,15 +1268,15 @@ fn generate_is_inside_function(
     f.instruction(&Instruction::LocalSet(ff));
 
     // s = ray_origin - v0
-    f.instruction(&Instruction::LocalGet(0)); // x
+    f.instruction(&Instruction::LocalGet(x));
     f.instruction(&Instruction::LocalGet(v0x));
     f.instruction(&Instruction::F64Sub);
     f.instruction(&Instruction::LocalSet(s_x));
-    f.instruction(&Instruction::LocalGet(1)); // y
+    f.instruction(&Instruction::LocalGet(y));
     f.instruction(&Instruction::LocalGet(v0y));
     f.instruction(&Instruction::F64Sub);
     f.instruction(&Instruction::LocalSet(s_y));
-    f.instruction(&Instruction::LocalGet(2)); // z
+    f.instruction(&Instruction::LocalGet(z));
     f.instruction(&Instruction::LocalGet(v0z));
     f.instruction(&Instruction::F64Sub);
     f.instruction(&Instruction::LocalSet(s_z));

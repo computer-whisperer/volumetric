@@ -2,7 +2,11 @@
 
 //! Demo model: Torus (ring) centered at origin.
 //!
-//! Exports `is_inside(x,y,z) -> f32` (density) and bounding-box getter functions.
+//! This WASM module exports the N-dimensional model ABI:
+//! - `get_dimensions() -> u32`: Returns 3
+//! - `get_bounds(out_ptr: i32)`: Writes interleaved min/max bounds
+//! - `sample(pos_ptr: i32) -> f32`: Reads position, returns density
+//! - `memory`: Linear memory export
 
 #[cfg(target_arch = "wasm32")]
 use core::panic::PanicInfo;
@@ -13,43 +17,49 @@ fn panic(_info: &PanicInfo) -> ! {
     unsafe { core::arch::wasm32::unreachable() }
 }
 
+const R_MAJOR: f64 = 1.0;
+const R_MINOR: f64 = 0.35;
+
+const MIN_X: f64 = -(R_MAJOR + R_MINOR);
+const MAX_X: f64 = R_MAJOR + R_MINOR;
+const MIN_Y: f64 = -R_MINOR;
+const MAX_Y: f64 = R_MINOR;
+const MIN_Z: f64 = -(R_MAJOR + R_MINOR);
+const MAX_Z: f64 = R_MAJOR + R_MINOR;
+
 #[inline]
 fn inside_torus(x: f64, y: f64, z: f64) -> bool {
     // Implicit torus: (sqrt(x^2+z^2) - R)^2 + y^2 <= r^2
-    // R: major radius, r: minor radius
-    let r_major = 1.0;
-    let r_minor = 0.35;
-    let q = libm::sqrt(x * x + z * z) - r_major;
-    q * q + y * y <= r_minor * r_minor
+    let q = libm::sqrt(x * x + z * z) - R_MAJOR;
+    q * q + y * y <= R_MINOR * R_MINOR
 }
 
+/// Returns the number of dimensions (3 for this model).
 #[unsafe(no_mangle)]
-pub extern "C" fn is_inside(x: f64, y: f64, z: f64) -> f32 {
+pub extern "C" fn get_dimensions() -> u32 {
+    3
+}
+
+/// Writes the bounding box to memory at out_ptr.
+/// Format: [min_x, max_x, min_y, max_y, min_z, max_z] as f64
+#[unsafe(no_mangle)]
+pub extern "C" fn get_bounds(out_ptr: i32) {
+    let ptr = out_ptr as *mut f64;
+    unsafe {
+        *ptr.add(0) = MIN_X;
+        *ptr.add(1) = MAX_X;
+        *ptr.add(2) = MIN_Y;
+        *ptr.add(3) = MAX_Y;
+        *ptr.add(4) = MIN_Z;
+        *ptr.add(5) = MAX_Z;
+    }
+}
+
+/// Sample the density at the position read from pos_ptr.
+#[unsafe(no_mangle)]
+pub extern "C" fn sample(pos_ptr: i32) -> f32 {
+    let ptr = pos_ptr as *const f64;
+    let (x, y, z) = unsafe { (*ptr, *ptr.add(1), *ptr.add(2)) };
+
     if inside_torus(x, y, z) { 1.0 } else { 0.0 }
-}
-
-// Bounds: x/z in [-R-r, R+r], y in [-r, r]
-#[unsafe(no_mangle)]
-pub extern "C" fn get_bounds_min_x() -> f64 {
-    -(1.0 + 0.35)
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn get_bounds_min_y() -> f64 {
-    -0.35
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn get_bounds_min_z() -> f64 {
-    -(1.0 + 0.35)
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn get_bounds_max_x() -> f64 {
-    1.0 + 0.35
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn get_bounds_max_y() -> f64 {
-    0.35
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn get_bounds_max_z() -> f64 {
-    1.0 + 0.35
 }

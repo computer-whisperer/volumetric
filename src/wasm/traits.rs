@@ -29,6 +29,70 @@ impl ModelBounds {
     }
 }
 
+/// N-dimensional bounding box for volumetric models.
+///
+/// Stores bounds as interleaved min/max pairs: [min_0, max_0, min_1, max_1, ...]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelBoundsNd {
+    /// Interleaved min/max bounds: [min_0, max_0, min_1, max_1, ..., min_n-1, max_n-1]
+    bounds: Vec<f64>,
+}
+
+impl ModelBoundsNd {
+    /// Create new n-dimensional bounds from interleaved min/max values.
+    ///
+    /// The input should be `[min_0, max_0, min_1, max_1, ...]` with length `2 * n`.
+    pub fn new(bounds: Vec<f64>) -> Self {
+        assert!(bounds.len() % 2 == 0, "bounds must have even length");
+        Self { bounds }
+    }
+
+    /// Create 3D bounds from min/max corners.
+    pub fn from_3d(min: (f64, f64, f64), max: (f64, f64, f64)) -> Self {
+        Self {
+            bounds: vec![min.0, max.0, min.1, max.1, min.2, max.2],
+        }
+    }
+
+    /// Returns the number of dimensions.
+    pub fn dimensions(&self) -> usize {
+        self.bounds.len() / 2
+    }
+
+    /// Get the minimum bound for a given dimension.
+    pub fn min(&self, dim: usize) -> f64 {
+        self.bounds[dim * 2]
+    }
+
+    /// Get the maximum bound for a given dimension.
+    pub fn max(&self, dim: usize) -> f64 {
+        self.bounds[dim * 2 + 1]
+    }
+
+    /// Get the raw interleaved bounds.
+    pub fn as_slice(&self) -> &[f64] {
+        &self.bounds
+    }
+
+    /// Convert to 3D ModelBounds.
+    ///
+    /// Panics if dimensions < 3.
+    pub fn to_3d(&self) -> ModelBounds {
+        assert!(self.dimensions() >= 3, "need at least 3 dimensions for to_3d");
+        ModelBounds::new(
+            (self.min(0), self.min(1), self.min(2)),
+            (self.max(0), self.max(1), self.max(2)),
+        )
+    }
+
+    /// Convert to f32 tuples (3D subset).
+    ///
+    /// Panics if dimensions < 3.
+    pub fn as_f32(&self) -> ((f32, f32, f32), (f32, f32, f32)) {
+        self.to_3d().as_f32()
+    }
+}
+
 /// Executor for volumetric model WASM modules.
 ///
 /// This trait represents a single-threaded executor for WASM modules that export
