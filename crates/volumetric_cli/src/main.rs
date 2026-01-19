@@ -13,7 +13,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 use volumetric::{
-    adaptive_surface_nets_2::{AdaptiveMeshConfig2, MeshingStats2},
+    adaptive_surface_nets_2::{AdaptiveMeshConfig2, MeshingStats2, SharpEdgeConfig},
     generate_adaptive_mesh_v2_from_bytes, stl, Environment, Project, Triangle,
 };
 
@@ -92,6 +92,18 @@ pub struct MeshArgs {
     /// Normal epsilon fraction (default: 0.1)
     #[arg(long, default_value = "0.1")]
     normal_epsilon: f32,
+
+    /// Enable sharp edge detection and vertex duplication
+    #[arg(long)]
+    sharp_edges: bool,
+
+    /// Sharp edge angle threshold in degrees (default: 30)
+    #[arg(long, default_value = "30.0")]
+    sharp_angle: f64,
+
+    /// Sharp edge residual multiplier (default: 4.0)
+    #[arg(long, default_value = "4.0")]
+    sharp_residual: f64,
 
     /// Suppress profiling output
     #[arg(short, long)]
@@ -246,6 +258,32 @@ fn print_stats_summary(stats: &MeshingStats2) {
         );
     }
 
+    // Print sharp edge stats if any processing occurred
+    if stats.sharp_vertices_case1 > 0
+        || stats.sharp_edge_crossings > 0
+        || stats.sharp_vertices_duplicated > 0
+    {
+        println!();
+        println!(
+            "Stage 4.5 (Sharp Edges): {:>7.2}ms ({:>5.1}%)",
+            stats.stage4_5_time_secs * 1000.0,
+            stats.stage4_5_time_secs / stats.total_time_secs * 100.0
+        );
+        println!(
+            "  Case 1 sharp vertices: {}",
+            stats.sharp_vertices_case1
+        );
+        println!("  Edge crossings:        {}", stats.sharp_edge_crossings);
+        println!(
+            "  Vertices inserted:     {}",
+            stats.sharp_vertices_inserted
+        );
+        println!(
+            "  Vertices duplicated:   {}",
+            stats.sharp_vertices_duplicated
+        );
+    }
+
     println!("==========================");
 }
 
@@ -255,7 +293,19 @@ pub fn build_mesh_config(
     vertex_refinement: usize,
     normal_refinement: usize,
     normal_epsilon: f32,
+    sharp_edges: bool,
+    sharp_angle: f64,
+    sharp_residual: f64,
 ) -> AdaptiveMeshConfig2 {
+    let sharp_edge_config = if sharp_edges {
+        Some(SharpEdgeConfig {
+            angle_threshold: sharp_angle.to_radians(),
+            residual_multiplier: sharp_residual,
+        })
+    } else {
+        None
+    };
+
     AdaptiveMeshConfig2 {
         base_resolution,
         max_depth,
@@ -263,6 +313,7 @@ pub fn build_mesh_config(
         normal_sample_iterations: normal_refinement,
         normal_epsilon_frac: normal_epsilon,
         num_threads: 0,
+        sharp_edge_config,
     }
 }
 
@@ -278,6 +329,9 @@ fn run_mesh(args: MeshArgs) -> Result<()> {
         args.vertex_refinement,
         args.normal_refinement,
         args.normal_epsilon,
+        args.sharp_edges,
+        args.sharp_angle,
+        args.sharp_residual,
     );
 
     let effective_res = config.base_resolution * (1 << config.max_depth);

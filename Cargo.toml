@@ -39,6 +39,8 @@ native = ["dep:wasmtime", "dep:rayon"]
 web = ["dep:wasm-bindgen", "dep:js-sys"]
 # Enable normal refinement diagnostics (expensive, for benchmarking only)
 normal-diagnostic = []
+# Enable sharp edge detection diagnostics (expensive, for tuning only)
+edge-diagnostic = []
 
 [dependencies]
 wasmtime = { version = "27", optional = true }
