@@ -5,9 +5,7 @@ use clap::Parser;
 use serde::Serialize;
 use std::path::PathBuf;
 
-use volumetric::{
-    AssetType, Environment, ExecuteWasmInput, ExecuteWasmOutput, Project, ProjectEntry,
-};
+use volumetric::{AssetTypeHint, Environment, ExecutionInput, Project};
 
 // === Project New ===
 
@@ -37,7 +35,7 @@ pub fn run_project_new(args: ProjectNewArgs) -> Result<()> {
             .to_string()
     });
 
-    let project = Project::from_model_wasm(asset_id.clone(), wasm_bytes);
+    let project = Project::from_model(asset_id.clone(), wasm_bytes);
     project
         .save_to_file(&args.output)
         .context("Failed to save project")?;
@@ -85,13 +83,11 @@ pub fn run_project_add_model(args: ProjectAddModelArgs) -> Result<()> {
             .to_string()
     });
 
-    let asset_id = project.insert_model_wasm(&asset_id_base, wasm_bytes);
+    let asset_id = project.insert_model(&asset_id_base, wasm_bytes);
 
     // Remove the auto-added export if --no-export was specified
     if args.no_export {
-        project.entries_mut().retain(|e| {
-            !matches!(e, ProjectEntry::ExportAsset(id) if id == &asset_id)
-        });
+        project.exports_mut().retain(|id| id != &asset_id);
     }
 
     let output_path = args.output.unwrap_or(args.project);
@@ -116,7 +112,7 @@ pub struct ProjectAddOpArgs {
     #[arg(long)]
     pub operator: PathBuf,
 
-    /// Input asset IDs or literal values (format: "asset:id", "string:value", "json:{...}", or "data:base64")
+    /// Input asset IDs or literal values (format: "asset:id", "json:{...}", or "data:base64")
     #[arg(short, long)]
     pub input: Vec<String>,
 
@@ -133,11 +129,9 @@ pub struct ProjectAddOpArgs {
     pub no_export: bool,
 }
 
-fn parse_input(s: &str) -> Result<ExecuteWasmInput> {
+fn parse_input(s: &str) -> Result<ExecutionInput> {
     if let Some(rest) = s.strip_prefix("asset:") {
-        Ok(ExecuteWasmInput::AssetByID(rest.to_string()))
-    } else if let Some(rest) = s.strip_prefix("string:") {
-        Ok(ExecuteWasmInput::String(rest.to_string()))
+        Ok(ExecutionInput::AssetRef(rest.to_string()))
     } else if let Some(rest) = s.strip_prefix("json:") {
         // Parse JSON and convert to CBOR
         let json_value: serde_json::Value =
@@ -145,17 +139,17 @@ fn parse_input(s: &str) -> Result<ExecuteWasmInput> {
         let mut cbor_bytes = Vec::new();
         ciborium::into_writer(&json_value, &mut cbor_bytes)
             .context("Failed to convert JSON to CBOR")?;
-        Ok(ExecuteWasmInput::Data(cbor_bytes))
+        Ok(ExecutionInput::Inline(cbor_bytes))
     } else if let Some(rest) = s.strip_prefix("data:") {
         // Assume base64 encoded data
         use base64::{engine::general_purpose::STANDARD, Engine};
         let bytes = STANDARD
             .decode(rest)
             .context("Failed to decode base64 data")?;
-        Ok(ExecuteWasmInput::Data(bytes))
+        Ok(ExecutionInput::Inline(bytes))
     } else {
         // Default: treat as asset ID
-        Ok(ExecuteWasmInput::AssetByID(s.to_string()))
+        Ok(ExecutionInput::AssetRef(s.to_string()))
     }
 }
 
@@ -171,7 +165,7 @@ pub fn run_project_add_op(args: ProjectAddOpArgs) -> Result<()> {
         .unwrap_or("operator")
         .to_string();
 
-    let inputs: Vec<ExecuteWasmInput> = args
+    let inputs: Vec<ExecutionInput> = args
         .input
         .iter()
         .map(|s| parse_input(s))
@@ -179,7 +173,7 @@ pub fn run_project_add_op(args: ProjectAddOpArgs) -> Result<()> {
 
     // Get primary input for naming
     let primary_input = inputs.iter().find_map(|i| match i {
-        ExecuteWasmInput::AssetByID(id) => Some(id.as_str()),
+        ExecutionInput::AssetRef(id) => Some(id.as_str()),
         _ => None,
     });
 
@@ -187,18 +181,14 @@ pub fn run_project_add_op(args: ProjectAddOpArgs) -> Result<()> {
         .output_id
         .unwrap_or_else(|| project.default_output_name(&op_name, primary_input));
 
-    let outputs = vec![ExecuteWasmOutput::new(
-        output_id.clone(),
-        AssetType::ModelWASM,
-    )];
+    // Output IDs for the execution step (just the output ID, no types)
+    let output_ids = vec![output_id.clone()];
 
-    project.insert_operation(&op_name, op_bytes, inputs, outputs, output_id.clone());
+    project.insert_operation(&op_name, op_bytes, inputs, output_ids, output_id.clone());
 
     // Remove the auto-added export if --no-export was specified
     if args.no_export {
-        project.entries_mut().retain(|e| {
-            !matches!(e, ProjectEntry::ExportAsset(id) if id == &output_id)
-        });
+        project.exports_mut().retain(|id| id != &output_id);
     }
 
     let output_path = args.output.unwrap_or(args.project);
@@ -240,7 +230,7 @@ struct ExportResult {
 #[derive(Debug, Serialize)]
 struct ExportedAsset {
     asset_id: String,
-    asset_type: String,
+    type_hint: String,
     file_path: String,
     size_bytes: usize,
 }
@@ -263,29 +253,31 @@ pub fn run_project_export(args: ProjectExportArgs) -> Result<()> {
     } else {
         exports
             .into_iter()
-            .filter(|e| args.asset.contains(&e.asset_id().to_string()))
+            .filter(|e| args.asset.contains(&e.id().to_string()))
             .collect()
     };
 
     let mut results = Vec::new();
 
     for export in filtered_exports {
-        let asset_id = export.asset_id();
-        let (ext, asset_type_str) = match export.asset().asset_type() {
-            AssetType::ModelWASM => ("wasm", "ModelWASM"),
-            AssetType::OperationWASM => ("wasm", "OperationWASM"),
+        let asset_id = export.id();
+        let type_hint = export.type_hint().unwrap_or(AssetTypeHint::Binary);
+        let ext = match type_hint {
+            AssetTypeHint::Model | AssetTypeHint::Operator => "wasm",
+            AssetTypeHint::LuaSource => "lua",
+            _ => "bin",
         };
 
         let file_name = format!("{}.{}", asset_id, ext);
         let file_path = args.output.join(&file_name);
-        let bytes = export.asset().bytes();
+        let bytes = export.data();
 
         std::fs::write(&file_path, bytes)
             .with_context(|| format!("Failed to write {}", file_path.display()))?;
 
         results.push(ExportedAsset {
             asset_id: asset_id.to_string(),
-            asset_type: asset_type_str.to_string(),
+            type_hint: type_hint.to_string(),
             file_path: file_path.display().to_string(),
             size_bytes: bytes.len(),
         });
@@ -302,7 +294,7 @@ pub fn run_project_export(args: ProjectExportArgs) -> Result<()> {
         for result in &results {
             println!(
                 "  {} ({}) -> {} ({} bytes)",
-                result.asset_id, result.asset_type, result.file_path, result.size_bytes
+                result.asset_id, result.type_hint, result.file_path, result.size_bytes
             );
         }
     }
@@ -332,7 +324,7 @@ struct RunResult {
 #[derive(Debug, Serialize)]
 struct RunExport {
     asset_id: String,
-    asset_type: String,
+    type_hint: String,
     size_bytes: usize,
 }
 
@@ -347,9 +339,12 @@ pub fn run_project_run(args: ProjectRunArgs) -> Result<()> {
     let results: Vec<RunExport> = exports
         .iter()
         .map(|e| RunExport {
-            asset_id: e.asset_id().to_string(),
-            asset_type: format!("{:?}", e.asset().asset_type()),
-            size_bytes: e.asset().bytes().len(),
+            asset_id: e.id().to_string(),
+            type_hint: e
+                .type_hint()
+                .map(|h| h.to_string())
+                .unwrap_or_else(|| "Binary".to_string()),
+            size_bytes: e.data().len(),
         })
         .collect();
 
@@ -368,7 +363,7 @@ pub fn run_project_run(args: ProjectRunArgs) -> Result<()> {
         for result in &results {
             println!(
                 "  {} ({}, {} bytes)",
-                result.asset_id, result.asset_type, result.size_bytes
+                result.asset_id, result.type_hint, result.size_bytes
             );
         }
     }
@@ -391,55 +386,69 @@ pub struct ProjectListArgs {
 
 #[derive(Debug, Serialize)]
 struct ListResult {
-    declared_assets: Vec<DeclaredAsset>,
-    exported_assets: Vec<String>,
+    version: u32,
+    imports: Vec<ImportInfo>,
+    timeline_steps: usize,
+    exports: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
-struct DeclaredAsset {
-    asset_id: String,
-    asset_type: String,
+struct ImportInfo {
+    id: String,
+    type_hint: String,
+    size_bytes: usize,
 }
 
 pub fn run_project_list(args: ProjectListArgs) -> Result<()> {
     let project = Project::load_from_file(&args.project).context("Failed to load project")?;
 
-    let declared: Vec<DeclaredAsset> = project
-        .declared_assets()
-        .into_iter()
-        .map(|(id, ty)| DeclaredAsset {
-            asset_id: id,
-            asset_type: format!("{:?}", ty),
+    let imports: Vec<ImportInfo> = project
+        .imports()
+        .iter()
+        .map(|i| ImportInfo {
+            id: i.id.clone(),
+            type_hint: i
+                .type_hint
+                .map(|h| h.to_string())
+                .unwrap_or_else(|| "Binary".to_string()),
+            size_bytes: i.data.len(),
         })
         .collect();
 
-    let exported: Vec<String> = project
-        .entries()
-        .iter()
-        .filter_map(|e| match e {
-            ProjectEntry::ExportAsset(id) => Some(id.clone()),
-            _ => None,
-        })
-        .collect();
+    let exports = project.exports().to_vec();
 
     if args.json {
         let output = ListResult {
-            declared_assets: declared,
-            exported_assets: exported,
+            version: project.version,
+            imports,
+            timeline_steps: project.timeline().len(),
+            exports,
         };
         println!(
             "{}",
             serde_json::to_string_pretty(&output).context("Failed to serialize JSON")?
         );
     } else {
-        println!("Declared assets ({}):", declared.len());
-        for asset in &declared {
-            let is_exported = if exported.contains(&asset.asset_id) {
-                " [exported]"
-            } else {
-                ""
-            };
-            println!("  {} ({}){}", asset.asset_id, asset.asset_type, is_exported);
+        println!("Project version: {}", project.version);
+        println!();
+        println!("Imports ({}):", imports.len());
+        for import in &imports {
+            println!("  {} ({}, {} bytes)", import.id, import.type_hint, import.size_bytes);
+        }
+        println!();
+        println!("Timeline steps: {}", project.timeline().len());
+        for (idx, step) in project.timeline().iter().enumerate() {
+            println!(
+                "  {}. {} -> {:?}",
+                idx + 1,
+                step.operator_id,
+                step.outputs
+            );
+        }
+        println!();
+        println!("Exports ({}):", exports.len());
+        for id in &exports {
+            println!("  {}", id);
         }
     }
 

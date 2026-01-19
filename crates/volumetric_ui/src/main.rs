@@ -524,9 +524,8 @@ struct InProgressOperation {
 
 // Project system - common types
 use volumetric::{
-    adaptive_surface_nets_2, AssetType, Environment, ExecuteWasmEntry, ExecuteWasmInput,
-    ExecuteWasmOutput, LoadedAsset, OperatorMetadata, OperatorMetadataInput,
-    OperatorMetadataOutput, Project, ProjectEntry, Triangle,
+    adaptive_surface_nets_2, AssetTypeHint, Environment, ExecutionInput, LoadedAsset,
+    OperatorMetadata, OperatorMetadataInput, Project, Triangle,
 };
 
 // WASM execution functions available on both native and web
@@ -961,9 +960,9 @@ impl VolumetricApp {
 
             // Create render data for the first model asset with PointCloud mode
             let mut render_data = HashMap::new();
-            if let Some(first_model) = assets.iter().find(|a| a.as_model_wasm().is_some()) {
-                let id = first_model.asset_id().to_string();
-                let wasm_bytes = first_model.as_model_wasm().unwrap().to_vec();
+            if let Some(first_model) = assets.iter().find(|a| a.as_model().is_some()) {
+                let id = first_model.id().to_string();
+                let wasm_bytes = first_model.as_model().unwrap().to_vec();
                 render_data.insert(id, AssetRenderData::new(wasm_bytes, ExportRenderMode::AdaptiveSurfaceNets2));
             }
             (assets, render_data)
@@ -1030,15 +1029,15 @@ impl VolumetricApp {
                             let exported_ids: std::collections::HashSet<String> = self
                                 .exported_assets
                                 .iter()
-                                .map(|a| a.asset_id().to_string())
+                                .map(|a| a.id().to_string())
                                 .collect();
                             self.asset_render_data
                                 .retain(|id, _| exported_ids.contains(id));
 
                             // Update WASM bytes for existing render data entries, and add new exports
                             for asset in &self.exported_assets {
-                                if let Some(wasm_bytes) = asset.as_model_wasm() {
-                                    let asset_id = asset.asset_id();
+                                if let Some(wasm_bytes) = asset.as_model() {
+                                    let asset_id = asset.id();
                                     if let Some(render_data) = self.asset_render_data.get_mut(asset_id) {
                                         // Update existing entry
                                         render_data.wasm_bytes = wasm_bytes.to_vec();
@@ -1187,8 +1186,8 @@ impl VolumetricApp {
         let wasm_bytes = self
             .exported_assets
             .iter()
-            .find(|a| a.asset_id() == asset_id)
-            .and_then(|a| a.as_model_wasm())
+            .find(|a| a.id() == asset_id)
+            .and_then(|a| a.as_model())
             .map(|b| b.to_vec());
 
         match wasm_bytes {
@@ -1404,46 +1403,42 @@ impl VolumetricApp {
         }
     }
     
-    /// Start editing a project entry at the given index
+    /// Start editing a timeline step at the given index
     fn start_editing_entry(&mut self, idx: usize) {
         // First, extract all needed data from the project to avoid borrow conflicts
-        let entry_data = self.project.as_ref().and_then(|project| {
-            project.entries().get(idx).and_then(|entry| {
-                if let ProjectEntry::ExecuteWASM(exec_entry) = entry {
-                    Some((
-                        exec_entry.asset_id().to_string(),
-                        exec_entry.inputs().to_vec(),
-                        exec_entry.outputs().to_vec(),
-                    ))
-                } else {
-                    None
-                }
+        let step_data = self.project.as_ref().and_then(|project| {
+            project.timeline().get(idx).map(|step| {
+                (
+                    step.operator_id.clone(),
+                    step.inputs.clone(),
+                    step.outputs.clone(),
+                )
             })
         });
-        
-        let Some((asset_id, inputs, outputs)) = entry_data else { return };
-        
+
+        let Some((operator_id, inputs, outputs)) = step_data else { return };
+
         self.editing_entry_index = Some(idx);
         self.edit_config_values.clear();
         self.edit_lua_script.clear();
         self.edit_input_asset_ids.clear();
-        
+
         // Populate output asset ID from the first output (primary output)
         self.edit_output_asset_id = outputs.first()
-            .map(|o| o.asset_id.clone())
+            .cloned()
             .unwrap_or_default();
-        
+
         // Get operator metadata to understand input types
-        let crate_name = asset_id.strip_prefix("op_").unwrap_or(&asset_id);
+        let crate_name = operator_id.strip_prefix("op_").unwrap_or(&operator_id);
         let operator_metadata = self.operator_metadata_cached(crate_name);
-        
+
         if let Some(ref metadata) = operator_metadata {
             // Use metadata to properly decode each input
             for (input_idx, input_meta) in metadata.inputs.iter().enumerate() {
                 let input = inputs.get(input_idx);
                 match input_meta {
                     OperatorMetadataInput::ModelWASM => {
-                        if let Some(ExecuteWasmInput::AssetByID(id)) = input {
+                        if let Some(ExecutionInput::AssetRef(id)) = input {
                             self.edit_input_asset_ids.push(Some(id.clone()));
                         } else {
                             self.edit_input_asset_ids.push(None);
@@ -1452,7 +1447,7 @@ impl VolumetricApp {
                     OperatorMetadataInput::CBORConfiguration(cddl) => {
                         self.edit_input_asset_ids.push(None); // Placeholder for data inputs
                         // Decode CBOR data to populate config values
-                        if let Some(ExecuteWasmInput::Data(data)) = input {
+                        if let Some(ExecutionInput::Inline(data)) = input {
                             if let Ok(fields) = parse_cddl_record_schema(cddl.as_str()) {
                                 if let Ok(cbor_value) = ciborium::from_reader::<CborValue, _>(data.as_slice()) {
                                     if let CborValue::Map(map) = cbor_value {
@@ -1498,14 +1493,12 @@ impl VolumetricApp {
                     OperatorMetadataInput::LuaSource(_) => {
                         self.edit_input_asset_ids.push(None); // Placeholder for data inputs
                         // Extract Lua script from data
-                        if let Some(ExecuteWasmInput::Data(data)) = input {
+                        if let Some(ExecutionInput::Inline(data)) = input {
                             if let Ok(script) = std::str::from_utf8(data) {
                                 if !script.is_empty() {
                                     self.edit_lua_script = script.to_string();
                                 }
                             }
-                        } else if let Some(ExecuteWasmInput::String(s)) = input {
-                            self.edit_lua_script = s.clone();
                         }
                     }
                 }
@@ -1514,10 +1507,10 @@ impl VolumetricApp {
             // Fallback: no metadata available, use simple extraction
             for input in &inputs {
                 match input {
-                    ExecuteWasmInput::AssetByID(id) => {
+                    ExecutionInput::AssetRef(id) => {
                         self.edit_input_asset_ids.push(Some(id.clone()));
                     }
-                    ExecuteWasmInput::Data(data) => {
+                    ExecutionInput::Inline(data) => {
                         // Try to interpret as UTF-8 string (Lua script)
                         if let Ok(script) = std::str::from_utf8(data) {
                             if !script.is_empty() && self.edit_lua_script.is_empty() {
@@ -1525,12 +1518,6 @@ impl VolumetricApp {
                             }
                         }
                         self.edit_input_asset_ids.push(None);
-                    }
-                    ExecuteWasmInput::String(s) => {
-                        self.edit_input_asset_ids.push(None);
-                        if self.edit_lua_script.is_empty() {
-                            self.edit_lua_script = s.clone();
-                        }
                     }
                 }
             }
@@ -1546,45 +1533,40 @@ impl VolumetricApp {
         self.edit_output_asset_id.clear();
     }
     
-    /// Show the edit panel UI for the currently selected entry
+    /// Show the edit panel UI for the currently selected timeline step
     fn show_edit_panel(&mut self, ui: &mut egui::Ui) {
         let Some(idx) = self.editing_entry_index else { return };
-        
-        ui.heading("Edit Entry");
+
+        ui.heading("Edit Step");
         ui.separator();
-        
-        // Get entry info (we need to be careful about borrowing)
-        let entry_info = self.project.as_ref().and_then(|p| {
-            p.entries().get(idx).map(|entry| {
-                match entry {
-                    ProjectEntry::ExecuteWASM(exec_entry) => {
-                        Some((exec_entry.asset_id().to_string(), exec_entry.inputs().to_vec()))
-                    }
-                    _ => None
-                }
-            }).flatten()
+
+        // Get step info (we need to be careful about borrowing)
+        let step_info = self.project.as_ref().and_then(|p| {
+            p.timeline().get(idx).map(|step| {
+                (step.operator_id.clone(), step.inputs.clone())
+            })
         });
-        
-        let Some((asset_id, inputs)) = entry_info else {
-            ui.label("Entry not found or not editable");
+
+        let Some((operator_id, inputs)) = step_info else {
+            ui.label("Step not found or not editable");
             if ui.button("Close").clicked() {
                 self.close_edit_panel();
             }
             return;
         };
-        
-        ui.label(format!("Editing: {}", asset_id));
+
+        ui.label(format!("Editing: {}", operator_id));
         ui.add_space(8.0);
-        
-        // Get available input assets for dropdowns
+
+        // Get available input assets for dropdowns (only models)
         let input_asset_ids: Vec<String> = self
             .project
             .as_ref()
             .map(|p| {
                 p.declared_assets()
                     .into_iter()
-                    .filter_map(|(id, ty)| {
-                        if ty == AssetType::ModelWASM {
+                    .filter_map(|(id, hint)| {
+                        if hint == Some(AssetTypeHint::Model) || hint.is_none() {
                             Some(id)
                         } else {
                             None
@@ -1593,12 +1575,12 @@ impl VolumetricApp {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        
+
         // Try to get operator metadata for this operation
-        // Extract crate name from asset_id (e.g., "op_translate_operator" -> "translate_operator")
-        let crate_name = asset_id.strip_prefix("op_").unwrap_or(&asset_id);
+        // Extract crate name from operator_id (e.g., "op_translate_operator" -> "translate_operator")
+        let crate_name = operator_id.strip_prefix("op_").unwrap_or(&operator_id);
         let operator_metadata = self.operator_metadata_cached(crate_name);
-        
+
         ui.label("Inputs:");
         ui.indent("edit_inputs", |ui| {
             // Show input editors based on operator metadata or existing inputs
@@ -1609,19 +1591,19 @@ impl VolumetricApp {
                         OperatorMetadataInput::ModelWASM => {
                             ui.horizontal(|ui| {
                                 ui.label(format!("Model {}:", model_input_idx + 1));
-                                
+
                                 // Ensure we have enough slots
                                 while self.edit_input_asset_ids.len() <= input_idx {
                                     self.edit_input_asset_ids.push(None);
                                 }
-                                
+
                                 // Initialize from existing input if not set
                                 if self.edit_input_asset_ids[input_idx].is_none() {
-                                    if let Some(ExecuteWasmInput::AssetByID(id)) = inputs.get(input_idx) {
+                                    if let Some(ExecutionInput::AssetRef(id)) = inputs.get(input_idx) {
                                         self.edit_input_asset_ids[input_idx] = Some(id.clone());
                                     }
                                 }
-                                
+
                                 let selected = self.edit_input_asset_ids[input_idx]
                                     .as_deref()
                                     .unwrap_or("(none)");
@@ -1722,7 +1704,7 @@ impl VolumetricApp {
                             if self.edit_lua_script.is_empty() {
                                 // Try to get from existing input
                                 for input in &inputs {
-                                    if let ExecuteWasmInput::Data(data) = input {
+                                    if let ExecutionInput::Inline(data) = input {
                                         if let Ok(script) = std::str::from_utf8(data) {
                                             if !script.is_empty() {
                                                 self.edit_lua_script = script.to_string();
@@ -1789,30 +1771,24 @@ impl VolumetricApp {
         });
     }
     
-    /// Apply the changes from the edit panel to the project entry
+    /// Apply the changes from the edit panel to the timeline step
     fn apply_edit_changes(&mut self) {
         let Some(idx) = self.editing_entry_index else { return };
-        
+
         // Get operator metadata for building new inputs
-        let entry_info = self.project.as_ref().and_then(|p| {
-            p.entries().get(idx).and_then(|entry| {
-                if let ProjectEntry::ExecuteWASM(exec_entry) = entry {
-                    Some(exec_entry.asset_id().to_string())
-                } else {
-                    None
-                }
-            })
+        let operator_id = self.project.as_ref().and_then(|p| {
+            p.timeline().get(idx).map(|step| step.operator_id.clone())
         });
-        
-        let Some(asset_id) = entry_info else { return };
-        let crate_name = asset_id.strip_prefix("op_").unwrap_or(&asset_id);
+
+        let Some(operator_id) = operator_id else { return };
+        let crate_name = operator_id.strip_prefix("op_").unwrap_or(&operator_id);
         let operator_metadata = self.operator_metadata_cached(crate_name);
-        
+
         // Build new inputs based on edit state
-        let new_inputs: Vec<ExecuteWasmInput> = if let Some(ref metadata) = operator_metadata {
+        let new_inputs: Vec<ExecutionInput> = if let Some(ref metadata) = operator_metadata {
             let mut inputs = Vec::new();
             let mut model_input_idx = 0;
-            
+
             for input_meta in &metadata.inputs {
                 match input_meta {
                     OperatorMetadataInput::ModelWASM => {
@@ -1820,18 +1796,18 @@ impl VolumetricApp {
                             .get(model_input_idx)
                             .and_then(|o| o.clone())
                             .unwrap_or_default();
-                        inputs.push(ExecuteWasmInput::AssetByID(asset_id));
+                        inputs.push(ExecutionInput::AssetRef(asset_id));
                         model_input_idx += 1;
                     }
                     OperatorMetadataInput::CBORConfiguration(cddl) => {
                         let fields = parse_cddl_record_schema(cddl.as_str()).unwrap_or_default();
                         let bytes = encode_config_map_to_cbor(&fields, &self.edit_config_values)
                             .unwrap_or_default();
-                        inputs.push(ExecuteWasmInput::Data(bytes));
+                        inputs.push(ExecutionInput::Inline(bytes));
                     }
                     OperatorMetadataInput::LuaSource(_) => {
                         let script_bytes = self.edit_lua_script.as_bytes().to_vec();
-                        inputs.push(ExecuteWasmInput::Data(script_bytes));
+                        inputs.push(ExecutionInput::Inline(script_bytes));
                     }
                 }
             }
@@ -1840,55 +1816,41 @@ impl VolumetricApp {
             // No metadata, keep existing inputs
             return;
         };
-        
-        // Update the project entry
+
+        // Update the timeline step
         if let Some(ref mut project) = self.project {
-            // Get the old output asset ID to find and update the corresponding ExportAsset
-            let old_output_id = project.entries().get(idx).and_then(|entry| {
-                if let ProjectEntry::ExecuteWASM(exec_entry) = entry {
-                    exec_entry.outputs().first().map(|o| o.asset_id.clone())
-                } else {
-                    None
-                }
-            });
-            
+            // Get the old output ID to update exports
+            let old_output_id = project.timeline().get(idx).and_then(|step| step.outputs.first().cloned());
             let new_output_id = self.edit_output_asset_id.trim().to_string();
-            
-            if let Some(ProjectEntry::ExecuteWASM(exec_entry)) = project.entries_mut().get_mut(idx) {
-                // Build new outputs with the edited output name
-                let new_outputs: Vec<ExecuteWasmOutput> = exec_entry.outputs().iter().enumerate().map(|(i, old_out)| {
+
+            if let Some(step) = project.timeline_mut().get_mut(idx) {
+                // Update inputs
+                step.inputs = new_inputs;
+
+                // Update output IDs
+                let new_outputs: Vec<String> = step.outputs.iter().enumerate().map(|(i, _old_out)| {
                     if i == 0 {
-                        // Primary output uses the edited name
-                        ExecuteWasmOutput::new(new_output_id.clone(), old_out.asset_type)
+                        new_output_id.clone()
                     } else {
-                        // Secondary outputs get a suffix
-                        ExecuteWasmOutput::new(format!("{}_{}", new_output_id, i), old_out.asset_type)
+                        format!("{}_{}", new_output_id, i)
                     }
                 }).collect();
-                
-                let new_entry = ExecuteWasmEntry::new(
-                    exec_entry.asset_id().to_string(),
-                    new_inputs,
-                    new_outputs,
-                );
-                *exec_entry = new_entry;
+                step.outputs = new_outputs;
             }
-            
-            // Update the corresponding ExportAsset entry if the output name changed
+
+            // Update the corresponding export if the output name changed
             if let Some(old_id) = old_output_id {
                 if old_id != new_output_id {
-                    for entry in project.entries_mut().iter_mut() {
-                        if let ProjectEntry::ExportAsset(export_id) = entry {
-                            if *export_id == old_id {
-                                *export_id = new_output_id.clone();
-                                break;
-                            }
+                    for export_id in project.exports_mut().iter_mut() {
+                        if *export_id == old_id {
+                            *export_id = new_output_id.clone();
+                            break;
                         }
                     }
                 }
             }
         }
-        
+
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.project_path = None; // Mark as modified
@@ -1926,10 +1888,10 @@ impl eframe::App for VolumetricApp {
                     if let Some((name, wasm_bytes)) = result {
                         let asset_id = name.trim_end_matches(".wasm").to_string();
                         if self.project.is_none() {
-                            self.project = Some(Project::new(vec![]));
+                            self.project = Some(Project::new());
                         }
                         if let Some(ref mut project) = self.project {
-                            project.insert_model_wasm(&asset_id, wasm_bytes);
+                            project.insert_model(&asset_id, wasm_bytes);
                         }
                         self.run_project();
                     }
@@ -2213,10 +2175,10 @@ impl eframe::App for VolumetricApp {
                                 // First try bundled assets (works on both native and web)
                                 if let Some(wasm_bytes) = get_bundled_model(crate_name) {
                                     if self.project.is_none() {
-                                        self.project = Some(Project::new(vec![]));
+                                        self.project = Some(Project::new());
                                     }
                                     if let Some(ref mut project) = self.project {
-                                        project.insert_model_wasm(crate_name, wasm_bytes.to_vec());
+                                        project.insert_model(crate_name, wasm_bytes.to_vec());
                                     }
                                     #[cfg(not(target_arch = "wasm32"))]
                                     { self.project_path = None; }
@@ -2235,10 +2197,10 @@ impl eframe::App for VolumetricApp {
                                                             .unwrap_or("model")
                                                             .to_string();
                                                         if self.project.is_none() {
-                                                            self.project = Some(Project::new(vec![]));
+                                                            self.project = Some(Project::new());
                                                         }
                                                         if let Some(ref mut project) = self.project {
-                                                            project.insert_model_wasm(asset_id.as_str(), wasm_bytes);
+                                                            project.insert_model(asset_id.as_str(), wasm_bytes);
                                                         }
                                                         self.project_path = None;
                                                         self.run_project();
@@ -2287,10 +2249,10 @@ impl eframe::App for VolumetricApp {
                                                 .unwrap_or("model")
                                                 .to_string();
                                             if self.project.is_none() {
-                                                self.project = Some(Project::new(vec![]));
+                                                self.project = Some(Project::new());
                                             }
                                             if let Some(ref mut project) = self.project {
-                                                project.insert_model_wasm(asset_id.as_str(), wasm_bytes);
+                                                project.insert_model(asset_id.as_str(), wasm_bytes);
                                             }
                                             self.project_path = None;
                                             self.run_project();
@@ -2329,15 +2291,15 @@ impl eframe::App for VolumetricApp {
                 ui.collapsing("⚙ Operators", |ui| {
                     ui.add_space(4.0);
                     
-                    // Get available input assets for operators
+                    // Get available input assets for operators (only models)
                     let input_asset_ids: Vec<String> = self
                         .project
                         .as_ref()
                         .map(|p| {
                             p.declared_assets()
                                 .into_iter()
-                                .filter_map(|(id, ty)| {
-                                    if ty == AssetType::ModelWASM {
+                                .filter_map(|(id, hint)| {
+                                    if hint == Some(AssetTypeHint::Model) || hint.is_none() {
                                         Some(id)
                                     } else {
                                         None
@@ -2434,77 +2396,70 @@ impl eframe::App for VolumetricApp {
                                     .unwrap_or_else(|| format!("{}_output", crate_name));
                                 let op_asset_id = format!("op_{crate_name}");
 
-                                let (inputs, outputs) = match app.operator_metadata_cached(crate_name) {
+                                // Build inputs based on operator metadata
+                                let (inputs, output_ids): (Vec<ExecutionInput>, Vec<String>) = match app.operator_metadata_cached(crate_name) {
                                     Some(metadata) => {
                                         let mut inputs = Vec::with_capacity(metadata.inputs.len());
                                         let mut model_inputs_iter = [input_id_a.clone(), input_id_b.clone()].into_iter();
-                                        for (_idx, input) in metadata.inputs.iter().enumerate() {
+                                        for input in metadata.inputs.iter() {
                                             match input {
                                                 OperatorMetadataInput::ModelWASM => {
                                                     let id = model_inputs_iter
                                                         .next()
                                                         .unwrap_or_else(|| input_id_a.clone());
-                                                    inputs.push(ExecuteWasmInput::AssetByID(id));
+                                                    inputs.push(ExecutionInput::AssetRef(id));
                                                 }
                                                 OperatorMetadataInput::CBORConfiguration(cddl) => {
                                                     let fields = parse_cddl_record_schema(cddl.as_str()).unwrap_or_default();
                                                     let bytes = encode_config_map_to_cbor(&fields, &app.operation_config_values)
                                                         .unwrap_or_default();
-                                                    inputs.push(ExecuteWasmInput::Data(bytes));
+                                                    inputs.push(ExecutionInput::Inline(bytes));
                                                 }
                                                 OperatorMetadataInput::LuaSource(_) => {
                                                     let script_bytes = app.operation_lua_script.as_bytes().to_vec();
-                                                    inputs.push(ExecuteWasmInput::Data(script_bytes));
+                                                    inputs.push(ExecutionInput::Inline(script_bytes));
                                                 }
                                             }
                                         }
 
-                                        let mut outputs = Vec::with_capacity(metadata.outputs.len());
-                                        for (idx, output) in metadata.outputs.iter().enumerate() {
-                                            let asset_type = match output {
-                                                OperatorMetadataOutput::ModelWASM => AssetType::ModelWASM,
-                                            };
-                                            let out_id = if idx == 0 {
+                                        // Build output IDs (just strings now, no type needed)
+                                        let outputs: Vec<String> = metadata.outputs.iter().enumerate().map(|(idx, _)| {
+                                            if idx == 0 {
                                                 output_id.clone()
                                             } else {
                                                 format!("{output_id}_{idx}")
-                                            };
-                                            outputs.push(ExecuteWasmOutput::new(out_id, asset_type));
-                                        }
+                                            }
+                                        }).collect();
 
                                         (inputs, outputs)
                                     }
                                     None => (
-                                        vec![ExecuteWasmInput::AssetByID(input_id_a.clone())],
-                                        vec![ExecuteWasmOutput::new(output_id.clone(), AssetType::ModelWASM)],
+                                        vec![ExecutionInput::AssetRef(input_id_a.clone())],
+                                        vec![output_id.clone()],
                                     ),
                                 };
 
-                                let mut new_entry_idx: Option<usize> = None;
+                                let mut new_step_idx: Option<usize> = None;
                                 if let Some(ref mut project) = app.project {
-                                    let count_before = project.entries().len();
+                                    let count_before = project.timeline().len();
 
                                     project.insert_operation(
                                         op_asset_id.as_str(),
                                         wasm_bytes,
                                         inputs,
-                                        outputs,
+                                        output_ids,
                                         output_id,
                                     );
 
-                                    for (idx, entry) in project.entries().iter().enumerate().rev() {
-                                        if idx >= count_before.saturating_sub(1) {
-                                            if matches!(entry, ProjectEntry::ExecuteWASM(_)) {
-                                                new_entry_idx = Some(idx);
-                                                break;
-                                            }
-                                        }
+                                    // The new step is at the end of the timeline
+                                    if project.timeline().len() > count_before {
+                                        new_step_idx = Some(project.timeline().len() - 1);
                                     }
                                 }
 
                                 app.run_project();
 
-                                if let Some(idx) = new_entry_idx {
+                                if let Some(idx) = new_step_idx {
                                     app.start_editing_entry(idx);
                                 }
                             };
@@ -2546,11 +2501,11 @@ impl eframe::App for VolumetricApp {
 
                 ui.separator();
                 // Track actions to perform after the UI loop (to avoid borrow conflicts)
-                let mut entry_to_edit: Option<usize> = None;
-                let mut entry_to_delete: Option<usize> = None;
-                let mut entry_to_move_up: Option<usize> = None;
-                let mut entry_to_move_down: Option<usize> = None;
-                
+                let mut step_to_edit: Option<usize> = None;
+                let mut step_to_delete: Option<usize> = None;
+                let mut step_to_move_up: Option<usize> = None;
+                let mut step_to_move_down: Option<usize> = None;
+
                 egui::CollapsingHeader::new("Project Timeline")
                     .default_open(true)
                     .show(ui, |ui| {
@@ -2564,96 +2519,73 @@ impl eframe::App for VolumetricApp {
                             }
                         });
                         ui.add_space(4.0);
-                        
+
                         if let Some(ref project) = self.project {
-                            let entries = project.entries();
-                            if entries.is_empty() {
-                                ui.weak("No entries in project");
+                            // Show imports
+                            if !project.imports().is_empty() {
+                                ui.label("Imports:");
+                                for import in project.imports() {
+                                    let icon = match import.type_hint {
+                                        Some(AssetTypeHint::Model) => "📦",
+                                        Some(AssetTypeHint::Operator) => "⚙️",
+                                        _ => "📄",
+                                    };
+                                    ui.weak(format!("  {} {}", icon, import.id));
+                                }
+                                ui.add_space(4.0);
+                            }
+
+                            // Show timeline steps
+                            let timeline = project.timeline();
+                            if timeline.is_empty() {
+                                ui.weak("No operations in timeline");
                             } else {
+                                ui.label("Timeline:");
                                 egui::ScrollArea::vertical()
-                                    .max_height(300.0)
+                                    .max_height(200.0)
                                     .show(ui, |ui| {
-                                        for (idx, entry) in entries.iter().enumerate() {
+                                        for (idx, step) in timeline.iter().enumerate() {
                                             ui.group(|ui| {
                                                 ui.horizontal(|ui| {
-                                                    // Step number indicator
                                                     ui.label(format!("{}.", idx + 1));
-
-                                                    match entry {
-                                                        ProjectEntry::LoadAsset(load_entry) => {
-                                                            let icon = match load_entry.asset_type() {
-                                                                AssetType::ModelWASM => "📦",
-                                                                AssetType::OperationWASM => "⚙️",
-                                                            };
-                                                            ui.label(format!(
-                                                                "{} Load: {}",
-                                                                icon,
-                                                                load_entry.asset_id()
-                                                            ));
-                                                        }
-                                                        ProjectEntry::ExecuteWASM(exec_entry) => {
-                                                            ui.vertical(|ui| {
-                                                                ui.label(format!(
-                                                                    "▶ Execute: {}",
-                                                                    exec_entry.asset_id()
-                                                                ));
-                                                                // Show inputs
-                                                                let inputs = exec_entry.inputs();
-                                                                if !inputs.is_empty() {
-                                                                    ui.indent("inputs", |ui| {
-                                                                        for input in inputs {
-                                                                            ui.weak(format!(
-                                                                                "← {}",
-                                                                                input.display()
-                                                                            ));
-                                                                        }
-                                                                    });
-                                                                }
-                                                                // Show output count
-                                                                let output_count = exec_entry.output_count();
-                                                                if output_count > 0 {
-                                                                    ui.indent("outputs", |ui| {
-                                                                        ui.weak(format!(
-                                                                            "→ {} output(s)",
-                                                                            output_count
-                                                                        ));
-                                                                    });
+                                                    ui.vertical(|ui| {
+                                                        ui.label(format!("▶ {}", step.operator_id));
+                                                        if !step.inputs.is_empty() {
+                                                            ui.indent("inputs", |ui| {
+                                                                for input in &step.inputs {
+                                                                    ui.weak(format!("← {}", input.display()));
                                                                 }
                                                             });
                                                         }
-                                                        ProjectEntry::ExportAsset(asset_id) => {
-                                                            ui.label(format!(
-                                                                "📤 Export: {}",
-                                                                asset_id
-                                                            ));
+                                                        if !step.outputs.is_empty() {
+                                                            ui.indent("outputs", |ui| {
+                                                                for output in &step.outputs {
+                                                                    ui.weak(format!("→ {}", output));
+                                                                }
+                                                            });
                                                         }
-                                                    }
-                                                    
+                                                    });
+
                                                     // Add Edit, Delete, and Move buttons
                                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                        if ui.small_button("🗑").on_hover_text("Delete entry").clicked() {
-                                                            entry_to_delete = Some(idx);
+                                                        if ui.small_button("🗑").on_hover_text("Delete step").clicked() {
+                                                            step_to_delete = Some(idx);
                                                         }
-                                                        // Only show Edit for ExecuteWASM entries
-                                                        if matches!(entry, ProjectEntry::ExecuteWASM(_)) {
-                                                            if ui.small_button("✏").on_hover_text("Edit entry").clicked() {
-                                                                entry_to_edit = Some(idx);
-                                                            }
+                                                        if ui.small_button("✏").on_hover_text("Edit step").clicked() {
+                                                            step_to_edit = Some(idx);
                                                         }
-                                                        // Move down button (disabled for last entry)
-                                                        let is_last = idx == entries.len() - 1;
+                                                        let is_last = idx == timeline.len() - 1;
                                                         if ui.add_enabled(!is_last, egui::Button::new("▼").small())
                                                             .on_hover_text("Move down")
                                                             .clicked()
                                                         {
-                                                            entry_to_move_down = Some(idx);
+                                                            step_to_move_down = Some(idx);
                                                         }
-                                                        // Move up button (disabled for first entry)
                                                         if ui.add_enabled(idx > 0, egui::Button::new("▲").small())
                                                             .on_hover_text("Move up")
                                                             .clicked()
                                                         {
-                                                            entry_to_move_up = Some(idx);
+                                                            step_to_move_up = Some(idx);
                                                         }
                                                     });
                                                 });
@@ -2662,41 +2594,65 @@ impl eframe::App for VolumetricApp {
                                         }
                                     });
                             }
+
+                            // Show exports
+                            if !project.exports().is_empty() {
+                                ui.add_space(4.0);
+                                ui.label("Exports:");
+                                for export_id in project.exports() {
+                                    ui.weak(format!("  📤 {}", export_id));
+                                }
+                            }
                         } else {
                             ui.weak("No project loaded");
                         }
                     });
-                
+
                 // Handle edit action
-                if let Some(idx) = entry_to_edit {
+                if let Some(idx) = step_to_edit {
                     self.start_editing_entry(idx);
                 }
-                
+
                 // Handle delete action
-                if let Some(idx) = entry_to_delete {
+                if let Some(idx) = step_to_delete {
                     if let Some(ref mut project) = self.project {
-                        project.entries_mut().remove(idx);
-                        #[cfg(not(target_arch = "wasm32"))]
-                        {
-                            self.project_path = None; // Mark as modified
+                        // Remove the timeline step
+                        if idx < project.timeline().len() {
+                            // Get the output IDs before removing
+                            let output_ids: Vec<String> = project.timeline().get(idx)
+                                .map(|step| step.outputs.clone())
+                                .unwrap_or_default();
+
+                            // Remove the step
+                            project.timeline_mut().remove(idx);
+
+                            // Also remove corresponding exports
+                            for output_id in output_ids {
+                                project.exports_mut().retain(|e| e != &output_id);
+                            }
+
+                            #[cfg(not(target_arch = "wasm32"))]
+                            {
+                                self.project_path = None; // Mark as modified
+                            }
+                            self.run_project();
                         }
-                        self.run_project();
                     }
-                    // Close edit panel if we deleted the entry being edited
+                    // Close edit panel if we deleted the step being edited
                     if self.editing_entry_index == Some(idx) {
                         self.editing_entry_index = None;
                     } else if let Some(edit_idx) = self.editing_entry_index {
-                        // Adjust edit index if we deleted an entry before it
                         if idx < edit_idx {
                             self.editing_entry_index = Some(edit_idx - 1);
                         }
                     }
                 }
-                
+
                 // Handle move up action
-                if let Some(idx) = entry_to_move_up {
+                if let Some(idx) = step_to_move_up {
                     if let Some(ref mut project) = self.project {
-                        if project.move_entry_up(idx) {
+                        if idx > 0 && idx < project.timeline().len() {
+                            project.timeline_mut().swap(idx, idx - 1);
                             #[cfg(not(target_arch = "wasm32"))]
                             {
                                 self.project_path = None; // Mark as modified
@@ -2713,11 +2669,13 @@ impl eframe::App for VolumetricApp {
                         }
                     }
                 }
-                
+
                 // Handle move down action
-                if let Some(idx) = entry_to_move_down {
+                if let Some(idx) = step_to_move_down {
                     if let Some(ref mut project) = self.project {
-                        if project.move_entry_down(idx) {
+                        let len = project.timeline().len();
+                        if idx < len - 1 {
+                            project.timeline_mut().swap(idx, idx + 1);
                             #[cfg(not(target_arch = "wasm32"))]
                             {
                                 self.project_path = None; // Mark as modified
@@ -2747,30 +2705,33 @@ impl eframe::App for VolumetricApp {
                         // Clone to avoid borrow conflicts when UI callbacks mutate `self`.
                         let exported_assets = self.exported_assets.clone();
                         for asset in exported_assets {
-                            let asset_id = asset.asset_id().to_string();
+                            let asset_id = asset.id().to_string();
                             let is_rendering = self.asset_render_data.contains_key(&asset_id);
 
                             ui.group(|ui| {
                                 ui.horizontal(|ui| {
+                                    let type_name = asset.type_hint()
+                                        .map(|h| h.to_string())
+                                        .unwrap_or_else(|| "Binary".to_string());
                                     ui.label(format!(
                                         "{}: {} ({} bytes)",
-                                        asset.asset_id(),
-                                        asset.asset().asset_type(),
-                                        asset.asset().bytes().len(),
+                                        asset.id(),
+                                        type_name,
+                                        asset.data().len(),
                                     ));
                                     if is_rendering {
                                         ui.weak("(rendering)");
                                     }
                                 });
 
-                                if !asset.precursor_asset_ids().is_empty() {
+                                if !asset.precursor_ids().is_empty() {
                                     ui.label(format!(
                                         "precursors: {}",
-                                        asset.precursor_asset_ids().join(", ")
+                                        asset.precursor_ids().join(", ")
                                     ));
                                 }
 
-                                let is_renderable = asset.as_model_wasm().is_some();
+                                let is_renderable = asset.as_model().is_some();
                                 let current_mode = self.get_asset_render_mode(&asset_id);
 
                                 ui.horizontal(|ui| {
@@ -3040,7 +3001,7 @@ impl eframe::App for VolumetricApp {
 
                                 // Export WASM button - always available for model exports (doesn't depend on sampling)
                                 #[cfg(not(target_arch = "wasm32"))]
-                                if let Some(wasm_bytes) = asset.as_model_wasm() {
+                                if let Some(wasm_bytes) = asset.as_model() {
                                     if ui.button("Export WASM…").clicked() {
                                         if let Some(path) = rfd::FileDialog::new()
                                             .add_filter("WASM", &["wasm"])
@@ -3392,8 +3353,8 @@ fn main() -> Result<()> {
                             .unwrap_or("model")
                             .to_string();
                         println!("Importing WASM model from: {}", path.display());
-                        let mut project = Project::new(vec![]);
-                        project.insert_model_wasm(asset_id.as_str(), wasm_bytes);
+                        let mut project = Project::new();
+                        project.insert_model(asset_id.as_str(), wasm_bytes);
                         Some(project)
                     }
                     Err(e) => {
@@ -3411,7 +3372,7 @@ fn main() -> Result<()> {
             }
         }
     } else {
-        Some(Project::new(vec![]))
+        Some(Project::new())
     };
 
     println!("Volumetric Model Renderer (eframe/egui)");

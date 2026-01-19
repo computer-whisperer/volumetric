@@ -127,9 +127,9 @@ pub fn load_wasm_bytes(path: &PathBuf) -> Result<Vec<u8>> {
                 .ok_or_else(|| anyhow::anyhow!("Project has no exported assets"))?;
 
             export
-                .as_model_wasm()
+                .as_model()
                 .map(|b| b.to_vec())
-                .ok_or_else(|| anyhow::anyhow!("Exported asset is not a ModelWASM"))
+                .ok_or_else(|| anyhow::anyhow!("Exported asset is not a Model"))
         }
         _ => Err(anyhow::anyhow!(
             "Unknown file extension: {:?}. Expected .wasm or .vproj",

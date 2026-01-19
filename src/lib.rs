@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::fmt::Display;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -86,8 +85,6 @@ impl Triangle {
 pub enum ExecutionError {
     #[error("No loaded asset with id: {0}")]
     NoSuchAssetId(String),
-    #[error("Asset with id {0} is not of type {1}, but {2}")]
-    WrongAssetType(String, AssetType, AssetType),
     #[error("Invalid input index: {0}")]
     InvalidInputIndex(usize),
     #[error("Invalid output index: {0}")]
@@ -96,6 +93,94 @@ pub enum ExecutionError {
     Wasmtime(String),
     #[error("WASM backend error: {0}")]
     WasmBackend(String),
+}
+
+// =============================================================================
+// Project Format V2: Flat Imports/Exports and Blob-Based Assets
+// =============================================================================
+
+/// Type hint for assets - purely informational, not enforced at execution time.
+/// The UI uses these hints for validation and display purposes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, serde::Deserialize, serde::Serialize)]
+pub enum AssetTypeHint {
+    /// Volumetric boolean field (WASM with is_inside/get_bounds)
+    Model,
+    /// Transform operator (WASM with run/get_metadata)
+    Operator,
+    /// CBOR-encoded configuration
+    Config,
+    /// Lua script (UTF-8 text)
+    LuaSource,
+    /// Unknown/generic binary data
+    Binary,
+}
+
+impl std::fmt::Display for AssetTypeHint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AssetTypeHint::Model => write!(f, "Model"),
+            AssetTypeHint::Operator => write!(f, "Operator"),
+            AssetTypeHint::Config => write!(f, "Config"),
+            AssetTypeHint::LuaSource => write!(f, "LuaSource"),
+            AssetTypeHint::Binary => write!(f, "Binary"),
+        }
+    }
+}
+
+/// An asset imported into the project (available at start of execution).
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub struct ImportedAsset {
+    /// Unique identifier for this asset within the project.
+    pub id: String,
+    /// Raw binary data (the asset blob).
+    pub data: Vec<u8>,
+    /// Optional type hint for UI validation and display.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_hint: Option<AssetTypeHint>,
+}
+
+impl ImportedAsset {
+    pub fn new(id: String, data: Vec<u8>, type_hint: Option<AssetTypeHint>) -> Self {
+        Self { id, data, type_hint }
+    }
+
+    pub fn model(id: String, data: Vec<u8>) -> Self {
+        Self::new(id, data, Some(AssetTypeHint::Model))
+    }
+
+    pub fn operator(id: String, data: Vec<u8>) -> Self {
+        Self::new(id, data, Some(AssetTypeHint::Operator))
+    }
+}
+
+/// Input to an execution step.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub enum ExecutionInput {
+    /// Reference to an asset by ID.
+    AssetRef(String),
+    /// Inline embedded data.
+    Inline(Vec<u8>),
+}
+
+impl ExecutionInput {
+    /// Returns a display-friendly description of this input.
+    pub fn display(&self) -> String {
+        match self {
+            ExecutionInput::AssetRef(id) => format!("Asset: {}", id),
+            ExecutionInput::Inline(data) => format!("Inline ({} bytes)", data.len()),
+        }
+    }
+}
+
+/// A single step in the execution timeline.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub struct ExecutionStep {
+    /// ID of the operator asset to execute.
+    pub operator_id: String,
+    /// Inputs to the operator.
+    pub inputs: Vec<ExecutionInput>,
+    /// Output asset IDs (no types - just IDs).
+    pub outputs: Vec<String>,
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -302,364 +387,106 @@ pub fn generate_adaptive_mesh_v2_from_bytes(
     })
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, serde::Deserialize, serde::Serialize)]
-pub enum AssetType {
-    ModelWASM,
-    OperationWASM,
-}
 
-impl Display for AssetType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            AssetType::ModelWASM => write!(f, "ModelWASM"),
-            AssetType::OperationWASM => write!(f, "OperationWASM"),
-        }
-    }
-}
+// =============================================================================
+// Project V2: New Flat Structure
+// =============================================================================
 
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-pub enum Asset {
-    ModelWASM(Vec<u8>),
-    OperationWASM(Vec<u8>),
-}
-
-impl Asset {
-    /// Returns the type of this asset
-    pub fn asset_type(&self) -> AssetType {
-        match self {
-            Asset::ModelWASM(_) => AssetType::ModelWASM,
-            Asset::OperationWASM(_) => AssetType::OperationWASM,
-        }
-    }
-
-    /// Returns the raw WASM bytes
-    pub fn bytes(&self) -> &[u8] {
-        match self {
-            Asset::ModelWASM(bytes) => bytes,
-            Asset::OperationWASM(bytes) => bytes,
-        }
-    }
-}
-
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-pub struct LoadAssetEntry {
-    asset_id: String,
-    asset: Asset,
-}
-
-impl LoadAssetEntry {
-    pub fn new(asset_id: String, asset: Asset) -> Self {
-        Self { asset_id, asset }
-    }
-
-    /// Returns the asset ID
-    pub fn asset_id(&self) -> &str {
-        &self.asset_id
-    }
-
-    /// Returns the asset type
-    pub fn asset_type(&self) -> AssetType {
-        self.asset.asset_type()
-    }
-}
-
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-pub enum ExecuteWasmInput {
-    AssetByID(String),
-    String(String),
-    Data(Vec<u8>)
-}
-
-impl ExecuteWasmInput {
-    /// Returns a display-friendly description of this input
-    pub fn display(&self) -> String {
-        match self {
-            ExecuteWasmInput::AssetByID(id) => format!("Asset: {}", id),
-            ExecuteWasmInput::String(s) => {
-                if s.len() > 20 {
-                    format!("\"{}...\"", &s[..17])
-                } else {
-                    format!("\"{}\"", s)
-                }
-            }
-            ExecuteWasmInput::Data(_) => "Data".to_string(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-pub struct ExecuteWasmOutput {
-    pub asset_id: String,
-    pub asset_type: AssetType,
-}
-
-impl ExecuteWasmOutput {
-    pub fn new(asset_id: String, asset_type: AssetType) -> Self {
-        Self { asset_id, asset_type }
-    }
-}
-
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-pub struct ExecuteWasmEntry {
-    asset_id: String,
-    inputs: Vec<ExecuteWasmInput>,
-    outputs: Vec<ExecuteWasmOutput>
-}
-
-impl ExecuteWasmEntry {
-    pub fn new(asset_id: String, inputs: Vec<ExecuteWasmInput>, outputs: Vec<ExecuteWasmOutput>) -> Self {
-        Self { asset_id, inputs, outputs }
-    }
-
-    /// Returns the asset ID of the WASM operation to execute
-    pub fn asset_id(&self) -> &str {
-        &self.asset_id
-    }
-
-    /// Returns the inputs for this operation
-    pub fn inputs(&self) -> &[ExecuteWasmInput] {
-        &self.inputs
-    }
-
-    /// Returns the number of outputs this operation produces
-    pub fn output_count(&self) -> usize {
-        self.outputs.len()
-    }
-    
-    /// Returns the outputs for this operation
-    pub fn outputs(&self) -> &[ExecuteWasmOutput] {
-        &self.outputs
-    }
-}
-
-impl ExecuteWasmEntry {
-    #[cfg(feature = "native")]
-    pub fn run(&self, environment: &mut Environment) -> Result<(), ExecutionError> {
-        use wasm::{OperatorExecutor, OperatorIo};
-
-        // Extract the operator WASM binary (clone to release borrow)
-        let wasm_bin = {
-            let wasm_asset = environment.loaded_assets.get(&self.asset_id)
-                .ok_or(ExecutionError::NoSuchAssetId(self.asset_id.clone()))?;
-            match wasm_asset.asset.as_ref() {
-                Asset::OperationWASM(wasm_bin) => wasm_bin.clone(),
-                other => return Err(ExecutionError::WrongAssetType(
-                    self.asset_id.clone(),
-                    AssetType::OperationWASM,
-                    other.asset_type(),
-                )),
-            }
-        };
-
-        // Resolve inputs to raw bytes
-        let mut input_bytes = Vec::new();
-        let mut precursor_asset_ids = Vec::new();
-
-        for input in &self.inputs {
-            let bytes = match input {
-                ExecuteWasmInput::AssetByID(asset_id) => {
-                    let asset = environment.loaded_assets.get(asset_id)
-                        .ok_or(ExecutionError::NoSuchAssetId(asset_id.clone()))?;
-                    precursor_asset_ids.push(asset_id.clone());
-                    asset.asset.bytes().to_vec()
-                },
-                ExecuteWasmInput::String(s) => s.as_bytes().to_vec(),
-                ExecuteWasmInput::Data(d) => d.clone(),
-            };
-            input_bytes.push(bytes);
-        }
-
-        let mut executor = wasm::create_operator_executor(&wasm_bin)
-            .map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
-
-        let io = OperatorIo::new(input_bytes);
-        let result = executor.run(io)
-            .map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
-
-        // Collect outputs and add them to the environment
-        for (idx, output_spec) in self.outputs.iter().enumerate() {
-            if let Some(output_bytes) = result.outputs.get(&idx) {
-                let asset = match output_spec.asset_type {
-                    AssetType::ModelWASM => Asset::ModelWASM(output_bytes.clone()),
-                    AssetType::OperationWASM => Asset::OperationWASM(output_bytes.clone()),
-                };
-                environment.loaded_assets.insert(output_spec.asset_id.clone(), LoadedAsset {
-                    asset_id: output_spec.asset_id.clone(),
-                    asset: Arc::new(asset),
-                    precursor_asset_ids: precursor_asset_ids.clone(),
-                });
-            }
-        }
-
-        Ok(())
-    }
-
-    #[cfg(all(feature = "web", not(feature = "native")))]
-    pub fn run(&self, environment: &mut Environment) -> Result<(), ExecutionError> {
-        use wasm::{OperatorExecutor, OperatorIo};
-
-        // Extract the operator WASM binary (clone to release borrow)
-        let wasm_bin = {
-            let wasm_asset = environment.loaded_assets.get(&self.asset_id)
-                .ok_or(ExecutionError::NoSuchAssetId(self.asset_id.clone()))?;
-            match wasm_asset.asset.as_ref() {
-                Asset::OperationWASM(wasm_bin) => wasm_bin.clone(),
-                other => return Err(ExecutionError::WrongAssetType(
-                    self.asset_id.clone(),
-                    AssetType::OperationWASM,
-                    other.asset_type(),
-                )),
-            }
-        };
-
-        // Resolve inputs to raw bytes
-        let mut input_bytes = Vec::new();
-        let mut precursor_asset_ids = Vec::new();
-
-        for input in &self.inputs {
-            let bytes = match input {
-                ExecuteWasmInput::AssetByID(asset_id) => {
-                    let asset = environment.loaded_assets.get(asset_id)
-                        .ok_or(ExecutionError::NoSuchAssetId(asset_id.clone()))?;
-                    precursor_asset_ids.push(asset_id.clone());
-                    asset.asset.bytes().to_vec()
-                },
-                ExecuteWasmInput::String(s) => s.as_bytes().to_vec(),
-                ExecuteWasmInput::Data(d) => d.clone(),
-            };
-            input_bytes.push(bytes);
-        }
-
-        let mut executor = wasm::create_operator_executor(&wasm_bin)
-            .map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
-
-        let io = OperatorIo::new(input_bytes);
-        let result = executor.run(io)
-            .map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
-
-        // Collect outputs and add them to the environment
-        for (idx, output_spec) in self.outputs.iter().enumerate() {
-            if let Some(output_bytes) = result.outputs.get(&idx) {
-                let asset = match output_spec.asset_type {
-                    AssetType::ModelWASM => Asset::ModelWASM(output_bytes.clone()),
-                    AssetType::OperationWASM => Asset::OperationWASM(output_bytes.clone()),
-                };
-                environment.loaded_assets.insert(output_spec.asset_id.clone(), LoadedAsset {
-                    asset_id: output_spec.asset_id.clone(),
-                    asset: Arc::new(asset),
-                    precursor_asset_ids: precursor_asset_ids.clone(),
-                });
-            }
-        }
-
-        Ok(())
-    }
-
-    #[cfg(not(any(feature = "native", feature = "web")))]
-    pub fn run(&self, _environment: &mut Environment) -> Result<(), ExecutionError> {
-        Err(ExecutionError::Wasmtime("WASM execution requires the 'native' or 'web' feature".to_string()))
-    }
-}
-
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-pub enum ProjectEntry {
-    LoadAsset(LoadAssetEntry),
-    ExecuteWASM(ExecuteWasmEntry),
-    ExportAsset(String),
-}
-
-impl ProjectEntry {
-    pub fn run(&self, environment: &mut Environment) -> Result<Vec<LoadedAsset>, ExecutionError> {
-        match self {
-            ProjectEntry::LoadAsset(entry) => {
-                environment.loaded_assets.insert(entry.asset_id.clone(), LoadedAsset {
-                    asset_id: entry.asset_id.clone(),
-                    asset: Arc::new(entry.asset.clone()),
-                    precursor_asset_ids: vec![],
-                });
-                Ok(vec![])
-            }
-            ProjectEntry::ExecuteWASM(entry) => {
-                entry.run(environment)?;
-                Ok(vec![])
-            }
-            ProjectEntry::ExportAsset(asset_id) => {
-                Ok(vec![environment.loaded_assets.remove(asset_id).ok_or(ExecutionError::NoSuchAssetId(asset_id.clone()))?])
-            }
-        }
-    }
-}
-
+/// Project file format version 2 with flat imports/exports and blob-based assets.
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct Project {
-    entries: Vec<ProjectEntry>,
+    /// Format version (2 for this format).
+    pub version: u32,
+
+    /// Assets embedded in the project (available at start of execution).
+    pub imports: Vec<ImportedAsset>,
+
+    /// Execution timeline (operator invocations only).
+    pub timeline: Vec<ExecutionStep>,
+
+    /// Asset IDs to return after execution.
+    pub exports: Vec<String>,
 }
 
+/// A loaded asset in the execution environment.
 #[derive(Clone, Debug)]
 pub struct LoadedAsset {
-    asset_id: String,
-    asset: Arc<Asset>,
-    precursor_asset_ids: Vec<String>,
+    /// The asset ID.
+    id: String,
+    /// Raw binary data.
+    data: Arc<Vec<u8>>,
+    /// Optional type hint.
+    type_hint: Option<AssetTypeHint>,
+    /// IDs of assets that were used to create this asset.
+    precursor_ids: Vec<String>,
 }
 
 impl LoadedAsset {
-    /// Returns the asset ID
-    pub fn asset_id(&self) -> &str {
-        &self.asset_id
+    /// Returns the asset ID.
+    pub fn id(&self) -> &str {
+        &self.id
     }
 
-    /// Returns a reference to the asset
-    pub fn asset(&self) -> &Asset {
-        &self.asset
+    /// Returns the raw bytes of this asset.
+    pub fn data(&self) -> &[u8] {
+        &self.data
     }
 
-    /// Returns the asset wrapped in Arc
-    pub fn asset_arc(&self) -> Arc<Asset> {
-        Arc::clone(&self.asset)
+    /// Returns the data wrapped in Arc.
+    pub fn data_arc(&self) -> Arc<Vec<u8>> {
+        Arc::clone(&self.data)
     }
 
-    /// Returns the IDs of assets that were used to create this asset
-    pub fn precursor_asset_ids(&self) -> &[String] {
-        &self.precursor_asset_ids
+    /// Returns the type hint if available.
+    pub fn type_hint(&self) -> Option<AssetTypeHint> {
+        self.type_hint
     }
 
-    /// Returns the raw WASM bytes if this is a ModelWASM asset
-    pub fn as_model_wasm(&self) -> Option<&[u8]> {
-        match self.asset.as_ref() {
-            Asset::ModelWASM(bytes) => Some(bytes),
-            _ => None,
-        }
+    /// Returns the IDs of assets that were used to create this asset.
+    pub fn precursor_ids(&self) -> &[String] {
+        &self.precursor_ids
     }
 
-    /// Returns the raw WASM bytes if this is an OperationWASM asset
-    pub fn as_operation_wasm(&self) -> Option<&[u8]> {
-        match self.asset.as_ref() {
-            Asset::OperationWASM(bytes) => Some(bytes),
+    /// Returns the raw bytes if this looks like a model (by type hint).
+    pub fn as_model(&self) -> Option<&[u8]> {
+        match self.type_hint {
+            Some(AssetTypeHint::Model) | None => Some(&self.data),
             _ => None,
         }
     }
 }
 
+/// Execution environment that holds loaded assets during project execution.
 pub struct Environment {
-    loaded_assets: HashMap<String, LoadedAsset>,
+    assets: HashMap<String, LoadedAsset>,
 }
 
 impl Environment {
-    /// Creates a new empty environment
+    /// Creates a new empty environment.
     pub fn new() -> Self {
         Self {
-            loaded_assets: HashMap::new(),
+            assets: HashMap::new(),
         }
     }
 
-    /// Returns a reference to a loaded asset by ID
-    pub fn get_asset(&self, asset_id: &str) -> Option<&LoadedAsset> {
-        self.loaded_assets.get(asset_id)
+    /// Returns a reference to a loaded asset by ID.
+    pub fn get(&self, id: &str) -> Option<&LoadedAsset> {
+        self.assets.get(id)
     }
 
-    /// Returns all loaded asset IDs
+    /// Returns all loaded asset IDs.
     pub fn asset_ids(&self) -> impl Iterator<Item = &str> {
-        self.loaded_assets.keys().map(|s| s.as_str())
+        self.assets.keys().map(|s| s.as_str())
+    }
+
+    /// Inserts an asset into the environment.
+    fn insert(&mut self, asset: LoadedAsset) {
+        self.assets.insert(asset.id.clone(), asset);
+    }
+
+    /// Removes and returns an asset by ID.
+    fn remove(&mut self, id: &str) -> Option<LoadedAsset> {
+        self.assets.remove(id)
     }
 }
 
@@ -670,84 +497,58 @@ impl Default for Environment {
 }
 
 impl Project {
-    /// Creates a new project from a list of entries
-    pub fn new(entries: Vec<ProjectEntry>) -> Self {
-        Self { entries }
-    }
-
-    /// Creates a simple project that loads a ModelWASM and exports it
-    /// This is the standard way to import a raw WASM binary into the project system
-    pub fn from_model_wasm(asset_id: String, wasm_bytes: Vec<u8>) -> Self {
+    /// Creates a new empty project.
+    pub fn new() -> Self {
         Self {
-            entries: vec![
-                ProjectEntry::LoadAsset(LoadAssetEntry {
-                    asset_id: asset_id.clone(),
-                    asset: Asset::ModelWASM(wasm_bytes),
-                }),
-                ProjectEntry::ExportAsset(asset_id),
-            ],
+            version: 2,
+            imports: Vec::new(),
+            timeline: Vec::new(),
+            exports: Vec::new(),
         }
     }
 
-    fn first_export_index(&self) -> usize {
-        self.entries
-            .iter()
-            .position(|e| matches!(e, ProjectEntry::ExportAsset(_)))
-            .unwrap_or(self.entries.len())
-    }
-
-    fn last_declaration_index_for_asset_id(&self, asset_id: &str) -> Option<usize> {
-        let mut last: Option<usize> = None;
-        for (idx, entry) in self.entries.iter().enumerate() {
-            match entry {
-                ProjectEntry::LoadAsset(a) => {
-                    if a.asset_id() == asset_id {
-                        last = Some(idx);
-                    }
-                }
-                ProjectEntry::ExecuteWASM(e) => {
-                    if e.outputs.iter().any(|o| o.asset_id == asset_id) {
-                        last = Some(idx);
-                    }
-                }
-                ProjectEntry::ExportAsset(_) => {}
-            }
+    /// Creates a simple project that imports a model and exports it.
+    pub fn from_model(id: String, data: Vec<u8>) -> Self {
+        Self {
+            version: 2,
+            imports: vec![ImportedAsset::model(id.clone(), data)],
+            timeline: Vec::new(),
+            exports: vec![id],
         }
-        last
     }
 
-    /// Generates a reasonable default output name for an operator based on its type and primary input.
+    /// Returns all declared asset IDs with their type hints.
     ///
-    /// The name is derived from the operator crate name (e.g., "translate_operator" -> "translated")
-    /// and the primary input asset ID. The result is then made unique via `unique_asset_id`.
-    pub fn default_output_name(&self, operator_crate_name: &str, primary_input: Option<&str>) -> String {
-        // Map operator crate names to descriptive past-tense suffixes
-        let suffix = match operator_crate_name {
-            "translate_operator" => "translated",
-            "rotation_operator" => "rotated",
-            "scale_operator" => "scaled",
-            "boolean_operator" => "boolean_result",
-            "lua_script_operator" => "scripted",
-            _ => {
-                // For unknown operators, use the crate name with "_output" suffix
-                let base = operator_crate_name.strip_suffix("_operator").unwrap_or(operator_crate_name);
-                return self.unique_asset_id(&format!("{}_output", base));
+    /// This includes both imported assets and outputs from execution steps.
+    pub fn declared_assets(&self) -> Vec<(String, Option<AssetTypeHint>)> {
+        let mut out: Vec<(String, Option<AssetTypeHint>)> = Vec::new();
+        let mut seen: HashMap<String, usize> = HashMap::new();
+
+        // Add imported assets
+        for import in &self.imports {
+            if let Some(idx) = seen.get(&import.id).copied() {
+                out[idx].1 = import.type_hint;
+            } else {
+                seen.insert(import.id.clone(), out.len());
+                out.push((import.id.clone(), import.type_hint));
             }
-        };
+        }
 
-        // If we have a primary input, combine it with the suffix
-        let base = match primary_input {
-            Some(input) => format!("{}_{}", input, suffix),
-            None => suffix.to_string(),
-        };
+        // Add execution step outputs (type hint unknown for outputs)
+        for step in &self.timeline {
+            for output_id in &step.outputs {
+                if !seen.contains_key(output_id) {
+                    seen.insert(output_id.clone(), out.len());
+                    // Outputs from operators are typically models
+                    out.push((output_id.clone(), Some(AssetTypeHint::Model)));
+                }
+            }
+        }
 
-        self.unique_asset_id(&base)
+        out
     }
 
     /// Generates a unique asset ID based on the given base name.
-    ///
-    /// If `base` is not already declared, it is returned as-is. Otherwise, a numeric suffix
-    /// (`_2`, `_3`, etc.) is appended until a unique name is found.
     pub fn unique_asset_id(&self, base: &str) -> String {
         let declared: std::collections::HashSet<String> = self
             .declared_assets()
@@ -766,138 +567,176 @@ impl Project {
             }
         }
 
-        // Extremely unlikely; fall back to a timestamp-ish suffix.
         format!("{base}_{}", declared.len() + 1)
     }
 
-    /// Inserts a new `ModelWASM` into this project without replacing existing entries.
-    ///
-    /// The new `LoadAsset` entry will be inserted before the first `ExportAsset` entry (if any),
-    /// so that exports remain at the end of the timeline. A corresponding `ExportAsset` is also
-    /// inserted so the model will render.
-    ///
-    /// Returns the final asset id used (may differ from `asset_id_base` if it collided).
-    pub fn insert_model_wasm(&mut self, asset_id_base: &str, wasm_bytes: Vec<u8>) -> String {
-        let asset_id = self.unique_asset_id(asset_id_base);
-        let insert_at = self.first_export_index();
-        self.entries.insert(
-            insert_at,
-            ProjectEntry::LoadAsset(LoadAssetEntry::new(
-                asset_id.clone(),
-                Asset::ModelWASM(wasm_bytes),
-            )),
-        );
-        self.entries
-            .insert(insert_at + 1, ProjectEntry::ExportAsset(asset_id.clone()));
-        asset_id
+    /// Generates a reasonable default output name for an operator.
+    pub fn default_output_name(&self, operator_crate_name: &str, primary_input: Option<&str>) -> String {
+        let suffix = match operator_crate_name {
+            "translate_operator" => "translated",
+            "rotation_operator" => "rotated",
+            "scale_operator" => "scaled",
+            "boolean_operator" => "boolean_result",
+            "lua_script_operator" => "scripted",
+            _ => {
+                let base = operator_crate_name.strip_suffix("_operator").unwrap_or(operator_crate_name);
+                return self.unique_asset_id(&format!("{}_output", base));
+            }
+        };
+
+        let base = match primary_input {
+            Some(input) => format!("{}_{}", input, suffix),
+            None => suffix.to_string(),
+        };
+
+        self.unique_asset_id(&base)
     }
 
-    /// Inserts a new operator into this project, placing it after all declared input dependencies.
-    ///
-    /// The operator's `LoadAsset` and `ExecuteWASM` entries are inserted together, followed by an
-    /// `ExportAsset` for the primary output.
+    /// Inserts a new model into the project.
+    /// Returns the final asset ID (may differ from base if collision occurred).
+    pub fn insert_model(&mut self, id_base: &str, data: Vec<u8>) -> String {
+        let id = self.unique_asset_id(id_base);
+        self.imports.push(ImportedAsset::model(id.clone(), data));
+        self.exports.push(id.clone());
+        id
+    }
+
+    /// Inserts an operator and execution step into the project.
     pub fn insert_operation(
         &mut self,
-        op_asset_id_base: &str,
-        wasm_bytes: Vec<u8>,
-        inputs: Vec<ExecuteWasmInput>,
-        outputs: Vec<ExecuteWasmOutput>,
-        export_asset_id: String,
+        op_id_base: &str,
+        op_data: Vec<u8>,
+        inputs: Vec<ExecutionInput>,
+        output_ids: Vec<String>,
+        export_id: String,
     ) {
-        let op_asset_id = self.unique_asset_id(op_asset_id_base);
+        let op_id = self.unique_asset_id(op_id_base);
 
-        let mut dep_after = 0usize;
-        for input in &inputs {
-            if let ExecuteWasmInput::AssetByID(id) = input {
-                if let Some(idx) = self.last_declaration_index_for_asset_id(id.as_str()) {
-                    dep_after = dep_after.max(idx + 1);
+        // Add the operator as an import
+        self.imports.push(ImportedAsset::operator(op_id.clone(), op_data));
+
+        // Add the execution step
+        self.timeline.push(ExecutionStep {
+            operator_id: op_id,
+            inputs,
+            outputs: output_ids,
+        });
+
+        // Add to exports
+        if !self.exports.contains(&export_id) {
+            self.exports.push(export_id);
+        }
+    }
+
+    /// Returns the imports.
+    pub fn imports(&self) -> &[ImportedAsset] {
+        &self.imports
+    }
+
+    /// Returns mutable access to imports.
+    pub fn imports_mut(&mut self) -> &mut Vec<ImportedAsset> {
+        &mut self.imports
+    }
+
+    /// Returns the timeline.
+    pub fn timeline(&self) -> &[ExecutionStep] {
+        &self.timeline
+    }
+
+    /// Returns mutable access to timeline.
+    pub fn timeline_mut(&mut self) -> &mut Vec<ExecutionStep> {
+        &mut self.timeline
+    }
+
+    /// Returns the exports.
+    pub fn exports(&self) -> &[String] {
+        &self.exports
+    }
+
+    /// Returns mutable access to exports.
+    pub fn exports_mut(&mut self) -> &mut Vec<String> {
+        &mut self.exports
+    }
+
+    /// Runs the project and returns exported assets.
+    ///
+    /// The executor is type-agnostic: no type enforcement at execution time.
+    #[cfg(any(feature = "native", feature = "web"))]
+    pub fn run(&self, env: &mut Environment) -> Result<Vec<LoadedAsset>, ExecutionError> {
+        use wasm::{OperatorExecutor, OperatorIo};
+
+        // Load all imports into environment
+        for import in &self.imports {
+            env.insert(LoadedAsset {
+                id: import.id.clone(),
+                data: Arc::new(import.data.clone()),
+                type_hint: import.type_hint,
+                precursor_ids: vec![],
+            });
+        }
+
+        // Execute timeline steps
+        for step in &self.timeline {
+            // Get operator bytes
+            let op_data = env.get(&step.operator_id)
+                .ok_or_else(|| ExecutionError::NoSuchAssetId(step.operator_id.clone()))?
+                .data_arc();
+
+            // Resolve inputs to bytes
+            let mut input_bytes = Vec::new();
+            let mut precursor_ids = Vec::new();
+
+            for input in &step.inputs {
+                let bytes = match input {
+                    ExecutionInput::AssetRef(id) => {
+                        let asset = env.get(id)
+                            .ok_or_else(|| ExecutionError::NoSuchAssetId(id.clone()))?;
+                        precursor_ids.push(id.clone());
+                        asset.data().to_vec()
+                    }
+                    ExecutionInput::Inline(data) => data.clone(),
+                };
+                input_bytes.push(bytes);
+            }
+
+            // Execute the operator
+            let mut executor = wasm::create_operator_executor(&op_data)
+                .map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
+
+            let io = OperatorIo::new(input_bytes);
+            let result = executor.run(io)
+                .map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
+
+            // Store outputs
+            for (idx, output_id) in step.outputs.iter().enumerate() {
+                if let Some(output_bytes) = result.outputs.get(&idx) {
+                    env.insert(LoadedAsset {
+                        id: output_id.clone(),
+                        data: Arc::new(output_bytes.clone()),
+                        type_hint: Some(AssetTypeHint::Model), // Outputs are typically models
+                        precursor_ids: precursor_ids.clone(),
+                    });
                 }
             }
         }
 
-        let first_export = self.first_export_index();
-        let insert_at = first_export.max(dep_after);
-
-        self.entries.insert(
-            insert_at,
-            ProjectEntry::LoadAsset(LoadAssetEntry::new(
-                op_asset_id.clone(),
-                Asset::OperationWASM(wasm_bytes),
-            )),
-        );
-        self.entries.insert(
-            insert_at + 1,
-            ProjectEntry::ExecuteWASM(ExecuteWasmEntry::new(
-                op_asset_id,
-                inputs,
-                outputs,
-            )),
-        );
-        self.entries
-            .insert(insert_at + 2, ProjectEntry::ExportAsset(export_asset_id));
-    }
-
-    /// Returns the project entries
-    pub fn entries(&self) -> &[ProjectEntry] {
-        &self.entries
-    }
-
-    /// Returns all asset IDs that are declared by this project, along with their `AssetType`.
-    ///
-    /// This includes both explicitly loaded assets (`ProjectEntry::LoadAsset`) and assets
-    /// produced by operation steps (`ProjectEntry::ExecuteWASM` outputs).
-    pub fn declared_assets(&self) -> Vec<(String, AssetType)> {
-        let mut out: Vec<(String, AssetType)> = Vec::new();
-        let mut index_by_id: HashMap<String, usize> = HashMap::new();
-
-        for entry in &self.entries {
-            match entry {
-                ProjectEntry::LoadAsset(a) => {
-                    let id = a.asset_id().to_string();
-                    let ty = a.asset_type();
-                    if let Some(idx) = index_by_id.get(&id).copied() {
-                        out[idx].1 = ty;
-                    } else {
-                        index_by_id.insert(id.clone(), out.len());
-                        out.push((id, ty));
-                    }
-                }
-                ProjectEntry::ExecuteWASM(e) => {
-                    for o in &e.outputs {
-                        let id = o.asset_id.clone();
-                        let ty = o.asset_type;
-                        if let Some(idx) = index_by_id.get(&id).copied() {
-                            out[idx].1 = ty;
-                        } else {
-                            index_by_id.insert(id.clone(), out.len());
-                            out.push((id, ty));
-                        }
-                    }
-                }
-                ProjectEntry::ExportAsset(_) => {}
-            }
+        // Collect exports
+        let mut exported = Vec::new();
+        for export_id in &self.exports {
+            let asset = env.remove(export_id)
+                .ok_or_else(|| ExecutionError::NoSuchAssetId(export_id.clone()))?;
+            exported.push(asset);
         }
 
-        out
+        Ok(exported)
     }
 
-    /// Returns a mutable reference to the project entries.
-    ///
-    /// This is primarily intended for UI code to insert new operations into an existing project.
-    pub fn entries_mut(&mut self) -> &mut Vec<ProjectEntry> {
-        &mut self.entries
+    #[cfg(not(any(feature = "native", feature = "web")))]
+    pub fn run(&self, _env: &mut Environment) -> Result<Vec<LoadedAsset>, ExecutionError> {
+        Err(ExecutionError::Wasmtime("WASM execution requires the 'native' or 'web' feature".to_string()))
     }
 
-    /// Runs the project, executing all entries in order
-    pub fn run(&self, environment: &mut Environment) -> Result<Vec<LoadedAsset>, ExecutionError> {
-        let mut exported_assets = vec![];
-        for entry in &self.entries {
-            exported_assets.extend(entry.run(environment)?);
-        }
-        Ok(exported_assets)
-    }
-
-    /// Serializes the project to CBOR format
+    /// Serializes the project to CBOR format.
     pub fn to_cbor(&self) -> Result<Vec<u8>, std::io::Error> {
         let mut bytes = Vec::new();
         ciborium::into_writer(self, &mut bytes)
@@ -905,44 +744,28 @@ impl Project {
         Ok(bytes)
     }
 
-    /// Deserializes a project from CBOR format
+    /// Deserializes a project from CBOR format.
     pub fn from_cbor(bytes: &[u8]) -> Result<Self, std::io::Error> {
         ciborium::from_reader(bytes)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
     }
 
-    /// Saves the project to a file in CBOR format
+    /// Saves the project to a file in CBOR format.
     pub fn save_to_file(&self, path: &std::path::Path) -> Result<(), std::io::Error> {
         let bytes = self.to_cbor()?;
         std::fs::write(path, bytes)
     }
 
-    /// Loads a project from a CBOR file
+    /// Loads a project from a CBOR file.
     pub fn load_from_file(path: &std::path::Path) -> Result<Self, std::io::Error> {
         let bytes = std::fs::read(path)?;
         Self::from_cbor(&bytes)
     }
+}
 
-    /// Moves the entry at the given index up by one position (swaps with the previous entry).
-    ///
-    /// Returns `true` if the move was performed, `false` if the index is 0 or out of bounds.
-    pub fn move_entry_up(&mut self, index: usize) -> bool {
-        if index == 0 || index >= self.entries.len() {
-            return false;
-        }
-        self.entries.swap(index, index - 1);
-        true
-    }
-
-    /// Moves the entry at the given index down by one position (swaps with the next entry).
-    ///
-    /// Returns `true` if the move was performed, `false` if the index is the last element or out of bounds.
-    pub fn move_entry_down(&mut self, index: usize) -> bool {
-        if index >= self.entries.len() - 1 {
-            return false;
-        }
-        self.entries.swap(index, index + 1);
-        true
+impl Default for Project {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -952,14 +775,12 @@ mod tests {
 
     #[test]
     fn exporting_same_asset_twice_is_an_error() {
-        let project = Project::new(vec![
-            ProjectEntry::LoadAsset(LoadAssetEntry::new(
-                "a".to_string(),
-                Asset::ModelWASM(vec![1, 2, 3]),
-            )),
-            ProjectEntry::ExportAsset("a".to_string()),
-            ProjectEntry::ExportAsset("a".to_string()),
-        ]);
+        let project = Project {
+            version: 2,
+            imports: vec![ImportedAsset::model("a".to_string(), vec![1, 2, 3])],
+            timeline: vec![],
+            exports: vec!["a".to_string(), "a".to_string()],
+        };
 
         let mut env = Environment::new();
         let err = project.run(&mut env).unwrap_err();
@@ -970,78 +791,32 @@ mod tests {
     }
 
     #[test]
-    fn project_declared_assets_includes_execute_outputs_and_types() {
-        let project = Project::new(vec![
-            ProjectEntry::LoadAsset(LoadAssetEntry::new(
-                "model_a".to_string(),
-                Asset::ModelWASM(vec![1, 2, 3]),
-            )),
-            ProjectEntry::ExecuteWASM(ExecuteWasmEntry::new(
-                "op_identity".to_string(),
-                vec![ExecuteWasmInput::AssetByID("model_a".to_string())],
-                vec![ExecuteWasmOutput::new(
-                    "model_b".to_string(),
-                    AssetType::ModelWASM,
-                )],
-            )),
-        ]);
+    fn project_declared_assets_includes_outputs() {
+        let project = Project {
+            version: 2,
+            imports: vec![ImportedAsset::model("model_a".to_string(), vec![1, 2, 3])],
+            timeline: vec![ExecutionStep {
+                operator_id: "op".to_string(),
+                inputs: vec![ExecutionInput::AssetRef("model_a".to_string())],
+                outputs: vec!["model_b".to_string()],
+            }],
+            exports: vec![],
+        };
 
         let assets = project.declared_assets();
-        assert!(assets
-            .iter()
-            .any(|(id, ty)| id == "model_a" && *ty == AssetType::ModelWASM));
-        assert!(assets
-            .iter()
-            .any(|(id, ty)| id == "model_b" && *ty == AssetType::ModelWASM));
+        assert!(assets.iter().any(|(id, hint)| id == "model_a" && *hint == Some(AssetTypeHint::Model)));
+        assert!(assets.iter().any(|(id, _)| id == "model_b"));
     }
 
     #[test]
-    fn insert_model_wasm_appends_without_replacing_and_makes_ids_unique() {
-        let mut p = Project::new(vec![]);
-        let id1 = p.insert_model_wasm("model", vec![1, 2, 3]);
-        let id2 = p.insert_model_wasm("model", vec![4, 5, 6]);
+    fn insert_model_makes_ids_unique() {
+        let mut p = Project::new();
+        let id1 = p.insert_model("model", vec![1, 2, 3]);
+        let id2 = p.insert_model("model", vec![4, 5, 6]);
 
         assert_eq!(id1, "model");
         assert_eq!(id2, "model_2");
-        assert!(p.entries().len() >= 4);
-
-        let declared: Vec<String> = p.declared_assets().into_iter().map(|(id, _)| id).collect();
-        assert!(declared.contains(&"model".to_string()));
-        assert!(declared.contains(&"model_2".to_string()));
-    }
-
-    #[test]
-    fn insert_operation_is_placed_after_input_dependencies() {
-        let mut p = Project::new(vec![]);
-        let a = p.insert_model_wasm("a", vec![1]);
-        let b = p.insert_model_wasm("b", vec![2]);
-
-        // Insert an operation that depends on `b`.
-        p.insert_operation(
-            "op_identity_operator",
-            vec![9, 9, 9],
-            vec![ExecuteWasmInput::AssetByID(b.clone())],
-            vec![ExecuteWasmOutput::new("out".to_string(), AssetType::ModelWASM)],
-            "out".to_string(),
-        );
-
-        let mut idx_load_b = None;
-        let mut idx_exec = None;
-        for (idx, e) in p.entries().iter().enumerate() {
-            match e {
-                ProjectEntry::LoadAsset(le) if le.asset_id() == b => idx_load_b = Some(idx),
-                ProjectEntry::ExecuteWASM(_) => idx_exec = Some(idx),
-                _ => {}
-            }
-        }
-
-        assert!(idx_load_b.is_some());
-        assert!(idx_exec.is_some());
-        assert!(idx_exec.unwrap() > idx_load_b.unwrap());
-
-        // Sanity: earlier model still present.
-        let declared: Vec<String> = p.declared_assets().into_iter().map(|(id, _)| id).collect();
-        assert!(declared.contains(&a));
-        assert!(declared.contains(&b));
+        assert_eq!(p.imports.len(), 2);
+        assert_eq!(p.exports.len(), 2);
     }
 }

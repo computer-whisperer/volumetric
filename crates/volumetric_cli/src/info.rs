@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use wasmtime::{Engine, Instance, Module, Store};
 
 use volumetric::{
-    operator_metadata_from_wasm_bytes, ExecuteWasmInput, OperatorMetadata,
-    OperatorMetadataInput, OperatorMetadataOutput, Project, ProjectEntry,
+    operator_metadata_from_wasm_bytes, ExecutionInput, OperatorMetadata,
+    OperatorMetadataInput, OperatorMetadataOutput, Project,
 };
 
 // === WASM Type Detection ===
@@ -171,8 +171,10 @@ enum InfoOutput {
         metadata: OperatorMetadataJson,
     },
     Project {
-        entries: Vec<EntryInfo>,
-        declared_assets: Vec<DeclaredAsset>,
+        version: u32,
+        imports: Vec<ImportInfo>,
+        timeline: Vec<TimelineStepInfo>,
+        exports: Vec<String>,
     },
     Unknown {
         file_size: usize,
@@ -203,27 +205,17 @@ enum OutputInfo {
 }
 
 #[derive(Debug, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum EntryInfo {
-    LoadAsset {
-        asset_id: String,
-        asset_type: String,
-        size_bytes: usize,
-    },
-    ExecuteWasm {
-        operator_id: String,
-        inputs: Vec<String>,
-        outputs: Vec<String>,
-    },
-    Export {
-        asset_id: String,
-    },
+struct ImportInfo {
+    id: String,
+    type_hint: String,
+    size_bytes: usize,
 }
 
 #[derive(Debug, Serialize)]
-struct DeclaredAsset {
-    asset_id: String,
-    asset_type: String,
+struct TimelineStepInfo {
+    operator_id: String,
+    inputs: Vec<String>,
+    outputs: Vec<String>,
 }
 
 fn metadata_to_json(meta: &OperatorMetadata) -> OperatorMetadataJson {
@@ -253,65 +245,42 @@ fn metadata_to_json(meta: &OperatorMetadata) -> OperatorMetadataJson {
     }
 }
 
-fn format_input(input: &ExecuteWasmInput) -> String {
+fn format_input(input: &ExecutionInput) -> String {
     match input {
-        ExecuteWasmInput::AssetByID(id) => format!("asset:{}", id),
-        ExecuteWasmInput::String(s) => {
-            if s.len() > 30 {
-                format!("string:\"{}...\"", &s[..27])
-            } else {
-                format!("string:\"{}\"", s)
-            }
-        }
-        ExecuteWasmInput::Data(d) => format!("data:{} bytes", d.len()),
+        ExecutionInput::AssetRef(id) => format!("asset:{}", id),
+        ExecutionInput::Inline(d) => format!("inline:{} bytes", d.len()),
     }
 }
 
 fn get_project_info(project: &Project) -> Result<InfoOutput> {
-    let entries: Vec<EntryInfo> = project
-        .entries()
+    let imports: Vec<ImportInfo> = project
+        .imports()
         .iter()
-        .map(|e| match e {
-            ProjectEntry::LoadAsset(a) => {
-                let asset_bytes = match a.asset_type() {
-                    volumetric::AssetType::ModelWASM => "ModelWASM",
-                    volumetric::AssetType::OperationWASM => "OperationWASM",
-                };
-                // We can't directly access the asset bytes from LoadAssetEntry's public API
-                // So we'll use 0 as a placeholder - in practice the asset is embedded
-                EntryInfo::LoadAsset {
-                    asset_id: a.asset_id().to_string(),
-                    asset_type: asset_bytes.to_string(),
-                    size_bytes: 0, // Not directly accessible
-                }
-            }
-            ProjectEntry::ExecuteWASM(exec) => EntryInfo::ExecuteWasm {
-                operator_id: exec.asset_id().to_string(),
-                inputs: exec.inputs().iter().map(format_input).collect(),
-                outputs: exec
-                    .outputs()
-                    .iter()
-                    .map(|o| o.asset_id.clone())
-                    .collect(),
-            },
-            ProjectEntry::ExportAsset(id) => EntryInfo::Export {
-                asset_id: id.clone(),
-            },
+        .map(|i| ImportInfo {
+            id: i.id.clone(),
+            type_hint: i
+                .type_hint
+                .map(|h| h.to_string())
+                .unwrap_or_else(|| "Binary".to_string()),
+            size_bytes: i.data.len(),
         })
         .collect();
 
-    let declared = project
-        .declared_assets()
-        .into_iter()
-        .map(|(id, ty)| DeclaredAsset {
-            asset_id: id,
-            asset_type: format!("{:?}", ty),
+    let timeline: Vec<TimelineStepInfo> = project
+        .timeline()
+        .iter()
+        .map(|step| TimelineStepInfo {
+            operator_id: step.operator_id.clone(),
+            inputs: step.inputs.iter().map(format_input).collect(),
+            outputs: step.outputs.clone(),
         })
         .collect();
 
     Ok(InfoOutput::Project {
-        entries,
-        declared_assets: declared,
+        version: project.version,
+        imports,
+        timeline,
+        exports: project.exports().to_vec(),
     })
 }
 
@@ -377,45 +346,27 @@ fn print_info_human(output: &InfoOutput) {
             }
         }
         InfoOutput::Project {
-            entries,
-            declared_assets,
+            version,
+            imports,
+            timeline,
+            exports,
         } => {
-            println!("=== Project Info ===");
-            println!("Entries ({}):", entries.len());
-            for (i, entry) in entries.iter().enumerate() {
-                match entry {
-                    EntryInfo::LoadAsset {
-                        asset_id,
-                        asset_type,
-                        size_bytes,
-                    } => {
-                        if *size_bytes > 0 {
-                            println!(
-                                "  [{}] LoadAsset: {} ({}, {} bytes)",
-                                i, asset_id, asset_type, size_bytes
-                            );
-                        } else {
-                            println!("  [{}] LoadAsset: {} ({})", i, asset_id, asset_type);
-                        }
-                    }
-                    EntryInfo::ExecuteWasm {
-                        operator_id,
-                        inputs,
-                        outputs,
-                    } => {
-                        println!("  [{}] ExecuteWASM: {}", i, operator_id);
-                        println!("       Inputs: {}", inputs.join(", "));
-                        println!("       Outputs: {}", outputs.join(", "));
-                    }
-                    EntryInfo::Export { asset_id } => {
-                        println!("  [{}] Export: {}", i, asset_id);
-                    }
-                }
+            println!("=== Project Info (v{}) ===", version);
+            println!();
+            println!("Imports ({}):", imports.len());
+            for import in imports {
+                println!("  {} ({}, {} bytes)", import.id, import.type_hint, import.size_bytes);
             }
             println!();
-            println!("Declared assets ({}):", declared_assets.len());
-            for asset in declared_assets {
-                println!("  - {} ({})", asset.asset_id, asset.asset_type);
+            println!("Timeline ({} steps):", timeline.len());
+            for (i, step) in timeline.iter().enumerate() {
+                println!("  [{}] {} -> {:?}", i, step.operator_id, step.outputs);
+                println!("       Inputs: {}", step.inputs.join(", "));
+            }
+            println!();
+            println!("Exports ({}):", exports.len());
+            for id in exports {
+                println!("  {}", id);
             }
         }
         InfoOutput::Unknown { file_size, message } => {
