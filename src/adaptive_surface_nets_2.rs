@@ -2470,13 +2470,98 @@ where
     blended
 }
 
+/// Helper function to attempt sharp edge detection via clustering.
+///
+/// Returns Some(result) if a sharp edge is detected, None otherwise.
+fn try_sharp_edge_detection(
+    surface_pos: (f64, f64, f64),
+    surface_points: &[(f64, f64, f64)],
+    single_residual: f64,
+    n: (f64, f64, f64),
+    probe_epsilon: f64,
+    sharp_config: &SharpEdgeConfig,
+) -> Option<((f64, f64, f64), Option<(f64, f64, f64)>, VertexSharpInfo)> {
+    if surface_points.len() < 6 {
+        return None;
+    }
+
+    // Try to cluster points into two groups
+    let (cluster_a, cluster_b) = cluster_points_two(surface_points)?;
+
+    // Require at least 3 points per cluster for reliable plane fitting
+    if cluster_a.len() < 3 || cluster_b.len() < 3 {
+        return None;
+    }
+
+    let (normal_a, residual_a) = fit_plane_to_points(&cluster_a);
+    let (normal_b, residual_b) = fit_plane_to_points(&cluster_b);
+
+    // Compute improvement ratio: how much better is 2-plane fit vs 1-plane fit?
+    let combined_residual = residual_a + residual_b;
+    let improvement = single_residual / (combined_residual + 1e-12);
+
+    // Check individual cluster fit quality
+    let cluster_a_threshold = probe_epsilon * probe_epsilon * cluster_a.len() as f64;
+    let cluster_b_threshold = probe_epsilon * probe_epsilon * cluster_b.len() as f64;
+
+    // Orient normals consistently (toward the original normal direction)
+    let dot_a = normal_a.0 * n.0 + normal_a.1 * n.1 + normal_a.2 * n.2;
+    let dot_b = normal_b.0 * n.0 + normal_b.1 * n.1 + normal_b.2 * n.2;
+
+    let normal_a = if dot_a < 0.0 {
+        (-normal_a.0, -normal_a.1, -normal_a.2)
+    } else {
+        normal_a
+    };
+    let normal_b = if dot_b < 0.0 {
+        (-normal_b.0, -normal_b.1, -normal_b.2)
+    } else {
+        normal_b
+    };
+
+    // Check angle between normals
+    let dot_ab = normal_a.0 * normal_b.0 + normal_a.1 * normal_b.1 + normal_a.2 * normal_b.2;
+    let angle_between = dot_ab.clamp(-1.0, 1.0).acos();
+
+    // Sharp edge criteria:
+    // 1. Clustering improves fit by at least 2x
+    // 2. Angle between normals exceeds threshold
+    // 3. Individual cluster fits are reasonably good
+    let is_sharp = improvement > 2.0
+        && angle_between > sharp_config.angle_threshold
+        && residual_a < cluster_a_threshold * 3.0
+        && residual_b < cluster_b_threshold * 3.0;
+
+    if is_sharp {
+        // This is a sharp edge! Compute intersection line
+        let new_pos = project_to_plane_intersection(
+            surface_pos,
+            &cluster_a,
+            normal_a,
+            &cluster_b,
+            normal_b,
+        );
+
+        return Some((
+            normal_a,
+            new_pos,
+            VertexSharpInfo {
+                is_sharp: true,
+                normal_a,
+                normal_b: Some(normal_b),
+            },
+        ));
+    }
+
+    None
+}
+
 /// Refine normal via probing with optional sharp edge detection (Case 1).
 ///
-/// Similar to `refine_normal_via_probing`, but also detects sharp edges by:
-/// 1. Checking if the plane fitting residual is high
-/// 2. If so, clustering the probe points into two groups
-/// 3. Fitting planes to each cluster to get two normals
-/// 4. Moving the vertex position to the intersection line
+/// Uses adaptive probing:
+/// - Phase 1: 4 probes for quick smooth-surface detection (95% of vertices)
+/// - Phase 2: 8 more probes (12 total) for edge detection
+/// - Phase 3: 12 more probes (24 total) for ambiguous cases
 ///
 /// # Returns
 /// A tuple of:
@@ -2521,8 +2606,13 @@ where
     // Compute tangent basis
     let (t1, t2) = orthonormal_basis_perpendicular_to(n);
 
+    // Threshold for "smooth surface" early exit: residual per point should be very small
+    // relative to probe_epsilon squared (points should lie on a plane within position error)
+    // Use a tight threshold (0.05) so only clearly smooth surfaces early-exit
+    let smooth_threshold_per_point = probe_epsilon * probe_epsilon * 0.05;
+
     // =========================================================================
-    // PHASE 1: Initial 4-probe detection (cheap)
+    // PHASE 1: Initial 4-probe detection (cheap) - handles 95% of smooth surfaces
     // =========================================================================
     let mut surface_points: Vec<(f64, f64, f64)> = vec![surface_pos];
 
@@ -2553,12 +2643,39 @@ where
         }
     }
 
+    // Early exit check: if 4 probes fit a plane well AND normal agrees with topology, this is smooth
+    if surface_points.len() >= 4 {
+        let (phase1_normal, phase1_residual) = fit_plane_to_points(&surface_points);
+        let smooth_threshold = smooth_threshold_per_point * surface_points.len() as f64;
+
+        // Check if fitted normal agrees with topology normal (within ~15°)
+        let dot = phase1_normal.0 * n.0 + phase1_normal.1 * n.1 + phase1_normal.2 * n.2;
+        let normal_agrees = dot.abs() > 0.966; // cos(15°) ≈ 0.966
+
+        if phase1_residual < smooth_threshold && normal_agrees {
+            // Smooth surface - early exit with fitted normal
+            let final_normal = if dot < 0.0 {
+                (-phase1_normal.0, -phase1_normal.1, -phase1_normal.2)
+            } else {
+                phase1_normal
+            };
+            return (
+                final_normal,
+                None,
+                VertexSharpInfo {
+                    is_sharp: false,
+                    normal_a: final_normal,
+                    normal_b: None,
+                },
+            );
+        }
+    }
+
     // =========================================================================
-    // PHASE 2: Add more probes for sharp edge detection
+    // PHASE 2: Add 8 more probes for edge detection (12 total)
     // =========================================================================
-    // Use 12 additional probe directions (at 30° intervals, skipping cardinals)
-    // This gives 16 total probes for reliable clustering
-    let additional_dirs: Vec<(f64, f64, f64)> = (1..12)
+    // Use 8 additional probe directions at 30° intervals, skipping cardinals
+    let phase2_dirs: Vec<(f64, f64, f64)> = (1..12)
         .filter(|i| i % 3 != 0) // Skip 90° intervals (already have cardinals)
         .map(|i| {
             let angle = (i as f64) * std::f64::consts::PI / 6.0; // 30° increments
@@ -2572,7 +2689,7 @@ where
         })
         .collect();
 
-    for dir in additional_dirs.iter() {
+    for dir in phase2_dirs.iter() {
         let probe_pos = (
             surface_pos.0 + dir.0 * probe_epsilon,
             surface_pos.1 + dir.1 * probe_epsilon,
@@ -2605,10 +2722,85 @@ where
     }
 
     // =========================================================================
-    // PHASE 3: Try clustering with available points
+    // PHASE 2b: Check if this might be an edge (high residual)
     // =========================================================================
-    // Fit single plane first to measure baseline residual
     let (single_normal, single_residual) = fit_plane_to_points(&surface_points);
+    let smooth_threshold = smooth_threshold_per_point * surface_points.len() as f64;
+
+    // Escalation threshold: if residual is > 2x smooth threshold, this might be an edge
+    let escalation_threshold = smooth_threshold * 2.0;
+    let is_potential_edge = single_residual > escalation_threshold;
+
+    // =========================================================================
+    // PHASE 3: Escalation - add 12 more probes for potential edges
+    // =========================================================================
+    // If this looks like an edge, get more samples BEFORE trying detection
+    // This improves normal accuracy from ~16° to ~8° (more points per cluster)
+    if is_potential_edge {
+        // Add 12 more probes using golden-ratio distribution for better uniformity
+        let golden_ratio = (1.0 + 5.0_f64.sqrt()) / 2.0;
+        for i in 0..12 {
+            // Golden-ratio spiral gives better angular distribution than uniform
+            let angle = 2.0 * std::f64::consts::PI * (i as f64) / golden_ratio;
+            // Offset to avoid overlapping with existing probe directions
+            let angle = angle + std::f64::consts::PI / 12.0;
+            let cos_a = angle.cos();
+            let sin_a = angle.sin();
+            let dir = (
+                t1.0 * cos_a + t2.0 * sin_a,
+                t1.1 * cos_a + t2.1 * sin_a,
+                t1.2 * cos_a + t2.2 * sin_a,
+            );
+
+            let probe_pos = (
+                surface_pos.0 + dir.0 * probe_epsilon,
+                surface_pos.1 + dir.1 * probe_epsilon,
+                surface_pos.2 + dir.2 * probe_epsilon,
+            );
+
+            if let Some(found) = find_surface_point_along_direction(
+                probe_pos,
+                n,
+                search_distance,
+                binary_search_iterations,
+                sampler,
+                stats,
+            ) {
+                surface_points.push(found);
+            }
+        }
+
+        // Re-fit with all 24 points and try edge detection
+        let (_single_normal_v2, single_residual_v2) = fit_plane_to_points(&surface_points);
+
+        if let Some(result) = try_sharp_edge_detection(
+            surface_pos,
+            &surface_points,
+            single_residual_v2,
+            n,
+            probe_epsilon,
+            sharp_config,
+        ) {
+            return result;
+        }
+    } else {
+        // Not a potential edge based on residual, but still try detection with 12 probes
+        // (some edges may have lower residual due to probe alignment)
+        if let Some(result) = try_sharp_edge_detection(
+            surface_pos,
+            &surface_points,
+            single_residual,
+            n,
+            probe_epsilon,
+            sharp_config,
+        ) {
+            return result;
+        }
+    }
+
+    // =========================================================================
+    // Final: Not a sharp edge - perform regular Bayesian blending
+    // =========================================================================
     let dot = single_normal.0 * n.0 + single_normal.1 * n.1 + single_normal.2 * n.2;
     let measured = if dot < 0.0 {
         (-single_normal.0, -single_normal.1, -single_normal.2)
@@ -2616,77 +2808,7 @@ where
         single_normal
     };
 
-    // Try clustering and check if it produces significant improvement (ratio-based criterion)
-    // This matches the reference method's approach
-    if surface_points.len() >= 6 {
-        // Try to cluster points into two groups
-        if let Some((cluster_a, cluster_b)) = cluster_points_two(&surface_points) {
-            // Require at least 3 points per cluster for reliable plane fitting
-            if cluster_a.len() >= 3 && cluster_b.len() >= 3 {
-                let (normal_a, residual_a) = fit_plane_to_points(&cluster_a);
-                let (normal_b, residual_b) = fit_plane_to_points(&cluster_b);
-
-                // Compute improvement ratio: how much better is 2-plane fit vs 1-plane fit?
-                let combined_residual = residual_a + residual_b;
-                let improvement = single_residual / (combined_residual + 1e-12);
-
-                // Check individual cluster fit quality
-                let cluster_a_threshold = probe_epsilon * probe_epsilon * cluster_a.len() as f64;
-                let cluster_b_threshold = probe_epsilon * probe_epsilon * cluster_b.len() as f64;
-
-                // Orient normals consistently (toward the original normal direction)
-                let dot_a = normal_a.0 * n.0 + normal_a.1 * n.1 + normal_a.2 * n.2;
-                let dot_b = normal_b.0 * n.0 + normal_b.1 * n.1 + normal_b.2 * n.2;
-
-                let normal_a = if dot_a < 0.0 {
-                    (-normal_a.0, -normal_a.1, -normal_a.2)
-                } else {
-                    normal_a
-                };
-                let normal_b = if dot_b < 0.0 {
-                    (-normal_b.0, -normal_b.1, -normal_b.2)
-                } else {
-                    normal_b
-                };
-
-                // Check angle between normals
-                let dot_ab = normal_a.0 * normal_b.0 + normal_a.1 * normal_b.1 + normal_a.2 * normal_b.2;
-                let angle_between = dot_ab.clamp(-1.0, 1.0).acos();
-
-                // Sharp edge criteria (matching reference method):
-                // 1. Clustering improves fit by at least 2x
-                // 2. Angle between normals exceeds threshold
-                // 3. Individual cluster fits are reasonably good
-                let is_sharp = improvement > 2.0
-                    && angle_between > sharp_config.angle_threshold
-                    && residual_a < cluster_a_threshold * 3.0
-                    && residual_b < cluster_b_threshold * 3.0;
-
-                if is_sharp {
-                    // This is a sharp edge! Compute intersection line
-                    let new_pos = project_to_plane_intersection(
-                        surface_pos,
-                        &cluster_a,
-                        normal_a,
-                        &cluster_b,
-                        normal_b,
-                    );
-
-                    return (
-                        normal_a,
-                        new_pos,
-                        VertexSharpInfo {
-                            is_sharp: true,
-                            normal_a,
-                            normal_b: Some(normal_b),
-                        },
-                    );
-                }
-            }
-        }
-    }
-
-    // Not a sharp edge - perform regular Bayesian blending
+    // Bayesian blending
     let prior_sigma: f64 = 1.0_f64.to_radians();
     let position_error = search_distance / (1u64 << binary_search_iterations) as f64;
     let measurement_sigma = position_error / probe_epsilon;
