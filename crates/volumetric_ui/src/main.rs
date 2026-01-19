@@ -2505,6 +2505,9 @@ impl eframe::App for VolumetricApp {
                 let mut step_to_delete: Option<usize> = None;
                 let mut step_to_move_up: Option<usize> = None;
                 let mut step_to_move_down: Option<usize> = None;
+                let mut import_to_delete: Option<usize> = None;
+                let mut export_to_delete: Option<usize> = None;
+                let mut export_to_add: Option<String> = None;
 
                 egui::CollapsingHeader::new("Project Timeline")
                     .default_open(true)
@@ -2521,16 +2524,24 @@ impl eframe::App for VolumetricApp {
                         ui.add_space(4.0);
 
                         if let Some(ref project) = self.project {
-                            // Show imports
-                            if !project.imports().is_empty() {
+                            // Show imports with delete buttons
+                            let imports = project.imports();
+                            if !imports.is_empty() {
                                 ui.label("Imports:");
-                                for import in project.imports() {
-                                    let icon = match import.type_hint {
-                                        Some(AssetTypeHint::Model) => "📦",
-                                        Some(AssetTypeHint::Operator) => "⚙️",
-                                        _ => "📄",
-                                    };
-                                    ui.weak(format!("  {} {}", icon, import.id));
+                                for (idx, import) in imports.iter().enumerate() {
+                                    ui.horizontal(|ui| {
+                                        let icon = match import.type_hint {
+                                            Some(AssetTypeHint::Model) => "📦",
+                                            Some(AssetTypeHint::Operator) => "⚙️",
+                                            _ => "📄",
+                                        };
+                                        ui.weak(format!("{} {}", icon, import.id));
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            if ui.small_button("🗑").on_hover_text("Remove import").clicked() {
+                                                import_to_delete = Some(idx);
+                                            }
+                                        });
+                                    });
                                 }
                                 ui.add_space(4.0);
                             }
@@ -2595,13 +2606,47 @@ impl eframe::App for VolumetricApp {
                                     });
                             }
 
-                            // Show exports
-                            if !project.exports().is_empty() {
-                                ui.add_space(4.0);
-                                ui.label("Exports:");
-                                for export_id in project.exports() {
-                                    ui.weak(format!("  📤 {}", export_id));
+                            // Show exports with delete buttons and add functionality
+                            ui.add_space(4.0);
+                            ui.label("Exports:");
+                            let exports = project.exports();
+                            if exports.is_empty() {
+                                ui.weak("  (no exports)");
+                            } else {
+                                for (idx, export_id) in exports.iter().enumerate() {
+                                    ui.horizontal(|ui| {
+                                        ui.weak(format!("📤 {}", export_id));
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            if ui.small_button("🗑").on_hover_text("Remove export").clicked() {
+                                                export_to_delete = Some(idx);
+                                            }
+                                        });
+                                    });
                                 }
+                            }
+
+                            // Add export dropdown
+                            let declared = project.declared_assets();
+                            let current_exports: std::collections::HashSet<&str> = exports.iter().map(|s| s.as_str()).collect();
+                            let available_for_export: Vec<&str> = declared
+                                .iter()
+                                .filter(|(id, _)| !current_exports.contains(id.as_str()))
+                                .map(|(id, _)| id.as_str())
+                                .collect();
+
+                            if !available_for_export.is_empty() {
+                                ui.horizontal(|ui| {
+                                    ui.label("Add:");
+                                    egui::ComboBox::from_id_salt("add_export_combo")
+                                        .selected_text("Select asset…")
+                                        .show_ui(ui, |ui| {
+                                            for asset_id in &available_for_export {
+                                                if ui.selectable_label(false, *asset_id).clicked() {
+                                                    export_to_add = Some(asset_id.to_string());
+                                                }
+                                            }
+                                        });
+                                });
                             }
                         } else {
                             ui.weak("No project loaded");
@@ -2689,6 +2734,79 @@ impl eframe::App for VolumetricApp {
                                     self.editing_entry_index = Some(idx);
                                 }
                             }
+                        }
+                    }
+                }
+
+                // Handle import deletion
+                if let Some(idx) = import_to_delete {
+                    if let Some(ref mut project) = self.project {
+                        if idx < project.imports().len() {
+                            // Get the import ID before removing
+                            let import_id = project.imports()[idx].id.clone();
+
+                            // Remove the import
+                            project.imports_mut().remove(idx);
+
+                            // Remove any timeline steps that use this import as operator
+                            let steps_to_remove: Vec<usize> = project.timeline()
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, step)| step.operator_id == import_id)
+                                .map(|(i, _)| i)
+                                .collect();
+
+                            // Remove in reverse order to preserve indices
+                            for step_idx in steps_to_remove.into_iter().rev() {
+                                // Get output IDs for export cleanup
+                                let output_ids: Vec<String> = project.timeline().get(step_idx)
+                                    .map(|s| s.outputs.clone())
+                                    .unwrap_or_default();
+
+                                project.timeline_mut().remove(step_idx);
+
+                                // Remove corresponding exports
+                                for output_id in output_ids {
+                                    project.exports_mut().retain(|e| e != &output_id);
+                                }
+                            }
+
+                            // Also remove from exports if this import was exported directly
+                            project.exports_mut().retain(|e| e != &import_id);
+
+                            #[cfg(not(target_arch = "wasm32"))]
+                            {
+                                self.project_path = None; // Mark as modified
+                            }
+                            self.run_project();
+                        }
+                    }
+                }
+
+                // Handle export deletion
+                if let Some(idx) = export_to_delete {
+                    if let Some(ref mut project) = self.project {
+                        if idx < project.exports().len() {
+                            project.exports_mut().remove(idx);
+                            #[cfg(not(target_arch = "wasm32"))]
+                            {
+                                self.project_path = None; // Mark as modified
+                            }
+                            self.run_project();
+                        }
+                    }
+                }
+
+                // Handle export addition
+                if let Some(asset_id) = export_to_add {
+                    if let Some(ref mut project) = self.project {
+                        if !project.exports().contains(&asset_id) {
+                            project.exports_mut().push(asset_id);
+                            #[cfg(not(target_arch = "wasm32"))]
+                            {
+                                self.project_path = None; // Mark as modified
+                            }
+                            self.run_project();
                         }
                     }
                 }
