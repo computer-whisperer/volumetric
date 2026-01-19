@@ -145,6 +145,8 @@ volumetric_cli render -i <file> -o <output.png>
 - `--camera-pos <x,y,z>` - Custom camera position (overrides --views)
 - `--camera-target <x,y,z>` - Look-at point (default: model center)
 - `--camera-up <x,y,z>` - Up vector (default: 0,1,0)
+- `--near <distance>` - Near clipping plane distance (default: auto-computed)
+- `--far <distance>` - Far clipping plane distance (default: auto-computed)
 
 **Rendering Mode Options:**
 - `--wireframe` - Render mesh edges instead of filled triangles
@@ -185,6 +187,9 @@ volumetric_cli render -i model.wasm -o out.png --camera-pos 5,3,5 --camera-targe
 
 # Combined: orthographic + wireframe + custom camera
 volumetric_cli render -i model.wasm -o out.png --projection ortho --wireframe --camera-pos 10,10,10
+
+# Close-up wireframe inspection with custom clip planes
+volumetric_cli render -i model.wasm -o out.png --wireframe --camera-pos 0.5,0.5,0.5 --near 0.01 --far 10
 ```
 
 The CLI outputs detailed profiling statistics showing per-stage timing and sample counts, useful for performance analysis.

@@ -139,6 +139,17 @@ impl CameraSetup {
             far,
         }
     }
+
+    /// Override near and/or far clipping planes
+    pub fn with_clip_planes(mut self, near: Option<f32>, far: Option<f32>) -> Self {
+        if let Some(n) = near {
+            self.near = n;
+        }
+        if let Some(f) = far {
+            self.far = f;
+        }
+        self
+    }
 }
 
 /// Predefined view angles

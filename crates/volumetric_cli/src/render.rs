@@ -130,6 +130,14 @@ pub struct RenderArgs {
     /// Up vector as x,y,z (default: 0,1,0)
     #[arg(long, default_value = "0,1,0")]
     pub camera_up: String,
+
+    /// Near clipping plane distance (default: auto-computed from scene)
+    #[arg(long)]
+    pub near: Option<f32>,
+
+    /// Far clipping plane distance (default: auto-computed from scene)
+    #[arg(long)]
+    pub far: Option<f32>,
 }
 
 fn parse_hex_color(hex: &str) -> Result<[f32; 3]> {
@@ -485,7 +493,8 @@ pub fn run_render(args: RenderArgs) -> Result<()> {
             projection,
             bounds_min,
             bounds_max,
-        );
+        )
+        .with_clip_planes(args.near, args.far);
         let view_proj = camera.view_proj(aspect);
 
         println!("Rendering to {:?}", args.output);
@@ -519,7 +528,8 @@ pub fn run_render(args: RenderArgs) -> Result<()> {
             let output_path = output_path_for_view(&args.output, *view, views.len());
             println!("Rendering {} view to {:?}", view.suffix(), output_path);
 
-            let camera = CameraSetup::auto_frame(bounds_min, bounds_max, *view, projection);
+            let camera = CameraSetup::auto_frame(bounds_min, bounds_max, *view, projection)
+                .with_clip_planes(args.near, args.far);
             let view_proj = camera.view_proj(aspect);
 
             let uniforms = Uniforms {
