@@ -876,10 +876,7 @@ mod tests {
         let mut renderer = Renderer::new(wgpu::TextureFormat::Bgra8Unorm);
 
         let mesh = MeshData {
-            vertices: vec![MeshVertex {
-                position: [0.0, 0.0, 0.0],
-                normal: [0.0, 1.0, 0.0],
-            }],
+            vertices: vec![MeshVertex::new([0.0, 0.0, 0.0], [0.0, 1.0, 0.0])],
             indices: None,
         };
 

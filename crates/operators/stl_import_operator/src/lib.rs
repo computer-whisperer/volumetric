@@ -1418,7 +1418,7 @@ pub extern "C" fn run() {
 pub extern "C" fn get_metadata() -> i64 {
     static METADATA: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     let bytes = METADATA.get_or_init(|| {
-        let schema = "{ scale: float (default 1.0), translate: [float, float, float] (default [0,0,0]), center: bool (default false) }".to_string();
+        let schema = "{ scale: float .default 1.0, translate: [float, float, float] .default [0,0,0], center: bool .default false }".to_string();
         let metadata = OperatorMetadata {
             name: "stl_import_operator".to_string(),
             version: "0.1.0".to_string(),

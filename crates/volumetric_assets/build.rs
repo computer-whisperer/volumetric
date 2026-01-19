@@ -25,6 +25,7 @@ const OPERATORS: &[(&str, &str)] = &[
     ("lua_script_operator", "Lua Script"),
     ("stl_import_operator", "STL Import"),
     ("rectangular_prism_operator", "Rectangular Prism"),
+    ("heightmap_extrude_operator", "Heightmap Extrude"),
 ];
 
 fn main() {

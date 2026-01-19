@@ -579,6 +579,21 @@ fn parse_cddl_record_schema(cddl: &str) -> Result<Vec<(String, ConfigFieldType)>
         let name = name.trim();
         let ty = ty.trim();
 
+        // Strip CDDL control operators like ".default 1.0" from the type
+        // Per RFC 8610, .default is the proper syntax for default values
+        let ty = if let Some(dot_idx) = ty.find(".default") {
+            ty[..dot_idx].trim()
+        } else if let Some(paren_idx) = ty.find('(') {
+            // Also support legacy parenthetical annotations "(default 1.0)" for compatibility
+            if !ty[..paren_idx].contains('"') {
+                ty[..paren_idx].trim()
+            } else {
+                ty
+            }
+        } else {
+            ty
+        };
+
         let field_ty = match ty {
             "bool" => ConfigFieldType::Bool,
             "int" => ConfigFieldType::Int,
@@ -685,6 +700,46 @@ mod cddl_config_tests {
                 dz: 0.125
             }
         );
+    }
+
+    #[test]
+    fn parse_cddl_with_rfc8610_default_syntax() {
+        // RFC 8610 specifies .default as the control operator for default values
+        let fields = parse_cddl_record_schema(
+            "{ width: float .default 1.0, depth: float .default 1.0, height: float .default 1.0 }"
+        ).unwrap();
+
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[0].0, "width");
+        assert!(matches!(fields[0].1, ConfigFieldType::Float));
+        assert_eq!(fields[1].0, "depth");
+        assert!(matches!(fields[1].1, ConfigFieldType::Float));
+        assert_eq!(fields[2].0, "height");
+        assert!(matches!(fields[2].1, ConfigFieldType::Float));
+    }
+
+    #[test]
+    fn parse_cddl_with_bool_default() {
+        // RFC 8610 .default syntax
+        let fields = parse_cddl_record_schema(
+            "{ center: bool .default false }"
+        ).unwrap();
+
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].0, "center");
+        assert!(matches!(fields[0].1, ConfigFieldType::Bool));
+    }
+
+    #[test]
+    fn parse_cddl_with_legacy_paren_annotations() {
+        // Legacy (default X) annotations for backward compatibility
+        let fields = parse_cddl_record_schema(
+            "{ scale: float (default 1.0) }"
+        ).unwrap();
+
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].0, "scale");
+        assert!(matches!(fields[0].1, ConfigFieldType::Float));
     }
 }
 
@@ -893,6 +948,12 @@ pub struct VolumetricApp {
     /// Pending STL file data for operator input (native only, on web it's handled via Promise)
     #[cfg(not(target_arch = "wasm32"))]
     pending_stl_data: Option<Vec<u8>>,
+    /// Pending heightmap image import (web only)
+    #[cfg(target_arch = "wasm32")]
+    pending_heightmap_import: Option<Promise<Option<Vec<u8>>>>,
+    /// Pending heightmap image data for operator input (native only)
+    #[cfg(not(target_arch = "wasm32"))]
+    pending_heightmap_data: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1024,6 +1085,10 @@ impl VolumetricApp {
             pending_stl_import: None,
             #[cfg(not(target_arch = "wasm32"))]
             pending_stl_data: None,
+            #[cfg(target_arch = "wasm32")]
+            pending_heightmap_import: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            pending_heightmap_data: None,
         }
     }
 
@@ -1334,6 +1399,88 @@ impl VolumetricApp {
         if let Some(ref mut project) = self.project {
             project.insert_operation(
                 "op_stl_import_operator",
+                op_wasm,
+                inputs,
+                output_ids,
+                output_id,
+            );
+        }
+
+        // Clear the project path since we modified the project
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.project_path = None;
+        }
+
+        self.run_project();
+    }
+
+    /// Processes a heightmap image import by running the heightmap_extrude_operator
+    fn process_heightmap_import(&mut self, image_bytes: Vec<u8>) {
+        // Get the heightmap_extrude_operator WASM
+        let op_wasm = if let Some(bytes) = get_bundled_operator("heightmap_extrude_operator") {
+            bytes.to_vec()
+        } else {
+            // Filesystem fallback for native debug builds only
+            #[cfg(all(not(target_arch = "wasm32"), debug_assertions))]
+            {
+                if let Some(path) = operation_wasm_path("heightmap_extrude_operator") {
+                    match fs::read(&path) {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            self.error_message = Some(format!("Failed to read heightmap extrude operator: {}", e));
+                            return;
+                        }
+                    }
+                } else {
+                    self.error_message = Some(
+                        "Heightmap Extrude operator not found. Build it first with: cargo build --release --target wasm32-unknown-unknown -p heightmap_extrude_operator".to_string()
+                    );
+                    return;
+                }
+            }
+
+            #[cfg(any(target_arch = "wasm32", not(debug_assertions)))]
+            {
+                self.error_message = Some("Heightmap Extrude operator not bundled. Rebuild with WASM assets available.".to_string());
+                return;
+            }
+        };
+
+        // Create project if needed
+        if self.project.is_none() {
+            self.project = Some(Project::new());
+        }
+
+        // Generate output name for the imported model
+        let output_id = self.project.as_ref()
+            .map(|p| p.default_output_name("heightmap", None))
+            .unwrap_or_else(|| "heightmap_model".to_string());
+
+        // Build inputs: [CBORConfiguration (default config), Blob (image data)]
+        let default_config = {
+            // Encode default config: { width: 1.0, depth: 1.0, height: 1.0, clip: 0.0 }
+            let mut cbor_bytes = Vec::new();
+            let config_map = ciborium::value::Value::Map(vec![
+                (ciborium::value::Value::Text("width".to_string()), ciborium::value::Value::Float(1.0)),
+                (ciborium::value::Value::Text("depth".to_string()), ciborium::value::Value::Float(1.0)),
+                (ciborium::value::Value::Text("height".to_string()), ciborium::value::Value::Float(1.0)),
+                (ciborium::value::Value::Text("clip".to_string()), ciborium::value::Value::Float(0.0)),
+            ]);
+            ciborium::into_writer(&config_map, &mut cbor_bytes).ok();
+            cbor_bytes
+        };
+
+        let inputs = vec![
+            ExecutionInput::Inline(default_config), // CBORConfiguration
+            ExecutionInput::Inline(image_bytes),    // Blob: image data
+        ];
+
+        let output_ids = vec![output_id.clone()];
+
+        if let Some(ref mut project) = self.project {
+            project.insert_operation(
+                "op_heightmap_extrude_operator",
                 op_wasm,
                 inputs,
                 output_ids,
@@ -2167,8 +2314,19 @@ impl eframe::App for VolumetricApp {
                 }
             }
 
+            // Poll pending heightmap import
+            if let Some(ref promise) = self.pending_heightmap_import {
+                if let Some(result) = promise.ready() {
+                    let result = result.clone();
+                    self.pending_heightmap_import = None;
+                    if let Some(image_bytes) = result {
+                        self.process_heightmap_import(image_bytes);
+                    }
+                }
+            }
+
             // Request repaint while async operations are pending
-            if self.pending_wasm_import.is_some() || self.pending_project_load.is_some() || self.pending_stl_import.is_some() {
+            if self.pending_wasm_import.is_some() || self.pending_project_load.is_some() || self.pending_stl_import.is_some() || self.pending_heightmap_import.is_some() {
                 ctx.request_repaint();
             }
         }
@@ -2177,6 +2335,12 @@ impl eframe::App for VolumetricApp {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(stl_bytes) = self.pending_stl_data.take() {
             self.process_stl_import(stl_bytes);
+        }
+
+        // Process pending heightmap import (native)
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(image_bytes) = self.pending_heightmap_data.take() {
+            self.process_heightmap_import(image_bytes);
         }
 
         // Request continuous repaints while background tasks are running
@@ -2576,6 +2740,46 @@ impl eframe::App for VolumetricApp {
                                     self.pending_stl_import = Some(Promise::spawn_local(async {
                                         let file = rfd::AsyncFileDialog::new()
                                             .add_filter("STL", &["stl"])
+                                            .pick_file()
+                                            .await?;
+                                        Some(file.read().await)
+                                    }));
+                                }
+                            }
+
+                            // Import heightmap image (native version)
+                            #[cfg(not(target_arch = "wasm32"))]
+                            if ui
+                                .add(egui::Button::new("🏔 Import Heightmap…").min_size(egui::vec2(btn_width, 28.0)))
+                                .clicked()
+                            {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("Images", &["png", "jpg", "jpeg", "bmp", "gif"])
+                                    .pick_file()
+                                {
+                                    match fs::read(&path) {
+                                        Ok(image_bytes) => {
+                                            self.pending_heightmap_data = Some(image_bytes);
+                                        }
+                                        Err(e) => {
+                                            self.error_message =
+                                                Some(format!("Failed to read image file: {}", e));
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Import heightmap image (web version using async file picker)
+                            #[cfg(target_arch = "wasm32")]
+                            {
+                                let is_picking = self.pending_heightmap_import.is_some();
+                                if ui
+                                    .add_enabled(!is_picking, egui::Button::new(if is_picking { "⏳ Picking…" } else { "🏔 Import Heightmap…" }).min_size(egui::vec2(btn_width, 28.0)))
+                                    .clicked()
+                                {
+                                    self.pending_heightmap_import = Some(Promise::spawn_local(async {
+                                        let file = rfd::AsyncFileDialog::new()
+                                            .add_filter("Images", &["png", "jpg", "jpeg", "bmp", "gif"])
                                             .pick_file()
                                             .await?;
                                         Some(file.read().await)

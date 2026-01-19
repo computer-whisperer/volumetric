@@ -25,6 +25,7 @@ members = [
     "crates/operators/lua_script_operator",
     "crates/operators/stl_import_operator",
     "crates/operators/rectangular_prism_operator",
+    "crates/operators/heightmap_extrude_operator",
     "crates/volumetric_assets",
     "crates/volumetric_ui",
     "crates/volumetric_cli",

@@ -1,0 +1,17 @@
+[package]
+name = "heightmap_extrude_operator"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+ciborium = "0.2"
+wasm-encoder = "0.219"
+image = { version = "0.24", default-features = false, features = ["png", "jpeg", "bmp", "gif"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
