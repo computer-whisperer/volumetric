@@ -138,6 +138,19 @@ volumetric_cli render -i <file> -o <output.png>
 - `--base-resolution <n>`, `--max-depth <n>`, etc. - Same meshing options as the mesh command
 - `-q, --quiet` - Suppress profiling output
 
+**Projection & Camera Options:**
+- `--projection <type>` - Projection type: `perspective` or `ortho` (default: perspective)
+- `--fov <degrees>` - Field of view for perspective projection (default: 45)
+- `--ortho-scale <units>` - Orthographic vertical scale in world units (auto-computed if 0)
+- `--camera-pos <x,y,z>` - Custom camera position (overrides --views)
+- `--camera-target <x,y,z>` - Look-at point (default: model center)
+- `--camera-up <x,y,z>` - Up vector (default: 0,1,0)
+
+**Rendering Mode Options:**
+- `--wireframe` - Render mesh edges instead of filled triangles
+- `--wireframe-color <hex>` - Wireframe line color (default: ffffff)
+- `--recalc-normals` - Recompute smooth normals from mesh geometry (useful for imported STLs with bad normals)
+
 **Examples:**
 ```bash
 # Single isometric view
@@ -157,6 +170,21 @@ volumetric_cli render -i model.wasm -o out.png --grid 0.5
 
 # Without grid
 volumetric_cli render -i model.wasm -o out.png --grid 0
+
+# Orthographic projection (parallel lines don't converge)
+volumetric_cli render -i model.wasm -o out.png --projection ortho
+
+# Wide-angle perspective (90° FOV)
+volumetric_cli render -i model.wasm -o out.png --fov 90
+
+# Wireframe rendering
+volumetric_cli render -i model.wasm -o out.png --wireframe --wireframe-color 00ff00
+
+# Custom camera position
+volumetric_cli render -i model.wasm -o out.png --camera-pos 5,3,5 --camera-target 0,0,0
+
+# Combined: orthographic + wireframe + custom camera
+volumetric_cli render -i model.wasm -o out.png --projection ortho --wireframe --camera-pos 10,10,10
 ```
 
 The CLI outputs detailed profiling statistics showing per-stage timing and sample counts, useful for performance analysis.

@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
+use std::collections::HashSet;
 use std::path::Path;
 use wgpu::util::DeviceExt;
 
@@ -59,6 +60,59 @@ impl Default for Uniforms {
             fog_start: 1.0,
         }
     }
+}
+
+/// Options for wireframe rendering
+#[derive(Debug, Clone)]
+pub struct WireframeOptions {
+    pub color: [f32; 3],
+}
+
+/// Extract unique edges from triangle indices and convert to line vertices
+fn extract_wireframe_edges(
+    vertices: &[MeshVertex],
+    indices: &[u32],
+    color: [f32; 3],
+) -> Vec<GridVertex> {
+    let mut edges: HashSet<(u32, u32)> = HashSet::new();
+
+    // Collect unique edges (sorted indices to avoid duplicates)
+    for tri in indices.chunks(3) {
+        if tri.len() != 3 {
+            continue;
+        }
+        let tri_indices = [tri[0], tri[1], tri[2]];
+
+        // Add edges (i0-i1, i1-i2, i2-i0)
+        for i in 0..3 {
+            let a = tri_indices[i];
+            let b = tri_indices[(i + 1) % 3];
+            let edge = if a < b { (a, b) } else { (b, a) };
+            edges.insert(edge);
+        }
+    }
+
+    // Convert edges to line vertices
+    let mut line_vertices = Vec::with_capacity(edges.len() * 2);
+    for (a, b) in edges {
+        let va = &vertices[a as usize];
+        let vb = &vertices[b as usize];
+
+        line_vertices.push(GridVertex {
+            position: va.position,
+            _pad0: 0.0,
+            color,
+            _pad1: 0.0,
+        });
+        line_vertices.push(GridVertex {
+            position: vb.position,
+            _pad0: 0.0,
+            color,
+            _pad1: 0.0,
+        });
+    }
+
+    line_vertices
 }
 
 /// Headless wgpu renderer
@@ -268,7 +322,7 @@ impl HeadlessRenderer {
         })
     }
 
-    /// Render mesh to PNG with optional grid overlay
+    /// Render mesh to PNG with optional grid overlay and wireframe mode
     pub fn render_to_png(
         &self,
         vertices: &[MeshVertex],
@@ -276,6 +330,7 @@ impl HeadlessRenderer {
         uniforms: &Uniforms,
         background_color: [f32; 3],
         grid_vertices: Option<&[GridVertex]>,
+        wireframe: Option<&WireframeOptions>,
         output_path: &Path,
     ) -> Result<()> {
         // Create mesh vertex and index buffers
@@ -305,6 +360,18 @@ impl HeadlessRenderer {
                 })
         });
         let grid_vertex_count = grid_vertices.map(|gv| gv.len() as u32).unwrap_or(0);
+
+        // Create wireframe vertices if wireframe mode is enabled
+        let wireframe_verts = wireframe.map(|wf| extract_wireframe_edges(vertices, indices, wf.color));
+        let wireframe_buffer = wireframe_verts.as_ref().map(|wv| {
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Wireframe Vertex Buffer"),
+                    contents: bytemuck::cast_slice(wv),
+                    usage: wgpu::BufferUsages::VERTEX,
+                })
+        });
+        let wireframe_vertex_count = wireframe_verts.as_ref().map(|wv| wv.len() as u32).unwrap_or(0);
 
         // Create uniform buffer
         let uniform_buffer = self
@@ -417,12 +484,20 @@ impl HeadlessRenderer {
                 render_pass.draw(0..grid_vertex_count, 0..1);
             }
 
-            // Draw mesh
-            render_pass.set_pipeline(&self.mesh_pipeline);
-            render_pass.set_bind_group(0, &bind_group, &[]);
-            render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-            render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            render_pass.draw_indexed(0..indices.len() as u32, 0, 0..1);
+            if let Some(ref wb) = wireframe_buffer {
+                // Wireframe mode: draw edges as lines using grid pipeline
+                render_pass.set_pipeline(&self.grid_pipeline);
+                render_pass.set_bind_group(0, &bind_group, &[]);
+                render_pass.set_vertex_buffer(0, wb.slice(..));
+                render_pass.draw(0..wireframe_vertex_count, 0..1);
+            } else {
+                // Normal mode: draw filled mesh
+                render_pass.set_pipeline(&self.mesh_pipeline);
+                render_pass.set_bind_group(0, &bind_group, &[]);
+                render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                render_pass.draw_indexed(0..indices.len() as u32, 0, 0..1);
+            }
         }
 
         // Copy texture to buffer
