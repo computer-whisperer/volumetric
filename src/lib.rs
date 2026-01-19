@@ -113,6 +113,9 @@ pub enum AssetTypeHint {
     LuaSource,
     /// Unknown/generic binary data
     Binary,
+    /// Vector of f64 values with specified dimension (e.g., 3 for vec3)
+    /// Encoded as raw bytes (8 bytes per f64, little-endian)
+    VecF64(usize),
 }
 
 impl std::fmt::Display for AssetTypeHint {
@@ -123,6 +126,7 @@ impl std::fmt::Display for AssetTypeHint {
             AssetTypeHint::Config => write!(f, "Config"),
             AssetTypeHint::LuaSource => write!(f, "LuaSource"),
             AssetTypeHint::Binary => write!(f, "Binary"),
+            AssetTypeHint::VecF64(dim) => write!(f, "VecF64({dim})"),
         }
     }
 }
@@ -158,7 +162,7 @@ impl ImportedAsset {
 pub enum ExecutionInput {
     /// Reference to an asset by ID.
     AssetRef(String),
-    /// Inline embedded data.
+    /// Inline embedded data (raw bytes).
     Inline(Vec<u8>),
 }
 
@@ -207,6 +211,12 @@ pub enum OperatorMetadataInput {
     /// The host UI should display a file picker allowing the user to select a file.
     /// The file contents are passed as raw bytes to the operator.
     Blob,
+    /// A vector of f64 values with specified dimension.
+    ///
+    /// The `usize` specifies the expected dimension (e.g., 3 for vec3).
+    /// The host UI allows either literal input (drag values) or asset reference.
+    /// Data is encoded as raw bytes (8 bytes per f64, little-endian).
+    VecF64(usize),
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]

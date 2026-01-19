@@ -3322,6 +3322,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rectangular_prism_operator"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "serde",
+ "walrus 0.23.3",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

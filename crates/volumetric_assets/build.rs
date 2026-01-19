@@ -24,6 +24,7 @@ const OPERATORS: &[(&str, &str)] = &[
     ("scale_operator", "Scale"),
     ("lua_script_operator", "Lua Script"),
     ("stl_import_operator", "STL Import"),
+    ("rectangular_prism_operator", "Rectangular Prism"),
 ];
 
 fn main() {

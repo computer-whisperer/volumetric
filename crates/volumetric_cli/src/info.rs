@@ -196,6 +196,7 @@ enum InputInfo {
     ModelWasm,
     CborConfiguration { cddl: String },
     LuaSource { template: String },
+    VecF64 { dimension: usize },
 }
 
 #[derive(Debug, Serialize)]
@@ -232,6 +233,9 @@ fn metadata_to_json(meta: &OperatorMetadata) -> OperatorMetadataJson {
                 },
                 OperatorMetadataInput::LuaSource(template) => InputInfo::LuaSource {
                     template: template.clone(),
+                },
+                OperatorMetadataInput::VecF64(dim) => InputInfo::VecF64 {
+                    dimension: *dim,
                 },
             })
             .collect(),
@@ -335,6 +339,9 @@ fn print_info_human(output: &InfoOutput) {
                         if template.lines().count() > 5 {
                             println!("      ...");
                         }
+                    }
+                    InputInfo::VecF64 { dimension } => {
+                        println!("  [{}] VecF64({})", i, dimension);
                     }
                 }
             }

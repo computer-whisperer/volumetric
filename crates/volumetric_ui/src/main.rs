@@ -857,6 +857,9 @@ pub struct VolumetricApp {
     edit_input_asset_ids: Vec<Option<String>>,
     /// Output asset ID for the entry being edited
     edit_output_asset_id: String,
+    /// VecF64 input values for the entry being edited.
+    /// Key is input index, value is (use_literal, literal_values, asset_id).
+    edit_vec_inputs: HashMap<usize, (bool, Vec<f64>, Option<String>)>,
     /// Whether to automatically rebuild the project when entries change
     auto_rebuild: bool,
 
@@ -999,6 +1002,7 @@ impl VolumetricApp {
             edit_lua_script: String::new(),
             edit_input_asset_ids: Vec::new(),
             edit_output_asset_id: String::new(),
+            edit_vec_inputs: HashMap::new(),
             auto_rebuild: true,
 
             ssao_enabled: true,
@@ -1600,6 +1604,30 @@ impl VolumetricApp {
                         // Blob inputs are not editable in the current UI
                         self.edit_input_asset_ids.push(None);
                     }
+                    OperatorMetadataInput::VecF64(dim) => {
+                        self.edit_input_asset_ids.push(None); // Placeholder for data inputs
+                        // Decode VecF64 input - raw bytes (8 bytes per f64, little-endian) or asset reference
+                        match input {
+                            Some(ExecutionInput::Inline(data)) => {
+                                // Decode raw bytes: each f64 is 8 little-endian bytes
+                                let values: Vec<f64> = data.chunks_exact(8)
+                                    .map(|chunk| {
+                                        let arr: [u8; 8] = chunk.try_into().unwrap();
+                                        f64::from_le_bytes(arr)
+                                    })
+                                    .collect();
+                                self.edit_vec_inputs.insert(input_idx, (true, values, None));
+                            }
+                            Some(ExecutionInput::AssetRef(id)) => {
+                                // Using asset reference
+                                self.edit_vec_inputs.insert(input_idx, (false, vec![0.0; *dim], Some(id.clone())));
+                            }
+                            None => {
+                                // No input, use default literal
+                                self.edit_vec_inputs.insert(input_idx, (true, vec![0.0; *dim], None));
+                            }
+                        }
+                    }
                 }
             }
         } else {
@@ -1630,6 +1658,7 @@ impl VolumetricApp {
         self.edit_lua_script.clear();
         self.edit_input_asset_ids.clear();
         self.edit_output_asset_id.clear();
+        self.edit_vec_inputs.clear();
     }
     
     /// Show the edit panel UI for the currently selected timeline step
@@ -1838,6 +1867,69 @@ impl VolumetricApp {
                             ui.label("Blob Input:");
                             ui.colored_label(egui::Color32::GRAY, "(Binary data - not editable)");
                         }
+                        OperatorMetadataInput::VecF64(dim) => {
+                            ui.separator();
+                            let label = match dim {
+                                3 => "Vector (X, Y, Z):",
+                                2 => "Vector (X, Y):",
+                                4 => "Vector (X, Y, Z, W):",
+                                _ => "Vector:",
+                            };
+                            ui.label(label);
+
+                            // Initialize if not present
+                            let entry = self.edit_vec_inputs.entry(input_idx)
+                                .or_insert((true, vec![0.0; *dim], None));
+
+                            ui.horizontal(|ui| {
+                                ui.radio_value(&mut entry.0, true, "Literal");
+                                ui.radio_value(&mut entry.0, false, "Asset");
+                            });
+
+                            if entry.0 {
+                                // Literal mode - show drag values
+                                ui.horizontal(|ui| {
+                                    let labels = ["X", "Y", "Z", "W"];
+                                    for (i, val) in entry.1.iter_mut().enumerate() {
+                                        if i < labels.len() {
+                                            ui.label(format!("{}:", labels[i]));
+                                        } else {
+                                            ui.label(format!("[{}]:", i));
+                                        }
+                                        ui.add(egui::DragValue::new(val));
+                                    }
+                                });
+                            } else {
+                                // Asset mode - show asset selector
+                                // Find compatible assets (VecF64 with matching dimension)
+                                let vec_asset_ids: Vec<String> = self.project.as_ref()
+                                    .map(|p| {
+                                        p.imports().iter()
+                                            .filter(|a| a.type_hint == Some(AssetTypeHint::VecF64(*dim)))
+                                            .map(|a| a.id.clone())
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+
+                                let selected = entry.2.as_deref().unwrap_or("(none)");
+                                egui::ComboBox::from_id_salt(format!("edit_vec_input_{input_idx}"))
+                                    .selected_text(selected)
+                                    .show_ui(ui, |ui| {
+                                        if ui.selectable_label(entry.2.is_none(), "(none)").clicked() {
+                                            entry.2 = None;
+                                        }
+                                        for id in &vec_asset_ids {
+                                            if ui.selectable_label(entry.2.as_ref() == Some(id), id).clicked() {
+                                                entry.2 = Some(id.clone());
+                                            }
+                                        }
+                                    });
+
+                                if vec_asset_ids.is_empty() {
+                                    ui.colored_label(egui::Color32::YELLOW, "(no compatible assets)");
+                                }
+                            }
+                        }
                     }
                 }
             } else {
@@ -1928,6 +2020,32 @@ impl VolumetricApp {
                             }
                         } else {
                             inputs.push(ExecutionInput::Inline(Vec::new()));
+                        }
+                    }
+                    OperatorMetadataInput::VecF64(dim) => {
+                        let input_idx = inputs.len();
+                        if let Some((use_literal, values, asset_ref)) = self.edit_vec_inputs.get(&input_idx) {
+                            if *use_literal {
+                                // Encode as raw bytes: each f64 as 8 little-endian bytes
+                                let bytes: Vec<u8> = values.iter()
+                                    .flat_map(|v| v.to_le_bytes())
+                                    .collect();
+                                inputs.push(ExecutionInput::Inline(bytes));
+                            } else if let Some(asset_id) = asset_ref {
+                                inputs.push(ExecutionInput::AssetRef(asset_id.clone()));
+                            } else {
+                                // No asset selected, use default literal
+                                let bytes: Vec<u8> = (0..*dim)
+                                    .flat_map(|_| 0.0_f64.to_le_bytes())
+                                    .collect();
+                                inputs.push(ExecutionInput::Inline(bytes));
+                            }
+                        } else {
+                            // No entry, use default literal
+                            let bytes: Vec<u8> = (0..*dim)
+                                .flat_map(|_| 0.0_f64.to_le_bytes())
+                                .collect();
+                            inputs.push(ExecutionInput::Inline(bytes));
                         }
                     }
                 }
@@ -2532,6 +2650,12 @@ impl eframe::App for VolumetricApp {
                     }
                     
                     ui.add_space(8.0);
+                    ui.label("Emitters");
+                    if ui.add(egui::Button::new("▭ Rectangular Prism").min_size(egui::vec2(btn_width, 28.0))).clicked() {
+                        operator_to_add = Some("rectangular_prism_operator");
+                    }
+
+                    ui.add_space(8.0);
                     ui.label("Advanced");
                     if ui.add(egui::Button::new("📜 Lua Script").min_size(egui::vec2(btn_width, 28.0))).clicked() {
                         operator_to_add = Some("lua_script_operator");
@@ -2604,6 +2728,13 @@ impl eframe::App for VolumetricApp {
                                                     // For now, just add empty bytes - the STL import is handled
                                                     // through the dedicated "Import STL" button instead
                                                     inputs.push(ExecutionInput::Inline(Vec::new()));
+                                                }
+                                                OperatorMetadataInput::VecF64(dim) => {
+                                                    // Default VecF64 values (zeros) as raw bytes
+                                                    let bytes: Vec<u8> = (0..*dim)
+                                                        .flat_map(|_| 0.0_f64.to_le_bytes())
+                                                        .collect();
+                                                    inputs.push(ExecutionInput::Inline(bytes));
                                                 }
                                             }
                                         }
