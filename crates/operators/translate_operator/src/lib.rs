@@ -45,7 +45,7 @@ struct TranslateConfig {
 
 impl Default for TranslateConfig {
     fn default() -> Self {
-        Self { dx: 1.0, dy: 0.0, dz: 0.0 }
+        Self { dx: 0.0, dy: 0.0, dz: 0.0 }
     }
 }
 
@@ -307,10 +307,10 @@ pub extern "C" fn run() {
 pub extern "C" fn get_metadata() -> i64 {
     static METADATA: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     let bytes = METADATA.get_or_init(|| {
-        let schema = "{ dx: float, dy: float, dz: float }".to_string();
+        let schema = "{ dx: float .default 0.0, dy: float .default 0.0, dz: float .default 0.0 }".to_string();
         let metadata = OperatorMetadata {
             name: "translate_operator".to_string(),
-            version: "0.1.0".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
             inputs: vec![
                 OperatorMetadataInput::ModelWASM,
                 OperatorMetadataInput::CBORConfiguration(schema),

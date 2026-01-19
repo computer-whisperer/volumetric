@@ -166,10 +166,10 @@ pub extern "C" fn run() {
 pub extern "C" fn get_metadata() -> i64 {
     static METADATA: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     let bytes = METADATA.get_or_init(|| {
-        let schema = "{ sx: float, sy: float, sz: float }".to_string();
+        let schema = "{ sx: float .default 1.0, sy: float .default 1.0, sz: float .default 1.0 }".to_string();
         let metadata = OperatorMetadata {
             name: "scale_operator".to_string(),
-            version: "0.1.0".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
             inputs: vec![
                 OperatorMetadataInput::ModelWASM,
                 OperatorMetadataInput::CBORConfiguration(schema),

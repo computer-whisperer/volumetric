@@ -732,7 +732,7 @@ pub extern "C" fn get_metadata() -> i64 {
                 .to_string();
         let metadata = OperatorMetadata {
             name: "heightmap_extrude_operator".to_string(),
-            version: "0.1.0".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
             inputs: vec![
                 OperatorMetadataInput::CBORConfiguration(schema),
                 OperatorMetadataInput::Blob,

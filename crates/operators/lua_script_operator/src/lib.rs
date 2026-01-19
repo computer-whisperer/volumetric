@@ -1450,7 +1450,7 @@ pub extern "C" fn get_metadata() -> i64 {
     let bytes = METADATA.get_or_init(|| {
         let metadata = OperatorMetadata {
             name: "lua_script_operator".to_string(),
-            version: "0.1.0".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
             inputs: vec![OperatorMetadataInput::LuaSource(LUA_TEMPLATE.to_string())],
             outputs: vec![OperatorMetadataOutput::ModelWASM],
         };

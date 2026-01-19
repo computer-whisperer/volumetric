@@ -535,10 +535,10 @@ pub extern "C" fn run() {
 pub extern "C" fn get_metadata() -> i64 {
     static METADATA: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     let bytes = METADATA.get_or_init(|| {
-        let schema = "{ op: \"union\" / \"subtract\" / \"intersect\" }".to_string();
+        let schema = "{ op: \"union\" / \"subtract\" / \"intersect\" .default \"union\" }".to_string();
         let metadata = OperatorMetadata {
             name: "boolean_operator".to_string(),
-            version: "0.1.0".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
             inputs: vec![
                 OperatorMetadataInput::ModelWASM,
                 OperatorMetadataInput::ModelWASM,
