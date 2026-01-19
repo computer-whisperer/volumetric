@@ -898,12 +898,16 @@ where
 
 /// Stage 1: Coarse Grid Discovery
 ///
-/// Samples the volume at low resolution (`base_resolution³` cells) to find
-/// regions containing the surface. Returns a work queue of mixed cells with
-/// their corner samples pre-filled.
+/// Samples the volume at low resolution to find regions containing the surface.
+/// Returns a work queue of mixed cells with their corner samples pre-filled.
+///
+/// The grid is expanded by 1 cell on each side beyond the model bounds to
+/// correctly handle models that perfectly fill their advertised bounding box.
+/// This ensures surface detection at boundaries where the model meets empty space.
 ///
 /// # Algorithm
-/// 1. Create a grid of (base_resolution + 1)³ sample points (corners)
+/// 1. Create an expanded grid of (base_resolution + 3)³ sample points
+///    - Covers cells from -1 to base_resolution (inclusive)
 /// 2. Sample all corner points to determine inside/outside state
 /// 3. For each cell, check if corners have mixed states (surface crosses cell)
 /// 4. Return WorkQueueEntry for each mixed cell with all 8 corners known
@@ -918,13 +922,25 @@ where
     F: SamplerFn,
 {
     let res = config.base_resolution;
-    let num_corners = res + 1;
 
-    // Cell size at depth 0 (coarsest level)
+    // Expand the grid by 1 cell on each side to detect surfaces at the boundary.
+    // This handles models that perfectly fill their advertised bounds.
+    // Grid now covers cells from -1 to res (inclusive), so res+2 cells per axis.
+    let expanded_cells = res + 2;
+    let num_corners = expanded_cells + 1; // res + 3 corners per axis
+
+    // Cell size at depth 0 (coarsest level) - based on original bounds
     let cell_size = (
         (bounds_max.0 - bounds_min.0) / res as f64,
         (bounds_max.1 - bounds_min.1) / res as f64,
         (bounds_max.2 - bounds_min.2) / res as f64,
+    );
+
+    // Expanded bounds: start one cell before bounds_min
+    let expanded_min = (
+        bounds_min.0 - cell_size.0,
+        bounds_min.1 - cell_size.1,
+        bounds_min.2 - cell_size.2,
     );
 
     // Sample all corner points into a 3D array
@@ -934,20 +950,21 @@ where
     for iz in 0..num_corners {
         for iy in 0..num_corners {
             for ix in 0..num_corners {
-                let x = bounds_min.0 + ix as f64 * cell_size.0;
-                let y = bounds_min.1 + iy as f64 * cell_size.1;
-                let z = bounds_min.2 + iz as f64 * cell_size.2;
+                let x = expanded_min.0 + ix as f64 * cell_size.0;
+                let y = expanded_min.1 + iy as f64 * cell_size.1;
+                let z = expanded_min.2 + iz as f64 * cell_size.2;
                 corners[iz][iy][ix] = sample_is_inside(sampler, x, y, z, stats);
             }
         }
     }
 
     // Find mixed cells and create work queue entries
+    // Cell indices now go from -1 to res (i.e., 0..expanded_cells in array coords)
     let mut work_queue = Vec::new();
 
-    for iz in 0..res {
-        for iy in 0..res {
-            for ix in 0..res {
+    for iz in 0..expanded_cells {
+        for iy in 0..expanded_cells {
+            for ix in 0..expanded_cells {
                 // Gather the 8 corner samples for this cell using canonical corner ordering
                 let cell_corners: [bool; 8] = [
                     corners[iz][iy][ix],         // corner 0: (0,0,0)
@@ -963,7 +980,8 @@ where
                 let mask = CornerMask::from_bools(cell_corners);
 
                 if mask.is_mixed() {
-                    let cuboid = CuboidId::new(ix as i32, iy as i32, iz as i32, 0);
+                    // CuboidId uses actual grid coordinates: -1 to res
+                    let cuboid = CuboidId::new(ix as i32 - 1, iy as i32 - 1, iz as i32 - 1, 0);
                     let known_corners = cell_corners.map(Some);
                     work_queue.push(WorkQueueEntry::with_corners(cuboid, known_corners));
                 }
@@ -2946,11 +2964,13 @@ mod tests {
             &stats,
         );
 
-        let expected_samples = 5 * 5 * 5; // (base_resolution + 1)³
+        // With expanded grid: (base_resolution + 3)³ corners
+        // base_resolution=4 -> (4+3)³ = 7³ = 343 corners
+        let expected_samples = 7 * 7 * 7;
         assert_eq!(
             stats.total_samples.load(Ordering::Relaxed),
             expected_samples,
-            "Should sample exactly (base_resolution + 1)³ corner points"
+            "Should sample exactly (base_resolution + 3)³ corner points (expanded grid)"
         );
     }
 
@@ -3031,12 +3051,12 @@ mod tests {
         // Create a sampler that returns different values based on position
         // to verify the corners are correctly indexed
         let config = AdaptiveMeshConfig2 {
-            base_resolution: 1, // Single cell
+            base_resolution: 1, // Single cell (with expanded grid: cells from -1 to 1)
             ..Default::default()
         };
         let stats = SamplingStats::default();
 
-        // Sampler: inside only if x > 0.5 (so corners 1, 3, 5, 7 are inside)
+        // Sampler: inside only if x > 0.5 (so corners 1, 3, 5, 7 are inside for cell at origin)
         let half_space = |x: f64, _y: f64, _z: f64| -> f32 {
             if x > 0.5 { 1.0 } else { 0.0 }
         };
@@ -3049,9 +3069,13 @@ mod tests {
             &stats,
         );
 
-        assert_eq!(work_queue.len(), 1, "Should find exactly one mixed cell");
+        // With expanded grid, multiple cells will be mixed where x=0.5 plane crosses
+        // Find the cell at position (0, 0, 0) which is the "original" cell
+        let entry = work_queue
+            .iter()
+            .find(|e| e.cuboid.x == 0 && e.cuboid.y == 0 && e.cuboid.z == 0)
+            .expect("Should find the cell at (0,0,0)");
 
-        let entry = &work_queue[0];
         let corners = entry.known_corners;
 
         // Corners with x=1 should be inside (corners 1, 3, 5, 7)
