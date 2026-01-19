@@ -197,6 +197,7 @@ enum InputInfo {
     CborConfiguration { cddl: String },
     LuaSource { template: String },
     VecF64 { dimension: usize },
+    Blob,
 }
 
 #[derive(Debug, Serialize)]
@@ -237,6 +238,7 @@ fn metadata_to_json(meta: &OperatorMetadata) -> OperatorMetadataJson {
                 OperatorMetadataInput::VecF64(dim) => InputInfo::VecF64 {
                     dimension: *dim,
                 },
+                OperatorMetadataInput::Blob => InputInfo::Blob,
             })
             .collect(),
         outputs: meta
@@ -342,6 +344,9 @@ fn print_info_human(output: &InfoOutput) {
                     }
                     InputInfo::VecF64 { dimension } => {
                         println!("  [{}] VecF64({})", i, dimension);
+                    }
+                    InputInfo::Blob => {
+                        println!("  [{}] Blob (binary data)", i);
                     }
                 }
             }
