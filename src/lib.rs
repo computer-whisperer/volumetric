@@ -202,6 +202,11 @@ pub enum OperatorMetadataInput {
     /// The host UI displays a multiline text editor pre-populated with this template.
     /// The script is passed as UTF-8 bytes to the operator.
     LuaSource(String),
+    /// Raw binary data input (e.g., STL file data).
+    ///
+    /// The host UI should display a file picker allowing the user to select a file.
+    /// The file contents are passed as raw bytes to the operator.
+    Blob,
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]

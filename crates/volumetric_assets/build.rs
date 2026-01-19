@@ -23,6 +23,7 @@ const OPERATORS: &[(&str, &str)] = &[
     ("rotation_operator", "Rotation"),
     ("scale_operator", "Scale"),
     ("lua_script_operator", "Lua Script"),
+    ("stl_import_operator", "STL Import"),
 ];
 
 fn main() {

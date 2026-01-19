@@ -884,6 +884,12 @@ pub struct VolumetricApp {
     /// Pending project load (web only)
     #[cfg(target_arch = "wasm32")]
     pending_project_load: Option<Promise<Option<Vec<u8>>>>,
+    /// Pending STL file import (web only)
+    #[cfg(target_arch = "wasm32")]
+    pending_stl_import: Option<Promise<Option<Vec<u8>>>>,
+    /// Pending STL file data for operator input (native only, on web it's handled via Promise)
+    #[cfg(not(target_arch = "wasm32"))]
+    pending_stl_data: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1010,6 +1016,10 @@ impl VolumetricApp {
             pending_wasm_import: None,
             #[cfg(target_arch = "wasm32")]
             pending_project_load: None,
+            #[cfg(target_arch = "wasm32")]
+            pending_stl_import: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            pending_stl_data: None,
         }
     }
 
@@ -1249,6 +1259,91 @@ impl VolumetricApp {
         } else {
             self.last_evaluation_time = None;
         }
+    }
+
+    /// Processes an STL file import by running the stl_import_operator
+    fn process_stl_import(&mut self, stl_bytes: Vec<u8>) {
+        // Get the stl_import_operator WASM
+        let op_wasm = if let Some(bytes) = get_bundled_operator("stl_import_operator") {
+            bytes.to_vec()
+        } else {
+            // Filesystem fallback for native debug builds only
+            #[cfg(all(not(target_arch = "wasm32"), debug_assertions))]
+            {
+                if let Some(path) = operation_wasm_path("stl_import_operator") {
+                    match fs::read(&path) {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            self.error_message = Some(format!("Failed to read STL import operator: {}", e));
+                            return;
+                        }
+                    }
+                } else {
+                    self.error_message = Some(
+                        "STL Import operator not found. Build it first with: cargo build --release --target wasm32-unknown-unknown -p stl_import_operator".to_string()
+                    );
+                    return;
+                }
+            }
+
+            #[cfg(any(target_arch = "wasm32", not(debug_assertions)))]
+            {
+                self.error_message = Some("STL Import operator not bundled. Rebuild with WASM assets available.".to_string());
+                return;
+            }
+        };
+
+        // Create project if needed
+        if self.project.is_none() {
+            self.project = Some(Project::new());
+        }
+
+        // Generate output name for the imported model
+        let output_id = self.project.as_ref()
+            .map(|p| p.default_output_name("stl_import", None))
+            .unwrap_or_else(|| "stl_model".to_string());
+
+        // Build inputs: [Blob (STL data), CBORConfiguration (default config)]
+        let default_config = {
+            // Encode default config: { scale: 1.0, translate: [0,0,0], center: false }
+            let mut cbor_bytes = Vec::new();
+            let config_map = ciborium::value::Value::Map(vec![
+                (ciborium::value::Value::Text("scale".to_string()), ciborium::value::Value::Float(1.0)),
+                (ciborium::value::Value::Text("translate".to_string()), ciborium::value::Value::Array(vec![
+                    ciborium::value::Value::Float(0.0),
+                    ciborium::value::Value::Float(0.0),
+                    ciborium::value::Value::Float(0.0),
+                ])),
+                (ciborium::value::Value::Text("center".to_string()), ciborium::value::Value::Bool(false)),
+            ]);
+            ciborium::into_writer(&config_map, &mut cbor_bytes).ok();
+            cbor_bytes
+        };
+
+        let inputs = vec![
+            ExecutionInput::Inline(stl_bytes),      // Blob: STL data
+            ExecutionInput::Inline(default_config), // CBORConfiguration
+        ];
+
+        let output_ids = vec![output_id.clone()];
+
+        if let Some(ref mut project) = self.project {
+            project.insert_operation(
+                "op_stl_import_operator",
+                op_wasm,
+                inputs,
+                output_ids,
+                output_id,
+            );
+        }
+
+        // Clear the project path since we modified the project
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.project_path = None;
+        }
+
+        self.run_project();
     }
 
     /// Resamples all assets that need resampling (in background)
@@ -1501,6 +1596,10 @@ impl VolumetricApp {
                             }
                         }
                     }
+                    OperatorMetadataInput::Blob => {
+                        // Blob inputs are not editable in the current UI
+                        self.edit_input_asset_ids.push(None);
+                    }
                 }
             }
         } else {
@@ -1734,6 +1833,11 @@ impl VolumetricApp {
                                 self.edit_lua_script = template.clone();
                             }
                         }
+                        OperatorMetadataInput::Blob => {
+                            ui.separator();
+                            ui.label("Blob Input:");
+                            ui.colored_label(egui::Color32::GRAY, "(Binary data - not editable)");
+                        }
                     }
                 }
             } else {
@@ -1808,6 +1912,23 @@ impl VolumetricApp {
                     OperatorMetadataInput::LuaSource(_) => {
                         let script_bytes = self.edit_lua_script.as_bytes().to_vec();
                         inputs.push(ExecutionInput::Inline(script_bytes));
+                    }
+                    OperatorMetadataInput::Blob => {
+                        // Keep existing blob data (not editable)
+                        // We need to preserve the original inline data from the step
+                        if let Some(ref project) = self.project {
+                            if let Some(step) = project.timeline().get(idx) {
+                                if let Some(ExecutionInput::Inline(data)) = step.inputs.get(inputs.len()) {
+                                    inputs.push(ExecutionInput::Inline(data.clone()));
+                                } else {
+                                    inputs.push(ExecutionInput::Inline(Vec::new()));
+                                }
+                            } else {
+                                inputs.push(ExecutionInput::Inline(Vec::new()));
+                            }
+                        } else {
+                            inputs.push(ExecutionInput::Inline(Vec::new()));
+                        }
                     }
                 }
             }
@@ -1917,10 +2038,27 @@ impl eframe::App for VolumetricApp {
                 }
             }
 
+            // Poll pending STL import
+            if let Some(ref promise) = self.pending_stl_import {
+                if let Some(result) = promise.ready() {
+                    let result = result.clone();
+                    self.pending_stl_import = None;
+                    if let Some(stl_bytes) = result {
+                        self.process_stl_import(stl_bytes);
+                    }
+                }
+            }
+
             // Request repaint while async operations are pending
-            if self.pending_wasm_import.is_some() || self.pending_project_load.is_some() {
+            if self.pending_wasm_import.is_some() || self.pending_project_load.is_some() || self.pending_stl_import.is_some() {
                 ctx.request_repaint();
             }
+        }
+
+        // Process pending STL import (native)
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(stl_bytes) = self.pending_stl_data.take() {
+            self.process_stl_import(stl_bytes);
         }
 
         // Request continuous repaints while background tasks are running
@@ -2284,6 +2422,48 @@ impl eframe::App for VolumetricApp {
                                     }));
                                 }
                             }
+
+                            ui.add_space(4.0);
+
+                            // Import STL file (native version)
+                            #[cfg(not(target_arch = "wasm32"))]
+                            if ui
+                                .add(egui::Button::new("📐 Import STL…").min_size(egui::vec2(btn_width, 28.0)))
+                                .clicked()
+                            {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("STL", &["stl"])
+                                    .pick_file()
+                                {
+                                    match fs::read(&path) {
+                                        Ok(stl_bytes) => {
+                                            self.pending_stl_data = Some(stl_bytes);
+                                        }
+                                        Err(e) => {
+                                            self.error_message =
+                                                Some(format!("Failed to read STL file: {}", e));
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Import STL file (web version using async file picker)
+                            #[cfg(target_arch = "wasm32")]
+                            {
+                                let is_picking = self.pending_stl_import.is_some();
+                                if ui
+                                    .add_enabled(!is_picking, egui::Button::new(if is_picking { "⏳ Picking…" } else { "📐 Import STL…" }).min_size(egui::vec2(btn_width, 28.0)))
+                                    .clicked()
+                                {
+                                    self.pending_stl_import = Some(Promise::spawn_local(async {
+                                        let file = rfd::AsyncFileDialog::new()
+                                            .add_filter("STL", &["stl"])
+                                            .pick_file()
+                                            .await?;
+                                        Some(file.read().await)
+                                    }));
+                                }
+                            }
                         });
                 // ═══════════════════════════════════════════════════════════════
                 // TOOLBOX PANEL - Operators Section
@@ -2418,6 +2598,12 @@ impl eframe::App for VolumetricApp {
                                                 OperatorMetadataInput::LuaSource(_) => {
                                                     let script_bytes = app.operation_lua_script.as_bytes().to_vec();
                                                     inputs.push(ExecutionInput::Inline(script_bytes));
+                                                }
+                                                OperatorMetadataInput::Blob => {
+                                                    // Blob inputs should be handled specially (via file picker)
+                                                    // For now, just add empty bytes - the STL import is handled
+                                                    // through the dedicated "Import STL" button instead
+                                                    inputs.push(ExecutionInput::Inline(Vec::new()));
                                                 }
                                             }
                                         }

@@ -140,6 +140,11 @@ fn parse_input(s: &str) -> Result<ExecutionInput> {
         ciborium::into_writer(&json_value, &mut cbor_bytes)
             .context("Failed to convert JSON to CBOR")?;
         Ok(ExecutionInput::Inline(cbor_bytes))
+    } else if let Some(rest) = s.strip_prefix("file:") {
+        // Read raw bytes from file
+        let bytes = std::fs::read(rest)
+            .with_context(|| format!("Failed to read file: {}", rest))?;
+        Ok(ExecutionInput::Inline(bytes))
     } else if let Some(rest) = s.strip_prefix("data:") {
         // Assume base64 encoded data
         use base64::{engine::general_purpose::STANDARD, Engine};
