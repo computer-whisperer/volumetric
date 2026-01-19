@@ -1960,6 +1960,73 @@ where
     (refined, outcome)
 }
 
+/// Find a surface point along a given direction with fallbacks.
+///
+/// Used to refine crossing vertex positions to the actual surface.
+/// Unlike find_surface_point_along_direction (which only tries one direction),
+/// this function tries cardinal axes as fallback if the primary direction fails.
+///
+/// Returns Some(position) if a surface crossing is found and refined,
+/// or None if no crossing is found along any direction.
+fn find_surface_point_with_fallbacks<F>(
+    initial_pos: (f64, f64, f64),
+    search_dir: (f64, f64, f64),
+    search_distance: f64,
+    iterations: usize,
+    sampler: &F,
+    stats: &SamplingStats,
+) -> Option<(f64, f64, f64)>
+where
+    F: SamplerFn,
+{
+    // Sample at the initial position to determine which side we're on
+    let initial_inside = sample_is_inside(sampler, initial_pos.0, initial_pos.1, initial_pos.2, stats);
+
+    // Normalize primary search direction
+    let dir_len_sq = search_dir.0 * search_dir.0
+        + search_dir.1 * search_dir.1
+        + search_dir.2 * search_dir.2;
+
+    if dir_len_sq >= 1e-12 {
+        let inv_len = 1.0 / dir_len_sq.sqrt();
+        let dir = (
+            search_dir.0 * inv_len,
+            search_dir.1 * inv_len,
+            search_dir.2 * inv_len,
+        );
+
+        // Try primary direction first
+        if let Some((a, b, inside_a)) = find_crossing_along_direction(
+            initial_pos,
+            dir,
+            search_distance,
+            sampler,
+            stats,
+            initial_inside,
+        ) {
+            let refined = binary_search_crossing(a, b, inside_a, iterations, sampler, stats);
+            return Some(refined);
+        }
+    }
+
+    // No crossing found - try cardinal axes as fallback
+    let fallback_dirs = [(1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)];
+    for dir in &fallback_dirs {
+        if let Some((a, b, inside_a)) = find_crossing_along_direction(
+            initial_pos,
+            *dir,
+            search_distance,
+            sampler,
+            stats,
+            initial_inside,
+        ) {
+            let refined = binary_search_crossing(a, b, inside_a, iterations, sampler, stats);
+            return Some(refined);
+        }
+    }
+    None
+}
+
 // =============================================================================
 // NORMAL REFINEMENT VIA TANGENT PLANE PROBING
 // =============================================================================
@@ -2454,18 +2521,58 @@ where
     // Compute tangent basis
     let (t1, t2) = orthonormal_basis_perpendicular_to(n);
 
-    // Collect surface points for plane fitting
+    // =========================================================================
+    // PHASE 1: Initial 4-probe detection (cheap)
+    // =========================================================================
     let mut surface_points: Vec<(f64, f64, f64)> = vec![surface_pos];
 
-    // Probe directions: ±T1, ±T2
-    let probe_dirs = [
+    // Cardinal probe directions: ±T1, ±T2
+    let cardinal_dirs = [
         (t1.0, t1.1, t1.2),
         (-t1.0, -t1.1, -t1.2),
         (t2.0, t2.1, t2.2),
         (-t2.0, -t2.1, -t2.2),
     ];
 
-    for dir in probe_dirs.iter() {
+    for dir in cardinal_dirs.iter() {
+        let probe_pos = (
+            surface_pos.0 + dir.0 * probe_epsilon,
+            surface_pos.1 + dir.1 * probe_epsilon,
+            surface_pos.2 + dir.2 * probe_epsilon,
+        );
+
+        if let Some(found) = find_surface_point_along_direction(
+            probe_pos,
+            n,
+            search_distance,
+            binary_search_iterations,
+            sampler,
+            stats,
+        ) {
+            surface_points.push(found);
+        }
+    }
+
+    // =========================================================================
+    // PHASE 2: Add more probes for sharp edge detection
+    // =========================================================================
+    // Use 12 additional probe directions (at 30° intervals, skipping cardinals)
+    // This gives 16 total probes for reliable clustering
+    let additional_dirs: Vec<(f64, f64, f64)> = (1..12)
+        .filter(|i| i % 3 != 0) // Skip 90° intervals (already have cardinals)
+        .map(|i| {
+            let angle = (i as f64) * std::f64::consts::PI / 6.0; // 30° increments
+            let cos_a = angle.cos();
+            let sin_a = angle.sin();
+            (
+                t1.0 * cos_a + t2.0 * sin_a,
+                t1.1 * cos_a + t2.1 * sin_a,
+                t1.2 * cos_a + t2.2 * sin_a,
+            )
+        })
+        .collect();
+
+    for dir in additional_dirs.iter() {
         let probe_pos = (
             surface_pos.0 + dir.0 * probe_epsilon,
             surface_pos.1 + dir.1 * probe_epsilon,
@@ -2497,75 +2604,83 @@ where
         );
     }
 
-    // Fit plane to get measurement normal and residual
-    let (fitted_normal, residual) = fit_plane_to_points(&surface_points);
-
-    // Orient fitted normal to match prior direction
-    let dot = fitted_normal.0 * n.0 + fitted_normal.1 * n.1 + fitted_normal.2 * n.2;
+    // =========================================================================
+    // PHASE 3: Try clustering with available points
+    // =========================================================================
+    // Fit single plane first to measure baseline residual
+    let (single_normal, single_residual) = fit_plane_to_points(&surface_points);
+    let dot = single_normal.0 * n.0 + single_normal.1 * n.1 + single_normal.2 * n.2;
     let measured = if dot < 0.0 {
-        (-fitted_normal.0, -fitted_normal.1, -fitted_normal.2)
+        (-single_normal.0, -single_normal.1, -single_normal.2)
     } else {
-        fitted_normal
+        single_normal
     };
 
-    // Check residual threshold for sharp edge detection
-    let num_points = surface_points.len() as f64;
-    let base_threshold = probe_epsilon * probe_epsilon * num_points;
-    let sharp_threshold = base_threshold * sharp_config.residual_multiplier;
-
-    // Case 1: High residual indicates vertex straddles a sharp edge
-    if residual > sharp_threshold && surface_points.len() >= 4 {
+    // Try clustering and check if it produces significant improvement (ratio-based criterion)
+    // This matches the reference method's approach
+    if surface_points.len() >= 6 {
         // Try to cluster points into two groups
         if let Some((cluster_a, cluster_b)) = cluster_points_two(&surface_points) {
-            // Need at least 3 points per cluster for plane fitting
+            // Require at least 3 points per cluster for reliable plane fitting
             if cluster_a.len() >= 3 && cluster_b.len() >= 3 {
                 let (normal_a, residual_a) = fit_plane_to_points(&cluster_a);
                 let (normal_b, residual_b) = fit_plane_to_points(&cluster_b);
 
-                // Check that both fits are good (low residual per cluster)
+                // Compute improvement ratio: how much better is 2-plane fit vs 1-plane fit?
+                let combined_residual = residual_a + residual_b;
+                let improvement = single_residual / (combined_residual + 1e-12);
+
+                // Check individual cluster fit quality
                 let cluster_a_threshold = probe_epsilon * probe_epsilon * cluster_a.len() as f64;
                 let cluster_b_threshold = probe_epsilon * probe_epsilon * cluster_b.len() as f64;
 
-                if residual_a < cluster_a_threshold * 2.0 && residual_b < cluster_b_threshold * 2.0 {
-                    // Orient normals consistently (toward the original normal direction)
-                    let dot_a = normal_a.0 * n.0 + normal_a.1 * n.1 + normal_a.2 * n.2;
-                    let dot_b = normal_b.0 * n.0 + normal_b.1 * n.1 + normal_b.2 * n.2;
+                // Orient normals consistently (toward the original normal direction)
+                let dot_a = normal_a.0 * n.0 + normal_a.1 * n.1 + normal_a.2 * n.2;
+                let dot_b = normal_b.0 * n.0 + normal_b.1 * n.1 + normal_b.2 * n.2;
 
-                    let normal_a = if dot_a < 0.0 {
-                        (-normal_a.0, -normal_a.1, -normal_a.2)
-                    } else {
-                        normal_a
-                    };
-                    let normal_b = if dot_b < 0.0 {
-                        (-normal_b.0, -normal_b.1, -normal_b.2)
-                    } else {
-                        normal_b
-                    };
+                let normal_a = if dot_a < 0.0 {
+                    (-normal_a.0, -normal_a.1, -normal_a.2)
+                } else {
+                    normal_a
+                };
+                let normal_b = if dot_b < 0.0 {
+                    (-normal_b.0, -normal_b.1, -normal_b.2)
+                } else {
+                    normal_b
+                };
 
-                    // Check that the two normals are significantly different
-                    let dot_ab = normal_a.0 * normal_b.0 + normal_a.1 * normal_b.1 + normal_a.2 * normal_b.2;
-                    let angle_between = dot_ab.clamp(-1.0, 1.0).acos();
+                // Check angle between normals
+                let dot_ab = normal_a.0 * normal_b.0 + normal_a.1 * normal_b.1 + normal_a.2 * normal_b.2;
+                let angle_between = dot_ab.clamp(-1.0, 1.0).acos();
 
-                    if angle_between > sharp_config.angle_threshold {
-                        // This is a sharp edge! Compute intersection line
-                        let new_pos = project_to_plane_intersection(
-                            surface_pos,
-                            &cluster_a,
+                // Sharp edge criteria (matching reference method):
+                // 1. Clustering improves fit by at least 2x
+                // 2. Angle between normals exceeds threshold
+                // 3. Individual cluster fits are reasonably good
+                let is_sharp = improvement > 2.0
+                    && angle_between > sharp_config.angle_threshold
+                    && residual_a < cluster_a_threshold * 3.0
+                    && residual_b < cluster_b_threshold * 3.0;
+
+                if is_sharp {
+                    // This is a sharp edge! Compute intersection line
+                    let new_pos = project_to_plane_intersection(
+                        surface_pos,
+                        &cluster_a,
+                        normal_a,
+                        &cluster_b,
+                        normal_b,
+                    );
+
+                    return (
+                        normal_a,
+                        new_pos,
+                        VertexSharpInfo {
+                            is_sharp: true,
                             normal_a,
-                            &cluster_b,
-                            normal_b,
-                        );
-
-                        return (
-                            normal_a,
-                            new_pos,
-                            VertexSharpInfo {
-                                is_sharp: true,
-                                normal_a,
-                                normal_b: Some(normal_b),
-                            },
-                        );
-                    }
+                            normal_b: Some(normal_b),
+                        },
+                    );
                 }
             }
         }
@@ -2576,8 +2691,11 @@ where
     let position_error = search_distance / (1u64 << binary_search_iterations) as f64;
     let measurement_sigma = position_error / probe_epsilon;
 
+    // Use the single-plane residual to adjust measurement uncertainty
+    let num_points = surface_points.len() as f64;
+    let base_threshold = probe_epsilon * probe_epsilon * num_points;
     let residual_threshold = base_threshold * 4.0;
-    let residual_factor = if residual > residual_threshold { 10.0 } else { 1.0 };
+    let residual_factor = if single_residual > residual_threshold { 10.0 } else { 1.0 };
     let adjusted_measurement_sigma = measurement_sigma * residual_factor;
 
     let prior_weight = 1.0 / (prior_sigma * prior_sigma);
@@ -2607,115 +2725,123 @@ where
     )
 }
 
-/// Cluster points into two groups using k-means with k=2.
+/// Cluster points into two groups for sharp edge detection.
 ///
-/// Uses the probe points to identify two distinct surfaces meeting at an edge.
-/// Returns None if clustering fails or results in degenerate clusters.
+/// Tries multiple splitting strategies and returns the best one:
+/// 1. Split by fitted plane normal
+/// 2. Split by principal component direction
+/// 3. Split by largest point-pair separation
+///
+/// Returns the partition that gives the best 2-plane fit (lowest combined residual).
 fn cluster_points_two(points: &[(f64, f64, f64)]) -> Option<(Vec<(f64, f64, f64)>, Vec<(f64, f64, f64)>)> {
     if points.len() < 4 {
         return None;
     }
 
-    // Initialize centroids: use the two points furthest apart
-    let mut max_dist_sq = 0.0;
-    let mut c1_idx = 0;
-    let mut c2_idx = 1;
+    // Compute centroid (first point is typically the surface vertex)
+    let center = points[0];
 
-    for i in 0..points.len() {
-        for j in (i + 1)..points.len() {
-            let dx = points[i].0 - points[j].0;
-            let dy = points[i].1 - points[j].1;
-            let dz = points[i].2 - points[j].2;
-            let dist_sq = dx * dx + dy * dy + dz * dz;
-            if dist_sq > max_dist_sq {
-                max_dist_sq = dist_sq;
-                c1_idx = i;
-                c2_idx = j;
+    // Try multiple splitting directions and pick the best
+    let mut best_partition: Option<(Vec<(f64, f64, f64)>, Vec<(f64, f64, f64)>, f64)> = None;
+
+    // Strategy 1: Use fitted plane normal
+    let (fitted_normal, _) = fit_plane_to_points(points);
+    if let Some((ca, cb, score)) = try_split_by_direction(points, center, fitted_normal) {
+        best_partition = Some((ca, cb, score));
+    }
+
+    // Strategy 2: Try cardinal directions
+    for dir in &[(1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)] {
+        if let Some((ca, cb, score)) = try_split_by_direction(points, center, *dir) {
+            if best_partition.is_none() || score < best_partition.as_ref().unwrap().2 {
+                best_partition = Some((ca, cb, score));
             }
         }
     }
 
-    let mut centroid_a = points[c1_idx];
-    let mut centroid_b = points[c2_idx];
-
-    // K-means iterations
-    for _ in 0..10 {
-        // Assign points to nearest centroid
-        let mut cluster_a: Vec<(f64, f64, f64)> = Vec::new();
-        let mut cluster_b: Vec<(f64, f64, f64)> = Vec::new();
-
-        for &p in points {
-            let da = (p.0 - centroid_a.0).powi(2)
-                + (p.1 - centroid_a.1).powi(2)
-                + (p.2 - centroid_a.2).powi(2);
-            let db = (p.0 - centroid_b.0).powi(2)
-                + (p.1 - centroid_b.1).powi(2)
-                + (p.2 - centroid_b.2).powi(2);
-
-            if da <= db {
-                cluster_a.push(p);
-            } else {
-                cluster_b.push(p);
+    // Strategy 3: Find direction of maximum spread
+    // Compute vectors from center to each other point, find the one with max length
+    let mut max_len_sq = 0.0;
+    let mut max_dir = (1.0, 0.0, 0.0);
+    for p in &points[1..] {
+        let v = (p.0 - center.0, p.1 - center.1, p.2 - center.2);
+        let len_sq = v.0 * v.0 + v.1 * v.1 + v.2 * v.2;
+        if len_sq > max_len_sq {
+            max_len_sq = len_sq;
+            let len = len_sq.sqrt();
+            if len > 1e-12 {
+                max_dir = (v.0 / len, v.1 / len, v.2 / len);
             }
         }
-
-        // Check for degenerate clusters
-        if cluster_a.is_empty() || cluster_b.is_empty() {
-            return None;
-        }
-
-        // Update centroids
-        let new_centroid_a = (
-            cluster_a.iter().map(|p| p.0).sum::<f64>() / cluster_a.len() as f64,
-            cluster_a.iter().map(|p| p.1).sum::<f64>() / cluster_a.len() as f64,
-            cluster_a.iter().map(|p| p.2).sum::<f64>() / cluster_a.len() as f64,
-        );
-        let new_centroid_b = (
-            cluster_b.iter().map(|p| p.0).sum::<f64>() / cluster_b.len() as f64,
-            cluster_b.iter().map(|p| p.1).sum::<f64>() / cluster_b.len() as f64,
-            cluster_b.iter().map(|p| p.2).sum::<f64>() / cluster_b.len() as f64,
-        );
-
-        // Check for convergence
-        let delta_a = (new_centroid_a.0 - centroid_a.0).powi(2)
-            + (new_centroid_a.1 - centroid_a.1).powi(2)
-            + (new_centroid_a.2 - centroid_a.2).powi(2);
-        let delta_b = (new_centroid_b.0 - centroid_b.0).powi(2)
-            + (new_centroid_b.1 - centroid_b.1).powi(2)
-            + (new_centroid_b.2 - centroid_b.2).powi(2);
-
-        centroid_a = new_centroid_a;
-        centroid_b = new_centroid_b;
-
-        if delta_a < 1e-12 && delta_b < 1e-12 {
-            break;
+    }
+    if let Some((ca, cb, score)) = try_split_by_direction(points, center, max_dir) {
+        if best_partition.is_none() || score < best_partition.as_ref().unwrap().2 {
+            best_partition = Some((ca, cb, score));
         }
     }
 
-    // Final clustering
+    // Strategy 4: Cross product of two displacement vectors (perpendicular direction)
+    if points.len() >= 3 {
+        let v1 = (points[1].0 - center.0, points[1].1 - center.1, points[1].2 - center.2);
+        let v2 = (points[2].0 - center.0, points[2].1 - center.1, points[2].2 - center.2);
+        let cross = (
+            v1.1 * v2.2 - v1.2 * v2.1,
+            v1.2 * v2.0 - v1.0 * v2.2,
+            v1.0 * v2.1 - v1.1 * v2.0,
+        );
+        let cross_len = (cross.0 * cross.0 + cross.1 * cross.1 + cross.2 * cross.2).sqrt();
+        if cross_len > 1e-12 {
+            let cross_dir = (cross.0 / cross_len, cross.1 / cross_len, cross.2 / cross_len);
+            if let Some((ca, cb, score)) = try_split_by_direction(points, center, cross_dir) {
+                if best_partition.is_none() || score < best_partition.as_ref().unwrap().2 {
+                    best_partition = Some((ca, cb, score));
+                }
+            }
+        }
+    }
+
+    best_partition.map(|(ca, cb, _)| (ca, cb))
+}
+
+/// Try to split points using a given direction.
+/// Returns (cluster_a, cluster_b, combined_residual) if successful.
+fn try_split_by_direction(
+    points: &[(f64, f64, f64)],
+    center: (f64, f64, f64),
+    dir: (f64, f64, f64),
+) -> Option<(Vec<(f64, f64, f64)>, Vec<(f64, f64, f64)>, f64)> {
+    // Compute signed distance from plane through center with given normal
+    let signed_distances: Vec<f64> = points
+        .iter()
+        .map(|p| {
+            let v = (p.0 - center.0, p.1 - center.1, p.2 - center.2);
+            v.0 * dir.0 + v.1 * dir.1 + v.2 * dir.2
+        })
+        .collect();
+
+    // Partition by sign
     let mut cluster_a: Vec<(f64, f64, f64)> = Vec::new();
     let mut cluster_b: Vec<(f64, f64, f64)> = Vec::new();
 
-    for &p in points {
-        let da = (p.0 - centroid_a.0).powi(2)
-            + (p.1 - centroid_a.1).powi(2)
-            + (p.2 - centroid_a.2).powi(2);
-        let db = (p.0 - centroid_b.0).powi(2)
-            + (p.1 - centroid_b.1).powi(2)
-            + (p.2 - centroid_b.2).powi(2);
-
-        if da <= db {
+    for (i, &p) in points.iter().enumerate() {
+        if signed_distances[i] >= 0.0 {
             cluster_a.push(p);
         } else {
             cluster_b.push(p);
         }
     }
 
-    if cluster_a.len() >= 2 && cluster_b.len() >= 2 {
-        Some((cluster_a, cluster_b))
-    } else {
-        None
+    // Need at least 3 points in each cluster for plane fitting
+    if cluster_a.len() < 3 || cluster_b.len() < 3 {
+        return None;
     }
+
+    // Compute combined residual as quality metric
+    let (_, residual_a) = fit_plane_to_points(&cluster_a);
+    let (_, residual_b) = fit_plane_to_points(&cluster_b);
+    let combined_residual = residual_a + residual_b;
+
+    Some((cluster_a, cluster_b, combined_residual))
 }
 
 /// Project a point onto the intersection line of two planes.
@@ -2866,20 +2992,37 @@ fn detect_edge_crossings(
         let angle = dot_clamped.acos();
 
         if angle > config.angle_threshold {
-            // Find crossing point using plane intersection
-            let t = find_crossing_t(vertices[v0_idx], n0, vertices[v1_idx], n1);
-            let t_clamped = t.clamp(0.0, 1.0);
-
-            let position = (
-                vertices[v0_idx].0 + t_clamped * (vertices[v1_idx].0 - vertices[v0_idx].0),
-                vertices[v0_idx].1 + t_clamped * (vertices[v1_idx].1 - vertices[v0_idx].1),
-                vertices[v0_idx].2 + t_clamped * (vertices[v1_idx].2 - vertices[v0_idx].2),
+            // Compute crossing position on the geometric sharp edge (plane intersection)
+            let position = compute_edge_crossing_position(
+                vertices[v0_idx],
+                n0,
+                vertices[v1_idx],
+                n1,
             );
+
+            // Compute t for reference (approximate position along mesh edge)
+            let edge_vec = (
+                vertices[v1_idx].0 - vertices[v0_idx].0,
+                vertices[v1_idx].1 - vertices[v0_idx].1,
+                vertices[v1_idx].2 - vertices[v0_idx].2,
+            );
+            let edge_len_sq = edge_vec.0 * edge_vec.0 + edge_vec.1 * edge_vec.1 + edge_vec.2 * edge_vec.2;
+            let t = if edge_len_sq > 1e-12 {
+                let to_pos = (
+                    position.0 - vertices[v0_idx].0,
+                    position.1 - vertices[v0_idx].1,
+                    position.2 - vertices[v0_idx].2,
+                );
+                let dot = to_pos.0 * edge_vec.0 + to_pos.1 * edge_vec.1 + to_pos.2 * edge_vec.2;
+                (dot / edge_len_sq).clamp(0.0, 1.0)
+            } else {
+                0.5
+            };
 
             crossings.push(EdgeCrossing {
                 v0,
                 v1,
-                t: t_clamped,
+                t,
                 position,
                 normal_before: n0,
                 normal_after: n1,
@@ -2890,60 +3033,121 @@ fn detect_edge_crossings(
     crossings
 }
 
-/// Find the parameter t along edge (v0→v1) where the geometric sharp edge crosses.
+/// Compute the position where a mesh edge crosses a geometric sharp edge.
 ///
-/// Uses plane intersection geometry: the crossing is where the ridge line
-/// (intersection of planes through v0 with n0 and v1 with n1) meets the edge.
-fn find_crossing_t(
+/// Given two vertices v0, v1 on different faces with normals n0, n1,
+/// computes the point on the plane intersection line (the geometric sharp edge)
+/// that is closest to the mesh edge.
+///
+/// Returns the position on the geometric sharp edge, or falls back to
+/// mesh edge midpoint if planes are parallel.
+fn compute_edge_crossing_position(
     v0: (f64, f64, f64),
     n0: (f64, f64, f64),
     v1: (f64, f64, f64),
     n1: (f64, f64, f64),
-) -> f64 {
-    // Plane through v0 with normal n0: n0 · (p - v0) = 0
-    // Plane through v1 with normal n1: n1 · (p - v1) = 0
-    //
-    // For a point p = v0 + t*(v1-v0) to lie on the ridge,
-    // we use a heuristic: find t where the "normal transition" occurs.
-    //
-    // One approach: find t where the blended normal has equal components
-    // from both sides. This is approximated by weighting based on distance
-    // to each plane.
-    //
-    // Distance from point p to plane through v0 with normal n0:
-    //   d0 = n0 · (p - v0)
-    // Distance from point p to plane through v1 with normal n1:
-    //   d1 = n1 · (p - v1)
-    //
-    // The crossing is approximately where |d0| = |d1|.
+) -> (f64, f64, f64) {
+    // Normalize input normals for robust geometry calculations
+    let n0_len = (n0.0 * n0.0 + n0.1 * n0.1 + n0.2 * n0.2).sqrt();
+    let n1_len = (n1.0 * n1.0 + n1.1 * n1.1 + n1.2 * n1.2).sqrt();
 
-    let edge = (v1.0 - v0.0, v1.1 - v0.1, v1.2 - v0.2);
-
-    // d0(t) = n0 · (v0 + t*edge - v0) = t * (n0 · edge)
-    // d1(t) = n1 · (v0 + t*edge - v1) = n1 · (v0 - v1) + t * (n1 · edge)
-    //       = -n1 · edge + t * (n1 · edge) = (t - 1) * (n1 · edge)
-
-    let n0_dot_edge = n0.0 * edge.0 + n0.1 * edge.1 + n0.2 * edge.2;
-    let n1_dot_edge = n1.0 * edge.0 + n1.1 * edge.1 + n1.2 * edge.2;
-
-    // Solve for t where |t * n0_dot_edge| = |(t - 1) * n1_dot_edge|
-    //
-    // Case 1: t * n0_dot_edge = (t - 1) * n1_dot_edge
-    //   t * n0_dot_edge - t * n1_dot_edge = -n1_dot_edge
-    //   t * (n0_dot_edge - n1_dot_edge) = -n1_dot_edge
-    //   t = -n1_dot_edge / (n0_dot_edge - n1_dot_edge)
-    //     = n1_dot_edge / (n1_dot_edge - n0_dot_edge)
-
-    let denom = n1_dot_edge - n0_dot_edge;
-    if denom.abs() < 1e-12 {
-        // Normals have same projection onto edge - use midpoint
-        return 0.5;
+    if n0_len < 1e-12 || n1_len < 1e-12 {
+        // Degenerate normals - fall back to midpoint
+        return (
+            (v0.0 + v1.0) * 0.5,
+            (v0.1 + v1.1) * 0.5,
+            (v0.2 + v1.2) * 0.5,
+        );
     }
 
-    let t = n1_dot_edge / denom;
+    let n0 = (n0.0 / n0_len, n0.1 / n0_len, n0.2 / n0_len);
+    let n1 = (n1.0 / n1_len, n1.1 / n1_len, n1.2 / n1_len);
 
-    // Clamp to valid range
-    t.clamp(0.0, 1.0)
+    // The geometric sharp edge is the intersection line of:
+    // - Plane A: passes through v0 with normal n0
+    // - Plane B: passes through v1 with normal n1
+    //
+    // Direction of intersection line = n0 × n1
+    let edge_dir = (
+        n0.1 * n1.2 - n0.2 * n1.1,
+        n0.2 * n1.0 - n0.0 * n1.2,
+        n0.0 * n1.1 - n0.1 * n1.0,
+    );
+
+    let edge_len_sq = edge_dir.0 * edge_dir.0 + edge_dir.1 * edge_dir.1 + edge_dir.2 * edge_dir.2;
+    if edge_len_sq < 1e-12 {
+        // Planes are parallel - fall back to mesh edge midpoint
+        return (
+            (v0.0 + v1.0) * 0.5,
+            (v0.1 + v1.1) * 0.5,
+            (v0.2 + v1.2) * 0.5,
+        );
+    }
+
+    // Normalize edge direction
+    let edge_len = edge_len_sq.sqrt();
+    let edge_dir = (
+        edge_dir.0 / edge_len,
+        edge_dir.1 / edge_len,
+        edge_dir.2 / edge_len,
+    );
+
+    // Find a point p0 on the intersection line.
+    // Plane A: n0 · p = n0 · v0 = d0
+    // Plane B: n1 · p = n1 · v1 = d1
+    //
+    // We find p0 = α*n0 + β*n1 that satisfies both plane equations.
+    // (The component along edge_dir is arbitrary; we'll project later)
+    //
+    // α*(n0·n0) + β*(n0·n1) = d0
+    // α*(n0·n1) + β*(n1·n1) = d1
+
+    let d0 = n0.0 * v0.0 + n0.1 * v0.1 + n0.2 * v0.2;
+    let d1 = n1.0 * v1.0 + n1.1 * v1.1 + n1.2 * v1.2;
+
+    let n00 = n0.0 * n0.0 + n0.1 * n0.1 + n0.2 * n0.2; // = 1.0 (normalized above)
+    let n11 = n1.0 * n1.0 + n1.1 * n1.1 + n1.2 * n1.2;
+    let n01 = n0.0 * n1.0 + n0.1 * n1.1 + n0.2 * n1.2;
+
+    let det = n00 * n11 - n01 * n01;
+    if det.abs() < 1e-12 {
+        // Degenerate case - fall back to midpoint
+        return (
+            (v0.0 + v1.0) * 0.5,
+            (v0.1 + v1.1) * 0.5,
+            (v0.2 + v1.2) * 0.5,
+        );
+    }
+
+    let alpha = (d0 * n11 - d1 * n01) / det;
+    let beta = (d1 * n00 - d0 * n01) / det;
+
+    let p0 = (
+        alpha * n0.0 + beta * n1.0,
+        alpha * n0.1 + beta * n1.1,
+        alpha * n0.2 + beta * n1.2,
+    );
+
+    // Now project the mesh edge midpoint onto the intersection line.
+    // The crossing point should be on the geometric sharp edge (the line),
+    // at the location closest to where the mesh edge would cross it.
+    let midpoint = (
+        (v0.0 + v1.0) * 0.5,
+        (v0.1 + v1.1) * 0.5,
+        (v0.2 + v1.2) * 0.5,
+    );
+
+    // t = (midpoint - p0) · edge_dir
+    let t = (midpoint.0 - p0.0) * edge_dir.0
+        + (midpoint.1 - p0.1) * edge_dir.1
+        + (midpoint.2 - p0.2) * edge_dir.2;
+
+    // Final position on the intersection line
+    (
+        p0.0 + t * edge_dir.0,
+        p0.1 + t * edge_dir.1,
+        p0.2 + t * edge_dir.2,
+    )
 }
 
 /// Phase 4e: Re-triangulate mesh to incorporate edge crossing vertices.
@@ -3476,6 +3680,22 @@ where
     // =========================================================================
     let normal_search_distance = search_distance * 2.0;
 
+    // Run edge detection diagnostics when feature is enabled
+    #[cfg(all(feature = "edge-diagnostic", feature = "native"))]
+    if let Some(ref sharp_config) = config.sharp_edge_config {
+        eprintln!("=== Edge Detection Diagnostics ===");
+        let _ = run_edge_diagnostics(
+            &refined_positions,
+            &recomputed_normals,
+            probe_epsilon,
+            normal_search_distance,
+            sampler,
+            stats,
+            sharp_config,
+        );
+        eprintln!("==================================");
+    }
+
     // Check if sharp edge detection is enabled
     if let Some(ref sharp_config) = config.sharp_edge_config {
         if config.normal_sample_iterations > 0 {
@@ -3578,15 +3798,22 @@ pub struct Stage4_5Stats {
     pub vertices_duplicated: usize,
 }
 
-fn stage4_5_sharp_edge_processing(
+fn stage4_5_sharp_edge_processing<F>(
     stage4: Stage4Result,
     config: &SharpEdgeConfig,
-) -> (IndexedMesh2, Stage4_5Stats) {
+    sampler: &F,
+    cell_size: (f64, f64, f64),
+    stats: &SamplingStats,
+) -> (IndexedMesh2, Stage4_5Stats)
+where
+    F: SamplerFn,
+{
     let mut positions_f64 = stage4.positions_f64;
     let mut normals_f64 = stage4.normals_f64;
     let mut indices = stage4.indices;
     let mut sharp_info = stage4.sharp_info;
     let case1_vertices = stage4.case1_count;
+    let original_vertex_count = positions_f64.len();
 
     // =========================================================================
     // Phase 4d: Detect Case 2 Edge Crossings
@@ -3600,6 +3827,21 @@ fn stage4_5_sharp_edge_processing(
     );
     let edge_crossings = crossings.len();
 
+    // Run crossing position diagnostics when feature is enabled
+    #[cfg(all(feature = "edge-diagnostic", feature = "native"))]
+    if !crossings.is_empty() {
+        eprintln!("=== Crossing Position Diagnostics (before refinement) ===");
+        let _ = run_crossing_diagnostics(
+            &crossings,
+            &positions_f64,
+            &normals_f64,
+            cell_size,
+            sampler,
+            stats,
+        );
+        eprintln!("=========================================================");
+    }
+
     // =========================================================================
     // Phase 4e: Re-triangulate with Crossing Vertices
     // =========================================================================
@@ -3610,6 +3852,49 @@ fn stage4_5_sharp_edge_processing(
         &mut sharp_info,
         &crossings,
     );
+
+    // =========================================================================
+    // Phase 4e.5: Refine crossing vertex positions to actual surface
+    // =========================================================================
+    // The plane intersection gives us a point on the geometric edge LINE,
+    // but it may not be exactly on the surface. Use binary search to refine.
+    let max_cell_size = cell_size.0.max(cell_size.1).max(cell_size.2);
+    let search_distance = max_cell_size;
+
+    for i in original_vertex_count..positions_f64.len() {
+        let pos = positions_f64[i];
+        let info = &sharp_info[i];
+
+        // Use the average of the two normals as the search direction
+        let search_dir = if let Some(nb) = info.normal_b {
+            let avg = (
+                (info.normal_a.0 + nb.0) * 0.5,
+                (info.normal_a.1 + nb.1) * 0.5,
+                (info.normal_a.2 + nb.2) * 0.5,
+            );
+            let len_sq = avg.0 * avg.0 + avg.1 * avg.1 + avg.2 * avg.2;
+            if len_sq > 1e-12 {
+                let inv_len = 1.0 / len_sq.sqrt();
+                (avg.0 * inv_len, avg.1 * inv_len, avg.2 * inv_len)
+            } else {
+                info.normal_a
+            }
+        } else {
+            info.normal_a
+        };
+
+        // Binary search to find the surface along the search direction
+        if let Some(refined_pos) = find_surface_point_with_fallbacks(
+            pos,
+            search_dir,
+            search_distance,
+            12, // Use same iteration count as vertex refinement
+            sampler,
+            stats,
+        ) {
+            positions_f64[i] = refined_pos;
+        }
+    }
 
     // Convert to f32 before vertex duplication
     let mut vertices_f32: Vec<(f32, f32, f32)> = positions_f64
@@ -4154,6 +4439,322 @@ fn angular_error_degrees_f64(test: (f64, f64, f64), reference: (f64, f64, f64)) 
     dot_clamped.acos().to_degrees()
 }
 
+/// Diagnostic entry for Case 2 edge crossing position accuracy.
+#[cfg(feature = "edge-diagnostic")]
+#[derive(Clone, Debug)]
+pub struct CrossingDiagnosticEntry {
+    /// Method being tested
+    pub method: String,
+    /// Number of crossings analyzed
+    pub crossing_count: usize,
+    /// Mean position error (distance from reference)
+    pub position_error_mean: f64,
+    /// Median position error
+    pub position_error_median: f64,
+    /// P95 position error
+    pub position_error_p95: f64,
+    /// Max position error
+    pub position_error_max: f64,
+    /// Mean error as fraction of cell size
+    pub error_cell_fraction_mean: f64,
+}
+
+/// Run Case 2 crossing position diagnostics.
+///
+/// Compares the cheap crossing position estimate against an expensive reference
+/// computed using more iterations and multiple search directions.
+#[cfg(all(feature = "edge-diagnostic", feature = "native"))]
+pub fn run_crossing_diagnostics<F>(
+    crossings: &[EdgeCrossing],
+    vertices: &[(f64, f64, f64)],
+    normals: &[(f64, f64, f64)],
+    cell_size: (f64, f64, f64),
+    sampler: &F,
+    stats: &SamplingStats,
+) -> CrossingDiagnosticEntry
+where
+    F: SamplerFn,
+{
+    use rayon::prelude::*;
+
+    let crossing_count = crossings.len();
+    if crossing_count == 0 {
+        eprintln!("  No crossings to diagnose");
+        return CrossingDiagnosticEntry {
+            method: "plane-intersection".to_string(),
+            crossing_count: 0,
+            position_error_mean: 0.0,
+            position_error_median: 0.0,
+            position_error_p95: 0.0,
+            position_error_max: 0.0,
+            error_cell_fraction_mean: 0.0,
+        };
+    }
+
+    let max_cell = cell_size.0.max(cell_size.1).max(cell_size.2);
+    let min_cell = cell_size.0.min(cell_size.1).min(cell_size.2);
+    let search_distance = max_cell * 2.0;
+    let probe_epsilon = min_cell * 0.1; // Same as normal refinement
+
+    eprintln!("  Computing reference positions for {} crossings...", crossing_count);
+
+    // For each crossing, compute a reference position using expensive probing
+    let results: Vec<(f64, (f64, f64, f64), (f64, f64, f64))> = crossings
+        .par_iter()
+        .map(|crossing| {
+            let cheap_pos = crossing.position;
+
+            // Compute reference position using extensive probing
+            // Try multiple directions and more iterations
+            let avg_normal = (
+                (crossing.normal_before.0 + crossing.normal_after.0) * 0.5,
+                (crossing.normal_before.1 + crossing.normal_after.1) * 0.5,
+                (crossing.normal_before.2 + crossing.normal_after.2) * 0.5,
+            );
+
+            // Compute edge direction (perpendicular to both normals)
+            let edge_dir = (
+                crossing.normal_before.1 * crossing.normal_after.2
+                    - crossing.normal_before.2 * crossing.normal_after.1,
+                crossing.normal_before.2 * crossing.normal_after.0
+                    - crossing.normal_before.0 * crossing.normal_after.2,
+                crossing.normal_before.0 * crossing.normal_after.1
+                    - crossing.normal_before.1 * crossing.normal_after.0,
+            );
+
+            // Try searching along average normal with many iterations
+            let ref_pos = find_reference_crossing_position(
+                cheap_pos,
+                avg_normal,
+                edge_dir,
+                search_distance,
+                sampler,
+                stats,
+            );
+
+            let error = dist_f64(cheap_pos, ref_pos);
+            (error, cheap_pos, ref_pos)
+        })
+        .collect();
+
+    // Compute statistics
+    let mut errors: Vec<f64> = results.iter().map(|(e, _, _)| *e).collect();
+    errors.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let error_sum: f64 = errors.iter().sum();
+    let error_mean = error_sum / crossing_count as f64;
+    let error_median = errors[crossing_count / 2];
+    let error_p95 = errors[(crossing_count as f64 * 0.95) as usize];
+    let error_max = errors[crossing_count - 1];
+
+    let error_cell_fraction_mean = error_mean / max_cell;
+
+    eprintln!(
+        "  Crossing position errors: mean={:.6} median={:.6} p95={:.6} max={:.6}",
+        error_mean, error_median, error_p95, error_max
+    );
+    eprintln!(
+        "  As fraction of cell size: mean={:.2}% median={:.2}% p95={:.2}%",
+        error_cell_fraction_mean * 100.0,
+        (error_median / max_cell) * 100.0,
+        (error_p95 / max_cell) * 100.0
+    );
+
+    // Print worst cases for debugging with additional context
+    let mut indexed_errors: Vec<(usize, f64, (f64, f64, f64), (f64, f64, f64), &EdgeCrossing)> = results
+        .iter()
+        .enumerate()
+        .zip(crossings.iter())
+        .map(|((i, (e, cheap, reference)), crossing)| (i, *e, *cheap, *reference, crossing))
+        .collect();
+    indexed_errors.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    eprintln!("  Worst 5 crossings (with endpoint analysis):");
+    for (i, error, cheap, reference, crossing) in indexed_errors.iter().take(5) {
+        // Compute angle between normals
+        let n0 = crossing.normal_before;
+        let n1 = crossing.normal_after;
+        let dot = n0.0 * n1.0 + n0.1 * n1.1 + n0.2 * n1.2;
+        let n0_len = (n0.0 * n0.0 + n0.1 * n0.1 + n0.2 * n0.2).sqrt();
+        let n1_len = (n1.0 * n1.0 + n1.1 * n1.1 + n1.2 * n1.2).sqrt();
+        let angle = (dot / (n0_len * n1_len)).clamp(-1.0, 1.0).acos().to_degrees();
+
+        eprintln!(
+            "    #{}: err={:.6} ({:.1}% cell) angle={:.1}°",
+            i, error, error / max_cell * 100.0, angle
+        );
+        eprintln!(
+            "      cheap=({:.4},{:.4},{:.4}) ref=({:.4},{:.4},{:.4})",
+            cheap.0, cheap.1, cheap.2, reference.0, reference.1, reference.2
+        );
+        eprintln!(
+            "      n0=({:.3},{:.3},{:.3}) |n0|={:.3}  n1=({:.3},{:.3},{:.3}) |n1|={:.3}",
+            n0.0, n0.1, n0.2, n0_len, n1.0, n1.1, n1.2, n1_len
+        );
+
+        // Run expensive edge detection on both endpoints
+        let v0_idx = crossing.v0 as usize;
+        let v1_idx = crossing.v1 as usize;
+        let v0_pos = vertices[v0_idx];
+        let v1_pos = vertices[v1_idx];
+        let v0_norm = normals[v0_idx];
+        let v1_norm = normals[v1_idx];
+
+        // Use expensive 32-probe reference detection on each endpoint
+        let ref_v0 = compute_reference_edge_info(
+            v0_pos, v0_norm, probe_epsilon, search_distance, sampler, stats
+        );
+        let ref_v1 = compute_reference_edge_info(
+            v1_pos, v1_norm, probe_epsilon, search_distance, sampler, stats
+        );
+
+        eprintln!(
+            "      v0[{}]: pos=({:.4},{:.4},{:.4}) REF_SHARP={} conf={:.2}",
+            v0_idx, v0_pos.0, v0_pos.1, v0_pos.2, ref_v0.is_sharp, ref_v0.confidence
+        );
+        if ref_v0.is_sharp {
+            if let Some(nb) = ref_v0.normal_b {
+                let ref_angle = {
+                    let d = ref_v0.normal_a.0 * nb.0 + ref_v0.normal_a.1 * nb.1 + ref_v0.normal_a.2 * nb.2;
+                    d.clamp(-1.0, 1.0).acos().to_degrees()
+                };
+                eprintln!(
+                    "        -> TRUE EDGE! na=({:.3},{:.3},{:.3}) nb=({:.3},{:.3},{:.3}) angle={:.1}°",
+                    ref_v0.normal_a.0, ref_v0.normal_a.1, ref_v0.normal_a.2,
+                    nb.0, nb.1, nb.2, ref_angle
+                );
+            }
+        }
+
+        eprintln!(
+            "      v1[{}]: pos=({:.4},{:.4},{:.4}) REF_SHARP={} conf={:.2}",
+            v1_idx, v1_pos.0, v1_pos.1, v1_pos.2, ref_v1.is_sharp, ref_v1.confidence
+        );
+        if ref_v1.is_sharp {
+            if let Some(nb) = ref_v1.normal_b {
+                let ref_angle = {
+                    let d = ref_v1.normal_a.0 * nb.0 + ref_v1.normal_a.1 * nb.1 + ref_v1.normal_a.2 * nb.2;
+                    d.clamp(-1.0, 1.0).acos().to_degrees()
+                };
+                eprintln!(
+                    "        -> TRUE EDGE! na=({:.3},{:.3},{:.3}) nb=({:.3},{:.3},{:.3}) angle={:.1}°",
+                    ref_v1.normal_a.0, ref_v1.normal_a.1, ref_v1.normal_a.2,
+                    nb.0, nb.1, nb.2, ref_angle
+                );
+            }
+        }
+    }
+
+    // Also show distribution by error magnitude
+    let under_1pct = errors.iter().filter(|e| **e / max_cell < 0.01).count();
+    let under_5pct = errors.iter().filter(|e| **e / max_cell < 0.05).count();
+    let under_10pct = errors.iter().filter(|e| **e / max_cell < 0.10).count();
+    eprintln!(
+        "  Distribution: <1%={} ({:.1}%), <5%={} ({:.1}%), <10%={} ({:.1}%)",
+        under_1pct, under_1pct as f64 / crossing_count as f64 * 100.0,
+        under_5pct, under_5pct as f64 / crossing_count as f64 * 100.0,
+        under_10pct, under_10pct as f64 / crossing_count as f64 * 100.0
+    );
+
+    CrossingDiagnosticEntry {
+        method: "plane-intersection".to_string(),
+        crossing_count,
+        position_error_mean: error_mean,
+        position_error_median: error_median,
+        position_error_p95: error_p95,
+        position_error_max: error_max,
+        error_cell_fraction_mean,
+    }
+}
+
+/// Compute a high-quality reference position for a crossing point.
+///
+/// Uses multiple search directions and many iterations to find the best surface point.
+#[cfg(feature = "edge-diagnostic")]
+fn find_reference_crossing_position<F>(
+    initial_pos: (f64, f64, f64),
+    avg_normal: (f64, f64, f64),
+    edge_dir: (f64, f64, f64),
+    search_distance: f64,
+    sampler: &F,
+    stats: &SamplingStats,
+) -> (f64, f64, f64)
+where
+    F: SamplerFn,
+{
+    // Normalize directions
+    let norm_len = (avg_normal.0 * avg_normal.0 + avg_normal.1 * avg_normal.1 + avg_normal.2 * avg_normal.2).sqrt();
+    let avg_normal = if norm_len > 1e-12 {
+        (avg_normal.0 / norm_len, avg_normal.1 / norm_len, avg_normal.2 / norm_len)
+    } else {
+        (0.0, 0.0, 1.0)
+    };
+
+    let edge_len = (edge_dir.0 * edge_dir.0 + edge_dir.1 * edge_dir.1 + edge_dir.2 * edge_dir.2).sqrt();
+    let edge_dir = if edge_len > 1e-12 {
+        (edge_dir.0 / edge_len, edge_dir.1 / edge_len, edge_dir.2 / edge_len)
+    } else {
+        (1.0, 0.0, 0.0)
+    };
+
+    // Compute a direction perpendicular to edge but in the plane of the normals
+    let perp = (
+        avg_normal.1 * edge_dir.2 - avg_normal.2 * edge_dir.1,
+        avg_normal.2 * edge_dir.0 - avg_normal.0 * edge_dir.2,
+        avg_normal.0 * edge_dir.1 - avg_normal.1 * edge_dir.0,
+    );
+    let perp_len = (perp.0 * perp.0 + perp.1 * perp.1 + perp.2 * perp.2).sqrt();
+    let perp = if perp_len > 1e-12 {
+        (perp.0 / perp_len, perp.1 / perp_len, perp.2 / perp_len)
+    } else {
+        avg_normal
+    };
+
+    // Try multiple search directions
+    let directions = [
+        avg_normal,
+        perp,
+        (1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.0, 0.0, 1.0),
+    ];
+
+    let initial_inside = sample_is_inside(sampler, initial_pos.0, initial_pos.1, initial_pos.2, stats);
+
+    let mut best_pos = initial_pos;
+    let mut best_dist = f64::MAX;
+
+    for dir in &directions {
+        if let Some((a, b, inside_a)) = find_crossing_along_direction(
+            initial_pos,
+            *dir,
+            search_distance,
+            sampler,
+            stats,
+            initial_inside,
+        ) {
+            // Use many iterations for high precision
+            let refined = binary_search_crossing(a, b, inside_a, 32, sampler, stats);
+            let dist = dist_f64(initial_pos, refined);
+            if dist < best_dist {
+                best_dist = dist;
+                best_pos = refined;
+            }
+        }
+    }
+
+    best_pos
+}
+
+/// Distance between two f64 points
+#[cfg(feature = "edge-diagnostic")]
+fn dist_f64(a: (f64, f64, f64), b: (f64, f64, f64)) -> f64 {
+    let dx = a.0 - b.0;
+    let dy = a.1 - b.1;
+    let dz = a.2 - b.2;
+    (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
 // =============================================================================
 // MAIN ENTRY POINT
 // =============================================================================
@@ -4260,8 +4861,14 @@ where
     // Stage 4.5: Sharp edge processing (when enabled)
     let stage4_5_start = Instant::now();
     let (mesh, sharp_stats) = if let Some(ref sharp_config) = config.sharp_edge_config {
-        let (mesh, stats) = stage4_5_sharp_edge_processing(stage4_result, sharp_config);
-        (mesh, Some(stats))
+        let (mesh, sharp_s) = stage4_5_sharp_edge_processing(
+            stage4_result,
+            sharp_config,
+            &sampler,
+            cell_size,
+            &stats,
+        );
+        (mesh, Some(sharp_s))
     } else {
         (stage4_result_to_mesh(stage4_result), None)
     };
@@ -4413,8 +5020,14 @@ where
     // Stage 4.5: Sharp edge processing (when enabled)
     let stage4_5_start = Instant::now();
     let (mesh, sharp_stats) = if let Some(ref sharp_config) = config.sharp_edge_config {
-        let (mesh, stats) = stage4_5_sharp_edge_processing(stage4_result, sharp_config);
-        (mesh, Some(stats))
+        let (mesh, sharp_s) = stage4_5_sharp_edge_processing(
+            stage4_result,
+            sharp_config,
+            &sampler,
+            cell_size,
+            &stats,
+        );
+        (mesh, Some(sharp_s))
     } else {
         (stage4_result_to_mesh(stage4_result), None)
     };

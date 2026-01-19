@@ -97,8 +97,8 @@ pub struct MeshArgs {
     #[arg(long)]
     sharp_edges: bool,
 
-    /// Sharp edge angle threshold in degrees (default: 30)
-    #[arg(long, default_value = "30.0")]
+    /// Sharp edge angle threshold in degrees (default: 20)
+    #[arg(long, default_value = "20.0")]
     sharp_angle: f64,
 
     /// Sharp edge residual multiplier (default: 4.0)
