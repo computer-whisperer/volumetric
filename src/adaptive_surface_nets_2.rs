@@ -875,9 +875,9 @@ pub struct EdgeDiagnosticEntry {
     pub true_positive_rate: f64,
     /// False positive rate (detected sharp when actually smooth)
     pub false_positive_rate: f64,
-    /// Mean angular error for normal_a (degrees)
+    /// Mean angular error for normal_a (degrees) - vs reference
     pub normal_a_error_mean: f64,
-    /// Mean angular error for normal_b (degrees)
+    /// Mean angular error for normal_b (degrees) - vs reference
     pub normal_b_error_mean: f64,
     /// Mean position error for intersection point (as fraction of cell size)
     pub position_error_mean: f64,
@@ -885,6 +885,10 @@ pub struct EdgeDiagnosticEntry {
     pub position_error_p95: f64,
     /// Number of samples used by this method (per vertex)
     pub samples_per_vertex: u64,
+    /// Mean angular error for normal_a (degrees) - vs analytical ground truth (if available)
+    pub analytical_normal_a_error: Option<f64>,
+    /// Mean angular error for normal_b (degrees) - vs analytical ground truth (if available)
+    pub analytical_normal_b_error: Option<f64>,
 }
 
 impl MeshingStats2 {
@@ -4208,6 +4212,101 @@ fn generate_uniform_tangent_directions(
         .collect()
 }
 
+/// Analytical ground truth for the rotated cube test case.
+///
+/// The rotated cube has rotation parameters: rx=35.264°, ry=45°, rz=0° (Euler XYZ)
+/// This computes the 6 analytical face normals after rotation.
+#[cfg(feature = "edge-diagnostic")]
+pub struct AnalyticalRotatedCube {
+    /// The 6 rotated face normals: +X, -X, +Y, -Y, +Z, -Z (after rotation)
+    pub face_normals: [(f64, f64, f64); 6],
+}
+
+#[cfg(feature = "edge-diagnostic")]
+impl AnalyticalRotatedCube {
+    /// Create analytical ground truth for rotated cube with given Euler angles (degrees).
+    /// Uses XYZ rotation order: R = Rz * Ry * Rx
+    pub fn new(rx_deg: f64, ry_deg: f64, rz_deg: f64) -> Self {
+        let rx = rx_deg.to_radians();
+        let ry = ry_deg.to_radians();
+        let rz = rz_deg.to_radians();
+
+        let (sx, cx) = (rx.sin(), rx.cos());
+        let (sy, cy) = (ry.sin(), ry.cos());
+        let (sz, cz) = (rz.sin(), rz.cos());
+
+        // Combined rotation matrix R = Rz * Ry * Rx
+        // Row-major: r[row][col]
+        let r = [
+            [cy * cz, cz * sx * sy - cx * sz, cx * cz * sy + sx * sz],
+            [cy * sz, cx * cz + sx * sy * sz, cx * sy * sz - cz * sx],
+            [-sy, cy * sx, cx * cy],
+        ];
+
+        // Original face normals (unit cube faces)
+        let original_normals = [
+            (1.0, 0.0, 0.0),  // +X
+            (-1.0, 0.0, 0.0), // -X
+            (0.0, 1.0, 0.0),  // +Y
+            (0.0, -1.0, 0.0), // -Y
+            (0.0, 0.0, 1.0),  // +Z
+            (0.0, 0.0, -1.0), // -Z
+        ];
+
+        // Apply rotation to each normal
+        let mut face_normals = [(0.0, 0.0, 0.0); 6];
+        for (i, &(nx, ny, nz)) in original_normals.iter().enumerate() {
+            face_normals[i] = (
+                r[0][0] * nx + r[0][1] * ny + r[0][2] * nz,
+                r[1][0] * nx + r[1][1] * ny + r[1][2] * nz,
+                r[2][0] * nx + r[2][1] * ny + r[2][2] * nz,
+            );
+        }
+
+        Self { face_normals }
+    }
+
+    /// Create with the standard test cube rotation (rx=35.264°, ry=45°, rz=0°).
+    pub fn standard_test_cube() -> Self {
+        Self::new(35.264, 45.0, 0.0)
+    }
+
+    /// Find the best-matching analytical normal for a given normal.
+    /// Returns (best_normal, error_degrees).
+    pub fn find_best_match(&self, normal: (f64, f64, f64)) -> ((f64, f64, f64), f64) {
+        let mut best_normal = self.face_normals[0];
+        let mut best_error = 180.0f64;
+
+        for &face_normal in &self.face_normals {
+            let error = angular_error_degrees_f64(normal, face_normal);
+            if error < best_error {
+                best_error = error;
+                best_normal = face_normal;
+            }
+        }
+
+        (best_normal, best_error)
+    }
+
+    /// Given two normals from a sharp edge detection, find the best pair of
+    /// analytical normals and return the errors.
+    /// Handles face swapping to find optimal assignment.
+    pub fn compute_pair_errors(
+        &self,
+        normal_a: (f64, f64, f64),
+        normal_b: Option<(f64, f64, f64)>,
+    ) -> (f64, Option<f64>) {
+        let (_, error_a) = self.find_best_match(normal_a);
+
+        let error_b = normal_b.map(|nb| {
+            let (_, err) = self.find_best_match(nb);
+            err
+        });
+
+        (error_a, error_b)
+    }
+}
+
 /// Compute high-precision reference edge info for a single vertex.
 ///
 /// Uses many probe directions (128) at multiple radii with high binary search
@@ -5139,6 +5238,9 @@ where
 ///
 /// Tests various probe counts and residual thresholds against high-precision reference.
 /// Returns error statistics for each method.
+///
+/// Also computes analytical ground truth validation using the rotated cube test case
+/// (rotation rx=35.264°, ry=45°, rz=0°).
 #[cfg(all(feature = "edge-diagnostic", feature = "native"))]
 pub fn run_edge_diagnostics<F>(
     refined_positions: &[(f64, f64, f64)],
@@ -5156,6 +5258,10 @@ where
 
     let vertex_count = refined_positions.len();
     eprintln!("Running edge detection diagnostics on {} vertices...", vertex_count);
+
+    // Create analytical ground truth for the rotated cube test case
+    let analytical = AnalyticalRotatedCube::standard_test_cube();
+    eprintln!("  Using analytical ground truth: rotated cube (rx=35.264°, ry=45°, rz=0°)");
 
     // Compute high-precision reference for all vertices
     // Uses 64 directions × 4 radii = 256 probes + 2 normal probes = 258 probes per vertex
@@ -5180,11 +5286,36 @@ where
 
     let samples_for_ref = stats.total_samples.load(Ordering::Relaxed) - samples_before_ref;
     let sharp_count = references.iter().filter(|r| r.is_sharp).count();
+
+    // Compute analytical error for the reference itself
+    let mut ref_analytical_a_errors: Vec<f64> = Vec::new();
+    let mut ref_analytical_b_errors: Vec<f64> = Vec::new();
+    for reference in &references {
+        if reference.is_sharp {
+            let (err_a, err_b) = analytical.compute_pair_errors(reference.normal_a, reference.normal_b);
+            ref_analytical_a_errors.push(err_a);
+            if let Some(eb) = err_b {
+                ref_analytical_b_errors.push(eb);
+            }
+        }
+    }
+    let ref_analytical_a_mean = if !ref_analytical_a_errors.is_empty() {
+        ref_analytical_a_errors.iter().sum::<f64>() / ref_analytical_a_errors.len() as f64
+    } else { 0.0 };
+    let ref_analytical_b_mean = if !ref_analytical_b_errors.is_empty() {
+        ref_analytical_b_errors.iter().sum::<f64>() / ref_analytical_b_errors.len() as f64
+    } else { 0.0 };
+
     eprintln!(
         "  Reference computed: {} sharp, {} smooth ({} samples)",
         sharp_count,
         vertex_count - sharp_count,
         samples_for_ref
+    );
+    eprintln!(
+        "  Reference vs analytical: NormA={:.1}°  NormB={:.1}°",
+        ref_analytical_a_mean,
+        ref_analytical_b_mean
     );
 
     // Test the standard 4-probe method
@@ -5218,19 +5349,28 @@ where
     let mut normal_a_errors: Vec<f64> = Vec::new();
     let mut normal_b_errors: Vec<f64> = Vec::new();
     let mut position_errors: Vec<f64> = Vec::new();
+    let mut analytical_a_errors: Vec<f64> = Vec::new();
+    let mut analytical_b_errors: Vec<f64> = Vec::new();
 
     for (pred, reference) in predictions.iter().zip(references.iter()) {
         if reference.is_sharp {
             if pred.is_sharp {
                 true_positives += 1;
 
-                // Compute normal errors
+                // Compute normal errors vs reference
                 let error_a = angular_error_degrees_f64(pred.normal_a, reference.normal_a);
                 normal_a_errors.push(error_a);
 
                 if let (Some(pred_b), Some(ref_b)) = (pred.normal_b, reference.normal_b) {
                     let error_b = angular_error_degrees_f64(pred_b, ref_b);
                     normal_b_errors.push(error_b);
+                }
+
+                // Compute normal errors vs analytical ground truth
+                let (ana_err_a, ana_err_b) = analytical.compute_pair_errors(pred.normal_a, pred.normal_b);
+                analytical_a_errors.push(ana_err_a);
+                if let Some(eb) = ana_err_b {
+                    analytical_b_errors.push(eb);
                 }
             } else {
                 false_negatives += 1;
@@ -5280,6 +5420,17 @@ where
         0.0
     };
 
+    let analytical_a_mean = if !analytical_a_errors.is_empty() {
+        Some(analytical_a_errors.iter().sum::<f64>() / analytical_a_errors.len() as f64)
+    } else {
+        None
+    };
+    let analytical_b_mean = if !analytical_b_errors.is_empty() {
+        Some(analytical_b_errors.iter().sum::<f64>() / analytical_b_errors.len() as f64)
+    } else {
+        None
+    };
+
     eprintln!(
         "  standard: TPR={:.1}%  FPR={:.1}%  NormA={:.1}°  NormB={:.1}°  samples/vert={}",
         tpr * 100.0,
@@ -5288,6 +5439,12 @@ where
         normal_b_mean,
         samples_used / vertex_count as u64
     );
+    if let (Some(ana_a), Some(ana_b)) = (analytical_a_mean, analytical_b_mean) {
+        eprintln!(
+            "           vs analytical: NormA={:.1}°  NormB={:.1}°",
+            ana_a, ana_b
+        );
+    }
 
     let standard_entry = EdgeDiagnosticEntry {
         method: "standard".to_string(),
@@ -5298,6 +5455,8 @@ where
         position_error_mean: position_mean,
         position_error_p95: position_p95,
         samples_per_vertex: samples_used / vertex_count as u64,
+        analytical_normal_a_error: analytical_a_mean,
+        analytical_normal_b_error: analytical_b_mean,
     };
 
     // =========================================================================
@@ -5325,6 +5484,7 @@ where
     let bisect_entry = compute_experimental_metrics(
         &bisection_results,
         &references,
+        &analytical,
         "bisection",
         samples_bisect,
         vertex_count,
@@ -5355,6 +5515,7 @@ where
     let multi_entry = compute_experimental_metrics(
         &multiradius_results,
         &references,
+        &analytical,
         "multiradius",
         samples_multi,
         vertex_count,
@@ -5368,6 +5529,7 @@ where
 fn compute_experimental_metrics(
     results: &[ExperimentalEdgeResult],
     references: &[ReferenceEdgeInfo],
+    analytical: &AnalyticalRotatedCube,
     method_name: &str,
     samples_used: u64,
     vertex_count: usize,
@@ -5379,13 +5541,15 @@ fn compute_experimental_metrics(
     let mut normal_a_errors: Vec<f64> = Vec::new();
     let mut normal_b_errors: Vec<f64> = Vec::new();
     let mut position_errors: Vec<f64> = Vec::new();
+    let mut analytical_a_errors: Vec<f64> = Vec::new();
+    let mut analytical_b_errors: Vec<f64> = Vec::new();
 
     for (result, reference) in results.iter().zip(references.iter()) {
         if reference.is_sharp {
             if result.is_sharp {
                 true_positives += 1;
 
-                // Compute normal errors - handle potential face swap
+                // Compute normal errors vs reference - handle potential face swap
                 let error_a_direct = angular_error_degrees_f64(result.normal_a, reference.normal_a);
                 let error_a_swapped = if let Some(ref_b) = reference.normal_b {
                     angular_error_degrees_f64(result.normal_a, ref_b)
@@ -5404,6 +5568,13 @@ fn compute_experimental_metrics(
                     if let (Some(res_b), Some(_)) = (result.normal_b, reference.normal_b) {
                         normal_b_errors.push(angular_error_degrees_f64(res_b, reference.normal_a));
                     }
+                }
+
+                // Compute normal errors vs analytical ground truth
+                let (ana_err_a, ana_err_b) = analytical.compute_pair_errors(result.normal_a, result.normal_b);
+                analytical_a_errors.push(ana_err_a);
+                if let Some(eb) = ana_err_b {
+                    analytical_b_errors.push(eb);
                 }
 
                 // Position error
@@ -5444,6 +5615,17 @@ fn compute_experimental_metrics(
         position_errors[idx.min(position_errors.len() - 1)]
     } else { 0.0 };
 
+    let analytical_a_mean = if !analytical_a_errors.is_empty() {
+        Some(analytical_a_errors.iter().sum::<f64>() / analytical_a_errors.len() as f64)
+    } else {
+        None
+    };
+    let analytical_b_mean = if !analytical_b_errors.is_empty() {
+        Some(analytical_b_errors.iter().sum::<f64>() / analytical_b_errors.len() as f64)
+    } else {
+        None
+    };
+
     eprintln!(
         "  {}: TPR={:.1}%  FPR={:.1}%  NormA={:.1}°  NormB={:.1}°  samples/vert={}",
         method_name,
@@ -5453,6 +5635,12 @@ fn compute_experimental_metrics(
         normal_b_mean,
         samples_used / vertex_count as u64
     );
+    if let (Some(ana_a), Some(ana_b)) = (analytical_a_mean, analytical_b_mean) {
+        eprintln!(
+            "           vs analytical: NormA={:.1}°  NormB={:.1}°",
+            ana_a, ana_b
+        );
+    }
 
     EdgeDiagnosticEntry {
         method: method_name.to_string(),
@@ -5463,6 +5651,8 @@ fn compute_experimental_metrics(
         position_error_mean: position_mean,
         position_error_p95: position_p95,
         samples_per_vertex: samples_used / vertex_count as u64,
+        analytical_normal_a_error: analytical_a_mean,
+        analytical_normal_b_error: analytical_b_mean,
     }
 }
 
