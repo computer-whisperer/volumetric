@@ -3959,6 +3959,7 @@ where
             cell_size,
             sampler,
             stats,
+            config.angle_threshold,
         );
         eprintln!("=========================================================");
     }
@@ -4209,8 +4210,11 @@ fn generate_uniform_tangent_directions(
 
 /// Compute high-precision reference edge info for a single vertex.
 ///
-/// Uses many probe directions (32) and high binary search iterations (32)
-/// to get the best possible edge detection. Still probe-based (not gradient)!
+/// Uses many probe directions (128) at multiple radii with high binary search
+/// iterations (32) to get the best possible edge detection.
+///
+/// Multi-radius approach: probes at 0.5x, 0.75x, 1.0x, and 1.25x epsilon to
+/// capture surface geometry at different scales and improve cluster quality.
 #[cfg(feature = "edge-diagnostic")]
 fn compute_reference_edge_info<F>(
     surface_pos: (f64, f64, f64),
@@ -4219,6 +4223,7 @@ fn compute_reference_edge_info<F>(
     search_distance: f64,
     sampler: &F,
     stats: &SamplingStats,
+    angle_threshold: f64,
 ) -> ReferenceEdgeInfo
 where
     F: SamplerFn,
@@ -4244,24 +4249,50 @@ where
         initial_normal.2 * n_inv_len,
     );
 
-    // Generate 32 uniformly distributed probe directions
-    let probe_dirs = generate_uniform_tangent_directions(n, 32);
+    // Generate 64 uniformly distributed probe directions using golden ratio
+    let probe_dirs = generate_uniform_tangent_directions(n, 64);
+
+    // Use multiple radii to better sample the surface near edges
+    // Smaller radii stay closer to vertex, larger radii capture more of each face
+    let radii_multipliers = [0.5, 0.75, 1.0, 1.25];
 
     // Collect surface points with high precision (32 iterations)
     let mut surface_points: Vec<(f64, f64, f64)> = vec![surface_pos];
 
-    for dir in probe_dirs.iter() {
-        let probe_pos = (
-            surface_pos.0 + dir.0 * probe_epsilon,
-            surface_pos.1 + dir.1 * probe_epsilon,
-            surface_pos.2 + dir.2 * probe_epsilon,
-        );
+    for &radius_mult in &radii_multipliers {
+        let radius = probe_epsilon * radius_mult;
+        for dir in probe_dirs.iter() {
+            let probe_pos = (
+                surface_pos.0 + dir.0 * radius,
+                surface_pos.1 + dir.1 * radius,
+                surface_pos.2 + dir.2 * radius,
+            );
 
+            if let Some(found) = find_surface_point_along_direction(
+                probe_pos,
+                n,
+                search_distance,
+                32, // High precision binary search
+                sampler,
+                stats,
+            ) {
+                surface_points.push(found);
+            }
+        }
+    }
+
+    // Also probe along the normal direction (in case vertex is near a corner)
+    for &sign in &[1.0, -1.0] {
+        let probe_pos = (
+            surface_pos.0 + n.0 * probe_epsilon * 0.5 * sign,
+            surface_pos.1 + n.1 * probe_epsilon * 0.5 * sign,
+            surface_pos.2 + n.2 * probe_epsilon * 0.5 * sign,
+        );
         if let Some(found) = find_surface_point_along_direction(
             probe_pos,
             n,
             search_distance,
-            32, // High precision
+            32,
             sampler,
             stats,
         ) {
@@ -4269,7 +4300,7 @@ where
         }
     }
 
-    if surface_points.len() < 5 {
+    if surface_points.len() < 10 {
         // Not enough points for robust analysis
         let (fitted_normal, _) = fit_plane_to_points(&surface_points);
         let dot = fitted_normal.0 * n.0 + fitted_normal.1 * n.1 + fitted_normal.2 * n.2;
@@ -4292,14 +4323,32 @@ where
     let (single_normal, single_residual) = fit_plane_to_points(&surface_points);
     let base_threshold = probe_epsilon * probe_epsilon * surface_points.len() as f64;
 
-    // Try clustering into two groups
+    // Try clustering into two groups with more sophisticated approach
+    // Run clustering multiple times with slight variations and pick best result
+    let mut best_clustering: Option<(Vec<(f64, f64, f64)>, Vec<(f64, f64, f64)>, f64)> = None;
+
     if let Some((cluster_a, cluster_b)) = cluster_points_two(&surface_points) {
-        if cluster_a.len() >= 3 && cluster_b.len() >= 3 {
+        let (_, res_a) = fit_plane_to_points(&cluster_a);
+        let (_, res_b) = fit_plane_to_points(&cluster_b);
+        best_clustering = Some((cluster_a, cluster_b, res_a + res_b));
+    }
+
+    // Also try clustering with k-means initialization using PCA
+    if let Some((cluster_a, cluster_b)) = cluster_points_two_pca(&surface_points) {
+        let (_, res_a) = fit_plane_to_points(&cluster_a);
+        let (_, res_b) = fit_plane_to_points(&cluster_b);
+        let total_res = res_a + res_b;
+        if best_clustering.is_none() || total_res < best_clustering.as_ref().unwrap().2 {
+            best_clustering = Some((cluster_a, cluster_b, total_res));
+        }
+    }
+
+    if let Some((cluster_a, cluster_b, combined_residual)) = best_clustering {
+        if cluster_a.len() >= 5 && cluster_b.len() >= 5 {
             let (normal_a, residual_a) = fit_plane_to_points(&cluster_a);
             let (normal_b, residual_b) = fit_plane_to_points(&cluster_b);
 
             // Check if clustering produces better fits
-            let combined_residual = residual_a + residual_b;
             let improvement = single_residual / (combined_residual + 1e-12);
 
             // Orient normals
@@ -4322,16 +4371,16 @@ where
             let angle = dot_ab.clamp(-1.0, 1.0).acos();
 
             // Criteria for sharp edge:
-            // 1. Significant improvement from clustering
-            // 2. Angle between normals > 20 degrees
+            // 1. Significant improvement from clustering (>1.5x)
+            // 2. Angle between normals exceeds threshold
             // 3. Low residuals for individual clusters
             let cluster_threshold_a = probe_epsilon * probe_epsilon * cluster_a.len() as f64;
             let cluster_threshold_b = probe_epsilon * probe_epsilon * cluster_b.len() as f64;
 
-            let is_sharp = improvement > 2.0
-                && angle > 20.0_f64.to_radians()
-                && residual_a < cluster_threshold_a * 3.0
-                && residual_b < cluster_threshold_b * 3.0;
+            let is_sharp = improvement > 1.5
+                && angle > angle_threshold
+                && residual_a < cluster_threshold_a * 2.0
+                && residual_b < cluster_threshold_b * 2.0;
 
             if is_sharp {
                 // Compute edge direction
@@ -4389,6 +4438,703 @@ where
     }
 }
 
+/// Alternative clustering using PCA to find the principal split direction.
+/// This can be more robust when the standard clustering strategies fail.
+#[cfg(feature = "edge-diagnostic")]
+fn cluster_points_two_pca(points: &[(f64, f64, f64)]) -> Option<(Vec<(f64, f64, f64)>, Vec<(f64, f64, f64)>)> {
+    if points.len() < 6 {
+        return None;
+    }
+
+    // Compute centroid
+    let n = points.len() as f64;
+    let cx = points.iter().map(|p| p.0).sum::<f64>() / n;
+    let cy = points.iter().map(|p| p.1).sum::<f64>() / n;
+    let cz = points.iter().map(|p| p.2).sum::<f64>() / n;
+
+    // Build covariance matrix
+    let mut m00 = 0.0;
+    let mut m01 = 0.0;
+    let mut m02 = 0.0;
+    let mut m11 = 0.0;
+    let mut m12 = 0.0;
+    let mut m22 = 0.0;
+
+    for p in points {
+        let dx = p.0 - cx;
+        let dy = p.1 - cy;
+        let dz = p.2 - cz;
+        m00 += dx * dx;
+        m01 += dx * dy;
+        m02 += dx * dz;
+        m11 += dy * dy;
+        m12 += dy * dz;
+        m22 += dz * dz;
+    }
+
+    // Power iteration to find largest eigenvector (direction of max spread)
+    let mut v: (f64, f64, f64) = (1.0, 0.0, 0.0);
+    for _ in 0..20 {
+        let new_v = (
+            m00 * v.0 + m01 * v.1 + m02 * v.2,
+            m01 * v.0 + m11 * v.1 + m12 * v.2,
+            m02 * v.0 + m12 * v.1 + m22 * v.2,
+        );
+        let len = (new_v.0 * new_v.0 + new_v.1 * new_v.1 + new_v.2 * new_v.2).sqrt();
+        if len < 1e-12 {
+            break;
+        }
+        v = (new_v.0 / len, new_v.1 / len, new_v.2 / len);
+    }
+
+    // Split points by projection onto this direction
+    let mut cluster_a: Vec<(f64, f64, f64)> = Vec::new();
+    let mut cluster_b: Vec<(f64, f64, f64)> = Vec::new();
+
+    for p in points {
+        let proj = (p.0 - cx) * v.0 + (p.1 - cy) * v.1 + (p.2 - cz) * v.2;
+        if proj >= 0.0 {
+            cluster_a.push(*p);
+        } else {
+            cluster_b.push(*p);
+        }
+    }
+
+    if cluster_a.len() >= 3 && cluster_b.len() >= 3 {
+        Some((cluster_a, cluster_b))
+    } else {
+        None
+    }
+}
+
+// =============================================================================
+// EXPERIMENTAL EDGE PROBING ALGORITHMS
+// =============================================================================
+
+/// Result from experimental edge detection algorithms
+#[cfg(feature = "edge-diagnostic")]
+#[derive(Clone, Debug)]
+pub struct ExperimentalEdgeResult {
+    pub is_sharp: bool,
+    pub normal_a: (f64, f64, f64),
+    pub normal_b: Option<(f64, f64, f64)>,
+    pub edge_direction: Option<(f64, f64, f64)>,
+    pub edge_position: Option<(f64, f64, f64)>,
+    pub samples_used: u64,
+    pub method: &'static str,
+}
+
+/// EXPERIMENTAL Algorithm 1: Face-Assignment Bisection
+///
+/// After initial clustering, this algorithm finds the precise angular locations
+/// where the face assignment changes by binary searching between adjacent
+/// opposite-face probe points in the tangent plane.
+///
+/// Key insight: Instead of inferring edge location from plane intersection,
+/// we directly search for where the surface "switches" between faces.
+#[cfg(feature = "edge-diagnostic")]
+fn edge_detect_bisection<F>(
+    surface_pos: (f64, f64, f64),
+    initial_normal: (f64, f64, f64),
+    probe_epsilon: f64,
+    search_distance: f64,
+    sampler: &F,
+    stats: &SamplingStats,
+    angle_threshold: f64,
+) -> ExperimentalEdgeResult
+where
+    F: SamplerFn,
+{
+    let mut samples_used = 0u64;
+
+    // Normalize initial normal
+    let n_len_sq = initial_normal.0 * initial_normal.0
+        + initial_normal.1 * initial_normal.1
+        + initial_normal.2 * initial_normal.2;
+    if n_len_sq < 1e-12 {
+        return ExperimentalEdgeResult {
+            is_sharp: false,
+            normal_a: (0.0, 1.0, 0.0),
+            normal_b: None,
+            edge_direction: None,
+            edge_position: None,
+            samples_used: 0,
+            method: "bisection",
+        };
+    }
+    let n_inv_len = 1.0 / n_len_sq.sqrt();
+    let n = (
+        initial_normal.0 * n_inv_len,
+        initial_normal.1 * n_inv_len,
+        initial_normal.2 * n_inv_len,
+    );
+
+    let (t1, t2) = orthonormal_basis_perpendicular_to(n);
+
+    // Phase 1: Initial probing with 24 uniformly distributed directions
+    let num_initial_probes = 24;
+    let mut probe_data: Vec<(f64, (f64, f64, f64), (f64, f64, f64))> = Vec::new(); // (angle, direction, surface_point)
+
+    for i in 0..num_initial_probes {
+        let angle = 2.0 * std::f64::consts::PI * (i as f64) / (num_initial_probes as f64);
+        let cos_a = angle.cos();
+        let sin_a = angle.sin();
+        let dir = (
+            t1.0 * cos_a + t2.0 * sin_a,
+            t1.1 * cos_a + t2.1 * sin_a,
+            t1.2 * cos_a + t2.2 * sin_a,
+        );
+
+        let probe_pos = (
+            surface_pos.0 + dir.0 * probe_epsilon,
+            surface_pos.1 + dir.1 * probe_epsilon,
+            surface_pos.2 + dir.2 * probe_epsilon,
+        );
+
+        if let Some(found) = find_surface_point_along_direction(
+            probe_pos, n, search_distance, 16, sampler, stats,
+        ) {
+            samples_used += 16; // Approximate
+            probe_data.push((angle, dir, found));
+        }
+    }
+
+    if probe_data.len() < 6 {
+        return ExperimentalEdgeResult {
+            is_sharp: false,
+            normal_a: n,
+            normal_b: None,
+            edge_direction: None,
+            edge_position: None,
+            samples_used,
+            method: "bisection",
+        };
+    }
+
+    // Phase 2: Cluster the probe points to detect potential edge
+    let surface_points: Vec<(f64, f64, f64)> = std::iter::once(surface_pos)
+        .chain(probe_data.iter().map(|(_, _, p)| *p))
+        .collect();
+
+    let (single_normal, single_residual) = fit_plane_to_points(&surface_points);
+
+    let clustering = cluster_points_two(&surface_points);
+    if clustering.is_none() {
+        let dot = single_normal.0 * n.0 + single_normal.1 * n.1 + single_normal.2 * n.2;
+        let normal_a = if dot < 0.0 {
+            (-single_normal.0, -single_normal.1, -single_normal.2)
+        } else {
+            single_normal
+        };
+        return ExperimentalEdgeResult {
+            is_sharp: false,
+            normal_a,
+            normal_b: None,
+            edge_direction: None,
+            edge_position: None,
+            samples_used,
+            method: "bisection",
+        };
+    }
+
+    let (cluster_a, cluster_b) = clustering.unwrap();
+    let (normal_a, residual_a) = fit_plane_to_points(&cluster_a);
+    let (normal_b, residual_b) = fit_plane_to_points(&cluster_b);
+
+    // Check if this looks like an edge
+    let combined_residual = residual_a + residual_b;
+    let improvement = single_residual / (combined_residual + 1e-12);
+
+    let dot_a = normal_a.0 * n.0 + normal_a.1 * n.1 + normal_a.2 * n.2;
+    let dot_b = normal_b.0 * n.0 + normal_b.1 * n.1 + normal_b.2 * n.2;
+
+    let normal_a = if dot_a < 0.0 { (-normal_a.0, -normal_a.1, -normal_a.2) } else { normal_a };
+    let normal_b = if dot_b < 0.0 { (-normal_b.0, -normal_b.1, -normal_b.2) } else { normal_b };
+
+    let dot_ab = normal_a.0 * normal_b.0 + normal_a.1 * normal_b.1 + normal_a.2 * normal_b.2;
+    let angle_between = dot_ab.clamp(-1.0, 1.0).acos();
+
+    if improvement < 1.5 || angle_between < angle_threshold {
+        let normal_a = if dot_a.abs() > dot_b.abs() { normal_a } else { normal_b };
+        return ExperimentalEdgeResult {
+            is_sharp: false,
+            normal_a,
+            normal_b: None,
+            edge_direction: None,
+            edge_position: None,
+            samples_used,
+            method: "bisection",
+        };
+    }
+
+    // Phase 3: Face-assignment bisection
+    // Assign each probe point to a face based on plane distance
+    let mut probe_assignments: Vec<(f64, bool)> = Vec::new(); // (angle, is_face_a)
+
+    for (angle, _, point) in &probe_data {
+        // Compute signed distance to each plane
+        let centroid_a = (
+            cluster_a.iter().map(|p| p.0).sum::<f64>() / cluster_a.len() as f64,
+            cluster_a.iter().map(|p| p.1).sum::<f64>() / cluster_a.len() as f64,
+            cluster_a.iter().map(|p| p.2).sum::<f64>() / cluster_a.len() as f64,
+        );
+        let centroid_b = (
+            cluster_b.iter().map(|p| p.0).sum::<f64>() / cluster_b.len() as f64,
+            cluster_b.iter().map(|p| p.1).sum::<f64>() / cluster_b.len() as f64,
+            cluster_b.iter().map(|p| p.2).sum::<f64>() / cluster_b.len() as f64,
+        );
+
+        let dist_a = ((point.0 - centroid_a.0) * normal_a.0
+            + (point.1 - centroid_a.1) * normal_a.1
+            + (point.2 - centroid_a.2) * normal_a.2)
+            .abs();
+        let dist_b = ((point.0 - centroid_b.0) * normal_b.0
+            + (point.1 - centroid_b.1) * normal_b.1
+            + (point.2 - centroid_b.2) * normal_b.2)
+            .abs();
+
+        probe_assignments.push((*angle, dist_a < dist_b));
+    }
+
+    // Sort by angle
+    probe_assignments.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Find transitions (where face assignment changes)
+    let mut transitions: Vec<(f64, f64)> = Vec::new(); // (angle_a, angle_b) where assignment changes
+
+    for i in 0..probe_assignments.len() {
+        let j = (i + 1) % probe_assignments.len();
+        if probe_assignments[i].1 != probe_assignments[j].1 {
+            let angle_a = probe_assignments[i].0;
+            let mut angle_b = probe_assignments[j].0;
+            // Handle wrap-around
+            if angle_b < angle_a {
+                angle_b += 2.0 * std::f64::consts::PI;
+            }
+            transitions.push((angle_a, angle_b));
+        }
+    }
+
+    // We expect exactly 2 transitions for a simple edge
+    if transitions.len() != 2 {
+        // Complex geometry or noise - fall back to standard result
+        let edge_dir = (
+            normal_a.1 * normal_b.2 - normal_a.2 * normal_b.1,
+            normal_a.2 * normal_b.0 - normal_a.0 * normal_b.2,
+            normal_a.0 * normal_b.1 - normal_a.1 * normal_b.0,
+        );
+        let edge_len = (edge_dir.0 * edge_dir.0 + edge_dir.1 * edge_dir.1 + edge_dir.2 * edge_dir.2).sqrt();
+        let edge_direction = if edge_len > 1e-12 {
+            Some((edge_dir.0 / edge_len, edge_dir.1 / edge_len, edge_dir.2 / edge_len))
+        } else {
+            None
+        };
+
+        return ExperimentalEdgeResult {
+            is_sharp: true,
+            normal_a,
+            normal_b: Some(normal_b),
+            edge_direction,
+            edge_position: project_to_plane_intersection(surface_pos, &cluster_a, normal_a, &cluster_b, normal_b),
+            samples_used,
+            method: "bisection",
+        };
+    }
+
+    // Phase 4: Binary search each transition to find precise edge crossing angle
+    let mut edge_angles: Vec<f64> = Vec::new();
+
+    for (mut theta_a, mut theta_b) in transitions {
+        let is_a_face_a = probe_assignments.iter()
+            .find(|(a, _)| (*a - theta_a).abs() < 0.01 || (*a - theta_a + 2.0 * std::f64::consts::PI).abs() < 0.01)
+            .map(|(_, f)| *f)
+            .unwrap_or(true);
+
+        // Binary search for 8 iterations (~0.5° precision)
+        for _ in 0..8 {
+            let theta_mid = (theta_a + theta_b) / 2.0;
+            let cos_mid = theta_mid.cos();
+            let sin_mid = theta_mid.sin();
+            let dir_mid = (
+                t1.0 * cos_mid + t2.0 * sin_mid,
+                t1.1 * cos_mid + t2.1 * sin_mid,
+                t1.2 * cos_mid + t2.2 * sin_mid,
+            );
+
+            let probe_pos = (
+                surface_pos.0 + dir_mid.0 * probe_epsilon,
+                surface_pos.1 + dir_mid.1 * probe_epsilon,
+                surface_pos.2 + dir_mid.2 * probe_epsilon,
+            );
+
+            if let Some(point) = find_surface_point_along_direction(
+                probe_pos, n, search_distance, 16, sampler, stats,
+            ) {
+                samples_used += 16;
+
+                // Classify point
+                let centroid_a = (
+                    cluster_a.iter().map(|p| p.0).sum::<f64>() / cluster_a.len() as f64,
+                    cluster_a.iter().map(|p| p.1).sum::<f64>() / cluster_a.len() as f64,
+                    cluster_a.iter().map(|p| p.2).sum::<f64>() / cluster_a.len() as f64,
+                );
+                let centroid_b = (
+                    cluster_b.iter().map(|p| p.0).sum::<f64>() / cluster_b.len() as f64,
+                    cluster_b.iter().map(|p| p.1).sum::<f64>() / cluster_b.len() as f64,
+                    cluster_b.iter().map(|p| p.2).sum::<f64>() / cluster_b.len() as f64,
+                );
+
+                let dist_a = ((point.0 - centroid_a.0) * normal_a.0
+                    + (point.1 - centroid_a.1) * normal_a.1
+                    + (point.2 - centroid_a.2) * normal_a.2)
+                    .abs();
+                let dist_b = ((point.0 - centroid_b.0) * normal_b.0
+                    + (point.1 - centroid_b.1) * normal_b.1
+                    + (point.2 - centroid_b.2) * normal_b.2)
+                    .abs();
+
+                let is_face_a = dist_a < dist_b;
+
+                if is_face_a == is_a_face_a {
+                    theta_a = theta_mid;
+                } else {
+                    theta_b = theta_mid;
+                }
+            } else {
+                // Probe failed, use midpoint
+                break;
+            }
+        }
+
+        edge_angles.push((theta_a + theta_b) / 2.0);
+    }
+
+    // Compute edge direction from the two crossing angles
+    if edge_angles.len() == 2 {
+        let theta1 = edge_angles[0];
+        let theta2 = edge_angles[1];
+
+        let p1 = (
+            surface_pos.0 + (t1.0 * theta1.cos() + t2.0 * theta1.sin()) * probe_epsilon,
+            surface_pos.1 + (t1.1 * theta1.cos() + t2.1 * theta1.sin()) * probe_epsilon,
+            surface_pos.2 + (t1.2 * theta1.cos() + t2.2 * theta1.sin()) * probe_epsilon,
+        );
+        let p2 = (
+            surface_pos.0 + (t1.0 * theta2.cos() + t2.0 * theta2.sin()) * probe_epsilon,
+            surface_pos.1 + (t1.1 * theta2.cos() + t2.1 * theta2.sin()) * probe_epsilon,
+            surface_pos.2 + (t1.2 * theta2.cos() + t2.2 * theta2.sin()) * probe_epsilon,
+        );
+
+        let edge_vec = (p2.0 - p1.0, p2.1 - p1.1, p2.2 - p1.2);
+        let edge_len = (edge_vec.0 * edge_vec.0 + edge_vec.1 * edge_vec.1 + edge_vec.2 * edge_vec.2).sqrt();
+
+        let edge_direction = if edge_len > 1e-12 {
+            Some((edge_vec.0 / edge_len, edge_vec.1 / edge_len, edge_vec.2 / edge_len))
+        } else {
+            None
+        };
+
+        // Edge position is the midpoint projected to the plane intersection
+        let edge_position = project_to_plane_intersection(surface_pos, &cluster_a, normal_a, &cluster_b, normal_b);
+
+        return ExperimentalEdgeResult {
+            is_sharp: true,
+            normal_a,
+            normal_b: Some(normal_b),
+            edge_direction,
+            edge_position,
+            samples_used,
+            method: "bisection",
+        };
+    }
+
+    // Fallback
+    ExperimentalEdgeResult {
+        is_sharp: true,
+        normal_a,
+        normal_b: Some(normal_b),
+        edge_direction: None,
+        edge_position: project_to_plane_intersection(surface_pos, &cluster_a, normal_a, &cluster_b, normal_b),
+        samples_used,
+        method: "bisection",
+    }
+}
+
+/// EXPERIMENTAL Algorithm 2: Multi-Radius Probing with Consistency Check
+///
+/// Probes at multiple radii (small, medium, large) and checks for consistency.
+/// If all radii show the same face, that direction is "safe".
+/// If radii disagree, there's likely an edge in that direction.
+///
+/// This gives direct information about edge proximity without relying on
+/// plane fitting accuracy.
+#[cfg(feature = "edge-diagnostic")]
+fn edge_detect_multiradius<F>(
+    surface_pos: (f64, f64, f64),
+    initial_normal: (f64, f64, f64),
+    probe_epsilon: f64,
+    search_distance: f64,
+    sampler: &F,
+    stats: &SamplingStats,
+    angle_threshold: f64,
+) -> ExperimentalEdgeResult
+where
+    F: SamplerFn,
+{
+    let mut samples_used = 0u64;
+
+    // Normalize initial normal
+    let n_len_sq = initial_normal.0 * initial_normal.0
+        + initial_normal.1 * initial_normal.1
+        + initial_normal.2 * initial_normal.2;
+    if n_len_sq < 1e-12 {
+        return ExperimentalEdgeResult {
+            is_sharp: false,
+            normal_a: (0.0, 1.0, 0.0),
+            normal_b: None,
+            edge_direction: None,
+            edge_position: None,
+            samples_used: 0,
+            method: "multiradius",
+        };
+    }
+    let n_inv_len = 1.0 / n_len_sq.sqrt();
+    let n = (
+        initial_normal.0 * n_inv_len,
+        initial_normal.1 * n_inv_len,
+        initial_normal.2 * n_inv_len,
+    );
+
+    let (t1, t2) = orthonormal_basis_perpendicular_to(n);
+
+    // Probe at 16 angles and 3 radii
+    let num_angles = 16;
+    let radii = [0.4 * probe_epsilon, 0.7 * probe_epsilon, 1.0 * probe_epsilon];
+
+    // Collect probes: (angle, radius_idx, surface_point)
+    let mut all_probes: Vec<(f64, usize, (f64, f64, f64))> = Vec::new();
+
+    for i in 0..num_angles {
+        let angle = 2.0 * std::f64::consts::PI * (i as f64) / (num_angles as f64);
+        let cos_a = angle.cos();
+        let sin_a = angle.sin();
+        let dir = (
+            t1.0 * cos_a + t2.0 * sin_a,
+            t1.1 * cos_a + t2.1 * sin_a,
+            t1.2 * cos_a + t2.2 * sin_a,
+        );
+
+        for (r_idx, &radius) in radii.iter().enumerate() {
+            let probe_pos = (
+                surface_pos.0 + dir.0 * radius,
+                surface_pos.1 + dir.1 * radius,
+                surface_pos.2 + dir.2 * radius,
+            );
+
+            if let Some(found) = find_surface_point_along_direction(
+                probe_pos, n, search_distance, 16, sampler, stats,
+            ) {
+                samples_used += 16;
+                all_probes.push((angle, r_idx, found));
+            }
+        }
+    }
+
+    if all_probes.len() < 12 {
+        return ExperimentalEdgeResult {
+            is_sharp: false,
+            normal_a: n,
+            normal_b: None,
+            edge_direction: None,
+            edge_position: None,
+            samples_used,
+            method: "multiradius",
+        };
+    }
+
+    // Use largest radius probes for initial clustering
+    let large_radius_points: Vec<(f64, f64, f64)> = std::iter::once(surface_pos)
+        .chain(all_probes.iter().filter(|(_, r, _)| *r == 2).map(|(_, _, p)| *p))
+        .collect();
+
+    if large_radius_points.len() < 5 {
+        return ExperimentalEdgeResult {
+            is_sharp: false,
+            normal_a: n,
+            normal_b: None,
+            edge_direction: None,
+            edge_position: None,
+            samples_used,
+            method: "multiradius",
+        };
+    }
+
+    let (single_normal, single_residual) = fit_plane_to_points(&large_radius_points);
+
+    // Try clustering
+    if let Some((cluster_a, cluster_b)) = cluster_points_two(&large_radius_points) {
+        if cluster_a.len() >= 3 && cluster_b.len() >= 3 {
+            let (normal_a, residual_a) = fit_plane_to_points(&cluster_a);
+            let (normal_b, residual_b) = fit_plane_to_points(&cluster_b);
+
+            let combined_residual = residual_a + residual_b;
+            let improvement = single_residual / (combined_residual + 1e-12);
+
+            let dot_a = normal_a.0 * n.0 + normal_a.1 * n.1 + normal_a.2 * n.2;
+            let dot_b = normal_b.0 * n.0 + normal_b.1 * n.1 + normal_b.2 * n.2;
+
+            let normal_a = if dot_a < 0.0 { (-normal_a.0, -normal_a.1, -normal_a.2) } else { normal_a };
+            let normal_b = if dot_b < 0.0 { (-normal_b.0, -normal_b.1, -normal_b.2) } else { normal_b };
+
+            let dot_ab = normal_a.0 * normal_b.0 + normal_a.1 * normal_b.1 + normal_a.2 * normal_b.2;
+            let angle_between = dot_ab.clamp(-1.0, 1.0).acos();
+
+            if improvement > 1.5 && angle_between > angle_threshold {
+                // Looks like an edge! Now use multi-radius consistency to refine
+
+                // Compute centroids for face classification
+                let centroid_a = (
+                    cluster_a.iter().map(|p| p.0).sum::<f64>() / cluster_a.len() as f64,
+                    cluster_a.iter().map(|p| p.1).sum::<f64>() / cluster_a.len() as f64,
+                    cluster_a.iter().map(|p| p.2).sum::<f64>() / cluster_a.len() as f64,
+                );
+                let centroid_b = (
+                    cluster_b.iter().map(|p| p.0).sum::<f64>() / cluster_b.len() as f64,
+                    cluster_b.iter().map(|p| p.1).sum::<f64>() / cluster_b.len() as f64,
+                    cluster_b.iter().map(|p| p.2).sum::<f64>() / cluster_b.len() as f64,
+                );
+
+                // For each angle, check if all radii agree on the face
+                let mut consistent_a: Vec<(f64, f64, f64)> = Vec::new();
+                let mut consistent_b: Vec<(f64, f64, f64)> = Vec::new();
+                let mut inconsistent_angles: Vec<f64> = Vec::new();
+
+                for i in 0..num_angles {
+                    let angle = 2.0 * std::f64::consts::PI * (i as f64) / (num_angles as f64);
+
+                    // Get all probes at this angle
+                    let probes_at_angle: Vec<&(f64, usize, (f64, f64, f64))> = all_probes
+                        .iter()
+                        .filter(|(a, _, _)| (*a - angle).abs() < 0.01)
+                        .collect();
+
+                    if probes_at_angle.len() < 2 {
+                        continue;
+                    }
+
+                    // Classify each probe
+                    let classifications: Vec<bool> = probes_at_angle
+                        .iter()
+                        .map(|(_, _, point)| {
+                            let dist_a = ((point.0 - centroid_a.0) * normal_a.0
+                                + (point.1 - centroid_a.1) * normal_a.1
+                                + (point.2 - centroid_a.2) * normal_a.2)
+                                .abs();
+                            let dist_b = ((point.0 - centroid_b.0) * normal_b.0
+                                + (point.1 - centroid_b.1) * normal_b.1
+                                + (point.2 - centroid_b.2) * normal_b.2)
+                                .abs();
+                            dist_a < dist_b
+                        })
+                        .collect();
+
+                    // Check if all agree
+                    let all_face_a = classifications.iter().all(|&c| c);
+                    let all_face_b = classifications.iter().all(|&c| !c);
+
+                    if all_face_a {
+                        // All radii agree this is face A - use these for better normal estimate
+                        for (_, _, point) in probes_at_angle {
+                            consistent_a.push(*point);
+                        }
+                    } else if all_face_b {
+                        for (_, _, point) in probes_at_angle {
+                            consistent_b.push(*point);
+                        }
+                    } else {
+                        // Inconsistent - edge likely crosses this direction
+                        inconsistent_angles.push(angle);
+                    }
+                }
+
+                // Re-fit normals using only consistent probes (higher quality)
+                let final_normal_a = if consistent_a.len() >= 4 {
+                    let all_a: Vec<_> = std::iter::once(surface_pos).chain(consistent_a.iter().copied()).collect();
+                    let (fitted, _) = fit_plane_to_points(&all_a);
+                    let dot = fitted.0 * n.0 + fitted.1 * n.1 + fitted.2 * n.2;
+                    if dot < 0.0 { (-fitted.0, -fitted.1, -fitted.2) } else { fitted }
+                } else {
+                    normal_a
+                };
+
+                let final_normal_b = if consistent_b.len() >= 4 {
+                    let all_b: Vec<_> = std::iter::once(surface_pos).chain(consistent_b.iter().copied()).collect();
+                    let (fitted, _) = fit_plane_to_points(&all_b);
+                    let dot = fitted.0 * n.0 + fitted.1 * n.1 + fitted.2 * n.2;
+                    if dot < 0.0 { (-fitted.0, -fitted.1, -fitted.2) } else { fitted }
+                } else {
+                    normal_b
+                };
+
+                // Compute edge direction
+                let edge_dir = (
+                    final_normal_a.1 * final_normal_b.2 - final_normal_a.2 * final_normal_b.1,
+                    final_normal_a.2 * final_normal_b.0 - final_normal_a.0 * final_normal_b.2,
+                    final_normal_a.0 * final_normal_b.1 - final_normal_a.1 * final_normal_b.0,
+                );
+                let edge_len = (edge_dir.0 * edge_dir.0 + edge_dir.1 * edge_dir.1 + edge_dir.2 * edge_dir.2).sqrt();
+
+                let edge_direction = if edge_len > 1e-12 {
+                    Some((edge_dir.0 / edge_len, edge_dir.1 / edge_len, edge_dir.2 / edge_len))
+                } else {
+                    None
+                };
+
+                // Use consistent clusters for edge position
+                let edge_position = if consistent_a.len() >= 3 && consistent_b.len() >= 3 {
+                    project_to_plane_intersection(
+                        surface_pos,
+                        &consistent_a,
+                        final_normal_a,
+                        &consistent_b,
+                        final_normal_b,
+                    )
+                } else {
+                    project_to_plane_intersection(surface_pos, &cluster_a, normal_a, &cluster_b, normal_b)
+                };
+
+                return ExperimentalEdgeResult {
+                    is_sharp: true,
+                    normal_a: final_normal_a,
+                    normal_b: Some(final_normal_b),
+                    edge_direction,
+                    edge_position,
+                    samples_used,
+                    method: "multiradius",
+                };
+            }
+        }
+    }
+
+    // Not a sharp edge
+    let dot = single_normal.0 * n.0 + single_normal.1 * n.1 + single_normal.2 * n.2;
+    let normal_a = if dot < 0.0 {
+        (-single_normal.0, -single_normal.1, -single_normal.2)
+    } else {
+        single_normal
+    };
+
+    ExperimentalEdgeResult {
+        is_sharp: false,
+        normal_a,
+        normal_b: None,
+        edge_direction: None,
+        edge_position: None,
+        samples_used,
+        method: "multiradius",
+    }
+}
+
 /// Run edge detection diagnostics: compute reference edge info and compare detection methods.
 ///
 /// Tests various probe counts and residual thresholds against high-precision reference.
@@ -4412,8 +5158,10 @@ where
     eprintln!("Running edge detection diagnostics on {} vertices...", vertex_count);
 
     // Compute high-precision reference for all vertices
-    eprintln!("  Computing reference edge info (32 probes, 32 iterations)...");
+    // Uses 64 directions × 4 radii = 256 probes + 2 normal probes = 258 probes per vertex
+    eprintln!("  Computing reference edge info (258 probes, 32 iterations)...");
     let samples_before_ref = stats.total_samples.load(Ordering::Relaxed);
+    let angle_threshold = sharp_config.angle_threshold;
 
     let references: Vec<ReferenceEdgeInfo> = (0..vertex_count)
         .into_par_iter()
@@ -4425,6 +5173,7 @@ where
                 search_distance,
                 sampler,
                 stats,
+                angle_threshold,
             )
         })
         .collect();
@@ -4532,7 +5281,7 @@ where
     };
 
     eprintln!(
-        "  4-probe: TPR={:.1}%  FPR={:.1}%  NormA={:.1}°  NormB={:.1}°  samples/vert={}",
+        "  standard: TPR={:.1}%  FPR={:.1}%  NormA={:.1}°  NormB={:.1}°  samples/vert={}",
         tpr * 100.0,
         fpr * 100.0,
         normal_a_mean,
@@ -4540,8 +5289,8 @@ where
         samples_used / vertex_count as u64
     );
 
-    vec![EdgeDiagnosticEntry {
-        method: "4-probe".to_string(),
+    let standard_entry = EdgeDiagnosticEntry {
+        method: "standard".to_string(),
         true_positive_rate: tpr,
         false_positive_rate: fpr,
         normal_a_error_mean: normal_a_mean,
@@ -4549,7 +5298,172 @@ where
         position_error_mean: position_mean,
         position_error_p95: position_p95,
         samples_per_vertex: samples_used / vertex_count as u64,
-    }]
+    };
+
+    // =========================================================================
+    // Test experimental method: Face-Assignment Bisection
+    // =========================================================================
+    eprintln!("  Testing bisection method...");
+    let samples_before_bisect = stats.total_samples.load(Ordering::Relaxed);
+
+    let bisection_results: Vec<ExperimentalEdgeResult> = (0..vertex_count)
+        .into_par_iter()
+        .map(|i| {
+            edge_detect_bisection(
+                refined_positions[i],
+                recomputed_normals[i],
+                probe_epsilon,
+                search_distance * 2.0,
+                sampler,
+                stats,
+                angle_threshold,
+            )
+        })
+        .collect();
+
+    let samples_bisect = stats.total_samples.load(Ordering::Relaxed) - samples_before_bisect;
+    let bisect_entry = compute_experimental_metrics(
+        &bisection_results,
+        &references,
+        "bisection",
+        samples_bisect,
+        vertex_count,
+    );
+
+    // =========================================================================
+    // Test experimental method: Multi-Radius Probing
+    // =========================================================================
+    eprintln!("  Testing multiradius method...");
+    let samples_before_multi = stats.total_samples.load(Ordering::Relaxed);
+
+    let multiradius_results: Vec<ExperimentalEdgeResult> = (0..vertex_count)
+        .into_par_iter()
+        .map(|i| {
+            edge_detect_multiradius(
+                refined_positions[i],
+                recomputed_normals[i],
+                probe_epsilon,
+                search_distance * 2.0,
+                sampler,
+                stats,
+                angle_threshold,
+            )
+        })
+        .collect();
+
+    let samples_multi = stats.total_samples.load(Ordering::Relaxed) - samples_before_multi;
+    let multi_entry = compute_experimental_metrics(
+        &multiradius_results,
+        &references,
+        "multiradius",
+        samples_multi,
+        vertex_count,
+    );
+
+    vec![standard_entry, bisect_entry, multi_entry]
+}
+
+/// Helper to compute diagnostic metrics for experimental edge detection methods.
+#[cfg(all(feature = "edge-diagnostic", feature = "native"))]
+fn compute_experimental_metrics(
+    results: &[ExperimentalEdgeResult],
+    references: &[ReferenceEdgeInfo],
+    method_name: &str,
+    samples_used: u64,
+    vertex_count: usize,
+) -> EdgeDiagnosticEntry {
+    let mut true_positives = 0;
+    let mut false_positives = 0;
+    let mut true_negatives = 0;
+    let mut false_negatives = 0;
+    let mut normal_a_errors: Vec<f64> = Vec::new();
+    let mut normal_b_errors: Vec<f64> = Vec::new();
+    let mut position_errors: Vec<f64> = Vec::new();
+
+    for (result, reference) in results.iter().zip(references.iter()) {
+        if reference.is_sharp {
+            if result.is_sharp {
+                true_positives += 1;
+
+                // Compute normal errors - handle potential face swap
+                let error_a_direct = angular_error_degrees_f64(result.normal_a, reference.normal_a);
+                let error_a_swapped = if let Some(ref_b) = reference.normal_b {
+                    angular_error_degrees_f64(result.normal_a, ref_b)
+                } else {
+                    180.0
+                };
+
+                // Use the better match (handles face A/B swap)
+                if error_a_direct <= error_a_swapped {
+                    normal_a_errors.push(error_a_direct);
+                    if let (Some(res_b), Some(ref_b)) = (result.normal_b, reference.normal_b) {
+                        normal_b_errors.push(angular_error_degrees_f64(res_b, ref_b));
+                    }
+                } else {
+                    normal_a_errors.push(error_a_swapped);
+                    if let (Some(res_b), Some(_)) = (result.normal_b, reference.normal_b) {
+                        normal_b_errors.push(angular_error_degrees_f64(res_b, reference.normal_a));
+                    }
+                }
+
+                // Position error
+                if let (Some(res_pos), Some(ref_pos)) = (result.edge_position, reference.intersection_point) {
+                    let err = dist_f64(res_pos, ref_pos);
+                    position_errors.push(err);
+                }
+            } else {
+                false_negatives += 1;
+            }
+        } else if result.is_sharp {
+            false_positives += 1;
+        } else {
+            true_negatives += 1;
+        }
+    }
+
+    let total_sharp = true_positives + false_negatives;
+    let total_smooth = true_negatives + false_positives;
+
+    let tpr = if total_sharp > 0 { true_positives as f64 / total_sharp as f64 } else { 1.0 };
+    let fpr = if total_smooth > 0 { false_positives as f64 / total_smooth as f64 } else { 0.0 };
+
+    let normal_a_mean = if !normal_a_errors.is_empty() {
+        normal_a_errors.iter().sum::<f64>() / normal_a_errors.len() as f64
+    } else { 0.0 };
+
+    let normal_b_mean = if !normal_b_errors.is_empty() {
+        normal_b_errors.iter().sum::<f64>() / normal_b_errors.len() as f64
+    } else { 0.0 };
+
+    position_errors.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let position_mean = if !position_errors.is_empty() {
+        position_errors.iter().sum::<f64>() / position_errors.len() as f64
+    } else { 0.0 };
+    let position_p95 = if !position_errors.is_empty() {
+        let idx = (position_errors.len() as f64 * 0.95) as usize;
+        position_errors[idx.min(position_errors.len() - 1)]
+    } else { 0.0 };
+
+    eprintln!(
+        "  {}: TPR={:.1}%  FPR={:.1}%  NormA={:.1}°  NormB={:.1}°  samples/vert={}",
+        method_name,
+        tpr * 100.0,
+        fpr * 100.0,
+        normal_a_mean,
+        normal_b_mean,
+        samples_used / vertex_count as u64
+    );
+
+    EdgeDiagnosticEntry {
+        method: method_name.to_string(),
+        true_positive_rate: tpr,
+        false_positive_rate: fpr,
+        normal_a_error_mean: normal_a_mean,
+        normal_b_error_mean: normal_b_mean,
+        position_error_mean: position_mean,
+        position_error_p95: position_p95,
+        samples_per_vertex: samples_used / vertex_count as u64,
+    }
 }
 
 /// Compute angular error between two f64 normals in degrees.
@@ -4592,6 +5506,7 @@ pub fn run_crossing_diagnostics<F>(
     cell_size: (f64, f64, f64),
     sampler: &F,
     stats: &SamplingStats,
+    angle_threshold: f64,
 ) -> CrossingDiagnosticEntry
 where
     F: SamplerFn,
@@ -4721,12 +5636,12 @@ where
         let v0_norm = normals[v0_idx];
         let v1_norm = normals[v1_idx];
 
-        // Use expensive 32-probe reference detection on each endpoint
+        // Use expensive 258-probe reference detection on each endpoint
         let ref_v0 = compute_reference_edge_info(
-            v0_pos, v0_norm, probe_epsilon, search_distance, sampler, stats
+            v0_pos, v0_norm, probe_epsilon, search_distance, sampler, stats, angle_threshold
         );
         let ref_v1 = compute_reference_edge_info(
-            v1_pos, v1_norm, probe_epsilon, search_distance, sampler, stats
+            v1_pos, v1_norm, probe_epsilon, search_distance, sampler, stats, angle_threshold
         );
 
         eprintln!(
