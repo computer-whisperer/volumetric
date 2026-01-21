@@ -2,14 +2,22 @@
 
 ## Executive Summary
 
-The normal probing system estimates surface normals at mesh vertices by sampling nearby surface points and fitting planes. After implementing adaptive multi-phase probing, the system now achieves:
+The normal probing system estimates surface normals at mesh vertices by sampling nearby surface points and fitting planes. After implementing adaptive multi-phase probing and experimental algorithms, the system achieves:
 
-- **9° normal error** (down from 16-18°)
+**Standard Algorithm (Production):**
+- **4.2° normal error** vs analytical ground truth (NormA)
 - **100% true positive rate** for sharp edge detection
 - **0% false positive rate**
-- **73 samples/vertex** (down from ~180)
+- **73 samples/vertex**
 
-The key insight from testing is that **clustering-based point assignment consistently outperforms edge-direction-based assignment**, even when the edge direction is estimated from PCA.
+**Experimental Algorithms:**
+- **Bisection:** 3.7° error, 457 samples/vertex
+- **Multiradius:** 3.0° error, 912 samples/vertex
+
+**Key Insights:**
+1. **Clustering-based point assignment consistently outperforms edge-direction-based assignment**, even when the edge direction is estimated from PCA.
+2. **The probe-based reference diagnostic has inherent error** (~5.6° vs analytical truth), making "vs reference" metrics misleading. Always validate against analytical ground truth when available.
+3. **More probes help, but with diminishing returns.** The standard 73-sample method achieves 4.2° error; the 912-sample multiradius achieves 3.0° — only 1.2° improvement for 12x the cost.
 
 ---
 
@@ -429,6 +437,140 @@ An alternative approach was tested that used geometric edge direction estimation
 
 ---
 
+## Experimental Algorithms (2024)
+
+Two new experimental edge detection algorithms were implemented and tested against both the probe-based reference and analytical ground truth.
+
+### Algorithm: Face-Assignment Bisection (`edge_detect_bisection`)
+
+**Concept:** Binary search around the vertex to find angles where face assignment changes, then sample densely on each side.
+
+**Algorithm:**
+```
+1. Initial probing (12 directions at 30° spacing)
+   - Classify each probe point to face A or B via clustering
+
+2. Edge angle detection
+   - For each adjacent pair of probes with different face assignments:
+     - Binary search (8 iterations) to find precise transition angle
+   - Collect 2-4 edge crossing angles
+
+3. Face-specific sampling
+   - For each detected face region:
+     - Sample 8 additional probes within that angular range
+     - Fit plane to face-specific points
+
+4. Final plane fitting with all points per face
+```
+
+**Results:**
+| Metric | Value |
+|--------|-------|
+| vs Reference NormA | 2.7° |
+| vs Reference NormB | 4.4° |
+| vs Analytical NormA | 3.7° |
+| vs Analytical NormB | 7.5° |
+| Samples/vertex | 457 |
+| TPR | 100% |
+| FPR | 0% |
+
+**Analysis:** Bisection achieves the best "vs reference" metrics because it uses a similar sampling strategy. However, analytical validation shows it's only marginally better than the standard method (3.7° vs 4.2°) at 6x the sample cost.
+
+---
+
+### Algorithm: Multi-Radius Probing (`edge_detect_multiradius`)
+
+**Concept:** Probe at multiple radii (0.5x, 0.75x, 1.0x, 1.5x epsilon) and use consistency across radii to detect edges and improve normal estimates.
+
+**Algorithm:**
+```
+1. Multi-radius probing
+   - For each of 16 directions (golden-ratio distributed):
+     - Probe at 4 different radii
+     - Track which probes find surface successfully
+
+2. Consistency analysis
+   - For each direction, check if all radii agree on face assignment
+   - Directions with inconsistent assignments indicate edge proximity
+
+3. Clustering with radius weighting
+   - Weight points by radius (smaller radius = higher confidence)
+   - Cluster using weighted residual
+
+4. Edge detection
+   - If clustering shows clear separation with angle > threshold:
+     - Mark as sharp edge
+     - Return both face normals
+```
+
+**Results:**
+| Metric | Value |
+|--------|-------|
+| vs Reference NormA | 3.2° |
+| vs Reference NormB | 7.4° |
+| vs Analytical NormA | 3.0° |
+| vs Analytical NormB | 8.1° |
+| Samples/vertex | 912 |
+| TPR | 100% |
+| FPR | 0% |
+
+**Analysis:** Multiradius achieves the best analytical accuracy for NormA (3.0°) but at very high sample cost (912 samples). The NormB error is higher, suggesting the second face normal is harder to estimate accurately.
+
+---
+
+## Analytical Ground Truth Validation
+
+### The Problem with Probe-Based References
+
+The original diagnostic compared detection methods against a "reference" computed with 258 probes. However, this reference itself has error because:
+
+1. **Same fundamental limitations:** The reference uses the same probe-and-cluster approach, just with more probes
+2. **Search direction bias:** All methods search along the initial blended normal
+3. **Discretization effects:** Probing a boolean field has inherent quantization
+
+### Analytical Ground Truth
+
+For the rotated cube test case (rx=35.264°, ry=45°, rz=0°), we can compute the **exact** face normals analytically by applying the rotation matrix to the 6 unit cube face normals.
+
+**Implementation:** `AnalyticalRotatedCube` struct in `adaptive_surface_nets_2.rs`
+
+```rust
+// Euler XYZ rotation: R = Rz * Ry * Rx
+let analytical = AnalyticalRotatedCube::new(35.264, 45.0, 0.0);
+let (error_a, error_b) = analytical.compute_pair_errors(detected_normal_a, detected_normal_b);
+```
+
+### Validation Results
+
+| Method | vs Reference A | vs Reference B | vs Analytical A | vs Analytical B | Samples |
+|--------|---------------|----------------|-----------------|-----------------|---------|
+| Reference (258-probe) | — | — | **5.6°** | **5.2°** | 9,034 |
+| Standard | 13.4° | 13.4° | **4.2°** | 8.5° | 73 |
+| Bisection | 2.7° | 4.4° | **3.7°** | 7.5° | 457 |
+| Multiradius | 3.2° | 7.4° | **3.0°** | 8.1° | 912 |
+
+### Key Findings
+
+1. **The reference has ~5.6° error** against analytical truth. This means any method can appear to have up to ~11° error "vs reference" even if it's actually quite accurate.
+
+2. **Standard method outperforms reference on NormA** (4.2° vs 5.6°). The "13.4° vs reference" metric was misleading — the standard method is actually doing well.
+
+3. **Diminishing returns on samples:** Going from 73 to 912 samples only improves NormA from 4.2° to 3.0° (1.2° gain for 12x cost).
+
+4. **NormB is consistently harder:** All methods show higher error on the second face normal (7.5-8.5° vs 3.0-4.2° for NormA). This may be due to:
+   - Smaller angular coverage on one side of the edge
+   - Systematic bias in the initial normal direction
+   - Fewer probe points landing on the "far" face
+
+### Recommendations
+
+- **Always validate against analytical ground truth** when testing on known geometry
+- **Don't trust "vs reference" metrics alone** — the reference has its own errors
+- **Focus optimization efforts on NormB** — there's more room for improvement there
+- **Consider the cost/benefit tradeoff** — 73 samples at 4.2° error may be better than 912 samples at 3.0° error for most use cases
+
+---
+
 ## Recommendation (Updated)
 
 **Completed:** ✅ Adaptive Multi-Phase Probing (Approach B)
@@ -436,17 +578,32 @@ An alternative approach was tested that used geometric edge direction estimation
 - Escalation to 24 probes for edges
 - Golden-ratio distribution in Phase 4
 
-**Current state:** 9° normal error is acceptable for most use cases, and TPR/FPR are perfect.
+**Completed:** ✅ Experimental Algorithms
+- Face-Assignment Bisection (3.7° analytical error, 457 samples)
+- Multi-Radius Probing (3.0° analytical error, 912 samples)
+
+**Completed:** ✅ Analytical Ground Truth Validation
+- `AnalyticalRotatedCube` struct for rotated cube test case
+- Diagnostics now report both vs-reference and vs-analytical metrics
+
+**Current state:**
+- Standard method achieves **4.2° analytical error** at 73 samples/vertex
+- TPR/FPR are perfect (100%/0%)
+- This is likely sufficient for most use cases
 
 **Next priorities (if further improvement needed):**
 
-1. **More aggressive escalation:** For vertices with residual still high after 24 probes, escalate to 32-48 probes. This is a straightforward extension of the current approach.
+1. **Improve NormB accuracy:** All methods show ~2x higher error on NormB (7-8°) compared to NormA (3-4°). Investigate why and address the asymmetry.
 
-2. **Improve clustering:** The clustering algorithm is the key to accuracy. Better splitting strategies or iterative refinement could reduce error below 9°.
+2. **Hybrid approach:** Use bisection's edge-angle detection with standard clustering for point assignment. This might get bisection-level accuracy at lower sample cost.
 
-3. **Adaptive probe epsilon:** For very tight edges, smaller epsilon could keep probes on the correct face. This would help with vertices where the edge passes very close.
+3. **Adaptive probe epsilon:** For very tight edges, smaller epsilon could keep probes on the correct face.
 
-**Not recommended:** Edge-specific probing based on estimated edge direction. Testing showed this consistently performs worse than clustering due to error propagation.
+4. **Test on more geometry:** Current validation uses only the rotated cube. Test on spheres, cylinders, and complex CSG to ensure generalization.
+
+**Not recommended:**
+- Edge-specific probing based on estimated edge direction (consistently worse than clustering)
+- Massive sample increases for marginal gains (912 samples → 3.0° vs 73 samples → 4.2°)
 
 ---
 
@@ -454,25 +611,28 @@ An alternative approach was tested that used geometric edge direction estimation
 
 When testing changes, measure:
 
-1. **Normal accuracy** (degrees error vs 32-probe reference)
-   - ~~Original: 16-18° mean~~
-   - **Current: 9.0°/9.6° (NormA/NormB)** ✅
-   - Target: <10° mean, <5° for smooth surfaces
+1. **Normal accuracy vs analytical ground truth** (primary metric for known geometry)
+   - **Current: 4.2°/8.5° (NormA/NormB)** ✅
+   - Target: <5° NormA, <8° NormB
 
-2. **Sharp edge detection**
+2. **Normal accuracy vs reference** (secondary metric, useful for relative comparison)
+   - Current: 13.4°/13.4° (NormA/NormB)
+   - Note: Reference itself has ~5.6° error vs analytical
+
+3. **Sharp edge detection**
    - True positive rate: **100%** ✅
    - False positive rate: **0%** ✅
 
-3. **Crossing position error** (% of cell size)
-   - Current: 2.67% mean, 5.32% P95
+4. **Crossing position error** (% of cell size)
+   - Current: 2.00% mean, 5.32% P95
    - Target: <2% mean, <4% P95
 
-4. **Sample efficiency**
+5. **Sample efficiency**
    - ~~Original: ~180 samples/vertex~~
    - **Current: 73 samples/vertex** ✅
    - Target: Similar or better for same accuracy
 
-5. **Visual quality**
+6. **Visual quality**
    - Render with `--recalc-normals` and check for scalloping
    - Edge straightness at depth 1-2
 
@@ -481,10 +641,19 @@ When testing changes, measure:
 ## Test Commands
 
 ```bash
-# Run edge diagnostics
+# Run edge diagnostics (includes analytical ground truth validation)
 cargo run -p volumetric_cli --release --features volumetric/edge-diagnostic -- \
   mesh -i rotated_cube.wasm/rotated_cube.wasm -o /tmp/test.stl \
   --sharp-edges --max-depth 2
+
+# Expected output includes:
+#   Reference vs analytical: NormA=5.6°  NormB=5.2°
+#   standard: TPR=100.0%  FPR=0.0%  NormA=13.4°  NormB=13.4°  samples/vert=73
+#            vs analytical: NormA=4.2°  NormB=8.5°
+#   bisection: TPR=100.0%  FPR=0.0%  NormA=2.7°  NormB=4.4°  samples/vert=457
+#            vs analytical: NormA=3.7°  NormB=7.5°
+#   multiradius: TPR=100.0%  FPR=0.0%  NormA=3.2°  NormB=7.4°  samples/vert=912
+#            vs analytical: NormA=3.0°  NormB=8.1°
 
 # Render to check visual quality
 cargo run -p volumetric_cli --release -- render \
@@ -494,3 +663,13 @@ cargo run -p volumetric_cli --release -- render \
   --projection ortho --ortho-scale 0.8 \
   --width 1024 --height 1024 --grid 0
 ```
+
+## Enhanced Reference Diagnostic
+
+The reference diagnostic was upgraded to use 258 probes per vertex:
+- 64 directions (golden-ratio distributed)
+- 4 radii per direction (0.5x, 0.75x, 1.0x, 1.25x epsilon)
+- 2 additional probes along the normal direction
+- 32 binary search iterations (up from 12)
+
+Despite this thorough sampling, the reference still has ~5.6° error against analytical ground truth, demonstrating the inherent limitations of probe-based normal estimation on boolean fields.
