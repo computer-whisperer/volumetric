@@ -2732,18 +2732,16 @@ where
     let is_potential_edge = single_residual > escalation_threshold;
 
     // =========================================================================
-    // PHASE 3: Escalation - add 12 more probes for potential edges
+    // PHASE 3: Escalation for potential edges
     // =========================================================================
-    // If this looks like an edge, get more samples BEFORE trying detection
-    // This improves normal accuracy from ~16° to ~8° (more points per cluster)
+    // If high residual suggests an edge, add 12 more probes (24 total) before
+    // attempting clustering. More points = better plane fits = lower normal error.
     if is_potential_edge {
-        // Add 12 more probes using golden-ratio distribution for better uniformity
+        // Add 12 more probes using golden-ratio distribution
         let golden_ratio = (1.0 + 5.0_f64.sqrt()) / 2.0;
         for i in 0..12 {
-            // Golden-ratio spiral gives better angular distribution than uniform
             let angle = 2.0 * std::f64::consts::PI * (i as f64) / golden_ratio;
-            // Offset to avoid overlapping with existing probe directions
-            let angle = angle + std::f64::consts::PI / 12.0;
+            let angle = angle + std::f64::consts::PI / 12.0; // Offset from existing probes
             let cos_a = angle.cos();
             let sin_a = angle.sin();
             let dir = (
@@ -2770,7 +2768,7 @@ where
             }
         }
 
-        // Re-fit with all 24 points and try edge detection
+        // Re-fit and try clustering with 24 points
         let (_single_normal_v2, single_residual_v2) = fit_plane_to_points(&surface_points);
 
         if let Some(result) = try_sharp_edge_detection(
@@ -2794,6 +2792,7 @@ where
             probe_epsilon,
             sharp_config,
         ) {
+            // Edge detected! Return the detection result directly
             return result;
         }
     }
