@@ -334,6 +334,8 @@ pub struct VertexSharpInfo {
     pub normal_a: (f64, f64, f64),
     /// Secondary normal (present only if vertex is sharp)
     pub normal_b: Option<(f64, f64, f64)>,
+    /// Diagnostic: cluster sizes (cluster_a_size, cluster_b_size) when sharp
+    pub cluster_sizes: Option<(usize, usize)>,
 }
 
 impl Default for VertexSharpInfo {
@@ -342,6 +344,7 @@ impl Default for VertexSharpInfo {
             is_sharp: false,
             normal_a: (0.0, 1.0, 0.0),
             normal_b: None,
+            cluster_sizes: None,
         }
     }
 }
@@ -2553,6 +2556,7 @@ fn try_sharp_edge_detection(
                 is_sharp: true,
                 normal_a,
                 normal_b: Some(normal_b),
+                cluster_sizes: Some((cluster_a.len(), cluster_b.len())),
             },
         ));
     }
@@ -2597,6 +2601,7 @@ where
                 is_sharp: false,
                 normal_a: (0.0, 1.0, 0.0),
                 normal_b: None,
+                cluster_sizes: None,
             },
         );
     }
@@ -2670,6 +2675,7 @@ where
                     is_sharp: false,
                     normal_a: final_normal,
                     normal_b: None,
+                    cluster_sizes: None,
                 },
             );
         }
@@ -2721,6 +2727,7 @@ where
                 is_sharp: false,
                 normal_a: n,
                 normal_b: None,
+                cluster_sizes: None,
             },
         );
     }
@@ -2846,6 +2853,7 @@ where
             is_sharp: false,
             normal_a: blended,
             normal_b: None,
+            cluster_sizes: None,
         },
     )
 }
@@ -3321,6 +3329,7 @@ fn retriangulate_with_crossings(
             is_sharp: true,
             normal_a: crossing.normal_before,
             normal_b: Some(crossing.normal_after),
+            cluster_sizes: None, // Not applicable for crossing vertices
         });
 
         edge_to_new_vertex.insert(key, new_idx);
@@ -3896,6 +3905,7 @@ where
             is_sharp: false,
             normal_a: n,
             normal_b: None,
+            cluster_sizes: None,
         })
         .collect();
 
@@ -6474,6 +6484,135 @@ where
 
     let total_sharp = true_positives + false_negatives;
     let total_smooth = true_negatives + false_positives;
+
+    // Detailed analysis: for each true positive, check which normal is better
+    let mut a_better_count = 0usize;
+    let mut b_better_count = 0usize;
+    let mut a_errors_when_better: Vec<f64> = Vec::new();
+    let mut b_errors_when_better: Vec<f64> = Vec::new();
+    let mut a_errors_when_worse: Vec<f64> = Vec::new();
+    let mut b_errors_when_worse: Vec<f64> = Vec::new();
+
+    for (pred, _reference) in predictions.iter().zip(references.iter()) {
+        if pred.is_sharp {
+            let (ana_err_a, ana_err_b_opt) = analytical.compute_pair_errors(pred.normal_a, pred.normal_b);
+            if let Some(ana_err_b) = ana_err_b_opt {
+                if ana_err_a <= ana_err_b {
+                    a_better_count += 1;
+                    a_errors_when_better.push(ana_err_a);
+                    b_errors_when_worse.push(ana_err_b);
+                } else {
+                    b_better_count += 1;
+                    b_errors_when_better.push(ana_err_b);
+                    a_errors_when_worse.push(ana_err_a);
+                }
+            }
+        }
+    }
+
+    let a_better_mean = if !a_errors_when_better.is_empty() {
+        a_errors_when_better.iter().sum::<f64>() / a_errors_when_better.len() as f64
+    } else { 0.0 };
+    let b_worse_mean = if !b_errors_when_worse.is_empty() {
+        b_errors_when_worse.iter().sum::<f64>() / b_errors_when_worse.len() as f64
+    } else { 0.0 };
+    let b_better_mean = if !b_errors_when_better.is_empty() {
+        b_errors_when_better.iter().sum::<f64>() / b_errors_when_better.len() as f64
+    } else { 0.0 };
+    let a_worse_mean = if !a_errors_when_worse.is_empty() {
+        a_errors_when_worse.iter().sum::<f64>() / a_errors_when_worse.len() as f64
+    } else { 0.0 };
+
+    // Also analyze which analytical face each normal matched and cluster sizes
+    // Additionally check if the search direction (initial normal) correlates with accuracy
+    let mut face_matches: Vec<(String, String, f64, f64, Option<(usize, usize)>)> = Vec::new();
+    let mut search_dir_closer_to_better = 0;
+    let mut search_dir_closer_to_worse = 0;
+    let face_names = ["+X", "-X", "+Y", "-Y", "+Z", "-Z"];
+
+    for (i, (pred, _reference)) in predictions.iter().zip(references.iter()).enumerate() {
+        if pred.is_sharp {
+            if let Some(pred_b) = pred.normal_b {
+                let (best_a, err_a) = analytical.find_best_match(pred.normal_a);
+                let (best_b, err_b) = analytical.find_best_match(pred_b);
+
+                // Find face names
+                let face_a_idx = analytical.face_normals.iter().position(|&n| {
+                    let dot = n.0 * best_a.0 + n.1 * best_a.1 + n.2 * best_a.2;
+                    dot > 0.99
+                }).unwrap_or(0);
+                let face_b_idx = analytical.face_normals.iter().position(|&n| {
+                    let dot = n.0 * best_b.0 + n.1 * best_b.1 + n.2 * best_b.2;
+                    dot > 0.99
+                }).unwrap_or(0);
+
+                // Check: is the initial normal (search direction) closer to the better face?
+                let initial_n = recomputed_normals[i];
+                let dot_to_a = initial_n.0 * best_a.0 + initial_n.1 * best_a.1 + initial_n.2 * best_a.2;
+                let dot_to_b = initial_n.0 * best_b.0 + initial_n.1 * best_b.1 + initial_n.2 * best_b.2;
+
+                let a_is_better = err_a < err_b;
+                let initial_closer_to_a = dot_to_a.abs() > dot_to_b.abs();
+
+                if (a_is_better && initial_closer_to_a) || (!a_is_better && !initial_closer_to_a) {
+                    search_dir_closer_to_better += 1;
+                } else {
+                    search_dir_closer_to_worse += 1;
+                }
+
+                face_matches.push((
+                    face_names[face_a_idx].to_string(),
+                    face_names[face_b_idx].to_string(),
+                    err_a,
+                    err_b,
+                    pred.cluster_sizes,
+                ));
+            }
+        }
+    }
+
+    eprintln!("  === NormA vs NormB Analysis ===");
+    eprintln!("    A more accurate: {} vertices (A={:.1}°, B={:.1}°)",
+        a_better_count, a_better_mean, b_worse_mean);
+    eprintln!("    B more accurate: {} vertices (B={:.1}°, A={:.1}°)",
+        b_better_count, b_better_mean, a_worse_mean);
+    eprintln!("    Search direction correlation:");
+    eprintln!("      Initial normal closer to BETTER face: {} vertices", search_dir_closer_to_better);
+    eprintln!("      Initial normal closer to WORSE face: {} vertices", search_dir_closer_to_worse);
+
+    // Cluster size analysis
+    let mut larger_cluster_better = 0;
+    let mut smaller_cluster_better = 0;
+    let mut cluster_size_data: Vec<(usize, usize, f64, f64)> = Vec::new(); // (sizeA, sizeB, errA, errB)
+
+    for (_, _, ea, eb, sizes_opt) in &face_matches {
+        if let Some((size_a, size_b)) = sizes_opt {
+            cluster_size_data.push((*size_a, *size_b, *ea, *eb));
+            if ea < eb {
+                // A is better - check if A has larger cluster
+                if size_a >= size_b { larger_cluster_better += 1; }
+                else { smaller_cluster_better += 1; }
+            } else {
+                // B is better - check if B has larger cluster
+                if size_b >= size_a { larger_cluster_better += 1; }
+                else { smaller_cluster_better += 1; }
+            }
+        }
+    }
+
+    eprintln!("    Cluster size correlation:");
+    eprintln!("      Larger cluster more accurate: {} vertices", larger_cluster_better);
+    eprintln!("      Smaller cluster more accurate: {} vertices", smaller_cluster_better);
+
+    // Print detailed cluster info
+    eprintln!("    Detailed (sizeA, sizeB, errA, errB):");
+    for (i, (sa, sb, ea, eb)) in cluster_size_data.iter().take(10).enumerate() {
+        let better = if ea < eb { "A" } else { "B" };
+        let larger = if sa >= sb { "A" } else { "B" };
+        eprintln!("      #{}: sizes=({},{}) errs=({:.1}°,{:.1}°) => {} better, {} larger",
+            i + 1, sa, sb, ea, eb, better, larger);
+    }
+    eprintln!("  ===============================");
 
     let tpr = if total_sharp > 0 {
         true_positives as f64 / total_sharp as f64
