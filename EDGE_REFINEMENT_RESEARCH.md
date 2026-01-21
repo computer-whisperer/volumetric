@@ -615,3 +615,174 @@ src/adaptive_surface_nets_2/
 **Rationale**: The sharp edge detection algorithms documented in this file did not achieve production-quality results. The experimental code was consuming maintenance effort without providing value. By stubbing Stage 4, the meshing pipeline is simpler and faster while research can continue separately.
 
 **Archived code location**: See `PHASE4_ARCHIVE.md` for documentation of removed algorithms and their line ranges in the git history.
+
+---
+
+## Phase 4 Research Infrastructure Results (2026-01-21)
+
+### New Infrastructure Created
+
+Built comprehensive validation framework in `src/adaptive_surface_nets_2/stage4/research/`:
+
+| Module | Purpose |
+|--------|---------|
+| `analytical_cube.rs` | Ground truth geometry for rotated cube |
+| `sample_cache.rs` | Tracks samples, binary search helpers |
+| `reference_surface.rs` | Dense probing + plane fitting for faces |
+| `reference_edge.rs` | Original k-means clustering approach |
+| `improved_reference.rs` | 4 alternative approaches tested |
+| `robust_surface.rs` | **RANSAC face detection (0.021° avg)** |
+| `robust_edge.rs` | **RANSAC edge detection (0.19° avg)** |
+| `robust_corner.rs` | **RANSAC corner detection (0.11° avg)** |
+| `diagnostic_edge.rs` | Error source analysis |
+| `validation.rs` | Test point generation, accuracy metrics |
+
+### Critical Discovery: Binary Samplers vs SDFs
+
+From README: **Models return binary values (1 inside, 0 outside), NOT signed distance fields.**
+
+**Implication for edge detection:**
+- Central difference gradients are useless (yield 0 almost everywhere)
+- Cannot compute surface normals via gradient
+- Must use geometric methods on surface point positions
+
+**Proof from diagnostic:**
+```
+Gradient Epsilon Effect (at surface point on Face A):
+  Epsilon     Error°
+  0.1000      19.47°    (all produce identical wrong answer)
+  0.0100      19.47°
+  0.0010      19.47°
+
+Expected normal: (-0.408, -0.816, -0.408)
+Gradient gives:  (-0.577, -0.577, -0.577)  ← corner direction, NOT face normal
+```
+
+The gradient of a binary field points toward the nearest corner (in unrotated space), not perpendicular to the face.
+
+### Algorithm Comparison (12 edges of rotated cube)
+
+| Approach | Avg Error | Max Error | Success | Notes |
+|----------|-----------|-----------|---------|-------|
+| Original k-means position | 25.95° | 90.00° | 12/12 | Clusters by spatial distance |
+| Normal Clustering | 19.68° | 97.42° | 10/12 | Uses gradient (wrong) |
+| RANSAC (0.02 threshold) | 11.83° | 90.23° | 12/12 | Some outlier contamination |
+| Gradient Threshold | 6.49° | 19.47° | 12/12 | Lucky coincidence |
+| Two-Pass | 18.85° | 90.00° | 10/12 | Gradient clustering failed |
+
+**All gradient-based methods fundamentally broken for binary samplers.**
+
+### RANSAC Breakthrough: 0.19° Average Error
+
+Pure RANSAC plane fitting (no gradients) with **tight inlier threshold**:
+
+```
+Config: 200 probes, 0.01 threshold
+Edge    Na Err°    Nb Err°    Avg°     Inliers
+0         0.17       0.00      0.09     70/63
+1         0.07       0.00      0.04     71/64
+2         0.09       0.00      0.05     71/66
+...
+Success: 12/12, Avg: 0.19°, Max: 2.00°   ← TARGET MET!
+```
+
+**Key insight: The inlier threshold is critical.**
+
+| Threshold | Avg Error | Max Error | Notes |
+|-----------|-----------|-----------|-------|
+| 0.03 | 7.03° | 85.00° | Too loose, cross-contamination |
+| 0.02 | 2.73° | 35.06° | Some edge failures |
+| **0.01** | **0.19°** | **2.00°** | **Optimal** |
+
+At 0.01 threshold (1% of half-width):
+- Points clearly on one face are inliers
+- Points near the edge are excluded
+- Each plane fits only clean face samples
+
+### Algorithm: RANSAC Edge Detection for Binary Samplers
+
+```
+Input: point P near suspected edge, sampler function
+Output: edge direction, two face normals, point on edge
+
+1. PROBE: Generate N directions (Fibonacci sphere), binary search each to surface
+   → 200 directions, 30 binary search iterations each
+
+2. RANSAC PLANE 1:
+   - Random 3-point plane hypotheses (200 iterations)
+   - Count inliers (points within 0.01 distance)
+   - Keep plane with most inliers
+   - Refit via SVD to all inliers
+
+3. RANSAC PLANE 2:
+   - Remove plane 1 inliers from point set
+   - Repeat RANSAC on remaining points
+   - Refit via SVD
+
+4. EDGE:
+   - Edge direction = cross(normal_1, normal_2)
+   - Point on edge = iterative projection onto both planes
+   - Orient normals away from query point
+```
+
+### Why This Works
+
+1. **Binary search finds exact surface points**: Even with binary sampler, iterative bisection converges to surface crossing positions
+
+2. **Surface points lie on faces**: For a polyhedron, probed surface points cluster on flat faces
+
+3. **RANSAC is robust to outliers**: Points near the edge (on neither face) are naturally excluded
+
+4. **Plane fitting is accurate**: With clean face samples, SVD gives near-perfect plane normal
+
+5. **Tight threshold separates faces**: 0.01 is strict enough that a point can't be inlier to both planes
+
+### Corner Detection: 0.11° Average Error
+
+Same RANSAC approach extended to find 3 planes:
+
+```
+Config: 400 probes, 0.006 threshold
+Corner    Faces    N1 Err°    N2 Err°    N3 Err°    Pos Err
+0            3       0.60       0.02       0.47     0.0014
+1            3       0.00       0.00       0.05     0.0002
+2            3       0.03       0.00       0.50     0.0015
+...
+Success: 8/8, Avg normal: 0.11°, Max: 0.60°, Avg pos: 0.0006
+```
+
+Key additions for corner detection:
+- **Duplicate plane rejection**: Skip planes with normals within 25° of existing planes
+- **Tighter threshold**: 0.006 vs 0.01 for edges (corners need cleaner face separation)
+- **More probes**: 400 vs 200 (need good coverage of all 3 faces)
+
+### Face Detection: 0.021° Average Error
+
+RANSAC also dramatically improves face detection (75x improvement):
+
+```
+Config: 150 probes, 0.005 threshold
+Face         Error°    Inliers     Residual
+Face 0        0.019     64/96       0.000161
+Face 1        0.000     62/98       0.000000
+Face 2        0.073     61/98       0.000446
+...
+Avg: 0.021°, Max: 0.073°
+```
+
+### Final Results Summary
+
+| Detection | Method | Avg Error | Max Error | Target | Status |
+|-----------|--------|-----------|-----------|--------|--------|
+| **Face** | RANSAC (0.005) | **0.021°** | 0.073° | <1° | ✅ |
+| **Edge** | RANSAC (0.01) | **0.19°** | 2.00° | <1° | ✅ |
+| **Corner** | RANSAC (0.006) | **0.11°** | 0.60° | <1° | ✅ |
+
+**All three detection types now meet the <1° target!**
+
+### Remaining Work
+
+1. **Adaptive threshold**: Scale with cell size / expected feature size
+2. **Integration**: Replace Stage 4 stub with validated RANSAC approach
+3. **Classification**: Automatically determine if point is near face, edge, or corner
+4. **Edge case handling**: Ambiguous geometry, non-polyhedral surfaces
