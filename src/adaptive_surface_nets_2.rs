@@ -4623,6 +4623,1096 @@ pub struct ExperimentalEdgeResult {
     pub method: &'static str,
 }
 
+// =============================================================================
+// SAMPLE-BY-SAMPLE EDGE DETECTION INFRASTRUCTURE
+// =============================================================================
+
+/// A single cached boolean sample (position + is_inside result).
+#[cfg(feature = "edge-diagnostic")]
+#[derive(Clone, Debug)]
+pub struct CachedSample {
+    pub position: (f64, f64, f64),
+    pub is_inside: bool,
+}
+
+/// Cache that tracks all boolean samples taken during edge detection.
+///
+/// Key insight: Instead of each "probe" consuming ~14 samples internally and
+/// discarding intermediate data, we track every (position, is_inside) sample.
+/// This allows algorithms to make decisions based on all accumulated data.
+#[cfg(feature = "edge-diagnostic")]
+pub struct SampleCache {
+    samples: Vec<CachedSample>,
+}
+
+#[cfg(feature = "edge-diagnostic")]
+impl SampleCache {
+    /// Create a new empty sample cache.
+    pub fn new() -> Self {
+        Self { samples: Vec::new() }
+    }
+
+    /// Sample a position and cache the result.
+    pub fn sample<F>(
+        &mut self,
+        pos: (f64, f64, f64),
+        sampler: &F,
+        stats: &SamplingStats,
+    ) -> &CachedSample
+    where
+        F: SamplerFn,
+    {
+        let is_inside = sample_is_inside(sampler, pos.0, pos.1, pos.2, stats);
+        self.samples.push(CachedSample { position: pos, is_inside });
+        self.samples.last().unwrap()
+    }
+
+    /// Get the number of samples in the cache.
+    pub fn count(&self) -> usize {
+        self.samples.len()
+    }
+
+    /// Partition samples into inside and outside sets.
+    pub fn partition(&self) -> (Vec<(f64, f64, f64)>, Vec<(f64, f64, f64)>) {
+        let inside: Vec<_> = self.samples.iter()
+            .filter(|s| s.is_inside)
+            .map(|s| s.position)
+            .collect();
+        let outside: Vec<_> = self.samples.iter()
+            .filter(|s| !s.is_inside)
+            .map(|s| s.position)
+            .collect();
+        (inside, outside)
+    }
+
+    /// Get all samples.
+    pub fn all_samples(&self) -> &[CachedSample] {
+        &self.samples
+    }
+
+    /// Check if there's a mix of inside and outside samples.
+    pub fn has_mixed_samples(&self) -> bool {
+        let has_inside = self.samples.iter().any(|s| s.is_inside);
+        let has_outside = self.samples.iter().any(|s| !s.is_inside);
+        has_inside && has_outside
+    }
+}
+
+/// Bootstrap phase for sample-by-sample edge detection.
+///
+/// Samples:
+/// - Vertex position (1 sample)
+/// - 4 cardinal directions at probe_epsilon in the tangent plane (4 samples)
+/// - ±normal at 0.5*epsilon and 1.0*epsilon (4 samples)
+///
+/// Total: 9 bootstrap samples
+///
+/// Returns:
+/// - SampleCache with bootstrap samples
+/// - Tangent basis (t1, t2)
+/// - Whether the vertex is potentially on an edge (has mixed samples)
+#[cfg(feature = "edge-diagnostic")]
+fn bootstrap_edge_detection<F>(
+    surface_pos: (f64, f64, f64),
+    initial_normal: (f64, f64, f64),
+    probe_epsilon: f64,
+    sampler: &F,
+    stats: &SamplingStats,
+) -> (SampleCache, (f64, f64, f64), ((f64, f64, f64), (f64, f64, f64)), bool)
+where
+    F: SamplerFn,
+{
+    let mut cache = SampleCache::new();
+
+    // Normalize initial normal
+    let n_len_sq = initial_normal.0 * initial_normal.0
+        + initial_normal.1 * initial_normal.1
+        + initial_normal.2 * initial_normal.2;
+    let n = if n_len_sq < 1e-12 {
+        (0.0, 1.0, 0.0)
+    } else {
+        let n_inv_len = 1.0 / n_len_sq.sqrt();
+        (
+            initial_normal.0 * n_inv_len,
+            initial_normal.1 * n_inv_len,
+            initial_normal.2 * n_inv_len,
+        )
+    };
+
+    let (t1, t2) = orthonormal_basis_perpendicular_to(n);
+
+    // Sample 1: Vertex position
+    cache.sample(surface_pos, sampler, stats);
+
+    // Samples 2-5: 4 cardinal directions in tangent plane
+    for &(dx, dy) in &[(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
+        let pos = (
+            surface_pos.0 + (t1.0 * dx + t2.0 * dy) * probe_epsilon,
+            surface_pos.1 + (t1.1 * dx + t2.1 * dy) * probe_epsilon,
+            surface_pos.2 + (t1.2 * dx + t2.2 * dy) * probe_epsilon,
+        );
+        cache.sample(pos, sampler, stats);
+    }
+
+    // Samples 6-9: ±normal at 0.5*epsilon and 1.0*epsilon
+    for &mult in &[0.5, 1.0] {
+        for &sign in &[1.0, -1.0] {
+            let pos = (
+                surface_pos.0 + n.0 * probe_epsilon * mult * sign,
+                surface_pos.1 + n.1 * probe_epsilon * mult * sign,
+                surface_pos.2 + n.2 * probe_epsilon * mult * sign,
+            );
+            cache.sample(pos, sampler, stats);
+        }
+    }
+
+    let is_potentially_edge = cache.has_mixed_samples();
+
+    (cache, n, (t1, t2), is_potentially_edge)
+}
+
+/// Estimate edge parameters from cached samples using a given probe epsilon.
+///
+/// This version uses the provided surface points (which should be accurate
+/// surface crossing locations found via binary search).
+///
+/// Returns (is_sharp, normal_a, normal_b, edge_direction).
+#[cfg(feature = "edge-diagnostic")]
+fn estimate_edge_from_surface_points(
+    surface_points: &[(f64, f64, f64)],
+    reference_normal: (f64, f64, f64),
+    angle_threshold: f64,
+) -> (bool, (f64, f64, f64), Option<(f64, f64, f64)>, Option<(f64, f64, f64)>) {
+    if surface_points.len() < 4 {
+        return (false, reference_normal, None, None);
+    }
+
+    // Compute the spread of surface points (used for residual normalization)
+    let n_pts = surface_points.len() as f64;
+    let centroid = (
+        surface_points.iter().map(|p| p.0).sum::<f64>() / n_pts,
+        surface_points.iter().map(|p| p.1).sum::<f64>() / n_pts,
+        surface_points.iter().map(|p| p.2).sum::<f64>() / n_pts,
+    );
+    let avg_dist_sq: f64 = surface_points.iter().map(|p| {
+        let dx = p.0 - centroid.0;
+        let dy = p.1 - centroid.1;
+        let dz = p.2 - centroid.2;
+        dx * dx + dy * dy + dz * dz
+    }).sum::<f64>() / n_pts;
+
+    // Fit single plane to all surface points
+    let (single_normal, single_residual) = fit_plane_to_points(surface_points);
+
+    // Normalized residual: residual per point relative to point spread
+    let base_residual_threshold = avg_dist_sq * 0.01 * n_pts; // 1% of spread
+
+    // Try two-plane clustering
+    let clustering = cluster_points_two(surface_points);
+    if clustering.is_none() {
+        let dot = single_normal.0 * reference_normal.0
+            + single_normal.1 * reference_normal.1
+            + single_normal.2 * reference_normal.2;
+        let normal_a = if dot < 0.0 {
+            (-single_normal.0, -single_normal.1, -single_normal.2)
+        } else {
+            single_normal
+        };
+        return (false, normal_a, None, None);
+    }
+
+    let (cluster_a, cluster_b) = clustering.unwrap();
+    if cluster_a.len() < 3 || cluster_b.len() < 3 {
+        let dot = single_normal.0 * reference_normal.0
+            + single_normal.1 * reference_normal.1
+            + single_normal.2 * reference_normal.2;
+        let normal_a = if dot < 0.0 {
+            (-single_normal.0, -single_normal.1, -single_normal.2)
+        } else {
+            single_normal
+        };
+        return (false, normal_a, None, None);
+    }
+
+    let (normal_a_raw, residual_a) = fit_plane_to_points(&cluster_a);
+    let (normal_b_raw, residual_b) = fit_plane_to_points(&cluster_b);
+
+    let combined_residual = residual_a + residual_b;
+    let improvement = single_residual / (combined_residual + 1e-12);
+
+    // Orient normals to point in same hemisphere as reference
+    let dot_a = normal_a_raw.0 * reference_normal.0
+        + normal_a_raw.1 * reference_normal.1
+        + normal_a_raw.2 * reference_normal.2;
+    let dot_b = normal_b_raw.0 * reference_normal.0
+        + normal_b_raw.1 * reference_normal.1
+        + normal_b_raw.2 * reference_normal.2;
+
+    let normal_a = if dot_a < 0.0 {
+        (-normal_a_raw.0, -normal_a_raw.1, -normal_a_raw.2)
+    } else {
+        normal_a_raw
+    };
+    let normal_b = if dot_b < 0.0 {
+        (-normal_b_raw.0, -normal_b_raw.1, -normal_b_raw.2)
+    } else {
+        normal_b_raw
+    };
+
+    // Check angle between normals
+    let dot_ab = normal_a.0 * normal_b.0 + normal_a.1 * normal_b.1 + normal_a.2 * normal_b.2;
+    let angle_between_normals = dot_ab.clamp(-1.0, 1.0).acos();
+
+    // Edge detection criteria:
+    // 1. Single plane has high residual (doesn't fit well) OR significant improvement from clustering
+    // 2. Angle between fitted normals exceeds threshold
+    // 3. Individual cluster residuals are low (good fits)
+    let high_single_residual = single_residual > base_residual_threshold * 4.0;
+    let good_improvement = improvement > 2.0;
+    let good_cluster_fits = residual_a < base_residual_threshold * 2.0
+                          && residual_b < base_residual_threshold * 2.0;
+
+    let is_sharp = (high_single_residual || good_improvement)
+        && angle_between_normals > angle_threshold
+        && good_cluster_fits;
+
+    if is_sharp {
+        // Compute edge direction
+        let edge_dir = (
+            normal_a.1 * normal_b.2 - normal_a.2 * normal_b.1,
+            normal_a.2 * normal_b.0 - normal_a.0 * normal_b.2,
+            normal_a.0 * normal_b.1 - normal_a.1 * normal_b.0,
+        );
+        let edge_len = (edge_dir.0 * edge_dir.0 + edge_dir.1 * edge_dir.1 + edge_dir.2 * edge_dir.2).sqrt();
+        let edge_direction = if edge_len > 1e-12 {
+            Some((edge_dir.0 / edge_len, edge_dir.1 / edge_len, edge_dir.2 / edge_len))
+        } else {
+            None
+        };
+
+        (true, normal_a, Some(normal_b), edge_direction)
+    } else {
+        // Use the single plane normal (better for smooth surfaces)
+        let dot = single_normal.0 * reference_normal.0
+            + single_normal.1 * reference_normal.1
+            + single_normal.2 * reference_normal.2;
+        let normal = if dot < 0.0 {
+            (-single_normal.0, -single_normal.1, -single_normal.2)
+        } else {
+            single_normal
+        };
+        (false, normal, None, None)
+    }
+}
+
+/// Estimate edge parameters from cached samples using a given probe epsilon.
+///
+/// This is a convenience wrapper that uses midpoint interpolation for surface
+/// point estimation (fast but less accurate).
+///
+/// Returns (is_sharp, normal_a, normal_b, edge_direction).
+#[cfg(feature = "edge-diagnostic")]
+fn estimate_edge_from_samples_with_epsilon(
+    cache: &SampleCache,
+    reference_normal: (f64, f64, f64),
+    probe_epsilon: f64,
+    angle_threshold: f64,
+) -> (bool, (f64, f64, f64), Option<(f64, f64, f64)>, Option<(f64, f64, f64)>) {
+    let samples = cache.all_samples();
+
+    if samples.len() < 4 {
+        return (false, reference_normal, None, None);
+    }
+
+    let inside_samples: Vec<_> = samples.iter().filter(|s| s.is_inside).collect();
+    let outside_samples: Vec<_> = samples.iter().filter(|s| !s.is_inside).collect();
+
+    if inside_samples.is_empty() || outside_samples.is_empty() {
+        return (false, reference_normal, None, None);
+    }
+
+    // Find surface crossing points by interpolating between inside/outside pairs
+    let mut surface_points: Vec<(f64, f64, f64)> = Vec::new();
+    let max_pair_dist = probe_epsilon * 3.0;
+
+    for inside in &inside_samples {
+        for outside in &outside_samples {
+            let dx = outside.position.0 - inside.position.0;
+            let dy = outside.position.1 - inside.position.1;
+            let dz = outside.position.2 - inside.position.2;
+            let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+
+            if dist > 1e-12 && dist < max_pair_dist {
+                let t = 0.5;
+                let surface_pt = (
+                    inside.position.0 + dx * t,
+                    inside.position.1 + dy * t,
+                    inside.position.2 + dz * t,
+                );
+                surface_points.push(surface_pt);
+            }
+        }
+    }
+
+    // Add inside sample positions as surface estimates (they're near the surface)
+    for inside in &inside_samples {
+        surface_points.push(inside.position);
+    }
+
+    estimate_edge_from_surface_points(&surface_points, reference_normal, angle_threshold)
+}
+
+/// Compute the angular span of a set of angles (smallest arc containing all angles).
+/// Used for edge detection analysis.
+#[cfg(feature = "edge-diagnostic")]
+#[allow(dead_code)]
+fn compute_angular_span(angles: &[f64]) -> f64 {
+    if angles.len() < 2 {
+        return 0.0;
+    }
+
+    // Find the largest gap between consecutive angles
+    let mut max_gap = 0.0f64;
+    for i in 0..angles.len() {
+        let j = (i + 1) % angles.len();
+        let mut gap = angles[j] - angles[i];
+        if gap < 0.0 {
+            gap += 2.0 * std::f64::consts::PI;
+        }
+        max_gap = max_gap.max(gap);
+    }
+
+    // Span is 2π minus the largest gap
+    2.0 * std::f64::consts::PI - max_gap
+}
+
+/// Find surface crossing point between an inside and outside sample using binary search.
+///
+/// Performs 6 iterations of binary search to find where the surface crosses between
+/// the two sample positions. Returns the estimated crossing point.
+#[cfg(feature = "edge-diagnostic")]
+fn find_surface_crossing_quick<F>(
+    inside_pos: (f64, f64, f64),
+    outside_pos: (f64, f64, f64),
+    cache: &mut SampleCache,
+    sampler: &F,
+    stats: &SamplingStats,
+) -> (f64, f64, f64)
+where
+    F: SamplerFn,
+{
+    let mut inside = inside_pos;
+    let mut outside = outside_pos;
+
+    // 6 iterations of binary search for ~1.5% position accuracy
+    for _ in 0..6 {
+        let mid = (
+            (inside.0 + outside.0) * 0.5,
+            (inside.1 + outside.1) * 0.5,
+            (inside.2 + outside.2) * 0.5,
+        );
+        let sample = cache.sample(mid, sampler, stats);
+        if sample.is_inside {
+            inside = mid;
+        } else {
+            outside = mid;
+        }
+    }
+
+    // Return midpoint of final bracket
+    (
+        (inside.0 + outside.0) * 0.5,
+        (inside.1 + outside.1) * 0.5,
+        (inside.2 + outside.2) * 0.5,
+    )
+}
+
+/// Find accurate surface crossing points from cached samples by doing binary search
+/// between nearby inside/outside pairs.
+#[cfg(feature = "edge-diagnostic")]
+fn find_surface_crossings_from_cache<F>(
+    cache: &mut SampleCache,
+    probe_epsilon: f64,
+    sampler: &F,
+    stats: &SamplingStats,
+) -> Vec<(f64, f64, f64)>
+where
+    F: SamplerFn,
+{
+    // Get current samples before we start adding more
+    let samples: Vec<_> = cache.all_samples().to_vec();
+
+    let inside_samples: Vec<_> = samples.iter().filter(|s| s.is_inside).collect();
+    let outside_samples: Vec<_> = samples.iter().filter(|s| !s.is_inside).collect();
+
+    let mut surface_points: Vec<(f64, f64, f64)> = Vec::new();
+    let max_pair_dist = probe_epsilon * 2.5;
+
+    // Find pairs and do binary search to find surface crossings
+    let mut used_pairs: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+
+    for (i, inside) in inside_samples.iter().enumerate() {
+        for (j, outside) in outside_samples.iter().enumerate() {
+            let dx = outside.position.0 - inside.position.0;
+            let dy = outside.position.1 - inside.position.1;
+            let dz = outside.position.2 - inside.position.2;
+            let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+
+            if dist > 1e-12 && dist < max_pair_dist && !used_pairs.contains(&(i, j)) {
+                // Limit to 12 surface crossings to control sample count
+                if surface_points.len() >= 12 {
+                    break;
+                }
+
+                let crossing = find_surface_crossing_quick(
+                    inside.position,
+                    outside.position,
+                    cache,
+                    sampler,
+                    stats,
+                );
+                surface_points.push(crossing);
+                used_pairs.insert((i, j));
+            }
+        }
+    }
+
+    surface_points
+}
+
+// =============================================================================
+// ALGORITHM 1: BOUNDARY BISECTION
+// =============================================================================
+
+/// Sample-by-sample edge detection using boundary bisection.
+///
+/// Strategy:
+/// 1. Bootstrap: Sample vertex + cardinal directions + normal offsets (9 samples)
+/// 2. If not potentially an edge, return smooth
+/// 3. Angular scan: Sample 8 directions to find inside/outside transitions
+/// 4. Bisect each transition to find precise edge crossing angles
+/// 5. Sample perpendicular to edge for normal estimation
+///
+/// Expected samples: 17-20 (smooth), 30-40 (edge)
+#[cfg(feature = "edge-diagnostic")]
+fn edge_detect_boundary_bisection<F>(
+    surface_pos: (f64, f64, f64),
+    initial_normal: (f64, f64, f64),
+    probe_epsilon: f64,
+    sampler: &F,
+    stats: &SamplingStats,
+    angle_threshold: f64,
+) -> ExperimentalEdgeResult
+where
+    F: SamplerFn,
+{
+    // Bootstrap phase
+    let (mut cache, n, (t1, t2), is_potentially_edge) =
+        bootstrap_edge_detection(surface_pos, initial_normal, probe_epsilon, sampler, stats);
+
+    if !is_potentially_edge {
+        // All samples same class - likely smooth surface
+        let (_, normal_a, _, _) = estimate_edge_from_samples_with_epsilon(&cache, n, probe_epsilon, angle_threshold);
+        return ExperimentalEdgeResult {
+            is_sharp: false,
+            normal_a,
+            normal_b: None,
+            edge_direction: None,
+            edge_position: None,
+            samples_used: cache.count() as u64,
+            method: "boundary_bisection",
+        };
+    }
+
+    // Phase 2: Angular scan with 8 directions
+    let mut angular_samples: Vec<(f64, bool)> = Vec::with_capacity(8);
+
+    for i in 0..8 {
+        let angle = 2.0 * std::f64::consts::PI * (i as f64) / 8.0;
+        let cos_a = angle.cos();
+        let sin_a = angle.sin();
+        let dir = (
+            t1.0 * cos_a + t2.0 * sin_a,
+            t1.1 * cos_a + t2.1 * sin_a,
+            t1.2 * cos_a + t2.2 * sin_a,
+        );
+        let pos = (
+            surface_pos.0 + dir.0 * probe_epsilon,
+            surface_pos.1 + dir.1 * probe_epsilon,
+            surface_pos.2 + dir.2 * probe_epsilon,
+        );
+        let sample = cache.sample(pos, sampler, stats);
+        angular_samples.push((angle, sample.is_inside));
+    }
+
+    // Find transitions (where inside/outside changes)
+    let mut transitions: Vec<(f64, f64, bool)> = Vec::new(); // (angle_a, angle_b, a_is_inside)
+    for i in 0..8 {
+        let j = (i + 1) % 8;
+        if angular_samples[i].1 != angular_samples[j].1 {
+            let mut angle_b = angular_samples[j].0;
+            if angle_b < angular_samples[i].0 {
+                angle_b += 2.0 * std::f64::consts::PI;
+            }
+            transitions.push((angular_samples[i].0, angle_b, angular_samples[i].1));
+        }
+    }
+
+    // If no transitions or odd number, not a clean edge
+    if transitions.is_empty() || transitions.len() % 2 != 0 {
+        let (is_sharp, normal_a, normal_b, edge_direction) =
+            estimate_edge_from_samples_with_epsilon(&cache, n, probe_epsilon, angle_threshold);
+        return ExperimentalEdgeResult {
+            is_sharp,
+            normal_a,
+            normal_b,
+            edge_direction,
+            edge_position: if is_sharp { Some(surface_pos) } else { None },
+            samples_used: cache.count() as u64,
+            method: "boundary_bisection",
+        };
+    }
+
+    // Phase 3: Binary search each transition (6 iterations for ~0.7° precision)
+    let mut edge_angles: Vec<f64> = Vec::new();
+
+    for (mut theta_a, mut theta_b, a_is_inside) in transitions {
+        for _ in 0..6 {
+            let theta_mid = (theta_a + theta_b) / 2.0;
+            let cos_mid = theta_mid.cos();
+            let sin_mid = theta_mid.sin();
+            let dir = (
+                t1.0 * cos_mid + t2.0 * sin_mid,
+                t1.1 * cos_mid + t2.1 * sin_mid,
+                t1.2 * cos_mid + t2.2 * sin_mid,
+            );
+            let pos = (
+                surface_pos.0 + dir.0 * probe_epsilon,
+                surface_pos.1 + dir.1 * probe_epsilon,
+                surface_pos.2 + dir.2 * probe_epsilon,
+            );
+            let sample = cache.sample(pos, sampler, stats);
+
+            if sample.is_inside == a_is_inside {
+                theta_a = theta_mid;
+            } else {
+                theta_b = theta_mid;
+            }
+        }
+        edge_angles.push((theta_a + theta_b) / 2.0);
+    }
+
+    // Phase 4: Sample perpendicular to estimated edge for normal refinement
+    if edge_angles.len() >= 2 {
+        // Edge direction is perpendicular to the line connecting the two transition points
+        let angle1 = edge_angles[0];
+        let angle2 = if edge_angles.len() > 1 { edge_angles[1] } else { angle1 + std::f64::consts::PI };
+
+        // Sample additional points on each side of the edge
+        let mid_angle_a = (angle1 + angle2) / 2.0;
+        let mid_angle_b = mid_angle_a + std::f64::consts::PI;
+
+        for &angle in &[mid_angle_a, mid_angle_b] {
+            for &r in &[0.5, 0.75] {
+                let cos_a = angle.cos();
+                let sin_a = angle.sin();
+                let dir = (
+                    t1.0 * cos_a + t2.0 * sin_a,
+                    t1.1 * cos_a + t2.1 * sin_a,
+                    t1.2 * cos_a + t2.2 * sin_a,
+                );
+                let pos = (
+                    surface_pos.0 + dir.0 * probe_epsilon * r,
+                    surface_pos.1 + dir.1 * probe_epsilon * r,
+                    surface_pos.2 + dir.2 * probe_epsilon * r,
+                );
+                cache.sample(pos, sampler, stats);
+            }
+        }
+    }
+
+    // Phase 5: Find accurate surface crossings via binary search
+    let mut surface_points = find_surface_crossings_from_cache(
+        &mut cache,
+        probe_epsilon,
+        sampler,
+        stats,
+    );
+
+    // Add surface_pos as a known surface point
+    surface_points.push(surface_pos);
+
+    // Final estimate using accurate surface points
+    let (is_sharp, normal_a, normal_b, edge_direction) =
+        estimate_edge_from_surface_points(&surface_points, n, angle_threshold);
+
+    ExperimentalEdgeResult {
+        is_sharp,
+        normal_a,
+        normal_b,
+        edge_direction,
+        edge_position: if is_sharp { Some(surface_pos) } else { None },
+        samples_used: cache.count() as u64,
+        method: "boundary_bisection",
+    }
+}
+
+// =============================================================================
+// ALGORITHM 2: MAXIMUM UNCERTAINTY
+// =============================================================================
+
+/// Sample-by-sample edge detection using maximum uncertainty sampling.
+///
+/// Strategy:
+/// 1. Bootstrap: Sample vertex + cardinal directions + normal offsets (9 samples)
+/// 2. Maintain a polar grid of "belief" values (estimated P(inside))
+/// 3. Iteratively sample at locations with highest uncertainty (P ≈ 0.5)
+/// 4. Fit separating line to inside/outside samples; partition for normals
+///
+/// Expected samples: 12-15 (smooth), 25-40 (edge)
+#[cfg(feature = "edge-diagnostic")]
+fn edge_detect_max_uncertainty<F>(
+    surface_pos: (f64, f64, f64),
+    initial_normal: (f64, f64, f64),
+    probe_epsilon: f64,
+    sampler: &F,
+    stats: &SamplingStats,
+    angle_threshold: f64,
+) -> ExperimentalEdgeResult
+where
+    F: SamplerFn,
+{
+    // Bootstrap phase
+    let (mut cache, n, (t1, t2), is_potentially_edge) =
+        bootstrap_edge_detection(surface_pos, initial_normal, probe_epsilon, sampler, stats);
+
+    if !is_potentially_edge {
+        let (_, normal_a, _, _) = estimate_edge_from_samples_with_epsilon(&cache, n, probe_epsilon, angle_threshold);
+        return ExperimentalEdgeResult {
+            is_sharp: false,
+            normal_a,
+            normal_b: None,
+            edge_direction: None,
+            edge_position: None,
+            samples_used: cache.count() as u64,
+            method: "max_uncertainty",
+        };
+    }
+
+    // Polar grid: 16 angular bins × 3 radial bins
+    const NUM_ANGLES: usize = 16;
+    const NUM_RADII: usize = 3;
+    let radii = [0.33, 0.67, 1.0];
+
+    // Initialize belief grid based on bootstrap samples
+    // Each cell stores (sum_of_inside, count)
+    let mut belief_grid: Vec<Vec<(f64, f64)>> = vec![vec![(0.5, 0.0); NUM_RADII]; NUM_ANGLES];
+
+    // Helper to convert position to grid indices
+    let pos_to_grid = |pos: (f64, f64, f64)| -> Option<(usize, usize)> {
+        let dx = pos.0 - surface_pos.0;
+        let dy = pos.1 - surface_pos.1;
+        let dz = pos.2 - surface_pos.2;
+
+        // Project onto tangent plane
+        let u = dx * t1.0 + dy * t1.1 + dz * t1.2;
+        let v = dx * t2.0 + dy * t2.1 + dz * t2.2;
+
+        let dist = (u * u + v * v).sqrt();
+        if dist < 1e-12 || dist > probe_epsilon * 1.1 {
+            return None;
+        }
+
+        let angle = v.atan2(u);
+        let angle_normalized = if angle < 0.0 { angle + 2.0 * std::f64::consts::PI } else { angle };
+        let angle_idx = ((angle_normalized / (2.0 * std::f64::consts::PI)) * NUM_ANGLES as f64) as usize;
+        let angle_idx = angle_idx.min(NUM_ANGLES - 1);
+
+        let radius_normalized = dist / probe_epsilon;
+        let radius_idx = if radius_normalized < 0.5 { 0 } else if radius_normalized < 0.83 { 1 } else { 2 };
+
+        Some((angle_idx, radius_idx))
+    };
+
+    // Update belief grid with bootstrap samples
+    for sample in cache.all_samples() {
+        if let Some((ai, ri)) = pos_to_grid(sample.position) {
+            let value = if sample.is_inside { 1.0 } else { 0.0 };
+            belief_grid[ai][ri].0 += value;
+            belief_grid[ai][ri].1 += 1.0;
+        }
+    }
+
+    // Iteratively sample at maximum uncertainty locations
+    let max_iterations = 25;
+    for _ in 0..max_iterations {
+        // Find cell with highest uncertainty (closest to P=0.5)
+        let mut best_uncertainty = 0.0;
+        let mut best_cell: Option<(usize, usize)> = None;
+
+        for ai in 0..NUM_ANGLES {
+            for ri in 0..NUM_RADII {
+                let (sum, count) = belief_grid[ai][ri];
+                if count < 0.5 {
+                    // Unsampled cell - high uncertainty
+                    let uncertainty = 0.5;
+                    if uncertainty > best_uncertainty {
+                        best_uncertainty = uncertainty;
+                        best_cell = Some((ai, ri));
+                    }
+                } else {
+                    let p = sum / count;
+                    // Uncertainty is highest when p ≈ 0.5
+                    let uncertainty = 0.5 - (p - 0.5).abs();
+                    if uncertainty > best_uncertainty {
+                        best_uncertainty = uncertainty;
+                        best_cell = Some((ai, ri));
+                    }
+                }
+            }
+        }
+
+        // If uncertainty is very low, we're done
+        if best_uncertainty < 0.1 {
+            break;
+        }
+
+        // Sample at the center of the best cell
+        if let Some((ai, ri)) = best_cell {
+            let angle = 2.0 * std::f64::consts::PI * (ai as f64 + 0.5) / NUM_ANGLES as f64;
+            let radius = radii[ri] * probe_epsilon;
+
+            let cos_a = angle.cos();
+            let sin_a = angle.sin();
+            let dir = (
+                t1.0 * cos_a + t2.0 * sin_a,
+                t1.1 * cos_a + t2.1 * sin_a,
+                t1.2 * cos_a + t2.2 * sin_a,
+            );
+            let pos = (
+                surface_pos.0 + dir.0 * radius,
+                surface_pos.1 + dir.1 * radius,
+                surface_pos.2 + dir.2 * radius,
+            );
+
+            let sample = cache.sample(pos, sampler, stats);
+
+            // Update belief grid
+            let value = if sample.is_inside { 1.0 } else { 0.0 };
+            belief_grid[ai][ri].0 += value;
+            belief_grid[ai][ri].1 += 1.0;
+
+            // Also update neighboring cells (smoothing)
+            let neighbors = [
+                ((ai + NUM_ANGLES - 1) % NUM_ANGLES, ri),
+                ((ai + 1) % NUM_ANGLES, ri),
+            ];
+            for (nai, nri) in neighbors {
+                belief_grid[nai][nri].0 += value * 0.3;
+                belief_grid[nai][nri].1 += 0.3;
+            }
+        }
+    }
+
+    // Find accurate surface crossings via binary search
+    let mut surface_points = find_surface_crossings_from_cache(
+        &mut cache,
+        probe_epsilon,
+        sampler,
+        stats,
+    );
+
+    // Add surface_pos as a known surface point
+    surface_points.push(surface_pos);
+
+    // Final estimate using accurate surface points
+    let (is_sharp, normal_a, normal_b, edge_direction) =
+        estimate_edge_from_surface_points(&surface_points, n, angle_threshold);
+
+    ExperimentalEdgeResult {
+        is_sharp,
+        normal_a,
+        normal_b,
+        edge_direction,
+        edge_position: if is_sharp { Some(surface_pos) } else { None },
+        samples_used: cache.count() as u64,
+        method: "max_uncertainty",
+    }
+}
+
+// =============================================================================
+// ALGORITHM 3: ADAPTIVE GRID
+// =============================================================================
+
+/// Sample-by-sample edge detection using adaptive grid refinement.
+///
+/// Strategy:
+/// 1. Bootstrap: Sample vertex + cardinal directions + normal offsets (9 samples)
+/// 2. Level 0: Coarse 4×4 angular grid (16 cells)
+/// 3. Identify "mixed" cells (containing both inside and outside samples)
+/// 4. Refine only mixed cells to finer resolution (up to 3 levels)
+/// 5. Mixed cells trace the edge; samples on each side define normals
+///
+/// Expected samples: 8-12 (smooth), 20-35 (edge)
+#[cfg(feature = "edge-diagnostic")]
+fn edge_detect_adaptive_grid<F>(
+    surface_pos: (f64, f64, f64),
+    initial_normal: (f64, f64, f64),
+    probe_epsilon: f64,
+    sampler: &F,
+    stats: &SamplingStats,
+    angle_threshold: f64,
+) -> ExperimentalEdgeResult
+where
+    F: SamplerFn,
+{
+    // Bootstrap phase
+    let (mut cache, n, (t1, t2), is_potentially_edge) =
+        bootstrap_edge_detection(surface_pos, initial_normal, probe_epsilon, sampler, stats);
+
+    if !is_potentially_edge {
+        let (_, normal_a, _, _) = estimate_edge_from_samples_with_epsilon(&cache, n, probe_epsilon, angle_threshold);
+        return ExperimentalEdgeResult {
+            is_sharp: false,
+            normal_a,
+            normal_b: None,
+            edge_direction: None,
+            edge_position: None,
+            samples_used: cache.count() as u64,
+            method: "adaptive_grid",
+        };
+    }
+
+    // Grid cell representation: (angle_start, angle_end, radius_start, radius_end, level)
+    // Level 0: 4×2 = 8 cells (4 angular × 2 radial)
+    // Each refinement: cell splits into 4 (2×2)
+
+    #[derive(Clone)]
+    struct GridCell {
+        angle_start: f64,
+        angle_end: f64,
+        radius_start: f64,
+        radius_end: f64,
+        level: u8,
+        has_inside: bool,
+        has_outside: bool,
+        sampled: bool,
+    }
+
+    impl GridCell {
+        fn is_mixed(&self) -> bool {
+            self.has_inside && self.has_outside
+        }
+
+        fn center_angle(&self) -> f64 {
+            (self.angle_start + self.angle_end) / 2.0
+        }
+
+        fn center_radius(&self) -> f64 {
+            (self.radius_start + self.radius_end) / 2.0
+        }
+
+        fn subdivide(&self) -> [GridCell; 4] {
+            let mid_angle = self.center_angle();
+            let mid_radius = self.center_radius();
+            let new_level = self.level + 1;
+
+            [
+                GridCell {
+                    angle_start: self.angle_start,
+                    angle_end: mid_angle,
+                    radius_start: self.radius_start,
+                    radius_end: mid_radius,
+                    level: new_level,
+                    has_inside: false,
+                    has_outside: false,
+                    sampled: false,
+                },
+                GridCell {
+                    angle_start: mid_angle,
+                    angle_end: self.angle_end,
+                    radius_start: self.radius_start,
+                    radius_end: mid_radius,
+                    level: new_level,
+                    has_inside: false,
+                    has_outside: false,
+                    sampled: false,
+                },
+                GridCell {
+                    angle_start: self.angle_start,
+                    angle_end: mid_angle,
+                    radius_start: mid_radius,
+                    radius_end: self.radius_end,
+                    level: new_level,
+                    has_inside: false,
+                    has_outside: false,
+                    sampled: false,
+                },
+                GridCell {
+                    angle_start: mid_angle,
+                    angle_end: self.angle_end,
+                    radius_start: mid_radius,
+                    radius_end: self.radius_end,
+                    level: new_level,
+                    has_inside: false,
+                    has_outside: false,
+                    sampled: false,
+                },
+            ]
+        }
+
+        fn contains_point(&self, angle: f64, radius: f64) -> bool {
+            let angle_in = if self.angle_end > self.angle_start {
+                angle >= self.angle_start && angle < self.angle_end
+            } else {
+                // Wraps around 2π
+                angle >= self.angle_start || angle < self.angle_end
+            };
+            angle_in && radius >= self.radius_start && radius < self.radius_end
+        }
+    }
+
+    // Initialize level 0 grid: 4 angular × 2 radial = 8 cells
+    let mut cells: Vec<GridCell> = Vec::new();
+    let angle_step = 2.0 * std::f64::consts::PI / 4.0;
+    let radius_step = probe_epsilon / 2.0;
+
+    for ai in 0..4 {
+        for ri in 0..2 {
+            cells.push(GridCell {
+                angle_start: ai as f64 * angle_step,
+                angle_end: (ai + 1) as f64 * angle_step,
+                radius_start: ri as f64 * radius_step,
+                radius_end: (ri + 1) as f64 * radius_step,
+                level: 0,
+                has_inside: false,
+                has_outside: false,
+                sampled: false,
+            });
+        }
+    }
+
+    // Helper to sample a cell's center
+    let sample_cell = |cell: &GridCell, cache: &mut SampleCache, sampler: &F, stats: &SamplingStats| -> bool {
+        let angle = cell.center_angle();
+        let radius = cell.center_radius();
+        let cos_a = angle.cos();
+        let sin_a = angle.sin();
+        let dir = (
+            t1.0 * cos_a + t2.0 * sin_a,
+            t1.1 * cos_a + t2.1 * sin_a,
+            t1.2 * cos_a + t2.2 * sin_a,
+        );
+        let pos = (
+            surface_pos.0 + dir.0 * radius,
+            surface_pos.1 + dir.1 * radius,
+            surface_pos.2 + dir.2 * radius,
+        );
+        cache.sample(pos, sampler, stats).is_inside
+    };
+
+    // Update cells based on existing samples
+    for sample in cache.all_samples() {
+        let dx = sample.position.0 - surface_pos.0;
+        let dy = sample.position.1 - surface_pos.1;
+        let dz = sample.position.2 - surface_pos.2;
+
+        let u = dx * t1.0 + dy * t1.1 + dz * t1.2;
+        let v = dx * t2.0 + dy * t2.1 + dz * t2.2;
+        let radius = (u * u + v * v).sqrt();
+        let angle = {
+            let a = v.atan2(u);
+            if a < 0.0 { a + 2.0 * std::f64::consts::PI } else { a }
+        };
+
+        for cell in &mut cells {
+            if cell.contains_point(angle, radius) {
+                if sample.is_inside {
+                    cell.has_inside = true;
+                } else {
+                    cell.has_outside = true;
+                }
+            }
+        }
+    }
+
+    // Sample unsampled cells and refine mixed cells
+    const MAX_LEVEL: u8 = 3;
+    const MAX_SAMPLES: usize = 50;
+
+    for _ in 0..5 {
+        if cache.count() >= MAX_SAMPLES {
+            break;
+        }
+
+        // Sample unsampled cells
+        let mut new_samples: Vec<(usize, bool)> = Vec::new();
+        for (i, cell) in cells.iter().enumerate() {
+            if !cell.sampled && cache.count() < MAX_SAMPLES {
+                let is_inside = sample_cell(cell, &mut cache, sampler, stats);
+                new_samples.push((i, is_inside));
+            }
+        }
+
+        for (i, is_inside) in new_samples {
+            cells[i].sampled = true;
+            if is_inside {
+                cells[i].has_inside = true;
+            } else {
+                cells[i].has_outside = true;
+            }
+        }
+
+        // Find mixed cells to refine
+        let mut to_refine: Vec<usize> = Vec::new();
+        for (i, cell) in cells.iter().enumerate() {
+            if cell.is_mixed() && cell.level < MAX_LEVEL {
+                to_refine.push(i);
+            }
+        }
+
+        if to_refine.is_empty() {
+            break;
+        }
+
+        // Refine mixed cells (process in reverse order to maintain indices)
+        to_refine.sort_by(|a, b| b.cmp(a));
+        for i in to_refine {
+            if cache.count() >= MAX_SAMPLES {
+                break;
+            }
+            let subcells = cells[i].subdivide();
+            cells.remove(i);
+            cells.extend(subcells);
+        }
+    }
+
+    // Find accurate surface crossings via binary search
+    let mut surface_points = find_surface_crossings_from_cache(
+        &mut cache,
+        probe_epsilon,
+        sampler,
+        stats,
+    );
+
+    // Add surface_pos as a known surface point
+    surface_points.push(surface_pos);
+
+    // Final estimate using accurate surface points
+    let (is_sharp, normal_a, normal_b, edge_direction) =
+        estimate_edge_from_surface_points(&surface_points, n, angle_threshold);
+
+    ExperimentalEdgeResult {
+        is_sharp,
+        normal_a,
+        normal_b,
+        edge_direction,
+        edge_position: if is_sharp { Some(surface_pos) } else { None },
+        samples_used: cache.count() as u64,
+        method: "adaptive_grid",
+    }
+}
+
 /// EXPERIMENTAL Algorithm 1: Face-Assignment Bisection
 ///
 /// After initial clustering, this algorithm finds the precise angular locations
@@ -5521,7 +6611,97 @@ where
         vertex_count,
     );
 
-    vec![standard_entry, bisect_entry, multi_entry]
+    // =========================================================================
+    // Test sample-by-sample methods: Boundary Bisection
+    // =========================================================================
+    eprintln!("  Testing boundary_bisection method (sample-by-sample)...");
+    let samples_before_bb = stats.total_samples.load(Ordering::Relaxed);
+
+    let boundary_bisection_results: Vec<ExperimentalEdgeResult> = (0..vertex_count)
+        .into_par_iter()
+        .map(|i| {
+            edge_detect_boundary_bisection(
+                refined_positions[i],
+                recomputed_normals[i],
+                probe_epsilon,
+                sampler,
+                stats,
+                angle_threshold,
+            )
+        })
+        .collect();
+
+    let samples_bb = stats.total_samples.load(Ordering::Relaxed) - samples_before_bb;
+    let bb_entry = compute_experimental_metrics(
+        &boundary_bisection_results,
+        &references,
+        &analytical,
+        "boundary_bisection",
+        samples_bb,
+        vertex_count,
+    );
+
+    // =========================================================================
+    // Test sample-by-sample methods: Maximum Uncertainty
+    // =========================================================================
+    eprintln!("  Testing max_uncertainty method (sample-by-sample)...");
+    let samples_before_mu = stats.total_samples.load(Ordering::Relaxed);
+
+    let max_uncertainty_results: Vec<ExperimentalEdgeResult> = (0..vertex_count)
+        .into_par_iter()
+        .map(|i| {
+            edge_detect_max_uncertainty(
+                refined_positions[i],
+                recomputed_normals[i],
+                probe_epsilon,
+                sampler,
+                stats,
+                angle_threshold,
+            )
+        })
+        .collect();
+
+    let samples_mu = stats.total_samples.load(Ordering::Relaxed) - samples_before_mu;
+    let mu_entry = compute_experimental_metrics(
+        &max_uncertainty_results,
+        &references,
+        &analytical,
+        "max_uncertainty",
+        samples_mu,
+        vertex_count,
+    );
+
+    // =========================================================================
+    // Test sample-by-sample methods: Adaptive Grid
+    // =========================================================================
+    eprintln!("  Testing adaptive_grid method (sample-by-sample)...");
+    let samples_before_ag = stats.total_samples.load(Ordering::Relaxed);
+
+    let adaptive_grid_results: Vec<ExperimentalEdgeResult> = (0..vertex_count)
+        .into_par_iter()
+        .map(|i| {
+            edge_detect_adaptive_grid(
+                refined_positions[i],
+                recomputed_normals[i],
+                probe_epsilon,
+                sampler,
+                stats,
+                angle_threshold,
+            )
+        })
+        .collect();
+
+    let samples_ag = stats.total_samples.load(Ordering::Relaxed) - samples_before_ag;
+    let ag_entry = compute_experimental_metrics(
+        &adaptive_grid_results,
+        &references,
+        &analytical,
+        "adaptive_grid",
+        samples_ag,
+        vertex_count,
+    );
+
+    vec![standard_entry, bisect_entry, multi_entry, bb_entry, mu_entry, ag_entry]
 }
 
 /// Helper to compute diagnostic metrics for experimental edge detection methods.

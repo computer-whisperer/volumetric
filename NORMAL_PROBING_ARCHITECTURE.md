@@ -578,9 +578,15 @@ let (error_a, error_b) = analytical.compute_pair_errors(detected_normal_a, detec
 - Escalation to 24 probes for edges
 - Golden-ratio distribution in Phase 4
 
-**Completed:** ✅ Experimental Algorithms
+**Completed:** ✅ Experimental Algorithms (2024)
 - Face-Assignment Bisection (3.7° analytical error, 457 samples)
 - Multi-Radius Probing (3.0° analytical error, 912 samples)
+
+**Completed:** ✅ Sample-by-Sample Algorithms (2026)
+- Boundary Bisection (36.6° analytical error, 34 samples)
+- Maximum Uncertainty (34.6° analytical error, 106 samples)
+- Adaptive Grid (31.8° analytical error, 95 samples)
+- Infrastructure: `SampleCache`, `CachedSample`, bootstrap phase, surface crossing finder
 
 **Completed:** ✅ Analytical Ground Truth Validation
 - `AnalyticalRotatedCube` struct for rotated cube test case
@@ -590,12 +596,16 @@ let (error_a, error_b) = analytical.compute_pair_errors(detected_normal_a, detec
 - Standard method achieves **4.2° analytical error** at 73 samples/vertex
 - TPR/FPR are perfect (100%/0%)
 - This is likely sufficient for most use cases
+- Sample-by-sample algorithms achieve lower sample counts (34-106) but with reduced accuracy (31-37°)
 
 **Next priorities (if further improvement needed):**
 
 1. **Improve NormB accuracy:** All methods show ~2x higher error on NormB (7-8°) compared to NormA (3-4°). Investigate why and address the asymmetry.
 
-2. **Hybrid approach:** Use bisection's edge-angle detection with standard clustering for point assignment. This might get bisection-level accuracy at lower sample cost.
+2. **Refine sample-by-sample algorithms:** The infrastructure is in place. Key improvements:
+   - Increase binary search iterations (6 → 10-12) for better surface points
+   - Better edge detection criteria to reduce FPR
+   - Hybrid approach: sample-by-sample detection + traditional probing for refinement
 
 3. **Adaptive probe epsilon:** For very tight edges, smaller epsilon could keep probes on the correct face.
 
@@ -604,6 +614,7 @@ let (error_a, error_b) = analytical.compute_pair_errors(detected_normal_a, detec
 **Not recommended:**
 - Edge-specific probing based on estimated edge direction (consistently worse than clustering)
 - Massive sample increases for marginal gains (912 samples → 3.0° vs 73 samples → 4.2°)
+- Using current sample-by-sample algorithms in production (accuracy gap too large)
 
 ---
 
@@ -654,6 +665,12 @@ cargo run -p volumetric_cli --release --features volumetric/edge-diagnostic -- \
 #            vs analytical: NormA=3.7°  NormB=7.5°
 #   multiradius: TPR=100.0%  FPR=0.0%  NormA=3.2°  NormB=7.4°  samples/vert=912
 #            vs analytical: NormA=3.0°  NormB=8.1°
+#   boundary_bisection: TPR=63.6%  FPR=11.2%  samples/vert=34
+#            vs analytical: NormA=36.6°  NormB=23.1°
+#   max_uncertainty: TPR=95.5%  FPR=53.0%  samples/vert=106
+#            vs analytical: NormA=34.6°  NormB=30.1°
+#   adaptive_grid: TPR=86.4%  FPR=35.2%  samples/vert=95
+#            vs analytical: NormA=31.8°  NormB=28.7°
 
 # Render to check visual quality
 cargo run -p volumetric_cli --release -- render \
@@ -673,3 +690,220 @@ The reference diagnostic was upgraded to use 258 probes per vertex:
 - 32 binary search iterations (up from 12)
 
 Despite this thorough sampling, the reference still has ~5.6° error against analytical ground truth, demonstrating the inherent limitations of probe-based normal estimation on boolean fields.
+
+---
+
+## Sample-by-Sample Edge Detection (2026)
+
+### Motivation
+
+The existing edge detection algorithms consume many samples internally per "probe":
+- 1 origin sample
+- 2 coarse search samples
+- ~12 binary search samples
+
+This means each of the ~12-24 probe directions uses ~14 samples, but only the final surface crossing point is kept. All intermediate data is discarded.
+
+**New Approach:** Track every `(position, is_inside)` boolean sample. Make decisions about the next sample based on all accumulated data. This enables more sample-efficient algorithms.
+
+### Infrastructure Added
+
+```rust
+// Cached boolean sample
+struct CachedSample {
+    position: (f64, f64, f64),
+    is_inside: bool,
+}
+
+// Sample cache with helper methods
+struct SampleCache {
+    samples: Vec<CachedSample>,
+}
+
+impl SampleCache {
+    fn sample(&mut self, pos, sampler, stats) -> &CachedSample;
+    fn partition(&self) -> (inside_samples, outside_samples);
+    fn has_mixed_samples(&self) -> bool;
+    fn count(&self) -> usize;
+}
+```
+
+**Shared Bootstrap Phase (9 samples):**
+1. Vertex position (1 sample)
+2. 4 cardinal directions at probe_epsilon in tangent plane (4 samples)
+3. ±normal at 0.5×epsilon and 1.0×epsilon (4 samples)
+
+Bootstrap returns early if all samples are same class (smooth surface detected).
+
+### Algorithm 1: Boundary Bisection (`edge_detect_boundary_bisection`)
+
+**Strategy:** Angular scan to find inside/outside transitions, then binary search to refine transition angles.
+
+**Phases:**
+```
+1. Bootstrap (9 samples)
+   - If all same class → smooth surface, done
+
+2. Angular scan (8 samples)
+   - Sample 8 directions at probe_epsilon
+   - Track (angle, is_inside) for each
+
+3. Transition bisection (6 iterations each)
+   - For each adjacent pair with different classifications
+   - Binary search to find precise transition angle
+
+4. Perpendicular sampling
+   - Sample on each side of detected edge for normal refinement
+
+5. Surface crossing refinement
+   - Find accurate surface crossings via binary search between inside/outside pairs
+   - Fit planes to refined surface points
+```
+
+**Results:**
+| Metric | Value |
+|--------|-------|
+| TPR | 63.6% |
+| FPR | 11.2% |
+| vs Analytical NormA | 36.6° |
+| vs Analytical NormB | 23.1° |
+| Samples/vertex | 34 |
+
+---
+
+### Algorithm 2: Maximum Uncertainty (`edge_detect_max_uncertainty`)
+
+**Strategy:** Maintain a polar belief grid, iteratively sample where uncertainty is highest (P(inside) ≈ 0.5).
+
+**Phases:**
+```
+1. Bootstrap (9 samples)
+   - If all same class → smooth surface, done
+
+2. Initialize belief grid
+   - 16 angular bins × 3 radial bins
+   - Each cell stores (sum_of_inside, count)
+
+3. Uncertainty-guided sampling (up to 25 iterations)
+   - Find cell with highest uncertainty: 0.5 - |P(inside) - 0.5|
+   - Sample at cell center
+   - Update belief grid with smoothing to neighbors
+   - Stop when max uncertainty < 0.1
+
+4. Surface crossing refinement
+   - Binary search between inside/outside pairs
+   - Plane fitting on refined surface points
+```
+
+**Results:**
+| Metric | Value |
+|--------|-------|
+| TPR | 95.5% |
+| FPR | 53.0% |
+| vs Analytical NormA | 34.6° |
+| vs Analytical NormB | 30.1° |
+| Samples/vertex | 106 |
+
+---
+
+### Algorithm 3: Adaptive Grid (`edge_detect_adaptive_grid`)
+
+**Strategy:** Start with coarse grid, refine only cells that contain the surface boundary.
+
+**Phases:**
+```
+1. Bootstrap (9 samples)
+   - If all same class → smooth surface, done
+
+2. Initialize coarse grid
+   - 4 angular × 2 radial = 8 cells
+   - Track (has_inside, has_outside, sampled) per cell
+
+3. Adaptive refinement (up to 5 iterations, max 50 samples)
+   - Sample unsampled cells
+   - Identify "mixed" cells (has both inside and outside samples)
+   - Subdivide mixed cells into 4 subcells (up to level 3)
+   - Stop when no mixed cells remain
+
+4. Surface crossing refinement
+   - Binary search between inside/outside pairs
+   - Plane fitting on refined surface points
+```
+
+**Results:**
+| Metric | Value |
+|--------|-------|
+| TPR | 86.4% |
+| FPR | 35.2% |
+| vs Analytical NormA | 31.8° |
+| vs Analytical NormB | 28.7° |
+| Samples/vertex | 95 |
+
+---
+
+### Comparative Results Summary
+
+| Method | TPR | FPR | Analytical A | Analytical B | Samples |
+|--------|-----|-----|--------------|--------------|---------|
+| **Standard** | 100% | 0% | 4.2° | 8.5° | 73 |
+| **Bisection** | 100% | 0% | 3.7° | 7.5° | 457 |
+| **Multiradius** | 100% | 0% | 3.0° | 8.1° | 912 |
+| **Boundary Bisection** | 63.6% | 11.2% | 36.6° | 23.1° | 34 |
+| **Max Uncertainty** | 95.5% | 53.0% | 34.6° | 30.1° | 106 |
+| **Adaptive Grid** | 86.4% | 35.2% | 31.8° | 28.7° | 95 |
+
+### Analysis
+
+**Sample Efficiency vs Accuracy Tradeoff:**
+
+The sample-by-sample algorithms achieve significantly lower sample counts (34-106 vs 457-912) but with reduced accuracy and detection reliability:
+
+1. **TPR degradation:** The new algorithms miss some sharp edges (63-95% TPR vs 100%)
+2. **FPR issues:** Higher false positive rates, especially max_uncertainty (53%)
+3. **Normal accuracy:** 30-37° error vs 3-4° for existing methods
+
+**Why the Accuracy Gap?**
+
+1. **Surface point quality:** Existing algorithms use full binary search (12 iterations) along the normal direction to find precise surface crossings. Sample-by-sample algorithms interpolate between inside/outside samples or use quick 6-iteration searches, giving less accurate surface points.
+
+2. **Sparse data:** With only 34-106 samples covering a 2D tangent disk, there aren't enough surface points per cluster for accurate plane fitting. Existing methods get 60+ surface points per face.
+
+3. **Clustering sensitivity:** The clustering algorithm needs sufficient well-distributed points to distinguish two planes from one. Sparse, unevenly distributed points lead to poor cluster assignments.
+
+**Potential Improvements:**
+
+1. **Increase surface crossing iterations:** Change from 6 to 10-12 iterations would improve surface point accuracy at modest sample cost.
+
+2. **Smarter pair selection:** Only binary search between pairs that are geometrically meaningful (not redundant pairs from same angular region).
+
+3. **Better edge detection criteria:** Current residual-based detection has high FPR. Could use the angular distribution of inside/outside samples more directly.
+
+4. **Hybrid approach:** Use sample-by-sample for detection, then switch to traditional probing for normal refinement if an edge is detected.
+
+### Test Command
+
+```bash
+cargo run -p volumetric_cli --release --features volumetric/edge-diagnostic -- \
+  mesh -i rotated_cube.wasm/rotated_cube.wasm -o /tmp/test.stl \
+  --sharp-edges --max-depth 2
+
+# Output includes all methods:
+#   standard: TPR=100.0%  FPR=0.0%  samples/vert=73
+#            vs analytical: NormA=4.2°  NormB=8.5°
+#   bisection: TPR=100.0%  FPR=0.0%  samples/vert=457
+#            vs analytical: NormA=3.7°  NormB=7.5°
+#   multiradius: TPR=100.0%  FPR=0.0%  samples/vert=912
+#            vs analytical: NormA=3.0°  NormB=8.1°
+#   boundary_bisection: TPR=63.6%  FPR=11.2%  samples/vert=34
+#            vs analytical: NormA=36.6°  NormB=23.1°
+#   max_uncertainty: TPR=95.5%  FPR=53.0%  samples/vert=106
+#            vs analytical: NormA=34.6°  NormB=30.1°
+#   adaptive_grid: TPR=86.4%  FPR=35.2%  samples/vert=95
+#            vs analytical: NormA=31.8°  NormB=28.7°
+```
+
+### Conclusion
+
+The sample-by-sample approach shows promise for sample efficiency but doesn't yet achieve competitive accuracy. The key bottleneck is getting enough high-quality surface points for reliable plane fitting.
+
+**Recommendation:** The standard method (73 samples, 4.2° error, 100% TPR, 0% FPR) remains the best choice for production use. The sample-by-sample algorithms provide a foundation for future exploration of more sample-efficient edge detection, but need further refinement before they can match the existing methods' reliability.
