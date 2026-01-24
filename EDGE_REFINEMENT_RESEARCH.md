@@ -1,5 +1,90 @@
 # Edge Refinement Algorithm Research
 
+> **Note (2026-01-21):** This document records research that informed the Phase 4 redesign.
+> The "current" algorithms and pipeline described below refer to code that was **archived**
+> during the Stage 4 refactoring. The production Stage 4 is now a passthrough stub.
+> See `stage4/research/` for the active research infrastructure and `attempt_0.rs` for
+> the new implementation based on this research.
+
+---
+
+## Current State: Attempt 0 Results (2026-01-23)
+
+Implementation of residual-based geometry classification with full-sphere edge detection.
+
+### Edge Detection Results
+
+| Metric | Achieved | Target | Status |
+|--------|----------|--------|--------|
+| Classification | 12/12 (100%) | 100% | ✅ |
+| N_A error | 1.01° avg | <1° | ⚠️ Close |
+| N_B error | 12.31° avg | <1° | ❌ Needs work |
+| Samples | 913 avg | <80 | ❌ Over budget |
+
+**Per-edge breakdown:**
+```
+Edge  0:  0.1° /  0.0°  (1205 samples)
+Edge  1:  0.1° /  2.9°  ( 539 samples)
+Edge  2:  0.1° / 75.1°  ( 679 samples) ← N_B problem
+Edge  3:  0.0° /  0.0°  (1173 samples)
+Edge  4:  0.3° /  0.0°  (1171 samples)
+Edge  5:  0.0° /  0.0°  (1185 samples)
+Edge  6:  0.0° / 11.1°  ( 667 samples)
+Edge  7:  0.1° / 57.3°  ( 541 samples) ← N_B problem
+Edge  8: 10.8° /  1.1°  ( 699 samples) ← N_A problem
+Edge  9:  0.5° /  0.3°  ( 713 samples)
+Edge 10:  0.1° /  0.0°  (1187 samples)
+Edge 11:  0.0° /  0.0°  (1201 samples)
+```
+
+### Face Detection Results
+
+| Metric | Achieved | Target | Status |
+|--------|----------|--------|--------|
+| Error | 1.68° avg | <1° | ⚠️ Close |
+| Samples | 269 avg | <35 | ❌ Over budget |
+
+### Key Findings
+
+1. **Probe position matters critically:**
+   - Probing from ON the surface gives a thin coplanar shell (all points ~same distance)
+   - Probing from INSIDE (0.1 offset) gives good plane separation for RANSAC
+
+2. **Full-sphere probing outperforms biased hemispheres:**
+   - Biased hemisphere hints derived from outliers are often inaccurate
+   - 80-direction full-sphere coverage with RANSAC works reliably
+
+3. **RANSAC threshold of 0.006** (from baseline `robust_edge.rs`) provides good plane separation
+
+4. **Second normal (N_B) accuracy is inconsistent:**
+   - First plane fit succeeds, but remaining points for second plane are sometimes insufficient
+   - Edges 2, 7 have 50-75° error on N_B
+
+### Algorithm Flow
+
+```
+process_vertex(midpoint, accumulated_normal):
+  1. locate_surface() → find surface position, track crossing directions
+  2. measure_face() from surface position → if residual < 0.002, return Face
+  3. Find outliers from face fit → derive second face hint
+  4. measure_edge() with biased hemispheres from MIDPOINT (not surface)
+     - If angle < 30°, fallback to measure_edge_full_sphere()
+  5. If edge residual < 0.02 and angle > 30° → return Edge
+  6. Try corner detection, then fallback logic
+```
+
+### Next Steps for Improvement
+
+1. **Reduce sample count:** Currently ~900, target <80
+   - Use fewer full-sphere directions (40 instead of 80)
+   - Skip unnecessary fallbacks when biased hemispheres succeed
+
+2. **Improve N_B accuracy:**
+   - Better second-plane fitting when first plane claims most points
+   - Consider iterative refinement of second plane
+
+3. **Lower face threshold:** Currently 0.002, might need tuning per geometry
+
 ## Problem Statement
 
 Given a point P known to be on or near a sharp geometric edge, determine:
@@ -14,11 +99,14 @@ This algorithm serves both:
 
 ---
 
-## Current Best Results
+## Historical: Best Results from Archived Code
+
+> **Historical:** These results came from code that was archived during the Stage 4 refactoring.
+> The "Standard (production)" row refers to the old production algorithm, not current code.
 
 | Method | TPR | FPR | NormA Error | NormB Error | Samples |
 |--------|-----|-----|-------------|-------------|---------|
-| **Standard (production)** | 100% | 0% | 4.2° | 8.5° | 73 |
+| **Standard (archived)** | 100% | 0% | 4.2° | 8.5° | 73 |
 | Bisection | 100% | 0% | 3.7° | 7.5° | 457 |
 | Multiradius | 100% | 0% | 3.0° | 8.1° | 912 |
 | Boundary Bisection | 63.6% | 11.2% | 36.6° | 23.1° | 34 |
@@ -29,7 +117,7 @@ This algorithm serves both:
 
 ---
 
-## Core Algorithm (Production)
+## Historical: Core Algorithm (Archived Production Code)
 
 ```
 Input: surface_pos, initial_normal, probe_epsilon, search_distance
@@ -67,7 +155,10 @@ Input: surface_pos, initial_normal, probe_epsilon, search_distance
 
 ---
 
-## Algorithm Pipeline (How Initial Normals Are Computed)
+## Historical: Algorithm Pipeline (How Initial Normals Were Computed)
+
+> **Historical:** This describes the OLD vertex refinement pipeline that was archived.
+> The stages 4a, 4b, 4c described below no longer exist in production code.
 
 Understanding the NormB asymmetry requires understanding how `initial_normal` is computed.
 
@@ -123,9 +214,12 @@ But actually we see:
 - **Transition triangles** point in neither direction (errors of 35-50° to their "best match" face)
 - These transitions can dominate the sum, biasing it away from the true bisector
 
-### Key Discovery: Vertex Refinement Already Detects Edges
+### Historical Results: Crossing Count Analysis
 
-**The vertex refinement stage (4a) implicitly detects edge vertices with 100% accuracy.**
+> **Historical:** This discovery was made on the archived code. The crossing count feature
+> does not exist in current production code but is being re-implemented in `attempt_0.rs`.
+
+**The archived vertex refinement stage (4a) implicitly detected edge vertices with 100% accuracy.**
 
 During vertex refinement, we search along 4 directions (primary + 3 cardinal axes) for surface crossings:
 
@@ -232,9 +326,12 @@ The ±Y faces have highest error, likely because the rx rotation affects their o
 4. **Cluster size:** Cases #5, #7 show larger cluster can have WORSE accuracy.
 5. **More probes (36 total):** Mixed results (NormA worse, NormB slightly better).
 
-**Potential Fixes (Prioritized by Likelihood of Success):**
+**Implementation Priorities (from archived research):**
 
-1. **Use crossing count as early edge indicator (RECOMMENDED):**
+> **Note:** These fixes were identified from archived code analysis and are being
+> re-implemented in `stage4/research/attempt_0.rs`.
+
+1. **Re-implement crossing count detection as part of surface location:**
    - Vertices with exactly 2 crossings in refinement are 100% correlated with sharp edges
    - For 2-crossing vertices, skip the normal-based early exit entirely
    - Use the 2 successful search directions as hints for face normals
@@ -619,6 +716,10 @@ src/adaptive_surface_nets_2/
 ---
 
 ## Phase 4 Research Infrastructure Results (2026-01-21)
+
+> **Current:** This research infrastructure STILL EXISTS in `src/adaptive_surface_nets_2/stage4/research/`.
+> The RANSAC algorithms can be called directly for testing and comparison. The new `attempt_0.rs`
+> implementation builds on this infrastructure.
 
 ### New Infrastructure Created
 

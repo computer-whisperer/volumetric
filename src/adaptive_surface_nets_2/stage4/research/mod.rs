@@ -39,6 +39,7 @@
 //! ```
 
 pub mod analytical_cube;
+pub mod attempt_0;
 pub mod benchmark;
 pub mod diagnostic_edge;
 pub mod gradient_optimization;
@@ -64,4 +65,11 @@ pub use sample_cache::{SampleCache, SampleCacheStats};
 pub use validation::{
     generate_validation_points, validate_corner_detection, validate_edge_detection,
     validate_surface_detection, ValidationPoint, ValidationResult,
+};
+
+// Attempt 0: Crossing Count Algorithm
+pub use attempt_0::{
+    classify_geometry, locate_surface, measure_corner, measure_edge, measure_face, process_vertex,
+    CrossingCountConfig, CornerMeasurement, EdgeMeasurement, FaceMeasurement, GeometryClassification,
+    GeometryType, SurfaceLocation, VertexGeometry,
 };
