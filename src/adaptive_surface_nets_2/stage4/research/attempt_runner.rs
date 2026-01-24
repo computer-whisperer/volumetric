@@ -5,19 +5,66 @@
 //! edge direction errors, and sample counts.
 
 use super::analytical_cube::{angle_between, AnalyticalRotatedCube};
+use super::oracle::{OracleBenchmarkCase, OracleClassification, OracleHit};
 use super::attempt_0::{CrossingCountConfig, GeometryType, VertexGeometry};
+use super::attempt_1::{Attempt1Config, Attempt1Diag};
 use super::sample_cache::SampleCache;
 use super::validation::{generate_validation_points, ExpectedClassification, ValidationPoint};
 
 pub fn run_attempt_0_benchmark() {
     let config = CrossingCountConfig::default();
-    run_attempt_benchmark("Attempt 0 (crossing count + RANSAC)", |point, hint, sampler| {
-        let cache = SampleCache::new(|x, y, z| sampler(x, y, z));
-        let before = cache.stats().actual_samples();
-        let result = super::attempt_0::process_vertex(point, hint, 1.0, &cache, &config);
-        let after = cache.stats().actual_samples();
-        (result, after - before)
-    });
+    if read_oracle_mode() {
+        run_attempt_benchmark_oracle("Attempt 0 (crossing count + RANSAC)", |point, hint, sampler| {
+            let cache = SampleCache::new(|x, y, z| sampler(x, y, z));
+            let before = cache.stats().actual_samples();
+            let result = super::attempt_0::process_vertex(point, hint, 1.0, &cache, &config);
+            let after = cache.stats().actual_samples();
+            (result, after - before)
+        });
+    } else {
+        run_attempt_benchmark("Attempt 0 (crossing count + RANSAC)", |point, hint, sampler| {
+            let cache = SampleCache::new(|x, y, z| sampler(x, y, z));
+            let before = cache.stats().actual_samples();
+            let result = super::attempt_0::process_vertex(point, hint, 1.0, &cache, &config);
+            let after = cache.stats().actual_samples();
+            (result, after - before)
+        });
+    }
+}
+
+pub fn run_attempt_1_benchmark() {
+    let config = Attempt1Config::default();
+    let diag_budget = read_diag_budget();
+    if read_oracle_mode() {
+        run_attempt_benchmark_oracle("Attempt 1 (adaptive RANSAC + crossing count)", |point, hint, sampler| {
+            let cache = SampleCache::new(|x, y, z| sampler(x, y, z));
+            let before = cache.stats().actual_samples();
+            let result = super::attempt_1::process_vertex(point, hint, 1.0, &cache, &config);
+            let after = cache.stats().actual_samples();
+            (result, after - before)
+        });
+    } else if diag_budget > 0 {
+        run_attempt_benchmark_with_diag(
+            "Attempt 1 (adaptive RANSAC + crossing count)",
+            diag_budget,
+            |point, hint, sampler| {
+                let cache = SampleCache::new(|x, y, z| sampler(x, y, z));
+                let before = cache.stats().actual_samples();
+                let (result, diag) =
+                    super::attempt_1::process_vertex_with_diag(point, hint, 1.0, &cache, &config);
+                let after = cache.stats().actual_samples();
+                (result, after - before, diag)
+            },
+        );
+    } else {
+        run_attempt_benchmark("Attempt 1 (adaptive RANSAC + crossing count)", |point, hint, sampler| {
+            let cache = SampleCache::new(|x, y, z| sampler(x, y, z));
+            let before = cache.stats().actual_samples();
+            let result = super::attempt_1::process_vertex(point, hint, 1.0, &cache, &config);
+            let after = cache.stats().actual_samples();
+            (result, after - before)
+        });
+    }
 }
 
 pub fn run_attempt_benchmark<F>(name: &str, attempt: F)
@@ -48,6 +95,160 @@ where
     println!("ATTEMPT BENCHMARK (Analytical Rotated Cube)");
     println!("{}", "=".repeat(72));
     stats.report();
+}
+
+pub fn run_attempt_benchmark_oracle<F>(name: &str, attempt: F)
+where
+    F: Fn((f64, f64, f64), (f64, f64, f64), &dyn Fn(f64, f64, f64) -> f32) -> (VertexGeometry, u64),
+{
+    let cube = AnalyticalRotatedCube::standard_test_cube();
+    let oracle_case = OracleBenchmarkCase { shape: &cube, seed: 0 };
+    let points = oracle_case.points();
+
+    let mut stats = AttemptStats::new(name);
+    for point in &points {
+        let hint = (0.0, 1.0, 0.0);
+        let sampler = |x: f64, y: f64, z: f64| -> f32 {
+            let local = cube.world_to_local((x, y, z));
+            let h = 0.5;
+            if local.0.abs() <= h && local.1.abs() <= h && local.2.abs() <= h {
+                1.0
+            } else {
+                -1.0
+            }
+        };
+        let (result, samples_used) = attempt(*point, hint, &sampler);
+        stats.samples_used.push(samples_used);
+        let expected = expected_from_oracle(oracle_case.expected(*point));
+        let vpoint = ValidationPoint {
+            position: *point,
+            expected,
+            description: "oracle".to_string(),
+        };
+        stats.record(&vpoint, &result);
+    }
+
+    println!("\n{}", "=".repeat(72));
+    println!("ATTEMPT BENCHMARK (Oracle)");
+    println!("{}", "=".repeat(72));
+    stats.report();
+}
+
+pub fn run_attempt_benchmark_with_diag<F>(name: &str, diag_budget: usize, attempt: F)
+where
+    F: Fn((f64, f64, f64), (f64, f64, f64), &dyn Fn(f64, f64, f64) -> f32) -> (VertexGeometry, u64, Attempt1Diag),
+{
+    let cube = AnalyticalRotatedCube::standard_test_cube();
+    let points = generate_validation_points(&cube);
+
+    let mut stats = AttemptStats::new(name);
+    let mut printed = 0usize;
+    for point in &points {
+        let hint = hint_from_expected(&point.expected);
+        let sampler = |x: f64, y: f64, z: f64| -> f32 {
+            let local = cube.world_to_local((x, y, z));
+            let h = 0.5;
+            if local.0.abs() <= h && local.1.abs() <= h && local.2.abs() <= h {
+                1.0
+            } else {
+                -1.0
+            }
+        };
+        let (result, samples_used, diag) = attempt(point.position, hint, &sampler);
+        stats.samples_used.push(samples_used);
+        stats.record(point, &result);
+
+        if printed < diag_budget {
+            let is_match = matches_expected(point, &result);
+            if !is_match {
+                printed += 1;
+                print_diag(point, &result, &diag);
+            }
+        }
+    }
+
+    println!("\n{}", "=".repeat(72));
+    println!("ATTEMPT BENCHMARK (Analytical Rotated Cube)");
+    println!("{}", "=".repeat(72));
+    stats.report();
+}
+
+fn read_diag_budget() -> usize {
+    std::env::var("ATTEMPT1_DIAG")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+fn read_oracle_mode() -> bool {
+    std::env::var("ORACLE_BENCH")
+        .ok()
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+fn expected_from_oracle(hit: OracleHit) -> ExpectedClassification {
+    match hit.classification {
+        OracleClassification::Face => ExpectedClassification::OnFace {
+            face_index: 0,
+            expected_normal: hit.normals.get(0).copied().unwrap_or((0.0, 1.0, 0.0)),
+        },
+        OracleClassification::Edge => ExpectedClassification::OnEdge {
+            edge_index: 0,
+            expected_direction: hit.edge_direction.unwrap_or((1.0, 0.0, 0.0)),
+            expected_normals: (
+                hit.normals.get(0).copied().unwrap_or((0.0, 1.0, 0.0)),
+                hit.normals.get(1).copied().unwrap_or((1.0, 0.0, 0.0)),
+            ),
+        },
+        OracleClassification::Corner | OracleClassification::Unknown => {
+            let n0 = hit.normals.get(0).copied().unwrap_or((1.0, 0.0, 0.0));
+            let n1 = hit.normals.get(1).copied().unwrap_or((0.0, 1.0, 0.0));
+            let n2 = hit.normals.get(2).copied().unwrap_or((0.0, 0.0, 1.0));
+            ExpectedClassification::OnCorner {
+                corner_index: 0,
+                expected_normals: [n0, n1, n2],
+            }
+        }
+    }
+}
+
+fn matches_expected(point: &ValidationPoint, result: &VertexGeometry) -> bool {
+    match point.expected {
+        ExpectedClassification::OnFace { .. } => result.classification == GeometryType::Face,
+        ExpectedClassification::OnEdge { .. } => result.classification == GeometryType::Edge,
+        ExpectedClassification::OnCorner { .. } => result.classification == GeometryType::Corner,
+    }
+}
+
+fn print_diag(point: &ValidationPoint, result: &VertexGeometry, diag: &Attempt1Diag) {
+    let expected_label = match point.expected {
+        ExpectedClassification::OnFace { .. } => "Face",
+        ExpectedClassification::OnEdge { .. } => "Edge",
+        ExpectedClassification::OnCorner { .. } => "Corner",
+    };
+    println!("\nATTEMPT1_DIAG mismatch");
+    println!("  Expected: {}", expected_label);
+    println!("  Result: {:?}", result.classification);
+    println!(
+        "  Crossing count: {} | samples_used: {}",
+        diag.crossing_count, diag.samples_used
+    );
+    if let Some(residual) = diag.face_residual {
+        println!("  Face: points={} residual={:.6}", diag.face_points, residual);
+    }
+    if let Some((ra, rb)) = diag.edge_residuals {
+        println!(
+            "  Edge: points={} inliers={:?} angle={:?} residuals=({:.6},{:.6})",
+            diag.edge_points, diag.edge_inliers, diag.edge_angle_deg, ra, rb
+        );
+    }
+    if let Some(residuals) = diag.corner_residuals.as_ref() {
+        println!(
+            "  Corner: points={} residuals={:?}",
+            diag.corner_points, residuals
+        );
+    }
 }
 
 struct AttemptStats {
@@ -287,5 +488,10 @@ mod tests {
     #[test]
     fn benchmark_attempt_0_against_reference() {
         run_attempt_0_benchmark();
+    }
+
+    #[test]
+    fn benchmark_attempt_1_against_reference() {
+        run_attempt_1_benchmark();
     }
 }

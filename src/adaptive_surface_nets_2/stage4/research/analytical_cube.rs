@@ -11,6 +11,9 @@
 //! This rotation ensures no face normal is aligned with any coordinate axis,
 //! making it an excellent test case for geometry probing algorithms.
 
+use super::oracle::{OracleClassification, OracleHit, OracleShape};
+use super::validation::generate_validation_points;
+
 
 /// Analytical ground truth for a rotated unit cube centered at origin.
 ///
@@ -682,6 +685,50 @@ impl AnalyticalRotatedCube {
             (p0.1 + p1.1) / 2.0,
             (p0.2 + p1.2) / 2.0,
         )
+    }
+}
+
+impl OracleShape for AnalyticalRotatedCube {
+    fn name(&self) -> &str {
+        "AnalyticalRotatedCube"
+    }
+
+    fn classify(&self, point: (f64, f64, f64)) -> OracleHit {
+        let result = self.closest_surface_point(point);
+        match result.classification {
+            SurfaceClassification::OnFace { normal, .. } => OracleHit {
+                classification: OracleClassification::Face,
+                surface_position: result.point,
+                normals: vec![normal],
+                edge_direction: None,
+                corner_position: None,
+            },
+            SurfaceClassification::OnEdge { edge } => OracleHit {
+                classification: OracleClassification::Edge,
+                surface_position: result.point,
+                normals: vec![edge.face_a_normal, edge.face_b_normal],
+                edge_direction: Some(edge.direction),
+                corner_position: None,
+            },
+            SurfaceClassification::OnCorner { corner } => OracleHit {
+                classification: OracleClassification::Corner,
+                surface_position: result.point,
+                normals: vec![
+                    corner.face_normals[0],
+                    corner.face_normals[1],
+                    corner.face_normals[2],
+                ],
+                edge_direction: None,
+                corner_position: Some(corner.position),
+            },
+        }
+    }
+
+    fn validation_points(&self, _seed: u64) -> Vec<(f64, f64, f64)> {
+        generate_validation_points(self)
+            .into_iter()
+            .map(|p| p.position)
+            .collect()
     }
 }
 
