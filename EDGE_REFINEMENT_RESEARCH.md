@@ -533,6 +533,9 @@ Selects partition with lowest combined residual.
 ## Test Protocol
 
 ### Rotated Cube Diagnostic
+Note: `--sharp-edges` is currently stubbed in production (Stage 4 passthrough).
+It is included below for historical parity with earlier runs.
+
 ```bash
 cargo run -p volumetric_cli --release --features volumetric/edge-diagnostic -- \
   mesh -i rotated_cube.wasm/rotated_cube.wasm -o /tmp/test.stl \
@@ -554,6 +557,12 @@ cargo run -p volumetric_cli --release -- render \
 2. **TPR/FPR** for edge detection
 3. **Samples per vertex** (efficiency)
 4. **Visual quality** (scalloping, edge straightness)
+
+### Attempt Benchmark (binary-safe)
+```bash
+# Runs Attempt 0 against analytical ground truth using the validation set
+cargo test benchmark_attempt_0_against_reference -- --nocapture
+```
 
 ---
 
@@ -731,11 +740,9 @@ Built comprehensive validation framework in `src/adaptive_surface_nets_2/stage4/
 | `sample_cache.rs` | Tracks samples, binary search helpers |
 | `reference_surface.rs` | Dense probing + plane fitting for faces |
 | `reference_edge.rs` | Original k-means clustering approach |
-| `improved_reference.rs` | 4 alternative approaches tested |
 | `robust_surface.rs` | **RANSAC face detection (0.021° avg)** |
 | `robust_edge.rs` | **RANSAC edge detection (0.19° avg)** |
 | `robust_corner.rs` | **RANSAC corner detection (0.11° avg)** |
-| `diagnostic_edge.rs` | Error source analysis |
 | `validation.rs` | Test point generation, accuracy metrics |
 
 ### Critical Discovery: Binary Samplers vs SDFs

@@ -12,6 +12,9 @@ cargo build-wasm
 cargo build -p volumetric_cli --release
 ```
 
+Note: `--sharp-edges` is currently stubbed in production (Stage 4 passthrough).
+It is included below for historical parity with earlier runs.
+
 ## Step 1: Create Rotated Cube Project
 
 The existing `cube_attempt.vproj` already has the setup, but to recreate from scratch:
@@ -107,7 +110,7 @@ cargo run -p volumetric_cli --release -- render \
 - `--max-depth <n>`: Lower = coarser mesh, easier to see individual triangles (1=16³, 2=32³, 3=64³, 4=128³)
 - `--projection ortho`: Orthographic for consistent triangle sizes in view
 - `--ortho-scale <n>`: Smaller = more zoomed in
-- `--sharp-edges`: Enable sharp edge detection
+- `--sharp-edges`: Sharp edge detection flag (currently no-op; kept for compatibility)
 
 ## Current State Observations
 

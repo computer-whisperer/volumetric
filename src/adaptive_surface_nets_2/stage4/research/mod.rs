@@ -40,10 +40,7 @@
 
 pub mod analytical_cube;
 pub mod attempt_0;
-pub mod benchmark;
-pub mod diagnostic_edge;
-pub mod gradient_optimization;
-pub mod improved_reference;
+pub mod attempt_runner;
 pub mod reference_corner;
 pub mod reference_edge;
 pub mod reference_surface;
@@ -73,3 +70,5 @@ pub use attempt_0::{
     CrossingCountConfig, CornerMeasurement, EdgeMeasurement, FaceMeasurement, GeometryClassification,
     GeometryType, SurfaceLocation, VertexGeometry,
 };
+
+pub use attempt_runner::{run_attempt_0_benchmark, run_attempt_benchmark};

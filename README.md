@@ -141,9 +141,9 @@ volumetric_cli mesh -i <file> -o <output.stl>
 - `--vertex-refinement <n>` - Vertex position refinement iterations (default: 12)
 - `--normal-refinement <n>` - Normal estimation iterations (default: 12, use 0 to disable)
 - `--normal-epsilon <f>` - Normal probe distance as fraction of cell size (default: 0.1)
-- `--sharp-edges` - Enable sharp edge detection and vertex duplication for hard edges
-- `--sharp-angle <degrees>` - Angle threshold for sharp edge detection (default: 20)
-- `--sharp-residual <f>` - Residual multiplier for sharp edge clustering (default: 4.0)
+- `--sharp-edges` - Enable sharp edge detection and vertex duplication for hard edges (currently no-op; Stage 4 is stubbed)
+- `--sharp-angle <degrees>` - Angle threshold for sharp edge detection (default: 20, currently no-op)
+- `--sharp-residual <f>` - Residual multiplier for sharp edge clustering (default: 4.0, currently no-op)
 - `-q, --quiet` - Suppress profiling output
 
 **Examples:**
@@ -157,7 +157,7 @@ volumetric_cli mesh -i model.wasm -o output.stl --max-depth 3 --normal-refinemen
 # Mesh a project file
 volumetric_cli mesh -i scene.vproj -o scene.stl
 
-# High-quality mesh with sharp edge preservation (for CAD-like models)
+# Legacy sharp edge flags (currently no effect; kept for compatibility)
 volumetric_cli mesh -i box.wasm -o box.stl --sharp-edges --sharp-angle 30
 ```
 
@@ -181,7 +181,7 @@ volumetric_cli render -i <file> -o <output.png>
 - `--color <hex>` - Mesh base color as hex, e.g., 6699cc (default: 6699cc)
 - `--grid <spacing>` - Reference grid spacing in meters, 0 to disable (default: 1.0)
 - `--grid-color <hex>` - Grid color as hex, e.g., 555555 (default: 555555)
-- `--base-resolution <n>`, `--max-depth <n>`, `--sharp-edges`, etc. - Same meshing options as the mesh command
+- `--base-resolution <n>`, `--max-depth <n>`, `--sharp-edges`, etc. - Same meshing options as the mesh command (sharp-edge flags currently no-op)
 - `-q, --quiet` - Suppress profiling output
 
 **Projection & Camera Options:**
