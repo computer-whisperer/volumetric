@@ -49,9 +49,9 @@ pub struct RenderArgs {
     #[arg(long, default_value = "6699cc")]
     pub color: String,
 
-    /// Base resolution for coarse grid discovery
-    #[arg(long, default_value = "8")]
-    pub base_resolution: usize,
+    /// Base cell size for coarse grid discovery (world units)
+    #[arg(long, default_value = "0.25")]
+    pub base_cell_size: f64,
 
     /// Maximum refinement depth
     #[arg(long, default_value = "4")]
@@ -393,7 +393,7 @@ pub fn run_render(args: RenderArgs) -> Result<()> {
     println!("Loaded {} bytes", wasm_bytes.len());
 
     let config = build_mesh_config(
-        args.base_resolution,
+        args.base_cell_size,
         args.max_depth,
         args.vertex_refinement,
         args.normal_refinement,
@@ -403,10 +403,9 @@ pub fn run_render(args: RenderArgs) -> Result<()> {
         args.sharp_residual,
     );
 
-    let effective_res = config.base_resolution * (1 << config.max_depth);
     println!(
-        "Meshing with resolution {}³ (base={}, depth={})",
-        effective_res, config.base_resolution, config.max_depth
+        "Meshing with base cell {} and depth {}",
+        config.base_cell_size, config.max_depth
     );
 
     let mesh_result = generate_adaptive_mesh_v2_from_bytes(&wasm_bytes, &config)

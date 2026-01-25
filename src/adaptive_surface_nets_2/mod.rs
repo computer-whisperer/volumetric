@@ -60,6 +60,21 @@ use stage3::stage3_topology_finalization;
 use stage4_stub::{stage4_result_to_mesh, stage4_vertex_refinement_stub};
 use types::SamplingStats;
 
+fn compute_base_cells(
+    bounds_min: (f64, f64, f64),
+    bounds_max: (f64, f64, f64),
+    base_cell_size: f64,
+) -> (i32, i32, i32) {
+    let size_x = (bounds_max.0 - bounds_min.0).max(0.0);
+    let size_y = (bounds_max.1 - bounds_min.1).max(0.0);
+    let size_z = (bounds_max.2 - bounds_min.2).max(0.0);
+    let cell = base_cell_size.max(1e-9);
+    let cells_x = (size_x / cell).ceil().max(1.0) as i32;
+    let cells_y = (size_y / cell).ceil().max(1.0) as i32;
+    let cells_z = (size_z / cell).ceil().max(1.0) as i32;
+    (cells_x, cells_y, cells_z)
+}
+
 /// Main entry point for adaptive surface nets meshing (native version).
 ///
 /// # Arguments
@@ -95,14 +110,9 @@ where
         bounds_max.2 as f64,
     );
 
-    // Calculate cell size at finest level (per-axis for non-cubic bounds)
-    // Total cells at finest level = base_resolution * 2^max_depth
-    let finest_cells_per_axis = config.base_resolution * (1 << config.max_depth);
-    let cell_size = (
-        (bounds_max_f64.0 - bounds_min_f64.0) / finest_cells_per_axis as f64,
-        (bounds_max_f64.1 - bounds_min_f64.1) / finest_cells_per_axis as f64,
-        (bounds_max_f64.2 - bounds_min_f64.2) / finest_cells_per_axis as f64,
-    );
+    let base_cells = compute_base_cells(bounds_min_f64, bounds_max_f64, config.base_cell_size);
+    let finest_cell_size = config.base_cell_size / (1 << config.max_depth) as f64;
+    let cell_size = (finest_cell_size, finest_cell_size, finest_cell_size);
 
     // Stage 1: Coarse grid discovery
     let stage1_start = Instant::now();
@@ -110,8 +120,8 @@ where
     let initial_work_queue = stage1_coarse_discovery(
         &sampler,
         bounds_min_f64,
-        bounds_max_f64,
-        config,
+        base_cells,
+        config.base_cell_size,
         &stats,
     );
     let stage1_time = stage1_start.elapsed().as_secs_f64();
@@ -128,6 +138,7 @@ where
         &sampler,
         bounds_min_f64,
         cell_size,
+        base_cells,
         config,
         &stats,
     );
@@ -182,7 +193,11 @@ where
         total_samples,
         total_vertices: mesh.vertices.len(),
         total_triangles: mesh.indices.len() / 3,
-        effective_resolution: finest_cells_per_axis,
+        effective_resolution: (
+            (base_cells.0 as usize) * (1 << config.max_depth),
+            (base_cells.1 as usize) * (1 << config.max_depth),
+            (base_cells.2 as usize) * (1 << config.max_depth),
+        ),
         stage4_5_time_secs: 0.0,
         sharp_vertices_case1: 0,
         sharp_edge_crossings: 0,
@@ -225,13 +240,9 @@ where
         bounds_max.2 as f64,
     );
 
-    // Calculate cell size at finest level (per-axis for non-cubic bounds)
-    let finest_cells_per_axis = config.base_resolution * (1 << config.max_depth);
-    let cell_size = (
-        (bounds_max_f64.0 - bounds_min_f64.0) / finest_cells_per_axis as f64,
-        (bounds_max_f64.1 - bounds_min_f64.1) / finest_cells_per_axis as f64,
-        (bounds_max_f64.2 - bounds_min_f64.2) / finest_cells_per_axis as f64,
-    );
+    let base_cells = compute_base_cells(bounds_min_f64, bounds_max_f64, config.base_cell_size);
+    let finest_cell_size = config.base_cell_size / (1 << config.max_depth) as f64;
+    let cell_size = (finest_cell_size, finest_cell_size, finest_cell_size);
 
     // Stage 1: Coarse grid discovery
     let stage1_start = Instant::now();
@@ -239,8 +250,8 @@ where
     let initial_work_queue = stage1_coarse_discovery(
         &sampler,
         bounds_min_f64,
-        bounds_max_f64,
-        config,
+        base_cells,
+        config.base_cell_size,
         &stats,
     );
     let stage1_time = stage1_start.elapsed().as_secs_f64();
@@ -257,6 +268,7 @@ where
         &sampler,
         bounds_min_f64,
         cell_size,
+        base_cells,
         config,
         &stats,
     );
@@ -311,7 +323,11 @@ where
         total_samples,
         total_vertices: mesh.vertices.len(),
         total_triangles: mesh.indices.len() / 3,
-        effective_resolution: finest_cells_per_axis,
+        effective_resolution: (
+            (base_cells.0 as usize) * (1 << config.max_depth),
+            (base_cells.1 as usize) * (1 << config.max_depth),
+            (base_cells.2 as usize) * (1 << config.max_depth),
+        ),
         stage4_5_time_secs: 0.0,
         sharp_vertices_case1: 0,
         sharp_edge_crossings: 0,

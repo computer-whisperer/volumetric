@@ -17,6 +17,21 @@ mod tests {
         },
     };
 
+    fn compute_base_cells(
+        bounds_min: (f64, f64, f64),
+        bounds_max: (f64, f64, f64),
+        base_cell_size: f64,
+    ) -> (i32, i32, i32) {
+        let size_x = (bounds_max.0 - bounds_min.0).max(0.0);
+        let size_y = (bounds_max.1 - bounds_min.1).max(0.0);
+        let size_z = (bounds_max.2 - bounds_min.2).max(0.0);
+        let cell = base_cell_size.max(1e-9);
+        let cells_x = (size_x / cell).ceil().max(1.0) as i32;
+        let cells_y = (size_y / cell).ceil().max(1.0) as i32;
+        let cells_z = (size_z / cell).ceil().max(1.0) as i32;
+        (cells_x, cells_y, cells_z)
+    }
+
     #[test]
     fn test_corner_mask() {
         let mask = CornerMask::from_bools([true, false, true, false, false, false, false, false]);
@@ -35,7 +50,7 @@ mod tests {
     #[test]
     fn test_config_default() {
         let config = AdaptiveMeshConfig2::default();
-        assert_eq!(config.base_resolution, 8);
+        assert_eq!(config.base_cell_size, 0.25);
         assert_eq!(config.max_depth, 4);
     }
 
@@ -51,28 +66,27 @@ mod tests {
 
     #[test]
     fn test_stage1_sample_count() {
-        // With base_resolution=4, we should sample 5³ = 125 corner points
-        let config = AdaptiveMeshConfig2 {
-            base_resolution: 4,
-            ..Default::default()
-        };
+        // With base_cells=4, we should sample 5³ = 125 corner points
+        let bounds_min = (-2.0, -2.0, -2.0);
+        let bounds_max = (2.0, 2.0, 2.0);
+        let base_cell_size = 1.0;
         let stats = SamplingStats::default();
 
         let _ = stage1_coarse_discovery(
             &sphere_sampler,
-            (-2.0, -2.0, -2.0),
-            (2.0, 2.0, 2.0),
-            &config,
+            bounds_min,
+            compute_base_cells(bounds_min, bounds_max, base_cell_size),
+            base_cell_size,
             &stats,
         );
 
-        // With expanded grid: (base_resolution + 3)³ corners
-        // base_resolution=4 -> (4+3)³ = 7³ = 343 corners
+        // With expanded grid: (base_cells + 3)³ corners
+        // base_cells=4 -> (4+3)³ = 7³ = 343 corners
         let expected_samples = 7 * 7 * 7;
         assert_eq!(
             stats.total_samples.load(Ordering::Relaxed),
             expected_samples,
-            "Should sample exactly (base_resolution + 3)³ corner points (expanded grid)"
+            "Should sample exactly (base_cells + 3)³ corner points (expanded grid)"
         );
     }
 
@@ -80,17 +94,16 @@ mod tests {
     fn test_stage1_finds_mixed_cells() {
         // Sphere of radius 1 in a [-2, 2]³ box with resolution 4
         // Cell size = 4/4 = 1, so cells at the surface should be detected
-        let config = AdaptiveMeshConfig2 {
-            base_resolution: 4,
-            ..Default::default()
-        };
+        let bounds_min = (-2.0, -2.0, -2.0);
+        let bounds_max = (2.0, 2.0, 2.0);
+        let base_cell_size = 1.0;
         let stats = SamplingStats::default();
 
         let work_queue = stage1_coarse_discovery(
             &sphere_sampler,
-            (-2.0, -2.0, -2.0),
-            (2.0, 2.0, 2.0),
-            &config,
+            bounds_min,
+            compute_base_cells(bounds_min, bounds_max, base_cell_size),
+            base_cell_size,
             &stats,
         );
 
@@ -116,7 +129,7 @@ mod tests {
     #[test]
     fn test_stage1_empty_for_fully_inside() {
         // Tiny sphere that fits entirely within a single cell
-        // Box is [-1, 1]³, resolution 2, so cell size = 1
+        // Box is [-1, 1]³, base cell size = 1
         // Sphere radius 0.1 centered at (0.5, 0.5, 0.5) fits in one cell
         let tiny_sphere = |x: f64, y: f64, z: f64| -> f32 {
             let dx = x - 0.5;
@@ -125,17 +138,16 @@ mod tests {
             if dx * dx + dy * dy + dz * dz < 0.01 { 1.0 } else { 0.0 }
         };
 
-        let config = AdaptiveMeshConfig2 {
-            base_resolution: 2,
-            ..Default::default()
-        };
+        let bounds_min = (-1.0, -1.0, -1.0);
+        let bounds_max = (1.0, 1.0, 1.0);
+        let base_cell_size = 1.0;
         let stats = SamplingStats::default();
 
         let work_queue = stage1_coarse_discovery(
             &tiny_sphere,
-            (-1.0, -1.0, -1.0),
-            (1.0, 1.0, 1.0),
-            &config,
+            bounds_min,
+            compute_base_cells(bounds_min, bounds_max, base_cell_size),
+            base_cell_size,
             &stats,
         );
 
@@ -152,10 +164,9 @@ mod tests {
         // Verify that corner ordering matches CORNER_OFFSETS
         // Create a sampler that returns different values based on position
         // to verify the corners are correctly indexed
-        let config = AdaptiveMeshConfig2 {
-            base_resolution: 1, // Single cell (with expanded grid: cells from -1 to 1)
-            ..Default::default()
-        };
+        let bounds_min = (0.0, 0.0, 0.0);
+        let bounds_max = (1.0, 1.0, 1.0);
+        let base_cell_size = 1.0;
         let stats = SamplingStats::default();
 
         // Sampler: inside only if x > 0.5 (so corners 1, 3, 5, 7 are inside for cell at origin)
@@ -165,9 +176,9 @@ mod tests {
 
         let work_queue = stage1_coarse_discovery(
             &half_space,
-            (0.0, 0.0, 0.0),
-            (1.0, 1.0, 1.0),
-            &config,
+            bounds_min,
+            compute_base_cells(bounds_min, bounds_max, base_cell_size),
+            base_cell_size,
             &stats,
         );
 
@@ -260,7 +271,7 @@ mod tests {
     fn test_stage2_emits_triangles_for_sphere() {
         // Unit sphere in [-2, 2]³ box
         let config = AdaptiveMeshConfig2 {
-            base_resolution: 4,
+            base_cell_size: 1.0,
             max_depth: 2,
             ..Default::default()
         };
@@ -268,19 +279,15 @@ mod tests {
         let bounds_min = (-2.0, -2.0, -2.0);
         let bounds_max = (2.0, 2.0, 2.0);
 
-        // Calculate cell size at finest level (per-axis)
-        let finest_cells = config.base_resolution * (1 << config.max_depth);
-        let cell_size = (
-            (bounds_max.0 - bounds_min.0) / finest_cells as f64,
-            (bounds_max.1 - bounds_min.1) / finest_cells as f64,
-            (bounds_max.2 - bounds_min.2) / finest_cells as f64,
-        );
+        let finest_cell = config.base_cell_size / (1 << config.max_depth) as f64;
+        let cell_size = (finest_cell, finest_cell, finest_cell);
+        let base_cells = compute_base_cells(bounds_min, bounds_max, config.base_cell_size);
 
         let initial_queue = stage1_coarse_discovery(
             &sphere_sampler,
             bounds_min,
-            bounds_max,
-            &config,
+            base_cells,
+            config.base_cell_size,
             &stats,
         );
 
@@ -289,6 +296,7 @@ mod tests {
             &sphere_sampler,
             bounds_min,
             cell_size,
+            base_cells,
             &config,
             &stats,
         );
@@ -300,7 +308,7 @@ mod tests {
         );
 
         // A sphere should produce a reasonable number of triangles
-        // At resolution 4 * 2^2 = 16 cells per axis, we expect ~hundreds of triangles
+        // At base cell 1.0 and depth 2, we expect ~hundreds of triangles
         assert!(
             triangles.len() > 10,
             "Should have more than 10 triangles, got {}",
@@ -483,26 +491,23 @@ mod tests {
     fn test_stage2_triangle_count_consistency() {
         // Run twice with same input, should get same triangle count
         let config = AdaptiveMeshConfig2 {
-            base_resolution: 2,
+            base_cell_size: 1.5,
             max_depth: 2,
             ..Default::default()
         };
 
         let bounds_min = (-1.5, -1.5, -1.5);
         let bounds_max = (1.5, 1.5, 1.5);
-        let finest_cells = config.base_resolution * (1 << config.max_depth);
-        let cell_size = (
-            (bounds_max.0 - bounds_min.0) / finest_cells as f64,
-            (bounds_max.1 - bounds_min.1) / finest_cells as f64,
-            (bounds_max.2 - bounds_min.2) / finest_cells as f64,
-        );
+        let finest_cell = config.base_cell_size / (1 << config.max_depth) as f64;
+        let cell_size = (finest_cell, finest_cell, finest_cell);
+        let base_cells = compute_base_cells(bounds_min, bounds_max, config.base_cell_size);
 
         let stats1 = SamplingStats::default();
         let initial_queue1 = stage1_coarse_discovery(
             &sphere_sampler,
             bounds_min,
-            bounds_max,
-            &config,
+            base_cells,
+            config.base_cell_size,
             &stats1,
         );
         let triangles1 = stage2_subdivision_and_emission(
@@ -510,6 +515,7 @@ mod tests {
             &sphere_sampler,
             bounds_min,
             cell_size,
+            base_cells,
             &config,
             &stats1,
         );
@@ -518,8 +524,8 @@ mod tests {
         let initial_queue2 = stage1_coarse_discovery(
             &sphere_sampler,
             bounds_min,
-            bounds_max,
-            &config,
+            base_cells,
+            config.base_cell_size,
             &stats2,
         );
         let triangles2 = stage2_subdivision_and_emission(
@@ -527,6 +533,7 @@ mod tests {
             &sphere_sampler,
             bounds_min,
             cell_size,
+            base_cells,
             &config,
             &stats2,
         );
@@ -544,25 +551,22 @@ mod tests {
         let empty_sampler = |_x: f64, _y: f64, _z: f64| -> f32 { 0.0 };
 
         let config = AdaptiveMeshConfig2 {
-            base_resolution: 4,
+            base_cell_size: 0.5,
             max_depth: 2,
             ..Default::default()
         };
         let stats = SamplingStats::default();
         let bounds_min = (-1.0, -1.0, -1.0);
         let bounds_max = (1.0, 1.0, 1.0);
-        let finest_cells = config.base_resolution * (1 << config.max_depth);
-        let cell_size = (
-            (bounds_max.0 - bounds_min.0) / finest_cells as f64,
-            (bounds_max.1 - bounds_min.1) / finest_cells as f64,
-            (bounds_max.2 - bounds_min.2) / finest_cells as f64,
-        );
+        let finest_cell = config.base_cell_size / (1 << config.max_depth) as f64;
+        let cell_size = (finest_cell, finest_cell, finest_cell);
+        let base_cells = compute_base_cells(bounds_min, bounds_max, config.base_cell_size);
 
         let initial_queue = stage1_coarse_discovery(
             &empty_sampler,
             bounds_min,
-            bounds_max,
-            &config,
+            base_cells,
+            config.base_cell_size,
             &stats,
         );
 
@@ -574,6 +578,7 @@ mod tests {
             &empty_sampler,
             bounds_min,
             cell_size,
+            base_cells,
             &config,
             &stats,
         );
@@ -613,25 +618,22 @@ mod tests {
     fn test_stage3_produces_indexed_mesh() {
         // Run stages 1-3 and verify output structure
         let config = AdaptiveMeshConfig2 {
-            base_resolution: 4,
+            base_cell_size: 0.75,
             max_depth: 2,
             ..Default::default()
         };
         let stats = SamplingStats::default();
         let bounds_min = (-1.5, -1.5, -1.5);
         let bounds_max = (1.5, 1.5, 1.5);
-        let finest_cells = config.base_resolution * (1 << config.max_depth);
-        let cell_size = (
-            (bounds_max.0 - bounds_min.0) / finest_cells as f64,
-            (bounds_max.1 - bounds_min.1) / finest_cells as f64,
-            (bounds_max.2 - bounds_min.2) / finest_cells as f64,
-        );
+        let finest_cell = config.base_cell_size / (1 << config.max_depth) as f64;
+        let cell_size = (finest_cell, finest_cell, finest_cell);
+        let base_cells = compute_base_cells(bounds_min, bounds_max, config.base_cell_size);
 
         let initial_queue = stage1_coarse_discovery(
             &sphere_sampler,
             bounds_min,
-            bounds_max,
-            &config,
+            base_cells,
+            config.base_cell_size,
             &stats,
         );
 
@@ -640,6 +642,7 @@ mod tests {
             &sphere_sampler,
             bounds_min,
             cell_size,
+            base_cells,
             &config,
             &stats,
         );
@@ -671,7 +674,7 @@ mod tests {
     fn test_full_pipeline() {
         // Run the full pipeline (with stubbed Stage 4)
         let config = AdaptiveMeshConfig2 {
-            base_resolution: 4,
+            base_cell_size: 0.75,
             max_depth: 2,
             vertex_refinement_iterations: 4,
             normal_sample_iterations: 1,
@@ -715,7 +718,7 @@ mod tests {
     fn test_full_pipeline_without_refinement() {
         // Run with refinement disabled
         let config = AdaptiveMeshConfig2 {
-            base_resolution: 4,
+            base_cell_size: 0.75,
             max_depth: 2,
             vertex_refinement_iterations: 0, // Disabled
             normal_sample_iterations: 0,     // Disabled

@@ -79,7 +79,7 @@ enum BackgroundTask {
 struct ResampleConfig {
     resolution: usize,
     // ASN v2
-    asn2_base_resolution: usize,
+    asn2_base_cell_size: f64,
     asn2_max_depth: usize,
     asn2_vertex_refinement_iterations: usize,
     asn2_normal_sample_iterations: usize,
@@ -343,7 +343,7 @@ fn execute_resample(
         }
         ExportRenderMode::AdaptiveSurfaceNets2 => {
             let asn2_config = adaptive_surface_nets_2::AdaptiveMeshConfig2 {
-                base_resolution: config.asn2_base_resolution,
+                base_cell_size: config.asn2_base_cell_size,
                 max_depth: config.asn2_max_depth,
                 vertex_refinement_iterations: config.asn2_vertex_refinement_iterations,
                 normal_sample_iterations: config.asn2_normal_sample_iterations,
@@ -472,7 +472,7 @@ fn execute_resample(
         }
         ExportRenderMode::AdaptiveSurfaceNets2 => {
             let asn2_config = adaptive_surface_nets_2::AdaptiveMeshConfig2 {
-                base_resolution: config.asn2_base_resolution,
+                base_cell_size: config.asn2_base_cell_size,
                 max_depth: config.asn2_max_depth,
                 vertex_refinement_iterations: config.asn2_vertex_refinement_iterations,
                 normal_sample_iterations: config.asn2_normal_sample_iterations,
@@ -816,8 +816,8 @@ struct AssetRenderData {
     /// Whether to automatically resample when parameters change
     auto_resample: bool,
 
-    /// Adaptive Surface Nets v2: base resolution (cells per axis for initial discovery)
-    asn2_base_resolution: usize,
+    /// Adaptive Surface Nets v2: base cell size (world units, cubic cells)
+    asn2_base_cell_size: f64,
     /// Adaptive Surface Nets v2: maximum refinement depth
     asn2_max_depth: usize,
     /// Adaptive Surface Nets v2: binary search iterations for vertex position refinement
@@ -851,7 +851,7 @@ impl AssetRenderData {
             resolution: 20,
             auto_resample: true,
             // ASN v2 config
-            asn2_base_resolution: 8,
+            asn2_base_cell_size: 0.25,
             asn2_max_depth: 4,
             asn2_vertex_refinement_iterations: 12,
             // Normal refinement via tangent probing - works well with binary samplers
@@ -1530,7 +1530,7 @@ impl VolumetricApp {
 
             let config = ResampleConfig {
                 resolution: render_data.resolution,
-                asn2_base_resolution: render_data.asn2_base_resolution,
+                asn2_base_cell_size: render_data.asn2_base_cell_size,
                 asn2_max_depth: render_data.asn2_max_depth,
                 asn2_vertex_refinement_iterations: render_data.asn2_vertex_refinement_iterations,
                 asn2_normal_sample_iterations: render_data.asn2_normal_sample_iterations,
@@ -3451,14 +3451,17 @@ impl eframe::App for VolumetricApp {
                                 // Show ASN2 config options when AdaptiveSurfaceNets2 is selected
                                 if current_mode == ExportRenderMode::AdaptiveSurfaceNets2 {
                                     if let Some(render_data) = self.asset_render_data.get_mut(&asset_id) {
-                                        let mut base_res = render_data.asn2_base_resolution;
+                                        let mut base_cell_size = render_data.asn2_base_cell_size;
                                         let mut max_depth = render_data.asn2_max_depth;
                                         let mut auto_resample = render_data.auto_resample;
 
                                         ui.horizontal(|ui| {
-                                            ui.label("Base Resolution:");
-                                            if ui.add(egui::DragValue::new(&mut base_res).range(2..=32)).changed() {
-                                                render_data.asn2_base_resolution = base_res;
+                                            ui.label("Base Cell Size:");
+                                            if ui
+                                                .add(egui::DragValue::new(&mut base_cell_size).speed(0.01).range(0.01..=10.0))
+                                                .changed()
+                                            {
+                                                render_data.asn2_base_cell_size = base_cell_size;
                                                 if auto_resample {
                                                     render_data.needs_resample = true;
                                                 }
@@ -3475,8 +3478,8 @@ impl eframe::App for VolumetricApp {
                                             }
                                         });
 
-                                        let effective_res = base_res * (1 << max_depth);
-                                        ui.weak(format!("Effective resolution: {}³", effective_res));
+                                        let finest_cell = base_cell_size / (1 << max_depth) as f64;
+                                        ui.weak(format!("Finest cell size: {:.4}", finest_cell));
 
                                         let mut vertex_refine = render_data.asn2_vertex_refinement_iterations;
                                         let mut normal_iters = render_data.asn2_normal_sample_iterations;

@@ -136,8 +136,8 @@ volumetric_cli mesh -i <file> -o <output.stl>
 - `-o, --output <file>` - Output STL file path
 
 **Options:**
-- `--base-resolution <n>` - Coarse grid resolution (default: 8)
-- `--max-depth <n>` - Refinement depth (default: 4). Effective resolution = base × 2^depth
+- `--base-cell-size <f>` - Coarse grid cell size in world units (default: 0.25)
+- `--max-depth <n>` - Refinement depth (default: 4). Finest cell size = base-cell-size / 2^depth
 - `--vertex-refinement <n>` - Vertex position refinement iterations (default: 12)
 - `--normal-refinement <n>` - Normal estimation iterations (default: 12, use 0 to disable)
 - `--normal-epsilon <f>` - Normal probe distance as fraction of cell size (default: 0.1)
@@ -148,7 +148,7 @@ volumetric_cli mesh -i <file> -o <output.stl>
 
 **Examples:**
 ```bash
-# Mesh a WASM model with default settings (128³ effective resolution)
+# Mesh a WASM model with default settings
 volumetric_cli mesh -i simple_torus_model.wasm -o torus.stl
 
 # Faster meshing with lower resolution and no normal refinement
@@ -181,7 +181,7 @@ volumetric_cli render -i <file> -o <output.png>
 - `--color <hex>` - Mesh base color as hex, e.g., 6699cc (default: 6699cc)
 - `--grid <spacing>` - Reference grid spacing in meters, 0 to disable (default: 1.0)
 - `--grid-color <hex>` - Grid color as hex, e.g., 555555 (default: 555555)
-- `--base-resolution <n>`, `--max-depth <n>`, `--sharp-edges`, etc. - Same meshing options as the mesh command (sharp-edge flags currently no-op)
+- `--base-cell-size <f>`, `--max-depth <n>`, `--sharp-edges`, etc. - Same meshing options as the mesh command (sharp-edge flags currently no-op)
 - `-q, --quiet` - Suppress profiling output
 
 **Projection & Camera Options:**

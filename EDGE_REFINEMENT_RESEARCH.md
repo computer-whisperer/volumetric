@@ -79,3 +79,20 @@ See attempt notes in `src/adaptive_surface_nets_2/stage4/research/ATTEMPT_*.md`.
 2026-01-25 16:50 EST - Document trimmed to living knowledge, older experimental
 history removed to reduce confusion. Added critiques and clarified near-term
 research directions.
+
+2026-01-25 17:05 EST - Hermite micro-grid experiment added (grid edge crossings
+with k-means, RANSAC, and edge-aligned k-means plane fits). All variants find
+edges but produce high normal/direction errors, indicating mixed face samples
+in the local grid are still too ambiguous.
+
+2026-01-25 17:10 EST - Added edge-line RANSAC on micro-grid crossings. Edge
+direction error improves (~28°) but normals remain very poor (~98°), suggesting
+the crossing cloud is still face-mixed even with line-constrained fitting.
+
+2026-01-25 17:18 EST - Crossing-cone experiment (using crossing directions from
+locate_surface and sampling cones around them) performed poorly: ~113° normal
+error, ~118° edge direction error, and high sample cost (~1k). Likely still
+mixing face populations and/or using unreliable crossing directions.
+
+2026-01-25 17:20 EST - Retired the crossing-cone experiment (code removed) to
+reduce clutter; results retained above for reference.

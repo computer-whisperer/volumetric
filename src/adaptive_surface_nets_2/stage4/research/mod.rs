@@ -43,6 +43,7 @@ pub mod attempt_0;
 pub mod attempt_1;
 pub mod attempt_2;
 pub mod attempt_runner;
+pub mod experiments;
 pub mod oracle;
 pub mod reference_corner;
 pub mod reference_edge;

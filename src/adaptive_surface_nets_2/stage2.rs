@@ -229,7 +229,7 @@ fn create_neighbor_entry(
     dx: i32,
     dy: i32,
     dz: i32,
-    max_cells: i32,
+    max_cells: (i32, i32, i32),
     boundary_expansion: i32,
 ) -> Option<WorkQueueEntry> {
     let neighbor_cuboid = current.cuboid.neighbor(dx, dy, dz, max_cells, boundary_expansion)?;
@@ -332,7 +332,7 @@ fn process_work_entry<F>(
     bounds_min: (f64, f64, f64),
     cell_size: (f64, f64, f64),
     max_depth: u8,
-    base_res: i32,
+    base_cells: (i32, i32, i32),
     visited: &DashSet<CuboidId>,
     stats: &SamplingStats,
 ) -> ProcessedEntry
@@ -394,7 +394,12 @@ where
         );
 
         // Expand to neighbors (frontier expansion)
-        let cells_at_depth = base_res * (1i32 << current_depth);
+        let scale = 1i32 << current_depth;
+        let cells_at_depth = (
+            base_cells.0 * scale,
+            base_cells.1 * scale,
+            base_cells.2 * scale,
+        );
 
         const NEIGHBOR_DIRS: [(i32, i32, i32); 6] = [
             (-1, 0, 0), (1, 0, 0),
@@ -438,6 +443,7 @@ pub fn stage2_subdivision_and_emission<F>(
     sampler: &F,
     bounds_min: (f64, f64, f64),
     cell_size: (f64, f64, f64),
+    base_cells: (i32, i32, i32),
     config: &AdaptiveMeshConfig2,
     stats: &SamplingStats,
 ) -> Vec<SparseTriangle>
@@ -445,7 +451,6 @@ where
     F: SamplerFn,
 {
     let max_depth = config.max_depth as u8;
-    let base_res = config.base_resolution as i32;
 
     // Deduplication set: tracks CuboidIds we've already processed or queued
     let visited: DashSet<CuboidId> = DashSet::new();
@@ -471,7 +476,7 @@ where
                 bounds_min,
                 cell_size,
                 max_depth,
-                base_res,
+                base_cells,
                 &visited,
                 stats,
             )

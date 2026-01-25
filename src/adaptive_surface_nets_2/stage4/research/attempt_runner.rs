@@ -9,6 +9,7 @@ use super::oracle::{OracleBenchmarkCase, OracleClassification, OracleHit};
 use super::attempt_0::{CrossingCountConfig, GeometryType, VertexGeometry};
 use super::attempt_1::{Attempt1Config, Attempt1Diag};
 use super::attempt_2::{Attempt2Config, Attempt2Diag};
+use super::experiments::hermite_microgrid::{hermite_edge_from_microgrid, HermiteMicrogridConfig};
 use super::sample_cache::SampleCache;
 use super::validation::{generate_validation_points, ExpectedClassification, ValidationPoint};
 
@@ -88,6 +89,107 @@ pub fn run_attempt_2_benchmark() {
             let after = cache.stats().actual_samples();
             (result, after - before)
         });
+    }
+}
+
+pub fn run_hermite_microgrid_experiment() {
+    let kmeans = HermiteMicrogridConfig::default();
+    let mut ransac = HermiteMicrogridConfig::default();
+    ransac.fit_strategy = super::experiments::hermite_microgrid::PlaneFitStrategy::Ransac;
+    ransac.ransac_iterations = 120;
+    ransac.ransac_inlier_threshold = 0.04;
+    let mut edge_aligned = HermiteMicrogridConfig::default();
+    edge_aligned.fit_strategy = super::experiments::hermite_microgrid::PlaneFitStrategy::EdgeAlignedKMeans;
+    let mut line_ransac = HermiteMicrogridConfig::default();
+    line_ransac.fit_strategy = super::experiments::hermite_microgrid::PlaneFitStrategy::EdgeAlignedLineRansac;
+    line_ransac.ransac_iterations = 160;
+    line_ransac.line_inlier_threshold = 0.04;
+
+    run_hermite_microgrid_experiment_with_config("Hermite Microgrid (k-means)", &kmeans);
+    run_hermite_microgrid_experiment_with_config("Hermite Microgrid (RANSAC)", &ransac);
+    run_hermite_microgrid_experiment_with_config("Hermite Microgrid (edge-aligned k-means)", &edge_aligned);
+    run_hermite_microgrid_experiment_with_config("Hermite Microgrid (edge-line RANSAC)", &line_ransac);
+}
+
+
+fn run_hermite_microgrid_experiment_with_config(
+    name: &str,
+    config: &HermiteMicrogridConfig,
+) {
+    let cube = AnalyticalRotatedCube::standard_test_cube();
+    let points = generate_validation_points(&cube);
+
+    let mut total = 0usize;
+    let mut success = 0usize;
+    let mut normal_errors = Vec::new();
+    let mut direction_errors = Vec::new();
+    let mut samples_used = Vec::new();
+    let mut crossing_counts = Vec::new();
+
+    for point in &points {
+        let ExpectedClassification::OnEdge {
+            expected_direction,
+            expected_normals,
+            ..
+        } = point.expected
+        else {
+            continue;
+        };
+
+        total += 1;
+        let sampler = |x: f64, y: f64, z: f64| -> f32 {
+            let local = cube.world_to_local((x, y, z));
+            let h = 0.5;
+            if local.0.abs() <= h && local.1.abs() <= h && local.2.abs() <= h {
+                1.0
+            } else {
+                -1.0
+            }
+        };
+
+        let cache = SampleCache::new(|x, y, z| sampler(x, y, z));
+        let before = cache.stats().actual_samples();
+        let result = hermite_edge_from_microgrid(point.position, &cache, config);
+        let after = cache.stats().actual_samples();
+        samples_used.push(after - before);
+
+        if let Some(result) = result {
+            success += 1;
+            let (a_err, b_err) = best_normal_pairing(
+                Some(result.face_a_normal),
+                Some(result.face_b_normal),
+                expected_normals,
+            );
+            normal_errors.push(a_err);
+            normal_errors.push(b_err);
+            direction_errors.push(edge_direction_error(result.edge_direction, expected_direction));
+            crossing_counts.push(result.crossing_points as u64);
+        } else {
+            normal_errors.push(180.0);
+            normal_errors.push(180.0);
+            direction_errors.push(180.0);
+        }
+    }
+
+    println!("\n{}", "=".repeat(72));
+    println!("EXPERIMENT ({})", name);
+    println!("{}", "=".repeat(72));
+    println!("  Edge success: {}/{}", success, total);
+    if !normal_errors.is_empty() {
+        let avg = normal_errors.iter().sum::<f64>() / normal_errors.len() as f64;
+        println!("  Edge normal avg error: {:.2} deg", avg);
+    }
+    if !direction_errors.is_empty() {
+        let avg = direction_errors.iter().sum::<f64>() / direction_errors.len() as f64;
+        println!("  Edge direction avg error: {:.2} deg", avg);
+    }
+    if !samples_used.is_empty() {
+        let avg = samples_used.iter().sum::<u64>() as f64 / samples_used.len() as f64;
+        println!("  Avg samples used: {:.1}", avg);
+    }
+    if !crossing_counts.is_empty() {
+        let avg = crossing_counts.iter().sum::<u64>() as f64 / crossing_counts.len() as f64;
+        println!("  Avg crossing points: {:.1}", avg);
     }
 }
 
@@ -613,4 +715,10 @@ mod tests {
     fn benchmark_attempt_2_against_reference() {
         run_attempt_2_benchmark();
     }
+
+    #[test]
+    fn experiment_hermite_microgrid() {
+        run_hermite_microgrid_experiment();
+    }
+
 }

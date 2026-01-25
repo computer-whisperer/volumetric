@@ -73,9 +73,9 @@ pub struct MeshArgs {
     #[arg(short, long)]
     output: PathBuf,
 
-    /// Base resolution for coarse grid discovery (default: 8)
-    #[arg(long, default_value = "8")]
-    base_resolution: usize,
+    /// Base cell size for coarse grid discovery (world units, default: 0.25)
+    #[arg(long, default_value = "0.25")]
+    base_cell_size: f64,
 
     /// Maximum refinement depth (default: 4, effective resolution = base * 2^depth)
     #[arg(long, default_value = "4")]
@@ -191,7 +191,12 @@ fn print_stats_summary(stats: &MeshingStats2) {
     );
     println!("Vertices:        {}", stats.total_vertices);
     println!("Triangles:       {}", stats.total_triangles);
-    println!("Resolution:      {}³", stats.effective_resolution);
+    println!(
+        "Resolution:      {} x {} x {}",
+        stats.effective_resolution.0,
+        stats.effective_resolution.1,
+        stats.effective_resolution.2
+    );
     println!();
     println!("Stage breakdown:");
     println!(
@@ -288,7 +293,7 @@ fn print_stats_summary(stats: &MeshingStats2) {
 }
 
 pub fn build_mesh_config(
-    base_resolution: usize,
+    base_cell_size: f64,
     max_depth: usize,
     vertex_refinement: usize,
     normal_refinement: usize,
@@ -307,7 +312,7 @@ pub fn build_mesh_config(
     };
 
     AdaptiveMeshConfig2 {
-        base_resolution,
+        base_cell_size,
         max_depth,
         vertex_refinement_iterations: vertex_refinement,
         normal_sample_iterations: normal_refinement,
@@ -324,7 +329,7 @@ fn run_mesh(args: MeshArgs) -> Result<()> {
 
     // Configure meshing
     let config = build_mesh_config(
-        args.base_resolution,
+        args.base_cell_size,
         args.max_depth,
         args.vertex_refinement,
         args.normal_refinement,
@@ -334,10 +339,9 @@ fn run_mesh(args: MeshArgs) -> Result<()> {
         args.sharp_residual,
     );
 
-    let effective_res = config.base_resolution * (1 << config.max_depth);
     println!(
-        "Meshing with resolution {}³ (base={}, depth={})",
-        effective_res, config.base_resolution, config.max_depth
+        "Meshing with base cell {} and depth {}",
+        config.base_cell_size, config.max_depth
     );
 
     // Generate mesh

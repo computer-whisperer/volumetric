@@ -31,10 +31,10 @@ impl<F> SamplerFn for F where F: Fn(f64, f64, f64) -> f32 {}
 /// Configuration for the adaptive surface nets algorithm.
 #[derive(Clone, Debug)]
 pub struct AdaptiveMeshConfig2 {
-    /// Base grid resolution for initial discovery (e.g., 8 means 8³ coarse cells)
-    pub base_resolution: usize,
+    /// Base cell size for the coarse grid (world units, cubic cells).
+    pub base_cell_size: f64,
 
-    /// Maximum refinement depth (total resolution = base_resolution * 2^max_depth)
+    /// Maximum refinement depth (cell size = base_cell_size / 2^max_depth)
     pub max_depth: usize,
 
     /// Number of binary search iterations for vertex position refinement
@@ -77,7 +77,7 @@ pub struct AdaptiveMeshConfig2 {
 impl Default for AdaptiveMeshConfig2 {
     fn default() -> Self {
         Self {
-            base_resolution: 8,
+            base_cell_size: 0.25,
             max_depth: 4,
             vertex_refinement_iterations: 12,
             // Enable normal refinement by default - probing works well with binary samplers
@@ -181,16 +181,31 @@ impl CuboidId {
     ///
     /// # Arguments
     /// * `dx, dy, dz` - Direction offset (-1, 0, or 1)
-    /// * `max_cells` - Number of cells at this depth level (original grid)
+    /// * `max_cells` - Number of cells at this depth level (per axis)
     /// * `boundary_expansion` - Number of extra cells to allow beyond the grid on each side
     ///   (e.g., 1 means allow cells from -1 to max_cells inclusive)
-    pub fn neighbor(&self, dx: i32, dy: i32, dz: i32, max_cells: i32, boundary_expansion: i32) -> Option<CuboidId> {
+    pub fn neighbor(
+        &self,
+        dx: i32,
+        dy: i32,
+        dz: i32,
+        max_cells: (i32, i32, i32),
+        boundary_expansion: i32,
+    ) -> Option<CuboidId> {
         let nx = self.x + dx;
         let ny = self.y + dy;
         let nz = self.z + dz;
         let min_valid = -boundary_expansion;
-        let max_valid = max_cells + boundary_expansion;
-        if nx >= min_valid && nx < max_valid && ny >= min_valid && ny < max_valid && nz >= min_valid && nz < max_valid {
+        let max_valid_x = max_cells.0 + boundary_expansion;
+        let max_valid_y = max_cells.1 + boundary_expansion;
+        let max_valid_z = max_cells.2 + boundary_expansion;
+        if nx >= min_valid
+            && nx < max_valid_x
+            && ny >= min_valid
+            && ny < max_valid_y
+            && nz >= min_valid
+            && nz < max_valid_z
+        {
             Some(CuboidId::new(nx, ny, nz, self.depth))
         } else {
             None
@@ -409,7 +424,7 @@ pub struct MeshingStats2 {
     pub total_triangles: usize,
 
     /// Configuration used
-    pub effective_resolution: usize,
+    pub effective_resolution: (usize, usize, usize),
 
     /// Stage 4.5: Sharp edge detection (when enabled) - currently stubbed
     pub stage4_5_time_secs: f64,
@@ -460,7 +475,12 @@ impl MeshingStats2 {
         }
         println!("  Total vertices: {}", self.total_vertices);
         println!("  Total triangles: {}", self.total_triangles);
-        println!("  Effective resolution: {}³", self.effective_resolution);
+        println!(
+            "  Effective resolution: {} x {} x {}",
+            self.effective_resolution.0,
+            self.effective_resolution.1,
+            self.effective_resolution.2
+        );
         println!("================================================");
     }
 }

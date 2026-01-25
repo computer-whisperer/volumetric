@@ -86,7 +86,7 @@ Edge Index → (corner_a, corner_b, axis):
 ### Stage 1: Coarse Grid Discovery
 
 Sample the volume at low resolution to find regions containing the surface.
-- Grid of `base_resolution³` samples
+- Grid of cubic cells using `base_cell_size` (base cell count is derived per axis)
 - Identify "mixed" edges (inside→outside transitions)
 - Output: Initial work queue of coarse mixed cells WITH pre-sampled corners
 
@@ -171,8 +171,8 @@ always produce compatible triangle configurations.
 ## Integer Size Analysis
 
 **CuboidId coordinates (i32)**:
-- At max_depth, resolution = base_resolution * 2^max_depth
-- With base_resolution=8, max_depth=20: 8 * 2^20 = 8,388,608 cells per axis
+- At max_depth, resolution = base_cells * 2^max_depth (per axis)
+- Example: base_cells=8, max_depth=20: 8 * 2^20 = 8,388,608 cells per axis
 - i32 range: ±2,147,483,647 → sufficient for ~256x this resolution
 - **Verdict**: i32 is adequate for any practical use case
 
