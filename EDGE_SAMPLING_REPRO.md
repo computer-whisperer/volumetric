@@ -1,5 +1,7 @@
 # Edge Sampling Reproduction Procedure
 
+Last verified: 2026-01-25 16:50 EST
+
 Temporary file documenting how to reproduce rotated cube edge renders for edge sampling analysis.
 
 ## Prerequisites
