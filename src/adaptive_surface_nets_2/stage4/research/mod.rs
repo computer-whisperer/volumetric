@@ -41,6 +41,7 @@
 pub mod analytical_cube;
 pub mod attempt_0;
 pub mod attempt_1;
+pub mod attempt_2;
 pub mod attempt_runner;
 pub mod oracle;
 pub mod reference_corner;
@@ -74,6 +75,12 @@ pub use attempt_0::{
 };
 
 pub use attempt_1::{process_vertex as process_vertex_attempt_1, process_vertex_with_diag as process_vertex_attempt_1_with_diag, Attempt1Config, Attempt1Diag};
+pub use attempt_2::{
+    process_vertex as process_vertex_attempt_2,
+    process_vertex_with_diag as process_vertex_attempt_2_with_diag,
+    Attempt2Config,
+    Attempt2Diag,
+};
 pub use oracle::{OracleBenchmarkCase, OracleClassification, OracleHit, OracleShape};
 
 pub use attempt_runner::{run_attempt_0_benchmark, run_attempt_1_benchmark, run_attempt_benchmark};
