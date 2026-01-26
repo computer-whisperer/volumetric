@@ -112,7 +112,12 @@ pub struct ProjectAddOpArgs {
     #[arg(long)]
     pub operator: PathBuf,
 
-    /// Input asset IDs or literal values (format: "asset:id", "json:{...}", or "data:base64")
+    /// Input asset IDs or literal values. Formats:
+    ///   asset:id        - Reference an asset by ID
+    ///   json:{...}      - JSON object (converted to CBOR)
+    ///   file:path       - Raw bytes from file
+    ///   data:base64     - Base64-encoded bytes
+    ///   vecf64:x,y,...  - Raw f64 vector (little-endian bytes)
     #[arg(short, long)]
     pub input: Vec<String>,
 
@@ -151,6 +156,27 @@ fn parse_input(s: &str) -> Result<ExecutionInput> {
         let bytes = STANDARD
             .decode(rest)
             .context("Failed to decode base64 data")?;
+        Ok(ExecutionInput::Inline(bytes))
+    } else if let Some(rest) = s.strip_prefix("vecf64:") {
+        // Parse comma-separated f64 values and encode as raw little-endian bytes
+        let values: Vec<f64> = rest
+            .split(',')
+            .enumerate()
+            .map(|(i, s)| {
+                s.trim()
+                    .parse::<f64>()
+                    .with_context(|| format!("Failed to parse f64 at index {}: '{}'", i, s.trim()))
+            })
+            .collect::<Result<_>>()?;
+
+        if values.is_empty() {
+            anyhow::bail!("vecf64: requires at least one value");
+        }
+
+        let mut bytes = Vec::with_capacity(values.len() * 8);
+        for v in values {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
         Ok(ExecutionInput::Inline(bytes))
     } else {
         // Default: treat as asset ID
