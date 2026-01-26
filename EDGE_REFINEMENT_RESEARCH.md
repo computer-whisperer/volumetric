@@ -247,3 +247,44 @@ help edge detection but cause false edge classifications on faces.
 **Conclusion**: All three attempts fail at realistic scale. The RANSAC-based
 approach doesn't work reliably in small local neighborhoods. New approaches
 needed.
+
+2026-01-26 - **RNN Sampling Policy v2 - Major Progress**
+
+Refactored the RNN-based sampling policy with significant improvements:
+
+### Input Feature Redesign (10 → 6 dims)
+Previous inputs included oracle hint_normal (cheating). Replaced with clean
+minimal design:
+- `prev_offset[3]`: `(prev_sample - vertex) / cell_size`
+- `in_out_sign`: +1 inside, -1 outside, 0 first
+- `budget_remaining`: `1 - step/BUDGET`
+- `crossings_norm`: `crossings_found / 5` (capped)
+
+No oracle information in inputs. Reward still uses oracle distance for training
+signal (acceptable - shapes learning, not used at inference).
+
+### Validation Point Improvements
+- Random 3D offsets within cell (not just normal-aligned)
+- Reduced offset to `0.2 × cell_size` for easier start
+- Deterministic seeding for reproducibility
+
+### Training Results (6000 epochs, ~3.5 min)
+
+| Metric | Before | After |
+|--------|--------|-------|
+| Return | 22.0 | 33.3 |
+| Reward/step | 0.44 | 0.67 |
+| Sample spread | ~0.001 | ~0.05 |
+
+**Key achievement**: Policy learned to explore the full cell volume instead of
+clustering in a tiny region (50x improvement in sample spread).
+
+### Sample Cloud Format v2
+Added `cell_bounds: Option<BBox>` to `SampleCloudSet` for UI rendering of the
+sampling cell bounding box.
+
+See `src/adaptive_surface_nets_2/stage4/research/experiments/rnn_policy/README.md`
+for full documentation.
+
+**Next steps**: Scale up validation offset toward full cell_size, add more
+shapes, replace placeholder classifier with actual geometry fitting.

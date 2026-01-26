@@ -164,11 +164,142 @@ pub fn generate_validation_points(cube: &AnalyticalRotatedCube) -> Vec<Validatio
     generate_validation_points_with_offset(cube, 0.1)
 }
 
-/// Generate systematic validation points with a configurable inside offset.
+/// Simple seeded RNG for deterministic random offsets.
+struct SeededRng {
+    state: u64,
+}
+
+impl SeededRng {
+    fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    /// Generate next u64 using xorshift64
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.state = x;
+        x
+    }
+
+    /// Generate f64 in range [-1, 1]
+    fn next_f64_symmetric(&mut self) -> f64 {
+        (self.next_u64() as f64 / u64::MAX as f64) * 2.0 - 1.0
+    }
+
+    /// Generate random point in unit sphere
+    fn random_in_unit_sphere(&mut self) -> (f64, f64, f64) {
+        loop {
+            let x = self.next_f64_symmetric();
+            let y = self.next_f64_symmetric();
+            let z = self.next_f64_symmetric();
+            let len_sq = x * x + y * y + z * z;
+            if len_sq <= 1.0 && len_sq > 1e-10 {
+                return (x, y, z);
+            }
+        }
+    }
+}
+
+/// Generate validation points with random offsets within cell_size of surface.
+///
+/// Each surface point (face center, edge midpoint, corner) gets a random 3D offset
+/// within a sphere of radius `cell_size`. Uses deterministic seeding for reproducibility.
+pub fn generate_validation_points_randomized(
+    cube: &AnalyticalRotatedCube,
+    cell_size: f64,
+    points_per_feature: usize,
+    seed: u64,
+) -> Vec<ValidationPoint> {
+    let mut rng = SeededRng::new(seed);
+    let mut points = Vec::new();
+
+    // Face centers with random offsets
+    for face_idx in 0..6 {
+        let center = cube.face_center(face_idx);
+        let normal = cube.face_normals[face_idx];
+
+        for i in 0..points_per_feature {
+            let offset = rng.random_in_unit_sphere();
+            let pos = (
+                center.0 + offset.0 * cell_size,
+                center.1 + offset.1 * cell_size,
+                center.2 + offset.2 * cell_size,
+            );
+            points.push(ValidationPoint {
+                position: pos,
+                expected: ExpectedClassification::OnFace {
+                    face_index: face_idx,
+                    expected_normal: normal,
+                },
+                description: format!("Face {} sample {}", face_idx, i),
+            });
+        }
+    }
+
+    // Edge midpoints with random offsets
+    for edge_idx in 0..12 {
+        let edge = cube.get_edge(edge_idx);
+
+        for i in 0..points_per_feature {
+            let offset = rng.random_in_unit_sphere();
+            let pos = (
+                edge.point_on_edge.0 + offset.0 * cell_size,
+                edge.point_on_edge.1 + offset.1 * cell_size,
+                edge.point_on_edge.2 + offset.2 * cell_size,
+            );
+            points.push(ValidationPoint {
+                position: pos,
+                expected: ExpectedClassification::OnEdge {
+                    edge_index: edge_idx,
+                    expected_direction: edge.direction,
+                    expected_normals: (edge.face_a_normal, edge.face_b_normal),
+                },
+                description: format!("Edge {} sample {}", edge_idx, i),
+            });
+        }
+    }
+
+    // Corners with random offsets
+    for corner_idx in 0..8 {
+        let corner_pos = cube.corners[corner_idx];
+        let faces = faces_of_corner(corner_idx);
+        let expected_normals = [
+            cube.face_normals[faces[0]],
+            cube.face_normals[faces[1]],
+            cube.face_normals[faces[2]],
+        ];
+
+        for i in 0..points_per_feature {
+            let offset = rng.random_in_unit_sphere();
+            let pos = (
+                corner_pos.0 + offset.0 * cell_size,
+                corner_pos.1 + offset.1 * cell_size,
+                corner_pos.2 + offset.2 * cell_size,
+            );
+            points.push(ValidationPoint {
+                position: pos,
+                expected: ExpectedClassification::OnCorner {
+                    corner_index: corner_idx,
+                    expected_normals,
+                },
+                description: format!("Corner {} sample {}", corner_idx, i),
+            });
+        }
+    }
+
+    points
+}
+
+/// Generate systematic validation points with a configurable offset.
 ///
 /// The offset should typically be ~0.5 * cell_size to simulate real surface nets
 /// vertices which are within 1 cell of the actual surface.
-pub fn generate_validation_points_with_offset(cube: &AnalyticalRotatedCube, inside_offset: f64) -> Vec<ValidationPoint> {
+///
+/// This generates points both inside and outside the surface.
+pub fn generate_validation_points_with_offset(cube: &AnalyticalRotatedCube, offset: f64) -> Vec<ValidationPoint> {
     let mut points = Vec::new();
 
     // Face centers (6 points) - exactly on surface
@@ -217,14 +348,14 @@ pub fn generate_validation_points_with_offset(cube: &AnalyticalRotatedCube, insi
         });
     }
 
-    // Points slightly inside faces (offset inward)
+    // Points slightly INSIDE faces (offset inward)
     for face_idx in 0..6 {
         let center = cube.face_center(face_idx);
         let normal = cube.face_normals[face_idx];
         let inside_point = (
-            center.0 - normal.0 * inside_offset,
-            center.1 - normal.1 * inside_offset,
-            center.2 - normal.2 * inside_offset,
+            center.0 - normal.0 * offset,
+            center.1 - normal.1 * offset,
+            center.2 - normal.2 * offset,
         );
         points.push(ValidationPoint {
             position: inside_point,
@@ -236,14 +367,33 @@ pub fn generate_validation_points_with_offset(cube: &AnalyticalRotatedCube, insi
         });
     }
 
-    // Points slightly inside edges (offset inward along bisector)
+    // Points slightly OUTSIDE faces (offset outward)
+    for face_idx in 0..6 {
+        let center = cube.face_center(face_idx);
+        let normal = cube.face_normals[face_idx];
+        let outside_point = (
+            center.0 + normal.0 * offset,
+            center.1 + normal.1 * offset,
+            center.2 + normal.2 * offset,
+        );
+        points.push(ValidationPoint {
+            position: outside_point,
+            expected: ExpectedClassification::OnFace {
+                face_index: face_idx,
+                expected_normal: normal,
+            },
+            description: format!("Face {} (outside)", face_idx),
+        });
+    }
+
+    // Points slightly INSIDE edges (offset inward along bisector)
     for edge_idx in 0..12 {
         let edge = cube.get_edge(edge_idx);
         let bisector = normalize(add(edge.face_a_normal, edge.face_b_normal));
         let inside_point = (
-            edge.point_on_edge.0 - bisector.0 * inside_offset,
-            edge.point_on_edge.1 - bisector.1 * inside_offset,
-            edge.point_on_edge.2 - bisector.2 * inside_offset,
+            edge.point_on_edge.0 - bisector.0 * offset,
+            edge.point_on_edge.1 - bisector.1 * offset,
+            edge.point_on_edge.2 - bisector.2 * offset,
         );
         points.push(ValidationPoint {
             position: inside_point,
@@ -253,6 +403,26 @@ pub fn generate_validation_points_with_offset(cube: &AnalyticalRotatedCube, insi
                 expected_normals: (edge.face_a_normal, edge.face_b_normal),
             },
             description: format!("Edge {} (inside)", edge_idx),
+        });
+    }
+
+    // Points slightly OUTSIDE edges (offset outward along bisector)
+    for edge_idx in 0..12 {
+        let edge = cube.get_edge(edge_idx);
+        let bisector = normalize(add(edge.face_a_normal, edge.face_b_normal));
+        let outside_point = (
+            edge.point_on_edge.0 + bisector.0 * offset,
+            edge.point_on_edge.1 + bisector.1 * offset,
+            edge.point_on_edge.2 + bisector.2 * offset,
+        );
+        points.push(ValidationPoint {
+            position: outside_point,
+            expected: ExpectedClassification::OnEdge {
+                edge_index: edge_idx,
+                expected_direction: edge.direction,
+                expected_normals: (edge.face_a_normal, edge.face_b_normal),
+            },
+            description: format!("Edge {} (outside)", edge_idx),
         });
     }
 
@@ -584,17 +754,18 @@ mod tests {
         let cube = AnalyticalRotatedCube::standard_test_cube();
         let points = generate_validation_points(&cube);
 
-        // Should have: 6 face centers + 12 edge midpoints + 8 corners + 6 inside faces + 12 inside edges = 44
+        // Should have: 6 face centers + 12 edge midpoints + 8 corners
+        //            + 6 inside faces + 6 outside faces + 12 inside edges + 12 outside edges = 62
         assert!(points.len() >= 26, "Should have at least 26 points (basic), got {}", points.len());
 
-        // Check face points exist
+        // Check face points exist (center + inside + outside = 18)
         let face_points = points
             .iter()
             .filter(|p| matches!(p.expected, ExpectedClassification::OnFace { .. }))
             .count();
         assert!(face_points >= 6, "Should have at least 6 face points");
 
-        // Check edge points exist
+        // Check edge points exist (midpoint + inside + outside = 36)
         let edge_points = points
             .iter()
             .filter(|p| matches!(p.expected, ExpectedClassification::OnEdge { .. }))

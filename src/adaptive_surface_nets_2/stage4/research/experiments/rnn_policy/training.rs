@@ -10,7 +10,7 @@ use crate::adaptive_surface_nets_2::stage4::research::validation::{
 
 use super::gradients::{compute_batch_gradient, PolicyGradients};
 use super::gru::{Rng, HIDDEN_DIM};
-use super::policy::{run_episode, RnnPolicy, BUDGET, INPUT_DIM};
+use super::policy::{run_episode, RnnPolicy, BUDGET, CELL_SIZE, INPUT_DIM};
 use super::reward::RewardConfig;
 
 /// Training configuration.
@@ -381,14 +381,14 @@ fn classify_from_samples(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adaptive_surface_nets_2::stage4::research::validation::generate_validation_points;
+    use crate::adaptive_surface_nets_2::stage4::research::validation::generate_validation_points_randomized;
 
     #[test]
     fn test_training_loop() {
         let mut rng = Rng::new(42);
         let mut policy = RnnPolicy::new(&mut rng);
         let cube = AnalyticalRotatedCube::standard_test_cube();
-        let points = generate_validation_points(&cube);
+        let points = generate_validation_points_randomized(&cube, CELL_SIZE * 0.2, 2, 42);
 
         // Use a subset of points for faster test
         let subset: Vec<_> = points.into_iter().take(5).collect();
@@ -414,7 +414,7 @@ mod tests {
         let mut rng = Rng::new(42);
         let policy = RnnPolicy::new(&mut rng);
         let cube = AnalyticalRotatedCube::standard_test_cube();
-        let points = generate_validation_points(&cube);
+        let points = generate_validation_points_randomized(&cube, CELL_SIZE * 0.2, 2, 42);
 
         let subset: Vec<_> = points.into_iter().take(5).collect();
         let reward_config = RewardConfig::default();

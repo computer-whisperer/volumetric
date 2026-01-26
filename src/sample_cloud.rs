@@ -3,12 +3,37 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
-const SAMPLE_CLOUD_VERSION: u32 = 1;
+const SAMPLE_CLOUD_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SampleCloudDump {
     pub version: u32,
     pub sets: Vec<SampleCloudSet>,
+}
+
+/// Axis-aligned bounding box.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct BBox {
+    pub min: [f32; 3],
+    pub max: [f32; 3],
+}
+
+impl BBox {
+    /// Create a bounding box centered on a point with given half-extents.
+    pub fn centered(center: [f32; 3], half_extent: f32) -> Self {
+        Self {
+            min: [
+                center[0] - half_extent,
+                center[1] - half_extent,
+                center[2] - half_extent,
+            ],
+            max: [
+                center[0] + half_extent,
+                center[1] + half_extent,
+                center[2] + half_extent,
+            ],
+        }
+    }
 }
 
 impl SampleCloudDump {
@@ -42,6 +67,9 @@ pub struct SampleCloudSet {
     pub label: Option<String>,
     pub vertex: [f32; 3],
     pub hint_normal: [f32; 3],
+    /// Bounding box of the sampling cell (centered on vertex).
+    #[serde(default)]
+    pub cell_bounds: Option<BBox>,
     pub points: Vec<SamplePoint>,
     pub meta: SampleCloudMeta,
 }
@@ -53,6 +81,20 @@ impl SampleCloudSet {
             label: None,
             vertex,
             hint_normal,
+            cell_bounds: None,
+            points: Vec::new(),
+            meta: SampleCloudMeta::default(),
+        }
+    }
+
+    /// Create a new sample cloud set with cell bounds.
+    pub fn with_cell_size(id: u64, vertex: [f32; 3], hint_normal: [f32; 3], cell_size: f32) -> Self {
+        Self {
+            id,
+            label: None,
+            vertex,
+            hint_normal,
+            cell_bounds: Some(BBox::centered(vertex, cell_size * 0.5)),
             points: Vec::new(),
             meta: SampleCloudMeta::default(),
         }

@@ -5,20 +5,19 @@
 
 use crate::adaptive_surface_nets_2::stage4::research::analytical_cube::AnalyticalRotatedCube;
 use crate::adaptive_surface_nets_2::stage4::research::sample_cache::SampleCache;
-use crate::adaptive_surface_nets_2::stage4::research::validation::{ExpectedClassification, ValidationPoint};
+use crate::adaptive_surface_nets_2::stage4::research::validation::ValidationPoint;
 
 use super::chooser::{
     chooser_forward, octant_corners, position_from_probs, sample_categorical, ChooserCache,
     ChooserWeights,
 };
 use super::gru::{gru_forward, GruCache, GruWeights, Rng, HIDDEN_DIM};
-use super::math::{argmax, distance_3d, normalize_3d, add_3d};
+use super::math::argmax;
 use super::reward::{compute_step_reward, RewardConfig};
 
 /// Input dimension for the GRU.
-/// Features: normalized_pos(3), is_inside(1), oracle_dist(1), budget_frac(1),
-///           sample_count(1), spread_metric(1), last_reward(1), bias(1)
-pub const INPUT_DIM: usize = 10;
+/// Features: prev_offset(3), in_out_sign(1), budget_remaining(1), crossings_found(1)
+pub const INPUT_DIM: usize = 6;
 
 /// Maximum samples per episode.
 pub const BUDGET: usize = 50;
@@ -239,6 +238,30 @@ pub fn run_episode(
     training: bool,
     reward_config: &RewardConfig,
 ) -> Episode {
+    run_episode_ex(policy, cube, point, point_idx, rng, training, false, reward_config)
+}
+
+/// Run a single episode with the policy (extended version).
+///
+/// # Arguments
+/// * `policy` - The RNN policy
+/// * `cube` - Analytical cube for oracle queries
+/// * `point` - Validation point to process
+/// * `point_idx` - Index of the point (for tracking)
+/// * `rng` - Random number generator
+/// * `stochastic` - Whether to sample stochastically (true) or use argmax (false)
+/// * `use_discrete` - Whether to use discrete corners (true) or weighted positions (false)
+/// * `reward_config` - Reward configuration
+pub fn run_episode_ex(
+    policy: &RnnPolicy,
+    cube: &AnalyticalRotatedCube,
+    point: &ValidationPoint,
+    point_idx: usize,
+    rng: &mut Rng,
+    stochastic: bool,
+    use_discrete: bool,
+    reward_config: &RewardConfig,
+) -> Episode {
     // Create sampler for the cube
     let sampler = |x: f64, y: f64, z: f64| -> f32 {
         let local = cube.world_to_local((x, y, z));
@@ -258,21 +281,20 @@ pub fn run_episode(
     let mut steps = Vec::new();
     let mut rewards = Vec::new();
     let mut prev_inside: Option<bool> = None;
-    let mut last_reward = 0.0;
+    let mut prev_sample: Option<(f64, f64, f64)> = None;
+    let mut crossings_found: usize = 0;
 
     let corners = octant_corners(point.position, CELL_SIZE);
-    let hint_normal = hint_from_expected(&point.expected);
 
     // Run episode
     for step_idx in 0..BUDGET {
         // Build input features
         let input = build_input(
             point.position,
-            &samples,
-            step_idx,
+            prev_sample,
             prev_inside,
-            last_reward,
-            hint_normal,
+            step_idx,
+            crossings_found,
             CELL_SIZE,
         );
 
@@ -284,7 +306,7 @@ pub fn run_episode(
         let (_logits, probs, mut chooser_cache) = chooser_forward(&policy.chooser, &h);
 
         // Select action
-        let action = if training {
+        let action = if stochastic {
             sample_categorical(&probs, rng)
         } else {
             argmax(&probs)
@@ -292,11 +314,11 @@ pub fn run_episode(
         chooser_cache.action = action;
 
         // Compute sample position
-        let sample_pos = if training {
-            // During training, use the sampled corner
+        let sample_pos = if use_discrete || stochastic {
+            // Use discrete corner (required for training, optional for eval)
             corners[action]
         } else {
-            // During evaluation, use weighted average for smoother behavior
+            // Use weighted average for smoother behavior
             position_from_probs(&probs, &corners)
         };
 
@@ -309,7 +331,11 @@ pub fn run_episode(
         } else {
             false
         };
+        if is_crossing {
+            crossings_found += 1;
+        }
         prev_inside = Some(is_inside);
+        prev_sample = Some(sample_pos);
 
         // Get oracle distance
         let closest = cube.closest_surface_point(sample_pos);
@@ -324,7 +350,6 @@ pub fn run_episode(
             CELL_SIZE,
             reward_config,
         );
-        last_reward = reward;
 
         samples.push(sample_pos);
         rewards.push(reward);
@@ -352,82 +377,49 @@ pub fn run_episode(
 }
 
 /// Build input features for one step.
+///
+/// All spatial values are normalized by cell_size so the policy operates
+/// in a unit-cube reference frame.
 fn build_input(
     vertex: (f64, f64, f64),
-    samples: &[(f64, f64, f64)],
-    step_idx: usize,
+    prev_sample: Option<(f64, f64, f64)>,
     prev_inside: Option<bool>,
-    last_reward: f64,
-    hint_normal: (f64, f64, f64),
+    step_idx: usize,
+    crossings_found: usize,
     cell_size: f64,
 ) -> Vec<f64> {
-    // Normalized position relative to vertex
-    let rel_pos = if samples.is_empty() {
-        (0.0, 0.0, 0.0)
-    } else {
-        let last = samples.last().unwrap();
-        (
-            (last.0 - vertex.0) / cell_size,
-            (last.1 - vertex.1) / cell_size,
-            (last.2 - vertex.2) / cell_size,
-        )
+    // Previous sample offset from vertex, normalized by cell_size
+    // Range: approximately [-1, 1] since samples are within the cell
+    let prev_offset = match prev_sample {
+        Some(s) => (
+            (s.0 - vertex.0) / cell_size,
+            (s.1 - vertex.1) / cell_size,
+            (s.2 - vertex.2) / cell_size,
+        ),
+        None => (0.0, 0.0, 0.0),
     };
 
-    // Inside/outside indicator
-    let inside_indicator = match prev_inside {
+    // Inside/outside sign: +1 inside, -1 outside, 0 if no previous sample
+    let in_out_sign = match prev_inside {
         Some(true) => 1.0,
         Some(false) => -1.0,
         None => 0.0,
     };
 
-    // Spread metric: average distance between samples
-    let spread = if samples.len() < 2 {
-        0.0
-    } else {
-        let mut total_dist = 0.0;
-        let mut count = 0;
-        for i in 0..samples.len() {
-            for j in (i + 1)..samples.len() {
-                total_dist += distance_3d(samples[i], samples[j]);
-                count += 1;
-            }
-        }
-        if count > 0 {
-            (total_dist / count as f64 / cell_size).min(2.0)
-        } else {
-            0.0
-        }
-    };
+    // Budget remaining (1.0 at start, 0.0 at end)
+    let budget_remaining = 1.0 - (step_idx as f64 / BUDGET as f64);
+
+    // Crossings found so far, normalized (expect ~3-10 crossings for good fit)
+    let crossings_norm = (crossings_found as f64 / 5.0).min(2.0);
 
     vec![
-        rel_pos.0.tanh(),                          // 0: normalized x
-        rel_pos.1.tanh(),                          // 1: normalized y
-        rel_pos.2.tanh(),                          // 2: normalized z
-        inside_indicator,                          // 3: last sample inside/outside
-        (step_idx as f64 / BUDGET as f64),         // 4: budget fraction
-        (samples.len() as f64 / BUDGET as f64),    // 5: sample count fraction
-        spread,                                     // 6: spread metric
-        last_reward.tanh(),                        // 7: last reward (normalized)
-        hint_normal.0,                             // 8: hint normal x
-        1.0,                                       // 9: bias
+        prev_offset.0,      // 0: previous sample X offset / cell_size
+        prev_offset.1,      // 1: previous sample Y offset / cell_size
+        prev_offset.2,      // 2: previous sample Z offset / cell_size
+        in_out_sign,        // 3: previous sample inside(+1) / outside(-1) / none(0)
+        budget_remaining,   // 4: fraction of budget remaining
+        crossings_norm,     // 5: crossings found (normalized)
     ]
-}
-
-/// Extract hint normal from expected classification.
-fn hint_from_expected(expected: &ExpectedClassification) -> (f64, f64, f64) {
-    match expected {
-        ExpectedClassification::OnFace { expected_normal, .. } => *expected_normal,
-        ExpectedClassification::OnEdge { expected_normals, .. } => {
-            normalize_3d(add_3d(expected_normals.0, expected_normals.1))
-        }
-        ExpectedClassification::OnCorner { expected_normals, .. } => {
-            let sum = add_3d(
-                add_3d(expected_normals[0], expected_normals[1]),
-                expected_normals[2],
-            );
-            normalize_3d(sum)
-        }
-    }
 }
 
 #[cfg(test)]
@@ -439,22 +431,30 @@ mod tests {
         let mut rng = Rng::new(42);
         let policy = RnnPolicy::new(&mut rng);
         let count = policy.param_count();
-        // Should be in the ~4500 range
-        assert!(count > 4000 && count < 5000);
+        // With INPUT_DIM=6, HIDDEN_DIM=32, NUM_OCTANTS=8:
+        // GRU: 3 * (32*6 + 32*32 + 32) = 3 * (192 + 1024 + 32) = 3 * 1248 = 3744
+        // Chooser: 8*32 + 8 = 264
+        // Total: 4008
+        assert!(count > 3500 && count < 4500, "param_count={}", count);
     }
 
     #[test]
     fn test_build_input() {
         let vertex = (0.0, 0.0, 0.0);
-        let samples = vec![(0.01, 0.0, 0.0)];
-        let hint = (0.0, 1.0, 0.0);
-        let input = build_input(vertex, &samples, 5, Some(true), 0.5, hint, CELL_SIZE);
+        let prev_sample = Some((0.01, 0.02, -0.01));
+        let input = build_input(vertex, prev_sample, Some(true), 5, 2, CELL_SIZE);
 
         assert_eq!(input.len(), INPUT_DIM);
-        // Budget fraction at step 5
-        assert!((input[4] - 5.0 / BUDGET as f64).abs() < 1e-10);
-        // One sample
-        assert!((input[5] - 1.0 / BUDGET as f64).abs() < 1e-10);
+        // prev_offset = sample / cell_size
+        assert!((input[0] - 0.01 / CELL_SIZE).abs() < 1e-10);
+        assert!((input[1] - 0.02 / CELL_SIZE).abs() < 1e-10);
+        assert!((input[2] - -0.01 / CELL_SIZE).abs() < 1e-10);
+        // in_out_sign = +1 for inside
+        assert!((input[3] - 1.0).abs() < 1e-10);
+        // budget_remaining at step 5
+        assert!((input[4] - (1.0 - 5.0 / BUDGET as f64)).abs() < 1e-10);
+        // crossings_norm = 2 / 5 = 0.4
+        assert!((input[5] - 0.4).abs() < 1e-10);
     }
 
     #[test]

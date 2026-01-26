@@ -57,9 +57,12 @@ fn main() {
     println!("Set {} label={:?}", index, set.label);
     println!("Vertex: {:?}", set.vertex);
     println!("Hint: {:?}", set.hint_normal);
+    if let Some(bounds) = &set.cell_bounds {
+        println!("Cell bounds: min={:?} max={:?}", bounds.min, bounds.max);
+    }
     println!("Points: {}", set.points.len());
-    println!("Min: {:?}", min);
-    println!("Max: {:?}", max);
+    println!("Sample min: {:?}", min);
+    println!("Sample max: {:?}", max);
 }
 
 fn print_help() {

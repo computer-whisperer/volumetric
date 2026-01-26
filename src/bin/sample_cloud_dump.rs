@@ -20,6 +20,7 @@ fn main() {
     let mut ml_policy: Option<MlPolicyDumpKind> = None;
     let mut rnn_command: Option<RnnCommand> = None;
     let mut model_path: Option<PathBuf> = None;
+    let mut use_discrete = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -58,6 +59,9 @@ fn main() {
                     output = Some(PathBuf::from(value));
                 }
             }
+            "--discrete" => {
+                use_discrete = true;
+            }
             "--help" | "-h" => {
                 print_help();
                 return;
@@ -75,7 +79,7 @@ fn main() {
             }
             RnnCommand::Dump => {
                 let output = output.unwrap_or_else(|| PathBuf::from("sample_cloud_rnn_trained.cbor"));
-                load_and_dump_rnn_policy(&model, &output);
+                load_and_dump_rnn_policy(&model, &output, use_discrete);
             }
         }
         return;
@@ -105,5 +109,8 @@ fn print_help() {
     eprintln!("  sample_cloud_dump --attempt <0|1|2> [--out <file.cbor>]");
     eprintln!("  sample_cloud_dump --ml-policy <directional|octant-argmax|octant-lerp> [--out <file.cbor>]");
     eprintln!("  sample_cloud_dump --rnn-policy train [--model <file.bin>]");
-    eprintln!("  sample_cloud_dump --rnn-policy dump [--model <file.bin>] [--out <file.cbor>]");
+    eprintln!("  sample_cloud_dump --rnn-policy dump [--model <file.bin>] [--out <file.cbor>] [--discrete]");
+    eprintln!();
+    eprintln!("Options:");
+    eprintln!("  --discrete    Use discrete corner sampling instead of weighted positions");
 }

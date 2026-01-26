@@ -46,11 +46,11 @@ use crate::adaptive_surface_nets_2::stage4::research::analytical_cube::Analytica
 use crate::adaptive_surface_nets_2::stage4::research::sample_cache::{
     begin_sample_recording, end_sample_recording,
 };
-use crate::adaptive_surface_nets_2::stage4::research::validation::generate_validation_points;
+use crate::adaptive_surface_nets_2::stage4::research::validation::generate_validation_points_randomized;
 use crate::sample_cloud::{SampleCloudDump, SampleCloudSet};
 
 use gru::Rng;
-use policy::{run_episode, RnnPolicy};
+use policy::{run_episode, run_episode_ex, RnnPolicy};
 use reward::RewardConfig;
 use training::{evaluate_policy, train_policy, EvaluationResult, TrainingConfig};
 
@@ -73,7 +73,7 @@ pub const DEFAULT_MODEL_PATH: &str = "rnn_policy_trained.bin";
 /// This trains the policy on validation points and reports accuracy.
 pub fn run_rnn_policy_experiment() {
     let cube = AnalyticalRotatedCube::standard_test_cube();
-    let points = generate_validation_points(&cube);
+    let points = generate_validation_points_randomized(&cube, policy::CELL_SIZE * 0.2, 2, 42);
 
     let mut rng = Rng::new(12345);
     let reward_config = RewardConfig::default();
@@ -190,7 +190,7 @@ fn print_breakdown(eval: &EvaluationResult) {
 /// Train the RNN policy and save weights to a file.
 pub fn train_and_save_rnn_policy(model_path: &Path) {
     let cube = AnalyticalRotatedCube::standard_test_cube();
-    let points = generate_validation_points(&cube);
+    let points = generate_validation_points_randomized(&cube, policy::CELL_SIZE * 0.2, 2, 42);
 
     let mut rng = Rng::new(12345);
     let reward_config = RewardConfig::default();
@@ -209,10 +209,10 @@ pub fn train_and_save_rnn_policy(model_path: &Path) {
     println!("Before training: {}", eval_before.summary("Random"));
 
     // Train
-    println!("\nTraining (200 epochs)...");
+    println!("\nTraining (6000 epochs)...");
     let config = TrainingConfig {
-        epochs: 200,
-        print_every: 40,
+        epochs: 6000,
+        print_every: 1000,
         lr: 0.001,
         ..Default::default()
     };
@@ -231,7 +231,7 @@ pub fn train_and_save_rnn_policy(model_path: &Path) {
 }
 
 /// Load a trained RNN policy and dump sample clouds.
-pub fn load_and_dump_rnn_policy(model_path: &Path, output_path: &Path) {
+pub fn load_and_dump_rnn_policy(model_path: &Path, output_path: &Path, use_discrete: bool) {
     let policy = match RnnPolicy::load(model_path) {
         Ok(p) => p,
         Err(e) => {
@@ -241,13 +241,14 @@ pub fn load_and_dump_rnn_policy(model_path: &Path, output_path: &Path) {
     };
     println!("Loaded model from {}", model_path.display());
 
-    dump_rnn_policy_sample_cloud_with_policy(&policy, "rnn-trained", output_path);
+    let label = if use_discrete { "rnn-trained-discrete" } else { "rnn-trained" };
+    dump_rnn_policy_sample_cloud_with_policy(&policy, label, output_path, use_discrete);
 }
 
 /// Dump sample clouds from the RNN policy for visualization.
 pub fn dump_rnn_policy_sample_cloud(kind: RnnPolicyDumpKind, output_path: &Path) {
     let cube = AnalyticalRotatedCube::standard_test_cube();
-    let points = generate_validation_points(&cube);
+    let points = generate_validation_points_randomized(&cube, policy::CELL_SIZE * 0.2, 2, 42);
 
     let mut rng = Rng::new(12345);
     let reward_config = RewardConfig::default();
@@ -274,13 +275,13 @@ pub fn dump_rnn_policy_sample_cloud(kind: RnnPolicyDumpKind, output_path: &Path)
         }
     };
 
-    dump_rnn_policy_sample_cloud_with_policy(&policy, label, output_path);
+    dump_rnn_policy_sample_cloud_with_policy(&policy, label, output_path, true);
 }
 
 /// Dump sample clouds using a pre-loaded policy.
-fn dump_rnn_policy_sample_cloud_with_policy(policy: &RnnPolicy, label: &str, output_path: &Path) {
+fn dump_rnn_policy_sample_cloud_with_policy(policy: &RnnPolicy, label: &str, output_path: &Path, use_discrete: bool) {
     let cube = AnalyticalRotatedCube::standard_test_cube();
-    let points = generate_validation_points(&cube);
+    let points = generate_validation_points_randomized(&cube, policy::CELL_SIZE * 0.2, 2, 42);
 
     let mut rng = Rng::new(12345);
     let reward_config = RewardConfig::default();
@@ -290,12 +291,18 @@ fn dump_rnn_policy_sample_cloud_with_policy(policy: &RnnPolicy, label: &str, out
     for (idx, point) in points.iter().enumerate() {
         begin_sample_recording();
 
-        let episode = run_episode(policy, &cube, point, idx, &mut rng, false, &reward_config);
+        // stochastic=false (use argmax), use_discrete controls corner vs weighted position
+        let episode = run_episode_ex(policy, &cube, point, idx, &mut rng, false, use_discrete, &reward_config);
 
         let samples = end_sample_recording();
 
         let hint = hint_from_expected(&point.expected);
-        let mut set = SampleCloudSet::new(idx as u64, to_f32(point.position), to_f32(hint));
+        let mut set = SampleCloudSet::with_cell_size(
+            idx as u64,
+            to_f32(point.position),
+            to_f32(hint),
+            policy::CELL_SIZE as f32,
+        );
         set.label = Some(format!("{}: {}", label, point.description));
         set.points = samples;
         set.meta.samples_used = Some(episode.samples_used as u32);
@@ -345,7 +352,7 @@ mod tests {
     fn test_rnn_policy_experiment() {
         // Run a quick version of the experiment
         let cube = AnalyticalRotatedCube::standard_test_cube();
-        let points = generate_validation_points(&cube);
+        let points = generate_validation_points_randomized(&cube, policy::CELL_SIZE * 0.2, 2, 42);
         let subset: Vec<_> = points.into_iter().take(5).collect();
 
         let mut rng = Rng::new(42);
