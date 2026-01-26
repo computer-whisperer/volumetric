@@ -26,7 +26,7 @@ use walrus::{FunctionBuilder, FunctionId, MemoryId, Module, ModuleConfig, ValTyp
 #[derive(Clone, Debug, serde::Serialize)]
 enum OperatorMetadataInput {
     ModelWASM,
-    CBORConfiguration(String),
+    VecF64(usize),
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -42,17 +42,26 @@ struct OperatorMetadata {
     outputs: Vec<OperatorMetadataOutput>,
 }
 
-#[derive(Clone, Debug, serde::Deserialize)]
-struct TranslateConfig {
-    dx: f32,
-    dy: f32,
-    dz: f32,
+/// Read input data from the host
+fn read_input(idx: i32) -> Vec<u8> {
+    let len = unsafe { get_input_len(idx) } as usize;
+    if len == 0 {
+        return Vec::new();
+    }
+    let mut buf = vec![0u8; len];
+    unsafe { get_input_data(idx, buf.as_mut_ptr() as i32, len as i32) };
+    buf
 }
 
-impl Default for TranslateConfig {
-    fn default() -> Self {
-        Self { dx: 0.0, dy: 0.0, dz: 0.0 }
+/// Decode a VecF64 from raw bytes (8 bytes per f64, little-endian), with a default fallback
+fn decode_vec3(data: &[u8], default: [f64; 3]) -> [f64; 3] {
+    if data.len() < 24 {
+        return default;
     }
+    let x = f64::from_le_bytes(data[0..8].try_into().unwrap());
+    let y = f64::from_le_bytes(data[8..16].try_into().unwrap());
+    let z = f64::from_le_bytes(data[16..24].try_into().unwrap());
+    [x, y, z]
 }
 
 #[link(wasm_import_module = "host")]
@@ -85,7 +94,7 @@ fn generate_hex_suffix() -> String {
 }
 
 /// Transform the input WASM module to apply translation by (dx, dy, dz).
-fn transform_wasm(input_bytes: &[u8], cfg: TranslateConfig) -> Result<Vec<u8>, String> {
+fn transform_wasm(input_bytes: &[u8], translation: [f64; 3]) -> Result<Vec<u8>, String> {
     let config = ModuleConfig::new();
     let mut module = Module::from_buffer_with_config(input_bytes, &config)
         .map_err(|e| format!("Failed to parse WASM: {}", e))?;
@@ -175,7 +184,7 @@ fn transform_wasm(input_bytes: &[u8], cfg: TranslateConfig) -> Result<Vec<u8>, S
         builder.func_body()
             .i32_const(SCRATCH_POS_OFFSET)
             .local_get(x)
-            .f64_const(-(cfg.dx as f64))
+            .f64_const(-(translation[0]))
             .binop(walrus::ir::BinaryOp::F64Add)
             .store(memory_id, walrus::ir::StoreKind::F64, scratch_arg);
 
@@ -183,7 +192,7 @@ fn transform_wasm(input_bytes: &[u8], cfg: TranslateConfig) -> Result<Vec<u8>, S
         builder.func_body()
             .i32_const(SCRATCH_POS_OFFSET)
             .local_get(y)
-            .f64_const(-(cfg.dy as f64))
+            .f64_const(-(translation[1]))
             .binop(walrus::ir::BinaryOp::F64Add)
             .store(memory_id, walrus::ir::StoreKind::F64, scratch_arg_8);
 
@@ -191,7 +200,7 @@ fn transform_wasm(input_bytes: &[u8], cfg: TranslateConfig) -> Result<Vec<u8>, S
         builder.func_body()
             .i32_const(SCRATCH_POS_OFFSET)
             .local_get(z)
-            .f64_const(-(cfg.dz as f64))
+            .f64_const(-(translation[2]))
             .binop(walrus::ir::BinaryOp::F64Add)
             .store(memory_id, walrus::ir::StoreKind::F64, scratch_arg_16);
 
@@ -228,7 +237,7 @@ fn transform_wasm(input_bytes: &[u8], cfg: TranslateConfig) -> Result<Vec<u8>, S
         builder.func_body()
             .local_get(out_ptr)
             .load(memory_id, walrus::ir::LoadKind::F64, mem_arg)
-            .f64_const(cfg.dx as f64)
+            .f64_const(translation[0])
             .binop(walrus::ir::BinaryOp::F64Add)
             .local_set(tmp);
         builder.func_body()
@@ -241,7 +250,7 @@ fn transform_wasm(input_bytes: &[u8], cfg: TranslateConfig) -> Result<Vec<u8>, S
         builder.func_body()
             .local_get(out_ptr)
             .load(memory_id, walrus::ir::LoadKind::F64, mem_arg_8)
-            .f64_const(cfg.dx as f64)
+            .f64_const(translation[0])
             .binop(walrus::ir::BinaryOp::F64Add)
             .local_set(tmp);
         builder.func_body()
@@ -254,7 +263,7 @@ fn transform_wasm(input_bytes: &[u8], cfg: TranslateConfig) -> Result<Vec<u8>, S
         builder.func_body()
             .local_get(out_ptr)
             .load(memory_id, walrus::ir::LoadKind::F64, mem_arg_16)
-            .f64_const(cfg.dy as f64)
+            .f64_const(translation[1])
             .binop(walrus::ir::BinaryOp::F64Add)
             .local_set(tmp);
         builder.func_body()
@@ -267,7 +276,7 @@ fn transform_wasm(input_bytes: &[u8], cfg: TranslateConfig) -> Result<Vec<u8>, S
         builder.func_body()
             .local_get(out_ptr)
             .load(memory_id, walrus::ir::LoadKind::F64, mem_arg_24)
-            .f64_const(cfg.dy as f64)
+            .f64_const(translation[1])
             .binop(walrus::ir::BinaryOp::F64Add)
             .local_set(tmp);
         builder.func_body()
@@ -280,7 +289,7 @@ fn transform_wasm(input_bytes: &[u8], cfg: TranslateConfig) -> Result<Vec<u8>, S
         builder.func_body()
             .local_get(out_ptr)
             .load(memory_id, walrus::ir::LoadKind::F64, mem_arg_32)
-            .f64_const(cfg.dz as f64)
+            .f64_const(translation[2])
             .binop(walrus::ir::BinaryOp::F64Add)
             .local_set(tmp);
         builder.func_body()
@@ -293,7 +302,7 @@ fn transform_wasm(input_bytes: &[u8], cfg: TranslateConfig) -> Result<Vec<u8>, S
         builder.func_body()
             .local_get(out_ptr)
             .load(memory_id, walrus::ir::LoadKind::F64, mem_arg_40)
-            .f64_const(cfg.dz as f64)
+            .f64_const(translation[2])
             .binop(walrus::ir::BinaryOp::F64Add)
             .local_set(tmp);
         builder.func_body()
@@ -310,35 +319,20 @@ fn transform_wasm(input_bytes: &[u8], cfg: TranslateConfig) -> Result<Vec<u8>, S
 
 #[unsafe(no_mangle)]
 pub extern "C" fn run() {
-    let len = unsafe { get_input_len(0) } as usize;
-    let mut buf = vec![0u8; len];
+    // Read input 0: Model WASM bytes
+    let wasm_data = read_input(0);
 
-    if len > 0 {
-        unsafe {
-            get_input_data(0, buf.as_mut_ptr() as i32, len as i32);
-        }
-    }
-
-    let cfg = {
-        let cfg_len = unsafe { get_input_len(1) } as usize;
-        if cfg_len == 0 {
-            TranslateConfig::default()
-        } else {
-            let mut cfg_buf = vec![0u8; cfg_len];
-            unsafe {
-                get_input_data(1, cfg_buf.as_mut_ptr() as i32, cfg_len as i32);
-            }
-            let mut cursor = std::io::Cursor::new(&cfg_buf);
-            ciborium::de::from_reader::<TranslateConfig, _>(&mut cursor).unwrap_or_default()
-        }
-    };
+    // Read input 1: translation offset as VecF64(3) - [dx, dy, dz]
+    // Default to [0, 0, 0] (no translation)
+    let translation_data = read_input(1);
+    let translation = decode_vec3(&translation_data, [0.0, 0.0, 0.0]);
 
     // Transform the WASM
-    let output = match transform_wasm(&buf, cfg) {
+    let output = match transform_wasm(&wasm_data, translation) {
         Ok(transformed) => transformed,
         Err(_) => {
             // On error, pass through unchanged (like identity)
-            buf
+            wasm_data
         }
     };
 
@@ -351,13 +345,12 @@ pub extern "C" fn run() {
 pub extern "C" fn get_metadata() -> i64 {
     static METADATA: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     let bytes = METADATA.get_or_init(|| {
-        let schema = "{ dx: float .default 0.0, dy: float .default 0.0, dz: float .default 0.0 }".to_string();
         let metadata = OperatorMetadata {
             name: "translate_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             inputs: vec![
                 OperatorMetadataInput::ModelWASM,
-                OperatorMetadataInput::CBORConfiguration(schema),
+                OperatorMetadataInput::VecF64(3), // translation offset [dx, dy, dz]
             ],
             outputs: vec![OperatorMetadataOutput::ModelWASM],
         };

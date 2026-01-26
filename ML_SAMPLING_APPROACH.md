@@ -4,6 +4,11 @@ This document captures the current ML sampling experiment for edge detection.
 It is an MVP meant to validate sampling policy ideas before any full model is
 trained for geometry classification or parameter regression.
 
+> **WARNING (2026-01-25 21:00 EST):** MVP results below were obtained with
+> incorrect scaling parameters (cell_size=1.0, fixed offset=0.1). Metrics
+> need re-verification after fixing scale invariance issues. See
+> `EDGE_REFINEMENT_RESEARCH.md` for details.
+
 ## Goals
 
 - Learn a sampling policy that chooses where to probe next.

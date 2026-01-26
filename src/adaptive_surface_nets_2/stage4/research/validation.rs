@@ -156,11 +156,22 @@ impl ValidationResult {
     }
 }
 
-/// Generate systematic validation points for a rotated cube
+/// Generate systematic validation points for a rotated cube.
+///
+/// Uses the default inside offset of 0.1 for backwards compatibility.
+/// For cell_size-aware testing, use `generate_validation_points_with_offset`.
 pub fn generate_validation_points(cube: &AnalyticalRotatedCube) -> Vec<ValidationPoint> {
+    generate_validation_points_with_offset(cube, 0.1)
+}
+
+/// Generate systematic validation points with a configurable inside offset.
+///
+/// The offset should typically be ~0.5 * cell_size to simulate real surface nets
+/// vertices which are within 1 cell of the actual surface.
+pub fn generate_validation_points_with_offset(cube: &AnalyticalRotatedCube, inside_offset: f64) -> Vec<ValidationPoint> {
     let mut points = Vec::new();
 
-    // Face centers (6 points)
+    // Face centers (6 points) - exactly on surface
     for face_idx in 0..6 {
         let center = cube.face_center(face_idx);
         points.push(ValidationPoint {
@@ -173,7 +184,7 @@ pub fn generate_validation_points(cube: &AnalyticalRotatedCube) -> Vec<Validatio
         });
     }
 
-    // Edge midpoints (12 points)
+    // Edge midpoints (12 points) - exactly on surface
     for edge_idx in 0..12 {
         let edge = cube.get_edge(edge_idx);
         points.push(ValidationPoint {
@@ -187,7 +198,7 @@ pub fn generate_validation_points(cube: &AnalyticalRotatedCube) -> Vec<Validatio
         });
     }
 
-    // Corners (8 points)
+    // Corners (8 points) - exactly on surface
     for corner_idx in 0..8 {
         let corner_pos = cube.corners[corner_idx];
         let faces = faces_of_corner(corner_idx);
@@ -206,15 +217,14 @@ pub fn generate_validation_points(cube: &AnalyticalRotatedCube) -> Vec<Validatio
         });
     }
 
-    // Points slightly inside faces (offset inward by 0.1)
+    // Points slightly inside faces (offset inward)
     for face_idx in 0..6 {
         let center = cube.face_center(face_idx);
         let normal = cube.face_normals[face_idx];
-        let offset = 0.1;
         let inside_point = (
-            center.0 - normal.0 * offset,
-            center.1 - normal.1 * offset,
-            center.2 - normal.2 * offset,
+            center.0 - normal.0 * inside_offset,
+            center.1 - normal.1 * inside_offset,
+            center.2 - normal.2 * inside_offset,
         );
         points.push(ValidationPoint {
             position: inside_point,
@@ -230,11 +240,10 @@ pub fn generate_validation_points(cube: &AnalyticalRotatedCube) -> Vec<Validatio
     for edge_idx in 0..12 {
         let edge = cube.get_edge(edge_idx);
         let bisector = normalize(add(edge.face_a_normal, edge.face_b_normal));
-        let offset = 0.1;
         let inside_point = (
-            edge.point_on_edge.0 - bisector.0 * offset,
-            edge.point_on_edge.1 - bisector.1 * offset,
-            edge.point_on_edge.2 - bisector.2 * offset,
+            edge.point_on_edge.0 - bisector.0 * inside_offset,
+            edge.point_on_edge.1 - bisector.1 * inside_offset,
+            edge.point_on_edge.2 - bisector.2 * inside_offset,
         );
         points.push(ValidationPoint {
             position: inside_point,

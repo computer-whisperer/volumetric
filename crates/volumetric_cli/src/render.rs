@@ -10,7 +10,9 @@ use volumetric::generate_adaptive_mesh_v2_from_bytes;
 use volumetric::sample_cloud::{SampleCloudDump, SampleCloudSet, SamplePointKind};
 
 use crate::camera::{parse_views, CameraSetup, ProjectionType, ViewAngle};
-use crate::headless_renderer::{GridVertex, HeadlessRenderer, MeshVertex, Uniforms, WireframeOptions};
+use crate::headless_renderer::{
+    GridVertex, HeadlessRenderer, MeshVertex, PointInstance, PointShape, Uniforms, WireframeOptions,
+};
 use crate::{build_mesh_config, load_wasm_bytes};
 
 /// Projection type for CLI argument parsing
@@ -522,13 +524,18 @@ pub fn run_render(args: RenderArgs) -> Result<()> {
         args.sample_cloud_id,
     )?;
 
-    let sample_lines = sample_cloud.as_ref().map(|set| {
-        let cross_size = args.sample_cloud_size * scene_size;
-        let sample_color = parse_hex_color(&args.sample_cloud_color).unwrap_or([0.2, 0.8, 1.0]);
-        let vertex_color =
-            parse_hex_color(&args.sample_cloud_vertex_color).unwrap_or([1.0, 0.2, 0.4]);
-        sample_cloud_to_lines(set, cross_size, sample_color, vertex_color)
+    // Convert sample cloud to points for rendering
+    let sample_color = parse_hex_color(&args.sample_cloud_color).unwrap_or([0.2, 0.8, 1.0]);
+    let vertex_color = parse_hex_color(&args.sample_cloud_vertex_color).unwrap_or([1.0, 0.2, 0.4]);
+    let sample_points = sample_cloud.as_ref().map(|set| {
+        sample_cloud_to_points(
+            set,
+            [vertex_color[0], vertex_color[1], vertex_color[2], 1.0],
+            [sample_color[0], sample_color[1], sample_color[2], 0.85],
+        )
     });
+    // Point size in screen pixels (sample_cloud_size is a fraction, multiply by base size)
+    let point_size = args.sample_cloud_size * 400.0; // Base size of ~8px at default 0.02
 
     // Render based on camera mode
     if use_custom_camera {
@@ -571,7 +578,8 @@ pub fn run_render(args: RenderArgs) -> Result<()> {
             background_color,
             grid_vertices.as_deref(),
             wireframe_options.as_ref(),
-            sample_lines.as_deref(),
+            sample_points.as_deref(),
+            point_size,
             args.sample_cloud_mode,
             &args.output,
         )?;
@@ -607,7 +615,8 @@ pub fn run_render(args: RenderArgs) -> Result<()> {
                 background_color,
                 grid_vertices.as_deref(),
                 wireframe_options.as_ref(),
-                sample_lines.as_deref(),
+                sample_points.as_deref(),
+                point_size,
                 args.sample_cloud_mode,
                 &output_path,
             )?;
@@ -646,62 +655,32 @@ fn load_sample_cloud_set(
     Ok(Some(set))
 }
 
-fn sample_cloud_to_lines(
+/// Convert sample cloud to point instances for rendering.
+///
+/// Returns (sample_points, vertex_point) - the samples and the vertex marker.
+fn sample_cloud_to_points(
     set: &SampleCloudSet,
-    size: f32,
-    sample_color: [f32; 3],
-    vertex_color: [f32; 3],
-) -> Vec<GridVertex> {
-    let mut lines = Vec::new();
-    let vertex_size = size * 1.6;
-    add_cross(&mut lines, set.vertex, vertex_size, vertex_color);
+    vertex_color: [f32; 4],
+    default_color: [f32; 4],
+) -> Vec<PointInstance> {
+    let mut points = Vec::with_capacity(set.points.len() + 1);
 
+    // Add the vertex position as a larger, distinct point (will be rendered with diamond shape)
+    points.push(PointInstance::new(set.vertex, vertex_color));
+
+    // Add all sample points with color based on kind
     for point in &set.points {
         let color = match point.kind {
-            SamplePointKind::Crossing => [0.2, 1.0, 0.4],
-            SamplePointKind::Inside => [1.0, 0.8, 0.2],
-            SamplePointKind::Outside => [1.0, 0.4, 0.2],
-            SamplePointKind::Probe => sample_color,
-            SamplePointKind::Unknown => sample_color,
+            SamplePointKind::Crossing => [0.2, 1.0, 0.4, 0.95],  // Green
+            SamplePointKind::Inside => [1.0, 0.8, 0.2, 0.95],   // Yellow
+            SamplePointKind::Outside => [1.0, 0.4, 0.2, 0.95],  // Orange-red
+            SamplePointKind::Probe => default_color,
+            SamplePointKind::Unknown => default_color,
         };
-        add_cross(&mut lines, point.position, size, color);
+        points.push(PointInstance::new(point.position, color));
     }
 
-    lines
-}
-
-fn add_cross(lines: &mut Vec<GridVertex>, pos: [f32; 3], size: f32, color: [f32; 3]) {
-    let offsets = [
-        ([size, 0.0, 0.0], [-size, 0.0, 0.0]),
-        ([0.0, size, 0.0], [0.0, -size, 0.0]),
-        ([0.0, 0.0, size], [0.0, 0.0, -size]),
-    ];
-
-    for (a, b) in offsets {
-        let start = [
-            pos[0] + a[0],
-            pos[1] + a[1],
-            pos[2] + a[2],
-        ];
-        let end = [
-            pos[0] + b[0],
-            pos[1] + b[1],
-            pos[2] + b[2],
-        ];
-
-        lines.push(GridVertex {
-            position: start,
-            _pad0: 0.0,
-            color,
-            _pad1: 0.0,
-        });
-        lines.push(GridVertex {
-            position: end,
-            _pad0: 0.0,
-            color,
-            _pad1: 0.0,
-        });
-    }
+    points
 }
 
 fn render_with_sample_cloud(
@@ -712,49 +691,60 @@ fn render_with_sample_cloud(
     background_color: [f32; 3],
     grid_vertices: Option<&[GridVertex]>,
     wireframe: Option<&WireframeOptions>,
-    sample_lines: Option<&[GridVertex]>,
+    sample_points: Option<&[PointInstance]>,
+    point_size: f32,
     mode: SampleCloudMode,
     output_path: &PathBuf,
 ) -> Result<()> {
     match mode {
-        SampleCloudMode::Overlay => renderer.render_to_png(
+        SampleCloudMode::Overlay => renderer.render_with_points_to_png(
             vertices,
             indices,
             uniforms,
             background_color,
             grid_vertices,
-            sample_lines,
             wireframe,
+            sample_points,
+            point_size,
+            PointShape::Circle,
             output_path,
         ),
-        SampleCloudMode::CloudOnly => renderer.render_to_png(
-            vertices,
+        SampleCloudMode::CloudOnly => renderer.render_with_points_to_png(
+            &[],
             &[],
             uniforms,
             background_color,
             None,
-            sample_lines,
             None,
+            sample_points,
+            point_size,
+            PointShape::Circle,
             output_path,
         ),
         SampleCloudMode::Split => {
-            let left = renderer.render_to_image(
+            // Left side: mesh only
+            let left = renderer.render_with_points_to_image(
                 vertices,
                 indices,
                 uniforms,
                 background_color,
                 grid_vertices,
-                None,
                 wireframe,
+                None,
+                point_size,
+                PointShape::Circle,
             )?;
-            let right = renderer.render_to_image(
-                vertices,
+            // Right side: points only
+            let right = renderer.render_with_points_to_image(
+                &[],
                 &[],
                 uniforms,
                 background_color,
                 None,
-                sample_lines,
                 None,
+                sample_points,
+                point_size,
+                PointShape::Circle,
             )?;
             let combined = compose_side_by_side(&left, &right);
             combined.save(output_path).context("Failed to save PNG")?;

@@ -26,7 +26,7 @@ use walrus::{FunctionBuilder, FunctionId, MemoryId, Module, ModuleConfig, ValTyp
 #[derive(Clone, Debug, serde::Serialize)]
 enum OperatorMetadataInput {
     ModelWASM,
-    CBORConfiguration(String),
+    VecF64(usize),
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -42,17 +42,26 @@ struct OperatorMetadata {
     outputs: Vec<OperatorMetadataOutput>,
 }
 
-#[derive(Clone, Debug, serde::Deserialize)]
-struct ScaleConfig {
-    sx: f32,
-    sy: f32,
-    sz: f32,
+/// Read input data from the host
+fn read_input(idx: i32) -> Vec<u8> {
+    let len = unsafe { get_input_len(idx) } as usize;
+    if len == 0 {
+        return Vec::new();
+    }
+    let mut buf = vec![0u8; len];
+    unsafe { get_input_data(idx, buf.as_mut_ptr() as i32, len as i32) };
+    buf
 }
 
-impl Default for ScaleConfig {
-    fn default() -> Self {
-        Self { sx: 1.0, sy: 1.0, sz: 1.0 }
+/// Decode a VecF64 from raw bytes (8 bytes per f64, little-endian), with a default fallback
+fn decode_vec3(data: &[u8], default: [f64; 3]) -> [f64; 3] {
+    if data.len() < 24 {
+        return default;
     }
+    let x = f64::from_le_bytes(data[0..8].try_into().unwrap());
+    let y = f64::from_le_bytes(data[8..16].try_into().unwrap());
+    let z = f64::from_le_bytes(data[16..24].try_into().unwrap());
+    [x, y, z]
 }
 
 #[link(wasm_import_module = "host")]
@@ -76,7 +85,7 @@ fn generate_hex_suffix() -> String {
     result
 }
 
-fn transform_wasm(input_bytes: &[u8], cfg: ScaleConfig) -> Result<Vec<u8>, String> {
+fn transform_wasm(input_bytes: &[u8], scale: [f64; 3]) -> Result<Vec<u8>, String> {
     let config = ModuleConfig::new();
     let mut module = Module::from_buffer_with_config(input_bytes, &config)
         .map_err(|e| format!("Failed to parse WASM: {}", e))?;
@@ -143,21 +152,21 @@ fn transform_wasm(input_bytes: &[u8], cfg: ScaleConfig) -> Result<Vec<u8>, Strin
         b.func_body()
             .i32_const(SCRATCH_POS_OFFSET)
             .local_get(x)
-            .f64_const(cfg.sx as f64)
+            .f64_const(scale[0])
             .binop(F64Div)
             .store(memory_id, walrus::ir::StoreKind::F64, scratch_arg);
 
         b.func_body()
             .i32_const(SCRATCH_POS_OFFSET)
             .local_get(y)
-            .f64_const(cfg.sy as f64)
+            .f64_const(scale[1])
             .binop(F64Div)
             .store(memory_id, walrus::ir::StoreKind::F64, scratch_arg_8);
 
         b.func_body()
             .i32_const(SCRATCH_POS_OFFSET)
             .local_get(z)
-            .f64_const(cfg.sz as f64)
+            .f64_const(scale[2])
             .binop(F64Div)
             .store(memory_id, walrus::ir::StoreKind::F64, scratch_arg_16);
 
@@ -182,7 +191,7 @@ fn transform_wasm(input_bytes: &[u8], cfg: ScaleConfig) -> Result<Vec<u8>, Strin
         b.func_body().local_get(out_ptr).call(orig);
 
         // Process each axis: scale and handle sign flips
-        let scales = [(0, 8, cfg.sx as f64), (16, 24, cfg.sy as f64), (32, 40, cfg.sz as f64)];
+        let scales = [(0, 8, scale[0]), (16, 24, scale[1]), (32, 40, scale[2])];
 
         for (min_offset, max_offset, scale) in scales {
             let mem_arg_min = walrus::ir::MemArg { align: 3, offset: min_offset };
@@ -229,21 +238,18 @@ fn transform_wasm(input_bytes: &[u8], cfg: ScaleConfig) -> Result<Vec<u8>, Strin
 
 #[unsafe(no_mangle)]
 pub extern "C" fn run() {
-    let len = unsafe { get_input_len(0) } as usize;
-    let mut buf = vec![0u8; len];
-    if len > 0 { unsafe { get_input_data(0, buf.as_mut_ptr() as i32, len as i32); } }
+    // Read input 0: Model WASM bytes
+    let wasm_data = read_input(0);
 
-    let cfg = {
-        let cfg_len = unsafe { get_input_len(1) } as usize;
-        if cfg_len == 0 { ScaleConfig::default() } else {
-            let mut cfg_buf = vec![0u8; cfg_len];
-            unsafe { get_input_data(1, cfg_buf.as_mut_ptr() as i32, cfg_len as i32); }
-            let mut cursor = std::io::Cursor::new(&cfg_buf);
-            ciborium::de::from_reader::<ScaleConfig, _>(&mut cursor).unwrap_or_default()
-        }
+    // Read input 1: scale factors as VecF64(3) - [sx, sy, sz]
+    // Default to [1, 1, 1] (no scaling)
+    let scale_data = read_input(1);
+    let scale = decode_vec3(&scale_data, [1.0, 1.0, 1.0]);
+
+    let output = match transform_wasm(&wasm_data, scale) {
+        Ok(t) => t,
+        Err(_) => wasm_data,
     };
-
-    let output = match transform_wasm(&buf, cfg) { Ok(t) => t, Err(_) => buf };
     unsafe { post_output(0, output.as_ptr() as i32, output.len() as i32); }
 }
 
@@ -251,13 +257,12 @@ pub extern "C" fn run() {
 pub extern "C" fn get_metadata() -> i64 {
     static METADATA: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     let bytes = METADATA.get_or_init(|| {
-        let schema = "{ sx: float .default 1.0, sy: float .default 1.0, sz: float .default 1.0 }".to_string();
         let metadata = OperatorMetadata {
             name: "scale_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             inputs: vec![
                 OperatorMetadataInput::ModelWASM,
-                OperatorMetadataInput::CBORConfiguration(schema),
+                OperatorMetadataInput::VecF64(3), // scale factors [sx, sy, sz]
             ],
             outputs: vec![OperatorMetadataOutput::ModelWASM],
         };

@@ -37,6 +37,7 @@ window.wasmModelCreateSync = function(bytes) {
 
 // Get the bounding box of a model
 // Returns [minX, minY, minZ, maxX, maxY, maxZ] or null on error
+// Supports both legacy ABI (get_bounds_min_x etc.) and N-dimensional ABI (get_bounds(out_ptr))
 window.wasmModelGetBounds = function(handle) {
     const entry = wasmInstances.get(handle);
     if (!entry) {
@@ -46,6 +47,26 @@ window.wasmModelGetBounds = function(handle) {
 
     try {
         const exports = entry.instance.exports;
+
+        // Check for N-dimensional ABI (get_bounds + memory + get_dimensions)
+        if (exports.get_bounds && exports.memory && exports.get_dimensions) {
+            // N-dimensional ABI: call get_bounds(out_ptr) and read from memory
+            const BOUNDS_OFFSET = 256; // Standard bounds buffer offset
+            exports.get_bounds(BOUNDS_OFFSET);
+
+            // Read interleaved bounds: [min_x, max_x, min_y, max_y, min_z, max_z]
+            const memory = new Float64Array(exports.memory.buffer, BOUNDS_OFFSET, 6);
+            return new Float64Array([
+                memory[0], // min_x
+                memory[2], // min_y
+                memory[4], // min_z
+                memory[1], // max_x
+                memory[3], // max_y
+                memory[5], // max_z
+            ]);
+        }
+
+        // Legacy ABI: separate get_bounds_min_x() etc. functions
         return new Float64Array([
             exports.get_bounds_min_x(),
             exports.get_bounds_min_y(),
@@ -62,6 +83,7 @@ window.wasmModelGetBounds = function(handle) {
 
 // Sample the density at a point
 // Returns the density value (> 0 means inside), or NaN on error
+// Supports both legacy ABI (is_inside(x,y,z)) and N-dimensional ABI (sample(pos_ptr))
 window.wasmModelIsInside = function(handle, x, y, z) {
     const entry = wasmInstances.get(handle);
     if (!entry) {
@@ -70,7 +92,21 @@ window.wasmModelIsInside = function(handle, x, y, z) {
     }
 
     try {
-        return entry.instance.exports.is_inside(x, y, z);
+        const exports = entry.instance.exports;
+
+        // Check for N-dimensional ABI (sample + memory)
+        if (exports.sample && exports.memory) {
+            // N-dimensional ABI: write position to memory, call sample(pos_ptr)
+            const POS_OFFSET = 0; // Standard position buffer offset
+            const posBuffer = new Float64Array(exports.memory.buffer, POS_OFFSET, 3);
+            posBuffer[0] = x;
+            posBuffer[1] = y;
+            posBuffer[2] = z;
+            return exports.sample(POS_OFFSET);
+        }
+
+        // Legacy ABI: is_inside(x, y, z)
+        return exports.is_inside(x, y, z);
     } catch (e) {
         console.error("Failed to sample:", e);
         return NaN;

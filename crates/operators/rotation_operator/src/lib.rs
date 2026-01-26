@@ -26,7 +26,7 @@ use walrus::{FunctionBuilder, FunctionId, MemoryId, Module, ModuleConfig, ValTyp
 #[derive(Clone, Debug, serde::Serialize)]
 enum OperatorMetadataInput {
     ModelWASM,
-    CBORConfiguration(String),
+    VecF64(usize),
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -42,18 +42,26 @@ struct OperatorMetadata {
     outputs: Vec<OperatorMetadataOutput>,
 }
 
-#[derive(Clone, Debug, serde::Deserialize)]
-struct RotationConfig {
-    /// Degrees about X, Y, Z applied in order Rx -> Ry -> Rz
-    rx_deg: f32,
-    ry_deg: f32,
-    rz_deg: f32,
+/// Read input data from the host
+fn read_input(idx: i32) -> Vec<u8> {
+    let len = unsafe { get_input_len(idx) } as usize;
+    if len == 0 {
+        return Vec::new();
+    }
+    let mut buf = vec![0u8; len];
+    unsafe { get_input_data(idx, buf.as_mut_ptr() as i32, len as i32) };
+    buf
 }
 
-impl Default for RotationConfig {
-    fn default() -> Self {
-        Self { rx_deg: 0.0, ry_deg: 0.0, rz_deg: 0.0 }
+/// Decode a VecF64 from raw bytes (8 bytes per f64, little-endian), with a default fallback
+fn decode_vec3(data: &[u8], default: [f64; 3]) -> [f64; 3] {
+    if data.len() < 24 {
+        return default;
     }
+    let x = f64::from_le_bytes(data[0..8].try_into().unwrap());
+    let y = f64::from_le_bytes(data[8..16].try_into().unwrap());
+    let z = f64::from_le_bytes(data[16..24].try_into().unwrap());
+    [x, y, z]
 }
 
 #[link(wasm_import_module = "host")]
@@ -78,10 +86,11 @@ fn generate_hex_suffix() -> String {
 }
 
 /// Build rotation matrices constants from Euler angles (degrees). Returns (R, R_inv, abs(R))
-fn rotation_constants(cfg: &RotationConfig) -> ([[f64; 3]; 3], [[f64; 3]; 3], [[f64; 3]; 3]) {
-    let (sx, cx) = (cfg.rx_deg as f64).to_radians().sin_cos();
-    let (sy, cy) = (cfg.ry_deg as f64).to_radians().sin_cos();
-    let (sz, cz) = (cfg.rz_deg as f64).to_radians().sin_cos();
+/// rotation_deg is [rx_deg, ry_deg, rz_deg]
+fn rotation_constants(rotation_deg: [f64; 3]) -> ([[f64; 3]; 3], [[f64; 3]; 3], [[f64; 3]; 3]) {
+    let (sx, cx) = rotation_deg[0].to_radians().sin_cos();
+    let (sy, cy) = rotation_deg[1].to_radians().sin_cos();
+    let (sz, cz) = rotation_deg[2].to_radians().sin_cos();
 
     // R = Rz * Ry * Rx (apply X then Y then Z to a column vector)
     let rx = [[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]];
@@ -110,13 +119,13 @@ fn rotation_constants(cfg: &RotationConfig) -> ([[f64; 3]; 3], [[f64; 3]; 3], [[
     (r, r_inv, r_abs)
 }
 
-fn transform_wasm(input_bytes: &[u8], cfg: RotationConfig) -> Result<Vec<u8>, String> {
+fn transform_wasm(input_bytes: &[u8], rotation_deg: [f64; 3]) -> Result<Vec<u8>, String> {
     let config = ModuleConfig::new();
     let mut module = Module::from_buffer_with_config(input_bytes, &config)
         .map_err(|e| format!("Failed to parse WASM: {}", e))?;
 
     let suffix = generate_hex_suffix();
-    let (r, r_inv, r_abs) = rotation_constants(&cfg);
+    let (r, r_inv, r_abs) = rotation_constants(rotation_deg);
 
     // Find memory export
     let memory_id: Option<MemoryId> = module.exports.iter()
@@ -357,21 +366,18 @@ fn transform_wasm(input_bytes: &[u8], cfg: RotationConfig) -> Result<Vec<u8>, St
 
 #[unsafe(no_mangle)]
 pub extern "C" fn run() {
-    let len = unsafe { get_input_len(0) } as usize;
-    let mut buf = vec![0u8; len];
-    if len > 0 { unsafe { get_input_data(0, buf.as_mut_ptr() as i32, len as i32); } }
+    // Read input 0: Model WASM bytes
+    let wasm_data = read_input(0);
 
-    let cfg = {
-        let cfg_len = unsafe { get_input_len(1) } as usize;
-        if cfg_len == 0 { RotationConfig::default() } else {
-            let mut cfg_buf = vec![0u8; cfg_len];
-            unsafe { get_input_data(1, cfg_buf.as_mut_ptr() as i32, cfg_len as i32); }
-            let mut cursor = std::io::Cursor::new(&cfg_buf);
-            ciborium::de::from_reader::<RotationConfig, _>(&mut cursor).unwrap_or_default()
-        }
+    // Read input 1: rotation angles as VecF64(3) - [rx_deg, ry_deg, rz_deg]
+    // Default to [0, 0, 0] (no rotation)
+    let rotation_data = read_input(1);
+    let rotation_deg = decode_vec3(&rotation_data, [0.0, 0.0, 0.0]);
+
+    let output = match transform_wasm(&wasm_data, rotation_deg) {
+        Ok(t) => t,
+        Err(_) => wasm_data,
     };
-
-    let output = match transform_wasm(&buf, cfg) { Ok(t) => t, Err(_) => buf };
     unsafe { post_output(0, output.as_ptr() as i32, output.len() as i32); }
 }
 
@@ -379,13 +385,12 @@ pub extern "C" fn run() {
 pub extern "C" fn get_metadata() -> i64 {
     static METADATA: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     let bytes = METADATA.get_or_init(|| {
-        let schema = "{ rx_deg: float .default 0.0, ry_deg: float .default 0.0, rz_deg: float .default 0.0 }".to_string();
         let metadata = OperatorMetadata {
             name: "rotation_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             inputs: vec![
                 OperatorMetadataInput::ModelWASM,
-                OperatorMetadataInput::CBORConfiguration(schema),
+                OperatorMetadataInput::VecF64(3), // rotation angles [rx_deg, ry_deg, rz_deg]
             ],
             outputs: vec![OperatorMetadataOutput::ModelWASM],
         };

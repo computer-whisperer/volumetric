@@ -2,6 +2,11 @@
 
 Date/Time: 2026-01-25 16:50 EST (reviewed)
 
+> **WARNING (2026-01-25 21:00 EST):** Results below were obtained with incorrect
+> scaling parameters (cell_size=1.0, fixed offset=0.1). The algorithm is NOT
+> scale-invariant due to hardcoded absolute thresholds. All metrics need
+> re-verification. See `EDGE_REFINEMENT_RESEARCH.md` for details.
+
 ## Summary
 Fixed-budget, full-sphere RANSAC with crossing-count routing. Sampling is reused across passes.
 

@@ -13,7 +13,18 @@ use super::experiments::hermite_microgrid::{hermite_edge_from_microgrid, Hermite
 use super::experiments::ml_policy::run_ml_policy_experiment;
 use super::sample_cache::{begin_sample_recording, end_sample_recording, SampleCache};
 use crate::sample_cloud::{SampleCloudDump, SampleCloudSet};
-use super::validation::{generate_validation_points, ExpectedClassification, ValidationPoint};
+use super::validation::{generate_validation_points, generate_validation_points_with_offset, ExpectedClassification, ValidationPoint};
+
+/// Realistic cell size for research benchmarks.
+/// The validation points use an offset of 0.1 inside the surface.
+/// With config search_distance=0.5: search range = 0.5 * cell_size
+/// For search to reach the surface: 0.5 * cell_size >= 0.1 → cell_size >= 0.2
+///
+/// Using 0.1 gives search range = 0.05, which requires increasing search_distance
+/// factor in configs. Using 0.2 works with the default search_distance=0.5.
+///
+/// The old value of 1.0 was wrong - it made sample clouds span the entire model!
+const RESEARCH_CELL_SIZE: f64 = 1.0; // Testing scale invariance with proportional offset
 
 pub fn run_attempt_0_benchmark() {
     let config = CrossingCountConfig::default();
@@ -21,7 +32,7 @@ pub fn run_attempt_0_benchmark() {
         run_attempt_benchmark_oracle("Attempt 0 (crossing count + RANSAC)", |point, hint, sampler| {
             let cache = SampleCache::new(|x, y, z| sampler(x, y, z));
             let before = cache.stats().actual_samples();
-            let result = super::attempt_0::process_vertex(point, hint, 1.0, &cache, &config);
+            let result = super::attempt_0::process_vertex(point, hint, RESEARCH_CELL_SIZE, &cache, &config);
             let after = cache.stats().actual_samples();
             (result, after - before)
         });
@@ -29,7 +40,7 @@ pub fn run_attempt_0_benchmark() {
         run_attempt_benchmark("Attempt 0 (crossing count + RANSAC)", |point, hint, sampler| {
             let cache = SampleCache::new(|x, y, z| sampler(x, y, z));
             let before = cache.stats().actual_samples();
-            let result = super::attempt_0::process_vertex(point, hint, 1.0, &cache, &config);
+            let result = super::attempt_0::process_vertex(point, hint, RESEARCH_CELL_SIZE, &cache, &config);
             let after = cache.stats().actual_samples();
             (result, after - before)
         });
@@ -43,7 +54,7 @@ pub fn run_attempt_1_benchmark() {
         run_attempt_benchmark_oracle("Attempt 1 (adaptive RANSAC + crossing count)", |point, hint, sampler| {
             let cache = SampleCache::new(|x, y, z| sampler(x, y, z));
             let before = cache.stats().actual_samples();
-            let result = super::attempt_1::process_vertex(point, hint, 1.0, &cache, &config);
+            let result = super::attempt_1::process_vertex(point, hint, RESEARCH_CELL_SIZE, &cache, &config);
             let after = cache.stats().actual_samples();
             (result, after - before)
         });
@@ -55,7 +66,7 @@ pub fn run_attempt_1_benchmark() {
                 let cache = SampleCache::new(|x, y, z| sampler(x, y, z));
                 let before = cache.stats().actual_samples();
                 let (result, diag) =
-                    super::attempt_1::process_vertex_with_diag(point, hint, 1.0, &cache, &config);
+                    super::attempt_1::process_vertex_with_diag(point, hint, RESEARCH_CELL_SIZE, &cache, &config);
                 let after = cache.stats().actual_samples();
                 (result, after - before, diag)
             },
@@ -64,7 +75,7 @@ pub fn run_attempt_1_benchmark() {
         run_attempt_benchmark("Attempt 1 (adaptive RANSAC + crossing count)", |point, hint, sampler| {
             let cache = SampleCache::new(|x, y, z| sampler(x, y, z));
             let before = cache.stats().actual_samples();
-            let result = super::attempt_1::process_vertex(point, hint, 1.0, &cache, &config);
+            let result = super::attempt_1::process_vertex(point, hint, RESEARCH_CELL_SIZE, &cache, &config);
             let after = cache.stats().actual_samples();
             (result, after - before)
         });
@@ -79,7 +90,7 @@ pub fn run_attempt_2_benchmark() {
         run_attempt_benchmark_oracle("Attempt 2 (fixed RANSAC budgets)", |point, hint, sampler| {
             let cache = SampleCache::new(|x, y, z| sampler(x, y, z));
             let before = cache.stats().actual_samples();
-            let result = super::attempt_2::process_vertex(point, hint, 1.0, &cache, &config);
+            let result = super::attempt_2::process_vertex(point, hint, RESEARCH_CELL_SIZE, &cache, &config);
             let after = cache.stats().actual_samples();
             (result, after - before)
         });
@@ -87,7 +98,7 @@ pub fn run_attempt_2_benchmark() {
         run_attempt_benchmark("Attempt 2 (fixed RANSAC budgets)", |point, hint, sampler| {
             let cache = SampleCache::new(|x, y, z| sampler(x, y, z));
             let before = cache.stats().actual_samples();
-            let result = super::attempt_2::process_vertex(point, hint, 1.0, &cache, &config);
+            let result = super::attempt_2::process_vertex(point, hint, RESEARCH_CELL_SIZE, &cache, &config);
             let after = cache.stats().actual_samples();
             (result, after - before)
         });
@@ -96,7 +107,9 @@ pub fn run_attempt_2_benchmark() {
 
 pub fn dump_attempt_sample_cloud(attempt: u8, output_path: &std::path::Path) {
     let cube = AnalyticalRotatedCube::standard_test_cube();
-    let points = generate_validation_points(&cube);
+    // Use cell_size-relative offset: 0.5 * cell_size simulates vertex within 1 cell of surface
+    let inside_offset = 0.5 * RESEARCH_CELL_SIZE;
+    let points = generate_validation_points_with_offset(&cube, inside_offset);
     let mut dump = SampleCloudDump::new();
 
     let attempt_name = match attempt {
@@ -124,19 +137,19 @@ pub fn dump_attempt_sample_cloud(attempt: u8, output_path: &std::path::Path) {
         let result = match attempt {
             0 => {
                 let config = CrossingCountConfig::default();
-                super::attempt_0::process_vertex(point.position, hint, 1.0, &cache, &config)
+                super::attempt_0::process_vertex(point.position, hint, RESEARCH_CELL_SIZE, &cache, &config)
             }
             1 => {
                 let config = Attempt1Config::default();
-                super::attempt_1::process_vertex(point.position, hint, 1.0, &cache, &config)
+                super::attempt_1::process_vertex(point.position, hint, RESEARCH_CELL_SIZE, &cache, &config)
             }
             2 => {
                 let config = Attempt2Config::default();
-                super::attempt_2::process_vertex(point.position, hint, 1.0, &cache, &config)
+                super::attempt_2::process_vertex(point.position, hint, RESEARCH_CELL_SIZE, &cache, &config)
             }
             _ => {
                 let config = CrossingCountConfig::default();
-                super::attempt_0::process_vertex(point.position, hint, 1.0, &cache, &config)
+                super::attempt_0::process_vertex(point.position, hint, RESEARCH_CELL_SIZE, &cache, &config)
             }
         };
 
@@ -188,7 +201,8 @@ fn run_hermite_microgrid_experiment_with_config(
     config: &HermiteMicrogridConfig,
 ) {
     let cube = AnalyticalRotatedCube::standard_test_cube();
-    let points = generate_validation_points(&cube);
+    let inside_offset = 0.5 * RESEARCH_CELL_SIZE;
+    let points = generate_validation_points_with_offset(&cube, inside_offset);
 
     let mut total = 0usize;
     let mut success = 0usize;
@@ -266,7 +280,8 @@ fn run_hermite_microgrid_experiment_with_config(
 
 fn run_attempt_2_benchmark_with_diag(config: &Attempt2Config) {
     let cube = AnalyticalRotatedCube::standard_test_cube();
-    let points = generate_validation_points(&cube);
+    let inside_offset = 0.5 * RESEARCH_CELL_SIZE;
+    let points = generate_validation_points_with_offset(&cube, inside_offset);
 
     let mut stats = AttemptStats::new("Attempt 2 (fixed RANSAC budgets)");
     let mut edge_counts = [0usize; 5];
@@ -288,7 +303,7 @@ fn run_attempt_2_benchmark_with_diag(config: &Attempt2Config) {
         let cache = SampleCache::new(|x, y, z| sampler(x, y, z));
         let before = cache.stats().actual_samples();
         let (result, diag) =
-            super::attempt_2::process_vertex_with_diag(point.position, hint, 1.0, &cache, config);
+            super::attempt_2::process_vertex_with_diag(point.position, hint, RESEARCH_CELL_SIZE, &cache, config);
         let after = cache.stats().actual_samples();
         stats.samples_used.push(after - before);
         stats.record(point, &result);
@@ -330,7 +345,9 @@ where
     F: Fn((f64, f64, f64), (f64, f64, f64), &dyn Fn(f64, f64, f64) -> f32) -> (VertexGeometry, u64),
 {
     let cube = AnalyticalRotatedCube::standard_test_cube();
-    let points = generate_validation_points(&cube);
+    // Use cell_size-relative offset for scale invariance
+    let inside_offset = 0.5 * RESEARCH_CELL_SIZE;
+    let points = generate_validation_points_with_offset(&cube, inside_offset);
 
     let mut stats = AttemptStats::new(name);
     for point in &points {
@@ -397,7 +414,8 @@ where
     F: Fn((f64, f64, f64), (f64, f64, f64), &dyn Fn(f64, f64, f64) -> f32) -> (VertexGeometry, u64, Attempt1Diag),
 {
     let cube = AnalyticalRotatedCube::standard_test_cube();
-    let points = generate_validation_points(&cube);
+    let inside_offset = 0.5 * RESEARCH_CELL_SIZE;
+    let points = generate_validation_points_with_offset(&cube, inside_offset);
 
     let mut stats = AttemptStats::new(name);
     let mut printed = 0usize;
