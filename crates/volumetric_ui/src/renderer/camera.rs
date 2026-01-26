@@ -86,6 +86,31 @@ impl Camera {
         Mat4::perspective_rh(self.fov_y, aspect, self.near, self.far)
     }
 
+    /// Compute appropriate near/far clip planes based on camera radius.
+    ///
+    /// This enables viewing geometry at different scales without clipping issues.
+    /// The near plane is set to a small fraction of the radius to avoid clipping
+    /// geometry close to the target, while maintaining reasonable depth buffer precision.
+    pub fn compute_clip_planes(&self) -> (f32, f32) {
+        // Near plane: small fraction of radius, with absolute minimum to avoid precision issues
+        // Using 1% of radius allows viewing geometry very close to the target
+        let near = (self.radius * 0.01).max(0.0001);
+
+        // Far plane: large enough to see distant geometry
+        // Using max of 1000x radius or absolute minimum of 100 units
+        let far = (self.radius * 1000.0).max(100.0);
+
+        (near, far)
+    }
+
+    /// Create a camera with automatically computed clip planes based on radius.
+    pub fn with_auto_clip_planes(mut self) -> Self {
+        let (near, far) = self.compute_clip_planes();
+        self.near = near;
+        self.far = far;
+        self
+    }
+
     /// Compute combined view-projection matrix.
     pub fn view_projection_matrix(&self, aspect: f32) -> Mat4 {
         self.projection_matrix(aspect) * self.view_matrix()
@@ -140,18 +165,23 @@ impl Camera {
     /// Zoom the camera (adjust distance from target).
     ///
     /// - `delta`: Positive to zoom in, negative to zoom out
+    ///
+    /// Uses logarithmic scaling so each unit of delta changes the radius by a
+    /// fixed percentage. This feels consistent whether viewing micro geometry
+    /// or large scenes.
     pub fn zoom(&mut self, delta: f32) {
-        const MIN_RADIUS: f32 = 0.1;
-        const MAX_RADIUS: f32 = 1000.0;
+        // Allow zooming very close for small geometry (0.001 = 1mm at meter scale)
+        const MIN_RADIUS: f32 = 0.001;
+        const MAX_RADIUS: f32 = 10000.0;
 
-        // Multiplicative zoom for consistent feel
-        let factor = 1.0 - delta * 0.1;
+        // Logarithmic zoom: exp(-delta) gives ~10% change per unit delta
+        let factor = (-delta * 0.1).exp();
         self.radius = (self.radius * factor).clamp(MIN_RADIUS, MAX_RADIUS);
     }
 
     /// Zoom with explicit min/max radius.
     pub fn zoom_clamped(&mut self, delta: f32, min_radius: f32, max_radius: f32) {
-        let factor = 1.0 - delta * 0.1;
+        let factor = (-delta * 0.1).exp();
         self.radius = (self.radius * factor).clamp(min_radius, max_radius);
     }
 
@@ -166,14 +196,14 @@ impl Camera {
         let diagonal = (max - min).length();
         self.radius = diagonal * 1.5;
 
-        // Clamp radius to reasonable range
-        self.radius = self.radius.clamp(0.1, 1000.0);
+        // Clamp radius to reasonable range (allow very small for micro geometry)
+        self.radius = self.radius.clamp(0.001, 10000.0);
     }
 
     /// Focus on a point with specified distance.
     pub fn focus_on_point(&mut self, point: Vec3, distance: f32) {
         self.target = point;
-        self.radius = distance.clamp(0.1, 1000.0);
+        self.radius = distance.clamp(0.001, 10000.0);
     }
 
     /// Reset camera to default orientation while keeping target and distance.

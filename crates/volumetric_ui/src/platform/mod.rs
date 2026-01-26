@@ -13,6 +13,11 @@ mod native;
 #[cfg(target_arch = "wasm32")]
 mod web;
 
+#[cfg(not(target_arch = "wasm32"))]
+pub use native::save_file;
+#[cfg(target_arch = "wasm32")]
+pub use web::save_file;
+
 /// Result type alias for file operations
 pub type FileResult<T> = Result<T, FileError>;
 
@@ -62,5 +67,10 @@ impl FileFilter {
     pub const STL: FileFilter = FileFilter {
         name: "STL",
         extensions: &["stl"],
+    };
+
+    pub const PNG: FileFilter = FileFilter {
+        name: "PNG Image",
+        extensions: &["png"],
     };
 }

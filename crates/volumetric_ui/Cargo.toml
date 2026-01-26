@@ -20,6 +20,7 @@ log = "0.4"
 thiserror = "2"
 ciborium = "0.2"
 web-time = "1"
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 # Optional native dependencies
 rayon = { version = "1.10", optional = true }

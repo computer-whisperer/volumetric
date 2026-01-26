@@ -44,6 +44,109 @@ impl MeshVertex {
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct MaterialId(pub u32);
 
+/// Render mode for mesh rendering.
+///
+/// Determines how a mesh is rendered, including shading, wireframe, and debug modes.
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub enum MeshRenderMode {
+    /// Standard lit shading (current default)
+    #[default]
+    Shaded,
+    /// Edges only via line pipeline
+    Wireframe,
+    /// Filled triangles with wireframe overlay
+    ShadedWireframe,
+    /// Front faces normal color, back faces red (debug winding order)
+    BackFaceDebug,
+    /// Semi-transparent mesh with visible edges
+    XRay {
+        /// Opacity of the mesh surface (0.0 = invisible, 1.0 = opaque)
+        opacity: f32,
+    },
+}
+
+impl MeshRenderMode {
+    /// Returns true if this mode requires opaque rendering to the G-buffer.
+    pub fn is_opaque(&self) -> bool {
+        matches!(self, Self::Shaded | Self::ShadedWireframe | Self::BackFaceDebug)
+    }
+
+    /// Returns true if this mode requires transparent rendering.
+    pub fn is_transparent(&self) -> bool {
+        matches!(self, Self::XRay { .. })
+    }
+
+    /// Returns true if this mode requires wireframe edges to be rendered.
+    pub fn needs_wireframe(&self) -> bool {
+        matches!(self, Self::Wireframe | Self::ShadedWireframe | Self::XRay { .. })
+    }
+
+    /// Returns true if this mode requires back-face rendering (no culling).
+    pub fn needs_no_cull(&self) -> bool {
+        matches!(self, Self::BackFaceDebug | Self::XRay { .. })
+    }
+}
+
+/// Key for edge deduplication during wireframe extraction.
+///
+/// Edges are stored with canonical ordering (smaller index first) to ensure
+/// that edges shared between triangles are properly deduplicated.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct EdgeKey(pub u32, pub u32);
+
+impl EdgeKey {
+    /// Create a new edge key with canonical ordering.
+    pub fn new(a: u32, b: u32) -> Self {
+        if a <= b {
+            Self(a, b)
+        } else {
+            Self(b, a)
+        }
+    }
+}
+
+/// Extract unique edges from mesh data for wireframe rendering.
+///
+/// Uses HashSet-based deduplication with canonical edge ordering.
+/// O(triangles) time complexity, O(edges) space complexity.
+///
+/// # Arguments
+/// * `vertices` - Mesh vertices
+/// * `indices` - Optional index buffer. If None, vertices are interpreted as triangle list.
+///
+/// # Returns
+/// A vector of unique edge pairs as (vertex_index_a, vertex_index_b).
+pub fn extract_edges(vertices: &[MeshVertex], indices: Option<&[u32]>) -> Vec<(u32, u32)> {
+    use std::collections::HashSet;
+
+    let mut edge_set: HashSet<EdgeKey> = HashSet::new();
+
+    if let Some(indices) = indices {
+        // Indexed triangles
+        for tri in indices.chunks_exact(3) {
+            let i0 = tri[0];
+            let i1 = tri[1];
+            let i2 = tri[2];
+            edge_set.insert(EdgeKey::new(i0, i1));
+            edge_set.insert(EdgeKey::new(i1, i2));
+            edge_set.insert(EdgeKey::new(i2, i0));
+        }
+    } else {
+        // Non-indexed triangles (every 3 vertices form a triangle)
+        let num_triangles = vertices.len() / 3;
+        for t in 0..num_triangles {
+            let i0 = (t * 3) as u32;
+            let i1 = i0 + 1;
+            let i2 = i0 + 2;
+            edge_set.insert(EdgeKey::new(i0, i1));
+            edge_set.insert(EdgeKey::new(i1, i2));
+            edge_set.insert(EdgeKey::new(i2, i0));
+        }
+    }
+
+    edge_set.into_iter().map(|e| (e.0, e.1)).collect()
+}
+
 // ============================================================================
 // Line Types
 // ============================================================================
@@ -265,9 +368,11 @@ pub struct GridSettings {
     pub minor_color: [f32; 4],
     /// Lines between major lines
     pub subdivisions: u32,
-    /// Color for X axis line
+    /// Color for X axis line (red)
     pub x_axis_color: [f32; 4],
-    /// Color for Z axis line (on XZ plane)
+    /// Color for Y axis line (green, vertical)
+    pub y_axis_color: [f32; 4],
+    /// Color for Z axis line (blue)
     pub z_axis_color: [f32; 4],
 }
 
@@ -281,6 +386,7 @@ impl Default for GridSettings {
             minor_color: [0.3, 0.3, 0.3, 0.4],
             subdivisions: 5,
             x_axis_color: [0.8, 0.2, 0.2, 1.0], // Red
+            y_axis_color: [0.2, 0.8, 0.2, 1.0], // Green
             z_axis_color: [0.2, 0.2, 0.8, 1.0], // Blue
         }
     }
@@ -327,6 +433,13 @@ impl GridSettings {
                     color: color_x,
                 });
             }
+
+            // Vertical Y axis line at origin
+            lines.push(LineSegment {
+                start: [0.0, 0.0, 0.0],
+                end: [0.0, self.extent, 0.0],
+                color: self.y_axis_color,
+            });
         }
 
         if self.planes.xy {

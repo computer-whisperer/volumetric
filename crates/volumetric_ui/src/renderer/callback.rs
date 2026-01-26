@@ -7,18 +7,30 @@
 
 use eframe::egui;
 use eframe::egui_wgpu;
+use std::sync::{Arc, Mutex};
 
 use super::{
-    Camera, LineData, LineStyle, MaterialId, MeshData, PointData, PointStyle, RenderSettings,
-    Renderer,
+    Camera, LineData, LineStyle, MaterialId, MeshData, MeshRenderMode, PointData, PointStyle,
+    RenderSettings, Renderer,
 };
 use glam::Mat4;
+
+/// State for screenshot capture
+#[derive(Clone, Debug)]
+pub enum ScreenshotState {
+    /// Screenshot has been requested
+    Requested,
+    /// Screenshot data is ready (width, height, RGBA data)
+    Ready(u32, u32, Vec<u8>),
+    /// Screenshot failed
+    Failed(String),
+}
 
 /// Data for a single frame's rendering.
 #[derive(Clone)]
 pub struct SceneData {
-    /// Meshes to render
-    pub meshes: Vec<(MeshData, Mat4, MaterialId)>,
+    /// Meshes to render (mesh, transform, material, render_mode)
+    pub meshes: Vec<(MeshData, Mat4, MaterialId, MeshRenderMode)>,
     /// Lines to render
     pub lines: Vec<(LineData, Mat4, LineStyle)>,
     /// Points to render
@@ -41,9 +53,21 @@ impl SceneData {
         Self::default()
     }
 
-    /// Add a mesh to the scene.
+    /// Add a mesh to the scene with the default (Shaded) render mode.
     pub fn add_mesh(&mut self, mesh: MeshData, transform: Mat4, material: MaterialId) {
-        self.meshes.push((mesh, transform, material));
+        self.meshes
+            .push((mesh, transform, material, MeshRenderMode::Shaded));
+    }
+
+    /// Add a mesh to the scene with a specific render mode.
+    pub fn add_mesh_with_mode(
+        &mut self,
+        mesh: MeshData,
+        transform: Mat4,
+        material: MaterialId,
+        mode: MeshRenderMode,
+    ) {
+        self.meshes.push((mesh, transform, material, mode));
     }
 
     /// Add lines to the scene.
@@ -82,6 +106,8 @@ pub struct SceneDrawData {
     pub viewport_size: [u32; 2],
     /// Target texture format
     pub target_format: wgpu::TextureFormat,
+    /// Screenshot request (if Some, capture will be performed)
+    pub screenshot_request: Option<Arc<Mutex<ScreenshotState>>>,
 }
 
 /// egui callback for rendering 3D scenes.
@@ -103,6 +129,9 @@ impl egui_wgpu::CallbackTrait for SceneCallback {
             .entry::<SceneRendererResource>()
             .or_insert_with(|| SceneRendererResource::new(device, queue, self.data.target_format));
 
+        // Complete any pending screenshot from the previous frame
+        renderer.complete_pending_screenshot(device);
+
         // Resize target texture if viewport changed
         let new_size = (
             self.data.viewport_size[0].max(1),
@@ -120,8 +149,8 @@ impl egui_wgpu::CallbackTrait for SceneCallback {
         );
 
         // Submit scene data
-        for (mesh, transform, material) in &self.data.scene.meshes {
-            renderer.renderer.submit_mesh(mesh, *transform, *material);
+        for (mesh, transform, material, mode) in &self.data.scene.meshes {
+            renderer.renderer.submit_mesh(mesh, *transform, *material, *mode);
         }
         for (lines, transform, style) in &self.data.scene.lines {
             renderer.renderer.submit_lines(lines, *transform, style.clone());
@@ -141,6 +170,50 @@ impl egui_wgpu::CallbackTrait for SceneCallback {
         );
 
         renderer.renderer.end_frame();
+
+        // Handle screenshot request
+        if let Some(ref request) = self.data.screenshot_request {
+            let (width, height) = renderer.size;
+            let bytes_per_pixel = 4u32; // RGBA/BGRA
+            let unpadded_bytes_per_row = width * bytes_per_pixel;
+            let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+            let padded_bytes_per_row = (unpadded_bytes_per_row + align - 1) / align * align;
+            let buffer_size = (padded_bytes_per_row * height) as u64;
+
+            // Create staging buffer
+            let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("screenshot_staging_buffer"),
+                size: buffer_size,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+
+            // Copy texture to buffer
+            egui_encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &renderer.target_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &staging_buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(padded_bytes_per_row),
+                        rows_per_image: Some(height),
+                    },
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+
+            renderer.screenshot_staging_buffer = Some(staging_buffer);
+            renderer.screenshot_pending = Some(request.clone());
+        }
 
         Vec::new()
     }
@@ -187,6 +260,10 @@ struct SceneRendererResource {
     /// Current size
     size: (u32, u32),
     target_format: wgpu::TextureFormat,
+    /// Staging buffer for screenshot readback
+    screenshot_staging_buffer: Option<wgpu::Buffer>,
+    /// Pending screenshot request
+    screenshot_pending: Option<Arc<Mutex<ScreenshotState>>>,
 }
 
 impl SceneRendererResource {
@@ -300,6 +377,8 @@ impl SceneRendererResource {
             sampler,
             size,
             target_format,
+            screenshot_staging_buffer: None,
+            screenshot_pending: None,
         }
     }
 
@@ -319,7 +398,9 @@ impl SceneRendererResource {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -360,6 +441,75 @@ impl SceneRendererResource {
                 },
             ],
         })
+    }
+
+    /// Complete any pending screenshot capture from the previous frame.
+    fn complete_pending_screenshot(&mut self, device: &wgpu::Device) {
+        let Some(staging_buffer) = self.screenshot_staging_buffer.take() else {
+            return;
+        };
+
+        let Some(pending) = self.screenshot_pending.take() else {
+            return;
+        };
+
+        let (width, height) = self.size;
+        let bytes_per_pixel = 4u32;
+        let unpadded_bytes_per_row = width * bytes_per_pixel;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded_bytes_per_row = (unpadded_bytes_per_row + align - 1) / align * align;
+
+        // Map the buffer
+        let buffer_slice = staging_buffer.slice(..);
+
+        // Use a channel to signal when mapping is complete
+        let (tx, rx) = std::sync::mpsc::channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+
+        // Poll the device until mapping is complete
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+
+        // Check if mapping succeeded
+        match rx.recv() {
+            Ok(Ok(())) => {
+                let data = buffer_slice.get_mapped_range();
+                let mut rgba_data = Vec::with_capacity((width * height * 4) as usize);
+
+                // Copy data, removing row padding and converting BGRA to RGBA if needed
+                for row in 0..height {
+                    let start = (row * padded_bytes_per_row) as usize;
+                    let end = start + (unpadded_bytes_per_row) as usize;
+                    let row_data = &data[start..end];
+
+                    // Convert BGRA to RGBA (wgpu typically uses BGRA on most platforms)
+                    for pixel in row_data.chunks(4) {
+                        rgba_data.push(pixel[2]); // R (was B)
+                        rgba_data.push(pixel[1]); // G
+                        rgba_data.push(pixel[0]); // B (was R)
+                        rgba_data.push(pixel[3]); // A
+                    }
+                }
+
+                drop(data);
+                staging_buffer.unmap();
+
+                if let Ok(mut state) = pending.lock() {
+                    *state = ScreenshotState::Ready(width, height, rgba_data);
+                }
+            }
+            Ok(Err(e)) => {
+                if let Ok(mut state) = pending.lock() {
+                    *state = ScreenshotState::Failed(format!("Buffer mapping failed: {:?}", e));
+                }
+            }
+            Err(_) => {
+                if let Ok(mut state) = pending.lock() {
+                    *state = ScreenshotState::Failed("Failed to receive mapping result".to_string());
+                }
+            }
+        }
     }
 }
 

@@ -3,7 +3,7 @@ use ciborium::value::Value as CborValue;
 use eframe::egui;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use volumetric::sample_cloud::{SampleCloudDump, SampleCloudSet, SamplePointKind};
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -780,6 +780,17 @@ impl ExportRenderMode {
     }
 }
 
+/// Get a display label for a MeshRenderMode.
+fn mesh_render_mode_label(mode: renderer::MeshRenderMode) -> &'static str {
+    match mode {
+        renderer::MeshRenderMode::Shaded => "Shaded",
+        renderer::MeshRenderMode::Wireframe => "Wireframe",
+        renderer::MeshRenderMode::ShadedWireframe => "Shaded + Wireframe",
+        renderer::MeshRenderMode::BackFaceDebug => "Back Face Debug",
+        renderer::MeshRenderMode::XRay { .. } => "X-Ray",
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SampleCloudViewMode {
     Overlay,
@@ -808,8 +819,10 @@ impl SampleCloudViewMode {
 /// Per-asset render data for multi-entity rendering support.
 /// Each exported asset can have its own render mode and cached geometry.
 struct AssetRenderData {
-    /// The render mode for this asset
+    /// The sampling/meshing mode for this asset (how geometry is generated)
     mode: ExportRenderMode,
+    /// The visual render mode for this asset (how mesh is displayed)
+    mesh_render_mode: renderer::MeshRenderMode,
     /// Cached WASM bytes for this asset
     wasm_bytes: Vec<u8>,
     /// Bounding box minimum
@@ -861,6 +874,7 @@ impl AssetRenderData {
     fn new(wasm_bytes: Vec<u8>, mode: ExportRenderMode) -> Self {
         Self {
             mode,
+            mesh_render_mode: renderer::MeshRenderMode::Shaded,
             wasm_bytes,
             bounds_min: (0.0, 0.0, 0.0),
             bounds_max: (0.0, 0.0, 0.0),
@@ -948,11 +962,8 @@ pub struct VolumetricApp {
     /// Operator metadata cache (for bundled assets on all platforms)
     operator_metadata_cache: HashMap<String, CachedOperatorMetadata>,
     wgpu_target_format: wgpu::TextureFormat,
-    // Camera state
-    camera_theta: f32,
-    camera_phi: f32,
-    camera_radius: f32,
-    camera_target: glam::Vec3,
+    /// Camera state (orbit camera around target point)
+    camera: renderer::Camera,
     camera_control_scheme: renderer::CameraControlScheme,
     last_mouse_pos: Option<egui::Pos2>,
     /// Last project evaluation time (in seconds)
@@ -1025,6 +1036,9 @@ pub struct VolumetricApp {
     /// Pending heightmap image data for operator input (native only)
     #[cfg(not(target_arch = "wasm32"))]
     pending_heightmap_data: Option<Vec<u8>>,
+
+    /// Pending screenshot capture state
+    screenshot_state: Option<Arc<Mutex<renderer::ScreenshotState>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1121,10 +1135,15 @@ impl VolumetricApp {
             operation_lua_script: String::new(),
             operator_metadata_cache: HashMap::new(),
             wgpu_target_format,
-            camera_theta: std::f32::consts::FRAC_PI_4,
-            camera_phi: std::f32::consts::FRAC_PI_4,
-            camera_radius: 4.0,
-            camera_target: glam::Vec3::ZERO,
+            camera: renderer::Camera {
+                target: glam::Vec3::ZERO,
+                radius: 4.0,
+                theta: std::f32::consts::FRAC_PI_4,
+                phi: std::f32::consts::FRAC_PI_4,
+                fov_y: 60.0_f32.to_radians(),
+                near: 0.1,
+                far: 100.0,
+            },
             camera_control_scheme: renderer::CameraControlScheme::default(),
             last_mouse_pos: None,
             last_evaluation_time: None,
@@ -1168,6 +1187,8 @@ impl VolumetricApp {
             pending_heightmap_import: None,
             #[cfg(not(target_arch = "wasm32"))]
             pending_heightmap_data: None,
+
+            screenshot_state: None,
         }
     }
 
@@ -1667,10 +1688,8 @@ impl VolumetricApp {
 
     #[allow(dead_code)]
     fn camera_position(&self) -> (f32, f32, f32) {
-        let x = self.camera_radius * self.camera_phi.sin() * self.camera_theta.cos();
-        let y = self.camera_radius * self.camera_phi.cos();
-        let z = self.camera_radius * self.camera_phi.sin() * self.camera_theta.sin();
-        (x, y, z)
+        let pos = self.camera.eye_position();
+        (pos.x, pos.y, pos.z)
     }
 
     fn selected_sample_cloud_set(&self) -> Option<&SampleCloudSet> {
@@ -2540,10 +2559,16 @@ impl eframe::App for VolumetricApp {
                                 }
                             });
                         if ui.button("Reset Camera").clicked() {
-                            self.camera_theta = std::f32::consts::FRAC_PI_4;
-                            self.camera_phi = std::f32::consts::FRAC_PI_4;
-                            self.camera_radius = 4.0;
-                            self.camera_target = glam::Vec3::ZERO;
+                            self.camera.theta = std::f32::consts::FRAC_PI_4;
+                            self.camera.phi = std::f32::consts::FRAC_PI_4;
+                            self.camera.radius = 4.0;
+                            self.camera.target = glam::Vec3::ZERO;
+                        }
+
+                        // Screenshot button - only enable if no screenshot is in progress
+                        let screenshot_in_progress = self.screenshot_state.is_some();
+                        if ui.add_enabled(!screenshot_in_progress, egui::Button::new("Screenshot…")).clicked() {
+                            self.screenshot_state = Some(Arc::new(Mutex::new(renderer::ScreenshotState::Requested)));
                         }
 
                         ui.separator();
@@ -2602,9 +2627,9 @@ impl eframe::App for VolumetricApp {
                             // Focus camera on vertex button
                             if let Some(set) = dump.sets.get(self.sample_cloud_set_index) {
                                 if ui.button("🎯 Focus on Vertex").clicked() {
-                                    self.camera_target = glam::Vec3::from_array(set.vertex);
+                                    self.camera.target = glam::Vec3::from_array(set.vertex);
                                     // Use a reasonable distance based on cell size
-                                    self.camera_radius = 0.15;
+                                    self.camera.radius = 0.15;
                                 }
                             }
                         } else {
@@ -3562,6 +3587,54 @@ impl eframe::App for VolumetricApp {
                                     }
                                 });
 
+                                // Show mesh render mode selector for mesh-based modes
+                                if matches!(current_mode, ExportRenderMode::MarchingCubes | ExportRenderMode::AdaptiveSurfaceNets2) {
+                                    if let Some(render_data) = self.asset_render_data.get_mut(&asset_id) {
+                                        ui.horizontal(|ui| {
+                                            ui.label("Display:");
+                                            let mut mesh_mode = render_data.mesh_render_mode;
+                                            egui::ComboBox::from_id_salt(format!("mesh_render_{asset_id}"))
+                                                .selected_text(mesh_render_mode_label(mesh_mode))
+                                                .show_ui(ui, |ui| {
+                                                    ui.selectable_value(
+                                                        &mut mesh_mode,
+                                                        renderer::MeshRenderMode::Shaded,
+                                                        "Shaded",
+                                                    );
+                                                    ui.selectable_value(
+                                                        &mut mesh_mode,
+                                                        renderer::MeshRenderMode::Wireframe,
+                                                        "Wireframe",
+                                                    );
+                                                    ui.selectable_value(
+                                                        &mut mesh_mode,
+                                                        renderer::MeshRenderMode::ShadedWireframe,
+                                                        "Shaded + Wireframe",
+                                                    );
+                                                    ui.selectable_value(
+                                                        &mut mesh_mode,
+                                                        renderer::MeshRenderMode::BackFaceDebug,
+                                                        "Back Face Debug",
+                                                    );
+                                                    ui.selectable_value(
+                                                        &mut mesh_mode,
+                                                        renderer::MeshRenderMode::XRay { opacity: 0.3 },
+                                                        "X-Ray",
+                                                    );
+                                                });
+                                            render_data.mesh_render_mode = mesh_mode;
+                                        });
+
+                                        // Show opacity slider for X-Ray mode
+                                        if let renderer::MeshRenderMode::XRay { opacity } = &mut render_data.mesh_render_mode {
+                                            ui.horizontal(|ui| {
+                                                ui.label("Opacity:");
+                                                ui.add(egui::Slider::new(opacity, 0.05..=0.8));
+                                            });
+                                        }
+                                    }
+                                }
+
                                 // Show config options for PointCloud and MarchingCubes modes
                                 if current_mode == ExportRenderMode::PointCloud || current_mode == ExportRenderMode::MarchingCubes {
                                     if let Some(render_data) = self.asset_render_data.get_mut(&asset_id) {
@@ -3955,36 +4028,23 @@ impl eframe::App for VolumetricApp {
             let action = self.camera_control_scheme.determine_action(&input_state);
             match action {
                 renderer::CameraAction::Orbit => {
-                    self.camera_theta -= input_state.mouse_delta.x * 0.01;
-                    self.camera_phi = (self.camera_phi - input_state.mouse_delta.y * 0.01)
-                        .clamp(0.1, std::f32::consts::PI - 0.1);
+                    self.camera.orbit(
+                        -input_state.mouse_delta.x * 0.01,
+                        -input_state.mouse_delta.y * 0.01,
+                    );
                 }
                 renderer::CameraAction::Pan => {
-                    // Create temporary camera to compute pan in view plane
-                    let temp_camera = renderer::Camera {
-                        target: self.camera_target,
-                        radius: self.camera_radius,
-                        theta: self.camera_theta,
-                        phi: self.camera_phi,
-                        fov_y: 60.0_f32.to_radians(),
-                        near: 0.1,
-                        far: 100.0,
-                    };
-                    let right = temp_camera.right();
-                    let up = temp_camera.up();
-                    let scale = self.camera_radius * 0.002;
-                    self.camera_target -= right * (input_state.mouse_delta.x * scale);
-                    self.camera_target += up * (input_state.mouse_delta.y * scale);
+                    self.camera.pan(input_state.mouse_delta, glam::Vec2::ZERO);
                 }
                 renderer::CameraAction::Zoom => {
                     // For Maya alt+right drag, use mouse delta; otherwise use scroll
                     let zoom_delta = if input_state.scroll_delta != 0.0 {
-                        input_state.scroll_delta * 0.01
+                        input_state.scroll_delta * 0.05
                     } else {
                         // For drag zoom (Maya style), use horizontal mouse movement
-                        input_state.mouse_delta.x * 0.02
+                        input_state.mouse_delta.x * 0.1
                     };
-                    self.camera_radius = (self.camera_radius - zoom_delta).clamp(0.1, 100.0);
+                    self.camera.zoom(zoom_delta);
                 }
                 renderer::CameraAction::None => {}
             }
@@ -4036,13 +4096,14 @@ impl eframe::App for VolumetricApp {
                         ExportRenderMode::MarchingCubes |
                         ExportRenderMode::AdaptiveSurfaceNets2
                     ) && !asset_data.mesh_vertices.is_empty() {
-                        scene.add_mesh(
+                        scene.add_mesh_with_mode(
                             renderer::convert_mesh_data(
                                 &asset_data.mesh_vertices,
                                 asset_data.mesh_indices.as_ref().map(|v| v.as_slice()),
                             ),
                             glam::Mat4::IDENTITY,
                             renderer::MaterialId(0),
+                            asset_data.mesh_render_mode,
                         );
                     }
                 }
@@ -4098,16 +4159,9 @@ impl eframe::App for VolumetricApp {
                 }
             }
 
-            // Create camera from existing spherical coords
-            let camera = renderer::Camera {
-                target: self.camera_target,
-                radius: self.camera_radius,
-                theta: self.camera_theta,
-                phi: self.camera_phi,
-                fov_y: 60.0_f32.to_radians(),
-                near: 0.1,
-                far: 100.0,
-            };
+            // Create camera from existing spherical coords with auto-computed clip planes
+            // Apply auto clip planes for proper near/far based on zoom level
+            let camera = self.camera.clone().with_auto_clip_planes();
 
             let settings = renderer::RenderSettings {
                 ssao_enabled: self.ssao_enabled,
@@ -4148,6 +4202,7 @@ impl eframe::App for VolumetricApp {
                             settings: settings.clone(),
                             viewport_size: left_size,
                             target_format: self.wgpu_target_format,
+                            screenshot_request: self.screenshot_state.clone(),
                         },
                     },
                 );
@@ -4163,6 +4218,7 @@ impl eframe::App for VolumetricApp {
                                 settings,
                                 viewport_size: right_size,
                                 target_format: self.wgpu_target_format,
+                                screenshot_request: None,
                             },
                         },
                     );
@@ -4179,6 +4235,7 @@ impl eframe::App for VolumetricApp {
                             settings,
                             viewport_size: viewport_size_px,
                             target_format: self.wgpu_target_format,
+                            screenshot_request: self.screenshot_state.clone(),
                         },
                     },
                 );
@@ -4227,9 +4284,76 @@ impl eframe::App for VolumetricApp {
             );
         });
 
+        // Handle pending screenshots - completion happens in the callback
+        if let Some(ref state_arc) = self.screenshot_state {
+            // Check if screenshot is ready
+            let should_clear = {
+                let state = state_arc.lock().unwrap();
+                match &*state {
+                    renderer::ScreenshotState::Ready(width, height, rgba_data) => {
+                        // Encode as PNG
+                        match encode_screenshot_png(*width, *height, rgba_data) {
+                            Ok(png_data) => {
+                                // Save the file
+                                let filename = format!(
+                                    "screenshot_{}.png",
+                                    web_time::SystemTime::now()
+                                        .duration_since(web_time::UNIX_EPOCH)
+                                        .map(|d| d.as_secs())
+                                        .unwrap_or(0)
+                                );
+                                if let Err(e) = platform::save_file(
+                                    &platform::FileFilter::PNG,
+                                    &filename,
+                                    &png_data,
+                                ) {
+                                    log::error!("Failed to save screenshot: {}", e);
+                                }
+                            }
+                            Err(e) => {
+                                log::error!("Failed to encode screenshot: {}", e);
+                            }
+                        }
+                        true
+                    }
+                    renderer::ScreenshotState::Failed(msg) => {
+                        log::error!("Screenshot failed: {}", msg);
+                        true
+                    }
+                    renderer::ScreenshotState::Requested => false,
+                }
+            };
+
+            if should_clear {
+                self.screenshot_state = None;
+            }
+        }
+
         // Request continuous repaints for smooth interaction
         ctx.request_repaint();
     }
+}
+
+/// Encode RGBA pixel data as a PNG image.
+fn encode_screenshot_png(width: u32, height: u32, rgba_data: &[u8]) -> Result<Vec<u8>, String> {
+    use image::{ImageBuffer, ImageEncoder, Rgba};
+
+    let img: ImageBuffer<Rgba<u8>, Vec<u8>> =
+        ImageBuffer::from_raw(width, height, rgba_data.to_vec())
+            .ok_or_else(|| "Failed to create image buffer".to_string())?;
+
+    let mut png_data = Vec::new();
+    let encoder = image::codecs::png::PngEncoder::new(&mut png_data);
+    encoder
+        .write_image(
+            img.as_raw(),
+            width,
+            height,
+            image::ExtendedColorType::Rgba8,
+        )
+        .map_err(|e| format!("PNG encoding failed: {}", e))?;
+
+    Ok(png_data)
 }
 
 #[allow(dead_code)]

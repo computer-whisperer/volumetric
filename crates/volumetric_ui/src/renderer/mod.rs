@@ -44,17 +44,17 @@ mod types;
 pub use conversions::{convert_mesh_data, convert_points_to_point_data};
 
 pub use buffer::{DynamicBuffer, QuadVertex, StaticBuffer, QUAD_INDICES, QUAD_VERTICES};
-pub use callback::{SceneCallback, SceneData, SceneDrawData};
+pub use callback::{SceneCallback, SceneData, SceneDrawData, ScreenshotState};
 pub use camera::{Camera, CameraAction, CameraControlScheme, CameraInputState};
 pub use gbuffer::{AoTexture, GBuffer};
 pub use pipelines::{
     CompositePipeline, LinePipeline, MeshPipeline, MeshUniforms, PointPipeline, SsaoPipeline,
-    SsaoUniforms,
+    SsaoUniforms, XRayPipeline, XRayUniforms,
 };
 pub use types::{
-    AxisIndicator, DepthMode, GridSettings, LineData, LineInstance, LinePattern, LineSegment,
-    LineStyle, MaterialId, MeshData, MeshVertex, PointData, PointInstance, PointShape,
-    PointStyle, RenderSettings, WidthMode,
+    extract_edges, AxisIndicator, DepthMode, GridSettings, LineData, LineInstance, LinePattern,
+    LineSegment, LineStyle, MaterialId, MeshData, MeshRenderMode, MeshVertex, PointData,
+    PointInstance, PointShape, PointStyle, RenderSettings, WidthMode,
 };
 
 use glam::{Mat4, Vec3};
@@ -90,6 +90,7 @@ struct SubmittedMesh {
     transform: Mat4,
     #[allow(dead_code)]
     material: MaterialId,
+    render_mode: MeshRenderMode,
 }
 
 /// A submitted line batch for the current frame.
@@ -110,6 +111,7 @@ struct SubmittedPoints {
 struct GpuResources {
     // Pipelines
     mesh_pipeline: MeshPipeline,
+    xray_pipeline: XRayPipeline,
     ssao_pipeline: SsaoPipeline,
     composite_pipeline: CompositePipeline,
     line_pipeline: LinePipeline,
@@ -182,6 +184,7 @@ impl Renderer {
 
         // Create pipelines
         let mesh_pipeline = MeshPipeline::new(device, self.surface_format);
+        let xray_pipeline = XRayPipeline::new(device, self.surface_format);
         let ssao_pipeline = SsaoPipeline::new(device);
         let composite_pipeline = CompositePipeline::new(device, self.surface_format);
         let line_pipeline = LinePipeline::new(device, self.surface_format);
@@ -217,6 +220,7 @@ impl Renderer {
 
         self.gpu = Some(GpuResources {
             mesh_pipeline,
+            xray_pipeline,
             ssao_pipeline,
             composite_pipeline,
             line_pipeline,
@@ -273,7 +277,13 @@ impl Renderer {
     }
 
     /// Submit mesh geometry for this frame.
-    pub fn submit_mesh(&mut self, mesh: &MeshData, transform: Mat4, material: MaterialId) {
+    pub fn submit_mesh(
+        &mut self,
+        mesh: &MeshData,
+        transform: Mat4,
+        material: MaterialId,
+        render_mode: MeshRenderMode,
+    ) {
         if mesh.vertices.is_empty() {
             return;
         }
@@ -281,6 +291,7 @@ impl Renderer {
             data: mesh.clone(),
             transform,
             material,
+            render_mode,
         });
     }
 
@@ -311,14 +322,14 @@ impl Renderer {
     /// Execute all rendering for the frame.
     ///
     /// This performs all render passes in order:
-    /// 1. Mesh G-Buffer
+    /// 1. Mesh G-Buffer (opaque: Shaded, ShadedWireframe fill, BackFaceDebug)
     /// 2. SSAO
-    /// 3. Composite (to offscreen target)
-    /// 4. Grid lines (depth-tested)
-    /// 5. Scene lines (depth-tested)
-    /// 6. Scene points (depth-tested)
-    /// 7. Overlay lines
-    /// 8. Overlay points
+    /// 3. Composite (to final target)
+    /// 4. XRay Meshes (transparent, depth-test only, no depth write)
+    /// 5. Grid Lines (depth-tested)
+    /// 6. Scene Lines + Wireframe Edges (depth-tested)
+    /// 7. Scene Points (depth-tested)
+    /// 8-9. Overlay Lines/Points (no depth test)
     pub fn render(
         &mut self,
         device: &wgpu::Device,
@@ -341,21 +352,61 @@ impl Renderer {
         let screen_size = [self.viewport_size.0 as f32, self.viewport_size.1 as f32];
 
         // =================================================================
-        // Pass 1: Mesh G-Buffer
+        // Partition meshes by render mode
         // =================================================================
-        if !self.frame_meshes.is_empty() {
-            // Collect all mesh vertices (transformed)
+        let mut opaque_culled: Vec<&SubmittedMesh> = Vec::new();
+        let mut opaque_no_cull: Vec<&SubmittedMesh> = Vec::new();
+        let mut transparent: Vec<&SubmittedMesh> = Vec::new();
+        let mut wireframe_meshes: Vec<&SubmittedMesh> = Vec::new();
+
+        for submitted in &self.frame_meshes {
+            match submitted.render_mode {
+                MeshRenderMode::Shaded | MeshRenderMode::ShadedWireframe => {
+                    opaque_culled.push(submitted);
+                }
+                MeshRenderMode::BackFaceDebug => {
+                    opaque_no_cull.push(submitted);
+                }
+                MeshRenderMode::XRay { .. } => {
+                    transparent.push(submitted);
+                }
+                MeshRenderMode::Wireframe => {
+                    // Wireframe-only meshes don't render solid geometry
+                }
+            }
+
+            // Collect meshes that need wireframe edges
+            if submitted.render_mode.needs_wireframe() {
+                wireframe_meshes.push(submitted);
+            }
+        }
+
+        let has_opaque_meshes = !opaque_culled.is_empty() || !opaque_no_cull.is_empty();
+
+        // =================================================================
+        // Pass 1: Mesh G-Buffer (opaque meshes)
+        // =================================================================
+        if has_opaque_meshes {
+            // Determine if we need no-cull rendering
+            let has_no_cull = !opaque_no_cull.is_empty();
+
+            // Collect all opaque mesh vertices (transformed)
+            // All opaque meshes go in one batch - use no-cull pipeline if any BackFaceDebug
             let mut all_vertices = Vec::new();
             let mut all_indices = Vec::new();
             let mut use_indices = false;
 
-            for submitted in &self.frame_meshes {
+            // Process all opaque meshes (culled first, then no-cull)
+            for submitted in opaque_culled.iter().chain(opaque_no_cull.iter()) {
                 let base_vertex = all_vertices.len() as u32;
 
                 // Transform vertices
                 for v in &submitted.data.vertices {
                     let pos = submitted.transform.transform_point3(Vec3::from(v.position));
-                    let normal = submitted.transform.transform_vector3(Vec3::from(v.normal)).normalize();
+                    let normal = submitted
+                        .transform
+                        .transform_vector3(Vec3::from(v.normal))
+                        .normalize();
                     all_vertices.push(MeshVertex::new(pos.into(), normal.into()));
                 }
 
@@ -369,17 +420,21 @@ impl Renderer {
             }
 
             // Upload mesh data
-            gpu.mesh_pipeline.upload_vertices(device, queue, &all_vertices);
+            gpu.mesh_pipeline
+                .upload_vertices(device, queue, &all_vertices);
             if use_indices {
                 gpu.mesh_pipeline.upload_indices(device, queue, &all_indices);
             }
 
-            // Update mesh uniforms
+            // Update mesh uniforms BEFORE starting the render pass
+            // Use BackFaceDebug mode if any no-cull meshes exist
             let mesh_uniforms = MeshUniforms {
                 view_proj: view_proj_array,
                 light_dir_world: [0.4, 0.7, 0.2],
                 _pad0: 0.0,
                 base_color: [0.85, 0.9, 1.0],
+                render_mode: if has_no_cull { 1 } else { 0 },
+                back_face_color: [0.9, 0.2, 0.2],
                 _pad1: 0.0,
             };
             gpu.mesh_pipeline.update_uniforms(queue, &mesh_uniforms);
@@ -434,7 +489,8 @@ impl Renderer {
                     occlusion_query_set: None,
                 });
 
-                gpu.mesh_pipeline.render(&mut pass, use_indices);
+                // Render all opaque meshes - use no-cull pipeline if any BackFaceDebug meshes
+                gpu.mesh_pipeline.render(&mut pass, use_indices, has_no_cull);
             }
 
             // =================================================================
@@ -493,9 +549,9 @@ impl Renderer {
         // Pass 3: Composite to final target
         // =================================================================
         {
-            // When there are no meshes, the depth buffer was never initialized.
+            // When there are no opaque meshes, the depth buffer was never initialized.
             // We need to clear it in that case for subsequent passes (lines/points).
-            let depth_load_op = if self.frame_meshes.is_empty() {
+            let depth_load_op = if !has_opaque_meshes {
                 wgpu::LoadOp::Clear(1.0) // Clear to far plane
             } else {
                 wgpu::LoadOp::Load // Keep depth from mesh pass
@@ -529,13 +585,125 @@ impl Renderer {
                 occlusion_query_set: None,
             });
 
-            if !self.frame_meshes.is_empty() {
-                gpu.composite_pipeline.render(&mut pass, &gpu.composite_bind_group);
+            if has_opaque_meshes {
+                gpu.composite_pipeline
+                    .render(&mut pass, &gpu.composite_bind_group);
             }
         }
 
         // =================================================================
-        // Pass 4-6: Lines and Points (depth-tested)
+        // Pass 4: XRay Meshes (transparent, depth-test only, no depth write)
+        // =================================================================
+        if !transparent.is_empty() {
+            // Collect all XRay mesh vertices (transformed)
+            let mut xray_vertices = Vec::new();
+            let mut xray_indices = Vec::new();
+            let mut use_indices = false;
+            let mut opacity = 0.3f32;
+
+            for submitted in &transparent {
+                let base_vertex = xray_vertices.len() as u32;
+
+                // Get opacity from render mode
+                if let MeshRenderMode::XRay { opacity: op } = submitted.render_mode {
+                    opacity = op;
+                }
+
+                // Transform vertices
+                for v in &submitted.data.vertices {
+                    let pos = submitted.transform.transform_point3(Vec3::from(v.position));
+                    let normal = submitted
+                        .transform
+                        .transform_vector3(Vec3::from(v.normal))
+                        .normalize();
+                    xray_vertices.push(MeshVertex::new(pos.into(), normal.into()));
+                }
+
+                // Handle indices
+                if let Some(indices) = &submitted.data.indices {
+                    use_indices = true;
+                    for &idx in indices {
+                        xray_indices.push(base_vertex + idx);
+                    }
+                }
+            }
+
+            // Upload XRay mesh data
+            gpu.xray_pipeline
+                .upload_vertices(device, queue, &xray_vertices);
+            if use_indices {
+                gpu.xray_pipeline
+                    .upload_indices(device, queue, &xray_indices);
+            }
+
+            // Update XRay uniforms
+            let xray_uniforms = XRayUniforms {
+                view_proj: view_proj_array,
+                light_dir_world: [0.4, 0.7, 0.2],
+                opacity,
+                base_color: [0.6, 0.8, 1.0],
+                _pad0: 0.0,
+            };
+            gpu.xray_pipeline.update_uniforms(queue, &xray_uniforms);
+
+            // XRay render pass
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("xray_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &gpu.gbuffer.depth_stencil_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store, // XRay pipeline has depth write disabled internally
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+
+            gpu.xray_pipeline.render(&mut pass, use_indices);
+        }
+
+        // =================================================================
+        // Collect wireframe edges from meshes that need them
+        // =================================================================
+        let mut wireframe_segments: Vec<LineSegment> = Vec::new();
+        let wireframe_color = [0.3, 0.3, 0.3, 1.0]; // Dark gray edges
+
+        for submitted in &wireframe_meshes {
+            // Extract edges from mesh
+            let edges = extract_edges(
+                &submitted.data.vertices,
+                submitted.data.indices.as_deref(),
+            );
+
+            // Transform edge positions and create line segments
+            for (i0, i1) in edges {
+                let v0 = &submitted.data.vertices[i0 as usize];
+                let v1 = &submitted.data.vertices[i1 as usize];
+
+                let start = submitted.transform.transform_point3(Vec3::from(v0.position));
+                let end = submitted.transform.transform_point3(Vec3::from(v1.position));
+
+                wireframe_segments.push(LineSegment {
+                    start: start.into(),
+                    end: end.into(),
+                    color: wireframe_color,
+                });
+            }
+        }
+
+        // =================================================================
+        // Pass 5-7: Grid Lines, Scene Lines + Wireframe, Points (depth-tested)
         // =================================================================
         {
             // Collect and prepare all depth-tested line instances
@@ -567,6 +735,9 @@ impl Renderer {
                     }
                 }
             }
+
+            // Add wireframe edges
+            all_line_segments.extend(wireframe_segments);
 
             // Collect and prepare all depth-tested point instances
             let mut all_point_instances: Vec<PointInstance> = Vec::new();
@@ -601,14 +772,16 @@ impl Renderer {
             if !all_line_segments.is_empty() {
                 let instances = LinePipeline::prepare_instances(&all_line_segments, &line_style);
                 line_pipeline.upload_instances(device, queue, &instances);
-                let uniforms = LinePipeline::create_uniforms(view_proj_array, screen_size, &line_style);
+                let uniforms =
+                    LinePipeline::create_uniforms(view_proj_array, screen_size, &line_style);
                 line_pipeline.update_uniforms(queue, &uniforms);
             }
 
             if !all_point_instances.is_empty() {
                 let instances = PointPipeline::prepare_instances(&all_point_instances);
                 point_pipeline.upload_instances(device, queue, &instances);
-                let uniforms = PointPipeline::create_uniforms(view_proj_array, screen_size, &point_style);
+                let uniforms =
+                    PointPipeline::create_uniforms(view_proj_array, screen_size, &point_style);
                 point_pipeline.update_uniforms(queue, &uniforms);
             }
 
@@ -646,7 +819,7 @@ impl Renderer {
         }
 
         // =================================================================
-        // Pass 7-8: Overlay Lines and Points (no depth test)
+        // Pass 8-9: Overlay Lines and Points (no depth test)
         // =================================================================
         {
             // Collect and prepare all overlay line instances
@@ -880,7 +1053,7 @@ mod tests {
             indices: None,
         };
 
-        renderer.submit_mesh(&mesh, Mat4::IDENTITY, MaterialId(0));
+        renderer.submit_mesh(&mesh, Mat4::IDENTITY, MaterialId(0), MeshRenderMode::Shaded);
         assert_eq!(renderer.mesh_count(), 1);
 
         renderer.end_frame();

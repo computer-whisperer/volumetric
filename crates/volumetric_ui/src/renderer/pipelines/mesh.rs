@@ -1,12 +1,31 @@
 //! Mesh G-buffer rendering pipeline.
 //!
 //! Renders triangle meshes to the G-buffer with deferred shading data.
+//! Supports multiple render modes including standard shading and back-face debug.
 
 use bytemuck::{Pod, Zeroable};
 use glam::Mat4;
 use wgpu::util::DeviceExt;
 
-use crate::renderer::{DynamicBuffer, MeshVertex};
+use crate::renderer::{DynamicBuffer, MeshRenderMode, MeshVertex};
+
+/// Shader render mode values (must match mesh_gbuffer.wgsl)
+#[repr(u32)]
+#[derive(Copy, Clone, Debug, Default)]
+pub enum ShaderRenderMode {
+    #[default]
+    Shaded = 0,
+    BackFaceDebug = 1,
+}
+
+impl From<&MeshRenderMode> for ShaderRenderMode {
+    fn from(mode: &MeshRenderMode) -> Self {
+        match mode {
+            MeshRenderMode::BackFaceDebug => ShaderRenderMode::BackFaceDebug,
+            _ => ShaderRenderMode::Shaded,
+        }
+    }
+}
 
 /// Uniform data for mesh rendering.
 #[repr(C)]
@@ -16,6 +35,10 @@ pub struct MeshUniforms {
     pub light_dir_world: [f32; 3],
     pub _pad0: f32,
     pub base_color: [f32; 3],
+    /// Render mode: 0 = Shaded, 1 = BackFaceDebug
+    pub render_mode: u32,
+    /// Color for back faces in BackFaceDebug mode
+    pub back_face_color: [f32; 3],
     pub _pad1: f32,
 }
 
@@ -26,6 +49,8 @@ impl Default for MeshUniforms {
             light_dir_world: [0.4, 0.7, 0.2],
             _pad0: 0.0,
             base_color: [0.85, 0.9, 1.0],
+            render_mode: 0,
+            back_face_color: [0.9, 0.2, 0.2], // Red for back faces
             _pad1: 0.0,
         }
     }
@@ -36,12 +61,17 @@ impl PartialEq for MeshUniforms {
         self.view_proj == other.view_proj
             && self.light_dir_world == other.light_dir_world
             && self.base_color == other.base_color
+            && self.render_mode == other.render_mode
+            && self.back_face_color == other.back_face_color
     }
 }
 
 /// Pipeline for rendering meshes to the G-buffer.
 pub struct MeshPipeline {
+    /// Standard pipeline with back-face culling
     pipeline: wgpu::RenderPipeline,
+    /// Pipeline without face culling (for BackFaceDebug and XRay modes)
+    pipeline_no_cull: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
@@ -83,62 +113,75 @@ impl MeshPipeline {
             push_constant_ranges: &[],
         });
 
-        // Render pipeline
+        // Shared pipeline descriptor parts
+        let vertex_state = wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<MeshVertex>() as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &[
+                    // position
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x3,
+                        offset: 0,
+                        shader_location: 0,
+                    },
+                    // normal
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x3,
+                        offset: 12, // 3 * sizeof(f32)
+                        shader_location: 1,
+                    },
+                ],
+            }],
+            compilation_options: Default::default(),
+        };
+
+        let fragment_state = wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_gbuffer"),
+            targets: &[
+                // Color output
+                Some(wgpu::ColorTargetState {
+                    format: color_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+                // Normal output
+                Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+                // Depth output (for SSAO)
+                // Use Rgba16Float on web for better compatibility
+                Some(wgpu::ColorTargetState {
+                    #[cfg(target_arch = "wasm32")]
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    #[cfg(not(target_arch = "wasm32"))]
+                    format: wgpu::TextureFormat::R32Float,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+            ],
+            compilation_options: Default::default(),
+        };
+
+        let depth_stencil = Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth24Plus,
+            depth_write_enabled: true,
+            depth_compare: wgpu::CompareFunction::LessEqual,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        });
+
+        // Standard pipeline with back-face culling
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("mesh_gbuffer_pipeline"),
             layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<MeshVertex>() as u64,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &[
-                        // position
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32x3,
-                            offset: 0,
-                            shader_location: 0,
-                        },
-                        // normal
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32x3,
-                            offset: 12, // 3 * sizeof(f32)
-                            shader_location: 1,
-                        },
-                    ],
-                }],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_gbuffer"),
-                targets: &[
-                    // Color output
-                    Some(wgpu::ColorTargetState {
-                        format: color_format,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    }),
-                    // Normal output
-                    Some(wgpu::ColorTargetState {
-                        format: wgpu::TextureFormat::Rgba8Unorm,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    }),
-                    // Depth output (for SSAO)
-                    // Use Rgba16Float on web for better compatibility
-                    Some(wgpu::ColorTargetState {
-                        #[cfg(target_arch = "wasm32")]
-                        format: wgpu::TextureFormat::Rgba16Float,
-                        #[cfg(not(target_arch = "wasm32"))]
-                        format: wgpu::TextureFormat::R32Float,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    }),
-                ],
-                compilation_options: Default::default(),
-            }),
+            vertex: vertex_state.clone(),
+            fragment: Some(fragment_state.clone()),
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
                 strip_index_format: None,
@@ -148,13 +191,28 @@ impl MeshPipeline {
                 polygon_mode: wgpu::PolygonMode::Fill,
                 conservative: false,
             },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth24Plus,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::LessEqual,
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
+            depth_stencil: depth_stencil.clone(),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        // No-cull pipeline for BackFaceDebug and XRay modes
+        let pipeline_no_cull = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("mesh_gbuffer_pipeline_no_cull"),
+            layout: Some(&pipeline_layout),
+            vertex: vertex_state,
+            fragment: Some(fragment_state),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None, // No culling
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil,
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
             cache: None,
@@ -190,6 +248,7 @@ impl MeshPipeline {
 
         Self {
             pipeline,
+            pipeline_no_cull,
             bind_group_layout,
             uniform_buffer,
             bind_group,
@@ -231,16 +290,28 @@ impl MeshPipeline {
     /// Record the G-buffer render pass.
     ///
     /// This renders meshes to the G-buffer textures (color, normal, depth).
+    ///
+    /// # Arguments
+    /// * `render_pass` - The render pass to record commands into
+    /// * `use_indices` - Whether to use indexed drawing
+    /// * `use_no_cull` - Whether to use the no-cull pipeline variant
     pub fn render<'a>(
         &'a self,
         render_pass: &mut wgpu::RenderPass<'a>,
         use_indices: bool,
+        use_no_cull: bool,
     ) {
         if self.vertex_buffer.is_empty() {
             return;
         }
 
-        render_pass.set_pipeline(&self.pipeline);
+        let pipeline = if use_no_cull {
+            &self.pipeline_no_cull
+        } else {
+            &self.pipeline
+        };
+
+        render_pass.set_pipeline(pipeline);
         render_pass.set_bind_group(0, &self.bind_group, &[]);
 
         if let Some(buffer) = self.vertex_buffer.buffer() {

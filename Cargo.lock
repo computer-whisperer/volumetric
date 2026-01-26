@@ -4253,6 +4253,7 @@ dependencies = [
  "eframe",
  "env_logger",
  "glam 0.29.3",
+ "image 0.25.9",
  "js-sys",
  "log",
  "poll-promise",
