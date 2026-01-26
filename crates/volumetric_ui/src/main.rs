@@ -868,6 +868,9 @@ struct AssetRenderData {
 
     /// Detailed profiling stats from the last ASN2 meshing operation
     asn2_stats: Option<adaptive_surface_nets_2::MeshingStats2>,
+
+    /// Whether to show the model's bounding box wireframe
+    show_bounding_box: bool,
 }
 
 impl AssetRenderData {
@@ -897,6 +900,7 @@ impl AssetRenderData {
             asn2_normal_epsilon_frac: 0.1,
             asn2_sharp_edge_config: None, // Sharp edge detection disabled by default
             asn2_stats: None,
+            show_bounding_box: false,
         }
     }
 }
@@ -941,6 +945,42 @@ fn build_sample_cloud_root(set: &SampleCloudSet) -> renderer::PointData {
             color: [1.0, 0.2, 0.4, 1.0],
         }],
     }
+}
+
+/// Build line segments for a bounding box wireframe (12 edges).
+fn build_bbox_lines(min: [f32; 3], max: [f32; 3], color: [f32; 4]) -> renderer::LineData {
+    // 8 corners of the box
+    let corners = [
+        [min[0], min[1], min[2]], // 0: min corner
+        [max[0], min[1], min[2]], // 1
+        [max[0], max[1], min[2]], // 2
+        [min[0], max[1], min[2]], // 3
+        [min[0], min[1], max[2]], // 4
+        [max[0], min[1], max[2]], // 5
+        [max[0], max[1], max[2]], // 6: max corner
+        [min[0], max[1], max[2]], // 7
+    ];
+
+    // 12 edges connecting the corners
+    let edges = [
+        // Bottom face (z = min)
+        (0, 1), (1, 2), (2, 3), (3, 0),
+        // Top face (z = max)
+        (4, 5), (5, 6), (6, 7), (7, 4),
+        // Vertical edges
+        (0, 4), (1, 5), (2, 6), (3, 7),
+    ];
+
+    let segments = edges
+        .iter()
+        .map(|(a, b)| renderer::LineSegment {
+            start: corners[*a],
+            end: corners[*b],
+            color,
+        })
+        .collect();
+
+    renderer::LineData { segments }
 }
 
 /// Application state for the volumetric renderer
@@ -996,6 +1036,8 @@ pub struct VolumetricApp {
     sample_cloud_point_size: f32,
     /// Whether to render the sample cloud
     sample_cloud_enabled: bool,
+    /// Whether to render the sample cloud cell bounds
+    show_sample_cloud_cell_bounds: bool,
     /// Path to sample cloud file (native only)
     #[cfg(not(target_arch = "wasm32"))]
     sample_cloud_path: Option<PathBuf>,
@@ -1161,6 +1203,7 @@ impl VolumetricApp {
             sample_cloud_mode: SampleCloudViewMode::Overlay,
             sample_cloud_point_size: 5.0,
             sample_cloud_enabled: true,
+            show_sample_cloud_cell_bounds: true,
             #[cfg(not(target_arch = "wasm32"))]
             sample_cloud_path: None,
 
@@ -2623,6 +2666,7 @@ impl eframe::App for VolumetricApp {
                                 egui::Slider::new(&mut self.sample_cloud_point_size, 1.0..=16.0)
                                     .text("Point size"),
                             );
+                            ui.checkbox(&mut self.show_sample_cloud_cell_bounds, "Show cell bounds");
 
                             // Focus camera on vertex button
                             if let Some(set) = dump.sets.get(self.sample_cloud_set_index) {
@@ -3587,6 +3631,13 @@ impl eframe::App for VolumetricApp {
                                     }
                                 });
 
+                                // Show bounding box toggle when we have render data
+                                if current_mode != ExportRenderMode::None {
+                                    if let Some(render_data) = self.asset_render_data.get_mut(&asset_id) {
+                                        ui.checkbox(&mut render_data.show_bounding_box, "Show bounds");
+                                    }
+                                }
+
                                 // Show mesh render mode selector for mesh-based modes
                                 if matches!(current_mode, ExportRenderMode::MarchingCubes | ExportRenderMode::AdaptiveSurfaceNets2) {
                                     if let Some(render_data) = self.asset_render_data.get_mut(&asset_id) {
@@ -4109,6 +4160,29 @@ impl eframe::App for VolumetricApp {
                 }
             };
 
+            let add_asset_bounds = |scene: &mut renderer::SceneData, asset_render_data: &HashMap<String, AssetRenderData>| {
+                for asset_data in asset_render_data.values() {
+                    // Only show bounds if enabled for this asset and it has geometry
+                    if asset_data.show_bounding_box && asset_data.mode != ExportRenderMode::None {
+                        let min = [asset_data.bounds_min.0, asset_data.bounds_min.1, asset_data.bounds_min.2];
+                        let max = [asset_data.bounds_max.0, asset_data.bounds_max.1, asset_data.bounds_max.2];
+                        // Skip if bounds are zero (no data yet)
+                        if min != [0.0, 0.0, 0.0] || max != [0.0, 0.0, 0.0] {
+                            scene.add_lines(
+                                build_bbox_lines(min, max, [0.8, 0.6, 0.2, 0.9]), // Orange/yellow
+                                glam::Mat4::IDENTITY,
+                                renderer::LineStyle {
+                                    width: 1.5,
+                                    width_mode: renderer::WidthMode::ScreenSpace,
+                                    pattern: renderer::LinePattern::Solid,
+                                    depth_mode: renderer::DepthMode::Normal,
+                                },
+                            );
+                        }
+                    }
+                }
+            };
+
             let add_sample_cloud = |scene: &mut renderer::SceneData, set: &SampleCloudSet, size: f32| {
                 scene.add_points(
                     build_sample_cloud_points(set),
@@ -4132,12 +4206,31 @@ impl eframe::App for VolumetricApp {
                 );
             };
 
+            let add_sample_cloud_cell_bounds = |scene: &mut renderer::SceneData, set: &SampleCloudSet| {
+                if let Some(ref bounds) = set.cell_bounds {
+                    scene.add_lines(
+                        build_bbox_lines(bounds.min, bounds.max, [0.3, 0.7, 1.0, 0.9]), // Light blue
+                        glam::Mat4::IDENTITY,
+                        renderer::LineStyle {
+                            width: 1.5,
+                            width_mode: renderer::WidthMode::ScreenSpace,
+                            pattern: renderer::LinePattern::Solid,
+                            depth_mode: renderer::DepthMode::Normal,
+                        },
+                    );
+                }
+            };
+
             if split_view {
                 add_asset_points(&mut scene, &self.asset_render_data);
                 add_asset_meshes(&mut scene, &self.asset_render_data);
+                add_asset_bounds(&mut scene, &self.asset_render_data);
                 if let Some(set) = sample_set {
                     if let Some(ref mut right_scene) = scene_right {
                         add_sample_cloud(right_scene, set, self.sample_cloud_point_size);
+                        if self.show_sample_cloud_cell_bounds {
+                            add_sample_cloud_cell_bounds(right_scene, set);
+                        }
                     }
                 }
             } else {
@@ -4145,14 +4238,21 @@ impl eframe::App for VolumetricApp {
                     SampleCloudViewMode::CloudOnly if sample_set.is_some() => {
                         if let Some(set) = sample_set {
                             add_sample_cloud(&mut scene, set, self.sample_cloud_point_size);
+                            if self.show_sample_cloud_cell_bounds {
+                                add_sample_cloud_cell_bounds(&mut scene, set);
+                            }
                         }
                     }
                     _ => {
                         add_asset_points(&mut scene, &self.asset_render_data);
                         add_asset_meshes(&mut scene, &self.asset_render_data);
+                        add_asset_bounds(&mut scene, &self.asset_render_data);
                         if self.sample_cloud_mode == SampleCloudViewMode::Overlay {
                             if let Some(set) = sample_set {
                                 add_sample_cloud(&mut scene, set, self.sample_cloud_point_size);
+                                if self.show_sample_cloud_cell_bounds {
+                                    add_sample_cloud_cell_bounds(&mut scene, set);
+                                }
                             }
                         }
                     }
