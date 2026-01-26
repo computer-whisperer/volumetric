@@ -16,15 +16,13 @@ use crate::sample_cloud::{SampleCloudDump, SampleCloudSet};
 use super::validation::{generate_validation_points, generate_validation_points_with_offset, ExpectedClassification, ValidationPoint};
 
 /// Realistic cell size for research benchmarks.
-/// The validation points use an offset of 0.1 inside the surface.
-/// With config search_distance=0.5: search range = 0.5 * cell_size
-/// For search to reach the surface: 0.5 * cell_size >= 0.1 → cell_size >= 0.2
+/// For a unit cube, this should be ~5% of edge length to simulate realistic
+/// surface nets cell sizes. The validation point offset scales proportionally
+/// (0.5 * cell_size), placing test points within half a cell of the surface.
 ///
-/// Using 0.1 gives search range = 0.05, which requires increasing search_distance
-/// factor in configs. Using 0.2 works with the default search_distance=0.5.
-///
-/// The old value of 1.0 was wrong - it made sample clouds span the entire model!
-const RESEARCH_CELL_SIZE: f64 = 1.0; // Testing scale invariance with proportional offset
+/// With config search_distance=0.5: search range = 0.5 * cell_size = 0.025
+/// This means sample clouds will be localized to about 5% of the model.
+const RESEARCH_CELL_SIZE: f64 = 0.05;
 
 pub fn run_attempt_0_benchmark() {
     let config = CrossingCountConfig::default();

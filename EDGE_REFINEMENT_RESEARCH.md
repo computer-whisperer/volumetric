@@ -1,6 +1,6 @@
 # Edge Refinement Research (Living)
 
-Updated: 2026-01-25 21:00 EST
+Updated: 2026-01-26
 
 This document is the living knowledge for sharp edge detection on binary samplers.
 It intentionally omits archived details and historical algorithms. If something is
@@ -61,16 +61,23 @@ This supports:
 
 ## Attempt Status (Snapshot)
 
-**WARNING**: Previous assessments below were made with incorrect scaling (cell_size=1.0,
-fixed offset=0.1). These need re-evaluation after fixing scale invariance issues.
-See Log entry 2026-01-25 21:00 EST for details.
+Results at realistic scale (`cell_size=0.05`, proportional offset `0.5 * cell_size`).
+All attempts have scale-invariant thresholds (multiplied by cell_size).
 
-- Attempt 0: ~~strong classification~~, unstable second normal, high sampling cost.
-  *Re-test needed with realistic cell_size.*
-- Attempt 1: adaptive RANSAC collapses onto single face; false edges on corners.
-  *Re-test needed.*
-- Attempt 2: fixed-budget RANSAC improves faces/corners but fails edges due to mixed samples.
-  *Re-test needed.*
+| Attempt | Face | Edge | Corner | Face Err | Edge Err | Samples |
+|---------|------|------|--------|----------|----------|---------|
+| 0 | 12/12 | 2/24 | 0/8 | 44° | 169° | 1443 |
+| 1 | 12/12 | 0/24 | 0/8 | 21° | 180° | 808 |
+| 2 | 6/12 | 14/24 | 0/8 | 52° | 108° | 1594 |
+
+- **Attempt 0**: Classification works but measurement fails. **Not viable.**
+- **Attempt 1**: Best face error but zero edge detection. Already had scale-invariant
+  thresholds. **Not viable.**
+- **Attempt 2**: After threshold fix, detects edges (14/24) but misclassifies faces.
+  Trade-off between face/edge detection. **Not viable.**
+
+All three approaches fail at realistic scale. The fundamental issue is that
+local RANSAC plane fitting doesn't work reliably in small sample neighborhoods.
 
 See attempt notes in `src/adaptive_surface_nets_2/stage4/research/ATTEMPT_*.md`.
 
@@ -191,3 +198,52 @@ To fix:
 3. Benchmarks must be re-run after fixes to establish true baselines
 
 See `attempt_runner.rs:RESEARCH_CELL_SIZE` and the `generate_validation_points_with_offset()` function.
+
+2026-01-26 - **Attempt 0 re-tested at realistic scale**
+
+Set `RESEARCH_CELL_SIZE = 0.05` (5% of cube edge) and made all thresholds in
+`attempt_0.rs` scale with cell_size:
+- `tight_threshold = 0.006 * cell_size`
+- `face_residual_threshold = 0.002 * cell_size`
+- `outlier_threshold = 0.01 * cell_size`
+- `edge_residual_threshold = 0.02 * cell_size`
+- `corner_residual_threshold = 0.005 * cell_size`
+- `corner_threshold = config.ransac_inlier_threshold * cell_size * 0.6`
+
+Results:
+| Metric | cell_size=1.0 | cell_size=0.05 |
+|--------|---------------|----------------|
+| Face success | 12/12 | 12/12 |
+| Face error | 1.85° | 43.94° |
+| Edge success | 6/24 | 2/24 |
+| Corner success | 0/8 | 0/8 |
+| Samples | 1076 | 1443 |
+
+The crossing-count classification still works, but plane fitting fails at
+realistic scale. The algorithm was designed and tuned for the unrealistic
+cell_size=1.0 setup where sample clouds spanned the entire model. The unit
+tests in `attempt_0.rs` still use hardcoded cell_size=1.0 and don't test
+realistic behavior.
+
+**Conclusion**: Attempt 0 is not viable. Moving on to re-test attempts 1 and 2.
+
+2026-01-26 - **Attempts 1 and 2 re-tested at realistic scale**
+
+Attempt 1 already had scale-invariant thresholds. Results:
+- Face: 12/12, 21° error (best of all attempts)
+- Edge: 0/24, 180° error (complete failure)
+- Samples: 808
+
+Attempt 2 needed threshold scaling fix (added `* cell_size` to fit_face,
+fit_edge, fit_corner). Results after fix:
+- Face: 6/12, 52° error (threshold change broke face classification)
+- Edge: 14/24, 108° error (improved from 0/24 before fix)
+- Corner: 0/8
+- Samples: 1594
+
+The threshold scaling in attempt 2 reveals a trade-off: tighter thresholds
+help edge detection but cause false edge classifications on faces.
+
+**Conclusion**: All three attempts fail at realistic scale. The RANSAC-based
+approach doesn't work reliably in small local neighborhoods. New approaches
+needed.

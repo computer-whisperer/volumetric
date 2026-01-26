@@ -2,10 +2,14 @@
 
 Date/Time: 2026-01-25 16:50 EST (reviewed)
 
-> **WARNING (2026-01-25 21:00 EST):** Results below were obtained with incorrect
-> scaling parameters (cell_size=1.0, fixed offset=0.1). The algorithm is NOT
-> scale-invariant due to hardcoded absolute thresholds. All metrics need
-> re-verification. See `EDGE_REFINEMENT_RESEARCH.md` for details.
+> **UPDATE (2026-01-26):** Re-tested at realistic scale (`cell_size=0.05`).
+> Fixed all hardcoded thresholds to scale with cell_size. Results:
+> - Face: 12/12, 44° error (classification works, measurement fails)
+> - Edge: 2/24, 169° error
+> - Corner: 0/8
+> - Samples: 1443
+>
+> The algorithm is not viable at realistic scale.
 
 ## Summary
 Implementation of residual-based geometry classification with full-sphere edge detection.

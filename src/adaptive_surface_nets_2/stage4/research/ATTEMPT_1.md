@@ -2,10 +2,13 @@
 
 Date/Time: 2026-01-25 16:50 EST (reviewed)
 
-> **WARNING (2026-01-25 21:00 EST):** Results below were obtained with incorrect
-> scaling parameters (cell_size=1.0, fixed offset=0.1). The algorithm is NOT
-> scale-invariant due to hardcoded absolute thresholds. All metrics need
-> re-verification. See `EDGE_REFINEMENT_RESEARCH.md` for details.
+> **UPDATE (2026-01-26):** Re-tested at realistic scale (`cell_size=0.05`).
+> Attempt 1 already had scale-invariant thresholds. Results confirm failure:
+> - Face: 12/12, 21° error (best face detection of all attempts)
+> - Edge: 0/24, 180° error (complete failure)
+> - Samples: 808
+>
+> The algorithm cannot detect edges at realistic scale.
 
 ## Summary
 Adaptive RANSAC + diagnostics with crossing-count preclassification.

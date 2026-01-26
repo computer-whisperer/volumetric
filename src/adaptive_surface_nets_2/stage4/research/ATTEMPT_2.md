@@ -2,10 +2,15 @@
 
 Date/Time: 2026-01-25 16:50 EST (reviewed)
 
-> **WARNING (2026-01-25 21:00 EST):** Results below were obtained with incorrect
-> scaling parameters (cell_size=1.0, fixed offset=0.1). The algorithm is NOT
-> scale-invariant due to hardcoded absolute thresholds. All metrics need
-> re-verification. See `EDGE_REFINEMENT_RESEARCH.md` for details.
+> **UPDATE (2026-01-26):** Re-tested at realistic scale (`cell_size=0.05`).
+> Fixed threshold scaling (added `* cell_size` to fit_face, fit_edge, fit_corner).
+> Results:
+> - Face: 6/12, 52° error (threshold fix broke face classification)
+> - Edge: 14/24, 108° error (improved from 0/24 before fix)
+> - Corner: 0/8
+> - Samples: 1594
+>
+> Trade-off: tighter thresholds help edges but cause false edge classifications.
 
 ## Summary
 Fixed-budget, full-sphere RANSAC with crossing-count routing. Sampling is reused across passes.

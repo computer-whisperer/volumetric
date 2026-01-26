@@ -194,7 +194,7 @@ impl Default for CrossingCountConfig {
     fn default() -> Self {
         Self {
             binary_search_iterations: 15,
-            search_distance: 0.5, // Reduced from 1.5 to help with edge classification
+            search_distance: 0.5, // Half cell size
             probe_epsilon: 0.1,
             ransac_inlier_threshold: 0.01,
             ransac_iterations: 200,
@@ -569,8 +569,8 @@ where
         return None;
     }
 
-    // Two-plane RANSAC with threshold matching baseline robust_edge.rs (0.006)
-    let tight_threshold = 0.006;
+    // Two-plane RANSAC with threshold scaled to cell_size (0.006 per unit)
+    let tight_threshold = 0.006 * cell_size;
 
     // First plane
     let plane_a_result = ransac_plane_fit(&surface_points, tight_threshold, config.ransac_iterations);
@@ -684,8 +684,8 @@ where
         return None;
     }
 
-    // Two-plane RANSAC with threshold similar to baseline robust_edge.rs (0.006)
-    let tight_threshold = 0.006;
+    // Two-plane RANSAC with threshold scaled to cell_size (0.006 per unit)
+    let tight_threshold = 0.006 * cell_size;
 
     let (plane_a_inliers, plane_a_centroid, plane_a_normal, plane_a_residual) =
         ransac_plane_fit(&surface_points, tight_threshold, config.ransac_iterations)?;
@@ -796,7 +796,7 @@ where
     // Three-plane RANSAC with duplicate rejection
     let mut planes: Vec<((f64, f64, f64), Vec<(f64, f64, f64)>, f64)> = Vec::new();
     let mut remaining = surface_points.clone();
-    let corner_threshold = config.ransac_inlier_threshold * 0.6; // Tighter for corners
+    let corner_threshold = config.ransac_inlier_threshold * cell_size * 0.6; // Scaled to cell_size
 
     for _ in 0..3 {
         if remaining.len() < 3 {
@@ -895,12 +895,10 @@ where
     if let Some(ref face) = face_result {
         total_samples += face.samples_used;
 
-        // Threshold for "good" plane fit - if below this, it's likely a face
-        // Lower threshold to catch more edges (edge vertices near face centers have low residual)
-        const FACE_RESIDUAL_THRESHOLD: f64 = 0.002;
+        // Threshold for "good" plane fit - scaled to cell_size for scale invariance
+        let face_residual_threshold = 0.002 * cell_size;
 
-
-        if face.residual < FACE_RESIDUAL_THRESHOLD {
+        if face.residual < face_residual_threshold {
             return VertexGeometry {
                 classification: GeometryType::Face,
                 normals: vec![face.normal],
@@ -919,7 +917,7 @@ where
 
     // Find outliers from the face fit (points far from the fitted plane)
     let outlier_hint = if let Some(ref face) = face_result {
-        let outlier_threshold = 0.01; // Points more than 0.01 from plane are outliers
+        let outlier_threshold = 0.01 * cell_size; // Scaled to cell_size
         let outliers: Vec<_> = face.surface_points.iter()
             .filter(|p| {
                 let dist = dot(sub(**p, face.centroid), face.normal).abs();
@@ -972,13 +970,13 @@ where
 
         // Check if edge detection is significantly better than face
         let edge_residual = (edge.residual_a + edge.residual_b) / 2.0;
-        const EDGE_RESIDUAL_THRESHOLD: f64 = 0.02; // Increased from 0.005
+        let edge_residual_threshold = 0.02 * cell_size; // Scaled to cell_size
 
         // Also check that the two normals are significantly different (angle > 30°)
         let normal_angle = angle_between(edge.normal_a, edge.normal_b).to_degrees();
 
 
-        if edge_residual < EDGE_RESIDUAL_THRESHOLD && normal_angle > 30.0 {
+        if edge_residual < edge_residual_threshold && normal_angle > 30.0 {
             return VertexGeometry {
                 classification: GeometryType::Edge,
                 normals: vec![edge.normal_a, edge.normal_b],
@@ -997,14 +995,14 @@ where
         total_samples += corner.samples_used;
 
         let corner_residual = (corner.residuals[0] + corner.residuals[1] + corner.residuals[2]) / 3.0;
-        const CORNER_RESIDUAL_THRESHOLD: f64 = 0.005;
+        let corner_residual_threshold = 0.005 * cell_size; // Scaled to cell_size
 
         // Check that normals are mutually distinct
         let angle_01 = angle_between(corner.normals[0], corner.normals[1]).to_degrees();
         let angle_12 = angle_between(corner.normals[1], corner.normals[2]).to_degrees();
         let angle_02 = angle_between(corner.normals[0], corner.normals[2]).to_degrees();
 
-        if corner_residual < CORNER_RESIDUAL_THRESHOLD
+        if corner_residual < corner_residual_threshold
             && angle_01 > 30.0
             && angle_12 > 30.0
             && angle_02 > 30.0

@@ -150,7 +150,7 @@ where
         hint_hist,
     };
 
-    let face_fit = || fit_face(&surface_points, config, inside_point);
+    let face_fit = || fit_face(&surface_points, config, inside_point, cell_size);
     let edge_fit = || {
         let points = if edge_points.is_empty() {
             surface_points.as_slice()
@@ -167,7 +167,7 @@ where
             cell_size,
         )
     };
-    let corner_fit = || fit_corner(&surface_points, config, inside_point);
+    let corner_fit = || fit_corner(&surface_points, config, inside_point, cell_size);
 
     match location.crossing_count {
         3 | 4 => {
@@ -215,8 +215,10 @@ fn fit_face(
     points: &[(f64, f64, f64)],
     config: &Attempt2Config,
     query_point: (f64, f64, f64),
+    cell_size: f64,
 ) -> Option<VertexGeometry> {
-    let plane = ransac_plane_fit(points, config.face_inlier_threshold, config.ransac_iterations)?;
+    let threshold = config.face_inlier_threshold * cell_size;
+    let plane = ransac_plane_fit(points, threshold, config.ransac_iterations)?;
     let normal = orient_away(plane.normal, plane.centroid, query_point);
     Some(VertexGeometry {
         classification: GeometryType::Face,
@@ -253,10 +255,11 @@ fn fit_edge(
         }
     }
 
+    let edge_threshold = config.edge_inlier_threshold * cell_size;
     let (plane_a, plane_b, mode) = if let Some(hints) = hints {
         let result = two_plane_ransac_partitioned(
             &filtered_points,
-            config.edge_inlier_threshold,
+            edge_threshold,
             config.ransac_iterations,
             query_point,
             hints,
@@ -266,7 +269,7 @@ fn fit_edge(
     } else {
         let result = two_plane_ransac_exclusion(
             &filtered_points,
-            config.edge_inlier_threshold,
+            edge_threshold,
             config.ransac_iterations,
             config.edge_exclusion_scale,
         )?;
@@ -309,10 +312,12 @@ fn fit_corner(
     points: &[(f64, f64, f64)],
     config: &Attempt2Config,
     query_point: (f64, f64, f64),
+    cell_size: f64,
 ) -> Option<VertexGeometry> {
+    let threshold = config.corner_inlier_threshold * cell_size;
     let planes = three_plane_ransac(
         points,
-        config.corner_inlier_threshold,
+        threshold,
         config.ransac_iterations,
     )?;
 
