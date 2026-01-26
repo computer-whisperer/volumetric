@@ -149,11 +149,14 @@ pub fn dump_ml_policy_sample_cloud(kind: MlPolicyDumpKind, output_path: &Path) {
         );
         let samples = end_sample_recording();
 
-        let mut set = SampleCloudSet::new(idx as u64, to_f32(point.position), to_f32(initial_normal(point.expected.clone())));
+        let mut set = SampleCloudSet::new(idx as u64, to_f32(point.position));
         set.label = Some(format!("{}: {}", label, point.description));
         set.points = samples;
         set.meta.samples_used = Some(episode.samples_used as u32);
         set.meta.note = Some(label.to_string());
+        // Add initial normal as a named vector
+        let init_normal = initial_normal(point.expected.clone());
+        set.add_vector("initial_normal", to_f32(point.position), to_f32(init_normal), Some([0.5, 0.5, 1.0, 1.0]));
         dump.add_set(set);
     }
 

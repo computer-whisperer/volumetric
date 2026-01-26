@@ -8,6 +8,10 @@ use crate::adaptive_surface_nets_2::stage4::research::validation::{
     ExpectedClassification, ValidationPoint,
 };
 
+use super::classifier_heads::{
+    compute_classifier_gradients, compute_classifier_loss, ClassifierLossConfig, ExpectedGeometry,
+    CORNER_HEAD_OUTPUTS, EDGE_HEAD_OUTPUTS, FACE_HEAD_OUTPUTS,
+};
 use super::gradients::{compute_batch_gradient, PolicyGradients};
 use super::gru::{Rng, HIDDEN_DIM};
 use super::policy::{run_episode, RnnPolicy, BUDGET, CELL_SIZE, INPUT_DIM};
@@ -32,10 +36,16 @@ pub struct TrainingConfig {
     pub adam_eps: f64,
     /// Print progress every N epochs.
     pub print_every: usize,
-    /// Whether to use terminal (classifier-based) rewards.
+    /// Whether to use terminal (classifier-based) rewards (legacy RANSAC mode).
     pub use_terminal_reward: bool,
-    /// Terminal reward configuration.
+    /// Terminal reward configuration (legacy RANSAC mode).
     pub terminal_reward: TerminalRewardConfig,
+    /// Whether to use neural classifier heads for training.
+    pub use_classifier_heads: bool,
+    /// Classifier head loss configuration.
+    pub classifier_loss: ClassifierLossConfig,
+    /// Whether to use rotation augmentation during training.
+    pub use_rotation_augmentation: bool,
 }
 
 impl Default for TrainingConfig {
@@ -49,8 +59,11 @@ impl Default for TrainingConfig {
             adam_beta2: 0.999,
             adam_eps: 1e-8,
             print_every: 20,
-            use_terminal_reward: true, // Re-enabled with boosted accuracy weights
+            use_terminal_reward: false, // Disabled in favor of classifier heads
             terminal_reward: TerminalRewardConfig::default(),
+            use_classifier_heads: true, // New default: use neural classifier heads
+            classifier_loss: ClassifierLossConfig::default(),
+            use_rotation_augmentation: true, // Enable rotation by default
         }
     }
 }
@@ -69,6 +82,13 @@ pub struct AdamState {
     m_gru_b_h: Vec<f64>,
     m_chooser_w: Vec<f64>,
     m_chooser_b: Vec<f64>,
+    // Classifier heads
+    m_face_w: Vec<f64>,
+    m_face_b: Vec<f64>,
+    m_edge_w: Vec<f64>,
+    m_edge_b: Vec<f64>,
+    m_corner_w: Vec<f64>,
+    m_corner_b: Vec<f64>,
 
     /// Second moment (variance of gradients).
     v_gru_w_z: Vec<f64>,
@@ -82,6 +102,13 @@ pub struct AdamState {
     v_gru_b_h: Vec<f64>,
     v_chooser_w: Vec<f64>,
     v_chooser_b: Vec<f64>,
+    // Classifier heads
+    v_face_w: Vec<f64>,
+    v_face_b: Vec<f64>,
+    v_edge_w: Vec<f64>,
+    v_edge_b: Vec<f64>,
+    v_corner_w: Vec<f64>,
+    v_corner_b: Vec<f64>,
 
     /// Timestep.
     t: usize,
@@ -106,6 +133,12 @@ impl AdamState {
             m_gru_b_h: vec![0.0; h],
             m_chooser_w: vec![0.0; o * h],
             m_chooser_b: vec![0.0; o],
+            m_face_w: vec![0.0; FACE_HEAD_OUTPUTS * h],
+            m_face_b: vec![0.0; FACE_HEAD_OUTPUTS],
+            m_edge_w: vec![0.0; EDGE_HEAD_OUTPUTS * h],
+            m_edge_b: vec![0.0; EDGE_HEAD_OUTPUTS],
+            m_corner_w: vec![0.0; CORNER_HEAD_OUTPUTS * h],
+            m_corner_b: vec![0.0; CORNER_HEAD_OUTPUTS],
 
             v_gru_w_z: vec![0.0; h * i],
             v_gru_u_z: vec![0.0; h * h],
@@ -118,6 +151,12 @@ impl AdamState {
             v_gru_b_h: vec![0.0; h],
             v_chooser_w: vec![0.0; o * h],
             v_chooser_b: vec![0.0; o],
+            v_face_w: vec![0.0; FACE_HEAD_OUTPUTS * h],
+            v_face_b: vec![0.0; FACE_HEAD_OUTPUTS],
+            v_edge_w: vec![0.0; EDGE_HEAD_OUTPUTS * h],
+            v_edge_b: vec![0.0; EDGE_HEAD_OUTPUTS],
+            v_corner_w: vec![0.0; CORNER_HEAD_OUTPUTS * h],
+            v_corner_b: vec![0.0; CORNER_HEAD_OUTPUTS],
 
             t: 0,
         }
@@ -147,10 +186,18 @@ impl AdamState {
         adam_step(&mut policy.gru.b_h, &grads.gru.db_h, &mut self.m_gru_b_h, &mut self.v_gru_b_h, lr, b1, b2, eps, bc1, bc2);
         adam_step(&mut policy.chooser.w, &grads.chooser.dw, &mut self.m_chooser_w, &mut self.v_chooser_w, lr, b1, b2, eps, bc1, bc2);
         adam_step(&mut policy.chooser.b, &grads.chooser.db, &mut self.m_chooser_b, &mut self.v_chooser_b, lr, b1, b2, eps, bc1, bc2);
+
+        // Classifier heads (gradient descent for loss minimization)
+        adam_step_descent(&mut policy.classifier_heads.face.w, &grads.classifier_heads.face_dw, &mut self.m_face_w, &mut self.v_face_w, lr, b1, b2, eps, bc1, bc2);
+        adam_step_descent(&mut policy.classifier_heads.face.b, &grads.classifier_heads.face_db, &mut self.m_face_b, &mut self.v_face_b, lr, b1, b2, eps, bc1, bc2);
+        adam_step_descent(&mut policy.classifier_heads.edge.w, &grads.classifier_heads.edge_dw, &mut self.m_edge_w, &mut self.v_edge_w, lr, b1, b2, eps, bc1, bc2);
+        adam_step_descent(&mut policy.classifier_heads.edge.b, &grads.classifier_heads.edge_db, &mut self.m_edge_b, &mut self.v_edge_b, lr, b1, b2, eps, bc1, bc2);
+        adam_step_descent(&mut policy.classifier_heads.corner.w, &grads.classifier_heads.corner_dw, &mut self.m_corner_w, &mut self.v_corner_w, lr, b1, b2, eps, bc1, bc2);
+        adam_step_descent(&mut policy.classifier_heads.corner.b, &grads.classifier_heads.corner_db, &mut self.m_corner_b, &mut self.v_corner_b, lr, b1, b2, eps, bc1, bc2);
     }
 }
 
-/// Apply one Adam step to a parameter vector.
+/// Apply one Adam step to a parameter vector (gradient ascent for RL).
 fn adam_step(
     weights: &mut [f64],
     grads: &[f64],
@@ -173,6 +220,29 @@ fn adam_step(
         let v_hat = v[i] / bc2;
         // Update parameters (gradient ascent: + instead of -)
         weights[i] += lr * m_hat / (v_hat.sqrt() + eps);
+    }
+}
+
+/// Apply one Adam step to a parameter vector (gradient descent for supervised learning).
+fn adam_step_descent(
+    weights: &mut [f64],
+    grads: &[f64],
+    m: &mut [f64],
+    v: &mut [f64],
+    lr: f64,
+    b1: f64,
+    b2: f64,
+    eps: f64,
+    bc1: f64,
+    bc2: f64,
+) {
+    for i in 0..weights.len() {
+        m[i] = b1 * m[i] + (1.0 - b1) * grads[i];
+        v[i] = b2 * v[i] + (1.0 - b2) * grads[i] * grads[i];
+        let m_hat = m[i] / bc1;
+        let v_hat = v[i] / bc2;
+        // Gradient descent: - instead of +
+        weights[i] -= lr * m_hat / (v_hat.sqrt() + eps);
     }
 }
 
@@ -199,13 +269,29 @@ pub fn train_policy(
     let mut stats = Vec::new();
 
     for epoch in 0..config.epochs {
+        // Apply rotation augmentation if enabled
+        let (training_cube, training_points) = if config.use_rotation_augmentation {
+            let rotation = rng.next_rotation_matrix();
+            let rotated_cube = AnalyticalRotatedCube::from_rotation_matrix(rotation);
+            let rotated_points: Vec<ValidationPoint> = points
+                .iter()
+                .map(|p| p.rotate(&rotation))
+                .collect();
+            (rotated_cube, rotated_points)
+        } else {
+            (cube.clone(), points.to_vec())
+        };
+
         // Collect episodes for all points
         let mut episodes = Vec::new();
-        for (idx, point) in points.iter().enumerate() {
-            let mut episode = run_episode(policy, cube, point, idx, rng, true, reward_config);
+        let mut classifier_grads_sum = super::classifier_heads::ClassifierHeadGradients::zeros();
+        let mut total_classifier_loss = 0.0;
 
-            // Compute terminal reward if enabled
-            if config.use_terminal_reward {
+        for (idx, point) in training_points.iter().enumerate() {
+            let mut episode = run_episode(policy, &training_cube, point, idx, rng, true, reward_config);
+
+            // Compute terminal reward using legacy RANSAC if enabled
+            if config.use_terminal_reward && !config.use_classifier_heads {
                 let terminal_result = compute_terminal_reward(
                     &episode.final_samples,
                     &episode.inside_flags,
@@ -222,11 +308,49 @@ pub fn train_policy(
                 }
             }
 
+            // Compute classifier head loss and gradients if enabled
+            if config.use_classifier_heads {
+                let expected_geom = expected_to_geometry(&point.expected);
+                let predictions = policy.classify(&episode.h_final);
+
+                let (loss, _, _, _) = compute_classifier_loss(
+                    &predictions,
+                    &expected_geom,
+                    &config.classifier_loss,
+                );
+                total_classifier_loss += loss;
+
+                // Compute gradients for classifier heads
+                let (head_grads, _dh) = compute_classifier_gradients(
+                    &policy.classifier_heads,
+                    &episode.h_final,
+                    &predictions,
+                    &expected_geom,
+                    &config.classifier_loss,
+                );
+                classifier_grads_sum.add(&head_grads);
+
+                // Add classifier loss as terminal reward (negative because we minimize loss)
+                // This encourages the policy to sample in ways that help classification
+                // Scale increased to 0.5 for stronger signal
+                let classifier_reward = -loss * 0.5;
+                if let Some(last_reward) = episode.rewards.last_mut() {
+                    *last_reward += classifier_reward;
+                }
+                episode.terminal_reward = classifier_reward;
+            }
+
             episodes.push(episode);
         }
 
-        // Compute batch gradient
+        // Compute batch gradient for policy (GRU + Chooser)
         let mut grads = compute_batch_gradient(policy, &episodes, config.discount);
+
+        // Add classifier head gradients (averaged)
+        if config.use_classifier_heads {
+            classifier_grads_sum.scale(1.0 / episodes.len() as f64);
+            grads.classifier_heads = classifier_grads_sum;
+        }
 
         // Clip gradients
         grads.clip(config.grad_clip);
@@ -248,6 +372,11 @@ pub fn train_policy(
             / (episodes.len() * BUDGET) as f64;
         let avg_samples = episodes.iter().map(|e| e.samples_used as f64).sum::<f64>()
             / episodes.len() as f64;
+        let avg_classifier_loss = if config.use_classifier_heads {
+            total_classifier_loss / episodes.len() as f64
+        } else {
+            0.0
+        };
 
         let epoch_stats = EpochStats {
             epoch,
@@ -259,18 +388,56 @@ pub fn train_policy(
         stats.push(epoch_stats.clone());
 
         if (epoch + 1) % config.print_every == 0 || epoch == 0 {
-            println!(
-                "  Epoch {:3}: return={:.3}, reward={:.4}, grad_norm={:.4}, samples={:.1}",
-                epoch + 1,
-                avg_return,
-                avg_reward,
-                grad_norm,
-                avg_samples
-            );
+            if config.use_classifier_heads {
+                println!(
+                    "  Epoch {:3}: return={:.3}, clf_loss={:.3}, grad_norm={:.4}, samples={:.1}",
+                    epoch + 1,
+                    avg_return,
+                    avg_classifier_loss,
+                    grad_norm,
+                    avg_samples
+                );
+            } else {
+                println!(
+                    "  Epoch {:3}: return={:.3}, reward={:.4}, grad_norm={:.4}, samples={:.1}",
+                    epoch + 1,
+                    avg_return,
+                    avg_reward,
+                    grad_norm,
+                    avg_samples
+                );
+            }
         }
     }
 
     stats
+}
+
+/// Convert ExpectedClassification to ExpectedGeometry for classifier loss.
+fn expected_to_geometry(expected: &ExpectedClassification) -> ExpectedGeometry {
+    match expected {
+        ExpectedClassification::OnFace { expected_normal, .. } => {
+            ExpectedGeometry::Face {
+                normal: *expected_normal,
+            }
+        }
+        ExpectedClassification::OnEdge {
+            expected_normals,
+            expected_direction,
+            ..
+        } => {
+            ExpectedGeometry::Edge {
+                normal_a: expected_normals.0,
+                normal_b: expected_normals.1,
+                direction: *expected_direction,
+            }
+        }
+        ExpectedClassification::OnCorner { expected_normals, .. } => {
+            ExpectedGeometry::Corner {
+                normals: *expected_normals,
+            }
+        }
+    }
 }
 
 /// Evaluation result for a single point.

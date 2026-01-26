@@ -28,16 +28,34 @@ pub struct RewardConfig {
     pub lambda: f64,
     /// Scale factor for exponential decay (larger = sharper).
     pub surface_decay: f64,
+    /// Weight for entropy bonus (encourages diverse octant selection).
+    pub w_entropy: f64,
 }
 
 impl Default for RewardConfig {
     fn default() -> Self {
         Self {
-            w_surface: 0.1,      // Reduced - let terminal reward dominate
-            w_spread: 0.05,     // Reduced - was causing narrow-strip sampling
-            crossing_bonus: 0.0, // Disabled - was being reward hacked
-            lambda: 0.01,       // Small per-sample cost
+            w_surface: 0.2,      // Encourage sampling near surface
+            w_spread: 0.1,       // Encourage exploration
+            crossing_bonus: 0.5, // Strong bonus for finding crossings
+            lambda: 0.01,        // Small per-sample cost
             surface_decay: 5.0,
+            w_entropy: 0.0,      // Disabled by default
+        }
+    }
+}
+
+impl RewardConfig {
+    /// Config optimized for classifier head training.
+    /// Emphasizes exploration and crossing detection with entropy bonus.
+    pub fn for_classifier_training() -> Self {
+        Self {
+            w_surface: 0.15,     // Moderate surface proximity reward
+            w_spread: 0.1,       // Good exploration reward
+            crossing_bonus: 1.0, // Strong crossing bonus
+            lambda: 0.005,       // Lower per-sample cost
+            surface_decay: 4.0,  // Slightly softer decay
+            w_entropy: 0.1,      // Entropy bonus for action diversity
         }
     }
 }
@@ -83,6 +101,51 @@ pub fn compute_step_reward(
         + config.w_spread * spread_reward
         + crossing
         - config.lambda
+}
+
+/// Compute reward for a single sampling step with entropy bonus.
+///
+/// Extended version that includes entropy bonus from action probabilities.
+pub fn compute_step_reward_with_entropy(
+    sample_pos: (f64, f64, f64),
+    oracle_distance: f64,
+    prev_samples: &[(f64, f64, f64)],
+    is_crossing: bool,
+    cell_size: f64,
+    action_probs: &[f64],
+    config: &RewardConfig,
+) -> f64 {
+    let base_reward = compute_step_reward(
+        sample_pos,
+        oracle_distance,
+        prev_samples,
+        is_crossing,
+        cell_size,
+        config,
+    );
+
+    // Entropy bonus: -sum(p * log(p))
+    // Normalized by max entropy (log(n) for uniform distribution)
+    let entropy = compute_entropy(action_probs);
+    let max_entropy = (action_probs.len() as f64).ln();
+    let normalized_entropy = if max_entropy > 0.0 {
+        entropy / max_entropy
+    } else {
+        0.0
+    };
+
+    base_reward + config.w_entropy * normalized_entropy
+}
+
+/// Compute entropy of a probability distribution.
+fn compute_entropy(probs: &[f64]) -> f64 {
+    let mut entropy = 0.0;
+    for &p in probs {
+        if p > 1e-10 {
+            entropy -= p * p.ln();
+        }
+    }
+    entropy
 }
 
 /// Compute discounted returns from rewards.

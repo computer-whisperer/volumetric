@@ -56,13 +56,21 @@ fn main() {
 
     println!("Set {} label={:?}", index, set.label);
     println!("Vertex: {:?}", set.vertex);
-    println!("Hint: {:?}", set.hint_normal);
     if let Some(bounds) = &set.cell_bounds {
         println!("Cell bounds: min={:?} max={:?}", bounds.min, bounds.max);
     }
     println!("Points: {}", set.points.len());
     println!("Sample min: {:?}", min);
     println!("Sample max: {:?}", max);
+    if !set.vectors.is_empty() {
+        println!("Vectors: {}", set.vectors.len());
+        for v in &set.vectors {
+            println!("  {} @ {:?} -> {:?}", v.name, v.origin, v.direction);
+        }
+    }
+    if !set.triangles.is_empty() {
+        println!("Triangles: {}", set.triangles.len());
+    }
 }
 
 fn print_help() {

@@ -4,6 +4,7 @@
 //! combined with backpropagation through time for the GRU.
 
 use super::chooser::{chooser_backward_policy_gradient, ChooserGradients};
+use super::classifier_heads::ClassifierHeadGradients;
 use super::gru::{gru_backward, GruGradients, HIDDEN_DIM};
 use super::policy::{Episode, RnnPolicy, INPUT_DIM};
 use super::reward::{compute_advantages, compute_baseline, compute_returns};
@@ -13,6 +14,7 @@ use super::reward::{compute_advantages, compute_baseline, compute_returns};
 pub struct PolicyGradients {
     pub gru: GruGradients,
     pub chooser: ChooserGradients,
+    pub classifier_heads: ClassifierHeadGradients,
 }
 
 impl PolicyGradients {
@@ -21,6 +23,7 @@ impl PolicyGradients {
         Self {
             gru: GruGradients::zeros(INPUT_DIM),
             chooser: ChooserGradients::zeros(),
+            classifier_heads: ClassifierHeadGradients::zeros(),
         }
     }
 
@@ -28,18 +31,21 @@ impl PolicyGradients {
     pub fn add(&mut self, other: &PolicyGradients) {
         self.gru.add(&other.gru);
         self.chooser.add(&other.chooser);
+        self.classifier_heads.add(&other.classifier_heads);
     }
 
     /// Scale gradients.
     pub fn scale(&mut self, s: f64) {
         self.gru.scale(s);
         self.chooser.scale(s);
+        self.classifier_heads.scale(s);
     }
 
     /// Clip gradient norms.
     pub fn clip(&mut self, max_norm: f64) {
         self.gru.clip(max_norm);
         self.chooser.clip(max_norm);
+        self.classifier_heads.clip(max_norm);
     }
 
     /// Compute total gradient norm.
@@ -76,6 +82,25 @@ impl PolicyGradients {
             sum += v * v;
         }
         for &v in &self.chooser.db {
+            sum += v * v;
+        }
+        // Include classifier head gradients
+        for &v in &self.classifier_heads.face_dw {
+            sum += v * v;
+        }
+        for &v in &self.classifier_heads.face_db {
+            sum += v * v;
+        }
+        for &v in &self.classifier_heads.edge_dw {
+            sum += v * v;
+        }
+        for &v in &self.classifier_heads.edge_db {
+            sum += v * v;
+        }
+        for &v in &self.classifier_heads.corner_dw {
+            sum += v * v;
+        }
+        for &v in &self.classifier_heads.corner_db {
             sum += v * v;
         }
         sum.sqrt()

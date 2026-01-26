@@ -4,7 +4,7 @@ use eframe::egui;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use volumetric::sample_cloud::{SampleCloudDump, SampleCloudSet, SamplePointKind};
+use volumetric::sample_cloud::{ColoredTriangle, NamedVector, SampleCloudDump, SampleCloudSet, SamplePointKind};
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::fs;
@@ -945,6 +945,89 @@ fn build_sample_cloud_root(set: &SampleCloudSet) -> renderer::PointData {
             color: [1.0, 0.2, 0.4, 1.0],
         }],
     }
+}
+
+/// Build arrow lines from named vectors. Each vector renders as a shaft line with arrowhead.
+fn build_sample_cloud_vectors(vectors: &[NamedVector]) -> renderer::LineData {
+    // Default color palette for auto-assignment
+    const COLORS: [[f32; 4]; 6] = [
+        [1.0, 0.4, 0.4, 1.0], // Red
+        [0.4, 1.0, 0.4, 1.0], // Green
+        [0.4, 0.4, 1.0, 1.0], // Blue
+        [1.0, 1.0, 0.4, 1.0], // Yellow
+        [1.0, 0.4, 1.0, 1.0], // Magenta
+        [0.4, 1.0, 1.0, 1.0], // Cyan
+    ];
+
+    let mut segments = Vec::with_capacity(vectors.len() * 3); // shaft + 2 arrowhead lines
+
+    for (i, v) in vectors.iter().enumerate() {
+        let color = v.color.unwrap_or(COLORS[i % COLORS.len()]);
+        let origin = v.origin;
+        let dir = v.direction;
+
+        // Compute endpoint
+        let end = [origin[0] + dir[0], origin[1] + dir[1], origin[2] + dir[2]];
+
+        // Shaft line
+        segments.push(renderer::LineSegment {
+            start: origin,
+            end,
+            color,
+        });
+
+        // Arrowhead (two lines at ~20 degrees from the shaft)
+        let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+        if len > 1e-6 {
+            let arrow_len = len * 0.15; // Arrowhead is 15% of vector length
+            let norm = [dir[0] / len, dir[1] / len, dir[2] / len];
+
+            // Find a perpendicular vector
+            let perp = if norm[0].abs() < 0.9 {
+                let cross = [0.0, -norm[2], norm[1]];
+                let cross_len = (cross[1] * cross[1] + cross[2] * cross[2]).sqrt();
+                [cross[0] / cross_len, cross[1] / cross_len, cross[2] / cross_len]
+            } else {
+                let cross = [norm[2], 0.0, -norm[0]];
+                let cross_len = (cross[0] * cross[0] + cross[2] * cross[2]).sqrt();
+                [cross[0] / cross_len, cross[1] / cross_len, cross[2] / cross_len]
+            };
+
+            // Arrowhead vectors (angled back from tip)
+            let back = [-norm[0] * arrow_len * 0.866, -norm[1] * arrow_len * 0.866, -norm[2] * arrow_len * 0.866];
+            let side = [perp[0] * arrow_len * 0.5, perp[1] * arrow_len * 0.5, perp[2] * arrow_len * 0.5];
+
+            segments.push(renderer::LineSegment {
+                start: end,
+                end: [end[0] + back[0] + side[0], end[1] + back[1] + side[1], end[2] + back[2] + side[2]],
+                color,
+            });
+            segments.push(renderer::LineSegment {
+                start: end,
+                end: [end[0] + back[0] - side[0], end[1] + back[1] - side[1], end[2] + back[2] - side[2]],
+                color,
+            });
+        }
+    }
+
+    renderer::LineData { segments }
+}
+
+/// Build wireframe lines from colored triangles.
+fn build_sample_cloud_triangles(triangles: &[ColoredTriangle]) -> renderer::LineData {
+    let mut segments = Vec::with_capacity(triangles.len() * 3);
+
+    for tri in triangles {
+        let [v0, v1, v2] = tri.vertices;
+        let color = tri.color;
+
+        // Three edges of the triangle
+        segments.push(renderer::LineSegment { start: v0, end: v1, color });
+        segments.push(renderer::LineSegment { start: v1, end: v2, color });
+        segments.push(renderer::LineSegment { start: v2, end: v0, color });
+    }
+
+    renderer::LineData { segments }
 }
 
 /// Build line segments for a bounding box wireframe (12 edges).
@@ -4204,6 +4287,32 @@ impl eframe::App for VolumetricApp {
                         depth_mode: renderer::DepthMode::Normal,
                     },
                 );
+                // Render named vectors as arrows
+                if !set.vectors.is_empty() {
+                    scene.add_lines(
+                        build_sample_cloud_vectors(&set.vectors),
+                        glam::Mat4::IDENTITY,
+                        renderer::LineStyle {
+                            width: 2.0,
+                            width_mode: renderer::WidthMode::ScreenSpace,
+                            pattern: renderer::LinePattern::Solid,
+                            depth_mode: renderer::DepthMode::Normal,
+                        },
+                    );
+                }
+                // Render colored triangles as wireframe
+                if !set.triangles.is_empty() {
+                    scene.add_lines(
+                        build_sample_cloud_triangles(&set.triangles),
+                        glam::Mat4::IDENTITY,
+                        renderer::LineStyle {
+                            width: 1.5,
+                            width_mode: renderer::WidthMode::ScreenSpace,
+                            pattern: renderer::LinePattern::Solid,
+                            depth_mode: renderer::DepthMode::Normal,
+                        },
+                    );
+                }
             };
 
             let add_sample_cloud_cell_bounds = |scene: &mut renderer::SceneData, set: &SampleCloudSet| {

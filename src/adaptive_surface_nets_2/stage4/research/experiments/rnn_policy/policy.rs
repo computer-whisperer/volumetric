@@ -11,9 +11,10 @@ use super::chooser::{
     chooser_forward, octant_corners, position_from_probs, sample_categorical, ChooserCache,
     ChooserWeights,
 };
+use super::classifier_heads::{ClassifierHeads, ClassifierPredictions};
 use super::gru::{gru_forward, GruCache, GruWeights, Rng, HIDDEN_DIM};
 use super::math::argmax;
-use super::reward::{compute_step_reward, RewardConfig};
+use super::reward::{compute_step_reward_with_entropy, RewardConfig};
 
 /// Input dimension for the GRU.
 /// Features: prev_offset(3), in_out_sign(1), budget_remaining(1), crossings_found(1)
@@ -25,11 +26,12 @@ pub const BUDGET: usize = 50;
 /// Cell size for research experiments.
 pub const CELL_SIZE: f64 = 0.05;
 
-/// RNN Policy combining GRU and Chooser head.
+/// RNN Policy combining GRU, Chooser head, and Classifier heads.
 #[derive(Clone)]
 pub struct RnnPolicy {
     pub gru: GruWeights,
     pub chooser: ChooserWeights,
+    pub classifier_heads: ClassifierHeads,
 }
 
 impl RnnPolicy {
@@ -38,12 +40,18 @@ impl RnnPolicy {
         Self {
             gru: GruWeights::new(INPUT_DIM, rng),
             chooser: ChooserWeights::new(rng),
+            classifier_heads: ClassifierHeads::new(rng),
         }
     }
 
     /// Total number of parameters.
     pub fn param_count(&self) -> usize {
-        self.gru.param_count() + self.chooser.param_count()
+        self.gru.param_count() + self.chooser.param_count() + self.classifier_heads.param_count()
+    }
+
+    /// Run classifier heads on the given hidden state.
+    pub fn classify(&self, hidden: &[f64]) -> ClassifierPredictions {
+        self.classifier_heads.forward(hidden)
     }
 
     /// Save policy weights to a file.
@@ -51,9 +59,9 @@ impl RnnPolicy {
         use std::io::Write;
         let mut file = std::fs::File::create(path)?;
 
-        // Write magic and version
+        // Write magic and version (bump to v2 for classifier heads)
         file.write_all(b"RNNP")?;
-        file.write_all(&1u32.to_le_bytes())?;
+        file.write_all(&2u32.to_le_bytes())?;
 
         // Write dimensions
         file.write_all(&(INPUT_DIM as u32).to_le_bytes())?;
@@ -83,12 +91,22 @@ impl RnnPolicy {
         write_vec(&mut file, &self.chooser.w)?;
         write_vec(&mut file, &self.chooser.b)?;
 
+        // Classifier head weights (v2+)
+        write_vec(&mut file, &self.classifier_heads.face.w)?;
+        write_vec(&mut file, &self.classifier_heads.face.b)?;
+        write_vec(&mut file, &self.classifier_heads.edge.w)?;
+        write_vec(&mut file, &self.classifier_heads.edge.b)?;
+        write_vec(&mut file, &self.classifier_heads.corner.w)?;
+        write_vec(&mut file, &self.classifier_heads.corner.b)?;
+
         Ok(())
     }
 
     /// Load policy weights from a file.
     pub fn load(path: &std::path::Path) -> std::io::Result<Self> {
         use std::io::Read;
+        use super::classifier_heads::{HeadWeights, FACE_HEAD_OUTPUTS, EDGE_HEAD_OUTPUTS, CORNER_HEAD_OUTPUTS};
+
         let mut file = std::fs::File::open(path)?;
 
         // Read and verify magic
@@ -105,7 +123,7 @@ impl RnnPolicy {
         let mut version = [0u8; 4];
         file.read_exact(&mut version)?;
         let version = u32::from_le_bytes(version);
-        if version != 1 {
+        if version != 1 && version != 2 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("Unsupported RNN policy version: {}", version),
@@ -158,6 +176,38 @@ impl RnnPolicy {
         let chooser_w = read_vec(&mut file)?;
         let chooser_b = read_vec(&mut file)?;
 
+        // Classifier head weights (v2+), or initialize randomly for v1
+        let classifier_heads = if version >= 2 {
+            let face_w = read_vec(&mut file)?;
+            let face_b = read_vec(&mut file)?;
+            let edge_w = read_vec(&mut file)?;
+            let edge_b = read_vec(&mut file)?;
+            let corner_w = read_vec(&mut file)?;
+            let corner_b = read_vec(&mut file)?;
+
+            ClassifierHeads {
+                face: HeadWeights {
+                    w: face_w,
+                    b: face_b,
+                    output_dim: FACE_HEAD_OUTPUTS,
+                },
+                edge: HeadWeights {
+                    w: edge_w,
+                    b: edge_b,
+                    output_dim: EDGE_HEAD_OUTPUTS,
+                },
+                corner: HeadWeights {
+                    w: corner_w,
+                    b: corner_b,
+                    output_dim: CORNER_HEAD_OUTPUTS,
+                },
+            }
+        } else {
+            // v1 file: initialize classifier heads randomly
+            let mut rng = Rng::new(42);
+            ClassifierHeads::new(&mut rng)
+        };
+
         Ok(Self {
             gru: GruWeights {
                 input_dim: INPUT_DIM,
@@ -175,6 +225,7 @@ impl RnnPolicy {
                 w: chooser_w,
                 b: chooser_b,
             },
+            classifier_heads,
         })
     }
 }
@@ -219,6 +270,8 @@ pub struct Episode {
     pub inside_flags: Vec<bool>,
     /// Initial hidden state.
     pub h_init: Vec<f64>,
+    /// Final hidden state (for classifier heads).
+    pub h_final: Vec<f64>,
     /// Terminal reward (classifier-based, computed after episode).
     pub terminal_reward: f64,
 }
@@ -320,8 +373,20 @@ pub fn run_episode_ex(
 
         // Compute sample position
         let sample_pos = if use_discrete || stochastic {
-            // Use discrete corner (required for training, optional for eval)
-            corners[action]
+            // Use discrete corner with jitter during training
+            let base = corners[action];
+            if stochastic {
+                // Add small random jitter to break cache degeneracy
+                // Jitter is ~5% of cell size to stay near the corner
+                let jitter_scale = CELL_SIZE * 0.05;
+                (
+                    base.0 + (rng.next_f64() - 0.5) * jitter_scale,
+                    base.1 + (rng.next_f64() - 0.5) * jitter_scale,
+                    base.2 + (rng.next_f64() - 0.5) * jitter_scale,
+                )
+            } else {
+                base
+            }
         } else {
             // Use weighted average for smoother behavior
             position_from_probs(&probs, &corners)
@@ -346,13 +411,14 @@ pub fn run_episode_ex(
         let closest = cube.closest_surface_point(sample_pos);
         let oracle_distance = closest.distance;
 
-        // Compute reward
-        let reward = compute_step_reward(
+        // Compute reward with entropy bonus
+        let reward = compute_step_reward_with_entropy(
             sample_pos,
             oracle_distance,
             &samples,
             is_crossing,
             CELL_SIZE,
+            &probs,
             reward_config,
         );
 
@@ -380,6 +446,7 @@ pub fn run_episode_ex(
         final_samples: samples,
         inside_flags,
         h_init,
+        h_final: h,
         terminal_reward: 0.0, // Computed later by training loop
     }
 }
@@ -443,8 +510,13 @@ mod tests {
         // With INPUT_DIM=6, HIDDEN_DIM=32, NUM_OCTANTS=8:
         // GRU: 3 * (32*6 + 32*32 + 32) = 3 * (192 + 1024 + 32) = 3 * 1248 = 3744
         // Chooser: 8*32 + 8 = 264
-        // Total: 4008
-        assert!(count > 3500 && count < 4500, "param_count={}", count);
+        // Classifier heads:
+        //   Face: 4*32 + 4 = 132
+        //   Edge: 10*32 + 10 = 330
+        //   Corner: 10*32 + 10 = 330
+        //   Total: 792
+        // Grand total: 3744 + 264 + 792 = 4800
+        assert!(count > 4500 && count < 5200, "param_count={}", count);
     }
 
     #[test]

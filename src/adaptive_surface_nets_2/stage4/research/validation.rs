@@ -57,6 +57,69 @@ pub enum ExpectedClassification {
     },
 }
 
+impl ExpectedClassification {
+    /// Apply a rotation matrix to all normals/directions in this classification.
+    ///
+    /// Used for data augmentation during training to prevent overfitting
+    /// to specific normal directions.
+    pub fn rotate(&self, rotation: &[[f64; 3]; 3]) -> Self {
+        match self {
+            ExpectedClassification::OnFace {
+                face_index,
+                expected_normal,
+            } => ExpectedClassification::OnFace {
+                face_index: *face_index,
+                expected_normal: apply_rotation(rotation, *expected_normal),
+            },
+            ExpectedClassification::OnEdge {
+                edge_index,
+                expected_direction,
+                expected_normals,
+            } => ExpectedClassification::OnEdge {
+                edge_index: *edge_index,
+                expected_direction: apply_rotation(rotation, *expected_direction),
+                expected_normals: (
+                    apply_rotation(rotation, expected_normals.0),
+                    apply_rotation(rotation, expected_normals.1),
+                ),
+            },
+            ExpectedClassification::OnCorner {
+                corner_index,
+                expected_normals,
+            } => ExpectedClassification::OnCorner {
+                corner_index: *corner_index,
+                expected_normals: [
+                    apply_rotation(rotation, expected_normals[0]),
+                    apply_rotation(rotation, expected_normals[1]),
+                    apply_rotation(rotation, expected_normals[2]),
+                ],
+            },
+        }
+    }
+}
+
+impl ValidationPoint {
+    /// Apply a rotation matrix to both the position and expected classification.
+    ///
+    /// Used for data augmentation during training.
+    pub fn rotate(&self, rotation: &[[f64; 3]; 3]) -> Self {
+        ValidationPoint {
+            position: apply_rotation(rotation, self.position),
+            expected: self.expected.rotate(rotation),
+            description: self.description.clone(),
+        }
+    }
+}
+
+/// Apply a 3x3 rotation matrix to a 3D vector.
+fn apply_rotation(m: &[[f64; 3]; 3], v: (f64, f64, f64)) -> (f64, f64, f64) {
+    (
+        m[0][0] * v.0 + m[0][1] * v.1 + m[0][2] * v.2,
+        m[1][0] * v.0 + m[1][1] * v.1 + m[1][2] * v.2,
+        m[2][0] * v.0 + m[2][1] * v.1 + m[2][2] * v.2,
+    )
+}
+
 /// Result of validating surface detection at a point
 #[derive(Clone, Debug)]
 pub struct SurfaceValidationResult {

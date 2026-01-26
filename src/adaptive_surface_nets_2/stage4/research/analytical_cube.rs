@@ -209,6 +209,97 @@ impl AnalyticalRotatedCube {
         Self::new(rx_deg, 45.0, 0.0)
     }
 
+    /// Create from an arbitrary 3x3 rotation matrix.
+    ///
+    /// The matrix should be orthogonal (R^T R = I) with determinant +1.
+    /// This is useful for random rotation augmentation during training.
+    pub fn from_rotation_matrix(rotation_matrix: [[f64; 3]; 3]) -> Self {
+        // Inverse is transpose for rotation matrices
+        let inverse_rotation = [
+            [
+                rotation_matrix[0][0],
+                rotation_matrix[1][0],
+                rotation_matrix[2][0],
+            ],
+            [
+                rotation_matrix[0][1],
+                rotation_matrix[1][1],
+                rotation_matrix[2][1],
+            ],
+            [
+                rotation_matrix[0][2],
+                rotation_matrix[1][2],
+                rotation_matrix[2][2],
+            ],
+        ];
+
+        // Original face normals (unit cube faces)
+        let original_normals = [
+            (1.0, 0.0, 0.0),  // +X face
+            (-1.0, 0.0, 0.0), // -X face
+            (0.0, 1.0, 0.0),  // +Y face
+            (0.0, -1.0, 0.0), // -Y face
+            (0.0, 0.0, 1.0),  // +Z face
+            (0.0, 0.0, -1.0), // -Z face
+        ];
+
+        // Apply rotation to each normal
+        let mut face_normals = [(0.0, 0.0, 0.0); 6];
+        for (i, &n) in original_normals.iter().enumerate() {
+            face_normals[i] = Self::apply_matrix(&rotation_matrix, n);
+        }
+
+        // Face offsets are all 0.5 for unit cube
+        let face_offsets = [0.5; 6];
+
+        // Original corner positions
+        let h = 0.5;
+        let original_corners = [
+            (-h, -h, -h),
+            (h, -h, -h),
+            (-h, h, -h),
+            (h, h, -h),
+            (-h, -h, h),
+            (h, -h, h),
+            (-h, h, h),
+            (h, h, h),
+        ];
+
+        let mut corners = [(0.0, 0.0, 0.0); 8];
+        for (i, &c) in original_corners.iter().enumerate() {
+            corners[i] = Self::apply_matrix(&rotation_matrix, c);
+        }
+
+        let edge_corner_pairs = [
+            (0, 1),
+            (2, 3),
+            (4, 5),
+            (6, 7),
+            (0, 2),
+            (1, 3),
+            (4, 6),
+            (5, 7),
+            (0, 4),
+            (1, 5),
+            (2, 6),
+            (3, 7),
+        ];
+
+        Self {
+            face_normals,
+            face_offsets,
+            corners,
+            edge_corner_pairs,
+            rotation_matrix,
+            inverse_rotation,
+        }
+    }
+
+    /// Get the rotation matrix for this cube.
+    pub fn get_rotation_matrix(&self) -> [[f64; 3]; 3] {
+        self.rotation_matrix
+    }
+
     /// Apply a 3x3 matrix to a vector
     fn apply_matrix(m: &[[f64; 3]; 3], v: (f64, f64, f64)) -> (f64, f64, f64) {
         (

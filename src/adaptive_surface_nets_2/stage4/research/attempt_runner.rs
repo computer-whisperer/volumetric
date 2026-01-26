@@ -153,8 +153,10 @@ pub fn dump_attempt_sample_cloud(attempt: u8, output_path: &std::path::Path) {
         };
 
         let samples = end_sample_recording();
-        let mut set = SampleCloudSet::new(idx as u64, to_f32(point.position), to_f32(hint));
+        let mut set = SampleCloudSet::new(idx as u64, to_f32(point.position));
         set.label = Some(format!("{}: {}", attempt_name, point.description));
+        // Add hint normal as a named vector for visualization
+        set.add_vector("hint", to_f32(point.position), to_f32(hint), Some([0.5, 0.5, 1.0, 1.0]));
         set.points = samples;
         set.meta.samples_used = Some(result.samples_used);
         dump.add_set(set);

@@ -428,6 +428,52 @@ impl Rng {
     pub fn next_range(&mut self, scale: f64) -> f64 {
         (self.next_f64() * 2.0 - 1.0) * scale
     }
+
+    /// Generate a Gaussian random number (mean=0, std=1) using Box-Muller transform.
+    pub fn next_gaussian(&mut self) -> f64 {
+        // Box-Muller transform
+        let u1 = self.next_f64().max(1e-10); // Avoid log(0)
+        let u2 = self.next_f64();
+        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+    }
+
+    /// Generate a uniform random rotation matrix (uniform on SO(3)).
+    ///
+    /// Uses the quaternion method: sample 4 Gaussians, normalize to unit quaternion,
+    /// then convert to rotation matrix.
+    pub fn next_rotation_matrix(&mut self) -> [[f64; 3]; 3] {
+        // Sample 4 Gaussian values for quaternion (w, x, y, z)
+        let w = self.next_gaussian();
+        let x = self.next_gaussian();
+        let y = self.next_gaussian();
+        let z = self.next_gaussian();
+
+        // Normalize to unit quaternion
+        let len = (w * w + x * x + y * y + z * z).sqrt();
+        let (w, x, y, z) = if len > 1e-10 {
+            (w / len, x / len, y / len, z / len)
+        } else {
+            (1.0, 0.0, 0.0, 0.0) // Fallback to identity
+        };
+
+        // Convert quaternion to rotation matrix
+        // https://www.euclideanspace.com/maths/geometry/rotations/conversions/quaternionToMatrix/
+        let xx = x * x;
+        let yy = y * y;
+        let zz = z * z;
+        let xy = x * y;
+        let xz = x * z;
+        let yz = y * z;
+        let wx = w * x;
+        let wy = w * y;
+        let wz = w * z;
+
+        [
+            [1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy)],
+            [2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx)],
+            [2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy)],
+        ]
+    }
 }
 
 /// Generate random vector with values in [-scale, scale].
@@ -484,5 +530,68 @@ mod tests {
         let count = weights.param_count();
         // 3 * (32*10 + 32*32 + 32) = 3 * (320 + 1024 + 32) = 3 * 1376 = 4128
         assert_eq!(count, 3 * (HIDDEN_DIM * input_dim + HIDDEN_DIM * HIDDEN_DIM + HIDDEN_DIM));
+    }
+
+    #[test]
+    fn test_rotation_matrix_is_valid() {
+        let mut rng = Rng::new(12345);
+
+        // Generate several random rotation matrices and verify properties
+        for _ in 0..10 {
+            let r = rng.next_rotation_matrix();
+
+            // Check that R^T * R = I (orthogonality)
+            let mut rtc = [[0.0; 3]; 3];
+            for i in 0..3 {
+                for j in 0..3 {
+                    for k in 0..3 {
+                        rtc[i][j] += r[k][i] * r[k][j]; // R^T * R
+                    }
+                }
+            }
+
+            // Should be identity
+            for i in 0..3 {
+                for j in 0..3 {
+                    let expected = if i == j { 1.0 } else { 0.0 };
+                    assert!(
+                        (rtc[i][j] - expected).abs() < 1e-10,
+                        "R^T * R not identity at [{},{}]: got {}",
+                        i, j, rtc[i][j]
+                    );
+                }
+            }
+
+            // Check determinant is +1 (proper rotation, not reflection)
+            let det = r[0][0] * (r[1][1] * r[2][2] - r[1][2] * r[2][1])
+                    - r[0][1] * (r[1][0] * r[2][2] - r[1][2] * r[2][0])
+                    + r[0][2] * (r[1][0] * r[2][1] - r[1][1] * r[2][0]);
+            assert!(
+                (det - 1.0).abs() < 1e-10,
+                "Determinant should be 1, got {}",
+                det
+            );
+        }
+    }
+
+    #[test]
+    fn test_rotation_preserves_length() {
+        let mut rng = Rng::new(42);
+        let r = rng.next_rotation_matrix();
+
+        // Apply rotation to a unit vector
+        let v = (1.0, 0.0, 0.0);
+        let rv = (
+            r[0][0] * v.0 + r[0][1] * v.1 + r[0][2] * v.2,
+            r[1][0] * v.0 + r[1][1] * v.1 + r[1][2] * v.2,
+            r[2][0] * v.0 + r[2][1] * v.1 + r[2][2] * v.2,
+        );
+
+        let len = (rv.0 * rv.0 + rv.1 * rv.1 + rv.2 * rv.2).sqrt();
+        assert!(
+            (len - 1.0).abs() < 1e-10,
+            "Rotation should preserve length, got {}",
+            len
+        );
     }
 }
