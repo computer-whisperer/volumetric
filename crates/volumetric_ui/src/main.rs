@@ -4,6 +4,7 @@ use eframe::egui;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use volumetric::sample_cloud::{SampleCloudDump, SampleCloudSet, SamplePointKind};
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::fs;
@@ -779,6 +780,29 @@ impl ExportRenderMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SampleCloudViewMode {
+    Overlay,
+    Split,
+    CloudOnly,
+}
+
+impl SampleCloudViewMode {
+    const ALL: [SampleCloudViewMode; 3] = [
+        SampleCloudViewMode::Overlay,
+        SampleCloudViewMode::Split,
+        SampleCloudViewMode::CloudOnly,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            SampleCloudViewMode::Overlay => "Overlay",
+            SampleCloudViewMode::Split => "Split",
+            SampleCloudViewMode::CloudOnly => "Cloud Only",
+        }
+    }
+}
+
 /// A triangle in 3D space
 
 /// Per-asset render data for multi-entity rendering support.
@@ -878,6 +902,33 @@ fn format_anyhow_error_chain(e: &anyhow::Error) -> String {
     parts.join("\n")
 }
 
+fn build_sample_cloud_points(set: &SampleCloudSet) -> renderer::PointData {
+    let mut points = Vec::with_capacity(set.points.len());
+    for point in &set.points {
+        let color = match point.kind {
+            SamplePointKind::Crossing => [0.2, 1.0, 0.4, 0.95],
+            SamplePointKind::Inside => [1.0, 0.8, 0.2, 0.95],
+            SamplePointKind::Outside => [1.0, 0.4, 0.2, 0.95],
+            SamplePointKind::Probe => [0.2, 0.8, 1.0, 0.85],
+            SamplePointKind::Unknown => [0.7, 0.7, 0.7, 0.85],
+        };
+        points.push(renderer::PointInstance {
+            position: point.position,
+            color,
+        });
+    }
+    renderer::PointData { points }
+}
+
+fn build_sample_cloud_root(set: &SampleCloudSet) -> renderer::PointData {
+    renderer::PointData {
+        points: vec![renderer::PointInstance {
+            position: set.vertex,
+            color: [1.0, 0.2, 0.4, 1.0],
+        }],
+    }
+}
+
 /// Application state for the volumetric renderer
 pub struct VolumetricApp {
     /// The current project (contains the model pipeline)
@@ -923,6 +974,20 @@ pub struct VolumetricApp {
     edit_vec_inputs: HashMap<usize, (bool, Vec<f64>, Option<String>)>,
     /// Whether to automatically rebuild the project when entries change
     auto_rebuild: bool,
+
+    /// Loaded sample cloud dump (optional)
+    sample_cloud: Option<SampleCloudDump>,
+    /// Selected sample cloud set index
+    sample_cloud_set_index: usize,
+    /// Sample cloud visualization mode
+    sample_cloud_mode: SampleCloudViewMode,
+    /// Sample cloud point size in pixels
+    sample_cloud_point_size: f32,
+    /// Whether to render the sample cloud
+    sample_cloud_enabled: bool,
+    /// Path to sample cloud file (native only)
+    #[cfg(not(target_arch = "wasm32"))]
+    sample_cloud_path: Option<PathBuf>,
 
     // Shading
     ssao_enabled: bool,
@@ -1071,6 +1136,14 @@ impl VolumetricApp {
             edit_output_asset_id: String::new(),
             edit_vec_inputs: HashMap::new(),
             auto_rebuild: true,
+
+            sample_cloud: None,
+            sample_cloud_set_index: 0,
+            sample_cloud_mode: SampleCloudViewMode::Overlay,
+            sample_cloud_point_size: 5.0,
+            sample_cloud_enabled: true,
+            #[cfg(not(target_arch = "wasm32"))]
+            sample_cloud_path: None,
 
             ssao_enabled: true,
             ssao_radius: 0.08,
@@ -1598,6 +1671,11 @@ impl VolumetricApp {
         let y = self.camera_radius * self.camera_phi.cos();
         let z = self.camera_radius * self.camera_phi.sin() * self.camera_theta.sin();
         (x, y, z)
+    }
+
+    fn selected_sample_cloud_set(&self) -> Option<&SampleCloudSet> {
+        let dump = self.sample_cloud.as_ref()?;
+        dump.sets.get(self.sample_cloud_set_index)
     }
 
     #[allow(dead_code)]
@@ -2466,6 +2544,62 @@ impl eframe::App for VolumetricApp {
                             self.camera_phi = std::f32::consts::FRAC_PI_4;
                             self.camera_radius = 4.0;
                             self.camera_target = glam::Vec3::ZERO;
+                        }
+
+                        ui.separator();
+                        ui.label("Sample Cloud");
+                        #[cfg(not(target_arch = "wasm32"))]
+                        if ui.button("Load Sample Cloud…").clicked() {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("Sample Cloud", &["cbor"])
+                                .pick_file()
+                            {
+                                match SampleCloudDump::load(&path) {
+                                    Ok(dump) => {
+                                        self.sample_cloud = Some(dump);
+                                        self.sample_cloud_set_index = 0;
+                                        self.sample_cloud_path = Some(path);
+                                        self.error_message = None;
+                                    }
+                                    Err(e) => {
+                                        self.error_message = Some(format!("Failed to load sample cloud: {e}"));
+                                    }
+                                }
+                            }
+                        }
+
+                        if let Some(ref dump) = self.sample_cloud {
+                            ui.checkbox(&mut self.sample_cloud_enabled, "Show sample cloud");
+                            let set_count = dump.sets.len();
+                            if set_count > 0 {
+                                let max_index = set_count.saturating_sub(1);
+                                ui.add(
+                                    egui::Slider::new(&mut self.sample_cloud_set_index, 0..=max_index)
+                                        .text("Set index"),
+                                );
+                                if let Some(set) = dump.sets.get(self.sample_cloud_set_index) {
+                                    let label = set.label.as_deref().unwrap_or("(unnamed)");
+                                    ui.weak(format!("id={} • {}", set.id, label));
+                                    ui.weak(format!("points={}", set.points.len()));
+                                }
+                            } else {
+                                ui.weak("No sample sets found");
+                            }
+
+                            egui::ComboBox::from_label("View")
+                                .selected_text(self.sample_cloud_mode.label())
+                                .show_ui(ui, |ui| {
+                                    for mode in SampleCloudViewMode::ALL {
+                                        ui.selectable_value(&mut self.sample_cloud_mode, mode, mode.label());
+                                    }
+                                });
+
+                            ui.add(
+                                egui::Slider::new(&mut self.sample_cloud_point_size, 1.0..=16.0)
+                                    .text("Point size"),
+                            );
+                        } else {
+                            ui.weak("No sample cloud loaded");
                         }
 
                         // Project file operations (native only - uses filesystem)
@@ -3856,38 +3990,102 @@ impl eframe::App for VolumetricApp {
                 (rect.height() * pixels_per_point).round().max(1.0) as u32,
             ];
 
+            let sample_set = if self.sample_cloud_enabled {
+                self.selected_sample_cloud_set()
+            } else {
+                None
+            };
+            let split_view = self.sample_cloud_mode == SampleCloudViewMode::Split && sample_set.is_some();
+
             let mut scene = renderer::SceneData::new();
+            let mut scene_right = if split_view {
+                Some(renderer::SceneData::new())
+            } else {
+                None
+            };
 
-            // Add point clouds from assets
-            for asset_data in self.asset_render_data.values() {
-                if asset_data.mode == ExportRenderMode::PointCloud && !asset_data.points.is_empty() {
-                    scene.add_points(
-                        renderer::convert_points_to_point_data(&asset_data.points),
-                        glam::Mat4::IDENTITY,
-                        renderer::PointStyle {
-                            size: 3.0,
-                            size_mode: renderer::WidthMode::ScreenSpace,
-                            shape: renderer::PointShape::Circle,
-                            depth_mode: renderer::DepthMode::Normal,
-                        },
-                    );
+            let add_asset_points = |scene: &mut renderer::SceneData, asset_render_data: &HashMap<String, AssetRenderData>| {
+                for asset_data in asset_render_data.values() {
+                    if asset_data.mode == ExportRenderMode::PointCloud && !asset_data.points.is_empty() {
+                        scene.add_points(
+                            renderer::convert_points_to_point_data(&asset_data.points),
+                            glam::Mat4::IDENTITY,
+                            renderer::PointStyle {
+                                size: 3.0,
+                                size_mode: renderer::WidthMode::ScreenSpace,
+                                shape: renderer::PointShape::Circle,
+                                depth_mode: renderer::DepthMode::Normal,
+                            },
+                        );
+                    }
                 }
-            }
+            };
 
-            // Add meshes from assets
-            for asset_data in self.asset_render_data.values() {
-                if matches!(asset_data.mode,
-                    ExportRenderMode::MarchingCubes |
-                    ExportRenderMode::AdaptiveSurfaceNets2
-                ) && !asset_data.mesh_vertices.is_empty() {
-                    scene.add_mesh(
-                        renderer::convert_mesh_data(
-                            &asset_data.mesh_vertices,
-                            asset_data.mesh_indices.as_ref().map(|v| v.as_slice()),
-                        ),
-                        glam::Mat4::IDENTITY,
-                        renderer::MaterialId(0),
-                    );
+            let add_asset_meshes = |scene: &mut renderer::SceneData, asset_render_data: &HashMap<String, AssetRenderData>| {
+                for asset_data in asset_render_data.values() {
+                    if matches!(asset_data.mode,
+                        ExportRenderMode::MarchingCubes |
+                        ExportRenderMode::AdaptiveSurfaceNets2
+                    ) && !asset_data.mesh_vertices.is_empty() {
+                        scene.add_mesh(
+                            renderer::convert_mesh_data(
+                                &asset_data.mesh_vertices,
+                                asset_data.mesh_indices.as_ref().map(|v| v.as_slice()),
+                            ),
+                            glam::Mat4::IDENTITY,
+                            renderer::MaterialId(0),
+                        );
+                    }
+                }
+            };
+
+            let add_sample_cloud = |scene: &mut renderer::SceneData, set: &SampleCloudSet, size: f32| {
+                scene.add_points(
+                    build_sample_cloud_points(set),
+                    glam::Mat4::IDENTITY,
+                    renderer::PointStyle {
+                        size,
+                        size_mode: renderer::WidthMode::ScreenSpace,
+                        shape: renderer::PointShape::Circle,
+                        depth_mode: renderer::DepthMode::Normal,
+                    },
+                );
+                scene.add_points(
+                    build_sample_cloud_root(set),
+                    glam::Mat4::IDENTITY,
+                    renderer::PointStyle {
+                        size: size * 1.6,
+                        size_mode: renderer::WidthMode::ScreenSpace,
+                        shape: renderer::PointShape::Diamond,
+                        depth_mode: renderer::DepthMode::Normal,
+                    },
+                );
+            };
+
+            if split_view {
+                add_asset_points(&mut scene, &self.asset_render_data);
+                add_asset_meshes(&mut scene, &self.asset_render_data);
+                if let Some(set) = sample_set {
+                    if let Some(ref mut right_scene) = scene_right {
+                        add_sample_cloud(right_scene, set, self.sample_cloud_point_size);
+                    }
+                }
+            } else {
+                match self.sample_cloud_mode {
+                    SampleCloudViewMode::CloudOnly if sample_set.is_some() => {
+                        if let Some(set) = sample_set {
+                            add_sample_cloud(&mut scene, set, self.sample_cloud_point_size);
+                        }
+                    }
+                    _ => {
+                        add_asset_points(&mut scene, &self.asset_render_data);
+                        add_asset_meshes(&mut scene, &self.asset_render_data);
+                        if self.sample_cloud_mode == SampleCloudViewMode::Overlay {
+                            if let Some(set) = sample_set {
+                                add_sample_cloud(&mut scene, set, self.sample_cloud_point_size);
+                            }
+                        }
+                    }
                 }
             }
 
@@ -3914,20 +4112,69 @@ impl eframe::App for VolumetricApp {
                 background_color: [0.098, 0.098, 0.149, 1.0], // rgb(25,25,38)
             };
 
-            // Always render the scene (grid, axis indicator render even with no models)
-            let cb = eframe::egui_wgpu::Callback::new_paint_callback(
-                rect,
-                renderer::SceneCallback {
-                    data: renderer::SceneDrawData {
-                        scene: scene.clone(),
-                        camera,
-                        settings,
-                        viewport_size: viewport_size_px,
-                        target_format: self.wgpu_target_format,
+            if split_view {
+                let left_rect = egui::Rect::from_min_size(
+                    rect.min,
+                    egui::vec2(rect.width() * 0.5, rect.height()),
+                );
+                let right_rect = egui::Rect::from_min_size(
+                    egui::pos2(left_rect.max.x, rect.min.y),
+                    egui::vec2(rect.width() * 0.5, rect.height()),
+                );
+                let left_size = [
+                    (left_rect.width() * pixels_per_point).round().max(1.0) as u32,
+                    (left_rect.height() * pixels_per_point).round().max(1.0) as u32,
+                ];
+                let right_size = [
+                    (right_rect.width() * pixels_per_point).round().max(1.0) as u32,
+                    (right_rect.height() * pixels_per_point).round().max(1.0) as u32,
+                ];
+
+                let cb_left = eframe::egui_wgpu::Callback::new_paint_callback(
+                    left_rect,
+                    renderer::SceneCallback {
+                        data: renderer::SceneDrawData {
+                            scene: scene.clone(),
+                            camera: camera.clone(),
+                            settings: settings.clone(),
+                            viewport_size: left_size,
+                            target_format: self.wgpu_target_format,
+                        },
                     },
-                },
-            );
-            painter.add(egui::Shape::Callback(cb));
+                );
+                painter.add(egui::Shape::Callback(cb_left));
+
+                if let Some(right_scene) = scene_right {
+                    let cb_right = eframe::egui_wgpu::Callback::new_paint_callback(
+                        right_rect,
+                        renderer::SceneCallback {
+                            data: renderer::SceneDrawData {
+                                scene: right_scene,
+                                camera,
+                                settings,
+                                viewport_size: right_size,
+                                target_format: self.wgpu_target_format,
+                            },
+                        },
+                    );
+                    painter.add(egui::Shape::Callback(cb_right));
+                }
+            } else {
+                // Always render the scene (grid, axis indicator render even with no models)
+                let cb = eframe::egui_wgpu::Callback::new_paint_callback(
+                    rect,
+                    renderer::SceneCallback {
+                        data: renderer::SceneDrawData {
+                            scene: scene.clone(),
+                            camera,
+                            settings,
+                            viewport_size: viewport_size_px,
+                            target_format: self.wgpu_target_format,
+                        },
+                    },
+                );
+                painter.add(egui::Shape::Callback(cb));
+            }
 
             // Draw info text showing totals across all rendered assets
             let total_points: usize = self.asset_render_data.values()

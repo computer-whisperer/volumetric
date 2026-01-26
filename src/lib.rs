@@ -7,6 +7,7 @@ use anyhow::Context;
 // wasmtime imports are now used through the wasm module
 
 pub mod wasm;
+pub mod sample_cloud;
 
 /// A triangle in 3D space with vertices and per-vertex normal vectors.
 #[derive(Clone, Debug, PartialEq)]

@@ -322,17 +322,17 @@ impl HeadlessRenderer {
         })
     }
 
-    /// Render mesh to PNG with optional grid overlay and wireframe mode
-    pub fn render_to_png(
+    /// Render mesh to an in-memory image with optional overlays.
+    pub fn render_to_image(
         &self,
         vertices: &[MeshVertex],
         indices: &[u32],
         uniforms: &Uniforms,
         background_color: [f32; 3],
         grid_vertices: Option<&[GridVertex]>,
+        extra_lines: Option<&[GridVertex]>,
         wireframe: Option<&WireframeOptions>,
-        output_path: &Path,
-    ) -> Result<()> {
+    ) -> Result<image::RgbaImage> {
         // Create mesh vertex and index buffers
         let vertex_buffer = self
             .device
@@ -372,6 +372,16 @@ impl HeadlessRenderer {
                 })
         });
         let wireframe_vertex_count = wireframe_verts.as_ref().map(|wv| wv.len() as u32).unwrap_or(0);
+
+        let extra_buffer = extra_lines.map(|lines| {
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Extra Line Vertex Buffer"),
+                    contents: bytemuck::cast_slice(lines),
+                    usage: wgpu::BufferUsages::VERTEX,
+                })
+        });
+        let extra_vertex_count = extra_lines.map(|lines| lines.len() as u32).unwrap_or(0);
 
         // Create uniform buffer
         let uniform_buffer = self
@@ -498,6 +508,13 @@ impl HeadlessRenderer {
                 render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 render_pass.draw_indexed(0..indices.len() as u32, 0, 0..1);
             }
+
+            if let Some(ref eb) = extra_buffer {
+                render_pass.set_pipeline(&self.grid_pipeline);
+                render_pass.set_bind_group(0, &bind_group, &[]);
+                render_pass.set_vertex_buffer(0, eb.slice(..));
+                render_pass.draw(0..extra_vertex_count, 0..1);
+            }
         }
 
         // Copy texture to buffer
@@ -552,6 +569,31 @@ impl HeadlessRenderer {
         let img: image::RgbaImage =
             image::ImageBuffer::from_raw(self.width, self.height, pixels)
                 .context("Failed to create image buffer")?;
+
+        Ok(img)
+    }
+
+    /// Render mesh to PNG with optional grid overlay and wireframe mode
+    pub fn render_to_png(
+        &self,
+        vertices: &[MeshVertex],
+        indices: &[u32],
+        uniforms: &Uniforms,
+        background_color: [f32; 3],
+        grid_vertices: Option<&[GridVertex]>,
+        extra_lines: Option<&[GridVertex]>,
+        wireframe: Option<&WireframeOptions>,
+        output_path: &Path,
+    ) -> Result<()> {
+        let img = self.render_to_image(
+            vertices,
+            indices,
+            uniforms,
+            background_color,
+            grid_vertices,
+            extra_lines,
+            wireframe,
+        )?;
 
         img.save(output_path)
             .context("Failed to save PNG")?;

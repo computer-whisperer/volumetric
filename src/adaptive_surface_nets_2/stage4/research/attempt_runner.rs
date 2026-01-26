@@ -10,7 +10,9 @@ use super::attempt_0::{CrossingCountConfig, GeometryType, VertexGeometry};
 use super::attempt_1::{Attempt1Config, Attempt1Diag};
 use super::attempt_2::{Attempt2Config, Attempt2Diag};
 use super::experiments::hermite_microgrid::{hermite_edge_from_microgrid, HermiteMicrogridConfig};
-use super::sample_cache::SampleCache;
+use super::experiments::ml_policy::run_ml_policy_experiment;
+use super::sample_cache::{begin_sample_recording, end_sample_recording, SampleCache};
+use crate::sample_cloud::{SampleCloudDump, SampleCloudSet};
 use super::validation::{generate_validation_points, ExpectedClassification, ValidationPoint};
 
 pub fn run_attempt_0_benchmark() {
@@ -92,6 +94,71 @@ pub fn run_attempt_2_benchmark() {
     }
 }
 
+pub fn dump_attempt_sample_cloud(attempt: u8, output_path: &std::path::Path) {
+    let cube = AnalyticalRotatedCube::standard_test_cube();
+    let points = generate_validation_points(&cube);
+    let mut dump = SampleCloudDump::new();
+
+    let attempt_name = match attempt {
+        0 => "attempt0",
+        1 => "attempt1",
+        2 => "attempt2",
+        _ => "attempt",
+    };
+
+    for (idx, point) in points.iter().enumerate() {
+        let sampler = |x: f64, y: f64, z: f64| -> f32 {
+            let local = cube.world_to_local((x, y, z));
+            let h = 0.5;
+            if local.0.abs() <= h && local.1.abs() <= h && local.2.abs() <= h {
+                1.0
+            } else {
+                -1.0
+            }
+        };
+
+        let cache = SampleCache::new(|x, y, z| sampler(x, y, z));
+        let hint = hint_normal(point.expected.clone());
+        begin_sample_recording();
+
+        let result = match attempt {
+            0 => {
+                let config = CrossingCountConfig::default();
+                super::attempt_0::process_vertex(point.position, hint, 1.0, &cache, &config)
+            }
+            1 => {
+                let config = Attempt1Config::default();
+                super::attempt_1::process_vertex(point.position, hint, 1.0, &cache, &config)
+            }
+            2 => {
+                let config = Attempt2Config::default();
+                super::attempt_2::process_vertex(point.position, hint, 1.0, &cache, &config)
+            }
+            _ => {
+                let config = CrossingCountConfig::default();
+                super::attempt_0::process_vertex(point.position, hint, 1.0, &cache, &config)
+            }
+        };
+
+        let samples = end_sample_recording();
+        let mut set = SampleCloudSet::new(idx as u64, to_f32(point.position), to_f32(hint));
+        set.label = Some(format!("{}: {}", attempt_name, point.description));
+        set.points = samples;
+        set.meta.samples_used = Some(result.samples_used);
+        dump.add_set(set);
+    }
+
+    if let Err(err) = dump.save(output_path) {
+        eprintln!("Failed to write sample cloud: {err}");
+    } else {
+        println!(
+            "Wrote {} sample sets to {}",
+            dump.sets.len(),
+            output_path.display()
+        );
+    }
+}
+
 pub fn run_hermite_microgrid_experiment() {
     let kmeans = HermiteMicrogridConfig::default();
     let mut ransac = HermiteMicrogridConfig::default();
@@ -109,6 +176,10 @@ pub fn run_hermite_microgrid_experiment() {
     run_hermite_microgrid_experiment_with_config("Hermite Microgrid (RANSAC)", &ransac);
     run_hermite_microgrid_experiment_with_config("Hermite Microgrid (edge-aligned k-means)", &edge_aligned);
     run_hermite_microgrid_experiment_with_config("Hermite Microgrid (edge-line RANSAC)", &line_ransac);
+}
+
+pub fn run_ml_policy_experiment_runner() {
+    run_ml_policy_experiment();
 }
 
 
@@ -672,6 +743,23 @@ fn edge_direction_error(dir: (f64, f64, f64), expected: (f64, f64, f64)) -> f64 
     e1.min(e2)
 }
 
+fn hint_normal(expected: ExpectedClassification) -> (f64, f64, f64) {
+    match expected {
+        ExpectedClassification::OnFace { expected_normal, .. } => expected_normal,
+        ExpectedClassification::OnEdge { expected_normals, .. } => {
+            normalize(add(expected_normals.0, expected_normals.1))
+        }
+        ExpectedClassification::OnCorner { expected_normals, .. } => normalize(add(
+            add(expected_normals[0], expected_normals[1]),
+            expected_normals[2],
+        )),
+    }
+}
+
+fn to_f32(v: (f64, f64, f64)) -> [f32; 3] {
+    [v.0 as f32, v.1 as f32, v.2 as f32]
+}
+
 fn normalize(v: (f64, f64, f64)) -> (f64, f64, f64) {
     let len = length(v);
     if len > 1e-12 {
@@ -719,6 +807,11 @@ mod tests {
     #[test]
     fn experiment_hermite_microgrid() {
         run_hermite_microgrid_experiment();
+    }
+
+    #[test]
+    fn experiment_ml_policy_mvp() {
+        run_ml_policy_experiment_runner();
     }
 
 }

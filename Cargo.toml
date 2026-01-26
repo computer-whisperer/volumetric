@@ -46,6 +46,7 @@ edge-diagnostic = []
 wasmtime = { version = "27", optional = true }
 anyhow = "1"
 serde = { version="1.0.228", features = ["derive"] }
+serde_cbor = "0.11"
 wasmparser = "0.219"
 thiserror = "2"
 ciborium = "0.2"

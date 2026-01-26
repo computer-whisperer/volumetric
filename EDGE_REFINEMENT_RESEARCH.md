@@ -96,3 +96,6 @@ mixing face populations and/or using unreliable crossing directions.
 
 2026-01-25 17:20 EST - Retired the crossing-cone experiment (code removed) to
 reduce clutter; results retained above for reference.
+
+2026-01-25 18:40 EST - Added ML sampling MVP notes in `ML_SAMPLING_APPROACH.md`
+and sample cloud debug notes in `SAMPLE_CLOUD_DEBUG.md` for ongoing work.

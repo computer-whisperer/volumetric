@@ -3,9 +3,11 @@
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use glam::Vec3;
+use image::RgbaImage;
 use std::path::PathBuf;
 
 use volumetric::generate_adaptive_mesh_v2_from_bytes;
+use volumetric::sample_cloud::{SampleCloudDump, SampleCloudSet, SamplePointKind};
 
 use crate::camera::{parse_views, CameraSetup, ProjectionType, ViewAngle};
 use crate::headless_renderer::{GridVertex, HeadlessRenderer, MeshVertex, Uniforms, WireframeOptions};
@@ -17,6 +19,13 @@ pub enum ProjectionArg {
     #[default]
     Perspective,
     Ortho,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum SampleCloudMode {
+    Overlay,
+    Split,
+    CloudOnly,
 }
 
 #[derive(Parser, Debug)]
@@ -138,6 +147,34 @@ pub struct RenderArgs {
     /// Far clipping plane distance (default: auto-computed from scene)
     #[arg(long)]
     pub far: Option<f32>,
+
+    /// Sample cloud CBOR file to render alongside the model
+    #[arg(long)]
+    pub sample_cloud: Option<PathBuf>,
+
+    /// Sample cloud set index to render (0-based)
+    #[arg(long)]
+    pub sample_cloud_set: Option<usize>,
+
+    /// Sample cloud set id to render (matches SampleCloudSet.id)
+    #[arg(long)]
+    pub sample_cloud_id: Option<u64>,
+
+    /// How to render the sample cloud
+    #[arg(long, value_enum, default_value = "overlay")]
+    pub sample_cloud_mode: SampleCloudMode,
+
+    /// Sample cloud cross size as a fraction of scene size
+    #[arg(long, default_value = "0.02")]
+    pub sample_cloud_size: f32,
+
+    /// Sample cloud point color as hex (e.g., 33ccff)
+    #[arg(long, default_value = "33ccff")]
+    pub sample_cloud_color: String,
+
+    /// Sample cloud vertex color as hex (e.g., ff3366)
+    #[arg(long, default_value = "ff3366")]
+    pub sample_cloud_vertex_color: String,
 }
 
 fn parse_hex_color(hex: &str) -> Result<[f32; 3]> {
@@ -479,6 +516,20 @@ pub fn run_render(args: RenderArgs) -> Result<()> {
     let scene_size = (bounds_max - bounds_min).length();
     let center = (bounds_min + bounds_max) * 0.5;
 
+    let sample_cloud = load_sample_cloud_set(
+        args.sample_cloud.as_ref(),
+        args.sample_cloud_set,
+        args.sample_cloud_id,
+    )?;
+
+    let sample_lines = sample_cloud.as_ref().map(|set| {
+        let cross_size = args.sample_cloud_size * scene_size;
+        let sample_color = parse_hex_color(&args.sample_cloud_color).unwrap_or([0.2, 0.8, 1.0]);
+        let vertex_color =
+            parse_hex_color(&args.sample_cloud_vertex_color).unwrap_or([1.0, 0.2, 0.4]);
+        sample_cloud_to_lines(set, cross_size, sample_color, vertex_color)
+    });
+
     // Render based on camera mode
     if use_custom_camera {
         // Custom camera mode - single output
@@ -512,13 +563,16 @@ pub fn run_render(args: RenderArgs) -> Result<()> {
             fog_start: scene_size * 0.5,
         };
 
-        renderer.render_to_png(
+        render_with_sample_cloud(
+            &renderer,
             &gpu_vertices,
             &mesh_result.indices,
             &uniforms,
             background_color,
             grid_vertices.as_deref(),
             wireframe_options.as_ref(),
+            sample_lines.as_deref(),
+            args.sample_cloud_mode,
             &args.output,
         )?;
     } else {
@@ -545,13 +599,16 @@ pub fn run_render(args: RenderArgs) -> Result<()> {
                 fog_start: scene_size * 0.5,
             };
 
-            renderer.render_to_png(
+            render_with_sample_cloud(
+                &renderer,
                 &gpu_vertices,
                 &mesh_result.indices,
                 &uniforms,
                 background_color,
                 grid_vertices.as_deref(),
                 wireframe_options.as_ref(),
+                sample_lines.as_deref(),
+                args.sample_cloud_mode,
                 &output_path,
             )?;
         }
@@ -559,4 +616,171 @@ pub fn run_render(args: RenderArgs) -> Result<()> {
 
     println!("Done!");
     Ok(())
+}
+
+fn load_sample_cloud_set(
+    path: Option<&PathBuf>,
+    index: Option<usize>,
+    id: Option<u64>,
+) -> Result<Option<SampleCloudSet>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+
+    let dump = SampleCloudDump::load(path)?;
+    if let Some(id) = id {
+        let set = dump
+            .sets
+            .into_iter()
+            .find(|set| set.id == id)
+            .context(format!("Sample cloud set id {} not found", id))?;
+        return Ok(Some(set));
+    }
+
+    let idx = index.unwrap_or(0);
+    let set = dump
+        .sets
+        .into_iter()
+        .nth(idx)
+        .context(format!("Sample cloud set index {} not found", idx))?;
+    Ok(Some(set))
+}
+
+fn sample_cloud_to_lines(
+    set: &SampleCloudSet,
+    size: f32,
+    sample_color: [f32; 3],
+    vertex_color: [f32; 3],
+) -> Vec<GridVertex> {
+    let mut lines = Vec::new();
+    let vertex_size = size * 1.6;
+    add_cross(&mut lines, set.vertex, vertex_size, vertex_color);
+
+    for point in &set.points {
+        let color = match point.kind {
+            SamplePointKind::Crossing => [0.2, 1.0, 0.4],
+            SamplePointKind::Inside => [1.0, 0.8, 0.2],
+            SamplePointKind::Outside => [1.0, 0.4, 0.2],
+            SamplePointKind::Probe => sample_color,
+            SamplePointKind::Unknown => sample_color,
+        };
+        add_cross(&mut lines, point.position, size, color);
+    }
+
+    lines
+}
+
+fn add_cross(lines: &mut Vec<GridVertex>, pos: [f32; 3], size: f32, color: [f32; 3]) {
+    let offsets = [
+        ([size, 0.0, 0.0], [-size, 0.0, 0.0]),
+        ([0.0, size, 0.0], [0.0, -size, 0.0]),
+        ([0.0, 0.0, size], [0.0, 0.0, -size]),
+    ];
+
+    for (a, b) in offsets {
+        let start = [
+            pos[0] + a[0],
+            pos[1] + a[1],
+            pos[2] + a[2],
+        ];
+        let end = [
+            pos[0] + b[0],
+            pos[1] + b[1],
+            pos[2] + b[2],
+        ];
+
+        lines.push(GridVertex {
+            position: start,
+            _pad0: 0.0,
+            color,
+            _pad1: 0.0,
+        });
+        lines.push(GridVertex {
+            position: end,
+            _pad0: 0.0,
+            color,
+            _pad1: 0.0,
+        });
+    }
+}
+
+fn render_with_sample_cloud(
+    renderer: &HeadlessRenderer,
+    vertices: &[MeshVertex],
+    indices: &[u32],
+    uniforms: &Uniforms,
+    background_color: [f32; 3],
+    grid_vertices: Option<&[GridVertex]>,
+    wireframe: Option<&WireframeOptions>,
+    sample_lines: Option<&[GridVertex]>,
+    mode: SampleCloudMode,
+    output_path: &PathBuf,
+) -> Result<()> {
+    match mode {
+        SampleCloudMode::Overlay => renderer.render_to_png(
+            vertices,
+            indices,
+            uniforms,
+            background_color,
+            grid_vertices,
+            sample_lines,
+            wireframe,
+            output_path,
+        ),
+        SampleCloudMode::CloudOnly => renderer.render_to_png(
+            vertices,
+            &[],
+            uniforms,
+            background_color,
+            None,
+            sample_lines,
+            None,
+            output_path,
+        ),
+        SampleCloudMode::Split => {
+            let left = renderer.render_to_image(
+                vertices,
+                indices,
+                uniforms,
+                background_color,
+                grid_vertices,
+                None,
+                wireframe,
+            )?;
+            let right = renderer.render_to_image(
+                vertices,
+                &[],
+                uniforms,
+                background_color,
+                None,
+                sample_lines,
+                None,
+            )?;
+            let combined = compose_side_by_side(&left, &right);
+            combined.save(output_path).context("Failed to save PNG")?;
+            Ok(())
+        }
+    }
+}
+
+fn compose_side_by_side(left: &RgbaImage, right: &RgbaImage) -> RgbaImage {
+    let width = left.width() + right.width();
+    let height = left.height().max(right.height());
+    let mut img = RgbaImage::new(width, height);
+
+    for y in 0..left.height() {
+        for x in 0..left.width() {
+            let px = left.get_pixel(x, y);
+            img.put_pixel(x, y, *px);
+        }
+    }
+
+    for y in 0..right.height() {
+        for x in 0..right.width() {
+            let px = right.get_pixel(x, y);
+            img.put_pixel(x + left.width(), y, *px);
+        }
+    }
+
+    img
 }

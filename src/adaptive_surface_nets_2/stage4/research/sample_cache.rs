@@ -10,6 +10,35 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+use crate::sample_cloud::{SamplePoint, SamplePointKind};
+
+thread_local! {
+    static SAMPLE_RECORDER: RefCell<Option<Vec<SamplePoint>>> = RefCell::new(None);
+}
+
+pub fn begin_sample_recording() {
+    SAMPLE_RECORDER.with(|recorder| {
+        *recorder.borrow_mut() = Some(Vec::new());
+    });
+}
+
+pub fn end_sample_recording() -> Vec<SamplePoint> {
+    SAMPLE_RECORDER
+        .with(|recorder| recorder.borrow_mut().take())
+        .unwrap_or_default()
+}
+
+fn record_sample_point(position: (f64, f64, f64), kind: SamplePointKind) {
+    SAMPLE_RECORDER.with(|recorder| {
+        if let Some(ref mut points) = *recorder.borrow_mut() {
+            points.push(SamplePoint {
+                position: [position.0 as f32, position.1 as f32, position.2 as f32],
+                kind,
+            });
+        }
+    });
+}
+
 /// Statistics about cache usage
 #[derive(Clone, Debug, Default)]
 pub struct SampleCacheStats {
@@ -94,6 +123,14 @@ where
         // Check cache
         if let Some(&value) = self.cache.borrow().get(&key) {
             stats.hits += 1;
+            record_sample_point(
+                (x, y, z),
+                if value > 0.0 {
+                    SamplePointKind::Inside
+                } else {
+                    SamplePointKind::Outside
+                },
+            );
             return value;
         }
 
@@ -101,6 +138,14 @@ where
         stats.misses += 1;
         let value = (self.sampler)(x, y, z);
         self.cache.borrow_mut().insert(key, value);
+        record_sample_point(
+            (x, y, z),
+            if value > 0.0 {
+                SamplePointKind::Inside
+            } else {
+                SamplePointKind::Outside
+            },
+        );
         value
     }
 
@@ -263,6 +308,7 @@ where
                 + (crossing.2 - start.2).powi(2))
             .sqrt();
 
+            record_sample_point(crossing, SamplePointKind::Crossing);
             return Some((crossing, dist));
         }
 
