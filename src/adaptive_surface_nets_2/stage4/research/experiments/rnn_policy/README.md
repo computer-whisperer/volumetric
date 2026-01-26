@@ -88,6 +88,8 @@ The sampling cell is a cube of side `cell_size` centered on the control vertex.
 
 ## Reward Structure
 
+### Per-Step Reward
+
 Each sampling step receives a reward:
 
 ```
@@ -97,20 +99,52 @@ reward = W_SURFACE × exp(-oracle_dist/cell_size × decay)  // Surface proximity
        - LAMBDA                                            // Per-sample cost
 ```
 
-**Note:** The reward uses oracle distance (analytical ground truth) to shape learning. This is acceptable because:
-- The reward is the training signal, not a policy input
-- The policy must learn to achieve high reward using only its clean inputs
-- Once trained, the policy generalizes without needing oracle access
+### Terminal Reward (Classifier-Based)
 
-### Default Parameters
+At episode end, samples are evaluated by running the appropriate RANSAC classifier
+based on the oracle label (face/edge/corner):
+
+```
+terminal_reward = W_FIT_SUCCESS (if fit succeeded)
+                + W_RESIDUAL × (1 - normalized_residual)
+                + W_NORMAL_ACCURACY × (1 - normalized_normal_error)
+                + [edge only] W_EDGE_DIRECTION × (1 - normalized_direction_error)
+                + [corner only] completeness_bonus (if 3 planes found)
+```
+
+The terminal reward encourages the policy to collect samples that:
+1. Allow successful geometry fitting (face/edge/corner detection)
+2. Produce low residuals (samples tightly fit the expected geometry)
+3. Yield accurate normals relative to oracle ground truth
+
+**Training flow:**
+1. Policy collects samples during episode (only clean inputs used)
+2. At episode end, oracle label determines which classifier to run
+3. Classifier fit quality contributes to terminal reward
+4. Policy learns to sample in ways that produce good classifier fits
+
+### Default Parameters (v4)
+
+**Per-step:** (reduced to let terminal reward dominate)
 
 | Parameter | Value | Purpose |
 |-----------|-------|---------|
-| W_SURFACE | 1.0 | Weight for surface proximity |
-| W_SPREAD | 0.3 | Weight for spatial exploration |
-| crossing_bonus | 0.5 | Bonus for finding in/out transition |
-| LAMBDA | 0.02 | Per-sample cost (encourages efficiency) |
+| W_SURFACE | 0.1 | Weight for surface proximity (reduced) |
+| W_SPREAD | 0.05 | Weight for spatial exploration (reduced) |
+| crossing_bonus | 0.0 | **Disabled** - was causing reward hacking |
+| LAMBDA | 0.01 | Per-sample cost |
 | surface_decay | 5.0 | Exponential decay rate |
+
+**Terminal:** (boosted to be dominant factor)
+
+| Parameter | Value | Purpose |
+|-----------|-------|---------|
+| W_FIT_SUCCESS | 1.0 | Small bonus for successful fit |
+| W_RESIDUAL | 5.0 | Weight for residual quality |
+| W_NORMAL_ACCURACY | 20.0 | **Dominant**: accuracy vs oracle normals |
+| W_EDGE_DIRECTION | 5.0 | Weight for edge direction accuracy |
+| max_residual | 0.1 | Max expected residual (relative to cell_size) |
+| max_normal_error | 45.0 | Max expected normal error (degrees) |
 
 ## Training
 
@@ -143,32 +177,94 @@ reward = W_SURFACE × exp(-oracle_dist/cell_size × decay)  // Surface proximity
 - Random 3D offset within `0.2 × cell_size` of surface (easier start)
 - Deterministic seed for reproducibility
 
-## Results (v2 - 2026-01-26)
+## Results (v4 - 2026-01-26)
 
-### Training Progress (6000 epochs, ~3.5 min)
+### Classification Fit Rates by Geometry Type
 
-| Metric | Epoch 1 | Epoch 3000 | Epoch 6000 |
-|--------|---------|------------|------------|
-| Return | 22.0 | 29.7 | 33.3 |
-| Reward/step | 0.44 | 0.59 | 0.67 |
-| Gradient norm | 2.0 | 2.4 | 3.3 |
-| Samples used | 8 | 5 | 5 |
+| Geometry | Before Training | After Training |
+|----------|-----------------|----------------|
+| Face | 0% (0/12) | **41.7%** (5/12) |
+| Edge | 0% (0/24) | 0% (0/24) |
+| Corner | 0% (0/16) | 0% (0/16) |
+| **Overall** | 0% | **9.6%** |
 
-**Key improvements:**
-- Return increased 50% (22 → 33)
-- Still learning at 6000 epochs (gradients healthy)
-- More sample-efficient (8 → 5 samples)
+### Fit Quality (when fits succeed)
 
-### Sample Exploration
+| Metric | Value |
+|--------|-------|
+| Normal accuracy reward | 1.556 (of max 20) |
+| Residual reward | ~0.3 (of max 5) |
+| Avg crossings/episode | 2.2 |
+| Avg surface points | 67 (face), 38 (edge), 43 (corner) |
+
+### Key Findings
+
+1. **Faces work well**: 42% fit rate with reasonable normal accuracy
+2. **Edges/corners fail**: 0% fit rate despite having 38-43 outside samples
+3. **Root cause identified**: Outside samples cluster on ONE face, not spread across multiple faces needed for edge/corner fitting
+
+### Sample Exploration (improved from v2)
 
 | Version | Sample Spread per Axis |
 |---------|----------------------|
-| v1 (before) | ~0.001 (degenerate) |
-| v2 (after) | ~0.05 (full cell) |
-
-The policy learned to explore the entire cell volume instead of clustering in a tiny region.
+| v1 | ~0.001 (degenerate) |
+| v2 | ~0.05 (full cell) |
+| v3 | ~0.003 (reward hacking - narrow strip) |
+| v4 | ~0.04 (recovered after fixing rewards) |
 
 ## Changelog
+
+### v4 (2026-01-26) - Reward Rebalancing & Edge/Corner Investigation
+
+**Problem identified: Reward hacking**
+- Policy learned to alternate samples across surface in a narrow strip
+- This maximized crossing bonus while producing degenerate geometry
+- Samples had ~0.003 spread on one axis (collapsed to a line)
+
+**Reward structure overhauled:**
+- **Disabled** crossing_bonus (was being exploited)
+- **Reduced** per-step rewards (w_surface: 1.0→0.1, w_spread: 0.3→0.05)
+- **Boosted** terminal reward to dominate (w_normal_accuracy: 3→20)
+
+**Evaluation metric fixed:**
+- Removed broken RANSAC discrimination (tried to classify face/edge/corner from samples alone)
+- Now uses oracle-selected classifier and reports fit quality metrics
+- Tracks: fit_rate, normal_accuracy, residual_quality per geometry type
+
+**Edge/corner classification approach:**
+- For faces: use midpoints of inside/outside pairs (works well)
+- For edges/corners: use raw outside samples directly (they lie on actual face planes)
+- Relaxed RANSAC thresholds: inlier 10%→20%, parallel check 0.95→0.85
+
+**Current status:**
+- Faces: 42% fit rate, good normal accuracy ✓
+- Edges: 0% fit rate - samples cluster on one face, not both
+- Corners: 0% fit rate - same issue, samples don't span all three faces
+
+**Next steps to investigate:**
+- Why do outside samples cluster on one face instead of spreading across adjacent faces?
+- May need geometry-aware exploration reward or curriculum learning
+
+### v3 (2026-01-26) - Classifier-Based Terminal Reward
+
+**Added classifier module (`classifier.rs`):**
+- `fit_face_from_samples()` - RANSAC single-plane fit
+- `fit_edge_from_samples()` - RANSAC two-plane fit
+- `fit_corner_from_samples()` - RANSAC three-plane fit
+- Error metrics: `normal_error_degrees()`, `best_edge_normal_errors()`, `best_corner_normal_errors()`
+
+**Terminal reward integration:**
+- `TerminalRewardConfig` for classifier-based reward weights
+- `compute_terminal_reward()` evaluates samples against oracle label
+- Episode struct now tracks `inside_flags` and `terminal_reward`
+- Training loop computes terminal reward and adds to last step
+
+**Training configuration:**
+- New `use_terminal_reward` flag (default: true)
+- New `terminal_reward` config block
+
+This enables the policy to learn sampling strategies that produce good
+classifier fits, not just samples near the surface.
 
 ### v2 (2026-01-26) - Major Refactor
 
@@ -210,7 +306,8 @@ rnn_policy/
 ├── chooser.rs      # Octant weights → position mapping
 ├── policy.rs       # RnnPolicy struct, episode rollout, input building
 ├── gradients.rs    # BPTT gradient computation
-├── reward.rs       # Reward function
+├── reward.rs       # Per-step + terminal reward functions
+├── classifier.rs   # RANSAC classifiers for face/edge/corner fitting
 ├── training.rs     # Adam optimizer, training loop, evaluation
 └── README.md       # This file
 ```
@@ -244,17 +341,24 @@ cargo run --release --bin sample_cloud_inspect -- --file samples.cbor --set 0
 
 ## Future Work
 
+### Immediate (Edge/Corner Classification)
+1. **Investigate sample clustering**: Why do outside samples cluster on one face?
+   - Visualize sample distributions for edge/corner vertices
+   - Check if policy is biased toward certain octants
+2. **Geometry-aware exploration**: Add reward for sampling on multiple faces
+   - Could use dot product of sample directions to encourage diversity
+   - Or partial credit for finding samples on different faces
+3. **Curriculum learning**: Train on faces first, then gradually add edges/corners
+
 ### Short-term
-1. **Better classifier**: Replace oracle-based placeholder with actual geometry fitting from samples
-2. **Scale up offset**: Gradually increase validation offset toward full cell_size
-3. **More shapes**: Train on cylinder, chamfered box, CSG combinations
-4. **Early stopping**: End episodes when sufficient crossings found
+1. **Scale up offset**: Gradually increase validation offset toward full cell_size
+2. **More shapes**: Train on cylinder, chamfered box, CSG combinations
+3. **Early stopping**: End episodes when sufficient quality achieved
 
 ### Medium-term
-1. **Curriculum learning**: Start with faces, add edges, then corners
-2. **Entropy bonus**: Regularization to maintain exploration
-3. **Larger capacity**: Try hidden_dim=64 or 128
-4. **Attention**: Consider transformer architecture for sample history
+1. **Entropy bonus**: Regularization to maintain exploration
+2. **Larger capacity**: Try hidden_dim=64 or 128
+3. **Attention**: Consider transformer architecture for sample history
 
 ### Long-term
 1. **Integration**: Replace sampling in actual surface nets algorithm

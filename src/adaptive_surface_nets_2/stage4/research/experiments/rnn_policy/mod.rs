@@ -33,6 +33,7 @@
 //! ```
 
 pub mod chooser;
+pub mod classifier;
 pub mod gradients;
 pub mod gru;
 pub mod math;
@@ -142,39 +143,49 @@ fn print_breakdown(eval: &EvaluationResult) {
         ))
         .collect();
 
-    let face_correct = face_points.iter().filter(|p| p.correct).count();
-    let edge_correct = edge_points.iter().filter(|p| p.correct).count();
-    let corner_correct = corner_points.iter().filter(|p| p.correct).count();
+    // Report fit success rate, normal accuracy, and surface point counts per category
+    fn category_stats(points: &[&training::PointEvaluation]) -> (usize, f64, f64) {
+        let fit_count = points.iter().filter(|p| p.fit_success).count();
+        let avg_normal = if points.is_empty() {
+            0.0
+        } else {
+            points.iter().map(|p| p.normal_reward).sum::<f64>() / points.len() as f64
+        };
+        let avg_surface_pts = if points.is_empty() {
+            0.0
+        } else {
+            points.iter().map(|p| p.surface_points_count as f64).sum::<f64>() / points.len() as f64
+        };
+        (fit_count, avg_normal, avg_surface_pts)
+    }
+
+    let (face_fit, face_normal, face_surface) = category_stats(&face_points);
+    let (edge_fit, edge_normal, edge_surface) = category_stats(&edge_points);
+    let (corner_fit, corner_normal, corner_surface) = category_stats(&corner_points);
 
     println!(
-        "  Face:   {}/{} correct ({:.1}%)",
-        face_correct,
+        "  Face:   {}/{} fit ({:.1}%), normal={:.3}, surface_pts={:.1}",
+        face_fit,
         face_points.len(),
-        if face_points.is_empty() {
-            0.0
-        } else {
-            face_correct as f64 / face_points.len() as f64 * 100.0
-        }
+        if face_points.is_empty() { 0.0 } else { face_fit as f64 / face_points.len() as f64 * 100.0 },
+        face_normal,
+        face_surface
     );
     println!(
-        "  Edge:   {}/{} correct ({:.1}%)",
-        edge_correct,
+        "  Edge:   {}/{} fit ({:.1}%), normal={:.3}, surface_pts={:.1}",
+        edge_fit,
         edge_points.len(),
-        if edge_points.is_empty() {
-            0.0
-        } else {
-            edge_correct as f64 / edge_points.len() as f64 * 100.0
-        }
+        if edge_points.is_empty() { 0.0 } else { edge_fit as f64 / edge_points.len() as f64 * 100.0 },
+        edge_normal,
+        edge_surface
     );
     println!(
-        "  Corner: {}/{} correct ({:.1}%)",
-        corner_correct,
+        "  Corner: {}/{} fit ({:.1}%), normal={:.3}, surface_pts={:.1}",
+        corner_fit,
         corner_points.len(),
-        if corner_points.is_empty() {
-            0.0
-        } else {
-            corner_correct as f64 / corner_points.len() as f64 * 100.0
-        }
+        if corner_points.is_empty() { 0.0 } else { corner_fit as f64 / corner_points.len() as f64 * 100.0 },
+        corner_normal,
+        corner_surface
     );
 
     // Average crossings found
@@ -207,6 +218,7 @@ pub fn train_and_save_rnn_policy(model_path: &Path) {
     // Evaluate before training
     let eval_before = evaluate_policy(&policy, &cube, &points, &reward_config, &mut rng);
     println!("Before training: {}", eval_before.summary("Random"));
+    print_breakdown(&eval_before);
 
     // Train
     println!("\nTraining (6000 epochs)...");
@@ -221,6 +233,7 @@ pub fn train_and_save_rnn_policy(model_path: &Path) {
     // Evaluate after training
     let eval_after = evaluate_policy(&policy, &cube, &points, &reward_config, &mut rng);
     println!("\nAfter training: {}", eval_after.summary("Trained"));
+    print_breakdown(&eval_after);
 
     // Save
     if let Err(e) = policy.save(model_path) {

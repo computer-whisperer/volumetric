@@ -215,8 +215,12 @@ pub struct Episode {
     pub samples_used: u64,
     /// Final accumulated samples.
     pub final_samples: Vec<(f64, f64, f64)>,
+    /// Inside/outside flags for each sample (for terminal reward).
+    pub inside_flags: Vec<bool>,
     /// Initial hidden state.
     pub h_init: Vec<f64>,
+    /// Terminal reward (classifier-based, computed after episode).
+    pub terminal_reward: f64,
 }
 
 /// Run a single episode with the policy.
@@ -278,6 +282,7 @@ pub fn run_episode_ex(
     let mut h = vec![0.0; HIDDEN_DIM];
     let h_init = h.clone();
     let mut samples: Vec<(f64, f64, f64)> = Vec::new();
+    let mut inside_flags: Vec<bool> = Vec::new();
     let mut steps = Vec::new();
     let mut rewards = Vec::new();
     let mut prev_inside: Option<bool> = None;
@@ -352,6 +357,7 @@ pub fn run_episode_ex(
         );
 
         samples.push(sample_pos);
+        inside_flags.push(is_inside);
         rewards.push(reward);
         steps.push(EpisodeStep {
             input,
@@ -372,7 +378,9 @@ pub fn run_episode_ex(
         rewards,
         samples_used: cache.stats().actual_samples(),
         final_samples: samples,
+        inside_flags,
         h_init,
+        terminal_reward: 0.0, // Computed later by training loop
     }
 }
 
@@ -425,6 +433,7 @@ fn build_input(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adaptive_surface_nets_2::stage4::research::validation::ExpectedClassification;
 
     #[test]
     fn test_policy_param_count() {

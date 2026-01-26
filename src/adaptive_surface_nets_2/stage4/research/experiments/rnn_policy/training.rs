@@ -11,7 +11,7 @@ use crate::adaptive_surface_nets_2::stage4::research::validation::{
 use super::gradients::{compute_batch_gradient, PolicyGradients};
 use super::gru::{Rng, HIDDEN_DIM};
 use super::policy::{run_episode, RnnPolicy, BUDGET, CELL_SIZE, INPUT_DIM};
-use super::reward::RewardConfig;
+use super::reward::{compute_terminal_reward, RewardConfig, TerminalRewardConfig};
 
 /// Training configuration.
 #[derive(Clone, Debug)]
@@ -32,6 +32,10 @@ pub struct TrainingConfig {
     pub adam_eps: f64,
     /// Print progress every N epochs.
     pub print_every: usize,
+    /// Whether to use terminal (classifier-based) rewards.
+    pub use_terminal_reward: bool,
+    /// Terminal reward configuration.
+    pub terminal_reward: TerminalRewardConfig,
 }
 
 impl Default for TrainingConfig {
@@ -45,6 +49,8 @@ impl Default for TrainingConfig {
             adam_beta2: 0.999,
             adam_eps: 1e-8,
             print_every: 20,
+            use_terminal_reward: true, // Re-enabled with boosted accuracy weights
+            terminal_reward: TerminalRewardConfig::default(),
         }
     }
 }
@@ -196,7 +202,26 @@ pub fn train_policy(
         // Collect episodes for all points
         let mut episodes = Vec::new();
         for (idx, point) in points.iter().enumerate() {
-            let episode = run_episode(policy, cube, point, idx, rng, true, reward_config);
+            let mut episode = run_episode(policy, cube, point, idx, rng, true, reward_config);
+
+            // Compute terminal reward if enabled
+            if config.use_terminal_reward {
+                let terminal_result = compute_terminal_reward(
+                    &episode.final_samples,
+                    &episode.inside_flags,
+                    point.position,
+                    &point.expected,
+                    CELL_SIZE,
+                    &config.terminal_reward,
+                );
+                episode.terminal_reward = terminal_result.reward;
+
+                // Add terminal reward to the last step's reward
+                if let Some(last_reward) = episode.rewards.last_mut() {
+                    *last_reward += terminal_result.reward;
+                }
+            }
+
             episodes.push(episode);
         }
 
@@ -254,18 +279,29 @@ pub struct PointEvaluation {
     pub point_idx: usize,
     pub description: String,
     pub expected_class: OracleClassification,
-    pub predicted_class: OracleClassification,
-    pub correct: bool,
+    /// Whether the oracle-appropriate classifier fit succeeded.
+    pub fit_success: bool,
+    /// Normal accuracy reward (higher = fitted normals closer to oracle).
+    pub normal_reward: f64,
+    /// Residual reward (higher = lower fitting residual).
+    pub residual_reward: f64,
+    /// Total reward for this point.
     pub total_reward: f64,
     pub samples_used: u64,
     pub crossings_found: usize,
+    pub surface_points_count: usize,
 }
 
 /// Evaluation results.
 #[derive(Clone, Debug)]
 pub struct EvaluationResult {
     pub points: Vec<PointEvaluation>,
-    pub accuracy: f64,
+    /// Fraction of points where classifier fit succeeded.
+    pub fit_rate: f64,
+    /// Average normal accuracy reward (0-1 scale, higher = better).
+    pub avg_normal_reward: f64,
+    /// Average residual reward (0-1 scale, higher = better).
+    pub avg_residual_reward: f64,
     pub avg_reward: f64,
     pub avg_samples: f64,
 }
@@ -273,16 +309,20 @@ pub struct EvaluationResult {
 impl EvaluationResult {
     pub fn summary(&self, name: &str) -> String {
         format!(
-            "  {}: accuracy={:.1}%, avg_reward={:.3}, avg_samples={:.1}",
+            "  {}: fit_rate={:.1}%, normal_acc={:.3}, residual={:.3}, avg_reward={:.3}",
             name,
-            self.accuracy * 100.0,
+            self.fit_rate * 100.0,
+            self.avg_normal_reward,
+            self.avg_residual_reward,
             self.avg_reward,
-            self.avg_samples
         )
     }
 }
 
 /// Evaluate the policy without training.
+///
+/// Uses the oracle-selected RANSAC classifier for each point and measures
+/// how well the fitted geometry matches the oracle ground truth.
 pub fn evaluate_policy(
     policy: &RnnPolicy,
     cube: &AnalyticalRotatedCube,
@@ -290,24 +330,34 @@ pub fn evaluate_policy(
     reward_config: &RewardConfig,
     rng: &mut Rng,
 ) -> EvaluationResult {
+    let terminal_config = TerminalRewardConfig::default();
     let mut evaluations = Vec::new();
-    let mut correct = 0;
     let mut total_reward = 0.0;
     let mut total_samples = 0u64;
+    let mut fit_successes = 0;
+    let mut total_normal_reward = 0.0;
+    let mut total_residual_reward = 0.0;
 
     for (idx, point) in points.iter().enumerate() {
         let episode = run_episode(policy, cube, point, idx, rng, false, reward_config);
 
         let expected_class = expected_class_from_point(point);
 
-        // Simple classification based on sample distribution
-        // (This is a placeholder - in practice you'd use the samples for geometry fitting)
-        let predicted_class = classify_from_samples(&episode.final_samples, cube);
+        // Use oracle-selected RANSAC classifier to evaluate fit quality
+        let terminal_result = compute_terminal_reward(
+            &episode.final_samples,
+            &episode.inside_flags,
+            point.position,
+            &point.expected,
+            CELL_SIZE,
+            &terminal_config,
+        );
 
-        let is_correct = predicted_class == expected_class;
-        if is_correct {
-            correct += 1;
+        if terminal_result.fit_success {
+            fit_successes += 1;
         }
+        total_normal_reward += terminal_result.normal_reward;
+        total_residual_reward += terminal_result.residual_reward;
 
         let point_reward: f64 = episode.rewards.iter().sum();
         total_reward += point_reward;
@@ -323,18 +373,23 @@ pub fn evaluate_policy(
             point_idx: idx,
             description: point.description.clone(),
             expected_class,
-            predicted_class,
-            correct: is_correct,
+            fit_success: terminal_result.fit_success,
+            normal_reward: terminal_result.normal_reward,
+            residual_reward: terminal_result.residual_reward,
             total_reward: point_reward,
             samples_used: episode.samples_used,
             crossings_found,
+            surface_points_count: terminal_result.surface_points_count,
         });
     }
 
+    let n = points.len() as f64;
     EvaluationResult {
-        accuracy: correct as f64 / points.len() as f64,
-        avg_reward: total_reward / points.len() as f64,
-        avg_samples: total_samples as f64 / points.len() as f64,
+        fit_rate: fit_successes as f64 / n,
+        avg_normal_reward: total_normal_reward / n,
+        avg_residual_reward: total_residual_reward / n,
+        avg_reward: total_reward / n,
+        avg_samples: total_samples as f64 / n,
         points: evaluations,
     }
 }
@@ -347,36 +402,6 @@ fn expected_class_from_point(point: &ValidationPoint) -> OracleClassification {
     }
 }
 
-/// Simple classification based on sample spread.
-/// This is a placeholder - real implementation would do proper geometry fitting.
-fn classify_from_samples(
-    samples: &[(f64, f64, f64)],
-    cube: &AnalyticalRotatedCube,
-) -> OracleClassification {
-    if samples.is_empty() {
-        return OracleClassification::Unknown;
-    }
-
-    // Use the cube's oracle on the average sample position
-    let avg = (
-        samples.iter().map(|s| s.0).sum::<f64>() / samples.len() as f64,
-        samples.iter().map(|s| s.1).sum::<f64>() / samples.len() as f64,
-        samples.iter().map(|s| s.2).sum::<f64>() / samples.len() as f64,
-    );
-
-    let closest = cube.closest_surface_point(avg);
-    match closest.classification {
-        crate::adaptive_surface_nets_2::stage4::research::analytical_cube::SurfaceClassification::OnFace { .. } => {
-            OracleClassification::Face
-        }
-        crate::adaptive_surface_nets_2::stage4::research::analytical_cube::SurfaceClassification::OnEdge { .. } => {
-            OracleClassification::Edge
-        }
-        crate::adaptive_surface_nets_2::stage4::research::analytical_cube::SurfaceClassification::OnCorner { .. } => {
-            OracleClassification::Corner
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -422,6 +447,7 @@ mod tests {
         let eval = evaluate_policy(&policy, &cube, &subset, &reward_config, &mut rng);
 
         assert_eq!(eval.points.len(), 5);
-        assert!(eval.accuracy >= 0.0 && eval.accuracy <= 1.0);
+        assert!(eval.fit_rate >= 0.0 && eval.fit_rate <= 1.0);
+        assert!(eval.avg_normal_reward >= 0.0);
     }
 }

@@ -2,8 +2,8 @@
 //!
 //! Provides basic vector and matrix operations needed for neural network computations.
 
-/// Vector dot product.
-pub fn dot(a: &[f64], b: &[f64]) -> f64 {
+/// Vector dot product (slice version).
+pub fn dot_slice(a: &[f64], b: &[f64]) -> f64 {
     debug_assert_eq!(a.len(), b.len());
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
@@ -134,6 +134,33 @@ pub fn add_3d(a: (f64, f64, f64), b: (f64, f64, f64)) -> (f64, f64, f64) {
 /// Subtract two 3D vectors.
 pub fn sub_3d(a: (f64, f64, f64), b: (f64, f64, f64)) -> (f64, f64, f64) {
     (a.0 - b.0, a.1 - b.1, a.2 - b.2)
+}
+
+// Aliases for classifier.rs compatibility
+pub fn sub(a: (f64, f64, f64), b: (f64, f64, f64)) -> (f64, f64, f64) {
+    sub_3d(a, b)
+}
+
+pub fn length(v: (f64, f64, f64)) -> f64 {
+    length_3d(v)
+}
+
+pub fn normalize(v: (f64, f64, f64)) -> (f64, f64, f64) {
+    normalize_3d(v)
+}
+
+/// Dot product of two 3D vectors (tuple version).
+pub fn dot(a: (f64, f64, f64), b: (f64, f64, f64)) -> f64 {
+    a.0 * b.0 + a.1 * b.1 + a.2 * b.2
+}
+
+/// Cross product of two 3D vectors.
+pub fn cross(a: (f64, f64, f64), b: (f64, f64, f64)) -> (f64, f64, f64) {
+    (
+        a.1 * b.2 - a.2 * b.1,
+        a.2 * b.0 - a.0 * b.2,
+        a.0 * b.1 - a.1 * b.0,
+    )
 }
 
 /// Scale a 3D vector.
