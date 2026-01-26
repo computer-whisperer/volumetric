@@ -4,11 +4,22 @@ use volumetric::adaptive_surface_nets_2::stage4::research::attempt_runner::dump_
 use volumetric::adaptive_surface_nets_2::stage4::research::experiments::ml_policy::{
     dump_ml_policy_sample_cloud, MlPolicyDumpKind,
 };
+use volumetric::adaptive_surface_nets_2::stage4::research::experiments::rnn_policy::{
+    load_and_dump_rnn_policy, train_and_save_rnn_policy, DEFAULT_MODEL_PATH,
+};
+
+#[derive(Clone, Copy)]
+enum RnnCommand {
+    Train,
+    Dump,
+}
 
 fn main() {
     let mut attempt: Option<u8> = None;
     let mut output: Option<PathBuf> = None;
     let mut ml_policy: Option<MlPolicyDumpKind> = None;
+    let mut rnn_command: Option<RnnCommand> = None;
+    let mut model_path: Option<PathBuf> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -28,6 +39,20 @@ fn main() {
                     };
                 }
             }
+            "--rnn-policy" => {
+                if let Some(value) = args.next() {
+                    rnn_command = match value.as_str() {
+                        "train" => Some(RnnCommand::Train),
+                        "dump" => Some(RnnCommand::Dump),
+                        _ => None,
+                    };
+                }
+            }
+            "--model" => {
+                if let Some(value) = args.next() {
+                    model_path = Some(PathBuf::from(value));
+                }
+            }
             "--out" => {
                 if let Some(value) = args.next() {
                     output = Some(PathBuf::from(value));
@@ -39,6 +64,21 @@ fn main() {
             }
             _ => {}
         }
+    }
+
+    // Handle RNN policy commands
+    if let Some(cmd) = rnn_command {
+        let model = model_path.unwrap_or_else(|| PathBuf::from(DEFAULT_MODEL_PATH));
+        match cmd {
+            RnnCommand::Train => {
+                train_and_save_rnn_policy(&model);
+            }
+            RnnCommand::Dump => {
+                let output = output.unwrap_or_else(|| PathBuf::from("sample_cloud_rnn_trained.cbor"));
+                load_and_dump_rnn_policy(&model, &output);
+            }
+        }
+        return;
     }
 
     if let Some(kind) = ml_policy {
@@ -64,4 +104,6 @@ fn print_help() {
     eprintln!("Usage:");
     eprintln!("  sample_cloud_dump --attempt <0|1|2> [--out <file.cbor>]");
     eprintln!("  sample_cloud_dump --ml-policy <directional|octant-argmax|octant-lerp> [--out <file.cbor>]");
+    eprintln!("  sample_cloud_dump --rnn-policy train [--model <file.bin>]");
+    eprintln!("  sample_cloud_dump --rnn-policy dump [--model <file.bin>] [--out <file.cbor>]");
 }

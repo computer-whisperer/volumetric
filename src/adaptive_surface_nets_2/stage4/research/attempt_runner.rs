@@ -11,6 +11,7 @@ use super::attempt_1::{Attempt1Config, Attempt1Diag};
 use super::attempt_2::{Attempt2Config, Attempt2Diag};
 use super::experiments::hermite_microgrid::{hermite_edge_from_microgrid, HermiteMicrogridConfig};
 use super::experiments::ml_policy::run_ml_policy_experiment;
+use super::experiments::rnn_policy::run_rnn_policy_experiment;
 use super::sample_cache::{begin_sample_recording, end_sample_recording, SampleCache};
 use crate::sample_cloud::{SampleCloudDump, SampleCloudSet};
 use super::validation::{generate_validation_points, generate_validation_points_with_offset, ExpectedClassification, ValidationPoint};
@@ -191,6 +192,10 @@ pub fn run_hermite_microgrid_experiment() {
 
 pub fn run_ml_policy_experiment_runner() {
     run_ml_policy_experiment();
+}
+
+pub fn run_rnn_policy_experiment_runner() {
+    run_rnn_policy_experiment();
 }
 
 
@@ -830,4 +835,8 @@ mod tests {
         run_ml_policy_experiment_runner();
     }
 
+    #[test]
+    fn experiment_rnn_policy_mvp() {
+        run_rnn_policy_experiment_runner();
+    }
 }

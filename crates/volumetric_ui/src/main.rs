@@ -2598,6 +2598,15 @@ impl eframe::App for VolumetricApp {
                                 egui::Slider::new(&mut self.sample_cloud_point_size, 1.0..=16.0)
                                     .text("Point size"),
                             );
+
+                            // Focus camera on vertex button
+                            if let Some(set) = dump.sets.get(self.sample_cloud_set_index) {
+                                if ui.button("🎯 Focus on Vertex").clicked() {
+                                    self.camera_target = glam::Vec3::from_array(set.vertex);
+                                    // Use a reasonable distance based on cell size
+                                    self.camera_radius = 0.15;
+                                }
+                            }
                         } else {
                             ui.weak("No sample cloud loaded");
                         }
