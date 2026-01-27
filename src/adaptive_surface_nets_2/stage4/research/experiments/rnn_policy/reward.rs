@@ -6,13 +6,14 @@
 //! 3. Finding in/out transitions
 //! 4. Efficiency (penalty per sample)
 //! 5. Good classifier fits (terminal reward)
+//! 6. Directional diversity for outside samples (helps edge/corner fitting)
 
 use super::classifier::{
     best_corner_normal_errors, best_edge_normal_errors, extract_surface_points,
     fit_corner_from_samples, fit_edge_from_samples, fit_face_from_samples, normal_error_degrees,
     ClassifierConfig,
 };
-use super::math::distance_3d;
+use super::math::{distance_3d, dot, length, normalize, sub};
 use crate::adaptive_surface_nets_2::stage4::research::validation::ExpectedClassification;
 
 /// Reward weights and parameters.
@@ -30,6 +31,14 @@ pub struct RewardConfig {
     pub surface_decay: f64,
     /// Weight for entropy bonus (encourages diverse octant selection).
     pub w_entropy: f64,
+    /// Weight for directional diversity of outside samples.
+    /// Encourages sampling in directions orthogonal to previous outside samples,
+    /// which helps edge/corner fitting by spreading samples across multiple faces.
+    pub w_direction_diversity: f64,
+    /// Weight for spatial spread of outside samples.
+    /// Encourages outside samples to be far from each other spatially,
+    /// which helps edge/corner fitting by spreading samples across multiple faces.
+    pub w_outside_spread: f64,
 }
 
 impl Default for RewardConfig {
@@ -41,6 +50,8 @@ impl Default for RewardConfig {
             lambda: 0.01,        // Small per-sample cost
             surface_decay: 5.0,
             w_entropy: 0.0,      // Disabled by default
+            w_direction_diversity: 0.0, // Disabled by default
+            w_outside_spread: 0.0, // Disabled by default
         }
     }
 }
@@ -56,8 +67,115 @@ impl RewardConfig {
             lambda: 0.005,       // Lower per-sample cost
             surface_decay: 4.0,  // Slightly softer decay
             w_entropy: 0.1,      // Entropy bonus for action diversity
+            w_direction_diversity: 0.0, // Disabled for now
+            w_outside_spread: 0.0, // Disabled for now
         }
     }
+
+    /// Config with directional diversity enabled for edge/corner improvement.
+    /// This encourages outside samples to spread across multiple face planes.
+    pub fn with_direction_diversity() -> Self {
+        Self {
+            w_surface: 0.15,
+            w_spread: 0.1,
+            crossing_bonus: 0.5,
+            lambda: 0.005,
+            surface_decay: 4.0,
+            w_entropy: 0.0,
+            w_direction_diversity: 0.05, // Small diversity bonus
+            w_outside_spread: 0.15, // Stronger spatial spread for outside samples
+        }
+    }
+
+    /// Config with high crossing bonus to encourage finding transitions.
+    /// This may help edge/corner classification by encouraging exploration
+    /// across the surface in multiple directions.
+    pub fn with_high_crossing_bonus() -> Self {
+        Self {
+            w_surface: 0.1,       // Lower surface weight
+            w_spread: 0.15,       // Higher spread weight
+            crossing_bonus: 2.0,  // Very high crossing bonus
+            lambda: 0.01,
+            surface_decay: 4.0,
+            w_entropy: 0.0,
+            w_direction_diversity: 0.0,
+            w_outside_spread: 0.0,
+        }
+    }
+}
+
+/// Compute directional diversity bonus for an outside sample.
+///
+/// Returns a value in [0, 1] indicating how different this sample's direction
+/// (from vertex) is compared to previous outside samples. Higher values mean
+/// the sample explores a new direction, which helps edge/corner fitting.
+///
+/// For the first outside sample, returns 0.5 (neutral).
+/// For subsequent samples, returns the minimum angular difference (normalized)
+/// from any previous outside sample direction.
+pub fn compute_direction_diversity(
+    vertex: (f64, f64, f64),
+    sample_pos: (f64, f64, f64),
+    prev_outside_samples: &[(f64, f64, f64)],
+) -> f64 {
+    if prev_outside_samples.is_empty() {
+        return 0.5; // Neutral for first outside sample
+    }
+
+    // Compute direction from vertex to current sample
+    let dir = sub(sample_pos, vertex);
+    let len = length(dir);
+    if len < 1e-10 {
+        return 0.0; // Sample at vertex, no diversity
+    }
+    let dir_norm = normalize(dir);
+
+    // Find minimum angular difference to any previous outside sample
+    let mut min_cos_sim: f64 = 1.0; // cos(0) = 1, meaning identical direction
+
+    for &prev in prev_outside_samples {
+        let prev_dir = sub(prev, vertex);
+        let prev_len = length(prev_dir);
+        if prev_len < 1e-10 {
+            continue;
+        }
+        let prev_norm = normalize(prev_dir);
+
+        // Cosine similarity: 1 = same direction, 0 = orthogonal, -1 = opposite
+        let cos_sim: f64 = dot(dir_norm, prev_norm).abs(); // abs because opposite is also similar
+        min_cos_sim = min_cos_sim.min(cos_sim);
+    }
+
+    // Convert to diversity score: orthogonal (cos=0) gives max score (1.0)
+    // Same direction (cos=1) gives min score (0.0)
+    1.0 - min_cos_sim
+}
+
+/// Compute spatial spread bonus for an outside sample.
+///
+/// Returns a value in [0, 1] indicating how far this outside sample is from
+/// previous outside samples (normalized by cell_size). This encourages outside
+/// samples to spread out spatially, which helps edge/corner fitting.
+///
+/// For the first outside sample, returns 0.5 (neutral).
+pub fn compute_outside_spread(
+    sample_pos: (f64, f64, f64),
+    prev_outside_samples: &[(f64, f64, f64)],
+    cell_size: f64,
+) -> f64 {
+    if prev_outside_samples.is_empty() {
+        return 0.5; // Neutral for first outside sample
+    }
+
+    // Find minimum distance to any previous outside sample
+    let min_dist = prev_outside_samples
+        .iter()
+        .map(|&prev| distance_3d(sample_pos, prev))
+        .fold(f64::INFINITY, f64::min);
+
+    // Normalize by cell_size, cap at 1.0
+    // Reward increases linearly with distance up to cell_size
+    (min_dist / cell_size).min(1.0)
 }
 
 /// Compute reward for a single sampling step.
@@ -105,12 +223,28 @@ pub fn compute_step_reward(
 
 /// Compute reward for a single sampling step with entropy bonus.
 ///
-/// Extended version that includes entropy bonus from action probabilities.
+/// Extended version that includes entropy bonus from action probabilities
+/// and directional diversity bonus for outside samples.
+///
+/// # Arguments
+/// * `sample_pos` - Position that was sampled
+/// * `oracle_distance` - Distance to closest surface point
+/// * `prev_samples` - List of previous sample positions
+/// * `prev_inside_flags` - Inside/outside flag for each previous sample
+/// * `is_inside` - Whether current sample is inside
+/// * `is_crossing` - Whether this sample found an in/out transition
+/// * `vertex` - The vertex position (for directional diversity)
+/// * `cell_size` - Size of the cell
+/// * `action_probs` - Action probabilities (for entropy bonus)
+/// * `config` - Reward configuration
 pub fn compute_step_reward_with_entropy(
     sample_pos: (f64, f64, f64),
     oracle_distance: f64,
     prev_samples: &[(f64, f64, f64)],
+    prev_inside_flags: &[bool],
+    is_inside: bool,
     is_crossing: bool,
+    vertex: (f64, f64, f64),
     cell_size: f64,
     action_probs: &[f64],
     config: &RewardConfig,
@@ -134,7 +268,42 @@ pub fn compute_step_reward_with_entropy(
         0.0
     };
 
-    base_reward + config.w_entropy * normalized_entropy
+    // Collect previous outside samples (shared by both diversity bonuses)
+    let prev_outside: Vec<_> = if !is_inside
+        && (config.w_direction_diversity > 0.0 || config.w_outside_spread > 0.0)
+    {
+        prev_samples
+            .iter()
+            .zip(prev_inside_flags.iter())
+            .filter(|(_, inside)| !**inside)
+            .map(|(pos, _)| *pos)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // Directional diversity bonus for outside samples
+    // This encourages outside samples to spread across different faces,
+    // which helps edge/corner fitting
+    let direction_diversity = if !is_inside && config.w_direction_diversity > 0.0 {
+        compute_direction_diversity(vertex, sample_pos, &prev_outside)
+    } else {
+        0.0
+    };
+
+    // Spatial spread bonus for outside samples
+    // This encourages outside samples to be far from each other,
+    // which helps edge/corner fitting
+    let outside_spread = if !is_inside && config.w_outside_spread > 0.0 {
+        compute_outside_spread(sample_pos, &prev_outside, cell_size)
+    } else {
+        0.0
+    };
+
+    base_reward
+        + config.w_entropy * normalized_entropy
+        + config.w_direction_diversity * direction_diversity
+        + config.w_outside_spread * outside_spread
 }
 
 /// Compute entropy of a probability distribution.

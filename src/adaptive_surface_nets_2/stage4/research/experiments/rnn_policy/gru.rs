@@ -9,7 +9,7 @@ use super::math::{
 };
 
 /// Hidden dimension for the GRU.
-pub const HIDDEN_DIM: usize = 32;
+pub const HIDDEN_DIM: usize = 64;
 
 /// GRU weights for a single cell.
 ///

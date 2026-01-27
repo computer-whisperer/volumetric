@@ -51,10 +51,12 @@ use crate::adaptive_surface_nets_2::stage4::research::sample_cache::{
 use crate::adaptive_surface_nets_2::stage4::research::validation::generate_validation_points_randomized;
 use crate::sample_cloud::{SampleCloudDump, SampleCloudSet};
 
+use classifier_heads::{compute_classifier_loss, ClassifierLossConfig, ExpectedGeometry, GeometryType};
 use gru::Rng;
 use policy::{run_episode, run_episode_ex, RnnPolicy};
 use reward::RewardConfig;
-use training::{evaluate_policy, train_policy, EvaluationResult, TrainingConfig};
+use training::{train_policy, TrainingConfig};
+use crate::adaptive_surface_nets_2::stage4::research::validation::ExpectedClassification;
 
 /// Which variant of the RNN policy to use for sample cloud dumps.
 #[derive(Clone, Copy, Debug)]
@@ -114,21 +116,7 @@ pub fn run_rnn_policy_experiment_with_epochs(epochs: usize, print_every: usize) 
             let episode = run_episode_ex(policy, cube, point, idx, rng, true, true, &reward_config);
             let predictions = policy.classify(&episode.h_final);
 
-            let expected_geom = match &point.expected {
-                crate::adaptive_surface_nets_2::stage4::research::validation::ExpectedClassification::OnFace { expected_normal, .. } => {
-                    ExpectedGeometry::Face { normal: *expected_normal }
-                }
-                crate::adaptive_surface_nets_2::stage4::research::validation::ExpectedClassification::OnEdge { expected_normals, expected_direction, .. } => {
-                    ExpectedGeometry::Edge {
-                        normal_a: expected_normals.0,
-                        normal_b: expected_normals.1,
-                        direction: *expected_direction,
-                    }
-                }
-                crate::adaptive_surface_nets_2::stage4::research::validation::ExpectedClassification::OnCorner { expected_normals, .. } => {
-                    ExpectedGeometry::Corner { normals: *expected_normals }
-                }
-            };
+            let expected_geom = ExpectedGeometry::from_classification(&point.expected, point.position);
 
             let predicted_type = predictions.predicted_type();
             let expected_type = expected_geom.geometry_type();
@@ -136,7 +124,7 @@ pub fn run_rnn_policy_experiment_with_epochs(epochs: usize, print_every: usize) 
                 correct += 1;
             }
 
-            let (loss, _, _, _) = compute_classifier_loss(&predictions, &expected_geom, &loss_config);
+            let (loss, _, _, _, _) = compute_classifier_loss(&predictions, &expected_geom, &loss_config);
             total_loss += loss;
         }
 
@@ -146,11 +134,7 @@ pub fn run_rnn_policy_experiment_with_epochs(epochs: usize, print_every: usize) 
     // Evaluate before training
     let (acc_before, loss_before) = eval_classifier(&policy, &cube, &points, &mut rng);
     println!("\nBefore training:");
-    println!("  Classifier accuracy: {:.1}%, loss: {:.3}", acc_before * 100.0, loss_before);
-
-    // Also show RANSAC-based eval for comparison
-    let eval_before = evaluate_policy(&policy, &cube, &points, &reward_config, &mut rng);
-    println!("  RANSAC fit rate: {:.1}%", eval_before.fit_rate * 100.0);
+    println!("  Classifier accuracy: {:.1}% (loss: {:.3})", acc_before * 100.0, loss_before);
 
     // Train
     println!("\nTraining with rotation augmentation...");
@@ -167,99 +151,10 @@ pub fn run_rnn_policy_experiment_with_epochs(epochs: usize, print_every: usize) 
     // Evaluate after training (on standard cube - no rotation)
     let (acc_after, loss_after) = eval_classifier(&policy, &cube, &points, &mut rng);
     println!("\nAfter training:");
-    println!("  Classifier accuracy: {:.1}%, loss: {:.3}", acc_after * 100.0, loss_after);
-
-    let eval_after = evaluate_policy(&policy, &cube, &points, &reward_config, &mut rng);
-    println!("  RANSAC fit rate: {:.1}%", eval_after.fit_rate * 100.0);
-
-    // Breakdown by classification
-    println!("\nBreakdown by geometry type:");
-    print_breakdown(&eval_after);
+    println!("  Classifier accuracy: {:.1}% (loss: {:.3})", acc_after * 100.0, loss_after);
 
     // Show classifier confidence breakdown
-    println!("\nClassifier confidence analysis:");
     print_classifier_breakdown(&policy, &cube, &points, &reward_config, &mut rng);
-}
-
-fn print_breakdown(eval: &EvaluationResult) {
-    let face_points: Vec<_> = eval
-        .points
-        .iter()
-        .filter(|p| matches!(
-            p.expected_class,
-            crate::adaptive_surface_nets_2::stage4::research::oracle::OracleClassification::Face
-        ))
-        .collect();
-    let edge_points: Vec<_> = eval
-        .points
-        .iter()
-        .filter(|p| matches!(
-            p.expected_class,
-            crate::adaptive_surface_nets_2::stage4::research::oracle::OracleClassification::Edge
-        ))
-        .collect();
-    let corner_points: Vec<_> = eval
-        .points
-        .iter()
-        .filter(|p| matches!(
-            p.expected_class,
-            crate::adaptive_surface_nets_2::stage4::research::oracle::OracleClassification::Corner
-        ))
-        .collect();
-
-    // Report fit success rate, normal accuracy, and surface point counts per category
-    fn category_stats(points: &[&training::PointEvaluation]) -> (usize, f64, f64) {
-        let fit_count = points.iter().filter(|p| p.fit_success).count();
-        let avg_normal = if points.is_empty() {
-            0.0
-        } else {
-            points.iter().map(|p| p.normal_reward).sum::<f64>() / points.len() as f64
-        };
-        let avg_surface_pts = if points.is_empty() {
-            0.0
-        } else {
-            points.iter().map(|p| p.surface_points_count as f64).sum::<f64>() / points.len() as f64
-        };
-        (fit_count, avg_normal, avg_surface_pts)
-    }
-
-    let (face_fit, face_normal, face_surface) = category_stats(&face_points);
-    let (edge_fit, edge_normal, edge_surface) = category_stats(&edge_points);
-    let (corner_fit, corner_normal, corner_surface) = category_stats(&corner_points);
-
-    println!(
-        "  Face:   {}/{} fit ({:.1}%), normal={:.3}, surface_pts={:.1}",
-        face_fit,
-        face_points.len(),
-        if face_points.is_empty() { 0.0 } else { face_fit as f64 / face_points.len() as f64 * 100.0 },
-        face_normal,
-        face_surface
-    );
-    println!(
-        "  Edge:   {}/{} fit ({:.1}%), normal={:.3}, surface_pts={:.1}",
-        edge_fit,
-        edge_points.len(),
-        if edge_points.is_empty() { 0.0 } else { edge_fit as f64 / edge_points.len() as f64 * 100.0 },
-        edge_normal,
-        edge_surface
-    );
-    println!(
-        "  Corner: {}/{} fit ({:.1}%), normal={:.3}, surface_pts={:.1}",
-        corner_fit,
-        corner_points.len(),
-        if corner_points.is_empty() { 0.0 } else { corner_fit as f64 / corner_points.len() as f64 * 100.0 },
-        corner_normal,
-        corner_surface
-    );
-
-    // Average crossings found
-    let avg_crossings = eval
-        .points
-        .iter()
-        .map(|p| p.crossings_found as f64)
-        .sum::<f64>()
-        / eval.points.len() as f64;
-    println!("  Avg crossings per episode: {:.1}", avg_crossings);
 }
 
 fn print_classifier_breakdown(
@@ -357,37 +252,206 @@ pub fn train_and_save_rnn_policy(model_path: &Path) {
     println!("Creating RNN policy...");
     let mut policy = RnnPolicy::new(&mut rng);
     println!(
-        "Policy parameters: {} (GRU: {}, Chooser: {})",
+        "Policy parameters: {} (GRU: {}, Chooser: {}, Heads: {})",
         policy.param_count(),
         policy.gru.param_count(),
-        policy.chooser.param_count()
+        policy.chooser.param_count(),
+        policy.classifier_heads.param_count()
     );
 
-    // Evaluate before training
-    let eval_before = evaluate_policy(&policy, &cube, &points, &reward_config, &mut rng);
-    println!("Before training: {}", eval_before.summary("Random"));
-    print_breakdown(&eval_before);
+    // Evaluate classifier heads before training
+    let eval_before = evaluate_classifier_heads(&policy, &cube, &points, &reward_config, &mut rng);
+    println!("\nBefore training:");
+    println!("  Classifier accuracy: {:.1}% (loss: {:.3})", eval_before.accuracy * 100.0, eval_before.loss);
+    println!("  {:10} {:>8} {:>8} {:>12}", "Class", "TypeAcc", "Conf", "NormalLoss");
+    println!("  {:10} {:>3}/{:<2}={:3.0}% {:>7.3} {:>12.3}", "Face",
+        eval_before.face_correct, eval_before.face_total,
+        if eval_before.face_total > 0 { eval_before.face_correct as f64 / eval_before.face_total as f64 * 100.0 } else { 0.0 },
+        eval_before.face_conf, eval_before.face_normal_loss);
+    println!("  {:10} {:>3}/{:<2}={:3.0}% {:>7.3} {:>12.3}", "Edge",
+        eval_before.edge_correct, eval_before.edge_total,
+        if eval_before.edge_total > 0 { eval_before.edge_correct as f64 / eval_before.edge_total as f64 * 100.0 } else { 0.0 },
+        eval_before.edge_conf, eval_before.edge_normal_loss);
+    println!("  {:10} {:>3}/{:<2}={:3.0}% {:>7.3} {:>12.3}", "Corner",
+        eval_before.corner_correct, eval_before.corner_total,
+        if eval_before.corner_total > 0 { eval_before.corner_correct as f64 / eval_before.corner_total as f64 * 100.0 } else { 0.0 },
+        eval_before.corner_conf, eval_before.corner_normal_loss);
 
-    // Train
-    println!("\nTraining (6000 epochs)...");
+    // Train with classifier heads
+    println!("\nTraining (24000 epochs, lr=0.0003, hidden=64)...");
     let config = TrainingConfig {
-        epochs: 6000,
+        epochs: 24000,
         print_every: 1000,
-        lr: 0.001,
+        lr: 0.0003,
+        use_classifier_heads: true,
         ..Default::default()
     };
     train_policy(&mut policy, &cube, &points, &config, &reward_config, &mut rng);
 
-    // Evaluate after training
-    let eval_after = evaluate_policy(&policy, &cube, &points, &reward_config, &mut rng);
-    println!("\nAfter training: {}", eval_after.summary("Trained"));
-    print_breakdown(&eval_after);
+    // Evaluate classifier heads after training
+    let eval_after = evaluate_classifier_heads(&policy, &cube, &points, &reward_config, &mut rng);
+    println!("\nAfter training:");
+    println!("  Classifier accuracy: {:.1}% (loss: {:.3})", eval_after.accuracy * 100.0, eval_after.loss);
+    println!("  {:10} {:>8} {:>8} {:>12}", "Class", "TypeAcc", "Conf", "NormalLoss");
+    println!("  {:10} {:>3}/{:<2}={:3.0}% {:>7.3} {:>12.3}", "Face",
+        eval_after.face_correct, eval_after.face_total,
+        if eval_after.face_total > 0 { eval_after.face_correct as f64 / eval_after.face_total as f64 * 100.0 } else { 0.0 },
+        eval_after.face_conf, eval_after.face_normal_loss);
+    println!("  {:10} {:>3}/{:<2}={:3.0}% {:>7.3} {:>12.3}", "Edge",
+        eval_after.edge_correct, eval_after.edge_total,
+        if eval_after.edge_total > 0 { eval_after.edge_correct as f64 / eval_after.edge_total as f64 * 100.0 } else { 0.0 },
+        eval_after.edge_conf, eval_after.edge_normal_loss);
+    println!("  {:10} {:>3}/{:<2}={:3.0}% {:>7.3} {:>12.3}", "Corner",
+        eval_after.corner_correct, eval_after.corner_total,
+        if eval_after.corner_total > 0 { eval_after.corner_correct as f64 / eval_after.corner_total as f64 * 100.0 } else { 0.0 },
+        eval_after.corner_conf, eval_after.corner_normal_loss);
 
     // Save
     if let Err(e) = policy.save(model_path) {
         eprintln!("Failed to save model: {}", e);
     } else {
         println!("\nSaved model to {}", model_path.display());
+    }
+}
+
+/// Classifier evaluation result with both accuracy and confidence.
+#[derive(Debug)]
+pub struct ClassifierEvalResult {
+    pub accuracy: f64,
+    pub loss: f64,
+    pub face_correct: usize,
+    pub face_total: usize,
+    pub face_conf: f64, // Avg confidence of face head on face points
+    pub face_normal_loss: f64, // Avg normal cosine loss for face predictions
+    pub edge_correct: usize,
+    pub edge_total: usize,
+    pub edge_conf: f64,
+    pub edge_normal_loss: f64,
+    pub corner_correct: usize,
+    pub corner_total: usize,
+    pub corner_conf: f64,
+    pub corner_normal_loss: f64, // Avg normal cosine loss for corner predictions
+}
+
+/// Compute cosine loss between predicted and expected normals.
+/// Returns 1 - |dot(pred, exp)|, so 0 = perfect, 1 = perpendicular.
+fn normal_cosine_loss(pred: (f64, f64, f64), exp: (f64, f64, f64)) -> f64 {
+    let d = pred.0 * exp.0 + pred.1 * exp.1 + pred.2 * exp.2;
+    1.0 - d.abs().min(1.0)
+}
+
+/// Compute best matching loss for 3 normals (greedy assignment).
+fn corner_normal_loss(pred: &[(f64, f64, f64); 3], exp: &[(f64, f64, f64); 3]) -> f64 {
+    let mut total = 0.0;
+    let mut used = [false; 3];
+
+    for p in pred {
+        let mut best = f64::MAX;
+        let mut best_idx = 0;
+        for (i, e) in exp.iter().enumerate() {
+            if !used[i] {
+                let loss = normal_cosine_loss(*p, *e);
+                if loss < best {
+                    best = loss;
+                    best_idx = i;
+                }
+            }
+        }
+        used[best_idx] = true;
+        total += best;
+    }
+    total / 3.0
+}
+
+/// Evaluate classifier head accuracy and confidence.
+fn evaluate_classifier_heads(
+    policy: &RnnPolicy,
+    cube: &AnalyticalRotatedCube,
+    points: &[crate::adaptive_surface_nets_2::stage4::research::validation::ValidationPoint],
+    reward_config: &RewardConfig,
+    rng: &mut Rng,
+) -> ClassifierEvalResult {
+    let loss_config = ClassifierLossConfig::default();
+
+    let mut correct = 0;
+    let mut total_loss = 0.0;
+    let mut face_correct = 0;
+    let mut face_total = 0;
+    let mut face_conf_sum = 0.0;
+    let mut face_normal_loss_sum = 0.0;
+    let mut edge_correct = 0;
+    let mut edge_total = 0;
+    let mut edge_conf_sum = 0.0;
+    let mut edge_normal_loss_sum = 0.0;
+    let mut corner_correct = 0;
+    let mut corner_total = 0;
+    let mut corner_conf_sum = 0.0;
+    let mut corner_normal_loss_sum = 0.0;
+
+    for (idx, point) in points.iter().enumerate() {
+        let episode = run_episode(policy, cube, point, idx, rng, false, reward_config);
+        let predictions = policy.classify(&episode.h_final);
+
+        let expected_geom = ExpectedGeometry::from_classification(&point.expected, point.position);
+
+        let predicted_type = predictions.predicted_type();
+        let expected_type = expected_geom.geometry_type();
+
+        // Track per-type accuracy, confidence, and normal quality
+        match &expected_geom {
+            ExpectedGeometry::Face { normal, .. } => {
+                face_total += 1;
+                face_conf_sum += predictions.face.confidence;
+                face_normal_loss_sum += normal_cosine_loss(predictions.face.normal, *normal);
+                if predicted_type == expected_type {
+                    face_correct += 1;
+                    correct += 1;
+                }
+            }
+            ExpectedGeometry::Edge { normal_a, normal_b, .. } => {
+                edge_total += 1;
+                edge_conf_sum += predictions.edge.confidence;
+                // Best matching of 2 normals
+                let loss1 = normal_cosine_loss(predictions.edge.normal_a, *normal_a)
+                    + normal_cosine_loss(predictions.edge.normal_b, *normal_b);
+                let loss2 = normal_cosine_loss(predictions.edge.normal_a, *normal_b)
+                    + normal_cosine_loss(predictions.edge.normal_b, *normal_a);
+                edge_normal_loss_sum += loss1.min(loss2) / 2.0;
+                if predicted_type == expected_type {
+                    edge_correct += 1;
+                    correct += 1;
+                }
+            }
+            ExpectedGeometry::Corner { normals, .. } => {
+                corner_total += 1;
+                corner_conf_sum += predictions.corner.confidence;
+                corner_normal_loss_sum += corner_normal_loss(&predictions.corner.normals, normals);
+                if predicted_type == expected_type {
+                    corner_correct += 1;
+                    correct += 1;
+                }
+            }
+        }
+
+        let (loss, _, _, _, _) = compute_classifier_loss(&predictions, &expected_geom, &loss_config);
+        total_loss += loss;
+    }
+
+    ClassifierEvalResult {
+        accuracy: correct as f64 / points.len() as f64,
+        loss: total_loss / points.len() as f64,
+        face_correct,
+        face_total,
+        face_conf: if face_total > 0 { face_conf_sum / face_total as f64 } else { 0.0 },
+        face_normal_loss: if face_total > 0 { face_normal_loss_sum / face_total as f64 } else { 0.0 },
+        edge_correct,
+        edge_total,
+        edge_conf: if edge_total > 0 { edge_conf_sum / edge_total as f64 } else { 0.0 },
+        edge_normal_loss: if edge_total > 0 { edge_normal_loss_sum / edge_total as f64 } else { 0.0 },
+        corner_correct,
+        corner_total,
+        corner_conf: if corner_total > 0 { corner_conf_sum / corner_total as f64 } else { 0.0 },
+        corner_normal_loss: if corner_total > 0 { corner_normal_loss_sum / corner_total as f64 } else { 0.0 },
     }
 }
 
@@ -501,19 +565,29 @@ fn dump_rnn_policy_sample_cloud_with_policy(policy: &RnnPolicy, label: &str, out
         );
 
         // Add predicted vectors based on geometry type
+        // Offset represents signed distance from vertex to plane (negative = inside surface)
+        // We visualize by showing a point on the surface: vertex + normal * (-offset)
         let vertex = to_f32(point.position);
         match predicted_type {
             GeometryType::Face => {
-                // Face: single normal (green)
+                // Face: single normal (green) with surface point (cyan)
                 set.add_vector(
                     "pred_normal",
                     vertex,
                     scale_vec(to_f32(predictions.face.normal), vec_scale),
                     Some([0.3, 1.0, 0.3, 1.0]),
                 );
+                // Show predicted surface point: move along normal by -offset * cell_size
+                let surface_pt = offset_point(vertex, to_f32(predictions.face.normal), predictions.face.offset, policy::CELL_SIZE as f32);
+                set.add_vector(
+                    "pred_surface",
+                    vertex,
+                    [surface_pt[0] - vertex[0], surface_pt[1] - vertex[1], surface_pt[2] - vertex[2]],
+                    Some([0.0, 1.0, 1.0, 1.0]), // cyan
+                );
             }
             GeometryType::Edge => {
-                // Edge: two normals (red, orange) and edge direction (yellow)
+                // Edge: two normals (red, orange), edge direction (yellow), and surface points
                 set.add_vector(
                     "pred_normal_a",
                     vertex,
@@ -532,13 +606,33 @@ fn dump_rnn_policy_sample_cloud_with_policy(policy: &RnnPolicy, label: &str, out
                     scale_vec(to_f32(predictions.edge.direction), vec_scale),
                     Some([1.0, 1.0, 0.3, 1.0]),
                 );
+                // Show predicted surface points for both faces
+                let surface_a = offset_point(vertex, to_f32(predictions.edge.normal_a), predictions.edge.offset_a, policy::CELL_SIZE as f32);
+                let surface_b = offset_point(vertex, to_f32(predictions.edge.normal_b), predictions.edge.offset_b, policy::CELL_SIZE as f32);
+                set.add_vector(
+                    "pred_surface_a",
+                    vertex,
+                    [surface_a[0] - vertex[0], surface_a[1] - vertex[1], surface_a[2] - vertex[2]],
+                    Some([1.0, 0.5, 0.5, 1.0]), // light red
+                );
+                set.add_vector(
+                    "pred_surface_b",
+                    vertex,
+                    [surface_b[0] - vertex[0], surface_b[1] - vertex[1], surface_b[2] - vertex[2]],
+                    Some([1.0, 0.8, 0.5, 1.0]), // light orange
+                );
             }
             GeometryType::Corner => {
-                // Corner: three normals (red, green, blue)
+                // Corner: three normals (red, green, blue) with surface points
                 let colors = [
                     [1.0, 0.3, 0.3, 1.0],
                     [0.3, 1.0, 0.3, 1.0],
                     [0.3, 0.3, 1.0, 1.0],
+                ];
+                let surface_colors = [
+                    [1.0, 0.6, 0.6, 1.0], // light red
+                    [0.6, 1.0, 0.6, 1.0], // light green
+                    [0.6, 0.6, 1.0, 1.0], // light blue
                 ];
                 for (i, normal) in predictions.corner.normals.iter().enumerate() {
                     set.add_vector(
@@ -546,6 +640,14 @@ fn dump_rnn_policy_sample_cloud_with_policy(policy: &RnnPolicy, label: &str, out
                         vertex,
                         scale_vec(to_f32(*normal), vec_scale),
                         Some(colors[i]),
+                    );
+                    // Show predicted surface point
+                    let surface_pt = offset_point(vertex, to_f32(*normal), predictions.corner.offsets[i], policy::CELL_SIZE as f32);
+                    set.add_vector(
+                        &format!("pred_surface_{}", i),
+                        vertex,
+                        [surface_pt[0] - vertex[0], surface_pt[1] - vertex[1], surface_pt[2] - vertex[2]],
+                        Some(surface_colors[i]),
                     );
                 }
             }
@@ -590,6 +692,391 @@ fn to_f32(v: (f64, f64, f64)) -> [f32; 3] {
 
 fn scale_vec(v: [f32; 3], scale: f32) -> [f32; 3] {
     [v[0] * scale, v[1] * scale, v[2] * scale]
+}
+
+/// Compute surface point from vertex, normal, and offset.
+/// offset is normalized by cell_size, so surface = vertex - offset * cell_size * normal
+fn offset_point(vertex: [f32; 3], normal: [f32; 3], offset: f64, cell_size: f32) -> [f32; 3] {
+    let off = (offset as f32) * cell_size;
+    [
+        vertex[0] - off * normal[0],
+        vertex[1] - off * normal[1],
+        vertex[2] - off * normal[2],
+    ]
+}
+
+/// Result of a single sweep configuration.
+#[derive(Debug)]
+pub struct SweepResult {
+    pub name: String,
+    pub accuracy: f64,
+    pub loss: f64,
+    pub face_correct: usize,
+    pub face_total: usize,
+    pub face_conf: f64,
+    pub face_normal_loss: f64, // Cosine loss for face normals (0=perfect, 1=perpendicular)
+    pub edge_correct: usize,
+    pub edge_total: usize,
+    pub edge_conf: f64,
+    pub edge_normal_loss: f64,
+    pub corner_correct: usize,
+    pub corner_total: usize,
+    pub corner_conf: f64,
+    pub corner_normal_loss: f64,
+}
+
+impl SweepResult {
+    pub fn face_pct(&self) -> f64 {
+        if self.face_total == 0 { 0.0 } else { self.face_correct as f64 / self.face_total as f64 * 100.0 }
+    }
+    pub fn edge_pct(&self) -> f64 {
+        if self.edge_total == 0 { 0.0 } else { self.edge_correct as f64 / self.edge_total as f64 * 100.0 }
+    }
+    pub fn corner_pct(&self) -> f64 {
+        if self.corner_total == 0 { 0.0 } else { self.corner_correct as f64 / self.corner_total as f64 * 100.0 }
+    }
+}
+
+/// Run a sweep of different reward configurations.
+pub fn run_reward_sweep() {
+    let cube = AnalyticalRotatedCube::standard_test_cube();
+    let points = generate_validation_points_randomized(&cube, policy::CELL_SIZE * 0.2, 2, 42);
+
+    println!("\n{}", "=".repeat(80));
+    println!("REWARD CONFIGURATION SWEEP");
+    println!("{}", "=".repeat(80));
+    println!("Points: {} (Face: 12, Edge: 24, Corner: 16)", points.len());
+    println!("Epochs: 3000 per config");
+    println!();
+
+    // Define configurations to test
+    let configs: Vec<(&str, RewardConfig)> = vec![
+        ("baseline", RewardConfig::default()),
+        ("classifier_training", RewardConfig::for_classifier_training()),
+        ("direction_diversity", RewardConfig::with_direction_diversity()),
+        ("high_crossing", RewardConfig::with_high_crossing_bonus()),
+        // Variations on entropy
+        ("entropy_0.1", RewardConfig {
+            w_entropy: 0.1,
+            ..RewardConfig::default()
+        }),
+        ("entropy_0.3", RewardConfig {
+            w_entropy: 0.3,
+            ..RewardConfig::default()
+        }),
+        // Variations on direction diversity
+        ("dir_div_0.1", RewardConfig {
+            w_direction_diversity: 0.1,
+            w_outside_spread: 0.1,
+            ..RewardConfig::default()
+        }),
+        ("dir_div_0.2", RewardConfig {
+            w_direction_diversity: 0.2,
+            w_outside_spread: 0.2,
+            ..RewardConfig::default()
+        }),
+        // Combined strategies
+        ("entropy+div", RewardConfig {
+            w_entropy: 0.1,
+            w_direction_diversity: 0.1,
+            w_outside_spread: 0.1,
+            ..RewardConfig::default()
+        }),
+        // Lower crossing bonus (was causing reward hacking before)
+        ("no_crossing", RewardConfig {
+            crossing_bonus: 0.0,
+            w_spread: 0.2,
+            ..RewardConfig::default()
+        }),
+        // High spread
+        ("high_spread", RewardConfig {
+            w_spread: 0.3,
+            crossing_bonus: 0.2,
+            ..RewardConfig::default()
+        }),
+    ];
+
+    let training_config = TrainingConfig {
+        epochs: 3000,
+        print_every: 3001, // Don't print per-epoch
+        lr: 0.001,
+        use_classifier_heads: true,
+        ..Default::default()
+    };
+
+    let mut results: Vec<SweepResult> = Vec::new();
+
+    for (name, reward_config) in &configs {
+        print!("Testing {:20} ... ", name);
+        std::io::Write::flush(&mut std::io::stdout()).unwrap();
+
+        let mut rng = Rng::new(12345); // Same seed for fair comparison
+        let mut policy = RnnPolicy::new(&mut rng);
+
+        // Train
+        train_policy(&mut policy, &cube, &points, &training_config, reward_config, &mut rng);
+
+        // Evaluate
+        let eval = evaluate_classifier_heads(&policy, &cube, &points, reward_config, &mut rng);
+
+        let result = SweepResult {
+            name: name.to_string(),
+            accuracy: eval.accuracy,
+            loss: eval.loss,
+            face_correct: eval.face_correct,
+            face_total: eval.face_total,
+            face_conf: eval.face_conf,
+            face_normal_loss: eval.face_normal_loss,
+            edge_correct: eval.edge_correct,
+            edge_total: eval.edge_total,
+            edge_conf: eval.edge_conf,
+            edge_normal_loss: eval.edge_normal_loss,
+            corner_correct: eval.corner_correct,
+            corner_total: eval.corner_total,
+            corner_conf: eval.corner_conf,
+            corner_normal_loss: eval.corner_normal_loss,
+        };
+
+        // Show type accuracy and normal loss
+        println!(
+            "TypeAcc: F={:2}/{:2} E={:2}/{:2} C={:2}/{:2} | NormLoss: F={:.3} E={:.3} C={:.3}",
+            result.face_correct, result.face_total,
+            result.edge_correct, result.edge_total,
+            result.corner_correct, result.corner_total,
+            result.face_normal_loss, result.edge_normal_loss, result.corner_normal_loss,
+        );
+
+        results.push(result);
+    }
+
+    // Summary - Accuracy table
+    println!("\n{}", "-".repeat(90));
+    println!("ACCURACY (sorted by overall)");
+    println!("{}", "-".repeat(90));
+
+    results.sort_by(|a, b| b.accuracy.partial_cmp(&a.accuracy).unwrap());
+
+    println!("{:20} {:>6} {:>10} {:>10} {:>10}", "Config", "Total", "Face", "Edge", "Corner");
+    println!("{}", "-".repeat(60));
+    for r in &results {
+        println!(
+            "{:20} {:5.1}% {:>4}/{:<2}={:4.0}% {:>4}/{:<2}={:4.0}% {:>4}/{:<2}={:4.0}%",
+            r.name,
+            r.accuracy * 100.0,
+            r.face_correct, r.face_total, r.face_pct(),
+            r.edge_correct, r.edge_total, r.edge_pct(),
+            r.corner_correct, r.corner_total, r.corner_pct(),
+        );
+    }
+
+    // Normal loss table (sorted by corner normal loss - lower is better)
+    println!("\n{}", "-".repeat(90));
+    println!("NORMAL LOSS (cosine loss, 0=perfect, 1=perpendicular) - sorted by corner");
+    println!("{}", "-".repeat(90));
+
+    results.sort_by(|a, b| a.corner_normal_loss.partial_cmp(&b.corner_normal_loss).unwrap());
+
+    println!("{:20} {:>12} {:>12} {:>12}", "Config", "Face Loss", "Edge Loss", "Corner Loss");
+    println!("{}", "-".repeat(60));
+    for r in &results {
+        println!(
+            "{:20} {:>12.3} {:>12.3} {:>12.3}",
+            r.name,
+            r.face_normal_loss,
+            r.edge_normal_loss,
+            r.corner_normal_loss,
+        );
+    }
+
+    // Confidence table
+    println!("\n{}", "-".repeat(90));
+    println!("CONFIDENCE for correct class (sorted by corner conf)");
+    println!("{}", "-".repeat(90));
+
+    results.sort_by(|a, b| b.corner_conf.partial_cmp(&a.corner_conf).unwrap());
+
+    println!("{:20} {:>10} {:>10} {:>10}", "Config", "Face Conf", "Edge Conf", "Corner Conf");
+    println!("{}", "-".repeat(55));
+    for r in &results {
+        println!(
+            "{:20} {:>10.3} {:>10.3} {:>10.3}",
+            r.name,
+            r.face_conf,
+            r.edge_conf,
+            r.corner_conf,
+        );
+    }
+
+    // Find best for each category
+    println!("\nBest accuracy per category:");
+    if let Some(best_face) = results.iter().max_by(|a, b| a.face_pct().partial_cmp(&b.face_pct()).unwrap()) {
+        println!("  Face:   {} ({:.1}%)", best_face.name, best_face.face_pct());
+    }
+    if let Some(best_edge) = results.iter().max_by(|a, b| a.edge_pct().partial_cmp(&b.edge_pct()).unwrap()) {
+        println!("  Edge:   {} ({:.1}%)", best_edge.name, best_edge.edge_pct());
+    }
+    if let Some(best_corner) = results.iter().max_by(|a, b| a.corner_pct().partial_cmp(&b.corner_pct()).unwrap()) {
+        println!("  Corner: {} ({:.1}%)", best_corner.name, best_corner.corner_pct());
+    }
+
+    println!("\nBest confidence per category:");
+    if let Some(best) = results.iter().max_by(|a, b| a.face_conf.partial_cmp(&b.face_conf).unwrap()) {
+        println!("  Face:   {} ({:.3})", best.name, best.face_conf);
+    }
+    if let Some(best) = results.iter().max_by(|a, b| a.edge_conf.partial_cmp(&b.edge_conf).unwrap()) {
+        println!("  Edge:   {} ({:.3})", best.name, best.edge_conf);
+    }
+    if let Some(best) = results.iter().max_by(|a, b| a.corner_conf.partial_cmp(&b.corner_conf).unwrap()) {
+        println!("  Corner: {} ({:.3})", best.name, best.corner_conf);
+    }
+
+    println!("\nBest normal loss per category (lower = better):");
+    if let Some(best) = results.iter().min_by(|a, b| a.face_normal_loss.partial_cmp(&b.face_normal_loss).unwrap()) {
+        println!("  Face:   {} ({:.3})", best.name, best.face_normal_loss);
+    }
+    if let Some(best) = results.iter().min_by(|a, b| a.edge_normal_loss.partial_cmp(&b.edge_normal_loss).unwrap()) {
+        println!("  Edge:   {} ({:.3})", best.name, best.edge_normal_loss);
+    }
+    if let Some(best) = results.iter().min_by(|a, b| a.corner_normal_loss.partial_cmp(&b.corner_normal_loss).unwrap()) {
+        println!("  Corner: {} ({:.3})", best.name, best.corner_normal_loss);
+    }
+}
+
+/// Run a diagnostic sweep to understand why corners aren't being classified.
+pub fn run_corner_diagnostic() {
+    use classifier_heads::{GeometryType, ClassifierLossConfig};
+
+    let cube = AnalyticalRotatedCube::standard_test_cube();
+    let points = generate_validation_points_randomized(&cube, policy::CELL_SIZE * 0.2, 2, 42);
+
+    println!("\n{}", "=".repeat(80));
+    println!("CORNER CLASSIFICATION DIAGNOSTIC");
+    println!("{}", "=".repeat(80));
+
+    let reward_config = RewardConfig::with_direction_diversity();
+
+    let training_config = TrainingConfig {
+        epochs: 6000,
+        print_every: 1000,
+        lr: 0.001,
+        use_classifier_heads: true,
+        ..Default::default()
+    };
+
+    let mut rng = Rng::new(12345);
+    let mut policy = RnnPolicy::new(&mut rng);
+
+    // Evaluate before training
+    println!("\n=== BEFORE TRAINING ===");
+    print_confidence_accuracy_table(&policy, &cube, &points, &reward_config, &mut rng);
+
+    println!("\nTraining for 6000 epochs...");
+    train_policy(&mut policy, &cube, &points, &training_config, &reward_config, &mut rng);
+
+    println!("\n=== AFTER TRAINING ===");
+    print_confidence_accuracy_table(&policy, &cube, &points, &reward_config, &mut rng);
+}
+
+/// Print a table showing both confidence (for correct class) and accuracy.
+fn print_confidence_accuracy_table(
+    policy: &RnnPolicy,
+    cube: &AnalyticalRotatedCube,
+    points: &[crate::adaptive_surface_nets_2::stage4::research::validation::ValidationPoint],
+    reward_config: &RewardConfig,
+    rng: &mut Rng,
+) {
+    use classifier_heads::GeometryType;
+
+    // Track per-class: correct count, total count, sum of correct-class confidence
+    let mut face_correct = 0usize;
+    let mut face_total = 0usize;
+    let mut face_conf_sum = 0.0f64; // Sum of face confidence for face points
+
+    let mut edge_correct = 0usize;
+    let mut edge_total = 0usize;
+    let mut edge_conf_sum = 0.0f64;
+
+    let mut corner_correct = 0usize;
+    let mut corner_total = 0usize;
+    let mut corner_conf_sum = 0.0f64;
+
+    // Also track what corners are predicted as
+    let mut corner_pred_dist = [0usize; 3]; // [face, edge, corner]
+
+    for (idx, point) in points.iter().enumerate() {
+        let episode = run_episode(policy, cube, point, idx, rng, false, reward_config);
+        let predictions = policy.classify(&episode.h_final);
+        let predicted_type = predictions.predicted_type();
+
+        let expected_type = match &point.expected {
+            ExpectedClassification::OnFace { .. } => GeometryType::Face,
+            ExpectedClassification::OnEdge { .. } => GeometryType::Edge,
+            ExpectedClassification::OnCorner { .. } => GeometryType::Corner,
+        };
+
+        match expected_type {
+            GeometryType::Face => {
+                face_total += 1;
+                face_conf_sum += predictions.face.confidence;
+                if predicted_type == GeometryType::Face {
+                    face_correct += 1;
+                }
+            }
+            GeometryType::Edge => {
+                edge_total += 1;
+                edge_conf_sum += predictions.edge.confidence;
+                if predicted_type == GeometryType::Edge {
+                    edge_correct += 1;
+                }
+            }
+            GeometryType::Corner => {
+                corner_total += 1;
+                corner_conf_sum += predictions.corner.confidence;
+                if predicted_type == GeometryType::Corner {
+                    corner_correct += 1;
+                }
+                // Track what corners are predicted as
+                match predicted_type {
+                    GeometryType::Face => corner_pred_dist[0] += 1,
+                    GeometryType::Edge => corner_pred_dist[1] += 1,
+                    GeometryType::Corner => corner_pred_dist[2] += 1,
+                }
+            }
+        }
+    }
+
+    // Print table
+    println!("\n{:10} {:>10} {:>10} {:>15}", "Class", "Accuracy", "Avg Conf", "Correct Conf");
+    println!("{}", "-".repeat(50));
+
+    let face_acc = if face_total > 0 { face_correct as f64 / face_total as f64 * 100.0 } else { 0.0 };
+    let face_avg_conf = if face_total > 0 { face_conf_sum / face_total as f64 } else { 0.0 };
+    println!("{:10} {:>9.1}% {:>10.3} {:>6}/{:>2} = {:.1}%",
+        "Face", face_acc, face_avg_conf, face_correct, face_total,
+        face_acc);
+
+    let edge_acc = if edge_total > 0 { edge_correct as f64 / edge_total as f64 * 100.0 } else { 0.0 };
+    let edge_avg_conf = if edge_total > 0 { edge_conf_sum / edge_total as f64 } else { 0.0 };
+    println!("{:10} {:>9.1}% {:>10.3} {:>6}/{:>2} = {:.1}%",
+        "Edge", edge_acc, edge_avg_conf, edge_correct, edge_total,
+        edge_acc);
+
+    let corner_acc = if corner_total > 0 { corner_correct as f64 / corner_total as f64 * 100.0 } else { 0.0 };
+    let corner_avg_conf = if corner_total > 0 { corner_conf_sum / corner_total as f64 } else { 0.0 };
+    println!("{:10} {:>9.1}% {:>10.3} {:>6}/{:>2} = {:.1}%",
+        "Corner", corner_acc, corner_avg_conf, corner_correct, corner_total,
+        corner_acc);
+
+    // Show corner prediction distribution
+    if corner_total > 0 {
+        println!("\nCorner points predicted as:");
+        println!("  Face:   {:2}/{:2} ({:.1}%)", corner_pred_dist[0], corner_total,
+            corner_pred_dist[0] as f64 / corner_total as f64 * 100.0);
+        println!("  Edge:   {:2}/{:2} ({:.1}%)", corner_pred_dist[1], corner_total,
+            corner_pred_dist[1] as f64 / corner_total as f64 * 100.0);
+        println!("  Corner: {:2}/{:2} ({:.1}%)", corner_pred_dist[2], corner_total,
+            corner_pred_dist[2] as f64 / corner_total as f64 * 100.0);
+    }
 }
 
 #[cfg(test)]

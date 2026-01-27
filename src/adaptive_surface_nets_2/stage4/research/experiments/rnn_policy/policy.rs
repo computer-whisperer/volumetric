@@ -18,7 +18,7 @@ use super::reward::{compute_step_reward_with_entropy, RewardConfig};
 
 /// Input dimension for the GRU.
 /// Features: prev_offset(3), in_out_sign(1), budget_remaining(1), crossings_found(1)
-pub const INPUT_DIM: usize = 6;
+pub const INPUT_DIM: usize = 5;
 
 /// Maximum samples per episode.
 pub const BUDGET: usize = 50;
@@ -352,7 +352,6 @@ pub fn run_episode_ex(
             prev_sample,
             prev_inside,
             step_idx,
-            crossings_found,
             CELL_SIZE,
         );
 
@@ -411,12 +410,15 @@ pub fn run_episode_ex(
         let closest = cube.closest_surface_point(sample_pos);
         let oracle_distance = closest.distance;
 
-        // Compute reward with entropy bonus
+        // Compute reward with entropy and directional diversity bonuses
         let reward = compute_step_reward_with_entropy(
             sample_pos,
             oracle_distance,
             &samples,
+            &inside_flags,
+            is_inside,
             is_crossing,
+            point.position,
             CELL_SIZE,
             &probs,
             reward_config,
@@ -460,7 +462,6 @@ fn build_input(
     prev_sample: Option<(f64, f64, f64)>,
     prev_inside: Option<bool>,
     step_idx: usize,
-    crossings_found: usize,
     cell_size: f64,
 ) -> Vec<f64> {
     // Previous sample offset from vertex, normalized by cell_size
@@ -484,16 +485,12 @@ fn build_input(
     // Budget remaining (1.0 at start, 0.0 at end)
     let budget_remaining = 1.0 - (step_idx as f64 / BUDGET as f64);
 
-    // Crossings found so far, normalized (expect ~3-10 crossings for good fit)
-    let crossings_norm = (crossings_found as f64 / 5.0).min(2.0);
-
     vec![
         prev_offset.0,      // 0: previous sample X offset / cell_size
         prev_offset.1,      // 1: previous sample Y offset / cell_size
         prev_offset.2,      // 2: previous sample Z offset / cell_size
         in_out_sign,        // 3: previous sample inside(+1) / outside(-1) / none(0)
         budget_remaining,   // 4: fraction of budget remaining
-        crossings_norm,     // 5: crossings found (normalized)
     ]
 }
 
@@ -507,15 +504,15 @@ mod tests {
         let mut rng = Rng::new(42);
         let policy = RnnPolicy::new(&mut rng);
         let count = policy.param_count();
-        // With INPUT_DIM=6, HIDDEN_DIM=32, NUM_OCTANTS=8:
-        // GRU: 3 * (32*6 + 32*32 + 32) = 3 * (192 + 1024 + 32) = 3 * 1248 = 3744
+        // With INPUT_DIM=5, HIDDEN_DIM=32, NUM_OCTANTS=8:
+        // GRU: 3 * (32*5 + 32*32 + 32) = 3 * (160 + 1024 + 32) = 3 * 1216 = 3648
         // Chooser: 8*32 + 8 = 264
         // Classifier heads:
-        //   Face: 4*32 + 4 = 132
-        //   Edge: 10*32 + 10 = 330
-        //   Corner: 10*32 + 10 = 330
-        //   Total: 792
-        // Grand total: 3744 + 264 + 792 = 4800
+        //   Face: 5*32 + 5 = 165
+        //   Edge: 12*32 + 12 = 396
+        //   Corner: 13*32 + 13 = 429
+        //   Total: 990
+        // Grand total: 3648 + 264 + 990 = 4902
         assert!(count > 4500 && count < 5200, "param_count={}", count);
     }
 
@@ -523,7 +520,7 @@ mod tests {
     fn test_build_input() {
         let vertex = (0.0, 0.0, 0.0);
         let prev_sample = Some((0.01, 0.02, -0.01));
-        let input = build_input(vertex, prev_sample, Some(true), 5, 2, CELL_SIZE);
+        let input = build_input(vertex, prev_sample, Some(true), 5, CELL_SIZE);
 
         assert_eq!(input.len(), INPUT_DIM);
         // prev_offset = sample / cell_size
@@ -534,8 +531,6 @@ mod tests {
         assert!((input[3] - 1.0).abs() < 1e-10);
         // budget_remaining at step 5
         assert!((input[4] - (1.0 - 5.0 / BUDGET as f64)).abs() < 1e-10);
-        // crossings_norm = 2 / 5 = 0.4
-        assert!((input[5] - 0.4).abs() < 1e-10);
     }
 
     #[test]

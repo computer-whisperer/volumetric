@@ -21,12 +21,14 @@ These approaches don't adapt based on what they've already learned. The RNN poli
 ### Network Components
 
 ```
-Input[6] → GRU[32] → Linear[8] → Softmax → Weighted Position
+Input[5] → GRU[64] → Linear[8] → Softmax → Weighted Position
+                  ↓
+            Classifier Heads → Face/Edge/Corner predictions
 ```
 
 #### GRU Updater
-- **Input dimension**: 6 features (clean, no oracle cheating)
-- **Hidden dimension**: 32
+- **Input dimension**: 5 features (clean, no oracle cheating)
+- **Hidden dimension**: 64
 - **Output**: Updated hidden state
 
 The GRU was chosen over LSTM because:
@@ -39,30 +41,41 @@ The GRU was chosen over LSTM because:
 - **Output**: 8 weights (one per octant corner)
 - **Position calculation**: Weighted average of cube corners via softmax
 
-### Input Features (v2 - Clean Design)
+### Input Features (v5 - Minimal Design)
 
 | Index | Feature | Range | Description |
 |-------|---------|-------|-------------|
 | 0-2 | prev_offset | ~[-1, 1] | `(prev_sample - vertex) / cell_size` |
 | 3 | in_out_sign | {-1, 0, 1} | Previous sample: inside=+1, outside=-1, first=0 |
 | 4 | budget_remaining | [0, 1] | `1 - step_idx / BUDGET` |
-| 5 | crossings_norm | [0, 2] | `crossings_found / 5` (capped) |
 
 **Key design decisions:**
 - No oracle information in inputs (previous version cheated with hint_normal)
 - All spatial values normalized by cell_size
 - Minimal feature set - only information available at inference time
+- Removed `crossings_found` (v5) - model should learn from spatial patterns, not counts
 
 ### Parameter Count
 
 | Component | Parameters |
 |-----------|------------|
-| GRU W_z, W_r, W_h | 3 × (32 × 6) = 576 |
-| GRU U_z, U_r, U_h | 3 × (32 × 32) = 3,072 |
-| GRU b_z, b_r, b_h | 3 × 32 = 96 |
-| Chooser W | 8 × 32 = 256 |
+| GRU W_z, W_r, W_h | 3 × (64 × 5) = 960 |
+| GRU U_z, U_r, U_h | 3 × (64 × 64) = 12,288 |
+| GRU b_z, b_r, b_h | 3 × 64 = 192 |
+| Chooser W | 8 × 64 = 512 |
 | Chooser b | 8 |
-| **Total** | **4,008** |
+| Face head | 5 × 64 + 5 = 325 |
+| Edge head | 12 × 64 + 12 = 780 |
+| Corner head | 13 × 64 + 13 = 845 |
+| **Total** | **15,910** |
+
+#### Classifier Head Outputs
+
+| Head | Outputs | Description |
+|------|---------|-------------|
+| Face | 5 | confidence + normal(3) + offset(1) |
+| Edge | 12 | confidence + normal_a(3) + offset_a + normal_b(3) + offset_b + direction(3) |
+| Corner | 13 | confidence + [normal(3) + offset] × 3 |
 
 ## Octant System
 
@@ -157,12 +170,28 @@ The terminal reward encourages the policy to collect samples that:
 5. Compute policy gradient via BPTT
 6. Update with Adam optimizer
 
+### Parallel Training
+
+When the `native` feature is enabled, episode collection and evaluation are
+parallelized using rayon. This provides ~2.5x speedup on multi-core systems:
+
+```bash
+# Build with parallel training
+cargo build --release --features native
+
+# Training time: ~1.5 minutes (vs ~4 minutes sequential)
+cargo run --release --features native --bin sample_cloud_dump -- --rnn-policy train
+```
+
+Each parallel worker uses a deterministic RNG seeded by `(epoch * num_points + point_idx)`,
+ensuring reproducible results across runs.
+
 ### Current Configuration
 
 | Parameter | Value |
 |-----------|-------|
-| Epochs | 6000 |
-| Learning rate | 0.001 |
+| Epochs | 24000 |
+| Learning rate | 0.0003 |
 | Discount (γ) | 0.98 |
 | Gradient clipping | 1.0 |
 | Adam β₁ | 0.9 |
@@ -177,9 +206,44 @@ The terminal reward encourages the policy to collect samples that:
 - Random 3D offset within `0.2 × cell_size` of surface (easier start)
 - Deterministic seed for reproducibility
 
-## Results (v4 - 2026-01-26)
+## Results (v7 - 2026-01-27)
 
-### Classification Fit Rates by Geometry Type
+### Neural Classifier Accuracy (with Asymmetric Margin Loss)
+
+| Geometry | Type Accuracy | Confidence | Normal Loss |
+|----------|---------------|------------|-------------|
+| Face | 42% (5/12) | 0.241 | 0.496 |
+| Edge | 29% (7/24) | 0.255 | 0.274 |
+| Corner | **94%** (15/16) | 0.352 | 0.269 |
+| **Overall** | **51.9%** | - | - |
+
+### Key Findings
+
+1. **Corner classification solved**: 94% accuracy (up from 0%!)
+2. **Balanced confidence**: All heads now have similar confidence levels (0.24-0.35)
+3. **Trade-off with edges**: Edge accuracy dropped to 29% (from 92% in v6)
+4. **Face improved**: 42% (up from 25% in v6)
+
+### What Fixed Corners
+
+The corner confidence problem was solved with two changes:
+1. **Asymmetric margin loss**: Only applied when ground truth is corner
+   - Requires corner confidence to exceed other heads by margin=0.1
+   - Doesn't hurt other classes when they're correct
+2. **Higher wrong confidence penalty**: w_wrong_conf=4.0 (up from 2.0)
+   - Penalizes overconfident wrong predictions
+   - Prevents any single head from dominating
+
+### Remaining Challenge: Edge Classification
+
+Edges are now the weakest class (29%). The model sometimes misclassifies edges as:
+- Corners (when corner confidence is boosted by margin loss)
+- Faces (simpler geometry is sometimes preferred)
+
+This suggests the edge/corner distinction needs more work, but the fundamental
+corner confidence calibration problem is solved.
+
+### Previous Results (v4 - RANSAC-based)
 
 | Geometry | Before Training | After Training |
 |----------|-----------------|----------------|
@@ -188,31 +252,108 @@ The terminal reward encourages the policy to collect samples that:
 | Corner | 0% (0/16) | 0% (0/16) |
 | **Overall** | 0% | **9.6%** |
 
-### Fit Quality (when fits succeed)
-
-| Metric | Value |
-|--------|-------|
-| Normal accuracy reward | 1.556 (of max 20) |
-| Residual reward | ~0.3 (of max 5) |
-| Avg crossings/episode | 2.2 |
-| Avg surface points | 67 (face), 38 (edge), 43 (corner) |
-
-### Key Findings
-
-1. **Faces work well**: 42% fit rate with reasonable normal accuracy
-2. **Edges/corners fail**: 0% fit rate despite having 38-43 outside samples
-3. **Root cause identified**: Outside samples cluster on ONE face, not spread across multiple faces needed for edge/corner fitting
-
-### Sample Exploration (improved from v2)
-
-| Version | Sample Spread per Axis |
-|---------|----------------------|
-| v1 | ~0.001 (degenerate) |
-| v2 | ~0.05 (full cell) |
-| v3 | ~0.003 (reward hacking - narrow strip) |
-| v4 | ~0.04 (recovered after fixing rewards) |
-
 ## Changelog
+
+### v7 (2026-01-27) - Margin Loss & Confidence Calibration Fix
+
+**Problem solved: Corner confidence calibration**
+- Corners now correctly classified at 94% (was 0%)
+- Overall accuracy improved to 51.9%
+
+**Asymmetric margin loss (only for corners):**
+- Added hinge-style margin loss: `max(0, margin - (correct_conf - wrong_conf))`
+- Only activated when ground truth is Corner (not Face/Edge)
+- Parameters: w_margin=3.0, margin=0.1
+- This pushes corner confidence above other heads without destabilizing other classes
+
+**Increased wrong confidence penalty:**
+- w_wrong_conf increased from 2.0 to 4.0
+- Penalizes heads for being confident when they're wrong
+- Prevents any single head from dominating
+
+**Loss configuration (final):**
+```rust
+w_correct_conf: 1.0,
+w_normal: 5.0,
+w_offset: 2.0,
+w_wrong_conf: 4.0,  // increased
+w_margin: 3.0,      // new
+margin: 0.1,        // new
+class_weights: [1.0, 1.0, 1.0],  // equal
+```
+
+**Results progression:**
+| Version | Face | Edge | Corner | Overall |
+|---------|------|------|--------|---------|
+| v6 (baseline) | 25% | 92% | 0% | 48% |
+| v7 + symmetric margin | 67% | 0% | 75% | 27% |
+| v7 + asymmetric margin | 42% | 29% | 94% | **52%** |
+
+**Key insight:**
+The corner problem was not about model capacity or architecture - it was about
+the training objective. Independent sigmoid confidences don't compete directly.
+The margin loss creates the necessary competition for corners to win.
+
+### v6 (2026-01-27) - Model Scale-Up Experiment
+
+**Capacity increase:**
+- Scaled HIDDEN_DIM from 32 to 64 (3.2x more parameters: 4,902 → 15,910)
+- Extended training from 6k to 24k epochs
+- Reduced learning rate from 0.001 to 0.0003 for stability
+
+**Training observations:**
+- With lr=0.001: unstable, high gradient norms
+- With lr=0.0003: smooth descent, loss reached 3.683 at epoch 23k (best)
+- Training still improving at end, suggesting even longer training could help
+
+**Results:**
+- Edge accuracy improved: 83% → 92%
+- Face accuracy regressed: 50% → 25%
+- Corner accuracy unchanged: 0%
+- Corner confidence improved (0.251 → 0.330) but still loses to edge (0.532)
+
+**Key insight:**
+More capacity helps edge classification but doesn't solve the corner confidence problem.
+The model learns to be a very confident edge classifier, making it harder for corners to win.
+This is not a capacity problem - it's a training objective/architecture problem.
+
+### v5 (2026-01-27) - Neural Classifier Heads & Offset Prediction
+
+**Major architecture change: Neural classifier heads**
+- Replaced RANSAC-based classification with learned neural heads
+- Three parallel heads from GRU hidden state: Face, Edge, Corner
+- Each head predicts: confidence + normals + offsets
+- Training uses cross-entropy for type classification + cosine loss for normals + L1 for offsets
+
+**Classifier head outputs:**
+- Face: confidence + 1 normal + 1 offset (5 outputs)
+- Edge: confidence + 2 normals + 2 offsets + direction (12 outputs)
+- Corner: confidence + 3 normals + 3 offsets (13 outputs)
+
+**Offset prediction:**
+- Offset = signed distance from vertex to plane, normalized by cell_size
+- Computed as: `(dot(vertex, normal) - 0.5) / cell_size`
+- Enables direct surface position prediction without RANSAC fitting
+
+**Input simplification:**
+- Removed `crossings_found` from inputs (INPUT_DIM: 6 → 5)
+- Model should learn from spatial patterns, not explicit crossing counts
+
+**Order-invariant loss:**
+- Edge normals: best matching of 2 predicted to 2 expected
+- Corner normals: greedy assignment of 3 predicted to 3 expected
+- Offset loss uses same assignment as normal loss
+
+**Results:**
+- Edge classification: 83% accuracy (major improvement over RANSAC's 0%)
+- Face classification: 50% accuracy
+- Corner classification: 0% (confidence calibration problem)
+- Corner normal quality is actually BEST (0.255 loss) but confidence always loses
+
+**Current investigation:**
+- Why does corner confidence (~0.25) always lose to edge confidence (~0.45)?
+- Possible causes: class imbalance (16 corners vs 24 edges), architecture bias
+- The model predicts good corner normals but refuses to classify as corner
 
 ### v4 (2026-01-26) - Reward Rebalancing & Edge/Corner Investigation
 
@@ -300,16 +441,17 @@ classifier fits, not just samples near the surface.
 
 ```
 rnn_policy/
-├── mod.rs          # Public API, training entry points
-├── math.rs         # Vector/matrix operations
-├── gru.rs          # GRU forward/backward passes
-├── chooser.rs      # Octant weights → position mapping
-├── policy.rs       # RnnPolicy struct, episode rollout, input building
-├── gradients.rs    # BPTT gradient computation
-├── reward.rs       # Per-step + terminal reward functions
-├── classifier.rs   # RANSAC classifiers for face/edge/corner fitting
-├── training.rs     # Adam optimizer, training loop, evaluation
-└── README.md       # This file
+├── mod.rs              # Public API, training entry points, sweep experiments
+├── math.rs             # Vector/matrix operations
+├── gru.rs              # GRU forward/backward passes
+├── chooser.rs          # Octant weights → position mapping
+├── policy.rs           # RnnPolicy struct, episode rollout, input building
+├── gradients.rs        # BPTT gradient computation
+├── reward.rs           # Per-step + terminal reward functions
+├── classifier.rs       # RANSAC classifiers for face/edge/corner fitting (legacy)
+├── classifier_heads.rs # Neural classifier heads (Face/Edge/Corner prediction)
+├── training.rs         # Adam optimizer, training loop, evaluation
+└── README.md           # This file
 ```
 
 ## Usage
@@ -341,24 +483,32 @@ cargo run --release --bin sample_cloud_inspect -- --file samples.cbor --set 0
 
 ## Future Work
 
-### Immediate (Edge/Corner Classification)
-1. **Investigate sample clustering**: Why do outside samples cluster on one face?
-   - Visualize sample distributions for edge/corner vertices
-   - Check if policy is biased toward certain octants
-2. **Geometry-aware exploration**: Add reward for sampling on multiple faces
-   - Could use dot product of sample directions to encourage diversity
-   - Or partial credit for finding samples on different faces
-3. **Curriculum learning**: Train on faces first, then gradually add edges/corners
+### Immediate (Edge Classification Problem)
+Corner problem solved (94% accuracy). Now edges are the weakest class (29%).
+
+1. **Edge-specific improvements**:
+   - Add asymmetric margin for edges (similar to what fixed corners)
+   - Try edge-specific class weight increase
+   - Investigate edge→corner misclassification patterns
+2. **Hierarchical classification**:
+   - First: Face vs Multi-plane (Edge/Corner)
+   - Second: Edge vs Corner
+   - May help disambiguate 2-plane vs 3-plane geometry
+3. **Feature engineering**:
+   - Add angle between predicted normals as auxiliary feature
+   - Edge geometry: normals should be ~90° apart
+   - Corner geometry: normals should span 3D
 
 ### Short-term
 1. **Scale up offset**: Gradually increase validation offset toward full cell_size
 2. **More shapes**: Train on cylinder, chamfered box, CSG combinations
-3. **Early stopping**: End episodes when sufficient quality achieved
+3. **Longer training**: Loss still improving at 24k epochs
 
-### Medium-term
-1. **Entropy bonus**: Regularization to maintain exploration
-2. **Larger capacity**: Try hidden_dim=64 or 128
-3. **Attention**: Consider transformer architecture for sample history
+### Solved
+- ✅ **Corner confidence problem** (v7): Asymmetric margin loss + higher wrong_conf penalty
+- ✅ Larger capacity (hidden_dim=64): Now 15,910 parameters
+- ✅ Lower learning rate (0.0003): Stable training
+- ✅ Longer training (24k epochs): Continued improvement
 
 ### Long-term
 1. **Integration**: Replace sampling in actual surface nets algorithm

@@ -1,6 +1,7 @@
 //! Training loop for RNN policy.
 //!
 //! Uses Adam optimizer with gradient clipping for stable training.
+//! When the `native` feature is enabled, episode collection is parallelized using rayon.
 
 use crate::adaptive_surface_nets_2::stage4::research::analytical_cube::AnalyticalRotatedCube;
 use crate::adaptive_surface_nets_2::stage4::research::oracle::OracleClassification;
@@ -9,13 +10,17 @@ use crate::adaptive_surface_nets_2::stage4::research::validation::{
 };
 
 use super::classifier_heads::{
-    compute_classifier_gradients, compute_classifier_loss, ClassifierLossConfig, ExpectedGeometry,
-    CORNER_HEAD_OUTPUTS, EDGE_HEAD_OUTPUTS, FACE_HEAD_OUTPUTS,
+    compute_classifier_gradients, compute_classifier_loss, ClassifierHeadGradients,
+    ClassifierLossConfig, ExpectedGeometry, CORNER_HEAD_OUTPUTS, EDGE_HEAD_OUTPUTS,
+    FACE_HEAD_OUTPUTS,
 };
 use super::gradients::{compute_batch_gradient, PolicyGradients};
 use super::gru::{Rng, HIDDEN_DIM};
-use super::policy::{run_episode, RnnPolicy, BUDGET, CELL_SIZE, INPUT_DIM};
+use super::policy::{run_episode, Episode, RnnPolicy, BUDGET, CELL_SIZE, INPUT_DIM};
 use super::reward::{compute_terminal_reward, RewardConfig, TerminalRewardConfig};
+
+#[cfg(feature = "native")]
+use rayon::prelude::*;
 
 /// Training configuration.
 #[derive(Clone, Debug)]
@@ -256,7 +261,170 @@ pub struct EpochStats {
     pub avg_samples: f64,
 }
 
+/// Result of processing a single episode (for parallel collection).
+struct EpisodeResult {
+    episode: Episode,
+    classifier_grads: Option<ClassifierHeadGradients>,
+    classifier_loss: f64,
+}
+
+/// Collect episodes in parallel using rayon (native feature).
+#[cfg(feature = "native")]
+fn collect_episodes_parallel(
+    policy: &RnnPolicy,
+    training_cube: &AnalyticalRotatedCube,
+    training_points: &[ValidationPoint],
+    config: &TrainingConfig,
+    reward_config: &RewardConfig,
+    epoch: usize,
+) -> Vec<EpisodeResult> {
+    let num_points = training_points.len();
+
+    training_points
+        .par_iter()
+        .enumerate()
+        .map(|(idx, point)| {
+            // Create thread-local RNG with deterministic seed
+            let seed = (epoch as u64 * num_points as u64 + idx as u64) ^ 0xDEADBEEF;
+            let mut rng = Rng::new(seed);
+
+            let mut episode = run_episode(policy, training_cube, point, idx, &mut rng, true, reward_config);
+
+            // Compute terminal reward using legacy RANSAC if enabled
+            if config.use_terminal_reward && !config.use_classifier_heads {
+                let terminal_result = compute_terminal_reward(
+                    &episode.final_samples,
+                    &episode.inside_flags,
+                    point.position,
+                    &point.expected,
+                    CELL_SIZE,
+                    &config.terminal_reward,
+                );
+                episode.terminal_reward = terminal_result.reward;
+
+                if let Some(last_reward) = episode.rewards.last_mut() {
+                    *last_reward += terminal_result.reward;
+                }
+            }
+
+            // Compute classifier head loss and gradients if enabled
+            let (classifier_grads, classifier_loss) = if config.use_classifier_heads {
+                let expected_geom = expected_to_geometry(&point.expected, point.position);
+                let predictions = policy.classify(&episode.h_final);
+
+                let (loss, _, _, _, _) = compute_classifier_loss(
+                    &predictions,
+                    &expected_geom,
+                    &config.classifier_loss,
+                );
+
+                let (head_grads, _dh) = compute_classifier_gradients(
+                    &policy.classifier_heads,
+                    &episode.h_final,
+                    &predictions,
+                    &expected_geom,
+                    &config.classifier_loss,
+                );
+
+                let classifier_reward = -loss * 0.5;
+                if let Some(last_reward) = episode.rewards.last_mut() {
+                    *last_reward += classifier_reward;
+                }
+                episode.terminal_reward = classifier_reward;
+
+                (Some(head_grads), loss)
+            } else {
+                (None, 0.0)
+            };
+
+            EpisodeResult {
+                episode,
+                classifier_grads,
+                classifier_loss,
+            }
+        })
+        .collect()
+}
+
+/// Collect episodes sequentially (fallback when native feature is disabled).
+#[cfg(not(feature = "native"))]
+fn collect_episodes_parallel(
+    policy: &RnnPolicy,
+    training_cube: &AnalyticalRotatedCube,
+    training_points: &[ValidationPoint],
+    config: &TrainingConfig,
+    reward_config: &RewardConfig,
+    epoch: usize,
+) -> Vec<EpisodeResult> {
+    let num_points = training_points.len();
+
+    training_points
+        .iter()
+        .enumerate()
+        .map(|(idx, point)| {
+            let seed = (epoch as u64 * num_points as u64 + idx as u64) ^ 0xDEADBEEF;
+            let mut rng = Rng::new(seed);
+
+            let mut episode = run_episode(policy, training_cube, point, idx, &mut rng, true, reward_config);
+
+            if config.use_terminal_reward && !config.use_classifier_heads {
+                let terminal_result = compute_terminal_reward(
+                    &episode.final_samples,
+                    &episode.inside_flags,
+                    point.position,
+                    &point.expected,
+                    CELL_SIZE,
+                    &config.terminal_reward,
+                );
+                episode.terminal_reward = terminal_result.reward;
+
+                if let Some(last_reward) = episode.rewards.last_mut() {
+                    *last_reward += terminal_result.reward;
+                }
+            }
+
+            let (classifier_grads, classifier_loss) = if config.use_classifier_heads {
+                let expected_geom = expected_to_geometry(&point.expected, point.position);
+                let predictions = policy.classify(&episode.h_final);
+
+                let (loss, _, _, _, _) = compute_classifier_loss(
+                    &predictions,
+                    &expected_geom,
+                    &config.classifier_loss,
+                );
+
+                let (head_grads, _dh) = compute_classifier_gradients(
+                    &policy.classifier_heads,
+                    &episode.h_final,
+                    &predictions,
+                    &expected_geom,
+                    &config.classifier_loss,
+                );
+
+                let classifier_reward = -loss * 0.5;
+                if let Some(last_reward) = episode.rewards.last_mut() {
+                    *last_reward += classifier_reward;
+                }
+                episode.terminal_reward = classifier_reward;
+
+                (Some(head_grads), loss)
+            } else {
+                (None, 0.0)
+            };
+
+            EpisodeResult {
+                episode,
+                classifier_grads,
+                classifier_loss,
+            }
+        })
+        .collect()
+}
+
 /// Train the RNN policy.
+///
+/// When the `native` feature is enabled, episode collection is parallelized
+/// across CPU cores using rayon, providing significant speedup for training.
 pub fn train_policy(
     policy: &mut RnnPolicy,
     cube: &AnalyticalRotatedCube,
@@ -282,65 +450,27 @@ pub fn train_policy(
             (cube.clone(), points.to_vec())
         };
 
-        // Collect episodes for all points
-        let mut episodes = Vec::new();
-        let mut classifier_grads_sum = super::classifier_heads::ClassifierHeadGradients::zeros();
+        // Collect episodes for all points (parallelized when native feature enabled)
+        let results = collect_episodes_parallel(
+            policy,
+            &training_cube,
+            &training_points,
+            config,
+            reward_config,
+            epoch,
+        );
+
+        // Aggregate results from parallel collection
+        let mut episodes = Vec::with_capacity(results.len());
+        let mut classifier_grads_sum = ClassifierHeadGradients::zeros();
         let mut total_classifier_loss = 0.0;
 
-        for (idx, point) in training_points.iter().enumerate() {
-            let mut episode = run_episode(policy, &training_cube, point, idx, rng, true, reward_config);
-
-            // Compute terminal reward using legacy RANSAC if enabled
-            if config.use_terminal_reward && !config.use_classifier_heads {
-                let terminal_result = compute_terminal_reward(
-                    &episode.final_samples,
-                    &episode.inside_flags,
-                    point.position,
-                    &point.expected,
-                    CELL_SIZE,
-                    &config.terminal_reward,
-                );
-                episode.terminal_reward = terminal_result.reward;
-
-                // Add terminal reward to the last step's reward
-                if let Some(last_reward) = episode.rewards.last_mut() {
-                    *last_reward += terminal_result.reward;
-                }
+        for result in results {
+            if let Some(grads) = result.classifier_grads {
+                classifier_grads_sum.add(&grads);
             }
-
-            // Compute classifier head loss and gradients if enabled
-            if config.use_classifier_heads {
-                let expected_geom = expected_to_geometry(&point.expected);
-                let predictions = policy.classify(&episode.h_final);
-
-                let (loss, _, _, _) = compute_classifier_loss(
-                    &predictions,
-                    &expected_geom,
-                    &config.classifier_loss,
-                );
-                total_classifier_loss += loss;
-
-                // Compute gradients for classifier heads
-                let (head_grads, _dh) = compute_classifier_gradients(
-                    &policy.classifier_heads,
-                    &episode.h_final,
-                    &predictions,
-                    &expected_geom,
-                    &config.classifier_loss,
-                );
-                classifier_grads_sum.add(&head_grads);
-
-                // Add classifier loss as terminal reward (negative because we minimize loss)
-                // This encourages the policy to sample in ways that help classification
-                // Scale increased to 0.5 for stronger signal
-                let classifier_reward = -loss * 0.5;
-                if let Some(last_reward) = episode.rewards.last_mut() {
-                    *last_reward += classifier_reward;
-                }
-                episode.terminal_reward = classifier_reward;
-            }
-
-            episodes.push(episode);
+            total_classifier_loss += result.classifier_loss;
+            episodes.push(result.episode);
         }
 
         // Compute batch gradient for policy (GRU + Chooser)
@@ -414,30 +544,11 @@ pub fn train_policy(
 }
 
 /// Convert ExpectedClassification to ExpectedGeometry for classifier loss.
-fn expected_to_geometry(expected: &ExpectedClassification) -> ExpectedGeometry {
-    match expected {
-        ExpectedClassification::OnFace { expected_normal, .. } => {
-            ExpectedGeometry::Face {
-                normal: *expected_normal,
-            }
-        }
-        ExpectedClassification::OnEdge {
-            expected_normals,
-            expected_direction,
-            ..
-        } => {
-            ExpectedGeometry::Edge {
-                normal_a: expected_normals.0,
-                normal_b: expected_normals.1,
-                direction: *expected_direction,
-            }
-        }
-        ExpectedClassification::OnCorner { expected_normals, .. } => {
-            ExpectedGeometry::Corner {
-                normals: *expected_normals,
-            }
-        }
-    }
+fn expected_to_geometry(
+    expected: &ExpectedClassification,
+    vertex_position: (f64, f64, f64),
+) -> ExpectedGeometry {
+    ExpectedGeometry::from_classification(expected, vertex_position)
 }
 
 /// Evaluation result for a single point.
@@ -490,67 +601,24 @@ impl EvaluationResult {
 ///
 /// Uses the oracle-selected RANSAC classifier for each point and measures
 /// how well the fitted geometry matches the oracle ground truth.
+///
+/// When the `native` feature is enabled, evaluation is parallelized.
 pub fn evaluate_policy(
     policy: &RnnPolicy,
     cube: &AnalyticalRotatedCube,
     points: &[ValidationPoint],
     reward_config: &RewardConfig,
-    rng: &mut Rng,
+    _rng: &mut Rng,
 ) -> EvaluationResult {
-    let terminal_config = TerminalRewardConfig::default();
-    let mut evaluations = Vec::new();
-    let mut total_reward = 0.0;
-    let mut total_samples = 0u64;
-    let mut fit_successes = 0;
-    let mut total_normal_reward = 0.0;
-    let mut total_residual_reward = 0.0;
-
-    for (idx, point) in points.iter().enumerate() {
-        let episode = run_episode(policy, cube, point, idx, rng, false, reward_config);
-
-        let expected_class = expected_class_from_point(point);
-
-        // Use oracle-selected RANSAC classifier to evaluate fit quality
-        let terminal_result = compute_terminal_reward(
-            &episode.final_samples,
-            &episode.inside_flags,
-            point.position,
-            &point.expected,
-            CELL_SIZE,
-            &terminal_config,
-        );
-
-        if terminal_result.fit_success {
-            fit_successes += 1;
-        }
-        total_normal_reward += terminal_result.normal_reward;
-        total_residual_reward += terminal_result.residual_reward;
-
-        let point_reward: f64 = episode.rewards.iter().sum();
-        total_reward += point_reward;
-        total_samples += episode.samples_used;
-
-        let crossings_found = episode
-            .steps
-            .iter()
-            .filter(|s| s.is_crossing)
-            .count();
-
-        evaluations.push(PointEvaluation {
-            point_idx: idx,
-            description: point.description.clone(),
-            expected_class,
-            fit_success: terminal_result.fit_success,
-            normal_reward: terminal_result.normal_reward,
-            residual_reward: terminal_result.residual_reward,
-            total_reward: point_reward,
-            samples_used: episode.samples_used,
-            crossings_found,
-            surface_points_count: terminal_result.surface_points_count,
-        });
-    }
+    let evaluations = evaluate_points_parallel(policy, cube, points, reward_config);
 
     let n = points.len() as f64;
+    let fit_successes = evaluations.iter().filter(|e| e.fit_success).count();
+    let total_normal_reward: f64 = evaluations.iter().map(|e| e.normal_reward).sum();
+    let total_residual_reward: f64 = evaluations.iter().map(|e| e.residual_reward).sum();
+    let total_reward: f64 = evaluations.iter().map(|e| e.total_reward).sum();
+    let total_samples: u64 = evaluations.iter().map(|e| e.samples_used).sum();
+
     EvaluationResult {
         fit_rate: fit_successes as f64 / n,
         avg_normal_reward: total_normal_reward / n,
@@ -559,6 +627,102 @@ pub fn evaluate_policy(
         avg_samples: total_samples as f64 / n,
         points: evaluations,
     }
+}
+
+/// Evaluate points in parallel (native feature).
+#[cfg(feature = "native")]
+fn evaluate_points_parallel(
+    policy: &RnnPolicy,
+    cube: &AnalyticalRotatedCube,
+    points: &[ValidationPoint],
+    reward_config: &RewardConfig,
+) -> Vec<PointEvaluation> {
+    let terminal_config = TerminalRewardConfig::default();
+
+    points
+        .par_iter()
+        .enumerate()
+        .map(|(idx, point)| {
+            let seed = (idx as u64) ^ 0xCAFEBABE;
+            let mut rng = Rng::new(seed);
+
+            let episode = run_episode(policy, cube, point, idx, &mut rng, false, reward_config);
+            let expected_class = expected_class_from_point(point);
+
+            let terminal_result = compute_terminal_reward(
+                &episode.final_samples,
+                &episode.inside_flags,
+                point.position,
+                &point.expected,
+                CELL_SIZE,
+                &terminal_config,
+            );
+
+            let point_reward: f64 = episode.rewards.iter().sum();
+            let crossings_found = episode.steps.iter().filter(|s| s.is_crossing).count();
+
+            PointEvaluation {
+                point_idx: idx,
+                description: point.description.clone(),
+                expected_class,
+                fit_success: terminal_result.fit_success,
+                normal_reward: terminal_result.normal_reward,
+                residual_reward: terminal_result.residual_reward,
+                total_reward: point_reward,
+                samples_used: episode.samples_used,
+                crossings_found,
+                surface_points_count: terminal_result.surface_points_count,
+            }
+        })
+        .collect()
+}
+
+/// Evaluate points sequentially (fallback when native feature is disabled).
+#[cfg(not(feature = "native"))]
+fn evaluate_points_parallel(
+    policy: &RnnPolicy,
+    cube: &AnalyticalRotatedCube,
+    points: &[ValidationPoint],
+    reward_config: &RewardConfig,
+) -> Vec<PointEvaluation> {
+    let terminal_config = TerminalRewardConfig::default();
+
+    points
+        .iter()
+        .enumerate()
+        .map(|(idx, point)| {
+            let seed = (idx as u64) ^ 0xCAFEBABE;
+            let mut rng = Rng::new(seed);
+
+            let episode = run_episode(policy, cube, point, idx, &mut rng, false, reward_config);
+            let expected_class = expected_class_from_point(point);
+
+            let terminal_result = compute_terminal_reward(
+                &episode.final_samples,
+                &episode.inside_flags,
+                point.position,
+                &point.expected,
+                CELL_SIZE,
+                &terminal_config,
+            );
+
+            let point_reward: f64 = episode.rewards.iter().sum();
+            let crossings_found = episode.steps.iter().filter(|s| s.is_crossing).count();
+
+            PointEvaluation {
+                point_idx: idx,
+                description: point.description.clone(),
+                expected_class,
+                fit_success: terminal_result.fit_success,
+                normal_reward: terminal_result.normal_reward,
+                residual_reward: terminal_result.residual_reward,
+                total_reward: point_reward,
+                samples_used: episode.samples_used,
+                crossings_found,
+                surface_points_count: terminal_result.surface_points_count,
+            }
+        })
+        .collect()
 }
 
 fn expected_class_from_point(point: &ValidationPoint) -> OracleClassification {

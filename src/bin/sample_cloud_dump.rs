@@ -5,13 +5,15 @@ use volumetric::adaptive_surface_nets_2::stage4::research::experiments::ml_polic
     dump_ml_policy_sample_cloud, MlPolicyDumpKind,
 };
 use volumetric::adaptive_surface_nets_2::stage4::research::experiments::rnn_policy::{
-    load_and_dump_rnn_policy, train_and_save_rnn_policy, DEFAULT_MODEL_PATH,
+    load_and_dump_rnn_policy, run_corner_diagnostic, run_reward_sweep, train_and_save_rnn_policy, DEFAULT_MODEL_PATH,
 };
 
 #[derive(Clone, Copy)]
 enum RnnCommand {
     Train,
     Dump,
+    Sweep,
+    Diagnostic,
 }
 
 fn main() {
@@ -45,6 +47,8 @@ fn main() {
                     rnn_command = match value.as_str() {
                         "train" => Some(RnnCommand::Train),
                         "dump" => Some(RnnCommand::Dump),
+                        "sweep" => Some(RnnCommand::Sweep),
+                        "diag" => Some(RnnCommand::Diagnostic),
                         _ => None,
                     };
                 }
@@ -81,6 +85,12 @@ fn main() {
                 let output = output.unwrap_or_else(|| PathBuf::from("sample_cloud_rnn_trained.cbor"));
                 load_and_dump_rnn_policy(&model, &output, use_discrete);
             }
+            RnnCommand::Sweep => {
+                run_reward_sweep();
+            }
+            RnnCommand::Diagnostic => {
+                run_corner_diagnostic();
+            }
         }
         return;
     }
@@ -110,6 +120,7 @@ fn print_help() {
     eprintln!("  sample_cloud_dump --ml-policy <directional|octant-argmax|octant-lerp> [--out <file.cbor>]");
     eprintln!("  sample_cloud_dump --rnn-policy train [--model <file.bin>]");
     eprintln!("  sample_cloud_dump --rnn-policy dump [--model <file.bin>] [--out <file.cbor>] [--discrete]");
+    eprintln!("  sample_cloud_dump --rnn-policy sweep    # Run reward configuration sweep");
     eprintln!();
     eprintln!("Options:");
     eprintln!("  --discrete    Use discrete corner sampling instead of weighted positions");

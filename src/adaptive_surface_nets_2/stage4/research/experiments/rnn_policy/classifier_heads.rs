@@ -1,32 +1,36 @@
-//! Neural classification heads for geometry type and normal prediction.
+//! Neural classification heads for geometry type, normal, and offset prediction.
 //!
 //! These heads replace the RANSAC-based classifier, learning to directly predict
-//! geometry type (face/edge/corner) and normals from the RNN hidden state.
+//! geometry type (face/edge/corner), normals, and plane offsets from the RNN hidden state.
 //!
 //! ## Architecture
 //!
 //! Three parallel heads from the shared RNN hidden state:
-//! - Face head: confidence + 1 normal (4 outputs)
-//! - Edge head: confidence + 2 normals + edge direction (10 outputs)
-//! - Corner head: confidence + 3 normals (10 outputs)
+//! - Face head: confidence + 1 normal + 1 offset (5 outputs)
+//! - Edge head: confidence + 2 normals + 2 offsets + edge direction (12 outputs)
+//! - Corner head: confidence + 3 normals + 3 offsets (13 outputs)
+//!
+//! The offset is the signed distance from the vertex to the plane, normalized by cell_size.
+//! A positive offset means the plane is in the positive normal direction from the vertex.
 //!
 //! ## Training Loss
 //!
 //! For the oracle-selected correct head:
 //! - Maximize confidence (cross-entropy style)
 //! - Minimize normal error (cosine similarity loss)
+//! - Minimize offset error (L1 or L2 loss)
 //!
 //! For wrong heads:
 //! - Minimize confidence (penalize false positives)
-//! - Ignore normal predictions
+//! - Ignore normal/offset predictions
 
 use super::gru::{Rng, HIDDEN_DIM};
 use super::math::{dot, matvec, vec_add};
 
 /// Number of outputs for each head.
-pub const FACE_HEAD_OUTPUTS: usize = 4;  // confidence + 1 normal
-pub const EDGE_HEAD_OUTPUTS: usize = 10; // confidence + 2 normals + direction
-pub const CORNER_HEAD_OUTPUTS: usize = 10; // confidence + 3 normals
+pub const FACE_HEAD_OUTPUTS: usize = 5;   // confidence + 1 normal + 1 offset
+pub const EDGE_HEAD_OUTPUTS: usize = 12;  // confidence + 2 normals + 2 offsets + direction
+pub const CORNER_HEAD_OUTPUTS: usize = 13; // confidence + 3 normals + 3 offsets
 
 /// Weights for a single classification head (linear layer).
 #[derive(Clone)]
@@ -143,14 +147,18 @@ pub struct FacePrediction {
     pub confidence: f64,
     /// Predicted normal (normalized).
     pub normal: (f64, f64, f64),
+    /// Predicted offset (signed distance from vertex to plane, normalized by cell_size).
+    pub offset: f64,
     /// Raw outputs before activation (for gradient computation).
     pub raw_confidence: f64,
     pub raw_normal: (f64, f64, f64),
+    pub raw_offset: f64,
 }
 
 impl FacePrediction {
     fn from_raw(raw: &[f64]) -> Self {
         debug_assert_eq!(raw.len(), FACE_HEAD_OUTPUTS);
+        // Layout: [conf, nx, ny, nz, offset]
 
         let raw_confidence = raw[0];
         let confidence = sigmoid(raw_confidence);
@@ -158,11 +166,16 @@ impl FacePrediction {
         let raw_normal = (raw[1], raw[2], raw[3]);
         let normal = normalize_vec(raw_normal);
 
+        let raw_offset = raw[4];
+        // Offset is used directly (no activation), represents distance/cell_size
+
         Self {
             confidence,
             normal,
+            offset: raw_offset,
             raw_confidence,
             raw_normal,
+            raw_offset,
         }
     }
 }
@@ -174,36 +187,49 @@ pub struct EdgePrediction {
     pub confidence: f64,
     /// First face normal (normalized).
     pub normal_a: (f64, f64, f64),
+    /// Offset for first face (signed distance from vertex to plane).
+    pub offset_a: f64,
     /// Second face normal (normalized).
     pub normal_b: (f64, f64, f64),
+    /// Offset for second face.
+    pub offset_b: f64,
     /// Edge direction (normalized).
     pub direction: (f64, f64, f64),
     /// Raw outputs.
     pub raw_confidence: f64,
     pub raw_normal_a: (f64, f64, f64),
+    pub raw_offset_a: f64,
     pub raw_normal_b: (f64, f64, f64),
+    pub raw_offset_b: f64,
     pub raw_direction: (f64, f64, f64),
 }
 
 impl EdgePrediction {
     fn from_raw(raw: &[f64]) -> Self {
         debug_assert_eq!(raw.len(), EDGE_HEAD_OUTPUTS);
+        // Layout: [conf, na_x, na_y, na_z, off_a, nb_x, nb_y, nb_z, off_b, dx, dy, dz]
 
         let raw_confidence = raw[0];
         let confidence = sigmoid(raw_confidence);
 
         let raw_normal_a = (raw[1], raw[2], raw[3]);
-        let raw_normal_b = (raw[4], raw[5], raw[6]);
-        let raw_direction = (raw[7], raw[8], raw[9]);
+        let raw_offset_a = raw[4];
+        let raw_normal_b = (raw[5], raw[6], raw[7]);
+        let raw_offset_b = raw[8];
+        let raw_direction = (raw[9], raw[10], raw[11]);
 
         Self {
             confidence,
             normal_a: normalize_vec(raw_normal_a),
+            offset_a: raw_offset_a,
             normal_b: normalize_vec(raw_normal_b),
+            offset_b: raw_offset_b,
             direction: normalize_vec(raw_direction),
             raw_confidence,
             raw_normal_a,
+            raw_offset_a,
             raw_normal_b,
+            raw_offset_b,
             raw_direction,
         }
     }
@@ -216,23 +242,28 @@ pub struct CornerPrediction {
     pub confidence: f64,
     /// Three face normals (normalized).
     pub normals: [(f64, f64, f64); 3],
+    /// Three offsets (signed distance from vertex to each plane).
+    pub offsets: [f64; 3],
     /// Raw outputs.
     pub raw_confidence: f64,
     pub raw_normals: [(f64, f64, f64); 3],
+    pub raw_offsets: [f64; 3],
 }
 
 impl CornerPrediction {
     fn from_raw(raw: &[f64]) -> Self {
         debug_assert_eq!(raw.len(), CORNER_HEAD_OUTPUTS);
+        // Layout: [conf, n0_x, n0_y, n0_z, off_0, n1_x, n1_y, n1_z, off_1, n2_x, n2_y, n2_z, off_2]
 
         let raw_confidence = raw[0];
         let confidence = sigmoid(raw_confidence);
 
         let raw_normals = [
             (raw[1], raw[2], raw[3]),
-            (raw[4], raw[5], raw[6]),
-            (raw[7], raw[8], raw[9]),
+            (raw[5], raw[6], raw[7]),
+            (raw[9], raw[10], raw[11]),
         ];
+        let raw_offsets = [raw[4], raw[8], raw[12]];
 
         Self {
             confidence,
@@ -241,8 +272,10 @@ impl CornerPrediction {
                 normalize_vec(raw_normals[1]),
                 normalize_vec(raw_normals[2]),
             ],
+            offsets: raw_offsets,
             raw_confidence,
             raw_normals,
+            raw_offsets,
         }
     }
 }
@@ -252,14 +285,19 @@ impl CornerPrediction {
 pub enum ExpectedGeometry {
     Face {
         normal: (f64, f64, f64),
+        /// Signed distance from vertex to plane (normalized by cell_size).
+        offset: f64,
     },
     Edge {
         normal_a: (f64, f64, f64),
+        offset_a: f64,
         normal_b: (f64, f64, f64),
+        offset_b: f64,
         direction: (f64, f64, f64),
     },
     Corner {
         normals: [(f64, f64, f64); 3],
+        offsets: [f64; 3],
     },
 }
 
@@ -271,6 +309,61 @@ impl ExpectedGeometry {
             ExpectedGeometry::Corner { .. } => GeometryType::Corner,
         }
     }
+
+    /// Create ExpectedGeometry from ExpectedClassification with vertex position.
+    ///
+    /// Computes the offset (signed distance from vertex to plane, normalized by cell_size) for each face.
+    /// The cube is centered at origin with half-size 0.5.
+    pub fn from_classification(
+        expected: &crate::adaptive_surface_nets_2::stage4::research::validation::ExpectedClassification,
+        vertex_position: (f64, f64, f64),
+    ) -> Self {
+        // Use the same cell_size as the policy
+        Self::from_classification_with_cell_size(expected, vertex_position, super::policy::CELL_SIZE)
+    }
+
+    /// Create ExpectedGeometry with explicit cell_size for offset normalization.
+    pub fn from_classification_with_cell_size(
+        expected: &crate::adaptive_surface_nets_2::stage4::research::validation::ExpectedClassification,
+        vertex_position: (f64, f64, f64),
+        cell_size: f64,
+    ) -> Self {
+        use crate::adaptive_surface_nets_2::stage4::research::validation::ExpectedClassification;
+
+        // Offset = (dot(vertex, normal) - 0.5) / cell_size
+        // This normalizes the signed distance by cell_size for scale-independent learning
+        let compute_offset = |normal: (f64, f64, f64)| -> f64 {
+            let (vx, vy, vz) = vertex_position;
+            let (nx, ny, nz) = normal;
+            (vx * nx + vy * ny + vz * nz - 0.5) / cell_size
+        };
+
+        match expected {
+            ExpectedClassification::OnFace { expected_normal, .. } => ExpectedGeometry::Face {
+                normal: *expected_normal,
+                offset: compute_offset(*expected_normal),
+            },
+            ExpectedClassification::OnEdge {
+                expected_normals,
+                expected_direction,
+                ..
+            } => ExpectedGeometry::Edge {
+                normal_a: expected_normals.0,
+                offset_a: compute_offset(expected_normals.0),
+                normal_b: expected_normals.1,
+                offset_b: compute_offset(expected_normals.1),
+                direction: *expected_direction,
+            },
+            ExpectedClassification::OnCorner { expected_normals, .. } => ExpectedGeometry::Corner {
+                normals: *expected_normals,
+                offsets: [
+                    compute_offset(expected_normals[0]),
+                    compute_offset(expected_normals[1]),
+                    compute_offset(expected_normals[2]),
+                ],
+            },
+        }
+    }
 }
 
 /// Loss configuration.
@@ -280,11 +373,17 @@ pub struct ClassifierLossConfig {
     pub w_correct_conf: f64,
     /// Weight for correct head normal accuracy loss.
     pub w_normal: f64,
+    /// Weight for correct head offset accuracy loss.
+    pub w_offset: f64,
     /// Weight for penalizing wrong head confidences.
     pub w_wrong_conf: f64,
     /// Per-class weight multipliers to handle class imbalance.
     /// Order: [face, edge, corner]
     pub class_weights: [f64; 3],
+    /// Weight for margin-based contrastive loss (correct conf > wrong conf + margin).
+    pub w_margin: f64,
+    /// Margin that correct confidence should exceed wrong confidences by.
+    pub margin: f64,
 }
 
 impl Default for ClassifierLossConfig {
@@ -292,23 +391,27 @@ impl Default for ClassifierLossConfig {
         Self {
             w_correct_conf: 1.0,
             w_normal: 5.0,
-            w_wrong_conf: 2.0, // Increased from 0.5 to penalize wrong predictions more
+            w_offset: 2.0, // Weight for offset prediction
+            w_wrong_conf: 4.0, // Balanced penalty for wrong predictions
             // Balance class weights inversely to frequency
             // Face: 12/52 = 0.23, Edge: 24/52 = 0.46, Corner: 16/52 = 0.31
-            // Inverse weights normalized: Face: 2.0, Edge: 1.0, Corner: 1.5
-            class_weights: [2.0, 1.0, 1.5],
+            // Equal weights with asymmetric margin loss
+            class_weights: [1.0, 1.0, 1.0],
+            // Margin loss only applied to corners (see compute_classifier_loss)
+            w_margin: 3.0,
+            margin: 0.1,
         }
     }
 }
 
 /// Compute classification loss.
 ///
-/// Returns (total_loss, correct_conf_loss, normal_loss, wrong_conf_loss).
+/// Returns (total_loss, correct_conf_loss, normal_loss, offset_loss, wrong_conf_loss).
 pub fn compute_classifier_loss(
     predictions: &ClassifierPredictions,
     expected: &ExpectedGeometry,
     config: &ClassifierLossConfig,
-) -> (f64, f64, f64, f64) {
+) -> (f64, f64, f64, f64, f64) {
     let correct_type = expected.geometry_type();
 
     // Get class weight for the correct type
@@ -319,31 +422,72 @@ pub fn compute_classifier_loss(
     };
 
     // Correct head confidence loss: -log(confidence)
-    let correct_conf = match correct_type {
-        GeometryType::Face => predictions.face.confidence,
-        GeometryType::Edge => predictions.edge.confidence,
-        GeometryType::Corner => predictions.corner.confidence,
+    let (correct_conf, wrong_confs) = match correct_type {
+        GeometryType::Face => (predictions.face.confidence, [predictions.edge.confidence, predictions.corner.confidence]),
+        GeometryType::Edge => (predictions.edge.confidence, [predictions.face.confidence, predictions.corner.confidence]),
+        GeometryType::Corner => (predictions.corner.confidence, [predictions.face.confidence, predictions.edge.confidence]),
     };
     let correct_conf_loss = -correct_conf.max(1e-10).ln();
 
-    // Normal loss for correct head (cosine similarity: 1 - |dot|)
-    let normal_loss = match expected {
-        ExpectedGeometry::Face { normal } => {
-            normal_cosine_loss(predictions.face.normal, *normal)
+    // Margin loss: penalize if correct_conf < wrong_conf + margin
+    // Uses hinge loss: max(0, margin - (correct_conf - wrong_conf))
+    // ONLY apply for corners (the class that was failing due to low confidence)
+    let mut margin_loss = 0.0;
+    if correct_type == GeometryType::Corner && config.w_margin > 0.0 {
+        for wrong_conf in wrong_confs {
+            let violation = config.margin - (correct_conf - wrong_conf);
+            if violation > 0.0 {
+                margin_loss += violation;
+            }
         }
-        ExpectedGeometry::Edge { normal_a, normal_b, direction } => {
-            // Best matching of predicted normals to expected
-            let (loss_a, loss_b) = best_normal_pair_loss(
-                (predictions.edge.normal_a, predictions.edge.normal_b),
-                (*normal_a, *normal_b),
-            );
-            let dir_loss = normal_cosine_loss(predictions.edge.direction, *direction);
-            (loss_a + loss_b + dir_loss) / 3.0
+        margin_loss /= 2.0; // Average over the two wrong heads
+    }
+
+    // Normal and offset loss for correct head
+    let (normal_loss, offset_loss) = match expected {
+        ExpectedGeometry::Face { normal, offset } => {
+            let n_loss = normal_cosine_loss(predictions.face.normal, *normal);
+            let o_loss = (predictions.face.offset - offset).abs();
+            (n_loss, o_loss)
         }
-        ExpectedGeometry::Corner { normals } => {
+        ExpectedGeometry::Edge { normal_a, offset_a, normal_b, offset_b, direction } => {
+            // Best matching of predicted normals to expected (determines offset pairing too)
+            let loss1 = normal_cosine_loss(predictions.edge.normal_a, *normal_a)
+                + normal_cosine_loss(predictions.edge.normal_b, *normal_b);
+            let loss2 = normal_cosine_loss(predictions.edge.normal_a, *normal_b)
+                + normal_cosine_loss(predictions.edge.normal_b, *normal_a);
+
+            let (n_loss, o_loss) = if loss1 <= loss2 {
+                // Assignment: pred_a -> exp_a, pred_b -> exp_b
+                let nl = (normal_cosine_loss(predictions.edge.normal_a, *normal_a)
+                    + normal_cosine_loss(predictions.edge.normal_b, *normal_b)
+                    + normal_cosine_loss(predictions.edge.direction, *direction)) / 3.0;
+                let ol = ((predictions.edge.offset_a - offset_a).abs()
+                    + (predictions.edge.offset_b - offset_b).abs()) / 2.0;
+                (nl, ol)
+            } else {
+                // Assignment: pred_a -> exp_b, pred_b -> exp_a
+                let nl = (normal_cosine_loss(predictions.edge.normal_a, *normal_b)
+                    + normal_cosine_loss(predictions.edge.normal_b, *normal_a)
+                    + normal_cosine_loss(predictions.edge.direction, *direction)) / 3.0;
+                let ol = ((predictions.edge.offset_a - offset_b).abs()
+                    + (predictions.edge.offset_b - offset_a).abs()) / 2.0;
+                (nl, ol)
+            };
+            (n_loss, o_loss)
+        }
+        ExpectedGeometry::Corner { normals, offsets } => {
             // Greedy matching of predicted normals to expected
-            let losses = best_corner_normal_losses(&predictions.corner.normals, normals);
-            losses.iter().sum::<f64>() / 3.0
+            let (n_losses, assignments) = best_corner_normal_losses_with_assignment(
+                &predictions.corner.normals, normals);
+            let n_loss = n_losses.iter().sum::<f64>() / 3.0;
+
+            // Compute offset loss using the same assignment
+            let mut o_loss = 0.0;
+            for (pred_idx, exp_idx) in assignments.iter().enumerate() {
+                o_loss += (predictions.corner.offsets[pred_idx] - offsets[*exp_idx]).abs();
+            }
+            (n_loss, o_loss / 3.0)
         }
     };
 
@@ -368,10 +512,44 @@ pub fn compute_classifier_loss(
     let total = class_weight * (
         config.w_correct_conf * correct_conf_loss
         + config.w_normal * normal_loss
+        + config.w_offset * offset_loss
         + config.w_wrong_conf * wrong_conf_loss
+        + config.w_margin * margin_loss
     );
 
-    (total, correct_conf_loss, normal_loss, wrong_conf_loss)
+    (total, correct_conf_loss, normal_loss, offset_loss, wrong_conf_loss)
+}
+
+/// Find best greedy assignment of 3 predicted normals to 3 expected normals.
+/// Returns losses and the assignment (pred_idx -> exp_idx).
+fn best_corner_normal_losses_with_assignment(
+    predicted: &[(f64, f64, f64); 3],
+    expected: &[(f64, f64, f64); 3],
+) -> ([f64; 3], [usize; 3]) {
+    let mut losses = [0.0; 3];
+    let mut assignment = [0usize; 3];
+    let mut used = [false; 3];
+
+    for (pred_idx, pred) in predicted.iter().enumerate() {
+        let mut best_loss = f64::MAX;
+        let mut best_idx = 0;
+
+        for (i, exp) in expected.iter().enumerate() {
+            if !used[i] {
+                let loss = normal_cosine_loss(*pred, *exp);
+                if loss < best_loss {
+                    best_loss = loss;
+                    best_idx = i;
+                }
+            }
+        }
+
+        used[best_idx] = true;
+        losses[pred_idx] = best_loss;
+        assignment[pred_idx] = best_idx;
+    }
+
+    (losses, assignment)
 }
 
 /// Cosine similarity loss for normals: 1 - |dot(a, b)|.
@@ -537,6 +715,64 @@ pub fn compute_classifier_gradients(
 
     let correct_type = expected.geometry_type();
 
+    // Compute margin loss gradients
+    // For margin loss: L = max(0, margin - (correct_conf - wrong_conf))
+    // dL/d(correct_conf) = -1 if violation > 0, else 0
+    // dL/d(wrong_conf) = +1 if violation > 0, else 0
+    let (correct_conf, wrong_confs, wrong_types) = match correct_type {
+        GeometryType::Face => (
+            predictions.face.confidence,
+            [predictions.edge.confidence, predictions.corner.confidence],
+            [GeometryType::Edge, GeometryType::Corner],
+        ),
+        GeometryType::Edge => (
+            predictions.edge.confidence,
+            [predictions.face.confidence, predictions.corner.confidence],
+            [GeometryType::Face, GeometryType::Corner],
+        ),
+        GeometryType::Corner => (
+            predictions.corner.confidence,
+            [predictions.face.confidence, predictions.edge.confidence],
+            [GeometryType::Face, GeometryType::Edge],
+        ),
+    };
+
+    // Compute margin violation flags
+    let mut margin_d_correct: f64 = 0.0;
+    let mut margin_d_face: f64 = 0.0;
+    let mut margin_d_edge: f64 = 0.0;
+    let mut margin_d_corner: f64 = 0.0;
+
+    let class_weight = match correct_type {
+        GeometryType::Face => config.class_weights[0],
+        GeometryType::Edge => config.class_weights[1],
+        GeometryType::Corner => config.class_weights[2],
+    };
+
+    // Only apply margin for corners (the class that was originally failing)
+    if correct_type == GeometryType::Corner && config.w_margin > 0.0 {
+        for (wrong_conf, wrong_type) in wrong_confs.iter().zip(wrong_types.iter()) {
+            let violation = config.margin - (correct_conf - wrong_conf);
+            if violation > 0.0 {
+                // Gradient: class_weight * w_margin * (1/2) because we average over 2 wrong heads
+                let scale = class_weight * config.w_margin * 0.5;
+                margin_d_correct -= scale; // Push correct conf up
+                match wrong_type {
+                    GeometryType::Face => margin_d_face += scale,
+                    GeometryType::Edge => margin_d_edge += scale,
+                    GeometryType::Corner => margin_d_corner += scale,
+                }
+            }
+        }
+    }
+
+    // Set the gradient for the correct head from margin loss
+    match correct_type {
+        GeometryType::Face => margin_d_face += margin_d_correct,
+        GeometryType::Edge => margin_d_edge += margin_d_correct,
+        GeometryType::Corner => margin_d_corner += margin_d_correct,
+    }
+
     // Compute gradients for each head
     // For the correct head: gradient from confidence loss + normal loss
     // For wrong heads: gradient from wrong confidence penalty
@@ -549,6 +785,7 @@ pub fn compute_classifier_gradients(
         expected,
         correct_type == GeometryType::Face,
         config,
+        margin_d_face,
     );
     grads.face_dw = face_grad.dw;
     grads.face_db = face_grad.db;
@@ -564,6 +801,7 @@ pub fn compute_classifier_gradients(
         expected,
         correct_type == GeometryType::Edge,
         config,
+        margin_d_edge,
     );
     grads.edge_dw = edge_grad.dw;
     grads.edge_db = edge_grad.db;
@@ -579,6 +817,7 @@ pub fn compute_classifier_gradients(
         expected,
         correct_type == GeometryType::Corner,
         config,
+        margin_d_corner,
     );
     grads.corner_dw = corner_grad.dw;
     grads.corner_db = corner_grad.db;
@@ -597,6 +836,7 @@ struct HeadGradResult {
 }
 
 /// Compute gradients for face head.
+/// Layout: [conf, n_x, n_y, n_z, offset] (5 outputs)
 fn compute_face_head_gradient(
     head: &HeadWeights,
     hidden: &[f64],
@@ -604,6 +844,7 @@ fn compute_face_head_gradient(
     expected: &ExpectedGeometry,
     is_correct: bool,
     config: &ClassifierLossConfig,
+    margin_d_conf: f64,
 ) -> HeadGradResult {
     let pred = &predictions.face;
     let mut d_raw = vec![0.0; FACE_HEAD_OUTPUTS];
@@ -611,25 +852,43 @@ fn compute_face_head_gradient(
     if is_correct {
         // Correct head: gradient from -log(conf) => d/d_raw_conf = -sigmoid'(x)/sigmoid(x) = -(1-sigmoid(x))
         // Since loss = -log(sigmoid(x)), dL/dx = sigmoid(x) - 1 = conf - 1
-        d_raw[0] = config.w_correct_conf * (pred.confidence - 1.0);
+        let class_weight = config.class_weights[0];
+        d_raw[0] = class_weight * config.w_correct_conf * (pred.confidence - 1.0);
 
-        // Normal loss gradient (for correct head only)
-        if let ExpectedGeometry::Face { normal } = expected {
+        // Normal and offset loss gradients (for correct head only)
+        if let ExpectedGeometry::Face { normal, offset } = expected {
             let d_normal = normal_loss_gradient(pred.raw_normal, pred.normal, *normal);
-            d_raw[1] += config.w_normal * d_normal.0;
-            d_raw[2] += config.w_normal * d_normal.1;
-            d_raw[3] += config.w_normal * d_normal.2;
+            d_raw[1] += class_weight * config.w_normal * d_normal.0;
+            d_raw[2] += class_weight * config.w_normal * d_normal.1;
+            d_raw[3] += class_weight * config.w_normal * d_normal.2;
+
+            // Offset gradient: L1 loss = |pred - exp|, dL/d_pred = sign(pred - exp)
+            let offset_diff = pred.offset - offset;
+            d_raw[4] += class_weight * config.w_offset * offset_diff.signum();
         }
     } else {
         // Wrong head: gradient from -log(1-conf) => d/d_raw_conf = sigmoid(x)/(1-sigmoid(x)) * sigmoid'(x)
         // = sigmoid(x) = conf
-        d_raw[0] = config.w_wrong_conf * pred.confidence * 0.5; // /2 for averaging two wrong heads
+        // Note: class_weight applied at the total loss level (correct class determines weight)
+        let correct_class_weight = match expected.geometry_type() {
+            GeometryType::Face => config.class_weights[0],
+            GeometryType::Edge => config.class_weights[1],
+            GeometryType::Corner => config.class_weights[2],
+        };
+        d_raw[0] = correct_class_weight * config.w_wrong_conf * pred.confidence * 0.5; // /2 for averaging two wrong heads
     }
+
+    // Add margin gradient contribution
+    // d(margin_loss)/d(raw_conf) = d(margin_loss)/d(conf) * d(conf)/d(raw_conf)
+    //                            = margin_d_conf * sigmoid'(raw_conf)
+    //                            = margin_d_conf * conf * (1 - conf)
+    d_raw[0] += margin_d_conf * pred.confidence * (1.0 - pred.confidence);
 
     linear_backward(head, hidden, &d_raw)
 }
 
 /// Compute gradients for edge head.
+/// Layout: [conf, na_x, na_y, na_z, off_a, nb_x, nb_y, nb_z, off_b, dir_x, dir_y, dir_z] (12 outputs)
 fn compute_edge_head_gradient(
     head: &HeadWeights,
     hidden: &[f64],
@@ -637,49 +896,68 @@ fn compute_edge_head_gradient(
     expected: &ExpectedGeometry,
     is_correct: bool,
     config: &ClassifierLossConfig,
+    margin_d_conf: f64,
 ) -> HeadGradResult {
     let pred = &predictions.edge;
     let mut d_raw = vec![0.0; EDGE_HEAD_OUTPUTS];
 
     if is_correct {
-        d_raw[0] = config.w_correct_conf * (pred.confidence - 1.0);
+        let class_weight = config.class_weights[1];
+        d_raw[0] = class_weight * config.w_correct_conf * (pred.confidence - 1.0);
 
-        if let ExpectedGeometry::Edge { normal_a, normal_b, direction } = expected {
-            // Find best assignment for normals
+        if let ExpectedGeometry::Edge { normal_a, offset_a, normal_b, offset_b, direction } = expected {
+            // Find best assignment for normals (same as loss computation)
             let loss1 = normal_cosine_loss(pred.normal_a, *normal_a)
                 + normal_cosine_loss(pred.normal_b, *normal_b);
             let loss2 = normal_cosine_loss(pred.normal_a, *normal_b)
                 + normal_cosine_loss(pred.normal_b, *normal_a);
 
-            let (exp_a, exp_b) = if loss1 <= loss2 {
-                (*normal_a, *normal_b)
+            let (exp_a, exp_off_a, exp_b, exp_off_b) = if loss1 <= loss2 {
+                (*normal_a, *offset_a, *normal_b, *offset_b)
             } else {
-                (*normal_b, *normal_a)
+                (*normal_b, *offset_b, *normal_a, *offset_a)
             };
 
             let d_normal_a = normal_loss_gradient(pred.raw_normal_a, pred.normal_a, exp_a);
             let d_normal_b = normal_loss_gradient(pred.raw_normal_b, pred.normal_b, exp_b);
             let d_dir = normal_loss_gradient(pred.raw_direction, pred.direction, *direction);
 
-            let scale = config.w_normal / 3.0;
+            let scale = class_weight * config.w_normal / 3.0;
+            // Normal A: indices 1, 2, 3
             d_raw[1] += scale * d_normal_a.0;
             d_raw[2] += scale * d_normal_a.1;
             d_raw[3] += scale * d_normal_a.2;
-            d_raw[4] += scale * d_normal_b.0;
-            d_raw[5] += scale * d_normal_b.1;
-            d_raw[6] += scale * d_normal_b.2;
-            d_raw[7] += scale * d_dir.0;
-            d_raw[8] += scale * d_dir.1;
-            d_raw[9] += scale * d_dir.2;
+            // Offset A: index 4
+            let offset_scale = class_weight * config.w_offset / 2.0;
+            d_raw[4] += offset_scale * (pred.offset_a - exp_off_a).signum();
+            // Normal B: indices 5, 6, 7
+            d_raw[5] += scale * d_normal_b.0;
+            d_raw[6] += scale * d_normal_b.1;
+            d_raw[7] += scale * d_normal_b.2;
+            // Offset B: index 8
+            d_raw[8] += offset_scale * (pred.offset_b - exp_off_b).signum();
+            // Direction: indices 9, 10, 11
+            d_raw[9] += scale * d_dir.0;
+            d_raw[10] += scale * d_dir.1;
+            d_raw[11] += scale * d_dir.2;
         }
     } else {
-        d_raw[0] = config.w_wrong_conf * pred.confidence * 0.5;
+        let correct_class_weight = match expected.geometry_type() {
+            GeometryType::Face => config.class_weights[0],
+            GeometryType::Edge => config.class_weights[1],
+            GeometryType::Corner => config.class_weights[2],
+        };
+        d_raw[0] = correct_class_weight * config.w_wrong_conf * pred.confidence * 0.5;
     }
+
+    // Add margin gradient contribution
+    d_raw[0] += margin_d_conf * pred.confidence * (1.0 - pred.confidence);
 
     linear_backward(head, hidden, &d_raw)
 }
 
 /// Compute gradients for corner head.
+/// Layout: [conf, n0_x, n0_y, n0_z, off_0, n1_x, n1_y, n1_z, off_1, n2_x, n2_y, n2_z, off_2] (13 outputs)
 fn compute_corner_head_gradient(
     head: &HeadWeights,
     hidden: &[f64],
@@ -687,14 +965,16 @@ fn compute_corner_head_gradient(
     expected: &ExpectedGeometry,
     is_correct: bool,
     config: &ClassifierLossConfig,
+    margin_d_conf: f64,
 ) -> HeadGradResult {
     let pred = &predictions.corner;
     let mut d_raw = vec![0.0; CORNER_HEAD_OUTPUTS];
 
     if is_correct {
-        d_raw[0] = config.w_correct_conf * (pred.confidence - 1.0);
+        let class_weight = config.class_weights[2];
+        d_raw[0] = class_weight * config.w_correct_conf * (pred.confidence - 1.0);
 
-        if let ExpectedGeometry::Corner { normals: exp_normals } = expected {
+        if let ExpectedGeometry::Corner { normals: exp_normals, offsets: exp_offsets } = expected {
             // Greedy matching (same as loss computation)
             let mut used = [false; 3];
             let mut assignments = [(0usize, 0usize); 3];
@@ -716,22 +996,34 @@ fn compute_corner_head_gradient(
                 assignments[pred_idx] = (pred_idx, best_exp_idx);
             }
 
-            let scale = config.w_normal / 3.0;
+            let n_scale = class_weight * config.w_normal / 3.0;
+            let o_scale = class_weight * config.w_offset / 3.0;
             for (pred_idx, exp_idx) in assignments {
                 let d_n = normal_loss_gradient(
                     pred.raw_normals[pred_idx],
                     pred.normals[pred_idx],
                     exp_normals[exp_idx],
                 );
-                let base = 1 + pred_idx * 3;
-                d_raw[base] += scale * d_n.0;
-                d_raw[base + 1] += scale * d_n.1;
-                d_raw[base + 2] += scale * d_n.2;
+                // Layout: each normal-offset block is 4 values: [n_x, n_y, n_z, offset]
+                let base = 1 + pred_idx * 4;
+                d_raw[base] += n_scale * d_n.0;
+                d_raw[base + 1] += n_scale * d_n.1;
+                d_raw[base + 2] += n_scale * d_n.2;
+                // Offset gradient
+                d_raw[base + 3] += o_scale * (pred.offsets[pred_idx] - exp_offsets[exp_idx]).signum();
             }
         }
     } else {
-        d_raw[0] = config.w_wrong_conf * pred.confidence * 0.5;
+        let correct_class_weight = match expected.geometry_type() {
+            GeometryType::Face => config.class_weights[0],
+            GeometryType::Edge => config.class_weights[1],
+            GeometryType::Corner => config.class_weights[2],
+        };
+        d_raw[0] = correct_class_weight * config.w_wrong_conf * pred.confidence * 0.5;
     }
+
+    // Add margin gradient contribution
+    d_raw[0] += margin_d_conf * pred.confidence * (1.0 - pred.confidence);
 
     linear_backward(head, hidden, &d_raw)
 }
@@ -842,16 +1134,18 @@ mod tests {
 
         let expected = ExpectedGeometry::Face {
             normal: (0.0, 0.0, 1.0),
+            offset: 0.1,
         };
 
         let config = ClassifierLossConfig::default();
-        let (total, conf_loss, normal_loss, wrong_loss) =
+        let (total, conf_loss, normal_loss, offset_loss, wrong_loss) =
             compute_classifier_loss(&preds, &expected, &config);
 
         // All losses should be non-negative
         assert!(total >= 0.0);
         assert!(conf_loss >= 0.0);
         assert!(normal_loss >= 0.0);
+        assert!(offset_loss >= 0.0);
         assert!(wrong_loss >= 0.0);
     }
 
