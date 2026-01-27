@@ -706,38 +706,46 @@ impl Renderer {
         // Pass 5-7: Grid Lines, Scene Lines + Wireframe, Points (depth-tested)
         // =================================================================
         {
-            // Collect and prepare all depth-tested line instances
-            let mut all_line_segments: Vec<LineSegment> = Vec::new();
-            let mut line_style = LineStyle {
+            // Prepare line instances - each batch uses its own style for width
+            let mut all_line_instances: Vec<LineInstance> = Vec::new();
+
+            // Grid style (fixed width for grid lines)
+            let grid_style = LineStyle {
                 width: 1.0,
                 width_mode: WidthMode::ScreenSpace,
                 pattern: LinePattern::Solid,
                 depth_mode: DepthMode::Normal,
             };
 
-            // Add grid lines
+            // Add grid line instances with grid style
             if !self.cached_grid_lines.is_empty() {
-                all_line_segments.extend_from_slice(&self.cached_grid_lines);
+                let grid_instances = LinePipeline::prepare_instances(&self.cached_grid_lines, &grid_style);
+                all_line_instances.extend(grid_instances);
             }
 
-            // Add scene lines (depth-tested)
+            // Add scene line instances (depth-tested) - each with its own style's width
             for submitted in &self.frame_lines {
                 if submitted.style.depth_mode == DepthMode::Normal {
-                    line_style = submitted.style.clone();
+                    let mut segments: Vec<LineSegment> = Vec::new();
                     for seg in &submitted.data.segments {
                         let start = submitted.transform.transform_point3(Vec3::from(seg.start));
                         let end = submitted.transform.transform_point3(Vec3::from(seg.end));
-                        all_line_segments.push(LineSegment {
+                        segments.push(LineSegment {
                             start: start.into(),
                             end: end.into(),
                             color: seg.color,
                         });
                     }
+                    let instances = LinePipeline::prepare_instances(&segments, &submitted.style);
+                    all_line_instances.extend(instances);
                 }
             }
 
-            // Add wireframe edges
-            all_line_segments.extend(wireframe_segments);
+            // Add wireframe edge instances with grid style (thin lines)
+            if !wireframe_segments.is_empty() {
+                let wireframe_instances = LinePipeline::prepare_instances(&wireframe_segments, &grid_style);
+                all_line_instances.extend(wireframe_instances);
+            }
 
             // Collect and prepare all depth-tested point instances
             let mut all_point_instances: Vec<PointInstance> = Vec::new();
@@ -769,11 +777,11 @@ impl Renderer {
                 ..
             } = gpu;
 
-            if !all_line_segments.is_empty() {
-                let instances = LinePipeline::prepare_instances(&all_line_segments, &line_style);
-                line_pipeline.upload_instances(device, queue, &instances);
+            if !all_line_instances.is_empty() {
+                line_pipeline.upload_instances(device, queue, &all_line_instances);
+                // Use grid_style for uniforms (width_mode and pattern) - individual widths are per-instance
                 let uniforms =
-                    LinePipeline::create_uniforms(view_proj_array, screen_size, &line_style);
+                    LinePipeline::create_uniforms(view_proj_array, screen_size, &grid_style);
                 line_pipeline.update_uniforms(queue, &uniforms);
             }
 
@@ -810,7 +818,7 @@ impl Renderer {
             });
 
             // Render all uploaded data
-            if !all_line_segments.is_empty() {
+            if !all_line_instances.is_empty() {
                 line_pipeline.render(&mut pass, DepthMode::Normal);
             }
             if !all_point_instances.is_empty() {
@@ -916,9 +924,13 @@ impl Renderer {
                     // Offset for arrow tip - extend slightly beyond line end
                     // Diamond size is 12px, so offset by ~half that in NDC
                     let tip_offset = 6.0 / vp_width.min(vp_height);
-                    let dir_len = (dir.x * dir.x + dir.y * dir.y).sqrt().max(0.001);
-                    let tip_ndc_x = end_ndc_x + (dir.x / dir_len) * tip_offset / aspect;
-                    let tip_ndc_y = end_ndc_y + (dir.y / dir_len) * tip_offset;
+                    // Compute direction in NDC space (with aspect correction applied)
+                    let ndc_dir_x = dir.x / aspect;
+                    let ndc_dir_y = dir.y;
+                    let ndc_dir_len = (ndc_dir_x * ndc_dir_x + ndc_dir_y * ndc_dir_y).sqrt().max(0.001);
+                    // Extend tip along the visual NDC direction
+                    let tip_ndc_x = end_ndc_x + (ndc_dir_x / ndc_dir_len) * tip_offset;
+                    let tip_ndc_y = end_ndc_y + (ndc_dir_y / ndc_dir_len) * tip_offset;
 
                     let start_pos = unproject(start_ndc_x, start_ndc_y);
                     let end_pos = unproject(end_ndc_x, end_ndc_y);
