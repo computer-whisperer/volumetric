@@ -95,9 +95,11 @@ Index  Signs   Corner Position (relative to vertex)
 
 The sampling cell is a cube of side `cell_size` centered on the control vertex.
 
-**Sampling modes:**
-- **Training (stochastic)**: Sample octant from softmax, use discrete corner
-- **Evaluation (weighted)**: Compute position as weighted average of all corners
+**Sample position calculation (octant lerp):**
+- Softmax produces probabilities for each of the 8 corners
+- Sample position = weighted average of all corners based on probabilities
+- This produces positions throughout the cell volume, not just at corners
+- Same calculation used for both training and evaluation
 
 ## Reward Structure
 
@@ -199,6 +201,30 @@ ensuring reproducible results across runs.
 | Budget (max samples) | 50 |
 | Validation offset | 0.2 × cell_size |
 
+### Exploration Schedule (Optional)
+
+When enabled, training starts with random sampling and transitions to policy-based:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| use_exploration_schedule | false | Enable curriculum learning |
+| exploration_start | 1.0 | Fraction random at epoch 0 (100%) |
+| exploration_end | 0.0 | Fraction random at final epoch (0%) |
+
+**Usage:**
+```rust
+let config = TrainingConfig {
+    use_exploration_schedule: true,
+    exploration_start: 1.0,
+    exploration_end: 0.0,
+    ..Default::default()
+};
+// Or use convenience constructor:
+let config = TrainingConfig::with_exploration_schedule();
+```
+
+The exploration rate is linearly interpolated: `rate = start + (end - start) * (epoch / total_epochs)`
+
 ### Validation Set
 
 - 52 points on analytical rotated cube
@@ -206,9 +232,38 @@ ensuring reproducible results across runs.
 - Random 3D offset within `0.2 × cell_size` of surface (easier start)
 - Deterministic seed for reproducibility
 
-## Results (v7 - 2026-01-27)
+## Results (v8 - 2026-01-27)
 
-### Neural Classifier Accuracy (with Asymmetric Margin Loss)
+### Exploration Schedule Comparison
+
+Comparison of baseline training vs exploration schedule (100% random → 0% random over 6000 epochs):
+
+| Metric | Baseline | Exploration Schedule | Change |
+|--------|----------|---------------------|--------|
+| **Overall Accuracy** | 36.5% | 46.2% | **+9.6%** |
+| **Loss** | 5.133 | 4.698 | **-0.435** |
+
+**Per-class breakdown:**
+
+| Class | Baseline | Exploration |
+|-------|----------|-------------|
+| Face | 42% (5/12) | 0% (0/12) |
+| Edge | 4% (1/24) | 100% (24/24) |
+| Corner | 81% (13/16) | 0% (0/16) |
+
+**Key observation:** The exploration schedule improved overall accuracy but caused the model to collapse to predicting "Edge" for everything. This is a local minimum - edges are 46% of training data (24/52), so always predicting edge achieves 46% accuracy.
+
+### Analysis
+
+The exploration schedule helps the classifier heads see more diverse samples early in training, but the sampler doesn't learn class-discriminative sampling patterns fast enough. By the time exploration cools to 0%, the model has already converged to predicting the majority class.
+
+**Potential improvements to explore:**
+1. Don't cool all the way to 0% (try `exploration_end: 0.1`)
+2. Use non-linear schedule (exponential decay)
+3. Run more epochs after exploration ends
+4. Class-balanced exploration during random phase
+
+### Previous Results (v7)
 
 | Geometry | Type Accuracy | Confidence | Normal Loss |
 |----------|---------------|------------|-------------|
@@ -216,32 +271,6 @@ ensuring reproducible results across runs.
 | Edge | 29% (7/24) | 0.255 | 0.274 |
 | Corner | **94%** (15/16) | 0.352 | 0.269 |
 | **Overall** | **51.9%** | - | - |
-
-### Key Findings
-
-1. **Corner classification solved**: 94% accuracy (up from 0%!)
-2. **Balanced confidence**: All heads now have similar confidence levels (0.24-0.35)
-3. **Trade-off with edges**: Edge accuracy dropped to 29% (from 92% in v6)
-4. **Face improved**: 42% (up from 25% in v6)
-
-### What Fixed Corners
-
-The corner confidence problem was solved with two changes:
-1. **Asymmetric margin loss**: Only applied when ground truth is corner
-   - Requires corner confidence to exceed other heads by margin=0.1
-   - Doesn't hurt other classes when they're correct
-2. **Higher wrong confidence penalty**: w_wrong_conf=4.0 (up from 2.0)
-   - Penalizes overconfident wrong predictions
-   - Prevents any single head from dominating
-
-### Remaining Challenge: Edge Classification
-
-Edges are now the weakest class (29%). The model sometimes misclassifies edges as:
-- Corners (when corner confidence is boosted by margin loss)
-- Faces (simpler geometry is sometimes preferred)
-
-This suggests the edge/corner distinction needs more work, but the fundamental
-corner confidence calibration problem is solved.
 
 ### Previous Results (v4 - RANSAC-based)
 
@@ -253,6 +282,36 @@ corner confidence calibration problem is solved.
 | **Overall** | 0% | **9.6%** |
 
 ## Changelog
+
+### v8 (2026-01-27) - Exploration Schedule & Architecture Cleanup
+
+**New feature: Exploration schedule for curriculum learning**
+- Added `use_exploration_schedule` option to `TrainingConfig`
+- Training starts with 100% random sampling and cools to 0% (fully policy-based)
+- Ensures classifier heads see diverse samples early in training
+- Parameters: `exploration_start` (default 1.0), `exploration_end` (default 0.0)
+
+**Removed discrete corners feature:**
+- Eliminated `use_discrete` parameter from all functions
+- Sample positions now always use weighted lerp (octant lerp)
+- Position = weighted average of 8 corners based on softmax probabilities
+- Removed `--discrete` CLI flag from `sample_cloud_dump`
+
+**API changes:**
+- `run_episode_ex` removed, replaced by `run_episode_with_exploration`
+- `run_episode(policy, cube, point, idx, rng, stochastic, reward_config)` - simplified
+- `load_and_dump_rnn_policy(model_path, output_path)` - no more discrete flag
+
+**Exploration schedule results:**
+- +9.6% accuracy improvement over baseline (36.5% → 46.2%)
+- Lower loss (5.133 → 4.698)
+- However: model collapsed to predicting "Edge" for all inputs
+- Indicates need for further tuning (partial exploration, longer post-exploration training)
+
+**New dump functions:**
+- `dump_baseline_sample_cloud(path)` - train without exploration
+- `dump_exploration_schedule_sample_cloud(path)` - train with exploration
+- `compare_exploration_schedule()` - side-by-side comparison
 
 ### v7 (2026-01-27) - Margin Loss & Confidence Calibration Fix
 
@@ -458,14 +517,27 @@ rnn_policy/
 
 ### Train and save model
 ```bash
-cargo run --release --bin sample_cloud_dump -- --rnn-policy train
+cargo run --release --features native --bin sample_cloud_dump -- --rnn-policy train
 # Saves to rnn_policy_trained.bin
 ```
 
 ### Dump sample cloud for visualization
 ```bash
-cargo run --release --bin sample_cloud_dump -- --rnn-policy dump --out samples.cbor
-# Use --discrete for corner sampling instead of weighted
+cargo run --release --features native --bin sample_cloud_dump -- --rnn-policy dump --out samples.cbor
+```
+
+### Run exploration schedule comparison
+```bash
+cargo test --release --features native compare_exploration -- --ignored --nocapture
+```
+
+### Dump sample clouds with exploration schedule
+```bash
+# With exploration schedule (100% → 0% random)
+cargo test --release --features native test_dump_exploration_sample_cloud -- --ignored --nocapture
+
+# Baseline (no exploration)
+cargo test --release --features native test_dump_baseline_sample_cloud -- --ignored --nocapture
 ```
 
 ### Visualize with CLI
@@ -483,8 +555,24 @@ cargo run --release --bin sample_cloud_inspect -- --file samples.cbor --set 0
 
 ## Future Work
 
-### Immediate (Edge Classification Problem)
-Corner problem solved (94% accuracy). Now edges are the weakest class (29%).
+### Immediate (Exploration Schedule Tuning)
+Exploration schedule shows promise (+9.6% accuracy) but causes class collapse.
+
+1. **Partial exploration**: Don't cool all the way to 0%
+   - Try `exploration_end: 0.1` to maintain some diversity
+   - May prevent collapse to majority class
+2. **Non-linear schedule**: Exponential decay instead of linear
+   - Fast initial learning, slow refinement
+   - `rate = start * decay^epoch` instead of linear interpolation
+3. **Extended post-exploration training**: Run more epochs at 0% exploration
+   - Allow sampler to catch up after classifier heads are trained
+   - May need 2-phase training: exploration phase + refinement phase
+4. **Class-balanced exploration**: During random phase, balance class exposure
+   - Weight random sampling toward underrepresented classes
+   - Ensure equal samples from face/edge/corner regions
+
+### Edge Classification Problem
+Edges remain the weakest class in baseline training (29% in v7).
 
 1. **Edge-specific improvements**:
    - Add asymmetric margin for edges (similar to what fixed corners)
@@ -494,10 +582,6 @@ Corner problem solved (94% accuracy). Now edges are the weakest class (29%).
    - First: Face vs Multi-plane (Edge/Corner)
    - Second: Edge vs Corner
    - May help disambiguate 2-plane vs 3-plane geometry
-3. **Feature engineering**:
-   - Add angle between predicted normals as auxiliary feature
-   - Edge geometry: normals should be ~90° apart
-   - Corner geometry: normals should span 3D
 
 ### Short-term
 1. **Scale up offset**: Gradually increase validation offset toward full cell_size
@@ -505,6 +589,8 @@ Corner problem solved (94% accuracy). Now edges are the weakest class (29%).
 3. **Longer training**: Loss still improving at 24k epochs
 
 ### Solved
+- ✅ **Discrete corners removed** (v8): Always use octant lerp
+- ✅ **Exploration schedule infrastructure** (v8): Foundation for curriculum learning
 - ✅ **Corner confidence problem** (v7): Asymmetric margin loss + higher wrong_conf penalty
 - ✅ Larger capacity (hidden_dim=64): Now 15,910 parameters
 - ✅ Lower learning rate (0.0003): Stable training

@@ -53,9 +53,9 @@ use crate::sample_cloud::{SampleCloudDump, SampleCloudSet};
 
 use classifier_heads::{compute_classifier_loss, ClassifierLossConfig, ExpectedGeometry, GeometryType};
 use gru::Rng;
-use policy::{run_episode, run_episode_ex, RnnPolicy};
+use policy::{run_episode, RnnPolicy};
 use reward::RewardConfig;
-use training::{train_policy, TrainingConfig};
+use training::{train_policy, evaluate_policy, TrainingConfig};
 use crate::adaptive_surface_nets_2::stage4::research::validation::ExpectedClassification;
 
 /// Which variant of the RNN policy to use for sample cloud dumps.
@@ -112,8 +112,8 @@ pub fn run_rnn_policy_experiment_with_epochs(epochs: usize, print_every: usize) 
         let loss_config = ClassifierLossConfig::default();
 
         for (idx, point) in points.iter().enumerate() {
-            // Use stochastic=true to get jittered samples matching training
-            let episode = run_episode_ex(policy, cube, point, idx, rng, true, true, &reward_config);
+            // Use stochastic=true to match training behavior
+            let episode = run_episode(policy, cube, point, idx, rng, true, &reward_config);
             let predictions = policy.classify(&episode.h_final);
 
             let expected_geom = ExpectedGeometry::from_classification(&point.expected, point.position);
@@ -179,8 +179,8 @@ fn print_classifier_breakdown(
     let mut corner_conf_sum = 0.0;
 
     for (idx, point) in points.iter().enumerate() {
-        // Use stochastic=true for jittered samples matching training
-        let episode = run_episode_ex(policy, cube, point, idx, rng, true, true, reward_config);
+        // Use stochastic=true to match training behavior
+        let episode = run_episode(policy, cube, point, idx, rng, true, reward_config);
         let predictions = policy.classify(&episode.h_final);
         let predicted_type = predictions.predicted_type();
 
@@ -312,6 +312,198 @@ pub fn train_and_save_rnn_policy(model_path: &Path) {
     } else {
         println!("\nSaved model to {}", model_path.display());
     }
+}
+
+/// Compare training with and without exploration schedule.
+/// Runs both approaches with the same initial seed and compares results.
+pub fn compare_exploration_schedule() {
+    let cube = AnalyticalRotatedCube::standard_test_cube();
+    let points = generate_validation_points_randomized(&cube, policy::CELL_SIZE * 0.2, 2, 42);
+    let reward_config = RewardConfig::default();
+
+    // Shorter training for comparison (still substantial)
+    let epochs = 6000;
+    let print_every = 500;
+    let lr = 0.0003;
+
+    println!("=== Exploration Schedule Comparison ===");
+    println!("Training points: {}", points.len());
+    println!("Epochs: {}, LR: {}", epochs, lr);
+    println!();
+
+    // --- Baseline (no exploration schedule) ---
+    println!(">>> BASELINE (no exploration schedule) <<<");
+    let mut rng_baseline = Rng::new(12345);
+    let mut policy_baseline = RnnPolicy::new(&mut rng_baseline);
+
+    let eval_before = evaluate_classifier_heads(&policy_baseline, &cube, &points, &reward_config, &mut rng_baseline);
+    println!("Before: acc={:.1}%, loss={:.3}", eval_before.accuracy * 100.0, eval_before.loss);
+
+    let config_baseline = TrainingConfig {
+        epochs,
+        print_every,
+        lr,
+        use_classifier_heads: true,
+        use_exploration_schedule: false,
+        ..Default::default()
+    };
+    train_policy(&mut policy_baseline, &cube, &points, &config_baseline, &reward_config, &mut rng_baseline);
+
+    let eval_baseline = evaluate_classifier_heads(&policy_baseline, &cube, &points, &reward_config, &mut rng_baseline);
+    println!("\nBaseline final results:");
+    println!("  Accuracy: {:.1}% (loss: {:.3})", eval_baseline.accuracy * 100.0, eval_baseline.loss);
+    println!("  Face:   {}/{} = {:.0}%, normal_loss={:.3}",
+        eval_baseline.face_correct, eval_baseline.face_total,
+        if eval_baseline.face_total > 0 { eval_baseline.face_correct as f64 / eval_baseline.face_total as f64 * 100.0 } else { 0.0 },
+        eval_baseline.face_normal_loss);
+    println!("  Edge:   {}/{} = {:.0}%, normal_loss={:.3}",
+        eval_baseline.edge_correct, eval_baseline.edge_total,
+        if eval_baseline.edge_total > 0 { eval_baseline.edge_correct as f64 / eval_baseline.edge_total as f64 * 100.0 } else { 0.0 },
+        eval_baseline.edge_normal_loss);
+    println!("  Corner: {}/{} = {:.0}%, normal_loss={:.3}",
+        eval_baseline.corner_correct, eval_baseline.corner_total,
+        if eval_baseline.corner_total > 0 { eval_baseline.corner_correct as f64 / eval_baseline.corner_total as f64 * 100.0 } else { 0.0 },
+        eval_baseline.corner_normal_loss);
+
+    println!();
+
+    // --- With exploration schedule ---
+    println!(">>> WITH EXPLORATION SCHEDULE (100% -> 0%) <<<");
+    let mut rng_explore = Rng::new(12345); // Same seed for fair comparison
+    let mut policy_explore = RnnPolicy::new(&mut rng_explore);
+
+    let config_explore = TrainingConfig {
+        epochs,
+        print_every,
+        lr,
+        use_classifier_heads: true,
+        use_exploration_schedule: true,
+        exploration_start: 1.0,
+        exploration_end: 0.0,
+        ..Default::default()
+    };
+    train_policy(&mut policy_explore, &cube, &points, &config_explore, &reward_config, &mut rng_explore);
+
+    let eval_explore = evaluate_classifier_heads(&policy_explore, &cube, &points, &reward_config, &mut rng_explore);
+    println!("\nExploration schedule final results:");
+    println!("  Accuracy: {:.1}% (loss: {:.3})", eval_explore.accuracy * 100.0, eval_explore.loss);
+    println!("  Face:   {}/{} = {:.0}%, normal_loss={:.3}",
+        eval_explore.face_correct, eval_explore.face_total,
+        if eval_explore.face_total > 0 { eval_explore.face_correct as f64 / eval_explore.face_total as f64 * 100.0 } else { 0.0 },
+        eval_explore.face_normal_loss);
+    println!("  Edge:   {}/{} = {:.0}%, normal_loss={:.3}",
+        eval_explore.edge_correct, eval_explore.edge_total,
+        if eval_explore.edge_total > 0 { eval_explore.edge_correct as f64 / eval_explore.edge_total as f64 * 100.0 } else { 0.0 },
+        eval_explore.edge_normal_loss);
+    println!("  Corner: {}/{} = {:.0}%, normal_loss={:.3}",
+        eval_explore.corner_correct, eval_explore.corner_total,
+        if eval_explore.corner_total > 0 { eval_explore.corner_correct as f64 / eval_explore.corner_total as f64 * 100.0 } else { 0.0 },
+        eval_explore.corner_normal_loss);
+
+    // Summary comparison
+    println!("\n=== COMPARISON SUMMARY ===");
+    println!("                    Baseline    Exploration");
+    println!("  Accuracy:         {:>6.1}%      {:>6.1}%",
+        eval_baseline.accuracy * 100.0, eval_explore.accuracy * 100.0);
+    println!("  Loss:             {:>6.3}       {:>6.3}",
+        eval_baseline.loss, eval_explore.loss);
+    println!("  Face normal:      {:>6.3}       {:>6.3}",
+        eval_baseline.face_normal_loss, eval_explore.face_normal_loss);
+    println!("  Edge normal:      {:>6.3}       {:>6.3}",
+        eval_baseline.edge_normal_loss, eval_explore.edge_normal_loss);
+    println!("  Corner normal:    {:>6.3}       {:>6.3}",
+        eval_baseline.corner_normal_loss, eval_explore.corner_normal_loss);
+
+    let acc_diff = eval_explore.accuracy - eval_baseline.accuracy;
+    let loss_diff = eval_baseline.loss - eval_explore.loss; // positive = explore is better
+    println!("\n  Accuracy improvement: {:+.1}%", acc_diff * 100.0);
+    println!("  Loss improvement:     {:+.3}", loss_diff);
+}
+
+/// Train without exploration schedule (baseline) and dump sample clouds.
+pub fn dump_baseline_sample_cloud(output_path: &Path) {
+    let cube = AnalyticalRotatedCube::standard_test_cube();
+    let points = generate_validation_points_randomized(&cube, policy::CELL_SIZE * 0.2, 2, 42);
+    let reward_config = RewardConfig::default();
+
+    let epochs = 6000;
+    let lr = 0.0003;
+
+    println!("=== Training Baseline (no exploration) for Sample Cloud Dump ===");
+    println!("Epochs: {}, LR: {}", epochs, lr);
+
+    let mut rng = Rng::new(12345);
+    let mut policy = RnnPolicy::new(&mut rng);
+
+    let config = TrainingConfig {
+        epochs,
+        print_every: 1000,
+        lr,
+        use_classifier_heads: true,
+        use_exploration_schedule: false,
+        ..Default::default()
+    };
+    train_policy(&mut policy, &cube, &points, &config, &reward_config, &mut rng);
+
+    // Evaluate
+    let eval = evaluate_classifier_heads(&policy, &cube, &points, &reward_config, &mut rng);
+    println!("\nFinal results:");
+    println!("  Accuracy: {:.1}% (loss: {:.3})", eval.accuracy * 100.0, eval.loss);
+    println!("  Face:   {}/{} = {:.0}%", eval.face_correct, eval.face_total,
+        if eval.face_total > 0 { eval.face_correct as f64 / eval.face_total as f64 * 100.0 } else { 0.0 });
+    println!("  Edge:   {}/{} = {:.0}%", eval.edge_correct, eval.edge_total,
+        if eval.edge_total > 0 { eval.edge_correct as f64 / eval.edge_total as f64 * 100.0 } else { 0.0 });
+    println!("  Corner: {}/{} = {:.0}%", eval.corner_correct, eval.corner_total,
+        if eval.corner_total > 0 { eval.corner_correct as f64 / eval.corner_total as f64 * 100.0 } else { 0.0 });
+
+    // Dump sample clouds (use_discrete=false for weighted lerp positions)
+    println!("\nDumping sample clouds to {}...", output_path.display());
+    dump_rnn_policy_sample_cloud_with_policy(&policy, "rnn-baseline", output_path);
+    println!("Done!");
+}
+
+/// Train with exploration schedule and dump sample clouds.
+pub fn dump_exploration_schedule_sample_cloud(output_path: &Path) {
+    let cube = AnalyticalRotatedCube::standard_test_cube();
+    let points = generate_validation_points_randomized(&cube, policy::CELL_SIZE * 0.2, 2, 42);
+    let reward_config = RewardConfig::default();
+
+    let epochs = 6000;
+    let lr = 0.0003;
+
+    println!("=== Training with Exploration Schedule for Sample Cloud Dump ===");
+    println!("Epochs: {}, LR: {}", epochs, lr);
+
+    let mut rng = Rng::new(12345);
+    let mut policy = RnnPolicy::new(&mut rng);
+
+    let config = TrainingConfig {
+        epochs,
+        print_every: 1000,
+        lr,
+        use_classifier_heads: true,
+        use_exploration_schedule: true,
+        exploration_start: 1.0,
+        exploration_end: 0.0,
+        ..Default::default()
+    };
+    train_policy(&mut policy, &cube, &points, &config, &reward_config, &mut rng);
+
+    // Evaluate
+    let eval = evaluate_classifier_heads(&policy, &cube, &points, &reward_config, &mut rng);
+    println!("\nFinal results:");
+    println!("  Accuracy: {:.1}% (loss: {:.3})", eval.accuracy * 100.0, eval.loss);
+    println!("  Face:   {}/{} = {:.0}%", eval.face_correct, eval.face_total,
+        if eval.face_total > 0 { eval.face_correct as f64 / eval.face_total as f64 * 100.0 } else { 0.0 });
+    println!("  Edge:   {}/{} = {:.0}%", eval.edge_correct, eval.edge_total,
+        if eval.edge_total > 0 { eval.edge_correct as f64 / eval.edge_total as f64 * 100.0 } else { 0.0 });
+    println!("  Corner: {}/{} = {:.0}%", eval.corner_correct, eval.corner_total,
+        if eval.corner_total > 0 { eval.corner_correct as f64 / eval.corner_total as f64 * 100.0 } else { 0.0 });
+
+    // Dump sample clouds (use_discrete=false for weighted lerp positions)
+    println!("\nDumping sample clouds to {}...", output_path.display());
+    dump_rnn_policy_sample_cloud_with_policy(&policy, "rnn-exploration-schedule", output_path);
+    println!("Done!");
 }
 
 /// Classifier evaluation result with both accuracy and confidence.
@@ -456,7 +648,7 @@ fn evaluate_classifier_heads(
 }
 
 /// Load a trained RNN policy and dump sample clouds.
-pub fn load_and_dump_rnn_policy(model_path: &Path, output_path: &Path, use_discrete: bool) {
+pub fn load_and_dump_rnn_policy(model_path: &Path, output_path: &Path) {
     let policy = match RnnPolicy::load(model_path) {
         Ok(p) => p,
         Err(e) => {
@@ -466,8 +658,7 @@ pub fn load_and_dump_rnn_policy(model_path: &Path, output_path: &Path, use_discr
     };
     println!("Loaded model from {}", model_path.display());
 
-    let label = if use_discrete { "rnn-trained-discrete" } else { "rnn-trained" };
-    dump_rnn_policy_sample_cloud_with_policy(&policy, label, output_path, use_discrete);
+    dump_rnn_policy_sample_cloud_with_policy(&policy, "rnn-trained", output_path);
 }
 
 /// Dump sample clouds from the RNN policy for visualization.
@@ -500,11 +691,11 @@ pub fn dump_rnn_policy_sample_cloud(kind: RnnPolicyDumpKind, output_path: &Path)
         }
     };
 
-    dump_rnn_policy_sample_cloud_with_policy(&policy, label, output_path, true);
+    dump_rnn_policy_sample_cloud_with_policy(&policy, label, output_path);
 }
 
 /// Dump sample clouds using a pre-loaded policy.
-fn dump_rnn_policy_sample_cloud_with_policy(policy: &RnnPolicy, label: &str, output_path: &Path, use_discrete: bool) {
+fn dump_rnn_policy_sample_cloud_with_policy(policy: &RnnPolicy, label: &str, output_path: &Path) {
     use classifier_heads::GeometryType;
 
     let cube = AnalyticalRotatedCube::standard_test_cube();
@@ -521,8 +712,8 @@ fn dump_rnn_policy_sample_cloud_with_policy(policy: &RnnPolicy, label: &str, out
     for (idx, point) in points.iter().enumerate() {
         begin_sample_recording();
 
-        // stochastic=false (use argmax), use_discrete controls corner vs weighted position
-        let episode = run_episode_ex(policy, &cube, point, idx, &mut rng, false, use_discrete, &reward_config);
+        // stochastic=false (use argmax) for deterministic evaluation
+        let episode = run_episode(policy, &cube, point, idx, &mut rng, false, &reward_config);
 
         let samples = end_sample_recording();
 
@@ -1104,5 +1295,32 @@ mod tests {
 
         let eval = evaluate_policy(&policy, &cube, &subset, &reward_config, &mut rng);
         assert!(eval.fit_rate >= 0.0 && eval.fit_rate <= 1.0);
+    }
+
+    /// Run exploration schedule comparison.
+    /// This test is ignored by default as it takes several minutes.
+    /// Run with: cargo test --release --features native compare_exploration -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn compare_exploration() {
+        compare_exploration_schedule();
+    }
+
+    /// Dump sample cloud from exploration schedule training.
+    /// Run with: cargo test --release --features native test_dump_exploration_sample_cloud -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn test_dump_exploration_sample_cloud() {
+        let output_path = std::path::Path::new("sample_cloud_rnn_exploration.cbor");
+        super::dump_exploration_schedule_sample_cloud(output_path);
+    }
+
+    /// Dump sample cloud from baseline (no exploration) training.
+    /// Run with: cargo test --release --features native test_dump_baseline_sample_cloud -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn test_dump_baseline_sample_cloud() {
+        let output_path = std::path::Path::new("sample_cloud_rnn_baseline.cbor");
+        super::dump_baseline_sample_cloud(output_path);
     }
 }

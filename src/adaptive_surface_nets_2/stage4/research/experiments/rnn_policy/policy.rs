@@ -284,7 +284,7 @@ pub struct Episode {
 /// * `point` - Validation point to process
 /// * `point_idx` - Index of the point (for tracking)
 /// * `rng` - Random number generator
-/// * `training` - Whether to sample stochastically (true) or use argmax (false)
+/// * `stochastic` - Whether to sample stochastically (true) or use argmax (false)
 /// * `reward_config` - Reward configuration
 pub fn run_episode(
     policy: &RnnPolicy,
@@ -292,13 +292,16 @@ pub fn run_episode(
     point: &ValidationPoint,
     point_idx: usize,
     rng: &mut Rng,
-    training: bool,
+    stochastic: bool,
     reward_config: &RewardConfig,
 ) -> Episode {
-    run_episode_ex(policy, cube, point, point_idx, rng, training, false, reward_config)
+    run_episode_with_exploration(policy, cube, point, point_idx, rng, stochastic, 0.0, reward_config)
 }
 
-/// Run a single episode with the policy (extended version).
+/// Run a single episode with exploration rate for curriculum learning.
+///
+/// Sample positions are computed as weighted averages of octant corners based on
+/// the softmax probabilities from the chooser head (octant lerp).
 ///
 /// # Arguments
 /// * `policy` - The RNN policy
@@ -307,16 +310,16 @@ pub fn run_episode(
 /// * `point_idx` - Index of the point (for tracking)
 /// * `rng` - Random number generator
 /// * `stochastic` - Whether to sample stochastically (true) or use argmax (false)
-/// * `use_discrete` - Whether to use discrete corners (true) or weighted positions (false)
+/// * `exploration_rate` - Fraction of samples to select randomly (0.0 = all policy, 1.0 = all random)
 /// * `reward_config` - Reward configuration
-pub fn run_episode_ex(
+pub fn run_episode_with_exploration(
     policy: &RnnPolicy,
     cube: &AnalyticalRotatedCube,
     point: &ValidationPoint,
     point_idx: usize,
     rng: &mut Rng,
     stochastic: bool,
-    use_discrete: bool,
+    exploration_rate: f64,
     reward_config: &RewardConfig,
 ) -> Episode {
     // Create sampler for the cube
@@ -363,33 +366,24 @@ pub fn run_episode_ex(
         let (_logits, probs, mut chooser_cache) = chooser_forward(&policy.chooser, &h);
 
         // Select action
+        // When exploration_rate > 0, some fraction of actions are selected uniformly at random
+        // to encourage diverse sampling for training the classifier heads early on.
         let action = if stochastic {
-            sample_categorical(&probs, rng)
+            if exploration_rate > 0.0 && rng.next_f64() < exploration_rate {
+                // Random exploration: uniform over 8 octants
+                (rng.next_f64() * 8.0) as usize % 8
+            } else {
+                // Policy-based: sample from learned distribution
+                sample_categorical(&probs, rng)
+            }
         } else {
             argmax(&probs)
         };
         chooser_cache.action = action;
 
-        // Compute sample position
-        let sample_pos = if use_discrete || stochastic {
-            // Use discrete corner with jitter during training
-            let base = corners[action];
-            if stochastic {
-                // Add small random jitter to break cache degeneracy
-                // Jitter is ~5% of cell size to stay near the corner
-                let jitter_scale = CELL_SIZE * 0.05;
-                (
-                    base.0 + (rng.next_f64() - 0.5) * jitter_scale,
-                    base.1 + (rng.next_f64() - 0.5) * jitter_scale,
-                    base.2 + (rng.next_f64() - 0.5) * jitter_scale,
-                )
-            } else {
-                base
-            }
-        } else {
-            // Use weighted average for smoother behavior
-            position_from_probs(&probs, &corners)
-        };
+        // Compute sample position using weighted average of corners (octant lerp)
+        // This produces positions throughout the cell volume based on softmax probabilities
+        let sample_pos = position_from_probs(&probs, &corners);
 
         // Query the sampler
         let is_inside = cache.is_inside(sample_pos.0, sample_pos.1, sample_pos.2);

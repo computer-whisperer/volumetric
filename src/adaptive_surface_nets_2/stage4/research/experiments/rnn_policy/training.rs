@@ -16,7 +16,7 @@ use super::classifier_heads::{
 };
 use super::gradients::{compute_batch_gradient, PolicyGradients};
 use super::gru::{Rng, HIDDEN_DIM};
-use super::policy::{run_episode, Episode, RnnPolicy, BUDGET, CELL_SIZE, INPUT_DIM};
+use super::policy::{run_episode, run_episode_with_exploration, Episode, RnnPolicy, BUDGET, CELL_SIZE, INPUT_DIM};
 use super::reward::{compute_terminal_reward, RewardConfig, TerminalRewardConfig};
 
 #[cfg(feature = "native")]
@@ -51,6 +51,15 @@ pub struct TrainingConfig {
     pub classifier_loss: ClassifierLossConfig,
     /// Whether to use rotation augmentation during training.
     pub use_rotation_augmentation: bool,
+    /// Whether to use exploration schedule (random sampling that cools down).
+    /// When enabled, sample selection starts fully random and transitions to policy-based.
+    pub use_exploration_schedule: bool,
+    /// Starting exploration rate (fraction of random samples at epoch 0).
+    /// Only used when use_exploration_schedule is true.
+    pub exploration_start: f64,
+    /// Ending exploration rate (fraction of random samples at final epoch).
+    /// Only used when use_exploration_schedule is true.
+    pub exploration_end: f64,
 }
 
 impl Default for TrainingConfig {
@@ -69,7 +78,39 @@ impl Default for TrainingConfig {
             use_classifier_heads: true, // New default: use neural classifier heads
             classifier_loss: ClassifierLossConfig::default(),
             use_rotation_augmentation: true, // Enable rotation by default
+            use_exploration_schedule: false, // Disabled by default for backwards compatibility
+            exploration_start: 1.0, // 100% random at start
+            exploration_end: 0.0, // 0% random at end (fully policy-based)
         }
+    }
+}
+
+impl TrainingConfig {
+    /// Create a config with exploration schedule enabled.
+    /// This starts training with fully random sampling and gradually transitions
+    /// to policy-based sampling, allowing the classifier heads to learn from
+    /// diverse samples early in training.
+    pub fn with_exploration_schedule() -> Self {
+        Self {
+            use_exploration_schedule: true,
+            exploration_start: 1.0,
+            exploration_end: 0.0,
+            ..Default::default()
+        }
+    }
+
+    /// Compute the exploration rate for a given epoch.
+    /// Returns 0.0 if exploration schedule is disabled.
+    /// Otherwise returns a linearly interpolated value between exploration_start and exploration_end.
+    pub fn exploration_rate(&self, epoch: usize) -> f64 {
+        if !self.use_exploration_schedule {
+            return 0.0;
+        }
+        if self.epochs <= 1 {
+            return self.exploration_end;
+        }
+        let t = epoch as f64 / (self.epochs - 1) as f64;
+        self.exploration_start + t * (self.exploration_end - self.exploration_start)
     }
 }
 
@@ -259,6 +300,8 @@ pub struct EpochStats {
     pub avg_reward: f64,
     pub grad_norm: f64,
     pub avg_samples: f64,
+    /// Exploration rate used for this epoch (0.0 if exploration schedule disabled).
+    pub exploration_rate: f64,
 }
 
 /// Result of processing a single episode (for parallel collection).
@@ -277,6 +320,7 @@ fn collect_episodes_parallel(
     config: &TrainingConfig,
     reward_config: &RewardConfig,
     epoch: usize,
+    exploration_rate: f64,
 ) -> Vec<EpisodeResult> {
     let num_points = training_points.len();
 
@@ -288,7 +332,9 @@ fn collect_episodes_parallel(
             let seed = (epoch as u64 * num_points as u64 + idx as u64) ^ 0xDEADBEEF;
             let mut rng = Rng::new(seed);
 
-            let mut episode = run_episode(policy, training_cube, point, idx, &mut rng, true, reward_config);
+            let mut episode = run_episode_with_exploration(
+                policy, training_cube, point, idx, &mut rng, true, exploration_rate, reward_config
+            );
 
             // Compute terminal reward using legacy RANSAC if enabled
             if config.use_terminal_reward && !config.use_classifier_heads {
@@ -355,6 +401,7 @@ fn collect_episodes_parallel(
     config: &TrainingConfig,
     reward_config: &RewardConfig,
     epoch: usize,
+    exploration_rate: f64,
 ) -> Vec<EpisodeResult> {
     let num_points = training_points.len();
 
@@ -365,7 +412,9 @@ fn collect_episodes_parallel(
             let seed = (epoch as u64 * num_points as u64 + idx as u64) ^ 0xDEADBEEF;
             let mut rng = Rng::new(seed);
 
-            let mut episode = run_episode(policy, training_cube, point, idx, &mut rng, true, reward_config);
+            let mut episode = run_episode_with_exploration(
+                policy, training_cube, point, idx, &mut rng, true, exploration_rate, reward_config
+            );
 
             if config.use_terminal_reward && !config.use_classifier_heads {
                 let terminal_result = compute_terminal_reward(
@@ -450,6 +499,9 @@ pub fn train_policy(
             (cube.clone(), points.to_vec())
         };
 
+        // Compute exploration rate for this epoch (cooling schedule)
+        let exploration_rate = config.exploration_rate(epoch);
+
         // Collect episodes for all points (parallelized when native feature enabled)
         let results = collect_episodes_parallel(
             policy,
@@ -458,6 +510,7 @@ pub fn train_policy(
             config,
             reward_config,
             epoch,
+            exploration_rate,
         );
 
         // Aggregate results from parallel collection
@@ -514,27 +567,35 @@ pub fn train_policy(
             avg_reward,
             grad_norm,
             avg_samples,
+            exploration_rate,
         };
         stats.push(epoch_stats.clone());
 
         if (epoch + 1) % config.print_every == 0 || epoch == 0 {
+            let explore_str = if config.use_exploration_schedule {
+                format!(", explore={:.0}%", exploration_rate * 100.0)
+            } else {
+                String::new()
+            };
             if config.use_classifier_heads {
                 println!(
-                    "  Epoch {:3}: return={:.3}, clf_loss={:.3}, grad_norm={:.4}, samples={:.1}",
+                    "  Epoch {:3}: return={:.3}, clf_loss={:.3}, grad_norm={:.4}, samples={:.1}{}",
                     epoch + 1,
                     avg_return,
                     avg_classifier_loss,
                     grad_norm,
-                    avg_samples
+                    avg_samples,
+                    explore_str
                 );
             } else {
                 println!(
-                    "  Epoch {:3}: return={:.3}, reward={:.4}, grad_norm={:.4}, samples={:.1}",
+                    "  Epoch {:3}: return={:.3}, reward={:.4}, grad_norm={:.4}, samples={:.1}{}",
                     epoch + 1,
                     avg_return,
                     avg_reward,
                     grad_norm,
-                    avg_samples
+                    avg_samples,
+                    explore_str
                 );
             }
         }
