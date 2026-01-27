@@ -33,8 +33,8 @@ struct LineInstance {
 struct VsOut {
     @builtin(position) position: vec4<f32>,
     @location(0) color: vec4<f32>,
-    @location(1) edge_coord: f32,     // -1 to +1 across line width (for AA)
-    @location(2) line_coord: f32,     // Distance along line (world units, for dashing)
+    @location(1) @interpolate(linear) edge_coord: f32,     // -1 to +1 across line width (for AA) - linear interpolation to avoid perspective distortion
+    @location(2) @interpolate(linear) line_coord: f32,     // Distance along line (world units, for dashing)
 };
 
 @vertex
@@ -43,24 +43,33 @@ fn vs_main(quad: QuadVertex, line: LineInstance) -> VsOut {
 
     // Select position along line (0 = start, 1 = end)
     let t = quad.corner.x;
-    let world_pos = mix(line.start, line.end, t);
 
     // Project both endpoints to clip space
     let clip_start = uniforms.view_proj * vec4(line.start, 1.0);
     let clip_end = uniforms.view_proj * vec4(line.end, 1.0);
 
-    // Convert to NDC
-    let ndc_start = clip_start.xy / clip_start.w;
-    let ndc_end = clip_end.xy / clip_end.w;
+    // Current clip position for this vertex
+    let clip_pos = mix(clip_start, clip_end, t);
 
-    // Screen-space direction and perpendicular
-    let screen_start = (ndc_start * 0.5 + 0.5) * uniforms.screen_size;
-    let screen_end = (ndc_end * 0.5 + 0.5) * uniforms.screen_size;
-    let screen_dir = screen_end - screen_start;
-    let screen_len = length(screen_dir);
+    // Safe W values
+    let w_min = 0.0001;
+    let w_safe = max(clip_pos.w, w_min);
 
-    // Perpendicular (rotate 90 degrees)
-    let perp = vec2(-screen_dir.y, screen_dir.x) / max(screen_len, 0.001);
+    // Clip-space line direction
+    let clip_dir = clip_end - clip_start;
+
+    // Compute the screen-space tangent direction at the current vertex position.
+    // The derivative of screen position with respect to line parameter is:
+    // d(screen)/dt = [(clip_dir.xy * w - clip.xy * clip_dir.w) / w²] * screen_size * 0.5
+    // This gives the local screen-space direction of the line at this vertex.
+    let screen_tangent = (clip_dir.xy * clip_pos.w - clip_pos.xy * clip_dir.w) / (w_safe * w_safe);
+
+    // Convert to actual screen pixels (NDC to screen scale)
+    let screen_tangent_px = screen_tangent * 0.5 * uniforms.screen_size;
+    let tangent_len = length(screen_tangent_px);
+
+    // Perpendicular in screen space (rotate 90 degrees)
+    let screen_perp = vec2(-screen_tangent_px.y, screen_tangent_px.x) / max(tangent_len, 0.001);
 
     // Determine width
     let width = select(uniforms.default_width, line.width, line.width > 0.0);
@@ -70,18 +79,16 @@ fn vs_main(quad: QuadVertex, line: LineInstance) -> VsOut {
         half_width_px = width * 0.5;
     } else {
         // World-space: approximate pixel width from clip.w
-        let clip_w = mix(clip_start.w, clip_end.w, t);
-        half_width_px = (width / clip_w) * uniforms.screen_size.y * 0.5;
+        half_width_px = (width / w_safe) * uniforms.screen_size.y * 0.5;
     }
 
-    // Offset in screen space
-    let offset_px = perp * half_width_px * quad.corner.y;
+    // Offset in screen pixels
+    let offset_screen_px = screen_perp * half_width_px * quad.corner.y;
 
-    // Convert offset back to NDC
-    let offset_ndc = offset_px * 2.0 / uniforms.screen_size;
+    // Convert screen pixel offset back to NDC
+    let offset_ndc = offset_screen_px * 2.0 / uniforms.screen_size;
 
-    // Current clip position
-    let clip_pos = mix(clip_start, clip_end, t);
+    // Apply offset in clip space (multiply by w to maintain correct perspective)
     out.position = vec4(clip_pos.xy + offset_ndc * clip_pos.w, clip_pos.zw);
 
     out.color = line.color;
