@@ -2759,6 +2759,66 @@ impl eframe::App for VolumetricApp {
                                     self.camera.radius = 0.15;
                                 }
                             }
+
+                            // Sample cloud legend
+                            ui.collapsing("Legend", |ui| {
+                                let legend_entries: &[(&str, [f32; 3], &str)] = &[
+                                    ("Crossing", [0.2, 1.0, 0.4], "circle"),
+                                    ("Inside", [1.0, 0.8, 0.2], "circle"),
+                                    ("Outside", [1.0, 0.4, 0.2], "circle"),
+                                    ("Probe", [0.2, 0.8, 1.0], "circle"),
+                                    ("Unknown", [0.7, 0.7, 0.7], "circle"),
+                                    ("Root Vertex", [1.0, 0.2, 0.4], "diamond"),
+                                    ("Cell Bounds", [0.3, 0.7, 1.0], "box"),
+                                ];
+
+                                for (label, color, shape) in legend_entries {
+                                    ui.horizontal(|ui| {
+                                        let (rect, _response) = ui.allocate_exact_size(
+                                            egui::vec2(16.0, 16.0),
+                                            egui::Sense::hover(),
+                                        );
+                                        let painter = ui.painter_at(rect);
+                                        let color32 = egui::Color32::from_rgb(
+                                            (color[0] * 255.0) as u8,
+                                            (color[1] * 255.0) as u8,
+                                            (color[2] * 255.0) as u8,
+                                        );
+
+                                        match *shape {
+                                            "circle" => {
+                                                painter.circle_filled(rect.center(), 6.0, color32);
+                                            }
+                                            "diamond" => {
+                                                let c = rect.center();
+                                                let s = 6.0;
+                                                let points = vec![
+                                                    egui::pos2(c.x, c.y - s),
+                                                    egui::pos2(c.x + s, c.y),
+                                                    egui::pos2(c.x, c.y + s),
+                                                    egui::pos2(c.x - s, c.y),
+                                                ];
+                                                painter.add(egui::Shape::convex_polygon(
+                                                    points,
+                                                    color32,
+                                                    egui::Stroke::NONE,
+                                                ));
+                                            }
+                                            "box" => {
+                                                painter.rect_stroke(
+                                                    rect.shrink(3.0),
+                                                    0.0,
+                                                    egui::Stroke::new(2.0, color32),
+                                                    egui::StrokeKind::Inside,
+                                                );
+                                            }
+                                            _ => {}
+                                        }
+
+                                        ui.label(*label);
+                                    });
+                                }
+                            });
                         } else {
                             ui.weak("No sample cloud loaded");
                         }
@@ -3714,10 +3774,33 @@ impl eframe::App for VolumetricApp {
                                     }
                                 });
 
-                                // Show bounding box toggle when we have render data
+                                // Show bounding box toggle and focus button when we have render data
                                 if current_mode != ExportRenderMode::None {
+                                    // Extract bounds for focus button (immutable borrow)
+                                    let bounds = self.asset_render_data.get(&asset_id).map(|rd| {
+                                        (rd.bounds_min, rd.bounds_max)
+                                    });
+
                                     if let Some(render_data) = self.asset_render_data.get_mut(&asset_id) {
                                         ui.checkbox(&mut render_data.show_bounding_box, "Show bounds");
+                                    }
+
+                                    // Focus button (uses camera, needs bounds computed above)
+                                    if let Some((bounds_min, bounds_max)) = bounds {
+                                        if ui.button("🎯 Focus on").clicked() {
+                                            let center = glam::Vec3::new(
+                                                (bounds_min.0 + bounds_max.0) / 2.0,
+                                                (bounds_min.1 + bounds_max.1) / 2.0,
+                                                (bounds_min.2 + bounds_max.2) / 2.0,
+                                            );
+                                            let extent = glam::Vec3::new(
+                                                bounds_max.0 - bounds_min.0,
+                                                bounds_max.1 - bounds_min.1,
+                                                bounds_max.2 - bounds_min.2,
+                                            );
+                                            self.camera.target = center;
+                                            self.camera.radius = extent.length().max(0.5) * 1.5;
+                                        }
                                     }
                                 }
 
@@ -4380,7 +4463,7 @@ impl eframe::App for VolumetricApp {
                 ssao_strength: self.ssao_strength,
                 grid: renderer::GridSettings::default(),
                 axis_indicator: renderer::AxisIndicator::default(),
-                show_axis_indicator: false,
+                show_axis_indicator: true,
                 background_color: [0.098, 0.098, 0.149, 1.0], // rgb(25,25,38)
             };
 

@@ -821,6 +821,7 @@ impl Renderer {
         // =================================================================
         // Pass 8-9: Overlay Lines and Points (no depth test)
         // =================================================================
+        // Also includes axis indicator lines transformed to corner position
         {
             // Collect and prepare all overlay line instances
             let mut all_line_segments: Vec<LineSegment> = Vec::new();
@@ -846,6 +847,101 @@ impl Renderer {
                 }
             }
 
+            // Add axis indicator lines (transformed to corner position)
+            // Uses NDC-space positioning with inv_view_proj to ensure constant screen size
+            // regardless of camera zoom or clip plane settings.
+            // Also collects arrow tip positions for rendering as points.
+            let mut axis_arrow_tips: Vec<(Vec3, [f32; 4])> = Vec::new();
+
+            if settings.show_axis_indicator {
+                let indicator = &settings.axis_indicator;
+                let inv_view_proj = view_proj.inverse();
+
+                // Extract camera orientation from view matrix
+                // The view matrix rotation shows how world axes map to view/screen axes
+                let view = camera.view_matrix();
+                let (_scale, rotation, _translation) = view.to_scale_rotation_translation();
+
+                // In view space: +X is right, +Y is up, +Z is towards viewer
+                // rotation * world_axis = view_axis (how that world axis appears on screen)
+                let x_view = rotation * Vec3::X;
+                let y_view = rotation * Vec3::Y;
+                let z_view = rotation * Vec3::Z;
+
+                // Screen directions (X,Y components of view-space vectors)
+                let x_screen = glam::Vec2::new(x_view.x, x_view.y);
+                let y_screen = glam::Vec2::new(y_view.x, y_view.y);
+                let z_screen = glam::Vec2::new(z_view.x, z_view.y);
+
+                // Compute corner position in NDC (-1 to 1 range)
+                let vp_width = self.viewport_size.0 as f32;
+                let vp_height = self.viewport_size.1 as f32;
+                let indicator_size = indicator.size;
+
+                // Position is normalized (0-1), convert to NDC
+                let corner_ndc_x = indicator.position[0] * 2.0 - 1.0;
+                let corner_ndc_y = indicator.position[1] * 2.0 - 1.0;
+
+                // Scale factor for the indicator size in NDC space (increased for visibility)
+                let aspect = vp_width / vp_height;
+                let ndc_scale = indicator_size / vp_width.min(vp_height) * 4.0;
+
+                // Use a fixed NDC depth close to near plane
+                // NDC z ranges from 0 (near) to 1 (far) in wgpu
+                let ndc_z = 0.1;
+
+                // Helper to unproject NDC to world space
+                let unproject = |ndc_x: f32, ndc_y: f32| -> Vec3 {
+                    // Clip space position (w=1 before perspective divide)
+                    let clip = glam::Vec4::new(ndc_x, ndc_y, ndc_z, 1.0);
+                    let world_h = inv_view_proj * clip;
+                    // Perspective divide to get world position
+                    Vec3::new(
+                        world_h.x / world_h.w,
+                        world_h.y / world_h.w,
+                        world_h.z / world_h.w,
+                    )
+                };
+
+                // Helper to create a line segment at the corner position
+                let mut add_axis_line = |dir: glam::Vec2, color: [f32; 4]| {
+                    // Start position in NDC
+                    let start_ndc_x = corner_ndc_x;
+                    let start_ndc_y = corner_ndc_y;
+
+                    // End position in NDC (scale X by aspect to keep square appearance)
+                    let end_ndc_x = corner_ndc_x + dir.x * ndc_scale / aspect;
+                    let end_ndc_y = corner_ndc_y + dir.y * ndc_scale;
+
+                    // Offset for arrow tip - extend slightly beyond line end
+                    // Diamond size is 12px, so offset by ~half that in NDC
+                    let tip_offset = 6.0 / vp_width.min(vp_height);
+                    let dir_len = (dir.x * dir.x + dir.y * dir.y).sqrt().max(0.001);
+                    let tip_ndc_x = end_ndc_x + (dir.x / dir_len) * tip_offset / aspect;
+                    let tip_ndc_y = end_ndc_y + (dir.y / dir_len) * tip_offset;
+
+                    let start_pos = unproject(start_ndc_x, start_ndc_y);
+                    let end_pos = unproject(end_ndc_x, end_ndc_y);
+                    let tip_pos = unproject(tip_ndc_x, tip_ndc_y);
+
+                    all_line_segments.push(LineSegment {
+                        start: start_pos.into(),
+                        end: end_pos.into(),
+                        color,
+                    });
+
+                    // Store arrow tip position for point rendering (offset beyond line)
+                    axis_arrow_tips.push((tip_pos, color));
+                };
+
+                add_axis_line(x_screen, indicator.x_color);
+                add_axis_line(y_screen, indicator.y_color);
+                add_axis_line(z_screen, indicator.z_color);
+
+                // Use thicker lines for the axis indicator
+                line_style.width = 4.0;
+            }
+
             // Collect and prepare all overlay point instances
             let mut all_point_instances: Vec<PointInstance> = Vec::new();
             let mut point_style = PointStyle {
@@ -868,6 +964,21 @@ impl Renderer {
                 }
             }
 
+            // Prepare axis arrow tip points (diamond shaped)
+            let axis_tip_instances: Vec<PointInstance> = axis_arrow_tips
+                .iter()
+                .map(|(pos, color)| PointInstance {
+                    position: (*pos).into(),
+                    color: *color,
+                })
+                .collect();
+            let axis_tip_style = PointStyle {
+                size: 12.0,
+                size_mode: WidthMode::ScreenSpace,
+                shape: PointShape::Diamond,
+                depth_mode: DepthMode::Overlay,
+            };
+
             // Upload all data before starting the render pass (split borrow)
             let GpuResources {
                 line_pipeline,
@@ -883,45 +994,81 @@ impl Renderer {
                 line_pipeline.update_uniforms(queue, &uniforms);
             }
 
-            if !all_point_instances.is_empty() {
-                let instances = PointPipeline::prepare_instances(&all_point_instances);
-                point_pipeline.upload_instances(device, queue, &instances);
-                let uniforms = PointPipeline::create_uniforms(view_proj_array, screen_size, &point_style);
-                point_pipeline.update_uniforms(queue, &uniforms);
-            }
+            // Render overlay lines and regular points in first pass
+            if !all_line_segments.is_empty() || !all_point_instances.is_empty() {
+                // Upload regular points if any
+                if !all_point_instances.is_empty() {
+                    let instances = PointPipeline::prepare_instances(&all_point_instances);
+                    point_pipeline.upload_instances(device, queue, &instances);
+                    let uniforms = PointPipeline::create_uniforms(view_proj_array, screen_size, &point_style);
+                    point_pipeline.update_uniforms(queue, &uniforms);
+                }
 
-            // Now start the render pass
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("overlay_pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &gbuffer.depth_stencil_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Discard,
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("overlay_pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: target,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &gbuffer.depth_stencil_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Discard,
+                        }),
+                        stencil_ops: None,
                     }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
 
-            // Render all uploaded data
-            if !all_line_segments.is_empty() {
-                line_pipeline.render(&mut pass, DepthMode::Overlay);
+                if !all_line_segments.is_empty() {
+                    line_pipeline.render(&mut pass, DepthMode::Overlay);
+                }
+                if !all_point_instances.is_empty() {
+                    point_pipeline.render(&mut pass, DepthMode::Overlay);
+                }
             }
-            if !all_point_instances.is_empty() {
+
+            // Render axis arrow tips in separate pass (different point style)
+            if !axis_tip_instances.is_empty() {
+                let instances = PointPipeline::prepare_instances(&axis_tip_instances);
+                point_pipeline.upload_instances(device, queue, &instances);
+                let uniforms = PointPipeline::create_uniforms(view_proj_array, screen_size, &axis_tip_style);
+                point_pipeline.update_uniforms(queue, &uniforms);
+
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("axis_tips_pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: target,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &gbuffer.depth_stencil_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Discard,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+
                 point_pipeline.render(&mut pass, DepthMode::Overlay);
             }
         }
+
     }
 
     /// Clear frame state for next frame.
@@ -987,44 +1134,123 @@ impl Renderer {
     }
 }
 
-/// Generate axis indicator lines for rendering.
+/// Axis indicator geometry for rendering (shafts + cone arrow heads).
+pub struct AxisIndicatorGeometry {
+    /// Line segments for the axis shafts
+    pub shafts: Vec<LineSegment>,
+    /// Triangle vertices for the cone arrow heads (position, normal, color)
+    pub cone_vertices: Vec<MeshVertex>,
+    /// Colors for the cones (one per axis: X, Y, Z)
+    pub cone_colors: [[f32; 4]; 3],
+}
+
+/// Generate axis indicator geometry (shafts and cone arrow heads).
 ///
-/// Creates three line segments representing the X, Y, and Z axes,
+/// Creates three arrows representing the X, Y, and Z axes,
 /// transformed by the camera's rotation for display in a corner viewport.
-pub fn generate_axis_indicator_lines(camera: &Camera, indicator: &AxisIndicator) -> Vec<LineSegment> {
+pub fn generate_axis_indicator_geometry(camera: &Camera, indicator: &AxisIndicator) -> AxisIndicatorGeometry {
     // Get the camera's view rotation
     let view = camera.view_matrix();
 
-    // Extract rotation from view matrix (inverse of camera rotation)
-    // We want to show world axes as seen from the camera's perspective
+    // Extract rotation from view matrix
+    // The view matrix rotation transforms world space to view space,
+    // so it shows how world axes appear from the camera's perspective
     let (_scale, rotation, _translation) = view.to_scale_rotation_translation();
-    let inv_rotation = rotation.inverse();
 
-    // Transform world axes to view space
-    let x_dir = inv_rotation * Vec3::X;
-    let y_dir = inv_rotation * Vec3::Y;
-    let z_dir = inv_rotation * Vec3::Z;
+    // Transform world axes by view rotation to get screen-space directions
+    let x_dir = rotation * Vec3::X;
+    let y_dir = rotation * Vec3::Y;
+    let z_dir = rotation * Vec3::Z;
 
     let origin = Vec3::ZERO;
-    let len = 1.0; // Normalized length, will be scaled by viewport
+    let shaft_len = 0.75; // Leave room for arrow head
+    let arrow_len = 1.0;
 
-    vec![
+    // Generate shaft lines
+    let shafts = vec![
         LineSegment {
             start: origin.into(),
-            end: (origin + x_dir * len).into(),
+            end: (origin + x_dir * shaft_len).into(),
             color: indicator.x_color,
         },
         LineSegment {
             start: origin.into(),
-            end: (origin + y_dir * len).into(),
+            end: (origin + y_dir * shaft_len).into(),
             color: indicator.y_color,
         },
         LineSegment {
             start: origin.into(),
-            end: (origin + z_dir * len).into(),
+            end: (origin + z_dir * shaft_len).into(),
             color: indicator.z_color,
         },
-    ]
+    ];
+
+    // Generate cone arrow heads (8 segments per cone)
+    let mut cone_vertices = Vec::new();
+    let cone_radius = 0.15;
+    let cone_height = 0.25;
+    let segments = 8;
+
+    for (dir, color) in [
+        (x_dir, indicator.x_color),
+        (y_dir, indicator.y_color),
+        (z_dir, indicator.z_color),
+    ] {
+        let tip = origin + dir * arrow_len;
+        let base_center = origin + dir * shaft_len;
+
+        // Create orthonormal basis for cone base
+        let (perp1, perp2) = perpendicular_vectors(dir);
+
+        // Generate cone triangles
+        for i in 0..segments {
+            let angle1 = (i as f32) * std::f32::consts::TAU / (segments as f32);
+            let angle2 = ((i + 1) as f32) * std::f32::consts::TAU / (segments as f32);
+
+            let (sin1, cos1) = angle1.sin_cos();
+            let (sin2, cos2) = angle2.sin_cos();
+
+            let base1 = base_center + (perp1 * cos1 + perp2 * sin1) * cone_radius;
+            let base2 = base_center + (perp1 * cos2 + perp2 * sin2) * cone_radius;
+
+            // Cone side triangle (tip, base1, base2)
+            let edge1 = base1 - tip;
+            let edge2 = base2 - tip;
+            let normal = edge2.cross(edge1).normalize();
+
+            cone_vertices.push(MeshVertex::new(tip.into(), normal.into()));
+            cone_vertices.push(MeshVertex::new(base1.into(), normal.into()));
+            cone_vertices.push(MeshVertex::new(base2.into(), normal.into()));
+
+            // Base triangle (base_center, base2, base1) - reverse winding for bottom face
+            let base_normal = -dir;
+            cone_vertices.push(MeshVertex::new(base_center.into(), base_normal.into()));
+            cone_vertices.push(MeshVertex::new(base2.into(), base_normal.into()));
+            cone_vertices.push(MeshVertex::new(base1.into(), base_normal.into()));
+        }
+    }
+
+    AxisIndicatorGeometry {
+        shafts,
+        cone_vertices,
+        cone_colors: [indicator.x_color, indicator.y_color, indicator.z_color],
+    }
+}
+
+/// Get two perpendicular vectors to the given direction.
+fn perpendicular_vectors(dir: Vec3) -> (Vec3, Vec3) {
+    let perp1 = if dir.x.abs() < 0.9 {
+        dir.cross(Vec3::X).normalize()
+    } else {
+        dir.cross(Vec3::Y).normalize()
+    };
+    let perp2 = dir.cross(perp1).normalize();
+    (perp1, perp2)
+}
+
+/// Generate axis indicator lines for rendering (legacy, shafts only).
+pub fn generate_axis_indicator_lines(camera: &Camera, indicator: &AxisIndicator) -> Vec<LineSegment> {
+    generate_axis_indicator_geometry(camera, indicator).shafts
 }
 
 /// Compute an orthographic projection for the axis indicator.
