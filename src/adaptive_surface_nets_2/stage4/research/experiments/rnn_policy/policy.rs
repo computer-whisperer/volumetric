@@ -14,10 +14,10 @@ use super::chooser::{
 use super::classifier_heads::{ClassifierHeads, ClassifierPredictions};
 use super::gru::{gru_forward, GruCache, GruWeights, Rng, HIDDEN_DIM};
 use super::math::argmax;
-use super::reward::{compute_step_reward_with_entropy, RewardConfig};
+use super::reward::{compute_step_reward_with_breakdown, compute_step_reward_with_entropy, RewardBreakdown, RewardConfig};
 
 /// Input dimension for the GRU.
-/// Features: prev_offset(3), in_out_sign(1), budget_remaining(1), crossings_found(1)
+/// Features: prev_offset(3), in_out_sign(1), budget_remaining(1)
 pub const INPUT_DIM: usize = 5;
 
 /// Maximum samples per episode.
@@ -274,6 +274,8 @@ pub struct Episode {
     pub h_final: Vec<f64>,
     /// Terminal reward (classifier-based, computed after episode).
     pub terminal_reward: f64,
+    /// Accumulated reward breakdown for diagnostics.
+    pub reward_breakdown: RewardBreakdown,
 }
 
 /// Run a single episode with the policy.
@@ -344,6 +346,7 @@ pub fn run_episode_with_exploration(
     let mut prev_inside: Option<bool> = None;
     let mut prev_sample: Option<(f64, f64, f64)> = None;
     let mut crossings_found: usize = 0;
+    let mut reward_breakdown = RewardBreakdown::default();
 
     let corners = octant_corners(point.position, CELL_SIZE);
 
@@ -365,25 +368,35 @@ pub fn run_episode_with_exploration(
         // Chooser forward
         let (_logits, probs, mut chooser_cache) = chooser_forward(&policy.chooser, &h);
 
-        // Select action
-        // When exploration_rate > 0, some fraction of actions are selected uniformly at random
+        // Select action and compute sample position
+        // When exploration_rate > 0, some fraction of samples use uniform random positions
         // to encourage diverse sampling for training the classifier heads early on.
-        let action = if stochastic {
-            if exploration_rate > 0.0 && rng.next_f64() < exploration_rate {
-                // Random exploration: uniform over 8 octants
-                (rng.next_f64() * 8.0) as usize % 8
-            } else {
-                // Policy-based: sample from learned distribution
-                sample_categorical(&probs, rng)
-            }
+        let (action, sample_pos) = if exploration_rate > 0.0 && rng.next_f64() < exploration_rate {
+            // Random exploration: uniform random position within the cell
+            // Generate random offsets in [-0.5, 0.5] * CELL_SIZE from vertex
+            let rx = (rng.next_f64() - 0.5) * CELL_SIZE;
+            let ry = (rng.next_f64() - 0.5) * CELL_SIZE;
+            let rz = (rng.next_f64() - 0.5) * CELL_SIZE;
+            let pos = (
+                point.position.0 + rx,
+                point.position.1 + ry,
+                point.position.2 + rz,
+            );
+            // Action is arbitrary for random exploration (not used for gradient)
+            let action = (rng.next_f64() * 8.0) as usize % 8;
+            (action, pos)
+        } else if stochastic {
+            // Policy-based with stochastic sampling
+            let action = sample_categorical(&probs, rng);
+            let pos = position_from_probs(&probs, &corners);
+            (action, pos)
         } else {
-            argmax(&probs)
+            // Deterministic: argmax
+            let action = argmax(&probs);
+            let pos = position_from_probs(&probs, &corners);
+            (action, pos)
         };
         chooser_cache.action = action;
-
-        // Compute sample position using weighted average of corners (octant lerp)
-        // This produces positions throughout the cell volume based on softmax probabilities
-        let sample_pos = position_from_probs(&probs, &corners);
 
         // Query the sampler
         let is_inside = cache.is_inside(sample_pos.0, sample_pos.1, sample_pos.2);
@@ -418,6 +431,17 @@ pub fn run_episode_with_exploration(
             reward_config,
         );
 
+        // Track breakdown for diagnostics (uses base components only)
+        let step_breakdown = compute_step_reward_with_breakdown(
+            sample_pos,
+            oracle_distance,
+            &samples,
+            is_crossing,
+            CELL_SIZE,
+            reward_config,
+        );
+        reward_breakdown.accumulate(&step_breakdown);
+
         samples.push(sample_pos);
         inside_flags.push(is_inside);
         rewards.push(reward);
@@ -444,6 +468,7 @@ pub fn run_episode_with_exploration(
         h_init,
         h_final: h,
         terminal_reward: 0.0, // Computed later by training loop
+        reward_breakdown,
     }
 }
 

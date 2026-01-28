@@ -46,7 +46,7 @@ impl Default for RewardConfig {
         Self {
             w_surface: 0.2,      // Encourage sampling near surface
             w_spread: 0.1,       // Encourage exploration
-            crossing_bonus: 0.5, // Strong bonus for finding crossings
+            crossing_bonus: 0.0, // Disabled - crossing detection handled by classifier
             lambda: 0.01,        // Small per-sample cost
             surface_decay: 5.0,
             w_entropy: 0.0,      // Disabled by default
@@ -58,12 +58,12 @@ impl Default for RewardConfig {
 
 impl RewardConfig {
     /// Config optimized for classifier head training.
-    /// Emphasizes exploration and crossing detection with entropy bonus.
+    /// Emphasizes exploration with entropy bonus.
     pub fn for_classifier_training() -> Self {
         Self {
             w_surface: 0.15,     // Moderate surface proximity reward
             w_spread: 0.1,       // Good exploration reward
-            crossing_bonus: 1.0, // Strong crossing bonus
+            crossing_bonus: 0.0, // Disabled - crossing detection handled by classifier
             lambda: 0.005,       // Lower per-sample cost
             surface_decay: 4.0,  // Slightly softer decay
             w_entropy: 0.1,      // Entropy bonus for action diversity
@@ -78,28 +78,12 @@ impl RewardConfig {
         Self {
             w_surface: 0.15,
             w_spread: 0.1,
-            crossing_bonus: 0.5,
+            crossing_bonus: 0.0, // Disabled
             lambda: 0.005,
             surface_decay: 4.0,
             w_entropy: 0.0,
             w_direction_diversity: 0.05, // Small diversity bonus
             w_outside_spread: 0.15, // Stronger spatial spread for outside samples
-        }
-    }
-
-    /// Config with high crossing bonus to encourage finding transitions.
-    /// This may help edge/corner classification by encouraging exploration
-    /// across the surface in multiple directions.
-    pub fn with_high_crossing_bonus() -> Self {
-        Self {
-            w_surface: 0.1,       // Lower surface weight
-            w_spread: 0.15,       // Higher spread weight
-            crossing_bonus: 2.0,  // Very high crossing bonus
-            lambda: 0.01,
-            surface_decay: 4.0,
-            w_entropy: 0.0,
-            w_direction_diversity: 0.0,
-            w_outside_spread: 0.0,
         }
     }
 }
@@ -178,6 +162,41 @@ pub fn compute_outside_spread(
     (min_dist / cell_size).min(1.0)
 }
 
+/// Breakdown of reward components for diagnostics.
+#[derive(Clone, Debug, Default)]
+pub struct RewardBreakdown {
+    /// Surface proximity component (weighted)
+    pub surface: f64,
+    /// Spread/exploration component (weighted)
+    pub spread: f64,
+    /// Crossing bonus (weighted)
+    pub crossing: f64,
+    /// Per-sample cost (negative)
+    pub lambda: f64,
+    /// Total reward
+    pub total: f64,
+}
+
+impl RewardBreakdown {
+    /// Accumulate another breakdown into this one.
+    pub fn accumulate(&mut self, other: &RewardBreakdown) {
+        self.surface += other.surface;
+        self.spread += other.spread;
+        self.crossing += other.crossing;
+        self.lambda += other.lambda;
+        self.total += other.total;
+    }
+
+    /// Divide all components by a scalar (for averaging).
+    pub fn scale(&mut self, s: f64) {
+        self.surface *= s;
+        self.spread *= s;
+        self.crossing *= s;
+        self.lambda *= s;
+        self.total *= s;
+    }
+}
+
 /// Compute reward for a single sampling step.
 ///
 /// # Arguments
@@ -195,12 +214,27 @@ pub fn compute_step_reward(
     cell_size: f64,
     config: &RewardConfig,
 ) -> f64 {
+    compute_step_reward_with_breakdown(sample_pos, oracle_distance, prev_samples, is_crossing, cell_size, config).total
+}
+
+/// Compute reward for a single sampling step with component breakdown.
+///
+/// Returns both the total reward and a breakdown of each component for diagnostics.
+pub fn compute_step_reward_with_breakdown(
+    sample_pos: (f64, f64, f64),
+    oracle_distance: f64,
+    prev_samples: &[(f64, f64, f64)],
+    is_crossing: bool,
+    cell_size: f64,
+    config: &RewardConfig,
+) -> RewardBreakdown {
     // Surface proximity: exp(-distance/cell_size * decay)
     let normalized_dist = oracle_distance / cell_size;
-    let surface_reward = (-normalized_dist * config.surface_decay).exp();
+    let surface_raw = (-normalized_dist * config.surface_decay).exp();
+    let surface = config.w_surface * surface_raw;
 
     // Spread: minimum distance to any previous sample
-    let spread_reward = if prev_samples.is_empty() {
+    let spread_raw = if prev_samples.is_empty() {
         0.5 // Neutral reward for first sample
     } else {
         let min_dist = prev_samples
@@ -210,15 +244,24 @@ pub fn compute_step_reward(
         // Normalize by cell_size, cap at 1.0
         (min_dist / cell_size).min(1.0)
     };
+    let spread = config.w_spread * spread_raw;
 
     // Crossing bonus
     let crossing = if is_crossing { config.crossing_bonus } else { 0.0 };
 
+    // Per-sample cost
+    let lambda = -config.lambda;
+
     // Total reward
-    config.w_surface * surface_reward
-        + config.w_spread * spread_reward
-        + crossing
-        - config.lambda
+    let total = surface + spread + crossing + lambda;
+
+    RewardBreakdown {
+        surface,
+        spread,
+        crossing,
+        lambda,
+        total,
+    }
 }
 
 /// Compute reward for a single sampling step with entropy bonus.

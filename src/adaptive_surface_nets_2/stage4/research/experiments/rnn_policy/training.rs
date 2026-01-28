@@ -17,7 +17,7 @@ use super::classifier_heads::{
 use super::gradients::{compute_batch_gradient, PolicyGradients};
 use super::gru::{Rng, HIDDEN_DIM};
 use super::policy::{run_episode, run_episode_with_exploration, Episode, RnnPolicy, BUDGET, CELL_SIZE, INPUT_DIM};
-use super::reward::{compute_terminal_reward, RewardConfig, TerminalRewardConfig};
+use super::reward::{compute_terminal_reward, RewardBreakdown, RewardConfig, TerminalRewardConfig};
 
 #[cfg(feature = "native")]
 use rayon::prelude::*;
@@ -304,11 +304,41 @@ pub struct EpochStats {
     pub exploration_rate: f64,
 }
 
+/// Breakdown of classifier loss components for diagnostics.
+#[derive(Clone, Debug, Default)]
+pub struct ClassifierLossBreakdown {
+    pub total: f64,
+    pub conf_loss: f64,
+    pub normal_loss: f64,
+    pub offset_loss: f64,
+}
+
+impl ClassifierLossBreakdown {
+    /// Accumulate another breakdown into this one.
+    pub fn accumulate(&mut self, other: &ClassifierLossBreakdown) {
+        self.total += other.total;
+        self.conf_loss += other.conf_loss;
+        self.normal_loss += other.normal_loss;
+        self.offset_loss += other.offset_loss;
+    }
+
+    /// Scale all components by a factor.
+    pub fn scale(&mut self, factor: f64) {
+        self.total *= factor;
+        self.conf_loss *= factor;
+        self.normal_loss *= factor;
+        self.offset_loss *= factor;
+    }
+}
+
 /// Result of processing a single episode (for parallel collection).
 struct EpisodeResult {
     episode: Episode,
     classifier_grads: Option<ClassifierHeadGradients>,
+    /// Gradient of classifier loss w.r.t. final hidden state (for BPTT).
+    classifier_dh: Vec<f64>,
     classifier_loss: f64,
+    classifier_breakdown: ClassifierLossBreakdown,
 }
 
 /// Collect episodes in parallel using rayon (native feature).
@@ -354,17 +384,24 @@ fn collect_episodes_parallel(
             }
 
             // Compute classifier head loss and gradients if enabled
-            let (classifier_grads, classifier_loss) = if config.use_classifier_heads {
+            let (classifier_grads, classifier_dh, classifier_loss, classifier_breakdown) = if config.use_classifier_heads {
                 let expected_geom = expected_to_geometry(&point.expected, point.position);
                 let predictions = policy.classify(&episode.h_final);
 
-                let (loss, _, _, _, _) = compute_classifier_loss(
+                let (loss, conf_loss, normal_loss, offset_loss, _wrong_loss) = compute_classifier_loss(
                     &predictions,
                     &expected_geom,
                     &config.classifier_loss,
                 );
 
-                let (head_grads, _dh) = compute_classifier_gradients(
+                let breakdown = ClassifierLossBreakdown {
+                    total: loss,
+                    conf_loss,
+                    normal_loss,
+                    offset_loss,
+                };
+
+                let (head_grads, dh) = compute_classifier_gradients(
                     &policy.classifier_heads,
                     &episode.h_final,
                     &predictions,
@@ -378,15 +415,17 @@ fn collect_episodes_parallel(
                 }
                 episode.terminal_reward = classifier_reward;
 
-                (Some(head_grads), loss)
+                (Some(head_grads), dh, loss, breakdown)
             } else {
-                (None, 0.0)
+                (None, vec![0.0; HIDDEN_DIM], 0.0, ClassifierLossBreakdown::default())
             };
 
             EpisodeResult {
                 episode,
                 classifier_grads,
+                classifier_dh,
                 classifier_loss,
+                classifier_breakdown,
             }
         })
         .collect()
@@ -432,17 +471,24 @@ fn collect_episodes_parallel(
                 }
             }
 
-            let (classifier_grads, classifier_loss) = if config.use_classifier_heads {
+            let (classifier_grads, classifier_dh, classifier_loss, classifier_breakdown) = if config.use_classifier_heads {
                 let expected_geom = expected_to_geometry(&point.expected, point.position);
                 let predictions = policy.classify(&episode.h_final);
 
-                let (loss, _, _, _, _) = compute_classifier_loss(
+                let (loss, conf_loss, normal_loss, offset_loss, _wrong_loss) = compute_classifier_loss(
                     &predictions,
                     &expected_geom,
                     &config.classifier_loss,
                 );
 
-                let (head_grads, _dh) = compute_classifier_gradients(
+                let breakdown = ClassifierLossBreakdown {
+                    total: loss,
+                    conf_loss,
+                    normal_loss,
+                    offset_loss,
+                };
+
+                let (head_grads, dh) = compute_classifier_gradients(
                     &policy.classifier_heads,
                     &episode.h_final,
                     &predictions,
@@ -456,15 +502,17 @@ fn collect_episodes_parallel(
                 }
                 episode.terminal_reward = classifier_reward;
 
-                (Some(head_grads), loss)
+                (Some(head_grads), dh, loss, breakdown)
             } else {
-                (None, 0.0)
+                (None, vec![0.0; HIDDEN_DIM], 0.0, ClassifierLossBreakdown::default())
             };
 
             EpisodeResult {
                 episode,
                 classifier_grads,
+                classifier_dh,
                 classifier_loss,
+                classifier_breakdown,
             }
         })
         .collect()
@@ -516,18 +564,40 @@ pub fn train_policy(
         // Aggregate results from parallel collection
         let mut episodes = Vec::with_capacity(results.len());
         let mut classifier_grads_sum = ClassifierHeadGradients::zeros();
+        let mut classifier_dh_list = Vec::with_capacity(results.len());
         let mut total_classifier_loss = 0.0;
+        let mut classifier_breakdown_sum = ClassifierLossBreakdown::default();
 
         for result in results {
             if let Some(grads) = result.classifier_grads {
                 classifier_grads_sum.add(&grads);
             }
+            classifier_dh_list.push(result.classifier_dh);
             total_classifier_loss += result.classifier_loss;
+            classifier_breakdown_sum.accumulate(&result.classifier_breakdown);
             episodes.push(result.episode);
         }
 
         // Compute batch gradient for policy (GRU + Chooser)
-        let mut grads = compute_batch_gradient(policy, &episodes, config.discount);
+        // Pass classifier dh gradients to backpropagate through GRU
+        // IMPORTANT: Negate classifier_dh because:
+        // - classifier_dh is d_loss/d_h (gradient for minimizing loss)
+        // - policy gradient uses gradient ascent (maximizing reward)
+        // - reward = -loss, so d_reward/d_h = -d_loss/d_h
+        let classifier_dh_negated: Vec<Vec<f64>> = if config.use_classifier_heads {
+            classifier_dh_list
+                .iter()
+                .map(|dh| dh.iter().map(|&x| -x).collect())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let classifier_dh_ref = if config.use_classifier_heads {
+            Some(classifier_dh_negated.as_slice())
+        } else {
+            None
+        };
+        let mut grads = compute_batch_gradient(policy, &episodes, config.discount, classifier_dh_ref);
 
         // Add classifier head gradients (averaged)
         if config.use_classifier_heads {
@@ -561,6 +631,17 @@ pub fn train_policy(
             0.0
         };
 
+        // Average classifier breakdown
+        let mut avg_clf_breakdown = classifier_breakdown_sum;
+        avg_clf_breakdown.scale(1.0 / episodes.len() as f64);
+
+        // Aggregate reward breakdown
+        let mut avg_breakdown = RewardBreakdown::default();
+        for ep in &episodes {
+            avg_breakdown.accumulate(&ep.reward_breakdown);
+        }
+        avg_breakdown.scale(1.0 / episodes.len() as f64);
+
         let epoch_stats = EpochStats {
             epoch,
             avg_return,
@@ -586,6 +667,19 @@ pub fn train_policy(
                     grad_norm,
                     avg_samples,
                     explore_str
+                );
+                println!(
+                    "             clf breakdown: conf={:.3}, normal={:.3}, offset={:.3}",
+                    avg_clf_breakdown.conf_loss,
+                    avg_clf_breakdown.normal_loss,
+                    avg_clf_breakdown.offset_loss
+                );
+                println!(
+                    "             reward breakdown: surface={:.3}, spread={:.3}, crossing={:.3}, lambda={:.3}",
+                    avg_breakdown.surface,
+                    avg_breakdown.spread,
+                    avg_breakdown.crossing,
+                    avg_breakdown.lambda
                 );
             } else {
                 println!(

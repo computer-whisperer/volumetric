@@ -237,23 +237,137 @@ The exploration rate is linearly interpolated: `rate = start + (end - start) * (
 - Random 3D offset within `0.2 × cell_size` of surface (easier start)
 - Deterministic seed for reproducibility
 
-## Results (v9 - 2026-01-27)
+## Results (v11 - 2026-01-28)
 
-### Softmax Classification
+### Critical Bug Fix: Gradient Sign Error
 
-Replaced independent sigmoid confidences with softmax across all three heads. This ensures
-confidences sum to 1 and heads compete properly for classification.
+Found and fixed a fundamental bug in the training pipeline:
+
+**The problem:** Classifier gradients were being passed to BPTT with the wrong sign.
+- `classifier_dh` computes `d_loss/d_hidden` (gradient for minimizing loss)
+- BPTT uses gradient **ascent** (maximizing reward)
+- Since `reward = -loss`, we need `d_reward/d_h = -d_loss/d_h`
+- The fix: negate `classifier_dh` before passing to `compute_batch_gradient`
+
+**Impact:** Before the fix, the GRU was being trained in the WRONG direction for
+classification. Normal predictions improved because those gradients flow correctly
+through the classifier head weights (using gradient descent), but the GRU received
+inverted signals for classification.
+
+### Classification Now Learning (But Unstable)
+
+With the gradient fix, classification IS learning with random sampling:
+
+| Epoch | conf_loss | Status |
+|-------|-----------|--------|
+| 0     | 1.12      | Initial (uniform prediction) |
+| 500   | 0.83      | Learning! |
+| 1000  | 0.58      | Continued improvement |
+| 1500  | 0.53      | Getting better |
+| 2000  | 0.52      | Best point |
+| 2500  | **2.22**  | Catastrophic collapse! |
+| 3000+ | 1.06      | Stuck at uniform |
+
+**Key observation:** Training collapses around epoch 2500. The conf_loss suddenly
+spikes to 2.22 then settles at 1.058 (uniform distribution). This is a sudden
+catastrophic event, not gradual drift.
+
+### Cooling Schedule (100% → 0% Random)
+
+Tested linear cooling from fully random to fully policy-based over 6000 epochs:
+
+| Epoch | explore | conf_loss | Status |
+|-------|---------|-----------|--------|
+| 1     | 100%    | 1.108     | Initial |
+| 500   | 92%     | 0.806     | Learning! |
+| 1000  | 83%     | 0.588     | Good progress |
+| 1500  | 75%     | 0.551     | Best point |
+| 2000  | 67%     | **1.302** | Collapse (same pattern) |
+| 2500-5500 | 58%→8% | 1.058 | Stuck at uniform |
+| 6000  | 0%      | **0.752** | Recovery! |
+
+**Key findings:**
+1. Same collapse pattern around epoch ~2000
+2. But **recovers** when exploration reaches 0% (fully policy-based)
+3. Final results: 51.9% accuracy (vs 50% baseline), Edge 96% (vs 88%)
+4. Spread collapses: 1.27 → 0.115 as policy takes over
+5. Samples used decreases: 50 → 31.6 (policy learns early termination)
+
+The instability occurs during the mixed random+policy phase. Pure modes (100% random
+or 0% random) are more stable, but each has drawbacks.
+
+### Baseline (Policy-Guided) Is More Stable
+
+| Metric | Baseline | Random | Cooling |
+|--------|----------|--------|---------|
+| Stability | Stable | Collapses | Collapses then recovers |
+| Final conf_loss | 0.65 | 1.06 | 0.75 |
+| Final accuracy | 50% | 46% | 52% |
+| Spread | 0.05 (degenerate) | 1.27 (good) | 0.12 (degenerate) |
+
+The baseline is stable but has degenerate sampling (all samples clustered).
+Random sampling provides good coverage but is unstable.
+Cooling schedule achieves best accuracy but goes through unstable phase.
+
+### Removed Crossing Reward
+
+The `crossing_bonus` reward component has been disabled (set to 0.0). Surface crossing
+detection is now handled entirely by the classifier heads. This simplifies the reward
+structure to: surface proximity + spread - lambda cost.
+
+### New Diagnostics
+
+Added comprehensive diagnostics at each training checkpoint:
+
+**Reward breakdown:** `surface, spread, crossing, lambda`
+**Classifier breakdown:** `conf_loss, normal_loss, offset_loss`
+**Epoch checkpoint dumps:** Sample clouds saved at specific epochs for debugging
+
+### Previous: Sampling Strategy Investigation (v10)
+
+Extensive testing with 100% random sampling throughout training AND evaluation confirms that
+the classification problem is **not caused by the sampling strategy**. The classifier heads
+fail regardless of whether samples come from the learned policy or random positions.
+
+| Sampling | Face | Edge | Corner | Overall | Notes |
+|----------|------|------|--------|---------|-------|
+| Policy-based | 67% | 88% | 0% | 55.8% | Learned sampling positions |
+| 100% Random | 0% | 100% | 0% | 46.2% | Uniform random in cell |
+
+**Critical insight**: With 50 truly random samples spread throughout the cell volume,
+the classifier has MORE than enough information to determine geometry type. Visual
+inspection confirms samples adequately cover the cell. The problem is purely in the
+classifier architecture/training, not data quality.
+
+### Bug Fix: Exploration Was Not Actually Random (v10)
+
+Previous "exploration" mode had a critical bug: even when exploration_rate=1.0, the
+sample positions were still computed from policy probabilities. Only the action selection
+was random, not the positions. This has been fixed - exploration now generates truly
+uniform random positions within the cell.
+
+### Path Forward
+
+**Immediate priority: Stabilize training with random sampling**
+
+The gradient fix proved classification CAN learn, but training is unstable. Investigate:
+1. **Lower learning rate** for random sampling (currently 0.0001)
+2. **Gradient clipping** specifically for classifier path
+3. **Warmup schedule** - start with very low LR
+4. **Batch normalization** or layer normalization in classifier heads
+5. **Separate optimizers** for GRU vs classifier heads
+
+**After stabilization:**
+1. Train longer with stable random sampling
+2. Gradually transition from random to policy-guided sampling
+3. Fine-tune sampling policy with working classifier
+
+### Previous Results (v9 - Softmax)
 
 | Config | Face | Edge | Corner | Overall | Loss |
 |--------|------|------|--------|---------|------|
 | Baseline | 67% (8/12) | 88% (21/24) | 0% (0/16) | **55.8%** | 3.38 |
 | Exploration | 67% (8/12) | 79% (19/24) | 0% (0/16) | 51.9% | 3.20 |
-
-**Key observations:**
-- Face and edge classification work well (67% and 88%)
-- Corner classification completely fails (0%) despite good normal predictions
-- Corner normal loss is actually the best (0.21-0.30) but corners never win softmax
-- Exploration no longer causes class collapse (was 100% edge in v8)
 
 ### Approach Comparison
 
@@ -261,21 +375,17 @@ confidences sum to 1 and heads compete properly for classification.
 |----------|------|------|--------|---------|
 | v7: Margin (corners only) | 67% | 0% | 75% | 38.5% |
 | v8: Margin (all classes) | 67% | 88% | 0% | 55.8% |
-| v9: Softmax | 67% | 88% | 0% | **55.8%** |
+| v9: Softmax | 67% | 88% | 0% | 55.8% |
+| v10: 100% Random | 0% | 100% | 0% | 46.2% |
 
 **Analysis:**
+- The classifier consistently fails on at least one class
 - Margin loss on corners only: corners work, edges fail
 - Margin loss on all classes: edges work, corners fail
-- Softmax: same as margin-all, edges work, corners fail
+- 100% random sampling: class collapse to edges
 
-The fundamental issue is that corners are intrinsically harder to classify. The model
-learns to be more confident about faces and edges, so corners always lose the competition.
-
-**Potential improvements:**
-1. **Class weights** - Boost corner weight (e.g., `[1.0, 1.0, 2.0]`)
-2. **Focal loss** - Focus on hard examples (corners)
-3. **Temperature scaling** - Flatten softmax distribution
-4. **Hierarchical classification** - First Face vs Multi-plane, then Edge vs Corner
+The fundamental issue is that the classifier architecture cannot simultaneously
+learn all three classes. This is NOT a data/sampling problem.
 
 ### Previous Results (v8 - Exploration Schedule)
 
@@ -309,6 +419,69 @@ The exploration schedule caused class collapse to all-edge predictions.
 | **Overall** | 0% | **9.6%** |
 
 ## Changelog
+
+### v11 (2026-01-28) - Gradient Sign Fix & Cooling Schedule
+
+**Critical bug fix: Classifier gradient sign error**
+- `classifier_dh` (d_loss/d_h) was passed directly to BPTT which uses gradient ascent
+- Since reward = -loss, the correct gradient is `d_reward/d_h = -d_loss/d_h`
+- Fixed by negating `classifier_dh` before passing to `compute_batch_gradient`
+- This was causing the GRU to train in the wrong direction for classification
+- Explains why normals improved (direct gradient descent) but classification didn't (inverted GRU signal)
+
+**Classification now learning:**
+- With fix, conf_loss drops from 1.12 → 0.52 over 2000 epochs
+- Proves the architecture CAN learn classification
+- But training is unstable - collapses around epoch 2500
+
+**Removed crossing reward:**
+- Set `crossing_bonus = 0.0` in all RewardConfig presets
+- Removed `with_high_crossing_bonus()` preset
+- Surface crossing detection now handled by classifier, not reward shaping
+
+**New diagnostics:**
+- `RewardBreakdown` struct: tracks surface, spread, crossing, lambda components
+- `ClassifierLossBreakdown` struct: tracks conf, normal, offset components
+- Both printed at each training checkpoint
+- `dump_training_epoch_checkpoints()`: saves sample clouds at epochs 2000, 4000, 6000
+
+**Fixed INPUT_DIM comment:**
+- Was incorrectly documenting `crossings_found` as an input feature
+- Actual inputs: prev_offset(3), in_out_sign(1), budget_remaining(1)
+
+**New test:**
+- `test_dump_epoch_checkpoints`: generates sample clouds at specific training epochs
+
+**Cooling schedule tested (100% → 0% random):**
+- Same collapse pattern at epoch ~2000
+- But recovers when exploration reaches 0%
+- Best final accuracy: 51.9% (vs 50% baseline)
+- Edge accuracy: 96% (vs 88% baseline)
+- Instability occurs during mixed random+policy phase
+
+### v10 (2026-01-28) - Random Sampling Investigation
+
+**Critical bug fix: Exploration wasn't actually random**
+- Previous exploration mode selected random actions but computed positions from policy probs
+- With uniform probs [0.125; 8], `position_from_probs` returns the cell centroid every time
+- Fixed to generate truly uniform random positions: `vertex + random_offset * cell_size`
+
+**Key discovery: Sampling strategy is NOT the problem**
+- Tested with 100% random sampling during both training AND evaluation
+- Classification still fails: collapses to all-edge (46.2% accuracy)
+- Visual inspection confirms 50 random samples provide excellent cell coverage
+- The classifier architecture itself cannot learn all three classes
+
+**New development strategy: Random sampling first**
+- Keep sampling 100% random until classification is solved
+- Eliminates sampling as a variable during debugging
+- Consider increasing BUDGET from 50 to 100 for easier learning
+- Only optimize sampling policy AFTER classification works
+
+**New functions:**
+- `dump_random_sampling_sample_cloud()`: Trains and dumps with 100% random
+- `evaluate_classifier_heads_with_options()`: Supports random sampling during eval
+- `dump_rnn_policy_sample_cloud_with_options()`: Supports exploration_rate parameter
 
 ### v9 (2026-01-27) - Softmax Classification
 
@@ -607,36 +780,53 @@ cargo run --release --bin sample_cloud_inspect -- --file samples.cbor --set 0
 
 ## Future Work
 
-### Immediate (Corner Classification Problem)
-With softmax, corners are never classified (0%) despite good normal predictions.
-The corner head learns good geometry but always loses the softmax competition.
+### Development Strategy: Random Sampling First
 
-1. **Class weights**: Boost corner class weight
-   - Try `class_weights: [1.0, 1.0, 2.0]` or higher
-   - Increases loss contribution from corner examples
-   - Simple parameter change, no architecture modifications
+**Use 100% random sampling until classification is solved.** The sampling policy (GRU + Chooser)
+should be disabled/frozen while debugging the classifier. This eliminates sampling as a variable
+and ensures the classifier sees diverse, representative samples.
 
-2. **Focal loss**: Focus training on hard examples
-   - Down-weight easy (face/edge) examples
-   - `FL(p) = -(1-p)^γ * log(p)` with γ=2
-   - Corners are "hard" so they get more gradient signal
+Once classification works reliably with random samples, THEN optimize the sampling policy.
 
-3. **Temperature scaling**: Flatten softmax distribution
-   - `softmax(logits / T)` with T > 1
-   - Gives corners more chance to win
-   - Can anneal T during training
+### Immediate Priority: Stabilize Random Sampling Training
 
-4. **Hierarchical classification**:
-   - First: Face vs Multi-plane (Edge/Corner)
-   - Second: Edge vs Corner
-   - May help since face vs multi-plane is easier
+The gradient fix proved classification CAN learn (conf_loss 1.12→0.52), but training
+collapses around epoch 2500. The collapse is sudden and catastrophic (conf_loss spikes
+to 2.22 then settles at 1.058).
 
-### Exploration Schedule Refinements
-Exploration no longer causes class collapse with softmax, but could be improved:
+**Stabilization approaches to try:**
 
-1. **Partial exploration**: Try `exploration_end: 0.1` to maintain diversity
-2. **Non-linear schedule**: Exponential decay instead of linear
-3. **Extended post-exploration**: More epochs at 0% exploration
+1. **Lower learning rate**: Currently 0.0001, try 0.00003 or 0.00001
+   - Random sampling creates high variance gradients
+   - Lower LR may prevent the catastrophic update
+
+2. **Gradient clipping for classifier path**:
+   - Currently only overall grad_clip=1.0
+   - May need separate, stricter clipping for classifier_dh
+
+3. **Learning rate warmup**:
+   - Start with very low LR (1e-6), ramp up over first 500 epochs
+   - Allows model to find stable region before aggressive updates
+
+4. **Separate optimizers**:
+   - Use lower LR for GRU (receives random sample noise)
+   - Higher LR for classifier heads (more stable gradients)
+
+5. **Regularization**:
+   - Add L2 weight decay to prevent weight explosion
+   - Layer normalization in classifier heads
+
+**After stabilization:**
+
+1. **Continue training**: The model was still improving at epoch 2000
+2. **Curriculum learning**: Transition from random to policy-based sampling
+3. **Test on validation**: Verify generalization, not just training loss
+
+### After Classification Works
+
+1. **Re-enable sampling policy**: Train GRU+Chooser with working classifier
+2. **Curriculum learning**: Start with random, anneal to policy-based
+3. **Joint optimization**: Balance sampling quality vs classification accuracy
 
 ### Short-term
 1. **Scale up offset**: Gradually increase validation offset toward full cell_size
@@ -644,13 +834,14 @@ Exploration no longer causes class collapse with softmax, but could be improved:
 3. **Longer training**: Loss still improving at 24k epochs
 
 ### Solved
+- ✅ **Gradient sign bug fix** (v11): Classifier gradients now correctly negated for BPTT
+- ✅ **Classification CAN learn** (v11): Conf loss drops 1.12→0.52 (but unstable)
+- ✅ **Random sampling bug fix** (v10): Exploration now generates truly random positions
+- ✅ **Confirmed sampling not the problem** (v10): Classification fails regardless of sampling strategy
 - ✅ **Softmax classification** (v9): Proper probabilistic competition between heads
-- ✅ **Edge classification** (v9): 88% accuracy with softmax
-- ✅ **Class collapse prevention** (v9): Exploration schedule no longer causes all-edge predictions
 - ✅ **Discrete corners removed** (v8): Always use octant lerp
-- ✅ **Exploration schedule infrastructure** (v8): Foundation for curriculum learning
+- ✅ **Exploration infrastructure** (v8): Foundation for curriculum learning
 - ✅ Larger capacity (hidden_dim=64): Now 15,910 parameters
-- ✅ Lower learning rate (0.0003): Stable training
 
 ### Long-term
 1. **Integration**: Replace sampling in actual surface nets algorithm

@@ -53,7 +53,7 @@ use crate::sample_cloud::{SampleCloudDump, SampleCloudSet};
 
 use classifier_heads::{compute_classifier_loss, ClassifierLossConfig, ExpectedGeometry, GeometryType};
 use gru::Rng;
-use policy::{run_episode, RnnPolicy};
+use policy::{run_episode, run_episode_with_exploration, RnnPolicy};
 use reward::RewardConfig;
 use training::{train_policy, evaluate_policy, TrainingConfig};
 use crate::adaptive_surface_nets_2::stage4::research::validation::ExpectedClassification;
@@ -321,14 +321,24 @@ pub fn compare_exploration_schedule() {
     let points = generate_validation_points_randomized(&cube, policy::CELL_SIZE * 0.2, 2, 42);
     let reward_config = RewardConfig::default();
 
-    // Shorter training for comparison (still substantial)
+    // Training parameters
     let epochs = 6000;
     let print_every = 500;
-    let lr = 0.0003;
+    let lr = 0.0001; // Reduced from 0.0003 for slower, more stable learning
+
+    // Boost classification weight relative to normal/offset prediction
+    let classifier_loss = ClassifierLossConfig {
+        w_correct_conf: 5.0, // Increased from 1.0 to match w_normal
+        w_normal: 5.0,
+        w_offset: 2.0,
+        ..Default::default()
+    };
 
     println!("=== Exploration Schedule Comparison ===");
     println!("Training points: {}", points.len());
     println!("Epochs: {}, LR: {}", epochs, lr);
+    println!("Loss weights: w_conf={}, w_normal={}, w_offset={}",
+        classifier_loss.w_correct_conf, classifier_loss.w_normal, classifier_loss.w_offset);
     println!();
 
     // --- Baseline (no exploration schedule) ---
@@ -345,6 +355,7 @@ pub fn compare_exploration_schedule() {
         lr,
         use_classifier_heads: true,
         use_exploration_schedule: false,
+        classifier_loss: classifier_loss.clone(),
         ..Default::default()
     };
     train_policy(&mut policy_baseline, &cube, &points, &config_baseline, &reward_config, &mut rng_baseline);
@@ -367,55 +378,57 @@ pub fn compare_exploration_schedule() {
 
     println!();
 
-    // --- With exploration schedule ---
-    println!(">>> WITH EXPLORATION SCHEDULE (100% -> 0%) <<<");
-    let mut rng_explore = Rng::new(12345); // Same seed for fair comparison
-    let mut policy_explore = RnnPolicy::new(&mut rng_explore);
+    // --- With cooling schedule (100% → 0% random) ---
+    println!(">>> WITH COOLING SCHEDULE (100% → 0% random) <<<");
+    let mut rng_cooling = Rng::new(12345); // Same seed for fair comparison
+    let mut policy_cooling = RnnPolicy::new(&mut rng_cooling);
 
-    let config_explore = TrainingConfig {
+    let config_cooling = TrainingConfig {
         epochs,
         print_every,
         lr,
         use_classifier_heads: true,
         use_exploration_schedule: true,
-        exploration_start: 1.0,
-        exploration_end: 0.0,
+        exploration_start: 1.0,  // Start 100% random
+        exploration_end: 0.0,    // End fully policy-based
+        classifier_loss: classifier_loss.clone(),
         ..Default::default()
     };
-    train_policy(&mut policy_explore, &cube, &points, &config_explore, &reward_config, &mut rng_explore);
+    train_policy(&mut policy_cooling, &cube, &points, &config_cooling, &reward_config, &mut rng_cooling);
 
-    let eval_explore = evaluate_classifier_heads(&policy_explore, &cube, &points, &reward_config, &mut rng_explore);
-    println!("\nExploration schedule final results:");
-    println!("  Accuracy: {:.1}% (loss: {:.3})", eval_explore.accuracy * 100.0, eval_explore.loss);
+    // Evaluate with policy-based sampling (final mode)
+    let eval_cooling = evaluate_classifier_heads(&policy_cooling, &cube, &points, &reward_config, &mut rng_cooling);
+    println!("\nCooling schedule final results (evaluated with policy):");
+    println!("  Accuracy: {:.1}% (loss: {:.3})", eval_cooling.accuracy * 100.0, eval_cooling.loss);
     println!("  Face:   {}/{} = {:.0}%, normal_loss={:.3}",
-        eval_explore.face_correct, eval_explore.face_total,
-        if eval_explore.face_total > 0 { eval_explore.face_correct as f64 / eval_explore.face_total as f64 * 100.0 } else { 0.0 },
-        eval_explore.face_normal_loss);
+        eval_cooling.face_correct, eval_cooling.face_total,
+        if eval_cooling.face_total > 0 { eval_cooling.face_correct as f64 / eval_cooling.face_total as f64 * 100.0 } else { 0.0 },
+        eval_cooling.face_normal_loss);
     println!("  Edge:   {}/{} = {:.0}%, normal_loss={:.3}",
-        eval_explore.edge_correct, eval_explore.edge_total,
-        if eval_explore.edge_total > 0 { eval_explore.edge_correct as f64 / eval_explore.edge_total as f64 * 100.0 } else { 0.0 },
-        eval_explore.edge_normal_loss);
+        eval_cooling.edge_correct, eval_cooling.edge_total,
+        if eval_cooling.edge_total > 0 { eval_cooling.edge_correct as f64 / eval_cooling.edge_total as f64 * 100.0 } else { 0.0 },
+        eval_cooling.edge_normal_loss);
     println!("  Corner: {}/{} = {:.0}%, normal_loss={:.3}",
-        eval_explore.corner_correct, eval_explore.corner_total,
-        if eval_explore.corner_total > 0 { eval_explore.corner_correct as f64 / eval_explore.corner_total as f64 * 100.0 } else { 0.0 },
-        eval_explore.corner_normal_loss);
+        eval_cooling.corner_correct, eval_cooling.corner_total,
+        if eval_cooling.corner_total > 0 { eval_cooling.corner_correct as f64 / eval_cooling.corner_total as f64 * 100.0 } else { 0.0 },
+        eval_cooling.corner_normal_loss);
 
     // Summary comparison
     println!("\n=== COMPARISON SUMMARY ===");
-    println!("                    Baseline    Exploration");
+    println!("                    Baseline    Cooling");
     println!("  Accuracy:         {:>6.1}%      {:>6.1}%",
-        eval_baseline.accuracy * 100.0, eval_explore.accuracy * 100.0);
+        eval_baseline.accuracy * 100.0, eval_cooling.accuracy * 100.0);
     println!("  Loss:             {:>6.3}       {:>6.3}",
-        eval_baseline.loss, eval_explore.loss);
+        eval_baseline.loss, eval_cooling.loss);
     println!("  Face normal:      {:>6.3}       {:>6.3}",
-        eval_baseline.face_normal_loss, eval_explore.face_normal_loss);
+        eval_baseline.face_normal_loss, eval_cooling.face_normal_loss);
     println!("  Edge normal:      {:>6.3}       {:>6.3}",
-        eval_baseline.edge_normal_loss, eval_explore.edge_normal_loss);
+        eval_baseline.edge_normal_loss, eval_cooling.edge_normal_loss);
     println!("  Corner normal:    {:>6.3}       {:>6.3}",
-        eval_baseline.corner_normal_loss, eval_explore.corner_normal_loss);
+        eval_baseline.corner_normal_loss, eval_cooling.corner_normal_loss);
 
-    let acc_diff = eval_explore.accuracy - eval_baseline.accuracy;
-    let loss_diff = eval_baseline.loss - eval_explore.loss; // positive = explore is better
+    let acc_diff = eval_cooling.accuracy - eval_baseline.accuracy;
+    let loss_diff = eval_baseline.loss - eval_cooling.loss; // positive = cooling is better
     println!("\n  Accuracy improvement: {:+.1}%", acc_diff * 100.0);
     println!("  Loss improvement:     {:+.3}", loss_diff);
 }
@@ -506,6 +519,59 @@ pub fn dump_exploration_schedule_sample_cloud(output_path: &Path) {
     println!("Done!");
 }
 
+/// Train with 100% random sampling throughout and dump sample clouds.
+pub fn dump_random_sampling_sample_cloud(output_path: &Path) {
+    let cube = AnalyticalRotatedCube::standard_test_cube();
+    let points = generate_validation_points_randomized(&cube, policy::CELL_SIZE * 0.2, 2, 42);
+    let reward_config = RewardConfig::default();
+
+    let epochs = 6000;
+    let lr = 0.0001;
+
+    // Boost classification weight
+    let classifier_loss = ClassifierLossConfig {
+        w_correct_conf: 5.0,
+        w_normal: 5.0,
+        w_offset: 2.0,
+        ..Default::default()
+    };
+
+    println!("=== Training with 100% Random Sampling for Sample Cloud Dump ===");
+    println!("Epochs: {}, LR: {}", epochs, lr);
+
+    let mut rng = Rng::new(12345);
+    let mut policy = RnnPolicy::new(&mut rng);
+
+    let config = TrainingConfig {
+        epochs,
+        print_every: 1000,
+        lr,
+        use_classifier_heads: true,
+        use_exploration_schedule: true,
+        exploration_start: 1.0,
+        exploration_end: 1.0, // 100% random throughout
+        classifier_loss,
+        ..Default::default()
+    };
+    train_policy(&mut policy, &cube, &points, &config, &reward_config, &mut rng);
+
+    // Evaluate with random sampling
+    let eval = evaluate_classifier_heads_with_options(&policy, &cube, &points, &reward_config, &mut rng, true);
+    println!("\nFinal results (evaluated with random sampling):");
+    println!("  Accuracy: {:.1}% (loss: {:.3})", eval.accuracy * 100.0, eval.loss);
+    println!("  Face:   {}/{} = {:.0}%", eval.face_correct, eval.face_total,
+        if eval.face_total > 0 { eval.face_correct as f64 / eval.face_total as f64 * 100.0 } else { 0.0 });
+    println!("  Edge:   {}/{} = {:.0}%", eval.edge_correct, eval.edge_total,
+        if eval.edge_total > 0 { eval.edge_correct as f64 / eval.edge_total as f64 * 100.0 } else { 0.0 });
+    println!("  Corner: {}/{} = {:.0}%", eval.corner_correct, eval.corner_total,
+        if eval.corner_total > 0 { eval.corner_correct as f64 / eval.corner_total as f64 * 100.0 } else { 0.0 });
+
+    // Dump sample clouds with 100% random sampling
+    println!("\nDumping sample clouds to {}...", output_path.display());
+    dump_rnn_policy_sample_cloud_with_options(&policy, "rnn-random-100%", output_path, Some(1.0));
+    println!("Done!");
+}
+
 /// Classifier evaluation result with both accuracy and confidence.
 #[derive(Debug)]
 pub struct ClassifierEvalResult {
@@ -563,6 +629,17 @@ fn evaluate_classifier_heads(
     reward_config: &RewardConfig,
     rng: &mut Rng,
 ) -> ClassifierEvalResult {
+    evaluate_classifier_heads_with_options(policy, cube, points, reward_config, rng, false)
+}
+
+fn evaluate_classifier_heads_with_options(
+    policy: &RnnPolicy,
+    cube: &AnalyticalRotatedCube,
+    points: &[crate::adaptive_surface_nets_2::stage4::research::validation::ValidationPoint],
+    reward_config: &RewardConfig,
+    rng: &mut Rng,
+    use_random_sampling: bool,
+) -> ClassifierEvalResult {
     let loss_config = ClassifierLossConfig::default();
 
     let mut correct = 0;
@@ -581,7 +658,12 @@ fn evaluate_classifier_heads(
     let mut corner_normal_loss_sum = 0.0;
 
     for (idx, point) in points.iter().enumerate() {
-        let episode = run_episode(policy, cube, point, idx, rng, false, reward_config);
+        // Use random sampling (exploration_rate=1.0) or policy-based sampling
+        let episode = if use_random_sampling {
+            run_episode_with_exploration(policy, cube, point, idx, rng, false, 1.0, reward_config)
+        } else {
+            run_episode(policy, cube, point, idx, rng, false, reward_config)
+        };
         let predictions = policy.classify(&episode.h_final);
 
         let expected_geom = ExpectedGeometry::from_classification(&point.expected, point.position);
@@ -696,6 +778,114 @@ pub fn dump_rnn_policy_sample_cloud(kind: RnnPolicyDumpKind, output_path: &Path)
 
 /// Dump sample clouds using a pre-loaded policy.
 fn dump_rnn_policy_sample_cloud_with_policy(policy: &RnnPolicy, label: &str, output_path: &Path) {
+    dump_rnn_policy_sample_cloud_with_options(policy, label, output_path, None);
+}
+
+/// Dump sample clouds at specific training epochs for debugging.
+/// Creates dumps for:
+/// - Random sampling at epoch 2000 (before collapse)
+/// - Random sampling at epoch 4000 (after collapse)
+/// - Baseline at epoch 6000 (end of training)
+pub fn dump_training_epoch_checkpoints() {
+    use std::path::Path;
+
+    let cube = AnalyticalRotatedCube::standard_test_cube();
+    let points = generate_validation_points_randomized(&cube, policy::CELL_SIZE * 0.2, 2, 42);
+
+    let classifier_loss_config = ClassifierLossConfig {
+        w_correct_conf: 5.0,
+        w_normal: 5.0,
+        w_offset: 2.0,
+        ..Default::default()
+    };
+
+    let reward_config = RewardConfig::default();
+
+    println!("=== Training Epoch Checkpoint Dumps ===");
+    println!("Training points: {}", points.len());
+
+    // --- Random sampling training with checkpoints ---
+    println!("\n>>> Training with 100% random sampling <<<");
+    let mut rng = Rng::new(42);
+    let mut policy_random = RnnPolicy::new(&mut rng);
+
+    let config_random = TrainingConfig {
+        epochs: 2000,
+        lr: 0.0001,
+        discount: 0.99,
+        use_exploration_schedule: true,
+        exploration_start: 1.0,
+        exploration_end: 1.0,
+        use_terminal_reward: false,
+        use_classifier_heads: true,
+        classifier_loss: classifier_loss_config.clone(),
+        print_every: 500,
+        ..Default::default()
+    };
+
+    // Train to epoch 2000, then dump
+    train_policy(&mut policy_random, &cube, &points, &config_random, &reward_config, &mut rng);
+    println!("Dumping random sampling at epoch 2000...");
+    dump_rnn_policy_sample_cloud_with_options(
+        &policy_random,
+        "random-epoch-2000",
+        Path::new("sample_cloud_random_epoch_2000.cbor"),
+        Some(1.0)
+    );
+
+    // Continue to epoch 4000, then dump
+    train_policy(&mut policy_random, &cube, &points, &config_random, &reward_config, &mut rng);
+    println!("Dumping random sampling at epoch 4000...");
+    dump_rnn_policy_sample_cloud_with_options(
+        &policy_random,
+        "random-epoch-4000",
+        Path::new("sample_cloud_random_epoch_4000.cbor"),
+        Some(1.0)
+    );
+
+    // --- Baseline training ---
+    println!("\n>>> Training baseline (no exploration) <<<");
+    let mut rng = Rng::new(42);
+    let mut policy_baseline = RnnPolicy::new(&mut rng);
+
+    let config_baseline = TrainingConfig {
+        epochs: 6000,
+        lr: 0.0001,
+        discount: 0.99,
+        use_exploration_schedule: false,
+        exploration_start: 0.0,
+        exploration_end: 0.0,
+        use_terminal_reward: false,
+        use_classifier_heads: true,
+        classifier_loss: classifier_loss_config.clone(),
+        print_every: 1000,
+        ..Default::default()
+    };
+
+    train_policy(&mut policy_baseline, &cube, &points, &config_baseline, &reward_config, &mut rng);
+    println!("Dumping baseline at epoch 6000...");
+    dump_rnn_policy_sample_cloud_with_options(
+        &policy_baseline,
+        "baseline-epoch-6000",
+        Path::new("sample_cloud_baseline_epoch_6000.cbor"),
+        None
+    );
+
+    println!("\n=== Dumps complete ===");
+    println!("Files created:");
+    println!("  - sample_cloud_random_epoch_2000.cbor");
+    println!("  - sample_cloud_random_epoch_4000.cbor");
+    println!("  - sample_cloud_baseline_epoch_6000.cbor");
+}
+
+/// Dump sample clouds with optional random sampling.
+/// If exploration_rate is Some(rate), use that rate of random sampling (1.0 = fully random).
+fn dump_rnn_policy_sample_cloud_with_options(
+    policy: &RnnPolicy,
+    label: &str,
+    output_path: &Path,
+    exploration_rate: Option<f64>,
+) {
     use classifier_heads::GeometryType;
 
     let cube = AnalyticalRotatedCube::standard_test_cube();
@@ -712,8 +902,12 @@ fn dump_rnn_policy_sample_cloud_with_policy(policy: &RnnPolicy, label: &str, out
     for (idx, point) in points.iter().enumerate() {
         begin_sample_recording();
 
-        // stochastic=false (use argmax) for deterministic evaluation
-        let episode = run_episode(policy, &cube, point, idx, &mut rng, false, &reward_config);
+        // Use random sampling if exploration_rate specified, otherwise policy-based
+        let episode = if let Some(rate) = exploration_rate {
+            run_episode_with_exploration(policy, &cube, point, idx, &mut rng, false, rate, &reward_config)
+        } else {
+            run_episode(policy, &cube, point, idx, &mut rng, false, &reward_config)
+        };
 
         let samples = end_sample_recording();
 
@@ -945,7 +1139,6 @@ pub fn run_reward_sweep() {
         ("baseline", RewardConfig::default()),
         ("classifier_training", RewardConfig::for_classifier_training()),
         ("direction_diversity", RewardConfig::with_direction_diversity()),
-        ("high_crossing", RewardConfig::with_high_crossing_bonus()),
         // Variations on entropy
         ("entropy_0.1", RewardConfig {
             w_entropy: 0.1,
@@ -1322,5 +1515,22 @@ mod tests {
     fn test_dump_baseline_sample_cloud() {
         let output_path = std::path::Path::new("sample_cloud_rnn_baseline.cbor");
         super::dump_baseline_sample_cloud(output_path);
+    }
+
+    /// Dump sample cloud with 100% random sampling (training and evaluation).
+    /// Run with: cargo test --release --features native test_dump_random_sample_cloud -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn test_dump_random_sample_cloud() {
+        let output_path = std::path::Path::new("sample_cloud_rnn_random.cbor");
+        super::dump_random_sampling_sample_cloud(output_path);
+    }
+
+    /// Dump sample clouds at specific training epochs for debugging.
+    /// Run with: cargo test --release --features native test_dump_epoch_checkpoints -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn test_dump_epoch_checkpoints() {
+        super::dump_training_epoch_checkpoints();
     }
 }

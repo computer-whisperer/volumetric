@@ -110,10 +110,15 @@ impl PolicyGradients {
 /// Compute policy gradient for a single episode using REINFORCE with baseline.
 ///
 /// Uses full BPTT since episodes are short (~50 steps).
+///
+/// If `dh_classifier` is provided, it's used as the initial gradient flowing back
+/// from the classifier loss into the final hidden state. This allows classifier
+/// loss to backpropagate through the entire GRU sequence.
 pub fn compute_episode_gradient(
     policy: &RnnPolicy,
     episode: &Episode,
     discount: f64,
+    dh_classifier: Option<&[f64]>,
 ) -> PolicyGradients {
     if episode.steps.is_empty() {
         return PolicyGradients::zeros();
@@ -129,7 +134,12 @@ pub fn compute_episode_gradient(
 
     // Backward pass through time
     // We accumulate dL/dh as we go backward
-    let mut dh_next = vec![0.0; HIDDEN_DIM];
+    // Start with classifier gradient if provided, otherwise zeros
+    let mut dh_next = if let Some(dh_clf) = dh_classifier {
+        dh_clf.to_vec()
+    } else {
+        vec![0.0; HIDDEN_DIM]
+    };
 
     for (t, step) in episode.steps.iter().enumerate().rev() {
         let advantage = advantages[t];
@@ -138,7 +148,7 @@ pub fn compute_episode_gradient(
         let (chooser_grad, dh_from_chooser) =
             chooser_backward_policy_gradient(&policy.chooser, &step.chooser_cache, advantage);
 
-        // Combine dL/dh from chooser and from next timestep
+        // Combine dL/dh from chooser and from next timestep (includes classifier gradient)
         let dh: Vec<f64> = dh_from_chooser
             .iter()
             .zip(dh_next.iter())
@@ -160,10 +170,15 @@ pub fn compute_episode_gradient(
 }
 
 /// Compute average policy gradient over multiple episodes.
+///
+/// If `classifier_dh_list` is provided, each episode's classifier gradient is
+/// backpropagated through its GRU sequence. The list must have the same length
+/// as `episodes`.
 pub fn compute_batch_gradient(
     policy: &RnnPolicy,
     episodes: &[Episode],
     discount: f64,
+    classifier_dh_list: Option<&[Vec<f64>]>,
 ) -> PolicyGradients {
     if episodes.is_empty() {
         return PolicyGradients::zeros();
@@ -171,8 +186,9 @@ pub fn compute_batch_gradient(
 
     let mut total_grads = PolicyGradients::zeros();
 
-    for episode in episodes {
-        let grads = compute_episode_gradient(policy, episode, discount);
+    for (i, episode) in episodes.iter().enumerate() {
+        let dh_classifier = classifier_dh_list.map(|list| list[i].as_slice());
+        let grads = compute_episode_gradient(policy, episode, discount, dh_classifier);
         total_grads.add(&grads);
     }
 
@@ -228,7 +244,7 @@ pub fn numerical_gradient_check(
     }
 
     // Compute analytical gradient
-    let analytical = compute_episode_gradient(policy, episode, discount);
+    let analytical = compute_episode_gradient(policy, episode, discount, None);
 
     // Sample a few parameters to check
     let mut max_error: f64 = 0.0;
@@ -281,7 +297,7 @@ mod tests {
         let reward_config = RewardConfig::default();
 
         let episode = run_episode(&policy, &cube, &point, 0, &mut rng, true, &reward_config);
-        let grads = compute_episode_gradient(&policy, &episode, 0.99);
+        let grads = compute_episode_gradient(&policy, &episode, 0.99, None);
 
         // Gradients should be non-zero
         let norm = grads.norm();
@@ -310,7 +326,7 @@ mod tests {
             episodes.push(episode);
         }
 
-        let grads = compute_batch_gradient(&policy, &episodes, 0.99);
+        let grads = compute_batch_gradient(&policy, &episodes, 0.99, None);
         assert!(grads.norm() > 0.0);
     }
 }
