@@ -23,8 +23,13 @@ These approaches don't adapt based on what they've already learned. The RNN poli
 ```
 Input[5] → GRU[64] → Linear[8] → Softmax → Weighted Position
                   ↓
-            Classifier Heads → Face/Edge/Corner predictions
+            Classifier Heads (Face/Edge/Corner)
+                  ↓
+            Softmax → Classification (winner-take-all)
 ```
+
+The classifier heads output raw logits that are combined via softmax for classification.
+This ensures the three geometry types compete properly (confidences sum to 1).
 
 #### GRU Updater
 - **Input dimension**: 5 features (clean, no oracle cheating)
@@ -232,36 +237,58 @@ The exploration rate is linearly interpolated: `rate = start + (end - start) * (
 - Random 3D offset within `0.2 × cell_size` of surface (easier start)
 - Deterministic seed for reproducibility
 
-## Results (v8 - 2026-01-27)
+## Results (v9 - 2026-01-27)
 
-### Exploration Schedule Comparison
+### Softmax Classification
 
-Comparison of baseline training vs exploration schedule (100% random → 0% random over 6000 epochs):
+Replaced independent sigmoid confidences with softmax across all three heads. This ensures
+confidences sum to 1 and heads compete properly for classification.
 
-| Metric | Baseline | Exploration Schedule | Change |
-|--------|----------|---------------------|--------|
-| **Overall Accuracy** | 36.5% | 46.2% | **+9.6%** |
-| **Loss** | 5.133 | 4.698 | **-0.435** |
+| Config | Face | Edge | Corner | Overall | Loss |
+|--------|------|------|--------|---------|------|
+| Baseline | 67% (8/12) | 88% (21/24) | 0% (0/16) | **55.8%** | 3.38 |
+| Exploration | 67% (8/12) | 79% (19/24) | 0% (0/16) | 51.9% | 3.20 |
 
-**Per-class breakdown:**
+**Key observations:**
+- Face and edge classification work well (67% and 88%)
+- Corner classification completely fails (0%) despite good normal predictions
+- Corner normal loss is actually the best (0.21-0.30) but corners never win softmax
+- Exploration no longer causes class collapse (was 100% edge in v8)
+
+### Approach Comparison
+
+| Approach | Face | Edge | Corner | Overall |
+|----------|------|------|--------|---------|
+| v7: Margin (corners only) | 67% | 0% | 75% | 38.5% |
+| v8: Margin (all classes) | 67% | 88% | 0% | 55.8% |
+| v9: Softmax | 67% | 88% | 0% | **55.8%** |
+
+**Analysis:**
+- Margin loss on corners only: corners work, edges fail
+- Margin loss on all classes: edges work, corners fail
+- Softmax: same as margin-all, edges work, corners fail
+
+The fundamental issue is that corners are intrinsically harder to classify. The model
+learns to be more confident about faces and edges, so corners always lose the competition.
+
+**Potential improvements:**
+1. **Class weights** - Boost corner weight (e.g., `[1.0, 1.0, 2.0]`)
+2. **Focal loss** - Focus on hard examples (corners)
+3. **Temperature scaling** - Flatten softmax distribution
+4. **Hierarchical classification** - First Face vs Multi-plane, then Edge vs Corner
+
+### Previous Results (v8 - Exploration Schedule)
+
+Comparison with independent sigmoid confidences + margin loss:
 
 | Class | Baseline | Exploration |
 |-------|----------|-------------|
 | Face | 42% (5/12) | 0% (0/12) |
 | Edge | 4% (1/24) | 100% (24/24) |
 | Corner | 81% (13/16) | 0% (0/16) |
+| **Overall** | 38.5% | 46.2% |
 
-**Key observation:** The exploration schedule improved overall accuracy but caused the model to collapse to predicting "Edge" for everything. This is a local minimum - edges are 46% of training data (24/52), so always predicting edge achieves 46% accuracy.
-
-### Analysis
-
-The exploration schedule helps the classifier heads see more diverse samples early in training, but the sampler doesn't learn class-discriminative sampling patterns fast enough. By the time exploration cools to 0%, the model has already converged to predicting the majority class.
-
-**Potential improvements to explore:**
-1. Don't cool all the way to 0% (try `exploration_end: 0.1`)
-2. Use non-linear schedule (exponential decay)
-3. Run more epochs after exploration ends
-4. Class-balanced exploration during random phase
+The exploration schedule caused class collapse to all-edge predictions.
 
 ### Previous Results (v7)
 
@@ -282,6 +309,31 @@ The exploration schedule helps the classifier heads see more diverse samples ear
 | **Overall** | 0% | **9.6%** |
 
 ## Changelog
+
+### v9 (2026-01-27) - Softmax Classification
+
+**Major change: Replaced independent sigmoids with softmax**
+- Confidences now computed via softmax across all three heads
+- Ensures confidences sum to 1 and heads compete properly
+- Simplified loss function: standard cross-entropy replaces custom wrong_conf penalty
+- Removed margin loss (softmax provides natural competition)
+
+**Architecture changes:**
+- `ClassifierPredictions::confidences()` now returns softmax probabilities
+- Added `ClassifierPredictions::raw_confidences()` for pre-softmax logits
+- Added `softmax3()` helper function with numerical stability (max subtraction)
+- Gradient computation simplified: `d_loss/d_raw[i] = softmax[i] - target[i]`
+
+**Results:**
+- Baseline accuracy: 55.8% (same as margin-all)
+- Face: 67%, Edge: 88%, Corner: 0%
+- Lower loss (3.2-3.4) compared to sigmoid approach (4.5-5.1)
+- Exploration schedule no longer causes class collapse
+
+**Remaining issue:**
+- Corners never classified despite good normal predictions
+- Corner head learns good geometry but loses softmax competition
+- Need class weights or focal loss to address class imbalance
 
 ### v8 (2026-01-27) - Exploration Schedule & Architecture Cleanup
 
@@ -555,33 +607,36 @@ cargo run --release --bin sample_cloud_inspect -- --file samples.cbor --set 0
 
 ## Future Work
 
-### Immediate (Exploration Schedule Tuning)
-Exploration schedule shows promise (+9.6% accuracy) but causes class collapse.
+### Immediate (Corner Classification Problem)
+With softmax, corners are never classified (0%) despite good normal predictions.
+The corner head learns good geometry but always loses the softmax competition.
 
-1. **Partial exploration**: Don't cool all the way to 0%
-   - Try `exploration_end: 0.1` to maintain some diversity
-   - May prevent collapse to majority class
-2. **Non-linear schedule**: Exponential decay instead of linear
-   - Fast initial learning, slow refinement
-   - `rate = start * decay^epoch` instead of linear interpolation
-3. **Extended post-exploration training**: Run more epochs at 0% exploration
-   - Allow sampler to catch up after classifier heads are trained
-   - May need 2-phase training: exploration phase + refinement phase
-4. **Class-balanced exploration**: During random phase, balance class exposure
-   - Weight random sampling toward underrepresented classes
-   - Ensure equal samples from face/edge/corner regions
+1. **Class weights**: Boost corner class weight
+   - Try `class_weights: [1.0, 1.0, 2.0]` or higher
+   - Increases loss contribution from corner examples
+   - Simple parameter change, no architecture modifications
 
-### Edge Classification Problem
-Edges remain the weakest class in baseline training (29% in v7).
+2. **Focal loss**: Focus training on hard examples
+   - Down-weight easy (face/edge) examples
+   - `FL(p) = -(1-p)^γ * log(p)` with γ=2
+   - Corners are "hard" so they get more gradient signal
 
-1. **Edge-specific improvements**:
-   - Add asymmetric margin for edges (similar to what fixed corners)
-   - Try edge-specific class weight increase
-   - Investigate edge→corner misclassification patterns
-2. **Hierarchical classification**:
+3. **Temperature scaling**: Flatten softmax distribution
+   - `softmax(logits / T)` with T > 1
+   - Gives corners more chance to win
+   - Can anneal T during training
+
+4. **Hierarchical classification**:
    - First: Face vs Multi-plane (Edge/Corner)
    - Second: Edge vs Corner
-   - May help disambiguate 2-plane vs 3-plane geometry
+   - May help since face vs multi-plane is easier
+
+### Exploration Schedule Refinements
+Exploration no longer causes class collapse with softmax, but could be improved:
+
+1. **Partial exploration**: Try `exploration_end: 0.1` to maintain diversity
+2. **Non-linear schedule**: Exponential decay instead of linear
+3. **Extended post-exploration**: More epochs at 0% exploration
 
 ### Short-term
 1. **Scale up offset**: Gradually increase validation offset toward full cell_size
@@ -589,12 +644,13 @@ Edges remain the weakest class in baseline training (29% in v7).
 3. **Longer training**: Loss still improving at 24k epochs
 
 ### Solved
+- ✅ **Softmax classification** (v9): Proper probabilistic competition between heads
+- ✅ **Edge classification** (v9): 88% accuracy with softmax
+- ✅ **Class collapse prevention** (v9): Exploration schedule no longer causes all-edge predictions
 - ✅ **Discrete corners removed** (v8): Always use octant lerp
 - ✅ **Exploration schedule infrastructure** (v8): Foundation for curriculum learning
-- ✅ **Corner confidence problem** (v7): Asymmetric margin loss + higher wrong_conf penalty
 - ✅ Larger capacity (hidden_dim=64): Now 15,910 parameters
 - ✅ Lower learning rate (0.0003): Stable training
-- ✅ Longer training (24k epochs): Continued improvement
 
 ### Long-term
 1. **Integration**: Replace sampling in actual surface nets algorithm

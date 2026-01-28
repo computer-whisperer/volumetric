@@ -114,12 +114,19 @@ pub struct ClassifierPredictions {
 }
 
 impl ClassifierPredictions {
-    /// Get confidences as array [face, edge, corner].
-    pub fn confidences(&self) -> [f64; 3] {
-        [self.face.confidence, self.edge.confidence, self.corner.confidence]
+    /// Get raw (pre-softmax) confidence logits as array [face, edge, corner].
+    pub fn raw_confidences(&self) -> [f64; 3] {
+        [self.face.raw_confidence, self.edge.raw_confidence, self.corner.raw_confidence]
     }
 
-    /// Get the predicted geometry type (highest confidence).
+    /// Get softmax confidences as array [face, edge, corner].
+    /// Uses softmax across all three heads so they sum to 1 and compete properly.
+    pub fn confidences(&self) -> [f64; 3] {
+        let raw = self.raw_confidences();
+        softmax3(raw)
+    }
+
+    /// Get the predicted geometry type (highest softmax confidence).
     pub fn predicted_type(&self) -> GeometryType {
         let confs = self.confidences();
         if confs[0] >= confs[1] && confs[0] >= confs[2] {
@@ -130,6 +137,17 @@ impl ClassifierPredictions {
             GeometryType::Corner
         }
     }
+}
+
+/// Compute softmax over 3 values.
+fn softmax3(x: [f64; 3]) -> [f64; 3] {
+    // Subtract max for numerical stability
+    let max_x = x[0].max(x[1]).max(x[2]);
+    let exp0 = (x[0] - max_x).exp();
+    let exp1 = (x[1] - max_x).exp();
+    let exp2 = (x[2] - max_x).exp();
+    let sum = exp0 + exp1 + exp2;
+    [exp0 / sum, exp1 / sum, exp2 / sum]
 }
 
 /// Geometry type enum.
@@ -407,6 +425,7 @@ impl Default for ClassifierLossConfig {
 /// Compute classification loss.
 ///
 /// Returns (total_loss, correct_conf_loss, normal_loss, offset_loss, wrong_conf_loss).
+/// Note: wrong_conf_loss is always 0 with softmax (kept for API compatibility).
 pub fn compute_classifier_loss(
     predictions: &ClassifierPredictions,
     expected: &ExpectedGeometry,
@@ -421,27 +440,17 @@ pub fn compute_classifier_loss(
         GeometryType::Corner => config.class_weights[2],
     };
 
-    // Correct head confidence loss: -log(confidence)
-    let (correct_conf, wrong_confs) = match correct_type {
-        GeometryType::Face => (predictions.face.confidence, [predictions.edge.confidence, predictions.corner.confidence]),
-        GeometryType::Edge => (predictions.edge.confidence, [predictions.face.confidence, predictions.corner.confidence]),
-        GeometryType::Corner => (predictions.corner.confidence, [predictions.face.confidence, predictions.edge.confidence]),
+    // Get softmax confidences - these sum to 1 and compete properly
+    let softmax_confs = predictions.confidences();
+    let correct_conf = match correct_type {
+        GeometryType::Face => softmax_confs[0],
+        GeometryType::Edge => softmax_confs[1],
+        GeometryType::Corner => softmax_confs[2],
     };
-    let correct_conf_loss = -correct_conf.max(1e-10).ln();
 
-    // Margin loss: penalize if correct_conf < wrong_conf + margin
-    // Uses hinge loss: max(0, margin - (correct_conf - wrong_conf))
-    // ONLY apply for corners (the class that was failing due to low confidence)
-    let mut margin_loss = 0.0;
-    if correct_type == GeometryType::Corner && config.w_margin > 0.0 {
-        for wrong_conf in wrong_confs {
-            let violation = config.margin - (correct_conf - wrong_conf);
-            if violation > 0.0 {
-                margin_loss += violation;
-            }
-        }
-        margin_loss /= 2.0; // Average over the two wrong heads
-    }
+    // Cross-entropy loss with softmax: -log(softmax[correct_class])
+    // This naturally penalizes wrong classes without needing separate wrong_conf_loss
+    let correct_conf_loss = -correct_conf.max(1e-10).ln();
 
     // Normal and offset loss for correct head
     let (normal_loss, offset_loss) = match expected {
@@ -491,30 +500,15 @@ pub fn compute_classifier_loss(
         }
     };
 
-    // Wrong head confidence penalty: log(1 - confidence) for wrong heads
-    // We want wrong heads to have LOW confidence, so penalize high confidence
-    let wrong_conf_loss = match correct_type {
-        GeometryType::Face => {
-            -((1.0 - predictions.edge.confidence).max(1e-10).ln()
-                + (1.0 - predictions.corner.confidence).max(1e-10).ln()) / 2.0
-        }
-        GeometryType::Edge => {
-            -((1.0 - predictions.face.confidence).max(1e-10).ln()
-                + (1.0 - predictions.corner.confidence).max(1e-10).ln()) / 2.0
-        }
-        GeometryType::Corner => {
-            -((1.0 - predictions.face.confidence).max(1e-10).ln()
-                + (1.0 - predictions.edge.confidence).max(1e-10).ln()) / 2.0
-        }
-    };
+    // With softmax, we don't need separate wrong_conf_loss - cross-entropy handles it
+    let wrong_conf_loss = 0.0;
 
     // Apply class weight to balance minority classes
+    // With softmax, we only need cross-entropy + normal/offset losses
     let total = class_weight * (
         config.w_correct_conf * correct_conf_loss
         + config.w_normal * normal_loss
         + config.w_offset * offset_loss
-        + config.w_wrong_conf * wrong_conf_loss
-        + config.w_margin * margin_loss
     );
 
     (total, correct_conf_loss, normal_loss, offset_loss, wrong_conf_loss)
@@ -714,68 +708,36 @@ pub fn compute_classifier_gradients(
     let mut dh = vec![0.0; HIDDEN_DIM];
 
     let correct_type = expected.geometry_type();
-
-    // Compute margin loss gradients
-    // For margin loss: L = max(0, margin - (correct_conf - wrong_conf))
-    // dL/d(correct_conf) = -1 if violation > 0, else 0
-    // dL/d(wrong_conf) = +1 if violation > 0, else 0
-    let (correct_conf, wrong_confs, wrong_types) = match correct_type {
-        GeometryType::Face => (
-            predictions.face.confidence,
-            [predictions.edge.confidence, predictions.corner.confidence],
-            [GeometryType::Edge, GeometryType::Corner],
-        ),
-        GeometryType::Edge => (
-            predictions.edge.confidence,
-            [predictions.face.confidence, predictions.corner.confidence],
-            [GeometryType::Face, GeometryType::Corner],
-        ),
-        GeometryType::Corner => (
-            predictions.corner.confidence,
-            [predictions.face.confidence, predictions.edge.confidence],
-            [GeometryType::Face, GeometryType::Edge],
-        ),
-    };
-
-    // Compute margin violation flags
-    let mut margin_d_correct: f64 = 0.0;
-    let mut margin_d_face: f64 = 0.0;
-    let mut margin_d_edge: f64 = 0.0;
-    let mut margin_d_corner: f64 = 0.0;
-
     let class_weight = match correct_type {
         GeometryType::Face => config.class_weights[0],
         GeometryType::Edge => config.class_weights[1],
         GeometryType::Corner => config.class_weights[2],
     };
 
-    // Only apply margin for corners (the class that was originally failing)
-    if correct_type == GeometryType::Corner && config.w_margin > 0.0 {
-        for (wrong_conf, wrong_type) in wrong_confs.iter().zip(wrong_types.iter()) {
-            let violation = config.margin - (correct_conf - wrong_conf);
-            if violation > 0.0 {
-                // Gradient: class_weight * w_margin * (1/2) because we average over 2 wrong heads
-                let scale = class_weight * config.w_margin * 0.5;
-                margin_d_correct -= scale; // Push correct conf up
-                match wrong_type {
-                    GeometryType::Face => margin_d_face += scale,
-                    GeometryType::Edge => margin_d_edge += scale,
-                    GeometryType::Corner => margin_d_corner += scale,
-                }
-            }
-        }
-    }
+    // Get softmax confidences for gradient computation
+    // For softmax cross-entropy: d_loss/d_raw[i] = softmax[i] - target[i]
+    let softmax_confs = predictions.confidences();
 
-    // Set the gradient for the correct head from margin loss
-    match correct_type {
-        GeometryType::Face => margin_d_face += margin_d_correct,
-        GeometryType::Edge => margin_d_edge += margin_d_correct,
-        GeometryType::Corner => margin_d_corner += margin_d_correct,
-    }
-
-    // Compute gradients for each head
-    // For the correct head: gradient from confidence loss + normal loss
-    // For wrong heads: gradient from wrong confidence penalty
+    // Compute d_loss/d_raw_conf for each head
+    // For correct head: softmax[i] - 1
+    // For wrong heads: softmax[i]
+    let (d_face_conf, d_edge_conf, d_corner_conf) = match correct_type {
+        GeometryType::Face => (
+            class_weight * config.w_correct_conf * (softmax_confs[0] - 1.0),
+            class_weight * config.w_correct_conf * softmax_confs[1],
+            class_weight * config.w_correct_conf * softmax_confs[2],
+        ),
+        GeometryType::Edge => (
+            class_weight * config.w_correct_conf * softmax_confs[0],
+            class_weight * config.w_correct_conf * (softmax_confs[1] - 1.0),
+            class_weight * config.w_correct_conf * softmax_confs[2],
+        ),
+        GeometryType::Corner => (
+            class_weight * config.w_correct_conf * softmax_confs[0],
+            class_weight * config.w_correct_conf * softmax_confs[1],
+            class_weight * config.w_correct_conf * (softmax_confs[2] - 1.0),
+        ),
+    };
 
     // Face head gradients
     let face_grad = compute_face_head_gradient(
@@ -785,7 +747,7 @@ pub fn compute_classifier_gradients(
         expected,
         correct_type == GeometryType::Face,
         config,
-        margin_d_face,
+        d_face_conf,
     );
     grads.face_dw = face_grad.dw;
     grads.face_db = face_grad.db;
@@ -801,7 +763,7 @@ pub fn compute_classifier_gradients(
         expected,
         correct_type == GeometryType::Edge,
         config,
-        margin_d_edge,
+        d_edge_conf,
     );
     grads.edge_dw = edge_grad.dw;
     grads.edge_db = edge_grad.db;
@@ -817,7 +779,7 @@ pub fn compute_classifier_gradients(
         expected,
         correct_type == GeometryType::Corner,
         config,
-        margin_d_corner,
+        d_corner_conf,
     );
     grads.corner_dw = corner_grad.dw;
     grads.corner_db = corner_grad.db;
@@ -844,18 +806,17 @@ fn compute_face_head_gradient(
     expected: &ExpectedGeometry,
     is_correct: bool,
     config: &ClassifierLossConfig,
-    margin_d_conf: f64,
+    d_conf: f64, // Gradient from softmax cross-entropy (already computed)
 ) -> HeadGradResult {
     let pred = &predictions.face;
     let mut d_raw = vec![0.0; FACE_HEAD_OUTPUTS];
 
-    if is_correct {
-        // Correct head: gradient from -log(conf) => d/d_raw_conf = -sigmoid'(x)/sigmoid(x) = -(1-sigmoid(x))
-        // Since loss = -log(sigmoid(x)), dL/dx = sigmoid(x) - 1 = conf - 1
-        let class_weight = config.class_weights[0];
-        d_raw[0] = class_weight * config.w_correct_conf * (pred.confidence - 1.0);
+    // Confidence gradient from softmax cross-entropy (passed in)
+    d_raw[0] = d_conf;
 
-        // Normal and offset loss gradients (for correct head only)
+    // Normal and offset loss gradients (for correct head only)
+    if is_correct {
+        let class_weight = config.class_weights[0];
         if let ExpectedGeometry::Face { normal, offset } = expected {
             let d_normal = normal_loss_gradient(pred.raw_normal, pred.normal, *normal);
             d_raw[1] += class_weight * config.w_normal * d_normal.0;
@@ -866,23 +827,7 @@ fn compute_face_head_gradient(
             let offset_diff = pred.offset - offset;
             d_raw[4] += class_weight * config.w_offset * offset_diff.signum();
         }
-    } else {
-        // Wrong head: gradient from -log(1-conf) => d/d_raw_conf = sigmoid(x)/(1-sigmoid(x)) * sigmoid'(x)
-        // = sigmoid(x) = conf
-        // Note: class_weight applied at the total loss level (correct class determines weight)
-        let correct_class_weight = match expected.geometry_type() {
-            GeometryType::Face => config.class_weights[0],
-            GeometryType::Edge => config.class_weights[1],
-            GeometryType::Corner => config.class_weights[2],
-        };
-        d_raw[0] = correct_class_weight * config.w_wrong_conf * pred.confidence * 0.5; // /2 for averaging two wrong heads
     }
-
-    // Add margin gradient contribution
-    // d(margin_loss)/d(raw_conf) = d(margin_loss)/d(conf) * d(conf)/d(raw_conf)
-    //                            = margin_d_conf * sigmoid'(raw_conf)
-    //                            = margin_d_conf * conf * (1 - conf)
-    d_raw[0] += margin_d_conf * pred.confidence * (1.0 - pred.confidence);
 
     linear_backward(head, hidden, &d_raw)
 }
@@ -896,15 +841,17 @@ fn compute_edge_head_gradient(
     expected: &ExpectedGeometry,
     is_correct: bool,
     config: &ClassifierLossConfig,
-    margin_d_conf: f64,
+    d_conf: f64, // Gradient from softmax cross-entropy (already computed)
 ) -> HeadGradResult {
     let pred = &predictions.edge;
     let mut d_raw = vec![0.0; EDGE_HEAD_OUTPUTS];
 
+    // Confidence gradient from softmax cross-entropy (passed in)
+    d_raw[0] = d_conf;
+
+    // Normal and offset loss gradients (for correct head only)
     if is_correct {
         let class_weight = config.class_weights[1];
-        d_raw[0] = class_weight * config.w_correct_conf * (pred.confidence - 1.0);
-
         if let ExpectedGeometry::Edge { normal_a, offset_a, normal_b, offset_b, direction } = expected {
             // Find best assignment for normals (same as loss computation)
             let loss1 = normal_cosine_loss(pred.normal_a, *normal_a)
@@ -941,17 +888,7 @@ fn compute_edge_head_gradient(
             d_raw[10] += scale * d_dir.1;
             d_raw[11] += scale * d_dir.2;
         }
-    } else {
-        let correct_class_weight = match expected.geometry_type() {
-            GeometryType::Face => config.class_weights[0],
-            GeometryType::Edge => config.class_weights[1],
-            GeometryType::Corner => config.class_weights[2],
-        };
-        d_raw[0] = correct_class_weight * config.w_wrong_conf * pred.confidence * 0.5;
     }
-
-    // Add margin gradient contribution
-    d_raw[0] += margin_d_conf * pred.confidence * (1.0 - pred.confidence);
 
     linear_backward(head, hidden, &d_raw)
 }
@@ -965,15 +902,17 @@ fn compute_corner_head_gradient(
     expected: &ExpectedGeometry,
     is_correct: bool,
     config: &ClassifierLossConfig,
-    margin_d_conf: f64,
+    d_conf: f64, // Gradient from softmax cross-entropy (already computed)
 ) -> HeadGradResult {
     let pred = &predictions.corner;
     let mut d_raw = vec![0.0; CORNER_HEAD_OUTPUTS];
 
+    // Confidence gradient from softmax cross-entropy (passed in)
+    d_raw[0] = d_conf;
+
+    // Normal and offset loss gradients (for correct head only)
     if is_correct {
         let class_weight = config.class_weights[2];
-        d_raw[0] = class_weight * config.w_correct_conf * (pred.confidence - 1.0);
-
         if let ExpectedGeometry::Corner { normals: exp_normals, offsets: exp_offsets } = expected {
             // Greedy matching (same as loss computation)
             let mut used = [false; 3];
@@ -1013,17 +952,7 @@ fn compute_corner_head_gradient(
                 d_raw[base + 3] += o_scale * (pred.offsets[pred_idx] - exp_offsets[exp_idx]).signum();
             }
         }
-    } else {
-        let correct_class_weight = match expected.geometry_type() {
-            GeometryType::Face => config.class_weights[0],
-            GeometryType::Edge => config.class_weights[1],
-            GeometryType::Corner => config.class_weights[2],
-        };
-        d_raw[0] = correct_class_weight * config.w_wrong_conf * pred.confidence * 0.5;
     }
-
-    // Add margin gradient contribution
-    d_raw[0] += margin_d_conf * pred.confidence * (1.0 - pred.confidence);
 
     linear_backward(head, hidden, &d_raw)
 }
