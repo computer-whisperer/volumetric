@@ -268,9 +268,26 @@ With the gradient fix, classification IS learning with random sampling:
 | 2500  | **2.22**  | Catastrophic collapse! |
 | 3000+ | 1.06      | Stuck at uniform |
 
-**Key observation:** Training collapses around epoch 2500. The conf_loss suddenly
+**Key observation:** Training collapses around epoch 2500-2750. The conf_loss suddenly
 spikes to 2.22 then settles at 1.058 (uniform distribution). This is a sudden
 catastrophic event, not gradual drift.
+
+**Detailed analysis of collapse (250-epoch granularity):**
+
+| Epoch | conf | normal | grad_norm | Notes |
+|-------|------|--------|-----------|-------|
+| 750   | 0.59 | 0.34   | **3.38**  | Grad norm starts rising |
+| 1000  | 0.61 | 0.38   | **3.91**  | Grad norm jumps to ~3.9 |
+| 2500  | 0.52 | 0.36   | 3.96      | Best conf, pre-collapse |
+| 2750  | **1.68** | **0.29** | 3.99 | **COLLAPSE!** |
+| 3000  | 1.06 | 0.38   | 3.87      | Settled at uniform |
+
+**Observations:**
+1. Reward breakdown is CONSTANT throughout (random samples don't change)
+2. Grad norm rises early (epoch 750-1000) but stays stable - not the trigger
+3. Normal loss is volatile (0.29-0.42) even while conf improves
+4. **Strange: normal loss IMPROVES at collapse** (0.36 → 0.29)
+5. Collapse doesn't correlate with reward changes or gradient explosion
 
 ### Cooling Schedule (100% → 0% Random)
 

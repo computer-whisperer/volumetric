@@ -378,57 +378,57 @@ pub fn compare_exploration_schedule() {
 
     println!();
 
-    // --- With cooling schedule (100% → 0% random) ---
-    println!(">>> WITH COOLING SCHEDULE (100% → 0% random) <<<");
-    let mut rng_cooling = Rng::new(12345); // Same seed for fair comparison
-    let mut policy_cooling = RnnPolicy::new(&mut rng_cooling);
+    // --- With 100% random sampling throughout ---
+    println!(">>> WITH 100% RANDOM SAMPLING <<<");
+    let mut rng_random = Rng::new(12345); // Same seed for fair comparison
+    let mut policy_random = RnnPolicy::new(&mut rng_random);
 
-    let config_cooling = TrainingConfig {
+    let config_random = TrainingConfig {
         epochs,
-        print_every,
+        print_every: 250, // More frequent printing to catch the collapse
         lr,
         use_classifier_heads: true,
         use_exploration_schedule: true,
-        exploration_start: 1.0,  // Start 100% random
-        exploration_end: 0.0,    // End fully policy-based
+        exploration_start: 1.0,  // 100% random
+        exploration_end: 1.0,    // Stay 100% random
         classifier_loss: classifier_loss.clone(),
         ..Default::default()
     };
-    train_policy(&mut policy_cooling, &cube, &points, &config_cooling, &reward_config, &mut rng_cooling);
+    train_policy(&mut policy_random, &cube, &points, &config_random, &reward_config, &mut rng_random);
 
-    // Evaluate with policy-based sampling (final mode)
-    let eval_cooling = evaluate_classifier_heads(&policy_cooling, &cube, &points, &reward_config, &mut rng_cooling);
-    println!("\nCooling schedule final results (evaluated with policy):");
-    println!("  Accuracy: {:.1}% (loss: {:.3})", eval_cooling.accuracy * 100.0, eval_cooling.loss);
+    // Evaluate with random sampling to match training
+    let eval_random = evaluate_classifier_heads_with_options(&policy_random, &cube, &points, &reward_config, &mut rng_random, true);
+    println!("\n100% random final results:");
+    println!("  Accuracy: {:.1}% (loss: {:.3})", eval_random.accuracy * 100.0, eval_random.loss);
     println!("  Face:   {}/{} = {:.0}%, normal_loss={:.3}",
-        eval_cooling.face_correct, eval_cooling.face_total,
-        if eval_cooling.face_total > 0 { eval_cooling.face_correct as f64 / eval_cooling.face_total as f64 * 100.0 } else { 0.0 },
-        eval_cooling.face_normal_loss);
+        eval_random.face_correct, eval_random.face_total,
+        if eval_random.face_total > 0 { eval_random.face_correct as f64 / eval_random.face_total as f64 * 100.0 } else { 0.0 },
+        eval_random.face_normal_loss);
     println!("  Edge:   {}/{} = {:.0}%, normal_loss={:.3}",
-        eval_cooling.edge_correct, eval_cooling.edge_total,
-        if eval_cooling.edge_total > 0 { eval_cooling.edge_correct as f64 / eval_cooling.edge_total as f64 * 100.0 } else { 0.0 },
-        eval_cooling.edge_normal_loss);
+        eval_random.edge_correct, eval_random.edge_total,
+        if eval_random.edge_total > 0 { eval_random.edge_correct as f64 / eval_random.edge_total as f64 * 100.0 } else { 0.0 },
+        eval_random.edge_normal_loss);
     println!("  Corner: {}/{} = {:.0}%, normal_loss={:.3}",
-        eval_cooling.corner_correct, eval_cooling.corner_total,
-        if eval_cooling.corner_total > 0 { eval_cooling.corner_correct as f64 / eval_cooling.corner_total as f64 * 100.0 } else { 0.0 },
-        eval_cooling.corner_normal_loss);
+        eval_random.corner_correct, eval_random.corner_total,
+        if eval_random.corner_total > 0 { eval_random.corner_correct as f64 / eval_random.corner_total as f64 * 100.0 } else { 0.0 },
+        eval_random.corner_normal_loss);
 
     // Summary comparison
     println!("\n=== COMPARISON SUMMARY ===");
-    println!("                    Baseline    Cooling");
+    println!("                    Baseline    Random");
     println!("  Accuracy:         {:>6.1}%      {:>6.1}%",
-        eval_baseline.accuracy * 100.0, eval_cooling.accuracy * 100.0);
+        eval_baseline.accuracy * 100.0, eval_random.accuracy * 100.0);
     println!("  Loss:             {:>6.3}       {:>6.3}",
-        eval_baseline.loss, eval_cooling.loss);
+        eval_baseline.loss, eval_random.loss);
     println!("  Face normal:      {:>6.3}       {:>6.3}",
-        eval_baseline.face_normal_loss, eval_cooling.face_normal_loss);
+        eval_baseline.face_normal_loss, eval_random.face_normal_loss);
     println!("  Edge normal:      {:>6.3}       {:>6.3}",
-        eval_baseline.edge_normal_loss, eval_cooling.edge_normal_loss);
+        eval_baseline.edge_normal_loss, eval_random.edge_normal_loss);
     println!("  Corner normal:    {:>6.3}       {:>6.3}",
-        eval_baseline.corner_normal_loss, eval_cooling.corner_normal_loss);
+        eval_baseline.corner_normal_loss, eval_random.corner_normal_loss);
 
-    let acc_diff = eval_cooling.accuracy - eval_baseline.accuracy;
-    let loss_diff = eval_baseline.loss - eval_cooling.loss; // positive = cooling is better
+    let acc_diff = eval_random.accuracy - eval_baseline.accuracy;
+    let loss_diff = eval_baseline.loss - eval_random.loss; // positive = random is better
     println!("\n  Accuracy improvement: {:+.1}%", acc_diff * 100.0);
     println!("  Loss improvement:     {:+.3}", loss_diff);
 }
