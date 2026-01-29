@@ -5,8 +5,8 @@
 
 use super::chooser::{chooser_backward_policy_gradient, ChooserGradients};
 use super::classifier_heads::ClassifierHeadGradients;
-use super::gru::{gru_backward, GruGradients, HIDDEN_DIM};
-use super::policy::{Episode, RnnPolicy, INPUT_DIM};
+use super::gru::{gru_backward, GruGradients, HIDDEN_DIM, NUM_LAYERS};
+use super::policy::{Episode, RnnPolicy};
 use super::reward::{compute_advantages, compute_baseline, compute_returns};
 
 /// Combined gradients for the entire policy.
@@ -18,10 +18,10 @@ pub struct PolicyGradients {
 }
 
 impl PolicyGradients {
-    /// Create zero-initialized gradients.
-    pub fn zeros() -> Self {
+    /// Create zero-initialized gradients matching policy structure.
+    pub fn zeros(policy: &RnnPolicy) -> Self {
         Self {
-            gru: GruGradients::zeros(INPUT_DIM),
+            gru: GruGradients::zeros(&policy.gru),
             chooser: ChooserGradients::zeros(),
             classifier_heads: ClassifierHeadGradients::zeros(),
         }
@@ -51,32 +51,35 @@ impl PolicyGradients {
     /// Compute total gradient norm.
     pub fn norm(&self) -> f64 {
         let mut sum = 0.0;
-        for &v in &self.gru.dw_z {
-            sum += v * v;
-        }
-        for &v in &self.gru.du_z {
-            sum += v * v;
-        }
-        for &v in &self.gru.db_z {
-            sum += v * v;
-        }
-        for &v in &self.gru.dw_r {
-            sum += v * v;
-        }
-        for &v in &self.gru.du_r {
-            sum += v * v;
-        }
-        for &v in &self.gru.db_r {
-            sum += v * v;
-        }
-        for &v in &self.gru.dw_h {
-            sum += v * v;
-        }
-        for &v in &self.gru.du_h {
-            sum += v * v;
-        }
-        for &v in &self.gru.db_h {
-            sum += v * v;
+        // Sum over all GRU layers
+        for layer_grads in &self.gru.layers {
+            for &v in &layer_grads.dw_z {
+                sum += v * v;
+            }
+            for &v in &layer_grads.du_z {
+                sum += v * v;
+            }
+            for &v in &layer_grads.db_z {
+                sum += v * v;
+            }
+            for &v in &layer_grads.dw_r {
+                sum += v * v;
+            }
+            for &v in &layer_grads.du_r {
+                sum += v * v;
+            }
+            for &v in &layer_grads.db_r {
+                sum += v * v;
+            }
+            for &v in &layer_grads.dw_h {
+                sum += v * v;
+            }
+            for &v in &layer_grads.du_h {
+                sum += v * v;
+            }
+            for &v in &layer_grads.db_h {
+                sum += v * v;
+            }
         }
         for &v in &self.chooser.dw {
             sum += v * v;
@@ -112,7 +115,7 @@ impl PolicyGradients {
 /// Uses full BPTT since episodes are short (~50 steps).
 ///
 /// If `dh_classifier` is provided, it's used as the initial gradient flowing back
-/// from the classifier loss into the final hidden state. This allows classifier
+/// from the classifier loss into the final layer's hidden state. This allows classifier
 /// loss to backpropagate through the entire GRU sequence.
 pub fn compute_episode_gradient(
     policy: &RnnPolicy,
@@ -121,7 +124,7 @@ pub fn compute_episode_gradient(
     dh_classifier: Option<&[f64]>,
 ) -> PolicyGradients {
     if episode.steps.is_empty() {
-        return PolicyGradients::zeros();
+        return PolicyGradients::zeros(policy);
     }
 
     // Compute returns and advantages
@@ -130,40 +133,57 @@ pub fn compute_episode_gradient(
     let advantages = compute_advantages(&returns, baseline);
 
     // Initialize accumulated gradients
-    let mut grads = PolicyGradients::zeros();
+    let mut grads = PolicyGradients::zeros(policy);
 
     // Backward pass through time
-    // We accumulate dL/dh as we go backward
-    // Start with classifier gradient if provided, otherwise zeros
-    let mut dh_next = if let Some(dh_clf) = dh_classifier {
-        dh_clf.to_vec()
-    } else {
-        vec![0.0; HIDDEN_DIM]
-    };
+    // We accumulate dL/dh as we go backward for all layers
+    // Start with classifier gradient (affects final layer only) if provided
+    let mut dh_next: Vec<Vec<f64>> = (0..NUM_LAYERS)
+        .map(|layer_idx| {
+            if layer_idx == NUM_LAYERS - 1 {
+                // Final layer gets classifier gradient if provided
+                dh_classifier.map(|dh| dh.to_vec()).unwrap_or_else(|| vec![0.0; HIDDEN_DIM])
+            } else {
+                vec![0.0; HIDDEN_DIM]
+            }
+        })
+        .collect();
 
     for (t, step) in episode.steps.iter().enumerate().rev() {
-        let advantage = advantages[t];
+        // Skip policy gradient for random exploration steps.
+        // The action was not sampled from the policy, so computing
+        // ∇ log π(random_action) would inject noise into training.
+        // We still backprop dh_next through GRU for classifier gradients.
+        let (dh_final_layer, chooser_grad) = if step.is_random {
+            // Random step: no chooser gradient, only pass through classifier gradient
+            (dh_next[NUM_LAYERS - 1].clone(), ChooserGradients::zeros())
+        } else {
+            // Policy step: compute REINFORCE gradient as normal
+            let advantage = advantages[t];
+            let (cg, dh_from_chooser) =
+                chooser_backward_policy_gradient(&policy.chooser, &step.chooser_cache, advantage);
+            // Combine dL/dh from chooser and from next timestep (includes classifier gradient)
+            let dh: Vec<f64> = dh_from_chooser
+                .iter()
+                .zip(dh_next[NUM_LAYERS - 1].iter())
+                .map(|(&c, &n)| c + n)
+                .collect();
+            (dh, cg)
+        };
 
-        // Chooser backward: get gradients and dL/dh from chooser
-        let (chooser_grad, dh_from_chooser) =
-            chooser_backward_policy_gradient(&policy.chooser, &step.chooser_cache, advantage);
+        // Update final layer's dh_next with chooser contribution
+        let mut dh_for_backward = dh_next.clone();
+        dh_for_backward[NUM_LAYERS - 1] = dh_final_layer;
 
-        // Combine dL/dh from chooser and from next timestep (includes classifier gradient)
-        let dh: Vec<f64> = dh_from_chooser
-            .iter()
-            .zip(dh_next.iter())
-            .map(|(&c, &n)| c + n)
-            .collect();
-
-        // GRU backward: get gradients and dL/dh_prev
-        let (gru_grad, dh_prev) = gru_backward(&policy.gru, &step.gru_cache, &dh);
+        // GRU backward: get gradients and dL/dh_prev for all layers
+        let (gru_grad, dh_prev_all) = gru_backward(&policy.gru, &step.gru_cache, &dh_for_backward[NUM_LAYERS - 1]);
 
         // Accumulate gradients
         grads.gru.add(&gru_grad);
         grads.chooser.add(&chooser_grad);
 
-        // Pass gradient to previous timestep
-        dh_next = dh_prev;
+        // Pass gradient to previous timestep (all layers)
+        dh_next = dh_prev_all;
     }
 
     grads
@@ -181,10 +201,10 @@ pub fn compute_batch_gradient(
     classifier_dh_list: Option<&[Vec<f64>]>,
 ) -> PolicyGradients {
     if episodes.is_empty() {
-        return PolicyGradients::zeros();
+        return PolicyGradients::zeros(policy);
     }
 
-    let mut total_grads = PolicyGradients::zeros();
+    let mut total_grads = PolicyGradients::zeros(policy);
 
     for (i, episode) in episodes.iter().enumerate() {
         let dh_classifier = classifier_dh_list.map(|list| list[i].as_slice());
@@ -200,16 +220,18 @@ pub fn compute_batch_gradient(
 
 /// Apply gradients to policy (gradient ascent for maximizing return).
 pub fn apply_gradients(policy: &mut RnnPolicy, grads: &PolicyGradients, lr: f64) {
-    // GRU weights
-    apply_grad_vec(&mut policy.gru.w_z, &grads.gru.dw_z, lr);
-    apply_grad_vec(&mut policy.gru.u_z, &grads.gru.du_z, lr);
-    apply_grad_vec(&mut policy.gru.b_z, &grads.gru.db_z, lr);
-    apply_grad_vec(&mut policy.gru.w_r, &grads.gru.dw_r, lr);
-    apply_grad_vec(&mut policy.gru.u_r, &grads.gru.du_r, lr);
-    apply_grad_vec(&mut policy.gru.b_r, &grads.gru.db_r, lr);
-    apply_grad_vec(&mut policy.gru.w_h, &grads.gru.dw_h, lr);
-    apply_grad_vec(&mut policy.gru.u_h, &grads.gru.du_h, lr);
-    apply_grad_vec(&mut policy.gru.b_h, &grads.gru.db_h, lr);
+    // GRU weights for all layers
+    for (layer_weights, layer_grads) in policy.gru.layers.iter_mut().zip(grads.gru.layers.iter()) {
+        apply_grad_vec(&mut layer_weights.w_z, &layer_grads.dw_z, lr);
+        apply_grad_vec(&mut layer_weights.u_z, &layer_grads.du_z, lr);
+        apply_grad_vec(&mut layer_weights.b_z, &layer_grads.db_z, lr);
+        apply_grad_vec(&mut layer_weights.w_r, &layer_grads.dw_r, lr);
+        apply_grad_vec(&mut layer_weights.u_r, &layer_grads.du_r, lr);
+        apply_grad_vec(&mut layer_weights.b_r, &layer_grads.db_r, lr);
+        apply_grad_vec(&mut layer_weights.w_h, &layer_grads.dw_h, lr);
+        apply_grad_vec(&mut layer_weights.u_h, &layer_grads.du_h, lr);
+        apply_grad_vec(&mut layer_weights.b_h, &layer_grads.db_h, lr);
+    }
 
     // Chooser weights
     apply_grad_vec(&mut policy.chooser.w, &grads.chooser.dw, lr);
@@ -250,20 +272,20 @@ pub fn numerical_gradient_check(
     let mut max_error: f64 = 0.0;
     let num_checks = 10;
 
-    // Check GRU w_z
-    for i in 0..num_checks.min(policy.gru.w_z.len()) {
-        let orig = policy.gru.w_z[i];
+    // Check GRU layer 0 w_z
+    for i in 0..num_checks.min(policy.gru.layers[0].w_z.len()) {
+        let orig = policy.gru.layers[0].w_z[i];
 
-        policy.gru.w_z[i] = orig + epsilon;
+        policy.gru.layers[0].w_z[i] = orig + epsilon;
         let loss_plus = total_return(episode, discount);
 
-        policy.gru.w_z[i] = orig - epsilon;
+        policy.gru.layers[0].w_z[i] = orig - epsilon;
         let loss_minus = total_return(episode, discount);
 
-        policy.gru.w_z[i] = orig;
+        policy.gru.layers[0].w_z[i] = orig;
 
         let numerical = (loss_plus - loss_minus) / (2.0 * epsilon);
-        let error = (numerical - analytical.gru.dw_z[i]).abs();
+        let error = (numerical - analytical.gru.layers[0].dw_z[i]).abs();
         max_error = max_error.max(error);
     }
 

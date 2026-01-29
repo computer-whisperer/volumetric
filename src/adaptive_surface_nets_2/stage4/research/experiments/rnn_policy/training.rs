@@ -15,7 +15,7 @@ use super::classifier_heads::{
     FACE_HEAD_OUTPUTS,
 };
 use super::gradients::{compute_batch_gradient, PolicyGradients};
-use super::gru::{Rng, HIDDEN_DIM};
+use super::gru::{final_hidden, Rng, HIDDEN_DIM, NUM_LAYERS};
 use super::policy::{run_episode, run_episode_with_exploration, Episode, RnnPolicy, BUDGET, CELL_SIZE, INPUT_DIM};
 use super::reward::{compute_terminal_reward, RewardBreakdown, RewardConfig, TerminalRewardConfig};
 
@@ -114,20 +114,63 @@ impl TrainingConfig {
     }
 }
 
+/// Adam optimizer state for a single GRU layer.
+struct GruLayerAdamState {
+    m_w_z: Vec<f64>,
+    m_u_z: Vec<f64>,
+    m_b_z: Vec<f64>,
+    m_w_r: Vec<f64>,
+    m_u_r: Vec<f64>,
+    m_b_r: Vec<f64>,
+    m_w_h: Vec<f64>,
+    m_u_h: Vec<f64>,
+    m_b_h: Vec<f64>,
+    v_w_z: Vec<f64>,
+    v_u_z: Vec<f64>,
+    v_b_z: Vec<f64>,
+    v_w_r: Vec<f64>,
+    v_u_r: Vec<f64>,
+    v_b_r: Vec<f64>,
+    v_w_h: Vec<f64>,
+    v_u_h: Vec<f64>,
+    v_b_h: Vec<f64>,
+}
+
+impl GruLayerAdamState {
+    fn new(input_dim: usize) -> Self {
+        let h = HIDDEN_DIM;
+        Self {
+            m_w_z: vec![0.0; h * input_dim],
+            m_u_z: vec![0.0; h * h],
+            m_b_z: vec![0.0; h],
+            m_w_r: vec![0.0; h * input_dim],
+            m_u_r: vec![0.0; h * h],
+            m_b_r: vec![0.0; h],
+            m_w_h: vec![0.0; h * input_dim],
+            m_u_h: vec![0.0; h * h],
+            m_b_h: vec![0.0; h],
+            v_w_z: vec![0.0; h * input_dim],
+            v_u_z: vec![0.0; h * h],
+            v_b_z: vec![0.0; h],
+            v_w_r: vec![0.0; h * input_dim],
+            v_u_r: vec![0.0; h * h],
+            v_b_r: vec![0.0; h],
+            v_w_h: vec![0.0; h * input_dim],
+            v_u_h: vec![0.0; h * h],
+            v_b_h: vec![0.0; h],
+        }
+    }
+}
+
 /// Adam optimizer state.
 pub struct AdamState {
-    /// First moment (mean of gradients).
-    m_gru_w_z: Vec<f64>,
-    m_gru_u_z: Vec<f64>,
-    m_gru_b_z: Vec<f64>,
-    m_gru_w_r: Vec<f64>,
-    m_gru_u_r: Vec<f64>,
-    m_gru_b_r: Vec<f64>,
-    m_gru_w_h: Vec<f64>,
-    m_gru_u_h: Vec<f64>,
-    m_gru_b_h: Vec<f64>,
+    /// State for each GRU layer.
+    gru_layers: Vec<GruLayerAdamState>,
+    /// Chooser head state.
     m_chooser_w: Vec<f64>,
     m_chooser_b: Vec<f64>,
+    v_chooser_w: Vec<f64>,
+    v_chooser_b: Vec<f64>,
     // Classifier heads
     m_face_w: Vec<f64>,
     m_face_b: Vec<f64>,
@@ -135,48 +178,30 @@ pub struct AdamState {
     m_edge_b: Vec<f64>,
     m_corner_w: Vec<f64>,
     m_corner_b: Vec<f64>,
-
-    /// Second moment (variance of gradients).
-    v_gru_w_z: Vec<f64>,
-    v_gru_u_z: Vec<f64>,
-    v_gru_b_z: Vec<f64>,
-    v_gru_w_r: Vec<f64>,
-    v_gru_u_r: Vec<f64>,
-    v_gru_b_r: Vec<f64>,
-    v_gru_w_h: Vec<f64>,
-    v_gru_u_h: Vec<f64>,
-    v_gru_b_h: Vec<f64>,
-    v_chooser_w: Vec<f64>,
-    v_chooser_b: Vec<f64>,
-    // Classifier heads
     v_face_w: Vec<f64>,
     v_face_b: Vec<f64>,
     v_edge_w: Vec<f64>,
     v_edge_b: Vec<f64>,
     v_corner_w: Vec<f64>,
     v_corner_b: Vec<f64>,
-
     /// Timestep.
     t: usize,
 }
 
 impl AdamState {
     /// Create new Adam state for the given policy.
-    pub fn new(_policy: &RnnPolicy) -> Self {
+    pub fn new(policy: &RnnPolicy) -> Self {
         let h = HIDDEN_DIM;
-        let i = INPUT_DIM;
         let o = 8; // NUM_OCTANTS
 
+        // Create state for each GRU layer
+        let gru_layers: Vec<_> = policy.gru.layers
+            .iter()
+            .map(|layer| GruLayerAdamState::new(layer.input_dim))
+            .collect();
+
         Self {
-            m_gru_w_z: vec![0.0; h * i],
-            m_gru_u_z: vec![0.0; h * h],
-            m_gru_b_z: vec![0.0; h],
-            m_gru_w_r: vec![0.0; h * i],
-            m_gru_u_r: vec![0.0; h * h],
-            m_gru_b_r: vec![0.0; h],
-            m_gru_w_h: vec![0.0; h * i],
-            m_gru_u_h: vec![0.0; h * h],
-            m_gru_b_h: vec![0.0; h],
+            gru_layers,
             m_chooser_w: vec![0.0; o * h],
             m_chooser_b: vec![0.0; o],
             m_face_w: vec![0.0; FACE_HEAD_OUTPUTS * h],
@@ -186,15 +211,6 @@ impl AdamState {
             m_corner_w: vec![0.0; CORNER_HEAD_OUTPUTS * h],
             m_corner_b: vec![0.0; CORNER_HEAD_OUTPUTS],
 
-            v_gru_w_z: vec![0.0; h * i],
-            v_gru_u_z: vec![0.0; h * h],
-            v_gru_b_z: vec![0.0; h],
-            v_gru_w_r: vec![0.0; h * i],
-            v_gru_u_r: vec![0.0; h * h],
-            v_gru_b_r: vec![0.0; h],
-            v_gru_w_h: vec![0.0; h * i],
-            v_gru_u_h: vec![0.0; h * h],
-            v_gru_b_h: vec![0.0; h],
             v_chooser_w: vec![0.0; o * h],
             v_chooser_b: vec![0.0; o],
             v_face_w: vec![0.0; FACE_HEAD_OUTPUTS * h],
@@ -220,16 +236,24 @@ impl AdamState {
         let bc1 = 1.0 - b1.powi(self.t as i32);
         let bc2 = 1.0 - b2.powi(self.t as i32);
 
-        // Update each parameter group
-        adam_step(&mut policy.gru.w_z, &grads.gru.dw_z, &mut self.m_gru_w_z, &mut self.v_gru_w_z, lr, b1, b2, eps, bc1, bc2);
-        adam_step(&mut policy.gru.u_z, &grads.gru.du_z, &mut self.m_gru_u_z, &mut self.v_gru_u_z, lr, b1, b2, eps, bc1, bc2);
-        adam_step(&mut policy.gru.b_z, &grads.gru.db_z, &mut self.m_gru_b_z, &mut self.v_gru_b_z, lr, b1, b2, eps, bc1, bc2);
-        adam_step(&mut policy.gru.w_r, &grads.gru.dw_r, &mut self.m_gru_w_r, &mut self.v_gru_w_r, lr, b1, b2, eps, bc1, bc2);
-        adam_step(&mut policy.gru.u_r, &grads.gru.du_r, &mut self.m_gru_u_r, &mut self.v_gru_u_r, lr, b1, b2, eps, bc1, bc2);
-        adam_step(&mut policy.gru.b_r, &grads.gru.db_r, &mut self.m_gru_b_r, &mut self.v_gru_b_r, lr, b1, b2, eps, bc1, bc2);
-        adam_step(&mut policy.gru.w_h, &grads.gru.dw_h, &mut self.m_gru_w_h, &mut self.v_gru_w_h, lr, b1, b2, eps, bc1, bc2);
-        adam_step(&mut policy.gru.u_h, &grads.gru.du_h, &mut self.m_gru_u_h, &mut self.v_gru_u_h, lr, b1, b2, eps, bc1, bc2);
-        adam_step(&mut policy.gru.b_h, &grads.gru.db_h, &mut self.m_gru_b_h, &mut self.v_gru_b_h, lr, b1, b2, eps, bc1, bc2);
+        // Update each GRU layer
+        for (layer_idx, (layer_weights, layer_grads)) in policy.gru.layers.iter_mut()
+            .zip(grads.gru.layers.iter())
+            .enumerate()
+        {
+            let state = &mut self.gru_layers[layer_idx];
+            adam_step(&mut layer_weights.w_z, &layer_grads.dw_z, &mut state.m_w_z, &mut state.v_w_z, lr, b1, b2, eps, bc1, bc2);
+            adam_step(&mut layer_weights.u_z, &layer_grads.du_z, &mut state.m_u_z, &mut state.v_u_z, lr, b1, b2, eps, bc1, bc2);
+            adam_step(&mut layer_weights.b_z, &layer_grads.db_z, &mut state.m_b_z, &mut state.v_b_z, lr, b1, b2, eps, bc1, bc2);
+            adam_step(&mut layer_weights.w_r, &layer_grads.dw_r, &mut state.m_w_r, &mut state.v_w_r, lr, b1, b2, eps, bc1, bc2);
+            adam_step(&mut layer_weights.u_r, &layer_grads.du_r, &mut state.m_u_r, &mut state.v_u_r, lr, b1, b2, eps, bc1, bc2);
+            adam_step(&mut layer_weights.b_r, &layer_grads.db_r, &mut state.m_b_r, &mut state.v_b_r, lr, b1, b2, eps, bc1, bc2);
+            adam_step(&mut layer_weights.w_h, &layer_grads.dw_h, &mut state.m_w_h, &mut state.v_w_h, lr, b1, b2, eps, bc1, bc2);
+            adam_step(&mut layer_weights.u_h, &layer_grads.du_h, &mut state.m_u_h, &mut state.v_u_h, lr, b1, b2, eps, bc1, bc2);
+            adam_step(&mut layer_weights.b_h, &layer_grads.db_h, &mut state.m_b_h, &mut state.v_b_h, lr, b1, b2, eps, bc1, bc2);
+        }
+
+        // Chooser head
         adam_step(&mut policy.chooser.w, &grads.chooser.dw, &mut self.m_chooser_w, &mut self.v_chooser_w, lr, b1, b2, eps, bc1, bc2);
         adam_step(&mut policy.chooser.b, &grads.chooser.db, &mut self.m_chooser_b, &mut self.v_chooser_b, lr, b1, b2, eps, bc1, bc2);
 
@@ -386,7 +410,7 @@ fn collect_episodes_parallel(
             // Compute classifier head loss and gradients if enabled
             let (classifier_grads, classifier_dh, classifier_loss, classifier_breakdown) = if config.use_classifier_heads {
                 let expected_geom = expected_to_geometry(&point.expected, point.position);
-                let predictions = policy.classify(&episode.h_final);
+                let predictions = policy.classify(final_hidden(&episode.h_final));
 
                 let (loss, conf_loss, normal_loss, offset_loss, _wrong_loss) = compute_classifier_loss(
                     &predictions,
@@ -403,7 +427,7 @@ fn collect_episodes_parallel(
 
                 let (head_grads, dh) = compute_classifier_gradients(
                     &policy.classifier_heads,
-                    &episode.h_final,
+                    final_hidden(&episode.h_final),
                     &predictions,
                     &expected_geom,
                     &config.classifier_loss,
@@ -473,7 +497,7 @@ fn collect_episodes_parallel(
 
             let (classifier_grads, classifier_dh, classifier_loss, classifier_breakdown) = if config.use_classifier_heads {
                 let expected_geom = expected_to_geometry(&point.expected, point.position);
-                let predictions = policy.classify(&episode.h_final);
+                let predictions = policy.classify(final_hidden(&episode.h_final));
 
                 let (loss, conf_loss, normal_loss, offset_loss, _wrong_loss) = compute_classifier_loss(
                     &predictions,
@@ -490,7 +514,7 @@ fn collect_episodes_parallel(
 
                 let (head_grads, dh) = compute_classifier_gradients(
                     &policy.classifier_heads,
-                    &episode.h_final,
+                    final_hidden(&episode.h_final),
                     &predictions,
                     &expected_geom,
                     &config.classifier_loss,
@@ -580,14 +604,15 @@ pub fn train_policy(
 
         // Compute batch gradient for policy (GRU + Chooser)
         // Pass classifier dh gradients to backpropagate through GRU
-        // IMPORTANT: Negate classifier_dh because:
+        // IMPORTANT: Scale and negate classifier_dh because:
         // - classifier_dh is d_loss/d_h (gradient for minimizing loss)
         // - policy gradient uses gradient ascent (maximizing reward)
-        // - reward = -loss, so d_reward/d_h = -d_loss/d_h
+        // - reward = -0.5 * loss, so d_reward/d_h = -0.5 * d_loss/d_h
+        // The 0.5 factor must match the scaling used in classifier_reward calculation.
         let classifier_dh_negated: Vec<Vec<f64>> = if config.use_classifier_heads {
             classifier_dh_list
                 .iter()
-                .map(|dh| dh.iter().map(|&x| -x).collect())
+                .map(|dh| dh.iter().map(|&x| -0.5 * x).collect())
                 .collect()
         } else {
             Vec::new()

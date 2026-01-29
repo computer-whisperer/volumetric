@@ -1,7 +1,33 @@
-//! GRU (Gated Recurrent Unit) implementation.
+//! Stacked GRU (Gated Recurrent Unit) implementation.
 //!
-//! Implements a GRU cell with forward and backward passes for gradient computation.
-//! The GRU is simpler than LSTM and sufficient for short episodes (~50 steps).
+//! Implements a multi-layer GRU with forward and backward passes for gradient computation.
+//! Each layer processes the output of the previous layer, building hierarchical representations.
+//!
+//! ## Architecture
+//!
+//! ```text
+//! Input x ──► GRU Layer 0 ──► h[0] ──► GRU Layer 1 ──► h[1] ──► ... ──► h[N-1]
+//!                  ▲                        ▲                              │
+//!             h_prev[0]                h_prev[1]                     final output
+//! ```
+//!
+//! - Layer 0: input_dim → hidden_dim
+//! - Layer 1+: hidden_dim → hidden_dim
+//! - Final layer's hidden state is used by downstream heads (chooser, classifier)
+//!
+//! ## Configuration
+//!
+//! - `HIDDEN_DIM`: Size of hidden state per layer (default: 32)
+//! - `NUM_LAYERS`: Number of stacked GRU layers (default: 2)
+//!
+//! ## GRU Equations (per layer)
+//!
+//! ```text
+//! z = sigmoid(W_z @ x + U_z @ h_prev + b_z)       // update gate
+//! r = sigmoid(W_r @ x + U_r @ h_prev + b_r)       // reset gate
+//! h_tilde = tanh(W_h @ x + U_h @ (r * h_prev) + b_h)  // candidate
+//! h = (1 - z) * h_prev + z * h_tilde             // new hidden state
+//! ```
 
 use super::math::{
     matvec, outer_product, vec_add, vec_mul, vec_sigmoid, vec_tanh,
@@ -9,9 +35,12 @@ use super::math::{
 };
 
 /// Hidden dimension for the GRU.
-pub const HIDDEN_DIM: usize = 64;
+pub const HIDDEN_DIM: usize = 32;
 
-/// GRU weights for a single cell.
+/// Number of stacked GRU layers.
+pub const NUM_LAYERS: usize = 2;
+
+/// GRU weights for a single layer.
 ///
 /// GRU equations:
 ///   z = sigmoid(W_z @ x + U_z @ h_prev + b_z)  // update gate
@@ -19,8 +48,8 @@ pub const HIDDEN_DIM: usize = 64;
 ///   h_tilde = tanh(W_h @ x + U_h @ (r * h_prev) + b_h)  // candidate
 ///   h = (1 - z) * h_prev + z * h_tilde  // new hidden state
 #[derive(Clone)]
-pub struct GruWeights {
-    /// Input dimension.
+pub struct GruLayerWeights {
+    /// Input dimension for this layer.
     pub input_dim: usize,
     /// Update gate weights for input: W_z [hidden_dim x input_dim].
     pub w_z: Vec<f64>,
@@ -42,8 +71,8 @@ pub struct GruWeights {
     pub b_h: Vec<f64>,
 }
 
-impl GruWeights {
-    /// Create new GRU weights initialized to small random values.
+impl GruLayerWeights {
+    /// Create new GRU layer weights initialized to small random values.
     pub fn new(input_dim: usize, rng: &mut Rng) -> Self {
         let hidden = HIDDEN_DIM;
         let scale = 0.1;
@@ -62,7 +91,7 @@ impl GruWeights {
         }
     }
 
-    /// Total number of parameters.
+    /// Total number of parameters for this layer.
     pub fn param_count(&self) -> usize {
         let h = HIDDEN_DIM;
         let i = self.input_dim;
@@ -71,12 +100,48 @@ impl GruWeights {
     }
 }
 
-/// Intermediate values from GRU forward pass, needed for backpropagation.
+/// Stacked GRU weights for multiple layers.
+///
+/// Layer 0 takes external input (input_dim), subsequent layers take
+/// the hidden state from the previous layer (hidden_dim).
 #[derive(Clone)]
-pub struct GruCache {
-    /// Input vector.
+pub struct GruWeights {
+    /// Weights for each layer.
+    pub layers: Vec<GruLayerWeights>,
+}
+
+impl GruWeights {
+    /// Create new stacked GRU weights.
+    /// Layer 0: input_dim -> hidden_dim
+    /// Layer 1+: hidden_dim -> hidden_dim
+    pub fn new(input_dim: usize, rng: &mut Rng) -> Self {
+        let mut layers = Vec::with_capacity(NUM_LAYERS);
+
+        for layer_idx in 0..NUM_LAYERS {
+            let layer_input_dim = if layer_idx == 0 { input_dim } else { HIDDEN_DIM };
+            layers.push(GruLayerWeights::new(layer_input_dim, rng));
+        }
+
+        Self { layers }
+    }
+
+    /// Total number of parameters across all layers.
+    pub fn param_count(&self) -> usize {
+        self.layers.iter().map(|l| l.param_count()).sum()
+    }
+
+    /// Get the input dimension (for layer 0).
+    pub fn input_dim(&self) -> usize {
+        self.layers[0].input_dim
+    }
+}
+
+/// Intermediate values from a single GRU layer forward pass.
+#[derive(Clone)]
+pub struct GruLayerCache {
+    /// Input vector to this layer.
     pub x: Vec<f64>,
-    /// Previous hidden state.
+    /// Previous hidden state for this layer.
     pub h_prev: Vec<f64>,
     /// Update gate pre-activation.
     pub z_pre: Vec<f64>,
@@ -92,14 +157,23 @@ pub struct GruCache {
     pub h_tilde: Vec<f64>,
     /// Reset gate applied to h_prev.
     pub r_h_prev: Vec<f64>,
-    /// New hidden state.
+    /// New hidden state for this layer.
     pub h: Vec<f64>,
 }
 
-/// GRU forward pass.
-///
-/// Returns (new_hidden_state, cache_for_backward).
-pub fn gru_forward(weights: &GruWeights, x: &[f64], h_prev: &[f64]) -> (Vec<f64>, GruCache) {
+/// Intermediate values from stacked GRU forward pass.
+#[derive(Clone)]
+pub struct GruCache {
+    /// Cache for each layer.
+    pub layers: Vec<GruLayerCache>,
+}
+
+/// Single GRU layer forward pass.
+fn gru_layer_forward(
+    weights: &GruLayerWeights,
+    x: &[f64],
+    h_prev: &[f64],
+) -> (Vec<f64>, GruLayerCache) {
     let h_dim = HIDDEN_DIM;
 
     // Update gate: z = sigmoid(W_z @ x + U_z @ h_prev + b_z)
@@ -130,7 +204,7 @@ pub fn gru_forward(weights: &GruWeights, x: &[f64], h_prev: &[f64]) -> (Vec<f64>
         .map(|((&omz, &hp), (&zi, &ht))| omz * hp + zi * ht)
         .collect();
 
-    let cache = GruCache {
+    let cache = GruLayerCache {
         x: x.to_vec(),
         h_prev: h_prev.to_vec(),
         z_pre,
@@ -146,9 +220,59 @@ pub fn gru_forward(weights: &GruWeights, x: &[f64], h_prev: &[f64]) -> (Vec<f64>
     (h, cache)
 }
 
-/// Gradients for GRU weights.
+/// Stacked GRU forward pass.
+///
+/// Takes input x and previous hidden states for all layers.
+/// Returns new hidden states for all layers and cache for backward pass.
+///
+/// h_prev should have NUM_LAYERS elements, one per layer.
+/// Returns h_new with NUM_LAYERS elements.
+pub fn gru_forward(
+    weights: &GruWeights,
+    x: &[f64],
+    h_prev: &[Vec<f64>],
+) -> (Vec<Vec<f64>>, GruCache) {
+    debug_assert_eq!(h_prev.len(), NUM_LAYERS);
+    debug_assert_eq!(weights.layers.len(), NUM_LAYERS);
+
+    let mut layer_caches: Vec<GruLayerCache> = Vec::with_capacity(NUM_LAYERS);
+    let mut h_new: Vec<Vec<f64>> = Vec::with_capacity(NUM_LAYERS);
+
+    for layer_idx in 0..NUM_LAYERS {
+        let layer_weights = &weights.layers[layer_idx];
+
+        // Input to this layer: external x for layer 0, previous layer's output otherwise
+        let layer_input: &[f64] = if layer_idx == 0 {
+            x
+        } else {
+            &h_new[layer_idx - 1]
+        };
+
+        let (h_out, cache) = gru_layer_forward(layer_weights, layer_input, &h_prev[layer_idx]);
+        layer_caches.push(cache);
+        h_new.push(h_out);
+    }
+
+    let cache = GruCache {
+        layers: layer_caches,
+    };
+
+    (h_new, cache)
+}
+
+/// Initialize hidden states for all layers (zeros).
+pub fn init_hidden() -> Vec<Vec<f64>> {
+    (0..NUM_LAYERS).map(|_| vec![0.0; HIDDEN_DIM]).collect()
+}
+
+/// Get the final layer's hidden state (for downstream use like classifier).
+pub fn final_hidden(h: &[Vec<f64>]) -> &[f64] {
+    &h[NUM_LAYERS - 1]
+}
+
+/// Gradients for a single GRU layer.
 #[derive(Clone)]
-pub struct GruGradients {
+pub struct GruLayerGradients {
     pub dw_z: Vec<f64>,
     pub du_z: Vec<f64>,
     pub db_z: Vec<f64>,
@@ -160,8 +284,8 @@ pub struct GruGradients {
     pub db_h: Vec<f64>,
 }
 
-impl GruGradients {
-    /// Create zero-initialized gradients.
+impl GruLayerGradients {
+    /// Create zero-initialized gradients for a layer.
     pub fn zeros(input_dim: usize) -> Self {
         let h = HIDDEN_DIM;
         Self {
@@ -178,7 +302,7 @@ impl GruGradients {
     }
 
     /// Add another gradient (for accumulation).
-    pub fn add(&mut self, other: &GruGradients) {
+    pub fn add(&mut self, other: &GruLayerGradients) {
         for (a, b) in self.dw_z.iter_mut().zip(other.dw_z.iter()) {
             *a += b;
         }
@@ -253,6 +377,45 @@ impl GruGradients {
     }
 }
 
+/// Gradients for all GRU layers.
+#[derive(Clone)]
+pub struct GruGradients {
+    pub layers: Vec<GruLayerGradients>,
+}
+
+impl GruGradients {
+    /// Create zero-initialized gradients for all layers.
+    pub fn zeros(weights: &GruWeights) -> Self {
+        let layers = weights
+            .layers
+            .iter()
+            .map(|l| GruLayerGradients::zeros(l.input_dim))
+            .collect();
+        Self { layers }
+    }
+
+    /// Add another gradient (for accumulation).
+    pub fn add(&mut self, other: &GruGradients) {
+        for (a, b) in self.layers.iter_mut().zip(other.layers.iter()) {
+            a.add(b);
+        }
+    }
+
+    /// Scale gradients.
+    pub fn scale(&mut self, s: f64) {
+        for layer in &mut self.layers {
+            layer.scale(s);
+        }
+    }
+
+    /// Clip gradient norms.
+    pub fn clip(&mut self, max_norm: f64) {
+        for layer in &mut self.layers {
+            layer.clip(max_norm);
+        }
+    }
+}
+
 /// Clip vector norm to max_norm.
 fn clip_vec(v: &mut [f64], max_norm: f64) {
     let norm: f64 = v.iter().map(|x| x * x).sum::<f64>().sqrt();
@@ -264,17 +427,14 @@ fn clip_vec(v: &mut [f64], max_norm: f64) {
     }
 }
 
-/// GRU backward pass.
+/// Single GRU layer backward pass.
 ///
-/// Given dL/dh (gradient of loss w.r.t. output hidden state),
-/// computes gradients w.r.t. weights and gradient w.r.t. h_prev.
-///
-/// Returns (gradients, dL/dh_prev).
-pub fn gru_backward(
-    weights: &GruWeights,
-    cache: &GruCache,
+/// Returns (layer_gradients, dL/dh_prev, dL/dx).
+fn gru_layer_backward(
+    weights: &GruLayerWeights,
+    cache: &GruLayerCache,
     dh: &[f64],
-) -> (GruGradients, Vec<f64>) {
+) -> (GruLayerGradients, Vec<f64>, Vec<f64>) {
     let h_dim = HIDDEN_DIM;
 
     // h = (1 - z) * h_prev + z * h_tilde
@@ -339,7 +499,7 @@ pub fn gru_backward(
     let dw_r = outer_product(&dr_pre, &cache.x);
     let du_r = outer_product(&dr_pre, &cache.h_prev);
 
-    // Gradient w.r.t. h_prev
+    // Gradient w.r.t. h_prev (for BPTT to previous timestep)
     // From: h = (1 - z) * h_prev + z * h_tilde
     let dh_prev_from_h: Vec<f64> = dh
         .iter()
@@ -360,14 +520,26 @@ pub fn gru_backward(
         .map(|(&drh, &ri)| drh * ri)
         .collect();
 
-    // Sum all contributions
+    // Sum all contributions to dh_prev
     let dh_prev: Vec<f64> = (0..h_dim)
         .map(|i| {
             dh_prev_from_h[i] + dh_prev_from_z[i] + dh_prev_from_r[i] + dh_prev_from_rh[i]
         })
         .collect();
 
-    let grads = GruGradients {
+    // Gradient w.r.t. input x (for backprop to previous layer)
+    // From: z_pre = W_z @ x + ...
+    let dx_from_z = matvec_transpose(&weights.w_z, &dz_pre, h_dim, weights.input_dim);
+    // From: r_pre = W_r @ x + ...
+    let dx_from_r = matvec_transpose(&weights.w_r, &dr_pre, h_dim, weights.input_dim);
+    // From: h_tilde_pre = W_h @ x + ...
+    let dx_from_h = matvec_transpose(&weights.w_h, &dh_tilde_pre, h_dim, weights.input_dim);
+
+    let dx: Vec<f64> = (0..weights.input_dim)
+        .map(|i| dx_from_z[i] + dx_from_r[i] + dx_from_h[i])
+        .collect();
+
+    let grads = GruLayerGradients {
         dw_z,
         du_z,
         db_z,
@@ -379,7 +551,47 @@ pub fn gru_backward(
         db_h,
     };
 
-    (grads, dh_prev)
+    (grads, dh_prev, dx)
+}
+
+/// Stacked GRU backward pass.
+///
+/// Given dL/dh for the final layer output, computes gradients for all layers
+/// and returns dL/dh_prev for all layers (needed for BPTT).
+///
+/// Returns (gradients, dL/dh_prev for all layers).
+pub fn gru_backward(
+    weights: &GruWeights,
+    cache: &GruCache,
+    dh_final: &[f64],
+) -> (GruGradients, Vec<Vec<f64>>) {
+    let mut layer_grads = vec![];
+    let mut dh_prev_all = vec![vec![]; NUM_LAYERS];
+
+    // Backprop through layers in reverse order
+    let mut dh_current = dh_final.to_vec();
+
+    for layer_idx in (0..NUM_LAYERS).rev() {
+        let (layer_grad, dh_prev, dx) = gru_layer_backward(
+            &weights.layers[layer_idx],
+            &cache.layers[layer_idx],
+            &dh_current,
+        );
+        layer_grads.push(layer_grad);
+        dh_prev_all[layer_idx] = dh_prev;
+
+        // dx becomes dh for the previous layer (if any)
+        if layer_idx > 0 {
+            dh_current = dx;
+        }
+    }
+
+    // Reverse layer_grads since we collected them in reverse order
+    layer_grads.reverse();
+
+    let grads = GruGradients { layers: layer_grads };
+
+    (grads, dh_prev_all)
 }
 
 /// Transpose matrix-vector multiplication: result = M^T @ v.
@@ -492,14 +704,23 @@ mod tests {
         let weights = GruWeights::new(input_dim, &mut rng);
 
         let x = vec![0.1; input_dim];
-        let h_prev = vec![0.0; HIDDEN_DIM];
+        let h_prev = init_hidden();
 
         let (h, cache) = gru_forward(&weights, &x, &h_prev);
 
-        assert_eq!(h.len(), HIDDEN_DIM);
-        assert_eq!(cache.z.len(), HIDDEN_DIM);
-        assert_eq!(cache.r.len(), HIDDEN_DIM);
-        assert_eq!(cache.h_tilde.len(), HIDDEN_DIM);
+        // h should have NUM_LAYERS entries
+        assert_eq!(h.len(), NUM_LAYERS);
+        for layer_h in &h {
+            assert_eq!(layer_h.len(), HIDDEN_DIM);
+        }
+
+        // cache should have NUM_LAYERS layer caches
+        assert_eq!(cache.layers.len(), NUM_LAYERS);
+        for layer_cache in &cache.layers {
+            assert_eq!(layer_cache.z.len(), HIDDEN_DIM);
+            assert_eq!(layer_cache.r.len(), HIDDEN_DIM);
+            assert_eq!(layer_cache.h_tilde.len(), HIDDEN_DIM);
+        }
     }
 
     #[test]
@@ -509,17 +730,31 @@ mod tests {
         let weights = GruWeights::new(input_dim, &mut rng);
 
         let x = vec![0.1; input_dim];
-        let h_prev = vec![0.0; HIDDEN_DIM];
+        let h_prev = init_hidden();
 
         let (h, cache) = gru_forward(&weights, &x, &h_prev);
-        let dh = vec![1.0; HIDDEN_DIM];
+        let dh = vec![1.0; HIDDEN_DIM]; // gradient for final layer output
 
-        let (grads, dh_prev) = gru_backward(&weights, &cache, &dh);
+        let (grads, dh_prev_all) = gru_backward(&weights, &cache, &dh);
 
-        assert_eq!(dh_prev.len(), HIDDEN_DIM);
-        assert_eq!(grads.dw_z.len(), HIDDEN_DIM * input_dim);
-        assert_eq!(grads.du_z.len(), HIDDEN_DIM * HIDDEN_DIM);
-        assert_eq!(grads.db_z.len(), HIDDEN_DIM);
+        // dh_prev_all should have NUM_LAYERS entries
+        assert_eq!(dh_prev_all.len(), NUM_LAYERS);
+        for dh_prev in &dh_prev_all {
+            assert_eq!(dh_prev.len(), HIDDEN_DIM);
+        }
+
+        // grads should have NUM_LAYERS layer gradients
+        assert_eq!(grads.layers.len(), NUM_LAYERS);
+
+        // Layer 0 has input_dim inputs
+        assert_eq!(grads.layers[0].dw_z.len(), HIDDEN_DIM * input_dim);
+        assert_eq!(grads.layers[0].du_z.len(), HIDDEN_DIM * HIDDEN_DIM);
+        assert_eq!(grads.layers[0].db_z.len(), HIDDEN_DIM);
+
+        // Layer 1+ has HIDDEN_DIM inputs
+        for layer_idx in 1..NUM_LAYERS {
+            assert_eq!(grads.layers[layer_idx].dw_z.len(), HIDDEN_DIM * HIDDEN_DIM);
+        }
     }
 
     #[test]
@@ -528,8 +763,39 @@ mod tests {
         let input_dim = 10;
         let weights = GruWeights::new(input_dim, &mut rng);
         let count = weights.param_count();
-        // 3 * (32*10 + 32*32 + 32) = 3 * (320 + 1024 + 32) = 3 * 1376 = 4128
-        assert_eq!(count, 3 * (HIDDEN_DIM * input_dim + HIDDEN_DIM * HIDDEN_DIM + HIDDEN_DIM));
+
+        // Layer 0: 3 * (hidden*input + hidden*hidden + hidden)
+        let layer0_params = 3 * (HIDDEN_DIM * input_dim + HIDDEN_DIM * HIDDEN_DIM + HIDDEN_DIM);
+        // Layer 1+: 3 * (hidden*hidden + hidden*hidden + hidden)
+        let layern_params = 3 * (HIDDEN_DIM * HIDDEN_DIM + HIDDEN_DIM * HIDDEN_DIM + HIDDEN_DIM);
+
+        let expected = layer0_params + (NUM_LAYERS - 1) * layern_params;
+        assert_eq!(count, expected);
+    }
+
+    #[test]
+    fn test_init_hidden() {
+        let h = init_hidden();
+        assert_eq!(h.len(), NUM_LAYERS);
+        for layer_h in &h {
+            assert_eq!(layer_h.len(), HIDDEN_DIM);
+            for &val in layer_h {
+                assert_eq!(val, 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn test_final_hidden() {
+        let mut h = init_hidden();
+        // Put some values in final layer
+        h[NUM_LAYERS - 1][0] = 1.5;
+        h[NUM_LAYERS - 1][1] = 2.5;
+
+        let final_h = final_hidden(&h);
+        assert_eq!(final_h.len(), HIDDEN_DIM);
+        assert_eq!(final_h[0], 1.5);
+        assert_eq!(final_h[1], 2.5);
     }
 
     #[test]

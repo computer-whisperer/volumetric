@@ -1,24 +1,63 @@
-//! RNN-Based Sampling Policy MVP
+//! RNN-Based Sampling Policy for Geometry Classification
 //!
-//! This module implements an RNN policy that learns WHERE to sample in a cubic
-//! volume around a vertex, replacing the fixed-direction sampling approaches.
+//! This module implements an RNN policy that learns to sample points in a cubic
+//! volume around a vertex and classify the local geometry (face/edge/corner).
 //!
 //! ## Architecture
 //!
-//! - **GRU Updater**: `(latent[32], input[~10]) → new_latent[32]`
-//!   - Takes normalized position, in/out status, oracle distance, budget fraction
-//!   - GRU chosen over LSTM (simpler, sufficient for short episodes ~50 steps)
+//! ```text
+//! Input Features (5D):
+//!   - prev_sample_offset (3D): normalized position of last sample
+//!   - in_out_sign (1D): +1 inside, -1 outside
+//!   - budget_remaining (1D): fraction of samples left
 //!
-//! - **Chooser Head**: `latent[32] → octant_weights[8] → position`
-//!   - Linear layer outputs 8 weights for cube corners
-//!   - Position = weighted average of corners (vertex ± 0.5*cell_size)
+//! Stacked GRU (configurable depth):
+//!   Layer 0: input[5] → hidden[32]
+//!   Layer 1+: hidden[32] → hidden[32]
+//!   Constants: HIDDEN_DIM=32, NUM_LAYERS=2
+//!
+//! Heads (from final layer hidden state):
+//!   - Chooser: hidden[32] → octant_weights[8] → sample position
+//!   - Classifier: hidden[32] → face/edge/corner predictions
+//!     - Face head: confidence + normal[3] + offset = 5 outputs
+//!     - Edge head: confidence + normal1[3] + normal2[3] + offsets[2] + corner_offsets[3] = 12 outputs
+//!     - Corner head: confidence + normals[9] + offsets[3] = 13 outputs
+//! ```
 //!
 //! ## Training
 //!
-//! - REINFORCE with baseline
-//! - Adam optimizer, lr ~0.001
+//! - **Policy**: REINFORCE with baseline, gradient ascent (Adam)
+//! - **Classifier**: Cross-entropy + normal/offset losses, gradient descent (Adam)
 //! - Gradient clipping at 1.0
-//! - Full BPTT (episodes are short, no truncation needed)
+//! - Full BPTT (episodes are short, ~50 steps)
+//! - Optional exploration schedule: 100% random → 0% random cooling
+//!
+//! ## Experimental Findings
+//!
+//! With random sampling (100% exploration), the model achieves:
+//! - ~50% classification accuracy (predicts "edge" for almost everything)
+//! - Loss plateaus at conf_loss ≈ 0.49 (close to theoretical minimum for edge-biased prior)
+//!
+//! Experiments showed that neither increased capacity nor depth significantly improves accuracy:
+//!
+//! | Config | Accuracy | Face | Edge | Corner | Loss | Time |
+//! |--------|----------|------|------|--------|------|------|
+//! | 1-layer h=64 | 50% | 0% | 100% | 12% | 31.3 | 1650s |
+//! | 2-layer h=32 | 50% | 0% | 100% | 12% | 30.7 | 209s |
+//! | 8-layer h=32 | 48% | 8% | 96% | 6% | 31.8 | 1104s |
+//! | 2x samples (100) | 48% | 0% | 100% | 6% | - | - |
+//! | 2x latent (128) | 50% | 0% | 100% | 12% | - | - |
+//!
+//! **Notable**: 8-layer was the first to classify any faces (1/12), suggesting deeper
+//! processing can extract weak signals. However, it suffered from delayed learning
+//! (vanishing gradients through 8 layers) and didn't improve overall accuracy.
+//!
+//! **Bottleneck**: Input features `(position, in_out, budget)` lack class-discriminative
+//! information. The RNN aggregates data but cannot distinguish geometry types from
+//! randomly scattered inside/outside samples alone.
+//!
+//! **Next direction**: Attention mechanisms to let samples "look at" each other and
+//! find geometric patterns (e.g., planar clusters for faces, linear clusters for edges).
 //!
 //! ## Usage
 //!
@@ -52,7 +91,7 @@ use crate::adaptive_surface_nets_2::stage4::research::validation::generate_valid
 use crate::sample_cloud::{SampleCloudDump, SampleCloudSet};
 
 use classifier_heads::{compute_classifier_loss, ClassifierLossConfig, ExpectedGeometry, GeometryType};
-use gru::Rng;
+use gru::{final_hidden, Rng};
 use policy::{run_episode, run_episode_with_exploration, RnnPolicy};
 use reward::RewardConfig;
 use training::{train_policy, evaluate_policy, TrainingConfig};
@@ -114,7 +153,7 @@ pub fn run_rnn_policy_experiment_with_epochs(epochs: usize, print_every: usize) 
         for (idx, point) in points.iter().enumerate() {
             // Use stochastic=true to match training behavior
             let episode = run_episode(policy, cube, point, idx, rng, true, &reward_config);
-            let predictions = policy.classify(&episode.h_final);
+            let predictions = policy.classify(final_hidden(&episode.h_final));
 
             let expected_geom = ExpectedGeometry::from_classification(&point.expected, point.position);
 
@@ -181,7 +220,7 @@ fn print_classifier_breakdown(
     for (idx, point) in points.iter().enumerate() {
         // Use stochastic=true to match training behavior
         let episode = run_episode(policy, cube, point, idx, rng, true, reward_config);
-        let predictions = policy.classify(&episode.h_final);
+        let predictions = policy.classify(final_hidden(&episode.h_final));
         let predicted_type = predictions.predicted_type();
 
         let expected_type = match &point.expected {
@@ -526,13 +565,16 @@ pub fn dump_random_sampling_sample_cloud(output_path: &Path) {
     let reward_config = RewardConfig::default();
 
     let epochs = 6000;
-    let lr = 0.0001;
+    let lr = 0.0001;  // Back to baseline for experiments
 
-    // Boost classification weight
+    // Heavily boost classification weight to prioritize class accuracy over geometry fit
+    // Normal/offset losses only train the correct head, so they don't help classification
+    // Use inverse frequency class weights: Face=4.3, Edge=2.2, Corner=3.25 (52/count)
     let classifier_loss = ClassifierLossConfig {
-        w_correct_conf: 5.0,
+        w_correct_conf: 20.0,  // Dominant: must classify correctly first
         w_normal: 5.0,
         w_offset: 2.0,
+        class_weights: [4.3, 2.2, 3.25],  // Inverse frequency: Face 12, Edge 24, Corner 16
         ..Default::default()
     };
 
@@ -544,7 +586,7 @@ pub fn dump_random_sampling_sample_cloud(output_path: &Path) {
 
     let config = TrainingConfig {
         epochs,
-        print_every: 1000,
+        print_every: 500,  // More frequent to see trajectory
         lr,
         use_classifier_heads: true,
         use_exploration_schedule: true,
@@ -664,7 +706,7 @@ fn evaluate_classifier_heads_with_options(
         } else {
             run_episode(policy, cube, point, idx, rng, false, reward_config)
         };
-        let predictions = policy.classify(&episode.h_final);
+        let predictions = policy.classify(final_hidden(&episode.h_final));
 
         let expected_geom = ExpectedGeometry::from_classification(&point.expected, point.position);
 
@@ -912,7 +954,7 @@ fn dump_rnn_policy_sample_cloud_with_options(
         let samples = end_sample_recording();
 
         // Run classifier on final hidden state
-        let predictions = policy.classify(&episode.h_final);
+        let predictions = policy.classify(final_hidden(&episode.h_final));
         let predicted_type = predictions.predicted_type();
         let confs = predictions.confidences();
 
@@ -1389,7 +1431,7 @@ fn print_confidence_accuracy_table(
 
     for (idx, point) in points.iter().enumerate() {
         let episode = run_episode(policy, cube, point, idx, rng, false, reward_config);
-        let predictions = policy.classify(&episode.h_final);
+        let predictions = policy.classify(final_hidden(&episode.h_final));
         let predicted_type = predictions.predicted_type();
 
         let expected_type = match &point.expected {

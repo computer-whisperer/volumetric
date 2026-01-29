@@ -12,7 +12,7 @@ use super::chooser::{
     ChooserWeights,
 };
 use super::classifier_heads::{ClassifierHeads, ClassifierPredictions};
-use super::gru::{gru_forward, GruCache, GruWeights, Rng, HIDDEN_DIM};
+use super::gru::{gru_forward, init_hidden, final_hidden, GruCache, GruWeights, Rng, HIDDEN_DIM, NUM_LAYERS};
 use super::math::argmax;
 use super::reward::{compute_step_reward_with_breakdown, compute_step_reward_with_entropy, RewardBreakdown, RewardConfig};
 
@@ -59,13 +59,14 @@ impl RnnPolicy {
         use std::io::Write;
         let mut file = std::fs::File::create(path)?;
 
-        // Write magic and version (bump to v2 for classifier heads)
+        // Write magic and version (v3 for stacked GRU)
         file.write_all(b"RNNP")?;
-        file.write_all(&2u32.to_le_bytes())?;
+        file.write_all(&3u32.to_le_bytes())?;
 
         // Write dimensions
         file.write_all(&(INPUT_DIM as u32).to_le_bytes())?;
         file.write_all(&(HIDDEN_DIM as u32).to_le_bytes())?;
+        file.write_all(&(NUM_LAYERS as u32).to_le_bytes())?;
 
         // Helper to write a Vec<f64>
         let write_vec = |f: &mut std::fs::File, v: &[f64]| -> std::io::Result<()> {
@@ -76,22 +77,24 @@ impl RnnPolicy {
             Ok(())
         };
 
-        // GRU weights
-        write_vec(&mut file, &self.gru.w_z)?;
-        write_vec(&mut file, &self.gru.u_z)?;
-        write_vec(&mut file, &self.gru.b_z)?;
-        write_vec(&mut file, &self.gru.w_r)?;
-        write_vec(&mut file, &self.gru.u_r)?;
-        write_vec(&mut file, &self.gru.b_r)?;
-        write_vec(&mut file, &self.gru.w_h)?;
-        write_vec(&mut file, &self.gru.u_h)?;
-        write_vec(&mut file, &self.gru.b_h)?;
+        // GRU weights for all layers
+        for layer in &self.gru.layers {
+            write_vec(&mut file, &layer.w_z)?;
+            write_vec(&mut file, &layer.u_z)?;
+            write_vec(&mut file, &layer.b_z)?;
+            write_vec(&mut file, &layer.w_r)?;
+            write_vec(&mut file, &layer.u_r)?;
+            write_vec(&mut file, &layer.b_r)?;
+            write_vec(&mut file, &layer.w_h)?;
+            write_vec(&mut file, &layer.u_h)?;
+            write_vec(&mut file, &layer.b_h)?;
+        }
 
         // Chooser weights
         write_vec(&mut file, &self.chooser.w)?;
         write_vec(&mut file, &self.chooser.b)?;
 
-        // Classifier head weights (v2+)
+        // Classifier head weights
         write_vec(&mut file, &self.classifier_heads.face.w)?;
         write_vec(&mut file, &self.classifier_heads.face.b)?;
         write_vec(&mut file, &self.classifier_heads.edge.w)?;
@@ -106,6 +109,7 @@ impl RnnPolicy {
     pub fn load(path: &std::path::Path) -> std::io::Result<Self> {
         use std::io::Read;
         use super::classifier_heads::{HeadWeights, FACE_HEAD_OUTPUTS, EDGE_HEAD_OUTPUTS, CORNER_HEAD_OUTPUTS};
+        use super::gru::GruLayerWeights;
 
         let mut file = std::fs::File::open(path)?;
 
@@ -123,10 +127,10 @@ impl RnnPolicy {
         let mut version = [0u8; 4];
         file.read_exact(&mut version)?;
         let version = u32::from_le_bytes(version);
-        if version != 1 && version != 2 {
+        if version != 3 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Unsupported RNN policy version: {}", version),
+                format!("Unsupported RNN policy version: {} (only v3 supported for stacked GRU)", version),
             ));
         }
 
@@ -136,13 +140,15 @@ impl RnnPolicy {
         let input_dim = u32::from_le_bytes(buf4) as usize;
         file.read_exact(&mut buf4)?;
         let hidden_dim = u32::from_le_bytes(buf4) as usize;
+        file.read_exact(&mut buf4)?;
+        let num_layers = u32::from_le_bytes(buf4) as usize;
 
-        if input_dim != INPUT_DIM || hidden_dim != HIDDEN_DIM {
+        if input_dim != INPUT_DIM || hidden_dim != HIDDEN_DIM || num_layers != NUM_LAYERS {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
-                    "Dimension mismatch: file has input={} hidden={}, expected input={} hidden={}",
-                    input_dim, hidden_dim, INPUT_DIM, HIDDEN_DIM
+                    "Dimension mismatch: file has input={} hidden={} layers={}, expected input={} hidden={} layers={}",
+                    input_dim, hidden_dim, num_layers, INPUT_DIM, HIDDEN_DIM, NUM_LAYERS
                 ),
             ));
         }
@@ -161,56 +167,22 @@ impl RnnPolicy {
             Ok(vec)
         };
 
-        // GRU weights
-        let w_z = read_vec(&mut file)?;
-        let u_z = read_vec(&mut file)?;
-        let b_z = read_vec(&mut file)?;
-        let w_r = read_vec(&mut file)?;
-        let u_r = read_vec(&mut file)?;
-        let b_r = read_vec(&mut file)?;
-        let w_h = read_vec(&mut file)?;
-        let u_h = read_vec(&mut file)?;
-        let b_h = read_vec(&mut file)?;
+        // GRU weights for all layers
+        let mut gru_layers = Vec::with_capacity(num_layers);
+        for layer_idx in 0..num_layers {
+            let layer_input_dim = if layer_idx == 0 { INPUT_DIM } else { HIDDEN_DIM };
+            let w_z = read_vec(&mut file)?;
+            let u_z = read_vec(&mut file)?;
+            let b_z = read_vec(&mut file)?;
+            let w_r = read_vec(&mut file)?;
+            let u_r = read_vec(&mut file)?;
+            let b_r = read_vec(&mut file)?;
+            let w_h = read_vec(&mut file)?;
+            let u_h = read_vec(&mut file)?;
+            let b_h = read_vec(&mut file)?;
 
-        // Chooser weights
-        let chooser_w = read_vec(&mut file)?;
-        let chooser_b = read_vec(&mut file)?;
-
-        // Classifier head weights (v2+), or initialize randomly for v1
-        let classifier_heads = if version >= 2 {
-            let face_w = read_vec(&mut file)?;
-            let face_b = read_vec(&mut file)?;
-            let edge_w = read_vec(&mut file)?;
-            let edge_b = read_vec(&mut file)?;
-            let corner_w = read_vec(&mut file)?;
-            let corner_b = read_vec(&mut file)?;
-
-            ClassifierHeads {
-                face: HeadWeights {
-                    w: face_w,
-                    b: face_b,
-                    output_dim: FACE_HEAD_OUTPUTS,
-                },
-                edge: HeadWeights {
-                    w: edge_w,
-                    b: edge_b,
-                    output_dim: EDGE_HEAD_OUTPUTS,
-                },
-                corner: HeadWeights {
-                    w: corner_w,
-                    b: corner_b,
-                    output_dim: CORNER_HEAD_OUTPUTS,
-                },
-            }
-        } else {
-            // v1 file: initialize classifier heads randomly
-            let mut rng = Rng::new(42);
-            ClassifierHeads::new(&mut rng)
-        };
-
-        Ok(Self {
-            gru: GruWeights {
-                input_dim: INPUT_DIM,
+            gru_layers.push(GruLayerWeights {
+                input_dim: layer_input_dim,
                 w_z,
                 u_z,
                 b_z,
@@ -220,7 +192,41 @@ impl RnnPolicy {
                 w_h,
                 u_h,
                 b_h,
+            });
+        }
+
+        // Chooser weights
+        let chooser_w = read_vec(&mut file)?;
+        let chooser_b = read_vec(&mut file)?;
+
+        // Classifier head weights
+        let face_w = read_vec(&mut file)?;
+        let face_b = read_vec(&mut file)?;
+        let edge_w = read_vec(&mut file)?;
+        let edge_b = read_vec(&mut file)?;
+        let corner_w = read_vec(&mut file)?;
+        let corner_b = read_vec(&mut file)?;
+
+        let classifier_heads = ClassifierHeads {
+            face: HeadWeights {
+                w: face_w,
+                b: face_b,
+                output_dim: FACE_HEAD_OUTPUTS,
             },
+            edge: HeadWeights {
+                w: edge_w,
+                b: edge_b,
+                output_dim: EDGE_HEAD_OUTPUTS,
+            },
+            corner: HeadWeights {
+                w: corner_w,
+                b: corner_b,
+                output_dim: CORNER_HEAD_OUTPUTS,
+            },
+        };
+
+        Ok(Self {
+            gru: GruWeights { layers: gru_layers },
             chooser: super::chooser::ChooserWeights {
                 w: chooser_w,
                 b: chooser_b,
@@ -251,6 +257,10 @@ pub struct EpisodeStep {
     pub is_crossing: bool,
     /// Reward received.
     pub reward: f64,
+    /// Whether this step used random exploration (not policy-selected).
+    /// When true, policy gradients should not be computed for this step
+    /// since the action was not sampled from the policy distribution.
+    pub is_random: bool,
 }
 
 /// Complete episode trace for training.
@@ -268,10 +278,10 @@ pub struct Episode {
     pub final_samples: Vec<(f64, f64, f64)>,
     /// Inside/outside flags for each sample (for terminal reward).
     pub inside_flags: Vec<bool>,
-    /// Initial hidden state.
-    pub h_init: Vec<f64>,
-    /// Final hidden state (for classifier heads).
-    pub h_final: Vec<f64>,
+    /// Initial hidden state (one per layer).
+    pub h_init: Vec<Vec<f64>>,
+    /// Final hidden state (one per layer, last layer used for classifier heads).
+    pub h_final: Vec<Vec<f64>>,
     /// Terminal reward (classifier-based, computed after episode).
     pub terminal_reward: f64,
     /// Accumulated reward breakdown for diagnostics.
@@ -336,8 +346,8 @@ pub fn run_episode_with_exploration(
     };
     let cache = SampleCache::new(sampler);
 
-    // Initialize state
-    let mut h = vec![0.0; HIDDEN_DIM];
+    // Initialize state (one hidden state per layer)
+    let mut h = init_hidden();
     let h_init = h.clone();
     let mut samples: Vec<(f64, f64, f64)> = Vec::new();
     let mut inside_flags: Vec<bool> = Vec::new();
@@ -361,17 +371,17 @@ pub fn run_episode_with_exploration(
             CELL_SIZE,
         );
 
-        // GRU forward
+        // GRU forward (stacked layers)
         let (new_h, gru_cache) = gru_forward(&policy.gru, &input, &h);
         h = new_h;
 
-        // Chooser forward
-        let (_logits, probs, mut chooser_cache) = chooser_forward(&policy.chooser, &h);
+        // Chooser forward (uses final layer's hidden state)
+        let (_logits, probs, mut chooser_cache) = chooser_forward(&policy.chooser, final_hidden(&h));
 
         // Select action and compute sample position
         // When exploration_rate > 0, some fraction of samples use uniform random positions
         // to encourage diverse sampling for training the classifier heads early on.
-        let (action, sample_pos) = if exploration_rate > 0.0 && rng.next_f64() < exploration_rate {
+        let (action, sample_pos, is_random) = if exploration_rate > 0.0 && rng.next_f64() < exploration_rate {
             // Random exploration: uniform random position within the cell
             // Generate random offsets in [-0.5, 0.5] * CELL_SIZE from vertex
             let rx = (rng.next_f64() - 0.5) * CELL_SIZE;
@@ -382,19 +392,20 @@ pub fn run_episode_with_exploration(
                 point.position.1 + ry,
                 point.position.2 + rz,
             );
-            // Action is arbitrary for random exploration (not used for gradient)
+            // Action is arbitrary for random exploration - policy gradients are skipped
+            // for this step since the action was not sampled from the policy.
             let action = (rng.next_f64() * 8.0) as usize % 8;
-            (action, pos)
+            (action, pos, true)
         } else if stochastic {
             // Policy-based with stochastic sampling
             let action = sample_categorical(&probs, rng);
             let pos = position_from_probs(&probs, &corners);
-            (action, pos)
+            (action, pos, false)
         } else {
             // Deterministic: argmax
             let action = argmax(&probs);
             let pos = position_from_probs(&probs, &corners);
-            (action, pos)
+            (action, pos, false)
         };
         chooser_cache.action = action;
 
@@ -455,6 +466,7 @@ pub fn run_episode_with_exploration(
             oracle_distance,
             is_crossing,
             reward,
+            is_random,
         });
     }
 
@@ -523,16 +535,18 @@ mod tests {
         let mut rng = Rng::new(42);
         let policy = RnnPolicy::new(&mut rng);
         let count = policy.param_count();
-        // With INPUT_DIM=5, HIDDEN_DIM=32, NUM_OCTANTS=8:
-        // GRU: 3 * (32*5 + 32*32 + 32) = 3 * (160 + 1024 + 32) = 3 * 1216 = 3648
+        // With INPUT_DIM=5, HIDDEN_DIM=32, NUM_LAYERS=2, NUM_OCTANTS=8:
+        // GRU Layer 0: 3 * (32*5 + 32*32 + 32) = 3 * 1216 = 3648
+        // GRU Layer 1: 3 * (32*32 + 32*32 + 32) = 3 * 2080 = 6240
+        // Total GRU: 9888
         // Chooser: 8*32 + 8 = 264
         // Classifier heads:
         //   Face: 5*32 + 5 = 165
         //   Edge: 12*32 + 12 = 396
         //   Corner: 13*32 + 13 = 429
         //   Total: 990
-        // Grand total: 3648 + 264 + 990 = 4902
-        assert!(count > 4500 && count < 5200, "param_count={}", count);
+        // Grand total: 9888 + 264 + 990 = 11142
+        assert!(count > 10000 && count < 12000, "param_count={}", count);
     }
 
     #[test]
