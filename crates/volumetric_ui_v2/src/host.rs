@@ -213,7 +213,10 @@ impl ApplicationHandler for Host {
                                 mouse_delta: Vec2::new(lx - last_x, ly - last_y),
                                 scroll_delta: 0.0,
                             };
-                            if gfx.viewport_renderer.apply_camera_input(&input) {
+                            if gfx
+                                .viewport_renderer
+                                .apply_camera_input(&input, self.app.camera_control_scheme())
+                            {
                                 gfx.window.request_redraw();
                             }
                             self.last_camera_pointer = Some((lx, ly));
@@ -267,12 +270,16 @@ impl ApplicationHandler for Host {
                         let Some((lx, ly)) = self.last_pointer else {
                             return;
                         };
-                        let dy = match delta {
-                            MouseScrollDelta::LineDelta(_, y) => -y * 50.0,
-                            MouseScrollDelta::PixelDelta(p) => -(p.y as f32) / scale,
+                        let (dy, camera_scroll_delta) = match delta {
+                            MouseScrollDelta::LineDelta(_, y) => (-y * 50.0, y),
+                            MouseScrollDelta::PixelDelta(p) => {
+                                let logical_y = p.y as f32 / scale;
+                                (-logical_y, logical_y / 50.0)
+                            }
                         };
                         if pointer_in_rect(self.last_viewport_rect, lx, ly) {
-                            gfx.viewport_renderer.zoom_camera(-dy * 0.001);
+                            gfx.viewport_renderer
+                                .zoom_camera(camera_scroll_delta, self.app.camera_control_scheme());
                             gfx.window.request_redraw();
                         }
                         if gfx.aetna.pointer_wheel(lx, ly, dy) {
@@ -600,12 +607,16 @@ impl ViewportRenderer {
         pass.draw(0..3, 0..1);
     }
 
-    fn apply_camera_input(&mut self, input: &renderer::CameraInputState) -> bool {
+    fn apply_camera_input(
+        &mut self,
+        input: &renderer::CameraInputState,
+        scheme: renderer::CameraControlScheme,
+    ) -> bool {
         let Some(camera) = &mut self.camera else {
             return false;
         };
 
-        match viewport_camera_action(input) {
+        match scheme.determine_action(input) {
             renderer::CameraAction::Orbit => {
                 camera.orbit(-input.mouse_delta.x * 0.01, -input.mouse_delta.y * 0.01);
                 true
@@ -616,7 +627,7 @@ impl ViewportRenderer {
             }
             renderer::CameraAction::Zoom => {
                 let zoom_delta = if input.scroll_delta != 0.0 {
-                    input.scroll_delta * 0.01
+                    input.scroll_delta * 0.5
                 } else {
                     input.mouse_delta.x * 0.02
                 };
@@ -627,12 +638,12 @@ impl ViewportRenderer {
         }
     }
 
-    fn zoom_camera(&mut self, scroll_delta: f32) {
+    fn zoom_camera(&mut self, scroll_delta: f32, scheme: renderer::CameraControlScheme) {
         let input = renderer::CameraInputState {
             scroll_delta,
             ..Default::default()
         };
-        let _ = self.apply_camera_input(&input);
+        let _ = self.apply_camera_input(&input, scheme);
     }
 
     fn scene_for_request(
@@ -677,18 +688,6 @@ impl ViewportRenderer {
             .get_or_insert_with(renderer::test_scenes::create_test_camera)
             .clone();
         (scene, camera)
-    }
-}
-
-fn viewport_camera_action(input: &renderer::CameraInputState) -> renderer::CameraAction {
-    if input.scroll_delta != 0.0 {
-        renderer::CameraAction::Zoom
-    } else if input.shift_down && (input.left_down || input.middle_down || input.right_down) {
-        renderer::CameraAction::Pan
-    } else if input.left_down || input.middle_down || input.right_down {
-        renderer::CameraAction::Orbit
-    } else {
-        renderer::CameraAction::None
     }
 }
 

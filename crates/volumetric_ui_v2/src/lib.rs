@@ -5,10 +5,12 @@
 
 use std::sync::Arc;
 
-use aetna_core::prelude::*;
 use volumetric::{
     AssetTypeHint, Environment, ExecutionInput, LoadedAsset, Project, adaptive_surface_nets_2,
 };
+use volumetric_renderer::CameraControlScheme;
+
+use aetna_core::prelude::*;
 
 pub mod host;
 
@@ -24,6 +26,7 @@ const MODEL_ROUTE_PREFIX: &str = "model:";
 const OPERATOR_ROUTE_PREFIX: &str = "operator:";
 const RENDER_MODE_PREFIX: &str = "viewport:render-mode:";
 const PREVIEW_RESOLUTION_PREFIX: &str = "viewport:preview-resolution:";
+const CAMERA_SCHEME_PREFIX: &str = "viewport:camera-scheme:";
 const SELECT_IMPORT_PREFIX: &str = "project:select-import:";
 const DELETE_IMPORT_PREFIX: &str = "project:delete-import:";
 const SELECT_STEP_PREFIX: &str = "project:select-step:";
@@ -193,6 +196,7 @@ pub struct ProjectSummary {
     pub selected_project_item: Option<ProjectSelection>,
     pub render_mode: PreviewRenderMode,
     pub preview_resolution: usize,
+    pub camera_control_scheme: CameraControlScheme,
     pub show_grid: bool,
     pub ssao: bool,
     pub runtime_assets: Vec<RuntimeAssetSummary>,
@@ -210,6 +214,7 @@ pub struct VolumetricUiV2 {
     selected_project_item: Option<ProjectSelection>,
     render_mode: PreviewRenderMode,
     preview_resolution: usize,
+    camera_control_scheme: CameraControlScheme,
     show_grid: bool,
     ssao: bool,
     runtime_assets: Vec<LoadedAsset>,
@@ -231,6 +236,7 @@ impl Default for VolumetricUiV2 {
             selected_project_item: None,
             render_mode: PreviewRenderMode::AdaptiveSurfaceNets2,
             preview_resolution: 64,
+            camera_control_scheme: CameraControlScheme::default(),
             show_grid: true,
             ssao: true,
             runtime_assets: Vec::new(),
@@ -256,6 +262,7 @@ impl VolumetricUiV2 {
             selected_project_item: None,
             render_mode: PreviewRenderMode::AdaptiveSurfaceNets2,
             preview_resolution: 64,
+            camera_control_scheme: CameraControlScheme::default(),
             show_grid: true,
             ssao: true,
             runtime_assets: Vec::new(),
@@ -300,6 +307,10 @@ impl VolumetricUiV2 {
         })
     }
 
+    pub fn camera_control_scheme(&self) -> CameraControlScheme {
+        self.camera_control_scheme
+    }
+
     pub fn summary(&self) -> ProjectSummary {
         ProjectSummary {
             imports: self.project.imports().len(),
@@ -311,6 +322,7 @@ impl VolumetricUiV2 {
             selected_project_item: self.selected_project_item.clone(),
             render_mode: self.render_mode,
             preview_resolution: self.preview_resolution,
+            camera_control_scheme: self.camera_control_scheme,
             show_grid: self.show_grid,
             ssao: self.ssao,
             runtime_assets: self
@@ -599,6 +611,11 @@ impl VolumetricUiV2 {
         self.preview_resolution = resolution;
         self.status = format!("preview resolution: {resolution}^3");
     }
+
+    fn set_camera_control_scheme(&mut self, scheme: CameraControlScheme) {
+        self.camera_control_scheme = scheme;
+        self.status = format!("camera controls: {}", scheme.name());
+    }
 }
 
 impl App for VolumetricUiV2 {
@@ -669,6 +686,10 @@ impl App for VolumetricUiV2 {
             }
         } else if let Some(resolution) = parse_index_route(route, PREVIEW_RESOLUTION_PREFIX) {
             self.set_preview_resolution(resolution);
+        } else if let Some(name) = route.strip_prefix(CAMERA_SCHEME_PREFIX) {
+            if let Some(scheme) = camera_control_scheme_from_route(name) {
+                self.set_camera_control_scheme(scheme);
+            }
         } else if let Some(idx) = parse_index_route(route, SELECT_IMPORT_PREFIX) {
             self.selected_project_item = Some(ProjectSelection::Import(idx));
             self.status = format!("selected import {}", idx + 1);
@@ -808,39 +829,69 @@ fn viewport_workspace(app: &VolumetricUiV2) -> El {
 }
 
 fn viewport_controls(app: &VolumetricUiV2) -> El {
-    toolbar([
-        toolbar_group(
-            PreviewRenderMode::ALL
-                .into_iter()
-                .map(|mode| render_mode_button(app, mode)),
-        )
-        .gap(tokens::SPACE_1),
-        vertical_separator().height(Size::Fixed(24.0)),
-        toolbar_group(PREVIEW_RESOLUTIONS.into_iter().map(|resolution| {
-            let selected = app.preview_resolution == resolution;
-            let button = button(format!("{resolution}^3"))
+    column([
+        toolbar([
+            toolbar_group(
+                PreviewRenderMode::ALL
+                    .into_iter()
+                    .map(|mode| render_mode_button(app, mode)),
+            )
+            .gap(tokens::SPACE_1),
+            vertical_separator().height(Size::Fixed(24.0)),
+            toolbar_group(PREVIEW_RESOLUTIONS.into_iter().map(|resolution| {
+                let selected = app.preview_resolution == resolution;
+                let button = button(format!("{resolution}^3"))
+                    .xsmall()
+                    .key(format!("{PREVIEW_RESOLUTION_PREFIX}{resolution}"));
+                if selected {
+                    button.primary()
+                } else {
+                    button.secondary()
+                }
+            }))
+            .gap(tokens::SPACE_1),
+            spacer(),
+            button_with_icon("refresh-cw", "Run")
+                .primary()
                 .xsmall()
-                .key(format!("{PREVIEW_RESOLUTION_PREFIX}{resolution}"));
-            if selected {
-                button.primary()
-            } else {
-                button.secondary()
-            }
-        }))
+                .key(RUN_PROJECT_KEY),
+            icon_button("refresh-cw")
+                .secondary()
+                .xsmall()
+                .tooltip("Frame selection"),
+        ])
         .gap(tokens::SPACE_1),
-        spacer(),
-        toggle_chip("Grid", app.show_grid, TOGGLE_GRID_KEY),
-        toggle_chip("SSAO", app.ssao, TOGGLE_SSAO_KEY),
-        button_with_icon("refresh-cw", "Run")
-            .primary()
-            .xsmall()
-            .key(RUN_PROJECT_KEY),
-        icon_button("refresh-cw")
-            .secondary()
-            .xsmall()
-            .tooltip("Frame selection"),
+        toolbar([
+            text("Camera").caption().muted(),
+            toolbar_group(
+                CameraControlScheme::ALL
+                    .iter()
+                    .copied()
+                    .map(|scheme| camera_scheme_button(app, scheme)),
+            )
+            .gap(tokens::SPACE_1),
+            spacer(),
+            toggle_chip("Grid", app.show_grid, TOGGLE_GRID_KEY),
+            toggle_chip("SSAO", app.ssao, TOGGLE_SSAO_KEY),
+        ])
+        .gap(tokens::SPACE_1),
     ])
     .gap(tokens::SPACE_1)
+}
+
+fn camera_scheme_button(app: &VolumetricUiV2, scheme: CameraControlScheme) -> El {
+    let button = button(camera_scheme_short_label(scheme))
+        .xsmall()
+        .tooltip(camera_scheme_tooltip(scheme))
+        .key(format!(
+            "{CAMERA_SCHEME_PREFIX}{}",
+            camera_scheme_route_name(scheme)
+        ));
+    if app.camera_control_scheme == scheme {
+        button.primary()
+    } else {
+        button.secondary()
+    }
 }
 
 fn render_mode_button(app: &VolumetricUiV2, mode: PreviewRenderMode) -> El {
@@ -1394,6 +1445,43 @@ fn asn2_resolution_split(target_resolution: usize) -> (usize, usize) {
     (base_resolution, max_depth)
 }
 
+fn camera_scheme_route_name(scheme: CameraControlScheme) -> &'static str {
+    match scheme {
+        CameraControlScheme::Blender => "blender",
+        CameraControlScheme::OnShape => "onshape",
+        CameraControlScheme::Fusion360 => "fusion360",
+        CameraControlScheme::SolidWorks => "solidworks",
+        CameraControlScheme::Maya => "maya",
+    }
+}
+
+fn camera_control_scheme_from_route(name: &str) -> Option<CameraControlScheme> {
+    CameraControlScheme::ALL
+        .iter()
+        .copied()
+        .find(|scheme| camera_scheme_route_name(*scheme) == name)
+}
+
+fn camera_scheme_short_label(scheme: CameraControlScheme) -> &'static str {
+    match scheme {
+        CameraControlScheme::Blender => "Blender",
+        CameraControlScheme::OnShape => "OnShape",
+        CameraControlScheme::Fusion360 => "Fusion",
+        CameraControlScheme::SolidWorks => "Solid",
+        CameraControlScheme::Maya => "Maya",
+    }
+}
+
+fn camera_scheme_tooltip(scheme: CameraControlScheme) -> &'static str {
+    match scheme {
+        CameraControlScheme::Blender => "Blender: middle orbit, Shift+middle pan, wheel zoom",
+        CameraControlScheme::OnShape => "OnShape: right orbit, middle pan, wheel zoom",
+        CameraControlScheme::Fusion360 => "Fusion 360: middle orbit, Shift+middle pan, wheel zoom",
+        CameraControlScheme::SolidWorks => "SolidWorks: middle orbit, Ctrl+middle pan, wheel zoom",
+        CameraControlScheme::Maya => "Maya: Alt+left orbit, Alt+middle pan, Alt+right/wheel zoom",
+    }
+}
+
 fn editable_model_asset_ids(app: &VolumetricUiV2) -> Vec<String> {
     app.project
         .declared_assets()
@@ -1530,10 +1618,12 @@ mod tests {
         let mut app = VolumetricUiV2::default();
         app.on_event(UiEvent::synthetic_click("viewport:render-mode:points"));
         app.on_event(UiEvent::synthetic_click("viewport:preview-resolution:96"));
+        app.on_event(UiEvent::synthetic_click("viewport:camera-scheme:onshape"));
 
         let summary = app.summary();
         assert_eq!(summary.render_mode, PreviewRenderMode::Points);
         assert_eq!(summary.preview_resolution, 96);
+        assert_eq!(summary.camera_control_scheme, CameraControlScheme::OnShape);
     }
 
     #[test]
