@@ -426,7 +426,6 @@ struct ViewportRenderer {
     surface_format: wgpu::TextureFormat,
     scene_cache: Option<PreviewSceneCache>,
     camera: Option<renderer::Camera>,
-    camera_control_scheme: renderer::CameraControlScheme,
 }
 
 impl ViewportRenderer {
@@ -514,7 +513,6 @@ impl ViewportRenderer {
             surface_format: format,
             scene_cache: None,
             camera: None,
-            camera_control_scheme: renderer::CameraControlScheme::default(),
         }
     }
 
@@ -607,7 +605,7 @@ impl ViewportRenderer {
             return false;
         };
 
-        match self.camera_control_scheme.determine_action(input) {
+        match viewport_camera_action(input) {
             renderer::CameraAction::Orbit => {
                 camera.orbit(-input.mouse_delta.x * 0.01, -input.mouse_delta.y * 0.01);
                 true
@@ -679,6 +677,18 @@ impl ViewportRenderer {
             .get_or_insert_with(renderer::test_scenes::create_test_camera)
             .clone();
         (scene, camera)
+    }
+}
+
+fn viewport_camera_action(input: &renderer::CameraInputState) -> renderer::CameraAction {
+    if input.scroll_delta != 0.0 {
+        renderer::CameraAction::Zoom
+    } else if input.shift_down && (input.left_down || input.middle_down || input.right_down) {
+        renderer::CameraAction::Pan
+    } else if input.left_down || input.middle_down || input.right_down {
+        renderer::CameraAction::Orbit
+    } else {
+        renderer::CameraAction::None
     }
 }
 
