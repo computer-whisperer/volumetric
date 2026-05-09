@@ -18,7 +18,7 @@ use winit::window::{CursorIcon, Window, WindowId};
 
 use crate::{
     PreviewBuildStatus, PreviewMeshPlan, PreviewRenderMode, PreviewRequest, VIEWPORT_KEY,
-    VolumetricUiV2,
+    ViewportCameraCommand, VolumetricUiV2,
 };
 
 pub fn run(
@@ -369,6 +369,9 @@ impl Host {
             .viewport_renderer
             .sync_preview_request(preview_request.as_ref());
         self.app.set_preview_build_status(preview_status);
+        if let Some(command) = self.app.take_camera_command() {
+            gfx.viewport_renderer.apply_camera_command(command);
+        }
         self.app.before_build();
         let theme = self.app.theme();
         let palette = theme.palette().clone();
@@ -447,6 +450,7 @@ struct ViewportRenderer {
     preview_worker: PreviewWorker,
     pending_preview_key: Option<PreviewSceneKey>,
     failed_preview: Option<(PreviewSceneKey, String)>,
+    pending_frame_preview: bool,
     camera: Option<renderer::Camera>,
 }
 
@@ -549,6 +553,7 @@ impl ViewportRenderer {
             preview_worker: PreviewWorker::new(),
             pending_preview_key: None,
             failed_preview: None,
+            pending_frame_preview: false,
             camera: None,
         }
     }
@@ -677,6 +682,24 @@ impl ViewportRenderer {
         let _ = self.apply_camera_input(&input, scheme);
     }
 
+    fn apply_camera_command(&mut self, command: ViewportCameraCommand) {
+        match command {
+            ViewportCameraCommand::FramePreview => self.frame_preview(),
+        }
+    }
+
+    fn frame_preview(&mut self) {
+        let Some(cache) = &self.scene_cache else {
+            self.pending_frame_preview = true;
+            return;
+        };
+
+        let mut camera = self.camera.clone().unwrap_or_default();
+        camera.focus_on(cache.scene.bounds.min_vec3(), cache.scene.bounds.max_vec3());
+        self.camera = Some(camera);
+        self.pending_frame_preview = false;
+    }
+
     fn has_pending_preview(&self) -> bool {
         self.pending_preview_key.is_some()
     }
@@ -729,11 +752,14 @@ impl ViewportRenderer {
             match result.result {
                 Ok(scene) => {
                     self.failed_preview = None;
-                    self.camera = Some(scene.1.clone());
+                    self.camera = Some(scene.camera.clone());
                     self.scene_cache = Some(PreviewSceneCache {
                         key: result.key,
                         scene,
                     });
+                    if self.pending_frame_preview {
+                        self.frame_preview();
+                    }
                 }
                 Err(error) => {
                     self.failed_preview = Some((result.key, error));
@@ -770,7 +796,7 @@ impl ViewportRenderer {
                         .as_ref()
                         .is_some_and(|(failed_key, _)| failed_key == &key)
             })
-            .map(|cache| cache.scene.0.clone())
+            .map(|cache| cache.scene.scene.clone())
             .unwrap_or_else(renderer::test_scenes::create_test_scene);
         let camera = self
             .camera
@@ -839,7 +865,27 @@ impl PreviewSceneKey {
     }
 }
 
-type PreviewScene = (renderer::SceneData, renderer::Camera);
+struct PreviewScene {
+    scene: renderer::SceneData,
+    camera: renderer::Camera,
+    bounds: PreviewBounds,
+}
+
+#[derive(Clone, Copy)]
+struct PreviewBounds {
+    min: (f32, f32, f32),
+    max: (f32, f32, f32),
+}
+
+impl PreviewBounds {
+    fn min_vec3(self) -> Vec3 {
+        Vec3::new(self.min.0, self.min.1, self.min.2)
+    }
+
+    fn max_vec3(self) -> Vec3 {
+        Vec3::new(self.max.0, self.max.1, self.max.2)
+    }
+}
 
 struct PreviewSceneCache {
     key: PreviewSceneKey,
@@ -978,7 +1024,14 @@ fn build_preview_scene(request: &PreviewRequest) -> Result<PreviewScene, String>
         }
     };
 
-    Ok((scene, camera_for_bounds(bounds_min, bounds_max)))
+    Ok(PreviewScene {
+        scene,
+        camera: camera_for_bounds(bounds_min, bounds_max),
+        bounds: PreviewBounds {
+            min: bounds_min,
+            max: bounds_max,
+        },
+    })
 }
 
 fn render_settings(

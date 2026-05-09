@@ -21,6 +21,7 @@ pub const NEW_PROJECT_KEY: &str = "action:new-project";
 pub const RUN_PROJECT_KEY: &str = "action:run-project";
 pub const TOGGLE_GRID_KEY: &str = "viewport:toggle-grid";
 pub const TOGGLE_SSAO_KEY: &str = "viewport:toggle-ssao";
+pub const FRAME_PREVIEW_KEY: &str = "viewport:frame-preview";
 
 const MODEL_ROUTE_PREFIX: &str = "model:";
 const OPERATOR_ROUTE_PREFIX: &str = "operator:";
@@ -201,6 +202,11 @@ pub enum PreviewBuildStatus {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewportCameraCommand {
+    FramePreview,
+}
+
 impl PreviewBuildStatus {
     fn label(&self) -> String {
         match self {
@@ -256,6 +262,7 @@ pub struct VolumetricUiV2 {
     last_run_error: Option<String>,
     last_run_stale: bool,
     preview_build_status: PreviewBuildStatus,
+    pending_camera_command: Option<ViewportCameraCommand>,
     status: String,
 }
 
@@ -279,6 +286,7 @@ impl Default for VolumetricUiV2 {
             last_run_error: None,
             last_run_stale: false,
             preview_build_status: PreviewBuildStatus::Idle,
+            pending_camera_command: None,
             status: "idle".to_string(),
         };
         app.add_selected_model();
@@ -306,6 +314,7 @@ impl VolumetricUiV2 {
             last_run_error: None,
             last_run_stale: false,
             preview_build_status: PreviewBuildStatus::Idle,
+            pending_camera_command: None,
             status: "idle".to_string(),
         }
     }
@@ -350,6 +359,10 @@ impl VolumetricUiV2 {
 
     pub(crate) fn set_preview_build_status(&mut self, status: PreviewBuildStatus) {
         self.preview_build_status = status;
+    }
+
+    pub(crate) fn take_camera_command(&mut self) -> Option<ViewportCameraCommand> {
+        self.pending_camera_command.take()
     }
 
     pub fn summary(&self) -> ProjectSummary {
@@ -709,6 +722,12 @@ impl App for VolumetricUiV2 {
             return;
         }
 
+        if event.is_click_or_activate(FRAME_PREVIEW_KEY) {
+            self.pending_camera_command = Some(ViewportCameraCommand::FramePreview);
+            self.status = "framing preview".to_string();
+            return;
+        }
+
         if !matches!(event.kind, UiEventKind::Click | UiEventKind::Activate) {
             return;
         }
@@ -900,7 +919,8 @@ fn viewport_controls(app: &VolumetricUiV2) -> El {
             icon_button("refresh-cw")
                 .secondary()
                 .xsmall()
-                .tooltip("Frame selection"),
+                .tooltip("Frame preview")
+                .key(FRAME_PREVIEW_KEY),
         ])
         .gap(tokens::SPACE_1),
         toolbar([
@@ -1707,6 +1727,20 @@ mod tests {
         let summary = app.summary();
         assert!(!summary.show_grid);
         assert!(!summary.ssao);
+    }
+
+    #[test]
+    fn frame_preview_action_queues_camera_command() {
+        let mut app = VolumetricUiV2::default();
+
+        app.on_event(UiEvent::synthetic_click(FRAME_PREVIEW_KEY));
+
+        assert_eq!(
+            app.take_camera_command(),
+            Some(ViewportCameraCommand::FramePreview)
+        );
+        assert_eq!(app.status, "framing preview");
+        assert_eq!(app.take_camera_command(), None);
     }
 
     #[test]
