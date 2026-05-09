@@ -1,4 +1,4 @@
-# Volumetric UI Rendering Engine Architecture
+# Volumetric Renderer Architecture
 
 ## Overview
 

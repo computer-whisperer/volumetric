@@ -1,87 +1,109 @@
-//! Line rendering pipeline with vertex shader quad expansion.
+//! Point rendering pipeline with instanced quad expansion.
 //!
-//! Renders line segments as screen-aligned quads with anti-aliased edges.
-//! Supports both screen-space and world-space line widths, as well as
-//! dash patterns.
+//! Renders points as screen-aligned quads with anti-aliased shapes.
+//! Supports circle, square, and diamond shapes, with alpha blending
+//! and both screen-space and world-space sizing.
 
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-use crate::renderer::{
-    DepthMode, DynamicBuffer, LineInstance, LinePattern, LineSegment, LineStyle, QUAD_INDICES,
-    QUAD_VERTICES, QuadVertex, StaticBuffer, WidthMode,
+use crate::{
+    DepthMode, DynamicBuffer, PointInstance, PointStyle, QUAD_INDICES, QUAD_VERTICES, QuadVertex,
+    StaticBuffer, WidthMode,
 };
 
-/// Uniform data for line rendering.
+/// GPU-compatible point instance (with padding for alignment).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
-pub struct LineUniforms {
-    pub view_proj: [[f32; 4]; 4],
-    pub screen_size: [f32; 2],
-    pub width_mode: u32,
-    pub default_width: f32,
-    pub dash_length: f32,
-    pub gap_length: f32,
-    pub _pad: [f32; 2],
+pub struct GpuPointInstance {
+    pub position: [f32; 3],
+    pub _pad: f32,
+    pub color: [f32; 4],
 }
 
-impl Default for LineUniforms {
-    fn default() -> Self {
+impl From<&PointInstance> for GpuPointInstance {
+    fn from(p: &PointInstance) -> Self {
         Self {
-            view_proj: [[0.0; 4]; 4],
-            screen_size: [1.0, 1.0],
-            width_mode: 0, // Screen space
-            default_width: 2.0,
-            dash_length: 0.0,
-            gap_length: 0.0,
-            _pad: [0.0; 2],
+            position: p.position,
+            _pad: 0.0,
+            color: p.color,
         }
     }
 }
 
-impl PartialEq for LineUniforms {
-    fn eq(&self, other: &Self) -> bool {
-        self.view_proj == other.view_proj
-            && self.screen_size == other.screen_size
-            && self.width_mode == other.width_mode
-            && (self.default_width - other.default_width).abs() < f32::EPSILON
-            && (self.dash_length - other.dash_length).abs() < f32::EPSILON
-            && (self.gap_length - other.gap_length).abs() < f32::EPSILON
+/// Uniform data for point rendering.
+///
+/// WGSL alignment: vec3<f32> has 16-byte alignment, causing implicit padding
+/// before _pad in the shader. Total WGSL struct size is 112 bytes.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct PointUniforms {
+    pub view_proj: [[f32; 4]; 4], // 64 bytes, offset 0
+    pub screen_size_px: [f32; 2], // 8 bytes, offset 64
+    pub point_size_px: f32,       // 4 bytes, offset 72
+    pub size_mode: u32,           // 4 bytes, offset 76
+    pub shape: u32,               // 4 bytes, offset 80
+    pub _pad: [f32; 7],           // 28 bytes to reach 112 (matches WGSL vec3 alignment + final pad)
+}
+
+// Verify struct size matches WGSL expectations (112 bytes due to vec3 alignment)
+const _: [(); 112] = [(); std::mem::size_of::<PointUniforms>()];
+
+impl Default for PointUniforms {
+    fn default() -> Self {
+        Self {
+            view_proj: [[0.0; 4]; 4],
+            screen_size_px: [1.0, 1.0],
+            point_size_px: 4.0,
+            size_mode: 0, // Screen space
+            shape: 0,     // Circle
+            _pad: [0.0; 7],
+        }
     }
 }
 
-/// Pipeline for rendering lines with vertex shader quad expansion.
-pub struct LinePipeline {
-    /// Pipeline for depth-tested lines
+impl PartialEq for PointUniforms {
+    fn eq(&self, other: &Self) -> bool {
+        self.view_proj == other.view_proj
+            && self.screen_size_px == other.screen_size_px
+            && (self.point_size_px - other.point_size_px).abs() < f32::EPSILON
+            && self.size_mode == other.size_mode
+            && self.shape == other.shape
+    }
+}
+
+/// Pipeline for rendering points as screen-aligned quads.
+pub struct PointPipeline {
+    /// Pipeline for depth-tested points
     depth_pipeline: wgpu::RenderPipeline,
-    /// Pipeline for overlay lines (no depth test)
+    /// Pipeline for overlay points (no depth test)
     overlay_pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
-    /// Static quad vertex buffer (4 vertices)
+    /// Static quad vertex buffer
     quad_vertex_buffer: StaticBuffer<QuadVertex>,
-    /// Static quad index buffer (6 indices for 2 triangles)
+    /// Static quad index buffer
     quad_index_buffer: StaticBuffer<u16>,
-    /// Dynamic instance buffer for line segments
-    instance_buffer: DynamicBuffer<LineInstance>,
-    cached_uniforms: Option<LineUniforms>,
+    /// Dynamic instance buffer for points
+    instance_buffer: DynamicBuffer<GpuPointInstance>,
+    cached_uniforms: Option<PointUniforms>,
 }
 
-impl LinePipeline {
-    /// Create a new line pipeline.
+impl PointPipeline {
+    /// Create a new point pipeline.
     pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
         // Shader
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("line_shader"),
+            label: Some("point_shader"),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
-                "../shaders/line.wgsl"
+                "../shaders/point.wgsl"
             ))),
         });
 
         // Bind group layout
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("line_uniform_bgl"),
+            label: Some("point_uniform_bgl"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
                 visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
@@ -96,7 +118,7 @@ impl LinePipeline {
 
         // Pipeline layout
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("line_pipeline_layout"),
+            label: Some("point_pipeline_layout"),
             bind_group_layouts: &[Some(&bind_group_layout)],
             immediate_size: 0,
         });
@@ -107,36 +129,33 @@ impl LinePipeline {
             wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<QuadVertex>() as u64,
                 step_mode: wgpu::VertexStepMode::Vertex,
-                attributes: &[wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Float32x2,
-                    offset: 0,
-                    shader_location: 0, // corner
-                }],
+                attributes: &[
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x2,
+                        offset: 0,
+                        shader_location: 0, // corner
+                    },
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x2,
+                        offset: 8,
+                        shader_location: 1, // uv
+                    },
+                ],
             },
-            // Line instance (per-instance)
+            // Point instance (per-instance)
             wgpu::VertexBufferLayout {
-                array_stride: std::mem::size_of::<LineInstance>() as u64,
+                array_stride: std::mem::size_of::<GpuPointInstance>() as u64,
                 step_mode: wgpu::VertexStepMode::Instance,
                 attributes: &[
                     wgpu::VertexAttribute {
                         format: wgpu::VertexFormat::Float32x3,
                         offset: 0,
-                        shader_location: 1, // start
-                    },
-                    wgpu::VertexAttribute {
-                        format: wgpu::VertexFormat::Float32x3,
-                        offset: 12,
-                        shader_location: 2, // end
+                        shader_location: 2, // position
                     },
                     wgpu::VertexAttribute {
                         format: wgpu::VertexFormat::Float32x4,
-                        offset: 24,
+                        offset: 16,         // After position (12) + padding (4)
                         shader_location: 3, // color
-                    },
-                    wgpu::VertexAttribute {
-                        format: wgpu::VertexFormat::Float32,
-                        offset: 40,
-                        shader_location: 4, // width
                     },
                 ],
             },
@@ -144,7 +163,7 @@ impl LinePipeline {
 
         // Depth-tested pipeline
         let depth_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("line_depth_pipeline"),
+            label: Some("point_depth_pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
@@ -166,7 +185,7 @@ impl LinePipeline {
                 topology: wgpu::PrimitiveTopology::TriangleList,
                 strip_index_format: None,
                 front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None, // Lines are double-sided
+                cull_mode: None,
                 unclipped_depth: false,
                 polygon_mode: wgpu::PolygonMode::Fill,
                 conservative: false,
@@ -185,7 +204,7 @@ impl LinePipeline {
 
         // Overlay pipeline (no depth test)
         let overlay_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("line_overlay_pipeline"),
+            label: Some("point_overlay_pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
@@ -215,7 +234,7 @@ impl LinePipeline {
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth24Plus,
                 depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::Always), // No depth test
+                depth_compare: Some(wgpu::CompareFunction::Always),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -225,16 +244,16 @@ impl LinePipeline {
         });
 
         // Uniform buffer
-        let uniforms = LineUniforms::default();
+        let uniforms = PointUniforms::default();
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("line_uniform_buffer"),
+            label: Some("point_uniform_buffer"),
             contents: bytemuck::bytes_of(&uniforms),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
         // Bind group
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("line_uniform_bg"),
+            label: Some("point_uniform_bg"),
             layout: &bind_group_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
@@ -247,19 +266,19 @@ impl LinePipeline {
             device,
             &QUAD_VERTICES,
             wgpu::BufferUsages::VERTEX,
-            "line_quad_vertex_buffer",
+            "point_quad_vertex_buffer",
         );
         let quad_index_buffer = StaticBuffer::new(
             device,
             &QUAD_INDICES,
             wgpu::BufferUsages::INDEX,
-            "line_quad_index_buffer",
+            "point_quad_index_buffer",
         );
 
         // Dynamic instance buffer
         let instance_buffer = DynamicBuffer::new(
             wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            "line_instance_buffer",
+            "point_instance_buffer",
         );
 
         Self {
@@ -276,7 +295,7 @@ impl LinePipeline {
     }
 
     /// Update uniforms if they have changed.
-    pub fn update_uniforms(&mut self, queue: &wgpu::Queue, uniforms: &LineUniforms) {
+    pub fn update_uniforms(&mut self, queue: &wgpu::Queue, uniforms: &PointUniforms) {
         if self.cached_uniforms.as_ref() == Some(uniforms) {
             return;
         }
@@ -284,20 +303,17 @@ impl LinePipeline {
         self.cached_uniforms = Some(*uniforms);
     }
 
-    /// Prepare line instances from segments with style.
-    pub fn prepare_instances(segments: &[LineSegment], style: &LineStyle) -> Vec<LineInstance> {
-        segments
-            .iter()
-            .map(|seg| LineInstance::from_segment(seg, style.width))
-            .collect()
+    /// Prepare GPU instances from point data.
+    pub fn prepare_instances(points: &[PointInstance]) -> Vec<GpuPointInstance> {
+        points.iter().map(GpuPointInstance::from).collect()
     }
 
-    /// Upload line instances to the GPU.
+    /// Upload point instances to the GPU.
     pub fn upload_instances(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        instances: &[LineInstance],
+        instances: &[GpuPointInstance],
     ) {
         self.instance_buffer.upload(device, queue, instances);
     }
@@ -305,33 +321,23 @@ impl LinePipeline {
     /// Create uniforms from view-proj matrix, screen size, and style.
     pub fn create_uniforms(
         view_proj: [[f32; 4]; 4],
-        screen_size: [f32; 2],
-        style: &LineStyle,
-    ) -> LineUniforms {
-        let (dash_length, gap_length) = match style.pattern {
-            LinePattern::Solid => (0.0, 0.0),
-            LinePattern::Dashed {
-                dash_length,
-                gap_length,
-            } => (dash_length, gap_length),
-            LinePattern::Dotted { spacing } => (0.1, spacing),
-        };
-
-        LineUniforms {
+        screen_size_px: [f32; 2],
+        style: &PointStyle,
+    ) -> PointUniforms {
+        PointUniforms {
             view_proj,
-            screen_size,
-            width_mode: match style.width_mode {
+            screen_size_px,
+            point_size_px: style.size,
+            size_mode: match style.size_mode {
                 WidthMode::ScreenSpace => 0,
                 WidthMode::WorldSpace => 1,
             },
-            default_width: style.width,
-            dash_length,
-            gap_length,
-            _pad: [0.0; 2],
+            shape: style.shape.to_shader_value(),
+            _pad: [0.0; 7],
         }
     }
 
-    /// Record a line render pass.
+    /// Record a point render pass.
     pub fn render<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>, depth_mode: DepthMode) {
         if self.instance_buffer.is_empty() {
             return;
@@ -357,7 +363,7 @@ impl LinePipeline {
         render_pass.draw_indexed(0..6, 0, 0..self.instance_buffer.len() as u32);
     }
 
-    /// Get the number of line instances currently uploaded.
+    /// Get the number of point instances currently uploaded.
     pub fn instance_count(&self) -> usize {
         self.instance_buffer.len()
     }

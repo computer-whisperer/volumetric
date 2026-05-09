@@ -6,7 +6,7 @@ use bytemuck::{Pod, Zeroable};
 use glam::Mat4;
 use wgpu::util::DeviceExt;
 
-use crate::renderer::{DynamicBuffer, MeshVertex};
+use crate::{DynamicBuffer, MeshVertex};
 
 /// Uniform data for mesh rendering.
 #[repr(C)]

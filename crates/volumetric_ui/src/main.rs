@@ -25,7 +25,7 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
 mod platform;
-mod renderer;
+use volumetric_renderer as renderer;
 
 // =============================================================================
 // Background Task System

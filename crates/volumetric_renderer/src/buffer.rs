@@ -164,10 +164,10 @@ impl<T: Pod + PartialEq> UniformBuffer<T> {
         value: &T,
     ) -> bool {
         // Check if value changed
-        if let Some(cached) = &self.cached_value {
-            if cached == value {
-                return false;
-            }
+        if let Some(cached) = &self.cached_value
+            && cached == value
+        {
+            return false;
         }
 
         // Ensure buffer exists

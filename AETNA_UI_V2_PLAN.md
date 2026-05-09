@@ -155,6 +155,37 @@ Aetna widgets that should map well:
   model, renders bundled model/operator catalogs from `volumetric_assets`, routes
   Aetna click/activation events, and exposes a project summary for the future
   renderer host.
+- Project details are now represented in v2 with imports, operation timeline,
+  and exports lists plus initial select, delete, move, and add-export actions.
+  This is the starting point for rebuilding the old project sequence editor;
+  selected operation steps can also retarget their first input and update output
+  export wiring.
+- The v2 shell has been reworked toward Aetna's stock app vocabulary: sidebar
+  groups and menu buttons, toolbar headers/actions, card anatomy, table rows,
+  field rows, icon buttons, and tooltips now carry the main layout instead of
+  hand-rolled panel and row styling.
+- The shell is shifting toward a denser CAD/workbench shape: narrower rails,
+  tighter table rows, compact catalog/action controls, and controlled viewport
+  preview settings for render mode, preview resolution, grid visibility, and
+  SSAO are now part of app state.
+- The v2 app can now run the current `Project`, retain materialized runtime
+  exports, report elapsed time/errors, and expose the selected runtime asset as
+  the handoff point for the future renderer/export host.
+- The renderer handoff is now explicit as a `PreviewRequest`: selected runtime
+  WASM bytes, render mode, mesh plan, grid/SSAO flags, and stale state are
+  packaged from app state instead of being inferred from scattered UI controls.
+- The native v2 binary now uses a custom winit/wgpu host built on
+  `aetna_wgpu::Runner`: it prepares Aetna layout, resolves `VIEWPORT_KEY`, paints
+  a GPU-backed viewport region, then renders Aetna chrome on top. The viewport
+  now renders through `volumetric_renderer::Renderer` into an offscreen
+  viewport-sized target and blits that into the keyed Aetna rect.
+- The old egui renderer module has been extracted into `crates/volumetric_renderer`.
+  Core renderer types/pipelines are usable without egui, while the previous egui
+  paint callback remains behind an `egui-callback` feature for `volumetric_ui`.
+- The v2 host can convert `PreviewRequest` into cached renderer `SceneData` using
+  point cloud, marching-cubes, or Adaptive Surface Nets v2 mesh generation. When
+  no runtime preview is available it falls back to the renderer test scene, so
+  the viewport remains structurally representative.
 - CI now checks out Aetna alongside Volumetric so the v2 crate's path
   dependencies resolve in GitHub Actions.
 

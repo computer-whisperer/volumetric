@@ -6,9 +6,16 @@ publish = false
 
 [dependencies]
 aetna-core = { version = "0.3.0", path = "../../../../aetna/aetna.main/crates/aetna-core" }
+aetna-wgpu = { version = "0.3.0", path = "../../../../aetna/aetna.main/crates/aetna-wgpu" }
 aetna-winit-wgpu = { version = "0.3.0", path = "../../../../aetna/aetna.main/crates/aetna-winit-wgpu" }
+anyhow = "1"
+glam = "0.32"
+pollster = "0.4"
 volumetric = { path = "../../" }
 volumetric_assets = { path = "../volumetric_assets" }
+volumetric_renderer = { path = "../volumetric_renderer" }
+wgpu = "29"
+winit = "0.30"
 
 [[bin]]
 name = "volumetric_ui_v2"

@@ -11,10 +11,10 @@ web = ["volumetric/web", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:we
 [dependencies]
 volumetric = { path = "../../", default-features = false }
 volumetric_assets = { path = "../volumetric_assets" }
+volumetric_renderer = { path = "../volumetric_renderer", features = ["egui-callback"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 wasmparser = "0.248"
-bytemuck = { version = "1", features = ["derive"] }
 glam = "0.32"
 log = "0.4"
 thiserror = "2"

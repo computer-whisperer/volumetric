@@ -33,28 +33,32 @@
 #![allow(dead_code)]
 
 mod buffer;
+#[cfg(feature = "egui-callback")]
 mod callback;
 mod camera;
 mod conversions;
 mod gbuffer;
 mod pipelines;
+mod scene;
 pub mod test_scenes;
 mod types;
 
 pub use conversions::{convert_mesh_data, convert_points_to_point_data};
 
 pub use buffer::{DynamicBuffer, QUAD_INDICES, QUAD_VERTICES, QuadVertex, StaticBuffer};
-pub use callback::{SceneCallback, SceneData, SceneDrawData};
+#[cfg(feature = "egui-callback")]
+pub use callback::SceneCallback;
 pub use camera::{Camera, CameraAction, CameraControlScheme, CameraInputState};
 pub use gbuffer::{AoTexture, GBuffer};
 pub use pipelines::{
     CompositePipeline, LinePipeline, MeshPipeline, MeshUniforms, PointPipeline, SsaoPipeline,
     SsaoUniforms,
 };
+pub use scene::{SceneData, SceneDrawData};
 pub use types::{
-    AxisIndicator, DepthMode, GridSettings, LineData, LineInstance, LinePattern, LineSegment,
-    LineStyle, MaterialId, MeshData, MeshVertex, PointData, PointInstance, PointShape, PointStyle,
-    RenderSettings, WidthMode,
+    AxisIndicator, DepthMode, GridPlanes, GridSettings, LineData, LineInstance, LinePattern,
+    LineSegment, LineStyle, MaterialId, MeshData, MeshVertex, PointData, PointInstance, PointShape,
+    PointStyle, RenderSettings, WidthMode,
 };
 
 use glam::{Mat4, Vec3};
