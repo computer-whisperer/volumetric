@@ -1,4 +1,8 @@
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    mpsc::{self, Receiver, Sender},
+};
+use std::thread;
 
 use aetna_core::prelude::*;
 use aetna_core::{Cursor, KeyModifiers, PointerButton, UiKey};
@@ -394,17 +398,17 @@ impl Host {
         let viewport_rect = gfx.aetna.rect_of_key(VIEWPORT_KEY);
         self.last_viewport_rect = viewport_rect;
 
-        gfx.viewport_renderer.render(
-            &gfx.device,
-            &gfx.queue,
-            &mut encoder,
-            &view,
-            viewport_rect,
+        gfx.viewport_renderer.render(ViewportRenderParams {
+            device: &gfx.device,
+            queue: &gfx.queue,
+            encoder: &mut encoder,
+            target_view: &view,
+            logical_rect: viewport_rect,
             scale_factor,
-            (gfx.config.width, gfx.config.height),
-            bg_color(&palette),
-            self.app.preview_request(),
-        );
+            surface_extent: (gfx.config.width, gfx.config.height),
+            clear_color: bg_color(&palette),
+            preview_request: self.app.preview_request(),
+        });
         gfx.aetna.render(
             &gfx.device,
             &mut encoder,
@@ -417,7 +421,7 @@ impl Host {
         gfx.queue.submit(Some(encoder.finish()));
         frame.present();
 
-        if prepare.needs_redraw {
+        if prepare.needs_redraw || gfx.viewport_renderer.has_pending_preview() {
             gfx.window.request_redraw();
         }
     }
@@ -432,7 +436,22 @@ struct ViewportRenderer {
     sampler: wgpu::Sampler,
     surface_format: wgpu::TextureFormat,
     scene_cache: Option<PreviewSceneCache>,
+    preview_worker: PreviewWorker,
+    pending_preview_key: Option<PreviewSceneKey>,
+    failed_preview_key: Option<PreviewSceneKey>,
     camera: Option<renderer::Camera>,
+}
+
+struct ViewportRenderParams<'a> {
+    device: &'a wgpu::Device,
+    queue: &'a wgpu::Queue,
+    encoder: &'a mut wgpu::CommandEncoder,
+    target_view: &'a wgpu::TextureView,
+    logical_rect: Option<Rect>,
+    scale_factor: f32,
+    surface_extent: (u32, u32),
+    clear_color: wgpu::Color,
+    preview_request: Option<PreviewRequest>,
 }
 
 impl ViewportRenderer {
@@ -519,6 +538,9 @@ impl ViewportRenderer {
             sampler,
             surface_format: format,
             scene_cache: None,
+            preview_worker: PreviewWorker::new(),
+            pending_preview_key: None,
+            failed_preview_key: None,
             camera: None,
         }
     }
@@ -528,18 +550,19 @@ impl ViewportRenderer {
         // It is resized during `render` once Aetna layout has resolved that rect.
     }
 
-    fn render(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        encoder: &mut wgpu::CommandEncoder,
-        target_view: &wgpu::TextureView,
-        logical_rect: Option<Rect>,
-        scale_factor: f32,
-        surface_extent: (u32, u32),
-        clear_color: wgpu::Color,
-        preview_request: Option<PreviewRequest>,
-    ) {
+    fn render(&mut self, params: ViewportRenderParams<'_>) {
+        let ViewportRenderParams {
+            device,
+            queue,
+            encoder,
+            target_view,
+            logical_rect,
+            scale_factor,
+            surface_extent,
+            clear_color,
+            preview_request,
+        } = params;
+
         clear_viewport(encoder, target_view, clear_color);
 
         let Some(rect) = logical_rect else {
@@ -561,6 +584,7 @@ impl ViewportRenderer {
         }
 
         self.renderer.set_viewport_size(device, w, h);
+        self.sync_preview_request(preview_request.as_ref());
         let (scene, camera) = self.scene_for_request(preview_request.as_ref());
         for (mesh, transform, material) in &scene.meshes {
             self.renderer.submit_mesh(mesh, *transform, *material);
@@ -646,6 +670,61 @@ impl ViewportRenderer {
         let _ = self.apply_camera_input(&input, scheme);
     }
 
+    fn has_pending_preview(&self) -> bool {
+        self.pending_preview_key.is_some()
+    }
+
+    fn sync_preview_request(&mut self, request: Option<&PreviewRequest>) {
+        self.drain_preview_results();
+
+        let Some(request) = request else {
+            self.pending_preview_key = None;
+            self.failed_preview_key = None;
+            return;
+        };
+
+        let key = PreviewSceneKey::from(request);
+        if self
+            .scene_cache
+            .as_ref()
+            .is_some_and(|cache| cache.key == key)
+            || self.pending_preview_key.as_ref() == Some(&key)
+            || self.failed_preview_key.as_ref() == Some(&key)
+        {
+            return;
+        }
+
+        self.failed_preview_key = None;
+        self.pending_preview_key = Some(key.clone());
+        self.preview_worker.request(PreviewBuildJob {
+            key,
+            request: request.clone(),
+        });
+    }
+
+    fn drain_preview_results(&mut self) {
+        for result in self.preview_worker.drain_results() {
+            if self.pending_preview_key.as_ref() != Some(&result.key) {
+                continue;
+            }
+
+            self.pending_preview_key = None;
+            match result.result {
+                Ok(scene) => {
+                    self.failed_preview_key = None;
+                    self.camera = Some(scene.1.clone());
+                    self.scene_cache = Some(PreviewSceneCache {
+                        key: result.key,
+                        scene,
+                    });
+                }
+                Err(_) => {
+                    self.failed_preview_key = Some(result.key);
+                }
+            }
+        }
+    }
+
     fn scene_for_request(
         &mut self,
         request: Option<&PreviewRequest>,
@@ -663,25 +742,15 @@ impl ViewportRenderer {
         };
 
         let key = PreviewSceneKey::from(request);
-        let rebuild = self
-            .scene_cache
-            .as_ref()
-            .is_none_or(|cache| cache.key != key);
-        if rebuild {
-            self.scene_cache = Some(PreviewSceneCache {
-                key,
-                result: build_preview_scene(request),
-            });
-            self.camera = self
-                .scene_cache
-                .as_ref()
-                .and_then(|cache| cache.result.as_ref().ok().map(|(_, camera)| camera.clone()));
-        }
-
         let scene = self
             .scene_cache
             .as_ref()
-            .and_then(|cache| cache.result.as_ref().ok().map(|(scene, _)| scene.clone()))
+            .filter(|cache| {
+                cache.key == key
+                    || self.pending_preview_key.is_some()
+                    || self.failed_preview_key.as_ref() == Some(&key)
+            })
+            .map(|cache| cache.scene.0.clone())
             .unwrap_or_else(renderer::test_scenes::create_test_scene);
         let camera = self
             .camera
@@ -726,6 +795,8 @@ impl ViewportTarget {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PreviewSceneKey {
     asset_id: String,
+    wasm_ptr: usize,
+    wasm_len: usize,
     render_mode: PreviewRenderMode,
     mesh_plan: PreviewMeshPlan,
 }
@@ -734,6 +805,8 @@ impl From<&PreviewRequest> for PreviewSceneKey {
     fn from(request: &PreviewRequest) -> Self {
         Self {
             asset_id: request.asset_id.clone(),
+            wasm_ptr: Arc::as_ptr(&request.wasm_bytes) as usize,
+            wasm_len: request.wasm_bytes.len(),
             render_mode: request.render_mode,
             mesh_plan: request.mesh_plan.clone(),
         }
@@ -744,7 +817,68 @@ type PreviewScene = (renderer::SceneData, renderer::Camera);
 
 struct PreviewSceneCache {
     key: PreviewSceneKey,
+    scene: PreviewScene,
+}
+
+struct PreviewBuildJob {
+    key: PreviewSceneKey,
+    request: PreviewRequest,
+}
+
+struct PreviewBuildResult {
+    key: PreviewSceneKey,
     result: Result<PreviewScene, String>,
+}
+
+struct PreviewWorker {
+    jobs: Sender<PreviewBuildJob>,
+    results: Receiver<PreviewBuildResult>,
+}
+
+impl PreviewWorker {
+    fn new() -> Self {
+        let (job_tx, job_rx) = mpsc::channel::<PreviewBuildJob>();
+        let (result_tx, result_rx) = mpsc::channel::<PreviewBuildResult>();
+
+        thread::Builder::new()
+            .name("volumetric-preview-worker".to_string())
+            .spawn(move || {
+                while let Ok(mut job) = job_rx.recv() {
+                    while let Ok(newer_job) = job_rx.try_recv() {
+                        job = newer_job;
+                    }
+
+                    let result = build_preview_scene(&job.request);
+                    if result_tx
+                        .send(PreviewBuildResult {
+                            key: job.key,
+                            result,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn preview worker");
+
+        Self {
+            jobs: job_tx,
+            results: result_rx,
+        }
+    }
+
+    fn request(&self, job: PreviewBuildJob) {
+        let _ = self.jobs.send(job);
+    }
+
+    fn drain_results(&self) -> Vec<PreviewBuildResult> {
+        let mut results = Vec::new();
+        while let Ok(result) = self.results.try_recv() {
+            results.push(result);
+        }
+        results
+    }
 }
 
 fn build_preview_scene(request: &PreviewRequest) -> Result<PreviewScene, String> {
