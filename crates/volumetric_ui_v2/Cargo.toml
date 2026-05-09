@@ -1,0 +1,19 @@
+[package]
+name = "volumetric_ui_v2"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+aetna-core = { version = "0.3.0", path = "../../../../aetna/aetna.main/crates/aetna-core" }
+aetna-winit-wgpu = { version = "0.3.0", path = "../../../../aetna/aetna.main/crates/aetna-winit-wgpu" }
+volumetric = { path = "../../" }
+volumetric_assets = { path = "../volumetric_assets" }
+
+[[bin]]
+name = "volumetric_ui_v2"
+path = "src/main.rs"
+
+[[bin]]
+name = "dump_v2_shell"
+path = "src/bin/dump_v2_shell.rs"

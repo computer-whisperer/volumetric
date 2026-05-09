@@ -144,6 +144,20 @@ Aetna widgets that should map well:
 
 ## Migration Slices
 
+### Current Progress
+
+- Slice 0 is complete: the workspace is dependency-modernized and CI covers
+  rustfmt, clippy, tests, and WASM asset builds.
+- Slice 1 has started with `crates/volumetric_ui_v2`, a native Aetna shell that
+  opens via `aetna_winit_wgpu::run`, reserves a keyed `viewport` region, and can
+  dump Aetna bundle artifacts through `dump_v2_shell`.
+- The v2 shell now owns real app state: it initializes a `Project` with a bundled
+  model, renders bundled model/operator catalogs from `volumetric_assets`, routes
+  Aetna click/activation events, and exposes a project summary for the future
+  renderer host.
+- CI now checks out Aetna alongside Volumetric so the v2 crate's path
+  dependencies resolve in GitHub Actions.
+
 ### Slice 0: Dependency Update
 
 Modernize dependencies and keep the current UI building. This is the dependency

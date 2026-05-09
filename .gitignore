@@ -1,3 +1,4 @@
 /target
+/crates/volumetric_ui_v2/out
 .idea/*
 .claude/*

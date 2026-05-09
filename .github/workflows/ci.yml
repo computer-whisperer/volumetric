@@ -13,8 +13,17 @@ jobs:
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: volumetric/main
     steps:
       - uses: actions/checkout@v5
+        with:
+          path: volumetric/main
+      - uses: actions/checkout@v5
+        with:
+          repository: computer-whisperer/aetna
+          path: aetna/aetna.main
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -23,8 +32,17 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: volumetric/main
     steps:
       - uses: actions/checkout@v5
+        with:
+          path: volumetric/main
+      - uses: actions/checkout@v5
+        with:
+          repository: computer-whisperer/aetna
+          path: aetna/aetna.main
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -33,6 +51,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libvulkan-dev libwayland-dev libxkbcommon-dev libdbus-1-dev
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: volumetric/main
       - name: Run clippy
         run: >
           cargo clippy --workspace --all-targets --
@@ -65,23 +85,45 @@ jobs:
   test:
     name: Tests
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: volumetric/main
     steps:
       - uses: actions/checkout@v5
+        with:
+          path: volumetric/main
+      - uses: actions/checkout@v5
+        with:
+          repository: computer-whisperer/aetna
+          path: aetna/aetna.main
       - uses: dtolnay/rust-toolchain@stable
       - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y libvulkan-dev libwayland-dev libxkbcommon-dev libdbus-1-dev
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: volumetric/main
       - run: cargo test --workspace
 
   wasm:
     name: WASM Assets
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: volumetric/main
     steps:
       - uses: actions/checkout@v5
+        with:
+          path: volumetric/main
+      - uses: actions/checkout@v5
+        with:
+          repository: computer-whisperer/aetna
+          path: aetna/aetna.main
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: volumetric/main
       - run: cargo build-wasm
