@@ -7,8 +7,10 @@ use std::path::PathBuf;
 
 use volumetric::generate_adaptive_mesh_v2_from_bytes;
 
-use crate::camera::{parse_views, CameraSetup, ProjectionType, ViewAngle};
-use crate::headless_renderer::{GridVertex, HeadlessRenderer, MeshVertex, Uniforms, WireframeOptions};
+use crate::camera::{CameraSetup, ProjectionType, ViewAngle, parse_views};
+use crate::headless_renderer::{
+    GridVertex, HeadlessRenderer, MeshVertex, Uniforms, WireframeOptions,
+};
 use crate::{build_mesh_config, load_wasm_bytes};
 
 /// Projection type for CLI argument parsing
@@ -94,7 +96,6 @@ pub struct RenderArgs {
     pub grid_color: String,
 
     // === New rendering mode options ===
-
     /// Projection type: perspective or ortho
     #[arg(long, value_enum, default_value = "perspective")]
     pub projection: ProjectionArg,
@@ -143,7 +144,10 @@ pub struct RenderArgs {
 fn parse_hex_color(hex: &str) -> Result<[f32; 3]> {
     let hex = hex.trim_start_matches('#');
     if hex.len() != 6 {
-        anyhow::bail!("Invalid hex color: expected 6 characters, got {}", hex.len());
+        anyhow::bail!(
+            "Invalid hex color: expected 6 characters, got {}",
+            hex.len()
+        );
     }
     let r = u8::from_str_radix(&hex[0..2], 16).context("Invalid red component")?;
     let g = u8::from_str_radix(&hex[2..4], 16).context("Invalid green component")?;
@@ -164,10 +168,7 @@ fn parse_vec3(s: &str) -> Result<Vec3> {
 }
 
 /// Recalculate smooth normals from mesh geometry using area-weighted face normals
-fn recalculate_normals(
-    vertices: &[(f32, f32, f32)],
-    indices: &[u32],
-) -> Vec<(f32, f32, f32)> {
+fn recalculate_normals(vertices: &[(f32, f32, f32)], indices: &[u32]) -> Vec<(f32, f32, f32)> {
     let mut normals = vec![Vec3::ZERO; vertices.len()];
 
     // Accumulate area-weighted face normals for each vertex
@@ -250,7 +251,8 @@ fn generate_grid_vertices(
     // Generate lines parallel to Z axis (varying X)
     let mut x = x_min;
     while x <= x_max + 0.001 {
-        let is_major = (x / major_spacing).abs().fract() < 0.01 || (x / major_spacing).abs().fract() > 0.99;
+        let is_major =
+            (x / major_spacing).abs().fract() < 0.01 || (x / major_spacing).abs().fract() > 0.99;
         let line_color = if is_major { major_color } else { minor_color };
 
         vertices.push(GridVertex {
@@ -272,7 +274,8 @@ fn generate_grid_vertices(
     // Generate lines parallel to X axis (varying Z)
     let mut z = z_min;
     while z <= z_max + 0.001 {
-        let is_major = (z / major_spacing).abs().fract() < 0.01 || (z / major_spacing).abs().fract() > 0.99;
+        let is_major =
+            (z / major_spacing).abs().fract() < 0.01 || (z / major_spacing).abs().fract() > 0.99;
         let line_color = if is_major { major_color } else { minor_color };
 
         vertices.push(GridVertex {
@@ -337,7 +340,8 @@ pub fn run_render(args: RenderArgs) -> Result<()> {
     let background_color = parse_hex_color(&args.background).context("Invalid background color")?;
     let base_color = parse_hex_color(&args.color).context("Invalid mesh color")?;
     let grid_color = parse_hex_color(&args.grid_color).context("Invalid grid color")?;
-    let wireframe_color = parse_hex_color(&args.wireframe_color).context("Invalid wireframe color")?;
+    let wireframe_color =
+        parse_hex_color(&args.wireframe_color).context("Invalid wireframe color")?;
 
     // Build projection type from CLI args
     let projection = match args.projection {
@@ -350,16 +354,22 @@ pub fn run_render(args: RenderArgs) -> Result<()> {
             if args.fov != 45.0 {
                 eprintln!("Warning: --fov is ignored with orthographic projection");
             }
-            ProjectionType::Orthographic { scale: args.ortho_scale }
+            ProjectionType::Orthographic {
+                scale: args.ortho_scale,
+            }
         }
     };
 
     // Parse custom camera if specified
-    let custom_camera_pos = args.camera_pos.as_ref()
+    let custom_camera_pos = args
+        .camera_pos
+        .as_ref()
         .map(|s| parse_vec3(s))
         .transpose()
         .context("Invalid --camera-pos")?;
-    let custom_camera_target = args.camera_target.as_ref()
+    let custom_camera_target = args
+        .camera_target
+        .as_ref()
         .map(|s| parse_vec3(s))
         .transpose()
         .context("Invalid --camera-target")?;
@@ -385,7 +395,11 @@ pub fn run_render(args: RenderArgs) -> Result<()> {
     if use_custom_camera {
         println!("Using custom camera position");
     } else {
-        println!("Rendering {} view(s): {:?}", views.len(), views.iter().map(|v| v.suffix()).collect::<Vec<_>>());
+        println!(
+            "Rendering {} view(s): {:?}",
+            views.len(),
+            views.iter().map(|v| v.suffix()).collect::<Vec<_>>()
+        );
     }
 
     // Load WASM and generate mesh
@@ -468,7 +482,10 @@ pub fn run_render(args: RenderArgs) -> Result<()> {
     };
 
     // Initialize renderer
-    println!("Initializing headless renderer ({}x{})", args.width, args.height);
+    println!(
+        "Initializing headless renderer ({}x{})",
+        args.width, args.height
+    );
     let renderer = HeadlessRenderer::new(args.width, args.height)?;
 
     let aspect = args.width as f32 / args.height as f32;

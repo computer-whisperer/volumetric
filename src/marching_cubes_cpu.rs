@@ -143,7 +143,11 @@ where
                     let (bdx, bdy, bdz) = C_OFF[b];
                     let pa = corner_pos(xc + adx, yc + ady, zc + adz);
                     let pb = corner_pos(xc + bdx, yc + bdy, zc + bdz);
-                    let mid = ((pa.0 + pb.0) * 0.5, (pa.1 + pb.1) * 0.5, (pa.2 + pb.2) * 0.5);
+                    let mid = (
+                        (pa.0 + pb.0) * 0.5,
+                        (pa.1 + pb.1) * 0.5,
+                        (pa.2 + pb.2) * 0.5,
+                    );
                     acc.0 += mid.0;
                     acc.1 += mid.1;
                     acc.2 += mid.2;
@@ -310,11 +314,7 @@ fn orient_triangles_consistently_and_outward<F>(
         }
     }
 
-    fn tri_ids(
-        tri: &Triangle,
-        vid: &mut HashMap<VKey, u32>,
-        next_id: &mut u32,
-    ) -> [u32; 3] {
+    fn tri_ids(tri: &Triangle, vid: &mut HashMap<VKey, u32>, next_id: &mut u32) -> [u32; 3] {
         let mut out = [0u32; 3];
         for (i, v) in tri.vertices.iter().copied().enumerate() {
             let k = VKey::from_v(v);
@@ -502,7 +502,11 @@ fn orient_triangles_consistently_and_outward<F>(
 #[allow(dead_code)]
 fn interpolate_vertex(p1: (f32, f32, f32), p2: (f32, f32, f32)) -> (f32, f32, f32) {
     // Kept for reference/debugging against the old marching-cubes implementation.
-    ((p1.0 + p2.0) * 0.5, (p1.1 + p2.1) * 0.5, (p1.2 + p2.2) * 0.5)
+    (
+        (p1.0 + p2.0) * 0.5,
+        (p1.1 + p2.1) * 0.5,
+        (p1.2 + p2.2) * 0.5,
+    )
 }
 
 #[cfg(test)]
@@ -571,7 +575,10 @@ mod tests {
                 }
             }
         }
-        assert!(bad == 0, "found {bad}/{total} invalid normals (expected all finite and near-unit)");
+        assert!(
+            bad == 0,
+            "found {bad}/{total} invalid normals (expected all finite and near-unit)"
+        );
     }
 
     fn triangle_unit_normal(tri: &Triangle) -> Option<(f32, f32, f32)> {
@@ -586,9 +593,14 @@ mod tests {
         let a = tri.vertices[0];
         let b = tri.vertices[1];
         let c = tri.vertices[2];
-        ((a.0 + b.0 + c.0) / 3.0, (a.1 + b.1 + c.1) / 3.0, (a.2 + b.2 + c.2) / 3.0)
+        (
+            (a.0 + b.0 + c.0) / 3.0,
+            (a.1 + b.1 + c.1) / 3.0,
+            (a.2 + b.2 + c.2) / 3.0,
+        )
     }
 
+    #[allow(dead_code)]
     fn assert_closed_oriented_manifold_edges(tris: &[Triangle]) {
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
         struct VKey(u32, u32, u32);
@@ -657,12 +669,16 @@ mod tests {
             let sample_boundary: Vec<String> = boundary_edges
                 .iter()
                 .take(6)
-                .map(|((a, b), c0, c1)| format!("edge({a},{b}) counts(min->max={c0}, max->min={c1})"))
+                .map(|((a, b), c0, c1)| {
+                    format!("edge({a},{b}) counts(min->max={c0}, max->min={c1})")
+                })
                 .collect();
             let sample_imbalanced: Vec<String> = imbalanced_edges
                 .iter()
                 .take(6)
-                .map(|((a, b), c0, c1)| format!("edge({a},{b}) counts(min->max={c0}, max->min={c1})"))
+                .map(|((a, b), c0, c1)| {
+                    format!("edge({a},{b}) counts(min->max={c0}, max->min={c1})")
+                })
                 .collect();
 
             panic!(
@@ -686,7 +702,8 @@ mod tests {
         let resolution = 8;
 
         let tris = marching_cubes_mesh(bounds_min, bounds_max, resolution, |p| {
-              Ok(if p.0 >= bounds_min.0
+            Ok(
+                if p.0 >= bounds_min.0
                     && p.0 <= bounds_max.0
                     && p.1 >= bounds_min.1
                     && p.1 <= bounds_max.1
@@ -696,7 +713,8 @@ mod tests {
                     1.0
                 } else {
                     0.0
-                })
+                },
+            )
         })
         .unwrap();
 
@@ -716,7 +734,13 @@ mod tests {
         let mut saw_outside = false;
         'outer: for tri in &tris {
             for v in &tri.vertices {
-                if v.0 < min_expected || v.0 > max_expected || v.1 < min_expected || v.1 > max_expected || v.2 < min_expected || v.2 > max_expected {
+                if v.0 < min_expected
+                    || v.0 > max_expected
+                    || v.1 < min_expected
+                    || v.1 > max_expected
+                    || v.2 < min_expected
+                    || v.2 > max_expected
+                {
                     saw_outside = true;
                     break 'outer;
                 }
@@ -740,7 +764,10 @@ mod tests {
         })
         .unwrap();
 
-        assert!(!tris.is_empty(), "expected sphere-ish field to produce triangles");
+        assert!(
+            !tris.is_empty(),
+            "expected sphere-ish field to produce triangles"
+        );
 
         // Sanity: vertices should not fly far away from the sampling domain.
         let step = (bounds_max.0 - bounds_min.0) / resolution as f32;
@@ -792,7 +819,10 @@ mod tests {
         }
 
         // With correct winding, nearly all normals should point outward.
-        assert!(ok as f32 >= total as f32 * 0.995, "outward normals ratio too low: {ok}/{total}");
+        assert!(
+            ok as f32 >= total as f32 * 0.995,
+            "outward normals ratio too low: {ok}/{total}"
+        );
     }
 
     #[test]
@@ -808,7 +838,11 @@ mod tests {
             let xy = (p.0 * p.0 + p.1 * p.1).sqrt();
             let qx = xy - r_major;
             let qy = p.2;
-            Ok(if qx * qx + qy * qy <= r_minor * r_minor { 1.0 } else { 0.0 })
+            Ok(if qx * qx + qy * qy <= r_minor * r_minor {
+                1.0
+            } else {
+                0.0
+            })
         })
         .unwrap();
         assert!(!tris.is_empty());
@@ -881,7 +915,11 @@ mod tests {
         let resolution = 20;
 
         let tris = marching_cubes_mesh(bounds_min, bounds_max, resolution, |p| {
-            Ok(if mandelbulb_inside(p.0, p.1, p.2) { 1.0 } else { 0.0 })
+            Ok(if mandelbulb_inside(p.0, p.1, p.2) {
+                1.0
+            } else {
+                0.0
+            })
         })
         .unwrap();
         assert!(!tris.is_empty(), "expected mandelbulb to produce triangles");
@@ -946,7 +984,11 @@ mod tests {
         let resolution = 28;
 
         let tris = marching_cubes_mesh(bounds_min, bounds_max, resolution, |p| {
-            Ok(if mandelbulb_inside(p.0, p.1, p.2) { 1.0 } else { 0.0 })
+            Ok(if mandelbulb_inside(p.0, p.1, p.2) {
+                1.0
+            } else {
+                0.0
+            })
         })
         .unwrap();
         assert!(!tris.is_empty());
@@ -987,7 +1029,15 @@ mod tests {
             }
         }
 
-        assert!(decided as f32 >= tris.len() as f32 * 0.92, "decided={decided} total={}", tris.len());
-        assert!(ok as f32 >= decided as f32 * 0.99, "ok={ok} decided={decided} total={}", tris.len());
+        assert!(
+            decided as f32 >= tris.len() as f32 * 0.92,
+            "decided={decided} total={}",
+            tris.len()
+        );
+        assert!(
+            ok as f32 >= decided as f32 * 0.99,
+            "ok={ok} decided={decided} total={}",
+            tris.len()
+        );
     }
 }

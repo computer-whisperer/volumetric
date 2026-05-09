@@ -152,42 +152,63 @@ fn generate_wasm(mode: &str, vector_a: [f64; 3], vector_b: [f64; 3]) -> Result<V
         };
 
         // Store min_x at out_ptr + 0
-        builder.func_body()
+        builder
+            .func_body()
             .local_get(out_ptr)
             .f64_const(min_x)
             .store(memory_id, walrus::ir::StoreKind::F64, mem_arg);
 
         // Store max_x at out_ptr + 8
-        let mem_arg_8 = walrus::ir::MemArg { align: 3, offset: 8 };
-        builder.func_body()
+        let mem_arg_8 = walrus::ir::MemArg {
+            align: 3,
+            offset: 8,
+        };
+        builder
+            .func_body()
             .local_get(out_ptr)
             .f64_const(max_x)
             .store(memory_id, walrus::ir::StoreKind::F64, mem_arg_8);
 
         // Store min_y at out_ptr + 16
-        let mem_arg_16 = walrus::ir::MemArg { align: 3, offset: 16 };
-        builder.func_body()
+        let mem_arg_16 = walrus::ir::MemArg {
+            align: 3,
+            offset: 16,
+        };
+        builder
+            .func_body()
             .local_get(out_ptr)
             .f64_const(min_y)
             .store(memory_id, walrus::ir::StoreKind::F64, mem_arg_16);
 
         // Store max_y at out_ptr + 24
-        let mem_arg_24 = walrus::ir::MemArg { align: 3, offset: 24 };
-        builder.func_body()
+        let mem_arg_24 = walrus::ir::MemArg {
+            align: 3,
+            offset: 24,
+        };
+        builder
+            .func_body()
             .local_get(out_ptr)
             .f64_const(max_y)
             .store(memory_id, walrus::ir::StoreKind::F64, mem_arg_24);
 
         // Store min_z at out_ptr + 32
-        let mem_arg_32 = walrus::ir::MemArg { align: 3, offset: 32 };
-        builder.func_body()
+        let mem_arg_32 = walrus::ir::MemArg {
+            align: 3,
+            offset: 32,
+        };
+        builder
+            .func_body()
             .local_get(out_ptr)
             .f64_const(min_z)
             .store(memory_id, walrus::ir::StoreKind::F64, mem_arg_32);
 
         // Store max_z at out_ptr + 40
-        let mem_arg_40 = walrus::ir::MemArg { align: 3, offset: 40 };
-        builder.func_body()
+        let mem_arg_40 = walrus::ir::MemArg {
+            align: 3,
+            offset: 40,
+        };
+        builder
+            .func_body()
             .local_get(out_ptr)
             .f64_const(max_z)
             .store(memory_id, walrus::ir::StoreKind::F64, mem_arg_40);
@@ -206,24 +227,36 @@ fn generate_wasm(mode: &str, vector_a: [f64; 3], vector_b: [f64; 3]) -> Result<V
         let y = module.locals.add(ValType::F64);
         let z = module.locals.add(ValType::F64);
 
-        let mem_arg = walrus::ir::MemArg { align: 3, offset: 0 };
-        let mem_arg_8 = walrus::ir::MemArg { align: 3, offset: 8 };
-        let mem_arg_16 = walrus::ir::MemArg { align: 3, offset: 16 };
+        let mem_arg = walrus::ir::MemArg {
+            align: 3,
+            offset: 0,
+        };
+        let mem_arg_8 = walrus::ir::MemArg {
+            align: 3,
+            offset: 8,
+        };
+        let mem_arg_16 = walrus::ir::MemArg {
+            align: 3,
+            offset: 16,
+        };
 
         // Load x from pos_ptr + 0
-        builder.func_body()
+        builder
+            .func_body()
             .local_get(pos_ptr)
             .load(memory_id, walrus::ir::LoadKind::F64, mem_arg)
             .local_set(x);
 
         // Load y from pos_ptr + 8
-        builder.func_body()
+        builder
+            .func_body()
             .local_get(pos_ptr)
             .load(memory_id, walrus::ir::LoadKind::F64, mem_arg_8)
             .local_set(y);
 
         // Load z from pos_ptr + 16
-        builder.func_body()
+        builder
+            .func_body()
             .local_get(pos_ptr)
             .load(memory_id, walrus::ir::LoadKind::F64, mem_arg_16)
             .local_set(z);
@@ -232,7 +265,8 @@ fn generate_wasm(mode: &str, vector_a: [f64; 3], vector_b: [f64; 3]) -> Result<V
         use walrus::ir::UnaryOp::F32ConvertSI32;
 
         // Check: (x >= min_x) && (x <= max_x) && (y >= min_y) && (y <= max_y) && (z >= min_z) && (z <= max_z)
-        builder.func_body()
+        builder
+            .func_body()
             // x >= min_x
             .local_get(x)
             .f64_const(min_x)
@@ -320,7 +354,9 @@ pub extern "C" fn run() {
 pub extern "C" fn get_metadata() -> i64 {
     static METADATA: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     let bytes = METADATA.get_or_init(|| {
-        let schema = r#"{ mode: "opposite_corners" / "position_size" .default "opposite_corners" }"#.to_string();
+        let schema =
+            r#"{ mode: "opposite_corners" / "position_size" .default "opposite_corners" }"#
+                .to_string();
         let metadata = OperatorMetadata {
             name: "rectangular_prism_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),

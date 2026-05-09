@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::fs;
-use wasmtime::*;
 use wasmparser::Payload;
+use wasmtime::*;
 
 fn print_section_summary(label: &str, wasm: &[u8]) {
     let mut types = 0u32;
@@ -56,9 +56,13 @@ fn run_operator(engine: &Engine, op_wasm: &[u8], inputs: Vec<Vec<u8>>) -> Result
     );
 
     let mut linker = Linker::new(engine);
-    linker.func_wrap("host", "get_input_len", |caller: Caller<'_, HostState>, idx: i32| -> u32 {
-        caller.data().inputs[idx as usize].len() as u32
-    })?;
+    linker.func_wrap(
+        "host",
+        "get_input_len",
+        |caller: Caller<'_, HostState>, idx: i32| -> u32 {
+            caller.data().inputs[idx as usize].len() as u32
+        },
+    )?;
 
     linker.func_wrap(
         "host",
@@ -102,11 +106,16 @@ fn run_operator(engine: &Engine, op_wasm: &[u8], inputs: Vec<Vec<u8>>) -> Result
 
 fn main() -> Result<()> {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let dir = root.join("target").join("wasm32-unknown-unknown").join("debug");
+    let dir = root
+        .join("target")
+        .join("wasm32-unknown-unknown")
+        .join("debug");
 
     let torus = fs::read(dir.join("simple_torus_model.wasm")).context("read torus model")?;
-    let translate_op = fs::read(dir.join("translate_operator.wasm")).context("read translate operator")?;
-    let boolean_op = fs::read(dir.join("boolean_operator.wasm")).context("read boolean operator")?;
+    let translate_op =
+        fs::read(dir.join("translate_operator.wasm")).context("read translate operator")?;
+    let boolean_op =
+        fs::read(dir.join("boolean_operator.wasm")).context("read boolean operator")?;
 
     // CBOR for `{ dx: 1.0, dy: 0.0, dz: 0.0 }` (the operator's default), encoded explicitly.
     // This keeps the smoke binary self-contained.
@@ -132,8 +141,12 @@ fn main() -> Result<()> {
         translated_torus.len()
     );
 
-    let merged = run_operator(&engine, &boolean_op, vec![torus, translated_torus, Vec::new()])
-        .context("run boolean operator")?;
+    let merged = run_operator(
+        &engine,
+        &boolean_op,
+        vec![torus, translated_torus, Vec::new()],
+    )
+    .context("run boolean operator")?;
     println!("Merged model size: {} bytes", merged.len());
 
     // Validate the merged model can be instantiated and queried.

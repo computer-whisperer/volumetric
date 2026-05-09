@@ -149,13 +149,11 @@ const HEADER_OFFSET: u32 = IO_BUFFER_SIZE;
 const HEADER_SIZE: u32 = 40;
 const DATA_OFFSET: u32 = HEADER_OFFSET + HEADER_SIZE; // 296
 
-// Header field offsets (relative to HEADER_OFFSET)
-const WIDTH_PIXELS_OFFSET: u32 = HEADER_OFFSET;       // 256
-const HEIGHT_PIXELS_OFFSET: u32 = HEADER_OFFSET + 4;  // 260
-const CONFIG_WIDTH_OFFSET: u32 = HEADER_OFFSET + 8;   // 264
-const CONFIG_DEPTH_OFFSET: u32 = HEADER_OFFSET + 16;  // 272
+// Header field offsets
+const CONFIG_WIDTH_OFFSET: u32 = HEADER_OFFSET + 8; // 264
+const CONFIG_DEPTH_OFFSET: u32 = HEADER_OFFSET + 16; // 272
 const CONFIG_HEIGHT_OFFSET: u32 = HEADER_OFFSET + 24; // 280
-const CONFIG_CLIP_OFFSET: u32 = HEADER_OFFSET + 32;   // 288
+const CONFIG_CLIP_OFFSET: u32 = HEADER_OFFSET + 32; // 288
 
 // Function indices
 const FN_GET_DIMENSIONS: u32 = 0;
@@ -164,8 +162,8 @@ const FN_SAMPLE: u32 = 2;
 
 // Type indices
 const TYPE_GET_DIMENSIONS: u32 = 0; // () -> i32
-const TYPE_GET_BOUNDS: u32 = 1;     // (i32) -> ()
-const TYPE_SAMPLE: u32 = 2;         // (i32) -> f32
+const TYPE_GET_BOUNDS: u32 = 1; // (i32) -> ()
+const TYPE_SAMPLE: u32 = 2; // (i32) -> f32
 
 fn generate_wasm(heightmap: &Heightmap, config: &HeightmapConfig) -> Vec<u8> {
     let pixel_count = heightmap.width * heightmap.height;
@@ -284,33 +282,57 @@ fn generate_get_bounds_function(config: &HeightmapConfig) -> Function {
 
     // Store min_x at out_ptr + 0
     f.instruction(&Instruction::LocalGet(out_ptr));
-    f.instruction(&Instruction::F64Const(-config.width / 2.0));
-    f.instruction(&Instruction::F64Store(wasm_encoder::MemArg { offset: 0, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::F64Const((-config.width / 2.0).into()));
+    f.instruction(&Instruction::F64Store(wasm_encoder::MemArg {
+        offset: 0,
+        align: 3,
+        memory_index: 0,
+    }));
 
     // Store max_x at out_ptr + 8
     f.instruction(&Instruction::LocalGet(out_ptr));
-    f.instruction(&Instruction::F64Const(config.width / 2.0));
-    f.instruction(&Instruction::F64Store(wasm_encoder::MemArg { offset: 8, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::F64Const((config.width / 2.0).into()));
+    f.instruction(&Instruction::F64Store(wasm_encoder::MemArg {
+        offset: 8,
+        align: 3,
+        memory_index: 0,
+    }));
 
     // Store min_y at out_ptr + 16
     f.instruction(&Instruction::LocalGet(out_ptr));
-    f.instruction(&Instruction::F64Const(0.0));
-    f.instruction(&Instruction::F64Store(wasm_encoder::MemArg { offset: 16, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::F64Const(0.0.into()));
+    f.instruction(&Instruction::F64Store(wasm_encoder::MemArg {
+        offset: 16,
+        align: 3,
+        memory_index: 0,
+    }));
 
     // Store max_y at out_ptr + 24
     f.instruction(&Instruction::LocalGet(out_ptr));
-    f.instruction(&Instruction::F64Const(config.height));
-    f.instruction(&Instruction::F64Store(wasm_encoder::MemArg { offset: 24, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::F64Const(config.height.into()));
+    f.instruction(&Instruction::F64Store(wasm_encoder::MemArg {
+        offset: 24,
+        align: 3,
+        memory_index: 0,
+    }));
 
     // Store min_z at out_ptr + 32
     f.instruction(&Instruction::LocalGet(out_ptr));
-    f.instruction(&Instruction::F64Const(-config.depth / 2.0));
-    f.instruction(&Instruction::F64Store(wasm_encoder::MemArg { offset: 32, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::F64Const((-config.depth / 2.0).into()));
+    f.instruction(&Instruction::F64Store(wasm_encoder::MemArg {
+        offset: 32,
+        align: 3,
+        memory_index: 0,
+    }));
 
     // Store max_z at out_ptr + 40
     f.instruction(&Instruction::LocalGet(out_ptr));
-    f.instruction(&Instruction::F64Const(config.depth / 2.0));
-    f.instruction(&Instruction::F64Store(wasm_encoder::MemArg { offset: 40, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::F64Const((config.depth / 2.0).into()));
+    f.instruction(&Instruction::F64Store(wasm_encoder::MemArg {
+        offset: 40,
+        align: 3,
+        memory_index: 0,
+    }));
 
     f.instruction(&Instruction::End);
     f
@@ -386,46 +408,74 @@ fn generate_sample_function(width_pixels: u32, height_pixels: u32) -> Function {
     // Load position from memory at pos_ptr
     // x at pos_ptr + 0
     f.instruction(&Instruction::LocalGet(pos_ptr));
-    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg { offset: 0, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
+        offset: 0,
+        align: 3,
+        memory_index: 0,
+    }));
     f.instruction(&Instruction::LocalSet(x));
 
     // y at pos_ptr + 8
     f.instruction(&Instruction::LocalGet(pos_ptr));
-    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg { offset: 8, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
+        offset: 8,
+        align: 3,
+        memory_index: 0,
+    }));
     f.instruction(&Instruction::LocalSet(y));
 
     // z at pos_ptr + 16
     f.instruction(&Instruction::LocalGet(pos_ptr));
-    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg { offset: 16, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
+        offset: 16,
+        align: 3,
+        memory_index: 0,
+    }));
     f.instruction(&Instruction::LocalSet(z));
 
     // Load config from memory (at HEADER_OFFSET + field offset)
     // config_width at CONFIG_WIDTH_OFFSET (264)
     f.instruction(&Instruction::I32Const(CONFIG_WIDTH_OFFSET as i32));
-    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg { offset: 0, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
+        offset: 0,
+        align: 3,
+        memory_index: 0,
+    }));
     f.instruction(&Instruction::LocalSet(config_width));
 
     // config_depth at CONFIG_DEPTH_OFFSET (272)
     f.instruction(&Instruction::I32Const(CONFIG_DEPTH_OFFSET as i32));
-    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg { offset: 0, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
+        offset: 0,
+        align: 3,
+        memory_index: 0,
+    }));
     f.instruction(&Instruction::LocalSet(config_depth));
 
     // config_height at CONFIG_HEIGHT_OFFSET (280)
     f.instruction(&Instruction::I32Const(CONFIG_HEIGHT_OFFSET as i32));
-    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg { offset: 0, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
+        offset: 0,
+        align: 3,
+        memory_index: 0,
+    }));
     f.instruction(&Instruction::LocalSet(config_height));
 
     // config_clip at CONFIG_CLIP_OFFSET (288)
     f.instruction(&Instruction::I32Const(CONFIG_CLIP_OFFSET as i32));
-    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg { offset: 0, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
+        offset: 0,
+        align: 3,
+        memory_index: 0,
+    }));
     f.instruction(&Instruction::LocalSet(config_clip));
 
     // Check if y < 0: return 0 (below model)
     f.instruction(&Instruction::LocalGet(y));
-    f.instruction(&Instruction::F64Const(0.0));
+    f.instruction(&Instruction::F64Const(0.0.into()));
     f.instruction(&Instruction::F64Lt);
     f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-    f.instruction(&Instruction::F32Const(0.0));
+    f.instruction(&Instruction::F32Const(0.0.into()));
     f.instruction(&Instruction::Return);
     f.instruction(&Instruction::End);
 
@@ -433,7 +483,7 @@ fn generate_sample_function(width_pixels: u32, height_pixels: u32) -> Function {
     // nx = (x + width/2) / width
     f.instruction(&Instruction::LocalGet(x));
     f.instruction(&Instruction::LocalGet(config_width));
-    f.instruction(&Instruction::F64Const(2.0));
+    f.instruction(&Instruction::F64Const(2.0.into()));
     f.instruction(&Instruction::F64Div);
     f.instruction(&Instruction::F64Add);
     f.instruction(&Instruction::LocalGet(config_width));
@@ -443,7 +493,7 @@ fn generate_sample_function(width_pixels: u32, height_pixels: u32) -> Function {
     // nz = (z + depth/2) / depth
     f.instruction(&Instruction::LocalGet(z));
     f.instruction(&Instruction::LocalGet(config_depth));
-    f.instruction(&Instruction::F64Const(2.0));
+    f.instruction(&Instruction::F64Const(2.0.into()));
     f.instruction(&Instruction::F64Div);
     f.instruction(&Instruction::F64Add);
     f.instruction(&Instruction::LocalGet(config_depth));
@@ -452,22 +502,22 @@ fn generate_sample_function(width_pixels: u32, height_pixels: u32) -> Function {
 
     // Check bounds: if nx < 0 or nx > 1 or nz < 0 or nz > 1, return 0
     f.instruction(&Instruction::LocalGet(nx));
-    f.instruction(&Instruction::F64Const(0.0));
+    f.instruction(&Instruction::F64Const(0.0.into()));
     f.instruction(&Instruction::F64Lt);
     f.instruction(&Instruction::LocalGet(nx));
-    f.instruction(&Instruction::F64Const(1.0));
+    f.instruction(&Instruction::F64Const(1.0.into()));
     f.instruction(&Instruction::F64Gt);
     f.instruction(&Instruction::I32Or);
     f.instruction(&Instruction::LocalGet(nz));
-    f.instruction(&Instruction::F64Const(0.0));
+    f.instruction(&Instruction::F64Const(0.0.into()));
     f.instruction(&Instruction::F64Lt);
     f.instruction(&Instruction::I32Or);
     f.instruction(&Instruction::LocalGet(nz));
-    f.instruction(&Instruction::F64Const(1.0));
+    f.instruction(&Instruction::F64Const(1.0.into()));
     f.instruction(&Instruction::F64Gt);
     f.instruction(&Instruction::I32Or);
     f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-    f.instruction(&Instruction::F32Const(0.0));
+    f.instruction(&Instruction::F32Const(0.0.into()));
     f.instruction(&Instruction::Return);
     f.instruction(&Instruction::End);
 
@@ -475,12 +525,12 @@ fn generate_sample_function(width_pixels: u32, height_pixels: u32) -> Function {
     // px = nx * (width_pixels - 1)
     // pz = nz * (height_pixels - 1)
     f.instruction(&Instruction::LocalGet(nx));
-    f.instruction(&Instruction::F64Const((width_pixels - 1) as f64));
+    f.instruction(&Instruction::F64Const(((width_pixels - 1) as f64).into()));
     f.instruction(&Instruction::F64Mul);
     f.instruction(&Instruction::LocalSet(px));
 
     f.instruction(&Instruction::LocalGet(nz));
-    f.instruction(&Instruction::F64Const((height_pixels - 1) as f64));
+    f.instruction(&Instruction::F64Const(((height_pixels - 1) as f64).into()));
     f.instruction(&Instruction::F64Mul);
     f.instruction(&Instruction::LocalSet(pz));
 
@@ -652,10 +702,10 @@ fn generate_sample_function(width_pixels: u32, height_pixels: u32) -> Function {
     //          + (1-px_frac)*pz_frac*h01 + px_frac*pz_frac*h11
 
     // (1-px_frac)*(1-pz_frac)*h00
-    f.instruction(&Instruction::F64Const(1.0));
+    f.instruction(&Instruction::F64Const(1.0.into()));
     f.instruction(&Instruction::LocalGet(px_frac));
     f.instruction(&Instruction::F64Sub);
-    f.instruction(&Instruction::F64Const(1.0));
+    f.instruction(&Instruction::F64Const(1.0.into()));
     f.instruction(&Instruction::LocalGet(pz_frac));
     f.instruction(&Instruction::F64Sub);
     f.instruction(&Instruction::F64Mul);
@@ -664,7 +714,7 @@ fn generate_sample_function(width_pixels: u32, height_pixels: u32) -> Function {
 
     // + px_frac*(1-pz_frac)*h10
     f.instruction(&Instruction::LocalGet(px_frac));
-    f.instruction(&Instruction::F64Const(1.0));
+    f.instruction(&Instruction::F64Const(1.0.into()));
     f.instruction(&Instruction::LocalGet(pz_frac));
     f.instruction(&Instruction::F64Sub);
     f.instruction(&Instruction::F64Mul);
@@ -673,7 +723,7 @@ fn generate_sample_function(width_pixels: u32, height_pixels: u32) -> Function {
     f.instruction(&Instruction::F64Add);
 
     // + (1-px_frac)*pz_frac*h01
-    f.instruction(&Instruction::F64Const(1.0));
+    f.instruction(&Instruction::F64Const(1.0.into()));
     f.instruction(&Instruction::LocalGet(px_frac));
     f.instruction(&Instruction::F64Sub);
     f.instruction(&Instruction::LocalGet(pz_frac));
@@ -697,7 +747,7 @@ fn generate_sample_function(width_pixels: u32, height_pixels: u32) -> Function {
     f.instruction(&Instruction::LocalGet(config_clip));
     f.instruction(&Instruction::F64Lt);
     f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-    f.instruction(&Instruction::F32Const(0.0));
+    f.instruction(&Instruction::F32Const(0.0.into()));
     f.instruction(&Instruction::Return);
     f.instruction(&Instruction::End);
 
@@ -711,10 +761,12 @@ fn generate_sample_function(width_pixels: u32, height_pixels: u32) -> Function {
     f.instruction(&Instruction::LocalGet(y));
     f.instruction(&Instruction::LocalGet(surface_height));
     f.instruction(&Instruction::F64Le);
-    f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(ValType::F32)));
-    f.instruction(&Instruction::F32Const(1.0));
+    f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(
+        ValType::F32,
+    )));
+    f.instruction(&Instruction::F32Const(1.0.into()));
     f.instruction(&Instruction::Else);
-    f.instruction(&Instruction::F32Const(0.0));
+    f.instruction(&Instruction::F32Const(0.0.into()));
     f.instruction(&Instruction::End);
 
     f.instruction(&Instruction::End);

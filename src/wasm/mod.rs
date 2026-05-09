@@ -42,11 +42,16 @@ pub mod web;
 
 // Re-export main types
 pub use error::WasmBackendError;
-pub use traits::{ModelBounds, ModelBoundsNd, ModelExecutor, OperatorExecutor, OperatorIo, ParallelModelSampler};
+pub use traits::{
+    ModelBounds, ModelBoundsNd, ModelExecutor, OperatorExecutor, OperatorIo, ParallelModelSampler,
+};
 
 // Re-export native types when available
 #[cfg(feature = "native")]
-pub use native::{NativeModelExecutor, NativeModelExecutorNd, NativeOperatorExecutor, NativeParallelSampler, NativeParallelSamplerNd};
+pub use native::{
+    NativeModelExecutor, NativeModelExecutorNd, NativeOperatorExecutor, NativeParallelSampler,
+    NativeParallelSamplerNd,
+};
 
 // Re-export web types when available
 #[cfg(feature = "web")]
@@ -81,9 +86,7 @@ impl ModelExecutor for AutoModelExecutor {
 /// Returns the appropriate executor for the current build configuration.
 /// Automatically detects whether the WASM uses the legacy 3D ABI or the new N-dimensional ABI.
 #[cfg(feature = "native")]
-pub fn create_model_executor(
-    wasm_bytes: &[u8],
-) -> Result<impl ModelExecutor, WasmBackendError> {
+pub fn create_model_executor(wasm_bytes: &[u8]) -> Result<impl ModelExecutor, WasmBackendError> {
     match detect_abi_version(wasm_bytes)? {
         AbiVersion::Nd => {
             let executor = NativeModelExecutorNd::new(wasm_bytes)?;
@@ -98,17 +101,13 @@ pub fn create_model_executor(
 
 /// Create a model executor from WASM bytes (web backend).
 #[cfg(all(feature = "web", not(feature = "native")))]
-pub fn create_model_executor(
-    wasm_bytes: &[u8],
-) -> Result<impl ModelExecutor, WasmBackendError> {
+pub fn create_model_executor(wasm_bytes: &[u8]) -> Result<impl ModelExecutor, WasmBackendError> {
     WebModelExecutor::new(wasm_bytes)
 }
 
 /// Create a model executor from WASM bytes (no backend available).
 #[cfg(not(any(feature = "native", feature = "web")))]
-pub fn create_model_executor(
-    _wasm_bytes: &[u8],
-) -> Result<impl ModelExecutor, WasmBackendError> {
+pub fn create_model_executor(_wasm_bytes: &[u8]) -> Result<impl ModelExecutor, WasmBackendError> {
     Err::<DummyExecutor, _>(WasmBackendError::Unavailable(
         "No WASM backend available. Enable 'native' or 'web' feature.".to_string(),
     ))

@@ -14,7 +14,7 @@ use core::panic::PanicInfo;
 #[cfg(target_arch = "wasm32")]
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
-    unsafe { core::arch::wasm32::unreachable() }
+    core::arch::wasm32::unreachable()
 }
 
 const MIN_X: f64 = -1.0;

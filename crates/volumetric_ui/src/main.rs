@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use ciborium::value::Value as CborValue;
 use eframe::egui;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::fs;
@@ -18,11 +18,11 @@ use std::time::SystemTime;
 
 // Web-specific imports
 #[cfg(target_arch = "wasm32")]
-use wasm_bindgen::prelude::*;
+use poll_promise::Promise;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::JsCast;
 #[cfg(target_arch = "wasm32")]
-use poll_promise::Promise;
+use wasm_bindgen::prelude::*;
 
 mod platform;
 mod renderer;
@@ -62,9 +62,7 @@ impl Default for CancellationToken {
 /// A task to be executed in the background.
 enum BackgroundTask {
     /// Execute a project pipeline
-    RunProject {
-        project: Project,
-    },
+    RunProject { project: Project },
     /// Resample a single asset
     ResampleAsset {
         asset_id: String,
@@ -100,9 +98,7 @@ enum BackgroundTaskResult {
         result: ResampleResult,
     },
     /// Task was cancelled
-    Cancelled {
-        description: String,
-    },
+    Cancelled { description: String },
 }
 
 /// Result of a resample operation
@@ -172,12 +168,13 @@ impl BackgroundWorker {
             }
 
             let result = match task {
-                BackgroundTask::RunProject { project } => {
-                    execute_project(project, &cancel_token)
-                }
-                BackgroundTask::ResampleAsset { asset_id, wasm_bytes, mode, config } => {
-                    execute_resample(asset_id, wasm_bytes, mode, config, &cancel_token)
-                }
+                BackgroundTask::RunProject { project } => execute_project(project, &cancel_token),
+                BackgroundTask::ResampleAsset {
+                    asset_id,
+                    wasm_bytes,
+                    mode,
+                    config,
+                } => execute_resample(asset_id, wasm_bytes, mode, config, &cancel_token),
             };
 
             let _ = result_sender.send(result);
@@ -198,7 +195,9 @@ struct BackgroundWorker {
 #[cfg(target_arch = "wasm32")]
 impl BackgroundWorker {
     fn new() -> Self {
-        Self { pending_tasks: std::collections::VecDeque::new() }
+        Self {
+            pending_tasks: std::collections::VecDeque::new(),
+        }
     }
 
     fn send_task(&mut self, task: BackgroundTask, cancel_token: CancellationToken) {
@@ -527,12 +526,15 @@ struct InProgressOperation {
 
 // Project system - common types
 use volumetric::{
-    adaptive_surface_nets_2, AssetTypeHint, Environment, ExecutionInput, LoadedAsset,
-    OperatorMetadata, OperatorMetadataInput, Project, Triangle,
+    AssetTypeHint, Environment, ExecutionInput, LoadedAsset, OperatorMetadata,
+    OperatorMetadataInput, Project, Triangle, adaptive_surface_nets_2,
 };
 
 // WASM execution functions available on both native and web
-use volumetric::{generate_marching_cubes_mesh_from_bytes, generate_adaptive_mesh_v2_from_bytes, sample_model_from_bytes, operator_metadata_from_wasm_bytes};
+use volumetric::{
+    generate_adaptive_mesh_v2_from_bytes, generate_marching_cubes_mesh_from_bytes,
+    operator_metadata_from_wasm_bytes, sample_model_from_bytes,
+};
 
 // Native-only: Advanced WASM execution functions (require wasmtime directly)
 #[cfg(not(target_arch = "wasm32"))]
@@ -576,9 +578,9 @@ fn parse_cddl_record_schema(cddl: &str) -> Result<Vec<(String, ConfigFieldType)>
         if part.is_empty() {
             continue;
         }
-        let (name, ty) = part
-            .split_once(':')
-            .ok_or_else(|| anyhow::anyhow!("Invalid CDDL field (expected `name: type`): `{part}`"))?;
+        let (name, ty) = part.split_once(':').ok_or_else(|| {
+            anyhow::anyhow!("Invalid CDDL field (expected `name: type`): `{part}`")
+        })?;
         let name = name.trim();
         let ty = ty.trim();
 
@@ -606,11 +608,16 @@ fn parse_cddl_record_schema(cddl: &str) -> Result<Vec<(String, ConfigFieldType)>
                 // Very small subset for string enums:
                 //   op: "union" / "subtract" / "intersect"
                 // Also tolerates surrounding parentheses.
-                let trimmed = other.trim().trim_start_matches('(').trim_end_matches(')').trim();
+                let trimmed = other
+                    .trim()
+                    .trim_start_matches('(')
+                    .trim_end_matches(')')
+                    .trim();
                 let mut options = Vec::new();
                 for opt in trimmed.split('/') {
                     let opt = opt.trim();
-                    if let Some(stripped) = opt.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+                    if let Some(stripped) = opt.strip_prefix('"').and_then(|s| s.strip_suffix('"'))
+                    {
                         if !stripped.is_empty() {
                             options.push(stripped.to_string());
                         }
@@ -640,7 +647,10 @@ fn parse_cddl_record_schema(cddl: &str) -> Result<Vec<(String, ConfigFieldType)>
     Ok(out)
 }
 
-fn encode_config_map_to_cbor(fields: &[(String, ConfigFieldType)], values: &HashMap<String, ConfigValue>) -> Result<Vec<u8>> {
+fn encode_config_map_to_cbor(
+    fields: &[(String, ConfigFieldType)],
+    values: &HashMap<String, ConfigValue>,
+) -> Result<Vec<u8>> {
     let mut map_entries: Vec<(CborValue, CborValue)> = Vec::with_capacity(fields.len());
     for (name, ty) in fields {
         let value = values.get(name);
@@ -665,8 +675,7 @@ fn encode_config_map_to_cbor(fields: &[(String, ConfigFieldType)], values: &Hash
 
     let value = CborValue::Map(map_entries);
     let mut out = Vec::new();
-    ciborium::ser::into_writer(&value, &mut out)
-        .context("Failed to encode configuration CBOR")?;
+    ciborium::ser::into_writer(&value, &mut out).context("Failed to encode configuration CBOR")?;
     Ok(out)
 }
 
@@ -709,8 +718,9 @@ mod cddl_config_tests {
     fn parse_cddl_with_rfc8610_default_syntax() {
         // RFC 8610 specifies .default as the control operator for default values
         let fields = parse_cddl_record_schema(
-            "{ width: float .default 1.0, depth: float .default 1.0, height: float .default 1.0 }"
-        ).unwrap();
+            "{ width: float .default 1.0, depth: float .default 1.0, height: float .default 1.0 }",
+        )
+        .unwrap();
 
         assert_eq!(fields.len(), 3);
         assert_eq!(fields[0].0, "width");
@@ -724,9 +734,7 @@ mod cddl_config_tests {
     #[test]
     fn parse_cddl_with_bool_default() {
         // RFC 8610 .default syntax
-        let fields = parse_cddl_record_schema(
-            "{ center: bool .default false }"
-        ).unwrap();
+        let fields = parse_cddl_record_schema("{ center: bool .default false }").unwrap();
 
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].0, "center");
@@ -736,9 +744,7 @@ mod cddl_config_tests {
     #[test]
     fn parse_cddl_with_legacy_paren_annotations() {
         // Legacy (default X) annotations for backward compatibility
-        let fields = parse_cddl_record_schema(
-            "{ scale: float (default 1.0) }"
-        ).unwrap();
+        let fields = parse_cddl_record_schema("{ scale: float (default 1.0) }").unwrap();
 
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].0, "scale");
@@ -755,7 +761,8 @@ mod wasm_error_reporting_tests {
         let wasm_bytes = vec![0x01, 0x02, 0x03, 0x04];
         let err = sample_model_from_bytes(&wasm_bytes, 4).unwrap_err();
         let msg = format_anyhow_error_chain(&err);
-        assert!(msg.contains("Failed to load WASM module from bytes"), "{msg}");
+        assert!(msg.contains("Failed to create model executor"), "{msg}");
+        assert!(msg.contains("WASM instantiation error"), "{msg}");
     }
 }
 
@@ -778,8 +785,6 @@ impl ExportRenderMode {
         }
     }
 }
-
-/// A triangle in 3D space
 
 /// Per-asset render data for multi-entity rendering support.
 /// Each exported asset can have its own render mode and cached geometry.
@@ -970,7 +975,6 @@ struct CachedOperatorMetadata {
     metadata: Option<OperatorMetadata>,
 }
 
-
 /// Get bundled model WASM bytes by crate name.
 /// Uses the asset registry which embeds WASM at compile time.
 fn get_bundled_model(crate_name: &str) -> Option<&'static [u8]> {
@@ -1030,19 +1034,28 @@ impl VolumetricApp {
             .unwrap_or(wgpu::TextureFormat::Bgra8UnormSrgb);
 
         // If we have an initial project, run it to extract exports
-        let (exported_assets, asset_render_data) = initial_project.as_ref().map_or((vec![], HashMap::new()), |proj| {
-            let mut env = Environment::new();
-            let assets = proj.run(&mut env).unwrap_or_default();
+        let (exported_assets, asset_render_data) =
+            initial_project
+                .as_ref()
+                .map_or((vec![], HashMap::new()), |proj| {
+                    let mut env = Environment::new();
+                    let assets = proj.run(&mut env).unwrap_or_default();
 
-            // Create render data for the first model asset with PointCloud mode
-            let mut render_data = HashMap::new();
-            if let Some(first_model) = assets.iter().find(|a| a.as_model().is_some()) {
-                let id = first_model.id().to_string();
-                let wasm_bytes = first_model.as_model().unwrap().to_vec();
-                render_data.insert(id, AssetRenderData::new(wasm_bytes, ExportRenderMode::AdaptiveSurfaceNets2));
-            }
-            (assets, render_data)
-        });
+                    // Create render data for the first model asset with PointCloud mode
+                    let mut render_data = HashMap::new();
+                    if let Some(first_model) = assets.iter().find(|a| a.as_model().is_some()) {
+                        let id = first_model.id().to_string();
+                        let wasm_bytes = first_model.as_model().unwrap().to_vec();
+                        render_data.insert(
+                            id,
+                            AssetRenderData::new(
+                                wasm_bytes,
+                                ExportRenderMode::AdaptiveSurfaceNets2,
+                            ),
+                        );
+                    }
+                    (assets, render_data)
+                });
 
         Self {
             project: initial_project,
@@ -1102,7 +1115,10 @@ impl VolumetricApp {
     fn poll_background_tasks(&mut self) {
         while let Some(result) = self.background_worker.try_recv_result() {
             match result {
-                BackgroundTaskResult::ProjectComplete { assets, elapsed_secs } => {
+                BackgroundTaskResult::ProjectComplete {
+                    assets,
+                    elapsed_secs,
+                } => {
                     self.in_progress_operation = None;
                     match assets {
                         Ok(assets) => {
@@ -1123,7 +1139,9 @@ impl VolumetricApp {
                             for asset in &self.exported_assets {
                                 if let Some(wasm_bytes) = asset.as_model() {
                                     let asset_id = asset.id();
-                                    if let Some(render_data) = self.asset_render_data.get_mut(asset_id) {
+                                    if let Some(render_data) =
+                                        self.asset_render_data.get_mut(asset_id)
+                                    {
                                         // Update existing entry
                                         render_data.wasm_bytes = wasm_bytes.to_vec();
                                         render_data.needs_resample = true;
@@ -1132,7 +1150,10 @@ impl VolumetricApp {
                                         // New export - initialize with ASNv2 render mode
                                         self.asset_render_data.insert(
                                             asset_id.to_string(),
-                                            AssetRenderData::new(wasm_bytes.to_vec(), ExportRenderMode::AdaptiveSurfaceNets2),
+                                            AssetRenderData::new(
+                                                wasm_bytes.to_vec(),
+                                                ExportRenderMode::AdaptiveSurfaceNets2,
+                                            ),
                                         );
                                     }
                                 }
@@ -1212,7 +1233,8 @@ impl VolumetricApp {
                 );
             }
 
-            return self.operator_metadata_cache
+            return self
+                .operator_metadata_cache
                 .get(&cache_key)
                 .and_then(|c| c.metadata.clone());
         }
@@ -1250,7 +1272,8 @@ impl VolumetricApp {
                     );
                 }
 
-                return self.operator_metadata_cache
+                return self
+                    .operator_metadata_cache
                     .get(&path_str)
                     .and_then(|c| c.metadata.clone());
             }
@@ -1285,10 +1308,8 @@ impl VolumetricApp {
                         data.last_error = None;
                     }
                 } else {
-                    self.asset_render_data.insert(
-                        asset_id.to_string(),
-                        AssetRenderData::new(bytes, mode),
-                    );
+                    self.asset_render_data
+                        .insert(asset_id.to_string(), AssetRenderData::new(bytes, mode));
                 }
                 self.error_message = None;
             }
@@ -1299,7 +1320,7 @@ impl VolumetricApp {
             }
         }
     }
-    
+
     /// Gets the render mode for a specific asset
     fn get_asset_render_mode(&self, asset_id: &str) -> ExportRenderMode {
         self.asset_render_data
@@ -1349,7 +1370,8 @@ impl VolumetricApp {
                     match fs::read(&path) {
                         Ok(bytes) => bytes,
                         Err(e) => {
-                            self.error_message = Some(format!("Failed to read STL import operator: {}", e));
+                            self.error_message =
+                                Some(format!("Failed to read STL import operator: {}", e));
                             return;
                         }
                     }
@@ -1363,7 +1385,10 @@ impl VolumetricApp {
 
             #[cfg(any(target_arch = "wasm32", not(debug_assertions)))]
             {
-                self.error_message = Some("STL Import operator not bundled. Rebuild with WASM assets available.".to_string());
+                self.error_message = Some(
+                    "STL Import operator not bundled. Rebuild with WASM assets available."
+                        .to_string(),
+                );
                 return;
             }
         };
@@ -1374,7 +1399,9 @@ impl VolumetricApp {
         }
 
         // Generate output name for the imported model
-        let output_id = self.project.as_ref()
+        let output_id = self
+            .project
+            .as_ref()
             .map(|p| p.default_output_name("stl_import", None))
             .unwrap_or_else(|| "stl_model".to_string());
 
@@ -1383,13 +1410,22 @@ impl VolumetricApp {
             // Encode default config: { scale: 1.0, translate: [0,0,0], center: false }
             let mut cbor_bytes = Vec::new();
             let config_map = ciborium::value::Value::Map(vec![
-                (ciborium::value::Value::Text("scale".to_string()), ciborium::value::Value::Float(1.0)),
-                (ciborium::value::Value::Text("translate".to_string()), ciborium::value::Value::Array(vec![
-                    ciborium::value::Value::Float(0.0),
-                    ciborium::value::Value::Float(0.0),
-                    ciborium::value::Value::Float(0.0),
-                ])),
-                (ciborium::value::Value::Text("center".to_string()), ciborium::value::Value::Bool(false)),
+                (
+                    ciborium::value::Value::Text("scale".to_string()),
+                    ciborium::value::Value::Float(1.0),
+                ),
+                (
+                    ciborium::value::Value::Text("translate".to_string()),
+                    ciborium::value::Value::Array(vec![
+                        ciborium::value::Value::Float(0.0),
+                        ciborium::value::Value::Float(0.0),
+                        ciborium::value::Value::Float(0.0),
+                    ]),
+                ),
+                (
+                    ciborium::value::Value::Text("center".to_string()),
+                    ciborium::value::Value::Bool(false),
+                ),
             ]);
             ciborium::into_writer(&config_map, &mut cbor_bytes).ok();
             cbor_bytes
@@ -1434,7 +1470,8 @@ impl VolumetricApp {
                     match fs::read(&path) {
                         Ok(bytes) => bytes,
                         Err(e) => {
-                            self.error_message = Some(format!("Failed to read heightmap extrude operator: {}", e));
+                            self.error_message =
+                                Some(format!("Failed to read heightmap extrude operator: {}", e));
                             return;
                         }
                     }
@@ -1448,7 +1485,10 @@ impl VolumetricApp {
 
             #[cfg(any(target_arch = "wasm32", not(debug_assertions)))]
             {
-                self.error_message = Some("Heightmap Extrude operator not bundled. Rebuild with WASM assets available.".to_string());
+                self.error_message = Some(
+                    "Heightmap Extrude operator not bundled. Rebuild with WASM assets available."
+                        .to_string(),
+                );
                 return;
             }
         };
@@ -1459,7 +1499,9 @@ impl VolumetricApp {
         }
 
         // Generate output name for the imported model
-        let output_id = self.project.as_ref()
+        let output_id = self
+            .project
+            .as_ref()
             .map(|p| p.default_output_name("heightmap", None))
             .unwrap_or_else(|| "heightmap_model".to_string());
 
@@ -1468,10 +1510,22 @@ impl VolumetricApp {
             // Encode default config: { width: 1.0, depth: 1.0, height: 1.0, clip: 0.0 }
             let mut cbor_bytes = Vec::new();
             let config_map = ciborium::value::Value::Map(vec![
-                (ciborium::value::Value::Text("width".to_string()), ciborium::value::Value::Float(1.0)),
-                (ciborium::value::Value::Text("depth".to_string()), ciborium::value::Value::Float(1.0)),
-                (ciborium::value::Value::Text("height".to_string()), ciborium::value::Value::Float(1.0)),
-                (ciborium::value::Value::Text("clip".to_string()), ciborium::value::Value::Float(0.0)),
+                (
+                    ciborium::value::Value::Text("width".to_string()),
+                    ciborium::value::Value::Float(1.0),
+                ),
+                (
+                    ciborium::value::Value::Text("depth".to_string()),
+                    ciborium::value::Value::Float(1.0),
+                ),
+                (
+                    ciborium::value::Value::Text("height".to_string()),
+                    ciborium::value::Value::Float(1.0),
+                ),
+                (
+                    ciborium::value::Value::Text("clip".to_string()),
+                    ciborium::value::Value::Float(0.0),
+                ),
             ]);
             ciborium::into_writer(&config_map, &mut cbor_bytes).ok();
             cbor_bytes
@@ -1506,7 +1560,8 @@ impl VolumetricApp {
     /// Resamples all assets that need resampling (in background)
     fn resample_all_assets(&mut self) {
         // Collect assets that need resampling
-        let mut assets_to_resample: Vec<(String, Vec<u8>, ExportRenderMode, ResampleConfig)> = Vec::new();
+        let mut assets_to_resample: Vec<(String, Vec<u8>, ExportRenderMode, ResampleConfig)> =
+            Vec::new();
 
         for (asset_id, render_data) in self.asset_render_data.iter_mut() {
             if !render_data.needs_resample {
@@ -1603,17 +1658,22 @@ impl VolumetricApp {
     #[allow(dead_code)]
     fn project_point(&self, point: (f32, f32, f32), rect: &egui::Rect) -> Option<egui::Pos2> {
         let (cx, cy, cz) = self.camera_position();
-        
+
         // Simple perspective projection
         let dx = point.0 - cx;
         let dy = point.1 - cy;
         let dz = point.2 - cz;
-        
+
         // Camera forward direction (towards origin)
         let forward = (-cx, -cy, -cz);
-        let forward_len = (forward.0 * forward.0 + forward.1 * forward.1 + forward.2 * forward.2).sqrt();
-        let forward = (forward.0 / forward_len, forward.1 / forward_len, forward.2 / forward_len);
-        
+        let forward_len =
+            (forward.0 * forward.0 + forward.1 * forward.1 + forward.2 * forward.2).sqrt();
+        let forward = (
+            forward.0 / forward_len,
+            forward.1 / forward_len,
+            forward.2 / forward_len,
+        );
+
         // Camera right direction
         let up = (0.0, 1.0, 0.0);
         let right = (
@@ -1623,39 +1683,43 @@ impl VolumetricApp {
         );
         let right_len = (right.0 * right.0 + right.1 * right.1 + right.2 * right.2).sqrt();
         let right = if right_len > 0.001 {
-            (right.0 / right_len, right.1 / right_len, right.2 / right_len)
+            (
+                right.0 / right_len,
+                right.1 / right_len,
+                right.2 / right_len,
+            )
         } else {
             (1.0, 0.0, 0.0)
         };
-        
+
         // Camera up direction
         let cam_up = (
             right.1 * forward.2 - right.2 * forward.1,
             right.2 * forward.0 - right.0 * forward.2,
             right.0 * forward.1 - right.1 * forward.0,
         );
-        
+
         // Project point onto camera plane
         let depth = dx * forward.0 + dy * forward.1 + dz * forward.2;
-        
+
         if depth < 0.1 {
             return None; // Behind camera
         }
-        
+
         let proj_x = (dx * right.0 + dy * right.1 + dz * right.2) / depth;
         let proj_y = (dx * cam_up.0 + dy * cam_up.1 + dz * cam_up.2) / depth;
-        
+
         let scale = rect.width().min(rect.height()) * 0.8;
         let screen_x = rect.center().x + proj_x * scale;
         let screen_y = rect.center().y - proj_y * scale;
-        
+
         if rect.contains(egui::pos2(screen_x, screen_y)) {
             Some(egui::pos2(screen_x, screen_y))
         } else {
             None
         }
     }
-    
+
     /// Start editing a timeline step at the given index
     fn start_editing_entry(&mut self, idx: usize) {
         // First, extract all needed data from the project to avoid borrow conflicts
@@ -1669,7 +1733,9 @@ impl VolumetricApp {
             })
         });
 
-        let Some((operator_id, inputs, outputs)) = step_data else { return };
+        let Some((operator_id, inputs, outputs)) = step_data else {
+            return;
+        };
 
         self.editing_entry_index = Some(idx);
         self.edit_config_values.clear();
@@ -1677,9 +1743,7 @@ impl VolumetricApp {
         self.edit_input_asset_ids.clear();
 
         // Populate output asset ID from the first output (primary output)
-        self.edit_output_asset_id = outputs.first()
-            .cloned()
-            .unwrap_or_default();
+        self.edit_output_asset_id = outputs.first().cloned().unwrap_or_default();
 
         // Get operator metadata to understand input types
         let crate_name = operator_id.strip_prefix("op_").unwrap_or(&operator_id);
@@ -1702,7 +1766,9 @@ impl VolumetricApp {
                         // Decode CBOR data to populate config values
                         if let Some(ExecutionInput::Inline(data)) = input {
                             if let Ok(fields) = parse_cddl_record_schema(cddl.as_str()) {
-                                if let Ok(cbor_value) = ciborium::from_reader::<CborValue, _>(data.as_slice()) {
+                                if let Ok(cbor_value) =
+                                    ciborium::from_reader::<CborValue, _>(data.as_slice())
+                                {
                                     if let CborValue::Map(map) = cbor_value {
                                         for (field_name, field_ty) in &fields {
                                             // Find the value in the CBOR map
@@ -1710,28 +1776,39 @@ impl VolumetricApp {
                                                 if let CborValue::Text(key_str) = key {
                                                     if key_str == field_name {
                                                         let config_value = match (field_ty, value) {
-                                                            (ConfigFieldType::Bool, CborValue::Bool(b)) => {
-                                                                Some(ConfigValue::Bool(*b))
-                                                            }
-                                                            (ConfigFieldType::Int, CborValue::Integer(i)) => {
-                                                                Some(ConfigValue::Int(i128::from(*i) as i64))
-                                                            }
-                                                            (ConfigFieldType::Float, CborValue::Float(f)) => {
-                                                                Some(ConfigValue::Float(*f))
-                                                            }
-                                                            (ConfigFieldType::Float, CborValue::Integer(i)) => {
-                                                                Some(ConfigValue::Float(i128::from(*i) as f64))
-                                                            }
-                                                            (ConfigFieldType::Text, CborValue::Text(t)) => {
-                                                                Some(ConfigValue::Text(t.clone()))
-                                                            }
-                                                            (ConfigFieldType::Enum(_), CborValue::Text(t)) => {
-                                                                Some(ConfigValue::Text(t.clone()))
-                                                            }
+                                                            (
+                                                                ConfigFieldType::Bool,
+                                                                CborValue::Bool(b),
+                                                            ) => Some(ConfigValue::Bool(*b)),
+                                                            (
+                                                                ConfigFieldType::Int,
+                                                                CborValue::Integer(i),
+                                                            ) => Some(ConfigValue::Int(
+                                                                i128::from(*i) as i64,
+                                                            )),
+                                                            (
+                                                                ConfigFieldType::Float,
+                                                                CborValue::Float(f),
+                                                            ) => Some(ConfigValue::Float(*f)),
+                                                            (
+                                                                ConfigFieldType::Float,
+                                                                CborValue::Integer(i),
+                                                            ) => Some(ConfigValue::Float(
+                                                                i128::from(*i) as f64,
+                                                            )),
+                                                            (
+                                                                ConfigFieldType::Text,
+                                                                CborValue::Text(t),
+                                                            ) => Some(ConfigValue::Text(t.clone())),
+                                                            (
+                                                                ConfigFieldType::Enum(_),
+                                                                CborValue::Text(t),
+                                                            ) => Some(ConfigValue::Text(t.clone())),
                                                             _ => None,
                                                         };
                                                         if let Some(cv) = config_value {
-                                                            self.edit_config_values.insert(field_name.clone(), cv);
+                                                            self.edit_config_values
+                                                                .insert(field_name.clone(), cv);
                                                         }
                                                         break;
                                                     }
@@ -1764,7 +1841,8 @@ impl VolumetricApp {
                         match input {
                             Some(ExecutionInput::Inline(data)) => {
                                 // Decode raw bytes: each f64 is 8 little-endian bytes
-                                let values: Vec<f64> = data.chunks_exact(8)
+                                let values: Vec<f64> = data
+                                    .chunks_exact(8)
                                     .map(|chunk| {
                                         let arr: [u8; 8] = chunk.try_into().unwrap();
                                         f64::from_le_bytes(arr)
@@ -1774,11 +1852,13 @@ impl VolumetricApp {
                             }
                             Some(ExecutionInput::AssetRef(id)) => {
                                 // Using asset reference
-                                self.edit_vec_inputs.insert(input_idx, (false, vec![0.0; *dim], Some(id.clone())));
+                                self.edit_vec_inputs
+                                    .insert(input_idx, (false, vec![0.0; *dim], Some(id.clone())));
                             }
                             None => {
                                 // No input, use default literal
-                                self.edit_vec_inputs.insert(input_idx, (true, vec![0.0; *dim], None));
+                                self.edit_vec_inputs
+                                    .insert(input_idx, (true, vec![0.0; *dim], None));
                             }
                         }
                     }
@@ -1804,7 +1884,7 @@ impl VolumetricApp {
             }
         }
     }
-    
+
     /// Close the edit panel
     fn close_edit_panel(&mut self) {
         self.editing_entry_index = None;
@@ -1814,19 +1894,21 @@ impl VolumetricApp {
         self.edit_output_asset_id.clear();
         self.edit_vec_inputs.clear();
     }
-    
+
     /// Show the edit panel UI for the currently selected timeline step
     fn show_edit_panel(&mut self, ui: &mut egui::Ui) {
-        let Some(idx) = self.editing_entry_index else { return };
+        let Some(idx) = self.editing_entry_index else {
+            return;
+        };
 
         ui.heading("Edit Step");
         ui.separator();
 
         // Get step info (we need to be careful about borrowing)
         let step_info = self.project.as_ref().and_then(|p| {
-            p.timeline().get(idx).map(|step| {
-                (step.operator_id.clone(), step.inputs.clone())
-            })
+            p.timeline()
+                .get(idx)
+                .map(|step| (step.operator_id.clone(), step.inputs.clone()))
         });
 
         let Some((operator_id, inputs)) = step_info else {
@@ -1881,7 +1963,9 @@ impl VolumetricApp {
 
                                 // Initialize from existing input if not set
                                 if self.edit_input_asset_ids[input_idx].is_none() {
-                                    if let Some(ExecutionInput::AssetRef(id)) = inputs.get(input_idx) {
+                                    if let Some(ExecutionInput::AssetRef(id)) =
+                                        inputs.get(input_idx)
+                                    {
                                         self.edit_input_asset_ids[input_idx] = Some(id.clone());
                                     }
                                 }
@@ -1906,7 +1990,7 @@ impl VolumetricApp {
                         OperatorMetadataInput::CBORConfiguration(cddl) => {
                             ui.separator();
                             ui.label("Configuration:");
-                            
+
                             match parse_cddl_record_schema(cddl.as_str()) {
                                 Ok(fields) => {
                                     for (field_name, field_ty) in &fields {
@@ -1944,7 +2028,9 @@ impl VolumetricApp {
                                                     let entry = self
                                                         .edit_config_values
                                                         .entry(field_name.clone())
-                                                        .or_insert_with(|| ConfigValue::Text(String::new()));
+                                                        .or_insert_with(|| {
+                                                            ConfigValue::Text(String::new())
+                                                        });
                                                     if let ConfigValue::Text(t) = entry {
                                                         ui.text_edit_singleline(t);
                                                     }
@@ -1954,17 +2040,28 @@ impl VolumetricApp {
                                                         .edit_config_values
                                                         .entry(field_name.clone())
                                                         .or_insert_with(|| {
-                                                            ConfigValue::Text(options.first().cloned().unwrap_or_default())
+                                                            ConfigValue::Text(
+                                                                options
+                                                                    .first()
+                                                                    .cloned()
+                                                                    .unwrap_or_default(),
+                                                            )
                                                         });
 
                                                     if let ConfigValue::Text(selected) = entry {
-                                                        egui::ComboBox::from_id_salt(format!("edit_cfg_enum_{field_name}"))
-                                                            .selected_text(selected.as_str())
-                                                            .show_ui(ui, |ui| {
-                                                                for opt in options {
-                                                                    ui.selectable_value(selected, opt.clone(), opt);
-                                                                }
-                                                            });
+                                                        egui::ComboBox::from_id_salt(format!(
+                                                            "edit_cfg_enum_{field_name}"
+                                                        ))
+                                                        .selected_text(selected.as_str())
+                                                        .show_ui(ui, |ui| {
+                                                            for opt in options {
+                                                                ui.selectable_value(
+                                                                    selected,
+                                                                    opt.clone(),
+                                                                    opt,
+                                                                );
+                                                            }
+                                                        });
                                                     }
                                                 }
                                             }
@@ -1972,16 +2069,17 @@ impl VolumetricApp {
                                     }
                                 }
                                 Err(e) => {
-                                    ui.colored_label(egui::Color32::YELLOW, format!(
-                                        "Unsupported configuration schema: {e}"
-                                    ));
+                                    ui.colored_label(
+                                        egui::Color32::YELLOW,
+                                        format!("Unsupported configuration schema: {e}"),
+                                    );
                                 }
                             }
                         }
                         OperatorMetadataInput::LuaSource(template) => {
                             ui.separator();
                             ui.label("Lua Script:");
-                            
+
                             // Initialize with existing script or template
                             if self.edit_lua_script.is_empty() {
                                 // Try to get from existing input
@@ -2000,7 +2098,7 @@ impl VolumetricApp {
                                     self.edit_lua_script = template.clone();
                                 }
                             }
-                            
+
                             egui::ScrollArea::vertical()
                                 .max_height(200.0)
                                 .show(ui, |ui| {
@@ -2011,7 +2109,7 @@ impl VolumetricApp {
                                             .desired_rows(10),
                                     );
                                 });
-                            
+
                             if ui.button("Reset to template").clicked() {
                                 self.edit_lua_script = template.clone();
                             }
@@ -2032,8 +2130,11 @@ impl VolumetricApp {
                             ui.label(label);
 
                             // Initialize if not present
-                            let entry = self.edit_vec_inputs.entry(input_idx)
-                                .or_insert((true, vec![0.0; *dim], None));
+                            let entry = self.edit_vec_inputs.entry(input_idx).or_insert((
+                                true,
+                                vec![0.0; *dim],
+                                None,
+                            ));
 
                             ui.horizontal(|ui| {
                                 ui.radio_value(&mut entry.0, true, "Literal");
@@ -2056,10 +2157,15 @@ impl VolumetricApp {
                             } else {
                                 // Asset mode - show asset selector
                                 // Find compatible assets (VecF64 with matching dimension)
-                                let vec_asset_ids: Vec<String> = self.project.as_ref()
+                                let vec_asset_ids: Vec<String> = self
+                                    .project
+                                    .as_ref()
                                     .map(|p| {
-                                        p.imports().iter()
-                                            .filter(|a| a.type_hint == Some(AssetTypeHint::VecF64(*dim)))
+                                        p.imports()
+                                            .iter()
+                                            .filter(|a| {
+                                                a.type_hint == Some(AssetTypeHint::VecF64(*dim))
+                                            })
                                             .map(|a| a.id.clone())
                                             .collect()
                                     })
@@ -2069,18 +2175,27 @@ impl VolumetricApp {
                                 egui::ComboBox::from_id_salt(format!("edit_vec_input_{input_idx}"))
                                     .selected_text(selected)
                                     .show_ui(ui, |ui| {
-                                        if ui.selectable_label(entry.2.is_none(), "(none)").clicked() {
+                                        if ui
+                                            .selectable_label(entry.2.is_none(), "(none)")
+                                            .clicked()
+                                        {
                                             entry.2 = None;
                                         }
                                         for id in &vec_asset_ids {
-                                            if ui.selectable_label(entry.2.as_ref() == Some(id), id).clicked() {
+                                            if ui
+                                                .selectable_label(entry.2.as_ref() == Some(id), id)
+                                                .clicked()
+                                            {
                                                 entry.2 = Some(id.clone());
                                             }
                                         }
                                     });
 
                                 if vec_asset_ids.is_empty() {
-                                    ui.colored_label(egui::Color32::YELLOW, "(no compatible assets)");
+                                    ui.colored_label(
+                                        egui::Color32::YELLOW,
+                                        "(no compatible assets)",
+                                    );
                                 }
                             }
                         }
@@ -2093,10 +2208,10 @@ impl VolumetricApp {
                 }
             }
         });
-        
+
         ui.add_space(8.0);
         ui.separator();
-        
+
         // Output name editing
         ui.label("Output:");
         ui.indent("edit_output", |ui| {
@@ -2105,14 +2220,17 @@ impl VolumetricApp {
                 ui.text_edit_singleline(&mut self.edit_output_asset_id);
             });
         });
-        
+
         ui.add_space(16.0);
         ui.separator();
-        
+
         // Action buttons
         let can_apply = !self.edit_output_asset_id.trim().is_empty();
         ui.horizontal(|ui| {
-            if ui.add_enabled(can_apply, egui::Button::new("Apply Changes")).clicked() {
+            if ui
+                .add_enabled(can_apply, egui::Button::new("Apply Changes"))
+                .clicked()
+            {
                 self.apply_edit_changes();
             }
             if ui.button("Cancel").clicked() {
@@ -2120,17 +2238,22 @@ impl VolumetricApp {
             }
         });
     }
-    
+
     /// Apply the changes from the edit panel to the timeline step
     fn apply_edit_changes(&mut self) {
-        let Some(idx) = self.editing_entry_index else { return };
+        let Some(idx) = self.editing_entry_index else {
+            return;
+        };
 
         // Get operator metadata for building new inputs
-        let operator_id = self.project.as_ref().and_then(|p| {
-            p.timeline().get(idx).map(|step| step.operator_id.clone())
-        });
+        let operator_id = self
+            .project
+            .as_ref()
+            .and_then(|p| p.timeline().get(idx).map(|step| step.operator_id.clone()));
 
-        let Some(operator_id) = operator_id else { return };
+        let Some(operator_id) = operator_id else {
+            return;
+        };
         let crate_name = operator_id.strip_prefix("op_").unwrap_or(&operator_id);
         let operator_metadata = self.operator_metadata_cached(crate_name);
 
@@ -2142,7 +2265,8 @@ impl VolumetricApp {
             for input_meta in &metadata.inputs {
                 match input_meta {
                     OperatorMetadataInput::ModelWASM => {
-                        let asset_id = self.edit_input_asset_ids
+                        let asset_id = self
+                            .edit_input_asset_ids
                             .get(model_input_idx)
                             .and_then(|o| o.clone())
                             .unwrap_or_default();
@@ -2164,7 +2288,9 @@ impl VolumetricApp {
                         // We need to preserve the original inline data from the step
                         if let Some(ref project) = self.project {
                             if let Some(step) = project.timeline().get(idx) {
-                                if let Some(ExecutionInput::Inline(data)) = step.inputs.get(inputs.len()) {
+                                if let Some(ExecutionInput::Inline(data)) =
+                                    step.inputs.get(inputs.len())
+                                {
                                     inputs.push(ExecutionInput::Inline(data.clone()));
                                 } else {
                                     inputs.push(ExecutionInput::Inline(Vec::new()));
@@ -2178,27 +2304,26 @@ impl VolumetricApp {
                     }
                     OperatorMetadataInput::VecF64(dim) => {
                         let input_idx = inputs.len();
-                        if let Some((use_literal, values, asset_ref)) = self.edit_vec_inputs.get(&input_idx) {
+                        if let Some((use_literal, values, asset_ref)) =
+                            self.edit_vec_inputs.get(&input_idx)
+                        {
                             if *use_literal {
                                 // Encode as raw bytes: each f64 as 8 little-endian bytes
-                                let bytes: Vec<u8> = values.iter()
-                                    .flat_map(|v| v.to_le_bytes())
-                                    .collect();
+                                let bytes: Vec<u8> =
+                                    values.iter().flat_map(|v| v.to_le_bytes()).collect();
                                 inputs.push(ExecutionInput::Inline(bytes));
                             } else if let Some(asset_id) = asset_ref {
                                 inputs.push(ExecutionInput::AssetRef(asset_id.clone()));
                             } else {
                                 // No asset selected, use default literal
-                                let bytes: Vec<u8> = (0..*dim)
-                                    .flat_map(|_| 0.0_f64.to_le_bytes())
-                                    .collect();
+                                let bytes: Vec<u8> =
+                                    (0..*dim).flat_map(|_| 0.0_f64.to_le_bytes()).collect();
                                 inputs.push(ExecutionInput::Inline(bytes));
                             }
                         } else {
                             // No entry, use default literal
-                            let bytes: Vec<u8> = (0..*dim)
-                                .flat_map(|_| 0.0_f64.to_le_bytes())
-                                .collect();
+                            let bytes: Vec<u8> =
+                                (0..*dim).flat_map(|_| 0.0_f64.to_le_bytes()).collect();
                             inputs.push(ExecutionInput::Inline(bytes));
                         }
                     }
@@ -2213,7 +2338,10 @@ impl VolumetricApp {
         // Update the timeline step
         if let Some(ref mut project) = self.project {
             // Get the old output ID to update exports
-            let old_output_id = project.timeline().get(idx).and_then(|step| step.outputs.first().cloned());
+            let old_output_id = project
+                .timeline()
+                .get(idx)
+                .and_then(|step| step.outputs.first().cloned());
             let new_output_id = self.edit_output_asset_id.trim().to_string();
 
             if let Some(step) = project.timeline_mut().get_mut(idx) {
@@ -2221,13 +2349,18 @@ impl VolumetricApp {
                 step.inputs = new_inputs;
 
                 // Update output IDs
-                let new_outputs: Vec<String> = step.outputs.iter().enumerate().map(|(i, _old_out)| {
-                    if i == 0 {
-                        new_output_id.clone()
-                    } else {
-                        format!("{}_{}", new_output_id, i)
-                    }
-                }).collect();
+                let new_outputs: Vec<String> = step
+                    .outputs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _old_out)| {
+                        if i == 0 {
+                            new_output_id.clone()
+                        } else {
+                            format!("{}_{}", new_output_id, i)
+                        }
+                    })
+                    .collect();
                 step.outputs = new_outputs;
             }
 
@@ -2254,7 +2387,9 @@ impl VolumetricApp {
 }
 
 impl eframe::App for VolumetricApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+
         // Poll for completed background tasks
         self.poll_background_tasks();
 
@@ -2333,7 +2468,11 @@ impl eframe::App for VolumetricApp {
             }
 
             // Request repaint while async operations are pending
-            if self.pending_wasm_import.is_some() || self.pending_project_load.is_some() || self.pending_stl_import.is_some() || self.pending_heightmap_import.is_some() {
+            if self.pending_wasm_import.is_some()
+                || self.pending_project_load.is_some()
+                || self.pending_stl_import.is_some()
+                || self.pending_heightmap_import.is_some()
+            {
                 ctx.request_repaint();
             }
         }
@@ -2361,9 +2500,9 @@ impl eframe::App for VolumetricApp {
         }
 
         // Left panel with controls
-        egui::SidePanel::left("controls")
-            .default_width(250.0)
-            .show(ctx, |ui| {
+        egui::Panel::left("controls")
+            .default_size(250.0)
+            .show_inside(ui, |ui| {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false; 2])
                     .show(ui, |ui| {
@@ -2571,11 +2710,11 @@ impl eframe::App for VolumetricApp {
                         // ═══════════════════════════════════════════════════════════════
                         ui.collapsing("📦 Models", |ui| {
                             ui.add_space(4.0);
-                            
+
                             // Track which model to add (if any)
                             let mut model_to_add: Option<&str> = None;
                             let btn_width = ui.available_width();
-                            
+
                             // Primitive shapes
                             ui.label("Primitives");
                             if ui.add(egui::Button::new("● Sphere").min_size(egui::vec2(btn_width, 28.0))).clicked() {
@@ -2587,7 +2726,7 @@ impl eframe::App for VolumetricApp {
                             if ui.add(egui::Button::new("▢ Rounded Box").min_size(egui::vec2(btn_width, 28.0))).clicked() {
                                 model_to_add = Some("rounded_box_model");
                             }
-                            
+
                             ui.add_space(8.0);
                             ui.label("Complex");
                             if ui.add(egui::Button::new("✦ Gyroid Lattice").min_size(egui::vec2(btn_width, 28.0))).clicked() {
@@ -2596,7 +2735,7 @@ impl eframe::App for VolumetricApp {
                             if ui.add(egui::Button::new("❋ Mandelbulb").min_size(egui::vec2(btn_width, 28.0))).clicked() {
                                 model_to_add = Some("mandelbulb_model");
                             }
-                            
+
                             // Handle model addition - uses bundled assets with optional filesystem fallback in debug
                             if let Some(crate_name) = model_to_add {
                                 // First try bundled assets (works on both native and web)
@@ -2654,7 +2793,7 @@ impl eframe::App for VolumetricApp {
                                     }
                                 }
                             }
-                            
+
                             ui.add_space(8.0);
                             ui.separator();
 
@@ -2799,7 +2938,7 @@ impl eframe::App for VolumetricApp {
                 // ═══════════════════════════════════════════════════════════════
                 ui.collapsing("⚙ Operators", |ui| {
                     ui.add_space(4.0);
-                    
+
                     // Get available input assets for operators (only models)
                     let input_asset_ids: Vec<String> = self
                         .project
@@ -2817,7 +2956,7 @@ impl eframe::App for VolumetricApp {
                                 .collect::<Vec<_>>()
                         })
                         .unwrap_or_default();
-                    
+
                     // Update default inputs
                     let needs_default_input = match self.operation_input_asset_id.as_deref() {
                         Some(id) => !input_asset_ids.iter().any(|x| x == id),
@@ -2826,7 +2965,7 @@ impl eframe::App for VolumetricApp {
                     if needs_default_input {
                         self.operation_input_asset_id = input_asset_ids.first().cloned();
                     }
-                    
+
                     let needs_default_input_b = match self.operation_input_asset_id_b.as_deref() {
                         Some(id) => !input_asset_ids.iter().any(|x| x == id),
                         None => true,
@@ -2837,11 +2976,11 @@ impl eframe::App for VolumetricApp {
                             .cloned()
                             .or_else(|| self.operation_input_asset_id.clone());
                     }
-                    
+
                     // Track which operator to add (if any)
                     let mut operator_to_add: Option<&str> = None;
                     let btn_width = ui.available_width();
-                    
+
                     // Transform operators
                     ui.label("Transform");
                     if ui.add(egui::Button::new("↔ Translate").min_size(egui::vec2(btn_width, 28.0))).clicked() {
@@ -2853,13 +2992,13 @@ impl eframe::App for VolumetricApp {
                     if ui.add(egui::Button::new("⤢ Scale").min_size(egui::vec2(btn_width, 28.0))).clicked() {
                         operator_to_add = Some("scale_operator");
                     }
-                    
+
                     ui.add_space(8.0);
                     ui.label("Combine");
                     if ui.add(egui::Button::new("⊕ Boolean").min_size(egui::vec2(btn_width, 28.0))).clicked() {
                         operator_to_add = Some("boolean_operator");
                     }
-                    
+
                     ui.add_space(8.0);
                     ui.label("Emitters");
                     if ui.add(egui::Button::new("▭ Rectangular Prism").min_size(egui::vec2(btn_width, 28.0))).clicked() {
@@ -2871,7 +3010,7 @@ impl eframe::App for VolumetricApp {
                     if ui.add(egui::Button::new("📜 Lua Script").min_size(egui::vec2(btn_width, 28.0))).clicked() {
                         operator_to_add = Some("lua_script_operator");
                     }
-                    
+
                     // Handle operator addition
                     if let Some(crate_name) = operator_to_add {
                         // Check if we have a project and required inputs
@@ -2885,7 +3024,7 @@ impl eframe::App for VolumetricApp {
                                     .count()
                             })
                             .unwrap_or(1);
-                        
+
                         let has_required_inputs = if model_input_count >= 2 {
                             self.operation_input_asset_id.is_some() && self.operation_input_asset_id_b.is_some()
                         } else if model_input_count == 1 {
@@ -2893,7 +3032,7 @@ impl eframe::App for VolumetricApp {
                         } else {
                             true
                         };
-                        
+
                         if self.project.is_none() {
                             self.error_message = Some("Please add a model first before adding operators.".to_string());
                         } else if !has_required_inputs {
@@ -3424,7 +3563,7 @@ impl eframe::App for VolumetricApp {
                                     if let Some(render_data) = self.asset_render_data.get_mut(&asset_id) {
                                         let mut resolution = render_data.resolution;
                                         let mut auto_resample = render_data.auto_resample;
-                                        
+
                                         ui.horizontal(|ui| {
                                             ui.label("Resolution:");
                                             if ui.add(egui::Slider::new(&mut resolution, 5..=300)).changed() {
@@ -3434,7 +3573,7 @@ impl eframe::App for VolumetricApp {
                                                 }
                                             }
                                         });
-                                        
+
                                         ui.horizontal(|ui| {
                                             if ui.checkbox(&mut auto_resample, "Auto Resample").changed() {
                                                 render_data.auto_resample = auto_resample;
@@ -3574,7 +3713,7 @@ impl eframe::App for VolumetricApp {
                                         ui.horizontal(|ui| {
                                             ui.weak(format!("Meshed in {:.2}ms", time * 1000.0));
                                             if let Some(count) = render_data.last_sample_count {
-                                                let avg = (time * 1000_000.0) / (count as f32);
+                                                let avg = (time * 1_000_000.0) / (count as f32);
                                                 ui.weak(format!("({:.2}µs/sample avg)", avg));
                                             }
                                         });
@@ -3753,24 +3892,22 @@ impl eframe::App for VolumetricApp {
 
         // Right panel for editing project entries (shown when editing_entry_index is Some)
         if self.editing_entry_index.is_some() {
-            egui::SidePanel::right("edit_panel")
-                .default_width(300.0)
-                .show(ctx, |ui| {
+            egui::Panel::right("edit_panel")
+                .default_size(300.0)
+                .show_inside(ui, |ui| {
                     self.show_edit_panel(ui);
                 });
         }
 
         // Central panel with 3D view
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let (response, painter) = ui.allocate_painter(
-                ui.available_size(),
-                egui::Sense::click_and_drag(),
-            );
-            
+        egui::CentralPanel::default().show_inside(ui, |ui| {
+            let (response, painter) =
+                ui.allocate_painter(ui.available_size(), egui::Sense::click_and_drag());
+
             let rect = response.rect;
 
             // Gather input state for camera control
-            let scroll = ui.input(|i| i.raw_scroll_delta.y);
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
             let modifiers = ui.input(|i| i.modifiers);
 
             let input_state = renderer::CameraInputState {
@@ -3842,7 +3979,7 @@ impl eframe::App for VolumetricApp {
                 }
                 renderer::CameraAction::None => {}
             }
-            
+
             // Draw background
             painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(25, 25, 38));
 
@@ -3857,7 +3994,8 @@ impl eframe::App for VolumetricApp {
 
             // Add point clouds from assets
             for asset_data in self.asset_render_data.values() {
-                if asset_data.mode == ExportRenderMode::PointCloud && !asset_data.points.is_empty() {
+                if asset_data.mode == ExportRenderMode::PointCloud && !asset_data.points.is_empty()
+                {
                     scene.add_points(
                         renderer::convert_points_to_point_data(&asset_data.points),
                         glam::Mat4::IDENTITY,
@@ -3873,10 +4011,11 @@ impl eframe::App for VolumetricApp {
 
             // Add meshes from assets
             for asset_data in self.asset_render_data.values() {
-                if matches!(asset_data.mode,
-                    ExportRenderMode::MarchingCubes |
-                    ExportRenderMode::AdaptiveSurfaceNets2
-                ) && !asset_data.mesh_vertices.is_empty() {
+                if matches!(
+                    asset_data.mode,
+                    ExportRenderMode::MarchingCubes | ExportRenderMode::AdaptiveSurfaceNets2
+                ) && !asset_data.mesh_vertices.is_empty()
+                {
                     scene.add_mesh(
                         renderer::convert_mesh_data(
                             &asset_data.mesh_vertices,
@@ -3927,14 +4066,21 @@ impl eframe::App for VolumetricApp {
             painter.add(egui::Shape::Callback(cb));
 
             // Draw info text showing totals across all rendered assets
-            let total_points: usize = self.asset_render_data.values()
+            let total_points: usize = self
+                .asset_render_data
+                .values()
                 .filter(|d| d.mode == ExportRenderMode::PointCloud)
                 .map(|d| d.points.len())
                 .sum();
-            let total_triangles: usize = self.asset_render_data.values()
-                .filter(|d| matches!(d.mode,
-                    ExportRenderMode::MarchingCubes |
-                    ExportRenderMode::AdaptiveSurfaceNets2))
+            let total_triangles: usize = self
+                .asset_render_data
+                .values()
+                .filter(|d| {
+                    matches!(
+                        d.mode,
+                        ExportRenderMode::MarchingCubes | ExportRenderMode::AdaptiveSurfaceNets2
+                    )
+                })
                 .map(|d| {
                     // For ASN2, count triangles from indices
                     if let Some(ref indices) = d.mesh_indices {
@@ -4008,7 +4154,7 @@ fn triangles_to_mesh_vertices(triangles: &[Triangle]) -> Vec<renderer::MeshVerte
         for i in idxs {
             let v = tri.vertices[i];
             let n = tri.normals[i];
-            
+
             // Fallback to up vector if normal is degenerate
             let normal = if n.0 == 0.0 && n.1 == 0.0 && n.2 == 0.0 {
                 [0.0, 1.0, 0.0]
@@ -4154,13 +4300,15 @@ pub fn start() -> Result<(), JsValue> {
     // Force WebGL2 backend instead of WebGPU to avoid memory issues
     let web_options = eframe::WebOptions {
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
-            wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(eframe::egui_wgpu::WgpuSetupCreateNew {
-                instance_descriptor: wgpu::InstanceDescriptor {
-                    backends: wgpu::Backends::GL,
+            wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(
+                eframe::egui_wgpu::WgpuSetupCreateNew {
+                    instance_descriptor: wgpu::InstanceDescriptor {
+                        backends: wgpu::Backends::GL,
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
-                ..Default::default()
-            }),
+            ),
             ..Default::default()
         },
         ..Default::default()

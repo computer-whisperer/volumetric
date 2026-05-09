@@ -23,6 +23,7 @@ use wasm_encoder::{
 // ============================================================================
 
 // NOTE: Order must match the OperatorMetadataInput enum in src/lib.rs for CBOR compatibility
+#[allow(dead_code)]
 #[derive(Clone, Debug, serde::Serialize)]
 enum OperatorMetadataInput {
     ModelWASM,
@@ -109,7 +110,7 @@ struct ParsedMesh {
 struct BvhNode {
     aabb_min: [f64; 3],
     aabb_max: [f64; 3],
-    left_or_start: u32,  // left child index (internal) or first triangle index (leaf)
+    left_or_start: u32, // left child index (internal) or first triangle index (leaf)
     right_or_count: u32, // right child index (internal) or triangle count (leaf)
     is_leaf: bool,
 }
@@ -172,7 +173,12 @@ fn parse_binary_stl(data: &[u8]) -> Result<Vec<Triangle>, &'static str> {
                 if offset + 4 > data.len() {
                     return Err("Unexpected end of binary STL");
                 }
-                let bytes = [data[offset], data[offset + 1], data[offset + 2], data[offset + 3]];
+                let bytes = [
+                    data[offset],
+                    data[offset + 1],
+                    data[offset + 2],
+                    data[offset + 3],
+                ];
                 *coord = f32::from_le_bytes(bytes) as f64;
                 offset += 4;
             }
@@ -249,7 +255,12 @@ fn compute_aabb(triangles: &[Triangle]) -> ([f64; 3], [f64; 3]) {
     (min, max)
 }
 
-fn apply_transforms(triangles: &mut [Triangle], config: &StlImportConfig, aabb_min: &[f64; 3], aabb_max: &[f64; 3]) {
+fn apply_transforms(
+    triangles: &mut [Triangle],
+    config: &StlImportConfig,
+    aabb_min: &[f64; 3],
+    aabb_max: &[f64; 3],
+) {
     // Compute center if centering is requested
     let center_offset = if config.center {
         [
@@ -327,7 +338,12 @@ fn aabb_surface_area(min: &[f64; 3], max: &[f64; 3]) -> f64 {
     2.0 * (dx * dy + dy * dz + dz * dx)
 }
 
-fn merge_aabb(a_min: &[f64; 3], a_max: &[f64; 3], b_min: &[f64; 3], b_max: &[f64; 3]) -> ([f64; 3], [f64; 3]) {
+fn merge_aabb(
+    a_min: &[f64; 3],
+    a_max: &[f64; 3],
+    b_min: &[f64; 3],
+    b_max: &[f64; 3],
+) -> ([f64; 3], [f64; 3]) {
     let min = [
         a_min[0].min(b_min[0]),
         a_min[1].min(b_min[1]),
@@ -438,7 +454,12 @@ fn build_bvh_recursive(
     }
 
     // Partition indices by centroid along best axis
-    partition_by_axis(&mut indices[start..end], centroids, best_axis, best_split_idx);
+    partition_by_axis(
+        &mut indices[start..end],
+        centroids,
+        best_axis,
+        best_split_idx,
+    );
 
     let mid = start + best_split_idx;
 
@@ -579,8 +600,8 @@ fn partition_by_axis(indices: &mut [u32], centroids: &[[f64; 3]], axis: usize, s
 // Memory layout constants
 // First 256 bytes reserved for I/O buffers (position input at 0, bounds output at 256)
 const IO_BUFFER_SIZE: u32 = 256;
-const BOUNDS_BUFFER_OFFSET: u32 = 256;
-const HEADER_OFFSET: u32 = IO_BUFFER_SIZE + 48; // After I/O buffers (48 bytes for bounds)
+const BOUNDS_BUFFER_OFFSET: u32 = IO_BUFFER_SIZE;
+const HEADER_OFFSET: u32 = BOUNDS_BUFFER_OFFSET + 48; // After bounds output buffer
 const HEADER_SIZE: u32 = 16;
 const NODE_SIZE: u32 = 56; // 6 × f64 (48) + 2 × u32 (8)
 const TRIANGLE_SIZE: u32 = 72; // 9 × f64
@@ -729,7 +750,8 @@ fn serialize_data(
         for (vi, v) in [tri.v0, tri.v1, tri.v2].iter().enumerate() {
             for j in 0..3 {
                 let bytes = v[j].to_le_bytes();
-                data[offset + vi * 24 + j * 8..offset + vi * 24 + j * 8 + 8].copy_from_slice(&bytes);
+                data[offset + vi * 24 + j * 8..offset + vi * 24 + j * 8 + 8]
+                    .copy_from_slice(&bytes);
             }
         }
     }
@@ -757,38 +779,86 @@ fn generate_get_bounds_function(nodes_offset: u32) -> Function {
     // min_x -> out_ptr + 0
     f.instruction(&Instruction::LocalGet(0)); // out_ptr
     f.instruction(&Instruction::I32Const(nodes_offset as i32));
-    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg { offset: 0, align: 3, memory_index: 0 }));
-    f.instruction(&Instruction::F64Store(wasm_encoder::MemArg { offset: 0, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
+        offset: 0,
+        align: 3,
+        memory_index: 0,
+    }));
+    f.instruction(&Instruction::F64Store(wasm_encoder::MemArg {
+        offset: 0,
+        align: 3,
+        memory_index: 0,
+    }));
 
     // max_x -> out_ptr + 8
     f.instruction(&Instruction::LocalGet(0));
     f.instruction(&Instruction::I32Const(nodes_offset as i32));
-    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg { offset: 24, align: 3, memory_index: 0 }));
-    f.instruction(&Instruction::F64Store(wasm_encoder::MemArg { offset: 8, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
+        offset: 24,
+        align: 3,
+        memory_index: 0,
+    }));
+    f.instruction(&Instruction::F64Store(wasm_encoder::MemArg {
+        offset: 8,
+        align: 3,
+        memory_index: 0,
+    }));
 
     // min_y -> out_ptr + 16
     f.instruction(&Instruction::LocalGet(0));
     f.instruction(&Instruction::I32Const(nodes_offset as i32));
-    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg { offset: 8, align: 3, memory_index: 0 }));
-    f.instruction(&Instruction::F64Store(wasm_encoder::MemArg { offset: 16, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
+        offset: 8,
+        align: 3,
+        memory_index: 0,
+    }));
+    f.instruction(&Instruction::F64Store(wasm_encoder::MemArg {
+        offset: 16,
+        align: 3,
+        memory_index: 0,
+    }));
 
     // max_y -> out_ptr + 24
     f.instruction(&Instruction::LocalGet(0));
     f.instruction(&Instruction::I32Const(nodes_offset as i32));
-    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg { offset: 32, align: 3, memory_index: 0 }));
-    f.instruction(&Instruction::F64Store(wasm_encoder::MemArg { offset: 24, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
+        offset: 32,
+        align: 3,
+        memory_index: 0,
+    }));
+    f.instruction(&Instruction::F64Store(wasm_encoder::MemArg {
+        offset: 24,
+        align: 3,
+        memory_index: 0,
+    }));
 
     // min_z -> out_ptr + 32
     f.instruction(&Instruction::LocalGet(0));
     f.instruction(&Instruction::I32Const(nodes_offset as i32));
-    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg { offset: 16, align: 3, memory_index: 0 }));
-    f.instruction(&Instruction::F64Store(wasm_encoder::MemArg { offset: 32, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
+        offset: 16,
+        align: 3,
+        memory_index: 0,
+    }));
+    f.instruction(&Instruction::F64Store(wasm_encoder::MemArg {
+        offset: 32,
+        align: 3,
+        memory_index: 0,
+    }));
 
     // max_z -> out_ptr + 40
     f.instruction(&Instruction::LocalGet(0));
     f.instruction(&Instruction::I32Const(nodes_offset as i32));
-    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg { offset: 40, align: 3, memory_index: 0 }));
-    f.instruction(&Instruction::F64Store(wasm_encoder::MemArg { offset: 40, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
+        offset: 40,
+        align: 3,
+        memory_index: 0,
+    }));
+    f.instruction(&Instruction::F64Store(wasm_encoder::MemArg {
+        offset: 40,
+        align: 3,
+        memory_index: 0,
+    }));
 
     f.instruction(&Instruction::End);
     f
@@ -826,27 +896,27 @@ fn generate_sample_function(
     // 46: t (f64)
 
     let locals = vec![
-        (3, ValType::F64),  // x, y, z
-        (1, ValType::I32),  // hit_count
-        (1, ValType::I32),  // stack_ptr
-        (1, ValType::I32),  // current_node_idx
-        (1, ValType::I32),  // node_offset
-        (6, ValType::F64),  // node AABB: min_x, min_y, min_z, max_x, max_y, max_z
-        (1, ValType::I32),  // left_or_start
-        (1, ValType::I32),  // right_or_count
-        (1, ValType::I32),  // tri_idx
-        (1, ValType::I32),  // tri_offset
-        (9, ValType::F64),  // triangle vertices
-        (3, ValType::F64),  // edge1
-        (3, ValType::F64),  // edge2
-        (3, ValType::F64),  // h
-        (1, ValType::F64),  // a
-        (1, ValType::F64),  // f
-        (3, ValType::F64),  // s
-        (1, ValType::F64),  // u
-        (3, ValType::F64),  // q
-        (1, ValType::F64),  // v_param
-        (1, ValType::F64),  // t
+        (3, ValType::F64), // x, y, z
+        (1, ValType::I32), // hit_count
+        (1, ValType::I32), // stack_ptr
+        (1, ValType::I32), // current_node_idx
+        (1, ValType::I32), // node_offset
+        (6, ValType::F64), // node AABB: min_x, min_y, min_z, max_x, max_y, max_z
+        (1, ValType::I32), // left_or_start
+        (1, ValType::I32), // right_or_count
+        (1, ValType::I32), // tri_idx
+        (1, ValType::I32), // tri_offset
+        (9, ValType::F64), // triangle vertices
+        (3, ValType::F64), // edge1
+        (3, ValType::F64), // edge2
+        (3, ValType::F64), // h
+        (1, ValType::F64), // a
+        (1, ValType::F64), // f
+        (3, ValType::F64), // s
+        (1, ValType::F64), // u
+        (3, ValType::F64), // q
+        (1, ValType::F64), // v_param
+        (1, ValType::F64), // t
     ];
 
     let mut f = Function::new(locals);
@@ -902,15 +972,27 @@ fn generate_sample_function(
 
     // Load position from memory at pos_ptr
     f.instruction(&Instruction::LocalGet(pos_ptr));
-    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg { offset: 0, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
+        offset: 0,
+        align: 3,
+        memory_index: 0,
+    }));
     f.instruction(&Instruction::LocalSet(x));
 
     f.instruction(&Instruction::LocalGet(pos_ptr));
-    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg { offset: 8, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
+        offset: 8,
+        align: 3,
+        memory_index: 0,
+    }));
     f.instruction(&Instruction::LocalSet(y));
 
     f.instruction(&Instruction::LocalGet(pos_ptr));
-    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg { offset: 16, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
+        offset: 16,
+        align: 3,
+        memory_index: 0,
+    }));
     f.instruction(&Instruction::LocalSet(z));
 
     // Add small jitter to Y and Z to avoid axis-aligned edge intersections
@@ -923,12 +1005,12 @@ fn generate_sample_function(
     const RAY_JITTER_Y: f64 = 1.234567e-9;
     const RAY_JITTER_Z: f64 = 2.345678e-9;
     f.instruction(&Instruction::LocalGet(y));
-    f.instruction(&Instruction::F64Const(RAY_JITTER_Y));
+    f.instruction(&Instruction::F64Const(RAY_JITTER_Y.into()));
     f.instruction(&Instruction::F64Add);
     f.instruction(&Instruction::LocalSet(y)); // y = y + jitter_y
 
     f.instruction(&Instruction::LocalGet(z));
-    f.instruction(&Instruction::F64Const(RAY_JITTER_Z));
+    f.instruction(&Instruction::F64Const(RAY_JITTER_Z.into()));
     f.instruction(&Instruction::F64Add);
     f.instruction(&Instruction::LocalSet(z)); // z = z + jitter_z
 
@@ -1161,35 +1243,71 @@ fn generate_sample_function(
 
     // Load v0
     f.instruction(&Instruction::LocalGet(tri_offset));
-    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg { offset: 0, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
+        offset: 0,
+        align: 3,
+        memory_index: 0,
+    }));
     f.instruction(&Instruction::LocalSet(v0x));
     f.instruction(&Instruction::LocalGet(tri_offset));
-    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg { offset: 8, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
+        offset: 8,
+        align: 3,
+        memory_index: 0,
+    }));
     f.instruction(&Instruction::LocalSet(v0y));
     f.instruction(&Instruction::LocalGet(tri_offset));
-    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg { offset: 16, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
+        offset: 16,
+        align: 3,
+        memory_index: 0,
+    }));
     f.instruction(&Instruction::LocalSet(v0z));
 
     // Load v1
     f.instruction(&Instruction::LocalGet(tri_offset));
-    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg { offset: 24, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
+        offset: 24,
+        align: 3,
+        memory_index: 0,
+    }));
     f.instruction(&Instruction::LocalSet(v1x));
     f.instruction(&Instruction::LocalGet(tri_offset));
-    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg { offset: 32, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
+        offset: 32,
+        align: 3,
+        memory_index: 0,
+    }));
     f.instruction(&Instruction::LocalSet(v1y));
     f.instruction(&Instruction::LocalGet(tri_offset));
-    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg { offset: 40, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
+        offset: 40,
+        align: 3,
+        memory_index: 0,
+    }));
     f.instruction(&Instruction::LocalSet(v1z));
 
     // Load v2
     f.instruction(&Instruction::LocalGet(tri_offset));
-    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg { offset: 48, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
+        offset: 48,
+        align: 3,
+        memory_index: 0,
+    }));
     f.instruction(&Instruction::LocalSet(v2x));
     f.instruction(&Instruction::LocalGet(tri_offset));
-    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg { offset: 56, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
+        offset: 56,
+        align: 3,
+        memory_index: 0,
+    }));
     f.instruction(&Instruction::LocalSet(v2y));
     f.instruction(&Instruction::LocalGet(tri_offset));
-    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg { offset: 64, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
+        offset: 64,
+        align: 3,
+        memory_index: 0,
+    }));
     f.instruction(&Instruction::LocalSet(v2z));
 
     // Möller-Trumbore ray-triangle intersection
@@ -1225,7 +1343,7 @@ fn generate_sample_function(
 
     // h = ray_dir × edge2 = (1,0,0) × edge2 = (0*edge2_z - 0*edge2_y, 0*edge2_x - 1*edge2_z, 1*edge2_y - 0*edge2_x)
     //   = (0, -edge2_z, edge2_y)
-    f.instruction(&Instruction::F64Const(0.0));
+    f.instruction(&Instruction::F64Const(0.0.into()));
     f.instruction(&Instruction::LocalSet(h_x));
     f.instruction(&Instruction::LocalGet(edge2_z));
     f.instruction(&Instruction::F64Neg);
@@ -1250,7 +1368,7 @@ fn generate_sample_function(
     // if |a| < epsilon, skip (ray parallel to triangle)
     f.instruction(&Instruction::LocalGet(a));
     f.instruction(&Instruction::F64Abs);
-    f.instruction(&Instruction::F64Const(1e-10));
+    f.instruction(&Instruction::F64Const(1e-10.into()));
     f.instruction(&Instruction::F64Lt);
     f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
     // Skip to next triangle
@@ -1262,7 +1380,7 @@ fn generate_sample_function(
     f.instruction(&Instruction::End);
 
     // f = 1/a
-    f.instruction(&Instruction::F64Const(1.0));
+    f.instruction(&Instruction::F64Const(1.0.into()));
     f.instruction(&Instruction::LocalGet(a));
     f.instruction(&Instruction::F64Div);
     f.instruction(&Instruction::LocalSet(ff));
@@ -1300,10 +1418,10 @@ fn generate_sample_function(
     // if u < -epsilon or u > 1+epsilon, skip (with tolerance for edge hits)
     const BARY_EPSILON: f64 = 1e-9;
     f.instruction(&Instruction::LocalGet(u));
-    f.instruction(&Instruction::F64Const(-BARY_EPSILON));
+    f.instruction(&Instruction::F64Const((-BARY_EPSILON).into()));
     f.instruction(&Instruction::F64Lt);
     f.instruction(&Instruction::LocalGet(u));
-    f.instruction(&Instruction::F64Const(1.0 + BARY_EPSILON));
+    f.instruction(&Instruction::F64Const((1.0 + BARY_EPSILON).into()));
     f.instruction(&Instruction::F64Gt);
     f.instruction(&Instruction::I32Or);
     f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
@@ -1350,12 +1468,12 @@ fn generate_sample_function(
 
     // if v < -epsilon or u + v > 1+epsilon, skip (with tolerance for edge hits)
     f.instruction(&Instruction::LocalGet(v_param));
-    f.instruction(&Instruction::F64Const(-BARY_EPSILON));
+    f.instruction(&Instruction::F64Const((-BARY_EPSILON).into()));
     f.instruction(&Instruction::F64Lt);
     f.instruction(&Instruction::LocalGet(u));
     f.instruction(&Instruction::LocalGet(v_param));
     f.instruction(&Instruction::F64Add);
-    f.instruction(&Instruction::F64Const(1.0 + BARY_EPSILON));
+    f.instruction(&Instruction::F64Const((1.0 + BARY_EPSILON).into()));
     f.instruction(&Instruction::F64Gt);
     f.instruction(&Instruction::I32Or);
     f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
@@ -1384,7 +1502,7 @@ fn generate_sample_function(
 
     // if t > epsilon, we have a hit
     f.instruction(&Instruction::LocalGet(t));
-    f.instruction(&Instruction::F64Const(1e-10));
+    f.instruction(&Instruction::F64Const(1e-10.into()));
     f.instruction(&Instruction::F64Gt);
     f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
     // hit_count++
@@ -1423,7 +1541,10 @@ fn generate_sample_function(
     f
 }
 
-fn process_and_generate_wasm(stl_data: &[u8], config: &StlImportConfig) -> Result<Vec<u8>, &'static str> {
+fn process_and_generate_wasm(
+    stl_data: &[u8],
+    config: &StlImportConfig,
+) -> Result<Vec<u8>, &'static str> {
     let mesh = process_stl(stl_data, config)?;
     let bvh = build_bvh(&mesh.triangles);
     Ok(generate_wasm(&mesh, &bvh))

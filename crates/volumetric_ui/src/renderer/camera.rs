@@ -39,9 +39,9 @@ impl Default for Camera {
         Self {
             target: Vec3::ZERO,
             radius: 5.0,
-            theta: std::f32::consts::FRAC_PI_4,       // 45 degrees
-            phi: std::f32::consts::FRAC_PI_4,         // 45 degrees from top
-            fov_y: std::f32::consts::FRAC_PI_3,       // 60 degrees
+            theta: std::f32::consts::FRAC_PI_4, // 45 degrees
+            phi: std::f32::consts::FRAC_PI_4,   // 45 degrees from top
+            fov_y: std::f32::consts::FRAC_PI_3, // 60 degrees
             near: 0.1,
             far: 1000.0,
         }
@@ -458,15 +458,19 @@ mod tests {
 
     #[test]
     fn test_phi_clamping() {
-        let mut camera = Camera::default();
-
         // Try to go past top
-        camera.phi = 0.0;
+        let mut camera = Camera {
+            phi: 0.0,
+            ..Default::default()
+        };
         camera.orbit(0.0, -1.0);
         assert!(camera.phi > 0.0);
 
         // Try to go past bottom
-        camera.phi = std::f32::consts::PI;
+        let mut camera = Camera {
+            phi: std::f32::consts::PI,
+            ..Default::default()
+        };
         camera.orbit(0.0, 1.0);
         assert!(camera.phi < std::f32::consts::PI);
     }

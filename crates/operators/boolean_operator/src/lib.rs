@@ -20,7 +20,10 @@
 //! - Reads CBOR configuration from input 2 (schema declared in metadata)
 //! - Produces a merged WASM model with sample/bounds implementing union/subtract/intersect
 
-use wasm_encoder::{CodeSection, ExportKind, ExportSection, Function, FunctionSection, Instruction, Module, TypeSection, ValType};
+use wasm_encoder::{
+    CodeSection, ExportKind, ExportSection, Function, FunctionSection, Instruction, Module,
+    TypeSection, ValType,
+};
 
 #[derive(Clone, Debug, serde::Serialize)]
 enum OperatorMetadataInput {
@@ -63,7 +66,9 @@ struct BooleanConfig {
 
 impl Default for BooleanConfig {
     fn default() -> Self {
-        Self { op: Some(BooleanOpConfig::Union) }
+        Self {
+            op: Some(BooleanOpConfig::Union),
+        }
     }
 }
 
@@ -95,7 +100,8 @@ struct AbiExportsNd {
 }
 
 fn parse_abi_exports_nd(wasm: &[u8]) -> Result<AbiExportsNd, String> {
-    let mut map: std::collections::HashMap<String, (wasmparser::ExternalKind, u32)> = std::collections::HashMap::new();
+    let mut map: std::collections::HashMap<String, (wasmparser::ExternalKind, u32)> =
+        std::collections::HashMap::new();
     for payload in wasmparser::Parser::new(0).parse_all(wasm) {
         match payload.map_err(|e| e.to_string())? {
             wasmparser::Payload::ImportSection(s) => {
@@ -152,13 +158,27 @@ fn count_sections(wasm: &[u8]) -> Result<Counts, String> {
     let mut counts = Counts::default();
     for payload in wasmparser::Parser::new(0).parse_all(wasm) {
         match payload.map_err(|e| e.to_string())? {
-            wasmparser::Payload::TypeSection(s) => counts.types = counts.types.saturating_add(s.count()),
-            wasmparser::Payload::FunctionSection(s) => counts.funcs = counts.funcs.saturating_add(s.count()),
-            wasmparser::Payload::GlobalSection(s) => counts.globals = counts.globals.saturating_add(s.count()),
-            wasmparser::Payload::TableSection(s) => counts.tables = counts.tables.saturating_add(s.count()),
-            wasmparser::Payload::MemorySection(s) => counts.memories = counts.memories.saturating_add(s.count()),
-            wasmparser::Payload::ElementSection(s) => counts.elements = counts.elements.saturating_add(s.count()),
-            wasmparser::Payload::DataSection(s) => counts.data = counts.data.saturating_add(s.count()),
+            wasmparser::Payload::TypeSection(s) => {
+                counts.types = counts.types.saturating_add(s.count())
+            }
+            wasmparser::Payload::FunctionSection(s) => {
+                counts.funcs = counts.funcs.saturating_add(s.count())
+            }
+            wasmparser::Payload::GlobalSection(s) => {
+                counts.globals = counts.globals.saturating_add(s.count())
+            }
+            wasmparser::Payload::TableSection(s) => {
+                counts.tables = counts.tables.saturating_add(s.count())
+            }
+            wasmparser::Payload::MemorySection(s) => {
+                counts.memories = counts.memories.saturating_add(s.count())
+            }
+            wasmparser::Payload::ElementSection(s) => {
+                counts.elements = counts.elements.saturating_add(s.count())
+            }
+            wasmparser::Payload::DataSection(s) => {
+                counts.data = counts.data.saturating_add(s.count())
+            }
             wasmparser::Payload::DataCountSection { .. } => counts.has_data_count = true,
             wasmparser::Payload::ImportSection(s) => {
                 if s.count() > 0 {
@@ -185,32 +205,47 @@ struct OffsetReencoder {
 impl wasm_encoder::reencode::Reencode for OffsetReencoder {
     type Error = std::convert::Infallible;
 
-    fn type_index(&mut self, ty: u32) -> u32 {
-        self.type_offset + ty
+    fn type_index(&mut self, ty: u32) -> Result<u32, wasm_encoder::reencode::Error<Self::Error>> {
+        Ok(self.type_offset + ty)
     }
 
-    fn function_index(&mut self, func: u32) -> u32 {
-        self.func_offset + func
+    fn function_index(
+        &mut self,
+        func: u32,
+    ) -> Result<u32, wasm_encoder::reencode::Error<Self::Error>> {
+        Ok(self.func_offset + func)
     }
 
-    fn global_index(&mut self, global: u32) -> u32 {
-        self.global_offset + global
+    fn global_index(
+        &mut self,
+        global: u32,
+    ) -> Result<u32, wasm_encoder::reencode::Error<Self::Error>> {
+        Ok(self.global_offset + global)
     }
 
-    fn table_index(&mut self, table: u32) -> u32 {
-        self.table_offset + table
+    fn table_index(
+        &mut self,
+        table: u32,
+    ) -> Result<u32, wasm_encoder::reencode::Error<Self::Error>> {
+        Ok(self.table_offset + table)
     }
 
-    fn memory_index(&mut self, memory: u32) -> u32 {
-        self.memory_offset + memory
+    fn memory_index(
+        &mut self,
+        memory: u32,
+    ) -> Result<u32, wasm_encoder::reencode::Error<Self::Error>> {
+        Ok(self.memory_offset + memory)
     }
 
-    fn data_index(&mut self, data: u32) -> u32 {
-        data
+    fn data_index(&mut self, data: u32) -> Result<u32, wasm_encoder::reencode::Error<Self::Error>> {
+        Ok(data)
     }
 
-    fn element_index(&mut self, element: u32) -> u32 {
-        element
+    fn element_index(
+        &mut self,
+        element: u32,
+    ) -> Result<u32, wasm_encoder::reencode::Error<Self::Error>> {
+        Ok(element)
     }
 }
 
@@ -416,14 +451,14 @@ fn add_sample_wrapper(
     f.instruction(&Instruction::LocalGet(0));
     f.instruction(&Instruction::Call(a_idx));
     // Convert to boolean: a_bool = (a_density > 0.5)
-    f.instruction(&Instruction::F32Const(0.5));
+    f.instruction(&Instruction::F32Const(0.5.into()));
     f.instruction(&Instruction::F32Gt);
 
     if op == BooleanOp::Subtract {
         // Call B's sample
         f.instruction(&Instruction::LocalGet(0));
         f.instruction(&Instruction::Call(b_idx));
-        f.instruction(&Instruction::F32Const(0.5));
+        f.instruction(&Instruction::F32Const(0.5.into()));
         f.instruction(&Instruction::F32Gt);
         // a && !b
         f.instruction(&Instruction::I32Eqz);
@@ -432,7 +467,7 @@ fn add_sample_wrapper(
         // Call B's sample
         f.instruction(&Instruction::LocalGet(0));
         f.instruction(&Instruction::Call(b_idx));
-        f.instruction(&Instruction::F32Const(0.5));
+        f.instruction(&Instruction::F32Const(0.5.into()));
         f.instruction(&Instruction::F32Gt);
         // a || b
         f.instruction(&Instruction::I32Or);
@@ -440,7 +475,7 @@ fn add_sample_wrapper(
         // Intersect: a && b
         f.instruction(&Instruction::LocalGet(0));
         f.instruction(&Instruction::Call(b_idx));
-        f.instruction(&Instruction::F32Const(0.5));
+        f.instruction(&Instruction::F32Const(0.5.into()));
         f.instruction(&Instruction::F32Gt);
         f.instruction(&Instruction::I32And);
     }
@@ -618,7 +653,8 @@ pub extern "C" fn run() {
 pub extern "C" fn get_metadata() -> i64 {
     static METADATA: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     let bytes = METADATA.get_or_init(|| {
-        let schema = "{ op: \"union\" / \"subtract\" / \"intersect\" .default \"union\" }".to_string();
+        let schema =
+            "{ op: \"union\" / \"subtract\" / \"intersect\" .default \"union\" }".to_string();
         let metadata = OperatorMetadata {
             name: "boolean_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),

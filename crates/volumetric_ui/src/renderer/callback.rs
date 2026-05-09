@@ -15,7 +15,7 @@ use super::{
 use glam::Mat4;
 
 /// Data for a single frame's rendering.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct SceneData {
     /// Meshes to render
     pub meshes: Vec<(MeshData, Mat4, MaterialId)>,
@@ -23,16 +23,6 @@ pub struct SceneData {
     pub lines: Vec<(LineData, Mat4, LineStyle)>,
     /// Points to render
     pub points: Vec<(PointData, Mat4, PointStyle)>,
-}
-
-impl Default for SceneData {
-    fn default() -> Self {
-        Self {
-            meshes: Vec::new(),
-            lines: Vec::new(),
-            points: Vec::new(),
-        }
-    }
 }
 
 impl SceneData {
@@ -124,10 +114,14 @@ impl egui_wgpu::CallbackTrait for SceneCallback {
             renderer.renderer.submit_mesh(mesh, *transform, *material);
         }
         for (lines, transform, style) in &self.data.scene.lines {
-            renderer.renderer.submit_lines(lines, *transform, style.clone());
+            renderer
+                .renderer
+                .submit_lines(lines, *transform, style.clone());
         }
         for (points, transform, style) in &self.data.scene.points {
-            renderer.renderer.submit_points(points, *transform, style.clone());
+            renderer
+                .renderer
+                .submit_points(points, *transform, style.clone());
         }
 
         // Render to the offscreen target
@@ -238,8 +232,8 @@ impl SceneRendererResource {
 
         let blit_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("scene_blit_pipeline_layout"),
-            bind_group_layouts: &[&blit_bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&blit_bind_group_layout)],
+            immediate_size: 0,
         });
 
         let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -267,24 +261,20 @@ impl SceneRendererResource {
             #[cfg(not(target_arch = "wasm32"))]
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth24Plus,
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::Always,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
             #[cfg(target_arch = "wasm32")]
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
-        let blit_bind_group = Self::create_blit_bind_group(
-            device,
-            &blit_bind_group_layout,
-            &target_view,
-            &sampler,
-        );
+        let blit_bind_group =
+            Self::create_blit_bind_group(device, &blit_bind_group_layout, &target_view, &sampler);
 
         // Create and initialize renderer
         let mut renderer = Renderer::new(target_format);

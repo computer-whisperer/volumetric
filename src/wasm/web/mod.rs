@@ -19,14 +19,15 @@ mod js_bindings;
 pub use js_bindings::*;
 
 use crate::wasm::error::WasmBackendError;
-use crate::wasm::traits::{ModelBounds, ModelExecutor, OperatorExecutor, OperatorIo, ParallelModelSampler};
+use crate::wasm::traits::{
+    ModelBounds, ModelExecutor, OperatorExecutor, OperatorIo, ParallelModelSampler,
+};
 
 #[cfg(feature = "web")]
 use js_bindings::{
-    wasm_model_create_sync, wasm_model_get_bounds, wasm_model_is_inside, wasm_model_destroy,
-    wasm_operator_create, wasm_operator_run, wasm_operator_get_output,
-    wasm_operator_get_output_indices, wasm_operator_get_metadata, wasm_operator_destroy,
-    JsWasmHandle,
+    JsWasmHandle, wasm_model_create_sync, wasm_model_destroy, wasm_model_get_bounds,
+    wasm_model_is_inside, wasm_operator_create, wasm_operator_destroy, wasm_operator_get_metadata,
+    wasm_operator_get_output, wasm_operator_get_output_indices, wasm_operator_run,
 };
 
 /// Web model executor using JavaScript bridge.
@@ -62,8 +63,9 @@ impl Drop for WebModelExecutor {
 #[cfg(feature = "web")]
 impl ModelExecutor for WebModelExecutor {
     fn get_bounds(&mut self) -> Result<ModelBounds, WasmBackendError> {
-        let bounds = wasm_model_get_bounds(self.handle)
-            .ok_or_else(|| WasmBackendError::Execution("Failed to get bounds from WASM".to_string()))?;
+        let bounds = wasm_model_get_bounds(self.handle).ok_or_else(|| {
+            WasmBackendError::Execution("Failed to get bounds from WASM".to_string())
+        })?;
 
         if bounds.len() != 6 {
             return Err(WasmBackendError::Execution(format!(
@@ -81,7 +83,9 @@ impl ModelExecutor for WebModelExecutor {
     fn is_inside(&mut self, x: f64, y: f64, z: f64) -> Result<f32, WasmBackendError> {
         let result = wasm_model_is_inside(self.handle, x, y, z);
         if result.is_nan() {
-            return Err(WasmBackendError::Execution("WASM is_inside returned NaN".to_string()));
+            return Err(WasmBackendError::Execution(
+                "WASM is_inside returned NaN".to_string(),
+            ));
         }
         Ok(result)
     }
@@ -110,8 +114,9 @@ impl WebParallelSampler {
         }
 
         // Get bounds immediately and cache them
-        let bounds_vec = wasm_model_get_bounds(handle)
-            .ok_or_else(|| WasmBackendError::Execution("Failed to get bounds from WASM".to_string()))?;
+        let bounds_vec = wasm_model_get_bounds(handle).ok_or_else(|| {
+            WasmBackendError::Execution("Failed to get bounds from WASM".to_string())
+        })?;
 
         if bounds_vec.len() != 6 {
             wasm_model_destroy(handle);

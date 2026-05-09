@@ -9,4 +9,4 @@ crate-type = ["cdylib"]
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 ciborium = "0.2"
-walrus = "0.23"
+walrus = "0.26"

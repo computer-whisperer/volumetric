@@ -1,8 +1,8 @@
 //! Web platform implementation using poll-promise and web-sys.
 
 use super::{FileError, FileFilter, FileResult, PickedFile};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use wasm_bindgen::JsCast;
 
 // =============================================================================
@@ -105,7 +105,10 @@ pub fn pick_file_async(filter: &FileFilter) -> PendingFilePick {
 
     let promise = poll_promise::Promise::spawn_local(async move {
         let file = rfd::AsyncFileDialog::new()
-            .add_filter(&filter_name, &filter_exts.iter().map(|s| s.as_str()).collect::<Vec<_>>())
+            .add_filter(
+                &filter_name,
+                &filter_exts.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            )
             .pick_file()
             .await?;
 

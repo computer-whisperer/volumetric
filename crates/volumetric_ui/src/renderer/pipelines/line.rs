@@ -8,8 +8,8 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
 use crate::renderer::{
-    DynamicBuffer, DepthMode, LineInstance, LinePattern, LineSegment, LineStyle,
-    QuadVertex, StaticBuffer, WidthMode, QUAD_INDICES, QUAD_VERTICES,
+    DepthMode, DynamicBuffer, LineInstance, LinePattern, LineSegment, LineStyle, QUAD_INDICES,
+    QUAD_VERTICES, QuadVertex, StaticBuffer, WidthMode,
 };
 
 /// Uniform data for line rendering.
@@ -97,8 +97,8 @@ impl LinePipeline {
         // Pipeline layout
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("line_pipeline_layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
 
         // Vertex buffer layouts
@@ -173,13 +173,13 @@ impl LinePipeline {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth24Plus,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::LessEqual,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -214,13 +214,13 @@ impl LinePipeline {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth24Plus,
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::Always, // No depth test
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always), // No depth test
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -285,10 +285,7 @@ impl LinePipeline {
     }
 
     /// Prepare line instances from segments with style.
-    pub fn prepare_instances(
-        segments: &[LineSegment],
-        style: &LineStyle,
-    ) -> Vec<LineInstance> {
+    pub fn prepare_instances(segments: &[LineSegment], style: &LineStyle) -> Vec<LineInstance> {
         segments
             .iter()
             .map(|seg| LineInstance::from_segment(seg, style.width))
@@ -313,7 +310,10 @@ impl LinePipeline {
     ) -> LineUniforms {
         let (dash_length, gap_length) = match style.pattern {
             LinePattern::Solid => (0.0, 0.0),
-            LinePattern::Dashed { dash_length, gap_length } => (dash_length, gap_length),
+            LinePattern::Dashed {
+                dash_length,
+                gap_length,
+            } => (dash_length, gap_length),
             LinePattern::Dotted { spacing } => (0.1, spacing),
         };
 
@@ -332,11 +332,7 @@ impl LinePipeline {
     }
 
     /// Record a line render pass.
-    pub fn render<'a>(
-        &'a self,
-        render_pass: &mut wgpu::RenderPass<'a>,
-        depth_mode: DepthMode,
-    ) {
+    pub fn render<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>, depth_mode: DepthMode) {
         if self.instance_buffer.is_empty() {
             return;
         }

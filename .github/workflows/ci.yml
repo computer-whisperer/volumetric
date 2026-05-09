@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvulkan-dev libwayland-dev libxkbcommon-dev libdbus-1-dev
+      - uses: Swatinem/rust-cache@v2
+      - name: Run clippy
+        run: >
+          cargo clippy --workspace --all-targets --
+          -D warnings
+          -A clippy::approx_constant
+          -A clippy::collapsible_if
+          -A clippy::collapsible_match
+          -A clippy::doc_lazy_continuation
+          -A clippy::io_other_error
+          -A clippy::large_enum_variant
+          -A clippy::len_zero
+          -A clippy::let_and_return
+          -A clippy::manual_div_ceil
+          -A clippy::manual_is_multiple_of
+          -A clippy::manual_range_contains
+          -A clippy::manual_unwrap_or
+          -A clippy::manual_unwrap_or_default
+          -A clippy::needless_range_loop
+          -A clippy::only_used_in_recursion
+          -A clippy::ptr_arg
+          -A clippy::redundant_closure
+          -A clippy::single_match
+          -A clippy::too_many_arguments
+          -A clippy::type_complexity
+          -A clippy::unnecessary_cast
+          -A clippy::unnecessary_lazy_evaluations
+          -A clippy::unnecessary_unwrap
+          -A clippy::useless_format
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvulkan-dev libwayland-dev libxkbcommon-dev libdbus-1-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+
+  wasm:
+    name: WASM Assets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build-wasm

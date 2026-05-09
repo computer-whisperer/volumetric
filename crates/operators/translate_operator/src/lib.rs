@@ -51,7 +51,11 @@ struct TranslateConfig {
 
 impl Default for TranslateConfig {
     fn default() -> Self {
-        Self { dx: 0.0, dy: 0.0, dz: 0.0 }
+        Self {
+            dx: 0.0,
+            dy: 0.0,
+            dz: 0.0,
+        }
     }
 }
 
@@ -63,11 +67,7 @@ unsafe extern "C" {
 }
 
 /// New N-dimensional ABI function names
-const ABI_FUNCTIONS_ND: &[&str] = &[
-    "get_dimensions",
-    "get_bounds",
-    "sample",
-];
+const ABI_FUNCTIONS_ND: &[&str] = &["get_dimensions", "get_bounds", "sample"];
 
 /// Scratch buffer offset for transformed position (after bounds buffer at 256)
 const SCRATCH_POS_OFFSET: i32 = 512;
@@ -93,9 +93,18 @@ fn transform_wasm(input_bytes: &[u8], cfg: TranslateConfig) -> Result<Vec<u8>, S
     let suffix = generate_hex_suffix();
 
     // Find memory export
-    let memory_id: Option<MemoryId> = module.exports.iter()
-        .find(|e| e.name == "memory")
-        .and_then(|e| if let walrus::ExportItem::Memory(m) = e.item { Some(m) } else { None });
+    let memory_id: Option<MemoryId> =
+        module
+            .exports
+            .iter()
+            .find(|e| e.name == "memory")
+            .and_then(|e| {
+                if let walrus::ExportItem::Memory(m) = e.item {
+                    Some(m)
+                } else {
+                    None
+                }
+            });
 
     let memory_id = memory_id.ok_or("Input model missing memory export")?;
 
@@ -135,44 +144,62 @@ fn transform_wasm(input_bytes: &[u8], cfg: TranslateConfig) -> Result<Vec<u8>, S
         // sample(pos_ptr: i32) -> f32
         // Wrapper reads position from pos_ptr, subtracts translation for first 3 dims,
         // writes to scratch buffer, then calls original sample with scratch buffer
-        let mut builder = FunctionBuilder::new(
-            &mut module.types,
-            &[ValType::I32],
-            &[ValType::F32],
-        );
+        let mut builder = FunctionBuilder::new(&mut module.types, &[ValType::I32], &[ValType::F32]);
 
         let pos_ptr = module.locals.add(ValType::I32);
         let x = module.locals.add(ValType::F64);
         let y = module.locals.add(ValType::F64);
         let z = module.locals.add(ValType::F64);
 
-        let mem_arg = walrus::ir::MemArg { align: 3, offset: 0,  };
-        let mem_arg_8 = walrus::ir::MemArg { align: 3, offset: 8,  };
-        let mem_arg_16 = walrus::ir::MemArg { align: 3, offset: 16,  };
+        let mem_arg = walrus::ir::MemArg {
+            align: 3,
+            offset: 0,
+        };
+        let mem_arg_8 = walrus::ir::MemArg {
+            align: 3,
+            offset: 8,
+        };
+        let mem_arg_16 = walrus::ir::MemArg {
+            align: 3,
+            offset: 16,
+        };
 
         // Load x, y, z from input position
-        builder.func_body()
+        builder
+            .func_body()
             .local_get(pos_ptr)
             .load(memory_id, walrus::ir::LoadKind::F64, mem_arg)
             .local_set(x);
 
-        builder.func_body()
+        builder
+            .func_body()
             .local_get(pos_ptr)
             .load(memory_id, walrus::ir::LoadKind::F64, mem_arg_8)
             .local_set(y);
 
-        builder.func_body()
+        builder
+            .func_body()
             .local_get(pos_ptr)
             .load(memory_id, walrus::ir::LoadKind::F64, mem_arg_16)
             .local_set(z);
 
         // Subtract translation and write to scratch buffer
-        let scratch_arg = walrus::ir::MemArg { align: 3, offset: 0,  };
-        let scratch_arg_8 = walrus::ir::MemArg { align: 3, offset: 8,  };
-        let scratch_arg_16 = walrus::ir::MemArg { align: 3, offset: 16,  };
+        let scratch_arg = walrus::ir::MemArg {
+            align: 3,
+            offset: 0,
+        };
+        let scratch_arg_8 = walrus::ir::MemArg {
+            align: 3,
+            offset: 8,
+        };
+        let scratch_arg_16 = walrus::ir::MemArg {
+            align: 3,
+            offset: 16,
+        };
 
         // x - dx -> scratch[0]
-        builder.func_body()
+        builder
+            .func_body()
             .i32_const(SCRATCH_POS_OFFSET)
             .local_get(x)
             .f64_const(-(cfg.dx as f64))
@@ -180,7 +207,8 @@ fn transform_wasm(input_bytes: &[u8], cfg: TranslateConfig) -> Result<Vec<u8>, S
             .store(memory_id, walrus::ir::StoreKind::F64, scratch_arg);
 
         // y - dy -> scratch[8]
-        builder.func_body()
+        builder
+            .func_body()
             .i32_const(SCRATCH_POS_OFFSET)
             .local_get(y)
             .f64_const(-(cfg.dy as f64))
@@ -188,7 +216,8 @@ fn transform_wasm(input_bytes: &[u8], cfg: TranslateConfig) -> Result<Vec<u8>, S
             .store(memory_id, walrus::ir::StoreKind::F64, scratch_arg_8);
 
         // z - dz -> scratch[16]
-        builder.func_body()
+        builder
+            .func_body()
             .i32_const(SCRATCH_POS_OFFSET)
             .local_get(z)
             .f64_const(-(cfg.dz as f64))
@@ -196,7 +225,8 @@ fn transform_wasm(input_bytes: &[u8], cfg: TranslateConfig) -> Result<Vec<u8>, S
             .store(memory_id, walrus::ir::StoreKind::F64, scratch_arg_16);
 
         // Call original sample with scratch buffer pointer
-        builder.func_body()
+        builder
+            .func_body()
             .i32_const(SCRATCH_POS_OFFSET)
             .call(original_sample_id);
 
@@ -208,98 +238,125 @@ fn transform_wasm(input_bytes: &[u8], cfg: TranslateConfig) -> Result<Vec<u8>, S
     if let Some(&original_bounds_id) = renamed_functions.get("get_bounds") {
         // get_bounds(out_ptr: i32)
         // Wrapper calls original, then adds translation to the returned bounds
-        let mut builder = FunctionBuilder::new(
-            &mut module.types,
-            &[ValType::I32],
-            &[],
-        );
+        let mut builder = FunctionBuilder::new(&mut module.types, &[ValType::I32], &[]);
 
         let out_ptr = module.locals.add(ValType::I32);
         let tmp = module.locals.add(ValType::F64);
 
         // Call original get_bounds
-        builder.func_body()
+        builder
+            .func_body()
             .local_get(out_ptr)
             .call(original_bounds_id);
 
-        let mem_arg = walrus::ir::MemArg { align: 3, offset: 0,  };
+        let mem_arg = walrus::ir::MemArg {
+            align: 3,
+            offset: 0,
+        };
 
         // Add dx to min_x (offset 0)
-        builder.func_body()
+        builder
+            .func_body()
             .local_get(out_ptr)
             .load(memory_id, walrus::ir::LoadKind::F64, mem_arg)
             .f64_const(cfg.dx as f64)
             .binop(walrus::ir::BinaryOp::F64Add)
             .local_set(tmp);
-        builder.func_body()
-            .local_get(out_ptr)
-            .local_get(tmp)
-            .store(memory_id, walrus::ir::StoreKind::F64, mem_arg);
+        builder.func_body().local_get(out_ptr).local_get(tmp).store(
+            memory_id,
+            walrus::ir::StoreKind::F64,
+            mem_arg,
+        );
 
         // Add dx to max_x (offset 8)
-        let mem_arg_8 = walrus::ir::MemArg { align: 3, offset: 8,  };
-        builder.func_body()
+        let mem_arg_8 = walrus::ir::MemArg {
+            align: 3,
+            offset: 8,
+        };
+        builder
+            .func_body()
             .local_get(out_ptr)
             .load(memory_id, walrus::ir::LoadKind::F64, mem_arg_8)
             .f64_const(cfg.dx as f64)
             .binop(walrus::ir::BinaryOp::F64Add)
             .local_set(tmp);
-        builder.func_body()
-            .local_get(out_ptr)
-            .local_get(tmp)
-            .store(memory_id, walrus::ir::StoreKind::F64, mem_arg_8);
+        builder.func_body().local_get(out_ptr).local_get(tmp).store(
+            memory_id,
+            walrus::ir::StoreKind::F64,
+            mem_arg_8,
+        );
 
         // Add dy to min_y (offset 16)
-        let mem_arg_16 = walrus::ir::MemArg { align: 3, offset: 16,  };
-        builder.func_body()
+        let mem_arg_16 = walrus::ir::MemArg {
+            align: 3,
+            offset: 16,
+        };
+        builder
+            .func_body()
             .local_get(out_ptr)
             .load(memory_id, walrus::ir::LoadKind::F64, mem_arg_16)
             .f64_const(cfg.dy as f64)
             .binop(walrus::ir::BinaryOp::F64Add)
             .local_set(tmp);
-        builder.func_body()
-            .local_get(out_ptr)
-            .local_get(tmp)
-            .store(memory_id, walrus::ir::StoreKind::F64, mem_arg_16);
+        builder.func_body().local_get(out_ptr).local_get(tmp).store(
+            memory_id,
+            walrus::ir::StoreKind::F64,
+            mem_arg_16,
+        );
 
         // Add dy to max_y (offset 24)
-        let mem_arg_24 = walrus::ir::MemArg { align: 3, offset: 24,  };
-        builder.func_body()
+        let mem_arg_24 = walrus::ir::MemArg {
+            align: 3,
+            offset: 24,
+        };
+        builder
+            .func_body()
             .local_get(out_ptr)
             .load(memory_id, walrus::ir::LoadKind::F64, mem_arg_24)
             .f64_const(cfg.dy as f64)
             .binop(walrus::ir::BinaryOp::F64Add)
             .local_set(tmp);
-        builder.func_body()
-            .local_get(out_ptr)
-            .local_get(tmp)
-            .store(memory_id, walrus::ir::StoreKind::F64, mem_arg_24);
+        builder.func_body().local_get(out_ptr).local_get(tmp).store(
+            memory_id,
+            walrus::ir::StoreKind::F64,
+            mem_arg_24,
+        );
 
         // Add dz to min_z (offset 32)
-        let mem_arg_32 = walrus::ir::MemArg { align: 3, offset: 32,  };
-        builder.func_body()
+        let mem_arg_32 = walrus::ir::MemArg {
+            align: 3,
+            offset: 32,
+        };
+        builder
+            .func_body()
             .local_get(out_ptr)
             .load(memory_id, walrus::ir::LoadKind::F64, mem_arg_32)
             .f64_const(cfg.dz as f64)
             .binop(walrus::ir::BinaryOp::F64Add)
             .local_set(tmp);
-        builder.func_body()
-            .local_get(out_ptr)
-            .local_get(tmp)
-            .store(memory_id, walrus::ir::StoreKind::F64, mem_arg_32);
+        builder.func_body().local_get(out_ptr).local_get(tmp).store(
+            memory_id,
+            walrus::ir::StoreKind::F64,
+            mem_arg_32,
+        );
 
         // Add dz to max_z (offset 40)
-        let mem_arg_40 = walrus::ir::MemArg { align: 3, offset: 40,  };
-        builder.func_body()
+        let mem_arg_40 = walrus::ir::MemArg {
+            align: 3,
+            offset: 40,
+        };
+        builder
+            .func_body()
             .local_get(out_ptr)
             .load(memory_id, walrus::ir::LoadKind::F64, mem_arg_40)
             .f64_const(cfg.dz as f64)
             .binop(walrus::ir::BinaryOp::F64Add)
             .local_set(tmp);
-        builder.func_body()
-            .local_get(out_ptr)
-            .local_get(tmp)
-            .store(memory_id, walrus::ir::StoreKind::F64, mem_arg_40);
+        builder.func_body().local_get(out_ptr).local_get(tmp).store(
+            memory_id,
+            walrus::ir::StoreKind::F64,
+            mem_arg_40,
+        );
 
         let wrapper_id = builder.finish(vec![out_ptr], &mut module.funcs);
         module.exports.add("get_bounds", wrapper_id);
@@ -351,7 +408,8 @@ pub extern "C" fn run() {
 pub extern "C" fn get_metadata() -> i64 {
     static METADATA: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     let bytes = METADATA.get_or_init(|| {
-        let schema = "{ dx: float .default 0.0, dy: float .default 0.0, dz: float .default 0.0 }".to_string();
+        let schema = "{ dx: float .default 0.0, dy: float .default 0.0, dz: float .default 0.0 }"
+            .to_string();
         let metadata = OperatorMetadata {
             name: "translate_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),

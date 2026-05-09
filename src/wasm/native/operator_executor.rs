@@ -53,11 +53,7 @@ impl NativeOperatorExecutor {
                 "host",
                 "get_input_data",
                 |mut caller: Caller<'_, OperatorState>, idx: i32, ptr: i32, len: i32| {
-                    let data = caller
-                        .data()
-                        .inputs
-                        .get(idx as usize)
-                        .cloned();
+                    let data = caller.data().inputs.get(idx as usize).cloned();
 
                     if let Some(src_data) = data {
                         let copy_len = (len as usize).min(src_data.len());

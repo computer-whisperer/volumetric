@@ -18,7 +18,7 @@ use core::panic::PanicInfo;
 #[cfg(target_arch = "wasm32")]
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
-    unsafe { core::arch::wasm32::unreachable() }
+    core::arch::wasm32::unreachable()
 }
 
 const BOUND: f64 = 1.35;
@@ -105,5 +105,9 @@ pub extern "C" fn sample(pos_ptr: i32) -> f32 {
 
     // Slight scale so the interesting structure fills the bounds better.
     let s = 0.9f64;
-    if mandelbulb_inside(x * s, y * s, z * s) { 1.0 } else { 0.0 }
+    if mandelbulb_inside(x * s, y * s, z * s) {
+        1.0
+    } else {
+        0.0
+    }
 }

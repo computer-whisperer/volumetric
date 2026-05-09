@@ -115,12 +115,7 @@ impl GBuffer {
 
     /// Resize the G-buffer if the size has changed.
     /// Returns true if the buffer was resized.
-    pub fn resize_if_needed(
-        &mut self,
-        device: &wgpu::Device,
-        width: u32,
-        height: u32,
-    ) -> bool {
+    pub fn resize_if_needed(&mut self, device: &wgpu::Device, width: u32, height: u32) -> bool {
         let new_size = (width.max(1), height.max(1));
         if self.size == new_size {
             return false;

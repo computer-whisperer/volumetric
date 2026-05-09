@@ -13,8 +13,9 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 use volumetric::{
+    Environment, Project, Triangle,
     adaptive_surface_nets_2::{AdaptiveMeshConfig2, MeshingStats2, SharpEdgeConfig},
-    generate_adaptive_mesh_v2_from_bytes, stl, Environment, Project, Triangle,
+    generate_adaptive_mesh_v2_from_bytes, stl,
 };
 
 mod camera;
@@ -269,15 +270,9 @@ fn print_stats_summary(stats: &MeshingStats2) {
             stats.stage4_5_time_secs * 1000.0,
             stats.stage4_5_time_secs / stats.total_time_secs * 100.0
         );
-        println!(
-            "  Case 1 sharp vertices: {}",
-            stats.sharp_vertices_case1
-        );
+        println!("  Case 1 sharp vertices: {}", stats.sharp_vertices_case1);
         println!("  Edge crossings:        {}", stats.sharp_edge_crossings);
-        println!(
-            "  Vertices inserted:     {}",
-            stats.sharp_vertices_inserted
-        );
+        println!("  Vertices inserted:     {}", stats.sharp_vertices_inserted);
         println!(
             "  Vertices duplicated:   {}",
             stats.sharp_vertices_duplicated

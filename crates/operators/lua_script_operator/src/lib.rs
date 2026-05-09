@@ -76,10 +76,14 @@
 use walrus::{FunctionBuilder, Module, ModuleConfig, ValType};
 
 #[derive(Clone, Debug, serde::Serialize)]
-enum OperatorMetadataInput { LuaSource(String) }
+enum OperatorMetadataInput {
+    LuaSource(String),
+}
 
 #[derive(Clone, Debug, serde::Serialize)]
-enum OperatorMetadataOutput { ModelWASM }
+enum OperatorMetadataOutput {
+    ModelWASM,
+}
 
 #[derive(Clone, Debug, serde::Serialize)]
 struct OperatorMetadata {
@@ -127,9 +131,20 @@ enum CompileError {
 /// Binary operators in the IR
 #[derive(Clone, Debug)]
 enum IrBinOp {
-    Add, Sub, Mul, Div, Mod, Pow,
-    Lt, Le, Gt, Ge, Eq, Ne,
-    And, Or,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Pow,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+    Ne,
+    And,
+    Or,
 }
 
 /// Unary operators in the IR
@@ -143,10 +158,22 @@ enum IrUnaryOp {
 #[derive(Clone, Debug)]
 enum IrMathFunc {
     // Native WASM operations
-    Abs, Sqrt, Floor, Ceil, Trunc, Nearest,
-    Min, Max,
+    Abs,
+    Sqrt,
+    Floor,
+    Ceil,
+    Trunc,
+    Nearest,
+    Min,
+    Max,
     // Polynomial approximations (no native WASM support)
-    Sin, Cos, Tan, Exp, Log, Pow, Atan2,
+    Sin,
+    Cos,
+    Tan,
+    Exp,
+    Log,
+    Pow,
+    Atan2,
 }
 
 /// IR Expression - decoupled from the AST
@@ -155,22 +182,61 @@ enum IrMathFunc {
 enum IrExpr {
     Number(f64),
     Var(String),
-    BinOp { op: IrBinOp, lhs: Box<IrExpr>, rhs: Box<IrExpr> },
-    UnaryOp { op: IrUnaryOp, expr: Box<IrExpr> },
-    MathCall { func: IrMathFunc, args: Vec<IrExpr> },
-    FuncCall { name: String, args: Vec<IrExpr> },
-    IfThenElse { cond: Box<IrExpr>, then_expr: Box<IrExpr>, else_expr: Box<IrExpr> },
+    BinOp {
+        op: IrBinOp,
+        lhs: Box<IrExpr>,
+        rhs: Box<IrExpr>,
+    },
+    UnaryOp {
+        op: IrUnaryOp,
+        expr: Box<IrExpr>,
+    },
+    MathCall {
+        func: IrMathFunc,
+        args: Vec<IrExpr>,
+    },
+    FuncCall {
+        name: String,
+        args: Vec<IrExpr>,
+    },
+    IfThenElse {
+        cond: Box<IrExpr>,
+        then_expr: Box<IrExpr>,
+        else_expr: Box<IrExpr>,
+    },
 }
 
 /// IR Statement
 #[derive(Clone, Debug)]
 enum IrStmt {
-    LocalAssign { name: String, value: IrExpr },
-    Assign { name: String, value: IrExpr },
-    If { cond: IrExpr, then_body: Vec<IrStmt>, else_body: Vec<IrStmt> },
-    While { cond: IrExpr, body: Vec<IrStmt> },
-    RepeatUntil { body: Vec<IrStmt>, cond: IrExpr },
-    NumericFor { var: String, start: IrExpr, end: IrExpr, step: Option<IrExpr>, body: Vec<IrStmt> },
+    LocalAssign {
+        name: String,
+        value: IrExpr,
+    },
+    Assign {
+        name: String,
+        value: IrExpr,
+    },
+    If {
+        cond: IrExpr,
+        then_body: Vec<IrStmt>,
+        else_body: Vec<IrStmt>,
+    },
+    While {
+        cond: IrExpr,
+        body: Vec<IrStmt>,
+    },
+    RepeatUntil {
+        body: Vec<IrStmt>,
+        cond: IrExpr,
+    },
+    NumericFor {
+        var: String,
+        start: IrExpr,
+        end: IrExpr,
+        step: Option<IrExpr>,
+        body: Vec<IrStmt>,
+    },
     Break,
     Return(IrExpr),
 }
@@ -188,21 +254,20 @@ struct IrFunc {
 
 /// Convert a Lua AST expression to IR
 fn ast_expr_to_ir(expr: &full_moon::ast::Expression) -> Result<IrExpr, CompileError> {
-    use full_moon::ast::{Expression, BinOp, UnOp, Var};
-    
+    use full_moon::ast::{BinOp, Expression, UnOp, Var};
+
     match expr {
         Expression::Number(token) => {
             let num_str = token.token().to_string();
-            let v: f64 = num_str.parse()
+            let v: f64 = num_str
+                .parse()
                 .map_err(|_| CompileError::Parse(format!("invalid number: {}", num_str)))?;
             Ok(IrExpr::Number(v))
         }
         Expression::Var(var) => {
-            use full_moon::ast::{Suffix, Index};
+            use full_moon::ast::{Index, Suffix};
             match var {
-                Var::Name(token) => {
-                    Ok(IrExpr::Var(token.token().to_string()))
-                }
+                Var::Name(token) => Ok(IrExpr::Var(token.token().to_string())),
                 Var::Expression(var_expr) => {
                     // Handle math.pi and similar constants
                     if let full_moon::ast::Prefix::Name(obj_token) = var_expr.prefix() {
@@ -220,21 +285,31 @@ fn ast_expr_to_ir(expr: &full_moon::ast::Expression) -> Result<IrExpr, CompileEr
                             }
                         }
                     }
-                    Err(CompileError::Unsupported("complex variable expressions not supported".into()))
+                    Err(CompileError::Unsupported(
+                        "complex variable expressions not supported".into(),
+                    ))
                 }
-                _ => Err(CompileError::Unsupported("unsupported variable type".into())),
+                _ => Err(CompileError::Unsupported(
+                    "unsupported variable type".into(),
+                )),
             }
         }
-        Expression::Parentheses { expression, .. } => {
-            ast_expr_to_ir(expression)
-        }
+        Expression::Parentheses { expression, .. } => ast_expr_to_ir(expression),
         Expression::UnaryOperator { unop, expression } => {
             let inner = ast_expr_to_ir(expression)?;
             match unop {
-                UnOp::Minus(_) => Ok(IrExpr::UnaryOp { op: IrUnaryOp::Neg, expr: Box::new(inner) }),
-                UnOp::Not(_) => Ok(IrExpr::UnaryOp { op: IrUnaryOp::Not, expr: Box::new(inner) }),
+                UnOp::Minus(_) => Ok(IrExpr::UnaryOp {
+                    op: IrUnaryOp::Neg,
+                    expr: Box::new(inner),
+                }),
+                UnOp::Not(_) => Ok(IrExpr::UnaryOp {
+                    op: IrUnaryOp::Not,
+                    expr: Box::new(inner),
+                }),
                 UnOp::Hash(_) => Err(CompileError::Unsupported("length operator".into())),
-                _ => Err(CompileError::Unsupported("unsupported unary operator".into())),
+                _ => Err(CompileError::Unsupported(
+                    "unsupported unary operator".into(),
+                )),
             }
         }
         Expression::BinaryOperator { lhs, binop, rhs } => {
@@ -255,45 +330,58 @@ fn ast_expr_to_ir(expr: &full_moon::ast::Expression) -> Result<IrExpr, CompileEr
                 BinOp::Or(_) => IrBinOp::Or,
                 BinOp::Caret(_) => IrBinOp::Pow,
                 BinOp::Percent(_) => IrBinOp::Mod,
-                BinOp::TwoDots(_) => return Err(CompileError::Unsupported("string concatenation".into())),
-                _ => return Err(CompileError::Unsupported("unsupported binary operator".into())),
+                BinOp::TwoDots(_) => {
+                    return Err(CompileError::Unsupported("string concatenation".into()));
+                }
+                _ => {
+                    return Err(CompileError::Unsupported(
+                        "unsupported binary operator".into(),
+                    ));
+                }
             };
-            Ok(IrExpr::BinOp { op, lhs: Box::new(left), rhs: Box::new(right) })
+            Ok(IrExpr::BinOp {
+                op,
+                lhs: Box::new(left),
+                rhs: Box::new(right),
+            })
         }
-        Expression::FunctionCall(call) => {
-            ast_func_call_to_ir(call)
-        }
+        Expression::FunctionCall(call) => ast_func_call_to_ir(call),
         Expression::Symbol(token) => {
             let sym = token.token().to_string();
             match sym.as_str() {
                 "true" => Ok(IrExpr::Number(1.0)),
                 "false" => Ok(IrExpr::Number(0.0)),
-                _ => Err(CompileError::Unsupported(format!("unsupported symbol: {}", sym))),
+                _ => Err(CompileError::Unsupported(format!(
+                    "unsupported symbol: {}",
+                    sym
+                ))),
             }
         }
-        _ => Err(CompileError::Unsupported("unsupported expression type".into())),
+        _ => Err(CompileError::Unsupported(
+            "unsupported expression type".into(),
+        )),
     }
 }
 
 /// Convert a function call AST to IR
 fn ast_func_call_to_ir(call: &full_moon::ast::FunctionCall) -> Result<IrExpr, CompileError> {
-    use full_moon::ast::{Prefix, Suffix, Index};
-    
+    use full_moon::ast::{Index, Prefix, Suffix};
+
     let prefix = call.prefix();
     let suffixes: Vec<_> = call.suffixes().collect();
-    
+
     // Pattern: math.abs(x) -> prefix=Name("math"), suffixes=[Index::Dot("abs"), Call(...)]
     // Pattern: helper(x) -> prefix=Name("helper"), suffixes=[Call(...)]
-    
+
     if let Prefix::Name(obj_token) = prefix {
         let obj_name = obj_token.token().to_string();
-        
+
         // Check for math.func pattern
         if suffixes.len() >= 2 {
             if let Suffix::Index(Index::Dot { name, .. }) = &suffixes[0] {
                 let method_name = name.token().to_string();
                 let args = extract_call_args_from_suffixes(&suffixes[1..])?;
-                
+
                 if obj_name == "math" {
                     let func = match method_name.as_str() {
                         "abs" => IrMathFunc::Abs,
@@ -311,65 +399,80 @@ fn ast_func_call_to_ir(call: &full_moon::ast::FunctionCall) -> Result<IrExpr, Co
                         "log" => IrMathFunc::Log,
                         "pow" => IrMathFunc::Pow,
                         "atan2" => IrMathFunc::Atan2,
-                        _ => return Err(CompileError::Unsupported(format!("unsupported math function: math.{}", method_name))),
+                        _ => {
+                            return Err(CompileError::Unsupported(format!(
+                                "unsupported math function: math.{}",
+                                method_name
+                            )));
+                        }
                     };
                     return Ok(IrExpr::MathCall { func, args });
                 } else {
-                    return Err(CompileError::Unsupported(format!("unsupported module: {}", obj_name)));
+                    return Err(CompileError::Unsupported(format!(
+                        "unsupported module: {}",
+                        obj_name
+                    )));
                 }
             }
         }
-        
+
         // Check for simple function call pattern: func(args)
         if suffixes.len() == 1 {
             let args = extract_call_args_from_suffixes(&suffixes)?;
-            return Ok(IrExpr::FuncCall { name: obj_name, args });
+            return Ok(IrExpr::FuncCall {
+                name: obj_name,
+                args,
+            });
         }
     }
-    
-    Err(CompileError::Unsupported("unsupported function call pattern".into()))
+
+    Err(CompileError::Unsupported(
+        "unsupported function call pattern".into(),
+    ))
 }
 
 /// Extract arguments from call suffixes
-fn extract_call_args_from_suffixes(suffixes: &[&full_moon::ast::Suffix]) -> Result<Vec<IrExpr>, CompileError> {
-    use full_moon::ast::{Suffix, Call, FunctionArgs};
-    
+fn extract_call_args_from_suffixes(
+    suffixes: &[&full_moon::ast::Suffix],
+) -> Result<Vec<IrExpr>, CompileError> {
+    use full_moon::ast::{Call, FunctionArgs, Suffix};
+
     for suffix in suffixes.iter() {
         if let Suffix::Call(call_suffix) = suffix {
             match call_suffix {
-                Call::AnonymousCall(func_args) => {
-                    match func_args {
-                        FunctionArgs::Parentheses { arguments, .. } => {
-                            return arguments.iter()
-                                .map(|arg| ast_expr_to_ir(arg))
-                                .collect();
-                        }
-                        _ => {}
+                Call::AnonymousCall(func_args) => match func_args {
+                    FunctionArgs::Parentheses { arguments, .. } => {
+                        return arguments.iter().map(|arg| ast_expr_to_ir(arg)).collect();
                     }
-                }
+                    _ => {}
+                },
                 Call::MethodCall(_) => {
-                    return Err(CompileError::Unsupported("method call syntax not supported".into()));
+                    return Err(CompileError::Unsupported(
+                        "method call syntax not supported".into(),
+                    ));
                 }
                 _ => {}
             }
         }
     }
-    Err(CompileError::Unsupported("could not extract function arguments".into()))
+    Err(CompileError::Unsupported(
+        "could not extract function arguments".into(),
+    ))
 }
 
 /// Convert a Lua block to IR statements
 fn ast_block_to_ir(block: &full_moon::ast::Block) -> Result<Vec<IrStmt>, CompileError> {
-    use full_moon::ast::{Stmt, LastStmt};
-    
+    use full_moon::ast::{LastStmt, Stmt};
+
     let mut stmts = Vec::new();
-    
+
     for stmt in block.stmts() {
         match stmt {
             Stmt::LocalAssignment(local_assign) => {
                 // Handle: local x = expr
                 let names: Vec<_> = local_assign.names().iter().collect();
                 let exprs: Vec<_> = local_assign.expressions().iter().collect();
-                
+
                 for (i, name_token) in names.iter().enumerate() {
                     let name = name_token.token().to_string();
                     let value = if i < exprs.len() {
@@ -384,7 +487,7 @@ fn ast_block_to_ir(block: &full_moon::ast::Block) -> Result<Vec<IrStmt>, Compile
                 // Handle: x = expr
                 let vars: Vec<_> = assign.variables().iter().collect();
                 let exprs: Vec<_> = assign.expressions().iter().collect();
-                
+
                 for (i, var) in vars.iter().enumerate() {
                     if let full_moon::ast::Var::Name(name_token) = var {
                         let name = name_token.token().to_string();
@@ -395,7 +498,9 @@ fn ast_block_to_ir(block: &full_moon::ast::Block) -> Result<Vec<IrStmt>, Compile
                         };
                         stmts.push(IrStmt::Assign { name, value });
                     } else {
-                        return Err(CompileError::Unsupported("complex assignment target".into()));
+                        return Err(CompileError::Unsupported(
+                            "complex assignment target".into(),
+                        ));
                     }
                 }
             }
@@ -418,7 +523,13 @@ fn ast_block_to_ir(block: &full_moon::ast::Block) -> Result<Vec<IrStmt>, Compile
                     None
                 };
                 let body = ast_block_to_ir(for_stmt.block())?;
-                stmts.push(IrStmt::NumericFor { var, start, end, step, body });
+                stmts.push(IrStmt::NumericFor {
+                    var,
+                    start,
+                    end,
+                    step,
+                    body,
+                });
             }
             Stmt::Repeat(repeat_stmt) => {
                 let body = ast_block_to_ir(repeat_stmt.block())?;
@@ -426,11 +537,13 @@ fn ast_block_to_ir(block: &full_moon::ast::Block) -> Result<Vec<IrStmt>, Compile
                 stmts.push(IrStmt::RepeatUntil { body, cond });
             }
             _ => {
-                return Err(CompileError::Unsupported("unsupported statement type".into()));
+                return Err(CompileError::Unsupported(
+                    "unsupported statement type".into(),
+                ));
             }
         }
     }
-    
+
     // Handle last statement (return)
     if let Some(last_stmt) = block.last_stmt() {
         match last_stmt {
@@ -451,11 +564,13 @@ fn ast_block_to_ir(block: &full_moon::ast::Block) -> Result<Vec<IrStmt>, Compile
                 stmts.push(IrStmt::Break);
             }
             _ => {
-                return Err(CompileError::Unsupported("unsupported last statement".into()));
+                return Err(CompileError::Unsupported(
+                    "unsupported last statement".into(),
+                ));
             }
         }
     }
-    
+
     Ok(stmts)
 }
 
@@ -463,10 +578,10 @@ fn ast_block_to_ir(block: &full_moon::ast::Block) -> Result<Vec<IrStmt>, Compile
 fn ast_if_to_ir(if_stmt: &full_moon::ast::If) -> Result<IrStmt, CompileError> {
     let cond = ast_expr_to_ir(if_stmt.condition())?;
     let then_body = ast_block_to_ir(if_stmt.block())?;
-    
+
     // Handle elseif chains by converting to nested if-else
     let mut else_body = Vec::new();
-    
+
     if let Some(else_ifs) = if_stmt.else_if() {
         // Build nested if-else from elseif chain
         let else_ifs: Vec<_> = else_ifs.iter().collect();
@@ -478,8 +593,12 @@ fn ast_if_to_ir(if_stmt: &full_moon::ast::If) -> Result<IrStmt, CompileError> {
     } else if let Some(else_block) = if_stmt.else_block() {
         else_body = ast_block_to_ir(else_block)?;
     }
-    
-    Ok(IrStmt::If { cond, then_body, else_body })
+
+    Ok(IrStmt::If {
+        cond,
+        then_body,
+        else_body,
+    })
 }
 
 /// Build nested if-else from elseif chain
@@ -493,29 +612,36 @@ fn build_elseif_chain(
         }
         return Ok(Vec::new());
     }
-    
+
     let first = else_ifs[0];
     let cond = ast_expr_to_ir(first.condition())?;
     let then_body = ast_block_to_ir(first.block())?;
     let else_body = build_elseif_chain(&else_ifs[1..], final_else)?;
-    
-    Ok(vec![IrStmt::If { cond, then_body, else_body }])
+
+    Ok(vec![IrStmt::If {
+        cond,
+        then_body,
+        else_body,
+    }])
 }
 
 /// Convert a function declaration to IR
 fn ast_func_to_ir(func_decl: &full_moon::ast::FunctionDeclaration) -> Result<IrFunc, CompileError> {
     use full_moon::ast::Parameter;
-    
-    let params: Vec<String> = func_decl.body().parameters().iter()
+
+    let params: Vec<String> = func_decl
+        .body()
+        .parameters()
+        .iter()
         .filter_map(|p| match p {
             Parameter::Name(token) => Some(token.token().to_string()),
             Parameter::Ellipsis(_) => None,
             _ => None,
         })
         .collect();
-    
+
     let body = ast_block_to_ir(func_decl.body().block())?;
-    
+
     Ok(IrFunc { params, body })
 }
 
@@ -531,7 +657,11 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
 
     // Parse the Lua source into an AST
     let ast = full_moon::parse(src).map_err(|errors| {
-        let msg = errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; ");
+        let msg = errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("; ");
         CompileError::Parse(msg)
     })?;
 
@@ -540,11 +670,14 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
 
     for stmt in ast.nodes().stmts() {
         if let Stmt::FunctionDeclaration(func_decl) = stmt {
-            let name = func_decl.name().names().iter()
+            let name = func_decl
+                .name()
+                .names()
+                .iter()
                 .map(|t| t.token().to_string())
                 .collect::<Vec<_>>()
                 .join(".");
-            
+
             let ir_func = ast_func_to_ir(func_decl)?;
             functions.insert(name, ir_func);
         }
@@ -579,21 +712,24 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                 if let Some(&local_id) = locals.get(name) {
                     b.local_get(local_id);
                 } else {
-                    return Err(CompileError::Unsupported(format!("unknown variable: {}", name)));
+                    return Err(CompileError::Unsupported(format!(
+                        "unknown variable: {}",
+                        name
+                    )));
                 }
             }
             IrExpr::BinOp { op, lhs, rhs } => {
                 match op {
                     IrBinOp::Mod => {
                         // Lua modulo: a % b = a - floor(a/b) * b
-                        emit_ir_expr(b, func_ids, lhs, params, locals)?;  // a (for final subtraction)
-                        emit_ir_expr(b, func_ids, lhs, params, locals)?;  // a
-                        emit_ir_expr(b, func_ids, rhs, params, locals)?;  // b
-                        b.binop(BinaryOp::F64Div);              // a/b
-                        b.unop(UnaryOp::F64Floor);              // floor(a/b)
-                        emit_ir_expr(b, func_ids, rhs, params, locals)?;  // b
-                        b.binop(BinaryOp::F64Mul);              // floor(a/b) * b
-                        b.binop(BinaryOp::F64Sub);              // a - floor(a/b) * b
+                        emit_ir_expr(b, func_ids, lhs, params, locals)?; // a (for final subtraction)
+                        emit_ir_expr(b, func_ids, lhs, params, locals)?; // a
+                        emit_ir_expr(b, func_ids, rhs, params, locals)?; // b
+                        b.binop(BinaryOp::F64Div); // a/b
+                        b.unop(UnaryOp::F64Floor); // floor(a/b)
+                        emit_ir_expr(b, func_ids, rhs, params, locals)?; // b
+                        b.binop(BinaryOp::F64Mul); // floor(a/b) * b
+                        b.binop(BinaryOp::F64Sub); // a - floor(a/b) * b
                     }
                     IrBinOp::Pow => {
                         // x^y = exp(y * log(x)) - same as math.pow
@@ -610,10 +746,10 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                         b.binop(BinaryOp::F64Mul);
                         b.f64_const(2.0);
                         b.binop(BinaryOp::F64Div);
-                        b.binop(BinaryOp::F64Sub);  // log(x) ≈ (x-1) - (x-1)²/2
+                        b.binop(BinaryOp::F64Sub); // log(x) ≈ (x-1) - (x-1)²/2
                         // Multiply by y
                         emit_ir_expr(b, func_ids, rhs, params, locals)?;
-                        b.binop(BinaryOp::F64Mul);  // y * log(x)
+                        b.binop(BinaryOp::F64Mul); // y * log(x)
                         // exp(z) ≈ 1 + z
                         b.f64_const(1.0);
                         b.binop(BinaryOp::F64Add);
@@ -623,7 +759,7 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                         // Evaluate lhs for condition check
                         emit_ir_expr(b, func_ids, lhs, params, locals)?;
                         b.f64_const(0.0);
-                        b.binop(BinaryOp::F64Ne);  // lhs != 0.0
+                        b.binop(BinaryOp::F64Ne); // lhs != 0.0
                         let lhs = lhs.clone();
                         let rhs = rhs.clone();
                         let params_vec: Vec<String> = params.to_vec();
@@ -633,13 +769,25 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                             ValType::F64,
                             |then_block| {
                                 // lhs truthy: return rhs
-                                emit_ir_expr(then_block, func_ids_ref, &rhs, &params_vec, &locals_clone)
-                                    .expect("emit_ir_expr in and-then branch failed");
+                                emit_ir_expr(
+                                    then_block,
+                                    func_ids_ref,
+                                    &rhs,
+                                    &params_vec,
+                                    &locals_clone,
+                                )
+                                .expect("emit_ir_expr in and-then branch failed");
                             },
                             |else_block| {
                                 // lhs falsy: return lhs (re-evaluate, will be 0.0)
-                                emit_ir_expr(else_block, func_ids_ref, &lhs, &params_vec, &locals_clone)
-                                    .expect("emit_ir_expr in and-else branch failed");
+                                emit_ir_expr(
+                                    else_block,
+                                    func_ids_ref,
+                                    &lhs,
+                                    &params_vec,
+                                    &locals_clone,
+                                )
+                                .expect("emit_ir_expr in and-else branch failed");
                             },
                         );
                     }
@@ -648,7 +796,7 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                         // Evaluate lhs for condition check
                         emit_ir_expr(b, func_ids, lhs, params, locals)?;
                         b.f64_const(0.0);
-                        b.binop(BinaryOp::F64Ne);  // lhs != 0.0
+                        b.binop(BinaryOp::F64Ne); // lhs != 0.0
                         let lhs = lhs.clone();
                         let rhs = rhs.clone();
                         let params_vec: Vec<String> = params.to_vec();
@@ -658,39 +806,73 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                             ValType::F64,
                             |then_block| {
                                 // lhs truthy: return lhs (re-evaluate)
-                                emit_ir_expr(then_block, func_ids_ref, &lhs, &params_vec, &locals_clone)
-                                    .expect("emit_ir_expr in or-then branch failed");
+                                emit_ir_expr(
+                                    then_block,
+                                    func_ids_ref,
+                                    &lhs,
+                                    &params_vec,
+                                    &locals_clone,
+                                )
+                                .expect("emit_ir_expr in or-then branch failed");
                             },
                             |else_block| {
                                 // lhs falsy: return rhs
-                                emit_ir_expr(else_block, func_ids_ref, &rhs, &params_vec, &locals_clone)
-                                    .expect("emit_ir_expr in or-else branch failed");
+                                emit_ir_expr(
+                                    else_block,
+                                    func_ids_ref,
+                                    &rhs,
+                                    &params_vec,
+                                    &locals_clone,
+                                )
+                                .expect("emit_ir_expr in or-else branch failed");
                             },
                         );
                     }
                     _ => {
-                        emit_ir_expr(b, func_ids,lhs, params, locals)?;
-                        emit_ir_expr(b, func_ids,rhs, params, locals)?;
+                        emit_ir_expr(b, func_ids, lhs, params, locals)?;
+                        emit_ir_expr(b, func_ids, rhs, params, locals)?;
                         match op {
-                            IrBinOp::Add => { b.binop(BinaryOp::F64Add); }
-                            IrBinOp::Sub => { b.binop(BinaryOp::F64Sub); }
-                            IrBinOp::Mul => { b.binop(BinaryOp::F64Mul); }
-                            IrBinOp::Div => { b.binop(BinaryOp::F64Div); }
-                            IrBinOp::Lt => { b.binop(BinaryOp::F64Lt); }
-                            IrBinOp::Le => { b.binop(BinaryOp::F64Le); }
-                            IrBinOp::Gt => { b.binop(BinaryOp::F64Gt); }
-                            IrBinOp::Ge => { b.binop(BinaryOp::F64Ge); }
-                            IrBinOp::Eq => { b.binop(BinaryOp::F64Eq); }
-                            IrBinOp::Ne => { b.binop(BinaryOp::F64Ne); }
+                            IrBinOp::Add => {
+                                b.binop(BinaryOp::F64Add);
+                            }
+                            IrBinOp::Sub => {
+                                b.binop(BinaryOp::F64Sub);
+                            }
+                            IrBinOp::Mul => {
+                                b.binop(BinaryOp::F64Mul);
+                            }
+                            IrBinOp::Div => {
+                                b.binop(BinaryOp::F64Div);
+                            }
+                            IrBinOp::Lt => {
+                                b.binop(BinaryOp::F64Lt);
+                            }
+                            IrBinOp::Le => {
+                                b.binop(BinaryOp::F64Le);
+                            }
+                            IrBinOp::Gt => {
+                                b.binop(BinaryOp::F64Gt);
+                            }
+                            IrBinOp::Ge => {
+                                b.binop(BinaryOp::F64Ge);
+                            }
+                            IrBinOp::Eq => {
+                                b.binop(BinaryOp::F64Eq);
+                            }
+                            IrBinOp::Ne => {
+                                b.binop(BinaryOp::F64Ne);
+                            }
                             _ => unreachable!(),
                         }
                     }
                 }
             }
             IrExpr::UnaryOp { op, expr: inner } => {
-                emit_ir_expr(b, func_ids,inner, params, locals)?;
+                emit_ir_expr(b, func_ids, inner, params, locals)?;
                 match op {
-                    IrUnaryOp::Neg => { b.unop(UnaryOp::F64Neg); }
+                    IrUnaryOp::Neg => {
+                        b.unop(UnaryOp::F64Neg);
+                    }
                     IrUnaryOp::Not => {
                         // Convert to boolean: compare with 0, then negate
                         b.f64_const(0.0);
@@ -700,31 +882,55 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
             }
             IrExpr::MathCall { func, args } => {
                 match func {
-                    IrMathFunc::Abs | IrMathFunc::Sqrt | IrMathFunc::Floor |
-                    IrMathFunc::Ceil | IrMathFunc::Trunc | IrMathFunc::Nearest => {
+                    IrMathFunc::Abs
+                    | IrMathFunc::Sqrt
+                    | IrMathFunc::Floor
+                    | IrMathFunc::Ceil
+                    | IrMathFunc::Trunc
+                    | IrMathFunc::Nearest => {
                         if args.len() != 1 {
-                            return Err(CompileError::Type(format!("math function requires 1 argument")));
+                            return Err(CompileError::Type(format!(
+                                "math function requires 1 argument"
+                            )));
                         }
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
                         match func {
-                            IrMathFunc::Abs => { b.unop(UnaryOp::F64Abs); }
-                            IrMathFunc::Sqrt => { b.unop(UnaryOp::F64Sqrt); }
-                            IrMathFunc::Floor => { b.unop(UnaryOp::F64Floor); }
-                            IrMathFunc::Ceil => { b.unop(UnaryOp::F64Ceil); }
-                            IrMathFunc::Trunc => { b.unop(UnaryOp::F64Trunc); }
-                            IrMathFunc::Nearest => { b.unop(UnaryOp::F64Nearest); }
+                            IrMathFunc::Abs => {
+                                b.unop(UnaryOp::F64Abs);
+                            }
+                            IrMathFunc::Sqrt => {
+                                b.unop(UnaryOp::F64Sqrt);
+                            }
+                            IrMathFunc::Floor => {
+                                b.unop(UnaryOp::F64Floor);
+                            }
+                            IrMathFunc::Ceil => {
+                                b.unop(UnaryOp::F64Ceil);
+                            }
+                            IrMathFunc::Trunc => {
+                                b.unop(UnaryOp::F64Trunc);
+                            }
+                            IrMathFunc::Nearest => {
+                                b.unop(UnaryOp::F64Nearest);
+                            }
                             _ => unreachable!(),
                         }
                     }
                     IrMathFunc::Min | IrMathFunc::Max => {
                         if args.len() != 2 {
-                            return Err(CompileError::Type(format!("math.min/max requires 2 arguments")));
+                            return Err(CompileError::Type(format!(
+                                "math.min/max requires 2 arguments"
+                            )));
                         }
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[1], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[1], params, locals)?;
                         match func {
-                            IrMathFunc::Min => { b.binop(BinaryOp::F64Min); }
-                            IrMathFunc::Max => { b.binop(BinaryOp::F64Max); }
+                            IrMathFunc::Min => {
+                                b.binop(BinaryOp::F64Min);
+                            }
+                            IrMathFunc::Max => {
+                                b.binop(BinaryOp::F64Max);
+                            }
                             _ => unreachable!(),
                         }
                     }
@@ -734,46 +940,46 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                         }
                         // sin(x) ≈ x - x³/6 + x⁵/120 - x⁷/5040 (Taylor series, accurate for |x| < π)
                         // Compute: x
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
                         // Compute: - x³/6
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
                         b.binop(BinaryOp::F64Mul);
-                        b.binop(BinaryOp::F64Mul);  // x³
+                        b.binop(BinaryOp::F64Mul); // x³
                         b.f64_const(6.0);
-                        b.binop(BinaryOp::F64Div);  // x³/6
-                        b.binop(BinaryOp::F64Sub);  // x - x³/6
+                        b.binop(BinaryOp::F64Div); // x³/6
+                        b.binop(BinaryOp::F64Sub); // x - x³/6
                         // Compute: + x⁵/120
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
                         b.binop(BinaryOp::F64Mul);
                         b.binop(BinaryOp::F64Mul);
                         b.binop(BinaryOp::F64Mul);
-                        b.binop(BinaryOp::F64Mul);  // x⁵
+                        b.binop(BinaryOp::F64Mul); // x⁵
                         b.f64_const(120.0);
-                        b.binop(BinaryOp::F64Div);  // x⁵/120
-                        b.binop(BinaryOp::F64Add);  // x - x³/6 + x⁵/120
+                        b.binop(BinaryOp::F64Div); // x⁵/120
+                        b.binop(BinaryOp::F64Add); // x - x³/6 + x⁵/120
                         // Compute: - x⁷/5040
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
                         b.binop(BinaryOp::F64Mul);
                         b.binop(BinaryOp::F64Mul);
                         b.binop(BinaryOp::F64Mul);
                         b.binop(BinaryOp::F64Mul);
                         b.binop(BinaryOp::F64Mul);
-                        b.binop(BinaryOp::F64Mul);  // x⁷
+                        b.binop(BinaryOp::F64Mul); // x⁷
                         b.f64_const(5040.0);
-                        b.binop(BinaryOp::F64Div);  // x⁷/5040
-                        b.binop(BinaryOp::F64Sub);  // final result
+                        b.binop(BinaryOp::F64Div); // x⁷/5040
+                        b.binop(BinaryOp::F64Sub); // final result
                     }
                     IrMathFunc::Cos => {
                         if args.len() != 1 {
@@ -782,38 +988,38 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                         // cos(x) ≈ 1 - x²/2 + x⁴/24 - x⁶/720 (Taylor series)
                         b.f64_const(1.0);
                         // - x²/2
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        b.binop(BinaryOp::F64Mul);  // x²
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        b.binop(BinaryOp::F64Mul); // x²
                         b.f64_const(2.0);
-                        b.binop(BinaryOp::F64Div);  // x²/2
-                        b.binop(BinaryOp::F64Sub);  // 1 - x²/2
+                        b.binop(BinaryOp::F64Div); // x²/2
+                        b.binop(BinaryOp::F64Sub); // 1 - x²/2
                         // + x⁴/24
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
                         b.binop(BinaryOp::F64Mul);
                         b.binop(BinaryOp::F64Mul);
-                        b.binop(BinaryOp::F64Mul);  // x⁴
+                        b.binop(BinaryOp::F64Mul); // x⁴
                         b.f64_const(24.0);
-                        b.binop(BinaryOp::F64Div);  // x⁴/24
+                        b.binop(BinaryOp::F64Div); // x⁴/24
                         b.binop(BinaryOp::F64Add);
                         // - x⁶/720
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
                         b.binop(BinaryOp::F64Mul);
                         b.binop(BinaryOp::F64Mul);
                         b.binop(BinaryOp::F64Mul);
                         b.binop(BinaryOp::F64Mul);
-                        b.binop(BinaryOp::F64Mul);  // x⁶
+                        b.binop(BinaryOp::F64Mul); // x⁶
                         b.f64_const(720.0);
-                        b.binop(BinaryOp::F64Div);  // x⁶/720
-                        b.binop(BinaryOp::F64Sub);  // final result
+                        b.binop(BinaryOp::F64Div); // x⁶/720
+                        b.binop(BinaryOp::F64Sub); // final result
                     }
                     IrMathFunc::Tan => {
                         if args.len() != 1 {
@@ -821,27 +1027,27 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                         }
                         // tan(x) = sin(x) / cos(x) - use simpler approximation
                         // tan(x) ≈ x + x³/3 + 2x⁵/15 for small x
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
                         // + x³/3
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
                         b.binop(BinaryOp::F64Mul);
                         b.binop(BinaryOp::F64Mul);
                         b.f64_const(3.0);
                         b.binop(BinaryOp::F64Div);
                         b.binop(BinaryOp::F64Add);
                         // + 2x⁵/15
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
                         b.binop(BinaryOp::F64Mul);
                         b.binop(BinaryOp::F64Mul);
                         b.binop(BinaryOp::F64Mul);
                         b.binop(BinaryOp::F64Mul);
-                        b.f64_const(7.5);  // 15/2
+                        b.f64_const(7.5); // 15/2
                         b.binop(BinaryOp::F64Div);
                         b.binop(BinaryOp::F64Add);
                     }
@@ -852,29 +1058,29 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                         // exp(x) ≈ 1 + x + x²/2 + x³/6 + x⁴/24 + x⁵/120 + x⁶/720
                         b.f64_const(1.0);
                         // + x
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
                         b.binop(BinaryOp::F64Add);
                         // + x²/2
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
                         b.binop(BinaryOp::F64Mul);
                         b.f64_const(2.0);
                         b.binop(BinaryOp::F64Div);
                         b.binop(BinaryOp::F64Add);
                         // + x³/6
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
                         b.binop(BinaryOp::F64Mul);
                         b.binop(BinaryOp::F64Mul);
                         b.f64_const(6.0);
                         b.binop(BinaryOp::F64Div);
                         b.binop(BinaryOp::F64Add);
                         // + x⁴/24
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
                         b.binop(BinaryOp::F64Mul);
                         b.binop(BinaryOp::F64Mul);
                         b.binop(BinaryOp::F64Mul);
@@ -882,11 +1088,11 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                         b.binop(BinaryOp::F64Div);
                         b.binop(BinaryOp::F64Add);
                         // + x⁵/120
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
                         b.binop(BinaryOp::F64Mul);
                         b.binop(BinaryOp::F64Mul);
                         b.binop(BinaryOp::F64Mul);
@@ -895,12 +1101,12 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                         b.binop(BinaryOp::F64Div);
                         b.binop(BinaryOp::F64Add);
                         // + x⁶/720
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
                         b.binop(BinaryOp::F64Mul);
                         b.binop(BinaryOp::F64Mul);
                         b.binop(BinaryOp::F64Mul);
@@ -921,37 +1127,37 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                         // log(x) ≈ (x-1) - (x-1)²/2 + (x-1)³/3 - (x-1)⁴/4
                         // Let u = x - 1
                         // Compute u
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
                         b.f64_const(1.0);
-                        b.binop(BinaryOp::F64Sub);  // u = x - 1
+                        b.binop(BinaryOp::F64Sub); // u = x - 1
                         // For simplicity, just use u - u²/2 + u³/3
                         // We need u multiple times, so emit (x-1) each time
                         // - u²/2
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
                         b.f64_const(1.0);
                         b.binop(BinaryOp::F64Sub);
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
                         b.f64_const(1.0);
                         b.binop(BinaryOp::F64Sub);
-                        b.binop(BinaryOp::F64Mul);  // u²
+                        b.binop(BinaryOp::F64Mul); // u²
                         b.f64_const(2.0);
-                        b.binop(BinaryOp::F64Div);  // u²/2
-                        b.binop(BinaryOp::F64Sub);  // u - u²/2
+                        b.binop(BinaryOp::F64Div); // u²/2
+                        b.binop(BinaryOp::F64Sub); // u - u²/2
                         // + u³/3
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
                         b.f64_const(1.0);
                         b.binop(BinaryOp::F64Sub);
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
                         b.f64_const(1.0);
                         b.binop(BinaryOp::F64Sub);
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
                         b.f64_const(1.0);
                         b.binop(BinaryOp::F64Sub);
                         b.binop(BinaryOp::F64Mul);
-                        b.binop(BinaryOp::F64Mul);  // u³
+                        b.binop(BinaryOp::F64Mul); // u³
                         b.f64_const(3.0);
-                        b.binop(BinaryOp::F64Div);  // u³/3
-                        b.binop(BinaryOp::F64Add);  // u - u²/2 + u³/3
+                        b.binop(BinaryOp::F64Div); // u³/3
+                        b.binop(BinaryOp::F64Add); // u - u²/2 + u³/3
                     }
                     IrMathFunc::Pow => {
                         if args.len() != 2 {
@@ -959,22 +1165,22 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                         }
                         // pow(x, y) = exp(y * log(x))
                         // First compute log(x)
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
                         b.f64_const(1.0);
                         b.binop(BinaryOp::F64Sub);
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
                         b.f64_const(1.0);
                         b.binop(BinaryOp::F64Sub);
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
                         b.f64_const(1.0);
                         b.binop(BinaryOp::F64Sub);
                         b.binop(BinaryOp::F64Mul);
                         b.f64_const(2.0);
                         b.binop(BinaryOp::F64Div);
-                        b.binop(BinaryOp::F64Sub);  // log(x) ≈ (x-1) - (x-1)²/2
+                        b.binop(BinaryOp::F64Sub); // log(x) ≈ (x-1) - (x-1)²/2
                         // Multiply by y
-                        emit_ir_expr(b, func_ids,&args[1], params, locals)?;
-                        b.binop(BinaryOp::F64Mul);  // y * log(x)
+                        emit_ir_expr(b, func_ids, &args[1], params, locals)?;
+                        b.binop(BinaryOp::F64Mul); // y * log(x)
                         // Now compute exp of that - store intermediate and use exp approximation
                         // exp(z) ≈ 1 + z + z²/2 + z³/6
                         // This is tricky because we need z multiple times but it's a computed value
@@ -982,34 +1188,36 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                         // We need to duplicate the z value, but we can't without locals
                         // WORKAROUND: Recompute y*log(x) each time
                         b.f64_const(1.0);
-                        b.binop(BinaryOp::F64Add);  // 1 + z (very rough exp approximation)
+                        b.binop(BinaryOp::F64Add); // 1 + z (very rough exp approximation)
                     }
                     IrMathFunc::Atan2 => {
                         if args.len() != 2 {
-                            return Err(CompileError::Type("math.atan2 requires 2 arguments".into()));
+                            return Err(CompileError::Type(
+                                "math.atan2 requires 2 arguments".into(),
+                            ));
                         }
                         // atan2(y, x) - simplified approximation
                         // For the primary case (x > 0): atan(y/x)
                         // atan(z) ≈ z - z³/3 + z⁵/5 for |z| < 1
                         // For simplicity: atan2(y,x) ≈ y/x - (y/x)³/3 when x > 0, |y/x| < 1
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;  // y
-                        emit_ir_expr(b, func_ids,&args[1], params, locals)?;  // x
-                        b.binop(BinaryOp::F64Div);  // y/x = z
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?; // y
+                        emit_ir_expr(b, func_ids, &args[1], params, locals)?; // x
+                        b.binop(BinaryOp::F64Div); // y/x = z
                         // - z³/3
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[1], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[1], params, locals)?;
                         b.binop(BinaryOp::F64Div);
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[1], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[1], params, locals)?;
                         b.binop(BinaryOp::F64Div);
-                        emit_ir_expr(b, func_ids,&args[0], params, locals)?;
-                        emit_ir_expr(b, func_ids,&args[1], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[0], params, locals)?;
+                        emit_ir_expr(b, func_ids, &args[1], params, locals)?;
                         b.binop(BinaryOp::F64Div);
                         b.binop(BinaryOp::F64Mul);
-                        b.binop(BinaryOp::F64Mul);  // z³
+                        b.binop(BinaryOp::F64Mul); // z³
                         b.f64_const(3.0);
-                        b.binop(BinaryOp::F64Div);  // z³/3
-                        b.binop(BinaryOp::F64Sub);  // z - z³/3
+                        b.binop(BinaryOp::F64Div); // z³/3
+                        b.binop(BinaryOp::F64Sub); // z - z³/3
                     }
                 }
             }
@@ -1023,10 +1231,17 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                     // Call the function
                     b.call(fid);
                 } else {
-                    return Err(CompileError::Unsupported(format!("unknown function: {}", name)));
+                    return Err(CompileError::Unsupported(format!(
+                        "unknown function: {}",
+                        name
+                    )));
                 }
             }
-            IrExpr::IfThenElse { cond, then_expr, else_expr } => {
+            IrExpr::IfThenElse {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
                 emit_ir_condition(b, func_ids, cond, params, locals)?;
                 let then_expr = then_expr.clone();
                 let else_expr = else_expr.clone();
@@ -1036,12 +1251,24 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                 b.if_else(
                     ValType::F64,
                     |then_block| {
-                        emit_ir_expr(then_block, func_ids_ref, &then_expr, &params_vec, &locals_clone)
-                            .expect("emit_ir_expr in then branch failed");
+                        emit_ir_expr(
+                            then_block,
+                            func_ids_ref,
+                            &then_expr,
+                            &params_vec,
+                            &locals_clone,
+                        )
+                        .expect("emit_ir_expr in then branch failed");
                     },
                     |else_block| {
-                        emit_ir_expr(else_block, func_ids_ref, &else_expr, &params_vec, &locals_clone)
-                            .expect("emit_ir_expr in else branch failed");
+                        emit_ir_expr(
+                            else_block,
+                            func_ids_ref,
+                            &else_expr,
+                            &params_vec,
+                            &locals_clone,
+                        )
+                        .expect("emit_ir_expr in else branch failed");
                     },
                 );
             }
@@ -1058,29 +1285,44 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
         locals: &HashMap<String, walrus::LocalId>,
     ) -> Result<(), CompileError> {
         match expr {
-            IrExpr::BinOp { op, lhs, rhs } => {
-                match op {
-                    IrBinOp::Lt | IrBinOp::Le | IrBinOp::Gt | IrBinOp::Ge | IrBinOp::Eq | IrBinOp::Ne => {
-                        emit_ir_expr(b, func_ids,lhs, params, locals)?;
-                        emit_ir_expr(b, func_ids,rhs, params, locals)?;
-                        match op {
-                            IrBinOp::Lt => { b.binop(BinaryOp::F64Lt); }
-                            IrBinOp::Le => { b.binop(BinaryOp::F64Le); }
-                            IrBinOp::Gt => { b.binop(BinaryOp::F64Gt); }
-                            IrBinOp::Ge => { b.binop(BinaryOp::F64Ge); }
-                            IrBinOp::Eq => { b.binop(BinaryOp::F64Eq); }
-                            IrBinOp::Ne => { b.binop(BinaryOp::F64Ne); }
-                            _ => unreachable!(),
+            IrExpr::BinOp { op, lhs, rhs } => match op {
+                IrBinOp::Lt
+                | IrBinOp::Le
+                | IrBinOp::Gt
+                | IrBinOp::Ge
+                | IrBinOp::Eq
+                | IrBinOp::Ne => {
+                    emit_ir_expr(b, func_ids, lhs, params, locals)?;
+                    emit_ir_expr(b, func_ids, rhs, params, locals)?;
+                    match op {
+                        IrBinOp::Lt => {
+                            b.binop(BinaryOp::F64Lt);
                         }
-                        return Ok(());
+                        IrBinOp::Le => {
+                            b.binop(BinaryOp::F64Le);
+                        }
+                        IrBinOp::Gt => {
+                            b.binop(BinaryOp::F64Gt);
+                        }
+                        IrBinOp::Ge => {
+                            b.binop(BinaryOp::F64Ge);
+                        }
+                        IrBinOp::Eq => {
+                            b.binop(BinaryOp::F64Eq);
+                        }
+                        IrBinOp::Ne => {
+                            b.binop(BinaryOp::F64Ne);
+                        }
+                        _ => unreachable!(),
                     }
-                    _ => {}
+                    return Ok(());
                 }
-            }
+                _ => {}
+            },
             _ => {}
         }
         // For non-comparison expressions, emit as f64 and convert to i32 (non-zero = true)
-        emit_ir_expr(b, func_ids,expr, params, locals)?;
+        emit_ir_expr(b, func_ids, expr, params, locals)?;
         b.f64_const(0.0);
         b.binop(BinaryOp::F64Ne);
         Ok(())
@@ -1105,18 +1347,25 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                         locals.insert(name.clone(), id);
                         id
                     };
-                    emit_ir_expr(b, func_ids,value, params, locals)?;
+                    emit_ir_expr(b, func_ids, value, params, locals)?;
                     b.local_set(local_id);
                 }
                 IrStmt::Assign { name, value } => {
                     if let Some(&local_id) = locals.get(name) {
-                        emit_ir_expr(b, func_ids,value, params, locals)?;
+                        emit_ir_expr(b, func_ids, value, params, locals)?;
                         b.local_set(local_id);
                     } else {
-                        return Err(CompileError::Unsupported(format!("assignment to unknown variable: {}", name)));
+                        return Err(CompileError::Unsupported(format!(
+                            "assignment to unknown variable: {}",
+                            name
+                        )));
                     }
                 }
-                IrStmt::If { cond, then_body, else_body } => {
+                IrStmt::If {
+                    cond,
+                    then_body,
+                    else_body,
+                } => {
                     emit_ir_condition(b, func_ids, cond, params, locals)?;
                     let params_vec: Vec<String> = params.to_vec();
                     let then_locals = locals.clone();
@@ -1128,16 +1377,28 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                             // We need a dummy ModuleLocals for nested calls - this is a limitation
                             // For now, we'll handle simple if-then-else with returns
                             if let Some(IrStmt::Return(expr)) = then_body.first() {
-                                emit_ir_expr(then_block, func_ids_ref, expr, &params_vec, &then_locals)
-                                    .expect("emit in then branch failed");
+                                emit_ir_expr(
+                                    then_block,
+                                    func_ids_ref,
+                                    expr,
+                                    &params_vec,
+                                    &then_locals,
+                                )
+                                .expect("emit in then branch failed");
                             } else {
                                 then_block.f64_const(0.0); // fallback
                             }
                         },
                         |else_block| {
                             if let Some(IrStmt::Return(expr)) = else_body.first() {
-                                emit_ir_expr(else_block, func_ids_ref, expr, &params_vec, &else_locals)
-                                    .expect("emit in else branch failed");
+                                emit_ir_expr(
+                                    else_block,
+                                    func_ids_ref,
+                                    expr,
+                                    &params_vec,
+                                    &else_locals,
+                                )
+                                .expect("emit in else branch failed");
                             } else {
                                 else_block.f64_const(0.0); // fallback
                             }
@@ -1159,18 +1420,31 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                             let loop_id = loop_block.id();
 
                             // Emit condition check - exit if false
-                            emit_ir_condition(loop_block, func_ids_ref, &cond, &params_vec, &loop_locals)
-                                .expect("emit while condition failed");
+                            emit_ir_condition(
+                                loop_block,
+                                func_ids_ref,
+                                &cond,
+                                &params_vec,
+                                &loop_locals,
+                            )
+                            .expect("emit while condition failed");
                             loop_block.unop(UnaryOp::I32Eqz); // Invert: exit if condition is false
                             loop_block.br_if(exit_id);
 
                             // Emit body statements
                             for stmt in &body {
                                 match stmt {
-                                    IrStmt::LocalAssign { name, value } | IrStmt::Assign { name, value } => {
+                                    IrStmt::LocalAssign { name, value }
+                                    | IrStmt::Assign { name, value } => {
                                         if let Some(&local_id) = loop_locals.get(name) {
-                                            emit_ir_expr(loop_block, func_ids_ref, value, &params_vec, &loop_locals)
-                                                .expect("emit while body assignment failed");
+                                            emit_ir_expr(
+                                                loop_block,
+                                                func_ids_ref,
+                                                value,
+                                                &params_vec,
+                                                &loop_locals,
+                                            )
+                                            .expect("emit while body assignment failed");
                                             loop_block.local_set(local_id);
                                         }
                                         // If local doesn't exist, skip (limitation: can't create new locals in loop)
@@ -1206,10 +1480,17 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                             // Emit body statements first (always executes at least once)
                             for stmt in &body {
                                 match stmt {
-                                    IrStmt::LocalAssign { name, value } | IrStmt::Assign { name, value } => {
+                                    IrStmt::LocalAssign { name, value }
+                                    | IrStmt::Assign { name, value } => {
                                         if let Some(&local_id) = loop_locals.get(name) {
-                                            emit_ir_expr(loop_block, func_ids_ref, value, &params_vec, &loop_locals)
-                                                .expect("emit repeat body assignment failed");
+                                            emit_ir_expr(
+                                                loop_block,
+                                                func_ids_ref,
+                                                value,
+                                                &params_vec,
+                                                &loop_locals,
+                                            )
+                                            .expect("emit repeat body assignment failed");
                                             loop_block.local_set(local_id);
                                         }
                                     }
@@ -1221,8 +1502,14 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                             }
 
                             // Check condition - exit if true (until condition met)
-                            emit_ir_condition(loop_block, func_ids_ref, &cond, &params_vec, &loop_locals)
-                                .expect("emit repeat-until condition failed");
+                            emit_ir_condition(
+                                loop_block,
+                                func_ids_ref,
+                                &cond,
+                                &params_vec,
+                                &loop_locals,
+                            )
+                            .expect("emit repeat-until condition failed");
                             loop_block.br_if(exit_id);
 
                             // Continue to next iteration
@@ -1230,7 +1517,13 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                         });
                     });
                 }
-                IrStmt::NumericFor { var, start, end, step, body } => {
+                IrStmt::NumericFor {
+                    var,
+                    start,
+                    end,
+                    step,
+                    body,
+                } => {
                     // Create local for loop variable
                     let loop_var_id = module_locals.add(ValType::F64);
                     locals.insert(var.clone(), loop_var_id);
@@ -1240,16 +1533,16 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                     let step_var_id = module_locals.add(ValType::F64);
 
                     // Initialize loop variable with start value
-                    emit_ir_expr(b, func_ids,start, params, locals)?;
+                    emit_ir_expr(b, func_ids, start, params, locals)?;
                     b.local_set(loop_var_id);
 
                     // Initialize end value
-                    emit_ir_expr(b, func_ids,end, params, locals)?;
+                    emit_ir_expr(b, func_ids, end, params, locals)?;
                     b.local_set(end_var_id);
 
                     // Initialize step value (default to 1.0)
                     if let Some(step_expr) = step {
-                        emit_ir_expr(b, func_ids,step_expr, params, locals)?;
+                        emit_ir_expr(b, func_ids, step_expr, params, locals)?;
                     } else {
                         b.f64_const(1.0);
                     }
@@ -1273,20 +1566,27 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                             // This works for both positive and negative steps
                             loop_block.local_get(loop_var_id);
                             loop_block.local_get(end_var_id);
-                            loop_block.binop(BinaryOp::F64Sub);  // i - end
+                            loop_block.binop(BinaryOp::F64Sub); // i - end
                             loop_block.local_get(step_var_id);
-                            loop_block.binop(BinaryOp::F64Mul);  // (i - end) * step
+                            loop_block.binop(BinaryOp::F64Mul); // (i - end) * step
                             loop_block.f64_const(0.0);
-                            loop_block.binop(BinaryOp::F64Gt);   // > 0 means we should exit
+                            loop_block.binop(BinaryOp::F64Gt); // > 0 means we should exit
                             loop_block.br_if(exit_id);
 
                             // Emit body statements
                             for stmt in &body {
                                 match stmt {
-                                    IrStmt::LocalAssign { name, value } | IrStmt::Assign { name, value } => {
+                                    IrStmt::LocalAssign { name, value }
+                                    | IrStmt::Assign { name, value } => {
                                         if let Some(&local_id) = loop_locals.get(name) {
-                                            emit_ir_expr(loop_block, func_ids_ref, value, &params_vec, &loop_locals)
-                                                .expect("emit for body assignment failed");
+                                            emit_ir_expr(
+                                                loop_block,
+                                                func_ids_ref,
+                                                value,
+                                                &params_vec,
+                                                &loop_locals,
+                                            )
+                                            .expect("emit for body assignment failed");
                                             loop_block.local_set(local_id);
                                         }
                                     }
@@ -1333,7 +1633,9 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
         let mut fb = FunctionBuilder::new(&mut module.types, &param_types, &[ValType::F64]);
 
         // Create locals for parameters
-        let param_locals: Vec<walrus::LocalId> = ir_func.params.iter()
+        let param_locals: Vec<walrus::LocalId> = ir_func
+            .params
+            .iter()
             .map(|_| module.locals.add(ValType::F64))
             .collect();
 
@@ -1343,7 +1645,14 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
         }
 
         let mut ib = fb.func_body();
-        let ret_expr = emit_ir_stmts(&mut ib, &func_ids, &ir_func.body, &ir_func.params, &mut locals_map, &mut module.locals)?;
+        let ret_expr = emit_ir_stmts(
+            &mut ib,
+            &func_ids,
+            &ir_func.body,
+            &ir_func.params,
+            &mut locals_map,
+            &mut module.locals,
+        )?;
         if let Some(expr) = ret_expr {
             emit_ir_expr(&mut ib, &func_ids, &expr, &ir_func.params, &locals_map)?;
         }
@@ -1382,7 +1691,14 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                 locals_map.insert(ir_func.params[1].clone(), l_y);
                 locals_map.insert(ir_func.params[2].clone(), l_z);
                 let mut ib = fb.func_body();
-                let ret_expr = emit_ir_stmts(&mut ib, &func_ids, &ir_func.body, &ir_func.params, &mut locals_map, &mut module.locals)?;
+                let ret_expr = emit_ir_stmts(
+                    &mut ib,
+                    &func_ids,
+                    &ir_func.body,
+                    &ir_func.params,
+                    &mut locals_map,
+                    &mut module.locals,
+                )?;
                 if let Some(expr) = ret_expr {
                     emit_ir_expr(&mut ib, &func_ids, &expr, &ir_func.params, &locals_map)?;
                 }
@@ -1392,12 +1708,21 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
             _ => {
                 // Bounds getter: () -> f64
                 if !ir_func.params.is_empty() {
-                    return Err(CompileError::Type("bounds getters must have 0 params".into()));
+                    return Err(CompileError::Type(
+                        "bounds getters must have 0 params".into(),
+                    ));
                 }
                 let mut fb = FunctionBuilder::new(&mut module.types, &[], &[ValType::F64]);
                 let mut locals_map: HashMap<String, walrus::LocalId> = HashMap::new();
                 let mut ib = fb.func_body();
-                let ret_expr = emit_ir_stmts(&mut ib, &func_ids, &ir_func.body, &ir_func.params, &mut locals_map, &mut module.locals)?;
+                let ret_expr = emit_ir_stmts(
+                    &mut ib,
+                    &func_ids,
+                    &ir_func.body,
+                    &ir_func.params,
+                    &mut locals_map,
+                    &mut module.locals,
+                )?;
                 if let Some(expr) = ret_expr {
                     emit_ir_expr(&mut ib, &func_ids, &expr, &ir_func.params, &locals_map)?;
                 }
@@ -1454,17 +1779,26 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
         let is_inside_id = *internal_func_ids.get("is_inside").unwrap();
 
         // Load x from pos_ptr + 0
-        let mem_arg_x = walrus::ir::MemArg { align: 3, offset: 0 };
+        let mem_arg_x = walrus::ir::MemArg {
+            align: 3,
+            offset: 0,
+        };
         ib.local_get(pos_ptr);
         ib.load(memory_id, walrus::ir::LoadKind::F64, mem_arg_x);
 
         // Load y from pos_ptr + 8
-        let mem_arg_y = walrus::ir::MemArg { align: 3, offset: 8 };
+        let mem_arg_y = walrus::ir::MemArg {
+            align: 3,
+            offset: 8,
+        };
         ib.local_get(pos_ptr);
         ib.load(memory_id, walrus::ir::LoadKind::F64, mem_arg_y);
 
         // Load z from pos_ptr + 16
-        let mem_arg_z = walrus::ir::MemArg { align: 3, offset: 16 };
+        let mem_arg_z = walrus::ir::MemArg {
+            align: 3,
+            offset: 16,
+        };
         ib.local_get(pos_ptr);
         ib.load(memory_id, walrus::ir::LoadKind::F64, mem_arg_z);
 
@@ -1485,16 +1819,28 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
 pub extern "C" fn run() {
     let len = unsafe { get_input_len(0) } as usize;
     let mut buf = vec![0u8; len];
-    if len > 0 { unsafe { get_input_data(0, buf.as_mut_ptr() as i32, len as i32); } }
-    let src = match std::str::from_utf8(&buf) { Ok(s) => s, Err(_) => "" };
-    let output = match compile_lua_to_wasm(src) { Ok(w) => w, Err(e) => {
-        // On error, return empty bytes to signal failure upstream (percolate)
-        let msg = format!("Lua compile error: {}", e);
-        let mut b = Vec::new();
-        b.extend_from_slice(msg.as_bytes());
-        b
-    }};
-    unsafe { post_output(0, output.as_ptr() as i32, output.len() as i32); }
+    if len > 0 {
+        unsafe {
+            get_input_data(0, buf.as_mut_ptr() as i32, len as i32);
+        }
+    }
+    let src = match std::str::from_utf8(&buf) {
+        Ok(s) => s,
+        Err(_) => "",
+    };
+    let output = match compile_lua_to_wasm(src) {
+        Ok(w) => w,
+        Err(e) => {
+            // On error, return empty bytes to signal failure upstream (percolate)
+            let msg = format!("Lua compile error: {}", e);
+            let mut b = Vec::new();
+            b.extend_from_slice(msg.as_bytes());
+            b
+        }
+    };
+    unsafe {
+        post_output(0, output.as_ptr() as i32, output.len() as i32);
+    }
 }
 
 /// Minimal stub template for the Lua script input.
@@ -1543,7 +1889,8 @@ pub extern "C" fn get_metadata() -> i64 {
             outputs: vec![OperatorMetadataOutput::ModelWASM],
         };
         let mut out = Vec::new();
-        ciborium::ser::into_writer(&metadata, &mut out).expect("metadata CBOR serialization should not fail");
+        ciborium::ser::into_writer(&metadata, &mut out)
+            .expect("metadata CBOR serialization should not fail");
         out
     });
     let ptr = bytes.as_ptr() as u32;
@@ -1626,7 +1973,11 @@ function get_bounds_max_z()
 end
 "#;
         let result = compile_lua_to_wasm(lua_src);
-        assert!(result.is_ok(), "Failed to compile with math.sqrt: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to compile with math.sqrt: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -1661,7 +2012,11 @@ function get_bounds_max_z()
 end
 "#;
         let result = compile_lua_to_wasm(lua_src);
-        assert!(result.is_ok(), "Failed to compile with unary minus: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to compile with unary minus: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -1730,7 +2085,11 @@ function get_bounds_max_z()
 end
 "#;
         let result = compile_lua_to_wasm(lua_src);
-        assert!(result.is_ok(), "Failed to compile with if-then-else: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to compile with if-then-else: {:?}",
+            result.err()
+        );
         let wasm = result.unwrap();
         // Check that we got valid WASM (starts with magic number)
         assert!(wasm.len() > 8, "WASM output too short");
@@ -1773,7 +2132,11 @@ function get_bounds_max_z()
 end
 "#;
         let result = compile_lua_to_wasm(lua_src);
-        assert!(result.is_ok(), "Failed to compile with modulo: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to compile with modulo: {:?}",
+            result.err()
+        );
         let wasm = result.unwrap();
         assert!(wasm.len() > 8, "WASM output too short");
         assert_eq!(&wasm[0..4], b"\0asm", "Invalid WASM magic number");
@@ -1818,7 +2181,11 @@ function get_bounds_max_z()
 end
 "#;
         let result = compile_lua_to_wasm(lua_src);
-        assert!(result.is_ok(), "Failed to compile with while loop: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to compile with while loop: {:?}",
+            result.err()
+        );
         let wasm = result.unwrap();
         assert!(wasm.len() > 8, "WASM output too short");
         assert_eq!(&wasm[0..4], b"\0asm", "Invalid WASM magic number");
@@ -1861,7 +2228,11 @@ function get_bounds_max_z()
 end
 "#;
         let result = compile_lua_to_wasm(lua_src);
-        assert!(result.is_ok(), "Failed to compile with numeric for: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to compile with numeric for: {:?}",
+            result.err()
+        );
         let wasm = result.unwrap();
         assert!(wasm.len() > 8, "WASM output too short");
         assert_eq!(&wasm[0..4], b"\0asm", "Invalid WASM magic number");
@@ -1901,7 +2272,11 @@ function get_bounds_max_z()
 end
 "#;
         let result = compile_lua_to_wasm(lua_src);
-        assert!(result.is_ok(), "Failed to compile with trig functions: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to compile with trig functions: {:?}",
+            result.err()
+        );
         let wasm = result.unwrap();
         assert!(wasm.len() > 8, "WASM output too short");
         assert_eq!(&wasm[0..4], b"\0asm", "Invalid WASM magic number");
@@ -1945,7 +2320,11 @@ function get_bounds_max_z()
 end
 "#;
         let result = compile_lua_to_wasm(lua_src);
-        assert!(result.is_ok(), "Failed to compile with user function: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to compile with user function: {:?}",
+            result.err()
+        );
         let wasm = result.unwrap();
         assert!(wasm.len() > 8, "WASM output too short");
         assert_eq!(&wasm[0..4], b"\0asm", "Invalid WASM magic number");
@@ -1984,7 +2363,11 @@ function get_bounds_max_z()
 end
 "#;
         let result = compile_lua_to_wasm(lua_src);
-        assert!(result.is_ok(), "Failed to compile with exponentiation: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to compile with exponentiation: {:?}",
+            result.err()
+        );
         let wasm = result.unwrap();
         assert!(wasm.len() > 8, "WASM output too short");
         assert_eq!(&wasm[0..4], b"\0asm", "Invalid WASM magic number");
@@ -2029,7 +2412,11 @@ function get_bounds_max_z()
 end
 "#;
         let result = compile_lua_to_wasm(lua_src);
-        assert!(result.is_ok(), "Failed to compile with repeat-until: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to compile with repeat-until: {:?}",
+            result.err()
+        );
         let wasm = result.unwrap();
         assert!(wasm.len() > 8, "WASM output too short");
         assert_eq!(&wasm[0..4], b"\0asm", "Invalid WASM magic number");
@@ -2074,7 +2461,11 @@ function get_bounds_max_z()
 end
 "#;
         let result = compile_lua_to_wasm(lua_src);
-        assert!(result.is_ok(), "Failed to compile with logical and/or: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to compile with logical and/or: {:?}",
+            result.err()
+        );
         let wasm = result.unwrap();
         assert!(wasm.len() > 8, "WASM output too short");
         assert_eq!(&wasm[0..4], b"\0asm", "Invalid WASM magic number");
@@ -2115,7 +2506,11 @@ function get_bounds_max_z()
 end
 "#;
         let result = compile_lua_to_wasm(lua_src);
-        assert!(result.is_ok(), "Failed to compile with math.pi: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to compile with math.pi: {:?}",
+            result.err()
+        );
         let wasm = result.unwrap();
         assert!(wasm.len() > 8, "WASM output too short");
         assert_eq!(&wasm[0..4], b"\0asm", "Invalid WASM magic number");
@@ -2162,7 +2557,11 @@ function get_bounds_max_z()
 end
 "#;
         let result = compile_lua_to_wasm(lua_src);
-        assert!(result.is_ok(), "Failed to compile with break in repeat: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to compile with break in repeat: {:?}",
+            result.err()
+        );
         let wasm = result.unwrap();
         assert!(wasm.len() > 8, "WASM output too short");
         assert_eq!(&wasm[0..4], b"\0asm", "Invalid WASM magic number");

@@ -5,8 +5,8 @@
 
 use crate::wasm::error::WasmBackendError;
 use crate::wasm::traits::{ModelBounds, ModelBoundsNd, ParallelModelSampler};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use wasmtime::{Engine, Instance, Memory, Module, Store, TypedFunc};
 
 /// Global counter for assigning unique IDs to samplers.

@@ -23,16 +23,25 @@ impl Triangle {
     /// The same face normal is assigned to all three vertices.
     pub fn new(vertices: [(f32, f32, f32); 3]) -> Self {
         let normal = Self::compute_face_normal(&vertices);
-        Self { vertices, normals: [normal, normal, normal] }
+        Self {
+            vertices,
+            normals: [normal, normal, normal],
+        }
     }
 
     /// Create a new triangle with explicit vertices and a single normal for all vertices.
     pub fn with_normal(vertices: [(f32, f32, f32); 3], normal: (f32, f32, f32)) -> Self {
-        Self { vertices, normals: [normal, normal, normal] }
+        Self {
+            vertices,
+            normals: [normal, normal, normal],
+        }
     }
 
     /// Create a new triangle with explicit per-vertex normals.
-    pub fn with_vertex_normals(vertices: [(f32, f32, f32); 3], normals: [(f32, f32, f32); 3]) -> Self {
+    pub fn with_vertex_normals(
+        vertices: [(f32, f32, f32); 3],
+        normals: [(f32, f32, f32); 3],
+    ) -> Self {
         Self { vertices, normals }
     }
 
@@ -145,7 +154,11 @@ pub struct ImportedAsset {
 
 impl ImportedAsset {
     pub fn new(id: String, data: Vec<u8>, type_hint: Option<AssetTypeHint>) -> Self {
-        Self { id, data, type_hint }
+        Self {
+            id,
+            data,
+            type_hint,
+        }
     }
 
     pub fn model(id: String, data: Vec<u8>) -> Self {
@@ -240,7 +253,9 @@ pub struct OperatorMetadata {
 ///   `(ptr: u32, len: u32)` as `ptr | (len << 32)`.
 /// - The referenced bytes are CBOR encoded and match `OperatorMetadata`.
 #[cfg(any(feature = "native", feature = "web"))]
-pub fn operator_metadata_from_wasm_bytes(wasm_bin: &[u8]) -> Result<OperatorMetadata, ExecutionError> {
+pub fn operator_metadata_from_wasm_bytes(
+    wasm_bin: &[u8],
+) -> Result<OperatorMetadata, ExecutionError> {
     use wasm::OperatorExecutor;
 
     let mut executor = wasm::create_operator_executor(wasm_bin)
@@ -251,28 +266,35 @@ pub fn operator_metadata_from_wasm_bytes(wasm_bin: &[u8]) -> Result<OperatorMeta
         .map_err(|e| ExecutionError::WasmBackend(e.to_string()))?;
 
     let mut cursor = std::io::Cursor::new(bytes);
-    ciborium::de::from_reader(&mut cursor)
-        .map_err(|e| ExecutionError::WasmBackend(format!("Failed to decode operator metadata CBOR: {e}")))
+    ciborium::de::from_reader(&mut cursor).map_err(|e| {
+        ExecutionError::WasmBackend(format!("Failed to decode operator metadata CBOR: {e}"))
+    })
 }
 
-pub mod stl;
-pub mod marching_cubes_cpu;
 pub mod adaptive_surface_nets_2;
+pub mod marching_cubes_cpu;
+pub mod stl;
 
 /// Sample points from the WASM volumetric model
 #[cfg(feature = "native")]
-pub fn sample_model(wasm_path: &Path, resolution: usize) -> anyhow::Result<(Vec<(f32, f32, f32)>, (f32, f32, f32), (f32, f32, f32))> {
+pub fn sample_model(
+    wasm_path: &Path,
+    resolution: usize,
+) -> anyhow::Result<(Vec<(f32, f32, f32)>, (f32, f32, f32), (f32, f32, f32))> {
     let wasm_bytes = std::fs::read(wasm_path)?;
     sample_model_from_bytes(&wasm_bytes, resolution)
 }
 
 /// Sample points from WASM bytes (in-memory model)
 #[cfg(any(feature = "native", feature = "web"))]
-pub fn sample_model_from_bytes(wasm_bytes: &[u8], resolution: usize) -> anyhow::Result<(Vec<(f32, f32, f32)>, (f32, f32, f32), (f32, f32, f32))> {
+pub fn sample_model_from_bytes(
+    wasm_bytes: &[u8],
+    resolution: usize,
+) -> anyhow::Result<(Vec<(f32, f32, f32)>, (f32, f32, f32), (f32, f32, f32))> {
     use wasm::ModelExecutor;
 
-    let mut executor = wasm::create_model_executor(wasm_bytes)
-        .context("Failed to create model executor")?;
+    let mut executor =
+        wasm::create_model_executor(wasm_bytes).context("Failed to create model executor")?;
 
     let bounds = executor.get_bounds()?;
     let (bounds_min, bounds_max) = bounds.as_f32();
@@ -301,18 +323,24 @@ pub fn sample_model_from_bytes(wasm_bytes: &[u8], resolution: usize) -> anyhow::
 
 /// Generate a mesh using marching cubes algorithm from the WASM volumetric model
 #[cfg(feature = "native")]
-pub fn generate_marching_cubes_mesh(wasm_path: &Path, resolution: usize) -> anyhow::Result<(Vec<Triangle>, (f32, f32, f32), (f32, f32, f32))> {
+pub fn generate_marching_cubes_mesh(
+    wasm_path: &Path,
+    resolution: usize,
+) -> anyhow::Result<(Vec<Triangle>, (f32, f32, f32), (f32, f32, f32))> {
     let wasm_bytes = std::fs::read(wasm_path)?;
     generate_marching_cubes_mesh_from_bytes(&wasm_bytes, resolution)
 }
 
 /// Generate a mesh using marching cubes from WASM bytes
 #[cfg(any(feature = "native", feature = "web"))]
-pub fn generate_marching_cubes_mesh_from_bytes(wasm_bytes: &[u8], resolution: usize) -> anyhow::Result<(Vec<Triangle>, (f32, f32, f32), (f32, f32, f32))> {
+pub fn generate_marching_cubes_mesh_from_bytes(
+    wasm_bytes: &[u8],
+    resolution: usize,
+) -> anyhow::Result<(Vec<Triangle>, (f32, f32, f32), (f32, f32, f32))> {
     use wasm::ModelExecutor;
 
-    let mut executor = wasm::create_model_executor(wasm_bytes)
-        .context("Failed to create model executor")?;
+    let mut executor =
+        wasm::create_model_executor(wasm_bytes).context("Failed to create model executor")?;
 
     let bounds = executor.get_bounds()?;
     let (bounds_min, bounds_max) = bounds.as_f32();
@@ -320,10 +348,13 @@ pub fn generate_marching_cubes_mesh_from_bytes(wasm_bytes: &[u8], resolution: us
     // Wrap executor in RefCell for interior mutability in the closure
     let executor = std::cell::RefCell::new(executor);
 
-    let triangles = marching_cubes_cpu::marching_cubes_mesh(bounds_min, bounds_max, resolution, |p| {
-        let d = executor.borrow_mut().is_inside(p.0 as f64, p.1 as f64, p.2 as f64)?;
-        Ok(d)
-    })?;
+    let triangles =
+        marching_cubes_cpu::marching_cubes_mesh(bounds_min, bounds_max, resolution, |p| {
+            let d = executor
+                .borrow_mut()
+                .is_inside(p.0 as f64, p.1 as f64, p.2 as f64)?;
+            Ok(d)
+        })?;
 
     Ok((triangles, bounds_min, bounds_max))
 }
@@ -347,18 +378,17 @@ pub fn generate_adaptive_mesh_v2_from_bytes(
 ) -> anyhow::Result<AdaptiveMeshV2Result> {
     use wasm::ParallelModelSampler;
 
-    let wasm_sampler = wasm::create_parallel_sampler(wasm_bytes)
-        .context("Failed to create parallel sampler")?;
+    let wasm_sampler =
+        wasm::create_parallel_sampler(wasm_bytes).context("Failed to create parallel sampler")?;
 
     let bounds = wasm_sampler.get_bounds()?;
     let (bounds_min, bounds_max) = bounds.as_f32();
 
     // Create a closure-based sampler that wraps the ParallelModelSampler
-    let sampler = move |x: f64, y: f64, z: f64| -> f32 {
-        wasm_sampler.sample(x, y, z)
-    };
+    let sampler = move |x: f64, y: f64, z: f64| -> f32 { wasm_sampler.sample(x, y, z) };
 
-    let result = adaptive_surface_nets_2::adaptive_surface_nets_2(sampler, bounds_min, bounds_max, config);
+    let result =
+        adaptive_surface_nets_2::adaptive_surface_nets_2(sampler, bounds_min, bounds_max, config);
 
     Ok(AdaptiveMeshV2Result {
         vertices: result.mesh.vertices,
@@ -379,18 +409,17 @@ pub fn generate_adaptive_mesh_v2_from_bytes(
 ) -> anyhow::Result<AdaptiveMeshV2Result> {
     use wasm::ParallelModelSampler;
 
-    let wasm_sampler = wasm::create_parallel_sampler(wasm_bytes)
-        .context("Failed to create parallel sampler")?;
+    let wasm_sampler =
+        wasm::create_parallel_sampler(wasm_bytes).context("Failed to create parallel sampler")?;
 
     let bounds = wasm_sampler.get_bounds()?;
     let (bounds_min, bounds_max) = bounds.as_f32();
 
     // Create a closure-based sampler that wraps the WebParallelSampler
-    let sampler = move |x: f64, y: f64, z: f64| -> f32 {
-        wasm_sampler.sample(x, y, z)
-    };
+    let sampler = move |x: f64, y: f64, z: f64| -> f32 { wasm_sampler.sample(x, y, z) };
 
-    let result = adaptive_surface_nets_2::adaptive_surface_nets_2(sampler, bounds_min, bounds_max, config);
+    let result =
+        adaptive_surface_nets_2::adaptive_surface_nets_2(sampler, bounds_min, bounds_max, config);
 
     Ok(AdaptiveMeshV2Result {
         vertices: result.mesh.vertices,
@@ -401,7 +430,6 @@ pub fn generate_adaptive_mesh_v2_from_bytes(
         stats: result.stats,
     })
 }
-
 
 // =============================================================================
 // Project V2: New Flat Structure
@@ -586,7 +614,11 @@ impl Project {
     }
 
     /// Generates a reasonable default output name for an operator.
-    pub fn default_output_name(&self, operator_crate_name: &str, primary_input: Option<&str>) -> String {
+    pub fn default_output_name(
+        &self,
+        operator_crate_name: &str,
+        primary_input: Option<&str>,
+    ) -> String {
         let suffix = match operator_crate_name {
             "translate_operator" => "translated",
             "rotation_operator" => "rotated",
@@ -594,7 +626,9 @@ impl Project {
             "boolean_operator" => "boolean_result",
             "lua_script_operator" => "scripted",
             _ => {
-                let base = operator_crate_name.strip_suffix("_operator").unwrap_or(operator_crate_name);
+                let base = operator_crate_name
+                    .strip_suffix("_operator")
+                    .unwrap_or(operator_crate_name);
                 return self.unique_asset_id(&format!("{}_output", base));
             }
         };
@@ -628,7 +662,8 @@ impl Project {
         let op_id = self.unique_asset_id(op_id_base);
 
         // Add the operator as an import
-        self.imports.push(ImportedAsset::operator(op_id.clone(), op_data));
+        self.imports
+            .push(ImportedAsset::operator(op_id.clone(), op_data));
 
         // Add the execution step
         self.timeline.push(ExecutionStep {
@@ -693,7 +728,8 @@ impl Project {
         // Execute timeline steps
         for step in &self.timeline {
             // Get operator bytes
-            let op_data = env.get(&step.operator_id)
+            let op_data = env
+                .get(&step.operator_id)
                 .ok_or_else(|| ExecutionError::NoSuchAssetId(step.operator_id.clone()))?
                 .data_arc();
 
@@ -704,7 +740,8 @@ impl Project {
             for input in &step.inputs {
                 let bytes = match input {
                     ExecutionInput::AssetRef(id) => {
-                        let asset = env.get(id)
+                        let asset = env
+                            .get(id)
                             .ok_or_else(|| ExecutionError::NoSuchAssetId(id.clone()))?;
                         precursor_ids.push(id.clone());
                         asset.data().to_vec()
@@ -719,7 +756,8 @@ impl Project {
                 .map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
 
             let io = OperatorIo::new(input_bytes);
-            let result = executor.run(io)
+            let result = executor
+                .run(io)
                 .map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
 
             // Store outputs
@@ -738,7 +776,8 @@ impl Project {
         // Collect exports
         let mut exported = Vec::new();
         for export_id in &self.exports {
-            let asset = env.remove(export_id)
+            let asset = env
+                .remove(export_id)
                 .ok_or_else(|| ExecutionError::NoSuchAssetId(export_id.clone()))?;
             exported.push(asset);
         }
@@ -748,7 +787,9 @@ impl Project {
 
     #[cfg(not(any(feature = "native", feature = "web")))]
     pub fn run(&self, _env: &mut Environment) -> Result<Vec<LoadedAsset>, ExecutionError> {
-        Err(ExecutionError::Wasmtime("WASM execution requires the 'native' or 'web' feature".to_string()))
+        Err(ExecutionError::Wasmtime(
+            "WASM execution requires the 'native' or 'web' feature".to_string(),
+        ))
     }
 
     /// Serializes the project to CBOR format.
@@ -819,7 +860,11 @@ mod tests {
         };
 
         let assets = project.declared_assets();
-        assert!(assets.iter().any(|(id, hint)| id == "model_a" && *hint == Some(AssetTypeHint::Model)));
+        assert!(
+            assets
+                .iter()
+                .any(|(id, hint)| id == "model_a" && *hint == Some(AssetTypeHint::Model))
+        );
         assert!(assets.iter().any(|(id, _)| id == "model_b"));
     }
 

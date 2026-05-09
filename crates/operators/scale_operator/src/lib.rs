@@ -51,7 +51,11 @@ struct ScaleConfig {
 
 impl Default for ScaleConfig {
     fn default() -> Self {
-        Self { sx: 1.0, sy: 1.0, sz: 1.0 }
+        Self {
+            sx: 1.0,
+            sy: 1.0,
+            sz: 1.0,
+        }
     }
 }
 
@@ -84,13 +88,23 @@ fn transform_wasm(input_bytes: &[u8], cfg: ScaleConfig) -> Result<Vec<u8>, Strin
     let suffix = generate_hex_suffix();
 
     // Find memory export
-    let memory_id: Option<MemoryId> = module.exports.iter()
-        .find(|e| e.name == "memory")
-        .and_then(|e| if let walrus::ExportItem::Memory(m) = e.item { Some(m) } else { None });
+    let memory_id: Option<MemoryId> =
+        module
+            .exports
+            .iter()
+            .find(|e| e.name == "memory")
+            .and_then(|e| {
+                if let walrus::ExportItem::Memory(m) = e.item {
+                    Some(m)
+                } else {
+                    None
+                }
+            });
 
     let memory_id = memory_id.ok_or("Input model missing memory export")?;
 
-    let mut renamed: std::collections::HashMap<String, FunctionId> = std::collections::HashMap::new();
+    let mut renamed: std::collections::HashMap<String, FunctionId> =
+        std::collections::HashMap::new();
     let mut exports_to_remove = Vec::new();
     for export in module.exports.iter() {
         if ABI_FUNCTIONS_ND.contains(&export.name.as_str()) {
@@ -126,19 +140,46 @@ fn transform_wasm(input_bytes: &[u8], cfg: ScaleConfig) -> Result<Vec<u8>, Strin
         let z = module.locals.add(ValType::F64);
 
         use walrus::ir::BinaryOp::F64Div;
-        let mem_arg = walrus::ir::MemArg { align: 3, offset: 0 };
-        let mem_arg_8 = walrus::ir::MemArg { align: 3, offset: 8 };
-        let mem_arg_16 = walrus::ir::MemArg { align: 3, offset: 16 };
+        let mem_arg = walrus::ir::MemArg {
+            align: 3,
+            offset: 0,
+        };
+        let mem_arg_8 = walrus::ir::MemArg {
+            align: 3,
+            offset: 8,
+        };
+        let mem_arg_16 = walrus::ir::MemArg {
+            align: 3,
+            offset: 16,
+        };
 
         // Load position from input
-        b.func_body().local_get(pos_ptr).load(memory_id, walrus::ir::LoadKind::F64, mem_arg).local_set(x);
-        b.func_body().local_get(pos_ptr).load(memory_id, walrus::ir::LoadKind::F64, mem_arg_8).local_set(y);
-        b.func_body().local_get(pos_ptr).load(memory_id, walrus::ir::LoadKind::F64, mem_arg_16).local_set(z);
+        b.func_body()
+            .local_get(pos_ptr)
+            .load(memory_id, walrus::ir::LoadKind::F64, mem_arg)
+            .local_set(x);
+        b.func_body()
+            .local_get(pos_ptr)
+            .load(memory_id, walrus::ir::LoadKind::F64, mem_arg_8)
+            .local_set(y);
+        b.func_body()
+            .local_get(pos_ptr)
+            .load(memory_id, walrus::ir::LoadKind::F64, mem_arg_16)
+            .local_set(z);
 
         // Write scaled position to scratch buffer
-        let scratch_arg = walrus::ir::MemArg { align: 3, offset: 0 };
-        let scratch_arg_8 = walrus::ir::MemArg { align: 3, offset: 8 };
-        let scratch_arg_16 = walrus::ir::MemArg { align: 3, offset: 16 };
+        let scratch_arg = walrus::ir::MemArg {
+            align: 3,
+            offset: 0,
+        };
+        let scratch_arg_8 = walrus::ir::MemArg {
+            align: 3,
+            offset: 8,
+        };
+        let scratch_arg_16 = walrus::ir::MemArg {
+            align: 3,
+            offset: 16,
+        };
 
         b.func_body()
             .i32_const(SCRATCH_POS_OFFSET)
@@ -176,17 +217,27 @@ fn transform_wasm(input_bytes: &[u8], cfg: ScaleConfig) -> Result<Vec<u8>, Strin
         let min_val = module.locals.add(ValType::F64);
         let max_val = module.locals.add(ValType::F64);
 
-        use walrus::ir::BinaryOp::{F64Mul, F64Min, F64Max};
+        use walrus::ir::BinaryOp::{F64Max, F64Min, F64Mul};
 
         // Call original get_bounds
         b.func_body().local_get(out_ptr).call(orig);
 
         // Process each axis: scale and handle sign flips
-        let scales = [(0, 8, cfg.sx as f64), (16, 24, cfg.sy as f64), (32, 40, cfg.sz as f64)];
+        let scales = [
+            (0, 8, cfg.sx as f64),
+            (16, 24, cfg.sy as f64),
+            (32, 40, cfg.sz as f64),
+        ];
 
         for (min_offset, max_offset, scale) in scales {
-            let mem_arg_min = walrus::ir::MemArg { align: 3, offset: min_offset };
-            let mem_arg_max = walrus::ir::MemArg { align: 3, offset: max_offset };
+            let mem_arg_min = walrus::ir::MemArg {
+                align: 3,
+                offset: min_offset,
+            };
+            let mem_arg_max = walrus::ir::MemArg {
+                align: 3,
+                offset: max_offset,
+            };
 
             // Load min and max, multiply by scale
             b.func_body()
@@ -231,27 +282,41 @@ fn transform_wasm(input_bytes: &[u8], cfg: ScaleConfig) -> Result<Vec<u8>, Strin
 pub extern "C" fn run() {
     let len = unsafe { get_input_len(0) } as usize;
     let mut buf = vec![0u8; len];
-    if len > 0 { unsafe { get_input_data(0, buf.as_mut_ptr() as i32, len as i32); } }
+    if len > 0 {
+        unsafe {
+            get_input_data(0, buf.as_mut_ptr() as i32, len as i32);
+        }
+    }
 
     let cfg = {
         let cfg_len = unsafe { get_input_len(1) } as usize;
-        if cfg_len == 0 { ScaleConfig::default() } else {
+        if cfg_len == 0 {
+            ScaleConfig::default()
+        } else {
             let mut cfg_buf = vec![0u8; cfg_len];
-            unsafe { get_input_data(1, cfg_buf.as_mut_ptr() as i32, cfg_len as i32); }
+            unsafe {
+                get_input_data(1, cfg_buf.as_mut_ptr() as i32, cfg_len as i32);
+            }
             let mut cursor = std::io::Cursor::new(&cfg_buf);
             ciborium::de::from_reader::<ScaleConfig, _>(&mut cursor).unwrap_or_default()
         }
     };
 
-    let output = match transform_wasm(&buf, cfg) { Ok(t) => t, Err(_) => buf };
-    unsafe { post_output(0, output.as_ptr() as i32, output.len() as i32); }
+    let output = match transform_wasm(&buf, cfg) {
+        Ok(t) => t,
+        Err(_) => buf,
+    };
+    unsafe {
+        post_output(0, output.as_ptr() as i32, output.len() as i32);
+    }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn get_metadata() -> i64 {
     static METADATA: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     let bytes = METADATA.get_or_init(|| {
-        let schema = "{ sx: float .default 1.0, sy: float .default 1.0, sz: float .default 1.0 }".to_string();
+        let schema = "{ sx: float .default 1.0, sy: float .default 1.0, sz: float .default 1.0 }"
+            .to_string();
         let metadata = OperatorMetadata {
             name: "scale_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -262,7 +327,8 @@ pub extern "C" fn get_metadata() -> i64 {
             outputs: vec![OperatorMetadataOutput::ModelWASM],
         };
         let mut out = Vec::new();
-        ciborium::ser::into_writer(&metadata, &mut out).expect("scale_operator metadata CBOR serialization should not fail");
+        ciborium::ser::into_writer(&metadata, &mut out)
+            .expect("scale_operator metadata CBOR serialization should not fail");
         out
     });
     let ptr = bytes.as_ptr() as u32;

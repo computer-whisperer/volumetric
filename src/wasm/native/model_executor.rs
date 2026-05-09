@@ -114,7 +114,6 @@ pub struct NativeModelExecutorNd {
     store: Store<()>,
     memory: Memory,
     dimensions: u32,
-    get_dimensions: TypedFunc<(), u32>,
     get_bounds: TypedFunc<i32, ()>,
     sample: TypedFunc<i32, f32>,
 }
@@ -159,7 +158,6 @@ impl NativeModelExecutorNd {
             store,
             memory,
             dimensions,
-            get_dimensions,
             get_bounds,
             sample,
         })

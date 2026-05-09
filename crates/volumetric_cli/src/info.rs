@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use wasmtime::{Engine, Instance, Module, Store};
 
 use volumetric::{
-    operator_metadata_from_wasm_bytes, ExecutionInput, OperatorMetadata,
-    OperatorMetadataInput, OperatorMetadataOutput, Project,
+    ExecutionInput, OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput, Project,
+    operator_metadata_from_wasm_bytes,
 };
 
 // === WASM Type Detection ===
@@ -63,9 +63,16 @@ fn detect_model_abi(module: &Module) -> ModelAbiVersion {
     }
 }
 
+fn wasmtime_result<T>(result: std::result::Result<T, wasmtime::Error>, context: &str) -> Result<T> {
+    result.map_err(|err| anyhow::anyhow!("{context}: {err}"))
+}
+
 fn detect_wasm_type(wasm_bytes: &[u8]) -> Result<WasmType> {
     let engine = Engine::default();
-    let module = Module::new(&engine, wasm_bytes).context("Failed to parse WASM module")?;
+    let module = wasmtime_result(
+        Module::new(&engine, wasm_bytes),
+        "Failed to parse WASM module",
+    )?;
 
     // Check for new N-dimensional ABI first
     let has_sample = module.exports().any(|e| e.name() == "sample");
@@ -74,9 +81,7 @@ fn detect_wasm_type(wasm_bytes: &[u8]) -> Result<WasmType> {
     let has_is_inside = module.exports().any(|e| e.name() == "is_inside");
     let has_get_metadata = module.exports().any(|e| e.name() == "get_metadata");
 
-    if has_sample && has_get_dimensions {
-        Ok(WasmType::Model)
-    } else if has_is_inside {
+    if (has_sample && has_get_dimensions) || has_is_inside {
         Ok(WasmType::Model)
     } else if has_get_metadata {
         Ok(WasmType::Operator)
@@ -104,34 +109,55 @@ impl Bounds {
 }
 
 /// Get bounds using the legacy ABI (separate get_bounds_min_x etc. functions)
-fn get_model_bounds_legacy(
-    store: &mut Store<()>,
-    instance: &Instance,
-) -> Result<Bounds> {
-    let min_x = instance
-        .get_typed_func::<(), f64>(&mut *store, "get_bounds_min_x")
-        .context("Missing get_bounds_min_x export")?
-        .call(&mut *store, ())?;
-    let min_y = instance
-        .get_typed_func::<(), f64>(&mut *store, "get_bounds_min_y")
-        .context("Missing get_bounds_min_y export")?
-        .call(&mut *store, ())?;
-    let min_z = instance
-        .get_typed_func::<(), f64>(&mut *store, "get_bounds_min_z")
-        .context("Missing get_bounds_min_z export")?
-        .call(&mut *store, ())?;
-    let max_x = instance
-        .get_typed_func::<(), f64>(&mut *store, "get_bounds_max_x")
-        .context("Missing get_bounds_max_x export")?
-        .call(&mut *store, ())?;
-    let max_y = instance
-        .get_typed_func::<(), f64>(&mut *store, "get_bounds_max_y")
-        .context("Missing get_bounds_max_y export")?
-        .call(&mut *store, ())?;
-    let max_z = instance
-        .get_typed_func::<(), f64>(&mut *store, "get_bounds_max_z")
-        .context("Missing get_bounds_max_z export")?
-        .call(&mut *store, ())?;
+fn get_model_bounds_legacy(store: &mut Store<()>, instance: &Instance) -> Result<Bounds> {
+    let min_x_func = wasmtime_result(
+        instance.get_typed_func::<(), f64>(&mut *store, "get_bounds_min_x"),
+        "Missing get_bounds_min_x export",
+    )?;
+    let min_x = wasmtime_result(
+        min_x_func.call(&mut *store, ()),
+        "get_bounds_min_x call failed",
+    )?;
+    let min_y_func = wasmtime_result(
+        instance.get_typed_func::<(), f64>(&mut *store, "get_bounds_min_y"),
+        "Missing get_bounds_min_y export",
+    )?;
+    let min_y = wasmtime_result(
+        min_y_func.call(&mut *store, ()),
+        "get_bounds_min_y call failed",
+    )?;
+    let min_z_func = wasmtime_result(
+        instance.get_typed_func::<(), f64>(&mut *store, "get_bounds_min_z"),
+        "Missing get_bounds_min_z export",
+    )?;
+    let min_z = wasmtime_result(
+        min_z_func.call(&mut *store, ()),
+        "get_bounds_min_z call failed",
+    )?;
+    let max_x_func = wasmtime_result(
+        instance.get_typed_func::<(), f64>(&mut *store, "get_bounds_max_x"),
+        "Missing get_bounds_max_x export",
+    )?;
+    let max_x = wasmtime_result(
+        max_x_func.call(&mut *store, ()),
+        "get_bounds_max_x call failed",
+    )?;
+    let max_y_func = wasmtime_result(
+        instance.get_typed_func::<(), f64>(&mut *store, "get_bounds_max_y"),
+        "Missing get_bounds_max_y export",
+    )?;
+    let max_y = wasmtime_result(
+        max_y_func.call(&mut *store, ()),
+        "get_bounds_max_y call failed",
+    )?;
+    let max_z_func = wasmtime_result(
+        instance.get_typed_func::<(), f64>(&mut *store, "get_bounds_max_z"),
+        "Missing get_bounds_max_z export",
+    )?;
+    let max_z = wasmtime_result(
+        max_z_func.call(&mut *store, ()),
+        "get_bounds_max_z call failed",
+    )?;
 
     Ok(Bounds {
         min: [min_x, min_y, min_z],
@@ -140,29 +166,34 @@ fn get_model_bounds_legacy(
 }
 
 /// Get bounds using the N-dimensional ABI (get_bounds(out_ptr) with memory)
-fn get_model_bounds_nd(
-    store: &mut Store<()>,
-    instance: &Instance,
-) -> Result<(u32, Bounds)> {
+fn get_model_bounds_nd(store: &mut Store<()>, instance: &Instance) -> Result<(u32, Bounds)> {
     let memory = instance
         .get_memory(&mut *store, "memory")
         .context("Missing memory export")?;
 
-    let get_dimensions = instance
-        .get_typed_func::<(), u32>(&mut *store, "get_dimensions")
-        .context("Missing get_dimensions export")?;
+    let get_dimensions = wasmtime_result(
+        instance.get_typed_func::<(), u32>(&mut *store, "get_dimensions"),
+        "Missing get_dimensions export",
+    )?;
 
-    let get_bounds = instance
-        .get_typed_func::<i32, ()>(&mut *store, "get_bounds")
-        .context("Missing get_bounds export")?;
+    let get_bounds = wasmtime_result(
+        instance.get_typed_func::<i32, ()>(&mut *store, "get_bounds"),
+        "Missing get_bounds export",
+    )?;
 
-    let dimensions = get_dimensions.call(&mut *store, ())?;
+    let dimensions = wasmtime_result(
+        get_dimensions.call(&mut *store, ()),
+        "get_dimensions call failed",
+    )?;
 
     // Buffer offset for bounds output (after position buffer)
     const BOUNDS_BUFFER_OFFSET: i32 = 256;
 
     // Call get_bounds to write bounds to memory
-    get_bounds.call(&mut *store, BOUNDS_BUFFER_OFFSET)?;
+    wasmtime_result(
+        get_bounds.call(&mut *store, BOUNDS_BUFFER_OFFSET),
+        "get_bounds call failed",
+    )?;
 
     // Read bounds from memory (interleaved: min_x, max_x, min_y, max_y, ...)
     let mut bounds_data = vec![0u8; (dimensions as usize) * 2 * 8];
@@ -213,10 +244,15 @@ fn get_model_bounds_nd(
 
 fn get_model_bounds(wasm_bytes: &[u8]) -> Result<Bounds> {
     let engine = Engine::default();
-    let module = Module::new(&engine, wasm_bytes).context("Failed to parse WASM module")?;
+    let module = wasmtime_result(
+        Module::new(&engine, wasm_bytes),
+        "Failed to parse WASM module",
+    )?;
     let mut store = Store::new(&engine, ());
-    let instance =
-        Instance::new(&mut store, &module, &[]).context("Failed to instantiate WASM module")?;
+    let instance = wasmtime_result(
+        Instance::new(&mut store, &module, &[]),
+        "Failed to instantiate WASM module",
+    )?;
 
     let abi_version = detect_model_abi(&module);
 
@@ -232,10 +268,15 @@ fn get_model_bounds(wasm_bytes: &[u8]) -> Result<Bounds> {
 /// Get model bounds along with ABI version info
 fn get_model_bounds_with_abi(wasm_bytes: &[u8]) -> Result<(ModelAbiVersion, u32, Bounds)> {
     let engine = Engine::default();
-    let module = Module::new(&engine, wasm_bytes).context("Failed to parse WASM module")?;
+    let module = wasmtime_result(
+        Module::new(&engine, wasm_bytes),
+        "Failed to parse WASM module",
+    )?;
     let mut store = Store::new(&engine, ());
-    let instance =
-        Instance::new(&mut store, &module, &[]).context("Failed to instantiate WASM module")?;
+    let instance = wasmtime_result(
+        Instance::new(&mut store, &module, &[]),
+        "Failed to instantiate WASM module",
+    )?;
 
     let abi_version = detect_model_abi(&module);
 
@@ -259,15 +300,17 @@ fn sample_model_legacy(
     instance: &Instance,
     points: &[(f64, f64, f64)],
 ) -> Result<Vec<f32>> {
-    let is_inside = instance
-        .get_typed_func::<(f64, f64, f64), f32>(&mut *store, "is_inside")
-        .context("Missing is_inside export")?;
+    let is_inside = wasmtime_result(
+        instance.get_typed_func::<(f64, f64, f64), f32>(&mut *store, "is_inside"),
+        "Missing is_inside export",
+    )?;
 
     let mut results = Vec::with_capacity(points.len());
     for &(x, y, z) in points {
-        let value = is_inside
-            .call(&mut *store, (x, y, z))
-            .context("is_inside call failed")?;
+        let value = wasmtime_result(
+            is_inside.call(&mut *store, (x, y, z)),
+            "is_inside call failed",
+        )?;
         results.push(value);
     }
     Ok(results)
@@ -283,9 +326,10 @@ fn sample_model_nd(
         .get_memory(&mut *store, "memory")
         .context("Missing memory export")?;
 
-    let sample = instance
-        .get_typed_func::<i32, f32>(&mut *store, "sample")
-        .context("Missing sample export")?;
+    let sample = wasmtime_result(
+        instance.get_typed_func::<i32, f32>(&mut *store, "sample"),
+        "Missing sample export",
+    )?;
 
     // Position buffer at offset 0
     const POS_BUFFER_OFFSET: i32 = 0;
@@ -303,9 +347,10 @@ fn sample_model_nd(
             .context("Failed to write position to memory")?;
 
         // Call sample
-        let value = sample
-            .call(&mut *store, POS_BUFFER_OFFSET)
-            .context("sample call failed")?;
+        let value = wasmtime_result(
+            sample.call(&mut *store, POS_BUFFER_OFFSET),
+            "sample call failed",
+        )?;
         results.push(value);
     }
 
@@ -314,10 +359,15 @@ fn sample_model_nd(
 
 fn sample_model(wasm_bytes: &[u8], points: &[(f64, f64, f64)]) -> Result<Vec<f32>> {
     let engine = Engine::default();
-    let module = Module::new(&engine, wasm_bytes).context("Failed to parse WASM module")?;
+    let module = wasmtime_result(
+        Module::new(&engine, wasm_bytes),
+        "Failed to parse WASM module",
+    )?;
     let mut store = Store::new(&engine, ());
-    let instance =
-        Instance::new(&mut store, &module, &[]).context("Failed to instantiate WASM module")?;
+    let instance = wasmtime_result(
+        Instance::new(&mut store, &module, &[]),
+        "Failed to instantiate WASM module",
+    )?;
 
     let abi_version = detect_model_abi(&module);
 
@@ -433,15 +483,13 @@ fn metadata_to_json(meta: &OperatorMetadata) -> OperatorMetadataJson {
             .iter()
             .map(|i| match i {
                 OperatorMetadataInput::ModelWASM => InputInfo::ModelWasm,
-                OperatorMetadataInput::CBORConfiguration(cddl) => InputInfo::CborConfiguration {
-                    cddl: cddl.clone(),
-                },
+                OperatorMetadataInput::CBORConfiguration(cddl) => {
+                    InputInfo::CborConfiguration { cddl: cddl.clone() }
+                }
                 OperatorMetadataInput::LuaSource(template) => InputInfo::LuaSource {
                     template: template.clone(),
                 },
-                OperatorMetadataInput::VecF64(dim) => InputInfo::VecF64 {
-                    dimension: *dim,
-                },
+                OperatorMetadataInput::VecF64(dim) => InputInfo::VecF64 { dimension: *dim },
                 OperatorMetadataInput::Blob => InputInfo::Blob,
             })
             .collect(),
@@ -574,7 +622,10 @@ fn print_info_human(output: &InfoOutput) {
             println!();
             println!("Imports ({}):", imports.len());
             for import in imports {
-                println!("  {} ({}, {} bytes)", import.id, import.type_hint, import.size_bytes);
+                println!(
+                    "  {} ({}, {} bytes)",
+                    import.id, import.type_hint, import.size_bytes
+                );
             }
             println!();
             println!("Timeline ({} steps):", timeline.len());
@@ -607,8 +658,7 @@ pub fn run_info(args: InfoArgs) -> Result<()> {
 
     let output = match extension.as_str() {
         "wasm" => {
-            let wasm_bytes =
-                std::fs::read(&args.input).context("Failed to read WASM file")?;
+            let wasm_bytes = std::fs::read(&args.input).context("Failed to read WASM file")?;
             let wasm_type = detect_wasm_type(&wasm_bytes)?;
 
             match wasm_type {
@@ -687,7 +737,10 @@ fn print_bounds_human(bounds: &Bounds) {
         "Bounds: ({:.3}, {:.3}, {:.3}) to ({:.3}, {:.3}, {:.3})",
         bounds.min[0], bounds.min[1], bounds.min[2], bounds.max[0], bounds.max[1], bounds.max[2]
     );
-    println!("Dimensions: {:.3} x {:.3} x {:.3}", dims[0], dims[1], dims[2]);
+    println!(
+        "Dimensions: {:.3} x {:.3} x {:.3}",
+        dims[0], dims[1], dims[2]
+    );
 }
 
 pub fn run_bounds(args: BoundsArgs) -> Result<()> {

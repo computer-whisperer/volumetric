@@ -187,9 +187,9 @@
 //!
 //! ## Data Structures
 
+use dashmap::DashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use web_time::Instant;
-use dashmap::DashSet;
 
 /// Conditional parallel iteration helpers.
 ///
@@ -381,10 +381,10 @@ impl Default for AdaptiveMeshConfig2 {
 }
 
 /// A unique identifier for a cuboid at a specific position and depth.
-/// 
+///
 /// Uses explicit (x, y, z, depth) representation for clarity and debuggability.
 /// Morton encoding could be added later if cache performance becomes an issue.
-/// 
+///
 /// **CRITICAL**: All coordinates are INTEGER cell indices at the given depth level.
 /// Never compute CuboidId from floating-point positions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -404,7 +404,7 @@ impl CuboidId {
     pub fn new(x: i32, y: i32, z: i32, depth: u8) -> Self {
         Self { x, y, z, depth }
     }
-    
+
     /// Convert this cell's coordinates to finest-level units.
     /// At depth d, each cell spans 2^(max_depth - d) finest-level units.
     #[inline]
@@ -412,7 +412,7 @@ impl CuboidId {
         let scale = 1i32 << (max_depth - self.depth);
         (self.x * scale, self.y * scale, self.z * scale)
     }
-    
+
     /// Get the 8 child CuboidIds when subdividing this cell.
     /// Returns children in canonical corner order (see CORNER_OFFSETS).
     pub fn subdivide(&self) -> [CuboidId; 8] {
@@ -421,17 +421,17 @@ impl CuboidId {
         let by = self.y * 2;
         let bz = self.z * 2;
         [
-            CuboidId::new(bx,     by,     bz,     child_depth), // corner 0
-            CuboidId::new(bx + 1, by,     bz,     child_depth), // corner 1
-            CuboidId::new(bx,     by + 1, bz,     child_depth), // corner 2
-            CuboidId::new(bx + 1, by + 1, bz,     child_depth), // corner 3
-            CuboidId::new(bx,     by,     bz + 1, child_depth), // corner 4
-            CuboidId::new(bx + 1, by,     bz + 1, child_depth), // corner 5
-            CuboidId::new(bx,     by + 1, bz + 1, child_depth), // corner 6
+            CuboidId::new(bx, by, bz, child_depth),             // corner 0
+            CuboidId::new(bx + 1, by, bz, child_depth),         // corner 1
+            CuboidId::new(bx, by + 1, bz, child_depth),         // corner 2
+            CuboidId::new(bx + 1, by + 1, bz, child_depth),     // corner 3
+            CuboidId::new(bx, by, bz + 1, child_depth),         // corner 4
+            CuboidId::new(bx + 1, by, bz + 1, child_depth),     // corner 5
+            CuboidId::new(bx, by + 1, bz + 1, child_depth),     // corner 6
             CuboidId::new(bx + 1, by + 1, bz + 1, child_depth), // corner 7
         ]
     }
-    
+
     /// Get a neighbor cell at the same depth level.
     /// Returns None if the neighbor would be outside the valid range.
     ///
@@ -440,22 +440,35 @@ impl CuboidId {
     /// * `max_cells` - Number of cells at this depth level (original grid)
     /// * `boundary_expansion` - Number of extra cells to allow beyond the grid on each side
     ///   (e.g., 1 means allow cells from -1 to max_cells inclusive)
-    pub fn neighbor(&self, dx: i32, dy: i32, dz: i32, max_cells: i32, boundary_expansion: i32) -> Option<CuboidId> {
+    pub fn neighbor(
+        &self,
+        dx: i32,
+        dy: i32,
+        dz: i32,
+        max_cells: i32,
+        boundary_expansion: i32,
+    ) -> Option<CuboidId> {
         let nx = self.x + dx;
         let ny = self.y + dy;
         let nz = self.z + dz;
         let min_valid = -boundary_expansion;
         let max_valid = max_cells + boundary_expansion;
-        if nx >= min_valid && nx < max_valid && ny >= min_valid && ny < max_valid && nz >= min_valid && nz < max_valid {
+        if nx >= min_valid
+            && nx < max_valid
+            && ny >= min_valid
+            && ny < max_valid
+            && nz >= min_valid
+            && nz < max_valid
+        {
             Some(CuboidId::new(nx, ny, nz, self.depth))
         } else {
             None
         }
     }
-    
+
     /// Compute the EdgeId for a given edge index (0-11) of this cell.
     /// The EdgeId is computed in finest-level integer coordinates.
-    /// 
+    ///
     /// **CRITICAL**: This is the ONLY correct way to compute EdgeIds.
     /// Never compute EdgeIds from floating-point positions.
     pub fn edge_id(&self, edge_index: usize, max_depth: u8) -> EdgeId {
@@ -472,7 +485,7 @@ impl CuboidId {
 
 /// A unique identifier for an edge in the voxel grid.
 /// Edges are identified by their minimum corner and axis direction.
-/// 
+///
 /// **CRITICAL**: All coordinates are INTEGER positions in finest-level units.
 /// EdgeIds must be computed via CuboidId::edge_id(), never from floats.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -520,13 +533,13 @@ impl CornerMask {
     pub fn is_inside(&self, index: usize) -> bool {
         (self.0 >> index) & 1 != 0
     }
-    
+
     /// Check if this cuboid has mixed corners (some inside, some outside)
     #[inline]
     pub fn is_mixed(&self) -> bool {
         self.0 != 0 && self.0 != 0xFF
     }
-    
+
     /// Create from 8 boolean values
     pub fn from_bools(corners: [bool; 8]) -> Self {
         let mut mask = 0u8;
@@ -615,7 +628,7 @@ fn our_mask_to_mc_mask(our_mask: u8) -> u8 {
     ((our_mask & 0b00001000) >> 1) |    // our bit 3 -> MC bit 2
     (our_mask & 0b00110000) |           // bits 4,5 stay
     ((our_mask & 0b01000000) << 1) |    // our bit 6 -> MC bit 7
-    ((our_mask & 0b10000000) >> 1)      // our bit 7 -> MC bit 6
+    ((our_mask & 0b10000000) >> 1) // our bit 7 -> MC bit 6
 }
 
 /// Convert MC edge index to our edge index.
@@ -639,38 +652,26 @@ const MC_EDGE_TO_OUR_EDGE: [usize; 12] = [
 /// Bit N is set if edge N has a sign change (crosses the surface).
 /// This uses the standard Marching Cubes table adapted to our corner indexing.
 pub const MC_EDGE_FLAGS: [u16; 256] = [
-    0x000, 0x109, 0x203, 0x30a, 0x406, 0x50f, 0x605, 0x70c,
-    0x80c, 0x905, 0xa0f, 0xb06, 0xc0a, 0xd03, 0xe09, 0xf00,
-    0x190, 0x099, 0x393, 0x29a, 0x596, 0x49f, 0x795, 0x69c,
-    0x99c, 0x895, 0xb9f, 0xa96, 0xd9a, 0xc93, 0xf99, 0xe90,
-    0x230, 0x339, 0x033, 0x13a, 0x636, 0x73f, 0x435, 0x53c,
-    0xa3c, 0xb35, 0x83f, 0x936, 0xe3a, 0xf33, 0xc39, 0xd30,
-    0x3a0, 0x2a9, 0x1a3, 0x0aa, 0x7a6, 0x6af, 0x5a5, 0x4ac,
-    0xbac, 0xaa5, 0x9af, 0x8a6, 0xfaa, 0xea3, 0xda9, 0xca0,
-    0x460, 0x569, 0x663, 0x76a, 0x066, 0x16f, 0x265, 0x36c,
-    0xc6c, 0xd65, 0xe6f, 0xf66, 0x86a, 0x963, 0xa69, 0xb60,
-    0x5f0, 0x4f9, 0x7f3, 0x6fa, 0x1f6, 0x0ff, 0x3f5, 0x2fc,
-    0xdfc, 0xcf5, 0xfff, 0xef6, 0x9fa, 0x8f3, 0xbf9, 0xaf0,
-    0x650, 0x759, 0x453, 0x55a, 0x256, 0x35f, 0x055, 0x15c,
-    0xe5c, 0xf55, 0xc5f, 0xd56, 0xa5a, 0xb53, 0x859, 0x950,
-    0x7c0, 0x6c9, 0x5c3, 0x4ca, 0x3c6, 0x2cf, 0x1c5, 0x0cc,
-    0xfcc, 0xec5, 0xdcf, 0xcc6, 0xbca, 0xac3, 0x9c9, 0x8c0,
-    0x8c0, 0x9c9, 0xac3, 0xbca, 0xcc6, 0xdcf, 0xec5, 0xfcc,
-    0x0cc, 0x1c5, 0x2cf, 0x3c6, 0x4ca, 0x5c3, 0x6c9, 0x7c0,
-    0x950, 0x859, 0xb53, 0xa5a, 0xd56, 0xc5f, 0xf55, 0xe5c,
-    0x15c, 0x055, 0x35f, 0x256, 0x55a, 0x453, 0x759, 0x650,
-    0xaf0, 0xbf9, 0x8f3, 0x9fa, 0xef6, 0xfff, 0xcf5, 0xdfc,
-    0x2fc, 0x3f5, 0x0ff, 0x1f6, 0x6fa, 0x7f3, 0x4f9, 0x5f0,
-    0xb60, 0xa69, 0x963, 0x86a, 0xf66, 0xe6f, 0xd65, 0xc6c,
-    0x36c, 0x265, 0x16f, 0x066, 0x76a, 0x663, 0x569, 0x460,
-    0xca0, 0xda9, 0xea3, 0xfaa, 0x8a6, 0x9af, 0xaa5, 0xbac,
-    0x4ac, 0x5a5, 0x6af, 0x7a6, 0x0aa, 0x1a3, 0x2a9, 0x3a0,
-    0xd30, 0xc39, 0xf33, 0xe3a, 0x936, 0x83f, 0xb35, 0xa3c,
-    0x53c, 0x435, 0x73f, 0x636, 0x13a, 0x033, 0x339, 0x230,
-    0xe90, 0xf99, 0xc93, 0xd9a, 0xa96, 0xb9f, 0x895, 0x99c,
-    0x69c, 0x795, 0x49f, 0x596, 0x29a, 0x393, 0x099, 0x190,
-    0xf00, 0xe09, 0xd03, 0xc0a, 0xb06, 0xa0f, 0x905, 0x80c,
-    0x70c, 0x605, 0x50f, 0x406, 0x30a, 0x203, 0x109, 0x000,
+    0x000, 0x109, 0x203, 0x30a, 0x406, 0x50f, 0x605, 0x70c, 0x80c, 0x905, 0xa0f, 0xb06, 0xc0a,
+    0xd03, 0xe09, 0xf00, 0x190, 0x099, 0x393, 0x29a, 0x596, 0x49f, 0x795, 0x69c, 0x99c, 0x895,
+    0xb9f, 0xa96, 0xd9a, 0xc93, 0xf99, 0xe90, 0x230, 0x339, 0x033, 0x13a, 0x636, 0x73f, 0x435,
+    0x53c, 0xa3c, 0xb35, 0x83f, 0x936, 0xe3a, 0xf33, 0xc39, 0xd30, 0x3a0, 0x2a9, 0x1a3, 0x0aa,
+    0x7a6, 0x6af, 0x5a5, 0x4ac, 0xbac, 0xaa5, 0x9af, 0x8a6, 0xfaa, 0xea3, 0xda9, 0xca0, 0x460,
+    0x569, 0x663, 0x76a, 0x066, 0x16f, 0x265, 0x36c, 0xc6c, 0xd65, 0xe6f, 0xf66, 0x86a, 0x963,
+    0xa69, 0xb60, 0x5f0, 0x4f9, 0x7f3, 0x6fa, 0x1f6, 0x0ff, 0x3f5, 0x2fc, 0xdfc, 0xcf5, 0xfff,
+    0xef6, 0x9fa, 0x8f3, 0xbf9, 0xaf0, 0x650, 0x759, 0x453, 0x55a, 0x256, 0x35f, 0x055, 0x15c,
+    0xe5c, 0xf55, 0xc5f, 0xd56, 0xa5a, 0xb53, 0x859, 0x950, 0x7c0, 0x6c9, 0x5c3, 0x4ca, 0x3c6,
+    0x2cf, 0x1c5, 0x0cc, 0xfcc, 0xec5, 0xdcf, 0xcc6, 0xbca, 0xac3, 0x9c9, 0x8c0, 0x8c0, 0x9c9,
+    0xac3, 0xbca, 0xcc6, 0xdcf, 0xec5, 0xfcc, 0x0cc, 0x1c5, 0x2cf, 0x3c6, 0x4ca, 0x5c3, 0x6c9,
+    0x7c0, 0x950, 0x859, 0xb53, 0xa5a, 0xd56, 0xc5f, 0xf55, 0xe5c, 0x15c, 0x055, 0x35f, 0x256,
+    0x55a, 0x453, 0x759, 0x650, 0xaf0, 0xbf9, 0x8f3, 0x9fa, 0xef6, 0xfff, 0xcf5, 0xdfc, 0x2fc,
+    0x3f5, 0x0ff, 0x1f6, 0x6fa, 0x7f3, 0x4f9, 0x5f0, 0xb60, 0xa69, 0x963, 0x86a, 0xf66, 0xe6f,
+    0xd65, 0xc6c, 0x36c, 0x265, 0x16f, 0x066, 0x76a, 0x663, 0x569, 0x460, 0xca0, 0xda9, 0xea3,
+    0xfaa, 0x8a6, 0x9af, 0xaa5, 0xbac, 0x4ac, 0x5a5, 0x6af, 0x7a6, 0x0aa, 0x1a3, 0x2a9, 0x3a0,
+    0xd30, 0xc39, 0xf33, 0xe3a, 0x936, 0x83f, 0xb35, 0xa3c, 0x53c, 0x435, 0x73f, 0x636, 0x13a,
+    0x033, 0x339, 0x230, 0xe90, 0xf99, 0xc93, 0xd9a, 0xa96, 0xb9f, 0x895, 0x99c, 0x69c, 0x795,
+    0x49f, 0x596, 0x29a, 0x393, 0x099, 0x190, 0xf00, 0xe09, 0xd03, 0xc0a, 0xb06, 0xa0f, 0x905,
+    0x80c, 0x70c, 0x605, 0x50f, 0x406, 0x30a, 0x203, 0x109, 0x000,
 ];
 
 /// Marching Cubes triangle table: MC_TRI_TABLE[corner_mask] = list of edge indices forming triangles
@@ -684,7 +685,7 @@ pub const MC_TRI_TABLE: [[i8; 16]; 256] = include!("mc_tri_table.inc");
 // =============================================================================
 
 /// A work queue entry containing a cuboid ID and pre-sampled corner states.
-/// 
+///
 /// This replaces the sample cache approach. Each work queue entry carries
 /// the corner samples that are already known, avoiding redundant sampling
 /// and eliminating cache synchronization complexity.
@@ -705,17 +706,20 @@ impl WorkQueueEntry {
             known_corners: [None; 8],
         }
     }
-    
+
     /// Create a new work queue entry with some known corners
     pub fn with_corners(cuboid: CuboidId, known_corners: [Option<bool>; 8]) -> Self {
-        Self { cuboid, known_corners }
+        Self {
+            cuboid,
+            known_corners,
+        }
     }
-    
+
     /// Check if all corners are known
     pub fn all_corners_known(&self) -> bool {
         self.known_corners.iter().all(|c| c.is_some())
     }
-    
+
     /// Convert known corners to a CornerMask (panics if not all corners known)
     pub fn to_corner_mask(&self) -> CornerMask {
         let mut mask = 0u8;
@@ -739,7 +743,9 @@ pub struct SparseTriangle {
 
 impl SparseTriangle {
     pub fn new(v0: EdgeId, v1: EdgeId, v2: EdgeId) -> Self {
-        Self { vertices: [v0, v1, v2] }
+        Self {
+            vertices: [v0, v1, v2],
+        }
     }
 }
 
@@ -893,27 +899,35 @@ impl MeshingStats2 {
         println!("=== Adaptive Surface Nets v2 Profiling Report ===");
         println!("Total time: {:.2}ms", self.total_time_secs * 1000.0);
         println!();
-        println!("Stage 1 (Coarse Discovery): {:.2}ms ({:.1}%)",
+        println!(
+            "Stage 1 (Coarse Discovery): {:.2}ms ({:.1}%)",
             self.stage1_time_secs * 1000.0,
-            self.stage1_time_secs / self.total_time_secs * 100.0);
+            self.stage1_time_secs / self.total_time_secs * 100.0
+        );
         println!("  Samples: {}", self.stage1_samples);
         println!("  Mixed cells found: {}", self.stage1_mixed_cells);
         println!();
-        println!("Stage 2 (Subdivision & Emission): {:.2}ms ({:.1}%)",
+        println!(
+            "Stage 2 (Subdivision & Emission): {:.2}ms ({:.1}%)",
             self.stage2_time_secs * 1000.0,
-            self.stage2_time_secs / self.total_time_secs * 100.0);
+            self.stage2_time_secs / self.total_time_secs * 100.0
+        );
         println!("  Samples: {}", self.stage2_samples);
         println!("  Cuboids processed: {}", self.stage2_cuboids_processed);
         println!("  Triangles emitted: {}", self.stage2_triangles_emitted);
         println!();
-        println!("Stage 3 (Topology Finalization): {:.2}ms ({:.1}%)",
+        println!(
+            "Stage 3 (Topology Finalization): {:.2}ms ({:.1}%)",
             self.stage3_time_secs * 1000.0,
-            self.stage3_time_secs / self.total_time_secs * 100.0);
+            self.stage3_time_secs / self.total_time_secs * 100.0
+        );
         println!("  Unique vertices: {}", self.stage3_unique_vertices);
         println!();
-        println!("Stage 4 (Vertex Refinement): {:.2}ms ({:.1}%)",
+        println!(
+            "Stage 4 (Vertex Refinement): {:.2}ms ({:.1}%)",
             self.stage4_time_secs * 1000.0,
-            self.stage4_time_secs / self.total_time_secs * 100.0);
+            self.stage4_time_secs / self.total_time_secs * 100.0
+        );
         println!("  Samples: {}", self.stage4_samples);
         let total_refined = self.stage4_refine_primary_hit
             + self.stage4_refine_fallback_x_hit
@@ -922,27 +936,39 @@ impl MeshingStats2 {
             + self.stage4_refine_miss;
         if total_refined > 0 {
             println!("  Refinement outcomes:");
-            println!("    Primary hit:    {:>8} ({:>5.1}%)",
+            println!(
+                "    Primary hit:    {:>8} ({:>5.1}%)",
                 self.stage4_refine_primary_hit,
-                self.stage4_refine_primary_hit as f64 / total_refined as f64 * 100.0);
-            println!("    Fallback X hit: {:>8} ({:>5.1}%)",
+                self.stage4_refine_primary_hit as f64 / total_refined as f64 * 100.0
+            );
+            println!(
+                "    Fallback X hit: {:>8} ({:>5.1}%)",
                 self.stage4_refine_fallback_x_hit,
-                self.stage4_refine_fallback_x_hit as f64 / total_refined as f64 * 100.0);
-            println!("    Fallback Y hit: {:>8} ({:>5.1}%)",
+                self.stage4_refine_fallback_x_hit as f64 / total_refined as f64 * 100.0
+            );
+            println!(
+                "    Fallback Y hit: {:>8} ({:>5.1}%)",
                 self.stage4_refine_fallback_y_hit,
-                self.stage4_refine_fallback_y_hit as f64 / total_refined as f64 * 100.0);
-            println!("    Fallback Z hit: {:>8} ({:>5.1}%)",
+                self.stage4_refine_fallback_y_hit as f64 / total_refined as f64 * 100.0
+            );
+            println!(
+                "    Fallback Z hit: {:>8} ({:>5.1}%)",
                 self.stage4_refine_fallback_z_hit,
-                self.stage4_refine_fallback_z_hit as f64 / total_refined as f64 * 100.0);
-            println!("    MISS (no crossing): {:>8} ({:>5.1}%)",
+                self.stage4_refine_fallback_z_hit as f64 / total_refined as f64 * 100.0
+            );
+            println!(
+                "    MISS (no crossing): {:>8} ({:>5.1}%)",
                 self.stage4_refine_miss,
-                self.stage4_refine_miss as f64 / total_refined as f64 * 100.0);
+                self.stage4_refine_miss as f64 / total_refined as f64 * 100.0
+            );
         }
         println!();
         println!("Summary:");
         println!("  Total samples: {}", self.total_samples);
-        println!("  Avg sample time: {:.2}µs",
-            self.total_time_secs * 1_000_000.0 / self.total_samples as f64);
+        println!(
+            "  Avg sample time: {:.2}µs",
+            self.total_time_secs * 1_000_000.0 / self.total_samples as f64
+        );
         println!("  Total vertices: {}", self.total_vertices);
         println!("  Total triangles: {}", self.total_triangles);
         println!("  Effective resolution: {}³", self.effective_resolution);
@@ -1104,13 +1130,13 @@ where
             for ix in 0..expanded_cells {
                 // Gather the 8 corner samples for this cell using canonical corner ordering
                 let cell_corners: [bool; 8] = [
-                    corners[iz][iy][ix],         // corner 0: (0,0,0)
-                    corners[iz][iy][ix + 1],     // corner 1: (1,0,0)
-                    corners[iz][iy + 1][ix],     // corner 2: (0,1,0)
-                    corners[iz][iy + 1][ix + 1], // corner 3: (1,1,0)
-                    corners[iz + 1][iy][ix],     // corner 4: (0,0,1)
-                    corners[iz + 1][iy][ix + 1], // corner 5: (1,0,1)
-                    corners[iz + 1][iy + 1][ix], // corner 6: (0,1,1)
+                    corners[iz][iy][ix],             // corner 0: (0,0,0)
+                    corners[iz][iy][ix + 1],         // corner 1: (1,0,0)
+                    corners[iz][iy + 1][ix],         // corner 2: (0,1,0)
+                    corners[iz][iy + 1][ix + 1],     // corner 3: (1,1,0)
+                    corners[iz + 1][iy][ix],         // corner 4: (0,0,1)
+                    corners[iz + 1][iy][ix + 1],     // corner 5: (1,0,1)
+                    corners[iz + 1][iy + 1][ix],     // corner 6: (0,1,1)
                     corners[iz + 1][iy + 1][ix + 1], // corner 7: (1,1,1)
                 ];
 
@@ -1179,13 +1205,8 @@ where
 {
     for corner_idx in 0..8 {
         if entry.known_corners[corner_idx].is_none() {
-            let (x, y, z) = corner_world_position(
-                &entry.cuboid,
-                corner_idx,
-                bounds_min,
-                cell_size,
-                max_depth,
-            );
+            let (x, y, z) =
+                corner_world_position(&entry.cuboid, corner_idx, bounds_min, cell_size, max_depth);
             entry.known_corners[corner_idx] = Some(sample_is_inside(sampler, x, y, z, stats));
         }
     }
@@ -1351,7 +1372,9 @@ fn create_neighbor_entry(
     max_cells: i32,
     boundary_expansion: i32,
 ) -> Option<WorkQueueEntry> {
-    let neighbor_cuboid = current.cuboid.neighbor(dx, dy, dz, max_cells, boundary_expansion)?;
+    let neighbor_cuboid = current
+        .cuboid
+        .neighbor(dx, dy, dz, max_cells, boundary_expansion)?;
     let mut neighbor = WorkQueueEntry::new(neighbor_cuboid);
 
     // Propagate shared corners
@@ -1475,14 +1498,8 @@ where
     stats.cuboids_processed.fetch_add(1, Ordering::Relaxed);
 
     // Complete corner samples
-    let corner_mask = complete_corner_samples(
-        &mut entry,
-        sampler,
-        bounds_min,
-        cell_size,
-        max_depth,
-        stats,
-    );
+    let corner_mask =
+        complete_corner_samples(&mut entry, sampler, bounds_min, cell_size, max_depth, stats);
 
     // Skip if not mixed (all inside or all outside)
     if !corner_mask.is_mixed() {
@@ -1496,14 +1513,8 @@ where
 
     if current_depth < max_depth {
         // Subdivide and get only mixed children (with all corners sampled)
-        let mixed_children = subdivide_and_filter_mixed(
-            &entry,
-            sampler,
-            bounds_min,
-            cell_size,
-            max_depth,
-            stats,
-        );
+        let mixed_children =
+            subdivide_and_filter_mixed(&entry, sampler, bounds_min, cell_size, max_depth, stats);
 
         // Filter to only new (unvisited) children
         let new_work: Vec<WorkQueueEntry> = mixed_children
@@ -1518,21 +1529,18 @@ where
     } else {
         // At max depth: emit triangles and expand frontier
         let mut triangles = Vec::new();
-        emit_triangles_for_cell(
-            &entry.cuboid,
-            corner_mask,
-            max_depth,
-            &mut triangles,
-            stats,
-        );
+        emit_triangles_for_cell(&entry.cuboid, corner_mask, max_depth, &mut triangles, stats);
 
         // Expand to neighbors (frontier expansion)
         let cells_at_depth = base_res * (1i32 << current_depth);
 
         const NEIGHBOR_DIRS: [(i32, i32, i32); 6] = [
-            (-1, 0, 0), (1, 0, 0),
-            (0, -1, 0), (0, 1, 0),
-            (0, 0, -1), (0, 0, 1),
+            (-1, 0, 0),
+            (1, 0, 0),
+            (0, -1, 0),
+            (0, 1, 0),
+            (0, 0, -1),
+            (0, 0, 1),
         ];
 
         let mut new_work = Vec::new();
@@ -1548,7 +1556,10 @@ where
             }
         }
 
-        ProcessedEntry { new_work, triangles }
+        ProcessedEntry {
+            new_work,
+            triangles,
+        }
     }
 }
 
@@ -1585,14 +1596,7 @@ where
         // Process current batch in parallel (or sequentially on web)
         let results: Vec<ProcessedEntry> = parallel_iter::map_vec(current_batch, |entry| {
             process_work_entry(
-                entry,
-                sampler,
-                bounds_min,
-                cell_size,
-                max_depth,
-                base_res,
-                &visited,
-                stats,
+                entry, sampler, bounds_min, cell_size, max_depth, base_res, &visited, stats,
             )
         });
 
@@ -1631,7 +1635,11 @@ pub struct Stage3Result {
 
 /// Compute the face normal for a triangle (not normalized).
 /// Returns the cross product of two edges, with magnitude proportional to area.
-fn compute_face_normal(v0: (f64, f64, f64), v1: (f64, f64, f64), v2: (f64, f64, f64)) -> (f64, f64, f64) {
+fn compute_face_normal(
+    v0: (f64, f64, f64),
+    v1: (f64, f64, f64),
+    v2: (f64, f64, f64),
+) -> (f64, f64, f64) {
     // Edge vectors
     let e1 = (v1.0 - v0.0, v1.1 - v0.1, v1.2 - v0.2);
     let e2 = (v2.0 - v0.0, v2.1 - v0.1, v2.2 - v0.2);
@@ -1842,11 +1850,7 @@ where
     F: SamplerFn,
 {
     for _ in 0..iterations {
-        let mid = (
-            (a.0 + b.0) * 0.5,
-            (a.1 + b.1) * 0.5,
-            (a.2 + b.2) * 0.5,
-        );
+        let mid = ((a.0 + b.0) * 0.5, (a.1 + b.1) * 0.5, (a.2 + b.2) * 0.5);
 
         let inside_mid = sample_is_inside(sampler, mid.0, mid.1, mid.2, stats);
 
@@ -1859,11 +1863,7 @@ where
     }
 
     // Return midpoint of final interval
-    (
-        (a.0 + b.0) * 0.5,
-        (a.1 + b.1) * 0.5,
-        (a.2 + b.2) * 0.5,
-    )
+    ((a.0 + b.0) * 0.5, (a.1 + b.1) * 0.5, (a.2 + b.2) * 0.5)
 }
 
 /// Compute squared distance between two points.
@@ -1897,7 +1897,8 @@ where
     F: SamplerFn,
 {
     // Sample at the initial position to determine which side we're on
-    let initial_inside = sample_is_inside(sampler, initial_pos.0, initial_pos.1, initial_pos.2, stats);
+    let initial_inside =
+        sample_is_inside(sampler, initial_pos.0, initial_pos.1, initial_pos.2, stats);
 
     // Build list of candidate directions with their outcome labels
     let mut candidates: Vec<((f64, f64, f64), RefineOutcome)> = Vec::with_capacity(4);
@@ -1929,7 +1930,12 @@ where
 
     for (dir, outcome) in &candidates {
         if let Some((a, b, inside_a)) = find_crossing_along_direction(
-            initial_pos, *dir, search_distance, sampler, stats, initial_inside,
+            initial_pos,
+            *dir,
+            search_distance,
+            sampler,
+            stats,
+            initial_inside,
         ) {
             // Refine this crossing with binary search
             let refined = binary_search_crossing(a, b, inside_a, iterations, sampler, stats);
@@ -1980,12 +1986,12 @@ where
     F: SamplerFn,
 {
     // Sample at the initial position to determine which side we're on
-    let initial_inside = sample_is_inside(sampler, initial_pos.0, initial_pos.1, initial_pos.2, stats);
+    let initial_inside =
+        sample_is_inside(sampler, initial_pos.0, initial_pos.1, initial_pos.2, stats);
 
     // Normalize primary search direction
-    let dir_len_sq = search_dir.0 * search_dir.0
-        + search_dir.1 * search_dir.1
-        + search_dir.2 * search_dir.2;
+    let dir_len_sq =
+        search_dir.0 * search_dir.0 + search_dir.1 * search_dir.1 + search_dir.2 * search_dir.2;
 
     if dir_len_sq >= 1e-12 {
         let inv_len = 1.0 / dir_len_sq.sqrt();
@@ -2099,9 +2105,8 @@ where
     F: SamplerFn,
 {
     // Normalize direction
-    let dir_len_sq = search_dir.0 * search_dir.0
-        + search_dir.1 * search_dir.1
-        + search_dir.2 * search_dir.2;
+    let dir_len_sq =
+        search_dir.0 * search_dir.0 + search_dir.1 * search_dir.1 + search_dir.2 * search_dir.2;
 
     if dir_len_sq < 1e-12 {
         return None;
@@ -2119,7 +2124,12 @@ where
 
     // Try to find crossing along this direction
     if let Some((a, b, inside_a)) = find_crossing_along_direction(
-        start_pos, dir, search_distance, sampler, stats, start_inside,
+        start_pos,
+        dir,
+        search_distance,
+        sampler,
+        stats,
+        start_inside,
     ) {
         // Refine with binary search
         let refined = binary_search_crossing(a, b, inside_a, iterations, sampler, stats);
@@ -2167,16 +2177,8 @@ fn fit_plane_to_points(points: &[(f64, f64, f64)]) -> ((f64, f64, f64), f64) {
 
         for i in 0..n {
             let j = (i + 1) % n;
-            let v1 = (
-                points[i].0 - cx,
-                points[i].1 - cy,
-                points[i].2 - cz,
-            );
-            let v2 = (
-                points[j].0 - cx,
-                points[j].1 - cy,
-                points[j].2 - cz,
-            );
+            let v1 = (points[i].0 - cx, points[i].1 - cy, points[i].2 - cz);
+            let v2 = (points[j].0 - cx, points[j].1 - cy, points[j].2 - cz);
             // Cross product v1 × v2
             let normal = (
                 v1.1 * v2.2 - v1.2 * v2.1,
@@ -2188,7 +2190,10 @@ fn fit_plane_to_points(points: &[(f64, f64, f64)]) -> ((f64, f64, f64), f64) {
             sum_normal.2 += normal.2;
         }
 
-        let len = (sum_normal.0 * sum_normal.0 + sum_normal.1 * sum_normal.1 + sum_normal.2 * sum_normal.2).sqrt();
+        let len = (sum_normal.0 * sum_normal.0
+            + sum_normal.1 * sum_normal.1
+            + sum_normal.2 * sum_normal.2)
+            .sqrt();
         if len < 1e-12 {
             // Degenerate - all points collinear
             return ((0.0, 1.0, 0.0), f64::MAX);
@@ -2199,7 +2204,9 @@ fn fit_plane_to_points(points: &[(f64, f64, f64)]) -> ((f64, f64, f64), f64) {
         // Compute residual: sum of squared distances from each point to the fitted plane
         let mut residual = 0.0;
         for p in points {
-            let d = (p.0 - cx) * fitted_normal.0 + (p.1 - cy) * fitted_normal.1 + (p.2 - cz) * fitted_normal.2;
+            let d = (p.0 - cx) * fitted_normal.0
+                + (p.1 - cy) * fitted_normal.1
+                + (p.2 - cz) * fitted_normal.2;
             residual += d * d;
         }
 
@@ -2250,8 +2257,12 @@ fn fit_plane_to_points(points: &[(f64, f64, f64)]) -> ((f64, f64, f64), f64) {
     }
 
     // Deflate: M2 = M - λ1 * v1 * v1^T where λ1 = v1^T * M * v1
-    let lambda1 = m00 * v1.0 * v1.0 + m11 * v1.1 * v1.1 + m22 * v1.2 * v1.2
-        + 2.0 * m01 * v1.0 * v1.1 + 2.0 * m02 * v1.0 * v1.2 + 2.0 * m12 * v1.1 * v1.2;
+    let lambda1 = m00 * v1.0 * v1.0
+        + m11 * v1.1 * v1.1
+        + m22 * v1.2 * v1.2
+        + 2.0 * m01 * v1.0 * v1.1
+        + 2.0 * m02 * v1.0 * v1.2
+        + 2.0 * m12 * v1.1 * v1.2;
 
     let d00 = m00 - lambda1 * v1.0 * v1.0;
     let d01 = m01 - lambda1 * v1.0 * v1.1;
@@ -2650,7 +2661,8 @@ where
                 };
 
                 // Check angle between normals
-                let dot_ab = normal_a.0 * normal_b.0 + normal_a.1 * normal_b.1 + normal_a.2 * normal_b.2;
+                let dot_ab =
+                    normal_a.0 * normal_b.0 + normal_a.1 * normal_b.1 + normal_a.2 * normal_b.2;
                 let angle_between = dot_ab.clamp(-1.0, 1.0).acos();
 
                 // Sharp edge criteria (matching reference method):
@@ -2695,7 +2707,11 @@ where
     let num_points = surface_points.len() as f64;
     let base_threshold = probe_epsilon * probe_epsilon * num_points;
     let residual_threshold = base_threshold * 4.0;
-    let residual_factor = if single_residual > residual_threshold { 10.0 } else { 1.0 };
+    let residual_factor = if single_residual > residual_threshold {
+        10.0
+    } else {
+        1.0
+    };
     let adjusted_measurement_sigma = measurement_sigma * residual_factor;
 
     let prior_weight = 1.0 / (prior_sigma * prior_sigma);
@@ -2733,7 +2749,9 @@ where
 /// 3. Split by largest point-pair separation
 ///
 /// Returns the partition that gives the best 2-plane fit (lowest combined residual).
-fn cluster_points_two(points: &[(f64, f64, f64)]) -> Option<(Vec<(f64, f64, f64)>, Vec<(f64, f64, f64)>)> {
+fn cluster_points_two(
+    points: &[(f64, f64, f64)],
+) -> Option<(Vec<(f64, f64, f64)>, Vec<(f64, f64, f64)>)> {
     if points.len() < 4 {
         return None;
     }
@@ -2782,8 +2800,16 @@ fn cluster_points_two(points: &[(f64, f64, f64)]) -> Option<(Vec<(f64, f64, f64)
 
     // Strategy 4: Cross product of two displacement vectors (perpendicular direction)
     if points.len() >= 3 {
-        let v1 = (points[1].0 - center.0, points[1].1 - center.1, points[1].2 - center.2);
-        let v2 = (points[2].0 - center.0, points[2].1 - center.1, points[2].2 - center.2);
+        let v1 = (
+            points[1].0 - center.0,
+            points[1].1 - center.1,
+            points[1].2 - center.2,
+        );
+        let v2 = (
+            points[2].0 - center.0,
+            points[2].1 - center.1,
+            points[2].2 - center.2,
+        );
         let cross = (
             v1.1 * v2.2 - v1.2 * v2.1,
             v1.2 * v2.0 - v1.0 * v2.2,
@@ -2791,7 +2817,11 @@ fn cluster_points_two(points: &[(f64, f64, f64)]) -> Option<(Vec<(f64, f64, f64)
         );
         let cross_len = (cross.0 * cross.0 + cross.1 * cross.1 + cross.2 * cross.2).sqrt();
         if cross_len > 1e-12 {
-            let cross_dir = (cross.0 / cross_len, cross.1 / cross_len, cross.2 / cross_len);
+            let cross_dir = (
+                cross.0 / cross_len,
+                cross.1 / cross_len,
+                cross.2 / cross_len,
+            );
             if let Some((ca, cb, score)) = try_split_by_direction(points, center, cross_dir) {
                 if best_partition.is_none() || score < best_partition.as_ref().unwrap().2 {
                     best_partition = Some((ca, cb, score));
@@ -2883,7 +2913,11 @@ fn project_to_plane_intersection(
 
     // Normalize edge direction
     let edge_len = edge_len_sq.sqrt();
-    let edge_dir = (edge_dir.0 / edge_len, edge_dir.1 / edge_len, edge_dir.2 / edge_len);
+    let edge_dir = (
+        edge_dir.0 / edge_len,
+        edge_dir.1 / edge_len,
+        edge_dir.2 / edge_len,
+    );
 
     // Find a point on the intersection line.
     // We solve for a point that lies on both planes:
@@ -2993,12 +3027,8 @@ fn detect_edge_crossings(
 
         if angle > config.angle_threshold {
             // Compute crossing position on the geometric sharp edge (plane intersection)
-            let position = compute_edge_crossing_position(
-                vertices[v0_idx],
-                n0,
-                vertices[v1_idx],
-                n1,
-            );
+            let position =
+                compute_edge_crossing_position(vertices[v0_idx], n0, vertices[v1_idx], n1);
 
             // Compute t for reference (approximate position along mesh edge)
             let edge_vec = (
@@ -3006,7 +3036,8 @@ fn detect_edge_crossings(
                 vertices[v1_idx].1 - vertices[v0_idx].1,
                 vertices[v1_idx].2 - vertices[v0_idx].2,
             );
-            let edge_len_sq = edge_vec.0 * edge_vec.0 + edge_vec.1 * edge_vec.1 + edge_vec.2 * edge_vec.2;
+            let edge_len_sq =
+                edge_vec.0 * edge_vec.0 + edge_vec.1 * edge_vec.1 + edge_vec.2 * edge_vec.2;
             let t = if edge_len_sq > 1e-12 {
                 let to_pos = (
                     position.0 - vertices[v0_idx].0,
@@ -3818,13 +3849,8 @@ where
     // =========================================================================
     // Phase 4d: Detect Case 2 Edge Crossings
     // =========================================================================
-    let crossings = detect_edge_crossings(
-        &positions_f64,
-        &normals_f64,
-        &indices,
-        &sharp_info,
-        config,
-    );
+    let crossings =
+        detect_edge_crossings(&positions_f64, &normals_f64, &indices, &sharp_info, config);
     let edge_crossings = crossings.len();
 
     // Run crossing position diagnostics when feature is enabled
@@ -4197,7 +4223,8 @@ where
             };
 
             // Check angle between normals
-            let dot_ab = normal_a.0 * normal_b.0 + normal_a.1 * normal_b.1 + normal_a.2 * normal_b.2;
+            let dot_ab =
+                normal_a.0 * normal_b.0 + normal_a.1 * normal_b.1 + normal_a.2 * normal_b.2;
             let angle = dot_ab.clamp(-1.0, 1.0).acos();
 
             // Criteria for sharp edge:
@@ -4224,8 +4251,18 @@ where
 
                 let (edge_direction, intersection_point) = if edge_len_sq > 1e-12 {
                     let edge_len = edge_len_sq.sqrt();
-                    let edge_dir_norm = (edge_dir.0 / edge_len, edge_dir.1 / edge_len, edge_dir.2 / edge_len);
-                    let int_pt = project_to_plane_intersection(surface_pos, &cluster_a, normal_a, &cluster_b, normal_b);
+                    let edge_dir_norm = (
+                        edge_dir.0 / edge_len,
+                        edge_dir.1 / edge_len,
+                        edge_dir.2 / edge_len,
+                    );
+                    let int_pt = project_to_plane_intersection(
+                        surface_pos,
+                        &cluster_a,
+                        normal_a,
+                        &cluster_b,
+                        normal_b,
+                    );
                     (Some(edge_dir_norm), int_pt)
                 } else {
                     (None, None)
@@ -4288,7 +4325,10 @@ where
     use rayon::prelude::*;
 
     let vertex_count = refined_positions.len();
-    eprintln!("Running edge detection diagnostics on {} vertices...", vertex_count);
+    eprintln!(
+        "Running edge detection diagnostics on {} vertices...",
+        vertex_count
+    );
 
     // Compute high-precision reference for all vertices
     eprintln!("  Computing reference edge info (32 probes, 32 iterations)...");
@@ -4496,7 +4536,10 @@ where
     let search_distance = max_cell * 2.0;
     let probe_epsilon = min_cell * 0.1; // Same as normal refinement
 
-    eprintln!("  Computing reference positions for {} crossings...", crossing_count);
+    eprintln!(
+        "  Computing reference positions for {} crossings...",
+        crossing_count
+    );
 
     // For each crossing, compute a reference position using expensive probing
     let results: Vec<(f64, (f64, f64, f64), (f64, f64, f64))> = crossings
@@ -4561,12 +4604,13 @@ where
     );
 
     // Print worst cases for debugging with additional context
-    let mut indexed_errors: Vec<(usize, f64, (f64, f64, f64), (f64, f64, f64), &EdgeCrossing)> = results
-        .iter()
-        .enumerate()
-        .zip(crossings.iter())
-        .map(|((i, (e, cheap, reference)), crossing)| (i, *e, *cheap, *reference, crossing))
-        .collect();
+    let mut indexed_errors: Vec<(usize, f64, (f64, f64, f64), (f64, f64, f64), &EdgeCrossing)> =
+        results
+            .iter()
+            .enumerate()
+            .zip(crossings.iter())
+            .map(|((i, (e, cheap, reference)), crossing)| (i, *e, *cheap, *reference, crossing))
+            .collect();
     indexed_errors.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     eprintln!("  Worst 5 crossings (with endpoint analysis):");
@@ -4577,11 +4621,17 @@ where
         let dot = n0.0 * n1.0 + n0.1 * n1.1 + n0.2 * n1.2;
         let n0_len = (n0.0 * n0.0 + n0.1 * n0.1 + n0.2 * n0.2).sqrt();
         let n1_len = (n1.0 * n1.0 + n1.1 * n1.1 + n1.2 * n1.2).sqrt();
-        let angle = (dot / (n0_len * n1_len)).clamp(-1.0, 1.0).acos().to_degrees();
+        let angle = (dot / (n0_len * n1_len))
+            .clamp(-1.0, 1.0)
+            .acos()
+            .to_degrees();
 
         eprintln!(
             "    #{}: err={:.6} ({:.1}% cell) angle={:.1}°",
-            i, error, error / max_cell * 100.0, angle
+            i,
+            error,
+            error / max_cell * 100.0,
+            angle
         );
         eprintln!(
             "      cheap=({:.4},{:.4},{:.4}) ref=({:.4},{:.4},{:.4})",
@@ -4602,10 +4652,20 @@ where
 
         // Use expensive 32-probe reference detection on each endpoint
         let ref_v0 = compute_reference_edge_info(
-            v0_pos, v0_norm, probe_epsilon, search_distance, sampler, stats
+            v0_pos,
+            v0_norm,
+            probe_epsilon,
+            search_distance,
+            sampler,
+            stats,
         );
         let ref_v1 = compute_reference_edge_info(
-            v1_pos, v1_norm, probe_epsilon, search_distance, sampler, stats
+            v1_pos,
+            v1_norm,
+            probe_epsilon,
+            search_distance,
+            sampler,
+            stats,
         );
 
         eprintln!(
@@ -4615,13 +4675,20 @@ where
         if ref_v0.is_sharp {
             if let Some(nb) = ref_v0.normal_b {
                 let ref_angle = {
-                    let d = ref_v0.normal_a.0 * nb.0 + ref_v0.normal_a.1 * nb.1 + ref_v0.normal_a.2 * nb.2;
+                    let d = ref_v0.normal_a.0 * nb.0
+                        + ref_v0.normal_a.1 * nb.1
+                        + ref_v0.normal_a.2 * nb.2;
                     d.clamp(-1.0, 1.0).acos().to_degrees()
                 };
                 eprintln!(
                     "        -> TRUE EDGE! na=({:.3},{:.3},{:.3}) nb=({:.3},{:.3},{:.3}) angle={:.1}°",
-                    ref_v0.normal_a.0, ref_v0.normal_a.1, ref_v0.normal_a.2,
-                    nb.0, nb.1, nb.2, ref_angle
+                    ref_v0.normal_a.0,
+                    ref_v0.normal_a.1,
+                    ref_v0.normal_a.2,
+                    nb.0,
+                    nb.1,
+                    nb.2,
+                    ref_angle
                 );
             }
         }
@@ -4633,13 +4700,20 @@ where
         if ref_v1.is_sharp {
             if let Some(nb) = ref_v1.normal_b {
                 let ref_angle = {
-                    let d = ref_v1.normal_a.0 * nb.0 + ref_v1.normal_a.1 * nb.1 + ref_v1.normal_a.2 * nb.2;
+                    let d = ref_v1.normal_a.0 * nb.0
+                        + ref_v1.normal_a.1 * nb.1
+                        + ref_v1.normal_a.2 * nb.2;
                     d.clamp(-1.0, 1.0).acos().to_degrees()
                 };
                 eprintln!(
                     "        -> TRUE EDGE! na=({:.3},{:.3},{:.3}) nb=({:.3},{:.3},{:.3}) angle={:.1}°",
-                    ref_v1.normal_a.0, ref_v1.normal_a.1, ref_v1.normal_a.2,
-                    nb.0, nb.1, nb.2, ref_angle
+                    ref_v1.normal_a.0,
+                    ref_v1.normal_a.1,
+                    ref_v1.normal_a.2,
+                    nb.0,
+                    nb.1,
+                    nb.2,
+                    ref_angle
                 );
             }
         }
@@ -4651,9 +4725,12 @@ where
     let under_10pct = errors.iter().filter(|e| **e / max_cell < 0.10).count();
     eprintln!(
         "  Distribution: <1%={} ({:.1}%), <5%={} ({:.1}%), <10%={} ({:.1}%)",
-        under_1pct, under_1pct as f64 / crossing_count as f64 * 100.0,
-        under_5pct, under_5pct as f64 / crossing_count as f64 * 100.0,
-        under_10pct, under_10pct as f64 / crossing_count as f64 * 100.0
+        under_1pct,
+        under_1pct as f64 / crossing_count as f64 * 100.0,
+        under_5pct,
+        under_5pct as f64 / crossing_count as f64 * 100.0,
+        under_10pct,
+        under_10pct as f64 / crossing_count as f64 * 100.0
     );
 
     CrossingDiagnosticEntry {
@@ -4683,16 +4760,27 @@ where
     F: SamplerFn,
 {
     // Normalize directions
-    let norm_len = (avg_normal.0 * avg_normal.0 + avg_normal.1 * avg_normal.1 + avg_normal.2 * avg_normal.2).sqrt();
+    let norm_len =
+        (avg_normal.0 * avg_normal.0 + avg_normal.1 * avg_normal.1 + avg_normal.2 * avg_normal.2)
+            .sqrt();
     let avg_normal = if norm_len > 1e-12 {
-        (avg_normal.0 / norm_len, avg_normal.1 / norm_len, avg_normal.2 / norm_len)
+        (
+            avg_normal.0 / norm_len,
+            avg_normal.1 / norm_len,
+            avg_normal.2 / norm_len,
+        )
     } else {
         (0.0, 0.0, 1.0)
     };
 
-    let edge_len = (edge_dir.0 * edge_dir.0 + edge_dir.1 * edge_dir.1 + edge_dir.2 * edge_dir.2).sqrt();
+    let edge_len =
+        (edge_dir.0 * edge_dir.0 + edge_dir.1 * edge_dir.1 + edge_dir.2 * edge_dir.2).sqrt();
     let edge_dir = if edge_len > 1e-12 {
-        (edge_dir.0 / edge_len, edge_dir.1 / edge_len, edge_dir.2 / edge_len)
+        (
+            edge_dir.0 / edge_len,
+            edge_dir.1 / edge_len,
+            edge_dir.2 / edge_len,
+        )
     } else {
         (1.0, 0.0, 0.0)
     };
@@ -4719,7 +4807,8 @@ where
         (0.0, 0.0, 1.0),
     ];
 
-    let initial_inside = sample_is_inside(sampler, initial_pos.0, initial_pos.1, initial_pos.2, stats);
+    let initial_inside =
+        sample_is_inside(sampler, initial_pos.0, initial_pos.1, initial_pos.2, stats);
 
     let mut best_pos = initial_pos;
     let mut best_dist = f64::MAX;
@@ -4806,13 +4895,8 @@ where
     // Stage 1: Coarse grid discovery
     let stage1_start = Instant::now();
     let samples_before_stage1 = stats.total_samples.load(Ordering::Relaxed);
-    let initial_work_queue = stage1_coarse_discovery(
-        &sampler,
-        bounds_min_f64,
-        bounds_max_f64,
-        config,
-        &stats,
-    );
+    let initial_work_queue =
+        stage1_coarse_discovery(&sampler, bounds_min_f64, bounds_max_f64, config, &stats);
     let stage1_time = stage1_start.elapsed().as_secs_f64();
     let stage1_samples = stats.total_samples.load(Ordering::Relaxed) - samples_before_stage1;
     let stage1_mixed_cells = initial_work_queue.len();
@@ -4833,28 +4917,20 @@ where
     let stage2_time = stage2_start.elapsed().as_secs_f64();
     let stage2_samples = stats.total_samples.load(Ordering::Relaxed) - samples_before_stage2;
     let stage2_cuboids = stats.cuboids_processed.load(Ordering::Relaxed) - cuboids_before_stage2;
-    let stage2_triangles = stats.triangles_emitted.load(Ordering::Relaxed) - triangles_before_stage2;
+    let stage2_triangles =
+        stats.triangles_emitted.load(Ordering::Relaxed) - triangles_before_stage2;
 
     // Stage 3: Topology finalization
     let stage3_start = Instant::now();
-    let stage3_result = stage3_topology_finalization(
-        sparse_triangles,
-        bounds_min_f64,
-        cell_size,
-    );
+    let stage3_result = stage3_topology_finalization(sparse_triangles, bounds_min_f64, cell_size);
     let stage3_time = stage3_start.elapsed().as_secs_f64();
     let stage3_unique_vertices = stage3_result.vertices.len();
 
     // Stage 4: Vertex refinement & normal estimation
     let stage4_start = Instant::now();
     let samples_before_stage4 = stats.total_samples.load(Ordering::Relaxed);
-    let stage4_result = stage4_vertex_refinement(
-        stage3_result,
-        &sampler,
-        cell_size,
-        config,
-        &stats,
-    );
+    let stage4_result =
+        stage4_vertex_refinement(stage3_result, &sampler, cell_size, config, &stats);
     let stage4_time = stage4_start.elapsed().as_secs_f64();
     let stage4_samples = stats.total_samples.load(Ordering::Relaxed) - samples_before_stage4;
 
@@ -4965,13 +5041,8 @@ where
     // Stage 1: Coarse grid discovery
     let stage1_start = Instant::now();
     let samples_before_stage1 = stats.total_samples.load(Ordering::Relaxed);
-    let initial_work_queue = stage1_coarse_discovery(
-        &sampler,
-        bounds_min_f64,
-        bounds_max_f64,
-        config,
-        &stats,
-    );
+    let initial_work_queue =
+        stage1_coarse_discovery(&sampler, bounds_min_f64, bounds_max_f64, config, &stats);
     let stage1_time = stage1_start.elapsed().as_secs_f64();
     let stage1_samples = stats.total_samples.load(Ordering::Relaxed) - samples_before_stage1;
     let stage1_mixed_cells = initial_work_queue.len();
@@ -4992,28 +5063,20 @@ where
     let stage2_time = stage2_start.elapsed().as_secs_f64();
     let stage2_samples = stats.total_samples.load(Ordering::Relaxed) - samples_before_stage2;
     let stage2_cuboids = stats.cuboids_processed.load(Ordering::Relaxed) - cuboids_before_stage2;
-    let stage2_triangles = stats.triangles_emitted.load(Ordering::Relaxed) - triangles_before_stage2;
+    let stage2_triangles =
+        stats.triangles_emitted.load(Ordering::Relaxed) - triangles_before_stage2;
 
     // Stage 3: Topology finalization
     let stage3_start = Instant::now();
-    let stage3_result = stage3_topology_finalization(
-        sparse_triangles,
-        bounds_min_f64,
-        cell_size,
-    );
+    let stage3_result = stage3_topology_finalization(sparse_triangles, bounds_min_f64, cell_size);
     let stage3_time = stage3_start.elapsed().as_secs_f64();
     let stage3_unique_vertices = stage3_result.vertices.len();
 
     // Stage 4: Vertex refinement & normal estimation
     let stage4_start = Instant::now();
     let samples_before_stage4 = stats.total_samples.load(Ordering::Relaxed);
-    let stage4_result = stage4_vertex_refinement(
-        stage3_result,
-        &sampler,
-        cell_size,
-        config,
-        &stats,
-    );
+    let stage4_result =
+        stage4_vertex_refinement(stage3_result, &sampler, cell_size, config, &stats);
     let stage4_time = stage4_start.elapsed().as_secs_f64();
     let stage4_samples = stats.total_samples.load(Ordering::Relaxed) - samples_before_stage4;
 
@@ -5086,7 +5149,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_corner_mask() {
         let mask = CornerMask::from_bools([true, false, true, false, false, false, false, false]);
@@ -5094,14 +5157,14 @@ mod tests {
         assert!(!mask.is_inside(1));
         assert!(mask.is_inside(2));
         assert!(mask.is_mixed());
-        
+
         let all_inside = CornerMask(0xFF);
         assert!(!all_inside.is_mixed());
-        
+
         let all_outside = CornerMask(0x00);
         assert!(!all_outside.is_mixed());
     }
-    
+
     #[test]
     fn test_config_default() {
         let config = AdaptiveMeshConfig2::default();
@@ -5192,7 +5255,11 @@ mod tests {
             let dx = x - 0.5;
             let dy = y - 0.5;
             let dz = z - 0.5;
-            if dx * dx + dy * dy + dz * dz < 0.01 { 1.0 } else { 0.0 }
+            if dx * dx + dy * dy + dz * dz < 0.01 {
+                1.0
+            } else {
+                0.0
+            }
         };
 
         let config = AdaptiveMeshConfig2 {
@@ -5229,9 +5296,7 @@ mod tests {
         let stats = SamplingStats::default();
 
         // Sampler: inside only if x > 0.5 (so corners 1, 3, 5, 7 are inside for cell at origin)
-        let half_space = |x: f64, _y: f64, _z: f64| -> f32 {
-            if x > 0.5 { 1.0 } else { 0.0 }
-        };
+        let half_space = |x: f64, _y: f64, _z: f64| -> f32 { if x > 0.5 { 1.0 } else { 0.0 } };
 
         let work_queue = stage1_coarse_discovery(
             &half_space,
@@ -5251,13 +5316,29 @@ mod tests {
         let corners = entry.known_corners;
 
         // Corners with x=1 should be inside (corners 1, 3, 5, 7)
-        assert_eq!(corners[0], Some(false), "Corner 0 (0,0,0) should be outside");
+        assert_eq!(
+            corners[0],
+            Some(false),
+            "Corner 0 (0,0,0) should be outside"
+        );
         assert_eq!(corners[1], Some(true), "Corner 1 (1,0,0) should be inside");
-        assert_eq!(corners[2], Some(false), "Corner 2 (0,1,0) should be outside");
+        assert_eq!(
+            corners[2],
+            Some(false),
+            "Corner 2 (0,1,0) should be outside"
+        );
         assert_eq!(corners[3], Some(true), "Corner 3 (1,1,0) should be inside");
-        assert_eq!(corners[4], Some(false), "Corner 4 (0,0,1) should be outside");
+        assert_eq!(
+            corners[4],
+            Some(false),
+            "Corner 4 (0,0,1) should be outside"
+        );
         assert_eq!(corners[5], Some(true), "Corner 5 (1,0,1) should be inside");
-        assert_eq!(corners[6], Some(false), "Corner 6 (0,1,1) should be outside");
+        assert_eq!(
+            corners[6],
+            Some(false),
+            "Corner 6 (0,1,1) should be outside"
+        );
         assert_eq!(corners[7], Some(true), "Corner 7 (1,1,1) should be inside");
     }
 
@@ -5346,13 +5427,8 @@ mod tests {
             (bounds_max.2 - bounds_min.2) / finest_cells as f64,
         );
 
-        let initial_queue = stage1_coarse_discovery(
-            &sphere_sampler,
-            bounds_min,
-            bounds_max,
-            &config,
-            &stats,
-        );
+        let initial_queue =
+            stage1_coarse_discovery(&sphere_sampler, bounds_min, bounds_max, &config, &stats);
 
         let triangles = stage2_subdivision_and_emission(
             initial_queue,
@@ -5489,9 +5565,7 @@ mod tests {
         // Sampler: inside if x > 0.25 (in [0,1] bounds)
         // This means the -X children (cx=0) will have surface crossing them
         // and the +X children (cx=1) will be fully inside
-        let half_space = |x: f64, _y: f64, _z: f64| -> f32 {
-            if x > 0.25 { 1.0 } else { 0.0 }
-        };
+        let half_space = |x: f64, _y: f64, _z: f64| -> f32 { if x > 0.25 { 1.0 } else { 0.0 } };
 
         let stats = SamplingStats::default();
         let bounds_min = (0.0, 0.0, 0.0);
@@ -5568,13 +5642,8 @@ mod tests {
         );
 
         let stats1 = SamplingStats::default();
-        let initial_queue1 = stage1_coarse_discovery(
-            &sphere_sampler,
-            bounds_min,
-            bounds_max,
-            &config,
-            &stats1,
-        );
+        let initial_queue1 =
+            stage1_coarse_discovery(&sphere_sampler, bounds_min, bounds_max, &config, &stats1);
         let triangles1 = stage2_subdivision_and_emission(
             initial_queue1,
             &sphere_sampler,
@@ -5585,13 +5654,8 @@ mod tests {
         );
 
         let stats2 = SamplingStats::default();
-        let initial_queue2 = stage1_coarse_discovery(
-            &sphere_sampler,
-            bounds_min,
-            bounds_max,
-            &config,
-            &stats2,
-        );
+        let initial_queue2 =
+            stage1_coarse_discovery(&sphere_sampler, bounds_min, bounds_max, &config, &stats2);
         let triangles2 = stage2_subdivision_and_emission(
             initial_queue2,
             &sphere_sampler,
@@ -5628,16 +5692,14 @@ mod tests {
             (bounds_max.2 - bounds_min.2) / finest_cells as f64,
         );
 
-        let initial_queue = stage1_coarse_discovery(
-            &empty_sampler,
-            bounds_min,
-            bounds_max,
-            &config,
-            &stats,
-        );
+        let initial_queue =
+            stage1_coarse_discovery(&empty_sampler, bounds_min, bounds_max, &config, &stats);
 
         // Empty space should produce no mixed cells
-        assert!(initial_queue.is_empty(), "Empty space should have no mixed cells");
+        assert!(
+            initial_queue.is_empty(),
+            "Empty space should have no mixed cells"
+        );
 
         let triangles = stage2_subdivision_and_emission(
             initial_queue,
@@ -5648,7 +5710,10 @@ mod tests {
             &stats,
         );
 
-        assert!(triangles.is_empty(), "Empty space should produce no triangles");
+        assert!(
+            triangles.is_empty(),
+            "Empty space should produce no triangles"
+        );
     }
 
     #[test]
@@ -5682,9 +5747,7 @@ mod tests {
     #[test]
     fn test_refine_vertex_position_finds_surface() {
         // Simple half-space: inside if x < 0.3
-        let half_space = |x: f64, _y: f64, _z: f64| -> f32 {
-            if x < 0.3 { 1.0 } else { 0.0 }
-        };
+        let half_space = |x: f64, _y: f64, _z: f64| -> f32 { if x < 0.3 { 1.0 } else { 0.0 } };
         let stats = SamplingStats::default();
 
         // Start at x=0.5 (outside), search toward -x (normal points outward from inside)
@@ -5743,7 +5806,11 @@ mod tests {
     fn test_refine_vertex_position_zero_direction() {
         // When primary direction is zero, the function uses fallback directions (+X, +Y, +Z)
         let sphere = |x: f64, y: f64, z: f64| -> f32 {
-            if x * x + y * y + z * z < 1.0 { 1.0 } else { 0.0 }
+            if x * x + y * y + z * z < 1.0 {
+                1.0
+            } else {
+                0.0
+            }
         };
         let stats = SamplingStats::default();
 
@@ -5832,12 +5899,8 @@ mod tests {
             ..Default::default()
         };
 
-        let result = adaptive_surface_nets_2(
-            sphere_sampler,
-            (-1.5, -1.5, -1.5),
-            (1.5, 1.5, 1.5),
-            &config,
-        );
+        let result =
+            adaptive_surface_nets_2(sphere_sampler, (-1.5, -1.5, -1.5), (1.5, 1.5, 1.5), &config);
         let mesh = &result.mesh;
 
         // Should produce a mesh
@@ -5887,12 +5950,8 @@ mod tests {
             ..Default::default()
         };
 
-        let result = adaptive_surface_nets_2(
-            sphere_sampler,
-            (-1.5, -1.5, -1.5),
-            (1.5, 1.5, 1.5),
-            &config,
-        );
+        let result =
+            adaptive_surface_nets_2(sphere_sampler, (-1.5, -1.5, -1.5), (1.5, 1.5, 1.5), &config);
         let mesh = &result.mesh;
 
         // Should still produce a valid mesh

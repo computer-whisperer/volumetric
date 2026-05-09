@@ -43,7 +43,7 @@ mod types;
 
 pub use conversions::{convert_mesh_data, convert_points_to_point_data};
 
-pub use buffer::{DynamicBuffer, QuadVertex, StaticBuffer, QUAD_INDICES, QUAD_VERTICES};
+pub use buffer::{DynamicBuffer, QUAD_INDICES, QUAD_VERTICES, QuadVertex, StaticBuffer};
 pub use callback::{SceneCallback, SceneData, SceneDrawData};
 pub use camera::{Camera, CameraAction, CameraControlScheme, CameraInputState};
 pub use gbuffer::{AoTexture, GBuffer};
@@ -53,8 +53,8 @@ pub use pipelines::{
 };
 pub use types::{
     AxisIndicator, DepthMode, GridSettings, LineData, LineInstance, LinePattern, LineSegment,
-    LineStyle, MaterialId, MeshData, MeshVertex, PointData, PointInstance, PointShape,
-    PointStyle, RenderSettings, WidthMode,
+    LineStyle, MaterialId, MeshData, MeshVertex, PointData, PointInstance, PointShape, PointStyle,
+    RenderSettings, WidthMode,
 };
 
 use glam::{Mat4, Vec3};
@@ -188,7 +188,12 @@ impl Renderer {
         let point_pipeline = PointPipeline::new(device, self.surface_format);
 
         // Create textures
-        let gbuffer = GBuffer::new(device, self.viewport_size.0, self.viewport_size.1, self.surface_format);
+        let gbuffer = GBuffer::new(
+            device,
+            self.viewport_size.0,
+            self.viewport_size.1,
+            self.surface_format,
+        );
         let ao_texture = AoTexture::new(device, self.viewport_size.0, self.viewport_size.1);
 
         // Create sampler
@@ -199,21 +204,15 @@ impl Renderer {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
 
         // Create bind groups
-        let ssao_bind_group = ssao_pipeline.create_bind_group(
-            device,
-            &gbuffer.normal_view,
-            &gbuffer.depth_view,
-        );
-        let composite_bind_group = composite_pipeline.create_bind_group(
-            device,
-            &gbuffer.color_view,
-            &ao_texture.view,
-        );
+        let ssao_bind_group =
+            ssao_pipeline.create_bind_group(device, &gbuffer.normal_view, &gbuffer.depth_view);
+        let composite_bind_group =
+            composite_pipeline.create_bind_group(device, &gbuffer.color_view, &ao_texture.view);
 
         self.gpu = Some(GpuResources {
             mesh_pipeline,
@@ -251,7 +250,8 @@ impl Renderer {
         // Resize GPU resources if initialized
         if let Some(gpu) = &mut self.gpu {
             gpu.gbuffer.resize_if_needed(device, new_size.0, new_size.1);
-            gpu.ao_texture.resize_if_needed(device, new_size.0, new_size.1);
+            gpu.ao_texture
+                .resize_if_needed(device, new_size.0, new_size.1);
 
             // Recreate bind groups with new texture views
             gpu.ssao_bind_group = gpu.ssao_pipeline.create_bind_group(
@@ -355,7 +355,10 @@ impl Renderer {
                 // Transform vertices
                 for v in &submitted.data.vertices {
                     let pos = submitted.transform.transform_point3(Vec3::from(v.position));
-                    let normal = submitted.transform.transform_vector3(Vec3::from(v.normal)).normalize();
+                    let normal = submitted
+                        .transform
+                        .transform_vector3(Vec3::from(v.normal))
+                        .normalize();
                     all_vertices.push(MeshVertex::new(pos.into(), normal.into()));
                 }
 
@@ -369,9 +372,11 @@ impl Renderer {
             }
 
             // Upload mesh data
-            gpu.mesh_pipeline.upload_vertices(device, queue, &all_vertices);
+            gpu.mesh_pipeline
+                .upload_vertices(device, queue, &all_vertices);
             if use_indices {
-                gpu.mesh_pipeline.upload_indices(device, queue, &all_indices);
+                gpu.mesh_pipeline
+                    .upload_indices(device, queue, &all_indices);
             }
 
             // Update mesh uniforms
@@ -432,6 +437,7 @@ impl Renderer {
                     }),
                     timestamp_writes: None,
                     occlusion_query_set: None,
+                    multiview_mask: None,
                 });
 
                 gpu.mesh_pipeline.render(&mut pass, use_indices);
@@ -466,6 +472,7 @@ impl Renderer {
                     depth_stencil_attachment: None,
                     timestamp_writes: None,
                     occlusion_query_set: None,
+                    multiview_mask: None,
                 });
 
                 gpu.ssao_pipeline.render(&mut pass, &gpu.ssao_bind_group);
@@ -485,6 +492,7 @@ impl Renderer {
                     depth_stencil_attachment: None,
                     timestamp_writes: None,
                     occlusion_query_set: None,
+                    multiview_mask: None,
                 });
             }
         }
@@ -527,10 +535,12 @@ impl Renderer {
                 }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
 
             if !self.frame_meshes.is_empty() {
-                gpu.composite_pipeline.render(&mut pass, &gpu.composite_bind_group);
+                gpu.composite_pipeline
+                    .render(&mut pass, &gpu.composite_bind_group);
             }
         }
 
@@ -581,7 +591,9 @@ impl Renderer {
                 if submitted.style.depth_mode == DepthMode::Normal {
                     point_style = submitted.style.clone();
                     for pt in &submitted.data.points {
-                        let pos = submitted.transform.transform_point3(Vec3::from(pt.position));
+                        let pos = submitted
+                            .transform
+                            .transform_point3(Vec3::from(pt.position));
                         all_point_instances.push(PointInstance {
                             position: pos.into(),
                             color: pt.color,
@@ -601,14 +613,16 @@ impl Renderer {
             if !all_line_segments.is_empty() {
                 let instances = LinePipeline::prepare_instances(&all_line_segments, &line_style);
                 line_pipeline.upload_instances(device, queue, &instances);
-                let uniforms = LinePipeline::create_uniforms(view_proj_array, screen_size, &line_style);
+                let uniforms =
+                    LinePipeline::create_uniforms(view_proj_array, screen_size, &line_style);
                 line_pipeline.update_uniforms(queue, &uniforms);
             }
 
             if !all_point_instances.is_empty() {
                 let instances = PointPipeline::prepare_instances(&all_point_instances);
                 point_pipeline.upload_instances(device, queue, &instances);
-                let uniforms = PointPipeline::create_uniforms(view_proj_array, screen_size, &point_style);
+                let uniforms =
+                    PointPipeline::create_uniforms(view_proj_array, screen_size, &point_style);
                 point_pipeline.update_uniforms(queue, &uniforms);
             }
 
@@ -634,6 +648,7 @@ impl Renderer {
                 }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
 
             // Render all uploaded data
@@ -686,7 +701,9 @@ impl Renderer {
                 if submitted.style.depth_mode == DepthMode::Overlay {
                     point_style = submitted.style.clone();
                     for pt in &submitted.data.points {
-                        let pos = submitted.transform.transform_point3(Vec3::from(pt.position));
+                        let pos = submitted
+                            .transform
+                            .transform_point3(Vec3::from(pt.position));
                         all_point_instances.push(PointInstance {
                             position: pos.into(),
                             color: pt.color,
@@ -706,14 +723,16 @@ impl Renderer {
             if !all_line_segments.is_empty() {
                 let instances = LinePipeline::prepare_instances(&all_line_segments, &line_style);
                 line_pipeline.upload_instances(device, queue, &instances);
-                let uniforms = LinePipeline::create_uniforms(view_proj_array, screen_size, &line_style);
+                let uniforms =
+                    LinePipeline::create_uniforms(view_proj_array, screen_size, &line_style);
                 line_pipeline.update_uniforms(queue, &uniforms);
             }
 
             if !all_point_instances.is_empty() {
                 let instances = PointPipeline::prepare_instances(&all_point_instances);
                 point_pipeline.upload_instances(device, queue, &instances);
-                let uniforms = PointPipeline::create_uniforms(view_proj_array, screen_size, &point_style);
+                let uniforms =
+                    PointPipeline::create_uniforms(view_proj_array, screen_size, &point_style);
                 point_pipeline.update_uniforms(queue, &uniforms);
             }
 
@@ -739,6 +758,7 @@ impl Renderer {
                 }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
 
             // Render all uploaded data
@@ -818,7 +838,10 @@ impl Renderer {
 ///
 /// Creates three line segments representing the X, Y, and Z axes,
 /// transformed by the camera's rotation for display in a corner viewport.
-pub fn generate_axis_indicator_lines(camera: &Camera, indicator: &AxisIndicator) -> Vec<LineSegment> {
+pub fn generate_axis_indicator_lines(
+    camera: &Camera,
+    indicator: &AxisIndicator,
+) -> Vec<LineSegment> {
     // Get the camera's view rotation
     let view = camera.view_matrix();
 

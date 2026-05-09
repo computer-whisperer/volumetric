@@ -8,8 +8,8 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
 use crate::renderer::{
-    DepthMode, DynamicBuffer, PointInstance, PointStyle, QuadVertex, StaticBuffer, WidthMode,
-    QUAD_INDICES, QUAD_VERTICES,
+    DepthMode, DynamicBuffer, PointInstance, PointStyle, QUAD_INDICES, QUAD_VERTICES, QuadVertex,
+    StaticBuffer, WidthMode,
 };
 
 /// GPU-compatible point instance (with padding for alignment).
@@ -38,12 +38,12 @@ impl From<&PointInstance> for GpuPointInstance {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct PointUniforms {
-    pub view_proj: [[f32; 4]; 4],  // 64 bytes, offset 0
-    pub screen_size_px: [f32; 2],  // 8 bytes, offset 64
-    pub point_size_px: f32,        // 4 bytes, offset 72
-    pub size_mode: u32,            // 4 bytes, offset 76
-    pub shape: u32,                // 4 bytes, offset 80
-    pub _pad: [f32; 7],            // 28 bytes to reach 112 (matches WGSL vec3 alignment + final pad)
+    pub view_proj: [[f32; 4]; 4], // 64 bytes, offset 0
+    pub screen_size_px: [f32; 2], // 8 bytes, offset 64
+    pub point_size_px: f32,       // 4 bytes, offset 72
+    pub size_mode: u32,           // 4 bytes, offset 76
+    pub shape: u32,               // 4 bytes, offset 80
+    pub _pad: [f32; 7],           // 28 bytes to reach 112 (matches WGSL vec3 alignment + final pad)
 }
 
 // Verify struct size matches WGSL expectations (112 bytes due to vec3 alignment)
@@ -119,8 +119,8 @@ impl PointPipeline {
         // Pipeline layout
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("point_pipeline_layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
 
         // Vertex buffer layouts
@@ -154,7 +154,7 @@ impl PointPipeline {
                     },
                     wgpu::VertexAttribute {
                         format: wgpu::VertexFormat::Float32x4,
-                        offset: 16, // After position (12) + padding (4)
+                        offset: 16,         // After position (12) + padding (4)
                         shader_location: 3, // color
                     },
                 ],
@@ -192,13 +192,13 @@ impl PointPipeline {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth24Plus,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::LessEqual,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -233,13 +233,13 @@ impl PointPipeline {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth24Plus,
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::Always,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -338,11 +338,7 @@ impl PointPipeline {
     }
 
     /// Record a point render pass.
-    pub fn render<'a>(
-        &'a self,
-        render_pass: &mut wgpu::RenderPass<'a>,
-        depth_mode: DepthMode,
-    ) {
+    pub fn render<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>, depth_mode: DepthMode) {
         if self.instance_buffer.is_empty() {
             return;
         }

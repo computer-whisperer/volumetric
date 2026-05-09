@@ -49,9 +49,9 @@ pub fn create_test_cube(size: f32) -> MeshData {
     ];
 
     let indices = vec![
-        0, 1, 2, 2, 3, 0,       // Front
-        4, 5, 6, 6, 7, 4,       // Back
-        8, 9, 10, 10, 11, 8,    // Top
+        0, 1, 2, 2, 3, 0, // Front
+        4, 5, 6, 6, 7, 4, // Back
+        8, 9, 10, 10, 11, 8, // Top
         12, 13, 14, 14, 15, 12, // Bottom
         16, 17, 18, 18, 19, 16, // Right
         20, 21, 22, 22, 23, 20, // Left
@@ -103,9 +103,18 @@ pub fn create_wireframe_box(min: Vec3, max: Vec3, color: [f32; 4]) -> LineData {
     ];
 
     let edges = [
-        (0, 1), (1, 2), (2, 3), (3, 0), // Bottom face
-        (4, 5), (5, 6), (6, 7), (7, 4), // Top face
-        (0, 4), (1, 5), (2, 6), (3, 7), // Vertical edges
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 0), // Bottom face
+        (4, 5),
+        (5, 6),
+        (6, 7),
+        (7, 4), // Top face
+        (0, 4),
+        (1, 5),
+        (2, 6),
+        (3, 7), // Vertical edges
     ];
 
     LineData {
@@ -178,7 +187,11 @@ pub fn create_test_scene() -> SceneData {
 
     // Add a wireframe box
     scene.add_lines(
-        create_wireframe_box(Vec3::new(-1.5, 0.0, -1.5), Vec3::new(1.5, 2.0, 1.5), [0.5, 0.5, 0.5, 0.5]),
+        create_wireframe_box(
+            Vec3::new(-1.5, 0.0, -1.5),
+            Vec3::new(1.5, 2.0, 1.5),
+            [0.5, 0.5, 0.5, 0.5],
+        ),
         Mat4::IDENTITY,
         LineStyle {
             width: 1.0,

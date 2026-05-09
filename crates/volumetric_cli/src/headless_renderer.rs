@@ -131,7 +131,7 @@ impl HeadlessRenderer {
     pub fn new(width: u32, height: u32) -> Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
 
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -141,15 +141,14 @@ impl HeadlessRenderer {
         }))
         .context("Failed to find a suitable GPU adapter")?;
 
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("Headless Device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                memory_hints: Default::default(),
-            },
-            None,
-        ))
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("Headless Device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            experimental_features: wgpu::ExperimentalFeatures::default(),
+            memory_hints: Default::default(),
+            trace: wgpu::Trace::Off,
+        }))
         .context("Failed to create device")?;
 
         // Load mesh shader
@@ -183,8 +182,8 @@ impl HeadlessRenderer {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Render Pipeline Layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
 
         // Mesh vertex buffer layout
@@ -210,13 +209,13 @@ impl HeadlessRenderer {
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &mesh_shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
                 buffers: &[mesh_vertex_layout],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: &mesh_shader,
-                entry_point: "fs_main",
+                entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: wgpu::TextureFormat::Rgba8UnormSrgb,
                     blend: Some(wgpu::BlendState::REPLACE),
@@ -235,8 +234,8 @@ impl HeadlessRenderer {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth24Plus,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -245,7 +244,7 @@ impl HeadlessRenderer {
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -272,13 +271,13 @@ impl HeadlessRenderer {
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &grid_shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
                 buffers: &[grid_vertex_layout],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: &grid_shader,
-                entry_point: "fs_main",
+                entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: wgpu::TextureFormat::Rgba8UnormSrgb,
                     blend: Some(wgpu::BlendState::REPLACE),
@@ -297,8 +296,8 @@ impl HeadlessRenderer {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth24Plus,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -307,7 +306,7 @@ impl HeadlessRenderer {
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -362,7 +361,8 @@ impl HeadlessRenderer {
         let grid_vertex_count = grid_vertices.map(|gv| gv.len() as u32).unwrap_or(0);
 
         // Create wireframe vertices if wireframe mode is enabled
-        let wireframe_verts = wireframe.map(|wf| extract_wireframe_edges(vertices, indices, wf.color));
+        let wireframe_verts =
+            wireframe.map(|wf| extract_wireframe_edges(vertices, indices, wf.color));
         let wireframe_buffer = wireframe_verts.as_ref().map(|wv| {
             self.device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -371,7 +371,10 @@ impl HeadlessRenderer {
                     usage: wgpu::BufferUsages::VERTEX,
                 })
         });
-        let wireframe_vertex_count = wireframe_verts.as_ref().map(|wv| wv.len() as u32).unwrap_or(0);
+        let wireframe_vertex_count = wireframe_verts
+            .as_ref()
+            .map(|wv| wv.len() as u32)
+            .unwrap_or(0);
 
         // Create uniform buffer
         let uniform_buffer = self
@@ -453,6 +456,7 @@ impl HeadlessRenderer {
                 label: Some("Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &color_view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -474,6 +478,7 @@ impl HeadlessRenderer {
                 }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
 
             // Draw grid first (so mesh renders on top)
@@ -502,15 +507,15 @@ impl HeadlessRenderer {
 
         // Copy texture to buffer
         encoder.copy_texture_to_buffer(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &color_texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            wgpu::ImageCopyBuffer {
+            wgpu::TexelCopyBufferInfo {
                 buffer: &output_buffer,
-                layout: wgpu::ImageDataLayout {
+                layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(padded_bytes_per_row),
                     rows_per_image: Some(self.height),
@@ -532,7 +537,7 @@ impl HeadlessRenderer {
             sender.send(result).unwrap();
         });
 
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device.poll(wgpu::PollType::wait_indefinitely())?;
         receiver.recv()?.context("Failed to map output buffer")?;
 
         let data = buffer_slice.get_mapped_range();
@@ -549,12 +554,10 @@ impl HeadlessRenderer {
         output_buffer.unmap();
 
         // Save as PNG
-        let img: image::RgbaImage =
-            image::ImageBuffer::from_raw(self.width, self.height, pixels)
-                .context("Failed to create image buffer")?;
+        let img: image::RgbaImage = image::ImageBuffer::from_raw(self.width, self.height, pixels)
+            .context("Failed to create image buffer")?;
 
-        img.save(output_path)
-            .context("Failed to save PNG")?;
+        img.save(output_path).context("Failed to save PNG")?;
 
         Ok(())
     }

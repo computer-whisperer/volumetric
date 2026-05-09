@@ -79,8 +79,8 @@ impl MeshPipeline {
         // Pipeline layout
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("mesh_gbuffer_pipeline_layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
 
         // Render pipeline
@@ -150,13 +150,13 @@ impl MeshPipeline {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth24Plus,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::LessEqual,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -219,23 +219,14 @@ impl MeshPipeline {
     }
 
     /// Upload index data.
-    pub fn upload_indices(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        indices: &[u32],
-    ) {
+    pub fn upload_indices(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, indices: &[u32]) {
         self.index_buffer.upload(device, queue, indices);
     }
 
     /// Record the G-buffer render pass.
     ///
     /// This renders meshes to the G-buffer textures (color, normal, depth).
-    pub fn render<'a>(
-        &'a self,
-        render_pass: &mut wgpu::RenderPass<'a>,
-        use_indices: bool,
-    ) {
+    pub fn render<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>, use_indices: bool) {
         if self.vertex_buffer.is_empty() {
             return;
         }

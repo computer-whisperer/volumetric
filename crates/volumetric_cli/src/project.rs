@@ -71,8 +71,7 @@ pub struct ProjectAddModelArgs {
 }
 
 pub fn run_project_add_model(args: ProjectAddModelArgs) -> Result<()> {
-    let mut project =
-        Project::load_from_file(&args.project).context("Failed to load project")?;
+    let mut project = Project::load_from_file(&args.project).context("Failed to load project")?;
     let wasm_bytes = std::fs::read(&args.input).context("Failed to read WASM file")?;
 
     let asset_id_base = args.asset_id.unwrap_or_else(|| {
@@ -142,12 +141,12 @@ fn parse_input(s: &str) -> Result<ExecutionInput> {
         Ok(ExecutionInput::Inline(cbor_bytes))
     } else if let Some(rest) = s.strip_prefix("file:") {
         // Read raw bytes from file
-        let bytes = std::fs::read(rest)
-            .with_context(|| format!("Failed to read file: {}", rest))?;
+        let bytes =
+            std::fs::read(rest).with_context(|| format!("Failed to read file: {}", rest))?;
         Ok(ExecutionInput::Inline(bytes))
     } else if let Some(rest) = s.strip_prefix("data:") {
         // Assume base64 encoded data
-        use base64::{engine::general_purpose::STANDARD, Engine};
+        use base64::{Engine, engine::general_purpose::STANDARD};
         let bytes = STANDARD
             .decode(rest)
             .context("Failed to decode base64 data")?;
@@ -159,8 +158,7 @@ fn parse_input(s: &str) -> Result<ExecutionInput> {
 }
 
 pub fn run_project_add_op(args: ProjectAddOpArgs) -> Result<()> {
-    let mut project =
-        Project::load_from_file(&args.project).context("Failed to load project")?;
+    let mut project = Project::load_from_file(&args.project).context("Failed to load project")?;
     let op_bytes = std::fs::read(&args.operator).context("Failed to read operator WASM")?;
 
     let op_name = args
@@ -438,17 +436,15 @@ pub fn run_project_list(args: ProjectListArgs) -> Result<()> {
         println!();
         println!("Imports ({}):", imports.len());
         for import in &imports {
-            println!("  {} ({}, {} bytes)", import.id, import.type_hint, import.size_bytes);
+            println!(
+                "  {} ({}, {} bytes)",
+                import.id, import.type_hint, import.size_bytes
+            );
         }
         println!();
         println!("Timeline steps: {}", project.timeline().len());
         for (idx, step) in project.timeline().iter().enumerate() {
-            println!(
-                "  {}. {} -> {:?}",
-                idx + 1,
-                step.operator_id,
-                step.outputs
-            );
+            println!("  {}. {} -> {:?}", idx + 1, step.operator_id, step.outputs);
         }
         println!();
         println!("Exports ({}):", exports.len());

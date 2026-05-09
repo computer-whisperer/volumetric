@@ -78,7 +78,10 @@ impl ModelBoundsNd {
     ///
     /// Panics if dimensions < 3.
     pub fn to_3d(&self) -> ModelBounds {
-        assert!(self.dimensions() >= 3, "need at least 3 dimensions for to_3d");
+        assert!(
+            self.dimensions() >= 3,
+            "need at least 3 dimensions for to_3d"
+        );
         ModelBounds::new(
             (self.min(0), self.min(1), self.min(2)),
             (self.max(0), self.max(1), self.max(2)),

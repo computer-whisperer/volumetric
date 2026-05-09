@@ -18,7 +18,7 @@ use core::panic::PanicInfo;
 #[cfg(target_arch = "wasm32")]
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
-    unsafe { core::arch::wasm32::unreachable() }
+    core::arch::wasm32::unreachable()
 }
 
 const BOUND: f64 = 3.14159265; // ~pi
@@ -72,5 +72,9 @@ pub extern "C" fn sample(pos_ptr: i32) -> f32 {
         return 0.0;
     }
 
-    if gyroid(x, y, z).abs() < THICKNESS { 1.0 } else { 0.0 }
+    if gyroid(x, y, z).abs() < THICKNESS {
+        1.0
+    } else {
+        0.0
+    }
 }

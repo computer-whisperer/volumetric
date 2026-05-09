@@ -12,17 +12,17 @@ web = ["volumetric/web", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:we
 volumetric = { path = "../../", default-features = false }
 volumetric_assets = { path = "../volumetric_assets" }
 anyhow = "1"
-serde = { version = "1.0.228", features = ["derive"] }
-wasmparser = "0.219"
+serde = { version = "1", features = ["derive"] }
+wasmparser = "0.248"
 bytemuck = { version = "1", features = ["derive"] }
-glam = "0.29"
+glam = "0.32"
 log = "0.4"
 thiserror = "2"
 ciborium = "0.2"
 web-time = "1"
 
 # Optional native dependencies
-rayon = { version = "1.10", optional = true }
+rayon = { version = "1", optional = true }
 env_logger = { version = "0.11", optional = true }
 
 # Optional WASM dependencies
@@ -35,13 +35,13 @@ web-sys = { version = "0.3", features = ["Window", "Document", "Blob", "Url", "H
 
 # Target-specific dependencies
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-eframe = { version = "0.33.3", default-features = false, features = ["default_fonts", "wgpu", "x11", "wayland"] }
-wgpu = { version = "27.0.0", default-features = false, features = ["wgsl", "vulkan"] }
-rfd = "0.15"
+eframe = { version = "0.34", default-features = false, features = ["default_fonts", "wgpu", "x11", "wayland"] }
+wgpu = "29"
+rfd = "0.17"
 poll-promise = "0.3"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-eframe = { version = "0.33.3", default-features = false, features = ["default_fonts", "wgpu", "web_screen_reader"] }
-wgpu = { version = "27.0.0", default-features = false, features = ["wgsl", "webgl", "webgpu"] }
-rfd = "0.15"
+eframe = { version = "0.34", default-features = false, features = ["default_fonts", "wgpu", "web_screen_reader"] }
+wgpu = { version = "29", features = ["webgl"] }
+rfd = "0.17"
 poll-promise = { version = "0.3", features = ["web"] }

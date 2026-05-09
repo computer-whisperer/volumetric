@@ -2,9 +2,9 @@
 
 use super::{FileError, FileFilter, FileResult, PickedFile};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 // =============================================================================

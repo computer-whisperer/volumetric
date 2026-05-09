@@ -13,13 +13,13 @@ use wgpu::util::DeviceExt;
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct SsaoUniforms {
-    pub view_proj: [[f32; 4]; 4],    // 64 bytes, offset 0
+    pub view_proj: [[f32; 4]; 4],     // 64 bytes, offset 0
     pub inv_view_proj: [[f32; 4]; 4], // 64 bytes, offset 64
-    pub screen_size_px: [f32; 2],    // 8 bytes, offset 128
+    pub screen_size_px: [f32; 2],     // 8 bytes, offset 128
     pub radius: f32,                  // 4 bytes, offset 136
     pub bias: f32,                    // 4 bytes, offset 140
     pub strength: f32,                // 4 bytes, offset 144
-    pub _pad0: [f32; 7],             // 28 bytes to reach 176 (matches WGSL padding + vec3 + final pad)
+    pub _pad0: [f32; 7], // 28 bytes to reach 176 (matches WGSL padding + vec3 + final pad)
 }
 
 // Verify struct size matches WGSL expectations (176 bytes due to vec3 alignment)
@@ -78,7 +78,7 @@ impl SsaoPipeline {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
 
@@ -132,8 +132,8 @@ impl SsaoPipeline {
         // Pipeline layout
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("ssao_pipeline_layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
 
         // Render pipeline (fullscreen pass to AO texture)
@@ -159,7 +159,7 @@ impl SsaoPipeline {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -221,7 +221,11 @@ impl SsaoPipeline {
     }
 
     /// Record the SSAO render pass.
-    pub fn render<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>, bind_group: &'a wgpu::BindGroup) {
+    pub fn render<'a>(
+        &'a self,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        bind_group: &'a wgpu::BindGroup,
+    ) {
         render_pass.set_pipeline(&self.pipeline);
         render_pass.set_bind_group(0, bind_group, &[]);
         render_pass.draw(0..3, 0..1); // Fullscreen triangle
