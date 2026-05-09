@@ -16,7 +16,10 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{CursorIcon, Window, WindowId};
 
-use crate::{PreviewMeshPlan, PreviewRenderMode, PreviewRequest, VIEWPORT_KEY, VolumetricUiV2};
+use crate::{
+    PreviewBuildStatus, PreviewMeshPlan, PreviewRenderMode, PreviewRequest, VIEWPORT_KEY,
+    VolumetricUiV2,
+};
 
 pub fn run(
     title: &'static str,
@@ -361,6 +364,11 @@ impl Host {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
+        let preview_request = self.app.preview_request();
+        let preview_status = gfx
+            .viewport_renderer
+            .sync_preview_request(preview_request.as_ref());
+        self.app.set_preview_build_status(preview_status);
         self.app.before_build();
         let theme = self.app.theme();
         let palette = theme.palette().clone();
@@ -407,7 +415,7 @@ impl Host {
             scale_factor,
             surface_extent: (gfx.config.width, gfx.config.height),
             clear_color: bg_color(&palette),
-            preview_request: self.app.preview_request(),
+            preview_request,
         });
         gfx.aetna.render(
             &gfx.device,
@@ -438,7 +446,7 @@ struct ViewportRenderer {
     scene_cache: Option<PreviewSceneCache>,
     preview_worker: PreviewWorker,
     pending_preview_key: Option<PreviewSceneKey>,
-    failed_preview_key: Option<PreviewSceneKey>,
+    failed_preview: Option<(PreviewSceneKey, String)>,
     camera: Option<renderer::Camera>,
 }
 
@@ -540,7 +548,7 @@ impl ViewportRenderer {
             scene_cache: None,
             preview_worker: PreviewWorker::new(),
             pending_preview_key: None,
-            failed_preview_key: None,
+            failed_preview: None,
             camera: None,
         }
     }
@@ -584,7 +592,6 @@ impl ViewportRenderer {
         }
 
         self.renderer.set_viewport_size(device, w, h);
-        self.sync_preview_request(preview_request.as_ref());
         let (scene, camera) = self.scene_for_request(preview_request.as_ref());
         for (mesh, transform, material) in &scene.meshes {
             self.renderer.submit_mesh(mesh, *transform, *material);
@@ -674,13 +681,13 @@ impl ViewportRenderer {
         self.pending_preview_key.is_some()
     }
 
-    fn sync_preview_request(&mut self, request: Option<&PreviewRequest>) {
+    fn sync_preview_request(&mut self, request: Option<&PreviewRequest>) -> PreviewBuildStatus {
         self.drain_preview_results();
 
         let Some(request) = request else {
             self.pending_preview_key = None;
-            self.failed_preview_key = None;
-            return;
+            self.failed_preview = None;
+            return PreviewBuildStatus::Idle;
         };
 
         let key = PreviewSceneKey::from(request);
@@ -688,18 +695,28 @@ impl ViewportRenderer {
             .scene_cache
             .as_ref()
             .is_some_and(|cache| cache.key == key)
-            || self.pending_preview_key.as_ref() == Some(&key)
-            || self.failed_preview_key.as_ref() == Some(&key)
         {
-            return;
+            return PreviewBuildStatus::Ready { label: key.label() };
+        }
+        if self.pending_preview_key.as_ref() == Some(&key) {
+            return PreviewBuildStatus::Building { label: key.label() };
+        }
+        if let Some((failed_key, error)) = &self.failed_preview
+            && failed_key == &key
+        {
+            return PreviewBuildStatus::Failed {
+                label: key.label(),
+                error: error.clone(),
+            };
         }
 
-        self.failed_preview_key = None;
+        self.failed_preview = None;
         self.pending_preview_key = Some(key.clone());
         self.preview_worker.request(PreviewBuildJob {
-            key,
+            key: key.clone(),
             request: request.clone(),
         });
+        PreviewBuildStatus::Building { label: key.label() }
     }
 
     fn drain_preview_results(&mut self) {
@@ -711,15 +728,15 @@ impl ViewportRenderer {
             self.pending_preview_key = None;
             match result.result {
                 Ok(scene) => {
-                    self.failed_preview_key = None;
+                    self.failed_preview = None;
                     self.camera = Some(scene.1.clone());
                     self.scene_cache = Some(PreviewSceneCache {
                         key: result.key,
                         scene,
                     });
                 }
-                Err(_) => {
-                    self.failed_preview_key = Some(result.key);
+                Err(error) => {
+                    self.failed_preview = Some((result.key, error));
                 }
             }
         }
@@ -748,7 +765,10 @@ impl ViewportRenderer {
             .filter(|cache| {
                 cache.key == key
                     || self.pending_preview_key.is_some()
-                    || self.failed_preview_key.as_ref() == Some(&key)
+                    || self
+                        .failed_preview
+                        .as_ref()
+                        .is_some_and(|(failed_key, _)| failed_key == &key)
             })
             .map(|cache| cache.scene.0.clone())
             .unwrap_or_else(renderer::test_scenes::create_test_scene);
@@ -810,6 +830,12 @@ impl From<&PreviewRequest> for PreviewSceneKey {
             render_mode: request.render_mode,
             mesh_plan: request.mesh_plan.clone(),
         }
+    }
+}
+
+impl PreviewSceneKey {
+    fn label(&self) -> String {
+        self.mesh_plan.label()
     }
 }
 

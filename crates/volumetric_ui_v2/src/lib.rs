@@ -185,6 +185,40 @@ pub struct PreviewRequest {
     pub stale: bool,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum PreviewBuildStatus {
+    #[default]
+    Idle,
+    Building {
+        label: String,
+    },
+    Ready {
+        label: String,
+    },
+    Failed {
+        label: String,
+        error: String,
+    },
+}
+
+impl PreviewBuildStatus {
+    fn label(&self) -> String {
+        match self {
+            Self::Idle => "preview idle".to_string(),
+            Self::Building { label } => format!("building {label}"),
+            Self::Ready { label } => format!("ready {label}"),
+            Self::Failed { label, .. } => format!("failed {label}"),
+        }
+    }
+
+    fn tooltip(&self) -> Option<&str> {
+        match self {
+            Self::Failed { error, .. } => Some(error),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectSummary {
     pub imports: usize,
@@ -221,6 +255,7 @@ pub struct VolumetricUiV2 {
     last_run_elapsed_ms: Option<u128>,
     last_run_error: Option<String>,
     last_run_stale: bool,
+    preview_build_status: PreviewBuildStatus,
     status: String,
 }
 
@@ -243,6 +278,7 @@ impl Default for VolumetricUiV2 {
             last_run_elapsed_ms: None,
             last_run_error: None,
             last_run_stale: false,
+            preview_build_status: PreviewBuildStatus::Idle,
             status: "idle".to_string(),
         };
         app.add_selected_model();
@@ -269,6 +305,7 @@ impl VolumetricUiV2 {
             last_run_elapsed_ms: None,
             last_run_error: None,
             last_run_stale: false,
+            preview_build_status: PreviewBuildStatus::Idle,
             status: "idle".to_string(),
         }
     }
@@ -309,6 +346,10 @@ impl VolumetricUiV2 {
 
     pub fn camera_control_scheme(&self) -> CameraControlScheme {
         self.camera_control_scheme
+    }
+
+    pub(crate) fn set_preview_build_status(&mut self, status: PreviewBuildStatus) {
+        self.preview_build_status = status;
     }
 
     pub fn summary(&self) -> ProjectSummary {
@@ -814,6 +855,7 @@ fn viewport_workspace(app: &VolumetricUiV2) -> El {
             ])
             .gap(tokens::SPACE_1)
             .width(Size::Fill(1.0)),
+            preview_status_chip(app),
             badge("Aetna").secondary().xsmall(),
             badge("wgpu 29").secondary().xsmall(),
         ]),
@@ -939,6 +981,35 @@ fn viewport_status_bar(app: &VolumetricUiV2, summary: &ProjectSummary) -> El {
     .gap(tokens::SPACE_1)
 }
 
+fn preview_status_chip(app: &VolumetricUiV2) -> El {
+    let label = app.preview_build_status.label();
+    let badge = match &app.preview_build_status {
+        PreviewBuildStatus::Idle => badge(label).muted().xsmall(),
+        PreviewBuildStatus::Building { .. } => badge(label).info().xsmall(),
+        PreviewBuildStatus::Ready { .. } => badge(label).success().xsmall(),
+        PreviewBuildStatus::Failed { .. } => badge(label).destructive().xsmall(),
+    };
+    let badge = if let Some(tooltip) = app.preview_build_status.tooltip() {
+        badge.tooltip(tooltip)
+    } else {
+        badge
+    };
+
+    if matches!(
+        app.preview_build_status,
+        PreviewBuildStatus::Building { .. }
+    ) {
+        row([
+            spinner().width(Size::Fixed(14.0)).height(Size::Fixed(14.0)),
+            badge,
+        ])
+        .gap(tokens::SPACE_1)
+        .align(Align::Center)
+    } else {
+        badge
+    }
+}
+
 fn project_details(app: &VolumetricUiV2) -> El {
     card([
         card_header([
@@ -984,6 +1055,7 @@ fn right_inspector(app: &VolumetricUiV2) -> El {
                 [
                     field_row("Mode", badge("ASN v2").secondary()),
                     detail_row("Selected", selected_export),
+                    detail_row("Preview", &app.preview_build_status.label()),
                     detail_row("Status", &app.status),
                 ],
             ),
@@ -1496,7 +1568,7 @@ fn editable_model_asset_ids(app: &VolumetricUiV2) -> Vec<String> {
 pub fn shell_bundle(viewport: Rect) -> aetna_core::bundle::artifact::Bundle {
     let app = VolumetricUiV2::default();
     let mut tree = shell(&app);
-    aetna_core::bundle::artifact::render_bundle(&mut tree, viewport, Some(env!("CARGO_PKG_NAME")))
+    aetna_core::bundle::artifact::render_bundle(&mut tree, viewport)
 }
 
 #[cfg(test)]
