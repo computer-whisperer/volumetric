@@ -616,7 +616,7 @@ impl ViewportRenderer {
             return false;
         };
 
-        match scheme.determine_action(input) {
+        match camera_action_with_left_fallback(scheme, input) {
             renderer::CameraAction::Orbit => {
                 camera.orbit(-input.mouse_delta.x * 0.01, -input.mouse_delta.y * 0.01);
                 true
@@ -688,6 +688,22 @@ impl ViewportRenderer {
             .get_or_insert_with(renderer::test_scenes::create_test_camera)
             .clone();
         (scene, camera)
+    }
+}
+
+fn camera_action_with_left_fallback(
+    scheme: renderer::CameraControlScheme,
+    input: &renderer::CameraInputState,
+) -> renderer::CameraAction {
+    let action = scheme.determine_action(input);
+    if action != renderer::CameraAction::None || !input.left_down {
+        return action;
+    }
+
+    if input.shift_down || input.ctrl_down {
+        renderer::CameraAction::Pan
+    } else {
+        renderer::CameraAction::Orbit
     }
 }
 
