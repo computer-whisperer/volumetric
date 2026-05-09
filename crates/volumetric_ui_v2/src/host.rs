@@ -372,6 +372,15 @@ impl Host {
         if let Some(command) = self.app.take_camera_command() {
             gfx.viewport_renderer.apply_camera_command(command);
         }
+        if let Some(rect) = self.last_viewport_rect {
+            gfx.viewport_renderer.ensure_target_for_rect(
+                &gfx.device,
+                rect,
+                gfx.window.scale_factor() as f32,
+            );
+        }
+        self.app
+            .set_viewport_texture(gfx.viewport_renderer.app_texture());
         self.app.before_build();
         let theme = self.app.theme();
         let palette = theme.palette().clone();
@@ -409,14 +418,12 @@ impl Host {
         let viewport_rect = gfx.aetna.rect_of_key(VIEWPORT_KEY);
         self.last_viewport_rect = viewport_rect;
 
-        gfx.viewport_renderer.render(ViewportRenderParams {
+        let viewport_resized = gfx.viewport_renderer.render(ViewportRenderParams {
             device: &gfx.device,
             queue: &gfx.queue,
             encoder: &mut encoder,
-            target_view: &view,
             logical_rect: viewport_rect,
             scale_factor,
-            surface_extent: (gfx.config.width, gfx.config.height),
             clear_color: bg_color(&palette),
             preview_request,
         });
@@ -426,13 +433,13 @@ impl Host {
             &frame.texture,
             &view,
             None,
-            wgpu::LoadOp::Load,
+            wgpu::LoadOp::Clear(bg_color(&palette)),
         );
 
         gfx.queue.submit(Some(encoder.finish()));
         frame.present();
 
-        if prepare.needs_redraw || gfx.viewport_renderer.has_pending_preview() {
+        if prepare.needs_redraw || viewport_resized || gfx.viewport_renderer.has_pending_preview() {
             gfx.window.request_redraw();
         }
     }
@@ -441,10 +448,6 @@ impl Host {
 struct ViewportRenderer {
     renderer: renderer::Renderer,
     target: ViewportTarget,
-    blit_pipeline: wgpu::RenderPipeline,
-    blit_bind_group_layout: wgpu::BindGroupLayout,
-    blit_bind_group: wgpu::BindGroup,
-    sampler: wgpu::Sampler,
     surface_format: wgpu::TextureFormat,
     scene_cache: Option<PreviewSceneCache>,
     preview_worker: PreviewWorker,
@@ -458,10 +461,8 @@ struct ViewportRenderParams<'a> {
     device: &'a wgpu::Device,
     queue: &'a wgpu::Queue,
     encoder: &'a mut wgpu::CommandEncoder,
-    target_view: &'a wgpu::TextureView,
     logical_rect: Option<Rect>,
     scale_factor: f32,
-    surface_extent: (u32, u32),
     clear_color: wgpu::Color,
     preview_request: Option<PreviewRequest>,
 }
@@ -472,82 +473,10 @@ impl ViewportRenderer {
         renderer.initialize(device, queue, None);
 
         let target = ViewportTarget::new(device, (1, 1), format);
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("volumetric_ui_v2::viewport_blit_sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-            ..Default::default()
-        });
-        let blit_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("volumetric_ui_v2::viewport_blit_bgl"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            multisampled: false,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                ],
-            });
-        let blit_bind_group =
-            create_blit_bind_group(device, &blit_bind_group_layout, &target.view, &sampler);
-        let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("volumetric_ui_v2::viewport_blit_shader"),
-            source: wgpu::ShaderSource::Wgsl(VIEWPORT_BLIT_WGSL.into()),
-        });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("volumetric_ui_v2::viewport_blit_layout"),
-            bind_group_layouts: &[Some(&blit_bind_group_layout)],
-            immediate_size: 0,
-        });
-        let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("volumetric_ui_v2::viewport_blit_pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &blit_shader,
-                entry_point: Some("vs_main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &[],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &blit_shader,
-                entry_point: Some("fs_main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
 
         Self {
             renderer,
             target,
-            blit_pipeline,
-            blit_bind_group_layout,
-            blit_bind_group,
-            sampler,
             surface_format: format,
             scene_cache: None,
             preview_worker: PreviewWorker::new(),
@@ -563,38 +492,42 @@ impl ViewportRenderer {
         // It is resized during `render` once Aetna layout has resolved that rect.
     }
 
-    fn render(&mut self, params: ViewportRenderParams<'_>) {
+    fn app_texture(&self) -> AppTexture {
+        self.target.app_texture.clone()
+    }
+
+    fn ensure_target_for_rect(
+        &mut self,
+        device: &wgpu::Device,
+        rect: Rect,
+        scale_factor: f32,
+    ) -> bool {
+        let extent = viewport_extent(rect, scale_factor);
+        if self.target.extent == extent {
+            return false;
+        }
+
+        self.target = ViewportTarget::new(device, extent, self.surface_format);
+        true
+    }
+
+    fn render(&mut self, params: ViewportRenderParams<'_>) -> bool {
         let ViewportRenderParams {
             device,
             queue,
             encoder,
-            target_view,
             logical_rect,
             scale_factor,
-            surface_extent,
             clear_color,
             preview_request,
         } = params;
 
-        clear_viewport(encoder, target_view, clear_color);
-
         let Some(rect) = logical_rect else {
-            return;
+            return false;
         };
 
-        let Some((x, y, w, h)) = physical_rect(rect, scale_factor, surface_extent) else {
-            return;
-        };
-
-        if self.target.extent != (w, h) {
-            self.target = ViewportTarget::new(device, (w, h), self.surface_format);
-            self.blit_bind_group = create_blit_bind_group(
-                device,
-                &self.blit_bind_group_layout,
-                &self.target.view,
-                &self.sampler,
-            );
-        }
+        let target_resized = self.ensure_target_for_rect(device, rect, scale_factor);
+        let (w, h) = self.target.extent;
 
         self.renderer.set_viewport_size(device, w, h);
         let (scene, camera) = self.scene_for_request(preview_request.as_ref());
@@ -619,28 +552,7 @@ impl ViewportRenderer {
             &self.target.view,
         );
         self.renderer.end_frame();
-
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("volumetric_ui_v2::viewport_blit_pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: target_view,
-                resolve_target: None,
-                depth_slice: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
-        pass.set_scissor_rect(x, y, w, h);
-        pass.set_viewport(x as f32, y as f32, w as f32, h as f32, 0.0, 1.0);
-        pass.set_pipeline(&self.blit_pipeline);
-        pass.set_bind_group(0, &self.blit_bind_group, &[]);
-        pass.draw(0..3, 0..1);
+        target_resized
     }
 
     fn apply_camera_input(
@@ -807,15 +719,16 @@ impl ViewportRenderer {
 }
 
 struct ViewportTarget {
-    _texture: wgpu::Texture,
+    _texture: Arc<wgpu::Texture>,
     view: wgpu::TextureView,
+    app_texture: AppTexture,
     extent: (u32, u32),
 }
 
 impl ViewportTarget {
     fn new(device: &wgpu::Device, extent: (u32, u32), format: wgpu::TextureFormat) -> Self {
         let extent = (extent.0.max(1), extent.1.max(1));
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
+        let texture = Arc::new(device.create_texture(&wgpu::TextureDescriptor {
             label: Some("volumetric_ui_v2::viewport_render_target"),
             size: wgpu::Extent3d {
                 width: extent.0,
@@ -828,11 +741,13 @@ impl ViewportTarget {
             format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
-        });
+        }));
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let app_texture = aetna_wgpu::app_texture(texture.clone());
         Self {
             _texture: texture,
             view,
+            app_texture,
             extent,
         }
     }
@@ -1108,28 +1023,6 @@ fn triangles_to_mesh_vertices(triangles: &[volumetric::Triangle]) -> Vec<rendere
     out
 }
 
-fn create_blit_bind_group(
-    device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
-    texture_view: &wgpu::TextureView,
-    sampler: &wgpu::Sampler,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("volumetric_ui_v2::viewport_blit_bg"),
-        layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(texture_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::Sampler(sampler),
-            },
-        ],
-    })
-}
-
 fn format_error_chain(error: anyhow::Error) -> String {
     error
         .chain()
@@ -1138,44 +1031,10 @@ fn format_error_chain(error: anyhow::Error) -> String {
         .join(": ")
 }
 
-fn clear_viewport(
-    encoder: &mut wgpu::CommandEncoder,
-    target_view: &wgpu::TextureView,
-    clear_color: wgpu::Color,
-) {
-    let _ = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-        label: Some("volumetric_ui_v2::viewport_clear_pass"),
-        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-            view: target_view,
-            resolve_target: None,
-            depth_slice: None,
-            ops: wgpu::Operations {
-                load: wgpu::LoadOp::Clear(clear_color),
-                store: wgpu::StoreOp::Store,
-            },
-        })],
-        depth_stencil_attachment: None,
-        timestamp_writes: None,
-        occlusion_query_set: None,
-        multiview_mask: None,
-    });
-}
-
-fn physical_rect(
-    rect: Rect,
-    scale_factor: f32,
-    extent: (u32, u32),
-) -> Option<(u32, u32, u32, u32)> {
-    let max_w = extent.0 as f32;
-    let max_h = extent.1 as f32;
-    let x0 = (rect.x * scale_factor).floor().clamp(0.0, max_w) as u32;
-    let y0 = (rect.y * scale_factor).floor().clamp(0.0, max_h) as u32;
-    let x1 = ((rect.x + rect.w) * scale_factor).ceil().clamp(0.0, max_w) as u32;
-    let y1 = ((rect.y + rect.h) * scale_factor).ceil().clamp(0.0, max_h) as u32;
-
-    let w = x1.checked_sub(x0)?;
-    let h = y1.checked_sub(y0)?;
-    (w > 0 && h > 0).then_some((x0, y0, w, h))
+fn viewport_extent(rect: Rect, scale_factor: f32) -> (u32, u32) {
+    let w = (rect.w * scale_factor).ceil().max(1.0) as u32;
+    let h = (rect.h * scale_factor).ceil().max(1.0) as u32;
+    (w, h)
 }
 
 fn pointer_in_rect(rect: Option<Rect>, x: f32, y: f32) -> bool {
@@ -1183,40 +1042,6 @@ fn pointer_in_rect(rect: Option<Rect>, x: f32, y: f32) -> bool {
         x >= rect.x && x <= rect.x + rect.w && y >= rect.y && y <= rect.y + rect.h
     })
 }
-
-const VIEWPORT_BLIT_WGSL: &str = r#"
-struct VsOut {
-    @builtin(position) position: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-};
-
-@vertex
-fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
-    var positions = array<vec2<f32>, 3>(
-        vec2<f32>(-1.0, -1.0),
-        vec2<f32>( 3.0, -1.0),
-        vec2<f32>(-1.0,  3.0)
-    );
-    var out: VsOut;
-    out.position = vec4<f32>(positions[vi], 0.0, 1.0);
-    out.uv = vec2<f32>(
-        (out.position.x + 1.0) * 0.5,
-        1.0 - (out.position.y + 1.0) * 0.5
-    );
-    return out;
-}
-
-@group(0) @binding(0)
-var t_source: texture_2d<f32>;
-
-@group(0) @binding(1)
-var s_source: sampler;
-
-@fragment
-fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    return textureSample(t_source, s_source, in.uv);
-}
-"#;
 
 fn map_key(key: &Key) -> Option<UiKey> {
     match key {

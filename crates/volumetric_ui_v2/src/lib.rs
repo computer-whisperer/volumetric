@@ -263,6 +263,7 @@ pub struct VolumetricUiV2 {
     last_run_stale: bool,
     preview_build_status: PreviewBuildStatus,
     pending_camera_command: Option<ViewportCameraCommand>,
+    viewport_texture: Option<AppTexture>,
     status: String,
 }
 
@@ -287,6 +288,7 @@ impl Default for VolumetricUiV2 {
             last_run_stale: false,
             preview_build_status: PreviewBuildStatus::Idle,
             pending_camera_command: None,
+            viewport_texture: None,
             status: "idle".to_string(),
         };
         app.add_selected_model();
@@ -315,6 +317,7 @@ impl VolumetricUiV2 {
             last_run_stale: false,
             preview_build_status: PreviewBuildStatus::Idle,
             pending_camera_command: None,
+            viewport_texture: None,
             status: "idle".to_string(),
         }
     }
@@ -363,6 +366,10 @@ impl VolumetricUiV2 {
 
     pub(crate) fn take_camera_command(&mut self) -> Option<ViewportCameraCommand> {
         self.pending_camera_command.take()
+    }
+
+    pub(crate) fn set_viewport_texture(&mut self, texture: AppTexture) {
+        self.viewport_texture = Some(texture);
     }
 
     pub fn summary(&self) -> ProjectSummary {
@@ -1051,8 +1058,17 @@ fn project_details(app: &VolumetricUiV2) -> El {
     .height(Size::Fixed(220.0))
 }
 
-fn viewport_placeholder(_app: &VolumetricUiV2) -> El {
-    spacer().key(VIEWPORT_KEY).fill_size().clip()
+fn viewport_placeholder(app: &VolumetricUiV2) -> El {
+    if let Some(texture) = &app.viewport_texture {
+        surface(texture.clone())
+            .surface_alpha(SurfaceAlpha::Opaque)
+            .surface_fit(ImageFit::Fill)
+            .key(VIEWPORT_KEY)
+            .fill_size()
+            .clip()
+    } else {
+        spacer().key(VIEWPORT_KEY).fill_size().clip()
+    }
 }
 
 fn right_inspector(app: &VolumetricUiV2) -> El {

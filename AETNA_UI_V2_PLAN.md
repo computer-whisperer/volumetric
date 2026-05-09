@@ -91,8 +91,8 @@ Frame sketch:
 2. Build the Aetna `El` tree.
 3. Call `aetna_runner.prepare(...)`.
 4. Query `aetna_runner.rect_of_key("viewport")`.
-5. Render the Volumetric 3D scene into that viewport region.
-6. Render Aetna chrome on top.
+5. Render the Volumetric 3D scene into the app-owned viewport texture.
+6. Let Aetna composite that texture through the keyed `surface()` element.
 7. Submit and present.
 
 ## Viewport Strategy
@@ -103,8 +103,8 @@ Start with the simplest robust path:
 
 - reserve a keyed Aetna element for the viewport;
 - render the Volumetric scene to an offscreen texture sized to the viewport rect;
-- blit or composite that texture into the surface at the viewport rect;
-- render Aetna over it.
+- expose that texture to Aetna as an app-owned `surface()` with opaque alpha;
+- let normal Aetna z-order, clipping, hit-testing, and overlays handle composition.
 
 This keeps the existing renderer's viewport-sized G-buffer, SSAO, grid, line, and
 point passes intact. A later optimization can render directly into a scissored
@@ -175,10 +175,9 @@ Aetna widgets that should map well:
   WASM bytes, render mode, mesh plan, grid/SSAO flags, and stale state are
   packaged from app state instead of being inferred from scattered UI controls.
 - The native v2 binary now uses a custom winit/wgpu host built on
-  `aetna_wgpu::Runner`: it prepares Aetna layout, resolves `VIEWPORT_KEY`, paints
-  a GPU-backed viewport region, then renders Aetna chrome on top. The viewport
-  now renders through `volumetric_renderer::Renderer` into an offscreen
-  viewport-sized target and blits that into the keyed Aetna rect.
+  `aetna_wgpu::Runner`: it prepares Aetna layout, resolves `VIEWPORT_KEY`, renders
+  `volumetric_renderer::Renderer` into a viewport-sized app-owned texture, and
+  exposes that texture as a keyed Aetna `surface()` element for composition.
 - The old egui renderer module has been extracted into `crates/volumetric_renderer`.
   Core renderer types/pipelines are usable without egui, while the previous egui
   paint callback remains behind an `egui-callback` feature for `volumetric_ui`.
