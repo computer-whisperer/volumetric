@@ -3,7 +3,7 @@ use std::sync::Arc;
 use aetna_core::prelude::*;
 use aetna_core::{Cursor, KeyModifiers, PointerButton, UiKey};
 use aetna_wgpu::Runner;
-use glam::Vec3;
+use glam::{Vec2, Vec3};
 use volumetric_renderer as renderer;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -29,6 +29,9 @@ pub fn run(
         modifiers: KeyModifiers::default(),
         last_cursor: Cursor::Default,
         pending_resize: None,
+        last_viewport_rect: None,
+        viewport_buttons: ViewportPointerButtons::default(),
+        last_camera_pointer: None,
     };
     event_loop.run_app(&mut host)?;
     Ok(())
@@ -43,6 +46,31 @@ struct Host {
     modifiers: KeyModifiers,
     last_cursor: Cursor,
     pending_resize: Option<PhysicalSize<u32>>,
+    last_viewport_rect: Option<Rect>,
+    viewport_buttons: ViewportPointerButtons,
+    last_camera_pointer: Option<(f32, f32)>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ViewportPointerButtons {
+    left: bool,
+    middle: bool,
+    right: bool,
+}
+
+impl ViewportPointerButtons {
+    fn set(&mut self, button: MouseButton, down: bool) {
+        match button {
+            MouseButton::Left => self.left = down,
+            MouseButton::Middle => self.middle = down,
+            MouseButton::Right => self.right = down,
+            _ => {}
+        }
+    }
+
+    fn any(self) -> bool {
+        self.left || self.middle || self.right
+    }
 }
 
 struct Gfx {
@@ -172,6 +200,24 @@ impl ApplicationHandler for Host {
                         let lx = position.x as f32 / scale;
                         let ly = position.y as f32 / scale;
                         self.last_pointer = Some((lx, ly));
+                        if let Some((last_x, last_y)) = self.last_camera_pointer
+                            && self.viewport_buttons.any()
+                        {
+                            let input = renderer::CameraInputState {
+                                left_down: self.viewport_buttons.left,
+                                middle_down: self.viewport_buttons.middle,
+                                right_down: self.viewport_buttons.right,
+                                shift_down: self.modifiers.shift,
+                                ctrl_down: self.modifiers.ctrl,
+                                alt_down: self.modifiers.alt,
+                                mouse_delta: Vec2::new(lx - last_x, ly - last_y),
+                                scroll_delta: 0.0,
+                            };
+                            if gfx.viewport_renderer.apply_camera_input(&input) {
+                                gfx.window.request_redraw();
+                            }
+                            self.last_camera_pointer = Some((lx, ly));
+                        }
                         let moved = gfx.aetna.pointer_moved(lx, ly);
                         for event in moved.events {
                             self.app.on_event(event);
@@ -182,16 +228,27 @@ impl ApplicationHandler for Host {
                     }
                     WindowEvent::CursorLeft { .. } => {
                         self.last_pointer = None;
+                        self.last_camera_pointer = None;
+                        self.viewport_buttons = ViewportPointerButtons::default();
                         gfx.aetna.pointer_left();
                         gfx.window.request_redraw();
                     }
                     WindowEvent::MouseInput { state, button, .. } => {
+                        self.viewport_buttons
+                            .set(button, state == ElementState::Pressed);
                         let Some(button) = pointer_button(button) else {
                             return;
                         };
                         let Some((lx, ly)) = self.last_pointer else {
                             return;
                         };
+                        if state == ElementState::Pressed
+                            && pointer_in_rect(self.last_viewport_rect, lx, ly)
+                        {
+                            self.last_camera_pointer = Some((lx, ly));
+                        } else if state == ElementState::Released && !self.viewport_buttons.any() {
+                            self.last_camera_pointer = None;
+                        }
                         match state {
                             ElementState::Pressed => {
                                 for event in gfx.aetna.pointer_down(lx, ly, button) {
@@ -214,6 +271,10 @@ impl ApplicationHandler for Host {
                             MouseScrollDelta::LineDelta(_, y) => -y * 50.0,
                             MouseScrollDelta::PixelDelta(p) => -(p.y as f32) / scale,
                         };
+                        if pointer_in_rect(self.last_viewport_rect, lx, ly) {
+                            gfx.viewport_renderer.zoom_camera(-dy * 0.001);
+                            gfx.window.request_redraw();
+                        }
                         if gfx.aetna.pointer_wheel(lx, ly, dy) {
                             gfx.window.request_redraw();
                         }
@@ -323,12 +384,15 @@ impl Host {
                 label: Some("volumetric_ui_v2::encoder"),
             });
 
+        let viewport_rect = gfx.aetna.rect_of_key(VIEWPORT_KEY);
+        self.last_viewport_rect = viewport_rect;
+
         gfx.viewport_renderer.render(
             &gfx.device,
             &gfx.queue,
             &mut encoder,
             &view,
-            gfx.aetna.rect_of_key(VIEWPORT_KEY),
+            viewport_rect,
             scale_factor,
             (gfx.config.width, gfx.config.height),
             bg_color(&palette),
@@ -361,6 +425,8 @@ struct ViewportRenderer {
     sampler: wgpu::Sampler,
     surface_format: wgpu::TextureFormat,
     scene_cache: Option<PreviewSceneCache>,
+    camera: Option<renderer::Camera>,
+    camera_control_scheme: renderer::CameraControlScheme,
 }
 
 impl ViewportRenderer {
@@ -447,6 +513,8 @@ impl ViewportRenderer {
             sampler,
             surface_format: format,
             scene_cache: None,
+            camera: None,
+            camera_control_scheme: renderer::CameraControlScheme::default(),
         }
     }
 
@@ -534,15 +602,55 @@ impl ViewportRenderer {
         pass.draw(0..3, 0..1);
     }
 
+    fn apply_camera_input(&mut self, input: &renderer::CameraInputState) -> bool {
+        let Some(camera) = &mut self.camera else {
+            return false;
+        };
+
+        match self.camera_control_scheme.determine_action(input) {
+            renderer::CameraAction::Orbit => {
+                camera.orbit(-input.mouse_delta.x * 0.01, -input.mouse_delta.y * 0.01);
+                true
+            }
+            renderer::CameraAction::Pan => {
+                camera.pan(input.mouse_delta, Vec2::ZERO);
+                true
+            }
+            renderer::CameraAction::Zoom => {
+                let zoom_delta = if input.scroll_delta != 0.0 {
+                    input.scroll_delta * 0.01
+                } else {
+                    input.mouse_delta.x * 0.02
+                };
+                camera.zoom_clamped(zoom_delta, 0.1, 1000.0);
+                true
+            }
+            renderer::CameraAction::None => false,
+        }
+    }
+
+    fn zoom_camera(&mut self, scroll_delta: f32) {
+        let input = renderer::CameraInputState {
+            scroll_delta,
+            ..Default::default()
+        };
+        let _ = self.apply_camera_input(&input);
+    }
+
     fn scene_for_request(
         &mut self,
         request: Option<&PreviewRequest>,
     ) -> (renderer::SceneData, renderer::Camera) {
         let Some(request) = request else {
-            return (
-                renderer::test_scenes::create_test_scene(),
-                renderer::test_scenes::create_test_camera(),
-            );
+            if self.scene_cache.is_some() {
+                self.scene_cache = None;
+                self.camera = Some(renderer::test_scenes::create_test_camera());
+            }
+            let camera = self
+                .camera
+                .get_or_insert_with(renderer::test_scenes::create_test_camera)
+                .clone();
+            return (renderer::test_scenes::create_test_scene(), camera);
         };
 
         let key = PreviewSceneKey::from(request);
@@ -555,17 +663,22 @@ impl ViewportRenderer {
                 key,
                 result: build_preview_scene(request),
             });
+            self.camera = self
+                .scene_cache
+                .as_ref()
+                .and_then(|cache| cache.result.as_ref().ok().map(|(_, camera)| camera.clone()));
         }
 
-        self.scene_cache
+        let scene = self
+            .scene_cache
             .as_ref()
-            .and_then(|cache| cache.result.as_ref().ok().cloned())
-            .unwrap_or_else(|| {
-                (
-                    renderer::test_scenes::create_test_scene(),
-                    renderer::test_scenes::create_test_camera(),
-                )
-            })
+            .and_then(|cache| cache.result.as_ref().ok().map(|(scene, _)| scene.clone()))
+            .unwrap_or_else(renderer::test_scenes::create_test_scene);
+        let camera = self
+            .camera
+            .get_or_insert_with(renderer::test_scenes::create_test_camera)
+            .clone();
+        (scene, camera)
     }
 }
 
@@ -841,6 +954,12 @@ fn physical_rect(
     let w = x1.checked_sub(x0)?;
     let h = y1.checked_sub(y0)?;
     (w > 0 && h > 0).then_some((x0, y0, w, h))
+}
+
+fn pointer_in_rect(rect: Option<Rect>, x: f32, y: f32) -> bool {
+    rect.is_some_and(|rect| {
+        x >= rect.x && x <= rect.x + rect.w && y >= rect.y && y <= rect.y + rect.h
+    })
 }
 
 const VIEWPORT_BLIT_WGSL: &str = r#"
