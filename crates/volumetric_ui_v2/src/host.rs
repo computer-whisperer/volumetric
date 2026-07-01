@@ -568,6 +568,30 @@ fn handle_file_action(app: &mut VolumetricUiV2, viewport: &ViewportRenderer, act
                 Err(err) => app.set_status(format!("failed to export STL: {err}")),
             }
         }
+        FileAction::ExportWasm(id) => {
+            // Grab the bytes (stable Arc) up front so the borrow doesn't span
+            // the blocking dialog.
+            let Some(bytes) = app
+                .runtime_assets()
+                .iter()
+                .find(|asset| asset.id() == id)
+                .map(|asset| asset.data_arc())
+            else {
+                app.set_status(format!("no runtime asset {id} — run the project first"));
+                return;
+            };
+            let Some(path) = rfd::FileDialog::new()
+                .add_filter("WASM", &["wasm"])
+                .set_file_name(format!("{id}.wasm"))
+                .save_file()
+            else {
+                return;
+            };
+            match std::fs::write(&path, bytes.as_slice()) {
+                Ok(()) => app.set_status(format!("exported {}", path.display())),
+                Err(err) => app.set_status(format!("failed to export WASM: {err}")),
+            }
+        }
     }
 }
 

@@ -45,6 +45,7 @@ const OUTPUT_MODE_PREFIX: &str = "output:mode:";
 const OUTPUT_RESOLUTION_PREFIX: &str = "output:res:";
 const OUTPUT_DEFAULTS_PREFIX: &str = "output:defaults:";
 const EXPORT_STL_PREFIX: &str = "output:stl:";
+const EXPORT_WASM_PREFIX: &str = "output:wasm:";
 /// Draggable divider between the viewport and the project panel.
 const PANEL_RESIZE_KEY: &str = "panel:resize";
 const PANEL_WIDTH_DEFAULT: f32 = 320.0;
@@ -323,6 +324,8 @@ pub enum FileAction {
     SaveProject,
     /// Export the cached preview mesh of the named output as binary STL.
     ExportStl(String),
+    /// Export the named output's model WASM bytes verbatim.
+    ExportWasm(String),
 }
 
 /// Render settings for one output. Stored per asset id when the user
@@ -1508,6 +1511,9 @@ impl App for VolumetricUiV2 {
         } else if let Some(id) = route.strip_prefix(EXPORT_STL_PREFIX) {
             self.pending_file_action = Some(FileAction::ExportStl(id.to_string()));
             self.open_select = None;
+        } else if let Some(id) = route.strip_prefix(EXPORT_WASM_PREFIX) {
+            self.pending_file_action = Some(FileAction::ExportWasm(id.to_string()));
+            self.open_select = None;
         } else if let Some(field_name) = route.strip_prefix(CONFIG_BOOL_PREFIX) {
             self.toggle_config_bool(field_name);
         } else if let Some(rest) = route.strip_prefix(CONFIG_ENUM_PREFIX) {
@@ -1680,6 +1686,13 @@ fn output_settings_popover(app: &VolumetricUiV2, id: &str) -> El {
             .secondary()
             .width(Size::Fill(1.0))
             .key(format!("{EXPORT_STL_PREFIX}{id}")),
+    );
+    body.push(
+        button_with_icon("upload", "Export WASM…")
+            .xsmall()
+            .secondary()
+            .width(Size::Fill(1.0))
+            .key(format!("{EXPORT_WASM_PREFIX}{id}")),
     );
 
     popover(
@@ -3083,6 +3096,15 @@ mod tests {
             Some(FileAction::ExportStl(exports[0].clone()))
         );
         assert_eq!(app.open_select, None);
+
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{EXPORT_WASM_PREFIX}{}", exports[1])),
+        );
+        assert_eq!(
+            app.take_file_action(),
+            Some(FileAction::ExportWasm(exports[1].clone()))
+        );
     }
 
     #[test]
