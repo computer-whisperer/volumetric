@@ -38,7 +38,7 @@ const SELECT_STEP_PREFIX: &str = "project:select-step:";
 const DELETE_STEP_PREFIX: &str = "project:delete-step:";
 const MOVE_STEP_UP_PREFIX: &str = "project:move-step-up:";
 const MOVE_STEP_DOWN_PREFIX: &str = "project:move-step-down:";
-const SET_STEP_INPUT_PREFIX: &str = "project:set-step-input:";
+const SET_STEP_MODEL_PREFIX: &str = "project:set-step-model:";
 const SELECT_EXPORT_PREFIX: &str = "project:select-export:";
 const DELETE_EXPORT_PREFIX: &str = "project:delete-export:";
 const ADD_EXPORT_PREFIX: &str = "project:add-export:";
@@ -269,9 +269,17 @@ pub struct ProjectSummary {
 /// schema plus a raw text buffer per field. The buffer is the source of truth
 /// while typing; parseable values are committed into the step's CBOR blob.
 #[derive(Debug)]
-struct ConfigEditState {
+struct StepEditState {
     step_idx: usize,
-    config_input_idx: usize,
+    /// Input indices that are `ModelWASM` slots, in declaration order.
+    model_slots: Vec<usize>,
+    /// The config form, present only when the operator declares a config input.
+    config: Option<ConfigForm>,
+}
+
+#[derive(Debug)]
+struct ConfigForm {
+    input_idx: usize,
     fields: Vec<ConfigField>,
     buffers: std::collections::BTreeMap<String, String>,
 }
@@ -301,8 +309,8 @@ pub struct VolumetricUiV2 {
     viewport_texture: Option<AppTexture>,
     /// Global text selection/focus for controlled text inputs (config fields).
     selection: Selection,
-    /// Config editor state for the currently selected operator step, if any.
-    config_edit: Option<ConfigEditState>,
+    /// Editor state (model slots + config form) for the selected step, if any.
+    step_edit: Option<StepEditState>,
     status: String,
 }
 
@@ -343,7 +351,7 @@ impl VolumetricUiV2 {
             pending_camera_command: None,
             viewport_texture: None,
             selection: Selection::default(),
-            config_edit: None,
+            step_edit: None,
             status: "idle".to_string(),
         }
     }
@@ -528,41 +536,71 @@ impl VolumetricUiV2 {
         self.status = "run queued".to_string();
     }
 
-    /// Rebuilds the config editor when the selected step changes. While the same
-    /// step stays selected the existing buffers (in-progress edits) are kept.
-    fn sync_config_edit(&mut self) {
+    /// Rebuilds the step editor when the selected step changes. While the same
+    /// step stays selected the existing config buffers (in-progress edits) are
+    /// kept.
+    fn sync_step_edit(&mut self) {
         let step_idx = match self.selected_project_item {
             Some(ProjectSelection::Step(idx)) => Some(idx),
             _ => None,
         };
         let Some(step_idx) = step_idx else {
-            self.config_edit = None;
+            self.step_edit = None;
             return;
         };
-        if self.config_edit.as_ref().map(|edit| edit.step_idx) == Some(step_idx) {
+        if self.step_edit.as_ref().map(|edit| edit.step_idx) == Some(step_idx) {
             return;
         }
-        self.config_edit = self.build_config_edit(step_idx);
+        self.step_edit = self.build_step_edit(step_idx);
     }
 
-    fn build_config_edit(&self, step_idx: usize) -> Option<ConfigEditState> {
+    fn build_step_edit(&self, step_idx: usize) -> Option<StepEditState> {
         let step = self.project.timeline().get(step_idx)?;
         let op_bytes = self.operator_bytes(&step.operator_id)?;
         let metadata = volumetric::operator_metadata_from_wasm_bytes(&op_bytes).ok()?;
-        let (config_input_idx, cddl) =
-            metadata
-                .inputs
-                .iter()
-                .enumerate()
-                .find_map(|(idx, input)| match input {
-                    OperatorMetadataInput::CBORConfiguration(cddl) => Some((idx, cddl.clone())),
-                    _ => None,
-                })?;
-        let fields = operator_config::parse_schema(&cddl).ok()?;
+
+        let model_slots: Vec<usize> = metadata
+            .inputs
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, input)| {
+                matches!(input, OperatorMetadataInput::ModelWASM).then_some(idx)
+            })
+            .collect();
+
+        let config = metadata
+            .inputs
+            .iter()
+            .enumerate()
+            .find_map(|(idx, input)| match input {
+                OperatorMetadataInput::CBORConfiguration(cddl) => Some((idx, cddl.clone())),
+                _ => None,
+            })
+            .and_then(|(input_idx, cddl)| self.build_config_form(step, input_idx, &cddl));
+
+        // Nothing editable → no step editor.
+        if model_slots.is_empty() && config.is_none() {
+            return None;
+        }
+
+        Some(StepEditState {
+            step_idx,
+            model_slots,
+            config,
+        })
+    }
+
+    fn build_config_form(
+        &self,
+        step: &volumetric::ExecutionStep,
+        input_idx: usize,
+        cddl: &str,
+    ) -> Option<ConfigForm> {
+        let fields = operator_config::parse_schema(cddl).ok()?;
         if fields.is_empty() {
             return None;
         }
-        let current = match step.inputs.get(config_input_idx) {
+        let current = match step.inputs.get(input_idx) {
             Some(ExecutionInput::Inline(bytes)) => operator_config::decode(bytes),
             _ => std::collections::BTreeMap::new(),
         };
@@ -576,9 +614,8 @@ impl VolumetricUiV2 {
                 (field.name.clone(), value.to_display_string())
             })
             .collect();
-        Some(ConfigEditState {
-            step_idx,
-            config_input_idx,
+        Some(ConfigForm {
+            input_idx,
             fields,
             buffers,
         })
@@ -592,55 +629,121 @@ impl VolumetricUiV2 {
             .map(|import| import.data.clone())
     }
 
+    /// Retargets one model input slot of a step. Retargeting the primary (first)
+    /// model slot also renames the step's first output after the new input and
+    /// rewires exports, matching how a freshly added operator is named.
+    fn set_step_model_input(&mut self, step_idx: usize, input_idx: usize, asset_id: &str) {
+        let primary_slot = self
+            .step_edit
+            .as_ref()
+            .filter(|edit| edit.step_idx == step_idx)
+            .and_then(|edit| edit.model_slots.first().copied())
+            .unwrap_or(0);
+        let rename_output = input_idx == primary_slot;
+
+        let Some(step) = self.project.timeline().get(step_idx) else {
+            return;
+        };
+        if input_idx >= step.inputs.len() {
+            return;
+        }
+        let operator_id = step.operator_id.clone();
+        let old_outputs = step.outputs.clone();
+        let new_output = rename_output.then(|| {
+            self.project
+                .default_output_name(&operator_id, Some(asset_id))
+        });
+
+        if let Some(step) = self.project.timeline_mut().get_mut(step_idx) {
+            step.inputs[input_idx] = ExecutionInput::AssetRef(asset_id.to_string());
+            if let Some(new_output) = &new_output {
+                if step.outputs.is_empty() {
+                    step.outputs.push(new_output.clone());
+                } else {
+                    step.outputs[0] = new_output.clone();
+                }
+            }
+        }
+
+        if let Some(new_output) = new_output {
+            for old_output in old_outputs {
+                self.project.exports_mut().retain(|id| id != &old_output);
+            }
+            if !self.project.exports().iter().any(|id| id == &new_output) {
+                self.project.exports_mut().push(new_output.clone());
+            }
+            self.selected_export = Some(new_output);
+        }
+
+        self.mark_project_dirty();
+        self.selected_project_item = Some(ProjectSelection::Step(step_idx));
+        self.status = format!(
+            "step {} input {} -> {asset_id}",
+            step_idx + 1,
+            input_idx + 1
+        );
+    }
+
     /// Commits the field's current buffer into the step's CBOR blob, but only if
     /// it parses; an invalid intermediate (e.g. an empty number field) is left
     /// in the buffer untouched.
-    fn commit_config_buffer(&mut self, edit: &ConfigEditState, field_name: &str) {
-        let Some(field) = edit.fields.iter().find(|f| f.name == field_name) else {
+    fn commit_config_buffer(&mut self, step_idx: usize, config: &ConfigForm, field_name: &str) {
+        let Some(field) = config.fields.iter().find(|f| f.name == field_name) else {
             return;
         };
-        let Some(buffer) = edit.buffers.get(field_name) else {
+        let Some(buffer) = config.buffers.get(field_name) else {
             return;
         };
         let Some(value) = ConfigValue::parse(&field.ty, buffer) else {
             return;
         };
-        self.write_config_value(edit, field_name, value);
+        self.write_config_value(step_idx, config, field_name, value);
         self.mark_project_dirty();
     }
 
-    fn write_config_value(&mut self, edit: &ConfigEditState, field_name: &str, value: ConfigValue) {
-        let Some(step) = self.project.timeline_mut().get_mut(edit.step_idx) else {
+    fn write_config_value(
+        &mut self,
+        step_idx: usize,
+        config: &ConfigForm,
+        field_name: &str,
+        value: ConfigValue,
+    ) {
+        let Some(step) = self.project.timeline_mut().get_mut(step_idx) else {
             return;
         };
-        let mut values = match step.inputs.get(edit.config_input_idx) {
+        let mut values = match step.inputs.get(config.input_idx) {
             Some(ExecutionInput::Inline(bytes)) => operator_config::decode(bytes),
             _ => return,
         };
         values.insert(field_name.to_string(), value);
-        let encoded = operator_config::encode(&edit.fields, &values);
-        if let Some(ExecutionInput::Inline(slot)) = step.inputs.get_mut(edit.config_input_idx) {
+        let encoded = operator_config::encode(&config.fields, &values);
+        if let Some(ExecutionInput::Inline(slot)) = step.inputs.get_mut(config.input_idx) {
             *slot = encoded;
         }
     }
 
-    /// Sets a field's buffer to `text` (used by bool/enum controls) and commits.
+    /// Sets a config field's buffer to `text` (bool/enum controls) and commits.
     fn set_config_buffer(&mut self, field_name: &str, text: String) {
-        let Some(mut edit) = self.config_edit.take() else {
+        let Some(mut edit) = self.step_edit.take() else {
             return;
         };
-        if let Some(buffer) = edit.buffers.get_mut(field_name) {
-            *buffer = text;
+        if let Some(config) = edit.config.as_mut() {
+            if let Some(buffer) = config.buffers.get_mut(field_name) {
+                *buffer = text;
+            }
         }
-        self.commit_config_buffer(&edit, field_name);
-        self.config_edit = Some(edit);
+        if let Some(config) = edit.config.as_ref() {
+            self.commit_config_buffer(edit.step_idx, config, field_name);
+        }
+        self.step_edit = Some(edit);
     }
 
     fn toggle_config_bool(&mut self, field_name: &str) {
         let current = self
-            .config_edit
+            .step_edit
             .as_ref()
-            .and_then(|edit| edit.buffers.get(field_name))
+            .and_then(|edit| edit.config.as_ref())
+            .and_then(|config| config.buffers.get(field_name))
             .map(|buffer| buffer == "true")
             .unwrap_or(false);
         self.set_config_buffer(field_name, (!current).to_string());
@@ -809,44 +912,6 @@ impl VolumetricUiV2 {
         self.status = format!("moved step {} to {}", idx + 1, target_idx + 1);
     }
 
-    fn set_step_input(&mut self, idx: usize, asset_id: &str) {
-        let Some(step) = self.project.timeline().get(idx) else {
-            return;
-        };
-        let operator_id = step.operator_id.clone();
-        let old_outputs = step.outputs.clone();
-        let new_output = self
-            .project
-            .default_output_name(&operator_id, Some(asset_id));
-
-        if let Some(step) = self.project.timeline_mut().get_mut(idx) {
-            if step.inputs.is_empty() {
-                step.inputs
-                    .push(ExecutionInput::AssetRef(asset_id.to_string()));
-            } else {
-                step.inputs[0] = ExecutionInput::AssetRef(asset_id.to_string());
-            }
-
-            if step.outputs.is_empty() {
-                step.outputs.push(new_output.clone());
-            } else {
-                step.outputs[0] = new_output.clone();
-            }
-        }
-
-        for old_output in old_outputs {
-            self.project.exports_mut().retain(|id| id != &old_output);
-        }
-        if !self.project.exports().iter().any(|id| id == &new_output) {
-            self.project.exports_mut().push(new_output.clone());
-        }
-        self.mark_project_dirty();
-
-        self.selected_export = Some(new_output.clone());
-        self.selected_project_item = Some(ProjectSelection::Step(idx));
-        self.status = format!("step {} input -> {asset_id}", idx + 1);
-    }
-
     fn delete_export(&mut self, idx: usize) {
         if idx >= self.project.exports().len() {
             return;
@@ -914,7 +979,7 @@ impl App for VolumetricUiV2 {
     }
 
     fn before_build(&mut self) {
-        self.sync_config_edit();
+        self.sync_step_edit();
     }
 
     fn selection(&self) -> Selection {
@@ -929,19 +994,21 @@ impl App for VolumetricUiV2 {
             .and_then(|key| key.strip_prefix(CONFIG_FIELD_PREFIX))
             .map(str::to_string)
         {
-            if let Some(mut edit) = self.config_edit.take() {
+            if let Some(mut edit) = self.step_edit.take() {
                 let key = format!("{CONFIG_FIELD_PREFIX}{field_name}");
-                let changed = edit
-                    .buffers
-                    .get_mut(&field_name)
-                    .map(|buffer| {
-                        text_input::apply_event(buffer, &mut self.selection, &event, &key)
-                    })
-                    .unwrap_or(false);
-                if changed {
-                    self.commit_config_buffer(&edit, &field_name);
+                let mut changed = false;
+                if let Some(config) = edit.config.as_mut() {
+                    if let Some(buffer) = config.buffers.get_mut(&field_name) {
+                        changed =
+                            text_input::apply_event(buffer, &mut self.selection, &event, &key);
+                    }
                 }
-                self.config_edit = Some(edit);
+                if changed {
+                    if let Some(config) = edit.config.as_ref() {
+                        self.commit_config_buffer(edit.step_idx, config, &field_name);
+                    }
+                }
+                self.step_edit = Some(edit);
                 return;
             }
         }
@@ -1052,8 +1119,10 @@ impl App for VolumetricUiV2 {
             self.move_step(idx, -1);
         } else if let Some(idx) = parse_index_route(route, MOVE_STEP_DOWN_PREFIX) {
             self.move_step(idx, 1);
-        } else if let Some((idx, asset_id)) = parse_step_asset_route(route, SET_STEP_INPUT_PREFIX) {
-            self.set_step_input(idx, asset_id);
+        } else if let Some((step_idx, input_idx, asset_id)) =
+            parse_step_model_route(route, SET_STEP_MODEL_PREFIX)
+        {
+            self.set_step_model_input(step_idx, input_idx, asset_id);
         } else if let Some(idx) = parse_index_route(route, SELECT_EXPORT_PREFIX) {
             if let Some(export_id) = self.project.exports().get(idx) {
                 self.selected_export = Some(export_id.clone());
@@ -1558,11 +1627,10 @@ fn step_detail_rows(app: &VolumetricUiV2, idx: usize) -> Vec<El> {
     let mut rows = vec![
         detail_row("Step", &(idx + 1).to_string()),
         detail_row("Operator", &step.operator_id),
-        detail_row("Inputs", &step.inputs.len().to_string()),
         detail_row("Outputs", &step.outputs.len().to_string()),
     ];
 
-    rows.extend(config_form_rows(app, idx));
+    rows.extend(step_edit_rows(app, idx));
 
     rows.push(
         toolbar([
@@ -1586,40 +1654,78 @@ fn step_detail_rows(app: &VolumetricUiV2, idx: usize) -> Vec<El> {
             .key(format!("{DELETE_STEP_PREFIX}{idx}")),
     );
 
-    rows.push(text("Set first input").muted().small());
-    for asset_id in editable_model_asset_ids(app) {
-        rows.push(
-            button_with_icon("git-branch", asset_id.clone())
-                .secondary()
-                .xsmall()
-                .width(Size::Fill(1.0))
-                .key(format!("{SET_STEP_INPUT_PREFIX}{idx}:{asset_id}")),
-        );
-    }
-
     rows
 }
 
-/// Renders the operator config form for the selected step, if it has a config
-/// schema. Field values are edited in place and committed into the step's CBOR.
-fn config_form_rows(app: &VolumetricUiV2, step_idx: usize) -> Vec<El> {
-    let Some(edit) = &app.config_edit else {
+/// Renders the editor for the selected step: a per-slot model selector for each
+/// `ModelWASM` input, then the config form (if the operator declares config).
+fn step_edit_rows(app: &VolumetricUiV2, step_idx: usize) -> Vec<El> {
+    let Some(edit) = &app.step_edit else {
         return Vec::new();
     };
     if edit.step_idx != step_idx {
         return Vec::new();
     }
+    let Some(step) = app.project.timeline().get(step_idx) else {
+        return Vec::new();
+    };
 
-    let mut rows = vec![text("Config").muted().caption().semibold()];
-    for field in &edit.fields {
-        let buffer = edit
-            .buffers
-            .get(&field.name)
-            .map(String::as_str)
-            .unwrap_or("");
-        rows.push(config_field_row(field, buffer, &app.selection));
+    let mut rows = Vec::new();
+
+    if !edit.model_slots.is_empty() {
+        let models = editable_model_asset_ids(app);
+        rows.push(text("Inputs").muted().caption().semibold());
+        for (n, &slot) in edit.model_slots.iter().enumerate() {
+            let current = match step.inputs.get(slot) {
+                Some(ExecutionInput::AssetRef(id)) => id.as_str(),
+                _ => "",
+            };
+            rows.push(model_slot_selector(step_idx, slot, n, current, &models));
+        }
     }
+
+    if let Some(config) = &edit.config {
+        rows.push(text("Config").muted().caption().semibold());
+        for field in &config.fields {
+            let buffer = config
+                .buffers
+                .get(&field.name)
+                .map(String::as_str)
+                .unwrap_or("");
+            rows.push(config_field_row(field, buffer, &app.selection));
+        }
+    }
+
     rows
+}
+
+/// A model input slot: a labelled column of full-width buttons, one per
+/// available model, with the current target highlighted.
+fn model_slot_selector(
+    step_idx: usize,
+    slot: usize,
+    ordinal: usize,
+    current: &str,
+    models: &[String],
+) -> El {
+    let mut items = vec![
+        text(format!("Input {}", ordinal + 1))
+            .muted()
+            .caption()
+            .width(Size::Fill(1.0)),
+    ];
+    for id in models {
+        let button = button_with_icon("git-branch", id.clone())
+            .xsmall()
+            .width(Size::Fill(1.0))
+            .key(format!("{SET_STEP_MODEL_PREFIX}{step_idx}:{slot}:{id}"));
+        items.push(if id == current {
+            button.primary()
+        } else {
+            button.secondary()
+        });
+    }
+    column(items).gap(tokens::SPACE_1).width(Size::Fill(1.0))
 }
 
 fn config_field_row(field: &ConfigField, buffer: &str, selection: &Selection) -> El {
@@ -1946,10 +2052,12 @@ fn parse_index_route(route: &str, prefix: &str) -> Option<usize> {
     route.strip_prefix(prefix)?.parse().ok()
 }
 
-fn parse_step_asset_route<'a>(route: &'a str, prefix: &str) -> Option<(usize, &'a str)> {
+/// Parses a `{prefix}{step}:{input}:{asset_id}` route.
+fn parse_step_model_route<'a>(route: &'a str, prefix: &str) -> Option<(usize, usize, &'a str)> {
     let rest = route.strip_prefix(prefix)?;
-    let (idx, asset_id) = rest.split_once(':')?;
-    Some((idx.parse().ok()?, asset_id))
+    let (step_idx, rest) = rest.split_once(':')?;
+    let (input_idx, asset_id) = rest.split_once(':')?;
+    Some((step_idx.parse().ok()?, input_idx.parse().ok()?, asset_id))
 }
 
 fn asn2_resolution_split(target_resolution: usize) -> (usize, usize) {
@@ -2163,33 +2271,6 @@ mod tests {
                 .iter()
                 .any(|(id, _)| id == "simple_sphere_model")
         );
-    }
-
-    #[test]
-    fn step_input_can_be_retargeted_to_another_model() {
-        let mut app = VolumetricUiV2::default();
-        dispatch(
-            &mut app,
-            UiEvent::synthetic_click("model:simple_torus_model"),
-        );
-        dispatch(&mut app, UiEvent::synthetic_click(ADD_MODEL_KEY));
-        dispatch(&mut app, UiEvent::synthetic_click(ADD_OPERATOR_KEY));
-        dispatch(
-            &mut app,
-            UiEvent::synthetic_click("project:set-step-input:0:simple_sphere_model"),
-        );
-
-        let step = &app.project().timeline()[0];
-        assert!(matches!(
-            &step.inputs[0],
-            ExecutionInput::AssetRef(id) if id == "simple_sphere_model"
-        ));
-        assert!(
-            step.outputs[0].starts_with("simple_sphere_model_"),
-            "{:?}",
-            step.outputs
-        );
-        assert!(app.project().exports().contains(&step.outputs[0]));
     }
 
     #[test]
@@ -2421,19 +2502,22 @@ mod tests {
             dispatch(&mut app, UiEvent::synthetic_click(ADD_OPERATOR_KEY));
             app.before_build();
 
-            let Some(edit) = app.config_edit.as_ref() else {
+            let Some(edit) = app.step_edit.as_ref() else {
+                continue;
+            };
+            let Some(config) = edit.config.as_ref() else {
                 continue;
             };
             let step_idx = edit.step_idx;
-            let config_input_idx = edit.config_input_idx;
-            let Some(field) = edit.fields.first().cloned() else {
+            let config_input_idx = config.input_idx;
+            let Some(field) = config.fields.first().cloned() else {
                 continue;
             };
             let field_name = field.name.clone();
 
             let expected = match &field.ty {
                 ConfigFieldType::Bool => {
-                    let before = edit.buffers[&field_name] == "true";
+                    let before = config.buffers[&field_name] == "true";
                     app.toggle_config_bool(&field_name);
                     ConfigValue::Bool(!before)
                 }
@@ -2477,17 +2561,48 @@ mod tests {
     }
 
     #[test]
-    fn selecting_a_non_step_clears_the_config_editor() {
+    fn selecting_a_non_step_clears_the_step_editor() {
         let mut app = VolumetricUiV2::default();
         dispatch(&mut app, UiEvent::synthetic_click(ADD_OPERATOR_KEY));
         app.before_build();
 
-        // Select an import (not a step); the config editor should clear.
+        // Select an import (not a step); the step editor should clear.
         dispatch(
             &mut app,
             UiEvent::synthetic_click(format!("{SELECT_IMPORT_PREFIX}0")),
         );
         app.before_build();
-        assert!(app.config_edit.is_none());
+        assert!(app.step_edit.is_none());
+    }
+
+    #[test]
+    fn model_slot_can_be_retargeted_per_slot() {
+        // Add a second model, then an operator, then retarget the operator's
+        // first model slot (input 0) to the sphere via the per-slot route.
+        let mut app = VolumetricUiV2::default();
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click("model:simple_torus_model"),
+        );
+        dispatch(&mut app, UiEvent::synthetic_click(ADD_MODEL_KEY));
+        dispatch(&mut app, UiEvent::synthetic_click(ADD_OPERATOR_KEY));
+        app.before_build();
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click("project:set-step-model:0:0:simple_sphere_model"),
+        );
+
+        let step = &app.project().timeline()[0];
+        assert!(matches!(
+            &step.inputs[0],
+            ExecutionInput::AssetRef(id) if id == "simple_sphere_model"
+        ));
+        // Retargeting the primary slot renames the first output after the input.
+        assert!(
+            step.outputs[0].starts_with("simple_sphere_model_"),
+            "{:?}",
+            step.outputs
+        );
+        assert!(app.project().exports().contains(&step.outputs[0]));
     }
 }
