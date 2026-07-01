@@ -811,7 +811,7 @@ fn left_sidebar(app: &VolumetricUiV2) -> El {
                     .semibold()
                     .ellipsis()
                     .key("brand-title"),
-                text("Aetna UI v2").caption().muted().ellipsis(),
+                text("Damascene UI v2").caption().muted().ellipsis(),
             ])
             .gap(1.0)
             .width(Size::Fill(1.0)),
@@ -885,7 +885,7 @@ fn viewport_workspace(app: &VolumetricUiV2) -> El {
             .gap(tokens::SPACE_1)
             .width(Size::Fill(1.0)),
             preview_status_chip(app),
-            badge("Aetna").secondary().xsmall(),
+            badge("Damascene").secondary().xsmall(),
             badge("wgpu 29").secondary().xsmall(),
         ]),
         viewport_controls(app),

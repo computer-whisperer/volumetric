@@ -1,27 +1,27 @@
-# Volumetric UI v2: Aetna Port Plan
+# Volumetric UI v2: Damascene Port Plan
 
 ## Goal
 
-Port `volumetric_ui` from the current `eframe`/`egui` shell to an Aetna-based UI,
+Port `volumetric_ui` from the current `eframe`/`egui` shell to a Damascene-based UI,
 while preserving the existing volumetric engine, project system, operators, WASM
 asset bundling, background meshing, and custom 3D renderer.
 
 This should be treated as a v2 UI effort, not an in-place rewrite of the current
-UI. The existing egui UI remains the usable baseline until the Aetna version can
+UI. The existing egui UI remains the usable baseline until the Damascene version can
 load projects, render model exports, and perform the main editing/export flows.
 
-## Why Aetna
+## Why Damascene
 
-Aetna is a better fit for the next UI because it provides:
+Damascene is a better fit for the next UI because it provides:
 
 - a more application-shaped widget vocabulary than egui;
 - controlled widgets and app-owned state, which matches Volumetric's project model;
 - keyed layout rects, which let the app reserve a viewport region for custom rendering;
-- direct `wgpu` integration without requiring Aetna to own the whole render graph;
+- direct `wgpu` integration without requiring Damascene to own the whole render graph;
 - headless layout/artifact dumps that should make UI iteration easier once the port is
   structured.
 
-The key architectural fit is host-composed rendering: Aetna paints the app chrome,
+The key architectural fit is host-composed rendering: Damascene paints the app chrome,
 and Volumetric paints the 3D viewport into a keyed rect in the same frame.
 
 ## Current Baseline
@@ -41,17 +41,17 @@ The current `volumetric_ui` combines several responsibilities in one large
 The custom renderer itself is already usefully separated under
 `crates/volumetric_ui/src/renderer/`. It is tied to the egui callback path only
 through `renderer/callback.rs`; the core renderer types and render passes should be
-portable to a custom Aetna host.
+portable to a custom Damascene host.
 
 ## First Milestone: Dependency Modernization
 
-Before starting the Aetna port, update Volumetric's dependency stack across the
+Before starting the Damascene port, update Volumetric's dependency stack across the
 workspace. This is useful regardless of the port and reduces the risk of fighting
 two migrations at once.
 
 Priority updates:
 
-- align UI-side `wgpu` with Aetna's current `wgpu` version;
+- align UI-side `wgpu` with Damascene's current `wgpu` version;
 - review whether the CLI renderer should remain on its own `wgpu` version or move
   at the same time;
 - update `wasmtime`, `wasmparser`, `wasm-encoder`, `walrus`, `eframe`, `rfd`, and
@@ -60,7 +60,7 @@ Priority updates:
 - keep `cargo build-wasm`, `cargo check --workspace`, and `cargo test --workspace`
   green after each dependency slice.
 
-The likely hard requirement for the Aetna UI is that the v2 renderer and Aetna use
+The likely hard requirement for the Damascene UI is that the v2 renderer and Damascene use
 the same `wgpu` crate version, because they must share a device, queue, texture
 views, command encoder, and render target.
 
@@ -75,24 +75,24 @@ Recommended shape:
   - a new crate, `crates/volumetric_ui_v2`, or
   - a new binary/module path inside `crates/volumetric_ui`.
 - Extract reusable app/domain state out of egui-specific code before rebuilding
-  controls in Aetna.
+  controls in Damascene.
 
 The v2 host should own:
 
 - `winit` event loop;
 - `wgpu` instance, adapter, device, queue, surface, and surface configuration;
-- one `aetna_wgpu::Runner`;
+- one `damascene_wgpu::Runner`;
 - one Volumetric 3D renderer instance;
-- frame ordering between Volumetric viewport rendering and Aetna UI rendering.
+- frame ordering between Volumetric viewport rendering and Damascene UI rendering.
 
 Frame sketch:
 
 1. Poll background work and app state.
-2. Build the Aetna `El` tree.
-3. Call `aetna_runner.prepare(...)`.
-4. Query `aetna_runner.rect_of_key("viewport")`.
+2. Build the Damascene `El` tree.
+3. Call `damascene_runner.prepare(...)`.
+4. Query `damascene_runner.rect_of_key("viewport")`.
 5. Render the Volumetric 3D scene into the app-owned viewport texture.
-6. Let Aetna composite that texture through the keyed `surface()` element.
+6. Let Damascene composite that texture through the keyed `surface()` element.
 7. Submit and present.
 
 ## Viewport Strategy
@@ -101,17 +101,17 @@ The central risk is the 3D viewport.
 
 Start with the simplest robust path:
 
-- reserve a keyed Aetna element for the viewport;
+- reserve a keyed Damascene element for the viewport;
 - render the Volumetric scene to an offscreen texture sized to the viewport rect;
-- expose that texture to Aetna as an app-owned `surface()` with opaque alpha;
-- let normal Aetna z-order, clipping, hit-testing, and overlays handle composition.
+- expose that texture to Damascene as an app-owned `surface()` with opaque alpha;
+- let normal Damascene z-order, clipping, hit-testing, and overlays handle composition.
 
 This keeps the existing renderer's viewport-sized G-buffer, SSAO, grid, line, and
 point passes intact. A later optimization can render directly into a scissored
 surface region if the offscreen path becomes a performance issue.
 
 Camera input should be handled by the custom host or app event layer, not hidden in
-the Aetna widget tree. Pointer events over the viewport rect should update the
+the Damascene widget tree. Pointer events over the viewport rect should update the
 existing orbit/pan/zoom camera state.
 
 ## UI Shell Sketch
@@ -135,7 +135,7 @@ Use an application workbench layout:
   - profiling stats;
   - export STL/WASM actions.
 
-Aetna widgets that should map well:
+Damascene widgets that should map well:
 
 - `sidebar`, `toolbar`, `card`, `tabs_list`, `field_row`, `form_item`;
 - `select`, `switch`, `checkbox`, `slider`, `text_input`, `text_area`;
@@ -148,19 +148,19 @@ Aetna widgets that should map well:
 
 - Slice 0 is complete: the workspace is dependency-modernized and CI covers
   rustfmt, clippy, tests, and WASM asset builds.
-- Slice 1 has started with `crates/volumetric_ui_v2`, a native Aetna shell that
-  opens via `aetna_winit_wgpu::run`, reserves a keyed `viewport` region, and can
-  dump Aetna bundle artifacts through `dump_v2_shell`.
+- Slice 1 has started with `crates/volumetric_ui_v2`, a native Damascene shell that
+  opens via `damascene_winit_wgpu::run`, reserves a keyed `viewport` region, and can
+  dump Damascene bundle artifacts through `dump_v2_shell`.
 - The v2 shell now owns real app state: it initializes a `Project` with a bundled
   model, renders bundled model/operator catalogs from `volumetric_assets`, routes
-  Aetna click/activation events, and exposes a project summary for the future
+  Damascene click/activation events, and exposes a project summary for the future
   renderer host.
 - Project details are now represented in v2 with imports, operation timeline,
   and exports lists plus initial select, delete, move, and add-export actions.
   This is the starting point for rebuilding the old project sequence editor;
   selected operation steps can also retarget their first input and update output
   export wiring.
-- The v2 shell has been reworked toward Aetna's stock app vocabulary: sidebar
+- The v2 shell has been reworked toward Damascene's stock app vocabulary: sidebar
   groups and menu buttons, toolbar headers/actions, card anatomy, table rows,
   field rows, icon buttons, and tooltips now carry the main layout instead of
   hand-rolled panel and row styling.
@@ -175,9 +175,9 @@ Aetna widgets that should map well:
   WASM bytes, render mode, mesh plan, grid/SSAO flags, and stale state are
   packaged from app state instead of being inferred from scattered UI controls.
 - The native v2 binary now uses a custom winit/wgpu host built on
-  `aetna_wgpu::Runner`: it prepares Aetna layout, resolves `VIEWPORT_KEY`, renders
+  `damascene_wgpu::Runner`: it prepares Damascene layout, resolves `VIEWPORT_KEY`, renders
   `volumetric_renderer::Renderer` into a viewport-sized app-owned texture, and
-  exposes that texture as a keyed Aetna `surface()` element for composition.
+  exposes that texture as a keyed Damascene `surface()` element for composition.
 - The old egui renderer module has been extracted into `crates/volumetric_renderer`.
   Core renderer types/pipelines are usable without egui, while the previous egui
   paint callback remains behind an `egui-callback` feature for `volumetric_ui`.
@@ -185,8 +185,9 @@ Aetna widgets that should map well:
   point cloud, marching-cubes, or Adaptive Surface Nets v2 mesh generation. When
   no runtime preview is available it falls back to the renderer test scene, so
   the viewport remains structurally representative.
-- CI now checks out Aetna alongside Volumetric so the v2 crate's path
-  dependencies resolve in GitHub Actions.
+- The v2 crate now depends on the published `damascene-{core,wgpu,winit-wgpu}`
+  crates from crates.io, so CI no longer needs a sibling checkout of the
+  Damascene repo.
 
 ### Slice 0: Dependency Update
 
@@ -200,15 +201,15 @@ Acceptance:
 - `cargo test --workspace` passes;
 - current egui UI still launches.
 
-### Slice 1: Aetna Host Prototype
+### Slice 1: Damascene Host Prototype
 
-Create a minimal v2 app that opens a window and renders Aetna chrome.
+Create a minimal v2 app that opens a window and renders Damascene chrome.
 
 Acceptance:
 
 - window opens;
 - basic sidebar + viewport placeholder layout renders;
-- Aetna artifact dump exists for the shell.
+- Damascene artifact dump exists for the shell.
 
 ### Slice 2: Renderer Integration
 
@@ -217,7 +218,7 @@ test mesh in the keyed viewport.
 
 Acceptance:
 
-- viewport rect is resolved from Aetna layout;
+- viewport rect is resolved from Damascene layout;
 - renderer draws into that rect at correct scale;
 - resizing keeps the viewport non-distorted;
 - no egui callback dependency remains in the v2 path.
@@ -235,7 +236,7 @@ Acceptance:
 
 ### Slice 4: Project and Operator Flows
 
-Rebuild the existing project workflows using Aetna.
+Rebuild the existing project workflows using Damascene.
 
 Acceptance:
 
@@ -273,6 +274,6 @@ Acceptance:
 
 - Do not resume the sharp-edge research as part of the UI port.
 - Do not rewrite the volumetric engine or project DAG.
-- Do not replace the custom 3D renderer with Aetna primitives.
-- Do not chase full egui feature parity before proving the Aetna host and viewport.
+- Do not replace the custom 3D renderer with Damascene primitives.
+- Do not chase full egui feature parity before proving the Damascene host and viewport.
 - Do not remove the current egui UI until v2 is clearly usable.
