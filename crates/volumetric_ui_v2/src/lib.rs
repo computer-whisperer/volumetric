@@ -36,6 +36,12 @@ const PIPELINE_KEY: &str = "pipeline";
 const MODE_SELECT_KEY: &str = "view:mode";
 const RESOLUTION_SELECT_KEY: &str = "view:res";
 const CAMERA_SELECT_KEY: &str = "view:camera";
+/// Per-output render settings: `output:settings:{id}` opens the popover
+/// (plus `:dismiss`); mode/res routes end `:{value}` after the asset id.
+const OUTPUT_SETTINGS_PREFIX: &str = "output:settings:";
+const OUTPUT_MODE_PREFIX: &str = "output:mode:";
+const OUTPUT_RESOLUTION_PREFIX: &str = "output:res:";
+const OUTPUT_DEFAULTS_PREFIX: &str = "output:defaults:";
 const SELECT_IMPORT_PREFIX: &str = "project:select-import:";
 const DELETE_IMPORT_PREFIX: &str = "project:delete-import:";
 const SELECT_STEP_PREFIX: &str = "project:select-step:";
@@ -300,6 +306,14 @@ struct LuaForm {
     source: String,
 }
 
+/// Render settings for one output. Stored per asset id when the user
+/// overrides the viewport defaults for that output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OutputRender {
+    pub mode: PreviewRenderMode,
+    pub resolution: usize,
+}
+
 #[derive(Debug)]
 pub struct VolumetricUiV2 {
     project: Project,
@@ -308,6 +322,9 @@ pub struct VolumetricUiV2 {
     /// Outputs pinned to stay in the viewport regardless of the current
     /// selection. The rendered scene is the selected node's output plus these.
     pinned_outputs: std::collections::BTreeSet<String>,
+    /// Per-output render settings; outputs without an entry follow the global
+    /// `render_mode`/`preview_resolution` defaults.
+    output_overrides: std::collections::BTreeMap<String, OutputRender>,
     render_mode: PreviewRenderMode,
     preview_resolution: usize,
     camera_control_scheme: CameraControlScheme,
@@ -356,6 +373,7 @@ impl VolumetricUiV2 {
             selected_export: None,
             selected_project_item: None,
             pinned_outputs: std::collections::BTreeSet::new(),
+            output_overrides: std::collections::BTreeMap::new(),
             render_mode: PreviewRenderMode::AdaptiveSurfaceNets2,
             preview_resolution: 64,
             camera_control_scheme: CameraControlScheme::default(),
@@ -464,6 +482,37 @@ impl VolumetricUiV2 {
             || (self.selection_is_renderable() && self.selected_render_id() == Some(id))
     }
 
+    /// Effective render settings for an output: its override if present,
+    /// otherwise the viewport defaults.
+    fn output_render(&self, id: &str) -> OutputRender {
+        self.output_overrides
+            .get(id)
+            .copied()
+            .unwrap_or(OutputRender {
+                mode: self.render_mode,
+                resolution: self.preview_resolution,
+            })
+    }
+
+    fn set_output_mode(&mut self, id: &str, mode: PreviewRenderMode) {
+        let mut render = self.output_render(id);
+        render.mode = mode;
+        self.output_overrides.insert(id.to_string(), render);
+        self.status = format!("{id}: {}", mode.full_label());
+    }
+
+    fn set_output_resolution(&mut self, id: &str, resolution: usize) {
+        let mut render = self.output_render(id);
+        render.resolution = resolution;
+        self.output_overrides.insert(id.to_string(), render);
+        self.status = format!("{id}: {resolution}^3");
+    }
+
+    fn clear_output_override(&mut self, id: &str) {
+        self.output_overrides.remove(id);
+        self.status = format!("{id}: viewport defaults");
+    }
+
     /// Builds a render request for a single runtime asset, or `None` when it is
     /// not a renderable model.
     fn render_request_for_asset(&self, asset: &LoadedAsset) -> Option<PreviewRequest> {
@@ -471,13 +520,14 @@ impl VolumetricUiV2 {
             return None;
         }
 
+        let render = self.output_render(asset.id());
         Some(PreviewRequest {
             asset_id: asset.id().to_string(),
             wasm_bytes: asset.data_arc(),
             type_hint: asset.type_hint(),
             precursor_ids: asset.precursor_ids().to_vec(),
-            render_mode: self.render_mode,
-            mesh_plan: PreviewMeshPlan::for_mode(self.render_mode, self.preview_resolution),
+            render_mode: render.mode,
+            mesh_plan: PreviewMeshPlan::for_mode(render.mode, render.resolution),
             show_grid: self.show_grid,
             ssao: self.ssao,
             stale: self.last_run_stale,
@@ -548,13 +598,15 @@ impl VolumetricUiV2 {
                 self.last_run_stale = false;
                 self.runtime_assets = assets;
 
-                // Drop pins for outputs this run no longer produces.
+                // Drop pins and render overrides for outputs this run no
+                // longer produces.
                 let live: std::collections::BTreeSet<String> = self
                     .runtime_assets
                     .iter()
                     .map(|asset| asset.id().to_string())
                     .collect();
                 self.pinned_outputs.retain(|id| live.contains(id));
+                self.output_overrides.retain(|id, _| live.contains(id));
 
                 // Make sure the viewport shows something: if the selection points
                 // at nothing materialized, follow the primary export.
@@ -621,6 +673,7 @@ impl VolumetricUiV2 {
     fn clear_runtime_assets(&mut self) {
         self.runtime_assets.clear();
         self.pinned_outputs.clear();
+        self.output_overrides.clear();
         self.last_run_elapsed_ms = None;
         self.last_run_error = None;
         self.last_run_stale = false;
@@ -1337,6 +1390,32 @@ impl App for VolumetricUiV2 {
             self.status = format!("selected runtime asset {asset_id}");
         } else if let Some(asset_id) = route.strip_prefix(TOGGLE_PIN_PREFIX) {
             self.toggle_pin(asset_id);
+        } else if let Some(rest) = route.strip_prefix(OUTPUT_SETTINGS_PREFIX) {
+            // Per-output settings popover: trigger toggles, scrim dismisses.
+            if rest.ends_with(":dismiss") {
+                self.open_select = None;
+            } else {
+                self.open_select = if self.open_select.as_deref() == Some(route) {
+                    None
+                } else {
+                    Some(route.to_string())
+                };
+                self.open_menu = None;
+            }
+        } else if let Some(rest) = route.strip_prefix(OUTPUT_MODE_PREFIX) {
+            if let Some((id, mode_name)) = rest.rsplit_once(':')
+                && let Some(mode) = PreviewRenderMode::from_route_name(mode_name)
+            {
+                self.set_output_mode(id, mode);
+            }
+        } else if let Some(rest) = route.strip_prefix(OUTPUT_RESOLUTION_PREFIX) {
+            if let Some((id, res)) = rest.rsplit_once(':')
+                && let Ok(resolution) = res.parse()
+            {
+                self.set_output_resolution(id, resolution);
+            }
+        } else if let Some(id) = route.strip_prefix(OUTPUT_DEFAULTS_PREFIX) {
+            self.clear_output_override(id);
         } else if let Some(field_name) = route.strip_prefix(CONFIG_BOOL_PREFIX) {
             self.toggle_config_bool(field_name);
         } else if let Some(rest) = route.strip_prefix(CONFIG_ENUM_PREFIX) {
@@ -1413,8 +1492,12 @@ fn add_menu_items() -> Vec<El> {
     items
 }
 
-/// The open viewport picker menu, rendered as a root overlay layer.
+/// The open viewport picker menu (or per-output settings popover), rendered
+/// as a root overlay layer.
 fn select_layer(app: &VolumetricUiV2) -> Option<El> {
+    if let Some(id) = app.open_select.as_deref()?.strip_prefix(OUTPUT_SETTINGS_PREFIX) {
+        return Some(output_settings_popover(app, id));
+    }
     match app.open_select.as_deref()? {
         MODE_SELECT_KEY => Some(select_menu(
             MODE_SELECT_KEY,
@@ -1437,6 +1520,62 @@ fn select_layer(app: &VolumetricUiV2) -> Option<El> {
         )),
         _ => None,
     }
+}
+
+/// Anchored settings popover for one output: render mode + resolution, and a
+/// reset to the viewport defaults when overridden. Picks keep the popover
+/// open (it's a settings panel, not a value picker); outside click dismisses.
+fn output_settings_popover(app: &VolumetricUiV2, id: &str) -> El {
+    let render = app.output_render(id);
+    let trigger_key = format!("{OUTPUT_SETTINGS_PREFIX}{id}");
+
+    let mode_buttons = row(PreviewRenderMode::ALL.into_iter().map(|mode| {
+        let button = button(mode.label())
+            .xsmall()
+            .tooltip(mode.full_label())
+            .key(format!("{OUTPUT_MODE_PREFIX}{id}:{}", mode.route_name()));
+        if render.mode == mode {
+            button.primary()
+        } else {
+            button.secondary()
+        }
+    }))
+    .gap(tokens::SPACE_1);
+    let resolution_buttons = row(PREVIEW_RESOLUTIONS.into_iter().map(|resolution| {
+        let button = button(format!("{resolution}^3"))
+            .xsmall()
+            .key(format!("{OUTPUT_RESOLUTION_PREFIX}{id}:{resolution}"));
+        if render.resolution == resolution {
+            button.primary()
+        } else {
+            button.secondary()
+        }
+    }))
+    .gap(tokens::SPACE_1);
+
+    let mut body = vec![
+        text(id).label().semibold().ellipsis(),
+        text("Render Mode").caption().muted(),
+        mode_buttons,
+        text("Resolution").caption().muted(),
+        resolution_buttons,
+    ];
+    if app.output_overrides.contains_key(id) {
+        body.push(divider());
+        body.push(
+            button("Use viewport defaults")
+                .xsmall()
+                .secondary()
+                .width(Size::Fill(1.0))
+                .key(format!("{OUTPUT_DEFAULTS_PREFIX}{id}")),
+        );
+    }
+
+    popover(
+        trigger_key.clone(),
+        Anchor::below_key(trigger_key),
+        column(body).gap(tokens::SPACE_2).padding(tokens::SPACE_2),
+    )
 }
 
 /// The viewport plus its floating chrome: view controls in the top-right
@@ -1726,12 +1865,28 @@ fn runtime_asset_row(app: &VolumetricUiV2, asset: &LoadedAsset) -> El {
     let id = asset.id();
     let pinned = app.pinned_outputs.contains(id);
     let visible = app.output_is_visible(id);
+    let render = app.output_render(id);
+    let overridden = app.output_overrides.contains_key(id);
 
     let pin = icon_button("pin")
         .xsmall()
         .tooltip(if pinned { "Unpin" } else { "Pin to viewport" })
         .key(format!("{TOGGLE_PIN_PREFIX}{id}"));
     let pin = if pinned { pin.primary() } else { pin.ghost() };
+
+    let settings = icon_button("settings")
+        .xsmall()
+        .tooltip(if overridden {
+            "Render settings (overriding defaults)"
+        } else {
+            "Render settings"
+        })
+        .key(format!("{OUTPUT_SETTINGS_PREFIX}{id}"));
+    let settings = if overridden {
+        settings.primary()
+    } else {
+        settings.ghost()
+    };
 
     table_row([
         // Dot marks outputs currently drawn in the viewport.
@@ -1740,11 +1895,17 @@ fn runtime_asset_row(app: &VolumetricUiV2, asset: &LoadedAsset) -> El {
             .muted()
             .width(Size::Fixed(12.0)),
         column([
-            text(asset_type_label(asset.type_hint()))
-                .caption()
-                .muted()
-                .ellipsis()
-                .width(Size::Fill(1.0)),
+            text(format!(
+                "{} · {} · {}^3{}",
+                asset_type_label(asset.type_hint()),
+                render.mode.label(),
+                render.resolution,
+                if overridden { " *" } else { "" },
+            ))
+            .caption()
+            .muted()
+            .ellipsis()
+            .width(Size::Fill(1.0)),
             text(id).label().ellipsis().width(Size::Fill(1.0)),
         ])
         .gap(1.0)
@@ -1760,6 +1921,7 @@ fn runtime_asset_row(app: &VolumetricUiV2, asset: &LoadedAsset) -> El {
             .xsmall()
             .tooltip("View")
             .key(format!("{SELECT_RUNTIME_ASSET_PREFIX}{id}")),
+        settings,
     ])
     .height(Size::Fixed(36.0))
     .padding(Sides::xy(tokens::SPACE_2, 0.0))
@@ -2672,6 +2834,111 @@ mod tests {
             requests.iter().any(|r| r.asset_id == exports[0] && r.stale),
             "pinned output stays on screen, stale"
         );
+    }
+
+    #[test]
+    fn per_output_override_changes_only_that_output() {
+        let (mut app, exports) = two_export_app();
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{TOGGLE_PIN_PREFIX}{}", exports[0])),
+        );
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{TOGGLE_PIN_PREFIX}{}", exports[1])),
+        );
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{OUTPUT_MODE_PREFIX}{}:points", exports[0])),
+        );
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{OUTPUT_RESOLUTION_PREFIX}{}:24", exports[0])),
+        );
+
+        let requests = app.preview_requests();
+        let overridden = requests
+            .iter()
+            .find(|r| r.asset_id == exports[0])
+            .expect("overridden output renders");
+        let default = requests
+            .iter()
+            .find(|r| r.asset_id == exports[1])
+            .expect("default output renders");
+        assert_eq!(overridden.render_mode, PreviewRenderMode::Points);
+        assert_eq!(
+            overridden.mesh_plan,
+            PreviewMeshPlan::for_mode(PreviewRenderMode::Points, 24)
+        );
+        assert_eq!(
+            default.render_mode,
+            PreviewRenderMode::AdaptiveSurfaceNets2
+        );
+    }
+
+    #[test]
+    fn output_defaults_click_clears_override() {
+        let (mut app, exports) = two_export_app();
+        // Pin it so it participates in preview_requests.
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{TOGGLE_PIN_PREFIX}{}", exports[0])),
+        );
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{OUTPUT_MODE_PREFIX}{}:points", exports[0])),
+        );
+        assert!(app.output_overrides.contains_key(&exports[0]));
+
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{OUTPUT_DEFAULTS_PREFIX}{}", exports[0])),
+        );
+        assert!(app.output_overrides.is_empty());
+        let requests = app.preview_requests();
+        let request = requests
+            .iter()
+            .find(|r| r.asset_id == exports[0])
+            .expect("output renders");
+        assert_eq!(
+            request.render_mode,
+            PreviewRenderMode::AdaptiveSurfaceNets2,
+            "back on viewport defaults"
+        );
+    }
+
+    #[test]
+    fn output_override_pruned_when_output_disappears() {
+        let (mut app, exports) = two_export_app();
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{OUTPUT_MODE_PREFIX}{}:points", exports[1])),
+        );
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click("project:delete-export:1"),
+        );
+        app.run_project();
+        assert!(!app.output_overrides.contains_key(&exports[1]));
+    }
+
+    #[test]
+    fn output_settings_popover_opens_and_survives_picks() {
+        let (mut app, exports) = two_export_app();
+        let key = format!("{OUTPUT_SETTINGS_PREFIX}{}", exports[0]);
+        dispatch(&mut app, UiEvent::synthetic_click(key.clone()));
+        assert_eq!(app.open_select.as_deref(), Some(key.as_str()));
+
+        // A pick adjusts the override but keeps the settings panel open.
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{OUTPUT_MODE_PREFIX}{}:points", exports[0])),
+        );
+        assert_eq!(app.open_select.as_deref(), Some(key.as_str()));
+
+        // Outside click (popover scrim) dismisses.
+        dispatch(&mut app, UiEvent::synthetic_click(format!("{key}:dismiss")));
+        assert_eq!(app.open_select, None);
     }
 
     #[test]

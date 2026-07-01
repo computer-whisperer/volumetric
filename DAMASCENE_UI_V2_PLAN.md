@@ -254,6 +254,17 @@ candidates for Phase 3c.
   inspector. Catalog "selection" state (`selected_model`/`selected_operator`)
   was deleted along with the dead Open/Save/Export STL buttons; per-output
   render overrides, panel resize, and wiring real file actions are Phase 3b/3c.
+- Phase 3b delivered the per-output render overrides deferred from Phase 2: an
+  `OutputRender { mode, resolution }` map keyed by asset id feeds
+  `render_request_for_asset`, so each output can mesh with its own mode and
+  resolution while the viewport pickers stay the defaults for un-overridden
+  outputs (matching egui v1's per-export Render combo, minus the None=hidden
+  mode, which pins/eye already cover). Each Outputs row shows its effective
+  `mode · res` and a settings popover (gear; highlighted when overriding)
+  with mode/resolution buttons and a "use viewport defaults" reset — picks
+  keep the panel open, outside click or Escape dismisses. Overrides prune
+  with pins when a run drops an output. Remaining for 3c: panel resize
+  handle, wide Lua sheet, real file actions.
 
 ### Slice 0: Dependency Update
 
