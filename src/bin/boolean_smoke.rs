@@ -45,6 +45,7 @@ fn run_operator(engine: &Engine, op_wasm: &[u8], inputs: Vec<Vec<u8>>) -> Result
     struct HostState {
         inputs: Vec<Vec<u8>>,
         output: Vec<u8>,
+        error: Option<String>,
     }
 
     let mut store = Store::new(
@@ -52,6 +53,7 @@ fn run_operator(engine: &Engine, op_wasm: &[u8], inputs: Vec<Vec<u8>>) -> Result
         HostState {
             inputs,
             output: Vec::new(),
+            error: None,
         },
     );
 
@@ -96,11 +98,31 @@ fn run_operator(engine: &Engine, op_wasm: &[u8], inputs: Vec<Vec<u8>>) -> Result
         },
     )?;
 
+    linker.func_wrap(
+        "host",
+        "post_error",
+        |mut caller: Caller<'_, HostState>, ptr: i32, len: i32| {
+            let len = len as usize;
+            let ptr = ptr as usize;
+            let mem = caller
+                .get_export("memory")
+                .and_then(|e| e.into_memory())
+                .unwrap();
+            let mut tmp = vec![0u8; len];
+            mem.read(&mut caller, ptr, &mut tmp).unwrap();
+            let msg = String::from_utf8_lossy(&tmp).into_owned();
+            caller.data_mut().error.get_or_insert(msg);
+        },
+    )?;
+
     let module = Module::new(engine, op_wasm)?;
     let instance = linker.instantiate(&mut store, &module)?;
     let run = instance.get_typed_func::<(), ()>(&mut store, "run")?;
     run.call(&mut store, ())?;
 
+    if let Some(msg) = &store.data().error {
+        anyhow::bail!("operator reported error: {msg}");
+    }
     Ok(store.data().output.clone())
 }
 
@@ -149,14 +171,28 @@ fn main() -> Result<()> {
     .context("run boolean operator")?;
     println!("Merged model size: {} bytes", merged.len());
 
-    // Validate the merged model can be instantiated and queried.
+    // Validate the merged model can be instantiated and queried (Nd ABI:
+    // write the position into the exported memory, call sample(pos_ptr)).
     let mut store = Store::new(&engine, ());
     let merged_module = Module::new(&engine, merged)?;
     let merged_instance = Instance::new(&mut store, &merged_module, &[])?;
-    let is_inside =
-        merged_instance.get_typed_func::<(f64, f64, f64), f32>(&mut store, "is_inside")?;
-    let v0 = is_inside.call(&mut store, (0.0, 0.0, 0.0))?;
-    let v1 = is_inside.call(&mut store, (5.0, 5.0, 5.0))?;
+    let memory = merged_instance
+        .get_memory(&mut store, "memory")
+        .context("merged model has no memory export")?;
+    let sample = merged_instance.get_typed_func::<i32, f32>(&mut store, "sample")?;
+
+    // Nonzero offset: address 0 is a null pointer to the model's Rust code.
+    const POS_OFFSET: usize = 8;
+    let sample_at = |store: &mut Store<()>, pos: [f64; 3]| -> Result<f32> {
+        let mut bytes = [0u8; 24];
+        for (i, v) in pos.iter().enumerate() {
+            bytes[i * 8..(i + 1) * 8].copy_from_slice(&v.to_le_bytes());
+        }
+        memory.write(&mut *store, POS_OFFSET, &bytes)?;
+        Ok(sample.call(&mut *store, POS_OFFSET as i32)?)
+    };
+    let v0 = sample_at(&mut store, [0.0, 0.0, 0.0])?;
+    let v1 = sample_at(&mut store, [5.0, 5.0, 5.0])?;
     println!("density(0,0,0) = {v0}, density(5,5,5) = {v1}");
 
     Ok(())

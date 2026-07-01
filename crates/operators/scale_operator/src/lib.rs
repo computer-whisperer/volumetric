@@ -64,6 +64,13 @@ unsafe extern "C" {
     fn get_input_len(arg: i32) -> u32;
     fn get_input_data(arg: i32, ptr: i32, len: i32);
     fn post_output(output_idx: i32, ptr: i32, len: i32);
+    fn post_error(ptr: i32, len: i32);
+}
+
+/// Report a failure to the host; the run fails with this message instead of
+/// producing outputs.
+fn report_error(msg: &str) {
+    unsafe { post_error(msg.as_ptr() as i32, msg.len() as i32) }
 }
 
 const ABI_FUNCTIONS_ND: &[&str] = &["get_dimensions", "get_bounds", "sample"];
@@ -304,7 +311,10 @@ pub extern "C" fn run() {
 
     let output = match transform_wasm(&buf, cfg) {
         Ok(t) => t,
-        Err(_) => buf,
+        Err(e) => {
+            report_error(&format!("transform failed: {e}"));
+            return;
+        }
     };
     unsafe {
         post_output(0, output.as_ptr() as i32, output.len() as i32);

@@ -187,6 +187,11 @@ impl OperatorIo {
 /// - `get_input_len(i32) -> u32` - Get length of input at index
 /// - `get_input_data(i32, i32, i32)` - Copy input data to WASM memory
 /// - `post_output(i32, i32, i32)` - Post output data from WASM memory
+///
+/// # Optional WASM Imports (from "host")
+/// - `post_error(ptr: i32, len: i32)` - Report a failure with a UTF-8 message.
+///   A run that posts an error fails with the message instead of returning
+///   outputs; only the first posted error is kept.
 pub trait OperatorExecutor: Send {
     /// Execute the operator with the given I/O state.
     fn run(&mut self, io: OperatorIo) -> Result<OperatorIo, WasmBackendError>;

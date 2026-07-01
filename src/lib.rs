@@ -102,6 +102,11 @@ pub enum ExecutionError {
     Wasmtime(String),
     #[error("WASM backend error: {0}")]
     WasmBackend(String),
+    #[error("Operator '{operator_id}' failed: {message}")]
+    OperatorFailed {
+        operator_id: String,
+        message: String,
+    },
     #[error("Execution cancelled")]
     Cancelled,
 }
@@ -780,9 +785,15 @@ impl Project {
                 .map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
 
             let io = OperatorIo::new(input_bytes);
-            let result = executor
-                .run(io)
-                .map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
+            let result = executor.run(io).map_err(|e| match e {
+                wasm::WasmBackendError::OperatorReported(message) => {
+                    ExecutionError::OperatorFailed {
+                        operator_id: step.operator_id.clone(),
+                        message,
+                    }
+                }
+                other => ExecutionError::Wasmtime(other.to_string()),
+            })?;
 
             // Store outputs
             for (idx, output_id) in step.outputs.iter().enumerate() {

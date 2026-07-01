@@ -118,8 +118,10 @@ pub struct NativeModelExecutorNd {
     sample: TypedFunc<i32, f32>,
 }
 
-/// Memory buffer offsets for N-dimensional ABI
-const POS_BUFFER_OFFSET: i32 = 0;
+/// Memory buffer offsets for N-dimensional ABI.
+/// The position offset must be nonzero: address 0 is a null pointer to the
+/// model's Rust code, and debug builds trap on null-pointer dereference.
+const POS_BUFFER_OFFSET: i32 = 8;
 const BOUNDS_BUFFER_OFFSET: i32 = 256;
 
 impl NativeModelExecutorNd {

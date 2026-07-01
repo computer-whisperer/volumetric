@@ -13,6 +13,8 @@ pub enum WasmBackendError {
     MissingExport(String),
     /// Memory access error (out of bounds, etc.).
     Memory(String),
+    /// The operator itself reported a failure via `host.post_error`.
+    OperatorReported(String),
     /// CBOR encoding/decoding error.
     Cbor(String),
     /// The backend is not available (e.g., native backend in web context).
@@ -26,6 +28,7 @@ impl fmt::Display for WasmBackendError {
             WasmBackendError::Execution(msg) => write!(f, "WASM execution error: {}", msg),
             WasmBackendError::MissingExport(name) => write!(f, "Missing WASM export: {}", name),
             WasmBackendError::Memory(msg) => write!(f, "WASM memory error: {}", msg),
+            WasmBackendError::OperatorReported(msg) => write!(f, "operator error: {}", msg),
             WasmBackendError::Cbor(msg) => write!(f, "CBOR error: {}", msg),
             WasmBackendError::Unavailable(msg) => write!(f, "Backend unavailable: {}", msg),
         }

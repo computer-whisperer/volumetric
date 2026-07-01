@@ -87,6 +87,13 @@ unsafe extern "C" {
     fn get_input_len(arg: i32) -> u32;
     fn get_input_data(arg: i32, ptr: i32, len: i32);
     fn post_output(output_idx: i32, ptr: i32, len: i32);
+    fn post_error(ptr: i32, len: i32);
+}
+
+/// Report a failure to the host; the run fails with this message instead of
+/// producing outputs.
+fn report_error(msg: &str) {
+    unsafe { post_error(msg.as_ptr() as i32, msg.len() as i32) }
 }
 
 const ABI_FUNCTIONS_ND: &[&str] = &["get_dimensions", "get_bounds", "sample"];
@@ -439,8 +446,9 @@ fn add_get_bounds_wrapper(
 
 /// Offset where B's copy of the sample position is written in B's memory.
 /// Matches the host convention for `sample(pos_ptr)` (position buffer at the
-/// bottom of linear memory).
-const POS_BUFFER_OFFSET: i32 = 0;
+/// bottom of linear memory). Must be nonzero: address 0 is a null pointer to
+/// the model's Rust code, and debug builds trap on null-pointer dereference.
+const POS_BUFFER_OFFSET: i32 = 8;
 
 /// Add sample wrapper that combines densities from both models.
 ///
@@ -708,7 +716,13 @@ pub extern "C" fn run() {
     };
     let op = cfg.op.unwrap_or(BooleanOpConfig::Union).into();
 
-    let output = merge_models(&a_buf, &b_buf, op).unwrap_or_else(|_| a_buf);
+    let output = match merge_models(&a_buf, &b_buf, op) {
+        Ok(out) => out,
+        Err(e) => {
+            report_error(&format!("model merge failed: {e}"));
+            return;
+        }
+    };
     unsafe {
         post_output(0, output.as_ptr() as i32, output.len() as i32);
     }

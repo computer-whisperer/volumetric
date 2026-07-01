@@ -64,6 +64,13 @@ unsafe extern "C" {
     fn get_input_len(arg: i32) -> u32;
     fn get_input_data(arg: i32, ptr: i32, len: i32);
     fn post_output(output_idx: i32, ptr: i32, len: i32);
+    fn post_error(ptr: i32, len: i32);
+}
+
+/// Report a failure to the host; the run fails with this message instead of
+/// producing outputs.
+fn report_error(msg: &str) {
+    unsafe { post_error(msg.as_ptr() as i32, msg.len() as i32) }
 }
 
 /// Read input data from the host
@@ -342,9 +349,9 @@ pub extern "C" fn run() {
 
     let output = match generate_wasm(&mode_config.mode, vector_a, vector_b) {
         Ok(wasm) => wasm,
-        Err(_) => {
-            // Return an empty WASM module on error
-            Module::default().emit_wasm()
+        Err(e) => {
+            report_error(&format!("prism generation failed: {e}"));
+            return;
         }
     };
     unsafe { post_output(0, output.as_ptr() as i32, output.len() as i32) };

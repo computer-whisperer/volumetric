@@ -14,6 +14,7 @@
 //! ## Operator Functions
 //! - `wasmOperatorCreate(bytes: Uint8Array, inputs: Array<Uint8Array>): number` - Create operator
 //! - `wasmOperatorRun(handle: number): boolean` - Run the operator
+//! - `wasmOperatorGetError(handle: number): string | null` - Get reported error, if any
 //! - `wasmOperatorGetOutput(handle: number, idx: number): Uint8Array | null` - Get output data
 //! - `wasmOperatorGetOutputIndices(handle: number): number[]` - Get indices of outputs
 //! - `wasmOperatorGetMetadata(handle: number): Uint8Array | null` - Get metadata
@@ -74,6 +75,11 @@ extern "C" {
     /// Returns true on success, false on error.
     #[wasm_bindgen(js_name = wasmOperatorRun)]
     pub fn wasm_operator_run(handle: JsWasmHandle) -> bool;
+
+    /// Get the error message the operator reported via `host.post_error`,
+    /// if any. Returns None when the operator did not report an error.
+    #[wasm_bindgen(js_name = wasmOperatorGetError)]
+    pub fn wasm_operator_get_error(handle: JsWasmHandle) -> Option<String>;
 
     /// Get the output data at the given index.
     /// Returns the output bytes or None if no output at that index.

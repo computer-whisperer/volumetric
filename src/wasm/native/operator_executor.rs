@@ -9,6 +9,8 @@ use wasmtime::{Caller, Engine, Linker, Module, Store};
 struct OperatorState {
     inputs: Vec<Vec<u8>>,
     outputs: HashMap<usize, Vec<u8>>,
+    /// First error message the operator reported via `host.post_error`.
+    error: Option<String>,
 }
 
 /// Native operator executor using wasmtime.
@@ -96,6 +98,31 @@ impl NativeOperatorExecutor {
             )
             .map_err(|e| WasmBackendError::Instantiation(e.to_string()))?;
 
+        // Host function: report a failure (UTF-8 message in WASM memory).
+        // Only the first reported error is kept.
+        linker
+            .func_wrap(
+                "host",
+                "post_error",
+                |mut caller: Caller<'_, OperatorState>, ptr: i32, len: i32| {
+                    if caller.data().error.is_some() {
+                        return;
+                    }
+                    if let Some(memory) = caller.get_export("memory").and_then(|e| e.into_memory())
+                    {
+                        let mem_data = memory.data(&caller);
+                        let src_start = ptr as usize;
+                        let src_end = src_start.saturating_add(len as usize);
+                        if src_end <= mem_data.len() {
+                            let msg =
+                                String::from_utf8_lossy(&mem_data[src_start..src_end]).into_owned();
+                            caller.data_mut().error = Some(msg);
+                        }
+                    }
+                },
+            )
+            .map_err(|e| WasmBackendError::Instantiation(e.to_string()))?;
+
         Ok(linker)
     }
 }
@@ -107,6 +134,7 @@ impl OperatorExecutor for NativeOperatorExecutor {
         let state = OperatorState {
             inputs: io.inputs,
             outputs: HashMap::new(),
+            error: None,
         };
         let mut store = Store::new(&self.engine, state);
 
@@ -123,6 +151,9 @@ impl OperatorExecutor for NativeOperatorExecutor {
             .map_err(|e| WasmBackendError::Execution(e.to_string()))?;
 
         let state = store.into_data();
+        if let Some(msg) = state.error {
+            return Err(WasmBackendError::OperatorReported(msg));
+        }
         Ok(OperatorIo {
             inputs: state.inputs,
             outputs: state.outputs,
@@ -154,6 +185,14 @@ impl OperatorExecutor for NativeOperatorExecutor {
                 "host",
                 "post_output",
                 |_caller: Caller<'_, ()>, _idx: i32, _ptr: i32, _len: i32| {},
+            )
+            .map_err(|e| WasmBackendError::Instantiation(e.to_string()))?;
+
+        linker
+            .func_wrap(
+                "host",
+                "post_error",
+                |_caller: Caller<'_, ()>, _ptr: i32, _len: i32| {},
             )
             .map_err(|e| WasmBackendError::Instantiation(e.to_string()))?;
 

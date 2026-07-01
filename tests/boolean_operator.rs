@@ -162,6 +162,24 @@ fn merged_model_composes_as_input_b() {
 }
 
 #[test]
+fn merge_failure_is_reported_not_swallowed() {
+    let boolean = wasm_artifact("boolean_operator");
+    let mut executor = create_operator_executor(&boolean).expect("create boolean executor");
+    let io = OperatorIo::new(vec![
+        wasm_artifact("simple_sphere_model"),
+        b"not a wasm module".to_vec(),
+        cbor_op("union"),
+    ]);
+
+    let err = executor.run(io).expect_err("merging garbage should fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("model merge failed"),
+        "unexpected error: {msg}"
+    );
+}
+
+#[test]
 fn subtract_removes_torus_from_sphere() {
     let merged = merge_sphere_torus("subtract");
 

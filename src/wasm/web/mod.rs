@@ -26,8 +26,9 @@ use crate::wasm::traits::{
 #[cfg(feature = "web")]
 use js_bindings::{
     JsWasmHandle, wasm_model_create_sync, wasm_model_destroy, wasm_model_get_bounds,
-    wasm_model_is_inside, wasm_operator_create, wasm_operator_destroy, wasm_operator_get_metadata,
-    wasm_operator_get_output, wasm_operator_get_output_indices, wasm_operator_run,
+    wasm_model_is_inside, wasm_operator_create, wasm_operator_destroy, wasm_operator_get_error,
+    wasm_operator_get_metadata, wasm_operator_get_output, wasm_operator_get_output_indices,
+    wasm_operator_run,
 };
 
 /// Web model executor using JavaScript bridge.
@@ -209,11 +210,13 @@ impl OperatorExecutor for WebOperatorExecutor {
 
         // Run the operator
         let success = wasm_operator_run(handle);
-        if !success {
+        let reported = wasm_operator_get_error(handle);
+        if !success || reported.is_some() {
             wasm_operator_destroy(handle);
-            return Err(WasmBackendError::Execution(
-                "Operator run() failed".to_string(),
-            ));
+            return Err(match reported {
+                Some(msg) => WasmBackendError::OperatorReported(msg),
+                None => WasmBackendError::Execution("Operator run() failed".to_string()),
+            });
         }
 
         // Collect outputs

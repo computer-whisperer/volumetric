@@ -102,6 +102,7 @@ window.wasmOperatorCreate = function(bytes, inputs) {
             outputs: new Map(),
             instance: null,
             module: null,
+            error: null,
         };
 
         // Create host imports that close over the state
@@ -132,6 +133,16 @@ window.wasmOperatorCreate = function(bytes, inputs) {
                     const src = new Uint8Array(memory.buffer, ptr, len);
                     // Copy the data (don't just reference it, as memory may change)
                     state.outputs.set(outputIdx, new Uint8Array(src));
+                },
+
+                // Report a failure (UTF-8 message in WASM memory).
+                // Only the first reported error is kept.
+                post_error: function(ptr, len) {
+                    if (!state.instance || state.error !== null) return;
+
+                    const memory = state.instance.exports.memory;
+                    const src = new Uint8Array(memory.buffer, ptr, len);
+                    state.error = new TextDecoder().decode(src);
                 },
             },
         };
@@ -166,6 +177,14 @@ window.wasmOperatorRun = function(handle) {
         console.error("Failed to run operator:", e);
         return false;
     }
+};
+
+// Get the error message the operator reported via host.post_error, if any
+// Returns a string or null
+window.wasmOperatorGetError = function(handle) {
+    const state = operatorInstances.get(handle);
+    if (!state) return null;
+    return state.error;
 };
 
 // Get the number of outputs produced

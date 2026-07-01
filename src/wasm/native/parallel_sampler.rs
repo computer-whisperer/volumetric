@@ -163,8 +163,10 @@ impl ParallelModelSampler for NativeParallelSampler {
 // N-Dimensional Parallel Sampler
 // =============================================================================
 
-/// Memory buffer offset for position input in N-dimensional ABI
-const POS_BUFFER_OFFSET_ND: i32 = 0;
+/// Memory buffer offset for position input in N-dimensional ABI.
+/// Must be nonzero: address 0 is a null pointer to the model's Rust code, and
+/// debug builds trap on null-pointer dereference.
+const POS_BUFFER_OFFSET_ND: i32 = 8;
 /// Memory buffer offset for bounds output in N-dimensional ABI
 const BOUNDS_BUFFER_OFFSET_ND: i32 = 256;
 
