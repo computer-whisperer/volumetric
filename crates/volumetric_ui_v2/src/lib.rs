@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use volumetric::operator_config::{ConfigField, ConfigFieldType, ConfigValue};
 use volumetric::{
     AssetTypeHint, ExecutionInput, LoadedAsset, OperatorMetadata, OperatorMetadataInput, Project,
     adaptive_surface_nets_2, operator_config,
@@ -42,6 +43,9 @@ const SELECT_EXPORT_PREFIX: &str = "project:select-export:";
 const DELETE_EXPORT_PREFIX: &str = "project:delete-export:";
 const ADD_EXPORT_PREFIX: &str = "project:add-export:";
 const SELECT_RUNTIME_ASSET_PREFIX: &str = "runtime:select-asset:";
+const CONFIG_FIELD_PREFIX: &str = "cfg:";
+const CONFIG_BOOL_PREFIX: &str = "cfg-bool:";
+const CONFIG_ENUM_PREFIX: &str = "cfg-enum:";
 const PREVIEW_RESOLUTIONS: [usize; 4] = [24, 48, 64, 96];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -261,6 +265,17 @@ pub struct ProjectSummary {
     pub auto_rebuild: bool,
 }
 
+/// Editing state for the selected operator step's config input: the parsed
+/// schema plus a raw text buffer per field. The buffer is the source of truth
+/// while typing; parseable values are committed into the step's CBOR blob.
+#[derive(Debug)]
+struct ConfigEditState {
+    step_idx: usize,
+    config_input_idx: usize,
+    fields: Vec<ConfigField>,
+    buffers: std::collections::BTreeMap<String, String>,
+}
+
 #[derive(Debug)]
 pub struct VolumetricUiV2 {
     project: Project,
@@ -284,6 +299,10 @@ pub struct VolumetricUiV2 {
     preview_build_status: PreviewBuildStatus,
     pending_camera_command: Option<ViewportCameraCommand>,
     viewport_texture: Option<AppTexture>,
+    /// Global text selection/focus for controlled text inputs (config fields).
+    selection: Selection,
+    /// Config editor state for the currently selected operator step, if any.
+    config_edit: Option<ConfigEditState>,
     status: String,
 }
 
@@ -323,6 +342,8 @@ impl VolumetricUiV2 {
             preview_build_status: PreviewBuildStatus::Idle,
             pending_camera_command: None,
             viewport_texture: None,
+            selection: Selection::default(),
+            config_edit: None,
             status: "idle".to_string(),
         }
     }
@@ -505,6 +526,124 @@ impl VolumetricUiV2 {
     fn request_run(&mut self) {
         self.pending_run = true;
         self.status = "run queued".to_string();
+    }
+
+    /// Rebuilds the config editor when the selected step changes. While the same
+    /// step stays selected the existing buffers (in-progress edits) are kept.
+    fn sync_config_edit(&mut self) {
+        let step_idx = match self.selected_project_item {
+            Some(ProjectSelection::Step(idx)) => Some(idx),
+            _ => None,
+        };
+        let Some(step_idx) = step_idx else {
+            self.config_edit = None;
+            return;
+        };
+        if self.config_edit.as_ref().map(|edit| edit.step_idx) == Some(step_idx) {
+            return;
+        }
+        self.config_edit = self.build_config_edit(step_idx);
+    }
+
+    fn build_config_edit(&self, step_idx: usize) -> Option<ConfigEditState> {
+        let step = self.project.timeline().get(step_idx)?;
+        let op_bytes = self.operator_bytes(&step.operator_id)?;
+        let metadata = volumetric::operator_metadata_from_wasm_bytes(&op_bytes).ok()?;
+        let (config_input_idx, cddl) =
+            metadata
+                .inputs
+                .iter()
+                .enumerate()
+                .find_map(|(idx, input)| match input {
+                    OperatorMetadataInput::CBORConfiguration(cddl) => Some((idx, cddl.clone())),
+                    _ => None,
+                })?;
+        let fields = operator_config::parse_schema(&cddl).ok()?;
+        if fields.is_empty() {
+            return None;
+        }
+        let current = match step.inputs.get(config_input_idx) {
+            Some(ExecutionInput::Inline(bytes)) => operator_config::decode(bytes),
+            _ => std::collections::BTreeMap::new(),
+        };
+        let buffers = fields
+            .iter()
+            .map(|field| {
+                let value = current
+                    .get(&field.name)
+                    .cloned()
+                    .unwrap_or_else(|| field.seed_value());
+                (field.name.clone(), value.to_display_string())
+            })
+            .collect();
+        Some(ConfigEditState {
+            step_idx,
+            config_input_idx,
+            fields,
+            buffers,
+        })
+    }
+
+    fn operator_bytes(&self, operator_id: &str) -> Option<Vec<u8>> {
+        self.project
+            .imports()
+            .iter()
+            .find(|import| import.id == operator_id)
+            .map(|import| import.data.clone())
+    }
+
+    /// Commits the field's current buffer into the step's CBOR blob, but only if
+    /// it parses; an invalid intermediate (e.g. an empty number field) is left
+    /// in the buffer untouched.
+    fn commit_config_buffer(&mut self, edit: &ConfigEditState, field_name: &str) {
+        let Some(field) = edit.fields.iter().find(|f| f.name == field_name) else {
+            return;
+        };
+        let Some(buffer) = edit.buffers.get(field_name) else {
+            return;
+        };
+        let Some(value) = ConfigValue::parse(&field.ty, buffer) else {
+            return;
+        };
+        self.write_config_value(edit, field_name, value);
+        self.mark_project_dirty();
+    }
+
+    fn write_config_value(&mut self, edit: &ConfigEditState, field_name: &str, value: ConfigValue) {
+        let Some(step) = self.project.timeline_mut().get_mut(edit.step_idx) else {
+            return;
+        };
+        let mut values = match step.inputs.get(edit.config_input_idx) {
+            Some(ExecutionInput::Inline(bytes)) => operator_config::decode(bytes),
+            _ => return,
+        };
+        values.insert(field_name.to_string(), value);
+        let encoded = operator_config::encode(&edit.fields, &values);
+        if let Some(ExecutionInput::Inline(slot)) = step.inputs.get_mut(edit.config_input_idx) {
+            *slot = encoded;
+        }
+    }
+
+    /// Sets a field's buffer to `text` (used by bool/enum controls) and commits.
+    fn set_config_buffer(&mut self, field_name: &str, text: String) {
+        let Some(mut edit) = self.config_edit.take() else {
+            return;
+        };
+        if let Some(buffer) = edit.buffers.get_mut(field_name) {
+            *buffer = text;
+        }
+        self.commit_config_buffer(&edit, field_name);
+        self.config_edit = Some(edit);
+    }
+
+    fn toggle_config_bool(&mut self, field_name: &str) {
+        let current = self
+            .config_edit
+            .as_ref()
+            .and_then(|edit| edit.buffers.get(field_name))
+            .map(|buffer| buffer == "true")
+            .unwrap_or(false);
+        self.set_config_buffer(field_name, (!current).to_string());
     }
 
     fn select_model(&mut self, name: &str) {
@@ -774,7 +913,43 @@ impl App for VolumetricUiV2 {
         shell(self)
     }
 
+    fn before_build(&mut self) {
+        self.sync_config_edit();
+    }
+
+    fn selection(&self) -> Selection {
+        self.selection.clone()
+    }
+
     fn on_event(&mut self, event: UiEvent, _cx: &EventCx) {
+        // Controlled text editing for config fields runs first: text, key, and
+        // selection events aren't clicks and would be dropped by the gate below.
+        if let Some(field_name) = event
+            .target_key()
+            .and_then(|key| key.strip_prefix(CONFIG_FIELD_PREFIX))
+            .map(str::to_string)
+        {
+            if let Some(mut edit) = self.config_edit.take() {
+                let key = format!("{CONFIG_FIELD_PREFIX}{field_name}");
+                let changed = edit
+                    .buffers
+                    .get_mut(&field_name)
+                    .map(|buffer| {
+                        text_input::apply_event(buffer, &mut self.selection, &event, &key)
+                    })
+                    .unwrap_or(false);
+                if changed {
+                    self.commit_config_buffer(&edit, &field_name);
+                }
+                self.config_edit = Some(edit);
+                return;
+            }
+        }
+        // Track focus/selection moving to another widget (e.g. clicking away).
+        if let Some(selection) = event.selection.clone() {
+            self.selection = selection;
+        }
+
         if event.is_click_or_activate(NEW_PROJECT_KEY) {
             self.project = Project::new();
             self.selected_export = None;
@@ -892,6 +1067,12 @@ impl App for VolumetricUiV2 {
         } else if let Some(asset_id) = route.strip_prefix(SELECT_RUNTIME_ASSET_PREFIX) {
             self.selected_export = Some(asset_id.to_string());
             self.status = format!("selected runtime asset {asset_id}");
+        } else if let Some(field_name) = route.strip_prefix(CONFIG_BOOL_PREFIX) {
+            self.toggle_config_bool(field_name);
+        } else if let Some(rest) = route.strip_prefix(CONFIG_ENUM_PREFIX) {
+            if let Some((field_name, value)) = rest.split_once(':') {
+                self.set_config_buffer(field_name, value.to_string());
+            }
         }
     }
 }
@@ -1379,6 +1560,11 @@ fn step_detail_rows(app: &VolumetricUiV2, idx: usize) -> Vec<El> {
         detail_row("Operator", &step.operator_id),
         detail_row("Inputs", &step.inputs.len().to_string()),
         detail_row("Outputs", &step.outputs.len().to_string()),
+    ];
+
+    rows.extend(config_form_rows(app, idx));
+
+    rows.push(
         toolbar([
             button_with_icon("chevron-left", "Up")
                 .secondary()
@@ -1391,12 +1577,14 @@ fn step_detail_rows(app: &VolumetricUiV2, idx: usize) -> Vec<El> {
         ])
         .gap(tokens::SPACE_1)
         .width(Size::Fill(1.0)),
+    );
+    rows.push(
         button_with_icon("x", "Delete")
             .destructive()
             .xsmall()
             .width(Size::Fill(1.0))
             .key(format!("{DELETE_STEP_PREFIX}{idx}")),
-    ];
+    );
 
     rows.push(text("Set first input").muted().small());
     for asset_id in editable_model_asset_ids(app) {
@@ -1410,6 +1598,62 @@ fn step_detail_rows(app: &VolumetricUiV2, idx: usize) -> Vec<El> {
     }
 
     rows
+}
+
+/// Renders the operator config form for the selected step, if it has a config
+/// schema. Field values are edited in place and committed into the step's CBOR.
+fn config_form_rows(app: &VolumetricUiV2, step_idx: usize) -> Vec<El> {
+    let Some(edit) = &app.config_edit else {
+        return Vec::new();
+    };
+    if edit.step_idx != step_idx {
+        return Vec::new();
+    }
+
+    let mut rows = vec![text("Config").muted().caption().semibold()];
+    for field in &edit.fields {
+        let buffer = edit
+            .buffers
+            .get(&field.name)
+            .map(String::as_str)
+            .unwrap_or("");
+        rows.push(config_field_row(field, buffer, &app.selection));
+    }
+    rows
+}
+
+fn config_field_row(field: &ConfigField, buffer: &str, selection: &Selection) -> El {
+    let control = match &field.ty {
+        ConfigFieldType::Bool => switch(
+            format!("{CONFIG_BOOL_PREFIX}{}", field.name),
+            buffer == "true",
+        ),
+        ConfigFieldType::Enum(options) => config_enum_control(&field.name, options, buffer),
+        _ => text_input(
+            &format!("{CONFIG_FIELD_PREFIX}{}", field.name),
+            buffer,
+            selection,
+        )
+        .width(Size::Fixed(132.0)),
+    };
+    field_row(&field.name, control).gap(tokens::SPACE_2)
+}
+
+fn config_enum_control(field_name: &str, options: &[String], buffer: &str) -> El {
+    row(options
+        .iter()
+        .map(|option| {
+            let button = button(option.clone())
+                .xsmall()
+                .key(format!("{CONFIG_ENUM_PREFIX}{field_name}:{option}"));
+            if option == buffer {
+                button.primary()
+            } else {
+                button.secondary()
+            }
+        })
+        .collect::<Vec<_>>())
+    .gap(tokens::SPACE_1)
 }
 
 fn export_detail_rows(app: &VolumetricUiV2, idx: usize) -> Vec<El> {
@@ -2160,5 +2404,90 @@ mod tests {
         assert!(!summary.last_run_stale);
         assert!(!app.take_pending_run());
         assert!(app.preview_request().is_none());
+    }
+
+    /// Adds each bundled operator and, for the first one that declares a config
+    /// schema, edits its first field and asserts the change lands in the step's
+    /// CBOR blob.
+    #[test]
+    fn editing_config_updates_the_step_cbor() {
+        let mut exercised = false;
+        for op in volumetric_assets::operators() {
+            let mut app = VolumetricUiV2::default();
+            dispatch(
+                &mut app,
+                UiEvent::synthetic_click(format!("{OPERATOR_ROUTE_PREFIX}{}", op.name)),
+            );
+            dispatch(&mut app, UiEvent::synthetic_click(ADD_OPERATOR_KEY));
+            app.before_build();
+
+            let Some(edit) = app.config_edit.as_ref() else {
+                continue;
+            };
+            let step_idx = edit.step_idx;
+            let config_input_idx = edit.config_input_idx;
+            let Some(field) = edit.fields.first().cloned() else {
+                continue;
+            };
+            let field_name = field.name.clone();
+
+            let expected = match &field.ty {
+                ConfigFieldType::Bool => {
+                    let before = edit.buffers[&field_name] == "true";
+                    app.toggle_config_bool(&field_name);
+                    ConfigValue::Bool(!before)
+                }
+                ConfigFieldType::Enum(options) => {
+                    let target = options.last().cloned().unwrap();
+                    app.set_config_buffer(&field_name, target.clone());
+                    ConfigValue::Text(target)
+                }
+                ConfigFieldType::Int => {
+                    app.set_config_buffer(&field_name, "5".to_string());
+                    ConfigValue::Int(5)
+                }
+                ConfigFieldType::Float => {
+                    app.set_config_buffer(&field_name, "2.5".to_string());
+                    ConfigValue::Float(2.5)
+                }
+                ConfigFieldType::Text => {
+                    app.set_config_buffer(&field_name, "hello".to_string());
+                    ConfigValue::Text("hello".to_string())
+                }
+            };
+
+            let step = &app.project().timeline()[step_idx];
+            let ExecutionInput::Inline(bytes) = &step.inputs[config_input_idx] else {
+                panic!("config input should be inline CBOR");
+            };
+            let decoded = operator_config::decode(bytes);
+            assert_eq!(
+                decoded.get(&field_name),
+                Some(&expected),
+                "operator {}",
+                op.name
+            );
+            exercised = true;
+            break;
+        }
+        assert!(
+            exercised,
+            "expected at least one bundled operator with a config schema"
+        );
+    }
+
+    #[test]
+    fn selecting_a_non_step_clears_the_config_editor() {
+        let mut app = VolumetricUiV2::default();
+        dispatch(&mut app, UiEvent::synthetic_click(ADD_OPERATOR_KEY));
+        app.before_build();
+
+        // Select an import (not a step); the config editor should clear.
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{SELECT_IMPORT_PREFIX}0")),
+        );
+        app.before_build();
+        assert!(app.config_edit.is_none());
     }
 }

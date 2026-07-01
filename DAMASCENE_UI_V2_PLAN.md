@@ -203,6 +203,15 @@ Damascene widgets that should map well:
   the error, and only a full project replacement (new/open) clears the runtime.
   Adding a new model/operator still transitions the viewport to that new node's
   (building) preview, since selection follows the freshly added output.
+- Operators are now configurable. Config schema handling lives in
+  `volumetric::operator_config` (parse CDDL, encode/decode the CBOR map, seed
+  defaults). Adding an operator reads its metadata and wires one step input per
+  declared input; selecting an operator step shows an inspector config form with
+  editable fields (float/int/tstr via controlled text inputs, bool via switch,
+  string enums via a button group) that commit into the step's CBOR blob and
+  mark the project dirty. Not yet editable in the form: Lua source (`text_area`),
+  `VecF64` literal/asset, `Blob` file picker, and per-slot model selectors for
+  multi-input operators (only the first model input is retargetable so far).
 
 ### Slice 0: Dependency Update
 
