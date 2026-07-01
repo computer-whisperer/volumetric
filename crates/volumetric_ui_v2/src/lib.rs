@@ -20,6 +20,7 @@ pub const VIEWPORT_KEY: &str = "viewport";
 pub const NEW_PROJECT_KEY: &str = "action:new-project";
 pub const OPEN_PROJECT_KEY: &str = "action:open-project";
 pub const SAVE_PROJECT_KEY: &str = "action:save-project";
+pub const SAVE_PROJECT_AS_KEY: &str = "action:save-project-as";
 pub const IMPORT_WASM_KEY: &str = "action:import-wasm";
 pub const IMPORT_STL_KEY: &str = "action:import-stl";
 pub const IMPORT_HEIGHTMAP_KEY: &str = "action:import-heightmap";
@@ -72,6 +73,12 @@ const DELETE_EXPORT_PREFIX: &str = "project:delete-export:";
 const ADD_EXPORT_PREFIX: &str = "project:add-export:";
 const SELECT_RUNTIME_ASSET_PREFIX: &str = "runtime:select-asset:";
 const TOGGLE_PIN_PREFIX: &str = "runtime:toggle-pin:";
+/// Text buffer for the selected step's output name; committed by the Rename
+/// button (`project:rename-output:{step_idx}`), not per keystroke, so
+/// half-typed names never leak into exports/references.
+const OUTPUT_NAME_KEY: &str = "step-output-name";
+const RENAME_OUTPUT_PREFIX: &str = "project:rename-output:";
+const RESET_LUA_PREFIX: &str = "project:reset-lua:";
 const CONFIG_FIELD_PREFIX: &str = "cfg:";
 const CONFIG_BOOL_PREFIX: &str = "cfg-bool:";
 const CONFIG_ENUM_PREFIX: &str = "cfg-enum:";
@@ -343,6 +350,8 @@ struct StepEditState {
     config: Option<ConfigForm>,
     /// The Lua source editor, present only for a `LuaSource` input.
     lua: Option<LuaForm>,
+    /// Edit buffer for the step's (first) output name; committed via Rename.
+    output_name: String,
 }
 
 #[derive(Debug)]
@@ -432,6 +441,9 @@ pub struct VolumetricUiV2 {
     pipeline_open: std::collections::BTreeSet<String>,
     /// A queued file operation for the host to run (dialogs are host-side).
     pending_file_action: Option<FileAction>,
+    /// Where the project was last opened from / saved to; Save re-saves here,
+    /// Save As always asks. Cleared by New Project.
+    project_path: Option<std::path::PathBuf>,
     /// Project panel width, adjusted by the divider's resize handle.
     panel_width: f32,
     panel_drag: ResizeDrag,
@@ -487,6 +499,7 @@ impl VolumetricUiV2 {
                 .map(str::to_string)
                 .collect(),
             pending_file_action: None,
+            project_path: None,
             panel_width: PANEL_WIDTH_DEFAULT,
             panel_drag: ResizeDrag::default(),
         }
@@ -844,16 +857,21 @@ impl VolumetricUiV2 {
                 self.selected_project_item = None;
                 self.clear_runtime_assets();
                 self.request_run();
+                self.project_path = Some(path.to_path_buf());
                 self.status = format!("opened {}", path.display());
             }
             Err(err) => self.status = format!("failed to open project: {err}"),
         }
     }
 
-    /// Saves the project to disk. Called by the host after its Save dialog.
+    /// Saves the project to disk. Called by the host after its Save dialog,
+    /// or directly by Save when the path is already known.
     pub(crate) fn save_project_file(&mut self, path: &std::path::Path) {
         match self.project.save_to_file(path) {
-            Ok(()) => self.status = format!("saved {}", path.display()),
+            Ok(()) => {
+                self.project_path = Some(path.to_path_buf());
+                self.status = format!("saved {}", path.display());
+            }
             Err(err) => self.status = format!("failed to save project: {err}"),
         }
     }
@@ -929,6 +947,7 @@ impl VolumetricUiV2 {
             model_slots,
             config,
             lua,
+            output_name: step.outputs.first().cloned().unwrap_or_default(),
         })
     }
 
@@ -1024,6 +1043,119 @@ impl VolumetricUiV2 {
             step_idx + 1,
             input_idx + 1
         );
+    }
+
+    /// Restores the selected step's Lua source to the operator's template.
+    fn reset_lua_source(&mut self, step_idx: usize) {
+        let Some(step) = self.project.timeline().get(step_idx) else {
+            return;
+        };
+        let Some(op_bytes) = self.operator_bytes(&step.operator_id) else {
+            return;
+        };
+        let Ok(metadata) = volumetric::operator_metadata_from_wasm_bytes(&op_bytes) else {
+            return;
+        };
+        let Some(template) = metadata.inputs.iter().find_map(|input| match input {
+            OperatorMetadataInput::LuaSource(template) => Some(template.clone()),
+            _ => None,
+        }) else {
+            return;
+        };
+        let Some(mut edit) = self.step_edit.take() else {
+            return;
+        };
+        if edit.step_idx == step_idx
+            && let Some(lua) = edit.lua.as_mut()
+        {
+            lua.source = template;
+            self.write_lua_source(step_idx, lua);
+            self.status = format!("step {} script reset to template", step_idx + 1);
+        }
+        self.step_edit = Some(edit);
+    }
+
+    /// Commits the step editor's output-name buffer: renames the step's
+    /// outputs and rewrites every reference (exports, downstream `AssetRef`
+    /// inputs, pins, render overrides, selection). v1 left downstream
+    /// references dangling on rename; this doesn't.
+    fn rename_step_output(&mut self, step_idx: usize) {
+        let Some(edit) = &self.step_edit else {
+            return;
+        };
+        if edit.step_idx != step_idx {
+            return;
+        }
+        let new_name = edit.output_name.trim().to_string();
+        if new_name.is_empty() {
+            self.status = "output name can't be empty".to_string();
+            return;
+        }
+        let Some(step) = self.project.timeline().get(step_idx) else {
+            return;
+        };
+        let old_outputs = step.outputs.clone();
+        let Some(old_name) = old_outputs.first().cloned() else {
+            return;
+        };
+        if new_name == old_name {
+            return;
+        }
+        if self
+            .project
+            .declared_assets()
+            .iter()
+            .any(|(id, _)| *id == new_name)
+        {
+            self.status = format!("{new_name} is already in use");
+            return;
+        }
+
+        // First output takes the new name; extra outputs get `_i` suffixes
+        // (same convention as v1).
+        let new_outputs: Vec<String> = old_outputs
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                if i == 0 {
+                    new_name.clone()
+                } else {
+                    format!("{new_name}_{i}")
+                }
+            })
+            .collect();
+        if let Some(step) = self.project.timeline_mut().get_mut(step_idx) {
+            step.outputs = new_outputs.clone();
+        }
+
+        for (old, new) in old_outputs.iter().zip(&new_outputs) {
+            for export in self.project.exports_mut().iter_mut() {
+                if export == old {
+                    *export = new.clone();
+                }
+            }
+            for step in self.project.timeline_mut().iter_mut() {
+                for input in step.inputs.iter_mut() {
+                    if let ExecutionInput::AssetRef(id) = input
+                        && id == old
+                    {
+                        *id = new.clone();
+                    }
+                }
+            }
+            if self.pinned_outputs.remove(old) {
+                self.pinned_outputs.insert(new.clone());
+            }
+            if let Some(render) = self.output_overrides.remove(old) {
+                self.output_overrides.insert(new.clone(), render);
+            }
+            if self.selected_export.as_deref() == Some(old.as_str()) {
+                self.selected_export = Some(new.clone());
+            }
+        }
+
+        self.mark_project_dirty();
+        self.status = format!("renamed {old_name} -> {new_name}");
     }
 
     /// Commits the field's current buffer into the step's CBOR blob, but only if
@@ -1490,6 +1622,19 @@ impl App for VolumetricUiV2 {
                 return;
             }
         }
+        // Controlled editing for the output-name buffer (committed by Rename).
+        if event.target_key() == Some(OUTPUT_NAME_KEY) {
+            if let Some(mut edit) = self.step_edit.take() {
+                text_input::apply_event(
+                    &mut edit.output_name,
+                    &mut self.selection,
+                    &event,
+                    OUTPUT_NAME_KEY,
+                );
+                self.step_edit = Some(edit);
+                return;
+            }
+        }
         // Controlled editing for the Lua source area.
         if event.target_key() == Some(LUA_SOURCE_KEY) {
             if let Some(mut edit) = self.step_edit.take() {
@@ -1534,6 +1679,7 @@ impl App for VolumetricUiV2 {
             self.selected_project_item = None;
             self.clear_runtime_assets();
             self.open_menu = None;
+            self.project_path = None;
             self.status = "new project".to_string();
             return;
         }
@@ -1545,6 +1691,17 @@ impl App for VolumetricUiV2 {
         }
 
         if event.is_click_or_activate(SAVE_PROJECT_KEY) {
+            // Re-save in place when the path is known; first save asks.
+            if let Some(path) = self.project_path.clone() {
+                self.save_project_file(&path);
+            } else {
+                self.pending_file_action = Some(FileAction::SaveProject);
+            }
+            self.open_menu = None;
+            return;
+        }
+
+        if event.is_click_or_activate(SAVE_PROJECT_AS_KEY) {
             self.pending_file_action = Some(FileAction::SaveProject);
             self.open_menu = None;
             return;
@@ -1651,6 +1808,10 @@ impl App for VolumetricUiV2 {
             self.status = format!("selected step {}", idx + 1);
         } else if let Some(idx) = parse_index_route(route, DELETE_STEP_PREFIX) {
             self.delete_step(idx);
+        } else if let Some(idx) = parse_index_route(route, RENAME_OUTPUT_PREFIX) {
+            self.rename_step_output(idx);
+        } else if let Some(idx) = parse_index_route(route, RESET_LUA_PREFIX) {
+            self.reset_lua_source(idx);
         } else if let Some(idx) = parse_index_route(route, MOVE_STEP_UP_PREFIX) {
             self.move_step(idx, -1);
         } else if let Some(idx) = parse_index_route(route, MOVE_STEP_DOWN_PREFIX) {
@@ -1784,7 +1945,8 @@ fn menu_layer(app: &VolumetricUiV2) -> Option<El> {
                 menubar_item_with_icon("plus", "New Project").key(NEW_PROJECT_KEY),
                 menubar_separator(),
                 menubar_item_with_icon("folder", "Open Project…").key(OPEN_PROJECT_KEY),
-                menubar_item_with_icon("download", "Save Project…").key(SAVE_PROJECT_KEY),
+                menubar_item_with_icon("download", "Save Project").key(SAVE_PROJECT_KEY),
+                menubar_item_with_icon("download", "Save Project As…").key(SAVE_PROJECT_AS_KEY),
             ],
         )),
         "add" => Some(menubar_menu(MENUBAR_KEY, "add", add_menu_items())),
@@ -2496,7 +2658,28 @@ fn step_edit_rows(app: &VolumetricUiV2, step_idx: usize) -> Vec<El> {
                 .width(Size::Fill(1.0))
                 .height(Size::Fixed(180.0)),
         );
+        rows.push(
+            button("Reset to template")
+                .xsmall()
+                .secondary()
+                .width(Size::Fill(1.0))
+                .key(format!("{RESET_LUA_PREFIX}{step_idx}")),
+        );
     }
+
+    rows.push(text("Output").muted().caption().semibold());
+    rows.push(
+        row([
+            text_input(OUTPUT_NAME_KEY, &edit.output_name, &app.selection)
+                .width(Size::Fill(1.0)),
+            button("Rename")
+                .xsmall()
+                .secondary()
+                .key(format!("{RENAME_OUTPUT_PREFIX}{step_idx}")),
+        ])
+        .gap(tokens::SPACE_1)
+        .align(Align::Center),
+    );
 
     rows
 }
@@ -2569,14 +2752,24 @@ fn export_detail_rows(app: &VolumetricUiV2, idx: usize) -> Vec<El> {
         return vec![text("Selected export no longer exists.").muted().small()];
     };
 
-    vec![
-        detail_row("Export", export_id),
+    let mut rows = vec![detail_row("Export", export_id)];
+    // Lineage of the materialized output, when the last run produced one.
+    if let Some(asset) = app
+        .runtime_assets
+        .iter()
+        .find(|asset| asset.id() == export_id)
+        && !asset.precursor_ids().is_empty()
+    {
+        rows.push(detail_row("Precursors", &asset.precursor_ids().join(", ")));
+    }
+    rows.push(
         button_with_icon("x", "Delete")
             .destructive()
             .xsmall()
             .width(Size::Fill(1.0))
             .key(format!("{DELETE_EXPORT_PREFIX}{idx}")),
-    ]
+    );
+    rows
 }
 
 fn import_rows(app: &VolumetricUiV2) -> Vec<El> {
@@ -3595,6 +3788,32 @@ mod tests {
     }
 
     #[test]
+    fn save_remembers_the_path_for_one_click_resave() {
+        let path = std::env::temp_dir().join(format!(
+            "volumetric_ui_v2_resave_{}.vproj",
+            std::process::id()
+        ));
+        let mut app = VolumetricUiV2::default();
+        app.save_project_file(&path);
+
+        // Save re-saves in place; no dialog queued.
+        app.status.clear();
+        dispatch(&mut app, UiEvent::synthetic_click(SAVE_PROJECT_KEY));
+        assert_eq!(app.take_file_action(), None);
+        assert!(app.status.starts_with("saved"), "{}", app.status);
+
+        // Save As always asks.
+        dispatch(&mut app, UiEvent::synthetic_click(SAVE_PROJECT_AS_KEY));
+        assert_eq!(app.take_file_action(), Some(FileAction::SaveProject));
+
+        // New Project forgets the path.
+        dispatch(&mut app, UiEvent::synthetic_click(NEW_PROJECT_KEY));
+        dispatch(&mut app, UiEvent::synthetic_click(SAVE_PROJECT_KEY));
+        assert_eq!(app.take_file_action(), Some(FileAction::SaveProject));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn project_save_open_roundtrip() {
         let path = std::env::temp_dir().join(format!(
             "volumetric_ui_v2_roundtrip_{}.vproj",
@@ -3706,6 +3925,66 @@ mod tests {
             exercised,
             "expected at least one bundled operator with a config schema"
         );
+    }
+
+    #[test]
+    fn renaming_an_output_rewrites_every_reference() {
+        // sphere -> op A (output O1) -> op B (input O1, output O2)
+        let mut app = VolumetricUiV2::default();
+        add_operator_click(&mut app, first_operator_name());
+        let o1 = app.project().timeline()[0].outputs[0].clone();
+        add_operator_click(&mut app, first_operator_name());
+        assert!(matches!(
+            &app.project().timeline()[1].inputs[0],
+            ExecutionInput::AssetRef(id) if *id == o1
+        ));
+
+        // Pin + override the old name so the rekeying paths are exercised.
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{TOGGLE_PIN_PREFIX}{o1}")),
+        );
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{OUTPUT_MODE_PREFIX}{o1}:points")),
+        );
+
+        // Edit step 0 and rename its output.
+        dispatch(&mut app, UiEvent::synthetic_click(format!("{SELECT_STEP_PREFIX}0")));
+        app.before_build();
+        app.step_edit.as_mut().unwrap().output_name = "renamed_part".to_string();
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{RENAME_OUTPUT_PREFIX}0")),
+        );
+
+        assert_eq!(app.project().timeline()[0].outputs[0], "renamed_part");
+        assert!(matches!(
+            &app.project().timeline()[1].inputs[0],
+            ExecutionInput::AssetRef(id) if id == "renamed_part"
+        ));
+        assert!(app.project().exports().iter().any(|e| e == "renamed_part"));
+        assert!(!app.project().exports().iter().any(|e| *e == o1));
+        assert!(app.pinned_outputs.contains("renamed_part"));
+        assert!(app.output_overrides.contains_key("renamed_part"));
+        assert!(app.summary().last_run_stale);
+    }
+
+    #[test]
+    fn rename_rejects_names_already_in_use() {
+        let mut app = VolumetricUiV2::default();
+        add_operator_click(&mut app, first_operator_name());
+        let original = app.project().timeline()[0].outputs[0].clone();
+
+        app.before_build();
+        app.step_edit.as_mut().unwrap().output_name = "simple_sphere_model".to_string();
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{RENAME_OUTPUT_PREFIX}0")),
+        );
+
+        assert_eq!(app.project().timeline()[0].outputs[0], original);
+        assert!(app.status.contains("already in use"), "{}", app.status);
     }
 
     #[test]
