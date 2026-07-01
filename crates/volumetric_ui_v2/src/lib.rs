@@ -5,7 +5,10 @@
 
 use std::sync::Arc;
 
-use volumetric::{AssetTypeHint, ExecutionInput, LoadedAsset, Project, adaptive_surface_nets_2};
+use volumetric::{
+    AssetTypeHint, ExecutionInput, LoadedAsset, OperatorMetadata, OperatorMetadataInput, Project,
+    adaptive_surface_nets_2, operator_config,
+};
 use volumetric_renderer::CameraControlScheme;
 
 use damascene_core::prelude::*;
@@ -557,10 +560,22 @@ impl VolumetricUiV2 {
         let output_id = self
             .project
             .default_output_name(asset.name, Some(&input_id));
+
+        // Build the step's inputs from the operator's declared metadata so
+        // config blobs, Lua templates, and extra model slots are all wired up
+        // (not just the first model input).
+        let inputs = match volumetric::operator_metadata_from_wasm_bytes(asset.bytes) {
+            Ok(metadata) => operator_step_inputs(&metadata, &input_id),
+            Err(err) => {
+                self.status = format!("couldn't read {} metadata: {err}", asset.display_name);
+                vec![ExecutionInput::AssetRef(input_id.clone())]
+            }
+        };
+
         self.project.insert_operation(
             asset.name,
             asset.bytes.to_vec(),
-            vec![ExecutionInput::AssetRef(input_id.clone())],
+            inputs,
             vec![output_id.clone()],
             output_id.clone(),
         );
@@ -1649,6 +1664,32 @@ fn asset_type_label(type_hint: Option<AssetTypeHint>) -> &'static str {
     }
 }
 
+/// Builds a fresh step's inputs, one per declared operator metadata input, in
+/// order. Model slots point at `primary_model` (retarget later); config slots
+/// get a default-seeded CBOR map; Lua slots get the template; other slots get
+/// empty/zeroed placeholders.
+fn operator_step_inputs(metadata: &OperatorMetadata, primary_model: &str) -> Vec<ExecutionInput> {
+    metadata
+        .inputs
+        .iter()
+        .map(|input| match input {
+            OperatorMetadataInput::ModelWASM => ExecutionInput::AssetRef(primary_model.to_string()),
+            OperatorMetadataInput::CBORConfiguration(cddl) => {
+                let fields = operator_config::parse_schema(cddl).unwrap_or_default();
+                ExecutionInput::Inline(operator_config::encode(
+                    &fields,
+                    &operator_config::default_values(&fields),
+                ))
+            }
+            OperatorMetadataInput::LuaSource(template) => {
+                ExecutionInput::Inline(template.clone().into_bytes())
+            }
+            OperatorMetadataInput::Blob => ExecutionInput::Inline(Vec::new()),
+            OperatorMetadataInput::VecF64(dim) => ExecutionInput::Inline(vec![0u8; dim * 8]),
+        })
+        .collect()
+}
+
 fn step_depends_on_asset(step: &volumetric::ExecutionStep, asset_id: &str) -> bool {
     step.operator_id == asset_id
         || step.inputs.iter().any(|input| match input {
@@ -1807,6 +1848,43 @@ mod tests {
             summary.selected_project_item,
             Some(ProjectSelection::Step(0))
         );
+    }
+
+    #[test]
+    fn added_operator_wires_all_declared_inputs() {
+        let mut app = VolumetricUiV2::default();
+        dispatch(&mut app, UiEvent::synthetic_click(ADD_OPERATOR_KEY));
+
+        let op_name = app.summary().selected_operator.expect("operator selected");
+        let asset = volumetric_assets::get_operator(&op_name).expect("bundled operator");
+        let metadata =
+            volumetric::operator_metadata_from_wasm_bytes(asset.bytes).expect("operator metadata");
+
+        let step = &app.project().timeline()[0];
+        assert_eq!(
+            step.inputs.len(),
+            metadata.inputs.len(),
+            "one step input per declared metadata input"
+        );
+        for (input, meta) in step.inputs.iter().zip(&metadata.inputs) {
+            match meta {
+                OperatorMetadataInput::ModelWASM => {
+                    assert!(matches!(input, ExecutionInput::AssetRef(_)));
+                }
+                OperatorMetadataInput::CBORConfiguration(cddl) => {
+                    let ExecutionInput::Inline(bytes) = input else {
+                        panic!("config input should be inline CBOR");
+                    };
+                    // The default config decodes and covers every schema field.
+                    let fields = operator_config::parse_schema(cddl).unwrap_or_default();
+                    let decoded = operator_config::decode(bytes);
+                    for field in &fields {
+                        assert!(decoded.contains_key(&field.name), "missing {}", field.name);
+                    }
+                }
+                _ => assert!(matches!(input, ExecutionInput::Inline(_))),
+            }
+        }
     }
 
     #[test]
