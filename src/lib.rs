@@ -207,51 +207,9 @@ pub struct ExecutionStep {
     pub outputs: Vec<String>,
 }
 
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-pub enum OperatorMetadataInput {
-    ModelWASM,
-    /// A CBOR-encoded configuration blob.
-    ///
-    /// The `String` is a CDDL snippet describing the expected CBOR structure.
-    ///
-    /// v0 convention (current host support): a single record/map like:
-    /// `{ dx: float, dy: float, dz: float }`.
-    ///
-    /// The host UI uses this to generate widgets and encodes a CBOR map from field names to
-    /// primitive values.
-    CBORConfiguration(String),
-    /// A Lua script source input.
-    ///
-    /// The `String` is a template/stub script showing the required function signatures.
-    /// The host UI displays a multiline text editor pre-populated with this template.
-    /// The script is passed as UTF-8 bytes to the operator.
-    LuaSource(String),
-    /// Raw binary data input (e.g., STL file data).
-    ///
-    /// The host UI should display a file picker allowing the user to select a file.
-    /// The file contents are passed as raw bytes to the operator.
-    Blob,
-    /// A vector of f64 values with specified dimension.
-    ///
-    /// The `usize` specifies the expected dimension (e.g., 3 for vec3).
-    /// The host UI allows either literal input (drag values) or asset reference.
-    /// Data is encoded as raw bytes (8 bytes per f64, little-endian).
-    VecF64(usize),
-}
-
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-pub enum OperatorMetadataOutput {
-    ModelWASM,
-}
-
-// TODO: The operators should emit this as a cbor-encoded response to get_metadata()
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-pub struct OperatorMetadata {
-    pub name: String,
-    pub version: String,
-    pub inputs: Vec<OperatorMetadataInput>,
-    pub outputs: Vec<OperatorMetadataOutput>,
-}
+// The operator metadata contract is shared with the operator crates through
+// volumetric_abi; re-exported here so hosts keep using `volumetric::OperatorMetadata`.
+pub use volumetric_abi::{OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput};
 
 /// Load `OperatorMetadata` from an operator WASM module via its `get_metadata()` export.
 ///
@@ -272,10 +230,7 @@ pub fn operator_metadata_from_wasm_bytes(
         .get_metadata()
         .map_err(|e| ExecutionError::WasmBackend(e.to_string()))?;
 
-    let mut cursor = std::io::Cursor::new(bytes);
-    ciborium::de::from_reader(&mut cursor).map_err(|e| {
-        ExecutionError::WasmBackend(format!("Failed to decode operator metadata CBOR: {e}"))
-    })
+    volumetric_abi::decode_metadata(&bytes).map_err(ExecutionError::WasmBackend)
 }
 
 pub mod adaptive_surface_nets_2;

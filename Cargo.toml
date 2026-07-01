@@ -26,6 +26,7 @@ members = [
     "crates/operators/stl_import_operator",
     "crates/operators/rectangular_prism_operator",
     "crates/operators/heightmap_extrude_operator",
+    "crates/volumetric_abi",
     "crates/volumetric_assets",
     "crates/volumetric_renderer",
     "crates/volumetric_ui",
@@ -45,6 +46,7 @@ normal-diagnostic = []
 edge-diagnostic = []
 
 [dependencies]
+volumetric_abi = { path = "crates/volumetric_abi" }
 wasmtime = { version = "44", optional = true }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }

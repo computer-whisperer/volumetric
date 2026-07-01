@@ -312,6 +312,7 @@ version = "0.1.0"
 dependencies = [
  "ciborium",
  "serde",
+ "volumetric_abi",
  "wasm-encoder 0.248.0",
  "wasmparser 0.248.0",
 ]
@@ -2132,6 +2133,7 @@ dependencies = [
  "ciborium",
  "image",
  "serde",
+ "volumetric_abi",
  "wasm-encoder 0.248.0",
 ]
 
@@ -2603,6 +2605,7 @@ dependencies = [
  "full_moon",
  "serde",
  "thiserror 2.0.18",
+ "volumetric_abi",
  "walrus",
 ]
 
@@ -3689,6 +3692,7 @@ version = "0.1.0"
 dependencies = [
  "ciborium",
  "serde",
+ "volumetric_abi",
  "walrus",
 ]
 
@@ -3812,6 +3816,7 @@ version = "0.1.0"
 dependencies = [
  "ciborium",
  "serde",
+ "volumetric_abi",
  "walrus",
 ]
 
@@ -3920,6 +3925,7 @@ version = "0.1.0"
 dependencies = [
  "ciborium",
  "serde",
+ "volumetric_abi",
  "walrus",
 ]
 
@@ -4247,6 +4253,7 @@ version = "0.1.0"
 dependencies = [
  "ciborium",
  "serde",
+ "volumetric_abi",
  "wasm-encoder 0.248.0",
 ]
 
@@ -4554,6 +4561,7 @@ version = "0.1.0"
 dependencies = [
  "ciborium",
  "serde",
+ "volumetric_abi",
  "walrus",
 ]
 
@@ -4735,10 +4743,19 @@ dependencies = [
  "rayon",
  "serde",
  "thiserror 2.0.18",
+ "volumetric_abi",
  "wasm-bindgen",
  "wasmparser 0.248.0",
  "wasmtime",
  "web-time",
+]
+
+[[package]]
+name = "volumetric_abi"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "serde",
 ]
 
 [[package]]

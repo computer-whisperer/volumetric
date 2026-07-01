@@ -1,12 +1,6 @@
 //! Translate operator.
 //!
-//! Host ABI:
-//! - `host.get_input_len(i32) -> u32`
-//! - `host.get_input_data(i32, ptr, len)`
-//! - `host.post_output(i32, ptr, len)`
-//!
-//! Operator ABI:
-//! - `get_metadata() -> i64` returning `(ptr: u32, len: u32)` packed as `ptr | (len << 32)`
+//! Host/operator ABI: see the `volumetric_abi` crate.
 //!
 //! Generated Model ABI (N-dimensional):
 //! - `get_dimensions() -> u32`: Passed through from input model
@@ -23,24 +17,7 @@
 
 use walrus::{FunctionBuilder, FunctionId, MemoryId, Module, ModuleConfig, ValType};
 
-#[derive(Clone, Debug, serde::Serialize)]
-enum OperatorMetadataInput {
-    ModelWASM,
-    CBORConfiguration(String),
-}
-
-#[derive(Clone, Debug, serde::Serialize)]
-enum OperatorMetadataOutput {
-    ModelWASM,
-}
-
-#[derive(Clone, Debug, serde::Serialize)]
-struct OperatorMetadata {
-    name: String,
-    version: String,
-    inputs: Vec<OperatorMetadataInput>,
-    outputs: Vec<OperatorMetadataOutput>,
-}
+use volumetric_abi::{OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput};
 
 #[derive(Clone, Debug, serde::Deserialize)]
 struct TranslateConfig {
@@ -59,19 +36,7 @@ impl Default for TranslateConfig {
     }
 }
 
-#[link(wasm_import_module = "host")]
-unsafe extern "C" {
-    fn get_input_len(arg: i32) -> u32;
-    fn get_input_data(arg: i32, ptr: i32, len: i32);
-    fn post_output(output_idx: i32, ptr: i32, len: i32);
-    fn post_error(ptr: i32, len: i32);
-}
-
-/// Report a failure to the host; the run fails with this message instead of
-/// producing outputs.
-fn report_error(msg: &str) {
-    unsafe { post_error(msg.as_ptr() as i32, msg.len() as i32) }
-}
+use volumetric_abi::host::{post_output, read_input, report_error};
 
 /// New N-dimensional ABI function names
 const ABI_FUNCTIONS_ND: &[&str] = &["get_dimensions", "get_bounds", "sample"];
@@ -374,24 +339,13 @@ fn transform_wasm(input_bytes: &[u8], cfg: TranslateConfig) -> Result<Vec<u8>, S
 
 #[unsafe(no_mangle)]
 pub extern "C" fn run() {
-    let len = unsafe { get_input_len(0) } as usize;
-    let mut buf = vec![0u8; len];
-
-    if len > 0 {
-        unsafe {
-            get_input_data(0, buf.as_mut_ptr() as i32, len as i32);
-        }
-    }
+    let buf = read_input(0);
 
     let cfg = {
-        let cfg_len = unsafe { get_input_len(1) } as usize;
-        if cfg_len == 0 {
+        let cfg_buf = read_input(1);
+        if cfg_buf.is_empty() {
             TranslateConfig::default()
         } else {
-            let mut cfg_buf = vec![0u8; cfg_len];
-            unsafe {
-                get_input_data(1, cfg_buf.as_mut_ptr() as i32, cfg_len as i32);
-            }
             let mut cursor = std::io::Cursor::new(&cfg_buf);
             ciborium::de::from_reader::<TranslateConfig, _>(&mut cursor).unwrap_or_default()
         }
@@ -406,18 +360,16 @@ pub extern "C" fn run() {
         }
     };
 
-    unsafe {
-        post_output(0, output.as_ptr() as i32, output.len() as i32);
-    }
+    post_output(0, &output);
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn get_metadata() -> i64 {
     static METADATA: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-    let bytes = METADATA.get_or_init(|| {
+    volumetric_abi::metadata_reply(&METADATA, || {
         let schema = "{ dx: float .default 0.0, dy: float .default 0.0, dz: float .default 0.0 }"
             .to_string();
-        let metadata = OperatorMetadata {
+        OperatorMetadata {
             name: "translate_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             inputs: vec![
@@ -425,15 +377,6 @@ pub extern "C" fn get_metadata() -> i64 {
                 OperatorMetadataInput::CBORConfiguration(schema),
             ],
             outputs: vec![OperatorMetadataOutput::ModelWASM],
-        };
-
-        let mut out = Vec::new();
-        ciborium::ser::into_writer(&metadata, &mut out)
-            .expect("translate_operator metadata CBOR serialization should not fail");
-        out
-    });
-
-    let ptr = bytes.as_ptr() as u32;
-    let len = bytes.len() as u32;
-    (ptr as u64 | ((len as u64) << 32)) as i64
+        }
+    })
 }

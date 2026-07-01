@@ -209,10 +209,9 @@ impl OperatorExecutor for NativeOperatorExecutor {
 
         let packed = metadata_func
             .call(&mut store, ())
-            .map_err(|e| WasmBackendError::Execution(e.to_string()))? as u64;
+            .map_err(|e| WasmBackendError::Execution(e.to_string()))?;
 
-        let ptr = (packed & 0xFFFF_FFFF) as usize;
-        let len = (packed >> 32) as usize;
+        let (ptr, len) = volumetric_abi::unpack_ptr_len(packed);
 
         let memory = instance
             .get_memory(&mut store, "memory")

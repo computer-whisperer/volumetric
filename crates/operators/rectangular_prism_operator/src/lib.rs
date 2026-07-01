@@ -2,13 +2,7 @@
 //!
 //! Emitter operator that generates a volumetric box model using the N-dimensional ABI.
 //!
-//! Host ABI:
-//! - `host.get_input_len(i32) -> u32`
-//! - `host.get_input_data(i32, ptr, len)`
-//! - `host.post_output(i32, ptr, len)`
-//!
-//! Operator ABI:
-//! - `get_metadata() -> i64` returning `(ptr: u32, len: u32)` packed as `ptr | (len << 32)`
+//! Host/operator ABI: see the `volumetric_abi` crate.
 //!
 //! Generated Model ABI:
 //! - `get_dimensions() -> u32`: Returns 3
@@ -27,24 +21,7 @@
 
 use walrus::{FunctionBuilder, MemoryId, Module, ValType};
 
-#[derive(Clone, Debug, serde::Serialize)]
-enum OperatorMetadataInput {
-    CBORConfiguration(String),
-    VecF64(usize),
-}
-
-#[derive(Clone, Debug, serde::Serialize)]
-enum OperatorMetadataOutput {
-    ModelWASM,
-}
-
-#[derive(Clone, Debug, serde::Serialize)]
-struct OperatorMetadata {
-    name: String,
-    version: String,
-    inputs: Vec<OperatorMetadataInput>,
-    outputs: Vec<OperatorMetadataOutput>,
-}
+use volumetric_abi::{OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput};
 
 #[derive(Clone, Debug, serde::Deserialize)]
 struct ModeConfig {
@@ -59,30 +36,7 @@ impl Default for ModeConfig {
     }
 }
 
-#[link(wasm_import_module = "host")]
-unsafe extern "C" {
-    fn get_input_len(arg: i32) -> u32;
-    fn get_input_data(arg: i32, ptr: i32, len: i32);
-    fn post_output(output_idx: i32, ptr: i32, len: i32);
-    fn post_error(ptr: i32, len: i32);
-}
-
-/// Report a failure to the host; the run fails with this message instead of
-/// producing outputs.
-fn report_error(msg: &str) {
-    unsafe { post_error(msg.as_ptr() as i32, msg.len() as i32) }
-}
-
-/// Read input data from the host
-fn read_input(idx: i32) -> Vec<u8> {
-    let len = unsafe { get_input_len(idx) } as usize;
-    if len == 0 {
-        return Vec::new();
-    }
-    let mut buf = vec![0u8; len];
-    unsafe { get_input_data(idx, buf.as_mut_ptr() as i32, len as i32) };
-    buf
-}
+use volumetric_abi::host::{post_output, read_input, report_error};
 
 /// Decode a VecF64 from raw bytes (8 bytes per f64, little-endian), with a default fallback
 fn decode_vec3(data: &[u8], default: [f64; 3]) -> [f64; 3] {
@@ -354,17 +308,17 @@ pub extern "C" fn run() {
             return;
         }
     };
-    unsafe { post_output(0, output.as_ptr() as i32, output.len() as i32) };
+    post_output(0, &output);
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn get_metadata() -> i64 {
     static METADATA: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-    let bytes = METADATA.get_or_init(|| {
+    volumetric_abi::metadata_reply(&METADATA, || {
         let schema =
             r#"{ mode: "opposite_corners" / "position_size" .default "opposite_corners" }"#
                 .to_string();
-        let metadata = OperatorMetadata {
+        OperatorMetadata {
             name: "rectangular_prism_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             inputs: vec![
@@ -373,13 +327,6 @@ pub extern "C" fn get_metadata() -> i64 {
                 OperatorMetadataInput::VecF64(3), // vector_b
             ],
             outputs: vec![OperatorMetadataOutput::ModelWASM],
-        };
-        let mut out = Vec::new();
-        ciborium::ser::into_writer(&metadata, &mut out)
-            .expect("rectangular_prism_operator metadata CBOR serialization should not fail");
-        out
-    });
-    let ptr = bytes.as_ptr() as u32;
-    let len = bytes.len() as u32;
-    (ptr as u64 | ((len as u64) << 32)) as i64
+        }
+    })
 }

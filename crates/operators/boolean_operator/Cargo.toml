@@ -7,6 +7,7 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
+volumetric_abi = { path = "../../volumetric_abi" }
 serde = { version = "1", features = ["derive"] }
 ciborium = "0.2"
 wasmparser = "0.248"

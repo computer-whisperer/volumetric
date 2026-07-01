@@ -1,12 +1,6 @@
 //! STL Import Operator.
 //!
-//! Host ABI:
-//! - `host.get_input_len(i32) -> u32`
-//! - `host.get_input_data(i32, ptr, len)`
-//! - `host.post_output(i32, ptr, len)`
-//!
-//! Operator ABI:
-//! - `get_metadata() -> i64` returning `(ptr: u32, len: u32)` packed as `ptr | (len << 32)`
+//! Host/operator ABI: see the `volumetric_abi` crate.
 //!
 //! Behavior:
 //! - Reads STL data (binary or ASCII) from input 0
@@ -24,26 +18,7 @@ use wasm_encoder::{
 
 // NOTE: Order must match the OperatorMetadataInput enum in src/lib.rs for CBOR compatibility
 #[allow(dead_code)]
-#[derive(Clone, Debug, serde::Serialize)]
-enum OperatorMetadataInput {
-    ModelWASM,
-    CBORConfiguration(String),
-    LuaSource(String),
-    Blob,
-}
-
-#[derive(Clone, Debug, serde::Serialize)]
-enum OperatorMetadataOutput {
-    ModelWASM,
-}
-
-#[derive(Clone, Debug, serde::Serialize)]
-struct OperatorMetadata {
-    name: String,
-    version: String,
-    inputs: Vec<OperatorMetadataInput>,
-    outputs: Vec<OperatorMetadataOutput>,
-}
+use volumetric_abi::{OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput};
 
 // ============================================================================
 // Configuration
@@ -77,19 +52,7 @@ impl Default for StlImportConfig {
 // Host ABI
 // ============================================================================
 
-#[link(wasm_import_module = "host")]
-unsafe extern "C" {
-    fn get_input_len(arg: i32) -> u32;
-    fn get_input_data(arg: i32, ptr: i32, len: i32);
-    fn post_output(output_idx: i32, ptr: i32, len: i32);
-    fn post_error(ptr: i32, len: i32);
-}
-
-/// Report a failure to the host; the run fails with this message instead of
-/// producing outputs.
-fn report_error(msg: &str) {
-    unsafe { post_error(msg.as_ptr() as i32, msg.len() as i32) }
-}
+use volumetric_abi::host::{post_output, read_input, report_error};
 
 // ============================================================================
 // STL Data Structures
@@ -1564,20 +1527,14 @@ fn process_and_generate_wasm(
 #[unsafe(no_mangle)]
 pub extern "C" fn run() {
     // Read STL data from input 0
-    let stl_len = unsafe { get_input_len(0) } as usize;
-    let mut stl_buf = vec![0u8; stl_len];
-    if stl_len > 0 {
-        unsafe { get_input_data(0, stl_buf.as_mut_ptr() as i32, stl_len as i32) };
-    }
+    let stl_buf = read_input(0);
 
     // Read config from input 1
     let config = {
-        let cfg_len = unsafe { get_input_len(1) } as usize;
-        if cfg_len == 0 {
+        let cfg_buf = read_input(1);
+        if cfg_buf.is_empty() {
             StlImportConfig::default()
         } else {
-            let mut cfg_buf = vec![0u8; cfg_len];
-            unsafe { get_input_data(1, cfg_buf.as_mut_ptr() as i32, cfg_len as i32) };
             let mut cursor = std::io::Cursor::new(&cfg_buf);
             ciborium::de::from_reader::<StlImportConfig, _>(&mut cursor).unwrap_or_default()
         }
@@ -1592,17 +1549,15 @@ pub extern "C" fn run() {
         }
     };
 
-    unsafe {
-        post_output(0, output.as_ptr() as i32, output.len() as i32);
-    }
+    post_output(0, &output);
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn get_metadata() -> i64 {
     static METADATA: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-    let bytes = METADATA.get_or_init(|| {
+    volumetric_abi::metadata_reply(&METADATA, || {
         let schema = "{ scale: float .default 1.0, translate: [float, float, float] .default [0,0,0], center: bool .default false }".to_string();
-        let metadata = OperatorMetadata {
+        OperatorMetadata {
             name: "stl_import_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             inputs: vec![
@@ -1610,15 +1565,6 @@ pub extern "C" fn get_metadata() -> i64 {
                 OperatorMetadataInput::CBORConfiguration(schema),
             ],
             outputs: vec![OperatorMetadataOutput::ModelWASM],
-        };
-
-        let mut out = Vec::new();
-        ciborium::ser::into_writer(&metadata, &mut out)
-            .expect("stl_import_operator metadata CBOR serialization should not fail");
-        out
-    });
-
-    let ptr = bytes.as_ptr() as u32;
-    let len = bytes.len() as u32;
-    (ptr as u64 | ((len as u64) << 32)) as i64
+        }
+    })
 }

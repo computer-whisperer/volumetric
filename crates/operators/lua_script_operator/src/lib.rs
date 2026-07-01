@@ -1,12 +1,6 @@
 //! Lua Script Operator: compiles a restricted Lua script into a WASM Model module.
 //!
-//! Host ABI:
-//! - `host.get_input_len(i32) -> u32`
-//! - `host.get_input_data(i32, ptr, len)`
-//! - `host.post_output(i32, ptr, len)`
-//!
-//! Operator ABI:
-//! - `get_metadata() -> i64` returning `(ptr: u32, len: u32)` packed as `ptr | (len << 32)`
+//! Host/operator ABI: see the `volumetric_abi` crate.
 //!
 //! Input/Output:
 //! - Input 0: UTF-8 Lua source containing the required functions
@@ -75,37 +69,9 @@
 
 use walrus::{FunctionBuilder, Module, ModuleConfig, ValType};
 
-#[derive(Clone, Debug, serde::Serialize)]
-enum OperatorMetadataInput {
-    LuaSource(String),
-}
+use volumetric_abi::{OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput};
 
-#[derive(Clone, Debug, serde::Serialize)]
-enum OperatorMetadataOutput {
-    ModelWASM,
-}
-
-#[derive(Clone, Debug, serde::Serialize)]
-struct OperatorMetadata {
-    name: String,
-    version: String,
-    inputs: Vec<OperatorMetadataInput>,
-    outputs: Vec<OperatorMetadataOutput>,
-}
-
-#[link(wasm_import_module = "host")]
-unsafe extern "C" {
-    fn get_input_len(arg: i32) -> u32;
-    fn get_input_data(arg: i32, ptr: i32, len: i32);
-    fn post_output(output_idx: i32, ptr: i32, len: i32);
-    fn post_error(ptr: i32, len: i32);
-}
-
-/// Report a failure to the host; the run fails with this message instead of
-/// producing outputs.
-fn report_error(msg: &str) {
-    unsafe { post_error(msg.as_ptr() as i32, msg.len() as i32) }
-}
+use volumetric_abi::host::{post_output, read_input, report_error};
 
 /// Required Lua functions that must be defined in the script.
 /// These are compiled to internal WASM functions and wrapped by the ABI exports.
@@ -1824,13 +1790,7 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn run() {
-    let len = unsafe { get_input_len(0) } as usize;
-    let mut buf = vec![0u8; len];
-    if len > 0 {
-        unsafe {
-            get_input_data(0, buf.as_mut_ptr() as i32, len as i32);
-        }
-    }
+    let buf = read_input(0);
     let src = match std::str::from_utf8(&buf) {
         Ok(s) => s,
         Err(_) => {
@@ -1845,9 +1805,7 @@ pub extern "C" fn run() {
             return;
         }
     };
-    unsafe {
-        post_output(0, output.as_ptr() as i32, output.len() as i32);
-    }
+    post_output(0, &output);
 }
 
 /// Minimal stub template for the Lua script input.
@@ -1888,21 +1846,12 @@ end
 #[unsafe(no_mangle)]
 pub extern "C" fn get_metadata() -> i64 {
     static METADATA: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-    let bytes = METADATA.get_or_init(|| {
-        let metadata = OperatorMetadata {
-            name: "lua_script_operator".to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            inputs: vec![OperatorMetadataInput::LuaSource(LUA_TEMPLATE.to_string())],
-            outputs: vec![OperatorMetadataOutput::ModelWASM],
-        };
-        let mut out = Vec::new();
-        ciborium::ser::into_writer(&metadata, &mut out)
-            .expect("metadata CBOR serialization should not fail");
-        out
-    });
-    let ptr = bytes.as_ptr() as u32;
-    let len = bytes.len() as u32;
-    (ptr as u64 | ((len as u64) << 32)) as i64
+    volumetric_abi::metadata_reply(&METADATA, || OperatorMetadata {
+        name: "lua_script_operator".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        inputs: vec![OperatorMetadataInput::LuaSource(LUA_TEMPLATE.to_string())],
+        outputs: vec![OperatorMetadataOutput::ModelWASM],
+    })
 }
 
 #[cfg(test)]

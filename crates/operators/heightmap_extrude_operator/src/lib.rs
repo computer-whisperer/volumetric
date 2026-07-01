@@ -1,12 +1,6 @@
 //! Heightmap Extrude Operator.
 //!
-//! Host ABI:
-//! - `host.get_input_len(i32) -> u32`
-//! - `host.get_input_data(i32, ptr, len)`
-//! - `host.post_output(i32, ptr, len)`
-//!
-//! Operator ABI:
-//! - `get_metadata() -> i64` returning `(ptr: u32, len: u32)` packed as `ptr | (len << 32)`
+//! Host/operator ABI: see the `volumetric_abi` crate.
 //!
 //! Generated Model ABI (N-dimensional):
 //! - `get_dimensions() -> u32`: Returns 3
@@ -39,27 +33,7 @@ use wasm_encoder::{
 // Operator Metadata Types
 // ============================================================================
 
-#[derive(Clone, Debug, serde::Serialize)]
-#[allow(dead_code)]
-enum OperatorMetadataInput {
-    ModelWASM,
-    CBORConfiguration(String),
-    LuaSource(String),
-    Blob,
-}
-
-#[derive(Clone, Debug, serde::Serialize)]
-enum OperatorMetadataOutput {
-    ModelWASM,
-}
-
-#[derive(Clone, Debug, serde::Serialize)]
-struct OperatorMetadata {
-    name: String,
-    version: String,
-    inputs: Vec<OperatorMetadataInput>,
-    outputs: Vec<OperatorMetadataOutput>,
-}
+use volumetric_abi::{OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput};
 
 // ============================================================================
 // Configuration
@@ -97,19 +71,7 @@ impl Default for HeightmapConfig {
 // Host ABI
 // ============================================================================
 
-#[link(wasm_import_module = "host")]
-unsafe extern "C" {
-    fn get_input_len(arg: i32) -> u32;
-    fn get_input_data(arg: i32, ptr: i32, len: i32);
-    fn post_output(output_idx: i32, ptr: i32, len: i32);
-    fn post_error(ptr: i32, len: i32);
-}
-
-/// Report a failure to the host; the run fails with this message instead of
-/// producing outputs.
-fn report_error(msg: &str) {
-    unsafe { post_error(msg.as_ptr() as i32, msg.len() as i32) }
-}
+use volumetric_abi::host::{post_output, read_input, report_error};
 
 // ============================================================================
 // Image Processing
@@ -796,23 +758,17 @@ fn process_and_generate_wasm(
 pub extern "C" fn run() {
     // Read config from input 0
     let config = {
-        let cfg_len = unsafe { get_input_len(0) } as usize;
-        if cfg_len == 0 {
+        let cfg_buf = read_input(0);
+        if cfg_buf.is_empty() {
             HeightmapConfig::default()
         } else {
-            let mut cfg_buf = vec![0u8; cfg_len];
-            unsafe { get_input_data(0, cfg_buf.as_mut_ptr() as i32, cfg_len as i32) };
             let mut cursor = std::io::Cursor::new(&cfg_buf);
             ciborium::de::from_reader::<HeightmapConfig, _>(&mut cursor).unwrap_or_default()
         }
     };
 
     // Read image data from input 1
-    let img_len = unsafe { get_input_len(1) } as usize;
-    let mut img_buf = vec![0u8; img_len];
-    if img_len > 0 {
-        unsafe { get_input_data(1, img_buf.as_mut_ptr() as i32, img_len as i32) };
-    }
+    let img_buf = read_input(1);
 
     // Process image and generate WASM
     let output = match process_and_generate_wasm(&img_buf, &config) {
@@ -823,19 +779,17 @@ pub extern "C" fn run() {
         }
     };
 
-    unsafe {
-        post_output(0, output.as_ptr() as i32, output.len() as i32);
-    }
+    post_output(0, &output);
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn get_metadata() -> i64 {
     static METADATA: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-    let bytes = METADATA.get_or_init(|| {
+    volumetric_abi::metadata_reply(&METADATA, || {
         let schema =
             "{ width: float .default 1.0, depth: float .default 1.0, height: float .default 1.0, clip: float .default 0.0 }"
                 .to_string();
-        let metadata = OperatorMetadata {
+        OperatorMetadata {
             name: "heightmap_extrude_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             inputs: vec![
@@ -843,15 +797,6 @@ pub extern "C" fn get_metadata() -> i64 {
                 OperatorMetadataInput::Blob,
             ],
             outputs: vec![OperatorMetadataOutput::ModelWASM],
-        };
-
-        let mut out = Vec::new();
-        ciborium::ser::into_writer(&metadata, &mut out)
-            .expect("heightmap_extrude_operator metadata CBOR serialization should not fail");
-        out
-    });
-
-    let ptr = bytes.as_ptr() as u32;
-    let len = bytes.len() as u32;
-    (ptr as u64 | ((len as u64) << 32)) as i64
+        }
+    })
 }
