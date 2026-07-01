@@ -29,6 +29,7 @@ pub const TOGGLE_AUTO_REBUILD_KEY: &str = "action:toggle-auto-rebuild";
 pub const TOGGLE_GRID_KEY: &str = "viewport:toggle-grid";
 pub const TOGGLE_SSAO_KEY: &str = "viewport:toggle-ssao";
 pub const FRAME_PREVIEW_KEY: &str = "viewport:frame-preview";
+pub const RESET_CAMERA_KEY: &str = "viewport:reset-camera";
 
 /// Top application menubar; menu values are `file` and `add`.
 const MENUBAR_KEY: &str = "main-menu";
@@ -41,6 +42,9 @@ const PIPELINE_KEY: &str = "pipeline";
 const MODE_SELECT_KEY: &str = "view:mode";
 const RESOLUTION_SELECT_KEY: &str = "view:res";
 const CAMERA_SELECT_KEY: &str = "view:camera";
+/// SSAO parameter popover trigger; steppers use `view:ssao-adj:{field}:{dir}`.
+const SSAO_SETTINGS_KEY: &str = "view:ssao";
+const SSAO_ADJUST_PREFIX: &str = "view:ssao-adj:";
 /// Per-output render settings: `output:settings:{id}` opens the popover
 /// (plus `:dismiss`); mode/res routes end `:{value}` after the asset id.
 const OUTPUT_SETTINGS_PREFIX: &str = "output:settings:";
@@ -72,7 +76,7 @@ const CONFIG_FIELD_PREFIX: &str = "cfg:";
 const CONFIG_BOOL_PREFIX: &str = "cfg-bool:";
 const CONFIG_ENUM_PREFIX: &str = "cfg-enum:";
 const LUA_SOURCE_KEY: &str = "lua-source";
-const PREVIEW_RESOLUTIONS: [usize; 4] = [24, 48, 64, 96];
+const PREVIEW_RESOLUTIONS: [usize; 9] = [16, 24, 32, 48, 64, 96, 128, 192, 256];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProjectSelection {
@@ -248,6 +252,9 @@ pub struct PreviewRequest {
     pub mesh_plan: PreviewMeshPlan,
     pub show_grid: bool,
     pub ssao: bool,
+    pub ssao_radius: f32,
+    pub ssao_bias: f32,
+    pub ssao_strength: f32,
     pub stale: bool,
 }
 
@@ -270,6 +277,8 @@ pub enum PreviewBuildStatus {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ViewportCameraCommand {
     FramePreview,
+    /// Return the camera to its default pose.
+    Reset,
 }
 
 /// Lifecycle of the (host-driven) asynchronous project run.
@@ -396,6 +405,9 @@ pub struct VolumetricUiV2 {
     camera_control_scheme: CameraControlScheme,
     show_grid: bool,
     ssao: bool,
+    ssao_radius: f32,
+    ssao_bias: f32,
+    ssao_strength: f32,
     runtime_assets: Vec<LoadedAsset>,
     last_run_elapsed_ms: Option<u128>,
     last_run_error: Option<String>,
@@ -450,6 +462,10 @@ impl VolumetricUiV2 {
             camera_control_scheme: CameraControlScheme::default(),
             show_grid: true,
             ssao: true,
+            // Renderer defaults (renderer::RenderSettings::default()).
+            ssao_radius: 0.5,
+            ssao_bias: 0.025,
+            ssao_strength: 1.0,
             runtime_assets: Vec::new(),
             last_run_elapsed_ms: None,
             last_run_error: None,
@@ -628,8 +644,26 @@ impl VolumetricUiV2 {
             mesh_plan: PreviewMeshPlan::for_mode(render.mode, render.resolution, render.asn2),
             show_grid: self.show_grid,
             ssao: self.ssao,
+            ssao_radius: self.ssao_radius,
+            ssao_bias: self.ssao_bias,
+            ssao_strength: self.ssao_strength,
             stale: self.last_run_stale,
         })
+    }
+
+    /// Adjusts one SSAO parameter; `up` steps the value up. Radius and bias
+    /// step geometrically (their useful ranges span orders of magnitude).
+    fn adjust_ssao(&mut self, field: &str, up: bool) {
+        let scale = if up { 1.5 } else { 1.0 / 1.5 };
+        match field {
+            "radius" => self.ssao_radius = (self.ssao_radius * scale).clamp(0.005, 0.5),
+            "bias" => self.ssao_bias = (self.ssao_bias * scale).clamp(0.0001, 0.02),
+            "strength" => {
+                let delta = if up { 0.25 } else { -0.25 };
+                self.ssao_strength = (self.ssao_strength + delta).clamp(0.5, 4.0);
+            }
+            _ => {}
+        }
     }
 
     pub fn camera_control_scheme(&self) -> CameraControlScheme {
@@ -1336,7 +1370,14 @@ impl VolumetricUiV2 {
     /// (render mode, resolution, camera scheme) into app state. Returns true
     /// when the event belonged to one of them.
     fn handle_view_select(&mut self, event: &UiEvent) -> bool {
-        for key in [MODE_SELECT_KEY, RESOLUTION_SELECT_KEY, CAMERA_SELECT_KEY] {
+        for key in [
+            MODE_SELECT_KEY,
+            RESOLUTION_SELECT_KEY,
+            CAMERA_SELECT_KEY,
+            // Not a value picker (steppers live inside), but the trigger and
+            // dismiss-scrim routes follow the same shape; Pick never fires.
+            SSAO_SETTINGS_KEY,
+        ] {
             let Some(action) = select::classify_event(event, key) else {
                 continue;
             };
@@ -1574,6 +1615,12 @@ impl App for VolumetricUiV2 {
             return;
         }
 
+        if event.is_click_or_activate(RESET_CAMERA_KEY) {
+            self.pending_camera_command = Some(ViewportCameraCommand::Reset);
+            self.status = "camera reset".to_string();
+            return;
+        }
+
         if !matches!(event.kind, UiEventKind::Click | UiEventKind::Activate) {
             return;
         }
@@ -1661,6 +1708,10 @@ impl App for VolumetricUiV2 {
             }
         } else if let Some(id) = route.strip_prefix(OUTPUT_DEFAULTS_PREFIX) {
             self.clear_output_override(id);
+        } else if let Some(rest) = route.strip_prefix(SSAO_ADJUST_PREFIX) {
+            if let Some((field, direction)) = rest.split_once(':') {
+                self.adjust_ssao(field, direction == "up");
+            }
         } else if let Some(rest) = route.strip_prefix(OUTPUT_ASN2_PREFIX) {
             if let Some((rest, direction)) = rest.rsplit_once(':')
                 && let Some((id, field)) = rest.rsplit_once(':')
@@ -1800,8 +1851,49 @@ fn select_layer(app: &VolumetricUiV2) -> Option<El> {
                 .copied()
                 .map(|scheme| (camera_scheme_route_name(scheme), camera_scheme_tooltip(scheme))),
         )),
+        SSAO_SETTINGS_KEY => Some(ssao_settings_popover(app)),
         _ => None,
     }
+}
+
+/// Anchored popover with SSAO parameter steppers. Steppers keep it open;
+/// outside click or Escape dismisses.
+fn ssao_settings_popover(app: &VolumetricUiV2) -> El {
+    let stepper = |field: &str, label: &str, value: String| {
+        field_row(
+            label,
+            row([
+                icon_button("chevron-left")
+                    .ghost()
+                    .xsmall()
+                    .key(format!("{SSAO_ADJUST_PREFIX}{field}:down")),
+                text(value)
+                    .label()
+                    .text_align(TextAlign::Center)
+                    .width(Size::Fixed(56.0)),
+                icon_button("chevron-right")
+                    .ghost()
+                    .xsmall()
+                    .key(format!("{SSAO_ADJUST_PREFIX}{field}:up")),
+            ])
+            .gap(tokens::SPACE_1)
+            .align(Align::Center),
+        )
+        .gap(tokens::SPACE_2)
+    };
+    popover(
+        SSAO_SETTINGS_KEY,
+        Anchor::below_key(SSAO_SETTINGS_KEY),
+        popover_panel([column([
+            text("SSAO").label().semibold(),
+            stepper("radius", "Radius", format!("{:.3}", app.ssao_radius)),
+            stepper("bias", "Bias", format!("{:.4}", app.ssao_bias)),
+            stepper("strength", "Strength", format!("{:.2}", app.ssao_strength)),
+        ])
+        .gap(tokens::SPACE_2)
+        .padding(tokens::SPACE_2)
+        .width(Size::Fixed(240.0))]),
+    )
 }
 
 /// Anchored settings popover for one output: render mode + resolution, and a
@@ -1823,15 +1915,19 @@ fn output_settings_popover(app: &VolumetricUiV2, id: &str) -> El {
         }
     }))
     .gap(tokens::SPACE_1);
-    let resolution_buttons = row(PREVIEW_RESOLUTIONS.into_iter().map(|resolution| {
-        let button = button(format!("{resolution}^3"))
-            .xsmall()
-            .key(format!("{OUTPUT_RESOLUTION_PREFIX}{id}:{resolution}"));
-        if render.resolution == resolution {
-            button.primary()
-        } else {
-            button.secondary()
-        }
+    // Two rows: the preset ladder is too wide for one popover line.
+    let resolution_buttons = column(PREVIEW_RESOLUTIONS.chunks(5).map(|chunk| {
+        row(chunk.iter().map(|&resolution| {
+            let button = button(format!("{resolution}^3"))
+                .xsmall()
+                .key(format!("{OUTPUT_RESOLUTION_PREFIX}{id}:{resolution}"));
+            if render.resolution == resolution {
+                button.primary()
+            } else {
+                button.secondary()
+            }
+        }))
+        .gap(tokens::SPACE_1)
     }))
     .gap(tokens::SPACE_1);
 
@@ -1967,11 +2063,21 @@ fn view_controls_cluster(app: &VolumetricUiV2) -> El {
     card([row([
         toggle("Grid", app.show_grid, TOGGLE_GRID_KEY),
         toggle("SSAO", app.ssao, TOGGLE_SSAO_KEY),
+        icon_button("chevron-down")
+            .ghost()
+            .xsmall()
+            .tooltip("SSAO settings")
+            .key(SSAO_SETTINGS_KEY),
         button("Frame")
             .xsmall()
             .secondary()
             .tooltip("Frame the preview in view")
             .key(FRAME_PREVIEW_KEY),
+        button("Reset")
+            .xsmall()
+            .secondary()
+            .tooltip("Reset the camera to its default pose")
+            .key(RESET_CAMERA_KEY),
         vertical_separator().height(Size::Fixed(20.0)),
         select_trigger(MODE_SELECT_KEY, app.render_mode.label()).width(Size::Fixed(90.0)),
         select_trigger(
@@ -3233,6 +3339,35 @@ mod tests {
         assert_eq!(
             default.render_mode,
             PreviewRenderMode::AdaptiveSurfaceNets2
+        );
+    }
+
+    #[test]
+    fn ssao_steppers_and_camera_reset() {
+        let mut app = VolumetricUiV2::default();
+        dispatch(&mut app, UiEvent::synthetic_click(SSAO_SETTINGS_KEY));
+        assert_eq!(app.open_select.as_deref(), Some(SSAO_SETTINGS_KEY));
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{SSAO_ADJUST_PREFIX}radius:down")),
+        );
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{SSAO_ADJUST_PREFIX}strength:up")),
+        );
+        // Steppers keep the popover open.
+        assert_eq!(app.open_select.as_deref(), Some(SSAO_SETTINGS_KEY));
+
+        app.run_project();
+        let requests = app.preview_requests();
+        let request = &requests[0];
+        assert!((request.ssao_radius - 0.5 / 1.5).abs() < 1e-6);
+        assert!((request.ssao_strength - 1.25).abs() < 1e-6);
+
+        dispatch(&mut app, UiEvent::synthetic_click(RESET_CAMERA_KEY));
+        assert_eq!(
+            app.take_camera_command(),
+            Some(ViewportCameraCommand::Reset)
         );
     }
 

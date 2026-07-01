@@ -837,6 +837,10 @@ impl ViewportRenderer {
     fn apply_camera_command(&mut self, command: ViewportCameraCommand) {
         match command {
             ViewportCameraCommand::FramePreview => self.frame_preview(),
+            ViewportCameraCommand::Reset => {
+                self.camera = Some(renderer::test_scenes::create_test_camera());
+                self.pending_frame_preview = false;
+            }
         }
     }
 
@@ -1385,6 +1389,9 @@ fn render_settings(
 
     if let Some(request) = request {
         settings.ssao_enabled = request.ssao;
+        settings.ssao_radius = request.ssao_radius;
+        settings.ssao_bias = request.ssao_bias;
+        settings.ssao_strength = request.ssao_strength;
         if !request.show_grid {
             settings.grid.planes = renderer::GridPlanes::NONE;
         }
@@ -1494,6 +1501,9 @@ mod tests {
             mesh_plan: PreviewMeshPlan::PointCloud { resolution },
             show_grid: true,
             ssao: true,
+            ssao_radius: 0.5,
+            ssao_bias: 0.025,
+            ssao_strength: 1.0,
             stale: false,
         }
     }
