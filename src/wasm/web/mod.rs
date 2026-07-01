@@ -12,6 +12,7 @@
 //!
 //! The JavaScript helper (wasm_helper.js) maintains a handle map of WASM instances
 //! and provides synchronous functions for creating instances and calling exports.
+//! Models use the N-dimensional ABI (get_dimensions/get_bounds/sample/memory).
 
 mod js_bindings;
 
@@ -20,16 +21,52 @@ pub use js_bindings::*;
 
 use crate::wasm::error::WasmBackendError;
 use crate::wasm::traits::{
-    ModelBounds, ModelExecutor, OperatorExecutor, OperatorIo, ParallelModelSampler,
+    ModelBounds, ModelBoundsNd, ModelExecutor, OperatorExecutor, OperatorIo, ParallelModelSampler,
 };
 
 #[cfg(feature = "web")]
 use js_bindings::{
     JsWasmHandle, wasm_model_create_sync, wasm_model_destroy, wasm_model_get_bounds,
-    wasm_model_is_inside, wasm_operator_create, wasm_operator_destroy, wasm_operator_get_error,
-    wasm_operator_get_metadata, wasm_operator_get_output, wasm_operator_get_output_indices,
-    wasm_operator_run,
+    wasm_model_get_dimensions, wasm_model_sample, wasm_operator_create, wasm_operator_destroy,
+    wasm_operator_get_error, wasm_operator_get_metadata, wasm_operator_get_output,
+    wasm_operator_get_output_indices, wasm_operator_run,
 };
+
+/// Fetch a model's N-dimensional bounds through the JS bridge.
+#[cfg(feature = "web")]
+fn fetch_bounds_nd(handle: JsWasmHandle) -> Result<ModelBoundsNd, WasmBackendError> {
+    let dimensions = wasm_model_get_dimensions(handle) as usize;
+    if dimensions == 0 {
+        return Err(WasmBackendError::Execution(
+            "model reported 0 dimensions".to_string(),
+        ));
+    }
+
+    let bounds = wasm_model_get_bounds(handle)
+        .ok_or_else(|| WasmBackendError::Execution("Failed to get bounds from WASM".to_string()))?;
+
+    if bounds.len() != dimensions * 2 {
+        return Err(WasmBackendError::Execution(format!(
+            "Expected {} bounds values, got {}",
+            dimensions * 2,
+            bounds.len()
+        )));
+    }
+
+    Ok(ModelBoundsNd::new(bounds))
+}
+
+/// Convert N-dimensional bounds to 3D, erroring on lower-dimensional models.
+#[cfg(feature = "web")]
+fn bounds_3d(bounds: &ModelBoundsNd) -> Result<ModelBounds, WasmBackendError> {
+    if bounds.dimensions() < 3 {
+        return Err(WasmBackendError::Execution(format!(
+            "model has only {} dimensions, need at least 3",
+            bounds.dimensions()
+        )));
+    }
+    Ok(bounds.to_3d())
+}
 
 /// Web model executor using JavaScript bridge.
 ///
@@ -38,6 +75,7 @@ use js_bindings::{
 #[cfg(feature = "web")]
 pub struct WebModelExecutor {
     handle: JsWasmHandle,
+    bounds: ModelBoundsNd,
 }
 
 #[cfg(feature = "web")]
@@ -50,7 +88,14 @@ impl WebModelExecutor {
                 "JavaScript failed to create WASM instance".to_string(),
             ));
         }
-        Ok(Self { handle })
+        let bounds = match fetch_bounds_nd(handle) {
+            Ok(bounds) => bounds,
+            Err(e) => {
+                wasm_model_destroy(handle);
+                return Err(e);
+            }
+        };
+        Ok(Self { handle, bounds })
     }
 }
 
@@ -64,28 +109,14 @@ impl Drop for WebModelExecutor {
 #[cfg(feature = "web")]
 impl ModelExecutor for WebModelExecutor {
     fn get_bounds(&mut self) -> Result<ModelBounds, WasmBackendError> {
-        let bounds = wasm_model_get_bounds(self.handle).ok_or_else(|| {
-            WasmBackendError::Execution("Failed to get bounds from WASM".to_string())
-        })?;
-
-        if bounds.len() != 6 {
-            return Err(WasmBackendError::Execution(format!(
-                "Expected 6 bounds values, got {}",
-                bounds.len()
-            )));
-        }
-
-        Ok(ModelBounds::new(
-            (bounds[0], bounds[1], bounds[2]),
-            (bounds[3], bounds[4], bounds[5]),
-        ))
+        bounds_3d(&self.bounds)
     }
 
     fn is_inside(&mut self, x: f64, y: f64, z: f64) -> Result<f32, WasmBackendError> {
-        let result = wasm_model_is_inside(self.handle, x, y, z);
+        let result = wasm_model_sample(self.handle, x, y, z);
         if result.is_nan() {
             return Err(WasmBackendError::Execution(
-                "WASM is_inside returned NaN".to_string(),
+                "WASM sample returned NaN".to_string(),
             ));
         }
         Ok(result)
@@ -100,7 +131,7 @@ impl ModelExecutor for WebModelExecutor {
 #[cfg(feature = "web")]
 pub struct WebParallelSampler {
     handle: JsWasmHandle,
-    bounds: ModelBounds,
+    bounds: ModelBoundsNd,
 }
 
 #[cfg(feature = "web")]
@@ -113,25 +144,13 @@ impl WebParallelSampler {
                 "JavaScript failed to create WASM instance".to_string(),
             ));
         }
-
-        // Get bounds immediately and cache them
-        let bounds_vec = wasm_model_get_bounds(handle).ok_or_else(|| {
-            WasmBackendError::Execution("Failed to get bounds from WASM".to_string())
-        })?;
-
-        if bounds_vec.len() != 6 {
-            wasm_model_destroy(handle);
-            return Err(WasmBackendError::Execution(format!(
-                "Expected 6 bounds values, got {}",
-                bounds_vec.len()
-            )));
-        }
-
-        let bounds = ModelBounds::new(
-            (bounds_vec[0], bounds_vec[1], bounds_vec[2]),
-            (bounds_vec[3], bounds_vec[4], bounds_vec[5]),
-        );
-
+        let bounds = match fetch_bounds_nd(handle) {
+            Ok(bounds) => bounds,
+            Err(e) => {
+                wasm_model_destroy(handle);
+                return Err(e);
+            }
+        };
         Ok(Self { handle, bounds })
     }
 }
@@ -146,7 +165,7 @@ impl Drop for WebParallelSampler {
 #[cfg(feature = "web")]
 impl ParallelModelSampler for WebParallelSampler {
     fn sample(&self, x: f64, y: f64, z: f64) -> f32 {
-        let result = wasm_model_is_inside(self.handle, x, y, z);
+        let result = wasm_model_sample(self.handle, x, y, z);
         if result.is_nan() {
             0.0 // Return 0 (outside) on error
         } else {
@@ -155,7 +174,7 @@ impl ParallelModelSampler for WebParallelSampler {
     }
 
     fn get_bounds(&self) -> Result<ModelBounds, WasmBackendError> {
-        Ok(self.bounds.clone())
+        bounds_3d(&self.bounds)
     }
 }
 

@@ -5,10 +5,11 @@
 //!
 //! The companion JavaScript file (wasm_helper.js) implements:
 //!
-//! ## Model Functions
+//! ## Model Functions (N-dimensional ABI)
 //! - `wasmModelCreateSync(bytes: Uint8Array): number` - Create a model instance synchronously
-//! - `wasmModelGetBounds(handle: number): Float64Array` - Get [minX, minY, minZ, maxX, maxY, maxZ]
-//! - `wasmModelIsInside(handle: number, x: f64, y: f64, z: f64): f32` - Sample density
+//! - `wasmModelGetDimensions(handle: number): number` - Get the number of dimensions
+//! - `wasmModelGetBounds(handle: number): Float64Array` - Get interleaved [min_0, max_0, min_1, max_1, ...]
+//! - `wasmModelSample(handle: number, x: f64, y: f64, z: f64): f32` - Sample density (extra dims zero)
 //! - `wasmModelDestroy(handle: number)` - Free the model instance
 //!
 //! ## Operator Functions
@@ -42,16 +43,20 @@ extern "C" {
     #[wasm_bindgen(js_name = wasmModelCreateSync)]
     pub fn wasm_model_create_sync(bytes: &[u8]) -> JsWasmHandle;
 
+    /// Get the number of dimensions of a model. Returns 0 on error.
+    #[wasm_bindgen(js_name = wasmModelGetDimensions)]
+    pub fn wasm_model_get_dimensions(handle: JsWasmHandle) -> u32;
+
     /// Get the bounding box of a model.
-    /// Returns a Float64Array with [minX, minY, minZ, maxX, maxY, maxZ].
-    /// Returns null/undefined on error.
+    /// Returns a Float64Array with interleaved [min_0, max_0, min_1, max_1, ...]
+    /// (2 * dimensions values). Returns null/undefined on error.
     #[wasm_bindgen(js_name = wasmModelGetBounds)]
     pub fn wasm_model_get_bounds(handle: JsWasmHandle) -> Option<Vec<f64>>;
 
-    /// Sample the density at a point.
-    /// Returns the density value (> 0 means inside).
-    #[wasm_bindgen(js_name = wasmModelIsInside)]
-    pub fn wasm_model_is_inside(handle: JsWasmHandle, x: f64, y: f64, z: f64) -> f32;
+    /// Sample the density at a point (extra dimensions are zeroed).
+    /// Returns the density value, or NaN on error.
+    #[wasm_bindgen(js_name = wasmModelSample)]
+    pub fn wasm_model_sample(handle: JsWasmHandle, x: f64, y: f64, z: f64) -> f32;
 
     /// Destroy a model instance and free resources.
     #[wasm_bindgen(js_name = wasmModelDestroy)]

@@ -119,7 +119,7 @@ pub enum ExecutionError {
 /// The UI uses these hints for validation and display purposes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, serde::Deserialize, serde::Serialize)]
 pub enum AssetTypeHint {
-    /// Volumetric boolean field (WASM with is_inside/get_bounds)
+    /// Volumetric boolean field (WASM with sample/get_bounds/get_dimensions)
     Model,
     /// Transform operator (WASM with run/get_metadata)
     Operator,

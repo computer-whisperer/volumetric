@@ -1,33 +1,37 @@
 // WASM Helper for nested WASM module execution
 // This file provides JavaScript functions for instantiating and calling WASM model modules
 // from within the main volumetric_ui WASM module.
+//
+// Models use the N-dimensional ABI:
+//   get_dimensions() -> u32
+//   get_bounds(out_ptr: i32)   -- writes interleaved min/max f64 pairs
+//   sample(pos_ptr: i32) -> f32
+//   memory export
+
+// Memory buffer offsets, matching the native host convention. The position
+// offset must be nonzero: address 0 is a null pointer to the model's Rust
+// code, and debug builds trap on null-pointer dereference.
+const MODEL_POS_BUFFER_OFFSET = 8;
+const MODEL_BOUNDS_BUFFER_OFFSET = 256;
 
 // Map of handle -> WASM instance
 const wasmInstances = new Map();
 let nextHandle = 1;
 
-// Create a model WASM instance from bytes
-// Returns a handle (number) that can be used with other functions
-window.wasmModelCreate = async function(bytes) {
-    try {
-        const module = await WebAssembly.compile(bytes);
-        const instance = await WebAssembly.instantiate(module, {});
-        const handle = nextHandle++;
-        wasmInstances.set(handle, { instance, module });
-        return handle;
-    } catch (e) {
-        console.error("Failed to create WASM model:", e);
-        return 0; // 0 indicates error
-    }
-};
-
-// Synchronous version for use from WASM (blocks until complete)
+// Create a model WASM instance from bytes (synchronous, for use from WASM)
+// Returns a handle (number) that can be used with other functions, 0 on error
 window.wasmModelCreateSync = function(bytes) {
     try {
         const module = new WebAssembly.Module(bytes);
         const instance = new WebAssembly.Instance(module, {});
+        const exports = instance.exports;
+        if (!exports.get_dimensions || !exports.get_bounds || !exports.sample || !exports.memory) {
+            console.error("WASM model does not export the N-dimensional ABI");
+            return 0;
+        }
+        const dimensions = exports.get_dimensions();
         const handle = nextHandle++;
-        wasmInstances.set(handle, { instance, module });
+        wasmInstances.set(handle, { instance, module, dimensions });
         return handle;
     } catch (e) {
         console.error("Failed to create WASM model:", e);
@@ -35,8 +39,18 @@ window.wasmModelCreateSync = function(bytes) {
     }
 };
 
+// Get the number of dimensions of a model, 0 on error
+window.wasmModelGetDimensions = function(handle) {
+    const entry = wasmInstances.get(handle);
+    if (!entry) {
+        console.error("Invalid WASM handle:", handle);
+        return 0;
+    }
+    return entry.dimensions;
+};
+
 // Get the bounding box of a model
-// Returns [minX, minY, minZ, maxX, maxY, maxZ] or null on error
+// Returns interleaved [min_0, max_0, min_1, max_1, ...] (2 * dims) or null on error
 window.wasmModelGetBounds = function(handle) {
     const entry = wasmInstances.get(handle);
     if (!entry) {
@@ -46,23 +60,23 @@ window.wasmModelGetBounds = function(handle) {
 
     try {
         const exports = entry.instance.exports;
-        return new Float64Array([
-            exports.get_bounds_min_x(),
-            exports.get_bounds_min_y(),
-            exports.get_bounds_min_z(),
-            exports.get_bounds_max_x(),
-            exports.get_bounds_max_y(),
-            exports.get_bounds_max_z(),
-        ]);
+        exports.get_bounds(MODEL_BOUNDS_BUFFER_OFFSET);
+        const view = new Float64Array(
+            exports.memory.buffer,
+            MODEL_BOUNDS_BUFFER_OFFSET,
+            entry.dimensions * 2,
+        );
+        // Copy: the view aliases WASM memory, which may move on growth
+        return new Float64Array(view);
     } catch (e) {
         console.error("Failed to get bounds:", e);
         return null;
     }
 };
 
-// Sample the density at a point
-// Returns the density value (> 0 means inside), or NaN on error
-window.wasmModelIsInside = function(handle, x, y, z) {
+// Sample the density at a point (extra dimensions are zeroed)
+// Returns the density value, or NaN on error
+window.wasmModelSample = function(handle, x, y, z) {
     const entry = wasmInstances.get(handle);
     if (!entry) {
         console.error("Invalid WASM handle:", handle);
@@ -70,7 +84,17 @@ window.wasmModelIsInside = function(handle, x, y, z) {
     }
 
     try {
-        return entry.instance.exports.is_inside(x, y, z);
+        const exports = entry.instance.exports;
+        const pos = new Float64Array(
+            exports.memory.buffer,
+            MODEL_POS_BUFFER_OFFSET,
+            entry.dimensions,
+        );
+        pos.fill(0);
+        pos[0] = x;
+        if (entry.dimensions > 1) pos[1] = y;
+        if (entry.dimensions > 2) pos[2] = z;
+        return exports.sample(MODEL_POS_BUFFER_OFFSET);
     } catch (e) {
         console.error("Failed to sample:", e);
         return NaN;

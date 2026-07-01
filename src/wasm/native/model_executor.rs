@@ -6,111 +6,13 @@ use crate::wasm::traits::{ModelBounds, ModelBoundsNd, ModelExecutor};
 use wasmtime::{Instance, Memory, Store, TypedFunc};
 
 /// Native model executor using wasmtime.
-pub struct NativeModelExecutor {
-    store: Store<()>,
-    is_inside: TypedFunc<(f64, f64, f64), f32>,
-    get_bounds_min_x: TypedFunc<(), f64>,
-    get_bounds_min_y: TypedFunc<(), f64>,
-    get_bounds_min_z: TypedFunc<(), f64>,
-    get_bounds_max_x: TypedFunc<(), f64>,
-    get_bounds_max_y: TypedFunc<(), f64>,
-    get_bounds_max_z: TypedFunc<(), f64>,
-}
-
-impl NativeModelExecutor {
-    /// Create a new executor from WASM bytes.
-    pub fn new(wasm_bytes: &[u8]) -> Result<Self, WasmBackendError> {
-        let cache = model_cache();
-        let module = cache.get_or_compile(wasm_bytes)?;
-
-        let mut store = Store::new(cache.engine(), ());
-        let instance = Instance::new(&mut store, &module, &[])
-            .map_err(|e| WasmBackendError::Instantiation(e.to_string()))?;
-
-        let is_inside = instance
-            .get_typed_func::<(f64, f64, f64), f32>(&mut store, "is_inside")
-            .map_err(|e| WasmBackendError::MissingExport(format!("is_inside: {}", e)))?;
-
-        let get_bounds_min_x = instance
-            .get_typed_func::<(), f64>(&mut store, "get_bounds_min_x")
-            .map_err(|e| WasmBackendError::MissingExport(format!("get_bounds_min_x: {}", e)))?;
-        let get_bounds_min_y = instance
-            .get_typed_func::<(), f64>(&mut store, "get_bounds_min_y")
-            .map_err(|e| WasmBackendError::MissingExport(format!("get_bounds_min_y: {}", e)))?;
-        let get_bounds_min_z = instance
-            .get_typed_func::<(), f64>(&mut store, "get_bounds_min_z")
-            .map_err(|e| WasmBackendError::MissingExport(format!("get_bounds_min_z: {}", e)))?;
-        let get_bounds_max_x = instance
-            .get_typed_func::<(), f64>(&mut store, "get_bounds_max_x")
-            .map_err(|e| WasmBackendError::MissingExport(format!("get_bounds_max_x: {}", e)))?;
-        let get_bounds_max_y = instance
-            .get_typed_func::<(), f64>(&mut store, "get_bounds_max_y")
-            .map_err(|e| WasmBackendError::MissingExport(format!("get_bounds_max_y: {}", e)))?;
-        let get_bounds_max_z = instance
-            .get_typed_func::<(), f64>(&mut store, "get_bounds_max_z")
-            .map_err(|e| WasmBackendError::MissingExport(format!("get_bounds_max_z: {}", e)))?;
-
-        Ok(Self {
-            store,
-            is_inside,
-            get_bounds_min_x,
-            get_bounds_min_y,
-            get_bounds_min_z,
-            get_bounds_max_x,
-            get_bounds_max_y,
-            get_bounds_max_z,
-        })
-    }
-}
-
-impl ModelExecutor for NativeModelExecutor {
-    fn get_bounds(&mut self) -> Result<ModelBounds, WasmBackendError> {
-        let min_x = self
-            .get_bounds_min_x
-            .call(&mut self.store, ())
-            .map_err(|e| WasmBackendError::Execution(e.to_string()))?;
-        let min_y = self
-            .get_bounds_min_y
-            .call(&mut self.store, ())
-            .map_err(|e| WasmBackendError::Execution(e.to_string()))?;
-        let min_z = self
-            .get_bounds_min_z
-            .call(&mut self.store, ())
-            .map_err(|e| WasmBackendError::Execution(e.to_string()))?;
-        let max_x = self
-            .get_bounds_max_x
-            .call(&mut self.store, ())
-            .map_err(|e| WasmBackendError::Execution(e.to_string()))?;
-        let max_y = self
-            .get_bounds_max_y
-            .call(&mut self.store, ())
-            .map_err(|e| WasmBackendError::Execution(e.to_string()))?;
-        let max_z = self
-            .get_bounds_max_z
-            .call(&mut self.store, ())
-            .map_err(|e| WasmBackendError::Execution(e.to_string()))?;
-
-        Ok(ModelBounds::new(
-            (min_x, min_y, min_z),
-            (max_x, max_y, max_z),
-        ))
-    }
-
-    fn is_inside(&mut self, x: f64, y: f64, z: f64) -> Result<f32, WasmBackendError> {
-        self.is_inside
-            .call(&mut self.store, (x, y, z))
-            .map_err(|e| WasmBackendError::Execution(e.to_string()))
-    }
-}
-
-/// Native model executor for N-dimensional ABI using wasmtime.
 ///
-/// This executor supports the new N-dimensional ABI:
+/// Models use the N-dimensional ABI:
 /// - `get_dimensions() -> u32`: Returns number of dimensions
 /// - `get_bounds(out_ptr: i32)`: Writes 2n f64 values (interleaved min/max)
 /// - `sample(pos_ptr: i32) -> f32`: Reads n f64 values, returns density
 /// - `memory` export required
-pub struct NativeModelExecutorNd {
+pub struct NativeModelExecutor {
     store: Store<()>,
     memory: Memory,
     dimensions: u32,
@@ -124,8 +26,8 @@ pub struct NativeModelExecutorNd {
 const POS_BUFFER_OFFSET: i32 = 8;
 const BOUNDS_BUFFER_OFFSET: i32 = 256;
 
-impl NativeModelExecutorNd {
-    /// Create a new N-dimensional executor from WASM bytes.
+impl NativeModelExecutor {
+    /// Create a new executor from WASM bytes.
     pub fn new(wasm_bytes: &[u8]) -> Result<Self, WasmBackendError> {
         let cache = model_cache();
         let module = cache.get_or_compile(wasm_bytes)?;
@@ -228,7 +130,7 @@ impl NativeModelExecutorNd {
     }
 }
 
-impl ModelExecutor for NativeModelExecutorNd {
+impl ModelExecutor for NativeModelExecutor {
     fn get_bounds(&mut self) -> Result<ModelBounds, WasmBackendError> {
         let bounds_nd = self.get_bounds_nd()?;
         if bounds_nd.dimensions() < 3 {

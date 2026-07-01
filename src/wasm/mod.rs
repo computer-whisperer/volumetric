@@ -3,10 +3,16 @@
 //! This module provides traits and implementations for executing WASM modules
 //! in different environments (native desktop via wasmtime, web via JavaScript bridge).
 //!
+//! Models use the N-dimensional ABI:
+//! - `get_dimensions() -> u32`
+//! - `get_bounds(out_ptr: i32)` — writes interleaved min/max f64 pairs
+//! - `sample(pos_ptr: i32) -> f32` — reads `dims` f64 values
+//! - `memory` export
+//!
 //! # Feature Flags
 //!
 //! - `native` (default): Enables the native wasmtime backend
-//! - `web`: Enables the web JavaScript bridge backend (future)
+//! - `web`: Enables the web JavaScript bridge backend
 //!
 //! # Usage
 //!
@@ -49,59 +55,61 @@ pub use traits::{
 // Re-export native types when available
 #[cfg(feature = "native")]
 pub use native::{
-    NativeModelExecutor, NativeModelExecutorNd, NativeOperatorExecutor, NativeParallelSampler,
-    NativeParallelSamplerNd,
+    ModuleCache, NativeModelExecutor, NativeOperatorExecutor, NativeParallelSampler, model_cache,
+    operator_cache,
 };
 
 // Re-export web types when available
 #[cfg(feature = "web")]
 pub use web::{WebModelExecutor, WebOperatorExecutor, WebParallelSampler};
 
-/// Wrapper enum for model executors that auto-detects ABI version.
-#[cfg(feature = "native")]
-pub enum AutoModelExecutor {
-    Legacy(NativeModelExecutor),
-    Nd(NativeModelExecutorNd),
-}
+/// Reject models built against the removed legacy 3D ABI with a clear error.
+///
+/// Legacy models exported `is_inside(f64, f64, f64) -> f32` plus six
+/// `get_bounds_*` getters. Support was removed; every model in this repo (and
+/// every operator output) uses the N-dimensional ABI. Without this check a
+/// legacy blob from an old saved project would fail with a bare
+/// "missing export: get_dimensions".
+fn reject_legacy_model(wasm_bytes: &[u8]) -> Result<(), WasmBackendError> {
+    let mut has_sample = false;
+    let mut has_is_inside = false;
 
-#[cfg(feature = "native")]
-impl ModelExecutor for AutoModelExecutor {
-    fn get_bounds(&mut self) -> Result<ModelBounds, WasmBackendError> {
-        match self {
-            AutoModelExecutor::Legacy(e) => e.get_bounds(),
-            AutoModelExecutor::Nd(e) => e.get_bounds(),
+    for payload in wasmparser::Parser::new(0).parse_all(wasm_bytes) {
+        let payload = payload.map_err(|e| WasmBackendError::Instantiation(e.to_string()))?;
+        if let wasmparser::Payload::ExportSection(section) = payload {
+            for export in section {
+                let export = export.map_err(|e| WasmBackendError::Instantiation(e.to_string()))?;
+                match export.name {
+                    "sample" => has_sample = true,
+                    "is_inside" => has_is_inside = true,
+                    _ => {}
+                }
+            }
         }
     }
 
-    fn is_inside(&mut self, x: f64, y: f64, z: f64) -> Result<f32, WasmBackendError> {
-        match self {
-            AutoModelExecutor::Legacy(e) => e.is_inside(x, y, z),
-            AutoModelExecutor::Nd(e) => e.is_inside(x, y, z),
-        }
+    if has_is_inside && !has_sample {
+        return Err(WasmBackendError::Instantiation(
+            "model exports the legacy 3D ABI (is_inside/get_bounds_*), which is no longer \
+             supported; rebuild the model against the N-dimensional ABI \
+             (get_dimensions/get_bounds/sample/memory)"
+                .to_string(),
+        ));
     }
+    Ok(())
 }
 
 /// Create a model executor from WASM bytes.
-///
-/// Returns the appropriate executor for the current build configuration.
-/// Automatically detects whether the WASM uses the legacy 3D ABI or the new N-dimensional ABI.
 #[cfg(feature = "native")]
 pub fn create_model_executor(wasm_bytes: &[u8]) -> Result<impl ModelExecutor, WasmBackendError> {
-    match detect_abi_version(wasm_bytes)? {
-        AbiVersion::Nd => {
-            let executor = NativeModelExecutorNd::new(wasm_bytes)?;
-            Ok(AutoModelExecutor::Nd(executor))
-        }
-        AbiVersion::Legacy => {
-            let executor = NativeModelExecutor::new(wasm_bytes)?;
-            Ok(AutoModelExecutor::Legacy(executor))
-        }
-    }
+    reject_legacy_model(wasm_bytes)?;
+    NativeModelExecutor::new(wasm_bytes)
 }
 
 /// Create a model executor from WASM bytes (web backend).
 #[cfg(all(feature = "web", not(feature = "native")))]
 pub fn create_model_executor(wasm_bytes: &[u8]) -> Result<impl ModelExecutor, WasmBackendError> {
+    reject_legacy_model(wasm_bytes)?;
     WebModelExecutor::new(wasm_bytes)
 }
 
@@ -113,48 +121,15 @@ pub fn create_model_executor(_wasm_bytes: &[u8]) -> Result<impl ModelExecutor, W
     ))
 }
 
-/// Wrapper enum for parallel samplers that auto-detects ABI version.
-#[cfg(feature = "native")]
-pub enum AutoParallelSampler {
-    Legacy(NativeParallelSampler),
-    Nd(NativeParallelSamplerNd),
-}
-
-#[cfg(feature = "native")]
-impl ParallelModelSampler for AutoParallelSampler {
-    fn sample(&self, x: f64, y: f64, z: f64) -> f32 {
-        match self {
-            AutoParallelSampler::Legacy(s) => s.sample(x, y, z),
-            AutoParallelSampler::Nd(s) => s.sample(x, y, z),
-        }
-    }
-
-    fn get_bounds(&self) -> Result<ModelBounds, WasmBackendError> {
-        match self {
-            AutoParallelSampler::Legacy(s) => s.get_bounds(),
-            AutoParallelSampler::Nd(s) => s.get_bounds(),
-        }
-    }
-}
-
 /// Create a parallel model sampler from WASM bytes.
 ///
 /// Returns a thread-safe sampler that can be used from multiple threads.
-/// Automatically detects whether the WASM uses the legacy 3D ABI or the new N-dimensional ABI.
 #[cfg(feature = "native")]
 pub fn create_parallel_sampler(
     wasm_bytes: &[u8],
 ) -> Result<impl ParallelModelSampler, WasmBackendError> {
-    match detect_abi_version(wasm_bytes)? {
-        AbiVersion::Nd => {
-            let sampler = NativeParallelSamplerNd::new(wasm_bytes)?;
-            Ok(AutoParallelSampler::Nd(sampler))
-        }
-        AbiVersion::Legacy => {
-            let sampler = NativeParallelSampler::new(wasm_bytes)?;
-            Ok(AutoParallelSampler::Legacy(sampler))
-        }
-    }
+    reject_legacy_model(wasm_bytes)?;
+    NativeParallelSampler::new(wasm_bytes)
 }
 
 /// Create a parallel model sampler from WASM bytes (web backend).
@@ -162,6 +137,7 @@ pub fn create_parallel_sampler(
 pub fn create_parallel_sampler(
     wasm_bytes: &[u8],
 ) -> Result<impl ParallelModelSampler, WasmBackendError> {
+    reject_legacy_model(wasm_bytes)?;
     WebParallelSampler::new(wasm_bytes)
 }
 
@@ -199,72 +175,6 @@ pub fn create_operator_executor(
     Err::<DummyOperator, _>(WasmBackendError::Unavailable(
         "No WASM backend available. Enable 'native' or 'web' feature.".to_string(),
     ))
-}
-
-/// Create a parallel model sampler for N-dimensional ABI from WASM bytes.
-///
-/// Returns a thread-safe sampler that can be used from multiple threads.
-/// This sampler works with the new N-dimensional ABI:
-/// - `get_dimensions() -> u32`
-/// - `get_bounds(out_ptr: i32)` - writes interleaved min/max
-/// - `sample(pos_ptr: i32) -> f32`
-/// - `memory` export
-#[cfg(feature = "native")]
-pub fn create_parallel_sampler_nd(
-    wasm_bytes: &[u8],
-) -> Result<NativeParallelSamplerNd, WasmBackendError> {
-    NativeParallelSamplerNd::new(wasm_bytes)
-}
-
-/// Create an N-dimensional model executor from WASM bytes.
-#[cfg(feature = "native")]
-pub fn create_model_executor_nd(
-    wasm_bytes: &[u8],
-) -> Result<NativeModelExecutorNd, WasmBackendError> {
-    NativeModelExecutorNd::new(wasm_bytes)
-}
-
-/// Detect which ABI version a WASM module uses.
-///
-/// Returns `AbiVersion::Nd` if the module exports `sample` and `get_dimensions`,
-/// otherwise returns `AbiVersion::Legacy` if it exports `is_inside`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AbiVersion {
-    /// Legacy 3D ABI: is_inside(x, y, z) and separate get_bounds_* functions
-    Legacy,
-    /// New N-dimensional ABI: sample(pos_ptr), get_bounds(out_ptr), get_dimensions()
-    Nd,
-}
-
-/// Detect ABI version by examining WASM exports.
-///
-/// Uses wasmparser to scan the export section directly — no compilation, so
-/// this is cheap enough to call before every executor creation.
-pub fn detect_abi_version(wasm_bytes: &[u8]) -> Result<AbiVersion, WasmBackendError> {
-    let mut has_sample = false;
-    let mut has_get_dimensions = false;
-    let mut has_memory = false;
-
-    for payload in wasmparser::Parser::new(0).parse_all(wasm_bytes) {
-        let payload = payload.map_err(|e| WasmBackendError::Instantiation(e.to_string()))?;
-        if let wasmparser::Payload::ExportSection(section) = payload {
-            for export in section {
-                let export = export.map_err(|e| WasmBackendError::Instantiation(e.to_string()))?;
-                match export.name {
-                    "sample" => has_sample = true,
-                    "get_dimensions" => has_get_dimensions = true,
-                    "memory" => has_memory = true,
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    if has_sample && has_get_dimensions && has_memory {
-        Ok(AbiVersion::Nd)
-    } else {
-        Ok(AbiVersion::Legacy)
-    }
 }
 
 // Dummy types for when no backend is available (needed for type inference)
