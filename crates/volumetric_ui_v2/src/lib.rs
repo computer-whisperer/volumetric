@@ -18,6 +18,8 @@ pub mod host;
 
 pub const VIEWPORT_KEY: &str = "viewport";
 pub const NEW_PROJECT_KEY: &str = "action:new-project";
+pub const OPEN_PROJECT_KEY: &str = "action:open-project";
+pub const SAVE_PROJECT_KEY: &str = "action:save-project";
 pub const RUN_PROJECT_KEY: &str = "action:run-project";
 pub const CANCEL_RUN_KEY: &str = "action:cancel-run";
 pub const TOGGLE_AUTO_REBUILD_KEY: &str = "action:toggle-auto-rebuild";
@@ -42,6 +44,12 @@ const OUTPUT_SETTINGS_PREFIX: &str = "output:settings:";
 const OUTPUT_MODE_PREFIX: &str = "output:mode:";
 const OUTPUT_RESOLUTION_PREFIX: &str = "output:res:";
 const OUTPUT_DEFAULTS_PREFIX: &str = "output:defaults:";
+const EXPORT_STL_PREFIX: &str = "output:stl:";
+/// Draggable divider between the viewport and the project panel.
+const PANEL_RESIZE_KEY: &str = "panel:resize";
+const PANEL_WIDTH_DEFAULT: f32 = 320.0;
+const PANEL_WIDTH_MIN: f32 = 240.0;
+const PANEL_WIDTH_MAX: f32 = 560.0;
 const SELECT_IMPORT_PREFIX: &str = "project:select-import:";
 const DELETE_IMPORT_PREFIX: &str = "project:delete-import:";
 const SELECT_STEP_PREFIX: &str = "project:select-step:";
@@ -306,6 +314,17 @@ struct LuaForm {
     source: String,
 }
 
+/// A file operation the app has requested. The host owns the native file
+/// dialogs (and, for STL, the cached preview meshes), so the app queues the
+/// intent and the host drains it via `take_file_action`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FileAction {
+    OpenProject,
+    SaveProject,
+    /// Export the cached preview mesh of the named output as binary STL.
+    ExportStl(String),
+}
+
 /// Render settings for one output. Stored per asset id when the user
 /// overrides the viewport defaults for that output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -352,6 +371,11 @@ pub struct VolumetricUiV2 {
     open_select: Option<String>,
     /// Expanded pipeline accordion sections (`imports` | `steps` | `exports`).
     pipeline_open: std::collections::BTreeSet<String>,
+    /// A queued file operation for the host to run (dialogs are host-side).
+    pending_file_action: Option<FileAction>,
+    /// Project panel width, adjusted by the divider's resize handle.
+    panel_width: f32,
+    panel_drag: ResizeDrag,
 }
 
 impl Default for VolumetricUiV2 {
@@ -399,6 +423,9 @@ impl VolumetricUiV2 {
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
+            pending_file_action: None,
+            panel_width: PANEL_WIDTH_DEFAULT,
+            panel_drag: ResizeDrag::default(),
         }
     }
 
@@ -695,6 +722,40 @@ impl VolumetricUiV2 {
     fn request_run(&mut self) {
         self.pending_run = true;
         self.status = "run queued".to_string();
+    }
+
+    /// One-shot: the file operation queued by a File-menu or output action.
+    pub(crate) fn take_file_action(&mut self) -> Option<FileAction> {
+        self.pending_file_action.take()
+    }
+
+    /// Replaces the project with one loaded from disk and queues a run so its
+    /// outputs materialize. Called by the host after its Open dialog.
+    pub(crate) fn open_project_file(&mut self, path: &std::path::Path) {
+        match Project::load_from_file(path) {
+            Ok(project) => {
+                self.project = project;
+                self.selected_export = None;
+                self.selected_project_item = None;
+                self.clear_runtime_assets();
+                self.request_run();
+                self.status = format!("opened {}", path.display());
+            }
+            Err(err) => self.status = format!("failed to open project: {err}"),
+        }
+    }
+
+    /// Saves the project to disk. Called by the host after its Save dialog.
+    pub(crate) fn save_project_file(&mut self, path: &std::path::Path) {
+        match self.project.save_to_file(path) {
+            Ok(()) => self.status = format!("saved {}", path.display()),
+            Err(err) => self.status = format!("failed to save project: {err}"),
+        }
+    }
+
+    /// Status line for host-side operations (e.g. STL export results).
+    pub(crate) fn set_status(&mut self, status: impl Into<String>) {
+        self.status = status.into();
     }
 
     /// Rebuilds the step editor when the selected step changes. While the same
@@ -1209,6 +1270,22 @@ impl App for VolumetricUiV2 {
             return;
         }
 
+        // Panel divider drags (pointer down/drag/up + arrow keys on the
+        // focused handle) — not clicks, so they run before the gate below.
+        if event.route() == Some(PANEL_RESIZE_KEY) {
+            resize_handle::apply_event_fixed(
+                &mut self.panel_width,
+                &mut self.panel_drag,
+                &event,
+                PANEL_RESIZE_KEY,
+                Axis::Row,
+                resize_handle::Side::End,
+                PANEL_WIDTH_MIN,
+                PANEL_WIDTH_MAX,
+            );
+            return;
+        }
+
         // Controlled text editing for config fields runs first: text, key, and
         // selection events aren't clicks and would be dropped by the gate below.
         if let Some(field_name) = event
@@ -1279,6 +1356,18 @@ impl App for VolumetricUiV2 {
             self.clear_runtime_assets();
             self.open_menu = None;
             self.status = "new project".to_string();
+            return;
+        }
+
+        if event.is_click_or_activate(OPEN_PROJECT_KEY) {
+            self.pending_file_action = Some(FileAction::OpenProject);
+            self.open_menu = None;
+            return;
+        }
+
+        if event.is_click_or_activate(SAVE_PROJECT_KEY) {
+            self.pending_file_action = Some(FileAction::SaveProject);
+            self.open_menu = None;
             return;
         }
 
@@ -1416,6 +1505,9 @@ impl App for VolumetricUiV2 {
             }
         } else if let Some(id) = route.strip_prefix(OUTPUT_DEFAULTS_PREFIX) {
             self.clear_output_override(id);
+        } else if let Some(id) = route.strip_prefix(EXPORT_STL_PREFIX) {
+            self.pending_file_action = Some(FileAction::ExportStl(id.to_string()));
+            self.open_select = None;
         } else if let Some(field_name) = route.strip_prefix(CONFIG_BOOL_PREFIX) {
             self.toggle_config_bool(field_name);
         } else if let Some(rest) = route.strip_prefix(CONFIG_ENUM_PREFIX) {
@@ -1429,9 +1521,16 @@ impl App for VolumetricUiV2 {
 pub fn shell(app: &VolumetricUiV2) -> El {
     let main = column([
         top_bar(app),
-        row([viewport_pane(app), project_panel(app)])
-            .width(Size::Fill(1.0))
-            .height(Size::Fill(1.0)),
+        row([
+            viewport_pane(app),
+            resize_handle(PANEL_RESIZE_KEY, Axis::Row),
+            project_panel(app),
+        ])
+        // Gap keeps the handle's expanded grab band off the viewport's
+        // hit target (HitOverflowCollision lint).
+        .gap(tokens::SPACE_1)
+        .width(Size::Fill(1.0))
+        .height(Size::Fill(1.0)),
     ])
     .fill_size();
 
@@ -1465,7 +1564,12 @@ fn menu_layer(app: &VolumetricUiV2) -> Option<El> {
         "file" => Some(menubar_menu(
             MENUBAR_KEY,
             "file",
-            [menubar_item_with_icon("plus", "New Project").key(NEW_PROJECT_KEY)],
+            [
+                menubar_item_with_icon("plus", "New Project").key(NEW_PROJECT_KEY),
+                menubar_separator(),
+                menubar_item_with_icon("folder", "Open Project…").key(OPEN_PROJECT_KEY),
+                menubar_item_with_icon("download", "Save Project…").key(SAVE_PROJECT_KEY),
+            ],
         )),
         "add" => Some(menubar_menu(MENUBAR_KEY, "add", add_menu_items())),
         _ => None,
@@ -1561,7 +1665,6 @@ fn output_settings_popover(app: &VolumetricUiV2, id: &str) -> El {
         resolution_buttons,
     ];
     if app.output_overrides.contains_key(id) {
-        body.push(divider());
         body.push(
             button("Use viewport defaults")
                 .xsmall()
@@ -1570,6 +1673,14 @@ fn output_settings_popover(app: &VolumetricUiV2, id: &str) -> El {
                 .key(format!("{OUTPUT_DEFAULTS_PREFIX}{id}")),
         );
     }
+    body.push(divider());
+    body.push(
+        button_with_icon("download", "Export STL…")
+            .xsmall()
+            .secondary()
+            .width(Size::Fill(1.0))
+            .key(format!("{EXPORT_STL_PREFIX}{id}")),
+    );
 
     popover(
         trigger_key.clone(),
@@ -1751,7 +1862,7 @@ fn project_panel(app: &VolumetricUiV2) -> El {
         // by the scroll's horizontal scissor.
         .px(tokens::RING_WIDTH),
     ])
-    .width(Size::Fixed(320.0))
+    .width(Size::Fixed(app.panel_width))
     .height(Size::Fill(1.0))
     .padding(tokens::SPACE_3)
     .gap(tokens::SPACE_2)
@@ -2941,6 +3052,67 @@ mod tests {
         // Outside click (popover scrim) dismisses.
         dispatch(&mut app, UiEvent::synthetic_click(format!("{key}:dismiss")));
         assert_eq!(app.open_select, None);
+    }
+
+    #[test]
+    fn file_menu_clicks_queue_file_actions_for_the_host() {
+        let mut app = VolumetricUiV2::default();
+        dispatch(&mut app, UiEvent::synthetic_click("main-menu:menu:file"));
+        dispatch(&mut app, UiEvent::synthetic_click(OPEN_PROJECT_KEY));
+        assert_eq!(app.take_file_action(), Some(FileAction::OpenProject));
+        assert_eq!(app.open_menu, None, "menu closes on item click");
+        assert_eq!(app.take_file_action(), None, "one-shot");
+
+        dispatch(&mut app, UiEvent::synthetic_click(SAVE_PROJECT_KEY));
+        assert_eq!(app.take_file_action(), Some(FileAction::SaveProject));
+    }
+
+    #[test]
+    fn export_stl_click_queues_action_and_closes_popover() {
+        let (mut app, exports) = two_export_app();
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{OUTPUT_SETTINGS_PREFIX}{}", exports[0])),
+        );
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{EXPORT_STL_PREFIX}{}", exports[0])),
+        );
+        assert_eq!(
+            app.take_file_action(),
+            Some(FileAction::ExportStl(exports[0].clone()))
+        );
+        assert_eq!(app.open_select, None);
+    }
+
+    #[test]
+    fn project_save_open_roundtrip() {
+        let path = std::env::temp_dir().join(format!(
+            "volumetric_ui_v2_roundtrip_{}.vproj",
+            std::process::id()
+        ));
+        let mut source = VolumetricUiV2::default();
+        add_operator_click(&mut source, first_operator_name());
+        source.save_project_file(&path);
+        assert!(source.status.starts_with("saved"), "{}", source.status);
+
+        let mut opened = VolumetricUiV2::empty();
+        opened.open_project_file(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(opened.status.starts_with("opened"), "{}", opened.status);
+        let summary = opened.summary();
+        let expected = source.summary();
+        // Imports include the operator wasm alongside the model.
+        assert_eq!(summary.imports, expected.imports);
+        assert_eq!(summary.timeline_steps, expected.timeline_steps);
+        assert_eq!(summary.exports, expected.exports);
+        assert!(opened.take_pending_run(), "open queues a run");
+    }
+
+    #[test]
+    fn panel_divider_is_in_the_shell() {
+        let bundle = shell_bundle(Rect::new(0.0, 0.0, 1280.0, 800.0));
+        assert!(bundle.tree_dump.contains(PANEL_RESIZE_KEY));
     }
 
     #[test]

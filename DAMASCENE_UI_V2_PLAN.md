@@ -265,6 +265,19 @@ candidates for Phase 3c.
   keep the panel open, outside click or Escape dismisses. Overrides prune
   with pins when a run drops an output. Remaining for 3c: panel resize
   handle, wide Lua sheet, real file actions.
+- Phase 3c wired the real file actions and the panel divider. The app queues a
+  `FileAction` (Open/Save/ExportStl) and the host drains it each frame,
+  showing blocking rfd dialogs (same trade-off as v1) and routing outcomes
+  back: Open replaces the project, clears runtime state, and queues a run;
+  Save writes `.vproj` via the engine's `save_to_file`; Export STL (in the
+  per-output settings popover) converts the host's cached preview mesh —
+  what's actually on screen, transforms applied — to `volumetric::Triangle`s
+  and writes binary STL, with a status hint when the output has no mesh (e.g.
+  points mode). The project panel is now resizable via a `resize_handle`
+  divider (240–560px, `Side::End`), with a small row gap so the handle's grab
+  band stays off the viewport's hit target. Still open: the wide Lua `sheet`
+  (deferred until the in-panel editor actually pinches) and remembering the
+  save path for one-click re-save.
 
 ### Slice 0: Dependency Update
 

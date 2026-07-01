@@ -9,7 +9,7 @@ use std::thread;
 use damascene_core::prelude::*;
 use damascene_wgpu::Runner;
 use damascene_winit_wgpu::host::input::{key_modifiers, map_key, pointer_button, winit_cursor};
-use glam::{Vec2, Vec3};
+use glam::{Mat4, Vec2, Vec3};
 use volumetric_renderer as renderer;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -18,8 +18,8 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowId};
 
 use crate::{
-    PreviewBuildStatus, PreviewMeshPlan, PreviewRenderMode, PreviewRequest, RunState, VIEWPORT_KEY,
-    ViewportCameraCommand, VolumetricUiV2,
+    FileAction, PreviewBuildStatus, PreviewMeshPlan, PreviewRenderMode, PreviewRequest, RunState,
+    VIEWPORT_KEY, ViewportCameraCommand, VolumetricUiV2,
 };
 
 pub fn run(
@@ -415,6 +415,12 @@ impl Host {
             self.app.on_run_cancelled();
         }
 
+        // Run a queued file action (native dialogs block the loop, like v1).
+        // Before the run dispatch so an opened project's run starts this frame.
+        if let Some(action) = self.app.take_file_action() {
+            handle_file_action(&mut self.app, &gfx.viewport_renderer, action);
+        }
+
         // Dispatch a queued run to the worker.
         if self.app.take_pending_run() {
             self.run_generation += 1;
@@ -513,6 +519,90 @@ impl Host {
             || self.active_run.is_some()
         {
             gfx.window.request_redraw();
+        }
+    }
+}
+
+/// Runs a queued file action: native dialogs first, then the outcome is
+/// routed back into the app. The blocking dialogs stall the event loop while
+/// open — same trade-off as the v1 egui app.
+fn handle_file_action(app: &mut VolumetricUiV2, viewport: &ViewportRenderer, action: FileAction) {
+    match action {
+        FileAction::OpenProject => {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("Project", &["vproj"])
+                .pick_file()
+            {
+                app.open_project_file(&path);
+            }
+        }
+        FileAction::SaveProject => {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("Project", &["vproj"])
+                .save_file()
+            {
+                app.save_project_file(&path);
+            }
+        }
+        FileAction::ExportStl(id) => {
+            let triangles = viewport.preview_triangles(&id);
+            if triangles.is_empty() {
+                app.set_status(format!(
+                    "no preview mesh for {id} — view it in a mesh render mode first"
+                ));
+                return;
+            }
+            let Some(path) = rfd::FileDialog::new()
+                .add_filter("STL", &["stl"])
+                .set_file_name(format!("{id}.stl"))
+                .save_file()
+            else {
+                return;
+            };
+            match volumetric::stl::write_binary_stl(&path, &triangles, "volumetric") {
+                Ok(()) => app.set_status(format!(
+                    "exported {} triangles to {}",
+                    triangles.len(),
+                    path.display()
+                )),
+                Err(err) => app.set_status(format!("failed to export STL: {err}")),
+            }
+        }
+    }
+}
+
+/// Expands a (possibly indexed) render mesh into world-space STL triangles.
+fn mesh_triangles(
+    mesh: &renderer::MeshData,
+    transform: Mat4,
+    out: &mut Vec<volumetric::Triangle>,
+) {
+    let corner = |idx: usize| -> Option<((f32, f32, f32), (f32, f32, f32))> {
+        let vertex = mesh.vertices.get(idx)?;
+        let position = transform.transform_point3(Vec3::from(vertex.position));
+        let normal = transform
+            .transform_vector3(Vec3::from(vertex.normal))
+            .normalize_or_zero();
+        Some((position.into(), normal.into()))
+    };
+    let mut push = |a: usize, b: usize, c: usize| {
+        if let (Some(a), Some(b), Some(c)) = (corner(a), corner(b), corner(c)) {
+            out.push(volumetric::Triangle {
+                vertices: [a.0, b.0, c.0],
+                normals: [a.1, b.1, c.1],
+            });
+        }
+    };
+    match &mesh.indices {
+        Some(indices) => {
+            for tri in indices.chunks_exact(3) {
+                push(tri[0] as usize, tri[1] as usize, tri[2] as usize);
+            }
+        }
+        None => {
+            for base in (0..mesh.vertices.len()).step_by(3) {
+                push(base, base + 1, base + 2);
+            }
         }
     }
 }
@@ -690,6 +780,19 @@ impl ViewportRenderer {
         self.preview_cache.has_pending()
     }
 
+    /// World-space triangles of an output's cached preview mesh, for STL
+    /// export. Empty when the output isn't cached or was meshed as points.
+    fn preview_triangles(&self, id: &str) -> Vec<volumetric::Triangle> {
+        let Some(scene) = self.preview_cache.entity_scene(id) else {
+            return Vec::new();
+        };
+        let mut triangles = Vec::new();
+        for (mesh, transform, _) in &scene.meshes {
+            mesh_triangles(mesh, *transform, &mut triangles);
+        }
+        triangles
+    }
+
     /// Reconciles the desired output set with the mesh cache and returns the
     /// aggregate build status plus any per-output jobs to enqueue on the shared
     /// worker. (The host owns the worker so project runs and preview meshing
@@ -850,6 +953,11 @@ struct PreviewCache {
 }
 
 impl PreviewCache {
+    /// The cached scene for one output, if a build has completed for it.
+    fn entity_scene(&self, id: &str) -> Option<&renderer::SceneData> {
+        self.entities.get(id).map(|(_, entity)| &entity.scene)
+    }
+
     /// Drops any outputs no longer requested, then returns the aggregate build
     /// status and the jobs needed to bring the requested set up to date.
     fn sync(&mut self, requests: &[PreviewRequest]) -> (PreviewBuildStatus, Vec<PreviewBuildJob>) {
