@@ -228,6 +228,18 @@ Damascene widgets that should map well:
   user's view alone. This is Phase 1 of the render/selection redesign; the
   selection surface (follow-selected-node + per-output pins and render modes) and
   the layout rework are Phases 2–3.
+- Phase 2 wires the selection surface: the viewport now follows the selected
+  pipeline node (selecting an import/step/export previews its output) plus any
+  pinned outputs, dissolving the old disconnect where clicking a node never
+  changed what rendered. `selected_render_id` maps the selection to a runtime
+  output; `pinned_outputs` keeps chosen outputs on screen across selection
+  changes; the Outputs inspector card gained a per-output pin toggle, a View
+  action, and a visibility dot. Selecting a node with no materialized output
+  (e.g. an unexported step) renders only the pins and shows a "run to preview"
+  hint. Runtime output rendering resolves through `runtime_assets` (stable
+  `Arc`s), so previewing an import that hasn't been run/exported is deferred.
+  Per-output render *mode/resolution* overrides remain global for now and land
+  with the Outputs-list layout in Phase 3.
 
 ### Slice 0: Dependency Update
 

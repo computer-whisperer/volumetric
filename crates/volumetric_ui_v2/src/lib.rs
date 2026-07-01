@@ -43,6 +43,7 @@ const SELECT_EXPORT_PREFIX: &str = "project:select-export:";
 const DELETE_EXPORT_PREFIX: &str = "project:delete-export:";
 const ADD_EXPORT_PREFIX: &str = "project:add-export:";
 const SELECT_RUNTIME_ASSET_PREFIX: &str = "runtime:select-asset:";
+const TOGGLE_PIN_PREFIX: &str = "runtime:toggle-pin:";
 const CONFIG_FIELD_PREFIX: &str = "cfg:";
 const CONFIG_BOOL_PREFIX: &str = "cfg-bool:";
 const CONFIG_ENUM_PREFIX: &str = "cfg-enum:";
@@ -253,6 +254,7 @@ pub struct ProjectSummary {
     pub selected_operator: Option<String>,
     pub selected_export: Option<String>,
     pub selected_project_item: Option<ProjectSelection>,
+    pub pinned_outputs: Vec<String>,
     pub render_mode: PreviewRenderMode,
     pub preview_resolution: usize,
     pub camera_control_scheme: CameraControlScheme,
@@ -303,6 +305,9 @@ pub struct VolumetricUiV2 {
     selected_operator: Option<&'static str>,
     selected_export: Option<String>,
     selected_project_item: Option<ProjectSelection>,
+    /// Outputs pinned to stay in the viewport regardless of the current
+    /// selection. The rendered scene is the selected node's output plus these.
+    pinned_outputs: std::collections::BTreeSet<String>,
     render_mode: PreviewRenderMode,
     preview_resolution: usize,
     camera_control_scheme: CameraControlScheme,
@@ -346,6 +351,7 @@ impl VolumetricUiV2 {
                 .map(|asset| asset.name),
             selected_export: None,
             selected_project_item: None,
+            pinned_outputs: std::collections::BTreeSet::new(),
             render_mode: PreviewRenderMode::AdaptiveSurfaceNets2,
             preview_resolution: 64,
             camera_control_scheme: CameraControlScheme::default(),
@@ -383,15 +389,69 @@ impl VolumetricUiV2 {
             .find(|asset| asset.id() == selected_export)
     }
 
-    /// The set of runtime outputs to render this frame. Phase 1 renders every
-    /// renderable runtime export at the global render mode; the host composites
-    /// them into one multi-entity scene. (Phase 2 will narrow this to the
-    /// selected node plus pinned outputs, each with its own render mode.)
+    /// The set of runtime outputs to render this frame: the selected pipeline
+    /// node's output plus every pinned output. The host composites them into one
+    /// multi-entity scene. Ids that aren't materialized in the current run are
+    /// silently skipped (e.g. a selected step whose output isn't exported yet).
     pub fn preview_requests(&self) -> Vec<PreviewRequest> {
-        self.runtime_assets
-            .iter()
+        let mut ids: Vec<&str> = self.pinned_outputs.iter().map(String::as_str).collect();
+        if let Some(selected) = self.selected_render_id()
+            && !ids.contains(&selected)
+        {
+            ids.push(selected);
+        }
+
+        ids.into_iter()
+            .filter_map(|id| self.runtime_assets.iter().find(|asset| asset.id() == id))
             .filter_map(|asset| self.render_request_for_asset(asset))
             .collect()
+    }
+
+    /// The runtime asset id the current pipeline selection points at, if any.
+    /// Exports and imports map to their own id; a step maps to its primary
+    /// output. The id may or may not be materialized — callers resolve it
+    /// against `runtime_assets`.
+    fn selected_render_id(&self) -> Option<&str> {
+        match self.selected_project_item.as_ref()? {
+            ProjectSelection::Export(idx) => self.project.exports().get(*idx).map(String::as_str),
+            ProjectSelection::Import(idx) => self
+                .project
+                .imports()
+                .get(*idx)
+                .map(|import| import.id.as_str()),
+            ProjectSelection::Step(idx) => self
+                .project
+                .timeline()
+                .get(*idx)
+                .and_then(|step| step.outputs.first())
+                .map(String::as_str),
+        }
+    }
+
+    /// Whether the current selection resolves to a materialized runtime output.
+    /// When false, the selected node contributes nothing to the viewport (only
+    /// pinned outputs render) and the inspector shows a "run to preview" hint.
+    fn selection_is_renderable(&self) -> bool {
+        self.selected_render_id()
+            .is_some_and(|id| self.runtime_assets.iter().any(|asset| asset.id() == id))
+    }
+
+    /// Toggles whether an output stays pinned in the viewport across selection
+    /// changes.
+    fn toggle_pin(&mut self, id: &str) {
+        if self.pinned_outputs.take(id).is_none() {
+            self.pinned_outputs.insert(id.to_string());
+            self.status = format!("pinned {id}");
+        } else {
+            self.status = format!("unpinned {id}");
+        }
+    }
+
+    /// Whether an output is currently drawn in the viewport (pinned, or the
+    /// resolvable selection).
+    fn output_is_visible(&self, id: &str) -> bool {
+        self.pinned_outputs.contains(id)
+            || (self.selection_is_renderable() && self.selected_render_id() == Some(id))
     }
 
     /// Builds a render request for a single runtime asset, or `None` when it is
@@ -478,11 +538,25 @@ impl VolumetricUiV2 {
                 self.last_run_stale = false;
                 self.runtime_assets = assets;
 
-                if self.selected_runtime_asset().is_none() {
-                    self.selected_export = self
+                // Drop pins for outputs this run no longer produces.
+                let live: std::collections::BTreeSet<String> = self
+                    .runtime_assets
+                    .iter()
+                    .map(|asset| asset.id().to_string())
+                    .collect();
+                self.pinned_outputs.retain(|id| live.contains(id));
+
+                // Make sure the viewport shows something: if the selection points
+                // at nothing materialized, follow the primary export.
+                if !self.selection_is_renderable()
+                    && let Some(id) = self
                         .runtime_assets
                         .first()
-                        .map(|asset| asset.id().to_string());
+                        .map(|asset| asset.id().to_string())
+                {
+                    let export_idx = self.project.exports().iter().position(|e| *e == id);
+                    self.selected_export = Some(id);
+                    self.selected_project_item = export_idx.map(ProjectSelection::Export);
                 }
 
                 self.status = format!(
@@ -509,6 +583,7 @@ impl VolumetricUiV2 {
             selected_operator: self.selected_operator.map(str::to_string),
             selected_export: self.selected_export.clone(),
             selected_project_item: self.selected_project_item.clone(),
+            pinned_outputs: self.pinned_outputs.iter().cloned().collect(),
             render_mode: self.render_mode,
             preview_resolution: self.preview_resolution,
             camera_control_scheme: self.camera_control_scheme,
@@ -537,6 +612,7 @@ impl VolumetricUiV2 {
     /// keeping on screen.
     fn clear_runtime_assets(&mut self) {
         self.runtime_assets.clear();
+        self.pinned_outputs.clear();
         self.last_run_elapsed_ms = None;
         self.last_run_error = None;
         self.last_run_stale = false;
@@ -1205,7 +1281,17 @@ impl App for VolumetricUiV2 {
             self.add_export(asset_id);
         } else if let Some(asset_id) = route.strip_prefix(SELECT_RUNTIME_ASSET_PREFIX) {
             self.selected_export = Some(asset_id.to_string());
+            // Fold runtime selection into the pipeline selection so the viewport
+            // follows it: a runtime asset is the output of its matching export.
+            self.selected_project_item = self
+                .project
+                .exports()
+                .iter()
+                .position(|export| export == asset_id)
+                .map(ProjectSelection::Export);
             self.status = format!("selected runtime asset {asset_id}");
+        } else if let Some(asset_id) = route.strip_prefix(TOGGLE_PIN_PREFIX) {
+            self.toggle_pin(asset_id);
         } else if let Some(field_name) = route.strip_prefix(CONFIG_BOOL_PREFIX) {
             self.toggle_config_bool(field_name);
         } else if let Some(rest) = route.strip_prefix(CONFIG_ENUM_PREFIX) {
@@ -1591,7 +1677,7 @@ fn right_inspector(app: &VolumetricUiV2) -> El {
 }
 
 fn project_item_card(app: &VolumetricUiV2) -> El {
-    let rows = match &app.selected_project_item {
+    let mut rows = match &app.selected_project_item {
         Some(ProjectSelection::Import(idx)) => import_detail_rows(app, *idx),
         Some(ProjectSelection::Step(idx)) => step_detail_rows(app, *idx),
         Some(ProjectSelection::Export(idx)) => export_detail_rows(app, *idx),
@@ -1601,6 +1687,18 @@ fn project_item_card(app: &VolumetricUiV2) -> El {
                 .small(),
         ],
     };
+
+    // The viewport follows the selected node; flag when it has no materialized
+    // output to show (only pinned outputs render until the project runs).
+    if app.selected_render_id().is_some() && !app.selection_is_renderable() {
+        rows.push(
+            alert([alert_description(
+                "No materialized output — run the project to preview this node.",
+            )])
+            .info()
+            .padding(tokens::SPACE_2),
+        );
+    }
 
     inspector_card_from("Project Item", "Modify the selected graph entry.", rows)
 }
@@ -1633,7 +1731,7 @@ fn runtime_card(app: &VolumetricUiV2) -> El {
             table([table_body(
                 app.runtime_assets
                     .iter()
-                    .map(runtime_asset_row)
+                    .map(|asset| runtime_asset_row(app, asset))
                     .collect::<Vec<_>>(),
             )
             .gap(tokens::SPACE_1)])
@@ -1641,18 +1739,37 @@ fn runtime_card(app: &VolumetricUiV2) -> El {
         );
     }
 
-    inspector_card_from("Runtime", "Materialized exports for rendering.", rows)
+    inspector_card_from(
+        "Outputs",
+        "Pin outputs to keep them in the viewport; View follows a single output.",
+        rows,
+    )
 }
 
-fn runtime_asset_row(asset: &LoadedAsset) -> El {
+fn runtime_asset_row(app: &VolumetricUiV2, asset: &LoadedAsset) -> El {
+    let id = asset.id();
+    let pinned = app.pinned_outputs.contains(id);
+    let visible = app.output_is_visible(id);
+
+    let pin = icon_button("pin")
+        .xsmall()
+        .tooltip(if pinned { "Unpin" } else { "Pin to viewport" })
+        .key(format!("{TOGGLE_PIN_PREFIX}{id}"));
+    let pin = if pinned { pin.primary() } else { pin.ghost() };
+
     table_row([
+        // Dot marks outputs currently drawn in the viewport.
+        text(if visible { "●" } else { "○" })
+            .caption()
+            .muted()
+            .width(Size::Fixed(12.0)),
         column([
             text(asset_type_label(asset.type_hint()))
                 .caption()
                 .muted()
                 .ellipsis()
                 .width(Size::Fill(1.0)),
-            text(asset.id()).label().ellipsis().width(Size::Fill(1.0)),
+            text(id).label().ellipsis().width(Size::Fill(1.0)),
         ])
         .gap(1.0)
         .width(Size::Fill(1.0)),
@@ -1660,12 +1777,13 @@ fn runtime_asset_row(asset: &LoadedAsset) -> El {
             .caption()
             .muted()
             .text_align(TextAlign::End)
-            .width(Size::Fixed(64.0)),
-        icon_button("settings")
+            .width(Size::Fixed(56.0)),
+        pin,
+        icon_button("eye")
             .ghost()
             .xsmall()
-            .tooltip("Select")
-            .key(format!("{SELECT_RUNTIME_ASSET_PREFIX}{}", asset.id())),
+            .tooltip("View")
+            .key(format!("{SELECT_RUNTIME_ASSET_PREFIX}{id}")),
     ])
     .height(Size::Fixed(36.0))
     .padding(Sides::xy(tokens::SPACE_2, 0.0))
@@ -2451,20 +2569,77 @@ mod tests {
         assert_eq!(config.max_depth, 4);
     }
 
-    #[test]
-    fn preview_requests_cover_every_renderable_export() {
-        // A project with two model exports must emit one render request per
-        // export so the host can composite both into the viewport.
+    /// Builds a two-export project and returns (app, export ids) after a run.
+    fn two_export_app() -> (VolumetricUiV2, Vec<String>) {
         let mut app = VolumetricUiV2::default();
         app.add_selected_model(); // second copy; unique id via `insert_model`
         app.run_project();
+        let exports = app.project().exports().to_vec();
+        assert_eq!(exports.len(), 2);
+        (app, exports)
+    }
 
-        let requests = app.preview_requests();
-        assert_eq!(requests.len(), 2, "both exports should be rendered");
-        let ids: std::collections::BTreeSet<_> =
-            requests.iter().map(|r| r.asset_id.clone()).collect();
-        assert_eq!(ids.len(), 2, "render requests target distinct assets");
-        assert!(requests.iter().all(|r| r.render_mode == app.render_mode));
+    #[test]
+    fn selecting_an_export_renders_only_that_output() {
+        let (mut app, exports) = two_export_app();
+
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{SELECT_EXPORT_PREFIX}0")),
+        );
+        let ids: Vec<_> = app
+            .preview_requests()
+            .into_iter()
+            .map(|r| r.asset_id)
+            .collect();
+        assert_eq!(ids, vec![exports[0].clone()]);
+
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{SELECT_EXPORT_PREFIX}1")),
+        );
+        let ids: Vec<_> = app
+            .preview_requests()
+            .into_iter()
+            .map(|r| r.asset_id)
+            .collect();
+        assert_eq!(ids, vec![exports[1].clone()]);
+    }
+
+    #[test]
+    fn pinning_keeps_an_output_visible_across_selection() {
+        let (mut app, exports) = two_export_app();
+
+        // Pin the first export, then view the second: both should render.
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{TOGGLE_PIN_PREFIX}{}", exports[0])),
+        );
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{SELECT_EXPORT_PREFIX}1")),
+        );
+
+        let ids: std::collections::BTreeSet<_> = app
+            .preview_requests()
+            .into_iter()
+            .map(|r| r.asset_id)
+            .collect();
+        assert!(ids.contains(&exports[0]), "pinned output stays visible");
+        assert!(ids.contains(&exports[1]), "selected output visible");
+        assert_eq!(ids.len(), 2);
+
+        // Unpinning drops it back to just the selection.
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{TOGGLE_PIN_PREFIX}{}", exports[0])),
+        );
+        let ids: Vec<_> = app
+            .preview_requests()
+            .into_iter()
+            .map(|r| r.asset_id)
+            .collect();
+        assert_eq!(ids, vec![exports[1].clone()]);
     }
 
     #[test]
@@ -2548,14 +2723,15 @@ mod tests {
     }
 
     #[test]
-    fn edit_that_keeps_selection_preserves_the_stale_preview() {
-        let mut app = VolumetricUiV2::default();
-        dispatch(&mut app, UiEvent::synthetic_click(ADD_MODEL_KEY));
-        app.run_project();
-        assert_eq!(app.summary().runtime_assets.len(), 2);
+    fn pinned_output_survives_a_stale_edit() {
+        let (mut app, exports) = two_export_app();
 
-        // Delete the second export; selection falls back to the first, which is
-        // still materialized -> the preview stays available (stale), not blank.
+        // Pin the first export so it stays in the viewport independent of
+        // selection, then make an edit that doesn't rerun.
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{TOGGLE_PIN_PREFIX}{}", exports[0])),
+        );
         dispatch(
             &mut app,
             UiEvent::synthetic_click("project:delete-export:1"),
@@ -2563,12 +2739,13 @@ mod tests {
 
         let summary = app.summary();
         assert!(summary.last_run_stale);
-        assert_eq!(summary.runtime_assets.len(), 2);
-        // The runtime outputs are untouched until a rerun, so both still render,
-        // flagged stale rather than blanked.
+        // The pinned output's runtime asset is untouched until a rerun, so it
+        // keeps rendering (flagged stale) even though the edit cleared selection.
         let requests = app.preview_requests();
-        assert_eq!(requests.len(), 2, "stale preview retained");
-        assert!(requests.iter().all(|r| r.stale));
+        assert!(
+            requests.iter().any(|r| r.asset_id == exports[0] && r.stale),
+            "pinned output stays on screen, stale"
+        );
     }
 
     #[test]
