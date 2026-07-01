@@ -293,9 +293,16 @@ candidates for Phase 3c.
   As with a remembered project path; Lua reset-to-template; precursor lineage
   in the export inspector; and meshing statistics (time, triangle/point/
   sample counts in the output popover with ASN2 per-stage profiling lines,
-  plus scene totals in the viewport HUD). Knowingly not ported: the wasm32/
-  web build (v2's host is native-only) and v1's arbitrary-resolution slider
-  (ladder presets instead).
+  plus scene totals in the viewport HUD). Not yet ported: the wasm32/web
+  build — v2's host is native-only *for now, but a web version is expected to
+  follow shortly*, so new host-side code must keep platform assumptions
+  behind narrow seams (the `FileAction` queue and bytes-based app methods are
+  the pattern). Known web-hostile spots to fix when the port starts: blocking
+  `rfd::FileDialog` calls (web needs `AsyncFileDialog` + polling, as in v1),
+  the `BackgroundWorker` std::thread, `std::time::Instant` in preview stats,
+  and path-based project open/save (web needs bytes + browser download).
+  Also deliberately changed from v1: ladder resolution presets instead of an
+  arbitrary-resolution slider.
 
 ### Slice 0: Dependency Update
 
