@@ -1574,7 +1574,9 @@ fn output_settings_popover(app: &VolumetricUiV2, id: &str) -> El {
     popover(
         trigger_key.clone(),
         Anchor::below_key(trigger_key),
-        column(body).gap(tokens::SPACE_2).padding(tokens::SPACE_2),
+        // popover_panel paints the floating card surface (fill + border +
+        // shadow); a bare column would float transparently over the panel.
+        popover_panel([column(body).gap(tokens::SPACE_2).padding(tokens::SPACE_2)]),
     )
 }
 
