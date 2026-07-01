@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use aetna_core::prelude::{Rect, write_bundle};
+use damascene_core::prelude::{Rect, write_bundle};
 use volumetric_ui_v2::shell_bundle;
 
 fn main() -> std::io::Result<()> {

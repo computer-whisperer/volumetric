@@ -1,7 +1,7 @@
-//! Aetna-based v2 UI shell for Volumetric.
+//! Damascene-based v2 UI shell for Volumetric.
 //!
 //! This crate intentionally starts as a separate app path so the current egui UI
-//! remains the usable baseline while the Aetna port grows toward parity.
+//! remains the usable baseline while the Damascene port grows toward parity.
 
 use std::sync::Arc;
 
@@ -10,7 +10,7 @@ use volumetric::{
 };
 use volumetric_renderer::CameraControlScheme;
 
-use aetna_core::prelude::*;
+use damascene_core::prelude::*;
 
 pub mod host;
 
@@ -684,7 +684,7 @@ impl App for VolumetricUiV2 {
         shell(self)
     }
 
-    fn on_event(&mut self, event: UiEvent) {
+    fn on_event(&mut self, event: UiEvent, _cx: &EventCx) {
         if event.is_click_or_activate(NEW_PROJECT_KEY) {
             self.project = Project::new();
             self.selected_export = None;
@@ -861,7 +861,10 @@ fn left_sidebar(app: &VolumetricUiV2) -> El {
             ]),
         ])
         .key("catalog-scroll")
-        .gap(tokens::SPACE_2),
+        .gap(tokens::SPACE_2)
+        // Gutter so keyboard focus rings on full-width list items aren't
+        // clipped by the scroll's horizontal scissor.
+        .px(tokens::RING_WIDTH),
         alert([alert_description(&app.status)])
             .info()
             .padding(tokens::SPACE_2),
@@ -976,13 +979,10 @@ fn render_mode_button(app: &VolumetricUiV2, mode: PreviewRenderMode) -> El {
 }
 
 fn toggle_chip(label: &str, value: bool, key: &str) -> El {
-    row([
-        text(label).caption().muted().ellipsis(),
-        switch(value).key(key),
-    ])
-    .gap(tokens::SPACE_1)
-    .align(Align::Center)
-    .height(Size::Fixed(24.0))
+    row([text(label).caption().muted().ellipsis(), switch(key, value)])
+        .gap(tokens::SPACE_1)
+        .align(Align::Center)
+        .height(Size::Fixed(24.0))
 }
 
 fn viewport_status_bar(app: &VolumetricUiV2, summary: &ProjectSummary) -> El {
@@ -1308,8 +1308,11 @@ where
 fn project_list(title: &str, rows: Vec<El>) -> El {
     column([
         text(title).muted().caption().semibold(),
-        scroll([table([table_body(rows).gap(tokens::SPACE_1)])])
-            .key(format!("project-list:{title}")),
+        scroll([table([table_body(rows).gap(tokens::SPACE_1)])
+            // Gutter so row focus rings aren't clipped by the table's
+            // (non-scrollable, both-axis) vertical scissor.
+            .py(tokens::RING_WIDTH)])
+        .key(format!("project-list:{title}")),
     ])
     .gap(tokens::SPACE_1)
     .width(Size::Fill(1.0))
@@ -1424,9 +1427,10 @@ fn project_row(kind: &str, label: &str, select_route: String, delete_route: Stri
             .tooltip("Delete")
             .key(delete_route),
     ])
-    .height(Size::Fixed(36.0))
+    .height(Size::Fixed(40.0))
     .padding(Sides::xy(tokens::SPACE_2, 0.0))
     .gap(tokens::SPACE_1)
+    .align(Align::Center)
 }
 
 fn project_note_row(kind: &str, label: &str) -> El {
@@ -1601,15 +1605,21 @@ fn editable_model_asset_ids(app: &VolumetricUiV2) -> Vec<String> {
         .collect()
 }
 
-pub fn shell_bundle(viewport: Rect) -> aetna_core::bundle::artifact::Bundle {
+pub fn shell_bundle(viewport: Rect) -> damascene_core::bundle::artifact::Bundle {
     let app = VolumetricUiV2::default();
     let mut tree = shell(&app);
-    aetna_core::bundle::artifact::render_bundle(&mut tree, viewport)
+    damascene_core::bundle::artifact::render_bundle(&mut tree, viewport)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Dispatch a synthetic event with an empty `EventCx` — the app's
+    /// handlers don't read event-time geometry, so tests don't need one.
+    fn dispatch(app: &mut VolumetricUiV2, event: UiEvent) {
+        app.on_event(event, &EventCx::new());
+    }
 
     #[test]
     fn shell_reserves_a_viewport_region() {
@@ -1636,7 +1646,7 @@ mod tests {
     #[test]
     fn add_model_action_appends_unique_import() {
         let mut app = VolumetricUiV2::default();
-        app.on_event(UiEvent::synthetic_click(ADD_MODEL_KEY));
+        dispatch(&mut app, UiEvent::synthetic_click(ADD_MODEL_KEY));
 
         let summary = app.summary();
         assert_eq!(summary.imports, 2);
@@ -1648,7 +1658,10 @@ mod tests {
     #[test]
     fn catalog_click_changes_selected_model() {
         let mut app = VolumetricUiV2::empty();
-        app.on_event(UiEvent::synthetic_click("model:simple_torus_model"));
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click("model:simple_torus_model"),
+        );
 
         assert_eq!(
             app.summary().selected_model.as_deref(),
@@ -1659,7 +1672,7 @@ mod tests {
     #[test]
     fn add_operator_action_appends_timeline_step() {
         let mut app = VolumetricUiV2::default();
-        app.on_event(UiEvent::synthetic_click(ADD_OPERATOR_KEY));
+        dispatch(&mut app, UiEvent::synthetic_click(ADD_OPERATOR_KEY));
 
         let summary = app.summary();
         assert_eq!(summary.timeline_steps, 1);
@@ -1673,8 +1686,11 @@ mod tests {
     #[test]
     fn delete_import_removes_dependent_step_and_exports() {
         let mut app = VolumetricUiV2::default();
-        app.on_event(UiEvent::synthetic_click(ADD_OPERATOR_KEY));
-        app.on_event(UiEvent::synthetic_click("project:delete-import:0"));
+        dispatch(&mut app, UiEvent::synthetic_click(ADD_OPERATOR_KEY));
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click("project:delete-import:0"),
+        );
 
         let summary = app.summary();
         assert_eq!(summary.imports, 1);
@@ -1685,7 +1701,10 @@ mod tests {
     #[test]
     fn delete_export_keeps_declared_asset_available() {
         let mut app = VolumetricUiV2::default();
-        app.on_event(UiEvent::synthetic_click("project:delete-export:0"));
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click("project:delete-export:0"),
+        );
 
         let summary = app.summary();
         assert_eq!(summary.imports, 1);
@@ -1701,12 +1720,16 @@ mod tests {
     #[test]
     fn step_input_can_be_retargeted_to_another_model() {
         let mut app = VolumetricUiV2::default();
-        app.on_event(UiEvent::synthetic_click("model:simple_torus_model"));
-        app.on_event(UiEvent::synthetic_click(ADD_MODEL_KEY));
-        app.on_event(UiEvent::synthetic_click(ADD_OPERATOR_KEY));
-        app.on_event(UiEvent::synthetic_click(
-            "project:set-step-input:0:simple_sphere_model",
-        ));
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click("model:simple_torus_model"),
+        );
+        dispatch(&mut app, UiEvent::synthetic_click(ADD_MODEL_KEY));
+        dispatch(&mut app, UiEvent::synthetic_click(ADD_OPERATOR_KEY));
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click("project:set-step-input:0:simple_sphere_model"),
+        );
 
         let step = &app.project().timeline()[0];
         assert!(matches!(
@@ -1724,9 +1747,18 @@ mod tests {
     #[test]
     fn viewport_controls_update_preview_settings() {
         let mut app = VolumetricUiV2::default();
-        app.on_event(UiEvent::synthetic_click("viewport:render-mode:points"));
-        app.on_event(UiEvent::synthetic_click("viewport:preview-resolution:96"));
-        app.on_event(UiEvent::synthetic_click("viewport:camera-scheme:onshape"));
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click("viewport:render-mode:points"),
+        );
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click("viewport:preview-resolution:96"),
+        );
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click("viewport:camera-scheme:onshape"),
+        );
 
         let summary = app.summary();
         assert_eq!(summary.render_mode, PreviewRenderMode::Points);
@@ -1737,8 +1769,8 @@ mod tests {
     #[test]
     fn viewport_toggles_are_controlled_by_app_state() {
         let mut app = VolumetricUiV2::default();
-        app.on_event(UiEvent::synthetic_click(TOGGLE_GRID_KEY));
-        app.on_event(UiEvent::synthetic_click(TOGGLE_SSAO_KEY));
+        dispatch(&mut app, UiEvent::synthetic_click(TOGGLE_GRID_KEY));
+        dispatch(&mut app, UiEvent::synthetic_click(TOGGLE_SSAO_KEY));
 
         let summary = app.summary();
         assert!(!summary.show_grid);
@@ -1749,7 +1781,7 @@ mod tests {
     fn frame_preview_action_queues_camera_command() {
         let mut app = VolumetricUiV2::default();
 
-        app.on_event(UiEvent::synthetic_click(FRAME_PREVIEW_KEY));
+        dispatch(&mut app, UiEvent::synthetic_click(FRAME_PREVIEW_KEY));
 
         assert_eq!(
             app.take_camera_command(),
@@ -1762,7 +1794,7 @@ mod tests {
     #[test]
     fn run_project_action_materializes_runtime_exports() {
         let mut app = VolumetricUiV2::default();
-        app.on_event(UiEvent::synthetic_click(RUN_PROJECT_KEY));
+        dispatch(&mut app, UiEvent::synthetic_click(RUN_PROJECT_KEY));
 
         let summary = app.summary();
         assert_eq!(summary.runtime_assets.len(), 1);
@@ -1778,9 +1810,15 @@ mod tests {
     #[test]
     fn preview_request_uses_selected_runtime_asset_and_controls() {
         let mut app = VolumetricUiV2::default();
-        app.on_event(UiEvent::synthetic_click(RUN_PROJECT_KEY));
-        app.on_event(UiEvent::synthetic_click("viewport:render-mode:asn2"));
-        app.on_event(UiEvent::synthetic_click("viewport:preview-resolution:96"));
+        dispatch(&mut app, UiEvent::synthetic_click(RUN_PROJECT_KEY));
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click("viewport:render-mode:asn2"),
+        );
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click("viewport:preview-resolution:96"),
+        );
 
         let request = app.preview_request().expect("runtime preview request");
         assert_eq!(request.asset_id, "simple_sphere_model");
@@ -1806,8 +1844,8 @@ mod tests {
     #[test]
     fn project_mutation_clears_runtime_exports() {
         let mut app = VolumetricUiV2::default();
-        app.on_event(UiEvent::synthetic_click(RUN_PROJECT_KEY));
-        app.on_event(UiEvent::synthetic_click(ADD_MODEL_KEY));
+        dispatch(&mut app, UiEvent::synthetic_click(RUN_PROJECT_KEY));
+        dispatch(&mut app, UiEvent::synthetic_click(ADD_MODEL_KEY));
 
         let summary = app.summary();
         assert!(summary.runtime_assets.is_empty());

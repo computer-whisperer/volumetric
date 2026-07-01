@@ -4,17 +4,16 @@ use std::sync::{
 };
 use std::thread;
 
-use aetna_core::prelude::*;
-use aetna_core::{Cursor, KeyModifiers, PointerButton, UiKey};
-use aetna_wgpu::Runner;
+use damascene_core::prelude::*;
+use damascene_wgpu::Runner;
+use damascene_winit_wgpu::host::input::{key_modifiers, map_key, pointer_button, winit_cursor};
 use glam::{Vec2, Vec3};
 use volumetric_renderer as renderer;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
-use winit::keyboard::{Key, NamedKey};
-use winit::window::{CursorIcon, Window, WindowId};
+use winit::window::{Window, WindowId};
 
 use crate::{
     PreviewBuildStatus, PreviewMeshPlan, PreviewRenderMode, PreviewRequest, VIEWPORT_KEY,
@@ -82,7 +81,7 @@ impl ViewportPointerButtons {
 
 struct Gfx {
     viewport_renderer: ViewportRenderer,
-    aetna: Runner,
+    damascene: Runner,
     surface: wgpu::Surface<'static>,
     queue: wgpu::Queue,
     device: wgpu::Device,
@@ -153,11 +152,11 @@ impl ApplicationHandler for Host {
         };
         surface.configure(&device, &config);
 
-        let mut aetna = Runner::new(&device, &queue, format);
-        aetna.set_theme(self.app.theme());
-        aetna.set_surface_size(config.width, config.height);
+        let mut damascene = Runner::new(&device, &queue, format);
+        damascene.set_theme(self.app.theme());
+        damascene.set_surface_size(config.width, config.height);
         for shader in self.app.shaders() {
-            aetna.register_shader_with(
+            damascene.register_shader_with(
                 &device,
                 shader.name,
                 shader.wgsl,
@@ -168,7 +167,7 @@ impl ApplicationHandler for Host {
 
         self.gfx = Some(Gfx {
             viewport_renderer: ViewportRenderer::new(&device, &queue, format),
-            aetna,
+            damascene,
             surface,
             queue,
             device,
@@ -228,9 +227,9 @@ impl ApplicationHandler for Host {
                             }
                             self.last_camera_pointer = Some((lx, ly));
                         }
-                        let moved = gfx.aetna.pointer_moved(lx, ly);
+                        let moved = gfx.damascene.pointer_moved(Pointer::moving(lx, ly));
                         for event in moved.events {
-                            self.app.on_event(event);
+                            dispatch_event(&mut self.app, &gfx.damascene, event);
                         }
                         if moved.needs_redraw {
                             gfx.window.request_redraw();
@@ -240,7 +239,9 @@ impl ApplicationHandler for Host {
                         self.last_pointer = None;
                         self.last_camera_pointer = None;
                         self.viewport_buttons = ViewportPointerButtons::default();
-                        gfx.aetna.pointer_left();
+                        for event in gfx.damascene.pointer_left() {
+                            dispatch_event(&mut self.app, &gfx.damascene, event);
+                        }
                         gfx.window.request_redraw();
                     }
                     WindowEvent::MouseInput { state, button, .. } => {
@@ -261,13 +262,17 @@ impl ApplicationHandler for Host {
                         }
                         match state {
                             ElementState::Pressed => {
-                                for event in gfx.aetna.pointer_down(lx, ly, button) {
-                                    self.app.on_event(event);
+                                for event in
+                                    gfx.damascene.pointer_down(Pointer::mouse(lx, ly, button))
+                                {
+                                    dispatch_event(&mut self.app, &gfx.damascene, event);
                                 }
                             }
                             ElementState::Released => {
-                                for event in gfx.aetna.pointer_up(lx, ly, button) {
-                                    self.app.on_event(event);
+                                for event in
+                                    gfx.damascene.pointer_up(Pointer::mouse(lx, ly, button))
+                                {
+                                    dispatch_event(&mut self.app, &gfx.damascene, event);
                                 }
                             }
                         }
@@ -289,13 +294,13 @@ impl ApplicationHandler for Host {
                                 .zoom_camera(camera_scroll_delta, self.app.camera_control_scheme());
                             gfx.window.request_redraw();
                         }
-                        if gfx.aetna.pointer_wheel(lx, ly, dy) {
+                        if gfx.damascene.pointer_wheel(lx, ly, dy) {
                             gfx.window.request_redraw();
                         }
                     }
                     WindowEvent::ModifiersChanged(modifiers) => {
                         self.modifiers = key_modifiers(modifiers.state());
-                        gfx.aetna.set_modifiers(self.modifiers);
+                        gfx.damascene.set_modifiers(self.modifiers);
                     }
                     WindowEvent::KeyboardInput {
                         event:
@@ -307,20 +312,23 @@ impl ApplicationHandler for Host {
                         ..
                     } => {
                         if let Some(key) = map_key(&key_event.logical_key) {
-                            for event in gfx.aetna.key_down(key, self.modifiers, key_event.repeat) {
-                                self.app.on_event(event);
+                            for event in
+                                gfx.damascene
+                                    .key_down(key, self.modifiers, key_event.repeat)
+                            {
+                                dispatch_event(&mut self.app, &gfx.damascene, event);
                             }
                         }
                         if let Some(text) = &key_event.text
-                            && let Some(event) = gfx.aetna.text_input(text.to_string())
+                            && let Some(event) = gfx.damascene.text_input(text.to_string())
                         {
-                            self.app.on_event(event);
+                            dispatch_event(&mut self.app, &gfx.damascene, event);
                         }
                         gfx.window.request_redraw();
                     }
                     WindowEvent::Ime(winit::event::Ime::Commit(text)) => {
-                        if let Some(event) = gfx.aetna.text_input(text) {
-                            self.app.on_event(event);
+                        if let Some(event) = gfx.damascene.text_input(text) {
+                            dispatch_event(&mut self.app, &gfx.damascene, event);
                         }
                         gfx.window.request_redraw();
                     }
@@ -342,7 +350,7 @@ impl Host {
             gfx.config.width = size.width;
             gfx.config.height = size.height;
             gfx.surface.configure(&gfx.device, &gfx.config);
-            gfx.aetna
+            gfx.damascene
                 .set_surface_size(gfx.config.width, gfx.config.height);
             gfx.viewport_renderer
                 .resize(&gfx.device, gfx.config.width, gfx.config.height);
@@ -384,13 +392,13 @@ impl Host {
         self.app.before_build();
         let theme = self.app.theme();
         let palette = theme.palette().clone();
-        let cx = aetna_core::BuildCx::new(&theme);
+        let cx = damascene_core::BuildCx::new(&theme);
         let mut tree = self.app.build(&cx);
 
-        gfx.aetna.set_theme(theme);
-        gfx.aetna.set_hotkeys(self.app.hotkeys());
-        gfx.aetna.set_selection(self.app.selection());
-        gfx.aetna.push_toasts(self.app.drain_toasts());
+        gfx.damascene.set_theme(theme);
+        gfx.damascene.set_hotkeys(self.app.hotkeys());
+        gfx.damascene.set_selection(self.app.selection());
+        gfx.damascene.push_toasts(self.app.drain_toasts());
 
         let scale_factor = gfx.window.scale_factor() as f32;
         let viewport = Rect::new(
@@ -399,11 +407,11 @@ impl Host {
             gfx.config.width as f32 / scale_factor,
             gfx.config.height as f32 / scale_factor,
         );
-        let prepare = gfx
-            .aetna
-            .prepare(&gfx.device, &gfx.queue, &mut tree, viewport, scale_factor);
+        let prepare =
+            gfx.damascene
+                .prepare(&gfx.device, &gfx.queue, &mut tree, viewport, scale_factor);
 
-        let cursor = gfx.aetna.ui_state().cursor(&tree);
+        let cursor = gfx.damascene.ui_state().cursor(&tree);
         if cursor != self.last_cursor {
             gfx.window.set_cursor(winit_cursor(cursor));
             self.last_cursor = cursor;
@@ -415,7 +423,7 @@ impl Host {
                 label: Some("volumetric_ui_v2::encoder"),
             });
 
-        let viewport_rect = gfx.aetna.rect_of_key(VIEWPORT_KEY);
+        let viewport_rect = gfx.damascene.rect_of_key(VIEWPORT_KEY);
         self.last_viewport_rect = viewport_rect;
 
         let viewport_resized = gfx.viewport_renderer.render(ViewportRenderParams {
@@ -427,7 +435,7 @@ impl Host {
             clear_color: bg_color(&palette),
             preview_request,
         });
-        gfx.aetna.render(
+        gfx.damascene.render(
             &gfx.device,
             &mut encoder,
             &frame.texture,
@@ -489,7 +497,7 @@ impl ViewportRenderer {
 
     fn resize(&mut self, _device: &wgpu::Device, _width: u32, _height: u32) {
         // The renderer's real size is the keyed viewport rect, not the full window.
-        // It is resized during `render` once Aetna layout has resolved that rect.
+        // It is resized during `render` once Damascene layout has resolved that rect.
     }
 
     fn app_texture(&self) -> AppTexture {
@@ -743,7 +751,7 @@ impl ViewportTarget {
             view_formats: &[],
         }));
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let app_texture = aetna_wgpu::app_texture(texture.clone());
+        let app_texture = damascene_wgpu::app_texture(texture.clone());
         Self {
             _texture: texture,
             view,
@@ -1043,67 +1051,14 @@ fn pointer_in_rect(rect: Option<Rect>, x: f32, y: f32) -> bool {
     })
 }
 
-fn map_key(key: &Key) -> Option<UiKey> {
-    match key {
-        Key::Named(NamedKey::Enter) => Some(UiKey::Enter),
-        Key::Named(NamedKey::Escape) => Some(UiKey::Escape),
-        Key::Named(NamedKey::Tab) => Some(UiKey::Tab),
-        Key::Named(NamedKey::Space) => Some(UiKey::Space),
-        Key::Named(NamedKey::ArrowUp) => Some(UiKey::ArrowUp),
-        Key::Named(NamedKey::ArrowDown) => Some(UiKey::ArrowDown),
-        Key::Named(NamedKey::ArrowLeft) => Some(UiKey::ArrowLeft),
-        Key::Named(NamedKey::ArrowRight) => Some(UiKey::ArrowRight),
-        Key::Named(NamedKey::Backspace) => Some(UiKey::Backspace),
-        Key::Named(NamedKey::Delete) => Some(UiKey::Delete),
-        Key::Named(NamedKey::Home) => Some(UiKey::Home),
-        Key::Named(NamedKey::End) => Some(UiKey::End),
-        Key::Named(NamedKey::PageUp) => Some(UiKey::PageUp),
-        Key::Named(NamedKey::PageDown) => Some(UiKey::PageDown),
-        Key::Character(s) => Some(UiKey::Character(s.to_string())),
-        Key::Named(named) => Some(UiKey::Other(format!("{named:?}"))),
-        _ => None,
-    }
+/// Dispatch a UI event to the app, attaching the runner's `UiState` so
+/// geometry accessors on `EventCx` can answer.
+fn dispatch_event(app: &mut VolumetricUiV2, runner: &Runner, event: UiEvent) {
+    let cx = EventCx::new().with_ui_state(runner.ui_state());
+    app.on_event(event, &cx);
 }
 
-fn pointer_button(button: MouseButton) -> Option<PointerButton> {
-    match button {
-        MouseButton::Left => Some(PointerButton::Primary),
-        MouseButton::Right => Some(PointerButton::Secondary),
-        MouseButton::Middle => Some(PointerButton::Middle),
-        _ => None,
-    }
-}
-
-fn key_modifiers(modifiers: winit::keyboard::ModifiersState) -> KeyModifiers {
-    KeyModifiers {
-        shift: modifiers.shift_key(),
-        ctrl: modifiers.control_key(),
-        alt: modifiers.alt_key(),
-        logo: modifiers.super_key(),
-    }
-}
-
-fn winit_cursor(cursor: Cursor) -> CursorIcon {
-    match cursor {
-        Cursor::Default => CursorIcon::Default,
-        Cursor::Pointer => CursorIcon::Pointer,
-        Cursor::Text => CursorIcon::Text,
-        Cursor::NotAllowed => CursorIcon::NotAllowed,
-        Cursor::Grab => CursorIcon::Grab,
-        Cursor::Grabbing => CursorIcon::Grabbing,
-        Cursor::Move => CursorIcon::Move,
-        Cursor::EwResize => CursorIcon::EwResize,
-        Cursor::NsResize => CursorIcon::NsResize,
-        Cursor::NwseResize => CursorIcon::NwseResize,
-        Cursor::NeswResize => CursorIcon::NeswResize,
-        Cursor::ColResize => CursorIcon::ColResize,
-        Cursor::RowResize => CursorIcon::RowResize,
-        Cursor::Crosshair => CursorIcon::Crosshair,
-        _ => CursorIcon::Default,
-    }
-}
-
-fn bg_color(palette: &aetna_core::Palette) -> wgpu::Color {
+fn bg_color(palette: &damascene_core::Palette) -> wgpu::Color {
     let c = palette.background;
     wgpu::Color {
         r: srgb_to_linear(c.r as f64 / 255.0),
