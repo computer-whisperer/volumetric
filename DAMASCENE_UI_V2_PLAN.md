@@ -215,6 +215,19 @@ Damascene widgets that should map well:
   in a `text_area` whose contents are written straight back to the step's input
   bytes. Not yet editable in the form: `VecF64` literal/asset and `Blob` file
   picker.
+- The viewport now renders a *set* of outputs, not a single selected asset —
+  the capability the egui v1 UI had (`asset_render_data` multi-entity rendering)
+  that the initial port dropped. `preview_requests()` emits one request per
+  renderable runtime export; a host-side `PreviewCache` meshes each output on the
+  background worker (coalesced per output id), keeps the last good mesh per
+  output while a rebuild is in flight, evicts outputs that leave the set, and
+  composites the cached geometry into one `SceneData` (memoized against the
+  contributing keys). Camera framing changed accordingly: instead of snapping on
+  every rebuild, the camera re-frames the union bounds when the set of rendered
+  outputs changes or the Frame command is issued, and otherwise leaves the
+  user's view alone. This is Phase 1 of the render/selection redesign; the
+  selection surface (follow-selected-node + per-output pins and render modes) and
+  the layout rework are Phases 2–3.
 
 ### Slice 0: Dependency Update
 

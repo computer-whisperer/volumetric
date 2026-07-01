@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -428,12 +429,12 @@ impl Host {
             });
         }
 
-        let preview_request = self.app.preview_request();
-        let (preview_status, preview_job) = gfx
+        let preview_requests = self.app.preview_requests();
+        let (preview_status, preview_jobs) = gfx
             .viewport_renderer
-            .sync_preview_request(preview_request.as_ref());
+            .sync_preview_requests(&preview_requests);
         self.app.set_preview_build_status(preview_status);
-        if let Some(job) = preview_job {
+        for job in preview_jobs {
             self.worker.send(BackgroundJob::BuildPreview(job));
         }
         if let Some(command) = self.app.take_camera_command() {
@@ -492,7 +493,7 @@ impl Host {
             logical_rect: viewport_rect,
             scale_factor,
             clear_color: bg_color(&palette),
-            preview_request,
+            preview_requests,
         });
         gfx.damascene.render(
             &gfx.device,
@@ -520,9 +521,14 @@ struct ViewportRenderer {
     renderer: renderer::Renderer,
     target: ViewportTarget,
     surface_format: wgpu::TextureFormat,
-    scene_cache: Option<PreviewSceneCache>,
-    pending_preview_key: Option<PreviewSceneKey>,
-    failed_preview: Option<(PreviewSceneKey, String)>,
+    /// Per-output mesh cache + build bookkeeping (no GPU state; unit-tested).
+    preview_cache: PreviewCache,
+    /// Union bounds of the currently composited scene, for the Frame command.
+    scene_bounds: Option<PreviewBounds>,
+    /// The set of output ids the camera was last framed against. The camera
+    /// re-frames when this set changes (an output added/removed) but not on a
+    /// mere resolution/mode tweak of the same set.
+    framed_ids: Option<Vec<String>>,
     pending_frame_preview: bool,
     camera: Option<renderer::Camera>,
 }
@@ -534,7 +540,7 @@ struct ViewportRenderParams<'a> {
     logical_rect: Option<Rect>,
     scale_factor: f32,
     clear_color: wgpu::Color,
-    preview_request: Option<PreviewRequest>,
+    preview_requests: Vec<PreviewRequest>,
 }
 
 impl ViewportRenderer {
@@ -548,9 +554,9 @@ impl ViewportRenderer {
             renderer,
             target,
             surface_format: format,
-            scene_cache: None,
-            pending_preview_key: None,
-            failed_preview: None,
+            preview_cache: PreviewCache::default(),
+            scene_bounds: None,
+            framed_ids: None,
             pending_frame_preview: false,
             camera: None,
         }
@@ -588,7 +594,7 @@ impl ViewportRenderer {
             logical_rect,
             scale_factor,
             clear_color,
-            preview_request,
+            preview_requests,
         } = params;
 
         let Some(rect) = logical_rect else {
@@ -599,7 +605,7 @@ impl ViewportRenderer {
         let (w, h) = self.target.extent;
 
         self.renderer.set_viewport_size(device, w, h);
-        let (scene, camera) = self.scene_for_request(preview_request.as_ref());
+        let scene = self.resolve_scene(&preview_requests);
         for (mesh, transform, material) in &scene.meshes {
             self.renderer.submit_mesh(mesh, *transform, *material);
         }
@@ -610,8 +616,12 @@ impl ViewportRenderer {
             self.renderer
                 .submit_points(points, *transform, style.clone());
         }
+        let camera = self
+            .camera
+            .get_or_insert_with(renderer::test_scenes::create_test_camera)
+            .clone();
 
-        let settings = render_settings(preview_request.as_ref(), clear_color);
+        let settings = render_settings(preview_requests.first(), clear_color);
         self.renderer.render(
             device,
             queue,
@@ -669,130 +679,57 @@ impl ViewportRenderer {
         }
     }
 
+    /// The Frame command re-centers the camera on the current scene. The actual
+    /// framing happens in `resolve_scene`, which owns the union bounds; here we
+    /// only raise the request so it fires even if the scene isn't cached yet.
     fn frame_preview(&mut self) {
-        let Some(cache) = &self.scene_cache else {
-            self.pending_frame_preview = true;
-            return;
-        };
-
-        let mut camera = self.camera.clone().unwrap_or_default();
-        camera.focus_on(cache.scene.bounds.min_vec3(), cache.scene.bounds.max_vec3());
-        self.camera = Some(camera);
-        self.pending_frame_preview = false;
+        self.pending_frame_preview = true;
     }
 
     fn has_pending_preview(&self) -> bool {
-        self.pending_preview_key.is_some()
+        self.preview_cache.has_pending()
     }
 
-    /// Decides the preview build status for the current request and, when a new
-    /// build is needed, returns the job for the host to enqueue on the shared
+    /// Reconciles the desired output set with the mesh cache and returns the
+    /// aggregate build status plus any per-output jobs to enqueue on the shared
     /// worker. (The host owns the worker so project runs and preview meshing
     /// share one thread and one result channel.)
-    fn sync_preview_request(
+    fn sync_preview_requests(
         &mut self,
-        request: Option<&PreviewRequest>,
-    ) -> (PreviewBuildStatus, Option<PreviewBuildJob>) {
-        let Some(request) = request else {
-            self.pending_preview_key = None;
-            self.failed_preview = None;
-            return (PreviewBuildStatus::Idle, None);
-        };
-
-        let key = PreviewSceneKey::from(request);
-        if self
-            .scene_cache
-            .as_ref()
-            .is_some_and(|cache| cache.key == key)
-        {
-            return (PreviewBuildStatus::Ready { label: key.label() }, None);
-        }
-        if self.pending_preview_key.as_ref() == Some(&key) {
-            return (PreviewBuildStatus::Building { label: key.label() }, None);
-        }
-        if let Some((failed_key, error)) = &self.failed_preview
-            && failed_key == &key
-        {
-            return (
-                PreviewBuildStatus::Failed {
-                    label: key.label(),
-                    error: error.clone(),
-                },
-                None,
-            );
-        }
-
-        self.failed_preview = None;
-        self.pending_preview_key = Some(key.clone());
-        let job = PreviewBuildJob {
-            key: key.clone(),
-            request: request.clone(),
-        };
-        (
-            PreviewBuildStatus::Building { label: key.label() },
-            Some(job),
-        )
+        requests: &[PreviewRequest],
+    ) -> (PreviewBuildStatus, Vec<PreviewBuildJob>) {
+        self.preview_cache.sync(requests)
     }
 
     fn accept_preview_result(&mut self, result: PreviewBuildResult) {
-        if self.pending_preview_key.as_ref() != Some(&result.key) {
-            return;
-        }
-
-        self.pending_preview_key = None;
-        match result.result {
-            Ok(scene) => {
-                self.failed_preview = None;
-                self.camera = Some(scene.camera.clone());
-                self.scene_cache = Some(PreviewSceneCache {
-                    key: result.key,
-                    scene,
-                });
-                if self.pending_frame_preview {
-                    self.frame_preview();
-                }
-            }
-            Err(error) => {
-                self.failed_preview = Some((result.key, error));
-            }
-        }
+        self.preview_cache.accept(result);
     }
 
-    fn scene_for_request(
-        &mut self,
-        request: Option<&PreviewRequest>,
-    ) -> (renderer::SceneData, renderer::Camera) {
-        let Some(request) = request else {
-            if self.scene_cache.is_some() {
-                self.scene_cache = None;
-                self.camera = Some(renderer::test_scenes::create_test_camera());
+    /// Composites the cached meshes for the current output set into one scene,
+    /// updating the camera: framing the union bounds when the output set changes
+    /// or a Frame command is pending, and otherwise leaving the user's view. When
+    /// nothing is cached yet it falls back to the renderer test scene.
+    fn resolve_scene(&mut self, requests: &[PreviewRequest]) -> renderer::SceneData {
+        let Some((scene, bounds, ids)) = self.preview_cache.composite(requests) else {
+            // Nothing materialized yet: keep the placeholder scene, don't disturb
+            // the camera the user may already have moved.
+            if self.scene_bounds.is_none() {
+                self.camera
+                    .get_or_insert_with(renderer::test_scenes::create_test_camera);
             }
-            let camera = self
-                .camera
-                .get_or_insert_with(renderer::test_scenes::create_test_camera)
-                .clone();
-            return (renderer::test_scenes::create_test_scene(), camera);
+            return renderer::test_scenes::create_test_scene();
         };
 
-        let key = PreviewSceneKey::from(request);
-        let scene = self
-            .scene_cache
-            .as_ref()
-            .filter(|cache| {
-                cache.key == key
-                    || self.pending_preview_key.is_some()
-                    || self
-                        .failed_preview
-                        .as_ref()
-                        .is_some_and(|(failed_key, _)| failed_key == &key)
-            })
-            .map(|cache| cache.scene.scene.clone())
-            .unwrap_or_else(renderer::test_scenes::create_test_scene);
-        let camera = self
-            .camera
-            .get_or_insert_with(renderer::test_scenes::create_test_camera)
-            .clone();
-        (scene, camera)
+        self.scene_bounds = Some(bounds);
+        let reframe = self.pending_frame_preview || self.framed_ids.as_ref() != Some(&ids);
+        if reframe {
+            let mut camera = self.camera.take().unwrap_or_default();
+            camera.focus_on(bounds.min_vec3(), bounds.max_vec3());
+            self.camera = Some(camera);
+            self.framed_ids = Some(ids);
+            self.pending_frame_preview = false;
+        }
+        scene
     }
 }
 
@@ -858,9 +795,10 @@ impl PreviewSceneKey {
     }
 }
 
-struct PreviewScene {
+/// A single built output: its meshed geometry and world-space bounds.
+#[derive(Clone)]
+struct PreviewEntity {
     scene: renderer::SceneData,
-    camera: renderer::Camera,
     bounds: PreviewBounds,
 }
 
@@ -878,11 +816,157 @@ impl PreviewBounds {
     fn max_vec3(self) -> Vec3 {
         Vec3::new(self.max.0, self.max.1, self.max.2)
     }
+
+    /// The bounding box enclosing both `self` and `other`.
+    fn union(self, other: PreviewBounds) -> PreviewBounds {
+        PreviewBounds {
+            min: (
+                self.min.0.min(other.min.0),
+                self.min.1.min(other.min.1),
+                self.min.2.min(other.min.2),
+            ),
+            max: (
+                self.max.0.max(other.max.0),
+                self.max.1.max(other.max.1),
+                self.max.2.max(other.max.2),
+            ),
+        }
+    }
 }
 
-struct PreviewSceneCache {
-    key: PreviewSceneKey,
-    scene: PreviewScene,
+/// Per-output mesh cache and build bookkeeping. Holds no GPU state, so its
+/// reconcile/accept/composite logic is unit-tested directly.
+///
+/// Keyed by asset id: each output has at most one cached entity, which is kept
+/// (stale) until a fresh build for the same asset replaces it, so a resolution
+/// or mode change never blanks an output mid-rebuild.
+#[derive(Default)]
+struct PreviewCache {
+    entities: HashMap<String, (PreviewSceneKey, PreviewEntity)>,
+    pending: HashMap<String, PreviewSceneKey>,
+    failed: HashMap<String, (PreviewSceneKey, String)>,
+    /// Memoized composite, rebuilt only when the contributing keys change.
+    composite: Option<(Vec<PreviewSceneKey>, renderer::SceneData, PreviewBounds)>,
+}
+
+impl PreviewCache {
+    /// Drops any outputs no longer requested, then returns the aggregate build
+    /// status and the jobs needed to bring the requested set up to date.
+    fn sync(&mut self, requests: &[PreviewRequest]) -> (PreviewBuildStatus, Vec<PreviewBuildJob>) {
+        let desired: std::collections::HashSet<&str> =
+            requests.iter().map(|r| r.asset_id.as_str()).collect();
+        self.entities.retain(|id, _| desired.contains(id.as_str()));
+        self.pending.retain(|id, _| desired.contains(id.as_str()));
+        self.failed.retain(|id, _| desired.contains(id.as_str()));
+
+        let mut jobs = Vec::new();
+        for request in requests {
+            let key = PreviewSceneKey::from(request);
+            let id = &request.asset_id;
+            let cached = self.entities.get(id).map(|(k, _)| k) == Some(&key);
+            let building = self.pending.get(id) == Some(&key);
+            let failed = self.failed.get(id).map(|(k, _)| k) == Some(&key);
+            if cached || building || failed {
+                continue;
+            }
+            self.failed.remove(id);
+            self.pending.insert(id.clone(), key.clone());
+            jobs.push(PreviewBuildJob {
+                key,
+                request: request.clone(),
+            });
+        }
+
+        let status = if !self.pending.is_empty() {
+            PreviewBuildStatus::Building {
+                label: format!("{} building", self.pending.len()),
+            }
+        } else if let Some((_, (key, error))) = self.failed.iter().next() {
+            PreviewBuildStatus::Failed {
+                label: key.label(),
+                error: error.clone(),
+            }
+        } else if self.entities.is_empty() {
+            PreviewBuildStatus::Idle
+        } else {
+            PreviewBuildStatus::Ready {
+                label: format!("{} outputs", self.entities.len()),
+            }
+        };
+        (status, jobs)
+    }
+
+    /// Records a completed build, ignoring results superseded by a newer request.
+    fn accept(&mut self, result: PreviewBuildResult) {
+        let PreviewBuildResult { key, result } = result;
+        let id = key.asset_id.clone();
+        if self.pending.get(&id) != Some(&key) {
+            return; // a newer build for this output was requested; drop this one.
+        }
+        self.pending.remove(&id);
+        match result {
+            Ok(entity) => {
+                self.failed.remove(&id);
+                self.entities.insert(id, (key, entity));
+                self.composite = None;
+            }
+            Err(error) => {
+                self.failed.insert(id, (key, error));
+            }
+        }
+    }
+
+    fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// Composites the cached geometry for the requested outputs into one scene.
+    /// Returns the merged scene, its union bounds, and the sorted ids of the
+    /// contributing outputs (used to decide when to re-frame the camera), or
+    /// `None` when no requested output has materialized yet. The result is
+    /// memoized against the contributing keys so a static scene isn't re-merged
+    /// every frame.
+    fn composite(
+        &mut self,
+        requests: &[PreviewRequest],
+    ) -> Option<(renderer::SceneData, PreviewBounds, Vec<String>)> {
+        let mut keys = Vec::new();
+        let mut ids = Vec::new();
+        for request in requests {
+            if let Some((key, _)) = self.entities.get(&request.asset_id) {
+                keys.push(key.clone());
+                ids.push(request.asset_id.clone());
+            }
+        }
+        if keys.is_empty() {
+            return None;
+        }
+        ids.sort();
+
+        if self
+            .composite
+            .as_ref()
+            .is_none_or(|(cached_keys, _, _)| cached_keys != &keys)
+        {
+            let mut scene = renderer::SceneData::new();
+            let mut bounds: Option<PreviewBounds> = None;
+            for request in requests {
+                if let Some((_, entity)) = self.entities.get(&request.asset_id) {
+                    scene.meshes.extend(entity.scene.meshes.iter().cloned());
+                    scene.lines.extend(entity.scene.lines.iter().cloned());
+                    scene.points.extend(entity.scene.points.iter().cloned());
+                    bounds = Some(match bounds {
+                        Some(acc) => acc.union(entity.bounds),
+                        None => entity.bounds,
+                    });
+                }
+            }
+            self.composite = Some((keys, scene, bounds.expect("non-empty keys imply bounds")));
+        }
+
+        let (_, scene, bounds) = self.composite.as_ref().unwrap();
+        Some((scene.clone(), *bounds, ids))
+    }
 }
 
 struct PreviewBuildJob {
@@ -892,7 +976,7 @@ struct PreviewBuildJob {
 
 struct PreviewBuildResult {
     key: PreviewSceneKey,
-    result: Result<PreviewScene, String>,
+    result: Result<PreviewEntity, String>,
 }
 
 /// A unit of background work for [`BackgroundWorker`].
@@ -916,8 +1000,10 @@ enum BackgroundResult {
 }
 
 /// A single worker thread that serially executes project runs and preview mesh
-/// builds. Jobs are coalesced per kind — only the newest queued run and the
-/// newest queued preview survive — so a burst of edits collapses to one rebuild.
+/// builds. The newest queued run is coalesced (a burst of edits collapses to one
+/// rebuild); preview jobs are coalesced per output id, so several outputs can be
+/// meshed while re-requesting one output supersedes its stale job. Runs are
+/// always drained before previews so a following preview sees fresh assets.
 struct BackgroundWorker {
     jobs: Sender<BackgroundJob>,
     results: Receiver<BackgroundResult>,
@@ -932,22 +1018,23 @@ impl BackgroundWorker {
             .name("volumetric-background-worker".to_string())
             .spawn(move || {
                 let mut pending_run: Option<(u64, volumetric::Project, Arc<AtomicBool>)> = None;
-                let mut pending_preview: Option<PreviewBuildJob> = None;
+                let mut pending_previews: HashMap<String, PreviewBuildJob> = HashMap::new();
 
                 loop {
                     // Block for work only when nothing is already pending.
-                    if pending_run.is_none() && pending_preview.is_none() {
+                    if pending_run.is_none() && pending_previews.is_empty() {
                         match job_rx.recv() {
-                            Ok(job) => stash_job(&mut pending_run, &mut pending_preview, job),
+                            Ok(job) => stash_job(&mut pending_run, &mut pending_previews, job),
                             Err(_) => break,
                         }
                     }
-                    // Coalesce everything queued right now (newest of each kind wins).
+                    // Coalesce everything queued right now (newest run, newest job per output).
                     while let Ok(job) = job_rx.try_recv() {
-                        stash_job(&mut pending_run, &mut pending_preview, job);
+                        stash_job(&mut pending_run, &mut pending_previews, job);
                     }
 
-                    // Run the project first so a following preview sees fresh assets.
+                    // Run the project first so a following preview sees fresh assets;
+                    // loop back afterwards so a newly queued run preempts any previews.
                     if let Some((generation, project, cancel)) = pending_run.take() {
                         let start = std::time::Instant::now();
                         let result = project
@@ -964,9 +1051,13 @@ impl BackgroundWorker {
                         {
                             break;
                         }
+                        continue;
                     }
 
-                    if let Some(job) = pending_preview.take() {
+                    // Mesh one output per iteration, re-checking the job queue between
+                    // outputs so a fresh run jumps ahead of the remaining previews.
+                    if let Some(id) = pending_previews.keys().next().cloned() {
+                        let job = pending_previews.remove(&id).expect("key just observed");
                         let result = build_preview_scene(&job.request);
                         if result_tx
                             .send(BackgroundResult::PreviewComplete(PreviewBuildResult {
@@ -1003,7 +1094,7 @@ impl BackgroundWorker {
 
 fn stash_job(
     run: &mut Option<(u64, volumetric::Project, Arc<AtomicBool>)>,
-    preview: &mut Option<PreviewBuildJob>,
+    previews: &mut HashMap<String, PreviewBuildJob>,
     job: BackgroundJob,
 ) {
     match job {
@@ -1012,11 +1103,14 @@ fn stash_job(
             project,
             cancel,
         } => *run = Some((generation, project, cancel)),
-        BackgroundJob::BuildPreview(preview_job) => *preview = Some(preview_job),
+        BackgroundJob::BuildPreview(preview_job) => {
+            // Newest job per output wins.
+            previews.insert(preview_job.key.asset_id.clone(), preview_job);
+        }
     }
 }
 
-fn build_preview_scene(request: &PreviewRequest) -> Result<PreviewScene, String> {
+fn build_preview_scene(request: &PreviewRequest) -> Result<PreviewEntity, String> {
     let (scene, bounds_min, bounds_max) = match &request.mesh_plan {
         PreviewMeshPlan::PointCloud { resolution } => {
             let (points, bounds_min, bounds_max) =
@@ -1087,9 +1181,8 @@ fn build_preview_scene(request: &PreviewRequest) -> Result<PreviewScene, String>
         }
     };
 
-    Ok(PreviewScene {
+    Ok(PreviewEntity {
         scene,
-        camera: camera_for_bounds(bounds_min, bounds_max),
         bounds: PreviewBounds {
             min: bounds_min,
             max: bounds_max,
@@ -1119,14 +1212,6 @@ fn render_settings(
     }
 
     settings
-}
-
-fn camera_for_bounds(bounds_min: (f32, f32, f32), bounds_max: (f32, f32, f32)) -> renderer::Camera {
-    let min = Vec3::new(bounds_min.0, bounds_min.1, bounds_min.2);
-    let max = Vec3::new(bounds_max.0, bounds_max.1, bounds_max.2);
-    let mut camera = renderer::Camera::default();
-    camera.focus_on(min, max);
-    camera
 }
 
 fn triangles_to_mesh_vertices(triangles: &[volumetric::Triangle]) -> Vec<renderer::MeshVertex> {
@@ -1219,6 +1304,140 @@ fn srgb_to_linear(c: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn request(id: &str, resolution: usize) -> PreviewRequest {
+        PreviewRequest {
+            asset_id: id.to_string(),
+            wasm_bytes: Arc::new(vec![1, 2, 3]),
+            type_hint: None,
+            precursor_ids: Vec::new(),
+            render_mode: PreviewRenderMode::Points,
+            mesh_plan: PreviewMeshPlan::PointCloud { resolution },
+            show_grid: true,
+            ssao: true,
+            stale: false,
+        }
+    }
+
+    /// A one-point entity, so a composite's point count reveals how many outputs
+    /// contributed.
+    fn entity() -> PreviewEntity {
+        let mut scene = renderer::SceneData::new();
+        scene.add_points(
+            renderer::convert_points_to_point_data(&[(0.0, 0.0, 0.0)]),
+            glam::Mat4::IDENTITY,
+            renderer::PointStyle {
+                size: 1.0,
+                size_mode: renderer::WidthMode::ScreenSpace,
+                shape: renderer::PointShape::Circle,
+                depth_mode: renderer::DepthMode::Normal,
+            },
+        );
+        PreviewEntity {
+            scene,
+            bounds: PreviewBounds {
+                min: (0.0, 0.0, 0.0),
+                max: (1.0, 1.0, 1.0),
+            },
+        }
+    }
+
+    fn accept_ok(cache: &mut PreviewCache, job: PreviewBuildJob) {
+        cache.accept(PreviewBuildResult {
+            key: job.key,
+            result: Ok(entity()),
+        });
+    }
+
+    /// The milestone: two requested outputs each get a build job, and once both
+    /// land they composite into a single multi-entity scene.
+    #[test]
+    fn sync_meshes_each_output_then_composites_all() {
+        let mut cache = PreviewCache::default();
+        let requests = vec![request("a", 8), request("b", 8)];
+
+        let (status, jobs) = cache.sync(&requests);
+        assert_eq!(jobs.len(), 2, "one build job per output");
+        assert!(matches!(status, PreviewBuildStatus::Building { .. }));
+        assert!(cache.composite(&requests).is_none(), "nothing built yet");
+
+        for job in jobs {
+            accept_ok(&mut cache, job);
+        }
+
+        let (status, jobs) = cache.sync(&requests);
+        assert!(jobs.is_empty(), "everything cached, no rebuild");
+        assert!(matches!(status, PreviewBuildStatus::Ready { .. }));
+
+        let (scene, _bounds, ids) = cache.composite(&requests).expect("composited scene");
+        assert_eq!(scene.points.len(), 2, "both outputs render together");
+        assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    /// Changing an output's resolution requeues its build but keeps the last good
+    /// mesh on screen until the new one arrives.
+    #[test]
+    fn resolution_change_keeps_stale_output_until_rebuilt() {
+        let mut cache = PreviewCache::default();
+        let coarse = vec![request("a", 8)];
+        let (_, jobs) = cache.sync(&coarse);
+        accept_ok(&mut cache, jobs.into_iter().next().unwrap());
+
+        let fine = vec![request("a", 32)];
+        let (status, jobs) = cache.sync(&fine);
+        assert_eq!(jobs.len(), 1, "the finer resolution requeues a build");
+        assert!(matches!(status, PreviewBuildStatus::Building { .. }));
+
+        let (scene, _, _) = cache.composite(&fine).expect("stale mesh still shown");
+        assert_eq!(scene.points.len(), 1);
+    }
+
+    /// An output that is no longer requested is evicted from the cache.
+    #[test]
+    fn dropping_an_output_evicts_it() {
+        let mut cache = PreviewCache::default();
+        // Clone shared requests so each output keeps one stable Arc (and thus a
+        // stable cache key) across syncs, mirroring the app's `data_arc()`.
+        let (a, b) = (request("a", 8), request("b", 8));
+        let both = vec![a.clone(), b.clone()];
+        let (_, jobs) = cache.sync(&both);
+        for job in jobs {
+            accept_ok(&mut cache, job);
+        }
+
+        let only_a = vec![a.clone()];
+        let (_, jobs) = cache.sync(&only_a);
+        assert!(jobs.is_empty());
+        let (scene, _, ids) = cache.composite(&only_a).unwrap();
+        assert_eq!(scene.points.len(), 1);
+        assert_eq!(ids, vec!["a".to_string()]);
+
+        // "b" was evicted, so requesting it again requires a fresh build.
+        let (_, jobs) = cache.sync(&both);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].key.asset_id, "b");
+    }
+
+    /// A build result for a superseded request (its output was re-requested with
+    /// different settings) is discarded rather than shown.
+    #[test]
+    fn superseded_build_result_is_ignored() {
+        let mut cache = PreviewCache::default();
+        let (_, jobs) = cache.sync(&[request("a", 8)]);
+        let stale_job = jobs.into_iter().next().unwrap();
+
+        // Re-request "a" at a new resolution before the first build returns.
+        let fine = vec![request("a", 32)];
+        let (_, jobs) = cache.sync(&fine);
+        let fresh_job = jobs.into_iter().next().unwrap();
+
+        // The stale build lands first and must be dropped.
+        accept_ok(&mut cache, stale_job);
+        assert!(cache.composite(&fine).is_none(), "stale result discarded");
+
+        accept_ok(&mut cache, fresh_job);
+        assert!(cache.composite(&fine).is_some(), "fresh result accepted");
+    }
 
     /// End-to-end check that the shared worker executes a project off-thread and
     /// reports the result back through the channel, tagged with its generation.

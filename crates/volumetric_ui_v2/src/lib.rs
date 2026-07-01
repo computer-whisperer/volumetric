@@ -383,8 +383,20 @@ impl VolumetricUiV2 {
             .find(|asset| asset.id() == selected_export)
     }
 
-    pub fn preview_request(&self) -> Option<PreviewRequest> {
-        let asset = self.selected_runtime_asset()?;
+    /// The set of runtime outputs to render this frame. Phase 1 renders every
+    /// renderable runtime export at the global render mode; the host composites
+    /// them into one multi-entity scene. (Phase 2 will narrow this to the
+    /// selected node plus pinned outputs, each with its own render mode.)
+    pub fn preview_requests(&self) -> Vec<PreviewRequest> {
+        self.runtime_assets
+            .iter()
+            .filter_map(|asset| self.render_request_for_asset(asset))
+            .collect()
+    }
+
+    /// Builds a render request for a single runtime asset, or `None` when it is
+    /// not a renderable model.
+    fn render_request_for_asset(&self, asset: &LoadedAsset) -> Option<PreviewRequest> {
         if !matches!(asset.type_hint(), Some(AssetTypeHint::Model) | None) {
             return None;
         }
@@ -2404,7 +2416,7 @@ mod tests {
     }
 
     #[test]
-    fn preview_request_uses_selected_runtime_asset_and_controls() {
+    fn preview_requests_carry_render_mode_and_controls() {
         let mut app = VolumetricUiV2::default();
         app.run_project();
         dispatch(
@@ -2416,7 +2428,9 @@ mod tests {
             UiEvent::synthetic_click("viewport:preview-resolution:96"),
         );
 
-        let request = app.preview_request().expect("runtime preview request");
+        let requests = app.preview_requests();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
         assert_eq!(request.asset_id, "simple_sphere_model");
         assert_eq!(request.render_mode, PreviewRenderMode::AdaptiveSurfaceNets2);
         assert_eq!(
@@ -2435,6 +2449,22 @@ mod tests {
             .expect("asn2 config");
         assert_eq!(config.base_resolution, 6);
         assert_eq!(config.max_depth, 4);
+    }
+
+    #[test]
+    fn preview_requests_cover_every_renderable_export() {
+        // A project with two model exports must emit one render request per
+        // export so the host can composite both into the viewport.
+        let mut app = VolumetricUiV2::default();
+        app.add_selected_model(); // second copy; unique id via `insert_model`
+        app.run_project();
+
+        let requests = app.preview_requests();
+        assert_eq!(requests.len(), 2, "both exports should be rendered");
+        let ids: std::collections::BTreeSet<_> =
+            requests.iter().map(|r| r.asset_id.clone()).collect();
+        assert_eq!(ids.len(), 2, "render requests target distinct assets");
+        assert!(requests.iter().all(|r| r.render_mode == app.render_mode));
     }
 
     #[test]
@@ -2534,9 +2564,11 @@ mod tests {
         let summary = app.summary();
         assert!(summary.last_run_stale);
         assert_eq!(summary.runtime_assets.len(), 2);
-        let request = app.preview_request().expect("stale preview retained");
-        assert_eq!(request.asset_id, "simple_sphere_model");
-        assert!(request.stale);
+        // The runtime outputs are untouched until a rerun, so both still render,
+        // flagged stale rather than blanked.
+        let requests = app.preview_requests();
+        assert_eq!(requests.len(), 2, "stale preview retained");
+        assert!(requests.iter().all(|r| r.stale));
     }
 
     #[test]
@@ -2551,7 +2583,7 @@ mod tests {
         assert!(summary.runtime_assets.is_empty());
         assert!(!summary.last_run_stale);
         assert!(!app.take_pending_run());
-        assert!(app.preview_request().is_none());
+        assert!(app.preview_requests().is_empty());
     }
 
     /// Adds each bundled operator and, for the first one that declares a config
