@@ -435,7 +435,8 @@ impl VolumetricUiV2 {
                 );
             }
             Err(err) => {
-                self.runtime_assets.clear();
+                // Keep the last good runtime assets on screen; surface the error
+                // and leave the output marked stale.
                 self.last_run_error = Some(err.clone());
                 self.last_run_stale = true;
                 self.status = format!("project run failed: {err}");
@@ -475,10 +476,22 @@ impl VolumetricUiV2 {
         }
     }
 
-    fn invalidate_runtime_assets(&mut self) {
+    /// Drops materialized runtime assets and run bookkeeping. Used when the
+    /// whole project is replaced (new/open) — there is no stale output worth
+    /// keeping on screen.
+    fn clear_runtime_assets(&mut self) {
         self.runtime_assets.clear();
         self.last_run_elapsed_ms = None;
         self.last_run_error = None;
+        self.last_run_stale = false;
+        self.pending_run = false;
+    }
+
+    /// Marks the last run's output stale after an incremental project edit. The
+    /// previous runtime assets stay in place so the viewport keeps showing the
+    /// last good preview until a fresh run replaces it; the run is queued now
+    /// when auto-rebuild is enabled.
+    fn mark_project_dirty(&mut self) {
         self.last_run_stale = true;
         if self.auto_rebuild {
             self.pending_run = true;
@@ -516,7 +529,7 @@ impl VolumetricUiV2 {
         };
 
         let id = self.project.insert_model(asset.name, asset.bytes.to_vec());
-        self.invalidate_runtime_assets();
+        self.mark_project_dirty();
         self.selected_export = Some(id.clone());
         self.selected_project_item = self
             .project
@@ -551,7 +564,7 @@ impl VolumetricUiV2 {
             vec![output_id.clone()],
             output_id.clone(),
         );
-        self.invalidate_runtime_assets();
+        self.mark_project_dirty();
 
         self.selected_export = Some(output_id.clone());
         self.selected_project_item = self
@@ -570,7 +583,7 @@ impl VolumetricUiV2 {
 
         let import_id = self.project.imports()[idx].id.clone();
         self.project.imports_mut().remove(idx);
-        self.invalidate_runtime_assets();
+        self.mark_project_dirty();
 
         let mut removed_outputs = Vec::new();
         for step_idx in (0..self.project.timeline().len()).rev() {
@@ -610,7 +623,7 @@ impl VolumetricUiV2 {
         }
 
         let step = self.project.timeline_mut().remove(idx);
-        self.invalidate_runtime_assets();
+        self.mark_project_dirty();
         for output_id in &step.outputs {
             self.project.exports_mut().retain(|id| id != output_id);
         }
@@ -637,7 +650,7 @@ impl VolumetricUiV2 {
         }
 
         self.project.timeline_mut().swap(idx, target_idx);
-        self.invalidate_runtime_assets();
+        self.mark_project_dirty();
         self.selected_project_item = Some(ProjectSelection::Step(target_idx));
         self.status = format!("moved step {} to {}", idx + 1, target_idx + 1);
     }
@@ -673,7 +686,7 @@ impl VolumetricUiV2 {
         if !self.project.exports().iter().any(|id| id == &new_output) {
             self.project.exports_mut().push(new_output.clone());
         }
-        self.invalidate_runtime_assets();
+        self.mark_project_dirty();
 
         self.selected_export = Some(new_output.clone());
         self.selected_project_item = Some(ProjectSelection::Step(idx));
@@ -686,7 +699,7 @@ impl VolumetricUiV2 {
         }
 
         let export_id = self.project.exports_mut().remove(idx);
-        self.invalidate_runtime_assets();
+        self.mark_project_dirty();
         if self.selected_export.as_deref() == Some(export_id.as_str()) {
             self.selected_export = self.project.exports().last().cloned();
         }
@@ -700,7 +713,7 @@ impl VolumetricUiV2 {
         }
 
         self.project.exports_mut().push(asset_id.to_string());
-        self.invalidate_runtime_assets();
+        self.mark_project_dirty();
         self.selected_export = Some(asset_id.to_string());
         self.selected_project_item = self
             .project
@@ -751,7 +764,7 @@ impl App for VolumetricUiV2 {
             self.project = Project::new();
             self.selected_export = None;
             self.selected_project_item = None;
-            self.invalidate_runtime_assets();
+            self.clear_runtime_assets();
             self.status = "new project".to_string();
             return;
         }
@@ -2017,15 +2030,57 @@ mod tests {
     }
 
     #[test]
-    fn project_mutation_clears_runtime_exports() {
+    fn project_edit_keeps_stale_runtime_until_rerun() {
         let mut app = VolumetricUiV2::default();
         app.run_project();
+        assert_eq!(app.summary().runtime_assets.len(), 1);
+
         dispatch(&mut app, UiEvent::synthetic_click(ADD_MODEL_KEY));
 
         let summary = app.summary();
-        assert!(summary.runtime_assets.is_empty());
-        assert!(summary.last_run_error.is_none());
+        // The previous run's output stays materialized (marked stale) so the
+        // viewport keeps its last good preview until a new run replaces it.
+        assert_eq!(summary.runtime_assets.len(), 1);
         assert!(summary.last_run_stale);
+        assert!(summary.last_run_error.is_none());
+        // Auto-rebuild is off by default, so no run was queued.
+        assert!(!app.take_pending_run());
+    }
+
+    #[test]
+    fn edit_that_keeps_selection_preserves_the_stale_preview() {
+        let mut app = VolumetricUiV2::default();
+        dispatch(&mut app, UiEvent::synthetic_click(ADD_MODEL_KEY));
+        app.run_project();
+        assert_eq!(app.summary().runtime_assets.len(), 2);
+
+        // Delete the second export; selection falls back to the first, which is
+        // still materialized -> the preview stays available (stale), not blank.
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click("project:delete-export:1"),
+        );
+
+        let summary = app.summary();
+        assert!(summary.last_run_stale);
+        assert_eq!(summary.runtime_assets.len(), 2);
+        let request = app.preview_request().expect("stale preview retained");
+        assert_eq!(request.asset_id, "simple_sphere_model");
+        assert!(request.stale);
+    }
+
+    #[test]
+    fn new_project_clears_runtime_and_pending_run() {
+        let mut app = VolumetricUiV2::default();
+        app.run_project();
+        assert_eq!(app.summary().runtime_assets.len(), 1);
+
+        dispatch(&mut app, UiEvent::synthetic_click(NEW_PROJECT_KEY));
+
+        let summary = app.summary();
+        assert!(summary.runtime_assets.is_empty());
+        assert!(!summary.last_run_stale);
+        assert!(!app.take_pending_run());
         assert!(app.preview_request().is_none());
     }
 }

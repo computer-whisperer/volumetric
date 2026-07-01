@@ -196,8 +196,13 @@ Damascene widgets that should map well:
   Cancellation is cooperative (`Project::run_cancellable` checks a flag between
   timeline steps) and generation-tagged results discard superseded/cancelled
   runs. Run status, Run/Cancel, and the auto-rebuild toggle are surfaced in the
-  shell. Not yet done: keeping the stale preview visible during an auto-rebuild
-  (the viewport briefly falls back to the test scene on edit).
+  shell.
+- Incremental project edits now keep the last good run output on screen instead
+  of clearing it: edits only mark the output stale (and queue a run when
+  auto-rebuild is on), a failed rerun keeps the previous preview while surfacing
+  the error, and only a full project replacement (new/open) clears the runtime.
+  Adding a new model/operator still transitions the viewport to that new node's
+  (building) preview, since selection follows the freshly added output.
 
 ### Slice 0: Dependency Update
 
