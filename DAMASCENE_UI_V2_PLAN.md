@@ -303,6 +303,19 @@ candidates for Phase 3c.
   and path-based project open/save (web needs bytes + browser download).
   Also deliberately changed from v1: ladder resolution presets instead of an
   arbitrary-resolution slider.
+- The custom host was reviewed against upstream Damascene's hosted-app path
+  (`WinitWgpuApp` + `run_host_app_with_config`) and kept: pixel-exact,
+  DPI-scaled viewport rendering needs the host-side `rect_of_key` surface,
+  which hosted apps cannot reach today (BuildCx viewport metrics are a
+  documented future addition; the hosted `AppTexture` path stretches a
+  fixed-size texture). In preparation for the web shell, the host was split
+  into `session.rs` — the platform-neutral core (preview cache, viewport
+  renderer/target, camera input typed over Damascene's
+  `PointerButton`/`KeyModifiers`, run/cancel generations, `JobQueue` +
+  `execute_job` for background work) — and `host.rs`, now only winit plumbing:
+  event loop, input mapping, the worker thread pumping the job queue, and the
+  blocking `rfd` dialogs. A web shell plugs a canvas event source, async
+  dialogs, and its own job execution strategy into the same `Session`.
 
 ### Slice 0: Dependency Update
 

@@ -15,6 +15,7 @@ use volumetric_renderer::CameraControlScheme;
 use damascene_core::prelude::*;
 
 pub mod host;
+pub mod session;
 
 pub const VIEWPORT_KEY: &str = "viewport";
 pub const NEW_PROJECT_KEY: &str = "action:new-project";
@@ -618,9 +619,17 @@ impl VolumetricUiV2 {
     fn adjust_output_asn2(&mut self, id: &str, field: &str, up: bool) {
         let mut render = self.output_render(id);
         let asn2 = &mut render.asn2;
-        let step_usize = |v: usize| if up { (v + 1).min(16) } else { v.saturating_sub(1) };
+        let step_usize = |v: usize| {
+            if up {
+                (v + 1).min(16)
+            } else {
+                v.saturating_sub(1)
+            }
+        };
         match field {
-            "vr" => asn2.vertex_refinement_iterations = step_usize(asn2.vertex_refinement_iterations),
+            "vr" => {
+                asn2.vertex_refinement_iterations = step_usize(asn2.vertex_refinement_iterations)
+            }
             "nr" => asn2.normal_sample_iterations = step_usize(asn2.normal_sample_iterations),
             "sharp" => asn2.sharp_edges = !asn2.sharp_edges,
             "angle" => {
@@ -2013,7 +2022,11 @@ fn add_menu_items() -> Vec<El> {
 /// The open viewport picker menu (or per-output settings popover), rendered
 /// as a root overlay layer.
 fn select_layer(app: &VolumetricUiV2) -> Option<El> {
-    if let Some(id) = app.open_select.as_deref()?.strip_prefix(OUTPUT_SETTINGS_PREFIX) {
+    if let Some(id) = app
+        .open_select
+        .as_deref()?
+        .strip_prefix(OUTPUT_SETTINGS_PREFIX)
+    {
         return Some(output_settings_popover(app, id));
     }
     match app.open_select.as_deref()? {
@@ -2031,10 +2044,12 @@ fn select_layer(app: &VolumetricUiV2) -> Option<El> {
         )),
         CAMERA_SELECT_KEY => Some(select_menu(
             CAMERA_SELECT_KEY,
-            CameraControlScheme::ALL
-                .iter()
-                .copied()
-                .map(|scheme| (camera_scheme_route_name(scheme), camera_scheme_tooltip(scheme))),
+            CameraControlScheme::ALL.iter().copied().map(|scheme| {
+                (
+                    camera_scheme_route_name(scheme),
+                    camera_scheme_tooltip(scheme),
+                )
+            }),
         )),
         SSAO_SETTINGS_KEY => Some(ssao_settings_popover(app)),
         _ => None,
@@ -2172,7 +2187,10 @@ fn output_settings_popover(app: &VolumetricUiV2, id: &str) -> El {
             summary.push_str(&format!(" · {} pts", format_count(stats.points)));
         }
         if stats.samples > 0 {
-            summary.push_str(&format!(" · {} samples", format_count(stats.samples as usize)));
+            summary.push_str(&format!(
+                " · {} samples",
+                format_count(stats.samples as usize)
+            ));
         }
         body.push(text(summary).caption().muted());
         for line in &stats.detail {
@@ -2260,7 +2278,11 @@ fn viewport_overlay(app: &VolumetricUiV2) -> El {
 fn view_controls_cluster(app: &VolumetricUiV2) -> El {
     let toggle = |label: &str, on: bool, key: &str| {
         let button = button(label).xsmall().key(key);
-        if on { button.primary() } else { button.secondary() }
+        if on {
+            button.primary()
+        } else {
+            button.secondary()
+        }
     };
     card([row([
         toggle("Grid", app.show_grid, TOGGLE_GRID_KEY),
@@ -2314,10 +2336,18 @@ fn viewport_hud(app: &VolumetricUiV2) -> El {
             .xsmall(),
     ];
     if triangles > 0 {
-        badges.push(badge(format!("{} tris", format_count(triangles))).muted().xsmall());
+        badges.push(
+            badge(format!("{} tris", format_count(triangles)))
+                .muted()
+                .xsmall(),
+        );
     }
     if points > 0 {
-        badges.push(badge(format!("{} pts", format_count(points))).muted().xsmall());
+        badges.push(
+            badge(format!("{} pts", format_count(points)))
+                .muted()
+                .xsmall(),
+        );
     }
     badges.push(badge(&app.status).secondary().xsmall());
     badges.push(spacer());
@@ -2422,20 +2452,18 @@ fn viewport_placeholder(app: &VolumetricUiV2) -> El {
 /// The single project panel: pipeline spine (imports → steps → exports),
 /// materialized outputs, and the inspector for the current selection.
 fn project_panel(app: &VolumetricUiV2) -> El {
-    column([
-        scroll([
-            pipeline_accordion(app),
-            divider(),
-            panel_section("Outputs", outputs_rows(app)),
-            divider(),
-            panel_section("Inspector", inspector_rows(app)),
-        ])
-        .key("project-panel-scroll")
-        .gap(tokens::SPACE_3)
-        // Gutter so keyboard focus rings on full-width rows aren't clipped
-        // by the scroll's horizontal scissor.
-        .px(tokens::RING_WIDTH),
+    column([scroll([
+        pipeline_accordion(app),
+        divider(),
+        panel_section("Outputs", outputs_rows(app)),
+        divider(),
+        panel_section("Inspector", inspector_rows(app)),
     ])
+    .key("project-panel-scroll")
+    .gap(tokens::SPACE_3)
+    // Gutter so keyboard focus rings on full-width rows aren't clipped
+    // by the scroll's horizontal scissor.
+    .px(tokens::RING_WIDTH)])
     .width(Size::Fixed(app.panel_width))
     .height(Size::Fill(1.0))
     .padding(tokens::SPACE_3)
@@ -2728,8 +2756,7 @@ fn step_edit_rows(app: &VolumetricUiV2, step_idx: usize) -> Vec<El> {
     rows.push(text("Output").muted().caption().semibold());
     rows.push(
         row([
-            text_input(OUTPUT_NAME_KEY, &edit.output_name, &app.selection)
-                .width(Size::Fill(1.0)),
+            text_input(OUTPUT_NAME_KEY, &edit.output_name, &app.selection).width(Size::Fill(1.0)),
             button("Rename")
                 .xsmall()
                 .secondary()
@@ -3131,7 +3158,10 @@ mod tests {
 
     /// Click the Add-menu entry for the named bundled model.
     fn add_model_click(app: &mut VolumetricUiV2, name: &str) {
-        dispatch(app, UiEvent::synthetic_click(format!("{ADD_MODEL_PREFIX}{name}")));
+        dispatch(
+            app,
+            UiEvent::synthetic_click(format!("{ADD_MODEL_PREFIX}{name}")),
+        );
     }
 
     /// Click the Add-menu entry for the named bundled operator.
@@ -3290,7 +3320,10 @@ mod tests {
         // Trigger click opens the picker; option click applies and closes it.
         dispatch(&mut app, UiEvent::synthetic_click(MODE_SELECT_KEY));
         assert_eq!(app.open_select.as_deref(), Some(MODE_SELECT_KEY));
-        dispatch(&mut app, UiEvent::synthetic_click("view:mode:option:points"));
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click("view:mode:option:points"),
+        );
         assert_eq!(app.open_select, None);
         dispatch(&mut app, UiEvent::synthetic_click("view:res:option:96"));
         dispatch(
@@ -3587,10 +3620,7 @@ mod tests {
             overridden.mesh_plan,
             PreviewMeshPlan::for_mode(PreviewRenderMode::Points, 24, Asn2Settings::default())
         );
-        assert_eq!(
-            default.render_mode,
-            PreviewRenderMode::AdaptiveSurfaceNets2
-        );
+        assert_eq!(default.render_mode, PreviewRenderMode::AdaptiveSurfaceNets2);
     }
 
     #[test]
@@ -4008,7 +4038,10 @@ mod tests {
         );
 
         // Edit step 0 and rename its output.
-        dispatch(&mut app, UiEvent::synthetic_click(format!("{SELECT_STEP_PREFIX}0")));
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{SELECT_STEP_PREFIX}0")),
+        );
         app.before_build();
         app.step_edit.as_mut().unwrap().output_name = "renamed_part".to_string();
         dispatch(
