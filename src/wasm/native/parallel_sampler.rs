@@ -4,8 +4,8 @@
 //! module, enabling efficient parallel sampling without mutex contention.
 
 use crate::wasm::error::WasmBackendError;
+use crate::wasm::native::module_cache::model_cache;
 use crate::wasm::traits::{ModelBounds, ModelBoundsNd, ParallelModelSampler};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use wasmtime::{Engine, Instance, Memory, Module, Store, TypedFunc};
 
@@ -46,17 +46,17 @@ impl ThreadLocalContext {
 /// WASM modules.
 pub struct NativeParallelSampler {
     id: u64,
-    engine: Arc<Engine>,
-    module: Arc<Module>,
+    engine: Engine,
+    module: Module,
     bounds: ModelBounds,
 }
 
 impl NativeParallelSampler {
     /// Create a new parallel sampler from WASM bytes.
     pub fn new(wasm_bytes: &[u8]) -> Result<Self, WasmBackendError> {
-        let engine = Engine::default();
-        let module = Module::new(&engine, wasm_bytes)
-            .map_err(|e| WasmBackendError::Instantiation(e.to_string()))?;
+        let cache = model_cache();
+        let engine = cache.engine().clone();
+        let module = cache.get_or_compile(wasm_bytes)?;
 
         // Get bounds from a temporary instance
         let bounds = Self::fetch_bounds(&engine, &module)?;
@@ -65,8 +65,8 @@ impl NativeParallelSampler {
 
         Ok(Self {
             id,
-            engine: Arc::new(engine),
-            module: Arc::new(module),
+            engine,
+            module,
             bounds,
         })
     }
@@ -228,8 +228,8 @@ impl ThreadLocalContextNd {
 /// for every sample while still allowing parallel access.
 pub struct NativeParallelSamplerNd {
     id: u64,
-    engine: Arc<Engine>,
-    module: Arc<Module>,
+    engine: Engine,
+    module: Module,
     dimensions: u32,
     bounds: ModelBoundsNd,
 }
@@ -237,9 +237,9 @@ pub struct NativeParallelSamplerNd {
 impl NativeParallelSamplerNd {
     /// Create a new N-dimensional parallel sampler from WASM bytes.
     pub fn new(wasm_bytes: &[u8]) -> Result<Self, WasmBackendError> {
-        let engine = Engine::default();
-        let module = Module::new(&engine, wasm_bytes)
-            .map_err(|e| WasmBackendError::Instantiation(e.to_string()))?;
+        let cache = model_cache();
+        let engine = cache.engine().clone();
+        let module = cache.get_or_compile(wasm_bytes)?;
 
         // Get dimensions and bounds from a temporary instance
         let (dimensions, bounds) = Self::fetch_dimensions_and_bounds(&engine, &module)?;
@@ -248,8 +248,8 @@ impl NativeParallelSamplerNd {
 
         Ok(Self {
             id,
-            engine: Arc::new(engine),
-            module: Arc::new(module),
+            engine,
+            module,
             dimensions,
             bounds,
         })

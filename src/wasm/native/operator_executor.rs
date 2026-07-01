@@ -1,6 +1,7 @@
 //! Native (wasmtime) implementation of OperatorExecutor.
 
 use crate::wasm::error::WasmBackendError;
+use crate::wasm::native::module_cache::operator_cache;
 use crate::wasm::traits::{OperatorExecutor, OperatorIo};
 use std::collections::HashMap;
 use wasmtime::{Caller, Engine, Linker, Module, Store};
@@ -22,10 +23,9 @@ pub struct NativeOperatorExecutor {
 impl NativeOperatorExecutor {
     /// Create a new executor from WASM bytes.
     pub fn new(wasm_bytes: &[u8]) -> Result<Self, WasmBackendError> {
-        let engine = Engine::new(wasmtime::Config::new().debug_info(true))
-            .map_err(|e| WasmBackendError::Instantiation(e.to_string()))?;
-        let module = Module::new(&engine, wasm_bytes)
-            .map_err(|e| WasmBackendError::Instantiation(e.to_string()))?;
+        let cache = operator_cache();
+        let engine = cache.engine().clone();
+        let module = cache.get_or_compile(wasm_bytes)?;
 
         Ok(Self { engine, module })
     }
@@ -55,21 +55,23 @@ impl NativeOperatorExecutor {
                 "host",
                 "get_input_data",
                 |mut caller: Caller<'_, OperatorState>, idx: i32, ptr: i32, len: i32| {
-                    let data = caller.data().inputs.get(idx as usize).cloned();
-
-                    if let Some(src_data) = data {
-                        let copy_len = (len as usize).min(src_data.len());
-                        if let Some(memory) =
-                            caller.get_export("memory").and_then(|e| e.into_memory())
-                        {
-                            let mem_data = memory.data_mut(&mut caller);
-                            let dest_start = ptr as usize;
-                            let dest_end = dest_start + copy_len;
-                            if dest_end <= mem_data.len() {
-                                mem_data[dest_start..dest_end]
-                                    .copy_from_slice(&src_data[..copy_len]);
-                            }
-                        }
+                    let Some(memory) = caller.get_export("memory").and_then(|e| e.into_memory())
+                    else {
+                        return;
+                    };
+                    // Split-borrow the memory and host state so the input can
+                    // be copied straight into WASM memory without cloning it.
+                    let (mem_data, state) = memory.data_and_store_mut(&mut caller);
+                    let Some(src_data) = state.inputs.get(idx as usize) else {
+                        return;
+                    };
+                    let copy_len = (len as usize).min(src_data.len());
+                    let dest_start = ptr as usize;
+                    let Some(dest_end) = dest_start.checked_add(copy_len) else {
+                        return;
+                    };
+                    if let Some(dest) = mem_data.get_mut(dest_start..dest_end) {
+                        dest.copy_from_slice(&src_data[..copy_len]);
                     }
                 },
             )

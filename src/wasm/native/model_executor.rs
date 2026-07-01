@@ -1,8 +1,9 @@
 //! Native (wasmtime) implementation of ModelExecutor.
 
 use crate::wasm::error::WasmBackendError;
+use crate::wasm::native::module_cache::model_cache;
 use crate::wasm::traits::{ModelBounds, ModelBoundsNd, ModelExecutor};
-use wasmtime::{Engine, Instance, Memory, Module, Store, TypedFunc};
+use wasmtime::{Instance, Memory, Store, TypedFunc};
 
 /// Native model executor using wasmtime.
 pub struct NativeModelExecutor {
@@ -19,11 +20,10 @@ pub struct NativeModelExecutor {
 impl NativeModelExecutor {
     /// Create a new executor from WASM bytes.
     pub fn new(wasm_bytes: &[u8]) -> Result<Self, WasmBackendError> {
-        let engine = Engine::default();
-        let module = Module::new(&engine, wasm_bytes)
-            .map_err(|e| WasmBackendError::Instantiation(e.to_string()))?;
+        let cache = model_cache();
+        let module = cache.get_or_compile(wasm_bytes)?;
 
-        let mut store = Store::new(&engine, ());
+        let mut store = Store::new(cache.engine(), ());
         let instance = Instance::new(&mut store, &module, &[])
             .map_err(|e| WasmBackendError::Instantiation(e.to_string()))?;
 
@@ -127,11 +127,10 @@ const BOUNDS_BUFFER_OFFSET: i32 = 256;
 impl NativeModelExecutorNd {
     /// Create a new N-dimensional executor from WASM bytes.
     pub fn new(wasm_bytes: &[u8]) -> Result<Self, WasmBackendError> {
-        let engine = Engine::default();
-        let module = Module::new(&engine, wasm_bytes)
-            .map_err(|e| WasmBackendError::Instantiation(e.to_string()))?;
+        let cache = model_cache();
+        let module = cache.get_or_compile(wasm_bytes)?;
 
-        let mut store = Store::new(&engine, ());
+        let mut store = Store::new(cache.engine(), ());
         let instance = Instance::new(&mut store, &module, &[])
             .map_err(|e| WasmBackendError::Instantiation(e.to_string()))?;
 

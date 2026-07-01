@@ -237,17 +237,28 @@ pub enum AbiVersion {
 }
 
 /// Detect ABI version by examining WASM exports.
-#[cfg(feature = "native")]
+///
+/// Uses wasmparser to scan the export section directly — no compilation, so
+/// this is cheap enough to call before every executor creation.
 pub fn detect_abi_version(wasm_bytes: &[u8]) -> Result<AbiVersion, WasmBackendError> {
-    use wasmtime::{Engine, Module};
+    let mut has_sample = false;
+    let mut has_get_dimensions = false;
+    let mut has_memory = false;
 
-    let engine = Engine::default();
-    let module = Module::new(&engine, wasm_bytes)
-        .map_err(|e| WasmBackendError::Instantiation(e.to_string()))?;
-
-    let has_sample = module.exports().any(|e| e.name() == "sample");
-    let has_get_dimensions = module.exports().any(|e| e.name() == "get_dimensions");
-    let has_memory = module.exports().any(|e| e.name() == "memory");
+    for payload in wasmparser::Parser::new(0).parse_all(wasm_bytes) {
+        let payload = payload.map_err(|e| WasmBackendError::Instantiation(e.to_string()))?;
+        if let wasmparser::Payload::ExportSection(section) = payload {
+            for export in section {
+                let export = export.map_err(|e| WasmBackendError::Instantiation(e.to_string()))?;
+                match export.name {
+                    "sample" => has_sample = true,
+                    "get_dimensions" => has_get_dimensions = true,
+                    "memory" => has_memory = true,
+                    _ => {}
+                }
+            }
+        }
+    }
 
     if has_sample && has_get_dimensions && has_memory {
         Ok(AbiVersion::Nd)

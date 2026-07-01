@@ -4,9 +4,11 @@
 //! using the wasmtime runtime. It's the default backend for desktop applications.
 
 mod model_executor;
+mod module_cache;
 mod operator_executor;
 mod parallel_sampler;
 
 pub use model_executor::{NativeModelExecutor, NativeModelExecutorNd};
+pub use module_cache::{ModuleCache, model_cache, operator_cache};
 pub use operator_executor::NativeOperatorExecutor;
 pub use parallel_sampler::{NativeParallelSampler, NativeParallelSamplerNd};
