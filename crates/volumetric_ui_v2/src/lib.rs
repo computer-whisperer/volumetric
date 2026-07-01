@@ -20,6 +20,9 @@ pub const VIEWPORT_KEY: &str = "viewport";
 pub const NEW_PROJECT_KEY: &str = "action:new-project";
 pub const OPEN_PROJECT_KEY: &str = "action:open-project";
 pub const SAVE_PROJECT_KEY: &str = "action:save-project";
+pub const IMPORT_WASM_KEY: &str = "action:import-wasm";
+pub const IMPORT_STL_KEY: &str = "action:import-stl";
+pub const IMPORT_HEIGHTMAP_KEY: &str = "action:import-heightmap";
 pub const RUN_PROJECT_KEY: &str = "action:run-project";
 pub const CANCEL_RUN_KEY: &str = "action:cancel-run";
 pub const TOGGLE_AUTO_REBUILD_KEY: &str = "action:toggle-auto-rebuild";
@@ -326,6 +329,12 @@ pub enum FileAction {
     ExportStl(String),
     /// Export the named output's model WASM bytes verbatim.
     ExportWasm(String),
+    /// Import a model WASM file into the project.
+    ImportWasm,
+    /// Import an STL mesh via the bundled `stl_import_operator`.
+    ImportStl,
+    /// Import a heightmap image via the bundled `heightmap_extrude_operator`.
+    ImportHeightmap,
 }
 
 /// Render settings for one output. Stored per asset id when the user
@@ -999,6 +1008,73 @@ impl VolumetricUiV2 {
         self.mark_project_dirty();
     }
 
+    /// Imports external model WASM bytes as a project import. Called by the
+    /// host after its Import dialog.
+    pub(crate) fn import_model_wasm(&mut self, name: &str, bytes: Vec<u8>) {
+        let id = self.project.insert_model(name, bytes);
+        self.mark_project_dirty();
+        self.selected_export = Some(id.clone());
+        self.selected_project_item = self
+            .project
+            .imports()
+            .len()
+            .checked_sub(1)
+            .map(ProjectSelection::Import);
+        self.status = format!("imported {id}");
+    }
+
+    /// Imports a data file (STL mesh, heightmap image, …) by staging the named
+    /// bundled operator with the file bytes wired into its Blob input. Called
+    /// by the host after its Import dialog.
+    pub(crate) fn import_blob_asset(
+        &mut self,
+        operator_name: &str,
+        output_base: &str,
+        blob: Vec<u8>,
+    ) {
+        let Some(asset) = volumetric_assets::get_operator(operator_name) else {
+            self.status = format!("missing bundled operator {operator_name}");
+            return;
+        };
+        let metadata = match volumetric::operator_metadata_from_wasm_bytes(asset.bytes) {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                self.status = format!("couldn't read {operator_name} metadata: {err}");
+                return;
+            }
+        };
+        // Import operators take no model inputs, so the primary-model id is
+        // never referenced; the schema-derived config defaults are what matter.
+        let mut inputs = operator_step_inputs(&metadata, "");
+        let Some(blob_slot) = metadata
+            .inputs
+            .iter()
+            .position(|input| matches!(input, OperatorMetadataInput::Blob))
+        else {
+            self.status = format!("{operator_name} declares no Blob input");
+            return;
+        };
+        inputs[blob_slot] = ExecutionInput::Inline(blob);
+
+        let output_id = self.project.default_output_name(output_base, None);
+        self.project.insert_operation(
+            asset.name,
+            asset.bytes.to_vec(),
+            inputs,
+            vec![output_id.clone()],
+            output_id.clone(),
+        );
+        self.mark_project_dirty();
+        self.selected_export = Some(output_id.clone());
+        self.selected_project_item = self
+            .project
+            .timeline()
+            .len()
+            .checked_sub(1)
+            .map(ProjectSelection::Step);
+        self.status = format!("imported {output_id}");
+    }
+
     fn add_model(&mut self, name: &str) {
         let Some(asset) = volumetric_assets::get_model(name) else {
             self.status = format!("missing bundled model {name}");
@@ -1374,6 +1450,24 @@ impl App for VolumetricUiV2 {
             return;
         }
 
+        if event.is_click_or_activate(IMPORT_WASM_KEY) {
+            self.pending_file_action = Some(FileAction::ImportWasm);
+            self.open_menu = None;
+            return;
+        }
+
+        if event.is_click_or_activate(IMPORT_STL_KEY) {
+            self.pending_file_action = Some(FileAction::ImportStl);
+            self.open_menu = None;
+            return;
+        }
+
+        if event.is_click_or_activate(IMPORT_HEIGHTMAP_KEY) {
+            self.pending_file_action = Some(FileAction::ImportHeightmap);
+            self.open_menu = None;
+            return;
+        }
+
         if event.is_click_or_activate(RUN_PROJECT_KEY) {
             self.request_run();
             return;
@@ -1582,7 +1676,12 @@ fn menu_layer(app: &VolumetricUiV2) -> Option<El> {
     }
 }
 
-/// The Add menu body: every bundled model and operator, one click to add.
+/// Operators reachable through Add > Import rather than the plain operator
+/// list: staging them bare (empty Blob input) would only fail the next run.
+const IMPORT_OPERATORS: [&str; 2] = ["stl_import_operator", "heightmap_extrude_operator"];
+
+/// The Add menu body: every bundled model and operator (one click to add),
+/// plus file-import actions for external assets.
 fn add_menu_items() -> Vec<El> {
     let mut items = vec![menubar_label("Models")];
     for asset in volumetric_assets::models() {
@@ -1594,11 +1693,19 @@ fn add_menu_items() -> Vec<El> {
     items.push(menubar_separator());
     items.push(menubar_label("Operators"));
     for asset in volumetric_assets::operators() {
+        if IMPORT_OPERATORS.contains(&asset.name) {
+            continue;
+        }
         items.push(
             menubar_item_with_icon("settings", asset.display_name)
                 .key(format!("{ADD_OPERATOR_PREFIX}{}", asset.name)),
         );
     }
+    items.push(menubar_separator());
+    items.push(menubar_label("Import"));
+    items.push(menubar_item_with_icon("file", "Model WASM…").key(IMPORT_WASM_KEY));
+    items.push(menubar_item_with_icon("file", "STL Mesh…").key(IMPORT_STL_KEY));
+    items.push(menubar_item_with_icon("file", "Heightmap Image…").key(IMPORT_HEIGHTMAP_KEY));
     items
 }
 
@@ -3105,6 +3212,85 @@ mod tests {
             app.take_file_action(),
             Some(FileAction::ExportWasm(exports[1].clone()))
         );
+    }
+
+    #[test]
+    fn import_menu_clicks_queue_file_actions() {
+        let mut app = VolumetricUiV2::default();
+        dispatch(&mut app, UiEvent::synthetic_click(IMPORT_WASM_KEY));
+        assert_eq!(app.take_file_action(), Some(FileAction::ImportWasm));
+        dispatch(&mut app, UiEvent::synthetic_click(IMPORT_STL_KEY));
+        assert_eq!(app.take_file_action(), Some(FileAction::ImportStl));
+        dispatch(&mut app, UiEvent::synthetic_click(IMPORT_HEIGHTMAP_KEY));
+        assert_eq!(app.take_file_action(), Some(FileAction::ImportHeightmap));
+    }
+
+    #[test]
+    fn import_model_wasm_adds_a_selected_import() {
+        let mut app = VolumetricUiV2::empty();
+        let bytes = volumetric_assets::models()[0].bytes.to_vec();
+        app.import_model_wasm("custom_part", bytes);
+
+        let summary = app.summary();
+        assert_eq!(summary.imports, 1);
+        assert_eq!(summary.exports, 1);
+        assert!(summary.last_run_stale);
+        assert_eq!(
+            summary.selected_project_item,
+            Some(ProjectSelection::Import(0))
+        );
+        assert_eq!(app.project().exports()[0], "custom_part");
+    }
+
+    #[test]
+    fn import_blob_asset_wires_bytes_into_the_blob_slot() {
+        let mut app = VolumetricUiV2::empty();
+        let stl = vec![0xAB; 96];
+        app.import_blob_asset("stl_import_operator", "stl_import", stl.clone());
+
+        let summary = app.summary();
+        assert_eq!(summary.timeline_steps, 1);
+        assert_eq!(summary.exports, 1);
+        assert_eq!(
+            summary.selected_project_item,
+            Some(ProjectSelection::Step(0))
+        );
+
+        // The operator's Blob slot holds the file bytes; the config slot got
+        // its schema defaults.
+        let asset = volumetric_assets::get_operator("stl_import_operator").unwrap();
+        let metadata = volumetric::operator_metadata_from_wasm_bytes(asset.bytes).unwrap();
+        let step = &app.project().timeline()[0];
+        let blob_slot = metadata
+            .inputs
+            .iter()
+            .position(|input| matches!(input, OperatorMetadataInput::Blob))
+            .expect("stl operator has a blob input");
+        assert!(matches!(
+            &step.inputs[blob_slot],
+            ExecutionInput::Inline(bytes) if *bytes == stl
+        ));
+    }
+
+    #[test]
+    fn import_operators_hidden_from_plain_operator_menu() {
+        fn collect_keys(el: &El, keys: &mut Vec<String>) {
+            if let Some(key) = &el.key {
+                keys.push(key.clone());
+            }
+            for child in &el.children {
+                collect_keys(child, keys);
+            }
+        }
+        let mut keys = Vec::new();
+        for item in add_menu_items() {
+            collect_keys(&item, &mut keys);
+        }
+        assert!(
+            !keys.contains(&format!("{ADD_OPERATOR_PREFIX}stl_import_operator")),
+            "import operators only reachable via Import"
+        );
+        assert!(keys.contains(&IMPORT_STL_KEY.to_string()));
     }
 
     #[test]

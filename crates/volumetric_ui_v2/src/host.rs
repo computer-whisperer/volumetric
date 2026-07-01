@@ -592,6 +592,53 @@ fn handle_file_action(app: &mut VolumetricUiV2, viewport: &ViewportRenderer, act
                 Err(err) => app.set_status(format!("failed to export WASM: {err}")),
             }
         }
+        FileAction::ImportWasm => {
+            let Some(path) = rfd::FileDialog::new()
+                .add_filter("WASM", &["wasm"])
+                .pick_file()
+            else {
+                return;
+            };
+            let name = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("model")
+                .to_string();
+            match std::fs::read(&path) {
+                Ok(bytes) => app.import_model_wasm(&name, bytes),
+                Err(err) => app.set_status(format!("failed to read WASM file: {err}")),
+            }
+        }
+        FileAction::ImportStl => {
+            import_blob_file(app, ("STL", &["stl"]), "stl_import_operator", "stl_import");
+        }
+        FileAction::ImportHeightmap => {
+            import_blob_file(
+                app,
+                ("Images", &["png", "jpg", "jpeg", "bmp", "gif"]),
+                "heightmap_extrude_operator",
+                "heightmap",
+            );
+        }
+    }
+}
+
+/// Shared pick-and-read path for Blob-input imports (STL, heightmap).
+fn import_blob_file(
+    app: &mut VolumetricUiV2,
+    (filter_name, extensions): (&str, &[&str]),
+    operator_name: &str,
+    output_base: &str,
+) {
+    let Some(path) = rfd::FileDialog::new()
+        .add_filter(filter_name, extensions)
+        .pick_file()
+    else {
+        return;
+    };
+    match std::fs::read(&path) {
+        Ok(bytes) => app.import_blob_asset(operator_name, output_base, bytes),
+        Err(err) => app.set_status(format!("failed to read {}: {err}", path.display())),
     }
 }
 
