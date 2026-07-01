@@ -1095,6 +1095,8 @@ impl VolumetricUiV2 {
                     } else {
                         Some(key.to_string())
                     };
+                    // At most one popover layer at a time (see menubar above).
+                    self.open_menu = None;
                 }
                 SelectAction::Dismiss => self.open_select = None,
                 SelectAction::Pick(value) => {
@@ -1146,6 +1148,14 @@ impl App for VolumetricUiV2 {
     }
 
     fn on_event(&mut self, event: UiEvent, _cx: &EventCx) {
+        // Escape closes any open menu/picker popover (the popover contract:
+        // the scrim handles outside clicks, the app handles Escape).
+        if matches!(event.kind, UiEventKind::Escape)
+            && (self.open_menu.take().is_some() | self.open_select.take().is_some())
+        {
+            return;
+        }
+
         // Controlled text editing for config fields runs first: text, key, and
         // selection events aren't clicks and would be dropped by the gate below.
         if let Some(field_name) = event
@@ -1197,8 +1207,10 @@ impl App for VolumetricUiV2 {
             self.selection = selection;
         }
 
-        // Menubar trigger toggles and dismiss-scrim clicks.
+        // Menubar trigger toggles and dismiss-scrim clicks. At most one
+        // popover layer at a time: opening a menu closes any picker.
         if menubar::apply_event(&mut self.open_menu, &event, MENUBAR_KEY) {
+            self.open_select = None;
             return;
         }
 
@@ -1461,19 +1473,24 @@ fn view_controls_cluster(app: &VolumetricUiV2) -> El {
             .tooltip("Frame the preview in view")
             .key(FRAME_PREVIEW_KEY),
         vertical_separator().height(Size::Fixed(20.0)),
-        select_trigger(MODE_SELECT_KEY, app.render_mode.label()),
+        select_trigger(MODE_SELECT_KEY, app.render_mode.label()).width(Size::Fixed(90.0)),
         select_trigger(
             RESOLUTION_SELECT_KEY,
             format!("{}^3", app.preview_resolution),
-        ),
+        )
+        .width(Size::Fixed(84.0)),
         select_trigger(
             CAMERA_SELECT_KEY,
             camera_scheme_short_label(app.camera_control_scheme),
-        ),
+        )
+        .width(Size::Fixed(104.0)),
     ])
     .gap(tokens::SPACE_1)
     .align(Align::Center)])
     .padding(tokens::SPACE_1)
+    // Hug, not the card's default Fill: anything wider is a click-eating
+    // band over the viewport (keyed controls win the stack hit-test).
+    .width(Size::Hug)
 }
 
 /// One-line readout at the bottom of the viewport. Unkeyed, so it never
