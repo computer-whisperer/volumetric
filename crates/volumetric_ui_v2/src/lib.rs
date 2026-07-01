@@ -46,6 +46,7 @@ const SELECT_RUNTIME_ASSET_PREFIX: &str = "runtime:select-asset:";
 const CONFIG_FIELD_PREFIX: &str = "cfg:";
 const CONFIG_BOOL_PREFIX: &str = "cfg-bool:";
 const CONFIG_ENUM_PREFIX: &str = "cfg-enum:";
+const LUA_SOURCE_KEY: &str = "lua-source";
 const PREVIEW_RESOLUTIONS: [usize; 4] = [24, 48, 64, 96];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -275,6 +276,8 @@ struct StepEditState {
     model_slots: Vec<usize>,
     /// The config form, present only when the operator declares a config input.
     config: Option<ConfigForm>,
+    /// The Lua source editor, present only for a `LuaSource` input.
+    lua: Option<LuaForm>,
 }
 
 #[derive(Debug)]
@@ -282,6 +285,15 @@ struct ConfigForm {
     input_idx: usize,
     fields: Vec<ConfigField>,
     buffers: std::collections::BTreeMap<String, String>,
+}
+
+/// Editor state for a `LuaSource` input. The `source` buffer is the edit
+/// source of truth; every change is written straight back to the step (no
+/// parse gate — any text is a valid script).
+#[derive(Debug)]
+struct LuaForm {
+    input_idx: usize,
+    source: String,
 }
 
 #[derive(Debug)]
@@ -578,8 +590,22 @@ impl VolumetricUiV2 {
             })
             .and_then(|(input_idx, cddl)| self.build_config_form(step, input_idx, &cddl));
 
+        let lua = metadata
+            .inputs
+            .iter()
+            .position(|input| matches!(input, OperatorMetadataInput::LuaSource(_)))
+            .map(|input_idx| {
+                let source = match step.inputs.get(input_idx) {
+                    Some(ExecutionInput::Inline(bytes)) => {
+                        String::from_utf8_lossy(bytes).into_owned()
+                    }
+                    _ => String::new(),
+                };
+                LuaForm { input_idx, source }
+            });
+
         // Nothing editable → no step editor.
-        if model_slots.is_empty() && config.is_none() {
+        if model_slots.is_empty() && config.is_none() && lua.is_none() {
             return None;
         }
 
@@ -587,6 +613,7 @@ impl VolumetricUiV2 {
             step_idx,
             model_slots,
             config,
+            lua,
         })
     }
 
@@ -747,6 +774,16 @@ impl VolumetricUiV2 {
             .map(|buffer| buffer == "true")
             .unwrap_or(false);
         self.set_config_buffer(field_name, (!current).to_string());
+    }
+
+    /// Writes the Lua editor's current source into the step's input bytes.
+    fn write_lua_source(&mut self, step_idx: usize, lua: &LuaForm) {
+        if let Some(step) = self.project.timeline_mut().get_mut(step_idx) {
+            if let Some(ExecutionInput::Inline(slot)) = step.inputs.get_mut(lua.input_idx) {
+                *slot = lua.source.clone().into_bytes();
+            }
+        }
+        self.mark_project_dirty();
     }
 
     fn select_model(&mut self, name: &str) {
@@ -1006,6 +1043,27 @@ impl App for VolumetricUiV2 {
                 if changed {
                     if let Some(config) = edit.config.as_ref() {
                         self.commit_config_buffer(edit.step_idx, config, &field_name);
+                    }
+                }
+                self.step_edit = Some(edit);
+                return;
+            }
+        }
+        // Controlled editing for the Lua source area.
+        if event.target_key() == Some(LUA_SOURCE_KEY) {
+            if let Some(mut edit) = self.step_edit.take() {
+                let mut changed = false;
+                if let Some(lua) = edit.lua.as_mut() {
+                    changed = text_area::apply_event(
+                        &mut lua.source,
+                        &mut self.selection,
+                        &event,
+                        LUA_SOURCE_KEY,
+                    );
+                }
+                if changed {
+                    if let Some(lua) = edit.lua.as_ref() {
+                        self.write_lua_source(edit.step_idx, lua);
                     }
                 }
                 self.step_edit = Some(edit);
@@ -1694,6 +1752,15 @@ fn step_edit_rows(app: &VolumetricUiV2, step_idx: usize) -> Vec<El> {
                 .unwrap_or("");
             rows.push(config_field_row(field, buffer, &app.selection));
         }
+    }
+
+    if let Some(lua) = &edit.lua {
+        rows.push(text("Script").muted().caption().semibold());
+        rows.push(
+            text_area(LUA_SOURCE_KEY, &lua.source, &app.selection)
+                .width(Size::Fill(1.0))
+                .height(Size::Fixed(180.0)),
+        );
     }
 
     rows
@@ -2604,5 +2671,58 @@ mod tests {
             step.outputs
         );
         assert!(app.project().exports().contains(&step.outputs[0]));
+    }
+
+    /// Adds each bundled operator and, for the first one with a Lua input, edits
+    /// the source and asserts it lands in the step's input bytes.
+    #[test]
+    fn editing_lua_source_updates_step_bytes() {
+        let mut exercised = false;
+        for op in volumetric_assets::operators() {
+            let mut app = VolumetricUiV2::default();
+            dispatch(
+                &mut app,
+                UiEvent::synthetic_click(format!("{OPERATOR_ROUTE_PREFIX}{}", op.name)),
+            );
+            dispatch(&mut app, UiEvent::synthetic_click(ADD_OPERATOR_KEY));
+            app.before_build();
+
+            let Some(edit) = app.step_edit.as_ref() else {
+                continue;
+            };
+            if edit.lua.is_none() {
+                continue;
+            }
+
+            // Simulate a text-area edit: set the buffer and commit it.
+            let new_source = "-- edited\nreturn 1\n".to_string();
+            let mut edit = app.step_edit.take().unwrap();
+            let input_idx = {
+                let lua = edit.lua.as_mut().unwrap();
+                lua.source = new_source.clone();
+                lua.input_idx
+            };
+            let lua_source = edit.lua.as_ref().unwrap();
+            app.write_lua_source(edit.step_idx, lua_source);
+            let step_idx = edit.step_idx;
+            app.step_edit = Some(edit);
+
+            let step = &app.project().timeline()[step_idx];
+            let ExecutionInput::Inline(bytes) = &step.inputs[input_idx] else {
+                panic!("lua input should be inline bytes");
+            };
+            assert_eq!(
+                bytes.as_slice(),
+                new_source.as_bytes(),
+                "operator {}",
+                op.name
+            );
+            exercised = true;
+            break;
+        }
+        assert!(
+            exercised,
+            "expected at least one bundled operator with a Lua input"
+        );
     }
 }

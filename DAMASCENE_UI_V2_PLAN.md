@@ -211,8 +211,10 @@ Damascene widgets that should map well:
   string enums via a button group) that commit into the step's CBOR blob and
   mark the project dirty. Each `ModelWASM` input slot has its own selector, so
   multi-input operators (e.g. boolean) can wire every model input; retargeting
-  the primary slot renames the output as before. Not yet editable in the form:
-  Lua source (`text_area`), `VecF64` literal/asset, and `Blob` file picker.
+  the primary slot renames the output as before. `LuaSource` inputs are edited
+  in a `text_area` whose contents are written straight back to the step's input
+  bytes. Not yet editable in the form: `VecF64` literal/asset and `Blob` file
+  picker.
 
 ### Slice 0: Dependency Update
 
