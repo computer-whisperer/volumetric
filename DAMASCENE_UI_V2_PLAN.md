@@ -116,31 +116,32 @@ existing orbit/pan/zoom camera state.
 
 ## UI Shell Sketch
 
-Use an application workbench layout:
+Viewport-dominant workbench: the 3D view is ~90% of the screen and everything
+else packs into a thin menubar, floating viewport chrome, and one project
+panel.
 
-- left sidebar:
-  - project status and file actions;
-  - bundled demo models;
-  - operator toolbox;
-  - project timeline;
-- center:
-  - keyed 3D viewport;
-  - lightweight viewport HUD for asset/triangle/sample counts;
-- right inspector/sheet:
-  - selected timeline entry editor;
-  - operator input/config editing;
-- lower or sidebar section:
-  - project exports;
-  - render mode and meshing controls;
-  - profiling stats;
-  - export STL/WASM actions.
+- top bar (single thin strip):
+  - menubar: `File` (new/open/save/export actions) and `Add` (bundled model +
+    operator catalogs as menu groups — adding is write-once, no permanent
+    panel);
+  - run/cancel, auto-rebuild toggle, run + preview status chips;
+- center: keyed 3D viewport filling everything else, with floating chrome
+  composed via `stack` (only keyed nodes hit-test, so camera input passes
+  through):
+  - top-right cluster: grid/SSAO/frame toggles plus `select` pickers for
+    default render mode, resolution, and camera scheme;
+  - bottom HUD: unkeyed one-line badges for scene counts and status;
+- right project panel (the one fat sidebar):
+  - pipeline accordion: imports → steps → exports, with select/delete rows;
+  - Outputs list: per-output visibility dot, pin, view, and (Phase 3b)
+    per-output render mode/resolution overrides;
+  - inspector for the current selection: step editor, operator config form,
+    Lua source.
 
-Damascene widgets that should map well:
-
-- `sidebar`, `toolbar`, `card`, `tabs_list`, `field_row`, `form_item`;
-- `select`, `switch`, `checkbox`, `slider`, `text_input`, `text_area`;
-- `resize_handle` for adjustable sidebar/inspector widths;
-- toasts or alerts for errors and completion messages.
+Damascene widgets in play: `menubar`, `accordion`, `select`, `popover`,
+`toolbar`, `card`, `field_row`, `switch`, `text_input`, `text_area`;
+`resize_handle` for the panel width and `sheet` for a wide Lua editor are
+candidates for Phase 3c.
 
 ## Migration Slices
 
@@ -240,6 +241,19 @@ Damascene widgets that should map well:
   `Arc`s), so previewing an import that hasn't been run/exported is deferred.
   Per-output render *mode/resolution* overrides remain global for now and land
   with the Outputs-list layout in Phase 3.
+- Phase 3a restructured the chrome around a viewport-dominant workbench: the
+  left sidebar and the four inspector cards are gone. A single thin top bar
+  carries the menubar (`File` → New Project; `Add` → one-click bundled model /
+  operator entries via `add:model:{name}` / `add:operator:{name}`), the
+  run/status chips, and the auto-rebuild toggle. View controls (grid, SSAO,
+  frame, and `select`-based mode / resolution / camera pickers) float over the
+  viewport's top-right corner — hit-testing only targets keyed nodes, so camera
+  input passes through everywhere else — with a one-line unkeyed HUD along the
+  bottom. All project structure lives in one right panel: a pipeline accordion
+  (imports/steps/exports with counts), the Outputs list, and the selection
+  inspector. Catalog "selection" state (`selected_model`/`selected_operator`)
+  was deleted along with the dead Open/Save/Export STL buttons; per-output
+  render overrides, panel resize, and wiring real file actions are Phase 3b/3c.
 
 ### Slice 0: Dependency Update
 

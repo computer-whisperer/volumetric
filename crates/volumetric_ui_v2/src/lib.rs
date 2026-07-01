@@ -17,8 +17,6 @@ use damascene_core::prelude::*;
 pub mod host;
 
 pub const VIEWPORT_KEY: &str = "viewport";
-pub const ADD_MODEL_KEY: &str = "action:add-model";
-pub const ADD_OPERATOR_KEY: &str = "action:add-operator";
 pub const NEW_PROJECT_KEY: &str = "action:new-project";
 pub const RUN_PROJECT_KEY: &str = "action:run-project";
 pub const CANCEL_RUN_KEY: &str = "action:cancel-run";
@@ -27,11 +25,17 @@ pub const TOGGLE_GRID_KEY: &str = "viewport:toggle-grid";
 pub const TOGGLE_SSAO_KEY: &str = "viewport:toggle-ssao";
 pub const FRAME_PREVIEW_KEY: &str = "viewport:frame-preview";
 
-const MODEL_ROUTE_PREFIX: &str = "model:";
-const OPERATOR_ROUTE_PREFIX: &str = "operator:";
-const RENDER_MODE_PREFIX: &str = "viewport:render-mode:";
-const PREVIEW_RESOLUTION_PREFIX: &str = "viewport:preview-resolution:";
-const CAMERA_SCHEME_PREFIX: &str = "viewport:camera-scheme:";
+/// Top application menubar; menu values are `file` and `add`.
+const MENUBAR_KEY: &str = "main-menu";
+/// One-click add of a bundled asset from the Add menu.
+const ADD_MODEL_PREFIX: &str = "add:model:";
+const ADD_OPERATOR_PREFIX: &str = "add:operator:";
+/// Pipeline accordion in the project panel; values `imports|steps|exports`.
+const PIPELINE_KEY: &str = "pipeline";
+/// Viewport overlay value pickers (controlled select widgets).
+const MODE_SELECT_KEY: &str = "view:mode";
+const RESOLUTION_SELECT_KEY: &str = "view:res";
+const CAMERA_SELECT_KEY: &str = "view:camera";
 const SELECT_IMPORT_PREFIX: &str = "project:select-import:";
 const DELETE_IMPORT_PREFIX: &str = "project:delete-import:";
 const SELECT_STEP_PREFIX: &str = "project:select-step:";
@@ -250,8 +254,6 @@ pub struct ProjectSummary {
     pub imports: usize,
     pub timeline_steps: usize,
     pub exports: usize,
-    pub selected_model: Option<String>,
-    pub selected_operator: Option<String>,
     pub selected_export: Option<String>,
     pub selected_project_item: Option<ProjectSelection>,
     pub pinned_outputs: Vec<String>,
@@ -301,8 +303,6 @@ struct LuaForm {
 #[derive(Debug)]
 pub struct VolumetricUiV2 {
     project: Project,
-    selected_model: Option<&'static str>,
-    selected_operator: Option<&'static str>,
     selected_export: Option<String>,
     selected_project_item: Option<ProjectSelection>,
     /// Outputs pinned to stay in the viewport regardless of the current
@@ -329,12 +329,20 @@ pub struct VolumetricUiV2 {
     /// Editor state (model slots + config form) for the selected step, if any.
     step_edit: Option<StepEditState>,
     status: String,
+    /// Open menubar menu (`file` | `add`), if any.
+    open_menu: Option<String>,
+    /// Open viewport picker (one of the `view:*` select keys), if any.
+    open_select: Option<String>,
+    /// Expanded pipeline accordion sections (`imports` | `steps` | `exports`).
+    pipeline_open: std::collections::BTreeSet<String>,
 }
 
 impl Default for VolumetricUiV2 {
     fn default() -> Self {
         let mut app = Self::empty();
-        app.add_selected_model();
+        if let Some(model) = volumetric_assets::models().first() {
+            app.add_model(model.name);
+        }
         app
     }
 }
@@ -345,10 +353,6 @@ impl VolumetricUiV2 {
     pub fn empty() -> Self {
         Self {
             project: Project::new(),
-            selected_model: volumetric_assets::models().first().map(|asset| asset.name),
-            selected_operator: volumetric_assets::operators()
-                .first()
-                .map(|asset| asset.name),
             selected_export: None,
             selected_project_item: None,
             pinned_outputs: std::collections::BTreeSet::new(),
@@ -371,6 +375,12 @@ impl VolumetricUiV2 {
             selection: Selection::default(),
             step_edit: None,
             status: "idle".to_string(),
+            open_menu: None,
+            open_select: None,
+            pipeline_open: ["imports", "steps", "exports"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
         }
     }
 
@@ -579,8 +589,6 @@ impl VolumetricUiV2 {
             imports: self.project.imports().len(),
             timeline_steps: self.project.timeline().len(),
             exports: self.project.exports().len(),
-            selected_model: self.selected_model.map(str::to_string),
-            selected_operator: self.selected_operator.map(str::to_string),
             selected_export: self.selected_export.clone(),
             selected_project_item: self.selected_project_item.clone(),
             pinned_outputs: self.pinned_outputs.iter().cloned().collect(),
@@ -874,25 +882,7 @@ impl VolumetricUiV2 {
         self.mark_project_dirty();
     }
 
-    fn select_model(&mut self, name: &str) {
-        if let Some(asset) = volumetric_assets::get_model(name) {
-            self.selected_model = Some(asset.name);
-            self.status = format!("selected {}", asset.display_name);
-        }
-    }
-
-    fn select_operator(&mut self, name: &str) {
-        if let Some(asset) = volumetric_assets::get_operator(name) {
-            self.selected_operator = Some(asset.name);
-            self.status = format!("selected {}", asset.display_name);
-        }
-    }
-
-    fn add_selected_model(&mut self) {
-        let Some(name) = self.selected_model else {
-            self.status = "no bundled model available".to_string();
-            return;
-        };
+    fn add_model(&mut self, name: &str) {
         let Some(asset) = volumetric_assets::get_model(name) else {
             self.status = format!("missing bundled model {name}");
             return;
@@ -910,11 +900,9 @@ impl VolumetricUiV2 {
         self.status = format!("imported {} as {id}", asset.display_name);
     }
 
-    fn stage_selected_operator(&mut self) {
-        let Some(name) = self.selected_operator else {
-            self.status = "no bundled operator available".to_string();
-            return;
-        };
+    /// Appends a timeline step for the named bundled operator, wired to the
+    /// currently selected export as its primary model input.
+    fn add_operator(&mut self, name: &str) {
         let Some(asset) = volumetric_assets::get_operator(name) else {
             self.status = format!("missing bundled operator {name}");
             return;
@@ -1092,6 +1080,52 @@ impl VolumetricUiV2 {
         self.status = format!("preview resolution: {resolution}^3");
     }
 
+    /// Folds trigger/dismiss/pick events for the three viewport pickers
+    /// (render mode, resolution, camera scheme) into app state. Returns true
+    /// when the event belonged to one of them.
+    fn handle_view_select(&mut self, event: &UiEvent) -> bool {
+        for key in [MODE_SELECT_KEY, RESOLUTION_SELECT_KEY, CAMERA_SELECT_KEY] {
+            let Some(action) = select::classify_event(event, key) else {
+                continue;
+            };
+            match action {
+                SelectAction::Toggle => {
+                    self.open_select = if self.open_select.as_deref() == Some(key) {
+                        None
+                    } else {
+                        Some(key.to_string())
+                    };
+                }
+                SelectAction::Dismiss => self.open_select = None,
+                SelectAction::Pick(value) => {
+                    self.open_select = None;
+                    match key {
+                        MODE_SELECT_KEY => {
+                            if let Some(mode) = PreviewRenderMode::from_route_name(&value) {
+                                self.set_render_mode(mode);
+                            }
+                        }
+                        RESOLUTION_SELECT_KEY => {
+                            if let Ok(resolution) = value.parse() {
+                                self.set_preview_resolution(resolution);
+                            }
+                        }
+                        CAMERA_SELECT_KEY => {
+                            if let Some(scheme) = camera_control_scheme_from_route(&value) {
+                                self.set_camera_control_scheme(scheme);
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                // Future SelectAction variants (non-exhaustive enum): ignore.
+                _ => {}
+            }
+            return true;
+        }
+        false
+    }
+
     fn set_camera_control_scheme(&mut self, scheme: CameraControlScheme) {
         self.camera_control_scheme = scheme;
         self.status = format!("camera controls: {}", scheme.name());
@@ -1163,22 +1197,23 @@ impl App for VolumetricUiV2 {
             self.selection = selection;
         }
 
+        // Menubar trigger toggles and dismiss-scrim clicks.
+        if menubar::apply_event(&mut self.open_menu, &event, MENUBAR_KEY) {
+            return;
+        }
+
+        // Viewport value pickers share one open slot; picks route to state.
+        if self.handle_view_select(&event) {
+            return;
+        }
+
         if event.is_click_or_activate(NEW_PROJECT_KEY) {
             self.project = Project::new();
             self.selected_export = None;
             self.selected_project_item = None;
             self.clear_runtime_assets();
+            self.open_menu = None;
             self.status = "new project".to_string();
-            return;
-        }
-
-        if event.is_click_or_activate(ADD_MODEL_KEY) {
-            self.add_selected_model();
-            return;
-        }
-
-        if event.is_click_or_activate(ADD_OPERATOR_KEY) {
-            self.stage_selected_operator();
             return;
         }
 
@@ -1237,20 +1272,18 @@ impl App for VolumetricUiV2 {
             return;
         };
 
-        if let Some(name) = route.strip_prefix(MODEL_ROUTE_PREFIX) {
-            self.select_model(name);
-        } else if let Some(name) = route.strip_prefix(OPERATOR_ROUTE_PREFIX) {
-            self.select_operator(name);
-        } else if let Some(name) = route.strip_prefix(RENDER_MODE_PREFIX) {
-            if let Some(mode) = PreviewRenderMode::from_route_name(name) {
-                self.set_render_mode(mode);
+        if let Some(accordion::AccordionAction::Toggle(section)) =
+            accordion::classify_event(&event, PIPELINE_KEY)
+        {
+            if !self.pipeline_open.remove(section) {
+                self.pipeline_open.insert(section.to_string());
             }
-        } else if let Some(resolution) = parse_index_route(route, PREVIEW_RESOLUTION_PREFIX) {
-            self.set_preview_resolution(resolution);
-        } else if let Some(name) = route.strip_prefix(CAMERA_SCHEME_PREFIX) {
-            if let Some(scheme) = camera_control_scheme_from_route(name) {
-                self.set_camera_control_scheme(scheme);
-            }
+        } else if let Some(name) = route.strip_prefix(ADD_MODEL_PREFIX) {
+            self.add_model(name);
+            self.open_menu = None;
+        } else if let Some(name) = route.strip_prefix(ADD_OPERATOR_PREFIX) {
+            self.add_operator(name);
+            self.open_menu = None;
         } else if let Some(idx) = parse_index_route(route, SELECT_IMPORT_PREFIX) {
             self.selected_project_item = Some(ProjectSelection::Import(idx));
             self.status = format!("selected import {}", idx + 1);
@@ -1303,186 +1336,160 @@ impl App for VolumetricUiV2 {
 }
 
 pub fn shell(app: &VolumetricUiV2) -> El {
-    let main = row([
-        left_sidebar(app),
-        viewport_workspace(app),
-        right_inspector(app),
+    let main = column([
+        top_bar(app),
+        row([viewport_pane(app), project_panel(app)])
+            .width(Size::Fill(1.0))
+            .height(Size::Fill(1.0)),
     ])
     .fill_size();
 
-    overlays(main, std::iter::empty::<Option<El>>())
+    overlays(main, [menu_layer(app), select_layer(app)])
 }
 
-fn left_sidebar(app: &VolumetricUiV2) -> El {
-    sidebar([
-        sidebar_header([row([
-            icon("layout-dashboard").icon_size(tokens::ICON_SM).muted(),
-            column([
-                text("Volumetric")
-                    .label()
-                    .semibold()
-                    .ellipsis()
-                    .key("brand-title"),
-                text("Damascene UI v2").caption().muted().ellipsis(),
-            ])
-            .gap(1.0)
-            .width(Size::Fill(1.0)),
-        ])
-        .gap(tokens::SPACE_2)
-        .align(Align::Center)]),
-        divider(),
-        sidebar_group([
-            sidebar_group_label("Project"),
-            toolbar([
-                button_with_icon("plus", "New")
-                    .secondary()
-                    .xsmall()
-                    .key(NEW_PROJECT_KEY),
-                button_with_icon("folder", "Open").secondary().xsmall(),
-            ])
-            .gap(tokens::SPACE_1)
-            .width(Size::Fill(1.0)),
-            button_with_icon("download", "Save")
-                .secondary()
-                .xsmall()
-                .width(Size::Fill(1.0)),
-            run_control(app, true),
+/// The single strip of application chrome above the viewport: menubar
+/// (File / Add), then run controls and status on the right.
+fn top_bar(app: &VolumetricUiV2) -> El {
+    let open = app.open_menu.as_deref();
+    toolbar([
+        icon("layout-dashboard").icon_size(tokens::ICON_SM).muted(),
+        text("Volumetric").label().semibold().key("brand-title"),
+        menubar([
+            menubar_trigger(MENUBAR_KEY, "file", "File", open == Some("file")),
+            menubar_trigger(MENUBAR_KEY, "add", "Add", open == Some("add")),
         ]),
-        scroll([
-            sidebar_group([
-                sidebar_group_label("Bundled Models"),
-                sidebar_menu(catalog_items(
-                    volumetric_assets::models(),
-                    MODEL_ROUTE_PREFIX,
-                    app.selected_model,
-                    "activity",
-                )),
-            ]),
-            sidebar_group([
-                sidebar_group_label("Operators"),
-                sidebar_menu(catalog_items(
-                    volumetric_assets::operators(),
-                    OPERATOR_ROUTE_PREFIX,
-                    app.selected_operator,
-                    "settings",
-                )),
-            ]),
-        ])
-        .key("catalog-scroll")
-        .gap(tokens::SPACE_2)
-        // Gutter so keyboard focus rings on full-width list items aren't
-        // clipped by the scroll's horizontal scissor.
-        .px(tokens::RING_WIDTH),
-        alert([alert_description(&app.status)])
-            .info()
-            .padding(tokens::SPACE_2),
+        spacer(),
+        run_status_chip(app),
+        preview_status_chip(app),
+        toggle_chip("Auto", app.auto_rebuild, TOGGLE_AUTO_REBUILD_KEY),
+        run_control(app),
     ])
-    .width(Size::Fixed(248.0))
-    .padding(tokens::SPACE_3)
-    .gap(tokens::SPACE_3)
-}
-
-fn viewport_workspace(app: &VolumetricUiV2) -> El {
-    let summary = app.summary();
-    column([
-        toolbar([
-            column([
-                toolbar_title("Scene").key("scene-title"),
-                toolbar_description("Viewport host region is keyed for custom rendering."),
-            ])
-            .gap(tokens::SPACE_1)
-            .width(Size::Fill(1.0)),
-            run_status_chip(app),
-            preview_status_chip(app),
-            badge("Damascene").secondary().xsmall(),
-            badge("wgpu 29").secondary().xsmall(),
-        ]),
-        viewport_controls(app),
-        viewport_placeholder(app),
-        project_details(app),
-        viewport_status_bar(app, &summary),
-    ])
-    .width(Size::Fill(1.0))
-    .height(Size::Fill(1.0))
-    .padding(tokens::SPACE_3)
     .gap(tokens::SPACE_2)
+    .padding(Sides::xy(tokens::SPACE_3, tokens::SPACE_2))
 }
 
-fn viewport_controls(app: &VolumetricUiV2) -> El {
+/// The open menubar menu, rendered as a root overlay layer.
+fn menu_layer(app: &VolumetricUiV2) -> Option<El> {
+    match app.open_menu.as_deref()? {
+        "file" => Some(menubar_menu(
+            MENUBAR_KEY,
+            "file",
+            [menubar_item_with_icon("plus", "New Project").key(NEW_PROJECT_KEY)],
+        )),
+        "add" => Some(menubar_menu(MENUBAR_KEY, "add", add_menu_items())),
+        _ => None,
+    }
+}
+
+/// The Add menu body: every bundled model and operator, one click to add.
+fn add_menu_items() -> Vec<El> {
+    let mut items = vec![menubar_label("Models")];
+    for asset in volumetric_assets::models() {
+        items.push(
+            menubar_item_with_icon("activity", asset.display_name)
+                .key(format!("{ADD_MODEL_PREFIX}{}", asset.name)),
+        );
+    }
+    items.push(menubar_separator());
+    items.push(menubar_label("Operators"));
+    for asset in volumetric_assets::operators() {
+        items.push(
+            menubar_item_with_icon("settings", asset.display_name)
+                .key(format!("{ADD_OPERATOR_PREFIX}{}", asset.name)),
+        );
+    }
+    items
+}
+
+/// The open viewport picker menu, rendered as a root overlay layer.
+fn select_layer(app: &VolumetricUiV2) -> Option<El> {
+    match app.open_select.as_deref()? {
+        MODE_SELECT_KEY => Some(select_menu(
+            MODE_SELECT_KEY,
+            PreviewRenderMode::ALL
+                .into_iter()
+                .map(|mode| (mode.route_name(), mode.full_label())),
+        )),
+        RESOLUTION_SELECT_KEY => Some(select_menu(
+            RESOLUTION_SELECT_KEY,
+            PREVIEW_RESOLUTIONS
+                .into_iter()
+                .map(|resolution| (resolution.to_string(), format!("{resolution}^3 voxels"))),
+        )),
+        CAMERA_SELECT_KEY => Some(select_menu(
+            CAMERA_SELECT_KEY,
+            CameraControlScheme::ALL
+                .iter()
+                .copied()
+                .map(|scheme| (camera_scheme_route_name(scheme), camera_scheme_tooltip(scheme))),
+        )),
+        _ => None,
+    }
+}
+
+/// The viewport plus its floating chrome: view controls in the top-right
+/// corner, a status HUD along the bottom. Only keyed controls hit-test, so
+/// camera input passes through everywhere else.
+fn viewport_pane(app: &VolumetricUiV2) -> El {
+    stack([viewport_placeholder(app), viewport_overlay(app)])
+        .width(Size::Fill(1.0))
+        .height(Size::Fill(1.0))
+}
+
+fn viewport_overlay(app: &VolumetricUiV2) -> El {
     column([
-        toolbar([
-            toolbar_group(
-                PreviewRenderMode::ALL
-                    .into_iter()
-                    .map(|mode| render_mode_button(app, mode)),
-            )
-            .gap(tokens::SPACE_1),
-            vertical_separator().height(Size::Fixed(24.0)),
-            toolbar_group(PREVIEW_RESOLUTIONS.into_iter().map(|resolution| {
-                let selected = app.preview_resolution == resolution;
-                let button = button(format!("{resolution}^3"))
-                    .xsmall()
-                    .key(format!("{PREVIEW_RESOLUTION_PREFIX}{resolution}"));
-                if selected {
-                    button.primary()
-                } else {
-                    button.secondary()
-                }
-            }))
-            .gap(tokens::SPACE_1),
-            spacer(),
-            run_control(app, false),
-            icon_button("refresh-cw")
-                .secondary()
-                .xsmall()
-                .tooltip("Frame preview")
-                .key(FRAME_PREVIEW_KEY),
-        ])
-        .gap(tokens::SPACE_1),
-        toolbar([
-            text("Camera").caption().muted(),
-            toolbar_group(
-                CameraControlScheme::ALL
-                    .iter()
-                    .copied()
-                    .map(|scheme| camera_scheme_button(app, scheme)),
-            )
-            .gap(tokens::SPACE_1),
-            spacer(),
-            toggle_chip("Auto", app.auto_rebuild, TOGGLE_AUTO_REBUILD_KEY),
-            toggle_chip("Grid", app.show_grid, TOGGLE_GRID_KEY),
-            toggle_chip("SSAO", app.ssao, TOGGLE_SSAO_KEY),
-        ])
-        .gap(tokens::SPACE_1),
+        row([spacer(), view_controls_cluster(app)]).width(Size::Fill(1.0)),
+        spacer().height(Size::Fill(1.0)),
+        viewport_hud(app),
+    ])
+    .fill_size()
+    .padding(tokens::SPACE_2)
+}
+
+/// Compact floating cluster of view toggles + pickers.
+fn view_controls_cluster(app: &VolumetricUiV2) -> El {
+    let toggle = |label: &str, on: bool, key: &str| {
+        let button = button(label).xsmall().key(key);
+        if on { button.primary() } else { button.secondary() }
+    };
+    card([row([
+        toggle("Grid", app.show_grid, TOGGLE_GRID_KEY),
+        toggle("SSAO", app.ssao, TOGGLE_SSAO_KEY),
+        button("Frame")
+            .xsmall()
+            .secondary()
+            .tooltip("Frame the preview in view")
+            .key(FRAME_PREVIEW_KEY),
+        vertical_separator().height(Size::Fixed(20.0)),
+        select_trigger(MODE_SELECT_KEY, app.render_mode.label()),
+        select_trigger(
+            RESOLUTION_SELECT_KEY,
+            format!("{}^3", app.preview_resolution),
+        ),
+        select_trigger(
+            CAMERA_SELECT_KEY,
+            camera_scheme_short_label(app.camera_control_scheme),
+        ),
     ])
     .gap(tokens::SPACE_1)
+    .align(Align::Center)])
+    .padding(tokens::SPACE_1)
 }
 
-fn camera_scheme_button(app: &VolumetricUiV2, scheme: CameraControlScheme) -> El {
-    let button = button(camera_scheme_short_label(scheme))
-        .xsmall()
-        .tooltip(camera_scheme_tooltip(scheme))
-        .key(format!(
-            "{CAMERA_SCHEME_PREFIX}{}",
-            camera_scheme_route_name(scheme)
-        ));
-    if app.camera_control_scheme == scheme {
-        button.primary()
-    } else {
-        button.secondary()
-    }
-}
-
-fn render_mode_button(app: &VolumetricUiV2, mode: PreviewRenderMode) -> El {
-    let button = button(mode.label())
-        .xsmall()
-        .tooltip(mode.full_label())
-        .key(format!("{RENDER_MODE_PREFIX}{}", mode.route_name()));
-    if app.render_mode == mode {
-        button.primary()
-    } else {
-        button.secondary()
-    }
+/// One-line readout at the bottom of the viewport. Unkeyed, so it never
+/// intercepts camera input.
+fn viewport_hud(app: &VolumetricUiV2) -> El {
+    let visible = app.preview_requests().len();
+    row([
+        badge(format!("{visible} in viewport")).muted().xsmall(),
+        badge(format!("{} outputs", app.runtime_assets.len()))
+            .muted()
+            .xsmall(),
+        badge(&app.status).secondary().xsmall(),
+        spacer(),
+    ])
+    .gap(tokens::SPACE_1)
+    .align(Align::Center)
 }
 
 fn toggle_chip(label: &str, value: bool, key: &str) -> El {
@@ -1494,8 +1501,8 @@ fn toggle_chip(label: &str, value: bool, key: &str) -> El {
 
 /// Run/Cancel button that reflects the async run lifecycle. While a run is in
 /// flight it becomes a Cancel action; otherwise it triggers a run request.
-fn run_control(app: &VolumetricUiV2, full_width: bool) -> El {
-    let button = match app.run_state() {
+fn run_control(app: &VolumetricUiV2) -> El {
+    match app.run_state() {
         RunState::Running => button_with_icon("x", "Cancel")
             .destructive()
             .xsmall()
@@ -1504,11 +1511,6 @@ fn run_control(app: &VolumetricUiV2, full_width: bool) -> El {
             .primary()
             .xsmall()
             .key(RUN_PROJECT_KEY),
-    };
-    if full_width {
-        button.width(Size::Fill(1.0))
-    } else {
-        button
     }
 }
 
@@ -1530,29 +1532,6 @@ fn run_status_chip(app: &VolumetricUiV2) -> El {
             }
         }
     }
-}
-
-fn viewport_status_bar(app: &VolumetricUiV2, summary: &ProjectSummary) -> El {
-    toolbar([
-        badge(format!("{} imports", summary.imports))
-            .muted()
-            .xsmall(),
-        badge(format!("{} steps", summary.timeline_steps))
-            .muted()
-            .xsmall(),
-        badge(format!("{} exports", summary.exports))
-            .muted()
-            .xsmall(),
-        badge(format!("{} runtime", summary.runtime_assets.len()))
-            .muted()
-            .xsmall(),
-        badge(app.render_mode.label()).secondary().xsmall(),
-        badge(format!("{}^3", app.preview_resolution))
-            .secondary()
-            .xsmall(),
-        badge(&app.status).success().xsmall(),
-    ])
-    .gap(tokens::SPACE_1)
 }
 
 fn preview_status_chip(app: &VolumetricUiV2) -> El {
@@ -1584,27 +1563,6 @@ fn preview_status_chip(app: &VolumetricUiV2) -> El {
     }
 }
 
-fn project_details(app: &VolumetricUiV2) -> El {
-    card([
-        card_header([
-            card_title("Project Details"),
-            card_description("Current imports, operation sequence, and exported assets."),
-        ])
-        .padding(tokens::SPACE_3)
-        .gap(tokens::SPACE_1),
-        card_content([row([
-            project_list("Imports", import_rows(app)),
-            project_list("Timeline", step_rows(app)),
-            project_list("Exports", export_rows(app)),
-        ])
-        .gap(tokens::SPACE_3)
-        .height(Size::Fill(1.0))])
-        .px(tokens::SPACE_3)
-        .pb(tokens::SPACE_3),
-    ])
-    .height(Size::Fixed(220.0))
-}
-
 fn viewport_placeholder(app: &VolumetricUiV2) -> El {
     if let Some(texture) = &app.viewport_texture {
         surface(texture.clone())
@@ -1618,65 +1576,70 @@ fn viewport_placeholder(app: &VolumetricUiV2) -> El {
     }
 }
 
-fn right_inspector(app: &VolumetricUiV2) -> El {
-    let selected_model = selected_asset_label(volumetric_assets::get_model, app.selected_model);
-    let selected_operator =
-        selected_asset_label(volumetric_assets::get_operator, app.selected_operator);
-    let selected_export = app.selected_export.as_deref().unwrap_or("none");
-
+/// The single project panel: pipeline spine (imports → steps → exports),
+/// materialized outputs, and the inspector for the current selection.
+fn project_panel(app: &VolumetricUiV2) -> El {
     column([
-        toolbar([column([
-            toolbar_title("Inspector"),
-            toolbar_description("Selected catalog and project item"),
-        ])
-        .gap(tokens::SPACE_1)
-        .width(Size::Fill(1.0))]),
         scroll([
-            inspector_card(
-                "Render Mode",
-                "Current viewport sampling defaults.",
-                [
-                    field_row("Mode", badge("ASN v2").secondary()),
-                    detail_row("Selected", selected_export),
-                    detail_row("Preview", &app.preview_build_status.label()),
-                    detail_row("Status", &app.status),
-                ],
-            ),
-            inspector_card(
-                "Selection",
-                "Add catalog entries to the project graph.",
-                [
-                    detail_row("Model", selected_model),
-                    detail_row("Operator", selected_operator),
-                    button_with_icon("plus", "Add Model")
-                        .primary()
-                        .xsmall()
-                        .width(Size::Fill(1.0))
-                        .key(ADD_MODEL_KEY),
-                    button_with_icon("settings", "Add Operator")
-                        .secondary()
-                        .xsmall()
-                        .width(Size::Fill(1.0))
-                        .key(ADD_OPERATOR_KEY),
-                ],
-            ),
-            runtime_card(app),
-            project_item_card(app),
+            pipeline_accordion(app),
+            divider(),
+            panel_section("Outputs", outputs_rows(app)),
+            divider(),
+            panel_section("Inspector", inspector_rows(app)),
         ])
-        .key("inspector-scroll")
-        .gap(tokens::SPACE_2),
-        button_with_icon("download", "Export STL")
-            .secondary()
-            .xsmall()
-            .width(Size::Fill(1.0)),
+        .key("project-panel-scroll")
+        .gap(tokens::SPACE_3)
+        // Gutter so keyboard focus rings on full-width rows aren't clipped
+        // by the scroll's horizontal scissor.
+        .px(tokens::RING_WIDTH),
     ])
-    .width(Size::Fixed(300.0))
+    .width(Size::Fixed(320.0))
     .height(Size::Fill(1.0))
     .padding(tokens::SPACE_3)
     .gap(tokens::SPACE_2)
 }
 
-fn project_item_card(app: &VolumetricUiV2) -> El {
+fn panel_section(title: &str, body: Vec<El>) -> El {
+    let mut children = vec![text(title).muted().caption().semibold()];
+    children.extend(body);
+    column(children).gap(tokens::SPACE_2).width(Size::Fill(1.0))
+}
+
+fn pipeline_accordion(app: &VolumetricUiV2) -> El {
+    let open = |section: &str| app.pipeline_open.contains(section);
+    let section = |value: &str, label: String, rows: Vec<El>| {
+        accordion_item(
+            PIPELINE_KEY,
+            value,
+            label,
+            open(value),
+            // Gutter so the trigger's focus ring isn't occluded by the first
+            // row painted flush below it.
+            [table([table_body(rows).gap(tokens::SPACE_1)])
+                .width(Size::Fill(1.0))
+                .py(tokens::RING_WIDTH)],
+        )
+    };
+    accordion([
+        section(
+            "imports",
+            format!("Imports ({})", app.project.imports().len()),
+            import_rows(app),
+        ),
+        section(
+            "steps",
+            format!("Steps ({})", app.project.timeline().len()),
+            step_rows(app),
+        ),
+        section(
+            "exports",
+            format!("Exports ({})", app.project.exports().len()),
+            export_rows(app),
+        ),
+    ])
+}
+
+fn inspector_rows(app: &VolumetricUiV2) -> Vec<El> {
     let mut rows = match &app.selected_project_item {
         Some(ProjectSelection::Import(idx)) => import_detail_rows(app, *idx),
         Some(ProjectSelection::Step(idx)) => step_detail_rows(app, *idx),
@@ -1700,10 +1663,10 @@ fn project_item_card(app: &VolumetricUiV2) -> El {
         );
     }
 
-    inspector_card_from("Project Item", "Modify the selected graph entry.", rows)
+    rows
 }
 
-fn runtime_card(app: &VolumetricUiV2) -> El {
+fn outputs_rows(app: &VolumetricUiV2) -> Vec<El> {
     let mut rows = Vec::new();
 
     if let Some(error) = &app.last_run_error {
@@ -1739,11 +1702,7 @@ fn runtime_card(app: &VolumetricUiV2) -> El {
         );
     }
 
-    inspector_card_from(
-        "Outputs",
-        "Pin outputs to keep them in the viewport; View follows a single output.",
-        rows,
-    )
+    rows
 }
 
 fn runtime_asset_row(app: &VolumetricUiV2, asset: &LoadedAsset) -> El {
@@ -1974,39 +1933,6 @@ fn export_detail_rows(app: &VolumetricUiV2, idx: usize) -> Vec<El> {
     ]
 }
 
-fn inspector_card<const N: usize>(title: &str, description: &str, body: [El; N]) -> El {
-    inspector_card_from(title, description, body)
-}
-
-fn inspector_card_from<I>(title: &str, description: &str, body: I) -> El
-where
-    I: IntoIterator<Item = El>,
-{
-    card([
-        card_header([card_title(title), card_description(description)])
-            .padding(tokens::SPACE_3)
-            .gap(tokens::SPACE_1),
-        card_content(body)
-            .px(tokens::SPACE_3)
-            .pb(tokens::SPACE_3)
-            .gap(tokens::SPACE_2),
-    ])
-}
-
-fn project_list(title: &str, rows: Vec<El>) -> El {
-    column([
-        text(title).muted().caption().semibold(),
-        scroll([table([table_body(rows).gap(tokens::SPACE_1)])
-            // Gutter so row focus rings aren't clipped by the table's
-            // (non-scrollable, both-axis) vertical scissor.
-            .py(tokens::RING_WIDTH)])
-        .key(format!("project-list:{title}")),
-    ])
-    .gap(tokens::SPACE_1)
-    .width(Size::Fill(1.0))
-    .height(Size::Fill(1.0))
-}
-
 fn import_rows(app: &VolumetricUiV2) -> Vec<El> {
     if app.project.imports().is_empty() {
         return vec![empty_project_row("No imports")];
@@ -2145,27 +2071,6 @@ fn empty_project_row(label: &str) -> El {
         .padding(Sides::xy(tokens::SPACE_2, 0.0))
 }
 
-fn catalog_items(
-    assets: &'static [volumetric_assets::BundledAsset],
-    route_prefix: &str,
-    selected_name: Option<&str>,
-    icon_name: &'static str,
-) -> Vec<El> {
-    assets
-        .iter()
-        .map(|asset| {
-            sidebar_menu_button_with_icon(
-                icon_name,
-                asset.display_name,
-                selected_name == Some(asset.name),
-            )
-            .height(Size::Fixed(30.0))
-            .padding(Sides::xy(tokens::SPACE_2, 0.0))
-            .key(format!("{route_prefix}{}", asset.name))
-        })
-        .collect()
-}
-
 fn detail_row(label: &str, value: &str) -> El {
     field_row(
         label,
@@ -2187,16 +2092,6 @@ fn format_bytes(bytes: usize) -> String {
     } else {
         format!("{bytes} B")
     }
-}
-
-fn selected_asset_label(
-    lookup: fn(&str) -> Option<&'static volumetric_assets::BundledAsset>,
-    selected_name: Option<&str>,
-) -> &'static str {
-    selected_name
-        .and_then(lookup)
-        .map(|asset| asset.display_name)
-        .unwrap_or("none")
 }
 
 fn asset_type_label(type_hint: Option<AssetTypeHint>) -> &'static str {
@@ -2337,6 +2232,26 @@ mod tests {
         app.on_event(event, &EventCx::new());
     }
 
+    /// Click the Add-menu entry for the named bundled model.
+    fn add_model_click(app: &mut VolumetricUiV2, name: &str) {
+        dispatch(app, UiEvent::synthetic_click(format!("{ADD_MODEL_PREFIX}{name}")));
+    }
+
+    /// Click the Add-menu entry for the named bundled operator.
+    fn add_operator_click(app: &mut VolumetricUiV2, name: &str) {
+        dispatch(
+            app,
+            UiEvent::synthetic_click(format!("{ADD_OPERATOR_PREFIX}{name}")),
+        );
+    }
+
+    fn first_operator_name() -> &'static str {
+        volumetric_assets::operators()
+            .first()
+            .expect("bundled operators")
+            .name
+    }
+
     #[test]
     fn shell_reserves_a_viewport_region() {
         let bundle = shell_bundle(Rect::new(0.0, 0.0, 1280.0, 800.0));
@@ -2360,9 +2275,9 @@ mod tests {
     }
 
     #[test]
-    fn add_model_action_appends_unique_import() {
+    fn add_menu_click_appends_unique_import() {
         let mut app = VolumetricUiV2::default();
-        dispatch(&mut app, UiEvent::synthetic_click(ADD_MODEL_KEY));
+        add_model_click(&mut app, "simple_sphere_model");
 
         let summary = app.summary();
         assert_eq!(summary.imports, 2);
@@ -2372,23 +2287,25 @@ mod tests {
     }
 
     #[test]
-    fn catalog_click_changes_selected_model() {
-        let mut app = VolumetricUiV2::empty();
-        dispatch(
-            &mut app,
-            UiEvent::synthetic_click("model:simple_torus_model"),
-        );
+    fn menubar_opens_and_menu_item_click_closes_it() {
+        let mut app = VolumetricUiV2::default();
+        dispatch(&mut app, UiEvent::synthetic_click("main-menu:menu:add"));
+        assert_eq!(app.open_menu.as_deref(), Some("add"));
 
-        assert_eq!(
-            app.summary().selected_model.as_deref(),
-            Some("simple_torus_model")
-        );
+        add_model_click(&mut app, "simple_sphere_model");
+        assert_eq!(app.open_menu, None);
+        assert_eq!(app.summary().imports, 2);
+
+        // Clicking the trigger again toggles closed too.
+        dispatch(&mut app, UiEvent::synthetic_click("main-menu:menu:file"));
+        dispatch(&mut app, UiEvent::synthetic_click("main-menu:menu:file"));
+        assert_eq!(app.open_menu, None);
     }
 
     #[test]
-    fn add_operator_action_appends_timeline_step() {
+    fn add_operator_click_appends_timeline_step() {
         let mut app = VolumetricUiV2::default();
-        dispatch(&mut app, UiEvent::synthetic_click(ADD_OPERATOR_KEY));
+        add_operator_click(&mut app, first_operator_name());
 
         let summary = app.summary();
         assert_eq!(summary.timeline_steps, 1);
@@ -2402,10 +2319,10 @@ mod tests {
     #[test]
     fn added_operator_wires_all_declared_inputs() {
         let mut app = VolumetricUiV2::default();
-        dispatch(&mut app, UiEvent::synthetic_click(ADD_OPERATOR_KEY));
+        let op_name = first_operator_name();
+        add_operator_click(&mut app, op_name);
 
-        let op_name = app.summary().selected_operator.expect("operator selected");
-        let asset = volumetric_assets::get_operator(&op_name).expect("bundled operator");
+        let asset = volumetric_assets::get_operator(op_name).expect("bundled operator");
         let metadata =
             volumetric::operator_metadata_from_wasm_bytes(asset.bytes).expect("operator metadata");
 
@@ -2439,7 +2356,7 @@ mod tests {
     #[test]
     fn delete_import_removes_dependent_step_and_exports() {
         let mut app = VolumetricUiV2::default();
-        dispatch(&mut app, UiEvent::synthetic_click(ADD_OPERATOR_KEY));
+        add_operator_click(&mut app, first_operator_name());
         dispatch(
             &mut app,
             UiEvent::synthetic_click("project:delete-import:0"),
@@ -2471,19 +2388,17 @@ mod tests {
     }
 
     #[test]
-    fn viewport_controls_update_preview_settings() {
+    fn viewport_pickers_update_preview_settings() {
         let mut app = VolumetricUiV2::default();
+        // Trigger click opens the picker; option click applies and closes it.
+        dispatch(&mut app, UiEvent::synthetic_click(MODE_SELECT_KEY));
+        assert_eq!(app.open_select.as_deref(), Some(MODE_SELECT_KEY));
+        dispatch(&mut app, UiEvent::synthetic_click("view:mode:option:points"));
+        assert_eq!(app.open_select, None);
+        dispatch(&mut app, UiEvent::synthetic_click("view:res:option:96"));
         dispatch(
             &mut app,
-            UiEvent::synthetic_click("viewport:render-mode:points"),
-        );
-        dispatch(
-            &mut app,
-            UiEvent::synthetic_click("viewport:preview-resolution:96"),
-        );
-        dispatch(
-            &mut app,
-            UiEvent::synthetic_click("viewport:camera-scheme:onshape"),
+            UiEvent::synthetic_click("view:camera:option:onshape"),
         );
 
         let summary = app.summary();
@@ -2537,14 +2452,8 @@ mod tests {
     fn preview_requests_carry_render_mode_and_controls() {
         let mut app = VolumetricUiV2::default();
         app.run_project();
-        dispatch(
-            &mut app,
-            UiEvent::synthetic_click("viewport:render-mode:asn2"),
-        );
-        dispatch(
-            &mut app,
-            UiEvent::synthetic_click("viewport:preview-resolution:96"),
-        );
+        dispatch(&mut app, UiEvent::synthetic_click("view:mode:option:asn2"));
+        dispatch(&mut app, UiEvent::synthetic_click("view:res:option:96"));
 
         let requests = app.preview_requests();
         assert_eq!(requests.len(), 1);
@@ -2572,7 +2481,7 @@ mod tests {
     /// Builds a two-export project and returns (app, export ids) after a run.
     fn two_export_app() -> (VolumetricUiV2, Vec<String>) {
         let mut app = VolumetricUiV2::default();
-        app.add_selected_model(); // second copy; unique id via `insert_model`
+        app.add_model("simple_sphere_model"); // second copy; unique id via `insert_model`
         app.run_project();
         let exports = app.project().exports().to_vec();
         assert_eq!(exports.len(), 2);
@@ -2695,12 +2604,12 @@ mod tests {
         let mut app = VolumetricUiV2::default();
         assert!(!app.auto_rebuild());
         // Editing without auto-rebuild does not queue a run.
-        dispatch(&mut app, UiEvent::synthetic_click(ADD_MODEL_KEY));
+        add_model_click(&mut app, "simple_sphere_model");
         assert!(!app.take_pending_run());
 
         dispatch(&mut app, UiEvent::synthetic_click(TOGGLE_AUTO_REBUILD_KEY));
         assert!(app.auto_rebuild());
-        dispatch(&mut app, UiEvent::synthetic_click(ADD_MODEL_KEY));
+        add_model_click(&mut app, "simple_sphere_model");
         assert!(app.take_pending_run());
     }
 
@@ -2710,7 +2619,7 @@ mod tests {
         app.run_project();
         assert_eq!(app.summary().runtime_assets.len(), 1);
 
-        dispatch(&mut app, UiEvent::synthetic_click(ADD_MODEL_KEY));
+        add_model_click(&mut app, "simple_sphere_model");
 
         let summary = app.summary();
         // The previous run's output stays materialized (marked stale) so the
@@ -2771,11 +2680,7 @@ mod tests {
         let mut exercised = false;
         for op in volumetric_assets::operators() {
             let mut app = VolumetricUiV2::default();
-            dispatch(
-                &mut app,
-                UiEvent::synthetic_click(format!("{OPERATOR_ROUTE_PREFIX}{}", op.name)),
-            );
-            dispatch(&mut app, UiEvent::synthetic_click(ADD_OPERATOR_KEY));
+            add_operator_click(&mut app, op.name);
             app.before_build();
 
             let Some(edit) = app.step_edit.as_ref() else {
@@ -2839,7 +2744,7 @@ mod tests {
     #[test]
     fn selecting_a_non_step_clears_the_step_editor() {
         let mut app = VolumetricUiV2::default();
-        dispatch(&mut app, UiEvent::synthetic_click(ADD_OPERATOR_KEY));
+        add_operator_click(&mut app, first_operator_name());
         app.before_build();
 
         // Select an import (not a step); the step editor should clear.
@@ -2856,12 +2761,8 @@ mod tests {
         // Add a second model, then an operator, then retarget the operator's
         // first model slot (input 0) to the sphere via the per-slot route.
         let mut app = VolumetricUiV2::default();
-        dispatch(
-            &mut app,
-            UiEvent::synthetic_click("model:simple_torus_model"),
-        );
-        dispatch(&mut app, UiEvent::synthetic_click(ADD_MODEL_KEY));
-        dispatch(&mut app, UiEvent::synthetic_click(ADD_OPERATOR_KEY));
+        add_model_click(&mut app, "simple_torus_model");
+        add_operator_click(&mut app, first_operator_name());
         app.before_build();
         dispatch(
             &mut app,
@@ -2889,11 +2790,7 @@ mod tests {
         let mut exercised = false;
         for op in volumetric_assets::operators() {
             let mut app = VolumetricUiV2::default();
-            dispatch(
-                &mut app,
-                UiEvent::synthetic_click(format!("{OPERATOR_ROUTE_PREFIX}{}", op.name)),
-            );
-            dispatch(&mut app, UiEvent::synthetic_click(ADD_OPERATOR_KEY));
+            add_operator_click(&mut app, op.name);
             app.before_build();
 
             let Some(edit) = app.step_edit.as_ref() else {
