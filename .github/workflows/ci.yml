@@ -85,6 +85,8 @@ jobs:
         with:
           path: volumetric/main
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -92,6 +94,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: volumetric/main
+      # The volumetric_assets build script bundles the model/operator WASM
+      # modules from target/wasm32-unknown-unknown/release/, and the v2 UI
+      # tests assert against those bundled assets — build them first.
+      - run: cargo build-wasm
       - run: cargo test --workspace
 
   wasm:
