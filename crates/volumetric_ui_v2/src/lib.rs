@@ -47,6 +47,8 @@ const OUTPUT_SETTINGS_PREFIX: &str = "output:settings:";
 const OUTPUT_MODE_PREFIX: &str = "output:mode:";
 const OUTPUT_RESOLUTION_PREFIX: &str = "output:res:";
 const OUTPUT_DEFAULTS_PREFIX: &str = "output:defaults:";
+/// ASN2 setting stepper: `output:asn2:{id}:{field}:{up|down}`.
+const OUTPUT_ASN2_PREFIX: &str = "output:asn2:";
 const EXPORT_STL_PREFIX: &str = "output:stl:";
 const EXPORT_WASM_PREFIX: &str = "output:wasm:";
 /// Draggable divider between the viewport and the project panel.
@@ -130,6 +132,36 @@ pub struct RuntimeAssetSummary {
     pub precursor_count: usize,
 }
 
+/// ASN2 meshing quality settings, adjustable per output. Angles and the
+/// residual multiplier are stored as scaled integers so the settings stay
+/// `Eq`/`Hash`-able for the preview cache key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Asn2Settings {
+    /// Binary-search iterations for vertex position refinement (0-16).
+    pub vertex_refinement_iterations: usize,
+    /// Binary-search iterations for normal refinement probing (0 = face
+    /// normals, 4-8 = smooth probed normals).
+    pub normal_sample_iterations: usize,
+    /// Detect sharp edges and duplicate vertices across them.
+    pub sharp_edges: bool,
+    /// Sharp-edge angle threshold in whole degrees (10-90).
+    pub sharp_angle_degrees: u16,
+    /// Sharp-edge plane-fit residual multiplier, tenths (10-200 = 1.0-20.0).
+    pub sharp_residual_x10: u16,
+}
+
+impl Default for Asn2Settings {
+    fn default() -> Self {
+        Self {
+            vertex_refinement_iterations: 8,
+            normal_sample_iterations: 0,
+            sharp_edges: false,
+            sharp_angle_degrees: 30,
+            sharp_residual_x10: 40,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PreviewMeshPlan {
     PointCloud {
@@ -142,13 +174,12 @@ pub enum PreviewMeshPlan {
         target_resolution: usize,
         base_resolution: usize,
         max_depth: usize,
-        vertex_refinement_iterations: usize,
-        normal_sample_iterations: usize,
+        settings: Asn2Settings,
     },
 }
 
 impl PreviewMeshPlan {
-    fn for_mode(mode: PreviewRenderMode, resolution: usize) -> Self {
+    fn for_mode(mode: PreviewRenderMode, resolution: usize, asn2: Asn2Settings) -> Self {
         match mode {
             PreviewRenderMode::Points => Self::PointCloud { resolution },
             PreviewRenderMode::MarchingCubes => Self::MarchingCubes { resolution },
@@ -158,8 +189,7 @@ impl PreviewMeshPlan {
                     target_resolution: resolution,
                     base_resolution,
                     max_depth,
-                    vertex_refinement_iterations: 8,
-                    normal_sample_iterations: 0,
+                    settings: asn2,
                 }
             }
         }
@@ -184,8 +214,7 @@ impl PreviewMeshPlan {
         let Self::AdaptiveSurfaceNets2 {
             base_resolution,
             max_depth,
-            vertex_refinement_iterations,
-            normal_sample_iterations,
+            settings,
             ..
         } = self
         else {
@@ -195,11 +224,16 @@ impl PreviewMeshPlan {
         Some(adaptive_surface_nets_2::AdaptiveMeshConfig2 {
             base_resolution: *base_resolution,
             max_depth: *max_depth,
-            vertex_refinement_iterations: *vertex_refinement_iterations,
-            normal_sample_iterations: *normal_sample_iterations,
+            vertex_refinement_iterations: settings.vertex_refinement_iterations,
+            normal_sample_iterations: settings.normal_sample_iterations,
             normal_epsilon_frac: 0.1,
             num_threads: 0,
-            sharp_edge_config: None,
+            sharp_edge_config: settings.sharp_edges.then(|| {
+                adaptive_surface_nets_2::SharpEdgeConfig {
+                    angle_threshold: f64::from(settings.sharp_angle_degrees).to_radians(),
+                    residual_multiplier: f64::from(settings.sharp_residual_x10) / 10.0,
+                }
+            }),
         })
     }
 }
@@ -343,6 +377,7 @@ pub enum FileAction {
 pub struct OutputRender {
     pub mode: PreviewRenderMode,
     pub resolution: usize,
+    pub asn2: Asn2Settings,
 }
 
 #[derive(Debug)]
@@ -530,7 +565,31 @@ impl VolumetricUiV2 {
             .unwrap_or(OutputRender {
                 mode: self.render_mode,
                 resolution: self.preview_resolution,
+                asn2: Asn2Settings::default(),
             })
+    }
+
+    /// Adjusts one ASN2 setting for an output; `up` steps the value up. The
+    /// `sharp` field toggles regardless of direction.
+    fn adjust_output_asn2(&mut self, id: &str, field: &str, up: bool) {
+        let mut render = self.output_render(id);
+        let asn2 = &mut render.asn2;
+        let step_usize = |v: usize| if up { (v + 1).min(16) } else { v.saturating_sub(1) };
+        match field {
+            "vr" => asn2.vertex_refinement_iterations = step_usize(asn2.vertex_refinement_iterations),
+            "nr" => asn2.normal_sample_iterations = step_usize(asn2.normal_sample_iterations),
+            "sharp" => asn2.sharp_edges = !asn2.sharp_edges,
+            "angle" => {
+                let next = i32::from(asn2.sharp_angle_degrees) + if up { 5 } else { -5 };
+                asn2.sharp_angle_degrees = next.clamp(10, 90) as u16;
+            }
+            "resid" => {
+                let next = i32::from(asn2.sharp_residual_x10) + if up { 5 } else { -5 };
+                asn2.sharp_residual_x10 = next.clamp(10, 200) as u16;
+            }
+            _ => return,
+        }
+        self.output_overrides.insert(id.to_string(), render);
     }
 
     fn set_output_mode(&mut self, id: &str, mode: PreviewRenderMode) {
@@ -566,7 +625,7 @@ impl VolumetricUiV2 {
             type_hint: asset.type_hint(),
             precursor_ids: asset.precursor_ids().to_vec(),
             render_mode: render.mode,
-            mesh_plan: PreviewMeshPlan::for_mode(render.mode, render.resolution),
+            mesh_plan: PreviewMeshPlan::for_mode(render.mode, render.resolution, render.asn2),
             show_grid: self.show_grid,
             ssao: self.ssao,
             stale: self.last_run_stale,
@@ -1602,6 +1661,12 @@ impl App for VolumetricUiV2 {
             }
         } else if let Some(id) = route.strip_prefix(OUTPUT_DEFAULTS_PREFIX) {
             self.clear_output_override(id);
+        } else if let Some(rest) = route.strip_prefix(OUTPUT_ASN2_PREFIX) {
+            if let Some((rest, direction)) = rest.rsplit_once(':')
+                && let Some((id, field)) = rest.rsplit_once(':')
+            {
+                self.adjust_output_asn2(id, field, direction == "up");
+            }
         } else if let Some(id) = route.strip_prefix(EXPORT_STL_PREFIX) {
             self.pending_file_action = Some(FileAction::ExportStl(id.to_string()));
             self.open_select = None;
@@ -1777,6 +1842,45 @@ fn output_settings_popover(app: &VolumetricUiV2, id: &str) -> El {
         text("Resolution").caption().muted(),
         resolution_buttons,
     ];
+    if render.mode == PreviewRenderMode::AdaptiveSurfaceNets2 {
+        body.push(text("ASN2 Quality").caption().muted());
+        body.push(asn2_stepper_row(
+            id,
+            "vr",
+            "Vertex refine",
+            &render.asn2.vertex_refinement_iterations.to_string(),
+        ));
+        body.push(asn2_stepper_row(
+            id,
+            "nr",
+            "Normal refine",
+            &render.asn2.normal_sample_iterations.to_string(),
+        ));
+        body.push(
+            field_row(
+                "Sharp edges",
+                switch(
+                    format!("{OUTPUT_ASN2_PREFIX}{id}:sharp:up"),
+                    render.asn2.sharp_edges,
+                ),
+            )
+            .gap(tokens::SPACE_2),
+        );
+        if render.asn2.sharp_edges {
+            body.push(asn2_stepper_row(
+                id,
+                "angle",
+                "Angle (deg)",
+                &render.asn2.sharp_angle_degrees.to_string(),
+            ));
+            body.push(asn2_stepper_row(
+                id,
+                "resid",
+                "Residual mult",
+                &format!("{:.1}", f64::from(render.asn2.sharp_residual_x10) / 10.0),
+            ));
+        }
+    }
     if app.output_overrides.contains_key(id) {
         body.push(
             button("Use viewport defaults")
@@ -1809,6 +1913,30 @@ fn output_settings_popover(app: &VolumetricUiV2, id: &str) -> El {
         // shadow); a bare column would float transparently over the panel.
         popover_panel([column(body).gap(tokens::SPACE_2).padding(tokens::SPACE_2)]),
     )
+}
+
+/// A label + `- value +` stepper row driving one ASN2 setting.
+fn asn2_stepper_row(id: &str, field: &str, label: &str, value: &str) -> El {
+    field_row(
+        label,
+        row([
+            icon_button("chevron-left")
+                .ghost()
+                .xsmall()
+                .key(format!("{OUTPUT_ASN2_PREFIX}{id}:{field}:down")),
+            text(value)
+                .label()
+                .text_align(TextAlign::Center)
+                .width(Size::Fixed(40.0)),
+            icon_button("chevron-right")
+                .ghost()
+                .xsmall()
+                .key(format!("{OUTPUT_ASN2_PREFIX}{id}:{field}:up")),
+        ])
+        .gap(tokens::SPACE_1)
+        .align(Align::Center),
+    )
+    .gap(tokens::SPACE_2)
 }
 
 /// The viewport plus its floating chrome: view controls in the top-right
@@ -2878,8 +3006,7 @@ mod tests {
                 target_resolution: 96,
                 base_resolution: 6,
                 max_depth: 4,
-                vertex_refinement_iterations: 8,
-                normal_sample_iterations: 0,
+                settings: Asn2Settings::default(),
             }
         );
         let config = request
@@ -3101,12 +3228,51 @@ mod tests {
         assert_eq!(overridden.render_mode, PreviewRenderMode::Points);
         assert_eq!(
             overridden.mesh_plan,
-            PreviewMeshPlan::for_mode(PreviewRenderMode::Points, 24)
+            PreviewMeshPlan::for_mode(PreviewRenderMode::Points, 24, Asn2Settings::default())
         );
         assert_eq!(
             default.render_mode,
             PreviewRenderMode::AdaptiveSurfaceNets2
         );
+    }
+
+    #[test]
+    fn asn2_steppers_adjust_output_settings() {
+        let (mut app, exports) = two_export_app();
+        let id = exports[0].clone();
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{TOGGLE_PIN_PREFIX}{id}")),
+        );
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{OUTPUT_ASN2_PREFIX}{id}:sharp:up")),
+        );
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{OUTPUT_ASN2_PREFIX}{id}:vr:down")),
+        );
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{OUTPUT_ASN2_PREFIX}{id}:angle:up")),
+        );
+
+        let render = app.output_render(&id);
+        assert!(render.asn2.sharp_edges);
+        assert_eq!(render.asn2.vertex_refinement_iterations, 7);
+        assert_eq!(render.asn2.sharp_angle_degrees, 35);
+
+        // The settings flow through to the meshing config.
+        let requests = app.preview_requests();
+        let request = requests.iter().find(|r| r.asset_id == id).unwrap();
+        let config = request
+            .mesh_plan
+            .adaptive_surface_nets_config()
+            .expect("asn2 config");
+        assert_eq!(config.vertex_refinement_iterations, 7);
+        let sharp = config.sharp_edge_config.expect("sharp edges enabled");
+        assert!((sharp.angle_threshold - 35f64.to_radians()).abs() < 1e-9);
+        assert!((sharp.residual_multiplier - 4.0).abs() < 1e-9);
     }
 
     #[test]
