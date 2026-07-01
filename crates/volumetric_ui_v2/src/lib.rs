@@ -173,6 +173,18 @@ impl Default for Asn2Settings {
     }
 }
 
+/// Meshing statistics for one built preview, reported by the host's worker.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct OutputStats {
+    pub mesh_ms: f64,
+    pub triangles: usize,
+    pub points: usize,
+    /// Total sampler invocations, when the mesher reports them (ASN2).
+    pub samples: u64,
+    /// Preformatted per-stage profiling lines (ASN2 only).
+    pub detail: Vec<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PreviewMeshPlan {
     PointCloud {
@@ -439,6 +451,8 @@ pub struct VolumetricUiV2 {
     open_select: Option<String>,
     /// Expanded pipeline accordion sections (`imports` | `steps` | `exports`).
     pipeline_open: std::collections::BTreeSet<String>,
+    /// Meshing stats per built output, mirrored from the host's preview cache.
+    output_stats: std::collections::BTreeMap<String, OutputStats>,
     /// A queued file operation for the host to run (dialogs are host-side).
     pending_file_action: Option<FileAction>,
     /// Where the project was last opened from / saved to; Save re-saves here,
@@ -498,6 +512,7 @@ impl VolumetricUiV2 {
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
+            output_stats: std::collections::BTreeMap::new(),
             pending_file_action: None,
             project_path: None,
             panel_width: PANEL_WIDTH_DEFAULT,
@@ -879,6 +894,14 @@ impl VolumetricUiV2 {
     /// Status line for host-side operations (e.g. STL export results).
     pub(crate) fn set_status(&mut self, status: impl Into<String>) {
         self.status = status.into();
+    }
+
+    /// Meshing stats mirrored from the host's preview cache each frame.
+    pub(crate) fn set_output_stats(
+        &mut self,
+        stats: std::collections::BTreeMap<String, OutputStats>,
+    ) {
+        self.output_stats = stats;
     }
 
     /// Rebuilds the step editor when the selected step changes. While the same
@@ -2139,6 +2162,23 @@ fn output_settings_popover(app: &VolumetricUiV2, id: &str) -> El {
             ));
         }
     }
+    if let Some(stats) = app.output_stats.get(id) {
+        body.push(divider());
+        let mut summary = format!("meshed in {:.1} ms", stats.mesh_ms);
+        if stats.triangles > 0 {
+            summary.push_str(&format!(" · {} tris", format_count(stats.triangles)));
+        }
+        if stats.points > 0 {
+            summary.push_str(&format!(" · {} pts", format_count(stats.points)));
+        }
+        if stats.samples > 0 {
+            summary.push_str(&format!(" · {} samples", format_count(stats.samples as usize)));
+        }
+        body.push(text(summary).caption().muted());
+        for line in &stats.detail {
+            body.push(text(line).caption().muted());
+        }
+    }
     if app.output_overrides.contains_key(id) {
         body.push(
             button("Use viewport defaults")
@@ -2265,16 +2305,34 @@ fn view_controls_cluster(app: &VolumetricUiV2) -> El {
 /// intercepts camera input.
 fn viewport_hud(app: &VolumetricUiV2) -> El {
     let visible = app.preview_requests().len();
-    row([
+    let triangles: usize = app.output_stats.values().map(|s| s.triangles).sum();
+    let points: usize = app.output_stats.values().map(|s| s.points).sum();
+    let mut badges = vec![
         badge(format!("{visible} in viewport")).muted().xsmall(),
         badge(format!("{} outputs", app.runtime_assets.len()))
             .muted()
             .xsmall(),
-        badge(&app.status).secondary().xsmall(),
-        spacer(),
-    ])
-    .gap(tokens::SPACE_1)
-    .align(Align::Center)
+    ];
+    if triangles > 0 {
+        badges.push(badge(format!("{} tris", format_count(triangles))).muted().xsmall());
+    }
+    if points > 0 {
+        badges.push(badge(format!("{} pts", format_count(points))).muted().xsmall());
+    }
+    badges.push(badge(&app.status).secondary().xsmall());
+    badges.push(spacer());
+    row(badges).gap(tokens::SPACE_1).align(Align::Center)
+}
+
+/// Compact count formatting: 950, 12.4k, 3.1M.
+fn format_count(count: usize) -> String {
+    if count >= 1_000_000 {
+        format!("{:.1}M", count as f64 / 1_000_000.0)
+    } else if count >= 1_000 {
+        format!("{:.1}k", count as f64 / 1_000.0)
+    } else {
+        count.to_string()
+    }
 }
 
 fn toggle_chip(label: &str, value: bool, key: &str) -> El {

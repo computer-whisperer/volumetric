@@ -18,8 +18,8 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowId};
 
 use crate::{
-    FileAction, PreviewBuildStatus, PreviewMeshPlan, PreviewRenderMode, PreviewRequest, RunState,
-    VIEWPORT_KEY, ViewportCameraCommand, VolumetricUiV2,
+    FileAction, OutputStats, PreviewBuildStatus, PreviewMeshPlan, PreviewRenderMode,
+    PreviewRequest, RunState, VIEWPORT_KEY, ViewportCameraCommand, VolumetricUiV2,
 };
 
 pub fn run(
@@ -440,6 +440,8 @@ impl Host {
             .viewport_renderer
             .sync_preview_requests(&preview_requests);
         self.app.set_preview_build_status(preview_status);
+        self.app
+            .set_output_stats(gfx.viewport_renderer.preview_cache.output_stats());
         for job in preview_jobs {
             self.worker.send(BackgroundJob::BuildPreview(job));
         }
@@ -973,11 +975,13 @@ impl PreviewSceneKey {
     }
 }
 
-/// A single built output: its meshed geometry and world-space bounds.
+/// A single built output: its meshed geometry, world-space bounds, and the
+/// meshing statistics surfaced in the UI.
 #[derive(Clone)]
 struct PreviewEntity {
     scene: renderer::SceneData,
     bounds: PreviewBounds,
+    stats: OutputStats,
 }
 
 #[derive(Clone, Copy)]
@@ -1031,6 +1035,14 @@ impl PreviewCache {
     /// The cached scene for one output, if a build has completed for it.
     fn entity_scene(&self, id: &str) -> Option<&renderer::SceneData> {
         self.entities.get(id).map(|(_, entity)| &entity.scene)
+    }
+
+    /// Meshing stats for every cached output, keyed by asset id.
+    fn output_stats(&self) -> std::collections::BTreeMap<String, OutputStats> {
+        self.entities
+            .iter()
+            .map(|(id, (_, entity))| (id.clone(), entity.stats.clone()))
+            .collect()
     }
 
     /// Drops any outputs no longer requested, then returns the aggregate build
@@ -1294,11 +1306,14 @@ fn stash_job(
 }
 
 fn build_preview_scene(request: &PreviewRequest) -> Result<PreviewEntity, String> {
+    let build_start = std::time::Instant::now();
+    let mut stats = OutputStats::default();
     let (scene, bounds_min, bounds_max) = match &request.mesh_plan {
         PreviewMeshPlan::PointCloud { resolution } => {
             let (points, bounds_min, bounds_max) =
                 volumetric::sample_model_from_bytes(request.wasm_bytes.as_slice(), *resolution)
                     .map_err(format_error_chain)?;
+            stats.points = points.len();
             let mut scene = renderer::SceneData::new();
             scene.add_points(
                 renderer::convert_points_to_point_data(&points),
@@ -1319,6 +1334,7 @@ fn build_preview_scene(request: &PreviewRequest) -> Result<PreviewEntity, String
                     *resolution,
                 )
                 .map_err(format_error_chain)?;
+            stats.triangles = triangles.len();
             let mut scene = renderer::SceneData::new();
             scene.add_mesh(
                 renderer::MeshData {
@@ -1340,6 +1356,9 @@ fn build_preview_scene(request: &PreviewRequest) -> Result<PreviewEntity, String
                 &config,
             )
             .map_err(format_error_chain)?;
+            stats.triangles = mesh.indices.len() / 3;
+            stats.samples = mesh.stats.total_samples;
+            stats.detail = asn2_stage_lines(&mesh.stats);
             let vertices = mesh
                 .vertices
                 .iter()
@@ -1364,13 +1383,53 @@ fn build_preview_scene(request: &PreviewRequest) -> Result<PreviewEntity, String
         }
     };
 
+    stats.mesh_ms = build_start.elapsed().as_secs_f64() * 1000.0;
     Ok(PreviewEntity {
         scene,
         bounds: PreviewBounds {
             min: bounds_min,
             max: bounds_max,
         },
+        stats,
     })
+}
+
+/// Per-stage profiling lines for the ASN2 mesher, shown in the output's
+/// settings popover (v1 had these in a collapsible "Profiling Details").
+fn asn2_stage_lines(stats: &volumetric::adaptive_surface_nets_2::MeshingStats2) -> Vec<String> {
+    let ms = |secs: f64| secs * 1000.0;
+    let mut lines = vec![
+        format!(
+            "S1 discovery {:.1} ms · {} samples · {} cells",
+            ms(stats.stage1_time_secs),
+            stats.stage1_samples,
+            stats.stage1_mixed_cells
+        ),
+        format!(
+            "S2 subdivide {:.1} ms · {} tris",
+            ms(stats.stage2_time_secs),
+            stats.stage2_triangles_emitted
+        ),
+        format!(
+            "S3 topology {:.1} ms · {} verts",
+            ms(stats.stage3_time_secs),
+            stats.stage3_unique_vertices
+        ),
+        format!(
+            "S4 refine {:.1} ms · {} samples",
+            ms(stats.stage4_time_secs),
+            stats.stage4_samples
+        ),
+    ];
+    if stats.stage4_5_time_secs > 0.0 || stats.sharp_vertices_inserted > 0 {
+        lines.push(format!(
+            "S4.5 sharp {:.1} ms · {} inserted · {} duplicated",
+            ms(stats.stage4_5_time_secs),
+            stats.sharp_vertices_inserted,
+            stats.sharp_vertices_duplicated
+        ));
+    }
+    lines
 }
 
 fn render_settings(
@@ -1528,6 +1587,7 @@ mod tests {
                 min: (0.0, 0.0, 0.0),
                 max: (1.0, 1.0, 1.0),
             },
+            stats: OutputStats::default(),
         }
     }
 

@@ -278,6 +278,24 @@ candidates for Phase 3c.
   band stays off the viewport's hit target. Still open: the wide Lua `sheet`
   (deferred until the in-panel editor actually pinches) and remembering the
   save path for one-click re-save.
+- The v1-parity sweep closed the remaining functional gaps found by comparing
+  against the egui app's full feature inventory: per-output Export WASM;
+  Add > Import for external model WASM / STL meshes / heightmap images (the
+  two Blob-input import operators are hidden from the plain operator list and
+  reached via Import, with config defaults derived from the operator schema
+  instead of v1's hand-encoded CBOR); per-output ASN2 quality settings
+  (vertex/normal refinement, sharp edge detection with angle + residual
+  steppers) — the base/depth split stays derived from the single resolution
+  knob, unlike v1's two coupled drags; SSAO radius/bias/strength steppers in
+  a viewport-cluster popover; camera Reset; a 16-256 resolution ladder;
+  output rename in the step editor (also rewrites downstream AssetRef inputs,
+  pins, overrides, and selection — v1 left references dangling); Save vs Save
+  As with a remembered project path; Lua reset-to-template; precursor lineage
+  in the export inspector; and meshing statistics (time, triangle/point/
+  sample counts in the output popover with ASN2 per-stage profiling lines,
+  plus scene totals in the viewport HUD). Knowingly not ported: the wasm32/
+  web build (v2's host is native-only) and v1's arbitrary-resolution slider
+  (ladder presets instead).
 
 ### Slice 0: Dependency Update
 
