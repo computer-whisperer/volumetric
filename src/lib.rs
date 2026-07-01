@@ -107,8 +107,50 @@ pub enum ExecutionError {
         operator_id: String,
         message: String,
     },
+    #[error("Asset '{0}' is exported more than once")]
+    DuplicateExport(String),
     #[error("Execution cancelled")]
     Cancelled,
+}
+
+/// A structural problem in a project, found by [`Project::validate`].
+///
+/// These are the mistakes the executor would otherwise surface mid-run as
+/// [`ExecutionError::NoSuchAssetId`] (or, for duplicate asset ids, silently
+/// tolerate by overwriting); hosts can run validation at edit time instead.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ValidationIssue {
+    /// Two imports, an import and a step output, or two step outputs declare
+    /// the same id. Execution would silently overwrite the earlier asset.
+    #[error("asset id '{id}' is declared more than once")]
+    DuplicateAssetId { id: String },
+    /// A step input references an asset that no import or earlier step
+    /// defines (unknown id, or defined only by a later step).
+    #[error(
+        "step {step_index} ('{operator_id}') input {input_index} references '{id}', \
+         which is not defined by an import or an earlier step"
+    )]
+    UnresolvedInput {
+        step_index: usize,
+        operator_id: String,
+        input_index: usize,
+        id: String,
+    },
+    /// A step's operator id resolves to no import or earlier step output.
+    #[error(
+        "step {step_index} references operator '{operator_id}', \
+         which is not defined by an import or an earlier step"
+    )]
+    UnresolvedOperator {
+        step_index: usize,
+        operator_id: String,
+    },
+    /// An export id that no import or step output defines.
+    #[error("export '{id}' is not defined by any import or step output")]
+    UnknownExport { id: String },
+    /// The same id appears in the export list more than once.
+    #[error("asset '{id}' is exported more than once")]
+    DuplicateExport { id: String },
 }
 
 // =============================================================================
@@ -334,7 +376,11 @@ pub struct AdaptiveMeshV2Result {
 
 /// Generate an indexed mesh using the new Adaptive Surface Nets v2 algorithm.
 /// Returns a result struct containing mesh data, bounds, and detailed profiling statistics.
-#[cfg(feature = "native")]
+///
+/// Works with whichever [`ParallelModelSampler`](wasm::ParallelModelSampler)
+/// backend the build enables (thread-local wasmtime instances on native, a
+/// single JS-bridge instance on the web).
+#[cfg(any(feature = "native", feature = "web"))]
 pub fn generate_adaptive_mesh_v2_from_bytes(
     wasm_bytes: &[u8],
     config: &adaptive_surface_nets_2::AdaptiveMeshConfig2,
@@ -348,37 +394,6 @@ pub fn generate_adaptive_mesh_v2_from_bytes(
     let (bounds_min, bounds_max) = bounds.as_f32();
 
     // Create a closure-based sampler that wraps the ParallelModelSampler
-    let sampler = move |x: f64, y: f64, z: f64| -> f32 { wasm_sampler.sample(x, y, z) };
-
-    let result =
-        adaptive_surface_nets_2::adaptive_surface_nets_2(sampler, bounds_min, bounds_max, config);
-
-    Ok(AdaptiveMeshV2Result {
-        vertices: result.mesh.vertices,
-        normals: result.mesh.normals,
-        indices: result.mesh.indices,
-        bounds_min,
-        bounds_max,
-        stats: result.stats,
-    })
-}
-
-/// Generate an indexed mesh using Adaptive Surface Nets v2 (web version).
-/// Uses the WebParallelSampler for single-threaded web execution.
-#[cfg(all(feature = "web", not(feature = "native")))]
-pub fn generate_adaptive_mesh_v2_from_bytes(
-    wasm_bytes: &[u8],
-    config: &adaptive_surface_nets_2::AdaptiveMeshConfig2,
-) -> anyhow::Result<AdaptiveMeshV2Result> {
-    use wasm::ParallelModelSampler;
-
-    let wasm_sampler =
-        wasm::create_parallel_sampler(wasm_bytes).context("Failed to create parallel sampler")?;
-
-    let bounds = wasm_sampler.get_bounds()?;
-    let (bounds_min, bounds_max) = bounds.as_f32();
-
-    // Create a closure-based sampler that wraps the WebParallelSampler
     let sampler = move |x: f64, y: f64, z: f64| -> f32 { wasm_sampler.sample(x, y, z) };
 
     let result =
@@ -454,6 +469,10 @@ impl LoadedAsset {
     }
 
     /// Returns the raw bytes if this looks like a model (by type hint).
+    ///
+    /// Assets with no type hint are permissively treated as models: hints
+    /// are advisory and the executor is type-agnostic, so a missing hint
+    /// must not prevent an asset from being rendered or meshed.
     pub fn as_model(&self) -> Option<&[u8]> {
         match self.type_hint {
             Some(AssetTypeHint::Model) | None => Some(&self.data),
@@ -671,6 +690,66 @@ impl Project {
         &mut self.exports
     }
 
+    /// Checks the project for structural problems without executing it.
+    ///
+    /// Returns every issue found (empty means the project is structurally
+    /// sound). Validation mirrors execution order: an asset is defined by an
+    /// import or by the outputs of an earlier step, so use-before-define is
+    /// reported the same way as a completely unknown id.
+    ///
+    /// This is intended for edit-time feedback in hosts; [`Project::run`]
+    /// performs its own (coarser) checks at execution time.
+    pub fn validate(&self) -> Vec<ValidationIssue> {
+        let mut issues = Vec::new();
+        let mut defined: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
+        for import in &self.imports {
+            if !defined.insert(import.id.as_str()) {
+                issues.push(ValidationIssue::DuplicateAssetId {
+                    id: import.id.clone(),
+                });
+            }
+        }
+
+        for (step_index, step) in self.timeline.iter().enumerate() {
+            if !defined.contains(step.operator_id.as_str()) {
+                issues.push(ValidationIssue::UnresolvedOperator {
+                    step_index,
+                    operator_id: step.operator_id.clone(),
+                });
+            }
+            for (input_index, input) in step.inputs.iter().enumerate() {
+                if let ExecutionInput::AssetRef(id) = input
+                    && !defined.contains(id.as_str())
+                {
+                    issues.push(ValidationIssue::UnresolvedInput {
+                        step_index,
+                        operator_id: step.operator_id.clone(),
+                        input_index,
+                        id: id.clone(),
+                    });
+                }
+            }
+            for output in &step.outputs {
+                if !defined.insert(output.as_str()) {
+                    issues.push(ValidationIssue::DuplicateAssetId { id: output.clone() });
+                }
+            }
+        }
+
+        let mut exported: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for id in &self.exports {
+            if !defined.contains(id.as_str()) {
+                issues.push(ValidationIssue::UnknownExport { id: id.clone() });
+            }
+            if !exported.insert(id.as_str()) {
+                issues.push(ValidationIssue::DuplicateExport { id: id.clone() });
+            }
+        }
+
+        issues
+    }
+
     /// Runs the project and returns exported assets.
     ///
     /// The executor is type-agnostic: no type enforcement at execution time.
@@ -763,7 +842,16 @@ impl Project {
             }
         }
 
-        // Collect exports
+        // Collect exports. Duplicates are rejected up front so the second
+        // occurrence doesn't surface as a misleading NoSuchAssetId (exports
+        // are removed from the environment as they are collected).
+        let mut export_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for export_id in &self.exports {
+            if !export_ids.insert(export_id.as_str()) {
+                return Err(ExecutionError::DuplicateExport(export_id.clone()));
+            }
+        }
+
         let mut exported = Vec::new();
         for export_id in &self.exports {
             let asset = env
@@ -831,9 +919,131 @@ mod tests {
         let mut env = Environment::new();
         let err = project.run(&mut env).unwrap_err();
         match err {
-            ExecutionError::NoSuchAssetId(id) => assert_eq!(id, "a"),
-            other => panic!("expected NoSuchAssetId, got: {other:?}"),
+            ExecutionError::DuplicateExport(id) => assert_eq!(id, "a"),
+            other => panic!("expected DuplicateExport, got: {other:?}"),
         }
+    }
+
+    fn step(operator_id: &str, inputs: &[&str], outputs: &[&str]) -> ExecutionStep {
+        ExecutionStep {
+            operator_id: operator_id.to_string(),
+            inputs: inputs
+                .iter()
+                .map(|id| ExecutionInput::AssetRef(id.to_string()))
+                .collect(),
+            outputs: outputs.iter().map(|id| id.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn validate_accepts_a_sound_project() {
+        let project = Project {
+            version: 2,
+            imports: vec![
+                ImportedAsset::model("m".to_string(), vec![1]),
+                ImportedAsset::operator("op".to_string(), vec![2]),
+            ],
+            timeline: vec![
+                step("op", &["m"], &["a"]),
+                step("op", &["a"], &["b"]), // chained: consumes an earlier output
+            ],
+            exports: vec!["b".to_string()],
+        };
+        assert_eq!(project.validate(), vec![]);
+    }
+
+    #[test]
+    fn validate_reports_unresolved_and_use_before_define() {
+        let project = Project {
+            version: 2,
+            imports: vec![ImportedAsset::operator("op".to_string(), vec![1])],
+            timeline: vec![
+                step("op", &["later", "missing"], &["a"]), // "later" defined by step 1
+                step("op", &[], &["later"]),
+            ],
+            exports: vec![],
+        };
+        let issues = project.validate();
+        assert_eq!(
+            issues,
+            vec![
+                ValidationIssue::UnresolvedInput {
+                    step_index: 0,
+                    operator_id: "op".to_string(),
+                    input_index: 0,
+                    id: "later".to_string(),
+                },
+                ValidationIssue::UnresolvedInput {
+                    step_index: 0,
+                    operator_id: "op".to_string(),
+                    input_index: 1,
+                    id: "missing".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn validate_reports_unresolved_operator() {
+        let project = Project {
+            version: 2,
+            imports: vec![],
+            timeline: vec![step("ghost", &[], &["a"])],
+            exports: vec![],
+        };
+        assert_eq!(
+            project.validate(),
+            vec![ValidationIssue::UnresolvedOperator {
+                step_index: 0,
+                operator_id: "ghost".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn validate_reports_duplicate_asset_ids() {
+        let project = Project {
+            version: 2,
+            imports: vec![
+                ImportedAsset::model("m".to_string(), vec![1]),
+                ImportedAsset::model("m".to_string(), vec![2]),
+                ImportedAsset::operator("op".to_string(), vec![3]),
+            ],
+            timeline: vec![step("op", &[], &["m"])], // shadows the import too
+            exports: vec![],
+        };
+        assert_eq!(
+            project.validate(),
+            vec![
+                ValidationIssue::DuplicateAssetId {
+                    id: "m".to_string()
+                },
+                ValidationIssue::DuplicateAssetId {
+                    id: "m".to_string()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn validate_reports_export_problems() {
+        let project = Project {
+            version: 2,
+            imports: vec![ImportedAsset::model("m".to_string(), vec![1])],
+            timeline: vec![],
+            exports: vec!["m".to_string(), "m".to_string(), "ghost".to_string()],
+        };
+        assert_eq!(
+            project.validate(),
+            vec![
+                ValidationIssue::DuplicateExport {
+                    id: "m".to_string()
+                },
+                ValidationIssue::UnknownExport {
+                    id: "ghost".to_string()
+                },
+            ]
+        );
     }
 
     #[test]

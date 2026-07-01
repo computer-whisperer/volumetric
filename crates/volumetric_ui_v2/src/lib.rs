@@ -729,8 +729,27 @@ impl VolumetricUiV2 {
 
     /// Host hook: consumes a pending run request queued by the UI (a Run click
     /// or, when enabled, an auto-rebuild after a project edit).
+    ///
+    /// A structurally invalid project never dispatches: the request is dropped
+    /// and the validation issues land where a mid-run failure would, so the
+    /// user sees "step 2 references 'foo'..." instead of a doomed background
+    /// run's NoSuchAssetId.
     pub(crate) fn take_pending_run(&mut self) -> bool {
-        std::mem::take(&mut self.pending_run)
+        if !std::mem::take(&mut self.pending_run) {
+            return false;
+        }
+        let issues = self.project.validate();
+        if issues.is_empty() {
+            return true;
+        }
+        let summary = issues
+            .iter()
+            .map(|issue| issue.to_string())
+            .collect::<Vec<_>>()
+            .join("; ");
+        self.last_run_error = Some(format!("project is invalid: {summary}"));
+        self.status = "run blocked: project is invalid".to_string();
+        false
     }
 
     /// Host hook: consumes a pending cancel request for the in-flight run.
@@ -3199,6 +3218,23 @@ mod tests {
         assert_eq!(summary.imports, 1);
         assert_eq!(summary.exports, 1);
         assert!(summary.selected_export.is_some());
+    }
+
+    #[test]
+    fn invalid_project_blocks_run_dispatch_with_diagnostics() {
+        let mut app = VolumetricUiV2::default();
+        // Break the project: export an id nothing defines.
+        app.project.exports_mut().push("ghost".to_string());
+
+        app.request_run();
+        assert!(!app.take_pending_run(), "invalid project must not dispatch");
+        let err = app.last_run_error.as_deref().expect("run error set");
+        assert!(err.contains("ghost"), "diagnostic names the bad id: {err}");
+
+        // A sound project still dispatches.
+        app.project.exports_mut().retain(|id| id != "ghost");
+        app.request_run();
+        assert!(app.take_pending_run());
     }
 
     #[test]
