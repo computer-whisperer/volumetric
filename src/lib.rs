@@ -102,6 +102,8 @@ pub enum ExecutionError {
     Wasmtime(String),
     #[error("WASM backend error: {0}")]
     WasmBackend(String),
+    #[error("Execution cancelled")]
+    Cancelled,
 }
 
 // =============================================================================
@@ -713,6 +715,23 @@ impl Project {
     /// The executor is type-agnostic: no type enforcement at execution time.
     #[cfg(any(feature = "native", feature = "web"))]
     pub fn run(&self, env: &mut Environment) -> Result<Vec<LoadedAsset>, ExecutionError> {
+        static NEVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        self.run_cancellable(env, &NEVER)
+    }
+
+    /// Runs the project, checking `cancel` before each timeline step.
+    ///
+    /// Cancellation is cooperative and coarse-grained: it takes effect between
+    /// operator invocations, not mid-operator (a single WASM operator call is
+    /// not interruptible). Returns [`ExecutionError::Cancelled`] if the flag is
+    /// set before a step begins.
+    #[cfg(any(feature = "native", feature = "web"))]
+    pub fn run_cancellable(
+        &self,
+        env: &mut Environment,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Vec<LoadedAsset>, ExecutionError> {
+        use std::sync::atomic::Ordering;
         use wasm::{OperatorExecutor, OperatorIo};
 
         // Load all imports into environment
@@ -727,6 +746,10 @@ impl Project {
 
         // Execute timeline steps
         for step in &self.timeline {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(ExecutionError::Cancelled);
+            }
+
             // Get operator bytes
             let op_data = env
                 .get(&step.operator_id)

@@ -188,6 +188,16 @@ Damascene widgets that should map well:
 - The v2 crate now depends on the published `damascene-{core,wgpu,winit-wgpu}`
   crates from crates.io, so CI no longer needs a sibling checkout of the
   Damascene repo.
+- Project execution is now asynchronous. A single host-owned `BackgroundWorker`
+  thread serially runs project execution and preview meshing, coalescing jobs
+  per kind so bursts of edits collapse to one rebuild. The app no longer
+  executes inline: a Run click (or, when the auto-rebuild toggle is on, any
+  project edit) queues a run that the host dispatches and drains per frame.
+  Cancellation is cooperative (`Project::run_cancellable` checks a flag between
+  timeline steps) and generation-tagged results discard superseded/cancelled
+  runs. Run status, Run/Cancel, and the auto-rebuild toggle are surfaced in the
+  shell. Not yet done: keeping the stale preview visible during an auto-rebuild
+  (the viewport briefly falls back to the test scene on edit).
 
 ### Slice 0: Dependency Update
 

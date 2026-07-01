@@ -5,9 +5,7 @@
 
 use std::sync::Arc;
 
-use volumetric::{
-    AssetTypeHint, Environment, ExecutionInput, LoadedAsset, Project, adaptive_surface_nets_2,
-};
+use volumetric::{AssetTypeHint, ExecutionInput, LoadedAsset, Project, adaptive_surface_nets_2};
 use volumetric_renderer::CameraControlScheme;
 
 use damascene_core::prelude::*;
@@ -19,6 +17,8 @@ pub const ADD_MODEL_KEY: &str = "action:add-model";
 pub const ADD_OPERATOR_KEY: &str = "action:add-operator";
 pub const NEW_PROJECT_KEY: &str = "action:new-project";
 pub const RUN_PROJECT_KEY: &str = "action:run-project";
+pub const CANCEL_RUN_KEY: &str = "action:cancel-run";
+pub const TOGGLE_AUTO_REBUILD_KEY: &str = "action:toggle-auto-rebuild";
 pub const TOGGLE_GRID_KEY: &str = "viewport:toggle-grid";
 pub const TOGGLE_SSAO_KEY: &str = "viewport:toggle-ssao";
 pub const FRAME_PREVIEW_KEY: &str = "viewport:frame-preview";
@@ -207,6 +207,17 @@ pub enum ViewportCameraCommand {
     FramePreview,
 }
 
+/// Lifecycle of the (host-driven) asynchronous project run.
+///
+/// The app never executes the project itself; it requests a run and the host's
+/// background worker reports back through [`VolumetricUiV2::apply_run_result`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RunState {
+    #[default]
+    Idle,
+    Running,
+}
+
 impl PreviewBuildStatus {
     fn label(&self) -> String {
         match self {
@@ -243,6 +254,8 @@ pub struct ProjectSummary {
     pub last_run_elapsed_ms: Option<u128>,
     pub last_run_error: Option<String>,
     pub last_run_stale: bool,
+    pub run_state: RunState,
+    pub auto_rebuild: bool,
 }
 
 #[derive(Debug)]
@@ -261,6 +274,10 @@ pub struct VolumetricUiV2 {
     last_run_elapsed_ms: Option<u128>,
     last_run_error: Option<String>,
     last_run_stale: bool,
+    run_state: RunState,
+    auto_rebuild: bool,
+    pending_run: bool,
+    cancel_requested: bool,
     preview_build_status: PreviewBuildStatus,
     pending_camera_command: Option<ViewportCameraCommand>,
     viewport_texture: Option<AppTexture>,
@@ -269,34 +286,15 @@ pub struct VolumetricUiV2 {
 
 impl Default for VolumetricUiV2 {
     fn default() -> Self {
-        let mut app = Self {
-            project: Project::new(),
-            selected_model: volumetric_assets::models().first().map(|asset| asset.name),
-            selected_operator: volumetric_assets::operators()
-                .first()
-                .map(|asset| asset.name),
-            selected_export: None,
-            selected_project_item: None,
-            render_mode: PreviewRenderMode::AdaptiveSurfaceNets2,
-            preview_resolution: 64,
-            camera_control_scheme: CameraControlScheme::default(),
-            show_grid: true,
-            ssao: true,
-            runtime_assets: Vec::new(),
-            last_run_elapsed_ms: None,
-            last_run_error: None,
-            last_run_stale: false,
-            preview_build_status: PreviewBuildStatus::Idle,
-            pending_camera_command: None,
-            viewport_texture: None,
-            status: "idle".to_string(),
-        };
+        let mut app = Self::empty();
         app.add_selected_model();
         app
     }
 }
 
 impl VolumetricUiV2 {
+    /// Builds the app with no project contents. `default()` additionally seeds
+    /// the first bundled model.
     pub fn empty() -> Self {
         Self {
             project: Project::new(),
@@ -315,6 +313,10 @@ impl VolumetricUiV2 {
             last_run_elapsed_ms: None,
             last_run_error: None,
             last_run_stale: false,
+            run_state: RunState::Idle,
+            auto_rebuild: false,
+            pending_run: false,
+            cancel_requested: false,
             preview_build_status: PreviewBuildStatus::Idle,
             pending_camera_command: None,
             viewport_texture: None,
@@ -372,6 +374,75 @@ impl VolumetricUiV2 {
         self.viewport_texture = Some(texture);
     }
 
+    pub fn run_state(&self) -> RunState {
+        self.run_state
+    }
+
+    pub fn auto_rebuild(&self) -> bool {
+        self.auto_rebuild
+    }
+
+    /// Host hook: consumes a pending run request queued by the UI (a Run click
+    /// or, when enabled, an auto-rebuild after a project edit).
+    pub(crate) fn take_pending_run(&mut self) -> bool {
+        std::mem::take(&mut self.pending_run)
+    }
+
+    /// Host hook: consumes a pending cancel request for the in-flight run.
+    pub(crate) fn take_cancel_request(&mut self) -> bool {
+        std::mem::take(&mut self.cancel_requested)
+    }
+
+    pub(crate) fn set_run_state(&mut self, state: RunState) {
+        self.run_state = state;
+        if state == RunState::Running {
+            self.status = "running project".to_string();
+        }
+    }
+
+    /// Host hook: the in-flight run was cancelled. Its (abandoned) result, if it
+    /// still arrives, is discarded by generation on the host side.
+    pub(crate) fn on_run_cancelled(&mut self) {
+        self.run_state = RunState::Idle;
+        self.last_run_stale = true;
+        self.status = "run cancelled".to_string();
+    }
+
+    /// Host hook: apply the result of a completed background project run.
+    pub(crate) fn apply_run_result(
+        &mut self,
+        result: Result<Vec<LoadedAsset>, String>,
+        elapsed_ms: u128,
+    ) {
+        self.run_state = RunState::Idle;
+        self.last_run_elapsed_ms = Some(elapsed_ms);
+        match result {
+            Ok(assets) => {
+                self.last_run_error = None;
+                self.last_run_stale = false;
+                self.runtime_assets = assets;
+
+                if self.selected_runtime_asset().is_none() {
+                    self.selected_export = self
+                        .runtime_assets
+                        .first()
+                        .map(|asset| asset.id().to_string());
+                }
+
+                self.status = format!(
+                    "ran project: {} exports in {elapsed_ms}ms",
+                    self.runtime_assets.len()
+                );
+            }
+            Err(err) => {
+                self.runtime_assets.clear();
+                self.last_run_error = Some(err.clone());
+                self.last_run_stale = true;
+                self.status = format!("project run failed: {err}");
+            }
+        }
+    }
+
     pub fn summary(&self) -> ProjectSummary {
         ProjectSummary {
             imports: self.project.imports().len(),
@@ -399,6 +470,8 @@ impl VolumetricUiV2 {
             last_run_elapsed_ms: self.last_run_elapsed_ms,
             last_run_error: self.last_run_error.clone(),
             last_run_stale: self.last_run_stale,
+            run_state: self.run_state,
+            auto_rebuild: self.auto_rebuild,
         }
     }
 
@@ -407,6 +480,15 @@ impl VolumetricUiV2 {
         self.last_run_elapsed_ms = None;
         self.last_run_error = None;
         self.last_run_stale = true;
+        if self.auto_rebuild {
+            self.pending_run = true;
+        }
+    }
+
+    /// Queues an asynchronous project run for the host to pick up.
+    fn request_run(&mut self) {
+        self.pending_run = true;
+        self.status = "run queued".to_string();
     }
 
     fn select_model(&mut self, name: &str) {
@@ -629,38 +711,18 @@ impl VolumetricUiV2 {
         self.status = format!("exporting {asset_id}");
     }
 
+    /// Executes the project synchronously and applies the result. Production
+    /// runs go through the host's background worker; this blocking path exists
+    /// so tests can exercise execution without a host.
+    #[cfg(test)]
     fn run_project(&mut self) {
+        self.pending_run = false;
         let start = std::time::Instant::now();
-        let mut env = Environment::new();
-
-        match self.project.run(&mut env) {
-            Ok(assets) => {
-                self.last_run_elapsed_ms = Some(start.elapsed().as_millis());
-                self.last_run_error = None;
-                self.last_run_stale = false;
-                self.runtime_assets = assets;
-
-                if self.selected_runtime_asset().is_none() {
-                    self.selected_export = self
-                        .runtime_assets
-                        .first()
-                        .map(|asset| asset.id().to_string());
-                }
-
-                self.status = format!(
-                    "ran project: {} exports in {}ms",
-                    self.runtime_assets.len(),
-                    self.last_run_elapsed_ms.unwrap_or_default()
-                );
-            }
-            Err(err) => {
-                self.runtime_assets.clear();
-                self.last_run_elapsed_ms = Some(start.elapsed().as_millis());
-                self.last_run_error = Some(err.to_string());
-                self.last_run_stale = true;
-                self.status = format!("project run failed: {err}");
-            }
-        }
+        let result = self
+            .project
+            .run(&mut volumetric::Environment::new())
+            .map_err(|err| err.to_string());
+        self.apply_run_result(result, start.elapsed().as_millis());
     }
 
     fn set_render_mode(&mut self, mode: PreviewRenderMode) {
@@ -705,7 +767,23 @@ impl App for VolumetricUiV2 {
         }
 
         if event.is_click_or_activate(RUN_PROJECT_KEY) {
-            self.run_project();
+            self.request_run();
+            return;
+        }
+
+        if event.is_click_or_activate(CANCEL_RUN_KEY) {
+            self.cancel_requested = true;
+            self.status = "cancelling run".to_string();
+            return;
+        }
+
+        if event.is_click_or_activate(TOGGLE_AUTO_REBUILD_KEY) {
+            self.auto_rebuild = !self.auto_rebuild;
+            self.status = if self.auto_rebuild {
+                "auto-rebuild on".to_string()
+            } else {
+                "auto-rebuild off".to_string()
+            };
             return;
         }
 
@@ -834,11 +912,7 @@ fn left_sidebar(app: &VolumetricUiV2) -> El {
                 .secondary()
                 .xsmall()
                 .width(Size::Fill(1.0)),
-            button_with_icon("refresh-cw", "Run")
-                .primary()
-                .xsmall()
-                .width(Size::Fill(1.0))
-                .key(RUN_PROJECT_KEY),
+            run_control(app, true),
         ]),
         scroll([
             sidebar_group([
@@ -884,6 +958,7 @@ fn viewport_workspace(app: &VolumetricUiV2) -> El {
             ])
             .gap(tokens::SPACE_1)
             .width(Size::Fill(1.0)),
+            run_status_chip(app),
             preview_status_chip(app),
             badge("Damascene").secondary().xsmall(),
             badge("wgpu 29").secondary().xsmall(),
@@ -922,10 +997,7 @@ fn viewport_controls(app: &VolumetricUiV2) -> El {
             }))
             .gap(tokens::SPACE_1),
             spacer(),
-            button_with_icon("refresh-cw", "Run")
-                .primary()
-                .xsmall()
-                .key(RUN_PROJECT_KEY),
+            run_control(app, false),
             icon_button("refresh-cw")
                 .secondary()
                 .xsmall()
@@ -943,6 +1015,7 @@ fn viewport_controls(app: &VolumetricUiV2) -> El {
             )
             .gap(tokens::SPACE_1),
             spacer(),
+            toggle_chip("Auto", app.auto_rebuild, TOGGLE_AUTO_REBUILD_KEY),
             toggle_chip("Grid", app.show_grid, TOGGLE_GRID_KEY),
             toggle_chip("SSAO", app.ssao, TOGGLE_SSAO_KEY),
         ])
@@ -983,6 +1056,46 @@ fn toggle_chip(label: &str, value: bool, key: &str) -> El {
         .gap(tokens::SPACE_1)
         .align(Align::Center)
         .height(Size::Fixed(24.0))
+}
+
+/// Run/Cancel button that reflects the async run lifecycle. While a run is in
+/// flight it becomes a Cancel action; otherwise it triggers a run request.
+fn run_control(app: &VolumetricUiV2, full_width: bool) -> El {
+    let button = match app.run_state() {
+        RunState::Running => button_with_icon("x", "Cancel")
+            .destructive()
+            .xsmall()
+            .key(CANCEL_RUN_KEY),
+        RunState::Idle => button_with_icon("refresh-cw", "Run")
+            .primary()
+            .xsmall()
+            .key(RUN_PROJECT_KEY),
+    };
+    if full_width {
+        button.width(Size::Fill(1.0))
+    } else {
+        button
+    }
+}
+
+fn run_status_chip(app: &VolumetricUiV2) -> El {
+    match app.run_state() {
+        RunState::Running => row([
+            spinner().width(Size::Fixed(14.0)).height(Size::Fixed(14.0)),
+            badge("running").info().xsmall(),
+        ])
+        .gap(tokens::SPACE_1)
+        .align(Align::Center),
+        RunState::Idle => {
+            if app.last_run_stale && !app.runtime_assets.is_empty() {
+                badge("stale").secondary().xsmall()
+            } else if let Some(ms) = app.last_run_elapsed_ms {
+                badge(format!("ran {ms}ms")).success().xsmall()
+            } else {
+                badge("not run").muted().xsmall()
+            }
+        }
+    }
 }
 
 fn viewport_status_bar(app: &VolumetricUiV2, summary: &ProjectSummary) -> El {
@@ -1794,7 +1907,7 @@ mod tests {
     #[test]
     fn run_project_action_materializes_runtime_exports() {
         let mut app = VolumetricUiV2::default();
-        dispatch(&mut app, UiEvent::synthetic_click(RUN_PROJECT_KEY));
+        app.run_project();
 
         let summary = app.summary();
         assert_eq!(summary.runtime_assets.len(), 1);
@@ -1810,7 +1923,7 @@ mod tests {
     #[test]
     fn preview_request_uses_selected_runtime_asset_and_controls() {
         let mut app = VolumetricUiV2::default();
-        dispatch(&mut app, UiEvent::synthetic_click(RUN_PROJECT_KEY));
+        app.run_project();
         dispatch(
             &mut app,
             UiEvent::synthetic_click("viewport:render-mode:asn2"),
@@ -1842,9 +1955,71 @@ mod tests {
     }
 
     #[test]
-    fn project_mutation_clears_runtime_exports() {
+    fn run_click_queues_a_run_request_without_executing() {
         let mut app = VolumetricUiV2::default();
         dispatch(&mut app, UiEvent::synthetic_click(RUN_PROJECT_KEY));
+
+        // The click only requests a run; execution happens on the host worker.
+        assert!(app.summary().runtime_assets.is_empty());
+        assert!(app.take_pending_run());
+        // The request is one-shot.
+        assert!(!app.take_pending_run());
+    }
+
+    #[test]
+    fn apply_run_result_materializes_exports_off_thread() {
+        let mut app = VolumetricUiV2::default();
+        dispatch(&mut app, UiEvent::synthetic_click(RUN_PROJECT_KEY));
+        assert!(app.take_pending_run());
+        app.set_run_state(RunState::Running);
+        assert_eq!(app.run_state(), RunState::Running);
+
+        // Simulate the worker executing and reporting back.
+        let assets = app
+            .project()
+            .run(&mut volumetric::Environment::new())
+            .expect("project run");
+        app.apply_run_result(Ok(assets), 42);
+
+        let summary = app.summary();
+        assert_eq!(summary.run_state, RunState::Idle);
+        assert_eq!(summary.runtime_assets.len(), 1);
+        assert_eq!(summary.last_run_elapsed_ms, Some(42));
+        assert!(!summary.last_run_stale);
+    }
+
+    #[test]
+    fn cancel_click_requests_cancellation() {
+        let mut app = VolumetricUiV2::default();
+        app.set_run_state(RunState::Running);
+        dispatch(&mut app, UiEvent::synthetic_click(CANCEL_RUN_KEY));
+
+        assert!(app.take_cancel_request());
+        assert!(!app.take_cancel_request());
+
+        app.on_run_cancelled();
+        assert_eq!(app.run_state(), RunState::Idle);
+        assert!(app.summary().last_run_stale);
+    }
+
+    #[test]
+    fn auto_rebuild_queues_a_run_on_project_edit() {
+        let mut app = VolumetricUiV2::default();
+        assert!(!app.auto_rebuild());
+        // Editing without auto-rebuild does not queue a run.
+        dispatch(&mut app, UiEvent::synthetic_click(ADD_MODEL_KEY));
+        assert!(!app.take_pending_run());
+
+        dispatch(&mut app, UiEvent::synthetic_click(TOGGLE_AUTO_REBUILD_KEY));
+        assert!(app.auto_rebuild());
+        dispatch(&mut app, UiEvent::synthetic_click(ADD_MODEL_KEY));
+        assert!(app.take_pending_run());
+    }
+
+    #[test]
+    fn project_mutation_clears_runtime_exports() {
+        let mut app = VolumetricUiV2::default();
+        app.run_project();
         dispatch(&mut app, UiEvent::synthetic_click(ADD_MODEL_KEY));
 
         let summary = app.summary();

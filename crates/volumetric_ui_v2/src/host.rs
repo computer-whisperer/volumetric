@@ -1,5 +1,6 @@
 use std::sync::{
     Arc,
+    atomic::{AtomicBool, Ordering},
     mpsc::{self, Receiver, Sender},
 };
 use std::thread;
@@ -16,7 +17,7 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowId};
 
 use crate::{
-    PreviewBuildStatus, PreviewMeshPlan, PreviewRenderMode, PreviewRequest, VIEWPORT_KEY,
+    PreviewBuildStatus, PreviewMeshPlan, PreviewRenderMode, PreviewRequest, RunState, VIEWPORT_KEY,
     ViewportCameraCommand, VolumetricUiV2,
 };
 
@@ -38,6 +39,9 @@ pub fn run(
         last_viewport_rect: None,
         viewport_buttons: ViewportPointerButtons::default(),
         last_camera_pointer: None,
+        worker: BackgroundWorker::new(),
+        run_generation: 0,
+        active_run: None,
     };
     event_loop.run_app(&mut host)?;
     Ok(())
@@ -55,6 +59,14 @@ struct Host {
     last_viewport_rect: Option<Rect>,
     viewport_buttons: ViewportPointerButtons,
     last_camera_pointer: Option<(f32, f32)>,
+    /// Shared worker thread for project execution and preview meshing.
+    worker: BackgroundWorker,
+    /// Monotonic id for the most recently dispatched project run. Results whose
+    /// generation is older than the active run are discarded (superseded or
+    /// cancelled).
+    run_generation: u64,
+    /// The in-flight run's generation and its cooperative cancel flag.
+    active_run: Option<(u64, Arc<AtomicBool>)>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -372,11 +384,58 @@ impl Host {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
+        // Drain completed background work and route it to the app / viewport.
+        for result in self.worker.drain_results() {
+            match result {
+                BackgroundResult::ProjectComplete {
+                    generation,
+                    result,
+                    elapsed_ms,
+                } => {
+                    if self.active_run.as_ref().map(|(g, _)| *g) == Some(generation) {
+                        self.active_run = None;
+                        self.app.apply_run_result(result, elapsed_ms);
+                    }
+                    // Otherwise the run was superseded or cancelled; discard it.
+                }
+                BackgroundResult::PreviewComplete(preview) => {
+                    gfx.viewport_renderer.accept_preview_result(preview);
+                }
+            }
+        }
+
+        // Honor a cancel request for the in-flight run: signal the worker and
+        // bump the generation so its (abandoned) result is ignored on arrival.
+        if self.app.take_cancel_request() {
+            if let Some((_, cancel)) = self.active_run.take() {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            self.run_generation += 1;
+            self.app.on_run_cancelled();
+        }
+
+        // Dispatch a queued run to the worker.
+        if self.app.take_pending_run() {
+            self.run_generation += 1;
+            let generation = self.run_generation;
+            let cancel = Arc::new(AtomicBool::new(false));
+            self.active_run = Some((generation, cancel.clone()));
+            self.app.set_run_state(RunState::Running);
+            self.worker.send(BackgroundJob::RunProject {
+                generation,
+                project: self.app.project().clone(),
+                cancel,
+            });
+        }
+
         let preview_request = self.app.preview_request();
-        let preview_status = gfx
+        let (preview_status, preview_job) = gfx
             .viewport_renderer
             .sync_preview_request(preview_request.as_ref());
         self.app.set_preview_build_status(preview_status);
+        if let Some(job) = preview_job {
+            self.worker.send(BackgroundJob::BuildPreview(job));
+        }
         if let Some(command) = self.app.take_camera_command() {
             gfx.viewport_renderer.apply_camera_command(command);
         }
@@ -447,7 +506,11 @@ impl Host {
         gfx.queue.submit(Some(encoder.finish()));
         frame.present();
 
-        if prepare.needs_redraw || viewport_resized || gfx.viewport_renderer.has_pending_preview() {
+        if prepare.needs_redraw
+            || viewport_resized
+            || gfx.viewport_renderer.has_pending_preview()
+            || self.active_run.is_some()
+        {
             gfx.window.request_redraw();
         }
     }
@@ -458,7 +521,6 @@ struct ViewportRenderer {
     target: ViewportTarget,
     surface_format: wgpu::TextureFormat,
     scene_cache: Option<PreviewSceneCache>,
-    preview_worker: PreviewWorker,
     pending_preview_key: Option<PreviewSceneKey>,
     failed_preview: Option<(PreviewSceneKey, String)>,
     pending_frame_preview: bool,
@@ -487,7 +549,6 @@ impl ViewportRenderer {
             target,
             surface_format: format,
             scene_cache: None,
-            preview_worker: PreviewWorker::new(),
             pending_preview_key: None,
             failed_preview: None,
             pending_frame_preview: false,
@@ -624,13 +685,18 @@ impl ViewportRenderer {
         self.pending_preview_key.is_some()
     }
 
-    fn sync_preview_request(&mut self, request: Option<&PreviewRequest>) -> PreviewBuildStatus {
-        self.drain_preview_results();
-
+    /// Decides the preview build status for the current request and, when a new
+    /// build is needed, returns the job for the host to enqueue on the shared
+    /// worker. (The host owns the worker so project runs and preview meshing
+    /// share one thread and one result channel.)
+    fn sync_preview_request(
+        &mut self,
+        request: Option<&PreviewRequest>,
+    ) -> (PreviewBuildStatus, Option<PreviewBuildJob>) {
         let Some(request) = request else {
             self.pending_preview_key = None;
             self.failed_preview = None;
-            return PreviewBuildStatus::Idle;
+            return (PreviewBuildStatus::Idle, None);
         };
 
         let key = PreviewSceneKey::from(request);
@@ -639,51 +705,55 @@ impl ViewportRenderer {
             .as_ref()
             .is_some_and(|cache| cache.key == key)
         {
-            return PreviewBuildStatus::Ready { label: key.label() };
+            return (PreviewBuildStatus::Ready { label: key.label() }, None);
         }
         if self.pending_preview_key.as_ref() == Some(&key) {
-            return PreviewBuildStatus::Building { label: key.label() };
+            return (PreviewBuildStatus::Building { label: key.label() }, None);
         }
         if let Some((failed_key, error)) = &self.failed_preview
             && failed_key == &key
         {
-            return PreviewBuildStatus::Failed {
-                label: key.label(),
-                error: error.clone(),
-            };
+            return (
+                PreviewBuildStatus::Failed {
+                    label: key.label(),
+                    error: error.clone(),
+                },
+                None,
+            );
         }
 
         self.failed_preview = None;
         self.pending_preview_key = Some(key.clone());
-        self.preview_worker.request(PreviewBuildJob {
+        let job = PreviewBuildJob {
             key: key.clone(),
             request: request.clone(),
-        });
-        PreviewBuildStatus::Building { label: key.label() }
+        };
+        (
+            PreviewBuildStatus::Building { label: key.label() },
+            Some(job),
+        )
     }
 
-    fn drain_preview_results(&mut self) {
-        for result in self.preview_worker.drain_results() {
-            if self.pending_preview_key.as_ref() != Some(&result.key) {
-                continue;
-            }
+    fn accept_preview_result(&mut self, result: PreviewBuildResult) {
+        if self.pending_preview_key.as_ref() != Some(&result.key) {
+            return;
+        }
 
-            self.pending_preview_key = None;
-            match result.result {
-                Ok(scene) => {
-                    self.failed_preview = None;
-                    self.camera = Some(scene.camera.clone());
-                    self.scene_cache = Some(PreviewSceneCache {
-                        key: result.key,
-                        scene,
-                    });
-                    if self.pending_frame_preview {
-                        self.frame_preview();
-                    }
+        self.pending_preview_key = None;
+        match result.result {
+            Ok(scene) => {
+                self.failed_preview = None;
+                self.camera = Some(scene.camera.clone());
+                self.scene_cache = Some(PreviewSceneCache {
+                    key: result.key,
+                    scene,
+                });
+                if self.pending_frame_preview {
+                    self.frame_preview();
                 }
-                Err(error) => {
-                    self.failed_preview = Some((result.key, error));
-                }
+            }
+            Err(error) => {
+                self.failed_preview = Some((result.key, error));
             }
         }
     }
@@ -825,37 +895,92 @@ struct PreviewBuildResult {
     result: Result<PreviewScene, String>,
 }
 
-struct PreviewWorker {
-    jobs: Sender<PreviewBuildJob>,
-    results: Receiver<PreviewBuildResult>,
+/// A unit of background work for [`BackgroundWorker`].
+enum BackgroundJob {
+    RunProject {
+        generation: u64,
+        project: volumetric::Project,
+        cancel: Arc<AtomicBool>,
+    },
+    BuildPreview(PreviewBuildJob),
 }
 
-impl PreviewWorker {
+/// A completed unit of background work.
+enum BackgroundResult {
+    ProjectComplete {
+        generation: u64,
+        result: Result<Vec<volumetric::LoadedAsset>, String>,
+        elapsed_ms: u128,
+    },
+    PreviewComplete(PreviewBuildResult),
+}
+
+/// A single worker thread that serially executes project runs and preview mesh
+/// builds. Jobs are coalesced per kind — only the newest queued run and the
+/// newest queued preview survive — so a burst of edits collapses to one rebuild.
+struct BackgroundWorker {
+    jobs: Sender<BackgroundJob>,
+    results: Receiver<BackgroundResult>,
+}
+
+impl BackgroundWorker {
     fn new() -> Self {
-        let (job_tx, job_rx) = mpsc::channel::<PreviewBuildJob>();
-        let (result_tx, result_rx) = mpsc::channel::<PreviewBuildResult>();
+        let (job_tx, job_rx) = mpsc::channel::<BackgroundJob>();
+        let (result_tx, result_rx) = mpsc::channel::<BackgroundResult>();
 
         thread::Builder::new()
-            .name("volumetric-preview-worker".to_string())
+            .name("volumetric-background-worker".to_string())
             .spawn(move || {
-                while let Ok(mut job) = job_rx.recv() {
-                    while let Ok(newer_job) = job_rx.try_recv() {
-                        job = newer_job;
+                let mut pending_run: Option<(u64, volumetric::Project, Arc<AtomicBool>)> = None;
+                let mut pending_preview: Option<PreviewBuildJob> = None;
+
+                loop {
+                    // Block for work only when nothing is already pending.
+                    if pending_run.is_none() && pending_preview.is_none() {
+                        match job_rx.recv() {
+                            Ok(job) => stash_job(&mut pending_run, &mut pending_preview, job),
+                            Err(_) => break,
+                        }
+                    }
+                    // Coalesce everything queued right now (newest of each kind wins).
+                    while let Ok(job) = job_rx.try_recv() {
+                        stash_job(&mut pending_run, &mut pending_preview, job);
                     }
 
-                    let result = build_preview_scene(&job.request);
-                    if result_tx
-                        .send(PreviewBuildResult {
-                            key: job.key,
-                            result,
-                        })
-                        .is_err()
-                    {
-                        break;
+                    // Run the project first so a following preview sees fresh assets.
+                    if let Some((generation, project, cancel)) = pending_run.take() {
+                        let start = std::time::Instant::now();
+                        let result = project
+                            .run_cancellable(&mut volumetric::Environment::new(), &cancel)
+                            .map_err(|err| err.to_string());
+                        let elapsed_ms = start.elapsed().as_millis();
+                        if result_tx
+                            .send(BackgroundResult::ProjectComplete {
+                                generation,
+                                result,
+                                elapsed_ms,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+
+                    if let Some(job) = pending_preview.take() {
+                        let result = build_preview_scene(&job.request);
+                        if result_tx
+                            .send(BackgroundResult::PreviewComplete(PreviewBuildResult {
+                                key: job.key,
+                                result,
+                            }))
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
                 }
             })
-            .expect("spawn preview worker");
+            .expect("spawn background worker");
 
         Self {
             jobs: job_tx,
@@ -863,16 +988,31 @@ impl PreviewWorker {
         }
     }
 
-    fn request(&self, job: PreviewBuildJob) {
+    fn send(&self, job: BackgroundJob) {
         let _ = self.jobs.send(job);
     }
 
-    fn drain_results(&self) -> Vec<PreviewBuildResult> {
+    fn drain_results(&self) -> Vec<BackgroundResult> {
         let mut results = Vec::new();
         while let Ok(result) = self.results.try_recv() {
             results.push(result);
         }
         results
+    }
+}
+
+fn stash_job(
+    run: &mut Option<(u64, volumetric::Project, Arc<AtomicBool>)>,
+    preview: &mut Option<PreviewBuildJob>,
+    job: BackgroundJob,
+) {
+    match job {
+        BackgroundJob::RunProject {
+            generation,
+            project,
+            cancel,
+        } => *run = Some((generation, project, cancel)),
+        BackgroundJob::BuildPreview(preview_job) => *preview = Some(preview_job),
     }
 }
 
@@ -1073,5 +1213,45 @@ fn srgb_to_linear(c: f64) -> f64 {
         c / 12.92
     } else {
         ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// End-to-end check that the shared worker executes a project off-thread and
+    /// reports the result back through the channel, tagged with its generation.
+    #[test]
+    fn background_worker_runs_project_off_thread() {
+        let worker = BackgroundWorker::new();
+        let project = VolumetricUiV2::default().project().clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        worker.send(BackgroundJob::RunProject {
+            generation: 7,
+            project,
+            cancel,
+        });
+
+        let mut completion = None;
+        for _ in 0..300 {
+            for result in worker.drain_results() {
+                if let BackgroundResult::ProjectComplete {
+                    generation, result, ..
+                } = result
+                {
+                    completion = Some((generation, result));
+                }
+            }
+            if completion.is_some() {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let (generation, result) = completion.expect("worker reported a project result");
+        assert_eq!(generation, 7);
+        let assets = result.expect("default project runs cleanly");
+        assert_eq!(assets.len(), 1);
     }
 }
