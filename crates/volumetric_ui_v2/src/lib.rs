@@ -4091,7 +4091,7 @@ mod tests {
             ExecutionInput::AssetRef(id) if id == "renamed_part"
         ));
         assert!(app.project().exports().iter().any(|e| e == "renamed_part"));
-        assert!(!app.project().exports().iter().any(|e| *e == o1));
+        assert!(!app.project().exports().contains(&o1));
         assert!(app.pinned_outputs.contains("renamed_part"));
         assert!(app.output_overrides.contains_key("renamed_part"));
         assert!(app.summary().last_run_stale);
