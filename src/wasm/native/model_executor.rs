@@ -9,6 +9,7 @@ use wasmtime::{Instance, Memory, Store, TypedFunc};
 ///
 /// Models use the N-dimensional ABI:
 /// - `get_dimensions() -> u32`: Returns number of dimensions
+/// - `get_io_ptr() -> i32`: Returns the model-owned IO buffer (>= 2n f64s)
 /// - `get_bounds(out_ptr: i32)`: Writes 2n f64 values (interleaved min/max)
 /// - `sample(pos_ptr: i32) -> f32`: Reads n f64 values, returns density
 /// - `memory` export required
@@ -16,15 +17,10 @@ pub struct NativeModelExecutor {
     store: Store<()>,
     memory: Memory,
     dimensions: u32,
+    io_ptr: i32,
     get_bounds: TypedFunc<i32, ()>,
     sample: TypedFunc<i32, f32>,
 }
-
-/// Memory buffer offsets for N-dimensional ABI.
-/// The position offset must be nonzero: address 0 is a null pointer to the
-/// model's Rust code, and debug builds trap on null-pointer dereference.
-const POS_BUFFER_OFFSET: i32 = 8;
-const BOUNDS_BUFFER_OFFSET: i32 = 256;
 
 impl NativeModelExecutor {
     /// Create a new executor from WASM bytes.
@@ -44,6 +40,10 @@ impl NativeModelExecutor {
             .get_typed_func::<(), u32>(&mut store, "get_dimensions")
             .map_err(|e| WasmBackendError::MissingExport(format!("get_dimensions: {}", e)))?;
 
+        let get_io_ptr = instance
+            .get_typed_func::<(), i32>(&mut store, "get_io_ptr")
+            .map_err(|e| WasmBackendError::MissingExport(format!("get_io_ptr: {}", e)))?;
+
         let get_bounds = instance
             .get_typed_func::<i32, ()>(&mut store, "get_bounds")
             .map_err(|e| WasmBackendError::MissingExport(format!("get_bounds: {}", e)))?;
@@ -57,10 +57,17 @@ impl NativeModelExecutor {
             .call(&mut store, ())
             .map_err(|e| WasmBackendError::Execution(e.to_string()))?;
 
+        // Ask the model where its IO buffer lives
+        let io_ptr = get_io_ptr
+            .call(&mut store, ())
+            .map_err(|e| WasmBackendError::Execution(e.to_string()))?;
+        validate_io_ptr(io_ptr, dimensions, memory.data_size(&store))?;
+
         Ok(Self {
             store,
             memory,
             dimensions,
+            io_ptr,
             get_bounds,
             sample,
         })
@@ -73,9 +80,9 @@ impl NativeModelExecutor {
 
     /// Get the N-dimensional bounding box.
     pub fn get_bounds_nd(&mut self) -> Result<ModelBoundsNd, WasmBackendError> {
-        // Call get_bounds to write bounds to memory
+        // Call get_bounds to write bounds into the model's IO buffer
         self.get_bounds
-            .call(&mut self.store, BOUNDS_BUFFER_OFFSET)
+            .call(&mut self.store, self.io_ptr)
             .map_err(|e| WasmBackendError::Execution(e.to_string()))?;
 
         // Read bounds from memory (2n f64 values)
@@ -84,7 +91,7 @@ impl NativeModelExecutor {
         let mut bounds = vec![0.0f64; n * 2];
 
         let mem_data = self.memory.data(&self.store);
-        let offset = BOUNDS_BUFFER_OFFSET as usize;
+        let offset = self.io_ptr as usize;
         if offset + byte_count > mem_data.len() {
             return Err(WasmBackendError::Execution(
                 "bounds buffer exceeds memory".to_string(),
@@ -113,10 +120,10 @@ impl NativeModelExecutor {
             )));
         }
 
-        // Write position to memory
+        // Write position into the model's IO buffer
         {
             let mem_data = self.memory.data_mut(&mut self.store);
-            let offset = POS_BUFFER_OFFSET as usize;
+            let offset = self.io_ptr as usize;
             for (i, &val) in position.iter().enumerate() {
                 let start = offset + i * 8;
                 mem_data[start..start + 8].copy_from_slice(&val.to_le_bytes());
@@ -125,9 +132,28 @@ impl NativeModelExecutor {
 
         // Call sample
         self.sample
-            .call(&mut self.store, POS_BUFFER_OFFSET)
+            .call(&mut self.store, self.io_ptr)
             .map_err(|e| WasmBackendError::Execution(e.to_string()))
     }
+}
+
+/// Sanity-check the pointer a model returned from `get_io_ptr`.
+///
+/// The buffer must be nonzero (address 0 is a null pointer to the model's own
+/// Rust code) and hold `2 * dims` f64s within the exported memory.
+pub(crate) fn validate_io_ptr(
+    io_ptr: i32,
+    dimensions: u32,
+    memory_size: usize,
+) -> Result<(), WasmBackendError> {
+    let needed = dimensions as usize * 2 * 8;
+    if io_ptr <= 0 || (io_ptr as usize).saturating_add(needed) > memory_size {
+        return Err(WasmBackendError::Execution(format!(
+            "model returned invalid IO buffer pointer {io_ptr} \
+             (need {needed} bytes within {memory_size} bytes of memory)"
+        )));
+    }
+    Ok(())
 }
 
 impl ModelExecutor for NativeModelExecutor {

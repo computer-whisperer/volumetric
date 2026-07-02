@@ -12,7 +12,8 @@
 //!
 //! The JavaScript helper (wasm_helper.js) maintains a handle map of WASM instances
 //! and provides synchronous functions for creating instances and calling exports.
-//! Models use the N-dimensional ABI (get_dimensions/get_bounds/sample/memory).
+//! Models use the N-dimensional ABI
+//! (get_dimensions/get_io_ptr/get_bounds/sample/memory).
 
 mod js_bindings;
 

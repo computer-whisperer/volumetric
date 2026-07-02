@@ -4,15 +4,13 @@
 //
 // Models use the N-dimensional ABI:
 //   get_dimensions() -> u32
+//   get_io_ptr() -> i32        -- model-owned IO buffer (>= 2 * dims f64s)
 //   get_bounds(out_ptr: i32)   -- writes interleaved min/max f64 pairs
 //   sample(pos_ptr: i32) -> f32
 //   memory export
-
-// Memory buffer offsets, matching the native host convention. The position
-// offset must be nonzero: address 0 is a null pointer to the model's Rust
-// code, and debug builds trap on null-pointer dereference.
-const MODEL_POS_BUFFER_OFFSET = 8;
-const MODEL_BOUNDS_BUFFER_OFFSET = 256;
+//
+// The host writes positions into (and reads bounds from) the buffer the model
+// returns from get_io_ptr, so the model's own layout decides where it lives.
 
 // Map of handle -> WASM instance
 const wasmInstances = new Map();
@@ -25,13 +23,19 @@ window.wasmModelCreateSync = function(bytes) {
         const module = new WebAssembly.Module(bytes);
         const instance = new WebAssembly.Instance(module, {});
         const exports = instance.exports;
-        if (!exports.get_dimensions || !exports.get_bounds || !exports.sample || !exports.memory) {
+        if (!exports.get_dimensions || !exports.get_io_ptr || !exports.get_bounds
+            || !exports.sample || !exports.memory) {
             console.error("WASM model does not export the N-dimensional ABI");
             return 0;
         }
         const dimensions = exports.get_dimensions();
+        const ioPtr = exports.get_io_ptr();
+        if (ioPtr <= 0 || ioPtr + dimensions * 2 * 8 > exports.memory.buffer.byteLength) {
+            console.error("WASM model returned an invalid IO buffer pointer:", ioPtr);
+            return 0;
+        }
         const handle = nextHandle++;
-        wasmInstances.set(handle, { instance, module, dimensions });
+        wasmInstances.set(handle, { instance, module, dimensions, ioPtr });
         return handle;
     } catch (e) {
         console.error("Failed to create WASM model:", e);
@@ -60,10 +64,10 @@ window.wasmModelGetBounds = function(handle) {
 
     try {
         const exports = entry.instance.exports;
-        exports.get_bounds(MODEL_BOUNDS_BUFFER_OFFSET);
+        exports.get_bounds(entry.ioPtr);
         const view = new Float64Array(
             exports.memory.buffer,
-            MODEL_BOUNDS_BUFFER_OFFSET,
+            entry.ioPtr,
             entry.dimensions * 2,
         );
         // Copy: the view aliases WASM memory, which may move on growth
@@ -87,14 +91,14 @@ window.wasmModelSample = function(handle, x, y, z) {
         const exports = entry.instance.exports;
         const pos = new Float64Array(
             exports.memory.buffer,
-            MODEL_POS_BUFFER_OFFSET,
+            entry.ioPtr,
             entry.dimensions,
         );
         pos.fill(0);
         pos[0] = x;
         if (entry.dimensions > 1) pos[1] = y;
         if (entry.dimensions > 2) pos[2] = z;
-        return exports.sample(MODEL_POS_BUFFER_OFFSET);
+        return exports.sample(entry.ioPtr);
     } catch (e) {
         console.error("Failed to sample:", e);
         return NaN;

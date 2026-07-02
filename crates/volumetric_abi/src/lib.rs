@@ -17,6 +17,25 @@
 //! - `post_output(idx: i32, ptr: i32, len: i32)`
 //! - `post_error(ptr: i32, len: i32)` — optional; a run that posts an error
 //!   fails with the message instead of returning outputs
+//!
+//! # Model ABI (N-dimensional)
+//!
+//! Model WASM blobs (operator inputs/outputs of type `ModelWASM`) export:
+//! - `get_dimensions() -> u32` — number of dimensions `n`
+//! - `get_io_ptr() -> i32` — pointer to a model-owned IO scratch buffer of at
+//!   least `2 * n` f64s. Callers use it as the position buffer for `sample`
+//!   and the output buffer for `get_bounds`; the model's own layout decides
+//!   where it lives, so callers never write to assumed offsets.
+//! - `get_bounds(out_ptr: i32)` — writes `2 * n` interleaved f64s
+//!   `[min_0, max_0, min_1, max_1, ...]` at `out_ptr`
+//! - `sample(pos_ptr: i32) -> f32` — reads `n` f64s at `pos_ptr`, returns
+//!   density
+//! - `memory` — the linear memory the pointers above refer to
+//!
+//! `sample` and `get_bounds` accept any pointer to a large-enough region of
+//! the model's memory, and the model may clobber that region during the call
+//! (transform wrappers rewrite the position in place). A caller that needs
+//! the position after a call must keep its own copy.
 
 use std::sync::OnceLock;
 

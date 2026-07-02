@@ -4,8 +4,10 @@
 //!
 //! Generated Model ABI (N-dimensional):
 //! - `get_dimensions() -> u32`: Passed through from input model
+//! - `get_io_ptr() -> i32`: Passed through from input model
 //! - `get_bounds(out_ptr: i32)`: Wrapper that multiplies bounds by scale factors
-//! - `sample(pos_ptr: i32) -> f32`: Wrapper that divides position by scale factors
+//! - `sample(pos_ptr: i32) -> f32`: Wrapper that divides the position by the
+//!   scale factors in place (the ABI allows clobbering the position buffer)
 //! - `memory`: Passed through from input model
 //!
 //! Behavior:
@@ -38,8 +40,12 @@ impl Default for ScaleConfig {
 
 use volumetric_abi::host::{post_output, read_input, report_error};
 
-const ABI_FUNCTIONS_ND: &[&str] = &["get_dimensions", "get_bounds", "sample"];
-const SCRATCH_POS_OFFSET: i32 = 512;
+/// N-dimensional ABI function names. `get_dimensions` and `get_io_ptr` are
+/// passed through unchanged; `get_bounds` and `sample` get wrappers.
+const ABI_FUNCTIONS_ND: &[&str] = &["get_dimensions", "get_io_ptr", "get_bounds", "sample"];
+
+/// ABI functions the wrappers replace; the rest keep their exports.
+const WRAPPED_FUNCTIONS: &[&str] = &["get_bounds", "sample"];
 
 fn generate_hex_suffix() -> String {
     let mut state: u32 = 0xC0FFEE77;
@@ -87,95 +93,52 @@ fn transform_wasm(input_bytes: &[u8], cfg: ScaleConfig) -> Result<Vec<u8>, Strin
         }
     }
 
-    // Remove old exports except get_dimensions
+    if !renamed.contains_key("get_io_ptr") {
+        return Err(
+            "Input model missing `get_io_ptr` export; rebuild it against the \
+                    current N-dimensional ABI"
+                .to_string(),
+        );
+    }
+
+    // Remove the exports we wrap; memory, get_dimensions and get_io_ptr pass through
     for id in exports_to_remove {
         let export_name = module.exports.get(id).name.clone();
-        if export_name != "get_dimensions" {
+        if WRAPPED_FUNCTIONS.contains(&export_name.as_str()) {
             module.exports.delete(id);
         }
     }
 
-    // Rename original functions except get_dimensions
+    // Rename the wrapped functions by adding suffix
     for (name, func_id) in &renamed {
-        if name != "get_dimensions" {
+        if WRAPPED_FUNCTIONS.contains(&name.as_str()) {
             let new_name = format!("{}_{}", name, suffix);
             module.funcs.get_mut(*func_id).name = Some(new_name);
         }
     }
 
-    // sample(pos_ptr): call original with (x/sx, y/sy, z/sz)
+    // sample(pos_ptr): divide the position by the scale factors in place,
+    // then call the original with the same pointer
     if let Some(&orig) = renamed.get("sample") {
         let mut b = FunctionBuilder::new(&mut module.types, &[ValType::I32], &[ValType::F32]);
         let pos_ptr = module.locals.add(ValType::I32);
-        let x = module.locals.add(ValType::F64);
-        let y = module.locals.add(ValType::F64);
-        let z = module.locals.add(ValType::F64);
 
         use walrus::ir::BinaryOp::F64Div;
-        let mem_arg = walrus::ir::MemArg {
-            align: 3,
-            offset: 0,
-        };
-        let mem_arg_8 = walrus::ir::MemArg {
-            align: 3,
-            offset: 8,
-        };
-        let mem_arg_16 = walrus::ir::MemArg {
-            align: 3,
-            offset: 16,
-        };
 
-        // Load position from input
-        b.func_body()
-            .local_get(pos_ptr)
-            .load(memory_id, walrus::ir::LoadKind::F64, mem_arg)
-            .local_set(x);
-        b.func_body()
-            .local_get(pos_ptr)
-            .load(memory_id, walrus::ir::LoadKind::F64, mem_arg_8)
-            .local_set(y);
-        b.func_body()
-            .local_get(pos_ptr)
-            .load(memory_id, walrus::ir::LoadKind::F64, mem_arg_16)
-            .local_set(z);
+        // pos[i] /= s for each axis
+        for (offset, s) in [(0, cfg.sx), (8, cfg.sy), (16, cfg.sz)] {
+            let mem_arg = walrus::ir::MemArg { align: 3, offset };
+            b.func_body()
+                .local_get(pos_ptr)
+                .local_get(pos_ptr)
+                .load(memory_id, walrus::ir::LoadKind::F64, mem_arg)
+                .f64_const(s as f64)
+                .binop(F64Div)
+                .store(memory_id, walrus::ir::StoreKind::F64, mem_arg);
+        }
 
-        // Write scaled position to scratch buffer
-        let scratch_arg = walrus::ir::MemArg {
-            align: 3,
-            offset: 0,
-        };
-        let scratch_arg_8 = walrus::ir::MemArg {
-            align: 3,
-            offset: 8,
-        };
-        let scratch_arg_16 = walrus::ir::MemArg {
-            align: 3,
-            offset: 16,
-        };
-
-        b.func_body()
-            .i32_const(SCRATCH_POS_OFFSET)
-            .local_get(x)
-            .f64_const(cfg.sx as f64)
-            .binop(F64Div)
-            .store(memory_id, walrus::ir::StoreKind::F64, scratch_arg);
-
-        b.func_body()
-            .i32_const(SCRATCH_POS_OFFSET)
-            .local_get(y)
-            .f64_const(cfg.sy as f64)
-            .binop(F64Div)
-            .store(memory_id, walrus::ir::StoreKind::F64, scratch_arg_8);
-
-        b.func_body()
-            .i32_const(SCRATCH_POS_OFFSET)
-            .local_get(z)
-            .f64_const(cfg.sz as f64)
-            .binop(F64Div)
-            .store(memory_id, walrus::ir::StoreKind::F64, scratch_arg_16);
-
-        // Call original with scratch buffer
-        b.func_body().i32_const(SCRATCH_POS_OFFSET).call(orig);
+        // Call original with the transformed position
+        b.func_body().local_get(pos_ptr).call(orig);
 
         let fid = b.finish(vec![pos_ptr], &mut module.funcs);
         module.exports.add("sample", fid);

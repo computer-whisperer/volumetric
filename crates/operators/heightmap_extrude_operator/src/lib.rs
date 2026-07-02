@@ -4,6 +4,7 @@
 //!
 //! Generated Model ABI (N-dimensional):
 //! - `get_dimensions() -> u32`: Returns 3
+//! - `get_io_ptr() -> i32`: Returns the model-owned IO buffer (2n f64s)
 //! - `get_bounds(out_ptr: i32)`: Writes interleaved min/max bounds
 //! - `sample(pos_ptr: i32) -> f32`: Reads position from memory, returns density
 //! - `memory`: Linear memory export
@@ -111,9 +112,11 @@ fn parse_image_to_heightmap(image_data: &[u8]) -> Result<Heightmap, &'static str
 // ============================================================================
 
 // Memory layout constants
-// I/O buffer: 256 bytes reserved at start
+// I/O buffer: 256 bytes reserved at start (advertised via get_io_ptr, which
+// returns IO_PTR — nonzero so a null pointer never aliases the buffer)
 // Header: 2 × u32 (8) + 4 × f64 (32) = 40 bytes
 const IO_BUFFER_SIZE: u32 = 256;
+const IO_PTR: i32 = 8;
 const HEADER_OFFSET: u32 = IO_BUFFER_SIZE;
 const HEADER_SIZE: u32 = 40;
 const DATA_OFFSET: u32 = HEADER_OFFSET + HEADER_SIZE; // 296
@@ -126,11 +129,12 @@ const CONFIG_CLIP_OFFSET: u32 = HEADER_OFFSET + 32; // 288
 
 // Function indices
 const FN_GET_DIMENSIONS: u32 = 0;
-const FN_GET_BOUNDS: u32 = 1;
-const FN_SAMPLE: u32 = 2;
+const FN_GET_IO_PTR: u32 = 1;
+const FN_GET_BOUNDS: u32 = 2;
+const FN_SAMPLE: u32 = 3;
 
 // Type indices
-const TYPE_GET_DIMENSIONS: u32 = 0; // () -> i32
+const TYPE_GET_DIMENSIONS: u32 = 0; // () -> i32 (also used by get_io_ptr)
 const TYPE_GET_BOUNDS: u32 = 1; // (i32) -> ()
 const TYPE_SAMPLE: u32 = 2; // (i32) -> f32
 
@@ -161,6 +165,7 @@ fn generate_wasm(heightmap: &Heightmap, config: &HeightmapConfig) -> Vec<u8> {
     // Function section
     let mut funcs = FunctionSection::new();
     funcs.function(TYPE_GET_DIMENSIONS);
+    funcs.function(TYPE_GET_DIMENSIONS); // get_io_ptr shares () -> i32
     funcs.function(TYPE_GET_BOUNDS);
     funcs.function(TYPE_SAMPLE);
     module.section(&funcs);
@@ -180,6 +185,7 @@ fn generate_wasm(heightmap: &Heightmap, config: &HeightmapConfig) -> Vec<u8> {
     let mut exports = ExportSection::new();
     exports.export("memory", ExportKind::Memory, 0);
     exports.export("get_dimensions", ExportKind::Func, FN_GET_DIMENSIONS);
+    exports.export("get_io_ptr", ExportKind::Func, FN_GET_IO_PTR);
     exports.export("get_bounds", ExportKind::Func, FN_GET_BOUNDS);
     exports.export("sample", ExportKind::Func, FN_SAMPLE);
     module.section(&exports);
@@ -189,6 +195,9 @@ fn generate_wasm(heightmap: &Heightmap, config: &HeightmapConfig) -> Vec<u8> {
 
     // get_dimensions() -> 3
     code.function(&generate_get_dimensions_function());
+
+    // get_io_ptr() -> IO_PTR (the reserved low-memory IO region)
+    code.function(&generate_get_io_ptr_function());
 
     // get_bounds(out_ptr) - writes interleaved min/max
     // Centered origin: x spans [-width/2, +width/2], z spans [-depth/2, +depth/2]
@@ -239,6 +248,13 @@ fn serialize_data(heightmap: &Heightmap, config: &HeightmapConfig) -> Vec<u8> {
 fn generate_get_dimensions_function() -> Function {
     let mut f = Function::new([]);
     f.instruction(&Instruction::I32Const(3));
+    f.instruction(&Instruction::End);
+    f
+}
+
+fn generate_get_io_ptr_function() -> Function {
+    let mut f = Function::new([]);
+    f.instruction(&Instruction::I32Const(IO_PTR));
     f.instruction(&Instruction::End);
     f
 }

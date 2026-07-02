@@ -12,18 +12,12 @@ use wasmtime::{Engine, Instance, Memory, Module, Store, TypedFunc};
 /// Global counter for assigning unique IDs to samplers.
 static SAMPLER_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Memory buffer offset for position input.
-/// Must be nonzero: address 0 is a null pointer to the model's Rust code, and
-/// debug builds trap on null-pointer dereference.
-const POS_BUFFER_OFFSET: i32 = 8;
-/// Memory buffer offset for bounds output.
-const BOUNDS_BUFFER_OFFSET: i32 = 256;
-
 /// Thread-local WASM execution context.
 struct ThreadLocalContext {
     store: Store<()>,
     memory: Memory,
     dimensions: u32,
+    io_ptr: i32,
     sample: TypedFunc<i32, f32>,
 }
 
@@ -33,23 +27,31 @@ impl ThreadLocalContext {
         let instance = Instance::new(&mut store, module, &[]).ok()?;
 
         let memory = instance.get_memory(&mut store, "memory")?;
+        let get_io_ptr = instance
+            .get_typed_func::<(), i32>(&mut store, "get_io_ptr")
+            .ok()?;
         let sample = instance
             .get_typed_func::<i32, f32>(&mut store, "sample")
+            .ok()?;
+
+        let io_ptr = get_io_ptr.call(&mut store, ()).ok()?;
+        super::model_executor::validate_io_ptr(io_ptr, dimensions, memory.data_size(&store))
             .ok()?;
 
         Some(Self {
             store,
             memory,
             dimensions,
+            io_ptr,
             sample,
         })
     }
 
     fn sample(&mut self, x: f64, y: f64, z: f64) -> f32 {
-        // Write position to memory (pad with zeros for extra dimensions)
+        // Write position into the model's IO buffer (pad extra dims with zeros)
         {
             let mem_data = self.memory.data_mut(&mut self.store);
-            let offset = POS_BUFFER_OFFSET as usize;
+            let offset = self.io_ptr as usize;
 
             // Write x, y, z
             mem_data[offset..offset + 8].copy_from_slice(&x.to_le_bytes());
@@ -65,7 +67,7 @@ impl ThreadLocalContext {
 
         // Call sample
         self.sample
-            .call(&mut self.store, POS_BUFFER_OFFSET)
+            .call(&mut self.store, self.io_ptr)
             .unwrap_or(0.0)
     }
 }
@@ -124,6 +126,10 @@ impl NativeParallelSampler {
             .get_typed_func::<(), u32>(&mut store, "get_dimensions")
             .map_err(|e| WasmBackendError::MissingExport(format!("get_dimensions: {}", e)))?;
 
+        let get_io_ptr = instance
+            .get_typed_func::<(), i32>(&mut store, "get_io_ptr")
+            .map_err(|e| WasmBackendError::MissingExport(format!("get_io_ptr: {}", e)))?;
+
         let get_bounds = instance
             .get_typed_func::<i32, ()>(&mut store, "get_bounds")
             .map_err(|e| WasmBackendError::MissingExport(format!("get_bounds: {}", e)))?;
@@ -133,9 +139,15 @@ impl NativeParallelSampler {
             .call(&mut store, ())
             .map_err(|e| WasmBackendError::Execution(e.to_string()))?;
 
+        // Ask the model where its IO buffer lives
+        let io_ptr = get_io_ptr
+            .call(&mut store, ())
+            .map_err(|e| WasmBackendError::Execution(e.to_string()))?;
+        super::model_executor::validate_io_ptr(io_ptr, dimensions, memory.data_size(&store))?;
+
         // Get bounds
         get_bounds
-            .call(&mut store, BOUNDS_BUFFER_OFFSET)
+            .call(&mut store, io_ptr)
             .map_err(|e| WasmBackendError::Execution(e.to_string()))?;
 
         // Read bounds from memory
@@ -144,7 +156,7 @@ impl NativeParallelSampler {
         let mut bounds_vec = vec![0.0f64; n * 2];
 
         let mem_data = memory.data(&store);
-        let offset = BOUNDS_BUFFER_OFFSET as usize;
+        let offset = io_ptr as usize;
         if offset + byte_count > mem_data.len() {
             return Err(WasmBackendError::Execution(
                 "bounds buffer exceeds memory".to_string(),

@@ -4,6 +4,8 @@
 //!
 //! Generated Model ABI (N-dimensional):
 //! - `get_dimensions() -> u32`: Passed through from model A
+//! - `get_io_ptr() -> i32`: Passed through from model A (whose memory is the
+//!   exported one); B's buffer is obtained by calling B's own `get_io_ptr`
 //! - `get_bounds(out_ptr: i32)`: Combines bounds from both models based on operation
 //! - `sample(pos_ptr: i32) -> f32`: Combines densities from both models
 //! - `memory`: First memory from merged modules
@@ -61,11 +63,12 @@ impl From<BooleanOpConfig> for BooleanOp {
 
 use volumetric_abi::host::{post_output, read_input, report_error};
 
-const ABI_FUNCTIONS_ND: &[&str] = &["get_dimensions", "get_bounds", "sample"];
+const ABI_FUNCTIONS_ND: &[&str] = &["get_dimensions", "get_io_ptr", "get_bounds", "sample"];
 
 #[derive(Debug)]
 struct AbiExportsNd {
     get_dimensions: u32,
+    get_io_ptr: u32,
     get_bounds: u32,
     sample: u32,
     memory: u32,
@@ -108,6 +111,7 @@ fn parse_abi_exports_nd(wasm: &[u8]) -> Result<AbiExportsNd, String> {
 
     Ok(AbiExportsNd {
         get_dimensions: get_func("get_dimensions")?,
+        get_io_ptr: get_func("get_io_ptr")?,
         get_bounds: get_func("get_bounds")?,
         sample: get_func("sample")?,
         memory: get_mem("memory")?,
@@ -305,15 +309,14 @@ fn add_get_dimensions_wrapper(
     exports.export("get_dimensions", ExportKind::Func, func_index);
 }
 
-/// Scratch buffer offset for temporary bounds storage
-const SCRATCH_BOUNDS_OFFSET: i32 = 768;
-
 /// Add get_bounds wrapper that combines bounds from both models.
 ///
 /// The merged module keeps both models' memories, so each model's get_bounds
-/// writes into its *own* memory: A's bounds are read back from `a_mem_idx`,
-/// B's from `b_mem_idx`. The combined result is stored to `out_ptr` in A's
-/// memory, which is the module's exported memory.
+/// writes into its *own* memory. A shares the module's exported memory, so it
+/// writes straight to `out_ptr`; B writes into its own IO buffer (obtained by
+/// calling B's `get_io_ptr`, index `b_io_idx`) in `b_mem_idx`. The combined
+/// result is stored to `out_ptr` in A's memory.
+#[allow(clippy::too_many_arguments)]
 fn add_get_bounds_wrapper(
     types: &mut TypeSection,
     funcs: &mut FunctionSection,
@@ -321,6 +324,7 @@ fn add_get_bounds_wrapper(
     exports: &mut ExportSection,
     a_idx: u32,
     b_idx: u32,
+    b_io_idx: u32,
     op: BooleanOp,
     a_mem_idx: u32,
     b_mem_idx: u32,
@@ -329,47 +333,42 @@ fn add_get_bounds_wrapper(
     types.ty().function([ValType::I32], []);
     funcs.function(ty);
 
-    // Locals: out_ptr (param), min/max values for combining
+    // Locals: out_ptr (param 0), A's bounds (1-6), B's bounds (7-12), b_io (13)
     let locals = vec![
         (6, ValType::F64), // a_min_x, a_max_x, a_min_y, a_max_y, a_min_z, a_max_z
         (6, ValType::F64), // b_min_x, b_max_x, b_min_y, b_max_y, b_min_z, b_max_z
+        (1, ValType::I32), // B's IO buffer pointer
     ];
     let mut f = Function::new(locals);
 
-    // Call A's get_bounds to scratch area
-    f.instruction(&Instruction::I32Const(SCRATCH_BOUNDS_OFFSET));
+    // Call A's get_bounds directly into out_ptr (A's memory is exported)
+    f.instruction(&Instruction::LocalGet(0));
     f.instruction(&Instruction::Call(a_idx));
 
-    // Load A's bounds from scratch (A wrote into its own memory)
-    for i in 0..6 {
-        f.instruction(&Instruction::I32Const(SCRATCH_BOUNDS_OFFSET));
-        f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
-            offset: (i * 8) as u64,
-            align: 3,
-            memory_index: a_mem_idx,
-        }));
-        f.instruction(&Instruction::LocalSet(1 + i)); // locals 1-6 are A's bounds
-    }
-
-    if op == BooleanOp::Subtract {
-        // For subtract, use A's bounds only
+    if op != BooleanOp::Subtract {
+        // For subtract, A's bounds at out_ptr are already the answer.
+        // Otherwise load A's bounds into locals before overwriting out_ptr.
         for i in 0..6 {
-            f.instruction(&Instruction::LocalGet(0)); // out_ptr
-            f.instruction(&Instruction::LocalGet(1 + i)); // A's bound
-            f.instruction(&Instruction::F64Store(wasm_encoder::MemArg {
+            f.instruction(&Instruction::LocalGet(0));
+            f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
                 offset: (i * 8) as u64,
                 align: 3,
                 memory_index: a_mem_idx,
             }));
+            f.instruction(&Instruction::LocalSet(1 + i)); // locals 1-6 are A's bounds
         }
-    } else {
-        // Call B's get_bounds to scratch area
-        f.instruction(&Instruction::I32Const(SCRATCH_BOUNDS_OFFSET));
+
+        // b_io = B's get_io_ptr()
+        f.instruction(&Instruction::Call(b_io_idx));
+        f.instruction(&Instruction::LocalSet(13));
+
+        // Call B's get_bounds into B's own IO buffer
+        f.instruction(&Instruction::LocalGet(13));
         f.instruction(&Instruction::Call(b_idx));
 
-        // Load B's bounds from scratch (B wrote into its own memory)
+        // Load B's bounds (B wrote into its own memory)
         for i in 0..6 {
-            f.instruction(&Instruction::I32Const(SCRATCH_BOUNDS_OFFSET));
+            f.instruction(&Instruction::LocalGet(13));
             f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
                 offset: (i * 8) as u64,
                 align: 3,
@@ -409,18 +408,14 @@ fn add_get_bounds_wrapper(
     exports.export("get_bounds", ExportKind::Func, func_index);
 }
 
-/// Offset where B's copy of the sample position is written in B's memory.
-/// Matches the host convention for `sample(pos_ptr)` (position buffer at the
-/// bottom of linear memory). Must be nonzero: address 0 is a null pointer to
-/// the model's Rust code, and debug builds trap on null-pointer dereference.
-const POS_BUFFER_OFFSET: i32 = 8;
-
 /// Add sample wrapper that combines densities from both models.
 ///
 /// The caller writes the position into the module's exported memory (A's), so
 /// A's sample can read `pos_ptr` directly. B's code reads its *own* memory,
-/// so the wrapper first copies `dims * 8` bytes from A's memory at `pos_ptr`
-/// to B's memory at `POS_BUFFER_OFFSET`, then calls B with that offset.
+/// so the wrapper copies `dims * 8` bytes from A's memory at `pos_ptr` into
+/// B's IO buffer (obtained by calling B's `get_io_ptr`, index `b_io_idx`),
+/// then calls B with that pointer. The copy happens before calling A because
+/// the ABI allows a model's sample to clobber its position buffer.
 #[allow(clippy::too_many_arguments)]
 fn add_sample_wrapper(
     types: &mut TypeSection,
@@ -429,6 +424,7 @@ fn add_sample_wrapper(
     exports: &mut ExportSection,
     a_idx: u32,
     b_idx: u32,
+    b_io_idx: u32,
     a_dims_idx: u32,
     op: BooleanOp,
     a_mem_idx: u32,
@@ -438,8 +434,8 @@ fn add_sample_wrapper(
     types.ty().function([ValType::I32], [ValType::F32]);
     funcs.function(ty);
 
-    // Locals: pos_ptr (param 0), dims_bytes (1), i (2)
-    let mut f = Function::new([(2, ValType::I32)]);
+    // Locals: pos_ptr (param 0), dims_bytes (1), i (2), b_io (3)
+    let mut f = Function::new([(3, ValType::I32)]);
 
     // dims_bytes = get_dimensions() * 8
     f.instruction(&Instruction::Call(a_dims_idx));
@@ -447,8 +443,12 @@ fn add_sample_wrapper(
     f.instruction(&Instruction::I32Shl);
     f.instruction(&Instruction::LocalSet(1));
 
+    // b_io = B's get_io_ptr()
+    f.instruction(&Instruction::Call(b_io_idx));
+    f.instruction(&Instruction::LocalSet(3));
+
     // for (i = 0; i < dims_bytes; i += 8)
-    //     B_mem[POS_BUFFER_OFFSET + i] = A_mem[pos_ptr + i]
+    //     B_mem[b_io + i] = A_mem[pos_ptr + i]
     f.instruction(&Instruction::I32Const(0));
     f.instruction(&Instruction::LocalSet(2));
     f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
@@ -457,7 +457,7 @@ fn add_sample_wrapper(
     f.instruction(&Instruction::LocalGet(1));
     f.instruction(&Instruction::I32GeS);
     f.instruction(&Instruction::BrIf(1));
-    f.instruction(&Instruction::I32Const(POS_BUFFER_OFFSET));
+    f.instruction(&Instruction::LocalGet(3));
     f.instruction(&Instruction::LocalGet(2));
     f.instruction(&Instruction::I32Add); // dest address in B's memory
     f.instruction(&Instruction::LocalGet(0));
@@ -490,7 +490,7 @@ fn add_sample_wrapper(
 
     if op == BooleanOp::Subtract {
         // Call B's sample on the copied position
-        f.instruction(&Instruction::I32Const(POS_BUFFER_OFFSET));
+        f.instruction(&Instruction::LocalGet(3));
         f.instruction(&Instruction::Call(b_idx));
         f.instruction(&Instruction::F32Const(0.5.into()));
         f.instruction(&Instruction::F32Gt);
@@ -499,7 +499,7 @@ fn add_sample_wrapper(
         f.instruction(&Instruction::I32And);
     } else if op == BooleanOp::Union {
         // Call B's sample on the copied position
-        f.instruction(&Instruction::I32Const(POS_BUFFER_OFFSET));
+        f.instruction(&Instruction::LocalGet(3));
         f.instruction(&Instruction::Call(b_idx));
         f.instruction(&Instruction::F32Const(0.5.into()));
         f.instruction(&Instruction::F32Gt);
@@ -507,7 +507,7 @@ fn add_sample_wrapper(
         f.instruction(&Instruction::I32Or);
     } else {
         // Intersect: a && b
-        f.instruction(&Instruction::I32Const(POS_BUFFER_OFFSET));
+        f.instruction(&Instruction::LocalGet(3));
         f.instruction(&Instruction::Call(b_idx));
         f.instruction(&Instruction::F32Const(0.5.into()));
         f.instruction(&Instruction::F32Gt);
@@ -595,6 +595,10 @@ fn merge_models(a_wasm: &[u8], b_wasm: &[u8], op: BooleanOp) -> Result<Vec<u8>, 
         a_exports.get_dimensions,
     );
 
+    // The merged model's IO buffer is A's: A's memory is the exported one, so
+    // A's get_io_ptr already points where callers need to write positions.
+    exports.export("get_io_ptr", ExportKind::Func, a_exports.get_io_ptr);
+
     add_get_bounds_wrapper(
         &mut types,
         &mut funcs,
@@ -602,6 +606,7 @@ fn merge_models(a_wasm: &[u8], b_wasm: &[u8], op: BooleanOp) -> Result<Vec<u8>, 
         &mut exports,
         a_exports.get_bounds,
         b_exports.get_bounds + a_counts.funcs,
+        b_exports.get_io_ptr + a_counts.funcs,
         op,
         a_exports.memory,
         b_exports.memory + a_counts.memories,
@@ -614,6 +619,7 @@ fn merge_models(a_wasm: &[u8], b_wasm: &[u8], op: BooleanOp) -> Result<Vec<u8>, 
         &mut exports,
         a_exports.sample,
         b_exports.sample + a_counts.funcs,
+        b_exports.get_io_ptr + a_counts.funcs,
         a_exports.get_dimensions,
         op,
         a_exports.memory,

@@ -2,6 +2,7 @@
 //!
 //! This WASM module exports the N-dimensional model ABI:
 //! - `get_dimensions() -> u32`: Returns 3
+//! - `get_io_ptr() -> i32`: Returns the model-owned IO buffer (2n f64s)
 //! - `get_bounds(out_ptr: i32)`: Writes interleaved min/max bounds
 //! - `sample(pos_ptr: i32) -> f32`: Reads position, returns density
 //! - `memory`: Linear memory export
@@ -61,6 +62,16 @@ fn sdf_rounded_box(x: f64, y: f64, z: f64, bx: f64, by: f64, bz: f64, r: f64) ->
 #[unsafe(no_mangle)]
 pub extern "C" fn get_dimensions() -> u32 {
     3
+}
+
+/// Model-owned IO scratch buffer: the host writes sample positions here and
+/// reads bounds back from here. Must hold at least 2 * dims f64s.
+static mut IO_BUFFER: [f64; 6] = [0.0; 6];
+
+/// Returns a pointer to the model's IO buffer.
+#[unsafe(no_mangle)]
+pub extern "C" fn get_io_ptr() -> i32 {
+    (&raw mut IO_BUFFER) as i32
 }
 
 /// Writes the bounding box to memory at out_ptr.

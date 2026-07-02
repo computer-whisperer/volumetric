@@ -8,6 +8,7 @@
 //!
 //! Generated Model ABI:
 //! - `get_dimensions() -> u32`: Returns 3 (always 3D)
+//! - `get_io_ptr() -> i32`: Returns the model-owned IO buffer (2n f64s)
 //! - `get_bounds(out_ptr: i32)`: Writes 6 f64 values (min_x, max_x, min_y, max_y, min_z, max_z)
 //! - `sample(pos_ptr: i32) -> f32`: Reads position from memory, returns density
 //! - `memory`: Exported memory for position/bounds I/O
@@ -1712,6 +1713,18 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
         ib.i32_const(3); // Always 3 dimensions
         let fid = fb.finish(vec![], &mut module.funcs);
         module.exports.add("get_dimensions", fid);
+    }
+
+    // Generate and export get_io_ptr() -> i32
+    // The compiled Lua functions keep no state in linear memory, so the IO
+    // buffer is the start of the page (offset 8: nonzero so it never aliases
+    // a null pointer).
+    {
+        let mut fb = FunctionBuilder::new(&mut module.types, &[], &[ValType::I32]);
+        let mut ib = fb.func_body();
+        ib.i32_const(8);
+        let fid = fb.finish(vec![], &mut module.funcs);
+        module.exports.add("get_io_ptr", fid);
     }
 
     // Generate and export get_bounds(out_ptr: i32)

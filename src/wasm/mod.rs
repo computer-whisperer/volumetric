@@ -5,6 +5,8 @@
 //!
 //! Models use the N-dimensional ABI:
 //! - `get_dimensions() -> u32`
+//! - `get_io_ptr() -> i32` — model-owned IO buffer (>= `2 * dims` f64s); the
+//!   host writes positions into it and reads bounds from it
 //! - `get_bounds(out_ptr: i32)` — writes interleaved min/max f64 pairs
 //! - `sample(pos_ptr: i32) -> f32` — reads `dims` f64 values
 //! - `memory` export
@@ -63,16 +65,20 @@ pub use native::{
 #[cfg(feature = "web")]
 pub use web::{WebModelExecutor, WebOperatorExecutor, WebParallelSampler};
 
-/// Reject models built against the removed legacy 3D ABI with a clear error.
+/// Reject models built against outdated ABIs with a clear error.
 ///
 /// Legacy models exported `is_inside(f64, f64, f64) -> f32` plus six
 /// `get_bounds_*` getters. Support was removed; every model in this repo (and
 /// every operator output) uses the N-dimensional ABI. Without this check a
 /// legacy blob from an old saved project would fail with a bare
 /// "missing export: get_dimensions".
+///
+/// Early N-dimensional models predate `get_io_ptr` (the host used to write
+/// into hardcoded low-memory offsets); those also need a rebuild.
 fn reject_legacy_model(wasm_bytes: &[u8]) -> Result<(), WasmBackendError> {
     let mut has_sample = false;
     let mut has_is_inside = false;
+    let mut has_get_io_ptr = false;
 
     for payload in wasmparser::Parser::new(0).parse_all(wasm_bytes) {
         let payload = payload.map_err(|e| WasmBackendError::Instantiation(e.to_string()))?;
@@ -82,6 +88,7 @@ fn reject_legacy_model(wasm_bytes: &[u8]) -> Result<(), WasmBackendError> {
                 match export.name {
                     "sample" => has_sample = true,
                     "is_inside" => has_is_inside = true,
+                    "get_io_ptr" => has_get_io_ptr = true,
                     _ => {}
                 }
             }
@@ -92,7 +99,15 @@ fn reject_legacy_model(wasm_bytes: &[u8]) -> Result<(), WasmBackendError> {
         return Err(WasmBackendError::Instantiation(
             "model exports the legacy 3D ABI (is_inside/get_bounds_*), which is no longer \
              supported; rebuild the model against the N-dimensional ABI \
-             (get_dimensions/get_bounds/sample/memory)"
+             (get_dimensions/get_io_ptr/get_bounds/sample/memory)"
+                .to_string(),
+        ));
+    }
+    if has_sample && !has_get_io_ptr {
+        return Err(WasmBackendError::Instantiation(
+            "model predates the model-owned IO buffer ABI (missing `get_io_ptr` export); \
+             rebuild the model against the current N-dimensional ABI \
+             (get_dimensions/get_io_ptr/get_bounds/sample/memory)"
                 .to_string(),
         ));
     }
@@ -175,6 +190,53 @@ pub fn create_operator_executor(
     Err::<DummyOperator, _>(WasmBackendError::Unavailable(
         "No WASM backend available. Enable 'native' or 'web' feature.".to_string(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Encode a minimal module whose export section names `names` as
+    /// functions. Only the export scan runs on it, so the (dangling)
+    /// function indices never get validated.
+    fn module_exporting(names: &[&str]) -> Vec<u8> {
+        let mut body = vec![names.len() as u8];
+        for name in names {
+            body.push(name.len() as u8);
+            body.extend_from_slice(name.as_bytes());
+            body.push(0x00); // kind: func
+            body.push(0x00); // index 0
+        }
+        let mut wasm = b"\0asm\x01\0\0\0".to_vec();
+        wasm.push(7); // export section id
+        wasm.push(body.len() as u8);
+        wasm.extend_from_slice(&body);
+        wasm
+    }
+
+    #[test]
+    fn legacy_3d_models_are_rejected() {
+        let err = reject_legacy_model(&module_exporting(&["is_inside", "get_bounds_min_x"]))
+            .expect_err("legacy models must be rejected");
+        assert!(err.to_string().contains("legacy 3D ABI"), "{err}");
+    }
+
+    #[test]
+    fn models_without_get_io_ptr_are_rejected() {
+        let err = reject_legacy_model(&module_exporting(&["get_dimensions", "sample"]))
+            .expect_err("models predating get_io_ptr must be rejected");
+        assert!(err.to_string().contains("get_io_ptr"), "{err}");
+    }
+
+    #[test]
+    fn current_abi_models_pass_the_scan() {
+        reject_legacy_model(&module_exporting(&[
+            "get_dimensions",
+            "get_io_ptr",
+            "sample",
+        ]))
+        .expect("current-ABI models must pass");
+    }
 }
 
 // Dummy types for when no backend is available (needed for type inference)

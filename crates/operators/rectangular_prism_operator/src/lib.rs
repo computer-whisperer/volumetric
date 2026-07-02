@@ -6,6 +6,7 @@
 //!
 //! Generated Model ABI:
 //! - `get_dimensions() -> u32`: Returns 3
+//! - `get_io_ptr() -> i32`: Returns the model-owned IO buffer (2n f64s)
 //! - `get_bounds(out_ptr: i32)`: Writes interleaved min/max bounds
 //! - `sample(pos_ptr: i32) -> f32`: Reads position from memory, returns density
 //! - `memory`: Linear memory export
@@ -99,6 +100,16 @@ fn generate_wasm(mode: &str, vector_a: [f64; 3], vector_b: [f64; 3]) -> Result<V
         builder.func_body().i32_const(3);
         let func_id = builder.finish(vec![], &mut module.funcs);
         module.exports.add("get_dimensions", func_id);
+    }
+
+    // Create get_io_ptr() -> i32
+    // The generated module keeps no state in memory, so the IO buffer is the
+    // start of the page (offset 8: nonzero so it never aliases a null pointer).
+    {
+        let mut builder = FunctionBuilder::new(&mut module.types, &[], &[ValType::I32]);
+        builder.func_body().i32_const(8);
+        let func_id = builder.finish(vec![], &mut module.funcs);
+        module.exports.add("get_io_ptr", func_id);
     }
 
     // Create get_bounds(out_ptr: i32)

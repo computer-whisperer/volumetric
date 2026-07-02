@@ -4,8 +4,10 @@
 //!
 //! Generated Model ABI (N-dimensional):
 //! - `get_dimensions() -> u32`: Passed through from input model
+//! - `get_io_ptr() -> i32`: Passed through from input model
 //! - `get_bounds(out_ptr: i32)`: Wrapper that applies rotation to bounds AABB
-//! - `sample(pos_ptr: i32) -> f32`: Wrapper that applies inverse rotation to position
+//! - `sample(pos_ptr: i32) -> f32`: Wrapper that applies the inverse rotation
+//!   to the position in place (the ABI allows clobbering the position buffer)
 //! - `memory`: Passed through from input model
 //!
 //! Behavior:
@@ -39,8 +41,12 @@ impl Default for RotationConfig {
 
 use volumetric_abi::host::{post_output, read_input, report_error};
 
-const ABI_FUNCTIONS_ND: &[&str] = &["get_dimensions", "get_bounds", "sample"];
-const SCRATCH_POS_OFFSET: i32 = 512;
+/// N-dimensional ABI function names. `get_dimensions` and `get_io_ptr` are
+/// passed through unchanged; `get_bounds` and `sample` get wrappers.
+const ABI_FUNCTIONS_ND: &[&str] = &["get_dimensions", "get_io_ptr", "get_bounds", "sample"];
+
+/// ABI functions the wrappers replace; the rest keep their exports.
+const WRAPPED_FUNCTIONS: &[&str] = &["get_bounds", "sample"];
 
 fn generate_hex_suffix() -> String {
     let mut state: u32 = 0xA5A5_1337;
@@ -127,17 +133,25 @@ fn transform_wasm(input_bytes: &[u8], cfg: RotationConfig) -> Result<Vec<u8>, St
         }
     }
 
-    // Remove old exports except get_dimensions
+    if !renamed.contains_key("get_io_ptr") {
+        return Err(
+            "Input model missing `get_io_ptr` export; rebuild it against the \
+                    current N-dimensional ABI"
+                .to_string(),
+        );
+    }
+
+    // Remove the exports we wrap; memory, get_dimensions and get_io_ptr pass through
     for id in exports_to_remove {
         let export_name = module.exports.get(id).name.clone();
-        if export_name != "get_dimensions" {
+        if WRAPPED_FUNCTIONS.contains(&export_name.as_str()) {
             module.exports.delete(id);
         }
     }
 
-    // Rename original functions except get_dimensions
+    // Rename the wrapped functions by adding suffix
     for (name, func_id) in &renamed {
-        if name != "get_dimensions" {
+        if WRAPPED_FUNCTIONS.contains(&name.as_str()) {
             let new_name = format!("{}_{}", name, suffix);
             module.funcs.get_mut(*func_id).name = Some(new_name);
         }
@@ -228,37 +242,27 @@ fn transform_wasm(input_bytes: &[u8], cfg: RotationConfig) -> Result<Vec<u8>, St
             .binop(F64Add)
             .local_set(rz);
 
-        // Write rotated position to scratch buffer
-        let scratch_arg = walrus::ir::MemArg {
-            align: 3,
-            offset: 0,
-        };
-        let scratch_arg_8 = walrus::ir::MemArg {
-            align: 3,
-            offset: 8,
-        };
-        let scratch_arg_16 = walrus::ir::MemArg {
-            align: 3,
-            offset: 16,
-        };
+        // Write the rotated position back in place at pos_ptr
+        b.func_body().local_get(pos_ptr).local_get(rx).store(
+            memory_id,
+            walrus::ir::StoreKind::F64,
+            mem_arg,
+        );
 
-        b.func_body()
-            .i32_const(SCRATCH_POS_OFFSET)
-            .local_get(rx)
-            .store(memory_id, walrus::ir::StoreKind::F64, scratch_arg);
+        b.func_body().local_get(pos_ptr).local_get(ry).store(
+            memory_id,
+            walrus::ir::StoreKind::F64,
+            mem_arg_8,
+        );
 
-        b.func_body()
-            .i32_const(SCRATCH_POS_OFFSET)
-            .local_get(ry)
-            .store(memory_id, walrus::ir::StoreKind::F64, scratch_arg_8);
+        b.func_body().local_get(pos_ptr).local_get(rz).store(
+            memory_id,
+            walrus::ir::StoreKind::F64,
+            mem_arg_16,
+        );
 
-        b.func_body()
-            .i32_const(SCRATCH_POS_OFFSET)
-            .local_get(rz)
-            .store(memory_id, walrus::ir::StoreKind::F64, scratch_arg_16);
-
-        // Call original sample with scratch buffer
-        b.func_body().i32_const(SCRATCH_POS_OFFSET).call(orig);
+        // Call original sample with the transformed position
+        b.func_body().local_get(pos_ptr).call(orig);
 
         let fid = b.finish(vec![pos_ptr], &mut module.funcs);
         module.exports.add("sample", fid);
@@ -295,10 +299,11 @@ fn transform_wasm(input_bytes: &[u8], cfg: RotationConfig) -> Result<Vec<u8>, St
 
         use walrus::ir::BinaryOp::{F64Add, F64Mul, F64Sub};
 
-        // Call original get_bounds to scratch area
-        b.func_body().i32_const(SCRATCH_POS_OFFSET).call(orig);
+        // Call original get_bounds directly into out_ptr; the original values
+        // are loaded into locals below before the rotated AABB overwrites them
+        b.func_body().local_get(out_ptr).call(orig);
 
-        // Load original bounds from scratch area
+        // Load original bounds from out_ptr
         let mem_arg_0 = walrus::ir::MemArg {
             align: 3,
             offset: 0,
@@ -325,27 +330,27 @@ fn transform_wasm(input_bytes: &[u8], cfg: RotationConfig) -> Result<Vec<u8>, St
         };
 
         b.func_body()
-            .i32_const(SCRATCH_POS_OFFSET)
+            .local_get(out_ptr)
             .load(memory_id, walrus::ir::LoadKind::F64, mem_arg_0)
             .local_set(min_x);
         b.func_body()
-            .i32_const(SCRATCH_POS_OFFSET)
+            .local_get(out_ptr)
             .load(memory_id, walrus::ir::LoadKind::F64, mem_arg_8)
             .local_set(max_x);
         b.func_body()
-            .i32_const(SCRATCH_POS_OFFSET)
+            .local_get(out_ptr)
             .load(memory_id, walrus::ir::LoadKind::F64, mem_arg_16)
             .local_set(min_y);
         b.func_body()
-            .i32_const(SCRATCH_POS_OFFSET)
+            .local_get(out_ptr)
             .load(memory_id, walrus::ir::LoadKind::F64, mem_arg_24)
             .local_set(max_y);
         b.func_body()
-            .i32_const(SCRATCH_POS_OFFSET)
+            .local_get(out_ptr)
             .load(memory_id, walrus::ir::LoadKind::F64, mem_arg_32)
             .local_set(min_z);
         b.func_body()
-            .i32_const(SCRATCH_POS_OFFSET)
+            .local_get(out_ptr)
             .load(memory_id, walrus::ir::LoadKind::F64, mem_arg_40)
             .local_set(max_z);
 

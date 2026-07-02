@@ -568,10 +568,11 @@ fn partition_by_axis(indices: &mut [u32], centroids: &[[f64; 3]], axis: usize, s
 // ============================================================================
 
 // Memory layout constants
-// First 256 bytes reserved for I/O buffers (position input at 0, bounds output at 256)
+// First 304 bytes reserved for the IO buffer (advertised via get_io_ptr,
+// which returns IO_PTR — nonzero so a null pointer never aliases the buffer)
 const IO_BUFFER_SIZE: u32 = 256;
-const BOUNDS_BUFFER_OFFSET: u32 = IO_BUFFER_SIZE;
-const HEADER_OFFSET: u32 = BOUNDS_BUFFER_OFFSET + 48; // After bounds output buffer
+const IO_PTR: i32 = 8;
+const HEADER_OFFSET: u32 = IO_BUFFER_SIZE + 48;
 const HEADER_SIZE: u32 = 16;
 const NODE_SIZE: u32 = 56; // 6 × f64 (48) + 2 × u32 (8)
 const TRIANGLE_SIZE: u32 = 72; // 9 × f64
@@ -579,11 +580,12 @@ const STACK_SIZE: u32 = 256; // 64 × u32
 
 // Function indices (these must match the order we add functions)
 const FN_GET_DIMENSIONS: u32 = 0;
-const FN_GET_BOUNDS: u32 = 1;
-const FN_SAMPLE: u32 = 2;
+const FN_GET_IO_PTR: u32 = 1;
+const FN_GET_BOUNDS: u32 = 2;
+const FN_SAMPLE: u32 = 3;
 
 // Type indices
-const TYPE_GET_DIMENSIONS: u32 = 0; // () -> u32
+const TYPE_GET_DIMENSIONS: u32 = 0; // () -> u32 (also used by get_io_ptr)
 const TYPE_GET_BOUNDS: u32 = 1; // (i32) -> ()
 const TYPE_SAMPLE: u32 = 2; // (i32) -> f32
 
@@ -619,6 +621,7 @@ fn generate_wasm(mesh: &ParsedMesh, bvh: &Bvh) -> Vec<u8> {
     // Function section
     let mut funcs = FunctionSection::new();
     funcs.function(TYPE_GET_DIMENSIONS); // get_dimensions
+    funcs.function(TYPE_GET_DIMENSIONS); // get_io_ptr shares () -> i32
     funcs.function(TYPE_GET_BOUNDS); // get_bounds
     funcs.function(TYPE_SAMPLE); // sample
     module.section(&funcs);
@@ -638,6 +641,7 @@ fn generate_wasm(mesh: &ParsedMesh, bvh: &Bvh) -> Vec<u8> {
     let mut exports = ExportSection::new();
     exports.export("memory", ExportKind::Memory, 0);
     exports.export("get_dimensions", ExportKind::Func, FN_GET_DIMENSIONS);
+    exports.export("get_io_ptr", ExportKind::Func, FN_GET_IO_PTR);
     exports.export("get_bounds", ExportKind::Func, FN_GET_BOUNDS);
     exports.export("sample", ExportKind::Func, FN_SAMPLE);
     module.section(&exports);
@@ -647,6 +651,9 @@ fn generate_wasm(mesh: &ParsedMesh, bvh: &Bvh) -> Vec<u8> {
 
     // get_dimensions() -> u32 - returns 3
     code.function(&generate_get_dimensions_function());
+
+    // get_io_ptr() -> IO_PTR (the reserved low-memory IO region)
+    code.function(&generate_get_io_ptr_function());
 
     // get_bounds(out_ptr: i32) - writes interleaved min/max bounds
     code.function(&generate_get_bounds_function(nodes_offset));
@@ -733,6 +740,14 @@ fn serialize_data(
 fn generate_get_dimensions_function() -> Function {
     let mut f = Function::new([]);
     f.instruction(&Instruction::I32Const(3)); // 3 dimensions
+    f.instruction(&Instruction::End);
+    f
+}
+
+/// Generate get_io_ptr() -> i32 function (the reserved low-memory IO region)
+fn generate_get_io_ptr_function() -> Function {
+    let mut f = Function::new([]);
+    f.instruction(&Instruction::I32Const(IO_PTR));
     f.instruction(&Instruction::End);
     f
 }

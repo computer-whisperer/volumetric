@@ -181,24 +181,29 @@ fn get_model_bounds_nd(store: &mut Store<()>, instance: &Instance) -> Result<(u3
         "Missing get_bounds export",
     )?;
 
+    let get_io_ptr = wasmtime_result(
+        instance.get_typed_func::<(), i32>(&mut *store, "get_io_ptr"),
+        "Missing get_io_ptr export",
+    )?;
+
     let dimensions = wasmtime_result(
         get_dimensions.call(&mut *store, ()),
         "get_dimensions call failed",
     )?;
 
-    // Buffer offset for bounds output (after position buffer)
-    const BOUNDS_BUFFER_OFFSET: i32 = 256;
+    // Ask the model where its IO buffer lives
+    let io_ptr = wasmtime_result(get_io_ptr.call(&mut *store, ()), "get_io_ptr call failed")?;
 
-    // Call get_bounds to write bounds to memory
+    // Call get_bounds to write bounds into the IO buffer
     wasmtime_result(
-        get_bounds.call(&mut *store, BOUNDS_BUFFER_OFFSET),
+        get_bounds.call(&mut *store, io_ptr),
         "get_bounds call failed",
     )?;
 
     // Read bounds from memory (interleaved: min_x, max_x, min_y, max_y, ...)
     let mut bounds_data = vec![0u8; (dimensions as usize) * 2 * 8];
     memory
-        .read(&mut *store, BOUNDS_BUFFER_OFFSET as usize, &mut bounds_data)
+        .read(&mut *store, io_ptr as usize, &mut bounds_data)
         .context("Failed to read bounds from memory")?;
 
     // Parse interleaved bounds - for 3D: [min_x, max_x, min_y, max_y, min_z, max_z]
@@ -331,26 +336,26 @@ fn sample_model_nd(
         "Missing sample export",
     )?;
 
-    // Position buffer at offset 0
-    const POS_BUFFER_OFFSET: i32 = 0;
+    let get_io_ptr = wasmtime_result(
+        instance.get_typed_func::<(), i32>(&mut *store, "get_io_ptr"),
+        "Missing get_io_ptr export",
+    )?;
+    let io_ptr = wasmtime_result(get_io_ptr.call(&mut *store, ()), "get_io_ptr call failed")?;
 
     let mut results = Vec::with_capacity(points.len());
     for &(x, y, z) in points {
-        // Write position to memory
+        // Write position into the model's IO buffer
         let mut pos_bytes = [0u8; 24];
         pos_bytes[0..8].copy_from_slice(&x.to_le_bytes());
         pos_bytes[8..16].copy_from_slice(&y.to_le_bytes());
         pos_bytes[16..24].copy_from_slice(&z.to_le_bytes());
 
         memory
-            .write(&mut *store, POS_BUFFER_OFFSET as usize, &pos_bytes)
+            .write(&mut *store, io_ptr as usize, &pos_bytes)
             .context("Failed to write position to memory")?;
 
         // Call sample
-        let value = wasmtime_result(
-            sample.call(&mut *store, POS_BUFFER_OFFSET),
-            "sample call failed",
-        )?;
+        let value = wasmtime_result(sample.call(&mut *store, io_ptr), "sample call failed")?;
         results.push(value);
     }
 

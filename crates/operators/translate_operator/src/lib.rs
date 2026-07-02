@@ -4,8 +4,10 @@
 //!
 //! Generated Model ABI (N-dimensional):
 //! - `get_dimensions() -> u32`: Passed through from input model
+//! - `get_io_ptr() -> i32`: Passed through from input model
 //! - `get_bounds(out_ptr: i32)`: Wrapper that adds translation to bounds
-//! - `sample(pos_ptr: i32) -> f32`: Wrapper that subtracts translation from position
+//! - `sample(pos_ptr: i32) -> f32`: Wrapper that subtracts translation from
+//!   the position in place (the ABI allows clobbering the position buffer)
 //! - `memory`: Passed through from input model
 //!
 //! Behavior:
@@ -38,11 +40,12 @@ impl Default for TranslateConfig {
 
 use volumetric_abi::host::{post_output, read_input, report_error};
 
-/// New N-dimensional ABI function names
-const ABI_FUNCTIONS_ND: &[&str] = &["get_dimensions", "get_bounds", "sample"];
+/// N-dimensional ABI function names. `get_dimensions` and `get_io_ptr` are
+/// passed through unchanged; `get_bounds` and `sample` get wrappers.
+const ABI_FUNCTIONS_ND: &[&str] = &["get_dimensions", "get_io_ptr", "get_bounds", "sample"];
 
-/// Scratch buffer offset for transformed position (after bounds buffer at 256)
-const SCRATCH_POS_OFFSET: i32 = 512;
+/// ABI functions the wrappers replace; the rest keep their exports.
+const WRAPPED_FUNCTIONS: &[&str] = &["get_bounds", "sample"];
 
 /// Generate a random hex string for suffixing renamed functions
 fn generate_hex_suffix() -> String {
@@ -94,17 +97,25 @@ fn transform_wasm(input_bytes: &[u8], cfg: TranslateConfig) -> Result<Vec<u8>, S
         }
     }
 
-    // Remove old exports (except memory and get_dimensions which we pass through)
+    if !renamed_functions.contains_key("get_io_ptr") {
+        return Err(
+            "Input model missing `get_io_ptr` export; rebuild it against the \
+                    current N-dimensional ABI"
+                .to_string(),
+        );
+    }
+
+    // Remove the exports we wrap; memory, get_dimensions and get_io_ptr pass through
     for export_id in exports_to_remove {
         let export_name = module.exports.get(export_id).name.clone();
-        if export_name != "get_dimensions" {
+        if WRAPPED_FUNCTIONS.contains(&export_name.as_str()) {
             module.exports.delete(export_id);
         }
     }
 
-    // Rename the original functions by adding suffix (except get_dimensions)
+    // Rename the wrapped functions by adding suffix
     for (original_name, func_id) in &renamed_functions {
-        if original_name != "get_dimensions" {
+        if WRAPPED_FUNCTIONS.contains(&original_name.as_str()) {
             let new_name = format!("{}_{}", original_name, suffix);
             let func = module.funcs.get_mut(*func_id);
             func.name = Some(new_name);
@@ -114,92 +125,29 @@ fn transform_wasm(input_bytes: &[u8], cfg: TranslateConfig) -> Result<Vec<u8>, S
     // Create wrapper for sample
     if let Some(&original_sample_id) = renamed_functions.get("sample") {
         // sample(pos_ptr: i32) -> f32
-        // Wrapper reads position from pos_ptr, subtracts translation for first 3 dims,
-        // writes to scratch buffer, then calls original sample with scratch buffer
+        // Wrapper subtracts the translation from the first 3 dims in place at
+        // pos_ptr, then calls the original sample with the same pointer.
         let mut builder = FunctionBuilder::new(&mut module.types, &[ValType::I32], &[ValType::F32]);
 
         let pos_ptr = module.locals.add(ValType::I32);
-        let x = module.locals.add(ValType::F64);
-        let y = module.locals.add(ValType::F64);
-        let z = module.locals.add(ValType::F64);
 
-        let mem_arg = walrus::ir::MemArg {
-            align: 3,
-            offset: 0,
-        };
-        let mem_arg_8 = walrus::ir::MemArg {
-            align: 3,
-            offset: 8,
-        };
-        let mem_arg_16 = walrus::ir::MemArg {
-            align: 3,
-            offset: 16,
-        };
+        // pos[i] -= d for each axis
+        for (offset, d) in [(0, cfg.dx), (8, cfg.dy), (16, cfg.dz)] {
+            let mem_arg = walrus::ir::MemArg { align: 3, offset };
+            builder
+                .func_body()
+                .local_get(pos_ptr)
+                .local_get(pos_ptr)
+                .load(memory_id, walrus::ir::LoadKind::F64, mem_arg)
+                .f64_const(-(d as f64))
+                .binop(walrus::ir::BinaryOp::F64Add)
+                .store(memory_id, walrus::ir::StoreKind::F64, mem_arg);
+        }
 
-        // Load x, y, z from input position
+        // Call original sample with the transformed position
         builder
             .func_body()
             .local_get(pos_ptr)
-            .load(memory_id, walrus::ir::LoadKind::F64, mem_arg)
-            .local_set(x);
-
-        builder
-            .func_body()
-            .local_get(pos_ptr)
-            .load(memory_id, walrus::ir::LoadKind::F64, mem_arg_8)
-            .local_set(y);
-
-        builder
-            .func_body()
-            .local_get(pos_ptr)
-            .load(memory_id, walrus::ir::LoadKind::F64, mem_arg_16)
-            .local_set(z);
-
-        // Subtract translation and write to scratch buffer
-        let scratch_arg = walrus::ir::MemArg {
-            align: 3,
-            offset: 0,
-        };
-        let scratch_arg_8 = walrus::ir::MemArg {
-            align: 3,
-            offset: 8,
-        };
-        let scratch_arg_16 = walrus::ir::MemArg {
-            align: 3,
-            offset: 16,
-        };
-
-        // x - dx -> scratch[0]
-        builder
-            .func_body()
-            .i32_const(SCRATCH_POS_OFFSET)
-            .local_get(x)
-            .f64_const(-(cfg.dx as f64))
-            .binop(walrus::ir::BinaryOp::F64Add)
-            .store(memory_id, walrus::ir::StoreKind::F64, scratch_arg);
-
-        // y - dy -> scratch[8]
-        builder
-            .func_body()
-            .i32_const(SCRATCH_POS_OFFSET)
-            .local_get(y)
-            .f64_const(-(cfg.dy as f64))
-            .binop(walrus::ir::BinaryOp::F64Add)
-            .store(memory_id, walrus::ir::StoreKind::F64, scratch_arg_8);
-
-        // z - dz -> scratch[16]
-        builder
-            .func_body()
-            .i32_const(SCRATCH_POS_OFFSET)
-            .local_get(z)
-            .f64_const(-(cfg.dz as f64))
-            .binop(walrus::ir::BinaryOp::F64Add)
-            .store(memory_id, walrus::ir::StoreKind::F64, scratch_arg_16);
-
-        // Call original sample with scratch buffer pointer
-        builder
-            .func_body()
-            .i32_const(SCRATCH_POS_OFFSET)
             .call(original_sample_id);
 
         let wrapper_id = builder.finish(vec![pos_ptr], &mut module.funcs);

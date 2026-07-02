@@ -172,24 +172,25 @@ fn main() -> Result<()> {
     println!("Merged model size: {} bytes", merged.len());
 
     // Validate the merged model can be instantiated and queried (Nd ABI:
-    // write the position into the exported memory, call sample(pos_ptr)).
+    // write the position into the model's IO buffer, call sample(pos_ptr)).
     let mut store = Store::new(&engine, ());
     let merged_module = Module::new(&engine, merged)?;
     let merged_instance = Instance::new(&mut store, &merged_module, &[])?;
     let memory = merged_instance
         .get_memory(&mut store, "memory")
         .context("merged model has no memory export")?;
+    let get_io_ptr = merged_instance.get_typed_func::<(), i32>(&mut store, "get_io_ptr")?;
     let sample = merged_instance.get_typed_func::<i32, f32>(&mut store, "sample")?;
 
-    // Nonzero offset: address 0 is a null pointer to the model's Rust code.
-    const POS_OFFSET: usize = 8;
+    let io_ptr = get_io_ptr.call(&mut store, ())?;
+    println!("merged model IO buffer at {io_ptr}");
     let sample_at = |store: &mut Store<()>, pos: [f64; 3]| -> Result<f32> {
         let mut bytes = [0u8; 24];
         for (i, v) in pos.iter().enumerate() {
             bytes[i * 8..(i + 1) * 8].copy_from_slice(&v.to_le_bytes());
         }
-        memory.write(&mut *store, POS_OFFSET, &bytes)?;
-        Ok(sample.call(&mut *store, POS_OFFSET as i32)?)
+        memory.write(&mut *store, io_ptr as usize, &bytes)?;
+        Ok(sample.call(&mut *store, io_ptr)?)
     };
     let v0 = sample_at(&mut store, [0.0, 0.0, 0.0])?;
     let v1 = sample_at(&mut store, [5.0, 5.0, 5.0])?;
