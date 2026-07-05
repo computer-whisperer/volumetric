@@ -23,8 +23,10 @@
 //! gradient over the free dofs.
 
 pub mod element;
+pub mod inverse;
 
 pub use element::{ElementStiffness, Material, cube_stiffness, hex8_stiffness};
+pub use inverse::{InverseConfig, InverseResult, TargetMap, solve_inverse};
 use volumetric_abi::fea::{FeaElementKind, FeaMesh};
 
 /// An implicit rigid body, sampled by occupancy (the Model ABI contract).
@@ -64,6 +66,17 @@ impl FixedBoundary {
             other => Err(format!(
                 "unknown fixed boundary {other:?} (expected xmin/xmax/ymin/ymax/zmin/zmax/none)"
             )),
+        }
+    }
+
+    /// The contact (axis, sign) implied by this fixed boundary: the rigid
+    /// body presses along the fixed face's axis, approaching from the
+    /// opposite side (`sign` = +1 when it presses from the axis' positive
+    /// side). With no fixed face it presses down the z axis, from above.
+    pub fn contact_axis(self) -> (usize, f64) {
+        match self.axis() {
+            Some((axis, glued_min)) => (axis, if glued_min { 1.0 } else { -1.0 }),
+            None => (2, 1.0),
         }
     }
 
@@ -176,7 +189,7 @@ pub fn detect_uniform_grid(mesh: &FeaMesh) -> Result<f64, String> {
 
 /// Per-element stiffness multipliers from an optional `stiffness_scale`
 /// element field (missing field = all 1.0).
-fn stiffness_scales(mesh: &FeaMesh) -> Result<Vec<f64>, String> {
+pub(crate) fn stiffness_scales(mesh: &FeaMesh) -> Result<Vec<f64>, String> {
     let Some(field) = mesh
         .element_fields
         .iter()
@@ -406,11 +419,7 @@ pub fn solve(
     // The rigid body presses toward the glued face: contact acts along the
     // fixed boundary's axis, with the body approaching from the opposite
     // side (glued at min → body on the positive side pressing negative).
-    // With no fixed face it presses down the z axis, from above.
-    let (contact_axis, contact_sign) = match config.fixed_boundary.axis() {
-        Some((axis, glued_min)) => (axis, if glued_min { 1.0 } else { -1.0 }),
-        None => (2, 1.0),
-    };
+    let (contact_axis, contact_sign) = config.fixed_boundary.contact_axis();
     let scan_limit = ((hi[contact_axis] - lo[contact_axis]) / h).ceil() as usize + 4;
 
     // Base constraints: the glued face.
@@ -619,8 +628,9 @@ mod tests {
     use volumetric_abi::fea::FeaField;
 
     /// Build the uniform grid mesh the mesher would emit: nx*ny*nz cells of
-    /// size h with the origin at (0, 0, 0).
-    fn grid_mesh(nx: usize, ny: usize, nz: usize, h: f64) -> FeaMesh {
+    /// size h with the origin at (0, 0, 0). Shared with the inverse module's
+    /// tests.
+    pub(crate) fn grid_mesh(nx: usize, ny: usize, nz: usize, h: f64) -> FeaMesh {
         let (mx, my) = (nx + 1, ny + 1);
         let mut node_positions = Vec::new();
         for k in 0..=nz {

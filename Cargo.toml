@@ -32,6 +32,7 @@ members = [
     "crates/operators/fea_grid_mesh_operator",
     "crates/operators/fea_solve_operator",
     "crates/operators/fea_density_operator",
+    "crates/operators/fea_inverse_operator",
     "crates/operators/mesh_to_model_operator",
     "crates/volumetric_abi",
     "crates/fea_core",
@@ -73,3 +74,8 @@ js-sys = { version = "0.3", optional = true }
 
 # Cross-platform time (works on both native and wasm)
 web-time = "1"
+
+[dev-dependencies]
+# Hand-assemble tiny test models in integration tests (already in the tree
+# via wasmtime).
+wat = "1"

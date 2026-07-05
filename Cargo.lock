@@ -1522,6 +1522,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fea_inverse_operator"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "fea_core",
+ "serde",
+ "volumetric_abi",
+]
+
+[[package]]
 name = "fea_solve_operator"
 version = "0.1.0"
 dependencies = [
@@ -4840,6 +4850,7 @@ dependencies = [
  "wasm-bindgen",
  "wasmparser 0.248.0",
  "wasmtime",
+ "wat",
  "web-time",
 ]
 
