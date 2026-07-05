@@ -34,6 +34,7 @@ use walrus::{FunctionBuilder, FunctionId, MemoryId, Module, ModuleConfig, ValTyp
 use volumetric_abi::{OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput};
 
 #[derive(Clone, Debug, serde::Deserialize)]
+#[serde(default)]
 struct ExtrudeConfig {
     height: f64,
 }
@@ -251,7 +252,13 @@ pub extern "C" fn run() {
             ExtrudeConfig::default()
         } else {
             let mut cursor = std::io::Cursor::new(&cfg_buf);
-            ciborium::de::from_reader::<ExtrudeConfig, _>(&mut cursor).unwrap_or_default()
+            match ciborium::de::from_reader::<ExtrudeConfig, _>(&mut cursor) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    report_error(&format!("invalid configuration: {e}"));
+                    return;
+                }
+            }
         }
     };
 

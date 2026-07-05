@@ -58,17 +58,28 @@ fn circle_sketch_wasm() -> Vec<u8> {
     .expect("compile 2D lua sketch")
 }
 
-fn height_config(height: f64) -> Vec<u8> {
+fn cbor_floats(fields: &[(&str, f64)]) -> Vec<u8> {
     let mut out = Vec::new();
     ciborium::ser::into_writer(
-        &ciborium::value::Value::Map(vec![(
-            ciborium::value::Value::Text("height".into()),
-            ciborium::value::Value::Float(height),
-        )]),
+        &ciborium::value::Value::Map(
+            fields
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        ciborium::value::Value::Text((*k).into()),
+                        ciborium::value::Value::Float(*v),
+                    )
+                })
+                .collect(),
+        ),
         &mut out,
     )
     .unwrap();
     out
+}
+
+fn height_config(height: f64) -> Vec<u8> {
+    cbor_floats(&[("height", height)])
 }
 
 #[test]
@@ -263,6 +274,127 @@ fn revolved_model_extrude_style_composes() {
     let mut executor = NativeModelExecutor::new(&moved).unwrap();
     assert_eq!(executor.sample_nd(&[0.75, 0.0, 2.0]).unwrap(), 1.0);
     assert_eq!(executor.sample_nd(&[0.75, 0.0, 0.5]).unwrap(), 0.0);
+}
+
+#[test]
+fn translate_adapts_to_2d_sketches() {
+    // dz would overrun a 2D model's bounds buffer if the wrapper weren't
+    // dimension-adaptive — pass a nonzero one to prove it's ignored safely.
+    let moved = run_operator(
+        "translate_operator",
+        vec![
+            circle_sketch_wasm(),
+            cbor_floats(&[("dx", 1.0), ("dy", 0.5), ("dz", 99.0)]),
+        ],
+    )
+    .expect("translate sketch");
+
+    let mut executor = NativeModelExecutor::new(&moved).unwrap();
+    assert_eq!(executor.dimensions(), 2);
+
+    let bounds = executor.get_bounds_nd().unwrap();
+    assert_eq!(bounds.dimensions(), 2);
+    assert_eq!((bounds.min(0), bounds.max(0)), (-0.5, 2.5));
+    assert_eq!((bounds.min(1), bounds.max(1)), (-1.0, 2.0));
+
+    // The old circle center moved to (1.0, 0.5); the old origin is now on
+    // the outside (distance to new center > 1).
+    assert_eq!(executor.sample_nd(&[1.0, 0.5]).unwrap(), 1.0);
+    assert_eq!(executor.sample_nd(&[2.4, 0.5]).unwrap(), 0.0);
+    // Sample again after get_bounds to catch buffer-overrun corruption.
+    assert_eq!(executor.sample_nd(&[1.0, 0.5]).unwrap(), 1.0);
+}
+
+/// Off-axis rectangle: 1 <= x <= 2, -0.5 <= y <= 0.5.
+const OFFSET_RECT_SKETCH: &str = r#"
+function is_inside(x, y)
+    if x >= 1.0 and x <= 2.0 and y >= -0.5 and y <= 0.5 then
+        return 1.0
+    else
+        return 0.0
+    end
+end
+function get_bounds_min_x() return 0.75 end
+function get_bounds_max_x() return 2.25 end
+function get_bounds_min_y() return -0.75 end
+function get_bounds_max_y() return 0.75 end
+"#;
+
+#[test]
+fn rotation_rotates_sketches_in_plane() {
+    let sketch = run_operator(
+        "lua_script_operator",
+        vec![OFFSET_RECT_SKETCH.as_bytes().to_vec()],
+    )
+    .expect("compile offset rect");
+    let rotated = run_operator(
+        "rotation_operator",
+        vec![sketch.clone(), cbor_floats(&[("rz_deg", 90.0)])],
+    )
+    .expect("rotate sketch");
+
+    let mut executor = NativeModelExecutor::new(&rotated).unwrap();
+    assert_eq!(executor.dimensions(), 2);
+
+    // The rectangle rotated from +x onto +y.
+    assert_eq!(executor.sample_nd(&[0.0, 1.5]).unwrap(), 1.0);
+    assert_eq!(executor.sample_nd(&[1.5, 0.0]).unwrap(), 0.0);
+
+    // Bounds: center (1.5, 0) -> (0, 1.5); half-extents (0.75, 0.75) stay.
+    let bounds = executor.get_bounds_nd().unwrap();
+    assert!((bounds.min(0) - -0.75).abs() < 1e-9, "{}", bounds.min(0));
+    assert!((bounds.max(0) - 0.75).abs() < 1e-9, "{}", bounds.max(0));
+    assert!((bounds.min(1) - 0.75).abs() < 1e-9, "{}", bounds.min(1));
+    assert!((bounds.max(1) - 2.25).abs() < 1e-9, "{}", bounds.max(1));
+
+    // Out-of-plane rotation of a 2D model errors loudly instead of being
+    // silently dropped.
+    let err = run_operator(
+        "rotation_operator",
+        vec![sketch, cbor_floats(&[("rx_deg", 10.0)])],
+    )
+    .expect_err("rx on a 2D model must fail");
+    assert!(err.contains("in-plane"), "{err}");
+}
+
+#[test]
+fn scale_adapts_to_2d_sketches() {
+    let scaled = run_operator(
+        "scale_operator",
+        vec![
+            circle_sketch_wasm(),
+            cbor_floats(&[("sx", 2.0), ("sy", 1.0), ("sz", 99.0)]),
+        ],
+    )
+    .expect("scale sketch");
+
+    let mut executor = NativeModelExecutor::new(&scaled).unwrap();
+    assert_eq!(executor.dimensions(), 2);
+
+    let bounds = executor.get_bounds_nd().unwrap();
+    assert_eq!((bounds.min(0), bounds.max(0)), (-3.0, 3.0));
+    assert_eq!((bounds.min(1), bounds.max(1)), (-1.5, 1.5));
+
+    // Ellipse: (1.8, 0) maps back to sketch (0.9, 0) — inside; (0, 1.2) is
+    // outside (y unscaled).
+    assert_eq!(executor.sample_nd(&[1.8, 0.0]).unwrap(), 1.0);
+    assert_eq!(executor.sample_nd(&[0.0, 1.2]).unwrap(), 0.0);
+}
+
+#[test]
+fn transformed_sketch_extrudes() {
+    // The point of 2D transforms: position a sketch before lifting it.
+    let moved = run_operator(
+        "translate_operator",
+        vec![circle_sketch_wasm(), cbor_floats(&[("dx", 1.0)])],
+    )
+    .expect("translate sketch");
+    let extruded =
+        run_operator("extrude_operator", vec![moved, height_config(1.0)]).expect("extrude");
+
+    let mut executor = NativeModelExecutor::new(&extruded).unwrap();
+    assert_eq!(executor.sample_nd(&[1.0, 0.0, 0.5]).unwrap(), 1.0);
+    assert_eq!(executor.sample_nd(&[-0.9, 0.0, 0.5]).unwrap(), 0.0);
 }
 
 #[test]

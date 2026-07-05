@@ -14,6 +14,11 @@
 //!   transform doesn't change what the samples mean)
 //! - `memory`: Passed through from input model
 //!
+//! Dimension-adaptive: the wrapper reads the input's `get_dimensions`
+//! constant. A 2D sketch rotates in-plane about z using rz only — nonzero
+//! rx/ry on a 2D input is an error, not silently dropped. 3D+ inputs use
+//! the full Euler rotation on the first three dimensions.
+//!
 //! Behavior:
 //! - Reads WASM model bytes from input 0
 //! - Reads CBOR configuration from input 1
@@ -26,6 +31,7 @@ use walrus::{FunctionBuilder, FunctionId, MemoryId, Module, ModuleConfig, ValTyp
 use volumetric_abi::{OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput};
 
 #[derive(Clone, Debug, serde::Deserialize)]
+#[serde(default)]
 struct RotationConfig {
     /// Degrees about X, Y, Z applied in order Rx -> Ry -> Rz
     rx_deg: f32,
@@ -105,6 +111,183 @@ fn rotation_constants(cfg: &RotationConfig) -> ([[f64; 3]; 3], [[f64; 3]; 3], [[
         }
     }
     (r, r_inv, r_abs)
+}
+
+/// Read the constant a trivial `() -> i32` function returns, if its body is
+/// a single `i32.const`. Every model generator emits `get_dimensions` this
+/// way, so this is how the operator adapts to the input's dimensionality
+/// without being able to instantiate it.
+fn const_i32_return(module: &Module, func_id: FunctionId) -> Option<i32> {
+    let local = match &module.funcs.get(func_id).kind {
+        walrus::FunctionKind::Local(local) => local,
+        _ => return None,
+    };
+    let block = local.block(local.entry_block());
+    match block.instrs.as_slice() {
+        [(walrus::ir::Instr::Const(c), _)] => match c.value {
+            walrus::ir::Value::I32(v) => Some(v),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Emit code that applies the inverse in-plane rotation (about z; the config
+/// validated rx = ry = 0, so the matrix's top-left 2x2 block is exactly Rz)
+/// to the first 2 dims in place at `pos_ptr`.
+fn emit_position_rewrite_2d(
+    b: &mut FunctionBuilder,
+    locals: &mut walrus::ModuleLocals,
+    pos_ptr: walrus::LocalId,
+    memory_id: MemoryId,
+    r_inv: &[[f64; 3]; 3],
+) {
+    let x = locals.add(ValType::F64);
+    let y = locals.add(ValType::F64);
+    let rx = locals.add(ValType::F64);
+    let ry = locals.add(ValType::F64);
+
+    use walrus::ir::BinaryOp::{F64Add, F64Mul};
+    let mem_arg = walrus::ir::MemArg {
+        align: 3,
+        offset: 0,
+    };
+    let mem_arg_8 = walrus::ir::MemArg {
+        align: 3,
+        offset: 8,
+    };
+
+    b.func_body()
+        .local_get(pos_ptr)
+        .load(memory_id, walrus::ir::LoadKind::F64, mem_arg)
+        .local_set(x);
+    b.func_body()
+        .local_get(pos_ptr)
+        .load(memory_id, walrus::ir::LoadKind::F64, mem_arg_8)
+        .local_set(y);
+
+    // (rx, ry) = R2_inv * (x, y)
+    for (out, row) in [(rx, &r_inv[0]), (ry, &r_inv[1])] {
+        b.func_body()
+            .local_get(x)
+            .f64_const(row[0])
+            .binop(F64Mul)
+            .local_get(y)
+            .f64_const(row[1])
+            .binop(F64Mul)
+            .binop(F64Add)
+            .local_set(out);
+    }
+
+    b.func_body().local_get(pos_ptr).local_get(rx).store(
+        memory_id,
+        walrus::ir::StoreKind::F64,
+        mem_arg,
+    );
+    b.func_body().local_get(pos_ptr).local_get(ry).store(
+        memory_id,
+        walrus::ir::StoreKind::F64,
+        mem_arg_8,
+    );
+}
+
+/// Build the 2D `get_bounds` wrapper: call the original, then transform the
+/// two-axis AABB by center/half-extents — c' = R2 c, h' = |R2| h — writing
+/// only the input's own 2*2 bounds slots.
+fn build_bounds_wrapper_2d(
+    module: &mut Module,
+    memory_id: MemoryId,
+    orig: FunctionId,
+    r: &[[f64; 3]; 3],
+    r_abs: &[[f64; 3]; 3],
+) -> FunctionId {
+    let mut b = FunctionBuilder::new(&mut module.types, &[ValType::I32], &[]);
+    let out_ptr = module.locals.add(ValType::I32);
+    let c = [
+        module.locals.add(ValType::F64),
+        module.locals.add(ValType::F64),
+    ];
+    let h = [
+        module.locals.add(ValType::F64),
+        module.locals.add(ValType::F64),
+    ];
+    let rc = [
+        module.locals.add(ValType::F64),
+        module.locals.add(ValType::F64),
+    ];
+    let rh = [
+        module.locals.add(ValType::F64),
+        module.locals.add(ValType::F64),
+    ];
+
+    use walrus::ir::BinaryOp::{F64Add, F64Mul, F64Sub};
+    let arg = |offset: u64| walrus::ir::MemArg { align: 3, offset };
+
+    b.func_body().local_get(out_ptr).call(orig);
+
+    // Per axis: c = (min + max) / 2, h = (max - min) / 2
+    for axis in 0..2 {
+        let (min_off, max_off) = ((axis * 16) as u64, (axis * 16 + 8) as u64);
+        b.func_body()
+            .local_get(out_ptr)
+            .load(memory_id, walrus::ir::LoadKind::F64, arg(min_off))
+            .local_get(out_ptr)
+            .load(memory_id, walrus::ir::LoadKind::F64, arg(max_off))
+            .binop(F64Add)
+            .f64_const(0.5)
+            .binop(F64Mul)
+            .local_set(c[axis]);
+        b.func_body()
+            .local_get(out_ptr)
+            .load(memory_id, walrus::ir::LoadKind::F64, arg(max_off))
+            .local_get(out_ptr)
+            .load(memory_id, walrus::ir::LoadKind::F64, arg(min_off))
+            .binop(F64Sub)
+            .f64_const(0.5)
+            .binop(F64Mul)
+            .local_set(h[axis]);
+    }
+
+    // rc = R2 * c, rh = |R2| * h
+    for axis in 0..2 {
+        b.func_body()
+            .local_get(c[0])
+            .f64_const(r[axis][0])
+            .binop(F64Mul)
+            .local_get(c[1])
+            .f64_const(r[axis][1])
+            .binop(F64Mul)
+            .binop(F64Add)
+            .local_set(rc[axis]);
+        b.func_body()
+            .local_get(h[0])
+            .f64_const(r_abs[axis][0])
+            .binop(F64Mul)
+            .local_get(h[1])
+            .f64_const(r_abs[axis][1])
+            .binop(F64Mul)
+            .binop(F64Add)
+            .local_set(rh[axis]);
+    }
+
+    // min = rc - rh, max = rc + rh
+    for axis in 0..2 {
+        let (min_off, max_off) = ((axis * 16) as u64, (axis * 16 + 8) as u64);
+        b.func_body()
+            .local_get(out_ptr)
+            .local_get(rc[axis])
+            .local_get(rh[axis])
+            .binop(F64Sub)
+            .store(memory_id, walrus::ir::StoreKind::F64, arg(min_off));
+        b.func_body()
+            .local_get(out_ptr)
+            .local_get(rc[axis])
+            .local_get(rh[axis])
+            .binop(F64Add)
+            .store(memory_id, walrus::ir::StoreKind::F64, arg(max_off));
+    }
+
+    b.finish(vec![out_ptr], &mut module.funcs)
 }
 
 /// Emit code that applies the inverse rotation to the first 3 dims in place
@@ -231,6 +414,28 @@ fn transform_wasm(input_bytes: &[u8], cfg: RotationConfig) -> Result<Vec<u8>, St
         );
     }
 
+    // Adapt to the input's dimensionality. A 2D sketch rotates in-plane
+    // (about z, using rz only); writing 3 axes into its 2*2-f64 IO buffer
+    // would corrupt memory past it.
+    let dims_func = renamed
+        .get("get_dimensions")
+        .ok_or("Input model missing `get_dimensions` export")?;
+    let dims = const_i32_return(&module, *dims_func).ok_or(
+        "cannot determine input model dimensionality (get_dimensions is not a constant function)",
+    )?;
+    if dims < 2 {
+        return Err(format!(
+            "rotation needs at least 2 dimensions, input model has {dims}"
+        ));
+    }
+    let spatial = (dims as usize).min(3);
+    if spatial == 2 && (cfg.rx_deg != 0.0 || cfg.ry_deg != 0.0) {
+        return Err(format!(
+            "2D models rotate in-plane only: rx and ry must be 0 (got rx={}, ry={})",
+            cfg.rx_deg, cfg.ry_deg
+        ));
+    }
+
     // Remove the exports we wrap; memory, get_dimensions and get_io_ptr pass through
     for id in exports_to_remove {
         let export_name = module.exports.get(id).name.clone();
@@ -252,7 +457,11 @@ fn transform_wasm(input_bytes: &[u8], cfg: RotationConfig) -> Result<Vec<u8>, St
         let mut b = FunctionBuilder::new(&mut module.types, &[ValType::I32], &[ValType::F32]);
         let pos_ptr = module.locals.add(ValType::I32);
 
-        emit_position_rewrite(&mut b, &mut module.locals, pos_ptr, memory_id, &r_inv);
+        if spatial == 2 {
+            emit_position_rewrite_2d(&mut b, &mut module.locals, pos_ptr, memory_id, &r_inv);
+        } else {
+            emit_position_rewrite(&mut b, &mut module.locals, pos_ptr, memory_id, &r_inv);
+        }
         b.func_body().local_get(pos_ptr).call(orig);
 
         let fid = b.finish(vec![pos_ptr], &mut module.funcs);
@@ -267,7 +476,11 @@ fn transform_wasm(input_bytes: &[u8], cfg: RotationConfig) -> Result<Vec<u8>, St
         let pos_ptr = module.locals.add(ValType::I32);
         let out_ptr = module.locals.add(ValType::I32);
 
-        emit_position_rewrite(&mut b, &mut module.locals, pos_ptr, memory_id, &r_inv);
+        if spatial == 2 {
+            emit_position_rewrite_2d(&mut b, &mut module.locals, pos_ptr, memory_id, &r_inv);
+        } else {
+            emit_position_rewrite(&mut b, &mut module.locals, pos_ptr, memory_id, &r_inv);
+        }
         b.func_body()
             .local_get(pos_ptr)
             .local_get(out_ptr)
@@ -277,8 +490,19 @@ fn transform_wasm(input_bytes: &[u8], cfg: RotationConfig) -> Result<Vec<u8>, St
         module.exports.add("sample_channels", fid);
     }
 
+    // get_bounds wrapper (2D): in-plane center/half-extents transform over
+    // the input's two bounds slots only.
+    if spatial == 2 {
+        if let Some(&orig) = renamed.get("get_bounds") {
+            let fid = build_bounds_wrapper_2d(&mut module, memory_id, orig, &r, &r_abs);
+            module.exports.add("get_bounds", fid);
+        }
+    }
+
     // get_bounds wrapper using center/half-extents transform: h' = |R| h, c' = R c
-    if let Some(&orig) = renamed.get("get_bounds") {
+    if spatial >= 3
+        && let Some(&orig) = renamed.get("get_bounds")
+    {
         let mut b = FunctionBuilder::new(&mut module.types, &[ValType::I32], &[]);
         let out_ptr = module.locals.add(ValType::I32);
 
@@ -552,7 +776,13 @@ pub extern "C" fn run() {
             RotationConfig::default()
         } else {
             let mut cursor = std::io::Cursor::new(&cfg_buf);
-            ciborium::de::from_reader::<RotationConfig, _>(&mut cursor).unwrap_or_default()
+            match ciborium::de::from_reader::<RotationConfig, _>(&mut cursor) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    report_error(&format!("invalid configuration: {e}"));
+                    return;
+                }
+            }
         }
     };
 

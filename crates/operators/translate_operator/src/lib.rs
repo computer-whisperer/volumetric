@@ -14,6 +14,10 @@
 //!   transform doesn't change what the samples mean)
 //! - `memory`: Passed through from input model
 //!
+//! Dimension-adaptive: the wrapper reads the input's `get_dimensions`
+//! constant and translates only the spatial prefix min(dims, 3) — a 2D
+//! sketch uses dx/dy (dz is ignored), and higher dimensions pass through.
+//!
 //! Behavior:
 //! - Reads WASM model bytes from input 0
 //! - Reads CBOR configuration from input 1 (schema declared in metadata)
@@ -26,6 +30,7 @@ use walrus::{FunctionBuilder, FunctionId, MemoryId, Module, ModuleConfig, ValTyp
 use volumetric_abi::{OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput};
 
 #[derive(Clone, Debug, serde::Deserialize)]
+#[serde(default)]
 struct TranslateConfig {
     dx: f32,
     dy: f32,
@@ -70,16 +75,41 @@ fn generate_hex_suffix() -> String {
     result
 }
 
-/// Emit code that subtracts the translation from the first 3 dims in place
-/// at `pos_ptr` (shared by the `sample` and `sample_channels` wrappers).
+/// Read the constant a trivial `() -> i32` function returns, if its body is
+/// a single `i32.const`. Every model generator emits `get_dimensions` this
+/// way, so this is how the operator adapts to the input's dimensionality
+/// without being able to instantiate it.
+fn const_i32_return(module: &Module, func_id: FunctionId) -> Option<i32> {
+    let local = match &module.funcs.get(func_id).kind {
+        walrus::FunctionKind::Local(local) => local,
+        _ => return None,
+    };
+    let block = local.block(local.entry_block());
+    match block.instrs.as_slice() {
+        [(walrus::ir::Instr::Const(c), _)] => match c.value {
+            walrus::ir::Value::I32(v) => Some(v),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Emit code that subtracts the translation from the first `spatial` dims in
+/// place at `pos_ptr` (shared by the `sample` and `sample_channels`
+/// wrappers). `spatial` is min(input dims, 3): the transform touches the
+/// spatial prefix and passes higher dimensions through.
 fn emit_position_rewrite(
     builder: &mut FunctionBuilder,
     pos_ptr: walrus::LocalId,
     memory_id: MemoryId,
     cfg: &TranslateConfig,
+    spatial: usize,
 ) {
-    // pos[i] -= d for each axis
-    for (offset, d) in [(0, cfg.dx), (8, cfg.dy), (16, cfg.dz)] {
+    // pos[i] -= d for each spatial axis
+    for (offset, d) in [(0, cfg.dx), (8, cfg.dy), (16, cfg.dz)][..spatial]
+        .iter()
+        .copied()
+    {
         let mem_arg = walrus::ir::MemArg { align: 3, offset };
         builder
             .func_body()
@@ -138,6 +168,20 @@ fn transform_wasm(input_bytes: &[u8], cfg: TranslateConfig) -> Result<Vec<u8>, S
         );
     }
 
+    // Adapt to the input's dimensionality: only the spatial prefix
+    // min(dims, 3) is translated. Writing all 3 axes into a 2D model would
+    // corrupt memory past its 2*2-f64 IO buffer.
+    let dims_func = renamed_functions
+        .get("get_dimensions")
+        .ok_or("Input model missing `get_dimensions` export")?;
+    let dims = const_i32_return(&module, *dims_func).ok_or(
+        "cannot determine input model dimensionality (get_dimensions is not a constant function)",
+    )?;
+    if dims < 1 {
+        return Err(format!("input model reports invalid dimensionality {dims}"));
+    }
+    let spatial = (dims as usize).min(3);
+
     // Remove the exports we wrap; memory, get_dimensions and get_io_ptr pass through
     for export_id in exports_to_remove {
         let export_name = module.exports.get(export_id).name.clone();
@@ -161,7 +205,7 @@ fn transform_wasm(input_bytes: &[u8], cfg: TranslateConfig) -> Result<Vec<u8>, S
         let mut builder = FunctionBuilder::new(&mut module.types, &[ValType::I32], &[ValType::F32]);
         let pos_ptr = module.locals.add(ValType::I32);
 
-        emit_position_rewrite(&mut builder, pos_ptr, memory_id, &cfg);
+        emit_position_rewrite(&mut builder, pos_ptr, memory_id, &cfg, spatial);
         builder
             .func_body()
             .local_get(pos_ptr)
@@ -180,7 +224,7 @@ fn transform_wasm(input_bytes: &[u8], cfg: TranslateConfig) -> Result<Vec<u8>, S
         let pos_ptr = module.locals.add(ValType::I32);
         let out_ptr = module.locals.add(ValType::I32);
 
-        emit_position_rewrite(&mut builder, pos_ptr, memory_id, &cfg);
+        emit_position_rewrite(&mut builder, pos_ptr, memory_id, &cfg, spatial);
         builder
             .func_body()
             .local_get(pos_ptr)
@@ -206,114 +250,28 @@ fn transform_wasm(input_bytes: &[u8], cfg: TranslateConfig) -> Result<Vec<u8>, S
             .local_get(out_ptr)
             .call(original_bounds_id);
 
-        let mem_arg = walrus::ir::MemArg {
-            align: 3,
-            offset: 0,
-        };
-
-        // Add dx to min_x (offset 0)
-        builder
-            .func_body()
-            .local_get(out_ptr)
-            .load(memory_id, walrus::ir::LoadKind::F64, mem_arg)
-            .f64_const(cfg.dx as f64)
-            .binop(walrus::ir::BinaryOp::F64Add)
-            .local_set(tmp);
-        builder.func_body().local_get(out_ptr).local_get(tmp).store(
-            memory_id,
-            walrus::ir::StoreKind::F64,
-            mem_arg,
-        );
-
-        // Add dx to max_x (offset 8)
-        let mem_arg_8 = walrus::ir::MemArg {
-            align: 3,
-            offset: 8,
-        };
-        builder
-            .func_body()
-            .local_get(out_ptr)
-            .load(memory_id, walrus::ir::LoadKind::F64, mem_arg_8)
-            .f64_const(cfg.dx as f64)
-            .binop(walrus::ir::BinaryOp::F64Add)
-            .local_set(tmp);
-        builder.func_body().local_get(out_ptr).local_get(tmp).store(
-            memory_id,
-            walrus::ir::StoreKind::F64,
-            mem_arg_8,
-        );
-
-        // Add dy to min_y (offset 16)
-        let mem_arg_16 = walrus::ir::MemArg {
-            align: 3,
-            offset: 16,
-        };
-        builder
-            .func_body()
-            .local_get(out_ptr)
-            .load(memory_id, walrus::ir::LoadKind::F64, mem_arg_16)
-            .f64_const(cfg.dy as f64)
-            .binop(walrus::ir::BinaryOp::F64Add)
-            .local_set(tmp);
-        builder.func_body().local_get(out_ptr).local_get(tmp).store(
-            memory_id,
-            walrus::ir::StoreKind::F64,
-            mem_arg_16,
-        );
-
-        // Add dy to max_y (offset 24)
-        let mem_arg_24 = walrus::ir::MemArg {
-            align: 3,
-            offset: 24,
-        };
-        builder
-            .func_body()
-            .local_get(out_ptr)
-            .load(memory_id, walrus::ir::LoadKind::F64, mem_arg_24)
-            .f64_const(cfg.dy as f64)
-            .binop(walrus::ir::BinaryOp::F64Add)
-            .local_set(tmp);
-        builder.func_body().local_get(out_ptr).local_get(tmp).store(
-            memory_id,
-            walrus::ir::StoreKind::F64,
-            mem_arg_24,
-        );
-
-        // Add dz to min_z (offset 32)
-        let mem_arg_32 = walrus::ir::MemArg {
-            align: 3,
-            offset: 32,
-        };
-        builder
-            .func_body()
-            .local_get(out_ptr)
-            .load(memory_id, walrus::ir::LoadKind::F64, mem_arg_32)
-            .f64_const(cfg.dz as f64)
-            .binop(walrus::ir::BinaryOp::F64Add)
-            .local_set(tmp);
-        builder.func_body().local_get(out_ptr).local_get(tmp).store(
-            memory_id,
-            walrus::ir::StoreKind::F64,
-            mem_arg_32,
-        );
-
-        // Add dz to max_z (offset 40)
-        let mem_arg_40 = walrus::ir::MemArg {
-            align: 3,
-            offset: 40,
-        };
-        builder
-            .func_body()
-            .local_get(out_ptr)
-            .load(memory_id, walrus::ir::LoadKind::F64, mem_arg_40)
-            .f64_const(cfg.dz as f64)
-            .binop(walrus::ir::BinaryOp::F64Add)
-            .local_set(tmp);
-        builder.func_body().local_get(out_ptr).local_get(tmp).store(
-            memory_id,
-            walrus::ir::StoreKind::F64,
-            mem_arg_40,
-        );
+        // Add the axis delta to both interleaved min/max slots, spatial
+        // prefix only — the input's bounds buffer holds exactly 2*dims f64s.
+        for (axis, d) in [cfg.dx, cfg.dy, cfg.dz][..spatial].iter().enumerate() {
+            for slot in 0..2 {
+                let mem_arg = walrus::ir::MemArg {
+                    align: 3,
+                    offset: (axis * 16 + slot * 8) as u64,
+                };
+                builder
+                    .func_body()
+                    .local_get(out_ptr)
+                    .load(memory_id, walrus::ir::LoadKind::F64, mem_arg)
+                    .f64_const(*d as f64)
+                    .binop(walrus::ir::BinaryOp::F64Add)
+                    .local_set(tmp);
+                builder.func_body().local_get(out_ptr).local_get(tmp).store(
+                    memory_id,
+                    walrus::ir::StoreKind::F64,
+                    mem_arg,
+                );
+            }
+        }
 
         let wrapper_id = builder.finish(vec![out_ptr], &mut module.funcs);
         module.exports.add("get_bounds", wrapper_id);
@@ -332,7 +290,13 @@ pub extern "C" fn run() {
             TranslateConfig::default()
         } else {
             let mut cursor = std::io::Cursor::new(&cfg_buf);
-            ciborium::de::from_reader::<TranslateConfig, _>(&mut cursor).unwrap_or_default()
+            match ciborium::de::from_reader::<TranslateConfig, _>(&mut cursor) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    report_error(&format!("invalid configuration: {e}"));
+                    return;
+                }
+            }
         }
     };
 

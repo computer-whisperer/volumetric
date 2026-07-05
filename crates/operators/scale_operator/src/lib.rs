@@ -14,6 +14,10 @@
 //!   transform doesn't change what the samples mean)
 //! - `memory`: Passed through from input model
 //!
+//! Dimension-adaptive: the wrapper reads the input's `get_dimensions`
+//! constant and scales only the spatial prefix min(dims, 3) — a 2D sketch
+//! uses sx/sy (sz is ignored), and higher dimensions pass through.
+//!
 //! Behavior:
 //! - Reads WASM model bytes from input 0
 //! - Reads CBOR configuration from input 1
@@ -26,6 +30,7 @@ use walrus::{FunctionBuilder, FunctionId, MemoryId, Module, ModuleConfig, ValTyp
 use volumetric_abi::{OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput};
 
 #[derive(Clone, Debug, serde::Deserialize)]
+#[serde(default)]
 struct ScaleConfig {
     sx: f32,
     sy: f32,
@@ -69,18 +74,43 @@ fn generate_hex_suffix() -> String {
     result
 }
 
-/// Emit code that divides the first 3 dims by the scale factors in place at
-/// `pos_ptr` (shared by the `sample` and `sample_channels` wrappers).
+/// Read the constant a trivial `() -> i32` function returns, if its body is
+/// a single `i32.const`. Every model generator emits `get_dimensions` this
+/// way, so this is how the operator adapts to the input's dimensionality
+/// without being able to instantiate it.
+fn const_i32_return(module: &Module, func_id: FunctionId) -> Option<i32> {
+    let local = match &module.funcs.get(func_id).kind {
+        walrus::FunctionKind::Local(local) => local,
+        _ => return None,
+    };
+    let block = local.block(local.entry_block());
+    match block.instrs.as_slice() {
+        [(walrus::ir::Instr::Const(c), _)] => match c.value {
+            walrus::ir::Value::I32(v) => Some(v),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Emit code that divides the first `spatial` dims by the scale factors in
+/// place at `pos_ptr` (shared by the `sample` and `sample_channels`
+/// wrappers). `spatial` is min(input dims, 3): the transform touches the
+/// spatial prefix and passes higher dimensions through.
 fn emit_position_rewrite(
     b: &mut FunctionBuilder,
     pos_ptr: walrus::LocalId,
     memory_id: MemoryId,
     cfg: &ScaleConfig,
+    spatial: usize,
 ) {
     use walrus::ir::BinaryOp::F64Div;
 
-    // pos[i] /= s for each axis
-    for (offset, s) in [(0, cfg.sx), (8, cfg.sy), (16, cfg.sz)] {
+    // pos[i] /= s for each spatial axis
+    for (offset, s) in [(0, cfg.sx), (8, cfg.sy), (16, cfg.sz)][..spatial]
+        .iter()
+        .copied()
+    {
         let mem_arg = walrus::ir::MemArg { align: 3, offset };
         b.func_body()
             .local_get(pos_ptr)
@@ -135,6 +165,20 @@ fn transform_wasm(input_bytes: &[u8], cfg: ScaleConfig) -> Result<Vec<u8>, Strin
         );
     }
 
+    // Adapt to the input's dimensionality: only the spatial prefix
+    // min(dims, 3) is scaled. Writing all 3 axes into a 2D model would
+    // corrupt memory past its 2*2-f64 IO buffer.
+    let dims_func = renamed
+        .get("get_dimensions")
+        .ok_or("Input model missing `get_dimensions` export")?;
+    let dims = const_i32_return(&module, *dims_func).ok_or(
+        "cannot determine input model dimensionality (get_dimensions is not a constant function)",
+    )?;
+    if dims < 1 {
+        return Err(format!("input model reports invalid dimensionality {dims}"));
+    }
+    let spatial = (dims as usize).min(3);
+
     // Remove the exports we wrap; memory, get_dimensions and get_io_ptr pass through
     for id in exports_to_remove {
         let export_name = module.exports.get(id).name.clone();
@@ -157,7 +201,7 @@ fn transform_wasm(input_bytes: &[u8], cfg: ScaleConfig) -> Result<Vec<u8>, Strin
         let mut b = FunctionBuilder::new(&mut module.types, &[ValType::I32], &[ValType::F32]);
         let pos_ptr = module.locals.add(ValType::I32);
 
-        emit_position_rewrite(&mut b, pos_ptr, memory_id, &cfg);
+        emit_position_rewrite(&mut b, pos_ptr, memory_id, &cfg, spatial);
         b.func_body().local_get(pos_ptr).call(orig);
 
         let fid = b.finish(vec![pos_ptr], &mut module.funcs);
@@ -172,7 +216,7 @@ fn transform_wasm(input_bytes: &[u8], cfg: ScaleConfig) -> Result<Vec<u8>, Strin
         let pos_ptr = module.locals.add(ValType::I32);
         let out_ptr = module.locals.add(ValType::I32);
 
-        emit_position_rewrite(&mut b, pos_ptr, memory_id, &cfg);
+        emit_position_rewrite(&mut b, pos_ptr, memory_id, &cfg, spatial);
         b.func_body()
             .local_get(pos_ptr)
             .local_get(out_ptr)
@@ -195,14 +239,15 @@ fn transform_wasm(input_bytes: &[u8], cfg: ScaleConfig) -> Result<Vec<u8>, Strin
         // Call original get_bounds
         b.func_body().local_get(out_ptr).call(orig);
 
-        // Process each axis: scale and handle sign flips
+        // Process each spatial axis: scale and handle sign flips. Only the
+        // input's own 2*dims bounds slots exist — never write past them.
         let scales = [
             (0, 8, cfg.sx as f64),
             (16, 24, cfg.sy as f64),
             (32, 40, cfg.sz as f64),
         ];
 
-        for (min_offset, max_offset, scale) in scales {
+        for (min_offset, max_offset, scale) in scales[..spatial].iter().copied() {
             let mem_arg_min = walrus::ir::MemArg {
                 align: 3,
                 offset: min_offset,
@@ -261,7 +306,13 @@ pub extern "C" fn run() {
             ScaleConfig::default()
         } else {
             let mut cursor = std::io::Cursor::new(&cfg_buf);
-            ciborium::de::from_reader::<ScaleConfig, _>(&mut cursor).unwrap_or_default()
+            match ciborium::de::from_reader::<ScaleConfig, _>(&mut cursor) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    report_error(&format!("invalid configuration: {e}"));
+                    return;
+                }
+            }
         }
     };
 
