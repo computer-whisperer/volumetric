@@ -978,12 +978,13 @@ fn asn2_stage_lines(stats: &volumetric::adaptive_surface_nets_2::MeshingStats2) 
             stats.stage4_samples
         ),
     ];
-    if stats.stage4_5_time_secs > 0.0 || stats.sharp_vertices_inserted > 0 {
+    if stats.sharp_regions > 0 || stats.sharp_candidates > 0 {
         lines.push(format!(
-            "S4.5 sharp {:.1} ms · {} inserted · {} duplicated",
+            "S4.5 sharp {:.1} ms · {} regions · {} snapped · {} welded",
             ms(stats.stage4_5_time_secs),
-            stats.sharp_vertices_inserted,
-            stats.sharp_vertices_duplicated
+            stats.sharp_regions,
+            stats.sharp_snapped_edges + stats.sharp_snapped_corners,
+            stats.sharp_welded_vertices
         ));
     }
     lines

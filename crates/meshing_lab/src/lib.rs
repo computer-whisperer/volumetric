@@ -18,11 +18,10 @@
 //! - Every claim gets re-measured on at least one curved shape (sphere,
 //!   cylinder) before it is believed; planar-only results overfit.
 
-pub mod adjacency;
-pub mod cleanup;
-pub mod fit;
+// The algorithm modules under test live in the production crate; the lab
+// re-exports them so its oracle benchmarks always measure the shipped code.
+pub use volumetric::sharp_features::{adjacency, cleanup, fit, segmentation, snap};
+
 pub mod harness;
 pub mod oracle;
 pub mod render;
-pub mod segmentation;
-pub mod snap;

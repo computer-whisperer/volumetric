@@ -11,8 +11,9 @@
 
 use glam::DVec3;
 use meshing_lab::adjacency::unique_edges;
+use meshing_lab::fit::VertexFit;
 use meshing_lab::fit::unsigned_angle_degrees;
-use meshing_lab::harness::{BUCKET_NAMES, VertexFit, mesh_shape};
+use meshing_lab::harness::{BUCKET_NAMES, mesh_shape};
 use meshing_lab::oracle::{
     BoxShape, CylinderShape, OracleShape, Rotated, SphereShape, standard_rotation,
 };

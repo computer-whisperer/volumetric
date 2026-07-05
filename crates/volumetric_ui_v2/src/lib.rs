@@ -154,12 +154,11 @@ pub struct Asn2Settings {
     /// Binary-search iterations for normal refinement probing (0 = face
     /// normals, 4-8 = smooth probed normals).
     pub normal_sample_iterations: usize,
-    /// Detect sharp edges and duplicate vertices across them.
+    /// Reconstruct sharp edges and corners (region-based snapping).
     pub sharp_edges: bool,
-    /// Sharp-edge angle threshold in whole degrees (10-90).
+    /// Sharp features: max same-region normal jump between adjacent
+    /// vertices, in whole degrees (10-90).
     pub sharp_angle_degrees: u16,
-    /// Sharp-edge plane-fit residual multiplier, tenths (10-200 = 1.0-20.0).
-    pub sharp_residual_x10: u16,
 }
 
 impl Default for Asn2Settings {
@@ -168,8 +167,7 @@ impl Default for Asn2Settings {
             vertex_refinement_iterations: 8,
             normal_sample_iterations: 0,
             sharp_edges: false,
-            sharp_angle_degrees: 30,
-            sharp_residual_x10: 40,
+            sharp_angle_degrees: 15,
         }
     }
 }
@@ -252,11 +250,10 @@ impl PreviewMeshPlan {
             normal_sample_iterations: settings.normal_sample_iterations,
             normal_epsilon_frac: 0.1,
             num_threads: 0,
-            sharp_edge_config: settings.sharp_edges.then(|| {
-                adaptive_surface_nets_2::SharpEdgeConfig {
-                    angle_threshold: f64::from(settings.sharp_angle_degrees).to_radians(),
-                    residual_multiplier: f64::from(settings.sharp_residual_x10) / 10.0,
-                }
+            sharp_features: settings.sharp_edges.then(|| {
+                let mut sharp = volumetric::sharp_features::SharpFeatureConfig::default();
+                sharp.segmentation.max_normal_jump_deg = f64::from(settings.sharp_angle_degrees);
+                sharp
             }),
         })
     }
@@ -635,10 +632,6 @@ impl VolumetricUiV2 {
             "angle" => {
                 let next = i32::from(asn2.sharp_angle_degrees) + if up { 5 } else { -5 };
                 asn2.sharp_angle_degrees = next.clamp(10, 90) as u16;
-            }
-            "resid" => {
-                let next = i32::from(asn2.sharp_residual_x10) + if up { 5 } else { -5 };
-                asn2.sharp_residual_x10 = next.clamp(10, 200) as u16;
             }
             _ => return,
         }
@@ -2188,12 +2181,6 @@ fn output_settings_popover(app: &VolumetricUiV2, id: &str) -> El {
                 "Angle (deg)",
                 &render.asn2.sharp_angle_degrees.to_string(),
             ));
-            body.push(asn2_stepper_row(
-                id,
-                "resid",
-                "Residual mult",
-                &format!("{:.1}", f64::from(render.asn2.sharp_residual_x10) / 10.0),
-            ));
         }
     }
     if let Some(stats) = app.output_stats.get(id) {
@@ -3712,7 +3699,7 @@ mod tests {
         let render = app.output_render(&id);
         assert!(render.asn2.sharp_edges);
         assert_eq!(render.asn2.vertex_refinement_iterations, 7);
-        assert_eq!(render.asn2.sharp_angle_degrees, 35);
+        assert_eq!(render.asn2.sharp_angle_degrees, 20);
 
         // The settings flow through to the meshing config.
         let requests = app.preview_requests();
@@ -3722,9 +3709,8 @@ mod tests {
             .adaptive_surface_nets_config()
             .expect("asn2 config");
         assert_eq!(config.vertex_refinement_iterations, 7);
-        let sharp = config.sharp_edge_config.expect("sharp edges enabled");
-        assert!((sharp.angle_threshold - 35f64.to_radians()).abs() < 1e-9);
-        assert!((sharp.residual_multiplier - 4.0).abs() < 1e-9);
+        let sharp = config.sharp_features.expect("sharp features enabled");
+        assert!((sharp.segmentation.max_normal_jump_deg - 20.0).abs() < 1e-9);
     }
 
     #[test]

@@ -82,7 +82,7 @@ struct ResampleConfig {
     asn2_vertex_refinement_iterations: usize,
     asn2_normal_sample_iterations: usize,
     asn2_normal_epsilon_frac: f32,
-    asn2_sharp_edge_config: Option<adaptive_surface_nets_2::SharpEdgeConfig>,
+    asn2_sharp_features: Option<volumetric::sharp_features::SharpFeatureConfig>,
 }
 
 /// Result from a background task.
@@ -348,7 +348,7 @@ fn execute_resample(
                 normal_sample_iterations: config.asn2_normal_sample_iterations,
                 normal_epsilon_frac: config.asn2_normal_epsilon_frac,
                 num_threads: 0,
-                sharp_edge_config: config.asn2_sharp_edge_config.clone(),
+                sharp_features: config.asn2_sharp_features.clone(),
             };
             match generate_adaptive_mesh_v2_from_bytes(&wasm_bytes, &asn2_config) {
                 Ok(meshing_result) => {
@@ -477,7 +477,7 @@ fn execute_resample(
                 normal_sample_iterations: config.asn2_normal_sample_iterations,
                 normal_epsilon_frac: config.asn2_normal_epsilon_frac,
                 num_threads: 0, // Web is single-threaded
-                sharp_edge_config: config.asn2_sharp_edge_config.clone(),
+                sharp_features: config.asn2_sharp_features.clone(),
             };
             match generate_adaptive_mesh_v2_from_bytes(&wasm_bytes, &asn2_config) {
                 Ok(meshing_result) => {
@@ -832,7 +832,7 @@ struct AssetRenderData {
     /// Adaptive Surface Nets v2: epsilon fraction for normal estimation
     asn2_normal_epsilon_frac: f32,
     /// Adaptive Surface Nets v2: sharp edge detection config (None = disabled)
-    asn2_sharp_edge_config: Option<adaptive_surface_nets_2::SharpEdgeConfig>,
+    asn2_sharp_features: Option<volumetric::sharp_features::SharpFeatureConfig>,
 
     /// Detailed profiling stats from the last ASN2 meshing operation
     asn2_stats: Option<adaptive_surface_nets_2::MeshingStats2>,
@@ -862,7 +862,7 @@ impl AssetRenderData {
             // Normal refinement via tangent probing - works well with binary samplers
             asn2_normal_sample_iterations: 12,
             asn2_normal_epsilon_frac: 0.1,
-            asn2_sharp_edge_config: None, // Sharp edge detection disabled by default
+            asn2_sharp_features: None, // Sharp feature reconstruction disabled by default
             asn2_stats: None,
         }
     }
@@ -1590,7 +1590,7 @@ impl VolumetricApp {
                 asn2_vertex_refinement_iterations: render_data.asn2_vertex_refinement_iterations,
                 asn2_normal_sample_iterations: render_data.asn2_normal_sample_iterations,
                 asn2_normal_epsilon_frac: render_data.asn2_normal_epsilon_frac,
-                asn2_sharp_edge_config: render_data.asn2_sharp_edge_config.clone(),
+                asn2_sharp_features: render_data.asn2_sharp_features.clone(),
             };
 
             assets_to_resample.push((
@@ -3647,18 +3647,18 @@ impl eframe::App for VolumetricApp {
 
                                         ui.separator();
 
-                                        // Sharp Edge Detection controls
-                                        let sharp_enabled = render_data.asn2_sharp_edge_config.is_some();
+                                        // Sharp feature reconstruction controls
+                                        let sharp_enabled = render_data.asn2_sharp_features.is_some();
                                         let mut sharp_checkbox = sharp_enabled;
 
                                         ui.horizontal(|ui| {
-                                            if ui.checkbox(&mut sharp_checkbox, "Sharp Edge Detection").changed() {
+                                            if ui.checkbox(&mut sharp_checkbox, "Sharp Features").changed() {
                                                 if sharp_checkbox {
-                                                    render_data.asn2_sharp_edge_config = Some(
-                                                        adaptive_surface_nets_2::SharpEdgeConfig::default()
+                                                    render_data.asn2_sharp_features = Some(
+                                                        volumetric::sharp_features::SharpFeatureConfig::default()
                                                     );
                                                 } else {
-                                                    render_data.asn2_sharp_edge_config = None;
+                                                    render_data.asn2_sharp_features = None;
                                                 }
                                                 if auto_resample {
                                                     render_data.needs_resample = true;
@@ -3666,31 +3666,20 @@ impl eframe::App for VolumetricApp {
                                             }
                                         });
 
-                                        if let Some(ref mut sharp_config) = render_data.asn2_sharp_edge_config {
-                                            let mut angle_degrees = sharp_config.angle_threshold.to_degrees();
-                                            let mut residual_mult = sharp_config.residual_multiplier;
+                                        if let Some(ref mut sharp_config) = render_data.asn2_sharp_features {
+                                            let mut angle_degrees = sharp_config.segmentation.max_normal_jump_deg;
 
                                             ui.horizontal(|ui| {
-                                                ui.label("  Angle Threshold:");
+                                                ui.label("  Region angle gate:");
                                                 if ui.add(egui::DragValue::new(&mut angle_degrees).range(10.0..=90.0).suffix("°")).changed() {
-                                                    sharp_config.angle_threshold = angle_degrees.to_radians();
+                                                    sharp_config.segmentation.max_normal_jump_deg = angle_degrees;
                                                     if auto_resample {
                                                         render_data.needs_resample = true;
                                                     }
                                                 }
                                             });
 
-                                            ui.horizontal(|ui| {
-                                                ui.label("  Residual Multiplier:");
-                                                if ui.add(egui::DragValue::new(&mut residual_mult).range(1.0..=20.0)).changed() {
-                                                    sharp_config.residual_multiplier = residual_mult;
-                                                    if auto_resample {
-                                                        render_data.needs_resample = true;
-                                                    }
-                                                }
-                                            });
-
-                                            ui.weak("  Detects sharp edges and duplicates vertices for crisp shading");
+                                            ui.weak("  Snaps feature-zone vertices onto fitted edges and corners");
                                         }
 
                                         ui.separator();
@@ -3763,22 +3752,19 @@ impl eframe::App for VolumetricApp {
                                             });
                                             ui.weak(format!("  {} samples", stats.stage4_samples));
 
-                                            // Show Stage 4.5 (Sharp Edges) if any processing occurred
-                                            if stats.sharp_vertices_case1 > 0
-                                                || stats.sharp_edge_crossings > 0
-                                                || stats.sharp_vertices_duplicated > 0
-                                            {
+                                            // Show Stage 4.5 (Sharp Features) if any processing occurred
+                                            if stats.sharp_regions > 0 || stats.sharp_candidates > 0 {
                                                 ui.horizontal(|ui| {
-                                                    ui.weak("Stage 4.5 (Sharp Edges):");
+                                                    ui.weak("Stage 4.5 (Sharp Features):");
                                                     ui.weak(format!("{:.2}ms ({:.1}%)",
                                                         stats.stage4_5_time_secs * 1000.0,
                                                         stats.stage4_5_time_secs / stats.total_time_secs * 100.0));
                                                 });
-                                                ui.weak(format!("  Case1: {}, Crossings: {}, Inserted: {}, Duplicated: {}",
-                                                    stats.sharp_vertices_case1,
-                                                    stats.sharp_edge_crossings,
-                                                    stats.sharp_vertices_inserted,
-                                                    stats.sharp_vertices_duplicated));
+                                                ui.weak(format!("  Regions: {}, Snapped: {} edge + {} corner, Welded: {}",
+                                                    stats.sharp_regions,
+                                                    stats.sharp_snapped_edges,
+                                                    stats.sharp_snapped_corners,
+                                                    stats.sharp_welded_vertices));
                                             }
                                         });
                                     }

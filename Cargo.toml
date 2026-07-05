@@ -46,8 +46,6 @@ native = ["dep:wasmtime", "dep:rayon"]
 web = ["dep:wasm-bindgen", "dep:js-sys"]
 # Enable normal refinement diagnostics (expensive, for benchmarking only)
 normal-diagnostic = []
-# Enable sharp edge detection diagnostics (expensive, for tuning only)
-edge-diagnostic = []
 
 [dependencies]
 volumetric_abi = { path = "crates/volumetric_abi" }

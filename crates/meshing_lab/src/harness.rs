@@ -7,7 +7,7 @@ use glam::DVec3;
 use volumetric::adaptive_surface_nets_2::{AdaptiveMeshConfig2, adaptive_surface_nets_2};
 
 use crate::adjacency::MeshAdjacency;
-use crate::fit::fit_plane;
+use crate::fit::{VertexFit, ring_fits};
 use crate::oracle::{OracleShape, SurfaceTruth};
 
 /// A shape meshed by the real adaptive surface nets pipeline, with oracle
@@ -42,7 +42,7 @@ pub fn mesh_shape(shape: &dyn OracleShape, max_depth: usize) -> MeshedShape<'_> 
         normal_sample_iterations: 0,
         normal_epsilon_frac: 0.1,
         num_threads: 0,
-        sharp_edge_config: None,
+        sharp_features: None,
     };
     let finest_cells = config.base_resolution * (1 << config.max_depth);
     let cell = (hi - lo).max_element() / finest_cells as f64;
@@ -86,50 +86,6 @@ pub fn mesh_shape(shape: &dyn OracleShape, max_depth: usize) -> MeshedShape<'_> 
         total_samples: result.stats.total_samples,
         refine_misses: result.stats.stage4_refine_miss,
     }
-}
-
-/// Per-vertex plane fit over a k-ring neighborhood.
-#[derive(Clone, Debug)]
-pub struct VertexFit {
-    /// Fitted plane normal, oriented outward when a reference normal is
-    /// available (sign is otherwise the PCA's arbitrary choice).
-    pub normal: DVec3,
-    /// RMS point-to-plane distance in cell units.
-    pub residual_cells: f64,
-}
-
-/// Fit a plane to each vertex's k-ring. `orient_refs` supplies outward
-/// reference normals (typically the accumulated mesh normals); pass an empty
-/// slice to skip orientation. Vertices with fewer than 4 ring members or a
-/// degenerate fit get `None`.
-pub fn ring_fits(
-    positions: &[DVec3],
-    adjacency: &MeshAdjacency,
-    orient_refs: &[DVec3],
-    cell: f64,
-    k: usize,
-) -> Vec<Option<VertexFit>> {
-    (0..positions.len() as u32)
-        .map(|v| {
-            let ring = adjacency.k_ring(v, k);
-            if ring.len() < 4 {
-                return None;
-            }
-            let pts: Vec<DVec3> = ring.iter().map(|&u| positions[u as usize]).collect();
-            let fit = fit_plane(&pts)?;
-            let mut normal = fit.normal;
-            if let Some(reference) = orient_refs.get(v as usize)
-                && reference.length_squared() > 0.25
-                && normal.dot(*reference) < 0.0
-            {
-                normal = -normal;
-            }
-            Some(VertexFit {
-                normal,
-                residual_cells: fit.rms_residual / cell,
-            })
-        })
-        .collect()
 }
 
 impl MeshedShape<'_> {

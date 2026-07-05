@@ -142,6 +142,50 @@ pub fn unsigned_angle_degrees(a: DVec3, b: DVec3) -> f64 {
     a.dot(b).abs().clamp(0.0, 1.0).acos().to_degrees()
 }
 
+/// Per-vertex plane fit over a k-ring neighborhood.
+#[derive(Clone, Debug)]
+pub struct VertexFit {
+    /// Fitted plane normal, oriented outward when a reference normal is
+    /// available (sign is otherwise the PCA's arbitrary choice).
+    pub normal: DVec3,
+    /// RMS point-to-plane distance in cell units.
+    pub residual_cells: f64,
+}
+
+/// Fit a plane to each vertex's k-ring. `orient_refs` supplies outward
+/// reference normals (typically the accumulated mesh normals); pass an empty
+/// slice to skip orientation. Vertices with fewer than 4 ring members or a
+/// degenerate fit get `None`.
+pub fn ring_fits(
+    positions: &[DVec3],
+    adjacency: &crate::sharp_features::adjacency::MeshAdjacency,
+    orient_refs: &[DVec3],
+    cell: f64,
+    k: usize,
+) -> Vec<Option<VertexFit>> {
+    (0..positions.len() as u32)
+        .map(|v| {
+            let ring = adjacency.k_ring(v, k);
+            if ring.len() < 4 {
+                return None;
+            }
+            let pts: Vec<DVec3> = ring.iter().map(|&u| positions[u as usize]).collect();
+            let fit = fit_plane(&pts)?;
+            let mut normal = fit.normal;
+            if let Some(reference) = orient_refs.get(v as usize)
+                && reference.length_squared() > 0.25
+                && normal.dot(*reference) < 0.0
+            {
+                normal = -normal;
+            }
+            Some(VertexFit {
+                normal,
+                residual_cells: fit.rms_residual / cell,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

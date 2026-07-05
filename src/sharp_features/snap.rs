@@ -16,8 +16,8 @@
 
 use glam::DVec3;
 
-use crate::adjacency::MeshAdjacency;
-use crate::fit::fit_plane;
+use crate::sharp_features::adjacency::MeshAdjacency;
+use crate::sharp_features::fit::fit_plane;
 
 #[derive(Clone, Debug)]
 pub struct SnapConfig {
@@ -296,8 +296,8 @@ fn intersect_three_planes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::harness::ring_fits;
-    use crate::segmentation::{SegmentationConfig, segment_regions};
+    use crate::sharp_features::fit::ring_fits;
+    use crate::sharp_features::segmentation::{SegmentationConfig, segment_regions};
 
     fn plane(normal: DVec3, centroid: DVec3) -> SidePlane {
         SidePlane {

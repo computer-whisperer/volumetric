@@ -75,17 +75,14 @@ pub struct RenderArgs {
     #[arg(long, default_value = "0.1")]
     pub normal_epsilon: f32,
 
-    /// Enable sharp edge detection and vertex duplication
+    /// Enable sharp feature reconstruction (region-based edge/corner snapping)
     #[arg(long)]
     pub sharp_edges: bool,
 
-    /// Sharp edge angle threshold in degrees (default: 20)
-    #[arg(long, default_value = "20.0")]
+    /// Sharp features: max same-region normal jump between adjacent vertices
+    /// in degrees (default: 15)
+    #[arg(long, default_value = "15.0")]
     pub sharp_angle: f64,
-
-    /// Sharp edge residual multiplier (default: 4.0)
-    #[arg(long, default_value = "4.0")]
-    pub sharp_residual: f64,
 
     /// Suppress profiling output
     #[arg(short, long)]
@@ -418,7 +415,6 @@ pub fn run_render(args: RenderArgs) -> Result<()> {
         args.normal_epsilon,
         args.sharp_edges,
         args.sharp_angle,
-        args.sharp_residual,
     );
 
     let effective_res = config.base_resolution * (1 << config.max_depth);

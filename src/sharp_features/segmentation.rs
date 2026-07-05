@@ -16,9 +16,9 @@
 //! High-residual vertices are never claimed; they form the feature zone
 //! between regions and are resolved by later pipeline stages.
 
-use crate::adjacency::MeshAdjacency;
-use crate::fit::unsigned_angle_degrees;
-use crate::harness::VertexFit;
+use crate::sharp_features::adjacency::MeshAdjacency;
+use crate::sharp_features::fit::VertexFit;
+use crate::sharp_features::fit::unsigned_angle_degrees;
 use std::collections::VecDeque;
 
 #[derive(Clone, Debug)]
@@ -141,7 +141,7 @@ pub fn segment_regions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::harness::ring_fits;
+    use crate::sharp_features::fit::ring_fits;
     use glam::DVec3;
 
     /// Triangulated (nx x ny) vertex grid; `pos` maps grid coordinates to 3D.

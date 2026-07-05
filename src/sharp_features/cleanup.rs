@@ -9,7 +9,7 @@
 //! mapping to the same output vertex) are dropped; that cannot open a hole,
 //! because every neighbor sharing a welded edge sees the same collapse.
 
-use crate::snap::SnapKind;
+use crate::sharp_features::snap::SnapKind;
 use glam::DVec3;
 use std::collections::HashMap;
 
