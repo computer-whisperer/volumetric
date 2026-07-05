@@ -1,5 +1,5 @@
 [package]
-name = "stl_import_operator"
+name = "mesh_to_model_operator"
 version = "0.1.0"
 edition = "2024"
 
@@ -8,5 +8,5 @@ crate-type = ["cdylib"]
 
 [dependencies]
 volumetric_abi = { path = "../../volumetric_abi" }
-serde = { version = "1", features = ["derive"] }
-ciborium = "0.2"
+trimesh_model_core = { path = "../../trimesh_model_core" }
+walrus = "0.26"

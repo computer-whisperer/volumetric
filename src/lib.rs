@@ -177,6 +177,9 @@ pub enum AssetTypeHint {
     /// CBOR-encoded FEA mesh (explicit nodes/elements/attributes; not a
     /// sampleable field, so never handed to the model executor)
     FeaMesh,
+    /// CBOR-encoded general-purpose triangle mesh (explicit data, no
+    /// manifold requirement; never handed to the model executor)
+    TriMesh,
 }
 
 impl std::fmt::Display for AssetTypeHint {
@@ -189,6 +192,7 @@ impl std::fmt::Display for AssetTypeHint {
             AssetTypeHint::Binary => write!(f, "Binary"),
             AssetTypeHint::VecF64(dim) => write!(f, "VecF64({dim})"),
             AssetTypeHint::FeaMesh => write!(f, "FeaMesh"),
+            AssetTypeHint::TriMesh => write!(f, "TriMesh"),
         }
     }
 }
@@ -200,6 +204,7 @@ impl From<&OperatorMetadataOutput> for AssetTypeHint {
         match output {
             OperatorMetadataOutput::ModelWASM => AssetTypeHint::Model,
             OperatorMetadataOutput::FeaMesh => AssetTypeHint::FeaMesh,
+            OperatorMetadataOutput::TriMesh => AssetTypeHint::TriMesh,
         }
     }
 }
@@ -270,6 +275,9 @@ pub use volumetric_abi::{OperatorMetadata, OperatorMetadataInput, OperatorMetada
 
 // The FEA mesh value type (CBOR payload of FeaMesh-typed assets).
 pub use volumetric_abi::fea;
+
+// The triangle mesh value type (CBOR payload of TriMesh-typed assets).
+pub use volumetric_abi::trimesh;
 
 /// Load `OperatorMetadata` from an operator WASM module via its `get_metadata()` export.
 ///

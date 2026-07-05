@@ -416,6 +416,7 @@ pub fn run_project_export(args: ProjectExportArgs) -> Result<()> {
             AssetTypeHint::Model | AssetTypeHint::Operator => "wasm",
             AssetTypeHint::LuaSource => "lua",
             AssetTypeHint::FeaMesh => "vfea",
+            AssetTypeHint::TriMesh => "vmesh",
             _ => "bin",
         };
 

@@ -2755,6 +2755,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mesh_to_model_operator"
+version = "0.1.0"
+dependencies = [
+ "trimesh_model_core",
+ "volumetric_abi",
+ "walrus",
+]
+
+[[package]]
 name = "meshing_lab"
 version = "0.1.0"
 dependencies = [
@@ -4325,7 +4334,6 @@ dependencies = [
  "ciborium",
  "serde",
  "volumetric_abi",
- "wasm-encoder 0.248.0",
 ]
 
 [[package]]
@@ -4645,6 +4653,20 @@ dependencies = [
  "memchr",
  "nom",
  "petgraph 0.8.3",
+]
+
+[[package]]
+name = "trimesh_model_core"
+version = "0.1.0"
+dependencies = [
+ "volumetric_abi",
+]
+
+[[package]]
+name = "trimesh_model_template"
+version = "0.1.0"
+dependencies = [
+ "trimesh_model_core",
 ]
 
 [[package]]

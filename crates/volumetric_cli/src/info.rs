@@ -187,6 +187,7 @@ enum InputInfo {
     VecF64 { dimension: usize },
     Blob,
     FeaMesh,
+    TriMesh,
 }
 
 #[derive(Debug, Serialize)]
@@ -194,6 +195,7 @@ enum InputInfo {
 enum OutputInfo {
     ModelWasm,
     FeaMesh,
+    TriMesh,
 }
 
 #[derive(Debug, Serialize)]
@@ -228,6 +230,7 @@ fn metadata_to_json(meta: &OperatorMetadata) -> OperatorMetadataJson {
                 OperatorMetadataInput::VecF64(dim) => InputInfo::VecF64 { dimension: *dim },
                 OperatorMetadataInput::Blob => InputInfo::Blob,
                 OperatorMetadataInput::FeaMesh => InputInfo::FeaMesh,
+                OperatorMetadataInput::TriMesh => InputInfo::TriMesh,
             })
             .collect(),
         outputs: meta
@@ -236,6 +239,7 @@ fn metadata_to_json(meta: &OperatorMetadata) -> OperatorMetadataJson {
             .map(|o| match o {
                 OperatorMetadataOutput::ModelWASM => OutputInfo::ModelWasm,
                 OperatorMetadataOutput::FeaMesh => OutputInfo::FeaMesh,
+                OperatorMetadataOutput::TriMesh => OutputInfo::TriMesh,
             })
             .collect(),
     }
@@ -348,6 +352,9 @@ fn print_info_human(output: &InfoOutput) {
                     InputInfo::FeaMesh => {
                         println!("  [{}] FEA Mesh", i);
                     }
+                    InputInfo::TriMesh => {
+                        println!("  [{}] Triangle Mesh", i);
+                    }
                 }
             }
             println!("Outputs:");
@@ -355,6 +362,7 @@ fn print_info_human(output: &InfoOutput) {
                 match output {
                     OutputInfo::ModelWasm => println!("  [{}] ModelWASM", i),
                     OutputInfo::FeaMesh => println!("  [{}] FEA Mesh", i),
+                    OutputInfo::TriMesh => println!("  [{}] Triangle Mesh", i),
                 }
             }
         }

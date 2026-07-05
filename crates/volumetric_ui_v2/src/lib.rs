@@ -363,6 +363,7 @@ pub struct ProjectSummary {
 enum AssetSlotKind {
     Model,
     FeaMesh,
+    TriMesh,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -702,7 +703,7 @@ impl VolumetricUiV2 {
     fn render_request_for_asset(&self, asset: &LoadedAsset) -> Option<PreviewRequest> {
         if !matches!(
             asset.type_hint(),
-            Some(AssetTypeHint::Model | AssetTypeHint::FeaMesh) | None
+            Some(AssetTypeHint::Model | AssetTypeHint::FeaMesh | AssetTypeHint::TriMesh) | None
         ) {
             return None;
         }
@@ -1000,6 +1001,7 @@ impl VolumetricUiV2 {
                 let kind = match input {
                     OperatorMetadataInput::ModelWASM => AssetSlotKind::Model,
                     OperatorMetadataInput::FeaMesh => AssetSlotKind::FeaMesh,
+                    OperatorMetadataInput::TriMesh => AssetSlotKind::TriMesh,
                     _ => return None,
                 };
                 Some(AssetSlot {
@@ -1416,7 +1418,7 @@ impl VolumetricUiV2 {
         };
         // Import operators take no model inputs, so the primary-model id is
         // never referenced; the schema-derived config defaults are what matter.
-        let mut inputs = operator_step_inputs(&metadata, "", None);
+        let mut inputs = operator_step_inputs(&metadata, &SlotPrimaries::default());
         let Some(blob_slot) = metadata
             .inputs
             .iter()
@@ -1435,8 +1437,32 @@ impl VolumetricUiV2 {
             vec![output_id.clone()],
             output_id.clone(),
         );
+
+        // A TriMesh-producing import (STL) also gets a conversion step so
+        // the import yields a usable solid out of the box, matching the old
+        // one-step importer. Non-manifold meshes still render as meshes;
+        // the convert step is separate and deletable.
+        let mut final_id = output_id.clone();
+        if matches!(
+            metadata.outputs.first(),
+            Some(volumetric::OperatorMetadataOutput::TriMesh)
+        ) && let Some(converter) = volumetric_assets::get_operator("mesh_to_model_operator")
+        {
+            let solid_id = self
+                .project
+                .default_output_name("mesh_to_model", Some(&output_id));
+            self.project.insert_operation(
+                converter.name,
+                converter.bytes.to_vec(),
+                vec![ExecutionInput::AssetRef(output_id.clone())],
+                vec![solid_id.clone()],
+                solid_id.clone(),
+            );
+            final_id = solid_id;
+        }
+
         self.mark_project_dirty();
-        self.selected_export = Some(output_id.clone());
+        self.selected_export = Some(final_id.clone());
         self.selected_project_item = self
             .project
             .timeline()
@@ -1483,7 +1509,7 @@ impl VolumetricUiV2 {
         // Build the step's inputs from the operator's declared metadata so
         // config blobs, Lua templates, and extra model/mesh slots are all
         // wired up (not just the first model input). The selection fills the
-        // slot matching its own type; the other kind falls back to the first
+        // slot matching its own type; the other kinds fall back to the first
         // asset of that kind in the project.
         let typed = self.declared_assets_typed();
         let hint_of = |id: &str| {
@@ -1498,16 +1524,30 @@ impl VolumetricUiV2 {
                 .find(|(_, hint)| *hint == Some(kind))
                 .map(|(id, _)| id.clone())
         };
-        let (primary_model, primary_fea) = if hint_of(&input_id) == Some(AssetTypeHint::FeaMesh) {
-            (
-                first_of(AssetTypeHint::Model).unwrap_or_default(),
-                Some(input_id.clone()),
-            )
-        } else {
-            (input_id.clone(), first_of(AssetTypeHint::FeaMesh))
+        let selected_hint = hint_of(&input_id);
+        let for_kind = |kind: AssetTypeHint| {
+            if selected_hint == Some(kind) {
+                Some(input_id.clone())
+            } else {
+                first_of(kind)
+            }
         };
+        let primary_model = if matches!(selected_hint, Some(AssetTypeHint::Model) | None) {
+            input_id.clone()
+        } else {
+            first_of(AssetTypeHint::Model).unwrap_or_default()
+        };
+        let primary_fea = for_kind(AssetTypeHint::FeaMesh);
+        let primary_trimesh = for_kind(AssetTypeHint::TriMesh);
         let inputs = match volumetric::operator_metadata_from_wasm_bytes(asset.bytes) {
-            Ok(metadata) => operator_step_inputs(&metadata, &primary_model, primary_fea.as_deref()),
+            Ok(metadata) => operator_step_inputs(
+                &metadata,
+                &SlotPrimaries {
+                    model: &primary_model,
+                    fea: primary_fea.as_deref(),
+                    trimesh: primary_trimesh.as_deref(),
+                },
+            ),
             Err(err) => {
                 self.status = format!("couldn't read {} metadata: {err}", asset.display_name);
                 vec![ExecutionInput::AssetRef(input_id.clone())]
@@ -2858,6 +2898,7 @@ fn step_edit_rows(app: &VolumetricUiV2, step_idx: usize) -> Vec<El> {
     if !edit.asset_slots.is_empty() {
         let models = editable_model_asset_ids(app);
         let meshes = editable_fea_asset_ids(app);
+        let trimeshes = editable_trimesh_asset_ids(app);
         rows.push(text("Inputs").muted().caption().semibold());
         for (n, slot) in edit.asset_slots.iter().enumerate() {
             let current = match step.inputs.get(slot.input_idx) {
@@ -2867,6 +2908,7 @@ fn step_edit_rows(app: &VolumetricUiV2, step_idx: usize) -> Vec<El> {
             let options = match slot.kind {
                 AssetSlotKind::Model => &models,
                 AssetSlotKind::FeaMesh => &meshes,
+                AssetSlotKind::TriMesh => &trimeshes,
             };
             rows.push(asset_slot_selector(
                 step_idx,
@@ -3180,20 +3222,31 @@ fn asset_type_label(type_hint: Option<AssetTypeHint>) -> &'static str {
         Some(AssetTypeHint::Binary) => "Binary",
         Some(AssetTypeHint::VecF64(_)) => "Vec",
         Some(AssetTypeHint::FeaMesh) => "FEA Mesh",
+        Some(AssetTypeHint::TriMesh) => "Tri Mesh",
         None => "Asset",
     }
 }
 
+/// The assets a fresh step's typed slots initially point at (retargeted
+/// later via the step editor's pickers).
+#[derive(Default)]
+struct SlotPrimaries<'a> {
+    model: &'a str,
+    fea: Option<&'a str>,
+    trimesh: Option<&'a str>,
+}
+
 /// Builds a fresh step's inputs, one per declared operator metadata input, in
-/// order. Model slots point at `primary_model`, FeaMesh slots at
-/// `primary_fea` (retarget later via the step editor's pickers); config
-/// slots get a default-seeded CBOR map; Lua slots get the template; other
-/// slots get empty/zeroed placeholders.
+/// order. Typed asset slots point at the matching primary; config slots get
+/// a default-seeded CBOR map; Lua slots get the template; other slots get
+/// empty/zeroed placeholders.
 fn operator_step_inputs(
     metadata: &OperatorMetadata,
-    primary_model: &str,
-    primary_fea: Option<&str>,
+    primaries: &SlotPrimaries<'_>,
 ) -> Vec<ExecutionInput> {
+    let primary_model = primaries.model;
+    let primary_fea = primaries.fea;
+    let primary_trimesh = primaries.trimesh;
     metadata
         .inputs
         .iter()
@@ -3211,10 +3264,14 @@ fn operator_step_inputs(
             }
             OperatorMetadataInput::Blob => ExecutionInput::Inline(Vec::new()),
             OperatorMetadataInput::VecF64(dim) => ExecutionInput::Inline(vec![0u8; dim * 8]),
-            // With no FEA mesh in the project yet, the empty placeholder
-            // makes the operator report a bad input at run time; the step
-            // editor's picker fills it in once a producer exists.
+            // With no mesh of the right kind in the project yet, the empty
+            // placeholder makes the operator report a bad input at run time;
+            // the step editor's picker fills it in once a producer exists.
             OperatorMetadataInput::FeaMesh => match primary_fea {
+                Some(id) => ExecutionInput::AssetRef(id.to_string()),
+                None => ExecutionInput::Inline(Vec::new()),
+            },
+            OperatorMetadataInput::TriMesh => match primary_trimesh {
                 Some(id) => ExecutionInput::AssetRef(id.to_string()),
                 None => ExecutionInput::Inline(Vec::new()),
             },
@@ -3309,6 +3366,13 @@ fn editable_fea_asset_ids(app: &VolumetricUiV2) -> Vec<String> {
     app.declared_assets_typed()
         .into_iter()
         .filter_map(|(id, type_hint)| (type_hint == Some(AssetTypeHint::FeaMesh)).then_some(id))
+        .collect()
+}
+
+fn editable_trimesh_asset_ids(app: &VolumetricUiV2) -> Vec<String> {
+    app.declared_assets_typed()
+        .into_iter()
+        .filter_map(|(id, type_hint)| (type_hint == Some(AssetTypeHint::TriMesh)).then_some(id))
         .collect()
 }
 
@@ -4052,13 +4116,22 @@ mod tests {
         let stl = vec![0xAB; 96];
         app.import_blob_asset("stl_import_operator", "stl_import", stl.clone());
 
+        // An STL import stages two steps: STL -> TriMesh, then the wired
+        // mesh -> model conversion, so the import yields a usable solid.
         let summary = app.summary();
-        assert_eq!(summary.timeline_steps, 1);
-        assert_eq!(summary.exports, 1);
+        assert_eq!(summary.timeline_steps, 2);
+        assert_eq!(summary.exports, 2);
         assert_eq!(
             summary.selected_project_item,
-            Some(ProjectSelection::Step(0))
+            Some(ProjectSelection::Step(1))
         );
+        let convert = &app.project().timeline()[1];
+        assert_eq!(convert.operator_id, "mesh_to_model_operator");
+        let mesh_id = app.project().timeline()[0].outputs[0].clone();
+        assert!(matches!(
+            &convert.inputs[0],
+            ExecutionInput::AssetRef(id) if *id == mesh_id
+        ));
 
         // The operator's Blob slot holds the file bytes; the config slot got
         // its schema defaults.

@@ -95,6 +95,7 @@
 use std::sync::OnceLock;
 
 pub mod fea;
+pub mod trimesh;
 
 /// The single inside/outside threshold for occupancy samples.
 ///
@@ -241,6 +242,9 @@ pub enum OperatorMetadataInput {
     /// The concrete schema ships with the first mesh-producing operator;
     /// the host UI offers a picker over FEA-mesh-typed assets.
     FeaMesh,
+    /// A CBOR-encoded general-purpose triangle mesh (see [`crate::trimesh`]);
+    /// explicit data with no manifold requirement, not a sampleable field.
+    TriMesh,
 }
 
 /// Output slot declaration in an operator's metadata.
@@ -253,6 +257,9 @@ pub enum OperatorMetadataOutput {
     /// Unlike `ModelWASM`, this is explicit data: hosts must not feed it to
     /// the model executor (there is nothing to sample).
     FeaMesh,
+    /// A CBOR-encoded triangle mesh (see [`OperatorMetadataInput::TriMesh`]);
+    /// explicit data, never fed to the model executor.
+    TriMesh,
 }
 
 /// Metadata an operator returns from `get_metadata()`, CBOR-encoded.
@@ -417,10 +424,12 @@ mod tests {
                 OperatorMetadataInput::Blob,
                 OperatorMetadataInput::VecF64(3),
                 OperatorMetadataInput::FeaMesh,
+                OperatorMetadataInput::TriMesh,
             ],
             outputs: vec![
                 OperatorMetadataOutput::ModelWASM,
                 OperatorMetadataOutput::FeaMesh,
+                OperatorMetadataOutput::TriMesh,
             ],
         };
 

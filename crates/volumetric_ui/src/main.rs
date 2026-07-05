@@ -1831,7 +1831,9 @@ impl VolumetricApp {
                             }
                         }
                     }
-                    OperatorMetadataInput::Blob | OperatorMetadataInput::FeaMesh => {
+                    OperatorMetadataInput::Blob
+                    | OperatorMetadataInput::FeaMesh
+                    | OperatorMetadataInput::TriMesh => {
                         // Blob and FEA-mesh inputs are not editable in this UI
                         self.edit_input_asset_ids.push(None);
                     }
@@ -2124,6 +2126,11 @@ impl VolumetricApp {
                             ui.label("FEA Mesh Input:");
                             ui.colored_label(egui::Color32::GRAY, "(FEA mesh - not editable)");
                         }
+                        OperatorMetadataInput::TriMesh => {
+                            ui.separator();
+                            ui.label("Triangle Mesh Input:");
+                            ui.colored_label(egui::Color32::GRAY, "(Triangle mesh - not editable)");
+                        }
                         OperatorMetadataInput::VecF64(dim) => {
                             ui.separator();
                             let label = match dim {
@@ -2288,7 +2295,9 @@ impl VolumetricApp {
                         let script_bytes = self.edit_lua_script.as_bytes().to_vec();
                         inputs.push(ExecutionInput::Inline(script_bytes));
                     }
-                    OperatorMetadataInput::Blob | OperatorMetadataInput::FeaMesh => {
+                    OperatorMetadataInput::Blob
+                    | OperatorMetadataInput::FeaMesh
+                    | OperatorMetadataInput::TriMesh => {
                         // Keep existing blob/mesh data (not editable)
                         // We need to preserve the original inline data from the step
                         if let Some(ref project) = self.project {
@@ -3079,7 +3088,8 @@ impl eframe::App for VolumetricApp {
                                                     inputs.push(ExecutionInput::Inline(script_bytes));
                                                 }
                                                 OperatorMetadataInput::Blob
-                                                | OperatorMetadataInput::FeaMesh => {
+                                                | OperatorMetadataInput::FeaMesh
+                                                | OperatorMetadataInput::TriMesh => {
                                                     // Blob inputs should be handled specially (via file picker)
                                                     // For now, just add empty bytes - the STL import is handled
                                                     // through the dedicated "Import STL" button instead

@@ -31,6 +31,7 @@ const OPERATORS: &[(&str, &str)] = &[
     ("fea_grid_mesh_operator", "FEA Grid Mesh"),
     ("fea_solve_operator", "FEA Solve"),
     ("fea_density_operator", "FEA Density"),
+    ("mesh_to_model_operator", "Mesh to Model"),
 ];
 
 fn main() {

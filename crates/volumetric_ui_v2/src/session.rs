@@ -875,10 +875,13 @@ fn build_preview_scene(request: &PreviewRequest) -> Result<PreviewEntity, String
     let build_start = std::time::Instant::now();
     let mut stats = OutputStats::default();
 
-    // FEA meshes are explicit data, not sampleable models: draw their
-    // boundary faces directly, ignoring the model mesh plans.
+    // Explicit mesh values are data, not sampleable models: draw them
+    // directly, ignoring the model mesh plans.
     if request.type_hint == Some(AssetTypeHint::FeaMesh) {
         return build_fea_mesh_preview(request, build_start);
+    }
+    if request.type_hint == Some(AssetTypeHint::TriMesh) {
+        return build_tri_mesh_preview(request, build_start);
     }
 
     // 2D sketches get a flat raster preview; the 3D mesh plans don't apply.
@@ -1337,6 +1340,96 @@ fn build_fea_mesh_preview(
     })
 }
 
+/// Preview of a general triangle mesh: the triangles exactly as they are,
+/// drawn double-sided so open and non-manifold meshes (a scan with holes, a
+/// single free triangle) render cleanly from every angle, with a wireframe
+/// of the unique edges.
+fn build_tri_mesh_preview(
+    request: &PreviewRequest,
+    build_start: std::time::Instant,
+) -> Result<PreviewEntity, String> {
+    let mesh = volumetric::trimesh::decode_tri_mesh(request.data.as_slice())?;
+
+    let position = |vertex: u32| -> [f32; 3] {
+        let p = mesh.position(vertex as usize);
+        [p[0] as f32, p[1] as f32, p[2] as f32]
+    };
+
+    let mut vertices: Vec<renderer::MeshVertex> = Vec::with_capacity(mesh.triangle_count() * 6);
+    let mut emit = |a: [f32; 3], b: [f32; 3], c: [f32; 3]| {
+        let (ab, ac) = (Vec3::from(b) - Vec3::from(a), Vec3::from(c) - Vec3::from(a));
+        let normal = ab.cross(ac).normalize_or_zero().to_array();
+        for p in [a, b, c] {
+            vertices.push(renderer::MeshVertex {
+                position: p,
+                _pad0: 0.0,
+                normal,
+                _pad1: 0.0,
+            });
+        }
+    };
+    for t in 0..mesh.triangle_count() {
+        let [i, j, k] = mesh.triangle(t);
+        let (a, b, c) = (position(i), position(j), position(k));
+        emit(a, b, c);
+        emit(a, c, b); // back face, so open meshes show from both sides
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut segments = Vec::new();
+    for t in 0..mesh.triangle_count() {
+        let [i, j, k] = mesh.triangle(t);
+        for (a, b) in [(i, j), (j, k), (k, i)] {
+            if seen.insert((a.min(b), a.max(b))) {
+                segments.push(renderer::LineSegment {
+                    start: position(a),
+                    end: position(b),
+                    color: [0.05, 0.06, 0.08, 0.9],
+                });
+            }
+        }
+    }
+
+    let bounds = match mesh.bounds() {
+        Some(b) => PreviewBounds {
+            min: (b[0] as f32, b[2] as f32, b[4] as f32),
+            max: (b[1] as f32, b[3] as f32, b[5] as f32),
+        },
+        None => PreviewBounds {
+            min: (-1.0, -1.0, -1.0),
+            max: (1.0, 1.0, 1.0),
+        },
+    };
+
+    let stats = OutputStats {
+        triangles: vertices.len() / 3,
+        detail: vec![format!(
+            "triangle mesh: {} vertices · {} triangles",
+            mesh.vertex_count(),
+            mesh.triangle_count()
+        )],
+        mesh_ms: build_start.elapsed().as_secs_f64() * 1000.0,
+        ..Default::default()
+    };
+
+    let mut scene = renderer::SceneData::new();
+    scene.add_mesh(
+        renderer::MeshData {
+            vertices,
+            indices: None,
+        },
+        glam::Mat4::IDENTITY,
+        renderer::MaterialId(0),
+    );
+
+    Ok(PreviewEntity {
+        scene,
+        bounds,
+        stats,
+        wireframe_lines: Some(renderer::LineData { segments }),
+    })
+}
+
 /// Raster resolution for sketch previews, reusing the output's configured
 /// mesh resolution.
 fn sketch_raster_resolution(plan: &PreviewMeshPlan) -> usize {
@@ -1571,6 +1664,28 @@ function get_bounds_max_y() return 1.5 end
             "detail should mention deformation: {:?}",
             entity.stats.detail
         );
+
+        // A triangle mesh — including a non-manifold single triangle —
+        // renders double-sided with a full wireframe.
+        use volumetric::trimesh::{TriMesh, encode_tri_mesh};
+        let tri = TriMesh {
+            positions: vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            indices: vec![0, 1, 2],
+            vertex_fields: vec![],
+            face_fields: vec![],
+        };
+        let mut req = request("tri", 64);
+        req.data = Arc::new(encode_tri_mesh(&tri));
+        req.type_hint = Some(AssetTypeHint::TriMesh);
+        let entity = build_preview_scene(&req).expect("tri mesh preview");
+        assert_eq!(entity.stats.triangles, 2, "front + back face");
+        assert_eq!(
+            entity.wireframe_lines.as_ref().unwrap().segments.len(),
+            3,
+            "three unique edges"
+        );
+        assert_eq!(entity.bounds.min, (0.0, 0.0, 0.0));
+        assert_eq!(entity.bounds.max, (1.0, 1.0, 0.0));
 
         // Garbage bytes fail with a decode error instead of a wasm error.
         let mut junk = request("junk", 64);

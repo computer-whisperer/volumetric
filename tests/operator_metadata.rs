@@ -21,6 +21,7 @@ const OPERATORS: &[&str] = &[
     "fea_grid_mesh_operator",
     "fea_solve_operator",
     "fea_density_operator",
+    "mesh_to_model_operator",
 ];
 
 #[test]
