@@ -22,6 +22,7 @@ use crate::{
     OutputStats, PreviewBuildStatus, PreviewMeshPlan, PreviewRenderMode, PreviewRequest, RunState,
     VolumetricUiV2,
 };
+use volumetric::AssetTypeHint;
 
 /// Per-frame and per-event driver for one running app instance.
 ///
@@ -541,8 +542,8 @@ fn mesh_triangles(mesh: &renderer::MeshData, transform: Mat4, out: &mut Vec<volu
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PreviewSceneKey {
     asset_id: String,
-    wasm_ptr: usize,
-    wasm_len: usize,
+    data_ptr: usize,
+    data_len: usize,
     render_mode: PreviewRenderMode,
     mesh_plan: PreviewMeshPlan,
 }
@@ -551,8 +552,8 @@ impl From<&PreviewRequest> for PreviewSceneKey {
     fn from(request: &PreviewRequest) -> Self {
         Self {
             asset_id: request.asset_id.clone(),
-            wasm_ptr: Arc::as_ptr(&request.wasm_bytes) as usize,
-            wasm_len: request.wasm_bytes.len(),
+            data_ptr: Arc::as_ptr(&request.data) as usize,
+            data_len: request.data.len(),
             render_mode: request.render_mode,
             mesh_plan: request.mesh_plan.clone(),
         }
@@ -874,8 +875,14 @@ fn build_preview_scene(request: &PreviewRequest) -> Result<PreviewEntity, String
     let build_start = std::time::Instant::now();
     let mut stats = OutputStats::default();
 
+    // FEA meshes are explicit data, not sampleable models: draw their
+    // boundary faces directly, ignoring the model mesh plans.
+    if request.type_hint == Some(AssetTypeHint::FeaMesh) {
+        return build_fea_mesh_preview(request, build_start);
+    }
+
     // 2D sketches get a flat raster preview; the 3D mesh plans don't apply.
-    let dims = volumetric::model_dimensions_from_bytes(request.wasm_bytes.as_slice())
+    let dims = volumetric::model_dimensions_from_bytes(request.data.as_slice())
         .map_err(format_error_chain)?;
     if dims == 2 {
         return build_sketch_preview(request, build_start);
@@ -884,7 +891,7 @@ fn build_preview_scene(request: &PreviewRequest) -> Result<PreviewEntity, String
     let (scene, wireframe_lines, bounds_min, bounds_max) = match &request.mesh_plan {
         PreviewMeshPlan::PointCloud { resolution } => {
             let (points, bounds_min, bounds_max) =
-                volumetric::sample_model_from_bytes(request.wasm_bytes.as_slice(), *resolution)
+                volumetric::sample_model_from_bytes(request.data.as_slice(), *resolution)
                     .map_err(format_error_chain)?;
             stats.points = points.len();
             let mut scene = renderer::SceneData::new();
@@ -903,7 +910,7 @@ fn build_preview_scene(request: &PreviewRequest) -> Result<PreviewEntity, String
         PreviewMeshPlan::MarchingCubes { resolution } => {
             let (triangles, bounds_min, bounds_max) =
                 volumetric::generate_marching_cubes_mesh_from_bytes(
-                    request.wasm_bytes.as_slice(),
+                    request.data.as_slice(),
                     *resolution,
                 )
                 .map_err(format_error_chain)?;
@@ -926,11 +933,9 @@ fn build_preview_scene(request: &PreviewRequest) -> Result<PreviewEntity, String
                 .mesh_plan
                 .adaptive_surface_nets_config()
                 .ok_or_else(|| "missing adaptive surface nets config".to_string())?;
-            let mesh = volumetric::generate_adaptive_mesh_v2_from_bytes(
-                request.wasm_bytes.as_slice(),
-                &config,
-            )
-            .map_err(format_error_chain)?;
+            let mesh =
+                volumetric::generate_adaptive_mesh_v2_from_bytes(request.data.as_slice(), &config)
+                    .map_err(format_error_chain)?;
             stats.triangles = mesh.indices.len() / 3;
             stats.samples = mesh.stats.total_samples;
             stats.detail = asn2_stage_lines(&mesh.stats);
@@ -1102,7 +1107,7 @@ fn build_sketch_preview(
     build_start: std::time::Instant,
 ) -> Result<PreviewEntity, String> {
     let resolution = sketch_raster_resolution(&request.mesh_plan);
-    let raster = volumetric::rasterize_sketch_from_bytes(request.wasm_bytes.as_slice(), resolution)
+    let raster = volumetric::rasterize_sketch_from_bytes(request.data.as_slice(), resolution)
         .map_err(format_error_chain)?;
 
     let cell_w = (raster.bounds_max.0 - raster.bounds_min.0) / raster.width as f32;
@@ -1177,6 +1182,121 @@ fn build_sketch_preview(
         },
         stats,
         wireframe_lines: None,
+    })
+}
+
+/// Preview of an FEA mesh output: the mesh's boundary faces, flat-shaded,
+/// with the wireframe overlay tracing element edges (quad edges only — no
+/// triangulation diagonals).
+fn build_fea_mesh_preview(
+    request: &PreviewRequest,
+    build_start: std::time::Instant,
+) -> Result<PreviewEntity, String> {
+    let mesh = volumetric::fea::decode_fea_mesh(request.data.as_slice())?;
+    let quads = mesh.boundary_quads();
+
+    let position = |node: u32| -> [f32; 3] {
+        let p = mesh.node_position(node as usize);
+        [p[0] as f32, p[1] as f32, p[2] as f32]
+    };
+
+    // Flat-shaded triangle soup: two triangles per boundary quad, each with
+    // its own face normal (deformed meshes can have non-planar quads).
+    let mut vertices: Vec<renderer::MeshVertex> = Vec::with_capacity(quads.len() * 6);
+    let mut emit_triangle = |a: [f32; 3], b: [f32; 3], c: [f32; 3]| {
+        let (ab, ac) = (Vec3::from(b) - Vec3::from(a), Vec3::from(c) - Vec3::from(a));
+        let normal = ab.cross(ac).normalize_or_zero().to_array();
+        for p in [a, b, c] {
+            vertices.push(renderer::MeshVertex {
+                position: p,
+                _pad0: 0.0,
+                normal,
+                _pad1: 0.0,
+            });
+        }
+    };
+    for quad in &quads {
+        let [a, b, c, d] = [
+            position(quad[0]),
+            position(quad[1]),
+            position(quad[2]),
+            position(quad[3]),
+        ];
+        emit_triangle(a, b, c);
+        emit_triangle(a, c, d);
+    }
+
+    // Wireframe from the quads' perimeter edges, deduplicated by node pair.
+    let mut seen = std::collections::HashSet::new();
+    let mut segments = Vec::new();
+    for quad in &quads {
+        for (a, b) in [
+            (quad[0], quad[1]),
+            (quad[1], quad[2]),
+            (quad[2], quad[3]),
+            (quad[3], quad[0]),
+        ] {
+            if seen.insert((a.min(b), a.max(b))) {
+                segments.push(renderer::LineSegment {
+                    start: position(a),
+                    end: position(b),
+                    color: [0.05, 0.06, 0.08, 0.9],
+                });
+            }
+        }
+    }
+
+    let mut bounds = PreviewBounds {
+        min: (f32::INFINITY, f32::INFINITY, f32::INFINITY),
+        max: (f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY),
+    };
+    for n in 0..mesh.node_count() {
+        let p = position(n as u32);
+        bounds.min = (
+            bounds.min.0.min(p[0]),
+            bounds.min.1.min(p[1]),
+            bounds.min.2.min(p[2]),
+        );
+        bounds.max = (
+            bounds.max.0.max(p[0]),
+            bounds.max.1.max(p[1]),
+            bounds.max.2.max(p[2]),
+        );
+    }
+    if mesh.node_count() == 0 {
+        bounds = PreviewBounds {
+            min: (-1.0, -1.0, -1.0),
+            max: (1.0, 1.0, 1.0),
+        };
+    }
+
+    let stats = OutputStats {
+        triangles: vertices.len() / 3,
+        detail: vec![format!(
+            "FEA mesh: {} nodes · {} elements · {} boundary faces",
+            mesh.node_count(),
+            mesh.element_count(),
+            quads.len()
+        )],
+        mesh_ms: build_start.elapsed().as_secs_f64() * 1000.0,
+        ..Default::default()
+    };
+
+    let mut scene = renderer::SceneData::new();
+    scene.add_mesh(
+        renderer::MeshData {
+            vertices,
+            indices: None,
+        },
+        glam::Mat4::IDENTITY,
+        renderer::MaterialId(0),
+    );
+
+    Ok(PreviewEntity {
+        scene,
+        bounds,
+        stats,
+        wireframe_lines: Some(renderer::LineData { segments }),
     })
 }
 
@@ -1262,7 +1382,7 @@ mod tests {
     fn request(id: &str, resolution: usize) -> PreviewRequest {
         PreviewRequest {
             asset_id: id.to_string(),
-            wasm_bytes: Arc::new(vec![1, 2, 3]),
+            data: Arc::new(vec![1, 2, 3]),
             type_hint: None,
             precursor_ids: Vec::new(),
             render_mode: PreviewRenderMode::Points,
@@ -1339,7 +1459,7 @@ function get_bounds_max_y() return 1.5 end
         let sketch = result.outputs.get(&0).expect("sketch wasm").clone();
 
         let mut req = request("sketch", 64);
-        req.wasm_bytes = Arc::new(sketch);
+        req.data = Arc::new(sketch);
         let entity = build_preview_scene(&req).expect("sketch preview");
 
         assert!(
@@ -1356,6 +1476,49 @@ function get_bounds_max_y() return 1.5 end
         assert_eq!(entity.bounds.max.2, 0.0);
         assert_eq!(entity.bounds.min.0, -1.5);
         assert_eq!(entity.bounds.max.1, 1.5);
+    }
+
+    #[test]
+    fn fea_mesh_outputs_get_a_boundary_preview() {
+        use volumetric::fea::{FeaElementKind, FeaMesh, encode_fea_mesh};
+
+        // A single unit hex at the origin.
+        let mesh = FeaMesh {
+            element_kind: FeaElementKind::Hex8,
+            node_positions: vec![
+                0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, //
+                0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0,
+            ],
+            connectivity: (0..8).collect(),
+            node_fields: vec![],
+            element_fields: vec![],
+        };
+
+        let mut req = request("fea", 64);
+        req.data = Arc::new(encode_fea_mesh(&mesh));
+        req.type_hint = Some(AssetTypeHint::FeaMesh);
+        let entity = build_preview_scene(&req).expect("fea preview");
+
+        // 6 boundary quads = 12 flat-shaded triangles, 12 unique cube edges.
+        assert_eq!(entity.stats.triangles, 12);
+        let wireframe = entity.wireframe_lines.expect("fea preview has wireframe");
+        assert_eq!(wireframe.segments.len(), 12);
+        assert_eq!(entity.bounds.min, (0.0, 0.0, 0.0));
+        assert_eq!(entity.bounds.max, (1.0, 1.0, 1.0));
+        assert!(
+            entity.stats.detail.iter().any(|l| l.contains("FEA mesh")),
+            "stats should describe the mesh: {:?}",
+            entity.stats.detail
+        );
+
+        // Garbage bytes fail with a decode error instead of a wasm error.
+        let mut junk = request("junk", 64);
+        junk.data = Arc::new(vec![0xff, 0x00, 0x13]);
+        junk.type_hint = Some(AssetTypeHint::FeaMesh);
+        let Err(err) = build_preview_scene(&junk) else {
+            panic!("junk must fail");
+        };
+        assert!(err.contains("FEA mesh"), "unexpected error: {err}");
     }
 
     /// The milestone: two requested outputs each get a build job, and once both

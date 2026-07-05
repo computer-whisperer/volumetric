@@ -1495,6 +1495,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fea_grid_mesh_operator"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "serde",
+ "volumetric_abi",
+]
+
+[[package]]
 name = "fearless_simd"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

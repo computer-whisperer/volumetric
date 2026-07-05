@@ -28,6 +28,7 @@ const OPERATORS: &[(&str, &str)] = &[
     ("heightmap_extrude_operator", "Heightmap Extrude"),
     ("extrude_operator", "Extrude"),
     ("revolve_operator", "Revolve"),
+    ("fea_grid_mesh_operator", "FEA Grid Mesh"),
 ];
 
 fn main() {

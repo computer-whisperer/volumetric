@@ -217,6 +217,13 @@ impl OperatorIo {
 /// - `post_error(ptr: i32, len: i32)` - Report a failure with a UTF-8 message.
 ///   A run that posts an error fails with the message instead of returning
 ///   outputs; only the first posted error is kept.
+/// - `input_model_dimensions(i32) -> i32`, `input_model_bounds(i32, i32) ->
+///   i32`, `input_model_sample(i32, i32, i32, i32) -> i32` - Evaluate a
+///   `ModelWASM` input without instantiating it inside the operator; the
+///   host services the calls with a native model executor. See the
+///   `volumetric_abi` crate docs for the full contract. Currently native
+///   only - the web backend's JS bridge does not provide them yet, so
+///   operators that import them fail to instantiate there.
 pub trait OperatorExecutor: Send {
     /// Execute the operator with the given I/O state.
     fn run(&mut self, io: OperatorIo) -> Result<OperatorIo, WasmBackendError>;

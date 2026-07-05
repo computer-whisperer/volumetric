@@ -268,6 +268,9 @@ pub struct ExecutionStep {
 // volumetric_abi; re-exported here so hosts keep using `volumetric::OperatorMetadata`.
 pub use volumetric_abi::{OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput};
 
+// The FEA mesh value type (CBOR payload of FeaMesh-typed assets).
+pub use volumetric_abi::fea;
+
 /// Load `OperatorMetadata` from an operator WASM module via its `get_metadata()` export.
 ///
 /// ABI contract:

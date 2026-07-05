@@ -263,7 +263,9 @@ impl PreviewMeshPlan {
 #[derive(Clone, Debug)]
 pub struct PreviewRequest {
     pub asset_id: String,
-    pub wasm_bytes: Arc<Vec<u8>>,
+    /// The asset's raw bytes: a model WASM module, or CBOR mesh data for
+    /// `AssetTypeHint::FeaMesh` outputs.
+    pub data: Arc<Vec<u8>>,
     pub type_hint: Option<AssetTypeHint>,
     pub precursor_ids: Vec<String>,
     pub render_mode: PreviewRenderMode,
@@ -465,6 +467,13 @@ pub struct VolumetricUiV2 {
     /// Project panel width, adjusted by the divider's resize handle.
     panel_width: f32,
     panel_drag: ResizeDrag,
+    /// Decoded operator metadata keyed by operator asset id, so per-frame
+    /// consumers (asset pickers) don't instantiate operator WASM on every
+    /// call. Entries are revalidated by the import's byte length — an
+    /// operator asset replaced by a same-length module with different
+    /// metadata would serve one stale answer, which the next run corrects.
+    operator_metadata_cache:
+        std::cell::RefCell<std::collections::HashMap<String, (usize, Option<OperatorMetadata>)>>,
 }
 
 impl Default for VolumetricUiV2 {
@@ -521,6 +530,7 @@ impl VolumetricUiV2 {
             project_path: None,
             panel_width: PANEL_WIDTH_DEFAULT,
             panel_drag: ResizeDrag::default(),
+            operator_metadata_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -673,16 +683,19 @@ impl VolumetricUiV2 {
     }
 
     /// Builds a render request for a single runtime asset, or `None` when it is
-    /// not a renderable model.
+    /// not renderable (models and FEA meshes are).
     fn render_request_for_asset(&self, asset: &LoadedAsset) -> Option<PreviewRequest> {
-        if !matches!(asset.type_hint(), Some(AssetTypeHint::Model) | None) {
+        if !matches!(
+            asset.type_hint(),
+            Some(AssetTypeHint::Model | AssetTypeHint::FeaMesh) | None
+        ) {
             return None;
         }
 
         let render = self.output_render(asset.id());
         Some(PreviewRequest {
             asset_id: asset.id().to_string(),
-            wasm_bytes: asset.data_arc(),
+            data: asset.data_arc(),
             type_hint: asset.type_hint(),
             precursor_ids: asset.precursor_ids().to_vec(),
             render_mode: render.mode,
@@ -1048,6 +1061,56 @@ impl VolumetricUiV2 {
             .iter()
             .find(|import| import.id == operator_id)
             .map(|import| import.data.clone())
+    }
+
+    /// The decoded metadata of an operator import, cached (see the
+    /// `operator_metadata_cache` field for the invalidation rule).
+    fn operator_metadata_cached(&self, operator_id: &str) -> Option<OperatorMetadata> {
+        let import_len = self
+            .project
+            .imports()
+            .iter()
+            .find(|import| import.id == operator_id)?
+            .data
+            .len();
+
+        let mut cache = self.operator_metadata_cache.borrow_mut();
+        if let Some((len, metadata)) = cache.get(operator_id)
+            && *len == import_len
+        {
+            return metadata.clone();
+        }
+        let metadata = self
+            .operator_bytes(operator_id)
+            .and_then(|bytes| volumetric::operator_metadata_from_wasm_bytes(&bytes).ok());
+        cache.insert(operator_id.to_string(), (import_len, metadata.clone()));
+        metadata
+    }
+
+    /// Declared assets with step-output hints refined by operator metadata.
+    /// `Project::declared_assets` alone is a static inspection that assumes
+    /// every step output is a model; here outputs of operators that declare
+    /// other output types (e.g. FeaMesh) get their true hint.
+    fn declared_assets_typed(&self) -> Vec<(String, Option<AssetTypeHint>)> {
+        let mut assets = self.project.declared_assets();
+        let mut output_hints: std::collections::HashMap<String, AssetTypeHint> =
+            std::collections::HashMap::new();
+        for step in self.project.timeline() {
+            let Some(metadata) = self.operator_metadata_cached(&step.operator_id) else {
+                continue;
+            };
+            for (idx, output_id) in step.outputs.iter().enumerate() {
+                if let Some(output) = metadata.outputs.get(idx) {
+                    output_hints.insert(output_id.clone(), AssetTypeHint::from(output));
+                }
+            }
+        }
+        for (id, hint) in assets.iter_mut() {
+            if let Some(refined) = output_hints.get(id) {
+                *hint = Some(*refined);
+            }
+        }
+        assets
     }
 
     /// Retargets one model input slot of a step. Retargeting the primary (first)
@@ -3168,8 +3231,7 @@ fn camera_scheme_tooltip(scheme: CameraControlScheme) -> &'static str {
 }
 
 fn editable_model_asset_ids(app: &VolumetricUiV2) -> Vec<String> {
-    app.project
-        .declared_assets()
+    app.declared_assets_typed()
         .into_iter()
         .filter_map(|(id, type_hint)| match type_hint {
             Some(AssetTypeHint::Model) | None => Some(id),
@@ -3940,6 +4002,31 @@ mod tests {
             &step.inputs[blob_slot],
             ExecutionInput::Inline(bytes) if *bytes == stl
         ));
+    }
+
+    #[test]
+    fn fea_mesh_outputs_stay_out_of_model_pickers() {
+        let mut app = VolumetricUiV2::default();
+        add_operator_click(&mut app, "fea_grid_mesh_operator");
+
+        let step = &app.project().timeline()[0];
+        let mesh_output = step.outputs[0].clone();
+
+        // The static inspection alone would call the output a model...
+        assert!(
+            app.project()
+                .declared_assets()
+                .iter()
+                .any(|(id, hint)| *id == mesh_output && *hint == Some(AssetTypeHint::Model))
+        );
+        // ...but the metadata-refined view types it correctly, and the model
+        // pickers exclude it.
+        assert!(
+            app.declared_assets_typed()
+                .iter()
+                .any(|(id, hint)| *id == mesh_output && *hint == Some(AssetTypeHint::FeaMesh))
+        );
+        assert!(!editable_model_asset_ids(&app).contains(&mesh_output));
     }
 
     #[test]

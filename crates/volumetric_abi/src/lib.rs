@@ -18,6 +18,23 @@
 //! - `post_error(ptr: i32, len: i32)` — optional; a run that posts an error
 //!   fails with the message instead of returning outputs
 //!
+//! ## Model-input sampling imports
+//!
+//! Operators that need to *evaluate* a `ModelWASM` input (rather than
+//! rewrite it) use these imports; the host instantiates the input natively
+//! and services the calls. All three fail soft (return 0) when the slot
+//! doesn't hold a usable model. Only meaningful during `run()` — during
+//! `get_metadata()` there are no inputs and they always fail.
+//! - `input_model_dimensions(idx: i32) -> i32` — the model's dimension
+//!   count `n`, or 0 on failure
+//! - `input_model_bounds(idx: i32, out_ptr: i32) -> i32` — writes `2 * n`
+//!   interleaved f64s `[min_0, max_0, ...]`; returns 1 on success
+//! - `input_model_sample(idx: i32, pos_ptr: i32, count: i32, out_ptr: i32)
+//!   -> i32` — reads `count * n` f64s at `pos_ptr`, writes `count` f32
+//!   occupancies at `out_ptr` (classify with [`is_occupied`]; individual
+//!   failed samples read 0.0 per the ABI error convention); returns 1 on
+//!   success, 0 when the slot is not a model or a range is out of bounds
+//!
 //! # Model ABI (N-dimensional)
 //!
 //! Model WASM blobs (operator inputs/outputs of type `ModelWASM`) export:
@@ -76,6 +93,8 @@
 //! exactly like `sample`.
 
 use std::sync::OnceLock;
+
+pub mod fea;
 
 /// The single inside/outside threshold for occupancy samples.
 ///
@@ -319,6 +338,9 @@ pub mod host {
             pub fn get_input_data(idx: i32, ptr: i32, len: i32);
             pub fn post_output(output_idx: i32, ptr: i32, len: i32);
             pub fn post_error(ptr: i32, len: i32);
+            pub fn input_model_dimensions(idx: i32) -> i32;
+            pub fn input_model_bounds(idx: i32, out_ptr: i32) -> i32;
+            pub fn input_model_sample(idx: i32, pos_ptr: i32, count: i32, out_ptr: i32) -> i32;
         }
     }
 
@@ -341,6 +363,41 @@ pub mod host {
     /// of producing outputs. Only the first reported error is kept.
     pub fn report_error(msg: &str) {
         unsafe { raw::post_error(msg.as_ptr() as i32, msg.len() as i32) }
+    }
+
+    /// The dimension count of the model in input slot `idx`, or `None` if
+    /// the slot doesn't hold a usable model.
+    pub fn input_model_dimensions(idx: i32) -> Option<u32> {
+        let n = unsafe { raw::input_model_dimensions(idx) };
+        (n > 0).then_some(n as u32)
+    }
+
+    /// The bounds of the model in input slot `idx`: `dimensions`
+    /// interleaved `[min, max]` pairs.
+    pub fn input_model_bounds(idx: i32, dimensions: usize) -> Option<Vec<f64>> {
+        let mut bounds = vec![0.0f64; 2 * dimensions];
+        let ok = unsafe { raw::input_model_bounds(idx, bounds.as_mut_ptr() as i32) };
+        (ok == 1).then_some(bounds)
+    }
+
+    /// Sample the model in input slot `idx` at `positions` (`dimensions`
+    /// f64s per sample, concatenated). Returns one occupancy value per
+    /// sample — classify with [`crate::is_occupied`].
+    pub fn input_model_sample(idx: i32, positions: &[f64], dimensions: usize) -> Option<Vec<f32>> {
+        if dimensions == 0 || !positions.len().is_multiple_of(dimensions) {
+            return None;
+        }
+        let count = positions.len() / dimensions;
+        let mut out = vec![0.0f32; count];
+        let ok = unsafe {
+            raw::input_model_sample(
+                idx,
+                positions.as_ptr() as i32,
+                count as i32,
+                out.as_mut_ptr() as i32,
+            )
+        };
+        (ok == 1).then_some(out)
     }
 }
 
