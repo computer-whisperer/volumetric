@@ -1,0 +1,12 @@
+[package]
+name = "density_gradient_model"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+test = false
+doctest = false
+
+[dependencies]
+volumetric_abi = { path = "../../volumetric_abi" }

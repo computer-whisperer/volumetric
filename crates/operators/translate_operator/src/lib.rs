@@ -8,6 +8,10 @@
 //! - `get_bounds(out_ptr: i32)`: Wrapper that adds translation to bounds
 //! - `sample(pos_ptr: i32) -> f32`: Wrapper that subtracts translation from
 //!   the position in place (the ABI allows clobbering the position buffer)
+//! - `sample_channels(pos_ptr: i32, out_ptr: i32)`: Same wrapper as `sample`,
+//!   present iff the input model has it
+//! - `get_sample_format() -> i64`: Passed through from input model (a
+//!   transform doesn't change what the samples mean)
 //! - `memory`: Passed through from input model
 //!
 //! Behavior:
@@ -40,12 +44,19 @@ impl Default for TranslateConfig {
 
 use volumetric_abi::host::{post_output, read_input, report_error};
 
-/// N-dimensional ABI function names. `get_dimensions` and `get_io_ptr` are
-/// passed through unchanged; `get_bounds` and `sample` get wrappers.
-const ABI_FUNCTIONS_ND: &[&str] = &["get_dimensions", "get_io_ptr", "get_bounds", "sample"];
+/// N-dimensional ABI function names. `get_dimensions`, `get_io_ptr` and
+/// `get_sample_format` are passed through unchanged; `get_bounds`, `sample`
+/// and `sample_channels` get wrappers.
+const ABI_FUNCTIONS_ND: &[&str] = &[
+    "get_dimensions",
+    "get_io_ptr",
+    "get_bounds",
+    "sample",
+    "sample_channels",
+];
 
 /// ABI functions the wrappers replace; the rest keep their exports.
-const WRAPPED_FUNCTIONS: &[&str] = &["get_bounds", "sample"];
+const WRAPPED_FUNCTIONS: &[&str] = &["get_bounds", "sample", "sample_channels"];
 
 /// Generate a random hex string for suffixing renamed functions
 fn generate_hex_suffix() -> String {
@@ -57,6 +68,28 @@ fn generate_hex_suffix() -> String {
         result.push(char::from_digit(nibble, 16).unwrap());
     }
     result
+}
+
+/// Emit code that subtracts the translation from the first 3 dims in place
+/// at `pos_ptr` (shared by the `sample` and `sample_channels` wrappers).
+fn emit_position_rewrite(
+    builder: &mut FunctionBuilder,
+    pos_ptr: walrus::LocalId,
+    memory_id: MemoryId,
+    cfg: &TranslateConfig,
+) {
+    // pos[i] -= d for each axis
+    for (offset, d) in [(0, cfg.dx), (8, cfg.dy), (16, cfg.dz)] {
+        let mem_arg = walrus::ir::MemArg { align: 3, offset };
+        builder
+            .func_body()
+            .local_get(pos_ptr)
+            .local_get(pos_ptr)
+            .load(memory_id, walrus::ir::LoadKind::F64, mem_arg)
+            .f64_const(-(d as f64))
+            .binop(walrus::ir::BinaryOp::F64Add)
+            .store(memory_id, walrus::ir::StoreKind::F64, mem_arg);
+    }
 }
 
 /// Transform the input WASM module to apply translation by (dx, dy, dz).
@@ -122,29 +155,13 @@ fn transform_wasm(input_bytes: &[u8], cfg: TranslateConfig) -> Result<Vec<u8>, S
         }
     }
 
-    // Create wrapper for sample
+    // Create wrapper for sample: subtract the translation from the first 3
+    // dims in place at pos_ptr, then call the original with the same pointer.
     if let Some(&original_sample_id) = renamed_functions.get("sample") {
-        // sample(pos_ptr: i32) -> f32
-        // Wrapper subtracts the translation from the first 3 dims in place at
-        // pos_ptr, then calls the original sample with the same pointer.
         let mut builder = FunctionBuilder::new(&mut module.types, &[ValType::I32], &[ValType::F32]);
-
         let pos_ptr = module.locals.add(ValType::I32);
 
-        // pos[i] -= d for each axis
-        for (offset, d) in [(0, cfg.dx), (8, cfg.dy), (16, cfg.dz)] {
-            let mem_arg = walrus::ir::MemArg { align: 3, offset };
-            builder
-                .func_body()
-                .local_get(pos_ptr)
-                .local_get(pos_ptr)
-                .load(memory_id, walrus::ir::LoadKind::F64, mem_arg)
-                .f64_const(-(d as f64))
-                .binop(walrus::ir::BinaryOp::F64Add)
-                .store(memory_id, walrus::ir::StoreKind::F64, mem_arg);
-        }
-
-        // Call original sample with the transformed position
+        emit_position_rewrite(&mut builder, pos_ptr, memory_id, &cfg);
         builder
             .func_body()
             .local_get(pos_ptr)
@@ -152,6 +169,26 @@ fn transform_wasm(input_bytes: &[u8], cfg: TranslateConfig) -> Result<Vec<u8>, S
 
         let wrapper_id = builder.finish(vec![pos_ptr], &mut module.funcs);
         module.exports.add("sample", wrapper_id);
+    }
+
+    // Create wrapper for sample_channels: identical position rewrite, then
+    // call the original with both pointers. Only present when the input model
+    // declares typed channels; get_sample_format passes through untouched.
+    if let Some(&original_channels_id) = renamed_functions.get("sample_channels") {
+        let mut builder =
+            FunctionBuilder::new(&mut module.types, &[ValType::I32, ValType::I32], &[]);
+        let pos_ptr = module.locals.add(ValType::I32);
+        let out_ptr = module.locals.add(ValType::I32);
+
+        emit_position_rewrite(&mut builder, pos_ptr, memory_id, &cfg);
+        builder
+            .func_body()
+            .local_get(pos_ptr)
+            .local_get(out_ptr)
+            .call(original_channels_id);
+
+        let wrapper_id = builder.finish(vec![pos_ptr, out_ptr], &mut module.funcs);
+        module.exports.add("sample_channels", wrapper_id);
     }
 
     // Create wrapper for get_bounds

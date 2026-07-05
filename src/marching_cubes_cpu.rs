@@ -66,8 +66,7 @@ where
         for y in min_corner..=max_corner {
             for x in min_corner..=max_corner {
                 let p = corner_pos(x, y, z);
-                // Convert density to boolean occupancy
-                corner_inside[corner_idx3(x, y, z)] = is_inside(p)? > 0.5;
+                corner_inside[corner_idx3(x, y, z)] = volumetric_abi::is_occupied(is_inside(p)?);
             }
         }
     }
@@ -472,8 +471,12 @@ fn orient_triangles_consistently_and_outward<F>(
                         centroid.1 - n.1 * d,
                         centroid.2 - n.2 * d,
                     );
-                    let inside_plus = is_inside(p_plus).ok().is_some_and(|v| v > 0.5);
-                    let inside_minus = is_inside(p_minus).ok().is_some_and(|v| v > 0.5);
+                    let inside_plus = is_inside(p_plus)
+                        .ok()
+                        .is_some_and(volumetric_abi::is_occupied);
+                    let inside_minus = is_inside(p_minus)
+                        .ok()
+                        .is_some_and(volumetric_abi::is_occupied);
                     if inside_plus != inside_minus {
                         decided = true;
                         inward = inside_plus && !inside_minus;

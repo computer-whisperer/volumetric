@@ -484,7 +484,10 @@ fn add_sample_wrapper(
     // Call A's sample with pos_ptr
     f.instruction(&Instruction::LocalGet(0));
     f.instruction(&Instruction::Call(a_idx));
-    // Convert to boolean: a_bool = (a_density > 0.5)
+    // Classify with the shared occupancy contract (volumetric_abi:
+    // OCCUPANCY_THRESHOLD): a_bool = (a_occupancy > 0.5). The generated model
+    // emits canonical 1.0/0.0 and is occupancy-only — child sample formats
+    // are dropped by construction (the export section is built explicitly).
     f.instruction(&Instruction::F32Const(0.5.into()));
     f.instruction(&Instruction::F32Gt);
 

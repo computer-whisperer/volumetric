@@ -98,25 +98,27 @@ impl ModelBoundsNd {
 
 /// Executor for volumetric model WASM modules.
 ///
-/// This trait represents a single-threaded executor for WASM modules that export
-/// the volumetric model interface (`is_inside`, `get_bounds_*`).
-///
-/// # Required WASM Exports
-/// - `is_inside(f64, f64, f64) -> f32` - Returns density at a point
-/// - `get_bounds_min_x() -> f64`
-/// - `get_bounds_min_y() -> f64`
-/// - `get_bounds_min_z() -> f64`
-/// - `get_bounds_max_x() -> f64`
-/// - `get_bounds_max_y() -> f64`
-/// - `get_bounds_max_z() -> f64`
+/// This trait represents a single-threaded executor for WASM modules that
+/// export the N-dimensional model interface (`get_dimensions`, `get_io_ptr`,
+/// `get_bounds`, `sample`) documented in the `volumetric_abi` crate.
 pub trait ModelExecutor: Send {
     /// Get the bounding box of the model.
     fn get_bounds(&mut self) -> Result<ModelBounds, WasmBackendError>;
 
-    /// Sample the density at a point.
+    /// Sample the occupancy at a point.
     ///
-    /// Returns a value where > 0.0 indicates the point is inside the model.
+    /// Classify the result with [`volumetric_abi::is_occupied`] (inside iff
+    /// `> 0.5`); the magnitude carries no meaning. Models emit the canonical
+    /// values `1.0`/`0.0`.
     fn is_inside(&mut self, x: f64, y: f64, z: f64) -> Result<f32, WasmBackendError>;
+
+    /// The model's declared per-sample format.
+    ///
+    /// Models without a `get_sample_format` export get the default
+    /// occupancy-only format.
+    fn sample_format(&mut self) -> Result<volumetric_abi::SampleFormat, WasmBackendError> {
+        Ok(volumetric_abi::SampleFormat::default())
+    }
 }
 
 /// Thread-safe sampler for parallel volumetric model sampling.
@@ -130,10 +132,11 @@ pub trait ModelExecutor: Send {
 /// 2. The implementation can log/handle errors internally and return a default (0.0)
 /// 3. The meshing algorithms are designed to handle occasional bad samples gracefully
 pub trait ParallelModelSampler: Send + Sync {
-    /// Sample the density at a point.
+    /// Sample the occupancy at a point.
     ///
-    /// Returns a value where > 0.0 indicates the point is inside the model.
-    /// On error, implementations should return 0.0.
+    /// Classify the result with [`volumetric_abi::is_occupied`] (inside iff
+    /// `> 0.5`). On error, implementations return 0.0 — errors read as
+    /// "outside".
     fn sample(&self, x: f64, y: f64, z: f64) -> f32;
 
     /// Get the bounding box of the model.

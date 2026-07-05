@@ -8,6 +8,10 @@
 //! - `get_bounds(out_ptr: i32)`: Wrapper that multiplies bounds by scale factors
 //! - `sample(pos_ptr: i32) -> f32`: Wrapper that divides the position by the
 //!   scale factors in place (the ABI allows clobbering the position buffer)
+//! - `sample_channels(pos_ptr: i32, out_ptr: i32)`: Same wrapper as `sample`,
+//!   present iff the input model has it
+//! - `get_sample_format() -> i64`: Passed through from input model (a
+//!   transform doesn't change what the samples mean)
 //! - `memory`: Passed through from input model
 //!
 //! Behavior:
@@ -40,12 +44,19 @@ impl Default for ScaleConfig {
 
 use volumetric_abi::host::{post_output, read_input, report_error};
 
-/// N-dimensional ABI function names. `get_dimensions` and `get_io_ptr` are
-/// passed through unchanged; `get_bounds` and `sample` get wrappers.
-const ABI_FUNCTIONS_ND: &[&str] = &["get_dimensions", "get_io_ptr", "get_bounds", "sample"];
+/// N-dimensional ABI function names. `get_dimensions`, `get_io_ptr` and
+/// `get_sample_format` are passed through unchanged; `get_bounds`, `sample`
+/// and `sample_channels` get wrappers.
+const ABI_FUNCTIONS_ND: &[&str] = &[
+    "get_dimensions",
+    "get_io_ptr",
+    "get_bounds",
+    "sample",
+    "sample_channels",
+];
 
 /// ABI functions the wrappers replace; the rest keep their exports.
-const WRAPPED_FUNCTIONS: &[&str] = &["get_bounds", "sample"];
+const WRAPPED_FUNCTIONS: &[&str] = &["get_bounds", "sample", "sample_channels"];
 
 fn generate_hex_suffix() -> String {
     let mut state: u32 = 0xC0FFEE77;
@@ -56,6 +67,29 @@ fn generate_hex_suffix() -> String {
         result.push(char::from_digit(nibble, 16).unwrap());
     }
     result
+}
+
+/// Emit code that divides the first 3 dims by the scale factors in place at
+/// `pos_ptr` (shared by the `sample` and `sample_channels` wrappers).
+fn emit_position_rewrite(
+    b: &mut FunctionBuilder,
+    pos_ptr: walrus::LocalId,
+    memory_id: MemoryId,
+    cfg: &ScaleConfig,
+) {
+    use walrus::ir::BinaryOp::F64Div;
+
+    // pos[i] /= s for each axis
+    for (offset, s) in [(0, cfg.sx), (8, cfg.sy), (16, cfg.sz)] {
+        let mem_arg = walrus::ir::MemArg { align: 3, offset };
+        b.func_body()
+            .local_get(pos_ptr)
+            .local_get(pos_ptr)
+            .load(memory_id, walrus::ir::LoadKind::F64, mem_arg)
+            .f64_const(s as f64)
+            .binop(F64Div)
+            .store(memory_id, walrus::ir::StoreKind::F64, mem_arg);
+    }
 }
 
 fn transform_wasm(input_bytes: &[u8], cfg: ScaleConfig) -> Result<Vec<u8>, String> {
@@ -123,25 +157,29 @@ fn transform_wasm(input_bytes: &[u8], cfg: ScaleConfig) -> Result<Vec<u8>, Strin
         let mut b = FunctionBuilder::new(&mut module.types, &[ValType::I32], &[ValType::F32]);
         let pos_ptr = module.locals.add(ValType::I32);
 
-        use walrus::ir::BinaryOp::F64Div;
-
-        // pos[i] /= s for each axis
-        for (offset, s) in [(0, cfg.sx), (8, cfg.sy), (16, cfg.sz)] {
-            let mem_arg = walrus::ir::MemArg { align: 3, offset };
-            b.func_body()
-                .local_get(pos_ptr)
-                .local_get(pos_ptr)
-                .load(memory_id, walrus::ir::LoadKind::F64, mem_arg)
-                .f64_const(s as f64)
-                .binop(F64Div)
-                .store(memory_id, walrus::ir::StoreKind::F64, mem_arg);
-        }
-
-        // Call original with the transformed position
+        emit_position_rewrite(&mut b, pos_ptr, memory_id, &cfg);
         b.func_body().local_get(pos_ptr).call(orig);
 
         let fid = b.finish(vec![pos_ptr], &mut module.funcs);
         module.exports.add("sample", fid);
+    }
+
+    // sample_channels(pos_ptr, out_ptr): identical position rewrite, then
+    // call the original with both pointers. Only present when the input model
+    // declares typed channels; get_sample_format passes through untouched.
+    if let Some(&orig) = renamed.get("sample_channels") {
+        let mut b = FunctionBuilder::new(&mut module.types, &[ValType::I32, ValType::I32], &[]);
+        let pos_ptr = module.locals.add(ValType::I32);
+        let out_ptr = module.locals.add(ValType::I32);
+
+        emit_position_rewrite(&mut b, pos_ptr, memory_id, &cfg);
+        b.func_body()
+            .local_get(pos_ptr)
+            .local_get(out_ptr)
+            .call(orig);
+
+        let fid = b.finish(vec![pos_ptr, out_ptr], &mut module.funcs);
+        module.exports.add("sample_channels", fid);
     }
 
     // get_bounds(out_ptr): call original, then multiply bounds by scale factors

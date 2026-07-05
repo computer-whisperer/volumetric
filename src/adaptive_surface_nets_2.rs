@@ -6,9 +6,9 @@
 //! ## Problem Statement
 //!
 //! Given a volumetric sampling function `is_inside(x: f64, y: f64, z: f64) -> f32`:
-//! - Returns `> 0.0` for points inside the model
-//! - Returns `0.0` for points in empty space
-//! - **NOT an SDF** - only the sign/threshold matters, not the magnitude
+//! - Returns an occupancy value: inside iff `> 0.5` (`volumetric_abi::is_occupied`)
+//! - Canonical values are `1.0` (inside) and `0.0` (outside); errors report `0.0`
+//! - **NOT an SDF** - only the classification matters, not the magnitude
 //!
 //! We must produce a triangle mesh that:
 //! 1. Is **airtight** (no holes or gaps) - unless the surface intersects the bounding box
@@ -1049,14 +1049,14 @@ pub struct IndexedMesh2 {
 // STAGE 1: COARSE GRID DISCOVERY
 // =============================================================================
 
-/// Sample a single point and return whether it's inside (density > 0).
+/// Sample a single point and classify it with the shared occupancy contract.
 #[inline]
 fn sample_is_inside<F>(sampler: &F, x: f64, y: f64, z: f64, stats: &SamplingStats) -> bool
 where
     F: SamplerFn,
 {
     stats.total_samples.fetch_add(1, Ordering::Relaxed);
-    sampler(x, y, z) > 0.0
+    volumetric_abi::is_occupied(sampler(x, y, z))
 }
 
 /// Stage 1: Coarse Grid Discovery
@@ -4851,7 +4851,7 @@ fn dist_f64(a: (f64, f64, f64), b: (f64, f64, f64)) -> f64 {
 /// Main entry point for adaptive surface nets meshing.
 ///
 /// # Arguments
-/// * `sampler` - Function that returns > 0.0 if point is inside the model
+/// * `sampler` - Occupancy function; inside iff `volumetric_abi::is_occupied`
 /// * `bounds_min` - Minimum corner of bounding box
 /// * `bounds_max` - Maximum corner of bounding box
 /// * `config` - Algorithm configuration

@@ -29,15 +29,159 @@
 //! - `get_bounds(out_ptr: i32)` — writes `2 * n` interleaved f64s
 //!   `[min_0, max_0, min_1, max_1, ...]` at `out_ptr`
 //! - `sample(pos_ptr: i32) -> f32` — reads `n` f64s at `pos_ptr`, returns
-//!   density
+//!   the occupancy value for that position (see below)
 //! - `memory` — the linear memory the pointers above refer to
 //!
 //! `sample` and `get_bounds` accept any pointer to a large-enough region of
 //! the model's memory, and the model may clobber that region during the call
 //! (transform wrappers rewrite the position in place). A caller that needs
 //! the position after a call must keep its own copy.
+//!
+//! ## Sample semantics: occupancy, not a distance field
+//!
+//! `sample` returns an *occupancy* value. Only the classification against
+//! [`OCCUPANCY_THRESHOLD`] is meaningful — never the magnitude:
+//! - A point is inside iff `value > 0.5`; consumers classify with
+//!   [`is_occupied`] and must not invent other thresholds.
+//! - Models return the canonical values `1.0` (inside) and `0.0` (outside).
+//! - A failed sample is reported as `0.0`: errors read as "outside".
+//!
+//! Models are deliberately *not* required to return signed distance. An
+//! open composition chain can't preserve distance-ness (booleans, sweeps,
+//! and non-uniform transforms all break it), and a magnitude consumers can't
+//! trust is worse than none. Richer per-sample data goes through declared
+//! channels instead.
+//!
+//! ## Optional: typed sample channels
+//!
+//! A model whose samples carry more than inside/outside (e.g. a material
+//! density for variable-density printing) declares a per-sample format:
+//! - `get_sample_format() -> i64` — `(ptr, len)` of CBOR-encoded
+//!   [`SampleFormat`], packed as `ptr | (len << 32)` (see [`pack_ptr_len`]).
+//!   A model without this export has the default format,
+//!   [`SampleFormat::default`] (a single [`ChannelKind::Occupancy`] channel).
+//! - `sample_channels(pos_ptr: i32, out_ptr: i32)` — reads `n` f64s at
+//!   `pos_ptr`, writes one f32 per declared channel at `out_ptr` (any
+//!   large-enough region of model memory; the clobber rule above applies).
+//!   Required iff the format declares more than one channel.
+//!
+//! Channel 0 is always [`ChannelKind::Occupancy`] and must agree with what
+//! `sample` returns at the same position — every consumer can classify
+//! inside/outside through plain `sample` without ever reading the format.
+//! Extra channels are strictly additive: each [`ChannelKind`] documents its
+//! own value semantics, and a consumer ignores channels it doesn't
+//! recognize. Operators that don't understand channels emit occupancy-only
+//! models (channels are dropped, never silently mangled); position-only
+//! wrappers like transforms forward the format and wrap `sample_channels`
+//! exactly like `sample`.
 
 use std::sync::OnceLock;
+
+/// The single inside/outside threshold for occupancy samples.
+///
+/// A sample is "inside" iff it is strictly greater than this. Every host,
+/// operator, and generated model classifies with this one rule (via
+/// [`is_occupied`]); models emit the canonical values `1.0`/`0.0`.
+pub const OCCUPANCY_THRESHOLD: f32 = 0.5;
+
+/// Classify an occupancy sample: `true` iff the point is inside.
+///
+/// This is the only correct way to interpret a `sample` return value.
+/// `NaN` classifies as outside, matching the error convention (failed
+/// samples report `0.0`).
+#[inline]
+pub fn is_occupied(sample: f32) -> bool {
+    sample > OCCUPANCY_THRESHOLD
+}
+
+/// What one per-sample channel means. Each kind defines its own value
+/// semantics; consumers ignore kinds they don't recognize.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+pub enum ChannelKind {
+    /// Inside/outside classification: canonical `1.0`/`0.0`, classified with
+    /// [`is_occupied`]. Channel 0 of every format is this kind, and must
+    /// agree with the model's plain `sample` export.
+    Occupancy,
+    /// Fraction of solid material in `[0.0, 1.0]` (e.g. infill fraction for
+    /// variable-density printing). Only meaningful where occupancy says
+    /// inside.
+    Density,
+    /// An application-defined kind. Namespace the string (e.g.
+    /// `"myapp.temperature"`) to avoid collisions.
+    Custom(String),
+}
+
+/// One declared per-sample channel.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct SampleChannel {
+    pub name: String,
+    pub kind: ChannelKind,
+}
+
+/// A model's declared per-sample format: what `sample_channels` writes, one
+/// f32 per channel, in order. Returned (CBOR-encoded) by the optional
+/// `get_sample_format()` model export; models without the export have the
+/// [`Default`] format.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct SampleFormat {
+    pub channels: Vec<SampleChannel>,
+}
+
+impl Default for SampleFormat {
+    /// The implicit format of a model with no `get_sample_format` export:
+    /// a single occupancy channel.
+    fn default() -> Self {
+        Self {
+            channels: vec![SampleChannel {
+                name: "occupancy".to_string(),
+                kind: ChannelKind::Occupancy,
+            }],
+        }
+    }
+}
+
+impl SampleFormat {
+    /// Check the structural rules: at least one channel, channel 0 is
+    /// [`ChannelKind::Occupancy`], and channel names are non-empty and
+    /// unique.
+    pub fn validate(&self) -> Result<(), String> {
+        let Some(first) = self.channels.first() else {
+            return Err("sample format declares no channels".to_string());
+        };
+        if first.kind != ChannelKind::Occupancy {
+            return Err(format!(
+                "sample format channel 0 must be Occupancy, got {:?}",
+                first.kind
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for channel in &self.channels {
+            if channel.name.is_empty() {
+                return Err("sample format has a channel with an empty name".to_string());
+            }
+            if !seen.insert(channel.name.as_str()) {
+                return Err(format!("duplicate sample channel name {:?}", channel.name));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// CBOR-encode a sample format (the payload `get_sample_format()` points at).
+pub fn encode_sample_format(format: &SampleFormat) -> Vec<u8> {
+    let mut out = Vec::new();
+    ciborium::ser::into_writer(format, &mut out)
+        .expect("sample format CBOR serialization should not fail");
+    out
+}
+
+/// Decode and structurally validate a `get_sample_format()` payload.
+pub fn decode_sample_format(bytes: &[u8]) -> Result<SampleFormat, String> {
+    let format: SampleFormat = ciborium::de::from_reader(std::io::Cursor::new(bytes))
+        .map_err(|e| format!("failed to decode sample format CBOR: {e}"))?;
+    format.validate()?;
+    Ok(format)
+}
 
 /// Input slot declaration in an operator's metadata.
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -135,6 +279,23 @@ pub fn metadata_reply(
     pack_ptr_len(cell.get_or_init(|| encode_metadata(&build())))
 }
 
+/// The complete `get_sample_format()` body: encode once into `cell`, return
+/// the packed pointer.
+///
+/// ```ignore
+/// #[unsafe(no_mangle)]
+/// pub extern "C" fn get_sample_format() -> i64 {
+///     static FORMAT: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+///     volumetric_abi::sample_format_reply(&FORMAT, || SampleFormat { ... })
+/// }
+/// ```
+pub fn sample_format_reply(
+    cell: &'static OnceLock<Vec<u8>>,
+    build: impl FnOnce() -> SampleFormat,
+) -> i64 {
+    pack_ptr_len(cell.get_or_init(|| encode_sample_format(&build())))
+}
+
 /// Safe wrappers over the host imports available to operator WASM modules.
 ///
 /// Only meaningful when compiled to wasm32 and run under a volumetric host;
@@ -193,6 +354,65 @@ mod tests {
 
         let decoded = decode_metadata(&encode_metadata(&metadata)).unwrap();
         assert_eq!(decoded, metadata);
+    }
+
+    #[test]
+    fn sample_format_round_trips_and_validates() {
+        let format = SampleFormat {
+            channels: vec![
+                SampleChannel {
+                    name: "occupancy".to_string(),
+                    kind: ChannelKind::Occupancy,
+                },
+                SampleChannel {
+                    name: "infill".to_string(),
+                    kind: ChannelKind::Density,
+                },
+                SampleChannel {
+                    name: "temp".to_string(),
+                    kind: ChannelKind::Custom("test.temperature".to_string()),
+                },
+            ],
+        };
+        let decoded = decode_sample_format(&encode_sample_format(&format)).unwrap();
+        assert_eq!(decoded, format);
+
+        assert!(SampleFormat::default().validate().is_ok());
+        assert_eq!(SampleFormat::default().channels.len(), 1);
+
+        // Channel 0 must be occupancy
+        let bad = SampleFormat {
+            channels: vec![SampleChannel {
+                name: "d".to_string(),
+                kind: ChannelKind::Density,
+            }],
+        };
+        assert!(decode_sample_format(&encode_sample_format(&bad)).is_err());
+
+        // Empty and duplicate-name formats rejected
+        assert!(SampleFormat { channels: vec![] }.validate().is_err());
+        let dup = SampleFormat {
+            channels: vec![
+                SampleChannel {
+                    name: "x".to_string(),
+                    kind: ChannelKind::Occupancy,
+                },
+                SampleChannel {
+                    name: "x".to_string(),
+                    kind: ChannelKind::Density,
+                },
+            ],
+        };
+        assert!(dup.validate().is_err());
+    }
+
+    #[test]
+    fn occupancy_classification() {
+        assert!(is_occupied(1.0));
+        assert!(!is_occupied(0.0));
+        assert!(!is_occupied(0.5)); // strictly greater
+        assert!(!is_occupied(0.3)); // the #3 disagreement case: outside, everywhere
+        assert!(!is_occupied(f32::NAN));
     }
 
     #[test]

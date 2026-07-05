@@ -18,6 +18,7 @@ members = [
     "crates/models/rounded_box_model",
     "crates/models/gyroid_lattice_model",
     "crates/models/mandelbulb_model",
+    "crates/models/density_gradient_model",
     "crates/operators/translate_operator",
     "crates/operators/boolean_operator",
     "crates/operators/rotation_operator",

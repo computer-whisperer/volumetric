@@ -8,6 +8,10 @@
 //! - `get_bounds(out_ptr: i32)`: Wrapper that applies rotation to bounds AABB
 //! - `sample(pos_ptr: i32) -> f32`: Wrapper that applies the inverse rotation
 //!   to the position in place (the ABI allows clobbering the position buffer)
+//! - `sample_channels(pos_ptr: i32, out_ptr: i32)`: Same wrapper as `sample`,
+//!   present iff the input model has it
+//! - `get_sample_format() -> i64`: Passed through from input model (a
+//!   transform doesn't change what the samples mean)
 //! - `memory`: Passed through from input model
 //!
 //! Behavior:
@@ -41,12 +45,19 @@ impl Default for RotationConfig {
 
 use volumetric_abi::host::{post_output, read_input, report_error};
 
-/// N-dimensional ABI function names. `get_dimensions` and `get_io_ptr` are
-/// passed through unchanged; `get_bounds` and `sample` get wrappers.
-const ABI_FUNCTIONS_ND: &[&str] = &["get_dimensions", "get_io_ptr", "get_bounds", "sample"];
+/// N-dimensional ABI function names. `get_dimensions`, `get_io_ptr` and
+/// `get_sample_format` are passed through unchanged; `get_bounds`, `sample`
+/// and `sample_channels` get wrappers.
+const ABI_FUNCTIONS_ND: &[&str] = &[
+    "get_dimensions",
+    "get_io_ptr",
+    "get_bounds",
+    "sample",
+    "sample_channels",
+];
 
 /// ABI functions the wrappers replace; the rest keep their exports.
-const WRAPPED_FUNCTIONS: &[&str] = &["get_bounds", "sample"];
+const WRAPPED_FUNCTIONS: &[&str] = &["get_bounds", "sample", "sample_channels"];
 
 fn generate_hex_suffix() -> String {
     let mut state: u32 = 0xA5A5_1337;
@@ -94,6 +105,85 @@ fn rotation_constants(cfg: &RotationConfig) -> ([[f64; 3]; 3], [[f64; 3]; 3], [[
         }
     }
     (r, r_inv, r_abs)
+}
+
+/// Emit code that applies the inverse rotation to the first 3 dims in place
+/// at `pos_ptr` (shared by the `sample` and `sample_channels` wrappers).
+fn emit_position_rewrite(
+    b: &mut FunctionBuilder,
+    locals: &mut walrus::ModuleLocals,
+    pos_ptr: walrus::LocalId,
+    memory_id: MemoryId,
+    r_inv: &[[f64; 3]; 3],
+) {
+    let x = locals.add(ValType::F64);
+    let y = locals.add(ValType::F64);
+    let z = locals.add(ValType::F64);
+    let rx = locals.add(ValType::F64);
+    let ry = locals.add(ValType::F64);
+    let rz = locals.add(ValType::F64);
+
+    use walrus::ir::BinaryOp::{F64Add, F64Mul};
+    let mem_arg = walrus::ir::MemArg {
+        align: 3,
+        offset: 0,
+    };
+    let mem_arg_8 = walrus::ir::MemArg {
+        align: 3,
+        offset: 8,
+    };
+    let mem_arg_16 = walrus::ir::MemArg {
+        align: 3,
+        offset: 16,
+    };
+
+    // Load position from input
+    b.func_body()
+        .local_get(pos_ptr)
+        .load(memory_id, walrus::ir::LoadKind::F64, mem_arg)
+        .local_set(x);
+    b.func_body()
+        .local_get(pos_ptr)
+        .load(memory_id, walrus::ir::LoadKind::F64, mem_arg_8)
+        .local_set(y);
+    b.func_body()
+        .local_get(pos_ptr)
+        .load(memory_id, walrus::ir::LoadKind::F64, mem_arg_16)
+        .local_set(z);
+
+    // Apply inverse rotation: (rx, ry, rz) = R_inv * (x, y, z)
+    for (out, row) in [(rx, &r_inv[0]), (ry, &r_inv[1]), (rz, &r_inv[2])] {
+        b.func_body()
+            .local_get(x)
+            .f64_const(row[0])
+            .binop(F64Mul)
+            .local_get(y)
+            .f64_const(row[1])
+            .binop(F64Mul)
+            .binop(F64Add)
+            .local_get(z)
+            .f64_const(row[2])
+            .binop(F64Mul)
+            .binop(F64Add)
+            .local_set(out);
+    }
+
+    // Write the rotated position back in place at pos_ptr
+    b.func_body().local_get(pos_ptr).local_get(rx).store(
+        memory_id,
+        walrus::ir::StoreKind::F64,
+        mem_arg,
+    );
+    b.func_body().local_get(pos_ptr).local_get(ry).store(
+        memory_id,
+        walrus::ir::StoreKind::F64,
+        mem_arg_8,
+    );
+    b.func_body().local_get(pos_ptr).local_get(rz).store(
+        memory_id,
+        walrus::ir::StoreKind::F64,
+        mem_arg_16,
+    );
 }
 
 fn transform_wasm(input_bytes: &[u8], cfg: RotationConfig) -> Result<Vec<u8>, String> {
@@ -161,111 +251,30 @@ fn transform_wasm(input_bytes: &[u8], cfg: RotationConfig) -> Result<Vec<u8>, St
     if let Some(&orig) = renamed.get("sample") {
         let mut b = FunctionBuilder::new(&mut module.types, &[ValType::I32], &[ValType::F32]);
         let pos_ptr = module.locals.add(ValType::I32);
-        let x = module.locals.add(ValType::F64);
-        let y = module.locals.add(ValType::F64);
-        let z = module.locals.add(ValType::F64);
-        let rx = module.locals.add(ValType::F64);
-        let ry = module.locals.add(ValType::F64);
-        let rz = module.locals.add(ValType::F64);
 
-        use walrus::ir::BinaryOp::{F64Add, F64Mul};
-        let mem_arg = walrus::ir::MemArg {
-            align: 3,
-            offset: 0,
-        };
-        let mem_arg_8 = walrus::ir::MemArg {
-            align: 3,
-            offset: 8,
-        };
-        let mem_arg_16 = walrus::ir::MemArg {
-            align: 3,
-            offset: 16,
-        };
-
-        // Load position from input
-        b.func_body()
-            .local_get(pos_ptr)
-            .load(memory_id, walrus::ir::LoadKind::F64, mem_arg)
-            .local_set(x);
-        b.func_body()
-            .local_get(pos_ptr)
-            .load(memory_id, walrus::ir::LoadKind::F64, mem_arg_8)
-            .local_set(y);
-        b.func_body()
-            .local_get(pos_ptr)
-            .load(memory_id, walrus::ir::LoadKind::F64, mem_arg_16)
-            .local_set(z);
-
-        // Apply inverse rotation: (rx, ry, rz) = R_inv * (x, y, z)
-        // rx = r_inv[0][0]*x + r_inv[0][1]*y + r_inv[0][2]*z
-        b.func_body()
-            .local_get(x)
-            .f64_const(r_inv[0][0])
-            .binop(F64Mul)
-            .local_get(y)
-            .f64_const(r_inv[0][1])
-            .binop(F64Mul)
-            .binop(F64Add)
-            .local_get(z)
-            .f64_const(r_inv[0][2])
-            .binop(F64Mul)
-            .binop(F64Add)
-            .local_set(rx);
-
-        // ry = r_inv[1][0]*x + r_inv[1][1]*y + r_inv[1][2]*z
-        b.func_body()
-            .local_get(x)
-            .f64_const(r_inv[1][0])
-            .binop(F64Mul)
-            .local_get(y)
-            .f64_const(r_inv[1][1])
-            .binop(F64Mul)
-            .binop(F64Add)
-            .local_get(z)
-            .f64_const(r_inv[1][2])
-            .binop(F64Mul)
-            .binop(F64Add)
-            .local_set(ry);
-
-        // rz = r_inv[2][0]*x + r_inv[2][1]*y + r_inv[2][2]*z
-        b.func_body()
-            .local_get(x)
-            .f64_const(r_inv[2][0])
-            .binop(F64Mul)
-            .local_get(y)
-            .f64_const(r_inv[2][1])
-            .binop(F64Mul)
-            .binop(F64Add)
-            .local_get(z)
-            .f64_const(r_inv[2][2])
-            .binop(F64Mul)
-            .binop(F64Add)
-            .local_set(rz);
-
-        // Write the rotated position back in place at pos_ptr
-        b.func_body().local_get(pos_ptr).local_get(rx).store(
-            memory_id,
-            walrus::ir::StoreKind::F64,
-            mem_arg,
-        );
-
-        b.func_body().local_get(pos_ptr).local_get(ry).store(
-            memory_id,
-            walrus::ir::StoreKind::F64,
-            mem_arg_8,
-        );
-
-        b.func_body().local_get(pos_ptr).local_get(rz).store(
-            memory_id,
-            walrus::ir::StoreKind::F64,
-            mem_arg_16,
-        );
-
-        // Call original sample with the transformed position
+        emit_position_rewrite(&mut b, &mut module.locals, pos_ptr, memory_id, &r_inv);
         b.func_body().local_get(pos_ptr).call(orig);
 
         let fid = b.finish(vec![pos_ptr], &mut module.funcs);
         module.exports.add("sample", fid);
+    }
+
+    // sample_channels(pos_ptr, out_ptr): identical position rewrite, then
+    // call the original with both pointers. Only present when the input model
+    // declares typed channels; get_sample_format passes through untouched.
+    if let Some(&orig) = renamed.get("sample_channels") {
+        let mut b = FunctionBuilder::new(&mut module.types, &[ValType::I32, ValType::I32], &[]);
+        let pos_ptr = module.locals.add(ValType::I32);
+        let out_ptr = module.locals.add(ValType::I32);
+
+        emit_position_rewrite(&mut b, &mut module.locals, pos_ptr, memory_id, &r_inv);
+        b.func_body()
+            .local_get(pos_ptr)
+            .local_get(out_ptr)
+            .call(orig);
+
+        let fid = b.finish(vec![pos_ptr, out_ptr], &mut module.funcs);
+        module.exports.add("sample_channels", fid);
     }
 
     // get_bounds wrapper using center/half-extents transform: h' = |R| h, c' = R c

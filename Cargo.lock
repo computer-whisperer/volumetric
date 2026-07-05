@@ -1077,6 +1077,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "density_gradient_model"
+version = "0.1.0"
+dependencies = [
+ "volumetric_abi",
+]
+
+[[package]]
 name = "derive_more"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

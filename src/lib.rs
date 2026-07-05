@@ -315,8 +315,8 @@ pub fn sample_model_from_bytes(
             let y = min_y + (max_y - min_y) * (y_idx as f32 / (resolution - 1).max(1) as f32);
             for x_idx in 0..resolution {
                 let x = min_x + (max_x - min_x) * (x_idx as f32 / (resolution - 1).max(1) as f32);
-                let density = executor.is_inside(x as f64, y as f64, z as f64)?;
-                if density > 0.5 {
+                let occupancy = executor.is_inside(x as f64, y as f64, z as f64)?;
+                if volumetric_abi::is_occupied(occupancy) {
                     points.push((x, y, z));
                 }
             }
