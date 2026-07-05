@@ -35,6 +35,7 @@ members = [
     "crates/volumetric_ui",
     "crates/volumetric_ui_v2",
     "crates/volumetric_cli",
+    "crates/meshing_lab",
 ]
 
 [features]

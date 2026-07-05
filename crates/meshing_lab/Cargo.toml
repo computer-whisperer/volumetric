@@ -1,0 +1,12 @@
+[package]
+name = "meshing_lab"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+volumetric = { path = "../../" }
+glam = "0.32"
+
+[[bin]]
+name = "patch_fit_bench"
+path = "src/bin/patch_fit_bench.rs"
