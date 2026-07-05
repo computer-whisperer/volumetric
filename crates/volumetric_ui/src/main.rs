@@ -1831,8 +1831,8 @@ impl VolumetricApp {
                             }
                         }
                     }
-                    OperatorMetadataInput::Blob => {
-                        // Blob inputs are not editable in the current UI
+                    OperatorMetadataInput::Blob | OperatorMetadataInput::FeaMesh => {
+                        // Blob and FEA-mesh inputs are not editable in this UI
                         self.edit_input_asset_ids.push(None);
                     }
                     OperatorMetadataInput::VecF64(dim) => {
@@ -2119,6 +2119,11 @@ impl VolumetricApp {
                             ui.label("Blob Input:");
                             ui.colored_label(egui::Color32::GRAY, "(Binary data - not editable)");
                         }
+                        OperatorMetadataInput::FeaMesh => {
+                            ui.separator();
+                            ui.label("FEA Mesh Input:");
+                            ui.colored_label(egui::Color32::GRAY, "(FEA mesh - not editable)");
+                        }
                         OperatorMetadataInput::VecF64(dim) => {
                             ui.separator();
                             let label = match dim {
@@ -2283,8 +2288,8 @@ impl VolumetricApp {
                         let script_bytes = self.edit_lua_script.as_bytes().to_vec();
                         inputs.push(ExecutionInput::Inline(script_bytes));
                     }
-                    OperatorMetadataInput::Blob => {
-                        // Keep existing blob data (not editable)
+                    OperatorMetadataInput::Blob | OperatorMetadataInput::FeaMesh => {
+                        // Keep existing blob/mesh data (not editable)
                         // We need to preserve the original inline data from the step
                         if let Some(ref project) = self.project {
                             if let Some(step) = project.timeline().get(idx) {
@@ -3073,7 +3078,8 @@ impl eframe::App for VolumetricApp {
                                                     let script_bytes = app.operation_lua_script.as_bytes().to_vec();
                                                     inputs.push(ExecutionInput::Inline(script_bytes));
                                                 }
-                                                OperatorMetadataInput::Blob => {
+                                                OperatorMetadataInput::Blob
+                                                | OperatorMetadataInput::FeaMesh => {
                                                     // Blob inputs should be handled specially (via file picker)
                                                     // For now, just add empty bytes - the STL import is handled
                                                     // through the dedicated "Import STL" button instead

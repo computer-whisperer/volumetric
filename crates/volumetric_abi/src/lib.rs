@@ -216,6 +216,12 @@ pub enum OperatorMetadataInput {
     /// reference. Data is encoded as raw bytes (8 bytes per f64,
     /// little-endian).
     VecF64(usize),
+    /// A CBOR-encoded FEA mesh (explicit node positions, element
+    /// connectivity, and named attribute arrays — not a sampleable field).
+    ///
+    /// The concrete schema ships with the first mesh-producing operator;
+    /// the host UI offers a picker over FEA-mesh-typed assets.
+    FeaMesh,
 }
 
 /// Output slot declaration in an operator's metadata.
@@ -223,6 +229,11 @@ pub enum OperatorMetadataInput {
 pub enum OperatorMetadataOutput {
     /// A model WASM blob (N-dimensional model ABI).
     ModelWASM,
+    /// A CBOR-encoded FEA mesh (see [`OperatorMetadataInput::FeaMesh`]).
+    ///
+    /// Unlike `ModelWASM`, this is explicit data: hosts must not feed it to
+    /// the model executor (there is nothing to sample).
+    FeaMesh,
 }
 
 /// Metadata an operator returns from `get_metadata()`, CBOR-encoded.
@@ -348,8 +359,12 @@ mod tests {
                 OperatorMetadataInput::LuaSource("-- stub".to_string()),
                 OperatorMetadataInput::Blob,
                 OperatorMetadataInput::VecF64(3),
+                OperatorMetadataInput::FeaMesh,
             ],
-            outputs: vec![OperatorMetadataOutput::ModelWASM],
+            outputs: vec![
+                OperatorMetadataOutput::ModelWASM,
+                OperatorMetadataOutput::FeaMesh,
+            ],
         };
 
         let decoded = decode_metadata(&encode_metadata(&metadata)).unwrap();

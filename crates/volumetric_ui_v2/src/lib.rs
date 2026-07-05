@@ -3059,6 +3059,7 @@ fn asset_type_label(type_hint: Option<AssetTypeHint>) -> &'static str {
         Some(AssetTypeHint::LuaSource) => "Lua",
         Some(AssetTypeHint::Binary) => "Binary",
         Some(AssetTypeHint::VecF64(_)) => "Vec",
+        Some(AssetTypeHint::FeaMesh) => "FEA Mesh",
         None => "Asset",
     }
 }
@@ -3085,6 +3086,10 @@ fn operator_step_inputs(metadata: &OperatorMetadata, primary_model: &str) -> Vec
             }
             OperatorMetadataInput::Blob => ExecutionInput::Inline(Vec::new()),
             OperatorMetadataInput::VecF64(dim) => ExecutionInput::Inline(vec![0u8; dim * 8]),
+            // No FEA-mesh asset picker yet (no producing operators exist);
+            // the empty placeholder makes the operator report a bad input at
+            // run time instead of silently sampling the wrong asset.
+            OperatorMetadataInput::FeaMesh => ExecutionInput::Inline(Vec::new()),
         })
         .collect()
 }

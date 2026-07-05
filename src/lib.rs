@@ -174,6 +174,9 @@ pub enum AssetTypeHint {
     /// Vector of f64 values with specified dimension (e.g., 3 for vec3)
     /// Encoded as raw bytes (8 bytes per f64, little-endian)
     VecF64(usize),
+    /// CBOR-encoded FEA mesh (explicit nodes/elements/attributes; not a
+    /// sampleable field, so never handed to the model executor)
+    FeaMesh,
 }
 
 impl std::fmt::Display for AssetTypeHint {
@@ -185,6 +188,18 @@ impl std::fmt::Display for AssetTypeHint {
             AssetTypeHint::LuaSource => write!(f, "LuaSource"),
             AssetTypeHint::Binary => write!(f, "Binary"),
             AssetTypeHint::VecF64(dim) => write!(f, "VecF64({dim})"),
+            AssetTypeHint::FeaMesh => write!(f, "FeaMesh"),
+        }
+    }
+}
+
+impl From<&OperatorMetadataOutput> for AssetTypeHint {
+    /// The type hint a step output carries when its operator declares this
+    /// output kind.
+    fn from(output: &OperatorMetadataOutput) -> Self {
+        match output {
+            OperatorMetadataOutput::ModelWASM => AssetTypeHint::Model,
+            OperatorMetadataOutput::FeaMesh => AssetTypeHint::FeaMesh,
         }
     }
 }
@@ -685,12 +700,14 @@ impl Project {
             }
         }
 
-        // Add execution step outputs (type hint unknown for outputs)
+        // Add execution step outputs. This is a static inspection (no WASM
+        // execution), so operator-declared output types are not available
+        // here; outputs are assumed to be models, matching the runtime
+        // fallback. Runtime `LoadedAsset`s carry the operator-declared type.
         for step in &self.timeline {
             for output_id in &step.outputs {
                 if !seen.contains_key(output_id) {
                     seen.insert(output_id.clone(), out.len());
-                    // Outputs from operators are typically models
                     out.push((output_id.clone(), Some(AssetTypeHint::Model)));
                 }
             }
@@ -944,6 +961,17 @@ impl Project {
             let mut executor = wasm::create_operator_executor(&op_data)
                 .map_err(|e| ExecutionError::Wasmtime(e.to_string()))?;
 
+            // Output type hints come from the operator's declared metadata;
+            // an operator without decodable metadata (or with fewer declared
+            // outputs than the step maps) falls back to Model, matching the
+            // historical assumption.
+            let declared_outputs: Vec<AssetTypeHint> = executor
+                .get_metadata()
+                .ok()
+                .and_then(|bytes| volumetric_abi::decode_metadata(&bytes).ok())
+                .map(|metadata| metadata.outputs.iter().map(AssetTypeHint::from).collect())
+                .unwrap_or_default();
+
             let io = OperatorIo::new(input_bytes);
             let result = executor.run(io).map_err(|e| match e {
                 wasm::WasmBackendError::OperatorReported(message) => {
@@ -961,7 +989,12 @@ impl Project {
                     env.insert(LoadedAsset {
                         id: output_id.clone(),
                         data: Arc::new(output_bytes.clone()),
-                        type_hint: Some(AssetTypeHint::Model), // Outputs are typically models
+                        type_hint: Some(
+                            declared_outputs
+                                .get(idx)
+                                .copied()
+                                .unwrap_or(AssetTypeHint::Model),
+                        ),
                         precursor_ids: precursor_ids.clone(),
                     });
                 }

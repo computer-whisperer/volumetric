@@ -186,12 +186,14 @@ enum InputInfo {
     LuaSource { template: String },
     VecF64 { dimension: usize },
     Blob,
+    FeaMesh,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum OutputInfo {
     ModelWasm,
+    FeaMesh,
 }
 
 #[derive(Debug, Serialize)]
@@ -225,6 +227,7 @@ fn metadata_to_json(meta: &OperatorMetadata) -> OperatorMetadataJson {
                 },
                 OperatorMetadataInput::VecF64(dim) => InputInfo::VecF64 { dimension: *dim },
                 OperatorMetadataInput::Blob => InputInfo::Blob,
+                OperatorMetadataInput::FeaMesh => InputInfo::FeaMesh,
             })
             .collect(),
         outputs: meta
@@ -232,6 +235,7 @@ fn metadata_to_json(meta: &OperatorMetadata) -> OperatorMetadataJson {
             .iter()
             .map(|o| match o {
                 OperatorMetadataOutput::ModelWASM => OutputInfo::ModelWasm,
+                OperatorMetadataOutput::FeaMesh => OutputInfo::FeaMesh,
             })
             .collect(),
     }
@@ -341,12 +345,16 @@ fn print_info_human(output: &InfoOutput) {
                     InputInfo::Blob => {
                         println!("  [{}] Blob (binary data)", i);
                     }
+                    InputInfo::FeaMesh => {
+                        println!("  [{}] FEA Mesh", i);
+                    }
                 }
             }
             println!("Outputs:");
             for (i, output) in metadata.outputs.iter().enumerate() {
                 match output {
                     OutputInfo::ModelWasm => println!("  [{}] ModelWASM", i),
+                    OutputInfo::FeaMesh => println!("  [{}] FEA Mesh", i),
                 }
             }
         }
