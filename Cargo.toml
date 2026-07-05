@@ -28,6 +28,7 @@ members = [
     "crates/operators/rectangular_prism_operator",
     "crates/operators/heightmap_extrude_operator",
     "crates/operators/extrude_operator",
+    "crates/operators/revolve_operator",
     "crates/volumetric_abi",
     "crates/volumetric_assets",
     "crates/volumetric_renderer",

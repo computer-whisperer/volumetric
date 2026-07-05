@@ -27,6 +27,7 @@ const OPERATORS: &[(&str, &str)] = &[
     ("rectangular_prism_operator", "Rectangular Prism"),
     ("heightmap_extrude_operator", "Heightmap Extrude"),
     ("extrude_operator", "Extrude"),
+    ("revolve_operator", "Revolve"),
 ];
 
 fn main() {

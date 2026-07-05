@@ -169,6 +169,102 @@ fn extruding_a_3d_model_is_rejected() {
     assert!(err.contains("2D sketch"), "{err}");
 }
 
+/// Rectangle profile in the r/z plane: r in [0.5, 1.0], z in [0.0, 2.0].
+/// Revolved, it becomes a tube (hollow cylinder) around the z axis.
+const RING_PROFILE: &str = r#"
+function is_inside(x, y)
+    if x >= 0.5 and x <= 1.0 and y >= 0.0 and y <= 2.0 then
+        return 1.0
+    else
+        return 0.0
+    end
+end
+
+function get_bounds_min_x() return 0.0 end
+function get_bounds_max_x() return 1.25 end
+function get_bounds_min_y() return -0.25 end
+function get_bounds_max_y() return 2.25 end
+"#;
+
+#[test]
+fn revolve_turns_profile_into_tube() {
+    let sketch = run_operator(
+        "lua_script_operator",
+        vec![RING_PROFILE.as_bytes().to_vec()],
+    )
+    .expect("compile ring profile");
+    let revolved = run_operator("revolve_operator", vec![sketch]).expect("revolve profile");
+
+    let mut executor = NativeModelExecutor::new(&revolved).unwrap();
+    assert_eq!(executor.dimensions(), 3);
+
+    // Bounds: R = max(sketch max_x, 0) = 1.25; z takes the sketch's y bounds.
+    let bounds = executor.get_bounds_nd().unwrap();
+    assert_eq!((bounds.min(0), bounds.max(0)), (-1.25, 1.25));
+    assert_eq!((bounds.min(1), bounds.max(1)), (-1.25, 1.25));
+    assert_eq!((bounds.min(2), bounds.max(2)), (-0.25, 2.25));
+
+    // In the tube wall, in several directions (rotational symmetry).
+    assert_eq!(executor.sample_nd(&[0.75, 0.0, 1.0]).unwrap(), 1.0);
+    assert_eq!(executor.sample_nd(&[0.0, 0.75, 1.0]).unwrap(), 1.0);
+    assert_eq!(executor.sample_nd(&[-0.6, -0.45, 1.0]).unwrap(), 1.0); // r = 0.75
+    // In the hole (r < 0.5).
+    assert_eq!(executor.sample_nd(&[0.2, 0.0, 1.0]).unwrap(), 0.0);
+    assert_eq!(executor.sample_nd(&[0.0, 0.0, 1.0]).unwrap(), 0.0);
+    // Outside radially (r > 1.0).
+    assert_eq!(executor.sample_nd(&[1.1, 0.0, 1.0]).unwrap(), 0.0);
+    // Outside axially.
+    assert_eq!(executor.sample_nd(&[0.75, 0.0, -0.1]).unwrap(), 0.0);
+    assert_eq!(executor.sample_nd(&[0.75, 0.0, 2.1]).unwrap(), 0.0);
+}
+
+#[test]
+fn revolving_a_3d_model_is_rejected() {
+    let err = run_operator(
+        "revolve_operator",
+        vec![wasm_artifact("simple_sphere_model")],
+    )
+    .expect_err("revolving a 3D model must fail");
+    assert!(err.contains("2D sketch"), "{err}");
+}
+
+#[test]
+fn revolved_model_extrude_style_composes() {
+    // Revolve output must behave like any 3D model downstream: translate it
+    // up by 1 and check the tube moved.
+    let sketch = run_operator(
+        "lua_script_operator",
+        vec![RING_PROFILE.as_bytes().to_vec()],
+    )
+    .expect("compile ring profile");
+    let revolved = run_operator("revolve_operator", vec![sketch]).expect("revolve profile");
+
+    let mut cfg = Vec::new();
+    ciborium::ser::into_writer(
+        &ciborium::value::Value::Map(vec![
+            (
+                ciborium::value::Value::Text("dx".into()),
+                ciborium::value::Value::Float(0.0),
+            ),
+            (
+                ciborium::value::Value::Text("dy".into()),
+                ciborium::value::Value::Float(0.0),
+            ),
+            (
+                ciborium::value::Value::Text("dz".into()),
+                ciborium::value::Value::Float(1.0),
+            ),
+        ]),
+        &mut cfg,
+    )
+    .unwrap();
+    let moved = run_operator("translate_operator", vec![revolved, cfg]).expect("translate tube");
+
+    let mut executor = NativeModelExecutor::new(&moved).unwrap();
+    assert_eq!(executor.sample_nd(&[0.75, 0.0, 2.0]).unwrap(), 1.0);
+    assert_eq!(executor.sample_nd(&[0.75, 0.0, 0.5]).unwrap(), 0.0);
+}
+
 #[test]
 fn sketches_rasterize_for_preview() {
     let raster = volumetric::rasterize_sketch_from_bytes(&circle_sketch_wasm(), 64)

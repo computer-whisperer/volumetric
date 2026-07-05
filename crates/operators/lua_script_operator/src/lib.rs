@@ -848,23 +848,31 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                             IrBinOp::Div => {
                                 b.binop(BinaryOp::F64Div);
                             }
+                            // Comparisons produce an i32; expression context
+                            // is uniformly f64, so convert the 0/1 back.
                             IrBinOp::Lt => {
                                 b.binop(BinaryOp::F64Lt);
+                                b.unop(UnaryOp::F64ConvertSI32);
                             }
                             IrBinOp::Le => {
                                 b.binop(BinaryOp::F64Le);
+                                b.unop(UnaryOp::F64ConvertSI32);
                             }
                             IrBinOp::Gt => {
                                 b.binop(BinaryOp::F64Gt);
+                                b.unop(UnaryOp::F64ConvertSI32);
                             }
                             IrBinOp::Ge => {
                                 b.binop(BinaryOp::F64Ge);
+                                b.unop(UnaryOp::F64ConvertSI32);
                             }
                             IrBinOp::Eq => {
                                 b.binop(BinaryOp::F64Eq);
+                                b.unop(UnaryOp::F64ConvertSI32);
                             }
                             IrBinOp::Ne => {
                                 b.binop(BinaryOp::F64Ne);
+                                b.unop(UnaryOp::F64ConvertSI32);
                             }
                             _ => unreachable!(),
                         }
@@ -878,9 +886,11 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                         b.unop(UnaryOp::F64Neg);
                     }
                     IrUnaryOp::Not => {
-                        // Convert to boolean: compare with 0, then negate
+                        // Convert to boolean: compare with 0 (i32), then back
+                        // to the f64 expression convention.
                         b.f64_const(0.0);
                         b.binop(BinaryOp::F64Eq);
+                        b.unop(UnaryOp::F64ConvertSI32);
                     }
                 }
             }
@@ -1879,6 +1889,45 @@ pub extern "C" fn get_metadata() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Reparse compiled output with walrus, which rejects type-invalid code
+    /// sections — comparisons used as *values* (e.g. chained `and`) once
+    /// emitted i32 where the f64 expression convention was expected.
+    fn assert_valid_wasm(bytes: &[u8]) {
+        Module::from_buffer_with_config(bytes, &ModuleConfig::new())
+            .expect("compiled Lua module must reparse as valid wasm");
+    }
+
+    #[test]
+    fn comparisons_as_values_emit_valid_wasm() {
+        let lua_src = r#"
+function is_inside(x, y)
+    if x >= 0.5 and x <= 1.0 and y >= 0.0 and y <= 2.0 then
+        return 1.0
+    else
+        return 0.0
+    end
+end
+function get_bounds_min_x() return 0.0 end
+function get_bounds_max_x() return 1.25 end
+function get_bounds_min_y() return -0.25 end
+function get_bounds_max_y() return 2.25 end
+"#;
+        assert_valid_wasm(&compile_lua_to_wasm(lua_src).expect("compile chained and"));
+
+        let lua_src_not = r#"
+function is_inside(x, y, z)
+    return (not (x > 0.0)) or (y < 1.0 and z ~= 0.0)
+end
+function get_bounds_min_x() return -1.0 end
+function get_bounds_max_x() return 1.0 end
+function get_bounds_min_y() return -1.0 end
+function get_bounds_max_y() return 1.0 end
+function get_bounds_min_z() return -1.0 end
+function get_bounds_max_z() return 1.0 end
+"#;
+        assert_valid_wasm(&compile_lua_to_wasm(lua_src_not).expect("compile not/or"));
+    }
 
     #[test]
     fn test_compile_simple_sphere() {
