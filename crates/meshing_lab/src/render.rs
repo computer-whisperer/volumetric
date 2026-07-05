@@ -142,6 +142,114 @@ pub fn render_png(
     img.save(path)
 }
 
+/// Render with smooth (Gouraud-style per-pixel) shading from per-vertex
+/// normals, like a production viewport. This is where crease shading quality
+/// is visible: flat shading hides blended vertex normals entirely.
+pub fn render_smooth_png(
+    positions: &[DVec3],
+    normals: &[DVec3],
+    indices: &[u32],
+    config: &RenderConfig,
+    path: &Path,
+) -> Result<(), image::ImageError> {
+    let (w, h) = (config.width, config.height);
+    let mut color = vec![config.background; w * h];
+    let mut inv_depth = vec![0.0f64; w * h];
+
+    let forward = (config.target - config.camera_pos).normalize();
+    let up_hint = if forward.dot(DVec3::Y).abs() > 0.99 {
+        DVec3::Z
+    } else {
+        DVec3::Y
+    };
+    let right = forward.cross(up_hint).normalize();
+    let up = right.cross(forward);
+
+    let focal = (h as f64 / 2.0) / (config.fov_deg.to_radians() / 2.0).tan();
+    let near = 1e-3;
+    let light = DVec3::new(0.45, 0.8, 0.4).normalize();
+    let base = [0.62, 0.66, 0.72];
+
+    let project = |p: DVec3| -> (DVec3, f64) {
+        let rel = p - config.camera_pos;
+        let view = DVec3::new(rel.dot(right), rel.dot(up), -rel.dot(forward));
+        let depth = -view.z;
+        let sx = w as f64 / 2.0 + focal * view.x / depth;
+        let sy = h as f64 / 2.0 - focal * view.y / depth;
+        (DVec3::new(sx, sy, 0.0), depth)
+    };
+
+    for tri in indices.chunks_exact(3) {
+        let (ia, ib, ic) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+        let (p0, p1, p2) = (positions[ia], positions[ib], positions[ic]);
+        let (s0, d0) = project(p0);
+        let (s1, d1) = project(p1);
+        let (s2, d2) = project(p2);
+        if d0 < near || d1 < near || d2 < near {
+            continue;
+        }
+        let n0 = positions_normal(normals[ia]);
+        let n1 = positions_normal(normals[ib]);
+        let n2 = positions_normal(normals[ic]);
+
+        let min_x = s0.x.min(s1.x).min(s2.x).floor().max(0.0) as usize;
+        let max_x = (s0.x.max(s1.x).max(s2.x).ceil() as usize).min(w - 1);
+        let min_y = s0.y.min(s1.y).min(s2.y).floor().max(0.0) as usize;
+        let max_y = (s0.y.max(s1.y).max(s2.y).ceil() as usize).min(h - 1);
+        if min_x > max_x || min_y > max_y {
+            continue;
+        }
+
+        let edge = |a: DVec3, b: DVec3, x: f64, y: f64| -> f64 {
+            (b.x - a.x) * (y - a.y) - (b.y - a.y) * (x - a.x)
+        };
+        let area = edge(s0, s1, s2.x, s2.y);
+        if area.abs() < 1e-12 {
+            continue;
+        }
+
+        for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                let (px, py) = (x as f64 + 0.5, y as f64 + 0.5);
+                let w0 = edge(s1, s2, px, py) / area;
+                let w1 = edge(s2, s0, px, py) / area;
+                let w2 = 1.0 - w0 - w1;
+                if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
+                    continue;
+                }
+                let inv_z = w0 / d0 + w1 / d1 + w2 / d2;
+                let px_idx = y * w + x;
+                if inv_z <= inv_depth[px_idx] {
+                    continue;
+                }
+                inv_depth[px_idx] = inv_z;
+                let mut n = (n0 * w0 + n1 * w1 + n2 * w2).normalize_or_zero();
+                if n == DVec3::ZERO {
+                    n = DVec3::Y;
+                }
+                // Light both sides so inward-blended normals stay visible
+                // rather than going black.
+                let intensity = 0.25 + 0.75 * n.dot(light).abs();
+                color[px_idx] = [
+                    (base[0] * intensity * 255.0).clamp(0.0, 255.0) as u8,
+                    (base[1] * intensity * 255.0).clamp(0.0, 255.0) as u8,
+                    (base[2] * intensity * 255.0).clamp(0.0, 255.0) as u8,
+                ];
+            }
+        }
+    }
+
+    let mut img = image::RgbImage::new(w as u32, h as u32);
+    for (x, y, pixel) in img.enumerate_pixels_mut() {
+        *pixel = image::Rgb(color[y as usize * w + x as usize]);
+    }
+    img.save(path)
+}
+
+fn positions_normal(n: DVec3) -> DVec3 {
+    n.try_normalize().unwrap_or(DVec3::Y)
+}
+
 /// Camera framing a bounding box from the standard three-quarter view.
 pub fn frame_bounds(lo: DVec3, hi: DVec3) -> RenderConfig {
     let center = (lo + hi) / 2.0;

@@ -21,6 +21,10 @@
 //! 4. **Weld** ([`cleanup::weld_snapped_vertices`]): cross-band vertex pairs
 //!    that landed on the same feature point merge, collapsing the folded
 //!    slivers between them.
+//! 5. **Crease split** ([`crease::split_crease_vertices`]): snapped vertices
+//!    are duplicated per adjacent region so each side of a feature shades
+//!    with its own normal. Positions coincide — the surface stays
+//!    geometrically sealed; only shading topology splits.
 //!
 //! Robustness contract: every snap sits behind a chain of gates (side
 //! support, side residual, intersection conditioning, movement clamp, sampler
@@ -35,6 +39,7 @@
 
 pub mod adjacency;
 pub mod cleanup;
+pub mod crease;
 pub mod fit;
 pub mod segmentation;
 pub mod snap;
@@ -61,6 +66,8 @@ pub struct SharpFeatureStats {
     pub snapped_corners: usize,
     pub welded_vertices: usize,
     pub dropped_triangles: usize,
+    /// Extra vertex copies created for per-region crease shading.
+    pub crease_splits: usize,
 }
 
 pub struct SharpFeatureOutput {
@@ -118,15 +125,32 @@ pub fn apply_sharp_features(
 
     // Carry accumulated normals through the weld remap; cluster members agree
     // in orientation, so summing preserves the outward direction.
-    let mut out_normals = vec![DVec3::ZERO; cleaned.positions.len()];
+    let mut welded_normals = vec![DVec3::ZERO; cleaned.positions.len()];
+    let mut welded_labels: Vec<Option<u32>> = vec![None; cleaned.positions.len()];
+    let mut is_crease = vec![false; cleaned.positions.len()];
     for v in 0..positions.len() {
-        out_normals[cleaned.remap[v] as usize] += normals_v[v];
+        let out = cleaned.remap[v] as usize;
+        welded_normals[out] += normals_v[v];
+        if let Some(label) = seg.labels[v] {
+            welded_labels[out] = Some(label);
+        }
+        if snapped.snapped[v].is_some() {
+            is_crease[out] = true;
+        }
     }
 
+    let split = crease::split_crease_vertices(
+        &cleaned.positions,
+        &welded_normals,
+        &cleaned.indices,
+        &welded_labels,
+        &is_crease,
+    );
+
     SharpFeatureOutput {
-        positions: cleaned.positions.iter().map(|p| (p.x, p.y, p.z)).collect(),
-        normals: out_normals.iter().map(|n| (n.x, n.y, n.z)).collect(),
-        indices: cleaned.indices,
+        positions: split.positions.iter().map(|p| (p.x, p.y, p.z)).collect(),
+        normals: split.normals.iter().map(|n| (n.x, n.y, n.z)).collect(),
+        indices: split.indices,
         stats: SharpFeatureStats {
             regions: seg.region_count,
             candidates: snapped.stats.candidates,
@@ -134,6 +158,7 @@ pub fn apply_sharp_features(
             snapped_corners: snapped.stats.snapped_corners,
             welded_vertices: cleaned.welded_vertices,
             dropped_triangles: cleaned.dropped_triangles,
+            crease_splits: split.split_vertices,
         },
     }
 }

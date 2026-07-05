@@ -14,12 +14,13 @@ use glam::{DQuat, DVec3};
 use meshing_lab::cleanup::{
     CleanupConfig, boundary_edge_count, inward_facing_count, weld_snapped_vertices,
 };
+use meshing_lab::crease::split_crease_vertices;
 use meshing_lab::harness::mesh_shape;
 use meshing_lab::oracle::{
     BoxShape, CylinderShape, MandelbulbShape, OracleShape, PolygonPrism, Rotated, SphereShape,
     standard_rotation,
 };
-use meshing_lab::render::{render_plain, render_segments};
+use meshing_lab::render::{frame_bounds, render_plain, render_segments, render_smooth_png};
 use meshing_lab::segmentation::{SegmentationConfig, segment_regions};
 use meshing_lab::snap::{SnapConfig, SnapKind, snap_feature_vertices};
 use std::path::PathBuf;
@@ -224,6 +225,74 @@ fn run_case(
         cleaned.welded_vertices, cleaned.dropped_triangles
     );
 
+    // -------- Crease split: per-region shading normals --------
+    let mut cleaned_labels: Vec<Option<u32>> = vec![None; cleaned.positions.len()];
+    let mut is_crease = vec![false; cleaned.positions.len()];
+    for v in 0..m.positions.len() {
+        if let Some(l) = seg.labels[v] {
+            cleaned_labels[cleaned.remap[v] as usize] = Some(l);
+        }
+        if result.snapped[v].is_some() {
+            is_crease[cleaned.remap[v] as usize] = true;
+        }
+    }
+    let split = split_crease_vertices(
+        &cleaned.positions,
+        &cleaned_normals,
+        &cleaned.indices,
+        &cleaned_labels,
+        &is_crease,
+    );
+
+    // Geometric seal: the split adds topological boundary edges along
+    // creases, but every one must have a position-coincident partner, or the
+    // surface has a real crack.
+    let unsealed = unsealed_boundary_edges(&split.positions, &split.indices);
+
+    // Crease shading accuracy: each crease-copy normal vs the oracle normal
+    // at the centroid of a triangle referencing it (the centroid sits inside
+    // that side's face, so the oracle picks the correct smooth face).
+    let mut crease_normal_errs: Vec<f64> = Vec::new();
+    if has_truth {
+        for tri in split.indices.chunks_exact(3) {
+            let (pa, pb, pc) = (
+                split.positions[tri[0] as usize],
+                split.positions[tri[1] as usize],
+                split.positions[tri[2] as usize],
+            );
+            // Slivers along the crease have their centroid on the feature
+            // line, where the oracle's nearest face is a coin flip; they also
+            // cover no pixels. Skip them.
+            if (pb - pa).cross(pc - pa).length() / 2.0 < 0.01 * m.cell * m.cell {
+                continue;
+            }
+            let centroid = (pa + pb + pc) / 3.0;
+            let truth_normal = shape.truth(centroid).normal;
+            for &v in tri {
+                if (v as usize) < is_crease.len() && !is_crease[v as usize] {
+                    continue; // only crease slots (originals or copies)
+                }
+                let n = split.normals[v as usize];
+                if n.length_squared() > 1e-20 {
+                    crease_normal_errs.push(oriented_angle_degrees_v(n.normalize(), truth_normal));
+                }
+            }
+        }
+    }
+    print!(
+        "  crease split: {} copies | unsealed boundary edges {}",
+        split.split_vertices, unsealed
+    );
+    if crease_normal_errs.is_empty() {
+        println!();
+    } else {
+        println!(
+            " | copy normal vs oracle med {:.2} deg p95 {:.2} deg",
+            median(&crease_normal_errs),
+            p95(&crease_normal_errs)
+        );
+    }
+
     // -------- Validity (all shapes) --------
     let moves: Vec<f64> = (0..m.positions.len())
         .filter(|&v| result.snapped[v].is_some())
@@ -264,12 +333,31 @@ fn run_case(
         let after = dir.join(format!("{}_d{}_after.png", slug, max_depth));
         render_plain(&m.positions, &m.indices, bounds, &before);
         render_plain(&cleaned.positions, &cleaned.indices, bounds, &after);
-        let mut cleaned_labels: Vec<Option<u32>> = vec![None; cleaned.positions.len()];
-        for v in 0..m.positions.len() {
-            if let Some(l) = seg.labels[v] {
-                cleaned_labels[cleaned.remap[v] as usize] = Some(l);
-            }
+
+        // Smooth-shaded pair: blended single normals vs per-region copies.
+        // This is where crease shading quality shows; flat renders hide it.
+        let blended = dir.join(format!("{}_d{}_smooth_blended.png", slug, max_depth));
+        let crisp = dir.join(format!("{}_d{}_smooth_split.png", slug, max_depth));
+        let smooth_config = frame_bounds(bounds.0, bounds.1);
+        if let Err(err) = render_smooth_png(
+            &cleaned.positions,
+            &cleaned_normals,
+            &cleaned.indices,
+            &smooth_config,
+            &blended,
+        ) {
+            eprintln!("render failed: {err}");
         }
+        if let Err(err) = render_smooth_png(
+            &split.positions,
+            &split.normals,
+            &split.indices,
+            &smooth_config,
+            &crisp,
+        ) {
+            eprintln!("render failed: {err}");
+        }
+
         let segments = dir.join(format!("{}_d{}_after_segments.png", slug, max_depth));
         render_segments(
             &cleaned.positions,
@@ -301,6 +389,41 @@ fn degenerate_count(positions: &[DVec3], indices: &[u32], cell: f64) -> usize {
                 < area_floor
         })
         .count()
+}
+
+/// Boundary edges (used by exactly one triangle) whose endpoint positions are
+/// not shared by any other edge of the mesh. Crease splits create boundary
+/// edges by design, but each coincides positionally with the opposite side's
+/// edge (which may itself be a regular interior edge when only one side
+/// split); an edge alone at its position is a real crack.
+fn unsealed_boundary_edges(positions: &[DVec3], indices: &[u32]) -> usize {
+    use std::collections::HashMap;
+    let key = |v: u32| -> [u64; 3] {
+        let p = positions[v as usize];
+        [p.x.to_bits(), p.y.to_bits(), p.z.to_bits()]
+    };
+    let pos_key = |a: u32, b: u32| -> [[u64; 3]; 2] {
+        let (ka, kb) = (key(a), key(b));
+        if ka <= kb { [ka, kb] } else { [kb, ka] }
+    };
+    // Index-level edge use counts and position-level totals.
+    let mut index_counts: HashMap<(u32, u32), u32> = HashMap::new();
+    let mut position_totals: HashMap<[[u64; 3]; 2], u32> = HashMap::new();
+    for tri in indices.chunks_exact(3) {
+        for (a, b) in [(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
+            *index_counts.entry((a.min(b), a.max(b))).or_default() += 1;
+            *position_totals.entry(pos_key(a, b)).or_default() += 1;
+        }
+    }
+    index_counts
+        .iter()
+        .filter(|&(&(a, b), &c)| c == 1 && position_totals[&pos_key(a, b)] == 1)
+        .count()
+}
+
+/// Oriented angle between unit vectors, degrees.
+fn oriented_angle_degrees_v(a: DVec3, b: DVec3) -> f64 {
+    a.dot(b).clamp(-1.0, 1.0).acos().to_degrees()
 }
 
 fn percentile(values: &[f64], p: f64) -> f64 {

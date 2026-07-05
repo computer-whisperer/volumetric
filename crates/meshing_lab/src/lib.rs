@@ -20,7 +20,7 @@
 
 // The algorithm modules under test live in the production crate; the lab
 // re-exports them so its oracle benchmarks always measure the shipped code.
-pub use volumetric::sharp_features::{adjacency, cleanup, fit, segmentation, snap};
+pub use volumetric::sharp_features::{adjacency, cleanup, crease, fit, segmentation, snap};
 
 pub mod harness;
 pub mod oracle;

@@ -753,6 +753,8 @@ pub struct MeshingStats2 {
     pub sharp_welded_vertices: usize,
     /// Triangles dropped because welding collapsed them
     pub sharp_dropped_triangles: usize,
+    /// Vertex copies created for per-region crease shading
+    pub sharp_crease_splits: usize,
 }
 
 // =============================================================================
@@ -2881,6 +2883,7 @@ where
         sharp_snapped_corners: sharp_stats.snapped_corners,
         sharp_welded_vertices: sharp_stats.welded_vertices,
         sharp_dropped_triangles: sharp_stats.dropped_triangles,
+        sharp_crease_splits: sharp_stats.crease_splits,
     };
 
     MeshingResult2 {
@@ -3015,6 +3018,7 @@ where
         sharp_snapped_corners: sharp_stats.snapped_corners,
         sharp_welded_vertices: sharp_stats.welded_vertices,
         sharp_dropped_triangles: sharp_stats.dropped_triangles,
+        sharp_crease_splits: sharp_stats.crease_splits,
     };
 
     MeshingResult2 {
