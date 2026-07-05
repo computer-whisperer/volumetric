@@ -55,6 +55,7 @@ const OUTPUT_RESOLUTION_PREFIX: &str = "output:res:";
 const OUTPUT_DEFAULTS_PREFIX: &str = "output:defaults:";
 /// ASN2 setting stepper: `output:asn2:{id}:{field}:{up|down}`.
 const OUTPUT_ASN2_PREFIX: &str = "output:asn2:";
+const OUTPUT_WIREFRAME_PREFIX: &str = "output:wire:";
 const EXPORT_STL_PREFIX: &str = "output:stl:";
 const EXPORT_WASM_PREFIX: &str = "output:wasm:";
 /// Draggable divider between the viewport and the project panel.
@@ -267,6 +268,9 @@ pub struct PreviewRequest {
     pub precursor_ids: Vec<String>,
     pub render_mode: PreviewRenderMode,
     pub mesh_plan: PreviewMeshPlan,
+    /// Overlay the mesh edges as lines (display-only; not part of the mesh
+    /// cache key, so toggling never re-meshes).
+    pub wireframe: bool,
     pub show_grid: bool,
     pub ssao: bool,
     pub ssao_radius: f32,
@@ -406,6 +410,8 @@ pub struct OutputRender {
     pub mode: PreviewRenderMode,
     pub resolution: usize,
     pub asn2: Asn2Settings,
+    /// Draw the mesh's edges as an overlay (display-only; never re-meshes).
+    pub wireframe: bool,
 }
 
 #[derive(Debug)]
@@ -608,6 +614,7 @@ impl VolumetricUiV2 {
                 mode: self.render_mode,
                 resolution: self.preview_resolution,
                 asn2: Asn2Settings::default(),
+                wireframe: false,
             })
     }
 
@@ -652,6 +659,14 @@ impl VolumetricUiV2 {
         self.status = format!("{id}: {resolution}^3");
     }
 
+    fn toggle_output_wireframe(&mut self, id: &str) {
+        let mut render = self.output_render(id);
+        render.wireframe = !render.wireframe;
+        let state = if render.wireframe { "on" } else { "off" };
+        self.output_overrides.insert(id.to_string(), render);
+        self.status = format!("{id}: wireframe {state}");
+    }
+
     fn clear_output_override(&mut self, id: &str) {
         self.output_overrides.remove(id);
         self.status = format!("{id}: viewport defaults");
@@ -672,6 +687,7 @@ impl VolumetricUiV2 {
             precursor_ids: asset.precursor_ids().to_vec(),
             render_mode: render.mode,
             mesh_plan: PreviewMeshPlan::for_mode(render.mode, render.resolution, render.asn2),
+            wireframe: render.wireframe,
             show_grid: self.show_grid,
             ssao: self.ssao,
             ssao_radius: self.ssao_radius,
@@ -1913,6 +1929,8 @@ impl App for VolumetricUiV2 {
             }
         } else if let Some(id) = route.strip_prefix(OUTPUT_DEFAULTS_PREFIX) {
             self.clear_output_override(id);
+        } else if let Some(id) = route.strip_prefix(OUTPUT_WIREFRAME_PREFIX) {
+            self.toggle_output_wireframe(id);
         } else if let Some(rest) = route.strip_prefix(SSAO_ADJUST_PREFIX) {
             if let Some((field, direction)) = rest.split_once(':') {
                 self.adjust_ssao(field, direction == "up");
@@ -2150,6 +2168,15 @@ fn output_settings_popover(app: &VolumetricUiV2, id: &str) -> El {
         text("Resolution").caption().muted(),
         resolution_buttons,
     ];
+    if render.mode != PreviewRenderMode::Points {
+        body.push(
+            field_row(
+                "Wireframe",
+                switch(format!("{OUTPUT_WIREFRAME_PREFIX}{id}"), render.wireframe),
+            )
+            .gap(tokens::SPACE_2),
+        );
+    }
     if render.mode == PreviewRenderMode::AdaptiveSurfaceNets2 {
         body.push(text("ASN2 Quality").caption().muted());
         body.push(asn2_stepper_row(
@@ -3711,6 +3738,40 @@ mod tests {
         assert_eq!(config.vertex_refinement_iterations, 7);
         let sharp = config.sharp_features.expect("sharp features enabled");
         assert!((sharp.segmentation.max_normal_jump_deg - 20.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn wireframe_toggle_is_display_only() {
+        let (mut app, exports) = two_export_app();
+        let id = exports[0].clone();
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{TOGGLE_PIN_PREFIX}{id}")),
+        );
+        let plan_before = app
+            .preview_requests()
+            .iter()
+            .find(|r| r.asset_id == id)
+            .unwrap()
+            .mesh_plan
+            .clone();
+
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{OUTPUT_WIREFRAME_PREFIX}{id}")),
+        );
+        assert!(app.output_render(&id).wireframe);
+        let requests = app.preview_requests();
+        let request = requests.iter().find(|r| r.asset_id == id).unwrap();
+        assert!(request.wireframe);
+        // The mesh plan (the rebuild cache key) is untouched by the toggle.
+        assert_eq!(request.mesh_plan, plan_before);
+
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{OUTPUT_WIREFRAME_PREFIX}{id}")),
+        );
+        assert!(!app.output_render(&id).wireframe);
     }
 
     #[test]

@@ -572,6 +572,10 @@ struct PreviewEntity {
     scene: renderer::SceneData,
     bounds: PreviewBounds,
     stats: OutputStats,
+    /// Unique mesh edges, prebuilt so the wireframe toggle is display-only
+    /// (composited in per frame when requested; `None` for point clouds and
+    /// sketch previews).
+    wireframe_lines: Option<renderer::LineData>,
 }
 
 #[derive(Clone, Copy)]
@@ -617,8 +621,13 @@ struct PreviewCache {
     entities: HashMap<String, (PreviewSceneKey, PreviewEntity)>,
     pending: HashMap<String, PreviewSceneKey>,
     failed: HashMap<String, (PreviewSceneKey, String)>,
-    /// Memoized composite, rebuilt only when the contributing keys change.
-    composite: Option<(Vec<PreviewSceneKey>, renderer::SceneData, PreviewBounds)>,
+    /// Memoized composite, rebuilt only when the contributing keys (or their
+    /// wireframe flags) change.
+    composite: Option<(
+        Vec<(PreviewSceneKey, bool)>,
+        renderer::SceneData,
+        PreviewBounds,
+    )>,
 }
 
 impl PreviewCache {
@@ -719,7 +728,7 @@ impl PreviewCache {
         let mut ids = Vec::new();
         for request in requests {
             if let Some((key, _)) = self.entities.get(&request.asset_id) {
-                keys.push(key.clone());
+                keys.push((key.clone(), request.wireframe));
                 ids.push(request.asset_id.clone());
             }
         }
@@ -740,6 +749,13 @@ impl PreviewCache {
                     scene.meshes.extend(entity.scene.meshes.iter().cloned());
                     scene.lines.extend(entity.scene.lines.iter().cloned());
                     scene.points.extend(entity.scene.points.iter().cloned());
+                    if request.wireframe
+                        && let Some(lines) = &entity.wireframe_lines
+                    {
+                        scene
+                            .lines
+                            .push((lines.clone(), glam::Mat4::IDENTITY, wireframe_style()));
+                    }
                     bounds = Some(match bounds {
                         Some(acc) => acc.union(entity.bounds),
                         None => entity.bounds,
@@ -865,7 +881,7 @@ fn build_preview_scene(request: &PreviewRequest) -> Result<PreviewEntity, String
         return build_sketch_preview(request, build_start);
     }
 
-    let (scene, bounds_min, bounds_max) = match &request.mesh_plan {
+    let (scene, wireframe_lines, bounds_min, bounds_max) = match &request.mesh_plan {
         PreviewMeshPlan::PointCloud { resolution } => {
             let (points, bounds_min, bounds_max) =
                 volumetric::sample_model_from_bytes(request.wasm_bytes.as_slice(), *resolution)
@@ -882,7 +898,7 @@ fn build_preview_scene(request: &PreviewRequest) -> Result<PreviewEntity, String
                     depth_mode: renderer::DepthMode::Normal,
                 },
             );
-            (scene, bounds_min, bounds_max)
+            (scene, None, bounds_min, bounds_max)
         }
         PreviewMeshPlan::MarchingCubes { resolution } => {
             let (triangles, bounds_min, bounds_max) =
@@ -892,16 +908,18 @@ fn build_preview_scene(request: &PreviewRequest) -> Result<PreviewEntity, String
                 )
                 .map_err(format_error_chain)?;
             stats.triangles = triangles.len();
+            let vertices = triangles_to_mesh_vertices(&triangles);
+            let wireframe = mesh_edge_lines(&vertices, None);
             let mut scene = renderer::SceneData::new();
             scene.add_mesh(
                 renderer::MeshData {
-                    vertices: triangles_to_mesh_vertices(&triangles),
+                    vertices,
                     indices: None,
                 },
                 glam::Mat4::IDENTITY,
                 renderer::MaterialId(0),
             );
-            (scene, bounds_min, bounds_max)
+            (scene, Some(wireframe), bounds_min, bounds_max)
         }
         PreviewMeshPlan::AdaptiveSurfaceNets2 { .. } => {
             let config = request
@@ -916,7 +934,7 @@ fn build_preview_scene(request: &PreviewRequest) -> Result<PreviewEntity, String
             stats.triangles = mesh.indices.len() / 3;
             stats.samples = mesh.stats.total_samples;
             stats.detail = asn2_stage_lines(&mesh.stats);
-            let vertices = mesh
+            let vertices: Vec<renderer::MeshVertex> = mesh
                 .vertices
                 .iter()
                 .zip(mesh.normals.iter())
@@ -927,6 +945,7 @@ fn build_preview_scene(request: &PreviewRequest) -> Result<PreviewEntity, String
                     _pad1: 0.0,
                 })
                 .collect();
+            let wireframe = mesh_edge_lines(&vertices, Some(&mesh.indices));
             let mut scene = renderer::SceneData::new();
             scene.add_mesh(
                 renderer::MeshData {
@@ -936,7 +955,7 @@ fn build_preview_scene(request: &PreviewRequest) -> Result<PreviewEntity, String
                 glam::Mat4::IDENTITY,
                 renderer::MaterialId(0),
             );
-            (scene, mesh.bounds_min, mesh.bounds_max)
+            (scene, Some(wireframe), mesh.bounds_min, mesh.bounds_max)
         }
     };
 
@@ -948,7 +967,66 @@ fn build_preview_scene(request: &PreviewRequest) -> Result<PreviewEntity, String
             max: bounds_max,
         },
         stats,
+        wireframe_lines,
     })
+}
+
+/// Style for the wireframe overlay: thin dark depth-tested lines. The line
+/// pipeline uses `LessEqual` depth compare, so lines coincident with mesh
+/// edges win over the faces they border.
+fn wireframe_style() -> renderer::LineStyle {
+    renderer::LineStyle {
+        width: 1.0,
+        width_mode: renderer::WidthMode::ScreenSpace,
+        pattern: renderer::LinePattern::Solid,
+        depth_mode: renderer::DepthMode::Normal,
+    }
+}
+
+/// Unique edges of a mesh as line segments. With an index buffer, edges are
+/// deduplicated by index pair; for triangle soup, by quantized endpoint
+/// positions.
+fn mesh_edge_lines(
+    vertices: &[renderer::MeshVertex],
+    indices: Option<&[u32]>,
+) -> renderer::LineData {
+    const COLOR: [f32; 4] = [0.05, 0.06, 0.08, 0.9];
+    let mut segments = Vec::new();
+    match indices {
+        Some(indices) => {
+            let mut seen = std::collections::HashSet::new();
+            for tri in indices.chunks_exact(3) {
+                for (a, b) in [(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
+                    if seen.insert((a.min(b), a.max(b))) {
+                        segments.push(renderer::LineSegment {
+                            start: vertices[a as usize].position,
+                            end: vertices[b as usize].position,
+                            color: COLOR,
+                        });
+                    }
+                }
+            }
+        }
+        None => {
+            let key = |p: [f32; 3]| (p[0].to_bits(), p[1].to_bits(), p[2].to_bits());
+            let mut seen = std::collections::HashSet::new();
+            for tri in vertices.chunks_exact(3) {
+                for (a, b) in [(0usize, 1usize), (1, 2), (2, 0)] {
+                    let (pa, pb) = (tri[a].position, tri[b].position);
+                    let (ka, kb) = (key(pa), key(pb));
+                    let edge_key = if ka <= kb { (ka, kb) } else { (kb, ka) };
+                    if seen.insert(edge_key) {
+                        segments.push(renderer::LineSegment {
+                            start: pa,
+                            end: pb,
+                            color: COLOR,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    renderer::LineData { segments }
 }
 
 /// Per-stage profiling lines for the ASN2 mesher, shown in the output's
@@ -1098,6 +1176,7 @@ fn build_sketch_preview(
             max: (raster.bounds_max.0, raster.bounds_max.1, 0.0),
         },
         stats,
+        wireframe_lines: None,
     })
 }
 
@@ -1188,6 +1267,7 @@ mod tests {
             precursor_ids: Vec::new(),
             render_mode: PreviewRenderMode::Points,
             mesh_plan: PreviewMeshPlan::PointCloud { resolution },
+            wireframe: false,
             show_grid: true,
             ssao: true,
             ssao_radius: 0.5,
@@ -1218,6 +1298,7 @@ mod tests {
                 max: (1.0, 1.0, 1.0),
             },
             stats: OutputStats::default(),
+            wireframe_lines: None,
         }
     }
 
@@ -1279,6 +1360,39 @@ function get_bounds_max_y() return 1.5 end
 
     /// The milestone: two requested outputs each get a build job, and once both
     /// land they composite into a single multi-entity scene.
+    /// Wireframe is display-only: toggling it injects the prebuilt edge
+    /// lines into the composite without scheduling any rebuild.
+    #[test]
+    fn wireframe_toggle_composites_lines_without_rebuilding() {
+        let mut cache = PreviewCache::default();
+        let requests = vec![request("a", 32)];
+        let (_, jobs) = cache.sync(&requests);
+        assert_eq!(jobs.len(), 1);
+        for job in jobs {
+            let mut built = entity();
+            built.wireframe_lines = Some(renderer::LineData {
+                segments: vec![renderer::LineSegment {
+                    start: [0.0; 3],
+                    end: [1.0, 0.0, 0.0],
+                    color: [0.0, 0.0, 0.0, 1.0],
+                }],
+            });
+            cache.accept(PreviewBuildResult {
+                key: job.key,
+                result: Ok(built),
+            });
+        }
+        let (scene, _, _) = cache.composite(&requests).expect("scene");
+        assert!(scene.lines.is_empty(), "wireframe off: no line batches");
+
+        let mut wire_requests = requests.clone();
+        wire_requests[0].wireframe = true;
+        let (_, jobs) = cache.sync(&wire_requests);
+        assert!(jobs.is_empty(), "toggling wireframe must not rebuild");
+        let (scene, _, _) = cache.composite(&wire_requests).expect("scene");
+        assert_eq!(scene.lines.len(), 1, "wireframe on: edge lines composited");
+    }
+
     #[test]
     fn sync_meshes_each_output_then_composites_all() {
         let mut cache = PreviewCache::default();
