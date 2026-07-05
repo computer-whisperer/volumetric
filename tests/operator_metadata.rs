@@ -20,6 +20,7 @@ const OPERATORS: &[&str] = &[
     "heightmap_extrude_operator",
     "fea_grid_mesh_operator",
     "fea_solve_operator",
+    "fea_density_operator",
 ];
 
 #[test]

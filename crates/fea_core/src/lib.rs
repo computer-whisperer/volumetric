@@ -142,7 +142,10 @@ const CELL_CORNERS: [[f64; 3]; 8] = [
 ];
 
 /// Verify the mesh is an axis-aligned uniform grid and return its cell size.
-fn detect_uniform_grid(mesh: &FeaMesh) -> Result<f64, String> {
+///
+/// Public because grid consumers beyond the solver (e.g. the density
+/// extractor's cell-grid reconstruction) share the same contract.
+pub fn detect_uniform_grid(mesh: &FeaMesh) -> Result<f64, String> {
     if mesh.element_count() == 0 {
         return Err("mesh has no elements".to_string());
     }
