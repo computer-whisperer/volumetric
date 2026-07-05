@@ -20,4 +20,7 @@
 
 pub mod adjacency;
 pub mod fit;
+pub mod harness;
 pub mod oracle;
+pub mod render;
+pub mod segmentation;
