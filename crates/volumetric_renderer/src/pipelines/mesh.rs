@@ -100,10 +100,15 @@ impl MeshPipeline {
                             offset: 0,
                             shader_location: 0,
                         },
-                        // normal
+                        // normal — offset 16, not 12: MeshVertex pads the
+                        // position out to 16 bytes (_pad0), so the normal
+                        // starts one f32 later than a packed layout would.
+                        // Reading at 12 fed the shader (_pad0, nx, ny),
+                        // which turned exactly-axis-aligned normals into
+                        // normalize((0,0,0)) = NaN.
                         wgpu::VertexAttribute {
                             format: wgpu::VertexFormat::Float32x3,
-                            offset: 12, // 3 * sizeof(f32)
+                            offset: std::mem::offset_of!(MeshVertex, normal) as u64,
                             shader_location: 1,
                         },
                     ],

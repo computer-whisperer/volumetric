@@ -250,6 +250,109 @@ fn positions_normal(n: DVec3) -> DVec3 {
     n.try_normalize().unwrap_or(DVec3::Y)
 }
 
+/// Render replicating the production viewport's mesh pipeline semantics:
+/// back-face culling, raw (unnormalized) vertex normals interpolated then
+/// normalized per pixel, and one-sided diffuse lighting. Defects the
+/// two-sided [`render_smooth_png`] hides — inverted windings, wrong-side
+/// normals, magnitude imbalance across a triangle — are glaring here.
+pub fn render_gui_png(
+    positions: &[DVec3],
+    normals: &[DVec3],
+    indices: &[u32],
+    config: &RenderConfig,
+    path: &Path,
+) -> Result<(), image::ImageError> {
+    let (w, h) = (config.width, config.height);
+    let mut color = vec![config.background; w * h];
+    let mut inv_depth = vec![0.0f64; w * h];
+
+    let forward = (config.target - config.camera_pos).normalize();
+    let up_hint = if forward.dot(DVec3::Y).abs() > 0.99 {
+        DVec3::Z
+    } else {
+        DVec3::Y
+    };
+    let right = forward.cross(up_hint).normalize();
+    let up = right.cross(forward);
+
+    let focal = (h as f64 / 2.0) / (config.fov_deg.to_radians() / 2.0).tan();
+    let near = 1e-3;
+    // The production renderer's light and lighting model (mesh_gbuffer.wgsl).
+    let light = DVec3::new(0.4, 0.7, 0.2).normalize();
+    let base = [0.78, 0.80, 0.83];
+
+    let project = |p: DVec3| -> (DVec3, f64) {
+        let rel = p - config.camera_pos;
+        let view = DVec3::new(rel.dot(right), rel.dot(up), -rel.dot(forward));
+        let depth = -view.z;
+        let sx = w as f64 / 2.0 + focal * view.x / depth;
+        let sy = h as f64 / 2.0 - focal * view.y / depth;
+        (DVec3::new(sx, sy, 0.0), depth)
+    };
+
+    for tri in indices.chunks_exact(3) {
+        let (ia, ib, ic) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+        let (p0, p1, p2) = (positions[ia], positions[ib], positions[ic]);
+        let (s0, d0) = project(p0);
+        let (s1, d1) = project(p1);
+        let (s2, d2) = project(p2);
+        if d0 < near || d1 < near || d2 < near {
+            continue;
+        }
+        // Raw normals, as the GPU pipeline interpolates them.
+        let (n0, n1, n2) = (normals[ia], normals[ib], normals[ic]);
+
+        let edge = |a: DVec3, b: DVec3, x: f64, y: f64| -> f64 {
+            (b.x - a.x) * (y - a.y) - (b.y - a.y) * (x - a.x)
+        };
+        let area = edge(s0, s1, s2.x, s2.y);
+        // Back-face culling: CCW-in-NDC front faces are CW in this Y-down
+        // screen space, i.e. negative signed area.
+        if area >= 0.0 {
+            continue;
+        }
+
+        let min_x = s0.x.min(s1.x).min(s2.x).floor().max(0.0) as usize;
+        let max_x = (s0.x.max(s1.x).max(s2.x).ceil() as usize).min(w - 1);
+        let min_y = s0.y.min(s1.y).min(s2.y).floor().max(0.0) as usize;
+        let max_y = (s0.y.max(s1.y).max(s2.y).ceil() as usize).min(h - 1);
+        if min_x > max_x || min_y > max_y {
+            continue;
+        }
+
+        for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                let (px, py) = (x as f64 + 0.5, y as f64 + 0.5);
+                let w0 = edge(s1, s2, px, py) / area;
+                let w1 = edge(s2, s0, px, py) / area;
+                let w2 = 1.0 - w0 - w1;
+                if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
+                    continue;
+                }
+                let inv_z = w0 / d0 + w1 / d1 + w2 / d2;
+                let px_idx = y * w + x;
+                if inv_z <= inv_depth[px_idx] {
+                    continue;
+                }
+                inv_depth[px_idx] = inv_z;
+                let n = (n0 * w0 + n1 * w1 + n2 * w2).normalize_or_zero();
+                let intensity = 0.22 + 0.78 * n.dot(light).max(0.0);
+                color[px_idx] = [
+                    (base[0] * intensity * 255.0).clamp(0.0, 255.0) as u8,
+                    (base[1] * intensity * 255.0).clamp(0.0, 255.0) as u8,
+                    (base[2] * intensity * 255.0).clamp(0.0, 255.0) as u8,
+                ];
+            }
+        }
+    }
+
+    let mut img = image::RgbImage::new(w as u32, h as u32);
+    for (x, y, pixel) in img.enumerate_pixels_mut() {
+        *pixel = image::Rgb(color[y as usize * w + x as usize]);
+    }
+    img.save(path)
+}
+
 /// Camera framing a bounding box from the standard three-quarter view.
 pub fn frame_bounds(lo: DVec3, hi: DVec3) -> RenderConfig {
     let center = (lo + hi) / 2.0;

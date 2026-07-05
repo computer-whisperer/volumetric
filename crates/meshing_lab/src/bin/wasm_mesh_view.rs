@@ -181,6 +181,90 @@ fn main() {
             std::fs::write(out_dir.join("rim_chain.csv"), csv).expect("write csv");
         }
 
+        // Winding audit: the GUI culls back faces (CCW front), so a triangle
+        // wound inward is invisible there even though the two-sided lab
+        // renders hide it. Score each triangle's geometric normal against the
+        // exact outward direction at its centroid.
+        let mut inward = [0usize; 3]; // cap, barrel, rim band
+        let mut total = [0usize; 3];
+        for tri in indices.chunks_exact(3) {
+            let (a, b, c) = (
+                positions[tri[0] as usize],
+                positions[tri[1] as usize],
+                positions[tri[2] as usize],
+            );
+            let face = (b - a).cross(c - a);
+            if face.length() < 1e-9 * cell * cell {
+                continue; // degenerate: no meaningful winding
+            }
+            let m = (a + b + c) / 3.0;
+            let rho = (m.x * m.x + m.y * m.y).sqrt();
+            let dzr = (m.z - 1.0).abs().min(m.z.abs());
+            let drim = ((rho - 1.0).powi(2) + dzr * dzr).sqrt() / cell;
+            let (bucket, outward) = if drim < 1.0 {
+                let cap_n = DVec3::Z * (m.z - 0.5).signum();
+                let bar_n = DVec3::new(m.x / rho.max(1e-12), m.y / rho.max(1e-12), 0.0);
+                (
+                    2,
+                    if (rho - 1.0).abs() < dzr {
+                        bar_n
+                    } else {
+                        cap_n
+                    },
+                )
+            } else if dzr < 0.35 * cell {
+                (0, DVec3::Z * (m.z - 0.5).signum())
+            } else {
+                (
+                    1,
+                    DVec3::new(m.x / rho.max(1e-12), m.y / rho.max(1e-12), 0.0),
+                )
+            };
+            total[bucket] += 1;
+            if face.dot(outward) < 0.0 {
+                inward[bucket] += 1;
+            }
+        }
+        println!(
+            "winding: inward-facing cap {}/{} barrel {}/{} rim {}/{}",
+            inward[0], total[0], inward[1], total[1], inward[2], total[2]
+        );
+        let zero_normals = normals
+            .iter()
+            .filter(|n| n.length_squared() < 1e-20 || !n.is_finite())
+            .count();
+        println!("zero/non-finite vertex normals: {zero_normals}");
+
+        // Triangle corners whose vertex normal opposes the triangle's own
+        // face normal shade as the wrong surface (the GUI's one-sided
+        // lighting makes these glaring; the lab's two-sided abs() hid them).
+        let mut mismatched_tris = 0usize;
+        let mut worst_mismatch = 0.0f64;
+        for tri in indices.chunks_exact(3) {
+            let (a, b, c) = (
+                positions[tri[0] as usize],
+                positions[tri[1] as usize],
+                positions[tri[2] as usize],
+            );
+            let face = (b - a).cross(c - a);
+            if face.length() < 0.02 * cell * cell {
+                continue;
+            }
+            let face_n = face.normalize();
+            let worst = tri
+                .iter()
+                .filter_map(|&v| normals[v as usize].try_normalize())
+                .map(|n| n.dot(face_n).clamp(-1.0, 1.0).acos().to_degrees())
+                .fold(0.0, f64::max);
+            if worst > 60.0 {
+                mismatched_tris += 1;
+            }
+            worst_mismatch = worst_mismatch.max(worst);
+        }
+        println!(
+            "corner-normal vs face-normal: {mismatched_tris} tris with a corner > 60 deg off (worst {worst_mismatch:.1} deg)"
+        );
+
         // Shading-normal error vs truth. Near the rim either face's normal is
         // legitimate (crease copies), so score against the closer of the two;
         // elsewhere the true normal is unambiguous.
@@ -420,6 +504,14 @@ fn main() {
             indices,
             &cfg,
             &out_dir.join(format!("{name}_smooth.png")),
+        )
+        .expect("render");
+        render::render_gui_png(
+            &positions,
+            &normals,
+            indices,
+            &cfg,
+            &out_dir.join(format!("{name}_gui.png")),
         )
         .expect("render");
         render::render_png(
