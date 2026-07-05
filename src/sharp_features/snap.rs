@@ -1,7 +1,8 @@
 //! Feature snapping: move feature-zone vertices onto the sharp edge or corner
 //! implied by the smooth regions around them.
 //!
-//! For each unclaimed vertex, claimed vertices of each adjacent region are
+//! For each candidate vertex (unclaimed, or claimed with a neighbor claimed
+//! by a different region), claimed vertices of each adjacent region are
 //! gathered within a small radius. These are face-pure *by construction* (the
 //! region label came from connectivity, not from geometric separation of a
 //! mixed sample cloud — the failure mode of every per-vertex probing attempt).
@@ -114,51 +115,54 @@ pub fn snap_feature_vertices(
     let mut snapped: Vec<Option<SnapKind>> = vec![None; positions.len()];
     let mut stats = SnapStats::default();
 
-    let ring_depth = config.gather_radius_cells.ceil() as usize + 1;
-    let radius = config.gather_radius_cells * cell;
+    // Around corners the unclaimed pool is wider than along edges, pushing
+    // each region's claimed vertices further away; one retry with a larger
+    // gather radius recovers those without loosening the common case.
+    const RETRY_GATHER_SCALE: f64 = 1.75;
+    let gather_radii = [
+        config.gather_radius_cells,
+        config.gather_radius_cells * RETRY_GATHER_SCALE,
+    ];
+
+    // Candidates are the feature-zone (unclaimed) vertices, plus
+    // region-boundary vertices: when the sampling grid aligns with a feature,
+    // the sawtooth amplitude collapses below the segmentation residual gates
+    // and two regions grow into direct contact with no unclaimed band between
+    // them. A claimed vertex with a differently-claimed neighbor sits on a
+    // feature all the same. (That regime is also exactly when near-feature
+    // vertex positions are accurate, so gathering from them is sound.)
+    let is_candidate = |v: usize| -> bool {
+        match labels[v] {
+            None => true,
+            Some(a) => adjacency
+                .neighbors(v as u32)
+                .iter()
+                .any(|&u| matches!(labels[u as usize], Some(b) if b != a)),
+        }
+    };
 
     for v in 0..positions.len() {
-        if labels[v].is_some() {
+        if !is_candidate(v) {
             continue;
         }
         stats.candidates += 1;
         let origin = positions[v];
 
-        // Gather claimed vertices per region within the radius.
-        let mut sides: Vec<(u32, Vec<DVec3>)> = Vec::new();
-        for u in adjacency.k_ring(v as u32, ring_depth) {
-            let Some(label) = labels[u as usize] else {
-                continue;
-            };
-            let p = positions[u as usize];
-            if (p - origin).length() > radius {
-                continue;
-            }
-            match sides.iter_mut().find(|(l, _)| *l == label) {
-                Some((_, pts)) => pts.push(p),
-                None => sides.push((label, vec![p])),
-            }
-        }
-
-        // Qualify sides: enough support and a tight local plane fit.
         let mut planes: Vec<SidePlane> = Vec::new();
-        for (_, pts) in &sides {
-            if pts.len() < config.min_side_points {
-                continue;
+        for &radius_cells in &gather_radii {
+            planes = gather_side_planes(
+                positions,
+                adjacency,
+                labels,
+                v,
+                origin,
+                radius_cells,
+                cell,
+                config,
+            );
+            if planes.len() >= 2 {
+                break;
             }
-            let Some(fit) = fit_plane(pts) else {
-                continue;
-            };
-            if fit.rms_residual / cell > config.max_side_residual_cells {
-                continue;
-            }
-            // PCA normal sign is arbitrary; the intersection solves are
-            // sign-agnostic and verification orients per-side later.
-            planes.push(SidePlane {
-                normal: fit.normal,
-                centroid: fit.centroid,
-                support: pts.len(),
-            });
         }
         if planes.len() < 2 {
             stats.rejected_sides += 1;
@@ -167,13 +171,18 @@ pub fn snap_feature_vertices(
         planes.sort_by_key(|p| std::cmp::Reverse(p.support));
 
         // Try a corner when three sides qualify, falling back to the
-        // best-supported edge pair.
+        // best-supported edge pair when the corner solve is ill-conditioned
+        // or its target is out of movement range (vertices along an edge near
+        // a corner see three regions but belong on the edge line).
+        let max_move = config.max_move_cells * cell;
         let mut target: Option<(DVec3, SnapKind)> = None;
         if planes.len() >= 3 {
             match intersect_three_planes(&planes[0], &planes[1], &planes[2], config.min_corner_det)
             {
-                Some(p) => target = Some((p, SnapKind::Corner)),
-                None => stats.corner_fallbacks += 1,
+                Some(p) if p.is_finite() && (p - origin).length() <= max_move => {
+                    target = Some((p, SnapKind::Corner));
+                }
+                _ => stats.corner_fallbacks += 1,
             }
         }
         if target.is_none() {
@@ -192,7 +201,7 @@ pub fn snap_feature_vertices(
             stats.rejected_nonfinite += 1;
             continue;
         }
-        if (p - origin).length() > config.max_move_cells * cell {
+        if (p - origin).length() > max_move {
             stats.rejected_move += 1;
             continue;
         }
@@ -235,6 +244,59 @@ pub fn snap_feature_vertices(
         snapped,
         stats,
     }
+}
+
+/// Gather claimed vertices per region within `radius_cells` of `origin` and
+/// fit one qualifying plane per side (enough support, tight fit).
+#[allow(clippy::too_many_arguments)]
+fn gather_side_planes(
+    positions: &[DVec3],
+    adjacency: &MeshAdjacency,
+    labels: &[Option<u32>],
+    v: usize,
+    origin: DVec3,
+    radius_cells: f64,
+    cell: f64,
+    config: &SnapConfig,
+) -> Vec<SidePlane> {
+    let ring_depth = radius_cells.ceil() as usize + 1;
+    let radius = radius_cells * cell;
+
+    let mut sides: Vec<(u32, Vec<DVec3>)> = Vec::new();
+    for u in adjacency.k_ring(v as u32, ring_depth) {
+        let Some(label) = labels[u as usize] else {
+            continue;
+        };
+        let p = positions[u as usize];
+        if (p - origin).length() > radius {
+            continue;
+        }
+        match sides.iter_mut().find(|(l, _)| *l == label) {
+            Some((_, pts)) => pts.push(p),
+            None => sides.push((label, vec![p])),
+        }
+    }
+
+    let mut planes: Vec<SidePlane> = Vec::new();
+    for (_, pts) in &sides {
+        if pts.len() < config.min_side_points {
+            continue;
+        }
+        let Some(fit) = fit_plane(pts) else {
+            continue;
+        };
+        if fit.rms_residual / cell > config.max_side_residual_cells {
+            continue;
+        }
+        // PCA normal sign is arbitrary; the intersection solves are
+        // sign-agnostic and verification orients per-side later.
+        planes.push(SidePlane {
+            normal: fit.normal,
+            centroid: fit.centroid,
+            support: pts.len(),
+        });
+    }
+    planes
 }
 
 /// Orient a side plane normal to point out of the material, determined by one

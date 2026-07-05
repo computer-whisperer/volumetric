@@ -38,24 +38,41 @@ pub fn split_crease_vertices(
     labels: &[Option<u32>],
     is_crease: &[bool],
 ) -> CreaseSplitResult {
-    // Assign each triangle to a region by its claimed vertices. Regions never
-    // touch directly (an unclaimed band separates them), so claimed labels
-    // within one triangle agree in practice; majority is a defensive choice.
+    // Assign each triangle to a region by its claimed vertices. When labels
+    // conflict within one triangle (regions in direct contact, which happens
+    // when grid alignment leaves no unclaimed band), the tie is broken
+    // geometrically: the region whose corners' carried normals best agree
+    // with the triangle's face normal wins. Label majority alone mis-assigns
+    // half the cross-feature triangles in that regime.
     let tri_count = indices.len() / 3;
     let mut tri_region: Vec<Option<u32>> = Vec::with_capacity(tri_count);
     for tri in indices.chunks_exact(3) {
-        let mut counts: Vec<(u32, usize)> = Vec::new();
+        let mut candidates: Vec<(u32, DVec3)> = Vec::new();
         for &v in tri {
             if let Some(label) = labels[v as usize] {
-                match counts.iter_mut().find(|(l, _)| *l == label) {
-                    Some((_, c)) => *c += 1,
-                    None => counts.push((label, 1)),
+                match candidates.iter_mut().find(|(l, _)| *l == label) {
+                    Some((_, n)) => *n += normals[v as usize],
+                    None => candidates.push((label, normals[v as usize])),
                 }
             }
         }
-        // Majority, ties broken by smaller region id for determinism.
-        counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        tri_region.push(counts.first().map(|&(l, _)| l));
+        let region = match candidates.len() {
+            0 => None,
+            1 => Some(candidates[0].0),
+            _ => {
+                let (a, b, c) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+                let face = (positions[b] - positions[a]).cross(positions[c] - positions[a]);
+                candidates
+                    .iter()
+                    .max_by(|(_, na), (_, nb)| {
+                        let da = face.dot(na.normalize_or_zero());
+                        let db = face.dot(nb.normalize_or_zero());
+                        da.total_cmp(&db)
+                    })
+                    .map(|&(l, _)| l)
+            }
+        };
+        tri_region.push(region);
     }
 
     // First pass: which regions touch each crease vertex (sorted for

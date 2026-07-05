@@ -30,8 +30,20 @@ pub struct MeshedShape<'a> {
 /// bounds margin, refined vertices, and accumulated normals (no normal
 /// probing).
 pub fn mesh_shape(shape: &dyn OracleShape, max_depth: usize) -> MeshedShape<'_> {
+    mesh_shape_with_margin(shape, max_depth, 0.12)
+}
+
+/// [`mesh_shape`] with an explicit bounds margin fraction. The production
+/// path pads by ~2 finest cells (fraction `2 / effective_resolution`), which
+/// aligns features with the grid very differently than a generous margin --
+/// benchmark both.
+pub fn mesh_shape_with_margin(
+    shape: &dyn OracleShape,
+    max_depth: usize,
+    margin_frac: f64,
+) -> MeshedShape<'_> {
     let (lo, hi) = shape.world_bounds();
-    let margin = (hi - lo).max_element() * 0.12;
+    let margin = (hi - lo).max_element() * margin_frac;
     let lo = lo - DVec3::splat(margin);
     let hi = hi + DVec3::splat(margin);
 

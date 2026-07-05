@@ -473,11 +473,57 @@ pub fn generate_adaptive_mesh_v2_from_bytes(
     let bounds = wasm_sampler.get_bounds()?;
     let (bounds_min, bounds_max) = bounds.as_f32();
 
-    // Create a closure-based sampler that wraps the ParallelModelSampler
-    let sampler = move |x: f64, y: f64, z: f64| -> f32 { wasm_sampler.sample(x, y, z) };
+    // Models declare tight bounds, so their surface may lie exactly on the
+    // bounding planes (a default box fills its bounds entirely). The mesher
+    // needs outside samples beyond the surface to see those transitions, or
+    // it falls back to synthetic boundary faces that the refinement and sharp
+    // feature stages cannot work with. Sample a volume padded by ~2 finest
+    // cells per side, clamping everything outside the declared bounds to
+    // "outside" — which also caps volume-filling models (e.g. lattices)
+    // exactly at their declared bounds instead of at the sampling box.
+    let finest_cells = (config.base_resolution * (1 << config.max_depth)) as f32;
+    let pad_frac = 2.0 / finest_cells;
+    let pad = (
+        (bounds_max.0 - bounds_min.0) * pad_frac,
+        (bounds_max.1 - bounds_min.1) * pad_frac,
+        (bounds_max.2 - bounds_min.2) * pad_frac,
+    );
+    let padded_min = (
+        bounds_min.0 - pad.0,
+        bounds_min.1 - pad.1,
+        bounds_min.2 - pad.2,
+    );
+    let padded_max = (
+        bounds_max.0 + pad.0,
+        bounds_max.1 + pad.1,
+        bounds_max.2 + pad.2,
+    );
+    let clamp_min = (
+        bounds_min.0 as f64,
+        bounds_min.1 as f64,
+        bounds_min.2 as f64,
+    );
+    let clamp_max = (
+        bounds_max.0 as f64,
+        bounds_max.1 as f64,
+        bounds_max.2 as f64,
+    );
+
+    let sampler = move |x: f64, y: f64, z: f64| -> f32 {
+        if x < clamp_min.0
+            || x > clamp_max.0
+            || y < clamp_min.1
+            || y > clamp_max.1
+            || z < clamp_min.2
+            || z > clamp_max.2
+        {
+            return 0.0;
+        }
+        wasm_sampler.sample(x, y, z)
+    };
 
     let result =
-        adaptive_surface_nets_2::adaptive_surface_nets_2(sampler, bounds_min, bounds_max, config);
+        adaptive_surface_nets_2::adaptive_surface_nets_2(sampler, padded_min, padded_max, config);
 
     Ok(AdaptiveMeshV2Result {
         vertices: result.mesh.vertices,

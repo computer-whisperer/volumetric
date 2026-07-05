@@ -15,7 +15,7 @@ use meshing_lab::cleanup::{
     CleanupConfig, boundary_edge_count, inward_facing_count, weld_snapped_vertices,
 };
 use meshing_lab::crease::split_crease_vertices;
-use meshing_lab::harness::mesh_shape;
+use meshing_lab::harness::mesh_shape_with_margin;
 use meshing_lab::oracle::{
     BoxShape, CylinderShape, MandelbulbShape, OracleShape, PolygonPrism, Rotated, SphereShape,
     standard_rotation,
@@ -46,7 +46,10 @@ fn main() {
     }
 
     let rot = standard_rotation();
-    let shapes: Vec<(Box<dyn OracleShape>, &str, bool)> = vec![
+    // (shape, slug, has_truth, bounds margin fraction). The 0.015625 margin
+    // mimics the production pad (~2 cells at depth 4), where grid alignment
+    // collapses the sawtooth and regions touch without an unclaimed band.
+    let shapes: Vec<(Box<dyn OracleShape>, &str, bool, f64)> = vec![
         (
             Box::new(Rotated::new(
                 BoxShape {
@@ -56,8 +59,27 @@ fn main() {
             )),
             "box",
             true,
+            0.12,
         ),
-        (Box::new(SphereShape { radius: 0.5 }), "sphere", true),
+        // Axis-aligned: features on grid planes -- the degenerate case users
+        // hit first (a plain cube), untested by rotated shapes.
+        (
+            Box::new(BoxShape {
+                half: DVec3::splat(0.5),
+            }),
+            "box_axis",
+            true,
+            0.12,
+        ),
+        (
+            Box::new(BoxShape {
+                half: DVec3::splat(0.5),
+            }),
+            "box_axis_tight",
+            true,
+            0.015625,
+        ),
+        (Box::new(SphereShape { radius: 0.5 }), "sphere", true, 0.12),
         (
             Box::new(Rotated::new(
                 CylinderShape {
@@ -68,26 +90,30 @@ fn main() {
             )),
             "cylinder",
             true,
+            0.12,
         ),
         (
             Box::new(Rotated::new(PolygonPrism::l_shape(0.5, 0.4), rot)),
             "lprism",
             true,
+            0.12,
         ),
         (
             Box::new(MandelbulbShape { iterations: 10 }),
             "mandelbulb",
             false,
+            0.12,
         ),
     ];
 
-    for (shape, slug, has_truth) in &shapes {
+    for (shape, slug, has_truth, margin) in &shapes {
         for &depth in &depths {
             run_case(
                 shape.as_ref(),
                 depth,
                 slug,
                 *has_truth,
+                *margin,
                 rot,
                 render_dir.as_deref(),
             );
@@ -100,10 +126,11 @@ fn run_case(
     max_depth: usize,
     slug: &str,
     has_truth: bool,
+    margin_frac: f64,
     box_rotation: DQuat,
     render_dir: Option<&std::path::Path>,
 ) {
-    let m = mesh_shape(shape, max_depth);
+    let m = mesh_shape_with_margin(shape, max_depth, margin_frac);
     let fits = m.ring_fits(1);
     let seg = segment_regions(&m.adjacency, &fits, &SegmentationConfig::default());
 
@@ -161,12 +188,17 @@ fn run_case(
             );
         }
 
-        // Corner-snap accuracy for the box: distance to the nearest true
-        // (rotated) cube corner.
-        if slug == "box" {
+        // Corner-snap accuracy for the boxes: distance to the nearest true
+        // cube corner.
+        if slug.starts_with("box") {
+            let corner_rot = if slug == "box" {
+                box_rotation
+            } else {
+                DQuat::IDENTITY
+            };
             let corners: Vec<DVec3> = (0..8)
                 .map(|i| {
-                    box_rotation
+                    corner_rot
                         * DVec3::new(
                             if i & 1 == 0 { -0.5 } else { 0.5 },
                             if i & 2 == 0 { -0.5 } else { 0.5 },
@@ -291,6 +323,46 @@ fn run_case(
             median(&crease_normal_errs),
             p95(&crease_normal_errs)
         );
+    }
+
+    // Post-pipeline shading normals for NON-crease vertices (the carried
+    // ones), bucketed by true feature distance: this is what the viewport
+    // actually interpolates, and where edge smearing hides if crease copies
+    // alone look clean.
+    if has_truth {
+        println!("  carried shading normal error vs oracle (deg):");
+        for bucket in 0..3 {
+            let errs: Vec<f64> = (0..cleaned.positions.len())
+                .filter(|&v| !is_crease[v])
+                .filter(|&v| {
+                    let cells = shape.truth(split.positions[v]).dist_to_sharp / m.cell;
+                    match bucket {
+                        0 => cells >= 2.0,
+                        1 => (1.0..2.0).contains(&cells),
+                        _ => cells < 1.0,
+                    }
+                })
+                .filter_map(|v| {
+                    let n = split.normals[v];
+                    (n.length_squared() > 1e-20).then(|| {
+                        oriented_angle_degrees_v(
+                            n.normalize(),
+                            shape.truth(split.positions[v]).normal,
+                        )
+                    })
+                })
+                .collect();
+            if !errs.is_empty() {
+                println!(
+                    "    {:<16} {:>7} vertices | med {:>6.2} p95 {:>6.2} max {:>6.2}",
+                    ["interior (>=2c)", "near (1-2c)", "feature (<1c)"][bucket],
+                    errs.len(),
+                    median(&errs),
+                    p95(&errs),
+                    errs.iter().copied().fold(0.0, f64::max)
+                );
+            }
+        }
     }
 
     // -------- Validity (all shapes) --------
