@@ -19,6 +19,7 @@ const OPERATORS: &[&str] = &[
     "rectangular_prism_operator",
     "heightmap_extrude_operator",
     "fea_grid_mesh_operator",
+    "fea_solve_operator",
 ];
 
 #[test]

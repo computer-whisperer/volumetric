@@ -29,6 +29,7 @@ const OPERATORS: &[(&str, &str)] = &[
     ("extrude_operator", "Extrude"),
     ("revolve_operator", "Revolve"),
     ("fea_grid_mesh_operator", "FEA Grid Mesh"),
+    ("fea_solve_operator", "FEA Solve"),
 ];
 
 fn main() {

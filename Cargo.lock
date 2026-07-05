@@ -1495,10 +1495,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "fea_core"
+version = "0.1.0"
+dependencies = [
+ "volumetric_abi",
+]
+
+[[package]]
 name = "fea_grid_mesh_operator"
 version = "0.1.0"
 dependencies = [
  "ciborium",
+ "serde",
+ "volumetric_abi",
+]
+
+[[package]]
+name = "fea_solve_operator"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "fea_core",
  "serde",
  "volumetric_abi",
 ]

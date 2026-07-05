@@ -1192,8 +1192,43 @@ fn build_fea_mesh_preview(
     request: &PreviewRequest,
     build_start: std::time::Instant,
 ) -> Result<PreviewEntity, String> {
-    let mesh = volumetric::fea::decode_fea_mesh(request.data.as_slice())?;
+    let mut mesh = volumetric::fea::decode_fea_mesh(request.data.as_slice())?;
     let quads = mesh.boundary_quads();
+
+    // Solved meshes draw in their deformed configuration (positions +
+    // displacement); connectivity (and thus the boundary) is unchanged.
+    let mut extra_detail = Vec::new();
+    if let Some(displacement) = mesh
+        .node_fields
+        .iter()
+        .find(|f| f.name == "displacement" && f.components == 3)
+    {
+        let max_u = displacement
+            .data
+            .chunks_exact(3)
+            .map(|u| (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt())
+            .fold(0.0f64, f64::max);
+        extra_detail.push(format!("deformed view · max |u| = {max_u:.4}"));
+        let data = displacement.data.clone();
+        for (p, u) in mesh.node_positions.iter_mut().zip(&data) {
+            *p += u;
+        }
+    }
+    if let Some(contact) = mesh
+        .node_fields
+        .iter()
+        .find(|f| f.name == "contact_force" && f.components == 3)
+    {
+        let total_fz: f64 = contact.data.chunks_exact(3).map(|f| f[2]).sum();
+        let touching = contact
+            .data
+            .chunks_exact(3)
+            .filter(|f| f[0] != 0.0 || f[1] != 0.0 || f[2] != 0.0)
+            .count();
+        if touching > 0 {
+            extra_detail.push(format!("contact Fz = {total_fz:.4} over {touching} nodes"));
+        }
+    }
 
     let position = |node: u32| -> [f32; 3] {
         let p = mesh.node_position(node as usize);
@@ -1270,14 +1305,16 @@ fn build_fea_mesh_preview(
         };
     }
 
+    let mut detail = vec![format!(
+        "FEA mesh: {} nodes · {} elements · {} boundary faces",
+        mesh.node_count(),
+        mesh.element_count(),
+        quads.len()
+    )];
+    detail.extend(extra_detail);
     let stats = OutputStats {
         triangles: vertices.len() / 3,
-        detail: vec![format!(
-            "FEA mesh: {} nodes · {} elements · {} boundary faces",
-            mesh.node_count(),
-            mesh.element_count(),
-            quads.len()
-        )],
+        detail,
         mesh_ms: build_start.elapsed().as_secs_f64() * 1000.0,
         ..Default::default()
     };
@@ -1480,7 +1517,7 @@ function get_bounds_max_y() return 1.5 end
 
     #[test]
     fn fea_mesh_outputs_get_a_boundary_preview() {
-        use volumetric::fea::{FeaElementKind, FeaMesh, encode_fea_mesh};
+        use volumetric::fea::{FeaElementKind, FeaField, FeaMesh, encode_fea_mesh};
 
         // A single unit hex at the origin.
         let mesh = FeaMesh {
@@ -1508,6 +1545,30 @@ function get_bounds_max_y() return 1.5 end
         assert!(
             entity.stats.detail.iter().any(|l| l.contains("FEA mesh")),
             "stats should describe the mesh: {:?}",
+            entity.stats.detail
+        );
+
+        // A solved mesh draws deformed: a uniform +1 z displacement shifts
+        // the drawn bounds, and the detail lines report it.
+        let mut solved = mesh.clone();
+        solved.node_fields.push(FeaField {
+            name: "displacement".to_string(),
+            components: 3,
+            data: (0..8).flat_map(|_| [0.0, 0.0, 1.0]).collect(),
+        });
+        let mut req = request("fea_solved", 64);
+        req.data = Arc::new(encode_fea_mesh(&solved));
+        req.type_hint = Some(AssetTypeHint::FeaMesh);
+        let entity = build_preview_scene(&req).expect("solved fea preview");
+        assert_eq!(entity.bounds.min, (0.0, 0.0, 1.0));
+        assert_eq!(entity.bounds.max, (1.0, 1.0, 2.0));
+        assert!(
+            entity
+                .stats
+                .detail
+                .iter()
+                .any(|l| l.contains("deformed view")),
+            "detail should mention deformation: {:?}",
             entity.stats.detail
         );
 

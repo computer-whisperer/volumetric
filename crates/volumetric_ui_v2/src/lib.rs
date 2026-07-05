@@ -357,11 +357,26 @@ pub struct ProjectSummary {
 /// Editing state for the selected operator step's config input: the parsed
 /// schema plus a raw text buffer per field. The buffer is the source of truth
 /// while typing; parseable values are committed into the step's CBOR blob.
+/// What kind of asset an operator input slot accepts (drives which assets
+/// its picker offers).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AssetSlotKind {
+    Model,
+    FeaMesh,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AssetSlot {
+    input_idx: usize,
+    kind: AssetSlotKind,
+}
+
 #[derive(Debug)]
 struct StepEditState {
     step_idx: usize,
-    /// Input indices that are `ModelWASM` slots, in declaration order.
-    model_slots: Vec<usize>,
+    /// Input indices that reference assets (`ModelWASM` / `FeaMesh` slots),
+    /// in declaration order.
+    asset_slots: Vec<AssetSlot>,
     /// The config form, present only when the operator declares a config input.
     config: Option<ConfigForm>,
     /// The Lua source editor, present only for a `LuaSource` input.
@@ -977,12 +992,20 @@ impl VolumetricUiV2 {
         let op_bytes = self.operator_bytes(&step.operator_id)?;
         let metadata = volumetric::operator_metadata_from_wasm_bytes(&op_bytes).ok()?;
 
-        let model_slots: Vec<usize> = metadata
+        let asset_slots: Vec<AssetSlot> = metadata
             .inputs
             .iter()
             .enumerate()
             .filter_map(|(idx, input)| {
-                matches!(input, OperatorMetadataInput::ModelWASM).then_some(idx)
+                let kind = match input {
+                    OperatorMetadataInput::ModelWASM => AssetSlotKind::Model,
+                    OperatorMetadataInput::FeaMesh => AssetSlotKind::FeaMesh,
+                    _ => return None,
+                };
+                Some(AssetSlot {
+                    input_idx: idx,
+                    kind,
+                })
             })
             .collect();
 
@@ -1011,13 +1034,13 @@ impl VolumetricUiV2 {
             });
 
         // Nothing editable → no step editor.
-        if model_slots.is_empty() && config.is_none() && lua.is_none() {
+        if asset_slots.is_empty() && config.is_none() && lua.is_none() {
             return None;
         }
 
         Some(StepEditState {
             step_idx,
-            model_slots,
+            asset_slots,
             config,
             lua,
             output_name: step.outputs.first().cloned().unwrap_or_default(),
@@ -1121,7 +1144,7 @@ impl VolumetricUiV2 {
             .step_edit
             .as_ref()
             .filter(|edit| edit.step_idx == step_idx)
-            .and_then(|edit| edit.model_slots.first().copied())
+            .and_then(|edit| edit.asset_slots.first().map(|slot| slot.input_idx))
             .unwrap_or(0);
         let rename_output = input_idx == primary_slot;
 
@@ -1393,7 +1416,7 @@ impl VolumetricUiV2 {
         };
         // Import operators take no model inputs, so the primary-model id is
         // never referenced; the schema-derived config defaults are what matter.
-        let mut inputs = operator_step_inputs(&metadata, "");
+        let mut inputs = operator_step_inputs(&metadata, "", None);
         let Some(blob_slot) = metadata
             .inputs
             .iter()
@@ -1458,10 +1481,33 @@ impl VolumetricUiV2 {
             .default_output_name(asset.name, Some(&input_id));
 
         // Build the step's inputs from the operator's declared metadata so
-        // config blobs, Lua templates, and extra model slots are all wired up
-        // (not just the first model input).
+        // config blobs, Lua templates, and extra model/mesh slots are all
+        // wired up (not just the first model input). The selection fills the
+        // slot matching its own type; the other kind falls back to the first
+        // asset of that kind in the project.
+        let typed = self.declared_assets_typed();
+        let hint_of = |id: &str| {
+            typed
+                .iter()
+                .find(|(asset_id, _)| asset_id == id)
+                .and_then(|(_, hint)| *hint)
+        };
+        let first_of = |kind: AssetTypeHint| {
+            typed
+                .iter()
+                .find(|(_, hint)| *hint == Some(kind))
+                .map(|(id, _)| id.clone())
+        };
+        let (primary_model, primary_fea) = if hint_of(&input_id) == Some(AssetTypeHint::FeaMesh) {
+            (
+                first_of(AssetTypeHint::Model).unwrap_or_default(),
+                Some(input_id.clone()),
+            )
+        } else {
+            (input_id.clone(), first_of(AssetTypeHint::FeaMesh))
+        };
         let inputs = match volumetric::operator_metadata_from_wasm_bytes(asset.bytes) {
-            Ok(metadata) => operator_step_inputs(&metadata, &input_id),
+            Ok(metadata) => operator_step_inputs(&metadata, &primary_model, primary_fea.as_deref()),
             Err(err) => {
                 self.status = format!("couldn't read {} metadata: {err}", asset.display_name);
                 vec![ExecutionInput::AssetRef(input_id.clone())]
@@ -2809,15 +2855,26 @@ fn step_edit_rows(app: &VolumetricUiV2, step_idx: usize) -> Vec<El> {
 
     let mut rows = Vec::new();
 
-    if !edit.model_slots.is_empty() {
+    if !edit.asset_slots.is_empty() {
         let models = editable_model_asset_ids(app);
+        let meshes = editable_fea_asset_ids(app);
         rows.push(text("Inputs").muted().caption().semibold());
-        for (n, &slot) in edit.model_slots.iter().enumerate() {
-            let current = match step.inputs.get(slot) {
+        for (n, slot) in edit.asset_slots.iter().enumerate() {
+            let current = match step.inputs.get(slot.input_idx) {
                 Some(ExecutionInput::AssetRef(id)) => id.as_str(),
                 _ => "",
             };
-            rows.push(model_slot_selector(step_idx, slot, n, current, &models));
+            let options = match slot.kind {
+                AssetSlotKind::Model => &models,
+                AssetSlotKind::FeaMesh => &meshes,
+            };
+            rows.push(asset_slot_selector(
+                step_idx,
+                slot.input_idx,
+                n,
+                current,
+                options,
+            ));
         }
     }
 
@@ -2865,9 +2922,9 @@ fn step_edit_rows(app: &VolumetricUiV2, step_idx: usize) -> Vec<El> {
     rows
 }
 
-/// A model input slot: a labelled column of full-width buttons, one per
-/// available model, with the current target highlighted.
-fn model_slot_selector(
+/// An asset input slot: a labelled column of full-width buttons, one per
+/// available asset of the slot's kind, with the current target highlighted.
+fn asset_slot_selector(
     step_idx: usize,
     slot: usize,
     ordinal: usize,
@@ -3128,10 +3185,15 @@ fn asset_type_label(type_hint: Option<AssetTypeHint>) -> &'static str {
 }
 
 /// Builds a fresh step's inputs, one per declared operator metadata input, in
-/// order. Model slots point at `primary_model` (retarget later); config slots
-/// get a default-seeded CBOR map; Lua slots get the template; other slots get
-/// empty/zeroed placeholders.
-fn operator_step_inputs(metadata: &OperatorMetadata, primary_model: &str) -> Vec<ExecutionInput> {
+/// order. Model slots point at `primary_model`, FeaMesh slots at
+/// `primary_fea` (retarget later via the step editor's pickers); config
+/// slots get a default-seeded CBOR map; Lua slots get the template; other
+/// slots get empty/zeroed placeholders.
+fn operator_step_inputs(
+    metadata: &OperatorMetadata,
+    primary_model: &str,
+    primary_fea: Option<&str>,
+) -> Vec<ExecutionInput> {
     metadata
         .inputs
         .iter()
@@ -3149,10 +3211,13 @@ fn operator_step_inputs(metadata: &OperatorMetadata, primary_model: &str) -> Vec
             }
             OperatorMetadataInput::Blob => ExecutionInput::Inline(Vec::new()),
             OperatorMetadataInput::VecF64(dim) => ExecutionInput::Inline(vec![0u8; dim * 8]),
-            // No FEA-mesh asset picker yet (no producing operators exist);
-            // the empty placeholder makes the operator report a bad input at
-            // run time instead of silently sampling the wrong asset.
-            OperatorMetadataInput::FeaMesh => ExecutionInput::Inline(Vec::new()),
+            // With no FEA mesh in the project yet, the empty placeholder
+            // makes the operator report a bad input at run time; the step
+            // editor's picker fills it in once a producer exists.
+            OperatorMetadataInput::FeaMesh => match primary_fea {
+                Some(id) => ExecutionInput::AssetRef(id.to_string()),
+                None => ExecutionInput::Inline(Vec::new()),
+            },
         })
         .collect()
 }
@@ -3237,6 +3302,13 @@ fn editable_model_asset_ids(app: &VolumetricUiV2) -> Vec<String> {
             Some(AssetTypeHint::Model) | None => Some(id),
             _ => None,
         })
+        .collect()
+}
+
+fn editable_fea_asset_ids(app: &VolumetricUiV2) -> Vec<String> {
+    app.declared_assets_typed()
+        .into_iter()
+        .filter_map(|(id, type_hint)| (type_hint == Some(AssetTypeHint::FeaMesh)).then_some(id))
         .collect()
 }
 
@@ -4027,6 +4099,52 @@ mod tests {
                 .any(|(id, hint)| *id == mesh_output && *hint == Some(AssetTypeHint::FeaMesh))
         );
         assert!(!editable_model_asset_ids(&app).contains(&mesh_output));
+    }
+
+    #[test]
+    fn solve_operator_wires_mesh_model_and_config_slots() {
+        let mut app = VolumetricUiV2::default();
+        let model_id = app.project().imports()[0].id.clone();
+        add_operator_click(&mut app, "fea_grid_mesh_operator");
+        let mesh_id = app.project().timeline()[0].outputs[0].clone();
+
+        // The mesher's output is now selected; adding the solver must wire
+        // its FeaMesh slot to that output and fall back to the project's
+        // model for the rigid-body slot.
+        add_operator_click(&mut app, "fea_solve_operator");
+        let step = &app.project().timeline()[1];
+        assert!(
+            matches!(&step.inputs[0], ExecutionInput::AssetRef(id) if *id == mesh_id),
+            "mesh slot: {:?}",
+            step.inputs[0]
+        );
+        assert!(
+            matches!(&step.inputs[1], ExecutionInput::AssetRef(id) if *id == model_id),
+            "rigid slot: {:?}",
+            step.inputs[1]
+        );
+
+        // The seeded config decodes with the schema defaults (in particular
+        // the fixed_boundary enum default must arrive unquoted).
+        let ExecutionInput::Inline(config) = &step.inputs[2] else {
+            panic!("config slot should be inline CBOR");
+        };
+        let decoded = operator_config::decode(config);
+        assert_eq!(
+            decoded.get("fixed_boundary"),
+            Some(&operator_config::ConfigValue::Text("zmin".to_string()))
+        );
+        assert_eq!(
+            decoded.get("youngs_modulus"),
+            Some(&operator_config::ConfigValue::Float(1.0))
+        );
+
+        // And the step editor's FeaMesh picker offers the mesh outputs (the
+        // mesher's, and the solver's own downstream one) but no models.
+        let fea_ids = editable_fea_asset_ids(&app);
+        assert!(fea_ids.contains(&mesh_id), "picker: {fea_ids:?}");
+        assert!(!fea_ids.contains(&model_id));
+        assert!(!editable_model_asset_ids(&app).contains(&mesh_id));
     }
 
     #[test]
