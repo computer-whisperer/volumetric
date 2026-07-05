@@ -99,6 +99,16 @@ impl NativeParallelSampler {
         // Get dimensions and bounds from a temporary instance
         let (dimensions, bounds) = Self::fetch_dimensions_and_bounds(&engine, &module)?;
 
+        // The (x, y, z) sampler interface is inherently 3D; feeding it a 2D
+        // sketch would silently ignore z. Sketches get meshed only after an
+        // extrude-style operator lifts them to 3D.
+        if dimensions < 3 {
+            return Err(WasmBackendError::Execution(format!(
+                "model has {dimensions} dimensions; 3D sampling needs at least 3 \
+                 (extrude 2D sketches before meshing)"
+            )));
+        }
+
         let id = SAMPLER_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
 
         Ok(Self {

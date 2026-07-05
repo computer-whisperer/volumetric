@@ -277,8 +277,14 @@ impl ModelExecutor for NativeModelExecutor {
     }
 
     fn is_inside(&mut self, x: f64, y: f64, z: f64) -> Result<f32, WasmBackendError> {
-        // Pad position with zeros if model has more than 3 dimensions
         let n = self.dimensions as usize;
+        if n < 3 {
+            return Err(WasmBackendError::Execution(format!(
+                "model has {n} dimensions; 3D sampling needs at least 3 \
+                 (extrude 2D sketches before meshing)"
+            )));
+        }
+        // Pad position with zeros if model has more than 3 dimensions
         let mut pos = vec![0.0f64; n];
         pos[0] = x;
         pos[1] = y;

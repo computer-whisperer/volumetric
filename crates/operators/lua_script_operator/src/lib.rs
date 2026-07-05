@@ -6,11 +6,20 @@
 //! - Input 0: UTF-8 Lua source containing the required functions
 //! - Output 0: WASM bytes of a model module that exports the N-dimensional model ABI
 //!
+//! The script's dimensionality comes from `is_inside`'s arity:
+//! `is_inside(x, y, z)` compiles a 3D volume, `is_inside(x, y)` a 2D sketch
+//! (for use with extrude-style operators). A 2D script defines only the
+//! x/y bounds functions.
+//!
+//! `is_inside` returns an occupancy value per the `volumetric_abi` contract:
+//! `1.0` inside, `0.0` outside (a point classifies as inside iff the value
+//! is `> 0.5`).
+//!
 //! Generated Model ABI:
-//! - `get_dimensions() -> u32`: Returns 3 (always 3D)
+//! - `get_dimensions() -> u32`: Returns 2 or 3 per is_inside's arity
 //! - `get_io_ptr() -> i32`: Returns the model-owned IO buffer (2n f64s)
-//! - `get_bounds(out_ptr: i32)`: Writes 6 f64 values (min_x, max_x, min_y, max_y, min_z, max_z)
-//! - `sample(pos_ptr: i32) -> f32`: Reads position from memory, returns density
+//! - `get_bounds(out_ptr: i32)`: Writes 2n f64 values, interleaved min/max
+//! - `sample(pos_ptr: i32) -> f32`: Reads position from memory, returns occupancy
 //! - `memory`: Exported memory for position/bounds I/O
 //!
 //! # Supported Lua Subset
@@ -59,7 +68,11 @@
 //! end
 //!
 //! function is_inside(x, y, z)
-//!     return dist(x, y, z) - 1.0
+//!     if dist(x, y, z) <= 1.0 then
+//!         return 1.0
+//!     else
+//!         return 0.0
+//!     end
 //! end
 //! ```
 //!
@@ -74,15 +87,17 @@ use volumetric_abi::{OperatorMetadata, OperatorMetadataInput, OperatorMetadataOu
 
 use volumetric_abi::host::{post_output, read_input, report_error};
 
-/// Required Lua functions that must be defined in the script.
-/// These are compiled to internal WASM functions and wrapped by the ABI exports.
-const REQUIRED_FUNCS: &[&str] = &[
-    "is_inside",
+/// Per-axis bounds getters in IO-buffer order (interleaved min/max). A
+/// script must define the first `2 * dims` of these plus `is_inside`; the
+/// dimensionality comes from `is_inside`'s arity (2 for a sketch, 3 for a
+/// volume). These are compiled to internal WASM functions and wrapped by the
+/// ABI exports.
+const BOUNDS_FUNCS: &[&str] = &[
     "get_bounds_min_x",
-    "get_bounds_min_y",
-    "get_bounds_min_z",
     "get_bounds_max_x",
+    "get_bounds_min_y",
     "get_bounds_max_y",
+    "get_bounds_min_z",
     "get_bounds_max_z",
 ];
 
@@ -657,8 +672,23 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
         }
     }
 
+    // The script's dimensionality comes from is_inside's arity: 2 compiles
+    // a sketch (occupancy over x, y), 3 a volume.
+    let dims = match functions.get("is_inside") {
+        None => return Err(CompileError::MissingFunc("is_inside")),
+        Some(f) => f.params.len(),
+    };
+    if dims != 2 && dims != 3 {
+        return Err(CompileError::Type(format!(
+            "is_inside must take 2 params (2D sketch) or 3 params (3D volume), got {dims}"
+        )));
+    }
+    let required_funcs: Vec<&'static str> = std::iter::once("is_inside")
+        .chain(BOUNDS_FUNCS[..dims * 2].iter().copied())
+        .collect();
+
     // Verify all required functions are present
-    for &fname in REQUIRED_FUNCS {
+    for &fname in &required_funcs {
         if !functions.contains_key(fname) {
             return Err(CompileError::MissingFunc(fname));
         }
@@ -1598,7 +1628,7 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
     // First, generate helper functions (non-required functions)
     // These need to be created first so they can be called from required functions
     for (fname, ir_func) in &functions {
-        if REQUIRED_FUNCS.contains(&fname.as_str()) {
+        if required_funcs.contains(&fname.as_str()) {
             continue; // Required functions are generated separately below
         }
 
@@ -1644,26 +1674,20 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
     // These will be called by the ABI wrapper functions
     let mut internal_func_ids: HashMap<String, walrus::FunctionId> = HashMap::new();
 
-    for &fname in REQUIRED_FUNCS {
+    for &fname in &required_funcs {
         let ir_func = functions.get(fname).unwrap();
         match fname {
             "is_inside" => {
-                if ir_func.params.len() != 3 {
-                    return Err(CompileError::Type("is_inside must take 3 params".into()));
-                }
-                // Internal is_inside: (f64, f64, f64) -> f64 (not demoted to f32 yet)
-                let mut fb = FunctionBuilder::new(
-                    &mut module.types,
-                    &[ValType::F64, ValType::F64, ValType::F64],
-                    &[ValType::F64],
-                );
-                let l_x = module.locals.add(ValType::F64);
-                let l_y = module.locals.add(ValType::F64);
-                let l_z = module.locals.add(ValType::F64);
+                // Internal is_inside: (f64 * dims) -> f64 (not demoted to f32
+                // yet); arity was validated when dims was inferred.
+                let param_types = vec![ValType::F64; dims];
+                let mut fb = FunctionBuilder::new(&mut module.types, &param_types, &[ValType::F64]);
+                let param_locals: Vec<walrus::LocalId> =
+                    (0..dims).map(|_| module.locals.add(ValType::F64)).collect();
                 let mut locals_map: HashMap<String, walrus::LocalId> = HashMap::new();
-                locals_map.insert(ir_func.params[0].clone(), l_x);
-                locals_map.insert(ir_func.params[1].clone(), l_y);
-                locals_map.insert(ir_func.params[2].clone(), l_z);
+                for (param, &local) in ir_func.params.iter().zip(&param_locals) {
+                    locals_map.insert(param.clone(), local);
+                }
                 let mut ib = fb.func_body();
                 let ret_expr = emit_ir_stmts(
                     &mut ib,
@@ -1676,7 +1700,7 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                 if let Some(expr) = ret_expr {
                     emit_ir_expr(&mut ib, &func_ids, &expr, &ir_func.params, &locals_map)?;
                 }
-                let fid = fb.finish(vec![l_x, l_y, l_z], &mut module.funcs);
+                let fid = fb.finish(param_locals, &mut module.funcs);
                 internal_func_ids.insert(fname.to_string(), fid);
             }
             _ => {
@@ -1710,7 +1734,7 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
     {
         let mut fb = FunctionBuilder::new(&mut module.types, &[], &[ValType::I32]);
         let mut ib = fb.func_body();
-        ib.i32_const(3); // Always 3 dimensions
+        ib.i32_const(dims as i32);
         let fid = fb.finish(vec![], &mut module.funcs);
         module.exports.add("get_dimensions", fid);
     }
@@ -1728,24 +1752,18 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
     }
 
     // Generate and export get_bounds(out_ptr: i32)
-    // Writes 6 f64 values: min_x, max_x, min_y, max_y, min_z, max_z
+    // Writes 2 * dims f64 values, interleaved min/max per axis
     {
         let mut fb = FunctionBuilder::new(&mut module.types, &[ValType::I32], &[]);
         let out_ptr = module.locals.add(ValType::I32);
         let mut ib = fb.func_body();
 
-        let bounds_funcs = [
-            ("get_bounds_min_x", 0),
-            ("get_bounds_max_x", 8),
-            ("get_bounds_min_y", 16),
-            ("get_bounds_max_y", 24),
-            ("get_bounds_min_z", 32),
-            ("get_bounds_max_z", 40),
-        ];
-
-        for (func_name, offset) in bounds_funcs {
+        for (i, &func_name) in BOUNDS_FUNCS[..dims * 2].iter().enumerate() {
             let func_id = *internal_func_ids.get(func_name).unwrap();
-            let mem_arg = walrus::ir::MemArg { align: 3, offset };
+            let mem_arg = walrus::ir::MemArg {
+                align: 3,
+                offset: (i * 8) as u64,
+            };
             ib.local_get(out_ptr);
             ib.call(func_id);
             ib.store(memory_id, walrus::ir::StoreKind::F64, mem_arg);
@@ -1756,7 +1774,7 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
     }
 
     // Generate and export sample(pos_ptr: i32) -> f32
-    // Reads 3 f64 values from pos_ptr, calls internal is_inside, returns f32
+    // Reads dims f64 values from pos_ptr, calls internal is_inside, returns f32
     {
         let mut fb = FunctionBuilder::new(&mut module.types, &[ValType::I32], &[ValType::F32]);
         let pos_ptr = module.locals.add(ValType::I32);
@@ -1764,31 +1782,17 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
 
         let is_inside_id = *internal_func_ids.get("is_inside").unwrap();
 
-        // Load x from pos_ptr + 0
-        let mem_arg_x = walrus::ir::MemArg {
-            align: 3,
-            offset: 0,
-        };
-        ib.local_get(pos_ptr);
-        ib.load(memory_id, walrus::ir::LoadKind::F64, mem_arg_x);
+        // Load each position component from pos_ptr + 8 * axis
+        for axis in 0..dims {
+            let mem_arg = walrus::ir::MemArg {
+                align: 3,
+                offset: (axis * 8) as u64,
+            };
+            ib.local_get(pos_ptr);
+            ib.load(memory_id, walrus::ir::LoadKind::F64, mem_arg);
+        }
 
-        // Load y from pos_ptr + 8
-        let mem_arg_y = walrus::ir::MemArg {
-            align: 3,
-            offset: 8,
-        };
-        ib.local_get(pos_ptr);
-        ib.load(memory_id, walrus::ir::LoadKind::F64, mem_arg_y);
-
-        // Load z from pos_ptr + 16
-        let mem_arg_z = walrus::ir::MemArg {
-            align: 3,
-            offset: 16,
-        };
-        ib.local_get(pos_ptr);
-        ib.load(memory_id, walrus::ir::LoadKind::F64, mem_arg_z);
-
-        // Call internal is_inside(x, y, z) -> f64
+        // Call internal is_inside(...) -> f64
         ib.call(is_inside_id);
 
         // Convert f64 to f32
@@ -1823,11 +1827,16 @@ pub extern "C" fn run() {
 
 /// Minimal stub template for the Lua script input.
 /// This template shows all required function signatures that the script must implement.
-const LUA_TEMPLATE: &str = r#"-- Density field: 0.0 = empty, 1.0 = full
+const LUA_TEMPLATE: &str = r#"-- Occupancy: return 1.0 inside, 0.0 outside (inside iff value > 0.5).
+-- For a 2D sketch (extrude input), define is_inside(x, y) and only the
+-- x/y bounds functions instead.
 function is_inside(x, y, z)
     -- Example: unit sphere centered at origin
-    -- Returns 1.0 if inside (r < 1), 0.0 if outside
-    return math.max(0.0, 1.0 - math.sqrt(x*x + y*y + z*z))
+    if x*x + y*y + z*z <= 1.0 then
+        return 1.0
+    else
+        return 0.0
+    end
 end
 
 -- Bounding box functions define the region to sample
