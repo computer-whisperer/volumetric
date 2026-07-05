@@ -27,6 +27,10 @@ pub struct RenderArgs {
     #[arg(short, long)]
     pub input: PathBuf,
 
+    /// For .vproj inputs with multiple exports: which exported asset to render
+    #[arg(long)]
+    pub asset: Option<String>,
+
     /// Output PNG file path (view suffix added for multiple views)
     #[arg(short, long)]
     pub output: PathBuf,
@@ -403,7 +407,7 @@ pub fn run_render(args: RenderArgs) -> Result<()> {
     }
 
     // Load WASM and generate mesh
-    let wasm_bytes = load_wasm_bytes(&args.input)?;
+    let wasm_bytes = load_wasm_bytes(&args.input, args.asset.as_deref())?;
     println!("Loaded {} bytes", wasm_bytes.len());
 
     let config = build_mesh_config(

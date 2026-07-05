@@ -356,8 +356,10 @@ pub fn model_dimensions_from_bytes(wasm_bytes: &[u8]) -> anyhow::Result<u32> {
     Ok(executor.dimensions()?)
 }
 
-/// Rasterize a 2D sketch model into a `resolution^2` occupancy grid over its
-/// own bounds, sampling at cell centers.
+/// Rasterize a 2D sketch model into an occupancy grid over its own bounds,
+/// sampling at cell centers. `resolution` is the cell count along the longer
+/// bounds axis; the other axis is scaled to keep cells square (aspect-correct
+/// rasters, so previews don't distort non-square sketches).
 #[cfg(any(feature = "native", feature = "web"))]
 pub fn rasterize_sketch_from_bytes(
     wasm_bytes: &[u8],
@@ -378,18 +380,25 @@ pub fn rasterize_sketch_from_bytes(
     let (min_y, max_y) = (bounds.min(1), bounds.max(1));
 
     let n = resolution.max(1);
-    let mut cells = Vec::with_capacity(n * n);
-    for yi in 0..n {
-        let y = min_y + (max_y - min_y) * ((yi as f64 + 0.5) / n as f64);
-        for xi in 0..n {
-            let x = min_x + (max_x - min_x) * ((xi as f64 + 0.5) / n as f64);
+    let (span_x, span_y) = (max_x - min_x, max_y - min_y);
+    let (width, height) = if span_x >= span_y {
+        (n, ((n as f64 * span_y / span_x).round() as usize).max(1))
+    } else {
+        (((n as f64 * span_x / span_y).round() as usize).max(1), n)
+    };
+
+    let mut cells = Vec::with_capacity(width * height);
+    for yi in 0..height {
+        let y = min_y + span_y * ((yi as f64 + 0.5) / height as f64);
+        for xi in 0..width {
+            let x = min_x + span_x * ((xi as f64 + 0.5) / width as f64);
             cells.push(volumetric_abi::is_occupied(executor.sample_nd(&[x, y])?));
         }
     }
 
     Ok(SketchRaster {
-        width: n,
-        height: n,
+        width,
+        height,
         cells,
         bounds_min: (min_x as f32, min_y as f32),
         bounds_max: (max_x as f32, max_y as f32),

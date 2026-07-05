@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 volumetric = { path = "../../" }
+volumetric_abi = { path = "../volumetric_abi" }
+volumetric_assets = { path = "../volumetric_assets" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 wgpu = "29"

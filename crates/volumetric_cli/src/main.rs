@@ -3,10 +3,15 @@
 //! Provides subcommands for:
 //! - `mesh`: Generate STL files from volumetric models
 //! - `render`: Generate PNG images using headless wgpu rendering
+//! - `sketch-raster`: Rasterize a 2D sketch model to PNG or ASCII
 //! - `info`: Inspect WASM models, operators, and projects
 //! - `bounds`: Query bounding box of a model
-//! - `sample`: Sample is_inside values at points
-//! - `project-*`: Create and manipulate .vproj project files
+//! - `sample`: Sample occupancy values at points
+//! - `assets`: List the models and operators bundled into the binary
+//! - `project-*`: Create, validate and manipulate .vproj project files
+//!
+//! Model and operator arguments accept either a filesystem path or the name
+//! of a bundled asset (see `assets`).
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -18,10 +23,12 @@ use volumetric::{
     generate_adaptive_mesh_v2_from_bytes, stl,
 };
 
+mod assets;
 mod camera;
 mod headless_renderer;
 mod info;
 mod project;
+mod raster;
 mod render;
 
 #[derive(Parser, Debug)]
@@ -38,21 +45,32 @@ enum Commands {
     Mesh(MeshArgs),
     /// Render a volumetric model to PNG image(s)
     Render(render::RenderArgs),
+    /// Rasterize a 2D sketch model to a PNG image or ASCII art
+    #[command(name = "sketch-raster")]
+    SketchRaster(raster::SketchRasterArgs),
     /// Get information about a WASM model, operator, or project
     Info(info::InfoArgs),
     /// Query the bounding box of a model
     Bounds(info::BoundsArgs),
-    /// Sample is_inside values at specified points
+    /// Sample occupancy values at specified points
     Sample(info::SampleArgs),
-    /// Create a new project from a model WASM
+    /// List models and operators bundled into this binary
+    Assets(assets::AssetsArgs),
+    /// Create a new project, optionally seeded with a model
     #[command(name = "project-new")]
     ProjectNew(project::ProjectNewArgs),
     /// Add a model to an existing project
     #[command(name = "project-add-model")]
     ProjectAddModel(project::ProjectAddModelArgs),
+    /// Add a non-model asset (Lua source, config, blob) to a project
+    #[command(name = "project-add-asset")]
+    ProjectAddAsset(project::ProjectAddAssetArgs),
     /// Add an operator execution to a project
     #[command(name = "project-add-op")]
     ProjectAddOp(project::ProjectAddOpArgs),
+    /// Check a project for structural problems without running it
+    #[command(name = "project-validate")]
+    ProjectValidate(project::ProjectValidateArgs),
     /// Export assets from a project to WASM files
     #[command(name = "project-export")]
     ProjectExport(project::ProjectExportArgs),
@@ -69,6 +87,10 @@ pub struct MeshArgs {
     /// Input file: either a .wasm model or a .vproj project file
     #[arg(short, long)]
     input: PathBuf,
+
+    /// For .vproj inputs with multiple exports: which exported asset to mesh
+    #[arg(long)]
+    asset: Option<String>,
 
     /// Output STL file path
     #[arg(short, long)]
@@ -111,7 +133,12 @@ pub struct MeshArgs {
     quiet: bool,
 }
 
-pub fn load_wasm_bytes(path: &PathBuf) -> Result<Vec<u8>> {
+/// Load model WASM bytes from a `.wasm` file or a `.vproj` project.
+///
+/// For projects, `asset` selects which export to use. With no selector the
+/// project must have exactly one model export — silently picking the first
+/// of several meshes the wrong thing.
+pub fn load_wasm_bytes(path: &PathBuf, asset: Option<&str>) -> Result<Vec<u8>> {
     let extension = path
         .extension()
         .and_then(|e| e.to_str())
@@ -120,11 +147,18 @@ pub fn load_wasm_bytes(path: &PathBuf) -> Result<Vec<u8>> {
 
     match extension.as_str() {
         "wasm" => {
-            println!("Loading WASM model from {:?}", path);
-            std::fs::read(path).context("Failed to read WASM file")
+            if let Some(asset) = asset {
+                anyhow::bail!(
+                    "--asset '{asset}' only applies to .vproj inputs; {path:?} is a .wasm file"
+                );
+            }
+            eprintln!("Loading WASM model from {:?}", path);
+            let bytes = std::fs::read(path).context("Failed to read WASM file")?;
+            assets::ensure_wasm(&bytes, "model", &path.display().to_string())?;
+            Ok(bytes)
         }
         "vproj" => {
-            println!("Loading project from {:?}", path);
+            eprintln!("Loading project from {:?}", path);
             let project = Project::load_from_file(path).context("Failed to load .vproj file")?;
 
             // Run the project to get the exported assets
@@ -133,22 +167,49 @@ pub fn load_wasm_bytes(path: &PathBuf) -> Result<Vec<u8>> {
                 .run(&mut env)
                 .map_err(|e| anyhow::anyhow!("Project execution failed: {}", e))?;
 
-            // Take the first exported model
-            let export = exports
-                .into_iter()
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("Project has no exported assets"))?;
+            let model_exports: Vec<_> = exports.iter().filter(|e| e.as_model().is_some()).collect();
 
-            export
+            let export = match asset {
+                Some(id) => model_exports
+                    .iter()
+                    .find(|e| e.id() == id)
+                    .copied()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "project has no model export named '{id}'. Available: {}",
+                            join_ids(&model_exports)
+                        )
+                    })?,
+                None => match model_exports.as_slice() {
+                    [] => anyhow::bail!("project has no model exports"),
+                    [only] => only,
+                    _ => anyhow::bail!(
+                        "project has {} model exports; select one with --asset. Available: {}",
+                        model_exports.len(),
+                        join_ids(&model_exports)
+                    ),
+                },
+            };
+
+            eprintln!("Using export '{}'", export.id());
+            Ok(export
                 .as_model()
-                .map(|b| b.to_vec())
-                .ok_or_else(|| anyhow::anyhow!("Exported asset is not a Model"))
+                .expect("filtered to model exports")
+                .to_vec())
         }
         _ => Err(anyhow::anyhow!(
             "Unknown file extension: {:?}. Expected .wasm or .vproj",
             extension
         )),
     }
+}
+
+fn join_ids(exports: &[&volumetric::LoadedAsset]) -> String {
+    exports
+        .iter()
+        .map(|e| e.id())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn indexed_mesh_to_triangles(
@@ -314,7 +375,7 @@ pub fn build_mesh_config(
 
 fn run_mesh(args: MeshArgs) -> Result<()> {
     // Load WASM bytes
-    let wasm_bytes = load_wasm_bytes(&args.input)?;
+    let wasm_bytes = load_wasm_bytes(&args.input, args.asset.as_deref())?;
     println!("Loaded {} bytes", wasm_bytes.len());
 
     // Configure meshing
@@ -365,12 +426,16 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Mesh(args) => run_mesh(args),
         Commands::Render(args) => render::run_render(args),
+        Commands::SketchRaster(args) => raster::run_sketch_raster(args),
         Commands::Info(args) => info::run_info(args),
         Commands::Bounds(args) => info::run_bounds(args),
         Commands::Sample(args) => info::run_sample(args),
+        Commands::Assets(args) => assets::run_assets(args),
         Commands::ProjectNew(args) => project::run_project_new(args),
         Commands::ProjectAddModel(args) => project::run_project_add_model(args),
+        Commands::ProjectAddAsset(args) => project::run_project_add_asset(args),
         Commands::ProjectAddOp(args) => project::run_project_add_op(args),
+        Commands::ProjectValidate(args) => project::run_project_validate(args),
         Commands::ProjectExport(args) => project::run_project_export(args),
         Commands::ProjectRun(args) => project::run_project_run(args),
         Commands::ProjectList(args) => project::run_project_list(args),

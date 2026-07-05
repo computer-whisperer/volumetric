@@ -1,19 +1,38 @@
 //! Project manipulation subcommands for creating and modifying .vproj files.
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use serde::Serialize;
 use std::path::PathBuf;
 
-use volumetric::{AssetTypeHint, Environment, ExecutionInput, Project};
+use volumetric::{AssetTypeHint, Environment, ExecutionInput, ImportedAsset, Project};
+
+use crate::assets::{resolve_model_spec, resolve_operator_spec};
+
+/// Print every structural problem `Project::validate` finds as a warning.
+///
+/// The project is saved regardless — a half-built pipeline (e.g. an operator
+/// added before its config asset) is legitimate intermediate state — but the
+/// user should hear about it at edit time, not at run time.
+fn warn_validation_issues(project: &Project) {
+    for issue in project.validate() {
+        eprintln!("warning: {issue}");
+    }
+}
+
+fn save_project(project: &Project, path: &PathBuf) -> Result<()> {
+    warn_validation_issues(project);
+    project.save_to_file(path).context("Failed to save project")
+}
 
 // === Project New ===
 
 #[derive(Parser, Debug)]
 pub struct ProjectNewArgs {
-    /// Input WASM model file
+    /// Model to seed the project with: a .wasm path or a bundled model name.
+    /// Omit to create an empty project (e.g. one that starts with a sketch).
     #[arg(short, long)]
-    pub input: PathBuf,
+    pub input: Option<String>,
 
     /// Output .vproj file path
     #[arg(short, long)]
@@ -25,22 +44,24 @@ pub struct ProjectNewArgs {
 }
 
 pub fn run_project_new(args: ProjectNewArgs) -> Result<()> {
-    let wasm_bytes = std::fs::read(&args.input).context("Failed to read WASM file")?;
+    let project = match &args.input {
+        Some(spec) => {
+            let (name, wasm_bytes) = resolve_model_spec(spec)?;
+            let asset_id = args.asset_id.unwrap_or(name);
+            let project = Project::from_model(asset_id.clone(), wasm_bytes);
+            println!("Created project with model '{}'", asset_id);
+            project
+        }
+        None => {
+            if args.asset_id.is_some() {
+                anyhow::bail!("--asset-id requires --input");
+            }
+            println!("Created empty project");
+            Project::new()
+        }
+    };
 
-    let asset_id = args.asset_id.unwrap_or_else(|| {
-        args.input
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("model")
-            .to_string()
-    });
-
-    let project = Project::from_model(asset_id.clone(), wasm_bytes);
-    project
-        .save_to_file(&args.output)
-        .context("Failed to save project")?;
-
-    println!("Created project with model '{}'", asset_id);
+    save_project(&project, &args.output)?;
     println!("Saved to {:?}", args.output);
     Ok(())
 }
@@ -53,9 +74,9 @@ pub struct ProjectAddModelArgs {
     #[arg(short, long)]
     pub project: PathBuf,
 
-    /// WASM model file to add
+    /// Model to add: a .wasm path or a bundled model name
     #[arg(short, long)]
-    pub input: PathBuf,
+    pub input: String,
 
     /// Asset ID for the model (defaults to filename without extension)
     #[arg(long)]
@@ -72,16 +93,9 @@ pub struct ProjectAddModelArgs {
 
 pub fn run_project_add_model(args: ProjectAddModelArgs) -> Result<()> {
     let mut project = Project::load_from_file(&args.project).context("Failed to load project")?;
-    let wasm_bytes = std::fs::read(&args.input).context("Failed to read WASM file")?;
+    let (name, wasm_bytes) = resolve_model_spec(&args.input)?;
 
-    let asset_id_base = args.asset_id.unwrap_or_else(|| {
-        args.input
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("model")
-            .to_string()
-    });
-
+    let asset_id_base = args.asset_id.unwrap_or(name);
     let asset_id = project.insert_model(&asset_id_base, wasm_bytes);
 
     // Remove the auto-added export if --no-export was specified
@@ -90,11 +104,100 @@ pub fn run_project_add_model(args: ProjectAddModelArgs) -> Result<()> {
     }
 
     let output_path = args.output.unwrap_or(args.project);
-    project
-        .save_to_file(&output_path)
-        .context("Failed to save project")?;
+    save_project(&project, &output_path)?;
 
     println!("Added model '{}' to project", asset_id);
+    println!("Saved to {:?}", output_path);
+    Ok(())
+}
+
+// === Project Add Asset (non-model imports) ===
+
+/// Type hint for `project-add-asset`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum AssetTypeArg {
+    Lua,
+    Config,
+    Blob,
+}
+
+impl From<AssetTypeArg> for AssetTypeHint {
+    fn from(value: AssetTypeArg) -> Self {
+        match value {
+            AssetTypeArg::Lua => AssetTypeHint::LuaSource,
+            AssetTypeArg::Config => AssetTypeHint::Config,
+            AssetTypeArg::Blob => AssetTypeHint::Binary,
+        }
+    }
+}
+
+#[derive(Parser, Debug)]
+pub struct ProjectAddAssetArgs {
+    /// Project file to modify
+    #[arg(short, long)]
+    pub project: PathBuf,
+
+    /// File whose bytes become the asset (e.g. a .lua sketch source)
+    #[arg(short, long)]
+    pub input: PathBuf,
+
+    /// Asset type (defaults from the file extension: .lua -> lua, else blob)
+    #[arg(long, value_enum)]
+    pub r#type: Option<AssetTypeArg>,
+
+    /// Asset ID (defaults to filename without extension)
+    #[arg(long)]
+    pub asset_id: Option<String>,
+
+    /// Output project file (defaults to overwriting input)
+    #[arg(short, long)]
+    pub output: Option<PathBuf>,
+}
+
+pub fn run_project_add_asset(args: ProjectAddAssetArgs) -> Result<()> {
+    let mut project = Project::load_from_file(&args.project).context("Failed to load project")?;
+    let bytes = std::fs::read(&args.input)
+        .with_context(|| format!("Failed to read {}", args.input.display()))?;
+
+    let extension = args
+        .input
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let type_hint: AssetTypeHint = args
+        .r#type
+        .unwrap_or(match extension.as_str() {
+            "lua" => AssetTypeArg::Lua,
+            "cbor" => AssetTypeArg::Config,
+            _ => AssetTypeArg::Blob,
+        })
+        .into();
+
+    // Adding a wasm module as lua/blob is almost certainly a mistyped command.
+    if bytes.starts_with(b"\0asm") {
+        anyhow::bail!(
+            "{} is a WASM module; use project-add-model (or project-add-op for operators)",
+            args.input.display()
+        );
+    }
+
+    let asset_id_base = args.asset_id.unwrap_or_else(|| {
+        args.input
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("asset")
+            .to_string()
+    });
+    let asset_id = project.unique_asset_id(&asset_id_base);
+    project
+        .imports_mut()
+        .push(ImportedAsset::new(asset_id.clone(), bytes, Some(type_hint)));
+
+    let output_path = args.output.unwrap_or(args.project);
+    save_project(&project, &output_path)?;
+
+    println!("Added {} asset '{}' to project", type_hint, asset_id);
     println!("Saved to {:?}", output_path);
     Ok(())
 }
@@ -107,9 +210,9 @@ pub struct ProjectAddOpArgs {
     #[arg(short, long)]
     pub project: PathBuf,
 
-    /// Operator WASM file
+    /// Operator: a .wasm path or a bundled operator name (see `assets`)
     #[arg(long)]
-    pub operator: PathBuf,
+    pub operator: String,
 
     /// Input asset IDs or literal values (format: "asset:id", "json:{...}", or "data:base64")
     #[arg(short, long)]
@@ -159,14 +262,7 @@ fn parse_input(s: &str) -> Result<ExecutionInput> {
 
 pub fn run_project_add_op(args: ProjectAddOpArgs) -> Result<()> {
     let mut project = Project::load_from_file(&args.project).context("Failed to load project")?;
-    let op_bytes = std::fs::read(&args.operator).context("Failed to read operator WASM")?;
-
-    let op_name = args
-        .operator
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("operator")
-        .to_string();
+    let (op_name, op_bytes) = resolve_operator_spec(&args.operator)?;
 
     let inputs: Vec<ExecutionInput> = args
         .input
@@ -195,13 +291,64 @@ pub fn run_project_add_op(args: ProjectAddOpArgs) -> Result<()> {
     }
 
     let output_path = args.output.unwrap_or(args.project);
-    project
-        .save_to_file(&output_path)
-        .context("Failed to save project")?;
+    save_project(&project, &output_path)?;
 
     println!("Added operator '{}' with output '{}'", op_name, output_id);
     println!("Saved to {:?}", output_path);
     Ok(())
+}
+
+// === Project Validate ===
+
+#[derive(Parser, Debug)]
+pub struct ProjectValidateArgs {
+    /// Project file to check
+    #[arg(short, long)]
+    pub project: PathBuf,
+
+    /// Output as JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ValidateResult {
+    valid: bool,
+    issues: Vec<String>,
+}
+
+pub fn run_project_validate(args: ProjectValidateArgs) -> Result<()> {
+    let project = Project::load_from_file(&args.project).context("Failed to load project")?;
+    let issues: Vec<String> = project
+        .validate()
+        .into_iter()
+        .map(|i| i.to_string())
+        .collect();
+
+    if args.json {
+        let output = ValidateResult {
+            valid: issues.is_empty(),
+            issues: issues.clone(),
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&output).context("Failed to serialize JSON")?
+        );
+    } else if issues.is_empty() {
+        println!("Project is structurally sound");
+    } else {
+        println!("Found {} issue(s):", issues.len());
+        for issue in &issues {
+            println!("  {issue}");
+        }
+    }
+
+    if issues.is_empty() {
+        Ok(())
+    } else {
+        // Non-zero exit so scripts can gate on validity
+        std::process::exit(1);
+    }
 }
 
 // === Project Export ===

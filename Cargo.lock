@@ -4802,6 +4802,8 @@ dependencies = [
  "serde",
  "serde_json",
  "volumetric",
+ "volumetric_abi",
+ "volumetric_assets",
  "wasmtime",
  "wgpu",
 ]

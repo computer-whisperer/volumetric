@@ -1,14 +1,19 @@
 //! Info subcommands for inspecting WASM models, operators, and projects.
+//!
+//! Model access goes through [`volumetric::wasm::ModelExecutor`], so these
+//! commands see exactly what the meshing/preview pipeline sees — including
+//! 2D sketches and typed sample channels.
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use serde::Serialize;
 use std::path::PathBuf;
-use wasmtime::{Engine, Instance, Module, Store};
+use wasmtime::{Engine, Module};
 
 use volumetric::{
     ExecutionInput, OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput, Project,
     operator_metadata_from_wasm_bytes,
+    wasm::{ModelExecutor, create_model_executor},
 };
 
 // === WASM Type Detection ===
@@ -21,25 +26,6 @@ pub enum WasmType {
     Unknown,
 }
 
-/// ABI version for models
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ModelAbiVersion {
-    /// Legacy ABI: is_inside(x, y, z) -> f32, get_bounds_min_x() etc.
-    Legacy,
-    /// N-dimensional ABI: sample(pos_ptr) -> f32, get_bounds(out_ptr), get_dimensions() -> u32
-    Nd,
-}
-
-impl std::fmt::Display for ModelAbiVersion {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ModelAbiVersion::Legacy => write!(f, "Legacy (3D)"),
-            ModelAbiVersion::Nd => write!(f, "N-dimensional"),
-        }
-    }
-}
-
 impl std::fmt::Display for WasmType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -50,356 +36,98 @@ impl std::fmt::Display for WasmType {
     }
 }
 
-/// Detect the ABI version for a model WASM module
-fn detect_model_abi(module: &Module) -> ModelAbiVersion {
-    let has_sample = module.exports().any(|e| e.name() == "sample");
-    let has_get_dimensions = module.exports().any(|e| e.name() == "get_dimensions");
-    let has_memory = module.exports().any(|e| e.name() == "memory");
-
-    if has_sample && has_get_dimensions && has_memory {
-        ModelAbiVersion::Nd
-    } else {
-        ModelAbiVersion::Legacy
-    }
-}
-
-fn wasmtime_result<T>(result: std::result::Result<T, wasmtime::Error>, context: &str) -> Result<T> {
-    result.map_err(|err| anyhow::anyhow!("{context}: {err}"))
-}
-
 fn detect_wasm_type(wasm_bytes: &[u8]) -> Result<WasmType> {
     let engine = Engine::default();
-    let module = wasmtime_result(
-        Module::new(&engine, wasm_bytes),
-        "Failed to parse WASM module",
-    )?;
+    let module = Module::new(&engine, wasm_bytes)
+        .map_err(|err| anyhow::anyhow!("Failed to parse WASM module: {err}"))?;
 
-    // Check for new N-dimensional ABI first
-    let has_sample = module.exports().any(|e| e.name() == "sample");
-    let has_get_dimensions = module.exports().any(|e| e.name() == "get_dimensions");
-    // Legacy ABI
-    let has_is_inside = module.exports().any(|e| e.name() == "is_inside");
-    let has_get_metadata = module.exports().any(|e| e.name() == "get_metadata");
+    let has_export = |name: &str| module.exports().any(|e| e.name() == name);
 
-    if (has_sample && has_get_dimensions) || has_is_inside {
+    if has_export("sample")
+        && has_export("get_dimensions")
+        && has_export("get_io_ptr")
+        && has_export("memory")
+    {
         Ok(WasmType::Model)
-    } else if has_get_metadata {
+    } else if has_export("get_metadata") && has_export("run") {
         Ok(WasmType::Operator)
     } else {
         Ok(WasmType::Unknown)
     }
 }
 
-// === Bounds ===
+// === Model inspection via ModelExecutor ===
 
+/// Per-dimension bounds of an N-dimensional model.
 #[derive(Debug, Clone, Serialize)]
-pub struct Bounds {
-    pub min: [f64; 3],
-    pub max: [f64; 3],
+pub struct BoundsNd {
+    pub min: Vec<f64>,
+    pub max: Vec<f64>,
 }
 
-impl Bounds {
-    pub fn dimensions(&self) -> [f64; 3] {
-        [
-            self.max[0] - self.min[0],
-            self.max[1] - self.min[1],
-            self.max[2] - self.min[2],
-        ]
+impl BoundsNd {
+    pub fn size(&self) -> Vec<f64> {
+        self.min
+            .iter()
+            .zip(&self.max)
+            .map(|(lo, hi)| hi - lo)
+            .collect()
+    }
+
+    fn format_tuple(values: &[f64]) -> String {
+        let parts: Vec<String> = values.iter().map(|v| format!("{v:.3}")).collect();
+        format!("({})", parts.join(", "))
     }
 }
 
-/// Get bounds using the legacy ABI (separate get_bounds_min_x etc. functions)
-fn get_model_bounds_legacy(store: &mut Store<()>, instance: &Instance) -> Result<Bounds> {
-    let min_x_func = wasmtime_result(
-        instance.get_typed_func::<(), f64>(&mut *store, "get_bounds_min_x"),
-        "Missing get_bounds_min_x export",
-    )?;
-    let min_x = wasmtime_result(
-        min_x_func.call(&mut *store, ()),
-        "get_bounds_min_x call failed",
-    )?;
-    let min_y_func = wasmtime_result(
-        instance.get_typed_func::<(), f64>(&mut *store, "get_bounds_min_y"),
-        "Missing get_bounds_min_y export",
-    )?;
-    let min_y = wasmtime_result(
-        min_y_func.call(&mut *store, ()),
-        "get_bounds_min_y call failed",
-    )?;
-    let min_z_func = wasmtime_result(
-        instance.get_typed_func::<(), f64>(&mut *store, "get_bounds_min_z"),
-        "Missing get_bounds_min_z export",
-    )?;
-    let min_z = wasmtime_result(
-        min_z_func.call(&mut *store, ()),
-        "get_bounds_min_z call failed",
-    )?;
-    let max_x_func = wasmtime_result(
-        instance.get_typed_func::<(), f64>(&mut *store, "get_bounds_max_x"),
-        "Missing get_bounds_max_x export",
-    )?;
-    let max_x = wasmtime_result(
-        max_x_func.call(&mut *store, ()),
-        "get_bounds_max_x call failed",
-    )?;
-    let max_y_func = wasmtime_result(
-        instance.get_typed_func::<(), f64>(&mut *store, "get_bounds_max_y"),
-        "Missing get_bounds_max_y export",
-    )?;
-    let max_y = wasmtime_result(
-        max_y_func.call(&mut *store, ()),
-        "get_bounds_max_y call failed",
-    )?;
-    let max_z_func = wasmtime_result(
-        instance.get_typed_func::<(), f64>(&mut *store, "get_bounds_max_z"),
-        "Missing get_bounds_max_z export",
-    )?;
-    let max_z = wasmtime_result(
-        max_z_func.call(&mut *store, ()),
-        "get_bounds_max_z call failed",
-    )?;
-
-    Ok(Bounds {
-        min: [min_x, min_y, min_z],
-        max: [max_x, max_y, max_z],
-    })
+#[derive(Debug, Serialize)]
+struct ChannelInfo {
+    name: String,
+    kind: String,
 }
 
-/// Get bounds using the N-dimensional ABI (get_bounds(out_ptr) with memory)
-fn get_model_bounds_nd(store: &mut Store<()>, instance: &Instance) -> Result<(u32, Bounds)> {
-    let memory = instance
-        .get_memory(&mut *store, "memory")
-        .context("Missing memory export")?;
+fn channel_kind_name(kind: &volumetric_abi::ChannelKind) -> String {
+    match kind {
+        volumetric_abi::ChannelKind::Occupancy => "occupancy".to_string(),
+        volumetric_abi::ChannelKind::Density => "density".to_string(),
+        volumetric_abi::ChannelKind::Custom(name) => format!("custom:{name}"),
+    }
+}
 
-    let get_dimensions = wasmtime_result(
-        instance.get_typed_func::<(), u32>(&mut *store, "get_dimensions"),
-        "Missing get_dimensions export",
-    )?;
+/// Everything `info` and `bounds` report about a model, gathered in one
+/// executor instantiation.
+struct ModelReport {
+    dimensions: u32,
+    bounds: BoundsNd,
+    channels: Vec<ChannelInfo>,
+}
 
-    let get_bounds = wasmtime_result(
-        instance.get_typed_func::<i32, ()>(&mut *store, "get_bounds"),
-        "Missing get_bounds export",
-    )?;
+fn inspect_model(wasm_bytes: &[u8]) -> Result<ModelReport> {
+    let mut executor = create_model_executor(wasm_bytes).context("Failed to instantiate model")?;
 
-    let get_io_ptr = wasmtime_result(
-        instance.get_typed_func::<(), i32>(&mut *store, "get_io_ptr"),
-        "Missing get_io_ptr export",
-    )?;
-
-    let dimensions = wasmtime_result(
-        get_dimensions.call(&mut *store, ()),
-        "get_dimensions call failed",
-    )?;
-
-    // Ask the model where its IO buffer lives
-    let io_ptr = wasmtime_result(get_io_ptr.call(&mut *store, ()), "get_io_ptr call failed")?;
-
-    // Call get_bounds to write bounds into the IO buffer
-    wasmtime_result(
-        get_bounds.call(&mut *store, io_ptr),
-        "get_bounds call failed",
-    )?;
-
-    // Read bounds from memory (interleaved: min_x, max_x, min_y, max_y, ...)
-    let mut bounds_data = vec![0u8; (dimensions as usize) * 2 * 8];
-    memory
-        .read(&mut *store, io_ptr as usize, &mut bounds_data)
-        .context("Failed to read bounds from memory")?;
-
-    // Parse interleaved bounds - for 3D: [min_x, max_x, min_y, max_y, min_z, max_z]
-    let min_x = if dimensions >= 1 {
-        f64::from_le_bytes(bounds_data[0..8].try_into().unwrap())
-    } else {
-        0.0
+    let dimensions = executor.dimensions().context("get_dimensions failed")?;
+    let nd = executor.get_bounds_nd().context("get_bounds failed")?;
+    let bounds = BoundsNd {
+        min: (0..nd.dimensions()).map(|d| nd.min(d)).collect(),
+        max: (0..nd.dimensions()).map(|d| nd.max(d)).collect(),
     };
-    let max_x = if dimensions >= 1 {
-        f64::from_le_bytes(bounds_data[8..16].try_into().unwrap())
-    } else {
-        0.0
-    };
-    let min_y = if dimensions >= 2 {
-        f64::from_le_bytes(bounds_data[16..24].try_into().unwrap())
-    } else {
-        0.0
-    };
-    let max_y = if dimensions >= 2 {
-        f64::from_le_bytes(bounds_data[24..32].try_into().unwrap())
-    } else {
-        0.0
-    };
-    let min_z = if dimensions >= 3 {
-        f64::from_le_bytes(bounds_data[32..40].try_into().unwrap())
-    } else {
-        0.0
-    };
-    let max_z = if dimensions >= 3 {
-        f64::from_le_bytes(bounds_data[40..48].try_into().unwrap())
-    } else {
-        0.0
-    };
+    let format = executor
+        .sample_format()
+        .context("get_sample_format failed")?;
+    let channels = format
+        .channels
+        .iter()
+        .map(|c| ChannelInfo {
+            name: c.name.clone(),
+            kind: channel_kind_name(&c.kind),
+        })
+        .collect();
 
-    Ok((
+    Ok(ModelReport {
         dimensions,
-        Bounds {
-            min: [min_x, min_y, min_z],
-            max: [max_x, max_y, max_z],
-        },
-    ))
-}
-
-fn get_model_bounds(wasm_bytes: &[u8]) -> Result<Bounds> {
-    let engine = Engine::default();
-    let module = wasmtime_result(
-        Module::new(&engine, wasm_bytes),
-        "Failed to parse WASM module",
-    )?;
-    let mut store = Store::new(&engine, ());
-    let instance = wasmtime_result(
-        Instance::new(&mut store, &module, &[]),
-        "Failed to instantiate WASM module",
-    )?;
-
-    let abi_version = detect_model_abi(&module);
-
-    match abi_version {
-        ModelAbiVersion::Nd => {
-            let (_, bounds) = get_model_bounds_nd(&mut store, &instance)?;
-            Ok(bounds)
-        }
-        ModelAbiVersion::Legacy => get_model_bounds_legacy(&mut store, &instance),
-    }
-}
-
-/// Get model bounds along with ABI version info
-fn get_model_bounds_with_abi(wasm_bytes: &[u8]) -> Result<(ModelAbiVersion, u32, Bounds)> {
-    let engine = Engine::default();
-    let module = wasmtime_result(
-        Module::new(&engine, wasm_bytes),
-        "Failed to parse WASM module",
-    )?;
-    let mut store = Store::new(&engine, ());
-    let instance = wasmtime_result(
-        Instance::new(&mut store, &module, &[]),
-        "Failed to instantiate WASM module",
-    )?;
-
-    let abi_version = detect_model_abi(&module);
-
-    match abi_version {
-        ModelAbiVersion::Nd => {
-            let (dims, bounds) = get_model_bounds_nd(&mut store, &instance)?;
-            Ok((abi_version, dims, bounds))
-        }
-        ModelAbiVersion::Legacy => {
-            let bounds = get_model_bounds_legacy(&mut store, &instance)?;
-            Ok((abi_version, 3, bounds))
-        }
-    }
-}
-
-// === Sampling ===
-
-/// Sample using the legacy ABI (is_inside(x, y, z) -> f32)
-fn sample_model_legacy(
-    store: &mut Store<()>,
-    instance: &Instance,
-    points: &[(f64, f64, f64)],
-) -> Result<Vec<f32>> {
-    let is_inside = wasmtime_result(
-        instance.get_typed_func::<(f64, f64, f64), f32>(&mut *store, "is_inside"),
-        "Missing is_inside export",
-    )?;
-
-    let mut results = Vec::with_capacity(points.len());
-    for &(x, y, z) in points {
-        let value = wasmtime_result(
-            is_inside.call(&mut *store, (x, y, z)),
-            "is_inside call failed",
-        )?;
-        results.push(value);
-    }
-    Ok(results)
-}
-
-/// Sample using the N-dimensional ABI (sample(pos_ptr) -> f32 with memory)
-fn sample_model_nd(
-    store: &mut Store<()>,
-    instance: &Instance,
-    points: &[(f64, f64, f64)],
-) -> Result<Vec<f32>> {
-    let memory = instance
-        .get_memory(&mut *store, "memory")
-        .context("Missing memory export")?;
-
-    let sample = wasmtime_result(
-        instance.get_typed_func::<i32, f32>(&mut *store, "sample"),
-        "Missing sample export",
-    )?;
-
-    let get_io_ptr = wasmtime_result(
-        instance.get_typed_func::<(), i32>(&mut *store, "get_io_ptr"),
-        "Missing get_io_ptr export",
-    )?;
-    let io_ptr = wasmtime_result(get_io_ptr.call(&mut *store, ()), "get_io_ptr call failed")?;
-
-    let mut results = Vec::with_capacity(points.len());
-    for &(x, y, z) in points {
-        // Write position into the model's IO buffer
-        let mut pos_bytes = [0u8; 24];
-        pos_bytes[0..8].copy_from_slice(&x.to_le_bytes());
-        pos_bytes[8..16].copy_from_slice(&y.to_le_bytes());
-        pos_bytes[16..24].copy_from_slice(&z.to_le_bytes());
-
-        memory
-            .write(&mut *store, io_ptr as usize, &pos_bytes)
-            .context("Failed to write position to memory")?;
-
-        // Call sample
-        let value = wasmtime_result(sample.call(&mut *store, io_ptr), "sample call failed")?;
-        results.push(value);
-    }
-
-    Ok(results)
-}
-
-fn sample_model(wasm_bytes: &[u8], points: &[(f64, f64, f64)]) -> Result<Vec<f32>> {
-    let engine = Engine::default();
-    let module = wasmtime_result(
-        Module::new(&engine, wasm_bytes),
-        "Failed to parse WASM module",
-    )?;
-    let mut store = Store::new(&engine, ());
-    let instance = wasmtime_result(
-        Instance::new(&mut store, &module, &[]),
-        "Failed to instantiate WASM module",
-    )?;
-
-    let abi_version = detect_model_abi(&module);
-
-    match abi_version {
-        ModelAbiVersion::Nd => sample_model_nd(&mut store, &instance, points),
-        ModelAbiVersion::Legacy => sample_model_legacy(&mut store, &instance, points),
-    }
-}
-
-fn parse_point(s: &str) -> Result<(f64, f64, f64)> {
-    let parts: Vec<&str> = s.split(',').collect();
-    if parts.len() != 3 {
-        anyhow::bail!("Point must have exactly 3 coordinates: x,y,z");
-    }
-    let x: f64 = parts[0]
-        .trim()
-        .parse()
-        .context("Failed to parse x coordinate")?;
-    let y: f64 = parts[1]
-        .trim()
-        .parse()
-        .context("Failed to parse y coordinate")?;
-    let z: f64 = parts[2]
-        .trim()
-        .parse()
-        .context("Failed to parse z coordinate")?;
-    Ok((x, y, z))
+        bounds,
+        channels,
+    })
 }
 
 // === Info Subcommand ===
@@ -420,10 +148,10 @@ pub struct InfoArgs {
 enum InfoOutput {
     Model {
         file_size: usize,
-        abi_version: ModelAbiVersion,
-        model_dimensions: u32,
-        bounds: Bounds,
-        size_dimensions: [f64; 3],
+        dimensions: u32,
+        bounds: BoundsNd,
+        size: Vec<f64>,
+        channels: Vec<ChannelInfo>,
     },
     Operator {
         file_size: usize,
@@ -434,6 +162,7 @@ enum InfoOutput {
         imports: Vec<ImportInfo>,
         timeline: Vec<TimelineStepInfo>,
         exports: Vec<String>,
+        issues: Vec<String>,
     },
     Unknown {
         file_size: usize,
@@ -539,11 +268,18 @@ fn get_project_info(project: &Project) -> Result<InfoOutput> {
         })
         .collect();
 
+    let issues = project
+        .validate()
+        .into_iter()
+        .map(|i| i.to_string())
+        .collect();
+
     Ok(InfoOutput::Project {
         version: project.version,
         imports,
         timeline,
         exports: project.exports().to_vec(),
+        issues,
     })
 }
 
@@ -551,28 +287,25 @@ fn print_info_human(output: &InfoOutput) {
     match output {
         InfoOutput::Model {
             file_size,
-            abi_version,
-            model_dimensions,
+            dimensions,
             bounds,
-            size_dimensions,
+            size,
+            channels,
         } => {
             println!("=== Model Info ===");
-            println!("Type: Model");
+            println!("Type: Model ({}D)", dimensions);
             println!("File size: {} bytes", file_size);
-            println!("ABI: {} ({}D)", abi_version, model_dimensions);
             println!(
-                "Bounds: ({:.3}, {:.3}, {:.3}) to ({:.3}, {:.3}, {:.3})",
-                bounds.min[0],
-                bounds.min[1],
-                bounds.min[2],
-                bounds.max[0],
-                bounds.max[1],
-                bounds.max[2]
+                "Bounds: {} to {}",
+                BoundsNd::format_tuple(&bounds.min),
+                BoundsNd::format_tuple(&bounds.max)
             );
-            println!(
-                "Size: {:.3} x {:.3} x {:.3}",
-                size_dimensions[0], size_dimensions[1], size_dimensions[2]
-            );
+            let size_parts: Vec<String> = size.iter().map(|v| format!("{v:.3}")).collect();
+            println!("Size: {}", size_parts.join(" x "));
+            println!("Channels ({}):", channels.len());
+            for (i, c) in channels.iter().enumerate() {
+                println!("  [{}] {} ({})", i, c.name, c.kind);
+            }
         }
         InfoOutput::Operator {
             file_size,
@@ -622,6 +355,7 @@ fn print_info_human(output: &InfoOutput) {
             imports,
             timeline,
             exports,
+            issues,
         } => {
             println!("=== Project Info (v{}) ===", version);
             println!();
@@ -642,6 +376,13 @@ fn print_info_human(output: &InfoOutput) {
             println!("Exports ({}):", exports.len());
             for id in exports {
                 println!("  {}", id);
+            }
+            if !issues.is_empty() {
+                println!();
+                println!("Issues ({}):", issues.len());
+                for issue in issues {
+                    println!("  {}", issue);
+                }
             }
         }
         InfoOutput::Unknown { file_size, message } => {
@@ -668,14 +409,13 @@ pub fn run_info(args: InfoArgs) -> Result<()> {
 
             match wasm_type {
                 WasmType::Model => {
-                    let (abi_version, model_dims, bounds) = get_model_bounds_with_abi(&wasm_bytes)?;
-                    let size_dimensions = bounds.dimensions();
+                    let report = inspect_model(&wasm_bytes)?;
                     InfoOutput::Model {
                         file_size: wasm_bytes.len(),
-                        abi_version,
-                        model_dimensions: model_dims,
-                        bounds,
-                        size_dimensions,
+                        dimensions: report.dimensions,
+                        size: report.bounds.size(),
+                        bounds: report.bounds,
+                        channels: report.channels,
                     }
                 }
                 WasmType::Operator => {
@@ -688,7 +428,10 @@ pub fn run_info(args: InfoArgs) -> Result<()> {
                 }
                 WasmType::Unknown => InfoOutput::Unknown {
                     file_size: wasm_bytes.len(),
-                    message: "WASM file does not appear to be a model or operator".to_string(),
+                    message: "WASM file exports neither the N-dimensional model ABI \
+                              (sample/get_bounds/get_dimensions/get_io_ptr/memory) nor the \
+                              operator ABI (run/get_metadata)"
+                        .to_string(),
                 },
             }
         }
@@ -725,6 +468,10 @@ pub struct BoundsArgs {
     #[arg(short, long)]
     pub input: PathBuf,
 
+    /// For .vproj inputs with multiple exports: which exported asset to use
+    #[arg(long)]
+    pub asset: Option<String>,
+
     /// Output as JSON
     #[arg(long)]
     pub json: bool,
@@ -732,46 +479,39 @@ pub struct BoundsArgs {
 
 #[derive(Debug, Serialize)]
 struct BoundsOutput {
-    bounds: Bounds,
-    dimensions: [f64; 3],
-}
-
-fn print_bounds_human(bounds: &Bounds) {
-    let dims = bounds.dimensions();
-    println!(
-        "Bounds: ({:.3}, {:.3}, {:.3}) to ({:.3}, {:.3}, {:.3})",
-        bounds.min[0], bounds.min[1], bounds.min[2], bounds.max[0], bounds.max[1], bounds.max[2]
-    );
-    println!(
-        "Dimensions: {:.3} x {:.3} x {:.3}",
-        dims[0], dims[1], dims[2]
-    );
+    dimensions: u32,
+    bounds: BoundsNd,
+    size: Vec<f64>,
 }
 
 pub fn run_bounds(args: BoundsArgs) -> Result<()> {
-    let wasm_bytes = crate::load_wasm_bytes(&args.input)?;
-    let wasm_type = detect_wasm_type(&wasm_bytes)?;
-
-    if wasm_type != WasmType::Model {
-        anyhow::bail!(
-            "Input is not a model (detected type: {}). Cannot query bounds.",
-            wasm_type
-        );
-    }
-
-    let bounds = get_model_bounds(&wasm_bytes)?;
+    let wasm_bytes = crate::load_wasm_bytes(&args.input, args.asset.as_deref())?;
+    let report = inspect_model(&wasm_bytes)?;
 
     if args.json {
         let output = BoundsOutput {
-            dimensions: bounds.dimensions(),
-            bounds,
+            dimensions: report.dimensions,
+            size: report.bounds.size(),
+            bounds: report.bounds,
         };
         println!(
             "{}",
             serde_json::to_string_pretty(&output).context("Failed to serialize to JSON")?
         );
     } else {
-        print_bounds_human(&bounds);
+        println!("Dimensions: {}D", report.dimensions);
+        println!(
+            "Bounds: {} to {}",
+            BoundsNd::format_tuple(&report.bounds.min),
+            BoundsNd::format_tuple(&report.bounds.max)
+        );
+        let size_parts: Vec<String> = report
+            .bounds
+            .size()
+            .iter()
+            .map(|v| format!("{v:.3}"))
+            .collect();
+        println!("Size: {}", size_parts.join(" x "));
     }
 
     Ok(())
@@ -785,7 +525,12 @@ pub struct SampleArgs {
     #[arg(short, long)]
     pub input: PathBuf,
 
-    /// Points to sample as "x,y,z" (can specify multiple)
+    /// For .vproj inputs with multiple exports: which exported asset to use
+    #[arg(long)]
+    pub asset: Option<String>,
+
+    /// Points to sample as comma-separated coordinates matching the model's
+    /// dimensionality: "x,y" for a 2D sketch, "x,y,z" for a volume
     #[arg(short, long)]
     pub point: Vec<String>,
 
@@ -796,22 +541,25 @@ pub struct SampleArgs {
 
 #[derive(Debug, Serialize)]
 struct SampleOutput {
+    dimensions: u32,
     samples: Vec<SampleResult>,
 }
 
 #[derive(Debug, Serialize)]
 struct SampleResult {
-    point: [f64; 3],
+    point: Vec<f64>,
     value: f32,
+    occupied: bool,
 }
 
-fn print_samples_human(points: &[(f64, f64, f64)], values: &[f32]) {
-    for (point, value) in points.iter().zip(values.iter()) {
-        println!(
-            "({:.3}, {:.3}, {:.3}) -> {:.6}",
-            point.0, point.1, point.2, value
-        );
-    }
+fn parse_point(s: &str) -> Result<Vec<f64>> {
+    s.split(',')
+        .map(|part| {
+            part.trim()
+                .parse::<f64>()
+                .with_context(|| format!("Failed to parse coordinate '{}'", part.trim()))
+        })
+        .collect()
 }
 
 pub fn run_sample(args: SampleArgs) -> Result<()> {
@@ -819,43 +567,70 @@ pub fn run_sample(args: SampleArgs) -> Result<()> {
         anyhow::bail!("At least one point must be specified with -p/--point");
     }
 
-    let wasm_bytes = crate::load_wasm_bytes(&args.input)?;
-    let wasm_type = detect_wasm_type(&wasm_bytes)?;
+    let wasm_bytes = crate::load_wasm_bytes(&args.input, args.asset.as_deref())?;
 
-    if wasm_type != WasmType::Model {
-        anyhow::bail!(
-            "Input is not a model (detected type: {}). Cannot sample.",
-            wasm_type
-        );
-    }
-
-    let points: Vec<(f64, f64, f64)> = args
+    let points: Vec<Vec<f64>> = args
         .point
         .iter()
         .enumerate()
         .map(|(i, s)| parse_point(s).with_context(|| format!("Invalid point at index {}", i)))
         .collect::<Result<_>>()?;
 
-    let values = sample_model(&wasm_bytes, &points)?;
+    let mut executor = create_model_executor(&wasm_bytes).context("Failed to instantiate model")?;
+    let dimensions = executor.dimensions().context("get_dimensions failed")?;
+
+    for point in &points {
+        if point.len() != dimensions as usize {
+            anyhow::bail!(
+                "model is {}D but point {} has {} coordinate(s)",
+                dimensions,
+                BoundsNd::format_tuple(point),
+                point.len()
+            );
+        }
+    }
+
+    let mut samples = Vec::with_capacity(points.len());
+    for point in points {
+        let value = executor.sample_nd(&point).context("sample failed")?;
+        samples.push(SampleResult {
+            point,
+            value,
+            occupied: volumetric_abi::is_occupied(value),
+        });
+    }
 
     if args.json {
         let output = SampleOutput {
-            samples: points
-                .iter()
-                .zip(values.iter())
-                .map(|((x, y, z), v)| SampleResult {
-                    point: [*x, *y, *z],
-                    value: *v,
-                })
-                .collect(),
+            dimensions,
+            samples,
         };
         println!(
             "{}",
             serde_json::to_string_pretty(&output).context("Failed to serialize to JSON")?
         );
     } else {
-        print_samples_human(&points, &values);
+        for s in &samples {
+            println!(
+                "{} -> {:.6} ({})",
+                BoundsNd::format_tuple(&s.point),
+                s.value,
+                if s.occupied { "inside" } else { "outside" }
+            );
+        }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn points_parse_at_any_arity() {
+        assert_eq!(parse_point("1,2").unwrap(), vec![1.0, 2.0]);
+        assert_eq!(parse_point(" 1 , 2 , 3 ").unwrap(), vec![1.0, 2.0, 3.0]);
+        assert!(parse_point("1,two").is_err());
+    }
 }
