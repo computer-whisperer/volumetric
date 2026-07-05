@@ -19,6 +19,7 @@
 //!   cylinder) before it is believed; planar-only results overfit.
 
 pub mod adjacency;
+pub mod cleanup;
 pub mod fit;
 pub mod harness;
 pub mod oracle;

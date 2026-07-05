@@ -222,6 +222,155 @@ impl OracleShape for CylinderShape {
 }
 
 // =============================================================================
+// Polygon prism (concave features)
+// =============================================================================
+
+/// Prism along Z over an arbitrary simple polygon cross-section (CCW winding).
+/// Concave polygon vertices produce concave (reentrant) prism edges — the
+/// feature class the box and cylinder cannot exercise.
+///
+/// Face ids: side face `i` spans polygon edge `points[i] -> points[i+1]`;
+/// the top cap is `n`, the bottom cap `n + 1`.
+pub struct PolygonPrism {
+    pub points: Vec<glam::DVec2>,
+    pub half_height: f64,
+}
+
+impl PolygonPrism {
+    /// An L cross-section (one reentrant corner) spanning roughly [-s, s].
+    pub fn l_shape(s: f64, half_height: f64) -> Self {
+        let p = |x: f64, y: f64| glam::DVec2::new(x * s, y * s);
+        Self {
+            points: vec![
+                p(-1.0, -1.0),
+                p(1.0, -1.0),
+                p(1.0, 0.0),
+                p(0.0, 0.0), // reentrant corner
+                p(0.0, 1.0),
+                p(-1.0, 1.0),
+            ],
+            half_height,
+        }
+    }
+
+    fn inside_2d(&self, q: glam::DVec2) -> bool {
+        // Even-odd ray casting.
+        let n = self.points.len();
+        let mut inside = false;
+        for i in 0..n {
+            let a = self.points[i];
+            let b = self.points[(i + 1) % n];
+            if (a.y > q.y) != (b.y > q.y) {
+                let x_cross = a.x + (q.y - a.y) / (b.y - a.y) * (b.x - a.x);
+                if q.x < x_cross {
+                    inside = !inside;
+                }
+            }
+        }
+        inside
+    }
+
+    /// Nearest polygon edge to `q`: (edge index, closest point on it).
+    fn nearest_edge_2d(&self, q: glam::DVec2) -> (usize, glam::DVec2) {
+        let n = self.points.len();
+        let mut best = (0usize, self.points[0], f64::INFINITY);
+        for i in 0..n {
+            let a = self.points[i];
+            let b = self.points[(i + 1) % n];
+            let ab = b - a;
+            let t = ((q - a).dot(ab) / ab.length_squared()).clamp(0.0, 1.0);
+            let closest = a + ab * t;
+            let d = (q - closest).length();
+            if d < best.2 {
+                best = (i, closest, d);
+            }
+        }
+        (best.0, best.1)
+    }
+}
+
+impl OracleShape for PolygonPrism {
+    fn name(&self) -> String {
+        format!(
+            "polygon prism ({} verts) h={}",
+            self.points.len(),
+            2.0 * self.half_height
+        )
+    }
+
+    fn is_inside(&self, p: DVec3) -> bool {
+        p.z.abs() <= self.half_height && self.inside_2d(glam::DVec2::new(p.x, p.y))
+    }
+
+    fn truth(&self, p: DVec3) -> SurfaceTruth {
+        let n = self.points.len();
+        let h = self.half_height;
+        let q = glam::DVec2::new(p.x, p.y);
+        let inside_2d = self.inside_2d(q);
+        let (edge_idx, boundary_2d) = self.nearest_edge_2d(q);
+        let d_boundary_2d = (q - boundary_2d).length();
+
+        // Outward normal of the nearest side face (CCW polygon: outward is
+        // the right-hand perpendicular of the edge direction).
+        let a = self.points[edge_idx];
+        let b = self.points[(edge_idx + 1) % n];
+        let dir = (b - a).normalize();
+        let side_normal = DVec3::new(dir.y, -dir.x, 0.0);
+
+        // Signed distances to the side wall and cap planes (negative inside).
+        let d_side = if inside_2d {
+            -d_boundary_2d
+        } else {
+            d_boundary_2d
+        };
+        let d_cap = p.z.abs() - h;
+
+        let (normal, closest, face_id) = if d_side >= d_cap {
+            let closest = DVec3::new(boundary_2d.x, boundary_2d.y, p.z.clamp(-h, h));
+            (side_normal, closest, edge_idx as u32)
+        } else {
+            let sign = if p.z >= 0.0 { 1.0 } else { -1.0 };
+            let q_on_cap = if inside_2d { q } else { boundary_2d };
+            let closest = DVec3::new(q_on_cap.x, q_on_cap.y, sign * h);
+            let face_id = if sign > 0.0 { n as u32 } else { n as u32 + 1 };
+            (DVec3::new(0.0, 0.0, sign), closest, face_id)
+        };
+
+        // Sharp features: vertical edges at every polygon vertex (convex and
+        // reentrant alike) and the cap rim above every polygon edge.
+        let mut dist_to_sharp = f64::INFINITY;
+        for i in 0..n {
+            let v = self.points[i];
+            let d2 = (q - v).length();
+            let dz = (p.z.abs() - h).max(0.0);
+            dist_to_sharp = dist_to_sharp.min((d2 * d2 + dz * dz).sqrt());
+        }
+        let rim = (d_boundary_2d * d_boundary_2d + (p.z.abs() - h) * (p.z.abs() - h)).sqrt();
+        dist_to_sharp = dist_to_sharp.min(rim);
+
+        SurfaceTruth {
+            normal,
+            closest,
+            face_id,
+            dist_to_sharp,
+        }
+    }
+
+    fn world_bounds(&self) -> (DVec3, DVec3) {
+        let mut lo = glam::DVec2::splat(f64::INFINITY);
+        let mut hi = glam::DVec2::splat(f64::NEG_INFINITY);
+        for &p in &self.points {
+            lo = lo.min(p);
+            hi = hi.max(p);
+        }
+        (
+            DVec3::new(lo.x, lo.y, -self.half_height),
+            DVec3::new(hi.x, hi.y, self.half_height),
+        )
+    }
+}
+
+// =============================================================================
 // Mandelbulb (pathological control -- NO analytic truth)
 // =============================================================================
 
@@ -499,6 +648,48 @@ mod tests {
         let t = cyl.truth(DVec3::new(0.39, 0.0, 0.0));
         assert!((t.dist_to_sharp - (0.01f64 * 0.01 + 0.25).sqrt()).abs() < 1e-9);
         assert_eq!(t.face_id, 0);
+    }
+
+    #[test]
+    fn l_prism_truth_is_consistent_with_sampler() {
+        check_sampler_truth_consistency(&PolygonPrism::l_shape(0.5, 0.4), 1e-4);
+    }
+
+    #[test]
+    fn rotated_l_prism_truth_is_consistent_with_sampler() {
+        check_sampler_truth_consistency(
+            &Rotated::new(PolygonPrism::l_shape(0.5, 0.4), standard_rotation()),
+            1e-4,
+        );
+    }
+
+    #[test]
+    fn l_prism_reentrant_corner_is_sharp() {
+        let prism = PolygonPrism::l_shape(0.5, 0.4);
+        // The reentrant corner sits at the origin of the cross-section.
+        let t = prism.truth(DVec3::new(0.0, 0.0, 0.1));
+        assert!(t.dist_to_sharp < 1e-12, "reentrant corner not detected");
+        // Just inside the notch, next to the vertical face at x = 0
+        // (polygon edge (0,0) -> (0,0.5), outward normal +X).
+        let t = prism.truth(DVec3::new(-0.02, 0.2, 0.0));
+        assert_eq!(t.face_id, 3);
+        assert!((t.normal - DVec3::X).length() < 1e-12);
+        assert!(prism.is_inside(DVec3::new(-0.02, 0.2, 0.0)));
+        assert!(!prism.is_inside(DVec3::new(0.02, 0.2, 0.0)));
+    }
+
+    #[test]
+    fn l_shape_polygon_is_ccw() {
+        let prism = PolygonPrism::l_shape(1.0, 0.5);
+        let n = prism.points.len();
+        let shoelace: f64 = (0..n)
+            .map(|i| {
+                let a = prism.points[i];
+                let b = prism.points[(i + 1) % n];
+                a.x * b.y - b.x * a.y
+            })
+            .sum();
+        assert!(shoelace > 0.0, "polygon must wind CCW");
     }
 
     #[test]

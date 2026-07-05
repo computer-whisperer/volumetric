@@ -11,13 +11,17 @@
 //! Usage: snap_bench [depth...] [--render <dir>]
 
 use glam::{DQuat, DVec3};
-use meshing_lab::harness::{MeshedShape, mesh_shape};
+use meshing_lab::cleanup::{
+    CleanupConfig, boundary_edge_count, inward_facing_count, weld_snapped_vertices,
+};
+use meshing_lab::harness::mesh_shape;
 use meshing_lab::oracle::{
-    BoxShape, CylinderShape, MandelbulbShape, OracleShape, Rotated, SphereShape, standard_rotation,
+    BoxShape, CylinderShape, MandelbulbShape, OracleShape, PolygonPrism, Rotated, SphereShape,
+    standard_rotation,
 };
 use meshing_lab::render::{render_plain, render_segments};
 use meshing_lab::segmentation::{SegmentationConfig, segment_regions};
-use meshing_lab::snap::{SnapConfig, SnapKind, SnapResult, snap_feature_vertices};
+use meshing_lab::snap::{SnapConfig, SnapKind, snap_feature_vertices};
 use std::path::PathBuf;
 
 fn main() {
@@ -62,6 +66,11 @@ fn main() {
                 rot,
             )),
             "cylinder",
+            true,
+        ),
+        (
+            Box::new(Rotated::new(PolygonPrism::l_shape(0.5, 0.4), rot)),
+            "lprism",
             true,
         ),
         (
@@ -196,21 +205,57 @@ fn run_case(
         }
     }
 
+    // -------- Cleanup: weld the collapsed band --------
+    let cleaned = weld_snapped_vertices(
+        &result.positions,
+        &m.indices,
+        &result.snapped,
+        m.cell,
+        &CleanupConfig::default(),
+    );
+    // Carry outward reference normals through the remap; cluster members
+    // agree in orientation, so summing is safe.
+    let mut cleaned_normals: Vec<DVec3> = vec![DVec3::ZERO; cleaned.positions.len()];
+    for v in 0..m.positions.len() {
+        cleaned_normals[cleaned.remap[v] as usize] += m.mesh_normals[v];
+    }
+    println!(
+        "  cleanup: welded {} vertices, dropped {} triangles",
+        cleaned.welded_vertices, cleaned.dropped_triangles
+    );
+
     // -------- Validity (all shapes) --------
     let moves: Vec<f64> = (0..m.positions.len())
         .filter(|&v| result.snapped[v].is_some())
         .map(|v| (result.positions[v] - m.positions[v]).length() / m.cell)
         .collect();
-    let nonfinite = result.positions.iter().filter(|p| !p.is_finite()).count();
-    let (flipped, degenerate) = triangle_damage(&m, &result);
+    let nonfinite = cleaned.positions.iter().filter(|p| !p.is_finite()).count();
+    let boundary_before = boundary_edge_count(&m.indices);
+    let boundary_after = boundary_edge_count(&cleaned.indices);
+    // Winding damage among triangles big enough for their normal to mean
+    // anything (>= 1% of a cell face); sub-sliver normals are noise.
+    let min_area = 0.01 * m.cell * m.cell;
+    let inward_before = inward_facing_count(&m.positions, &m.indices, &m.mesh_normals, min_area);
+    let inward_after = inward_facing_count(
+        &cleaned.positions,
+        &cleaned.indices,
+        &cleaned_normals,
+        min_area,
+    );
+    let degenerate_before = degenerate_count(&m.positions, &m.indices, m.cell);
+    let degenerate_after = degenerate_count(&cleaned.positions, &cleaned.indices, m.cell);
     println!(
-        "  validity: moves med {:.3} max {:.3} cells | non-finite {} | flipped tris {} | degenerate tris {} (of {})",
+        "  validity: moves med {:.3} max {:.3} cells | non-finite {} | boundary edges {} -> {} | inward-facing {} -> {} | degenerate {} -> {} (of {})",
         median(&moves),
         moves.iter().copied().fold(0.0, f64::max),
         nonfinite,
-        flipped,
-        degenerate,
-        m.indices.len() / 3
+        boundary_before,
+        boundary_after,
+        inward_before,
+        inward_after,
+        degenerate_before,
+        degenerate_after,
+        cleaned.indices.len() / 3
     );
 
     if let Some(dir) = render_dir {
@@ -218,12 +263,18 @@ fn run_case(
         let before = dir.join(format!("{}_d{}_before.png", slug, max_depth));
         let after = dir.join(format!("{}_d{}_after.png", slug, max_depth));
         render_plain(&m.positions, &m.indices, bounds, &before);
-        render_plain(&result.positions, &m.indices, bounds, &after);
+        render_plain(&cleaned.positions, &cleaned.indices, bounds, &after);
+        let mut cleaned_labels: Vec<Option<u32>> = vec![None; cleaned.positions.len()];
+        for v in 0..m.positions.len() {
+            if let Some(l) = seg.labels[v] {
+                cleaned_labels[cleaned.remap[v] as usize] = Some(l);
+            }
+        }
         let segments = dir.join(format!("{}_d{}_after_segments.png", slug, max_depth));
         render_segments(
-            &result.positions,
-            &m.indices,
-            &seg.labels,
+            &cleaned.positions,
+            &cleaned.indices,
+            &cleaned_labels,
             bounds,
             &segments,
         );
@@ -236,28 +287,20 @@ fn run_case(
     }
 }
 
-/// Count triangles inverted (normal flipped past 90 degrees) or collapsed to
-/// near-zero area by snapping.
-fn triangle_damage(m: &MeshedShape, result: &SnapResult) -> (usize, usize) {
-    let mut flipped = 0;
-    let mut degenerate = 0;
-    let area_floor = 1e-6 * m.cell * m.cell;
-    for tri in m.indices.chunks_exact(3) {
-        let (a, b, c) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
-        if result.snapped[a].is_none() && result.snapped[b].is_none() && result.snapped[c].is_none()
-        {
-            continue;
-        }
-        let n_before = (m.positions[b] - m.positions[a]).cross(m.positions[c] - m.positions[a]);
-        let n_after = (result.positions[b] - result.positions[a])
-            .cross(result.positions[c] - result.positions[a]);
-        if n_after.length() / 2.0 < area_floor {
-            degenerate += 1;
-        } else if n_before.dot(n_after) < 0.0 {
-            flipped += 1;
-        }
-    }
-    (flipped, degenerate)
+/// Triangles with near-zero area (thin slivers left along feature lines).
+fn degenerate_count(positions: &[DVec3], indices: &[u32], cell: f64) -> usize {
+    let area_floor = 1e-6 * cell * cell;
+    indices
+        .chunks_exact(3)
+        .filter(|tri| {
+            let (a, b, c) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+            (positions[b] - positions[a])
+                .cross(positions[c] - positions[a])
+                .length()
+                / 2.0
+                < area_floor
+        })
+        .count()
 }
 
 fn percentile(values: &[f64], p: f64) -> f64 {
