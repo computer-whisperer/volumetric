@@ -15,3 +15,7 @@ path = "src/bin/patch_fit_bench.rs"
 [[bin]]
 name = "segment_bench"
 path = "src/bin/segment_bench.rs"
+
+[[bin]]
+name = "snap_bench"
+path = "src/bin/snap_bench.rs"

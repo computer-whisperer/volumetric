@@ -24,3 +24,4 @@ pub mod harness;
 pub mod oracle;
 pub mod render;
 pub mod segmentation;
+pub mod snap;

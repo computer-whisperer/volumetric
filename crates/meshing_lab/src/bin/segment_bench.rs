@@ -10,12 +10,12 @@
 //! Usage: segment_bench [depth...] [--render <dir>]
 
 use glam::DVec3;
-use meshing_lab::harness::{BUCKET_NAMES, MeshedShape, mesh_shape};
+use meshing_lab::harness::{BUCKET_NAMES, mesh_shape};
 use meshing_lab::oracle::{
     BoxShape, CylinderShape, OracleShape, Rotated, SphereShape, standard_rotation,
 };
-use meshing_lab::render::{RenderConfig, region_color, render_png};
-use meshing_lab::segmentation::{Segmentation, SegmentationConfig, segment_regions};
+use meshing_lab::render::render_segments;
+use meshing_lab::segmentation::{SegmentationConfig, segment_regions};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -203,32 +203,14 @@ fn run_case(
 
     if let Some(dir) = render_dir {
         let path = dir.join(format!("{}_d{}_segments.png", slug, max_depth));
-        render_segmentation(&m, &seg, &path);
+        render_segments(
+            &m.positions,
+            &m.indices,
+            &seg.labels,
+            m.shape.world_bounds(),
+            &path,
+        );
         println!("  render: {}", path.display());
-    }
-}
-
-/// Render with per-region colors; triangles touching any unclaimed vertex are
-/// bright red so the feature zone stands out.
-fn render_segmentation(m: &MeshedShape, seg: &Segmentation, path: &std::path::Path) {
-    let (lo, hi) = m.shape.world_bounds();
-    let center = (lo + hi) / 2.0;
-    let radius = (hi - lo).length() / 2.0;
-    let config = RenderConfig {
-        camera_pos: center + DVec3::new(1.0, 0.62, 1.05).normalize() * radius * 2.6,
-        target: center,
-        ..RenderConfig::default()
-    };
-    let tri_color = |tri: usize| -> [f64; 3] {
-        let vs = &m.indices[tri * 3..tri * 3 + 3];
-        let labels: Vec<Option<u32>> = vs.iter().map(|&v| seg.labels[v as usize]).collect();
-        if labels.iter().any(|l| l.is_none()) {
-            return [0.95, 0.15, 0.12]; // feature zone
-        }
-        region_color(labels[0].unwrap())
-    };
-    if let Err(err) = render_png(&m.positions, &m.indices, &tri_color, &config, path) {
-        eprintln!("render failed: {err}");
     }
 }
 

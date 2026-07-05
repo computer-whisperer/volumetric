@@ -222,6 +222,66 @@ impl OracleShape for CylinderShape {
 }
 
 // =============================================================================
+// Mandelbulb (pathological control -- NO analytic truth)
+// =============================================================================
+
+/// Power-8 mandelbulb by escape-time iteration: the pathological control
+/// shape. Fractal boundary, sub-cell detail everywhere, no meaningful smooth
+/// faces.
+///
+/// There is no closed-form surface truth for this shape: [`OracleShape::truth`]
+/// returns placeholders (radial normal, infinite feature distance) so it can
+/// flow through the harness, but only *validity* metrics (finiteness, movement
+/// bounds, triangle degeneracy) are meaningful — never accuracy metrics.
+pub struct MandelbulbShape {
+    pub iterations: usize,
+}
+
+impl OracleShape for MandelbulbShape {
+    fn name(&self) -> String {
+        format!("mandelbulb p8 i{} (validity only)", self.iterations)
+    }
+
+    fn is_inside(&self, p: DVec3) -> bool {
+        let c = p;
+        let mut z = p;
+        for _ in 0..self.iterations {
+            let r = z.length();
+            if r > 2.0 {
+                return false;
+            }
+            if r < 1e-12 {
+                z = c;
+                continue;
+            }
+            // z -> z^8 + c in spherical coordinates.
+            let theta = (z.z / r).clamp(-1.0, 1.0).acos() * 8.0;
+            let phi = z.y.atan2(z.x) * 8.0;
+            let r8 = r.powi(8);
+            z = DVec3::new(
+                r8 * theta.sin() * phi.cos(),
+                r8 * theta.sin() * phi.sin(),
+                r8 * theta.cos(),
+            ) + c;
+        }
+        true
+    }
+
+    fn truth(&self, p: DVec3) -> SurfaceTruth {
+        SurfaceTruth {
+            normal: p.try_normalize().unwrap_or(DVec3::Z),
+            closest: p,
+            face_id: 0,
+            dist_to_sharp: f64::INFINITY,
+        }
+    }
+
+    fn world_bounds(&self) -> (DVec3, DVec3) {
+        (DVec3::splat(-1.25), DVec3::splat(1.25))
+    }
+}
+
+// =============================================================================
 // Rotation wrapper
 // =============================================================================
 

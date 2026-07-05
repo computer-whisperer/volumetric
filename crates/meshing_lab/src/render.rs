@@ -142,6 +142,51 @@ pub fn render_png(
     img.save(path)
 }
 
+/// Camera framing a bounding box from the standard three-quarter view.
+pub fn frame_bounds(lo: DVec3, hi: DVec3) -> RenderConfig {
+    let center = (lo + hi) / 2.0;
+    let radius = (hi - lo).length() / 2.0;
+    RenderConfig {
+        camera_pos: center + DVec3::new(1.0, 0.62, 1.05).normalize() * radius * 2.6,
+        target: center,
+        ..RenderConfig::default()
+    }
+}
+
+/// Render with per-region colors; triangles touching any unclaimed vertex are
+/// bright red so the feature zone stands out.
+pub fn render_segments(
+    positions: &[DVec3],
+    indices: &[u32],
+    labels: &[Option<u32>],
+    bounds: (DVec3, DVec3),
+    path: &Path,
+) {
+    let config = frame_bounds(bounds.0, bounds.1);
+    let tri_color = |tri: usize| -> [f64; 3] {
+        let vs = &indices[tri * 3..tri * 3 + 3];
+        match vs.iter().map(|&v| labels[v as usize]).min().flatten() {
+            // All three vertices claimed: color by one of their regions.
+            Some(region) if vs.iter().all(|&v| labels[v as usize].is_some()) => {
+                region_color(region)
+            }
+            _ => [0.95, 0.15, 0.12], // feature zone
+        }
+    };
+    if let Err(err) = render_png(positions, indices, &tri_color, &config, path) {
+        eprintln!("render failed: {err}");
+    }
+}
+
+/// Render in a single neutral material color, like a production viewport.
+pub fn render_plain(positions: &[DVec3], indices: &[u32], bounds: (DVec3, DVec3), path: &Path) {
+    let config = frame_bounds(bounds.0, bounds.1);
+    let tri_color = |_: usize| -> [f64; 3] { [0.62, 0.66, 0.72] };
+    if let Err(err) = render_png(positions, indices, &tri_color, &config, path) {
+        eprintln!("render failed: {err}");
+    }
+}
+
 /// Distinct color for a region id: golden-ratio hue cycling over a range that
 /// avoids red, which is reserved for feature-zone highlighting.
 pub fn region_color(region: u32) -> [f64; 3] {
