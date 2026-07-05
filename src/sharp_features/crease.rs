@@ -17,8 +17,10 @@ use glam::DVec3;
 
 pub struct CreaseSplitResult {
     pub positions: Vec<DVec3>,
-    /// Vertex normals: carried through for unsplit vertices, re-accumulated
-    /// from referencing triangles for crease copies. Unnormalized.
+    /// Vertex normals: re-accumulated from the final triangles for crease
+    /// copies and for every vertex sharing a triangle with one (their fans
+    /// changed when the snap stage moved the feature vertices); carried
+    /// through unchanged elsewhere. Unnormalized.
     pub normals: Vec<DVec3>,
     pub indices: Vec<u32>,
     /// Extra vertex copies created (the first region reuses the base slot).
@@ -29,14 +31,17 @@ pub struct CreaseSplitResult {
 ///
 /// `labels` are post-weld region labels (`None` for feature-zone vertices);
 /// `is_crease` marks vertices the snap stage placed on a feature. `normals`
-/// are the carried per-vertex normals; crease copies get theirs re-derived
-/// from the triangles that reference them.
+/// are the carried per-vertex normals; crease copies (and their unsplit
+/// neighbors, whose fans the snap changed) get theirs re-derived from the
+/// triangles that reference them. `cell` is the finest cell size, used to
+/// tell real triangles from folded slivers during that re-derivation.
 pub fn split_crease_vertices(
     positions: &[DVec3],
     normals: &[DVec3],
     indices: &[u32],
     labels: &[Option<u32>],
     is_crease: &[bool],
+    cell: f64,
 ) -> CreaseSplitResult {
     // Assign each triangle to a region by its claimed vertices. When labels
     // conflict within one triangle (regions in direct contact, which happens
@@ -104,7 +109,9 @@ pub fn split_crease_vertices(
                 v as u32
             } else {
                 positions_out.push(positions[v]);
-                normals_out.push(DVec3::ZERO);
+                // Seeded with the base carried normal so a copy that ends up
+                // referenced only by slivers has a sane fallback below.
+                normals_out.push(normals[v]);
                 split_vertices += 1;
                 (positions_out.len() - 1) as u32
             };
@@ -128,25 +135,82 @@ pub fn split_crease_vertices(
         }
     }
 
-    // Re-derive crease copy normals from exactly the triangles that reference
-    // them (including reused base slots), leaving carried normals elsewhere.
-    let mut is_copy_slot = vec![false; positions_out.len()];
+    // Re-derive normals from the final triangles for every vertex whose fan
+    // the snap stage changed: the crease copies themselves (including reused
+    // base slots and snapped-but-unsplit vertices), plus their unsplit
+    // neighbors. The neighbors' carried normals were accumulated over the
+    // *pre-snap* fan — moving the rim vertices tilted those triangles, so a
+    // shoulder vertex half a cell from a feature can carry a normal 15-20
+    // degrees off the face it provably sits on. Vertices with no crease
+    // contact keep their carried normals (which may be probe-refined).
+    let mut rederive = vec![false; positions_out.len()];
+    let mut is_crease_slot = vec![false; positions_out.len()];
     for v in 0..positions.len() {
+        if is_crease[v] {
+            is_crease_slot[v] = true;
+        }
         for &(_, idx) in &copy_index[v] {
-            is_copy_slot[idx as usize] = true;
-            normals_out[idx as usize] = DVec3::ZERO;
+            is_crease_slot[idx as usize] = true;
+        }
+    }
+    for tri in indices_out.chunks_exact(3) {
+        if tri.iter().any(|&v| is_crease_slot[v as usize]) {
+            for &v in tri {
+                rederive[v as usize] = true;
+            }
+        }
+    }
+    let carried = normals_out.clone();
+    for (v, flag) in rederive.iter().enumerate() {
+        if *flag {
+            normals_out[v] = DVec3::ZERO;
         }
     }
     for tri in indices_out.chunks_exact(3) {
         let (a, b, c) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
-        if !(is_copy_slot[a] || is_copy_slot[b] || is_copy_slot[c]) {
+        if !(rederive[a] || rederive[b] || rederive[c]) {
             continue;
         }
         let face = (positions_out[b] - positions_out[a]).cross(positions_out[c] - positions_out[a]);
         for &v in &[a, b, c] {
-            if is_copy_slot[v] {
+            if rederive[v] {
                 normals_out[v] += face;
             }
+        }
+    }
+    // A slot referenced only by folded slivers accumulates a near-zero
+    // vector whose direction is fold noise (up to 90 degrees off any true
+    // face). Area weighting already drowns slivers wherever a real triangle
+    // contributes, so only these all-sliver slots need repair: shade them
+    // like the well-accumulated vertices they share those slivers with
+    // (same-region crease neighbors — the slot itself is invisible, but its
+    // normal shouldn't be noise). Carried normals are the last resort.
+    // (|cross| = 2x area; the threshold is a tiny fraction of one
+    // finest-cell triangle.)
+    let min_accum = 0.02 * cell * cell;
+    let accumulated = normals_out.clone();
+    let starved = |v: usize| -> bool {
+        rederive[v] && accumulated[v].length_squared() < min_accum * min_accum
+    };
+    for tri in indices_out.chunks_exact(3) {
+        if !tri.iter().any(|&v| starved(v as usize)) {
+            continue;
+        }
+        for &v in tri {
+            if !starved(v as usize) {
+                continue;
+            }
+            for &u in tri {
+                if u != v && !starved(u as usize) {
+                    let n = accumulated[u as usize];
+                    normals_out[v as usize] += n.normalize_or_zero() * (cell * cell);
+                }
+            }
+        }
+    }
+    for (v, flag) in rederive.iter().enumerate() {
+        if *flag && normals_out[v].length_squared() < min_accum * min_accum {
+            normals_out[v] = carried[v];
         }
     }
 
@@ -190,7 +254,8 @@ mod tests {
     fn crease_vertices_split_with_per_region_normals() {
         let (positions, indices, labels, is_crease) = crease_mesh();
         let carried = vec![DVec3::ONE; positions.len()];
-        let result = split_crease_vertices(&positions, &carried, &indices, &labels, &is_crease);
+        let result =
+            split_crease_vertices(&positions, &carried, &indices, &labels, &is_crease, 1.0);
 
         // Two crease vertices, two regions each: one extra copy per vertex.
         assert_eq!(result.split_vertices, 2);
@@ -218,9 +283,16 @@ mod tests {
         assert_eq!(result.positions[right_tri[0] as usize], positions[2]);
         assert_ne!(left_tri[1], right_tri[0], "sides use distinct copies");
 
-        // Unsplit vertices keep their carried normals.
-        assert_eq!(result.normals[0], DVec3::ONE);
-        assert_eq!(result.normals[4], DVec3::ONE);
+        // Unsplit vertices sharing a triangle with a crease vertex are
+        // re-accumulated from the final fan: face-true for planar sides.
+        assert!(
+            unsigned_angle_degrees(result.normals[0].normalize(), DVec3::Z) < 1e-9,
+            "left-face neighbor should re-accumulate the z-plane normal"
+        );
+        assert!(
+            unsigned_angle_degrees(result.normals[4].normalize(), DVec3::X) < 1e-9,
+            "right-face neighbor should re-accumulate the x-plane normal"
+        );
     }
 
     #[test]
@@ -228,7 +300,8 @@ mod tests {
         let (positions, indices, labels, _) = crease_mesh();
         let carried = vec![DVec3::ONE; positions.len()];
         let no_crease = vec![false; positions.len()];
-        let result = split_crease_vertices(&positions, &carried, &indices, &labels, &no_crease);
+        let result =
+            split_crease_vertices(&positions, &carried, &indices, &labels, &no_crease, 1.0);
         assert_eq!(result.split_vertices, 0);
         assert_eq!(result.indices, indices);
         assert_eq!(result.positions.len(), positions.len());

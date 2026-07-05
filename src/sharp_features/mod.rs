@@ -146,6 +146,7 @@ pub fn apply_sharp_features(
         &cleaned.indices,
         &welded_labels,
         &is_crease,
+        cell,
     );
 
     SharpFeatureOutput {

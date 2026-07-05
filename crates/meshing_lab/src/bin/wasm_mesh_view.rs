@@ -180,6 +180,120 @@ fn main() {
             }
             std::fs::write(out_dir.join("rim_chain.csv"), csv).expect("write csv");
         }
+
+        // Shading-normal error vs truth. Near the rim either face's normal is
+        // legitimate (crease copies), so score against the closer of the two;
+        // elsewhere the true normal is unambiguous.
+        let mut per_vertex_err = vec![0.0f64; positions.len()];
+        let mut buckets: [(&str, Vec<f64>); 3] = [
+            ("cap interior", Vec::new()),
+            ("barrel interior", Vec::new()),
+            ("rim band (<1.5c)", Vec::new()),
+        ];
+        for (i, p) in positions.iter().enumerate() {
+            let Some(n) = normals[i].try_normalize() else {
+                continue;
+            };
+            let rho = (p.x * p.x + p.y * p.y).sqrt();
+            let cap_n = DVec3::Z * (p.z - 0.5).signum();
+            let barrel_n = DVec3::new(p.x / rho.max(1e-12), p.y / rho.max(1e-12), 0.0);
+            let angle = |t: DVec3| n.dot(t).clamp(-1.0, 1.0).acos().to_degrees();
+            let dzr = (p.z - 1.0).abs().min(p.z.abs());
+            let drim = ((rho - 1.0).powi(2) + dzr * dzr).sqrt() / cell;
+            let (bucket, err) = if drim < 1.5 {
+                (2, angle(cap_n).min(angle(barrel_n)))
+            } else if dzr / cell < 0.5 {
+                (0, angle(cap_n))
+            } else {
+                (1, angle(barrel_n))
+            };
+            per_vertex_err[i] = err;
+            buckets[bucket].1.push(err);
+        }
+        for (name, errs) in &mut buckets {
+            if errs.is_empty() {
+                continue;
+            }
+            errs.sort_by(f64::total_cmp);
+            let n = errs.len();
+            println!(
+                "normal err {name} ({n} verts): med {:.2} p95 {:.2} max {:.2} deg",
+                errs[n / 2],
+                errs[(n as f64 * 0.95) as usize],
+                errs[n - 1]
+            );
+        }
+        // Dump the worst rim-band offenders with copy multiplicity (how many
+        // vertex slots share the same position — 2+ means crease copies).
+        let mut pos_count: HashMap<(i64, i64, i64), u32> = HashMap::new();
+        for p in &positions {
+            *pos_count.entry(quant(*p)).or_insert(0) += 1;
+        }
+        let mut bad = String::from("theta,rho_err_c,z_err_c,err_deg,copies,nx,ny,nz\n");
+        for (i, p) in positions.iter().enumerate() {
+            if per_vertex_err[i] < 15.0 {
+                continue;
+            }
+            let rho = (p.x * p.x + p.y * p.y).sqrt();
+            let dzr = (p.z - 1.0).abs().min(p.z.abs());
+            if ((rho - 1.0).powi(2) + dzr * dzr).sqrt() / cell >= 1.5 {
+                continue;
+            }
+            let n = normals[i].normalize_or_zero();
+            bad.push_str(&format!(
+                "{:.2},{:.3},{:.3},{:.1},{},{:.3},{:.3},{:.3}\n",
+                p.y.atan2(p.x).to_degrees(),
+                (rho - 1.0) / cell,
+                (p.z - 1.0) / cell,
+                per_vertex_err[i],
+                pos_count[&quant(*p)],
+                n.x,
+                n.y,
+                n.z
+            ));
+        }
+        std::fs::write(out_dir.join("bad_normals.csv"), bad).expect("write csv");
+
+        // Heatmap render: green 0 deg -> red >= 20 deg, per-triangle max.
+        let mut cfg = render::frame_bounds(
+            DVec3::new(
+                result.bounds_min.0 as f64,
+                result.bounds_min.1 as f64,
+                result.bounds_min.2 as f64,
+            ),
+            DVec3::new(
+                result.bounds_max.0 as f64,
+                result.bounds_max.1 as f64,
+                result.bounds_max.2 as f64,
+            ),
+        );
+        cfg.camera_pos = DVec3::new(2.2, 1.6, 2.2).normalize() * 4.5 + DVec3::new(0.0, 0.0, 0.5);
+        cfg.target = DVec3::new(0.0, 0.0, 0.5);
+        let tri_err = |t: usize| -> [f64; 3] {
+            let worst = indices[t * 3..t * 3 + 3]
+                .iter()
+                .map(|&v| per_vertex_err[v as usize])
+                .fold(0.0, f64::max);
+            let x = (worst / 20.0).min(1.0);
+            [0.2 + 0.6 * x, 0.7 - 0.5 * x, 0.25]
+        };
+        render::render_png(
+            &positions,
+            indices,
+            &tri_err,
+            &cfg,
+            &out_dir.join("normal_err_heat.png"),
+        )
+        .expect("render");
+        cfg.camera_pos = DVec3::new(0.15, 0.4, 3.0).normalize() * 4.5 + DVec3::new(0.0, 0.0, 0.5);
+        render::render_png(
+            &positions,
+            indices,
+            &tri_err,
+            &cfg,
+            &out_dir.join("normal_err_heat_axis.png"),
+        )
+        .expect("render");
     }
 
     // Per-vertex snap diagnosis for the top rim of a z-aligned cylinder:

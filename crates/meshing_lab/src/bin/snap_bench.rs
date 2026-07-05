@@ -274,6 +274,7 @@ fn run_case(
         &cleaned.indices,
         &cleaned_labels,
         &is_crease,
+        m.cell,
     );
 
     // Geometric seal: the split adds topological boundary edges along
