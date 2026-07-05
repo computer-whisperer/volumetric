@@ -170,6 +170,23 @@ fn extruding_a_3d_model_is_rejected() {
 }
 
 #[test]
+fn sketches_rasterize_for_preview() {
+    let raster = volumetric::rasterize_sketch_from_bytes(&circle_sketch_wasm(), 64)
+        .expect("rasterize sketch");
+    assert_eq!((raster.width, raster.height), (64, 64));
+    assert_eq!(raster.bounds_min, (-1.5, -1.5));
+    assert_eq!(raster.bounds_max, (1.5, 1.5));
+    // Center of the circle is occupied, the corner is not.
+    assert!(raster.cell(32, 32));
+    assert!(!raster.cell(0, 0));
+
+    // 3D models are rejected.
+    let err = volumetric::rasterize_sketch_from_bytes(&wasm_artifact("simple_sphere_model"), 8)
+        .expect_err("rasterizing a 3D model must fail");
+    assert!(err.to_string().contains("2D sketch"), "{err}");
+}
+
+#[test]
 fn lua_3d_scripts_still_compile() {
     let src = r#"
 function is_inside(x, y, z)

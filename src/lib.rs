@@ -326,6 +326,76 @@ pub fn sample_model_from_bytes(
     Ok((points, bounds_min, bounds_max))
 }
 
+/// Occupancy raster of a 2D sketch model, for flat previews.
+#[cfg(any(feature = "native", feature = "web"))]
+#[derive(Clone, Debug)]
+pub struct SketchRaster {
+    /// Cells along x.
+    pub width: usize,
+    /// Cells along y.
+    pub height: usize,
+    /// Row-major occupancy sampled at cell centers; row 0 is min_y.
+    pub cells: Vec<bool>,
+    pub bounds_min: (f32, f32),
+    pub bounds_max: (f32, f32),
+}
+
+#[cfg(any(feature = "native", feature = "web"))]
+impl SketchRaster {
+    pub fn cell(&self, x: usize, y: usize) -> bool {
+        self.cells[y * self.width + x]
+    }
+}
+
+/// Number of dimensions a model WASM reports (2 for a sketch, 3+ for a volume).
+#[cfg(any(feature = "native", feature = "web"))]
+pub fn model_dimensions_from_bytes(wasm_bytes: &[u8]) -> anyhow::Result<u32> {
+    use wasm::ModelExecutor;
+    let mut executor =
+        wasm::create_model_executor(wasm_bytes).context("Failed to create model executor")?;
+    Ok(executor.dimensions()?)
+}
+
+/// Rasterize a 2D sketch model into a `resolution^2` occupancy grid over its
+/// own bounds, sampling at cell centers.
+#[cfg(any(feature = "native", feature = "web"))]
+pub fn rasterize_sketch_from_bytes(
+    wasm_bytes: &[u8],
+    resolution: usize,
+) -> anyhow::Result<SketchRaster> {
+    use wasm::ModelExecutor;
+
+    let mut executor =
+        wasm::create_model_executor(wasm_bytes).context("Failed to create model executor")?;
+
+    let dims = executor.dimensions()?;
+    if dims != 2 {
+        anyhow::bail!("expected a 2D sketch model, got {dims} dimensions");
+    }
+
+    let bounds = executor.get_bounds_nd()?;
+    let (min_x, max_x) = (bounds.min(0), bounds.max(0));
+    let (min_y, max_y) = (bounds.min(1), bounds.max(1));
+
+    let n = resolution.max(1);
+    let mut cells = Vec::with_capacity(n * n);
+    for yi in 0..n {
+        let y = min_y + (max_y - min_y) * ((yi as f64 + 0.5) / n as f64);
+        for xi in 0..n {
+            let x = min_x + (max_x - min_x) * ((xi as f64 + 0.5) / n as f64);
+            cells.push(volumetric_abi::is_occupied(executor.sample_nd(&[x, y])?));
+        }
+    }
+
+    Ok(SketchRaster {
+        width: n,
+        height: n,
+        cells,
+        bounds_min: (min_x as f32, min_y as f32),
+        bounds_max: (max_x as f32, max_y as f32),
+    })
+}
+
 /// Generate a mesh using marching cubes algorithm from the WASM volumetric model
 #[cfg(feature = "native")]
 pub fn generate_marching_cubes_mesh(

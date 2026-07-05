@@ -119,6 +119,28 @@ pub trait ModelExecutor: Send {
     fn sample_format(&mut self) -> Result<volumetric_abi::SampleFormat, WasmBackendError> {
         Ok(volumetric_abi::SampleFormat::default())
     }
+
+    /// The model's number of dimensions.
+    fn dimensions(&mut self) -> Result<u32, WasmBackendError> {
+        Err(WasmBackendError::Unavailable(
+            "N-dimensional access not supported by this backend yet".to_string(),
+        ))
+    }
+
+    /// The model's N-dimensional bounding box.
+    fn get_bounds_nd(&mut self) -> Result<ModelBoundsNd, WasmBackendError> {
+        Err(WasmBackendError::Unavailable(
+            "N-dimensional access not supported by this backend yet".to_string(),
+        ))
+    }
+
+    /// Sample the occupancy at an N-dimensional position (classify with
+    /// [`volumetric_abi::is_occupied`]).
+    fn sample_nd(&mut self, _position: &[f64]) -> Result<f32, WasmBackendError> {
+        Err(WasmBackendError::Unavailable(
+            "N-dimensional access not supported by this backend yet".to_string(),
+        ))
+    }
 }
 
 /// Thread-safe sampler for parallel volumetric model sampling.

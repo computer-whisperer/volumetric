@@ -857,6 +857,14 @@ pub fn execute_job(job: BackgroundJob) -> BackgroundResult {
 fn build_preview_scene(request: &PreviewRequest) -> Result<PreviewEntity, String> {
     let build_start = std::time::Instant::now();
     let mut stats = OutputStats::default();
+
+    // 2D sketches get a flat raster preview; the 3D mesh plans don't apply.
+    let dims = volumetric::model_dimensions_from_bytes(request.wasm_bytes.as_slice())
+        .map_err(format_error_chain)?;
+    if dims == 2 {
+        return build_sketch_preview(request, build_start);
+    }
+
     let (scene, bounds_min, bounds_max) = match &request.mesh_plan {
         PreviewMeshPlan::PointCloud { resolution } => {
             let (points, bounds_min, bounds_max) =
@@ -1008,6 +1016,103 @@ fn render_settings(
     settings
 }
 
+/// Flat z=0 preview of a 2D sketch: run-length spans of occupied raster
+/// cells become double-sided quads (one +z face, one -z face).
+fn build_sketch_preview(
+    request: &PreviewRequest,
+    build_start: std::time::Instant,
+) -> Result<PreviewEntity, String> {
+    let resolution = sketch_raster_resolution(&request.mesh_plan);
+    let raster = volumetric::rasterize_sketch_from_bytes(request.wasm_bytes.as_slice(), resolution)
+        .map_err(format_error_chain)?;
+
+    let cell_w = (raster.bounds_max.0 - raster.bounds_min.0) / raster.width as f32;
+    let cell_h = (raster.bounds_max.1 - raster.bounds_min.1) / raster.height as f32;
+
+    let mut vertices: Vec<renderer::MeshVertex> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+    let mut emit_quad = |x0: f32, x1: f32, y0: f32, y1: f32| {
+        let corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)];
+        for (normal, winding) in [
+            ([0.0f32, 0.0, 1.0], [0u32, 1, 2, 0, 2, 3]),
+            ([0.0f32, 0.0, -1.0], [0u32, 2, 1, 0, 3, 2]),
+        ] {
+            let base = vertices.len() as u32;
+            for (x, y) in corners {
+                vertices.push(renderer::MeshVertex {
+                    position: [x, y, 0.0],
+                    _pad0: 0.0,
+                    normal,
+                    _pad1: 0.0,
+                });
+            }
+            indices.extend(winding.iter().map(|i| base + i));
+        }
+    };
+
+    for yi in 0..raster.height {
+        let y0 = raster.bounds_min.1 + cell_h * yi as f32;
+        let y1 = y0 + cell_h;
+        let mut run_start: Option<usize> = None;
+        for xi in 0..=raster.width {
+            let occupied = xi < raster.width && raster.cell(xi, yi);
+            match (occupied, run_start) {
+                (true, None) => run_start = Some(xi),
+                (false, Some(start)) => {
+                    let x0 = raster.bounds_min.0 + cell_w * start as f32;
+                    let x1 = raster.bounds_min.0 + cell_w * xi as f32;
+                    emit_quad(x0, x1, y0, y1);
+                    run_start = None;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let triangles = indices.len() / 3;
+    let mut scene = renderer::SceneData::new();
+    scene.add_mesh(
+        renderer::MeshData {
+            vertices,
+            indices: Some(indices),
+        },
+        glam::Mat4::IDENTITY,
+        renderer::MaterialId(0),
+    );
+
+    let stats = OutputStats {
+        triangles,
+        samples: (raster.width * raster.height) as u64,
+        detail: vec![format!(
+            "2D sketch raster {}x{}",
+            raster.width, raster.height
+        )],
+        mesh_ms: build_start.elapsed().as_secs_f64() * 1000.0,
+        ..Default::default()
+    };
+    Ok(PreviewEntity {
+        scene,
+        bounds: PreviewBounds {
+            min: (raster.bounds_min.0, raster.bounds_min.1, 0.0),
+            max: (raster.bounds_max.0, raster.bounds_max.1, 0.0),
+        },
+        stats,
+    })
+}
+
+/// Raster resolution for sketch previews, reusing the output's configured
+/// mesh resolution.
+fn sketch_raster_resolution(plan: &PreviewMeshPlan) -> usize {
+    let resolution = match plan {
+        PreviewMeshPlan::PointCloud { resolution } => *resolution,
+        PreviewMeshPlan::MarchingCubes { resolution } => *resolution,
+        PreviewMeshPlan::AdaptiveSurfaceNets2 {
+            target_resolution, ..
+        } => *target_resolution,
+    };
+    resolution.clamp(16, 1024)
+}
+
 fn triangles_to_mesh_vertices(triangles: &[volumetric::Triangle]) -> Vec<renderer::MeshVertex> {
     let mut out = Vec::with_capacity(triangles.len() * 3);
 
@@ -1120,6 +1225,55 @@ mod tests {
             key: job.key,
             result: Ok(entity()),
         });
+    }
+
+    /// A 2D model output routes to the flat sketch preview instead of the
+    /// 3D mesh plan: compile a circle sketch with the bundled Lua operator
+    /// and build its preview scene.
+    #[test]
+    fn two_dimensional_outputs_get_a_sketch_preview() {
+        use volumetric::wasm::OperatorExecutor;
+
+        let lua =
+            volumetric_assets::get_operator("lua_script_operator").expect("bundled lua operator");
+        let script = br#"
+function is_inside(x, y)
+    if x*x + y*y <= 1.0 then
+        return 1.0
+    else
+        return 0.0
+    end
+end
+function get_bounds_min_x() return -1.5 end
+function get_bounds_max_x() return 1.5 end
+function get_bounds_min_y() return -1.5 end
+function get_bounds_max_y() return 1.5 end
+"#;
+        let mut executor =
+            volumetric::wasm::create_operator_executor(lua.bytes).expect("create lua executor");
+        let result = executor
+            .run(volumetric::wasm::OperatorIo::new(vec![script.to_vec()]))
+            .expect("compile sketch");
+        let sketch = result.outputs.get(&0).expect("sketch wasm").clone();
+
+        let mut req = request("sketch", 64);
+        req.wasm_bytes = Arc::new(sketch);
+        let entity = build_preview_scene(&req).expect("sketch preview");
+
+        assert!(
+            entity.stats.triangles > 0,
+            "sketch preview emitted no quads"
+        );
+        assert!(
+            entity.stats.detail.iter().any(|l| l.contains("2D sketch")),
+            "stats should mention the sketch raster: {:?}",
+            entity.stats.detail
+        );
+        // Flat at z = 0, covering the sketch bounds
+        assert_eq!(entity.bounds.min.2, 0.0);
+        assert_eq!(entity.bounds.max.2, 0.0);
+        assert_eq!(entity.bounds.min.0, -1.5);
+        assert_eq!(entity.bounds.max.1, 1.5);
     }
 
     /// The milestone: two requested outputs each get a build job, and once both

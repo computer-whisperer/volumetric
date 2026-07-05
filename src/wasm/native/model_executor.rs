@@ -295,4 +295,16 @@ impl ModelExecutor for NativeModelExecutor {
     fn sample_format(&mut self) -> Result<SampleFormat, WasmBackendError> {
         Ok(self.sample_format.clone())
     }
+
+    fn dimensions(&mut self) -> Result<u32, WasmBackendError> {
+        Ok(self.dimensions)
+    }
+
+    fn get_bounds_nd(&mut self) -> Result<ModelBoundsNd, WasmBackendError> {
+        NativeModelExecutor::get_bounds_nd(self)
+    }
+
+    fn sample_nd(&mut self, position: &[f64]) -> Result<f32, WasmBackendError> {
+        NativeModelExecutor::sample_nd(self, position)
+    }
 }
