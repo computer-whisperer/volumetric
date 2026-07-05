@@ -417,6 +417,17 @@ impl Host {
     }
 }
 
+/// Append the expected extension when a save dialog returns a bare name —
+/// the Linux dialogs don't enforce their filter's extension. An explicit
+/// different extension typed by the user is left alone.
+fn ensure_extension(path: std::path::PathBuf, ext: &str) -> std::path::PathBuf {
+    if path.extension().is_none() {
+        path.with_extension(ext)
+    } else {
+        path
+    }
+}
+
 /// Runs a queued file action: native dialogs first, then the outcome is
 /// routed back into the app. The blocking dialogs stall the event loop while
 /// open — same trade-off as the v1 egui app.
@@ -433,9 +444,10 @@ fn handle_file_action(app: &mut VolumetricUiV2, session: &Session, action: FileA
         FileAction::SaveProject => {
             if let Some(path) = rfd::FileDialog::new()
                 .add_filter("Project", &["vproj"])
+                .set_file_name("project.vproj")
                 .save_file()
             {
-                app.save_project_file(&path);
+                app.save_project_file(&ensure_extension(path, "vproj"));
             }
         }
         FileAction::ExportStl(id) => {
@@ -453,6 +465,7 @@ fn handle_file_action(app: &mut VolumetricUiV2, session: &Session, action: FileA
             else {
                 return;
             };
+            let path = ensure_extension(path, "stl");
             match volumetric::stl::write_binary_stl(&path, &triangles, "volumetric") {
                 Ok(()) => app.set_status(format!(
                     "exported {} triangles to {}",
@@ -481,6 +494,7 @@ fn handle_file_action(app: &mut VolumetricUiV2, session: &Session, action: FileA
             else {
                 return;
             };
+            let path = ensure_extension(path, "wasm");
             match std::fs::write(&path, bytes.as_slice()) {
                 Ok(()) => app.set_status(format!("exported {}", path.display())),
                 Err(err) => app.set_status(format!("failed to export WASM: {err}")),
