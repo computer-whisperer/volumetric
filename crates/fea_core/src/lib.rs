@@ -10,10 +10,14 @@
 //!   for foam at seat strains; fine for relative density assignment.
 //! - Quasi-static single pose. The rigid body is sampled where the user
 //!   placed it (already interpenetrating the mesh = the pressed pose).
-//! - Contact presses along -z: a penetrating node's vertical displacement
-//!   is prescribed to the rigid body's lower surface on its column
-//!   (active-set Dirichlet; nodes with tensile reactions are released).
-//!   The constraint reactions are the interface force map.
+//! - Contact presses toward the glued face: the contact axis is the
+//!   `fixed_boundary` axis, with the rigid body approaching from the
+//!   opposite side (glued zmin → body presses down from +z; glued ymin →
+//!   body presses from +y; no fixed face → down from +z). A penetrating
+//!   node's contact-axis displacement is prescribed to the body's near
+//!   surface on its line (active-set Dirichlet; nodes with tensile
+//!   reactions are released). The constraint reactions are the interface
+//!   force map.
 //!
 //! The linear solves are matrix-free Jacobi-preconditioned conjugate
 //! gradient over the free dofs.
@@ -117,8 +121,8 @@ pub struct SolveResult {
     /// Per-node displacement, xyz interleaved.
     pub displacement: Vec<f64>,
     /// Per-node force applied by the rigid body (nonzero only on the active
-    /// contact set), xyz interleaved. z-components are <= 0: the body
-    /// presses down.
+    /// contact set), xyz interleaved. Along the contact axis the sign
+    /// presses toward the glued face.
     pub contact_force: Vec<f64>,
     /// Per-element strain energy per unit volume.
     pub strain_energy_density: Vec<f64>,
@@ -307,37 +311,44 @@ fn solve_cg(
     (max_iterations, false)
 }
 
-/// Find the rigid body's lower surface on the vertical column through
-/// `(x, y)`, starting from a height known to be inside. Scans down in
-/// `h`-steps to bracket the boundary, then bisects.
-fn rigid_lower_surface(
+/// Find the rigid body's near surface on the line through `inside` along
+/// `axis`: the boundary crossing reached by walking from the (inside)
+/// starting point *away* from the body's side (`sign` = +1 when the body
+/// presses from the axis' positive side). Scans in `h`-steps to bracket the
+/// boundary, then bisects. Returns the surface's coordinate along `axis`.
+fn rigid_contact_surface(
     rigid: &mut dyn RigidBody,
-    x: f64,
-    y: f64,
-    inside_z: f64,
+    inside: [f64; 3],
+    axis: usize,
+    sign: f64,
     h: f64,
     scan_limit: usize,
 ) -> Result<f64, String> {
-    let mut hi = inside_z;
-    let mut lo = None;
+    let mut hi = inside[axis]; // inside the body
+    let mut lo = None; // outside, past the surface
     for step in 1..=scan_limit {
-        let z = inside_z - step as f64 * h;
-        if rigid.is_inside([x, y, z]) {
-            hi = z;
+        let mut q = inside;
+        q[axis] = inside[axis] - sign * step as f64 * h;
+        if rigid.is_inside(q) {
+            hi = q[axis];
         } else {
-            lo = Some(z);
+            lo = Some(q[axis]);
             break;
         }
     }
     let Some(mut lo) = lo else {
         return Err(format!(
-            "rigid body engulfs the column below ({x:.4}, {y:.4}); it must not \
-             extend past the mesh bottom"
+            "rigid body spans the whole mesh along axis {axis} at \
+             ({:.4}, {:.4}, {:.4}); it must press against one face, not engulf \
+             the mesh",
+            inside[0], inside[1], inside[2]
         ));
     };
     for _ in 0..48 {
         let mid = 0.5 * (lo + hi);
-        if rigid.is_inside([x, y, mid]) {
+        let mut q = inside;
+        q[axis] = mid;
+        if rigid.is_inside(q) {
             hi = mid;
         } else {
             lo = mid;
@@ -389,7 +400,15 @@ pub fn solve(
             hi[axis] = hi[axis].max(p[axis]);
         }
     }
-    let scan_limit = ((hi[2] - lo[2]) / h).ceil() as usize + 4;
+    // The rigid body presses toward the glued face: contact acts along the
+    // fixed boundary's axis, with the body approaching from the opposite
+    // side (glued at min → body on the positive side pressing negative).
+    // With no fixed face it presses down the z axis, from above.
+    let (contact_axis, contact_sign) = match config.fixed_boundary.axis() {
+        Some((axis, glued_min)) => (axis, if glued_min { 1.0 } else { -1.0 }),
+        None => (2, 1.0),
+    };
+    let scan_limit = ((hi[contact_axis] - lo[contact_axis]) / h).ceil() as usize + 4;
 
     // Base constraints: the glued face.
     let mut constrained = vec![false; n];
@@ -428,13 +447,13 @@ pub fn solve(
         stats.contact_iterations += 1;
 
         // Activate/refresh: any node whose deformed position penetrates the
-        // rigid body gets its vertical displacement prescribed so it sits on
-        // the body's lower surface *at the node's deformed lateral position*
-        // — lateral (Poisson) slide moves nodes to columns where the surface
-        // height differs, so an already-active constraint is re-prescribed
-        // when it has drifted. Penetration (and drift) within a small slack
-        // is tolerated; without both, rim nodes cycle activate/release
-        // forever and the active set never settles.
+        // rigid body gets its contact-axis displacement prescribed so it
+        // sits on the body's near surface *at the node's deformed transverse
+        // position* — transverse (Poisson) slide moves nodes to lines where
+        // the surface height differs, so an already-active constraint is
+        // re-prescribed when it has drifted. Penetration (and drift) within
+        // a small slack is tolerated; without both, rim nodes cycle
+        // activate/release forever and the active set never settles.
         let slack = h * 1e-3;
         let mut set_changes = 0usize;
         for node in 0..node_count {
@@ -447,16 +466,18 @@ pub fn solve(
                 p[1] + u[node * 3 + 1],
                 p[2] + u[node * 3 + 2],
             ];
-            if !rigid.is_inside([deformed[0], deformed[1], deformed[2] - slack]) {
+            let mut probe = deformed;
+            probe[contact_axis] -= contact_sign * slack;
+            if !rigid.is_inside(probe) {
                 continue;
             }
             let surface =
-                rigid_lower_surface(rigid, deformed[0], deformed[1], deformed[2], h, scan_limit)?;
-            let prescribed_uz = surface - p[2];
+                rigid_contact_surface(rigid, deformed, contact_axis, contact_sign, h, scan_limit)?;
+            let prescribed_u = surface - p[contact_axis];
             match active.get(&node) {
-                Some(current) if (current - prescribed_uz).abs() <= slack => {}
+                Some(current) if (current - prescribed_u).abs() <= slack => {}
                 _ => {
-                    active.insert(node, prescribed_uz);
+                    active.insert(node, prescribed_u);
                     set_changes += 1;
                 }
             }
@@ -464,14 +485,14 @@ pub fn solve(
 
         // Refresh the constraint arrays and warm-started solution.
         for node in 0..node_count {
-            let dof = node * 3 + 2;
+            let dof = node * 3 + contact_axis;
             if fixed_node[node] {
                 continue;
             }
             match active.get(&node) {
-                Some(uz) => {
+                Some(value) => {
                     constrained[dof] = true;
-                    prescribed[dof] = *uz;
+                    prescribed[dof] = *value;
                 }
                 None => {
                     constrained[dof] = false;
@@ -506,19 +527,20 @@ pub fn solve(
         }
 
         // Reactions: external force = K u at constrained dofs. A contact
-        // constraint may only press down (f_z <= 0); meaningfully tensile
-        // ones release. The threshold is relative to the peak compression so
-        // noise-level forces at grazing rim nodes don't cycle the set.
+        // constraint may only press toward the glued face (f·sign <= 0);
+        // meaningfully tensile ones release. The threshold is relative to
+        // the peak compression so noise-level forces at grazing rim nodes
+        // don't cycle the set.
         op.apply_unmasked(&u, &mut forces);
         let peak_compression = active
             .keys()
-            .map(|node| -forces[node * 3 + 2])
+            .map(|node| -contact_sign * forces[node * 3 + contact_axis])
             .fold(0.0f64, f64::max);
         let release_tol = peak_compression * 1e-3;
         let released: Vec<usize> = active
             .keys()
             .copied()
-            .filter(|node| forces[node * 3 + 2] > release_tol)
+            .filter(|node| contact_sign * forces[node * 3 + contact_axis] > release_tol)
             .collect();
         for node in &released {
             active.remove(node);
@@ -535,7 +557,7 @@ pub fn solve(
     op_final_forces(mesh, &ke, &scales, &u, &mut forces);
     let mut contact_force = vec![0.0f64; n];
     for node in active.keys() {
-        contact_force[node * 3 + 2] = forces[node * 3 + 2];
+        contact_force[node * 3 + contact_axis] = forces[node * 3 + contact_axis];
     }
 
     // Strain energy density per element: (1/2) u_e^T K_e u_e / h^3.
@@ -821,6 +843,54 @@ mod tests {
     }
 
     #[test]
+    fn contact_axis_follows_the_fixed_boundary() {
+        // The fea_test.vproj scenario: default 2x2x2 box at the origin,
+        // sphere translated along +y to (0, 1.9, 0), glued at ymin. Contact
+        // must press along -y (it used to be hardcoded to -z, which turned
+        // this into garbage constraints and a livelock).
+        let mut mesh = grid_mesh(8, 8, 8, 0.25);
+        for v in mesh.node_positions.iter_mut() {
+            *v -= 1.0; // shift to [-1, 1]^3
+        }
+        let center = [0.0, 1.9, 0.0];
+        let mut sphere =
+            move |p: [f64; 3]| (0..3).map(|i| (p[i] - center[i]).powi(2)).sum::<f64>() < 1.0;
+        let solve_config = SolveConfig {
+            fixed_boundary: FixedBoundary::YMin,
+            ..config(0.3)
+        };
+        let result = solve(&mesh, &mut sphere, &solve_config).unwrap();
+        assert!(result.stats.converged, "stats: {:?}", result.stats);
+        assert!(result.stats.active_contacts > 0);
+
+        // The face-center node (0, 1, 0) is pressed 0.1 along -y.
+        let face_center = (0..mesh.node_count())
+            .find(|node| {
+                let p = mesh.node_position(*node);
+                p[0].abs() < 1e-9 && (p[1] - 1.0).abs() < 1e-9 && p[2].abs() < 1e-9
+            })
+            .unwrap();
+        let uy = result.displacement[face_center * 3 + 1];
+        assert!(
+            (uy + 0.1).abs() < 1e-4,
+            "face-center u_y {uy}, expected -0.1"
+        );
+
+        // Forces act along y (toward the glued face), none along z.
+        let total_fy: f64 = (0..mesh.node_count())
+            .map(|node| result.contact_force[node * 3 + 1])
+            .sum();
+        assert!(
+            total_fy < 0.0,
+            "net force must press toward ymin: {total_fy}"
+        );
+        assert!(
+            (0..mesh.node_count()).all(|node| result.contact_force[node * 3 + 2] == 0.0),
+            "no z contact forces expected"
+        );
+    }
+
+    #[test]
     fn non_uniform_meshes_are_rejected() {
         let mut mesh = grid_mesh(2, 2, 2, 0.5);
         mesh.node_positions[5] += 0.05; // perturb one node
@@ -832,6 +902,6 @@ mod tests {
     fn engulfing_rigid_body_is_an_error() {
         let mesh = grid_mesh(2, 2, 2, 0.5);
         let err = solve(&mesh, &mut |_p: [f64; 3]| true, &config(0.3)).unwrap_err();
-        assert!(err.contains("engulfs"), "unexpected error: {err}");
+        assert!(err.contains("engulf"), "unexpected error: {err}");
     }
 }

@@ -2,9 +2,11 @@
 //!
 //! Compresses an FEA mesh against a rigid implicit body with linear
 //! elasticity (see `fea_core` for scope: uniform hex grids, Hooke's law,
-//! quasi-static single pose, vertical active-set contact). The rigid body
-//! is sampled where the user placed it — position it already
-//! interpenetrating the mesh, in the fully pressed pose.
+//! quasi-static single pose, active-set contact). The rigid body is sampled
+//! where the user placed it — position it already interpenetrating the
+//! mesh, in the fully pressed pose. Contact presses along the
+//! `fixed_boundary` axis, toward the glued face (glue zmin, press with a
+//! body from +z; glue ymin, press from +y; ...).
 //!
 //! Inputs:
 //! - Input 0: FeaMesh (from `fea_grid_mesh_operator`; an optional
@@ -84,10 +86,12 @@ fn run_solve(config: &SolveOperatorConfig) -> Result<FeaMesh, String> {
         return Err(format!(
             "solve did not converge ({} contact iterations, {} CG iterations, \
              {} active contacts); check that the mesh is held by fixed_boundary \
-             and the rigid body only presses from above",
+             ({}) and that the rigid body presses toward that face from the \
+             opposite side",
             result.stats.contact_iterations,
             result.stats.cg_iterations,
-            result.stats.active_contacts
+            result.stats.active_contacts,
+            config.fixed_boundary
         ));
     }
 
