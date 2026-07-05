@@ -41,6 +41,21 @@ pub struct SnapConfig {
     /// must have material just inside and none just outside along the mean
     /// side normal. Set to 0 to disable (e.g. when no sampler is available).
     pub verify_delta_cells: f64,
+    /// Bisection iterations for sampler refinement of the snap target. The
+    /// fitted side planes are secants on curved faces (a plane through a
+    /// cylinder-rim arc sits inside the true tangent), which biases the
+    /// intersection target inward and modulates with grid alignment — visible
+    /// as rim wobble. Refinement bisects the occupancy boundary along each
+    /// side's outward normal so the target lands on the model's actual
+    /// surfaces instead of on the fitted planes. 0 disables (also disabled
+    /// when no sampler is available); exact for planar faces either way.
+    pub refine_iterations: usize,
+    /// Bisection bracket half-width (cell units) around the plane-fit target.
+    pub refine_bracket_cells: f64,
+    /// While bisecting one side, the probe line is shifted this far (cell
+    /// units) to the material side of the *other* sides, so it crosses only
+    /// the surface being refined.
+    pub refine_offset_cells: f64,
 }
 
 impl Default for SnapConfig {
@@ -53,6 +68,9 @@ impl Default for SnapConfig {
             min_corner_det: 0.05,
             max_move_cells: 1.5,
             verify_delta_cells: 0.6,
+            refine_iterations: 12,
+            refine_bracket_cells: 0.75,
+            refine_offset_cells: 0.25,
         }
     }
 }
@@ -195,7 +213,7 @@ pub fn snap_feature_vertices(
                 }
             }
         }
-        let (p, kind) = target.unwrap();
+        let (mut p, kind) = target.unwrap();
 
         if !p.is_finite() {
             stats.rejected_nonfinite += 1;
@@ -206,28 +224,41 @@ pub fn snap_feature_vertices(
             continue;
         }
 
-        // Verify against the sampler: material just inside, none just outside
-        // along the mean outward side normal. PCA normals have arbitrary
-        // sign, so each side is first oriented outward with one probe at its
-        // own centroid (far from the feature, so the probe is unambiguous).
-        if config.verify_delta_cells > 0.0
-            && let Some(is_inside) = sampler
-        {
-            let delta = config.verify_delta_cells * cell;
-            let mean: DVec3 = planes
+        if let Some(is_inside) = sampler {
+            // PCA normals have arbitrary sign; orient each participating side
+            // outward with one probe at its own centroid (far from the
+            // feature, so the probe is unambiguous).
+            let delta = config.verify_delta_cells.max(0.5) * cell;
+            let outward: Vec<DVec3> = planes
                 .iter()
                 .take(if kind == SnapKind::Corner { 3 } else { 2 })
                 .map(|s| orient_outward(s, is_inside, delta))
-                .sum();
-            let Some(b) = mean.try_normalize() else {
-                stats.rejected_verify += 1;
-                continue;
-            };
-            let inside_ok = is_inside(p - b * delta);
-            let outside_ok = !is_inside(p + b * delta);
-            if !(inside_ok && outside_ok) {
-                stats.rejected_verify += 1;
-                continue;
+                .collect();
+
+            // Refine the target onto the model's actual occupancy boundary.
+            // The clamp is re-checked because refinement moves the target;
+            // exceeding it falls back to the already-clamped plane target.
+            if config.refine_iterations > 0 {
+                let refined = refine_target(p, &outward, cell, config, is_inside);
+                if refined.is_finite() && (refined - origin).length() <= max_move {
+                    p = refined;
+                }
+            }
+
+            // Verify: material just inside, none just outside along the mean
+            // outward side normal.
+            if config.verify_delta_cells > 0.0 {
+                let delta = config.verify_delta_cells * cell;
+                let Some(b) = outward.iter().sum::<DVec3>().try_normalize() else {
+                    stats.rejected_verify += 1;
+                    continue;
+                };
+                let inside_ok = is_inside(p - b * delta);
+                let outside_ok = !is_inside(p + b * delta);
+                if !(inside_ok && outside_ok) {
+                    stats.rejected_verify += 1;
+                    continue;
+                }
             }
         }
 
@@ -297,6 +328,87 @@ fn gather_side_planes(
         });
     }
     planes
+}
+
+/// Refine a plane-intersection target onto the model's actual occupancy
+/// boundary. For each side, bisect along its outward normal, with the probe
+/// line shifted slightly to the material side of the other sides so it
+/// crosses only the surface being refined. Planar faces refine to themselves
+/// (up to bisection resolution); on curved faces this replaces the fitted
+/// plane's secant with the true surface. Sides whose bracket doesn't straddle
+/// the boundary contribute no correction, so a bad bracket can never make the
+/// target worse than the plane intersection it started from.
+fn refine_target(
+    target: DVec3,
+    outward: &[DVec3],
+    cell: f64,
+    config: &SnapConfig,
+    is_inside: &dyn Fn(DVec3) -> bool,
+) -> DVec3 {
+    let bracket = config.refine_bracket_cells * cell;
+    let offset_len = config.refine_offset_cells * cell;
+    let mut p = target;
+    // Two rounds: the solve is exact for planar faces, the second round
+    // cleans up what curvature shifted under the first round's probes.
+    for _ in 0..2 {
+        // Measure each side's signed offset: how far p must move along the
+        // side's outward normal to sit on that side's surface.
+        let mut measured: Vec<(DVec3, f64)> = Vec::new();
+        for (i, &n) in outward.iter().enumerate() {
+            let inward_rest: DVec3 = outward
+                .iter()
+                .enumerate()
+                .filter(|&(j, _)| j != i)
+                .map(|(_, &m)| -m)
+                .sum();
+            let Some(offset_dir) = inward_rest.try_normalize() else {
+                continue;
+            };
+            let base = p + offset_dir * offset_len;
+            let (mut lo, mut hi) = (-bracket, bracket);
+            if !is_inside(base + n * lo) || is_inside(base + n * hi) {
+                continue;
+            }
+            for _ in 0..config.refine_iterations {
+                let mid = 0.5 * (lo + hi);
+                if is_inside(base + n * mid) {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            // The crossing was measured on the offset probe line; adding the
+            // offset's normal component back expresses it as a constraint at
+            // p itself (offset_dir isn't perpendicular to n unless the sides
+            // are orthogonal).
+            measured.push((n, 0.5 * (lo + hi) + n.dot(offset_dir) * offset_len));
+        }
+        // Solve the joint constraints n_i . (p' - p) = d_i with minimal
+        // movement — the same solves as the plane intersections, but against
+        // measured surface positions instead of fitted planes. Conditioning
+        // was already gated when the target was accepted; the guards here
+        // only protect against division blow-ups.
+        match measured.as_slice() {
+            [(n, d)] => p += *n * *d,
+            [(n1, d1), (n2, d2)] => {
+                let dot = n1.dot(*n2);
+                let det = 1.0 - dot * dot;
+                if det > 1e-4 {
+                    let alpha = (d1 - dot * d2) / det;
+                    let beta = (d2 - dot * d1) / det;
+                    p += *n1 * alpha + *n2 * beta;
+                }
+            }
+            [(n1, d1), (n2, d2), (n3, d3)] => {
+                let det = n1.dot(n2.cross(*n3));
+                if det.abs() > 1e-3 {
+                    p += (n2.cross(*n3) * *d1 + n3.cross(*n1) * *d2 + n1.cross(*n2) * *d3) / det;
+                }
+            }
+            _ => {}
+        }
+    }
+    p
 }
 
 /// Orient a side plane normal to point out of the material, determined by one
@@ -402,6 +514,51 @@ mod tests {
         let b = plane(DVec3::new(1.0, 0.02, 0.0), DVec3::ZERO);
         let c = plane(DVec3::new(1.0, 0.0, 0.03), DVec3::ZERO);
         assert!(intersect_three_planes(&a, &b, &c, 0.05).is_none());
+    }
+
+    /// Refinement must pull a plane-fit target off its secant onto the true
+    /// curved surface: cylinder rim, radius 20 cells, cap at z = 10.
+    #[test]
+    fn refine_lands_on_curved_rim() {
+        let config = SnapConfig::default();
+        let is_inside = |p: DVec3| p.x * p.x + p.y * p.y <= 400.0 && p.z <= 10.0;
+        // Plane-fit target with the observed failure mode: pulled inward
+        // radially (secant bias), slightly off the cap too.
+        let target = DVec3::new(19.8, 0.0, 9.95);
+        let outward = [DVec3::X, DVec3::Z]; // barrel side, cap side
+        let p = refine_target(target, &outward, 1.0, &config, &is_inside);
+        assert!(
+            (p - DVec3::new(20.0, 0.0, 10.0)).length() < 5e-3,
+            "refined point should land on the rim, got {p:?}"
+        );
+    }
+
+    /// Non-orthogonal sides: the probe-line offset has a component along the
+    /// refined side's normal, which the update must compensate for.
+    #[test]
+    fn refine_is_exact_for_planar_non_orthogonal_wedge() {
+        let config = SnapConfig::default();
+        // Wedge z <= 0 AND x + z <= 0; edge along the y axis through origin.
+        let is_inside = |p: DVec3| p.z <= 0.0 && p.x + p.z <= 0.0;
+        let outward = [DVec3::Z, DVec3::new(1.0, 0.0, 1.0).normalize()];
+        let target = DVec3::new(0.12, 0.3, -0.07);
+        let p = refine_target(target, &outward, 1.0, &config, &is_inside);
+        assert!(
+            (p - DVec3::new(0.0, 0.3, 0.0)).length() < 5e-3,
+            "refined point should land on the wedge edge, got {p:?}"
+        );
+    }
+
+    /// A bracket that doesn't straddle the boundary must contribute no
+    /// correction: the target comes back unchanged, never worse.
+    #[test]
+    fn refine_without_boundary_in_bracket_is_identity() {
+        let config = SnapConfig::default();
+        let is_inside = |_: DVec3| true; // deep inside material
+        let outward = [DVec3::X, DVec3::Z];
+        let target = DVec3::new(1.0, 2.0, 3.0);
+        let p = refine_target(target, &outward, 1.0, &config, &is_inside);
+        assert_eq!(p, target);
     }
 
     /// End-to-end on the synthetic tent: crease vertices must land exactly on
