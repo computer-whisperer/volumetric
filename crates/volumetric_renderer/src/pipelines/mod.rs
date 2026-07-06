@@ -16,7 +16,7 @@ mod point;
 mod ssao;
 
 pub use composite::CompositePipeline;
-pub use line::LinePipeline;
-pub use mesh::{MeshPipeline, MeshUniforms};
-pub use point::PointPipeline;
+pub use line::{GpuLines, LinePipeline};
+pub use mesh::{GpuMesh, MeshPipeline, MeshUniforms};
+pub use point::{GpuPoints, PointPipeline};
 pub use ssao::{SsaoPipeline, SsaoUniforms};

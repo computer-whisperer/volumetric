@@ -3,10 +3,118 @@
 //! Renders triangle meshes to the G-buffer with deferred shading data.
 
 use bytemuck::{Pod, Zeroable};
-use glam::Mat4;
+use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
 
-use crate::{DynamicBuffer, MeshVertex};
+use crate::{DynamicBuffer, MeshData, MeshVertex};
+
+/// A mesh resident on the GPU: world-space vertices (the transform is
+/// applied at creation) uploaded once and drawn by reference each frame,
+/// so rebuilding a preview is the only time its dense buffers travel to
+/// the device. Created by [`GpuMesh::new`]; drawn via
+/// `Renderer::submit_retained_mesh`.
+pub struct GpuMesh {
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: Option<wgpu::Buffer>,
+    draw_count: u32,
+    /// Triangles dropped at the device's buffer size limit; 0 when the
+    /// whole mesh is resident.
+    pub dropped_triangles: usize,
+    /// Triangles in the source mesh.
+    pub total_triangles: usize,
+}
+
+impl GpuMesh {
+    /// Uploads `data`, transformed to world space, clamping to the
+    /// device's `max_buffer_size` limit (keeping the largest renderable
+    /// triangle prefix and reporting what was dropped).
+    pub fn new(device: &wgpu::Device, data: &MeshData, transform: Mat4) -> Self {
+        let mut vertices: Vec<MeshVertex> = data
+            .vertices
+            .iter()
+            .map(|v| {
+                let pos = transform.transform_point3(Vec3::from(v.position));
+                let normal = transform
+                    .transform_vector3(Vec3::from(v.normal))
+                    .normalize();
+                MeshVertex::colored(pos.into(), normal.into(), v.color)
+            })
+            .collect();
+        let mut indices = data.indices.clone();
+
+        let max_buffer = device.limits().max_buffer_size;
+        let (dropped_triangles, total_triangles) = clamp_mesh_to_budget(
+            &mut vertices,
+            &mut indices,
+            (max_buffer / std::mem::size_of::<MeshVertex>() as u64) as usize,
+            (max_buffer / std::mem::size_of::<u32>() as u64) as usize,
+        );
+
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("retained_mesh_vertex_buffer"),
+            contents: bytemuck::cast_slice(&vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let draw_count = indices
+            .as_ref()
+            .map_or(vertices.len(), |indices| indices.len()) as u32;
+        let index_buffer = indices.map(|indices| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("retained_mesh_index_buffer"),
+                contents: bytemuck::cast_slice(&indices),
+                usage: wgpu::BufferUsages::INDEX,
+            })
+        });
+
+        Self {
+            vertex_buffer,
+            index_buffer,
+            draw_count,
+            dropped_triangles,
+            total_triangles,
+        }
+    }
+}
+
+/// Clamps a single mesh to per-buffer element budgets, keeping the largest
+/// prefix of whole, renderable triangles: vertices are truncated to the
+/// vertex budget, and (for indexed meshes) only triangles whose vertices
+/// all survived are kept. Returns `(dropped_triangles, total_triangles)`.
+fn clamp_mesh_to_budget(
+    vertices: &mut Vec<MeshVertex>,
+    indices: &mut Option<Vec<u32>>,
+    max_vertices: usize,
+    max_indices: usize,
+) -> (usize, usize) {
+    match indices {
+        Some(indices) => {
+            let total = indices.len() / 3;
+            if vertices.len() <= max_vertices && indices.len() <= max_indices {
+                return (0, total);
+            }
+            let kept_vertices = vertices.len().min(max_vertices);
+            vertices.truncate(kept_vertices);
+            let in_range = kept_vertices as u32;
+            let mut kept = Vec::new();
+            for triple in indices.chunks_exact(3) {
+                if kept.len() + 3 > max_indices {
+                    break;
+                }
+                if triple.iter().all(|&i| i < in_range) {
+                    kept.extend_from_slice(triple);
+                }
+            }
+            *indices = kept;
+            (total - indices.len() / 3, total)
+        }
+        None => {
+            let total = vertices.len() / 3;
+            let kept = (vertices.len().min(max_vertices) / 3) * 3;
+            vertices.truncate(kept);
+            (total - kept / 3, total)
+        }
+    }
+}
 
 /// Uniform data for mesh rendering.
 #[repr(C)]
@@ -259,6 +367,34 @@ impl MeshPipeline {
         }
     }
 
+    /// Draw retained meshes into the G-buffer pass. Shares the immediate
+    /// path's pipeline and uniforms (retained vertices are world-space).
+    pub fn render_retained<'a>(
+        &'a self,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        meshes: &'a [std::sync::Arc<GpuMesh>],
+    ) {
+        if meshes.is_empty() {
+            return;
+        }
+
+        render_pass.set_pipeline(&self.pipeline);
+        render_pass.set_bind_group(0, &self.bind_group, &[]);
+        for mesh in meshes {
+            if mesh.draw_count == 0 {
+                continue;
+            }
+            render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+            match &mesh.index_buffer {
+                Some(indices) => {
+                    render_pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+                    render_pass.draw_indexed(0..mesh.draw_count, 0, 0..1);
+                }
+                None => render_pass.draw(0..mesh.draw_count, 0..1),
+            }
+        }
+    }
+
     /// Get the number of vertices currently uploaded.
     pub fn vertex_count(&self) -> usize {
         self.vertex_buffer.len()
@@ -267,5 +403,67 @@ impl MeshPipeline {
     /// Get the number of indices currently uploaded.
     pub fn index_count(&self) -> usize {
         self.index_buffer.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn verts(n: usize) -> Vec<MeshVertex> {
+        vec![MeshVertex::new([0.0; 3], [0.0, 1.0, 0.0]); n]
+    }
+
+    /// Meshes within both budgets pass through untouched.
+    #[test]
+    fn clamp_is_a_no_op_within_budget() {
+        let mut vertices = verts(6);
+        let mut indices = Some(vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(
+            clamp_mesh_to_budget(&mut vertices, &mut indices, 6, 6),
+            (0, 2)
+        );
+        assert_eq!(vertices.len(), 6);
+        assert_eq!(indices.unwrap().len(), 6);
+    }
+
+    /// Indexed meshes keep only triangles whose vertices all survived the
+    /// vertex clamp, then bow to the index budget in whole triangles.
+    #[test]
+    fn clamp_filters_indexed_triangles_past_the_vertex_budget() {
+        let mut vertices = verts(6);
+        // Triangles: (0,1,2) survives, (1,2,5) references a clamped vertex.
+        let mut indices = Some(vec![0, 1, 2, 1, 2, 5]);
+        assert_eq!(
+            clamp_mesh_to_budget(&mut vertices, &mut indices, 5, 100),
+            (1, 2)
+        );
+        assert_eq!(vertices.len(), 5);
+        assert_eq!(indices.unwrap(), vec![0, 1, 2]);
+    }
+
+    /// The index budget truncates to whole triangles.
+    #[test]
+    fn clamp_truncates_to_the_index_budget() {
+        let mut vertices = verts(3);
+        let mut indices = Some(vec![0, 1, 2, 2, 1, 0, 1, 0, 2]);
+        assert_eq!(
+            clamp_mesh_to_budget(&mut vertices, &mut indices, 100, 7),
+            (1, 3)
+        );
+        assert_eq!(indices.unwrap().len(), 6);
+    }
+
+    /// Non-indexed soups truncate to whole triangles within the vertex
+    /// budget.
+    #[test]
+    fn clamp_truncates_soups_to_whole_triangles() {
+        let mut vertices = verts(9);
+        let mut indices = None;
+        assert_eq!(
+            clamp_mesh_to_budget(&mut vertices, &mut indices, 8, 100),
+            (1, 3)
+        );
+        assert_eq!(vertices.len(), 6);
     }
 }

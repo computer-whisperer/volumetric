@@ -51,8 +51,8 @@ pub use callback::SceneCallback;
 pub use camera::{Camera, CameraAction, CameraControlScheme, CameraInputState};
 pub use gbuffer::{AoTexture, GBuffer};
 pub use pipelines::{
-    CompositePipeline, LinePipeline, MeshPipeline, MeshUniforms, PointPipeline, SsaoPipeline,
-    SsaoUniforms,
+    CompositePipeline, GpuLines, GpuMesh, GpuPoints, LinePipeline, MeshPipeline, MeshUniforms,
+    PointPipeline, SsaoPipeline, SsaoUniforms,
 };
 pub use scene::{SceneData, SceneDrawData};
 pub use types::{
@@ -95,10 +95,11 @@ impl RendererCapabilities {
 /// explainable.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GeometryOverflow {
-    /// Mesh vertices dropped (whole meshes are dropped, never partial ones).
-    pub dropped_mesh_vertices: usize,
-    /// Total mesh vertices submitted this frame.
-    pub total_mesh_vertices: usize,
+    /// Mesh triangles dropped, across immediate submissions (which drop
+    /// whole meshes) and retained meshes (clamped at creation).
+    pub dropped_triangles: usize,
+    /// Total mesh triangles submitted this frame.
+    pub total_triangles: usize,
     /// Line instances dropped across the depth-tested and overlay passes.
     pub dropped_lines: usize,
     /// Point instances dropped across the depth-tested and overlay passes.
@@ -110,8 +111,20 @@ pub struct GeometryOverflow {
 impl GeometryOverflow {
     /// Whether anything was actually dropped.
     pub fn any(&self) -> bool {
-        self.dropped_mesh_vertices > 0 || self.dropped_lines > 0 || self.dropped_points > 0
+        self.dropped_triangles > 0 || self.dropped_lines > 0 || self.dropped_points > 0
     }
+}
+
+/// One scene's geometry uploaded as retained GPU residents (transforms
+/// applied at creation): the once-per-rebuild counterpart of submitting a
+/// [`SceneData`] every frame. Hold it for as long as the scene should be
+/// drawable and submit the handles each frame via
+/// [`Renderer::submit_retained_mesh`] and friends.
+#[derive(Default)]
+pub struct RetainedScene {
+    pub meshes: Vec<std::sync::Arc<GpuMesh>>,
+    pub lines: Vec<std::sync::Arc<GpuLines>>,
+    pub points: Vec<std::sync::Arc<GpuPoints>>,
 }
 
 /// Drops trailing items that don't fit in one buffer of `max_bytes`;
@@ -138,8 +151,8 @@ struct SubmittedMesh {
 /// dropping whole meshes once either buffer budget would overflow — a
 /// partially uploaded indexed mesh would render as garbage, and buffers
 /// past the device limit are a validation panic. Earlier meshes keep
-/// rendering. Returns `(vertices, indices, use_indices, dropped_vertices,
-/// total_vertices)`.
+/// rendering. Returns `(vertices, indices, use_indices, dropped_triangles,
+/// total_triangles)`.
 fn flatten_meshes_within_budget(
     meshes: &[SubmittedMesh],
     max_vertices: usize,
@@ -148,17 +161,22 @@ fn flatten_meshes_within_budget(
     let mut all_vertices = Vec::new();
     let mut all_indices = Vec::new();
     let mut use_indices = false;
-    let mut dropped_vertices = 0usize;
-    let mut total_vertices = 0usize;
+    let mut dropped_triangles = 0usize;
+    let mut total_triangles = 0usize;
 
     for submitted in meshes {
         let vertex_count = submitted.data.vertices.len();
         let index_count = submitted.data.indices.as_ref().map_or(0, |i| i.len());
-        total_vertices += vertex_count;
+        let triangle_count = if submitted.data.indices.is_some() {
+            index_count / 3
+        } else {
+            vertex_count / 3
+        };
+        total_triangles += triangle_count;
         if all_vertices.len() + vertex_count > max_vertices
             || all_indices.len() + index_count > max_indices
         {
-            dropped_vertices += vertex_count;
+            dropped_triangles += triangle_count;
             continue;
         }
 
@@ -187,8 +205,8 @@ fn flatten_meshes_within_budget(
         all_vertices,
         all_indices,
         use_indices,
-        dropped_vertices,
-        total_vertices,
+        dropped_triangles,
+        total_triangles,
     )
 }
 
@@ -246,6 +264,12 @@ pub struct Renderer {
     frame_lines: Vec<SubmittedLines>,
     frame_points: Vec<SubmittedPoints>,
 
+    // Retained geometry submitted for the current frame (GPU-resident;
+    // no per-frame CPU flatten or upload)
+    frame_retained_meshes: Vec<std::sync::Arc<GpuMesh>>,
+    frame_retained_lines: Vec<std::sync::Arc<GpuLines>>,
+    frame_retained_points: Vec<std::sync::Arc<GpuPoints>>,
+
     // Grid line cache (regenerated when settings change)
     cached_grid_lines: Vec<LineSegment>,
     cached_grid_settings_hash: u64,
@@ -267,6 +291,9 @@ impl Renderer {
             frame_meshes: Vec::new(),
             frame_lines: Vec::new(),
             frame_points: Vec::new(),
+            frame_retained_meshes: Vec::new(),
+            frame_retained_lines: Vec::new(),
+            frame_retained_points: Vec::new(),
             cached_grid_lines: Vec::new(),
             cached_grid_settings_hash: 0,
             capabilities: None,
@@ -412,6 +439,81 @@ impl Renderer {
         });
     }
 
+    /// Uploads a scene's geometry as retained GPU residents (transforms
+    /// applied now, on the CPU, once). The empty scene is returned before
+    /// [`initialize`](Self::initialize).
+    pub fn create_retained_scene(&self, device: &wgpu::Device, scene: &SceneData) -> RetainedScene {
+        let Some(gpu) = &self.gpu else {
+            return RetainedScene::default();
+        };
+        RetainedScene {
+            meshes: scene
+                .meshes
+                .iter()
+                .map(|(mesh, transform, _)| {
+                    std::sync::Arc::new(GpuMesh::new(device, mesh, *transform))
+                })
+                .collect(),
+            lines: scene
+                .lines
+                .iter()
+                .map(|(lines, transform, style)| {
+                    std::sync::Arc::new(gpu.line_pipeline.create_retained(
+                        device,
+                        &lines.segments,
+                        *transform,
+                        style,
+                    ))
+                })
+                .collect(),
+            points: scene
+                .points
+                .iter()
+                .map(|(points, transform, style)| {
+                    std::sync::Arc::new(gpu.point_pipeline.create_retained(
+                        device,
+                        &points.points,
+                        *transform,
+                        style,
+                    ))
+                })
+                .collect(),
+        }
+    }
+
+    /// Uploads one line batch as a retained GPU resident. `None` before
+    /// [`initialize`](Self::initialize).
+    pub fn create_retained_lines(
+        &self,
+        device: &wgpu::Device,
+        lines: &LineData,
+        transform: Mat4,
+        style: &LineStyle,
+    ) -> Option<std::sync::Arc<GpuLines>> {
+        let gpu = self.gpu.as_ref()?;
+        Some(std::sync::Arc::new(gpu.line_pipeline.create_retained(
+            device,
+            &lines.segments,
+            transform,
+            style,
+        )))
+    }
+
+    /// Submit a retained mesh for this frame.
+    pub fn submit_retained_mesh(&mut self, mesh: &std::sync::Arc<GpuMesh>) {
+        self.frame_retained_meshes.push(mesh.clone());
+    }
+
+    /// Submit a retained line batch for this frame.
+    pub fn submit_retained_lines(&mut self, lines: &std::sync::Arc<GpuLines>) {
+        self.frame_retained_lines.push(lines.clone());
+    }
+
+    /// Submit a retained point batch for this frame.
+    pub fn submit_retained_points(&mut self, points: &std::sync::Arc<GpuPoints>) {
+        self.frame_retained_points.push(points.clone());
+    }
+
     /// Execute all rendering for the frame.
     ///
     /// This performs all render passes in order:
@@ -443,6 +545,18 @@ impl Renderer {
             max_buffer_bytes,
             ..GeometryOverflow::default()
         };
+        // Retained geometry was clamped at creation; fold what it dropped
+        // into this frame's report.
+        for mesh in &self.frame_retained_meshes {
+            self.frame_overflow.dropped_triangles += mesh.dropped_triangles;
+            self.frame_overflow.total_triangles += mesh.total_triangles;
+        }
+        for lines in &self.frame_retained_lines {
+            self.frame_overflow.dropped_lines += lines.dropped;
+        }
+        for points in &self.frame_retained_points {
+            self.frame_overflow.dropped_points += points.dropped;
+        }
 
         let Some(gpu) = &mut self.gpu else {
             return;
@@ -456,17 +570,19 @@ impl Renderer {
         // =================================================================
         // Pass 1: Mesh G-Buffer
         // =================================================================
-        if !self.frame_meshes.is_empty() {
-            // Collect all mesh vertices (transformed), keeping within what
-            // one vertex/index buffer may hold.
+        let has_meshes = !self.frame_meshes.is_empty() || !self.frame_retained_meshes.is_empty();
+        if has_meshes {
+            // Collect immediate mesh vertices (transformed), keeping within
+            // what one vertex/index buffer may hold. Retained meshes are
+            // already GPU-resident and skip all of this.
             let (all_vertices, all_indices, use_indices, dropped, total) =
                 flatten_meshes_within_budget(
                     &self.frame_meshes,
                     (max_buffer_bytes / std::mem::size_of::<MeshVertex>() as u64) as usize,
                     (max_buffer_bytes / std::mem::size_of::<u32>() as u64) as usize,
                 );
-            self.frame_overflow.dropped_mesh_vertices = dropped;
-            self.frame_overflow.total_mesh_vertices = total;
+            self.frame_overflow.dropped_triangles += dropped;
+            self.frame_overflow.total_triangles += total;
 
             // Upload mesh data
             gpu.mesh_pipeline
@@ -538,6 +654,8 @@ impl Renderer {
                 });
 
                 gpu.mesh_pipeline.render(&mut pass, use_indices);
+                gpu.mesh_pipeline
+                    .render_retained(&mut pass, &self.frame_retained_meshes);
             }
 
             // =================================================================
@@ -600,10 +718,10 @@ impl Renderer {
         {
             // When there are no meshes, the depth buffer was never initialized.
             // We need to clear it in that case for subsequent passes (lines/points).
-            let depth_load_op = if self.frame_meshes.is_empty() {
-                wgpu::LoadOp::Clear(1.0) // Clear to far plane
-            } else {
+            let depth_load_op = if has_meshes {
                 wgpu::LoadOp::Load // Keep depth from mesh pass
+            } else {
+                wgpu::LoadOp::Clear(1.0) // Clear to far plane
             };
 
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -635,7 +753,7 @@ impl Renderer {
                 multiview_mask: None,
             });
 
-            if !self.frame_meshes.is_empty() {
+            if has_meshes {
                 gpu.composite_pipeline
                     .render(&mut pass, &gpu.composite_bind_group);
             }
@@ -728,6 +846,28 @@ impl Renderer {
                 point_pipeline.update_uniforms(queue, &uniforms);
             }
 
+            // Refresh retained batches' per-frame camera uniforms
+            for batch in &self.frame_retained_lines {
+                if batch.depth_mode() == DepthMode::Normal {
+                    line_pipeline.write_retained_uniforms(
+                        queue,
+                        batch,
+                        view_proj_array,
+                        screen_size,
+                    );
+                }
+            }
+            for batch in &self.frame_retained_points {
+                if batch.depth_mode() == DepthMode::Normal {
+                    point_pipeline.write_retained_uniforms(
+                        queue,
+                        batch,
+                        view_proj_array,
+                        screen_size,
+                    );
+                }
+            }
+
             // Now start the render pass
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("forward_pass"),
@@ -759,6 +899,16 @@ impl Renderer {
             }
             if !all_point_instances.is_empty() {
                 point_pipeline.render(&mut pass, DepthMode::Normal);
+            }
+            for batch in &self.frame_retained_lines {
+                if batch.depth_mode() == DepthMode::Normal {
+                    line_pipeline.render_retained(&mut pass, batch);
+                }
+            }
+            for batch in &self.frame_retained_points {
+                if batch.depth_mode() == DepthMode::Normal {
+                    point_pipeline.render_retained(&mut pass, batch);
+                }
             }
         }
 
@@ -843,6 +993,28 @@ impl Renderer {
                 point_pipeline.update_uniforms(queue, &uniforms);
             }
 
+            // Refresh retained batches' per-frame camera uniforms
+            for batch in &self.frame_retained_lines {
+                if batch.depth_mode() == DepthMode::Overlay {
+                    line_pipeline.write_retained_uniforms(
+                        queue,
+                        batch,
+                        view_proj_array,
+                        screen_size,
+                    );
+                }
+            }
+            for batch in &self.frame_retained_points {
+                if batch.depth_mode() == DepthMode::Overlay {
+                    point_pipeline.write_retained_uniforms(
+                        queue,
+                        batch,
+                        view_proj_array,
+                        screen_size,
+                    );
+                }
+            }
+
             // Now start the render pass
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("overlay_pass"),
@@ -875,6 +1047,16 @@ impl Renderer {
             if !all_point_instances.is_empty() {
                 point_pipeline.render(&mut pass, DepthMode::Overlay);
             }
+            for batch in &self.frame_retained_lines {
+                if batch.depth_mode() == DepthMode::Overlay {
+                    line_pipeline.render_retained(&mut pass, batch);
+                }
+            }
+            for batch in &self.frame_retained_points {
+                if batch.depth_mode() == DepthMode::Overlay {
+                    point_pipeline.render_retained(&mut pass, batch);
+                }
+            }
         }
     }
 
@@ -883,6 +1065,9 @@ impl Renderer {
         self.frame_meshes.clear();
         self.frame_lines.clear();
         self.frame_points.clear();
+        self.frame_retained_meshes.clear();
+        self.frame_retained_lines.clear();
+        self.frame_retained_points.clear();
     }
 
     /// Geometry the most recent [`render`](Self::render) dropped because it
@@ -1059,46 +1244,46 @@ mod tests {
     #[test]
     fn flatten_drops_only_meshes_that_overflow_the_budget() {
         let meshes = [
-            submitted(10, true),
-            submitted(100, true),
-            submitted(20, true),
+            submitted(12, true),
+            submitted(99, true),
+            submitted(21, true),
         ];
-        let (vertices, indices, use_indices, dropped, total) =
+        let (vertices, indices, use_indices, dropped_triangles, total_triangles) =
             flatten_meshes_within_budget(&meshes, 50, usize::MAX);
 
-        assert_eq!(total, 130);
-        assert_eq!(dropped, 100);
-        assert_eq!(vertices.len(), 30);
+        assert_eq!(total_triangles, 4 + 33 + 7);
+        assert_eq!(dropped_triangles, 33);
+        assert_eq!(vertices.len(), 33);
         assert!(use_indices);
         // The third mesh's indices are rebased onto the compacted soup.
-        assert_eq!(indices[10], 10);
-        assert_eq!(*indices.last().unwrap(), 29);
+        assert_eq!(indices[12], 12);
+        assert_eq!(*indices.last().unwrap(), 32);
     }
 
     /// The index budget is enforced independently of the vertex budget.
     #[test]
     fn flatten_enforces_the_index_budget() {
-        let meshes = [submitted(10, true), submitted(10, true)];
-        let (vertices, indices, _, dropped, total) =
+        let meshes = [submitted(12, true), submitted(12, true)];
+        let (vertices, indices, _, dropped_triangles, total_triangles) =
             flatten_meshes_within_budget(&meshes, usize::MAX, 15);
 
-        assert_eq!(total, 20);
-        assert_eq!(dropped, 10);
-        assert_eq!(vertices.len(), 10);
-        assert_eq!(indices.len(), 10);
+        assert_eq!(total_triangles, 8);
+        assert_eq!(dropped_triangles, 4);
+        assert_eq!(vertices.len(), 12);
+        assert_eq!(indices.len(), 12);
     }
 
     /// Everything fits: nothing dropped and no overflow to report.
     #[test]
     fn flatten_within_budget_drops_nothing() {
-        let meshes = [submitted(10, false), submitted(20, false)];
-        let (vertices, indices, use_indices, dropped, total) =
+        let meshes = [submitted(12, false), submitted(18, false)];
+        let (vertices, indices, use_indices, dropped_triangles, total_triangles) =
             flatten_meshes_within_budget(&meshes, 30, 30);
 
         assert_eq!((vertices.len(), indices.len()), (30, 0));
         assert!(!use_indices);
-        assert_eq!(dropped, 0);
-        assert_eq!(total, 30);
+        assert_eq!(dropped_triangles, 0);
+        assert_eq!(total_triangles, 10);
         assert!(!GeometryOverflow::default().any());
     }
 

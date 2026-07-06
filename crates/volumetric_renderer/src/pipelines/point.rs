@@ -72,6 +72,28 @@ impl PartialEq for PointUniforms {
     }
 }
 
+/// A point batch resident on the GPU: world-space instances uploaded once
+/// (at build time), drawn by reference each frame. Owns its uniform buffer
+/// and bind group (per-batch style + per-frame camera); the renderer
+/// refreshes the uniforms each frame with a small write. Created by
+/// [`PointPipeline::create_retained`].
+pub struct GpuPoints {
+    instance_buffer: wgpu::Buffer,
+    count: u32,
+    uniform_buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    pub(crate) style: PointStyle,
+    /// Instances dropped at the device's buffer size limit.
+    pub dropped: usize,
+}
+
+impl GpuPoints {
+    /// The batch's depth mode (which render pass draws it).
+    pub fn depth_mode(&self) -> DepthMode {
+        self.style.depth_mode
+    }
+}
+
 /// Pipeline for rendering points as screen-aligned quads.
 pub struct PointPipeline {
     /// Pipeline for depth-tested points
@@ -335,6 +357,96 @@ impl PointPipeline {
             shape: style.shape.to_shader_value(),
             _pad: [0.0; 7],
         }
+    }
+
+    /// Uploads world-space points as a retained batch, clamped to the
+    /// device's buffer size limit.
+    pub fn create_retained(
+        &self,
+        device: &wgpu::Device,
+        points: &[PointInstance],
+        transform: glam::Mat4,
+        style: &PointStyle,
+    ) -> GpuPoints {
+        let max_instances = (device.limits().max_buffer_size
+            / std::mem::size_of::<GpuPointInstance>().max(1) as u64)
+            as usize;
+        let count = points.len().min(max_instances);
+        let instances: Vec<GpuPointInstance> = points[..count]
+            .iter()
+            .map(|p| GpuPointInstance {
+                position: transform
+                    .transform_point3(glam::Vec3::from(p.position))
+                    .into(),
+                _pad: 0.0,
+                color: p.color,
+            })
+            .collect();
+
+        let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("retained_point_instance_buffer"),
+            contents: bytemuck::cast_slice(&instances),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("retained_point_uniform_buffer"),
+            contents: bytemuck::bytes_of(&PointUniforms::default()),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("retained_point_uniform_bg"),
+            layout: &self.bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            }],
+        });
+
+        GpuPoints {
+            instance_buffer,
+            count: count as u32,
+            uniform_buffer,
+            bind_group,
+            style: style.clone(),
+            dropped: points.len() - count,
+        }
+    }
+
+    /// Refresh a retained batch's uniforms for this frame's camera.
+    pub fn write_retained_uniforms(
+        &self,
+        queue: &wgpu::Queue,
+        batch: &GpuPoints,
+        view_proj: [[f32; 4]; 4],
+        screen_size_px: [f32; 2],
+    ) {
+        let uniforms = Self::create_uniforms(view_proj, screen_size_px, &batch.style);
+        queue.write_buffer(&batch.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+    }
+
+    /// Draw a retained batch (in the pass matching its depth mode).
+    pub fn render_retained<'a>(
+        &'a self,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        batch: &'a GpuPoints,
+    ) {
+        if batch.count == 0 {
+            return;
+        }
+
+        let pipeline = match batch.style.depth_mode {
+            DepthMode::Normal => &self.depth_pipeline,
+            DepthMode::Overlay => &self.overlay_pipeline,
+        };
+        render_pass.set_pipeline(pipeline);
+        render_pass.set_bind_group(0, &batch.bind_group, &[]);
+        render_pass.set_vertex_buffer(0, self.quad_vertex_buffer.buffer().slice(..));
+        render_pass.set_vertex_buffer(1, batch.instance_buffer.slice(..));
+        render_pass.set_index_buffer(
+            self.quad_index_buffer.buffer().slice(..),
+            wgpu::IndexFormat::Uint16,
+        );
+        render_pass.draw_indexed(0..6, 0, 0..batch.count);
     }
 
     /// Record a point render pass.

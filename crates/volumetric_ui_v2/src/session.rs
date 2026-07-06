@@ -347,6 +347,11 @@ struct ViewportRenderer {
     surface_format: wgpu::TextureFormat,
     /// Per-output mesh cache + build bookkeeping (no GPU state; unit-tested).
     preview_cache: PreviewCache,
+    /// GPU residency per output: retained buffers, uploaded once per build
+    /// revision and dropped when the output leaves the viewport. Per frame
+    /// only the handles are submitted — the dense geometry never travels to
+    /// the device again until a rebuild lands.
+    resident: HashMap<String, ResidentEntity>,
     /// Union bounds of the currently composited scene, for the Frame command.
     scene_bounds: Option<PreviewBounds>,
     /// The set of output ids the camera was last framed against. The camera
@@ -355,6 +360,17 @@ struct ViewportRenderer {
     framed_ids: Option<Vec<String>>,
     pending_frame_preview: bool,
     camera: Option<renderer::Camera>,
+}
+
+/// One output's GPU-resident preview geometry.
+struct ResidentEntity {
+    /// The cache revision these buffers were uploaded from.
+    revision: u64,
+    scene: renderer::RetainedScene,
+    /// The prebuilt edge wireframe, uploaded lazily the first frame the
+    /// (display-only) toggle asks for it, then kept for the entity's
+    /// lifetime so toggling stays free.
+    wireframe: Option<Arc<renderer::GpuLines>>,
 }
 
 pub struct ViewportRenderParams<'a> {
@@ -379,6 +395,7 @@ impl ViewportRenderer {
             target,
             surface_format: format,
             preview_cache: PreviewCache::default(),
+            resident: HashMap::new(),
             scene_bounds: None,
             framed_ids: None,
             pending_frame_preview: false,
@@ -428,17 +445,7 @@ impl ViewportRenderer {
         let (w, h) = self.target.extent;
 
         self.renderer.set_viewport_size(device, w, h);
-        let scene = self.resolve_scene(&preview_requests);
-        for (mesh, transform, material) in &scene.meshes {
-            self.renderer.submit_mesh(mesh, *transform, *material);
-        }
-        for (lines, transform, style) in &scene.lines {
-            self.renderer.submit_lines(lines, *transform, style.clone());
-        }
-        for (points, transform, style) in &scene.points {
-            self.renderer
-                .submit_points(points, *transform, style.clone());
-        }
+        self.submit_scene(device, &preview_requests);
         let camera = self
             .camera
             .get_or_insert_with(renderer::test_scenes::create_test_camera)
@@ -523,21 +530,43 @@ impl ViewportRenderer {
         self.renderer.frame_overflow().map(overflow_message)
     }
 
-    /// Composites the cached meshes for the current output set into one scene,
-    /// updating the camera: framing the union bounds when the output set changes
-    /// or a Frame command is pending, and otherwise leaving the user's view. When
-    /// nothing is cached yet it falls back to the renderer test scene.
-    fn resolve_scene(&mut self, requests: &[PreviewRequest]) -> renderer::SceneData {
-        let Some((scene, bounds, ids)) = self.preview_cache.composite(requests) else {
-            // Nothing materialized yet: keep the placeholder scene, don't disturb
-            // the camera the user may already have moved.
+    /// Submits the current output set for rendering, reconciling GPU
+    /// residency with the preview cache: an output's retained buffers are
+    /// created when its build revision changes and merely re-submitted (by
+    /// handle) every other frame. Also updates camera framing — the union
+    /// bounds are framed when the output set changes or a Frame command is
+    /// pending, otherwise the user's view is left alone. When nothing is
+    /// cached yet the immediate-mode placeholder test scene is drawn.
+    fn submit_scene(&mut self, device: &wgpu::Device, requests: &[PreviewRequest]) {
+        let visible = self.preview_cache.visible(requests);
+        if visible.is_empty() {
+            self.resident.clear();
+            // Nothing materialized yet: keep the placeholder scene, don't
+            // disturb the camera the user may already have moved.
             if self.scene_bounds.is_none() {
                 self.camera
                     .get_or_insert_with(renderer::test_scenes::create_test_camera);
             }
-            return renderer::test_scenes::create_test_scene();
-        };
+            let scene = renderer::test_scenes::create_test_scene();
+            for (mesh, transform, material) in &scene.meshes {
+                self.renderer.submit_mesh(mesh, *transform, *material);
+            }
+            for (lines, transform, style) in &scene.lines {
+                self.renderer.submit_lines(lines, *transform, style.clone());
+            }
+            for (points, transform, style) in &scene.points {
+                self.renderer
+                    .submit_points(points, *transform, style.clone());
+            }
+            return;
+        }
 
+        let mut bounds = visible[0].3.bounds;
+        for (_, _, _, entity) in &visible[1..] {
+            bounds = bounds.union(entity.bounds);
+        }
+        let mut ids: Vec<String> = visible.iter().map(|(id, ..)| (*id).to_string()).collect();
+        ids.sort();
         self.scene_bounds = Some(bounds);
         let reframe = self.pending_frame_preview || self.framed_ids.as_ref() != Some(&ids);
         if reframe {
@@ -547,7 +576,54 @@ impl ViewportRenderer {
             self.framed_ids = Some(ids);
             self.pending_frame_preview = false;
         }
-        scene
+
+        let visible_ids: std::collections::HashSet<&str> =
+            visible.iter().map(|(id, ..)| *id).collect();
+        self.resident
+            .retain(|id, _| visible_ids.contains(id.as_str()));
+        for (id, revision, wireframe, entity) in visible {
+            if self
+                .resident
+                .get(id)
+                .is_none_or(|resident| resident.revision != revision)
+            {
+                self.resident.insert(
+                    id.to_string(),
+                    ResidentEntity {
+                        revision,
+                        scene: self.renderer.create_retained_scene(device, &entity.scene),
+                        wireframe: None,
+                    },
+                );
+            }
+            let resident = self
+                .resident
+                .get_mut(id)
+                .expect("resident was just ensured");
+            if wireframe
+                && resident.wireframe.is_none()
+                && let Some(lines) = &entity.wireframe_lines
+            {
+                resident.wireframe = self.renderer.create_retained_lines(
+                    device,
+                    lines,
+                    glam::Mat4::IDENTITY,
+                    &wireframe_style(),
+                );
+            }
+            for mesh in &resident.scene.meshes {
+                self.renderer.submit_retained_mesh(mesh);
+            }
+            for lines in &resident.scene.lines {
+                self.renderer.submit_retained_lines(lines);
+            }
+            for points in &resident.scene.points {
+                self.renderer.submit_retained_points(points);
+            }
+            if wireframe && let Some(lines) = &resident.wireframe {
+                self.renderer.submit_retained_lines(lines);
+            }
+        }
     }
 }
 
@@ -555,11 +631,11 @@ impl ViewportRenderer {
 /// size limit.
 fn overflow_message(overflow: &renderer::GeometryOverflow) -> String {
     let mut dropped = Vec::new();
-    if overflow.dropped_mesh_vertices > 0 {
+    if overflow.dropped_triangles > 0 {
         dropped.push(format!(
-            "{} of {} mesh vertices",
-            crate::format_count(overflow.dropped_mesh_vertices),
-            crate::format_count(overflow.total_mesh_vertices),
+            "{} of {} triangles",
+            crate::format_count(overflow.dropped_triangles),
+            crate::format_count(overflow.total_triangles),
         ));
     }
     if overflow.dropped_lines > 0 {
@@ -763,36 +839,40 @@ impl PreviewBounds {
 }
 
 /// Per-output mesh cache and build bookkeeping. Holds no GPU state, so its
-/// reconcile/accept/composite logic is unit-tested directly.
+/// reconcile/accept logic is unit-tested directly; each accepted build gets
+/// a monotonic revision the viewport uses to keep GPU residency in step.
 ///
 /// Keyed by asset id: each output has at most one cached entity, which is kept
 /// (stale) until a fresh build for the same asset replaces it, so a resolution
 /// or mode change never blanks an output mid-rebuild.
 #[derive(Default)]
 struct PreviewCache {
-    entities: HashMap<String, (PreviewSceneKey, PreviewEntity)>,
+    entities: HashMap<String, CachedBuild>,
     pending: HashMap<String, PreviewSceneKey>,
     failed: HashMap<String, (PreviewSceneKey, String)>,
-    /// Memoized composite, rebuilt only when the contributing keys (or their
-    /// wireframe flags) change.
-    composite: Option<(
-        Vec<(PreviewSceneKey, bool)>,
-        renderer::SceneData,
-        PreviewBounds,
-    )>,
+    /// Stamps accepted builds, so GPU residency can tell a rebuild from the
+    /// same still-cached entity.
+    next_revision: u64,
+}
+
+/// One accepted build in the cache.
+struct CachedBuild {
+    key: PreviewSceneKey,
+    entity: PreviewEntity,
+    revision: u64,
 }
 
 impl PreviewCache {
     /// The cached scene for one output, if a build has completed for it.
     fn entity_scene(&self, id: &str) -> Option<&renderer::SceneData> {
-        self.entities.get(id).map(|(_, entity)| &entity.scene)
+        self.entities.get(id).map(|build| &build.entity.scene)
     }
 
     /// Meshing stats for every cached output, keyed by asset id.
     fn output_stats(&self) -> std::collections::BTreeMap<String, OutputStats> {
         self.entities
             .iter()
-            .map(|(id, (_, entity))| (id.clone(), entity.stats.clone()))
+            .map(|(id, build)| (id.clone(), build.entity.stats.clone()))
             .collect()
     }
 
@@ -809,7 +889,7 @@ impl PreviewCache {
         for request in requests {
             let key = PreviewSceneKey::from(request);
             let id = &request.asset_id;
-            let cached = self.entities.get(id).map(|(k, _)| k) == Some(&key);
+            let cached = self.entities.get(id).map(|build| &build.key) == Some(&key);
             let building = self.pending.get(id) == Some(&key);
             let failed = self.failed.get(id).map(|(k, _)| k) == Some(&key);
             if cached || building || failed {
@@ -853,8 +933,15 @@ impl PreviewCache {
         match result {
             Ok(entity) => {
                 self.failed.remove(&id);
-                self.entities.insert(id, (key, entity));
-                self.composite = None;
+                self.next_revision += 1;
+                self.entities.insert(
+                    id,
+                    CachedBuild {
+                        key,
+                        entity,
+                        revision: self.next_revision,
+                    },
+                );
             }
             Err(error) => {
                 self.failed.insert(id, (key, error));
@@ -866,59 +953,27 @@ impl PreviewCache {
         !self.pending.is_empty()
     }
 
-    /// Composites the cached geometry for the requested outputs into one scene.
-    /// Returns the merged scene, its union bounds, and the sorted ids of the
-    /// contributing outputs (used to decide when to re-frame the camera), or
-    /// `None` when no requested output has materialized yet. The result is
-    /// memoized against the contributing keys so a static scene isn't re-merged
-    /// every frame.
-    fn composite(
-        &mut self,
-        requests: &[PreviewRequest],
-    ) -> Option<(renderer::SceneData, PreviewBounds, Vec<String>)> {
-        let mut keys = Vec::new();
-        let mut ids = Vec::new();
-        for request in requests {
-            if let Some((key, _)) = self.entities.get(&request.asset_id) {
-                keys.push((key.clone(), request.wireframe));
-                ids.push(request.asset_id.clone());
-            }
-        }
-        if keys.is_empty() {
-            return None;
-        }
-        ids.sort();
-
-        if self
-            .composite
-            .as_ref()
-            .is_none_or(|(cached_keys, _, _)| cached_keys != &keys)
-        {
-            let mut scene = renderer::SceneData::new();
-            let mut bounds: Option<PreviewBounds> = None;
-            for request in requests {
-                if let Some((_, entity)) = self.entities.get(&request.asset_id) {
-                    scene.meshes.extend(entity.scene.meshes.iter().cloned());
-                    scene.lines.extend(entity.scene.lines.iter().cloned());
-                    scene.points.extend(entity.scene.points.iter().cloned());
-                    if request.wireframe
-                        && let Some(lines) = &entity.wireframe_lines
-                    {
-                        scene
-                            .lines
-                            .push((lines.clone(), glam::Mat4::IDENTITY, wireframe_style()));
-                    }
-                    bounds = Some(match bounds {
-                        Some(acc) => acc.union(entity.bounds),
-                        None => entity.bounds,
-                    });
-                }
-            }
-            self.composite = Some((keys, scene, bounds.expect("non-empty keys imply bounds")));
-        }
-
-        let (_, scene, bounds) = self.composite.as_ref().unwrap();
-        Some((scene.clone(), *bounds, ids))
+    /// The requested outputs' cached builds, in request order: asset id,
+    /// build revision (bumps only when a rebuild lands, so GPU residency
+    /// re-uploads exactly then), whether the wireframe overlay is requested,
+    /// and the built entity. Empty when nothing has materialized yet.
+    fn visible<'a>(
+        &'a self,
+        requests: &'a [PreviewRequest],
+    ) -> Vec<(&'a str, u64, bool, &'a PreviewEntity)> {
+        requests
+            .iter()
+            .filter_map(|request| {
+                self.entities.get(&request.asset_id).map(|build| {
+                    (
+                        request.asset_id.as_str(),
+                        build.revision,
+                        request.wireframe,
+                        &build.entity,
+                    )
+                })
+            })
+            .collect()
     }
 }
 
@@ -2251,15 +2306,15 @@ mod tests {
     #[test]
     fn overflow_message_reads_well() {
         let message = overflow_message(&renderer::GeometryOverflow {
-            dropped_mesh_vertices: 5_853_732,
-            total_mesh_vertices: 5_853_732,
+            dropped_triangles: 1_951_244,
+            total_triangles: 1_951_244,
             dropped_lines: 1_200,
             dropped_points: 0,
             max_buffer_bytes: 256 * 1024 * 1024,
         });
         assert_eq!(
             message,
-            "over the 256 MiB GPU buffer limit — dropped 5.9M of 5.9M mesh vertices, \
+            "over the 256 MiB GPU buffer limit — dropped 2.0M of 2.0M triangles, \
              1.2k lines; reduce preview resolution"
         );
     }
@@ -2824,12 +2879,12 @@ function get_bounds_max_y() return 1.5 end
         assert!(err.contains("FEA mesh"), "unexpected error: {err}");
     }
 
-    /// The milestone: two requested outputs each get a build job, and once both
-    /// land they composite into a single multi-entity scene.
-    /// Wireframe is display-only: toggling it injects the prebuilt edge
-    /// lines into the composite without scheduling any rebuild.
+    /// Wireframe is display-only: toggling it flips the `visible` flag the
+    /// viewport reads (it submits the prebuilt, GPU-resident edge lines)
+    /// without scheduling any rebuild or bumping the build revision — a
+    /// revision bump would needlessly re-upload the dense buffers.
     #[test]
-    fn wireframe_toggle_composites_lines_without_rebuilding() {
+    fn wireframe_toggle_flags_without_rebuilding() {
         let mut cache = PreviewCache::default();
         let requests = vec![request("a", 32)];
         let (_, jobs) = cache.sync(&requests);
@@ -2848,26 +2903,32 @@ function get_bounds_max_y() return 1.5 end
                 result: Ok(built),
             });
         }
-        let (scene, _, _) = cache.composite(&requests).expect("scene");
-        assert!(scene.lines.is_empty(), "wireframe off: no line batches");
+        let visible = cache.visible(&requests);
+        assert!(!visible[0].2, "wireframe off");
+        let revision = visible[0].1;
 
         let mut wire_requests = requests.clone();
         wire_requests[0].wireframe = true;
         let (_, jobs) = cache.sync(&wire_requests);
         assert!(jobs.is_empty(), "toggling wireframe must not rebuild");
-        let (scene, _, _) = cache.composite(&wire_requests).expect("scene");
-        assert_eq!(scene.lines.len(), 1, "wireframe on: edge lines composited");
+        let visible = cache.visible(&wire_requests);
+        assert!(visible[0].2, "wireframe on");
+        assert!(visible[0].3.wireframe_lines.is_some());
+        assert_eq!(
+            visible[0].1, revision,
+            "display-only toggle keeps the GPU-resident revision"
+        );
     }
 
     #[test]
-    fn sync_meshes_each_output_then_composites_all() {
+    fn sync_meshes_each_output_then_exposes_all() {
         let mut cache = PreviewCache::default();
         let requests = vec![request("a", 8), request("b", 8)];
 
         let (status, jobs) = cache.sync(&requests);
         assert_eq!(jobs.len(), 2, "one build job per output");
         assert!(matches!(status, PreviewBuildStatus::Building { .. }));
-        assert!(cache.composite(&requests).is_none(), "nothing built yet");
+        assert!(cache.visible(&requests).is_empty(), "nothing built yet");
 
         for job in jobs {
             accept_ok(&mut cache, job);
@@ -2877,27 +2938,42 @@ function get_bounds_max_y() return 1.5 end
         assert!(jobs.is_empty(), "everything cached, no rebuild");
         assert!(matches!(status, PreviewBuildStatus::Ready { .. }));
 
-        let (scene, _bounds, ids) = cache.composite(&requests).expect("composited scene");
-        assert_eq!(scene.points.len(), 2, "both outputs render together");
-        assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
+        let visible = cache.visible(&requests);
+        assert_eq!(visible.len(), 2, "both outputs render together");
+        let ids: Vec<&str> = visible.iter().map(|(id, ..)| *id).collect();
+        assert_eq!(ids, vec!["a", "b"]);
+        assert_ne!(
+            visible[0].1, visible[1].1,
+            "each build gets its own revision"
+        );
     }
 
-    /// Changing an output's resolution requeues its build but keeps the last good
-    /// mesh on screen until the new one arrives.
+    /// Changing an output's resolution requeues its build but keeps the last
+    /// good mesh on screen — at its old revision, so the viewport keeps its
+    /// GPU residency — until the new one arrives, which bumps the revision.
     #[test]
     fn resolution_change_keeps_stale_output_until_rebuilt() {
         let mut cache = PreviewCache::default();
         let coarse = vec![request("a", 8)];
         let (_, jobs) = cache.sync(&coarse);
         accept_ok(&mut cache, jobs.into_iter().next().unwrap());
+        let coarse_revision = cache.visible(&coarse)[0].1;
 
         let fine = vec![request("a", 32)];
         let (status, jobs) = cache.sync(&fine);
         assert_eq!(jobs.len(), 1, "the finer resolution requeues a build");
         assert!(matches!(status, PreviewBuildStatus::Building { .. }));
 
-        let (scene, _, _) = cache.composite(&fine).expect("stale mesh still shown");
-        assert_eq!(scene.points.len(), 1);
+        let visible = cache.visible(&fine);
+        assert_eq!(visible.len(), 1, "stale mesh still shown");
+        assert_eq!(visible[0].1, coarse_revision, "still the old upload");
+
+        accept_ok(&mut cache, jobs.into_iter().next().unwrap());
+        assert_ne!(
+            cache.visible(&fine)[0].1,
+            coarse_revision,
+            "the rebuild bumps the revision so the viewport re-uploads"
+        );
     }
 
     /// An output that is no longer requested is evicted from the cache.
@@ -2916,9 +2992,9 @@ function get_bounds_max_y() return 1.5 end
         let only_a = vec![a.clone()];
         let (_, jobs) = cache.sync(&only_a);
         assert!(jobs.is_empty());
-        let (scene, _, ids) = cache.composite(&only_a).unwrap();
-        assert_eq!(scene.points.len(), 1);
-        assert_eq!(ids, vec!["a".to_string()]);
+        let visible = cache.visible(&only_a);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].0, "a");
 
         // "b" was evicted, so requesting it again requires a fresh build.
         let (_, jobs) = cache.sync(&both);
@@ -2941,10 +3017,10 @@ function get_bounds_max_y() return 1.5 end
 
         // The stale build lands first and must be dropped.
         accept_ok(&mut cache, stale_job);
-        assert!(cache.composite(&fine).is_none(), "stale result discarded");
+        assert!(cache.visible(&fine).is_empty(), "stale result discarded");
 
         accept_ok(&mut cache, fresh_job);
-        assert!(cache.composite(&fine).is_some(), "fresh result accepted");
+        assert!(!cache.visible(&fine).is_empty(), "fresh result accepted");
     }
 
     fn preview_job(id: &str, resolution: usize) -> BackgroundJob {

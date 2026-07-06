@@ -5,11 +5,18 @@
 //! preview build, submit through `VolumetricRenderer`'s actual wgpu pipelines
 //! (G-buffer, SSAO, composite), and save the frame as a PNG.
 //!
-//! Usage: headless_preview <model.wasm> <out.png> [--depth N] [--no-sharp]
+//! Usage: headless_preview <model.wasm> <out.png> [--depth N] [--no-sharp] [--retained]
+//!
+//! `--retained` draws through the retained-geometry path (upload once,
+//! draw by handle — what the session viewport uses) instead of immediate
+//! submission; the two must produce identical frames.
 
 use volumetric::adaptive_surface_nets_2::AdaptiveMeshConfig2;
 use volumetric::sharp_features::SharpFeatureConfig;
-use volumetric_renderer::{Camera, MaterialId, MeshData, MeshVertex, RenderSettings, Renderer};
+use volumetric_renderer::{
+    Camera, DepthMode, LineData, LineSegment, LineStyle, MaterialId, MeshData, MeshVertex,
+    PointData, RenderSettings, Renderer, WidthMode,
+};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -21,10 +28,13 @@ fn main() {
         .map(|(_, a)| a)
         .collect();
     if positional.len() != 2 {
-        eprintln!("usage: headless_preview <model.wasm> <out.png> [--depth N] [--no-sharp]");
+        eprintln!(
+            "usage: headless_preview <model.wasm> <out.png> [--depth N] [--no-sharp] [--retained]"
+        );
         std::process::exit(1);
     }
     let sharp = !args.iter().any(|a| a == "--no-sharp");
+    let retained = args.iter().any(|a| a == "--retained");
     let max_depth = args
         .iter()
         .position(|a| a == "--depth")
@@ -86,7 +96,55 @@ fn main() {
         renderer.set_viewport_size(&device, w, h);
         renderer.initialize(&device, &queue, Some(&adapter));
 
-        renderer.submit_mesh(&mesh_data, glam::Mat4::IDENTITY, MaterialId(0));
+        // A small line and point batch alongside the mesh, so both retained
+        // pipelines get exercised too.
+        let lines = LineData {
+            segments: vec![LineSegment {
+                start: [mesh.bounds_min.0, mesh.bounds_min.1, mesh.bounds_min.2],
+                end: [mesh.bounds_max.0, mesh.bounds_min.1, mesh.bounds_min.2],
+                color: [1.0, 0.2, 0.2, 1.0],
+            }],
+        };
+        let line_style = LineStyle {
+            width: 2.0,
+            width_mode: WidthMode::ScreenSpace,
+            pattern: volumetric_renderer::LinePattern::Solid,
+            depth_mode: DepthMode::Normal,
+        };
+        let points = PointData {
+            points: vec![volumetric_renderer::PointInstance {
+                position: [mesh.bounds_max.0, mesh.bounds_max.1, mesh.bounds_max.2],
+                color: [0.2, 1.0, 0.2, 1.0],
+            }],
+        };
+        let point_style = volumetric_renderer::PointStyle {
+            size: 8.0,
+            size_mode: WidthMode::ScreenSpace,
+            shape: volumetric_renderer::PointShape::Circle,
+            depth_mode: DepthMode::Normal,
+        };
+
+        if retained {
+            let mut scene = volumetric_renderer::SceneData::new();
+            scene.add_mesh(mesh_data.clone(), glam::Mat4::IDENTITY, MaterialId(0));
+            scene.add_lines(lines.clone(), glam::Mat4::IDENTITY, line_style.clone());
+            scene.add_points(points.clone(), glam::Mat4::IDENTITY, point_style.clone());
+            let resident = renderer.create_retained_scene(&device, &scene);
+            for mesh in &resident.meshes {
+                renderer.submit_retained_mesh(mesh);
+            }
+            for lines in &resident.lines {
+                renderer.submit_retained_lines(lines);
+            }
+            for points in &resident.points {
+                renderer.submit_retained_points(points);
+            }
+            println!("submitted via the retained path");
+        } else {
+            renderer.submit_mesh(&mesh_data, glam::Mat4::IDENTITY, MaterialId(0));
+            renderer.submit_lines(&lines, glam::Mat4::IDENTITY, line_style);
+            renderer.submit_points(&points, glam::Mat4::IDENTITY, point_style);
+        }
 
         // Look at the near cap from front-left-above, like the screenshot.
         let mut camera = Camera::new(center, 4.5);

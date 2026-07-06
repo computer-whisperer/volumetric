@@ -50,6 +50,28 @@ impl PartialEq for LineUniforms {
     }
 }
 
+/// A line batch resident on the GPU: world-space instances uploaded once
+/// (at build time), drawn by reference each frame. Owns its uniform buffer
+/// and bind group because line uniforms carry per-batch style alongside the
+/// per-frame camera; the renderer refreshes them each frame with a small
+/// write. Created by [`LinePipeline::create_retained`].
+pub struct GpuLines {
+    instance_buffer: wgpu::Buffer,
+    count: u32,
+    uniform_buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    pub(crate) style: LineStyle,
+    /// Instances dropped at the device's buffer size limit.
+    pub dropped: usize,
+}
+
+impl GpuLines {
+    /// The batch's depth mode (which render pass draws it).
+    pub fn depth_mode(&self) -> DepthMode {
+        self.style.depth_mode
+    }
+}
+
 /// Pipeline for rendering lines with vertex shader quad expansion.
 pub struct LinePipeline {
     /// Pipeline for depth-tested lines
@@ -329,6 +351,99 @@ impl LinePipeline {
             gap_length,
             _pad: [0.0; 2],
         }
+    }
+
+    /// Uploads world-space segments as a retained batch, clamped to the
+    /// device's buffer size limit.
+    pub fn create_retained(
+        &self,
+        device: &wgpu::Device,
+        segments: &[LineSegment],
+        transform: glam::Mat4,
+        style: &LineStyle,
+    ) -> GpuLines {
+        let max_instances = (device.limits().max_buffer_size
+            / std::mem::size_of::<LineInstance>().max(1) as u64)
+            as usize;
+        let count = segments.len().min(max_instances);
+        let instances: Vec<LineInstance> = segments[..count]
+            .iter()
+            .map(|seg| {
+                let seg = LineSegment {
+                    start: transform
+                        .transform_point3(glam::Vec3::from(seg.start))
+                        .into(),
+                    end: transform.transform_point3(glam::Vec3::from(seg.end)).into(),
+                    color: seg.color,
+                };
+                LineInstance::from_segment(&seg, style.width)
+            })
+            .collect();
+
+        let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("retained_line_instance_buffer"),
+            contents: bytemuck::cast_slice(&instances),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("retained_line_uniform_buffer"),
+            contents: bytemuck::bytes_of(&LineUniforms::default()),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("retained_line_uniform_bg"),
+            layout: &self.bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            }],
+        });
+
+        GpuLines {
+            instance_buffer,
+            count: count as u32,
+            uniform_buffer,
+            bind_group,
+            style: style.clone(),
+            dropped: segments.len() - count,
+        }
+    }
+
+    /// Refresh a retained batch's uniforms for this frame's camera.
+    pub fn write_retained_uniforms(
+        &self,
+        queue: &wgpu::Queue,
+        batch: &GpuLines,
+        view_proj: [[f32; 4]; 4],
+        screen_size: [f32; 2],
+    ) {
+        let uniforms = Self::create_uniforms(view_proj, screen_size, &batch.style);
+        queue.write_buffer(&batch.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+    }
+
+    /// Draw a retained batch (in the pass matching its depth mode).
+    pub fn render_retained<'a>(
+        &'a self,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        batch: &'a GpuLines,
+    ) {
+        if batch.count == 0 {
+            return;
+        }
+
+        let pipeline = match batch.style.depth_mode {
+            DepthMode::Normal => &self.depth_pipeline,
+            DepthMode::Overlay => &self.overlay_pipeline,
+        };
+        render_pass.set_pipeline(pipeline);
+        render_pass.set_bind_group(0, &batch.bind_group, &[]);
+        render_pass.set_vertex_buffer(0, self.quad_vertex_buffer.buffer().slice(..));
+        render_pass.set_vertex_buffer(1, batch.instance_buffer.slice(..));
+        render_pass.set_index_buffer(
+            self.quad_index_buffer.buffer().slice(..),
+            wgpu::IndexFormat::Uint16,
+        );
+        render_pass.draw_indexed(0..6, 0, 0..batch.count);
     }
 
     /// Record a line render pass.
