@@ -21,6 +21,7 @@ use volumetric::{
     Environment, Project, Triangle,
     adaptive_surface_nets_2::{AdaptiveMeshConfig2, MeshingStats2},
     generate_adaptive_mesh_v2_from_bytes,
+    mesh_decimation::DecimationConfig,
     sharp_features::SharpFeatureConfig,
     stl,
 };
@@ -126,6 +127,14 @@ pub struct MeshArgs {
     /// in degrees (default: 15)
     #[arg(long, default_value = "15.0")]
     sharp_angle: f64,
+
+    /// Disable the decimation post-pass (stage 5 quadric simplification)
+    #[arg(long)]
+    no_simplify: bool,
+
+    /// Decimation error budget, as a fraction of the finest cell size
+    #[arg(long, default_value = "1.0")]
+    simplify_tolerance: f64,
 
     /// Suppress profiling output
     #[arg(short, long)]
@@ -349,6 +358,7 @@ pub fn build_mesh_config(
     normal_epsilon: f32,
     sharp_edges: bool,
     sharp_angle: f64,
+    simplify_tolerance: Option<f64>,
 ) -> AdaptiveMeshConfig2 {
     let sharp_features = sharp_edges.then(|| {
         let mut config = SharpFeatureConfig::default();
@@ -365,6 +375,10 @@ pub fn build_mesh_config(
         num_threads: 0,
         sharp_features,
         edge_constrained_refinement: false,
+        decimation: simplify_tolerance.map(|tolerance| DecimationConfig {
+            error_tolerance_cells: tolerance,
+            ..Default::default()
+        }),
     }
 }
 
@@ -382,6 +396,7 @@ fn run_mesh(args: MeshArgs) -> Result<()> {
         args.normal_epsilon,
         args.sharp_edges,
         args.sharp_angle,
+        (!args.no_simplify).then_some(args.simplify_tolerance),
     );
 
     let effective_res = config.base_resolution * (1 << config.max_depth);

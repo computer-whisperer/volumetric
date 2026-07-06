@@ -84,6 +84,14 @@ pub struct RenderArgs {
     #[arg(long, default_value = "15.0")]
     pub sharp_angle: f64,
 
+    /// Disable the decimation post-pass (stage 5 quadric simplification)
+    #[arg(long)]
+    pub no_simplify: bool,
+
+    /// Decimation error budget, as a fraction of the finest cell size
+    #[arg(long, default_value = "1.0")]
+    pub simplify_tolerance: f64,
+
     /// Suppress profiling output
     #[arg(short, long)]
     pub quiet: bool,
@@ -415,6 +423,7 @@ pub fn run_render(args: RenderArgs) -> Result<()> {
         args.normal_epsilon,
         args.sharp_edges,
         args.sharp_angle,
+        (!args.no_simplify).then_some(args.simplify_tolerance),
     );
 
     let effective_res = config.base_resolution * (1 << config.max_depth);

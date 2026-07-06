@@ -344,6 +344,7 @@ fn execute_resample(
                 num_threads: 0,
                 sharp_features: config.asn2_sharp_features.clone(),
                 edge_constrained_refinement: false,
+                decimation: None,
             };
             match generate_adaptive_mesh_v2_from_bytes(&wasm_bytes, &asn2_config) {
                 Ok(meshing_result) => {
@@ -463,6 +464,7 @@ fn execute_resample(
                 num_threads: 0, // Web is single-threaded
                 sharp_features: config.asn2_sharp_features.clone(),
                 edge_constrained_refinement: false,
+                decimation: None,
             };
             match generate_adaptive_mesh_v2_from_bytes(&wasm_bytes, &asn2_config) {
                 Ok(meshing_result) => {

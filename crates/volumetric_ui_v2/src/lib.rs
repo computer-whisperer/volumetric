@@ -123,7 +123,7 @@ const VEC_INPUT_PREFIX: &str = "vec:";
 const CONFIG_BOOL_PREFIX: &str = "cfg-bool:";
 const CONFIG_ENUM_PREFIX: &str = "cfg-enum:";
 const LUA_SOURCE_KEY: &str = "lua-source";
-const PREVIEW_RESOLUTIONS: [usize; 9] = [16, 24, 32, 48, 64, 96, 128, 192, 256];
+const PREVIEW_RESOLUTIONS: [usize; 11] = [16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512];
 /// Raster resolutions offered for 2D field outputs (cells along the longer
 /// bounds axis).
 const SKETCH_RESOLUTIONS: [usize; 5] = [64, 128, 256, 512, 1024];
@@ -209,6 +209,12 @@ pub struct Asn2Settings {
     /// for thin lattice sheets visually bonding together — at the cost of
     /// slightly more quantized vertex placement.
     pub edge_constrained_refinement: bool,
+    /// Stage-5 quadric decimation: collapse edges whose removal stays
+    /// within the tolerance budget, cutting the grid-pitch triangle counts
+    /// of flat and gently curved regions while preserving topology.
+    pub simplify: bool,
+    /// Decimation error budget, in tenths of the finest cell size (1-30).
+    pub simplify_tolerance_tenths: u16,
 }
 
 impl Default for Asn2Settings {
@@ -219,6 +225,8 @@ impl Default for Asn2Settings {
             sharp_edges: true,
             sharp_angle_degrees: 15,
             edge_constrained_refinement: false,
+            simplify: true,
+            simplify_tolerance_tenths: 10,
         }
     }
 }
@@ -365,6 +373,12 @@ impl PreviewMeshPlan {
                 sharp.segmentation.max_normal_jump_deg = f64::from(settings.sharp_angle_degrees);
                 sharp
             }),
+            decimation: settings
+                .simplify
+                .then(|| volumetric::mesh_decimation::DecimationConfig {
+                    error_tolerance_cells: f64::from(settings.simplify_tolerance_tenths) / 10.0,
+                    ..Default::default()
+                }),
         })
     }
 }
@@ -991,6 +1005,11 @@ impl VolumetricUiV2 {
             "nr" => asn2.normal_sample_iterations = step_usize(asn2.normal_sample_iterations),
             "sharp" => asn2.sharp_edges = !asn2.sharp_edges,
             "edgec" => asn2.edge_constrained_refinement = !asn2.edge_constrained_refinement,
+            "simp" => asn2.simplify = !asn2.simplify,
+            "simptol" => {
+                let next = i32::from(asn2.simplify_tolerance_tenths) + if up { 1 } else { -1 };
+                asn2.simplify_tolerance_tenths = next.clamp(1, 30) as u16;
+            }
             "angle" => {
                 let next = i32::from(asn2.sharp_angle_degrees) + if up { 5 } else { -5 };
                 asn2.sharp_angle_degrees = next.clamp(10, 90) as u16;
@@ -3337,6 +3356,23 @@ fn model3d_settings(
             )
             .gap(tokens::SPACE_2),
         );
+        // Stage-5 quadric decimation; tolerance is the allowed surface
+        // deviation in finest-cell units.
+        body.push(
+            field_row(
+                "Simplify",
+                switch(format!("{OUTPUT_ASN2_PREFIX}{id}:simp:up"), asn2.simplify),
+            )
+            .gap(tokens::SPACE_2),
+        );
+        if asn2.simplify {
+            body.push(asn2_stepper_row(
+                id,
+                "simptol",
+                "Tolerance (cells)",
+                &format!("{:.1}", f64::from(asn2.simplify_tolerance_tenths) / 10.0),
+            ));
+        }
         if asn2.sharp_edges {
             body.push(asn2_stepper_row(
                 id,
@@ -5320,6 +5356,26 @@ mod tests {
             &mut app,
             UiEvent::synthetic_click(format!("{OUTPUT_ASN2_PREFIX}{id}:edgec:up")),
         );
+        // Simplify defaults on; toggling twice round-trips, and the
+        // tolerance stepper moves in tenths of a cell.
+        assert!(asn2.simplify);
+        assert_eq!(asn2.simplify_tolerance_tenths, 10);
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{OUTPUT_ASN2_PREFIX}{id}:simp:up")),
+        );
+        let OutputRender::Model3d { asn2: toggled, .. } = app.output_render(&id) else {
+            panic!("model output should carry 3D settings");
+        };
+        assert!(!toggled.simplify);
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{OUTPUT_ASN2_PREFIX}{id}:simp:up")),
+        );
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{OUTPUT_ASN2_PREFIX}{id}:simptol:up")),
+        );
         assert_eq!(asn2.vertex_refinement_iterations, 7);
         assert_eq!(asn2.sharp_angle_degrees, 20);
 
@@ -5339,6 +5395,8 @@ mod tests {
         assert!(config.edge_constrained_refinement);
         let sharp = config.sharp_features.expect("sharp features enabled");
         assert!((sharp.segmentation.max_normal_jump_deg - 20.0).abs() < 1e-9);
+        let decimation = config.decimation.expect("simplify enabled");
+        assert!((decimation.error_tolerance_cells - 1.1).abs() < 1e-9);
     }
 
     #[test]

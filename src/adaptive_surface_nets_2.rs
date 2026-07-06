@@ -196,7 +196,7 @@ use web_time::Instant;
 ///
 /// These functions provide parallel iteration when the `native` feature is enabled
 /// (using rayon), and fall back to sequential iteration on web (wasm32).
-mod parallel_iter {
+pub(crate) mod parallel_iter {
     #[cfg(feature = "native")]
     use rayon::prelude::*;
 
@@ -317,6 +317,14 @@ pub struct AdaptiveMeshConfig2 {
     /// and ~4x fewer samples, at the cost of slightly more quantized vertex
     /// placement (marching-cubes-like instead of free-floating).
     pub edge_constrained_refinement: bool,
+
+    /// Quadric-error-metric decimation post-pass (stage 5). Collapses edges
+    /// whose removal stays within an error budget scaled to the finest cell
+    /// size, cutting the grid-pitch triangle counts of flat and gently
+    /// curved regions while preserving topology (see
+    /// [`crate::mesh_decimation`]). When None (default), the mesh is
+    /// emitted at full grid density.
+    pub decimation: Option<crate::mesh_decimation::DecimationConfig>,
 }
 
 impl Default for AdaptiveMeshConfig2 {
@@ -331,6 +339,7 @@ impl Default for AdaptiveMeshConfig2 {
             num_threads: 0,
             sharp_features: None, // Disabled by default
             edge_constrained_refinement: false,
+            decimation: None,
         }
     }
 }
@@ -804,6 +813,12 @@ pub struct MeshingStats2 {
     pub sharp_dropped_triangles: usize,
     /// Vertex copies created for per-region crease shading
     pub sharp_crease_splits: usize,
+
+    /// Stage 5: decimation (when enabled)
+    pub stage5_time_secs: f64,
+    pub stage5_passes: usize,
+    /// Triangle count entering decimation (0 when the stage was skipped)
+    pub stage5_triangles_before: usize,
 }
 
 // =============================================================================
@@ -899,6 +914,21 @@ impl MeshingStats2 {
             );
         }
         println!();
+        if self.stage5_triangles_before > 0 {
+            println!(
+                "Stage 5 (Decimation): {:.2}ms ({:.1}%)",
+                self.stage5_time_secs * 1000.0,
+                self.stage5_time_secs / self.total_time_secs * 100.0
+            );
+            println!("  Passes: {}", self.stage5_passes);
+            println!(
+                "  Triangles: {} -> {} ({:.1}x)",
+                self.stage5_triangles_before,
+                self.total_triangles,
+                self.stage5_triangles_before as f64 / self.total_triangles.max(1) as f64
+            );
+            println!();
+        }
         println!("Summary:");
         println!("  Total samples: {}", self.total_samples);
         println!(
@@ -1641,7 +1671,7 @@ fn stage3_topology_finalization(
 }
 
 /// Normalize a vector, returning (0,1,0) if the vector is too small.
-fn normalize_or_default(v: (f64, f64, f64)) -> (f32, f32, f32) {
+pub(crate) fn normalize_or_default(v: (f64, f64, f64)) -> (f32, f32, f32) {
     let len_sq = v.0 * v.0 + v.1 * v.1 + v.2 * v.2;
     if len_sq > 1e-12 {
         let inv_len = 1.0 / len_sq.sqrt();
@@ -2431,7 +2461,7 @@ fn compute_error_stats(errors: &mut [f64]) -> (f64, f64, f64, f64) {
 /// Given refined vertex positions, recomputes face normals for each triangle
 /// and accumulates them per vertex. This gives better normal estimates than
 /// using the original normals computed from unrefined edge midpoints.
-fn recompute_accumulated_normals(
+pub(crate) fn recompute_accumulated_normals(
     vertices: &[(f64, f64, f64)],
     indices: &[u32],
 ) -> Vec<(f64, f64, f64)> {
@@ -2794,6 +2824,26 @@ where
 // MAIN ENTRY POINT
 // =============================================================================
 
+/// Stage 5: optional decimation post-pass (see [`crate::mesh_decimation`]).
+/// The error budget scales with the finest (per-axis minimum) cell size.
+/// Returns (time_secs, passes_run, triangles_before); zeros when disabled.
+fn stage5_decimation(
+    mesh: &mut IndexedMesh2,
+    config: &AdaptiveMeshConfig2,
+    cell_size: (f64, f64, f64),
+) -> (f64, usize, usize) {
+    let Some(ref decimation) = config.decimation else {
+        return (0.0, 0, 0);
+    };
+    let min_cell = cell_size.0.min(cell_size.1).min(cell_size.2);
+    let stats = crate::mesh_decimation::decimate_mesh(
+        mesh,
+        decimation.error_tolerance_cells * min_cell,
+        decimation.ramp_passes,
+    );
+    (stats.time_secs, stats.passes_run, stats.triangles_before)
+}
+
 /// Main entry point for adaptive surface nets meshing.
 ///
 /// # Arguments
@@ -2888,7 +2938,7 @@ where
 
     // Stage 4.5: Sharp feature reconstruction (when enabled)
     let stage4_5_start = Instant::now();
-    let (mesh, sharp_stats) = if let Some(ref sharp_config) = config.sharp_features {
+    let (mut mesh, sharp_stats) = if let Some(ref sharp_config) = config.sharp_features {
         let (mesh, sharp_s) =
             stage4_5_sharp_features(stage4_result, sharp_config, &sampler, cell_size, &stats);
         (mesh, sharp_s)
@@ -2899,6 +2949,10 @@ where
         )
     };
     let stage4_5_time = stage4_5_start.elapsed().as_secs_f64();
+
+    // Stage 5: Decimation (when enabled)
+    let (stage5_time, stage5_passes, stage5_triangles_before) =
+        stage5_decimation(&mut mesh, config, cell_size);
 
     let total_time = total_start.elapsed().as_secs_f64();
     let total_samples = stats.total_samples.load(Ordering::Relaxed);
@@ -2933,6 +2987,9 @@ where
         sharp_welded_vertices: sharp_stats.welded_vertices,
         sharp_dropped_triangles: sharp_stats.dropped_triangles,
         sharp_crease_splits: sharp_stats.crease_splits,
+        stage5_time_secs: stage5_time,
+        stage5_passes,
+        stage5_triangles_before,
     };
 
     MeshingResult2 {
@@ -3029,7 +3086,7 @@ where
 
     // Stage 4.5: Sharp feature reconstruction (when enabled)
     let stage4_5_start = Instant::now();
-    let (mesh, sharp_stats) = if let Some(ref sharp_config) = config.sharp_features {
+    let (mut mesh, sharp_stats) = if let Some(ref sharp_config) = config.sharp_features {
         let (mesh, sharp_s) =
             stage4_5_sharp_features(stage4_result, sharp_config, &sampler, cell_size, &stats);
         (mesh, sharp_s)
@@ -3040,6 +3097,10 @@ where
         )
     };
     let stage4_5_time = stage4_5_start.elapsed().as_secs_f64();
+
+    // Stage 5: Decimation (when enabled)
+    let (stage5_time, stage5_passes, stage5_triangles_before) =
+        stage5_decimation(&mut mesh, config, cell_size);
 
     let total_time = total_start.elapsed().as_secs_f64();
     let total_samples = stats.total_samples.load(Ordering::Relaxed);
@@ -3074,6 +3135,9 @@ where
         sharp_welded_vertices: sharp_stats.welded_vertices,
         sharp_dropped_triangles: sharp_stats.dropped_triangles,
         sharp_crease_splits: sharp_stats.crease_splits,
+        stage5_time_secs: stage5_time,
+        stage5_passes,
+        stage5_triangles_before,
     };
 
     MeshingResult2 {

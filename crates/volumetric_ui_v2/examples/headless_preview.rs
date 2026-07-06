@@ -52,6 +52,7 @@ fn main() {
         num_threads: 0,
         sharp_features: sharp.then(SharpFeatureConfig::default),
         edge_constrained_refinement: false,
+        decimation: None,
     };
     let mesh = volumetric::generate_adaptive_mesh_v2_from_bytes(&wasm_bytes, &config)
         .expect("meshing failed");

@@ -21,11 +21,14 @@ use volumetric::sharp_features::{SharpFeatureConfig, adjacency, fit, segmentatio
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let depth_value_pos = args.iter().position(|a| a == "--depth").map(|i| i + 1);
+    let value_positions: Vec<usize> = ["--depth", "--simplify-tolerance"]
+        .iter()
+        .filter_map(|flag| args.iter().position(|a| a == flag).map(|i| i + 1))
+        .collect();
     let positional: Vec<&String> = args
         .iter()
         .enumerate()
-        .filter(|(i, a)| !a.starts_with("--") && Some(*i) != depth_value_pos)
+        .filter(|(i, a)| !a.starts_with("--") && !value_positions.contains(i))
         .map(|(_, a)| a)
         .collect();
     if positional.len() != 2 {
@@ -46,6 +49,13 @@ fn main() {
 
     let wasm_bytes = std::fs::read(&wasm_path).expect("read wasm");
     // GUI-default settings: refine 8, no normal probing, sharp defaults.
+    let simplify = !args.iter().any(|a| a == "--no-simplify");
+    let simplify_tolerance: f64 = args
+        .iter()
+        .position(|a| a == "--simplify-tolerance")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1.0);
     let config = AdaptiveMeshConfig2 {
         base_resolution: 8,
         max_depth,
@@ -55,6 +65,10 @@ fn main() {
         num_threads: 0,
         sharp_features: sharp.then(SharpFeatureConfig::default),
         edge_constrained_refinement: args.iter().any(|a| a == "--edge-constrained"),
+        decimation: simplify.then(|| volumetric::mesh_decimation::DecimationConfig {
+            error_tolerance_cells: simplify_tolerance,
+            ..Default::default()
+        }),
     };
 
     let result = volumetric::generate_adaptive_mesh_v2_from_bytes(&wasm_bytes, &config)

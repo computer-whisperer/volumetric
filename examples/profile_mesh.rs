@@ -22,6 +22,11 @@ fn main() {
         .map(|v| v.parse().unwrap())
         .unwrap_or(0);
 
+    let simplify_tolerance: Option<f64> = args
+        .iter()
+        .position(|a| a == "--simplify")
+        .map(|i| args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(1.0));
+
     let wasm_bytes = std::fs::read(wasm_path).expect("read wasm");
     let config = AdaptiveMeshConfig2 {
         base_resolution: 8,
@@ -32,6 +37,12 @@ fn main() {
         num_threads: 0,
         sharp_features: sharp.then(SharpFeatureConfig::default),
         edge_constrained_refinement: args.iter().any(|a| a == "--edge-constrained"),
+        decimation: simplify_tolerance.map(|tolerance| {
+            volumetric::mesh_decimation::DecimationConfig {
+                error_tolerance_cells: tolerance,
+                ..Default::default()
+            }
+        }),
     };
     let result = volumetric::generate_adaptive_mesh_v2_from_bytes(&wasm_bytes, &config)
         .expect("meshing failed");
