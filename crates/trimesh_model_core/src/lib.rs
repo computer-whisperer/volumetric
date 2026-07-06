@@ -240,6 +240,70 @@ impl<'a> PayloadView<'a> {
         std::array::from_fn(|v| std::array::from_fn(|c| self.f32_at(base + (v * 3 + c) * 4)))
     }
 
+    /// Height of the mesh surface over a lateral point: the extreme
+    /// coordinate along `axis` (max when `top`, min otherwise) where the
+    /// axis-aligned line through `lat` crosses a triangle. `lat` holds the
+    /// other two coordinates in ascending axis order (axis 2 → (x, y),
+    /// axis 1 → (x, z), axis 0 → (y, z)). `None` when the line misses every
+    /// triangle. Triangles parallel to the line (vertical walls) don't
+    /// define a height and are skipped.
+    pub fn height_at(&self, lat: [f64; 2], axis: usize, top: bool) -> Option<f64> {
+        let (u, v) = match axis {
+            0 => (1, 2),
+            1 => (0, 2),
+            2 => (0, 1),
+            _ => panic!("axis out of range: {axis}"),
+        };
+        let mut origin = [0.0f64; 3];
+        origin[u] = lat[0];
+        origin[v] = lat[1];
+        let mut dir = [0.0f64; 3];
+        dir[axis] = 1.0;
+
+        if self.node_count == 0 {
+            return None;
+        }
+        let mut best: Option<f64> = None;
+        let mut stack = [0u32; 64];
+        let mut top_of_stack = 0usize;
+        stack[top_of_stack] = 0;
+        top_of_stack += 1;
+
+        while top_of_stack > 0 {
+            top_of_stack -= 1;
+            let node = stack[top_of_stack] as usize;
+            let base = HEADER_LEN + node * NODE_LEN;
+            // The line is axis-aligned and unbounded, so the node test is a
+            // point-in-rect over the two lateral axes.
+            let hit = [u, v].iter().zip(lat).all(|(&a, l)| {
+                l >= self.f32_at(base + a * 4) as f64 && l <= self.f32_at(base + 12 + a * 4) as f64
+            });
+            if !hit {
+                continue;
+            }
+            let a = self.u32_at(base + 24);
+            let b = self.u32_at(base + 28);
+            if a & LEAF_FLAG != 0 {
+                let first = (a & !LEAF_FLAG) as usize;
+                for t in first..first + b as usize {
+                    if let Some(h) = line_hit(self.triangle(t), origin, dir) {
+                        best = Some(match best {
+                            Some(prev) if top => prev.max(h),
+                            Some(prev) => prev.min(h),
+                            None => h,
+                        });
+                    }
+                }
+            } else {
+                stack[top_of_stack] = a;
+                top_of_stack += 1;
+                stack[top_of_stack] = b;
+                top_of_stack += 1;
+            }
+        }
+        best
+    }
+
     /// Point-in-mesh by ray parity along [`RAY_DIR`] (see the module docs
     /// for open-mesh and on-surface semantics).
     pub fn is_inside(&self, p: [f64; 3]) -> bool {
@@ -299,6 +363,13 @@ const RAY_DIR: [f64; 3] = [1.0, 1.618_033_988_7e-4, 2.718_281_828_4e-4];
 /// Möller–Trumbore for the [`RAY_DIR`] ray from `p`: does the ray cross
 /// this triangle at t > 0?
 fn ray_crosses(v: [[f32; 3]; 3], p: [f64; 3]) -> bool {
+    matches!(line_hit(v, p, RAY_DIR), Some(t) if t > 0.0)
+}
+
+/// Möller–Trumbore for the unbounded line `origin + t * dir`: the `t` where
+/// the line crosses this triangle, any sign. `None` when it misses or when
+/// the triangle is parallel to the line.
+fn line_hit(v: [[f32; 3]; 3], origin: [f64; 3], dir: [f64; 3]) -> Option<f64> {
     // All in f64 for headroom; vertex inputs are exact f32 values.
     let (v0, v1, v2) = (v[0], v[1], v[2]);
     let e1 = [
@@ -312,35 +383,34 @@ fn ray_crosses(v: [[f32; 3]; 3], p: [f64; 3]) -> bool {
         (v2[2] - v0[2]) as f64,
     ];
     let h = [
-        RAY_DIR[1] * e2[2] - RAY_DIR[2] * e2[1],
-        RAY_DIR[2] * e2[0] - RAY_DIR[0] * e2[2],
-        RAY_DIR[0] * e2[1] - RAY_DIR[1] * e2[0],
+        dir[1] * e2[2] - dir[2] * e2[1],
+        dir[2] * e2[0] - dir[0] * e2[2],
+        dir[0] * e2[1] - dir[1] * e2[0],
     ];
     let det = e1[0] * h[0] + e1[1] * h[1] + e1[2] * h[2];
     if det.abs() < 1e-12 {
-        return false; // ray parallel to the triangle plane
+        return None; // line parallel to the triangle plane
     }
     let inv_det = 1.0 / det;
     let s = [
-        p[0] - v0[0] as f64,
-        p[1] - v0[1] as f64,
-        p[2] - v0[2] as f64,
+        origin[0] - v0[0] as f64,
+        origin[1] - v0[1] as f64,
+        origin[2] - v0[2] as f64,
     ];
     let u = (s[0] * h[0] + s[1] * h[1] + s[2] * h[2]) * inv_det;
     if !(0.0..=1.0).contains(&u) {
-        return false;
+        return None;
     }
     let q = [
         s[1] * e1[2] - s[2] * e1[1],
         s[2] * e1[0] - s[0] * e1[2],
         s[0] * e1[1] - s[1] * e1[0],
     ];
-    let w = (RAY_DIR[0] * q[0] + RAY_DIR[1] * q[1] + RAY_DIR[2] * q[2]) * inv_det;
+    let w = (dir[0] * q[0] + dir[1] * q[1] + dir[2] * q[2]) * inv_det;
     if w < 0.0 || u + w > 1.0 {
-        return false;
+        return None;
     }
-    let t = (e2[0] * q[0] + e2[1] * q[1] + e2[2] * q[2]) * inv_det;
-    t > 0.0
+    Some((e2[0] * q[0] + e2[1] * q[1] + e2[2] * q[2]) * inv_det)
 }
 
 #[cfg(test)]
@@ -408,10 +478,8 @@ mod tests {
         assert!(!view.is_inside([5.0, 5.0, 5.0]));
     }
 
-    #[test]
-    fn bvh_matches_brute_force_on_a_sphere() {
-        // A UV sphere with enough triangles to force a real tree.
-        let (rings, segments) = (16, 24);
+    /// A unit UV sphere with enough triangles to force a real tree.
+    fn uv_sphere(rings: usize, segments: usize) -> TriMesh {
         let mut positions: Vec<f64> = vec![0.0, 0.0, 1.0, 0.0, 0.0, -1.0];
         for r in 1..rings {
             let phi = std::f64::consts::PI * r as f64 / rings as f64;
@@ -437,13 +505,17 @@ mod tests {
                 indices.extend([a, b, c, a, c, d]);
             }
         }
-        let mesh = TriMesh {
+        TriMesh {
             positions,
             indices,
             vertex_fields: vec![],
             face_fields: vec![],
-        };
+        }
+    }
 
+    #[test]
+    fn bvh_matches_brute_force_on_a_sphere() {
+        let mesh = uv_sphere(16, 24);
         let payload = build_payload(&mesh).unwrap();
         let view = PayloadView::new(&payload).unwrap();
 
@@ -470,6 +542,102 @@ mod tests {
             }
             if r > 1.05 {
                 assert!(!view.is_inside(p), "sphere exterior misclassified at {p:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn cube_height_query_hits_the_faces() {
+        let payload = build_payload(&cube(-1.0, 1.0)).unwrap();
+        let view = PayloadView::new(&payload).unwrap();
+
+        // Top/bottom along each axis; the lateral point (0.3, -0.2) is well
+        // inside every face.
+        for axis in 0..3 {
+            assert_eq!(view.height_at([0.3, -0.2], axis, true), Some(1.0));
+            assert_eq!(view.height_at([0.3, -0.2], axis, false), Some(-1.0));
+        }
+        // Outside the footprint the line misses.
+        assert_eq!(view.height_at([1.5, 0.0], 2, true), None);
+        assert_eq!(view.height_at([0.0, -1.5], 0, true), None);
+    }
+
+    #[test]
+    fn sphere_height_query_matches_the_analytic_surface() {
+        let mesh = uv_sphere(16, 24);
+        let payload = build_payload(&mesh).unwrap();
+        let view = PayloadView::new(&payload).unwrap();
+
+        // Inscribed tessellation: heights sit slightly under sqrt(1 - r^2).
+        for &(x, y) in &[(0.0, 0.0), (0.3, 0.1), (-0.5, 0.4), (0.2, -0.6)] {
+            let analytic = (1.0f64 - x * x - y * y).sqrt();
+            let top = view.height_at([x, y], 2, true).expect("line hits sphere");
+            let bottom = view.height_at([x, y], 2, false).expect("line hits sphere");
+            assert!(
+                (top - analytic).abs() < 0.05,
+                "top at ({x}, {y}): {top} vs {analytic}"
+            );
+            assert!(
+                (bottom + analytic).abs() < 0.05,
+                "bottom at ({x}, {y}): {bottom} vs {analytic}"
+            );
+        }
+        assert_eq!(view.height_at([1.2, 0.0], 2, true), None);
+    }
+
+    #[test]
+    fn height_query_matches_brute_force() {
+        let mesh = uv_sphere(16, 24);
+        let payload = build_payload(&mesh).unwrap();
+        let view = PayloadView::new(&payload).unwrap();
+
+        // No-BVH oracle: fold line_hit over every triangle.
+        let brute = |lat: [f64; 2], axis: usize, top: bool| -> Option<f64> {
+            let (u, v) = match axis {
+                0 => (1, 2),
+                1 => (0, 2),
+                _ => (0, 1),
+            };
+            let mut origin = [0.0f64; 3];
+            origin[u] = lat[0];
+            origin[v] = lat[1];
+            let mut dir = [0.0f64; 3];
+            dir[axis] = 1.0;
+            let mut best: Option<f64> = None;
+            for t in 0..mesh.triangle_count() {
+                let idx = mesh.triangle(t);
+                let tri: [[f32; 3]; 3] = std::array::from_fn(|i| {
+                    let q = mesh.position(idx[i] as usize);
+                    [q[0] as f32, q[1] as f32, q[2] as f32]
+                });
+                if let Some(h) = line_hit(tri, origin, dir) {
+                    best = Some(match best {
+                        Some(prev) if top => prev.max(h),
+                        Some(prev) => prev.min(h),
+                        None => h,
+                    });
+                }
+            }
+            best
+        };
+
+        let mut state = 0xdeadbeefu64;
+        let mut rand = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f64 / (1u64 << 31) as f64) * 3.0 - 1.5
+        };
+        for _ in 0..500 {
+            let lat = [rand(), rand()];
+            for axis in 0..3 {
+                for top in [true, false] {
+                    assert_eq!(
+                        view.height_at(lat, axis, top),
+                        brute(lat, axis, top),
+                        "BVH height disagrees with brute force at {lat:?} axis {axis} top {top}"
+                    );
+                }
             }
         }
     }

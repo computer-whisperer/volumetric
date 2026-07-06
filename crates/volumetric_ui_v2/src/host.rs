@@ -520,18 +520,18 @@ fn handle_file_action(app: &mut VolumetricUiV2, session: &Session, action: FileA
         FileAction::ImportStl => {
             import_blob_file(app, ("STL", &["stl"]), "stl_import_operator", "stl_import");
         }
-        FileAction::ImportHeightmap => {
+        FileAction::ImportImage => {
             import_blob_file(
                 app,
                 ("Images", &["png", "jpg", "jpeg", "bmp", "gif"]),
-                "heightmap_extrude_operator",
-                "heightmap",
+                "image_model_operator",
+                "image",
             );
         }
     }
 }
 
-/// Shared pick-and-read path for Blob-input imports (STL, heightmap).
+/// Shared pick-and-read path for Blob-input imports (STL, image).
 fn import_blob_file(
     app: &mut VolumetricUiV2,
     (filter_name, extensions): (&str, &[&str]),

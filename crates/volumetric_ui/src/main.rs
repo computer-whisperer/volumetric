@@ -1457,27 +1457,28 @@ impl VolumetricApp {
         self.run_project();
     }
 
-    /// Processes a heightmap image import by running the heightmap_extrude_operator
+    /// Processes an image import by running the image_model_operator (a 2D
+    /// field model; chain heightmap_extrude_operator to lift it to 3D)
     fn process_heightmap_import(&mut self, image_bytes: Vec<u8>) {
-        // Get the heightmap_extrude_operator WASM
-        let op_wasm = if let Some(bytes) = get_bundled_operator("heightmap_extrude_operator") {
+        // Get the image_model_operator WASM
+        let op_wasm = if let Some(bytes) = get_bundled_operator("image_model_operator") {
             bytes.to_vec()
         } else {
             // Filesystem fallback for native debug builds only
             #[cfg(all(not(target_arch = "wasm32"), debug_assertions))]
             {
-                if let Some(path) = operation_wasm_path("heightmap_extrude_operator") {
+                if let Some(path) = operation_wasm_path("image_model_operator") {
                     match fs::read(&path) {
                         Ok(bytes) => bytes,
                         Err(e) => {
                             self.error_message =
-                                Some(format!("Failed to read heightmap extrude operator: {}", e));
+                                Some(format!("Failed to read image model operator: {}", e));
                             return;
                         }
                     }
                 } else {
                     self.error_message = Some(
-                        "Heightmap Extrude operator not found. Build it first with: cargo build --release --target wasm32-unknown-unknown -p heightmap_extrude_operator".to_string()
+                        "Image model operator not found. Build it first with: cargo build --release --target wasm32-unknown-unknown -p image_model_operator".to_string()
                     );
                     return;
                 }
@@ -1486,7 +1487,7 @@ impl VolumetricApp {
             #[cfg(any(target_arch = "wasm32", not(debug_assertions)))]
             {
                 self.error_message = Some(
-                    "Heightmap Extrude operator not bundled. Rebuild with WASM assets available."
+                    "Image model operator not bundled. Rebuild with WASM assets available."
                         .to_string(),
                 );
                 return;
@@ -1502,45 +1503,20 @@ impl VolumetricApp {
         let output_id = self
             .project
             .as_ref()
-            .map(|p| p.default_output_name("heightmap", None))
-            .unwrap_or_else(|| "heightmap_model".to_string());
+            .map(|p| p.default_output_name("image", None))
+            .unwrap_or_else(|| "image_model".to_string());
 
-        // Build inputs: [CBORConfiguration (default config), Blob (image data)]
-        let default_config = {
-            // Encode default config: { width: 1.0, depth: 1.0, height: 1.0, clip: 0.0 }
-            let mut cbor_bytes = Vec::new();
-            let config_map = ciborium::value::Value::Map(vec![
-                (
-                    ciborium::value::Value::Text("width".to_string()),
-                    ciborium::value::Value::Float(1.0),
-                ),
-                (
-                    ciborium::value::Value::Text("depth".to_string()),
-                    ciborium::value::Value::Float(1.0),
-                ),
-                (
-                    ciborium::value::Value::Text("height".to_string()),
-                    ciborium::value::Value::Float(1.0),
-                ),
-                (
-                    ciborium::value::Value::Text("clip".to_string()),
-                    ciborium::value::Value::Float(0.0),
-                ),
-            ]);
-            ciborium::into_writer(&config_map, &mut cbor_bytes).ok();
-            cbor_bytes
-        };
-
+        // Inputs: [Blob (image data), CBORConfiguration (empty = defaults)]
         let inputs = vec![
-            ExecutionInput::Inline(default_config), // CBORConfiguration
-            ExecutionInput::Inline(image_bytes),    // Blob: image data
+            ExecutionInput::Inline(image_bytes),
+            ExecutionInput::Inline(Vec::new()),
         ];
 
         let output_ids = vec![output_id.clone()];
 
         if let Some(ref mut project) = self.project {
             project.insert_operation(
-                "op_heightmap_extrude_operator",
+                "op_image_model_operator",
                 op_wasm,
                 inputs,
                 output_ids,

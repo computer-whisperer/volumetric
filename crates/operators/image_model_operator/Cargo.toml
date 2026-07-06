@@ -1,5 +1,5 @@
 [package]
-name = "heightmap_extrude_operator"
+name = "image_model_operator"
 version = "0.1.0"
 edition = "2024"
 
@@ -8,6 +8,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 volumetric_abi = { path = "../../volumetric_abi" }
+gridfield_model_core = { path = "../../gridfield_model_core" }
 walrus = "0.26"
 serde = { version = "1", features = ["derive"] }
 ciborium = "0.2"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif"] }

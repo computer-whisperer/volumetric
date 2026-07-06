@@ -1,5 +1,5 @@
 [package]
-name = "heightmap_extrude_operator"
+name = "mesh_height_operator"
 version = "0.1.0"
 edition = "2024"
 
@@ -8,6 +8,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 volumetric_abi = { path = "../../volumetric_abi" }
+trimesh_model_core = { path = "../../trimesh_model_core" }
 walrus = "0.26"
 serde = { version = "1", features = ["derive"] }
 ciborium = "0.2"

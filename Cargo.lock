@@ -2106,6 +2106,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "gridfield_model_core"
+version = "0.1.0"
+
+[[package]]
+name = "gridfield_model_template"
+version = "0.1.0"
+dependencies = [
+ "gridfield_model_core",
+]
+
+[[package]]
 name = "gyroid_lattice_model"
 version = "0.1.0"
 dependencies = [
@@ -2195,10 +2206,9 @@ name = "heightmap_extrude_operator"
 version = "0.1.0"
 dependencies = [
  "ciborium",
- "image",
  "serde",
  "volumetric_abi",
- "wasm-encoder 0.248.0",
+ "walrus",
 ]
 
 [[package]]
@@ -2338,6 +2348,18 @@ dependencies = [
  "tiff",
  "zune-core",
  "zune-jpeg",
+]
+
+[[package]]
+name = "image_model_operator"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "gridfield_model_core",
+ "image",
+ "serde",
+ "volumetric_abi",
+ "walrus",
 ]
 
 [[package]]
@@ -2762,6 +2784,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "mesh_height_operator"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "serde",
+ "trimesh_model_core",
+ "volumetric_abi",
+ "walrus",
 ]
 
 [[package]]
@@ -4663,6 +4696,13 @@ dependencies = [
  "memchr",
  "nom",
  "petgraph 0.8.3",
+]
+
+[[package]]
+name = "trimesh_height_model_template"
+version = "0.1.0"
+dependencies = [
+ "trimesh_model_core",
 ]
 
 [[package]]

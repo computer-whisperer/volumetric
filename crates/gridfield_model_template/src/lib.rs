@@ -1,0 +1,94 @@
+//! The grid-field model template: a complete, *stateless* 2D Model ABI
+//! implementation over a grid-field payload that `image_model_operator`
+//! (and future grid-baking operators) patch into a copy of this module as
+//! data segments.
+//!
+//! All field work (decoding, resampling, serialization) happens in the
+//! operator via `gridfield_model_core`; this module only reads. Nothing
+//! here memoizes or mutates between `sample` calls.
+//!
+//! # Patch contract
+//!
+//! - `gridfield_payload_slot() -> i32` returns the address of a 4-byte
+//!   slot. The operator overwrites the slot (via an active data segment)
+//!   with the little-endian base address of the payload it appends in
+//!   freshly reserved memory pages. The slot must be read volatilely — its
+//!   compiled initializer is zero, and a folded read would make the
+//!   template permanently empty.
+//! - An unpatched template (slot still zero) or a corrupt payload behaves
+//!   as an empty model: bounds all zero, every sample 0.0 — the ABI's
+//!   errors-read-as-outside convention.
+//!
+//! Samples outside the payload's bounds rectangle are 0.0.
+//!
+//! # Regenerating the checked-in binary
+//!
+//! The operator embeds a prebuilt copy of this module (see
+//! `crates/operators/image_model_operator/template/`). After changing this
+//! crate or `gridfield_model_core`'s read side:
+//!
+//! ```text
+//! cargo build --release --target wasm32-unknown-unknown -p gridfield_model_template
+//! cp target/wasm32-unknown-unknown/release/gridfield_model_template.wasm \
+//!    crates/operators/image_model_operator/template/
+//! ```
+
+use gridfield_model_core::PayloadView;
+
+/// Model-owned IO scratch region (2 * 2 f64s), per the Model ABI.
+static mut IO_BUFFER: [f64; 4] = [0.0; 4];
+
+/// The 4-byte payload-base slot the operator patches. Aligned so the u32
+/// read is well-formed.
+#[repr(align(4))]
+struct Slot([u8; 4]);
+static PAYLOAD_SLOT: Slot = Slot([0; 4]);
+
+/// The patched payload, if the slot has been filled and the header
+/// validates.
+fn payload() -> Option<PayloadView<'static>> {
+    // Volatile: the slot's compile-time value is zero, and the whole point
+    // is that the bytes change after compilation.
+    let base = unsafe { core::ptr::read_volatile(PAYLOAD_SLOT.0.as_ptr() as *const u32) } as usize;
+    if base == 0 {
+        return None;
+    }
+    // payload_len lives at header offset 12; trust it only as far as
+    // PayloadView's structural validation.
+    let len = unsafe { core::ptr::read_volatile((base + 12) as *const u32) } as usize;
+    let bytes = unsafe { core::slice::from_raw_parts(base as *const u8, len) };
+    PayloadView::new(bytes).ok()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn gridfield_payload_slot() -> i32 {
+    PAYLOAD_SLOT.0.as_ptr() as i32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn get_dimensions() -> u32 {
+    2
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn get_io_ptr() -> i32 {
+    (&raw mut IO_BUFFER) as i32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn get_bounds(out_ptr: i32) {
+    let bounds = payload().map(|p| p.bounds()).unwrap_or([0.0; 4]);
+    for (i, v) in bounds.iter().enumerate() {
+        unsafe { core::ptr::write_unaligned((out_ptr as usize + i * 8) as *mut f64, *v) };
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sample(pos_ptr: i32) -> f32 {
+    let p: [f64; 2] = core::array::from_fn(|i| unsafe {
+        core::ptr::read_unaligned((pos_ptr as usize + i * 8) as *const f64)
+    });
+    payload()
+        .and_then(|view| view.sample(p[0], p[1]))
+        .unwrap_or(0.0)
+}

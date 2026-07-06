@@ -24,7 +24,7 @@ pub const SAVE_PROJECT_KEY: &str = "action:save-project";
 pub const SAVE_PROJECT_AS_KEY: &str = "action:save-project-as";
 pub const IMPORT_WASM_KEY: &str = "action:import-wasm";
 pub const IMPORT_STL_KEY: &str = "action:import-stl";
-pub const IMPORT_HEIGHTMAP_KEY: &str = "action:import-heightmap";
+pub const IMPORT_IMAGE_KEY: &str = "action:import-image";
 pub const RUN_PROJECT_KEY: &str = "action:run-project";
 pub const CANCEL_RUN_KEY: &str = "action:cancel-run";
 pub const TOGGLE_AUTO_REBUILD_KEY: &str = "action:toggle-auto-rebuild";
@@ -417,8 +417,9 @@ pub enum FileAction {
     ImportWasm,
     /// Import an STL mesh via the bundled `stl_import_operator`.
     ImportStl,
-    /// Import a heightmap image via the bundled `heightmap_extrude_operator`.
-    ImportHeightmap,
+    /// Import an image as a 2D field model via the bundled
+    /// `image_model_operator`.
+    ImportImage,
 }
 
 /// Render settings for one output. Stored per asset id when the user
@@ -1396,7 +1397,7 @@ impl VolumetricUiV2 {
         self.status = format!("imported {id}");
     }
 
-    /// Imports a data file (STL mesh, heightmap image, …) by staging the named
+    /// Imports a data file (STL mesh, image, …) by staging the named
     /// bundled operator with the file bytes wired into its Blob input. Called
     /// by the host after its Import dialog.
     pub(crate) fn import_blob_asset(
@@ -1928,8 +1929,8 @@ impl App for VolumetricUiV2 {
             return;
         }
 
-        if event.is_click_or_activate(IMPORT_HEIGHTMAP_KEY) {
-            self.pending_file_action = Some(FileAction::ImportHeightmap);
+        if event.is_click_or_activate(IMPORT_IMAGE_KEY) {
+            self.pending_file_action = Some(FileAction::ImportImage);
             self.open_menu = None;
             return;
         }
@@ -2167,7 +2168,7 @@ fn menu_layer(app: &VolumetricUiV2) -> Option<El> {
 
 /// Operators reachable through Add > Import rather than the plain operator
 /// list: staging them bare (empty Blob input) would only fail the next run.
-const IMPORT_OPERATORS: [&str; 2] = ["stl_import_operator", "heightmap_extrude_operator"];
+const IMPORT_OPERATORS: [&str; 2] = ["stl_import_operator", "image_model_operator"];
 
 /// The Add menu body: every bundled model and operator (one click to add),
 /// plus file-import actions for external assets.
@@ -2194,7 +2195,7 @@ fn add_menu_items() -> Vec<El> {
     items.push(menubar_label("Import"));
     items.push(menubar_item_with_icon("file", "Model WASM…").key(IMPORT_WASM_KEY));
     items.push(menubar_item_with_icon("file", "STL Mesh…").key(IMPORT_STL_KEY));
-    items.push(menubar_item_with_icon("file", "Heightmap Image…").key(IMPORT_HEIGHTMAP_KEY));
+    items.push(menubar_item_with_icon("file", "Image…").key(IMPORT_IMAGE_KEY));
     items
 }
 
@@ -4089,8 +4090,8 @@ mod tests {
         assert_eq!(app.take_file_action(), Some(FileAction::ImportWasm));
         dispatch(&mut app, UiEvent::synthetic_click(IMPORT_STL_KEY));
         assert_eq!(app.take_file_action(), Some(FileAction::ImportStl));
-        dispatch(&mut app, UiEvent::synthetic_click(IMPORT_HEIGHTMAP_KEY));
-        assert_eq!(app.take_file_action(), Some(FileAction::ImportHeightmap));
+        dispatch(&mut app, UiEvent::synthetic_click(IMPORT_IMAGE_KEY));
+        assert_eq!(app.take_file_action(), Some(FileAction::ImportImage));
     }
 
     #[test]

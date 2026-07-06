@@ -26,6 +26,7 @@ const OPERATORS: &[(&str, &str)] = &[
     ("stl_import_operator", "STL Import"),
     ("rectangular_prism_operator", "Rectangular Prism"),
     ("heightmap_extrude_operator", "Heightmap Extrude"),
+    ("image_model_operator", "Image"),
     ("extrude_operator", "Extrude"),
     ("revolve_operator", "Revolve"),
     ("fea_grid_mesh_operator", "FEA Grid Mesh"),
@@ -33,6 +34,7 @@ const OPERATORS: &[(&str, &str)] = &[
     ("fea_density_operator", "FEA Density"),
     ("fea_inverse_operator", "FEA Inverse"),
     ("mesh_to_model_operator", "Mesh to Model"),
+    ("mesh_height_operator", "Mesh Height Query"),
 ];
 
 fn main() {
