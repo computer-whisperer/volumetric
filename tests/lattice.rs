@@ -340,6 +340,86 @@ fn rejects_non_3d_inputs_and_bad_config() {
     assert!(err.contains("irregularity"), "{err}");
 }
 
+/// The lattice pattern lives in the merged model's own coordinate space,
+/// even when the input chain clobbers the position buffer in place (the
+/// ABI allows it; scale/rotation/translate transform positions that way).
+/// Regression: the glue used to read the position AFTER the input model
+/// ran, so a non-uniform upstream scale stretched the lattice cells by
+/// the model's aspect ratio.
+#[test]
+fn lattice_is_isotropic_after_upstream_scale() {
+    let prism = |a: [f64; 3], b: [f64; 3]| -> Vec<u8> {
+        let vec_bytes =
+            |v: [f64; 3]| -> Vec<u8> { v.iter().flat_map(|c| c.to_le_bytes()).collect() };
+        run_operator(
+            "rectangular_prism_operator",
+            vec![
+                cbor_config(&[(
+                    "mode",
+                    ciborium::value::Value::Text("opposite_corners".into()),
+                )]),
+                vec_bytes(a),
+                vec_bytes(b),
+            ],
+        )
+        .expect("prism runs")
+    };
+
+    // The same 2 x 1 x 0.5 box, once built directly and once as a unit
+    // cube run through a non-uniform (position-clobbering) scale.
+    let direct = prism([-1.0, -0.5, -0.25], [1.0, 0.5, 0.25]);
+    let scaled = run_operator(
+        "scale_operator",
+        vec![
+            prism([-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]),
+            cbor_config(&[
+                ("sx", ciborium::value::Value::Float(2.0)),
+                ("sy", ciborium::value::Value::Float(1.0)),
+                ("sz", ciborium::value::Value::Float(0.5)),
+            ]),
+        ],
+    )
+    .expect("scale runs");
+
+    let fill = |model: Vec<u8>| -> Vec<u8> {
+        run_operator(
+            "lattice_operator",
+            vec![
+                model,
+                cbor_config(&[
+                    ("lattice", ciborium::value::Value::Text("foam".into())),
+                    ("cell_size", ciborium::value::Value::Float(0.25)),
+                    ("uniform_density", ciborium::value::Value::Float(0.2)),
+                    ("irregularity", ciborium::value::Value::Float(0.0)),
+                ]),
+            ],
+        )
+        .expect("lattice runs")
+    };
+    let mut direct_exec = NativeModelExecutor::new(&fill(direct)).expect("direct executes");
+    let mut scaled_exec = NativeModelExecutor::new(&fill(scaled)).expect("scaled executes");
+
+    // Identical occupied region + identical (world-space) lattice pattern
+    // means identical occupancy everywhere.
+    let mut occupied = 0usize;
+    for i in 0..9 {
+        for j in 0..9 {
+            for k in 0..9 {
+                let p = [
+                    -0.93 + 0.221 * i as f64,
+                    -0.46 + 0.109 * j as f64,
+                    -0.23 + 0.053 * k as f64,
+                ];
+                let d = volumetric::is_occupied(direct_exec.sample_nd(&p).unwrap());
+                let s = volumetric::is_occupied(scaled_exec.sample_nd(&p).unwrap());
+                assert_eq!(d, s, "pattern must not depend on the input chain at {p:?}");
+                occupied += usize::from(d);
+            }
+        }
+    }
+    assert!(occupied > 0, "probe set should hit some struts");
+}
+
 /// The foam's irregularity knob reshapes the cells through the operator.
 #[test]
 fn foam_irregularity_flows_through() {

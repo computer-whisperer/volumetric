@@ -214,6 +214,11 @@ struct GlueIndices {
 /// Emit the merged `sample(pos_ptr) -> f32` glue: input occupancy gates the
 /// lattice evaluation; the density comes from the input's channel row (or a
 /// constant for occupancy-only inputs).
+///
+/// The position is saved to locals BEFORE calling the input model: the ABI
+/// allows `sample` to clobber its position buffer (scale/rotation/translate
+/// do, transforming in place), and the lattice must be evaluated in the
+/// merged model's own coordinate space, not the input chain's.
 #[allow(clippy::too_many_arguments)]
 fn add_sample_glue(
     sections: &mut MergeSections,
@@ -237,8 +242,14 @@ fn add_sample_glue(
         memory_index: idx.a_memory,
     };
 
-    // local 0: pos_ptr (param); local 1: scratch pointer.
-    let mut f = Function::new([(1, ValType::I32)]);
+    // local 0: pos_ptr (param); local 1: scratch pointer; locals 2-4: the
+    // position, saved before the input model can clobber it.
+    let mut f = Function::new([(1, ValType::I32), (3, ValType::F64)]);
+    for axis in 0..3u64 {
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::F64Load(mem64(axis * 8)));
+        f.instruction(&Instruction::LocalSet(2 + axis as u32));
+    }
     match idx.a_sample_channels {
         Some(a_sample_channels) => {
             // scratch = A.get_io_ptr() + 24
@@ -265,13 +276,10 @@ fn add_sample_glue(
     f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(
         ValType::F32,
     )));
-    // lattice_sample(x, y, z, density)
-    f.instruction(&Instruction::LocalGet(0));
-    f.instruction(&Instruction::F64Load(mem64(0)));
-    f.instruction(&Instruction::LocalGet(0));
-    f.instruction(&Instruction::F64Load(mem64(8)));
-    f.instruction(&Instruction::LocalGet(0));
-    f.instruction(&Instruction::F64Load(mem64(16)));
+    // lattice_sample(x, y, z, density) with the saved position
+    f.instruction(&Instruction::LocalGet(2));
+    f.instruction(&Instruction::LocalGet(3));
+    f.instruction(&Instruction::LocalGet(4));
     match idx.a_sample_channels {
         Some(_) => {
             f.instruction(&Instruction::LocalGet(1));
@@ -298,6 +306,10 @@ fn add_sample_glue(
 
 /// Emit the merged `sample_channels(pos_ptr, out_ptr)` glue: the input's
 /// channel row with channel 0 replaced by the lattice occupancy.
+///
+/// As in [`add_sample_glue`], the position is saved to locals before the
+/// input model runs (its `sample_channels` may clobber the position
+/// buffer in place).
 fn add_sample_channels_glue(
     sections: &mut MergeSections,
     exports: &mut ExportSection,
@@ -323,8 +335,13 @@ fn add_sample_channels_glue(
         memory_index: idx.a_memory,
     };
 
-    // params: 0 pos_ptr, 1 out_ptr.
-    let mut f = Function::new([]);
+    // params: 0 pos_ptr, 1 out_ptr; locals 2-4: the saved position.
+    let mut f = Function::new([(3, ValType::F64)]);
+    for axis in 0..3u64 {
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::F64Load(mem64(axis * 8)));
+        f.instruction(&Instruction::LocalSet(2 + axis as u32));
+    }
     // A.sample_channels(pos_ptr, out_ptr) fills the full row.
     f.instruction(&Instruction::LocalGet(0));
     f.instruction(&Instruction::LocalGet(1));
@@ -338,12 +355,9 @@ fn add_sample_channels_glue(
     f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(
         ValType::F32,
     )));
-    f.instruction(&Instruction::LocalGet(0));
-    f.instruction(&Instruction::F64Load(mem64(0)));
-    f.instruction(&Instruction::LocalGet(0));
-    f.instruction(&Instruction::F64Load(mem64(8)));
-    f.instruction(&Instruction::LocalGet(0));
-    f.instruction(&Instruction::F64Load(mem64(16)));
+    f.instruction(&Instruction::LocalGet(2));
+    f.instruction(&Instruction::LocalGet(3));
+    f.instruction(&Instruction::LocalGet(4));
     f.instruction(&Instruction::LocalGet(1));
     f.instruction(&Instruction::F32Load(MemArg {
         offset: u64::from(density_channel) * 4,
