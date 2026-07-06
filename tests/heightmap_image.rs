@@ -214,6 +214,40 @@ fn heightmap_extrude_max_height_caps_the_solid() {
 }
 
 #[test]
+fn negative_scale_carves_instead_of_raising() {
+    // Carve mode: surface = 1 - field. White pixels end at 0 (no
+    // geometry), black pixels rise to the full height. The default z_max
+    // (scale + offset = 0) is unknowable, so max_height is required.
+    let extruded = run_operator(
+        "heightmap_extrude_operator",
+        vec![
+            image_field_wasm(),
+            cbor_floats(&[("scale", -1.0), ("offset", 1.0), ("max_height", 1.0)]),
+        ],
+    )
+    .expect("carve-extrude field");
+    let mut executor = NativeModelExecutor::new(&extruded).unwrap();
+    // Top-right pixel is black: surface at 1.0.
+    assert_eq!(executor.sample_nd(&[1.0, 0.5, 0.9]).unwrap(), 1.0);
+    assert_eq!(executor.sample_nd(&[1.0, 0.5, 1.1]).unwrap(), 0.0);
+    // Top-left is white: surface at 0, which doesn't clear the clip.
+    assert_eq!(executor.sample_nd(&[-1.0, 0.5, 0.0]).unwrap(), 0.0);
+    // Bottom-left is 0.2: surface at 0.8.
+    assert_eq!(executor.sample_nd(&[-1.0, -0.5, 0.7]).unwrap(), 1.0);
+    assert_eq!(executor.sample_nd(&[-1.0, -0.5, 0.9]).unwrap(), 0.0);
+}
+
+#[test]
+fn nonpositive_default_bound_requires_max_height() {
+    let err = run_operator(
+        "heightmap_extrude_operator",
+        vec![image_field_wasm(), cbor_floats(&[("scale", -1.0)])],
+    )
+    .expect_err("negative scale without max_height must fail");
+    assert!(err.contains("max_height"), "{err}");
+}
+
+#[test]
 fn extruding_a_3d_model_is_rejected() {
     let err = run_operator(
         "heightmap_extrude_operator",

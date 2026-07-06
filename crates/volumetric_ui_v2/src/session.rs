@@ -946,11 +946,8 @@ fn build_preview_scene(request: &PreviewRequest) -> Result<PreviewEntity, String
                 .vertices
                 .iter()
                 .zip(mesh.normals.iter())
-                .map(|(position, normal)| renderer::MeshVertex {
-                    position: (*position).into(),
-                    _pad0: 0.0,
-                    normal: (*normal).into(),
-                    _pad1: 0.0,
+                .map(|(position, normal)| {
+                    renderer::MeshVertex::new((*position).into(), (*normal).into())
                 })
                 .collect();
             let wireframe = mesh_edge_lines(&vertices, Some(&mesh.indices));
@@ -1118,7 +1115,7 @@ fn build_sketch_preview(
 
     let mut vertices: Vec<renderer::MeshVertex> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
-    let mut emit_quad = |x0: f32, x1: f32, y0: f32, y1: f32| {
+    let mut emit_quad = |x0: f32, x1: f32, y0: f32, y1: f32, color: [f32; 4]| {
         let corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)];
         for (normal, winding) in [
             ([0.0f32, 0.0, 1.0], [0u32, 1, 2, 0, 2, 3]),
@@ -1126,32 +1123,58 @@ fn build_sketch_preview(
         ] {
             let base = vertices.len() as u32;
             for (x, y) in corners {
-                vertices.push(renderer::MeshVertex {
-                    position: [x, y, 0.0],
-                    _pad0: 0.0,
-                    normal,
-                    _pad1: 0.0,
-                });
+                vertices.push(renderer::MeshVertex::colored([x, y, 0.0], normal, color));
             }
             indices.extend(winding.iter().map(|i| base + i));
+        }
+    };
+
+    // Cell classification for per-row run-length merging: None = empty,
+    // Some(level) = draw with that level's color. Occupancy sketches keep
+    // the mask look (untinted, holes where empty); scalar fields draw
+    // every finite cell colormapped over the sampled value range.
+    let binary = raster.is_binary();
+    const LEVELS: usize = 48;
+    let value_span = (raster.value_max - raster.value_min).max(f32::MIN_POSITIVE);
+    let classify = |xi: usize, yi: usize| -> Option<usize> {
+        if binary {
+            raster.cell(xi, yi).then_some(LEVELS)
+        } else {
+            let v = raster.value(xi, yi);
+            if !v.is_finite() {
+                return None;
+            }
+            let t = (v - raster.value_min) / value_span;
+            Some(((t * LEVELS as f32) as usize).min(LEVELS - 1))
+        }
+    };
+    let level_color = |level: usize| -> [f32; 4] {
+        if binary {
+            [1.0; 4]
+        } else {
+            let [r, g, b] = volumetric::viridis((level as f32 + 0.5) / LEVELS as f32);
+            [r, g, b, 1.0]
         }
     };
 
     for yi in 0..raster.height {
         let y0 = raster.bounds_min.1 + cell_h * yi as f32;
         let y1 = y0 + cell_h;
-        let mut run_start: Option<usize> = None;
+        let mut run: Option<(usize, usize)> = None; // (start, level)
         for xi in 0..=raster.width {
-            let occupied = xi < raster.width && raster.cell(xi, yi);
-            match (occupied, run_start) {
-                (true, None) => run_start = Some(xi),
-                (false, Some(start)) => {
-                    let x0 = raster.bounds_min.0 + cell_w * start as f32;
-                    let x1 = raster.bounds_min.0 + cell_w * xi as f32;
-                    emit_quad(x0, x1, y0, y1);
-                    run_start = None;
-                }
-                _ => {}
+            let class = (xi < raster.width).then(|| classify(xi, yi)).flatten();
+            if let Some((start, level)) = run
+                && class != Some(level)
+            {
+                let x0 = raster.bounds_min.0 + cell_w * start as f32;
+                let x1 = raster.bounds_min.0 + cell_w * xi as f32;
+                emit_quad(x0, x1, y0, y1, level_color(level));
+                run = None;
+            }
+            if run.is_none()
+                && let Some(level) = class
+            {
+                run = Some((xi, level));
             }
         }
     }
@@ -1167,13 +1190,20 @@ fn build_sketch_preview(
         renderer::MaterialId(0),
     );
 
+    let mut detail = vec![format!(
+        "2D sketch raster {}x{}",
+        raster.width, raster.height
+    )];
+    if !binary {
+        detail.push(format!(
+            "field {:.4} .. {:.4} (viridis)",
+            raster.value_min, raster.value_max
+        ));
+    }
     let stats = OutputStats {
         triangles,
         samples: (raster.width * raster.height) as u64,
-        detail: vec![format!(
-            "2D sketch raster {}x{}",
-            raster.width, raster.height
-        )],
+        detail,
         mesh_ms: build_start.elapsed().as_secs_f64() * 1000.0,
         ..Default::default()
     };
@@ -1245,12 +1275,7 @@ fn build_fea_mesh_preview(
         let (ab, ac) = (Vec3::from(b) - Vec3::from(a), Vec3::from(c) - Vec3::from(a));
         let normal = ab.cross(ac).normalize_or_zero().to_array();
         for p in [a, b, c] {
-            vertices.push(renderer::MeshVertex {
-                position: p,
-                _pad0: 0.0,
-                normal,
-                _pad1: 0.0,
-            });
+            vertices.push(renderer::MeshVertex::new(p, normal));
         }
     };
     for quad in &quads {
@@ -1360,12 +1385,7 @@ fn build_tri_mesh_preview(
         let (ab, ac) = (Vec3::from(b) - Vec3::from(a), Vec3::from(c) - Vec3::from(a));
         let normal = ab.cross(ac).normalize_or_zero().to_array();
         for p in [a, b, c] {
-            vertices.push(renderer::MeshVertex {
-                position: p,
-                _pad0: 0.0,
-                normal,
-                _pad1: 0.0,
-            });
+            vertices.push(renderer::MeshVertex::new(p, normal));
         }
     };
     for t in 0..mesh.triangle_count() {
@@ -1473,12 +1493,7 @@ fn triangles_to_mesh_vertices(triangles: &[volumetric::Triangle]) -> Vec<rendere
             } else {
                 [n.0, n.1, n.2]
             };
-            out.push(renderer::MeshVertex {
-                position: [v.0, v.1, v.2],
-                _pad0: 0.0,
-                normal,
-                _pad1: 0.0,
-            });
+            out.push(renderer::MeshVertex::new([v.0, v.1, v.2], normal));
         }
     }
 

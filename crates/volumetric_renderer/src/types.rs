@@ -17,8 +17,8 @@ pub struct MeshData {
     pub indices: Option<Vec<u32>>,
 }
 
-/// A single mesh vertex with position and normal.
-/// Padded for GPU alignment (32 bytes total).
+/// A single mesh vertex with position, normal and color.
+/// Padded for GPU alignment (48 bytes total).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct MeshVertex {
@@ -26,16 +26,25 @@ pub struct MeshVertex {
     pub _pad0: f32,
     pub normal: [f32; 3],
     pub _pad1: f32,
+    /// Linear RGBA multiplied into the material base color; white for the
+    /// plain untinted look.
+    pub color: [f32; 4],
 }
 
 impl MeshVertex {
-    /// Create a new mesh vertex with the given position and normal.
+    /// Create a new mesh vertex with the given position and normal, untinted.
     pub fn new(position: [f32; 3], normal: [f32; 3]) -> Self {
+        Self::colored(position, normal, [1.0; 4])
+    }
+
+    /// Create a new mesh vertex with an explicit vertex color.
+    pub fn colored(position: [f32; 3], normal: [f32; 3], color: [f32; 4]) -> Self {
         Self {
             position,
             _pad0: 0.0,
             normal,
             _pad1: 0.0,
+            color,
         }
     }
 }

@@ -311,24 +311,18 @@ fn execute_resample(
                         tris.iter()
                             .flat_map(|t| {
                                 [
-                                    renderer::MeshVertex {
-                                        position: t.vertices[0].into(),
-                                        _pad0: 0.0,
-                                        normal: t.normals[0].into(),
-                                        _pad1: 0.0,
-                                    },
-                                    renderer::MeshVertex {
-                                        position: t.vertices[1].into(),
-                                        _pad0: 0.0,
-                                        normal: t.normals[1].into(),
-                                        _pad1: 0.0,
-                                    },
-                                    renderer::MeshVertex {
-                                        position: t.vertices[2].into(),
-                                        _pad0: 0.0,
-                                        normal: t.normals[2].into(),
-                                        _pad1: 0.0,
-                                    },
+                                    renderer::MeshVertex::new(
+                                        t.vertices[0].into(),
+                                        t.normals[0].into(),
+                                    ),
+                                    renderer::MeshVertex::new(
+                                        t.vertices[1].into(),
+                                        t.normals[1].into(),
+                                    ),
+                                    renderer::MeshVertex::new(
+                                        t.vertices[2].into(),
+                                        t.normals[2].into(),
+                                    ),
                                 ]
                             })
                             .collect(),
@@ -362,12 +356,7 @@ fn execute_resample(
                         .vertices
                         .iter()
                         .zip(meshing_result.normals.iter())
-                        .map(|(pos, norm)| renderer::MeshVertex {
-                            position: (*pos).into(),
-                            _pad0: 0.0,
-                            normal: (*norm).into(),
-                            _pad1: 0.0,
-                        })
+                        .map(|(pos, norm)| renderer::MeshVertex::new((*pos).into(), (*norm).into()))
                         .collect();
 
                     result.mesh_vertices = Arc::new(vertices);
@@ -440,24 +429,18 @@ fn execute_resample(
                         tris.iter()
                             .flat_map(|t| {
                                 [
-                                    renderer::MeshVertex {
-                                        position: t.vertices[0].into(),
-                                        _pad0: 0.0,
-                                        normal: t.normals[0].into(),
-                                        _pad1: 0.0,
-                                    },
-                                    renderer::MeshVertex {
-                                        position: t.vertices[1].into(),
-                                        _pad0: 0.0,
-                                        normal: t.normals[1].into(),
-                                        _pad1: 0.0,
-                                    },
-                                    renderer::MeshVertex {
-                                        position: t.vertices[2].into(),
-                                        _pad0: 0.0,
-                                        normal: t.normals[2].into(),
-                                        _pad1: 0.0,
-                                    },
+                                    renderer::MeshVertex::new(
+                                        t.vertices[0].into(),
+                                        t.normals[0].into(),
+                                    ),
+                                    renderer::MeshVertex::new(
+                                        t.vertices[1].into(),
+                                        t.normals[1].into(),
+                                    ),
+                                    renderer::MeshVertex::new(
+                                        t.vertices[2].into(),
+                                        t.normals[2].into(),
+                                    ),
                                 ]
                             })
                             .collect(),
@@ -491,12 +474,7 @@ fn execute_resample(
                         .vertices
                         .iter()
                         .zip(meshing_result.normals.iter())
-                        .map(|(pos, norm)| renderer::MeshVertex {
-                            position: (*pos).into(),
-                            _pad0: 0.0,
-                            normal: (*norm).into(),
-                            _pad1: 0.0,
-                        })
+                        .map(|(pos, norm)| renderer::MeshVertex::new((*pos).into(), (*norm).into()))
                         .collect();
 
                     result.mesh_vertices = Arc::new(vertices);
@@ -4140,12 +4118,7 @@ fn triangles_to_mesh_vertices(triangles: &[Triangle]) -> Vec<renderer::MeshVerte
                 [n.0, n.1, n.2]
             };
 
-            out.push(renderer::MeshVertex {
-                position: [v.0, v.1, v.2],
-                _pad0: 0.0,
-                normal,
-                _pad1: 0.0,
-            });
+            out.push(renderer::MeshVertex::new([v.0, v.1, v.2], normal));
         }
     }
 

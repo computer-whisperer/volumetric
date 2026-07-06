@@ -111,6 +111,12 @@ impl MeshPipeline {
                             offset: std::mem::offset_of!(MeshVertex, normal) as u64,
                             shader_location: 1,
                         },
+                        // vertex color (multiplied into the base color)
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: std::mem::offset_of!(MeshVertex, color) as u64,
+                            shader_location: 2,
+                        },
                     ],
                 }],
                 compilation_options: Default::default(),

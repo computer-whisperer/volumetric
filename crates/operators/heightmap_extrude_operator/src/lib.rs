@@ -8,15 +8,24 @@
 //! whose sample value is read as a height:
 //!
 //! ```text
-//! sample(x, y, z) = (field(x, y) > clip && 0 <= z <= field(x, y) * scale
-//!                    && z <= z_max) ? 1.0 : 0.0
+//! surface(x, y) = field(x, y) * scale + offset
+//! sample(x, y, z) = (surface > clip && 0 <= z <= surface && z <= z_max)
+//!                   ? 1.0 : 0.0
 //! ```
 //!
-//! where `z_max` is `max_height` when set, else `scale` (right for
-//! normalized [0, 1] fields like images; set `max_height` explicitly for
-//! absolute-height fields like mesh height queries). `z_max` is also the
-//! advertised z bound, so geometry demanded above it is cut off rather
-//! than left outside the bounds where meshing would miss it.
+//! `scale` may be negative (e.g. -1 turns a downward relief — a mesh
+//! height query's negative depths — into positive extrusion heights) and
+//! `offset` shifts absolute-height fields into range. `clip` is in output
+//! z units: surfaces at or below it produce no geometry, so the default
+//! 0.0 drops the background of a normalized image and negative-scale
+//! fields aren't accidentally clipped away.
+//!
+//! `z_max` is `max_height` when set, else `scale + offset` when that is
+//! positive (the natural maximum of a normalized [0, 1] field); when
+//! neither is positive the field's peak is unknowable statically and the
+//! operator errors, asking for an explicit `max_height`. `z_max` is also
+//! the advertised z bound, so geometry demanded above it is cut off
+//! rather than left outside the bounds where meshing would miss it.
 //!
 //! Generated Model ABI (same wrapping scheme as `extrude_operator`):
 //! - `get_dimensions() -> u32`: Returns 3
@@ -32,7 +41,7 @@
 //!
 //! Behavior:
 //! - Reads WASM model bytes from input 0
-//! - Reads CBOR configuration from input 1 (scale, max_height, clip)
+//! - Reads CBOR configuration from input 1 (scale, offset, max_height, clip)
 //! - Rejects non-2D input models
 //! - Outputs the modified WASM to output 0
 
@@ -43,12 +52,16 @@ use volumetric_abi::{OperatorMetadata, OperatorMetadataInput, OperatorMetadataOu
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(default)]
 struct HeightmapExtrudeConfig {
-    /// Multiplier from sample value to surface height.
+    /// Multiplier from sample value to surface height; negative flips a
+    /// downward relief into positive heights.
     scale: f64,
-    /// The advertised z bound and hard height cutoff; 0 = `scale` (a
-    /// normalized [0, 1] field's natural maximum).
+    /// Added to `field * scale`; shifts absolute-height fields into range.
+    offset: f64,
+    /// The advertised z bound and hard height cutoff; 0 = `scale + offset`
+    /// (a normalized [0, 1] field's natural maximum) when that is positive.
     max_height: f64,
-    /// Sample values <= clip produce no geometry.
+    /// Surfaces at or below this height (in output z units) produce no
+    /// geometry.
     clip: f64,
 }
 
@@ -56,6 +69,7 @@ impl Default for HeightmapExtrudeConfig {
     fn default() -> Self {
         Self {
             scale: 1.0,
+            offset: 0.0,
             max_height: 0.0,
             clip: 0.0,
         }
@@ -93,12 +107,18 @@ fn const_i32_return(module: &Module, func_id: FunctionId) -> Option<i32> {
 
 /// Transform the input 2D field WASM into its heightmap extrusion.
 fn transform_wasm(input_bytes: &[u8], cfg: HeightmapExtrudeConfig) -> Result<Vec<u8>, String> {
-    if !(cfg.scale > 0.0 && cfg.scale.is_finite()) {
-        return Err(format!("extrude scale must be > 0, got {}", cfg.scale));
+    if !(cfg.scale != 0.0 && cfg.scale.is_finite()) {
+        return Err(format!(
+            "extrude scale must be nonzero and finite, got {}",
+            cfg.scale
+        ));
+    }
+    if !cfg.offset.is_finite() {
+        return Err(format!("offset must be finite, got {}", cfg.offset));
     }
     if !(cfg.max_height >= 0.0 && cfg.max_height.is_finite()) {
         return Err(format!(
-            "max_height must be > 0 (or 0 to default to scale), got {}",
+            "max_height must be > 0 (or 0 for the scale + offset default), got {}",
             cfg.max_height
         ));
     }
@@ -107,8 +127,14 @@ fn transform_wasm(input_bytes: &[u8], cfg: HeightmapExtrudeConfig) -> Result<Vec
     }
     let z_max = if cfg.max_height > 0.0 {
         cfg.max_height
+    } else if cfg.scale + cfg.offset > 0.0 {
+        cfg.scale + cfg.offset
     } else {
-        cfg.scale
+        return Err(format!(
+            "the default height bound scale + offset = {} isn't positive; set max_height \
+             explicitly (the field's peak surface height)",
+            cfg.scale + cfg.offset
+        ));
     };
 
     let config = ModuleConfig::new();
@@ -202,16 +228,17 @@ fn transform_wasm(input_bytes: &[u8], cfg: HeightmapExtrudeConfig) -> Result<Vec
 
     // sample(pos_ptr): read z first (the field's sample may scribble on
     // shared memory), get the height from the field at (x, y) — the first
-    // two f64s, read via the same pointer — then gate. All comparisons are
-    // false on a NaN height, so garbage reads as outside.
+    // two f64s, read via the same pointer — compute the surface height,
+    // then gate. All comparisons are false on a NaN surface, so garbage
+    // reads as outside.
     {
         let orig_sample = originals["sample"];
         let mut b = FunctionBuilder::new(&mut module.types, &[ValType::I32], &[ValType::F32]);
         let pos_ptr = module.locals.add(ValType::I32);
         let z = module.locals.add(ValType::F64);
-        let h = module.locals.add(ValType::F64);
+        let surface = module.locals.add(ValType::F64);
 
-        use walrus::ir::BinaryOp::{F64Ge, F64Gt, F64Le, F64Mul, I32And};
+        use walrus::ir::BinaryOp::{F64Add, F64Ge, F64Gt, F64Le, F64Mul, I32And};
         let z_arg = walrus::ir::MemArg {
             align: 3,
             offset: 16,
@@ -221,12 +248,17 @@ fn transform_wasm(input_bytes: &[u8], cfg: HeightmapExtrudeConfig) -> Result<Vec
             .local_get(pos_ptr)
             .load(memory_id, walrus::ir::LoadKind::F64, z_arg)
             .local_set(z)
+            // surface = field * scale + offset
             .local_get(pos_ptr)
             .call(orig_sample)
             .unop(walrus::ir::UnaryOp::F64PromoteF32)
-            .local_set(h)
-            // h > clip
-            .local_get(h)
+            .f64_const(cfg.scale)
+            .binop(F64Mul)
+            .f64_const(cfg.offset)
+            .binop(F64Add)
+            .local_set(surface)
+            // surface > clip
+            .local_get(surface)
             .f64_const(cfg.clip)
             .binop(F64Gt)
             // && z >= 0
@@ -234,11 +266,9 @@ fn transform_wasm(input_bytes: &[u8], cfg: HeightmapExtrudeConfig) -> Result<Vec
             .f64_const(0.0)
             .binop(F64Ge)
             .binop(I32And)
-            // && z <= h * scale
+            // && z <= surface
             .local_get(z)
-            .local_get(h)
-            .f64_const(cfg.scale)
-            .binop(F64Mul)
+            .local_get(surface)
             .binop(F64Le)
             .binop(I32And)
             // && z <= z_max (keep the solid inside its advertised bounds)
@@ -328,8 +358,8 @@ pub extern "C" fn run() {
 pub extern "C" fn get_metadata() -> i64 {
     static METADATA: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     volumetric_abi::metadata_reply(&METADATA, || {
-        let schema = "{ scale: float .default 1.0, max_height: float .default 0.0, \
-                      clip: float .default 0.0 }"
+        let schema = "{ scale: float .default 1.0, offset: float .default 0.0, \
+                      max_height: float .default 0.0, clip: float .default 0.0 }"
             .to_string();
         OperatorMetadata {
             name: "heightmap_extrude_operator".to_string(),

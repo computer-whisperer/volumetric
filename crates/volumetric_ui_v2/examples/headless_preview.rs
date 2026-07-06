@@ -55,12 +55,7 @@ fn main() {
         .vertices
         .iter()
         .zip(mesh.normals.iter())
-        .map(|(position, normal)| MeshVertex {
-            position: (*position).into(),
-            _pad0: 0.0,
-            normal: (*normal).into(),
-            _pad1: 0.0,
-        })
+        .map(|(position, normal)| MeshVertex::new((*position).into(), (*normal).into()))
         .collect();
     let mesh_data = MeshData {
         vertices,

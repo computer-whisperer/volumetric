@@ -19,11 +19,13 @@ var<uniform> uniforms: Uniforms;
 struct VsIn {
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
+    @location(2) color: vec4<f32>,
 };
 
 struct VsOut {
     @builtin(position) position: vec4<f32>,
     @location(0) normal_world: vec3<f32>,
+    @location(1) color: vec4<f32>,
 };
 
 @vertex
@@ -31,6 +33,7 @@ fn vs_main(in: VsIn) -> VsOut {
     var out: VsOut;
     out.position = uniforms.view_proj * vec4<f32>(in.position, 1.0);
     out.normal_world = in.normal;
+    out.color = in.color;
     return out;
 }
 
@@ -52,7 +55,7 @@ fn fs_gbuffer(in: VsOut) -> FsOut {
     let ndotl = max(dot(n, l), 0.0);
     let ambient = 0.22;
     let diffuse = 0.78 * ndotl;
-    let color = uniforms.base_color * (ambient + diffuse);
+    let color = uniforms.base_color * in.color.rgb * (ambient + diffuse);
 
     var out: FsOut;
     out.color = vec4<f32>(color, 1.0);

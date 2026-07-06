@@ -353,7 +353,9 @@ pub fn sample_model_from_bytes(
     Ok((points, bounds_min, bounds_max))
 }
 
-/// Occupancy raster of a 2D sketch model, for flat previews.
+/// Sample raster of a 2D model, for flat previews. Carries the raw sample
+/// values so scalar fields (height maps, pressure maps) can be displayed as
+/// data instead of being thresholded into an occupancy mask.
 #[cfg(any(feature = "native", feature = "web"))]
 #[derive(Clone, Debug)]
 pub struct SketchRaster {
@@ -361,17 +363,55 @@ pub struct SketchRaster {
     pub width: usize,
     /// Cells along y.
     pub height: usize,
-    /// Row-major occupancy sampled at cell centers; row 0 is min_y.
-    pub cells: Vec<bool>,
+    /// Row-major sample values at cell centers; row 0 is min_y.
+    pub values: Vec<f32>,
+    /// Smallest finite sampled value (0.0 for an all-NaN raster).
+    pub value_min: f32,
+    /// Largest finite sampled value (0.0 for an all-NaN raster).
+    pub value_max: f32,
     pub bounds_min: (f32, f32),
     pub bounds_max: (f32, f32),
 }
 
 #[cfg(any(feature = "native", feature = "web"))]
 impl SketchRaster {
-    pub fn cell(&self, x: usize, y: usize) -> bool {
-        self.cells[y * self.width + x]
+    /// The raw sample value at a cell.
+    pub fn value(&self, x: usize, y: usize) -> f32 {
+        self.values[y * self.width + x]
     }
+
+    /// Occupancy view of a cell (the ABI threshold).
+    pub fn cell(&self, x: usize, y: usize) -> bool {
+        volumetric_abi::is_occupied(self.value(x, y))
+    }
+
+    /// True when every sampled value is (approximately) 0 or 1 — an
+    /// occupancy sketch, best displayed as a mask. Anything else is a
+    /// scalar field, best displayed through a colormap.
+    pub fn is_binary(&self) -> bool {
+        self.values
+            .iter()
+            .all(|v| (v - 0.0).abs() < 1e-4 || (v - 1.0).abs() < 1e-4)
+    }
+}
+
+/// The viridis colormap (Matt Zucker's public-domain polynomial fit),
+/// `t` in [0, 1] → linear RGB. The shared colormap for scalar-field
+/// display across the GUI and CLI.
+pub fn viridis(t: f32) -> [f32; 3] {
+    const C0: [f32; 3] = [0.277_727_3, 0.005_407_34, 0.334_099_8];
+    const C1: [f32; 3] = [0.105_093, 1.404_614, 1.384_59];
+    const C2: [f32; 3] = [-0.330_861_8, 0.214_847_6, 0.095_095_2];
+    const C3: [f32; 3] = [-4.634_23, -5.799_101, -19.332_44];
+    const C4: [f32; 3] = [6.228_27, 14.179_93, 56.690_55];
+    const C5: [f32; 3] = [4.776_385, -13.745_15, -65.353_03];
+    const C6: [f32; 3] = [-5.435_456, 4.645_853, 26.312_44];
+    let t = t.clamp(0.0, 1.0);
+    std::array::from_fn(|i| {
+        let v =
+            C0[i] + t * (C1[i] + t * (C2[i] + t * (C3[i] + t * (C4[i] + t * (C5[i] + t * C6[i])))));
+        v.clamp(0.0, 1.0)
+    })
 }
 
 /// Number of dimensions a model WASM reports (2 for a sketch, 3+ for a volume).
@@ -383,7 +423,7 @@ pub fn model_dimensions_from_bytes(wasm_bytes: &[u8]) -> anyhow::Result<u32> {
     Ok(executor.dimensions()?)
 }
 
-/// Rasterize a 2D sketch model into an occupancy grid over its own bounds,
+/// Rasterize a 2D model into a sample-value grid over its own bounds,
 /// sampling at cell centers. `resolution` is the cell count along the longer
 /// bounds axis; the other axis is scaled to keep cells square (aspect-correct
 /// rasters, so previews don't distort non-square sketches).
@@ -414,19 +454,30 @@ pub fn rasterize_sketch_from_bytes(
         (((n as f64 * span_x / span_y).round() as usize).max(1), n)
     };
 
-    let mut cells = Vec::with_capacity(width * height);
+    let mut values = Vec::with_capacity(width * height);
+    let (mut value_min, mut value_max) = (f32::INFINITY, f32::NEG_INFINITY);
     for yi in 0..height {
         let y = min_y + span_y * ((yi as f64 + 0.5) / height as f64);
         for xi in 0..width {
             let x = min_x + span_x * ((xi as f64 + 0.5) / width as f64);
-            cells.push(volumetric_abi::is_occupied(executor.sample_nd(&[x, y])?));
+            let v = executor.sample_nd(&[x, y])?;
+            if v.is_finite() {
+                value_min = value_min.min(v);
+                value_max = value_max.max(v);
+            }
+            values.push(v);
         }
+    }
+    if value_min > value_max {
+        (value_min, value_max) = (0.0, 0.0);
     }
 
     Ok(SketchRaster {
         width,
         height,
-        cells,
+        values,
+        value_min,
+        value_max,
         bounds_min: (min_x as f32, min_y as f32),
         bounds_max: (max_x as f32, max_y as f32),
     })
