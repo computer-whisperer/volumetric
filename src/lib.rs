@@ -618,12 +618,24 @@ pub fn generate_adaptive_mesh_v2_from_bytes(
     // bounding planes (a default box fills its bounds entirely). The mesher
     // needs outside samples beyond the surface to see those transitions, or
     // it falls back to synthetic boundary faces that the refinement and sharp
-    // feature stages cannot work with. Sample a volume padded by ~2 finest
-    // cells per side, clamping everything outside the declared bounds to
-    // "outside" — which also caps volume-filling models (e.g. lattices)
-    // exactly at their declared bounds instead of at the sampling box.
+    // feature stages cannot work with. Sample a padded volume, clamping
+    // everything outside the declared bounds to "outside" — which also caps
+    // volume-filling models (e.g. lattices) exactly at their declared bounds
+    // instead of at the sampling box.
+    //
+    // The pad is sized so the declared-bounds planes land exactly MID-CELL
+    // (2.5 finest cells from the padded edge): with pad = 2.5*E/(N-5) the
+    // finest cell is E/(N-5), putting the clamp plane exactly 2.5 cells in.
+    // A round 2-cell pad instead puts that plane 2 - 8/N cells in — within
+    // 0.03 cells of a sample-corner plane at 256, and closer the higher the
+    // resolution. Any geometry cut off by the bounds (lattice struts ending
+    // at the box) then nearly coincides with a corner plane, and the last
+    // cell layer degenerates into sliver triangles and erratic caps that get
+    // WORSE with resolution. Mid-cell alignment keeps the cut surface
+    // maximally far from the corner planes so bounds cuts alias no worse
+    // than any interior surface.
     let finest_cells = (config.base_resolution * (1 << config.max_depth)) as f32;
-    let pad_frac = 2.0 / finest_cells;
+    let pad_frac = 2.5 / (finest_cells - 5.0).max(1.0);
     let pad = (
         (bounds_max.0 - bounds_min.0) * pad_frac,
         (bounds_max.1 - bounds_min.1) * pad_frac,
