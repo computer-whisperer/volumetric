@@ -53,6 +53,11 @@ enum LatticeKindConfig {
     /// Tetrahedral strut lattice: thin uniform struts on the diamond-bond
     /// tiling (four struts per node), connected down to few-percent fills.
     Tetra,
+    /// Foam lattice: struts on the Voronoi edge skeleton of a jittered
+    /// BCC point set (Plateau geometry — pentagon/hexagon cell faces,
+    /// four struts per node). `irregularity` 0 gives regular Kelvin
+    /// cells; higher values organic non-repeating foam.
+    Foam,
 }
 
 impl LatticeKindConfig {
@@ -65,6 +70,7 @@ impl LatticeKindConfig {
             Self::Struts => 2,
             Self::Honeycomb => 3,
             Self::Tetra => 4,
+            Self::Foam => 5,
         }
     }
 }
@@ -81,6 +87,9 @@ struct LatticeConfig {
     density_gamma: f64,
     density_min: f64,
     density_max: f64,
+    /// Foam cell-shape jitter, 0 (regular Kelvin cells) ..= 1 (fully
+    /// organic). Other families ignore it.
+    irregularity: f64,
 }
 
 impl Default for LatticeConfig {
@@ -93,6 +102,7 @@ impl Default for LatticeConfig {
             density_gamma: 1.0,
             density_min: 0.0,
             density_max: 1.0,
+            irregularity: 0.3,
         }
     }
 }
@@ -113,9 +123,15 @@ fn const_i32_return(module: &walrus::Module, func_id: walrus::FunctionId) -> Opt
     }
 }
 
-/// Patch the lattice kind, cell size, and density calibration into the
-/// template's config slot and drop the patch-helper export.
-fn patch_template(kind: u32, cell_size: f32, density_map: [f32; 3]) -> Result<Vec<u8>, String> {
+/// Patch the lattice kind, cell size, density calibration, and shape
+/// parameters into the template's config slot and drop the patch-helper
+/// export.
+fn patch_template(
+    kind: u32,
+    cell_size: f32,
+    density_map: [f32; 3],
+    irregularity: f32,
+) -> Result<Vec<u8>, String> {
     let mut module =
         walrus::Module::from_buffer_with_config(TEMPLATE, &walrus::ModuleConfig::new())
             .map_err(|e| format!("failed to parse the embedded template: {e}"))?;
@@ -140,12 +156,13 @@ fn patch_template(kind: u32, cell_size: f32, density_map: [f32; 3]) -> Result<Ve
     };
     module.exports.delete(export.0);
 
-    let mut bytes = Vec::with_capacity(20);
+    let mut bytes = Vec::with_capacity(24);
     bytes.extend(kind.to_le_bytes());
     bytes.extend(cell_size.to_le_bytes());
     for value in density_map {
         bytes.extend(value.to_le_bytes());
     }
+    bytes.extend(irregularity.to_le_bytes());
     module.data.add(
         walrus::DataKind::Active {
             memory: memory_id,
@@ -375,6 +392,12 @@ fn build_lattice_model(input: &[u8], config: &LatticeConfig) -> Result<Vec<u8>, 
             config.density_min, config.density_max
         ));
     }
+    if !(config.irregularity.is_finite() && (0.0..=1.0).contains(&config.irregularity)) {
+        return Err(format!(
+            "irregularity must be in 0..=1, got {}",
+            config.irregularity
+        ));
+    }
     check_three_dimensional(input)?;
 
     let template = patch_template(
@@ -385,6 +408,7 @@ fn build_lattice_model(input: &[u8], config: &LatticeConfig) -> Result<Vec<u8>, 
             config.density_min as f32,
             config.density_max as f32,
         ],
+        config.irregularity as f32,
     )?;
 
     let a_counts = count_sections(input)?;
@@ -463,7 +487,7 @@ pub extern "C" fn run() {
 pub extern "C" fn get_metadata() -> i64 {
     static METADATA: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     volumetric_abi::metadata_reply(&METADATA, || {
-        let schema = r#"{ lattice: "gyroid" / "schwarz" / "struts" / "honeycomb" / "tetra" .default "gyroid", cell_size: float .default 0.05, density_channel: int .default 1, uniform_density: float .default 1.0, density_gamma: float .default 1.0, density_min: float .default 0.0, density_max: float .default 1.0 }"#.to_string();
+        let schema = r#"{ lattice: "gyroid" / "schwarz" / "struts" / "honeycomb" / "tetra" / "foam" .default "gyroid", cell_size: float .default 0.05, density_channel: int .default 1, uniform_density: float .default 1.0, density_gamma: float .default 1.0, density_min: float .default 0.0, density_max: float .default 1.0, irregularity: float .default 0.3 }"#.to_string();
         OperatorMetadata {
             name: "lattice_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),

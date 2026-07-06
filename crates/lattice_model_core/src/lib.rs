@@ -44,6 +44,14 @@ pub enum LatticeKind {
     /// supports very sparse fills (a few percent); thin-strut volume
     /// fraction tracks `d` exactly. The vendor-style tetrahedral tiling.
     Tetra = 4,
+    /// Foam lattice: struts along the edge skeleton of the Voronoi
+    /// diagram of a jittered BCC point set — polyhedral cells with
+    /// pentagon/hexagon faces, three faces meeting at every strut and
+    /// four struts at every vertex (Plateau geometry, like a dried real
+    /// foam). `LatticeParams::irregularity` 0 gives the periodic Kelvin
+    /// cell (truncated octahedra); higher values give organic,
+    /// non-repeating cells.
+    Foam = 5,
 }
 
 impl LatticeKind {
@@ -55,8 +63,24 @@ impl LatticeKind {
             2 => Some(Self::Struts),
             3 => Some(Self::Honeycomb),
             4 => Some(Self::Tetra),
+            5 => Some(Self::Foam),
             _ => None,
         }
+    }
+}
+
+/// Per-family shape parameters beyond the density (all families ignore
+/// the ones they don't use).
+#[derive(Clone, Copy, Debug)]
+pub struct LatticeParams {
+    /// Foam site jitter: 0 keeps the periodic Kelvin cells, 1 fully
+    /// randomizes cell shapes. Clamped to `[0, 1]`; non-finite reads 0.
+    pub irregularity: f64,
+}
+
+impl Default for LatticeParams {
+    fn default() -> Self {
+        Self { irregularity: 0.3 }
     }
 }
 
@@ -114,7 +138,13 @@ const TAU: f64 = core::f64::consts::TAU;
 /// `cell_size` is the pattern period in model units; non-positive cell
 /// sizes read as empty (an unpatched or corrupt config must not produce a
 /// misleading solid).
-pub fn lattice_occupied(kind: LatticeKind, pos: [f64; 3], cell_size: f64, density: f32) -> bool {
+pub fn lattice_occupied(
+    kind: LatticeKind,
+    pos: [f64; 3],
+    cell_size: f64,
+    density: f32,
+    params: &LatticeParams,
+) -> bool {
     let d = if density.is_finite() {
         f64::from(density).clamp(0.0, 1.0)
     } else {
@@ -166,6 +196,107 @@ pub fn lattice_occupied(kind: LatticeKind, pos: [f64; 3], cell_size: f64, densit
             let p = [x / TAU, y / TAU, z / TAU];
             diamond_strut_distance(p) <= diamond_strut_radius(d)
         }
+        LatticeKind::Foam => {
+            // Struts live where three Voronoi cells (nearly) meet: both
+            // the second and third site distances are within the
+            // threshold of the first. On a face (two cells) only d2
+            // closes in, so faces stay open; along the cell edges d2 and
+            // d3 both approach d1 and the region thickens into a strut.
+            let p = [x / TAU, y / TAU, z / TAU];
+            let jitter = if params.irregularity.is_finite() {
+                params.irregularity.clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let [d1, d2, d3] = foam_nearest_three(p, jitter);
+            let t = foam_threshold(d);
+            d2 - d1 <= t && d3 - d1 <= t
+        }
+    }
+}
+
+/// Deterministic integer hash (splitmix64-style finalizer) for foam site
+/// jitter: same cell always jitters the same way, with no runtime RNG.
+fn foam_hash(x: i64, y: i64, z: i64, coset: u64) -> u64 {
+    let mut h = (x as u64)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add((y as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F))
+        .wrapping_add((z as u64).wrapping_mul(0x1656_67B1_9E37_79F9))
+        .wrapping_add(coset.wrapping_mul(0x94D0_49BB_1331_11EB));
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94D0_49BB_1331_11EB);
+    h ^= h >> 31;
+    h
+}
+
+/// The jittered BCC site for a cell: base + coset offset + a hash-derived
+/// displacement of up to `0.25 * jitter` per axis (sites stay separated
+/// even at full irregularity; the BCC nearest-neighbor gap is sqrt(3)/2).
+fn foam_site(base: [i64; 3], coset: usize, jitter: f64) -> [f64; 3] {
+    let coset_offset = if coset == 0 { 0.0 } else { 0.5 };
+    let h = foam_hash(base[0], base[1], base[2], coset as u64);
+    let amp = 0.25 * jitter;
+    let unit = |bits: u64| -> f64 { (bits & 0x1F_FFFF) as f64 / 0xF_FFFF as f64 - 1.0 };
+    [
+        base[0] as f64 + coset_offset + amp * unit(h),
+        base[1] as f64 + coset_offset + amp * unit(h >> 21),
+        base[2] as f64 + coset_offset + amp * unit(h >> 42),
+    ]
+}
+
+/// Distances to the three nearest jittered-BCC sites (each coset searched
+/// in the 3x3x3 cell neighborhood around the position — ample for the
+/// third-nearest site anywhere the strut test can pass).
+fn foam_nearest_three(p: [f64; 3], jitter: f64) -> [f64; 3] {
+    let mut best = [f64::MAX; 3];
+    for coset in 0..2 {
+        let offset = if coset == 0 { 0.0 } else { 0.5 };
+        let center = [
+            (p[0] - offset).round() as i64,
+            (p[1] - offset).round() as i64,
+            (p[2] - offset).round() as i64,
+        ];
+        for dz in -1..=1 {
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    let base = [center[0] + dx, center[1] + dy, center[2] + dz];
+                    let s = foam_site(base, coset, jitter);
+                    let e = [p[0] - s[0], p[1] - s[1], p[2] - s[2]];
+                    let d2 = e[0] * e[0] + e[1] * e[1] + e[2] * e[2];
+                    if d2 < best[2] {
+                        best[2] = d2;
+                        if best[2] < best[1] {
+                            best.swap(1, 2);
+                            if best[1] < best[0] {
+                                best.swap(0, 1);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    best.map(f64::sqrt)
+}
+
+/// Foam strut threshold for a target relative density: the numerically
+/// measured sparse-range fit `VF = 5.39 * t^1.8` inverted (fitted at the
+/// default irregularity; realized VF tracks `d` within ~1% for d <= 0.2
+/// and ~10% to d = 0.4, drifting mildly with irregularity), blended
+/// linearly to a threshold past every point's largest gap once struts
+/// merge.
+fn foam_threshold(d: f64) -> f64 {
+    const BLEND_START: f64 = 0.6;
+    const FIT_COEFF: f64 = 5.39;
+    const FIT_EXPONENT: f64 = 1.8;
+    let thin = |d: f64| (d / FIT_COEFF).powf(1.0 / FIT_EXPONENT);
+    if d <= BLEND_START {
+        thin(d)
+    } else {
+        let t = (d - BLEND_START) / (1.0 - BLEND_START);
+        thin(BLEND_START) + t * (1.6 - thin(BLEND_START))
     }
 }
 
@@ -355,12 +486,13 @@ fn frac_dist(u: f64) -> f64 {
 mod tests {
     use super::*;
 
-    const KINDS: [LatticeKind; 5] = [
+    const KINDS: [LatticeKind; 6] = [
         LatticeKind::Gyroid,
         LatticeKind::SchwarzP,
         LatticeKind::Struts,
         LatticeKind::Honeycomb,
         LatticeKind::Tetra,
+        LatticeKind::Foam,
     ];
 
     /// A grid of probe points spanning several cells at odd offsets.
@@ -385,15 +517,15 @@ mod tests {
         for kind in KINDS {
             for pos in probes() {
                 assert!(
-                    !lattice_occupied(kind, pos, 0.25, 0.0),
+                    !lattice_occupied(kind, pos, 0.25, 0.0, &LatticeParams::default()),
                     "{kind:?} at {pos:?} should be empty at density 0"
                 );
                 assert!(
-                    lattice_occupied(kind, pos, 0.25, 1.0),
+                    lattice_occupied(kind, pos, 0.25, 1.0, &LatticeParams::default()),
                     "{kind:?} at {pos:?} should be solid at density 1"
                 );
                 assert!(
-                    !lattice_occupied(kind, pos, 0.25, f32::NAN),
+                    !lattice_occupied(kind, pos, 0.25, f32::NAN, &LatticeParams::default()),
                     "{kind:?} at {pos:?} should treat NaN density as empty"
                 );
             }
@@ -407,7 +539,7 @@ mod tests {
             for pos in probes() {
                 let mut was_occupied = false;
                 for d in densities {
-                    let occupied = lattice_occupied(kind, pos, 0.25, d);
+                    let occupied = lattice_occupied(kind, pos, 0.25, d, &LatticeParams::default());
                     assert!(
                         occupied || !was_occupied,
                         "{kind:?} at {pos:?} lost material raising density to {d}"
@@ -425,7 +557,7 @@ mod tests {
                 let probes = probes();
                 let hits = probes
                     .iter()
-                    .filter(|&&p| lattice_occupied(kind, p, 0.25, d))
+                    .filter(|&&p| lattice_occupied(kind, p, 0.25, d, &LatticeParams::default()))
                     .count();
                 hits as f64 / probes.len() as f64
             };
@@ -451,7 +583,8 @@ mod tests {
                 LatticeKind::Struts,
                 [t, 0.0, 0.0],
                 0.25,
-                0.2
+                0.2,
+                &LatticeParams::default()
             ));
             // (0.5, 0.25) is a lattice corner in cell units (2, 1): on a
             // z-parallel strut for every z.
@@ -459,7 +592,8 @@ mod tests {
                 LatticeKind::Struts,
                 [0.5, 0.25, t],
                 0.25,
-                0.2
+                0.2,
+                &LatticeParams::default()
             ));
         }
         // The body center is the last point to fill.
@@ -467,22 +601,42 @@ mod tests {
             LatticeKind::Struts,
             [0.125, 0.125, 0.125],
             0.25,
-            0.5
+            0.5,
+            &LatticeParams::default()
         ));
         assert!(lattice_occupied(
             LatticeKind::Struts,
             [0.125, 0.125, 0.125],
             0.25,
-            1.0
+            1.0,
+            &LatticeParams::default()
         ));
     }
 
     #[test]
     fn degenerate_cell_sizes_read_empty() {
         for kind in KINDS {
-            assert!(!lattice_occupied(kind, [0.1; 3], 0.0, 0.8));
-            assert!(!lattice_occupied(kind, [0.1; 3], -1.0, 0.8));
-            assert!(!lattice_occupied(kind, [0.1; 3], f64::NAN, 0.8));
+            assert!(!lattice_occupied(
+                kind,
+                [0.1; 3],
+                0.0,
+                0.8,
+                &LatticeParams::default()
+            ));
+            assert!(!lattice_occupied(
+                kind,
+                [0.1; 3],
+                -1.0,
+                0.8,
+                &LatticeParams::default()
+            ));
+            assert!(!lattice_occupied(
+                kind,
+                [0.1; 3],
+                f64::NAN,
+                0.8,
+                &LatticeParams::default()
+            ));
         }
     }
 
@@ -491,11 +645,23 @@ mod tests {
         // Occupancy is independent of z: probing the same xy at many
         // heights always agrees.
         for pos in probes() {
-            let base = lattice_occupied(LatticeKind::Honeycomb, pos, 0.25, 0.35);
+            let base = lattice_occupied(
+                LatticeKind::Honeycomb,
+                pos,
+                0.25,
+                0.35,
+                &LatticeParams::default(),
+            );
             for dz in [-3.7, -0.2, 1.9, 12.3] {
                 let shifted = [pos[0], pos[1], pos[2] + dz];
                 assert_eq!(
-                    lattice_occupied(LatticeKind::Honeycomb, shifted, 0.25, 0.35),
+                    lattice_occupied(
+                        LatticeKind::Honeycomb,
+                        shifted,
+                        0.25,
+                        0.35,
+                        &LatticeParams::default()
+                    ),
                     base,
                     "honeycomb occupancy must not depend on z ({pos:?} + {dz})"
                 );
@@ -509,25 +675,45 @@ mod tests {
         // walls: empty at any thin-wall density, filled last as d -> 1
         // (the exact center reaches the wall threshold only at d = 1).
         let center = [0.0, 0.0, 0.1];
-        assert!(!lattice_occupied(LatticeKind::Honeycomb, center, 1.0, 0.5));
-        assert!(lattice_occupied(LatticeKind::Honeycomb, center, 1.0, 1.0));
+        assert!(!lattice_occupied(
+            LatticeKind::Honeycomb,
+            center,
+            1.0,
+            0.5,
+            &LatticeParams::default()
+        ));
+        assert!(lattice_occupied(
+            LatticeKind::Honeycomb,
+            center,
+            1.0,
+            1.0,
+            &LatticeParams::default()
+        ));
         let near_center = [0.06, 0.03, 0.1];
         assert!(!lattice_occupied(
             LatticeKind::Honeycomb,
             near_center,
             1.0,
-            0.5
+            0.5,
+            &LatticeParams::default()
         ));
         assert!(lattice_occupied(
             LatticeKind::Honeycomb,
             near_center,
             1.0,
-            0.999
+            0.999,
+            &LatticeParams::default()
         ));
         // The midpoint between two adjacent sites lies on a wall: occupied
         // at any positive density.
         let wall = [0.5, 0.0, -2.0];
-        assert!(lattice_occupied(LatticeKind::Honeycomb, wall, 1.0, 0.05));
+        assert!(lattice_occupied(
+            LatticeKind::Honeycomb,
+            wall,
+            1.0,
+            0.05,
+            &LatticeParams::default()
+        ));
         // Thin-wall volume fraction tracks the density closely (exact up
         // to junction overlap).
         let fraction = |d: f32| -> f64 {
@@ -537,7 +723,13 @@ mod tests {
                 for j in 0..60 {
                     let pos = [0.013 + i as f64 * 0.061, -0.71 + j as f64 * 0.053, 0.0];
                     total += 1;
-                    if lattice_occupied(LatticeKind::Honeycomb, pos, 1.0, d) {
+                    if lattice_occupied(
+                        LatticeKind::Honeycomb,
+                        pos,
+                        1.0,
+                        d,
+                        &LatticeParams::default(),
+                    ) {
                         hits += 1;
                     }
                 }
@@ -558,14 +750,38 @@ mod tests {
         // The bond midpoint between the atoms at (0,0,0) and
         // (1/4,1/4,1/4) is on a strut: occupied at very sparse density.
         let on_bond = [0.125, 0.125, 0.125];
-        assert!(lattice_occupied(LatticeKind::Tetra, on_bond, 1.0, 0.02));
+        assert!(lattice_occupied(
+            LatticeKind::Tetra,
+            on_bond,
+            1.0,
+            0.02,
+            &LatticeParams::default()
+        ));
         // Atoms (strut nodes) are occupied too.
-        assert!(lattice_occupied(LatticeKind::Tetra, [0.0; 3], 1.0, 0.02));
+        assert!(lattice_occupied(
+            LatticeKind::Tetra,
+            [0.0; 3],
+            1.0,
+            0.02,
+            &LatticeParams::default()
+        ));
         // The tetrahedral void center (1/2,1/2,1/2) sits sqrt(3)/4 from
         // the nearest atom: empty at mid density, filled near solid.
         let void = [0.5, 0.5, 0.5];
-        assert!(!lattice_occupied(LatticeKind::Tetra, void, 1.0, 0.5));
-        assert!(lattice_occupied(LatticeKind::Tetra, void, 1.0, 0.999));
+        assert!(!lattice_occupied(
+            LatticeKind::Tetra,
+            void,
+            1.0,
+            0.5,
+            &LatticeParams::default()
+        ));
+        assert!(lattice_occupied(
+            LatticeKind::Tetra,
+            void,
+            1.0,
+            0.999,
+            &LatticeParams::default()
+        ));
     }
 
     #[test]
@@ -585,7 +801,13 @@ mod tests {
                             0.19 + k as f64 * 0.0611,
                         ];
                         total += 1;
-                        if lattice_occupied(LatticeKind::Tetra, pos, 1.0, d) {
+                        if lattice_occupied(
+                            LatticeKind::Tetra,
+                            pos,
+                            1.0,
+                            d,
+                            &LatticeParams::default(),
+                        ) {
                             hits += 1;
                         }
                     }
@@ -654,5 +876,84 @@ mod tests {
             max: 0.0,
         };
         assert_eq!(map_density(zeroed, 0.9), 0.0);
+    }
+    #[test]
+    fn foam_volume_fraction_tracks_density() {
+        // The fitted threshold keeps realized volume fraction close to d
+        // across the sparse range, at any irregularity.
+        for irr in [0.0f64, 0.3, 0.7] {
+            let params = LatticeParams { irregularity: irr };
+            for d in [0.05f32, 0.1, 0.2] {
+                let mut hits = 0usize;
+                let mut total = 0usize;
+                for i in 0..24 {
+                    for j in 0..24 {
+                        for k in 0..24 {
+                            let pos = [
+                                0.013 + i as f64 * 0.1013,
+                                -0.71 + j as f64 * 0.0997,
+                                0.19 + k as f64 * 0.1051,
+                            ];
+                            total += 1;
+                            if lattice_occupied(LatticeKind::Foam, pos, 1.0, d, &params) {
+                                hits += 1;
+                            }
+                        }
+                    }
+                }
+                let f = hits as f64 / total as f64;
+                assert!(
+                    (f - f64::from(d)).abs() < 0.015 + f64::from(d) * 0.2,
+                    "foam VF at irr={irr} d={d} should be ~{d}, got {f}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn foam_zero_irregularity_is_periodic_kelvin() {
+        // Without jitter the sites are plain BCC, so occupancy repeats
+        // with the unit cell in every direction.
+        let params = LatticeParams { irregularity: 0.0 };
+        for pos in probes() {
+            let base = lattice_occupied(LatticeKind::Foam, pos, 0.25, 0.25, &params);
+            for shift in [[0.25, 0.0, 0.0], [0.0, -0.5, 0.0], [0.75, 0.25, -0.5]] {
+                let moved = [pos[0] + shift[0], pos[1] + shift[1], pos[2] + shift[2]];
+                assert_eq!(
+                    lattice_occupied(LatticeKind::Foam, moved, 0.25, 0.25, &params),
+                    base,
+                    "kelvin foam must repeat per cell ({pos:?} + {shift:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn foam_irregularity_changes_the_structure() {
+        // Jitter must actually move material around (and non-finite
+        // irregularity must read as 0, not poison the sites).
+        let regular = LatticeParams { irregularity: 0.0 };
+        let organic = LatticeParams { irregularity: 0.6 };
+        let differing = probes()
+            .iter()
+            .filter(|&&p| {
+                lattice_occupied(LatticeKind::Foam, p, 0.25, 0.25, &regular)
+                    != lattice_occupied(LatticeKind::Foam, p, 0.25, 0.25, &organic)
+            })
+            .count();
+        assert!(
+            differing > probes().len() / 20,
+            "jitter should visibly reshape the foam ({differing} probes differ)"
+        );
+        let nan = LatticeParams {
+            irregularity: f64::NAN,
+        };
+        for pos in probes() {
+            assert_eq!(
+                lattice_occupied(LatticeKind::Foam, pos, 0.25, 0.25, &nan),
+                lattice_occupied(LatticeKind::Foam, pos, 0.25, 0.25, &regular),
+                "NaN irregularity should read as 0"
+            );
+        }
     }
 }

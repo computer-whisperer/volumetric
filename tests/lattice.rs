@@ -140,7 +140,7 @@ fn gyroid_fill_follows_the_density_gradient() {
 #[test]
 fn lattice_families_run_and_differ() {
     let input = wasm_artifact("density_gradient_model");
-    const FAMILIES: [&str; 5] = ["gyroid", "schwarz", "struts", "honeycomb", "tetra"];
+    const FAMILIES: [&str; 6] = ["gyroid", "schwarz", "struts", "honeycomb", "tetra", "foam"];
     let mut signatures = Vec::new();
     for lattice in FAMILIES {
         let output = run_operator(
@@ -328,4 +328,55 @@ fn rejects_non_3d_inputs_and_bad_config() {
     )
     .expect_err("inverted density range should be rejected");
     assert!(err.contains("density_min"), "{err}");
+
+    let err = run_operator(
+        "lattice_operator",
+        vec![
+            wasm_artifact("density_gradient_model"),
+            cbor_config(&[("irregularity", ciborium::value::Value::Float(1.5))]),
+        ],
+    )
+    .expect_err("out-of-range irregularity should be rejected");
+    assert!(err.contains("irregularity"), "{err}");
+}
+
+/// The foam's irregularity knob reshapes the cells through the operator.
+#[test]
+fn foam_irregularity_flows_through() {
+    let input = wasm_artifact("density_gradient_model");
+    let signature = |irregularity: f64| -> Vec<bool> {
+        let output = run_operator(
+            "lattice_operator",
+            vec![
+                input.clone(),
+                cbor_config(&[
+                    ("lattice", ciborium::value::Value::Text("foam".into())),
+                    ("cell_size", ciborium::value::Value::Float(0.5)),
+                    ("irregularity", ciborium::value::Value::Float(irregularity)),
+                ]),
+            ],
+        )
+        .expect("foam runs");
+        let mut executor = NativeModelExecutor::new(&output).expect("output executes");
+        // Incommensurate probe steps: a grid aligned to the cell period
+        // can alias entirely into the pores of the regular Kelvin foam.
+        let mut signature = Vec::new();
+        for i in 0..4 {
+            for j in 0..4 {
+                for k in 0..4 {
+                    let x = -0.81 + 0.487 * i as f64;
+                    let y = -0.79 + 0.463 * j as f64;
+                    let z = -0.83 + 0.521 * k as f64;
+                    signature.push(volumetric::is_occupied(
+                        executor.sample_nd(&[x, y, z]).unwrap(),
+                    ));
+                }
+            }
+        }
+        signature
+    };
+    let regular = signature(0.0);
+    let organic = signature(0.8);
+    assert!(regular.iter().any(|&b| b) && !regular.iter().all(|&b| b));
+    assert_ne!(regular, organic, "irregularity should reshape the foam");
 }
