@@ -345,10 +345,13 @@ impl Host {
 
         let scale_factor = gfx.window.scale_factor() as f32;
         let preview_requests = self.app.preview_requests();
-        for job in gfx
-            .session
-            .sync(&mut self.app, &gfx.device, &preview_requests, scale_factor)
-        {
+        for job in gfx.session.sync(
+            &mut self.app,
+            &gfx.device,
+            &gfx.queue,
+            &preview_requests,
+            scale_factor,
+        ) {
             self.worker.send(job);
         }
 

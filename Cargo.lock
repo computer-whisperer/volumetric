@@ -4981,6 +4981,7 @@ dependencies = [
  "volumetric",
  "volumetric_assets",
  "volumetric_renderer",
+ "wat",
  "wgpu",
  "winit",
 ]

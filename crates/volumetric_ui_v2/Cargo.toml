@@ -28,3 +28,5 @@ path = "src/bin/dump_v2_shell.rs"
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
+# Hand-assemble tiny 2D field models in session tests.
+wat = "1"

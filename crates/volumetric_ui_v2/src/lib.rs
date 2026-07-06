@@ -62,6 +62,10 @@ const OUTPUT_WIREFRAME_PREFIX: &str = "output:wire:";
 const OUTPUT_FEA_DEFORMED_PREFIX: &str = "output:fea-deformed:";
 const OUTPUT_FEA_EXAG_PREFIX: &str = "output:fea-exag:";
 const OUTPUT_FEA_FIELD_PREFIX: &str = "output:fea-field:";
+/// 2D field inspection lightbox: `output:inspect:{id}` opens it for an
+/// output; the modal scrim/close emit `lightbox:dismiss`.
+const OUTPUT_INSPECT_PREFIX: &str = "output:inspect:";
+const LIGHTBOX_KEY: &str = "lightbox";
 const EXPORT_STL_PREFIX: &str = "output:stl:";
 const EXPORT_WASM_PREFIX: &str = "output:wasm:";
 /// Draggable divider between the viewport and the project panel.
@@ -199,6 +203,38 @@ pub struct OutputStats {
     /// `node:{name}` / `element:{name}` (node fields with 1 or 3 components,
     /// element fields with 1). Feeds the per-output field picker.
     pub fea_fields: Vec<String>,
+}
+
+/// Everything the 2D inspection lightbox displays for one output, computed
+/// by a background job (sampling the model is too slow for the UI thread).
+/// `analytics` is an open-ended list of label/value rows — the place new
+/// engineering statistics get added over time.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LightboxData {
+    /// RGBA8 pixels of the colormapped raster, row 0 at the top (image
+    /// convention, ready for texture upload).
+    pub rgba: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub bounds_min: (f32, f32),
+    pub bounds_max: (f32, f32),
+    /// Occupancy mask (no meaningful value range or colorbar).
+    pub binary: bool,
+    pub value_min: f32,
+    pub value_max: f32,
+    /// Label/value analytics rows, in display order.
+    pub analytics: Vec<(String, String)>,
+}
+
+/// The open lightbox: which output, and the pipeline of things that arrive
+/// asynchronously after it opens (sampled data from the background job,
+/// then the GPU textures uploaded by the session).
+#[derive(Debug, Default)]
+pub struct LightboxState {
+    pub asset_id: String,
+    pub data: Option<LightboxData>,
+    pub texture: Option<AppTexture>,
+    pub colorbar: Option<AppTexture>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -618,6 +654,8 @@ pub struct VolumetricUiV2 {
     pipeline_open: std::collections::BTreeSet<String>,
     /// Meshing stats per built output, mirrored from the host's preview cache.
     output_stats: std::collections::BTreeMap<String, OutputStats>,
+    /// The open 2D inspection lightbox, if any.
+    lightbox: Option<LightboxState>,
     /// A queued file operation for the host to run (dialogs are host-side).
     pending_file_action: Option<FileAction>,
     /// Where the project was last opened from / saved to; Save re-saves here,
@@ -686,6 +724,7 @@ impl VolumetricUiV2 {
                 .map(str::to_string)
                 .collect(),
             output_stats: std::collections::BTreeMap::new(),
+            lightbox: None,
             pending_file_action: None,
             project_path: None,
             panel_width: PANEL_WIDTH_DEFAULT,
@@ -963,6 +1002,67 @@ impl VolumetricUiV2 {
     fn clear_output_override(&mut self, id: &str) {
         self.output_overrides.remove(id);
         self.status = format!("{id}: viewport defaults");
+    }
+
+    fn open_lightbox(&mut self, id: &str) {
+        self.lightbox = Some(LightboxState {
+            asset_id: id.to_string(),
+            ..Default::default()
+        });
+        self.open_select = None;
+        self.status = format!("inspecting {id}");
+    }
+
+    /// The output the open lightbox still needs sampled data for, if any.
+    /// The session turns this into a background job.
+    pub fn lightbox_wants_data(&self) -> Option<(String, Arc<Vec<u8>>)> {
+        let lightbox = self.lightbox.as_ref()?;
+        if lightbox.data.is_some() {
+            return None;
+        }
+        let asset = self
+            .runtime_assets
+            .iter()
+            .find(|a| a.id() == lightbox.asset_id)?;
+        Some((lightbox.asset_id.clone(), asset.data_arc()))
+    }
+
+    /// The lightbox data awaiting texture upload, if any. The session
+    /// uploads it and hands back the textures.
+    pub fn lightbox_wants_texture(&self) -> Option<&LightboxData> {
+        let lightbox = self.lightbox.as_ref()?;
+        if lightbox.texture.is_some() {
+            return None;
+        }
+        lightbox.data.as_ref()
+    }
+
+    /// Delivers the background job's sampled data (ignored if the lightbox
+    /// moved to another output or closed meanwhile).
+    pub fn set_lightbox_data(&mut self, asset_id: &str, result: Result<LightboxData, String>) {
+        let Some(lightbox) = self.lightbox.as_mut() else {
+            return;
+        };
+        if lightbox.asset_id != asset_id {
+            return;
+        }
+        match result {
+            Ok(data) => lightbox.data = Some(data),
+            Err(err) => {
+                self.lightbox = None;
+                self.status = format!("inspect failed: {err}");
+            }
+        }
+    }
+
+    /// Delivers the uploaded raster + colorbar textures for the open
+    /// lightbox (called in the same frame as `lightbox_wants_texture`, so
+    /// there's no id to re-check).
+    pub fn set_lightbox_textures(&mut self, raster: AppTexture, colorbar: AppTexture) {
+        if let Some(lightbox) = self.lightbox.as_mut() {
+            lightbox.texture = Some(raster);
+            lightbox.colorbar = Some(colorbar);
+        }
     }
 
     /// Builds a render request for a single runtime asset, or `None` when it is
@@ -2363,6 +2463,10 @@ impl App for VolumetricUiV2 {
             self.clear_output_override(id);
         } else if let Some(id) = route.strip_prefix(OUTPUT_WIREFRAME_PREFIX) {
             self.toggle_output_wireframe(id);
+        } else if route == format!("{LIGHTBOX_KEY}:dismiss") {
+            self.lightbox = None;
+        } else if let Some(id) = route.strip_prefix(OUTPUT_INSPECT_PREFIX) {
+            self.open_lightbox(id);
         } else if let Some(id) = route.strip_prefix(OUTPUT_FEA_DEFORMED_PREFIX) {
             self.toggle_output_fea_deformed(id);
         } else if let Some(rest) = route.strip_prefix(OUTPUT_FEA_EXAG_PREFIX) {
@@ -2425,7 +2529,10 @@ pub fn shell(app: &VolumetricUiV2) -> El {
     ])
     .fill_size();
 
-    overlays(main, [menu_layer(app), select_layer(app)])
+    overlays(
+        main,
+        [menu_layer(app), select_layer(app), lightbox_layer(app)],
+    )
 }
 
 /// The single strip of application chrome above the viewport: menubar
@@ -2538,6 +2645,62 @@ fn select_layer(app: &VolumetricUiV2) -> Option<El> {
     }
 }
 
+/// The 2D field inspection lightbox: a wide modal with the colormapped
+/// raster (pixel-exact — no viewport lighting), a colorbar over the sampled
+/// value range, and the analytics rows. More engineering statistics land in
+/// `LightboxData::analytics` over time; this just displays them.
+fn lightbox_layer(app: &VolumetricUiV2) -> Option<El> {
+    let lightbox = app.lightbox.as_ref()?;
+    let mut body: Vec<El> = Vec::new();
+    match (&lightbox.data, &lightbox.texture) {
+        (Some(data), Some(texture)) => {
+            body.push(
+                surface(texture.clone())
+                    .surface_alpha(SurfaceAlpha::Opaque)
+                    .surface_fit(ImageFit::Contain)
+                    .width(Size::Fill(1.0))
+                    .height(Size::Fixed(460.0))
+                    .clip(),
+            );
+            if data.binary {
+                body.push(text("occupancy mask").caption().muted());
+            } else if let Some(colorbar) = &lightbox.colorbar {
+                body.push(
+                    row([
+                        text(format!("{:.4}", data.value_min)).caption().muted(),
+                        surface(colorbar.clone())
+                            .surface_alpha(SurfaceAlpha::Opaque)
+                            .surface_fit(ImageFit::Fill)
+                            .height(Size::Fixed(12.0))
+                            .width(Size::Fill(1.0))
+                            .clip(),
+                        text(format!("{:.4}", data.value_max)).caption().muted(),
+                    ])
+                    .gap(tokens::SPACE_2)
+                    .align(Align::Center),
+                );
+            }
+            body.push(divider());
+            for (label, value) in &data.analytics {
+                body.push(
+                    row([
+                        text(label).caption().muted().width(Size::Fixed(140.0)),
+                        text(value).caption().width(Size::Fill(1.0)),
+                    ])
+                    .gap(tokens::SPACE_2),
+                );
+            }
+        }
+        _ => body.push(text("sampling…").label().muted()),
+    }
+    Some(overlay([
+        scrim(format!("{LIGHTBOX_KEY}:dismiss")),
+        modal_panel(lightbox.asset_id.clone(), body)
+            .width(Size::Fixed(720.0))
+            .block_pointer(),
+    ]))
+}
+
 /// Anchored popover with SSAO parameter steppers. Steppers keep it open;
 /// outside click or Escape dismisses.
 fn ssao_settings_popover(app: &VolumetricUiV2) -> El {
@@ -2597,6 +2760,13 @@ fn output_settings_popover(app: &VolumetricUiV2, id: &str) -> El {
             body.extend(model3d_settings(id, *mode, *resolution, asn2, *wireframe));
         }
         OutputRender::Model2d { resolution } => {
+            body.push(
+                button_with_icon("search", "Inspect field…")
+                    .xsmall()
+                    .secondary()
+                    .width(Size::Fill(1.0))
+                    .key(format!("{OUTPUT_INSPECT_PREFIX}{id}")),
+            );
             body.push(text("Raster Resolution").caption().muted());
             body.push(
                 row(SKETCH_RESOLUTIONS.iter().map(|&preset| {
@@ -4427,6 +4597,27 @@ mod tests {
             UiEvent::synthetic_click(format!("{OUTPUT_WIREFRAME_PREFIX}{id}")),
         );
         assert!(!app.output_render(&id).wireframe());
+    }
+
+    #[test]
+    fn inspect_route_opens_and_dismisses_the_lightbox() {
+        let (mut app, exports) = two_export_app();
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{OUTPUT_INSPECT_PREFIX}{}", exports[0])),
+        );
+        let lightbox = app.lightbox.as_ref().expect("lightbox opens");
+        assert_eq!(lightbox.asset_id, exports[0]);
+        // The freshly opened lightbox asks for sampled data for its output.
+        let (id, _) = app.lightbox_wants_data().expect("wants data");
+        assert_eq!(id, exports[0]);
+        assert!(app.lightbox_wants_texture().is_none(), "no data yet");
+
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{LIGHTBOX_KEY}:dismiss")),
+        );
+        assert!(app.lightbox.is_none());
     }
 
     #[test]

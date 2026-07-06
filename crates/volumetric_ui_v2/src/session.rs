@@ -19,8 +19,8 @@ use glam::{Mat4, Vec2, Vec3};
 use volumetric_renderer as renderer;
 
 use crate::{
-    OutputStats, PreviewBuildStatus, PreviewMeshPlan, PreviewPlan, PreviewRequest, RunState,
-    VolumetricUiV2,
+    LightboxData, OutputStats, PreviewBuildStatus, PreviewMeshPlan, PreviewPlan, PreviewRequest,
+    RunState, VolumetricUiV2,
 };
 use volumetric::AssetTypeHint;
 
@@ -56,6 +56,12 @@ pub struct Session {
     /// The viewport widget's rect from the last completed layout, used to
     /// hit-test camera input and to size the render target between frames.
     viewport_rect: Option<Rect>,
+    /// The output a lightbox sampling job is in flight for, so a slow job
+    /// isn't re-queued every frame.
+    lightbox_inflight: Option<String>,
+    /// The viridis colorbar gradient, uploaded once and reused across
+    /// lightboxes (its content never changes).
+    colorbar_texture: Option<AppTexture>,
 }
 
 impl Session {
@@ -66,6 +72,8 @@ impl Session {
             active_run: None,
             camera_pointer: None,
             camera_buttons: CameraButtons::default(),
+            lightbox_inflight: None,
+            colorbar_texture: None,
             viewport_rect: None,
         }
     }
@@ -94,6 +102,12 @@ impl Session {
                 BackgroundResult::PreviewComplete(preview) => {
                     self.viewport.accept_preview_result(preview);
                 }
+                BackgroundResult::LightboxComplete { asset_id, result } => {
+                    if self.lightbox_inflight.as_deref() == Some(asset_id.as_str()) {
+                        self.lightbox_inflight = None;
+                    }
+                    app.set_lightbox_data(&asset_id, result);
+                }
             }
         }
 
@@ -115,6 +129,7 @@ impl Session {
         &mut self,
         app: &mut VolumetricUiV2,
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         requests: &[PreviewRequest],
         scale_factor: f32,
     ) -> Vec<BackgroundJob> {
@@ -136,6 +151,47 @@ impl Session {
         app.set_preview_build_status(status);
         app.set_output_stats(self.viewport.preview_cache.output_stats());
         jobs.extend(preview_jobs.into_iter().map(BackgroundJob::BuildPreview));
+
+        // Lightbox: dispatch sampling for a freshly opened inspection, and
+        // upload arrived data as textures.
+        if let Some((asset_id, data)) = app.lightbox_wants_data() {
+            if self.lightbox_inflight.as_deref() != Some(asset_id.as_str()) {
+                self.lightbox_inflight = Some(asset_id.clone());
+                jobs.push(BackgroundJob::BuildLightbox { asset_id, data });
+            }
+        } else if app.lightbox_wants_texture().is_none() {
+            self.lightbox_inflight = None;
+        }
+        if let Some(data) = app.lightbox_wants_texture() {
+            let raster = upload_rgba_texture(
+                device,
+                queue,
+                "volumetric_ui_v2::lightbox_raster",
+                data.width,
+                data.height,
+                &data.rgba,
+            );
+            let colorbar = self
+                .colorbar_texture
+                .get_or_insert_with(|| {
+                    let mut rgba = Vec::with_capacity(256 * 4);
+                    for i in 0..256 {
+                        let c = volumetric::viridis(i as f32 / 255.0);
+                        rgba.extend(c.map(|ch| (ch * 255.0).round() as u8));
+                        rgba.push(255);
+                    }
+                    upload_rgba_texture(
+                        device,
+                        queue,
+                        "volumetric_ui_v2::lightbox_colorbar",
+                        256,
+                        1,
+                        &rgba,
+                    )
+                })
+                .clone();
+            app.set_lightbox_textures(raster, colorbar);
+        }
 
         if let Some(command) = app.take_camera_command() {
             self.viewport.apply_camera_command(command);
@@ -507,6 +563,47 @@ impl ViewportTarget {
     }
 }
 
+/// Uploads CPU RGBA8 pixels (sRGB, row 0 at the top) as a sampleable
+/// texture for damascene `surface()` elements.
+fn upload_rgba_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) -> AppTexture {
+    let texture = Arc::new(device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    }));
+    queue.write_texture(
+        texture.as_image_copy(),
+        rgba,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(width * 4),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    damascene_wgpu::app_texture(texture)
+}
+
 /// Expands a (possibly indexed) render mesh into world-space STL triangles.
 fn mesh_triangles(mesh: &renderer::MeshData, transform: Mat4, out: &mut Vec<volumetric::Triangle>) {
     let corner = |idx: usize| -> Option<((f32, f32, f32), (f32, f32, f32))> {
@@ -792,6 +889,11 @@ pub enum BackgroundJob {
         cancel: Arc<AtomicBool>,
     },
     BuildPreview(PreviewBuildJob),
+    /// Sample a 2D output for the inspection lightbox.
+    BuildLightbox {
+        asset_id: String,
+        data: Arc<Vec<u8>>,
+    },
 }
 
 /// A completed unit of background work, routed by [`Session::pre_frame`].
@@ -802,6 +904,10 @@ pub enum BackgroundResult {
         elapsed_ms: u128,
     },
     PreviewComplete(PreviewBuildResult),
+    LightboxComplete {
+        asset_id: String,
+        result: Result<LightboxData, String>,
+    },
 }
 
 /// Coalescing job queue: the newest queued project run wins (a burst of edits
@@ -813,6 +919,7 @@ pub enum BackgroundResult {
 pub struct JobQueue {
     run: Option<BackgroundJob>,
     previews: HashMap<String, PreviewBuildJob>,
+    lightbox: Option<BackgroundJob>,
 }
 
 impl JobQueue {
@@ -823,13 +930,19 @@ impl JobQueue {
                 // Newest job per output wins.
                 self.previews.insert(preview.key.asset_id.clone(), preview);
             }
+            // One lightbox is open at a time; newest wins.
+            lightbox @ BackgroundJob::BuildLightbox { .. } => self.lightbox = Some(lightbox),
         }
     }
 
-    /// The next job to execute: the pending run if any, else one preview.
+    /// The next job to execute: a pending run first, then the lightbox (the
+    /// user is actively looking at it), then one preview.
     pub fn pop(&mut self) -> Option<BackgroundJob> {
         if let Some(run) = self.run.take() {
             return Some(run);
+        }
+        if let Some(lightbox) = self.lightbox.take() {
+            return Some(lightbox);
         }
         let id = self.previews.keys().next()?.clone();
         let preview = self.previews.remove(&id).expect("key just observed");
@@ -837,7 +950,7 @@ impl JobQueue {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.run.is_none() && self.previews.is_empty()
+        self.run.is_none() && self.previews.is_empty() && self.lightbox.is_none()
     }
 }
 
@@ -869,7 +982,145 @@ pub fn execute_job(job: BackgroundJob) -> BackgroundResult {
                 result,
             })
         }
+        BackgroundJob::BuildLightbox { asset_id, data } => {
+            let result = build_lightbox_data(&data);
+            BackgroundResult::LightboxComplete { asset_id, result }
+        }
     }
+}
+
+/// Samples a 2D model for the inspection lightbox: the colormapped raster
+/// (pixel-exact, top row first, ready for texture upload) plus the
+/// engineering analytics rows. This is where new statistics get added.
+pub fn build_lightbox_data(wasm_bytes: &[u8]) -> Result<LightboxData, String> {
+    const RESOLUTION: usize = 512;
+    let raster = volumetric::rasterize_sketch_from_bytes(wasm_bytes, RESOLUTION)
+        .map_err(format_error_chain)?;
+    let binary = raster.is_binary();
+
+    // Colormap the raster, image row order (top row first). Occupancy
+    // masks draw black-on-white like the CLI PNG; scalar fields draw
+    // viridis over the sampled range; NaN cells scream magenta.
+    let span = (raster.value_max - raster.value_min).max(f32::EPSILON);
+    let mut rgba = Vec::with_capacity(raster.width * raster.height * 4);
+    for yi in (0..raster.height).rev() {
+        for xi in 0..raster.width {
+            let v = raster.value(xi, yi);
+            let pixel: [u8; 3] = if binary {
+                if raster.cell(xi, yi) {
+                    [0; 3]
+                } else {
+                    [255; 3]
+                }
+            } else if !v.is_finite() {
+                [255, 0, 255]
+            } else {
+                let c = volumetric::viridis((v - raster.value_min) / span);
+                c.map(|ch| (ch * 255.0).round() as u8)
+            };
+            rgba.extend(pixel);
+            rgba.push(255);
+        }
+    }
+
+    // Analytics over the sampled grid. Cell area weights the integral, so
+    // a pressure map's integral reads as total force.
+    let (width_m, height_m) = (
+        f64::from(raster.bounds_max.0 - raster.bounds_min.0),
+        f64::from(raster.bounds_max.1 - raster.bounds_min.1),
+    );
+    let cell_area = (width_m / raster.width as f64) * (height_m / raster.height as f64);
+    let cells = raster.values.len();
+    let mut finite = 0usize;
+    let mut nan_cells = 0usize;
+    let mut positive = 0usize;
+    let mut occupied = 0usize;
+    let mut sum = 0.0f64;
+    let mut sum_sq = 0.0f64;
+    for &v in &raster.values {
+        if !v.is_finite() {
+            nan_cells += 1;
+            continue;
+        }
+        finite += 1;
+        let v = f64::from(v);
+        sum += v;
+        sum_sq += v * v;
+        if v > 0.0 {
+            positive += 1;
+        }
+        if v > f64::from(volumetric::OCCUPANCY_THRESHOLD) {
+            occupied += 1;
+        }
+    }
+    let mean = if finite > 0 { sum / finite as f64 } else { 0.0 };
+    let rms = if finite > 0 {
+        (sum_sq / finite as f64).sqrt()
+    } else {
+        0.0
+    };
+    let percent = |n: usize| 100.0 * n as f64 / cells.max(1) as f64;
+
+    let mut analytics: Vec<(String, String)> = vec![
+        (
+            "raster".to_string(),
+            format!("{} x {} cells", raster.width, raster.height),
+        ),
+        (
+            "bounds".to_string(),
+            format!(
+                "x [{:.4}, {:.4}] · y [{:.4}, {:.4}]",
+                raster.bounds_min.0, raster.bounds_max.0, raster.bounds_min.1, raster.bounds_max.1
+            ),
+        ),
+        (
+            "area".to_string(),
+            format!("{:.6} (bounds rectangle)", width_m * height_m),
+        ),
+    ];
+    if binary {
+        analytics.push((
+            "occupied".to_string(),
+            format!(
+                "{:.1}% · area {:.6}",
+                percent(occupied),
+                occupied as f64 * cell_area
+            ),
+        ));
+    } else {
+        analytics.push((
+            "range".to_string(),
+            format!("{:.6} .. {:.6}", raster.value_min, raster.value_max),
+        ));
+        analytics.push(("mean".to_string(), format!("{mean:.6}")));
+        analytics.push(("rms".to_string(), format!("{rms:.6}")));
+        analytics.push((
+            "integral".to_string(),
+            format!("{:.6} (sum · cell area)", sum * cell_area),
+        ));
+        analytics.push((
+            "coverage (v > 0)".to_string(),
+            format!("{:.1}%", percent(positive)),
+        ));
+    }
+    if nan_cells > 0 {
+        analytics.push((
+            "non-finite cells".to_string(),
+            format!("{nan_cells} ({:.1}%, magenta)", percent(nan_cells)),
+        ));
+    }
+
+    Ok(LightboxData {
+        rgba,
+        width: raster.width as u32,
+        height: raster.height as u32,
+        bounds_min: raster.bounds_min,
+        bounds_max: raster.bounds_max,
+        binary,
+        value_min: raster.value_min,
+        value_max: raster.value_max,
+        analytics,
+    })
 }
 
 pub fn build_preview_scene(request: &PreviewRequest) -> Result<PreviewEntity, String> {
@@ -1688,6 +1939,72 @@ mod tests {
             ssao_strength: 1.0,
             stale: false,
         }
+    }
+
+    /// A 2D model over [0,1]^2 whose sample is `lo` where x < 0.5 and `hi`
+    /// elsewhere.
+    fn step_field(lo: f32, hi: f32) -> Vec<u8> {
+        wat::parse_str(format!(
+            r#"(module
+                (memory (export "memory") 1)
+                (func (export "get_dimensions") (result i32) (i32.const 2))
+                (func (export "get_io_ptr") (result i32) (i32.const 1024))
+                (func (export "get_bounds") (param $out i32)
+                    (f64.store (local.get $out) (f64.const 0))
+                    (f64.store offset=8 (local.get $out) (f64.const 1))
+                    (f64.store offset=16 (local.get $out) (f64.const 0))
+                    (f64.store offset=24 (local.get $out) (f64.const 1)))
+                (func (export "sample") (param $pos i32) (result f32)
+                    (select (f32.const {lo}) (f32.const {hi})
+                        (f64.lt (f64.load (local.get $pos)) (f64.const 0.5))))
+            )"#
+        ))
+        .expect("field module assembles")
+    }
+
+    fn analytic(data: &LightboxData, label: &str) -> String {
+        data.analytics
+            .iter()
+            .find(|(l, _)| l == label)
+            .unwrap_or_else(|| panic!("missing analytics row {label}: {:?}", data.analytics))
+            .1
+            .clone()
+    }
+
+    #[test]
+    fn lightbox_scalar_field_analytics() {
+        let data = build_lightbox_data(&step_field(1.0, 3.0)).expect("lightbox builds");
+        assert!(!data.binary);
+        assert_eq!((data.value_min, data.value_max), (1.0, 3.0));
+        assert_eq!((data.width, data.height), (512, 512));
+        assert_eq!(data.rgba.len(), 512 * 512 * 4);
+
+        // The step sits exactly on the midline: mean 2, integral 2 over the
+        // unit square, everything positive.
+        assert!(analytic(&data, "mean").starts_with("2.000000"));
+        assert!(analytic(&data, "integral").starts_with("2.000000"));
+        assert_eq!(analytic(&data, "coverage (v > 0)"), "100.0%");
+        assert!(analytic(&data, "range").contains("1.000000 .. 3.000000"));
+        // No NaN row for a clean field.
+        assert!(!data.analytics.iter().any(|(l, _)| l.contains("non-finite")));
+
+        // Both step levels appear as distinct viridis colors.
+        let first = &data.rgba[0..3];
+        let last = &data.rgba[data.rgba.len() - 4..data.rgba.len() - 1];
+        assert_ne!(first, last, "step levels should colormap differently");
+    }
+
+    #[test]
+    fn lightbox_binary_mask_analytics() {
+        let data = build_lightbox_data(&step_field(0.0, 1.0)).expect("lightbox builds");
+        assert!(data.binary);
+        assert!(analytic(&data, "occupied").starts_with("50.0%"));
+        // Mask pixels are pure black/white.
+        assert!(
+            data.rgba
+                .chunks_exact(4)
+                .all(|px| px[0..3] == [0, 0, 0] || px[0..3] == [255, 255, 255])
+        );
     }
 
     #[test]

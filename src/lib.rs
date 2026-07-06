@@ -279,6 +279,10 @@ pub use volumetric_abi::fea;
 // The triangle mesh value type (CBOR payload of TriMesh-typed assets).
 pub use volumetric_abi::trimesh;
 
+// Occupancy semantics for sample values, shared with hosts that classify
+// raw samples themselves (preview rasters, analytics).
+pub use volumetric_abi::{OCCUPANCY_THRESHOLD, is_occupied};
+
 /// Load `OperatorMetadata` from an operator WASM module via its `get_metadata()` export.
 ///
 /// ABI contract:
