@@ -123,7 +123,8 @@ const VEC_INPUT_PREFIX: &str = "vec:";
 const CONFIG_BOOL_PREFIX: &str = "cfg-bool:";
 const CONFIG_ENUM_PREFIX: &str = "cfg-enum:";
 const LUA_SOURCE_KEY: &str = "lua-source";
-const PREVIEW_RESOLUTIONS: [usize; 11] = [16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512];
+const PREVIEW_RESOLUTIONS: [usize; 13] =
+    [16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024];
 /// Raster resolutions offered for 2D field outputs (cells along the longer
 /// bounds axis).
 const SKETCH_RESOLUTIONS: [usize; 5] = [64, 128, 256, 512, 1024];

@@ -201,6 +201,330 @@ impl VertexFaces {
     }
 }
 
+/// Mutable working state for collapse sweeps over one face set (the whole
+/// mesh, or one spatial region of it on the parallel path).
+struct SweepMesh {
+    positions: Vec<[f64; 3]>,
+    faces: Vec<[u32; 3]>,
+    deleted: Vec<bool>,
+    quadrics: Vec<Quadric>,
+    boundary_edges: std::collections::HashSet<u64>,
+    boundary_vertex: Vec<bool>,
+    /// Pinned vertices take part in no collapse at all (neither endpoint).
+    /// The parallel path pins region-seam vertices: with both endpoints
+    /// unpinned, every face adjacent to either endpoint is inside the
+    /// region, so link-condition and flip-guard reads are complete and no
+    /// cross-region state is touched. Empty = nothing pinned.
+    pinned: Vec<bool>,
+}
+
+impl SweepMesh {
+    /// Run collapse passes: `ramp_passes` sweeps approaching the budget from
+    /// below (cheap collapses first), then full-budget sweeps until yields
+    /// go quiet. Returns the number of passes run.
+    fn run_passes(&mut self, budget: f64, ramp_passes: usize) -> usize {
+        let vertex_count = self.positions.len();
+        // Reused scratch buffers for the link-condition neighborhood sets.
+        let mut neighbors_src: Vec<u32> = Vec::new();
+        let mut neighbors_dst: Vec<u32> = Vec::new();
+        let mut opposite: Vec<u32> = Vec::new();
+
+        const MAX_CONVERGENCE_PASSES: usize = 16;
+        let mut pass = 0;
+        loop {
+            let threshold = if pass < ramp_passes {
+                let t = (pass + 1) as f64 / (ramp_passes + 1) as f64;
+                budget * t * t
+            } else {
+                budget
+            };
+
+            let adjacency = VertexFaces::build(&self.faces, &self.deleted, vertex_count);
+            let live_faces = adjacency.faces.len() / 3;
+            let mut dirty = vec![false; vertex_count];
+            let mut collapses = 0usize;
+
+            for fi in 0..self.faces.len() {
+                for k in 0..3 {
+                    if self.deleted[fi] {
+                        break;
+                    }
+                    let a = self.faces[fi][k];
+                    let b = self.faces[fi][(k + 1) % 3];
+                    if a == b || dirty[a as usize] || dirty[b as usize] {
+                        continue;
+                    }
+                    if !self.pinned.is_empty()
+                        && (self.pinned[a as usize] || self.pinned[b as usize])
+                    {
+                        continue;
+                    }
+
+                    // Boundary rule: a boundary vertex may only slide along a
+                    // boundary edge (which implies the target is boundary too).
+                    let edge_is_boundary = !self.boundary_edges.is_empty()
+                        && self.boundary_edges.contains(&edge_key(a, b));
+                    let can_move =
+                        |src: u32| !self.boundary_vertex[src as usize] || edge_is_boundary;
+
+                    // Subset placement: try the cheaper direction first.
+                    let err_a_to_b = combined_error(&self.quadrics, a, b, &self.positions);
+                    let err_b_to_a = combined_error(&self.quadrics, b, a, &self.positions);
+                    let directions = if err_a_to_b <= err_b_to_a {
+                        [(a, b, err_a_to_b), (b, a, err_b_to_a)]
+                    } else {
+                        [(b, a, err_b_to_a), (a, b, err_a_to_b)]
+                    };
+                    let chosen = directions.into_iter().find_map(|(src, dst, err)| {
+                        (err <= threshold
+                            && can_move(src)
+                            && link_condition_holds(
+                                src,
+                                dst,
+                                &self.faces,
+                                &self.deleted,
+                                &adjacency,
+                                &mut neighbors_src,
+                                &mut neighbors_dst,
+                                &mut opposite,
+                            )
+                            && !collapse_flips_normals(
+                                src,
+                                dst,
+                                &self.faces,
+                                &self.deleted,
+                                &adjacency,
+                                &self.positions,
+                            ))
+                        .then_some((src, dst))
+                    });
+
+                    if let Some((src, dst)) = chosen {
+                        self.quadrics[dst as usize] = {
+                            let mut q = self.quadrics[dst as usize];
+                            q.add(&self.quadrics[src as usize]);
+                            q
+                        };
+                        for &other_fi in adjacency.of(src) {
+                            let other_fi = other_fi as usize;
+                            if self.deleted[other_fi] {
+                                continue;
+                            }
+                            if self.faces[other_fi].contains(&dst) {
+                                self.deleted[other_fi] = true;
+                            } else {
+                                for slot in self.faces[other_fi].iter_mut() {
+                                    if *slot == src {
+                                        *slot = dst;
+                                    }
+                                }
+                            }
+                        }
+                        dirty[src as usize] = true;
+                        dirty[dst as usize] = true;
+                        collapses += 1;
+                    }
+                }
+            }
+
+            pass += 1;
+            let at_full_budget = pass > ramp_passes;
+            // Stop when a full-budget pass yields almost nothing: trailing
+            // convergence passes each sweep every live face for <0.2% gains.
+            if (at_full_budget && collapses * 500 < live_faces)
+                || pass >= ramp_passes + MAX_CONVERGENCE_PASSES
+            {
+                break;
+            }
+        }
+        pass
+    }
+}
+
+/// Single-threaded decimation over the whole face set.
+#[allow(clippy::type_complexity)]
+fn serial_decimate(
+    positions: Vec<[f64; 3]>,
+    faces: Vec<[u32; 3]>,
+    quadrics: Vec<Quadric>,
+    boundary_edges: std::collections::HashSet<u64>,
+    boundary_vertex: Vec<bool>,
+    budget: f64,
+    ramp_passes: usize,
+) -> (Vec<[u32; 3]>, Vec<bool>, usize) {
+    let deleted = vec![false; faces.len()];
+    let mut sweep = SweepMesh {
+        positions,
+        faces,
+        deleted,
+        quadrics,
+        boundary_edges,
+        boundary_vertex,
+        pinned: Vec::new(),
+    };
+    let passes = sweep.run_passes(budget, ramp_passes);
+    (sweep.faces, sweep.deleted, passes)
+}
+
+/// Parallel decimation: partition faces by centroid into a spatial grid, pin
+/// every vertex whose faces span more than one region, decimate the regions
+/// concurrently (pinned vertices are untouchable, so each region's reads and
+/// writes stay provably inside the region), then merge and run serial
+/// full-budget passes to dissolve the frozen grid-pitch seams.
+#[cfg(feature = "native")]
+#[allow(clippy::type_complexity)]
+fn parallel_decimate(
+    positions: Vec<[f64; 3]>,
+    faces: Vec<[u32; 3]>,
+    mut quadrics: Vec<Quadric>,
+    boundary_edges: std::collections::HashSet<u64>,
+    boundary_vertex: Vec<bool>,
+    budget: f64,
+    ramp_passes: usize,
+) -> (Vec<[u32; 3]>, Vec<bool>, usize) {
+    let vertex_count = positions.len();
+
+    // ~8 buckets per worker so uneven surface density still load-balances.
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let grid = (((workers * 8) as f64).cbrt().ceil() as usize).clamp(2, 8);
+
+    let mut lo = [f64::INFINITY; 3];
+    let mut hi = [f64::NEG_INFINITY; 3];
+    for p in &positions {
+        for axis in 0..3 {
+            lo[axis] = lo[axis].min(p[axis]);
+            hi[axis] = hi[axis].max(p[axis]);
+        }
+    }
+    let inv_extent: [f64; 3] =
+        std::array::from_fn(|axis| grid as f64 / (hi[axis] - lo[axis]).max(1e-12));
+
+    let mut buckets: Vec<Vec<[u32; 3]>> = vec![Vec::new(); grid * grid * grid];
+    for face in faces {
+        let mut cell = [0usize; 3];
+        for (axis, slot) in cell.iter_mut().enumerate() {
+            let centroid = (positions[face[0] as usize][axis]
+                + positions[face[1] as usize][axis]
+                + positions[face[2] as usize][axis])
+                / 3.0;
+            *slot = (((centroid - lo[axis]) * inv_extent[axis]) as usize).min(grid - 1);
+        }
+        buckets[cell[0] + grid * (cell[1] + grid * cell[2])].push(face);
+    }
+
+    // A vertex whose faces span more than one bucket is a seam vertex.
+    const UNSEEN: u32 = u32::MAX;
+    const SHARED: u32 = u32::MAX - 1;
+    let mut vertex_bucket = vec![UNSEEN; vertex_count];
+    for (bi, bucket) in buckets.iter().enumerate() {
+        for face in bucket {
+            for &v in face {
+                let slot = &mut vertex_bucket[v as usize];
+                if *slot == UNSEEN {
+                    *slot = bi as u32;
+                } else if *slot != bi as u32 {
+                    *slot = SHARED;
+                }
+            }
+        }
+    }
+
+    let non_empty: Vec<Vec<[u32; 3]>> = buckets.into_iter().filter(|b| !b.is_empty()).collect();
+    let results = parallel_iter::map_vec(non_empty, |bucket_faces| {
+        let mut local_to_global: Vec<u32> = bucket_faces.iter().flatten().copied().collect();
+        local_to_global.sort_unstable();
+        local_to_global.dedup();
+        let to_local = |g: u32| {
+            local_to_global
+                .binary_search(&g)
+                .expect("bucket vertex must be in its own vertex list") as u32
+        };
+        let local_faces: Vec<[u32; 3]> = bucket_faces.iter().map(|f| f.map(to_local)).collect();
+        let local_boundary_edges = if boundary_edges.is_empty() {
+            std::collections::HashSet::new()
+        } else {
+            let mut local = std::collections::HashSet::new();
+            for (face, global_face) in local_faces.iter().zip(&bucket_faces) {
+                for k in 0..3 {
+                    if boundary_edges.contains(&edge_key(global_face[k], global_face[(k + 1) % 3]))
+                    {
+                        local.insert(edge_key(face[k], face[(k + 1) % 3]));
+                    }
+                }
+            }
+            local
+        };
+        let deleted = vec![false; local_faces.len()];
+        let mut sweep = SweepMesh {
+            positions: local_to_global
+                .iter()
+                .map(|&g| positions[g as usize])
+                .collect(),
+            faces: local_faces,
+            deleted,
+            quadrics: local_to_global
+                .iter()
+                .map(|&g| quadrics[g as usize])
+                .collect(),
+            boundary_edges: local_boundary_edges,
+            boundary_vertex: local_to_global
+                .iter()
+                .map(|&g| boundary_vertex[g as usize])
+                .collect(),
+            pinned: local_to_global
+                .iter()
+                .map(|&g| vertex_bucket[g as usize] == SHARED)
+                .collect(),
+        };
+        let passes = sweep.run_passes(budget, ramp_passes);
+        let survivors: Vec<[u32; 3]> = sweep
+            .faces
+            .iter()
+            .zip(&sweep.deleted)
+            .filter(|&(_, &deleted)| !deleted)
+            .map(|(face, _)| face.map(|l| local_to_global[l as usize]))
+            .collect();
+        (survivors, local_to_global, sweep.quadrics, passes)
+    });
+
+    // Merge: survivors concatenate in deterministic region order; unpinned
+    // vertices are exclusive to one region, so their evolved quadrics write
+    // straight back (seam vertices never collapsed, theirs are unchanged).
+    let mut merged: Vec<[u32; 3]> = Vec::new();
+    let mut region_passes = 0usize;
+    for (survivors, local_to_global, local_quadrics, passes) in results {
+        region_passes = region_passes.max(passes);
+        for (local, &global) in local_to_global.iter().enumerate() {
+            if vertex_bucket[global as usize] != SHARED {
+                quadrics[global as usize] = local_quadrics[local];
+            }
+        }
+        merged.extend(survivors);
+    }
+
+    // Final serial passes dissolve the seams. No ramp: seam neighborhoods
+    // are still at grid pitch, and everything else is already converged.
+    let deleted = vec![false; merged.len()];
+    let mut sweep = SweepMesh {
+        positions,
+        faces: merged,
+        deleted,
+        quadrics,
+        boundary_edges,
+        boundary_vertex,
+        pinned: Vec::new(),
+    };
+    let final_passes = sweep.run_passes(budget, 0);
+    (sweep.faces, sweep.deleted, region_passes + final_passes)
+}
+
+/// Face count above which the native build partitions the mesh into spatial
+/// regions and decimates them in parallel (seams frozen, then dissolved by a
+/// final serial pass). Below it the partition/merge overhead isn't worth it.
+const PARALLEL_FACE_THRESHOLD: usize = 200_000;
+
 /// Decimate `mesh` in place so surviving geometry stays within roughly
 /// `error_tolerance` (world units, mean plane distance) of the input surface.
 /// Vertex normals are re-accumulated from the decimated topology.
@@ -208,6 +532,15 @@ pub fn decimate_mesh(
     mesh: &mut IndexedMesh2,
     error_tolerance: f64,
     ramp_passes: usize,
+) -> DecimationStats {
+    decimate_mesh_impl(mesh, error_tolerance, ramp_passes, PARALLEL_FACE_THRESHOLD)
+}
+
+fn decimate_mesh_impl(
+    mesh: &mut IndexedMesh2,
+    error_tolerance: f64,
+    ramp_passes: usize,
+    parallel_threshold: usize,
 ) -> DecimationStats {
     let start = Instant::now();
     let vertices_before = mesh.vertices.len();
@@ -239,7 +572,6 @@ pub fn decimate_mesh(
     // Stage 2 collects triangles in a nondeterministic parallel order; sort so
     // the collapse sequence (and thus the output) is deterministic.
     parallel_iter::sort_unstable(&mut faces);
-    let mut deleted = vec![false; faces.len()];
 
     // Initial quadrics: every face contributes its plane, weighted by area.
     let mut quadrics = vec![Quadric::default(); vertex_count];
@@ -295,111 +627,43 @@ pub fn decimate_mesh(
     }
 
     let budget = error_tolerance * error_tolerance;
-    // Reused scratch buffers for the link-condition neighborhood sets.
-    let mut neighbors_src: Vec<u32> = Vec::new();
-    let mut neighbors_dst: Vec<u32> = Vec::new();
-    let mut opposite: Vec<u32> = Vec::new();
 
-    // Ramp passes approach the budget from below (cheap collapses first),
-    // then full-budget passes run until convergence.
-    const MAX_CONVERGENCE_PASSES: usize = 16;
-    let mut pass = 0;
-    loop {
-        let threshold = if pass < ramp_passes {
-            let t = (pass + 1) as f64 / (ramp_passes + 1) as f64;
-            budget * t * t
-        } else {
-            budget
-        };
-
-        let adjacency = VertexFaces::build(&faces, &deleted, vertex_count);
-        let live_faces = adjacency.faces.len() / 3;
-        let mut dirty = vec![false; vertex_count];
-        let mut collapses = 0usize;
-
-        for fi in 0..faces.len() {
-            for k in 0..3 {
-                if deleted[fi] {
-                    break;
-                }
-                let a = faces[fi][k];
-                let b = faces[fi][(k + 1) % 3];
-                if a == b || dirty[a as usize] || dirty[b as usize] {
-                    continue;
-                }
-
-                // Boundary rule: a boundary vertex may only slide along a
-                // boundary edge (which implies the target is boundary too).
-                let edge_is_boundary =
-                    !boundary_edges.is_empty() && boundary_edges.contains(&edge_key(a, b));
-                let can_move = |src: u32| !boundary_vertex[src as usize] || edge_is_boundary;
-
-                // Subset placement: try the cheaper direction first.
-                let err_a_to_b = combined_error(&quadrics, a, b, &positions);
-                let err_b_to_a = combined_error(&quadrics, b, a, &positions);
-                let directions = if err_a_to_b <= err_b_to_a {
-                    [(a, b, err_a_to_b), (b, a, err_b_to_a)]
-                } else {
-                    [(b, a, err_b_to_a), (a, b, err_a_to_b)]
-                };
-                let chosen = directions.into_iter().find_map(|(src, dst, err)| {
-                    (err <= threshold
-                        && can_move(src)
-                        && link_condition_holds(
-                            src,
-                            dst,
-                            &faces,
-                            &deleted,
-                            &adjacency,
-                            &mut neighbors_src,
-                            &mut neighbors_dst,
-                            &mut opposite,
-                        )
-                        && !collapse_flips_normals(
-                            src, dst, &faces, &deleted, &adjacency, &positions,
-                        ))
-                    .then_some((src, dst))
-                });
-
-                if let Some((src, dst)) = chosen {
-                    quadrics[dst as usize] = {
-                        let mut q = quadrics[dst as usize];
-                        q.add(&quadrics[src as usize]);
-                        q
-                    };
-                    for &other_fi in adjacency.of(src) {
-                        let other_fi = other_fi as usize;
-                        if deleted[other_fi] {
-                            continue;
-                        }
-                        if faces[other_fi].contains(&dst) {
-                            deleted[other_fi] = true;
-                        } else {
-                            for slot in faces[other_fi].iter_mut() {
-                                if *slot == src {
-                                    *slot = dst;
-                                }
-                            }
-                        }
-                    }
-                    dirty[src as usize] = true;
-                    dirty[dst as usize] = true;
-                    collapses += 1;
-                }
-            }
-        }
-
-        pass += 1;
-        let at_full_budget = pass > ramp_passes;
-        // Stop when a full-budget pass yields almost nothing: trailing
-        // convergence passes each sweep every live face for <0.2% gains.
-        if (at_full_budget && collapses * 500 < live_faces)
-            || pass >= ramp_passes + MAX_CONVERGENCE_PASSES
-        {
-            break;
-        }
-    }
-    stats.passes_run = pass;
+    #[cfg(feature = "native")]
+    let (faces, deleted, passes_run) = if faces.len() >= parallel_threshold {
+        parallel_decimate(
+            positions,
+            faces,
+            quadrics,
+            boundary_edges,
+            boundary_vertex,
+            budget,
+            ramp_passes,
+        )
+    } else {
+        serial_decimate(
+            positions,
+            faces,
+            quadrics,
+            boundary_edges,
+            boundary_vertex,
+            budget,
+            ramp_passes,
+        )
+    };
+    #[cfg(not(feature = "native"))]
+    let (faces, deleted, passes_run) = {
+        let _ = parallel_threshold;
+        serial_decimate(
+            positions,
+            faces,
+            quadrics,
+            boundary_edges,
+            boundary_vertex,
+            budget,
+            ramp_passes,
+        )
+    };
+    stats.passes_run = passes_run;
 
     // Compact: drop deleted faces and remap surviving vertices. Positions
     // carry through unchanged (subset placement), but normals must be
@@ -803,6 +1067,62 @@ mod tests {
         for (_, count) in edge_face_counts(&mesh.indices) {
             assert_eq!(count, 2);
         }
+    }
+
+    #[test]
+    fn parallel_region_path_matches_serial_quality() {
+        let radius = 0.8;
+        let sampler = move |x: f64, y: f64, z: f64| {
+            if x * x + y * y + z * z < radius * radius {
+                1.0
+            } else {
+                0.0
+            }
+        };
+        let mut serial = mesh_sampler(sampler, 3);
+        let mut parallel = serial.clone();
+        // usize::MAX forces the serial path, 0 forces region partitioning.
+        decimate_mesh_impl(&mut serial, cell(3), 6, usize::MAX);
+        decimate_mesh_impl(&mut parallel, cell(3), 6, 0);
+
+        assert!(parallel.indices.len() < serial.indices.len() * 3 / 2);
+        // Same manifold guarantees as the serial path.
+        for (_, count) in edge_face_counts(&parallel.indices) {
+            assert_eq!(count, 2, "parallel path broke the closed surface");
+        }
+        // Subset placement holds across regions and the seam pass.
+        for &(x, y, z) in &parallel.vertices {
+            let r = ((x as f64).powi(2) + (y as f64).powi(2) + (z as f64).powi(2)).sqrt();
+            assert!(
+                (r - radius).abs() < cell(3) * 0.1,
+                "vertex off surface: {r}"
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_thin_strut_keeps_topology() {
+        let radius = 0.08;
+        let mut mesh = mesh_sampler(
+            move |x, y, _z| {
+                if x * x + y * y < radius * radius {
+                    1.0
+                } else {
+                    0.0
+                }
+            },
+            3,
+        );
+        let before = mesh.indices.len() / 3;
+        decimate_mesh_impl(&mut mesh, cell(3), 6, 0);
+        assert!(mesh.indices.len() / 3 < before);
+        assert_eq!(component_count(mesh.vertices.len(), &mesh.indices), 1);
+        let counts = edge_face_counts(&mesh.indices);
+        assert!(
+            counts.values().all(|&c| c <= 2),
+            "non-manifold edge created"
+        );
+        assert!(counts.values().filter(|&&c| c == 1).count() >= 6);
     }
 
     #[test]
