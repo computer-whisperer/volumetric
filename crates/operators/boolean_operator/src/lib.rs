@@ -17,8 +17,8 @@
 //! - Produces a merged WASM model with sample/bounds implementing union/subtract/intersect
 
 use wasm_encoder::{
-    CodeSection, ExportKind, ExportSection, Function, FunctionSection, Instruction, Module,
-    TypeSection, ValType,
+    CodeSection, ExportKind, ExportSection, Function, FunctionSection, Instruction, TypeSection,
+    ValType,
 };
 
 use volumetric_abi::{OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput};
@@ -61,232 +61,8 @@ impl From<BooleanOpConfig> for BooleanOp {
     }
 }
 
+use model_merge_core::{MergeSections, OffsetReencoder, count_sections, parse_model_exports};
 use volumetric_abi::host::{post_output, read_input, report_error};
-
-const ABI_FUNCTIONS_ND: &[&str] = &["get_dimensions", "get_io_ptr", "get_bounds", "sample"];
-
-#[derive(Debug)]
-struct AbiExportsNd {
-    get_dimensions: u32,
-    get_io_ptr: u32,
-    get_bounds: u32,
-    sample: u32,
-    memory: u32,
-}
-
-fn parse_abi_exports_nd(wasm: &[u8]) -> Result<AbiExportsNd, String> {
-    let mut map: std::collections::HashMap<String, (wasmparser::ExternalKind, u32)> =
-        std::collections::HashMap::new();
-    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
-        match payload.map_err(|e| e.to_string())? {
-            wasmparser::Payload::ImportSection(s) => {
-                if s.count() > 0 {
-                    return Err("Model must not import anything".to_string());
-                }
-            }
-            wasmparser::Payload::ExportSection(s) => {
-                for e in s {
-                    let e = e.map_err(|e| e.to_string())?;
-                    if ABI_FUNCTIONS_ND.contains(&e.name) || e.name == "memory" {
-                        map.insert(e.name.to_string(), (e.kind, e.index));
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let get_func = |name: &str| -> Result<u32, String> {
-        map.get(name)
-            .filter(|(k, _)| *k == wasmparser::ExternalKind::Func)
-            .map(|(_, i)| *i)
-            .ok_or_else(|| format!("Model missing function export `{name}`"))
-    };
-    let get_mem = |name: &str| -> Result<u32, String> {
-        map.get(name)
-            .filter(|(k, _)| *k == wasmparser::ExternalKind::Memory)
-            .map(|(_, i)| *i)
-            .ok_or_else(|| format!("Model missing memory export `{name}`"))
-    };
-
-    Ok(AbiExportsNd {
-        get_dimensions: get_func("get_dimensions")?,
-        get_io_ptr: get_func("get_io_ptr")?,
-        get_bounds: get_func("get_bounds")?,
-        sample: get_func("sample")?,
-        memory: get_mem("memory")?,
-    })
-}
-
-#[derive(Default)]
-struct Counts {
-    types: u32,
-    funcs: u32,
-    globals: u32,
-    tables: u32,
-    memories: u32,
-    elements: u32,
-    data: u32,
-    has_data_count: bool,
-}
-
-fn count_sections(wasm: &[u8]) -> Result<Counts, String> {
-    let mut counts = Counts::default();
-    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
-        match payload.map_err(|e| e.to_string())? {
-            wasmparser::Payload::TypeSection(s) => {
-                counts.types = counts.types.saturating_add(s.count())
-            }
-            wasmparser::Payload::FunctionSection(s) => {
-                counts.funcs = counts.funcs.saturating_add(s.count())
-            }
-            wasmparser::Payload::GlobalSection(s) => {
-                counts.globals = counts.globals.saturating_add(s.count())
-            }
-            wasmparser::Payload::TableSection(s) => {
-                counts.tables = counts.tables.saturating_add(s.count())
-            }
-            wasmparser::Payload::MemorySection(s) => {
-                counts.memories = counts.memories.saturating_add(s.count())
-            }
-            wasmparser::Payload::ElementSection(s) => {
-                counts.elements = counts.elements.saturating_add(s.count())
-            }
-            wasmparser::Payload::DataSection(s) => {
-                counts.data = counts.data.saturating_add(s.count())
-            }
-            wasmparser::Payload::DataCountSection { .. } => counts.has_data_count = true,
-            wasmparser::Payload::ImportSection(s) => {
-                if s.count() > 0 {
-                    return Err("Model must not import anything".to_string());
-                }
-            }
-            wasmparser::Payload::StartSection { .. } => {
-                return Err("Model must not define a start function".to_string());
-            }
-            _ => {}
-        }
-    }
-    Ok(counts)
-}
-
-struct OffsetReencoder {
-    type_offset: u32,
-    func_offset: u32,
-    global_offset: u32,
-    table_offset: u32,
-    memory_offset: u32,
-}
-
-impl wasm_encoder::reencode::Reencode for OffsetReencoder {
-    type Error = std::convert::Infallible;
-
-    fn type_index(&mut self, ty: u32) -> Result<u32, wasm_encoder::reencode::Error<Self::Error>> {
-        Ok(self.type_offset + ty)
-    }
-
-    fn function_index(
-        &mut self,
-        func: u32,
-    ) -> Result<u32, wasm_encoder::reencode::Error<Self::Error>> {
-        Ok(self.func_offset + func)
-    }
-
-    fn global_index(
-        &mut self,
-        global: u32,
-    ) -> Result<u32, wasm_encoder::reencode::Error<Self::Error>> {
-        Ok(self.global_offset + global)
-    }
-
-    fn table_index(
-        &mut self,
-        table: u32,
-    ) -> Result<u32, wasm_encoder::reencode::Error<Self::Error>> {
-        Ok(self.table_offset + table)
-    }
-
-    fn memory_index(
-        &mut self,
-        memory: u32,
-    ) -> Result<u32, wasm_encoder::reencode::Error<Self::Error>> {
-        Ok(self.memory_offset + memory)
-    }
-
-    fn data_index(&mut self, data: u32) -> Result<u32, wasm_encoder::reencode::Error<Self::Error>> {
-        Ok(data)
-    }
-
-    fn element_index(
-        &mut self,
-        element: u32,
-    ) -> Result<u32, wasm_encoder::reencode::Error<Self::Error>> {
-        Ok(element)
-    }
-}
-
-fn append_module_sections(
-    wasm: &[u8],
-    re: &mut dyn wasm_encoder::reencode::Reencode<Error = std::convert::Infallible>,
-    types: &mut TypeSection,
-    funcs: &mut FunctionSection,
-    code: &mut CodeSection,
-    globals: &mut wasm_encoder::GlobalSection,
-    tables: &mut wasm_encoder::TableSection,
-    memories: &mut wasm_encoder::MemorySection,
-    elements: &mut wasm_encoder::ElementSection,
-    data: &mut wasm_encoder::DataSection,
-) -> Result<(), String> {
-    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
-        match payload.map_err(|e| e.to_string())? {
-            wasmparser::Payload::TypeSection(s) => {
-                wasm_encoder::reencode::utils::parse_type_section(re, types, s)
-                    .map_err(|e| format!("type section reencode failed: {e}"))?;
-            }
-            wasmparser::Payload::FunctionSection(s) => {
-                wasm_encoder::reencode::utils::parse_function_section(re, funcs, s)
-                    .map_err(|e| format!("function section reencode failed: {e}"))?;
-            }
-            wasmparser::Payload::CodeSectionEntry(body) => {
-                wasm_encoder::reencode::utils::parse_function_body(re, code, body)
-                    .map_err(|e| format!("code reencode failed: {e}"))?;
-            }
-            wasmparser::Payload::GlobalSection(s) => {
-                wasm_encoder::reencode::utils::parse_global_section(re, globals, s)
-                    .map_err(|e| format!("global section reencode failed: {e}"))?;
-            }
-            wasmparser::Payload::TableSection(s) => {
-                wasm_encoder::reencode::utils::parse_table_section(re, tables, s)
-                    .map_err(|e| format!("table section reencode failed: {e}"))?;
-            }
-            wasmparser::Payload::MemorySection(s) => {
-                wasm_encoder::reencode::utils::parse_memory_section(re, memories, s)
-                    .map_err(|e| format!("memory section reencode failed: {e}"))?;
-            }
-            wasmparser::Payload::ElementSection(s) => {
-                wasm_encoder::reencode::utils::parse_element_section(re, elements, s)
-                    .map_err(|e| format!("element section reencode failed: {e}"))?;
-            }
-            wasmparser::Payload::DataSection(s) => {
-                wasm_encoder::reencode::utils::parse_data_section(re, data, s)
-                    .map_err(|e| format!("data section reencode failed: {e}"))?;
-            }
-            wasmparser::Payload::ImportSection(s) => {
-                if s.count() > 0 {
-                    return Err("Model must not import anything".to_string());
-                }
-            }
-            wasmparser::Payload::ExportSection(_)
-            | wasmparser::Payload::DataCountSection { .. }
-            | wasmparser::Payload::StartSection { .. }
-            | wasmparser::Payload::CustomSection(_) => {}
-            wasmparser::Payload::End(_) => break,
-            _ => {}
-        }
-    }
-
-    Ok(())
-}
 
 /// Add get_dimensions wrapper that passes through from model A
 fn add_get_dimensions_wrapper(
@@ -530,59 +306,12 @@ fn merge_models(a_wasm: &[u8], b_wasm: &[u8], op: BooleanOp) -> Result<Vec<u8>, 
     let a_counts = count_sections(a_wasm)?;
     let b_counts = count_sections(b_wasm)?;
 
-    let a_exports = parse_abi_exports_nd(a_wasm)?;
-    let b_exports = parse_abi_exports_nd(b_wasm)?;
+    let a_exports = parse_model_exports(a_wasm)?;
+    let b_exports = parse_model_exports(b_wasm)?;
 
-    let mut types = TypeSection::new();
-    let mut funcs = FunctionSection::new();
-    let mut code = CodeSection::new();
-    let mut globals = wasm_encoder::GlobalSection::new();
-    let mut tables = wasm_encoder::TableSection::new();
-    let mut memories = wasm_encoder::MemorySection::new();
-    let mut elements = wasm_encoder::ElementSection::new();
-    let mut data = wasm_encoder::DataSection::new();
-
-    // Append A with identity mapping.
-    let mut re_a = OffsetReencoder {
-        type_offset: 0,
-        func_offset: 0,
-        global_offset: 0,
-        table_offset: 0,
-        memory_offset: 0,
-    };
-    append_module_sections(
-        a_wasm,
-        &mut re_a,
-        &mut types,
-        &mut funcs,
-        &mut code,
-        &mut globals,
-        &mut tables,
-        &mut memories,
-        &mut elements,
-        &mut data,
-    )?;
-
-    // Append B with index offsets.
-    let mut re_b = OffsetReencoder {
-        type_offset: a_counts.types,
-        func_offset: a_counts.funcs,
-        global_offset: a_counts.globals,
-        table_offset: a_counts.tables,
-        memory_offset: a_counts.memories,
-    };
-    append_module_sections(
-        b_wasm,
-        &mut re_b,
-        &mut types,
-        &mut funcs,
-        &mut code,
-        &mut globals,
-        &mut tables,
-        &mut memories,
-        &mut elements,
-        &mut data,
-    )?;
+    let mut sections = MergeSections::default();
+    sections.append_module(a_wasm, &mut OffsetReencoder::identity())?;
+    sections.append_module(b_wasm, &mut OffsetReencoder::after(&a_counts))?;
 
     // Build exports with wrappers.
     let mut exports = ExportSection::new();
@@ -591,9 +320,9 @@ fn merge_models(a_wasm: &[u8], b_wasm: &[u8], op: BooleanOp) -> Result<Vec<u8>, 
     exports.export("memory", ExportKind::Memory, a_exports.memory);
 
     add_get_dimensions_wrapper(
-        &mut types,
-        &mut funcs,
-        &mut code,
+        &mut sections.types,
+        &mut sections.funcs,
+        &mut sections.code,
         &mut exports,
         a_exports.get_dimensions,
     );
@@ -603,9 +332,9 @@ fn merge_models(a_wasm: &[u8], b_wasm: &[u8], op: BooleanOp) -> Result<Vec<u8>, 
     exports.export("get_io_ptr", ExportKind::Func, a_exports.get_io_ptr);
 
     add_get_bounds_wrapper(
-        &mut types,
-        &mut funcs,
-        &mut code,
+        &mut sections.types,
+        &mut sections.funcs,
+        &mut sections.code,
         &mut exports,
         a_exports.get_bounds,
         b_exports.get_bounds + a_counts.funcs,
@@ -616,9 +345,9 @@ fn merge_models(a_wasm: &[u8], b_wasm: &[u8], op: BooleanOp) -> Result<Vec<u8>, 
     );
 
     add_sample_wrapper(
-        &mut types,
-        &mut funcs,
-        &mut code,
+        &mut sections.types,
+        &mut sections.funcs,
+        &mut sections.code,
         &mut exports,
         a_exports.sample,
         b_exports.sample + a_counts.funcs,
@@ -629,38 +358,9 @@ fn merge_models(a_wasm: &[u8], b_wasm: &[u8], op: BooleanOp) -> Result<Vec<u8>, 
         b_exports.memory + a_counts.memories,
     );
 
-    let mut out = Module::new();
-    if types.len() > 0 {
-        out.section(&types);
-    }
-    if funcs.len() > 0 {
-        out.section(&funcs);
-    }
-    if tables.len() > 0 {
-        out.section(&tables);
-    }
-    if memories.len() > 0 {
-        out.section(&memories);
-    }
-    if globals.len() > 0 {
-        out.section(&globals);
-    }
-    out.section(&exports);
-    if elements.len() > 0 {
-        out.section(&elements);
-    }
-
-    if a_counts.has_data_count || b_counts.has_data_count {
-        out.section(&wasm_encoder::DataCountSection {
-            count: a_counts.data + b_counts.data,
-        });
-    }
-    out.section(&code);
-    if data.len() > 0 {
-        out.section(&data);
-    }
-
-    Ok(out.finish())
+    let data_count =
+        (a_counts.has_data_count || b_counts.has_data_count).then(|| a_counts.data + b_counts.data);
+    Ok(sections.finish(&exports, data_count))
 }
 
 #[unsafe(no_mangle)]

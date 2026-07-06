@@ -311,6 +311,7 @@ name = "boolean_operator"
 version = "0.1.0"
 dependencies = [
  "ciborium",
+ "model_merge_core",
  "serde",
  "volumetric_abi",
  "wasm-encoder 0.248.0",
@@ -2584,6 +2585,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "lattice_model_core"
+version = "0.1.0"
+
+[[package]]
+name = "lattice_model_template"
+version = "0.1.0"
+dependencies = [
+ "lattice_model_core",
+]
+
+[[package]]
+name = "lattice_operator"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "model_merge_core",
+ "serde",
+ "volumetric_abi",
+ "walrus",
+ "wasm-encoder 0.248.0",
+]
+
+[[package]]
 name = "leb128"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2823,6 +2847,14 @@ checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
 dependencies = [
  "adler2",
  "simd-adler32",
+]
+
+[[package]]
+name = "model_merge_core"
+version = "0.1.0"
+dependencies = [
+ "wasm-encoder 0.248.0",
+ "wasmparser 0.248.0",
 ]
 
 [[package]]

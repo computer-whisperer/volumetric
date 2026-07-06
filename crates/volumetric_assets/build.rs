@@ -14,6 +14,9 @@ const MODELS: &[(&str, &str)] = &[
     ("rounded_box_model", "Rounded Box"),
     ("gyroid_lattice_model", "Gyroid Lattice"),
     ("mandelbulb_model", "Mandelbulb"),
+    // A solid cube with an x-gradient density channel — the lattice
+    // operator's playground input.
+    ("density_gradient_model", "Density Gradient"),
 ];
 
 /// Known operator crate names
@@ -35,6 +38,7 @@ const OPERATORS: &[(&str, &str)] = &[
     ("fea_inverse_operator", "FEA Inverse"),
     ("mesh_to_model_operator", "Mesh to Model"),
     ("mesh_height_operator", "Mesh Height Query"),
+    ("lattice_operator", "Lattice"),
 ];
 
 fn main() {

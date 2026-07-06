@@ -1,0 +1,11 @@
+[package]
+name = "lattice_model_template"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+lattice_model_core = { path = "../lattice_model_core" }

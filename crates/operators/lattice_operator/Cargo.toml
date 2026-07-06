@@ -1,5 +1,5 @@
 [package]
-name = "boolean_operator"
+name = "lattice_operator"
 version = "0.1.0"
 edition = "2024"
 
@@ -11,5 +11,5 @@ volumetric_abi = { path = "../../volumetric_abi" }
 model_merge_core = { path = "../../model_merge_core" }
 serde = { version = "1", features = ["derive"] }
 ciborium = "0.2"
-wasmparser = "0.248"
+walrus = "0.26"
 wasm-encoder = { version = "0.248", features = ["wasmparser"] }
