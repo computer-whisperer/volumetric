@@ -22,6 +22,10 @@
 //!   lightbox, colormaps) still sees the density field.
 //! - Occupancy-only inputs: every occupied point uses `uniform_density`,
 //!   so any plain model can be lattice-filled for experimentation.
+//! - `density_gamma` / `density_min` / `density_max` calibrate how the
+//!   density value maps to the lattice thickness parameter (curve shape,
+//!   thickness floor, thickness cap) before the family mapping — see
+//!   `lattice_model_core::DensityMap`.
 //!
 //! Bounds, dimensions, and IO buffer pass through from the input.
 
@@ -43,6 +47,12 @@ enum LatticeKindConfig {
     Gyroid,
     Schwarz,
     Struts,
+    /// Vertical hexagonal cell walls (compression along z, low surface
+    /// shear — the classic seat-cushion honeycomb).
+    Honeycomb,
+    /// Skeletal Schwarz-Diamond: smooth struts with tetrahedral node
+    /// topology.
+    Tetra,
 }
 
 impl LatticeKindConfig {
@@ -53,6 +63,8 @@ impl LatticeKindConfig {
             Self::Gyroid => 0,
             Self::Schwarz => 1,
             Self::Struts => 2,
+            Self::Honeycomb => 3,
+            Self::Tetra => 4,
         }
     }
 }
@@ -64,6 +76,11 @@ struct LatticeConfig {
     cell_size: f64,
     density_channel: i64,
     uniform_density: f64,
+    /// Density-to-thickness calibration (see `lattice_model_core::DensityMap`):
+    /// `d_eff = density_min + (density_max - density_min) * d^density_gamma`.
+    density_gamma: f64,
+    density_min: f64,
+    density_max: f64,
 }
 
 impl Default for LatticeConfig {
@@ -73,6 +90,9 @@ impl Default for LatticeConfig {
             cell_size: 0.05,
             density_channel: 1,
             uniform_density: 1.0,
+            density_gamma: 1.0,
+            density_min: 0.0,
+            density_max: 1.0,
         }
     }
 }
@@ -93,9 +113,9 @@ fn const_i32_return(module: &walrus::Module, func_id: walrus::FunctionId) -> Opt
     }
 }
 
-/// Patch the lattice kind + cell size into the template's config slot and
-/// drop the patch-helper export.
-fn patch_template(kind: u32, cell_size: f32) -> Result<Vec<u8>, String> {
+/// Patch the lattice kind, cell size, and density calibration into the
+/// template's config slot and drop the patch-helper export.
+fn patch_template(kind: u32, cell_size: f32, density_map: [f32; 3]) -> Result<Vec<u8>, String> {
     let mut module =
         walrus::Module::from_buffer_with_config(TEMPLATE, &walrus::ModuleConfig::new())
             .map_err(|e| format!("failed to parse the embedded template: {e}"))?;
@@ -120,9 +140,12 @@ fn patch_template(kind: u32, cell_size: f32) -> Result<Vec<u8>, String> {
     };
     module.exports.delete(export.0);
 
-    let mut bytes = Vec::with_capacity(8);
+    let mut bytes = Vec::with_capacity(20);
     bytes.extend(kind.to_le_bytes());
     bytes.extend(cell_size.to_le_bytes());
+    for value in density_map {
+        bytes.extend(value.to_le_bytes());
+    }
     module.data.add(
         walrus::DataKind::Active {
             memory: memory_id,
@@ -335,9 +358,34 @@ fn build_lattice_model(input: &[u8], config: &LatticeConfig) -> Result<Vec<u8>, 
             config.density_channel
         ));
     }
+    if !(config.density_gamma.is_finite() && config.density_gamma > 0.0) {
+        return Err(format!(
+            "density_gamma must be positive, got {}",
+            config.density_gamma
+        ));
+    }
+    let range_valid = config.density_min.is_finite()
+        && config.density_max.is_finite()
+        && 0.0 <= config.density_min
+        && config.density_min <= config.density_max
+        && config.density_max <= 1.0;
+    if !range_valid {
+        return Err(format!(
+            "density_min/density_max must satisfy 0 <= min <= max <= 1, got {} / {}",
+            config.density_min, config.density_max
+        ));
+    }
     check_three_dimensional(input)?;
 
-    let template = patch_template(config.lattice.as_u32(), config.cell_size as f32)?;
+    let template = patch_template(
+        config.lattice.as_u32(),
+        config.cell_size as f32,
+        [
+            config.density_gamma as f32,
+            config.density_min as f32,
+            config.density_max as f32,
+        ],
+    )?;
 
     let a_counts = count_sections(input)?;
     let b_counts = count_sections(&template)?;
@@ -415,7 +463,7 @@ pub extern "C" fn run() {
 pub extern "C" fn get_metadata() -> i64 {
     static METADATA: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     volumetric_abi::metadata_reply(&METADATA, || {
-        let schema = r#"{ lattice: "gyroid" / "schwarz" / "struts" .default "gyroid", cell_size: float .default 0.05, density_channel: int .default 1, uniform_density: float .default 1.0 }"#.to_string();
+        let schema = r#"{ lattice: "gyroid" / "schwarz" / "struts" / "honeycomb" / "tetra" .default "gyroid", cell_size: float .default 0.05, density_channel: int .default 1, uniform_density: float .default 1.0, density_gamma: float .default 1.0, density_min: float .default 0.0, density_max: float .default 1.0 }"#.to_string();
         OperatorMetadata {
             name: "lattice_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),

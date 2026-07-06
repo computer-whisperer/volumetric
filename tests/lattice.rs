@@ -136,12 +136,13 @@ fn gyroid_fill_follows_the_density_gradient() {
     );
 }
 
-/// All three lattice families produce valid, distinct structures.
+/// All lattice families produce valid, pairwise-distinct structures.
 #[test]
 fn lattice_families_run_and_differ() {
     let input = wasm_artifact("density_gradient_model");
+    const FAMILIES: [&str; 5] = ["gyroid", "schwarz", "struts", "honeycomb", "tetra"];
     let mut signatures = Vec::new();
-    for lattice in ["gyroid", "schwarz", "struts"] {
+    for lattice in FAMILIES {
         let output = run_operator(
             "lattice_operator",
             vec![input.clone(), lattice_config(lattice, 0.5)],
@@ -167,8 +168,68 @@ fn lattice_families_run_and_differ() {
         );
         signatures.push(signature);
     }
-    assert_ne!(signatures[0], signatures[1], "gyroid vs schwarz");
-    assert_ne!(signatures[0], signatures[2], "gyroid vs struts");
+    for a in 0..signatures.len() {
+        for b in (a + 1)..signatures.len() {
+            assert_ne!(
+                signatures[a], signatures[b],
+                "{} vs {}",
+                FAMILIES[a], FAMILIES[b]
+            );
+        }
+    }
+}
+
+/// The density calibration knobs reshape how the density map turns into
+/// structure: a floor thickens the sparse end, a cap hollows the dense end,
+/// and gamma bends the mid-range.
+#[test]
+fn density_calibration_reshapes_the_fill() {
+    let input = wasm_artifact("density_gradient_model");
+    let fraction_at = |extra: &[(&str, ciborium::value::Value)], x: f64| -> f64 {
+        let mut entries = vec![
+            ("lattice", ciborium::value::Value::Text("gyroid".into())),
+            ("cell_size", ciborium::value::Value::Float(0.4)),
+        ];
+        entries.extend_from_slice(extra);
+        let output = run_operator(
+            "lattice_operator",
+            vec![input.clone(), cbor_config(&entries)],
+        )
+        .expect("lattice operator runs");
+        let mut executor = NativeModelExecutor::new(&output).expect("output executes");
+        occupied_fraction(&mut executor, x)
+    };
+
+    // density_min floors the sparse end: x = -0.7 samples density 0.15,
+    // which a 0.85 floor lifts to ~0.87.
+    let default_low = fraction_at(&[], -0.7);
+    let floored_low = fraction_at(
+        &[("density_min", ciborium::value::Value::Float(0.85))],
+        -0.7,
+    );
+    assert!(
+        floored_low > default_low + 0.2,
+        "floor should thicken the sparse end: {default_low} -> {floored_low}"
+    );
+
+    // density_max caps the dense end: x = 0.96 samples density 0.98.
+    let default_high = fraction_at(&[], 0.96);
+    let capped_high = fraction_at(&[("density_max", ciborium::value::Value::Float(0.3))], 0.96);
+    assert!(
+        capped_high < default_high - 0.2,
+        "cap should hollow the dense end: {default_high} -> {capped_high}"
+    );
+
+    // gamma > 1 thins the mid-range without touching the endpoints.
+    let default_mid = fraction_at(&[], 0.0);
+    let curved_mid = fraction_at(
+        &[("density_gamma", ciborium::value::Value::Float(3.0))],
+        0.0,
+    );
+    assert!(
+        curved_mid < default_mid - 0.1,
+        "gamma 3 should thin the mid-range: {default_mid} -> {curved_mid}"
+    );
 }
 
 /// Occupancy-only inputs (no channels) lattice-fill with `uniform_density`.
@@ -244,4 +305,27 @@ fn rejects_non_3d_inputs_and_bad_config() {
     )
     .expect_err("zero cell size should be rejected");
     assert!(err.contains("cell_size"), "{err}");
+
+    let err = run_operator(
+        "lattice_operator",
+        vec![
+            wasm_artifact("density_gradient_model"),
+            cbor_config(&[("density_gamma", ciborium::value::Value::Float(0.0))]),
+        ],
+    )
+    .expect_err("non-positive gamma should be rejected");
+    assert!(err.contains("density_gamma"), "{err}");
+
+    let err = run_operator(
+        "lattice_operator",
+        vec![
+            wasm_artifact("density_gradient_model"),
+            cbor_config(&[
+                ("density_min", ciborium::value::Value::Float(0.8)),
+                ("density_max", ciborium::value::Value::Float(0.2)),
+            ]),
+        ],
+    )
+    .expect_err("inverted density range should be rejected");
+    assert!(err.contains("density_min"), "{err}");
 }

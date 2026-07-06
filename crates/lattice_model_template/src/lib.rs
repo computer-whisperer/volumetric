@@ -5,10 +5,12 @@
 //!
 //! # Patch contract
 //!
-//! - `lattice_config_slot() -> i32` returns the address of an 8-byte slot:
+//! - `lattice_config_slot() -> i32` returns the address of a 20-byte slot:
 //!   `kind: u32` (the `lattice_model_core::LatticeKind` discriminant),
-//!   `cell_size: f32` (pattern period in model units). The operator
-//!   overwrites it via an active data segment and drops this helper export.
+//!   `cell_size: f32` (pattern period in model units), then the
+//!   `DensityMap` calibration `gamma: f32, min: f32, max: f32`. The
+//!   operator overwrites it via an active data segment and drops this
+//!   helper export.
 //! - `lattice_sample(x, y, z, density) -> f32` evaluates the configured
 //!   lattice: 1.0 inside, 0.0 outside. Unpatched (zeroed) config reads as
 //!   cell size 0 and answers 0.0 everywhere.
@@ -25,12 +27,13 @@
 //!    crates/operators/lattice_operator/template/
 //! ```
 
-use lattice_model_core::{LatticeKind, lattice_occupied};
+use lattice_model_core::{DensityMap, LatticeKind, lattice_occupied, map_density};
 
-/// The 8-byte config slot the operator patches: kind u32, cell_size f32.
+/// The 20-byte config slot the operator patches: kind u32, cell_size f32,
+/// then the DensityMap gamma/min/max f32s.
 #[repr(align(4))]
-struct ConfigSlot([u8; 8]);
-static CONFIG_SLOT: ConfigSlot = ConfigSlot([0; 8]);
+struct ConfigSlot([u8; 20]);
+static CONFIG_SLOT: ConfigSlot = ConfigSlot([0; 20]);
 
 /// The patch address of the config slot (dropped from the merged module).
 #[unsafe(no_mangle)]
@@ -46,10 +49,16 @@ pub extern "C" fn lattice_sample(x: f64, y: f64, z: f64, density: f32) -> f32 {
     let base = CONFIG_SLOT.0.as_ptr();
     let kind_raw = unsafe { core::ptr::read_volatile(base as *const u32) };
     let cell_size = unsafe { core::ptr::read_volatile(base.add(4) as *const f32) };
+    let map = DensityMap {
+        gamma: unsafe { core::ptr::read_volatile(base.add(8) as *const f32) },
+        min: unsafe { core::ptr::read_volatile(base.add(12) as *const f32) },
+        max: unsafe { core::ptr::read_volatile(base.add(16) as *const f32) },
+    };
     let Some(kind) = LatticeKind::from_u32(kind_raw) else {
         return 0.0;
     };
-    if lattice_occupied(kind, [x, y, z], f64::from(cell_size), density) {
+    let mapped = map_density(map, density);
+    if lattice_occupied(kind, [x, y, z], f64::from(cell_size), mapped) {
         1.0
     } else {
         0.0
