@@ -2,11 +2,13 @@
 //!
 //! Everything here is window-system plumbing: the event loop, surface, and
 //! input mapping; a worker thread pumping the session's background jobs; and
-//! the blocking `rfd` dialogs that fulfill the app's queued file actions. All
-//! platform-neutral behavior (preview cache, viewport rendering, camera,
-//! run/cancel bookkeeping) lives in [`crate::session`], which a future web
-//! shell will drive instead.
+//! a file worker that runs the `rfd` dialogs and all disk I/O off the UI
+//! thread (a blocked loop stops answering the Wayland ping and the
+//! compositor kills the connection). All platform-neutral behavior (preview
+//! cache, viewport rendering, camera, run/cancel bookkeeping) lives in
+//! [`crate::session`], which a future web shell will drive instead.
 
+use std::path::PathBuf;
 use std::sync::{
     Arc,
     mpsc::{self, Receiver, Sender},
@@ -16,10 +18,11 @@ use std::thread;
 use damascene_core::prelude::*;
 use damascene_wgpu::Runner;
 use damascene_winit_wgpu::host::input::{key_modifiers, map_key, pointer_button, winit_cursor};
+use volumetric::Project;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowId};
 
 use crate::session::{
@@ -32,7 +35,8 @@ pub fn run(
     viewport: Rect,
     app: VolumetricUiV2,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let event_loop = EventLoop::new()?;
+    let event_loop = EventLoop::with_user_event().build()?;
+    let proxy = event_loop.create_proxy();
     let mut host = Host {
         title,
         viewport,
@@ -43,6 +47,7 @@ pub fn run(
         last_cursor: Cursor::Default,
         pending_resize: None,
         worker: BackgroundWorker::new(),
+        files: FileWorker::new(proxy),
     };
     event_loop.run_app(&mut host)?;
     Ok(())
@@ -59,6 +64,8 @@ struct Host {
     pending_resize: Option<PhysicalSize<u32>>,
     /// Shared worker thread for project execution and preview meshing.
     worker: BackgroundWorker,
+    /// Per-action worker threads for file dialogs and disk I/O.
+    files: FileWorker,
 }
 
 struct Gfx {
@@ -72,6 +79,14 @@ struct Gfx {
 }
 
 impl ApplicationHandler for Host {
+    /// The file worker pings the loop when an outcome is ready, so results
+    /// land promptly even while the loop is idle in `Wait`.
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ()) {
+        if let Some(gfx) = self.gfx.as_ref() {
+            gfx.window.request_redraw();
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.gfx.is_some() {
             return;
@@ -337,10 +352,19 @@ impl Host {
         gfx.session
             .pre_frame(&mut self.app, self.worker.drain_results());
 
-        // Run a queued file action (native dialogs block the loop, like v1).
-        // Before the session sync so an opened project's run starts this frame.
+        // Apply finished file operations, then hand any newly queued action
+        // to the file worker. Both before the session sync so an opened
+        // project's run starts this frame.
+        for outcome in self.files.drain() {
+            apply_file_outcome(&mut self.app, outcome);
+        }
         if let Some(action) = self.app.take_file_action() {
-            handle_file_action(&mut self.app, &gfx.session, action);
+            if self.files.in_flight() {
+                self.app
+                    .set_status("a file operation is already in progress");
+            } else if let Some(task) = gather_file_task(&mut self.app, &gfx.session, action) {
+                self.files.spawn(task);
+            }
         }
 
         let scale_factor = gfx.window.scale_factor() as f32;
@@ -431,56 +455,90 @@ fn ensure_extension(path: std::path::PathBuf, ext: &str) -> std::path::PathBuf {
     }
 }
 
-/// Runs a queued file action: native dialogs first, then the outcome is
-/// routed back into the app. The blocking dialogs stall the event loop while
-/// open — same trade-off as the v1 egui app.
-fn handle_file_action(app: &mut VolumetricUiV2, session: &Session, action: FileAction) {
+/// A file operation with everything it needs gathered up front, so the
+/// worker thread never touches app or session state.
+enum FileTask {
+    OpenProject,
+    /// `path: None` asks with a save dialog; `Some` re-saves in place.
+    SaveProject {
+        project: Project,
+        path: Option<PathBuf>,
+    },
+    ExportStl {
+        id: String,
+        triangles: Vec<volumetric::Triangle>,
+    },
+    ExportWasm {
+        id: String,
+        bytes: Arc<Vec<u8>>,
+    },
+    ImportWasm,
+    ImportBlob {
+        filter_name: &'static str,
+        extensions: &'static [&'static str],
+        operator_name: &'static str,
+        output_base: &'static str,
+    },
+}
+
+/// What a finished file task reports back; applied to the app on the UI
+/// thread by [`apply_file_outcome`]. Every task resolves to exactly one
+/// outcome (`Dismissed` when its dialog was cancelled) so the worker's
+/// in-flight flag always clears.
+enum FileOutcome {
+    OpenedProject {
+        path: PathBuf,
+        result: Result<Project, String>,
+    },
+    SavedProject {
+        path: PathBuf,
+        result: Result<(), String>,
+    },
+    ImportedWasm {
+        name: String,
+        bytes: Vec<u8>,
+    },
+    ImportedBlob {
+        operator_name: &'static str,
+        output_base: &'static str,
+        bytes: Vec<u8>,
+    },
+    /// A message for the status line (export results, read failures).
+    Status(String),
+    /// Dialog cancelled — nothing to apply.
+    Dismissed,
+}
+
+/// Converts a queued [`FileAction`] into a self-contained [`FileTask`],
+/// snapshotting whatever app/session state the task needs (preview
+/// triangles, asset bytes, the project itself). Returns `None` when the
+/// action can't proceed (with the reason on the status line).
+fn gather_file_task(
+    app: &mut VolumetricUiV2,
+    session: &Session,
+    action: FileAction,
+) -> Option<FileTask> {
     match action {
-        FileAction::OpenProject => {
-            if let Some(path) = rfd::FileDialog::new()
-                .add_filter("Project", &["vproj"])
-                .pick_file()
-            {
-                app.open_project_file(&path);
-            }
-        }
-        FileAction::SaveProject => {
-            if let Some(path) = rfd::FileDialog::new()
-                .add_filter("Project", &["vproj"])
-                .set_file_name("project.vproj")
-                .save_file()
-            {
-                app.save_project_file(&ensure_extension(path, "vproj"));
-            }
-        }
+        FileAction::OpenProject => Some(FileTask::OpenProject),
+        FileAction::SaveProject => Some(FileTask::SaveProject {
+            project: app.project().clone(),
+            path: None,
+        }),
+        FileAction::SaveProjectTo(path) => Some(FileTask::SaveProject {
+            project: app.project().clone(),
+            path: Some(path),
+        }),
         FileAction::ExportStl(id) => {
             let triangles = session.preview_triangles(&id);
             if triangles.is_empty() {
                 app.set_status(format!(
                     "no preview mesh for {id} — view it in a mesh render mode first"
                 ));
-                return;
+                return None;
             }
-            let Some(path) = rfd::FileDialog::new()
-                .add_filter("STL", &["stl"])
-                .set_file_name(format!("{id}.stl"))
-                .save_file()
-            else {
-                return;
-            };
-            let path = ensure_extension(path, "stl");
-            match volumetric::stl::write_binary_stl(&path, &triangles, "volumetric") {
-                Ok(()) => app.set_status(format!(
-                    "exported {} triangles to {}",
-                    triangles.len(),
-                    path.display()
-                )),
-                Err(err) => app.set_status(format!("failed to export STL: {err}")),
-            }
+            Some(FileTask::ExportStl { id, triangles })
         }
         FileAction::ExportWasm(id) => {
-            // Grab the bytes (stable Arc) up front so the borrow doesn't span
-            // the blocking dialog.
             let Some(bytes) = app
                 .runtime_assets()
                 .iter()
@@ -488,27 +546,98 @@ fn handle_file_action(app: &mut VolumetricUiV2, session: &Session, action: FileA
                 .map(|asset| asset.data_arc())
             else {
                 app.set_status(format!("no runtime asset {id} — run the project first"));
-                return;
+                return None;
             };
+            Some(FileTask::ExportWasm { id, bytes })
+        }
+        FileAction::ImportWasm => Some(FileTask::ImportWasm),
+        FileAction::ImportStl => Some(FileTask::ImportBlob {
+            filter_name: "STL",
+            extensions: &["stl"],
+            operator_name: "stl_import_operator",
+            output_base: "stl_import",
+        }),
+        FileAction::ImportImage => Some(FileTask::ImportBlob {
+            filter_name: "Images",
+            extensions: &["png", "jpg", "jpeg", "bmp", "gif"],
+            operator_name: "image_model_operator",
+            output_base: "image",
+        }),
+    }
+}
+
+/// Runs a file task to completion: dialog (if any), then disk I/O. Executes
+/// on a file-worker thread — never on the UI thread, where a long dialog or
+/// a slow disk would stall the event loop past the Wayland ping deadline.
+/// (rfd's portal-backed Linux dialogs are fine off the main thread; macOS
+/// would want dialogs on the main thread per rfd's docs.)
+fn perform_file_task(task: FileTask) -> FileOutcome {
+    match task {
+        FileTask::OpenProject => {
+            let Some(path) = rfd::FileDialog::new()
+                .add_filter("Project", &["vproj"])
+                .pick_file()
+            else {
+                return FileOutcome::Dismissed;
+            };
+            let result = Project::load_from_file(&path).map_err(|err| err.to_string());
+            FileOutcome::OpenedProject { path, result }
+        }
+        FileTask::SaveProject { project, path } => {
+            let path = match path {
+                Some(path) => path,
+                None => {
+                    let Some(picked) = rfd::FileDialog::new()
+                        .add_filter("Project", &["vproj"])
+                        .set_file_name("project.vproj")
+                        .save_file()
+                    else {
+                        return FileOutcome::Dismissed;
+                    };
+                    ensure_extension(picked, "vproj")
+                }
+            };
+            let result = project.save_to_file(&path).map_err(|err| err.to_string());
+            FileOutcome::SavedProject { path, result }
+        }
+        FileTask::ExportStl { id, triangles } => {
+            let Some(path) = rfd::FileDialog::new()
+                .add_filter("STL", &["stl"])
+                .set_file_name(format!("{id}.stl"))
+                .save_file()
+            else {
+                return FileOutcome::Dismissed;
+            };
+            let path = ensure_extension(path, "stl");
+            match volumetric::stl::write_binary_stl(&path, &triangles, "volumetric") {
+                Ok(()) => FileOutcome::Status(format!(
+                    "exported {} triangles to {}",
+                    triangles.len(),
+                    path.display()
+                )),
+                Err(err) => FileOutcome::Status(format!("failed to export STL: {err}")),
+            }
+        }
+        FileTask::ExportWasm { id, bytes } => {
             let Some(path) = rfd::FileDialog::new()
                 .add_filter("WASM", &["wasm"])
                 .set_file_name(format!("{id}.wasm"))
                 .save_file()
             else {
-                return;
+                return FileOutcome::Dismissed;
             };
             let path = ensure_extension(path, "wasm");
             match std::fs::write(&path, bytes.as_slice()) {
-                Ok(()) => app.set_status(format!("exported {}", path.display())),
-                Err(err) => app.set_status(format!("failed to export WASM: {err}")),
+                Ok(()) => FileOutcome::Status(format!("exported {}", path.display())),
+                Err(err) => FileOutcome::Status(format!("failed to export WASM: {err}")),
             }
         }
-        FileAction::ImportWasm => {
+        FileTask::ImportWasm => {
             let Some(path) = rfd::FileDialog::new()
                 .add_filter("WASM", &["wasm"])
                 .pick_file()
             else {
-                return;
+                return FileOutcome::Dismissed;
             };
             let name = path
                 .file_stem()
@@ -516,40 +645,100 @@ fn handle_file_action(app: &mut VolumetricUiV2, session: &Session, action: FileA
                 .unwrap_or("model")
                 .to_string();
             match std::fs::read(&path) {
-                Ok(bytes) => app.import_model_wasm(&name, bytes),
-                Err(err) => app.set_status(format!("failed to read WASM file: {err}")),
+                Ok(bytes) => FileOutcome::ImportedWasm { name, bytes },
+                Err(err) => FileOutcome::Status(format!("failed to read WASM file: {err}")),
             }
         }
-        FileAction::ImportStl => {
-            import_blob_file(app, ("STL", &["stl"]), "stl_import_operator", "stl_import");
-        }
-        FileAction::ImportImage => {
-            import_blob_file(
-                app,
-                ("Images", &["png", "jpg", "jpeg", "bmp", "gif"]),
-                "image_model_operator",
-                "image",
-            );
+        FileTask::ImportBlob {
+            filter_name,
+            extensions,
+            operator_name,
+            output_base,
+        } => {
+            let Some(path) = rfd::FileDialog::new()
+                .add_filter(filter_name, extensions)
+                .pick_file()
+            else {
+                return FileOutcome::Dismissed;
+            };
+            match std::fs::read(&path) {
+                Ok(bytes) => FileOutcome::ImportedBlob {
+                    operator_name,
+                    output_base,
+                    bytes,
+                },
+                Err(err) => {
+                    FileOutcome::Status(format!("failed to read {}: {err}", path.display()))
+                }
+            }
         }
     }
 }
 
-/// Shared pick-and-read path for Blob-input imports (STL, image).
-fn import_blob_file(
-    app: &mut VolumetricUiV2,
-    (filter_name, extensions): (&str, &[&str]),
-    operator_name: &str,
-    output_base: &str,
-) {
-    let Some(path) = rfd::FileDialog::new()
-        .add_filter(filter_name, extensions)
-        .pick_file()
-    else {
-        return;
-    };
-    match std::fs::read(&path) {
-        Ok(bytes) => app.import_blob_asset(operator_name, output_base, bytes),
-        Err(err) => app.set_status(format!("failed to read {}: {err}", path.display())),
+/// Routes a finished file operation back into the app (UI thread).
+fn apply_file_outcome(app: &mut VolumetricUiV2, outcome: FileOutcome) {
+    match outcome {
+        FileOutcome::OpenedProject { path, result } => app.apply_opened_project(path, result),
+        FileOutcome::SavedProject { path, result } => app.apply_saved_project(path, result),
+        FileOutcome::ImportedWasm { name, bytes } => app.import_model_wasm(&name, bytes),
+        FileOutcome::ImportedBlob {
+            operator_name,
+            output_base,
+            bytes,
+        } => app.import_blob_asset(operator_name, output_base, bytes),
+        FileOutcome::Status(status) => app.set_status(status),
+        FileOutcome::Dismissed => {}
+    }
+}
+
+/// Runs file tasks on short-lived worker threads, one at a time. Each task
+/// reports exactly one [`FileOutcome`] through the channel and pings the
+/// event loop proxy so the result is applied promptly even from `Wait`.
+struct FileWorker {
+    outcome_tx: Sender<FileOutcome>,
+    outcomes: Receiver<FileOutcome>,
+    proxy: EventLoopProxy<()>,
+    in_flight: bool,
+}
+
+impl FileWorker {
+    fn new(proxy: EventLoopProxy<()>) -> Self {
+        let (outcome_tx, outcomes) = mpsc::channel();
+        Self {
+            outcome_tx,
+            outcomes,
+            proxy,
+            in_flight: false,
+        }
+    }
+
+    fn in_flight(&self) -> bool {
+        self.in_flight
+    }
+
+    fn spawn(&mut self, task: FileTask) {
+        self.in_flight = true;
+        let tx = self.outcome_tx.clone();
+        let proxy = self.proxy.clone();
+        thread::Builder::new()
+            .name("volumetric-file-worker".to_string())
+            .spawn(move || {
+                let _ = tx.send(perform_file_task(task));
+                let _ = proxy.send_event(());
+            })
+            .expect("spawn file worker");
+    }
+
+    fn drain(&mut self) -> Vec<FileOutcome> {
+        let mut outcomes = Vec::new();
+        while let Ok(outcome) = self.outcomes.try_recv() {
+            outcomes.push(outcome);
+        }
+        // One task in flight at a time: any outcome means it finished.
+        if !outcomes.is_empty() {
+            self.in_flight = false;
+        }
+        outcomes
     }
 }
 
@@ -675,5 +864,51 @@ mod tests {
         assert_eq!(generation, 7);
         let assets = result.expect("default project runs cleanly");
         assert_eq!(assets.len(), 1);
+    }
+
+    /// The dialog-less re-save task writes the file and reports the saved
+    /// path — the whole known-path Save flow minus the UI thread.
+    #[test]
+    fn save_task_with_known_path_writes_off_thread() {
+        let path = std::env::temp_dir().join(format!(
+            "volumetric_ui_v2_file_worker_{}.vproj",
+            std::process::id()
+        ));
+        let project = VolumetricUiV2::default().project().clone();
+
+        let outcome = perform_file_task(FileTask::SaveProject {
+            project,
+            path: Some(path.clone()),
+        });
+
+        let FileOutcome::SavedProject {
+            path: saved,
+            result,
+        } = outcome
+        else {
+            panic!("save task should report SavedProject");
+        };
+        assert_eq!(saved, path);
+        result.expect("save succeeds");
+        assert!(path.exists());
+
+        let mut app = VolumetricUiV2::default();
+        apply_file_outcome(
+            &mut app,
+            FileOutcome::SavedProject {
+                path: saved,
+                result: Ok(()),
+            },
+        );
+        // A later Save re-saves in place through the worker (no dialog).
+        app.on_event(
+            UiEvent::synthetic_click(crate::SAVE_PROJECT_KEY),
+            &EventCx::new(),
+        );
+        assert_eq!(
+            app.take_file_action(),
+            Some(FileAction::SaveProjectTo(path.clone()))
+        );
+        std::fs::remove_file(&path).ok();
     }
 }

@@ -496,7 +496,10 @@ struct LuaForm {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FileAction {
     OpenProject,
+    /// Save with a path dialog (first save / Save As).
     SaveProject,
+    /// Re-save in place to the known project path (no dialog).
+    SaveProjectTo(std::path::PathBuf),
     /// Export the cached preview mesh of the named output as binary STL.
     ExportStl(String),
     /// Export the named output's model WASM bytes verbatim.
@@ -1345,33 +1348,61 @@ impl VolumetricUiV2 {
         self.pending_file_action.take()
     }
 
-    /// Replaces the project with one loaded from disk and queues a run so its
-    /// outputs materialize. Called by the host after its Open dialog.
-    pub(crate) fn open_project_file(&mut self, path: &std::path::Path) {
-        match Project::load_from_file(path) {
+    /// Applies a project the host's file worker loaded off-thread: swaps it
+    /// in and queues a run so its outputs materialize.
+    pub(crate) fn apply_opened_project(
+        &mut self,
+        path: std::path::PathBuf,
+        result: Result<Project, String>,
+    ) {
+        match result {
             Ok(project) => {
                 self.project = project;
                 self.selected_export = None;
                 self.selected_project_item = None;
                 self.clear_runtime_assets();
                 self.request_run();
-                self.project_path = Some(path.to_path_buf());
                 self.status = format!("opened {}", path.display());
+                self.project_path = Some(path);
             }
             Err(err) => self.status = format!("failed to open project: {err}"),
         }
     }
 
-    /// Saves the project to disk. Called by the host after its Save dialog,
-    /// or directly by Save when the path is already known.
-    pub(crate) fn save_project_file(&mut self, path: &std::path::Path) {
-        match self.project.save_to_file(path) {
+    /// Applies the result of a save the host's file worker performed
+    /// off-thread; a successful save pins the path for one-click re-saves.
+    pub(crate) fn apply_saved_project(
+        &mut self,
+        path: std::path::PathBuf,
+        result: Result<(), String>,
+    ) {
+        match result {
             Ok(()) => {
-                self.project_path = Some(path.to_path_buf());
                 self.status = format!("saved {}", path.display());
+                self.project_path = Some(path);
             }
             Err(err) => self.status = format!("failed to save project: {err}"),
         }
+    }
+
+    /// Loads a project from disk inline and applies it. Test convenience —
+    /// the host shell routes disk I/O through its file worker instead.
+    #[cfg(test)]
+    pub(crate) fn open_project_file(&mut self, path: &std::path::Path) {
+        let result = Project::load_from_file(path).map_err(|err| err.to_string());
+        self.apply_opened_project(path.to_path_buf(), result);
+    }
+
+    /// Saves the project to disk inline and applies the outcome. Test
+    /// convenience — the host shell routes disk I/O through its file worker
+    /// instead.
+    #[cfg(test)]
+    pub(crate) fn save_project_file(&mut self, path: &std::path::Path) {
+        let result = self
+            .project
+            .save_to_file(path)
+            .map_err(|err| err.to_string());
+        self.apply_saved_project(path.to_path_buf(), result);
     }
 
     /// Status line for host-side operations (e.g. STL export results).
@@ -2412,12 +2443,13 @@ impl App for VolumetricUiV2 {
         }
 
         if event.is_click_or_activate(SAVE_PROJECT_KEY) {
-            // Re-save in place when the path is known; first save asks.
-            if let Some(path) = self.project_path.clone() {
-                self.save_project_file(&path);
-            } else {
-                self.pending_file_action = Some(FileAction::SaveProject);
-            }
+            // Re-save in place when the path is known; first save asks. Both
+            // go through the host's file worker — disk writes don't belong
+            // on the UI thread any more than dialogs do.
+            self.pending_file_action = Some(match self.project_path.clone() {
+                Some(path) => FileAction::SaveProjectTo(path),
+                None => FileAction::SaveProject,
+            });
             self.open_menu = None;
             return;
         }
@@ -5326,11 +5358,13 @@ mod tests {
         let mut app = VolumetricUiV2::default();
         app.save_project_file(&path);
 
-        // Save re-saves in place; no dialog queued.
-        app.status.clear();
+        // Save re-saves in place: the known path is queued for the host's
+        // file worker, no dialog variant.
         dispatch(&mut app, UiEvent::synthetic_click(SAVE_PROJECT_KEY));
-        assert_eq!(app.take_file_action(), None);
-        assert!(app.status.starts_with("saved"), "{}", app.status);
+        assert_eq!(
+            app.take_file_action(),
+            Some(FileAction::SaveProjectTo(path.clone()))
+        );
 
         // Save As always asks.
         dispatch(&mut app, UiEvent::synthetic_click(SAVE_PROJECT_AS_KEY));
