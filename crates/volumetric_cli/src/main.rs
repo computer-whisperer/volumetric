@@ -364,6 +364,7 @@ pub fn build_mesh_config(
         normal_epsilon_frac: normal_epsilon,
         num_threads: 0,
         sharp_features,
+        edge_constrained_refinement: false,
     }
 }
 

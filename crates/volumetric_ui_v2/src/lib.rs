@@ -204,6 +204,11 @@ pub struct Asn2Settings {
     /// Sharp features: max same-region normal jump between adjacent
     /// vertices, in whole degrees (10-90).
     pub sharp_angle_degrees: u16,
+    /// Constrain vertex refinement to each vertex's own grid edge. Prevents
+    /// refinement from capturing a neighboring parallel surface — the fix
+    /// for thin lattice sheets visually bonding together — at the cost of
+    /// slightly more quantized vertex placement.
+    pub edge_constrained_refinement: bool,
 }
 
 impl Default for Asn2Settings {
@@ -213,6 +218,7 @@ impl Default for Asn2Settings {
             normal_sample_iterations: 0,
             sharp_edges: true,
             sharp_angle_degrees: 15,
+            edge_constrained_refinement: false,
         }
     }
 }
@@ -353,6 +359,7 @@ impl PreviewMeshPlan {
             normal_sample_iterations: settings.normal_sample_iterations,
             normal_epsilon_frac: 0.1,
             num_threads: 0,
+            edge_constrained_refinement: settings.edge_constrained_refinement,
             sharp_features: settings.sharp_edges.then(|| {
                 let mut sharp = volumetric::sharp_features::SharpFeatureConfig::default();
                 sharp.segmentation.max_normal_jump_deg = f64::from(settings.sharp_angle_degrees);
@@ -983,6 +990,7 @@ impl VolumetricUiV2 {
             }
             "nr" => asn2.normal_sample_iterations = step_usize(asn2.normal_sample_iterations),
             "sharp" => asn2.sharp_edges = !asn2.sharp_edges,
+            "edgec" => asn2.edge_constrained_refinement = !asn2.edge_constrained_refinement,
             "angle" => {
                 let next = i32::from(asn2.sharp_angle_degrees) + if up { 5 } else { -5 };
                 asn2.sharp_angle_degrees = next.clamp(10, 90) as u16;
@@ -3316,6 +3324,19 @@ fn model3d_settings(
             )
             .gap(tokens::SPACE_2),
         );
+        // Refine vertices only along their own grid edge: prevents thin
+        // lattice sheets from visually bonding when refinement captures a
+        // neighboring parallel surface.
+        body.push(
+            field_row(
+                "Edge-constrained",
+                switch(
+                    format!("{OUTPUT_ASN2_PREFIX}{id}:edgec:up"),
+                    asn2.edge_constrained_refinement,
+                ),
+            )
+            .gap(tokens::SPACE_2),
+        );
         if asn2.sharp_edges {
             body.push(asn2_stepper_row(
                 id,
@@ -5293,6 +5314,12 @@ mod tests {
             &mut app,
             UiEvent::synthetic_click(format!("{OUTPUT_ASN2_PREFIX}{id}:sharp:up")),
         );
+        // Edge-constrained refinement defaults off; the toggle inverts.
+        assert!(!asn2.edge_constrained_refinement);
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{OUTPUT_ASN2_PREFIX}{id}:edgec:up")),
+        );
         assert_eq!(asn2.vertex_refinement_iterations, 7);
         assert_eq!(asn2.sharp_angle_degrees, 20);
 
@@ -5309,6 +5336,7 @@ mod tests {
             .adaptive_surface_nets_config()
             .expect("asn2 config");
         assert_eq!(config.vertex_refinement_iterations, 7);
+        assert!(config.edge_constrained_refinement);
         let sharp = config.sharp_features.expect("sharp features enabled");
         assert!((sharp.segmentation.max_normal_jump_deg - 20.0).abs() < 1e-9);
     }

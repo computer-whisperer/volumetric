@@ -55,6 +55,7 @@ pub fn mesh_shape_with_margin(
         normal_epsilon_frac: 0.1,
         num_threads: 0,
         sharp_features: None,
+        edge_constrained_refinement: false,
     };
     let finest_cells = config.base_resolution * (1 << config.max_depth);
     let cell = (hi - lo).max_element() / finest_cells as f64;

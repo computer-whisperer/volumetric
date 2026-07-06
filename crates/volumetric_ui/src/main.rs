@@ -343,6 +343,7 @@ fn execute_resample(
                 normal_epsilon_frac: config.asn2_normal_epsilon_frac,
                 num_threads: 0,
                 sharp_features: config.asn2_sharp_features.clone(),
+                edge_constrained_refinement: false,
             };
             match generate_adaptive_mesh_v2_from_bytes(&wasm_bytes, &asn2_config) {
                 Ok(meshing_result) => {
@@ -461,6 +462,7 @@ fn execute_resample(
                 normal_epsilon_frac: config.asn2_normal_epsilon_frac,
                 num_threads: 0, // Web is single-threaded
                 sharp_features: config.asn2_sharp_features.clone(),
+                edge_constrained_refinement: false,
             };
             match generate_adaptive_mesh_v2_from_bytes(&wasm_bytes, &asn2_config) {
                 Ok(meshing_result) => {

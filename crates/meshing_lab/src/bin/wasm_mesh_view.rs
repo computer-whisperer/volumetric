@@ -54,6 +54,7 @@ fn main() {
         normal_epsilon_frac: 0.1,
         num_threads: 0,
         sharp_features: sharp.then(SharpFeatureConfig::default),
+        edge_constrained_refinement: args.iter().any(|a| a == "--edge-constrained"),
     };
 
     let result = volumetric::generate_adaptive_mesh_v2_from_bytes(&wasm_bytes, &config)

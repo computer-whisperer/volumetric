@@ -236,6 +236,17 @@ mod parallel_iter {
     {
         range.into_iter().map(f).collect()
     }
+
+    /// Sort a slice in parallel (native) or sequentially (web).
+    #[cfg(feature = "native")]
+    pub fn sort_unstable<T: Ord + Send>(items: &mut [T]) {
+        items.par_sort_unstable();
+    }
+
+    #[cfg(not(feature = "native"))]
+    pub fn sort_unstable<T: Ord>(items: &mut [T]) {
+        items.sort_unstable();
+    }
 }
 
 /// Marker trait for sampler functions used in adaptive surface nets.
@@ -293,6 +304,19 @@ pub struct AdaptiveMeshConfig2 {
     /// corner snapping; see [`crate::sharp_features`]).
     /// When None (default), the stage-4 output is used as-is.
     pub sharp_features: Option<SharpFeatureConfig>,
+
+    /// Constrain vertex refinement to each vertex's own grid edge.
+    ///
+    /// Free refinement (the default) searches ±1 cell along the accumulated
+    /// normal and all three axes and keeps the nearest crossing. On models
+    /// with parallel surfaces closer together than a cell — thin-walled
+    /// lattices — that search can capture the *neighboring* surface and
+    /// visually bond the two sheets. Edge-constrained mode binary-searches
+    /// only along the sign-changing grid edge that produced the vertex, so
+    /// the vertex can never leave its edge: immune to wrong-surface capture
+    /// and ~4x fewer samples, at the cost of slightly more quantized vertex
+    /// placement (marching-cubes-like instead of free-floating).
+    pub edge_constrained_refinement: bool,
 }
 
 impl Default for AdaptiveMeshConfig2 {
@@ -306,6 +330,7 @@ impl Default for AdaptiveMeshConfig2 {
             normal_epsilon_frac: 0.1,
             num_threads: 0,
             sharp_features: None, // Disabled by default
+            edge_constrained_refinement: false,
         }
     }
 }
@@ -418,7 +443,9 @@ impl CuboidId {
 ///
 /// **CRITICAL**: All coordinates are INTEGER positions in finest-level units.
 /// EdgeIds must be computed via CuboidId::edge_id(), never from floats.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// The `Ord` derive gives an arbitrary-but-deterministic total order used by
+/// stage 3 to assign vertex indices via parallel sort.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct EdgeId {
     /// X coordinate of minimum corner (in finest-level units)
     pub x: i32,
@@ -450,6 +477,28 @@ impl EdgeId {
             bounds_min.1 + my * cell_size.1,
             bounds_min.2 + mz * cell_size.2,
         )
+    }
+
+    /// Compute the world-space positions of this edge's two endpoints
+    /// (the two cell corners the edge connects, in min → max order).
+    pub fn endpoints_world_pos(
+        &self,
+        bounds_min: (f64, f64, f64),
+        cell_size: (f64, f64, f64),
+    ) -> ((f64, f64, f64), (f64, f64, f64)) {
+        let a = (
+            bounds_min.0 + self.x as f64 * cell_size.0,
+            bounds_min.1 + self.y as f64 * cell_size.1,
+            bounds_min.2 + self.z as f64 * cell_size.2,
+        );
+        let mut b = a;
+        match self.axis {
+            0 => b.0 += cell_size.0,
+            1 => b.1 += cell_size.1,
+            2 => b.2 += cell_size.2,
+            _ => unreachable!(),
+        }
+        (a, b)
     }
 }
 
@@ -1516,8 +1565,9 @@ pub struct Stage3Result {
     pub accumulated_normals: Vec<(f64, f64, f64)>,
     /// Triangle indices (groups of 3)
     pub indices: Vec<u32>,
-    /// Mapping from EdgeId to vertex index (for debugging/verification)
-    pub edge_to_vertex: std::collections::HashMap<EdgeId, u32>,
+    /// The grid edge that owns each vertex (indexed by vertex index, sorted
+    /// by EdgeId order). Used by edge-constrained vertex refinement.
+    pub vertex_edges: Vec<EdgeId>,
 }
 
 /// Compute the face normal for a triangle (not normalized).
@@ -1545,83 +1595,48 @@ fn compute_face_normal(
 /// vertex indices and accumulated face normals.
 ///
 /// # Algorithm
-/// 1. Collect all unique EdgeIds and assign monotonic vertex indices
+/// 1. Collect unique EdgeIds via parallel sort + dedup; a vertex's index is
+///    its edge's position in the sorted order (deterministic). This replaced
+///    a serial HashMap pass that dominated stage-3 time on large meshes.
 /// 2. Compute initial vertex positions from edge midpoints
-/// 3. Rewrite triangle indices from EdgeIds to vertex indices
+/// 3. Rewrite triangle indices from EdgeIds to vertex indices (binary search)
 /// 4. Compute and accumulate face normals per vertex
 fn stage3_topology_finalization(
     sparse_triangles: Vec<SparseTriangle>,
     bounds_min: (f64, f64, f64),
     cell_size: (f64, f64, f64),
 ) -> Stage3Result {
-    use std::collections::HashMap;
-
-    // Step 1: Collect unique EdgeIds and assign monotonic indices
-    let mut edge_to_vertex: HashMap<EdgeId, u32> = HashMap::new();
-    let mut next_vertex_idx = 0u32;
-
+    // Step 1: Unique EdgeIds, sorted; index in this Vec = vertex index.
+    let mut vertex_edges: Vec<EdgeId> = Vec::with_capacity(sparse_triangles.len() * 3);
     for tri in &sparse_triangles {
-        for edge_id in &tri.vertices {
-            edge_to_vertex.entry(*edge_id).or_insert_with(|| {
-                let idx = next_vertex_idx;
-                next_vertex_idx += 1;
-                idx
-            });
-        }
+        vertex_edges.extend_from_slice(&tri.vertices);
     }
-
-    let vertex_count = next_vertex_idx as usize;
+    parallel_iter::sort_unstable(&mut vertex_edges);
+    vertex_edges.dedup();
 
     // Step 2: Compute initial vertex positions from edge midpoints
-    let mut vertices: Vec<(f64, f64, f64)> = vec![(0.0, 0.0, 0.0); vertex_count];
-
-    for (edge_id, &vertex_idx) in &edge_to_vertex {
-        let pos = edge_id.midpoint_world_pos(bounds_min, cell_size);
-        vertices[vertex_idx as usize] = pos;
-    }
+    let vertices: Vec<(f64, f64, f64)> = parallel_iter::map_range(0..vertex_edges.len(), |i| {
+        vertex_edges[i].midpoint_world_pos(bounds_min, cell_size)
+    });
 
     // Step 3: Rewrite triangle indices
-    let mut indices: Vec<u32> = Vec::with_capacity(sparse_triangles.len() * 3);
-
-    for tri in &sparse_triangles {
-        indices.push(edge_to_vertex[&tri.vertices[0]]);
-        indices.push(edge_to_vertex[&tri.vertices[1]]);
-        indices.push(edge_to_vertex[&tri.vertices[2]]);
-    }
+    let index_triples: Vec<[u32; 3]> = parallel_iter::map_vec(sparse_triangles, |tri| {
+        tri.vertices.map(|edge_id| {
+            vertex_edges
+                .binary_search(&edge_id)
+                .expect("every triangle edge is in the sorted unique-edge list") as u32
+        })
+    });
+    let indices: Vec<u32> = index_triples.into_iter().flatten().collect();
 
     // Step 4: Compute and accumulate face normals per vertex
-    let mut accumulated_normals: Vec<(f64, f64, f64)> = vec![(0.0, 0.0, 0.0); vertex_count];
-
-    for tri_idx in 0..(indices.len() / 3) {
-        let i0 = indices[tri_idx * 3] as usize;
-        let i1 = indices[tri_idx * 3 + 1] as usize;
-        let i2 = indices[tri_idx * 3 + 2] as usize;
-
-        let v0 = vertices[i0];
-        let v1 = vertices[i1];
-        let v2 = vertices[i2];
-
-        let face_normal = compute_face_normal(v0, v1, v2);
-
-        // Accumulate to each vertex (area-weighted by virtue of unnormalized cross product)
-        accumulated_normals[i0].0 += face_normal.0;
-        accumulated_normals[i0].1 += face_normal.1;
-        accumulated_normals[i0].2 += face_normal.2;
-
-        accumulated_normals[i1].0 += face_normal.0;
-        accumulated_normals[i1].1 += face_normal.1;
-        accumulated_normals[i1].2 += face_normal.2;
-
-        accumulated_normals[i2].0 += face_normal.0;
-        accumulated_normals[i2].1 += face_normal.1;
-        accumulated_normals[i2].2 += face_normal.2;
-    }
+    let accumulated_normals = recompute_accumulated_normals(&vertices, &indices);
 
     Stage3Result {
         vertices,
         accumulated_normals,
         indices,
-        edge_to_vertex,
+        vertex_edges,
     }
 }
 
@@ -2480,6 +2495,7 @@ pub struct Stage4Result {
 fn stage4_vertex_refinement<F>(
     stage3: Stage3Result,
     sampler: &F,
+    bounds_min: (f64, f64, f64),
     cell_size: (f64, f64, f64),
     config: &AdaptiveMeshConfig2,
     stats: &SamplingStats,
@@ -2502,7 +2518,36 @@ where
     // =========================================================================
     // Phase 4a: Vertex Position Refinement
     // =========================================================================
-    let refined_positions: Vec<(f64, f64, f64)> = if config.vertex_refinement_iterations > 0 {
+    let refined_positions: Vec<(f64, f64, f64)> = if config.vertex_refinement_iterations == 0 {
+        stage3.vertices.clone()
+    } else if config.edge_constrained_refinement {
+        // Binary search along the vertex's own grid edge. The edge was
+        // emitted because its corner samples disagree, so the crossing
+        // bracket is known up front — and the vertex can never be captured
+        // by a neighboring parallel surface (see the config field docs).
+        parallel_iter::map_range(0..vertex_count, |i| {
+            let (a, b) = stage3.vertex_edges[i].endpoints_world_pos(bounds_min, cell_size);
+            let inside_a = sample_is_inside(sampler, a.0, a.1, a.2, stats);
+            let inside_b = sample_is_inside(sampler, b.0, b.1, b.2, stats);
+            if inside_a == inside_b {
+                // Only possible with a non-deterministic sampler; keep the
+                // edge midpoint rather than searching a bracket with no
+                // guaranteed crossing.
+                stats.refine_miss.fetch_add(1, Ordering::Relaxed);
+                stage3.vertices[i]
+            } else {
+                stats.refine_primary_hit.fetch_add(1, Ordering::Relaxed);
+                binary_search_crossing(
+                    a,
+                    b,
+                    inside_a,
+                    config.vertex_refinement_iterations,
+                    sampler,
+                    stats,
+                )
+            }
+        })
+    } else {
         parallel_iter::map_range(0..vertex_count, |i| {
             let initial_pos = stage3.vertices[i];
             let accumulated_normal = stage3.accumulated_normals[i];
@@ -2537,8 +2582,6 @@ where
 
             pos
         })
-    } else {
-        stage3.vertices.clone()
     };
 
     // =========================================================================
@@ -2832,8 +2875,14 @@ where
     // Stage 4: Vertex refinement & normal estimation
     let stage4_start = Instant::now();
     let samples_before_stage4 = stats.total_samples.load(Ordering::Relaxed);
-    let stage4_result =
-        stage4_vertex_refinement(stage3_result, &sampler, cell_size, config, &stats);
+    let stage4_result = stage4_vertex_refinement(
+        stage3_result,
+        &sampler,
+        bounds_min_f64,
+        cell_size,
+        config,
+        &stats,
+    );
     let stage4_time = stage4_start.elapsed().as_secs_f64();
     let stage4_samples = stats.total_samples.load(Ordering::Relaxed) - samples_before_stage4;
 
@@ -2967,8 +3016,14 @@ where
     // Stage 4: Vertex refinement & normal estimation
     let stage4_start = Instant::now();
     let samples_before_stage4 = stats.total_samples.load(Ordering::Relaxed);
-    let stage4_result =
-        stage4_vertex_refinement(stage3_result, &sampler, cell_size, config, &stats);
+    let stage4_result = stage4_vertex_refinement(
+        stage3_result,
+        &sampler,
+        bounds_min_f64,
+        cell_size,
+        config,
+        &stats,
+    );
     let stage4_time = stage4_start.elapsed().as_secs_f64();
     let stage4_samples = stats.total_samples.load(Ordering::Relaxed) - samples_before_stage4;
 
@@ -3842,5 +3897,84 @@ mod tests {
             mesh.normals.len(),
             "Vertex and normal counts should match"
         );
+    }
+
+    // =========================================================================
+    // Edge-Constrained Refinement Tests
+    // =========================================================================
+
+    #[test]
+    fn edge_constrained_refinement_stays_on_owning_edge() {
+        // Two parallel z-normal slabs, a few cells apart. Every surface
+        // crossing is on a z-axis grid edge, so with edge-constrained
+        // refinement each vertex must keep exact grid-aligned x/y and refine
+        // z onto one of the four slab faces — it can never wander toward
+        // (or bond with) the neighboring slab.
+        let slabs = |_x: f64, _y: f64, z: f64| -> f32 {
+            if (0.20..=0.30).contains(&z) || (0.45..=0.55).contains(&z) {
+                1.0
+            } else {
+                0.0
+            }
+        };
+        let config = AdaptiveMeshConfig2 {
+            base_resolution: 8,
+            max_depth: 1, // 16 cells per axis, cell = 0.0625
+            vertex_refinement_iterations: 12,
+            edge_constrained_refinement: true,
+            ..Default::default()
+        };
+        let result = adaptive_surface_nets_2(slabs, (0.0, 0.0, 0.0), (1.0, 1.0, 1.0), &config);
+        let mesh = &result.mesh;
+        assert!(!mesh.vertices.is_empty(), "Should mesh the slabs");
+        assert_eq!(result.stats.stage4_refine_miss, 0, "Brackets are known");
+
+        let cell = 1.0 / 16.0;
+        let on_grid = |v: f32| -> bool {
+            let steps = f64::from(v) / cell;
+            (steps - steps.round()).abs() < 1e-6
+        };
+        let slab_faces = [0.20, 0.30, 0.45, 0.55];
+        for (i, v) in mesh.vertices.iter().enumerate() {
+            assert!(
+                on_grid(v.0) && on_grid(v.1),
+                "Vertex {i} must keep grid-aligned x/y (z-edge), got {v:?}"
+            );
+            let dist_to_face = slab_faces
+                .iter()
+                .map(|f| (f64::from(v.2) - f).abs())
+                .fold(f64::MAX, f64::min);
+            assert!(
+                dist_to_face < 1e-3,
+                "Vertex {i} z should refine onto a slab face, got {v:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn edge_constrained_refinement_lands_on_sphere_surface() {
+        // On a smooth model, edge-constrained refinement must find the exact
+        // surface crossing along each vertex's own edge: every refined vertex
+        // sits on the unit sphere to binary-search precision.
+        let config = AdaptiveMeshConfig2 {
+            base_resolution: 4,
+            max_depth: 2,
+            vertex_refinement_iterations: 12,
+            edge_constrained_refinement: true,
+            ..Default::default()
+        };
+        let result =
+            adaptive_surface_nets_2(sphere_sampler, (-2.0, -2.0, -2.0), (2.0, 2.0, 2.0), &config);
+        let mesh = &result.mesh;
+        assert!(!mesh.vertices.is_empty(), "Should mesh the sphere");
+        assert_eq!(result.stats.stage4_refine_miss, 0, "Brackets are known");
+        for (i, v) in mesh.vertices.iter().enumerate() {
+            let r =
+                (f64::from(v.0).powi(2) + f64::from(v.1).powi(2) + f64::from(v.2).powi(2)).sqrt();
+            assert!(
+                (r - 1.0).abs() < 1e-3,
+                "Vertex {i} should sit on the sphere surface, got r={r}"
+            );
+        }
     }
 }
