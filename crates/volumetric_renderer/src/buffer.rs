@@ -54,15 +54,30 @@ impl<T: Pod> DynamicBuffer<T> {
         self.capacity
     }
 
+    /// The most elements a buffer of `T` may hold under the device's
+    /// `max_buffer_size` limit.
+    pub fn max_elements(device: &wgpu::Device) -> usize {
+        (device.limits().max_buffer_size / std::mem::size_of::<T>().max(1) as u64) as usize
+    }
+
     /// Ensure the buffer can hold at least `required` elements.
-    /// Reallocates with 2x growth if needed.
+    /// Reallocates with 2x growth if needed. Both the growth headroom and
+    /// the required size are clamped to the device's `max_buffer_size`
+    /// limit — allocating past it is a wgpu validation panic.
     pub fn ensure_capacity(&mut self, device: &wgpu::Device, required: usize) {
         if required <= self.capacity {
             return;
         }
 
-        // Calculate new capacity with 2x growth, minimum 64 elements
-        let new_capacity = required.max(self.capacity * 2).max(64);
+        // Calculate new capacity with 2x growth, minimum 64 elements,
+        // clamped to the device limit.
+        let new_capacity = required
+            .max(self.capacity * 2)
+            .max(64)
+            .min(Self::max_elements(device));
+        if new_capacity <= self.capacity {
+            return; // Already at the device limit.
+        }
         let byte_size = new_capacity * std::mem::size_of::<T>();
 
         // Create new buffer
@@ -77,24 +92,26 @@ impl<T: Pod> DynamicBuffer<T> {
         self.capacity = new_capacity;
     }
 
-    /// Upload data to the GPU buffer. Reallocates if needed.
+    /// Upload data to the GPU buffer. Reallocates if needed. Data beyond
+    /// the device's `max_buffer_size` limit is dropped rather than
+    /// panicking wgpu.
     ///
-    /// Returns true if the buffer was reallocated.
-    pub fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, data: &[T]) -> bool {
+    /// Returns the number of elements actually uploaded.
+    pub fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, data: &[T]) -> usize {
         if data.is_empty() {
             self.len = 0;
-            return false;
+            return 0;
         }
 
-        let reallocated = data.len() > self.capacity;
         self.ensure_capacity(device, data.len());
+        let count = data.len().min(self.capacity);
 
         if let Some(buffer) = &self.buffer {
-            queue.write_buffer(buffer, 0, bytemuck::cast_slice(data));
+            queue.write_buffer(buffer, 0, bytemuck::cast_slice(&data[..count]));
         }
 
-        self.len = data.len();
-        reallocated
+        self.len = count;
+        count
     }
 
     /// Upload data starting at a specific offset (in elements).

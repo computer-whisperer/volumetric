@@ -740,6 +740,9 @@ pub struct VolumetricUiV2 {
     pipeline_open: std::collections::BTreeSet<String>,
     /// Meshing stats per built output, mirrored from the host's preview cache.
     output_stats: std::collections::BTreeMap<String, OutputStats>,
+    /// Geometry the viewport had to drop at the GPU buffer size limit,
+    /// mirrored from the renderer each frame; shown as a HUD warning.
+    viewport_overflow: Option<String>,
     /// The open 2D inspection lightbox, if any.
     lightbox: Option<LightboxState>,
     /// A queued file operation for the host to run (dialogs are host-side).
@@ -808,6 +811,7 @@ impl VolumetricUiV2 {
             // Steps carry the editing workflow; imports/exports start folded.
             pipeline_open: ["steps"].into_iter().map(str::to_string).collect(),
             output_stats: std::collections::BTreeMap::new(),
+            viewport_overflow: None,
             lightbox: None,
             pending_file_action: None,
             project_path: None,
@@ -1319,6 +1323,10 @@ impl VolumetricUiV2 {
 
     pub(crate) fn set_preview_build_status(&mut self, status: PreviewBuildStatus) {
         self.preview_build_status = status;
+    }
+
+    pub(crate) fn set_viewport_overflow(&mut self, message: Option<String>) {
+        self.viewport_overflow = message;
     }
 
     pub(crate) fn take_camera_command(&mut self) -> Option<ViewportCameraCommand> {
@@ -3554,6 +3562,9 @@ fn viewport_hud(app: &VolumetricUiV2) -> El {
                 .muted()
                 .xsmall(),
         );
+    }
+    if let Some(warning) = &app.viewport_overflow {
+        badges.push(badge(warning).destructive().xsmall());
     }
     badges.push(badge(&app.status).secondary().xsmall());
     badges.push(spacer());

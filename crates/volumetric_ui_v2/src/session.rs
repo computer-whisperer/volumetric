@@ -160,6 +160,7 @@ impl Session {
         let (status, preview_jobs) = self.viewport.preview_cache.sync(requests);
         app.set_preview_build_status(status);
         app.set_output_stats(self.viewport.preview_cache.output_stats());
+        app.set_viewport_overflow(self.viewport.frame_overflow_message());
         jobs.extend(preview_jobs.into_iter().map(BackgroundJob::BuildPreview));
 
         // Lightbox: dispatch sampling for a freshly opened inspection (or a
@@ -516,6 +517,12 @@ impl ViewportRenderer {
         self.preview_cache.accept(result);
     }
 
+    /// A user-facing description of geometry the last rendered frame had to
+    /// drop at the device's buffer size limit; `None` when everything fit.
+    fn frame_overflow_message(&self) -> Option<String> {
+        self.renderer.frame_overflow().map(overflow_message)
+    }
+
     /// Composites the cached meshes for the current output set into one scene,
     /// updating the camera: framing the union bounds when the output set changes
     /// or a Frame command is pending, and otherwise leaving the user's view. When
@@ -542,6 +549,36 @@ impl ViewportRenderer {
         }
         scene
     }
+}
+
+/// The HUD warning for a frame that dropped geometry at the GPU buffer
+/// size limit.
+fn overflow_message(overflow: &renderer::GeometryOverflow) -> String {
+    let mut dropped = Vec::new();
+    if overflow.dropped_mesh_vertices > 0 {
+        dropped.push(format!(
+            "{} of {} mesh vertices",
+            crate::format_count(overflow.dropped_mesh_vertices),
+            crate::format_count(overflow.total_mesh_vertices),
+        ));
+    }
+    if overflow.dropped_lines > 0 {
+        dropped.push(format!(
+            "{} lines",
+            crate::format_count(overflow.dropped_lines)
+        ));
+    }
+    if overflow.dropped_points > 0 {
+        dropped.push(format!(
+            "{} points",
+            crate::format_count(overflow.dropped_points)
+        ));
+    }
+    let limit_mib = overflow.max_buffer_bytes / (1024 * 1024);
+    format!(
+        "over the {limit_mib} MiB GPU buffer limit — dropped {}; reduce preview resolution",
+        dropped.join(", ")
+    )
 }
 
 struct ViewportTarget {
@@ -2208,6 +2245,24 @@ fn point_in_rect(rect: Option<Rect>, pos: (f32, f32)) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The GPU-limit HUD warning names each dropped geometry class and the
+    /// limit it hit.
+    #[test]
+    fn overflow_message_reads_well() {
+        let message = overflow_message(&renderer::GeometryOverflow {
+            dropped_mesh_vertices: 5_853_732,
+            total_mesh_vertices: 5_853_732,
+            dropped_lines: 1_200,
+            dropped_points: 0,
+            max_buffer_bytes: 256 * 1024 * 1024,
+        });
+        assert_eq!(
+            message,
+            "over the 256 MiB GPU buffer limit — dropped 5.9M of 5.9M mesh vertices, \
+             1.2k lines; reduce preview resolution"
+        );
+    }
 
     /// A single unit hex with a scalar node field, a vector node field
     /// (displacement) and a scalar element field, for FEA preview tests.

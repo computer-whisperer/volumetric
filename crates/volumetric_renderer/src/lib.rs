@@ -88,12 +88,108 @@ impl RendererCapabilities {
     }
 }
 
+/// Geometry dropped from a frame because it would have exceeded the
+/// device's `max_buffer_size` limit (creating a larger buffer is a wgpu
+/// validation panic). The renderer keeps whatever fits and reports the
+/// rest here; hosts should surface it so a silently sparse viewport is
+/// explainable.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GeometryOverflow {
+    /// Mesh vertices dropped (whole meshes are dropped, never partial ones).
+    pub dropped_mesh_vertices: usize,
+    /// Total mesh vertices submitted this frame.
+    pub total_mesh_vertices: usize,
+    /// Line instances dropped across the depth-tested and overlay passes.
+    pub dropped_lines: usize,
+    /// Point instances dropped across the depth-tested and overlay passes.
+    pub dropped_points: usize,
+    /// The device's buffer size limit the frame was clamped to.
+    pub max_buffer_bytes: u64,
+}
+
+impl GeometryOverflow {
+    /// Whether anything was actually dropped.
+    pub fn any(&self) -> bool {
+        self.dropped_mesh_vertices > 0 || self.dropped_lines > 0 || self.dropped_points > 0
+    }
+}
+
+/// Drops trailing items that don't fit in one buffer of `max_bytes`;
+/// returns how many were dropped.
+fn truncate_to_buffer_budget<T>(items: &mut Vec<T>, max_bytes: u64) -> usize {
+    let max_items = (max_bytes / std::mem::size_of::<T>().max(1) as u64) as usize;
+    if items.len() <= max_items {
+        return 0;
+    }
+    let dropped = items.len() - max_items;
+    items.truncate(max_items);
+    dropped
+}
+
 /// A submitted mesh for the current frame.
 struct SubmittedMesh {
     data: MeshData,
     transform: Mat4,
     #[allow(dead_code)]
     material: MaterialId,
+}
+
+/// Flattens submitted meshes into one world-space vertex (and index) soup,
+/// dropping whole meshes once either buffer budget would overflow — a
+/// partially uploaded indexed mesh would render as garbage, and buffers
+/// past the device limit are a validation panic. Earlier meshes keep
+/// rendering. Returns `(vertices, indices, use_indices, dropped_vertices,
+/// total_vertices)`.
+fn flatten_meshes_within_budget(
+    meshes: &[SubmittedMesh],
+    max_vertices: usize,
+    max_indices: usize,
+) -> (Vec<MeshVertex>, Vec<u32>, bool, usize, usize) {
+    let mut all_vertices = Vec::new();
+    let mut all_indices = Vec::new();
+    let mut use_indices = false;
+    let mut dropped_vertices = 0usize;
+    let mut total_vertices = 0usize;
+
+    for submitted in meshes {
+        let vertex_count = submitted.data.vertices.len();
+        let index_count = submitted.data.indices.as_ref().map_or(0, |i| i.len());
+        total_vertices += vertex_count;
+        if all_vertices.len() + vertex_count > max_vertices
+            || all_indices.len() + index_count > max_indices
+        {
+            dropped_vertices += vertex_count;
+            continue;
+        }
+
+        let base_vertex = all_vertices.len() as u32;
+
+        // Transform vertices (color passes through untouched)
+        for v in &submitted.data.vertices {
+            let pos = submitted.transform.transform_point3(Vec3::from(v.position));
+            let normal = submitted
+                .transform
+                .transform_vector3(Vec3::from(v.normal))
+                .normalize();
+            all_vertices.push(MeshVertex::colored(pos.into(), normal.into(), v.color));
+        }
+
+        // Handle indices
+        if let Some(indices) = &submitted.data.indices {
+            use_indices = true;
+            for &idx in indices {
+                all_indices.push(base_vertex + idx);
+            }
+        }
+    }
+
+    (
+        all_vertices,
+        all_indices,
+        use_indices,
+        dropped_vertices,
+        total_vertices,
+    )
 }
 
 /// A submitted line batch for the current frame.
@@ -156,6 +252,9 @@ pub struct Renderer {
 
     // Capabilities
     capabilities: Option<RendererCapabilities>,
+
+    // Geometry dropped by the last render() because of device buffer limits
+    frame_overflow: GeometryOverflow,
 }
 
 impl Renderer {
@@ -171,6 +270,7 @@ impl Renderer {
             cached_grid_lines: Vec::new(),
             cached_grid_settings_hash: 0,
             capabilities: None,
+            frame_overflow: GeometryOverflow::default(),
         }
     }
 
@@ -335,6 +435,15 @@ impl Renderer {
         // Update grid lines if settings changed (must be before borrowing self.gpu)
         self.update_grid_cache(settings);
 
+        // Buffers larger than the device limit are a wgpu validation panic,
+        // so every geometry class is clamped to it below; whatever gets
+        // dropped is reported through frame_overflow().
+        let max_buffer_bytes = device.limits().max_buffer_size;
+        self.frame_overflow = GeometryOverflow {
+            max_buffer_bytes,
+            ..GeometryOverflow::default()
+        };
+
         let Some(gpu) = &mut self.gpu else {
             return;
         };
@@ -348,32 +457,16 @@ impl Renderer {
         // Pass 1: Mesh G-Buffer
         // =================================================================
         if !self.frame_meshes.is_empty() {
-            // Collect all mesh vertices (transformed)
-            let mut all_vertices = Vec::new();
-            let mut all_indices = Vec::new();
-            let mut use_indices = false;
-
-            for submitted in &self.frame_meshes {
-                let base_vertex = all_vertices.len() as u32;
-
-                // Transform vertices (color passes through untouched)
-                for v in &submitted.data.vertices {
-                    let pos = submitted.transform.transform_point3(Vec3::from(v.position));
-                    let normal = submitted
-                        .transform
-                        .transform_vector3(Vec3::from(v.normal))
-                        .normalize();
-                    all_vertices.push(MeshVertex::colored(pos.into(), normal.into(), v.color));
-                }
-
-                // Handle indices
-                if let Some(indices) = &submitted.data.indices {
-                    use_indices = true;
-                    for &idx in indices {
-                        all_indices.push(base_vertex + idx);
-                    }
-                }
-            }
+            // Collect all mesh vertices (transformed), keeping within what
+            // one vertex/index buffer may hold.
+            let (all_vertices, all_indices, use_indices, dropped, total) =
+                flatten_meshes_within_budget(
+                    &self.frame_meshes,
+                    (max_buffer_bytes / std::mem::size_of::<MeshVertex>() as u64) as usize,
+                    (max_buffer_bytes / std::mem::size_of::<u32>() as u64) as usize,
+                );
+            self.frame_overflow.dropped_mesh_vertices = dropped;
+            self.frame_overflow.total_mesh_vertices = total;
 
             // Upload mesh data
             gpu.mesh_pipeline
@@ -615,7 +708,10 @@ impl Renderer {
             } = gpu;
 
             if !all_line_segments.is_empty() {
-                let instances = LinePipeline::prepare_instances(&all_line_segments, &line_style);
+                let mut instances =
+                    LinePipeline::prepare_instances(&all_line_segments, &line_style);
+                self.frame_overflow.dropped_lines +=
+                    truncate_to_buffer_budget(&mut instances, max_buffer_bytes);
                 line_pipeline.upload_instances(device, queue, &instances);
                 let uniforms =
                     LinePipeline::create_uniforms(view_proj_array, screen_size, &line_style);
@@ -623,7 +719,9 @@ impl Renderer {
             }
 
             if !all_point_instances.is_empty() {
-                let instances = PointPipeline::prepare_instances(&all_point_instances);
+                let mut instances = PointPipeline::prepare_instances(&all_point_instances);
+                self.frame_overflow.dropped_points +=
+                    truncate_to_buffer_budget(&mut instances, max_buffer_bytes);
                 point_pipeline.upload_instances(device, queue, &instances);
                 let uniforms =
                     PointPipeline::create_uniforms(view_proj_array, screen_size, &point_style);
@@ -725,7 +823,10 @@ impl Renderer {
             } = gpu;
 
             if !all_line_segments.is_empty() {
-                let instances = LinePipeline::prepare_instances(&all_line_segments, &line_style);
+                let mut instances =
+                    LinePipeline::prepare_instances(&all_line_segments, &line_style);
+                self.frame_overflow.dropped_lines +=
+                    truncate_to_buffer_budget(&mut instances, max_buffer_bytes);
                 line_pipeline.upload_instances(device, queue, &instances);
                 let uniforms =
                     LinePipeline::create_uniforms(view_proj_array, screen_size, &line_style);
@@ -733,7 +834,9 @@ impl Renderer {
             }
 
             if !all_point_instances.is_empty() {
-                let instances = PointPipeline::prepare_instances(&all_point_instances);
+                let mut instances = PointPipeline::prepare_instances(&all_point_instances);
+                self.frame_overflow.dropped_points +=
+                    truncate_to_buffer_budget(&mut instances, max_buffer_bytes);
                 point_pipeline.upload_instances(device, queue, &instances);
                 let uniforms =
                     PointPipeline::create_uniforms(view_proj_array, screen_size, &point_style);
@@ -780,6 +883,13 @@ impl Renderer {
         self.frame_meshes.clear();
         self.frame_lines.clear();
         self.frame_points.clear();
+    }
+
+    /// Geometry the most recent [`render`](Self::render) dropped because it
+    /// exceeded the device's buffer size limit; `None` when everything fit.
+    /// Valid until the next `render` call (surviving `end_frame`).
+    pub fn frame_overflow(&self) -> Option<&GeometryOverflow> {
+        self.frame_overflow.any().then_some(&self.frame_overflow)
     }
 
     /// Update the grid line cache if settings have changed.
@@ -932,5 +1042,73 @@ mod tests {
         let lines = generate_axis_indicator_lines(&camera, &indicator);
 
         assert_eq!(lines.len(), 3); // X, Y, Z axes
+    }
+
+    fn submitted(vertex_count: usize, indexed: bool) -> SubmittedMesh {
+        let vertices = vec![MeshVertex::new([0.0; 3], [0.0, 1.0, 0.0]); vertex_count];
+        let indices = indexed.then(|| (0..vertex_count as u32).collect());
+        SubmittedMesh {
+            data: MeshData { vertices, indices },
+            transform: Mat4::IDENTITY,
+            material: MaterialId(0),
+        }
+    }
+
+    /// A mesh that would overflow the vertex budget is dropped whole;
+    /// meshes around it still render, with indices rebased past the gap.
+    #[test]
+    fn flatten_drops_only_meshes_that_overflow_the_budget() {
+        let meshes = [
+            submitted(10, true),
+            submitted(100, true),
+            submitted(20, true),
+        ];
+        let (vertices, indices, use_indices, dropped, total) =
+            flatten_meshes_within_budget(&meshes, 50, usize::MAX);
+
+        assert_eq!(total, 130);
+        assert_eq!(dropped, 100);
+        assert_eq!(vertices.len(), 30);
+        assert!(use_indices);
+        // The third mesh's indices are rebased onto the compacted soup.
+        assert_eq!(indices[10], 10);
+        assert_eq!(*indices.last().unwrap(), 29);
+    }
+
+    /// The index budget is enforced independently of the vertex budget.
+    #[test]
+    fn flatten_enforces_the_index_budget() {
+        let meshes = [submitted(10, true), submitted(10, true)];
+        let (vertices, indices, _, dropped, total) =
+            flatten_meshes_within_budget(&meshes, usize::MAX, 15);
+
+        assert_eq!(total, 20);
+        assert_eq!(dropped, 10);
+        assert_eq!(vertices.len(), 10);
+        assert_eq!(indices.len(), 10);
+    }
+
+    /// Everything fits: nothing dropped and no overflow to report.
+    #[test]
+    fn flatten_within_budget_drops_nothing() {
+        let meshes = [submitted(10, false), submitted(20, false)];
+        let (vertices, indices, use_indices, dropped, total) =
+            flatten_meshes_within_budget(&meshes, 30, 30);
+
+        assert_eq!((vertices.len(), indices.len()), (30, 0));
+        assert!(!use_indices);
+        assert_eq!(dropped, 0);
+        assert_eq!(total, 30);
+        assert!(!GeometryOverflow::default().any());
+    }
+
+    /// Instance lists clamp to whole buffers' worth of elements.
+    #[test]
+    fn truncate_to_buffer_budget_clamps_by_bytes() {
+        let mut items: Vec<u32> = (0..100).collect();
+        // 40 bytes = 10 u32s.
+        assert_eq!(truncate_to_buffer_budget(&mut items, 40), 90);
+        assert_eq!(items.len(), 10);
+        assert_eq!(truncate_to_buffer_budget(&mut items, 40), 0);
     }
 }

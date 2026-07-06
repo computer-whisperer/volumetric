@@ -114,7 +114,14 @@ impl ApplicationHandler for Host {
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("volumetric_ui_v2::device"),
             required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
+            // Preview meshes of fine models (e.g. lattices) routinely pass
+            // wgpu's 256 MiB default buffer ceiling; take whatever the
+            // hardware allows. The renderer clamps to the granted limit and
+            // reports overflow rather than panicking.
+            required_limits: wgpu::Limits {
+                max_buffer_size: adapter.limits().max_buffer_size,
+                ..wgpu::Limits::default()
+            },
             experimental_features: wgpu::ExperimentalFeatures::default(),
             memory_hints: wgpu::MemoryHints::Performance,
             trace: wgpu::Trace::Off,
