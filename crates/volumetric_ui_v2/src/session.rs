@@ -568,21 +568,24 @@ impl PreviewSceneKey {
 
 /// A single built output: its meshed geometry, world-space bounds, and the
 /// meshing statistics surfaced in the UI.
+///
+/// Public (with `build_preview_scene`) for the headless debug examples,
+/// which reproduce viewport rendering without a window.
 #[derive(Clone)]
-struct PreviewEntity {
-    scene: renderer::SceneData,
-    bounds: PreviewBounds,
-    stats: OutputStats,
+pub struct PreviewEntity {
+    pub scene: renderer::SceneData,
+    pub bounds: PreviewBounds,
+    pub stats: OutputStats,
     /// Unique mesh edges, prebuilt so the wireframe toggle is display-only
     /// (composited in per frame when requested; `None` for point clouds and
     /// sketch previews).
-    wireframe_lines: Option<renderer::LineData>,
+    pub wireframe_lines: Option<renderer::LineData>,
 }
 
 #[derive(Clone, Copy)]
-struct PreviewBounds {
-    min: (f32, f32, f32),
-    max: (f32, f32, f32),
+pub struct PreviewBounds {
+    pub min: (f32, f32, f32),
+    pub max: (f32, f32, f32),
 }
 
 impl PreviewBounds {
@@ -871,7 +874,7 @@ pub fn execute_job(job: BackgroundJob) -> BackgroundResult {
     }
 }
 
-fn build_preview_scene(request: &PreviewRequest) -> Result<PreviewEntity, String> {
+pub fn build_preview_scene(request: &PreviewRequest) -> Result<PreviewEntity, String> {
     let build_start = std::time::Instant::now();
     let mut stats = OutputStats::default();
 

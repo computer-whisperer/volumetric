@@ -356,14 +356,14 @@ impl Renderer {
             for submitted in &self.frame_meshes {
                 let base_vertex = all_vertices.len() as u32;
 
-                // Transform vertices
+                // Transform vertices (color passes through untouched)
                 for v in &submitted.data.vertices {
                     let pos = submitted.transform.transform_point3(Vec3::from(v.position));
                     let normal = submitted
                         .transform
                         .transform_vector3(Vec3::from(v.normal))
                         .normalize();
-                    all_vertices.push(MeshVertex::new(pos.into(), normal.into()));
+                    all_vertices.push(MeshVertex::colored(pos.into(), normal.into(), v.color));
                 }
 
                 // Handle indices
