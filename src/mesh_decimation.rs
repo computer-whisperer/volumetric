@@ -26,6 +26,7 @@
 //! ordering while staying O(faces) per pass with no heap.
 
 use crate::adaptive_surface_nets_2::{IndexedMesh2, parallel_iter};
+use std::sync::atomic::{AtomicBool, Ordering};
 use web_time::Instant;
 
 /// Configuration for the decimation post-pass.
@@ -221,8 +222,9 @@ struct SweepMesh {
 impl SweepMesh {
     /// Run collapse passes: `ramp_passes` sweeps approaching the budget from
     /// below (cheap collapses first), then full-budget sweeps until yields
-    /// go quiet. Returns the number of passes run.
-    fn run_passes(&mut self, budget: f64, ramp_passes: usize) -> usize {
+    /// go quiet. Returns the number of passes run. A cancellation stops
+    /// between passes, leaving a valid (partially decimated) face set.
+    fn run_passes(&mut self, budget: f64, ramp_passes: usize, cancel: &AtomicBool) -> usize {
         let vertex_count = self.positions.len();
         // Reused scratch buffers for the link-condition neighborhood sets.
         let mut neighbors_src: Vec<u32> = Vec::new();
@@ -232,6 +234,9 @@ impl SweepMesh {
         const MAX_CONVERGENCE_PASSES: usize = 16;
         let mut pass = 0;
         loop {
+            if cancel.load(Ordering::Relaxed) {
+                return pass;
+            }
             let threshold = if pass < ramp_passes {
                 let t = (pass + 1) as f64 / (ramp_passes + 1) as f64;
                 budget * t * t
@@ -351,6 +356,7 @@ fn serial_decimate(
     boundary_vertex: Vec<bool>,
     budget: f64,
     ramp_passes: usize,
+    cancel: &AtomicBool,
 ) -> (Vec<[u32; 3]>, Vec<bool>, usize) {
     let deleted = vec![false; faces.len()];
     let mut sweep = SweepMesh {
@@ -362,7 +368,7 @@ fn serial_decimate(
         boundary_vertex,
         pinned: Vec::new(),
     };
-    let passes = sweep.run_passes(budget, ramp_passes);
+    let passes = sweep.run_passes(budget, ramp_passes, cancel);
     (sweep.faces, sweep.deleted, passes)
 }
 
@@ -381,6 +387,7 @@ fn parallel_decimate(
     boundary_vertex: Vec<bool>,
     budget: f64,
     ramp_passes: usize,
+    cancel: &AtomicBool,
 ) -> (Vec<[u32; 3]>, Vec<bool>, usize) {
     let vertex_count = positions.len();
 
@@ -478,7 +485,7 @@ fn parallel_decimate(
                 .map(|&g| vertex_bucket[g as usize] == SHARED)
                 .collect(),
         };
-        let passes = sweep.run_passes(budget, ramp_passes);
+        let passes = sweep.run_passes(budget, ramp_passes, cancel);
         let survivors: Vec<[u32; 3]> = sweep
             .faces
             .iter()
@@ -516,7 +523,7 @@ fn parallel_decimate(
         boundary_vertex,
         pinned: Vec::new(),
     };
-    let final_passes = sweep.run_passes(budget, 0);
+    let final_passes = sweep.run_passes(budget, 0, cancel);
     (sweep.faces, sweep.deleted, region_passes + final_passes)
 }
 
@@ -533,7 +540,27 @@ pub fn decimate_mesh(
     error_tolerance: f64,
     ramp_passes: usize,
 ) -> DecimationStats {
-    decimate_mesh_impl(mesh, error_tolerance, ramp_passes, PARALLEL_FACE_THRESHOLD)
+    static NEVER: AtomicBool = AtomicBool::new(false);
+    decimate_mesh_cancellable(mesh, error_tolerance, ramp_passes, &NEVER)
+}
+
+/// [`decimate_mesh`], checking `cancel` between collapse passes. On
+/// cancellation the remaining passes are skipped but the mesh is still
+/// compacted, so it stays valid (just less decimated than requested);
+/// callers that cancel are expected to discard the result anyway.
+pub fn decimate_mesh_cancellable(
+    mesh: &mut IndexedMesh2,
+    error_tolerance: f64,
+    ramp_passes: usize,
+    cancel: &AtomicBool,
+) -> DecimationStats {
+    decimate_mesh_impl(
+        mesh,
+        error_tolerance,
+        ramp_passes,
+        PARALLEL_FACE_THRESHOLD,
+        cancel,
+    )
 }
 
 fn decimate_mesh_impl(
@@ -541,6 +568,7 @@ fn decimate_mesh_impl(
     error_tolerance: f64,
     ramp_passes: usize,
     parallel_threshold: usize,
+    cancel: &AtomicBool,
 ) -> DecimationStats {
     let start = Instant::now();
     let vertices_before = mesh.vertices.len();
@@ -638,6 +666,7 @@ fn decimate_mesh_impl(
             boundary_vertex,
             budget,
             ramp_passes,
+            cancel,
         )
     } else {
         serial_decimate(
@@ -648,6 +677,7 @@ fn decimate_mesh_impl(
             boundary_vertex,
             budget,
             ramp_passes,
+            cancel,
         )
     };
     #[cfg(not(feature = "native"))]
@@ -661,6 +691,7 @@ fn decimate_mesh_impl(
             boundary_vertex,
             budget,
             ramp_passes,
+            cancel,
         )
     };
     stats.passes_run = passes_run;
@@ -866,6 +897,8 @@ fn collapse_flips_normals(
 #[cfg(all(test, feature = "native"))]
 mod tests {
     use super::*;
+
+    static NEVER: AtomicBool = AtomicBool::new(false);
     use crate::adaptive_surface_nets_2::{AdaptiveMeshConfig2, adaptive_surface_nets_2};
 
     fn mesh_sampler<F>(sampler: F, depth: usize) -> IndexedMesh2
@@ -935,6 +968,28 @@ mod tests {
             }
         }
         roots.len()
+    }
+
+    /// A pre-set cancel flag skips every collapse pass: the mesh survives
+    /// unchanged (and valid) with zero passes run.
+    #[test]
+    fn pre_cancelled_decimation_is_a_noop() {
+        let mut mesh = mesh_sampler(
+            |x, y, z| {
+                if x * x + y * y + z * z < 0.64 {
+                    1.0
+                } else {
+                    0.0
+                }
+            },
+            3,
+        );
+        let before = mesh.indices.len() / 3;
+        let cancel = AtomicBool::new(true);
+        let stats = decimate_mesh_cancellable(&mut mesh, cell(3), 6, &cancel);
+        assert_eq!(stats.passes_run, 0);
+        assert_eq!(stats.triangles_after, before, "no collapses ran");
+        assert_eq!(mesh.indices.len() / 3, before);
     }
 
     #[test]
@@ -1082,8 +1137,8 @@ mod tests {
         let mut serial = mesh_sampler(sampler, 3);
         let mut parallel = serial.clone();
         // usize::MAX forces the serial path, 0 forces region partitioning.
-        decimate_mesh_impl(&mut serial, cell(3), 6, usize::MAX);
-        decimate_mesh_impl(&mut parallel, cell(3), 6, 0);
+        decimate_mesh_impl(&mut serial, cell(3), 6, usize::MAX, &NEVER);
+        decimate_mesh_impl(&mut parallel, cell(3), 6, 0, &NEVER);
 
         assert!(parallel.indices.len() < serial.indices.len() * 3 / 2);
         // Same manifold guarantees as the serial path.
@@ -1114,7 +1169,7 @@ mod tests {
             3,
         );
         let before = mesh.indices.len() / 3;
-        decimate_mesh_impl(&mut mesh, cell(3), 6, 0);
+        decimate_mesh_impl(&mut mesh, cell(3), 6, 0, &NEVER);
         assert!(mesh.indices.len() / 3 < before);
         assert_eq!(component_count(mesh.vertices.len(), &mesh.indices), 1);
         let counts = edge_face_counts(&mesh.indices);

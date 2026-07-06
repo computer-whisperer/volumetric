@@ -189,7 +189,7 @@
 
 use crate::sharp_features::SharpFeatureConfig;
 use dashmap::DashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use web_time::Instant;
 
 /// Conditional parallel iteration helpers.
@@ -1536,6 +1536,7 @@ fn stage2_subdivision_and_emission<F>(
     cell_size: (f64, f64, f64),
     config: &AdaptiveMeshConfig2,
     stats: &SamplingStats,
+    cancel: &AtomicBool,
 ) -> Vec<SparseTriangle>
 where
     F: SamplerFn,
@@ -1559,8 +1560,22 @@ where
 
     // Process in parallel batches until no more work
     while !current_batch.is_empty() {
+        // Cancellation: each work item checks the flag itself (so a batch
+        // already fanned out across workers drains in milliseconds), and the
+        // batch loop stops feeding new batches. The caller discards the
+        // truncated triangle soup.
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+
         // Process current batch in parallel (or sequentially on web)
         let results: Vec<ProcessedEntry> = parallel_iter::map_vec(current_batch, |entry| {
+            if cancel.load(Ordering::Relaxed) {
+                return ProcessedEntry {
+                    new_work: Vec::new(),
+                    triangles: Vec::new(),
+                };
+            }
             process_work_entry(
                 entry, sampler, bounds_min, cell_size, max_depth, base_res, &visited, stats,
             )
@@ -2529,6 +2544,7 @@ fn stage4_vertex_refinement<F>(
     cell_size: (f64, f64, f64),
     config: &AdaptiveMeshConfig2,
     stats: &SamplingStats,
+    cancel: &AtomicBool,
 ) -> Stage4Result
 where
     F: SamplerFn,
@@ -2556,6 +2572,11 @@ where
         // bracket is known up front — and the vertex can never be captured
         // by a neighboring parallel surface (see the config field docs).
         parallel_iter::map_range(0..vertex_count, |i| {
+            // Cancelled: skip the sampling, leave the vertex unrefined. The
+            // caller checks the flag after the stage and discards the mesh.
+            if cancel.load(Ordering::Relaxed) {
+                return stage3.vertices[i];
+            }
             let (a, b) = stage3.vertex_edges[i].endpoints_world_pos(bounds_min, cell_size);
             let inside_a = sample_is_inside(sampler, a.0, a.1, a.2, stats);
             let inside_b = sample_is_inside(sampler, b.0, b.1, b.2, stats);
@@ -2580,6 +2601,9 @@ where
     } else {
         parallel_iter::map_range(0..vertex_count, |i| {
             let initial_pos = stage3.vertices[i];
+            if cancel.load(Ordering::Relaxed) {
+                return initial_pos;
+            }
             let accumulated_normal = stage3.accumulated_normals[i];
 
             let (pos, outcome) = refine_vertex_position(
@@ -2630,6 +2654,9 @@ where
         parallel_iter::map_range(0..vertex_count, |i| {
             let refined_pos = refined_positions[i];
             let recomputed_normal = recomputed_normals[i];
+            if cancel.load(Ordering::Relaxed) {
+                return recomputed_normal;
+            }
 
             refine_normal_via_probing(
                 refined_pos,
@@ -2831,15 +2858,17 @@ fn stage5_decimation(
     mesh: &mut IndexedMesh2,
     config: &AdaptiveMeshConfig2,
     cell_size: (f64, f64, f64),
+    cancel: &AtomicBool,
 ) -> (f64, usize, usize) {
     let Some(ref decimation) = config.decimation else {
         return (0.0, 0, 0);
     };
     let min_cell = cell_size.0.min(cell_size.1).min(cell_size.2);
-    let stats = crate::mesh_decimation::decimate_mesh(
+    let stats = crate::mesh_decimation::decimate_mesh_cancellable(
         mesh,
         decimation.error_tolerance_cells * min_cell,
         decimation.ramp_passes,
+        cancel,
     );
     (stats.time_secs, stats.passes_run, stats.triangles_before)
 }
@@ -2854,7 +2883,6 @@ fn stage5_decimation(
 ///
 /// # Returns
 /// A MeshingResult2 containing the indexed mesh and detailed profiling statistics
-#[cfg(feature = "native")]
 pub fn adaptive_surface_nets_2<F>(
     sampler: F,
     bounds_min: (f32, f32, f32),
@@ -2864,151 +2892,25 @@ pub fn adaptive_surface_nets_2<F>(
 where
     F: SamplerFn,
 {
-    let total_start = Instant::now();
-    let stats = SamplingStats::default();
-
-    // Convert bounds to f64 for internal calculations
-    let bounds_min_f64 = (
-        bounds_min.0 as f64,
-        bounds_min.1 as f64,
-        bounds_min.2 as f64,
-    );
-    let bounds_max_f64 = (
-        bounds_max.0 as f64,
-        bounds_max.1 as f64,
-        bounds_max.2 as f64,
-    );
-
-    // Calculate cell size at finest level (per-axis for non-cubic bounds)
-    // Total cells at finest level = base_resolution * 2^max_depth
-    let finest_cells_per_axis = config.base_resolution * (1 << config.max_depth);
-    let cell_size = (
-        (bounds_max_f64.0 - bounds_min_f64.0) / finest_cells_per_axis as f64,
-        (bounds_max_f64.1 - bounds_min_f64.1) / finest_cells_per_axis as f64,
-        (bounds_max_f64.2 - bounds_min_f64.2) / finest_cells_per_axis as f64,
-    );
-
-    // Stage 1: Coarse grid discovery
-    let stage1_start = Instant::now();
-    let samples_before_stage1 = stats.total_samples.load(Ordering::Relaxed);
-    let initial_work_queue =
-        stage1_coarse_discovery(&sampler, bounds_min_f64, bounds_max_f64, config, &stats);
-    let stage1_time = stage1_start.elapsed().as_secs_f64();
-    let stage1_samples = stats.total_samples.load(Ordering::Relaxed) - samples_before_stage1;
-    let stage1_mixed_cells = initial_work_queue.len();
-
-    // Stage 2: Subdivision and triangle emission
-    let stage2_start = Instant::now();
-    let samples_before_stage2 = stats.total_samples.load(Ordering::Relaxed);
-    let cuboids_before_stage2 = stats.cuboids_processed.load(Ordering::Relaxed);
-    let triangles_before_stage2 = stats.triangles_emitted.load(Ordering::Relaxed);
-    let sparse_triangles = stage2_subdivision_and_emission(
-        initial_work_queue,
-        &sampler,
-        bounds_min_f64,
-        cell_size,
-        config,
-        &stats,
-    );
-    let stage2_time = stage2_start.elapsed().as_secs_f64();
-    let stage2_samples = stats.total_samples.load(Ordering::Relaxed) - samples_before_stage2;
-    let stage2_cuboids = stats.cuboids_processed.load(Ordering::Relaxed) - cuboids_before_stage2;
-    let stage2_triangles =
-        stats.triangles_emitted.load(Ordering::Relaxed) - triangles_before_stage2;
-
-    // Stage 3: Topology finalization
-    let stage3_start = Instant::now();
-    let stage3_result = stage3_topology_finalization(sparse_triangles, bounds_min_f64, cell_size);
-    let stage3_time = stage3_start.elapsed().as_secs_f64();
-    let stage3_unique_vertices = stage3_result.vertices.len();
-
-    // Stage 4: Vertex refinement & normal estimation
-    let stage4_start = Instant::now();
-    let samples_before_stage4 = stats.total_samples.load(Ordering::Relaxed);
-    let stage4_result = stage4_vertex_refinement(
-        stage3_result,
-        &sampler,
-        bounds_min_f64,
-        cell_size,
-        config,
-        &stats,
-    );
-    let stage4_time = stage4_start.elapsed().as_secs_f64();
-    let stage4_samples = stats.total_samples.load(Ordering::Relaxed) - samples_before_stage4;
-
-    // Stage 4.5: Sharp feature reconstruction (when enabled)
-    let stage4_5_start = Instant::now();
-    let (mut mesh, sharp_stats) = if let Some(ref sharp_config) = config.sharp_features {
-        let (mesh, sharp_s) =
-            stage4_5_sharp_features(stage4_result, sharp_config, &sampler, cell_size, &stats);
-        (mesh, sharp_s)
-    } else {
-        (
-            stage4_result_to_mesh(stage4_result),
-            crate::sharp_features::SharpFeatureStats::default(),
-        )
-    };
-    let stage4_5_time = stage4_5_start.elapsed().as_secs_f64();
-
-    // Stage 5: Decimation (when enabled)
-    let (stage5_time, stage5_passes, stage5_triangles_before) =
-        stage5_decimation(&mut mesh, config, cell_size);
-
-    let total_time = total_start.elapsed().as_secs_f64();
-    let total_samples = stats.total_samples.load(Ordering::Relaxed);
-
-    let meshing_stats = MeshingStats2 {
-        total_time_secs: total_time,
-        stage1_time_secs: stage1_time,
-        stage1_samples,
-        stage1_mixed_cells,
-        stage2_time_secs: stage2_time,
-        stage2_samples,
-        stage2_cuboids_processed: stage2_cuboids,
-        stage2_triangles_emitted: stage2_triangles,
-        stage3_time_secs: stage3_time,
-        stage3_unique_vertices,
-        stage4_time_secs: stage4_time,
-        stage4_samples,
-        stage4_refine_primary_hit: stats.refine_primary_hit.load(Ordering::Relaxed),
-        stage4_refine_fallback_x_hit: stats.refine_fallback_x_hit.load(Ordering::Relaxed),
-        stage4_refine_fallback_y_hit: stats.refine_fallback_y_hit.load(Ordering::Relaxed),
-        stage4_refine_fallback_z_hit: stats.refine_fallback_z_hit.load(Ordering::Relaxed),
-        stage4_refine_miss: stats.refine_miss.load(Ordering::Relaxed),
-        total_samples,
-        total_vertices: mesh.vertices.len(),
-        total_triangles: mesh.indices.len() / 3,
-        effective_resolution: finest_cells_per_axis,
-        stage4_5_time_secs: stage4_5_time,
-        sharp_regions: sharp_stats.regions,
-        sharp_candidates: sharp_stats.candidates,
-        sharp_snapped_edges: sharp_stats.snapped_edges,
-        sharp_snapped_corners: sharp_stats.snapped_corners,
-        sharp_welded_vertices: sharp_stats.welded_vertices,
-        sharp_dropped_triangles: sharp_stats.dropped_triangles,
-        sharp_crease_splits: sharp_stats.crease_splits,
-        stage5_time_secs: stage5_time,
-        stage5_passes,
-        stage5_triangles_before,
-    };
-
-    MeshingResult2 {
-        mesh,
-        stats: meshing_stats,
-    }
+    static NEVER: AtomicBool = AtomicBool::new(false);
+    adaptive_surface_nets_2_cancellable(sampler, bounds_min, bounds_max, config, &NEVER)
+        .expect("meshing with a never-set cancel flag cannot be cancelled")
 }
 
-/// Main entry point for adaptive surface nets meshing (web/sequential version).
-///
-/// This version does not require Send + Sync bounds since web is single-threaded.
-/// Uses sequential iteration instead of parallel iteration.
-#[cfg(not(feature = "native"))]
-pub fn adaptive_surface_nets_2<F>(
+/// [`adaptive_surface_nets_2`], checking `cancel` cooperatively throughout:
+/// per work item during subdivision, per vertex during refinement, between
+/// decimation passes, and at every stage boundary. Returns `None` once the
+/// flag is observed set — the mesh under construction is discarded, there is
+/// no partial result. Cancellation latency is bounded by the longest
+/// unchecked span (the stage-3 parallel sorts and the sharp-feature stage
+/// when enabled): a few seconds at high resolution.
+pub fn adaptive_surface_nets_2_cancellable<F>(
     sampler: F,
     bounds_min: (f32, f32, f32),
     bounds_max: (f32, f32, f32),
     config: &AdaptiveMeshConfig2,
-) -> MeshingResult2
+    cancel: &AtomicBool,
+) -> Option<MeshingResult2>
 where
     F: SamplerFn,
 {
@@ -3045,6 +2947,10 @@ where
     let stage1_samples = stats.total_samples.load(Ordering::Relaxed) - samples_before_stage1;
     let stage1_mixed_cells = initial_work_queue.len();
 
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+
     // Stage 2: Subdivision and triangle emission
     let stage2_start = Instant::now();
     let samples_before_stage2 = stats.total_samples.load(Ordering::Relaxed);
@@ -3057,6 +2963,7 @@ where
         cell_size,
         config,
         &stats,
+        cancel,
     );
     let stage2_time = stage2_start.elapsed().as_secs_f64();
     let stage2_samples = stats.total_samples.load(Ordering::Relaxed) - samples_before_stage2;
@@ -3064,11 +2971,19 @@ where
     let stage2_triangles =
         stats.triangles_emitted.load(Ordering::Relaxed) - triangles_before_stage2;
 
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+
     // Stage 3: Topology finalization
     let stage3_start = Instant::now();
     let stage3_result = stage3_topology_finalization(sparse_triangles, bounds_min_f64, cell_size);
     let stage3_time = stage3_start.elapsed().as_secs_f64();
     let stage3_unique_vertices = stage3_result.vertices.len();
+
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
 
     // Stage 4: Vertex refinement & normal estimation
     let stage4_start = Instant::now();
@@ -3080,9 +2995,14 @@ where
         cell_size,
         config,
         &stats,
+        cancel,
     );
     let stage4_time = stage4_start.elapsed().as_secs_f64();
     let stage4_samples = stats.total_samples.load(Ordering::Relaxed) - samples_before_stage4;
+
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
 
     // Stage 4.5: Sharp feature reconstruction (when enabled)
     let stage4_5_start = Instant::now();
@@ -3098,9 +3018,17 @@ where
     };
     let stage4_5_time = stage4_5_start.elapsed().as_secs_f64();
 
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+
     // Stage 5: Decimation (when enabled)
     let (stage5_time, stage5_passes, stage5_triangles_before) =
-        stage5_decimation(&mut mesh, config, cell_size);
+        stage5_decimation(&mut mesh, config, cell_size, cancel);
+
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
 
     let total_time = total_start.elapsed().as_secs_f64();
     let total_samples = stats.total_samples.load(Ordering::Relaxed);
@@ -3140,15 +3068,17 @@ where
         stage5_triangles_before,
     };
 
-    MeshingResult2 {
+    Some(MeshingResult2 {
         mesh,
         stats: meshing_stats,
-    }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static NEVER: AtomicBool = AtomicBool::new(false);
 
     #[test]
     fn test_corner_mask() {
@@ -3180,6 +3110,47 @@ mod tests {
     fn sphere_sampler(x: f64, y: f64, z: f64) -> f32 {
         let r2 = x * x + y * y + z * z;
         if r2 < 1.0 { 1.0 } else { 0.0 }
+    }
+
+    /// A pre-set cancel flag aborts before any real work; a flag flipped by
+    /// the sampler itself mid-run (deterministic regardless of thread
+    /// scheduling) aborts at a later checkpoint. Both return `None`.
+    #[test]
+    fn cancellation_returns_none() {
+        let cancel = AtomicBool::new(true);
+        assert!(
+            adaptive_surface_nets_2_cancellable(
+                sphere_sampler,
+                (-1.5, -1.5, -1.5),
+                (1.5, 1.5, 1.5),
+                &AdaptiveMeshConfig2::default(),
+                &cancel,
+            )
+            .is_none(),
+            "pre-set flag cancels"
+        );
+
+        let cancel = AtomicBool::new(false);
+        let samples = AtomicU64::new(0);
+        let sampler = |x: f64, y: f64, z: f64| -> f32 {
+            // Well below the run's total sample count, so the flag is set
+            // mid-stage-2 and every later checkpoint would also catch it.
+            if samples.fetch_add(1, Ordering::Relaxed) >= 2_000 {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            sphere_sampler(x, y, z)
+        };
+        assert!(
+            adaptive_surface_nets_2_cancellable(
+                sampler,
+                (-1.5, -1.5, -1.5),
+                (1.5, 1.5, 1.5),
+                &AdaptiveMeshConfig2::default(),
+                &cancel,
+            )
+            .is_none(),
+            "mid-run flag cancels"
+        );
     }
 
     #[test]
@@ -3437,6 +3408,7 @@ mod tests {
             cell_size,
             &config,
             &stats,
+            &NEVER,
         );
 
         // Should produce triangles for a sphere
@@ -3651,6 +3623,7 @@ mod tests {
             cell_size,
             &config,
             &stats1,
+            &NEVER,
         );
 
         let stats2 = SamplingStats::default();
@@ -3663,6 +3636,7 @@ mod tests {
             cell_size,
             &config,
             &stats2,
+            &NEVER,
         );
 
         assert_eq!(
@@ -3708,6 +3682,7 @@ mod tests {
             cell_size,
             &config,
             &stats,
+            &NEVER,
         );
 
         assert!(

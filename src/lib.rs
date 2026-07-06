@@ -606,6 +606,21 @@ pub fn generate_adaptive_mesh_v2_from_bytes(
     wasm_bytes: &[u8],
     config: &adaptive_surface_nets_2::AdaptiveMeshConfig2,
 ) -> anyhow::Result<AdaptiveMeshV2Result> {
+    static NEVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    generate_adaptive_mesh_v2_from_bytes_cancellable(wasm_bytes, config, &NEVER)
+        .map(|result| result.expect("meshing with a never-set cancel flag cannot be cancelled"))
+}
+
+/// [`generate_adaptive_mesh_v2_from_bytes`] with cooperative cancellation:
+/// once `cancel` is set the mesher stops within its next checkpoint (see
+/// [`adaptive_surface_nets_2::adaptive_surface_nets_2_cancellable`]) and
+/// `Ok(None)` is returned in place of a mesh.
+#[cfg(any(feature = "native", feature = "web"))]
+pub fn generate_adaptive_mesh_v2_from_bytes_cancellable(
+    wasm_bytes: &[u8],
+    config: &adaptive_surface_nets_2::AdaptiveMeshConfig2,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> anyhow::Result<Option<AdaptiveMeshV2Result>> {
     use wasm::ParallelModelSampler;
 
     let wasm_sampler =
@@ -675,17 +690,20 @@ pub fn generate_adaptive_mesh_v2_from_bytes(
         wasm_sampler.sample(x, y, z)
     };
 
-    let result =
-        adaptive_surface_nets_2::adaptive_surface_nets_2(sampler, padded_min, padded_max, config);
+    let Some(result) = adaptive_surface_nets_2::adaptive_surface_nets_2_cancellable(
+        sampler, padded_min, padded_max, config, cancel,
+    ) else {
+        return Ok(None);
+    };
 
-    Ok(AdaptiveMeshV2Result {
+    Ok(Some(AdaptiveMeshV2Result {
         vertices: result.mesh.vertices,
         normals: result.mesh.normals,
         indices: result.mesh.indices,
         bounds_min,
         bounds_max,
         stats: result.stats,
-    })
+    }))
 }
 
 // =============================================================================

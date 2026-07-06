@@ -46,6 +46,9 @@ pub const IMPORT_IMAGE_KEY: &str = "action:import-image";
 pub const RUN_PROJECT_KEY: &str = "action:run-project";
 pub const CANCEL_RUN_KEY: &str = "action:cancel-run";
 pub const TOGGLE_AUTO_REBUILD_KEY: &str = "action:toggle-auto-rebuild";
+pub const CANCEL_MESH_KEY: &str = "action:cancel-mesh";
+pub const REMESH_KEY: &str = "action:remesh";
+pub const TOGGLE_AUTO_REMESH_KEY: &str = "action:toggle-auto-remesh";
 pub const TOGGLE_GRID_KEY: &str = "viewport:toggle-grid";
 pub const TOGGLE_SSAO_KEY: &str = "viewport:toggle-ssao";
 pub const FRAME_PREVIEW_KEY: &str = "viewport:frame-preview";
@@ -415,6 +418,12 @@ pub enum PreviewBuildStatus {
     Ready {
         label: String,
     },
+    /// Requested previews are out of date but were not dispatched: either
+    /// auto-remesh is off, or their builds were explicitly cancelled. An
+    /// explicit Remesh dispatches them.
+    Stale {
+        label: String,
+    },
     Failed {
         label: String,
         error: String,
@@ -445,6 +454,7 @@ impl PreviewBuildStatus {
             Self::Idle => "preview idle".to_string(),
             Self::Building { label } => format!("building {label}"),
             Self::Ready { label } => format!("ready {label}"),
+            Self::Stale { label } => format!("stale {label}"),
             Self::Failed { label, .. } => format!("failed {label}"),
         }
     }
@@ -746,6 +756,15 @@ pub struct VolumetricUiV2 {
     auto_rebuild: bool,
     pending_run: bool,
     cancel_requested: bool,
+    /// Rebuild viewport meshes automatically when their settings change.
+    /// Off, changes accumulate as "stale" until an explicit Remesh — the
+    /// sane mode for lattice-scale models where every build is expensive.
+    auto_remesh: bool,
+    /// One-shot: an explicit Remesh was clicked; the next preview sync
+    /// dispatches stale builds even with auto-remesh off.
+    remesh_requested: bool,
+    /// One-shot: cancel all in-flight preview mesh builds.
+    mesh_cancel_requested: bool,
     preview_build_status: PreviewBuildStatus,
     pending_camera_command: Option<ViewportCameraCommand>,
     viewport_texture: Option<AppTexture>,
@@ -822,6 +841,9 @@ impl VolumetricUiV2 {
             auto_rebuild: false,
             pending_run: false,
             cancel_requested: false,
+            auto_remesh: true,
+            remesh_requested: false,
+            mesh_cancel_requested: false,
             preview_build_status: PreviewBuildStatus::Idle,
             pending_camera_command: None,
             viewport_texture: None,
@@ -1401,6 +1423,32 @@ impl VolumetricUiV2 {
     /// Host hook: consumes a pending cancel request for the in-flight run.
     pub(crate) fn take_cancel_request(&mut self) -> bool {
         std::mem::take(&mut self.cancel_requested)
+    }
+
+    /// Whether viewport meshes rebuild automatically when their settings
+    /// change (the preview sync consults this every frame).
+    pub fn auto_remesh(&self) -> bool {
+        self.auto_remesh
+    }
+
+    /// Host hook: consumes a pending explicit-remesh request.
+    pub(crate) fn take_remesh_request(&mut self) -> bool {
+        std::mem::take(&mut self.remesh_requested)
+    }
+
+    /// Host hook: consumes a pending cancel request for in-flight preview
+    /// mesh builds.
+    pub(crate) fn take_mesh_cancel_request(&mut self) -> bool {
+        std::mem::take(&mut self.mesh_cancel_requested)
+    }
+
+    /// Host hook: `count` in-flight preview builds were signalled to cancel.
+    pub(crate) fn on_mesh_builds_cancelled(&mut self, count: usize) {
+        self.status = match count {
+            0 => "no mesh builds in flight".to_string(),
+            1 => "cancelled 1 mesh build".to_string(),
+            n => format!("cancelled {n} mesh builds"),
+        };
     }
 
     pub(crate) fn set_run_state(&mut self, state: RunState) {
@@ -2677,6 +2725,28 @@ impl App for VolumetricUiV2 {
             return;
         }
 
+        if event.is_click_or_activate(CANCEL_MESH_KEY) {
+            self.mesh_cancel_requested = true;
+            self.status = "cancelling mesh builds".to_string();
+            return;
+        }
+
+        if event.is_click_or_activate(REMESH_KEY) {
+            self.remesh_requested = true;
+            self.status = "remesh queued".to_string();
+            return;
+        }
+
+        if event.is_click_or_activate(TOGGLE_AUTO_REMESH_KEY) {
+            self.auto_remesh = !self.auto_remesh;
+            self.status = if self.auto_remesh {
+                "auto-remesh on".to_string()
+            } else {
+                "auto-remesh off (changes wait for Remesh)".to_string()
+            };
+            return;
+        }
+
         if event.is_click_or_activate(TOGGLE_AUTO_REBUILD_KEY) {
             self.auto_rebuild = !self.auto_rebuild;
             self.status = if self.auto_rebuild {
@@ -2899,7 +2969,7 @@ pub fn shell(app: &VolumetricUiV2) -> El {
 /// (File / Add), then run controls and status on the right.
 fn top_bar(app: &VolumetricUiV2) -> El {
     let open = app.open_menu.as_deref();
-    toolbar([
+    let mut items = vec![
         icon("layout-dashboard").icon_size(tokens::ICON_SM).muted(),
         text("Volumetric").label().semibold().key("brand-title"),
         menubar([
@@ -2909,11 +2979,16 @@ fn top_bar(app: &VolumetricUiV2) -> El {
         spacer(),
         run_status_chip(app),
         preview_status_chip(app),
-        toggle_chip("Auto", app.auto_rebuild, TOGGLE_AUTO_REBUILD_KEY),
+    ];
+    items.extend(mesh_control(app));
+    items.extend([
+        toggle_chip("Auto mesh", app.auto_remesh, TOGGLE_AUTO_REMESH_KEY),
+        toggle_chip("Auto run", app.auto_rebuild, TOGGLE_AUTO_REBUILD_KEY),
         run_control(app),
-    ])
-    .gap(tokens::SPACE_2)
-    .padding(Sides::xy(tokens::SPACE_3, tokens::SPACE_2))
+    ]);
+    toolbar(items)
+        .gap(tokens::SPACE_2)
+        .padding(Sides::xy(tokens::SPACE_3, tokens::SPACE_2))
 }
 
 /// The open menubar menu, rendered as a root overlay layer.
@@ -3688,6 +3763,7 @@ fn preview_status_chip(app: &VolumetricUiV2) -> El {
         PreviewBuildStatus::Idle => badge(label).muted().xsmall(),
         PreviewBuildStatus::Building { .. } => badge(label).info().xsmall(),
         PreviewBuildStatus::Ready { .. } => badge(label).success().xsmall(),
+        PreviewBuildStatus::Stale { .. } => badge(label).secondary().xsmall(),
         PreviewBuildStatus::Failed { .. } => badge(label).destructive().xsmall(),
     };
     let badge = if let Some(tooltip) = app.preview_build_status.tooltip() {
@@ -3708,6 +3784,27 @@ fn preview_status_chip(app: &VolumetricUiV2) -> El {
         .align(Align::Center)
     } else {
         badge
+    }
+}
+
+/// Contextual mesh-build action: Cancel while previews build, Remesh when
+/// they are stale (auto-remesh off, or the builds were cancelled). `None`
+/// when there is nothing actionable.
+fn mesh_control(app: &VolumetricUiV2) -> Option<El> {
+    match &app.preview_build_status {
+        PreviewBuildStatus::Building { .. } => Some(
+            button_with_icon("x", "Cancel")
+                .destructive()
+                .xsmall()
+                .key(CANCEL_MESH_KEY),
+        ),
+        PreviewBuildStatus::Stale { .. } => Some(
+            button_with_icon("refresh-cw", "Remesh")
+                .primary()
+                .xsmall()
+                .key(REMESH_KEY),
+        ),
+        _ => None,
     }
 }
 
@@ -5176,6 +5273,28 @@ mod tests {
         app.on_run_cancelled();
         assert_eq!(app.run_state(), RunState::Idle);
         assert!(app.summary().last_run_stale);
+    }
+
+    /// The mesh-build controls mirror the run controls: a cancel click and a
+    /// remesh click each arm a one-shot host hook, and the auto-remesh chip
+    /// toggles the policy the preview sync consults.
+    #[test]
+    fn mesh_control_clicks_arm_cancel_remesh_and_auto_toggle() {
+        let mut app = VolumetricUiV2::default();
+        assert!(app.auto_remesh(), "auto-remesh defaults on");
+
+        dispatch(&mut app, UiEvent::synthetic_click(TOGGLE_AUTO_REMESH_KEY));
+        assert!(!app.auto_remesh());
+        dispatch(&mut app, UiEvent::synthetic_click(TOGGLE_AUTO_REMESH_KEY));
+        assert!(app.auto_remesh());
+
+        dispatch(&mut app, UiEvent::synthetic_click(CANCEL_MESH_KEY));
+        assert!(app.take_mesh_cancel_request());
+        assert!(!app.take_mesh_cancel_request(), "one-shot");
+
+        dispatch(&mut app, UiEvent::synthetic_click(REMESH_KEY));
+        assert!(app.take_remesh_request());
+        assert!(!app.take_remesh_request(), "one-shot");
     }
 
     #[test]

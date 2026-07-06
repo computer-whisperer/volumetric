@@ -128,6 +128,11 @@ impl Session {
             self.run_generation += 1;
             app.on_run_cancelled();
         }
+
+        if app.take_mesh_cancel_request() {
+            let cancelled = self.viewport.preview_cache.cancel_pending();
+            app.on_mesh_builds_cancelled(cancelled);
+        }
     }
 
     /// Frame-state sync between app and viewport. Dispatches a queued project
@@ -157,7 +162,11 @@ impl Session {
             });
         }
 
-        let (status, preview_jobs) = self.viewport.preview_cache.sync(requests);
+        let (status, preview_jobs) = self.viewport.preview_cache.sync(
+            requests,
+            app.auto_remesh(),
+            app.take_remesh_request(),
+        );
         app.set_preview_build_status(status);
         app.set_output_stats(self.viewport.preview_cache.output_stats());
         app.set_viewport_overflow(self.viewport.frame_overflow_message());
@@ -848,8 +857,13 @@ impl PreviewBounds {
 #[derive(Default)]
 struct PreviewCache {
     entities: HashMap<String, CachedBuild>,
-    pending: HashMap<String, PreviewSceneKey>,
+    pending: HashMap<String, PendingBuild>,
     failed: HashMap<String, (PreviewSceneKey, String)>,
+    /// Builds the user explicitly cancelled, by the key they were cancelled
+    /// at: not re-dispatched until the key changes (a settings edit) or an
+    /// explicit remesh clears the suppression. Without this, cancelling a
+    /// still-requested build would just re-queue it on the next frame.
+    declined: HashMap<String, PreviewSceneKey>,
     /// Stamps accepted builds, so GPU residency can tell a rebuild from the
     /// same still-cached entity.
     next_revision: u64,
@@ -860,6 +874,24 @@ struct CachedBuild {
     key: PreviewSceneKey,
     entity: PreviewEntity,
     revision: u64,
+}
+
+/// One in-flight build: its cache key plus the cooperative cancel flag the
+/// executing job polls. Superseding, dropping, or explicitly cancelling the
+/// build sets the flag so the serial background worker frees up early.
+struct PendingBuild {
+    key: PreviewSceneKey,
+    cancel: Arc<AtomicBool>,
+}
+
+/// "1 output" / "N outputs", the count phrasing shared by the aggregate
+/// build-status labels (rendered behind a "building"/"stale"/"ready" prefix).
+fn count_outputs(n: usize) -> String {
+    if n == 1 {
+        "1 output".to_string()
+    } else {
+        format!("{n} outputs")
+    }
 }
 
 impl PreviewCache {
@@ -876,62 +908,119 @@ impl PreviewCache {
             .collect()
     }
 
-    /// Drops any outputs no longer requested, then returns the aggregate build
-    /// status and the jobs needed to bring the requested set up to date.
-    fn sync(&mut self, requests: &[PreviewRequest]) -> (PreviewBuildStatus, Vec<PreviewBuildJob>) {
+    /// Drops any outputs no longer requested (cancelling their in-flight
+    /// builds), then returns the aggregate build status and the jobs needed
+    /// to bring the requested set up to date.
+    ///
+    /// When `auto` is false, out-of-date outputs are counted as stale instead
+    /// of dispatched; `force` (an explicit remesh request) dispatches them
+    /// regardless and clears any explicit-cancel suppressions.
+    fn sync(
+        &mut self,
+        requests: &[PreviewRequest],
+        auto: bool,
+        force: bool,
+    ) -> (PreviewBuildStatus, Vec<PreviewBuildJob>) {
         let desired: std::collections::HashSet<&str> =
             requests.iter().map(|r| r.asset_id.as_str()).collect();
         self.entities.retain(|id, _| desired.contains(id.as_str()));
-        self.pending.retain(|id, _| desired.contains(id.as_str()));
+        self.pending.retain(|id, build| {
+            let keep = desired.contains(id.as_str());
+            if !keep {
+                build.cancel.store(true, Ordering::Relaxed);
+            }
+            keep
+        });
         self.failed.retain(|id, _| desired.contains(id.as_str()));
+        self.declined.retain(|id, _| desired.contains(id.as_str()));
+        if force {
+            self.declined.clear();
+        }
 
         let mut jobs = Vec::new();
+        let mut stale = 0usize;
         for request in requests {
             let key = PreviewSceneKey::from(request);
             let id = &request.asset_id;
             let cached = self.entities.get(id).map(|build| &build.key) == Some(&key);
-            let building = self.pending.get(id) == Some(&key);
+            let building = self.pending.get(id).map(|build| &build.key) == Some(&key);
             let failed = self.failed.get(id).map(|(k, _)| k) == Some(&key);
             if cached || building || failed {
                 continue;
             }
+            if self.declined.get(id) == Some(&key) || (!auto && !force) {
+                stale += 1;
+                continue;
+            }
+            // Dispatching a fresh build supersedes any in-flight build for
+            // this output; signal its flag so the worker frees up early
+            // instead of finishing a mesh nobody will look at.
+            if let Some(superseded) = self.pending.remove(id) {
+                superseded.cancel.store(true, Ordering::Relaxed);
+            }
+            self.declined.remove(id);
             self.failed.remove(id);
-            self.pending.insert(id.clone(), key.clone());
+            let cancel = Arc::new(AtomicBool::new(false));
+            self.pending.insert(
+                id.clone(),
+                PendingBuild {
+                    key: key.clone(),
+                    cancel: cancel.clone(),
+                },
+            );
             jobs.push(PreviewBuildJob {
                 key,
                 request: request.clone(),
+                cancel,
             });
         }
 
         let status = if !self.pending.is_empty() {
             PreviewBuildStatus::Building {
-                label: format!("{} building", self.pending.len()),
+                label: count_outputs(self.pending.len()),
             }
         } else if let Some((_, (key, error))) = self.failed.iter().next() {
             PreviewBuildStatus::Failed {
                 label: key.label(),
                 error: error.clone(),
             }
+        } else if stale > 0 {
+            PreviewBuildStatus::Stale {
+                label: count_outputs(stale),
+            }
         } else if self.entities.is_empty() {
             PreviewBuildStatus::Idle
         } else {
             PreviewBuildStatus::Ready {
-                label: format!("{} outputs", self.entities.len()),
+                label: count_outputs(self.entities.len()),
             }
         };
         (status, jobs)
     }
 
-    /// Records a completed build, ignoring results superseded by a newer request.
+    /// Signals every in-flight build's cancel flag, suppressing identical
+    /// re-dispatch until the key changes or an explicit remesh. Returns how
+    /// many builds were cancelled.
+    fn cancel_pending(&mut self) -> usize {
+        let count = self.pending.len();
+        for (id, build) in self.pending.drain() {
+            build.cancel.store(true, Ordering::Relaxed);
+            self.declined.insert(id, build.key);
+        }
+        count
+    }
+
+    /// Records a completed build, ignoring results superseded by a newer
+    /// request or already-cancelled builds.
     fn accept(&mut self, result: PreviewBuildResult) {
         let PreviewBuildResult { key, result } = result;
         let id = key.asset_id.clone();
-        if self.pending.get(&id) != Some(&key) {
+        if self.pending.get(&id).map(|build| &build.key) != Some(&key) {
             return; // a newer build for this output was requested; drop this one.
         }
-        self.pending.remove(&id);
         match result {
             Ok(entity) => {
+                self.pending.remove(&id);
                 self.failed.remove(&id);
                 self.next_revision += 1;
                 self.entities.insert(
@@ -943,7 +1032,15 @@ impl PreviewCache {
                     },
                 );
             }
-            Err(error) => {
+            // A cancelled build whose pending entry still matches: someone
+            // set the flag without retiring the entry (defensive; the cancel
+            // paths all retire it). Retire it now with no failure record —
+            // the next sync decides whether to rebuild.
+            Err(PreviewBuildError::Cancelled) => {
+                self.pending.remove(&id);
+            }
+            Err(PreviewBuildError::Failed(error)) => {
+                self.pending.remove(&id);
                 self.failed.insert(id, (key, error));
             }
         }
@@ -980,11 +1077,21 @@ impl PreviewCache {
 pub struct PreviewBuildJob {
     key: PreviewSceneKey,
     request: PreviewRequest,
+    /// Cooperative cancel flag; the cache holds the other end.
+    cancel: Arc<AtomicBool>,
 }
 
 pub struct PreviewBuildResult {
     key: PreviewSceneKey,
-    result: Result<PreviewEntity, String>,
+    result: Result<PreviewEntity, PreviewBuildError>,
+}
+
+/// Why a preview build produced no entity.
+pub enum PreviewBuildError {
+    /// The build observed its cancel flag and stopped; not a failure, and
+    /// never surfaced to the user.
+    Cancelled,
+    Failed(String),
 }
 
 /// A unit of background work, produced by [`Session::sync`] and consumed by
@@ -1087,7 +1194,11 @@ pub fn execute_job(job: BackgroundJob) -> BackgroundResult {
             }
         }
         BackgroundJob::BuildPreview(job) => {
-            let result = build_preview_scene(&job.request);
+            let result = match build_preview_scene_cancellable(&job.request, &job.cancel) {
+                Ok(Some(entity)) => Ok(entity),
+                Ok(None) => Err(PreviewBuildError::Cancelled),
+                Err(error) => Err(PreviewBuildError::Failed(error)),
+            };
             BackgroundResult::PreviewComplete(PreviewBuildResult {
                 key: job.key,
                 result,
@@ -1429,23 +1540,40 @@ pub fn build_slice_lightbox_data(
 }
 
 pub fn build_preview_scene(request: &PreviewRequest) -> Result<PreviewEntity, String> {
+    static NEVER: AtomicBool = AtomicBool::new(false);
+    build_preview_scene_cancellable(request, &NEVER)
+        .map(|entity| entity.expect("a never-set cancel flag cannot cancel the build"))
+}
+
+/// [`build_preview_scene`] with cooperative cancellation. `Ok(None)` means
+/// the flag was observed set and the build was abandoned. Only the ASN2
+/// meshing path (by far the longest-running plan) checks mid-build; the
+/// other plans check once up front.
+pub fn build_preview_scene_cancellable(
+    request: &PreviewRequest,
+    cancel: &AtomicBool,
+) -> Result<Option<PreviewEntity>, String> {
     let build_start = std::time::Instant::now();
     let mut stats = OutputStats::default();
+
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
 
     // Explicit mesh values are data, not sampleable models: draw them
     // directly, ignoring the model mesh plans.
     if request.type_hint == Some(AssetTypeHint::FeaMesh) {
-        return build_fea_mesh_preview(request, build_start);
+        return build_fea_mesh_preview(request, build_start).map(Some);
     }
     if request.type_hint == Some(AssetTypeHint::TriMesh) {
-        return build_tri_mesh_preview(request, build_start);
+        return build_tri_mesh_preview(request, build_start).map(Some);
     }
 
     // 2D sketches get a flat raster preview; the 3D mesh plans don't apply.
     let dims = volumetric::model_dimensions_from_bytes(request.data.as_slice())
         .map_err(format_error_chain)?;
     if dims == 2 {
-        return build_sketch_preview(request, build_start);
+        return build_sketch_preview(request, build_start).map(Some);
     }
 
     // The plan normally matches the runtime dimensionality (the UI probes
@@ -1506,9 +1634,15 @@ pub fn build_preview_scene(request: &PreviewRequest) -> Result<PreviewEntity, St
             let config = mesh_plan
                 .adaptive_surface_nets_config()
                 .ok_or_else(|| "missing adaptive surface nets config".to_string())?;
-            let mesh =
-                volumetric::generate_adaptive_mesh_v2_from_bytes(request.data.as_slice(), &config)
-                    .map_err(format_error_chain)?;
+            let Some(mesh) = volumetric::generate_adaptive_mesh_v2_from_bytes_cancellable(
+                request.data.as_slice(),
+                &config,
+                cancel,
+            )
+            .map_err(format_error_chain)?
+            else {
+                return Ok(None);
+            };
             stats.triangles = mesh.indices.len() / 3;
             stats.samples = mesh.stats.total_samples;
             stats.detail = asn2_stage_lines(&mesh.stats);
@@ -1564,7 +1698,7 @@ pub fn build_preview_scene(request: &PreviewRequest) -> Result<PreviewEntity, St
     }
 
     stats.mesh_ms = build_start.elapsed().as_secs_f64() * 1000.0;
-    Ok(PreviewEntity {
+    Ok(Some(PreviewEntity {
         scene,
         bounds: PreviewBounds {
             min: bounds_min,
@@ -1572,7 +1706,7 @@ pub fn build_preview_scene(request: &PreviewRequest) -> Result<PreviewEntity, St
         },
         stats,
         wireframe_lines,
-    })
+    }))
 }
 
 /// Colormaps every point instance and mesh vertex of a built preview scene
@@ -2887,7 +3021,7 @@ function get_bounds_max_y() return 1.5 end
     fn wireframe_toggle_flags_without_rebuilding() {
         let mut cache = PreviewCache::default();
         let requests = vec![request("a", 32)];
-        let (_, jobs) = cache.sync(&requests);
+        let (_, jobs) = cache.sync(&requests, true, false);
         assert_eq!(jobs.len(), 1);
         for job in jobs {
             let mut built = entity();
@@ -2909,7 +3043,7 @@ function get_bounds_max_y() return 1.5 end
 
         let mut wire_requests = requests.clone();
         wire_requests[0].wireframe = true;
-        let (_, jobs) = cache.sync(&wire_requests);
+        let (_, jobs) = cache.sync(&wire_requests, true, false);
         assert!(jobs.is_empty(), "toggling wireframe must not rebuild");
         let visible = cache.visible(&wire_requests);
         assert!(visible[0].2, "wireframe on");
@@ -2925,7 +3059,7 @@ function get_bounds_max_y() return 1.5 end
         let mut cache = PreviewCache::default();
         let requests = vec![request("a", 8), request("b", 8)];
 
-        let (status, jobs) = cache.sync(&requests);
+        let (status, jobs) = cache.sync(&requests, true, false);
         assert_eq!(jobs.len(), 2, "one build job per output");
         assert!(matches!(status, PreviewBuildStatus::Building { .. }));
         assert!(cache.visible(&requests).is_empty(), "nothing built yet");
@@ -2934,7 +3068,7 @@ function get_bounds_max_y() return 1.5 end
             accept_ok(&mut cache, job);
         }
 
-        let (status, jobs) = cache.sync(&requests);
+        let (status, jobs) = cache.sync(&requests, true, false);
         assert!(jobs.is_empty(), "everything cached, no rebuild");
         assert!(matches!(status, PreviewBuildStatus::Ready { .. }));
 
@@ -2955,12 +3089,12 @@ function get_bounds_max_y() return 1.5 end
     fn resolution_change_keeps_stale_output_until_rebuilt() {
         let mut cache = PreviewCache::default();
         let coarse = vec![request("a", 8)];
-        let (_, jobs) = cache.sync(&coarse);
+        let (_, jobs) = cache.sync(&coarse, true, false);
         accept_ok(&mut cache, jobs.into_iter().next().unwrap());
         let coarse_revision = cache.visible(&coarse)[0].1;
 
         let fine = vec![request("a", 32)];
-        let (status, jobs) = cache.sync(&fine);
+        let (status, jobs) = cache.sync(&fine, true, false);
         assert_eq!(jobs.len(), 1, "the finer resolution requeues a build");
         assert!(matches!(status, PreviewBuildStatus::Building { .. }));
 
@@ -2984,20 +3118,20 @@ function get_bounds_max_y() return 1.5 end
         // stable cache key) across syncs, mirroring the app's `data_arc()`.
         let (a, b) = (request("a", 8), request("b", 8));
         let both = vec![a.clone(), b.clone()];
-        let (_, jobs) = cache.sync(&both);
+        let (_, jobs) = cache.sync(&both, true, false);
         for job in jobs {
             accept_ok(&mut cache, job);
         }
 
         let only_a = vec![a.clone()];
-        let (_, jobs) = cache.sync(&only_a);
+        let (_, jobs) = cache.sync(&only_a, true, false);
         assert!(jobs.is_empty());
         let visible = cache.visible(&only_a);
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].0, "a");
 
         // "b" was evicted, so requesting it again requires a fresh build.
-        let (_, jobs) = cache.sync(&both);
+        let (_, jobs) = cache.sync(&both, true, false);
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].key.asset_id, "b");
     }
@@ -3007,12 +3141,12 @@ function get_bounds_max_y() return 1.5 end
     #[test]
     fn superseded_build_result_is_ignored() {
         let mut cache = PreviewCache::default();
-        let (_, jobs) = cache.sync(&[request("a", 8)]);
+        let (_, jobs) = cache.sync(&[request("a", 8)], true, false);
         let stale_job = jobs.into_iter().next().unwrap();
 
         // Re-request "a" at a new resolution before the first build returns.
         let fine = vec![request("a", 32)];
-        let (_, jobs) = cache.sync(&fine);
+        let (_, jobs) = cache.sync(&fine, true, false);
         let fresh_job = jobs.into_iter().next().unwrap();
 
         // The stale build lands first and must be dropped.
@@ -3023,11 +3157,100 @@ function get_bounds_max_y() return 1.5 end
         assert!(!cache.visible(&fine).is_empty(), "fresh result accepted");
     }
 
+    /// With auto-remesh off, out-of-date outputs are counted stale rather
+    /// than dispatched; an explicit remesh (force) dispatches them anyway.
+    #[test]
+    fn auto_remesh_off_holds_builds_until_forced() {
+        let mut cache = PreviewCache::default();
+        let requests = vec![request("a", 8)];
+
+        let (status, jobs) = cache.sync(&requests, false, false);
+        assert!(jobs.is_empty(), "auto off: nothing dispatched");
+        assert!(matches!(status, PreviewBuildStatus::Stale { .. }));
+
+        let (status, jobs) = cache.sync(&requests, false, true);
+        assert_eq!(jobs.len(), 1, "explicit remesh dispatches");
+        assert!(matches!(status, PreviewBuildStatus::Building { .. }));
+    }
+
+    /// Superseding an in-flight build (same output, new settings) signals
+    /// the old build's cancel flag so the serial worker abandons it instead
+    /// of finishing a mesh nobody will look at.
+    #[test]
+    fn superseding_an_inflight_build_signals_its_cancel_flag() {
+        let mut cache = PreviewCache::default();
+        let (_, jobs) = cache.sync(&[request("a", 8)], true, false);
+        let old = jobs.into_iter().next().unwrap();
+        assert!(!old.cancel.load(Ordering::Relaxed));
+
+        let (_, jobs) = cache.sync(&[request("a", 32)], true, false);
+        assert_eq!(jobs.len(), 1, "the new settings dispatch a fresh build");
+        assert!(
+            old.cancel.load(Ordering::Relaxed),
+            "superseded build signalled"
+        );
+    }
+
+    /// Dropping an output entirely also signals its in-flight build.
+    #[test]
+    fn dropping_an_output_cancels_its_inflight_build() {
+        let mut cache = PreviewCache::default();
+        let (_, jobs) = cache.sync(&[request("a", 8)], true, false);
+        let job = jobs.into_iter().next().unwrap();
+
+        cache.sync(&[], true, false);
+        assert!(job.cancel.load(Ordering::Relaxed));
+    }
+
+    /// An explicit cancel suppresses re-dispatch of the identical build
+    /// (otherwise the next frame would immediately requeue it), until the
+    /// key changes or a remesh forces it. The cancelled result itself is
+    /// dropped without a failure record.
+    #[test]
+    fn explicit_cancel_suppresses_identical_redispatch() {
+        let mut cache = PreviewCache::default();
+        let requests = vec![request("a", 8)];
+        let (_, jobs) = cache.sync(&requests, true, false);
+        let job = jobs.into_iter().next().unwrap();
+
+        assert_eq!(cache.cancel_pending(), 1);
+        assert!(job.cancel.load(Ordering::Relaxed));
+        cache.accept(PreviewBuildResult {
+            key: job.key,
+            result: Err(PreviewBuildError::Cancelled),
+        });
+
+        let (status, jobs) = cache.sync(&requests, true, false);
+        assert!(jobs.is_empty(), "same key stays suppressed");
+        assert!(
+            matches!(status, PreviewBuildStatus::Stale { .. }),
+            "cancelled build reads as stale, not failed"
+        );
+
+        // A settings change (new key) lifts the suppression naturally...
+        let (_, jobs) = cache.sync(&[request("a", 32)], true, false);
+        assert_eq!(jobs.len(), 1);
+    }
+
+    /// ...and so does an explicit remesh at the unchanged key.
+    #[test]
+    fn explicit_remesh_clears_cancel_suppression() {
+        let mut cache = PreviewCache::default();
+        let requests = vec![request("a", 8)];
+        let (_, jobs) = cache.sync(&requests, true, false);
+        drop(jobs);
+        cache.cancel_pending();
+
+        let (_, jobs) = cache.sync(&requests, true, true);
+        assert_eq!(jobs.len(), 1);
+    }
+
     fn preview_job(id: &str, resolution: usize) -> BackgroundJob {
         let request = request(id, resolution);
         BackgroundJob::BuildPreview(PreviewBuildJob {
             key: PreviewSceneKey::from(&request),
             request,
+            cancel: Arc::new(AtomicBool::new(false)),
         })
     }
 
