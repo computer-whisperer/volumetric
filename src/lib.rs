@@ -423,6 +423,59 @@ pub fn model_dimensions_from_bytes(wasm_bytes: &[u8]) -> anyhow::Result<u32> {
     Ok(executor.dimensions()?)
 }
 
+/// Number of dimensions a model WASM reports, read statically — no
+/// instantiation. Every model generator emits `get_dimensions` as a single
+/// `i32.const`, so a streaming scan of the export and code sections
+/// recovers it; `None` when the export is missing or the body isn't a
+/// bare constant (fall back to instantiating in that case). Cheap enough
+/// for UI paths that need an output's dimensionality synchronously.
+pub fn model_dimensions_static(wasm_bytes: &[u8]) -> Option<u32> {
+    use wasmparser::{ExternalKind, Operator, Parser, Payload, TypeRef};
+
+    let mut imported_funcs = 0u32;
+    let mut target: Option<u32> = None;
+    let mut next_code_index = 0u32;
+    for payload in Parser::new(0).parse_all(wasm_bytes) {
+        // Section order (imports < exports < code) is fixed by the spec, so
+        // `target` is known before the code entries stream past.
+        match payload.ok()? {
+            Payload::ImportSection(reader) => {
+                for import in reader.into_imports() {
+                    if matches!(import.ok()?.ty, TypeRef::Func(_)) {
+                        imported_funcs += 1;
+                    }
+                }
+            }
+            Payload::ExportSection(reader) => {
+                for export in reader {
+                    let export = export.ok()?;
+                    if export.kind == ExternalKind::Func && export.name == "get_dimensions" {
+                        target = Some(export.index);
+                    }
+                }
+            }
+            Payload::CodeSectionEntry(body) => {
+                let func_index = imported_funcs + next_code_index;
+                next_code_index += 1;
+                if Some(func_index) != target {
+                    continue;
+                }
+                let mut ops = body.get_operators_reader().ok()?;
+                let value = match ops.read().ok()? {
+                    Operator::I32Const { value } => value,
+                    _ => return None,
+                };
+                return match ops.read().ok()? {
+                    Operator::End if value >= 0 => Some(value as u32),
+                    _ => None,
+                };
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Rasterize a 2D model into a sample-value grid over its own bounds,
 /// sampling at cell centers. `resolution` is the cell count along the longer
 /// bounds axis; the other axis is scaled to keep cells square (aspect-correct

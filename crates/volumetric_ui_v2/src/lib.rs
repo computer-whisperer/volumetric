@@ -56,6 +56,12 @@ const OUTPUT_DEFAULTS_PREFIX: &str = "output:defaults:";
 /// ASN2 setting stepper: `output:asn2:{id}:{field}:{up|down}`.
 const OUTPUT_ASN2_PREFIX: &str = "output:asn2:";
 const OUTPUT_WIREFRAME_PREFIX: &str = "output:wire:";
+/// FEA view controls: deformed toggle (`output:fea-deformed:{id}`),
+/// exaggeration stepper (`output:fea-exag:{id}:{up|down}`), colormap field
+/// (`output:fea-field:{id}:{node|element}:{name}` or `output:fea-field:{id}:none`).
+const OUTPUT_FEA_DEFORMED_PREFIX: &str = "output:fea-deformed:";
+const OUTPUT_FEA_EXAG_PREFIX: &str = "output:fea-exag:";
+const OUTPUT_FEA_FIELD_PREFIX: &str = "output:fea-field:";
 const EXPORT_STL_PREFIX: &str = "output:stl:";
 const EXPORT_WASM_PREFIX: &str = "output:wasm:";
 /// Draggable divider between the viewport and the project panel.
@@ -86,6 +92,12 @@ const CONFIG_BOOL_PREFIX: &str = "cfg-bool:";
 const CONFIG_ENUM_PREFIX: &str = "cfg-enum:";
 const LUA_SOURCE_KEY: &str = "lua-source";
 const PREVIEW_RESOLUTIONS: [usize; 9] = [16, 24, 32, 48, 64, 96, 128, 192, 256];
+/// Raster resolutions offered for 2D field outputs (cells along the longer
+/// bounds axis).
+const SKETCH_RESOLUTIONS: [usize; 5] = [64, 128, 256, 512, 1024];
+const SKETCH_RESOLUTION_DEFAULT: usize = 256;
+/// FEA deformation exaggeration ladder, in tenths (0.1x .. 100x).
+const FEA_EXAGGERATION_TENTHS: [u16; 10] = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProjectSelection {
@@ -183,6 +195,10 @@ pub struct OutputStats {
     pub samples: u64,
     /// Preformatted per-stage profiling lines (ASN2 only).
     pub detail: Vec<String>,
+    /// Colormappable fields of an FEA mesh output, qualified as
+    /// `node:{name}` / `element:{name}` (node fields with 1 or 3 components,
+    /// element fields with 1). Feeds the per-output field picker.
+    pub fea_fields: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -268,8 +284,8 @@ pub struct PreviewRequest {
     pub data: Arc<Vec<u8>>,
     pub type_hint: Option<AssetTypeHint>,
     pub precursor_ids: Vec<String>,
-    pub render_mode: PreviewRenderMode,
-    pub mesh_plan: PreviewMeshPlan,
+    /// The per-kind build recipe (part of the preview cache key).
+    pub plan: PreviewPlan,
     /// Overlay the mesh edges as lines (display-only; not part of the mesh
     /// cache key, so toggling never re-meshes).
     pub wireframe: bool,
@@ -422,15 +438,135 @@ pub enum FileAction {
     ImportImage,
 }
 
-/// Render settings for one output. Stored per asset id when the user
-/// overrides the viewport defaults for that output.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct OutputRender {
-    pub mode: PreviewRenderMode,
-    pub resolution: usize,
-    pub asn2: Asn2Settings,
-    /// Draw the mesh's edges as an overlay (display-only; never re-meshes).
+/// What an output *is*, for view purposes: each kind gets its own render
+/// settings and its own controls in the per-output settings popover.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum OutputKind {
+    /// A 3D model WASM: meshed by one of the volume mesh plans.
+    Model3d,
+    /// A 2D model WASM (sketch or scalar field): flat raster preview.
+    Model2d,
+    /// An FEA mesh value: boundary faces with FEA-specific view modes.
+    FeaMesh,
+    /// A triangle mesh value: drawn as-is.
+    TriMesh,
+}
+
+/// FEA-specific view settings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FeaRender {
+    /// Apply the `displacement` node field to positions (when present).
+    pub deformed: bool,
+    /// Displacement exaggeration in tenths (10 = true scale); integer so
+    /// the settings stay `Eq` for the preview cache key.
+    pub exaggeration_tenths: u16,
+    /// Colormapped field, qualified as `node:{name}` / `element:{name}`;
+    /// `None` draws plain shaded faces.
+    pub color_field: Option<String>,
+    /// Element-edge overlay.
     pub wireframe: bool,
+}
+
+impl Default for FeaRender {
+    fn default() -> Self {
+        Self {
+            deformed: true,
+            exaggeration_tenths: 10,
+            color_field: None,
+            wireframe: false,
+        }
+    }
+}
+
+/// Render settings for one output, per [`OutputKind`]. Stored per asset id
+/// when the user overrides the defaults for that output.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OutputRender {
+    Model3d {
+        mode: PreviewRenderMode,
+        resolution: usize,
+        asn2: Asn2Settings,
+        /// Draw the mesh's edges as an overlay (display-only; never
+        /// re-meshes).
+        wireframe: bool,
+    },
+    Model2d {
+        /// Raster cells along the longer bounds axis.
+        resolution: usize,
+    },
+    FeaMesh(FeaRender),
+    TriMesh {
+        wireframe: bool,
+    },
+}
+
+impl OutputRender {
+    fn kind(&self) -> OutputKind {
+        match self {
+            Self::Model3d { .. } => OutputKind::Model3d,
+            Self::Model2d { .. } => OutputKind::Model2d,
+            Self::FeaMesh(_) => OutputKind::FeaMesh,
+            Self::TriMesh { .. } => OutputKind::TriMesh,
+        }
+    }
+
+    /// One-line summary for the outputs table ("ASN2 · 64^3", "2D raster
+    /// · 256", …).
+    fn summary(&self) -> String {
+        match self {
+            Self::Model3d {
+                mode, resolution, ..
+            } => format!("{} · {}^3", mode.label(), resolution),
+            Self::Model2d { resolution } => format!("2D raster · {resolution}"),
+            Self::FeaMesh(fea) => match &fea.color_field {
+                Some(field) => format!(
+                    "FEA · {}",
+                    field.split_once(':').map(|(_, name)| name).unwrap_or(field)
+                ),
+                None => "FEA".to_string(),
+            },
+            Self::TriMesh { .. } => "triangle mesh".to_string(),
+        }
+    }
+
+    /// The display-only wireframe overlay flag, where the kind has one.
+    fn wireframe(&self) -> bool {
+        match self {
+            Self::Model3d { wireframe, .. } | Self::TriMesh { wireframe } => *wireframe,
+            Self::FeaMesh(fea) => fea.wireframe,
+            Self::Model2d { .. } => false,
+        }
+    }
+}
+
+/// The per-kind build recipe a [`PreviewRequest`] carries; part of the
+/// preview cache key, so any change here rebuilds the preview.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PreviewPlan {
+    Model3d(PreviewMeshPlan),
+    Sketch {
+        resolution: usize,
+    },
+    FeaMesh {
+        deformed: bool,
+        exaggeration_tenths: u16,
+        color_field: Option<String>,
+    },
+    TriMesh,
+}
+
+impl PreviewPlan {
+    pub fn label(&self) -> String {
+        match self {
+            Self::Model3d(mesh_plan) => mesh_plan.label(),
+            Self::Sketch { resolution } => format!("2D raster {resolution}"),
+            Self::FeaMesh { color_field, .. } => match color_field {
+                Some(field) => format!("FEA mesh · {field}"),
+                None => "FEA mesh".to_string(),
+            },
+            Self::TriMesh => "Triangle mesh".to_string(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -441,9 +577,15 @@ pub struct VolumetricUiV2 {
     /// Outputs pinned to stay in the viewport regardless of the current
     /// selection. The rendered scene is the selected node's output plus these.
     pinned_outputs: std::collections::BTreeSet<String>,
-    /// Per-output render settings; outputs without an entry follow the global
-    /// `render_mode`/`preview_resolution` defaults.
+    /// Per-output render settings; outputs without an entry follow the
+    /// kind's defaults (3D models: the global `render_mode`/
+    /// `preview_resolution`).
     output_overrides: std::collections::BTreeMap<String, OutputRender>,
+    /// Statically probed model dimensionality per output id, keyed by the
+    /// asset bytes' (ptr, len) so re-runs revalidate. Interior mutability:
+    /// the view path (settings popover) queries kinds through `&self`.
+    output_dims:
+        std::cell::RefCell<std::collections::HashMap<String, ((usize, usize), Option<u32>)>>,
     render_mode: PreviewRenderMode,
     preview_resolution: usize,
     camera_control_scheme: CameraControlScheme,
@@ -513,6 +655,7 @@ impl VolumetricUiV2 {
             selected_project_item: None,
             pinned_outputs: std::collections::BTreeSet::new(),
             output_overrides: std::collections::BTreeMap::new(),
+            output_dims: std::cell::RefCell::new(std::collections::HashMap::new()),
             render_mode: PreviewRenderMode::AdaptiveSurfaceNets2,
             preview_resolution: 64,
             camera_control_scheme: CameraControlScheme::default(),
@@ -631,25 +774,74 @@ impl VolumetricUiV2 {
             || (self.selection_is_renderable() && self.selected_render_id() == Some(id))
     }
 
-    /// Effective render settings for an output: its override if present,
-    /// otherwise the viewport defaults.
-    fn output_render(&self, id: &str) -> OutputRender {
-        self.output_overrides
-            .get(id)
-            .copied()
-            .unwrap_or(OutputRender {
+    /// What kind of output `id` is, for view purposes. FEA and triangle
+    /// meshes classify by type hint; models split 2D/3D by a cheap static
+    /// scan of the wasm (cached per asset id + byte length). Unknown ids
+    /// and unparseable models default to 3D.
+    fn output_kind(&self, id: &str) -> OutputKind {
+        let Some(asset) = self.runtime_assets.iter().find(|a| a.id() == id) else {
+            return OutputKind::Model3d;
+        };
+        match asset.type_hint() {
+            Some(AssetTypeHint::FeaMesh) => OutputKind::FeaMesh,
+            Some(AssetTypeHint::TriMesh) => OutputKind::TriMesh,
+            _ => {
+                let data = asset.data_arc();
+                let key = (Arc::as_ptr(&data) as usize, data.len());
+                let mut cache = self.output_dims.borrow_mut();
+                let dims = match cache.get(id) {
+                    Some((cached_key, dims)) if *cached_key == key => *dims,
+                    _ => {
+                        let dims = volumetric::model_dimensions_static(&data);
+                        cache.insert(id.to_string(), (key, dims));
+                        dims
+                    }
+                };
+                if dims == Some(2) {
+                    OutputKind::Model2d
+                } else {
+                    OutputKind::Model3d
+                }
+            }
+        }
+    }
+
+    /// Default render settings for an output of the given kind. 3D models
+    /// follow the viewport-global mode/resolution defaults.
+    fn default_output_render(&self, kind: OutputKind) -> OutputRender {
+        match kind {
+            OutputKind::Model3d => OutputRender::Model3d {
                 mode: self.render_mode,
                 resolution: self.preview_resolution,
                 asn2: Asn2Settings::default(),
                 wireframe: false,
-            })
+            },
+            OutputKind::Model2d => OutputRender::Model2d {
+                resolution: SKETCH_RESOLUTION_DEFAULT,
+            },
+            OutputKind::FeaMesh => OutputRender::FeaMesh(FeaRender::default()),
+            OutputKind::TriMesh => OutputRender::TriMesh { wireframe: false },
+        }
+    }
+
+    /// Effective render settings for an output: its override if present
+    /// (and still matching the output's kind — a re-run can change what an
+    /// id produces), otherwise the kind's defaults.
+    fn output_render(&self, id: &str) -> OutputRender {
+        let kind = self.output_kind(id);
+        match self.output_overrides.get(id) {
+            Some(render) if render.kind() == kind => render.clone(),
+            _ => self.default_output_render(kind),
+        }
     }
 
     /// Adjusts one ASN2 setting for an output; `up` steps the value up. The
-    /// `sharp` field toggles regardless of direction.
+    /// `sharp` field toggles regardless of direction. 3D models only.
     fn adjust_output_asn2(&mut self, id: &str, field: &str, up: bool) {
         let mut render = self.output_render(id);
-        let asn2 = &mut render.asn2;
+        let OutputRender::Model3d { asn2, .. } = &mut render else {
+            return;
+        };
         let step_usize = |v: usize| {
             if up {
                 (v + 1).min(16)
@@ -674,24 +866,98 @@ impl VolumetricUiV2 {
 
     fn set_output_mode(&mut self, id: &str, mode: PreviewRenderMode) {
         let mut render = self.output_render(id);
-        render.mode = mode;
+        let OutputRender::Model3d { mode: slot, .. } = &mut render else {
+            return;
+        };
+        *slot = mode;
         self.output_overrides.insert(id.to_string(), render);
         self.status = format!("{id}: {}", mode.full_label());
     }
 
     fn set_output_resolution(&mut self, id: &str, resolution: usize) {
         let mut render = self.output_render(id);
-        render.resolution = resolution;
+        match &mut render {
+            OutputRender::Model3d {
+                resolution: slot, ..
+            } => {
+                *slot = resolution;
+                self.status = format!("{id}: {resolution}^3");
+            }
+            OutputRender::Model2d { resolution: slot } => {
+                *slot = resolution;
+                self.status = format!("{id}: {resolution} px raster");
+            }
+            _ => return,
+        }
         self.output_overrides.insert(id.to_string(), render);
-        self.status = format!("{id}: {resolution}^3");
     }
 
     fn toggle_output_wireframe(&mut self, id: &str) {
         let mut render = self.output_render(id);
-        render.wireframe = !render.wireframe;
-        let state = if render.wireframe { "on" } else { "off" };
+        let slot = match &mut render {
+            OutputRender::Model3d { wireframe, .. } | OutputRender::TriMesh { wireframe } => {
+                wireframe
+            }
+            OutputRender::FeaMesh(fea) => &mut fea.wireframe,
+            OutputRender::Model2d { .. } => return,
+        };
+        *slot = !*slot;
+        let state = if *slot { "on" } else { "off" };
         self.output_overrides.insert(id.to_string(), render);
         self.status = format!("{id}: wireframe {state}");
+    }
+
+    fn toggle_output_fea_deformed(&mut self, id: &str) {
+        let mut render = self.output_render(id);
+        let OutputRender::FeaMesh(fea) = &mut render else {
+            return;
+        };
+        fea.deformed = !fea.deformed;
+        let state = if fea.deformed {
+            "deformed"
+        } else {
+            "undeformed"
+        };
+        self.output_overrides.insert(id.to_string(), render);
+        self.status = format!("{id}: {state}");
+    }
+
+    /// Steps the FEA deformation exaggeration through its preset ladder.
+    fn adjust_output_fea_exaggeration(&mut self, id: &str, up: bool) {
+        let mut render = self.output_render(id);
+        let OutputRender::FeaMesh(fea) = &mut render else {
+            return;
+        };
+        let pos = FEA_EXAGGERATION_TENTHS
+            .iter()
+            .position(|&t| t >= fea.exaggeration_tenths)
+            .unwrap_or(FEA_EXAGGERATION_TENTHS.len() - 1);
+        let next = if up {
+            (pos + 1).min(FEA_EXAGGERATION_TENTHS.len() - 1)
+        } else {
+            pos.saturating_sub(1)
+        };
+        fea.exaggeration_tenths = FEA_EXAGGERATION_TENTHS[next];
+        self.status = format!(
+            "{id}: deformation x{}",
+            fea.exaggeration_tenths as f32 / 10.0
+        );
+        self.output_overrides.insert(id.to_string(), render);
+    }
+
+    /// Sets the FEA colormap field (a `node:{name}` / `element:{name}`
+    /// qualified name, or `None` for plain shading).
+    fn set_output_fea_field(&mut self, id: &str, field: Option<String>) {
+        let mut render = self.output_render(id);
+        let OutputRender::FeaMesh(fea) = &mut render else {
+            return;
+        };
+        self.status = match &field {
+            Some(name) => format!("{id}: colormap {name}"),
+            None => format!("{id}: plain shading"),
+        };
+        fea.color_field = field;
+        self.output_overrides.insert(id.to_string(), render);
     }
 
     fn clear_output_override(&mut self, id: &str) {
@@ -710,14 +976,30 @@ impl VolumetricUiV2 {
         }
 
         let render = self.output_render(asset.id());
+        let plan = match &render {
+            OutputRender::Model3d {
+                mode,
+                resolution,
+                asn2,
+                ..
+            } => PreviewPlan::Model3d(PreviewMeshPlan::for_mode(*mode, *resolution, *asn2)),
+            OutputRender::Model2d { resolution } => PreviewPlan::Sketch {
+                resolution: *resolution,
+            },
+            OutputRender::FeaMesh(fea) => PreviewPlan::FeaMesh {
+                deformed: fea.deformed,
+                exaggeration_tenths: fea.exaggeration_tenths,
+                color_field: fea.color_field.clone(),
+            },
+            OutputRender::TriMesh { .. } => PreviewPlan::TriMesh,
+        };
         Some(PreviewRequest {
             asset_id: asset.id().to_string(),
             data: asset.data_arc(),
             type_hint: asset.type_hint(),
             precursor_ids: asset.precursor_ids().to_vec(),
-            render_mode: render.mode,
-            mesh_plan: PreviewMeshPlan::for_mode(render.mode, render.resolution, render.asn2),
-            wireframe: render.wireframe,
+            plan,
+            wireframe: render.wireframe(),
             show_grid: self.show_grid,
             ssao: self.ssao,
             ssao_radius: self.ssao_radius,
@@ -2081,6 +2363,26 @@ impl App for VolumetricUiV2 {
             self.clear_output_override(id);
         } else if let Some(id) = route.strip_prefix(OUTPUT_WIREFRAME_PREFIX) {
             self.toggle_output_wireframe(id);
+        } else if let Some(id) = route.strip_prefix(OUTPUT_FEA_DEFORMED_PREFIX) {
+            self.toggle_output_fea_deformed(id);
+        } else if let Some(rest) = route.strip_prefix(OUTPUT_FEA_EXAG_PREFIX) {
+            if let Some((id, direction)) = rest.rsplit_once(':') {
+                self.adjust_output_fea_exaggeration(id, direction == "up");
+            }
+        } else if let Some(rest) = route.strip_prefix(OUTPUT_FEA_FIELD_PREFIX) {
+            // `{id}:none` or `{id}:{node|element}:{name}` — split the value
+            // off the right so asset ids with colons still resolve.
+            if let Some((id, "none")) = rest
+                .rsplit_once(':')
+                .and_then(|(head, tail)| (tail == "none").then_some((head, tail)))
+            {
+                self.set_output_fea_field(id, None);
+            } else if let Some((head, name)) = rest.rsplit_once(':')
+                && let Some((id, container)) = head.rsplit_once(':')
+                && matches!(container, "node" | "element")
+            {
+                self.set_output_fea_field(id, Some(format!("{container}:{name}")));
+            }
         } else if let Some(rest) = route.strip_prefix(SSAO_ADJUST_PREFIX) {
             if let Some((field, direction)) = rest.split_once(':') {
                 self.adjust_ssao(field, direction == "up");
@@ -2276,88 +2578,51 @@ fn ssao_settings_popover(app: &VolumetricUiV2) -> El {
     )
 }
 
-/// Anchored settings popover for one output: render mode + resolution, and a
-/// reset to the viewport defaults when overridden. Picks keep the popover
-/// open (it's a settings panel, not a value picker); outside click dismisses.
+/// Anchored settings popover for one output, with controls for the output's
+/// kind (3D mesh plans, 2D raster resolution, FEA view modes, …) and a
+/// reset to the defaults when overridden. Picks keep the popover open (it's
+/// a settings panel, not a value picker); outside click dismisses.
 fn output_settings_popover(app: &VolumetricUiV2, id: &str) -> El {
     let render = app.output_render(id);
     let trigger_key = format!("{OUTPUT_SETTINGS_PREFIX}{id}");
 
-    let mode_buttons = row(PreviewRenderMode::ALL.into_iter().map(|mode| {
-        let button = button(mode.label())
-            .xsmall()
-            .tooltip(mode.full_label())
-            .key(format!("{OUTPUT_MODE_PREFIX}{id}:{}", mode.route_name()));
-        if render.mode == mode {
-            button.primary()
-        } else {
-            button.secondary()
+    let mut body = vec![text(id).label().semibold().ellipsis()];
+    match &render {
+        OutputRender::Model3d {
+            mode,
+            resolution,
+            asn2,
+            wireframe,
+        } => {
+            body.extend(model3d_settings(id, *mode, *resolution, asn2, *wireframe));
         }
-    }))
-    .gap(tokens::SPACE_1);
-    // Two rows: the preset ladder is too wide for one popover line.
-    let resolution_buttons = column(PREVIEW_RESOLUTIONS.chunks(5).map(|chunk| {
-        row(chunk.iter().map(|&resolution| {
-            let button = button(format!("{resolution}^3"))
-                .xsmall()
-                .key(format!("{OUTPUT_RESOLUTION_PREFIX}{id}:{resolution}"));
-            if render.resolution == resolution {
-                button.primary()
-            } else {
-                button.secondary()
-            }
-        }))
-        .gap(tokens::SPACE_1)
-    }))
-    .gap(tokens::SPACE_1);
-
-    let mut body = vec![
-        text(id).label().semibold().ellipsis(),
-        text("Render Mode").caption().muted(),
-        mode_buttons,
-        text("Resolution").caption().muted(),
-        resolution_buttons,
-    ];
-    if render.mode != PreviewRenderMode::Points {
-        body.push(
-            field_row(
-                "Wireframe",
-                switch(format!("{OUTPUT_WIREFRAME_PREFIX}{id}"), render.wireframe),
-            )
-            .gap(tokens::SPACE_2),
-        );
-    }
-    if render.mode == PreviewRenderMode::AdaptiveSurfaceNets2 {
-        body.push(text("ASN2 Quality").caption().muted());
-        body.push(asn2_stepper_row(
-            id,
-            "vr",
-            "Vertex refine",
-            &render.asn2.vertex_refinement_iterations.to_string(),
-        ));
-        body.push(asn2_stepper_row(
-            id,
-            "nr",
-            "Normal refine",
-            &render.asn2.normal_sample_iterations.to_string(),
-        ));
-        body.push(
-            field_row(
-                "Sharp edges",
-                switch(
-                    format!("{OUTPUT_ASN2_PREFIX}{id}:sharp:up"),
-                    render.asn2.sharp_edges,
-                ),
-            )
-            .gap(tokens::SPACE_2),
-        );
-        if render.asn2.sharp_edges {
-            body.push(asn2_stepper_row(
-                id,
-                "angle",
-                "Angle (deg)",
-                &render.asn2.sharp_angle_degrees.to_string(),
-            ));
+        OutputRender::Model2d { resolution } => {
+            body.push(text("Raster Resolution").caption().muted());
+            body.push(
+                row(SKETCH_RESOLUTIONS.iter().map(|&preset| {
+                    let button = button(preset.to_string())
+                        .xsmall()
+                        .key(format!("{OUTPUT_RESOLUTION_PREFIX}{id}:{preset}"));
+                    if *resolution == preset {
+                        button.primary()
+                    } else {
+                        button.secondary()
+                    }
+                }))
+                .gap(tokens::SPACE_1),
+            );
+        }
+        OutputRender::FeaMesh(fea) => {
+            body.extend(fea_settings(app, id, fea));
+        }
+        OutputRender::TriMesh { wireframe } => {
+            body.push(
+                field_row(
+                    "Wireframe",
+                    switch(format!("{OUTPUT_WIREFRAME_PREFIX}{id}"), *wireframe),
+                )
+                .gap(tokens::SPACE_2),
+            );
         }
     }
     if let Some(stats) = app.output_stats.get(id) {
@@ -2412,6 +2677,176 @@ fn output_settings_popover(app: &VolumetricUiV2, id: &str) -> El {
         // shadow); a bare column would float transparently over the panel.
         popover_panel([column(body).gap(tokens::SPACE_2).padding(tokens::SPACE_2)]),
     )
+}
+
+/// 3D model settings: render mode, voxel resolution, wireframe, ASN2 knobs.
+fn model3d_settings(
+    id: &str,
+    mode: PreviewRenderMode,
+    resolution: usize,
+    asn2: &Asn2Settings,
+    wireframe: bool,
+) -> Vec<El> {
+    let mode_buttons = row(PreviewRenderMode::ALL.into_iter().map(|preset| {
+        let button = button(preset.label())
+            .xsmall()
+            .tooltip(preset.full_label())
+            .key(format!("{OUTPUT_MODE_PREFIX}{id}:{}", preset.route_name()));
+        if mode == preset {
+            button.primary()
+        } else {
+            button.secondary()
+        }
+    }))
+    .gap(tokens::SPACE_1);
+    // Two rows: the preset ladder is too wide for one popover line.
+    let resolution_buttons = column(PREVIEW_RESOLUTIONS.chunks(5).map(|chunk| {
+        row(chunk.iter().map(|&preset| {
+            let button = button(format!("{preset}^3"))
+                .xsmall()
+                .key(format!("{OUTPUT_RESOLUTION_PREFIX}{id}:{preset}"));
+            if resolution == preset {
+                button.primary()
+            } else {
+                button.secondary()
+            }
+        }))
+        .gap(tokens::SPACE_1)
+    }))
+    .gap(tokens::SPACE_1);
+
+    let mut body = vec![
+        text("Render Mode").caption().muted(),
+        mode_buttons,
+        text("Resolution").caption().muted(),
+        resolution_buttons,
+    ];
+    if mode != PreviewRenderMode::Points {
+        body.push(
+            field_row(
+                "Wireframe",
+                switch(format!("{OUTPUT_WIREFRAME_PREFIX}{id}"), wireframe),
+            )
+            .gap(tokens::SPACE_2),
+        );
+    }
+    if mode == PreviewRenderMode::AdaptiveSurfaceNets2 {
+        body.push(text("ASN2 Quality").caption().muted());
+        body.push(asn2_stepper_row(
+            id,
+            "vr",
+            "Vertex refine",
+            &asn2.vertex_refinement_iterations.to_string(),
+        ));
+        body.push(asn2_stepper_row(
+            id,
+            "nr",
+            "Normal refine",
+            &asn2.normal_sample_iterations.to_string(),
+        ));
+        body.push(
+            field_row(
+                "Sharp edges",
+                switch(
+                    format!("{OUTPUT_ASN2_PREFIX}{id}:sharp:up"),
+                    asn2.sharp_edges,
+                ),
+            )
+            .gap(tokens::SPACE_2),
+        );
+        if asn2.sharp_edges {
+            body.push(asn2_stepper_row(
+                id,
+                "angle",
+                "Angle (deg)",
+                &asn2.sharp_angle_degrees.to_string(),
+            ));
+        }
+    }
+    body
+}
+
+/// FEA mesh settings: deformed view + exaggeration, wireframe, and the
+/// colormap field picker (fields mirrored from the built preview's stats).
+fn fea_settings(app: &VolumetricUiV2, id: &str, fea: &FeaRender) -> Vec<El> {
+    let mut body = vec![
+        field_row(
+            "Deformed",
+            switch(format!("{OUTPUT_FEA_DEFORMED_PREFIX}{id}"), fea.deformed),
+        )
+        .gap(tokens::SPACE_2),
+    ];
+    if fea.deformed {
+        body.push(
+            field_row(
+                "Exaggeration",
+                row([
+                    icon_button("chevron-left")
+                        .ghost()
+                        .xsmall()
+                        .key(format!("{OUTPUT_FEA_EXAG_PREFIX}{id}:down")),
+                    text(format!("x{}", fea.exaggeration_tenths as f32 / 10.0))
+                        .label()
+                        .text_align(TextAlign::Center)
+                        .width(Size::Fixed(56.0)),
+                    icon_button("chevron-right")
+                        .ghost()
+                        .xsmall()
+                        .key(format!("{OUTPUT_FEA_EXAG_PREFIX}{id}:up")),
+                ])
+                .gap(tokens::SPACE_1)
+                .align(Align::Center),
+            )
+            .gap(tokens::SPACE_2),
+        );
+    }
+    body.push(
+        field_row(
+            "Wireframe",
+            switch(format!("{OUTPUT_WIREFRAME_PREFIX}{id}"), fea.wireframe),
+        )
+        .gap(tokens::SPACE_2),
+    );
+
+    body.push(text("Colormap").caption().muted());
+    let none_button = button("None")
+        .xsmall()
+        .width(Size::Fill(1.0))
+        .key(format!("{OUTPUT_FEA_FIELD_PREFIX}{id}:none"));
+    body.push(if fea.color_field.is_none() {
+        none_button.primary()
+    } else {
+        none_button.secondary()
+    });
+    let fields = app
+        .output_stats
+        .get(id)
+        .map(|stats| stats.fea_fields.clone())
+        .unwrap_or_default();
+    if fields.is_empty() {
+        body.push(
+            text("fields appear after the first render")
+                .caption()
+                .muted(),
+        );
+    }
+    for field in fields {
+        let label = field
+            .split_once(':')
+            .map(|(_, name)| name)
+            .unwrap_or(&field);
+        let button = button(label)
+            .xsmall()
+            .tooltip(field.clone())
+            .width(Size::Fill(1.0))
+            .key(format!("{OUTPUT_FEA_FIELD_PREFIX}{id}:{field}"));
+        body.push(if fea.color_field.as_deref() == Some(field.as_str()) {
+            button.primary()
+        } else {
+            button.secondary()
+        });
+    }
+    body
 }
 
 /// A label + `- value +` stepper row driving one ASN2 setting.
@@ -2794,10 +3229,9 @@ fn runtime_asset_row(app: &VolumetricUiV2, asset: &LoadedAsset) -> El {
             .width(Size::Fixed(12.0)),
         column([
             text(format!(
-                "{} · {} · {}^3{}",
+                "{} · {}{}",
                 asset_type_label(asset.type_hint()),
-                render.mode.label(),
-                render.resolution,
+                render.summary(),
                 if overridden { " *" } else { "" },
             ))
             .caption()
@@ -3643,9 +4077,14 @@ mod tests {
         assert_eq!(requests.len(), 1);
         let request = &requests[0];
         assert_eq!(request.asset_id, "simple_sphere_model");
-        assert_eq!(request.render_mode, PreviewRenderMode::AdaptiveSurfaceNets2);
+        let PreviewPlan::Model3d(mesh_plan) = &request.plan else {
+            panic!(
+                "sphere output should carry a 3D plan, got {:?}",
+                request.plan
+            );
+        };
         assert_eq!(
-            request.mesh_plan,
+            *mesh_plan,
             PreviewMeshPlan::AdaptiveSurfaceNets2 {
                 target_resolution: 96,
                 base_resolution: 6,
@@ -3653,8 +4092,7 @@ mod tests {
                 settings: Asn2Settings::default(),
             }
         );
-        let config = request
-            .mesh_plan
+        let config = mesh_plan
             .adaptive_surface_nets_config()
             .expect("asn2 config");
         assert_eq!(config.base_resolution, 6);
@@ -3869,12 +4307,21 @@ mod tests {
             .iter()
             .find(|r| r.asset_id == exports[1])
             .expect("default output renders");
-        assert_eq!(overridden.render_mode, PreviewRenderMode::Points);
         assert_eq!(
-            overridden.mesh_plan,
-            PreviewMeshPlan::for_mode(PreviewRenderMode::Points, 24, Asn2Settings::default())
+            overridden.plan,
+            PreviewPlan::Model3d(PreviewMeshPlan::for_mode(
+                PreviewRenderMode::Points,
+                24,
+                Asn2Settings::default()
+            ))
         );
-        assert_eq!(default.render_mode, PreviewRenderMode::AdaptiveSurfaceNets2);
+        assert!(
+            matches!(
+                &default.plan,
+                PreviewPlan::Model3d(PreviewMeshPlan::AdaptiveSurfaceNets2 { .. })
+            ),
+            "un-overridden output keeps the viewport default plan"
+        );
     }
 
     #[test]
@@ -3927,16 +4374,20 @@ mod tests {
             UiEvent::synthetic_click(format!("{OUTPUT_ASN2_PREFIX}{id}:angle:up")),
         );
 
-        let render = app.output_render(&id);
-        assert!(render.asn2.sharp_edges);
-        assert_eq!(render.asn2.vertex_refinement_iterations, 7);
-        assert_eq!(render.asn2.sharp_angle_degrees, 20);
+        let OutputRender::Model3d { asn2, .. } = app.output_render(&id) else {
+            panic!("model output should carry 3D settings");
+        };
+        assert!(asn2.sharp_edges);
+        assert_eq!(asn2.vertex_refinement_iterations, 7);
+        assert_eq!(asn2.sharp_angle_degrees, 20);
 
         // The settings flow through to the meshing config.
         let requests = app.preview_requests();
         let request = requests.iter().find(|r| r.asset_id == id).unwrap();
-        let config = request
-            .mesh_plan
+        let PreviewPlan::Model3d(mesh_plan) = &request.plan else {
+            panic!("model output should carry a 3D plan");
+        };
+        let config = mesh_plan
             .adaptive_surface_nets_config()
             .expect("asn2 config");
         assert_eq!(config.vertex_refinement_iterations, 7);
@@ -3957,25 +4408,25 @@ mod tests {
             .iter()
             .find(|r| r.asset_id == id)
             .unwrap()
-            .mesh_plan
+            .plan
             .clone();
 
         dispatch(
             &mut app,
             UiEvent::synthetic_click(format!("{OUTPUT_WIREFRAME_PREFIX}{id}")),
         );
-        assert!(app.output_render(&id).wireframe);
+        assert!(app.output_render(&id).wireframe());
         let requests = app.preview_requests();
         let request = requests.iter().find(|r| r.asset_id == id).unwrap();
         assert!(request.wireframe);
-        // The mesh plan (the rebuild cache key) is untouched by the toggle.
-        assert_eq!(request.mesh_plan, plan_before);
+        // The plan (the rebuild cache key) is untouched by the toggle.
+        assert_eq!(request.plan, plan_before);
 
         dispatch(
             &mut app,
             UiEvent::synthetic_click(format!("{OUTPUT_WIREFRAME_PREFIX}{id}")),
         );
-        assert!(!app.output_render(&id).wireframe);
+        assert!(!app.output_render(&id).wireframe());
     }
 
     #[test]
@@ -4002,9 +4453,11 @@ mod tests {
             .iter()
             .find(|r| r.asset_id == exports[0])
             .expect("output renders");
-        assert_eq!(
-            request.render_mode,
-            PreviewRenderMode::AdaptiveSurfaceNets2,
+        assert!(
+            matches!(
+                &request.plan,
+                PreviewPlan::Model3d(PreviewMeshPlan::AdaptiveSurfaceNets2 { .. })
+            ),
             "back on viewport defaults"
         );
     }

@@ -1,44 +1,71 @@
-//! Render a 2D model through the real sketch-preview path, headlessly.
+//! Render a 2D model (or an FEA mesh) through the real preview path,
+//! headlessly.
 //!
-//! Reproduces GUI-reported 2D display defects without a window: rasterize
-//! and build the flat preview exactly like the session does
-//! (`build_preview_entity` on a 2D model), submit through the real wgpu
-//! pipelines, and save the frame as a PNG, viewed face-on from +z.
+//! Reproduces GUI-reported viewport defects without a window: build the
+//! preview exactly like the session does (`build_preview_scene`), submit
+//! through the real wgpu pipelines, and save the frame as a PNG, viewed
+//! face-on from +z.
 //!
 //! Usage: headless_sketch_preview <model.wasm> <out.png> [--resolution N]
+//!        headless_sketch_preview <mesh.vmesh> <out.png> --fea [--fea-field node:name]
 
 use std::sync::Arc;
 
+use volumetric::AssetTypeHint;
 use volumetric_renderer::{Camera, RenderSettings, Renderer};
 use volumetric_ui_v2::session::build_preview_scene;
-use volumetric_ui_v2::{PreviewMeshPlan, PreviewRenderMode, PreviewRequest};
+use volumetric_ui_v2::{PreviewPlan, PreviewRequest};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let res_value_pos = args.iter().position(|a| a == "--resolution").map(|i| i + 1);
+    let value_positions: Vec<usize> = args
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| *a == "--resolution" || *a == "--fea-field")
+        .map(|(i, _)| i + 1)
+        .collect();
     let positional: Vec<&String> = args
         .iter()
         .enumerate()
-        .filter(|(i, a)| !a.starts_with("--") && Some(*i) != res_value_pos)
+        .filter(|(i, a)| !a.starts_with("--") && !value_positions.contains(i))
         .map(|(_, a)| a)
         .collect();
     if positional.len() != 2 {
         eprintln!("usage: headless_sketch_preview <model.wasm> <out.png> [--resolution N]");
         std::process::exit(1);
     }
-    let resolution = res_value_pos
-        .and_then(|i| args.get(i))
+    let resolution = args
+        .iter()
+        .position(|a| a == "--resolution")
+        .and_then(|i| args.get(i + 1))
         .map(|v| v.parse().expect("--resolution takes an integer"))
         .unwrap_or(256);
+    let fea = args.iter().any(|a| a == "--fea");
+    let fea_field = args
+        .iter()
+        .position(|a| a == "--fea-field")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
 
-    let wasm_bytes = std::fs::read(positional[0]).expect("read wasm");
+    let bytes = std::fs::read(positional[0]).expect("read input");
+    let (type_hint, plan) = if fea || fea_field.is_some() {
+        (
+            Some(AssetTypeHint::FeaMesh),
+            PreviewPlan::FeaMesh {
+                deformed: true,
+                exaggeration_tenths: 10,
+                color_field: fea_field,
+            },
+        )
+    } else {
+        (None, PreviewPlan::Sketch { resolution })
+    };
     let request = PreviewRequest {
         asset_id: "sketch_debug".to_string(),
-        data: Arc::new(wasm_bytes),
-        type_hint: None,
+        data: Arc::new(bytes),
+        type_hint,
         precursor_ids: vec![],
-        render_mode: PreviewRenderMode::AdaptiveSurfaceNets2,
-        mesh_plan: PreviewMeshPlan::PointCloud { resolution },
+        plan,
         wireframe: false,
         show_grid: false,
         ssao: false,

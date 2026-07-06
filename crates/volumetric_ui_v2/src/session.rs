@@ -19,7 +19,7 @@ use glam::{Mat4, Vec2, Vec3};
 use volumetric_renderer as renderer;
 
 use crate::{
-    OutputStats, PreviewBuildStatus, PreviewMeshPlan, PreviewRenderMode, PreviewRequest, RunState,
+    OutputStats, PreviewBuildStatus, PreviewMeshPlan, PreviewPlan, PreviewRequest, RunState,
     VolumetricUiV2,
 };
 use volumetric::AssetTypeHint;
@@ -544,8 +544,7 @@ struct PreviewSceneKey {
     asset_id: String,
     data_ptr: usize,
     data_len: usize,
-    render_mode: PreviewRenderMode,
-    mesh_plan: PreviewMeshPlan,
+    plan: PreviewPlan,
 }
 
 impl From<&PreviewRequest> for PreviewSceneKey {
@@ -554,15 +553,14 @@ impl From<&PreviewRequest> for PreviewSceneKey {
             asset_id: request.asset_id.clone(),
             data_ptr: Arc::as_ptr(&request.data) as usize,
             data_len: request.data.len(),
-            render_mode: request.render_mode,
-            mesh_plan: request.mesh_plan.clone(),
+            plan: request.plan.clone(),
         }
     }
 }
 
 impl PreviewSceneKey {
     fn label(&self) -> String {
-        self.mesh_plan.label()
+        self.plan.label()
     }
 }
 
@@ -894,7 +892,18 @@ pub fn build_preview_scene(request: &PreviewRequest) -> Result<PreviewEntity, St
         return build_sketch_preview(request, build_start);
     }
 
-    let (scene, wireframe_lines, bounds_min, bounds_max) = match &request.mesh_plan {
+    // The plan normally matches the runtime dimensionality (the UI probes
+    // it statically); if a model defeats the static probe, fall back to a
+    // cheap default plan rather than failing.
+    let fallback_plan;
+    let mesh_plan = match &request.plan {
+        PreviewPlan::Model3d(mesh_plan) => mesh_plan,
+        _ => {
+            fallback_plan = PreviewMeshPlan::PointCloud { resolution: 24 };
+            &fallback_plan
+        }
+    };
+    let (scene, wireframe_lines, bounds_min, bounds_max) = match mesh_plan {
         PreviewMeshPlan::PointCloud { resolution } => {
             let (points, bounds_min, bounds_max) =
                 volumetric::sample_model_from_bytes(request.data.as_slice(), *resolution)
@@ -935,8 +944,7 @@ pub fn build_preview_scene(request: &PreviewRequest) -> Result<PreviewEntity, St
             (scene, Some(wireframe), bounds_min, bounds_max)
         }
         PreviewMeshPlan::AdaptiveSurfaceNets2 { .. } => {
-            let config = request
-                .mesh_plan
+            let config = mesh_plan
                 .adaptive_surface_nets_config()
                 .ok_or_else(|| "missing adaptive surface nets config".to_string())?;
             let mesh =
@@ -1109,7 +1117,11 @@ fn build_sketch_preview(
     request: &PreviewRequest,
     build_start: std::time::Instant,
 ) -> Result<PreviewEntity, String> {
-    let resolution = sketch_raster_resolution(&request.mesh_plan);
+    let resolution = match &request.plan {
+        PreviewPlan::Sketch { resolution } => *resolution,
+        // Kind/dims mismatch (static probe defeated): default raster.
+        _ => 256,
+    };
     let raster = volumetric::rasterize_sketch_from_bytes(request.data.as_slice(), resolution)
         .map_err(format_error_chain)?;
 
@@ -1221,7 +1233,9 @@ fn build_sketch_preview(
     })
 }
 
-/// Preview of an FEA mesh output: the mesh's boundary faces, flat-shaded,
+/// Preview of an FEA mesh output: the mesh's boundary faces, flat-shaded
+/// or colormapped by a chosen field (viridis over the field's range),
+/// optionally in the deformed configuration (displacement x exaggeration),
 /// with the wireframe overlay tracing element edges (quad edges only — no
 /// triangulation diagonals).
 fn build_fea_mesh_preview(
@@ -1229,25 +1243,126 @@ fn build_fea_mesh_preview(
     build_start: std::time::Instant,
 ) -> Result<PreviewEntity, String> {
     let mut mesh = volumetric::fea::decode_fea_mesh(request.data.as_slice())?;
-    let quads = mesh.boundary_quads();
+    let faces = mesh.boundary_faces();
 
-    // Solved meshes draw in their deformed configuration (positions +
-    // displacement); connectivity (and thus the boundary) is unchanged.
-    let mut extra_detail = Vec::new();
-    if let Some(displacement) = mesh
+    let (want_deformed, exaggeration, color_field) = match &request.plan {
+        PreviewPlan::FeaMesh {
+            deformed,
+            exaggeration_tenths,
+            color_field,
+        } => (
+            *deformed,
+            f64::from(*exaggeration_tenths) / 10.0,
+            color_field.clone(),
+        ),
+        // Plan/kind mismatch (shouldn't happen): the default view.
+        _ => (true, 1.0, None),
+    };
+
+    // Every colormappable field, mirrored to the settings popover's picker
+    // through the stats.
+    let fea_fields: Vec<String> = mesh
         .node_fields
         .iter()
-        .find(|f| f.name == "displacement" && f.components == 3)
+        .filter(|f| f.components == 1 || f.components == 3)
+        .map(|f| format!("node:{}", f.name))
+        .chain(
+            mesh.element_fields
+                .iter()
+                .filter(|f| f.components == 1)
+                .map(|f| format!("element:{}", f.name)),
+        )
+        .collect();
+
+    // Resolve the colormapped field to one scalar per node or per element
+    // (3-component node fields color by magnitude).
+    enum ColorSource {
+        Node(Vec<f64>),
+        Element(Vec<f64>),
+    }
+    let mut extra_detail = Vec::new();
+    let color_source = color_field.as_deref().and_then(|qualified| {
+        let (container, name) = qualified.split_once(':')?;
+        let scalars = |field: &volumetric::fea::FeaField| -> Option<Vec<f64>> {
+            match field.components {
+                1 => Some(field.data.clone()),
+                3 => Some(
+                    field
+                        .data
+                        .chunks_exact(3)
+                        .map(|v| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt())
+                        .collect(),
+                ),
+                _ => None,
+            }
+        };
+        let source = match container {
+            "node" => mesh
+                .node_fields
+                .iter()
+                .find(|f| f.name == name)
+                .and_then(scalars)
+                .map(ColorSource::Node),
+            "element" => mesh
+                .element_fields
+                .iter()
+                .find(|f| f.name == name && f.components == 1)
+                .map(|f| ColorSource::Element(f.data.clone())),
+            _ => None,
+        };
+        if source.is_none() {
+            extra_detail.push(format!("colormap field {qualified} not in this mesh"));
+        }
+        source
+    });
+    let color_range = color_source.as_ref().map(|source| {
+        let values = match source {
+            ColorSource::Node(v) | ColorSource::Element(v) => v,
+        };
+        let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+        for &v in values {
+            if v.is_finite() {
+                lo = lo.min(v);
+                hi = hi.max(v);
+            }
+        }
+        if lo > hi { (0.0, 0.0) } else { (lo, hi) }
+    });
+    if let (Some(field), Some((lo, hi))) = (&color_field, color_range) {
+        extra_detail.push(format!("colormap {field} {lo:.4} .. {hi:.4} (viridis)"));
+    }
+    let color_for = |value: f64| -> [f32; 4] {
+        let (lo, hi) = color_range.unwrap_or((0.0, 0.0));
+        let t = if hi > lo {
+            ((value - lo) / (hi - lo)) as f32
+        } else {
+            0.5
+        };
+        let [r, g, b] = volumetric::viridis(t);
+        [r, g, b, 1.0]
+    };
+
+    // Deformed configuration: positions + displacement x exaggeration;
+    // connectivity (and thus the boundary) is unchanged.
+    if want_deformed
+        && let Some(displacement) = mesh
+            .node_fields
+            .iter()
+            .find(|f| f.name == "displacement" && f.components == 3)
     {
         let max_u = displacement
             .data
             .chunks_exact(3)
             .map(|u| (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt())
             .fold(0.0f64, f64::max);
-        extra_detail.push(format!("deformed view · max |u| = {max_u:.4}"));
+        if (exaggeration - 1.0).abs() > 1e-9 {
+            extra_detail.push(format!("deformed x{exaggeration} · max |u| = {max_u:.4}"));
+        } else {
+            extra_detail.push(format!("deformed view · max |u| = {max_u:.4}"));
+        }
         let data = displacement.data.clone();
         for (p, u) in mesh.node_positions.iter_mut().zip(&data) {
-            *p += u;
+            *p += u * exaggeration;
         }
     }
     if let Some(contact) = mesh
@@ -1272,30 +1387,36 @@ fn build_fea_mesh_preview(
     };
 
     // Flat-shaded triangle soup: two triangles per boundary quad, each with
-    // its own face normal (deformed meshes can have non-planar quads).
-    let mut vertices: Vec<renderer::MeshVertex> = Vec::with_capacity(quads.len() * 6);
-    let mut emit_triangle = |a: [f32; 3], b: [f32; 3], c: [f32; 3]| {
+    // its own face normal (deformed meshes can have non-planar quads),
+    // corners carrying the colormap color (white when no field is chosen).
+    let mut vertices: Vec<renderer::MeshVertex> = Vec::with_capacity(faces.len() * 6);
+    let mut emit_triangle = |corners: [([f32; 3], [f32; 4]); 3]| {
+        let [(a, _), (b, _), (c, _)] = corners;
         let (ab, ac) = (Vec3::from(b) - Vec3::from(a), Vec3::from(c) - Vec3::from(a));
         let normal = ab.cross(ac).normalize_or_zero().to_array();
-        for p in [a, b, c] {
-            vertices.push(renderer::MeshVertex::new(p, normal));
+        for (p, color) in corners {
+            vertices.push(renderer::MeshVertex::colored(p, normal, color));
         }
     };
-    for quad in &quads {
-        let [a, b, c, d] = [
-            position(quad[0]),
-            position(quad[1]),
-            position(quad[2]),
-            position(quad[3]),
-        ];
-        emit_triangle(a, b, c);
-        emit_triangle(a, c, d);
+    for (element, quad) in &faces {
+        let corner = |slot: usize| -> ([f32; 3], [f32; 4]) {
+            let node = quad[slot];
+            let color = match &color_source {
+                Some(ColorSource::Node(values)) => color_for(values[node as usize]),
+                Some(ColorSource::Element(values)) => color_for(values[*element as usize]),
+                None => [1.0; 4],
+            };
+            (position(node), color)
+        };
+        let [a, b, c, d] = [corner(0), corner(1), corner(2), corner(3)];
+        emit_triangle([a, b, c]);
+        emit_triangle([a, c, d]);
     }
 
     // Wireframe from the quads' perimeter edges, deduplicated by node pair.
     let mut seen = std::collections::HashSet::new();
     let mut segments = Vec::new();
-    for quad in &quads {
+    for (_, quad) in &faces {
         for (a, b) in [
             (quad[0], quad[1]),
             (quad[1], quad[2]),
@@ -1340,12 +1461,13 @@ fn build_fea_mesh_preview(
         "FEA mesh: {} nodes · {} elements · {} boundary faces",
         mesh.node_count(),
         mesh.element_count(),
-        quads.len()
+        faces.len()
     )];
     detail.extend(extra_detail);
     let stats = OutputStats {
         triangles: vertices.len() / 3,
         detail,
+        fea_fields,
         mesh_ms: build_start.elapsed().as_secs_f64() * 1000.0,
         ..Default::default()
     };
@@ -1453,19 +1575,6 @@ fn build_tri_mesh_preview(
     })
 }
 
-/// Raster resolution for sketch previews, reusing the output's configured
-/// mesh resolution.
-fn sketch_raster_resolution(plan: &PreviewMeshPlan) -> usize {
-    let resolution = match plan {
-        PreviewMeshPlan::PointCloud { resolution } => *resolution,
-        PreviewMeshPlan::MarchingCubes { resolution } => *resolution,
-        PreviewMeshPlan::AdaptiveSurfaceNets2 {
-            target_resolution, ..
-        } => *target_resolution,
-    };
-    resolution.clamp(16, 1024)
-}
-
 fn triangles_to_mesh_vertices(triangles: &[volumetric::Triangle]) -> Vec<renderer::MeshVertex> {
     let mut out = Vec::with_capacity(triangles.len() * 3);
 
@@ -1527,14 +1636,155 @@ fn point_in_rect(rect: Option<Rect>, pos: (f32, f32)) -> bool {
 mod tests {
     use super::*;
 
+    /// A single unit hex with a scalar node field, a vector node field
+    /// (displacement) and a scalar element field, for FEA preview tests.
+    fn one_hex_mesh() -> volumetric::fea::FeaMesh {
+        use volumetric::fea::{FeaField, FeaMesh};
+        let positions: Vec<f64> = (0..8)
+            .flat_map(|i| {
+                [
+                    f64::from(i & 1),
+                    f64::from((i >> 1) & 1),
+                    f64::from((i >> 2) & 1),
+                ]
+            })
+            .collect();
+        FeaMesh {
+            element_kind: volumetric::fea::FeaElementKind::Hex8,
+            node_positions: positions,
+            connectivity: (0..8).collect(),
+            node_fields: vec![
+                FeaField {
+                    name: "temp".to_string(),
+                    components: 1,
+                    data: (0..8).map(f64::from).collect(),
+                },
+                FeaField {
+                    name: "displacement".to_string(),
+                    components: 3,
+                    data: (0..8).flat_map(|_| [0.0, 0.0, 0.5]).collect(),
+                },
+            ],
+            element_fields: vec![FeaField {
+                name: "stiffness_scale".to_string(),
+                components: 1,
+                data: vec![0.25],
+            }],
+        }
+    }
+
+    fn fea_request(plan: PreviewPlan) -> PreviewRequest {
+        PreviewRequest {
+            asset_id: "fea".to_string(),
+            data: Arc::new(volumetric::fea::encode_fea_mesh(&one_hex_mesh())),
+            type_hint: Some(AssetTypeHint::FeaMesh),
+            precursor_ids: Vec::new(),
+            plan,
+            wireframe: false,
+            show_grid: true,
+            ssao: false,
+            ssao_radius: 0.5,
+            ssao_bias: 0.025,
+            ssao_strength: 1.0,
+            stale: false,
+        }
+    }
+
+    #[test]
+    fn fea_preview_reports_colorable_fields_and_colors_nodes() {
+        let request = fea_request(PreviewPlan::FeaMesh {
+            deformed: false,
+            exaggeration_tenths: 10,
+            color_field: Some("node:temp".to_string()),
+        });
+        let entity = build_preview_scene(&request).expect("fea preview builds");
+
+        assert_eq!(
+            entity.stats.fea_fields,
+            vec![
+                "node:temp".to_string(),
+                "node:displacement".to_string(),
+                "element:stiffness_scale".to_string()
+            ]
+        );
+        assert!(
+            entity
+                .stats
+                .detail
+                .iter()
+                .any(|line| line.contains("colormap node:temp") && line.contains("viridis")),
+            "colormap range missing from stats: {:?}",
+            entity.stats.detail
+        );
+
+        // Node values 0..7 over the range: corner colors must vary.
+        let mesh = &entity.scene.meshes[0].0;
+        let first = mesh.vertices[0].color;
+        assert!(
+            mesh.vertices.iter().any(|v| v.color != first),
+            "node colormap produced uniform vertex colors"
+        );
+
+        // Undeformed: bounds stay the unit cube.
+        assert!((entity.bounds.max.2 - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fea_preview_element_colormap_and_exaggerated_deformation() {
+        let request = fea_request(PreviewPlan::FeaMesh {
+            deformed: true,
+            exaggeration_tenths: 20,
+            color_field: Some("element:stiffness_scale".to_string()),
+        });
+        let entity = build_preview_scene(&request).expect("fea preview builds");
+
+        // One element: every face gets the same (mid-range) color.
+        let mesh = &entity.scene.meshes[0].0;
+        let first = mesh.vertices[0].color;
+        assert!(
+            mesh.vertices.iter().all(|v| v.color == first),
+            "single-element colormap should be uniform"
+        );
+
+        // displacement (0, 0, 0.5) x2 exaggeration lifts the top to z = 2.
+        assert!(
+            (entity.bounds.max.2 - 2.0).abs() < 1e-6,
+            "exaggerated deformation missing: max z = {}",
+            entity.bounds.max.2
+        );
+    }
+
+    #[test]
+    fn fea_preview_missing_field_falls_back_to_plain() {
+        let request = fea_request(PreviewPlan::FeaMesh {
+            deformed: false,
+            exaggeration_tenths: 10,
+            color_field: Some("node:not_a_field".to_string()),
+        });
+        let entity = build_preview_scene(&request).expect("fea preview builds");
+        let mesh = &entity.scene.meshes[0].0;
+        assert!(
+            mesh.vertices.iter().all(|v| v.color == [1.0; 4]),
+            "missing field should draw untinted"
+        );
+        assert!(
+            entity
+                .stats
+                .detail
+                .iter()
+                .any(|line| line.contains("not in this mesh")),
+            "missing-field note absent: {:?}",
+            entity.stats.detail
+        );
+    }
+
     fn request(id: &str, resolution: usize) -> PreviewRequest {
         PreviewRequest {
             asset_id: id.to_string(),
             data: Arc::new(vec![1, 2, 3]),
             type_hint: None,
             precursor_ids: Vec::new(),
-            render_mode: PreviewRenderMode::Points,
-            mesh_plan: PreviewMeshPlan::PointCloud { resolution },
+            plan: PreviewPlan::Model3d(PreviewMeshPlan::PointCloud { resolution }),
             wireframe: false,
             show_grid: true,
             ssao: true,
@@ -1877,7 +2127,7 @@ function get_bounds_max_y() return 1.5 end
             let BackgroundJob::BuildPreview(preview) = job else {
                 panic!("only previews remain");
             };
-            previews.push((preview.key.asset_id.clone(), preview.request.mesh_plan));
+            previews.push((preview.key.asset_id.clone(), preview.request.plan));
         }
         previews.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(previews.len(), 2, "one coalesced job per output");
@@ -1885,7 +2135,7 @@ function get_bounds_max_y() return 1.5 end
             previews[0],
             (
                 "a".to_string(),
-                PreviewMeshPlan::PointCloud { resolution: 32 }
+                PreviewPlan::Model3d(PreviewMeshPlan::PointCloud { resolution: 32 })
             ),
             "newest job per output wins"
         );

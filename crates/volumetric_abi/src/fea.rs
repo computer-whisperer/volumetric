@@ -134,13 +134,14 @@ impl FeaMesh {
     }
 
     /// The mesh's boundary faces: quads belonging to exactly one element,
-    /// in outward-wound node indices ([`HEX8_FACES`] winding).
+    /// in outward-wound node indices ([`HEX8_FACES`] winding), paired with
+    /// the owning element's index (for element-field display).
     ///
     /// Interior faces (shared by two elements) cancel; a valid conforming
     /// mesh never has a face used more than twice, but if one appears (a
     /// malformed mesh) it is treated as interior and dropped.
-    pub fn boundary_quads(&self) -> Vec<[u32; 4]> {
-        let mut faces: std::collections::HashMap<[u32; 4], (u32, [u32; 4])> =
+    pub fn boundary_faces(&self) -> Vec<(u32, [u32; 4])> {
+        let mut faces: std::collections::HashMap<[u32; 4], (u32, u32, [u32; 4])> =
             std::collections::HashMap::new();
         for e in 0..self.element_count() {
             let element = self.element(e);
@@ -153,17 +154,25 @@ impl FeaMesh {
                 ];
                 let mut key = quad;
                 key.sort_unstable();
-                let entry = faces.entry(key).or_insert((0, quad));
+                let entry = faces.entry(key).or_insert((0, e as u32, quad));
                 entry.0 += 1;
             }
         }
-        let mut out: Vec<[u32; 4]> = faces
+        let mut out: Vec<(u32, [u32; 4])> = faces
             .into_values()
-            .filter_map(|(count, quad)| (count == 1).then_some(quad))
+            .filter_map(|(count, element, quad)| (count == 1).then_some((element, quad)))
             .collect();
         // HashMap iteration order is nondeterministic; keep output stable.
         out.sort_unstable();
         out
+    }
+
+    /// [`Self::boundary_faces`] without the element association.
+    pub fn boundary_quads(&self) -> Vec<[u32; 4]> {
+        self.boundary_faces()
+            .into_iter()
+            .map(|(_, quad)| quad)
+            .collect()
     }
 }
 
@@ -343,5 +352,26 @@ mod tests {
                 "shared interior face {quad:?} leaked into the boundary"
             );
         }
+    }
+
+    #[test]
+    fn boundary_faces_know_their_element() {
+        let mesh = two_hex_mesh();
+        let faces = mesh.boundary_faces();
+        assert_eq!(faces.len(), 10);
+        // Element 0 owns nodes 0..8, element 1 owns 4..12; every face's
+        // nodes must belong to its owning element.
+        for (element, quad) in &faces {
+            let owner = mesh.element(*element as usize);
+            for node in quad {
+                assert!(
+                    owner.contains(node),
+                    "face {quad:?} attributed to element {element} which lacks node {node}"
+                );
+            }
+        }
+        // Both elements contribute five exposed faces each.
+        assert_eq!(faces.iter().filter(|(e, _)| *e == 0).count(), 5);
+        assert_eq!(faces.iter().filter(|(e, _)| *e == 1).count(), 5);
     }
 }
