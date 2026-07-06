@@ -50,8 +50,8 @@ enum LatticeKindConfig {
     /// Vertical hexagonal cell walls (compression along z, low surface
     /// shear — the classic seat-cushion honeycomb).
     Honeycomb,
-    /// Skeletal Schwarz-Diamond: smooth struts with tetrahedral node
-    /// topology.
+    /// Tetrahedral strut lattice: thin uniform struts on the diamond-bond
+    /// tiling (four struts per node), connected down to few-percent fills.
     Tetra,
 }
 

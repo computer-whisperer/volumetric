@@ -38,9 +38,11 @@ pub enum LatticeKind {
     /// surface shear — the classic seat-cushion honeycomb. Thin-wall
     /// volume fraction tracks `d` exactly.
     Honeycomb = 3,
-    /// Skeletal Schwarz-Diamond: one labyrinth of the diamond TPMS —
-    /// a smooth strut network with tetrahedral (diamond-bond) node
-    /// topology, the "tetrahedral lattice" pattern with organic nodes.
+    /// Tetrahedral strut lattice: uniform-radius struts along the bonds
+    /// of the diamond lattice — every node joins four struts in
+    /// tetrahedral directions. Connected at any positive density, so it
+    /// supports very sparse fills (a few percent); thin-strut volume
+    /// fraction tracks `d` exactly. The vendor-style tetrahedral tiling.
     Tetra = 4,
 }
 
@@ -157,16 +159,106 @@ pub fn lattice_occupied(kind: LatticeKind, pos: [f64; 3], cell_size: f64, densit
             hex_wall_distance(x / TAU, y / TAU) <= honeycomb_half_thickness(d)
         }
         LatticeKind::Tetra => {
-            // Schwarz-Diamond implicit; its superlevel sets grow from the
-            // maxima along the diamond-bond skeleton, so lowering the iso
-            // from +sqrt(2) (empty) to -sqrt(2) (solid) thickens a
-            // tetrahedral strut network with smooth nodes.
-            let diamond = x.sin() * y.sin() * z.sin()
-                + x.sin() * y.cos() * z.cos()
-                + x.cos() * y.sin() * z.cos()
-                + x.cos() * y.cos() * z.sin();
-            diamond >= core::f64::consts::SQRT_2 * (1.0 - 2.0 * d)
+            // Uniform-radius struts along the bonds of the diamond
+            // lattice: every node joins exactly four struts in tetrahedral
+            // directions, and the network is connected at any positive
+            // radius — thin struts everywhere, down to ~1% fill.
+            let p = [x / TAU, y / TAU, z / TAU];
+            diamond_strut_distance(p) <= diamond_strut_radius(d)
         }
+    }
+}
+
+/// The four diamond bond offsets from an A-sublattice atom to its B
+/// neighbors (quarter-cell tetrahedral directions, length sqrt(3)/4).
+const DIAMOND_BONDS: [[f64; 3]; 4] = [
+    [0.25, 0.25, 0.25],
+    [-0.25, -0.25, 0.25],
+    [-0.25, 0.25, -0.25],
+    [0.25, -0.25, -0.25],
+];
+
+/// The FCC coset offsets within the unit cell (the A sublattice; the B
+/// sublattice adds (1/4, 1/4, 1/4)).
+const FCC_BASIS: [[f64; 3]; 4] = [
+    [0.0, 0.0, 0.0],
+    [0.0, 0.5, 0.5],
+    [0.5, 0.0, 0.5],
+    [0.5, 0.5, 0.0],
+];
+
+/// Nearest point of the lattice `Z^3 + offset` to `p` (exact: each
+/// coordinate rounds independently).
+fn nearest_coset_point(p: [f64; 3], offset: [f64; 3]) -> ([f64; 3], f64) {
+    let mut site = [0.0; 3];
+    let mut d2 = 0.0;
+    for axis in 0..3 {
+        let q = p[axis] - offset[axis];
+        let n = q.round();
+        site[axis] = offset[axis] + n;
+        let e = q - n;
+        d2 += e * e;
+    }
+    (site, d2)
+}
+
+/// Nearest FCC atom to `p`, with the sublattice shift `shift` added to
+/// every coset offset (0 for the A sublattice, 1/4 for B).
+fn nearest_fcc_atom(p: [f64; 3], shift: f64) -> [f64; 3] {
+    let mut best = [0.0; 3];
+    let mut best_d2 = f64::MAX;
+    for basis in FCC_BASIS {
+        let offset = [basis[0] + shift, basis[1] + shift, basis[2] + shift];
+        let (site, d2) = nearest_coset_point(p, offset);
+        if d2 < best_d2 {
+            best_d2 = d2;
+            best = site;
+        }
+    }
+    best
+}
+
+/// Distance from `p` to the segment `[a, a + t]`.
+fn segment_distance(p: [f64; 3], a: [f64; 3], t: [f64; 3]) -> f64 {
+    let ap = [p[0] - a[0], p[1] - a[1], p[2] - a[2]];
+    let tt = t[0] * t[0] + t[1] * t[1] + t[2] * t[2];
+    let s = ((ap[0] * t[0] + ap[1] * t[1] + ap[2] * t[2]) / tt).clamp(0.0, 1.0);
+    let e = [ap[0] - s * t[0], ap[1] - s * t[1], ap[2] - s * t[2]];
+    (e[0] * e[0] + e[1] * e[1] + e[2] * e[2]).sqrt()
+}
+
+/// Distance (in cell units) from `p` to the diamond-lattice bond network.
+///
+/// Any point within reach of a strut has that strut's endpoints as its
+/// nearest A- and B-sublattice atoms (the next atom of either sublattice
+/// is at least sqrt(2)/2 away, versus sqrt(3)/8 to a bond midpoint from
+/// its endpoint), so checking the four bonds of each nearest atom is
+/// exact wherever the answer can be within any usable strut radius.
+fn diamond_strut_distance(p: [f64; 3]) -> f64 {
+    let a = nearest_fcc_atom(p, 0.0);
+    let b = nearest_fcc_atom(p, 0.25);
+    let mut dist = f64::MAX;
+    for t in DIAMOND_BONDS {
+        dist = dist.min(segment_distance(p, a, t));
+        dist = dist.min(segment_distance(p, b, [-t[0], -t[1], -t[2]]));
+    }
+    dist
+}
+
+/// Diamond strut radius (in cell units) for a target relative density:
+/// the analytic thin-strut inverse (16 bonds of length sqrt(3)/4 per unit
+/// cell, fraction = 4 sqrt(3) pi r^2), blended linearly to 1/2 — beyond
+/// every point's distance to the network — once struts start merging.
+fn diamond_strut_radius(d: f64) -> f64 {
+    const BLEND_START: f64 = 0.6;
+    // 4 * sqrt(3) * pi
+    const THIN_COEFF: f64 = 21.765_659_582_517_43;
+    let thin = |d: f64| (d / THIN_COEFF).sqrt();
+    if d <= BLEND_START {
+        thin(d)
+    } else {
+        let t = (d - BLEND_START) / (1.0 - BLEND_START);
+        thin(BLEND_START) + t * (0.5 - thin(BLEND_START))
     }
 }
 
@@ -462,19 +554,52 @@ mod tests {
     }
 
     #[test]
-    fn tetra_is_half_full_at_mid_density() {
-        // The skeletal diamond at d = 0.5 is the balanced labyrinth: the
-        // iso is 0 and the two sides split the volume evenly.
-        let probes = probes();
-        let hits = probes
-            .iter()
-            .filter(|&&p| lattice_occupied(LatticeKind::Tetra, p, 0.25, 0.5))
-            .count();
-        let fraction = hits as f64 / probes.len() as f64;
-        assert!(
-            (fraction - 0.5).abs() < 0.1,
-            "tetra VF at d=0.5 should be ~0.5, got {fraction}"
-        );
+    fn tetra_geometry_bonds_and_voids() {
+        // The bond midpoint between the atoms at (0,0,0) and
+        // (1/4,1/4,1/4) is on a strut: occupied at very sparse density.
+        let on_bond = [0.125, 0.125, 0.125];
+        assert!(lattice_occupied(LatticeKind::Tetra, on_bond, 1.0, 0.02));
+        // Atoms (strut nodes) are occupied too.
+        assert!(lattice_occupied(LatticeKind::Tetra, [0.0; 3], 1.0, 0.02));
+        // The tetrahedral void center (1/2,1/2,1/2) sits sqrt(3)/4 from
+        // the nearest atom: empty at mid density, filled near solid.
+        let void = [0.5, 0.5, 0.5];
+        assert!(!lattice_occupied(LatticeKind::Tetra, void, 1.0, 0.5));
+        assert!(lattice_occupied(LatticeKind::Tetra, void, 1.0, 0.999));
+    }
+
+    #[test]
+    fn tetra_thin_strut_fraction_tracks_density() {
+        // The analytic thin-strut inverse keeps the realized volume
+        // fraction close to d across the sparse range — including the
+        // few-percent fills seat cushions actually print.
+        let fraction = |d: f32| -> f64 {
+            let mut hits = 0usize;
+            let mut total = 0usize;
+            for i in 0..17 {
+                for j in 0..17 {
+                    for k in 0..17 {
+                        let pos = [
+                            0.013 + i as f64 * 0.0603,
+                            -0.71 + j as f64 * 0.0567,
+                            0.19 + k as f64 * 0.0611,
+                        ];
+                        total += 1;
+                        if lattice_occupied(LatticeKind::Tetra, pos, 1.0, d) {
+                            hits += 1;
+                        }
+                    }
+                }
+            }
+            hits as f64 / total as f64
+        };
+        for d in [0.02f32, 0.1, 0.3] {
+            let f = fraction(d);
+            assert!(
+                (f - f64::from(d)).abs() < 0.02 + f64::from(d) * 0.25,
+                "tetra VF at d={d} should be ~{d}, got {f}"
+            );
+        }
     }
 
     #[test]
