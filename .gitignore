@@ -2,3 +2,6 @@
 /crates/volumetric_ui_v2/out
 .idea/*
 .claude/*
+
+# Local scratch projects saved from the GUI
+/*.vproj
