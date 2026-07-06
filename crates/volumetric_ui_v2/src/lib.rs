@@ -92,6 +92,8 @@ const PANEL_WIDTH_DEFAULT: f32 = 320.0;
 const PANEL_WIDTH_MIN: f32 = 240.0;
 const PANEL_WIDTH_MAX: f32 = 560.0;
 const SELECT_IMPORT_PREFIX: &str = "project:select-import:";
+/// Replace an imported operator's bytes with the matching bundled build.
+const UPGRADE_IMPORT_PREFIX: &str = "project:upgrade-import:";
 const DELETE_IMPORT_PREFIX: &str = "project:delete-import:";
 const SELECT_STEP_PREFIX: &str = "project:select-step:";
 const DELETE_STEP_PREFIX: &str = "project:delete-step:";
@@ -110,6 +112,8 @@ const OUTPUT_NAME_KEY: &str = "step-output-name";
 const RENAME_OUTPUT_PREFIX: &str = "project:rename-output:";
 const RESET_LUA_PREFIX: &str = "project:reset-lua:";
 const CONFIG_FIELD_PREFIX: &str = "cfg:";
+/// Text inputs for a `VecF64` operator input; value `{input_idx}:{component}`.
+const VEC_INPUT_PREFIX: &str = "vec:";
 const CONFIG_BOOL_PREFIX: &str = "cfg-bool:";
 const CONFIG_ENUM_PREFIX: &str = "cfg-enum:";
 const LUA_SOURCE_KEY: &str = "lua-source";
@@ -201,7 +205,7 @@ impl Default for Asn2Settings {
         Self {
             vertex_refinement_iterations: 8,
             normal_sample_iterations: 0,
-            sharp_edges: false,
+            sharp_edges: true,
             sharp_angle_degrees: 15,
         }
     }
@@ -444,12 +448,24 @@ struct AssetSlot {
     name: Option<String>,
 }
 
+/// Edit buffers for one `VecF64` input: one text field per component,
+/// committed component-wise into the step's inline little-endian f64 bytes.
+#[derive(Debug)]
+struct VecForm {
+    input_idx: usize,
+    /// The operator-declared label for this input, when metadata names it.
+    name: Option<String>,
+    buffers: Vec<String>,
+}
+
 #[derive(Debug)]
 struct StepEditState {
     step_idx: usize,
     /// Input indices that reference assets (`ModelWASM` / `FeaMesh` slots),
     /// in declaration order.
     asset_slots: Vec<AssetSlot>,
+    /// One editor per declared `VecF64` input, in declaration order.
+    vecs: Vec<VecForm>,
     /// The config form, present only when the operator declares a config input.
     config: Option<ConfigForm>,
     /// The Lua source editor, present only for a `LuaSource` input.
@@ -739,10 +755,8 @@ impl VolumetricUiV2 {
             status: "idle".to_string(),
             open_menu: None,
             open_select: None,
-            pipeline_open: ["imports", "steps", "exports"]
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
+            // Steps carry the editing workflow; imports/exports start folded.
+            pipeline_open: ["steps"].into_iter().map(str::to_string).collect(),
             output_stats: std::collections::BTreeMap::new(),
             lightbox: None,
             pending_file_action: None,
@@ -1415,6 +1429,26 @@ impl VolumetricUiV2 {
             })
             .collect();
 
+        let vecs: Vec<VecForm> = metadata
+            .inputs
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, input)| {
+                let OperatorMetadataInput::VecF64(dim) = input else {
+                    return None;
+                };
+                let values = match step.inputs.get(idx) {
+                    Some(ExecutionInput::Inline(bytes)) => decode_vec_f64(bytes, *dim),
+                    _ => vec![0.0; *dim],
+                };
+                Some(VecForm {
+                    input_idx: idx,
+                    name: metadata.input_name(idx).map(str::to_string),
+                    buffers: values.iter().map(|v| format!("{v}")).collect(),
+                })
+            })
+            .collect();
+
         let config = metadata
             .inputs
             .iter()
@@ -1440,13 +1474,14 @@ impl VolumetricUiV2 {
             });
 
         // Nothing editable → no step editor.
-        if asset_slots.is_empty() && config.is_none() && lua.is_none() {
+        if asset_slots.is_empty() && vecs.is_empty() && config.is_none() && lua.is_none() {
             return None;
         }
 
         Some(StepEditState {
             step_idx,
             asset_slots,
+            vecs,
             config,
             lua,
             output_name: step.outputs.first().cloned().unwrap_or_default(),
@@ -1713,6 +1748,33 @@ impl VolumetricUiV2 {
     /// Commits the field's current buffer into the step's CBOR blob, but only if
     /// it parses; an invalid intermediate (e.g. an empty number field) is left
     /// in the buffer untouched.
+    /// Parses one `VecF64` component buffer and patches its 8 bytes in the
+    /// step's inline little-endian f64 payload. Unparseable text is left in
+    /// the buffer (like config fields) and simply not committed.
+    fn commit_vec_component(
+        &mut self,
+        step_idx: usize,
+        input_idx: usize,
+        component: usize,
+        buffer: &str,
+    ) {
+        let Ok(value) = buffer.trim().parse::<f64>() else {
+            return;
+        };
+        let Some(step) = self.project.timeline_mut().get_mut(step_idx) else {
+            return;
+        };
+        let Some(ExecutionInput::Inline(bytes)) = step.inputs.get_mut(input_idx) else {
+            return;
+        };
+        let end = (component + 1) * 8;
+        if bytes.len() < end {
+            bytes.resize(end, 0);
+        }
+        bytes[component * 8..end].copy_from_slice(&value.to_le_bytes());
+        self.mark_project_dirty();
+    }
+
     fn commit_config_buffer(&mut self, step_idx: usize, config: &ConfigForm, field_name: &str) {
         let Some(field) = config.fields.iter().find(|f| f.name == field_name) else {
             return;
@@ -1842,31 +1904,8 @@ impl VolumetricUiV2 {
             output_id.clone(),
         );
 
-        // A TriMesh-producing import (STL) also gets a conversion step so
-        // the import yields a usable solid out of the box, matching the old
-        // one-step importer. Non-manifold meshes still render as meshes;
-        // the convert step is separate and deletable.
-        let mut final_id = output_id.clone();
-        if matches!(
-            metadata.outputs.first(),
-            Some(volumetric::OperatorMetadataOutput::TriMesh)
-        ) && let Some(converter) = volumetric_assets::get_operator("mesh_to_model_operator")
-        {
-            let solid_id = self
-                .project
-                .default_output_name("mesh_to_model", Some(&output_id));
-            self.project.insert_operation(
-                converter.name,
-                converter.bytes.to_vec(),
-                vec![ExecutionInput::AssetRef(output_id.clone())],
-                vec![solid_id.clone()],
-                solid_id.clone(),
-            );
-            final_id = solid_id;
-        }
-
         self.mark_project_dirty();
-        self.selected_export = Some(final_id.clone());
+        self.selected_export = Some(output_id.clone());
         self.selected_project_item = self
             .project
             .timeline()
@@ -1975,6 +2014,50 @@ impl VolumetricUiV2 {
             .checked_sub(1)
             .map(ProjectSelection::Step);
         self.status = format!("added {} -> {output_id}", asset.display_name);
+    }
+
+    /// Replaces an imported operator's bytes with the matching bundled
+    /// build (the offer surfaced by [`operator_upgrade_offer`]). Steps keep
+    /// referencing the import by id; if the new metadata declares more
+    /// inputs than a step carries, the missing slots are appended with
+    /// defaults (fewer: extras truncated) so upgraded steps stay runnable.
+    fn upgrade_import(&mut self, idx: usize) {
+        let Some(import) = self.project.imports().get(idx) else {
+            return;
+        };
+        let import_id = import.id.clone();
+        let Some(metadata) = self.operator_metadata_cached(&import_id) else {
+            return;
+        };
+        let Some(bundled) = volumetric_assets::get_operator(&metadata.name) else {
+            return;
+        };
+        let Ok(new_metadata) = volumetric::operator_metadata_from_wasm_bytes(bundled.bytes) else {
+            return;
+        };
+
+        self.project.imports_mut()[idx].data = bundled.bytes.to_vec();
+        // The metadata cache revalidates by byte length only; same-length
+        // upgrades would otherwise serve the old metadata.
+        self.operator_metadata_cache.borrow_mut().remove(&import_id);
+
+        let fresh_inputs = operator_step_inputs(&new_metadata, &SlotPrimaries::default());
+        for step in self.project.timeline_mut() {
+            if step.operator_id != import_id {
+                continue;
+            }
+            step.inputs.truncate(fresh_inputs.len());
+            for missing in step.inputs.len()..fresh_inputs.len() {
+                step.inputs.push(fresh_inputs[missing].clone());
+            }
+        }
+
+        self.step_edit = None;
+        self.mark_project_dirty();
+        self.status = format!(
+            "updated {import_id} to {} {}",
+            new_metadata.name, new_metadata.version
+        );
     }
 
     fn delete_import(&mut self, idx: usize) {
@@ -2235,6 +2318,31 @@ impl App for VolumetricUiV2 {
                 return;
             }
         }
+        // Controlled text editing for VecF64 component fields.
+        if let Some(rest) = event
+            .target_key()
+            .and_then(|key| key.strip_prefix(VEC_INPUT_PREFIX))
+            .map(str::to_string)
+        {
+            if let Some(mut edit) = self.step_edit.take() {
+                let key = format!("{VEC_INPUT_PREFIX}{rest}");
+                let mut commit = None;
+                if let Some((idx_str, component_str)) = rest.split_once(':')
+                    && let (Ok(input_idx), Ok(component)) =
+                        (idx_str.parse::<usize>(), component_str.parse::<usize>())
+                    && let Some(vec_form) = edit.vecs.iter_mut().find(|v| v.input_idx == input_idx)
+                    && let Some(buffer) = vec_form.buffers.get_mut(component)
+                    && text_input::apply_event(buffer, &mut self.selection, &event, &key)
+                {
+                    commit = Some((input_idx, component, buffer.clone()));
+                }
+                if let Some((input_idx, component, buffer)) = commit {
+                    self.commit_vec_component(edit.step_idx, input_idx, component, &buffer);
+                }
+                self.step_edit = Some(edit);
+                return;
+            }
+        }
         // Controlled editing for the output-name buffer (committed by Rename).
         if event.target_key() == Some(OUTPUT_NAME_KEY) {
             if let Some(mut edit) = self.step_edit.take() {
@@ -2414,6 +2522,8 @@ impl App for VolumetricUiV2 {
         } else if let Some(idx) = parse_index_route(route, SELECT_IMPORT_PREFIX) {
             self.selected_project_item = Some(ProjectSelection::Import(idx));
             self.status = format!("selected import {}", idx + 1);
+        } else if let Some(idx) = parse_index_route(route, UPGRADE_IMPORT_PREFIX) {
+            self.upgrade_import(idx);
         } else if let Some(idx) = parse_index_route(route, DELETE_IMPORT_PREFIX) {
             self.delete_import(idx);
         } else if let Some(idx) = parse_index_route(route, SELECT_STEP_PREFIX) {
@@ -3317,6 +3427,11 @@ fn pipeline_accordion(app: &VolumetricUiV2) -> El {
             export_rows(app),
         ),
     ])
+    // The stock accordion is gapless; with adjacent *collapsed* items the
+    // triggers' expanded hit targets overlap and focus rings occlude
+    // (damascene's own bundle lint flags it). A ring-width gap keeps every
+    // trigger's hit band and focus ring its own.
+    .gap(tokens::RING_WIDTH)
 }
 
 fn inspector_rows(app: &VolumetricUiV2) -> Vec<El> {
@@ -3456,16 +3571,33 @@ fn import_detail_rows(app: &VolumetricUiV2, idx: usize) -> Vec<El> {
         return vec![text("Selected import no longer exists.").muted().small()];
     };
 
-    vec![
+    let mut rows = vec![
         detail_row("Kind", asset_type_label(import.type_hint)),
         detail_row("Asset", &import.id),
         detail_row("Bytes", &import.data.len().to_string()),
+    ];
+    if import.type_hint == Some(AssetTypeHint::Operator)
+        && let Some(metadata) = app.operator_metadata_cached(&import.id)
+    {
+        rows.push(detail_row("Version", &metadata.version));
+        if let Some((_, bundled_version)) = operator_upgrade_offer(app, import) {
+            rows.push(
+                button_with_icon("refresh-cw", format!("Update to {bundled_version}"))
+                    .secondary()
+                    .xsmall()
+                    .width(Size::Fill(1.0))
+                    .key(format!("{UPGRADE_IMPORT_PREFIX}{idx}")),
+            );
+        }
+    }
+    rows.push(
         button_with_icon("x", "Delete")
             .destructive()
             .xsmall()
             .width(Size::Fill(1.0))
             .key(format!("{DELETE_IMPORT_PREFIX}{idx}")),
-    ]
+    );
+    rows
 }
 
 fn step_detail_rows(app: &VolumetricUiV2, idx: usize) -> Vec<El> {
@@ -3538,6 +3670,31 @@ fn step_edit_rows(app: &VolumetricUiV2, step_idx: usize) -> Vec<El> {
             };
             rows.push(asset_slot_selector(step_idx, slot, n, current, options));
         }
+    }
+
+    for vec_form in &edit.vecs {
+        let label = vec_form
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("Vector (input {})", vec_form.input_idx + 1));
+        rows.push(text(label).muted().caption().semibold());
+        rows.push(
+            row(vec_form
+                .buffers
+                .iter()
+                .enumerate()
+                .map(|(component, buffer)| {
+                    text_input(
+                        &format!("{VEC_INPUT_PREFIX}{}:{component}", vec_form.input_idx),
+                        buffer,
+                        &app.selection,
+                    )
+                    .width(Size::Fill(1.0))
+                })
+                .collect::<Vec<_>>())
+            .gap(tokens::SPACE_1)
+            .width(Size::Fill(1.0)),
+        );
     }
 
     if let Some(config) = &edit.config {
@@ -3725,8 +3882,13 @@ fn import_rows(app: &VolumetricUiV2) -> Vec<El> {
         .iter()
         .enumerate()
         .map(|(idx, import)| {
+            let kind = if operator_upgrade_offer(app, import).is_some() {
+                "Operator · update available".to_string()
+            } else {
+                asset_type_label(import.type_hint).to_string()
+            };
             project_row(
-                asset_type_label(import.type_hint),
+                &kind,
                 &import.id,
                 format!("{SELECT_IMPORT_PREFIX}{idx}"),
                 format!("{DELETE_IMPORT_PREFIX}{idx}"),
@@ -3887,6 +4049,38 @@ fn format_bytes(bytes: usize) -> String {
     }
 }
 
+/// Declared metadata name → version of every bundled operator, decoded once.
+fn bundled_operator_versions() -> &'static std::collections::HashMap<String, String> {
+    static VERSIONS: LazyLock<std::collections::HashMap<String, String>> = LazyLock::new(|| {
+        volumetric_assets::operators()
+            .iter()
+            .filter_map(|asset| {
+                let metadata = volumetric::operator_metadata_from_wasm_bytes(asset.bytes).ok()?;
+                Some((metadata.name, metadata.version))
+            })
+            .collect()
+    });
+    &VERSIONS
+}
+
+/// `(imported_version, bundled_version)` when an imported operator's
+/// declared name matches a bundled operator whose version differs —
+/// the signal that a one-click upgrade is worth offering. Projects embed
+/// operator bytes, so fixes only reach them through this path (or re-adding
+/// the operator by hand).
+fn operator_upgrade_offer(
+    app: &VolumetricUiV2,
+    import: &volumetric::ImportedAsset,
+) -> Option<(String, String)> {
+    if import.type_hint != Some(AssetTypeHint::Operator) {
+        return None;
+    }
+    let metadata = app.operator_metadata_cached(&import.id)?;
+    let bundled_version = bundled_operator_versions().get(&metadata.name)?;
+    (metadata.version != *bundled_version)
+        .then(|| (metadata.version.clone(), bundled_version.clone()))
+}
+
 fn asset_type_label(type_hint: Option<AssetTypeHint>) -> &'static str {
     match type_hint {
         Some(AssetTypeHint::Model) => "Model",
@@ -3949,6 +4143,20 @@ fn operator_step_inputs(
                 Some(id) => ExecutionInput::AssetRef(id.to_string()),
                 None => ExecutionInput::Inline(Vec::new()),
             },
+        })
+        .collect()
+}
+
+/// Decodes a `VecF64` input payload (little-endian f64s); missing or short
+/// bytes read as zeros so a malformed slot still yields an editable form.
+fn decode_vec_f64(bytes: &[u8], dim: usize) -> Vec<f64> {
+    (0..dim)
+        .map(|i| {
+            bytes
+                .get(i * 8..(i + 1) * 8)
+                .and_then(|chunk| chunk.try_into().ok())
+                .map(f64::from_le_bytes)
+                .unwrap_or(0.0)
         })
         .collect()
 }
@@ -4232,6 +4440,109 @@ mod tests {
             .map(|slot| slot.name.as_deref())
             .collect();
         assert_eq!(names, vec![Some("Model A"), Some("Model B")]);
+    }
+
+    /// A minimal operator (WAT text — the executor compiles it directly)
+    /// whose metadata mimics a bundled operator at a different version.
+    fn stale_operator_wasm(name: &str, version: &str) -> Vec<u8> {
+        let metadata = volumetric::encode_metadata(&OperatorMetadata {
+            name: name.to_string(),
+            version: version.to_string(),
+            inputs: vec![OperatorMetadataInput::ModelWASM],
+            input_names: vec!["Model".to_string()],
+            outputs: vec![volumetric::OperatorMetadataOutput::ModelWASM],
+        });
+        let data: String = metadata.iter().map(|b| format!("\\{b:02x}")).collect();
+        let packed = 1024_i64 | ((metadata.len() as i64) << 32);
+        format!(
+            r#"(module
+                (memory (export "memory") 1)
+                (data (i32.const 1024) "{data}")
+                (func (export "get_metadata") (result i64) (i64.const {packed}))
+                (func (export "run")))"#
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn stale_operator_import_offers_and_applies_upgrade() {
+        let mut app = VolumetricUiV2::empty();
+        app.project
+            .imports_mut()
+            .push(volumetric::ImportedAsset::operator(
+                "translate_operator".to_string(),
+                stale_operator_wasm("translate_operator", "0.0.1"),
+            ));
+        app.project.timeline_mut().push(volumetric::ExecutionStep {
+            operator_id: "translate_operator".to_string(),
+            // One input where the bundled build declares two (model+config):
+            // the upgrade must append the missing slot.
+            inputs: vec![ExecutionInput::AssetRef("part".to_string())],
+            outputs: vec!["moved".to_string()],
+        });
+
+        let bundled_version = bundled_operator_versions()
+            .get("translate_operator")
+            .expect("bundled translate_operator decodes")
+            .clone();
+        let offer = operator_upgrade_offer(&app, &app.project.imports()[0]);
+        assert_eq!(offer, Some(("0.0.1".to_string(), bundled_version)));
+
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{UPGRADE_IMPORT_PREFIX}0")),
+        );
+
+        let bundled = volumetric_assets::get_operator("translate_operator").unwrap();
+        let import = &app.project().imports()[0];
+        assert_eq!(import.data, bundled.bytes);
+        assert!(
+            operator_upgrade_offer(&app, import).is_none(),
+            "up-to-date import offers nothing"
+        );
+        let step = &app.project().timeline()[0];
+        assert_eq!(step.inputs.len(), 2, "inputs realigned to new arity");
+        assert!(matches!(
+            &step.inputs[0],
+            ExecutionInput::AssetRef(id) if id == "part"
+        ));
+    }
+
+    #[test]
+    fn vec_inputs_round_trip_through_the_step_editor() {
+        let mut app = VolumetricUiV2::default();
+        add_operator_click(&mut app, "rectangular_prism_operator");
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{SELECT_STEP_PREFIX}0")),
+        );
+        app.before_build();
+
+        let edit = app.step_edit.as_ref().expect("step editor state");
+        assert_eq!(edit.vecs.len(), 2, "prism declares two VecF64 inputs");
+        assert_eq!(edit.vecs[0].buffers, vec!["0", "0", "0"]);
+        let input_idx = edit.vecs[0].input_idx;
+
+        app.commit_vec_component(0, input_idx, 1, "2.5");
+        let step = &app.project().timeline()[0];
+        let ExecutionInput::Inline(bytes) = &step.inputs[input_idx] else {
+            panic!("VecF64 slot should stay inline");
+        };
+        assert_eq!(f64::from_le_bytes(bytes[8..16].try_into().unwrap()), 2.5);
+        assert_eq!(f64::from_le_bytes(bytes[0..8].try_into().unwrap()), 0.0);
+
+        // A rebuilt editor decodes the committed bytes back into buffers.
+        app.step_edit = app.build_step_edit(0);
+        let edit = app.step_edit.as_ref().expect("step editor state");
+        assert_eq!(edit.vecs[0].buffers[1], "2.5");
+
+        // Unparseable text leaves the slot untouched.
+        app.commit_vec_component(0, input_idx, 1, "not a number");
+        let step = &app.project().timeline()[0];
+        let ExecutionInput::Inline(bytes) = &step.inputs[input_idx] else {
+            panic!("VecF64 slot should stay inline");
+        };
+        assert_eq!(f64::from_le_bytes(bytes[8..16].try_into().unwrap()), 2.5);
     }
 
     /// Input pickers must only offer assets that exist before the step
@@ -4651,10 +4962,6 @@ mod tests {
         );
         dispatch(
             &mut app,
-            UiEvent::synthetic_click(format!("{OUTPUT_ASN2_PREFIX}{id}:sharp:up")),
-        );
-        dispatch(
-            &mut app,
             UiEvent::synthetic_click(format!("{OUTPUT_ASN2_PREFIX}{id}:vr:down")),
         );
         dispatch(
@@ -4665,7 +4972,20 @@ mod tests {
         let OutputRender::Model3d { asn2, .. } = app.output_render(&id) else {
             panic!("model output should carry 3D settings");
         };
+        // Sharp edges default on for 3D model outputs; the toggle inverts.
         assert!(asn2.sharp_edges);
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{OUTPUT_ASN2_PREFIX}{id}:sharp:up")),
+        );
+        let OutputRender::Model3d { asn2: toggled, .. } = app.output_render(&id) else {
+            panic!("model output should carry 3D settings");
+        };
+        assert!(!toggled.sharp_edges);
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{OUTPUT_ASN2_PREFIX}{id}:sharp:up")),
+        );
         assert_eq!(asn2.vertex_refinement_iterations, 7);
         assert_eq!(asn2.sharp_angle_degrees, 20);
 
@@ -4879,22 +5199,15 @@ mod tests {
         let stl = vec![0xAB; 96];
         app.import_blob_asset("stl_import_operator", "stl_import", stl.clone());
 
-        // An STL import stages two steps: STL -> TriMesh, then the wired
-        // mesh -> model conversion, so the import yields a usable solid.
+        // An STL import stages exactly one step (STL -> TriMesh); users add
+        // mesh_to_model themselves when they want a sampleable solid.
         let summary = app.summary();
-        assert_eq!(summary.timeline_steps, 2);
-        assert_eq!(summary.exports, 2);
+        assert_eq!(summary.timeline_steps, 1);
+        assert_eq!(summary.exports, 1);
         assert_eq!(
             summary.selected_project_item,
-            Some(ProjectSelection::Step(1))
+            Some(ProjectSelection::Step(0))
         );
-        let convert = &app.project().timeline()[1];
-        assert_eq!(convert.operator_id, "mesh_to_model_operator");
-        let mesh_id = app.project().timeline()[0].outputs[0].clone();
-        assert!(matches!(
-            &convert.inputs[0],
-            ExecutionInput::AssetRef(id) if *id == mesh_id
-        ));
 
         // The operator's Blob slot holds the file bytes; the config slot got
         // its schema defaults.

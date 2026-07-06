@@ -271,7 +271,9 @@ pub struct ExecutionStep {
 
 // The operator metadata contract is shared with the operator crates through
 // volumetric_abi; re-exported here so hosts keep using `volumetric::OperatorMetadata`.
-pub use volumetric_abi::{OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput};
+pub use volumetric_abi::{
+    OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput, encode_metadata,
+};
 
 // The FEA mesh value type (CBOR payload of FeaMesh-typed assets).
 pub use volumetric_abi::fea;
