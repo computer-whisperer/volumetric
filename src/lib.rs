@@ -275,6 +275,10 @@ pub use volumetric_abi::{
     OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput, encode_metadata,
 };
 
+// The per-sample channel format contract (declared via `get_sample_format`),
+// re-exported so hosts and tests build/inspect formats through `volumetric`.
+pub use volumetric_abi::{ChannelKind, SampleChannel, SampleFormat, encode_sample_format};
+
 // The FEA mesh value type (CBOR payload of FeaMesh-typed assets).
 pub use volumetric_abi::fea;
 

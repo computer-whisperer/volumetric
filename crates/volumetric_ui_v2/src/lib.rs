@@ -80,6 +80,12 @@ const OUTPUT_WIREFRAME_PREFIX: &str = "output:wire:";
 const OUTPUT_FEA_DEFORMED_PREFIX: &str = "output:fea-deformed:";
 const OUTPUT_FEA_EXAG_PREFIX: &str = "output:fea-exag:";
 const OUTPUT_FEA_FIELD_PREFIX: &str = "output:fea-field:";
+/// Colormap channel picker for 3D model outputs; value `{id}:none` or
+/// `{id}:{channel}`.
+const OUTPUT_CHANNEL_PREFIX: &str = "output:channel:";
+/// Slice controls inside a 3D model's lightbox; values `axis:{0|1|2}`,
+/// `pos:{up|down}`, `channel:{name}`.
+const LIGHTBOX_SLICE_PREFIX: &str = "lightbox:slice:";
 /// 2D field inspection lightbox: `output:inspect:{id}` opens it for an
 /// output; the modal scrim/close emit `lightbox:dismiss`.
 const OUTPUT_INSPECT_PREFIX: &str = "output:inspect:";
@@ -225,6 +231,10 @@ pub struct OutputStats {
     /// `node:{name}` / `element:{name}` (node fields with 1 or 3 components,
     /// element fields with 1). Feeds the per-output field picker.
     pub fea_fields: Vec<String>,
+    /// Declared sample channels of a 3D model output, in channel order
+    /// (channel 0 is occupancy). Feeds the "Color by" picker and the slice
+    /// lightbox's channel row; empty when the model declares no format.
+    pub model_channels: Vec<String>,
 }
 
 /// Everything the 2D inspection lightbox displays for one output, computed
@@ -248,12 +258,30 @@ pub struct LightboxData {
     pub analytics: Vec<(String, String)>,
 }
 
+/// What the lightbox samples: a 2D model's field directly, or an axis-
+/// aligned slice through a 3D model's declared sample channel. Part of the
+/// background job's identity — results for a stale mode are dropped.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum LightboxMode {
+    /// 2D model: rasterize the field over its bounds.
+    #[default]
+    Sketch,
+    /// 3D model: sample `channel` on the plane `position[axis] = min +
+    /// (frac_percent/100)·extent`, occupancy-masked.
+    Slice {
+        axis: usize,
+        frac_percent: u16,
+        channel: String,
+    },
+}
+
 /// The open lightbox: which output, and the pipeline of things that arrive
 /// asynchronously after it opens (sampled data from the background job,
 /// then the GPU textures uploaded by the session).
 #[derive(Debug, Default)]
 pub struct LightboxState {
     pub asset_id: String,
+    pub mode: LightboxMode,
     pub data: Option<LightboxData>,
     pub texture: Option<AppTexture>,
     pub colorbar: Option<AppTexture>,
@@ -564,6 +592,9 @@ pub enum OutputRender {
         /// Draw the mesh's edges as an overlay (display-only; never
         /// re-meshes).
         wireframe: bool,
+        /// Colormap points/vertices by this declared sample channel
+        /// (e.g. `density`); `None` renders plain.
+        color_channel: Option<String>,
     },
     Model2d {
         /// Raster cells along the longer bounds axis.
@@ -590,8 +621,14 @@ impl OutputRender {
     fn summary(&self) -> String {
         match self {
             Self::Model3d {
-                mode, resolution, ..
-            } => format!("{} · {}^3", mode.label(), resolution),
+                mode,
+                resolution,
+                color_channel,
+                ..
+            } => match color_channel {
+                Some(channel) => format!("{} · {}^3 · {channel}", mode.label(), resolution),
+                None => format!("{} · {}^3", mode.label(), resolution),
+            },
             Self::Model2d { resolution } => format!("2D raster · {resolution}"),
             Self::FeaMesh(fea) => match &fea.color_field {
                 Some(field) => format!(
@@ -618,7 +655,11 @@ impl OutputRender {
 /// preview cache key, so any change here rebuilds the preview.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PreviewPlan {
-    Model3d(PreviewMeshPlan),
+    Model3d {
+        mesh: PreviewMeshPlan,
+        /// Sample channel to colormap points/vertices by, when declared.
+        color_channel: Option<String>,
+    },
     Sketch {
         resolution: usize,
     },
@@ -633,7 +674,13 @@ pub enum PreviewPlan {
 impl PreviewPlan {
     pub fn label(&self) -> String {
         match self {
-            Self::Model3d(mesh_plan) => mesh_plan.label(),
+            Self::Model3d {
+                mesh,
+                color_channel,
+            } => match color_channel {
+                Some(channel) => format!("{} · {channel}", mesh.label()),
+                None => mesh.label(),
+            },
             Self::Sketch { resolution } => format!("2D raster {resolution}"),
             Self::FeaMesh { color_field, .. } => match color_field {
                 Some(field) => format!("FEA mesh · {field}"),
@@ -891,6 +938,7 @@ impl VolumetricUiV2 {
                 resolution: self.preview_resolution,
                 asn2: Asn2Settings::default(),
                 wireframe: false,
+                color_channel: None,
             },
             OutputKind::Model2d => OutputRender::Model2d {
                 resolution: SKETCH_RESOLUTION_DEFAULT,
@@ -1021,6 +1069,24 @@ impl VolumetricUiV2 {
         self.output_overrides.insert(id.to_string(), render);
     }
 
+    /// Sets the sample channel a 3D model output colormaps by (`None` for
+    /// plain shading).
+    fn set_output_channel(&mut self, id: &str, channel: Option<String>) {
+        let mut render = self.output_render(id);
+        let OutputRender::Model3d { color_channel, .. } = &mut render else {
+            return;
+        };
+        *color_channel = channel;
+        self.status = match &render {
+            OutputRender::Model3d {
+                color_channel: Some(name),
+                ..
+            } => format!("{id}: color by {name}"),
+            _ => format!("{id}: plain shading"),
+        };
+        self.output_overrides.insert(id.to_string(), render);
+    }
+
     /// Sets the FEA colormap field (a `node:{name}` / `element:{name}`
     /// qualified name, or `None` for plain shading).
     fn set_output_fea_field(&mut self, id: &str, field: Option<String>) {
@@ -1042,17 +1108,88 @@ impl VolumetricUiV2 {
     }
 
     fn open_lightbox(&mut self, id: &str) {
+        let mode = match self.output_kind(id) {
+            // 3D models inspect an interior slice; default to a z midplane
+            // of the first channel beyond occupancy (the interesting one —
+            // e.g. density), falling back to the occupancy cross-section.
+            OutputKind::Model3d => {
+                let channels = self.output_channels(id);
+                LightboxMode::Slice {
+                    axis: 2,
+                    frac_percent: 50,
+                    channel: channels
+                        .get(1)
+                        .or_else(|| channels.first())
+                        .cloned()
+                        .unwrap_or_else(|| "occupancy".to_string()),
+                }
+            }
+            _ => LightboxMode::Sketch,
+        };
         self.lightbox = Some(LightboxState {
             asset_id: id.to_string(),
+            mode,
             ..Default::default()
         });
         self.open_select = None;
         self.status = format!("inspecting {id}");
     }
 
-    /// The output the open lightbox still needs sampled data for, if any.
-    /// The session turns this into a background job.
-    pub fn lightbox_wants_data(&self) -> Option<(String, Arc<Vec<u8>>)> {
+    /// The declared sample channels of a 3D model output, mirrored from its
+    /// built preview's stats (empty until a preview builds).
+    fn output_channels(&self, id: &str) -> Vec<String> {
+        self.output_stats
+            .get(id)
+            .map(|stats| stats.model_channels.clone())
+            .unwrap_or_default()
+    }
+
+    /// Routes a `lightbox:slice:` control: axis pick, position step, or
+    /// channel pick. Any change drops the sampled data so the session
+    /// re-enqueues the slice job.
+    fn adjust_lightbox_slice(&mut self, rest: &str) {
+        let Some(lightbox) = self.lightbox.as_mut() else {
+            return;
+        };
+        let LightboxMode::Slice {
+            axis,
+            frac_percent,
+            channel,
+        } = &mut lightbox.mode
+        else {
+            return;
+        };
+        if let Some(picked) = rest.strip_prefix("axis:") {
+            let Ok(picked) = picked.parse::<usize>() else {
+                return;
+            };
+            if picked > 2 || picked == *axis {
+                return;
+            }
+            *axis = picked;
+        } else if let Some(direction) = rest.strip_prefix("pos:") {
+            let step: i32 = if direction == "up" { 5 } else { -5 };
+            let next = (i32::from(*frac_percent) + step).clamp(0, 100) as u16;
+            if next == *frac_percent {
+                return;
+            }
+            *frac_percent = next;
+        } else if let Some(picked) = rest.strip_prefix("channel:") {
+            if picked == channel.as_str() {
+                return;
+            }
+            *channel = picked.to_string();
+        } else {
+            return;
+        }
+        lightbox.data = None;
+        lightbox.texture = None;
+        lightbox.colorbar = None;
+    }
+
+    /// The output (and sampling mode) the open lightbox still needs data
+    /// for, if any. The session turns this into a background job.
+    pub fn lightbox_wants_data(&self) -> Option<(String, LightboxMode, Arc<Vec<u8>>)> {
         let lightbox = self.lightbox.as_ref()?;
         if lightbox.data.is_some() {
             return None;
@@ -1061,7 +1198,11 @@ impl VolumetricUiV2 {
             .runtime_assets
             .iter()
             .find(|a| a.id() == lightbox.asset_id)?;
-        Some((lightbox.asset_id.clone(), asset.data_arc()))
+        Some((
+            lightbox.asset_id.clone(),
+            lightbox.mode.clone(),
+            asset.data_arc(),
+        ))
     }
 
     /// The lightbox data awaiting texture upload, if any. The session
@@ -1075,12 +1216,19 @@ impl VolumetricUiV2 {
     }
 
     /// Delivers the background job's sampled data (ignored if the lightbox
-    /// moved to another output or closed meanwhile).
-    pub fn set_lightbox_data(&mut self, asset_id: &str, result: Result<LightboxData, String>) {
+    /// moved to another output, changed slice parameters, or closed
+    /// meanwhile — leaving `data` empty makes the session re-enqueue with
+    /// the current mode).
+    pub fn set_lightbox_data(
+        &mut self,
+        asset_id: &str,
+        mode: &LightboxMode,
+        result: Result<LightboxData, String>,
+    ) {
         let Some(lightbox) = self.lightbox.as_mut() else {
             return;
         };
-        if lightbox.asset_id != asset_id {
+        if lightbox.asset_id != asset_id || lightbox.mode != *mode {
             return;
         }
         match result {
@@ -1118,8 +1266,12 @@ impl VolumetricUiV2 {
                 mode,
                 resolution,
                 asn2,
+                color_channel,
                 ..
-            } => PreviewPlan::Model3d(PreviewMeshPlan::for_mode(*mode, *resolution, *asn2)),
+            } => PreviewPlan::Model3d {
+                mesh: PreviewMeshPlan::for_mode(*mode, *resolution, *asn2),
+                color_channel: color_channel.clone(),
+            },
             OutputRender::Model2d { resolution } => PreviewPlan::Sketch {
                 resolution: *resolution,
             },
@@ -2636,6 +2788,15 @@ impl App for VolumetricUiV2 {
             if let Some((id, direction)) = rest.rsplit_once(':') {
                 self.adjust_output_fea_exaggeration(id, direction == "up");
             }
+        } else if let Some(rest) = route.strip_prefix(OUTPUT_CHANNEL_PREFIX) {
+            // `{id}:none` or `{id}:{channel}` — value split off the right so
+            // asset ids with colons still resolve.
+            if let Some((id, channel)) = rest.rsplit_once(':') {
+                let channel = (channel != "none").then(|| channel.to_string());
+                self.set_output_channel(id, channel);
+            }
+        } else if let Some(rest) = route.strip_prefix(LIGHTBOX_SLICE_PREFIX) {
+            self.adjust_lightbox_slice(rest);
         } else if let Some(rest) = route.strip_prefix(OUTPUT_FEA_FIELD_PREFIX) {
             // `{id}:none` or `{id}:{node|element}:{name}` — split the value
             // off the right so asset ids with colons still resolve.
@@ -2815,6 +2976,55 @@ fn select_layer(app: &VolumetricUiV2) -> Option<El> {
 fn lightbox_layer(app: &VolumetricUiV2) -> Option<El> {
     let lightbox = app.lightbox.as_ref()?;
     let mut body: Vec<El> = Vec::new();
+    // Slice controls render above the image and stay live while a new
+    // sample is in flight (each change re-samples in the background).
+    if let LightboxMode::Slice {
+        axis,
+        frac_percent,
+        channel,
+    } = &lightbox.mode
+    {
+        let axis_button = |a: usize, label: &str| {
+            let button = button(label)
+                .xsmall()
+                .key(format!("{LIGHTBOX_SLICE_PREFIX}axis:{a}"));
+            if *axis == a {
+                button.primary()
+            } else {
+                button.secondary()
+            }
+        };
+        let mut controls = vec![
+            axis_button(0, "X"),
+            axis_button(1, "Y"),
+            axis_button(2, "Z"),
+            icon_button("chevron-left")
+                .ghost()
+                .xsmall()
+                .key(format!("{LIGHTBOX_SLICE_PREFIX}pos:down")),
+            text(format!("{frac_percent}%"))
+                .label()
+                .text_align(TextAlign::Center)
+                .width(Size::Fixed(48.0)),
+            icon_button("chevron-right")
+                .ghost()
+                .xsmall()
+                .key(format!("{LIGHTBOX_SLICE_PREFIX}pos:up")),
+        ];
+        let channels = app.output_channels(&lightbox.asset_id);
+        for name in &channels {
+            let button = button(name.clone())
+                .xsmall()
+                .key(format!("{LIGHTBOX_SLICE_PREFIX}channel:{name}"));
+            controls.push(if name == channel {
+                button.primary()
+            } else {
+                button.secondary()
+            });
+        }
+        body.push(row(controls).gap(tokens::SPACE_1).align(Align::Center));
+        body.push(divider());
+    }
     match (&lightbox.data, &lightbox.texture) {
         (Some(data), Some(texture)) => {
             body.push(
@@ -2919,8 +3129,17 @@ fn output_settings_popover(app: &VolumetricUiV2, id: &str) -> El {
             resolution,
             asn2,
             wireframe,
+            color_channel,
         } => {
-            body.extend(model3d_settings(id, *mode, *resolution, asn2, *wireframe));
+            body.extend(model3d_settings(
+                app,
+                id,
+                *mode,
+                *resolution,
+                asn2,
+                *wireframe,
+                color_channel.as_deref(),
+            ));
         }
         OutputRender::Model2d { resolution } => {
             body.push(
@@ -3014,11 +3233,13 @@ fn output_settings_popover(app: &VolumetricUiV2, id: &str) -> El {
 
 /// 3D model settings: render mode, voxel resolution, wireframe, ASN2 knobs.
 fn model3d_settings(
+    app: &VolumetricUiV2,
     id: &str,
     mode: PreviewRenderMode,
     resolution: usize,
     asn2: &Asn2Settings,
     wireframe: bool,
+    color_channel: Option<&str>,
 ) -> Vec<El> {
     let mode_buttons = row(PreviewRenderMode::ALL.into_iter().map(|preset| {
         let button = button(preset.label())
@@ -3095,6 +3316,40 @@ fn model3d_settings(
                 &asn2.sharp_angle_degrees.to_string(),
             ));
         }
+    }
+
+    // Channel colormap + slice inspection, for models that declare sample
+    // channels beyond occupancy (e.g. fea_density's density channel).
+    let channels = app.output_channels(id);
+    if channels.len() > 1 {
+        body.push(text("Color by").caption().muted());
+        let none_button = button("None")
+            .xsmall()
+            .width(Size::Fill(1.0))
+            .key(format!("{OUTPUT_CHANNEL_PREFIX}{id}:none"));
+        body.push(if color_channel.is_none() {
+            none_button.primary()
+        } else {
+            none_button.secondary()
+        });
+        for channel in channels.iter().skip(1) {
+            let button = button(channel.clone())
+                .xsmall()
+                .width(Size::Fill(1.0))
+                .key(format!("{OUTPUT_CHANNEL_PREFIX}{id}:{channel}"));
+            body.push(if color_channel == Some(channel.as_str()) {
+                button.primary()
+            } else {
+                button.secondary()
+            });
+        }
+        body.push(
+            button_with_icon("search", "Inspect slice…")
+                .secondary()
+                .xsmall()
+                .width(Size::Fill(1.0))
+                .key(format!("{OUTPUT_INSPECT_PREFIX}{id}")),
+        );
     }
     body
 }
@@ -4708,7 +4963,10 @@ mod tests {
         assert_eq!(requests.len(), 1);
         let request = &requests[0];
         assert_eq!(request.asset_id, "simple_sphere_model");
-        let PreviewPlan::Model3d(mesh_plan) = &request.plan else {
+        let PreviewPlan::Model3d {
+            mesh: mesh_plan, ..
+        } = &request.plan
+        else {
             panic!(
                 "sphere output should carry a 3D plan, got {:?}",
                 request.plan
@@ -4940,16 +5198,22 @@ mod tests {
             .expect("default output renders");
         assert_eq!(
             overridden.plan,
-            PreviewPlan::Model3d(PreviewMeshPlan::for_mode(
-                PreviewRenderMode::Points,
-                24,
-                Asn2Settings::default()
-            ))
+            PreviewPlan::Model3d {
+                mesh: PreviewMeshPlan::for_mode(
+                    PreviewRenderMode::Points,
+                    24,
+                    Asn2Settings::default()
+                ),
+                color_channel: None,
+            }
         );
         assert!(
             matches!(
                 &default.plan,
-                PreviewPlan::Model3d(PreviewMeshPlan::AdaptiveSurfaceNets2 { .. })
+                PreviewPlan::Model3d {
+                    mesh: PreviewMeshPlan::AdaptiveSurfaceNets2 { .. },
+                    ..
+                }
             ),
             "un-overridden output keeps the viewport default plan"
         );
@@ -5024,7 +5288,10 @@ mod tests {
         // The settings flow through to the meshing config.
         let requests = app.preview_requests();
         let request = requests.iter().find(|r| r.asset_id == id).unwrap();
-        let PreviewPlan::Model3d(mesh_plan) = &request.plan else {
+        let PreviewPlan::Model3d {
+            mesh: mesh_plan, ..
+        } = &request.plan
+        else {
             panic!("model output should carry a 3D plan");
         };
         let config = mesh_plan
@@ -5070,6 +5337,126 @@ mod tests {
     }
 
     #[test]
+    fn channel_route_overrides_model3d_colormap() {
+        let (mut app, exports) = two_export_app();
+        let id = exports[0].clone();
+
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{OUTPUT_CHANNEL_PREFIX}{id}:density")),
+        );
+        let OutputRender::Model3d { color_channel, .. } = app.output_render(&id) else {
+            panic!("model output should carry 3D settings");
+        };
+        assert_eq!(color_channel.as_deref(), Some("density"));
+        // The channel is part of the rebuild plan (cache key).
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{TOGGLE_PIN_PREFIX}{id}")),
+        );
+        let requests = app.preview_requests();
+        let request = requests.iter().find(|r| r.asset_id == id).unwrap();
+        assert!(matches!(
+            &request.plan,
+            PreviewPlan::Model3d { color_channel: Some(name), .. } if name == "density"
+        ));
+
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{OUTPUT_CHANNEL_PREFIX}{id}:none")),
+        );
+        let OutputRender::Model3d { color_channel, .. } = app.output_render(&id) else {
+            panic!("model output should carry 3D settings");
+        };
+        assert_eq!(color_channel, None);
+    }
+
+    #[test]
+    fn lightbox_slice_controls_update_mode_and_resample() {
+        let (mut app, exports) = two_export_app();
+        let id = exports[0].clone();
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{OUTPUT_INSPECT_PREFIX}{id}")),
+        );
+        // A 3D model output opens in slice mode: z midplane, occupancy
+        // fallback channel (no preview stats have arrived in this test).
+        let lightbox = app.lightbox.as_ref().expect("lightbox opens");
+        assert_eq!(
+            lightbox.mode,
+            LightboxMode::Slice {
+                axis: 2,
+                frac_percent: 50,
+                channel: "occupancy".to_string(),
+            }
+        );
+
+        // Pretend data arrived, then change the axis: the data drops so the
+        // session re-samples with the new mode.
+        app.lightbox.as_mut().unwrap().data = Some(LightboxData {
+            rgba: vec![0; 4],
+            width: 1,
+            height: 1,
+            bounds_min: (0.0, 0.0),
+            bounds_max: (1.0, 1.0),
+            binary: true,
+            value_min: 0.0,
+            value_max: 1.0,
+            analytics: vec![],
+        });
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{LIGHTBOX_SLICE_PREFIX}axis:0")),
+        );
+        let lightbox = app.lightbox.as_ref().unwrap();
+        assert!(lightbox.data.is_none(), "axis change drops stale data");
+        assert!(matches!(
+            &lightbox.mode,
+            LightboxMode::Slice { axis: 0, .. }
+        ));
+
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{LIGHTBOX_SLICE_PREFIX}pos:up")),
+        );
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{LIGHTBOX_SLICE_PREFIX}channel:density")),
+        );
+        assert_eq!(
+            app.lightbox.as_ref().unwrap().mode,
+            LightboxMode::Slice {
+                axis: 0,
+                frac_percent: 55,
+                channel: "density".to_string(),
+            }
+        );
+
+        // Stale-mode results are dropped: data delivered for the old mode
+        // leaves the lightbox waiting.
+        app.set_lightbox_data(
+            &id,
+            &LightboxMode::Slice {
+                axis: 2,
+                frac_percent: 50,
+                channel: "occupancy".to_string(),
+            },
+            Ok(LightboxData {
+                rgba: vec![0; 4],
+                width: 1,
+                height: 1,
+                bounds_min: (0.0, 0.0),
+                bounds_max: (1.0, 1.0),
+                binary: true,
+                value_min: 0.0,
+                value_max: 1.0,
+                analytics: vec![],
+            }),
+        );
+        assert!(app.lightbox.as_ref().unwrap().data.is_none());
+    }
+
+    #[test]
     fn inspect_route_opens_and_dismisses_the_lightbox() {
         let (mut app, exports) = two_export_app();
         dispatch(
@@ -5079,7 +5466,7 @@ mod tests {
         let lightbox = app.lightbox.as_ref().expect("lightbox opens");
         assert_eq!(lightbox.asset_id, exports[0]);
         // The freshly opened lightbox asks for sampled data for its output.
-        let (id, _) = app.lightbox_wants_data().expect("wants data");
+        let (id, _, _) = app.lightbox_wants_data().expect("wants data");
         assert_eq!(id, exports[0]);
         assert!(app.lightbox_wants_texture().is_none(), "no data yet");
 
@@ -5117,7 +5504,10 @@ mod tests {
         assert!(
             matches!(
                 &request.plan,
-                PreviewPlan::Model3d(PreviewMeshPlan::AdaptiveSurfaceNets2 { .. })
+                PreviewPlan::Model3d {
+                    mesh: PreviewMeshPlan::AdaptiveSurfaceNets2 { .. },
+                    ..
+                }
             ),
             "back on viewport defaults"
         );

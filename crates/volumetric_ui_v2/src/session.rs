@@ -19,8 +19,8 @@ use glam::{Mat4, Vec2, Vec3};
 use volumetric_renderer as renderer;
 
 use crate::{
-    LightboxData, OutputStats, PreviewBuildStatus, PreviewMeshPlan, PreviewPlan, PreviewRequest,
-    RunState, VolumetricUiV2,
+    LightboxData, LightboxMode, OutputStats, PreviewBuildStatus, PreviewMeshPlan, PreviewPlan,
+    PreviewRequest, RunState, VolumetricUiV2,
 };
 use volumetric::AssetTypeHint;
 
@@ -56,9 +56,9 @@ pub struct Session {
     /// The viewport widget's rect from the last completed layout, used to
     /// hit-test camera input and to size the render target between frames.
     viewport_rect: Option<Rect>,
-    /// The output a lightbox sampling job is in flight for, so a slow job
-    /// isn't re-queued every frame.
-    lightbox_inflight: Option<String>,
+    /// The output + sampling mode a lightbox job is in flight for, so a
+    /// slow job isn't re-queued every frame (a mode change re-queues).
+    lightbox_inflight: Option<(String, LightboxMode)>,
     /// The viridis colorbar gradient, uploaded once and reused across
     /// lightboxes (its content never changes).
     colorbar_texture: Option<AppTexture>,
@@ -102,11 +102,21 @@ impl Session {
                 BackgroundResult::PreviewComplete(preview) => {
                     self.viewport.accept_preview_result(preview);
                 }
-                BackgroundResult::LightboxComplete { asset_id, result } => {
-                    if self.lightbox_inflight.as_deref() == Some(asset_id.as_str()) {
+                BackgroundResult::LightboxComplete {
+                    asset_id,
+                    mode,
+                    result,
+                } => {
+                    if self
+                        .lightbox_inflight
+                        .as_ref()
+                        .is_some_and(|(id, inflight_mode)| {
+                            *id == asset_id && *inflight_mode == mode
+                        })
+                    {
                         self.lightbox_inflight = None;
                     }
-                    app.set_lightbox_data(&asset_id, result);
+                    app.set_lightbox_data(&asset_id, &mode, result);
                 }
             }
         }
@@ -152,12 +162,18 @@ impl Session {
         app.set_output_stats(self.viewport.preview_cache.output_stats());
         jobs.extend(preview_jobs.into_iter().map(BackgroundJob::BuildPreview));
 
-        // Lightbox: dispatch sampling for a freshly opened inspection, and
-        // upload arrived data as textures.
-        if let Some((asset_id, data)) = app.lightbox_wants_data() {
-            if self.lightbox_inflight.as_deref() != Some(asset_id.as_str()) {
-                self.lightbox_inflight = Some(asset_id.clone());
-                jobs.push(BackgroundJob::BuildLightbox { asset_id, data });
+        // Lightbox: dispatch sampling for a freshly opened inspection (or a
+        // slice parameter change), and upload arrived data as textures.
+        if let Some((asset_id, mode, data)) = app.lightbox_wants_data() {
+            let spec = (asset_id, mode);
+            if self.lightbox_inflight.as_ref() != Some(&spec) {
+                self.lightbox_inflight = Some(spec.clone());
+                let (asset_id, mode) = spec;
+                jobs.push(BackgroundJob::BuildLightbox {
+                    asset_id,
+                    mode,
+                    data,
+                });
             }
         } else if app.lightbox_wants_texture().is_none() {
             self.lightbox_inflight = None;
@@ -889,9 +905,11 @@ pub enum BackgroundJob {
         cancel: Arc<AtomicBool>,
     },
     BuildPreview(PreviewBuildJob),
-    /// Sample a 2D output for the inspection lightbox.
+    /// Sample an output for the inspection lightbox (a 2D field raster, or
+    /// a slice through a 3D model's channel).
     BuildLightbox {
         asset_id: String,
+        mode: LightboxMode,
         data: Arc<Vec<u8>>,
     },
 }
@@ -906,6 +924,7 @@ pub enum BackgroundResult {
     PreviewComplete(PreviewBuildResult),
     LightboxComplete {
         asset_id: String,
+        mode: LightboxMode,
         result: Result<LightboxData, String>,
     },
 }
@@ -982,9 +1001,24 @@ pub fn execute_job(job: BackgroundJob) -> BackgroundResult {
                 result,
             })
         }
-        BackgroundJob::BuildLightbox { asset_id, data } => {
-            let result = build_lightbox_data(&data);
-            BackgroundResult::LightboxComplete { asset_id, result }
+        BackgroundJob::BuildLightbox {
+            asset_id,
+            mode,
+            data,
+        } => {
+            let result = match &mode {
+                LightboxMode::Sketch => build_lightbox_data(&data),
+                LightboxMode::Slice {
+                    axis,
+                    frac_percent,
+                    channel,
+                } => build_slice_lightbox_data(&data, *axis, *frac_percent, channel),
+            };
+            BackgroundResult::LightboxComplete {
+                asset_id,
+                mode,
+                result,
+            }
         }
     }
 }
@@ -1123,6 +1157,185 @@ pub fn build_lightbox_data(wasm_bytes: &[u8]) -> Result<LightboxData, String> {
     })
 }
 
+/// Samples an axis-aligned slice through a 3D model's declared channel for
+/// the inspection lightbox: `position[axis]` is fixed at `min + frac% ·
+/// extent` and the chosen channel is sampled over the two lateral axes
+/// (ascending order, matching the FEA lateral-axis convention). Occupied
+/// cells colormap viridis over their value range; unoccupied cells stay
+/// white; the occupancy channel itself renders as a black-on-white mask.
+pub fn build_slice_lightbox_data(
+    wasm_bytes: &[u8],
+    axis: usize,
+    frac_percent: u16,
+    channel: &str,
+) -> Result<LightboxData, String> {
+    const RESOLUTION: usize = 256;
+
+    let mut executor = volumetric::wasm::native::NativeModelExecutor::new(wasm_bytes)
+        .map_err(|err| err.to_string())?;
+    if executor.dimensions() != 3 {
+        return Err(format!(
+            "slice inspection needs a 3D model (got {}D)",
+            executor.dimensions()
+        ));
+    }
+    if axis > 2 {
+        return Err(format!("slice axis {axis} out of range"));
+    }
+    let channel_idx = executor
+        .sample_format()
+        .channels
+        .iter()
+        .position(|c| c.name == channel)
+        .ok_or_else(|| format!("model declares no channel {channel:?}"))?;
+    let masked = channel_idx != 0;
+
+    let bounds = executor.get_bounds_nd().map_err(|err| err.to_string())?;
+    let plane =
+        bounds.min(axis) + (bounds.max(axis) - bounds.min(axis)) * f64::from(frac_percent) / 100.0;
+    let lateral: [usize; 2] = match axis {
+        0 => [1, 2],
+        1 => [0, 2],
+        _ => [0, 1],
+    };
+    let (u_min, u_max) = (bounds.min(lateral[0]), bounds.max(lateral[0]));
+    let (v_min, v_max) = (bounds.min(lateral[1]), bounds.max(lateral[1]));
+    let (u_extent, v_extent) = ((u_max - u_min).max(1e-9), (v_max - v_min).max(1e-9));
+
+    // Cells proportional to the slice's aspect ratio, longer side RESOLUTION.
+    let (width, height) = if u_extent >= v_extent {
+        let h = ((RESOLUTION as f64 * v_extent / u_extent).round() as usize).clamp(8, RESOLUTION);
+        (RESOLUTION, h)
+    } else {
+        let w = ((RESOLUTION as f64 * u_extent / v_extent).round() as usize).clamp(8, RESOLUTION);
+        (w, RESOLUTION)
+    };
+
+    // Sample the grid at cell centers: value channel + occupancy mask.
+    let mut values = vec![f32::NAN; width * height];
+    let mut occupied_mask = vec![false; width * height];
+    let mut position = [0.0f64; 3];
+    position[axis] = plane;
+    for vi in 0..height {
+        position[lateral[1]] = v_min + v_extent * ((vi as f64 + 0.5) / height as f64);
+        for ui in 0..width {
+            position[lateral[0]] = u_min + u_extent * ((ui as f64 + 0.5) / width as f64);
+            let row = executor
+                .sample_channels_nd(&position)
+                .map_err(|err| err.to_string())?;
+            let occupied = row.first().is_some_and(|&occ| volumetric::is_occupied(occ));
+            values[vi * width + ui] = row.get(channel_idx).copied().unwrap_or(f32::NAN);
+            occupied_mask[vi * width + ui] = occupied;
+        }
+    }
+
+    // Value range over occupied, finite cells (the colormap domain).
+    let mut value_min = f32::INFINITY;
+    let mut value_max = f32::NEG_INFINITY;
+    let mut occupied = 0usize;
+    let mut nan_cells = 0usize;
+    let mut sum = 0.0f64;
+    for (idx, &v) in values.iter().enumerate() {
+        if !occupied_mask[idx] {
+            continue;
+        }
+        occupied += 1;
+        if !v.is_finite() {
+            nan_cells += 1;
+            continue;
+        }
+        value_min = value_min.min(v);
+        value_max = value_max.max(v);
+        sum += f64::from(v);
+    }
+    if occupied == 0 || value_min > value_max {
+        (value_min, value_max) = (0.0, 0.0);
+    }
+    let span = (value_max - value_min).max(f32::EPSILON);
+
+    // Colormap, image row order (top row = max lateral-v).
+    let mut rgba = Vec::with_capacity(width * height * 4);
+    for vi in (0..height).rev() {
+        for ui in 0..width {
+            let idx = vi * width + ui;
+            let pixel: [u8; 3] = if !occupied_mask[idx] {
+                [255; 3]
+            } else if !masked {
+                [0; 3]
+            } else if !values[idx].is_finite() {
+                [255, 0, 255]
+            } else {
+                let c = volumetric::viridis((values[idx] - value_min) / span);
+                c.map(|ch| (ch * 255.0).round() as u8)
+            };
+            rgba.extend(pixel);
+            rgba.push(255);
+        }
+    }
+
+    let cells = width * height;
+    let cell_area = (u_extent / width as f64) * (v_extent / height as f64);
+    let finite_occupied = occupied - nan_cells;
+    let mean = if finite_occupied > 0 {
+        sum / finite_occupied as f64
+    } else {
+        0.0
+    };
+    let axis_name = ["x", "y", "z"][axis];
+    let mut analytics: Vec<(String, String)> = vec![
+        (
+            "slice".to_string(),
+            format!(
+                "{axis_name} = {plane:.4} ({frac_percent}% of [{:.4}, {:.4}])",
+                bounds.min(axis),
+                bounds.max(axis)
+            ),
+        ),
+        ("raster".to_string(), format!("{width} x {height} cells")),
+        (
+            "bounds".to_string(),
+            format!("u [{u_min:.4}, {u_max:.4}] · v [{v_min:.4}, {v_max:.4}]"),
+        ),
+        (
+            "occupied".to_string(),
+            format!(
+                "{:.1}% · area {:.6}",
+                100.0 * occupied as f64 / cells.max(1) as f64,
+                occupied as f64 * cell_area
+            ),
+        ),
+    ];
+    if masked && occupied > 0 {
+        analytics.push((
+            "range".to_string(),
+            format!("{value_min:.6} .. {value_max:.6}"),
+        ));
+        analytics.push(("mean (occupied)".to_string(), format!("{mean:.6}")));
+        analytics.push((
+            "integral".to_string(),
+            format!("{:.6} (sum · cell area)", sum * cell_area),
+        ));
+    }
+    if nan_cells > 0 {
+        analytics.push((
+            "non-finite cells".to_string(),
+            format!("{nan_cells} (magenta)"),
+        ));
+    }
+
+    Ok(LightboxData {
+        rgba,
+        width: width as u32,
+        height: height as u32,
+        bounds_min: (u_min as f32, v_min as f32),
+        bounds_max: (u_max as f32, v_max as f32),
+        binary: !masked,
+        value_min,
+        value_max,
+        analytics,
+    })
+}
+
 pub fn build_preview_scene(request: &PreviewRequest) -> Result<PreviewEntity, String> {
     let build_start = std::time::Instant::now();
     let mut stats = OutputStats::default();
@@ -1147,14 +1360,17 @@ pub fn build_preview_scene(request: &PreviewRequest) -> Result<PreviewEntity, St
     // it statically); if a model defeats the static probe, fall back to a
     // cheap default plan rather than failing.
     let fallback_plan;
-    let mesh_plan = match &request.plan {
-        PreviewPlan::Model3d(mesh_plan) => mesh_plan,
+    let (mesh_plan, color_channel) = match &request.plan {
+        PreviewPlan::Model3d {
+            mesh,
+            color_channel,
+        } => (mesh, color_channel.as_deref()),
         _ => {
             fallback_plan = PreviewMeshPlan::PointCloud { resolution: 24 };
-            &fallback_plan
+            (&fallback_plan, None)
         }
     };
-    let (scene, wireframe_lines, bounds_min, bounds_max) = match mesh_plan {
+    let (mut scene, wireframe_lines, bounds_min, bounds_max) = match mesh_plan {
         PreviewMeshPlan::PointCloud { resolution } => {
             let (points, bounds_min, bounds_max) =
                 volumetric::sample_model_from_bytes(request.data.as_slice(), *resolution)
@@ -1226,6 +1442,35 @@ pub fn build_preview_scene(request: &PreviewRequest) -> Result<PreviewEntity, St
         }
     };
 
+    // Channel discovery + colormap: mirror the declared channels into the
+    // stats (feeds the "Color by" picker and the slice lightbox), and when
+    // a channel is selected, colormap the built points/vertices by sampling
+    // it. The module is already in the executor cache from the meshing pass,
+    // so this executor is cheap to create.
+    match volumetric::wasm::native::NativeModelExecutor::new(request.data.as_slice()) {
+        Ok(mut executor) => {
+            stats.model_channels = executor
+                .sample_format()
+                .channels
+                .iter()
+                .map(|c| c.name.clone())
+                .collect();
+            if let Some(channel) = color_channel {
+                match colormap_scene_by_channel(&mut scene, &mut executor, channel) {
+                    Ok((value_min, value_max)) => stats.detail.push(format!(
+                        "Color: {channel} in [{value_min:.4}, {value_max:.4}]"
+                    )),
+                    Err(err) => stats.detail.push(format!("Color: {err}")),
+                }
+            }
+        }
+        Err(err) => {
+            if color_channel.is_some() {
+                stats.detail.push(format!("Color: {err}"));
+            }
+        }
+    }
+
     stats.mesh_ms = build_start.elapsed().as_secs_f64() * 1000.0;
     Ok(PreviewEntity {
         scene,
@@ -1236,6 +1481,83 @@ pub fn build_preview_scene(request: &PreviewRequest) -> Result<PreviewEntity, St
         stats,
         wireframe_lines,
     })
+}
+
+/// Colormaps every point instance and mesh vertex of a built preview scene
+/// by the named sample channel: viridis over the sampled range, magenta for
+/// non-finite samples. Returns the value range the colormap spans.
+fn colormap_scene_by_channel(
+    scene: &mut renderer::SceneData,
+    executor: &mut volumetric::wasm::native::NativeModelExecutor,
+    channel: &str,
+) -> Result<(f32, f32), String> {
+    let channel_idx = executor
+        .sample_format()
+        .channels
+        .iter()
+        .position(|c| c.name == channel)
+        .ok_or_else(|| format!("channel {channel:?} not declared"))?;
+
+    let mut sample = |position: [f32; 3]| -> Result<f32, String> {
+        let row = executor
+            .sample_channels_nd(&[
+                f64::from(position[0]),
+                f64::from(position[1]),
+                f64::from(position[2]),
+            ])
+            .map_err(|err| err.to_string())?;
+        Ok(row.get(channel_idx).copied().unwrap_or(f32::NAN))
+    };
+
+    // Sample everything first: the colormap needs the whole range.
+    let mut point_values: Vec<Vec<f32>> = Vec::new();
+    for (points, _, _) in &scene.points {
+        let mut values = Vec::with_capacity(points.points.len());
+        for point in &points.points {
+            values.push(sample(point.position)?);
+        }
+        point_values.push(values);
+    }
+    let mut vertex_values: Vec<Vec<f32>> = Vec::new();
+    for (mesh, _, _) in &scene.meshes {
+        let mut values = Vec::with_capacity(mesh.vertices.len());
+        for vertex in &mesh.vertices {
+            values.push(sample(vertex.position)?);
+        }
+        vertex_values.push(values);
+    }
+
+    let mut value_min = f32::INFINITY;
+    let mut value_max = f32::NEG_INFINITY;
+    for &v in point_values.iter().chain(vertex_values.iter()).flatten() {
+        if v.is_finite() {
+            value_min = value_min.min(v);
+            value_max = value_max.max(v);
+        }
+    }
+    if value_min > value_max {
+        (value_min, value_max) = (0.0, 0.0);
+    }
+    let span = (value_max - value_min).max(f32::EPSILON);
+    let color_of = |v: f32| -> [f32; 4] {
+        if !v.is_finite() {
+            return [1.0, 0.0, 1.0, 1.0];
+        }
+        let c = volumetric::viridis((v - value_min) / span);
+        [c[0], c[1], c[2], 1.0]
+    };
+
+    for ((points, _, _), values) in scene.points.iter_mut().zip(&point_values) {
+        for (point, &v) in points.points.iter_mut().zip(values) {
+            point.color = color_of(v);
+        }
+    }
+    for ((mesh, _, _), values) in scene.meshes.iter_mut().zip(&vertex_values) {
+        for (vertex, &v) in mesh.vertices.iter_mut().zip(values) {
+            vertex.color = color_of(v);
+        }
+    }
+    Ok((value_min, value_max))
 }
 
 /// Style for the wireframe overlay: thin dark depth-tested lines. The line
@@ -1971,6 +2293,168 @@ mod tests {
             .clone()
     }
 
+    /// A 3D model over [0,1]^3, occupied where x < 0.5, declaring a
+    /// `density` channel equal to the sample's z coordinate.
+    fn density_model() -> Vec<u8> {
+        let format = volumetric::encode_sample_format(&volumetric::SampleFormat {
+            channels: vec![
+                volumetric::SampleChannel {
+                    name: "occupancy".to_string(),
+                    kind: volumetric::ChannelKind::Occupancy,
+                },
+                volumetric::SampleChannel {
+                    name: "density".to_string(),
+                    kind: volumetric::ChannelKind::Density,
+                },
+            ],
+        });
+        let data: String = format.iter().map(|b| format!("\\{b:02x}")).collect();
+        let packed = 2048_i64 | ((format.len() as i64) << 32);
+        wat::parse_str(format!(
+            r#"(module
+                (memory (export "memory") 1)
+                (data (i32.const 2048) "{data}")
+                (func (export "get_dimensions") (result i32) (i32.const 3))
+                (func (export "get_io_ptr") (result i32) (i32.const 1024))
+                (func (export "get_bounds") (param $out i32)
+                    (f64.store (local.get $out) (f64.const 0))
+                    (f64.store offset=8 (local.get $out) (f64.const 1))
+                    (f64.store offset=16 (local.get $out) (f64.const 0))
+                    (f64.store offset=24 (local.get $out) (f64.const 1))
+                    (f64.store offset=32 (local.get $out) (f64.const 0))
+                    (f64.store offset=40 (local.get $out) (f64.const 1)))
+                (func $occ (param $pos i32) (result f32)
+                    (select (f32.const 1) (f32.const 0)
+                        (f64.lt (f64.load (local.get $pos)) (f64.const 0.5))))
+                (func (export "sample") (param $pos i32) (result f32)
+                    (call $occ (local.get $pos)))
+                (func (export "get_sample_format") (result i64) (i64.const {packed}))
+                (func (export "sample_channels") (param $pos i32) (param $out i32)
+                    (f32.store (local.get $out) (call $occ (local.get $pos)))
+                    (f32.store offset=4 (local.get $out)
+                        (f32.demote_f64 (f64.load offset=16 (local.get $pos)))))
+            )"#
+        ))
+        .expect("density model assembles")
+    }
+
+    #[test]
+    fn slice_lightbox_masks_by_occupancy_and_reads_the_channel() {
+        let model = density_model();
+
+        // z midplane: density == 0.5 across the occupied half (x < 0.5).
+        let data = build_slice_lightbox_data(&model, 2, 50, "density").expect("slice builds");
+        assert!(!data.binary);
+        assert!((data.value_min - 0.5).abs() < 1e-6);
+        assert!((data.value_max - 0.5).abs() < 1e-6);
+        assert!(analytic(&data, "occupied").starts_with("50.0%"));
+        assert!(analytic(&data, "slice").starts_with("z = 0.5"));
+        // Left half viridis, right half white (unoccupied).
+        let row = data.width as usize;
+        assert_ne!(&data.rgba[0..3], &[255, 255, 255]);
+        assert_eq!(
+            &data.rgba[(row - 1) * 4..(row - 1) * 4 + 3],
+            &[255, 255, 255]
+        );
+
+        // x slice inside the occupied half: density spans z.
+        let data = build_slice_lightbox_data(&model, 0, 25, "density").expect("slice builds");
+        assert!(analytic(&data, "occupied").starts_with("100.0%"));
+        assert!(data.value_min < 0.01 && data.value_max > 0.99);
+
+        // x slice in the empty half: nothing occupied, no value rows.
+        let data = build_slice_lightbox_data(&model, 0, 75, "density").expect("slice builds");
+        assert!(analytic(&data, "occupied").starts_with("0.0%"));
+        assert!(!data.analytics.iter().any(|(l, _)| l == "range"));
+
+        // The occupancy channel itself renders as a black-on-white mask.
+        let data = build_slice_lightbox_data(&model, 2, 50, "occupancy").expect("slice builds");
+        assert!(data.binary);
+        assert!(
+            data.rgba
+                .chunks_exact(4)
+                .all(|px| px[0..3] == [0, 0, 0] || px[0..3] == [255, 255, 255])
+        );
+
+        // Unknown channels fail with a readable error.
+        let err = build_slice_lightbox_data(&model, 2, 50, "nope").unwrap_err();
+        assert!(err.contains("no channel"), "{err}");
+    }
+
+    #[test]
+    fn preview_colors_points_by_declared_channel() {
+        let model = density_model();
+        let request = PreviewRequest {
+            asset_id: "density_points".to_string(),
+            data: Arc::new(model),
+            type_hint: None,
+            precursor_ids: vec![],
+            plan: PreviewPlan::Model3d {
+                mesh: PreviewMeshPlan::PointCloud { resolution: 8 },
+                color_channel: Some("density".to_string()),
+            },
+            wireframe: false,
+            show_grid: false,
+            ssao: false,
+            ssao_radius: 0.1,
+            ssao_bias: 0.02,
+            ssao_strength: 1.0,
+            stale: false,
+        };
+        let entity = build_preview_scene(&request).expect("preview builds");
+
+        assert_eq!(
+            entity.stats.model_channels,
+            vec!["occupancy".to_string(), "density".to_string()],
+            "declared channels mirror into the stats"
+        );
+        assert!(
+            entity
+                .stats
+                .detail
+                .iter()
+                .any(|line| line.starts_with("Color: density")),
+            "colormap range reported: {:?}",
+            entity.stats.detail
+        );
+
+        // Points along the density (z) gradient get distinct colors.
+        let (points, _, _) = &entity.scene.points[0];
+        let mut colors: Vec<[u8; 3]> = points
+            .points
+            .iter()
+            .map(|p| {
+                p.color[0..3]
+                    .iter()
+                    .map(|c| (c * 255.0) as u8)
+                    .collect::<Vec<_>>()
+            })
+            .map(|v| [v[0], v[1], v[2]])
+            .collect();
+        colors.sort();
+        colors.dedup();
+        assert!(colors.len() > 2, "expected a gradient, got {colors:?}");
+
+        // An undeclared channel degrades to a detail note, not a failure.
+        let request = PreviewRequest {
+            plan: PreviewPlan::Model3d {
+                mesh: PreviewMeshPlan::PointCloud { resolution: 8 },
+                color_channel: Some("nope".to_string()),
+            },
+            ..request
+        };
+        let entity = build_preview_scene(&request).expect("preview still builds");
+        assert!(
+            entity
+                .stats
+                .detail
+                .iter()
+                .any(|line| line.contains("not declared")),
+            "{:?}",
+            entity.stats.detail
+        );
+    }
+
     #[test]
     fn lightbox_scalar_field_analytics() {
         let data = build_lightbox_data(&step_field(1.0, 3.0)).expect("lightbox builds");
@@ -2101,7 +2585,10 @@ mod tests {
             data: Arc::new(vec![1, 2, 3]),
             type_hint: None,
             precursor_ids: Vec::new(),
-            plan: PreviewPlan::Model3d(PreviewMeshPlan::PointCloud { resolution }),
+            plan: PreviewPlan::Model3d {
+                mesh: PreviewMeshPlan::PointCloud { resolution },
+                color_channel: None,
+            },
             wireframe: false,
             show_grid: true,
             ssao: true,
@@ -2452,7 +2939,10 @@ function get_bounds_max_y() return 1.5 end
             previews[0],
             (
                 "a".to_string(),
-                PreviewPlan::Model3d(PreviewMeshPlan::PointCloud { resolution: 32 })
+                PreviewPlan::Model3d {
+                    mesh: PreviewMeshPlan::PointCloud { resolution: 32 },
+                    color_channel: None,
+                }
             ),
             "newest job per output wins"
         );
