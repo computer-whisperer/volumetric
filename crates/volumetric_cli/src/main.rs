@@ -136,6 +136,12 @@ pub struct MeshArgs {
     #[arg(long, default_value = "1.0")]
     simplify_tolerance: f64,
 
+    /// Constrain vertex refinement to each vertex's own grid edge. Prevents
+    /// refinement from capturing a neighboring parallel surface — use for
+    /// thin-walled lattices whose sheets visually bond together
+    #[arg(long)]
+    edge_constrained: bool,
+
     /// Suppress profiling output
     #[arg(short, long)]
     quiet: bool,
@@ -350,6 +356,7 @@ fn print_stats_summary(stats: &MeshingStats2) {
     println!("==========================");
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_mesh_config(
     base_resolution: usize,
     max_depth: usize,
@@ -359,6 +366,7 @@ pub fn build_mesh_config(
     sharp_edges: bool,
     sharp_angle: f64,
     simplify_tolerance: Option<f64>,
+    edge_constrained: bool,
 ) -> AdaptiveMeshConfig2 {
     let sharp_features = sharp_edges.then(|| {
         let mut config = SharpFeatureConfig::default();
@@ -374,7 +382,7 @@ pub fn build_mesh_config(
         normal_epsilon_frac: normal_epsilon,
         num_threads: 0,
         sharp_features,
-        edge_constrained_refinement: false,
+        edge_constrained_refinement: edge_constrained,
         decimation: simplify_tolerance.map(|tolerance| DecimationConfig {
             error_tolerance_cells: tolerance,
             ..Default::default()
@@ -397,6 +405,7 @@ fn run_mesh(args: MeshArgs) -> Result<()> {
         args.sharp_edges,
         args.sharp_angle,
         (!args.no_simplify).then_some(args.simplify_tolerance),
+        args.edge_constrained,
     );
 
     let effective_res = config.base_resolution * (1 << config.max_depth);
@@ -417,6 +426,12 @@ fn run_mesh(args: MeshArgs) -> Result<()> {
     // Convert to triangles and export STL
     let triangles = indexed_mesh_to_triangles(&result.vertices, &result.normals, &result.indices);
 
+    if triangles.is_empty() {
+        eprintln!(
+            "warning: the mesh is empty. If the model is a sparse lattice, coarse discovery \
+             may have missed its struts entirely — try a higher --max-depth."
+        );
+    }
     println!(
         "Exporting {} triangles to {:?}",
         triangles.len(),

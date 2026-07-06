@@ -92,6 +92,12 @@ pub struct RenderArgs {
     #[arg(long, default_value = "1.0")]
     pub simplify_tolerance: f64,
 
+    /// Constrain vertex refinement to each vertex's own grid edge. Prevents
+    /// refinement from capturing a neighboring parallel surface — use for
+    /// thin-walled lattices whose sheets visually bond together
+    #[arg(long)]
+    pub edge_constrained: bool,
+
     /// Suppress profiling output
     #[arg(short, long)]
     pub quiet: bool,
@@ -424,6 +430,7 @@ pub fn run_render(args: RenderArgs) -> Result<()> {
         args.sharp_edges,
         args.sharp_angle,
         (!args.no_simplify).then_some(args.simplify_tolerance),
+        args.edge_constrained,
     );
 
     let effective_res = config.base_resolution * (1 << config.max_depth);

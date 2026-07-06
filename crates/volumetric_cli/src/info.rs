@@ -547,8 +547,17 @@ pub struct SampleArgs {
 
     /// Points to sample as comma-separated coordinates matching the model's
     /// dimensionality: "x,y" for a 2D sketch, "x,y,z" for a volume
-    #[arg(short, long)]
+    #[arg(short, long, allow_hyphen_values = true)]
     pub point: Vec<String>,
+
+    /// Sample N evenly spaced points along a segment, endpoints included:
+    /// "x0,y0,z0 : x1,y1,z1 : N" (2D models take "x0,y0 : x1,y1 : N")
+    #[arg(short, long, allow_hyphen_values = true)]
+    pub line: Vec<String>,
+
+    /// Print every declared sample channel, not just occupancy
+    #[arg(short, long)]
+    pub channels: bool,
 
     /// Output as JSON
     #[arg(long)]
@@ -558,6 +567,8 @@ pub struct SampleArgs {
 #[derive(Debug, Serialize)]
 struct SampleOutput {
     dimensions: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    channels: Option<Vec<String>>,
     samples: Vec<SampleResult>,
 }
 
@@ -566,6 +577,8 @@ struct SampleResult {
     point: Vec<f64>,
     value: f32,
     occupied: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    values: Option<Vec<f32>>,
 }
 
 fn parse_point(s: &str) -> Result<Vec<f64>> {
@@ -578,22 +591,67 @@ fn parse_point(s: &str) -> Result<Vec<f64>> {
         .collect()
 }
 
+/// Expand a "start : end : N" line spec into N evenly spaced points
+/// (endpoints included; N=1 yields the start point).
+fn parse_line(s: &str) -> Result<Vec<Vec<f64>>> {
+    let parts: Vec<&str> = s.split(':').collect();
+    let [start, end, count] = parts.as_slice() else {
+        anyhow::bail!(
+            "line spec must be \"x0,y0,z0 : x1,y1,z1 : N\" (three ':'-separated parts), got '{s}'"
+        );
+    };
+    let start = parse_point(start)?;
+    let end = parse_point(end)?;
+    if start.len() != end.len() {
+        anyhow::bail!(
+            "line endpoints disagree on dimensionality ({} vs {} coordinates)",
+            start.len(),
+            end.len()
+        );
+    }
+    let count: usize = count
+        .trim()
+        .parse()
+        .with_context(|| format!("Failed to parse sample count '{}'", count.trim()))?;
+    if count == 0 {
+        anyhow::bail!("line sample count must be at least 1");
+    }
+    Ok((0..count)
+        .map(|i| {
+            let t = if count == 1 {
+                0.0
+            } else {
+                i as f64 / (count - 1) as f64
+            };
+            start
+                .iter()
+                .zip(&end)
+                .map(|(a, b)| a + (b - a) * t)
+                .collect()
+        })
+        .collect())
+}
+
 pub fn run_sample(args: SampleArgs) -> Result<()> {
-    if args.point.is_empty() {
-        anyhow::bail!("At least one point must be specified with -p/--point");
+    if args.point.is_empty() && args.line.is_empty() {
+        anyhow::bail!("Specify points with -p/--point and/or lines with -l/--line");
     }
 
     let wasm_bytes = crate::load_wasm_bytes(&args.input, args.asset.as_deref())?;
 
-    let points: Vec<Vec<f64>> = args
+    let mut points: Vec<Vec<f64>> = args
         .point
         .iter()
         .enumerate()
         .map(|(i, s)| parse_point(s).with_context(|| format!("Invalid point at index {}", i)))
         .collect::<Result<_>>()?;
+    for (i, spec) in args.line.iter().enumerate() {
+        points.extend(parse_line(spec).with_context(|| format!("Invalid line at index {}", i))?);
+    }
 
-    let mut executor = create_model_executor(&wasm_bytes).context("Failed to instantiate model")?;
-    let dimensions = executor.dimensions().context("get_dimensions failed")?;
+    let mut executor = volumetric::wasm::native::NativeModelExecutor::new(&wasm_bytes)
+        .map_err(|e| anyhow::anyhow!("Failed to instantiate model: {e}"))?;
+    let dimensions = executor.dimensions();
 
     for point in &points {
         if point.len() != dimensions as usize {
@@ -606,19 +664,37 @@ pub fn run_sample(args: SampleArgs) -> Result<()> {
         }
     }
 
+    let channel_names: Option<Vec<String>> = args.channels.then(|| {
+        executor
+            .sample_format()
+            .channels
+            .iter()
+            .map(|c| c.name.clone())
+            .collect()
+    });
+
     let mut samples = Vec::with_capacity(points.len());
     for point in points {
-        let value = executor.sample_nd(&point).context("sample failed")?;
+        let (value, values) = if args.channels {
+            let row = executor
+                .sample_channels_nd(&point)
+                .context("sample_channels failed")?;
+            (row[0], Some(row))
+        } else {
+            (executor.sample_nd(&point).context("sample failed")?, None)
+        };
         samples.push(SampleResult {
             point,
             value,
             occupied: volumetric_abi::is_occupied(value),
+            values,
         });
     }
 
     if args.json {
         let output = SampleOutput {
             dimensions,
+            channels: channel_names,
             samples,
         };
         println!(
@@ -626,9 +702,20 @@ pub fn run_sample(args: SampleArgs) -> Result<()> {
             serde_json::to_string_pretty(&output).context("Failed to serialize to JSON")?
         );
     } else {
+        if let Some(names) = &channel_names {
+            println!("channels: [{}]", names.join(", "));
+        }
         for s in &samples {
+            let channel_suffix = s
+                .values
+                .as_ref()
+                .map(|row| {
+                    let cells: Vec<String> = row.iter().map(|v| format!("{v:.6}")).collect();
+                    format!(" [{}]", cells.join(", "))
+                })
+                .unwrap_or_default();
             println!(
-                "{} -> {:.6} ({})",
+                "{} -> {:.6} ({}){channel_suffix}",
                 BoundsNd::format_tuple(&s.point),
                 s.value,
                 if s.occupied { "inside" } else { "outside" }
@@ -648,5 +735,26 @@ mod tests {
         assert_eq!(parse_point("1,2").unwrap(), vec![1.0, 2.0]);
         assert_eq!(parse_point(" 1 , 2 , 3 ").unwrap(), vec![1.0, 2.0, 3.0]);
         assert!(parse_point("1,two").is_err());
+    }
+
+    #[test]
+    fn lines_expand_to_evenly_spaced_points() {
+        let points = parse_line("-1,0,0 : 1,0,0 : 3").unwrap();
+        assert_eq!(
+            points,
+            vec![
+                vec![-1.0, 0.0, 0.0],
+                vec![0.0, 0.0, 0.0],
+                vec![1.0, 0.0, 0.0]
+            ]
+        );
+        // A single sample sits at the start; endpoints always included.
+        assert_eq!(parse_line("2,3 : 4,5 : 1").unwrap(), vec![vec![2.0, 3.0]]);
+        let two = parse_line("0,0,0 : 1,2,4 : 2").unwrap();
+        assert_eq!(two, vec![vec![0.0, 0.0, 0.0], vec![1.0, 2.0, 4.0]]);
+
+        assert!(parse_line("0,0,0 : 1,1,1").is_err(), "missing count");
+        assert!(parse_line("0,0 : 1,1,1 : 4").is_err(), "arity mismatch");
+        assert!(parse_line("0,0,0 : 1,1,1 : 0").is_err(), "zero count");
     }
 }
