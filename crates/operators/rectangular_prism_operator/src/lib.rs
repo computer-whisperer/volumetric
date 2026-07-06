@@ -337,6 +337,11 @@ pub extern "C" fn get_metadata() -> i64 {
                 OperatorMetadataInput::VecF64(3), // vector_a
                 OperatorMetadataInput::VecF64(3), // vector_b
             ],
+            input_names: vec![
+                "Config".to_string(),
+                "Vector A (corner or center)".to_string(),
+                "Vector B (corner or size)".to_string(),
+            ],
             outputs: vec![OperatorMetadataOutput::ModelWASM],
         }
     })

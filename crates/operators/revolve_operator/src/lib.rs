@@ -299,6 +299,7 @@ pub extern "C" fn get_metadata() -> i64 {
         name: "revolve_operator".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         inputs: vec![OperatorMetadataInput::ModelWASM],
+        input_names: vec!["Profile (2D)".to_string()],
         outputs: vec![OperatorMetadataOutput::ModelWASM],
     })
 }

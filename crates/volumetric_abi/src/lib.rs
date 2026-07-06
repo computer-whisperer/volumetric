@@ -268,7 +268,24 @@ pub struct OperatorMetadata {
     pub name: String,
     pub version: String,
     pub inputs: Vec<OperatorMetadataInput>,
+    /// Human-readable labels for `inputs`, parallel by index; hosts show
+    /// `input_names[i]` next to input slot `i`. Defaulted so metadata from
+    /// operators built before this field existed still decodes (they get an
+    /// empty list — hosts fall back to positional labels).
+    #[serde(default)]
+    pub input_names: Vec<String>,
     pub outputs: Vec<OperatorMetadataOutput>,
+}
+
+impl OperatorMetadata {
+    /// The declared label of input slot `idx`, if the operator provided a
+    /// non-empty one.
+    pub fn input_name(&self, idx: usize) -> Option<&str> {
+        self.input_names
+            .get(idx)
+            .map(String::as_str)
+            .filter(|name| !name.is_empty())
+    }
 }
 
 /// CBOR-encode operator metadata (the payload `get_metadata()` points at).
@@ -426,6 +443,15 @@ mod tests {
                 OperatorMetadataInput::FeaMesh,
                 OperatorMetadataInput::TriMesh,
             ],
+            input_names: vec![
+                "Model".to_string(),
+                "Config".to_string(),
+                "Script".to_string(),
+                "File".to_string(),
+                "Corner".to_string(),
+                "Mesh".to_string(),
+                "Surface".to_string(),
+            ],
             outputs: vec![
                 OperatorMetadataOutput::ModelWASM,
                 OperatorMetadataOutput::FeaMesh,
@@ -435,6 +461,37 @@ mod tests {
 
         let decoded = decode_metadata(&encode_metadata(&metadata)).unwrap();
         assert_eq!(decoded, metadata);
+        assert_eq!(metadata.input_name(0), Some("Model"));
+        assert_eq!(metadata.input_name(7), None);
+    }
+
+    /// Metadata CBOR from operators built before `input_names` existed
+    /// (no such map key) must still decode, with the field defaulted.
+    #[test]
+    fn metadata_without_input_names_decodes() {
+        #[derive(serde::Serialize)]
+        struct OldMetadata {
+            name: String,
+            version: String,
+            inputs: Vec<OperatorMetadataInput>,
+            outputs: Vec<OperatorMetadataOutput>,
+        }
+        let mut old = Vec::new();
+        ciborium::ser::into_writer(
+            &OldMetadata {
+                name: "legacy".to_string(),
+                version: "0.1.0".to_string(),
+                inputs: vec![OperatorMetadataInput::ModelWASM],
+                outputs: vec![OperatorMetadataOutput::ModelWASM],
+            },
+            &mut old,
+        )
+        .unwrap();
+
+        let decoded = decode_metadata(&old).unwrap();
+        assert_eq!(decoded.name, "legacy");
+        assert!(decoded.input_names.is_empty());
+        assert_eq!(decoded.input_name(0), None);
     }
 
     #[test]

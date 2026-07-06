@@ -3,7 +3,7 @@
 //! This crate intentionally starts as a separate app path so the current egui UI
 //! remains the usable baseline while the Damascene port grows toward parity.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use volumetric::operator_config::{ConfigField, ConfigFieldType, ConfigValue};
 use volumetric::{
@@ -12,7 +12,25 @@ use volumetric::{
 };
 use volumetric_renderer::CameraControlScheme;
 
+use damascene_core::SvgIcon;
 use damascene_core::prelude::*;
+
+/// App-supplied glyphs for names missing from damascene's built-in icon
+/// vocabulary (`damascene_core::all_icon_names()`). Lucide path data in the
+/// same 24×24 stroke style as the built-ins; `parse_current_color` makes
+/// them tint like any other icon.
+static EYE_ICON: LazyLock<SvgIcon> = LazyLock::new(|| {
+    SvgIcon::parse_current_color(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#000" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0"/><circle cx="12" cy="12" r="3"/></svg>"##,
+    )
+    .expect("eye icon SVG parses")
+});
+static PIN_ICON: LazyLock<SvgIcon> = LazyLock::new(|| {
+    SvgIcon::parse_current_color(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#000" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1z"/></svg>"##,
+    )
+    .expect("pin icon SVG parses")
+});
 
 pub mod host;
 pub mod session;
@@ -418,10 +436,12 @@ enum AssetSlotKind {
     TriMesh,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct AssetSlot {
     input_idx: usize,
     kind: AssetSlotKind,
+    /// The operator-declared label for this slot, when its metadata names it.
+    name: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1390,6 +1410,7 @@ impl VolumetricUiV2 {
                 Some(AssetSlot {
                     input_idx: idx,
                     kind,
+                    name: metadata.input_name(idx).map(str::to_string),
                 })
             })
             .collect();
@@ -2602,9 +2623,9 @@ fn add_menu_items() -> Vec<El> {
     }
     items.push(menubar_separator());
     items.push(menubar_label("Import"));
-    items.push(menubar_item_with_icon("file", "Model WASM…").key(IMPORT_WASM_KEY));
-    items.push(menubar_item_with_icon("file", "STL Mesh…").key(IMPORT_STL_KEY));
-    items.push(menubar_item_with_icon("file", "Image…").key(IMPORT_IMAGE_KEY));
+    items.push(menubar_item_with_icon("file-text", "Model WASM…").key(IMPORT_WASM_KEY));
+    items.push(menubar_item_with_icon("file-text", "STL Mesh…").key(IMPORT_STL_KEY));
+    items.push(menubar_item_with_icon("file-text", "Image…").key(IMPORT_IMAGE_KEY));
     items
 }
 
@@ -3371,7 +3392,7 @@ fn runtime_asset_row(app: &VolumetricUiV2, asset: &LoadedAsset) -> El {
     let render = app.output_render(id);
     let overridden = app.output_overrides.contains_key(id);
 
-    let pin = icon_button("pin")
+    let pin = icon_button(&*PIN_ICON)
         .xsmall()
         .tooltip(if pinned { "Unpin" } else { "Pin to viewport" })
         .key(format!("{TOGGLE_PIN_PREFIX}{id}"));
@@ -3418,7 +3439,7 @@ fn runtime_asset_row(app: &VolumetricUiV2, asset: &LoadedAsset) -> El {
             .text_align(TextAlign::End)
             .width(Size::Fixed(56.0)),
         pin,
-        icon_button("eye")
+        icon_button(&*EYE_ICON)
             .ghost()
             .xsmall()
             .tooltip("View")
@@ -3455,14 +3476,14 @@ fn step_detail_rows(app: &VolumetricUiV2, idx: usize) -> Vec<El> {
     let mut rows = vec![
         detail_row("Step", &(idx + 1).to_string()),
         detail_row("Operator", &step.operator_id),
-        detail_row("Outputs", &step.outputs.len().to_string()),
+        detail_row("Outputs", &step.outputs.join(", ")),
     ];
 
     rows.extend(step_edit_rows(app, idx));
 
     rows.push(
         toolbar([
-            button_with_icon("chevron-left", "Up")
+            button_with_icon("chevron-up", "Up")
                 .secondary()
                 .xsmall()
                 .key(format!("{MOVE_STEP_UP_PREFIX}{idx}")),
@@ -3501,9 +3522,9 @@ fn step_edit_rows(app: &VolumetricUiV2, step_idx: usize) -> Vec<El> {
     let mut rows = Vec::new();
 
     if !edit.asset_slots.is_empty() {
-        let models = editable_model_asset_ids(app);
-        let meshes = editable_fea_asset_ids(app);
-        let trimeshes = editable_trimesh_asset_ids(app);
+        let models = step_input_options(app, step_idx, AssetSlotKind::Model);
+        let meshes = step_input_options(app, step_idx, AssetSlotKind::FeaMesh);
+        let trimeshes = step_input_options(app, step_idx, AssetSlotKind::TriMesh);
         rows.push(text("Inputs").muted().caption().semibold());
         for (n, slot) in edit.asset_slots.iter().enumerate() {
             let current = match step.inputs.get(slot.input_idx) {
@@ -3515,13 +3536,7 @@ fn step_edit_rows(app: &VolumetricUiV2, step_idx: usize) -> Vec<El> {
                 AssetSlotKind::FeaMesh => &meshes,
                 AssetSlotKind::TriMesh => &trimeshes,
             };
-            rows.push(asset_slot_selector(
-                step_idx,
-                slot.input_idx,
-                n,
-                current,
-                options,
-            ));
+            rows.push(asset_slot_selector(step_idx, slot, n, current, options));
         }
     }
 
@@ -3569,26 +3584,61 @@ fn step_edit_rows(app: &VolumetricUiV2, step_idx: usize) -> Vec<El> {
     rows
 }
 
+/// The assets step `step_idx` may take as an input of the given kind: only
+/// what exists before the step runs — imports plus outputs of earlier steps.
+/// The step's own outputs and anything produced downstream would be a
+/// self-reference or forward reference (the run loop executes the timeline
+/// in order).
+fn step_input_options(app: &VolumetricUiV2, step_idx: usize, kind: AssetSlotKind) -> Vec<String> {
+    let not_yet_produced: std::collections::HashSet<&str> = app
+        .project
+        .timeline()
+        .iter()
+        .skip(step_idx)
+        .flat_map(|step| step.outputs.iter().map(String::as_str))
+        .collect();
+    let ids = match kind {
+        AssetSlotKind::Model => editable_model_asset_ids(app),
+        AssetSlotKind::FeaMesh => editable_fea_asset_ids(app),
+        AssetSlotKind::TriMesh => editable_trimesh_asset_ids(app),
+    };
+    ids.into_iter()
+        .filter(|id| !not_yet_produced.contains(id.as_str()))
+        .collect()
+}
+
 /// An asset input slot: a labelled column of full-width buttons, one per
 /// available asset of the slot's kind, with the current target highlighted.
 fn asset_slot_selector(
     step_idx: usize,
-    slot: usize,
+    slot: &AssetSlot,
     ordinal: usize,
     current: &str,
-    models: &[String],
+    options: &[String],
 ) -> El {
-    let mut items = vec![
-        text(format!("Input {}", ordinal + 1))
+    let label = slot
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("Input {}", ordinal + 1));
+    let mut items = vec![text(label).muted().caption().width(Size::Fill(1.0))];
+    if options.is_empty() {
+        items.push(
+            text(format!(
+                "No {} produced before this step",
+                asset_slot_kind_label(slot.kind),
+            ))
             .muted()
-            .caption()
-            .width(Size::Fill(1.0)),
-    ];
-    for id in models {
+            .caption(),
+        );
+    }
+    for id in options {
         let button = button_with_icon("git-branch", id.clone())
             .xsmall()
             .width(Size::Fill(1.0))
-            .key(format!("{SET_STEP_MODEL_PREFIX}{step_idx}:{slot}:{id}"));
+            .key(format!(
+                "{SET_STEP_MODEL_PREFIX}{step_idx}:{}:{id}",
+                slot.input_idx
+            ));
         items.push(if id == current {
             button.primary()
         } else {
@@ -3596,6 +3646,14 @@ fn asset_slot_selector(
         });
     }
     column(items).gap(tokens::SPACE_1).width(Size::Fill(1.0))
+}
+
+fn asset_slot_kind_label(kind: AssetSlotKind) -> &'static str {
+    match kind {
+        AssetSlotKind::Model => "model",
+        AssetSlotKind::FeaMesh => "FEA mesh",
+        AssetSlotKind::TriMesh => "triangle mesh",
+    }
 }
 
 fn config_field_row(field: &ConfigField, buffer: &str, selection: &Selection) -> El {
@@ -3693,8 +3751,17 @@ fn step_rows(app: &VolumetricUiV2) -> Vec<El> {
                 format!("{SELECT_STEP_PREFIX}{idx}"),
                 format!("{DELETE_STEP_PREFIX}{idx}"),
             )];
-            for input in &step.inputs {
-                rows.push(project_note_row("input", &input.display()));
+            let metadata = app.operator_metadata_cached(&step.operator_id);
+            for (input_idx, input) in step.inputs.iter().enumerate() {
+                let label = metadata
+                    .as_ref()
+                    .and_then(|m| m.input_name(input_idx))
+                    .unwrap_or("input");
+                let value = match input {
+                    ExecutionInput::AssetRef(id) => id.clone(),
+                    inline => inline.display(),
+                };
+                rows.push(project_note_row(label, &value));
             }
             for output in &step.outputs {
                 rows.push(project_note_row("output", output));
@@ -3773,11 +3840,13 @@ fn project_row(kind: &str, label: &str, select_route: String, delete_route: Stri
 
 fn project_note_row(kind: &str, label: &str) -> El {
     table_row([
+        // Wide enough for operator-declared input labels ("Rigid body",
+        // "Height field (2D)"), not just the generic "input"/"output".
         text(kind)
             .caption()
             .muted()
             .ellipsis()
-            .width(Size::Fixed(42.0)),
+            .width(Size::Fixed(96.0)),
         text(label)
             .muted()
             .caption()
@@ -4136,6 +4205,55 @@ mod tests {
                 _ => assert!(matches!(input, ExecutionInput::Inline(_))),
             }
         }
+    }
+
+    /// The app-supplied SVG glyphs (names damascene's built-in vocabulary
+    /// lacks) must parse — a bad path would otherwise panic at first render.
+    #[test]
+    fn custom_icons_parse() {
+        let _ = &*EYE_ICON;
+        let _ = &*PIN_ICON;
+    }
+
+    #[test]
+    fn step_editor_labels_slots_with_declared_names() {
+        let mut app = VolumetricUiV2::default();
+        add_operator_click(&mut app, "boolean_operator");
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{SELECT_STEP_PREFIX}0")),
+        );
+        app.before_build();
+
+        let edit = app.step_edit.as_ref().expect("step editor state");
+        let names: Vec<Option<&str>> = edit
+            .asset_slots
+            .iter()
+            .map(|slot| slot.name.as_deref())
+            .collect();
+        assert_eq!(names, vec![Some("Model A"), Some("Model B")]);
+    }
+
+    /// Input pickers must only offer assets that exist before the step
+    /// runs — not the step's own outputs, not downstream outputs.
+    #[test]
+    fn step_input_picker_excludes_own_and_downstream_outputs() {
+        let mut app = VolumetricUiV2::default();
+        add_operator_click(&mut app, "translate_operator");
+        add_operator_click(&mut app, "translate_operator");
+
+        let step0_out = app.project().timeline()[0].outputs[0].clone();
+        let step1_out = app.project().timeline()[1].outputs[0].clone();
+        assert_ne!(step0_out, step1_out);
+
+        let options0 = step_input_options(&app, 0, AssetSlotKind::Model);
+        assert!(!options0.is_empty(), "imports remain available");
+        assert!(!options0.contains(&step0_out), "own output excluded");
+        assert!(!options0.contains(&step1_out), "downstream output excluded");
+
+        let options1 = step_input_options(&app, 1, AssetSlotKind::Model);
+        assert!(options1.contains(&step0_out), "upstream output available");
+        assert!(!options1.contains(&step1_out), "own output excluded");
     }
 
     #[test]

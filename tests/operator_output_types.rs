@@ -20,6 +20,7 @@ fn operator_with_declared_outputs(outputs: Vec<OperatorMetadataOutput>) -> Vec<u
         name: "typed_outputs_test".to_string(),
         version: "0.0.0".to_string(),
         inputs: vec![],
+        input_names: vec![],
         outputs: outputs.clone(),
     });
 

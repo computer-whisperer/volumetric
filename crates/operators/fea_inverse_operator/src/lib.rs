@@ -218,6 +218,12 @@ pub extern "C" fn get_metadata() -> i64 {
                     .to_string(),
             ),
         ],
+        input_names: vec![
+            "Mesh".to_string(),
+            "Rigid body".to_string(),
+            "Target force map (2D)".to_string(),
+            "Config".to_string(),
+        ],
         outputs: vec![OperatorMetadataOutput::FeaMesh],
     }
     })

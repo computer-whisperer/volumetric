@@ -126,6 +126,7 @@ pub extern "C" fn get_metadata() -> i64 {
         name: "mesh_to_model_operator".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         inputs: vec![OperatorMetadataInput::TriMesh],
+        input_names: vec!["Mesh".to_string()],
         outputs: vec![OperatorMetadataOutput::ModelWASM],
     })
 }

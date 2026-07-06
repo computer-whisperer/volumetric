@@ -1882,6 +1882,7 @@ pub extern "C" fn get_metadata() -> i64 {
         name: "lua_script_operator".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         inputs: vec![OperatorMetadataInput::LuaSource(LUA_TEMPLATE.to_string())],
+        input_names: vec!["Script".to_string()],
         outputs: vec![OperatorMetadataOutput::ModelWASM],
     })
 }
