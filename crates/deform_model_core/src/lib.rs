@@ -20,6 +20,14 @@
 //! instead of being chopped off. Beyond the skin the pullback is `None`
 //! (outside).
 //!
+//! Two documented limits: the pullback trusts the mesh, so elements that
+//! fold (negative Jacobian, from extreme displacements or scale >> 1)
+//! make the map multivalued and whichever containing element the BVH
+//! visits first wins; and skin extrapolation is capped at about four
+//! element widths (the Newton iterate is clamped to local `[-4, 5]`), so
+//! a skin configured much larger than an element leaves its outer zone
+//! unmapped.
+//!
 //! # Payload layout (little-endian)
 //!
 //! ```text
@@ -90,6 +98,20 @@ pub fn build_payload(
     let deformed: Vec<f32> = (0..node_count * 3)
         .map(|i| (mesh.node_positions[i] + scale * field.data[i]) as f32)
         .collect();
+    // A diverged solve realistically produces NaN/inf displacements;
+    // reject them here with a readable error (downstream the BVH sort
+    // would panic on an incomparable centroid).
+    if let Some(i) =
+        (0..node_count * 3).find(|&i| !(deformed[i].is_finite() && undeformed[i].is_finite()))
+    {
+        return Err(format!(
+            "node {} has a non-finite (un)deformed position (position {}, {} {})",
+            i / 3,
+            mesh.node_positions[i],
+            displacement_field,
+            field.data[i]
+        ));
+    }
 
     #[derive(Clone, Copy)]
     struct ElementBounds {
@@ -263,8 +285,15 @@ impl<'a> PayloadView<'a> {
         let bvh_node_count = u32_at(8) as usize;
         let payload_len = u32_at(12) as usize;
         let mesh_node_count = u32_at(68) as usize;
-        let expected =
-            HEADER_LEN + bvh_node_count * NODE_LEN + mesh_node_count * 24 + element_count * 32;
+        // Checked arithmetic: the view runs on wasm32 where a crafted
+        // header's counts could wrap 32-bit usize math into a "valid"
+        // length.
+        let expected = bvh_node_count
+            .checked_mul(NODE_LEN)
+            .and_then(|n| mesh_node_count.checked_mul(24)?.checked_add(n))
+            .and_then(|n| element_count.checked_mul(32)?.checked_add(n))
+            .and_then(|n| n.checked_add(HEADER_LEN))
+            .ok_or("payload counts overflow")?;
         if payload_len != expected || bytes.len() < expected {
             return Err("payload length mismatch");
         }
@@ -714,6 +743,15 @@ mod tests {
         assert!(build_payload(&empty, "displacement", 1.0, None).is_err());
 
         assert!(build_payload(&mesh, "displacement", 1.0, Some(f64::NAN)).is_err());
+
+        // A diverged solve's NaN displacement is a readable error, not a
+        // panic in the BVH sort.
+        let mut diverged = mesh.clone();
+        diverged.node_fields[0].data[5] = f64::NAN;
+        let err = build_payload(&diverged, "displacement", 1.0, None).unwrap_err();
+        assert!(err.contains("non-finite"), "{err}");
+        // ...even at scale 0 (0 * NaN is still NaN).
+        assert!(build_payload(&diverged, "displacement", 0.0, None).is_err());
     }
 
     #[test]

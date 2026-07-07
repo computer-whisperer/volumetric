@@ -53,7 +53,9 @@ struct DeformConfig {
     /// The 3-component node field holding the displacement.
     field: String,
     /// Fallback distance for points outside every deformed element;
-    /// 0 = auto (half the mean deformed-element diagonal).
+    /// 0 = auto (half the mean deformed-element diagonal). Extrapolation
+    /// tops out around four element widths (see `deform_model_core`), so
+    /// values much larger than an element leave the outer skin unmapped.
     boundary_skin: f64,
 }
 
