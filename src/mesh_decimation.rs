@@ -14,7 +14,9 @@
 //! Topology is preserved: every collapse must pass the link condition (the
 //! one-ring intersection of the endpoints must be exactly the vertices
 //! opposite the shared faces), which prevents thin lattice struts from
-//! pinching off or fusing, plus a normal-flip guard against fold-overs.
+//! pinching off or fusing, plus a normal-flip guard against fold-overs that
+//! is anchored to each face's orientation at decimation entry (so rotation
+//! cannot accumulate across successive collapses).
 //! Boundary edges (open surfaces where the model meets the sampling bounds)
 //! are pinned by perpendicular constraint quadrics and may only collapse
 //! along the boundary itself.
@@ -207,6 +209,10 @@ impl VertexFaces {
 struct SweepMesh {
     positions: Vec<[f64; 3]>,
     faces: Vec<[u32; 3]>,
+    /// Each face's unit normal at decimation entry (zero for degenerate
+    /// faces), index-aligned with `faces`. The flip guard anchors to these so
+    /// rotation cannot accumulate across successive collapses.
+    original_normals: Vec<[f64; 3]>,
     deleted: Vec<bool>,
     quadrics: Vec<Quadric>,
     boundary_edges: std::collections::HashSet<u64>,
@@ -297,6 +303,7 @@ impl SweepMesh {
                                 src,
                                 dst,
                                 &self.faces,
+                                &self.original_normals,
                                 &self.deleted,
                                 &adjacency,
                                 &self.positions,
@@ -351,6 +358,7 @@ impl SweepMesh {
 fn serial_decimate(
     positions: Vec<[f64; 3]>,
     faces: Vec<[u32; 3]>,
+    face_normals: Vec<[f64; 3]>,
     quadrics: Vec<Quadric>,
     boundary_edges: std::collections::HashSet<u64>,
     boundary_vertex: Vec<bool>,
@@ -362,6 +370,7 @@ fn serial_decimate(
     let mut sweep = SweepMesh {
         positions,
         faces,
+        original_normals: face_normals,
         deleted,
         quadrics,
         boundary_edges,
@@ -382,6 +391,7 @@ fn serial_decimate(
 fn parallel_decimate(
     positions: Vec<[f64; 3]>,
     faces: Vec<[u32; 3]>,
+    face_normals: Vec<[f64; 3]>,
     mut quadrics: Vec<Quadric>,
     boundary_edges: std::collections::HashSet<u64>,
     boundary_vertex: Vec<bool>,
@@ -408,8 +418,11 @@ fn parallel_decimate(
     let inv_extent: [f64; 3] =
         std::array::from_fn(|axis| grid as f64 / (hi[axis] - lo[axis]).max(1e-12));
 
-    let mut buckets: Vec<Vec<[u32; 3]>> = vec![Vec::new(); grid * grid * grid];
-    for face in faces {
+    // Faces and their entry normals travel together through bucketing,
+    // region sweeps, and the merge, staying index-aligned throughout.
+    let mut buckets: Vec<(Vec<[u32; 3]>, Vec<[f64; 3]>)> =
+        vec![(Vec::new(), Vec::new()); grid * grid * grid];
+    for (face, normal) in faces.into_iter().zip(face_normals) {
         let mut cell = [0usize; 3];
         for (axis, slot) in cell.iter_mut().enumerate() {
             let centroid = (positions[face[0] as usize][axis]
@@ -418,15 +431,17 @@ fn parallel_decimate(
                 / 3.0;
             *slot = (((centroid - lo[axis]) * inv_extent[axis]) as usize).min(grid - 1);
         }
-        buckets[cell[0] + grid * (cell[1] + grid * cell[2])].push(face);
+        let bucket = &mut buckets[cell[0] + grid * (cell[1] + grid * cell[2])];
+        bucket.0.push(face);
+        bucket.1.push(normal);
     }
 
     // A vertex whose faces span more than one bucket is a seam vertex.
     const UNSEEN: u32 = u32::MAX;
     const SHARED: u32 = u32::MAX - 1;
     let mut vertex_bucket = vec![UNSEEN; vertex_count];
-    for (bi, bucket) in buckets.iter().enumerate() {
-        for face in bucket {
+    for (bi, (bucket_faces, _)) in buckets.iter().enumerate() {
+        for face in bucket_faces {
             for &v in face {
                 let slot = &mut vertex_bucket[v as usize];
                 if *slot == UNSEEN {
@@ -438,8 +453,11 @@ fn parallel_decimate(
         }
     }
 
-    let non_empty: Vec<Vec<[u32; 3]>> = buckets.into_iter().filter(|b| !b.is_empty()).collect();
-    let results = parallel_iter::map_vec(non_empty, |bucket_faces| {
+    let non_empty: Vec<(Vec<[u32; 3]>, Vec<[f64; 3]>)> = buckets
+        .into_iter()
+        .filter(|(faces, _)| !faces.is_empty())
+        .collect();
+    let results = parallel_iter::map_vec(non_empty, |(bucket_faces, bucket_normals)| {
         let mut local_to_global: Vec<u32> = bucket_faces.iter().flatten().copied().collect();
         local_to_global.sort_unstable();
         local_to_global.dedup();
@@ -470,6 +488,7 @@ fn parallel_decimate(
                 .map(|&g| positions[g as usize])
                 .collect(),
             faces: local_faces,
+            original_normals: bucket_normals,
             deleted,
             quadrics: local_to_global
                 .iter()
@@ -486,22 +505,30 @@ fn parallel_decimate(
                 .collect(),
         };
         let passes = sweep.run_passes(budget, ramp_passes, cancel);
-        let survivors: Vec<[u32; 3]> = sweep
-            .faces
-            .iter()
-            .zip(&sweep.deleted)
-            .filter(|&(_, &deleted)| !deleted)
-            .map(|(face, _)| face.map(|l| local_to_global[l as usize]))
-            .collect();
-        (survivors, local_to_global, sweep.quadrics, passes)
+        let mut survivors: Vec<[u32; 3]> = Vec::new();
+        let mut survivor_normals: Vec<[f64; 3]> = Vec::new();
+        for (fi, face) in sweep.faces.iter().enumerate() {
+            if !sweep.deleted[fi] {
+                survivors.push(face.map(|l| local_to_global[l as usize]));
+                survivor_normals.push(sweep.original_normals[fi]);
+            }
+        }
+        (
+            survivors,
+            survivor_normals,
+            local_to_global,
+            sweep.quadrics,
+            passes,
+        )
     });
 
     // Merge: survivors concatenate in deterministic region order; unpinned
     // vertices are exclusive to one region, so their evolved quadrics write
     // straight back (seam vertices never collapsed, theirs are unchanged).
     let mut merged: Vec<[u32; 3]> = Vec::new();
+    let mut merged_normals: Vec<[f64; 3]> = Vec::new();
     let mut region_passes = 0usize;
-    for (survivors, local_to_global, local_quadrics, passes) in results {
+    for (survivors, survivor_normals, local_to_global, local_quadrics, passes) in results {
         region_passes = region_passes.max(passes);
         for (local, &global) in local_to_global.iter().enumerate() {
             if vertex_bucket[global as usize] != SHARED {
@@ -509,6 +536,7 @@ fn parallel_decimate(
             }
         }
         merged.extend(survivors);
+        merged_normals.extend(survivor_normals);
     }
 
     // Final serial passes dissolve the seams. No ramp: seam neighborhoods
@@ -517,6 +545,7 @@ fn parallel_decimate(
     let mut sweep = SweepMesh {
         positions,
         faces: merged,
+        original_normals: merged_normals,
         deleted,
         quadrics,
         boundary_edges,
@@ -602,8 +631,11 @@ fn decimate_mesh_impl(
     parallel_iter::sort_unstable(&mut faces);
 
     // Initial quadrics: every face contributes its plane, weighted by area.
+    // The unit normals are also kept per face (zero when degenerate) as the
+    // flip guard's anchor orientation.
     let mut quadrics = vec![Quadric::default(); vertex_count];
-    for face in &faces {
+    let mut face_normals = vec![[0.0f64; 3]; faces.len()];
+    for (fi, face) in faces.iter().enumerate() {
         let [i0, i1, i2] = *face;
         let (p0, p1, p2) = (
             positions[i0 as usize],
@@ -616,6 +648,7 @@ fn decimate_mesh_impl(
             continue;
         }
         let unit_n = [n[0] / double_area, n[1] / double_area, n[2] / double_area];
+        face_normals[fi] = unit_n;
         let w = double_area * 0.5;
         quadrics[i0 as usize].add_plane(unit_n, p0, w);
         quadrics[i1 as usize].add_plane(unit_n, p0, w);
@@ -661,6 +694,7 @@ fn decimate_mesh_impl(
         parallel_decimate(
             positions,
             faces,
+            face_normals,
             quadrics,
             boundary_edges,
             boundary_vertex,
@@ -672,6 +706,7 @@ fn decimate_mesh_impl(
         serial_decimate(
             positions,
             faces,
+            face_normals,
             quadrics,
             boundary_edges,
             boundary_vertex,
@@ -686,6 +721,7 @@ fn decimate_mesh_impl(
         serial_decimate(
             positions,
             faces,
+            face_normals,
             quadrics,
             boundary_edges,
             boundary_vertex,
@@ -857,10 +893,22 @@ fn collect_neighbors(
 
 /// Reject collapses that fold any surviving face of `src` past perpendicular
 /// (or squash it to zero area) when `src` moves onto `dst`.
+///
+/// Two references are checked: the face's orientation just before this
+/// collapse, and its orientation at decimation entry (`original_normals`).
+/// The per-collapse check alone is not enough — each collapse may rotate a
+/// face by up to just-under-90°, so a face touched by several successive
+/// collapses could accumulate an arbitrary total rotation and end up facing
+/// back into the surface. Sub-cell foam walls made that real: decimation
+/// minted thousands of near-coplanar flipped slivers on lattice meshes whose
+/// input had none. Anchoring to the stage-4 orientation caps the cumulative
+/// rotation at 90°, which legitimate coarsening stays well inside.
+#[allow(clippy::too_many_arguments)]
 fn collapse_flips_normals(
     src: u32,
     dst: u32,
     faces: &[[u32; 3]],
+    original_normals: &[[f64; 3]],
     deleted: &[bool],
     adjacency: &VertexFaces,
     positions: &[[f64; 3]],
@@ -888,6 +936,12 @@ fn collapse_flips_normals(
         let n_old = cross(sub(old[1], old[0]), sub(old[2], old[0]));
         let n_new = cross(sub(new[1], new[0]), sub(new[2], new[0]));
         if dot(n_new, n_new) <= 0.0 || dot(n_old, n_new) <= 0.0 {
+            return true;
+        }
+        // Anchored check. A zero original normal (degenerate face at entry)
+        // imposes no constraint.
+        let orig = original_normals[fi as usize];
+        if dot(orig, n_new) <= 0.0 && dot(orig, orig) > 0.0 {
             return true;
         }
     }
@@ -1122,6 +1176,78 @@ mod tests {
         for (_, count) in edge_face_counts(&mesh.indices) {
             assert_eq!(count, 2);
         }
+    }
+
+    /// Interior edges whose two incident faces are folded back on each other
+    /// (unit-normal dot < -0.9). A clean decimation of a clean mesh has none.
+    fn hard_fold_edge_count(vertices: &[(f32, f32, f32)], indices: &[u32]) -> usize {
+        let positions: Vec<[f64; 3]> = vertices
+            .iter()
+            .map(|&(x, y, z)| [x as f64, y as f64, z as f64])
+            .collect();
+        let normals: Vec<Option<[f64; 3]>> = indices
+            .chunks_exact(3)
+            .map(|t| {
+                let (p0, p1, p2) = (
+                    positions[t[0] as usize],
+                    positions[t[1] as usize],
+                    positions[t[2] as usize],
+                );
+                normalize(cross(sub(p1, p0), sub(p2, p0)))
+            })
+            .collect();
+        let mut edge_faces: std::collections::HashMap<u64, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (fi, t) in indices.chunks_exact(3).enumerate() {
+            for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                edge_faces.entry(edge_key(a, b)).or_default().push(fi);
+            }
+        }
+        edge_faces
+            .values()
+            .filter(|faces| {
+                faces.len() == 2
+                    && match (normals[faces[0]], normals[faces[1]]) {
+                        (Some(n0), Some(n1)) => dot(n0, n1) < -0.9,
+                        _ => false,
+                    }
+            })
+            .count()
+    }
+
+    /// Regression test for decimation-minted flipped slivers (foam lattices,
+    /// 2026-07). The per-collapse flip guard lets a face rotate just under
+    /// 90° per collapse, so successive collapses on sub-cell thin walls
+    /// accumulated fold-overs: near-coplanar back-facing sliver patches on a
+    /// mesh whose raw input had zero fold-back edges. The guard is now also
+    /// anchored to each face's decimation-entry orientation, which makes
+    /// accumulation impossible. Without the anchor this thin-walled gyroid
+    /// yields dozens of hard fold edges; with it there must be none.
+    #[test]
+    fn thin_walled_gyroid_decimation_creates_no_fold_backs() {
+        let mut mesh = mesh_sampler(
+            |x, y, z| {
+                let a = 7.0;
+                let g = (a * x).sin() * (a * y).cos()
+                    + (a * y).sin() * (a * z).cos()
+                    + (a * z).sin() * (a * x).cos();
+                if g.abs() < 0.25 { 1.0 } else { 0.0 }
+            },
+            3,
+        );
+        assert_eq!(
+            hard_fold_edge_count(&mesh.vertices, &mesh.indices),
+            0,
+            "raw mesh must enter decimation clean for this test to mean anything"
+        );
+        let before = mesh.indices.len() / 3;
+        decimate_mesh(&mut mesh, cell(3) * 0.5, 6);
+        assert!(mesh.indices.len() / 3 < before, "decimation ran");
+        assert_eq!(
+            hard_fold_edge_count(&mesh.vertices, &mesh.indices),
+            0,
+            "decimation minted folded-back faces"
+        );
     }
 
     #[test]
