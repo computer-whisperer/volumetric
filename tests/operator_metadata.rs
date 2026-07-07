@@ -27,6 +27,7 @@ const OPERATORS: &[&str] = &[
     "fea_deform_operator",
     "mesh_to_model_operator",
     "lattice_operator",
+    "strut_pattern_operator",
     "brim_operator",
 ];
 

@@ -18,6 +18,8 @@
 //! Calibrating per-family `d -> parameter` curves (so printed foam density
 //! matches the FEA-requested density) is expected follow-up work.
 
+pub mod skeleton;
+
 /// The lattice families the operator offers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LatticeKind {

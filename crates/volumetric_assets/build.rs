@@ -40,6 +40,7 @@ const OPERATORS: &[(&str, &str)] = &[
     ("mesh_to_model_operator", "Mesh to Model"),
     ("mesh_height_operator", "Mesh Height Query"),
     ("lattice_operator", "Lattice"),
+    ("strut_pattern_operator", "Strut Pattern"),
     ("brim_operator", "Brim"),
 ];
 
