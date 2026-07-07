@@ -3,11 +3,13 @@
 //! distribution matches a target pressure map.
 //!
 //! Scope, matching the forward solver's v1:
-//! - Uniform hex grids only. Updates are per lateral column of elements —
-//!   the first-order series-spring model: under a prescribed rigid pose,
-//!   scaling a column's stiffness scales its share of the interface force.
-//!   The cross-column coupling (Poisson, shear) is what the outer fixed
-//!   point iterates away.
+//! - Updates are per lateral column of elements — the first-order
+//!   series-spring model: under a prescribed rigid pose, scaling a
+//!   column's stiffness scales its share of the interface force. The
+//!   cross-column coupling (Poisson, shear) is what the outer fixed
+//!   point iterates away. Hex grids column by exact grid cell; Bar2
+//!   strut meshes bin struts by lateral midpoint (see
+//!   [`solve_inverse_frame`]'s docs for how attribution differs).
 //! - Relative distribution matching. With a prescribed pose, absolute
 //!   forces just scale with global stiffness, so the target and the achieved
 //!   forces are each normalized to unit sum before comparison; the answer is
@@ -56,6 +58,10 @@ pub struct InverseConfig {
     /// Floor on `stiffness_scale` (scales are renormalized so the stiffest
     /// element sits at 1.0).
     pub min_scale: f64,
+    /// Bar2 strut meshes only: the lateral bin width that groups struts
+    /// into columns (hex grids use their cell size). 0 picks twice the
+    /// mean strut length — about one lattice cell for the strut families.
+    pub column_size: f64,
 }
 
 impl Default for InverseConfig {
@@ -66,6 +72,7 @@ impl Default for InverseConfig {
             tolerance: 0.02,
             exponent: 0.5,
             min_scale: 0.01,
+            column_size: 0.0,
         }
     }
 }
@@ -89,6 +96,9 @@ pub struct InverseResult {
     pub converged: bool,
 }
 
+/// A lateral column key and the fraction/force attributed to it.
+type ColumnShares = Vec<((i64, i64), f64)>;
+
 /// Write `scales` into the mesh's `stiffness_scale` element field.
 fn set_scale_field(mesh: &mut FeaMesh, scales: &[f64]) {
     let data = scales.to_vec();
@@ -111,7 +121,9 @@ fn set_scale_field(mesh: &mut FeaMesh, scales: &[f64]) {
 
 /// Back out the per-element `stiffness_scale` that makes the interface force
 /// distribution match `target`. See the module docs for scope; the returned
-/// result carries the final forward solve.
+/// result carries the final forward solve. Hex grids update per lateral
+/// grid column; Bar2 strut meshes bin struts into lateral columns of
+/// `column_size` (see [`InverseConfig`]).
 pub fn solve_inverse(
     mesh: &FeaMesh,
     rigid: &mut dyn RigidBody,
@@ -138,6 +150,25 @@ pub fn solve_inverse(
         ));
     }
 
+    match mesh.element_kind {
+        volumetric_abi::fea::FeaElementKind::Hex8 => {
+            solve_inverse_hex(mesh, rigid, target, config)
+        }
+        volumetric_abi::fea::FeaElementKind::Bar2 => {
+            solve_inverse_frame(mesh, rigid, target, config)
+        }
+    }
+}
+
+/// The hex-grid inverse: exact lateral grid columns, target sampled at
+/// column centers (uniform column footprints make pressure and per-column
+/// force the same shape).
+fn solve_inverse_hex(
+    mesh: &FeaMesh,
+    rigid: &mut dyn RigidBody,
+    target: &mut dyn TargetMap,
+    config: &InverseConfig,
+) -> Result<InverseResult, String> {
     let h = detect_uniform_grid(mesh)?;
     let (contact_axis, contact_sign) = config.solve.fixed_boundary.contact_axis();
     let lateral: [usize; 2] = match contact_axis {
@@ -202,7 +233,7 @@ pub fn solve_inverse(
                 (*c, mean)
             })
             .collect();
-        let mut contacts: Vec<(usize, Vec<((i64, i64), f64)>)> = Vec::new();
+        let mut contacts: Vec<(usize, ColumnShares)> = Vec::new();
         let mut col_force: HashMap<(i64, i64), f64> = HashMap::new();
         for node in 0..node_count {
             let force = -contact_sign * result.contact_force[node * 3 + contact_axis];
@@ -216,7 +247,7 @@ pub fn solve_inverse(
                 .filter(|c| columns.contains_key(c))
                 .collect();
             let total_weight: f64 = adjacent.iter().map(|c| col_scale[c]).sum();
-            let shares: Vec<((i64, i64), f64)> = adjacent
+            let shares: ColumnShares = adjacent
                 .iter()
                 .map(|c| (*c, force * col_scale[c] / total_weight))
                 .collect();
@@ -305,6 +336,227 @@ pub fn solve_inverse(
         // Renormalize so the stiffest element sits at 1.0 — distribution
         // matching is scale-free, and this keeps the SIMP knob in a stable,
         // clampable range.
+        let max = scales.iter().copied().fold(0.0f64, f64::max);
+        if max > 0.0 {
+            for s in &mut scales {
+                *s = (*s / max).clamp(config.min_scale, 1.0);
+            }
+        }
+    }
+}
+
+/// The strut-lattice inverse. Same fixed point as the hex path, adapted
+/// to irregular networks:
+///
+/// - Columns are lateral bins of width `column_size` (0 = twice the mean
+///   strut length); a strut belongs to its midpoint's bin.
+/// - A contact node's force splits among the columns of its *incident*
+///   struts, in proportion to column stiffness — the strut analog of the
+///   hex tributary split (the force a node transmits flows into the
+///   struts hanging off it).
+/// - The target pressure is sampled at each contact node's lateral
+///   position and attributed with the same shares as its force. Summed
+///   per column, demand and achievement carry identical footprint
+///   weighting, so partially covered boundary bins (or foam's uneven
+///   node density) aren't over-demanded, and comparison still happens at
+///   column granularity — per-node demands the actuator can't resolve
+///   average out inside their bin.
+fn solve_inverse_frame(
+    mesh: &FeaMesh,
+    rigid: &mut dyn RigidBody,
+    target: &mut dyn TargetMap,
+    config: &InverseConfig,
+) -> Result<InverseResult, String> {
+    if !(config.column_size >= 0.0 && config.column_size.is_finite()) {
+        return Err(format!(
+            "column_size {} must be zero (auto) or positive",
+            config.column_size
+        ));
+    }
+    if mesh.element_count() == 0 {
+        return Err("mesh has no struts".to_string());
+    }
+    let (contact_axis, contact_sign) = config.solve.fixed_boundary.contact_axis();
+    let lateral: [usize; 2] = match contact_axis {
+        0 => [1, 2],
+        1 => [0, 2],
+        _ => [0, 1],
+    };
+
+    let node_count = mesh.node_count();
+    let mut lo = [f64::INFINITY; 3];
+    for node in 0..node_count {
+        let p = mesh.node_position(node);
+        for axis in 0..3 {
+            lo[axis] = lo[axis].min(p[axis]);
+        }
+    }
+
+    let mut total_length = 0.0;
+    for e in 0..mesh.element_count() {
+        let pair = mesh.element(e);
+        let a = mesh.node_position(pair[0] as usize);
+        let b = mesh.node_position(pair[1] as usize);
+        total_length += (0..3).map(|c| (a[c] - b[c]).powi(2)).sum::<f64>().sqrt();
+    }
+    let bin = if config.column_size > 0.0 {
+        config.column_size
+    } else {
+        2.0 * total_length / mesh.element_count() as f64
+    };
+    if !(bin > 0.0 && bin.is_finite()) {
+        return Err(format!("degenerate column bin width {bin}"));
+    }
+
+    let col_of = |p: [f64; 3]| -> (i64, i64) {
+        (
+            ((p[lateral[0]] - lo[lateral[0]]) / bin).floor() as i64,
+            ((p[lateral[1]] - lo[lateral[1]]) / bin).floor() as i64,
+        )
+    };
+
+    // Struts grouped by the lateral column of their midpoint.
+    let mut columns: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
+    let mut strut_col: Vec<(i64, i64)> = Vec::with_capacity(mesh.element_count());
+    for e in 0..mesh.element_count() {
+        let pair = mesh.element(e);
+        let a = mesh.node_position(pair[0] as usize);
+        let b = mesh.node_position(pair[1] as usize);
+        let mid = [
+            0.5 * (a[0] + b[0]),
+            0.5 * (a[1] + b[1]),
+            0.5 * (a[2] + b[2]),
+        ];
+        let c = col_of(mid);
+        columns.entry(c).or_default().push(e);
+        strut_col.push(c);
+    }
+
+    // Node -> incident struts.
+    let mut node_struts: Vec<Vec<usize>> = vec![Vec::new(); node_count];
+    for e in 0..mesh.element_count() {
+        for &node in mesh.element(e) {
+            node_struts[node as usize].push(e);
+        }
+    }
+
+    let mut work = mesh.clone();
+    let mut scales = stiffness_scales(mesh)?;
+    let mut iterations = 0;
+
+    loop {
+        iterations += 1;
+        set_scale_field(&mut work, &scales);
+        let result = solve(&work, rigid, &config.solve)?;
+        if !result.stats.converged {
+            return Err(format!(
+                "forward solve did not converge at inverse iteration {iterations} \
+                 ({} contact iterations, {} CG iterations, {} active contacts)",
+                result.stats.contact_iterations,
+                result.stats.cg_iterations,
+                result.stats.active_contacts,
+            ));
+        }
+
+        let col_scale: HashMap<(i64, i64), f64> = columns
+            .iter()
+            .map(|(c, struts)| {
+                let mean = struts.iter().map(|&e| scales[e]).sum::<f64>() / struts.len() as f64;
+                (*c, mean)
+            })
+            .collect();
+
+        // Attribute each contact node's force AND its sampled pressure to
+        // the columns of its incident struts with the same shares.
+        let mut contacts: Vec<(usize, f64, ColumnShares)> = Vec::new();
+        let mut col_force: HashMap<(i64, i64), f64> = HashMap::new();
+        let mut col_target: HashMap<(i64, i64), f64> = HashMap::new();
+        for node in 0..node_count {
+            let force = -contact_sign * result.contact_force[node * 3 + contact_axis];
+            if force <= 0.0 {
+                continue;
+            }
+            let mut cols: Vec<(i64, i64)> = node_struts[node]
+                .iter()
+                .map(|&e| strut_col[e])
+                .collect();
+            cols.sort_unstable();
+            cols.dedup();
+            let p = mesh.node_position(node);
+            let pressure = target.pressure([p[lateral[0]], p[lateral[1]]]);
+            if !pressure.is_finite() {
+                return Err(format!(
+                    "target map returned a non-finite value at ({}, {})",
+                    p[lateral[0]], p[lateral[1]]
+                ));
+            }
+            let pressure = pressure.max(0.0);
+            let total_weight: f64 = cols.iter().map(|c| col_scale[c]).sum();
+            let fractions: ColumnShares = cols
+                .iter()
+                .map(|c| (*c, col_scale[c] / total_weight))
+                .collect();
+            for (c, fraction) in &fractions {
+                *col_force.entry(*c).or_default() += force * fraction;
+                *col_target.entry(*c).or_default() += pressure * fraction;
+            }
+            contacts.push((node, force, fractions));
+        }
+        if col_force.is_empty() {
+            return Err(
+                "the rigid body makes no contact with the lattice; position it \
+                 interpenetrating the face opposite the fixed boundary"
+                    .to_string(),
+            );
+        }
+
+        let total_force: f64 = col_force.values().sum();
+        let total_target: f64 = col_target.values().sum();
+        if total_target <= 0.0 {
+            return Err(
+                "the target map is zero (or negative) everywhere the rigid body \
+                 makes contact, so the desired distribution is undefined; check \
+                 that the map covers the contact patch"
+                    .to_string(),
+            );
+        }
+
+        let distribution_error: f64 = 0.5
+            * col_force
+                .iter()
+                .map(|(c, f)| (col_target[c] / total_target - f / total_force).abs())
+                .sum::<f64>();
+
+        let ratios: HashMap<(i64, i64), f64> = col_force
+            .iter()
+            .map(|(c, f)| (*c, (col_target[c] / total_target) / (f / total_force)))
+            .collect();
+
+        let converged = distribution_error <= config.tolerance;
+        if converged || iterations >= config.max_iterations {
+            let mut target_force = vec![0.0f64; node_count];
+            for (node, force, fractions) in &contacts {
+                target_force[*node] = fractions
+                    .iter()
+                    .map(|(c, fraction)| force * fraction * ratios[c])
+                    .sum();
+            }
+            return Ok(InverseResult {
+                stiffness_scale: scales,
+                target_force,
+                solve: result,
+                iterations,
+                distribution_error,
+                converged,
+            });
+        }
+
+        for (c, ratio) in &ratios {
+            let factor = ratio.powf(config.exponent).clamp(0.25, 4.0);
+            for &e in &columns[c] {
+                scales[e] *= factor;
+            }
+        }
         let max = scales.iter().copied().fold(0.0f64, f64::max);
         if max > 0.0 {
             for s in &mut scales {
@@ -451,6 +703,130 @@ mod tests {
             low_z > 1.5 * high_z,
             "expected stiffer columns at low z: low {low_z}, high {high_z}"
         );
+    }
+
+    /// A cubic strut lattice block: (nx+1)(ny+1)(nz+1) grid nodes with
+    /// struts along all three axes, uniform radius.
+    fn strut_grid(nx: usize, ny: usize, nz: usize, h: f64, radius: f64) -> FeaMesh {
+        use volumetric_abi::fea::FeaElementKind;
+        let (mx, my) = (nx + 1, ny + 1);
+        let node = |i: usize, j: usize, k: usize| (k * my * mx + j * mx + i) as u32;
+        let mut node_positions = Vec::new();
+        for k in 0..=nz {
+            for j in 0..=ny {
+                for i in 0..=nx {
+                    node_positions.extend([i as f64 * h, j as f64 * h, k as f64 * h]);
+                }
+            }
+        }
+        let mut connectivity = Vec::new();
+        for k in 0..=nz {
+            for j in 0..=ny {
+                for i in 0..=nx {
+                    if i < nx {
+                        connectivity.extend([node(i, j, k), node(i + 1, j, k)]);
+                    }
+                    if j < ny {
+                        connectivity.extend([node(i, j, k), node(i, j + 1, k)]);
+                    }
+                    if k < nz {
+                        connectivity.extend([node(i, j, k), node(i, j, k + 1)]);
+                    }
+                }
+            }
+        }
+        let strut_count = connectivity.len() / 2;
+        FeaMesh {
+            element_kind: FeaElementKind::Bar2,
+            node_positions,
+            connectivity,
+            node_fields: vec![],
+            element_fields: vec![FeaField {
+                name: "radius".to_string(),
+                components: 1,
+                data: vec![radius; strut_count],
+            }],
+        }
+    }
+
+    #[test]
+    fn frame_uniform_target_is_a_fixed_point() {
+        // A uniform cubic lattice under a flat plate: every top node has
+        // an identical vertical strut chain below it, so the contact
+        // forces are already uniform. Per-node target attribution must
+        // recognize the fixed point on the first solve — including in
+        // partially covered boundary bins.
+        let mesh = strut_grid(4, 4, 2, 0.25, 0.02);
+        let mut target = |_: [f64; 2]| 1.0;
+        let result = solve_inverse(
+            &mesh,
+            &mut plate(0.45),
+            &mut target,
+            &config(0.3, FixedBoundary::ZMin),
+        )
+        .unwrap();
+        assert!(result.converged, "error {}", result.distribution_error);
+        assert_eq!(result.iterations, 1);
+        assert!(result.distribution_error < 1e-6);
+        assert!(result.stiffness_scale.iter().all(|s| *s == 1.0));
+    }
+
+    #[test]
+    fn frame_step_target_shapes_forces() {
+        // 1x1x0.5 cubic lattice glued at z=0, plate pressed 10% in, three
+        // times the pressure demanded on the x > 0.5 half.
+        let mesh = strut_grid(8, 8, 4, 0.125, 0.015);
+        let mut target = |p: [f64; 2]| if p[0] < 0.5 { 1.0 } else { 3.0 };
+        let cfg = config(0.3, FixedBoundary::ZMin);
+        let result = solve_inverse(&mesh, &mut plate(0.45), &mut target, &cfg).unwrap();
+        assert!(
+            result.converged,
+            "error {} after {} iterations",
+            result.distribution_error, result.iterations
+        );
+        assert!(
+            result.iterations > 1,
+            "a step target cannot be a fixed point"
+        );
+
+        // The achieved nodal force split matches the demanded 1:3 shape
+        // (nodes exactly on x = 0.5 sample the high side, nudging the
+        // ratio above 3).
+        let mut split = [0.0f64; 2];
+        for node in 0..mesh.node_count() {
+            let f = -result.solve.contact_force[node * 3 + 2];
+            if f > 0.0 {
+                split[(mesh.node_position(node)[0] >= 0.5) as usize] += f;
+            }
+        }
+        let ratio = split[1] / split[0];
+        assert!(
+            (2.3..4.8).contains(&ratio),
+            "achieved high/low force ratio {ratio}, expected ~3"
+        );
+
+        // Stiffness follows: struts under the low-pressure side go soft.
+        let mut side_scale = [0.0f64; 2];
+        let mut side_count = [0usize; 2];
+        for e in 0..mesh.element_count() {
+            let pair = mesh.element(e);
+            let a = mesh.node_position(pair[0] as usize);
+            let b = mesh.node_position(pair[1] as usize);
+            let side = (0.5 * (a[0] + b[0]) > 0.5) as usize;
+            side_scale[side] += result.stiffness_scale[e];
+            side_count[side] += 1;
+        }
+        let low = side_scale[0] / side_count[0] as f64;
+        let high = side_scale[1] / side_count[1] as f64;
+        assert!(
+            high > 1.5 * low,
+            "stiffness contrast missing: low side {low}, high side {high}"
+        );
+
+        // target_force is scaled to the achieved total.
+        let total_target: f64 = result.target_force.iter().sum();
+        let total_force = split[0] + split[1];
+        assert!((total_target - total_force).abs() < 1e-6 * total_force);
     }
 
     #[test]

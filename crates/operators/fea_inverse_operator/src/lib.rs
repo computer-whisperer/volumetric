@@ -2,18 +2,22 @@
 //!
 //! Backs out per-element stiffness from a desired interface force
 //! distribution: repeatedly compresses the mesh against the rigid body (see
-//! `fea_core` for scope: uniform hex grids, Hooke's law, quasi-static single
-//! pose, active-set contact) and scales each lateral element column's
-//! `stiffness_scale` until the relative contact force distribution matches a
-//! target pressure map.
+//! `fea_core` for scope: Hooke's law, quasi-static single pose, active-set
+//! contact) and scales each lateral column's `stiffness_scale` until the
+//! relative contact force distribution matches a target pressure map. Hex
+//! grids column by grid cell; Bar2 strut lattices bin struts into lateral
+//! columns of `column_size` (0 = twice the mean strut length), so the same
+//! loop drives per-strut mechanical properties.
 //!
 //! Matching is relative: with a prescribed rigid pose, absolute forces just
 //! scale with global stiffness, so only the *shape* of the map matters
-//! ("where firm, where soft"). Feed the result to `fea_density_operator` for
-//! the density assignment.
+//! ("where firm, where soft"). Feed hex results to `fea_density_operator`
+//! for density assignment; strut results carry their converged per-strut
+//! `stiffness_scale` to the lattice-model realization step, which owns the
+//! scale-to-radius mapping.
 //!
 //! Inputs:
-//! - Input 0: FeaMesh (from `fea_grid_mesh_operator`; an existing
+//! - Input 0: FeaMesh (hex grid or Bar2 strut lattice; an existing
 //!   `stiffness_scale` element field is the starting point)
 //! - Input 1: ModelWASM — the rigid body (3D), placed in the pressed pose
 //! - Input 2: ModelWASM — the target pressure map (2D), sampled across the
@@ -27,13 +31,15 @@
 //!   (int, default 20), `tolerance` (float, default 0.02 — total variation
 //!   distance between normalized distributions), `exponent` (float, default
 //!   0.5 — update damping), `min_scale` (float, default 0.01 — stiffness
-//!   floor).
+//!   floor), `column_size` (float, default 0 — Bar2 lateral bin width,
+//!   0 = auto).
 //!
 //! Output 0: the input FeaMesh plus the converged per-element
 //! `stiffness_scale` (1), per-node `target_force` (1, the matched
 //! distribution scaled to the achieved total, comparable to
 //! `contact_force`), and the final solve's `displacement` (3),
-//! `contact_force` (3), `strain_energy_density` (1).
+//! `contact_force` (3), `strain_energy_density` (1), and `rotation` (3,
+//! Bar2 frame meshes only).
 
 use volumetric_abi::fea::{FeaField, FeaMesh, decode_fea_mesh, encode_fea_mesh};
 use volumetric_abi::host::{
@@ -53,6 +59,7 @@ struct InverseOperatorConfig {
     tolerance: f64,
     exponent: f64,
     min_scale: f64,
+    column_size: f64,
 }
 
 impl Default for InverseOperatorConfig {
@@ -65,6 +72,7 @@ impl Default for InverseOperatorConfig {
             tolerance: 0.02,
             exponent: 0.5,
             min_scale: 0.01,
+            column_size: 0.0,
         }
     }
 }
@@ -110,6 +118,7 @@ fn run_inverse(config: &InverseOperatorConfig) -> Result<FeaMesh, String> {
         tolerance: config.tolerance,
         exponent: config.exponent,
         min_scale: config.min_scale,
+        column_size: config.column_size,
     };
 
     let mut rigid = |p: [f64; 3]| {
@@ -159,6 +168,16 @@ fn run_inverse(config: &InverseOperatorConfig) -> Result<FeaMesh, String> {
             data: result.solve.displacement,
         },
     );
+    if let Some(rotation) = result.solve.rotation {
+        upsert(
+            &mut mesh.node_fields,
+            FeaField {
+                name: "rotation".to_string(),
+                components: 3,
+                data: rotation,
+            },
+        );
+    }
     upsert(
         &mut mesh.node_fields,
         FeaField {
@@ -214,7 +233,7 @@ pub extern "C" fn get_metadata() -> i64 {
             OperatorMetadataInput::ModelWASM,
             OperatorMetadataInput::ModelWASM,
             OperatorMetadataInput::CBORConfiguration(
-                r#"{ youngs_modulus: float .default 1.0, poissons_ratio: float .default 0.3, fixed_boundary: "zmin" / "zmax" / "xmin" / "xmax" / "ymin" / "ymax" / "none" .default "zmin", max_iterations: int .default 20, tolerance: float .default 0.02, exponent: float .default 0.5, min_scale: float .default 0.01 }"#
+                r#"{ youngs_modulus: float .default 1.0, poissons_ratio: float .default 0.3, fixed_boundary: "zmin" / "zmax" / "xmin" / "xmax" / "ymin" / "ymax" / "none" .default "zmin", max_iterations: int .default 20, tolerance: float .default 0.02, exponent: float .default 0.5, min_scale: float .default 0.01, column_size: float .default 0.0 }"#
                     .to_string(),
             ),
         ],
