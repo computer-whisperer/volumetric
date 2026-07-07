@@ -72,6 +72,17 @@ impl GpuLines {
     }
 }
 
+/// Immediate-mode GPU state for one depth mode's line pass. Each pass needs
+/// its own buffers: `queue.write_buffer` executes at submit, before any
+/// encoded pass runs, so uploads for a later pass into shared buffers would
+/// clobber an earlier pass's data.
+struct ImmediateLines {
+    instance_buffer: DynamicBuffer<LineInstance>,
+    uniform_buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    cached_uniforms: Option<LineUniforms>,
+}
+
 /// Pipeline for rendering lines with vertex shader quad expansion.
 pub struct LinePipeline {
     /// Pipeline for depth-tested lines
@@ -79,15 +90,20 @@ pub struct LinePipeline {
     /// Pipeline for overlay lines (no depth test)
     overlay_pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
-    uniform_buffer: wgpu::Buffer,
-    bind_group: wgpu::BindGroup,
     /// Static quad vertex buffer (4 vertices)
     quad_vertex_buffer: StaticBuffer<QuadVertex>,
     /// Static quad index buffer (6 indices for 2 triangles)
     quad_index_buffer: StaticBuffer<u16>,
-    /// Dynamic instance buffer for line segments
-    instance_buffer: DynamicBuffer<LineInstance>,
-    cached_uniforms: Option<LineUniforms>,
+    /// Per-depth-mode immediate state, indexed by [`slot_index`].
+    immediate: [ImmediateLines; 2],
+}
+
+/// The [`LinePipeline::immediate`] slot for a depth mode.
+fn slot_index(depth_mode: DepthMode) -> usize {
+    match depth_mode {
+        DepthMode::Normal => 0,
+        DepthMode::Overlay => 1,
+    }
 }
 
 impl LinePipeline {
@@ -246,22 +262,30 @@ impl LinePipeline {
             cache: None,
         });
 
-        // Uniform buffer
-        let uniforms = LineUniforms::default();
-        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("line_uniform_buffer"),
-            contents: bytemuck::bytes_of(&uniforms),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-
-        // Bind group
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("line_uniform_bg"),
-            layout: &bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            }],
+        // Per-depth-mode immediate buffers
+        let immediate = std::array::from_fn(|_| {
+            let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("line_uniform_buffer"),
+                contents: bytemuck::bytes_of(&LineUniforms::default()),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("line_uniform_bg"),
+                layout: &bind_group_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                }],
+            });
+            ImmediateLines {
+                instance_buffer: DynamicBuffer::new(
+                    wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    "line_instance_buffer",
+                ),
+                uniform_buffer,
+                bind_group,
+                cached_uniforms: None,
+            }
         });
 
         // Static quad buffers
@@ -278,32 +302,29 @@ impl LinePipeline {
             "line_quad_index_buffer",
         );
 
-        // Dynamic instance buffer
-        let instance_buffer = DynamicBuffer::new(
-            wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            "line_instance_buffer",
-        );
-
         Self {
             depth_pipeline,
             overlay_pipeline,
             bind_group_layout,
-            uniform_buffer,
-            bind_group,
             quad_vertex_buffer,
             quad_index_buffer,
-            instance_buffer,
-            cached_uniforms: None,
+            immediate,
         }
     }
 
-    /// Update uniforms if they have changed.
-    pub fn update_uniforms(&mut self, queue: &wgpu::Queue, uniforms: &LineUniforms) {
-        if self.cached_uniforms.as_ref() == Some(uniforms) {
+    /// Update a depth mode's uniforms if they have changed.
+    pub fn update_uniforms(
+        &mut self,
+        queue: &wgpu::Queue,
+        uniforms: &LineUniforms,
+        depth_mode: DepthMode,
+    ) {
+        let slot = &mut self.immediate[slot_index(depth_mode)];
+        if slot.cached_uniforms.as_ref() == Some(uniforms) {
             return;
         }
-        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(uniforms));
-        self.cached_uniforms = Some(*uniforms);
+        queue.write_buffer(&slot.uniform_buffer, 0, bytemuck::bytes_of(uniforms));
+        slot.cached_uniforms = Some(*uniforms);
     }
 
     /// Prepare line instances from segments with style.
@@ -314,14 +335,17 @@ impl LinePipeline {
             .collect()
     }
 
-    /// Upload line instances to the GPU.
+    /// Upload line instances for a depth mode's pass to the GPU.
     pub fn upload_instances(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         instances: &[LineInstance],
+        depth_mode: DepthMode,
     ) {
-        self.instance_buffer.upload(device, queue, instances);
+        self.immediate[slot_index(depth_mode)]
+            .instance_buffer
+            .upload(device, queue, instances);
     }
 
     /// Create uniforms from view-proj matrix, screen size, and style.
@@ -446,9 +470,10 @@ impl LinePipeline {
         render_pass.draw_indexed(0..6, 0, 0..batch.count);
     }
 
-    /// Record a line render pass.
+    /// Record a depth mode's line render pass.
     pub fn render<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>, depth_mode: DepthMode) {
-        if self.instance_buffer.is_empty() {
+        let slot = &self.immediate[slot_index(depth_mode)];
+        if slot.instance_buffer.is_empty() {
             return;
         }
 
@@ -458,9 +483,9 @@ impl LinePipeline {
         };
 
         render_pass.set_pipeline(pipeline);
-        render_pass.set_bind_group(0, &self.bind_group, &[]);
+        render_pass.set_bind_group(0, &slot.bind_group, &[]);
         render_pass.set_vertex_buffer(0, self.quad_vertex_buffer.buffer().slice(..));
-        if let Some(instance_buffer) = self.instance_buffer.buffer() {
+        if let Some(instance_buffer) = slot.instance_buffer.buffer() {
             render_pass.set_vertex_buffer(1, instance_buffer.slice(..));
         }
         render_pass.set_index_buffer(
@@ -469,11 +494,11 @@ impl LinePipeline {
         );
 
         // Draw: 6 indices per quad, N instances
-        render_pass.draw_indexed(0..6, 0, 0..self.instance_buffer.len() as u32);
+        render_pass.draw_indexed(0..6, 0, 0..slot.instance_buffer.len() as u32);
     }
 
-    /// Get the number of line instances currently uploaded.
-    pub fn instance_count(&self) -> usize {
-        self.instance_buffer.len()
+    /// Get the number of line instances currently uploaded for a depth mode.
+    pub fn instance_count(&self, depth_mode: DepthMode) -> usize {
+        self.immediate[slot_index(depth_mode)].instance_buffer.len()
     }
 }

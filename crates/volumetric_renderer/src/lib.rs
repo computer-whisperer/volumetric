@@ -830,20 +830,20 @@ impl Renderer {
                     LinePipeline::prepare_instances(&all_line_segments, &line_style);
                 self.frame_overflow.dropped_lines +=
                     truncate_to_buffer_budget(&mut instances, max_buffer_bytes);
-                line_pipeline.upload_instances(device, queue, &instances);
+                line_pipeline.upload_instances(device, queue, &instances, DepthMode::Normal);
                 let uniforms =
                     LinePipeline::create_uniforms(view_proj_array, screen_size, &line_style);
-                line_pipeline.update_uniforms(queue, &uniforms);
+                line_pipeline.update_uniforms(queue, &uniforms, DepthMode::Normal);
             }
 
             if !all_point_instances.is_empty() {
                 let mut instances = PointPipeline::prepare_instances(&all_point_instances);
                 self.frame_overflow.dropped_points +=
                     truncate_to_buffer_budget(&mut instances, max_buffer_bytes);
-                point_pipeline.upload_instances(device, queue, &instances);
+                point_pipeline.upload_instances(device, queue, &instances, DepthMode::Normal);
                 let uniforms =
                     PointPipeline::create_uniforms(view_proj_array, screen_size, &point_style);
-                point_pipeline.update_uniforms(queue, &uniforms);
+                point_pipeline.update_uniforms(queue, &uniforms, DepthMode::Normal);
             }
 
             // Refresh retained batches' per-frame camera uniforms
@@ -977,20 +977,20 @@ impl Renderer {
                     LinePipeline::prepare_instances(&all_line_segments, &line_style);
                 self.frame_overflow.dropped_lines +=
                     truncate_to_buffer_budget(&mut instances, max_buffer_bytes);
-                line_pipeline.upload_instances(device, queue, &instances);
+                line_pipeline.upload_instances(device, queue, &instances, DepthMode::Overlay);
                 let uniforms =
                     LinePipeline::create_uniforms(view_proj_array, screen_size, &line_style);
-                line_pipeline.update_uniforms(queue, &uniforms);
+                line_pipeline.update_uniforms(queue, &uniforms, DepthMode::Overlay);
             }
 
             if !all_point_instances.is_empty() {
                 let mut instances = PointPipeline::prepare_instances(&all_point_instances);
                 self.frame_overflow.dropped_points +=
                     truncate_to_buffer_budget(&mut instances, max_buffer_bytes);
-                point_pipeline.upload_instances(device, queue, &instances);
+                point_pipeline.upload_instances(device, queue, &instances, DepthMode::Overlay);
                 let uniforms =
                     PointPipeline::create_uniforms(view_proj_array, screen_size, &point_style);
-                point_pipeline.update_uniforms(queue, &uniforms);
+                point_pipeline.update_uniforms(queue, &uniforms, DepthMode::Overlay);
             }
 
             // Refresh retained batches' per-frame camera uniforms
