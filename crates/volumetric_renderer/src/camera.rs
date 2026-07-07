@@ -155,6 +155,17 @@ impl Camera {
         self.radius = (self.radius * factor).clamp(min_radius, max_radius);
     }
 
+    /// Fit the clip planes to the current orbit distance.
+    ///
+    /// Radius-relative planes make zooming scale-free: the near plane stays
+    /// a fixed fraction of the orbit distance, so a surface being approached
+    /// never crosses it — at any part scale. The 2e4 near:far ratio is well
+    /// within Depth24Plus precision.
+    pub fn fit_clip_planes(&mut self) {
+        self.near = self.radius * 0.005;
+        self.far = self.radius * 100.0;
+    }
+
     /// Focus the camera on a bounding box.
     ///
     /// Centers the target on the box and adjusts distance to fit the box in view.
@@ -454,6 +465,28 @@ mod tests {
         camera.zoom(1.0); // Zoom in
 
         assert!(camera.radius < initial_radius);
+    }
+
+    #[test]
+    fn clip_planes_follow_the_orbit_radius() {
+        let mut camera = Camera {
+            radius: 0.26, // a framed 0.1^3 part
+            ..Default::default()
+        };
+        camera.fit_clip_planes();
+        assert!(
+            camera.near < 0.26 * 0.01,
+            "near {} must sit well inside the orbit radius",
+            camera.near
+        );
+        assert!(camera.far > 0.26, "far {} must cover the scene", camera.far);
+
+        // Zooming in pulls the near plane along, so the approached surface
+        // never crosses it.
+        camera.radius = 0.01;
+        camera.fit_clip_planes();
+        assert!(camera.near < 0.001);
+        assert!(camera.near > 0.0);
     }
 
     #[test]

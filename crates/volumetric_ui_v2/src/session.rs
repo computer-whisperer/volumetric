@@ -464,8 +464,9 @@ impl ViewportRenderer {
         self.submit_scene(device, &preview_requests);
         let camera = self
             .camera
-            .get_or_insert_with(renderer::test_scenes::create_test_camera)
-            .clone();
+            .get_or_insert_with(renderer::test_scenes::create_test_camera);
+        camera.fit_clip_planes();
+        let camera = camera.clone();
 
         let settings = render_settings(preview_requests.first(), clear_color);
         self.renderer.render(
@@ -504,7 +505,8 @@ impl ViewportRenderer {
                 } else {
                     input.mouse_delta.x * 0.02
                 };
-                camera.zoom_clamped(zoom_delta, 0.1, 1000.0);
+                let (min_radius, max_radius) = zoom_limits(self.scene_bounds);
+                camera.zoom_clamped(zoom_delta, min_radius, max_radius);
                 true
             }
             renderer::CameraAction::None => false,
@@ -651,6 +653,20 @@ impl ViewportRenderer {
             }
         }
     }
+}
+
+/// Scene-relative zoom range: a fixed minimum orbit distance would stop far
+/// short of a tiny part's surface (and the clip planes follow the radius, so
+/// the range must scale with the scene). Falls back to the legacy fixed
+/// range until something has been framed.
+fn zoom_limits(bounds: Option<PreviewBounds>) -> (f32, f32) {
+    if let Some(bounds) = bounds {
+        let diagonal = (bounds.max_vec3() - bounds.min_vec3()).length();
+        if diagonal.is_finite() && diagonal > 0.0 {
+            return (diagonal * 0.02, diagonal * 50.0);
+        }
+    }
+    (0.1, 1000.0)
 }
 
 /// The 12 edges of an output's world-space bounding box.
@@ -2977,6 +2993,27 @@ mod tests {
             stats: OutputStats::default(),
             wireframe_lines: None,
         }
+    }
+
+    #[test]
+    fn zoom_limits_scale_with_the_scene() {
+        // A 0.1^3 part: the minimum orbit distance must land well under the
+        // old fixed 0.1, or the camera can never approach the surface.
+        let tiny = PreviewBounds {
+            min: (0.0, 0.0, 0.0),
+            max: (0.1, 0.1, 0.1),
+        };
+        let (min_radius, max_radius) = zoom_limits(Some(tiny));
+        assert!(min_radius < 0.01, "min radius was {min_radius}");
+        assert!(max_radius > 1.0);
+
+        // Nothing framed (or degenerate bounds): the legacy fixed range.
+        assert_eq!(zoom_limits(None), (0.1, 1000.0));
+        let point = PreviewBounds {
+            min: (1.0, 1.0, 1.0),
+            max: (1.0, 1.0, 1.0),
+        };
+        assert_eq!(zoom_limits(Some(point)), (0.1, 1000.0));
     }
 
     #[test]
