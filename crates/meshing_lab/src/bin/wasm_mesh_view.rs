@@ -70,6 +70,7 @@ fn main() {
         .unwrap_or(1.0);
     let config = AdaptiveMeshConfig2 {
         base_resolution: 8,
+        discovery_probes: 8,
         max_depth,
         vertex_refinement_iterations: 8,
         normal_sample_iterations: 0,

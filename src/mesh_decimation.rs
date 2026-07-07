@@ -961,6 +961,7 @@ mod tests {
     {
         let config = AdaptiveMeshConfig2 {
             base_resolution: 8,
+            discovery_probes: 0,
             max_depth: depth,
             vertex_refinement_iterations: 8,
             normal_sample_iterations: 0,

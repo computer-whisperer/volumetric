@@ -272,6 +272,20 @@ pub struct AdaptiveMeshConfig2 {
     /// Maximum refinement depth (total resolution = base_resolution * 2^max_depth)
     pub max_depth: usize,
 
+    /// Aperiodic interior probes per corner-uniform stage-1 cell (0 disables).
+    ///
+    /// The stage-1 corner grid is regular, so it can phase-lock to periodic
+    /// geometry: a lattice whose struts are thinner than the coarse cell
+    /// pitch may fall entirely between corner samples, and the whole
+    /// component is silently lost. Probes at low-discrepancy jittered
+    /// positions inside each cell break that periodicity; a probe that
+    /// disagrees with the cell's uniform corners seeds probe-guided
+    /// subdivision (see [`DiscoveryProbe`]), and max-depth frontier
+    /// expansion then walks the rest of the connected surface.
+    ///
+    /// Cost: at most this many extra samples per corner-uniform coarse cell.
+    pub discovery_probes: usize,
+
     /// Number of binary search iterations for vertex position refinement
     pub vertex_refinement_iterations: usize,
 
@@ -332,6 +346,7 @@ impl Default for AdaptiveMeshConfig2 {
         Self {
             base_resolution: 8,
             max_depth: 4,
+            discovery_probes: 8,
             vertex_refinement_iterations: 12,
             // Enable normal refinement by default - probing works well with binary samplers
             normal_sample_iterations: 12,
@@ -684,6 +699,23 @@ pub struct WorkQueueEntry {
     /// Pre-sampled corner states: Some(true) = inside, Some(false) = outside, None = unknown
     /// Uses canonical corner indexing (see CORNER_OFFSETS)
     pub known_corners: [Option<bool>; 8],
+    /// Interior-probe evidence of sub-corner-grid geometry (see
+    /// [`DiscoveryProbe`]). Lets a corner-uniform cell subdivide anyway,
+    /// descending toward the probe until some cell's corners turn mixed.
+    pub probe: Option<DiscoveryProbe>,
+}
+
+/// Evidence from stage-1 aperiodic interior probing: a world-space point
+/// whose sample disagreed with its cell's uniform corners. Carried down
+/// through subdivision (always to the child containing it) until normal
+/// corner-mixed processing takes over, or dropped when a cell's uniform
+/// corners come to agree with it.
+#[derive(Clone, Copy, Debug)]
+pub struct DiscoveryProbe {
+    /// World-space probe position.
+    pub pos: (f64, f64, f64),
+    /// The sampled state at `pos`.
+    pub inside: bool,
 }
 
 impl WorkQueueEntry {
@@ -692,6 +724,7 @@ impl WorkQueueEntry {
         Self {
             cuboid,
             known_corners: [None; 8],
+            probe: None,
         }
     }
 
@@ -700,6 +733,7 @@ impl WorkQueueEntry {
         Self {
             cuboid,
             known_corners,
+            probe: None,
         }
     }
 
@@ -767,6 +801,9 @@ pub struct MeshingStats2 {
     pub stage1_time_secs: f64,
     pub stage1_samples: u64,
     pub stage1_mixed_cells: usize,
+    /// Corner-uniform cells seeded by a disagreeing interior probe —
+    /// geometry the regular corner grid would have missed entirely.
+    pub stage1_probe_seeds: usize,
 
     /// Stage 2: Subdivision & triangle emission
     pub stage2_time_secs: f64,
@@ -857,6 +894,9 @@ impl MeshingStats2 {
         );
         println!("  Samples: {}", self.stage1_samples);
         println!("  Mixed cells found: {}", self.stage1_mixed_cells);
+        if self.stage1_probe_seeds > 0 {
+            println!("  Probe-seeded cells: {}", self.stage1_probe_seeds);
+        }
         println!();
         println!(
             "Stage 2 (Subdivision & Emission): {:.2}ms ({:.1}%)",
@@ -1087,7 +1127,8 @@ where
         }
     }
 
-    // Find mixed cells and create work queue entries
+    // Find mixed cells and create work queue entries; probe the interiors
+    // of corner-uniform cells for geometry the regular grid missed.
     // Cell indices now go from -1 to res (i.e., 0..expanded_cells in array coords)
     let mut work_queue = Vec::new();
 
@@ -1113,12 +1154,63 @@ where
                     let cuboid = CuboidId::new(ix as i32 - 1, iy as i32 - 1, iz as i32 - 1, 0);
                     let known_corners = cell_corners.map(Some);
                     work_queue.push(WorkQueueEntry::with_corners(cuboid, known_corners));
+                } else {
+                    // Corner-uniform cell: aperiodic interior probes, so
+                    // geometry thinner than the corner pitch (a lattice
+                    // period, say) can't hide between samples. First
+                    // disagreement wins; descent handles the rest.
+                    let corners_inside = cell_corners[0];
+                    for probe_index in 0..config.discovery_probes {
+                        let (ox, oy, oz) = probe_offset(ix, iy, iz, probe_index);
+                        let x = expanded_min.0 + (ix as f64 + ox) * cell_size.0;
+                        let y = expanded_min.1 + (iy as f64 + oy) * cell_size.1;
+                        let z = expanded_min.2 + (iz as f64 + oz) * cell_size.2;
+                        let inside = sample_is_inside(sampler, x, y, z, stats);
+                        if inside != corners_inside {
+                            let cuboid =
+                                CuboidId::new(ix as i32 - 1, iy as i32 - 1, iz as i32 - 1, 0);
+                            let mut entry =
+                                WorkQueueEntry::with_corners(cuboid, cell_corners.map(Some));
+                            entry.probe = Some(DiscoveryProbe {
+                                pos: (x, y, z),
+                                inside,
+                            });
+                            work_queue.push(entry);
+                            break;
+                        }
+                    }
                 }
             }
         }
     }
 
     work_queue
+}
+
+/// Offset in (0, 1)³ for interior probe `index` of stage-1 cell
+/// `(ix, iy, iz)`: the R3 low-discrepancy sequence (irrational per-axis
+/// steps, so probe spacing cannot phase-lock to any periodic geometry),
+/// phase-shifted per cell by a splitmix64 hash so neighboring cells don't
+/// probe congruent positions. Deterministic, so remeshes are reproducible.
+fn probe_offset(ix: usize, iy: usize, iz: usize, index: usize) -> (f64, f64, f64) {
+    // 1/g, 1/g², 1/g³ for g the fourth-degree plastic number (x⁴ = x + 1).
+    const A1: f64 = 0.819_172_513_396_164_5;
+    const A2: f64 = 0.671_043_606_703_789_3;
+    const A3: f64 = 0.549_700_477_901_970_3;
+
+    let mut h = (ix as u64) ^ ((iy as u64) << 21) ^ ((iz as u64) << 42);
+    h = h.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    h = (h ^ (h >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h = (h ^ (h >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    h ^= h >> 31;
+
+    let bits = |shift: u64| ((h >> shift) & 0x1F_FFFF) as f64 / (0x20_0000 as f64);
+    let step = (index + 1) as f64;
+    (
+        (bits(0) + step * A1).fract(),
+        (bits(21) + step * A2).fract(),
+        (bits(42) + step * A3).fract(),
+    )
 }
 
 // =============================================================================
@@ -1255,6 +1347,21 @@ where
         }
     }
 
+    // Which child inherits the parent's discovery probe: compare the probe
+    // position against the parent's world-space center (the shared corner of
+    // all 8 children, at finest-level offset child_scale from the parent
+    // origin).
+    let probe_child_idx = parent.probe.map(|probe| {
+        let center = (
+            bounds_min.0 + (fx + child_scale) as f64 * cell_size.0,
+            bounds_min.1 + (fy + child_scale) as f64 * cell_size.1,
+            bounds_min.2 + (fz + child_scale) as f64 * cell_size.2,
+        );
+        usize::from(probe.pos.0 >= center.0)
+            | (usize::from(probe.pos.1 >= center.1) << 1)
+            | (usize::from(probe.pos.2 >= center.2) << 2)
+    });
+
     // Now extract corners for each child and filter for mixed ones
     let mut result = Vec::with_capacity(8);
 
@@ -1292,8 +1399,23 @@ where
             child_corners[7].unwrap(),
         ]);
 
+        let carries_probe = probe_child_idx == Some(child_idx);
         if mask.is_mixed() {
-            result.push(WorkQueueEntry::with_corners(*child_cuboid, child_corners));
+            let mut entry = WorkQueueEntry::with_corners(*child_cuboid, child_corners);
+            if carries_probe {
+                entry.probe = parent.probe;
+            }
+            result.push(entry);
+        } else if carries_probe {
+            // Corner-uniform child containing the probe: keep descending if
+            // the probe still disagrees with the corners; the evidence is
+            // exhausted once they agree.
+            let probe = parent.probe.expect("carries_probe implies a probe");
+            if probe.inside != child_corners[0].unwrap() {
+                let mut entry = WorkQueueEntry::with_corners(*child_cuboid, child_corners);
+                entry.probe = Some(probe);
+                result.push(entry);
+            }
         }
     }
 
@@ -1467,15 +1589,25 @@ where
     let corner_mask =
         complete_corner_samples(&mut entry, sampler, bounds_min, cell_size, max_depth, stats);
 
-    // Skip if not mixed (all inside or all outside)
-    if !corner_mask.is_mixed() {
-        return ProcessedEntry {
-            new_work: Vec::new(),
-            triangles: Vec::new(),
-        };
-    }
-
     let current_depth = entry.cuboid.depth;
+
+    // Skip if not mixed (all inside or all outside) — unless the entry
+    // carries a still-disagreeing discovery probe, in which case uniform
+    // corners just mean the geometry is thinner than this cell's corner
+    // spacing: subdivide toward the probe until corners turn mixed. A
+    // probe that reaches max depth without that is sub-resolution and is
+    // dropped, same as any feature smaller than the finest cell.
+    if !corner_mask.is_mixed() {
+        let probe_disagrees = entry
+            .probe
+            .is_some_and(|probe| probe.inside != corner_mask.is_inside(0));
+        if !probe_disagrees || current_depth >= max_depth {
+            return ProcessedEntry {
+                new_work: Vec::new(),
+                triangles: Vec::new(),
+            };
+        }
+    }
 
     if current_depth < max_depth {
         // Subdivide and get only mixed children (with all corners sampled)
@@ -2945,7 +3077,11 @@ where
         stage1_coarse_discovery(&sampler, bounds_min_f64, bounds_max_f64, config, &stats);
     let stage1_time = stage1_start.elapsed().as_secs_f64();
     let stage1_samples = stats.total_samples.load(Ordering::Relaxed) - samples_before_stage1;
-    let stage1_mixed_cells = initial_work_queue.len();
+    let stage1_probe_seeds = initial_work_queue
+        .iter()
+        .filter(|entry| entry.probe.is_some())
+        .count();
+    let stage1_mixed_cells = initial_work_queue.len() - stage1_probe_seeds;
 
     if cancel.load(Ordering::Relaxed) {
         return None;
@@ -3038,6 +3174,7 @@ where
         stage1_time_secs: stage1_time,
         stage1_samples,
         stage1_mixed_cells,
+        stage1_probe_seeds,
         stage2_time_secs: stage2_time,
         stage2_samples,
         stage2_cuboids_processed: stage2_cuboids,
@@ -3158,6 +3295,7 @@ mod tests {
         // With base_resolution=4, we should sample 5³ = 125 corner points
         let config = AdaptiveMeshConfig2 {
             base_resolution: 4,
+            discovery_probes: 0,
             ..Default::default()
         };
         let stats = SamplingStats::default();
@@ -3186,6 +3324,7 @@ mod tests {
         // Cell size = 4/4 = 1, so cells at the surface should be detected
         let config = AdaptiveMeshConfig2 {
             base_resolution: 4,
+            discovery_probes: 0,
             ..Default::default()
         };
         let stats = SamplingStats::default();
@@ -3235,6 +3374,7 @@ mod tests {
 
         let config = AdaptiveMeshConfig2 {
             base_resolution: 2,
+            discovery_probes: 0,
             ..Default::default()
         };
         let stats = SamplingStats::default();
@@ -3253,6 +3393,109 @@ mod tests {
             work_queue.is_empty(),
             "Tiny sphere should not create mixed cells at coarse resolution"
         );
+    }
+
+    /// A thin slab sitting entirely between two coarse corner planes: the
+    /// regular grid samples every corner outside, but interior probes catch
+    /// it and seed probe-carrying work entries.
+    fn thin_slab_sampler(_x: f64, _y: f64, z: f64) -> f32 {
+        if z > 0.51 && z < 0.56 { 1.0 } else { 0.0 }
+    }
+
+    #[test]
+    fn probes_seed_geometry_the_corner_grid_misses() {
+        let stats = SamplingStats::default();
+        let blind = AdaptiveMeshConfig2 {
+            base_resolution: 8,
+            discovery_probes: 0,
+            ..Default::default()
+        };
+        let work_queue = stage1_coarse_discovery(
+            &thin_slab_sampler,
+            (0.0, 0.0, 0.0),
+            (1.0, 1.0, 1.0),
+            &blind,
+            &stats,
+        );
+        assert!(
+            work_queue.is_empty(),
+            "corner planes at z = k/8 must all miss the slab in (0.51, 0.56)"
+        );
+
+        let probing = AdaptiveMeshConfig2 {
+            discovery_probes: 8,
+            ..blind
+        };
+        let work_queue = stage1_coarse_discovery(
+            &thin_slab_sampler,
+            (0.0, 0.0, 0.0),
+            (1.0, 1.0, 1.0),
+            &probing,
+            &stats,
+        );
+        assert!(!work_queue.is_empty(), "interior probes must find the slab");
+        for entry in &work_queue {
+            let probe = entry.probe.expect("slab entries can only come from probes");
+            assert!(probe.inside, "probes disagree with all-outside corners");
+            assert!(
+                probe.pos.2 > 0.51 && probe.pos.2 < 0.56,
+                "an inside probe must be inside the slab, got z = {}",
+                probe.pos.2
+            );
+            assert!(!entry.to_corner_mask().is_mixed());
+        }
+    }
+
+    /// End-to-end: probe-guided descent carries the stage-1 evidence down
+    /// (base 2, so corners stay blind for several levels) until corners turn
+    /// mixed, and max-depth frontier expansion then walks the whole slab.
+    #[test]
+    fn probe_guided_descent_meshes_a_slab_between_corner_planes() {
+        let config = AdaptiveMeshConfig2 {
+            base_resolution: 2,
+            max_depth: 4,
+            discovery_probes: 8,
+            ..Default::default()
+        };
+        let result = adaptive_surface_nets_2(
+            thin_slab_sampler,
+            (0.0, 0.0, 0.0),
+            (1.0, 1.0, 1.0),
+            &config,
+        );
+        assert_eq!(result.stats.stage1_mixed_cells, 0, "corners must stay blind");
+        assert!(result.stats.stage1_probe_seeds > 0);
+        assert!(!result.mesh.indices.is_empty(), "slab must be meshed");
+
+        let (mut min, mut max) = ([f32::MAX; 3], [f32::MIN; 3]);
+        for &(x, y, z) in &result.mesh.vertices {
+            for (axis, value) in [x, y, z].into_iter().enumerate() {
+                min[axis] = min[axis].min(value);
+                max[axis] = max[axis].max(value);
+            }
+        }
+        // The slab surface, walked wall to wall by frontier expansion.
+        assert!(min[0] < 0.05 && max[0] > 0.95, "x span {min:?} {max:?}");
+        assert!(min[1] < 0.05 && max[1] > 0.95, "y span {min:?} {max:?}");
+        assert!(
+            min[2] > 0.45 && max[2] < 0.62,
+            "z must hug the slab, got {} .. {}",
+            min[2],
+            max[2]
+        );
+
+        // The same run without probes produces nothing at all.
+        let blind = AdaptiveMeshConfig2 {
+            discovery_probes: 0,
+            ..config
+        };
+        let result = adaptive_surface_nets_2(
+            thin_slab_sampler,
+            (0.0, 0.0, 0.0),
+            (1.0, 1.0, 1.0),
+            &blind,
+        );
+        assert!(result.mesh.indices.is_empty());
     }
 
     #[test]
@@ -3383,6 +3626,7 @@ mod tests {
         // Unit sphere in [-2, 2]³ box
         let config = AdaptiveMeshConfig2 {
             base_resolution: 4,
+            discovery_probes: 0,
             max_depth: 2,
             ..Default::default()
         };
@@ -3600,6 +3844,7 @@ mod tests {
         // Run twice with same input, should get same triangle count
         let config = AdaptiveMeshConfig2 {
             base_resolution: 2,
+            discovery_probes: 0,
             max_depth: 2,
             ..Default::default()
         };
@@ -3653,6 +3898,7 @@ mod tests {
 
         let config = AdaptiveMeshConfig2 {
             base_resolution: 4,
+            discovery_probes: 0,
             max_depth: 2,
             ..Default::default()
         };
@@ -3867,6 +4113,7 @@ mod tests {
         // Run the full pipeline with refinement enabled
         let config = AdaptiveMeshConfig2 {
             base_resolution: 4,
+            discovery_probes: 0,
             max_depth: 2,
             vertex_refinement_iterations: 4,
             normal_sample_iterations: 1,
@@ -3919,6 +4166,7 @@ mod tests {
         // Run with refinement disabled
         let config = AdaptiveMeshConfig2 {
             base_resolution: 4,
+            discovery_probes: 0,
             max_depth: 2,
             vertex_refinement_iterations: 0, // Disabled
             normal_sample_iterations: 0,     // Disabled
@@ -3958,6 +4206,7 @@ mod tests {
         };
         let config = AdaptiveMeshConfig2 {
             base_resolution: 8,
+            discovery_probes: 0,
             max_depth: 1, // 16 cells per axis, cell = 0.0625
             vertex_refinement_iterations: 12,
             edge_constrained_refinement: true,
@@ -3997,6 +4246,7 @@ mod tests {
         // sits on the unit sphere to binary-search precision.
         let config = AdaptiveMeshConfig2 {
             base_resolution: 4,
+            discovery_probes: 0,
             max_depth: 2,
             vertex_refinement_iterations: 12,
             edge_constrained_refinement: true,

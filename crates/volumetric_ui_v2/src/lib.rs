@@ -220,6 +220,15 @@ pub struct Asn2Settings {
     pub simplify: bool,
     /// Decimation error budget, in tenths of the finest cell size (1-30).
     pub simplify_tolerance_tenths: u16,
+    /// Aperiodic interior probes per corner-uniform discovery cell (0
+    /// disables). Catches geometry thinner than the coarse discovery grid's
+    /// pitch — lattice struts sitting between corner samples — that the
+    /// regular scan would silently lose.
+    pub discovery_probes: usize,
+    /// Stage-1 discovery grid override (0 = automatic 6/8 split). A denser
+    /// base spends more up-front samples for more reliable discovery of
+    /// busy geometry at the same finest resolution.
+    pub base_resolution: usize,
 }
 
 impl Default for Asn2Settings {
@@ -232,6 +241,8 @@ impl Default for Asn2Settings {
             edge_constrained_refinement: false,
             simplify: true,
             simplify_tolerance_tenths: 10,
+            discovery_probes: 8,
+            base_resolution: 0,
         }
     }
 }
@@ -336,7 +347,8 @@ impl PreviewMeshPlan {
             PreviewRenderMode::Points => Self::PointCloud { resolution },
             PreviewRenderMode::MarchingCubes => Self::MarchingCubes { resolution },
             PreviewRenderMode::AdaptiveSurfaceNets2 => {
-                let (base_resolution, max_depth) = asn2_resolution_split(resolution);
+                let (base_resolution, max_depth) =
+                    asn2_resolution_split(resolution, asn2.base_resolution);
                 Self::AdaptiveSurfaceNets2 {
                     target_resolution: resolution,
                     base_resolution,
@@ -376,6 +388,7 @@ impl PreviewMeshPlan {
         Some(adaptive_surface_nets_2::AdaptiveMeshConfig2 {
             base_resolution: *base_resolution,
             max_depth: *max_depth,
+            discovery_probes: settings.discovery_probes,
             vertex_refinement_iterations: settings.vertex_refinement_iterations,
             normal_sample_iterations: settings.normal_sample_iterations,
             normal_epsilon_frac: 0.1,
@@ -1059,6 +1072,21 @@ impl VolumetricUiV2 {
             "angle" => {
                 let next = i32::from(asn2.sharp_angle_degrees) + if up { 5 } else { -5 };
                 asn2.sharp_angle_degrees = next.clamp(10, 90) as u16;
+            }
+            "probes" => asn2.discovery_probes = step_usize(asn2.discovery_probes),
+            "base" => {
+                // Discovery grid presets; 0 is the automatic 6/8 split.
+                const BASES: [usize; 8] = [0, 8, 12, 16, 24, 32, 48, 64];
+                let index = BASES
+                    .iter()
+                    .position(|b| *b == asn2.base_resolution)
+                    .unwrap_or(0);
+                let next = if up {
+                    (index + 1).min(BASES.len() - 1)
+                } else {
+                    index.saturating_sub(1)
+                };
+                asn2.base_resolution = BASES[next];
             }
             _ => return,
         }
@@ -3551,6 +3579,21 @@ fn model3d_settings(
                 &asn2.sharp_angle_degrees.to_string(),
             ));
         }
+        // Stage-1 discovery: interior probes catch lattice geometry thinner
+        // than the coarse grid pitch; the base grid can be pinned denser
+        // than the automatic split.
+        body.push(asn2_stepper_row(
+            id,
+            "probes",
+            "Discovery probes",
+            &asn2.discovery_probes.to_string(),
+        ));
+        let base_label = if asn2.base_resolution == 0 {
+            "auto".to_string()
+        } else {
+            asn2.base_resolution.to_string()
+        };
+        body.push(asn2_stepper_row(id, "base", "Discovery grid", &base_label));
     }
 
     // Channel colormap + slice inspection, for models that declare sample
@@ -4765,13 +4808,17 @@ fn parse_step_model_route<'a>(route: &'a str, prefix: &str) -> Option<(usize, us
     Some((step_idx.parse().ok()?, input_idx.parse().ok()?, asset_id))
 }
 
-fn asn2_resolution_split(target_resolution: usize) -> (usize, usize) {
-    let base_resolution =
-        if !target_resolution.is_power_of_two() && target_resolution.is_multiple_of(6) {
-            6
-        } else {
-            8
-        };
+/// Splits a target resolution into (base_resolution, max_depth). A non-zero
+/// `base_override` pins the stage-1 discovery grid (clamped to the target);
+/// otherwise the automatic 6/8 split applies.
+fn asn2_resolution_split(target_resolution: usize, base_override: usize) -> (usize, usize) {
+    let base_resolution = if base_override > 0 {
+        base_override.min(target_resolution)
+    } else if !target_resolution.is_power_of_two() && target_resolution.is_multiple_of(6) {
+        6
+    } else {
+        8
+    };
     let mut max_depth = 0;
     let mut effective_resolution = base_resolution;
     while effective_resolution < target_resolution {
@@ -5728,6 +5775,21 @@ mod tests {
             &mut app,
             UiEvent::synthetic_click(format!("{OUTPUT_ASN2_PREFIX}{id}:simptol:up")),
         );
+        // Discovery probes default to 8; the base grid steps auto -> 8 -> 12.
+        assert_eq!(asn2.discovery_probes, 8);
+        assert_eq!(asn2.base_resolution, 0);
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{OUTPUT_ASN2_PREFIX}{id}:probes:up")),
+        );
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{OUTPUT_ASN2_PREFIX}{id}:base:up")),
+        );
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{OUTPUT_ASN2_PREFIX}{id}:base:up")),
+        );
         assert_eq!(asn2.vertex_refinement_iterations, 7);
         assert_eq!(asn2.sharp_angle_degrees, 20);
 
@@ -5745,6 +5807,11 @@ mod tests {
             .expect("asn2 config");
         assert_eq!(config.vertex_refinement_iterations, 7);
         assert!(config.edge_constrained_refinement);
+        assert_eq!(config.discovery_probes, 9);
+        assert_eq!(
+            config.base_resolution, 12,
+            "base override pins the discovery grid"
+        );
         let sharp = config.sharp_features.expect("sharp features enabled");
         assert!((sharp.segmentation.max_normal_jump_deg - 20.0).abs() < 1e-9);
         let decimation = config.decimation.expect("simplify enabled");

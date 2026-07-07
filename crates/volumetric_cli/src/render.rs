@@ -63,6 +63,11 @@ pub struct RenderArgs {
     #[arg(long, default_value = "4")]
     pub max_depth: usize,
 
+    /// Aperiodic interior probes per corner-uniform discovery cell
+    /// (default: 8, 0 to disable)
+    #[arg(long, default_value = "8")]
+    pub discovery_probes: usize,
+
     /// Vertex refinement iterations
     #[arg(long, default_value = "12")]
     pub vertex_refinement: usize,
@@ -424,6 +429,7 @@ pub fn run_render(args: RenderArgs) -> Result<()> {
     let config = build_mesh_config(
         args.base_resolution,
         args.max_depth,
+        args.discovery_probes,
         args.vertex_refinement,
         args.normal_refinement,
         args.normal_epsilon,

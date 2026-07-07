@@ -1974,10 +1974,15 @@ fn asn2_stage_lines(stats: &volumetric::adaptive_surface_nets_2::MeshingStats2) 
     let ms = |secs: f64| secs * 1000.0;
     let mut lines = vec![
         format!(
-            "S1 discovery {:.1} ms · {} samples · {} cells",
+            "S1 discovery {:.1} ms · {} samples · {} cells{}",
             ms(stats.stage1_time_secs),
             stats.stage1_samples,
-            stats.stage1_mixed_cells
+            stats.stage1_mixed_cells,
+            if stats.stage1_probe_seeds > 0 {
+                format!(" · {} probe seeds", stats.stage1_probe_seeds)
+            } else {
+                String::new()
+            }
         ),
         format!(
             "S2 subdivide {:.1} ms · {} tris",

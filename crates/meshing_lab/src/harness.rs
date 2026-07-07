@@ -49,6 +49,7 @@ pub fn mesh_shape_with_margin(
 
     let config = AdaptiveMeshConfig2 {
         base_resolution: 8,
+        discovery_probes: 8,
         max_depth,
         vertex_refinement_iterations: 12,
         normal_sample_iterations: 0,

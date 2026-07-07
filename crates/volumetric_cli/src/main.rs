@@ -107,6 +107,12 @@ pub struct MeshArgs {
     #[arg(long, default_value = "4")]
     max_depth: usize,
 
+    /// Aperiodic interior probes per corner-uniform discovery cell, catching
+    /// geometry (lattice struts) thinner than the coarse grid pitch
+    /// (default: 8, 0 to disable)
+    #[arg(long, default_value = "8")]
+    discovery_probes: usize,
+
     /// Vertex refinement iterations (default: 12)
     #[arg(long, default_value = "12")]
     vertex_refinement: usize,
@@ -360,6 +366,7 @@ fn print_stats_summary(stats: &MeshingStats2) {
 pub fn build_mesh_config(
     base_resolution: usize,
     max_depth: usize,
+    discovery_probes: usize,
     vertex_refinement: usize,
     normal_refinement: usize,
     normal_epsilon: f32,
@@ -377,6 +384,7 @@ pub fn build_mesh_config(
     AdaptiveMeshConfig2 {
         base_resolution,
         max_depth,
+        discovery_probes,
         vertex_refinement_iterations: vertex_refinement,
         normal_sample_iterations: normal_refinement,
         normal_epsilon_frac: normal_epsilon,
@@ -399,6 +407,7 @@ fn run_mesh(args: MeshArgs) -> Result<()> {
     let config = build_mesh_config(
         args.base_resolution,
         args.max_depth,
+        args.discovery_probes,
         args.vertex_refinement,
         args.normal_refinement,
         args.normal_epsilon,

@@ -45,6 +45,7 @@ fn main() {
     let wasm_bytes = std::fs::read(positional[0]).expect("read wasm");
     let config = AdaptiveMeshConfig2 {
         base_resolution: 8,
+        discovery_probes: 8,
         max_depth,
         vertex_refinement_iterations: 8,
         normal_sample_iterations: 0,

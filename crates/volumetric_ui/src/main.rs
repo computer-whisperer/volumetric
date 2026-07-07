@@ -337,6 +337,7 @@ fn execute_resample(
         ExportRenderMode::AdaptiveSurfaceNets2 => {
             let asn2_config = adaptive_surface_nets_2::AdaptiveMeshConfig2 {
                 base_resolution: config.asn2_base_resolution,
+                discovery_probes: 8,
                 max_depth: config.asn2_max_depth,
                 vertex_refinement_iterations: config.asn2_vertex_refinement_iterations,
                 normal_sample_iterations: config.asn2_normal_sample_iterations,
@@ -457,6 +458,7 @@ fn execute_resample(
         ExportRenderMode::AdaptiveSurfaceNets2 => {
             let asn2_config = adaptive_surface_nets_2::AdaptiveMeshConfig2 {
                 base_resolution: config.asn2_base_resolution,
+                discovery_probes: 8,
                 max_depth: config.asn2_max_depth,
                 vertex_refinement_iterations: config.asn2_vertex_refinement_iterations,
                 normal_sample_iterations: config.asn2_normal_sample_iterations,
