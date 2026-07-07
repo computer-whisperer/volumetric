@@ -11,20 +11,32 @@
 //! surface/rim error metrics and dumps the top-rim chain to rim_chain.csv;
 //! `--debug-rim` (with `--no-sharp`) re-runs the pipeline stages manually and
 //! reports per-vertex snap outcomes for the rim band to rim_debug.txt.
+//!
+//! `--dump-near x,y,z,r` prints final vertices+normals within `r` (inf-norm)
+//! of a point, flagging normals that aren't axis-aligned (useful on cubes).
+//! `--debug-corner x,y,z,r` (with `--no-sharp`) re-runs the sharp stages
+//! manually and reports per-vertex labels/snap outcomes plus the post-weld
+//! triangle-region assignment for the band — the workflow that root-caused
+//! the corner "dog ears" (region-less corner cap triangles).
 
 use glam::DVec3;
 use meshing_lab::render;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use volumetric::adaptive_surface_nets_2::AdaptiveMeshConfig2;
-use volumetric::sharp_features::{SharpFeatureConfig, adjacency, fit, segmentation, snap};
+use volumetric::sharp_features::{SharpFeatureConfig, adjacency, cleanup, fit, segmentation, snap};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let value_positions: Vec<usize> = ["--depth", "--simplify-tolerance"]
-        .iter()
-        .filter_map(|flag| args.iter().position(|a| a == flag).map(|i| i + 1))
-        .collect();
+    let value_positions: Vec<usize> = [
+        "--depth",
+        "--simplify-tolerance",
+        "--dump-near",
+        "--debug-corner",
+    ]
+    .iter()
+    .filter_map(|flag| args.iter().position(|a| a == flag).map(|i| i + 1))
+    .collect();
     let positional: Vec<&String> = args
         .iter()
         .enumerate()
@@ -127,6 +139,272 @@ fn main() {
     }
     let unsealed = edge_mult.values().filter(|&&c| c == 1).count();
     println!("validity: {unsealed} unsealed boundary edges, {degenerate} degenerate tris");
+
+    // Dump vertices+normals near a given point: --dump-near x,y,z,r
+    if let Some(spec) = args
+        .iter()
+        .position(|a| a == "--dump-near")
+        .and_then(|i| args.get(i + 1))
+    {
+        let vals: Vec<f64> = spec.split(',').map(|v| v.parse().unwrap()).collect();
+        let (cx, cy, cz, r) = (vals[0], vals[1], vals[2], vals[3]);
+        let target = DVec3::new(cx, cy, cz);
+        let mut hits: Vec<(usize, DVec3, DVec3)> = positions
+            .iter()
+            .zip(normals.iter())
+            .enumerate()
+            .filter(|(_, (p, _))| (**p - target).abs().max_element() < r)
+            .map(|(i, (p, n))| (i, *p, *n))
+            .collect();
+        hits.sort_by(|a, b| {
+            (b.1.x + b.1.y + b.1.z)
+                .partial_cmp(&(a.1.x + a.1.y + a.1.z))
+                .unwrap()
+        });
+        println!(
+            "--- {} vertices within {r} (inf-norm) of {target:?}:",
+            hits.len()
+        );
+        for (i, p, n) in hits {
+            let ax = n.abs().max_element();
+            let flag = if ax < 0.999 { "  <-- BLENDED" } else { "" };
+            println!(
+                "  v{i:<6} pos=({:+.5},{:+.5},{:+.5}) n=({:+.4},{:+.4},{:+.4}){flag}",
+                p.x, p.y, p.z, n.x, n.y, n.z
+            );
+        }
+    }
+
+    // Re-run the sharp pipeline stage by stage and dump per-stage state
+    // near a point: --debug-corner x,y,z,r  (requires --no-sharp so the
+    // meshed result is the raw stage-4 mesh, exactly what stage 4.5 sees).
+    // The triangle-region report replicates the crease split's INITIAL
+    // assignment (claimed corners + tie-break); the production code then
+    // resolves region-less crease-touching triangles geometrically.
+    if let Some(spec) = args
+        .iter()
+        .position(|a| a == "--debug-corner")
+        .and_then(|i| args.get(i + 1))
+    {
+        assert!(!sharp, "--debug-corner requires --no-sharp");
+        let vals: Vec<f64> = spec.split(',').map(|v| v.parse().unwrap()).collect();
+        let (cx, cy, cz, r) = (vals[0], vals[1], vals[2], vals[3]);
+        let target = DVec3::new(cx, cy, cz);
+        let near = |p: DVec3| (p - target).abs().max_element() < r;
+
+        // Production cell size: padded extent / finest cells (mid-cell pad).
+        let (bmin, bmax) = (result.bounds_min, result.bounds_max);
+        let finest = (8usize << max_depth) as f64;
+        let pad_frac = 2.5 / (finest - 5.0);
+        let cell = [
+            (bmax.0 - bmin.0) as f64,
+            (bmax.1 - bmin.1) as f64,
+            (bmax.2 - bmin.2) as f64,
+        ]
+        .iter()
+        .map(|e| e * (1.0 + 2.0 * pad_frac) / finest)
+        .fold(0.0f64, f64::max);
+        println!("debug-corner: cell={cell:.6} target={target:?} r={r}");
+
+        let sampler_impl = volumetric::wasm::create_parallel_sampler(&wasm_bytes).unwrap();
+        let is_inside = |p: DVec3| -> bool {
+            use volumetric::wasm::ParallelModelSampler;
+            if p.x < bmin.0 as f64
+                || p.x > bmax.0 as f64
+                || p.y < bmin.1 as f64
+                || p.y > bmax.1 as f64
+                || p.z < bmin.2 as f64
+                || p.z > bmax.2 as f64
+            {
+                return false;
+            }
+            sampler_impl.sample(p.x, p.y, p.z) > 0.5
+        };
+
+        let sharp_config = SharpFeatureConfig::default();
+        let adj = adjacency::MeshAdjacency::build(positions.len(), indices);
+        let fits = fit::ring_fits(&positions, &adj, &normals, cell, 1);
+        let seg = segmentation::segment_regions(&adj, &fits, &sharp_config.segmentation);
+        let snapped = snap::snap_feature_vertices(
+            &positions,
+            &adj,
+            &seg.labels,
+            cell,
+            &sharp_config.snap,
+            Some(&is_inside),
+        );
+
+        // Name regions by their mean carried normal (cube faces -> axes).
+        let mut region_normal: Vec<DVec3> = vec![DVec3::ZERO; seg.region_count];
+        for v in 0..positions.len() {
+            if let Some(l) = seg.labels[v] {
+                region_normal[l as usize] += normals[v];
+            }
+        }
+        let region_name = |l: u32| -> String {
+            let n = region_normal[l as usize].normalize_or_zero();
+            let names = ["+x", "+y", "+z"];
+            let mut best = (0.0f64, "??".to_string());
+            for (i, nm) in names.iter().enumerate() {
+                let c = n[i];
+                if c.abs() > best.0.abs() {
+                    best = (
+                        c,
+                        if c > 0.0 {
+                            nm.to_string()
+                        } else {
+                            nm.replace('+', "-")
+                        },
+                    );
+                }
+            }
+            format!("{}({})", best.1, l)
+        };
+
+        println!(
+            "snap stats: candidates {} snapped {}e+{}c fallbacks {} rejects: sides {} parallel {} move {} verify {} nonfinite {}",
+            snapped.stats.candidates,
+            snapped.stats.snapped_edges,
+            snapped.stats.snapped_corners,
+            snapped.stats.corner_fallbacks,
+            snapped.stats.rejected_sides,
+            snapped.stats.rejected_parallel,
+            snapped.stats.rejected_move,
+            snapped.stats.rejected_verify,
+            snapped.stats.rejected_nonfinite,
+        );
+
+        // Per-vertex: stage-4 state -> snap outcome.
+        let mut band: Vec<usize> = (0..positions.len())
+            .filter(|&v| near(positions[v]) || near(snapped.positions[v]))
+            .collect();
+        band.sort_by(|&a, &b| {
+            let (pa, pb) = (snapped.positions[a], snapped.positions[b]);
+            (pb.x + pb.y + pb.z)
+                .partial_cmp(&(pa.x + pa.y + pa.z))
+                .unwrap()
+        });
+        println!("--- {} stage-4 vertices in band:", band.len());
+        for &v in &band {
+            let p = positions[v];
+            let q = snapped.positions[v];
+            let fit_res = fits[v]
+                .as_ref()
+                .map(|f| format!("{:.3}", f.residual_cells))
+                .unwrap_or_else(|| "nofit".into());
+            let label = match seg.labels[v] {
+                Some(l) => region_name(l),
+                None => "UNCLAIMED".into(),
+            };
+            let kind = match snapped.snapped[v] {
+                Some(snap::SnapKind::Edge) => "edge",
+                Some(snap::SnapKind::Corner) => "CORNER",
+                None => "-",
+            };
+            println!(
+                "  v{v:<6} p=({:+.5},{:+.5},{:+.5}) fit={fit_res:<6} label={label:<10} snap={kind:<6} moved={:.3}c -> ({:+.5},{:+.5},{:+.5})",
+                p.x,
+                p.y,
+                p.z,
+                (q - p).length() / cell,
+                q.x,
+                q.y,
+                q.z,
+            );
+        }
+
+        // Weld + carry, exactly as apply_sharp_features does.
+        let cleaned = cleanup::weld_snapped_vertices(
+            &snapped.positions,
+            indices,
+            &snapped.snapped,
+            cell,
+            &sharp_config.cleanup,
+        );
+        let mut welded_normals = vec![DVec3::ZERO; cleaned.positions.len()];
+        let mut welded_labels: Vec<Option<u32>> = vec![None; cleaned.positions.len()];
+        let mut is_crease = vec![false; cleaned.positions.len()];
+        for v in 0..positions.len() {
+            let out = cleaned.remap[v] as usize;
+            welded_normals[out] += normals[v];
+            if let Some(label) = seg.labels[v] {
+                welded_labels[out] = Some(label);
+            }
+            if snapped.snapped[v].is_some() {
+                is_crease[out] = true;
+            }
+        }
+
+        // Replicate the crease-split triangle-region assignment (the tie-break
+        // in split_crease_vertices) and report it for band triangles.
+        println!("--- post-weld band triangles (region assignment):");
+        for (t, tri) in cleaned.indices.chunks_exact(3).enumerate() {
+            let (a, b, c) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+            if !(near(cleaned.positions[a])
+                && near(cleaned.positions[b])
+                && near(cleaned.positions[c]))
+            {
+                continue;
+            }
+            let mut candidates: Vec<(u32, DVec3)> = Vec::new();
+            for &v in tri {
+                if let Some(label) = welded_labels[v as usize] {
+                    match candidates.iter_mut().find(|(l, _)| *l == label) {
+                        Some((_, n)) => *n += welded_normals[v as usize],
+                        None => candidates.push((label, welded_normals[v as usize])),
+                    }
+                }
+            }
+            let face = (cleaned.positions[b] - cleaned.positions[a])
+                .cross(cleaned.positions[c] - cleaned.positions[a]);
+            let fn_unit = face.normalize_or_zero();
+            let assigned = match candidates.len() {
+                0 => "NONE(base-slot)".to_string(),
+                1 => region_name(candidates[0].0),
+                _ => {
+                    let winner = candidates
+                        .iter()
+                        .max_by(|(_, na), (_, nb)| {
+                            let da = face.dot(na.normalize_or_zero());
+                            let db = face.dot(nb.normalize_or_zero());
+                            da.total_cmp(&db)
+                        })
+                        .map(|&(l, _)| l)
+                        .unwrap();
+                    let opts: Vec<String> = candidates
+                        .iter()
+                        .map(|&(l, n)| {
+                            format!(
+                                "{}:{:+.2}",
+                                region_name(l),
+                                fn_unit.dot(n.normalize_or_zero())
+                            )
+                        })
+                        .collect();
+                    format!("TIE[{}]=>{}", opts.join(" "), region_name(winner))
+                }
+            };
+            let crease_corners: Vec<String> = tri
+                .iter()
+                .map(|&v| {
+                    let m = if is_crease[v as usize] { "*" } else { "" };
+                    let l = match welded_labels[v as usize] {
+                        Some(l) => region_name(l),
+                        None => "UNCL".into(),
+                    };
+                    format!("v{v}{m}({l})")
+                })
+                .collect();
+            println!(
+                "  t{t:<6} fn=({:+.2},{:+.2},{:+.2}) {} corners: {}",
+                fn_unit.x,
+                fn_unit.y,
+                fn_unit.z,
+                assigned,
+                crease_corners.join(" "),
+            );
+        }
+    }
 
     // Optional exact-truth check for a z-aligned cylinder (r=1, z in 0..1):
     // per-vertex distance to the true surface, plus rim-band accuracy.

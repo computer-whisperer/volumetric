@@ -80,6 +80,80 @@ pub fn split_crease_vertices(
         tri_region.push(region);
     }
 
+    // Region-less triangles that touch a crease vertex would otherwise keep
+    // referencing base slots — aliasing their face into whichever region
+    // reuses each slot, and starving the vertex of a copy for the face the
+    // triangle actually lies on. The canonical case is a corner cap whose
+    // three corners are all unclaimed feature-band vertices (a cube corner
+    // welds to corner + two edge vertices; one face's cap triangle survives
+    // with no claimed corner). Resolve each against the assigned triangles
+    // around its corners: the region whose nearby face normals best agree
+    // with its own wins. Sweeping to fixpoint lets multi-triangle pockets
+    // resolve from their rim inward.
+    //
+    // The agreement gate is strict: a triangle genuinely lying on a region's
+    // face scores near 1 against that region's neighboring face normals,
+    // while the crumpled fold triangles that corner pockets also contain
+    // (see the folded-sliver debt) score well below it in every direction —
+    // assigning those would mint copies whose re-derived normals are pure
+    // fold noise, worse than the base-slot blend they have today. Folds,
+    // zero-area slivers, and triangles with no assigned neighbor anywhere
+    // stay region-less and keep the base-slot behavior.
+    const MIN_RESOLVE_DOT: f64 = 0.9;
+    let mut vertex_tris: Vec<Vec<u32>> = vec![Vec::new(); positions.len()];
+    for (t, tri) in indices.chunks_exact(3).enumerate() {
+        for &v in tri {
+            vertex_tris[v as usize].push(t as u32);
+        }
+    }
+    loop {
+        let mut changed = false;
+        for (t, tri) in indices.chunks_exact(3).enumerate() {
+            if tri_region[t].is_some() || !tri.iter().any(|&v| is_crease[v as usize]) {
+                continue;
+            }
+            let (a, b, c) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+            let Some(face) = (positions[b] - positions[a])
+                .cross(positions[c] - positions[a])
+                .try_normalize()
+            else {
+                continue;
+            };
+            let mut neighbors: Vec<u32> = tri
+                .iter()
+                .flat_map(|&v| vertex_tris[v as usize].iter().copied())
+                .collect();
+            neighbors.sort_unstable();
+            neighbors.dedup();
+            let mut candidates: Vec<(u32, DVec3)> = Vec::new();
+            for &u in &neighbors {
+                let Some(label) = tri_region[u as usize] else {
+                    continue;
+                };
+                let utri = &indices[u as usize * 3..u as usize * 3 + 3];
+                let (ua, ub, uc) = (utri[0] as usize, utri[1] as usize, utri[2] as usize);
+                let un = (positions[ub] - positions[ua]).cross(positions[uc] - positions[ua]);
+                match candidates.iter_mut().find(|(l, _)| *l == label) {
+                    Some((_, n)) => *n += un,
+                    None => candidates.push((label, un)),
+                }
+            }
+            let best = candidates
+                .iter()
+                .map(|&(l, n)| (l, face.dot(n.normalize_or_zero())))
+                .max_by(|(_, da), (_, db)| da.total_cmp(db));
+            if let Some((label, dot)) = best {
+                if dot > MIN_RESOLVE_DOT {
+                    tri_region[t] = Some(label);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
     // First pass: which regions touch each crease vertex (sorted for
     // deterministic copy order; the first region reuses the base slot).
     let mut vertex_regions: Vec<Vec<u32>> = vec![Vec::new(); positions.len()];
@@ -293,6 +367,100 @@ mod tests {
             unsigned_angle_degrees(result.normals[4].normalize(), DVec3::X) < 1e-9,
             "right-face neighbor should re-accumulate the x-plane normal"
         );
+    }
+
+    /// The post-weld fan at a cube corner: three mutually perpendicular
+    /// faces (+X, +Y, +Z) meeting at corner K, with the unclaimed feature
+    /// band welded down to K plus one vertex per edge (Ex, Ey, Ez — all
+    /// crease, all label-less). Each face keeps one claimed interior vertex
+    /// (Dx, Dy, Dz). The quad diagonalization leaves the +X face with a cap
+    /// triangle (K, Ey, Ex) whose corners are all unclaimed — the triangle
+    /// that used to stay region-less, alias into the base slot, and shade
+    /// the corner with a cross-face blended normal (the "dog ears" bug).
+    #[test]
+    fn corner_cap_triangle_resolves_to_its_face() {
+        let k = DVec3::new(1.0, 1.0, 1.0);
+        let positions = vec![
+            k,                         // 0: K corner (crease)
+            DVec3::new(1.0, 1.0, 0.9), // 1: Ex, edge x=1,y=1 (crease)
+            DVec3::new(1.0, 0.9, 1.0), // 2: Ey, edge x=1,z=1 (crease)
+            DVec3::new(0.9, 1.0, 1.0), // 3: Ez, edge y=1,z=1 (crease)
+            DVec3::new(1.0, 0.9, 0.9), // 4: Dx, +X face interior
+            DVec3::new(0.9, 1.0, 0.9), // 5: Dy, +Y face interior
+            DVec3::new(0.9, 0.9, 1.0), // 6: Dz, +Z face interior
+        ];
+        let indices = vec![
+            4, 1, 2, // +X face, claimed corner Dx
+            0, 2, 1, // +X cap: all corners unclaimed crease vertices
+            5, 0, 1, // +Y face
+            5, 3, 0, // +Y face
+            6, 0, 3, // +Z face
+            6, 2, 0, // +Z face
+        ];
+        let labels = vec![None, None, None, None, Some(0), Some(1), Some(2)];
+        let is_crease = vec![true, true, true, true, false, false, false];
+        // Carried normals: blended for the feature band, face-true inside.
+        let carried = vec![
+            DVec3::ONE.normalize(),
+            DVec3::new(1.0, 1.0, 0.0).normalize(),
+            DVec3::new(1.0, 0.0, 1.0).normalize(),
+            DVec3::new(0.0, 1.0, 1.0).normalize(),
+            DVec3::X,
+            DVec3::Y,
+            DVec3::Z,
+        ];
+        let result =
+            split_crease_vertices(&positions, &carried, &indices, &labels, &is_crease, 0.1);
+
+        // The corner must shade all three faces: three K copies, one per
+        // region, each carrying that face's axis normal. Without the
+        // region-less resolution K gets two copies, one of them a blend.
+        let k_slots: Vec<usize> = (0..result.positions.len())
+            .filter(|&v| result.positions[v] == k)
+            .collect();
+        assert_eq!(k_slots.len(), 3, "corner needs one copy per face");
+        for axis in [DVec3::X, DVec3::Y, DVec3::Z] {
+            assert!(
+                k_slots.iter().any(|&v| {
+                    unsigned_angle_degrees(result.normals[v].normalize(), axis) < 1e-6
+                }),
+                "no corner copy shades the {axis:?} face: {:?}",
+                k_slots
+                    .iter()
+                    .map(|&v| result.normals[v].normalize())
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        // The cap's corners reference the same copies as the face triangle's
+        // crease corners: the +X face shades seamlessly.
+        let face_tri = &result.indices[0..3];
+        let cap_tri = &result.indices[3..6];
+        assert_eq!(face_tri[1], cap_tri[2], "Ex shared between cap and face");
+        assert_eq!(face_tri[2], cap_tri[1], "Ey shared between cap and face");
+    }
+
+    /// A crumpled fold triangle across the crease (all corners unclaimed,
+    /// face normal ~45 degrees off both adjacent faces — the folded-sliver
+    /// family that survives with real area at corner pockets) must NOT be
+    /// resolved to either region: assigning it would mint a copy whose
+    /// re-derived normal is fold noise. It stays on base slots.
+    #[test]
+    fn fold_triangle_stays_region_less() {
+        let (mut positions, mut indices, mut labels, mut is_crease) = crease_mesh();
+        positions.push(DVec3::new(1.05, 0.5, 0.05)); // 6: fold apex off both planes
+        labels.push(None);
+        is_crease.push(true);
+        indices.extend_from_slice(&[2, 6, 3]); // fold: c0, apex, c1 — all unclaimed
+        let carried = vec![DVec3::ONE; positions.len()];
+        let result =
+            split_crease_vertices(&positions, &carried, &indices, &labels, &is_crease, 1.0);
+
+        // Same copies as without the fold: no region resolved for it.
+        assert_eq!(result.split_vertices, 2);
+        // The fold triangle still references the base slots.
+        let fold = &result.indices[12..15];
+        assert_eq!(fold, &[2, 6, 3], "fold must keep base slots, got {fold:?}");
     }
 
     #[test]
