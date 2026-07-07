@@ -2361,6 +2361,27 @@ fn build_fea_mesh_preview(
         }
     }
 
+    // Bar2 strut meshes have no boundary faces: draw every strut as a line
+    // segment, colored by the chosen field (until dedicated capsule
+    // rendering lands).
+    if mesh.element_kind == volumetric::fea::FeaElementKind::Bar2 {
+        for e in 0..mesh.element_count() {
+            let [a, b] = [mesh.element(e)[0], mesh.element(e)[1]];
+            let color = match &color_source {
+                Some(ColorSource::Element(values)) => color_for(values[e]),
+                Some(ColorSource::Node(values)) => {
+                    color_for(0.5 * (values[a as usize] + values[b as usize]))
+                }
+                None => [0.75, 0.8, 0.9, 1.0],
+            };
+            segments.push(renderer::LineSegment {
+                start: position(a),
+                end: position(b),
+                color,
+            });
+        }
+    }
+
     let mut bounds = PreviewBounds {
         min: (f32::INFINITY, f32::INFINITY, f32::INFINITY),
         max: (f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY),
@@ -2385,12 +2406,20 @@ fn build_fea_mesh_preview(
         };
     }
 
-    let mut detail = vec![format!(
-        "FEA mesh: {} nodes · {} elements · {} boundary faces",
-        mesh.node_count(),
-        mesh.element_count(),
-        faces.len()
-    )];
+    let mut detail = vec![if mesh.element_kind == volumetric::fea::FeaElementKind::Bar2 {
+        format!(
+            "FEA strut mesh: {} nodes · {} struts",
+            mesh.node_count(),
+            mesh.element_count()
+        )
+    } else {
+        format!(
+            "FEA mesh: {} nodes · {} elements · {} boundary faces",
+            mesh.node_count(),
+            mesh.element_count(),
+            faces.len()
+        )
+    }];
     detail.extend(extra_detail);
     let stats = OutputStats {
         triangles: vertices.len() / 3,
@@ -2401,14 +2430,16 @@ fn build_fea_mesh_preview(
     };
 
     let mut scene = renderer::SceneData::new();
-    scene.add_mesh(
-        renderer::MeshData {
-            vertices,
-            indices: None,
-        },
-        glam::Mat4::IDENTITY,
-        renderer::MaterialId(0),
-    );
+    if !vertices.is_empty() {
+        scene.add_mesh(
+            renderer::MeshData {
+                vertices,
+                indices: None,
+            },
+            glam::Mat4::IDENTITY,
+            renderer::MaterialId(0),
+        );
+    }
 
     Ok(PreviewEntity {
         scene,
@@ -2927,6 +2958,56 @@ mod tests {
             (entity.bounds.max.2 - 2.0).abs() < 1e-6,
             "exaggerated deformation missing: max z = {}",
             entity.bounds.max.2
+        );
+    }
+
+    #[test]
+    fn bar2_preview_draws_struts_as_lines() {
+        use volumetric::fea::{FeaElementKind, FeaField, FeaMesh, encode_fea_mesh};
+        let mesh = FeaMesh {
+            element_kind: FeaElementKind::Bar2,
+            node_positions: vec![
+                0.0, 0.0, 0.0, //
+                1.0, 0.0, 0.0, //
+                1.0, 1.0, 0.0,
+            ],
+            connectivity: vec![0, 1, 1, 2],
+            node_fields: vec![],
+            element_fields: vec![FeaField {
+                name: "radius".to_string(),
+                components: 1,
+                data: vec![0.1, 0.2],
+            }],
+        };
+        let mut request = fea_request(PreviewPlan::FeaMesh {
+            deformed: false,
+            exaggeration_tenths: 10,
+            color_field: Some("element:radius".to_string()),
+        });
+        request.data = Arc::new(encode_fea_mesh(&mesh));
+        let entity = build_preview_scene(&request).expect("bar2 preview builds");
+
+        // No boundary faces, so no triangle soup — just strut lines.
+        assert!(entity.scene.meshes.is_empty());
+        let lines = entity.wireframe_lines.expect("strut preview has lines");
+        assert_eq!(lines.segments.len(), 2);
+        assert_ne!(
+            lines.segments[0].color, lines.segments[1].color,
+            "element colormap should tint the two struts differently"
+        );
+        assert!(
+            entity
+                .stats
+                .detail
+                .iter()
+                .any(|line| line.contains("2 struts")),
+            "strut count missing from stats: {:?}",
+            entity.stats.detail
+        );
+        assert_eq!(
+            entity.stats.fea_fields,
+            vec!["element:radius".to_string()],
+            "radius should be offered as a colormap field"
         );
     }
 

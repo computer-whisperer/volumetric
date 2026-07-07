@@ -7,6 +7,11 @@
 //! attribute arrays, CBOR-encoded with [`encode_fea_mesh`]. Hosts never hand
 //! it to the model executor.
 //!
+//! Meshes are homogeneous in element kind. [`FeaElementKind::Hex8`] volume
+//! meshes come from `fea_grid_mesh_operator`; [`FeaElementKind::Bar2`] line
+//! meshes are explicit strut lattices (two nodes per strut, cross-section
+//! carried in element fields such as a scalar `radius`).
+//!
 //! # Hex8 node ordering
 //!
 //! [`FeaElementKind::Hex8`] uses the VTK hexahedron convention. For an
@@ -26,6 +31,11 @@
 pub enum FeaElementKind {
     /// 8-node linear hexahedron (VTK ordering, see module docs).
     Hex8,
+    /// 2-node line element: a strut/beam between two nodes. A Bar2 mesh is
+    /// how an explicit strut lattice flows between operators; per-element
+    /// cross-section data (e.g. a scalar `radius` field) rides in
+    /// `element_fields`.
+    Bar2,
 }
 
 impl FeaElementKind {
@@ -33,6 +43,7 @@ impl FeaElementKind {
     pub fn node_count(self) -> usize {
         match self {
             FeaElementKind::Hex8 => 8,
+            FeaElementKind::Bar2 => 2,
         }
     }
 }
@@ -127,6 +138,17 @@ impl FeaMesh {
                 "connectivity references node {bad} but the mesh has {node_count} nodes"
             ));
         }
+        if self.element_kind == FeaElementKind::Bar2 {
+            for e in 0..self.element_count() {
+                let element = self.element(e);
+                if element[0] == element[1] {
+                    return Err(format!(
+                        "Bar2 element {e} is a self-loop on node {}",
+                        element[0]
+                    ));
+                }
+            }
+        }
 
         validate_fields("node", &self.node_fields, node_count)?;
         validate_fields("element", &self.element_fields, self.element_count())?;
@@ -140,7 +162,13 @@ impl FeaMesh {
     /// Interior faces (shared by two elements) cancel; a valid conforming
     /// mesh never has a face used more than twice, but if one appears (a
     /// malformed mesh) it is treated as interior and dropped.
+    ///
+    /// Only volume elements have faces: non-Hex8 meshes return no quads
+    /// (Bar2 meshes are drawn from their elements directly).
     pub fn boundary_faces(&self) -> Vec<(u32, [u32; 4])> {
+        if self.element_kind != FeaElementKind::Hex8 {
+            return Vec::new();
+        }
         let mut faces: std::collections::HashMap<[u32; 4], (u32, u32, [u32; 4])> =
             std::collections::HashMap::new();
         for e in 0..self.element_count() {
@@ -307,6 +335,56 @@ mod tests {
             data: vec![0.0; 12],
         });
         assert!(mesh.validate().is_err());
+    }
+
+    /// A 4-strut Bar2 square with one diagonal (5 nodes, unit cell in z=0).
+    fn strut_mesh() -> FeaMesh {
+        FeaMesh {
+            element_kind: FeaElementKind::Bar2,
+            node_positions: vec![
+                0.0, 0.0, 0.0, //
+                1.0, 0.0, 0.0, //
+                1.0, 1.0, 0.0, //
+                0.0, 1.0, 0.0, //
+                0.5, 0.5, 0.0,
+            ],
+            connectivity: vec![0, 1, 1, 2, 2, 3, 3, 0, 0, 4],
+            node_fields: vec![],
+            element_fields: vec![],
+        }
+    }
+
+    #[test]
+    fn bar2_meshes_round_trip_and_validate() {
+        let mut mesh = strut_mesh();
+        mesh.element_fields.push(FeaField {
+            name: "radius".to_string(),
+            components: 1,
+            data: vec![0.1; 5],
+        });
+        let decoded = decode_fea_mesh(&encode_fea_mesh(&mesh)).unwrap();
+        assert_eq!(decoded, mesh);
+        assert_eq!(decoded.node_count(), 5);
+        assert_eq!(decoded.element_count(), 5);
+        assert_eq!(decoded.element(4), &[0, 4]);
+        // Line meshes have no boundary faces.
+        assert!(decoded.boundary_faces().is_empty());
+    }
+
+    #[test]
+    fn bar2_validation_rejects_malformed_meshes() {
+        let mut mesh = strut_mesh();
+        mesh.connectivity.pop(); // partial strut
+        assert!(mesh.validate().is_err());
+
+        let mut mesh = strut_mesh();
+        mesh.connectivity[1] = 9; // out-of-range node
+        assert!(mesh.validate().is_err());
+
+        let mut mesh = strut_mesh();
+        mesh.connectivity[3] = mesh.connectivity[2]; // self-loop
+        let err = mesh.validate().unwrap_err();
+        assert!(err.contains("self-loop"), "unexpected error: {err}");
     }
 
     #[test]

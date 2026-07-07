@@ -72,7 +72,13 @@ pub fn build_payload(
     skin: Option<f64>,
 ) -> Result<Vec<u8>, String> {
     mesh.validate()?;
-    let FeaElementKind::Hex8 = mesh.element_kind;
+    if mesh.element_kind != FeaElementKind::Hex8 {
+        return Err(format!(
+            "deformation needs a Hex8 volume mesh, got {:?} elements \
+             (a strut lattice doesn't fill space)",
+            mesh.element_kind
+        ));
+    }
     let element_count = mesh.element_count();
     if element_count == 0 {
         return Err("mesh has no elements".to_string());

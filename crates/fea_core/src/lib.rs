@@ -1,13 +1,19 @@
-//! Linear-elastic FEA solve on uniform hex8 grids, with active-set contact
-//! against a rigid implicit body.
+//! Linear-elastic FEA solve with active-set contact against a rigid
+//! implicit body, over two element formulations:
 //!
-//! Scope (deliberately v1, matching the printed-cushion pipeline):
-//! - The mesh must be an axis-aligned uniform hex grid (what
-//!   `fea_grid_mesh_operator` emits): one shared element stiffness matrix,
-//!   optionally scaled per element by a `stiffness_scale` element field —
-//!   the SIMP-style knob the inverse-design loop will drive.
+//! - **Hex8 grids** (what `fea_grid_mesh_operator` emits): the mesh must be
+//!   an axis-aligned uniform hex grid — one shared element stiffness
+//!   matrix, optionally scaled per element by a `stiffness_scale` element
+//!   field, the SIMP-style knob the inverse-design loop drives.
+//! - **Bar2 strut lattices**: each element is a 3D Euler-Bernoulli frame
+//!   member (circular section, radius from the mesh's `radius` element
+//!   field, 6 dofs per node), so the solve sees the actual strut network —
+//!   including the bending-dominated response a solid-element model can't
+//!   represent. `stiffness_scale` multiplies a strut's Young's modulus.
+//!
+//! Shared scope (deliberately v1, matching the printed-cushion pipeline):
 //! - Small-displacement Hooke's law (isotropic E, nu). Quantitatively wrong
-//!   for foam at seat strains; fine for relative density assignment.
+//!   for foam at seat strains; fine for relative property assignment.
 //! - Quasi-static single pose. The rigid body is sampled where the user
 //!   placed it (already interpenetrating the mesh = the pressed pose).
 //! - Contact presses toward the glued face: the contact axis is the
@@ -23,6 +29,7 @@
 //! gradient over the free dofs.
 
 pub mod element;
+pub mod frame;
 pub mod inverse;
 
 pub use element::{ElementStiffness, Material, cube_stiffness, hex8_stiffness};
@@ -133,11 +140,15 @@ pub struct SolveStats {
 pub struct SolveResult {
     /// Per-node displacement, xyz interleaved.
     pub displacement: Vec<f64>,
+    /// Per-node rotation, xyz interleaved — `Some` for element kinds with
+    /// rotational dofs (Bar2 frames), `None` for Hex8.
+    pub rotation: Option<Vec<f64>>,
     /// Per-node force applied by the rigid body (nonzero only on the active
     /// contact set), xyz interleaved. Along the contact axis the sign
     /// presses toward the glued face.
     pub contact_force: Vec<f64>,
-    /// Per-element strain energy per unit volume.
+    /// Per-element strain energy per unit element volume (cell volume for
+    /// Hex8, strut volume `A * L` for Bar2).
     pub strain_energy_density: Vec<f64>,
     pub stats: SolveStats,
 }
@@ -159,6 +170,12 @@ const CELL_CORNERS: [[f64; 3]; 8] = [
 /// Public because grid consumers beyond the solver (e.g. the density
 /// extractor's cell-grid reconstruction) share the same contract.
 pub fn detect_uniform_grid(mesh: &FeaMesh) -> Result<f64, String> {
+    if mesh.element_kind != FeaElementKind::Hex8 {
+        return Err(format!(
+            "expected a Hex8 grid mesh, got {:?} elements",
+            mesh.element_kind
+        ));
+    }
     if mesh.element_count() == 0 {
         return Err("mesh has no elements".to_string());
     }
@@ -209,15 +226,38 @@ pub(crate) fn stiffness_scales(mesh: &FeaMesh) -> Result<Vec<f64>, String> {
     Ok(field.data.clone())
 }
 
-/// y = K x (matrix-free over elements), then constrained components zeroed.
-struct Operator<'a> {
-    mesh: &'a FeaMesh,
-    ke: &'a ElementStiffness,
-    scales: &'a [f64],
-    constrained: &'a [bool],
+/// The assembled stiffness action of one mesh under a concrete element
+/// formulation — everything the contact driver needs that depends on the
+/// element kind.
+trait StiffnessModel {
+    /// Degrees of freedom per node (3 for Hex8, 6 for Bar2 frames). The
+    /// first three dofs of a node are always its xyz translations.
+    fn dofs_per_node(&self) -> usize;
+    /// y = K x, unmasked (matrix-free over elements).
+    fn apply(&self, x: &[f64], y: &mut [f64]);
+    /// The assembled diagonal of K, for Jacobi preconditioning.
+    fn diagonal(&self) -> Vec<f64>;
+    /// Per-element strain energy per unit element volume at solution `u`.
+    fn energy_density(&self, u: &[f64]) -> Vec<f64>;
+    /// Characteristic element length: sets the contact scan step and the
+    /// fixed-face/slack tolerances.
+    fn length_scale(&self) -> f64;
 }
 
-impl Operator<'_> {
+/// Uniform-grid hex8 stiffness: one shared element matrix, scaled per
+/// element by `stiffness_scale`.
+struct HexModel<'a> {
+    mesh: &'a FeaMesh,
+    ke: ElementStiffness,
+    scales: Vec<f64>,
+    h: f64,
+}
+
+impl StiffnessModel for HexModel<'_> {
+    fn dofs_per_node(&self) -> usize {
+        3
+    }
+
     fn apply(&self, x: &[f64], y: &mut [f64]) {
         y.fill(0.0);
         for e in 0..self.mesh.element_count() {
@@ -245,40 +285,77 @@ impl Operator<'_> {
                 }
             }
         }
-        for (v, constrained) in y.iter_mut().zip(self.constrained) {
-            if *constrained {
-                *v = 0.0;
-            }
-        }
     }
 
-    /// K u without masking (for constraint reactions).
-    fn apply_unmasked(&self, x: &[f64], y: &mut [f64]) {
-        let unmasked = Operator {
-            constrained: &[],
-            ..*self
-        };
-        // An empty mask slice means "nothing constrained": zip stops at the
-        // shorter side.
-        unmasked.apply(x, y);
+    fn diagonal(&self) -> Vec<f64> {
+        let mut diag = vec![0.0f64; self.mesh.node_count() * 3];
+        for e in 0..self.mesh.element_count() {
+            let nodes = self.mesh.element(e);
+            for (i, node) in nodes.iter().enumerate() {
+                for c in 0..3 {
+                    diag[*node as usize * 3 + c] += self.scales[e] * self.ke[i * 3 + c][i * 3 + c];
+                }
+            }
+        }
+        diag
+    }
+
+    fn energy_density(&self, u: &[f64]) -> Vec<f64> {
+        // (1/2) u_e^T K_e u_e / h^3 per element.
+        let volume = self.h * self.h * self.h;
+        let mut out = Vec::with_capacity(self.mesh.element_count());
+        for e in 0..self.mesh.element_count() {
+            let nodes = self.mesh.element(e);
+            let mut ue = [0.0f64; 24];
+            for (i, node) in nodes.iter().enumerate() {
+                let base = *node as usize * 3;
+                ue[i * 3] = u[base];
+                ue[i * 3 + 1] = u[base + 1];
+                ue[i * 3 + 2] = u[base + 2];
+            }
+            let mut energy = 0.0;
+            for (i, uei) in ue.iter().enumerate() {
+                let row = &self.ke[i];
+                let mut sum = 0.0;
+                for (j, uej) in ue.iter().enumerate() {
+                    sum += row[j] * uej;
+                }
+                energy += uei * sum;
+            }
+            out.push(0.5 * self.scales[e] * energy / volume);
+        }
+        out
+    }
+
+    fn length_scale(&self) -> f64 {
+        self.h
     }
 }
 
 /// Jacobi-preconditioned CG for `K u = 0` with Dirichlet values already
 /// written into `u`. Returns (iterations, converged).
 fn solve_cg(
-    op: &Operator<'_>,
+    model: &dyn StiffnessModel,
+    constrained: &[bool],
     diag: &[f64],
     u: &mut [f64],
     tolerance: f64,
     max_iterations: usize,
 ) -> (usize, bool) {
     let n = u.len();
+    let masked_apply = |x: &[f64], y: &mut [f64]| {
+        model.apply(x, y);
+        for (v, c) in y.iter_mut().zip(constrained) {
+            if *c {
+                *v = 0.0;
+            }
+        }
+    };
     let mut r = vec![0.0; n];
     // r = -K u on free dofs (external forces are zero; Dirichlet drives).
-    op.apply_unmasked(u, &mut r);
+    model.apply(u, &mut r);
     for i in 0..n {
-        r[i] = if op.constrained[i] { 0.0 } else { -r[i] };
+        r[i] = if constrained[i] { 0.0 } else { -r[i] };
     }
 
     let norm0: f64 = r.iter().map(|v| v * v).sum::<f64>().sqrt();
@@ -300,7 +377,7 @@ fn solve_cg(
     let mut rz: f64 = r.iter().zip(&z).map(|(a, b)| a * b).sum();
 
     for iteration in 0..max_iterations {
-        op.apply(&p, &mut kp);
+        masked_apply(&p, &mut kp);
         let pkp: f64 = p.iter().zip(&kp).map(|(a, b)| a * b).sum();
         if pkp <= 0.0 {
             // Singular or indefinite (e.g. unconstrained mesh): bail out
@@ -373,15 +450,13 @@ fn rigid_contact_surface(
     Ok(0.5 * (lo + hi))
 }
 
-/// Solve the compression problem. See the module docs for scope.
+/// Solve the compression problem. See the module docs for scope; the
+/// element formulation is picked by the mesh's element kind.
 pub fn solve(
     mesh: &FeaMesh,
     rigid: &mut dyn RigidBody,
     config: &SolveConfig,
 ) -> Result<SolveResult, String> {
-    if mesh.element_kind != FeaElementKind::Hex8 {
-        return Err(format!("unsupported element kind {:?}", mesh.element_kind));
-    }
     mesh.validate()?;
     let nu = config.material.poissons_ratio;
     if !(-1.0 < nu && nu < 0.5) {
@@ -389,11 +464,12 @@ pub fn solve(
     }
 
     let node_count = mesh.node_count();
-    let n = node_count * 3;
     if mesh.element_count() == 0 {
         return Ok(SolveResult {
-            displacement: vec![0.0; n],
-            contact_force: vec![0.0; n],
+            displacement: vec![0.0; node_count * 3],
+            rotation: (mesh.element_kind == FeaElementKind::Bar2)
+                .then(|| vec![0.0; node_count * 3]),
+            contact_force: vec![0.0; node_count * 3],
             strain_energy_density: Vec::new(),
             stats: SolveStats {
                 converged: true,
@@ -402,9 +478,39 @@ pub fn solve(
         });
     }
 
-    let h = detect_uniform_grid(mesh)?;
-    let scales = stiffness_scales(mesh)?;
-    let ke = cube_stiffness(h, config.material)?;
+    match mesh.element_kind {
+        FeaElementKind::Hex8 => {
+            let h = detect_uniform_grid(mesh)?;
+            let scales = stiffness_scales(mesh)?;
+            let ke = cube_stiffness(h, config.material)?;
+            let model = HexModel {
+                mesh,
+                ke,
+                scales,
+                h,
+            };
+            contact_solve(mesh, &model, rigid, config)
+        }
+        FeaElementKind::Bar2 => {
+            let model = frame::FrameModel::new(mesh, config.material)?;
+            contact_solve(mesh, &model, rigid, config)
+        }
+    }
+}
+
+/// The active-set contact driver: element-kind-independent, working on the
+/// assembled stiffness action. Nodes on the fixed face are glued in all
+/// dofs; contact prescribes the translational contact-axis dof.
+fn contact_solve(
+    mesh: &FeaMesh,
+    model: &dyn StiffnessModel,
+    rigid: &mut dyn RigidBody,
+    config: &SolveConfig,
+) -> Result<SolveResult, String> {
+    let dpn = model.dofs_per_node();
+    let node_count = mesh.node_count();
+    let n = node_count * dpn;
+    let h = model.length_scale();
 
     // Mesh bounding box (for the fixed face and the contact scan limit).
     let mut lo = [f64::INFINITY; 3];
@@ -431,8 +537,8 @@ pub fn solve(
         for node in 0..node_count {
             if (mesh.node_position(node)[axis] - face).abs() < h * 1e-3 {
                 fixed_node[node] = true;
-                for c in 0..3 {
-                    constrained[node * 3 + c] = true;
+                for c in 0..dpn {
+                    constrained[node * dpn + c] = true;
                 }
             }
         }
@@ -440,15 +546,7 @@ pub fn solve(
 
     // Jacobi diagonal (constraint state doesn't affect it; masked entries
     // are never used).
-    let mut diag = vec![0.0f64; n];
-    for e in 0..mesh.element_count() {
-        let nodes = mesh.element(e);
-        for (i, node) in nodes.iter().enumerate() {
-            for c in 0..3 {
-                diag[*node as usize * 3 + c] += scales[e] * ke[i * 3 + c][i * 3 + c];
-            }
-        }
-    }
+    let diag = model.diagonal();
 
     let mut u = vec![0.0f64; n];
     let mut active: std::collections::HashMap<usize, f64> = std::collections::HashMap::new();
@@ -473,11 +571,8 @@ pub fn solve(
                 continue;
             }
             let p = mesh.node_position(node);
-            let deformed = [
-                p[0] + u[node * 3],
-                p[1] + u[node * 3 + 1],
-                p[2] + u[node * 3 + 2],
-            ];
+            let base = node * dpn;
+            let deformed = [p[0] + u[base], p[1] + u[base + 1], p[2] + u[base + 2]];
             let mut probe = deformed;
             probe[contact_axis] -= contact_sign * slack;
             if !rigid.is_inside(probe) {
@@ -497,7 +592,7 @@ pub fn solve(
 
         // Refresh the constraint arrays and warm-started solution.
         for node in 0..node_count {
-            let dof = node * 3 + contact_axis;
+            let dof = node * dpn + contact_axis;
             if fixed_node[node] {
                 continue;
             }
@@ -518,14 +613,9 @@ pub fn solve(
             }
         }
 
-        let op = Operator {
-            mesh,
-            ke: &ke,
-            scales: &scales,
-            constrained: &constrained,
-        };
         let (iterations, cg_converged) = solve_cg(
-            &op,
+            model,
+            &constrained,
             &diag,
             &mut u,
             config.cg_tolerance,
@@ -543,16 +633,16 @@ pub fn solve(
         // meaningfully tensile ones release. The threshold is relative to
         // the peak compression so noise-level forces at grazing rim nodes
         // don't cycle the set.
-        op.apply_unmasked(&u, &mut forces);
+        model.apply(&u, &mut forces);
         let peak_compression = active
             .keys()
-            .map(|node| -contact_sign * forces[node * 3 + contact_axis])
+            .map(|node| -contact_sign * forces[node * dpn + contact_axis])
             .fold(0.0f64, f64::max);
         let release_tol = peak_compression * 1e-3;
         let released: Vec<usize> = active
             .keys()
             .copied()
-            .filter(|node| contact_sign * forces[node * 3 + contact_axis] > release_tol)
+            .filter(|node| contact_sign * forces[node * dpn + contact_axis] > release_tol)
             .collect();
         for node in &released {
             active.remove(node);
@@ -565,61 +655,37 @@ pub fn solve(
     }
     stats.active_contacts = active.len();
 
-    // Contact force field: the reaction at each active node.
-    op_final_forces(mesh, &ke, &scales, &u, &mut forces);
-    let mut contact_force = vec![0.0f64; n];
+    // Contact force field: the reaction at each active node (translational,
+    // 3 per node regardless of the model's dof count).
+    model.apply(&u, &mut forces);
+    let mut contact_force = vec![0.0f64; node_count * 3];
     for node in active.keys() {
-        contact_force[node * 3 + contact_axis] = forces[node * 3 + contact_axis];
+        contact_force[node * 3 + contact_axis] = forces[node * dpn + contact_axis];
     }
 
-    // Strain energy density per element: (1/2) u_e^T K_e u_e / h^3.
-    let volume = h * h * h;
-    let mut strain_energy_density = Vec::with_capacity(mesh.element_count());
-    for e in 0..mesh.element_count() {
-        let nodes = mesh.element(e);
-        let mut ue = [0.0f64; 24];
-        for (i, node) in nodes.iter().enumerate() {
-            let base = *node as usize * 3;
-            ue[i * 3] = u[base];
-            ue[i * 3 + 1] = u[base + 1];
-            ue[i * 3 + 2] = u[base + 2];
+    let strain_energy_density = model.energy_density(&u);
+
+    // Split the solution into translations (+ rotations for 6-dof models).
+    let (displacement, rotation) = if dpn == 3 {
+        (u, None)
+    } else {
+        let mut translations = Vec::with_capacity(node_count * 3);
+        let mut rotations = Vec::with_capacity(node_count * 3);
+        for node in 0..node_count {
+            let base = node * dpn;
+            translations.extend_from_slice(&u[base..base + 3]);
+            rotations.extend_from_slice(&u[base + 3..base + 6]);
         }
-        let mut energy = 0.0;
-        for (i, uei) in ue.iter().enumerate() {
-            let row = &ke[i];
-            let mut sum = 0.0;
-            for (j, uej) in ue.iter().enumerate() {
-                sum += row[j] * uej;
-            }
-            energy += uei * sum;
-        }
-        strain_energy_density.push(0.5 * scales[e] * energy / volume);
-    }
+        (translations, Some(rotations))
+    };
 
     Ok(SolveResult {
-        displacement: u,
+        displacement,
+        rotation,
         contact_force,
         strain_energy_density,
         stats,
     })
-}
-
-/// K u with no masking, via a temporary operator (helper for the final
-/// reaction extraction, where the loop's operator has gone out of scope).
-fn op_final_forces(
-    mesh: &FeaMesh,
-    ke: &ElementStiffness,
-    scales: &[f64],
-    u: &[f64],
-    out: &mut [f64],
-) {
-    let op = Operator {
-        mesh,
-        ke,
-        scales,
-        constrained: &[],
-    };
-    op.apply(u, out);
 }
 
 #[cfg(test)]
@@ -901,6 +967,17 @@ mod tests {
             (0..mesh.node_count()).all(|node| result.contact_force[node * 3 + 2] == 0.0),
             "no z contact forces expected"
         );
+    }
+
+    #[test]
+    fn grid_detection_rejects_line_meshes() {
+        // detect_uniform_grid must not spuriously accept a Bar2 mesh (the
+        // corner zip would only check two nodes).
+        let mut mesh = grid_mesh(2, 2, 2, 0.5);
+        mesh.element_kind = FeaElementKind::Bar2;
+        mesh.connectivity = vec![0, 1, 1, 2];
+        let err = detect_uniform_grid(&mesh).unwrap_err();
+        assert!(err.contains("Hex8"), "unexpected error: {err}");
     }
 
     #[test]

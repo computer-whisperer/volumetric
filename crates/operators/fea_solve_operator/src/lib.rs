@@ -1,24 +1,31 @@
 //! FEA Solve Operator.
 //!
 //! Compresses an FEA mesh against a rigid implicit body with linear
-//! elasticity (see `fea_core` for scope: uniform hex grids, Hooke's law,
-//! quasi-static single pose, active-set contact). The rigid body is sampled
-//! where the user placed it — position it already interpenetrating the
-//! mesh, in the fully pressed pose. Contact presses along the
-//! `fixed_boundary` axis, toward the glued face (glue zmin, press with a
-//! body from +z; glue ymin, press from +y; ...).
+//! elasticity (see `fea_core` for scope: Hooke's law, quasi-static single
+//! pose, active-set contact). The rigid body is sampled where the user
+//! placed it — position it already interpenetrating the mesh, in the fully
+//! pressed pose. Contact presses along the `fixed_boundary` axis, toward
+//! the glued face (glue zmin, press with a body from +z; glue ymin, press
+//! from +y; ...).
+//!
+//! The element formulation follows the mesh's kind:
+//! - Hex8 (from `fea_grid_mesh_operator`): uniform-grid solid elements; an
+//!   optional `stiffness_scale` element field scales element stiffness.
+//! - Bar2 (an explicit strut lattice): 3D frame elements with a circular
+//!   section from the required `radius` element field; `stiffness_scale`
+//!   multiplies a strut's Young's modulus.
 //!
 //! Inputs:
-//! - Input 0: FeaMesh (from `fea_grid_mesh_operator`; an optional
-//!   `stiffness_scale` element field scales element stiffness)
+//! - Input 0: FeaMesh
 //! - Input 1: ModelWASM — the rigid body (must be 3D)
 //! - Input 2: CBOR configuration: `youngs_modulus` (float, default 1.0),
 //!   `poissons_ratio` (float, default 0.3), `fixed_boundary` (enum of
 //!   xmin/xmax/ymin/ymax/zmin/zmax/none, default zmin)
 //!
 //! Output 0: the input FeaMesh plus result fields — per-node `displacement`
-//! (3) and `contact_force` (3, the interface force map), per-element
-//! `strain_energy_density` (1).
+//! (3), `contact_force` (3, the interface force map), and `rotation` (3,
+//! Bar2 frame meshes only), per-element `strain_energy_density` (1, energy
+//! per unit element volume: cell volume for Hex8, strut volume for Bar2).
 
 use volumetric_abi::fea::{FeaField, FeaMesh, decode_fea_mesh, encode_fea_mesh};
 use volumetric_abi::host::{
@@ -103,6 +110,16 @@ fn run_solve(config: &SolveOperatorConfig) -> Result<FeaMesh, String> {
             data: result.displacement,
         },
     );
+    if let Some(rotation) = result.rotation {
+        upsert(
+            &mut mesh.node_fields,
+            FeaField {
+                name: "rotation".to_string(),
+                components: 3,
+                data: rotation,
+            },
+        );
+    }
     upsert(
         &mut mesh.node_fields,
         FeaField {
