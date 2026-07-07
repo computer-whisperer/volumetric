@@ -197,6 +197,50 @@ fn box_fills_with_a_valid_tetra_lattice() {
 }
 
 #[test]
+fn box_fills_with_a_valid_foam_lattice() {
+    use ciborium::value::Value;
+    let config = cbor_map(&[
+        ("family", Value::Text("foam".into())),
+        ("cell_size", Value::Float(0.25)),
+        ("irregularity", Value::Float(0.4)),
+    ]);
+    let outputs = run_project(config, false);
+    let (_, mesh, hint) = &outputs[0];
+
+    assert_eq!(*hint, AssetTypeHint::FeaMesh);
+    assert_eq!(mesh.element_kind, FeaElementKind::Bar2);
+    // ~24 struts per cell over 4^3 cells, minus boundary losses.
+    assert!(
+        mesh.element_count() > 400,
+        "suspiciously few foam struts: {}",
+        mesh.element_count()
+    );
+
+    // Nodes stay inside the box; interior nodes have the Plateau degree 4
+    // (clipped skin nodes are degree 1 by construction).
+    let mut degree = vec![0usize; mesh.node_count()];
+    for e in 0..mesh.element_count() {
+        degree[mesh.element(e)[0] as usize] += 1;
+        degree[mesh.element(e)[1] as usize] += 1;
+    }
+    let mut interior_checked = 0usize;
+    for n in 0..mesh.node_count() {
+        let p = mesh.node_position(n);
+        for axis in 0..3 {
+            assert!(
+                (-1e-6..=1.0 + 1e-6).contains(&p[axis]),
+                "node {n} outside the box: {p:?}"
+            );
+        }
+        if p.iter().all(|&v| v > 0.3 && v < 0.7) {
+            assert_eq!(degree[n], 4, "interior foam node {n} joins {} struts", degree[n]);
+            interior_checked += 1;
+        }
+    }
+    assert!(interior_checked > 5, "no interior nodes checked");
+}
+
+#[test]
 fn generated_lattice_survives_a_frame_solve() {
     use ciborium::value::Value;
     let config = cbor_map(&[

@@ -23,9 +23,10 @@
 //! Inputs:
 //! - Input 0: ModelWASM (must be 3D) — the domain to fill
 //! - Input 1: CBOR configuration:
-//!   `{ family: "cubic" / "tetra" .default "tetra", cell_size: float
-//!   .default 0.05, radius: float .default 0.0 (0 = cell_size / 10),
-//!   prune_islands: bool .default true }`
+//!   `{ family: "cubic" / "tetra" / "foam" .default "tetra", cell_size:
+//!   float .default 0.05, radius: float .default 0.0 (0 = cell_size / 10),
+//!   prune_islands: bool .default true, irregularity: float .default 0.3
+//!   (foam only) }`
 //!
 //! Output 0: CBOR-encoded Bar2 `FeaMesh` with a uniform scalar `radius`
 //! element field.
@@ -63,15 +64,9 @@ const MIN_CLIP_FRACTION: f64 = 1e-3;
 enum FamilyConfig {
     Cubic,
     Tetra,
-}
-
-impl FamilyConfig {
-    fn as_family(self) -> SkeletonFamily {
-        match self {
-            Self::Cubic => SkeletonFamily::Cubic,
-            Self::Tetra => SkeletonFamily::Tetra,
-        }
-    }
+    /// Voronoi foam (the production cushion pattern): `irregularity`
+    /// picks the cell shape, 0 = periodic Kelvin cells.
+    Foam,
 }
 
 #[derive(Clone, Copy, Debug, serde::Deserialize)]
@@ -82,6 +77,21 @@ struct PatternConfig {
     /// Strut cross-section radius; 0 = `cell_size / 10`.
     radius: f64,
     prune_islands: bool,
+    /// Foam cell-shape jitter, 0 (Kelvin) ..= 1 (fully organic); the
+    /// other families ignore it. Matches `lattice_operator`'s knob.
+    irregularity: f64,
+}
+
+impl PatternConfig {
+    fn as_family(&self) -> SkeletonFamily {
+        match self.family {
+            FamilyConfig::Cubic => SkeletonFamily::Cubic,
+            FamilyConfig::Tetra => SkeletonFamily::Tetra,
+            FamilyConfig::Foam => SkeletonFamily::Foam {
+                irregularity: self.irregularity,
+            },
+        }
+    }
 }
 
 impl Default for PatternConfig {
@@ -91,6 +101,7 @@ impl Default for PatternConfig {
             cell_size: 0.05,
             radius: 0.0,
             prune_islands: true,
+            irregularity: 0.3,
         }
     }
 }
@@ -261,6 +272,12 @@ fn build_pattern(config: &PatternConfig) -> Result<FeaMesh, String> {
     if !(radius.is_finite() && radius > 0.0) {
         return Err(format!("radius must be positive, got {}", config.radius));
     }
+    if !(config.irregularity.is_finite() && (0.0..=1.0).contains(&config.irregularity)) {
+        return Err(format!(
+            "irregularity must be in 0..=1, got {}",
+            config.irregularity
+        ));
+    }
 
     let dims =
         input_model_dimensions(0).ok_or_else(|| "input 0 is not a usable model".to_string())?;
@@ -274,7 +291,7 @@ fn build_pattern(config: &PatternConfig) -> Result<FeaMesh, String> {
     let lo = [bounds[0], bounds[2], bounds[4]];
     let hi = [bounds[1], bounds[3], bounds[5]];
 
-    let family = config.family.as_family();
+    let family = config.as_family();
     let estimate = estimate_strut_count(family, lo, hi, config.cell_size);
     if estimate > MAX_STRUTS {
         return Err(format!(
@@ -338,7 +355,7 @@ pub extern "C" fn run() {
 pub extern "C" fn get_metadata() -> i64 {
     static METADATA: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     volumetric_abi::metadata_reply(&METADATA, || {
-        let schema = r#"{ family: "cubic" / "tetra" .default "tetra", cell_size: float .default 0.05, radius: float .default 0.0, prune_islands: bool .default true }"#
+        let schema = r#"{ family: "cubic" / "tetra" / "foam" .default "tetra", cell_size: float .default 0.05, radius: float .default 0.0, prune_islands: bool .default true, irregularity: float .default 0.3 }"#
             .to_string();
         OperatorMetadata {
             name: "strut_pattern_operator".to_string(),
