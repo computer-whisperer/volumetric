@@ -39,6 +39,7 @@ const OPERATORS: &[(&str, &str)] = &[
     ("mesh_to_model_operator", "Mesh to Model"),
     ("mesh_height_operator", "Mesh Height Query"),
     ("lattice_operator", "Lattice"),
+    ("brim_operator", "Brim"),
 ];
 
 /// Reads `version = "..."` from a bundled crate's Cargo.toml. Every bundled

@@ -329,6 +329,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "brim_model_template"
+version = "0.1.0"
+dependencies = [
+ "gridfield_model_core",
+]
+
+[[package]]
+name = "brim_operator"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "gridfield_model_core",
+ "model_merge_core",
+ "serde",
+ "volumetric_abi",
+ "walrus",
+ "wasm-encoder 0.248.0",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

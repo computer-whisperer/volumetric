@@ -1,0 +1,10 @@
+[package]
+name = "brim_model_template"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+gridfield_model_core = { path = "../gridfield_model_core" }
