@@ -1,0 +1,11 @@
+[package]
+name = "deform_model_template"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+deform_model_core = { path = "../deform_model_core" }

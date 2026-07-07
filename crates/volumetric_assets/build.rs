@@ -36,6 +36,7 @@ const OPERATORS: &[(&str, &str)] = &[
     ("fea_solve_operator", "FEA Solve"),
     ("fea_density_operator", "FEA Density"),
     ("fea_inverse_operator", "FEA Inverse"),
+    ("fea_deform_operator", "FEA Deform"),
     ("mesh_to_model_operator", "Mesh to Model"),
     ("mesh_height_operator", "Mesh Height Query"),
     ("lattice_operator", "Lattice"),

@@ -1098,6 +1098,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "deform_model_core"
+version = "0.1.0"
+dependencies = [
+ "volumetric_abi",
+]
+
+[[package]]
+name = "deform_model_template"
+version = "0.1.0"
+dependencies = [
+ "deform_model_core",
+]
+
+[[package]]
 name = "density_gradient_model"
 version = "0.1.0"
 dependencies = [
@@ -1520,6 +1534,19 @@ name = "fea_core"
 version = "0.1.0"
 dependencies = [
  "volumetric_abi",
+]
+
+[[package]]
+name = "fea_deform_operator"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "deform_model_core",
+ "model_merge_core",
+ "serde",
+ "volumetric_abi",
+ "walrus",
+ "wasm-encoder 0.248.0",
 ]
 
 [[package]]

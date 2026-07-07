@@ -1,0 +1,16 @@
+[package]
+name = "fea_deform_operator"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+volumetric_abi = { path = "../../volumetric_abi" }
+deform_model_core = { path = "../../deform_model_core" }
+model_merge_core = { path = "../../model_merge_core" }
+serde = { version = "1", features = ["derive"] }
+ciborium = "0.2"
+walrus = "0.26"
+wasm-encoder = { version = "0.248", features = ["wasmparser"] }
