@@ -67,6 +67,7 @@ fn main() {
         precursor_ids: vec![],
         plan,
         wireframe: false,
+        show_bounds: false,
         show_grid: false,
         ssao: false,
         ssao_radius: 0.1,

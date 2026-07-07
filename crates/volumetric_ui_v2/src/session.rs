@@ -100,7 +100,7 @@ impl Session {
                     // Otherwise the run was superseded or cancelled; discard it.
                 }
                 BackgroundResult::PreviewComplete(preview) => {
-                    self.viewport.accept_preview_result(preview);
+                    self.viewport.accept_preview_result(*preview);
                 }
                 BackgroundResult::LightboxComplete {
                     asset_id,
@@ -593,6 +593,7 @@ impl ViewportRenderer {
             self.pending_frame_preview = false;
         }
 
+        let show_bounds = requests.first().is_some_and(|r| r.show_bounds);
         let visible_ids: std::collections::HashSet<&str> =
             visible.iter().map(|(id, ..)| *id).collect();
         self.resident
@@ -639,7 +640,72 @@ impl ViewportRenderer {
             if wireframe && let Some(lines) = &resident.wireframe {
                 self.renderer.submit_retained_lines(lines);
             }
+            // The bounds box is 12 segments; immediate-mode submission each
+            // frame is cheaper than retaining it.
+            if show_bounds {
+                self.renderer.submit_lines(
+                    &bounds_box_lines(entity.bounds),
+                    Mat4::IDENTITY,
+                    bounds_box_style(entity.bounds),
+                );
+            }
         }
+    }
+}
+
+/// The 12 edges of an output's world-space bounding box.
+fn bounds_box_lines(bounds: PreviewBounds) -> renderer::LineData {
+    const COLOR: [f32; 4] = [1.0, 0.72, 0.2, 0.9];
+    let xs = [bounds.min.0, bounds.max.0];
+    let ys = [bounds.min.1, bounds.max.1];
+    let zs = [bounds.min.2, bounds.max.2];
+    let mut segments = Vec::with_capacity(12);
+    for &y in &ys {
+        for &z in &zs {
+            segments.push(renderer::LineSegment {
+                start: [xs[0], y, z],
+                end: [xs[1], y, z],
+                color: COLOR,
+            });
+        }
+    }
+    for &x in &xs {
+        for &z in &zs {
+            segments.push(renderer::LineSegment {
+                start: [x, ys[0], z],
+                end: [x, ys[1], z],
+                color: COLOR,
+            });
+        }
+    }
+    for &x in &xs {
+        for &y in &ys {
+            segments.push(renderer::LineSegment {
+                start: [x, y, zs[0]],
+                end: [x, y, zs[1]],
+                color: COLOR,
+            });
+        }
+    }
+    renderer::LineData { segments }
+}
+
+/// Style for the bounds overlay: dashed lines drawn over the scene so the
+/// far edges stay visible behind the part. Dash lengths are world-space in
+/// the line shader, so they scale with the box.
+fn bounds_box_style(bounds: PreviewBounds) -> renderer::LineStyle {
+    let extent = (bounds.max.0 - bounds.min.0)
+        .max(bounds.max.1 - bounds.min.1)
+        .max(bounds.max.2 - bounds.min.2)
+        .max(f32::EPSILON);
+    renderer::LineStyle {
+        width: 1.5,
+        width_mode: renderer::WidthMode::ScreenSpace,
+        pattern: renderer::LinePattern::Dashed {
+            dash_length: extent * 0.03,
+            gap_length: extent * 0.02,
+        },
+        depth_mode: renderer::DepthMode::Overlay,
     }
 }
 
@@ -907,11 +973,17 @@ impl PreviewCache {
         self.entities.get(id).map(|build| &build.entity.scene)
     }
 
-    /// Meshing stats for every cached output, keyed by asset id.
+    /// Meshing stats for every cached output, keyed by asset id. The
+    /// entity's bounds ride along so the UI can show dimensions without a
+    /// second source of truth.
     fn output_stats(&self) -> std::collections::BTreeMap<String, OutputStats> {
         self.entities
             .iter()
-            .map(|(id, build)| (id.clone(), build.entity.stats.clone()))
+            .map(|(id, build)| {
+                let mut stats = build.entity.stats.clone();
+                stats.bounds = Some((build.entity.bounds.min, build.entity.bounds.max));
+                (id.clone(), stats)
+            })
             .collect()
     }
 
@@ -1134,7 +1206,7 @@ pub enum BackgroundResult {
         result: Result<Vec<volumetric::LoadedAsset>, String>,
         elapsed_ms: u128,
     },
-    PreviewComplete(PreviewBuildResult),
+    PreviewComplete(Box<PreviewBuildResult>),
     LightboxComplete {
         asset_id: String,
         mode: LightboxMode,
@@ -1227,10 +1299,10 @@ pub fn execute_job(job: BackgroundJob) -> BackgroundResult {
                 Ok(None) => Err(PreviewBuildError::Cancelled),
                 Err(error) => Err(PreviewBuildError::Failed(error)),
             };
-            BackgroundResult::PreviewComplete(PreviewBuildResult {
+            BackgroundResult::PreviewComplete(Box::new(PreviewBuildResult {
                 key: job.key,
                 result,
-            })
+            }))
         }
         BackgroundJob::BuildLightbox {
             asset_id,
@@ -2534,6 +2606,7 @@ mod tests {
             precursor_ids: Vec::new(),
             plan,
             wireframe: false,
+            show_bounds: false,
             show_grid: true,
             ssao: false,
             ssao_radius: 0.5,
@@ -2674,6 +2747,7 @@ mod tests {
                 color_channel: Some("density".to_string()),
             },
             wireframe: false,
+            show_bounds: false,
             show_grid: false,
             ssao: false,
             ssao_radius: 0.1,
@@ -2870,6 +2944,7 @@ mod tests {
                 color_channel: None,
             },
             wireframe: false,
+            show_bounds: false,
             show_grid: true,
             ssao: true,
             ssao_radius: 0.5,
@@ -2902,6 +2977,34 @@ mod tests {
             stats: OutputStats::default(),
             wireframe_lines: None,
         }
+    }
+
+    #[test]
+    fn bounds_box_is_twelve_edges_through_every_corner() {
+        let bounds = PreviewBounds {
+            min: (-1.0, -2.0, -3.0),
+            max: (1.0, 2.0, 3.0),
+        };
+        let lines = bounds_box_lines(bounds);
+        assert_eq!(lines.segments.len(), 12);
+
+        // Each of the 8 corners terminates exactly 3 edges.
+        let mut corner_uses = HashMap::new();
+        for segment in &lines.segments {
+            for p in [segment.start, segment.end] {
+                assert!(
+                    (p[0] == -1.0 || p[0] == 1.0)
+                        && (p[1] == -2.0 || p[1] == 2.0)
+                        && (p[2] == -3.0 || p[2] == 3.0),
+                    "endpoint {p:?} is not a box corner"
+                );
+                *corner_uses
+                    .entry((p[0].to_bits(), p[1].to_bits(), p[2].to_bits()))
+                    .or_insert(0usize) += 1;
+            }
+        }
+        assert_eq!(corner_uses.len(), 8);
+        assert!(corner_uses.values().all(|&n| n == 3));
     }
 
     fn accept_ok(cache: &mut PreviewCache, job: PreviewBuildJob) {
@@ -3115,6 +3218,13 @@ function get_bounds_max_y() return 1.5 end
         assert_ne!(
             visible[0].1, visible[1].1,
             "each build gets its own revision"
+        );
+
+        let stats = cache.output_stats();
+        assert_eq!(
+            stats["a"].bounds,
+            Some(((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))),
+            "stats carry the entity's bounds for the dimension readout"
         );
     }
 

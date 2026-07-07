@@ -50,6 +50,7 @@ pub const CANCEL_MESH_KEY: &str = "action:cancel-mesh";
 pub const REMESH_KEY: &str = "action:remesh";
 pub const TOGGLE_AUTO_REMESH_KEY: &str = "action:toggle-auto-remesh";
 pub const TOGGLE_GRID_KEY: &str = "viewport:toggle-grid";
+pub const TOGGLE_BOUNDS_KEY: &str = "viewport:toggle-bounds";
 pub const TOGGLE_SSAO_KEY: &str = "viewport:toggle-ssao";
 pub const FRAME_PREVIEW_KEY: &str = "viewport:frame-preview";
 pub const RESET_CAMERA_KEY: &str = "viewport:reset-camera";
@@ -235,6 +236,9 @@ impl Default for Asn2Settings {
     }
 }
 
+/// World-space `(min, max)` corners of an output's axis-aligned bounds.
+pub type BoundsCorners = ((f32, f32, f32), (f32, f32, f32));
+
 /// Meshing statistics for one built preview, reported by the host's worker.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct OutputStats {
@@ -253,6 +257,11 @@ pub struct OutputStats {
     /// (channel 0 is occupancy). Feeds the "Color by" picker and the slice
     /// lightbox's channel row; empty when the model declares no format.
     pub model_channels: Vec<String>,
+    /// World-space `(min, max)` bounds of the built output. For model
+    /// outputs this is the wasm-reported `get_bounds` domain, not the
+    /// meshed geometry's tight box. Feeds the bounds overlay's dimension
+    /// readouts.
+    pub bounds: Option<BoundsCorners>,
 }
 
 /// Everything the 2D inspection lightbox displays for one output, computed
@@ -401,6 +410,9 @@ pub struct PreviewRequest {
     /// cache key, so toggling never re-meshes).
     pub wireframe: bool,
     pub show_grid: bool,
+    /// Overlay each output's wasm-reported bounding box (display-only,
+    /// like `wireframe`).
+    pub show_bounds: bool,
     pub ssao: bool,
     pub ssao_radius: f32,
     pub ssao_bias: f32,
@@ -479,6 +491,7 @@ pub struct ProjectSummary {
     pub preview_resolution: usize,
     pub camera_control_scheme: CameraControlScheme,
     pub show_grid: bool,
+    pub show_bounds: bool,
     pub ssao: bool,
     pub runtime_assets: Vec<RuntimeAssetSummary>,
     pub last_run_elapsed_ms: Option<u128>,
@@ -744,6 +757,7 @@ pub struct VolumetricUiV2 {
     preview_resolution: usize,
     camera_control_scheme: CameraControlScheme,
     show_grid: bool,
+    show_bounds: bool,
     ssao: bool,
     ssao_radius: f32,
     ssao_bias: f32,
@@ -834,6 +848,7 @@ impl VolumetricUiV2 {
             preview_resolution: 64,
             camera_control_scheme: CameraControlScheme::default(),
             show_grid: true,
+            show_bounds: false,
             ssao: true,
             // Renderer defaults (renderer::RenderSettings::default()).
             ssao_radius: 0.5,
@@ -1352,6 +1367,7 @@ impl VolumetricUiV2 {
             plan,
             wireframe: render.wireframe(),
             show_grid: self.show_grid,
+            show_bounds: self.show_bounds,
             ssao: self.ssao,
             ssao_radius: self.ssao_radius,
             ssao_bias: self.ssao_bias,
@@ -1563,6 +1579,7 @@ impl VolumetricUiV2 {
             preview_resolution: self.preview_resolution,
             camera_control_scheme: self.camera_control_scheme,
             show_grid: self.show_grid,
+            show_bounds: self.show_bounds,
             ssao: self.ssao,
             runtime_assets: self
                 .runtime_assets
@@ -2818,6 +2835,16 @@ impl App for VolumetricUiV2 {
             return;
         }
 
+        if event.is_click_or_activate(TOGGLE_BOUNDS_KEY) {
+            self.show_bounds = !self.show_bounds;
+            self.status = if self.show_bounds {
+                "bounding boxes shown".to_string()
+            } else {
+                "bounding boxes hidden".to_string()
+            };
+            return;
+        }
+
         if event.is_click_or_activate(TOGGLE_SSAO_KEY) {
             self.ssao = !self.ssao;
             self.status = if self.ssao {
@@ -3355,6 +3382,22 @@ fn output_settings_popover(app: &VolumetricUiV2, id: &str) -> El {
             ));
         }
         body.push(text(summary).caption().muted());
+        if let Some((min, max)) = stats.bounds {
+            body.push(text(format!("size {}", format_dims(min, max))).caption().muted());
+            body.push(
+                text(format!(
+                    "bounds ({}, {}, {}) to ({}, {}, {})",
+                    format_dim(min.0),
+                    format_dim(min.1),
+                    format_dim(min.2),
+                    format_dim(max.0),
+                    format_dim(max.1),
+                    format_dim(max.2),
+                ))
+                .caption()
+                .muted(),
+            );
+        }
         for line in &stats.detail {
             body.push(text(line).caption().muted());
         }
@@ -3684,6 +3727,7 @@ fn view_controls_cluster(app: &VolumetricUiV2) -> El {
     };
     card([row([
         toggle("Grid", app.show_grid, TOGGLE_GRID_KEY),
+        toggle("Bounds", app.show_bounds, TOGGLE_BOUNDS_KEY),
         toggle("SSAO", app.ssao, TOGGLE_SSAO_KEY),
         icon_button("chevron-down")
             .ghost()
@@ -3724,11 +3768,11 @@ fn view_controls_cluster(app: &VolumetricUiV2) -> El {
 /// One-line readout at the bottom of the viewport. Unkeyed, so it never
 /// intercepts camera input.
 fn viewport_hud(app: &VolumetricUiV2) -> El {
-    let visible = app.preview_requests().len();
+    let requests = app.preview_requests();
     let triangles: usize = app.output_stats.values().map(|s| s.triangles).sum();
     let points: usize = app.output_stats.values().map(|s| s.points).sum();
     let mut badges = vec![
-        badge(format!("{visible} in viewport")).muted().xsmall(),
+        badge(format!("{} in viewport", requests.len())).muted().xsmall(),
         badge(format!("{} outputs", app.runtime_assets.len()))
             .muted()
             .xsmall(),
@@ -3747,12 +3791,45 @@ fn viewport_hud(app: &VolumetricUiV2) -> El {
                 .xsmall(),
         );
     }
+    if app.show_bounds {
+        for request in &requests {
+            let Some((min, max)) = app
+                .output_stats
+                .get(&request.asset_id)
+                .and_then(|s| s.bounds)
+            else {
+                continue;
+            };
+            badges.push(
+                badge(format!("{}: {}", request.asset_id, format_dims(min, max)))
+                    .secondary()
+                    .xsmall(),
+            );
+        }
+    }
     if let Some(warning) = &app.viewport_overflow {
         badges.push(badge(warning).destructive().xsmall());
     }
     badges.push(badge(&app.status).secondary().xsmall());
     badges.push(spacer());
     row(badges).gap(tokens::SPACE_1).align(Align::Center)
+}
+
+/// `W × D × H` size of a bounding box, compactly formatted.
+fn format_dims(min: (f32, f32, f32), max: (f32, f32, f32)) -> String {
+    format!(
+        "{} × {} × {}",
+        format_dim(max.0 - min.0),
+        format_dim(max.1 - min.1),
+        format_dim(max.2 - min.2),
+    )
+}
+
+/// Compact dimension formatting: up to 3 decimals, trailing zeros trimmed.
+fn format_dim(value: f32) -> String {
+    let text = format!("{value:.3}");
+    let text = text.trim_end_matches('0').trim_end_matches('.');
+    text.to_string()
 }
 
 /// Compact count formatting: 950, 12.4k, 3.1M.
@@ -5221,10 +5298,22 @@ mod tests {
         let mut app = VolumetricUiV2::default();
         dispatch(&mut app, UiEvent::synthetic_click(TOGGLE_GRID_KEY));
         dispatch(&mut app, UiEvent::synthetic_click(TOGGLE_SSAO_KEY));
+        dispatch(&mut app, UiEvent::synthetic_click(TOGGLE_BOUNDS_KEY));
 
         let summary = app.summary();
         assert!(!summary.show_grid);
         assert!(!summary.ssao);
+        assert!(summary.show_bounds, "bounds overlay defaults off");
+    }
+
+    #[test]
+    fn dimension_formatting_is_compact() {
+        assert_eq!(
+            format_dims((-1.0, 0.0, 0.5), (1.0, 0.25, 10.625)),
+            "2 × 0.25 × 10.125"
+        );
+        assert_eq!(format_dim(0.1234567), "0.123");
+        assert_eq!(format_dim(100.0), "100");
     }
 
     #[test]
@@ -5291,6 +5380,10 @@ mod tests {
             .expect("asn2 config");
         assert_eq!(config.base_resolution, 6);
         assert_eq!(config.max_depth, 4);
+        assert!(!request.show_bounds, "bounds overlay defaults off");
+
+        dispatch(&mut app, UiEvent::synthetic_click(TOGGLE_BOUNDS_KEY));
+        assert!(app.preview_requests()[0].show_bounds);
     }
 
     /// Builds a two-export project and returns (app, export ids) after a run.
