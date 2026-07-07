@@ -1,7 +1,8 @@
 //! Integration tests for the typed sample-channel model ABI (github issue #3
 //! follow-through): `get_sample_format` / `sample_channels`, the occupancy
 //! default for plain models, format pass-through with position rewriting in
-//! transform wrappers, and channel dropping in the boolean operator.
+//! transform wrappers, and channel pass-through in the boolean operator
+//! (model A's layout with channel 0 replaced by the combined occupancy).
 //!
 //! Requires the wasm32 artifacts (`cargo build-wasm`).
 
@@ -116,29 +117,67 @@ fn translate_forwards_format_and_rewrites_channel_positions() {
     assert!((row[1] - 0.625).abs() < 1e-6, "density was {}", row[1]);
 }
 
-#[test]
-fn boolean_drops_channels_to_occupancy_only() {
-    let mut op = Vec::new();
+fn boolean_config(op: &str) -> Vec<u8> {
+    let mut out = Vec::new();
     ciborium::ser::into_writer(
         &ciborium::value::Value::Map(vec![(
             ciborium::value::Value::Text("op".into()),
-            ciborium::value::Value::Text("union".into()),
+            ciborium::value::Value::Text(op.into()),
         )]),
-        &mut op,
+        &mut out,
     )
     .unwrap();
+    out
+}
+
+#[test]
+fn boolean_passes_model_a_channels_through() {
+    // Density cube minus the sphere: A's format survives, channel 0 is
+    // the boolean result, and the density channel keeps A's values even
+    // where the occupancy changed.
     let merged = run_operator(
         "boolean_operator",
         vec![
             wasm_artifact("density_gradient_model"),
             wasm_artifact("simple_sphere_model"),
-            op,
+            boolean_config("subtract"),
         ],
     );
     let mut executor = NativeModelExecutor::new(&merged).unwrap();
 
-    // The merged model is occupancy-only by construction; the density
-    // channel is dropped, not silently mangled.
+    let format = executor.sample_format().clone();
+    assert_eq!(format.channels.len(), 2);
+    assert_eq!(format.channels[0].kind, ChannelKind::Occupancy);
+    assert_eq!(format.channels[1].kind, ChannelKind::Density);
+
+    // Cube corner outside the sphere: solid, density 0.5 + 0.5 * 0.9.
+    let row = executor.sample_channels_nd(&[0.9, 0.9, 0.9]).unwrap();
+    assert_eq!(row[0], 1.0);
+    assert!((row[1] - 0.95).abs() < 1e-6, "density was {}", row[1]);
+    assert_eq!(row[0], executor.sample_nd(&[0.9, 0.9, 0.9]).unwrap());
+
+    // Center: subtracted away, but the density channel still reports A's
+    // field there.
+    let row = executor.sample_channels_nd(&[0.0, 0.0, 0.0]).unwrap();
+    assert_eq!(row[0], 0.0);
+    assert!((row[1] - 0.5).abs() < 1e-6, "density was {}", row[1]);
+    assert_eq!(row[0], executor.sample_nd(&[0.0, 0.0, 0.0]).unwrap());
+}
+
+#[test]
+fn boolean_with_formatless_a_stays_occupancy_only() {
+    // A has no declared format, so the output is occupancy-only even
+    // though B declares channels: the layout follows model A.
+    let merged = run_operator(
+        "boolean_operator",
+        vec![
+            wasm_artifact("simple_sphere_model"),
+            wasm_artifact("density_gradient_model"),
+            boolean_config("union"),
+        ],
+    );
+    let mut executor = NativeModelExecutor::new(&merged).unwrap();
+
     assert_eq!(executor.sample_format().channels.len(), 1);
     assert_eq!(
         executor.sample_format().channels[0].kind,

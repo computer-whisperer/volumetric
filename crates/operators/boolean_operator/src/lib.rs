@@ -10,6 +10,14 @@
 //! - `sample(pos_ptr: i32) -> f32`: Combines densities from both models
 //! - `memory`: First memory from merged modules
 //!
+//! Typed sample channels follow model A: when A declares a sample format,
+//! the output passes `get_sample_format` through and emits a
+//! `sample_channels` wrapper that keeps A's channel row with channel 0
+//! replaced by the combined occupancy. B contributes occupancy only — in
+//! regions where only B is solid (union), the other channels hold
+//! whatever A reports at that position. A format-less A yields the
+//! implicit occupancy-only output regardless of B's channels.
+//!
 //! Behavior:
 //! - Reads WASM model A bytes from input 0
 //! - Reads WASM model B bytes from input 1
@@ -81,7 +89,7 @@ fn add_get_dimensions_wrapper(
     f.instruction(&Instruction::End);
     code.function(&f);
 
-    let func_index = (funcs.len() - 1) as u32;
+    let func_index = funcs.len() - 1;
     exports.export("get_dimensions", ExportKind::Func, func_index);
 }
 
@@ -180,8 +188,84 @@ fn add_get_bounds_wrapper(
     f.instruction(&Instruction::End);
     code.function(&f);
 
-    let func_index = (funcs.len() - 1) as u32;
+    let func_index = funcs.len() - 1;
     exports.export("get_bounds", ExportKind::Func, func_index);
+}
+
+/// Copy `dims_bytes` (local `dims_local`) bytes of position from A's
+/// memory at the pointer in `pos_local` into B's IO buffer (local
+/// `b_io_local`): B's code reads its *own* memory. Must run before A's
+/// sample executes — the ABI allows a model to clobber its position
+/// buffer.
+fn emit_copy_position_to_b(
+    f: &mut Function,
+    pos_local: u32,
+    dims_local: u32,
+    i_local: u32,
+    b_io_local: u32,
+    a_mem_idx: u32,
+    b_mem_idx: u32,
+) {
+    // for (i = 0; i < dims_bytes; i += 8)
+    //     B_mem[b_io + i] = A_mem[pos + i]
+    f.instruction(&Instruction::I32Const(0));
+    f.instruction(&Instruction::LocalSet(i_local));
+    f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+    f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+    f.instruction(&Instruction::LocalGet(i_local));
+    f.instruction(&Instruction::LocalGet(dims_local));
+    f.instruction(&Instruction::I32GeS);
+    f.instruction(&Instruction::BrIf(1));
+    f.instruction(&Instruction::LocalGet(b_io_local));
+    f.instruction(&Instruction::LocalGet(i_local));
+    f.instruction(&Instruction::I32Add); // dest address in B's memory
+    f.instruction(&Instruction::LocalGet(pos_local));
+    f.instruction(&Instruction::LocalGet(i_local));
+    f.instruction(&Instruction::I32Add); // src address in A's memory
+    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
+        offset: 0,
+        align: 3,
+        memory_index: a_mem_idx,
+    }));
+    f.instruction(&Instruction::F64Store(wasm_encoder::MemArg {
+        offset: 0,
+        align: 3,
+        memory_index: b_mem_idx,
+    }));
+    f.instruction(&Instruction::LocalGet(i_local));
+    f.instruction(&Instruction::I32Const(8));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::LocalSet(i_local));
+    f.instruction(&Instruction::Br(0));
+    f.instruction(&Instruction::End);
+    f.instruction(&Instruction::End);
+}
+
+/// Combine A's occupancy (a boolean i32 already on the stack) with B's:
+/// calls B's sample on the position previously copied into B's IO buffer
+/// (local `b_io_local`) and leaves the combined boolean i32 on the stack.
+/// Classification uses the shared occupancy contract (`volumetric_abi`:
+/// OCCUPANCY_THRESHOLD).
+fn emit_combine_with_b(f: &mut Function, b_idx: u32, b_io_local: u32, op: BooleanOp) {
+    f.instruction(&Instruction::LocalGet(b_io_local));
+    f.instruction(&Instruction::Call(b_idx));
+    f.instruction(&Instruction::F32Const(0.5.into()));
+    f.instruction(&Instruction::F32Gt);
+    match op {
+        // a && !b
+        BooleanOp::Subtract => {
+            f.instruction(&Instruction::I32Eqz);
+            f.instruction(&Instruction::I32And);
+        }
+        // a || b
+        BooleanOp::Union => {
+            f.instruction(&Instruction::I32Or);
+        }
+        // a && b
+        BooleanOp::Intersect => {
+            f.instruction(&Instruction::I32And);
+        }
+    }
 }
 
 /// Add sample wrapper that combines densities from both models.
@@ -223,83 +307,89 @@ fn add_sample_wrapper(
     f.instruction(&Instruction::Call(b_io_idx));
     f.instruction(&Instruction::LocalSet(3));
 
-    // for (i = 0; i < dims_bytes; i += 8)
-    //     B_mem[b_io + i] = A_mem[pos_ptr + i]
-    f.instruction(&Instruction::I32Const(0));
-    f.instruction(&Instruction::LocalSet(2));
-    f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
-    f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
-    f.instruction(&Instruction::LocalGet(2));
-    f.instruction(&Instruction::LocalGet(1));
-    f.instruction(&Instruction::I32GeS);
-    f.instruction(&Instruction::BrIf(1));
-    f.instruction(&Instruction::LocalGet(3));
-    f.instruction(&Instruction::LocalGet(2));
-    f.instruction(&Instruction::I32Add); // dest address in B's memory
-    f.instruction(&Instruction::LocalGet(0));
-    f.instruction(&Instruction::LocalGet(2));
-    f.instruction(&Instruction::I32Add); // src address in A's memory
-    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
-        offset: 0,
-        align: 3,
-        memory_index: a_mem_idx,
-    }));
-    f.instruction(&Instruction::F64Store(wasm_encoder::MemArg {
-        offset: 0,
-        align: 3,
-        memory_index: b_mem_idx,
-    }));
-    f.instruction(&Instruction::LocalGet(2));
-    f.instruction(&Instruction::I32Const(8));
-    f.instruction(&Instruction::I32Add);
-    f.instruction(&Instruction::LocalSet(2));
-    f.instruction(&Instruction::Br(0));
-    f.instruction(&Instruction::End);
-    f.instruction(&Instruction::End);
+    emit_copy_position_to_b(&mut f, 0, 1, 2, 3, a_mem_idx, b_mem_idx);
 
-    // Call A's sample with pos_ptr
+    // Call A's sample with pos_ptr; a_bool = (a_occupancy > 0.5). The
+    // generated model emits canonical 1.0/0.0.
     f.instruction(&Instruction::LocalGet(0));
     f.instruction(&Instruction::Call(a_idx));
-    // Classify with the shared occupancy contract (volumetric_abi:
-    // OCCUPANCY_THRESHOLD): a_bool = (a_occupancy > 0.5). The generated model
-    // emits canonical 1.0/0.0 and is occupancy-only — child sample formats
-    // are dropped by construction (the export section is built explicitly).
     f.instruction(&Instruction::F32Const(0.5.into()));
     f.instruction(&Instruction::F32Gt);
-
-    if op == BooleanOp::Subtract {
-        // Call B's sample on the copied position
-        f.instruction(&Instruction::LocalGet(3));
-        f.instruction(&Instruction::Call(b_idx));
-        f.instruction(&Instruction::F32Const(0.5.into()));
-        f.instruction(&Instruction::F32Gt);
-        // a && !b
-        f.instruction(&Instruction::I32Eqz);
-        f.instruction(&Instruction::I32And);
-    } else if op == BooleanOp::Union {
-        // Call B's sample on the copied position
-        f.instruction(&Instruction::LocalGet(3));
-        f.instruction(&Instruction::Call(b_idx));
-        f.instruction(&Instruction::F32Const(0.5.into()));
-        f.instruction(&Instruction::F32Gt);
-        // a || b
-        f.instruction(&Instruction::I32Or);
-    } else {
-        // Intersect: a && b
-        f.instruction(&Instruction::LocalGet(3));
-        f.instruction(&Instruction::Call(b_idx));
-        f.instruction(&Instruction::F32Const(0.5.into()));
-        f.instruction(&Instruction::F32Gt);
-        f.instruction(&Instruction::I32And);
-    }
+    emit_combine_with_b(&mut f, b_idx, 3, op);
 
     // Convert boolean i32 to f32 0.0/1.0
     f.instruction(&Instruction::F32ConvertI32S);
     f.instruction(&Instruction::End);
     code.function(&f);
 
-    let func_index = (funcs.len() - 1) as u32;
+    let func_index = funcs.len() - 1;
     exports.export("sample", ExportKind::Func, func_index);
+}
+
+/// Add sample_channels wrapper: A's full channel row with channel 0
+/// replaced by the combined occupancy. B contributes occupancy only (via
+/// its plain `sample`), so the output keeps model A's declared format.
+///
+/// As in the sample wrapper, the position is copied into B's IO buffer
+/// before A runs — A's `sample_channels` may clobber its position buffer.
+#[allow(clippy::too_many_arguments)]
+fn add_sample_channels_wrapper(
+    types: &mut TypeSection,
+    funcs: &mut FunctionSection,
+    code: &mut CodeSection,
+    exports: &mut ExportSection,
+    a_channels_idx: u32,
+    b_idx: u32,
+    b_io_idx: u32,
+    a_dims_idx: u32,
+    op: BooleanOp,
+    a_mem_idx: u32,
+    b_mem_idx: u32,
+) {
+    let ty = types.len();
+    types.ty().function([ValType::I32, ValType::I32], []);
+    funcs.function(ty);
+
+    // Locals: pos_ptr (param 0), out_ptr (param 1), dims_bytes (2), i (3),
+    // b_io (4)
+    let mut f = Function::new([(3, ValType::I32)]);
+
+    // dims_bytes = get_dimensions() * 8
+    f.instruction(&Instruction::Call(a_dims_idx));
+    f.instruction(&Instruction::I32Const(3));
+    f.instruction(&Instruction::I32Shl);
+    f.instruction(&Instruction::LocalSet(2));
+
+    // b_io = B's get_io_ptr()
+    f.instruction(&Instruction::Call(b_io_idx));
+    f.instruction(&Instruction::LocalSet(4));
+
+    emit_copy_position_to_b(&mut f, 0, 2, 3, 4, a_mem_idx, b_mem_idx);
+
+    // A.sample_channels(pos_ptr, out_ptr) fills the full row.
+    f.instruction(&Instruction::LocalGet(0));
+    f.instruction(&Instruction::LocalGet(1));
+    f.instruction(&Instruction::Call(a_channels_idx));
+
+    // out[0] = combine(out[0] > 0.5, B)
+    let out_mem = wasm_encoder::MemArg {
+        offset: 0,
+        align: 2,
+        memory_index: a_mem_idx,
+    };
+    f.instruction(&Instruction::LocalGet(1));
+    f.instruction(&Instruction::LocalGet(1));
+    f.instruction(&Instruction::F32Load(out_mem));
+    f.instruction(&Instruction::F32Const(0.5.into()));
+    f.instruction(&Instruction::F32Gt);
+    emit_combine_with_b(&mut f, b_idx, 4, op);
+    f.instruction(&Instruction::F32ConvertI32S);
+    f.instruction(&Instruction::F32Store(out_mem));
+    f.instruction(&Instruction::End);
+    code.function(&f);
+
+    let func_index = funcs.len() - 1;
+    exports.export("sample_channels", ExportKind::Func, func_index);
 }
 
 fn merge_models(a_wasm: &[u8], b_wasm: &[u8], op: BooleanOp) -> Result<Vec<u8>, String> {
@@ -357,6 +447,27 @@ fn merge_models(a_wasm: &[u8], b_wasm: &[u8], op: BooleanOp) -> Result<Vec<u8>, 
         a_exports.memory,
         b_exports.memory + a_counts.memories,
     );
+
+    // Typed channels follow model A: pass its format through and keep its
+    // channel row with channel 0 replaced by the combined occupancy.
+    if let (Some(get_sample_format), Some(sample_channels)) =
+        (a_exports.get_sample_format, a_exports.sample_channels)
+    {
+        exports.export("get_sample_format", ExportKind::Func, get_sample_format);
+        add_sample_channels_wrapper(
+            &mut sections.types,
+            &mut sections.funcs,
+            &mut sections.code,
+            &mut exports,
+            sample_channels,
+            b_exports.sample + a_counts.funcs,
+            b_exports.get_io_ptr + a_counts.funcs,
+            a_exports.get_dimensions,
+            op,
+            a_exports.memory,
+            b_exports.memory + a_counts.memories,
+        );
+    }
 
     let data_count =
         (a_counts.has_data_count || b_counts.has_data_count).then(|| a_counts.data + b_counts.data);

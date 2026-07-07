@@ -49,8 +49,13 @@
 //!   (clamped to 16..=2048). Contact features smaller than a cell can be
 //!   missed — raise this for fine polka-dot patterns.
 //!
-//! The combined output is occupancy-only: typed sample channels of the
-//! input are dropped, as with the boolean operator.
+//! Typed sample channels follow the input, as with the boolean operator:
+//! when the input declares a sample format, the combined output passes
+//! `get_sample_format` through and keeps the input's channel row with
+//! channel 0 replaced by the union occupancy. In brim-only regions the
+//! other channels hold whatever the input reports at that position (e.g.
+//! density 0 outside the part). The bare `output: "brim"` solid is
+//! occupancy-only.
 
 use wasm_encoder::{BlockType, ExportKind, ExportSection, Function, Instruction, MemArg, ValType};
 
@@ -573,10 +578,70 @@ fn add_sample_glue(
     exports.export("sample", ExportKind::Func, sections.funcs.len() - 1);
 }
 
+/// `sample_channels` glue: the input's channel row with channel 0
+/// replaced by the union occupancy. As in [`add_sample_glue`], the
+/// position is saved to locals before the input model runs (its
+/// `sample_channels` may clobber the position buffer in place).
+fn add_sample_channels_glue(
+    sections: &mut MergeSections,
+    exports: &mut ExportSection,
+    a_sample_channels: u32,
+    brim_sample: u32,
+    a_memory: u32,
+) {
+    let ty = sections.types.len();
+    sections
+        .types
+        .ty()
+        .function([ValType::I32, ValType::I32], []);
+    sections.funcs.function(ty);
+
+    let out_mem = MemArg {
+        offset: 0,
+        align: 2,
+        memory_index: a_memory,
+    };
+
+    // params: 0 pos_ptr, 1 out_ptr; locals 2-4: the saved position.
+    let mut f = Function::new([(3, ValType::F64)]);
+    for axis in 0..3u32 {
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::F64Load(MemArg {
+            offset: u64::from(axis) * 8,
+            align: 3,
+            memory_index: a_memory,
+        }));
+        f.instruction(&Instruction::LocalSet(2 + axis));
+    }
+    // A.sample_channels(pos_ptr, out_ptr) fills the full row.
+    f.instruction(&Instruction::LocalGet(0));
+    f.instruction(&Instruction::LocalGet(1));
+    f.instruction(&Instruction::Call(a_sample_channels));
+    // out[0] = occupied ? 1.0 : brim_sample(x, y, z)
+    f.instruction(&Instruction::LocalGet(1));
+    f.instruction(&Instruction::LocalGet(1));
+    f.instruction(&Instruction::F32Load(out_mem));
+    f.instruction(&Instruction::F32Const(0.5.into()));
+    f.instruction(&Instruction::F32Gt);
+    f.instruction(&Instruction::If(BlockType::Result(ValType::F32)));
+    f.instruction(&Instruction::F32Const(1.0.into()));
+    f.instruction(&Instruction::Else);
+    f.instruction(&Instruction::LocalGet(2));
+    f.instruction(&Instruction::LocalGet(3));
+    f.instruction(&Instruction::LocalGet(4));
+    f.instruction(&Instruction::Call(brim_sample));
+    f.instruction(&Instruction::End);
+    f.instruction(&Instruction::F32Store(out_mem));
+    f.instruction(&Instruction::End);
+    sections.code.function(&f);
+    exports.export("sample_channels", ExportKind::Func, sections.funcs.len() - 1);
+}
+
 /// Merge the input model with the patched brim model: dimensions, IO
 /// buffer, and memory pass through from the input; `sample` is the union
-/// glue and `get_bounds` the precomputed union. Typed sample channels are
-/// dropped — the output has the implicit occupancy-only format.
+/// glue and `get_bounds` the precomputed union. When the input declares
+/// typed channels, its format passes through with channel 0 replaced by
+/// the union occupancy.
 fn merge_with_input(input: &[u8], brim: &[u8], bounds: [f64; 6]) -> Result<Vec<u8>, String> {
     let a_counts = count_sections(input)?;
     let b_counts = count_sections(brim)?;
@@ -593,6 +658,18 @@ fn merge_with_input(input: &[u8], brim: &[u8], bounds: [f64; 6]) -> Result<Vec<u
     exports.export("get_io_ptr", ExportKind::Func, a.get_io_ptr);
     add_bounds_glue(&mut sections, &mut exports, a.memory, bounds);
     add_sample_glue(&mut sections, &mut exports, a.sample, brim_sample, a.memory);
+    if let (Some(get_sample_format), Some(sample_channels)) =
+        (a.get_sample_format, a.sample_channels)
+    {
+        exports.export("get_sample_format", ExportKind::Func, get_sample_format);
+        add_sample_channels_glue(
+            &mut sections,
+            &mut exports,
+            sample_channels,
+            brim_sample,
+            a.memory,
+        );
+    }
 
     let data_count =
         (a_counts.has_data_count || b_counts.has_data_count).then(|| a_counts.data + b_counts.data);

@@ -6,7 +6,8 @@
 #![cfg(feature = "native")]
 
 use volumetric::wasm::{
-    ModelExecutor, OperatorExecutor, OperatorIo, create_model_executor, create_operator_executor,
+    ModelExecutor, NativeModelExecutor, OperatorExecutor, OperatorIo, create_model_executor,
+    create_operator_executor,
 };
 
 fn wasm_artifact(name: &str) -> Vec<u8> {
@@ -21,7 +22,7 @@ fn wasm_artifact(name: &str) -> Vec<u8> {
     })
 }
 
-fn run_brim(config: &[(&str, ciborium::value::Value)]) -> Result<Vec<u8>, String> {
+fn run_brim_on(model: &str, config: &[(&str, ciborium::value::Value)]) -> Result<Vec<u8>, String> {
     let mut cfg = Vec::new();
     ciborium::ser::into_writer(
         &ciborium::value::Value::Map(
@@ -37,16 +38,17 @@ fn run_brim(config: &[(&str, ciborium::value::Value)]) -> Result<Vec<u8>, String
     let operator_wasm = wasm_artifact("brim_operator");
     let mut executor = create_operator_executor(&operator_wasm).expect("operator executor");
     let result = executor
-        .run(OperatorIo::new(vec![
-            wasm_artifact("simple_sphere_model"),
-            cfg,
-        ]))
+        .run(OperatorIo::new(vec![wasm_artifact(model), cfg]))
         .map_err(|e| e.to_string())?;
     result
         .outputs
         .get(&0)
         .cloned()
         .ok_or_else(|| "operator posted no output".to_string())
+}
+
+fn run_brim(config: &[(&str, ciborium::value::Value)]) -> Result<Vec<u8>, String> {
+    run_brim_on("simple_sphere_model", config)
 }
 
 fn base_config() -> Vec<(&'static str, ciborium::value::Value)> {
@@ -131,6 +133,43 @@ fn gap_leaves_a_detached_ring() {
     assert!(!occupied_at(&mut model, [0.0, 0.0, -0.9]), "gap under the part");
     assert!(!occupied_at(&mut model, [0.5, 0.0, -0.9]), "inside the gap");
     assert!(occupied_at(&mut model, [0.7, 0.0, -0.9]), "the detached ring");
+}
+
+/// A channeled input keeps its sample format through the combined
+/// output: channel 0 is the union occupancy (1.0 in the brim ring), the
+/// density channel passes through untouched. The bare brim solid stays
+/// occupancy-only.
+#[test]
+fn channels_pass_through_the_combined_output() {
+    // density_gradient_model: [-1,1]^3 cube, density = 0.5 + 0.5x,
+    // channels [Occupancy, Density]. Its footprint at the scan height is
+    // the full square, so the brim ring sits beyond |x| or |y| = 1.
+    let wasm = run_brim_on("density_gradient_model", &base_config()).expect("brim run failed");
+    let mut model = NativeModelExecutor::new(&wasm).expect("model executor");
+
+    let format = model.sample_format().clone();
+    assert_eq!(format.channels.len(), 2, "input format passes through");
+
+    // Inside the part: occupancy plus the input's density gradient.
+    let row = model.sample_channels_nd(&[0.5, 0.0, -0.9]).unwrap();
+    assert_eq!(row[0], 1.0);
+    assert!((row[1] - 0.75).abs() < 1e-6, "density was {}", row[1]);
+
+    // In the brim ring: channel 0 reports the union occupancy.
+    let row = model.sample_channels_nd(&[1.2, 0.0, -0.9]).unwrap();
+    assert_eq!(row[0], 1.0, "brim ring must show in channel 0");
+    assert_eq!(row[0], model.sample_nd(&[1.2, 0.0, -0.9]).unwrap());
+
+    // Above the slab, outside the part: unoccupied.
+    let row = model.sample_channels_nd(&[1.2, 0.0, 0.0]).unwrap();
+    assert_eq!(row[0], 0.0);
+
+    // The bare brim solid has no channels to preserve.
+    let mut config = base_config();
+    config.push(("output", ciborium::value::Value::Text("brim".into())));
+    let bare = run_brim_on("density_gradient_model", &config).expect("brim run failed");
+    let bare_model = NativeModelExecutor::new(&bare).expect("model executor");
+    assert_eq!(bare_model.sample_format().channels.len(), 1);
 }
 
 /// A bed plane that misses the part is an error, not an empty brim.
