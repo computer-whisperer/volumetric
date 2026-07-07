@@ -41,6 +41,29 @@ const OPERATORS: &[(&str, &str)] = &[
     ("lattice_operator", "Lattice"),
 ];
 
+/// Reads `version = "..."` from a bundled crate's Cargo.toml. Every bundled
+/// asset declares `version: env!("CARGO_PKG_VERSION")` in its metadata, so
+/// the manifest version IS the declared metadata version — bundling it lets
+/// consumers (e.g. the UI's upgrade offer) know bundled versions without
+/// compiling the wasm modules at runtime.
+fn crate_version(crate_dir: &std::path::Path) -> String {
+    let manifest = crate_dir.join("Cargo.toml");
+    println!("cargo:rerun-if-changed={}", manifest.display());
+    let text = fs::read_to_string(&manifest)
+        .unwrap_or_else(|e| panic!("read {}: {e}", manifest.display()));
+    text.lines()
+        .find_map(|line| {
+            line.strip_prefix("version")?
+                .trim_start()
+                .strip_prefix('=')?
+                .trim()
+                .strip_prefix('"')?
+                .strip_suffix('"')
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| panic!("no version in {}", manifest.display()))
+}
+
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -68,10 +91,12 @@ fn main() {
             let wasm_path = wasm_dir.join(format!("{}.wasm", name));
             if wasm_path.exists() {
                 println!("cargo:rerun-if-changed={}", wasm_path.display());
+                let version = crate_version(&workspace_root.join("crates/models").join(name));
                 code.push_str(&format!(
-                    "    BundledAsset {{\n        name: \"{}\",\n        display_name: \"{}\",\n        bytes: include_bytes!(\"{}\"),\n        category: AssetCategory::Model,\n    }},\n",
+                    "    BundledAsset {{\n        name: \"{}\",\n        display_name: \"{}\",\n        version: \"{}\",\n        bytes: include_bytes!(\"{}\"),\n        category: AssetCategory::Model,\n    }},\n",
                     name,
                     display_name,
+                    version,
                     wasm_path.display()
                 ));
             } else {
@@ -97,10 +122,12 @@ fn main() {
             let wasm_path = wasm_dir.join(format!("{}.wasm", name));
             if wasm_path.exists() {
                 println!("cargo:rerun-if-changed={}", wasm_path.display());
+                let version = crate_version(&workspace_root.join("crates/operators").join(name));
                 code.push_str(&format!(
-                    "    BundledAsset {{\n        name: \"{}\",\n        display_name: \"{}\",\n        bytes: include_bytes!(\"{}\"),\n        category: AssetCategory::Operator,\n    }},\n",
+                    "    BundledAsset {{\n        name: \"{}\",\n        display_name: \"{}\",\n        version: \"{}\",\n        bytes: include_bytes!(\"{}\"),\n        category: AssetCategory::Operator,\n    }},\n",
                     name,
                     display_name,
+                    version,
                     wasm_path.display()
                 ));
             } else {

@@ -41,6 +41,11 @@ pub struct BundledAsset {
     pub name: &'static str,
     /// Human-readable display name (e.g., "Simple Sphere")
     pub display_name: &'static str,
+    /// The asset crate's Cargo.toml version, read at build time. Bundled
+    /// crates declare `version: env!("CARGO_PKG_VERSION")` in their runtime
+    /// metadata, so this matches the declared metadata version without
+    /// compiling the module.
+    pub version: &'static str,
     /// The raw WASM bytes
     pub bytes: &'static [u8],
     /// The category of this asset

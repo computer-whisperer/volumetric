@@ -765,6 +765,12 @@ pub struct VolumetricUiV2 {
     remesh_requested: bool,
     /// One-shot: cancel all in-flight preview mesh builds.
     mesh_cancel_requested: bool,
+    /// An Add-menu operator click waiting for dispatch to the background
+    /// worker (reading operator metadata compiles its wasm — too slow for
+    /// the UI thread). The step is inserted when the result arrives.
+    operator_add_request: Option<String>,
+    /// The operator add whose metadata read is on the worker right now.
+    operator_add_inflight: Option<String>,
     preview_build_status: PreviewBuildStatus,
     pending_camera_command: Option<ViewportCameraCommand>,
     viewport_texture: Option<AppTexture>,
@@ -844,6 +850,8 @@ impl VolumetricUiV2 {
             auto_remesh: true,
             remesh_requested: false,
             mesh_cancel_requested: false,
+            operator_add_request: None,
+            operator_add_inflight: None,
             preview_build_status: PreviewBuildStatus::Idle,
             pending_camera_command: None,
             viewport_texture: None,
@@ -1440,6 +1448,31 @@ impl VolumetricUiV2 {
     /// mesh builds.
     pub(crate) fn take_mesh_cancel_request(&mut self) -> bool {
         std::mem::take(&mut self.mesh_cancel_requested)
+    }
+
+    /// Host hook: consumes a queued operator-add metadata request for
+    /// dispatch to the background worker.
+    pub(crate) fn take_operator_metadata_request(&mut self) -> Option<String> {
+        let name = self.operator_add_request.take()?;
+        self.operator_add_inflight = Some(name.clone());
+        Some(name)
+    }
+
+    /// Host hook: an operator-add metadata read finished; wire up and insert
+    /// the step (or surface the error).
+    pub(crate) fn on_operator_metadata(
+        &mut self,
+        name: &str,
+        result: Result<OperatorMetadata, String>,
+    ) {
+        if self.operator_add_inflight.as_deref() != Some(name) {
+            return; // superseded or stale; nothing was waiting on it
+        }
+        self.operator_add_inflight = None;
+        match result {
+            Ok(metadata) => self.insert_operator_step(name, &metadata),
+            Err(err) => self.status = format!("couldn't read {name} metadata: {err}"),
+        }
     }
 
     /// Host hook: `count` in-flight preview builds were signalled to cancel.
@@ -2200,27 +2233,36 @@ impl VolumetricUiV2 {
         self.status = format!("imported {} as {id}", asset.display_name);
     }
 
-    /// Appends a timeline step for the named bundled operator, wired to the
-    /// currently selected export as its primary model input.
+    /// Queues a timeline-step insert for the named bundled operator. The
+    /// operator's declared metadata drives the step's input wiring, and
+    /// reading it compiles the operator's wasm module — seconds on a cold
+    /// cache in a debug build — so the read runs on the background worker;
+    /// [`Self::on_operator_metadata`] inserts the step when it lands.
     fn add_operator(&mut self, name: &str) {
         let Some(asset) = volumetric_assets::get_operator(name) else {
             self.status = format!("missing bundled operator {name}");
             return;
         };
-        let Some(input_id) = self.selected_export.clone() else {
-            self.status = "add or select a model before adding an operator".to_string();
+        if self.operator_add_request.is_some() || self.operator_add_inflight.is_some() {
+            self.status = "still adding the previous operator".to_string();
+            return;
+        }
+        self.operator_add_request = Some(name.to_string());
+        self.status = format!("adding {}…", asset.display_name);
+    }
+
+    /// Appends a timeline step for a bundled operator whose metadata just
+    /// arrived from the worker: typed slots wire to the current selection
+    /// (or the first asset of the right kind), config/Lua slots get their
+    /// schema defaults. Operators with a model input need a model to exist;
+    /// generators (no model slots) insert into an empty project.
+    fn insert_operator_step(&mut self, name: &str, metadata: &OperatorMetadata) {
+        let Some(asset) = volumetric_assets::get_operator(name) else {
+            self.status = format!("missing bundled operator {name}");
             return;
         };
+        let selection = self.selected_export.clone();
 
-        let output_id = self
-            .project
-            .default_output_name(asset.name, Some(&input_id));
-
-        // Build the step's inputs from the operator's declared metadata so
-        // config blobs, Lua templates, and extra model/mesh slots are all
-        // wired up (not just the first model input). The selection fills the
-        // slot matching its own type; the other kinds fall back to the first
-        // asset of that kind in the project.
         let typed = self.declared_assets_typed();
         let hint_of = |id: &str| {
             typed
@@ -2234,35 +2276,44 @@ impl VolumetricUiV2 {
                 .find(|(_, hint)| *hint == Some(kind))
                 .map(|(id, _)| id.clone())
         };
-        let selected_hint = hint_of(&input_id);
+        let selected_hint = selection.as_deref().map(hint_of);
         let for_kind = |kind: AssetTypeHint| {
-            if selected_hint == Some(kind) {
-                Some(input_id.clone())
+            if selected_hint == Some(Some(kind)) {
+                selection.clone()
             } else {
                 first_of(kind)
             }
         };
-        let primary_model = if matches!(selected_hint, Some(AssetTypeHint::Model) | None) {
-            input_id.clone()
+        // The selection counts as the primary model when it is one (or its
+        // type is unknown); otherwise the first model in the project serves.
+        let primary_model = if matches!(selected_hint, Some(Some(AssetTypeHint::Model) | None)) {
+            selection.clone()
         } else {
-            first_of(AssetTypeHint::Model).unwrap_or_default()
+            first_of(AssetTypeHint::Model)
         };
-        let primary_fea = for_kind(AssetTypeHint::FeaMesh);
-        let primary_trimesh = for_kind(AssetTypeHint::TriMesh);
-        let inputs = match volumetric::operator_metadata_from_wasm_bytes(asset.bytes) {
-            Ok(metadata) => operator_step_inputs(
-                &metadata,
-                &SlotPrimaries {
-                    model: &primary_model,
-                    fea: primary_fea.as_deref(),
-                    trimesh: primary_trimesh.as_deref(),
-                },
-            ),
-            Err(err) => {
-                self.status = format!("couldn't read {} metadata: {err}", asset.display_name);
-                vec![ExecutionInput::AssetRef(input_id.clone())]
-            }
-        };
+        let needs_model = metadata
+            .inputs
+            .iter()
+            .any(|input| matches!(input, OperatorMetadataInput::ModelWASM));
+        if needs_model && primary_model.is_none() {
+            self.status = format!(
+                "{} needs a model input — add or select a model first",
+                asset.display_name
+            );
+            return;
+        }
+
+        let output_id = self
+            .project
+            .default_output_name(asset.name, primary_model.as_deref());
+        let inputs = operator_step_inputs(
+            metadata,
+            &SlotPrimaries {
+                model: primary_model.as_deref().unwrap_or_default(),
+                fea: for_kind(AssetTypeHint::FeaMesh).as_deref(),
+                trimesh: for_kind(AssetTypeHint::TriMesh).as_deref(),
+            },
+        );
 
         self.project.insert_operation(
             asset.name,
@@ -4502,15 +4553,18 @@ fn format_bytes(bytes: usize) -> String {
     }
 }
 
-/// Declared metadata name → version of every bundled operator, decoded once.
+/// Declared metadata name → version of every bundled operator, from the
+/// build-time asset registry. Operator crates declare `name: <crate name>`
+/// and `version: env!("CARGO_PKG_VERSION")` in their metadata (a convention
+/// the `bundled_asset_registry_matches_declared_metadata` test enforces), so
+/// the registry answers this without compiling any wasm — the previous
+/// implementation compiled all ~28 MB of bundled operators on first use,
+/// a ~40-second UI stall in a debug build.
 fn bundled_operator_versions() -> &'static std::collections::HashMap<String, String> {
     static VERSIONS: LazyLock<std::collections::HashMap<String, String>> = LazyLock::new(|| {
         volumetric_assets::operators()
             .iter()
-            .filter_map(|asset| {
-                let metadata = volumetric::operator_metadata_from_wasm_bytes(asset.bytes).ok()?;
-                Some((metadata.name, metadata.version))
-            })
+            .map(|asset| (asset.name.to_string(), asset.version.to_string()))
             .collect()
     });
     &VERSIONS
@@ -4735,12 +4789,28 @@ mod tests {
         );
     }
 
-    /// Click the Add-menu entry for the named bundled operator.
+    /// Click the Add-menu entry for the named bundled operator, then pump
+    /// the metadata round-trip the background worker performs in production
+    /// (the click only queues a request; the step inserts on the result).
     fn add_operator_click(app: &mut VolumetricUiV2, name: &str) {
         dispatch(
             app,
             UiEvent::synthetic_click(format!("{ADD_OPERATOR_PREFIX}{name}")),
         );
+        pump_operator_add(app);
+    }
+
+    /// Executes a queued operator-add metadata request inline and feeds the
+    /// result back, standing in for the session/worker round-trip.
+    fn pump_operator_add(app: &mut VolumetricUiV2) {
+        if let Some(name) = app.take_operator_metadata_request() {
+            let result = match volumetric_assets::get_operator(&name) {
+                Some(asset) => volumetric::operator_metadata_from_wasm_bytes(asset.bytes)
+                    .map_err(|err| err.to_string()),
+                None => Err(format!("missing bundled operator {name}")),
+            };
+            app.on_operator_metadata(&name, result);
+        }
     }
 
     fn first_operator_name() -> &'static str {
@@ -4748,6 +4818,75 @@ mod tests {
             .first()
             .expect("bundled operators")
             .name
+    }
+
+    /// The asset registry's build-time name/version must match what each
+    /// operator actually declares at runtime: `bundled_operator_versions`
+    /// (and with it the upgrade offer) reads the registry precisely so the
+    /// UI never compiles all bundled operators just to learn their versions.
+    /// Compiles every bundled operator, so this is the slowest test here.
+    #[test]
+    fn bundled_asset_registry_matches_declared_metadata() {
+        for asset in volumetric_assets::operators() {
+            let metadata = volumetric::operator_metadata_from_wasm_bytes(asset.bytes)
+                .unwrap_or_else(|e| panic!("{} metadata: {e}", asset.name));
+            assert_eq!(
+                metadata.name, asset.name,
+                "declared metadata name must equal the crate name"
+            );
+            assert_eq!(
+                metadata.version, asset.version,
+                "{}: declared version must equal the crate version bundled at build time",
+                asset.name
+            );
+        }
+    }
+
+    /// A generator operator (no model inputs) inserts into an empty project
+    /// — the guard only demands a model when the operator declares a model
+    /// slot. This is the fresh-session repro: new session, Add menu,
+    /// Rectangular Prism.
+    #[test]
+    fn generator_operator_adds_without_a_selection() {
+        let mut app = VolumetricUiV2::empty();
+        assert!(app.selected_export.is_none());
+        add_operator_click(&mut app, "rectangular_prism_operator");
+        assert_eq!(app.summary().timeline_steps, 1, "{}", app.status);
+        assert!(app.status.starts_with("added"), "{}", app.status);
+    }
+
+    /// An operator with a model slot still refuses to insert into a project
+    /// with no model to wire it to.
+    #[test]
+    fn model_operator_refused_without_any_model() {
+        let mut app = VolumetricUiV2::empty();
+        add_operator_click(&mut app, "translate_operator");
+        assert_eq!(app.summary().timeline_steps, 0);
+        assert!(app.status.contains("needs a model input"), "{}", app.status);
+    }
+
+    /// A second Add click while the first's metadata read is still on the
+    /// worker is refused instead of queueing a competing request.
+    #[test]
+    fn concurrent_operator_adds_are_serialized() {
+        let mut app = VolumetricUiV2::default();
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{ADD_OPERATOR_PREFIX}rectangular_prism_operator")),
+        );
+        let name = app.take_operator_metadata_request().expect("queued");
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{ADD_OPERATOR_PREFIX}translate_operator")),
+        );
+        assert!(app.status.contains("still adding"), "{}", app.status);
+        assert!(app.take_operator_metadata_request().is_none());
+
+        let asset = volumetric_assets::get_operator(&name).unwrap();
+        let result =
+            volumetric::operator_metadata_from_wasm_bytes(asset.bytes).map_err(|e| e.to_string());
+        app.on_operator_metadata(&name, result);
+        assert_eq!(app.summary().timeline_steps, 1);
     }
 
     #[test]

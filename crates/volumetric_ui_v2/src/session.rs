@@ -118,6 +118,9 @@ impl Session {
                     }
                     app.set_lightbox_data(&asset_id, &mode, result);
                 }
+                BackgroundResult::OperatorMetadataReady { name, result } => {
+                    app.on_operator_metadata(&name, result);
+                }
             }
         }
 
@@ -160,6 +163,10 @@ impl Session {
                 project: app.project().clone(),
                 cancel,
             });
+        }
+
+        if let Some(name) = app.take_operator_metadata_request() {
+            jobs.push(BackgroundJob::ReadOperatorMetadata { name });
         }
 
         let (status, preview_jobs) = self.viewport.preview_cache.sync(
@@ -1111,6 +1118,13 @@ pub enum BackgroundJob {
         mode: LightboxMode,
         data: Arc<Vec<u8>>,
     },
+    /// Read a bundled operator's declared metadata for an Add-menu insert.
+    /// Reading metadata compiles the operator's wasm module on a cold cache
+    /// — over a second for the larger operators in a debug build — which is
+    /// why the Add click defers it here instead of blocking the UI thread.
+    ReadOperatorMetadata {
+        name: String,
+    },
 }
 
 /// A completed unit of background work, routed by [`Session::pre_frame`].
@@ -1126,6 +1140,10 @@ pub enum BackgroundResult {
         mode: LightboxMode,
         result: Result<LightboxData, String>,
     },
+    OperatorMetadataReady {
+        name: String,
+        result: Result<volumetric::OperatorMetadata, String>,
+    },
 }
 
 /// Coalescing job queue: the newest queued project run wins (a burst of edits
@@ -1138,6 +1156,7 @@ pub struct JobQueue {
     run: Option<BackgroundJob>,
     previews: HashMap<String, PreviewBuildJob>,
     lightbox: Option<BackgroundJob>,
+    metadata: Option<BackgroundJob>,
 }
 
 impl JobQueue {
@@ -1150,11 +1169,14 @@ impl JobQueue {
             }
             // One lightbox is open at a time; newest wins.
             lightbox @ BackgroundJob::BuildLightbox { .. } => self.lightbox = Some(lightbox),
+            // One operator add is in flight at a time (the app serializes).
+            metadata @ BackgroundJob::ReadOperatorMetadata { .. } => self.metadata = Some(metadata),
         }
     }
 
     /// The next job to execute: a pending run first, then the lightbox (the
-    /// user is actively looking at it), then one preview.
+    /// user is actively looking at it), then operator metadata (a click is
+    /// waiting on it), then one preview.
     pub fn pop(&mut self) -> Option<BackgroundJob> {
         if let Some(run) = self.run.take() {
             return Some(run);
@@ -1162,13 +1184,19 @@ impl JobQueue {
         if let Some(lightbox) = self.lightbox.take() {
             return Some(lightbox);
         }
+        if let Some(metadata) = self.metadata.take() {
+            return Some(metadata);
+        }
         let id = self.previews.keys().next()?.clone();
         let preview = self.previews.remove(&id).expect("key just observed");
         Some(BackgroundJob::BuildPreview(preview))
     }
 
     pub fn is_empty(&self) -> bool {
-        self.run.is_none() && self.previews.is_empty() && self.lightbox.is_none()
+        self.run.is_none()
+            && self.previews.is_empty()
+            && self.lightbox.is_none()
+            && self.metadata.is_none()
     }
 }
 
@@ -1222,6 +1250,14 @@ pub fn execute_job(job: BackgroundJob) -> BackgroundResult {
                 mode,
                 result,
             }
+        }
+        BackgroundJob::ReadOperatorMetadata { name } => {
+            let result = match volumetric_assets::get_operator(&name) {
+                Some(asset) => volumetric::operator_metadata_from_wasm_bytes(asset.bytes)
+                    .map_err(|err| err.to_string()),
+                None => Err(format!("missing bundled operator {name}")),
+            };
+            BackgroundResult::OperatorMetadataReady { name, result }
         }
     }
 }
