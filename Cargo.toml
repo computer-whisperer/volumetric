@@ -100,8 +100,10 @@ web-time = "1"
 # via wasmtime).
 wat = "1"
 # examples/profile_fea_inverse.rs replays the inverse solve natively on real
-# project inputs to measure the wasm tax and threading headroom.
-fea_core = { path = "crates/fea_core" }
+# project inputs to measure the wasm tax and threading headroom. The
+# parallel feature is dev-only here; the wasm operator builds (separate
+# cargo invocations via the build-wasm alias) never see it.
+fea_core = { path = "crates/fea_core", features = ["parallel"] }
 
 [[example]]
 name = "profile_fea_inverse"

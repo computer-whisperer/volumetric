@@ -219,6 +219,51 @@ fn local_forces(s: &Strut, v: &[[f64; 3]; 4]) -> [[f64; 3]; 4] {
 }
 
 impl FrameModel {
+    pub(crate) fn strut_count(&self) -> usize {
+        self.struts.len()
+    }
+
+    pub(crate) fn strut_nodes(&self, e: usize) -> [u32; 2] {
+        self.struts[e].nodes
+    }
+
+    /// The strut's assembled 12x12 global-frame element stiffness (dof
+    /// order: node0 translations, node0 rotations, node1 translations,
+    /// node1 rotations), column-probed out of local_forces so every
+    /// coupling and sign comes from the ground-truth kernel.
+    pub(crate) fn element_stiffness(&self, e: usize) -> [[f64; 12]; 12] {
+        let s = &self.struts[e];
+        // Columns in the strut frame first.
+        let mut local = [[0.0f64; 12]; 12];
+        for col in 0..12 {
+            let mut v = [[0.0f64; 3]; 4];
+            v[col / 3][col % 3] = 1.0;
+            let f = local_forces(s, &v);
+            for row in 0..12 {
+                local[row][col] = f[row / 3][row % 3];
+            }
+        }
+        // K_global = Rblk^T K_local Rblk with Rblk = blkdiag(R, R, R, R):
+        // every 3x3 quadrant transforms as R^T Q R.
+        let mut out = [[0.0f64; 12]; 12];
+        for qi in 0..4 {
+            for qj in 0..4 {
+                for i in 0..3 {
+                    for j in 0..3 {
+                        let mut sum = 0.0;
+                        for k in 0..3 {
+                            for l in 0..3 {
+                                sum += s.r[k][i] * local[qi * 3 + k][qj * 3 + l] * s.r[l][j];
+                            }
+                        }
+                        out[qi * 3 + i][qj * 3 + j] = sum;
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Gather a strut's four dof blocks from the global vector, rotated
     /// into the strut frame.
     fn gather_local(&self, s: &Strut, x: &[f64]) -> [[f64; 3]; 4] {
@@ -498,6 +543,124 @@ mod tests {
                 components: 1,
                 data: vec![0.05; elements],
             }],
+        }
+    }
+
+    /// The Schwarz-preconditioned solve must land on the same solution as
+    /// the default preconditioner: the preconditioner changes the CG path,
+    /// never the converged answer — including through contact activation.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn schwarz_solve_matches_default() {
+        let mut mesh = cubic_lattice(8);
+        // Soft/stiff contrast so the preconditioner actually works for a
+        // living: scale field ramping 1e-3..1 along x.
+        let scales: Vec<f64> = (0..mesh.connectivity.len() / 2)
+            .map(|e| {
+                let n0 = mesh.connectivity[e * 2] as usize;
+                let x = mesh.node_positions[n0 * 3];
+                1e-3_f64.powf(1.0 - x / 7.0)
+            })
+            .collect();
+        mesh.element_fields.push(FeaField {
+            name: "stiffness_scale".to_string(),
+            components: 1,
+            data: scales,
+        });
+        // Plate pressing down from above onto the 0..7 cube.
+        let mut plate = |p: [f64; 3]| p[2] > 6.3;
+
+        let mut config = SolveConfig {
+            fixed_boundary: FixedBoundary::ZMin,
+            ..Default::default()
+        };
+        let base = solve(&mesh, &mut plate, &config).unwrap();
+        for dense_local in [true, false] {
+            config.preconditioner = crate::PrecondChoice::Schwarz(crate::SchwarzParams {
+                target_nodes: 48,
+                dense_local,
+            });
+            let schwarz = solve(&mesh, &mut plate, &config).unwrap();
+
+            assert!(base.stats.converged && schwarz.stats.converged);
+            let scale = base
+                .displacement
+                .iter()
+                .fold(0.0f64, |m, v| m.max(v.abs()));
+            for (i, (a, b)) in base
+                .displacement
+                .iter()
+                .zip(&schwarz.displacement)
+                .enumerate()
+            {
+                assert!(
+                    (a - b).abs() <= scale * 1e-5,
+                    "dof {i} (dense_local {dense_local}): default {a} vs schwarz {b}"
+                );
+            }
+            assert!(
+                schwarz.stats.cg_iterations < base.stats.cg_iterations,
+                "schwarz (dense_local {dense_local}) {} vs default {} CG iterations",
+                schwarz.stats.cg_iterations,
+                base.stats.cg_iterations
+            );
+        }
+    }
+
+    /// Not a correctness test: forward contact solves on contrast-ramped
+    /// cubic lattices of growing size, block-Jacobi vs two-level Schwarz —
+    /// the scalability question is whether Schwarz iteration counts stay
+    /// flat as the mesh grows while the subdomain solves ride the thread
+    /// count. Run with RAYON_NUM_THREADS=<t> and:
+    ///   cargo test -p fea_core --features parallel --release -- \
+    ///       --ignored --nocapture schwarz_scaling_bench
+    #[cfg(feature = "parallel")]
+    #[test]
+    #[ignore]
+    fn schwarz_scaling_bench() {
+        for n in [12, 22, 32] {
+            let mut mesh = cubic_lattice(n);
+            let scales: Vec<f64> = (0..mesh.connectivity.len() / 2)
+                .map(|e| {
+                    let n0 = mesh.connectivity[e * 2] as usize;
+                    let x = mesh.node_positions[n0 * 3];
+                    1e-3_f64.powf(1.0 - x / (n - 1) as f64)
+                })
+                .collect();
+            mesh.element_fields.push(FeaField {
+                name: "stiffness_scale".to_string(),
+                components: 1,
+                data: scales,
+            });
+            let top = (n - 1) as f64 - 0.7;
+
+            for (label, preconditioner) in [
+                ("block-jacobi", crate::PrecondChoice::Auto),
+                (
+                    "schwarz-64",
+                    crate::PrecondChoice::Schwarz(crate::SchwarzParams {
+                        target_nodes: 64,
+                        dense_local: true,
+                    }),
+                ),
+            ] {
+                let mut plate = |p: [f64; 3]| p[2] > top;
+                let config = SolveConfig {
+                    fixed_boundary: FixedBoundary::ZMin,
+                    cg_tolerance: 1e-6,
+                    preconditioner,
+                    ..Default::default()
+                };
+                let timer = std::time::Instant::now();
+                let result = solve(&mesh, &mut plate, &config).unwrap();
+                println!(
+                    "n={n} ({} struts): {label} {:.2}s, {} cg iters, converged={}",
+                    mesh.connectivity.len() / 2,
+                    timer.elapsed().as_secs_f64(),
+                    result.stats.cg_iterations,
+                    result.stats.converged,
+                );
+            }
         }
     }
 

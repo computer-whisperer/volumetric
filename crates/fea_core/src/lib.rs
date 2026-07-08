@@ -31,9 +31,13 @@
 pub mod element;
 pub mod frame;
 pub mod inverse;
+#[cfg(feature = "parallel")]
+pub mod schwarz;
 
 pub use element::{ElementStiffness, Material, cube_stiffness, hex8_stiffness};
 pub use inverse::{InverseConfig, InverseResult, TargetMap, solve_inverse};
+#[cfg(feature = "parallel")]
+pub use schwarz::SchwarzParams;
 use volumetric_abi::fea::{FeaElementKind, FeaMesh};
 
 /// An implicit rigid body, sampled by occupancy (the Model ABI contract).
@@ -101,6 +105,19 @@ impl FixedBoundary {
     }
 }
 
+/// Which CG preconditioner the solve uses.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum PrecondChoice {
+    /// Block-Jacobi when the model assembles node blocks, scalar otherwise.
+    #[default]
+    Auto,
+    /// Two-level additive Schwarz (Bar2 frames only; falls back to Auto for
+    /// other element kinds). The scale/parallelism prototype — see the
+    /// `schwarz` module docs.
+    #[cfg(feature = "parallel")]
+    Schwarz(SchwarzParams),
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct SolveConfig {
     pub material: Material,
@@ -109,6 +126,7 @@ pub struct SolveConfig {
     pub cg_tolerance: f64,
     pub cg_max_iterations: usize,
     pub max_contact_iterations: usize,
+    pub preconditioner: PrecondChoice,
 }
 
 impl Default for SolveConfig {
@@ -122,6 +140,7 @@ impl Default for SolveConfig {
             cg_tolerance: 1e-8,
             cg_max_iterations: 20_000,
             max_contact_iterations: 16,
+            preconditioner: PrecondChoice::Auto,
         }
     }
 }
@@ -339,9 +358,11 @@ impl StiffnessModel for HexModel<'_> {
     }
 }
 
-/// The CG preconditioner: scalar Jacobi, or per-node block Jacobi when the
-/// model can assemble its node-diagonal blocks.
-enum Precond {
+/// The CG preconditioner: scalar Jacobi, per-node block Jacobi when the
+/// model can assemble its node-diagonal blocks, or a prebuilt two-level
+/// Schwarz preconditioner (borrowed — it outlives the per-contact-iteration
+/// scalar/block rebuilds).
+enum Precond<'a> {
     /// Reciprocal-safe scalar diagonal.
     Scalar(Vec<f64>),
     /// Per-node inverted blocks (row-major `dpn x dpn`), constraint
@@ -349,9 +370,55 @@ enum Precond {
     /// plain per-node matvec, which vectorizes far better than triangular
     /// solves.
     Block { dpn: usize, inverses: Vec<f64> },
+    #[cfg(feature = "parallel")]
+    Schwarz(&'a schwarz::SchwarzPrecond),
+    #[cfg(not(feature = "parallel"))]
+    #[allow(dead_code)]
+    Never(std::marker::PhantomData<&'a ()>),
 }
 
-impl Precond {
+/// Mask per-node blocks against the constraint set and invert them for
+/// block-Jacobi application: constrained (and zero-stiffness) dofs become
+/// identity rows/cols so they pass through untouched, numerically degenerate
+/// blocks fall back to their reciprocal diagonal.
+pub(crate) fn invert_node_blocks(blocks: &[f64], dpn: usize, constrained: &[bool]) -> Vec<f64> {
+    let node_count = constrained.len() / dpn;
+    let mut inverses = vec![0.0f64; blocks.len()];
+    let mut factor = vec![0.0f64; dpn * dpn];
+    for node in 0..node_count {
+        factor.copy_from_slice(&blocks[node * dpn * dpn..(node + 1) * dpn * dpn]);
+        for i in 0..dpn {
+            if constrained[node * dpn + i] || factor[i * dpn + i] <= 0.0 {
+                for j in 0..dpn {
+                    factor[i * dpn + j] = 0.0;
+                    factor[j * dpn + i] = 0.0;
+                }
+                factor[i * dpn + i] = 1.0;
+            }
+        }
+        let inv = &mut inverses[node * dpn * dpn..(node + 1) * dpn * dpn];
+        if cholesky_in_place(&mut factor, dpn) {
+            // Invert via solves against identity columns.
+            let mut col = vec![0.0f64; dpn];
+            for j in 0..dpn {
+                col.fill(0.0);
+                col[j] = 1.0;
+                cholesky_solve_in_place(&factor, dpn, &mut col);
+                for i in 0..dpn {
+                    inv[i * dpn + j] = col[i];
+                }
+            }
+        } else {
+            for i in 0..dpn {
+                let d = blocks[node * dpn * dpn + i * dpn + i];
+                inv[i * dpn + i] = if d > 0.0 { 1.0 / d } else { 1.0 };
+            }
+        }
+    }
+    inverses
+}
+
+impl Precond<'_> {
     /// Build for the current constraint set. `diag`/`blocks` are the
     /// unmasked assemblies, computed once per solve; constraints change per
     /// contact iteration, so masking and factoring happen here.
@@ -364,53 +431,25 @@ impl Precond {
         let Some(blocks) = blocks else {
             return Self::Scalar(diag.to_vec());
         };
-        let node_count = constrained.len() / dpn;
-        let mut inverses = vec![0.0f64; blocks.len()];
-        let mut factor = vec![0.0f64; dpn * dpn];
-        for node in 0..node_count {
-            factor.copy_from_slice(&blocks[node * dpn * dpn..(node + 1) * dpn * dpn]);
-            for i in 0..dpn {
-                // Identity out constrained dofs and any zero-stiffness dof
-                // (floating node) so the factorization exists and those dofs
-                // pass through untouched, matching the scalar fallback.
-                if constrained[node * dpn + i] || factor[i * dpn + i] <= 0.0 {
-                    for j in 0..dpn {
-                        factor[i * dpn + j] = 0.0;
-                        factor[j * dpn + i] = 0.0;
-                    }
-                    factor[i * dpn + i] = 1.0;
-                }
-            }
-            let inv = &mut inverses[node * dpn * dpn..(node + 1) * dpn * dpn];
-            if cholesky_in_place(&mut factor, dpn) {
-                // Invert via solves against identity columns.
-                let mut col = vec![0.0f64; dpn];
-                for j in 0..dpn {
-                    col.fill(0.0);
-                    col[j] = 1.0;
-                    cholesky_solve_in_place(&factor, dpn, &mut col);
-                    for i in 0..dpn {
-                        inv[i * dpn + j] = col[i];
-                    }
-                }
-            } else {
-                // Not SPD after masking (numerically degenerate block):
-                // fall back to its reciprocal diagonal.
-                for i in 0..dpn {
-                    let d = blocks[node * dpn * dpn + i * dpn + i];
-                    inv[i * dpn + i] = if d > 0.0 { 1.0 / d } else { 1.0 };
-                }
-            }
+        Self::Block {
+            dpn,
+            inverses: invert_node_blocks(blocks, dpn, constrained),
         }
-        Self::Block { dpn, inverses }
     }
 
-    fn apply(&self, r: &[f64], z: &mut [f64]) {
+    fn apply(&self, r: &[f64], z: &mut [f64], constrained: &[bool]) {
         match self {
             Self::Scalar(diag) => {
                 for i in 0..r.len() {
                     z[i] = if diag[i] > 0.0 { r[i] / diag[i] } else { r[i] };
                 }
+            }
+            #[cfg(feature = "parallel")]
+            Self::Schwarz(precond) => precond.apply(r, z, constrained),
+            #[cfg(not(feature = "parallel"))]
+            Self::Never(_) => {
+                let _ = constrained;
+                unreachable!()
             }
             Self::Block { dpn, inverses } => {
                 let dpn = *dpn;
@@ -502,7 +541,7 @@ fn solve_cg(
     }
     let target = norm0 * tolerance;
 
-    let precond = |r: &[f64], z: &mut [f64]| precond.apply(r, z);
+    let precond = |r: &[f64], z: &mut [f64]| precond.apply(r, z, constrained);
 
     let mut z = vec![0.0; n];
     precond(&r, &mut z);
@@ -623,11 +662,11 @@ pub fn solve(
                 scales,
                 h,
             };
-            contact_solve(mesh, &model, rigid, config)
+            contact_solve(mesh, &model, None, rigid, config)
         }
         FeaElementKind::Bar2 => {
             let model = frame::FrameModel::new(mesh, config.material)?;
-            contact_solve(mesh, &model, rigid, config)
+            contact_solve(mesh, &model, Some(&model), rigid, config)
         }
     }
 }
@@ -635,9 +674,14 @@ pub fn solve(
 /// The active-set contact driver: element-kind-independent, working on the
 /// assembled stiffness action. Nodes on the fixed face are glued in all
 /// dofs; contact prescribes the translational contact-axis dof.
+///
+/// `frame` is the concrete model when the elements are Bar2 struts — the
+/// Schwarz preconditioner assembles subdomain matrices from struts and so
+/// cannot be built from the type-erased stiffness action alone.
 fn contact_solve(
     mesh: &FeaMesh,
     model: &dyn StiffnessModel,
+    frame: Option<&frame::FrameModel>,
     rigid: &mut dyn RigidBody,
     config: &SolveConfig,
 ) -> Result<SolveResult, String> {
@@ -679,9 +723,21 @@ fn contact_solve(
     }
 
     // Unmasked preconditioner assemblies; the constraint-dependent masking
-    // and factoring happen per contact iteration.
+    // and factoring happen per contact iteration. The Schwarz preconditioner
+    // is built ONCE against the glued-face constraints (rebuilding dense
+    // subdomain factors per contact iteration would dwarf the CG cost);
+    // contact constraints are handled by masking its output.
     let diag = model.diagonal();
     let blocks = model.node_blocks();
+    #[cfg(feature = "parallel")]
+    let schwarz_precond = match (config.preconditioner, frame) {
+        (PrecondChoice::Schwarz(params), Some(frame_model)) => {
+            schwarz::SchwarzPrecond::build(mesh, frame_model, &constrained, params)
+        }
+        _ => None,
+    };
+    #[cfg(not(feature = "parallel"))]
+    let _ = frame;
 
     let mut u = vec![0.0f64; n];
     let mut active: std::collections::HashMap<usize, f64> = std::collections::HashMap::new();
@@ -748,6 +804,12 @@ fn contact_solve(
             }
         }
 
+        #[cfg(feature = "parallel")]
+        let precond = match &schwarz_precond {
+            Some(schwarz) => Precond::Schwarz(schwarz),
+            None => Precond::build(&diag, blocks.as_deref(), dpn, &constrained),
+        };
+        #[cfg(not(feature = "parallel"))]
         let precond = Precond::build(&diag, blocks.as_deref(), dpn, &constrained);
         let (iterations, cg_converged) = solve_cg(
             model,

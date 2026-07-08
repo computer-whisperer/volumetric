@@ -112,11 +112,28 @@ fn main() {
             .unwrap_or(f64::NAN)
     };
 
-    // Experiment knob: override the CG tolerance (default 1e-8) to measure
-    // how tight the inner solves actually need to be.
+    // Experiment knobs: override the CG tolerance (default 1e-8) to measure
+    // how tight the inner solves actually need to be; PROFILE_SCHWARZ=<nodes>
+    // switches to the two-level Schwarz preconditioner with that subdomain
+    // size (needs fea_core's `parallel` feature).
     let cg_tolerance = std::env::var("PROFILE_CG_TOL")
         .ok()
         .and_then(|s| s.parse().ok());
+    // PROFILE_SCHWARZ=<nodes>[,bj] — `bj` swaps the dense subdomain solves
+    // for block-Jacobi at the fine level (coarse space unchanged).
+    let preconditioner = match std::env::var("PROFILE_SCHWARZ") {
+        Ok(spec) => {
+            let (nodes, dense) = match spec.split_once(',') {
+                Some((nodes, "bj")) => (nodes.to_string(), false),
+                _ => (spec, true),
+            };
+            fea_core::PrecondChoice::Schwarz(fea_core::SchwarzParams {
+                target_nodes: nodes.parse().expect("PROFILE_SCHWARZ=<nodes>[,bj]"),
+                dense_local: dense,
+            })
+        }
+        Err(_) => fea_core::PrecondChoice::Auto,
+    };
     let inverse_config = fea_core::InverseConfig {
         solve: fea_core::SolveConfig {
             material: fea_core::Material {
@@ -126,6 +143,7 @@ fn main() {
             fixed_boundary: fea_core::FixedBoundary::parse(&config.fixed_boundary)
                 .expect("fixed_boundary"),
             cg_tolerance: cg_tolerance.unwrap_or(fea_core::SolveConfig::default().cg_tolerance),
+            preconditioner,
             ..Default::default()
         },
         max_iterations: config.max_iterations as usize,
