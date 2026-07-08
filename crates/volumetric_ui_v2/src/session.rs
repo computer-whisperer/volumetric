@@ -2361,24 +2361,117 @@ fn build_fea_mesh_preview(
         }
     }
 
-    // Bar2 strut meshes have no boundary faces: draw every strut as a line
-    // segment, colored by the chosen field (until dedicated capsule
-    // rendering lands).
+    // Bar2 strut meshes have no boundary faces: draw every strut as a
+    // hexagonal capped prism at the mesh's own `radius` field (the base
+    // radius — the scale-to-radius exponent belongs to the realization
+    // operator's config, so the designed radii are what the strut_model
+    // output's preview shows; colormap element:stiffness_scale to see the
+    // design here). Radial side normals shade the prisms as round tubes;
+    // joints rely on overlap at shared nodes rather than sphere blending.
     if mesh.element_kind == volumetric::fea::FeaElementKind::Bar2 {
+        let radius_field = mesh
+            .element_fields
+            .iter()
+            .find(|f| f.name == "radius" && f.components == 1);
+        // Fallback for meshes without radii: a tenth of the mean strut
+        // length, so the structure still reads.
+        let mean_length = {
+            let total: f32 = (0..mesh.element_count())
+                .map(|e| {
+                    let p = position(mesh.element(e)[0]);
+                    let q = position(mesh.element(e)[1]);
+                    (Vec3::from(q) - Vec3::from(p)).length()
+                })
+                .sum();
+            total / mesh.element_count().max(1) as f32
+        };
+        let fallback_radius = (mean_length / 10.0).max(1e-6);
+
+        const SIDES: usize = 6;
         for e in 0..mesh.element_count() {
-            let [a, b] = [mesh.element(e)[0], mesh.element(e)[1]];
-            let color = match &color_source {
-                Some(ColorSource::Element(values)) => color_for(values[e]),
-                Some(ColorSource::Node(values)) => {
-                    color_for(0.5 * (values[a as usize] + values[b as usize]))
+            let [na, nb] = [mesh.element(e)[0], mesh.element(e)[1]];
+            let a = Vec3::from(position(na));
+            let b = Vec3::from(position(nb));
+            let axis = b - a;
+            let length = axis.length();
+            if !(length.is_finite() && length > 0.0) {
+                continue;
+            }
+            let axis = axis / length;
+            let radius = radius_field
+                .map(|f| f.data[e] as f32)
+                .filter(|r| r.is_finite() && *r > 0.0)
+                .unwrap_or(fallback_radius);
+            let (color_a, color_b) = match &color_source {
+                Some(ColorSource::Element(values)) => {
+                    let c = color_for(values[e]);
+                    (c, c)
                 }
-                None => [0.75, 0.8, 0.9, 1.0],
+                Some(ColorSource::Node(values)) => (
+                    color_for(values[na as usize]),
+                    color_for(values[nb as usize]),
+                ),
+                None => {
+                    let c = [0.82, 0.85, 0.9, 1.0];
+                    (c, c)
+                }
             };
-            segments.push(renderer::LineSegment {
-                start: position(a),
-                end: position(b),
-                color,
-            });
+
+            // An orthonormal ring basis perpendicular to the strut.
+            let seed = if axis.x.abs() < 0.9 { Vec3::X } else { Vec3::Y };
+            let u = axis.cross(seed).normalize();
+            let w = axis.cross(u);
+            let ring_dir = |k: usize| -> Vec3 {
+                let theta = std::f32::consts::TAU * k as f32 / SIDES as f32;
+                u * theta.cos() + w * theta.sin()
+            };
+
+            // Sides: radial (smooth) normals, colors interpolating the
+            // strut's ends.
+            for k in 0..SIDES {
+                let (d0, d1) = (ring_dir(k), ring_dir((k + 1) % SIDES));
+                let quad = [
+                    (a + d0 * radius, d0, color_a),
+                    (b + d0 * radius, d0, color_b),
+                    (b + d1 * radius, d1, color_b),
+                    (a + d1 * radius, d1, color_a),
+                ];
+                for idx in [0, 1, 2, 0, 2, 3] {
+                    let (p, n, c) = quad[idx];
+                    vertices.push(renderer::MeshVertex::colored(
+                        p.to_array(),
+                        n.to_array(),
+                        c,
+                    ));
+                }
+            }
+            // Flat end caps (fans anchored at ring vertex 0).
+            for k in 1..SIDES - 1 {
+                for (p0, p1, p2, normal, color) in [
+                    (
+                        a + ring_dir(0) * radius,
+                        a + ring_dir(k + 1) * radius,
+                        a + ring_dir(k) * radius,
+                        -axis,
+                        color_a,
+                    ),
+                    (
+                        b + ring_dir(0) * radius,
+                        b + ring_dir(k) * radius,
+                        b + ring_dir(k + 1) * radius,
+                        axis,
+                        color_b,
+                    ),
+                ] {
+                    for p in [p0, p1, p2] {
+                        vertices.push(renderer::MeshVertex::colored(
+                            p.to_array(),
+                            normal.to_array(),
+                            color,
+                        ));
+                    }
+                }
+            }
         }
     }
 
@@ -2962,7 +3055,7 @@ mod tests {
     }
 
     #[test]
-    fn bar2_preview_draws_struts_as_lines() {
+    fn bar2_preview_draws_struts_as_capsule_prisms() {
         use volumetric::fea::{FeaElementKind, FeaField, FeaMesh, encode_fea_mesh};
         let mesh = FeaMesh {
             element_kind: FeaElementKind::Bar2,
@@ -2987,14 +3080,41 @@ mod tests {
         request.data = Arc::new(encode_fea_mesh(&mesh));
         let entity = build_preview_scene(&request).expect("bar2 preview builds");
 
-        // No boundary faces, so no triangle soup — just strut lines.
-        assert!(entity.scene.meshes.is_empty());
-        let lines = entity.wireframe_lines.expect("strut preview has lines");
-        assert_eq!(lines.segments.len(), 2);
+        // Each strut renders as a capped hexagonal prism: 12 side + 8 cap
+        // triangles, 60 vertices.
+        let scene_mesh = &entity.scene.meshes[0].0;
+        assert_eq!(scene_mesh.vertices.len(), 2 * 60);
+        assert_eq!(entity.stats.triangles, 2 * 20);
+
+        // The element colormap tints each strut uniformly, and the two
+        // struts (radius 0.1 vs 0.2) differently.
+        let strut_color = |strut: usize| -> [f32; 4] {
+            let base = strut * 60;
+            let color = scene_mesh.vertices[base].color;
+            assert!(
+                scene_mesh.vertices[base..base + 60]
+                    .iter()
+                    .all(|v| v.color == color),
+                "strut {strut} not uniformly colored"
+            );
+            color
+        };
         assert_ne!(
-            lines.segments[0].color, lines.segments[1].color,
+            strut_color(0),
+            strut_color(1),
             "element colormap should tint the two struts differently"
         );
+
+        // Prism cross-sections honor the radius field: the first strut's
+        // ring vertices sit 0.1 off its axis (y/z extent), the second 0.2.
+        let max_lateral = |strut: usize| -> f32 {
+            scene_mesh.vertices[strut * 60..(strut + 1) * 60]
+                .iter()
+                .map(|v| v.position[1].abs().max(v.position[2].abs()))
+                .fold(0.0f32, f32::max)
+        };
+        assert!((max_lateral(0) - 0.1).abs() < 1e-5);
+
         assert!(
             entity
                 .stats
