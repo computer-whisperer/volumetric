@@ -1,0 +1,23 @@
+# volumetric_daemon image. Build from the REPO ROOT (the workspace is the
+# build context so path deps resolve):
+#
+#   buildah build -f crates/volumetric_daemon/Containerfile .
+#
+# or just run crates/volumetric_daemon/build-push.sh.
+FROM docker.io/library/rust:1.96-bookworm AS builder
+WORKDIR /build
+COPY . .
+RUN cargo build --release --locked -p volumetric_daemon
+
+FROM docker.io/library/debian:bookworm-slim
+# tini: the daemon installs no signal handlers, and PID 1 ignores default
+# signal dispositions — without an init, SIGTERM on pod shutdown would hang
+# until the kill grace period expires.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends tini \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /build/target/release/volumetric_daemon /usr/local/bin/volumetric_daemon
+EXPOSE 7373
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/volumetric_daemon"]
+# The pod network is IPv6-only; callers override args in the deployment spec.
+CMD ["--bind", "[::]:7373"]
