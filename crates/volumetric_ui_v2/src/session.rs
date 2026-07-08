@@ -864,7 +864,7 @@ fn mesh_triangles(mesh: &renderer::MeshData, transform: Mat4, out: &mut Vec<volu
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct PreviewSceneKey {
+pub(crate) struct PreviewSceneKey {
     asset_id: String,
     data_ptr: usize,
     data_len: usize,
@@ -1170,15 +1170,15 @@ impl PreviewCache {
 }
 
 pub struct PreviewBuildJob {
-    key: PreviewSceneKey,
-    request: PreviewRequest,
+    pub(crate) key: PreviewSceneKey,
+    pub(crate) request: PreviewRequest,
     /// Cooperative cancel flag; the cache holds the other end.
-    cancel: Arc<AtomicBool>,
+    pub(crate) cancel: Arc<AtomicBool>,
 }
 
 pub struct PreviewBuildResult {
-    key: PreviewSceneKey,
-    result: Result<PreviewEntity, PreviewBuildError>,
+    pub(crate) key: PreviewSceneKey,
+    pub(crate) result: Result<PreviewEntity, PreviewBuildError>,
 }
 
 /// Why a preview build produced no entity.
@@ -1187,6 +1187,53 @@ pub enum PreviewBuildError {
     /// never surfaced to the user.
     Cancelled,
     Failed(String),
+}
+
+/// Where the heavy compute inside background jobs executes: in this process
+/// ([`LocalBackend`]) or forwarded to a build daemon
+/// ([`crate::remote::RemoteBackend`]). Only the work that scales with model
+/// size goes through here — project runs and ASN2 meshing. Lightbox
+/// sampling, marching-cubes/point-cloud previews, scene assembly, and
+/// bundled-operator metadata always run locally regardless of backend.
+pub trait ExecutionBackend: Send + Sync {
+    fn run_project(
+        &self,
+        project: &volumetric::Project,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<volumetric::LoadedAsset>, String>;
+
+    /// `Ok(None)` means the cancel flag was observed and the mesh abandoned.
+    fn mesh_model(
+        &self,
+        model_wasm: &[u8],
+        config: &volumetric::adaptive_surface_nets_2::AdaptiveMeshConfig2,
+        cancel: &AtomicBool,
+    ) -> Result<Option<volumetric::AdaptiveMeshV2Result>, String>;
+}
+
+/// Executes in this process, on whatever thread calls it.
+pub struct LocalBackend;
+
+impl ExecutionBackend for LocalBackend {
+    fn run_project(
+        &self,
+        project: &volumetric::Project,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<volumetric::LoadedAsset>, String> {
+        project
+            .run_cancellable(&mut volumetric::Environment::new(), cancel)
+            .map_err(|err| err.to_string())
+    }
+
+    fn mesh_model(
+        &self,
+        model_wasm: &[u8],
+        config: &volumetric::adaptive_surface_nets_2::AdaptiveMeshConfig2,
+        cancel: &AtomicBool,
+    ) -> Result<Option<volumetric::AdaptiveMeshV2Result>, String> {
+        volumetric::generate_adaptive_mesh_v2_from_bytes_cancellable(model_wasm, config, cancel)
+            .map_err(format_error_chain)
+    }
 }
 
 /// A unit of background work, produced by [`Session::sync`] and consumed by
@@ -1288,9 +1335,16 @@ impl JobQueue {
     }
 }
 
-/// Executes one background job to completion. Blocking; run it off the UI
-/// thread (or accept the stall, as a single-threaded web shell might).
+/// Executes one background job to completion in-process. Blocking; run it
+/// off the UI thread (or accept the stall, as a single-threaded web shell
+/// might).
 pub fn execute_job(job: BackgroundJob) -> BackgroundResult {
+    execute_job_with(job, &LocalBackend)
+}
+
+/// [`execute_job`] with the heavy compute (project run, ASN2 meshing) routed
+/// through `backend`; everything else executes in-process.
+pub fn execute_job_with(job: BackgroundJob, backend: &dyn ExecutionBackend) -> BackgroundResult {
     match job {
         BackgroundJob::RunProject {
             generation,
@@ -1300,9 +1354,7 @@ pub fn execute_job(job: BackgroundJob) -> BackgroundResult {
             // std::time::Instant panics on wasm32-unknown-unknown; swap for
             // web-time when the web shell lands.
             let start = std::time::Instant::now();
-            let result = project
-                .run_cancellable(&mut volumetric::Environment::new(), &cancel)
-                .map_err(|err| err.to_string());
+            let result = backend.run_project(&project, &cancel);
             BackgroundResult::ProjectComplete {
                 generation,
                 result,
@@ -1310,7 +1362,7 @@ pub fn execute_job(job: BackgroundJob) -> BackgroundResult {
             }
         }
         BackgroundJob::BuildPreview(job) => {
-            let result = match build_preview_scene_cancellable(&job.request, &job.cancel) {
+            let result = match build_preview_scene_with(&job.request, &job.cancel, backend) {
                 Ok(Some(entity)) => Ok(entity),
                 Ok(None) => Err(PreviewBuildError::Cancelled),
                 Err(error) => Err(PreviewBuildError::Failed(error)),
@@ -1677,6 +1729,18 @@ pub fn build_preview_scene_cancellable(
     request: &PreviewRequest,
     cancel: &AtomicBool,
 ) -> Result<Option<PreviewEntity>, String> {
+    build_preview_scene_with(request, cancel, &LocalBackend)
+}
+
+/// [`build_preview_scene_cancellable`] with the ASN2 meshing pass routed
+/// through `backend` (scene assembly, colormapping, and the cheap plans stay
+/// in-process — they need the local model executor or are not worth a round
+/// trip).
+pub fn build_preview_scene_with(
+    request: &PreviewRequest,
+    cancel: &AtomicBool,
+    backend: &dyn ExecutionBackend,
+) -> Result<Option<PreviewEntity>, String> {
     let build_start = std::time::Instant::now();
     let mut stats = OutputStats::default();
 
@@ -1758,13 +1822,7 @@ pub fn build_preview_scene_cancellable(
             let config = mesh_plan
                 .adaptive_surface_nets_config()
                 .ok_or_else(|| "missing adaptive surface nets config".to_string())?;
-            let Some(mesh) = volumetric::generate_adaptive_mesh_v2_from_bytes_cancellable(
-                request.data.as_slice(),
-                &config,
-                cancel,
-            )
-            .map_err(format_error_chain)?
-            else {
+            let Some(mesh) = backend.mesh_model(request.data.as_slice(), &config, cancel)? else {
                 return Ok(None);
             };
             stats.triangles = mesh.indices.len() / 3;

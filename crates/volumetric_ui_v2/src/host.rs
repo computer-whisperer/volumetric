@@ -25,10 +25,12 @@ use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowId};
 
+use crate::remote::RemoteBackend;
 use crate::session::{
-    BackgroundJob, BackgroundResult, JobQueue, Session, ViewportRenderParams, execute_job,
+    BackgroundJob, BackgroundResult, ExecutionBackend, JobQueue, LocalBackend, Session,
+    ViewportRenderParams, execute_job_with,
 };
-use crate::{FileAction, VIEWPORT_KEY, VolumetricUiV2};
+use crate::{ExecutorChoice, FileAction, VIEWPORT_KEY, VolumetricUiV2};
 
 pub fn run(
     title: &'static str,
@@ -46,7 +48,7 @@ pub fn run(
         modifiers: KeyModifiers::default(),
         last_cursor: Cursor::Default,
         pending_resize: None,
-        worker: BackgroundWorker::new(),
+        worker: BackgroundWorker::new(Arc::new(LocalBackend)),
         files: FileWorker::new(proxy),
     };
     event_loop.run_app(&mut host)?;
@@ -358,6 +360,19 @@ impl Host {
 
         gfx.session
             .pre_frame(&mut self.app, self.worker.drain_results());
+
+        // Swap the execution backend after results are routed and before
+        // jobs dispatch, so this frame's re-queued work lands on the new
+        // worker. The old worker thread exits after its current job; the app
+        // cancelled that job's bookkeeping when it requested the swap, so
+        // its (lost) results were already written off.
+        if let Some(choice) = self.app.take_executor_request() {
+            let backend: Arc<dyn ExecutionBackend> = match &choice {
+                ExecutorChoice::Local => Arc::new(LocalBackend),
+                ExecutorChoice::Remote(address) => Arc::new(RemoteBackend::new(address)),
+            };
+            self.worker = BackgroundWorker::new(backend);
+        }
 
         // Apply finished file operations, then hand any newly queued action
         // to the file worker. Both before the session sync so an opened
@@ -759,7 +774,10 @@ struct BackgroundWorker {
 }
 
 impl BackgroundWorker {
-    fn new() -> Self {
+    /// Spawns the worker over an execution backend — [`LocalBackend`], or a
+    /// [`RemoteBackend`] when remote build is enabled. Replacing the worker
+    /// drops this sender; the thread exits after its current job.
+    fn new(backend: Arc<dyn ExecutionBackend>) -> Self {
         let (job_tx, job_rx) = mpsc::channel::<BackgroundJob>();
         let (result_tx, result_rx) = mpsc::channel::<BackgroundResult>();
 
@@ -781,7 +799,9 @@ impl BackgroundWorker {
                         queue.push(job);
                     }
                     if let Some(job) = queue.pop()
-                        && result_tx.send(execute_job(job)).is_err()
+                        && result_tx
+                            .send(execute_job_with(job, backend.as_ref()))
+                            .is_err()
                     {
                         break;
                     }
@@ -842,7 +862,7 @@ mod tests {
     /// reports the result back through the channel, tagged with its generation.
     #[test]
     fn background_worker_runs_project_off_thread() {
-        let worker = BackgroundWorker::new();
+        let worker = BackgroundWorker::new(Arc::new(LocalBackend));
         let project = VolumetricUiV2::default().project().clone();
         let cancel = Arc::new(AtomicBool::new(false));
         worker.send(BackgroundJob::RunProject {

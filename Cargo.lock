@@ -5086,6 +5086,7 @@ dependencies = [
  "volumetric",
  "volumetric_abi",
  "volumetric_assets",
+ "volumetric_protocol",
  "wasmtime",
  "wgpu",
 ]
@@ -5168,6 +5169,8 @@ dependencies = [
  "rfd",
  "volumetric",
  "volumetric_assets",
+ "volumetric_daemon",
+ "volumetric_protocol",
  "volumetric_renderer",
  "wat",
  "wgpu",

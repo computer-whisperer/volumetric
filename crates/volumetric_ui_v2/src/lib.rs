@@ -33,6 +33,7 @@ static PIN_ICON: LazyLock<SvgIcon> = LazyLock::new(|| {
 });
 
 pub mod host;
+pub mod remote;
 pub mod session;
 
 pub const VIEWPORT_KEY: &str = "viewport";
@@ -46,6 +47,7 @@ pub const IMPORT_IMAGE_KEY: &str = "action:import-image";
 pub const RUN_PROJECT_KEY: &str = "action:run-project";
 pub const CANCEL_RUN_KEY: &str = "action:cancel-run";
 pub const TOGGLE_AUTO_REBUILD_KEY: &str = "action:toggle-auto-rebuild";
+pub const TOGGLE_REMOTE_BUILD_KEY: &str = "action:toggle-remote-build";
 pub const CANCEL_MESH_KEY: &str = "action:cancel-mesh";
 pub const REMESH_KEY: &str = "action:remesh";
 pub const TOGGLE_AUTO_REMESH_KEY: &str = "action:toggle-auto-remesh";
@@ -69,6 +71,9 @@ const CAMERA_SELECT_KEY: &str = "view:camera";
 /// SSAO parameter popover trigger; steppers use `view:ssao-adj:{field}:{dir}`.
 const SSAO_SETTINGS_KEY: &str = "view:ssao";
 const SSAO_ADJUST_PREFIX: &str = "view:ssao-adj:";
+/// Remote-build settings popover trigger and the daemon address input in it.
+const REMOTE_SETTINGS_KEY: &str = "view:remote-settings";
+const REMOTE_ADDRESS_KEY: &str = "remote-address-input";
 /// Per-output render settings: `output:settings:{id}` opens the popover
 /// (plus `:dismiss`); mode/res routes end `:{value}` after the asset id.
 const OUTPUT_SETTINGS_PREFIX: &str = "output:settings:";
@@ -407,6 +412,15 @@ impl PreviewMeshPlan {
                 }),
         })
     }
+}
+
+/// Where the shell's background worker executes heavy jobs. Produced by the
+/// remote-build toggle, consumed by the host, which rebuilds its worker
+/// around the matching [`session::ExecutionBackend`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExecutorChoice {
+    Local,
+    Remote(String),
 }
 
 #[derive(Clone, Debug)]
@@ -792,6 +806,14 @@ pub struct VolumetricUiV2 {
     remesh_requested: bool,
     /// One-shot: cancel all in-flight preview mesh builds.
     mesh_cancel_requested: bool,
+    /// Run project builds and ASN2 meshing on a remote daemon. The address
+    /// buffer below applies when this is toggled on.
+    remote_build: bool,
+    /// Daemon base URL (controlled text input in the remote settings
+    /// popover). Edits take effect the next time remote build is toggled on.
+    remote_address: String,
+    /// One-shot: the shell should swap its execution backend.
+    executor_request: Option<ExecutorChoice>,
     /// An Add-menu operator click waiting for dispatch to the background
     /// worker (reading operator metadata compiles its wasm — too slow for
     /// the UI thread). The step is inserted when the result arrives.
@@ -878,6 +900,9 @@ impl VolumetricUiV2 {
             auto_remesh: true,
             remesh_requested: false,
             mesh_cancel_requested: false,
+            remote_build: false,
+            remote_address: format!("http://127.0.0.1:{}", volumetric_protocol::DEFAULT_PORT),
+            executor_request: None,
             operator_add_request: None,
             operator_add_inflight: None,
             preview_build_status: PreviewBuildStatus::Idle,
@@ -1492,6 +1517,15 @@ impl VolumetricUiV2 {
     /// mesh builds.
     pub(crate) fn take_mesh_cancel_request(&mut self) -> bool {
         std::mem::take(&mut self.mesh_cancel_requested)
+    }
+
+    /// One-shot: the executor swap requested by the remote-build toggle.
+    pub(crate) fn take_executor_request(&mut self) -> Option<ExecutorChoice> {
+        self.executor_request.take()
+    }
+
+    pub fn remote_build(&self) -> bool {
+        self.remote_build
     }
 
     /// Host hook: consumes a queued operator-add metadata request for
@@ -2565,9 +2599,10 @@ impl VolumetricUiV2 {
             MODE_SELECT_KEY,
             RESOLUTION_SELECT_KEY,
             CAMERA_SELECT_KEY,
-            // Not a value picker (steppers live inside), but the trigger and
+            // Not value pickers (controls live inside), but the trigger and
             // dismiss-scrim routes follow the same shape; Pick never fires.
             SSAO_SETTINGS_KEY,
+            REMOTE_SETTINGS_KEY,
         ] {
             let Some(action) = select::classify_event(event, key) else {
                 continue;
@@ -2740,6 +2775,18 @@ impl App for VolumetricUiV2 {
                 return;
             }
         }
+        // Controlled editing for the remote daemon address buffer (takes
+        // effect the next time the Remote toggle is switched on).
+        if event.target_key() == Some(REMOTE_ADDRESS_KEY) {
+            text_input::apply_event(
+                &mut self.remote_address,
+                &mut self.selection,
+                &event,
+                REMOTE_ADDRESS_KEY,
+            );
+            return;
+        }
+
         // Track focus/selection moving to another widget (e.g. clicking away).
         if let Some(selection) = event.selection.clone() {
             self.selection = selection;
@@ -2849,6 +2896,29 @@ impl App for VolumetricUiV2 {
                 "auto-rebuild on".to_string()
             } else {
                 "auto-rebuild off".to_string()
+            };
+            return;
+        }
+
+        if event.is_click_or_activate(TOGGLE_REMOTE_BUILD_KEY) {
+            self.remote_build = !self.remote_build;
+            let address = self.remote_address.trim().to_string();
+            self.executor_request = Some(if self.remote_build {
+                ExecutorChoice::Remote(address.clone())
+            } else {
+                ExecutorChoice::Local
+            });
+            // Work in flight sits on the worker being replaced and will
+            // never report back: write it off now, and queue a fresh run +
+            // remesh so the new executor rebuilds everything.
+            self.cancel_requested = true;
+            self.mesh_cancel_requested = true;
+            self.remesh_requested = true;
+            self.pending_run = true;
+            self.status = if self.remote_build {
+                format!("remote build on {address}")
+            } else {
+                "remote build off (building locally)".to_string()
             };
             return;
         }
@@ -3090,6 +3160,12 @@ fn top_bar(app: &VolumetricUiV2) -> El {
     items.extend([
         toggle_chip("Auto mesh", app.auto_remesh, TOGGLE_AUTO_REMESH_KEY),
         toggle_chip("Auto run", app.auto_rebuild, TOGGLE_AUTO_REBUILD_KEY),
+        toggle_chip("Remote", app.remote_build, TOGGLE_REMOTE_BUILD_KEY),
+        icon_button("chevron-down")
+            .ghost()
+            .xsmall()
+            .tooltip("Remote build settings")
+            .key(REMOTE_SETTINGS_KEY),
         run_control(app),
     ]);
     toolbar(items)
@@ -3182,6 +3258,7 @@ fn select_layer(app: &VolumetricUiV2) -> Option<El> {
             }),
         )),
         SSAO_SETTINGS_KEY => Some(ssao_settings_popover(app)),
+        REMOTE_SETTINGS_KEY => Some(remote_settings_popover(app)),
         _ => None,
     }
 }
@@ -3328,6 +3405,38 @@ fn ssao_settings_popover(app: &VolumetricUiV2) -> El {
         .gap(tokens::SPACE_2)
         .padding(tokens::SPACE_2)
         .width(Size::Fixed(240.0))]),
+    )
+}
+
+/// Anchored popover with the remote build daemon address. The address is a
+/// controlled text input into a plain buffer; it takes effect the next time
+/// the Remote toggle is switched on, so mid-edit keystrokes never tear down
+/// a live executor.
+fn remote_settings_popover(app: &VolumetricUiV2) -> El {
+    let state = if app.remote_build {
+        format!("building on {}", app.remote_address.trim())
+    } else {
+        "building locally".to_string()
+    };
+    popover(
+        REMOTE_SETTINGS_KEY,
+        Anchor::below_key(REMOTE_SETTINGS_KEY),
+        popover_panel([column([
+            text("Remote build").label().semibold(),
+            field_row(
+                "Daemon",
+                text_input(REMOTE_ADDRESS_KEY, &app.remote_address, &app.selection)
+                    .width(Size::Fill(1.0)),
+            )
+            .gap(tokens::SPACE_2),
+            text(state).caption().muted(),
+            text("Address changes apply when Remote is toggled on.")
+                .caption()
+                .muted(),
+        ])
+        .gap(tokens::SPACE_2)
+        .padding(tokens::SPACE_2)
+        .width(Size::Fixed(320.0))]),
     )
 }
 
@@ -5588,6 +5697,27 @@ mod tests {
         assert!(app.auto_rebuild());
         add_model_click(&mut app, "simple_sphere_model");
         assert!(app.take_pending_run());
+    }
+
+    #[test]
+    fn remote_toggle_requests_an_executor_swap_and_rebuild() {
+        let mut app = VolumetricUiV2::default();
+        assert!(app.take_executor_request().is_none());
+
+        dispatch(&mut app, UiEvent::synthetic_click(TOGGLE_REMOTE_BUILD_KEY));
+        assert!(app.remote_build());
+        let choice = app.take_executor_request().expect("swap requested");
+        assert!(matches!(choice, ExecutorChoice::Remote(addr) if addr.starts_with("http://")));
+        // In-flight work is written off and a fresh run + remesh queued for
+        // the new executor.
+        assert!(app.take_cancel_request());
+        assert!(app.take_mesh_cancel_request());
+        assert!(app.take_remesh_request());
+        assert!(app.take_pending_run());
+
+        dispatch(&mut app, UiEvent::synthetic_click(TOGGLE_REMOTE_BUILD_KEY));
+        assert!(!app.remote_build());
+        assert_eq!(app.take_executor_request(), Some(ExecutorChoice::Local));
     }
 
     #[test]
