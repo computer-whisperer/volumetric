@@ -237,6 +237,13 @@ trait StiffnessModel {
     fn apply(&self, x: &[f64], y: &mut [f64]);
     /// The assembled diagonal of K, for Jacobi preconditioning.
     fn diagonal(&self) -> Vec<f64>;
+    /// The node-diagonal `dpn x dpn` blocks of K (row-major, `node_count`
+    /// of them), for block-Jacobi preconditioning — much stronger than the
+    /// scalar diagonal when stiffness contrast is high or the per-node dofs
+    /// couple (frame translation/rotation). `None` falls back to scalar.
+    fn node_blocks(&self) -> Option<Vec<f64>> {
+        None
+    }
     /// Per-element strain energy per unit element volume at solution `u`.
     fn energy_density(&self, u: &[f64]) -> Vec<f64>;
     /// Characteristic element length: sets the contact scan step and the
@@ -332,12 +339,143 @@ impl StiffnessModel for HexModel<'_> {
     }
 }
 
-/// Jacobi-preconditioned CG for `K u = 0` with Dirichlet values already
+/// The CG preconditioner: scalar Jacobi, or per-node block Jacobi when the
+/// model can assemble its node-diagonal blocks.
+enum Precond {
+    /// Reciprocal-safe scalar diagonal.
+    Scalar(Vec<f64>),
+    /// Per-node inverted blocks (row-major `dpn x dpn`), constraint
+    /// rows/cols replaced by identity before inverting — the apply is a
+    /// plain per-node matvec, which vectorizes far better than triangular
+    /// solves.
+    Block { dpn: usize, inverses: Vec<f64> },
+}
+
+impl Precond {
+    /// Build for the current constraint set. `diag`/`blocks` are the
+    /// unmasked assemblies, computed once per solve; constraints change per
+    /// contact iteration, so masking and factoring happen here.
+    fn build(
+        diag: &[f64],
+        blocks: Option<&[f64]>,
+        dpn: usize,
+        constrained: &[bool],
+    ) -> Self {
+        let Some(blocks) = blocks else {
+            return Self::Scalar(diag.to_vec());
+        };
+        let node_count = constrained.len() / dpn;
+        let mut inverses = vec![0.0f64; blocks.len()];
+        let mut factor = vec![0.0f64; dpn * dpn];
+        for node in 0..node_count {
+            factor.copy_from_slice(&blocks[node * dpn * dpn..(node + 1) * dpn * dpn]);
+            for i in 0..dpn {
+                // Identity out constrained dofs and any zero-stiffness dof
+                // (floating node) so the factorization exists and those dofs
+                // pass through untouched, matching the scalar fallback.
+                if constrained[node * dpn + i] || factor[i * dpn + i] <= 0.0 {
+                    for j in 0..dpn {
+                        factor[i * dpn + j] = 0.0;
+                        factor[j * dpn + i] = 0.0;
+                    }
+                    factor[i * dpn + i] = 1.0;
+                }
+            }
+            let inv = &mut inverses[node * dpn * dpn..(node + 1) * dpn * dpn];
+            if cholesky_in_place(&mut factor, dpn) {
+                // Invert via solves against identity columns.
+                let mut col = vec![0.0f64; dpn];
+                for j in 0..dpn {
+                    col.fill(0.0);
+                    col[j] = 1.0;
+                    cholesky_solve_in_place(&factor, dpn, &mut col);
+                    for i in 0..dpn {
+                        inv[i * dpn + j] = col[i];
+                    }
+                }
+            } else {
+                // Not SPD after masking (numerically degenerate block):
+                // fall back to its reciprocal diagonal.
+                for i in 0..dpn {
+                    let d = blocks[node * dpn * dpn + i * dpn + i];
+                    inv[i * dpn + i] = if d > 0.0 { 1.0 / d } else { 1.0 };
+                }
+            }
+        }
+        Self::Block { dpn, inverses }
+    }
+
+    fn apply(&self, r: &[f64], z: &mut [f64]) {
+        match self {
+            Self::Scalar(diag) => {
+                for i in 0..r.len() {
+                    z[i] = if diag[i] > 0.0 { r[i] / diag[i] } else { r[i] };
+                }
+            }
+            Self::Block { dpn, inverses } => {
+                let dpn = *dpn;
+                for node in 0..r.len() / dpn {
+                    let inv = &inverses[node * dpn * dpn..(node + 1) * dpn * dpn];
+                    let rn = &r[node * dpn..(node + 1) * dpn];
+                    let zn = &mut z[node * dpn..(node + 1) * dpn];
+                    for i in 0..dpn {
+                        zn[i] = (0..dpn).map(|j| inv[i * dpn + j] * rn[j]).sum();
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// In-place dense Cholesky (lower triangle, row-major). Returns false when
+/// the matrix is not numerically SPD.
+fn cholesky_in_place(a: &mut [f64], n: usize) -> bool {
+    for i in 0..n {
+        for j in 0..=i {
+            let mut sum = a[i * n + j];
+            for k in 0..j {
+                sum -= a[i * n + k] * a[j * n + k];
+            }
+            if i == j {
+                if sum <= 0.0 {
+                    return false;
+                }
+                a[i * n + i] = sum.sqrt();
+            } else {
+                a[i * n + j] = sum / a[j * n + j];
+            }
+        }
+        for j in (i + 1)..n {
+            a[i * n + j] = 0.0;
+        }
+    }
+    true
+}
+
+/// Solve `L L^T x = b` in place given the lower factor.
+fn cholesky_solve_in_place(l: &[f64], n: usize, b: &mut [f64]) {
+    for i in 0..n {
+        let mut sum = b[i];
+        for k in 0..i {
+            sum -= l[i * n + k] * b[k];
+        }
+        b[i] = sum / l[i * n + i];
+    }
+    for i in (0..n).rev() {
+        let mut sum = b[i];
+        for k in (i + 1)..n {
+            sum -= l[k * n + i] * b[k];
+        }
+        b[i] = sum / l[i * n + i];
+    }
+}
+
+/// Preconditioned CG for `K u = 0` with Dirichlet values already
 /// written into `u`. Returns (iterations, converged).
 fn solve_cg(
     model: &dyn StiffnessModel,
     constrained: &[bool],
-    diag: &[f64],
+    precond: &Precond,
     u: &mut [f64],
     tolerance: f64,
     max_iterations: usize,
@@ -364,11 +502,7 @@ fn solve_cg(
     }
     let target = norm0 * tolerance;
 
-    let precond = |r: &[f64], z: &mut [f64]| {
-        for i in 0..r.len() {
-            z[i] = if diag[i] > 0.0 { r[i] / diag[i] } else { r[i] };
-        }
-    };
+    let precond = |r: &[f64], z: &mut [f64]| precond.apply(r, z);
 
     let mut z = vec![0.0; n];
     precond(&r, &mut z);
@@ -544,9 +678,10 @@ fn contact_solve(
         }
     }
 
-    // Jacobi diagonal (constraint state doesn't affect it; masked entries
-    // are never used).
+    // Unmasked preconditioner assemblies; the constraint-dependent masking
+    // and factoring happen per contact iteration.
     let diag = model.diagonal();
+    let blocks = model.node_blocks();
 
     let mut u = vec![0.0f64; n];
     let mut active: std::collections::HashMap<usize, f64> = std::collections::HashMap::new();
@@ -613,10 +748,11 @@ fn contact_solve(
             }
         }
 
+        let precond = Precond::build(&diag, blocks.as_deref(), dpn, &constrained);
         let (iterations, cg_converged) = solve_cg(
             model,
             &constrained,
-            &diag,
+            &precond,
             &mut u,
             config.cg_tolerance,
             config.cg_max_iterations,

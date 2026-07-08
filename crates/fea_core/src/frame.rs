@@ -307,6 +307,67 @@ impl StiffnessModel for FrameModel {
         self.apply_serial(x, y);
     }
 
+    fn node_blocks(&self) -> Option<Vec<f64>> {
+        // q_global = R^T q_local R for a 3x3 quadrant (R rows are the local
+        // axes; translations and rotations rotate independently).
+        fn rotate(r: &[[f64; 3]; 3], q: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
+            let mut qr = [[0.0f64; 3]; 3];
+            for i in 0..3 {
+                for j in 0..3 {
+                    qr[i][j] = (0..3).map(|k| q[i][k] * r[k][j]).sum();
+                }
+            }
+            let mut out = [[0.0f64; 3]; 3];
+            for i in 0..3 {
+                for j in 0..3 {
+                    out[i][j] = (0..3).map(|k| r[k][i] * qr[k][j]).sum();
+                }
+            }
+            out
+        }
+
+        let mut blocks = vec![0.0f64; self.node_count * 36];
+        for s in &self.struts {
+            for end in 0..2 {
+                // Column-probe this end's 6x6 in the strut frame with unit
+                // end displacements — local_forces is the ground-truth
+                // kernel, so the block picks up every coupling (bending ties
+                // translations to rotations at the same node) with no
+                // re-derived signs. Rows/cols: (f, m) x (u, th) of this end.
+                let mut local = [[0.0f64; 6]; 6];
+                for col in 0..6 {
+                    let mut v = [[0.0f64; 3]; 4];
+                    v[end * 2 + col / 3][col % 3] = 1.0;
+                    let f = local_forces(s, &v);
+                    for row in 0..6 {
+                        local[row][col] = f[end * 2 + row / 3][row % 3];
+                    }
+                }
+                // Rotate each 3x3 quadrant into the global frame and
+                // accumulate into the node's block.
+                let node = s.nodes[end] as usize;
+                let block = &mut blocks[node * 36..(node + 1) * 36];
+                for qi in 0..2 {
+                    for qj in 0..2 {
+                        let mut q = [[0.0f64; 3]; 3];
+                        for i in 0..3 {
+                            for j in 0..3 {
+                                q[i][j] = local[qi * 3 + i][qj * 3 + j];
+                            }
+                        }
+                        let g = rotate(&s.r, &q);
+                        for i in 0..3 {
+                            for j in 0..3 {
+                                block[(qi * 3 + i) * 6 + qj * 3 + j] += g[i][j];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Some(blocks)
+    }
+
     fn diagonal(&self) -> Vec<f64> {
         let mut diag = vec![0.0f64; self.node_count * 6];
         for s in &self.struts {
@@ -523,8 +584,13 @@ mod tests {
             constrained[dof] = true;
             u[dof] = value;
         }
-        let diag = model.diagonal();
-        let (_, converged) = solve_cg(&model, &constrained, &diag, &mut u, 1e-12, 50_000);
+        let precond = crate::Precond::build(
+            &model.diagonal(),
+            model.node_blocks().as_deref(),
+            6,
+            &constrained,
+        );
+        let (_, converged) = solve_cg(&model, &constrained, &precond, &mut u, 1e-12, 50_000);
         assert!(converged, "CG failed to converge");
         let mut forces = vec![0.0; n];
         model.apply(&u, &mut forces);
@@ -534,6 +600,35 @@ mod tests {
     /// Constrain all 6 dofs of a node to zero.
     fn glue(node: usize) -> Vec<(usize, f64)> {
         (0..6).map(|c| (node * 6 + c, 0.0)).collect()
+    }
+
+    /// node_blocks must reproduce the node-diagonal 6x6 blocks of the
+    /// assembled K, probed column-by-column out of the ground-truth apply.
+    #[test]
+    fn node_blocks_match_probed_stiffness() {
+        // Skew chain: general rotation frames, shared interior nodes.
+        let mesh = chain([0.2, -0.1, 0.4], [1.0, 2.0, 3.0], 2.0, 5, 0.05);
+        let model = FrameModel::new(&mesh, material()).unwrap();
+        let blocks = model.node_blocks().unwrap();
+
+        let n = mesh.node_count() * 6;
+        let mut x = vec![0.0; n];
+        let mut y = vec![0.0; n];
+        for node in 0..mesh.node_count() {
+            for col in 0..6 {
+                x[node * 6 + col] = 1.0;
+                model.apply(&x, &mut y);
+                x[node * 6 + col] = 0.0;
+                for row in 0..6 {
+                    let expected = y[node * 6 + row];
+                    let got = blocks[node * 36 + row * 6 + col];
+                    assert!(
+                        (expected - got).abs() <= expected.abs().max(1.0) * 1e-12,
+                        "node {node} block[{row}][{col}]: probed {expected} vs {got}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
