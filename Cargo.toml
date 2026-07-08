@@ -99,3 +99,10 @@ web-time = "1"
 # Hand-assemble tiny test models in integration tests (already in the tree
 # via wasmtime).
 wat = "1"
+# examples/profile_fea_inverse.rs replays the inverse solve natively on real
+# project inputs to measure the wasm tax and threading headroom.
+fea_core = { path = "crates/fea_core" }
+
+[[example]]
+name = "profile_fea_inverse"
+required-features = ["native"]

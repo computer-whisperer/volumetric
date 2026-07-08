@@ -5,3 +5,10 @@ edition = "2024"
 
 [dependencies]
 volumetric_abi = { path = "../volumetric_abi" }
+rayon = { version = "1", optional = true }
+
+[features]
+# Thread the matrix-free apply with rayon. Native hosts and the
+# wasm32-wasip1-threads operator builds turn this on; the plain
+# wasm32-unknown-unknown operator builds must not.
+parallel = ["dep:rayon"]

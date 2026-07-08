@@ -51,6 +51,44 @@ pub(crate) struct FrameModel {
     node_count: usize,
     /// Mean strut length: the contact scan step / tolerance scale.
     mean_length: f64,
+    /// CSR node -> incident (strut, end) adjacency for the conflict-free
+    /// parallel apply; entries pack `strut << 1 | end`.
+    #[cfg(feature = "parallel")]
+    incidence_offsets: Vec<u32>,
+    #[cfg(feature = "parallel")]
+    incidence: Vec<u32>,
+}
+
+/// Below this strut count the parallel apply's fork-join and scratch-buffer
+/// overhead outweighs the win; the serial path runs instead. Measured with
+/// `apply_scaling_bench` (cubic lattices, 8-24 threads): ~0.4-0.55x at 2.7k
+/// struts, ~0.95-1.4x at 30k, ~1.2x at 300k+ — the kernel is memory-bandwidth
+/// bound, so the crossover sits high and the ceiling is modest.
+#[cfg(feature = "parallel")]
+const PARALLEL_MIN_STRUTS: usize = 32 * 1024;
+
+/// Build the node -> incident (strut, end) CSR adjacency.
+#[cfg(feature = "parallel")]
+fn build_incidence(struts: &[Strut], node_count: usize) -> (Vec<u32>, Vec<u32>) {
+    let mut offsets = vec![0u32; node_count + 1];
+    for s in struts {
+        for &node in &s.nodes {
+            offsets[node as usize + 1] += 1;
+        }
+    }
+    for i in 0..node_count {
+        offsets[i + 1] += offsets[i];
+    }
+    let mut cursor: Vec<u32> = offsets[..node_count].to_vec();
+    let mut entries = vec![0u32; offsets[node_count] as usize];
+    for (strut, s) in struts.iter().enumerate() {
+        for (end, &node) in s.nodes.iter().enumerate() {
+            let slot = &mut cursor[node as usize];
+            entries[*slot as usize] = (strut as u32) << 1 | end as u32;
+            *slot += 1;
+        }
+    }
+    (offsets, entries)
 }
 
 impl FrameModel {
@@ -117,10 +155,16 @@ impl FrameModel {
             });
         }
 
+        #[cfg(feature = "parallel")]
+        let (incidence_offsets, incidence) = build_incidence(&struts, mesh.node_count());
         Ok(Self {
             struts,
             node_count: mesh.node_count(),
             mean_length: total_length / mesh.element_count() as f64,
+            #[cfg(feature = "parallel")]
+            incidence_offsets,
+            #[cfg(feature = "parallel")]
+            incidence,
         })
     }
 }
@@ -191,12 +235,8 @@ impl FrameModel {
     }
 }
 
-impl StiffnessModel for FrameModel {
-    fn dofs_per_node(&self) -> usize {
-        6
-    }
-
-    fn apply(&self, x: &[f64], y: &mut [f64]) {
+impl FrameModel {
+    fn apply_serial(&self, x: &[f64], y: &mut [f64]) {
         y.fill(0.0);
         for s in &self.struts {
             let local = self.gather_local(s, x);
@@ -210,6 +250,61 @@ impl StiffnessModel for FrameModel {
                 }
             }
         }
+    }
+
+    /// The apply as two conflict-free parallel passes: per-strut global-frame
+    /// end forces into a scratch buffer (blocks `[f1, m1, f2, m2]`, so end 0
+    /// owns 0..6 and end 1 owns 6..12), then a per-node gather over the
+    /// incidence list. Result is bit-identical to the serial scatter apart
+    /// from float addition order.
+    #[cfg(feature = "parallel")]
+    fn apply_parallel(&self, x: &[f64], y: &mut [f64]) {
+        use rayon::prelude::*;
+
+        let mut contributions = vec![0.0f64; self.struts.len() * 12];
+        contributions
+            .par_chunks_mut(12)
+            .zip(self.struts.par_iter())
+            .for_each(|(out, s)| {
+                let local = self.gather_local(s, x);
+                let f = local_forces(s, &local);
+                // f_global = R^T f_local per block.
+                for (block, fl) in f.iter().enumerate() {
+                    for col in 0..3 {
+                        out[block * 3 + col] =
+                            s.r[0][col] * fl[0] + s.r[1][col] * fl[1] + s.r[2][col] * fl[2];
+                    }
+                }
+            });
+
+        y.par_chunks_mut(6).enumerate().for_each(|(node, block)| {
+            block.fill(0.0);
+            let start = self.incidence_offsets[node] as usize;
+            let end = self.incidence_offsets[node + 1] as usize;
+            for &packed in &self.incidence[start..end] {
+                let strut = (packed >> 1) as usize;
+                let strut_end = (packed & 1) as usize;
+                let c = &contributions[strut * 12 + strut_end * 6..][..6];
+                for (acc, v) in block.iter_mut().zip(c) {
+                    *acc += v;
+                }
+            }
+        });
+    }
+}
+
+impl StiffnessModel for FrameModel {
+    fn dofs_per_node(&self) -> usize {
+        6
+    }
+
+    fn apply(&self, x: &[f64], y: &mut [f64]) {
+        #[cfg(feature = "parallel")]
+        if self.struts.len() >= PARALLEL_MIN_STRUTS {
+            self.apply_parallel(x, y);
+            return;
+        }
+        self.apply_serial(x, y);
     }
 
     fn diagonal(&self) -> Vec<f64> {
@@ -299,6 +394,121 @@ mod tests {
                 components: 1,
                 data: vec![r; segments],
             }],
+        }
+    }
+
+    /// A cubic lattice: nodes on an n^3 grid, struts along the three axis
+    /// directions — representative strut-mesh topology for apply scaling.
+    #[cfg(feature = "parallel")]
+    fn cubic_lattice(n: usize) -> FeaMesh {
+        let idx = |i: usize, j: usize, k: usize| (i * n * n + j * n + k) as u32;
+        let mut node_positions = Vec::new();
+        for i in 0..n {
+            for j in 0..n {
+                for k in 0..n {
+                    node_positions.extend([i as f64, j as f64, k as f64]);
+                }
+            }
+        }
+        let mut connectivity = Vec::new();
+        for i in 0..n {
+            for j in 0..n {
+                for k in 0..n {
+                    if i + 1 < n {
+                        connectivity.extend([idx(i, j, k), idx(i + 1, j, k)]);
+                    }
+                    if j + 1 < n {
+                        connectivity.extend([idx(i, j, k), idx(i, j + 1, k)]);
+                    }
+                    if k + 1 < n {
+                        connectivity.extend([idx(i, j, k), idx(i, j, k + 1)]);
+                    }
+                }
+            }
+        }
+        let elements = connectivity.len() / 2;
+        FeaMesh {
+            element_kind: FeaElementKind::Bar2,
+            node_positions,
+            connectivity,
+            node_fields: vec![],
+            element_fields: vec![FeaField {
+                name: "radius".to_string(),
+                components: 1,
+                data: vec![0.05; elements],
+            }],
+        }
+    }
+
+    /// Not a correctness test: prints serial vs parallel apply timings over
+    /// lattice sizes so PARALLEL_MIN_STRUTS can be set from data. Run with
+    ///   cargo test -p fea_core --features parallel --release -- \
+    ///       --ignored --nocapture apply_scaling_bench
+    #[cfg(feature = "parallel")]
+    #[test]
+    #[ignore]
+    fn apply_scaling_bench() {
+        for n in [10, 22, 47, 100] {
+            let mesh = cubic_lattice(n);
+            let model = FrameModel::new(&mesh, material()).unwrap();
+            let dofs = mesh.node_count() * 6;
+            let x: Vec<f64> = (0..dofs).map(|i| (i as f64 * 0.37).sin()).collect();
+            let mut y = vec![0.0; dofs];
+
+            let struts = model.struts.len();
+            let reps = (2_000_000 / struts).max(3);
+            let timer = std::time::Instant::now();
+            for _ in 0..reps {
+                model.apply_serial(&x, &mut y);
+            }
+            let serial = timer.elapsed().as_secs_f64() / reps as f64;
+            let timer = std::time::Instant::now();
+            for _ in 0..reps {
+                model.apply_parallel(&x, &mut y);
+            }
+            let parallel = timer.elapsed().as_secs_f64() / reps as f64;
+            println!(
+                "{struts} struts: serial {:.1}us, parallel {:.1}us, speedup {:.2}x",
+                serial * 1e6,
+                parallel * 1e6,
+                serial / parallel
+            );
+        }
+    }
+
+    /// Parallel and serial applies must agree (up to float addition order)
+    /// on a mesh large enough to take the parallel path for real.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_apply_matches_serial() {
+        // A skew chain gives fully general rotation frames; > the
+        // PARALLEL_MIN_STRUTS threshold so StiffnessModel::apply dispatches
+        // to the parallel path.
+        let segments = PARALLEL_MIN_STRUTS + 500;
+        let mesh = chain([0.0; 3], [1.0, 2.0, 3.0], 10.0, segments, 0.05);
+        let model = FrameModel::new(&mesh, material()).unwrap();
+
+        let n = mesh.node_count() * 6;
+        // Deterministic pseudo-random displacements (LCG).
+        let mut state = 0x2545F4914F6CDD1Du64;
+        let x: Vec<f64> = (0..n)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (state >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+            })
+            .collect();
+
+        let mut serial = vec![0.0; n];
+        model.apply_serial(&x, &mut serial);
+        let mut parallel = vec![0.0; n];
+        model.apply(&x, &mut parallel);
+
+        let scale = serial.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+        for (i, (s, p)) in serial.iter().zip(&parallel).enumerate() {
+            assert!(
+                (s - p).abs() <= scale * 1e-12,
+                "dof {i}: serial {s} vs parallel {p}"
+            );
         }
     }
 

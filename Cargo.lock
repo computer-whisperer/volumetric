@@ -1545,6 +1545,7 @@ dependencies = [
 name = "fea_core"
 version = "0.1.0"
 dependencies = [
+ "rayon",
  "volumetric_abi",
 ]
 
@@ -5043,6 +5044,7 @@ dependencies = [
  "anyhow",
  "ciborium",
  "dashmap",
+ "fea_core",
  "glam 0.32.1",
  "js-sys",
  "log",
