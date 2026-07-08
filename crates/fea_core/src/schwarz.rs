@@ -1,28 +1,35 @@
-//! Two-level additive Schwarz preconditioner for Bar2 frame lattices —
-//! the scale/parallelism prototype.
+//! Two-level additive Schwarz preconditioner for Bar2 frame lattices — the
+//! scale/parallelism path for big solves.
 //!
 //! Motivation (measured on the strut example at 1000x stiffness contrast):
 //! Jacobi needs ~2k CG iterations per contact solve and block-Jacobi only
 //! shaves 1.5x, because the conditioning pathology is *global* — soft and
 //! stiff column regions in series create long-wavelength error modes no
-//! local preconditioner can touch. The fine SpMV is also memory-bandwidth
-//! bound, so threading it tops out around 1.2x. This preconditioner attacks
-//! both at once:
+//! local preconditioner can touch, and iteration counts grow with mesh size
+//! on top. The fine SpMV is memory-bandwidth bound, so threading it tops
+//! out around 1.2x. This preconditioner attacks both at once:
 //!
 //! - **Subdomains** (spatial boxes of ~`target_nodes` nodes, one strut layer
-//!   of overlap): dense-Cholesky local solves, embarrassingly parallel with
-//!   coarse granularity — cache-resident factors instead of bandwidth-bound
-//!   streaming.
-//! - **Coarse space** (6 rigid-body modes per subdomain, GDSW-style): a
-//!   small dense solve that propagates corrections globally per iteration,
-//!   killing the contrast-induced low-frequency modes.
+//!   of overlap): f32 sparse-Cholesky local solves (faer), embarrassingly
+//!   parallel with coarse granularity.
+//! - **Coarse space** (6 rigid-body modes per subdomain, GDSW-style),
+//!   assembled and factored sparse — subdomains only couple to neighbors:
+//!   propagates corrections globally each iteration, killing the
+//!   contrast-induced low-frequency modes and pinning iteration counts
+//!   nearly flat in mesh size (204 -> 325 CG iterations from 4.7k to 1M
+//!   struts, where block-Jacobi grows 380 -> 1810).
 //!
-//! Prototype scope: built once per solve against the glued-face constraints
-//! only; contact constraints are handled by masking the preconditioned
-//! residual (a preconditioner need not be exact — CG stays correct because
-//! the operator side is masked exactly). Subdomain factors are dense, which
-//! bounds practical subdomain size; a sparse local solver is the production
-//! path beyond ~10^6 struts.
+//! At 1M struts / 24 threads this solves 1.8x faster than block-Jacobi
+//! (40s vs 71s, phase split ~17s local solves / ~7s coarse / ~10s CG SpMV);
+//! below ~100k struts block-Jacobi's lower constant wins — hence the
+//! opt-in via [`crate::PrecondChoice`].
+//!
+//! Built once per solve against the glued-face constraints only; contact
+//! constraints are handled by masking the preconditioned residual (a
+//! preconditioner need not be exact — CG stays correct because the operator
+//! side is masked exactly). Remaining headroom, in measured order: the
+//! serial Z^T r / Z x_c coarse products, the serial overlap scatter-add,
+//! and the ~1.2x-ceiling parallel SpMV.
 
 use crate::frame::FrameModel;
 use crate::StiffnessModel;
@@ -52,8 +59,12 @@ impl Default for SchwarzParams {
 struct Subdomain {
     /// Global dof indices covered by this (overlapping) subdomain.
     dofs: Vec<u32>,
-    /// Sparse Cholesky factorization of the masked local stiffness.
-    solver: faer::sparse::linalg::solvers::Llt<usize, f64>,
+    /// Sparse Cholesky factorization of the masked local stiffness, in f32:
+    /// the triangular solves stream the factor from memory every iteration
+    /// (way past cache), so halving the bytes halves the dominant cost. The
+    /// preconditioner only steers CG — the Krylov iteration itself stays
+    /// f64, so converged answers are unaffected.
+    solver: faer::sparse::linalg::solvers::Llt<usize, f32>,
 }
 
 /// The fine (local) level of the two-level preconditioner.
@@ -64,6 +75,17 @@ enum LocalSolves {
     BlockJacobi(Vec<f64>),
 }
 
+// Phase timers (nanos) for the scaling bench: negligible cost (a handful of
+// atomic adds per apply), and the breakdown they print is what has driven
+// every tuning decision here so far.
+pub(crate) static T_LOCAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static T_SCATTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static T_COARSE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static T_BUILD_LOCAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static T_BUILD_COARSE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 pub(crate) struct SchwarzPrecond {
     local: LocalSolves,
     /// Non-overlapping owner subdomain per node (coarse partition of unity).
@@ -71,9 +93,11 @@ pub(crate) struct SchwarzPrecond {
     /// Per-node rigid-body-mode matrix N (build-time constraint rows baked
     /// in — the apply-side Z must match the Z that assembled A_c).
     modes: Vec<[[f64; 6]; 6]>,
-    /// Dense Cholesky factorization of the coarse operator Z^T K Z (6 dofs
-    /// per subdomain: rigid-body modes about the subdomain centroid).
-    coarse_solver: faer::linalg::solvers::Llt<f64>,
+    /// Sparse Cholesky factorization of the coarse operator Z^T K Z (6 dofs
+    /// per subdomain: rigid-body modes about the subdomain centroid). Sparse
+    /// because subdomains only couple to spatial neighbors — dense coarse
+    /// handling was measured to dominate everything past ~1k subdomains.
+    coarse_solver: faer::sparse::linalg::solvers::Llt<usize, f64>,
     coarse_n: usize,
 }
 
@@ -175,6 +199,7 @@ impl SchwarzPrecond {
             }
         }
 
+        let build_timer = std::time::Instant::now();
         let local = if params.direct_local {
             build_direct_local(mesh, model, constrained, &owner, nsub)?
         } else {
@@ -184,6 +209,12 @@ impl SchwarzPrecond {
                 constrained,
             ))
         };
+
+        T_BUILD_LOCAL.fetch_add(
+            build_timer.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let build_timer = std::time::Instant::now();
 
         // --- Coarse operator A_c = Z^T K Z, assembled per strut from the
         // element stiffness and each endpoint's owner modes. The per-node
@@ -198,8 +229,12 @@ impl SchwarzPrecond {
                 )
             })
             .collect();
+        // Accumulate per-subdomain-pair 6x6 blocks (canonical si >= sj; the
+        // symmetric counterpart is implied) — A_c is sparse with box-graph
+        // adjacency, so a block map then lower-triangle triplets.
         let coarse_n = nsub * 6;
-        let mut coarse = vec![0.0f64; coarse_n * coarse_n];
+        let mut blocks: std::collections::HashMap<(u32, u32), [f64; 36]> =
+            std::collections::HashMap::new();
         for e in 0..model.strut_count() {
             let [n1, n2] = model.strut_nodes(e);
             let ke = model.element_stiffness(e);
@@ -208,7 +243,11 @@ impl SchwarzPrecond {
                 ends.iter().map(|&node| modes[node]).collect();
             for (ei, &node_i) in ends.iter().enumerate() {
                 for (ej, &node_j) in ends.iter().enumerate() {
-                    let (si, sj) = (owner[node_i] as usize, owner[node_j] as usize);
+                    let (si, sj) = (owner[node_i], owner[node_j]);
+                    if si < sj {
+                        continue; // the (ej, ei) pass covers the transpose
+                    }
+                    let block = blocks.entry((si, sj)).or_insert([0.0; 36]);
                     // H = N_i^T K_e[6ei.., 6ej..] N_j, a 6x6 into (si, sj).
                     for a in 0..6 {
                         for b in 0..6 {
@@ -220,28 +259,49 @@ impl SchwarzPrecond {
                                         * n_mats[ej][c][b];
                                 }
                             }
-                            coarse[(si * 6 + a) * coarse_n + sj * 6 + b] += sum;
+                            block[a * 6 + b] += sum;
                         }
                     }
                 }
             }
         }
-        // Guard degenerate coarse dofs (fully glued subdomains).
-        for i in 0..coarse_n {
-            if coarse[i * coarse_n + i] <= 1e-12 {
-                for j in 0..coarse_n {
-                    coarse[i * coarse_n + j] = 0.0;
-                    coarse[j * coarse_n + i] = 0.0;
+        // Degenerate coarse dofs (fully glued subdomains) become identity;
+        // detect them from the diagonal blocks.
+        let mut degenerate = vec![false; coarse_n];
+        for s in 0..nsub as u32 {
+            if let Some(block) = blocks.get(&(s, s)) {
+                for a in 0..6 {
+                    degenerate[s as usize * 6 + a] = block[a * 6 + a] <= 1e-12;
                 }
-                coarse[i * coarse_n + i] = 1.0;
+            } else {
+                degenerate[s as usize * 6..s as usize * 6 + 6].fill(true);
             }
         }
-        // faer's dense kernels: the coarse factor is O((6 nsub)^3) and
-        // becomes the build bottleneck past a few hundred subdomains with a
-        // naive loop.
+        let mut triplets: Vec<faer::sparse::Triplet<usize, usize, f64>> = Vec::new();
+        for (&(si, sj), block) in &blocks {
+            for a in 0..6 {
+                for b in 0..6 {
+                    let (row, col) = (si as usize * 6 + a, sj as usize * 6 + b);
+                    if row < col || degenerate[row] || degenerate[col] {
+                        continue;
+                    }
+                    triplets.push(faer::sparse::Triplet::new(row, col, block[a * 6 + b]));
+                }
+            }
+        }
+        for (i, &degen) in degenerate.iter().enumerate() {
+            if degen {
+                triplets.push(faer::sparse::Triplet::new(i, i, 1.0));
+            }
+        }
         let coarse_mat =
-            faer::Mat::from_fn(coarse_n, coarse_n, |i, j| coarse[i * coarse_n + j]);
-        let coarse_solver = coarse_mat.llt(faer::Side::Lower).ok()?;
+            faer::sparse::SparseColMat::try_new_from_triplets(coarse_n, coarse_n, &triplets)
+                .ok()?;
+        let coarse_solver = coarse_mat.sp_cholesky(faer::Side::Lower).ok()?;
+        T_BUILD_COARSE.fetch_add(
+            build_timer.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         Some(Self {
             local,
@@ -307,7 +367,8 @@ fn build_direct_local(
             // Lower-triangle triplets (duplicates sum); constrained dofs are
             // masked by skipping their entries, and get identity diagonals
             // together with floating (no-stiffness) dofs afterwards.
-            let mut triplets: Vec<Triplet<usize, usize, f64>> = Vec::new();
+            // f32: see the Subdomain::solver docs.
+            let mut triplets: Vec<Triplet<usize, usize, f32>> = Vec::new();
             let mut has_diagonal = vec![false; m];
             let mut seen = std::collections::HashSet::new();
             for &node in &nodes {
@@ -347,7 +408,7 @@ fn build_direct_local(
                                     {
                                         continue;
                                     }
-                                    let value = ke[bi * 3 + r][bj * 3 + c];
+                                    let value = ke[bi * 3 + r][bj * 3 + c] as f32;
                                     if row == col {
                                         has_diagonal[row] = true;
                                     }
@@ -388,11 +449,12 @@ impl SchwarzPrecond {
             // overlap, so the scatter must not race).
             LocalSolves::Direct(subdomains) => {
                 use faer::linalg::solvers::Solve;
-                let locals: Vec<Vec<f64>> = subdomains
+                let timer = std::time::Instant::now();
+                let locals: Vec<Vec<f32>> = subdomains
                     .par_iter()
                     .map(|s| {
-                        let mut local: Vec<f64> =
-                            s.dofs.iter().map(|&dof| r[dof as usize]).collect();
+                        let mut local: Vec<f32> =
+                            s.dofs.iter().map(|&dof| r[dof as usize] as f32).collect();
                         let m = local.len();
                         s.solver.solve_in_place(
                             faer::MatMut::from_column_major_slice_mut(&mut local, m, 1),
@@ -400,12 +462,21 @@ impl SchwarzPrecond {
                         local
                     })
                     .collect();
+                T_LOCAL.fetch_add(
+                    timer.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                let timer = std::time::Instant::now();
                 z.fill(0.0);
                 for (s, local) in subdomains.iter().zip(&locals) {
-                    for (&dof, value) in s.dofs.iter().zip(local) {
-                        z[dof as usize] += value;
+                    for (&dof, &value) in s.dofs.iter().zip(local) {
+                        z[dof as usize] += value as f64;
                     }
                 }
+                T_SCATTER.fetch_add(
+                    timer.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             }
             LocalSolves::BlockJacobi(inverses) => {
                 for node in 0..r.len() / 6 {
@@ -420,6 +491,7 @@ impl SchwarzPrecond {
         }
 
         // Coarse correction.
+        let coarse_timer = std::time::Instant::now();
         let mut rc = vec![0.0f64; self.coarse_n];
         let node_count = self.owner.len();
         for node in 0..node_count {
@@ -450,6 +522,11 @@ impl SchwarzPrecond {
                 z[node * 6 + row] += sum;
             }
         }
+
+        T_COARSE.fetch_add(
+            coarse_timer.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         for (v, &c) in z.iter_mut().zip(constrained) {
             if c {

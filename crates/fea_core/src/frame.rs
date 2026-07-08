@@ -619,10 +619,17 @@ mod tests {
     #[ignore]
     fn schwarz_scaling_bench() {
         // Override lattice sizes with SCHWARZ_BENCH_N=12,22,32 when probing
-        // larger meshes or isolating one size for thread-scaling runs.
+        // larger meshes or isolating one size for thread-scaling runs;
+        // SCHWARZ_BENCH_TARGET sets the subdomain size (6 coarse dofs per
+        // subdomain, so this trades local against coarse solve cost);
+        // SCHWARZ_BENCH_SKIP_BJ=1 skips the block-Jacobi baseline.
         let sizes: Vec<usize> = std::env::var("SCHWARZ_BENCH_N")
             .map(|s| s.split(',').map(|v| v.parse().unwrap()).collect())
             .unwrap_or_else(|_| vec![12, 22, 32]);
+        let target_nodes: usize = std::env::var("SCHWARZ_BENCH_TARGET")
+            .map(|s| s.parse().unwrap())
+            .unwrap_or(128);
+        let skip_bj = std::env::var("SCHWARZ_BENCH_SKIP_BJ").is_ok();
         for n in sizes {
             let mut mesh = cubic_lattice(n);
             let scales: Vec<f64> = (0..mesh.connectivity.len() / 2)
@@ -639,16 +646,17 @@ mod tests {
             });
             let top = (n - 1) as f64 - 0.7;
 
-            for (label, preconditioner) in [
+            let configs = [
                 ("block-jacobi", crate::PrecondChoice::Auto),
                 (
-                    "schwarz-128",
+                    "schwarz",
                     crate::PrecondChoice::Schwarz(crate::SchwarzParams {
-                        target_nodes: 128,
+                        target_nodes,
                         direct_local: true,
                     }),
                 ),
-            ] {
+            ];
+            for &(label, preconditioner) in configs.iter().skip(if skip_bj { 1 } else { 0 }) {
                 let mut plate = |p: [f64; 3]| p[2] > top;
                 let config = SolveConfig {
                     fixed_boundary: FixedBoundary::ZMin,
@@ -659,11 +667,22 @@ mod tests {
                 let timer = std::time::Instant::now();
                 let result = solve(&mesh, &mut plate, &config).unwrap();
                 println!(
-                    "n={n} ({} struts): {label} {:.2}s, {} cg iters, converged={}",
+                    "n={n} ({} struts): {label}[{target_nodes}] {:.2}s, {} cg iters, converged={}",
                     mesh.connectivity.len() / 2,
                     timer.elapsed().as_secs_f64(),
                     result.stats.cg_iterations,
                     result.stats.converged,
+                );
+                // Phase timer dump (see schwarz.rs timers)
+                use std::sync::atomic::Ordering::Relaxed;
+                let take = |t: &std::sync::atomic::AtomicU64| t.swap(0, Relaxed) as f64 / 1e9;
+                println!(
+                    "  phases: build_local {:.2}s, build_coarse {:.2}s, local {:.2}s, scatter {:.2}s, coarse {:.2}s",
+                    take(&crate::schwarz::T_BUILD_LOCAL),
+                    take(&crate::schwarz::T_BUILD_COARSE),
+                    take(&crate::schwarz::T_LOCAL),
+                    take(&crate::schwarz::T_SCATTER),
+                    take(&crate::schwarz::T_COARSE),
                 );
             }
         }
