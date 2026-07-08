@@ -488,6 +488,49 @@ pub fn run_project_validate(args: ProjectValidateArgs) -> Result<()> {
 
 // === Project Export ===
 
+/// Runs a project to its exports, locally or — when `remote` names a daemon
+/// base URL — on a remote build daemon over `volumetric_protocol`.
+fn run_project_exports(
+    project: Project,
+    remote: Option<&str>,
+) -> Result<Vec<volumetric::LoadedAsset>> {
+    let Some(address) = remote else {
+        let mut env = Environment::new();
+        return project
+            .run(&mut env)
+            .map_err(|e| anyhow::anyhow!("Project execution failed: {}", e));
+    };
+
+    let client = volumetric_protocol::DaemonClient::new(address);
+    client
+        .info()
+        .with_context(|| format!("remote daemon at {address} is not usable"))?;
+    let outcome = client
+        .run(
+            &volumetric_protocol::JobRequest::RunProject { project },
+            &|| false,
+        )
+        .with_context(|| format!("remote run on {address} failed"))?;
+    match outcome {
+        volumetric_protocol::JobOutcome::Success {
+            output: volumetric_protocol::JobOutput::RunProject { exports },
+            ..
+        } => Ok(exports
+            .into_iter()
+            .map(volumetric_protocol::ExportedAsset::into_loaded)
+            .collect()),
+        volumetric_protocol::JobOutcome::Success { .. } => Err(anyhow::anyhow!(
+            "daemon returned the wrong output kind for a project run"
+        )),
+        volumetric_protocol::JobOutcome::Failed { error } => {
+            Err(anyhow::anyhow!("Project execution failed: {}", error))
+        }
+        volumetric_protocol::JobOutcome::Cancelled => {
+            Err(anyhow::anyhow!("remote run was cancelled"))
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 pub struct ProjectExportArgs {
     /// Project file to export from
@@ -505,6 +548,10 @@ pub struct ProjectExportArgs {
     /// Output as JSON (list of exported files)
     #[arg(long)]
     pub json: bool,
+
+    /// Execute on a remote build daemon (base URL, e.g. http://buildbox:7373)
+    #[arg(long)]
+    pub remote: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -527,10 +574,7 @@ pub fn run_project_export(args: ProjectExportArgs) -> Result<()> {
     std::fs::create_dir_all(&args.output).context("Failed to create output directory")?;
 
     // Run the project to get exported assets
-    let mut env = Environment::new();
-    let exports = project
-        .run(&mut env)
-        .map_err(|e| anyhow::anyhow!("Project execution failed: {}", e))?;
+    let exports = run_project_exports(project, args.remote.as_deref())?;
 
     // Filter exports if specific assets requested
     let filtered_exports: Vec<_> = if args.asset.is_empty() {
@@ -600,6 +644,10 @@ pub struct ProjectRunArgs {
     /// Output as JSON
     #[arg(long)]
     pub json: bool,
+
+    /// Execute on a remote build daemon (base URL, e.g. http://buildbox:7373)
+    #[arg(long)]
+    pub remote: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -618,10 +666,7 @@ struct RunExport {
 pub fn run_project_run(args: ProjectRunArgs) -> Result<()> {
     let project = Project::load_from_file(&args.project).context("Failed to load project")?;
 
-    let mut env = Environment::new();
-    let exports = project
-        .run(&mut env)
-        .map_err(|e| anyhow::anyhow!("Project execution failed: {}", e))?;
+    let exports = run_project_exports(project, args.remote.as_deref())?;
 
     let results: Vec<RunExport> = exports
         .iter()

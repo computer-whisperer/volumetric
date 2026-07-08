@@ -7,6 +7,7 @@ edition = "2024"
 volumetric = { path = "../../" }
 volumetric_abi = { path = "../volumetric_abi" }
 volumetric_assets = { path = "../volumetric_assets" }
+volumetric_protocol = { path = "../volumetric_protocol", features = ["client"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 wgpu = "29"
