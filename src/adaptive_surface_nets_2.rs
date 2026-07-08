@@ -264,7 +264,11 @@ pub trait SamplerFn: Fn(f64, f64, f64) -> f32 {}
 impl<F> SamplerFn for F where F: Fn(f64, f64, f64) -> f32 {}
 
 /// Configuration for the adaptive surface nets algorithm.
-#[derive(Clone, Debug)]
+///
+/// Serializable (with every field defaulting) so hosts can ship it across a
+/// process boundary — the build daemon receives it as part of a mesh job.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct AdaptiveMeshConfig2 {
     /// Base grid resolution for initial discovery (e.g., 8 means 8³ coarse cells)
     pub base_resolution: usize,
@@ -792,7 +796,8 @@ pub struct SamplingStats {
 }
 
 /// Per-stage timing and statistics for profiling
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct MeshingStats2 {
     /// Total time for the entire meshing operation (seconds)
     pub total_time_secs: f64,

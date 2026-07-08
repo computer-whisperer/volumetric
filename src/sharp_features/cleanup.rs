@@ -13,7 +13,8 @@ use crate::sharp_features::snap::SnapKind;
 use glam::DVec3;
 use std::collections::HashMap;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct CleanupConfig {
     /// Snapped vertices closer than this (cell units) are welded together.
     /// Must stay well below the inter-vertex spacing (~1 cell) so only

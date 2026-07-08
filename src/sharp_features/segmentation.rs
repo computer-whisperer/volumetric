@@ -21,7 +21,8 @@ use crate::sharp_features::fit::VertexFit;
 use crate::sharp_features::fit::unsigned_angle_degrees;
 use std::collections::VecDeque;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct SegmentationConfig {
     /// Maximum fitted-normal angle (degrees) between adjacent vertices of the
     /// same region. Smooth-surface jumps at practical resolutions are a few

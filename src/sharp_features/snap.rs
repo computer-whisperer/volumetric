@@ -20,7 +20,8 @@ use glam::DVec3;
 use crate::sharp_features::adjacency::MeshAdjacency;
 use crate::sharp_features::fit::fit_plane;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct SnapConfig {
     /// Radius (cell units) around the vertex for gathering region points.
     pub gather_radius_cells: f64,

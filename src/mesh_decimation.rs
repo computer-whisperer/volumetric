@@ -32,7 +32,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use web_time::Instant;
 
 /// Configuration for the decimation post-pass.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct DecimationConfig {
     /// Maximum allowed surface deviation, as a fraction of the finest
     /// meshing cell size (so the budget self-scales with resolution).

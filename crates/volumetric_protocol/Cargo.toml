@@ -1,0 +1,20 @@
+[package]
+name = "volumetric_protocol"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+# Blocking HTTP client for talking to a volumetric_daemon.
+client = ["dep:ureq"]
+
+[dependencies]
+# Types only (Project, AssetTypeHint, mesh configs) — no wasm backend, so
+# this crate stays usable from a wasm32 client build.
+volumetric = { path = "../..", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+ciborium = "0.2"
+thiserror = "2"
+# Plain-HTTP client (no TLS): the daemon speaks cleartext on a trusted network.
+ureq = { version = "2", default-features = false, optional = true }

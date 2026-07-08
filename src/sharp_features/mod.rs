@@ -50,7 +50,8 @@ use glam::DVec3;
 /// Configuration for sharp feature reconstruction. The defaults are the
 /// oracle-benchmarked values from `meshing_lab`; they are expressed relative
 /// to the finest cell size and need no per-model tuning.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct SharpFeatureConfig {
     pub segmentation: segmentation::SegmentationConfig,
     pub snap: snap::SnapConfig,

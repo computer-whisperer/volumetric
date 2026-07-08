@@ -1,0 +1,22 @@
+[package]
+name = "volumetric_daemon"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "volumetric_daemon"
+path = "src/main.rs"
+
+[dependencies]
+volumetric = { path = "../.." }
+volumetric_protocol = { path = "../volumetric_protocol" }
+tiny_http = "0.12"
+serde = "1"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+
+[dev-dependencies]
+volumetric_protocol = { path = "../volumetric_protocol", features = ["client"] }
+# Assemble tiny WAT test models to binary wasm (the model pipeline validates
+# bytes with wasmparser, which only accepts the binary format).
+wat = "1"

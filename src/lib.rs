@@ -740,6 +740,23 @@ pub struct LoadedAsset {
 }
 
 impl LoadedAsset {
+    /// Assembles an asset from its parts. This is how assets that crossed a
+    /// process boundary (e.g. results from a remote build daemon) re-enter
+    /// the in-memory representation.
+    pub fn from_parts(
+        id: String,
+        data: Vec<u8>,
+        type_hint: Option<AssetTypeHint>,
+        precursor_ids: Vec<String>,
+    ) -> Self {
+        Self {
+            id,
+            data: Arc::new(data),
+            type_hint,
+            precursor_ids,
+        }
+    }
+
     /// Returns the asset ID.
     pub fn id(&self) -> &str {
         &self.id
