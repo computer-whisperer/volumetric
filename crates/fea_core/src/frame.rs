@@ -575,10 +575,10 @@ mod tests {
             ..Default::default()
         };
         let base = solve(&mesh, &mut plate, &config).unwrap();
-        for dense_local in [true, false] {
+        for direct_local in [true, false] {
             config.preconditioner = crate::PrecondChoice::Schwarz(crate::SchwarzParams {
                 target_nodes: 48,
-                dense_local,
+                direct_local,
             });
             let schwarz = solve(&mesh, &mut plate, &config).unwrap();
 
@@ -595,12 +595,12 @@ mod tests {
             {
                 assert!(
                     (a - b).abs() <= scale * 1e-5,
-                    "dof {i} (dense_local {dense_local}): default {a} vs schwarz {b}"
+                    "dof {i} (direct_local {direct_local}): default {a} vs schwarz {b}"
                 );
             }
             assert!(
                 schwarz.stats.cg_iterations < base.stats.cg_iterations,
-                "schwarz (dense_local {dense_local}) {} vs default {} CG iterations",
+                "schwarz (direct_local {direct_local}) {} vs default {} CG iterations",
                 schwarz.stats.cg_iterations,
                 base.stats.cg_iterations
             );
@@ -618,7 +618,12 @@ mod tests {
     #[test]
     #[ignore]
     fn schwarz_scaling_bench() {
-        for n in [12, 22, 32] {
+        // Override lattice sizes with SCHWARZ_BENCH_N=12,22,32 when probing
+        // larger meshes or isolating one size for thread-scaling runs.
+        let sizes: Vec<usize> = std::env::var("SCHWARZ_BENCH_N")
+            .map(|s| s.split(',').map(|v| v.parse().unwrap()).collect())
+            .unwrap_or_else(|_| vec![12, 22, 32]);
+        for n in sizes {
             let mut mesh = cubic_lattice(n);
             let scales: Vec<f64> = (0..mesh.connectivity.len() / 2)
                 .map(|e| {
@@ -637,10 +642,10 @@ mod tests {
             for (label, preconditioner) in [
                 ("block-jacobi", crate::PrecondChoice::Auto),
                 (
-                    "schwarz-64",
+                    "schwarz-128",
                     crate::PrecondChoice::Schwarz(crate::SchwarzParams {
-                        target_nodes: 64,
-                        dense_local: true,
+                        target_nodes: 128,
+                        direct_local: true,
                     }),
                 ),
             ] {

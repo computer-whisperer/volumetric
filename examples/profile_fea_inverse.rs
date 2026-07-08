@@ -129,7 +129,7 @@ fn main() {
             };
             fea_core::PrecondChoice::Schwarz(fea_core::SchwarzParams {
                 target_nodes: nodes.parse().expect("PROFILE_SCHWARZ=<nodes>[,bj]"),
-                dense_local: dense,
+                direct_local: dense,
             })
         }
         Err(_) => fea_core::PrecondChoice::Auto,

@@ -6,9 +6,11 @@ edition = "2024"
 [dependencies]
 volumetric_abi = { path = "../volumetric_abi" }
 rayon = { version = "1", optional = true }
+faer = { version = "0.24", optional = true }
 
 [features]
-# Thread the matrix-free apply with rayon. Native hosts and the
-# wasm32-wasip1-threads operator builds turn this on; the plain
-# wasm32-unknown-unknown operator builds must not.
-parallel = ["dep:rayon"]
+# Thread the matrix-free apply with rayon and enable the two-level Schwarz
+# preconditioner (faer supplies the sparse subdomain factorizations).
+# Native hosts turn this on; the plain wasm32-unknown-unknown operator
+# builds must not.
+parallel = ["dep:rayon", "dep:faer"]

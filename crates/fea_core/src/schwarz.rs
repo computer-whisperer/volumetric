@@ -25,7 +25,7 @@
 //! path beyond ~10^6 struts.
 
 use crate::frame::FrameModel;
-use crate::{StiffnessModel, cholesky_in_place, cholesky_solve_in_place};
+use crate::StiffnessModel;
 use rayon::prelude::*;
 use volumetric_abi::fea::FeaMesh;
 
@@ -33,18 +33,18 @@ use volumetric_abi::fea::FeaMesh;
 pub struct SchwarzParams {
     /// Target nodes per subdomain box before overlap.
     pub target_nodes: usize,
-    /// Fine-level solver: dense Cholesky per overlapping subdomain (true) —
-    /// stronger, O(m^2) per apply and O(m^2) memory — or block-Jacobi
-    /// (false) — O(n) apply, pairing the coarse correction with the
-    /// cheapest local smoother.
-    pub dense_local: bool,
+    /// Fine-level solver: sparse-Cholesky direct solves per overlapping
+    /// subdomain (true; faer factorization, the real preconditioner) or
+    /// block-Jacobi (false; O(n) apply — measured to interfere with the
+    /// coarse correction, kept for comparison runs).
+    pub direct_local: bool,
 }
 
 impl Default for SchwarzParams {
     fn default() -> Self {
         Self {
-            target_nodes: 64,
-            dense_local: true,
+            target_nodes: 128,
+            direct_local: true,
         }
     }
 }
@@ -52,13 +52,13 @@ impl Default for SchwarzParams {
 struct Subdomain {
     /// Global dof indices covered by this (overlapping) subdomain.
     dofs: Vec<u32>,
-    /// Dense Cholesky lower factor of the masked local stiffness.
-    factor: Vec<f64>,
+    /// Sparse Cholesky factorization of the masked local stiffness.
+    solver: faer::sparse::linalg::solvers::Llt<usize, f64>,
 }
 
 /// The fine (local) level of the two-level preconditioner.
 enum LocalSolves {
-    Dense(Vec<Subdomain>),
+    Direct(Vec<Subdomain>),
     /// Per-node inverted 6x6 blocks (same construction as Precond::Block,
     /// masked against the build-time constraints).
     BlockJacobi(Vec<f64>),
@@ -71,9 +71,9 @@ pub(crate) struct SchwarzPrecond {
     /// Per-node rigid-body-mode matrix N (build-time constraint rows baked
     /// in — the apply-side Z must match the Z that assembled A_c).
     modes: Vec<[[f64; 6]; 6]>,
-    /// Dense Cholesky factor of the coarse operator Z^T K Z (6 dofs per
-    /// subdomain: rigid-body modes about the subdomain centroid).
-    coarse_factor: Vec<f64>,
+    /// Dense Cholesky factorization of the coarse operator Z^T K Z (6 dofs
+    /// per subdomain: rigid-body modes about the subdomain centroid).
+    coarse_solver: faer::linalg::solvers::Llt<f64>,
     coarse_n: usize,
 }
 
@@ -175,8 +175,8 @@ impl SchwarzPrecond {
             }
         }
 
-        let local = if params.dense_local {
-            build_dense_local(mesh, model, constrained, &owner, nsub)?
+        let local = if params.direct_local {
+            build_direct_local(mesh, model, constrained, &owner, nsub)?
         } else {
             LocalSolves::BlockJacobi(crate::invert_node_blocks(
                 &model.node_blocks()?,
@@ -236,28 +236,37 @@ impl SchwarzPrecond {
                 coarse[i * coarse_n + i] = 1.0;
             }
         }
-        if !cholesky_in_place(&mut coarse, coarse_n) {
-            return None;
-        }
+        // faer's dense kernels: the coarse factor is O((6 nsub)^3) and
+        // becomes the build bottleneck past a few hundred subdomains with a
+        // naive loop.
+        let coarse_mat =
+            faer::Mat::from_fn(coarse_n, coarse_n, |i, j| coarse[i * coarse_n + j]);
+        let coarse_solver = coarse_mat.llt(faer::Side::Lower).ok()?;
 
         Some(Self {
             local,
             owner,
             modes,
-            coarse_factor: coarse,
+            coarse_solver,
             coarse_n,
         })
     }
 }
 
-/// Assemble and factor the dense overlapping-subdomain solves.
-fn build_dense_local(
+/// Assemble and factor the sparse overlapping-subdomain solves.
+fn build_direct_local(
     mesh: &FeaMesh,
     model: &FrameModel,
     constrained: &[bool],
     owner: &[u32],
     nsub: usize,
 ) -> Option<LocalSolves> {
+    use faer::sparse::{SparseColMat, Triplet};
+
+    // faer ops run inside the outer rayon fan-out below (and per-subdomain
+    // problems are small), so keep faer itself sequential.
+    faer::set_global_parallelism(faer::Par::Seq);
+
     let node_count = mesh.node_count();
     // Overlap: each subdomain takes its own nodes plus every node one strut
     // away, collected per subdomain from the element list.
@@ -274,85 +283,97 @@ fn build_dense_local(
         }
     }
 
-    // Dense assembly + factorization (parallel: this is the expensive part
-    // and each subdomain is independent).
+    // Sparse assembly + factorization (parallel: each subdomain is
+    // independent; this is the one-time cost per solve).
     let element_of_node: Vec<Vec<u32>> = {
-            let mut incidence = vec![Vec::new(); node_count];
-            for e in 0..model.strut_count() {
-                for node in model.strut_nodes(e) {
-                    incidence[node as usize].push(e as u32);
-                }
+        let mut incidence = vec![Vec::new(); node_count];
+        for e in 0..model.strut_count() {
+            for node in model.strut_nodes(e) {
+                incidence[node as usize].push(e as u32);
             }
-            incidence
-        };
-        let subdomains: Vec<Option<Subdomain>> = extended
-            .par_iter()
-            .map(|nodes| {
-                let nodes: Vec<u32> = nodes.iter().copied().collect();
-                let m = nodes.len() * 6;
-                let index_of: std::collections::HashMap<u32, usize> = nodes
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &node)| (node, i))
-                    .collect();
-                let mut k = vec![0.0f64; m * m];
-                let mut seen = std::collections::HashSet::new();
-                for &node in &nodes {
-                    for &e in &element_of_node[node as usize] {
-                        if !seen.insert(e) {
+        }
+        incidence
+    };
+    let subdomains: Vec<Option<Subdomain>> = extended
+        .par_iter()
+        .map(|nodes| {
+            let nodes: Vec<u32> = nodes.iter().copied().collect();
+            let m = nodes.len() * 6;
+            let index_of: std::collections::HashMap<u32, usize> = nodes
+                .iter()
+                .enumerate()
+                .map(|(i, &node)| (node, i))
+                .collect();
+            // Lower-triangle triplets (duplicates sum); constrained dofs are
+            // masked by skipping their entries, and get identity diagonals
+            // together with floating (no-stiffness) dofs afterwards.
+            let mut triplets: Vec<Triplet<usize, usize, f64>> = Vec::new();
+            let mut has_diagonal = vec![false; m];
+            let mut seen = std::collections::HashSet::new();
+            for &node in &nodes {
+                for &e in &element_of_node[node as usize] {
+                    if !seen.insert(e) {
+                        continue;
+                    }
+                    let [n1, n2] = model.strut_nodes(e as usize);
+                    // R_s K R_s^T: keep every block whose row AND column
+                    // node are inside. A strut crossing the subdomain
+                    // boundary still contributes its inside node's diagonal
+                    // block — that grounding is what keeps interior
+                    // subdomains SPD (skipping cut struts leaves a
+                    // pure-Neumann singular local problem).
+                    let ends = [index_of.get(&n1), index_of.get(&n2)];
+                    let ke = model.element_stiffness(e as usize);
+                    for bi in 0..4 {
+                        let Some(&row_node) = ends[bi / 2] else {
                             continue;
-                        }
-                        let [n1, n2] = model.strut_nodes(e as usize);
-                        // R_s K R_s^T: keep every block whose row AND column
-                        // node are inside. A strut crossing the subdomain
-                        // boundary still contributes its inside node's
-                        // diagonal block — that grounding is what keeps
-                        // interior subdomains SPD (skipping cut struts
-                        // leaves a pure-Neumann singular local problem).
-                        let ends = [index_of.get(&n1), index_of.get(&n2)];
-                        let ke = model.element_stiffness(e as usize);
-                        for bi in 0..4 {
-                            let Some(&row_node) = ends[bi / 2] else {
+                        };
+                        for bj in 0..4 {
+                            let Some(&col_node) = ends[bj / 2] else {
                                 continue;
                             };
-                            for bj in 0..4 {
-                                let Some(&col_node) = ends[bj / 2] else {
-                                    continue;
-                                };
-                                let row_base = row_node * 6 + (bi % 2) * 3;
-                                let col_base = col_node * 6 + (bj % 2) * 3;
-                                for r in 0..3 {
-                                    for c in 0..3 {
-                                        k[(row_base + r) * m + col_base + c] +=
-                                            ke[bi * 3 + r][bj * 3 + c];
+                            let row_base = row_node * 6 + (bi % 2) * 3;
+                            let col_base = col_node * 6 + (bj % 2) * 3;
+                            for r in 0..3 {
+                                for c in 0..3 {
+                                    let (row, col) = (row_base + r, col_base + c);
+                                    if row < col {
+                                        continue;
                                     }
+                                    let dof_row = nodes[row / 6] * 6 + (row % 6) as u32;
+                                    let dof_col = nodes[col / 6] * 6 + (col % 6) as u32;
+                                    if constrained[dof_row as usize]
+                                        || constrained[dof_col as usize]
+                                    {
+                                        continue;
+                                    }
+                                    let value = ke[bi * 3 + r][bj * 3 + c];
+                                    if row == col {
+                                        has_diagonal[row] = true;
+                                    }
+                                    triplets.push(Triplet::new(row, col, value));
                                 }
                             }
                         }
                     }
                 }
-                // Mask constrained (and floating) dofs to identity.
-                let dofs: Vec<u32> = nodes
-                    .iter()
-                    .flat_map(|&node| (0..6).map(move |c| node * 6 + c))
-                    .collect();
-                for (local, &dof) in dofs.iter().enumerate() {
-                    if constrained[dof as usize] || k[local * m + local] <= 0.0 {
-                        for j in 0..m {
-                            k[local * m + j] = 0.0;
-                            k[j * m + local] = 0.0;
-                        }
-                        k[local * m + local] = 1.0;
-                    }
+            }
+            let dofs: Vec<u32> = nodes
+                .iter()
+                .flat_map(|&node| (0..6).map(move |c| node * 6 + c))
+                .collect();
+            for (local, &dof) in dofs.iter().enumerate() {
+                if constrained[dof as usize] || !has_diagonal[local] {
+                    triplets.push(Triplet::new(local, local, 1.0));
                 }
-                if !cholesky_in_place(&mut k, m) {
-                    return None;
-                }
-                Some(Subdomain { dofs, factor: k })
-            })
-            .collect();
+            }
+            let matrix = SparseColMat::try_new_from_triplets(m, m, &triplets).ok()?;
+            let solver = matrix.sp_cholesky(faer::Side::Lower).ok()?;
+            Some(Subdomain { dofs, solver })
+        })
+        .collect();
     let subdomains: Vec<Subdomain> = subdomains.into_iter().collect::<Option<Vec<_>>>()?;
-    Some(LocalSolves::Dense(subdomains))
+    Some(LocalSolves::Direct(subdomains))
 }
 
 impl SchwarzPrecond {
@@ -365,13 +386,17 @@ impl SchwarzPrecond {
             // Subdomain solves in parallel, each producing its local
             // contribution; scatter-add serially afterwards (contributions
             // overlap, so the scatter must not race).
-            LocalSolves::Dense(subdomains) => {
+            LocalSolves::Direct(subdomains) => {
+                use faer::linalg::solvers::Solve;
                 let locals: Vec<Vec<f64>> = subdomains
                     .par_iter()
                     .map(|s| {
                         let mut local: Vec<f64> =
                             s.dofs.iter().map(|&dof| r[dof as usize]).collect();
-                        cholesky_solve_in_place(&s.factor, local.len(), &mut local);
+                        let m = local.len();
+                        s.solver.solve_in_place(
+                            faer::MatMut::from_column_major_slice_mut(&mut local, m, 1),
+                        );
                         local
                     })
                     .collect();
@@ -408,7 +433,12 @@ impl SchwarzPrecond {
                 rc[base + col] += sum;
             }
         }
-        cholesky_solve_in_place(&self.coarse_factor, self.coarse_n, &mut rc);
+        {
+            use faer::linalg::solvers::Solve;
+            self.coarse_solver.solve_in_place(
+                faer::MatMut::from_column_major_slice_mut(&mut rc, self.coarse_n, 1),
+            );
+        }
         for node in 0..node_count {
             let n = &self.modes[node];
             let base = self.owner[node] as usize * 6;
