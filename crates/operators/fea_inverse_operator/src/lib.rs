@@ -136,10 +136,33 @@ fn run_inverse(config: &InverseOperatorConfig) -> Result<FeaMesh, String> {
     let result = fea_core::solve_inverse(&mesh, &mut rigid, &mut target, &inverse_config)?;
 
     if !result.converged {
+        // The dominant stall mode is scales frozen against the min_scale
+        // floor: the scenario demands more stiffness contrast than the
+        // floor permits, and no amount of extra iterations moves the
+        // clamped fixed point. Diagnose it so the message points at the
+        // knob that actually helps.
+        let floored = result
+            .stiffness_scale
+            .iter()
+            .filter(|&&s| s <= config.min_scale * 1.0001)
+            .count();
+        let floor_share = floored as f64 / result.stiffness_scale.len().max(1) as f64;
+        let hint = if floor_share > 0.25 {
+            format!(
+                "{:.0}% of elements sit at the min_scale floor ({}) — the target \
+                 needs more stiffness contrast than the floor allows; lower \
+                 min_scale",
+                floor_share * 100.0,
+                config.min_scale
+            )
+        } else {
+            "raise max_iterations, loosen tolerance, or check that the target \
+             map covers the contact patch"
+                .to_string()
+        };
         return Err(format!(
             "did not reach the target distribution in {} iterations (final \
-             relative error {:.4}, tolerance {}); raise max_iterations, loosen \
-             tolerance, or check that the target map covers the contact patch",
+             relative error {:.4}, tolerance {}); {hint}",
             result.iterations, result.distribution_error, config.tolerance
         ));
     }

@@ -16,6 +16,14 @@
 //!   fixed face. Crossing nodes are per-strut (no welding of distinct
 //!   struts at the skin).
 //! - Struts with both endpoints outside are dropped.
+//! - Struts shorter than `weld_factor * radius` are welded away: their
+//!   endpoints merge at the cluster centroid and any parallel duplicates
+//!   collapse. A strut shorter than its own radius is a joint blob, not a
+//!   beam — near-degenerate Voronoi edges (and boundary-clip stubs) carry
+//!   bending stiffness ~1/L^3, and leaving them in makes the solver's
+//!   conditioning explode (measured: an unwelded foam fails CG at 3e8
+//!   stiffness contrast; welded at 1 radius it converges in ~10k
+//!   iterations).
 //! - Unless `prune_islands` is off, only the largest connected component
 //!   survives: floating fragments (domain concavities can cut them loose)
 //!   would make the FEA solve singular.
@@ -26,7 +34,7 @@
 //!   `{ family: "cubic" / "tetra" / "foam" .default "tetra", cell_size:
 //!   float .default 0.05, radius: float .default 0.0 (0 = cell_size / 10),
 //!   prune_islands: bool .default true, irregularity: float .default 0.3
-//!   (foam only) }`
+//!   (foam only), weld_factor: float .default 1.0 (0 disables welding) }`
 //!
 //! Output 0: CBOR-encoded Bar2 `FeaMesh` with a uniform scalar `radius`
 //! element field.
@@ -80,6 +88,9 @@ struct PatternConfig {
     /// Foam cell-shape jitter, 0 (Kelvin) ..= 1 (fully organic); the
     /// other families ignore it. Matches `lattice_operator`'s knob.
     irregularity: f64,
+    /// Struts shorter than `weld_factor * radius` are welded into a
+    /// single joint node; 0 disables.
+    weld_factor: f64,
 }
 
 impl PatternConfig {
@@ -102,6 +113,7 @@ impl Default for PatternConfig {
             radius: 0.0,
             prune_islands: true,
             irregularity: 0.3,
+            weld_factor: 1.0,
         }
     }
 }
@@ -116,6 +128,7 @@ fn clip_skeleton(
     occupied: &mut dyn FnMut([f64; 3]) -> bool,
     radius: f64,
     prune_islands: bool,
+    weld_length: f64,
 ) -> Result<FeaMesh, String> {
     // Output nodes: skeleton nodes on first use (compacted), plus one
     // fresh node per clipped crossing.
@@ -183,6 +196,16 @@ fn clip_skeleton(
         );
     }
 
+    if weld_length > 0.0 {
+        (positions, connectivity) = weld_short_struts(positions, connectivity, weld_length);
+        if connectivity.is_empty() {
+            return Err(format!(
+                "welding at length {weld_length} collapsed every strut \
+                 (is weld_factor * radius larger than the struts?)"
+            ));
+        }
+    }
+
     if prune_islands {
         (positions, connectivity) = largest_component(positions, connectivity);
     }
@@ -201,6 +224,84 @@ fn clip_skeleton(
     };
     mesh.validate()?;
     Ok(mesh)
+}
+
+/// Weld away struts shorter than `weld_length`: union-find clusters over
+/// the short edges, each cluster's nodes merge at their centroid, the
+/// contracted struts vanish, and struts left connecting the same pair of
+/// joints keep only the first copy. Repeats until no strut is short —
+/// merging joints can pull previously-long struts under the threshold.
+fn weld_short_struts(
+    mut positions: Vec<f64>,
+    mut connectivity: Vec<u32>,
+    weld_length: f64,
+) -> (Vec<f64>, Vec<u32>) {
+    loop {
+        let node_count = positions.len() / 3;
+        let mut parent: Vec<u32> = (0..node_count as u32).collect();
+        fn find(parent: &mut [u32], mut x: u32) -> u32 {
+            while parent[x as usize] != x {
+                parent[x as usize] = parent[parent[x as usize] as usize];
+                x = parent[x as usize];
+            }
+            x
+        }
+        let mut short = 0usize;
+        for pair in connectivity.chunks_exact(2) {
+            let (a, b) = (pair[0] as usize * 3, pair[1] as usize * 3);
+            let len2: f64 = (0..3)
+                .map(|c| (positions[a + c] - positions[b + c]).powi(2))
+                .sum();
+            if len2 < weld_length * weld_length {
+                short += 1;
+                let (ra, rb) = (find(&mut parent, pair[0]), find(&mut parent, pair[1]));
+                if ra != rb {
+                    let (lo, hi) = (ra.min(rb), ra.max(rb));
+                    parent[hi as usize] = lo;
+                }
+            }
+        }
+        if short == 0 {
+            return (positions, connectivity);
+        }
+
+        let mut centroid = vec![[0.0f64; 3]; node_count];
+        let mut cluster_size = vec![0usize; node_count];
+        for node in 0..node_count {
+            let root = find(&mut parent, node as u32) as usize;
+            for c in 0..3 {
+                centroid[root][c] += positions[node * 3 + c];
+            }
+            cluster_size[root] += 1;
+        }
+
+        let mut remap = vec![u32::MAX; node_count];
+        let mut new_positions: Vec<f64> = Vec::new();
+        let mut new_connectivity: Vec<u32> = Vec::new();
+        let mut seen: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+        for pair in connectivity.chunks_exact(2) {
+            let (ra, rb) = (find(&mut parent, pair[0]), find(&mut parent, pair[1]));
+            if ra == rb {
+                continue; // contracted into a joint
+            }
+            if !seen.insert((ra.min(rb), ra.max(rb))) {
+                continue; // parallel duplicate of a kept strut
+            }
+            for root in [ra, rb] {
+                if remap[root as usize] == u32::MAX {
+                    remap[root as usize] = (new_positions.len() / 3) as u32;
+                    let size = cluster_size[root as usize] as f64;
+                    new_positions.extend(centroid[root as usize].iter().map(|s| s / size));
+                }
+                new_connectivity.push(remap[root as usize]);
+            }
+        }
+        positions = new_positions;
+        connectivity = new_connectivity;
+        if connectivity.is_empty() {
+            return (positions, connectivity);
+        }
+    }
 }
 
 /// Keep only the largest connected component (by strut count; ties break
@@ -278,6 +379,12 @@ fn build_pattern(config: &PatternConfig) -> Result<FeaMesh, String> {
             config.irregularity
         ));
     }
+    if !(config.weld_factor.is_finite() && config.weld_factor >= 0.0) {
+        return Err(format!(
+            "weld_factor must be non-negative, got {}",
+            config.weld_factor
+        ));
+    }
 
     let dims =
         input_model_dimensions(0).ok_or_else(|| "input 0 is not a usable model".to_string())?;
@@ -325,6 +432,7 @@ fn build_pattern(config: &PatternConfig) -> Result<FeaMesh, String> {
         &mut occupied,
         radius,
         config.prune_islands,
+        config.weld_factor * radius,
     )
 }
 
@@ -355,7 +463,7 @@ pub extern "C" fn run() {
 pub extern "C" fn get_metadata() -> i64 {
     static METADATA: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     volumetric_abi::metadata_reply(&METADATA, || {
-        let schema = r#"{ family: "cubic" / "tetra" / "foam" .default "tetra", cell_size: float .default 0.05, radius: float .default 0.0, prune_islands: bool .default true, irregularity: float .default 0.3 }"#
+        let schema = r#"{ family: "cubic" / "tetra" / "foam" .default "tetra", cell_size: float .default 0.05, radius: float .default 0.0, prune_islands: bool .default true, irregularity: float .default 0.3, weld_factor: float .default 1.0 }"#
             .to_string();
         OperatorMetadata {
             name: "strut_pattern_operator".to_string(),
@@ -386,7 +494,7 @@ mod tests {
         prune: bool,
     ) -> Result<FeaMesh, String> {
         let node_occupied: Vec<bool> = skeleton.nodes.iter().map(|&p| occupied(p)).collect();
-        clip_skeleton(skeleton, &node_occupied, occupied, 0.01, prune)
+        clip_skeleton(skeleton, &node_occupied, occupied, 0.01, prune, 0.01)
     }
 
     #[test]
@@ -470,6 +578,81 @@ mod tests {
         let skeleton = enumerate_skeleton(SkeletonFamily::Tetra, [0.0; 3], [1.0; 3], 0.2);
         let err = clip_with(&skeleton, &mut |_| false, true).unwrap_err();
         assert!(err.contains("no struts"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn welding_collapses_short_struts_into_joints() {
+        // A "dumbbell": two long struts joined by a tiny middle edge.
+        //   0 --(1.0)-- 1 --(0.01)-- 2 --(1.0)-- 3
+        let positions = vec![
+            0.0, 0.0, 0.0, // 0
+            1.0, 0.0, 0.0, // 1
+            1.01, 0.0, 0.0, // 2
+            2.01, 0.0, 0.0, // 3
+        ];
+        let connectivity = vec![0, 1, 1, 2, 2, 3];
+        let (p, c) = weld_short_struts(positions, connectivity, 0.05);
+        assert_eq!(c.len() / 2, 2, "tiny middle edge should contract");
+        assert_eq!(p.len() / 3, 3, "nodes 1 and 2 should merge");
+        // The joint sits at the pair's centroid.
+        assert!(p.chunks(3).any(|q| (q[0] - 1.005).abs() < 1e-12
+            && q[1] == 0.0
+            && q[2] == 0.0));
+    }
+
+    #[test]
+    fn welding_dedupes_parallel_struts() {
+        // A sliver triangle: welding its short edge leaves the two long
+        // edges connecting the same pair of joints; only one survives.
+        let positions = vec![
+            0.0, 0.0, 0.0, // 0
+            1.0, 0.0, 0.0, // 1
+            1.0, 0.01, 0.0, // 2
+        ];
+        let connectivity = vec![0, 1, 1, 2, 2, 0];
+        let (p, c) = weld_short_struts(positions, connectivity, 0.05);
+        assert_eq!(c.len() / 2, 1, "parallel duplicates should dedup");
+        assert_eq!(p.len() / 3, 2);
+    }
+
+    #[test]
+    fn welding_cascades_through_chains() {
+        // Three 0.04 edges chain into a 0.12 cluster: each merge pulls the
+        // next edge under the threshold, so the whole chain becomes one
+        // joint even though welding is threshold-per-pass.
+        let positions = vec![
+            0.0, 0.0, 0.0, // 0
+            1.0, 0.0, 0.0, // 1: chain start
+            1.04, 0.0, 0.0, // 2
+            1.08, 0.0, 0.0, // 3
+            1.12, 0.0, 0.0, // 4: chain end
+            2.12, 0.0, 0.0, // 5
+        ];
+        let connectivity = vec![0, 1, 1, 2, 2, 3, 3, 4, 4, 5];
+        let (p, c) = weld_short_struts(positions, connectivity, 0.05);
+        assert_eq!(c.len() / 2, 2, "the chain should contract to one joint");
+        assert_eq!(p.len() / 3, 3);
+    }
+
+    #[test]
+    fn clipped_meshes_have_no_short_struts() {
+        // The property the FEA solver needs: no strut shorter than the
+        // weld length survives clipping (foam's near-degenerate Voronoi
+        // edges and boundary stubs are otherwise 1/L^3 stiffness spikes).
+        let skeleton = enumerate_skeleton(
+            SkeletonFamily::Foam { irregularity: 0.3 },
+            [0.0; 3],
+            [1.0; 3],
+            0.2,
+        );
+        let mesh = clip_with(&skeleton, &mut sphere([0.5; 3], 0.45), true).unwrap();
+        for e in 0..mesh.element_count() {
+            let pair = mesh.element(e);
+            let a = mesh.node_position(pair[0] as usize);
+            let b = mesh.node_position(pair[1] as usize);
+            let len = (0..3).map(|c| (a[c] - b[c]).powi(2)).sum::<f64>().sqrt();
+            assert!(len >= 0.01, "strut {e} survived below the weld length: {len}");
+        }
     }
 
     #[test]
