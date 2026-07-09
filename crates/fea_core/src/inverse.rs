@@ -515,11 +515,28 @@ fn solve_inverse_frame(
     let mut scales = stiffness_scales(mesh)?;
     let mut iterations = 0;
     let mut best: Option<InverseResult> = None;
+    // EXPERIMENT (FEA_INVERSE_GRAD=1, native only): per-strut adjoint
+    // gradient update instead of the column ratio update. Step size and
+    // material weight via FEA_INVERSE_ETA / FEA_INVERSE_ALPHA. Column
+    // machinery still runs for the reported TV metric, keep-best, and the
+    // target_force output, so the two update paths are directly comparable.
+    let grad_mode = std::env::var("FEA_INVERSE_GRAD").is_ok_and(|v| v != "0");
+    let grad_eta = std::env::var("FEA_INVERSE_ETA")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.5);
+    let grad_alpha = std::env::var("FEA_INVERSE_ALPHA")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    // Barzilai-Borwein state: the previous log-scale point and its
+    // gradient, for the adaptive step length.
+    let mut bb_prev: Option<(Vec<f64>, Vec<f64>)> = None;
 
     loop {
         iterations += 1;
         set_scale_field(&mut work, &scales);
-        let result = solve(&work, rigid, &config.solve)?;
+        let (result, model, internals) = crate::solve_frame_internal(&work, rigid, &config.solve)?;
         if !result.stats.converged {
             return Err(forward_failure(iterations, &result.stats));
         }
@@ -638,6 +655,12 @@ fn solve_inverse_frame(
             );
         }
 
+        // Gradient-path objective — the smoothed column TV, so the gradient
+        // optimizes exactly what the metric measures. Computed before the
+        // keep-best snapshot consumes `result`.
+        let grad_input = grad_mode
+            .then(|| column_objective(&contacts, &col_force, &col_target, contact_sign));
+
         let converged = distribution_error <= config.tolerance;
         if best
             .as_ref()
@@ -665,20 +688,79 @@ fn solve_inverse_frame(
             return Ok(best);
         }
 
-        apply_update(&mut scales, &columns, &ratios, config);
+        if let Some((j, dj_dr)) = grad_input {
+            let mut grad = frame_match_gradient(
+                &model,
+                &internals,
+                &dj_dr,
+                contact_axis,
+                &scales,
+                &config.solve,
+            )?;
+            if grad_alpha > 0.0 {
+                // Material term: alpha * volume fraction — pins the
+                // sub-surface indeterminacy toward minimum material.
+                let total_volume: f64 = (0..scales.len()).map(|e| model.strut_volume(e)).sum();
+                for (e, g) in grad.iter_mut().enumerate() {
+                    *g += grad_alpha * model.strut_volume(e) / total_volume;
+                }
+            }
+            // Multiplicative log-space step. The step length comes from
+            // Barzilai-Borwein (curvature estimated from the last two
+            // gradients); the first iteration falls back to eta over the
+            // p99 |gradient| (outlier struts must not set the global step —
+            // same lesson as the p99 divisor). Each component is capped at
+            // ±ln 4, mirroring the column update's factor clamp.
+            let glog: Vec<f64> = grad.iter().zip(&scales).map(|(g, s)| g * s).collect();
+            let logs: Vec<f64> = scales.iter().map(|s| s.ln()).collect();
+            let fallback = || {
+                let mut mags: Vec<f64> = glog.iter().map(|g| g.abs()).collect();
+                let idx = (mags.len() - 1) * 99 / 100;
+                mags.select_nth_unstable_by(idx, |a, b| a.total_cmp(b));
+                if mags[idx] > 0.0 { grad_eta / mags[idx] } else { 0.0 }
+            };
+            let step = match &bb_prev {
+                Some((prev_logs, prev_glog)) => {
+                    let mut sy = 0.0;
+                    let mut yy = 0.0;
+                    for i in 0..glog.len() {
+                        let dx = logs[i] - prev_logs[i];
+                        let dy = glog[i] - prev_glog[i];
+                        sy += dx * dy;
+                        yy += dy * dy;
+                    }
+                    if yy > 0.0 && sy != 0.0 {
+                        (sy / yy).abs()
+                    } else {
+                        fallback()
+                    }
+                }
+                None => fallback(),
+            };
+            if debug_level >= 2 {
+                eprintln!("  grad: J={j:.6} step={step:.3e}");
+            }
+            bb_prev = Some((logs, glog.clone()));
+            let cap = 4.0f64.ln();
+            for (s, g) in scales.iter_mut().zip(&glog) {
+                let delta = (-step * g).clamp(-cap, cap);
+                *s = (*s * delta.exp()).clamp(config.min_scale, 1.0);
+            }
+        } else {
+            apply_update(&mut scales, &columns, &ratios, config);
+        }
     }
 }
 
-/// Smooth per-node distribution-matching objective for the gradient path:
-/// `J = sum_n (a_n - t_n)^2` over the active contact set, where `a_n` is
-/// node n's share of the achieved compressive force and `t_n` its share of
-/// the sampled target. Shares make J invariant to uniform stiffness
-/// scaling, matching the relative semantics of the column loop; the column
-/// TV distance stays the reported/converged metric.
+/// Per-node share-matching objective `J = sum_n (a_n - t_n)^2` over the
+/// active contact set — the finite-difference harness objective for
+/// validating the adjoint chain (production uses `column_objective`; the
+/// adjoint and per-strut assembly are objective-agnostic and shared).
 ///
 /// Returns `(J, dJ/dR per active node)` where `R` is the raw contact-axis
 /// reaction (`a_n = -contact_sign * R_n / F`), i.e. exactly the quantity
 /// the adjoint differentiates.
+#[cfg(test)]
 pub(crate) fn match_objective(
     contact_force: &[f64],
     active: &[usize],
@@ -720,6 +802,48 @@ pub(crate) fn match_objective(
         })
         .collect();
     Ok((j, dj_dr))
+}
+
+/// Reaction-space gradient of the squared *column* share error
+/// `J = sum_c (A_c - T_c)^2` — the same column granularity and attribution
+/// as the reported TV metric, in a smooth, well-conditioned form (an L1/
+/// sign-style gradient pushes every column equally hard and descends
+/// poorly). The attribution fractions are treated as frozen weights (they
+/// vary slowly with the scales).
+///
+/// Returns `(J, dJ/dR per contact node)` for `frame_match_gradient`.
+pub(crate) fn column_objective(
+    contacts: &[(usize, f64, ColumnShares)],
+    col_force: &HashMap<(i64, i64), f64>,
+    col_target: &HashMap<(i64, i64), f64>,
+    contact_sign: f64,
+) -> (f64, Vec<(usize, f64)>) {
+    let total_force: f64 = col_force.values().sum();
+    let total_target: f64 = col_target.values().sum();
+
+    let mut j = 0.0;
+    let mut coupling = 0.0; // sum_c 2 d_c A_c
+    let mut col_dphi: HashMap<(i64, i64), f64> = HashMap::with_capacity(col_force.len());
+    for (c, f) in col_force {
+        let a = f / total_force;
+        let d = a - col_target[c] / total_target;
+        j += d * d;
+        coupling += 2.0 * d * a;
+        col_dphi.insert(*c, 2.0 * d);
+    }
+
+    let dj_dr = contacts
+        .iter()
+        .map(|(node, _, fractions)| {
+            let along: f64 = fractions
+                .iter()
+                .map(|(c, fraction)| col_dphi[c] * fraction)
+                .sum();
+            let dj_df = (along - coupling) / total_force;
+            (*node, -contact_sign * dj_df)
+        })
+        .collect();
+    (j, dj_dr)
 }
 
 /// Per-strut gradient of `match_objective` via one adjoint solve: build the
@@ -900,6 +1024,68 @@ mod tests {
             low_z > 1.5 * high_z,
             "expected stiffer columns at low z: low {low_z}, high {high_z}"
         );
+    }
+
+    /// `column_objective`'s dJ/dR formula validated by finite differences
+    /// in reaction space — no solves involved, the attribution is frozen
+    /// exactly as the formula assumes. (The adjoint chain downstream of
+    /// dJ/dR is FD-validated end-to-end by the test below.)
+    #[test]
+    fn column_objective_gradient_matches_finite_differences() {
+        // Synthetic three-column attribution: four nodes, mixed fractions.
+        let cols = [(0i64, 0i64), (1, 0), (2, 0)];
+        let contacts: Vec<(usize, f64, ColumnShares)> = vec![
+            (3, 2.0, vec![(cols[0], 1.0)]),
+            (7, 1.0, vec![(cols[0], 0.4), (cols[1], 0.6)]),
+            (9, 0.5, vec![(cols[1], 0.7), (cols[2], 0.3)]),
+            (11, 1.5, vec![(cols[2], 1.0)]),
+        ];
+        let col_target: HashMap<(i64, i64), f64> =
+            [(cols[0], 1.0), (cols[1], 3.0), (cols[2], 0.5)].into();
+        let sign = -1.0; // exercise the reaction sign flip
+
+        let j_of = |forces: &[f64; 4]| {
+            let mut col_force: HashMap<(i64, i64), f64> = HashMap::new();
+            for ((_, _, fractions), f) in contacts.iter().zip(forces) {
+                for (c, fraction) in fractions {
+                    *col_force.entry(*c).or_default() += f * fraction;
+                }
+            }
+            let total_f: f64 = col_force.values().sum();
+            let total_t: f64 = col_target.values().sum();
+            col_force
+                .iter()
+                .map(|(c, f)| {
+                    let d = f / total_f - col_target[c] / total_t;
+                    d * d
+                })
+                .sum::<f64>()
+        };
+
+        let base = [2.0, 1.0, 0.5, 1.5];
+        let mut col_force: HashMap<(i64, i64), f64> = HashMap::new();
+        for ((_, _, fractions), f) in contacts.iter().zip(&base) {
+            for (c, fraction) in fractions {
+                *col_force.entry(*c).or_default() += f * fraction;
+            }
+        }
+        let (j, dj_dr) = column_objective(&contacts, &col_force, &col_target, sign);
+        assert!((j - j_of(&base)).abs() < 1e-12);
+
+        let eps = 1e-7;
+        for (i, &(node, _, _)) in contacts.iter().enumerate() {
+            let mut plus = base;
+            plus[i] += eps;
+            let mut minus = base;
+            minus[i] -= eps;
+            let dj_df = (j_of(&plus) - j_of(&minus)) / (2.0 * eps);
+            let dj_dr_expect = -sign * dj_df; // f = -sign * R
+            let (_, got) = dj_dr.iter().find(|(n, _)| *n == node).unwrap();
+            assert!(
+                (got - dj_dr_expect).abs() < 1e-6 * dj_dr_expect.abs().max(1e-9),
+                "node {node}: formula {got:.9e} vs fd {dj_dr_expect:.9e}"
+            );
+        }
     }
 
     /// The linchpin of the adjoint path: dJ/ds from `frame_match_gradient`

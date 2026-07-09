@@ -730,7 +730,10 @@ pub(crate) struct SolveInternals {
     /// Per-dof constraint mask at convergence (fixed face + active
     /// contacts).
     pub(crate) constrained: Vec<bool>,
-    /// Active contact node indices.
+    /// Active contact node indices. Part of the adjoint contract (an
+    /// objective may need the full frozen set, not just the compressive
+    /// nodes); currently read by the FD validation harness only.
+    #[allow(dead_code)]
     pub(crate) active: Vec<usize>,
     pub(crate) dpn: usize,
 }

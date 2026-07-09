@@ -146,4 +146,44 @@ fn main() {
         result.converged,
         result.distribution_error,
     );
+
+    // GRAZE_ANALYZE=1: mean designed scale by (radial band, orientation) for
+    // the top two node layers — shows whether the update differentiates
+    // lateral (hammock) struts from vertical chains, a freedom lateral
+    // column bins cannot express.
+    if std::env::var("GRAZE_ANALYZE").is_ok() {
+        let top = 0.3 - 1.5 * 0.05; // top two layers of the 0.3-tall block
+        let mut sums = [[0.0f64; 2]; 3];
+        let mut counts = [[0usize; 2]; 3];
+        for e in 0..mesh.element_count() {
+            let pair = mesh.element(e);
+            let a = mesh.node_position(pair[0] as usize);
+            let b = mesh.node_position(pair[1] as usize);
+            if a[2].min(b[2]) < top {
+                continue;
+            }
+            let (mx, my) = (0.5 * (a[0] + b[0]), 0.5 * (a[1] + b[1]));
+            let r = ((mx - 0.5).powi(2) + (my - 0.5).powi(2)).sqrt();
+            let band = if r < 0.15 {
+                0
+            } else if r < 0.35 {
+                1
+            } else {
+                2
+            };
+            let len = (0..3).map(|c| (a[c] - b[c]).powi(2)).sum::<f64>().sqrt();
+            let lateral = ((a[2] - b[2]).abs() / len) < 0.5;
+            sums[band][lateral as usize] += result.stiffness_scale[e];
+            counts[band][lateral as usize] += 1;
+        }
+        for (band, name) in ["center", "rim", "outside"].iter().enumerate() {
+            println!(
+                "surface {name}: vertical mean {:.3} (n={}), lateral mean {:.3} (n={})",
+                sums[band][0] / counts[band][0].max(1) as f64,
+                counts[band][0],
+                sums[band][1] / counts[band][1].max(1) as f64,
+                counts[band][1],
+            );
+        }
+    }
 }
