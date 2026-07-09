@@ -307,4 +307,8 @@ impl ModelExecutor for NativeModelExecutor {
     fn sample_nd(&mut self, position: &[f64]) -> Result<f32, WasmBackendError> {
         NativeModelExecutor::sample_nd(self, position)
     }
+
+    fn sample_channels_nd(&mut self, position: &[f64]) -> Result<Vec<f32>, WasmBackendError> {
+        NativeModelExecutor::sample_channels_nd(self, position)
+    }
 }

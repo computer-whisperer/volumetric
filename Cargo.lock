@@ -5904,11 +5904,15 @@ name = "volumetric_ui_v2"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "console_error_panic_hook",
+ "console_log",
  "damascene-core",
  "damascene-wgpu",
  "damascene-winit-wgpu",
  "glam 0.32.1",
  "image",
+ "js-sys",
+ "log",
  "pollster",
  "rfd",
  "volumetric",
@@ -5916,7 +5920,11 @@ dependencies = [
  "volumetric_daemon",
  "volumetric_protocol",
  "volumetric_renderer",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
  "wat",
+ "web-sys",
+ "web-time",
  "wgpu",
  "winit",
 ]

@@ -1,0 +1,17 @@
+[build]
+target = "index.html"
+dist = "dist"
+
+# The web-feature cargo flags live on index.html's rust link
+# (data-cargo-no-default-features / data-cargo-features="web").
+
+[watch]
+# Watch the UI crate, the engine, and the session/renderer it pulls in.
+watch = ["src", "index.html", "wasm_helper.js", "../../src", "../volumetric_renderer/src"]
+ignore = []
+
+[serve]
+address = "127.0.0.1"
+# v1 serves on 8080; keep both runnable side by side.
+port = 8081
+open = false

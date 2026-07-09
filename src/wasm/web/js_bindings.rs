@@ -10,6 +10,7 @@
 //! - `wasmModelGetDimensions(handle: number): number` - Get the number of dimensions
 //! - `wasmModelGetBounds(handle: number): Float64Array` - Get interleaved [min_0, max_0, min_1, max_1, ...]
 //! - `wasmModelSample(handle: number, x: f64, y: f64, z: f64): f32` - Sample density (extra dims zero)
+//! - `wasmModelSampleNd(handle: number, position: Float64Array): f32` - Sample density at an N-dimensional position
 //! - `wasmModelDestroy(handle: number)` - Free the model instance
 //!
 //! ## Operator Functions
@@ -57,6 +58,11 @@ extern "C" {
     /// Returns the density value, or NaN on error.
     #[wasm_bindgen(js_name = wasmModelSample)]
     pub fn wasm_model_sample(handle: JsWasmHandle, x: f64, y: f64, z: f64) -> f32;
+
+    /// Sample the density at an N-dimensional position (missing trailing
+    /// dimensions are zeroed, extras ignored). Returns NaN on error.
+    #[wasm_bindgen(js_name = wasmModelSampleNd)]
+    pub fn wasm_model_sample_nd(handle: JsWasmHandle, position: &[f64]) -> f32;
 
     /// Destroy a model instance and free resources.
     #[wasm_bindgen(js_name = wasmModelDestroy)]

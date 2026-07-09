@@ -28,9 +28,9 @@ use crate::wasm::traits::{
 #[cfg(feature = "web")]
 use js_bindings::{
     JsWasmHandle, wasm_model_create_sync, wasm_model_destroy, wasm_model_get_bounds,
-    wasm_model_get_dimensions, wasm_model_sample, wasm_operator_create, wasm_operator_destroy,
-    wasm_operator_get_error, wasm_operator_get_metadata, wasm_operator_get_output,
-    wasm_operator_get_output_indices, wasm_operator_run,
+    wasm_model_get_dimensions, wasm_model_sample, wasm_model_sample_nd, wasm_operator_create,
+    wasm_operator_destroy, wasm_operator_get_error, wasm_operator_get_metadata,
+    wasm_operator_get_output, wasm_operator_get_output_indices, wasm_operator_run,
 };
 
 /// Fetch a model's N-dimensional bounds through the JS bridge.
@@ -121,6 +121,32 @@ impl ModelExecutor for WebModelExecutor {
             ));
         }
         Ok(result)
+    }
+
+    fn dimensions(&mut self) -> Result<u32, WasmBackendError> {
+        Ok(self.bounds.dimensions() as u32)
+    }
+
+    fn get_bounds_nd(&mut self) -> Result<ModelBoundsNd, WasmBackendError> {
+        Ok(self.bounds.clone())
+    }
+
+    fn sample_nd(&mut self, position: &[f64]) -> Result<f32, WasmBackendError> {
+        let result = wasm_model_sample_nd(self.handle, position);
+        if result.is_nan() {
+            return Err(WasmBackendError::Execution(
+                "WASM sample returned NaN".to_string(),
+            ));
+        }
+        Ok(result)
+    }
+
+    fn sample_channels_nd(&mut self, position: &[f64]) -> Result<Vec<f32>, WasmBackendError> {
+        // The JS bridge has no `sample_channels` path yet, and this
+        // executor's `sample_format` is the occupancy-only default — so
+        // plain `sample` is the whole row (same fallback the native
+        // executor uses for occupancy-only models).
+        Ok(vec![self.sample_nd(position)?])
     }
 }
 

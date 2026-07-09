@@ -141,6 +141,15 @@ pub trait ModelExecutor: Send {
             "N-dimensional access not supported by this backend yet".to_string(),
         ))
     }
+
+    /// Sample every declared channel at an N-dimensional position, in
+    /// [`Self::sample_format`] order (channel 0 is occupancy). Backends
+    /// without the `sample_channels` ABI report unavailable.
+    fn sample_channels_nd(&mut self, _position: &[f64]) -> Result<Vec<f32>, WasmBackendError> {
+        Err(WasmBackendError::Unavailable(
+            "channel sampling not supported by this backend yet".to_string(),
+        ))
+    }
 }
 
 /// Thread-safe sampler for parallel volumetric model sampling.
@@ -220,10 +229,10 @@ impl OperatorIo {
 /// - `input_model_dimensions(i32) -> i32`, `input_model_bounds(i32, i32) ->
 ///   i32`, `input_model_sample(i32, i32, i32, i32) -> i32` - Evaluate a
 ///   `ModelWASM` input without instantiating it inside the operator; the
-///   host services the calls with a native model executor. See the
-///   `volumetric_abi` crate docs for the full contract. Currently native
-///   only - the web backend's JS bridge does not provide them yet, so
-///   operators that import them fail to instantiate there.
+///   host services the calls with a lazily-created model executor (a
+///   wasmtime instance natively; a browser `WebAssembly.Instance` via
+///   `wasm_helper.js` on the web). See the `volumetric_abi` crate docs for
+///   the full contract.
 pub trait OperatorExecutor: Send {
     /// Execute the operator with the given I/O state.
     fn run(&mut self, io: OperatorIo) -> Result<OperatorIo, WasmBackendError>;

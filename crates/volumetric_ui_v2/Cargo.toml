@@ -4,20 +4,69 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[features]
+default = ["native"]
+# Desktop shell: wasmtime engine backend, winit window, worker threads.
+native = ["volumetric/native"]
+# Browser shell: JS-bridge engine backend, canvas + async GPU setup,
+# inline job execution. Build with
+# `--target wasm32-unknown-unknown --no-default-features --features web`
+# (index.html's data-trunk rust link carries these flags for trunk builds).
+web = [
+    "volumetric/web",
+    "dep:wasm-bindgen",
+    "dep:wasm-bindgen-futures",
+    "dep:js-sys",
+    "dep:web-sys",
+    "dep:console_log",
+    "dep:console_error_panic_hook",
+]
+
 [dependencies]
 damascene-core = "0.4.5"
 damascene-wgpu = "0.4.5"
-damascene-winit-wgpu = "0.4.5"
 anyhow = "1"
 glam = "0.32"
-pollster = "0.4"
 rfd = "0.17"
-volumetric = { path = "../../" }
+volumetric = { path = "../../", default-features = false }
 volumetric_assets = { path = "../volumetric_assets" }
-volumetric_protocol = { path = "../volumetric_protocol", features = ["client"] }
 volumetric_renderer = { path = "../volumetric_renderer" }
 wgpu = "29"
 winit = "0.30"
+web-time = "1"
+log = "0.4"
+
+# Web-shell dependencies, enabled by the `web` feature.
+wasm-bindgen = { version = "0.2", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+js-sys = { version = "0.3", optional = true }
+console_log = { version = "1", optional = true }
+console_error_panic_hook = { version = "0.1", optional = true }
+web-sys = { version = "0.3", optional = true, features = [
+    "Window",
+    "Document",
+    "Element",
+    "HtmlElement",
+    "HtmlCanvasElement",
+    "HtmlAnchorElement",
+    "Blob",
+    "BlobPropertyBag",
+    "Url",
+    "ResizeObserver",
+    "CssStyleDeclaration",
+] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+damascene-winit-wgpu = "0.4.5"
+pollster = "0.4"
+# The daemon client is ureq (blocking TCP) — native only. The wasm build
+# below keeps the protocol types (DEFAULT_PORT, message shapes) without
+# the client.
+volumetric_protocol = { path = "../volumetric_protocol", features = ["client"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+volumetric_protocol = { path = "../volumetric_protocol" }
+wgpu = { version = "29", features = ["webgl"] }
 
 [[bin]]
 name = "volumetric_ui_v2"
@@ -26,6 +75,7 @@ path = "src/main.rs"
 [[bin]]
 name = "dump_v2_shell"
 path = "src/bin/dump_v2_shell.rs"
+required-features = ["native"]
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }

@@ -23,6 +23,10 @@ use crate::{
     PreviewRequest, RunState, VolumetricUiV2,
 };
 use volumetric::AssetTypeHint;
+// Model executors come from the engine's backend factory so both wasm
+// backends (wasmtime natively, the JS bridge in the browser) satisfy the
+// same call sites.
+use volumetric::wasm::ModelExecutor as _;
 
 /// Per-frame and per-event driver for one running app instance.
 ///
@@ -1395,9 +1399,9 @@ pub fn execute_job_monitored(
             project,
             cancel,
         } => {
-            // std::time::Instant panics on wasm32-unknown-unknown; swap for
-            // web-time when the web shell lands.
-            let start = std::time::Instant::now();
+            // web_time::Instant is std::time::Instant on native and a
+            // performance.now() clock on wasm32 (std's panics there).
+            let start = web_time::Instant::now();
             let result = backend.run_project(&project, &cancel, &|progress| {
                 emit(BackgroundResult::RunProgress {
                     generation,
@@ -1608,12 +1612,12 @@ pub fn build_slice_lightbox_data(
 ) -> Result<LightboxData, String> {
     const RESOLUTION: usize = 256;
 
-    let mut executor = volumetric::wasm::native::NativeModelExecutor::new(wasm_bytes)
-        .map_err(|err| err.to_string())?;
-    if executor.dimensions() != 3 {
+    let mut executor =
+        volumetric::wasm::create_model_executor(wasm_bytes).map_err(|err| err.to_string())?;
+    let dimensions = executor.dimensions().map_err(|err| err.to_string())?;
+    if dimensions != 3 {
         return Err(format!(
-            "slice inspection needs a 3D model (got {}D)",
-            executor.dimensions()
+            "slice inspection needs a 3D model (got {dimensions}D)"
         ));
     }
     if axis > 2 {
@@ -1621,6 +1625,7 @@ pub fn build_slice_lightbox_data(
     }
     let channel_idx = executor
         .sample_format()
+        .map_err(|err| err.to_string())?
         .channels
         .iter()
         .position(|c| c.name == channel)
@@ -1810,7 +1815,7 @@ pub fn build_preview_scene_monitored(
     backend: &dyn ExecutionBackend,
     progress: &dyn Fn(volumetric::BuildProgress),
 ) -> Result<Option<PreviewEntity>, String> {
-    let build_start = std::time::Instant::now();
+    let build_start = web_time::Instant::now();
     let mut stats = OutputStats::default();
 
     if cancel.load(Ordering::Relaxed) {
@@ -1926,14 +1931,12 @@ pub fn build_preview_scene_monitored(
     // a channel is selected, colormap the built points/vertices by sampling
     // it. The module is already in the executor cache from the meshing pass,
     // so this executor is cheap to create.
-    match volumetric::wasm::native::NativeModelExecutor::new(request.data.as_slice()) {
+    match volumetric::wasm::create_model_executor(request.data.as_slice()) {
         Ok(mut executor) => {
             stats.model_channels = executor
                 .sample_format()
-                .channels
-                .iter()
-                .map(|c| c.name.clone())
-                .collect();
+                .map(|format| format.channels.iter().map(|c| c.name.clone()).collect())
+                .unwrap_or_default();
             if let Some(channel) = color_channel {
                 match colormap_scene_by_channel(&mut scene, &mut executor, channel) {
                     Ok((value_min, value_max)) => stats.detail.push(format!(
@@ -1967,11 +1970,12 @@ pub fn build_preview_scene_monitored(
 /// non-finite samples. Returns the value range the colormap spans.
 fn colormap_scene_by_channel(
     scene: &mut renderer::SceneData,
-    executor: &mut volumetric::wasm::native::NativeModelExecutor,
+    executor: &mut impl volumetric::wasm::ModelExecutor,
     channel: &str,
 ) -> Result<(f32, f32), String> {
     let channel_idx = executor
         .sample_format()
+        .map_err(|err| err.to_string())?
         .channels
         .iter()
         .position(|c| c.name == channel)
@@ -2172,7 +2176,7 @@ fn render_settings(
 /// cells become double-sided quads (one +z face, one -z face).
 fn build_sketch_preview(
     request: &PreviewRequest,
-    build_start: std::time::Instant,
+    build_start: web_time::Instant,
 ) -> Result<PreviewEntity, String> {
     let resolution = match &request.plan {
         PreviewPlan::Sketch { resolution } => *resolution,
@@ -2297,7 +2301,7 @@ fn build_sketch_preview(
 /// triangulation diagonals).
 fn build_fea_mesh_preview(
     request: &PreviewRequest,
-    build_start: std::time::Instant,
+    build_start: web_time::Instant,
 ) -> Result<PreviewEntity, String> {
     let mut mesh = volumetric::fea::decode_fea_mesh(request.data.as_slice())?;
     let faces = mesh.boundary_faces();
@@ -2677,7 +2681,7 @@ fn build_fea_mesh_preview(
 /// of the unique edges.
 fn build_tri_mesh_preview(
     request: &PreviewRequest,
-    build_start: std::time::Instant,
+    build_start: web_time::Instant,
 ) -> Result<PreviewEntity, String> {
     let mesh = volumetric::trimesh::decode_tri_mesh(request.data.as_slice())?;
 

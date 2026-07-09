@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Volumetric UI v2</title>
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #1a1a2e;
+        }
+
+        #volumetric_canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+            outline: none;
+        }
+
+        /* Loading indicator */
+        #loading {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: #e0e0e0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            font-size: 1.5rem;
+            text-align: center;
+        }
+
+        #loading .spinner {
+            width: 50px;
+            height: 50px;
+            border: 4px solid rgba(255, 255, 255, 0.1);
+            border-top-color: #4a9eff;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 1rem;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        /* Hide loading when the app has started */
+        .loaded #loading {
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div id="loading">
+        <div class="spinner"></div>
+        <div>Loading Volumetric UI v2...</div>
+    </div>
+
+    <canvas id="volumetric_canvas"></canvas>
+
+    <!-- Build the Rust WASM binary with the web feature -->
+    <link data-trunk rel="rust" data-bin="volumetric_ui_v2" data-wasm-opt="z"
+          data-cargo-no-default-features data-cargo-features="web" />
+
+    <!-- Engine JS bridge for nested model/operator instantiation -->
+    <script data-trunk src="wasm_helper.js"></script>
+
+    <script>
+        // Trunk injects the wasm-bindgen init call itself (hashed bundle
+        // name) and announces completion with this event.
+        addEventListener('TrunkApplicationStarted', () => {
+            document.body.classList.add('loaded');
+        });
+        function showLoadError(message) {
+            const loading = document.getElementById('loading');
+            if (!loading || document.body.classList.contains('loaded')) return;
+            loading.innerHTML = `
+                <div style="color: #ff6b6b;">
+                    Failed to load application.<br>
+                    <small>${message}</small>
+                </div>
+            `;
+        }
+        addEventListener('error', (e) => showLoadError(e.message || e.error));
+        addEventListener('unhandledrejection', (e) => showLoadError(e.reason));
+    </script>
+</body>
+</html>

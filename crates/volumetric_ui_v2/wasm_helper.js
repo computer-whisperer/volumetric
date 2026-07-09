@@ -1,6 +1,10 @@
 // WASM Helper for nested WASM module execution
 // This file provides JavaScript functions for instantiating and calling WASM model modules
-// from within the main volumetric_ui WASM module.
+// from within the main volumetric_ui_v2 WASM module.
+//
+// Copied from crates/volumetric_ui/wasm_helper.js — the two files implement
+// the same engine JS-bridge contract (src/wasm/web/js_bindings.rs) and must
+// stay in sync.
 //
 // Models use the N-dimensional ABI:
 //   get_dimensions() -> u32

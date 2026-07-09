@@ -1,5 +1,8 @@
 /target
 /crates/volumetric_ui_v2/out
+# Trunk web-build output
+/crates/volumetric_ui/dist
+/crates/volumetric_ui_v2/dist
 .idea/*
 .claude/*
 
