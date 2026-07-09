@@ -374,22 +374,44 @@ fn solve_inverse_hex(
             return Ok(best);
         }
 
-        // Fixed-point update, damped by `exponent` and clamped per
-        // iteration so one bad linearization can't blow up the scales.
-        for (c, ratio) in &ratios {
-            let factor = ratio.powf(config.exponent).clamp(0.25, 4.0);
-            for &e in &columns[c] {
-                scales[e] *= factor;
-            }
+        apply_update(&mut scales, &columns, &ratios, config);
+    }
+}
+
+/// Fixed-point update shared by both inverse paths: boost each contacted
+/// column by its damped, clamped ratio, then renormalize by the
+/// 99th-percentile element scale and clamp to [min_scale, 1].
+///
+/// The percentile — not the max — sets the divisor. Unsatisfiable columns
+/// (a grazing rim demanding force where penetration vanishes) boost every
+/// iteration without ever quenching; renormalizing by their boost ratchets
+/// the *satisfied* bulk toward the floor (measured on fea_strut_example_2:
+/// ~1.6x bulk decay per iteration until 81% of struts sat at min_scale and
+/// the error collapsed from 0.023 to ~0.11). Such columns are outliers by
+/// population, so a p99 divisor ignores them — they just clamp at the 1.0
+/// ceiling — while the p99 element itself is regular interior whose demand
+/// quenches, so the divisor decays to 1 as the distribution converges.
+/// (Same case, same budget: max-divisor best error 0.035 then avalanche;
+/// p99 divisor converges to 0.019.)
+fn apply_update(
+    scales: &mut [f64],
+    columns: &HashMap<(i64, i64), Vec<usize>>,
+    ratios: &HashMap<(i64, i64), f64>,
+    config: &InverseConfig,
+) {
+    for (c, ratio) in ratios {
+        let factor = ratio.powf(config.exponent).clamp(0.25, 4.0);
+        for &e in &columns[c] {
+            scales[e] *= factor;
         }
-        // Renormalize so the stiffest element sits at 1.0 — distribution
-        // matching is scale-free, and this keeps the SIMP knob in a stable,
-        // clampable range.
-        let max = scales.iter().copied().fold(0.0f64, f64::max);
-        if max > 0.0 {
-            for s in &mut scales {
-                *s = (*s / max).clamp(config.min_scale, 1.0);
-            }
+    }
+    let mut sorted = scales.to_vec();
+    let idx = (sorted.len() - 1) * 99 / 100;
+    sorted.select_nth_unstable_by(idx, |a, b| a.total_cmp(b));
+    let divisor = sorted[idx];
+    if divisor > 0.0 {
+        for s in scales.iter_mut() {
+            *s = (*s / divisor).clamp(config.min_scale, 1.0);
         }
     }
 }
@@ -578,12 +600,41 @@ fn solve_inverse_frame(
 
         // Set FEA_INVERSE_DEBUG=1 to watch the outer fixed point: error
         // descending = keep iterating; error frozen with a large floored
-        // share = min_scale is binding (lower it).
-        if std::env::var("FEA_INVERSE_DEBUG").is_ok() {
+        // share = min_scale is binding (lower it). =2 adds update-dynamics
+        // stats (ratio spread, clamp counts, demand share of saturated
+        // columns — the unsatisfiable part of the target).
+        let debug_level = std::env::var("FEA_INVERSE_DEBUG")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0);
+        if debug_level >= 1 {
             let floored = scales.iter().filter(|s| **s <= config.min_scale).count();
             eprintln!(
                 "inverse iter {iterations}: error={distribution_error:.4} floored={floored}/{}",
                 scales.len(),
+            );
+        }
+        if debug_level >= 2 {
+            let factors: Vec<f64> = ratios
+                .values()
+                .map(|r| r.powf(config.exponent).clamp(0.25, 4.0))
+                .collect();
+            let clamped_high = factors.iter().filter(|f| **f >= 4.0).count();
+            let clamped_low = factors.iter().filter(|f| **f <= 0.25).count();
+            let max_ratio = ratios.values().cloned().fold(0.0f64, f64::max);
+            // How much of the demand sits in columns that are already at
+            // (or near) peak stiffness and still asking for more — demand
+            // no in-range scale field can satisfy.
+            let saturated_demand: f64 = col_force
+                .keys()
+                .filter(|c| col_scale[c] >= 0.99 && ratios[c] > 1.0)
+                .map(|c| col_target[c])
+                .sum();
+            eprintln!(
+                "  update: cols={} clamped_high={clamped_high} clamped_low={clamped_low} \
+                 max_ratio={max_ratio:.2} saturated_demand={:.3}",
+                ratios.len(),
+                saturated_demand / total_target,
             );
         }
 
@@ -614,18 +665,7 @@ fn solve_inverse_frame(
             return Ok(best);
         }
 
-        for (c, ratio) in &ratios {
-            let factor = ratio.powf(config.exponent).clamp(0.25, 4.0);
-            for &e in &columns[c] {
-                scales[e] *= factor;
-            }
-        }
-        let max = scales.iter().copied().fold(0.0f64, f64::max);
-        if max > 0.0 {
-            for s in &mut scales {
-                *s = (*s / max).clamp(config.min_scale, 1.0);
-            }
-        }
+        apply_update(&mut scales, &columns, &ratios, config);
     }
 }
 
