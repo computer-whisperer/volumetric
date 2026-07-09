@@ -150,6 +150,11 @@ fn main() {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(config.max_contact_iterations as usize),
+            // PROFILE_PASSES: stress-stiffening (hammock) passes.
+            stress_stiffening_passes: std::env::var("PROFILE_PASSES")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
             preconditioner,
             ..Default::default()
         },

@@ -122,6 +122,9 @@ fn main() {
         solve: fea_core::SolveConfig {
             fixed_boundary: fea_core::FixedBoundary::ZMin,
             cg_tolerance: 1e-4,
+            // GRAZE_PASSES: stress-stiffening (hammock) passes per forward
+            // solve.
+            stress_stiffening_passes: env_f64("GRAZE_PASSES", 0.0) as usize,
             ..Default::default()
         },
         max_iterations: env_f64("GRAZE_MAX_ITER", 30.0) as usize,

@@ -127,6 +127,14 @@ pub struct SolveConfig {
     pub cg_max_iterations: usize,
     pub max_contact_iterations: usize,
     pub preconditioner: PrecondChoice,
+    /// Stress-stiffening (Picard) passes for Bar2 frames: after each full
+    /// contact solve, the struts' tensile axial forces feed a geometric
+    /// stiffness (hammock/membrane action — a taut surface strut carries
+    /// transverse load like a string) and the contact problem is re-solved
+    /// against the stiffened tangent. 0 = linear (the historical behavior);
+    /// 1-2 passes capture most of the effect. Tension-only: compressive
+    /// softening would make K indefinite. Ignored for Hex8 meshes.
+    pub stress_stiffening_passes: usize,
 }
 
 impl Default for SolveConfig {
@@ -144,6 +152,7 @@ impl Default for SolveConfig {
             // contact rim have needed ~21 sweeps; 16 was too tight.
             max_contact_iterations: 64,
             preconditioner: PrecondChoice::Auto,
+            stress_stiffening_passes: 0,
         }
     }
 }
@@ -712,11 +721,40 @@ pub fn solve(
             };
             Ok(contact_solve(mesh, &model, None, rigid, config)?.0)
         }
-        FeaElementKind::Bar2 => {
-            let model = frame::FrameModel::new(mesh, config.material)?;
-            Ok(contact_solve(mesh, &model, Some(&model), rigid, config)?.0)
-        }
+        FeaElementKind::Bar2 => Ok(frame_contact_solve(mesh, rigid, config)?.0),
     }
+}
+
+/// The Bar2 contact solve with `stress_stiffening_passes` Picard passes:
+/// solve, feed the tensile axial forces into the geometric stiffness,
+/// re-solve against the stiffened tangent. Returns the model at its final
+/// prestress state (what the adjoint must differentiate against) and the
+/// last pass's internals; stats accumulate the cost of every pass.
+fn frame_contact_solve(
+    mesh: &FeaMesh,
+    rigid: &mut dyn RigidBody,
+    config: &SolveConfig,
+) -> Result<(SolveResult, frame::FrameModel, SolveInternals), String> {
+    let mut model = frame::FrameModel::new(mesh, config.material)?;
+    let (mut result, mut internals) = contact_solve(mesh, &model, Some(&model), rigid, config)?;
+    for _ in 0..config.stress_stiffening_passes {
+        if !result.stats.converged {
+            break;
+        }
+        model.update_prestress(&internals.u);
+        let (next, next_internals) = contact_solve(mesh, &model, Some(&model), rigid, config)?;
+        result = SolveResult {
+            stats: SolveStats {
+                cg_iterations: result.stats.cg_iterations + next.stats.cg_iterations,
+                contact_iterations: result.stats.contact_iterations
+                    + next.stats.contact_iterations,
+                ..next.stats
+            },
+            ..next
+        };
+        internals = next_internals;
+    }
+    Ok((result, model, internals))
 }
 
 /// Everything the converged contact state exposes beyond the result fields
@@ -739,8 +777,8 @@ pub(crate) struct SolveInternals {
 }
 
 /// The Bar2 forward solve, keeping the pieces the inverse gradient needs:
-/// the frame model (element stiffness access) and the converged contact
-/// state. Mirrors what `solve` does for Bar2.
+/// the frame model (element stiffness access, at final prestress) and the
+/// converged contact state. Mirrors what `solve` does for Bar2.
 pub(crate) fn solve_frame_internal(
     mesh: &FeaMesh,
     rigid: &mut dyn RigidBody,
@@ -751,9 +789,7 @@ pub(crate) fn solve_frame_internal(
     if !(-1.0 < nu && nu < 0.5) {
         return Err(format!("Poisson's ratio {nu} outside (-1, 0.5)"));
     }
-    let model = frame::FrameModel::new(mesh, config.material)?;
-    let (result, internals) = contact_solve(mesh, &model, Some(&model), rigid, config)?;
-    Ok((result, model, internals))
+    frame_contact_solve(mesh, rigid, config)
 }
 
 /// Solve the adjoint system `K_ff lambda_f = (K ghat)|_f`, `lambda = 0` on

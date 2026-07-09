@@ -29,6 +29,8 @@ struct Strut {
     nodes: [u32; 2],
     /// Rows are the local axes (x' along the strut) in global coordinates.
     r: [[f64; 3]; 3],
+    /// Strut length.
+    length: f64,
     /// Axial `E A / L`.
     k_ax: f64,
     /// Torsional `G J / L`.
@@ -41,6 +43,14 @@ struct Strut {
     b3: f64,
     /// Bending `2 E I / L`.
     b4: f64,
+    /// Geometric (stress-stiffening) bending terms from the axial prestress
+    /// `N`: `6N/5L`, `N/10`, `2NL/15`, `-NL/30` — the consistent
+    /// beam-column matrix, same block structure as the elastic terms. Zero
+    /// until `update_prestress` runs.
+    g1: f64,
+    g2: f64,
+    g3: f64,
+    g4: f64,
     /// Cross-section volume `A * L` (for energy density).
     volume: f64,
 }
@@ -145,12 +155,17 @@ impl FrameModel {
             struts.push(Strut {
                 nodes: [nodes[0], nodes[1]],
                 r: [x_axis, y_axis, z_axis],
+                length,
                 k_ax: e_modulus * scale * area / length,
                 k_tor: g_modulus * scale * (2.0 * inertia) / length,
                 b1: 12.0 * ei / length.powi(3),
                 b2: 6.0 * ei / (length * length),
                 b3: 4.0 * ei / length,
                 b4: 2.0 * ei / length,
+                g1: 0.0,
+                g2: 0.0,
+                g3: 0.0,
+                g4: 0.0,
                 volume: area * length,
             });
         }
@@ -203,17 +218,25 @@ fn local_forces(s: &Strut, v: &[[f64; 3]; 4]) -> [[f64; 3]; 4] {
     m1[0] = s.k_tor * (th1[0] - th2[0]);
     m2[0] = -m1[0];
 
+    // Bending terms: elastic plus the geometric (stress-stiffening) matrix,
+    // which shares the elastic block structure — a taut strut resists
+    // transverse displacement like a string on top of its bending stiffness.
+    let c1 = s.b1 + s.g1;
+    let c2 = s.b2 + s.g2;
+    let c3 = s.b3 + s.g3;
+    let c4 = s.b4 + s.g4;
+
     // Bending in the x'-y' plane: (u_y, theta_z).
-    f1[1] = s.b1 * u1[1] + s.b2 * th1[2] - s.b1 * u2[1] + s.b2 * th2[2];
-    m1[2] = s.b2 * u1[1] + s.b3 * th1[2] - s.b2 * u2[1] + s.b4 * th2[2];
+    f1[1] = c1 * u1[1] + c2 * th1[2] - c1 * u2[1] + c2 * th2[2];
+    m1[2] = c2 * u1[1] + c3 * th1[2] - c2 * u2[1] + c4 * th2[2];
     f2[1] = -f1[1];
-    m2[2] = s.b2 * u1[1] + s.b4 * th1[2] - s.b2 * u2[1] + s.b3 * th2[2];
+    m2[2] = c2 * u1[1] + c4 * th1[2] - c2 * u2[1] + c3 * th2[2];
 
     // Bending in the x'-z' plane: (u_z, theta_y), opposite coupling signs.
-    f1[2] = s.b1 * u1[2] - s.b2 * th1[1] - s.b1 * u2[2] - s.b2 * th2[1];
-    m1[1] = -s.b2 * u1[2] + s.b3 * th1[1] + s.b2 * u2[2] + s.b4 * th2[1];
+    f1[2] = c1 * u1[2] - c2 * th1[1] - c1 * u2[2] - c2 * th2[1];
+    m1[1] = -c2 * u1[2] + c3 * th1[1] + c2 * u2[2] + c4 * th2[1];
     f2[2] = -f1[2];
-    m2[1] = -s.b2 * u1[2] + s.b4 * th1[1] + s.b2 * u2[2] + s.b3 * th2[1];
+    m2[1] = -c2 * u1[2] + c4 * th1[1] + c2 * u2[2] + c3 * th2[1];
 
     [f1, m1, f2, m2]
 }
@@ -287,6 +310,40 @@ impl FrameModel {
     /// Cross-section volume `A * L` of one strut.
     pub(crate) fn strut_volume(&self, e: usize) -> f64 {
         self.struts[e].volume
+    }
+
+    /// Refresh the geometric (stress-stiffening) terms from the axial
+    /// forces at solution `u` — one Picard pass of the beam-column
+    /// nonlinearity. The elongation uses the von Karman (second-order)
+    /// strain: a lateral strut whose ends sag by different amounts
+    /// stretches by `(transverse difference)^2 / 2L` even though its
+    /// first-order axial strain is zero — that quadratic term IS the
+    /// hammock tension, so a linear strain measure would find nothing to
+    /// stiffen. Tension only: compressive geometric stiffness is negative
+    /// (buckling softening) and can make K indefinite, which CG cannot
+    /// solve; the hammock effect this models lives entirely in the tensile
+    /// struts.
+    pub(crate) fn update_prestress(&mut self, u: &[f64]) {
+        let axial: Vec<f64> = self
+            .struts
+            .iter()
+            .map(|s| {
+                let local = self.gather_local(s, u);
+                let dt_y = local[2][1] - local[0][1];
+                let dt_z = local[2][2] - local[0][2];
+                let elongation =
+                    (local[2][0] - local[0][0]) + (dt_y * dt_y + dt_z * dt_z) / (2.0 * s.length);
+                s.k_ax * elongation
+            })
+            .collect();
+        for (s, n) in self.struts.iter_mut().zip(axial) {
+            let n = n.max(0.0);
+            let l = s.length;
+            s.g1 = 6.0 * n / (5.0 * l);
+            s.g2 = n / 10.0;
+            s.g3 = 2.0 * n * l / 15.0;
+            s.g4 = -n * l / 30.0;
+        }
     }
 
     /// Gather a strut's four dof blocks from the global vector, rotated
@@ -442,10 +499,11 @@ impl StiffnessModel for FrameModel {
         let mut diag = vec![0.0f64; self.node_count * 6];
         for s in &self.struts {
             // The local per-node blocks are diagonal — translations
-            // (k_ax, b1, b1), rotations (k_tor, b3, b3) — so the global
-            // diagonal of R^T D R is a weighted sum of squared cosines.
-            let translation = [s.k_ax, s.b1, s.b1];
-            let rotation = [s.k_tor, s.b3, s.b3];
+            // (k_ax, b1+g1, b1+g1), rotations (k_tor, b3+g3, b3+g3) — so the
+            // global diagonal of R^T D R is a weighted sum of squared
+            // cosines.
+            let translation = [s.k_ax, s.b1 + s.g1, s.b1 + s.g1];
+            let rotation = [s.k_tor, s.b3 + s.g3, s.b3 + s.g3];
             for &node in &s.nodes {
                 let base = node as usize * 6;
                 for col in 0..3 {
@@ -840,6 +898,175 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The geometric stiffness added by `update_prestress` must be the
+    /// consistent beam-column matrix: stretch a single strut axially so
+    /// N = k_ax * elongation, and check element_stiffness gains exactly
+    /// the analytic (6N/5L, N/10, 2NL/15, -NL/30) bending blocks — and
+    /// nothing anywhere else. Compression must add nothing (tension-only).
+    #[test]
+    fn prestress_adds_the_consistent_geometric_matrix() {
+        let length = 0.7;
+        let mesh = chain([0.0; 3], [1.0, 0.0, 0.0], length, 1, 0.05);
+        let mut model = FrameModel::new(&mesh, material()).unwrap();
+        let base = model.element_stiffness(0);
+
+        // Stretch: node 1 moves +x by delta -> N = k_ax * delta.
+        let delta = 0.01;
+        let mut u = vec![0.0f64; 2 * 6];
+        u[6] = delta;
+        model.update_prestress(&u);
+        let n = model.struts[0].k_ax * delta;
+        let stiffened = model.element_stiffness(0);
+
+        // The strut lies along global x, so local axes == global axes and
+        // the geometric terms sit in the same slots as the elastic bending
+        // blocks: (u_y, th_z) and (u_z, th_y) per end.
+        let (g1, g2, g3, g4) = (
+            6.0 * n / (5.0 * length),
+            n / 10.0,
+            2.0 * n * length / 15.0,
+            -n * length / 30.0,
+        );
+        // Expected delta, built with the same sign structure as the
+        // elastic kernel (probe a strut with only geometric terms).
+        let probe = Strut {
+            nodes: model.struts[0].nodes,
+            r: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            length,
+            k_ax: 0.0,
+            k_tor: 0.0,
+            b1: 0.0,
+            b2: 0.0,
+            b3: 0.0,
+            b4: 0.0,
+            g1,
+            g2,
+            g3,
+            g4,
+            volume: model.struts[0].volume,
+        };
+        let mut expect = [[0.0f64; 12]; 12];
+        for col in 0..12 {
+            let mut v = [[0.0f64; 3]; 4];
+            v[col / 3][col % 3] = 1.0;
+            let f = local_forces(&probe, &v);
+            for row in 0..12 {
+                expect[row][col] = f[row / 3][row % 3];
+            }
+        }
+        for row in 0..12 {
+            for col in 0..12 {
+                let got = stiffened[row][col] - base[row][col];
+                assert!(
+                    (got - expect[row][col]).abs() < 1e-9 * n,
+                    "({row},{col}): geometric delta {got} vs {}",
+                    expect[row][col]
+                );
+            }
+        }
+
+        // Compression adds nothing.
+        u[6] = -delta;
+        model.update_prestress(&u);
+        let compressed = model.element_stiffness(0);
+        for row in 0..12 {
+            for col in 0..12 {
+                assert!((compressed[row][col] - base[row][col]).abs() < 1e-12);
+            }
+        }
+    }
+
+    /// The behavioral point of stress stiffening under displacement-driven
+    /// contact: a sphere pressed into a slender-strut lattice sags the
+    /// surface, the sagging laterals go taut, and the taut membrane resists
+    /// the DIFFERENTIAL sag the sphere prescribes — so total contact force
+    /// rises, and the share carried where penetration is deepest (the
+    /// center) rises with it while the shallow rim sheds. (The "membrane
+    /// spreads the load" intuition belongs to force-controlled pressing;
+    /// with a prescribed pose, holding the deepest nodes on the surface is
+    /// exactly what gets more expensive. Measured: total +30%, center share
+    /// 0.569 -> 0.643 with one pass, patch unchanged at 21 nodes.)
+    #[test]
+    fn stress_stiffening_adds_membrane_resistance() {
+        let mesh = cubic_lattice(7); // coords 0..6, very slender struts
+        let mut sphere = |p: [f64; 3]| {
+            let d = [p[0] - 3.0, p[1] - 3.0, p[2] - 8.8];
+            d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < 16.0
+        };
+        let mut press = |passes: usize| {
+            let config = SolveConfig {
+                material: material(),
+                fixed_boundary: FixedBoundary::ZMin,
+                stress_stiffening_passes: passes,
+                ..Default::default()
+            };
+            let result = solve(&mesh, &mut sphere, &config).unwrap();
+            assert!(result.stats.converged, "passes={passes} did not converge");
+            let mut center = 0.0;
+            let mut total = 0.0;
+            for node in 0..mesh.node_count() {
+                let f = -result.contact_force[node * 3 + 2];
+                if f <= 0.0 {
+                    continue;
+                }
+                let p = mesh.node_position(node);
+                let r2 = (p[0] - 3.0).powi(2) + (p[1] - 3.0).powi(2);
+                total += f;
+                if r2 < 1.5 * 1.5 {
+                    center += f;
+                }
+            }
+            assert!(total > 0.0);
+            (total, center / total)
+        };
+        let (linear_total, linear_share) = press(0);
+        let (stiff_total, stiff_share) = press(1);
+        assert!(
+            stiff_total > 1.15 * linear_total,
+            "membrane resistance missing: total {linear_total:.4} -> {stiff_total:.4}"
+        );
+        assert!(
+            stiff_share > 1.05 * linear_share,
+            "deep-penetration concentration missing: center share \
+             {linear_share:.4} -> {stiff_share:.4}"
+        );
+    }
+
+    /// Rigid translations must stay zero-force under prestress — the
+    /// geometric matrix has the same translation null space as the elastic
+    /// one.
+    #[test]
+    fn prestressed_rigid_translation_is_zero_force() {
+        let mesh = chain([0.2, -0.1, 0.4], [1.0, 2.0, -0.5], 1.3, 4, 0.03);
+        let mut model = FrameModel::new(&mesh, material()).unwrap();
+        // Stretch the whole chain along its axis to induce tension.
+        let axis = normalize([1.0, 2.0, -0.5]);
+        let mut u = vec![0.0f64; mesh.node_count() * 6];
+        for node in 0..mesh.node_count() {
+            let p = mesh.node_position(node);
+            let t = p[0] * axis[0] + p[1] * axis[1] + p[2] * axis[2];
+            for c in 0..3 {
+                u[node * 6 + c] = 0.02 * t * axis[c];
+            }
+        }
+        model.update_prestress(&u);
+        assert!(model.struts.iter().all(|s| s.g1 > 0.0), "no tension built");
+
+        let mut x = vec![0.0f64; mesh.node_count() * 6];
+        for node in 0..mesh.node_count() {
+            x[node * 6] = 0.3;
+            x[node * 6 + 1] = -0.7;
+            x[node * 6 + 2] = 0.1;
+        }
+        let mut y = vec![0.0f64; x.len()];
+        model.apply(&x, &mut y);
+        let peak = model.struts.iter().map(|s| s.g1).fold(0.0f64, f64::max);
+        assert!(
+            y.iter().all(|v| v.abs() < 1e-12 * peak.max(1.0)),
+            "rigid translation produces force under prestress"
+        );
     }
 
     /// `strut_end_forces` must equal `element_stiffness . u_e` under the
