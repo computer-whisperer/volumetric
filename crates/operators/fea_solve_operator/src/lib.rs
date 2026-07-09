@@ -20,7 +20,10 @@
 //! - Input 1: ModelWASM — the rigid body (must be 3D)
 //! - Input 2: CBOR configuration: `youngs_modulus` (float, default 1.0),
 //!   `poissons_ratio` (float, default 0.3), `fixed_boundary` (enum of
-//!   xmin/xmax/ymin/ymax/zmin/zmax/none, default zmin)
+//!   xmin/xmax/ymin/ymax/zmin/zmax/none, default zmin),
+//!   `max_contact_iterations` (int, default 64 — cap on the contact
+//!   active-set sweeps; grazing rims on curved rigid bodies can need a
+//!   few dozen)
 //!
 //! Output 0: the input FeaMesh plus result fields — per-node `displacement`
 //! (3), `contact_force` (3, the interface force map), and `rotation` (3,
@@ -41,6 +44,7 @@ struct SolveOperatorConfig {
     youngs_modulus: f64,
     poissons_ratio: f64,
     fixed_boundary: String,
+    max_contact_iterations: u32,
 }
 
 impl Default for SolveOperatorConfig {
@@ -49,6 +53,7 @@ impl Default for SolveOperatorConfig {
             youngs_modulus: 1.0,
             poissons_ratio: 0.3,
             fixed_boundary: "zmin".to_string(),
+            max_contact_iterations: 64,
         }
     }
 }
@@ -79,6 +84,7 @@ fn run_solve(config: &SolveOperatorConfig) -> Result<FeaMesh, String> {
             poissons_ratio: config.poissons_ratio,
         },
         fixed_boundary: fea_core::FixedBoundary::parse(&config.fixed_boundary)?,
+        max_contact_iterations: config.max_contact_iterations as usize,
         ..Default::default()
     };
 
@@ -90,15 +96,27 @@ fn run_solve(config: &SolveOperatorConfig) -> Result<FeaMesh, String> {
     let result = fea_core::solve(&mesh, &mut rigid, &solve_config)?;
 
     if !result.stats.converged {
+        let hint = match result.stats.failure {
+            Some(fea_core::SolveFailure::ContactUnsettled) => format!(
+                "the contact active set was still changing after {} contact \
+                 iterations (every CG solve converged) — raise \
+                 max_contact_iterations",
+                result.stats.contact_iterations,
+            ),
+            Some(fea_core::SolveFailure::CgStalled) | None => format!(
+                "CG failed to reach tolerance ({} CG iterations over {} \
+                 contact iterations); check that the mesh is held by \
+                 fixed_boundary ({}) with no disconnected regions, and that \
+                 the rigid body presses toward that face from the opposite \
+                 side",
+                result.stats.cg_iterations,
+                result.stats.contact_iterations,
+                config.fixed_boundary,
+            ),
+        };
         return Err(format!(
-            "solve did not converge ({} contact iterations, {} CG iterations, \
-             {} active contacts); check that the mesh is held by fixed_boundary \
-             ({}) and that the rigid body presses toward that face from the \
-             opposite side",
-            result.stats.contact_iterations,
-            result.stats.cg_iterations,
+            "solve did not converge: {hint}; {} active contacts",
             result.stats.active_contacts,
-            config.fixed_boundary
         ));
     }
 
@@ -174,7 +192,7 @@ pub extern "C" fn get_metadata() -> i64 {
             OperatorMetadataInput::FeaMesh,
             OperatorMetadataInput::ModelWASM,
             OperatorMetadataInput::CBORConfiguration(
-                r#"{ youngs_modulus: float .default 1.0, poissons_ratio: float .default 0.3, fixed_boundary: "zmin" / "zmax" / "xmin" / "xmax" / "ymin" / "ymax" / "none" .default "zmin" }"#
+                r#"{ youngs_modulus: float .default 1.0, poissons_ratio: float .default 0.3, fixed_boundary: "zmin" / "zmax" / "xmin" / "xmax" / "ymin" / "ymax" / "none" .default "zmin", max_contact_iterations: int .default 64 }"#
                     .to_string(),
             ),
         ],

@@ -25,6 +25,7 @@ struct InverseOperatorConfig {
     exponent: f64,
     min_scale: f64,
     column_size: f64,
+    max_contact_iterations: u32,
 }
 
 impl Default for InverseOperatorConfig {
@@ -38,6 +39,7 @@ impl Default for InverseOperatorConfig {
             exponent: 0.5,
             min_scale: 0.01,
             column_size: 0.0,
+            max_contact_iterations: 64,
         }
     }
 }
@@ -143,6 +145,11 @@ fn main() {
             fixed_boundary: fea_core::FixedBoundary::parse(&config.fixed_boundary)
                 .expect("fixed_boundary"),
             cg_tolerance: cg_tolerance.unwrap_or(fea_core::SolveConfig::default().cg_tolerance),
+            // PROFILE_MAX_CONTACT overrides the project's contact cap.
+            max_contact_iterations: std::env::var("PROFILE_MAX_CONTACT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(config.max_contact_iterations as usize),
             preconditioner,
             ..Default::default()
         },

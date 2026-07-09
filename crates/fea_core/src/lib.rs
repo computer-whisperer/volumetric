@@ -139,10 +139,27 @@ impl Default for SolveConfig {
             fixed_boundary: FixedBoundary::ZMin,
             cg_tolerance: 1e-8,
             cg_max_iterations: 20_000,
-            max_contact_iterations: 16,
+            // Settled sets exit early, so the cap only costs time on runs
+            // that would fail anyway. Fine foam lattices with a grazing
+            // contact rim have needed ~21 sweeps; 16 was too tight.
+            max_contact_iterations: 64,
             preconditioner: PrecondChoice::Auto,
         }
     }
+}
+
+/// Why a solve reported `converged == false`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SolveFailure {
+    /// A CG solve hit `cg_max_iterations` without reaching tolerance (or
+    /// found the system singular/indefinite, e.g. an unconstrained mesh).
+    CgStalled,
+    /// The contact active set was still changing when
+    /// `max_contact_iterations` ran out. Distinct from a solver problem:
+    /// every CG solve converged, the activate/release fixed point just
+    /// needs more sweeps (grazing rims on curved bodies are the usual
+    /// driver) — raising the cap is the remedy.
+    ContactUnsettled,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -153,6 +170,8 @@ pub struct SolveStats {
     pub active_contacts: usize,
     /// False when CG or the contact active set hit an iteration cap.
     pub converged: bool,
+    /// `Some` iff `converged` is false: which cap was hit.
+    pub failure: Option<SolveFailure>,
 }
 
 #[derive(Debug)]
@@ -822,6 +841,7 @@ fn contact_solve(
         stats.cg_iterations += iterations;
         if !cg_converged {
             stats.converged = false;
+            stats.failure = Some(SolveFailure::CgStalled);
             stats.active_contacts = active.len();
             break;
         }
@@ -846,10 +866,27 @@ fn contact_solve(
             active.remove(node);
         }
 
+        // Set FEA_CONTACT_DEBUG=1 to watch the active-set fixed point: a
+        // healthy solve shows released/set_changes decaying to zero; a
+        // livelock shows them oscillating. (No env on wasm32 — native only.)
+        if std::env::var("FEA_CONTACT_DEBUG").is_ok() {
+            eprintln!(
+                "contact iter {}: active={} set_changes={} released={} cg={}",
+                stats.contact_iterations,
+                active.len(),
+                set_changes,
+                released.len(),
+                iterations,
+            );
+        }
+
         if set_changes == 0 && released.is_empty() {
             stats.converged = true;
             break;
         }
+    }
+    if !stats.converged && stats.failure.is_none() {
+        stats.failure = Some(SolveFailure::ContactUnsettled);
     }
     stats.active_contacts = active.len();
 
@@ -944,6 +981,47 @@ mod tests {
     /// A rigid half-space `z > level` (a flat plate pressed straight down).
     fn plate(level: f64) -> impl FnMut([f64; 3]) -> bool {
         move |p: [f64; 3]| p[2] > level
+    }
+
+    #[test]
+    fn iteration_caps_classify_the_failure() {
+        // The sphere press needs several contact sweeps and nontrivial CG
+        // work, so either cap can be made the binding one.
+        let mesh = grid_mesh(8, 8, 4, 0.125);
+        let center = [0.5, 0.5, 0.5 - 0.05 + 1.0];
+        let mut sphere =
+            move |p: [f64; 3]| (0..3).map(|i| (p[i] - center[i]).powi(2)).sum::<f64>() < 1.0;
+
+        let unsettled = solve(
+            &mesh,
+            &mut sphere,
+            &SolveConfig {
+                max_contact_iterations: 1,
+                ..config(0.3)
+            },
+        )
+        .unwrap();
+        assert!(!unsettled.stats.converged);
+        assert_eq!(
+            unsettled.stats.failure,
+            Some(SolveFailure::ContactUnsettled)
+        );
+
+        let stalled = solve(
+            &mesh,
+            &mut sphere,
+            &SolveConfig {
+                cg_max_iterations: 2,
+                ..config(0.3)
+            },
+        )
+        .unwrap();
+        assert!(!stalled.stats.converged);
+        assert_eq!(stalled.stats.failure, Some(SolveFailure::CgStalled));
+
+        let healthy = solve(&mesh, &mut sphere, &config(0.3)).unwrap();
+        assert!(healthy.stats.converged);
+        assert_eq!(healthy.stats.failure, None);
     }
 
     #[test]

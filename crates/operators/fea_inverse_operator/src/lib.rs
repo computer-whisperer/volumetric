@@ -32,7 +32,9 @@
 //!   distance between normalized distributions), `exponent` (float, default
 //!   0.5 — update damping), `min_scale` (float, default 0.01 — stiffness
 //!   floor), `column_size` (float, default 0 — Bar2 lateral bin width,
-//!   0 = auto).
+//!   0 = auto), `max_contact_iterations` (int, default 64 — cap on the
+//!   contact active-set sweeps within each forward solve; grazing rims on
+//!   curved rigid bodies can need a few dozen).
 //!
 //! Output 0: the input FeaMesh plus the converged per-element
 //! `stiffness_scale` (1), per-node `target_force` (1, the matched
@@ -60,6 +62,7 @@ struct InverseOperatorConfig {
     exponent: f64,
     min_scale: f64,
     column_size: f64,
+    max_contact_iterations: u32,
 }
 
 impl Default for InverseOperatorConfig {
@@ -73,6 +76,7 @@ impl Default for InverseOperatorConfig {
             exponent: 0.5,
             min_scale: 0.01,
             column_size: 0.0,
+            max_contact_iterations: 64,
         }
     }
 }
@@ -112,6 +116,7 @@ fn run_inverse(config: &InverseOperatorConfig) -> Result<FeaMesh, String> {
                 poissons_ratio: config.poissons_ratio,
             },
             fixed_boundary: fea_core::FixedBoundary::parse(&config.fixed_boundary)?,
+            max_contact_iterations: config.max_contact_iterations as usize,
             ..Default::default()
         },
         max_iterations: config.max_iterations as usize,
@@ -256,7 +261,7 @@ pub extern "C" fn get_metadata() -> i64 {
             OperatorMetadataInput::ModelWASM,
             OperatorMetadataInput::ModelWASM,
             OperatorMetadataInput::CBORConfiguration(
-                r#"{ youngs_modulus: float .default 1.0, poissons_ratio: float .default 0.3, fixed_boundary: "zmin" / "zmax" / "xmin" / "xmax" / "ymin" / "ymax" / "none" .default "zmin", max_iterations: int .default 20, tolerance: float .default 0.02, exponent: float .default 0.5, min_scale: float .default 0.01, column_size: float .default 0.0 }"#
+                r#"{ youngs_modulus: float .default 1.0, poissons_ratio: float .default 0.3, fixed_boundary: "zmin" / "zmax" / "xmin" / "xmax" / "ymin" / "ymax" / "none" .default "zmin", max_iterations: int .default 20, tolerance: float .default 0.02, exponent: float .default 0.5, min_scale: float .default 0.01, column_size: float .default 0.0, max_contact_iterations: int .default 64 }"#
                     .to_string(),
             ),
         ],

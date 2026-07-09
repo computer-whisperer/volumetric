@@ -23,7 +23,10 @@
 //!   the tributary-area weighting that makes a uniform map an exact fixed
 //!   point under a flat press.
 
-use crate::{RigidBody, SolveConfig, SolveResult, detect_uniform_grid, solve, stiffness_scales};
+use crate::{
+    RigidBody, SolveConfig, SolveFailure, SolveResult, SolveStats, detect_uniform_grid, solve,
+    stiffness_scales,
+};
 use std::collections::HashMap;
 use volumetric_abi::fea::{FeaField, FeaMesh};
 
@@ -98,6 +101,32 @@ pub struct InverseResult {
 
 /// A lateral column key and the fraction/force attributed to it.
 type ColumnShares = Vec<((i64, i64), f64)>;
+
+/// Failure-specific message for a forward solve that didn't converge —
+/// "the contact set needs more sweeps" and "CG ran out" have opposite
+/// remedies, so don't let them read the same.
+fn forward_failure(iterations: usize, stats: &SolveStats) -> String {
+    let reason = match stats.failure {
+        Some(SolveFailure::ContactUnsettled) => format!(
+            "the contact active set was still changing after {} contact \
+             iterations (every CG solve converged; raise \
+             max_contact_iterations)",
+            stats.contact_iterations,
+        ),
+        Some(SolveFailure::CgStalled) | None => format!(
+            "CG failed to reach tolerance ({} CG iterations over {} contact \
+             iterations; the system may be near-singular — check for \
+             disconnected or barely-connected regions and extreme \
+             stiffness contrast)",
+            stats.cg_iterations, stats.contact_iterations,
+        ),
+    };
+    format!(
+        "forward solve did not converge at inverse iteration {iterations}: \
+         {reason}; {} active contacts",
+        stats.active_contacts,
+    )
+}
 
 /// Write `scales` into the mesh's `stiffness_scale` element field.
 fn set_scale_field(mesh: &mut FeaMesh, scales: &[f64]) {
@@ -208,13 +237,7 @@ fn solve_inverse_hex(
         set_scale_field(&mut work, &scales);
         let result = solve(&work, rigid, &config.solve)?;
         if !result.stats.converged {
-            return Err(format!(
-                "forward solve did not converge at inverse iteration {iterations} \
-                 ({} contact iterations, {} CG iterations, {} active contacts)",
-                result.stats.contact_iterations,
-                result.stats.cg_iterations,
-                result.stats.active_contacts,
-            ));
+            return Err(forward_failure(iterations, &result.stats));
         }
 
         // Split each contact node's compressive force among its adjacent
@@ -449,13 +472,7 @@ fn solve_inverse_frame(
         set_scale_field(&mut work, &scales);
         let result = solve(&work, rigid, &config.solve)?;
         if !result.stats.converged {
-            return Err(format!(
-                "forward solve did not converge at inverse iteration {iterations} \
-                 ({} contact iterations, {} CG iterations, {} active contacts)",
-                result.stats.contact_iterations,
-                result.stats.cg_iterations,
-                result.stats.active_contacts,
-            ));
+            return Err(forward_failure(iterations, &result.stats));
         }
 
         let col_scale: HashMap<(i64, i64), f64> = columns
