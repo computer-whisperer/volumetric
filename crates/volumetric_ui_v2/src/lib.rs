@@ -34,7 +34,8 @@ static PIN_ICON: LazyLock<SvgIcon> = LazyLock::new(|| {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod host;
-#[cfg(not(target_arch = "wasm32"))]
+// The daemon-outcome mapping is shared with the web shell; the blocking
+// RemoteBackend inside is native-only.
 pub mod remote;
 pub mod session;
 #[cfg(all(target_arch = "wasm32", feature = "web"))]
@@ -3195,10 +3196,6 @@ fn top_bar(app: &VolumetricUiV2) -> El {
         toggle_chip("Auto mesh", app.auto_remesh, TOGGLE_AUTO_REMESH_KEY),
         toggle_chip("Auto run", app.auto_rebuild, TOGGLE_AUTO_REBUILD_KEY),
     ]);
-    // The remote build daemon client is blocking HTTP over TCP — native
-    // only. The browser shell always builds locally, so don't offer the
-    // toggle there.
-    #[cfg(not(target_arch = "wasm32"))]
     items.extend([
         toggle_chip("Remote", app.remote_build, TOGGLE_REMOTE_BUILD_KEY),
         icon_button("chevron-down")

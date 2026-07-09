@@ -881,7 +881,7 @@ fn mesh_triangles(mesh: &renderer::MeshData, transform: Mat4, out: &mut Vec<volu
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PreviewSceneKey {
-    asset_id: String,
+    pub(crate) asset_id: String,
     data_ptr: usize,
     data_len: usize,
     plan: PreviewPlan,

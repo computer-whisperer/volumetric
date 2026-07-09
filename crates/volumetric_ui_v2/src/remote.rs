@@ -8,14 +8,78 @@
 //! long-poll loop forwards a raised flag as a cancel request, then waits for
 //! the daemon's acknowledging outcome.
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::OnceLock;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(not(target_arch = "wasm32"))]
 use volumetric::adaptive_surface_nets_2::AdaptiveMeshConfig2;
-use volumetric_protocol::{DaemonClient, JobOutcome, JobOutput, JobRequest};
+#[cfg(not(target_arch = "wasm32"))]
+use volumetric_protocol::{DaemonClient, JobRequest};
+use volumetric_protocol::{JobOutcome, JobOutput};
 
+#[cfg(not(target_arch = "wasm32"))]
 use crate::session::ExecutionBackend;
 
+// ---------------------------------------------------------------------------
+// Outcome mapping, shared by the native blocking backend below and the web
+// host's async fetch path (which awaits the same daemon protocol through
+// `volumetric_protocol::WebDaemonClient`). Keeping these together is what
+// keeps the two transports semantically identical.
+// ---------------------------------------------------------------------------
+
+/// Success output, `Ok(None)` for a cancelled job, or the daemon's failure
+/// message.
+pub fn output_from_outcome(outcome: JobOutcome) -> Result<Option<JobOutput>, String> {
+    match outcome {
+        JobOutcome::Success { output, .. } => Ok(Some(output)),
+        JobOutcome::Cancelled => Ok(None),
+        JobOutcome::Failed { error } => Err(error),
+    }
+}
+
+/// Maps a project-run job's output to the run result.
+pub fn project_exports_from_output(
+    output: Option<JobOutput>,
+) -> Result<Vec<volumetric::LoadedAsset>, String> {
+    match output {
+        Some(JobOutput::RunProject { exports }) => Ok(exports
+            .into_iter()
+            .map(volumetric_protocol::ExportedAsset::into_loaded)
+            .collect()),
+        Some(_) => Err("daemon returned the wrong output kind for a project run".to_string()),
+        // Matches LocalBackend, where a cancelled run surfaces as the
+        // ExecutionError::Cancelled message; the session discards the
+        // result by generation either way.
+        None => Err("Execution cancelled".to_string()),
+    }
+}
+
+/// Maps a mesh job's output to the meshing result (`Ok(None)`: cancelled).
+pub fn mesh_result_from_output(
+    output: Option<JobOutput>,
+) -> Result<Option<volumetric::AdaptiveMeshV2Result>, String> {
+    match output {
+        Some(JobOutput::MeshModel { mesh, stats }) => {
+            let vertices = mesh.unpack_positions().map_err(|e| e.to_string())?;
+            let normals = mesh.unpack_normals().map_err(|e| e.to_string())?;
+            let indices = mesh.unpack_indices().map_err(|e| e.to_string())?;
+            Ok(Some(volumetric::AdaptiveMeshV2Result {
+                vertices,
+                normals,
+                indices,
+                bounds_min: mesh.bounds_min.into(),
+                bounds_max: mesh.bounds_max.into(),
+                stats,
+            }))
+        }
+        Some(_) => Err("daemon returned the wrong output kind for a mesh job".to_string()),
+        None => Ok(None),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub struct RemoteBackend {
     client: DaemonClient,
     address: String,
@@ -25,6 +89,7 @@ pub struct RemoteBackend {
     probe: OnceLock<Result<(), String>>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl RemoteBackend {
     /// `address` like `http://buildbox:7373`.
     pub fn new(address: &str) -> Self {
@@ -59,14 +124,11 @@ impl RemoteBackend {
             .client
             .run(request, &|| cancel.load(Ordering::Relaxed), progress)
             .map_err(|err| format!("remote build at {}: {err}", self.address))?;
-        match outcome {
-            JobOutcome::Success { output, .. } => Ok(Some(output)),
-            JobOutcome::Cancelled => Ok(None),
-            JobOutcome::Failed { error } => Err(error),
-        }
+        output_from_outcome(outcome)
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl ExecutionBackend for RemoteBackend {
     fn run_project(
         &self,
@@ -77,17 +139,7 @@ impl ExecutionBackend for RemoteBackend {
         let request = JobRequest::RunProject {
             project: project.clone(),
         };
-        match self.run_job(&request, cancel, progress)? {
-            Some(JobOutput::RunProject { exports }) => Ok(exports
-                .into_iter()
-                .map(volumetric_protocol::ExportedAsset::into_loaded)
-                .collect()),
-            Some(_) => Err("daemon returned the wrong output kind for a project run".to_string()),
-            // Matches LocalBackend, where a cancelled run surfaces as the
-            // ExecutionError::Cancelled message; the session discards the
-            // result by generation either way.
-            None => Err("Execution cancelled".to_string()),
-        }
+        project_exports_from_output(self.run_job(&request, cancel, progress)?)
     }
 
     fn mesh_model(
@@ -101,23 +153,7 @@ impl ExecutionBackend for RemoteBackend {
             model_wasm: model_wasm.to_vec(),
             config: config.clone(),
         };
-        match self.run_job(&request, cancel, progress)? {
-            Some(JobOutput::MeshModel { mesh, stats }) => {
-                let vertices = mesh.unpack_positions().map_err(|e| e.to_string())?;
-                let normals = mesh.unpack_normals().map_err(|e| e.to_string())?;
-                let indices = mesh.unpack_indices().map_err(|e| e.to_string())?;
-                Ok(Some(volumetric::AdaptiveMeshV2Result {
-                    vertices,
-                    normals,
-                    indices,
-                    bounds_min: mesh.bounds_min.into(),
-                    bounds_max: mesh.bounds_max.into(),
-                    stats,
-                }))
-            }
-            Some(_) => Err("daemon returned the wrong output kind for a mesh job".to_string()),
-            None => Ok(None),
-        }
+        mesh_result_from_output(self.run_job(&request, cancel, progress)?)
     }
 }
 

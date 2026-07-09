@@ -5853,11 +5853,15 @@ name = "volumetric_protocol"
 version = "0.1.0"
 dependencies = [
  "ciborium",
+ "js-sys",
  "serde",
  "serde_bytes",
  "thiserror 2.0.18",
  "ureq",
  "volumetric",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

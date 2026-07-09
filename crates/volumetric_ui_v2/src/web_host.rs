@@ -20,15 +20,18 @@
 //! - blocking `rfd` dialogs + `std::fs` → `rfd::AsyncFileDialog` picks
 //!   (bytes in) and Blob/anchor downloads (bytes out). Project save always
 //!   downloads; the browser owns the destination.
-//!
-//! Remote builds are unavailable here: the daemon client is blocking HTTP
-//! over TCP. A fetch-based client would slot into the same
-//! `ExecutionBackend` seam later.
+//! - the native `RemoteBackend` (blocking HTTP on the worker thread) → async
+//!   fetch tasks: with the Remote toggle on, project runs and ASN2 meshing
+//!   long-poll the daemon through `WebDaemonClient` without occupying the
+//!   main thread. Remote is the one mode where builds don't freeze the tab.
+//!   The default daemon address is the page's own origin, so a UI served by
+//!   the daemon needs no configuration.
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use damascene_core::prelude::*;
 use damascene_wgpu::{Runner, RunnerCaps};
@@ -40,11 +43,15 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::platform::web::{EventLoopExtWebSys, WindowAttributesExtWebSys};
 use winit::window::{Window, WindowId};
 
+use volumetric_protocol::{JobRequest, WebDaemonClient};
+
+use crate::remote::{mesh_result_from_output, output_from_outcome, project_exports_from_output};
 use crate::session::{
-    BackgroundResult, ExecutionBackend, JobQueue, LocalBackend, Session, ViewportRenderParams,
-    execute_job_monitored,
+    BackgroundJob, BackgroundResult, ExecutionBackend, JobQueue, LocalBackend, PendingMesh,
+    PreviewBuildError, PreviewBuildResult, PreviewEntity, PreviewStage, Session,
+    ViewportRenderParams, execute_job_monitored, preview_postlude, preview_prelude,
 };
-use crate::{ExecutorChoice, FileAction, VIEWPORT_KEY, VolumetricUiV2};
+use crate::{ExecutorChoice, FileAction, PreviewRequest, VIEWPORT_KEY, VolumetricUiV2};
 
 /// The canvas element the shell binds to; declared by `index.html`.
 const CANVAS_ID: &str = "volumetric_canvas";
@@ -52,12 +59,20 @@ const CANVAS_ID: &str = "volumetric_canvas";
 /// Start the browser shell. Returns once winit's web event loop is spawned
 /// (the browser drives frames from then on) — call from the crate's
 /// `#[wasm_bindgen(start)]` entry.
-pub fn run(title: &str, viewport: Rect, app: VolumetricUiV2) {
+pub fn run(title: &str, viewport: Rect, mut app: VolumetricUiV2) {
     console_error_panic_hook::set_once();
     let _ = console_log::init_with_level(log::Level::Info);
 
     if let Some(document) = web_sys::window().and_then(|w| w.document()) {
         document.set_title(title);
+    }
+
+    // Default the remote daemon to the page's own origin: when the daemon
+    // hosts this UI, toggling Remote works with zero configuration (and
+    // same-origin fetches sidestep CORS entirely). Editable in the remote
+    // settings popover like any other address.
+    if let Some(origin) = web_sys::window().and_then(|w| w.location().origin().ok()) {
+        app.remote_address = origin;
     }
 
     let event_loop = EventLoop::new().expect("EventLoop::new");
@@ -93,6 +108,13 @@ struct WebHost {
     /// Async file-task state, the web analogue of the native `FileWorker`.
     file_outcomes: Rc<RefCell<Vec<FileOutcome>>>,
     file_in_flight: Rc<Cell<bool>>,
+    /// Daemon base URL while the Remote toggle is on. The pump consults it
+    /// per job: project runs and ASN2 meshing become async fetch tasks,
+    /// everything else stays inline (mirrors the native backend split).
+    remote: Rc<RefCell<Option<String>>>,
+    /// An async remote job is awaiting the daemon; the pump stays quiet
+    /// until it lands (parity with the native single worker thread).
+    remote_in_flight: Rc<Cell<bool>>,
 }
 
 struct Gfx {
@@ -128,6 +150,8 @@ impl WebHost {
             pump_scheduled: Rc::new(Cell::new(false)),
             file_outcomes: Rc::new(RefCell::new(Vec::new())),
             file_in_flight: Rc::new(Cell::new(false)),
+            remote: Rc::new(RefCell::new(None)),
+            remote_in_flight: Rc::new(Cell::new(false)),
         }
     }
 }
@@ -549,14 +573,16 @@ impl WebHost {
         gfx.session
             .pre_frame(&mut self.app, self.job_results.borrow_mut().drain(..));
 
-        // The browser shell always executes locally; a Remote request can
-        // only arrive through a stale code path (the toggle is hidden on
-        // wasm32) — answer it honestly rather than silently.
+        // The Remote toggle swaps where project runs and ASN2 meshing
+        // execute. There is no worker to rebuild here — the pump consults
+        // this address per job. The toggle handler already wrote off
+        // in-flight work and queued a fresh run, exactly as for the native
+        // worker swap.
         if let Some(choice) = self.app.take_executor_request() {
-            if matches!(choice, ExecutorChoice::Remote(_)) {
-                self.app
-                    .set_status("remote build isn't available in the browser; building locally");
-            }
+            *self.remote.borrow_mut() = match choice {
+                ExecutorChoice::Local => None,
+                ExecutorChoice::Remote(address) => Some(address),
+            };
         }
 
         // Apply finished file operations, then launch any newly queued
@@ -657,43 +683,35 @@ impl WebHost {
 
     /// Arrange for one queued job to execute on a `setTimeout(0)` turn.
     /// Reentrancy-guarded; each completed job requests a redraw, and that
-    /// redraw reschedules the pump while jobs remain.
+    /// redraw reschedules the pump while jobs remain. Jobs offloaded to the
+    /// remote daemon complete asynchronously instead; the pump waits for
+    /// them the way the native queue waits for its busy worker thread.
     fn schedule_job_pump(&self, window: Arc<Window>) {
-        if self.pump_scheduled.get() || self.jobs.borrow().is_empty() {
+        if self.pump_scheduled.get()
+            || self.remote_in_flight.get()
+            || self.jobs.borrow().is_empty()
+        {
             return;
         }
         self.pump_scheduled.set(true);
         let jobs = self.jobs.clone();
         let results = self.job_results.clone();
         let scheduled = self.pump_scheduled.clone();
+        let remote = self.remote.clone();
+        let remote_in_flight = self.remote_in_flight.clone();
         let closure = Closure::once_into_js(move || {
             let job = jobs.borrow_mut().pop();
             if let Some(job) = job {
-                // Progress snapshots pile up in the shared cell during the
-                // (blocking) execution and land in the UI together with the
-                // terminal result — a single-threaded shell can't repaint
-                // mid-job anyway.
-                let backend = LocalBackend;
-                let emit = |progress: BackgroundResult| {
-                    results.borrow_mut().push(progress);
-                };
-                let result = execute_job_monitored(job, &backend as &dyn ExecutionBackend, &emit);
-                // The UI surfaces these too, but a console line carries the
-                // full text — the status chips truncate.
-                match &result {
-                    BackgroundResult::ProjectComplete {
-                        result: Err(err), ..
-                    } => log::error!("project run failed: {err}"),
-                    BackgroundResult::PreviewComplete(preview) => {
-                        if let Err(crate::session::PreviewBuildError::Failed(err)) =
-                            &preview.result
-                        {
-                            log::error!("preview build failed: {err}");
-                        }
-                    }
-                    _ => {}
+                match remote.borrow().clone() {
+                    Some(address) => dispatch_job_with_remote(
+                        job,
+                        address,
+                        &results,
+                        &remote_in_flight,
+                        &window,
+                    ),
+                    None => run_job_inline(job, &results),
                 }
-                results.borrow_mut().push(result);
             }
             scheduled.set(false);
             window.request_redraw();
@@ -706,6 +724,229 @@ impl WebHost {
         }
     }
 
+}
+
+/// Execute one job in-process on the main thread. Progress snapshots pile
+/// up in the shared cell during the (blocking) execution and land in the UI
+/// together with the terminal result — a single-threaded shell can't
+/// repaint mid-job anyway.
+fn run_job_inline(job: BackgroundJob, results: &Rc<RefCell<Vec<BackgroundResult>>>) {
+    let emit = |progress: BackgroundResult| {
+        results.borrow_mut().push(progress);
+    };
+    let result = execute_job_monitored(job, &LocalBackend as &dyn ExecutionBackend, &emit);
+    log_failed_result(&result);
+    results.borrow_mut().push(result);
+}
+
+/// The UI surfaces failures too, but a console line carries the full text —
+/// the status chips truncate.
+fn log_failed_result(result: &BackgroundResult) {
+    match result {
+        BackgroundResult::ProjectComplete {
+            result: Err(err), ..
+        } => log::error!("project run failed: {err}"),
+        BackgroundResult::PreviewComplete(preview) => {
+            if let Err(PreviewBuildError::Failed(err)) = &preview.result {
+                log::error!("preview build failed: {err}");
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Route one job while the Remote toggle is on: project runs and ASN2
+/// meshing become async daemon fetches (the heavy compute leaves the tab,
+/// which stays responsive — remote is the one mode where web builds don't
+/// freeze the page); everything else executes inline exactly as in local
+/// mode, mirroring the native backend split.
+fn dispatch_job_with_remote(
+    job: BackgroundJob,
+    address: String,
+    results: &Rc<RefCell<Vec<BackgroundResult>>>,
+    in_flight: &Rc<Cell<bool>>,
+    window: &Arc<Window>,
+) {
+    match job {
+        BackgroundJob::RunProject {
+            generation,
+            project,
+            cancel,
+        } => {
+            in_flight.set(true);
+            let results = results.clone();
+            let in_flight = in_flight.clone();
+            let window = window.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let start = web_time::Instant::now();
+                let on_progress = |progress: volumetric::BuildProgress| {
+                    results
+                        .borrow_mut()
+                        .push(BackgroundResult::RunProgress {
+                            generation,
+                            progress,
+                        });
+                    window.request_redraw();
+                };
+                let result = remote_run_project(&address, project, &cancel, &on_progress).await;
+                let result = BackgroundResult::ProjectComplete {
+                    generation,
+                    result,
+                    elapsed_ms: start.elapsed().as_millis(),
+                };
+                log_failed_result(&result);
+                results.borrow_mut().push(result);
+                in_flight.set(false);
+                window.request_redraw();
+            });
+        }
+        BackgroundJob::BuildPreview(job) => {
+            // The prelude (plan dispatch and the cheap local meshes) runs
+            // inline; only an ASN2 plan crosses the wire.
+            match preview_prelude(&job.request, &job.cancel) {
+                Ok(Some(PreviewStage::NeedsMesh(pending))) => {
+                    in_flight.set(true);
+                    let results = results.clone();
+                    let in_flight = in_flight.clone();
+                    let window = window.clone();
+                    wasm_bindgen_futures::spawn_local(async move {
+                        let asset_id = job.key.asset_id.clone();
+                        let on_progress = |progress: volumetric::BuildProgress| {
+                            results
+                                .borrow_mut()
+                                .push(BackgroundResult::PreviewProgress {
+                                    asset_id: asset_id.clone(),
+                                    progress,
+                                });
+                            window.request_redraw();
+                        };
+                        let outcome = remote_mesh_preview(
+                            &address,
+                            &job.request,
+                            pending,
+                            &job.cancel,
+                            &on_progress,
+                        )
+                        .await;
+                        let result = match outcome {
+                            Ok(Some(entity)) => Ok(entity),
+                            Ok(None) => Err(PreviewBuildError::Cancelled),
+                            Err(err) => Err(PreviewBuildError::Failed(err)),
+                        };
+                        let result = BackgroundResult::PreviewComplete(Box::new(
+                            PreviewBuildResult {
+                                key: job.key,
+                                result,
+                            },
+                        ));
+                        log_failed_result(&result);
+                        results.borrow_mut().push(result);
+                        in_flight.set(false);
+                        window.request_redraw();
+                    });
+                }
+                Ok(Some(PreviewStage::Done(entity))) => {
+                    results
+                        .borrow_mut()
+                        .push(BackgroundResult::PreviewComplete(Box::new(
+                            PreviewBuildResult {
+                                key: job.key,
+                                result: Ok(*entity),
+                            },
+                        )));
+                }
+                Ok(None) => {
+                    results
+                        .borrow_mut()
+                        .push(BackgroundResult::PreviewComplete(Box::new(
+                            PreviewBuildResult {
+                                key: job.key,
+                                result: Err(PreviewBuildError::Cancelled),
+                            },
+                        )));
+                }
+                Err(err) => {
+                    log::error!("preview build failed: {err}");
+                    results
+                        .borrow_mut()
+                        .push(BackgroundResult::PreviewComplete(Box::new(
+                            PreviewBuildResult {
+                                key: job.key,
+                                result: Err(PreviewBuildError::Failed(err)),
+                            },
+                        )));
+                }
+            }
+        }
+        // Lightbox sampling and operator metadata never cross the wire
+        // (session.rs documents the backend split).
+        other => run_job_inline(other, results),
+    }
+}
+
+/// Reachability + protocol-version probe, then submit + long-poll a
+/// project run — the async analogue of `RemoteBackend::run_project`, with
+/// identical outcome mapping and error prefixes.
+async fn remote_run_project(
+    address: &str,
+    project: volumetric::Project,
+    cancel: &AtomicBool,
+    on_progress: &dyn Fn(volumetric::BuildProgress),
+) -> Result<Vec<volumetric::LoadedAsset>, String> {
+    let client = probed_client(address).await?;
+    let outcome = client
+        .run(
+            &JobRequest::RunProject { project },
+            &|| cancel.load(Ordering::Relaxed),
+            on_progress,
+        )
+        .await
+        .map_err(|err| format!("remote build at {address}: {err}"))?;
+    project_exports_from_output(output_from_outcome(outcome)?)
+}
+
+/// Remote ASN2 meshing plus the local postlude — the async analogue of
+/// `RemoteBackend::mesh_model` feeding `preview_postlude`. `Ok(None)`:
+/// cancelled.
+async fn remote_mesh_preview(
+    address: &str,
+    request: &PreviewRequest,
+    pending: PendingMesh,
+    cancel: &AtomicBool,
+    on_progress: &dyn Fn(volumetric::BuildProgress),
+) -> Result<Option<PreviewEntity>, String> {
+    let client = probed_client(address).await?;
+    let outcome = client
+        .run(
+            &JobRequest::MeshModel {
+                model_wasm: request.data.to_vec(),
+                config: pending.config.clone(),
+            },
+            &|| cancel.load(Ordering::Relaxed),
+            on_progress,
+        )
+        .await
+        .map_err(|err| format!("remote build at {address}: {err}"))?;
+    let Some(mesh) = mesh_result_from_output(output_from_outcome(outcome)?)? else {
+        return Ok(None);
+    };
+    Ok(Some(preview_postlude(request, pending, mesh)))
+}
+
+/// The async analogue of `RemoteBackend`'s lazy reachability +
+/// protocol-version probe — per job rather than per backend swap: one extra
+/// round trip against a build that takes seconds, and it keeps the
+/// stateless-client plumbing simple.
+async fn probed_client(address: &str) -> Result<WebDaemonClient, String> {
+    let client = WebDaemonClient::new(address);
+    client
+        .info()
+        .await
+        .map_err(|err| format!("remote build at {address}: {err}"))?;
+    Ok(client)
+}
+
+impl WebHost {
     /// Launch an async file task; its outcome lands in `file_outcomes` and
     /// wakes the frame loop.
     fn spawn_file_task(&self, window: Arc<Window>, task: FileTask) {
