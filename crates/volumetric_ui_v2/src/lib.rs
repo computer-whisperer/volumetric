@@ -1725,7 +1725,9 @@ impl VolumetricUiV2 {
     }
 
     /// Applies a project the host's file worker loaded off-thread: swaps it
-    /// in and queues a run so its outputs materialize.
+    /// in and marks it stale. A run is queued only when auto-rebuild is on —
+    /// opening a file must not commit the user to a build that can take
+    /// many minutes; the Run button materializes outputs on demand.
     pub(crate) fn apply_opened_project(
         &mut self,
         path: std::path::PathBuf,
@@ -1737,7 +1739,7 @@ impl VolumetricUiV2 {
                 self.selected_export = None;
                 self.selected_project_item = None;
                 self.clear_runtime_assets();
-                self.request_run();
+                self.mark_project_dirty();
                 self.status = format!("opened {}", path.display());
                 self.project_path = Some(path);
             }
@@ -6480,7 +6482,28 @@ mod tests {
         assert_eq!(summary.imports, expected.imports);
         assert_eq!(summary.timeline_steps, expected.timeline_steps);
         assert_eq!(summary.exports, expected.exports);
-        assert!(opened.take_pending_run(), "open queues a run");
+        // Opening must not commit the user to a run (a project's first
+        // build can take many minutes) — it lands stale for a manual Run.
+        assert!(!opened.take_pending_run(), "open must not queue a run");
+        assert!(opened.summary().last_run_stale);
+    }
+
+    #[test]
+    fn opening_a_project_queues_a_run_only_under_auto_rebuild() {
+        let path = std::env::temp_dir().join(format!(
+            "volumetric_ui_v2_open_autorun_{}.vproj",
+            std::process::id()
+        ));
+        let mut source = VolumetricUiV2::default();
+        add_operator_click(&mut source, first_operator_name());
+        source.save_project_file(&path);
+
+        let mut opened = VolumetricUiV2::empty();
+        dispatch(&mut opened, UiEvent::synthetic_click(TOGGLE_AUTO_REBUILD_KEY));
+        assert!(opened.auto_rebuild());
+        opened.open_project_file(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(opened.take_pending_run(), "auto-rebuild opens should run");
     }
 
     #[test]
