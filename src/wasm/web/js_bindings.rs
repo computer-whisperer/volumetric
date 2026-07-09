@@ -11,6 +11,9 @@
 //! - `wasmModelGetBounds(handle: number): Float64Array` - Get interleaved [min_0, max_0, min_1, max_1, ...]
 //! - `wasmModelSample(handle: number, x: f64, y: f64, z: f64): f32` - Sample density (extra dims zero)
 //! - `wasmModelSampleNd(handle: number, position: Float64Array): f32` - Sample density at an N-dimensional position
+//! - `wasmModelGetSampleFormat(handle: number): Uint8Array | null` - Raw CBOR `SampleFormat` (null: occupancy-only)
+//! - `wasmModelHasSampleChannels(handle: number): boolean` - Whether the model exports `sample_channels`
+//! - `wasmModelSampleChannelsNd(handle: number, position: Float64Array, channelCount: number): Float32Array | null` - Sample every channel
 //! - `wasmModelDestroy(handle: number)` - Free the model instance
 //!
 //! ## Operator Functions
@@ -63,6 +66,26 @@ extern "C" {
     /// dimensions are zeroed, extras ignored). Returns NaN on error.
     #[wasm_bindgen(js_name = wasmModelSampleNd)]
     pub fn wasm_model_sample_nd(handle: JsWasmHandle, position: &[f64]) -> f32;
+
+    /// Raw CBOR bytes of the model's declared `SampleFormat`, captured at
+    /// creation. None when the model has no `get_sample_format` export
+    /// (occupancy-only default).
+    #[wasm_bindgen(js_name = wasmModelGetSampleFormat)]
+    pub fn wasm_model_get_sample_format(handle: JsWasmHandle) -> Option<Vec<u8>>;
+
+    /// Whether the model exports `sample_channels`.
+    #[wasm_bindgen(js_name = wasmModelHasSampleChannels)]
+    pub fn wasm_model_has_sample_channels(handle: JsWasmHandle) -> bool;
+
+    /// Sample every declared channel at an N-dimensional position (same
+    /// position convention as `wasmModelSampleNd`); `channel_count` is the
+    /// decoded format's channel count. Returns None on error.
+    #[wasm_bindgen(js_name = wasmModelSampleChannelsNd)]
+    pub fn wasm_model_sample_channels_nd(
+        handle: JsWasmHandle,
+        position: &[f64],
+        channel_count: u32,
+    ) -> Option<Vec<f32>>;
 
     /// Destroy a model instance and free resources.
     #[wasm_bindgen(js_name = wasmModelDestroy)]

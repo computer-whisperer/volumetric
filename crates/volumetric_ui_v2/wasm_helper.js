@@ -21,7 +21,8 @@ const wasmInstances = new Map();
 let nextHandle = 1;
 
 // Instantiate a model module and validate the N-dimensional ABI.
-// Returns { instance, module, dimensions, ioPtr } or null on error.
+// Returns { instance, module, dimensions, ioPtr, sampleFormatBytes,
+// hasSampleChannels } or null on error.
 // Shared by the model executor path (wasmModelCreateSync) and the
 // operators' lazily-created input models (input_model_* host imports).
 function createModelEntry(bytes) {
@@ -40,7 +41,23 @@ function createModelEntry(bytes) {
             console.error("WASM model returned an invalid IO buffer pointer:", ioPtr);
             return null;
         }
-        return { instance, module, dimensions, ioPtr };
+        // Optional typed-channel exports (absent means occupancy-only). The
+        // declared format is a ptr|len-packed CBOR blob; copy it out at
+        // creation like the native executor does, and fail creation if the
+        // export exists but its region is bogus.
+        let sampleFormatBytes = null;
+        if (exports.get_sample_format) {
+            const packed = BigInt(exports.get_sample_format());
+            const ptr = Number(packed & BigInt(0xFFFFFFFF));
+            const len = Number(packed >> BigInt(32));
+            if (ptr + len > exports.memory.buffer.byteLength) {
+                console.error("get_sample_format returned an out-of-bounds region:", ptr, len);
+                return null;
+            }
+            sampleFormatBytes = new Uint8Array(exports.memory.buffer, ptr, len).slice();
+        }
+        const hasSampleChannels = !!exports.sample_channels;
+        return { instance, module, dimensions, ioPtr, sampleFormatBytes, hasSampleChannels };
     } catch (e) {
         console.error("Failed to create WASM model:", e);
         return null;
@@ -143,6 +160,62 @@ window.wasmModelSampleNd = function(handle, position) {
     } catch (e) {
         console.error("Failed to sample:", e);
         return NaN;
+    }
+};
+
+// Raw CBOR bytes of the model's declared SampleFormat, captured at creation.
+// Returns null when the model has no get_sample_format export (occupancy-only
+// default) or the handle is invalid.
+window.wasmModelGetSampleFormat = function(handle) {
+    const entry = wasmInstances.get(handle);
+    if (!entry) {
+        console.error("Invalid WASM handle:", handle);
+        return null;
+    }
+    return entry.sampleFormatBytes;
+};
+
+// Whether the model exports sample_channels.
+window.wasmModelHasSampleChannels = function(handle) {
+    const entry = wasmInstances.get(handle);
+    return entry ? entry.hasSampleChannels : false;
+};
+
+// Sample every declared channel at an N-dimensional position (same position
+// convention as wasmModelSampleNd). The position goes in the first half of
+// the IO buffer and the model writes one f32 per channel into the second
+// half; channelCount is the caller's decoded channel count (its fit in the
+// buffer's n*8-byte output half is validated executor-side at creation).
+// Returns a Float32Array of channelCount values, or null on error.
+window.wasmModelSampleChannelsNd = function(handle, position, channelCount) {
+    const entry = wasmInstances.get(handle);
+    if (!entry) {
+        console.error("Invalid WASM handle:", handle);
+        return null;
+    }
+    if (!entry.hasSampleChannels || channelCount * 4 > entry.dimensions * 8) {
+        console.error("sample_channels unavailable or channel count too large:", channelCount);
+        return null;
+    }
+
+    try {
+        const exports = entry.instance.exports;
+        const pos = new Float64Array(
+            exports.memory.buffer,
+            entry.ioPtr,
+            entry.dimensions,
+        );
+        pos.fill(0);
+        const n = Math.min(entry.dimensions, position.length);
+        for (let d = 0; d < n; d++) pos[d] = position[d];
+        const outPtr = entry.ioPtr + entry.dimensions * 8;
+        exports.sample_channels(entry.ioPtr, outPtr);
+        // Re-view after the call: memory may move on growth.
+        const view = new Float32Array(exports.memory.buffer, outPtr, channelCount);
+        return new Float32Array(view);
+    } catch (e) {
+        console.error("Failed to sample channels:", e);
+        return null;
     }
 };
 

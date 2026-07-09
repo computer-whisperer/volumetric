@@ -13,7 +13,8 @@
 //! The JavaScript helper (wasm_helper.js) maintains a handle map of WASM instances
 //! and provides synchronous functions for creating instances and calling exports.
 //! Models use the N-dimensional ABI
-//! (get_dimensions/get_io_ptr/get_bounds/sample/memory).
+//! (get_dimensions/get_io_ptr/get_bounds/sample/memory), plus the optional
+//! typed-channel exports (get_sample_format/sample_channels).
 
 mod js_bindings;
 
@@ -28,10 +29,13 @@ use crate::wasm::traits::{
 #[cfg(feature = "web")]
 use js_bindings::{
     JsWasmHandle, wasm_model_create_sync, wasm_model_destroy, wasm_model_get_bounds,
-    wasm_model_get_dimensions, wasm_model_sample, wasm_model_sample_nd, wasm_operator_create,
+    wasm_model_get_dimensions, wasm_model_get_sample_format, wasm_model_has_sample_channels,
+    wasm_model_sample, wasm_model_sample_channels_nd, wasm_model_sample_nd, wasm_operator_create,
     wasm_operator_destroy, wasm_operator_get_error, wasm_operator_get_metadata,
     wasm_operator_get_output, wasm_operator_get_output_indices, wasm_operator_run,
 };
+#[cfg(feature = "web")]
+use volumetric_abi::SampleFormat;
 
 /// Fetch a model's N-dimensional bounds through the JS bridge.
 #[cfg(feature = "web")]
@@ -77,6 +81,8 @@ fn bounds_3d(bounds: &ModelBoundsNd) -> Result<ModelBounds, WasmBackendError> {
 pub struct WebModelExecutor {
     handle: JsWasmHandle,
     bounds: ModelBoundsNd,
+    sample_format: SampleFormat,
+    has_sample_channels: bool,
 }
 
 #[cfg(feature = "web")]
@@ -89,14 +95,42 @@ impl WebModelExecutor {
                 "JavaScript failed to create WASM instance".to_string(),
             ));
         }
-        let bounds = match fetch_bounds_nd(handle) {
-            Ok(bounds) => bounds,
-            Err(e) => {
-                wasm_model_destroy(handle);
-                return Err(e);
-            }
+        Self::load(handle).inspect_err(|_| wasm_model_destroy(handle))
+    }
+
+    /// Fetch and validate the model's metadata for a freshly created handle,
+    /// mirroring the checks the native executor makes at load.
+    fn load(handle: JsWasmHandle) -> Result<Self, WasmBackendError> {
+        let bounds = fetch_bounds_nd(handle)?;
+        let sample_format = match wasm_model_get_sample_format(handle) {
+            None => SampleFormat::default(),
+            Some(bytes) => volumetric_abi::decode_sample_format(&bytes)
+                .map_err(WasmBackendError::Execution)?,
         };
-        Ok(Self { handle, bounds })
+        let has_sample_channels = wasm_model_has_sample_channels(handle);
+        if sample_format.channels.len() > 1 {
+            if !has_sample_channels {
+                return Err(WasmBackendError::MissingExport(format!(
+                    "sample_channels (format declares {} channels)",
+                    sample_format.channels.len()
+                )));
+            }
+            // Channel output goes in the second half of the IO buffer (the
+            // first n f64s hold the position), so it must fit there.
+            if sample_format.channels.len() * 4 > bounds.dimensions() * 8 {
+                return Err(WasmBackendError::Execution(format!(
+                    "{} channels exceed the IO buffer's output capacity ({} f32s)",
+                    sample_format.channels.len(),
+                    bounds.dimensions() * 2
+                )));
+            }
+        }
+        Ok(Self {
+            handle,
+            bounds,
+            sample_format,
+            has_sample_channels,
+        })
     }
 }
 
@@ -123,6 +157,10 @@ impl ModelExecutor for WebModelExecutor {
         Ok(result)
     }
 
+    fn sample_format(&mut self) -> Result<SampleFormat, WasmBackendError> {
+        Ok(self.sample_format.clone())
+    }
+
     fn dimensions(&mut self) -> Result<u32, WasmBackendError> {
         Ok(self.bounds.dimensions() as u32)
     }
@@ -142,11 +180,19 @@ impl ModelExecutor for WebModelExecutor {
     }
 
     fn sample_channels_nd(&mut self, position: &[f64]) -> Result<Vec<f32>, WasmBackendError> {
-        // The JS bridge has no `sample_channels` path yet, and this
-        // executor's `sample_format` is the occupancy-only default — so
-        // plain `sample` is the whole row (same fallback the native
-        // executor uses for occupancy-only models).
-        Ok(vec![self.sample_nd(position)?])
+        if !self.has_sample_channels {
+            // Occupancy-only model: plain `sample` is the whole row (same
+            // fallback the native executor uses).
+            return Ok(vec![self.sample_nd(position)?]);
+        }
+        wasm_model_sample_channels_nd(
+            self.handle,
+            position,
+            self.sample_format.channels.len() as u32,
+        )
+        .ok_or_else(|| {
+            WasmBackendError::Execution("WASM sample_channels failed".to_string())
+        })
     }
 }
 
