@@ -183,10 +183,27 @@ fn handle_request(state: &Arc<DaemonState>, mut request: tiny_http::Request) {
             Ok(id) => cancel_job(state, id),
             Err(_) => text_response(400, "job id must be an integer"),
         },
+        // Browser preflight (fetch with a CBOR content type is never a
+        // "simple" request). Cached a day so polling doesn't re-preflight.
+        ("OPTIONS", _) => text_response(204, "")
+            .with_header(header("Access-Control-Allow-Methods", "GET, POST, OPTIONS"))
+            .with_header(header("Access-Control-Allow-Headers", "Content-Type"))
+            .with_header(header("Access-Control-Max-Age", "86400")),
         _ => text_response(404, &format!("no such endpoint: {} {path}", method)),
     };
 
+    // The daemon trusts its network (see the README's security notes):
+    // any origin may call it, the same way any native client on the VPN
+    // may. When authentication lands it will guard the endpoints
+    // themselves, here in the dispatch — not the CORS layer.
+    let response = response.with_header(header("Access-Control-Allow-Origin", "*"));
+
     let _ = request.respond(response);
+}
+
+fn header(name: &str, value: &str) -> tiny_http::Header {
+    tiny_http::Header::from_bytes(name.as_bytes(), value.as_bytes())
+        .expect("static header name/value")
 }
 
 fn read_body(request: &mut tiny_http::Request) -> std::io::Result<Vec<u8>> {

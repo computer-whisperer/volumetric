@@ -278,3 +278,74 @@ fn unknown_job_is_a_clean_api_error() {
     );
     handle.shutdown();
 }
+
+/// Issue a raw HTTP request and return (status, headers) — the protocol
+/// client hides headers, and CORS lives entirely in them.
+fn raw_request(addr: SocketAddr, request: &str) -> (u16, Vec<(String, String)>) {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(addr).expect("connect");
+    stream.write_all(request.as_bytes()).expect("write request");
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).expect("read response");
+    // Bodies can be CBOR (binary); only the header block is text.
+    let header_end = response
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("header terminator");
+    let head = std::str::from_utf8(&response[..header_end]).expect("headers are UTF-8");
+    let mut lines = head.lines();
+    let status = lines
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .expect("status line");
+    let headers = lines
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
+        .collect();
+    (status, headers)
+}
+
+#[test]
+fn browser_clients_get_cors_headers() {
+    let (handle, _client) = start_daemon(1);
+    let addr = handle.addr();
+    let value_of = |headers: &[(String, String)], name: &str| {
+        headers
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.clone())
+    };
+
+    // Preflight: any path, any origin.
+    let (status, headers) = raw_request(
+        addr,
+        "OPTIONS /v1/jobs HTTP/1.1\r\nHost: test\r\nOrigin: http://example.com\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status, 204);
+    assert_eq!(
+        value_of(&headers, "access-control-allow-origin").as_deref(),
+        Some("*")
+    );
+    let methods = value_of(&headers, "access-control-allow-methods").expect("methods header");
+    assert!(methods.contains("POST"), "{methods}");
+    assert_eq!(
+        value_of(&headers, "access-control-allow-headers").as_deref(),
+        Some("Content-Type")
+    );
+
+    // Actual responses carry the origin header too (fetch refuses to
+    // expose the body without it).
+    let (status, headers) = raw_request(
+        addr,
+        "GET /v1/info HTTP/1.1\r\nHost: test\r\nOrigin: http://example.com\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status, 200);
+    assert_eq!(
+        value_of(&headers, "access-control-allow-origin").as_deref(),
+        Some("*")
+    );
+
+    handle.shutdown();
+}
