@@ -16,6 +16,88 @@
 // The host writes positions into (and reads bounds from) the buffer the model
 // returns from get_io_ptr, so the model's own layout decides where it lives.
 
+// Content-keyed caches of compiled WebAssembly.Modules, mirroring the
+// native backend's module_cache.rs: compiling is by far the most expensive
+// part of creating an instance, and the preview loop keeps recreating
+// executors for the same bytes (mesh sampler + channel executor per build,
+// one executor per lightbox slice, every operator per run). Modules are
+// cached; instances are always fresh (concurrent executors must not share
+// an IO buffer). FIFO-bounded like the native cache: interactive editing
+// keeps producing new merged-model blobs, so an unbounded cache would grow
+// for the lifetime of the page. Keys are the exact content — a hash picks
+// the bucket, a byte compare confirms (native keys by the full bytes too).
+const MODULE_CACHE_CAPACITY = 32;
+
+function newModuleCache() {
+    return { buckets: new Map(), order: [], hits: 0, misses: 0 };
+}
+
+const modelModuleCache = newModuleCache();
+const operatorModuleCache = newModuleCache();
+
+// Two interleaved FNV-1a-style 32-bit hashes plus the length; collisions
+// only cost a wasted bucket scan, correctness comes from sameBytes.
+function moduleCacheKey(bytes) {
+    let h1 = 0x811c9dc5 | 0;
+    let h2 = 0x01000193 | 0;
+    for (let i = 0; i < bytes.length; i++) {
+        h1 = Math.imul(h1 ^ bytes[i], 0x01000193);
+        h2 = Math.imul(h2 ^ bytes[i], 0x0100019b);
+    }
+    return bytes.length + ":" + (h1 >>> 0) + ":" + (h2 >>> 0);
+}
+
+function sameBytes(a, b) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+        if (a[i] !== b[i]) return false;
+    }
+    return true;
+}
+
+// Return the compiled module for bytes, compiling on a miss. Compile
+// failures propagate (and are not cached, matching the native cache).
+function getOrCompileModule(cache, bytes) {
+    const key = moduleCacheKey(bytes);
+    const bucket = cache.buckets.get(key);
+    if (bucket) {
+        for (const entry of bucket) {
+            if (sameBytes(entry.bytes, bytes)) {
+                cache.hits++;
+                return entry.module;
+            }
+        }
+    }
+    cache.misses++;
+    const module = new WebAssembly.Module(bytes);
+    // Copy the key bytes: the caller's array may be a view into wasm memory.
+    const entry = { key, bytes: bytes.slice(), module };
+    if (bucket) {
+        bucket.push(entry);
+    } else {
+        cache.buckets.set(key, [entry]);
+    }
+    cache.order.push(entry);
+    while (cache.order.length > MODULE_CACHE_CAPACITY) {
+        const evicted = cache.order.shift();
+        const evictedBucket = cache.buckets.get(evicted.key);
+        const idx = evictedBucket.indexOf(evicted);
+        evictedBucket.splice(idx, 1);
+        if (evictedBucket.length === 0) cache.buckets.delete(evicted.key);
+    }
+    return module;
+}
+
+// Cache hit/miss counters, for debugging and driving tests.
+window.wasmModuleCacheStats = function() {
+    return {
+        modelHits: modelModuleCache.hits,
+        modelMisses: modelModuleCache.misses,
+        operatorHits: operatorModuleCache.hits,
+        operatorMisses: operatorModuleCache.misses,
+    };
+};
+
 // Map of handle -> WASM instance
 const wasmInstances = new Map();
 let nextHandle = 1;
@@ -27,7 +109,7 @@ let nextHandle = 1;
 // operators' lazily-created input models (input_model_* host imports).
 function createModelEntry(bytes) {
     try {
-        const module = new WebAssembly.Module(bytes);
+        const module = getOrCompileModule(modelModuleCache, bytes);
         const instance = new WebAssembly.Instance(module, {});
         const exports = instance.exports;
         if (!exports.get_dimensions || !exports.get_io_ptr || !exports.get_bounds
@@ -374,7 +456,7 @@ window.wasmOperatorCreate = function(bytes, inputs) {
             },
         };
 
-        const module = new WebAssembly.Module(bytes);
+        const module = getOrCompileModule(operatorModuleCache, bytes);
         const instance = new WebAssembly.Instance(module, hostImports);
         state.instance = instance;
         state.module = module;
