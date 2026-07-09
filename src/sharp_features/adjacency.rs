@@ -1,28 +1,43 @@
 //! Mesh connectivity queries: vertex adjacency and k-ring neighborhoods.
 
-/// Per-vertex neighbor lists built from a triangle index buffer.
+/// Per-vertex neighbor lists built from a triangle index buffer, stored in
+/// compressed (CSR) form: one shared buffer plus per-vertex extents, instead
+/// of millions of tiny per-vertex allocations.
 pub struct MeshAdjacency {
-    neighbors: Vec<Vec<u32>>,
+    starts: Vec<u32>,
+    data: Vec<u32>,
 }
 
 impl MeshAdjacency {
     pub fn build(vertex_count: usize, indices: &[u32]) -> Self {
-        let mut neighbors: Vec<Vec<u32>> = vec![Vec::new(); vertex_count];
+        // Directed edges packed as (vertex << 32 | neighbor): one (parallel)
+        // sort groups the buffer by vertex with neighbors ordered within each
+        // group, and dedup collapses the repeats from the faces sharing each
+        // edge — the same result as per-vertex sort + dedup.
+        let mut pairs: Vec<u64> = Vec::with_capacity(indices.len() * 2);
         for tri in indices.chunks_exact(3) {
             for (a, b) in [(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
-                neighbors[a as usize].push(b);
-                neighbors[b as usize].push(a);
+                pairs.push(((a as u64) << 32) | b as u64);
+                pairs.push(((b as u64) << 32) | a as u64);
             }
         }
-        for list in &mut neighbors {
-            list.sort_unstable();
-            list.dedup();
+        crate::parallel_iter::sort_unstable(&mut pairs);
+        pairs.dedup();
+
+        let mut starts = vec![0u32; vertex_count + 1];
+        let mut data = Vec::with_capacity(pairs.len());
+        for &pair in &pairs {
+            starts[(pair >> 32) as usize + 1] += 1;
+            data.push(pair as u32);
         }
-        Self { neighbors }
+        for i in 1..starts.len() {
+            starts[i] += starts[i - 1];
+        }
+        Self { starts, data }
     }
 
     pub fn neighbors(&self, v: u32) -> &[u32] {
-        &self.neighbors[v as usize]
+        &self.data[self.starts[v as usize] as usize..self.starts[v as usize + 1] as usize]
     }
 
     /// All vertices within `k` mesh edges of `v`, including `v` itself.

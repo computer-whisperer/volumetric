@@ -315,6 +315,7 @@ pub mod adaptive_surface_nets_2;
 pub mod marching_cubes_cpu;
 pub mod mesh_decimation;
 pub mod operator_config;
+pub(crate) mod parallel_iter;
 pub mod sharp_features;
 pub mod stl;
 

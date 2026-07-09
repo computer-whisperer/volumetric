@@ -27,7 +27,8 @@
 //! until no edge qualifies. Quality on near-uniform meshes matches greedy
 //! ordering while staying O(faces) per pass with no heap.
 
-use crate::adaptive_surface_nets_2::{IndexedMesh2, parallel_iter};
+use crate::adaptive_surface_nets_2::IndexedMesh2;
+use crate::parallel_iter;
 use std::sync::atomic::{AtomicBool, Ordering};
 use web_time::Instant;
 
@@ -230,7 +231,9 @@ impl SweepMesh {
     /// Run collapse passes: `ramp_passes` sweeps approaching the budget from
     /// below (cheap collapses first), then full-budget sweeps until yields
     /// go quiet. Returns the number of passes run. A cancellation stops
-    /// between passes, leaving a valid (partially decimated) face set.
+    /// between passes and at coarse intervals within one (a full-mesh pass
+    /// can take seconds at 10M faces), leaving a valid (partially decimated)
+    /// face set.
     fn run_passes(&mut self, budget: f64, ramp_passes: usize, cancel: &AtomicBool) -> usize {
         let vertex_count = self.positions.len();
         // Reused scratch buffers for the link-condition neighborhood sets.
@@ -257,6 +260,10 @@ impl SweepMesh {
             let mut collapses = 0usize;
 
             for fi in 0..self.faces.len() {
+                const CANCEL_CHECK_INTERVAL: usize = 64 * 1024;
+                if fi % CANCEL_CHECK_INTERVAL == 0 && cancel.load(Ordering::Relaxed) {
+                    return pass;
+                }
                 for k in 0..3 {
                     if self.deleted[fi] {
                         break;

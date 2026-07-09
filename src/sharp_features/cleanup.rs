@@ -48,6 +48,19 @@ pub fn weld_snapped_vertices(
     cell: f64,
     config: &CleanupConfig,
 ) -> CleanupResult {
+    // Only snapped vertices ever weld; with none, the pass is an identity.
+    // Worth an early exit: smooth models (no features to snap) otherwise pay
+    // the full union-find + remap walk over millions of vertices for nothing.
+    if !snapped.iter().any(|s| s.is_some()) {
+        return CleanupResult {
+            positions: positions.to_vec(),
+            indices: indices.to_vec(),
+            remap: (0..positions.len() as u32).collect(),
+            welded_vertices: 0,
+            dropped_triangles: 0,
+        };
+    }
+
     let radius = config.weld_radius_cells * cell;
     let mut parent: Vec<u32> = (0..positions.len() as u32).collect();
 
@@ -101,9 +114,14 @@ pub fn weld_snapped_vertices(
 
     // Cluster positions: mean of members, except that corner snaps win over
     // edge snaps -- corners are exact feature points and must not be dragged
-    // along the edge by their welded neighbors.
+    // along the edge by their welded neighbors. Only snapped vertices are
+    // ever unioned, so the map covers just those; every other vertex is a
+    // singleton keeping its own position.
     let mut cluster_sum: HashMap<u32, (DVec3, usize, DVec3, usize)> = HashMap::new();
     for v in 0..positions.len() as u32 {
+        if snapped[v as usize].is_none() {
+            continue;
+        }
         let root = find(&mut parent, v);
         let entry = cluster_sum
             .entry(root)
@@ -121,12 +139,13 @@ pub fn weld_snapped_vertices(
     let mut new_positions: Vec<DVec3> = Vec::with_capacity(positions.len());
     for v in 0..positions.len() as u32 {
         if find(&mut parent, v) == v {
-            let (sum, count, corner_sum, corner_count) = cluster_sum[&v];
             remap[v as usize] = new_positions.len() as u32;
-            new_positions.push(if corner_count > 0 {
-                corner_sum / corner_count as f64
-            } else {
-                sum / count as f64
+            new_positions.push(match cluster_sum.get(&v) {
+                Some(&(_, _, corner_sum, corner_count)) if corner_count > 0 => {
+                    corner_sum / corner_count as f64
+                }
+                Some(&(sum, count, _, _)) => sum / count as f64,
+                None => positions[v as usize],
             });
         }
     }

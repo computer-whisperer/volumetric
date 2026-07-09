@@ -43,31 +43,54 @@ pub fn split_crease_vertices(
     is_crease: &[bool],
     cell: f64,
 ) -> CreaseSplitResult {
+    // Without crease vertices nothing splits, no triangle is rewritten and no
+    // normal is re-derived: the pass is an identity. Worth an early exit:
+    // smooth models otherwise pay the full triangle-region assignment over
+    // millions of triangles for nothing.
+    if !is_crease.iter().any(|&c| c) {
+        return CreaseSplitResult {
+            positions: positions.to_vec(),
+            normals: normals.to_vec(),
+            indices: indices.to_vec(),
+            split_vertices: 0,
+        };
+    }
+
     // Assign each triangle to a region by its claimed vertices. When labels
     // conflict within one triangle (regions in direct contact, which happens
     // when grid alignment leaves no unclaimed band), the tie is broken
     // geometrically: the region whose corners' carried normals best agree
     // with the triangle's face normal wins. Label majority alone mis-assigns
-    // half the cross-feature triangles in that regime.
+    // half the cross-feature triangles in that regime. Triangles are
+    // independent here, so this runs in parallel on native builds; the three
+    // corners bound the candidate set, so a fixed-size buffer avoids one
+    // allocation per triangle.
     let tri_count = indices.len() / 3;
-    let mut tri_region: Vec<Option<u32>> = Vec::with_capacity(tri_count);
-    for tri in indices.chunks_exact(3) {
-        let mut candidates: Vec<(u32, DVec3)> = Vec::new();
+    let mut tri_region: Vec<Option<u32>> = crate::parallel_iter::map_range(0..tri_count, |t| {
+        let tri = &indices[t * 3..t * 3 + 3];
+        let mut candidates = [(0u32, DVec3::ZERO); 3];
+        let mut candidate_count = 0usize;
         for &v in tri {
             if let Some(label) = labels[v as usize] {
-                match candidates.iter_mut().find(|(l, _)| *l == label) {
+                match candidates[..candidate_count]
+                    .iter_mut()
+                    .find(|(l, _)| *l == label)
+                {
                     Some((_, n)) => *n += normals[v as usize],
-                    None => candidates.push((label, normals[v as usize])),
+                    None => {
+                        candidates[candidate_count] = (label, normals[v as usize]);
+                        candidate_count += 1;
+                    }
                 }
             }
         }
-        let region = match candidates.len() {
+        match candidate_count {
             0 => None,
             1 => Some(candidates[0].0),
             _ => {
                 let (a, b, c) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
                 let face = (positions[b] - positions[a]).cross(positions[c] - positions[a]);
-                candidates
+                candidates[..candidate_count]
                     .iter()
                     .max_by(|(_, na), (_, nb)| {
                         let da = face.dot(na.normalize_or_zero());
@@ -76,9 +99,8 @@ pub fn split_crease_vertices(
                     })
                     .map(|&(l, _)| l)
             }
-        };
-        tri_region.push(region);
-    }
+        }
+    });
 
     // Region-less triangles that touch a crease vertex would otherwise keep
     // referencing base slots — aliasing their face into whichever region
@@ -100,12 +122,26 @@ pub fn split_crease_vertices(
     // zero-area slivers, and triangles with no assigned neighbor anywhere
     // stay region-less and keep the base-slot behavior.
     const MIN_RESOLVE_DOT: f64 = 0.9;
-    let mut vertex_tris: Vec<Vec<u32>> = vec![Vec::new(); positions.len()];
+    // Vertex -> incident triangles in compressed (CSR) form: two counting
+    // passes instead of millions of per-vertex Vec allocations.
+    let mut vt_starts = vec![0u32; positions.len() + 1];
+    for &v in indices {
+        vt_starts[v as usize + 1] += 1;
+    }
+    for i in 1..vt_starts.len() {
+        vt_starts[i] += vt_starts[i - 1];
+    }
+    let mut vt_cursor = vt_starts.clone();
+    let mut vt_tris = vec![0u32; indices.len()];
     for (t, tri) in indices.chunks_exact(3).enumerate() {
         for &v in tri {
-            vertex_tris[v as usize].push(t as u32);
+            vt_tris[vt_cursor[v as usize] as usize] = t as u32;
+            vt_cursor[v as usize] += 1;
         }
     }
+    let vertex_tris = |v: usize| -> &[u32] {
+        &vt_tris[vt_starts[v] as usize..vt_starts[v + 1] as usize]
+    };
     loop {
         let mut changed = false;
         for (t, tri) in indices.chunks_exact(3).enumerate() {
@@ -121,7 +157,7 @@ pub fn split_crease_vertices(
             };
             let mut neighbors: Vec<u32> = tri
                 .iter()
-                .flat_map(|&v| vertex_tris[v as usize].iter().copied())
+                .flat_map(|&v| vertex_tris(v as usize).iter().copied())
                 .collect();
             neighbors.sort_unstable();
             neighbors.dedup();

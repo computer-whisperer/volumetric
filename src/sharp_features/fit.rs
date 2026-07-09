@@ -155,7 +155,8 @@ pub struct VertexFit {
 /// Fit a plane to each vertex's k-ring. `orient_refs` supplies outward
 /// reference normals (typically the accumulated mesh normals); pass an empty
 /// slice to skip orientation. Vertices with fewer than 4 ring members or a
-/// degenerate fit get `None`.
+/// degenerate fit get `None`. Fits are independent per vertex and run in
+/// parallel on native builds.
 pub fn ring_fits(
     positions: &[DVec3],
     adjacency: &crate::sharp_features::adjacency::MeshAdjacency,
@@ -163,27 +164,25 @@ pub fn ring_fits(
     cell: f64,
     k: usize,
 ) -> Vec<Option<VertexFit>> {
-    (0..positions.len() as u32)
-        .map(|v| {
-            let ring = adjacency.k_ring(v, k);
-            if ring.len() < 4 {
-                return None;
-            }
-            let pts: Vec<DVec3> = ring.iter().map(|&u| positions[u as usize]).collect();
-            let fit = fit_plane(&pts)?;
-            let mut normal = fit.normal;
-            if let Some(reference) = orient_refs.get(v as usize)
-                && reference.length_squared() > 0.25
-                && normal.dot(*reference) < 0.0
-            {
-                normal = -normal;
-            }
-            Some(VertexFit {
-                normal,
-                residual_cells: fit.rms_residual / cell,
-            })
+    crate::parallel_iter::map_range(0..positions.len(), |v| {
+        let ring = adjacency.k_ring(v as u32, k);
+        if ring.len() < 4 {
+            return None;
+        }
+        let pts: Vec<DVec3> = ring.iter().map(|&u| positions[u as usize]).collect();
+        let fit = fit_plane(&pts)?;
+        let mut normal = fit.normal;
+        if let Some(reference) = orient_refs.get(v)
+            && reference.length_squared() > 0.25
+            && normal.dot(*reference) < 0.0
+        {
+            normal = -normal;
+        }
+        Some(VertexFit {
+            normal,
+            residual_cells: fit.rms_residual / cell,
         })
-        .collect()
+    })
 }
 
 #[cfg(test)]

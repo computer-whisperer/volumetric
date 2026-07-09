@@ -15,8 +15,11 @@
 //! where the mesher put it, so pathological geometry (fractals, sub-cell
 //! features) degrades to the current mesh, never to an invalid one.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use glam::DVec3;
 
+use crate::sharp_features::OccupancyFn;
 use crate::sharp_features::adjacency::MeshAdjacency;
 use crate::sharp_features::fit::fit_plane;
 
@@ -118,6 +121,22 @@ struct SidePlane {
     support: usize,
 }
 
+/// What one candidate evaluation produced, folded into [`SnapStats`] and the
+/// output arrays by the (serial) driver. `corner_fallback` travels alongside
+/// because a failed corner solve falls back to an edge attempt whose own
+/// outcome is independent.
+enum SnapAttempt {
+    Snapped(DVec3, SnapKind),
+    RejectedSides,
+    RejectedParallel,
+    RejectedMove,
+    RejectedVerify,
+    RejectedNonfinite,
+    /// The cancel flag was observed before this candidate ran; counts toward
+    /// no statistic (the caller discards the whole result anyway).
+    Cancelled,
+}
+
 /// Snap unclaimed vertices onto locally fitted feature lines/points.
 ///
 /// `sampler` is the model's binary occupancy function; when provided (and
@@ -128,21 +147,27 @@ pub fn snap_feature_vertices(
     labels: &[Option<u32>],
     cell: f64,
     config: &SnapConfig,
-    sampler: Option<&dyn Fn(DVec3) -> bool>,
+    sampler: Option<&dyn OccupancyFn>,
 ) -> SnapResult {
-    let mut out_positions = positions.to_vec();
-    let mut snapped: Vec<Option<SnapKind>> = vec![None; positions.len()];
-    let mut stats = SnapStats::default();
+    static NEVER: AtomicBool = AtomicBool::new(false);
+    snap_feature_vertices_cancellable(positions, adjacency, labels, cell, config, sampler, &NEVER)
+}
 
-    // Around corners the unclaimed pool is wider than along edges, pushing
-    // each region's claimed vertices further away; one retry with a larger
-    // gather radius recovers those without loosening the common case.
-    const RETRY_GATHER_SCALE: f64 = 1.75;
-    let gather_radii = [
-        config.gather_radius_cells,
-        config.gather_radius_cells * RETRY_GATHER_SCALE,
-    ];
-
+/// [`snap_feature_vertices`], checking `cancel` before each candidate.
+/// Candidates are evaluated in parallel on native builds — each reads only
+/// the shared inputs and returns its outcome, which a serial fold applies in
+/// candidate order, so the result is identical to the sequential path. On
+/// cancellation the remaining candidates are skipped and the (about to be
+/// discarded) result returns with whatever snaps completed.
+pub fn snap_feature_vertices_cancellable(
+    positions: &[DVec3],
+    adjacency: &MeshAdjacency,
+    labels: &[Option<u32>],
+    cell: f64,
+    config: &SnapConfig,
+    sampler: Option<&dyn OccupancyFn>,
+    cancel: &AtomicBool,
+) -> SnapResult {
     // Candidates are the feature-zone (unclaimed) vertices, plus
     // region-boundary vertices: when the sampling grid aligns with a feature,
     // the sawtooth amplitude collapses below the segmentation residual gates
@@ -159,115 +184,45 @@ pub fn snap_feature_vertices(
                 .any(|&u| matches!(labels[u as usize], Some(b) if b != a)),
         }
     };
+    let candidate_mask = crate::parallel_iter::map_range(0..positions.len(), &is_candidate);
+    let candidates: Vec<u32> = candidate_mask
+        .iter()
+        .enumerate()
+        .filter_map(|(v, &c)| c.then_some(v as u32))
+        .collect();
 
-    for v in 0..positions.len() {
-        if !is_candidate(v) {
-            continue;
+    let outcomes = crate::parallel_iter::map_vec(candidates, |v| {
+        if cancel.load(Ordering::Relaxed) {
+            return (v, false, SnapAttempt::Cancelled);
         }
+        let (corner_fallback, attempt) =
+            snap_one(v as usize, positions, adjacency, labels, cell, config, sampler);
+        (v, corner_fallback, attempt)
+    });
+
+    let mut out_positions = positions.to_vec();
+    let mut snapped: Vec<Option<SnapKind>> = vec![None; positions.len()];
+    let mut stats = SnapStats::default();
+    for (v, corner_fallback, attempt) in outcomes {
         stats.candidates += 1;
-        let origin = positions[v];
-
-        let mut planes: Vec<SidePlane> = Vec::new();
-        for &radius_cells in &gather_radii {
-            planes = gather_side_planes(
-                positions,
-                adjacency,
-                labels,
-                v,
-                origin,
-                radius_cells,
-                cell,
-                config,
-            );
-            if planes.len() >= 2 {
-                break;
-            }
+        if corner_fallback {
+            stats.corner_fallbacks += 1;
         }
-        if planes.len() < 2 {
-            stats.rejected_sides += 1;
-            continue;
-        }
-        planes.sort_by_key(|p| std::cmp::Reverse(p.support));
-
-        // Try a corner when three sides qualify, falling back to the
-        // best-supported edge pair when the corner solve is ill-conditioned
-        // or its target is out of movement range (vertices along an edge near
-        // a corner see three regions but belong on the edge line).
-        let max_move = config.max_move_cells * cell;
-        let mut target: Option<(DVec3, SnapKind)> = None;
-        if planes.len() >= 3 {
-            match intersect_three_planes(&planes[0], &planes[1], &planes[2], config.min_corner_det)
-            {
-                Some(p) if p.is_finite() && (p - origin).length() <= max_move => {
-                    target = Some((p, SnapKind::Corner));
-                }
-                _ => stats.corner_fallbacks += 1,
-            }
-        }
-        if target.is_none() {
-            let max_dot = (config.min_dihedral_deg.to_radians()).cos();
-            match intersect_two_planes(origin, &planes[0], &planes[1], max_dot) {
-                Some(p) => target = Some((p, SnapKind::Edge)),
-                None => {
-                    stats.rejected_parallel += 1;
-                    continue;
+        match attempt {
+            SnapAttempt::Snapped(p, kind) => {
+                out_positions[v as usize] = p;
+                snapped[v as usize] = Some(kind);
+                match kind {
+                    SnapKind::Edge => stats.snapped_edges += 1,
+                    SnapKind::Corner => stats.snapped_corners += 1,
                 }
             }
-        }
-        let (mut p, kind) = target.unwrap();
-
-        if !p.is_finite() {
-            stats.rejected_nonfinite += 1;
-            continue;
-        }
-        if (p - origin).length() > max_move {
-            stats.rejected_move += 1;
-            continue;
-        }
-
-        if let Some(is_inside) = sampler {
-            // PCA normals have arbitrary sign; orient each participating side
-            // outward with one probe at its own centroid (far from the
-            // feature, so the probe is unambiguous).
-            let delta = config.verify_delta_cells.max(0.5) * cell;
-            let outward: Vec<DVec3> = planes
-                .iter()
-                .take(if kind == SnapKind::Corner { 3 } else { 2 })
-                .map(|s| orient_outward(s, is_inside, delta))
-                .collect();
-
-            // Refine the target onto the model's actual occupancy boundary.
-            // The clamp is re-checked because refinement moves the target;
-            // exceeding it falls back to the already-clamped plane target.
-            if config.refine_iterations > 0 {
-                let refined = refine_target(p, &outward, cell, config, is_inside);
-                if refined.is_finite() && (refined - origin).length() <= max_move {
-                    p = refined;
-                }
-            }
-
-            // Verify: material just inside, none just outside along the mean
-            // outward side normal.
-            if config.verify_delta_cells > 0.0 {
-                let delta = config.verify_delta_cells * cell;
-                let Some(b) = outward.iter().sum::<DVec3>().try_normalize() else {
-                    stats.rejected_verify += 1;
-                    continue;
-                };
-                let inside_ok = is_inside(p - b * delta);
-                let outside_ok = !is_inside(p + b * delta);
-                if !(inside_ok && outside_ok) {
-                    stats.rejected_verify += 1;
-                    continue;
-                }
-            }
-        }
-
-        out_positions[v] = p;
-        snapped[v] = Some(kind);
-        match kind {
-            SnapKind::Edge => stats.snapped_edges += 1,
-            SnapKind::Corner => stats.snapped_corners += 1,
+            SnapAttempt::RejectedSides => stats.rejected_sides += 1,
+            SnapAttempt::RejectedParallel => stats.rejected_parallel += 1,
+            SnapAttempt::RejectedMove => stats.rejected_move += 1,
+            SnapAttempt::RejectedVerify => stats.rejected_verify += 1,
+            SnapAttempt::RejectedNonfinite => stats.rejected_nonfinite += 1,
+            SnapAttempt::Cancelled => {}
         }
     }
 
@@ -276,6 +231,122 @@ pub fn snap_feature_vertices(
         snapped,
         stats,
     }
+}
+
+/// Evaluate one candidate vertex: gather side planes, solve the feature
+/// intersection, refine and verify against the sampler. Reads only shared
+/// immutable inputs, so candidates evaluate in parallel.
+fn snap_one(
+    v: usize,
+    positions: &[DVec3],
+    adjacency: &MeshAdjacency,
+    labels: &[Option<u32>],
+    cell: f64,
+    config: &SnapConfig,
+    sampler: Option<&dyn OccupancyFn>,
+) -> (bool, SnapAttempt) {
+    // Around corners the unclaimed pool is wider than along edges, pushing
+    // each region's claimed vertices further away; one retry with a larger
+    // gather radius recovers those without loosening the common case.
+    const RETRY_GATHER_SCALE: f64 = 1.75;
+    let gather_radii = [
+        config.gather_radius_cells,
+        config.gather_radius_cells * RETRY_GATHER_SCALE,
+    ];
+    let origin = positions[v];
+    let mut corner_fallback = false;
+
+    let mut planes: Vec<SidePlane> = Vec::new();
+    for &radius_cells in &gather_radii {
+        planes = gather_side_planes(
+            positions,
+            adjacency,
+            labels,
+            v,
+            origin,
+            radius_cells,
+            cell,
+            config,
+        );
+        if planes.len() >= 2 {
+            break;
+        }
+    }
+    if planes.len() < 2 {
+        return (corner_fallback, SnapAttempt::RejectedSides);
+    }
+    planes.sort_by_key(|p| std::cmp::Reverse(p.support));
+
+    // Try a corner when three sides qualify, falling back to the
+    // best-supported edge pair when the corner solve is ill-conditioned
+    // or its target is out of movement range (vertices along an edge near
+    // a corner see three regions but belong on the edge line).
+    let max_move = config.max_move_cells * cell;
+    let mut target: Option<(DVec3, SnapKind)> = None;
+    if planes.len() >= 3 {
+        match intersect_three_planes(&planes[0], &planes[1], &planes[2], config.min_corner_det) {
+            Some(p) if p.is_finite() && (p - origin).length() <= max_move => {
+                target = Some((p, SnapKind::Corner));
+            }
+            _ => corner_fallback = true,
+        }
+    }
+    if target.is_none() {
+        let max_dot = (config.min_dihedral_deg.to_radians()).cos();
+        match intersect_two_planes(origin, &planes[0], &planes[1], max_dot) {
+            Some(p) => target = Some((p, SnapKind::Edge)),
+            None => return (corner_fallback, SnapAttempt::RejectedParallel),
+        }
+    }
+    let (mut p, kind) = target.unwrap();
+
+    if !p.is_finite() {
+        return (corner_fallback, SnapAttempt::RejectedNonfinite);
+    }
+    if (p - origin).length() > max_move {
+        return (corner_fallback, SnapAttempt::RejectedMove);
+    }
+
+    if let Some(is_inside) = sampler {
+        // The gather/refine helpers predate the parallel driver and take the
+        // plain closure trait; upcast once here.
+        let is_inside: &dyn Fn(DVec3) -> bool = is_inside;
+        // PCA normals have arbitrary sign; orient each participating side
+        // outward with one probe at its own centroid (far from the
+        // feature, so the probe is unambiguous).
+        let delta = config.verify_delta_cells.max(0.5) * cell;
+        let outward: Vec<DVec3> = planes
+            .iter()
+            .take(if kind == SnapKind::Corner { 3 } else { 2 })
+            .map(|s| orient_outward(s, is_inside, delta))
+            .collect();
+
+        // Refine the target onto the model's actual occupancy boundary.
+        // The clamp is re-checked because refinement moves the target;
+        // exceeding it falls back to the already-clamped plane target.
+        if config.refine_iterations > 0 {
+            let refined = refine_target(p, &outward, cell, config, is_inside);
+            if refined.is_finite() && (refined - origin).length() <= max_move {
+                p = refined;
+            }
+        }
+
+        // Verify: material just inside, none just outside along the mean
+        // outward side normal.
+        if config.verify_delta_cells > 0.0 {
+            let delta = config.verify_delta_cells * cell;
+            let Some(b) = outward.iter().sum::<DVec3>().try_normalize() else {
+                return (corner_fallback, SnapAttempt::RejectedVerify);
+            };
+            let inside_ok = is_inside(p - b * delta);
+            let outside_ok = !is_inside(p + b * delta);
+            if !(inside_ok && outside_ok) {
+                return (corner_fallback, SnapAttempt::RejectedVerify);
+            }
+        }
+    }
+
+    (corner_fallback, SnapAttempt::Snapped(p, kind))
 }
 
 /// Gather claimed vertices per region within `radius_cells` of `origin` and

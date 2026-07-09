@@ -45,7 +45,26 @@ pub mod fit;
 pub mod segmentation;
 pub mod snap;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use glam::DVec3;
+
+/// Marker trait for the binary occupancy sampler used by snap verification.
+///
+/// On native builds the sampler must be `Send + Sync`: snap evaluates
+/// candidates in parallel, each probing the sampler independently (the
+/// wasmtime-backed [`crate::wasm::ParallelModelSampler`] is built for exactly
+/// this). On web builds iteration is sequential and only `Fn` is required —
+/// the same split as [`crate::adaptive_surface_nets_2::SamplerFn`].
+#[cfg(feature = "native")]
+pub trait OccupancyFn: Fn(DVec3) -> bool + Send + Sync {}
+#[cfg(feature = "native")]
+impl<F> OccupancyFn for F where F: Fn(DVec3) -> bool + Send + Sync {}
+
+#[cfg(not(feature = "native"))]
+pub trait OccupancyFn: Fn(DVec3) -> bool {}
+#[cfg(not(feature = "native"))]
+impl<F> OccupancyFn for F where F: Fn(DVec3) -> bool {}
 
 /// Configuration for sharp feature reconstruction. The defaults are the
 /// oracle-benchmarked values from `meshing_lab`; they are expressed relative
@@ -92,30 +111,60 @@ pub fn apply_sharp_features(
     indices: &[u32],
     cell: f64,
     config: &SharpFeatureConfig,
-    is_inside: &dyn Fn(f64, f64, f64) -> bool,
+    is_inside: &dyn OccupancyFn,
 ) -> SharpFeatureOutput {
-    let positions_v: Vec<DVec3> = positions
-        .iter()
-        .map(|&(x, y, z)| DVec3::new(x, y, z))
-        .collect();
-    let normals_v: Vec<DVec3> = normals
-        .iter()
-        .map(|&(x, y, z)| DVec3::new(x, y, z))
-        .collect();
+    static NEVER: AtomicBool = AtomicBool::new(false);
+    apply_sharp_features_cancellable(positions, normals, indices, cell, config, is_inside, &NEVER)
+        .expect("sharp features with a never-set cancel flag cannot be cancelled")
+}
+
+/// [`apply_sharp_features`] with cooperative cancellation: the flag is checked
+/// at every pipeline-stage boundary and per candidate inside the (parallel)
+/// snap stage. Returns `None` once the flag is observed set — the mesh under
+/// construction is discarded, there is no partial result.
+pub fn apply_sharp_features_cancellable(
+    positions: &[(f64, f64, f64)],
+    normals: &[(f64, f64, f64)],
+    indices: &[u32],
+    cell: f64,
+    config: &SharpFeatureConfig,
+    is_inside: &dyn OccupancyFn,
+    cancel: &AtomicBool,
+) -> Option<SharpFeatureOutput> {
+    let positions_v: Vec<DVec3> = crate::parallel_iter::map_range(0..positions.len(), |i| {
+        let (x, y, z) = positions[i];
+        DVec3::new(x, y, z)
+    });
+    let normals_v: Vec<DVec3> = crate::parallel_iter::map_range(0..normals.len(), |i| {
+        let (x, y, z) = normals[i];
+        DVec3::new(x, y, z)
+    });
 
     let adjacency = adjacency::MeshAdjacency::build(positions.len(), indices);
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
     let fits = fit::ring_fits(&positions_v, &adjacency, &normals_v, cell, 1);
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
     let seg = segmentation::segment_regions(&adjacency, &fits, &config.segmentation);
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
 
-    let sampler = |p: DVec3| is_inside(p.x, p.y, p.z);
-    let snapped = snap::snap_feature_vertices(
+    let snapped = snap::snap_feature_vertices_cancellable(
         &positions_v,
         &adjacency,
         &seg.labels,
         cell,
         &config.snap,
-        Some(&sampler),
+        Some(is_inside),
+        cancel,
     );
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
 
     let cleaned = cleanup::weld_snapped_vertices(
         &snapped.positions,
@@ -124,6 +173,9 @@ pub fn apply_sharp_features(
         cell,
         &config.cleanup,
     );
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
 
     // Carry accumulated normals through the weld remap; cluster members agree
     // in orientation, so summing preserves the outward direction.
@@ -149,10 +201,19 @@ pub fn apply_sharp_features(
         &is_crease,
         cell,
     );
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
 
-    SharpFeatureOutput {
-        positions: split.positions.iter().map(|p| (p.x, p.y, p.z)).collect(),
-        normals: split.normals.iter().map(|n| (n.x, n.y, n.z)).collect(),
+    Some(SharpFeatureOutput {
+        positions: crate::parallel_iter::map_range(0..split.positions.len(), |i| {
+            let p = split.positions[i];
+            (p.x, p.y, p.z)
+        }),
+        normals: crate::parallel_iter::map_range(0..split.normals.len(), |i| {
+            let n = split.normals[i];
+            (n.x, n.y, n.z)
+        }),
         indices: split.indices,
         stats: SharpFeatureStats {
             regions: seg.region_count,
@@ -163,5 +224,5 @@ pub fn apply_sharp_features(
             dropped_triangles: cleaned.dropped_triangles,
             crease_splits: split.split_vertices,
         },
-    }
+    })
 }

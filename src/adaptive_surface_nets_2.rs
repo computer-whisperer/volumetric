@@ -192,62 +192,7 @@ use dashmap::DashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use web_time::Instant;
 
-/// Conditional parallel iteration helpers.
-///
-/// These functions provide parallel iteration when the `native` feature is enabled
-/// (using rayon), and fall back to sequential iteration on web (wasm32).
-pub(crate) mod parallel_iter {
-    #[cfg(feature = "native")]
-    use rayon::prelude::*;
-
-    /// Process a Vec in parallel (native) or sequentially (web), returning results.
-    #[cfg(feature = "native")]
-    pub fn map_vec<T, R, F>(items: Vec<T>, f: F) -> Vec<R>
-    where
-        T: Send,
-        R: Send,
-        F: Fn(T) -> R + Sync + Send,
-    {
-        items.into_par_iter().map(f).collect()
-    }
-
-    #[cfg(not(feature = "native"))]
-    pub fn map_vec<T, R, F>(items: Vec<T>, f: F) -> Vec<R>
-    where
-        F: Fn(T) -> R,
-    {
-        items.into_iter().map(f).collect()
-    }
-
-    /// Process a range in parallel (native) or sequentially (web), returning results.
-    #[cfg(feature = "native")]
-    pub fn map_range<R, F>(range: std::ops::Range<usize>, f: F) -> Vec<R>
-    where
-        R: Send,
-        F: Fn(usize) -> R + Sync + Send,
-    {
-        range.into_par_iter().map(f).collect()
-    }
-
-    #[cfg(not(feature = "native"))]
-    pub fn map_range<R, F>(range: std::ops::Range<usize>, f: F) -> Vec<R>
-    where
-        F: Fn(usize) -> R,
-    {
-        range.into_iter().map(f).collect()
-    }
-
-    /// Sort a slice in parallel (native) or sequentially (web).
-    #[cfg(feature = "native")]
-    pub fn sort_unstable<T: Ord + Send>(items: &mut [T]) {
-        items.par_sort_unstable();
-    }
-
-    #[cfg(not(feature = "native"))]
-    pub fn sort_unstable<T: Ord>(items: &mut [T]) {
-        items.sort_unstable();
-    }
-}
+use crate::parallel_iter;
 
 /// Marker trait for sampler functions used in adaptive surface nets.
 ///
@@ -2826,37 +2771,36 @@ fn stage4_5_sharp_features<F>(
     sampler: &F,
     cell_size: (f64, f64, f64),
     stats: &SamplingStats,
-) -> (IndexedMesh2, crate::sharp_features::SharpFeatureStats)
+    cancel: &AtomicBool,
+) -> Option<(IndexedMesh2, crate::sharp_features::SharpFeatureStats)>
 where
     F: SamplerFn,
 {
     let cell = cell_size.0.max(cell_size.1).max(cell_size.2);
-    let is_inside = |x: f64, y: f64, z: f64| -> bool {
+    let is_inside = |p: glam::DVec3| -> bool {
         stats.total_samples.fetch_add(1, Ordering::Relaxed);
-        volumetric_abi::is_occupied(sampler(x, y, z))
+        volumetric_abi::is_occupied(sampler(p.x, p.y, p.z))
     };
-    let out = crate::sharp_features::apply_sharp_features(
+    let out = crate::sharp_features::apply_sharp_features_cancellable(
         &stage4.positions_f64,
         &stage4.normals_f64,
         &stage4.indices,
         cell,
         config,
         &is_inside,
-    );
+        cancel,
+    )?;
     let mesh = IndexedMesh2 {
-        vertices: out
-            .positions
-            .iter()
-            .map(|p| (p.0 as f32, p.1 as f32, p.2 as f32))
-            .collect(),
-        normals: out
-            .normals
-            .iter()
-            .map(|n| normalize_or_default(*n))
-            .collect(),
+        vertices: parallel_iter::map_range(0..out.positions.len(), |i| {
+            let p = out.positions[i];
+            (p.0 as f32, p.1 as f32, p.2 as f32)
+        }),
+        normals: parallel_iter::map_range(0..out.normals.len(), |i| {
+            normalize_or_default(out.normals[i])
+        }),
         indices: out.indices,
     };
-    (mesh, out.stats)
+    Some((mesh, out.stats))
 }
 
 /// Convert Stage4Result to IndexedMesh2 (when sharp feature processing is skipped)
@@ -3035,12 +2979,14 @@ where
 }
 
 /// [`adaptive_surface_nets_2`], checking `cancel` cooperatively throughout:
-/// per work item during subdivision, per vertex during refinement, between
-/// decimation passes, and at every stage boundary. Returns `None` once the
-/// flag is observed set — the mesh under construction is discarded, there is
-/// no partial result. Cancellation latency is bounded by the longest
-/// unchecked span (the stage-3 parallel sorts and the sharp-feature stage
-/// when enabled): a few seconds at high resolution.
+/// per work item during subdivision, per vertex during refinement, per
+/// candidate during sharp-feature snapping, within and between decimation
+/// passes, and at every stage and sharp-feature-phase boundary. Returns
+/// `None` once the flag is observed set — the mesh under construction is
+/// discarded, there is no partial result. Cancellation latency is bounded by
+/// the longest unchecked span (the stage-3 parallel sorts and the serial
+/// sharp-feature phases: segmentation, weld, crease split): a few seconds at
+/// high resolution.
 pub fn adaptive_surface_nets_2_cancellable<F>(
     sampler: F,
     bounds_min: (f32, f32, f32),
@@ -3148,9 +3094,7 @@ where
     // Stage 4.5: Sharp feature reconstruction (when enabled)
     let stage4_5_start = Instant::now();
     let (mut mesh, sharp_stats) = if let Some(ref sharp_config) = config.sharp_features {
-        let (mesh, sharp_s) =
-            stage4_5_sharp_features(stage4_result, sharp_config, &sampler, cell_size, &stats);
-        (mesh, sharp_s)
+        stage4_5_sharp_features(stage4_result, sharp_config, &sampler, cell_size, &stats, cancel)?
     } else {
         (
             stage4_result_to_mesh(stage4_result),
@@ -4242,6 +4186,66 @@ mod tests {
                 "Vertex {i} z should refine onto a slab face, got {v:?}"
             );
         }
+    }
+
+    /// Stage-time profile on a lattice-like workload: thin-walled gyroid with
+    /// sharp features + decimation at UI defaults. Run with:
+    ///   cargo test --release sharp_scaling_bench -- --ignored --nocapture
+    /// SHARP_BENCH_DEPTH overrides max_depth (default 4 -> 128^3 effective).
+    #[test]
+    #[ignore]
+    fn sharp_scaling_bench() {
+        let depth: usize = std::env::var("SHARP_BENCH_DEPTH")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4);
+        let gyroid = |x: f64, y: f64, z: f64| -> f32 {
+            let a = 7.0;
+            let g = (a * x).sin() * (a * y).cos()
+                + (a * y).sin() * (a * z).cos()
+                + (a * z).sin() * (a * x).cos();
+            if g.abs() < 0.25 { 1.0 } else { 0.0 }
+        };
+        let config = AdaptiveMeshConfig2 {
+            base_resolution: 8,
+            max_depth: depth,
+            vertex_refinement_iterations: 8,
+            discovery_probes: 8,
+            sharp_features: Some(SharpFeatureConfig::default()),
+            decimation: Some(crate::mesh_decimation::DecimationConfig::default()),
+            ..Default::default()
+        };
+        let start = Instant::now();
+        let result =
+            adaptive_surface_nets_2(gyroid, (-1.0, -1.0, -1.0), (1.0, 1.0, 1.0), &config);
+        let wall = start.elapsed().as_secs_f64();
+        let s = &result.stats;
+        println!(
+            "depth {depth} ({res}^3): wall {wall:.2}s | s1 {:.2}s s2 {:.2}s s3 {:.2}s \
+             s4 {:.2}s s4.5 {:.2}s s5 {:.2}s ({} passes)",
+            s.stage1_time_secs,
+            s.stage2_time_secs,
+            s.stage3_time_secs,
+            s.stage4_time_secs,
+            s.stage4_5_time_secs,
+            s.stage5_time_secs,
+            s.stage5_passes,
+            res = s.effective_resolution,
+        );
+        println!(
+            "  vertices {} triangles {} | sharp: {} regions, {} candidates, \
+             {}+{} snapped, {} welded, {} splits | s5 tris {} -> {}",
+            s.total_vertices,
+            s.total_triangles,
+            s.sharp_regions,
+            s.sharp_candidates,
+            s.sharp_snapped_edges,
+            s.sharp_snapped_corners,
+            s.sharp_welded_vertices,
+            s.sharp_crease_splits,
+            s.stage5_triangles_before,
+            s.total_triangles,
+        );
     }
 
     #[test]
