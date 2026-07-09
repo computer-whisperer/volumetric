@@ -115,6 +115,12 @@ struct WebHost {
     /// An async remote job is awaiting the daemon; the pump stays quiet
     /// until it lands (parity with the native single worker thread).
     remote_in_flight: Rc<Cell<bool>>,
+    /// Bumped on every executor swap. In-flight remote tasks capture the
+    /// value they were spawned under and drop their results/progress if it
+    /// moved — the analogue of the native swap dropping the old worker's
+    /// result channel. Without this, a written-off preview's terminal
+    /// result would retire its identically-keyed replacement.
+    executor_epoch: Rc<Cell<u64>>,
 }
 
 struct Gfx {
@@ -152,6 +158,7 @@ impl WebHost {
             file_in_flight: Rc::new(Cell::new(false)),
             remote: Rc::new(RefCell::new(None)),
             remote_in_flight: Rc::new(Cell::new(false)),
+            executor_epoch: Rc::new(Cell::new(0)),
         }
     }
 }
@@ -583,6 +590,11 @@ impl WebHost {
                 ExecutorChoice::Local => None,
                 ExecutorChoice::Remote(address) => Some(address),
             };
+            // Write off in-flight remote work: the app already cancelled
+            // its bookkeeping, and the epoch bump makes the orphaned tasks
+            // drop their late results instead of colliding with the
+            // re-dispatched builds' identical keys.
+            self.executor_epoch.set(self.executor_epoch.get() + 1);
         }
 
         // Apply finished file operations, then launch any newly queued
@@ -699,6 +711,7 @@ impl WebHost {
         let scheduled = self.pump_scheduled.clone();
         let remote = self.remote.clone();
         let remote_in_flight = self.remote_in_flight.clone();
+        let executor_epoch = self.executor_epoch.clone();
         let closure = Closure::once_into_js(move || {
             let job = jobs.borrow_mut().pop();
             if let Some(job) = job {
@@ -708,6 +721,7 @@ impl WebHost {
                         address,
                         &results,
                         &remote_in_flight,
+                        &executor_epoch,
                         &window,
                     ),
                     None => run_job_inline(job, &results),
@@ -765,8 +779,13 @@ fn dispatch_job_with_remote(
     address: String,
     results: &Rc<RefCell<Vec<BackgroundResult>>>,
     in_flight: &Rc<Cell<bool>>,
+    epoch: &Rc<Cell<u64>>,
     window: &Arc<Window>,
 ) {
+    // A task spawned under this epoch is written off by any executor swap:
+    // its pushes are dropped, like the results of the worker thread a
+    // native swap abandons.
+    let spawned_epoch = epoch.get();
     match job {
         BackgroundJob::RunProject {
             generation,
@@ -776,10 +795,14 @@ fn dispatch_job_with_remote(
             in_flight.set(true);
             let results = results.clone();
             let in_flight = in_flight.clone();
+            let epoch = epoch.clone();
             let window = window.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 let start = web_time::Instant::now();
                 let on_progress = |progress: volumetric::BuildProgress| {
+                    if epoch.get() != spawned_epoch {
+                        return;
+                    }
                     results
                         .borrow_mut()
                         .push(BackgroundResult::RunProgress {
@@ -795,7 +818,9 @@ fn dispatch_job_with_remote(
                     elapsed_ms: start.elapsed().as_millis(),
                 };
                 log_failed_result(&result);
-                results.borrow_mut().push(result);
+                if epoch.get() == spawned_epoch {
+                    results.borrow_mut().push(result);
+                }
                 in_flight.set(false);
                 window.request_redraw();
             });
@@ -808,10 +833,14 @@ fn dispatch_job_with_remote(
                     in_flight.set(true);
                     let results = results.clone();
                     let in_flight = in_flight.clone();
+                    let epoch = epoch.clone();
                     let window = window.clone();
                     wasm_bindgen_futures::spawn_local(async move {
                         let asset_id = job.key.asset_id.clone();
                         let on_progress = |progress: volumetric::BuildProgress| {
+                            if epoch.get() != spawned_epoch {
+                                return;
+                            }
                             results
                                 .borrow_mut()
                                 .push(BackgroundResult::PreviewProgress {
@@ -840,7 +869,9 @@ fn dispatch_job_with_remote(
                             },
                         ));
                         log_failed_result(&result);
-                        results.borrow_mut().push(result);
+                        if epoch.get() == spawned_epoch {
+                            results.borrow_mut().push(result);
+                        }
                         in_flight.set(false);
                         window.request_redraw();
                     });
