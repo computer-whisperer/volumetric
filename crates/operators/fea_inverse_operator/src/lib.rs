@@ -36,12 +36,19 @@
 //!   contact active-set sweeps within each forward solve; grazing rims on
 //!   curved rigid bodies can need a few dozen).
 //!
-//! Output 0: the input FeaMesh plus the converged per-element
+//! Output 0: the input FeaMesh plus the designed per-element
 //! `stiffness_scale` (1), per-node `target_force` (1, the matched
 //! distribution scaled to the achieved total, comparable to
-//! `contact_force`), and the final solve's `displacement` (3),
+//! `contact_force`), and that iterate's solve fields: `displacement` (3),
 //! `contact_force` (3), `strain_energy_density` (1), and `rotation` (3,
 //! Bar2 frame meshes only).
+//!
+//! The result is best-effort: if `max_iterations` runs out above
+//! `tolerance`, the operator emits the lowest-error iterate the loop
+//! visited rather than failing — many targets are not exactly satisfiable
+//! (a pressure demanded at a grazing rim, contrast beyond the `min_scale`
+//! floor). Compare `target_force` against `contact_force` to judge the
+//! residual mismatch.
 
 use volumetric_abi::fea::{FeaField, FeaMesh, decode_fea_mesh, encode_fea_mesh};
 use volumetric_abi::host::{
@@ -138,39 +145,11 @@ fn run_inverse(config: &InverseOperatorConfig) -> Result<FeaMesh, String> {
             .map(|samples| samples[0] as f64)
             .unwrap_or(f64::NAN)
     };
+    // Non-convergence is not an error: many targets are not exactly
+    // satisfiable (grazing rims, min_scale floors), and solve_inverse
+    // returns its best iterate — emit that best effort; target_force vs
+    // contact_force carries the residual mismatch for inspection.
     let result = fea_core::solve_inverse(&mesh, &mut rigid, &mut target, &inverse_config)?;
-
-    if !result.converged {
-        // The dominant stall mode is scales frozen against the min_scale
-        // floor: the scenario demands more stiffness contrast than the
-        // floor permits, and no amount of extra iterations moves the
-        // clamped fixed point. Diagnose it so the message points at the
-        // knob that actually helps.
-        let floored = result
-            .stiffness_scale
-            .iter()
-            .filter(|&&s| s <= config.min_scale * 1.0001)
-            .count();
-        let floor_share = floored as f64 / result.stiffness_scale.len().max(1) as f64;
-        let hint = if floor_share > 0.25 {
-            format!(
-                "{:.0}% of elements sit at the min_scale floor ({}) — the target \
-                 needs more stiffness contrast than the floor allows; lower \
-                 min_scale",
-                floor_share * 100.0,
-                config.min_scale
-            )
-        } else {
-            "raise max_iterations, loosen tolerance, or check that the target \
-             map covers the contact patch"
-                .to_string()
-        };
-        return Err(format!(
-            "did not reach the target distribution in {} iterations (final \
-             relative error {:.4}, tolerance {}); {hint}",
-            result.iterations, result.distribution_error, config.tolerance
-        ));
-    }
 
     upsert(
         &mut mesh.element_fields,

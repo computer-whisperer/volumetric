@@ -80,20 +80,26 @@ impl Default for InverseConfig {
     }
 }
 
+/// The best iterate the loop visited: when `max_iterations` runs out above
+/// `tolerance`, this is the lowest-error design seen, not the last one —
+/// many targets are not exactly satisfiable (grazing rims, min_scale
+/// floors), and the update can destabilize after the scale field saturates,
+/// so best effort is the useful answer.
 #[derive(Debug)]
 pub struct InverseResult {
     /// The per-element stiffness multipliers that produced `solve`,
     /// renormalized to peak 1.0 and floored at `min_scale`.
     pub stiffness_scale: Vec<f64>,
     /// Per-node target force: the normalized target distribution scaled to
-    /// the achieved total, directly comparable to the final `contact_force`
+    /// the achieved total, directly comparable to `solve`'s `contact_force`
     /// (zero off the contact set).
     pub target_force: Vec<f64>,
-    /// The final forward solve.
+    /// The forward solve of the returned iterate.
     pub solve: SolveResult,
-    /// Forward solves performed.
+    /// Forward solves performed (not the index of the returned iterate).
     pub iterations: usize,
-    /// Final distribution error (total variation distance, in [0, 1]).
+    /// Distribution error of the returned iterate (total variation
+    /// distance, in [0, 1]).
     pub distribution_error: f64,
     /// False when `max_iterations` ran out above `tolerance`.
     pub converged: bool,
@@ -231,6 +237,7 @@ fn solve_inverse_hex(
     let mut work = mesh.clone();
     let mut scales = stiffness_scales(mesh)?;
     let mut iterations = 0;
+    let mut best: Option<InverseResult> = None;
 
     loop {
         iterations += 1;
@@ -341,7 +348,10 @@ fn solve_inverse_hex(
         }
 
         let converged = distribution_error <= config.tolerance;
-        if converged || iterations >= config.max_iterations {
+        if best
+            .as_ref()
+            .is_none_or(|b| distribution_error < b.distribution_error)
+        {
             // Per-node target force, comparable to the achieved contact
             // forces: each node's column shares scaled by their columns'
             // ratios (sums to the achieved total).
@@ -349,14 +359,19 @@ fn solve_inverse_hex(
             for (node, shares) in &contacts {
                 target_force[*node] = shares.iter().map(|(c, share)| share * ratios[c]).sum();
             }
-            return Ok(InverseResult {
-                stiffness_scale: scales,
+            best = Some(InverseResult {
+                stiffness_scale: scales.clone(),
                 target_force,
                 solve: result,
                 iterations,
                 distribution_error,
                 converged,
             });
+        }
+        if converged || iterations >= config.max_iterations {
+            let mut best = best.expect("the first iteration is always a best");
+            best.iterations = iterations;
+            return Ok(best);
         }
 
         // Fixed-point update, damped by `exponent` and clamped per
@@ -477,6 +492,7 @@ fn solve_inverse_frame(
     let mut work = mesh.clone();
     let mut scales = stiffness_scales(mesh)?;
     let mut iterations = 0;
+    let mut best: Option<InverseResult> = None;
 
     loop {
         iterations += 1;
@@ -572,7 +588,10 @@ fn solve_inverse_frame(
         }
 
         let converged = distribution_error <= config.tolerance;
-        if converged || iterations >= config.max_iterations {
+        if best
+            .as_ref()
+            .is_none_or(|b| distribution_error < b.distribution_error)
+        {
             let mut target_force = vec![0.0f64; node_count];
             for (node, force, fractions) in &contacts {
                 target_force[*node] = fractions
@@ -580,14 +599,19 @@ fn solve_inverse_frame(
                     .map(|(c, fraction)| force * fraction * ratios[c])
                     .sum();
             }
-            return Ok(InverseResult {
-                stiffness_scale: scales,
+            best = Some(InverseResult {
+                stiffness_scale: scales.clone(),
                 target_force,
                 solve: result,
                 iterations,
                 distribution_error,
                 converged,
             });
+        }
+        if converged || iterations >= config.max_iterations {
+            let mut best = best.expect("the first iteration is always a best");
+            best.iterations = iterations;
+            return Ok(best);
         }
 
         for (c, ratio) in &ratios {
@@ -742,6 +766,44 @@ mod tests {
             low_z > 1.5 * high_z,
             "expected stiffer columns at low z: low {low_z}, high {high_z}"
         );
+    }
+
+    #[test]
+    fn unsatisfiable_target_returns_the_best_iterate() {
+        // Demand a 100:1 pressure step while min_scale = 0.8 caps the
+        // expressible stiffness contrast at 1.25:1 — the tolerance is
+        // unreachable, so the loop must exhaust max_iterations and return
+        // its best effort.
+        let mesh = grid_mesh(8, 8, 4, 0.125);
+        let mut target = |p: [f64; 2]| if p[0] < 0.5 { 1.0 } else { 100.0 };
+        let mut cfg = config(0.3, FixedBoundary::ZMin);
+        cfg.min_scale = 0.8;
+
+        cfg.max_iterations = 1;
+        let first = solve_inverse(&mesh, &mut plate(0.45), &mut target, &cfg).unwrap();
+        cfg.max_iterations = 8;
+        let best = solve_inverse(&mesh, &mut plate(0.45), &mut target, &cfg).unwrap();
+
+        assert!(!best.converged);
+        assert_eq!(best.iterations, 8);
+        // Keep-best: more iterations can only improve (or match) the result.
+        assert!(
+            best.distribution_error <= first.distribution_error,
+            "error rose with more iterations: {} -> {}",
+            first.distribution_error,
+            best.distribution_error
+        );
+        // The returned iterate is internally consistent: target_force is
+        // scaled to the achieved compressive total of the returned solve.
+        let achieved: f64 = (0..mesh.node_count())
+            .map(|n| (-best.solve.contact_force[n * 3 + 2]).max(0.0))
+            .sum();
+        let demanded: f64 = best.target_force.iter().sum();
+        assert!(
+            (demanded - achieved).abs() < 1e-9 * achieved,
+            "target_force total {demanded} vs achieved {achieved}"
+        );
+        assert!(best.stiffness_scale.iter().all(|s| (0.8..=1.0).contains(s)));
     }
 
     /// A cubic strut lattice block: (nx+1)(ny+1)(nz+1) grid nodes with

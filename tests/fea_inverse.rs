@@ -163,9 +163,9 @@ fn sphere_press_matches_a_step_target_end_to_end() {
     assert_eq!(stiffness.len(), 512);
     assert_eq!(target_force.len(), nodes);
 
-    // The operator only outputs on convergence, so the achieved forces obey
-    // the demanded 1:3 split across x = 0.5 (up to the 0.02 distribution
-    // tolerance).
+    // This scenario converges within the default tolerance, so the achieved
+    // forces obey the demanded 1:3 split across x = 0.5 (up to the 0.02
+    // distribution tolerance).
     let mut achieved = [0.0f64; 2]; // [x < 0.5, x >= 0.5]
     let mut demanded = [0.0f64; 2];
     for n in 0..nodes {
@@ -217,6 +217,105 @@ fn sphere_press_matches_a_step_target_end_to_end() {
         high > 1.5 * low,
         "stiffness contrast missing under the patch: low side {low:.3}, high side {high:.3}"
     );
+}
+
+#[test]
+fn unsatisfiable_target_still_outputs_best_effort() {
+    use ciborium::value::Value;
+
+    // Same scenario as the converging test, but min_scale = 0.8 caps the
+    // stiffness contrast at 1.25:1 — far short of the demanded 1:3 step —
+    // so the loop cannot reach tolerance. The operator must still emit the
+    // best iterate's fields instead of failing the step.
+    let project = Project {
+        version: 2,
+        imports: vec![
+            ImportedAsset::model("sphere".to_string(), wasm_artifact("simple_sphere_model")),
+            ImportedAsset::model("target".to_string(), step_target_map()),
+            ImportedAsset::operator(
+                "prism".to_string(),
+                wasm_artifact("rectangular_prism_operator"),
+            ),
+            ImportedAsset::operator("translate".to_string(), wasm_artifact("translate_operator")),
+            ImportedAsset::operator(
+                "mesher".to_string(),
+                wasm_artifact("fea_grid_mesh_operator"),
+            ),
+            ImportedAsset::operator("inverse".to_string(), wasm_artifact("fea_inverse_operator")),
+        ],
+        timeline: vec![
+            ExecutionStep {
+                operator_id: "prism".to_string(),
+                inputs: vec![
+                    ExecutionInput::Inline(cbor_map(&[(
+                        "mode",
+                        Value::Text("opposite_corners".into()),
+                    )])),
+                    ExecutionInput::Inline(vec3([0.0, 0.0, 0.0])),
+                    ExecutionInput::Inline(vec3([1.0, 1.0, 1.0])),
+                ],
+                outputs: vec!["box".to_string()],
+            },
+            ExecutionStep {
+                operator_id: "translate".to_string(),
+                inputs: vec![
+                    ExecutionInput::AssetRef("sphere".to_string()),
+                    ExecutionInput::Inline(cbor_map(&[
+                        ("dx", Value::Float(0.5)),
+                        ("dy", Value::Float(0.5)),
+                        ("dz", Value::Float(1.9)),
+                    ])),
+                ],
+                outputs: vec!["butt".to_string()],
+            },
+            ExecutionStep {
+                operator_id: "mesher".to_string(),
+                inputs: vec![
+                    ExecutionInput::AssetRef("box".to_string()),
+                    ExecutionInput::Inline(cbor_map(&[("resolution", Value::Integer(8.into()))])),
+                ],
+                outputs: vec!["mesh".to_string()],
+            },
+            ExecutionStep {
+                operator_id: "inverse".to_string(),
+                inputs: vec![
+                    ExecutionInput::AssetRef("mesh".to_string()),
+                    ExecutionInput::AssetRef("butt".to_string()),
+                    ExecutionInput::AssetRef("target".to_string()),
+                    ExecutionInput::Inline(cbor_map(&[
+                        ("min_scale", Value::Float(0.8)),
+                        ("max_iterations", Value::Integer(3.into())),
+                    ])),
+                ],
+                outputs: vec!["designed".to_string()],
+            },
+        ],
+        exports: vec!["designed".to_string()],
+    };
+
+    let mut env = Environment::new();
+    let exports = project.run(&mut env).expect("best-effort run must not fail");
+    let mesh = decode_fea_mesh(exports[0].data()).expect("designed output decodes");
+
+    let stiffness = mesh
+        .element_fields
+        .iter()
+        .find(|f| f.name == "stiffness_scale")
+        .expect("stiffness_scale present");
+    assert!(
+        stiffness.data.iter().all(|s| (0.8..=1.0).contains(s)),
+        "scales respect the raised floor"
+    );
+    for name in ["target_force", "displacement", "contact_force"] {
+        assert!(
+            mesh.node_fields.iter().any(|f| f.name == name),
+            "missing field {name}"
+        );
+    }
+    // Best effort means it pushed toward the demand within the floor's
+    // reach: some contrast must exist, with the softer side below 1.
+    let min = stiffness.data.iter().cloned().fold(f64::INFINITY, f64::min);
+    assert!(min < 0.95, "no stiffness contrast at all (min {min})");
 }
 
 #[test]
