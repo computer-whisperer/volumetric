@@ -1103,12 +1103,10 @@ impl Project {
         self.run_cancellable(env, &NEVER)
     }
 
-    /// Runs the project, checking `cancel` before each timeline step.
-    ///
-    /// Cancellation is cooperative and coarse-grained: it takes effect between
-    /// operator invocations, not mid-operator (a single WASM operator call is
-    /// not interruptible). Returns [`ExecutionError::Cancelled`] if the flag is
-    /// set before a step begins.
+    /// Runs the project, checking `cancel` before each timeline step and
+    /// interrupting the operator currently executing (via wasmtime epoch
+    /// interruption on the native backend; the web backend can only cancel
+    /// between steps). Returns [`ExecutionError::Cancelled`].
     #[cfg(any(feature = "native", feature = "web"))]
     pub fn run_cancellable(
         &self,
@@ -1198,13 +1196,14 @@ impl Project {
                 .unwrap_or_default();
 
             let io = OperatorIo::new(input_bytes);
-            let result = executor.run(io).map_err(|e| match e {
+            let result = executor.run_cancellable(io, cancel).map_err(|e| match e {
                 wasm::WasmBackendError::OperatorReported(message) => {
                     ExecutionError::OperatorFailed {
                         operator_id: step.operator_id.clone(),
                         message,
                     }
                 }
+                wasm::WasmBackendError::Cancelled => ExecutionError::Cancelled,
                 other => ExecutionError::Wasmtime(other.to_string()),
             })?;
 

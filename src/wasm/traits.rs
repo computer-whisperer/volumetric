@@ -228,6 +228,19 @@ pub trait OperatorExecutor: Send {
     /// Execute the operator with the given I/O state.
     fn run(&mut self, io: OperatorIo) -> Result<OperatorIo, WasmBackendError>;
 
+    /// [`run`](Self::run), interruptible: aborts with
+    /// [`WasmBackendError::Cancelled`] shortly after `cancel` becomes true,
+    /// even mid-execution. Backends without an interruption mechanism (the
+    /// web bridge) fall back to an uninterruptible run.
+    fn run_cancellable(
+        &mut self,
+        io: OperatorIo,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<OperatorIo, WasmBackendError> {
+        let _ = cancel;
+        self.run(io)
+    }
+
     /// Get the operator's metadata as CBOR bytes.
     fn get_metadata(&mut self) -> Result<Vec<u8>, WasmBackendError>;
 }
