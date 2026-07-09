@@ -622,6 +622,20 @@ pub fn generate_adaptive_mesh_v2_from_bytes_cancellable(
     config: &adaptive_surface_nets_2::AdaptiveMeshConfig2,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> anyhow::Result<Option<AdaptiveMeshV2Result>> {
+    generate_adaptive_mesh_v2_from_bytes_monitored(wasm_bytes, config, cancel, &|_| {})
+}
+
+/// [`generate_adaptive_mesh_v2_from_bytes_cancellable`] with progress
+/// reporting: `progress` receives a [`BuildProgress`] snapshot at every
+/// meshing stage transition (and throttled cell counts during subdivision).
+/// It is called from the meshing thread itself, so it must be cheap.
+#[cfg(any(feature = "native", feature = "web"))]
+pub fn generate_adaptive_mesh_v2_from_bytes_monitored(
+    wasm_bytes: &[u8],
+    config: &adaptive_surface_nets_2::AdaptiveMeshConfig2,
+    cancel: &std::sync::atomic::AtomicBool,
+    progress: &dyn Fn(BuildProgress),
+) -> anyhow::Result<Option<AdaptiveMeshV2Result>> {
     use wasm::ParallelModelSampler;
 
     let wasm_sampler =
@@ -691,8 +705,8 @@ pub fn generate_adaptive_mesh_v2_from_bytes_cancellable(
         wasm_sampler.sample(x, y, z)
     };
 
-    let Some(result) = adaptive_surface_nets_2::adaptive_surface_nets_2_cancellable(
-        sampler, padded_min, padded_max, config, cancel,
+    let Some(result) = adaptive_surface_nets_2::adaptive_surface_nets_2_monitored(
+        sampler, padded_min, padded_max, config, cancel, progress,
     ) else {
         return Ok(None);
     };
@@ -705,6 +719,19 @@ pub fn generate_adaptive_mesh_v2_from_bytes_cancellable(
         bounds_max,
         stats: result.stats,
     }))
+}
+
+/// Progress snapshot reported by long-running build jobs — project runs
+/// (per timeline step) and meshing (per stage). Serializable so the remote
+/// build daemon can forward it over the wire.
+///
+/// `phase` is a short human-readable description of what is running right
+/// now; `fraction` is overall progress in `0..=1` when the job can estimate
+/// it (project runs know their step count; meshing stages mostly don't).
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct BuildProgress {
+    pub phase: String,
+    pub fraction: Option<f32>,
 }
 
 // =============================================================================
@@ -1088,6 +1115,20 @@ impl Project {
         env: &mut Environment,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<Vec<LoadedAsset>, ExecutionError> {
+        self.run_monitored(env, cancel, &|_| {})
+    }
+
+    /// [`run_cancellable`](Self::run_cancellable) with progress reporting:
+    /// `progress` receives a [`BuildProgress`] before each timeline step,
+    /// naming the operator about to run with the step fraction. It is called
+    /// from the executing thread itself, so it must be cheap.
+    #[cfg(any(feature = "native", feature = "web"))]
+    pub fn run_monitored(
+        &self,
+        env: &mut Environment,
+        cancel: &std::sync::atomic::AtomicBool,
+        progress: &dyn Fn(BuildProgress),
+    ) -> Result<Vec<LoadedAsset>, ExecutionError> {
         use std::sync::atomic::Ordering;
         use wasm::{OperatorExecutor, OperatorIo};
 
@@ -1102,10 +1143,20 @@ impl Project {
         }
 
         // Execute timeline steps
-        for step in &self.timeline {
+        let step_count = self.timeline.len();
+        for (step_index, step) in self.timeline.iter().enumerate() {
             if cancel.load(Ordering::Relaxed) {
                 return Err(ExecutionError::Cancelled);
             }
+            progress(BuildProgress {
+                phase: format!(
+                    "{} ({}/{})",
+                    step.operator_id,
+                    step_index + 1,
+                    step_count
+                ),
+                fraction: Some(step_index as f32 / step_count.max(1) as f32),
+            });
 
             // Get operator bytes
             let op_data = env

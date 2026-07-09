@@ -509,6 +509,7 @@ fn run_project_exports(
         .run(
             &volumetric_protocol::JobRequest::RunProject { project },
             &|| false,
+            &|progress| eprintln!("remote: {}", progress.phase),
         )
         .with_context(|| format!("remote run on {address} failed"))?;
     match outcome {

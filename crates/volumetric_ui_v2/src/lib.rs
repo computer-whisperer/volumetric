@@ -794,6 +794,11 @@ pub struct VolumetricUiV2 {
     last_run_error: Option<String>,
     last_run_stale: bool,
     run_state: RunState,
+    /// Latest progress snapshot from the in-flight run (shown in the run
+    /// chip); `None` when idle or before the first report arrives.
+    run_progress: Option<volumetric::BuildProgress>,
+    /// Latest progress snapshot from an in-flight preview mesh build.
+    preview_progress: Option<volumetric::BuildProgress>,
     auto_rebuild: bool,
     pending_run: bool,
     cancel_requested: bool,
@@ -894,6 +899,8 @@ impl VolumetricUiV2 {
             last_run_error: None,
             last_run_stale: false,
             run_state: RunState::Idle,
+            run_progress: None,
+            preview_progress: None,
             auto_rebuild: false,
             pending_run: false,
             cancel_requested: false,
@@ -1564,15 +1571,35 @@ impl VolumetricUiV2 {
 
     pub(crate) fn set_run_state(&mut self, state: RunState) {
         self.run_state = state;
+        self.run_progress = None;
         if state == RunState::Running {
             self.status = "running project".to_string();
         }
+    }
+
+    /// Host hook: a progress snapshot arrived from the in-flight run.
+    pub(crate) fn on_run_progress(&mut self, progress: volumetric::BuildProgress) {
+        if self.run_state == RunState::Running {
+            self.run_progress = Some(progress);
+        }
+    }
+
+    /// Host hook: a progress snapshot arrived from an in-flight preview build.
+    pub(crate) fn on_preview_progress(&mut self, progress: volumetric::BuildProgress) {
+        self.preview_progress = Some(progress);
+    }
+
+    /// Host hook: a preview build finished (however it ended); drop its
+    /// progress so the chip doesn't show a stale phase.
+    pub(crate) fn clear_preview_progress(&mut self) {
+        self.preview_progress = None;
     }
 
     /// Host hook: the in-flight run was cancelled. Its (abandoned) result, if it
     /// still arrives, is discarded by generation on the host side.
     pub(crate) fn on_run_cancelled(&mut self) {
         self.run_state = RunState::Idle;
+        self.run_progress = None;
         self.last_run_stale = true;
         self.status = "run cancelled".to_string();
     }
@@ -1584,6 +1611,7 @@ impl VolumetricUiV2 {
         elapsed_ms: u128,
     ) {
         self.run_state = RunState::Idle;
+        self.run_progress = None;
         self.last_run_elapsed_ms = Some(elapsed_ms);
         match result {
             Ok(assets) => {
@@ -4019,12 +4047,23 @@ fn run_control(app: &VolumetricUiV2) -> El {
 
 fn run_status_chip(app: &VolumetricUiV2) -> El {
     match app.run_state() {
-        RunState::Running => row([
-            spinner().width(Size::Fixed(14.0)).height(Size::Fixed(14.0)),
-            badge("running").info().xsmall(),
-        ])
-        .gap(tokens::SPACE_1)
-        .align(Align::Center),
+        RunState::Running => {
+            let label = match &app.run_progress {
+                Some(progress) => match progress.fraction {
+                    Some(fraction) => {
+                        format!("{} · {:.0}%", progress.phase, fraction * 100.0)
+                    }
+                    None => progress.phase.clone(),
+                },
+                None => "running".to_string(),
+            };
+            row([
+                spinner().width(Size::Fixed(14.0)).height(Size::Fixed(14.0)),
+                badge(label).info().xsmall(),
+            ])
+            .gap(tokens::SPACE_1)
+            .align(Align::Center)
+        }
         RunState::Idle => {
             if app.last_run_stale && !app.runtime_assets.is_empty() {
                 badge("stale").secondary().xsmall()
@@ -4038,7 +4077,14 @@ fn run_status_chip(app: &VolumetricUiV2) -> El {
 }
 
 fn preview_status_chip(app: &VolumetricUiV2) -> El {
-    let label = app.preview_build_status.label();
+    let mut label = app.preview_build_status.label();
+    // While a build is in flight, append its latest meshing phase (e.g.
+    // "subdividing (1.2M cells)") so long builds show what they're doing.
+    if matches!(app.preview_build_status, PreviewBuildStatus::Building { .. })
+        && let Some(progress) = &app.preview_progress
+    {
+        label = format!("{label} · {}", progress.phase);
+    }
     let badge = match &app.preview_build_status {
         PreviewBuildStatus::Idle => badge(label).muted().xsmall(),
         PreviewBuildStatus::Building { .. } => badge(label).info().xsmall(),

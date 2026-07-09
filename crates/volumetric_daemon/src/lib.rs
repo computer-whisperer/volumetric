@@ -56,6 +56,9 @@ struct JobEntry {
     cancel: Arc<AtomicBool>,
     outcome: Option<JobOutcome>,
     finished_at: Option<Instant>,
+    /// Latest snapshot from the job's progress callback, served with every
+    /// status response. Updates just overwrite; nothing waits on them.
+    progress: Option<volumetric::BuildProgress>,
 }
 
 struct DaemonState {
@@ -236,6 +239,7 @@ fn submit_job(state: &Arc<DaemonState>, body: &[u8]) -> HttpResponse {
             cancel: Arc::clone(&cancel),
             outcome: None,
             finished_at: None,
+            progress: None,
         },
     );
 
@@ -246,15 +250,36 @@ fn submit_job(state: &Arc<DaemonState>, body: &[u8]) -> HttpResponse {
 }
 
 fn run_job(state: &Arc<DaemonState>, job_id: u64, request: JobRequest, cancel: &AtomicBool) {
+    // One line per job start/end on stderr: enough to tell after the fact
+    // what a busy daemon was doing (job kind, size, outcome, duration).
+    let summary = match &request {
+        JobRequest::RunProject { project } => {
+            format!("run-project ({} steps)", project.timeline.len())
+        }
+        JobRequest::MeshModel { model_wasm, config } => format!(
+            "mesh-model ({} KiB wasm, {}^3 effective)",
+            model_wasm.len() / 1024,
+            config.base_resolution * (1 << config.max_depth),
+        ),
+    };
+    eprintln!("job {job_id}: {summary} queued");
     acquire_slot(state);
 
     let outcome = if cancel.load(Ordering::Relaxed) {
         JobOutcome::Cancelled
     } else {
         set_job_state(state, job_id, JobState::Running);
+        // Progress snapshots overwrite the job entry; status polls pick up
+        // whatever is latest. The callback runs on this job's thread, so the
+        // jobs mutex is held only for the field write.
+        let on_progress = |progress: volumetric::BuildProgress| {
+            if let Some(entry) = state.jobs.lock().unwrap().get_mut(&job_id) {
+                entry.progress = Some(progress);
+            }
+        };
         let started = Instant::now();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            execute(&request, cancel)
+            execute(&request, cancel, &on_progress)
         }));
         match result {
             Ok(Ok(Some(output))) => JobOutcome::Success {
@@ -269,6 +294,13 @@ fn run_job(state: &Arc<DaemonState>, job_id: u64, request: JobRequest, cancel: &
         }
     };
 
+    let disposition = match &outcome {
+        JobOutcome::Success { elapsed_ms, .. } => format!("succeeded in {elapsed_ms}ms"),
+        JobOutcome::Failed { error } => format!("failed: {error}"),
+        JobOutcome::Cancelled => "cancelled".to_string(),
+    };
+    eprintln!("job {job_id}: {disposition}");
+
     {
         let mut jobs = state.jobs.lock().unwrap();
         if let Some(entry) = jobs.get_mut(&job_id) {
@@ -282,11 +314,15 @@ fn run_job(state: &Arc<DaemonState>, job_id: u64, request: JobRequest, cancel: &
 }
 
 /// Runs one job payload. `Ok(None)` means cancelled.
-fn execute(request: &JobRequest, cancel: &AtomicBool) -> Result<Option<JobOutput>, String> {
+fn execute(
+    request: &JobRequest,
+    cancel: &AtomicBool,
+    on_progress: &dyn Fn(volumetric::BuildProgress),
+) -> Result<Option<JobOutput>, String> {
     match request {
         JobRequest::RunProject { project } => {
             let mut env = volumetric::Environment::new();
-            match project.run_cancellable(&mut env, cancel) {
+            match project.run_monitored(&mut env, cancel, on_progress) {
                 Ok(exports) => Ok(Some(JobOutput::RunProject {
                     exports: exports.iter().map(ExportedAsset::from_loaded).collect(),
                 })),
@@ -295,8 +331,11 @@ fn execute(request: &JobRequest, cancel: &AtomicBool) -> Result<Option<JobOutput
             }
         }
         JobRequest::MeshModel { model_wasm, config } => {
-            match volumetric::generate_adaptive_mesh_v2_from_bytes_cancellable(
-                model_wasm, config, cancel,
+            match volumetric::generate_adaptive_mesh_v2_from_bytes_monitored(
+                model_wasm,
+                config,
+                cancel,
+                on_progress,
             ) {
                 Ok(Some(result)) => Ok(Some(JobOutput::MeshModel {
                     mesh: MeshPayload::pack(
@@ -327,6 +366,7 @@ fn job_status(state: &Arc<DaemonState>, job_id: u64, wait_ms: u64) -> HttpRespon
             return cbor_response(&JobStatus {
                 state: entry.state,
                 outcome: entry.outcome.clone(),
+                progress: entry.progress.clone(),
             });
         }
         let now = Instant::now();
@@ -334,6 +374,7 @@ fn job_status(state: &Arc<DaemonState>, job_id: u64, wait_ms: u64) -> HttpRespon
             return cbor_response(&JobStatus {
                 state: entry.state,
                 outcome: None,
+                progress: entry.progress.clone(),
             });
         }
         let (guard, _timeout) = state

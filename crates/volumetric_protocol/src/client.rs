@@ -100,11 +100,14 @@ impl DaemonClient {
     /// Long-polls until the job finishes. `cancel_requested` is consulted
     /// between polls; the first time it reports true, cancellation is
     /// forwarded to the daemon and the wait continues until the daemon
-    /// acknowledges with a final outcome.
+    /// acknowledges with a final outcome. `on_progress` receives the job's
+    /// latest [`crate::BuildProgress`] whenever a poll returns one — at the
+    /// polling cadence, so an indicator rather than a stream.
     pub fn wait(
         &self,
         job_id: u64,
         cancel_requested: &dyn Fn() -> bool,
+        on_progress: &dyn Fn(crate::BuildProgress),
     ) -> Result<JobOutcome, ClientError> {
         let mut cancel_sent = false;
         loop {
@@ -116,6 +119,9 @@ impl DaemonClient {
             if let Some(outcome) = status.outcome {
                 return Ok(outcome);
             }
+            if let Some(progress) = status.progress {
+                on_progress(progress);
+            }
             debug_assert!(matches!(status.state, JobState::Queued | JobState::Running));
         }
     }
@@ -125,9 +131,10 @@ impl DaemonClient {
         &self,
         request: &JobRequest,
         cancel_requested: &dyn Fn() -> bool,
+        on_progress: &dyn Fn(crate::BuildProgress),
     ) -> Result<JobOutcome, ClientError> {
         let job_id = self.submit(request)?;
-        self.wait(job_id, cancel_requested)
+        self.wait(job_id, cancel_requested, on_progress)
     }
 
     fn get<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T, ClientError> {

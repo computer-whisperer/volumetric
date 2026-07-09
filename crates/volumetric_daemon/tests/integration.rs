@@ -98,6 +98,28 @@ fn one_step_project(operator: Vec<u8>, steps: usize) -> Project {
 }
 
 const NEVER_CANCEL: &dyn Fn() -> bool = &|| false;
+const IGNORE_PROGRESS: &dyn Fn(volumetric_protocol::BuildProgress) = &|_| {};
+
+/// `run_monitored` reports one snapshot per timeline step with a rising
+/// fraction — the payload the daemon's status endpoint serves to pollers.
+#[test]
+fn run_monitored_reports_each_step() {
+    let project = one_step_project(blob_operator(), 3);
+    let steps: std::cell::RefCell<Vec<volumetric::BuildProgress>> =
+        std::cell::RefCell::new(Vec::new());
+    let never = std::sync::atomic::AtomicBool::new(false);
+    project
+        .run_monitored(&mut volumetric::Environment::new(), &never, &|p| {
+            steps.borrow_mut().push(p)
+        })
+        .expect("project runs");
+    let steps = steps.into_inner();
+    assert_eq!(steps.len(), 3);
+    assert_eq!(steps[0].phase, "op (1/3)");
+    assert_eq!(steps[0].fraction, Some(0.0));
+    assert_eq!(steps[2].phase, "op (3/3)");
+    assert_eq!(steps[2].fraction, Some(2.0 / 3.0));
+}
 
 #[test]
 fn info_reports_matching_protocol_version() {
@@ -114,7 +136,7 @@ fn run_project_returns_exports() {
     let request = JobRequest::RunProject {
         project: one_step_project(blob_operator(), 1),
     };
-    let outcome = client.run(&request, NEVER_CANCEL).expect("job completes");
+    let outcome = client.run(&request, NEVER_CANCEL, IGNORE_PROGRESS).expect("job completes");
 
     let JobOutcome::Success { output, .. } = outcome else {
         panic!("expected success, got {outcome:?}");
@@ -149,7 +171,7 @@ fn run_project_reports_execution_errors() {
         exports: vec![],
     };
     let outcome = client
-        .run(&JobRequest::RunProject { project }, NEVER_CANCEL)
+        .run(&JobRequest::RunProject { project }, NEVER_CANCEL, IGNORE_PROGRESS)
         .expect("job completes");
 
     let JobOutcome::Failed { error } = outcome else {
@@ -173,7 +195,7 @@ fn mesh_model_returns_a_plausible_box_mesh() {
         model_wasm: box_model(),
         config,
     };
-    let outcome = client.run(&request, NEVER_CANCEL).expect("job completes");
+    let outcome = client.run(&request, NEVER_CANCEL, IGNORE_PROGRESS).expect("job completes");
 
     let JobOutcome::Success { output, .. } = outcome else {
         panic!("expected success, got {outcome:?}");
@@ -229,12 +251,12 @@ fn cancellation_stops_queued_and_running_jobs() {
     client.cancel(b).expect("cancel B");
     client.cancel(a).expect("cancel A");
 
-    let outcome_b = client.wait(b, NEVER_CANCEL).expect("await B");
+    let outcome_b = client.wait(b, NEVER_CANCEL, IGNORE_PROGRESS).expect("await B");
     assert!(
         matches!(outcome_b, JobOutcome::Cancelled),
         "queued job should cancel without running, got {outcome_b:?}"
     );
-    let outcome_a = client.wait(a, NEVER_CANCEL).expect("await A");
+    let outcome_a = client.wait(a, NEVER_CANCEL, IGNORE_PROGRESS).expect("await A");
     assert!(
         matches!(outcome_a, JobOutcome::Cancelled),
         "running job should cancel between steps, got {outcome_a:?}"

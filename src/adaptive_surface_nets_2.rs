@@ -1611,6 +1611,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stage2_subdivision_and_emission<F>(
     initial_queue: Vec<WorkQueueEntry>,
     sampler: &F,
@@ -1619,6 +1620,7 @@ fn stage2_subdivision_and_emission<F>(
     config: &AdaptiveMeshConfig2,
     stats: &SamplingStats,
     cancel: &AtomicBool,
+    progress: &dyn Fn(crate::BuildProgress),
 ) -> Vec<SparseTriangle>
 where
     F: SamplerFn,
@@ -1640,6 +1642,12 @@ where
         visited.insert(entry.cuboid);
     }
 
+    // Progress: subdivision's duration is workload-shaped (the work queue is
+    // discovered as it drains), so report live counts, throttled to keep the
+    // callback off the hot path when batches are small and frequent.
+    let mut last_report = Instant::now();
+    const REPORT_INTERVAL_SECS: f64 = 0.1;
+
     // Process in parallel batches until no more work
     while !current_batch.is_empty() {
         // Cancellation: each work item checks the flag itself (so a batch
@@ -1648,6 +1656,17 @@ where
         // truncated triangle soup.
         if cancel.load(Ordering::Relaxed) {
             break;
+        }
+        if last_report.elapsed().as_secs_f64() >= REPORT_INTERVAL_SECS {
+            last_report = Instant::now();
+            progress(crate::BuildProgress {
+                phase: format!(
+                    "subdividing ({} cells, {} triangles)",
+                    stats.cuboids_processed.load(Ordering::Relaxed),
+                    stats.triangles_emitted.load(Ordering::Relaxed),
+                ),
+                fraction: None,
+            });
         }
 
         // Process current batch in parallel (or sequentially on web)
@@ -2997,6 +3016,32 @@ pub fn adaptive_surface_nets_2_cancellable<F>(
 where
     F: SamplerFn,
 {
+    adaptive_surface_nets_2_monitored(sampler, bounds_min, bounds_max, config, cancel, &|_| {})
+}
+
+/// [`adaptive_surface_nets_2_cancellable`] with progress reporting:
+/// `progress` receives a [`crate::BuildProgress`] at every stage transition,
+/// plus throttled live cell counts during subdivision (the stage whose
+/// duration is least predictable). Fractions are omitted — an adaptive
+/// mesher cannot estimate its total work up front. The callback runs on the
+/// meshing thread itself, so it must be cheap.
+pub fn adaptive_surface_nets_2_monitored<F>(
+    sampler: F,
+    bounds_min: (f32, f32, f32),
+    bounds_max: (f32, f32, f32),
+    config: &AdaptiveMeshConfig2,
+    cancel: &AtomicBool,
+    progress: &dyn Fn(crate::BuildProgress),
+) -> Option<MeshingResult2>
+where
+    F: SamplerFn,
+{
+    let report = |phase: String| {
+        progress(crate::BuildProgress {
+            phase,
+            fraction: None,
+        })
+    };
     let total_start = Instant::now();
     let stats = SamplingStats::default();
 
@@ -3022,6 +3067,7 @@ where
     );
 
     // Stage 1: Coarse grid discovery
+    report("discovering surface".to_string());
     let stage1_start = Instant::now();
     let samples_before_stage1 = stats.total_samples.load(Ordering::Relaxed);
     let initial_work_queue =
@@ -3051,6 +3097,7 @@ where
         config,
         &stats,
         cancel,
+        progress,
     );
     let stage2_time = stage2_start.elapsed().as_secs_f64();
     let stage2_samples = stats.total_samples.load(Ordering::Relaxed) - samples_before_stage2;
@@ -3063,6 +3110,10 @@ where
     }
 
     // Stage 3: Topology finalization
+    report(format!(
+        "indexing topology ({} triangles)",
+        sparse_triangles.len()
+    ));
     let stage3_start = Instant::now();
     let stage3_result = stage3_topology_finalization(sparse_triangles, bounds_min_f64, cell_size);
     let stage3_time = stage3_start.elapsed().as_secs_f64();
@@ -3073,6 +3124,10 @@ where
     }
 
     // Stage 4: Vertex refinement & normal estimation
+    report(format!(
+        "refining {} vertices",
+        stage3_result.vertices.len()
+    ));
     let stage4_start = Instant::now();
     let samples_before_stage4 = stats.total_samples.load(Ordering::Relaxed);
     let stage4_result = stage4_vertex_refinement(
@@ -3094,6 +3149,7 @@ where
     // Stage 4.5: Sharp feature reconstruction (when enabled)
     let stage4_5_start = Instant::now();
     let (mut mesh, sharp_stats) = if let Some(ref sharp_config) = config.sharp_features {
+        report("reconstructing sharp features".to_string());
         stage4_5_sharp_features(stage4_result, sharp_config, &sampler, cell_size, &stats, cancel)?
     } else {
         (
@@ -3108,6 +3164,9 @@ where
     }
 
     // Stage 5: Decimation (when enabled)
+    if config.decimation.is_some() {
+        report(format!("decimating {} triangles", mesh.indices.len() / 3));
+    }
     let (stage5_time, stage5_passes, stage5_triangles_before) =
         stage5_decimation(&mut mesh, config, cell_size, cancel);
 
@@ -3602,6 +3661,7 @@ mod tests {
             &config,
             &stats,
             &NEVER,
+            &|_| {},
         );
 
         // Should produce triangles for a sphere
@@ -3818,6 +3878,7 @@ mod tests {
             &config,
             &stats1,
             &NEVER,
+            &|_| {},
         );
 
         let stats2 = SamplingStats::default();
@@ -3831,6 +3892,7 @@ mod tests {
             &config,
             &stats2,
             &NEVER,
+            &|_| {},
         );
 
         assert_eq!(
@@ -3878,6 +3940,7 @@ mod tests {
             &config,
             &stats,
             &NEVER,
+            &|_| {},
         );
 
         assert!(

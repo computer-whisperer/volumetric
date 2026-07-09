@@ -45,17 +45,19 @@ impl RemoteBackend {
     }
 
     /// Submits a job and long-polls it to completion, forwarding a raised
-    /// cancel flag. Returns the success output, `Ok(None)` for a cancelled
-    /// job, or the daemon's failure message.
+    /// cancel flag and the daemon's progress snapshots. Returns the success
+    /// output, `Ok(None)` for a cancelled job, or the daemon's failure
+    /// message.
     fn run_job(
         &self,
         request: &JobRequest,
         cancel: &AtomicBool,
+        progress: &dyn Fn(volumetric::BuildProgress),
     ) -> Result<Option<JobOutput>, String> {
         self.ensure_ready()?;
         let outcome = self
             .client
-            .run(request, &|| cancel.load(Ordering::Relaxed))
+            .run(request, &|| cancel.load(Ordering::Relaxed), progress)
             .map_err(|err| format!("remote build at {}: {err}", self.address))?;
         match outcome {
             JobOutcome::Success { output, .. } => Ok(Some(output)),
@@ -70,11 +72,12 @@ impl ExecutionBackend for RemoteBackend {
         &self,
         project: &volumetric::Project,
         cancel: &AtomicBool,
+        progress: &dyn Fn(volumetric::BuildProgress),
     ) -> Result<Vec<volumetric::LoadedAsset>, String> {
         let request = JobRequest::RunProject {
             project: project.clone(),
         };
-        match self.run_job(&request, cancel)? {
+        match self.run_job(&request, cancel, progress)? {
             Some(JobOutput::RunProject { exports }) => Ok(exports
                 .into_iter()
                 .map(volumetric_protocol::ExportedAsset::into_loaded)
@@ -92,12 +95,13 @@ impl ExecutionBackend for RemoteBackend {
         model_wasm: &[u8],
         config: &AdaptiveMeshConfig2,
         cancel: &AtomicBool,
+        progress: &dyn Fn(volumetric::BuildProgress),
     ) -> Result<Option<volumetric::AdaptiveMeshV2Result>, String> {
         let request = JobRequest::MeshModel {
             model_wasm: model_wasm.to_vec(),
             config: config.clone(),
         };
-        match self.run_job(&request, cancel)? {
+        match self.run_job(&request, cancel, progress)? {
             Some(JobOutput::MeshModel { mesh, stats }) => {
                 let vertices = mesh.unpack_positions().map_err(|e| e.to_string())?;
                 let normals = mesh.unpack_normals().map_err(|e| e.to_string())?;

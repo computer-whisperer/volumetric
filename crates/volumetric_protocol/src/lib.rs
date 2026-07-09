@@ -39,6 +39,7 @@
 
 use serde::{Deserialize, Serialize};
 use volumetric::adaptive_surface_nets_2::{AdaptiveMeshConfig2, MeshingStats2};
+pub use volumetric::BuildProgress;
 use volumetric::{AssetTypeHint, LoadedAsset, Project};
 
 #[cfg(feature = "client")]
@@ -103,6 +104,11 @@ pub struct JobStatus {
     pub state: JobState,
     /// Present exactly when `state` is [`JobState::Finished`].
     pub outcome: Option<JobOutcome>,
+    /// Latest progress snapshot from a running job, when it has reported
+    /// one. Refreshes at the long-poll cadence, so treat it as an indicator,
+    /// not a stream. `serde(default)` keeps older daemons decodable.
+    #[serde(default)]
+    pub progress: Option<BuildProgress>,
 }
 
 /// How a finished job ended.
@@ -276,6 +282,36 @@ pub fn from_cbor<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A status encoded by a daemon predating the `progress` field must still
+    /// decode (serde default) — the wire stays compatible across versions.
+    #[test]
+    fn job_status_decodes_without_progress_field() {
+        #[derive(Serialize)]
+        struct OldJobStatus {
+            state: JobState,
+            outcome: Option<JobOutcome>,
+        }
+        let old = OldJobStatus {
+            state: JobState::Running,
+            outcome: None,
+        };
+        let decoded: JobStatus = from_cbor(&to_cbor(&old)).expect("old encoding decodes");
+        assert_eq!(decoded.state, JobState::Running);
+        assert!(decoded.progress.is_none());
+
+        // And the new field round-trips when present.
+        let status = JobStatus {
+            state: JobState::Running,
+            outcome: None,
+            progress: Some(BuildProgress {
+                phase: "refining 12345 vertices".to_string(),
+                fraction: Some(0.5),
+            }),
+        };
+        let decoded: JobStatus = from_cbor(&to_cbor(&status)).expect("round trip");
+        assert_eq!(decoded.progress, status.progress);
+    }
 
     #[test]
     fn mesh_payload_round_trips() {

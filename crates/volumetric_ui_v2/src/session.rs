@@ -99,7 +99,19 @@ impl Session {
                     }
                     // Otherwise the run was superseded or cancelled; discard it.
                 }
+                BackgroundResult::RunProgress {
+                    generation,
+                    progress,
+                } => {
+                    if self.active_run.as_ref().map(|(g, _)| *g) == Some(generation) {
+                        app.on_run_progress(progress);
+                    }
+                }
+                BackgroundResult::PreviewProgress { progress, .. } => {
+                    app.on_preview_progress(progress);
+                }
                 BackgroundResult::PreviewComplete(preview) => {
+                    app.clear_preview_progress();
                     self.viewport.accept_preview_result(*preview);
                 }
                 BackgroundResult::LightboxComplete {
@@ -1196,10 +1208,14 @@ pub enum PreviewBuildError {
 /// sampling, marching-cubes/point-cloud previews, scene assembly, and
 /// bundled-operator metadata always run locally regardless of backend.
 pub trait ExecutionBackend: Send + Sync {
+    /// `progress` receives [`volumetric::BuildProgress`] snapshots while the
+    /// run executes (per timeline step locally; at the polling cadence
+    /// remotely). Called from the executing thread — keep it cheap.
     fn run_project(
         &self,
         project: &volumetric::Project,
         cancel: &AtomicBool,
+        progress: &dyn Fn(volumetric::BuildProgress),
     ) -> Result<Vec<volumetric::LoadedAsset>, String>;
 
     /// `Ok(None)` means the cancel flag was observed and the mesh abandoned.
@@ -1208,6 +1224,7 @@ pub trait ExecutionBackend: Send + Sync {
         model_wasm: &[u8],
         config: &volumetric::adaptive_surface_nets_2::AdaptiveMeshConfig2,
         cancel: &AtomicBool,
+        progress: &dyn Fn(volumetric::BuildProgress),
     ) -> Result<Option<volumetric::AdaptiveMeshV2Result>, String>;
 }
 
@@ -1219,9 +1236,10 @@ impl ExecutionBackend for LocalBackend {
         &self,
         project: &volumetric::Project,
         cancel: &AtomicBool,
+        progress: &dyn Fn(volumetric::BuildProgress),
     ) -> Result<Vec<volumetric::LoadedAsset>, String> {
         project
-            .run_cancellable(&mut volumetric::Environment::new(), cancel)
+            .run_monitored(&mut volumetric::Environment::new(), cancel, progress)
             .map_err(|err| err.to_string())
     }
 
@@ -1230,9 +1248,12 @@ impl ExecutionBackend for LocalBackend {
         model_wasm: &[u8],
         config: &volumetric::adaptive_surface_nets_2::AdaptiveMeshConfig2,
         cancel: &AtomicBool,
+        progress: &dyn Fn(volumetric::BuildProgress),
     ) -> Result<Option<volumetric::AdaptiveMeshV2Result>, String> {
-        volumetric::generate_adaptive_mesh_v2_from_bytes_cancellable(model_wasm, config, cancel)
-            .map_err(format_error_chain)
+        volumetric::generate_adaptive_mesh_v2_from_bytes_monitored(
+            model_wasm, config, cancel, progress,
+        )
+        .map_err(format_error_chain)
     }
 }
 
@@ -1268,6 +1289,17 @@ pub enum BackgroundResult {
         generation: u64,
         result: Result<Vec<volumetric::LoadedAsset>, String>,
         elapsed_ms: u128,
+    },
+    /// Mid-flight progress from the run tagged `generation` (never terminal;
+    /// a `ProjectComplete` always follows).
+    RunProgress {
+        generation: u64,
+        progress: volumetric::BuildProgress,
+    },
+    /// Mid-flight progress from the preview build for `asset_id`.
+    PreviewProgress {
+        asset_id: String,
+        progress: volumetric::BuildProgress,
     },
     PreviewComplete(Box<PreviewBuildResult>),
     LightboxComplete {
@@ -1345,6 +1377,18 @@ pub fn execute_job(job: BackgroundJob) -> BackgroundResult {
 /// [`execute_job`] with the heavy compute (project run, ASN2 meshing) routed
 /// through `backend`; everything else executes in-process.
 pub fn execute_job_with(job: BackgroundJob, backend: &dyn ExecutionBackend) -> BackgroundResult {
+    execute_job_monitored(job, backend, &|_| {})
+}
+
+/// [`execute_job_with`], emitting mid-flight [`BackgroundResult::RunProgress`]
+/// / [`BackgroundResult::PreviewProgress`] snapshots through `emit` while the
+/// job runs (the returned result is still the terminal one). The shell's
+/// worker forwards these onto its result channel so the UI can show them.
+pub fn execute_job_monitored(
+    job: BackgroundJob,
+    backend: &dyn ExecutionBackend,
+    emit: &dyn Fn(BackgroundResult),
+) -> BackgroundResult {
     match job {
         BackgroundJob::RunProject {
             generation,
@@ -1354,7 +1398,12 @@ pub fn execute_job_with(job: BackgroundJob, backend: &dyn ExecutionBackend) -> B
             // std::time::Instant panics on wasm32-unknown-unknown; swap for
             // web-time when the web shell lands.
             let start = std::time::Instant::now();
-            let result = backend.run_project(&project, &cancel);
+            let result = backend.run_project(&project, &cancel, &|progress| {
+                emit(BackgroundResult::RunProgress {
+                    generation,
+                    progress,
+                })
+            });
             BackgroundResult::ProjectComplete {
                 generation,
                 result,
@@ -1362,11 +1411,20 @@ pub fn execute_job_with(job: BackgroundJob, backend: &dyn ExecutionBackend) -> B
             }
         }
         BackgroundJob::BuildPreview(job) => {
-            let result = match build_preview_scene_with(&job.request, &job.cancel, backend) {
-                Ok(Some(entity)) => Ok(entity),
-                Ok(None) => Err(PreviewBuildError::Cancelled),
-                Err(error) => Err(PreviewBuildError::Failed(error)),
+            let asset_id = job.key.asset_id.clone();
+            let progress = |progress: volumetric::BuildProgress| {
+                emit(BackgroundResult::PreviewProgress {
+                    asset_id: asset_id.clone(),
+                    progress,
+                })
             };
+            let result =
+                match build_preview_scene_monitored(&job.request, &job.cancel, backend, &progress)
+                {
+                    Ok(Some(entity)) => Ok(entity),
+                    Ok(None) => Err(PreviewBuildError::Cancelled),
+                    Err(error) => Err(PreviewBuildError::Failed(error)),
+                };
             BackgroundResult::PreviewComplete(Box::new(PreviewBuildResult {
                 key: job.key,
                 result,
@@ -1741,6 +1799,17 @@ pub fn build_preview_scene_with(
     cancel: &AtomicBool,
     backend: &dyn ExecutionBackend,
 ) -> Result<Option<PreviewEntity>, String> {
+    build_preview_scene_monitored(request, cancel, backend, &|_| {})
+}
+
+/// [`build_preview_scene_with`] forwarding meshing progress to `progress`
+/// (only the ASN2 plan reports; the cheap plans finish too fast to matter).
+pub fn build_preview_scene_monitored(
+    request: &PreviewRequest,
+    cancel: &AtomicBool,
+    backend: &dyn ExecutionBackend,
+    progress: &dyn Fn(volumetric::BuildProgress),
+) -> Result<Option<PreviewEntity>, String> {
     let build_start = std::time::Instant::now();
     let mut stats = OutputStats::default();
 
@@ -1822,7 +1891,9 @@ pub fn build_preview_scene_with(
             let config = mesh_plan
                 .adaptive_surface_nets_config()
                 .ok_or_else(|| "missing adaptive surface nets config".to_string())?;
-            let Some(mesh) = backend.mesh_model(request.data.as_slice(), &config, cancel)? else {
+            let Some(mesh) =
+                backend.mesh_model(request.data.as_slice(), &config, cancel, progress)?
+            else {
                 return Ok(None);
             };
             stats.triangles = mesh.indices.len() / 3;
@@ -2745,6 +2816,90 @@ fn point_in_rect(rect: Option<Rect>, pos: (f32, f32)) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A monitored ASN2 preview build must emit `PreviewProgress` snapshots
+    /// through the local backend (meshing stage transitions report
+    /// unconditionally). Per-step run progress is covered by
+    /// `Project::run_monitored`'s own tests; the default project here has an
+    /// empty timeline, so it must report nothing.
+    #[test]
+    fn monitored_jobs_emit_progress() {
+        use std::sync::Mutex;
+
+        let sphere = volumetric_assets::get_model("simple_sphere_model")
+            .expect("bundled sphere model")
+            .bytes
+            .to_vec();
+        let request = PreviewRequest {
+            asset_id: "sphere".to_string(),
+            data: Arc::new(sphere),
+            type_hint: Some(volumetric::AssetTypeHint::Model),
+            precursor_ids: vec![],
+            plan: PreviewPlan::Model3d {
+                mesh: PreviewMeshPlan::AdaptiveSurfaceNets2 {
+                    target_resolution: 32,
+                    base_resolution: 8,
+                    max_depth: 2,
+                    settings: crate::Asn2Settings::default(),
+                },
+                color_channel: None,
+            },
+            wireframe: false,
+            show_grid: false,
+            show_bounds: false,
+            ssao: false,
+            ssao_radius: 0.5,
+            ssao_bias: 0.025,
+            ssao_strength: 1.0,
+            stale: false,
+        };
+        let job = PreviewBuildJob {
+            key: (&request).into(),
+            request,
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        let phases: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let result = execute_job_monitored(
+            BackgroundJob::BuildPreview(job),
+            &LocalBackend,
+            &|result| {
+                if let BackgroundResult::PreviewProgress { asset_id, progress } = result {
+                    assert_eq!(asset_id, "sphere");
+                    phases.lock().unwrap().push(progress.phase);
+                }
+            },
+        );
+        assert!(matches!(result, BackgroundResult::PreviewComplete(_)));
+        let phases = phases.into_inner().unwrap();
+        assert!(
+            phases.iter().any(|p| p.starts_with("refining")),
+            "expected a refinement phase, got {phases:?}"
+        );
+
+        let project = crate::VolumetricUiV2::default().project().clone();
+        let steps: Mutex<Vec<volumetric::BuildProgress>> = Mutex::new(Vec::new());
+        let result = execute_job_monitored(
+            BackgroundJob::RunProject {
+                generation: 1,
+                project,
+                cancel: Arc::new(AtomicBool::new(false)),
+            },
+            &LocalBackend,
+            &|result| {
+                if let BackgroundResult::RunProgress { progress, .. } = result {
+                    steps.lock().unwrap().push(progress);
+                }
+            },
+        );
+        assert!(matches!(
+            result,
+            BackgroundResult::ProjectComplete { result: Ok(_), .. }
+        ));
+        assert!(
+            steps.into_inner().unwrap().is_empty(),
+            "an empty timeline has no steps to report"
+        );
+    }
 
     /// The GPU-limit HUD warning names each dropped geometry class and the
     /// limit it hit.

@@ -28,7 +28,7 @@ use winit::window::{Window, WindowId};
 use crate::remote::RemoteBackend;
 use crate::session::{
     BackgroundJob, BackgroundResult, ExecutionBackend, JobQueue, LocalBackend, Session,
-    ViewportRenderParams, execute_job_with,
+    ViewportRenderParams, execute_job_monitored,
 };
 use crate::{ExecutorChoice, FileAction, VIEWPORT_KEY, VolumetricUiV2};
 
@@ -800,7 +800,9 @@ impl BackgroundWorker {
                     }
                     if let Some(job) = queue.pop()
                         && result_tx
-                            .send(execute_job_with(job, backend.as_ref()))
+                            .send(execute_job_monitored(job, backend.as_ref(), &|progress| {
+                                let _ = result_tx.send(progress);
+                            }))
                             .is_err()
                     {
                         break;
