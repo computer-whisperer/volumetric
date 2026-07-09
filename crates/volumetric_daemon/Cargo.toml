@@ -7,6 +7,13 @@ edition = "2024"
 name = "volumetric_daemon"
 path = "src/main.rs"
 
+[features]
+default = []
+# Serve the trunk-built v2 web UI (crates/volumetric_ui_v2/dist, embedded
+# at compile time) from the daemon's own origin. Build the dist first:
+#   cd crates/volumetric_ui_v2 && trunk build --release
+web-ui = ["dep:include_dir"]
+
 [dependencies]
 volumetric = { path = "../.." }
 volumetric_protocol = { path = "../volumetric_protocol" }
@@ -14,6 +21,7 @@ tiny_http = "0.12"
 serde = "1"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+include_dir = { version = "0.7", optional = true }
 
 [dev-dependencies]
 volumetric_protocol = { path = "../volumetric_protocol", features = ["client"] }

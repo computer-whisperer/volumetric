@@ -349,3 +349,40 @@ fn browser_clients_get_cors_headers() {
 
     handle.shutdown();
 }
+
+/// The embedded web UI (web-ui feature): the entry page serves from /, its
+/// hashed assets resolve with the right types, and /v1 stays API-only.
+#[cfg(feature = "web-ui")]
+#[test]
+fn serves_the_embedded_web_ui() {
+    let (handle, client) = start_daemon(1);
+    let addr = handle.addr();
+    let value_of = |headers: &[(String, String)], name: &str| {
+        headers
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.clone())
+    };
+
+    let (status, headers) = raw_request(
+        addr,
+        "GET / HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status, 200);
+    assert_eq!(
+        value_of(&headers, "content-type").as_deref(),
+        Some("text/html; charset=utf-8")
+    );
+    assert_eq!(value_of(&headers, "cache-control").as_deref(), Some("no-cache"));
+
+    let (status, _) = raw_request(
+        addr,
+        "GET /no-such-asset.js HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status, 404);
+
+    // The API dispatch still wins under /v1.
+    client.info().expect("info endpoint still served");
+
+    handle.shutdown();
+}

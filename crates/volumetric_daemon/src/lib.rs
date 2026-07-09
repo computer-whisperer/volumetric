@@ -189,6 +189,11 @@ fn handle_request(state: &Arc<DaemonState>, mut request: tiny_http::Request) {
             .with_header(header("Access-Control-Allow-Methods", "GET, POST, OPTIONS"))
             .with_header(header("Access-Control-Allow-Headers", "Content-Type"))
             .with_header(header("Access-Control-Max-Age", "86400")),
+        // Everything under /v1 is API; any other GET serves the embedded
+        // web UI (same origin as the API, so the UI's remote mode works
+        // with zero configuration and no CORS involvement).
+        #[cfg(feature = "web-ui")]
+        ("GET", segments) if segments.first() != Some(&"v1") => serve_web_ui(segments),
         _ => text_response(404, &format!("no such endpoint: {} {path}", method)),
     };
 
@@ -204,6 +209,46 @@ fn handle_request(state: &Arc<DaemonState>, mut request: tiny_http::Request) {
 fn header(name: &str, value: &str) -> tiny_http::Header {
     tiny_http::Header::from_bytes(name.as_bytes(), value.as_bytes())
         .expect("static header name/value")
+}
+
+/// The trunk-built v2 web UI, embedded at compile time by the `web-ui`
+/// feature (build `crates/volumetric_ui_v2/dist` with trunk first).
+#[cfg(feature = "web-ui")]
+static WEB_UI_DIST: include_dir::Dir<'_> =
+    include_dir::include_dir!("$CARGO_MANIFEST_DIR/../volumetric_ui_v2/dist");
+
+#[cfg(feature = "web-ui")]
+fn serve_web_ui(segments: &[&str]) -> HttpResponse {
+    let path = if segments.is_empty() {
+        "index.html".to_string()
+    } else {
+        segments.join("/")
+    };
+    let Some(file) = WEB_UI_DIST.get_file(&path) else {
+        return text_response(404, &format!("no such file: /{path}"));
+    };
+    let content_type = match path.rsplit_once('.').map(|(_, ext)| ext) {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") => "text/javascript",
+        // Must be exact for the browser's streaming wasm compilation.
+        Some("wasm") => "application/wasm",
+        Some("css") => "text/css",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("ico") => "image/x-icon",
+        _ => "application/octet-stream",
+    };
+    // Trunk content-hashes every asset except index.html: hashed files are
+    // immutable, the entry page must revalidate so a fresh deploy's hashes
+    // get picked up.
+    let cache = if path == "index.html" {
+        "no-cache"
+    } else {
+        "public, max-age=31536000, immutable"
+    };
+    tiny_http::Response::from_data(file.contents().to_vec())
+        .with_header(header("Content-Type", content_type))
+        .with_header(header("Cache-Control", cache))
 }
 
 fn read_body(request: &mut tiny_http::Request) -> std::io::Result<Vec<u8>> {

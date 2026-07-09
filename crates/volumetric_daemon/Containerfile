@@ -6,8 +6,16 @@
 # or just run crates/volumetric_daemon/build-push.sh.
 FROM docker.io/library/rust:1.96-bookworm AS builder
 WORKDIR /build
+# Trunk builds the v2 web UI bundle the daemon embeds (web-ui feature) and
+# serves from its own origin. Pinned to the version the workspace develops
+# against; trunk fetches wasm-bindgen/wasm-opt itself at build time.
+RUN rustup target add wasm32-unknown-unknown \
+ && curl -fsSL \
+    https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-unknown-linux-gnu.tar.gz \
+    | tar -xzf - -C /usr/local/bin trunk
 COPY . .
-RUN cargo build --release --locked -p volumetric_daemon
+RUN cd crates/volumetric_ui_v2 && trunk build --release
+RUN cargo build --release --locked -p volumetric_daemon --features web-ui
 
 FROM docker.io/library/debian:bookworm-slim
 # tini: the daemon installs no signal handlers, and PID 1 ignores default
