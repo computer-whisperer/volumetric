@@ -669,6 +669,100 @@ fn solve_inverse_frame(
     }
 }
 
+/// Smooth per-node distribution-matching objective for the gradient path:
+/// `J = sum_n (a_n - t_n)^2` over the active contact set, where `a_n` is
+/// node n's share of the achieved compressive force and `t_n` its share of
+/// the sampled target. Shares make J invariant to uniform stiffness
+/// scaling, matching the relative semantics of the column loop; the column
+/// TV distance stays the reported/converged metric.
+///
+/// Returns `(J, dJ/dR per active node)` where `R` is the raw contact-axis
+/// reaction (`a_n = -contact_sign * R_n / F`), i.e. exactly the quantity
+/// the adjoint differentiates.
+pub(crate) fn match_objective(
+    contact_force: &[f64],
+    active: &[usize],
+    contact_axis: usize,
+    contact_sign: f64,
+    targets: &[f64],
+) -> Result<(f64, Vec<(usize, f64)>), String> {
+    let f: Vec<f64> = active
+        .iter()
+        .map(|&n| -contact_sign * contact_force[n * 3 + contact_axis])
+        .collect();
+    let total_f: f64 = f.iter().sum();
+    let total_t: f64 = active.iter().map(|&n| targets[n]).sum();
+    if !(total_f > 0.0) {
+        return Err("no compressive contact force to match".to_string());
+    }
+    if !(total_t > 0.0) {
+        return Err("target is zero over the whole contact set".to_string());
+    }
+
+    let mut j = 0.0;
+    let mut coupling = 0.0; // sum_n (a_n - t_n) a_n
+    let shares: Vec<(f64, f64)> = active
+        .iter()
+        .zip(&f)
+        .map(|(&n, &force)| (force / total_f, targets[n] / total_t))
+        .collect();
+    for &(a, t) in &shares {
+        j += (a - t) * (a - t);
+        coupling += (a - t) * a;
+    }
+
+    let dj_dr = active
+        .iter()
+        .zip(&shares)
+        .map(|(&n, &(a, t))| {
+            let dj_df = 2.0 * ((a - t) - coupling) / total_f;
+            (n, -contact_sign * dj_df)
+        })
+        .collect();
+    Ok((j, dj_dr))
+}
+
+/// Per-strut gradient of `match_objective` via one adjoint solve: build the
+/// reaction-space gradient `ghat`, solve `K_ff lambda = (K ghat)|_f` under
+/// the forward solve's frozen active set, then per strut
+/// `dJ/ds_e = (ghat - lambda) . (K_e u_e) / s_e` (frame stiffness is linear
+/// in the scale).
+pub(crate) fn frame_match_gradient(
+    model: &crate::frame::FrameModel,
+    internals: &crate::SolveInternals,
+    dj_dreaction: &[(usize, f64)],
+    contact_axis: usize,
+    scales: &[f64],
+    config: &SolveConfig,
+) -> Result<Vec<f64>, String> {
+    let n = internals.u.len();
+    let dpn = internals.dpn;
+    let mut ghat = vec![0.0f64; n];
+    for &(node, g) in dj_dreaction {
+        ghat[node * dpn + contact_axis] = g;
+    }
+    let lambda = crate::adjoint_solve(model, internals, &ghat, config)?;
+
+    let mut w = ghat;
+    for (wi, li) in w.iter_mut().zip(&lambda) {
+        *wi -= li;
+    }
+    let mut grad = vec![0.0f64; scales.len()];
+    for (e, g) in grad.iter_mut().enumerate() {
+        let q = model.strut_end_forces(e, &internals.u);
+        let nodes = model.strut_nodes(e);
+        let mut dot = 0.0;
+        for block in 0..4 {
+            let off = nodes[block / 2] as usize * dpn + (block % 2) * 3;
+            for c in 0..3 {
+                dot += w[off + c] * q[block * 3 + c];
+            }
+        }
+        *g = dot / scales[e];
+    }
+    Ok(grad)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -806,6 +900,89 @@ mod tests {
             low_z > 1.5 * high_z,
             "expected stiffer columns at low z: low {low_z}, high {high_z}"
         );
+    }
+
+    /// The linchpin of the adjoint path: dJ/ds from `frame_match_gradient`
+    /// must match central finite differences of the objective through the
+    /// full contact solve. Catches sign, dof-order, and active-set-handling
+    /// errors that no structural test would.
+    #[test]
+    fn adjoint_gradient_matches_finite_differences() {
+        let mut mesh = strut_grid(6, 6, 3, 0.2, 0.02);
+        // Non-uniform scales so dK/ds is exercised away from 1.0, and an
+        // asymmetric target so gradients don't cancel by symmetry.
+        let count = mesh.element_count();
+        let scales: Vec<f64> = (0..count).map(|e| 0.4 + 0.6 * ((e * 7) % 10) as f64 / 10.0).collect();
+        set_scale_field(&mut mesh, &scales);
+        let node_targets: Vec<f64> = (0..mesh.node_count())
+            .map(|n| 1.0 + mesh.node_position(n)[0])
+            .collect();
+
+        let config = SolveConfig {
+            material: Material {
+                youngs_modulus: 1.0,
+                poissons_ratio: 0.3,
+            },
+            fixed_boundary: FixedBoundary::ZMin,
+            cg_tolerance: 1e-12,
+            ..Default::default()
+        };
+        let mut objective = |scales: &[f64]| -> (f64, usize) {
+            let mut work = mesh.clone();
+            set_scale_field(&mut work, scales);
+            let (result, _, internals) =
+                crate::solve_frame_internal(&work, &mut plate(0.55), &config).unwrap();
+            assert!(result.stats.converged);
+            let (j, _) = match_objective(
+                &result.contact_force,
+                &internals.active,
+                2,
+                1.0,
+                &node_targets,
+            )
+            .unwrap();
+            (j, internals.active.len())
+        };
+
+        // Adjoint gradient at the base point.
+        let (result, model, internals) =
+            crate::solve_frame_internal(&mesh, &mut plate(0.55), &config).unwrap();
+        let (_, dj_dr) = match_objective(
+            &result.contact_force,
+            &internals.active,
+            2,
+            1.0,
+            &node_targets,
+        )
+        .unwrap();
+        let grad = frame_match_gradient(&model, &internals, &dj_dr, 2, &scales, &config).unwrap();
+        let gmax = grad.iter().map(|g| g.abs()).fold(0.0f64, f64::max);
+        assert!(gmax > 0.0, "gradient is identically zero");
+
+        // Central differences on a spread of struts (top laterals, deep
+        // verticals, everything between via the stride).
+        let (_, base_active) = objective(&scales);
+        let eps = 1e-5;
+        for e in (0..count).step_by(count / 9) {
+            let mut plus = scales.clone();
+            plus[e] += eps;
+            let mut minus = scales.clone();
+            minus[e] -= eps;
+            let (jp, ap) = objective(&plus);
+            let (jm, am) = objective(&minus);
+            assert_eq!(
+                (ap, am),
+                (base_active, base_active),
+                "active set changed under perturbation of strut {e}"
+            );
+            let fd = (jp - jm) / (2.0 * eps);
+            let denom = fd.abs().max(grad[e].abs()).max(1e-4 * gmax);
+            assert!(
+                ((fd - grad[e]) / denom).abs() < 2e-2,
+                "strut {e}: fd {fd:.6e} vs adjoint {:.6e}",
+                grad[e]
+            );
+        }
     }
 
     #[test]

@@ -264,6 +264,31 @@ impl FrameModel {
         out
     }
 
+    /// The strut's global-frame internal end forces `K_e u_e` at the global
+    /// solution `x` (dof order as `element_stiffness`: node0 translations,
+    /// node0 rotations, node1 translations, node1 rotations). Since every
+    /// stiffness coefficient is linear in the strut's `stiffness_scale`,
+    /// `dK_e/ds_e u = strut_end_forces(e, u) / s_e` — the element factor of
+    /// the adjoint gradient.
+    pub(crate) fn strut_end_forces(&self, e: usize, x: &[f64]) -> [f64; 12] {
+        let s = &self.struts[e];
+        let local = self.gather_local(s, x);
+        let f = local_forces(s, &local);
+        let mut out = [0.0f64; 12];
+        for (block, fl) in f.iter().enumerate() {
+            for col in 0..3 {
+                out[block * 3 + col] =
+                    s.r[0][col] * fl[0] + s.r[1][col] * fl[1] + s.r[2][col] * fl[2];
+            }
+        }
+        out
+    }
+
+    /// Cross-section volume `A * L` of one strut.
+    pub(crate) fn strut_volume(&self, e: usize) -> f64 {
+        self.struts[e].volume
+    }
+
     /// Gather a strut's four dof blocks from the global vector, rotated
     /// into the strut frame.
     fn gather_local(&self, s: &Strut, x: &[f64]) -> [[f64; 3]; 4] {
@@ -505,7 +530,6 @@ mod tests {
 
     /// A cubic lattice: nodes on an n^3 grid, struts along the three axis
     /// directions — representative strut-mesh topology for apply scaling.
-    #[cfg(feature = "parallel")]
     fn cubic_lattice(n: usize) -> FeaMesh {
         let idx = |i: usize, j: usize, k: usize| (i * n * n + j * n + k) as u32;
         let mut node_positions = Vec::new();
@@ -814,6 +838,35 @@ mod tests {
                         "node {node} block[{row}][{col}]: probed {expected} vs {got}"
                     );
                 }
+            }
+        }
+    }
+
+    /// `strut_end_forces` must equal `element_stiffness . u_e` under the
+    /// documented dof order — the adjoint gradient assembly leans on both
+    /// the values and the ordering.
+    #[test]
+    fn strut_end_forces_match_element_stiffness() {
+        let mesh = cubic_lattice(2);
+        let model = FrameModel::new(&mesh, material()).unwrap();
+        let n = mesh.node_count() * 6;
+        let x: Vec<f64> = (0..n).map(|i| ((i * 13 % 17) as f64 - 8.0) / 8.0).collect();
+        for e in (0..model.strut_count()).step_by(3) {
+            let q = model.strut_end_forces(e, &x);
+            let ke = model.element_stiffness(e);
+            let nodes = model.strut_nodes(e);
+            let mut xe = [0.0f64; 12];
+            for block in 0..4 {
+                let off = nodes[block / 2] as usize * 6 + (block % 2) * 3;
+                xe[block * 3..block * 3 + 3].copy_from_slice(&x[off..off + 3]);
+            }
+            for row in 0..12 {
+                let expect: f64 = (0..12).map(|col| ke[row][col] * xe[col]).sum();
+                assert!(
+                    (q[row] - expect).abs() < 1e-12 * expect.abs().max(1.0),
+                    "strut {e} row {row}: {} vs {expect}",
+                    q[row]
+                );
             }
         }
     }

@@ -538,6 +538,31 @@ fn solve_cg(
     tolerance: f64,
     max_iterations: usize,
 ) -> (usize, bool) {
+    // External forces are zero; the Dirichlet values in `u` drive.
+    solve_cg_system(
+        model,
+        constrained,
+        precond,
+        None,
+        u,
+        tolerance,
+        max_iterations,
+    )
+}
+
+/// Preconditioned CG for `K x = rhs` on the free dofs, holding constrained
+/// dofs at their current `x` values (`None` rhs means zero). Returns
+/// (iterations, converged).
+fn solve_cg_system(
+    model: &dyn StiffnessModel,
+    constrained: &[bool],
+    precond: &Precond,
+    rhs: Option<&[f64]>,
+    x: &mut [f64],
+    tolerance: f64,
+    max_iterations: usize,
+) -> (usize, bool) {
+    let u = x;
     let n = u.len();
     let masked_apply = |x: &[f64], y: &mut [f64]| {
         model.apply(x, y);
@@ -548,10 +573,14 @@ fn solve_cg(
         }
     };
     let mut r = vec![0.0; n];
-    // r = -K u on free dofs (external forces are zero; Dirichlet drives).
+    // r = (rhs - K x) on free dofs.
     model.apply(u, &mut r);
     for i in 0..n {
-        r[i] = if constrained[i] { 0.0 } else { -r[i] };
+        r[i] = if constrained[i] {
+            0.0
+        } else {
+            rhs.map_or(0.0, |b| b[i]) - r[i]
+        };
     }
 
     let norm0: f64 = r.iter().map(|v| v * v).sum::<f64>().sqrt();
@@ -681,13 +710,85 @@ pub fn solve(
                 scales,
                 h,
             };
-            contact_solve(mesh, &model, None, rigid, config)
+            Ok(contact_solve(mesh, &model, None, rigid, config)?.0)
         }
         FeaElementKind::Bar2 => {
             let model = frame::FrameModel::new(mesh, config.material)?;
-            contact_solve(mesh, &model, Some(&model), rigid, config)
+            Ok(contact_solve(mesh, &model, Some(&model), rigid, config)?.0)
         }
     }
+}
+
+/// Everything the converged contact state exposes beyond the result fields
+/// — what an adjoint solve needs to differentiate through the (frozen)
+/// active set: the full dof-space solution, the constraint mask it was
+/// solved under, and the active contact nodes.
+pub(crate) struct SolveInternals {
+    /// Full dof-space solution (dpn dofs per node, prescribed values
+    /// included).
+    pub(crate) u: Vec<f64>,
+    /// Per-dof constraint mask at convergence (fixed face + active
+    /// contacts).
+    pub(crate) constrained: Vec<bool>,
+    /// Active contact node indices.
+    pub(crate) active: Vec<usize>,
+    pub(crate) dpn: usize,
+}
+
+/// The Bar2 forward solve, keeping the pieces the inverse gradient needs:
+/// the frame model (element stiffness access) and the converged contact
+/// state. Mirrors what `solve` does for Bar2.
+pub(crate) fn solve_frame_internal(
+    mesh: &FeaMesh,
+    rigid: &mut dyn RigidBody,
+    config: &SolveConfig,
+) -> Result<(SolveResult, frame::FrameModel, SolveInternals), String> {
+    mesh.validate()?;
+    let nu = config.material.poissons_ratio;
+    if !(-1.0 < nu && nu < 0.5) {
+        return Err(format!("Poisson's ratio {nu} outside (-1, 0.5)"));
+    }
+    let model = frame::FrameModel::new(mesh, config.material)?;
+    let (result, internals) = contact_solve(mesh, &model, Some(&model), rigid, config)?;
+    Ok((result, model, internals))
+}
+
+/// Solve the adjoint system `K_ff lambda_f = (K ghat)|_f`, `lambda = 0` on
+/// constrained dofs — the same operator, constraint mask, and
+/// preconditioner family as the forward solve's final contact iteration.
+/// With it, dJ/ds_e = (ghat - lambda)^T (dK_e/ds_e) u for any objective
+/// whose reaction-space gradient is `ghat` (zero off the reaction dofs).
+pub(crate) fn adjoint_solve(
+    model: &dyn StiffnessModel,
+    internals: &SolveInternals,
+    ghat: &[f64],
+    config: &SolveConfig,
+) -> Result<Vec<f64>, String> {
+    let n = internals.u.len();
+    let mut rhs = vec![0.0f64; n];
+    model.apply(ghat, &mut rhs);
+    let diag = model.diagonal();
+    let blocks = model.node_blocks();
+    let precond = Precond::build(
+        &diag,
+        blocks.as_deref(),
+        internals.dpn,
+        &internals.constrained,
+    );
+    let mut lambda = vec![0.0f64; n];
+    let (_, converged) = solve_cg_system(
+        model,
+        &internals.constrained,
+        &precond,
+        Some(&rhs),
+        &mut lambda,
+        config.cg_tolerance,
+        config.cg_max_iterations,
+    );
+    if !converged {
+        return Err("adjoint CG did not converge".to_string());
+    }
+    Ok(lambda)
 }
 
 /// The active-set contact driver: element-kind-independent, working on the
@@ -703,7 +804,7 @@ fn contact_solve(
     frame: Option<&frame::FrameModel>,
     rigid: &mut dyn RigidBody,
     config: &SolveConfig,
-) -> Result<SolveResult, String> {
+) -> Result<(SolveResult, SolveInternals), String> {
     let dpn = model.dofs_per_node();
     let node_count = mesh.node_count();
     let n = node_count * dpn;
@@ -902,7 +1003,7 @@ fn contact_solve(
 
     // Split the solution into translations (+ rotations for 6-dof models).
     let (displacement, rotation) = if dpn == 3 {
-        (u, None)
+        (u.clone(), None)
     } else {
         let mut translations = Vec::with_capacity(node_count * 3);
         let mut rotations = Vec::with_capacity(node_count * 3);
@@ -914,13 +1015,22 @@ fn contact_solve(
         (translations, Some(rotations))
     };
 
-    Ok(SolveResult {
-        displacement,
-        rotation,
-        contact_force,
-        strain_energy_density,
-        stats,
-    })
+    let internals = SolveInternals {
+        u,
+        constrained,
+        active: active.keys().copied().collect(),
+        dpn,
+    };
+    Ok((
+        SolveResult {
+            displacement,
+            rotation,
+            contact_force,
+            strain_energy_density,
+            stats,
+        },
+        internals,
+    ))
 }
 
 #[cfg(test)]
