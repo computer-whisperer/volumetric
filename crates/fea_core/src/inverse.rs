@@ -329,6 +329,17 @@ fn solve_inverse_hex(
             .map(|(c, f)| (*c, (col_target[c] / total_target) / (f / total_force)))
             .collect();
 
+        // Set FEA_INVERSE_DEBUG=1 to watch the outer fixed point: error
+        // descending = keep iterating; error frozen with a large floored
+        // share = min_scale is binding (lower it).
+        if std::env::var("FEA_INVERSE_DEBUG").is_ok() {
+            let floored = scales.iter().filter(|s| **s <= config.min_scale).count();
+            eprintln!(
+                "inverse iter {iterations}: error={distribution_error:.4} floored={floored}/{}",
+                scales.len(),
+            );
+        }
+
         let converged = distribution_error <= config.tolerance;
         if converged || iterations >= config.max_iterations {
             // Per-node target force, comparable to the achieved contact
@@ -548,6 +559,17 @@ fn solve_inverse_frame(
             .iter()
             .map(|(c, f)| (*c, (col_target[c] / total_target) / (f / total_force)))
             .collect();
+
+        // Set FEA_INVERSE_DEBUG=1 to watch the outer fixed point: error
+        // descending = keep iterating; error frozen with a large floored
+        // share = min_scale is binding (lower it).
+        if std::env::var("FEA_INVERSE_DEBUG").is_ok() {
+            let floored = scales.iter().filter(|s| **s <= config.min_scale).count();
+            eprintln!(
+                "inverse iter {iterations}: error={distribution_error:.4} floored={floored}/{}",
+                scales.len(),
+            );
+        }
 
         let converged = distribution_error <= config.tolerance;
         if converged || iterations >= config.max_iterations {

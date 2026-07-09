@@ -153,10 +153,19 @@ fn main() {
             preconditioner,
             ..Default::default()
         },
-        max_iterations: config.max_iterations as usize,
+        // PROFILE_MAX_ITER / PROFILE_MIN_SCALE override the project's
+        // inverse-loop knobs (convergence experiments without editing the
+        // project file).
+        max_iterations: std::env::var("PROFILE_MAX_ITER")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(config.max_iterations as usize),
         tolerance: config.tolerance,
         exponent: config.exponent,
-        min_scale: config.min_scale,
+        min_scale: std::env::var("PROFILE_MIN_SCALE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(config.min_scale),
         column_size: config.column_size,
     };
 
