@@ -7,6 +7,13 @@ edition = "2024"
 default = []
 # Blocking HTTP client for talking to a volumetric_daemon.
 client = ["dep:ureq"]
+# Browser fetch client (async), for wasm32 UI builds.
+web-client = [
+    "dep:wasm-bindgen",
+    "dep:wasm-bindgen-futures",
+    "dep:js-sys",
+    "dep:web-sys",
+]
 
 [dependencies]
 # Types only (Project, AssetTypeHint, mesh configs) — no wasm backend, so
@@ -18,3 +25,15 @@ ciborium = "0.2"
 thiserror = "2"
 # Plain-HTTP client (no TLS): the daemon speaks cleartext on a trusted network.
 ureq = { version = "2", default-features = false, optional = true }
+
+# Browser fetch client, enabled by the `web-client` feature.
+wasm-bindgen = { version = "0.2", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+js-sys = { version = "0.3", optional = true }
+web-sys = { version = "0.3", optional = true, features = [
+    "Window",
+    "Request",
+    "RequestInit",
+    "Response",
+    "Headers",
+] }

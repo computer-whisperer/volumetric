@@ -42,10 +42,20 @@ use volumetric::adaptive_surface_nets_2::{AdaptiveMeshConfig2, MeshingStats2};
 pub use volumetric::BuildProgress;
 use volumetric::{AssetTypeHint, LoadedAsset, Project};
 
+#[cfg(any(feature = "client", feature = "web-client"))]
+mod error;
+#[cfg(any(feature = "client", feature = "web-client"))]
+pub use error::ClientError;
+
 #[cfg(feature = "client")]
 mod client;
 #[cfg(feature = "client")]
-pub use client::{ClientError, DaemonClient};
+pub use client::DaemonClient;
+
+#[cfg(feature = "web-client")]
+mod web_client;
+#[cfg(feature = "web-client")]
+pub use web_client::WebDaemonClient;
 
 /// Bumped whenever a message shape changes incompatibly. Clients compare
 /// against [`DaemonInfo::protocol_version`] before submitting work.
