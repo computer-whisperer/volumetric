@@ -1815,6 +1815,46 @@ pub fn build_preview_scene_monitored(
     backend: &dyn ExecutionBackend,
     progress: &dyn Fn(volumetric::BuildProgress),
 ) -> Result<Option<PreviewEntity>, String> {
+    match preview_prelude(request, cancel)? {
+        None => Ok(None),
+        Some(PreviewStage::Done(entity)) => Ok(Some(*entity)),
+        Some(PreviewStage::NeedsMesh(pending)) => {
+            let Some(mesh) =
+                backend.mesh_model(request.data.as_slice(), &pending.config, cancel, progress)?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(preview_postlude(request, pending, mesh)))
+        }
+    }
+}
+
+/// Output of [`preview_prelude`]: either a finished preview, or an ASN2
+/// plan whose meshing pass the caller must run — through
+/// [`ExecutionBackend::mesh_model`] on a worker thread natively, or an
+/// awaited daemon fetch on the web — before finishing with
+/// [`preview_postlude`]. Split this way so the single-threaded web shell
+/// can suspend at the one point that crosses the wire.
+pub enum PreviewStage {
+    Done(Box<PreviewEntity>),
+    NeedsMesh(PendingMesh),
+}
+
+/// The ASN2 meshing request plus everything the postlude needs to finish
+/// the preview once a mesh exists.
+pub struct PendingMesh {
+    pub config: volumetric::adaptive_surface_nets_2::AdaptiveMeshConfig2,
+    color_channel: Option<String>,
+    stats: OutputStats,
+    build_start: web_time::Instant,
+}
+
+/// Everything of a preview build except the ASN2 meshing pass. `Ok(None)`
+/// means the cancel flag was observed.
+pub fn preview_prelude(
+    request: &PreviewRequest,
+    cancel: &AtomicBool,
+) -> Result<Option<PreviewStage>, String> {
     let build_start = web_time::Instant::now();
     let mut stats = OutputStats::default();
 
@@ -1822,20 +1862,22 @@ pub fn build_preview_scene_monitored(
         return Ok(None);
     }
 
+    let done = |entity: PreviewEntity| Some(PreviewStage::Done(Box::new(entity)));
+
     // Explicit mesh values are data, not sampleable models: draw them
     // directly, ignoring the model mesh plans.
     if request.type_hint == Some(AssetTypeHint::FeaMesh) {
-        return build_fea_mesh_preview(request, build_start).map(Some);
+        return build_fea_mesh_preview(request, build_start).map(done);
     }
     if request.type_hint == Some(AssetTypeHint::TriMesh) {
-        return build_tri_mesh_preview(request, build_start).map(Some);
+        return build_tri_mesh_preview(request, build_start).map(done);
     }
 
     // 2D sketches get a flat raster preview; the 3D mesh plans don't apply.
     let dims = volumetric::model_dimensions_from_bytes(request.data.as_slice())
         .map_err(format_error_chain)?;
     if dims == 2 {
-        return build_sketch_preview(request, build_start).map(Some);
+        return build_sketch_preview(request, build_start).map(done);
     }
 
     // The plan normally matches the runtime dimensionality (the UI probes
@@ -1852,7 +1894,7 @@ pub fn build_preview_scene_monitored(
             (&fallback_plan, None)
         }
     };
-    let (mut scene, wireframe_lines, bounds_min, bounds_max) = match mesh_plan {
+    let (scene, wireframe_lines, bounds_min, bounds_max) = match mesh_plan {
         PreviewMeshPlan::PointCloud { resolution } => {
             let (points, bounds_min, bounds_max) =
                 volumetric::sample_model_from_bytes(request.data.as_slice(), *resolution)
@@ -1896,36 +1938,81 @@ pub fn build_preview_scene_monitored(
             let config = mesh_plan
                 .adaptive_surface_nets_config()
                 .ok_or_else(|| "missing adaptive surface nets config".to_string())?;
-            let Some(mesh) =
-                backend.mesh_model(request.data.as_slice(), &config, cancel, progress)?
-            else {
-                return Ok(None);
-            };
-            stats.triangles = mesh.indices.len() / 3;
-            stats.samples = mesh.stats.total_samples;
-            stats.detail = asn2_stage_lines(&mesh.stats);
-            let vertices: Vec<renderer::MeshVertex> = mesh
-                .vertices
-                .iter()
-                .zip(mesh.normals.iter())
-                .map(|(position, normal)| {
-                    renderer::MeshVertex::new((*position).into(), (*normal).into())
-                })
-                .collect();
-            let wireframe = mesh_edge_lines(&vertices, Some(&mesh.indices));
-            let mut scene = renderer::SceneData::new();
-            scene.add_mesh(
-                renderer::MeshData {
-                    vertices,
-                    indices: Some(mesh.indices),
-                },
-                glam::Mat4::IDENTITY,
-                renderer::MaterialId(0),
-            );
-            (scene, Some(wireframe), mesh.bounds_min, mesh.bounds_max)
+            return Ok(Some(PreviewStage::NeedsMesh(PendingMesh {
+                config,
+                color_channel: color_channel.map(str::to_string),
+                stats,
+                build_start,
+            })));
         }
     };
 
+    Ok(Some(PreviewStage::Done(Box::new(finish_preview_scene(
+        request,
+        scene,
+        wireframe_lines,
+        (bounds_min, bounds_max),
+        color_channel.map(str::to_string),
+        stats,
+        build_start,
+    )))))
+}
+
+/// Finishes a preview once the ASN2 mesh exists: scene assembly plus the
+/// shared colormap/stats tail. Purely local — the pending state carries
+/// everything the prelude gathered.
+pub fn preview_postlude(
+    request: &PreviewRequest,
+    pending: PendingMesh,
+    mesh: volumetric::AdaptiveMeshV2Result,
+) -> PreviewEntity {
+    let PendingMesh {
+        config: _,
+        color_channel,
+        mut stats,
+        build_start,
+    } = pending;
+    stats.triangles = mesh.indices.len() / 3;
+    stats.samples = mesh.stats.total_samples;
+    stats.detail = asn2_stage_lines(&mesh.stats);
+    let vertices: Vec<renderer::MeshVertex> = mesh
+        .vertices
+        .iter()
+        .zip(mesh.normals.iter())
+        .map(|(position, normal)| renderer::MeshVertex::new((*position).into(), (*normal).into()))
+        .collect();
+    let wireframe = mesh_edge_lines(&vertices, Some(&mesh.indices));
+    let mut scene = renderer::SceneData::new();
+    scene.add_mesh(
+        renderer::MeshData {
+            vertices,
+            indices: Some(mesh.indices),
+        },
+        glam::Mat4::IDENTITY,
+        renderer::MaterialId(0),
+    );
+    finish_preview_scene(
+        request,
+        scene,
+        Some(wireframe),
+        (mesh.bounds_min, mesh.bounds_max),
+        color_channel,
+        stats,
+        build_start,
+    )
+}
+
+/// The tail every 3D preview shares: channel discovery + colormap, timing,
+/// and entity assembly.
+fn finish_preview_scene(
+    request: &PreviewRequest,
+    mut scene: renderer::SceneData,
+    wireframe_lines: Option<renderer::LineData>,
+    (bounds_min, bounds_max): ((f32, f32, f32), (f32, f32, f32)),
+    color_channel: Option<String>,
+    mut stats: OutputStats,
+    build_start: web_time::Instant,
+) -> PreviewEntity {
     // Channel discovery + colormap: mirror the declared channels into the
     // stats (feeds the "Color by" picker and the slice lightbox), and when
     // a channel is selected, colormap the built points/vertices by sampling
@@ -1937,7 +2024,7 @@ pub fn build_preview_scene_monitored(
                 .sample_format()
                 .map(|format| format.channels.iter().map(|c| c.name.clone()).collect())
                 .unwrap_or_default();
-            if let Some(channel) = color_channel {
+            if let Some(channel) = &color_channel {
                 match colormap_scene_by_channel(&mut scene, &mut executor, channel) {
                     Ok((value_min, value_max)) => stats.detail.push(format!(
                         "Color: {channel} in [{value_min:.4}, {value_max:.4}]"
@@ -1954,7 +2041,7 @@ pub fn build_preview_scene_monitored(
     }
 
     stats.mesh_ms = build_start.elapsed().as_secs_f64() * 1000.0;
-    Ok(Some(PreviewEntity {
+    PreviewEntity {
         scene,
         bounds: PreviewBounds {
             min: bounds_min,
@@ -1962,7 +2049,7 @@ pub fn build_preview_scene_monitored(
         },
         stats,
         wireframe_lines,
-    }))
+    }
 }
 
 /// Colormaps every point instance and mesh vertex of a built preview scene
