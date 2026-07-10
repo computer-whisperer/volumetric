@@ -68,7 +68,25 @@ fn crate_version(crate_dir: &std::path::Path) -> String {
         .unwrap_or_else(|| panic!("no version in {}", manifest.display()))
 }
 
+/// Reports a missing wasm artifact. Normally a warning (dev builds often
+/// don't need the bundle — tests, check builds), but release packaging must
+/// not silently ship an empty library: with VOLUMETRIC_ASSETS_REQUIRE set
+/// (the daemon Containerfile sets it), a missing file fails the build.
+fn missing(wasm_path: &std::path::Path, kind: &str, name: &str) {
+    if env::var_os("VOLUMETRIC_ASSETS_REQUIRE").is_some() {
+        panic!(
+            "{kind} '{name}' not found at {} but VOLUMETRIC_ASSETS_REQUIRE is set — run `cargo build-wasm` first",
+            wasm_path.display()
+        );
+    }
+    println!(
+        "cargo:warning=WASM file not found: {}. {kind} '{name}' will not be bundled.",
+        wasm_path.display()
+    );
+}
+
 fn main() {
+    println!("cargo:rerun-if-env-changed=VOLUMETRIC_ASSETS_REQUIRE");
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
 
@@ -104,11 +122,7 @@ fn main() {
                     wasm_path.display()
                 ));
             } else {
-                println!(
-                    "cargo:warning=WASM file not found: {}. Model '{}' will not be bundled.",
-                    wasm_path.display(),
-                    name
-                );
+                missing(&wasm_path, "Model", name);
             }
         }
 
@@ -135,11 +149,7 @@ fn main() {
                     wasm_path.display()
                 ));
             } else {
-                println!(
-                    "cargo:warning=WASM file not found: {}. Operator '{}' will not be bundled.",
-                    wasm_path.display(),
-                    name
-                );
+                missing(&wasm_path, "Operator", name);
             }
         }
 

@@ -14,6 +14,14 @@ RUN rustup target add wasm32-unknown-unknown \
     https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-unknown-linux-gnu.tar.gz \
     | tar -xzf - -C /usr/local/bin trunk
 COPY . .
+# The built-in model/operator library is embedded at compile time:
+# volumetric_assets/build.rs include_bytes!()es whatever exists in
+# target/wasm32-unknown-unknown/release/ and skips what doesn't. A clean
+# checkout has none, so without this step the web UI ships with an empty
+# Add menu. VOLUMETRIC_ASSETS_REQUIRE turns that skip into a build failure
+# so the image can never silently regress to an empty library.
+ENV VOLUMETRIC_ASSETS_REQUIRE=1
+RUN cargo build-wasm
 RUN cd crates/volumetric_ui_v2 && trunk build --release
 RUN cargo build --release --locked -p volumetric_daemon --features web-ui
 
