@@ -38,6 +38,8 @@ pub mod host;
 // RemoteBackend inside is native-only.
 pub mod remote;
 pub mod session;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod settings;
 #[cfg(all(target_arch = "wasm32", feature = "web"))]
 pub mod web_host;
 

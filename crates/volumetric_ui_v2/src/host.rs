@@ -15,7 +15,9 @@ use std::sync::{
 };
 use std::thread;
 
+use damascene_core::clipboard;
 use damascene_core::prelude::*;
+use damascene_core::widgets::text_input::{self, ClipboardKind};
 use damascene_wgpu::Runner;
 use damascene_winit_wgpu::host::input::{key_modifiers, map_key, pointer_button, winit_cursor};
 use volumetric::Project;
@@ -30,13 +32,32 @@ use crate::session::{
     BackgroundJob, BackgroundResult, ExecutionBackend, JobQueue, LocalBackend, Session,
     ViewportRenderParams, execute_job_monitored,
 };
+use crate::settings::UiSettings;
 use crate::{ExecutorChoice, FileAction, VIEWPORT_KEY, VolumetricUiV2};
 
 pub fn run(
     title: &'static str,
     viewport: Rect,
-    app: VolumetricUiV2,
+    mut app: VolumetricUiV2,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Load persisted preferences before the window exists so the initial
+    // window size and executor choice honor them. `viewport` is the
+    // caller's fallback for a first run with no recorded size.
+    let settings_path = UiSettings::config_path();
+    let last_settings = settings_path.as_deref().and_then(UiSettings::load);
+    let mut viewport = viewport;
+    if let Some(loaded) = &last_settings {
+        loaded.apply(&mut app);
+        if loaded.window_width > 0 && loaded.window_height > 0 {
+            viewport = Rect::new(
+                0.0,
+                0.0,
+                loaded.window_width as f32,
+                loaded.window_height as f32,
+            );
+        }
+    }
+
     let event_loop = EventLoop::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
     let mut host = Host {
@@ -50,6 +71,11 @@ pub fn run(
         pending_resize: None,
         worker: BackgroundWorker::new(Arc::new(LocalBackend)),
         files: FileWorker::new(proxy),
+        clipboard: arboard::Clipboard::new().ok(),
+        last_selection: Selection::default(),
+        last_primary: String::new(),
+        settings_path,
+        last_settings,
     };
     event_loop.run_app(&mut host)?;
     Ok(())
@@ -68,6 +94,18 @@ struct Host {
     worker: BackgroundWorker,
     /// Per-action worker threads for file dialogs and disk I/O.
     files: FileWorker,
+    /// Best-effort native clipboard. Initialization can fail (headless,
+    /// missing portal); text copy/cut/paste degrade to no-ops then.
+    clipboard: Option<arboard::Clipboard>,
+    /// Selection last mirrored to the Linux primary buffer, with the text
+    /// that was synced — dedups the per-frame sync in `redraw`.
+    last_selection: Selection,
+    last_primary: String,
+    /// Where preferences persist; `None` when the platform has no config
+    /// dir. `last_settings` is the snapshot already on disk, so `redraw`
+    /// only rewrites the file when something changed.
+    settings_path: Option<PathBuf>,
+    last_settings: Option<UiSettings>,
 }
 
 struct Gfx {
@@ -248,6 +286,8 @@ impl ApplicationHandler for Host {
                                 for event in
                                     gfx.damascene.pointer_down(Pointer::mouse(lx, ly, button))
                                 {
+                                    let event =
+                                        attach_primary_selection_text(event, &mut self.clipboard);
                                     dispatch_event(&mut self.app, &gfx.damascene, event);
                                 }
                             }
@@ -302,7 +342,30 @@ impl ApplicationHandler for Host {
                                 gfx.damascene
                                     .key_down(key, self.modifiers, key_event.repeat)
                             {
-                                dispatch_event(&mut self.app, &gfx.damascene, event);
+                                match text_input::clipboard_request(&event) {
+                                    Some(ClipboardKind::Copy) => {
+                                        copy_current_selection(&gfx.damascene, &mut self.clipboard);
+                                        dispatch_event(&mut self.app, &gfx.damascene, event);
+                                    }
+                                    Some(ClipboardKind::Cut) => {
+                                        copy_current_selection(&gfx.damascene, &mut self.clipboard);
+                                        let delete = clipboard::delete_selection_event(event);
+                                        dispatch_event(&mut self.app, &gfx.damascene, delete);
+                                    }
+                                    Some(ClipboardKind::Paste) => {
+                                        // No clipboard text: fall through with the raw
+                                        // key event so the widget can ignore it.
+                                        let event = match paste_text_from_clipboard(
+                                            event.clone(),
+                                            &mut self.clipboard,
+                                        ) {
+                                            Some(paste) => paste,
+                                            None => event,
+                                        };
+                                        dispatch_event(&mut self.app, &gfx.damascene, event);
+                                    }
+                                    None => dispatch_event(&mut self.app, &gfx.damascene, event),
+                                }
                             }
                         }
                         if let Some(text) = &key_event.text
@@ -389,6 +452,18 @@ impl Host {
             }
         }
 
+        // Persist preference changes: snapshot the persisted subset and
+        // rewrite the file when it differs from what's on disk. Saves are a
+        // few hundred bytes through tmp+rename, so writing on every changed
+        // frame (address keystrokes, panel drags) is fine.
+        if let Some(path) = self.settings_path.as_deref() {
+            let snapshot = UiSettings::from_app(&self.app, gfx.config.width, gfx.config.height);
+            if self.last_settings.as_ref() != Some(&snapshot) {
+                snapshot.save(path);
+                self.last_settings = Some(snapshot);
+            }
+        }
+
         let scale_factor = gfx.window.scale_factor() as f32;
         let preview_requests = self.app.preview_requests();
         for job in gfx.session.sync(
@@ -409,7 +484,25 @@ impl Host {
 
         gfx.damascene.set_theme(theme);
         gfx.damascene.set_hotkeys(self.app.hotkeys());
-        gfx.damascene.set_selection(self.app.selection());
+        let selection = self.app.selection();
+        if selection != self.last_selection {
+            self.last_selection = selection.clone();
+            // Mirror the new selection's text into the Linux primary buffer
+            // (middle-click paste). Reading it here, one frame event batch
+            // late at worst, matches what `prepare` is about to draw.
+            let text = gfx
+                .damascene
+                .selected_text_for(&self.last_selection)
+                .filter(|s| !s.is_empty())
+                .unwrap_or_default();
+            if text != self.last_primary {
+                if !text.is_empty() {
+                    primary::set(&mut self.clipboard, &text);
+                }
+                self.last_primary = text;
+            }
+        }
+        gfx.damascene.set_selection(selection);
         gfx.damascene.push_toasts(self.app.drain_toasts());
 
         let viewport = Rect::new(
@@ -835,6 +928,64 @@ impl BackgroundWorker {
 fn dispatch_event(app: &mut VolumetricUiV2, runner: &Runner, event: UiEvent) {
     let cx = EventCx::new().with_ui_state(runner.ui_state());
     app.on_event(event, &cx);
+}
+
+/// Copy the current damascene text selection to the system clipboard.
+fn copy_current_selection(runner: &Runner, clipboard: &mut Option<arboard::Clipboard>) {
+    let Some(text) = runner.selected_text() else {
+        return;
+    };
+    if let Some(cb) = clipboard {
+        let _ = cb.set_text(text);
+    }
+}
+
+/// Rewrite a paste-request key event into a text-input event carrying the
+/// system clipboard's text, or `None` when the clipboard is empty/non-text.
+fn paste_text_from_clipboard(
+    event: UiEvent,
+    clipboard: &mut Option<arboard::Clipboard>,
+) -> Option<UiEvent> {
+    let text = clipboard.as_mut()?.get_text().ok()?;
+    Some(clipboard::paste_text_event(event, text))
+}
+
+/// Attach the primary-selection text to middle-click events so text inputs
+/// can paste it (Linux convention; a no-op elsewhere).
+fn attach_primary_selection_text(
+    mut event: UiEvent,
+    clipboard: &mut Option<arboard::Clipboard>,
+) -> UiEvent {
+    if event.kind == UiEventKind::MiddleClick {
+        event.text = primary::get(clipboard);
+    }
+    event
+}
+
+/// Linux primary selection buffer; select-to-copy, middle-click-to-paste.
+mod primary {
+    #[cfg(target_os = "linux")]
+    pub fn set(clipboard: &mut Option<arboard::Clipboard>, text: &str) {
+        use arboard::{LinuxClipboardKind, SetExtLinux};
+        if let Some(cb) = clipboard {
+            let _ = cb.set().clipboard(LinuxClipboardKind::Primary).text(text);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn get(clipboard: &mut Option<arboard::Clipboard>) -> Option<String> {
+        use arboard::{GetExtLinux, LinuxClipboardKind};
+        let cb = clipboard.as_mut()?;
+        cb.get().clipboard(LinuxClipboardKind::Primary).text().ok()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn set(_clipboard: &mut Option<arboard::Clipboard>, _text: &str) {}
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn get(_clipboard: &mut Option<arboard::Clipboard>) -> Option<String> {
+        None
+    }
 }
 
 fn bg_color(palette: &damascene_core::Palette) -> wgpu::Color {
