@@ -117,7 +117,10 @@ fn brim_only_output_is_the_bare_slab() {
     assert!(occupied_at(&mut model, [0.0, 0.0, -0.9]), "under the part");
     assert!(occupied_at(&mut model, [0.8, 0.0, -0.9]), "the ring");
     assert!(!occupied_at(&mut model, [0.0, 0.0, 0.0]), "above the slab");
-    assert!(!occupied_at(&mut model, [1.05, 0.0, -0.9]), "past the reach");
+    assert!(
+        !occupied_at(&mut model, [1.05, 0.0, -0.9]),
+        "past the reach"
+    );
 }
 
 /// A positive gap detaches the brim from the footprint, skirt-style.
@@ -130,9 +133,15 @@ fn gap_leaves_a_detached_ring() {
     let mut model = create_model_executor(&wasm).expect("model executor");
 
     // Footprint radius ~0.436: distances 0, ~0.064, ~0.264 from it.
-    assert!(!occupied_at(&mut model, [0.0, 0.0, -0.9]), "gap under the part");
+    assert!(
+        !occupied_at(&mut model, [0.0, 0.0, -0.9]),
+        "gap under the part"
+    );
     assert!(!occupied_at(&mut model, [0.5, 0.0, -0.9]), "inside the gap");
-    assert!(occupied_at(&mut model, [0.7, 0.0, -0.9]), "the detached ring");
+    assert!(
+        occupied_at(&mut model, [0.7, 0.0, -0.9]),
+        "the detached ring"
+    );
 }
 
 /// A channeled input keeps its sample format through the combined
@@ -178,8 +187,5 @@ fn missing_footprint_reports_an_error() {
     let mut config = base_config();
     config.push(("bed_z", ciborium::value::Value::Float(-3.0)));
     let err = run_brim(&config).expect_err("scan below the part must fail");
-    assert!(
-        err.contains("no part geometry"),
-        "unexpected error: {err}"
-    );
+    assert!(err.contains("no part geometry"), "unexpected error: {err}");
 }

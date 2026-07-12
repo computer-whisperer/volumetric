@@ -68,10 +68,8 @@ pub fn build_payload(capsules: &[Capsule]) -> Result<Vec<u8>, String> {
     let boxes: Vec<Box3> = capsules
         .iter()
         .map(|c| {
-            let min: [f32; 3] =
-                std::array::from_fn(|i| (c.a[i].min(c.b[i]) - c.radius) as f32);
-            let max: [f32; 3] =
-                std::array::from_fn(|i| (c.a[i].max(c.b[i]) + c.radius) as f32);
+            let min: [f32; 3] = std::array::from_fn(|i| (c.a[i].min(c.b[i]) - c.radius) as f32);
+            let max: [f32; 3] = std::array::from_fn(|i| (c.a[i].max(c.b[i]) + c.radius) as f32);
             Box3 {
                 min,
                 max,

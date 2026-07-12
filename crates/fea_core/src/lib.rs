@@ -450,12 +450,7 @@ impl Precond<'_> {
     /// Build for the current constraint set. `diag`/`blocks` are the
     /// unmasked assemblies, computed once per solve; constraints change per
     /// contact iteration, so masking and factoring happen here.
-    fn build(
-        diag: &[f64],
-        blocks: Option<&[f64]>,
-        dpn: usize,
-        constrained: &[bool],
-    ) -> Self {
+    fn build(diag: &[f64], blocks: Option<&[f64]>, dpn: usize, constrained: &[bool]) -> Self {
         let Some(blocks) = blocks else {
             return Self::Scalar(diag.to_vec());
         };
@@ -746,8 +741,7 @@ fn frame_contact_solve(
         result = SolveResult {
             stats: SolveStats {
                 cg_iterations: result.stats.cg_iterations + next.stats.cg_iterations,
-                contact_iterations: result.stats.contact_iterations
-                    + next.stats.contact_iterations,
+                contact_iterations: result.stats.contact_iterations + next.stats.contact_iterations,
                 ..next.stats
             },
             ..next

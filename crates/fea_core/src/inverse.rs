@@ -186,9 +186,7 @@ pub fn solve_inverse(
     }
 
     match mesh.element_kind {
-        volumetric_abi::fea::FeaElementKind::Hex8 => {
-            solve_inverse_hex(mesh, rigid, target, config)
-        }
+        volumetric_abi::fea::FeaElementKind::Hex8 => solve_inverse_hex(mesh, rigid, target, config),
         volumetric_abi::fea::FeaElementKind::Bar2 => {
             solve_inverse_frame(mesh, rigid, target, config)
         }
@@ -559,10 +557,8 @@ fn solve_inverse_frame(
             if force <= 0.0 {
                 continue;
             }
-            let mut cols: Vec<(i64, i64)> = node_struts[node]
-                .iter()
-                .map(|&e| strut_col[e])
-                .collect();
+            let mut cols: Vec<(i64, i64)> =
+                node_struts[node].iter().map(|&e| strut_col[e]).collect();
             cols.sort_unstable();
             cols.dedup();
             let p = mesh.node_position(node);
@@ -658,8 +654,8 @@ fn solve_inverse_frame(
         // Gradient-path objective — the smoothed column TV, so the gradient
         // optimizes exactly what the metric measures. Computed before the
         // keep-best snapshot consumes `result`.
-        let grad_input = grad_mode
-            .then(|| column_objective(&contacts, &col_force, &col_target, contact_sign));
+        let grad_input =
+            grad_mode.then(|| column_objective(&contacts, &col_force, &col_target, contact_sign));
 
         let converged = distribution_error <= config.tolerance;
         if best
@@ -717,7 +713,11 @@ fn solve_inverse_frame(
                 let mut mags: Vec<f64> = glog.iter().map(|g| g.abs()).collect();
                 let idx = (mags.len() - 1) * 99 / 100;
                 mags.select_nth_unstable_by(idx, |a, b| a.total_cmp(b));
-                if mags[idx] > 0.0 { grad_eta / mags[idx] } else { 0.0 }
+                if mags[idx] > 0.0 {
+                    grad_eta / mags[idx]
+                } else {
+                    0.0
+                }
             };
             let step = match &bb_prev {
                 Some((prev_logs, prev_glog)) => {
@@ -774,10 +774,10 @@ pub(crate) fn match_objective(
         .collect();
     let total_f: f64 = f.iter().sum();
     let total_t: f64 = active.iter().map(|&n| targets[n]).sum();
-    if !(total_f > 0.0) {
+    if !(total_f > 0.0 && total_f.is_finite()) {
         return Err("no compressive contact force to match".to_string());
     }
-    if !(total_t > 0.0) {
+    if !(total_t > 0.0 && total_t.is_finite()) {
         return Err("target is zero over the whole contact set".to_string());
     }
 
@@ -1098,7 +1098,9 @@ mod tests {
         // Non-uniform scales so dK/ds is exercised away from 1.0, and an
         // asymmetric target so gradients don't cancel by symmetry.
         let count = mesh.element_count();
-        let scales: Vec<f64> = (0..count).map(|e| 0.4 + 0.6 * ((e * 7) % 10) as f64 / 10.0).collect();
+        let scales: Vec<f64> = (0..count)
+            .map(|e| 0.4 + 0.6 * ((e * 7) % 10) as f64 / 10.0)
+            .collect();
         set_scale_field(&mut mesh, &scales);
         let node_targets: Vec<f64> = (0..mesh.node_count())
             .map(|n| 1.0 + mesh.node_position(n)[0])
@@ -1113,7 +1115,7 @@ mod tests {
             cg_tolerance: 1e-12,
             ..Default::default()
         };
-        let mut objective = |scales: &[f64]| -> (f64, usize) {
+        let objective = |scales: &[f64]| -> (f64, usize) {
             let mut work = mesh.clone();
             set_scale_field(&mut work, scales);
             let (result, _, internals) =

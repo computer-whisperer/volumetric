@@ -109,9 +109,7 @@ fn run_solve(config: &SolveOperatorConfig) -> Result<FeaMesh, String> {
                  fixed_boundary ({}) with no disconnected regions, and that \
                  the rigid body presses toward that face from the opposite \
                  side",
-                result.stats.cg_iterations,
-                result.stats.contact_iterations,
-                config.fixed_boundary,
+                result.stats.cg_iterations, result.stats.contact_iterations, config.fixed_boundary,
             ),
         };
         return Err(format!(

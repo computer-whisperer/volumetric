@@ -59,18 +59,19 @@ impl WebDaemonClient {
     /// One status request, holding server-side up to `wait_ms` for the job
     /// to finish.
     pub async fn status(&self, job_id: u64, wait_ms: u64) -> Result<JobStatus, ClientError> {
-        self.get(&format!(
-            "{}/v1/jobs/{job_id}?wait_ms={wait_ms}",
-            self.base
-        ))
-        .await
+        self.get(&format!("{}/v1/jobs/{job_id}?wait_ms={wait_ms}", self.base))
+            .await
     }
 
     /// Requests cancellation. The job still runs to its next checkpoint and
     /// must be awaited for its (now likely `Cancelled`) outcome.
     pub async fn cancel(&self, job_id: u64) -> Result<(), ClientError> {
         let (status, bytes) = self
-            .fetch("POST", &format!("{}/v1/jobs/{job_id}/cancel", self.base), None)
+            .fetch(
+                "POST",
+                &format!("{}/v1/jobs/{job_id}/cancel", self.base),
+                None,
+            )
             .await?;
         check_status((status, &bytes))
     }
@@ -155,8 +156,8 @@ impl WebDaemonClient {
         let controller = web_sys::AbortController::new().map_err(|e| transport(&e))?;
         init.set_signal(Some(&controller.signal()));
 
-        let request = web_sys::Request::new_with_str_and_init(url, &init)
-            .map_err(|e| transport(&e))?;
+        let request =
+            web_sys::Request::new_with_str_and_init(url, &init).map_err(|e| transport(&e))?;
         if has_body {
             request
                 .headers()

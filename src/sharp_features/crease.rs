@@ -139,9 +139,8 @@ pub fn split_crease_vertices(
             vt_cursor[v as usize] += 1;
         }
     }
-    let vertex_tris = |v: usize| -> &[u32] {
-        &vt_tris[vt_starts[v] as usize..vt_starts[v + 1] as usize]
-    };
+    let vertex_tris =
+        |v: usize| -> &[u32] { &vt_tris[vt_starts[v] as usize..vt_starts[v + 1] as usize] };
     loop {
         let mut changed = false;
         for (t, tri) in indices.chunks_exact(3).enumerate() {

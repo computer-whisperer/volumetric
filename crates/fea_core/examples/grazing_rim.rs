@@ -104,9 +104,7 @@ fn main() {
     // sqrt(0.25 - 0.16) = 0.3, strictly inside the face's half-width 0.5 —
     // penetration falls 0.1 -> 0 across the patch (the grazing rim).
     let center = [0.5f64, 0.5, 0.7];
-    let mut rigid = |p: [f64; 3]| {
-        (0..3).map(|a| (p[a] - center[a]).powi(2)).sum::<f64>() < 0.25
-    };
+    let mut rigid = |p: [f64; 3]| (0..3).map(|a| (p[a] - center[a]).powi(2)).sum::<f64>() < 0.25;
     // Uniform demand over a disk (r=0.45) that fully covers the patch,
     // like example_2's target: uniform force demanded where penetration
     // varies, so rim demand is unsatisfiable at any stiffness.

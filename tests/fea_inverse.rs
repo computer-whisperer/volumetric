@@ -294,7 +294,9 @@ fn unsatisfiable_target_still_outputs_best_effort() {
     };
 
     let mut env = Environment::new();
-    let exports = project.run(&mut env).expect("best-effort run must not fail");
+    let exports = project
+        .run(&mut env)
+        .expect("best-effort run must not fail");
     let mesh = decode_fea_mesh(exports[0].data()).expect("designed output decodes");
 
     let stiffness = mesh
@@ -398,10 +400,7 @@ fn strut_lattice_inverse_matches_a_step_target_end_to_end() {
     let asset = &exports[0];
     assert_eq!(asset.type_hint(), Some(AssetTypeHint::FeaMesh));
     let mesh = decode_fea_mesh(asset.data()).expect("designed output decodes");
-    assert_eq!(
-        mesh.element_kind,
-        volumetric_abi::fea::FeaElementKind::Bar2
-    );
+    assert_eq!(mesh.element_kind, volumetric_abi::fea::FeaElementKind::Bar2);
 
     let field = |fields: &[volumetric::fea::FeaField], name: &str, components: usize| {
         let field = fields

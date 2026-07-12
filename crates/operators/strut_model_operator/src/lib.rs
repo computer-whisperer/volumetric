@@ -93,10 +93,16 @@ fn realize_capsules(mesh: &FeaMesh, config: &StrutModelConfig) -> Result<Vec<Cap
         ));
     }
     if !(config.min_radius.is_finite() && config.min_radius >= 0.0) {
-        return Err(format!("min_radius must be >= 0, got {}", config.min_radius));
+        return Err(format!(
+            "min_radius must be >= 0, got {}",
+            config.min_radius
+        ));
     }
     if !(config.max_radius.is_finite() && config.max_radius >= 0.0) {
-        return Err(format!("max_radius must be >= 0, got {}", config.max_radius));
+        return Err(format!(
+            "max_radius must be >= 0, got {}",
+            config.max_radius
+        ));
     }
     if config.max_radius > 0.0 && config.max_radius < config.min_radius {
         return Err(format!(
@@ -137,9 +143,8 @@ fn realize_capsules(mesh: &FeaMesh, config: &StrutModelConfig) -> Result<Vec<Cap
             *p += config.displacement_scale * u;
         }
     }
-    let position = |node: u32| -> [f64; 3] {
-        std::array::from_fn(|i| positions[node as usize * 3 + i])
-    };
+    let position =
+        |node: u32| -> [f64; 3] { std::array::from_fn(|i| positions[node as usize * 3 + i]) };
 
     let mut capsules = Vec::with_capacity(mesh.element_count());
     for e in 0..mesh.element_count() {
@@ -283,7 +288,8 @@ pub extern "C" fn run() {
 #[unsafe(no_mangle)]
 pub extern "C" fn get_metadata() -> i64 {
     static METADATA: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-    volumetric_abi::metadata_reply(&METADATA, || OperatorMetadata {
+    volumetric_abi::metadata_reply(&METADATA, || {
+        OperatorMetadata {
         name: "strut_model_operator".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         inputs: vec![
@@ -295,6 +301,7 @@ pub extern "C" fn get_metadata() -> i64 {
         ],
         input_names: vec!["Strut lattice".to_string(), "Config".to_string()],
         outputs: vec![OperatorMetadataOutput::ModelWASM],
+    }
     })
 }
 

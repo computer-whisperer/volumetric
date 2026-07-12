@@ -111,7 +111,10 @@ impl Default for BrimConfig {
 
 fn validate(cfg: &BrimConfig) -> Result<(), String> {
     if !(cfg.brim_width.is_finite() && cfg.brim_width > 0.0) {
-        return Err(format!("brim_width must be positive, got {}", cfg.brim_width));
+        return Err(format!(
+            "brim_width must be positive, got {}",
+            cfg.brim_width
+        ));
     }
     if !(cfg.brim_height.is_finite() && cfg.brim_height > 0.0) {
         return Err(format!(
@@ -243,9 +246,8 @@ fn dt_1d(f: &[f64], out: &mut [f64], v: &mut [usize], z: &mut [f64]) {
     let n = f.len();
     // Squares in f64: usize is 32-bit on wasm and nothing local bounds n.
     let sq = |i: usize| (i as f64) * (i as f64);
-    let intersect = |q: usize, p: usize| -> f64 {
-        ((f[q] + sq(q)) - (f[p] + sq(p))) / (2 * (q - p)) as f64
-    };
+    let intersect =
+        |q: usize, p: usize| -> f64 { ((f[q] + sq(q)) - (f[p] + sq(p))) / (2 * (q - p)) as f64 };
     let mut k = 0usize;
     v[0] = 0;
     z[0] = f64::NEG_INFINITY;
@@ -277,7 +279,10 @@ fn dt_1d(f: &[f64], out: &mut [f64], v: &mut [usize], z: &mut [f64]) {
 /// "far" stand-in, comfortably beyond any real distance.
 fn edt_squared(occupied: &[bool], nx: usize, ny: usize) -> Vec<f64> {
     let far = ((nx as f64) * (nx as f64) + (ny as f64) * (ny as f64)) * 4.0 + 1.0;
-    let mut d: Vec<f64> = occupied.iter().map(|&o| if o { 0.0 } else { far }).collect();
+    let mut d: Vec<f64> = occupied
+        .iter()
+        .map(|&o| if o { 0.0 } else { far })
+        .collect();
 
     let n = nx.max(ny);
     let mut f = vec![0.0f64; n];
@@ -634,7 +639,11 @@ fn add_sample_channels_glue(
     f.instruction(&Instruction::F32Store(out_mem));
     f.instruction(&Instruction::End);
     sections.code.function(&f);
-    exports.export("sample_channels", ExportKind::Func, sections.funcs.len() - 1);
+    exports.export(
+        "sample_channels",
+        ExportKind::Func,
+        sections.funcs.len() - 1,
+    );
 }
 
 /// Merge the input model with the patched brim model: dimensions, IO
@@ -805,7 +814,7 @@ mod tests {
     #[test]
     fn edt_measures_euclidean_distance() {
         // Single occupied cell in the middle of a 7x5 grid.
-        let (occ, nx, ny) = grid(&["......." , ".......", "...#...", ".......", "......."]);
+        let (occ, nx, ny) = grid(&[".......", ".......", "...#...", ".......", "......."]);
         let d2 = edt_squared(&occ, nx, ny);
         assert_eq!(d2[2 * nx + 3], 0.0);
         assert_eq!(d2[2 * nx + 5], 4.0); // two right
@@ -837,13 +846,7 @@ mod tests {
 
     #[test]
     fn outside_mask_finds_holes() {
-        let (occ, nx, ny) = grid(&[
-            ".....",
-            ".###.",
-            ".#.#.",
-            ".###.",
-            ".....",
-        ]);
+        let (occ, nx, ny) = grid(&[".....", ".###.", ".#.#.", ".###.", "....."]);
         let outside = outside_mask(&occ, nx, ny);
         assert!(outside[0]);
         assert!(outside[4 * nx + 4]);
@@ -883,15 +886,12 @@ mod tests {
 
     #[test]
     fn outside_only_empties_holes() {
-        let (occ, nx, ny) = grid(&[
-            ".....",
-            ".###.",
-            ".#.#.",
-            ".###.",
-            ".....",
-        ]);
+        let (occ, nx, ny) = grid(&[".....", ".###.", ".#.#.", ".###.", "....."]);
         let open = build_field(&occ, nx, ny, 1.0, &test_config());
-        assert!(open[2 * nx + 2] > 0.0, "without outside_only the hole fills");
+        assert!(
+            open[2 * nx + 2] > 0.0,
+            "without outside_only the hole fills"
+        );
         let cfg = BrimConfig {
             outside_only: true,
             ..test_config()

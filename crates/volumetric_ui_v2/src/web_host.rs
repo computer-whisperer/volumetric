@@ -190,7 +190,10 @@ fn measure_canvas(canvas: &web_sys::HtmlCanvasElement, fallback: Rect) -> (u32, 
     } else {
         fallback.h.max(1.0) as f64
     };
-    (((css_w * dpr).round() as u32).max(1), ((css_h * dpr).round() as u32).max(1))
+    (
+        ((css_w * dpr).round() as u32).max(1),
+        ((css_h * dpr).round() as u32).max(1),
+    )
 }
 
 /// sRGB-tagged sibling for a linear `*8Unorm` swapchain format, so the
@@ -699,9 +702,7 @@ impl WebHost {
     /// remote daemon complete asynchronously instead; the pump waits for
     /// them the way the native queue waits for its busy worker thread.
     fn schedule_job_pump(&self, window: Arc<Window>) {
-        if self.pump_scheduled.get()
-            || self.remote_in_flight.get()
-            || self.jobs.borrow().is_empty()
+        if self.pump_scheduled.get() || self.remote_in_flight.get() || self.jobs.borrow().is_empty()
         {
             return;
         }
@@ -731,13 +732,10 @@ impl WebHost {
             window.request_redraw();
         });
         if let Some(js_window) = web_sys::window() {
-            let _ = js_window.set_timeout_with_callback_and_timeout_and_arguments_0(
-                closure.unchecked_ref(),
-                0,
-            );
+            let _ = js_window
+                .set_timeout_with_callback_and_timeout_and_arguments_0(closure.unchecked_ref(), 0);
         }
     }
-
 }
 
 /// Execute one job in-process on the main thread. Progress snapshots pile
@@ -803,12 +801,10 @@ fn dispatch_job_with_remote(
                     if epoch.get() != spawned_epoch {
                         return;
                     }
-                    results
-                        .borrow_mut()
-                        .push(BackgroundResult::RunProgress {
-                            generation,
-                            progress,
-                        });
+                    results.borrow_mut().push(BackgroundResult::RunProgress {
+                        generation,
+                        progress,
+                    });
                     window.request_redraw();
                 };
                 let result = remote_run_project(&address, project, &cancel, &on_progress).await;
@@ -862,12 +858,11 @@ fn dispatch_job_with_remote(
                             Ok(None) => Err(PreviewBuildError::Cancelled),
                             Err(err) => Err(PreviewBuildError::Failed(err)),
                         };
-                        let result = BackgroundResult::PreviewComplete(Box::new(
-                            PreviewBuildResult {
+                        let result =
+                            BackgroundResult::PreviewComplete(Box::new(PreviewBuildResult {
                                 key: job.key,
                                 result,
-                            },
-                        ));
+                            }));
                         log_failed_result(&result);
                         if epoch.get() == spawned_epoch {
                             results.borrow_mut().push(result);
@@ -1136,10 +1131,9 @@ async fn perform_file_task(task: FileTask) -> FileOutcome {
             let bytes = volumetric::stl::triangles_to_binary_stl_bytes(&triangles, "volumetric");
             let name = format!("{id}.stl");
             match trigger_download(&name, &bytes) {
-                Ok(()) => FileOutcome::Status(format!(
-                    "exported {} triangles as {name}",
-                    triangles.len()
-                )),
+                Ok(()) => {
+                    FileOutcome::Status(format!("exported {} triangles as {name}", triangles.len()))
+                }
                 Err(err) => FileOutcome::Status(format!("failed to export STL: {err}")),
             }
         }

@@ -163,9 +163,7 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     use super::*;
-    use crate::session::{
-        BackgroundJob, BackgroundResult, PreviewBuildJob, execute_job_with,
-    };
+    use crate::session::{BackgroundJob, BackgroundResult, PreviewBuildJob, execute_job_with};
     use crate::{Asn2Settings, PreviewMeshPlan, PreviewPlan, PreviewRequest, VolumetricUiV2};
 
     fn daemon_backend() -> (volumetric_daemon::DaemonHandle, RemoteBackend) {

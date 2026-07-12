@@ -547,7 +547,10 @@ mod tests {
         // B saw A's epoch bump; had its callback mis-trapped it, it would
         // have finished with an Execution error by now.
         std::thread::sleep(Duration::from_millis(100));
-        assert!(!run_b.is_finished(), "run B should have survived A's cancel");
+        assert!(
+            !run_b.is_finished(),
+            "run B should have survived A's cancel"
+        );
 
         cancel_b.store(true, Ordering::Relaxed);
         let result_b = run_b.join().unwrap();

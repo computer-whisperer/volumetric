@@ -500,18 +500,24 @@ mod tests {
     #[test]
     fn sphere_clip_keeps_interior_and_reaches_the_skin() {
         let (center, radius) = ([0.5, 0.5, 0.5], 0.45);
-        let skeleton =
-            enumerate_skeleton(SkeletonFamily::Tetra, [0.0; 3], [1.0; 3], 0.2);
+        let skeleton = enumerate_skeleton(SkeletonFamily::Tetra, [0.0; 3], [1.0; 3], 0.2);
         let mesh = clip_with(&skeleton, &mut sphere(center, radius), true).unwrap();
         assert_eq!(mesh.element_kind, FeaElementKind::Bar2);
-        assert!(mesh.element_count() > 50, "few struts: {}", mesh.element_count());
+        assert!(
+            mesh.element_count() > 50,
+            "few struts: {}",
+            mesh.element_count()
+        );
 
         // Every node is inside or on the sphere (clip tolerance is tiny
         // relative to the cell).
         let mut on_skin = 0usize;
         for n in 0..mesh.node_count() {
             let p = mesh.node_position(n);
-            let d = (0..3).map(|i| (p[i] - center[i]).powi(2)).sum::<f64>().sqrt();
+            let d = (0..3)
+                .map(|i| (p[i] - center[i]).powi(2))
+                .sum::<f64>()
+                .sqrt();
             assert!(d <= radius + 1e-6, "node {n} at distance {d} > {radius}");
             if (d - radius).abs() < 1e-6 {
                 on_skin += 1;
@@ -533,12 +539,13 @@ mod tests {
         let mut two_spheres = |p: [f64; 3]| {
             let big = (0..3).map(|i| (p[i] - 0.5).powi(2)).sum::<f64>() < 0.45 * 0.45;
             let small_center = [2.5, 0.5, 0.5];
-            let small =
-                (0..3).map(|i| (p[i] - small_center[i]).powi(2)).sum::<f64>() < 0.25 * 0.25;
+            let small = (0..3)
+                .map(|i| (p[i] - small_center[i]).powi(2))
+                .sum::<f64>()
+                < 0.25 * 0.25;
             big || small
         };
-        let skeleton =
-            enumerate_skeleton(SkeletonFamily::Cubic, [0.0; 3], [3.0, 1.0, 1.0], 0.15);
+        let skeleton = enumerate_skeleton(SkeletonFamily::Cubic, [0.0; 3], [3.0, 1.0, 1.0], 0.15);
 
         let unpruned = clip_with(&skeleton, &mut two_spheres, false).unwrap();
         let pruned = clip_with(&skeleton, &mut two_spheres, true).unwrap();
@@ -595,9 +602,10 @@ mod tests {
         assert_eq!(c.len() / 2, 2, "tiny middle edge should contract");
         assert_eq!(p.len() / 3, 3, "nodes 1 and 2 should merge");
         // The joint sits at the pair's centroid.
-        assert!(p.chunks(3).any(|q| (q[0] - 1.005).abs() < 1e-12
-            && q[1] == 0.0
-            && q[2] == 0.0));
+        assert!(
+            p.chunks(3)
+                .any(|q| (q[0] - 1.005).abs() < 1e-12 && q[1] == 0.0 && q[2] == 0.0)
+        );
     }
 
     #[test]
@@ -651,7 +659,10 @@ mod tests {
             let a = mesh.node_position(pair[0] as usize);
             let b = mesh.node_position(pair[1] as usize);
             let len = (0..3).map(|c| (a[c] - b[c]).powi(2)).sum::<f64>().sqrt();
-            assert!(len >= 0.01, "strut {e} survived below the weld length: {len}");
+            assert!(
+                len >= 0.01,
+                "strut {e} survived below the weld length: {len}"
+            );
         }
     }
 
@@ -667,10 +678,7 @@ mod tests {
             let a = mesh.node_position(pair[0] as usize);
             let b = mesh.node_position(pair[1] as usize);
             let len = (0..3).map(|c| (a[c] - b[c]).powi(2)).sum::<f64>().sqrt();
-            assert!(
-                len <= cell + 1e-9,
-                "strut {e} longer than a cell: {len}"
-            );
+            assert!(len <= cell + 1e-9, "strut {e} longer than a cell: {len}");
             if (len - cell).abs() < 1e-9 {
                 full += 1;
             }

@@ -38,8 +38,8 @@
 //! of MB and per-element encoding would roughly double them.
 
 use serde::{Deserialize, Serialize};
-use volumetric::adaptive_surface_nets_2::{AdaptiveMeshConfig2, MeshingStats2};
 pub use volumetric::BuildProgress;
+use volumetric::adaptive_surface_nets_2::{AdaptiveMeshConfig2, MeshingStats2};
 use volumetric::{AssetTypeHint, LoadedAsset, Project};
 
 #[cfg(any(feature = "client", feature = "web-client"))]
@@ -139,8 +139,13 @@ pub enum JobOutcome {
 /// variant.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum JobOutput {
-    RunProject { exports: Vec<ExportedAsset> },
-    MeshModel { mesh: MeshPayload, stats: MeshingStats2 },
+    RunProject {
+        exports: Vec<ExportedAsset>,
+    },
+    MeshModel {
+        mesh: MeshPayload,
+        stats: MeshingStats2,
+    },
 }
 
 /// A [`LoadedAsset`] in wire form.

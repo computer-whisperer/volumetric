@@ -56,4 +56,3 @@ pub fn sort_unstable<T: Ord + Send>(items: &mut [T]) {
 pub fn sort_unstable<T: Ord>(items: &mut [T]) {
     items.sort_unstable();
 }
-

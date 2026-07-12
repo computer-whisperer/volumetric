@@ -3150,7 +3150,14 @@ where
     let stage4_5_start = Instant::now();
     let (mut mesh, sharp_stats) = if let Some(ref sharp_config) = config.sharp_features {
         report("reconstructing sharp features".to_string());
-        stage4_5_sharp_features(stage4_result, sharp_config, &sampler, cell_size, &stats, cancel)?
+        stage4_5_sharp_features(
+            stage4_result,
+            sharp_config,
+            &sampler,
+            cell_size,
+            &stats,
+            cancel,
+        )?
     } else {
         (
             stage4_result_to_mesh(stage4_result),
@@ -3465,13 +3472,12 @@ mod tests {
             discovery_probes: 8,
             ..Default::default()
         };
-        let result = adaptive_surface_nets_2(
-            thin_slab_sampler,
-            (0.0, 0.0, 0.0),
-            (1.0, 1.0, 1.0),
-            &config,
+        let result =
+            adaptive_surface_nets_2(thin_slab_sampler, (0.0, 0.0, 0.0), (1.0, 1.0, 1.0), &config);
+        assert_eq!(
+            result.stats.stage1_mixed_cells, 0,
+            "corners must stay blind"
         );
-        assert_eq!(result.stats.stage1_mixed_cells, 0, "corners must stay blind");
         assert!(result.stats.stage1_probe_seeds > 0);
         assert!(!result.mesh.indices.is_empty(), "slab must be meshed");
 
@@ -3497,12 +3503,8 @@ mod tests {
             discovery_probes: 0,
             ..config
         };
-        let result = adaptive_surface_nets_2(
-            thin_slab_sampler,
-            (0.0, 0.0, 0.0),
-            (1.0, 1.0, 1.0),
-            &blind,
-        );
+        let result =
+            adaptive_surface_nets_2(thin_slab_sampler, (0.0, 0.0, 0.0), (1.0, 1.0, 1.0), &blind);
         assert!(result.mesh.indices.is_empty());
     }
 
@@ -4279,8 +4281,7 @@ mod tests {
             ..Default::default()
         };
         let start = Instant::now();
-        let result =
-            adaptive_surface_nets_2(gyroid, (-1.0, -1.0, -1.0), (1.0, 1.0, 1.0), &config);
+        let result = adaptive_surface_nets_2(gyroid, (-1.0, -1.0, -1.0), (1.0, 1.0, 1.0), &config);
         let wall = start.elapsed().as_secs_f64();
         let s = &result.stats;
         println!(

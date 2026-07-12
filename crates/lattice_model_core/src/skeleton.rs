@@ -32,9 +32,7 @@ pub enum SkeletonFamily {
     /// `irregularity` as in [`crate::LatticeParams`]: 0 is the periodic
     /// Kelvin cell, 1 fully organic (clamped to `[0, 1]`, non-finite
     /// reads 0 — the same site set the implicit foam thickens).
-    Foam {
-        irregularity: f64,
-    },
+    Foam { irregularity: f64 },
 }
 
 /// An enumerated strut network: deduplicated nodes and the edges between
@@ -318,8 +316,7 @@ impl ConvexCell {
                 // The cut edge's supporting planes are the ones both
                 // endpoints lie on; the crossing adds the cutting plane.
                 let (ga, gb) = (&generators[a as usize], &generators[b as usize]);
-                let mut gens: Vec<usize> =
-                    ga.iter().filter(|g| gb.contains(g)).copied().collect();
+                let mut gens: Vec<usize> = ga.iter().filter(|g| gb.contains(g)).copied().collect();
                 gens.push(plane_id);
                 gens.sort_unstable();
                 gens.dedup();
@@ -504,8 +501,9 @@ fn foam_skeleton(cell_lo: [i64; 3], cell_hi: [i64; 3], cell_size: f64, jitter: f
                     // closed by its neighbors (can't happen with a sane
                     // site set) — skip the feature rather than emit
                     // box-artifact geometry.
-                    let neighbor_site =
-                        |plane: usize| -> Option<Site> { Some(neighbors.get(plane.checked_sub(6)?)?.0) };
+                    let neighbor_site = |plane: usize| -> Option<Site> {
+                        Some(neighbors.get(plane.checked_sub(6)?)?.0)
+                    };
                     for (va, vb, planes) in cell.edges() {
                         let (Some(n0), Some(n1)) =
                             (neighbor_site(planes[0]), neighbor_site(planes[1]))
@@ -519,10 +517,7 @@ fn foam_skeleton(cell_lo: [i64; 3], cell_hi: [i64; 3], cell_size: f64, jitter: f
                         }
                         // Drop numeric slivers (near-coincident Voronoi
                         // vertices): real foam edges are O(0.1) cells.
-                        let (pa, pb) = (
-                            cell.vertices[va as usize],
-                            cell.vertices[vb as usize],
-                        );
+                        let (pa, pb) = (cell.vertices[va as usize], cell.vertices[vb as usize]);
                         let len2 = (0..3).map(|a| (pa[a] - pb[a]).powi(2)).sum::<f64>();
                         if len2 < 1e-12 {
                             continue;
@@ -538,11 +533,7 @@ fn foam_skeleton(cell_lo: [i64; 3], cell_hi: [i64; 3], cell_size: f64, jitter: f
                             quad.sort_unstable();
                             Some(*node_ids.entry(quad).or_insert_with(|| {
                                 let p = cell.vertices[v as usize];
-                                nodes.push([
-                                    p[0] * cell_size,
-                                    p[1] * cell_size,
-                                    p[2] * cell_size,
-                                ]);
+                                nodes.push([p[0] * cell_size, p[1] * cell_size, p[2] * cell_size]);
                                 (nodes.len() - 1) as u32
                             }))
                         };
@@ -579,7 +570,13 @@ mod tests {
         skeleton
             .edges
             .iter()
-            .map(|e| segment_distance(p, skeleton.nodes[e[0] as usize], skeleton.nodes[e[1] as usize]))
+            .map(|e| {
+                segment_distance(
+                    p,
+                    skeleton.nodes[e[0] as usize],
+                    skeleton.nodes[e[1] as usize],
+                )
+            })
             .fold(f64::MAX, f64::min)
     }
 
@@ -761,8 +758,12 @@ mod tests {
         // irregularity 0 = plain BCC: every Voronoi edge of the truncated
         // octahedron has length sqrt(2)/4, interior nodes join 4 struts
         // (Plateau), and the density is 24 edges per unit cell.
-        let skeleton =
-            enumerate_skeleton(SkeletonFamily::Foam { irregularity: 0.0 }, [0.0; 3], [3.0; 3], 1.0);
+        let skeleton = enumerate_skeleton(
+            SkeletonFamily::Foam { irregularity: 0.0 },
+            [0.0; 3],
+            [3.0; 3],
+            1.0,
+        );
         let expected_len = 2.0f64.sqrt() / 4.0;
         for e in &skeleton.edges {
             let a = skeleton.nodes[e[0] as usize];
@@ -787,7 +788,11 @@ mod tests {
                 })
             })
             .count();
-        assert_eq!(central, 24 * 8, "kelvin edge density off: {central} in 8 cells");
+        assert_eq!(
+            central,
+            24 * 8,
+            "kelvin edge density off: {central} in 8 cells"
+        );
     }
 
     #[test]
@@ -831,15 +836,24 @@ mod tests {
     #[test]
     fn jittered_foam_is_deterministic_and_reshaped() {
         let run = || {
-            enumerate_skeleton(SkeletonFamily::Foam { irregularity: 0.4 }, [0.0; 3], [2.0; 3], 0.5)
+            enumerate_skeleton(
+                SkeletonFamily::Foam { irregularity: 0.4 },
+                [0.0; 3],
+                [2.0; 3],
+                0.5,
+            )
         };
         let (a, b) = (run(), run());
         assert_eq!(a.nodes, b.nodes);
         assert_eq!(a.edges, b.edges);
 
         // Jitter actually moves the network relative to Kelvin.
-        let kelvin =
-            enumerate_skeleton(SkeletonFamily::Foam { irregularity: 0.0 }, [0.0; 3], [2.0; 3], 0.5);
+        let kelvin = enumerate_skeleton(
+            SkeletonFamily::Foam { irregularity: 0.0 },
+            [0.0; 3],
+            [2.0; 3],
+            0.5,
+        );
         let moved = a
             .nodes
             .iter()

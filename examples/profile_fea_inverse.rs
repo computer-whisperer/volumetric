@@ -101,12 +101,7 @@ fn main() {
 
     let mut rigid_exec = NativeModelExecutor::new(&bytes_of(rigid_id)).expect("rigid model");
     let mut target_exec = NativeModelExecutor::new(&bytes_of(target_id)).expect("target model");
-    let mut rigid = |p: [f64; 3]| {
-        rigid_exec
-            .sample_nd(&p)
-            .map(is_occupied)
-            .unwrap_or(false)
-    };
+    let mut rigid = |p: [f64; 3]| rigid_exec.sample_nd(&p).map(is_occupied).unwrap_or(false);
     let mut target = |p: [f64; 2]| {
         target_exec
             .sample_nd(&p)

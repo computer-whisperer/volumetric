@@ -353,9 +353,7 @@ impl FrameModel {
         for (block, l) in local.iter_mut().enumerate() {
             let off = s.nodes[block / 2] as usize * 6 + (block % 2) * 3;
             for (row, value) in l.iter_mut().enumerate() {
-                *value = s.r[row][0] * x[off]
-                    + s.r[row][1] * x[off + 1]
-                    + s.r[row][2] * x[off + 2];
+                *value = s.r[row][0] * x[off] + s.r[row][1] * x[off + 1] + s.r[row][2] * x[off + 2];
             }
         }
         local
@@ -372,8 +370,7 @@ impl FrameModel {
             for (block, fl) in f.iter().enumerate() {
                 let off = s.nodes[block / 2] as usize * 6 + (block % 2) * 3;
                 for col in 0..3 {
-                    y[off + col] +=
-                        s.r[0][col] * fl[0] + s.r[1][col] * fl[1] + s.r[2][col] * fl[2];
+                    y[off + col] += s.r[0][col] * fl[0] + s.r[1][col] * fl[1] + s.r[2][col] * fl[2];
                 }
             }
         }
@@ -563,12 +560,22 @@ mod tests {
 
     /// A strut chain along `axis_dir` from `origin`, `segments` equal
     /// pieces of total length `length`, radius `r` everywhere.
-    fn chain(origin: [f64; 3], axis_dir: [f64; 3], length: f64, segments: usize, r: f64) -> FeaMesh {
+    fn chain(
+        origin: [f64; 3],
+        axis_dir: [f64; 3],
+        length: f64,
+        segments: usize,
+        r: f64,
+    ) -> FeaMesh {
         let n = normalize(axis_dir);
         let mut node_positions = Vec::new();
         for i in 0..=segments {
             let t = length * i as f64 / segments as f64;
-            node_positions.extend([origin[0] + n[0] * t, origin[1] + n[1] * t, origin[2] + n[2] * t]);
+            node_positions.extend([
+                origin[0] + n[0] * t,
+                origin[1] + n[1] * t,
+                origin[2] + n[2] * t,
+            ]);
         }
         let connectivity = (0..segments as u32)
             .flat_map(|i| [i, i + 1])
@@ -665,10 +672,7 @@ mod tests {
             let schwarz = solve(&mesh, &mut plate, &config).unwrap();
 
             assert!(base.stats.converged && schwarz.stats.converged);
-            let scale = base
-                .displacement
-                .iter()
-                .fold(0.0f64, |m, v| m.max(v.abs()));
+            let scale = base.displacement.iter().fold(0.0f64, |m, v| m.max(v.abs()));
             for (i, (a, b)) in base
                 .displacement
                 .iter()
@@ -823,7 +827,9 @@ mod tests {
         let mut state = 0x2545F4914F6CDD1Du64;
         let x: Vec<f64> = (0..n)
             .map(|_| {
-                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 (state >> 11) as f64 / (1u64 << 53) as f64 - 0.5
             })
             .collect();
@@ -1416,7 +1422,11 @@ mod tests {
         // The lateral (bending) response is finite and nonzero — the
         // off-center press shears the frame.
         let max_lateral = (0..8)
-            .map(|n| result.displacement[n * 3].abs().max(result.displacement[n * 3 + 1].abs()))
+            .map(|n| {
+                result.displacement[n * 3]
+                    .abs()
+                    .max(result.displacement[n * 3 + 1].abs())
+            })
             .fold(0.0f64, f64::max);
         assert!(
             max_lateral.is_finite() && max_lateral > 1e-9,

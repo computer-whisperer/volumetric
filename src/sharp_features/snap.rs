@@ -184,7 +184,7 @@ pub fn snap_feature_vertices_cancellable(
                 .any(|&u| matches!(labels[u as usize], Some(b) if b != a)),
         }
     };
-    let candidate_mask = crate::parallel_iter::map_range(0..positions.len(), &is_candidate);
+    let candidate_mask = crate::parallel_iter::map_range(0..positions.len(), is_candidate);
     let candidates: Vec<u32> = candidate_mask
         .iter()
         .enumerate()
@@ -195,8 +195,9 @@ pub fn snap_feature_vertices_cancellable(
         if cancel.load(Ordering::Relaxed) {
             return (v, false, SnapAttempt::Cancelled);
         }
-        let (corner_fallback, attempt) =
-            snap_one(v as usize, positions, adjacency, labels, cell, config, sampler);
+        let (corner_fallback, attempt) = snap_one(
+            v as usize, positions, adjacency, labels, cell, config, sampler,
+        );
         (v, corner_fallback, attempt)
     });
 

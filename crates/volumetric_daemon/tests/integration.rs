@@ -136,7 +136,9 @@ fn run_project_returns_exports() {
     let request = JobRequest::RunProject {
         project: one_step_project(blob_operator(), 1),
     };
-    let outcome = client.run(&request, NEVER_CANCEL, IGNORE_PROGRESS).expect("job completes");
+    let outcome = client
+        .run(&request, NEVER_CANCEL, IGNORE_PROGRESS)
+        .expect("job completes");
 
     let JobOutcome::Success { output, .. } = outcome else {
         panic!("expected success, got {outcome:?}");
@@ -171,7 +173,11 @@ fn run_project_reports_execution_errors() {
         exports: vec![],
     };
     let outcome = client
-        .run(&JobRequest::RunProject { project }, NEVER_CANCEL, IGNORE_PROGRESS)
+        .run(
+            &JobRequest::RunProject { project },
+            NEVER_CANCEL,
+            IGNORE_PROGRESS,
+        )
         .expect("job completes");
 
     let JobOutcome::Failed { error } = outcome else {
@@ -195,7 +201,9 @@ fn mesh_model_returns_a_plausible_box_mesh() {
         model_wasm: box_model(),
         config,
     };
-    let outcome = client.run(&request, NEVER_CANCEL, IGNORE_PROGRESS).expect("job completes");
+    let outcome = client
+        .run(&request, NEVER_CANCEL, IGNORE_PROGRESS)
+        .expect("job completes");
 
     let JobOutcome::Success { output, .. } = outcome else {
         panic!("expected success, got {outcome:?}");
@@ -251,12 +259,16 @@ fn cancellation_stops_queued_and_running_jobs() {
     client.cancel(b).expect("cancel B");
     client.cancel(a).expect("cancel A");
 
-    let outcome_b = client.wait(b, NEVER_CANCEL, IGNORE_PROGRESS).expect("await B");
+    let outcome_b = client
+        .wait(b, NEVER_CANCEL, IGNORE_PROGRESS)
+        .expect("await B");
     assert!(
         matches!(outcome_b, JobOutcome::Cancelled),
         "queued job should cancel without running, got {outcome_b:?}"
     );
-    let outcome_a = client.wait(a, NEVER_CANCEL, IGNORE_PROGRESS).expect("await A");
+    let outcome_a = client
+        .wait(a, NEVER_CANCEL, IGNORE_PROGRESS)
+        .expect("await A");
     assert!(
         matches!(outcome_a, JobOutcome::Cancelled),
         "running job should cancel between steps, got {outcome_a:?}"
@@ -373,7 +385,10 @@ fn serves_the_embedded_web_ui() {
         value_of(&headers, "content-type").as_deref(),
         Some("text/html; charset=utf-8")
     );
-    assert_eq!(value_of(&headers, "cache-control").as_deref(), Some("no-cache"));
+    assert_eq!(
+        value_of(&headers, "cache-control").as_deref(),
+        Some("no-cache")
+    );
 
     let (status, _) = raw_request(
         addr,

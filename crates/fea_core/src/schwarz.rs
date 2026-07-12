@@ -31,8 +31,8 @@
 //! serial Z^T r / Z x_c coarse products, the serial overlap scatter-add,
 //! and the ~1.2x-ceiling parallel SpMV.
 
-use crate::frame::FrameModel;
 use crate::StiffnessModel;
+use crate::frame::FrameModel;
 use rayon::prelude::*;
 use volumetric_abi::fea::FeaMesh;
 
@@ -113,11 +113,7 @@ fn node_modes(p: [f64; 3], c: [f64; 3], constrained_rows: &[bool; 6]) -> [[f64; 
         n[t][t] = 1.0;
     }
     // e_k x d for k = 0, 1, 2.
-    let cross = [
-        [0.0, -d[2], d[1]],
-        [d[2], 0.0, -d[0]],
-        [-d[1], d[0], 0.0],
-    ];
+    let cross = [[0.0, -d[2], d[1]], [d[2], 0.0, -d[0]], [-d[1], d[0], 0.0]];
     for k in 0..3 {
         for row in 0..3 {
             n[row][3 + k] = cross[k][row];
@@ -239,8 +235,7 @@ impl SchwarzPrecond {
             let [n1, n2] = model.strut_nodes(e);
             let ke = model.element_stiffness(e);
             let ends = [n1 as usize, n2 as usize];
-            let n_mats: Vec<[[f64; 6]; 6]> =
-                ends.iter().map(|&node| modes[node]).collect();
+            let n_mats: Vec<[[f64; 6]; 6]> = ends.iter().map(|&node| modes[node]).collect();
             for (ei, &node_i) in ends.iter().enumerate() {
                 for (ej, &node_j) in ends.iter().enumerate() {
                     let (si, sj) = (owner[node_i], owner[node_j]);
@@ -456,9 +451,10 @@ impl SchwarzPrecond {
                         let mut local: Vec<f32> =
                             s.dofs.iter().map(|&dof| r[dof as usize] as f32).collect();
                         let m = local.len();
-                        s.solver.solve_in_place(
-                            faer::MatMut::from_column_major_slice_mut(&mut local, m, 1),
-                        );
+                        s.solver
+                            .solve_in_place(faer::MatMut::from_column_major_slice_mut(
+                                &mut local, m, 1,
+                            ));
                         local
                     })
                     .collect();
@@ -507,9 +503,12 @@ impl SchwarzPrecond {
         }
         {
             use faer::linalg::solvers::Solve;
-            self.coarse_solver.solve_in_place(
-                faer::MatMut::from_column_major_slice_mut(&mut rc, self.coarse_n, 1),
-            );
+            self.coarse_solver
+                .solve_in_place(faer::MatMut::from_column_major_slice_mut(
+                    &mut rc,
+                    self.coarse_n,
+                    1,
+                ));
         }
         for node in 0..node_count {
             let n = &self.modes[node];

@@ -57,10 +57,7 @@ impl DaemonClient {
     /// One status request, holding server-side up to `wait_ms` for the job
     /// to finish.
     pub fn status(&self, job_id: u64, wait_ms: u64) -> Result<JobStatus, ClientError> {
-        self.get(&format!(
-            "{}/v1/jobs/{job_id}?wait_ms={wait_ms}",
-            self.base
-        ))
+        self.get(&format!("{}/v1/jobs/{job_id}?wait_ms={wait_ms}", self.base))
     }
 
     /// Requests cancellation. The job still runs to its next checkpoint and

@@ -49,10 +49,7 @@ fn vec3(v: [f64; 3]) -> Vec<u8> {
 
 /// Unit box → strut pattern; optionally chain a frame solve against the
 /// sphere pressed into the top. Returns the exported meshes by name.
-fn run_project(
-    pattern_config: Vec<u8>,
-    with_solve: bool,
-) -> Vec<(String, FeaMesh, AssetTypeHint)> {
+fn run_project(pattern_config: Vec<u8>, with_solve: bool) -> Vec<(String, FeaMesh, AssetTypeHint)> {
     use ciborium::value::Value;
 
     let dip = 0.05;
@@ -233,7 +230,11 @@ fn box_fills_with_a_valid_foam_lattice() {
             );
         }
         if p.iter().all(|&v| v > 0.3 && v < 0.7) {
-            assert_eq!(degree[n], 4, "interior foam node {n} joins {} struts", degree[n]);
+            assert_eq!(
+                degree[n], 4,
+                "interior foam node {n} joins {} struts",
+                degree[n]
+            );
             interior_checked += 1;
         }
     }
@@ -280,7 +281,10 @@ fn generated_lattice_survives_a_frame_solve() {
         .find(|f| f.name == "contact_force")
         .unwrap();
     let total_fz: f64 = contact.data.chunks_exact(3).map(|f| f[2]).sum();
-    assert!(total_fz < 0.0, "expected downward net force, got {total_fz}");
+    assert!(
+        total_fz < 0.0,
+        "expected downward net force, got {total_fz}"
+    );
 
     // Top-center node (0.5, 0.5, 1.0) is a cubic lattice point under the
     // sphere's deepest dip: pressed down by ~the dip depth.

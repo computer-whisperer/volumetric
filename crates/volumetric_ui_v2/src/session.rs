@@ -1422,13 +1422,16 @@ pub fn execute_job_monitored(
                     progress,
                 })
             };
-            let result =
-                match build_preview_scene_monitored(&job.request, &job.cancel, backend, &progress)
-                {
-                    Ok(Some(entity)) => Ok(entity),
-                    Ok(None) => Err(PreviewBuildError::Cancelled),
-                    Err(error) => Err(PreviewBuildError::Failed(error)),
-                };
+            let result = match build_preview_scene_monitored(
+                &job.request,
+                &job.cancel,
+                backend,
+                &progress,
+            ) {
+                Ok(Some(entity)) => Ok(entity),
+                Ok(None) => Err(PreviewBuildError::Cancelled),
+                Err(error) => Err(PreviewBuildError::Failed(error)),
+            };
             BackgroundResult::PreviewComplete(Box::new(PreviewBuildResult {
                 key: job.key,
                 result,
@@ -2658,11 +2661,7 @@ fn build_fea_mesh_preview(
                 ];
                 for idx in [0, 1, 2, 0, 2, 3] {
                     let (p, n, c) = quad[idx];
-                    vertices.push(renderer::MeshVertex::colored(
-                        p.to_array(),
-                        n.to_array(),
-                        c,
-                    ));
+                    vertices.push(renderer::MeshVertex::colored(p.to_array(), n.to_array(), c));
                 }
             }
             // Flat end caps (fans anchored at ring vertex 0).
@@ -2719,20 +2718,22 @@ fn build_fea_mesh_preview(
         };
     }
 
-    let mut detail = vec![if mesh.element_kind == volumetric::fea::FeaElementKind::Bar2 {
-        format!(
-            "FEA strut mesh: {} nodes · {} struts",
-            mesh.node_count(),
-            mesh.element_count()
-        )
-    } else {
-        format!(
-            "FEA mesh: {} nodes · {} elements · {} boundary faces",
-            mesh.node_count(),
-            mesh.element_count(),
-            faces.len()
-        )
-    }];
+    let mut detail = vec![
+        if mesh.element_kind == volumetric::fea::FeaElementKind::Bar2 {
+            format!(
+                "FEA strut mesh: {} nodes · {} struts",
+                mesh.node_count(),
+                mesh.element_count()
+            )
+        } else {
+            format!(
+                "FEA mesh: {} nodes · {} elements · {} boundary faces",
+                mesh.node_count(),
+                mesh.element_count(),
+                faces.len()
+            )
+        },
+    ];
     detail.extend(extra_detail);
     let stats = OutputStats {
         triangles: vertices.len() / 3,
@@ -2950,16 +2951,13 @@ mod tests {
             cancel: Arc::new(AtomicBool::new(false)),
         };
         let phases: Mutex<Vec<String>> = Mutex::new(Vec::new());
-        let result = execute_job_monitored(
-            BackgroundJob::BuildPreview(job),
-            &LocalBackend,
-            &|result| {
+        let result =
+            execute_job_monitored(BackgroundJob::BuildPreview(job), &LocalBackend, &|result| {
                 if let BackgroundResult::PreviewProgress { asset_id, progress } = result {
                     assert_eq!(asset_id, "sphere");
                     phases.lock().unwrap().push(progress.phase);
                 }
-            },
-        );
+            });
         assert!(matches!(result, BackgroundResult::PreviewComplete(_)));
         let phases = phases.into_inner().unwrap();
         assert!(

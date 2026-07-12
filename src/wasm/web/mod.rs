@@ -104,8 +104,9 @@ impl WebModelExecutor {
         let bounds = fetch_bounds_nd(handle)?;
         let sample_format = match wasm_model_get_sample_format(handle) {
             None => SampleFormat::default(),
-            Some(bytes) => volumetric_abi::decode_sample_format(&bytes)
-                .map_err(WasmBackendError::Execution)?,
+            Some(bytes) => {
+                volumetric_abi::decode_sample_format(&bytes).map_err(WasmBackendError::Execution)?
+            }
         };
         let has_sample_channels = wasm_model_has_sample_channels(handle);
         if sample_format.channels.len() > 1 {
@@ -190,9 +191,7 @@ impl ModelExecutor for WebModelExecutor {
             position,
             self.sample_format.channels.len() as u32,
         )
-        .ok_or_else(|| {
-            WasmBackendError::Execution("WASM sample_channels failed".to_string())
-        })
+        .ok_or_else(|| WasmBackendError::Execution("WASM sample_channels failed".to_string()))
     }
 }
 

@@ -3557,7 +3557,11 @@ fn output_settings_popover(app: &VolumetricUiV2, id: &str) -> El {
         }
         body.push(text(summary).caption().muted());
         if let Some((min, max)) = stats.bounds {
-            body.push(text(format!("size {}", format_dims(min, max))).caption().muted());
+            body.push(
+                text(format!("size {}", format_dims(min, max)))
+                    .caption()
+                    .muted(),
+            );
             body.push(
                 text(format!(
                     "bounds ({}, {}, {}) to ({}, {}, {})",
@@ -3961,7 +3965,9 @@ fn viewport_hud(app: &VolumetricUiV2) -> El {
     let triangles: usize = app.output_stats.values().map(|s| s.triangles).sum();
     let points: usize = app.output_stats.values().map(|s| s.points).sum();
     let mut badges = vec![
-        badge(format!("{} in viewport", requests.len())).muted().xsmall(),
+        badge(format!("{} in viewport", requests.len()))
+            .muted()
+            .xsmall(),
         badge(format!("{} outputs", app.runtime_assets.len()))
             .muted()
             .xsmall(),
@@ -4089,8 +4095,10 @@ fn preview_status_chip(app: &VolumetricUiV2) -> El {
     let mut label = app.preview_build_status.label();
     // While a build is in flight, append its latest meshing phase (e.g.
     // "subdividing (1.2M cells)") so long builds show what they're doing.
-    if matches!(app.preview_build_status, PreviewBuildStatus::Building { .. })
-        && let Some(progress) = &app.preview_progress
+    if matches!(
+        app.preview_build_status,
+        PreviewBuildStatus::Building { .. }
+    ) && let Some(progress) = &app.preview_progress
     {
         label = format!("{label} · {}", progress.phase);
     }
@@ -6506,7 +6514,10 @@ mod tests {
         source.save_project_file(&path);
 
         let mut opened = VolumetricUiV2::empty();
-        dispatch(&mut opened, UiEvent::synthetic_click(TOGGLE_AUTO_REBUILD_KEY));
+        dispatch(
+            &mut opened,
+            UiEvent::synthetic_click(TOGGLE_AUTO_REBUILD_KEY),
+        );
         assert!(opened.auto_rebuild());
         opened.open_project_file(&path);
         std::fs::remove_file(&path).ok();

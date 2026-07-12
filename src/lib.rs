@@ -1147,12 +1147,7 @@ impl Project {
                 return Err(ExecutionError::Cancelled);
             }
             progress(BuildProgress {
-                phase: format!(
-                    "{} ({}/{})",
-                    step.operator_id,
-                    step_index + 1,
-                    step_count
-                ),
+                phase: format!("{} ({}/{})", step.operator_id, step_index + 1, step_count),
                 fraction: Some(step_index as f32 / step_count.max(1) as f32),
             });
 
