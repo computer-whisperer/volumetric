@@ -658,6 +658,11 @@ impl ViewportRenderer {
             if wireframe && let Some(lines) = &resident.wireframe {
                 self.renderer.submit_retained_lines(lines);
             }
+            // Subspace gizmos are generated per frame (not retained) so
+            // their display extent can track the whole scene's bounds.
+            if let Some(subspace) = &entity.subspace {
+                submit_subspace_gizmo(&mut self.renderer, subspace, bounds);
+            }
             // The bounds box is 12 segments; immediate-mode submission each
             // frame is cheaper than retaining it.
             if show_bounds {
@@ -739,6 +744,152 @@ fn bounds_box_style(bounds: PreviewBounds) -> renderer::LineStyle {
         },
         depth_mode: renderer::DepthMode::Overlay,
     }
+}
+
+/// Subspace gizmo palette: the subspace itself in cyan-blue, the oriented
+/// hyperplane normal in amber, frame triads in the usual RGB = xyz.
+const SUBSPACE_COLOR: [f32; 4] = [0.30, 0.75, 1.0, 0.9];
+const SUBSPACE_GRID_COLOR: [f32; 4] = [0.30, 0.75, 1.0, 0.28];
+const SUBSPACE_NORMAL_COLOR: [f32; 4] = [1.0, 0.72, 0.2, 0.9];
+const SUBSPACE_FRAME_COLORS: [[f32; 4]; 3] = [
+    [0.94, 0.35, 0.35, 0.95],
+    [0.42, 0.85, 0.35, 0.95],
+    [0.35, 0.55, 1.0, 0.95],
+];
+
+/// A subspace's world vector padded into viewport 3-space (2-space values
+/// draw in the z = 0 plane).
+fn pad3(v: &[f64]) -> Vec3 {
+    Vec3::new(
+        v.first().copied().unwrap_or(0.0) as f32,
+        v.get(1).copied().unwrap_or(0.0) as f32,
+        v.get(2).copied().unwrap_or(0.0) as f32,
+    )
+}
+
+fn gizmo_segment(start: Vec3, end: Vec3, color: [f32; 4]) -> renderer::LineSegment {
+    renderer::LineSegment {
+        start: start.to_array(),
+        end: end.to_array(),
+        color,
+    }
+}
+
+/// Immediate-mode gizmo for a subspace entity. The subspace is infinite,
+/// so its display window is sized by the scene bounds and centered on the
+/// scene center's projection onto the subspace — a bed plane under a part
+/// spans the part no matter where its chart origin sits. Markers: a dot at
+/// the chart origin, and for hyperplanes an amber arrow along the oriented
+/// normal.
+///
+/// Public (with `build_preview_scene`) for the headless debug examples.
+pub fn submit_subspace_gizmo(
+    renderer: &mut renderer::Renderer,
+    subspace: &volumetric::subspace::Subspace,
+    scene: PreviewBounds,
+) {
+    let scene_center = (scene.min_vec3() + scene.max_vec3()) * 0.5;
+    let half = ((scene.max_vec3() - scene.min_vec3()).length() * 0.55).max(1.0);
+    let center = {
+        let world: Vec<f64> = scene_center.to_array()[..subspace.ambient().min(3)]
+            .iter()
+            .map(|c| *c as f64)
+            .collect();
+        let (chart, _) = subspace.project(&world);
+        pad3(&subspace.embed(&chart))
+    };
+
+    let origin = pad3(&subspace.origin);
+    let basis: Vec<Vec3> = (0..subspace.rank())
+        .map(|i| pad3(subspace.basis_vector(i)))
+        .collect();
+
+    // Depth-tested faint grid vs always-visible structural lines.
+    let mut main = Vec::new();
+    let mut grid = Vec::new();
+    let mut points = vec![renderer::PointInstance {
+        position: origin.to_array(),
+        color: SUBSPACE_COLOR,
+    }];
+
+    match basis.as_slice() {
+        [] => {
+            let r = half * 0.12;
+            for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
+                main.push(gizmo_segment(
+                    origin - axis * r,
+                    origin + axis * r,
+                    SUBSPACE_COLOR,
+                ));
+            }
+        }
+        [dir] => {
+            main.push(gizmo_segment(
+                center - *dir * half,
+                center + *dir * half,
+                SUBSPACE_COLOR,
+            ));
+        }
+        [u, v] => {
+            let at = |su: f32, sv: f32| center + *u * (su * half) + *v * (sv * half);
+            let corners = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)];
+            for (a, b) in corners.iter().zip(corners.iter().cycle().skip(1)) {
+                main.push(gizmo_segment(at(a.0, a.1), at(b.0, b.1), SUBSPACE_COLOR));
+            }
+            for t in [-0.5, 0.0, 0.5] {
+                grid.push(gizmo_segment(at(t, -1.0), at(t, 1.0), SUBSPACE_GRID_COLOR));
+                grid.push(gizmo_segment(at(-1.0, t), at(1.0, t), SUBSPACE_GRID_COLOR));
+            }
+        }
+        // Full frame: an axis triad at the chart origin.
+        triad => {
+            for (b, color) in triad.iter().zip(SUBSPACE_FRAME_COLORS) {
+                main.push(gizmo_segment(origin, origin + *b * (half * 0.5), color));
+            }
+        }
+    }
+
+    if let Some(normal) = subspace.normal() {
+        let tip = center + pad3(&normal) * (half * 0.35);
+        main.push(gizmo_segment(center, tip, SUBSPACE_NORMAL_COLOR));
+        points.push(renderer::PointInstance {
+            position: tip.to_array(),
+            color: SUBSPACE_NORMAL_COLOR,
+        });
+    }
+
+    if !grid.is_empty() {
+        renderer.submit_lines(
+            &renderer::LineData { segments: grid },
+            Mat4::IDENTITY,
+            renderer::LineStyle {
+                width: 1.0,
+                width_mode: renderer::WidthMode::ScreenSpace,
+                pattern: renderer::LinePattern::Solid,
+                depth_mode: renderer::DepthMode::Normal,
+            },
+        );
+    }
+    renderer.submit_lines(
+        &renderer::LineData { segments: main },
+        Mat4::IDENTITY,
+        renderer::LineStyle {
+            width: 2.0,
+            width_mode: renderer::WidthMode::ScreenSpace,
+            pattern: renderer::LinePattern::Solid,
+            depth_mode: renderer::DepthMode::Overlay,
+        },
+    );
+    renderer.submit_points(
+        &renderer::PointData { points },
+        Mat4::IDENTITY,
+        renderer::PointStyle {
+            size: 8.0,
+            size_mode: renderer::WidthMode::ScreenSpace,
+            shape: renderer::PointShape::Circle,
+            depth_mode: renderer::DepthMode::Overlay,
+        },
+    );
 }
 
 /// The HUD warning for a frame that dropped geometry at the GPU buffer
@@ -918,6 +1069,10 @@ pub struct PreviewEntity {
     /// (composited in per frame when requested; `None` for point clouds and
     /// sketch previews).
     pub wireframe_lines: Option<renderer::LineData>,
+    /// The decoded subspace value, for entities that are subspace gizmos.
+    /// Gizmo geometry is generated at submit time so its extent can follow
+    /// the whole scene's bounds, not this entity's own.
+    pub subspace: Option<volumetric::subspace::Subspace>,
 }
 
 #[derive(Clone, Copy)]
@@ -936,7 +1091,7 @@ impl PreviewBounds {
     }
 
     /// The bounding box enclosing both `self` and `other`.
-    fn union(self, other: PreviewBounds) -> PreviewBounds {
+    pub fn union(self, other: PreviewBounds) -> PreviewBounds {
         PreviewBounds {
             min: (
                 self.min.0.min(other.min.0),
@@ -1875,6 +2030,9 @@ pub fn preview_prelude(
     if request.type_hint == Some(AssetTypeHint::TriMesh) {
         return build_tri_mesh_preview(request, build_start).map(done);
     }
+    if request.type_hint == Some(AssetTypeHint::Subspace) {
+        return build_subspace_preview(request, build_start).map(done);
+    }
 
     // 2D sketches get a flat raster preview; the 3D mesh plans don't apply.
     let dims = volumetric::model_dimensions_from_bytes(request.data.as_slice())
@@ -2052,6 +2210,7 @@ fn finish_preview_scene(
         },
         stats,
         wireframe_lines,
+        subspace: None,
     }
 }
 
@@ -2381,6 +2540,7 @@ fn build_sketch_preview(
         },
         stats,
         wireframe_lines: None,
+        subspace: None,
     })
 }
 
@@ -2760,6 +2920,7 @@ fn build_fea_mesh_preview(
         bounds,
         stats,
         wireframe_lines: Some(renderer::LineData { segments }),
+        subspace: None,
     })
 }
 
@@ -2845,6 +3006,50 @@ fn build_tri_mesh_preview(
         bounds,
         stats,
         wireframe_lines: Some(renderer::LineData { segments }),
+        subspace: None,
+    })
+}
+
+/// Preview for a Subspace value: decode and validate now, but bake no
+/// geometry — the gizmo is generated per frame in `submit_scene`, sized
+/// to the whole scene. The placeholder bounds around the chart origin
+/// give the camera something to frame when the gizmo is alone.
+fn build_subspace_preview(
+    request: &PreviewRequest,
+    build_start: web_time::Instant,
+) -> Result<PreviewEntity, String> {
+    let subspace = volumetric::subspace::decode_subspace(request.data.as_slice())?;
+    if subspace.ambient() > 3 {
+        return Err(format!(
+            "cannot draw a subspace of {}-space in the 3D viewport",
+            subspace.ambient()
+        ));
+    }
+    let kind = match subspace.rank() {
+        0 => "point",
+        1 => "line",
+        2 => "plane",
+        _ => "frame",
+    };
+    let stats = OutputStats {
+        detail: vec![format!(
+            "subspace: {kind} (rank {}) in {}-space",
+            subspace.rank(),
+            subspace.ambient()
+        )],
+        mesh_ms: build_start.elapsed().as_secs_f64() * 1000.0,
+        ..Default::default()
+    };
+    let origin = pad3(&subspace.origin);
+    Ok(PreviewEntity {
+        scene: renderer::SceneData::new(),
+        bounds: PreviewBounds {
+            min: (origin.x - 1.0, origin.y - 1.0, origin.z - 1.0),
+            max: (origin.x + 1.0, origin.y + 1.0, origin.z + 1.0),
+        },
+        stats,
+        wireframe_lines: None,
+        subspace: Some(subspace),
     })
 }
 
@@ -3500,6 +3705,7 @@ mod tests {
             },
             stats: OutputStats::default(),
             wireframe_lines: None,
+            subspace: None,
         }
     }
 

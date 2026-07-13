@@ -257,7 +257,7 @@ impl Subspace {
                             .map(move |col| self.basis[row * n + col])
                     })
                     .collect();
-                let sign = if (n - 1 + j) % 2 == 0 { 1.0 } else { -1.0 };
+                let sign = if (n - 1 + j).is_multiple_of(2) { 1.0 } else { -1.0 };
                 sign * determinant(minor, k)
             })
             .collect();

@@ -545,6 +545,7 @@ enum AssetSlotKind {
     Model,
     FeaMesh,
     TriMesh,
+    Subspace,
 }
 
 #[derive(Clone, Debug)]
@@ -632,6 +633,8 @@ pub enum OutputKind {
     FeaMesh,
     /// A triangle mesh value: drawn as-is.
     TriMesh,
+    /// An affine subspace value: point/line/plane gizmo.
+    Subspace,
 }
 
 /// FEA-specific view settings.
@@ -683,6 +686,9 @@ pub enum OutputRender {
     TriMesh {
         wireframe: bool,
     },
+    /// Subspace gizmos have no settings yet; the extent adapts to the
+    /// scene.
+    Subspace,
 }
 
 impl OutputRender {
@@ -692,6 +698,7 @@ impl OutputRender {
             Self::Model2d { .. } => OutputKind::Model2d,
             Self::FeaMesh(_) => OutputKind::FeaMesh,
             Self::TriMesh { .. } => OutputKind::TriMesh,
+            Self::Subspace => OutputKind::Subspace,
         }
     }
 
@@ -717,6 +724,7 @@ impl OutputRender {
                 None => "FEA".to_string(),
             },
             Self::TriMesh { .. } => "triangle mesh".to_string(),
+            Self::Subspace => "subspace".to_string(),
         }
     }
 
@@ -725,7 +733,7 @@ impl OutputRender {
         match self {
             Self::Model3d { wireframe, .. } | Self::TriMesh { wireframe } => *wireframe,
             Self::FeaMesh(fea) => fea.wireframe,
-            Self::Model2d { .. } => false,
+            Self::Model2d { .. } | Self::Subspace => false,
         }
     }
 }
@@ -748,6 +756,7 @@ pub enum PreviewPlan {
         color_field: Option<String>,
     },
     TriMesh,
+    Subspace,
 }
 
 impl PreviewPlan {
@@ -766,6 +775,7 @@ impl PreviewPlan {
                 None => "FEA mesh".to_string(),
             },
             Self::TriMesh => "Triangle mesh".to_string(),
+            Self::Subspace => "Subspace".to_string(),
         }
     }
 }
@@ -1031,6 +1041,7 @@ impl VolumetricUiV2 {
         match asset.type_hint() {
             Some(AssetTypeHint::FeaMesh) => OutputKind::FeaMesh,
             Some(AssetTypeHint::TriMesh) => OutputKind::TriMesh,
+            Some(AssetTypeHint::Subspace) => OutputKind::Subspace,
             _ => {
                 let data = asset.data_arc();
                 let key = (Arc::as_ptr(&data) as usize, data.len());
@@ -1068,6 +1079,7 @@ impl VolumetricUiV2 {
             },
             OutputKind::FeaMesh => OutputRender::FeaMesh(FeaRender::default()),
             OutputKind::TriMesh => OutputRender::TriMesh { wireframe: false },
+            OutputKind::Subspace => OutputRender::Subspace,
         }
     }
 
@@ -1167,7 +1179,7 @@ impl VolumetricUiV2 {
                 wireframe
             }
             OutputRender::FeaMesh(fea) => &mut fea.wireframe,
-            OutputRender::Model2d { .. } => return,
+            OutputRender::Model2d { .. } | OutputRender::Subspace => return,
         };
         *slot = !*slot;
         let state = if *slot { "on" } else { "off" };
@@ -1399,7 +1411,12 @@ impl VolumetricUiV2 {
     fn render_request_for_asset(&self, asset: &LoadedAsset) -> Option<PreviewRequest> {
         if !matches!(
             asset.type_hint(),
-            Some(AssetTypeHint::Model | AssetTypeHint::FeaMesh | AssetTypeHint::TriMesh) | None
+            Some(
+                AssetTypeHint::Model
+                    | AssetTypeHint::FeaMesh
+                    | AssetTypeHint::TriMesh
+                    | AssetTypeHint::Subspace
+            ) | None
         ) {
             return None;
         }
@@ -1425,6 +1442,7 @@ impl VolumetricUiV2 {
                 color_field: fea.color_field.clone(),
             },
             OutputRender::TriMesh { .. } => PreviewPlan::TriMesh,
+            OutputRender::Subspace => PreviewPlan::Subspace,
         };
         Some(PreviewRequest {
             asset_id: asset.id().to_string(),
@@ -1835,6 +1853,7 @@ impl VolumetricUiV2 {
                     OperatorMetadataInput::ModelWASM => AssetSlotKind::Model,
                     OperatorMetadataInput::FeaMesh => AssetSlotKind::FeaMesh,
                     OperatorMetadataInput::TriMesh => AssetSlotKind::TriMesh,
+                    OperatorMetadataInput::Subspace => AssetSlotKind::Subspace,
                     _ => return None,
                 };
                 Some(AssetSlot {
@@ -3542,6 +3561,9 @@ fn output_settings_popover(app: &VolumetricUiV2, id: &str) -> El {
                 .gap(tokens::SPACE_2),
             );
         }
+        OutputRender::Subspace => {
+            body.push(text("Subspace gizmo · no settings yet").caption().muted());
+        }
     }
     if let Some(stats) = app.output_stats.get(id) {
         body.push(divider());
@@ -4456,6 +4478,7 @@ fn step_edit_rows(app: &VolumetricUiV2, step_idx: usize) -> Vec<El> {
         let models = step_input_options(app, step_idx, AssetSlotKind::Model);
         let meshes = step_input_options(app, step_idx, AssetSlotKind::FeaMesh);
         let trimeshes = step_input_options(app, step_idx, AssetSlotKind::TriMesh);
+        let subspaces = step_input_options(app, step_idx, AssetSlotKind::Subspace);
         rows.push(text("Inputs").muted().caption().semibold());
         for (n, slot) in edit.asset_slots.iter().enumerate() {
             let current = match step.inputs.get(slot.input_idx) {
@@ -4466,6 +4489,7 @@ fn step_edit_rows(app: &VolumetricUiV2, step_idx: usize) -> Vec<El> {
                 AssetSlotKind::Model => &models,
                 AssetSlotKind::FeaMesh => &meshes,
                 AssetSlotKind::TriMesh => &trimeshes,
+                AssetSlotKind::Subspace => &subspaces,
             };
             rows.push(asset_slot_selector(step_idx, slot, n, current, options));
         }
@@ -4557,6 +4581,7 @@ fn step_input_options(app: &VolumetricUiV2, step_idx: usize, kind: AssetSlotKind
         AssetSlotKind::Model => editable_model_asset_ids(app),
         AssetSlotKind::FeaMesh => editable_fea_asset_ids(app),
         AssetSlotKind::TriMesh => editable_trimesh_asset_ids(app),
+        AssetSlotKind::Subspace => editable_subspace_asset_ids(app),
     };
     ids.into_iter()
         .filter(|id| !not_yet_produced.contains(id.as_str()))
@@ -4609,6 +4634,7 @@ fn asset_slot_kind_label(kind: AssetSlotKind) -> &'static str {
         AssetSlotKind::Model => "model",
         AssetSlotKind::FeaMesh => "FEA mesh",
         AssetSlotKind::TriMesh => "triangle mesh",
+        AssetSlotKind::Subspace => "subspace",
     }
 }
 
@@ -5067,6 +5093,13 @@ fn editable_trimesh_asset_ids(app: &VolumetricUiV2) -> Vec<String> {
     app.declared_assets_typed()
         .into_iter()
         .filter_map(|(id, type_hint)| (type_hint == Some(AssetTypeHint::TriMesh)).then_some(id))
+        .collect()
+}
+
+fn editable_subspace_asset_ids(app: &VolumetricUiV2) -> Vec<String> {
+    app.declared_assets_typed()
+        .into_iter()
+        .filter_map(|(id, type_hint)| (type_hint == Some(AssetTypeHint::Subspace)).then_some(id))
         .collect()
 }
 
