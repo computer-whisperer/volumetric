@@ -43,6 +43,8 @@ const OPERATORS: &[(&str, &str)] = &[
     ("strut_pattern_operator", "Strut Pattern"),
     ("strut_model_operator", "Strut Model"),
     ("brim_operator", "Brim"),
+    ("subspace_operator", "Subspace"),
+    ("model_bound_operator", "Model Bound"),
 ];
 
 /// Reads `version = "..."` from a bundled crate's Cargo.toml. Every bundled

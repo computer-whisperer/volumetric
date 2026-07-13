@@ -290,6 +290,9 @@ pub use volumetric_abi::fea;
 // The triangle mesh value type (CBOR payload of TriMesh-typed assets).
 pub use volumetric_abi::trimesh;
 
+// The affine subspace value type (CBOR payload of Subspace-typed assets).
+pub use volumetric_abi::subspace;
+
 // Occupancy semantics for sample values, shared with hosts that classify
 // raw samples themselves (preview rasters, analytics).
 pub use volumetric_abi::{OCCUPANCY_THRESHOLD, is_occupied};

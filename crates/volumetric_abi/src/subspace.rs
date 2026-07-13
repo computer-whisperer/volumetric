@@ -36,8 +36,11 @@ pub struct Subspace {
 }
 
 /// Per-axis selector for [`Subspace::from_bounds`]: how the subspace
-/// relates to a bounding box along one axis.
+/// relates to a bounding box along one axis. Serialized lowercase so it
+/// can double as an operator-config enum (`"min"` / `"max"` / `"center"`
+/// / `"span"`).
 #[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum BoundSelector {
     /// Fix the axis at the box's minimum bound.
     Min,
@@ -206,11 +209,7 @@ impl Subspace {
     /// subspace.
     pub fn project(&self, point: &[f64]) -> (Vec<f64>, f64) {
         debug_assert_eq!(point.len(), self.ambient());
-        let rel: Vec<f64> = point
-            .iter()
-            .zip(&self.origin)
-            .map(|(p, o)| p - o)
-            .collect();
+        let rel: Vec<f64> = point.iter().zip(&self.origin).map(|(p, o)| p - o).collect();
         let chart: Vec<f64> = (0..self.rank())
             .map(|i| {
                 self.basis_vector(i)

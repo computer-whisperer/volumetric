@@ -3316,6 +3316,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "model_bound_operator"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "serde",
+ "volumetric_abi",
+]
+
+[[package]]
 name = "model_merge_core"
 version = "0.1.0"
 dependencies = [
@@ -5261,6 +5270,15 @@ version = "0.1.0"
 dependencies = [
  "ciborium",
  "lattice_model_core",
+ "serde",
+ "volumetric_abi",
+]
+
+[[package]]
+name = "subspace_operator"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
  "serde",
  "volumetric_abi",
 ]
