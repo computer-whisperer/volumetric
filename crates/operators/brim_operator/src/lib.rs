@@ -5,16 +5,21 @@
 //!
 //! # Bed plane convention
 //!
-//! The print bed is the axis-aligned plane `z = bed_z`, normal +z —
-//! `bed_z` defaults to the model's z-min bound (the part sits on the
-//! bed). Parts oriented differently should be print-oriented with the
-//! rotation operator first, exactly as in a slicer.
+//! The print bed is an axis-aligned plane on a configurable axis and
+//! extreme: `axis` picks the bed normal (x, y, or z) and `extreme`
+//! picks which side of the model the bed touches. The default — axis z,
+//! extreme min — is the slicer convention: the plane `z = z_min`, the
+//! part sitting on the bed. `bed_position` overrides the plane's
+//! coordinate along the axis; the brim slab always extends `brim_height`
+//! from the bed toward the part (up from a min bed, down from a max
+//! bed). The in-plane axes are the remaining two in ascending order.
 //!
 //! # Mechanism
 //!
 //! 1. The input model is scanned through the host's `input_model_*`
-//!    sampling imports: one thin slab at `z = bed_z + scan_height` on a
-//!    uniform x/y grid covering the model bounds plus the brim margin.
+//!    sampling imports: one thin slab offset `scan_height` from the bed
+//!    toward the part, on a uniform in-plane grid covering the model
+//!    bounds plus the brim margin.
 //! 2. A Euclidean distance transform over the scanned footprint bitmap
 //!    turns it into `distance_to_footprint` per grid cell. Every contact
 //!    patch radiates independently — a sparse polka-dot contact pattern
@@ -23,8 +28,8 @@
 //! 3. The field `brim_width - distance` is baked into a
 //!    `gridfield_model_core` payload and patched into the embedded
 //!    `brim_model_template` module: a standalone 3D model occupied where
-//!    the bilinear field is >= 0 within `bed_z <= z <= bed_z +
-//!    brim_height` (the zero crossing is the brim contour, smooth at
+//!    the bilinear field is >= 0 within the bed slab along the chosen
+//!    axis (the zero crossing is the brim contour, smooth at
 //!    sub-cell precision). The field is cropped to the actual brim
 //!    extent, so the advertised bounds — and the downstream meshing
 //!    domain — stay tight around sparse contact patterns.
@@ -35,17 +40,22 @@
 //!
 //! Configuration:
 //! - `brim_width`: how far the brim radiates from the footprint.
-//! - `brim_height`: brim thickness above the bed (a few layer heights).
-//! - `bed_z`: bed plane override; omitted = the model's z-min bound.
-//! - `scan_height`: footprint scan offset above the bed; 0 = auto (half
-//!   the brim height). Raising it also catches geometry that approaches
-//!   but does not touch the bed.
+//! - `brim_height`: brim thickness off the bed (a few layer heights).
+//! - `axis`: bed normal, `"x"` / `"y"` / `"z"`; default `"z"`.
+//! - `extreme`: which side of the model the bed touches, `"min"` /
+//!   `"max"`; default `"min"`.
+//! - `bed_position`: bed plane coordinate override; omitted = the
+//!   model's bound at the chosen axis/extreme. (`bed_z` is accepted as
+//!   a legacy alias.)
+//! - `scan_height`: footprint scan offset from the bed toward the part;
+//!   0 = auto (half the brim height). Raising it also catches geometry
+//!   that approaches but does not touch the bed.
 //! - `gap`: also cut `distance < gap`, detaching the brim from the part
 //!   (skirt-style). 0 lets the brim run under the footprint.
 //! - `outside_only`: keep enclosed holes in the footprint brim-free
 //!   (slicer "outer brim only"); off, holes fill like any other nearby
 //!   area.
-//! - `resolution`: scan grid cells along the longest model x/y axis
+//! - `resolution`: scan grid cells along the longest in-plane model axis
 //!   (clamped to 16..=2048). Contact features smaller than a cell can be
 //!   missed — raise this for fine polka-dot patterns.
 //!
@@ -81,12 +91,60 @@ enum BrimOutput {
     Brim,
 }
 
+/// The bed-normal axis.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Axis {
+    X,
+    Y,
+    Z,
+}
+
+impl Axis {
+    fn index(self) -> usize {
+        match self {
+            Axis::X => 0,
+            Axis::Y => 1,
+            Axis::Z => 2,
+        }
+    }
+
+    /// The two in-plane axes, ascending — the template uses the same
+    /// order to lay the field's (u, v) into world coordinates.
+    fn plane(self) -> (usize, usize) {
+        match self {
+            Axis::X => (1, 2),
+            Axis::Y => (0, 2),
+            Axis::Z => (0, 1),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Axis::X => "x",
+            Axis::Y => "y",
+            Axis::Z => "z",
+        }
+    }
+}
+
+/// Which side of the model the bed touches.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Extreme {
+    Min,
+    Max,
+}
+
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(default)]
 struct BrimConfig {
     brim_width: f64,
     brim_height: f64,
-    bed_z: Option<f64>,
+    axis: Axis,
+    extreme: Extreme,
+    #[serde(alias = "bed_z")]
+    bed_position: Option<f64>,
     scan_height: f64,
     gap: f64,
     outside_only: bool,
@@ -99,7 +157,9 @@ impl Default for BrimConfig {
         Self {
             brim_width: 5.0,
             brim_height: 0.6,
-            bed_z: None,
+            axis: Axis::Z,
+            extreme: Extreme::Min,
+            bed_position: None,
             scan_height: 0.0,
             gap: 0.0,
             outside_only: false,
@@ -137,10 +197,10 @@ fn validate(cfg: &BrimConfig) -> Result<(), String> {
             cfg.scan_height
         ));
     }
-    if let Some(bed_z) = cfg.bed_z
-        && !bed_z.is_finite()
+    if let Some(bed) = cfg.bed_position
+        && !bed.is_finite()
     {
-        return Err(format!("bed_z must be finite, got {bed_z}"));
+        return Err(format!("bed_position must be finite, got {bed}"));
     }
     Ok(())
 }
@@ -149,36 +209,40 @@ fn validate(cfg: &BrimConfig) -> Result<(), String> {
 // Scan grid
 // ---------------------------------------------------------------------------
 
-/// The corner-aligned x/y scan lattice (matches `gridfield_model_core`
-/// sampling: point (0, 0) sits exactly at (min_x, min_y)).
+/// The corner-aligned in-plane scan lattice over the (u, v) axes —
+/// the two axes other than the bed normal, ascending (matches
+/// `gridfield_model_core` sampling: point (0, 0) sits exactly at
+/// (min_u, min_v)).
 struct ScanGrid {
     nx: usize,
     ny: usize,
-    min_x: f64,
-    min_y: f64,
+    min_u: f64,
+    min_v: f64,
     cell: f64,
 }
 
 impl ScanGrid {
-    /// `[min_x, max_x, min_y, max_y]` of the lattice, spacing-exact.
+    /// `[min_u, max_u, min_v, max_v]` of the lattice, spacing-exact.
     fn bounds(&self) -> [f64; 4] {
         [
-            self.min_x,
-            self.min_x + (self.nx - 1) as f64 * self.cell,
-            self.min_y,
-            self.min_y + (self.ny - 1) as f64 * self.cell,
+            self.min_u,
+            self.min_u + (self.nx - 1) as f64 * self.cell,
+            self.min_v,
+            self.min_v + (self.ny - 1) as f64 * self.cell,
         ]
     }
 }
 
 const MAX_GRID_CELLS: u64 = 16_777_216;
 
-fn plan_grid(model_xy: [f64; 4], brim_width: f64, resolution: i64) -> Result<ScanGrid, String> {
-    let [min_x, max_x, min_y, max_y] = model_xy;
-    let (ex, ey) = (max_x - min_x, max_y - min_y);
+fn plan_grid(model_uv: [f64; 4], brim_width: f64, resolution: i64) -> Result<ScanGrid, String> {
+    let [min_u, max_u, min_v, max_v] = model_uv;
+    let (ex, ey) = (max_u - min_u, max_v - min_v);
     let longest = ex.max(ey);
     if !(longest > 0.0 && longest.is_finite()) {
-        return Err(format!("model x/y bounds are degenerate: {model_xy:?}"));
+        return Err(format!(
+            "model bounds in the bed plane are degenerate: {model_uv:?}"
+        ));
     }
     let cell = longest / resolution.clamp(16, 2048) as f64;
     // The brim reaches at most brim_width beyond the footprint (which lies
@@ -196,22 +260,23 @@ fn plan_grid(model_xy: [f64; 4], brim_width: f64, resolution: i64) -> Result<Sca
     Ok(ScanGrid {
         nx,
         ny,
-        min_x: min_x - margin,
-        min_y: min_y - margin,
+        min_u: min_u - margin,
+        min_v: min_v - margin,
         cell,
     })
 }
 
-/// Occupancy of every lattice point at `z = scan_z`, sampled a bounded
-/// batch of rows per host call.
-fn scan_footprint(grid: &ScanGrid, scan_z: f64) -> Result<Vec<bool>, String> {
+/// Occupancy of every lattice point on the plane `axis = scan_c`,
+/// sampled a bounded batch of rows per host call.
+fn scan_footprint(grid: &ScanGrid, axis: Axis, scan_c: f64) -> Result<Vec<bool>, String> {
     let ScanGrid {
         nx,
         ny,
-        min_x,
-        min_y,
+        min_u,
+        min_v,
         cell,
     } = *grid;
+    let (ua, va) = axis.plane();
     let mut occupied = vec![false; nx * ny];
     let rows_per_batch = (65536 / nx).max(1);
     let mut positions = Vec::with_capacity(rows_per_batch.min(ny) * nx * 3);
@@ -220,9 +285,12 @@ fn scan_footprint(grid: &ScanGrid, scan_z: f64) -> Result<Vec<bool>, String> {
         let end = (row + rows_per_batch).min(ny);
         positions.clear();
         for j in row..end {
-            let y = min_y + j as f64 * cell;
+            let v = min_v + j as f64 * cell;
             for i in 0..nx {
-                positions.extend([min_x + i as f64 * cell, y, scan_z]);
+                let mut p = [scan_c; 3];
+                p[ua] = min_u + i as f64 * cell;
+                p[va] = v;
+                positions.extend(p);
             }
         }
         let samples = input_model_sample(0, &positions, 3)
@@ -410,8 +478,8 @@ fn crop_field(field: Vec<f32>, grid: ScanGrid) -> Option<(Vec<f32>, ScanGrid)> {
         ScanGrid {
             nx: cx,
             ny: cy,
-            min_x: grid.min_x + min_i as f64 * grid.cell,
-            min_y: grid.min_y + min_j as f64 * grid.cell,
+            min_u: grid.min_u + min_i as f64 * grid.cell,
+            min_v: grid.min_v + min_j as f64 * grid.cell,
             cell: grid.cell,
         },
     ))
@@ -456,8 +524,14 @@ fn take_slot_export(module: &mut walrus::Module, name: &str) -> Result<i32, Stri
 }
 
 /// Patch the baked field payload (fresh pages, base address into the
-/// payload slot) and the z slab (directly into the config slot).
-fn patch_template(payload: &[u8], bed_z: f64, z_top: f64) -> Result<Vec<u8>, String> {
+/// payload slot) and the bed slab plus axis (directly into the config
+/// slot).
+fn patch_template(
+    payload: &[u8],
+    slab_lo: f64,
+    slab_hi: f64,
+    axis: Axis,
+) -> Result<Vec<u8>, String> {
     let mut module =
         walrus::Module::from_buffer_with_config(TEMPLATE, &walrus::ModuleConfig::new())
             .map_err(|e| format!("failed to parse the embedded template: {e}"))?;
@@ -498,9 +572,10 @@ fn patch_template(payload: &[u8], bed_z: f64, z_top: f64) -> Result<Vec<u8>, Str
         },
         (base as u32).to_le_bytes().to_vec(),
     );
-    let mut config_bytes = Vec::with_capacity(16);
-    config_bytes.extend(bed_z.to_le_bytes());
-    config_bytes.extend(z_top.to_le_bytes());
+    let mut config_bytes = Vec::with_capacity(24);
+    config_bytes.extend(slab_lo.to_le_bytes());
+    config_bytes.extend(slab_hi.to_le_bytes());
+    config_bytes.extend((axis.index() as u64).to_le_bytes());
     module.data.add(
         walrus::DataKind::Active {
             memory: memory_id,
@@ -705,24 +780,42 @@ fn build_brim(input: &[u8], cfg: &BrimConfig) -> Result<Vec<u8>, String> {
         return Err(format!("model bounds are not finite: {bounds:?}"));
     }
 
-    let bed_z = cfg.bed_z.unwrap_or(bounds[4]);
-    let z_top = bed_z + cfg.brim_height;
+    let a = cfg.axis.index();
+    let (ua, va) = cfg.axis.plane();
+    let bed = cfg.bed_position.unwrap_or(match cfg.extreme {
+        Extreme::Min => bounds[2 * a],
+        Extreme::Max => bounds[2 * a + 1],
+    });
+    // The slab and the scan reach from the bed toward the part: up from
+    // a min bed, down from a max bed.
+    let inward = match cfg.extreme {
+        Extreme::Min => 1.0,
+        Extreme::Max => -1.0,
+    };
+    let far = bed + inward * cfg.brim_height;
+    let (slab_lo, slab_hi) = (bed.min(far), bed.max(far));
     let scan_offset = if cfg.scan_height > 0.0 {
         cfg.scan_height
     } else {
         cfg.brim_height * 0.5
     };
-    let scan_z = bed_z + scan_offset;
+    let scan_c = bed + inward * scan_offset;
 
     let grid = plan_grid(
-        [bounds[0], bounds[1], bounds[2], bounds[3]],
+        [
+            bounds[2 * ua],
+            bounds[2 * ua + 1],
+            bounds[2 * va],
+            bounds[2 * va + 1],
+        ],
         cfg.brim_width,
         cfg.resolution,
     )?;
-    let occupied = scan_footprint(&grid, scan_z)?;
+    let occupied = scan_footprint(&grid, cfg.axis, scan_c)?;
     if !occupied.iter().any(|&o| o) {
         return Err(format!(
-            "no part geometry found at scan height z = {scan_z}; check bed_z / scan_height"
+            "no part geometry found at scan plane {} = {scan_c}; check bed_position / scan_height",
+            cfg.axis.name()
         ));
     }
 
@@ -736,20 +829,21 @@ fn build_brim(input: &[u8], cfg: &BrimConfig) -> Result<Vec<u8>, String> {
     })?;
     let payload =
         gridfield_model_core::build_payload(grid.nx as u32, grid.ny as u32, grid.bounds(), &field)?;
-    let brim = patch_template(&payload, bed_z, z_top)?;
+    let brim = patch_template(&payload, slab_lo, slab_hi, cfg.axis)?;
 
     match cfg.output {
         BrimOutput::Brim => Ok(brim),
         BrimOutput::Combined => {
             let gb = grid.bounds();
-            let merged_bounds = [
-                bounds[0].min(gb[0]),
-                bounds[1].max(gb[1]),
-                bounds[2].min(gb[2]),
-                bounds[3].max(gb[3]),
-                bounds[4].min(bed_z),
-                bounds[5].max(z_top),
+            let mut merged_bounds = [
+                bounds[0], bounds[1], bounds[2], bounds[3], bounds[4], bounds[5],
             ];
+            merged_bounds[2 * ua] = merged_bounds[2 * ua].min(gb[0]);
+            merged_bounds[2 * ua + 1] = merged_bounds[2 * ua + 1].max(gb[1]);
+            merged_bounds[2 * va] = merged_bounds[2 * va].min(gb[2]);
+            merged_bounds[2 * va + 1] = merged_bounds[2 * va + 1].max(gb[3]);
+            merged_bounds[2 * a] = merged_bounds[2 * a].min(slab_lo);
+            merged_bounds[2 * a + 1] = merged_bounds[2 * a + 1].max(slab_hi);
             merge_with_input(input, &brim, merged_bounds)
         }
     }
@@ -783,7 +877,7 @@ pub extern "C" fn run() {
 pub extern "C" fn get_metadata() -> i64 {
     static METADATA: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     volumetric_abi::metadata_reply(&METADATA, || {
-        let schema = r#"{ brim_width: float .default 5.0, brim_height: float .default 0.6, ? bed_z: float, scan_height: float .default 0.0, gap: float .default 0.0, outside_only: bool .default false, resolution: int .default 256, output: "combined" / "brim" .default "combined" }"#.to_string();
+        let schema = r#"{ brim_width: float .default 5.0, brim_height: float .default 0.6, axis: "x" / "y" / "z" .default "z", extreme: "min" / "max" .default "min", ? bed_position: float, scan_height: float .default 0.0, gap: float .default 0.0, outside_only: bool .default false, resolution: int .default 256, output: "combined" / "brim" .default "combined" }"#.to_string();
         OperatorMetadata {
             name: "brim_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -915,16 +1009,16 @@ mod tests {
         let scan = ScanGrid {
             nx,
             ny,
-            min_x: 0.0,
-            min_y: 0.0,
+            min_u: 0.0,
+            min_v: 0.0,
             cell: 1.0,
         };
         let field = build_field(&occ, nx, ny, 1.0, &test_config());
         let (cropped, cropped_grid) = crop_field(field, scan).unwrap();
         assert_eq!((cropped_grid.nx, cropped_grid.ny), (7, 5));
         assert_eq!(cropped.len(), 35);
-        assert_eq!(cropped_grid.min_x, 4.0); // dot at 7, pad 2, border 1
-        assert_eq!(cropped_grid.min_y, 0.0); // clamped at the grid edge
+        assert_eq!(cropped_grid.min_u, 4.0); // dot at 7, pad 2, border 1
+        assert_eq!(cropped_grid.min_v, 0.0); // clamped at the grid edge
         // The pad center survives the crop at its new coordinates.
         assert_eq!(cropped[2 * 7 + 3], 2.0);
     }
@@ -942,8 +1036,8 @@ mod tests {
         let scan = ScanGrid {
             nx,
             ny,
-            min_x: 0.0,
-            min_y: 0.0,
+            min_u: 0.0,
+            min_v: 0.0,
             cell: 1.0,
         };
         assert!(crop_field(field, scan).is_none());

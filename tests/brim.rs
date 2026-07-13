@@ -182,10 +182,61 @@ fn channels_pass_through_the_combined_output() {
 }
 
 /// A bed plane that misses the part is an error, not an empty brim.
+/// Uses the legacy `bed_z` alias, which must keep deserializing into
+/// `bed_position`.
 #[test]
 fn missing_footprint_reports_an_error() {
     let mut config = base_config();
     config.push(("bed_z", ciborium::value::Value::Float(-3.0)));
     let err = run_brim(&config).expect_err("scan below the part must fail");
     assert!(err.contains("no part geometry"), "unexpected error: {err}");
+}
+
+/// `extreme: "max"` hangs the brim from the top of the part: the slab
+/// extends downward from z = 1 and the scan runs at z = 0.9.
+#[test]
+fn max_extreme_brims_the_top() {
+    let mut config = base_config();
+    config.push(("extreme", ciborium::value::Value::Text("max".into())));
+    config.push(("output", ciborium::value::Value::Text("brim".into())));
+    let wasm = run_brim(&config).expect("brim run failed");
+    let mut model = create_model_executor(&wasm).expect("model executor");
+
+    let bounds = model.get_bounds_nd().expect("bounds");
+    assert_eq!(bounds.max(2), 1.0);
+    assert!((bounds.min(2) - 0.8).abs() < 1e-12, "slab reaches down");
+
+    // Cross-section radius at z = 0.9 is ~0.436, brim reach ~0.936.
+    assert!(occupied_at(&mut model, [0.8, 0.0, 0.9]), "the ring");
+    assert!(!occupied_at(&mut model, [0.8, 0.0, 0.7]), "below the slab");
+    assert!(!occupied_at(&mut model, [1.05, 0.0, 0.9]), "past the reach");
+}
+
+/// `axis: "x"` puts the bed on the x-min face: the slab spans x in
+/// [-1, -0.8], the footprint scan runs in the y/z plane at x = -0.9, and
+/// the combined output unions the ring with the intact sphere.
+#[test]
+fn x_axis_brims_the_side() {
+    let mut config = base_config();
+    config.push(("axis", ciborium::value::Value::Text("x".into())));
+    let wasm = run_brim(&config).expect("brim run failed");
+    let mut model = create_model_executor(&wasm).expect("model executor");
+
+    // The brim reach (~0.936) stays inside the sphere's y/z bounds and
+    // the slab inside its x bounds, so the union is the sphere's box.
+    let bounds = model.get_bounds_nd().expect("bounds");
+    assert_eq!(bounds.min(0), -1.0);
+    assert_eq!(bounds.max(0), 1.0);
+    assert_eq!(bounds.min(1), -1.0);
+    assert_eq!(bounds.max(2), 1.0);
+
+    // The part itself.
+    assert!(occupied_at(&mut model, [0.0, 0.0, 0.0]));
+    // Ring points in the y/z plane at the scan depth, outside the sphere.
+    assert!(occupied_at(&mut model, [-0.9, 0.8, 0.0]));
+    assert!(occupied_at(&mut model, [-0.9, 0.0, -0.8]));
+    // Same y/z but outside the slab (and outside the sphere).
+    assert!(!occupied_at(&mut model, [-0.7, 0.8, 0.0]));
+    // Beyond the brim reach.
+    assert!(!occupied_at(&mut model, [-0.9, 1.05, 0.0]));
 }
