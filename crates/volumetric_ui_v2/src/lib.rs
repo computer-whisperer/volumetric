@@ -1962,11 +1962,14 @@ impl VolumetricUiV2 {
         let buffers = fields
             .iter()
             .map(|field| {
-                let value = current
-                    .get(&field.name)
-                    .cloned()
-                    .unwrap_or_else(|| field.seed_value());
-                (field.name.clone(), value.to_display_string())
+                // An unset optional field shows an empty buffer (clearing the
+                // field is how it gets unset again).
+                let text = match current.get(&field.name) {
+                    Some(value) => value.to_display_string(),
+                    None if field.optional => String::new(),
+                    None => field.seed_value().to_display_string(),
+                };
+                (field.name.clone(), text)
             })
             .collect();
         Some(ConfigForm {
@@ -2239,8 +2242,15 @@ impl VolumetricUiV2 {
         let Some(buffer) = config.buffers.get(field_name) else {
             return;
         };
-        let Some(value) = ConfigValue::parse(&field.ty, buffer) else {
-            return;
+        // Clearing an optional field unsets it: the value drops out of the
+        // encoded map and the operator's absent-field behavior applies.
+        let value = if field.optional && buffer.trim().is_empty() {
+            None
+        } else {
+            match ConfigValue::parse(&field.ty, buffer) {
+                Some(value) => Some(value),
+                None => return,
+            }
         };
         self.write_config_value(step_idx, config, field_name, value);
         self.mark_project_dirty();
@@ -2251,7 +2261,7 @@ impl VolumetricUiV2 {
         step_idx: usize,
         config: &ConfigForm,
         field_name: &str,
-        value: ConfigValue,
+        value: Option<ConfigValue>,
     ) {
         let Some(step) = self.project.timeline_mut().get_mut(step_idx) else {
             return;
@@ -2260,7 +2270,10 @@ impl VolumetricUiV2 {
             Some(ExecutionInput::Inline(bytes)) => operator_config::decode(bytes),
             _ => return,
         };
-        values.insert(field_name.to_string(), value);
+        match value {
+            Some(value) => values.insert(field_name.to_string(), value),
+            None => values.remove(field_name),
+        };
         let encoded = operator_config::encode(&config.fields, &values);
         if let Some(ExecutionInput::Inline(slot)) = step.inputs.get_mut(config.input_idx) {
             *slot = encoded;
@@ -4689,7 +4702,14 @@ fn config_field_row(field: &ConfigField, buffer: &str, selection: &Selection) ->
         )
         .width(Size::Fixed(132.0)),
     };
-    field_row(&field.name, control).gap(tokens::SPACE_2)
+    // Optional fields (CDDL `?`) are marked; clearing one unsets it and the
+    // operator's absent-field behavior applies.
+    let label = if field.optional {
+        format!("{} (optional)", field.name)
+    } else {
+        field.name.clone()
+    };
+    field_row(&label, control).gap(tokens::SPACE_2)
 }
 
 fn config_enum_control(field_name: &str, options: &[String], buffer: &str) -> El {
@@ -5370,11 +5390,21 @@ mod tests {
                     let ExecutionInput::Inline(bytes) = input else {
                         panic!("config input should be inline CBOR");
                     };
-                    // The default config decodes and covers every schema field.
+                    // The default config decodes and covers every required
+                    // schema field; optional fields start unset so the
+                    // operator's absent-field behavior applies.
                     let fields = operator_config::parse_schema(cddl).unwrap_or_default();
                     let decoded = operator_config::decode(bytes);
                     for field in &fields {
-                        assert!(decoded.contains_key(&field.name), "missing {}", field.name);
+                        if field.optional {
+                            assert!(
+                                !decoded.contains_key(&field.name),
+                                "optional {} must start unset",
+                                field.name
+                            );
+                        } else {
+                            assert!(decoded.contains_key(&field.name), "missing {}", field.name);
+                        }
                     }
                 }
                 _ => assert!(matches!(input, ExecutionInput::Inline(_))),
@@ -6690,6 +6720,73 @@ mod tests {
         assert!(
             exercised,
             "expected at least one bundled operator with a config schema"
+        );
+    }
+
+    /// Optional (CDDL `?`) config fields start unset, appear in the CBOR only
+    /// while a value is committed, and clearing the buffer unsets them again
+    /// (regression: brim's `? bed_position` was once always sent — and under
+    /// a mis-parsed `? `-prefixed key at that).
+    #[test]
+    fn optional_config_fields_set_and_clear() {
+        let mut exercised = false;
+        for op in volumetric_assets::operators() {
+            let mut app = VolumetricUiV2::default();
+            add_operator_click(&mut app, op.name);
+            app.before_build();
+
+            let Some(config) = app.step_edit.as_ref().and_then(|edit| edit.config.as_ref())
+            else {
+                continue;
+            };
+            let Some(field) = config
+                .fields
+                .iter()
+                .find(|f| f.optional && f.ty == ConfigFieldType::Float)
+                .cloned()
+            else {
+                continue;
+            };
+            let step_idx = app.step_edit.as_ref().unwrap().step_idx;
+            let config_input_idx = config.input_idx;
+            let decoded_config = |app: &VolumetricUiV2| {
+                let step = &app.project().timeline()[step_idx];
+                let ExecutionInput::Inline(bytes) = &step.inputs[config_input_idx] else {
+                    panic!("config input should be inline CBOR");
+                };
+                operator_config::decode(bytes)
+            };
+
+            assert!(
+                !decoded_config(&app).contains_key(&field.name),
+                "{}: optional {} must start unset",
+                op.name,
+                field.name
+            );
+            assert_eq!(
+                app.step_edit.as_ref().unwrap().config.as_ref().unwrap().buffers[&field.name],
+                "",
+                "unset optional field shows an empty buffer"
+            );
+
+            app.set_config_buffer(&field.name, "1.5".to_string());
+            assert_eq!(
+                decoded_config(&app).get(&field.name),
+                Some(&ConfigValue::Float(1.5))
+            );
+
+            app.set_config_buffer(&field.name, String::new());
+            assert!(
+                !decoded_config(&app).contains_key(&field.name),
+                "clearing the buffer unsets the field"
+            );
+            exercised = true;
+            break;
+        }
+        assert!(
+            exercised,
+            "expected a bundled operator with an optional float config field \
+             (brim's bed_position)"
         );
     }
 

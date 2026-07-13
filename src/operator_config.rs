@@ -11,11 +11,17 @@
 //! { dx: float, dy: float, dz: float }
 //! { scale: float .default 1.0, center: bool .default false }
 //! { op: "union" / "subtract" / "intersect" }
+//! { ? bed_position: float }
 //! ```
 //!
 //! Leaf types: `bool`, `int`, `float`, `tstr`, and small string-enum unions.
 //! Default values are read from either the RFC 8610 `.default X` control
-//! operator or a legacy `(default X)` annotation.
+//! operator or a legacy `(default X)` annotation; string defaults may be
+//! quoted (`tstr .default "hi"`, enum `.default "z"`).
+//!
+//! A `?` occurrence marker makes a field optional: [`encode`] omits it from
+//! the config map unless a value was explicitly set, so the operator's own
+//! absent-field behavior applies (e.g. brim's auto bed placement).
 
 use std::collections::BTreeMap;
 
@@ -48,6 +54,9 @@ pub struct ConfigField {
     pub ty: ConfigFieldType,
     /// Declared default (`.default X` / `(default X)`), if the schema gave one.
     pub default: Option<ConfigValue>,
+    /// Declared with the CDDL `?` occurrence marker: omitted from the encoded
+    /// config unless a value is explicitly set.
+    pub optional: bool,
 }
 
 /// Error parsing a config CDDL snippet.
@@ -160,7 +169,12 @@ pub fn parse_schema(cddl: &str) -> Result<Vec<ConfigField>, ConfigSchemaError> {
         let (name, rhs) = part
             .split_once(':')
             .ok_or_else(|| ConfigSchemaError::MalformedField(part.to_string()))?;
-        let name = name.trim();
+        let mut name = name.trim();
+        // The `?` occurrence marker (RFC 8610): the field is optional.
+        let optional = name.starts_with('?');
+        if optional {
+            name = name[1..].trim_start();
+        }
         if name.is_empty() {
             return Err(ConfigSchemaError::EmptyName(part.to_string()));
         }
@@ -168,16 +182,26 @@ pub fn parse_schema(cddl: &str) -> Result<Vec<ConfigField>, ConfigSchemaError> {
 
         let (ty_str, default_str) = split_type_and_default(rhs);
         let ty = parse_field_type(ty_str)?;
-        let default = default_str.and_then(|d| ConfigValue::parse(&ty, d.trim()));
+        let default = default_str.and_then(|d| ConfigValue::parse(&ty, unquote(d.trim())));
 
         out.push(ConfigField {
             name: name.to_string(),
             ty,
             default,
+            optional,
         });
     }
 
     Ok(out)
+}
+
+/// Strip one layer of surrounding double quotes: CDDL writes string and
+/// enum defaults as quoted literals (`.default "z"`).
+fn unquote(token: &str) -> &str {
+    token
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(token)
 }
 
 /// Split a field's right-hand side into the type token and an optional raw
@@ -233,16 +257,19 @@ fn parse_field_type(ty: &str) -> Result<ConfigFieldType, ConfigSchemaError> {
 }
 
 /// Encode a set of values into the CBOR map an operator expects. Fields missing
-/// from `values` fall back to their declared default (or type-zero).
+/// from `values` fall back to their declared default (or type-zero); missing
+/// *optional* fields are omitted so the operator's absent-field behavior
+/// applies.
 pub fn encode(fields: &[ConfigField], values: &BTreeMap<String, ConfigValue>) -> Vec<u8> {
     let entries: Vec<(CborValue, CborValue)> = fields
         .iter()
-        .map(|field| {
-            let value = values
-                .get(&field.name)
-                .cloned()
-                .unwrap_or_else(|| field.seed_value());
-            (CborValue::Text(field.name.clone()), value.to_cbor())
+        .filter_map(|field| {
+            let value = match values.get(&field.name) {
+                Some(value) => value.clone(),
+                None if field.optional => return None,
+                None => field.seed_value(),
+            };
+            Some((CborValue::Text(field.name.clone()), value.to_cbor()))
         })
         .collect();
 
@@ -252,10 +279,12 @@ pub fn encode(fields: &[ConfigField], values: &BTreeMap<String, ConfigValue>) ->
     out
 }
 
-/// Seed values for a schema: the declared default (or type-zero) per field.
+/// Seed values for a schema: the declared default (or type-zero) per
+/// required field. Optional fields start unset.
 pub fn default_values(fields: &[ConfigField]) -> BTreeMap<String, ConfigValue> {
     fields
         .iter()
+        .filter(|field| !field.optional)
         .map(|field| (field.name.clone(), field.seed_value()))
         .collect()
 }
@@ -329,6 +358,42 @@ mod tests {
                 "intersect".to_string()
             ])
         );
+    }
+
+    #[test]
+    fn parses_quoted_string_defaults() {
+        let fields =
+            parse_schema(r#"{ axis: "x" / "y" / "z" .default "z", name: tstr .default "hi" }"#)
+                .unwrap();
+        assert_eq!(fields[0].default, Some(ConfigValue::Text("z".to_string())));
+        assert_eq!(fields[1].default, Some(ConfigValue::Text("hi".to_string())));
+    }
+
+    #[test]
+    fn optional_fields_parse_and_stay_unsent() {
+        let fields =
+            parse_schema(r#"{ width: float .default 5.0, ? bed_position: float }"#).unwrap();
+        assert_eq!(fields[0].name, "width");
+        assert!(!fields[0].optional);
+        assert_eq!(fields[1].name, "bed_position");
+        assert!(fields[1].optional);
+        assert!(fields[1].default.is_none());
+
+        // Fresh defaults leave the optional field unset, and the encoded map
+        // omits it — the operator's own absent-field behavior applies.
+        let values = default_values(&fields);
+        assert!(!values.contains_key("bed_position"));
+        let decoded = decode(&encode(&fields, &values));
+        assert_eq!(decoded.get("width"), Some(&ConfigValue::Float(5.0)));
+        assert!(!decoded.contains_key("bed_position"));
+
+        // An explicitly set value is sent; removing it omits it again.
+        let mut values = values;
+        values.insert("bed_position".to_string(), ConfigValue::Float(1.5));
+        let decoded = decode(&encode(&fields, &values));
+        assert_eq!(decoded.get("bed_position"), Some(&ConfigValue::Float(1.5)));
+        values.remove("bed_position");
+        assert!(!decode(&encode(&fields, &values)).contains_key("bed_position"));
     }
 
     #[test]
