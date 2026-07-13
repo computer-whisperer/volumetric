@@ -658,14 +658,15 @@ fn gather_file_task(
             project: app.project().clone(),
             path: Some(path),
         }),
-        FileAction::ExportStl(id) => {
-            let triangles = session.preview_triangles(&id);
+        FileAction::ExportMesh { id, scale } => {
+            let mut triangles = session.preview_triangles(&id);
             if triangles.is_empty() {
                 app.set_status(format!(
                     "no preview mesh for {id} — view it in a mesh render mode first"
                 ));
                 return None;
             }
+            crate::scale_triangles(&mut triangles, scale);
             Some(FileTask::ExportStl { id, triangles })
         }
         FileAction::ExportWasm(id) => {

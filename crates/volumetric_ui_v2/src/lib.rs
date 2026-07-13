@@ -14,6 +14,12 @@ use volumetric_renderer::CameraControlScheme;
 
 use damascene_core::SvgIcon;
 use damascene_core::prelude::*;
+// The scene mesh lives in damascene's pinned glam (a different major than
+// this crate's own `glam` dep) — build its types through `scene::glam`.
+use damascene_core::scene::{
+    GridPlanes, Material, MeshData as SceneMeshData, MeshHandle as SceneMeshHandle,
+    MeshVertex as SceneMeshVertex, SceneSpec, glam::Vec3 as SceneVec3,
+};
 
 /// App-supplied glyphs for names missing from damascene's built-in icon
 /// vocabulary (`damascene_core::all_icon_names()`). Lucide path data in the
@@ -106,7 +112,16 @@ const LIGHTBOX_SLICE_PREFIX: &str = "lightbox:slice:";
 /// output; the modal scrim/close emit `lightbox:dismiss`.
 const OUTPUT_INSPECT_PREFIX: &str = "output:inspect:";
 const LIGHTBOX_KEY: &str = "lightbox";
-const EXPORT_STL_PREFIX: &str = "output:stl:";
+/// Mesh export modal: `output:export-mesh:{id}` opens it for an output.
+/// Inside, the scrim and Cancel emit `export:dismiss`, the primary button
+/// `export:confirm`, unit presets `export:unit:{mm|cm|m|in}`, and the scale
+/// factor is a controlled text input at `export:scale`.
+const EXPORT_MESH_PREFIX: &str = "output:export-mesh:";
+const EXPORT_DISMISS_KEY: &str = "export:dismiss";
+const EXPORT_CONFIRM_KEY: &str = "export:confirm";
+const EXPORT_SCALE_KEY: &str = "export:scale";
+const EXPORT_UNIT_PREFIX: &str = "export:unit:";
+const EXPORT_SCENE_KEY: &str = "export:scene";
 const EXPORT_WASM_PREFIX: &str = "output:wasm:";
 /// Draggable divider between the viewport and the project panel.
 const PANEL_RESIZE_KEY: &str = "panel:resize";
@@ -335,6 +350,37 @@ pub struct LightboxState {
     pub data: Option<LightboxData>,
     pub texture: Option<AppTexture>,
     pub colorbar: Option<AppTexture>,
+}
+
+/// The open mesh-export modal: which output, the preview geometry as a
+/// damascene scene handle (delivered by the session from the preview cache
+/// the frame after opening), and the export configuration being edited.
+#[derive(Debug)]
+pub struct ExportDialogState {
+    pub asset_id: String,
+    pub mesh: ExportPreviewMesh,
+    /// Controlled scale-factor text buffer; parsed (finite, positive) at
+    /// build time for the size readout and the Export button's enabled
+    /// state, and again at confirm.
+    pub scale_text: String,
+}
+
+/// The modal's scene-ready copy of the output's cached preview mesh.
+#[derive(Debug, Default)]
+pub enum ExportPreviewMesh {
+    /// Waiting for the session to copy the cached preview (one frame).
+    #[default]
+    Pending,
+    /// No cached mesh preview — the output was meshed as points, or the
+    /// project hasn't been run.
+    Missing,
+    Ready {
+        /// Geometry for the modal's `chart3d` preview.
+        handle: SceneMeshHandle,
+        triangles: usize,
+        /// Tight `(min, max)` bounds of the unscaled triangles.
+        bounds: ((f32, f32, f32), (f32, f32, f32)),
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -601,15 +647,16 @@ struct LuaForm {
 /// A file operation the app has requested. The host owns the native file
 /// dialogs (and, for STL, the cached preview meshes), so the app queues the
 /// intent and the host drains it via `take_file_action`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum FileAction {
     OpenProject,
     /// Save with a path dialog (first save / Save As).
     SaveProject,
     /// Re-save in place to the known project path (no dialog).
     SaveProjectTo(std::path::PathBuf),
-    /// Export the cached preview mesh of the named output as binary STL.
-    ExportStl(String),
+    /// Export the cached preview mesh of the named output as binary STL,
+    /// with vertices multiplied by `scale` (the export modal's setting).
+    ExportMesh { id: String, scale: f32 },
     /// Export the named output's model WASM bytes verbatim.
     ExportWasm(String),
     /// Import a model WASM file into the project.
@@ -879,6 +926,8 @@ pub struct VolumetricUiV2 {
     viewport_overflow: Option<String>,
     /// The open 2D inspection lightbox, if any.
     lightbox: Option<LightboxState>,
+    /// The open mesh-export modal, if any.
+    export_dialog: Option<ExportDialogState>,
     /// A queued file operation for the host to run (dialogs are host-side).
     pending_file_action: Option<FileAction>,
     /// Where the project was last opened from / saved to; Save re-saves here,
@@ -958,6 +1007,7 @@ impl VolumetricUiV2 {
             output_stats: std::collections::BTreeMap::new(),
             viewport_overflow: None,
             lightbox: None,
+            export_dialog: None,
             pending_file_action: None,
             project_path: None,
             panel_width: PANEL_WIDTH_DEFAULT,
@@ -1316,6 +1366,69 @@ impl VolumetricUiV2 {
             .get(id)
             .map(|stats| stats.model_channels.clone())
             .unwrap_or_default()
+    }
+
+    /// Opens the mesh-export modal for an output. The session delivers the
+    /// cached preview mesh on its next sync (`export_dialog_wants_mesh` →
+    /// `set_export_mesh`).
+    fn open_export_dialog(&mut self, id: &str) {
+        self.export_dialog = Some(ExportDialogState {
+            asset_id: id.to_string(),
+            mesh: ExportPreviewMesh::Pending,
+            scale_text: "1".to_string(),
+        });
+        self.open_select = None;
+    }
+
+    /// The output the open export modal still needs preview geometry for.
+    pub fn export_dialog_wants_mesh(&self) -> Option<&str> {
+        let export = self.export_dialog.as_ref()?;
+        matches!(export.mesh, ExportPreviewMesh::Pending).then_some(export.asset_id.as_str())
+    }
+
+    /// Delivers the export modal's preview triangles (ignored if the modal
+    /// closed or moved to a different output meanwhile). Empty means no
+    /// cached mesh preview; the modal explains instead of exporting.
+    pub fn set_export_mesh(&mut self, asset_id: &str, triangles: &[volumetric::Triangle]) {
+        let Some(export) = self.export_dialog.as_mut() else {
+            return;
+        };
+        if export.asset_id != asset_id {
+            return;
+        }
+        export.mesh = if triangles.is_empty() {
+            ExportPreviewMesh::Missing
+        } else {
+            let (data, bounds) = export_scene_mesh(triangles);
+            ExportPreviewMesh::Ready {
+                handle: SceneMeshHandle::new(data),
+                triangles: triangles.len(),
+                bounds,
+            }
+        };
+    }
+
+    /// Queues the export file action with the modal's settings and closes
+    /// the modal. Refuses (status hint) when the mesh never arrived or the
+    /// scale doesn't parse — the Export button is disabled in both states,
+    /// but synthetic clicks and races land here.
+    fn confirm_export(&mut self) {
+        let Some(export) = self.export_dialog.as_ref() else {
+            return;
+        };
+        if !matches!(export.mesh, ExportPreviewMesh::Ready { .. }) {
+            self.status = "nothing to export — no cached mesh preview".to_string();
+            return;
+        }
+        let Some(scale) = parse_export_scale(&export.scale_text) else {
+            self.status = "export scale must be a positive number".to_string();
+            return;
+        };
+        self.pending_file_action = Some(FileAction::ExportMesh {
+            id: export.asset_id.clone(),
+            scale,
+        });
+        self.export_dialog = None;
     }
 
     /// Routes a `lightbox:slice:` control: axis pick, position step, or
@@ -2759,12 +2872,16 @@ impl App for VolumetricUiV2 {
     }
 
     fn on_event(&mut self, event: UiEvent, _cx: &EventCx) {
-        // Escape closes any open menu/picker popover (the popover contract:
-        // the scrim handles outside clicks, the app handles Escape).
-        if matches!(event.kind, UiEventKind::Escape)
-            && (self.open_menu.take().is_some() | self.open_select.take().is_some())
-        {
-            return;
+        // Escape closes the topmost layer: the export modal first, then any
+        // open menu/picker popover (the popover contract: the scrim handles
+        // outside clicks, the app handles Escape).
+        if matches!(event.kind, UiEventKind::Escape) {
+            if self.export_dialog.take().is_some() {
+                return;
+            }
+            if self.open_menu.take().is_some() | self.open_select.take().is_some() {
+                return;
+            }
         }
 
         // Panel divider drags (pointer down/drag/up + arrow keys on the
@@ -2876,6 +2993,19 @@ impl App for VolumetricUiV2 {
                 &event,
                 REMOTE_ADDRESS_KEY,
             );
+            return;
+        }
+        // Controlled editing for the export modal's scale factor buffer
+        // (applied at confirm; a half-typed value just disables Export).
+        if event.target_key() == Some(EXPORT_SCALE_KEY) {
+            if let Some(export) = self.export_dialog.as_mut() {
+                text_input::apply_event(
+                    &mut export.scale_text,
+                    &mut self.selection,
+                    &event,
+                    EXPORT_SCALE_KEY,
+                );
+            }
             return;
         }
 
@@ -3195,9 +3325,25 @@ impl App for VolumetricUiV2 {
             {
                 self.adjust_output_asn2(id, field, direction == "up");
             }
-        } else if let Some(id) = route.strip_prefix(EXPORT_STL_PREFIX) {
-            self.pending_file_action = Some(FileAction::ExportStl(id.to_string()));
-            self.open_select = None;
+        } else if let Some(id) = route.strip_prefix(EXPORT_MESH_PREFIX) {
+            self.open_export_dialog(id);
+        } else if route == EXPORT_DISMISS_KEY {
+            self.export_dialog = None;
+        } else if route == EXPORT_CONFIRM_KEY {
+            self.confirm_export();
+        } else if let Some(unit) = route.strip_prefix(EXPORT_UNIT_PREFIX) {
+            // Presets set the model-unit → millimetre factor (STL consumers
+            // read the file as mm).
+            let factor = match unit {
+                "mm" => Some("1"),
+                "cm" => Some("10"),
+                "m" => Some("1000"),
+                "in" => Some("25.4"),
+                _ => None,
+            };
+            if let (Some(factor), Some(export)) = (factor, self.export_dialog.as_mut()) {
+                export.scale_text = factor.to_string();
+            }
         } else if let Some(id) = route.strip_prefix(EXPORT_WASM_PREFIX) {
             self.pending_file_action = Some(FileAction::ExportWasm(id.to_string()));
             self.open_select = None;
@@ -3229,7 +3375,12 @@ pub fn shell(app: &VolumetricUiV2) -> El {
 
     overlays(
         main,
-        [menu_layer(app), select_layer(app), lightbox_layer(app)],
+        [
+            menu_layer(app),
+            select_layer(app),
+            lightbox_layer(app),
+            export_layer(app),
+        ],
     )
 }
 
@@ -3462,6 +3613,118 @@ fn lightbox_layer(app: &VolumetricUiV2) -> Option<El> {
     ]))
 }
 
+/// The mesh-export modal: an orbitable `chart3d` preview of the export
+/// geometry over the export configuration (scale factor with unit presets)
+/// and the Cancel/Export actions. 3MF joins the format row when it lands.
+fn export_layer(app: &VolumetricUiV2) -> Option<El> {
+    let export = app.export_dialog.as_ref()?;
+    let scale = parse_export_scale(&export.scale_text);
+    let mut body: Vec<El> = Vec::new();
+    match &export.mesh {
+        ExportPreviewMesh::Ready {
+            handle,
+            triangles,
+            bounds,
+        } => {
+            let scene = SceneSpec::new()
+                .mesh_with(
+                    handle.clone(),
+                    Material::matte(Color::srgb_u8(178, 186, 200)),
+                )
+                .grid(GridPlanes::XZ);
+            body.push(
+                chart3d(scene)
+                    .key(EXPORT_SCENE_KEY)
+                    .height(Size::Fixed(320.0)),
+            );
+            body.push(
+                text("drag to orbit · shift-drag to pan · wheel to zoom")
+                    .caption()
+                    .muted(),
+            );
+            // Size readout follows the scale factor live, so the preset
+            // buttons double as a sanity check on the exported dimensions.
+            let factor = scale.unwrap_or(1.0);
+            let (min, max) = *bounds;
+            let scaled_min = (min.0 * factor, min.1 * factor, min.2 * factor);
+            let scaled_max = (max.0 * factor, max.1 * factor, max.2 * factor);
+            body.push(
+                text(format!(
+                    "{} triangles · {} mm",
+                    format_count(*triangles),
+                    format_dims(scaled_min, scaled_max),
+                ))
+                .caption()
+                .muted(),
+            );
+        }
+        ExportPreviewMesh::Pending => {
+            body.push(
+                text("copying preview mesh…")
+                    .label()
+                    .muted()
+                    .height(Size::Fixed(320.0)),
+            );
+        }
+        ExportPreviewMesh::Missing => {
+            body.push(
+                text("no cached mesh preview — view this output in a mesh render mode first")
+                    .label()
+                    .muted(),
+            );
+        }
+    }
+    body.push(divider());
+    body.push(field_row("Format", text("STL · binary").label()));
+    let unit_button = |unit: &str, label: &str| {
+        button(label)
+            .xsmall()
+            .secondary()
+            .key(format!("{EXPORT_UNIT_PREFIX}{unit}"))
+    };
+    body.push(field_row(
+        "Scale",
+        row([
+            text_input(EXPORT_SCALE_KEY, &export.scale_text, &app.selection)
+                .width(Size::Fixed(96.0)),
+            unit_button("mm", "mm"),
+            unit_button("cm", "cm"),
+            unit_button("m", "m"),
+            unit_button("in", "in"),
+        ])
+        .gap(tokens::SPACE_1)
+        .align(Align::Center),
+    ));
+    body.push(
+        text("Unit presets set the factor from model units to millimetres — STL is read as mm.")
+            .caption()
+            .muted(),
+    );
+    if scale.is_none() {
+        body.push(form_message("Scale must be a positive number."));
+    }
+    body.push(divider());
+    let can_export =
+        scale.is_some() && matches!(export.mesh, ExportPreviewMesh::Ready { .. });
+    let confirm = button("Export STL…").primary().key(EXPORT_CONFIRM_KEY);
+    let confirm = if can_export { confirm } else { confirm.disabled() };
+    body.push(
+        row([
+            spacer(),
+            button("Cancel").secondary().key(EXPORT_DISMISS_KEY),
+            confirm,
+        ])
+        .gap(tokens::SPACE_2)
+        .align(Align::Center),
+    );
+    Some(overlay([
+        scrim(EXPORT_DISMISS_KEY),
+        modal_panel(format!("Export {}", export.asset_id), body)
+            .width(Size::Fixed(560.0))
+            .block_pointer(),
+    ]))
+}
+
 /// Anchored popover with SSAO parameter steppers. Steppers keep it open;
 /// outside click or Escape dismisses.
 fn ssao_settings_popover(app: &VolumetricUiV2) -> El {
@@ -3655,11 +3918,11 @@ fn output_settings_popover(app: &VolumetricUiV2, id: &str) -> El {
     }
     body.push(divider());
     body.push(
-        button_with_icon("download", "Export STL…")
+        button_with_icon("download", "Export mesh…")
             .xsmall()
             .secondary()
             .width(Size::Fill(1.0))
-            .key(format!("{EXPORT_STL_PREFIX}{id}")),
+            .key(format!("{EXPORT_MESH_PREFIX}{id}")),
     );
     body.push(
         button_with_icon("upload", "Export WASM…")
@@ -4083,6 +4346,64 @@ fn viewport_hud(app: &VolumetricUiV2) -> El {
     badges.push(badge(&app.status).secondary().xsmall());
     badges.push(spacer());
     row(badges).gap(tokens::SPACE_1).align(Align::Center)
+}
+
+/// Convert preview triangles to a damascene scene mesh (unindexed,
+/// per-vertex normals carried over) plus their tight `(min, max)` bounds.
+/// Both vocabularies are Y-up, so positions carry over unmapped.
+fn export_scene_mesh(
+    triangles: &[volumetric::Triangle],
+) -> (SceneMeshData, ((f32, f32, f32), (f32, f32, f32))) {
+    let mut vertices = Vec::with_capacity(triangles.len() * 3);
+    let mut min = (f32::INFINITY, f32::INFINITY, f32::INFINITY);
+    let mut max = (f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for triangle in triangles {
+        for (position, normal) in triangle.vertices.iter().zip(&triangle.normals) {
+            min = (
+                min.0.min(position.0),
+                min.1.min(position.1),
+                min.2.min(position.2),
+            );
+            max = (
+                max.0.max(position.0),
+                max.1.max(position.1),
+                max.2.max(position.2),
+            );
+            vertices.push(SceneMeshVertex {
+                position: SceneVec3::new(position.0, position.1, position.2),
+                normal: SceneVec3::new(normal.0, normal.1, normal.2),
+            });
+        }
+    }
+    (
+        SceneMeshData {
+            vertices,
+            indices: None,
+        },
+        (min, max),
+    )
+}
+
+/// Parse the export modal's scale buffer: a finite, strictly positive
+/// factor. `None` disables Export and flags the field.
+fn parse_export_scale(text: &str) -> Option<f32> {
+    let value: f32 = text.trim().parse().ok()?;
+    (value.is_finite() && value > 0.0).then_some(value)
+}
+
+/// Scale export triangles about the origin. Uniform, so the (unit) normals
+/// are unchanged. Runs on the file worker, not the UI thread.
+pub(crate) fn scale_triangles(triangles: &mut [volumetric::Triangle], scale: f32) {
+    if scale == 1.0 {
+        return;
+    }
+    for triangle in triangles {
+        for vertex in &mut triangle.vertices {
+            vertex.0 *= scale;
+            vertex.1 *= scale;
+            vertex.2 *= scale;
+        }
+    }
 }
 
 /// `W × D × H` size of a bounding box, compactly formatted.
@@ -5162,6 +5483,29 @@ fn editable_subspace_asset_ids(app: &VolumetricUiV2) -> Vec<String> {
 
 pub fn shell_bundle(viewport: Rect) -> damascene_core::bundle::artifact::Bundle {
     let app = VolumetricUiV2::default();
+    let mut tree = shell(&app);
+    damascene_core::bundle::artifact::render_bundle(&mut tree, viewport)
+}
+
+/// Like [`shell_bundle`], with the mesh-export modal open over a synthetic
+/// tetrahedron — the headless-artifact view of the export dialog.
+pub fn export_modal_bundle(viewport: Rect) -> damascene_core::bundle::artifact::Bundle {
+    let mut app = VolumetricUiV2::default();
+    let id = app
+        .project
+        .exports()
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "demo".to_string());
+    app.open_export_dialog(&id);
+    let tetrahedron = [
+        [(1.0, 1.0, 1.0), (-1.0, -1.0, 1.0), (-1.0, 1.0, -1.0)],
+        [(1.0, 1.0, 1.0), (-1.0, 1.0, -1.0), (1.0, -1.0, -1.0)],
+        [(1.0, 1.0, 1.0), (1.0, -1.0, -1.0), (-1.0, -1.0, 1.0)],
+        [(-1.0, -1.0, 1.0), (1.0, -1.0, -1.0), (-1.0, 1.0, -1.0)],
+    ]
+    .map(volumetric::Triangle::new);
+    app.set_export_mesh(&id, &tetrahedron);
     let mut tree = shell(&app);
     damascene_core::bundle::artifact::render_bundle(&mut tree, viewport)
 }
@@ -6379,7 +6723,7 @@ mod tests {
     }
 
     #[test]
-    fn export_stl_click_queues_action_and_closes_popover() {
+    fn export_mesh_click_opens_modal_and_confirm_queues_action() {
         let (mut app, exports) = two_export_app();
         dispatch(
             &mut app,
@@ -6387,13 +6731,44 @@ mod tests {
         );
         dispatch(
             &mut app,
-            UiEvent::synthetic_click(format!("{EXPORT_STL_PREFIX}{}", exports[0])),
+            UiEvent::synthetic_click(format!("{EXPORT_MESH_PREFIX}{}", exports[0])),
         );
+        assert_eq!(app.open_select, None, "settings popover closes");
+        assert_eq!(
+            app.export_dialog_wants_mesh(),
+            Some(exports[0].as_str()),
+            "modal opens pending the session's mesh delivery"
+        );
+        assert_eq!(app.take_file_action(), None, "opening exports nothing");
+
+        // Confirm refuses until the mesh arrives (and while it's missing).
+        dispatch(&mut app, UiEvent::synthetic_click(EXPORT_CONFIRM_KEY));
+        assert_eq!(app.take_file_action(), None);
+
+        app.set_export_mesh(
+            &exports[0],
+            &[volumetric::Triangle::new([
+                (0.0, 0.0, 0.0),
+                (1.0, 0.0, 0.0),
+                (0.0, 1.0, 0.0),
+            ])],
+        );
+        assert_eq!(app.export_dialog_wants_mesh(), None, "delivered once");
+
+        // The inch preset rewrites the scale buffer; confirm carries it.
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{EXPORT_UNIT_PREFIX}in")),
+        );
+        dispatch(&mut app, UiEvent::synthetic_click(EXPORT_CONFIRM_KEY));
         assert_eq!(
             app.take_file_action(),
-            Some(FileAction::ExportStl(exports[0].clone()))
+            Some(FileAction::ExportMesh {
+                id: exports[0].clone(),
+                scale: 25.4,
+            })
         );
-        assert_eq!(app.open_select, None);
+        assert!(app.export_dialog.is_none(), "confirm closes the modal");
 
         dispatch(
             &mut app,
@@ -6403,6 +6778,39 @@ mod tests {
             app.take_file_action(),
             Some(FileAction::ExportWasm(exports[1].clone()))
         );
+    }
+
+    #[test]
+    fn export_modal_missing_mesh_and_bad_scale_refuse_confirm() {
+        let (mut app, exports) = two_export_app();
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{EXPORT_MESH_PREFIX}{}", exports[0])),
+        );
+        // Empty delivery: output has no cached mesh preview.
+        app.set_export_mesh(&exports[0], &[]);
+        assert_eq!(app.export_dialog_wants_mesh(), None, "asked only once");
+        dispatch(&mut app, UiEvent::synthetic_click(EXPORT_CONFIRM_KEY));
+        assert_eq!(app.take_file_action(), None, "nothing to export");
+        assert!(app.export_dialog.is_some(), "modal stays open to explain");
+
+        // A mesh arrives after a rerun-and-reopen, but the scale is garbage.
+        app.set_export_mesh(
+            &exports[0],
+            &[volumetric::Triangle::new([
+                (0.0, 0.0, 0.0),
+                (1.0, 0.0, 0.0),
+                (0.0, 1.0, 0.0),
+            ])],
+        );
+        app.export_dialog.as_mut().unwrap().scale_text = "-2".to_string();
+        dispatch(&mut app, UiEvent::synthetic_click(EXPORT_CONFIRM_KEY));
+        assert_eq!(app.take_file_action(), None, "bad scale refuses");
+
+        // Dismiss closes without queueing anything.
+        dispatch(&mut app, UiEvent::synthetic_click(EXPORT_DISMISS_KEY));
+        assert!(app.export_dialog.is_none());
+        assert_eq!(app.take_file_action(), None);
     }
 
     #[test]

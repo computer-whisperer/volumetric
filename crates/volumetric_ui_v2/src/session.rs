@@ -195,6 +195,14 @@ impl Session {
         app.set_viewport_overflow(self.viewport.frame_overflow_message());
         jobs.extend(preview_jobs.into_iter().map(BackgroundJob::BuildPreview));
 
+        // Export modal: deliver the cached preview mesh the sync after the
+        // modal opens. A synchronous copy, not a re-mesh — empty means no
+        // cached mesh and the modal explains instead.
+        if let Some(asset_id) = app.export_dialog_wants_mesh().map(str::to_string) {
+            let triangles = self.preview_triangles(&asset_id);
+            app.set_export_mesh(&asset_id, &triangles);
+        }
+
         // Lightbox: dispatch sampling for a freshly opened inspection (or a
         // slice parameter change), and upload arrived data as textures.
         if let Some((asset_id, mode, data)) = app.lightbox_wants_data() {
