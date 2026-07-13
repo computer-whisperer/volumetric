@@ -188,6 +188,7 @@ enum InputInfo {
     Blob,
     FeaMesh,
     TriMesh,
+    Subspace,
 }
 
 #[derive(Debug, Serialize)]
@@ -196,6 +197,7 @@ enum OutputInfo {
     ModelWasm,
     FeaMesh,
     TriMesh,
+    Subspace,
 }
 
 #[derive(Debug, Serialize)]
@@ -231,6 +233,7 @@ fn metadata_to_json(meta: &OperatorMetadata) -> OperatorMetadataJson {
                 OperatorMetadataInput::Blob => InputInfo::Blob,
                 OperatorMetadataInput::FeaMesh => InputInfo::FeaMesh,
                 OperatorMetadataInput::TriMesh => InputInfo::TriMesh,
+                OperatorMetadataInput::Subspace => InputInfo::Subspace,
             })
             .collect(),
         outputs: meta
@@ -240,6 +243,7 @@ fn metadata_to_json(meta: &OperatorMetadata) -> OperatorMetadataJson {
                 OperatorMetadataOutput::ModelWASM => OutputInfo::ModelWasm,
                 OperatorMetadataOutput::FeaMesh => OutputInfo::FeaMesh,
                 OperatorMetadataOutput::TriMesh => OutputInfo::TriMesh,
+                OperatorMetadataOutput::Subspace => OutputInfo::Subspace,
             })
             .collect(),
     }
@@ -355,6 +359,9 @@ fn print_info_human(output: &InfoOutput) {
                     InputInfo::TriMesh => {
                         println!("  [{}] Triangle Mesh", i);
                     }
+                    InputInfo::Subspace => {
+                        println!("  [{}] Subspace", i);
+                    }
                 }
             }
             println!("Outputs:");
@@ -363,6 +370,7 @@ fn print_info_human(output: &InfoOutput) {
                     OutputInfo::ModelWasm => println!("  [{}] ModelWASM", i),
                     OutputInfo::FeaMesh => println!("  [{}] FEA Mesh", i),
                     OutputInfo::TriMesh => println!("  [{}] Triangle Mesh", i),
+                    OutputInfo::Subspace => println!("  [{}] Subspace", i),
                 }
             }
         }

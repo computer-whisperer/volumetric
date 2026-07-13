@@ -180,6 +180,9 @@ pub enum AssetTypeHint {
     /// CBOR-encoded general-purpose triangle mesh (explicit data, no
     /// manifold requirement; never handed to the model executor)
     TriMesh,
+    /// CBOR-encoded affine subspace with an orthonormal chart (explicit
+    /// data; never handed to the model executor)
+    Subspace,
 }
 
 impl std::fmt::Display for AssetTypeHint {
@@ -193,6 +196,7 @@ impl std::fmt::Display for AssetTypeHint {
             AssetTypeHint::VecF64(dim) => write!(f, "VecF64({dim})"),
             AssetTypeHint::FeaMesh => write!(f, "FeaMesh"),
             AssetTypeHint::TriMesh => write!(f, "TriMesh"),
+            AssetTypeHint::Subspace => write!(f, "Subspace"),
         }
     }
 }
@@ -205,6 +209,7 @@ impl From<&OperatorMetadataOutput> for AssetTypeHint {
             OperatorMetadataOutput::ModelWASM => AssetTypeHint::Model,
             OperatorMetadataOutput::FeaMesh => AssetTypeHint::FeaMesh,
             OperatorMetadataOutput::TriMesh => AssetTypeHint::TriMesh,
+            OperatorMetadataOutput::Subspace => AssetTypeHint::Subspace,
         }
     }
 }

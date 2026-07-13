@@ -95,6 +95,7 @@
 use std::sync::OnceLock;
 
 pub mod fea;
+pub mod subspace;
 pub mod trimesh;
 
 /// The single inside/outside threshold for occupancy samples.
@@ -245,6 +246,9 @@ pub enum OperatorMetadataInput {
     /// A CBOR-encoded general-purpose triangle mesh (see [`crate::trimesh`]);
     /// explicit data with no manifold requirement, not a sampleable field.
     TriMesh,
+    /// A CBOR-encoded affine subspace with an orthonormal chart (see
+    /// [`crate::subspace`]); explicit data, not a sampleable field.
+    Subspace,
 }
 
 /// Output slot declaration in an operator's metadata.
@@ -260,6 +264,9 @@ pub enum OperatorMetadataOutput {
     /// A CBOR-encoded triangle mesh (see [`OperatorMetadataInput::TriMesh`]);
     /// explicit data, never fed to the model executor.
     TriMesh,
+    /// A CBOR-encoded affine subspace (see [`OperatorMetadataInput::Subspace`]);
+    /// explicit data, never fed to the model executor.
+    Subspace,
 }
 
 /// Metadata an operator returns from `get_metadata()`, CBOR-encoded.

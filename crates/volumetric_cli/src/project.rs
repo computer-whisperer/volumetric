@@ -276,6 +276,7 @@ pub fn input_type_label(input: &OperatorMetadataInput) -> String {
         OperatorMetadataInput::VecF64(dim) => format!("VecF64({dim})"),
         OperatorMetadataInput::FeaMesh => "FeaMesh".to_string(),
         OperatorMetadataInput::TriMesh => "TriMesh".to_string(),
+        OperatorMetadataInput::Subspace => "Subspace".to_string(),
     }
 }
 

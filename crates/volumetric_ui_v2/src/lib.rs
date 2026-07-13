@@ -2428,6 +2428,7 @@ impl VolumetricUiV2 {
                 model: primary_model.as_deref().unwrap_or_default(),
                 fea: for_kind(AssetTypeHint::FeaMesh).as_deref(),
                 trimesh: for_kind(AssetTypeHint::TriMesh).as_deref(),
+                subspace: for_kind(AssetTypeHint::Subspace).as_deref(),
             },
         );
 
@@ -4892,6 +4893,7 @@ fn asset_type_label(type_hint: Option<AssetTypeHint>) -> &'static str {
         Some(AssetTypeHint::VecF64(_)) => "Vec",
         Some(AssetTypeHint::FeaMesh) => "FEA Mesh",
         Some(AssetTypeHint::TriMesh) => "Tri Mesh",
+        Some(AssetTypeHint::Subspace) => "Subspace",
         None => "Asset",
     }
 }
@@ -4903,6 +4905,7 @@ struct SlotPrimaries<'a> {
     model: &'a str,
     fea: Option<&'a str>,
     trimesh: Option<&'a str>,
+    subspace: Option<&'a str>,
 }
 
 /// Builds a fresh step's inputs, one per declared operator metadata input, in
@@ -4941,6 +4944,10 @@ fn operator_step_inputs(
                 None => ExecutionInput::Inline(Vec::new()),
             },
             OperatorMetadataInput::TriMesh => match primary_trimesh {
+                Some(id) => ExecutionInput::AssetRef(id.to_string()),
+                None => ExecutionInput::Inline(Vec::new()),
+            },
+            OperatorMetadataInput::Subspace => match primaries.subspace {
                 Some(id) => ExecutionInput::AssetRef(id.to_string()),
                 None => ExecutionInput::Inline(Vec::new()),
             },
