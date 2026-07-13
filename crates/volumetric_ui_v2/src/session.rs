@@ -2427,13 +2427,20 @@ fn build_sketch_preview(
     request: &PreviewRequest,
     build_start: web_time::Instant,
 ) -> Result<PreviewEntity, String> {
-    let resolution = match &request.plan {
-        PreviewPlan::Sketch { resolution } => *resolution,
+    let (resolution, color_channel) = match &request.plan {
+        PreviewPlan::Sketch {
+            resolution,
+            color_channel,
+        } => (*resolution, color_channel.as_deref()),
         // Kind/dims mismatch (static probe defeated): default raster.
-        _ => 256,
+        _ => (256, None),
     };
-    let raster = volumetric::rasterize_sketch_from_bytes(request.data.as_slice(), resolution)
-        .map_err(format_error_chain)?;
+    let raster = volumetric::rasterize_sketch_channel_from_bytes(
+        request.data.as_slice(),
+        resolution,
+        color_channel,
+    )
+    .map_err(format_error_chain)?;
 
     let cell_w = (raster.bounds_max.0 - raster.bounds_min.0) / raster.width as f32;
     let cell_h = (raster.bounds_max.1 - raster.bounds_min.1) / raster.height as f32;
@@ -2520,15 +2527,31 @@ fn build_sketch_preview(
         raster.width, raster.height
     )];
     if !binary {
+        let field = color_channel.unwrap_or("field");
         detail.push(format!(
-            "field {:.4} .. {:.4} (viridis)",
+            "{field} {:.4} .. {:.4} (viridis)",
             raster.value_min, raster.value_max
         ));
     }
+    // Mirror the declared channels into the stats, like the 3D path —
+    // this feeds the "Color by" picker for channeled 2D models (e.g. a
+    // planar slice of a density model). The module is already in the
+    // executor cache from the raster pass.
+    let model_channels = volumetric::wasm::create_model_executor(request.data.as_slice())
+        .ok()
+        .and_then(|mut executor| {
+            use volumetric::wasm::ModelExecutor;
+            executor
+                .sample_format()
+                .map(|format| format.channels.iter().map(|c| c.name.clone()).collect())
+                .ok()
+        })
+        .unwrap_or_default();
     let stats = OutputStats {
         triangles,
         samples: (raster.width * raster.height) as u64,
         detail,
+        model_channels,
         mesh_ms: build_start.elapsed().as_secs_f64() * 1000.0,
         ..Default::default()
     };

@@ -154,3 +154,24 @@ fn degenerate_slices_are_rejected() {
     let err = run_slice("simple_sphere_model", &flat).expect_err("2-space vs 3D must fail");
     assert!(err.contains("dimensions"), "unexpected error: {err}");
 }
+
+/// The 2D preview raster of a channeled slice: colormapping by the
+/// density-kind channel (named "infill" in the gradient model) yields
+/// the input's gradient masked to the occupied region — this is what
+/// the UI's "Color by" renders for 2D outputs.
+#[test]
+fn channel_raster_of_a_slice_shows_the_gradient() {
+    let plane = Subspace::axis_aligned(vec![0.0, 0.0, 0.0], &[0, 1]).unwrap();
+    let wasm = run_slice("density_gradient_model", &plane).expect("slice failed");
+
+    let raster = volumetric::rasterize_sketch_channel_from_bytes(&wasm, 64, Some("infill"))
+        .expect("channel raster failed");
+    // density = 0.5 + 0.5x over x in [-1, 1], sampled at cell centers.
+    assert!(raster.value_min < 0.05, "min was {}", raster.value_min);
+    assert!(raster.value_max > 0.95, "max was {}", raster.value_max);
+    let mid = raster.value(raster.width / 2, raster.height / 2);
+    assert!((mid - 0.5).abs() < 0.05, "center density was {mid}");
+
+    // Unknown channels are an error, not a silent occupancy raster.
+    assert!(volumetric::rasterize_sketch_channel_from_bytes(&wasm, 64, Some("nope")).is_err());
+}

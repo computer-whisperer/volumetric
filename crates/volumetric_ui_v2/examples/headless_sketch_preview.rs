@@ -21,7 +21,7 @@ fn main() {
     let value_positions: Vec<usize> = args
         .iter()
         .enumerate()
-        .filter(|(_, a)| *a == "--resolution" || *a == "--fea-field")
+        .filter(|(_, a)| *a == "--resolution" || *a == "--fea-field" || *a == "--channel")
         .map(|(i, _)| i + 1)
         .collect();
     let positional: Vec<&String> = args
@@ -46,6 +46,11 @@ fn main() {
         .position(|a| a == "--fea-field")
         .and_then(|i| args.get(i + 1))
         .cloned();
+    let channel = args
+        .iter()
+        .position(|a| a == "--channel")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
 
     let bytes = std::fs::read(positional[0]).expect("read input");
     let (type_hint, plan) = if fea || fea_field.is_some() {
@@ -58,7 +63,13 @@ fn main() {
             },
         )
     } else {
-        (None, PreviewPlan::Sketch { resolution })
+        (
+            None,
+            PreviewPlan::Sketch {
+                resolution,
+                color_channel: channel,
+            },
+        )
     };
     let request = PreviewRequest {
         asset_id: "sketch_debug".to_string(),

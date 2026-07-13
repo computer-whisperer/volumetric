@@ -681,6 +681,9 @@ pub enum OutputRender {
     Model2d {
         /// Raster cells along the longer bounds axis.
         resolution: usize,
+        /// Colormap the raster by this declared sample channel (masked
+        /// by occupancy); `None` rasters plain sample values.
+        color_channel: Option<String>,
     },
     FeaMesh(FeaRender),
     TriMesh {
@@ -715,7 +718,13 @@ impl OutputRender {
                 Some(channel) => format!("{} · {}^3 · {channel}", mode.label(), resolution),
                 None => format!("{} · {}^3", mode.label(), resolution),
             },
-            Self::Model2d { resolution } => format!("2D raster · {resolution}"),
+            Self::Model2d {
+                resolution,
+                color_channel,
+            } => match color_channel {
+                Some(channel) => format!("2D raster · {resolution} · {channel}"),
+                None => format!("2D raster · {resolution}"),
+            },
             Self::FeaMesh(fea) => match &fea.color_field {
                 Some(field) => format!(
                     "FEA · {}",
@@ -749,6 +758,7 @@ pub enum PreviewPlan {
     },
     Sketch {
         resolution: usize,
+        color_channel: Option<String>,
     },
     FeaMesh {
         deformed: bool,
@@ -769,7 +779,13 @@ impl PreviewPlan {
                 Some(channel) => format!("{} · {channel}", mesh.label()),
                 None => mesh.label(),
             },
-            Self::Sketch { resolution } => format!("2D raster {resolution}"),
+            Self::Sketch {
+                resolution,
+                color_channel,
+            } => match color_channel {
+                Some(channel) => format!("2D raster {resolution} · {channel}"),
+                None => format!("2D raster {resolution}"),
+            },
             Self::FeaMesh { color_field, .. } => match color_field {
                 Some(field) => format!("FEA mesh · {field}"),
                 None => "FEA mesh".to_string(),
@@ -1076,6 +1092,7 @@ impl VolumetricUiV2 {
             },
             OutputKind::Model2d => OutputRender::Model2d {
                 resolution: SKETCH_RESOLUTION_DEFAULT,
+                color_channel: None,
             },
             OutputKind::FeaMesh => OutputRender::FeaMesh(FeaRender::default()),
             OutputKind::TriMesh => OutputRender::TriMesh { wireframe: false },
@@ -1163,7 +1180,9 @@ impl VolumetricUiV2 {
                 *slot = resolution;
                 self.status = format!("{id}: {resolution}^3");
             }
-            OutputRender::Model2d { resolution: slot } => {
+            OutputRender::Model2d {
+                resolution: slot, ..
+            } => {
                 *slot = resolution;
                 self.status = format!("{id}: {resolution} px raster");
             }
@@ -1229,16 +1248,15 @@ impl VolumetricUiV2 {
     /// plain shading).
     fn set_output_channel(&mut self, id: &str, channel: Option<String>) {
         let mut render = self.output_render(id);
-        let OutputRender::Model3d { color_channel, .. } = &mut render else {
-            return;
+        let slot = match &mut render {
+            OutputRender::Model3d { color_channel, .. }
+            | OutputRender::Model2d { color_channel, .. } => color_channel,
+            _ => return,
         };
-        *color_channel = channel;
-        self.status = match &render {
-            OutputRender::Model3d {
-                color_channel: Some(name),
-                ..
-            } => format!("{id}: color by {name}"),
-            _ => format!("{id}: plain shading"),
+        *slot = channel;
+        self.status = match slot {
+            Some(name) => format!("{id}: color by {name}"),
+            None => format!("{id}: plain shading"),
         };
         self.output_overrides.insert(id.to_string(), render);
     }
@@ -1433,8 +1451,12 @@ impl VolumetricUiV2 {
                 mesh: PreviewMeshPlan::for_mode(*mode, *resolution, *asn2),
                 color_channel: color_channel.clone(),
             },
-            OutputRender::Model2d { resolution } => PreviewPlan::Sketch {
+            OutputRender::Model2d {
+                resolution,
+                color_channel,
+            } => PreviewPlan::Sketch {
                 resolution: *resolution,
+                color_channel: color_channel.clone(),
             },
             OutputRender::FeaMesh(fea) => PreviewPlan::FeaMesh {
                 deformed: fea.deformed,
@@ -3526,7 +3548,10 @@ fn output_settings_popover(app: &VolumetricUiV2, id: &str) -> El {
                 color_channel.as_deref(),
             ));
         }
-        OutputRender::Model2d { resolution } => {
+        OutputRender::Model2d {
+            resolution,
+            color_channel,
+        } => {
             body.push(
                 button_with_icon("search", "Inspect field…")
                     .xsmall()
@@ -3548,6 +3573,7 @@ fn output_settings_popover(app: &VolumetricUiV2, id: &str) -> El {
                 }))
                 .gap(tokens::SPACE_1),
             );
+            body.extend(color_by_buttons(app, id, color_channel.as_deref()));
         }
         OutputRender::FeaMesh(fea) => {
             body.extend(fea_settings(app, id, fea));
@@ -3773,29 +3799,8 @@ fn model3d_settings(
 
     // Channel colormap + slice inspection, for models that declare sample
     // channels beyond occupancy (e.g. fea_density's density channel).
-    let channels = app.output_channels(id);
-    if channels.len() > 1 {
-        body.push(text("Color by").caption().muted());
-        let none_button = button("None")
-            .xsmall()
-            .width(Size::Fill(1.0))
-            .key(format!("{OUTPUT_CHANNEL_PREFIX}{id}:none"));
-        body.push(if color_channel.is_none() {
-            none_button.primary()
-        } else {
-            none_button.secondary()
-        });
-        for channel in channels.iter().skip(1) {
-            let button = button(channel.clone())
-                .xsmall()
-                .width(Size::Fill(1.0))
-                .key(format!("{OUTPUT_CHANNEL_PREFIX}{id}:{channel}"));
-            body.push(if color_channel == Some(channel.as_str()) {
-                button.primary()
-            } else {
-                button.secondary()
-            });
-        }
+    if app.output_channels(id).len() > 1 {
+        body.extend(color_by_buttons(app, id, color_channel));
         body.push(
             button_with_icon("search", "Inspect slice…")
                 .secondary()
@@ -3805,6 +3810,38 @@ fn model3d_settings(
         );
     }
     body
+}
+
+/// The "Color by" channel picker rows, for outputs whose model declares
+/// sample channels beyond occupancy. Empty when there is nothing beyond
+/// channel 0 to color by.
+fn color_by_buttons(app: &VolumetricUiV2, id: &str, color_channel: Option<&str>) -> Vec<El> {
+    let channels = app.output_channels(id);
+    if channels.len() <= 1 {
+        return Vec::new();
+    }
+    let mut rows = vec![text("Color by").caption().muted()];
+    let none_button = button("None")
+        .xsmall()
+        .width(Size::Fill(1.0))
+        .key(format!("{OUTPUT_CHANNEL_PREFIX}{id}:none"));
+    rows.push(if color_channel.is_none() {
+        none_button.primary()
+    } else {
+        none_button.secondary()
+    });
+    for channel in channels.iter().skip(1) {
+        let button = button(channel.clone())
+            .xsmall()
+            .width(Size::Fill(1.0))
+            .key(format!("{OUTPUT_CHANNEL_PREFIX}{id}:{channel}"));
+        rows.push(if color_channel == Some(channel.as_str()) {
+            button.primary()
+        } else {
+            button.secondary()
+        });
+    }
+    rows
 }
 
 /// FEA mesh settings: deformed view + exaggeration, wireframe, and the

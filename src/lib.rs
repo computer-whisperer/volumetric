@@ -505,6 +505,19 @@ pub fn rasterize_sketch_from_bytes(
     wasm_bytes: &[u8],
     resolution: usize,
 ) -> anyhow::Result<SketchRaster> {
+    rasterize_sketch_channel_from_bytes(wasm_bytes, resolution, None)
+}
+
+/// [`rasterize_sketch_from_bytes`] over a declared sample channel: cells
+/// hold the channel's value where channel 0 says occupied and NaN (drawn
+/// empty) elsewhere, so a density slice rasters as a masked colormap.
+/// `None` — or naming channel 0 — rasters plain `sample` values.
+#[cfg(any(feature = "native", feature = "web"))]
+pub fn rasterize_sketch_channel_from_bytes(
+    wasm_bytes: &[u8],
+    resolution: usize,
+    channel: Option<&str>,
+) -> anyhow::Result<SketchRaster> {
     use wasm::ModelExecutor;
 
     let mut executor =
@@ -514,6 +527,18 @@ pub fn rasterize_sketch_from_bytes(
     if dims != 2 {
         anyhow::bail!("expected a 2D sketch model, got {dims} dimensions");
     }
+    let channel_idx = match channel {
+        Some(name) => {
+            let format = executor.sample_format()?;
+            let idx = format
+                .channels
+                .iter()
+                .position(|c| c.name == name)
+                .with_context(|| format!("model declares no channel {name:?}"))?;
+            (idx != 0).then_some(idx)
+        }
+        None => None,
+    };
 
     let bounds = executor.get_bounds_nd()?;
     let (min_x, max_x) = (bounds.min(0), bounds.max(0));
@@ -533,7 +558,17 @@ pub fn rasterize_sketch_from_bytes(
         let y = min_y + span_y * ((yi as f64 + 0.5) / height as f64);
         for xi in 0..width {
             let x = min_x + span_x * ((xi as f64 + 0.5) / width as f64);
-            let v = executor.sample_nd(&[x, y])?;
+            let v = match channel_idx {
+                Some(idx) => {
+                    let row = executor.sample_channels_nd(&[x, y])?;
+                    if is_occupied(row[0]) {
+                        row[idx]
+                    } else {
+                        f32::NAN
+                    }
+                }
+                None => executor.sample_nd(&[x, y])?,
+            };
             if v.is_finite() {
                 value_min = value_min.min(v);
                 value_max = value_max.max(v);
