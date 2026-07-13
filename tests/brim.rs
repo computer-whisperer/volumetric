@@ -51,6 +51,40 @@ fn run_brim(config: &[(&str, ciborium::value::Value)]) -> Result<Vec<u8>, String
     run_brim_on("simple_sphere_model", config)
 }
 
+/// Like [`run_brim_on`] with the optional bed-plane subspace wired to
+/// input 2.
+fn run_brim_with_bed(
+    config: &[(&str, ciborium::value::Value)],
+    bed: &volumetric::subspace::Subspace,
+) -> Result<Vec<u8>, String> {
+    let mut cfg = Vec::new();
+    ciborium::ser::into_writer(
+        &ciborium::value::Value::Map(
+            config
+                .iter()
+                .map(|(k, v)| (ciborium::value::Value::Text((*k).into()), v.clone()))
+                .collect(),
+        ),
+        &mut cfg,
+    )
+    .unwrap();
+
+    let operator_wasm = wasm_artifact("brim_operator");
+    let mut executor = create_operator_executor(&operator_wasm).expect("operator executor");
+    let result = executor
+        .run(OperatorIo::new(vec![
+            wasm_artifact("simple_sphere_model"),
+            cfg,
+            volumetric::subspace::encode_subspace(bed),
+        ]))
+        .map_err(|e| e.to_string())?;
+    result
+        .outputs
+        .get(&0)
+        .cloned()
+        .ok_or_else(|| "operator posted no output".to_string())
+}
+
 fn base_config() -> Vec<(&'static str, ciborium::value::Value)> {
     vec![
         ("brim_width", ciborium::value::Value::Float(0.5)),
@@ -239,4 +273,98 @@ fn x_axis_brims_the_side() {
     assert!(!occupied_at(&mut model, [-0.7, 0.8, 0.0]));
     // Beyond the brim reach.
     assert!(!occupied_at(&mut model, [-0.9, 1.05, 0.0]));
+}
+
+/// A bed-plane subspace equal to the default config placement (the
+/// bottom face) reproduces the config-driven brim exactly.
+#[test]
+fn subspace_bed_matches_the_config_bed() {
+    use volumetric::subspace::{BoundSelector::*, Subspace};
+    let bed =
+        Subspace::from_bounds(&[-1.0, 1.0, -1.0, 1.0, -1.0, 1.0], &[Span, Span, Min]).unwrap();
+    // Config placement fields are ignored when the subspace is wired —
+    // point them somewhere absurd to prove it.
+    let mut config = base_config();
+    config.push(("bed_position", ciborium::value::Value::Float(50.0)));
+    config.push(("extreme", ciborium::value::Value::Text("max".into())));
+    let wasm = run_brim_with_bed(&config, &bed).expect("brim run failed");
+    let mut model = create_model_executor(&wasm).expect("model executor");
+
+    assert!(occupied_at(&mut model, [0.0, 0.0, 0.0]), "the part");
+    assert!(occupied_at(&mut model, [0.8, 0.0, -0.9]), "the ring");
+    assert!(
+        !occupied_at(&mut model, [1.05, 0.0, -0.9]),
+        "past the reach"
+    );
+    assert!(!occupied_at(&mut model, [0.8, 0.0, -0.7]), "above the slab");
+}
+
+/// The brim grows toward the part regardless of the bed plane's own
+/// normal orientation: a top-face plane (whose from_bounds normal points
+/// away from the model) still brims downward under z = 1.
+#[test]
+fn subspace_bed_grows_toward_the_part() {
+    use volumetric::subspace::{BoundSelector::*, Subspace};
+    let bed =
+        Subspace::from_bounds(&[-1.0, 1.0, -1.0, 1.0, -1.0, 1.0], &[Span, Span, Max]).unwrap();
+    let mut config = base_config();
+    config.push(("output", ciborium::value::Value::Text("brim".into())));
+    let wasm = run_brim_with_bed(&config, &bed).expect("brim run failed");
+    let mut model = create_model_executor(&wasm).expect("model executor");
+
+    let bounds = model.get_bounds_nd().expect("bounds");
+    assert_eq!(bounds.max(2), 1.0);
+    assert!((bounds.min(2) - 0.8).abs() < 1e-12, "slab reaches down");
+    assert!(occupied_at(&mut model, [0.8, 0.0, 0.9]), "the ring");
+    assert!(!occupied_at(&mut model, [0.8, 0.0, 0.7]), "below the slab");
+}
+
+/// An arbitrarily tilted bed plane: tangent to the unit sphere at the
+/// direction d = (1, 0, 1)/sqrt(2), chart b1 = (1, 0, -1)/sqrt(2),
+/// b2 = y. The footprint scan at w = 0.1 toward the center sees the
+/// sphere's cross-section (radius ~0.436 at chart (0, 0)); the ring
+/// reaches ~0.936 in chart units.
+#[test]
+fn tilted_subspace_bed_grows_a_brim() {
+    let s = 0.5f64.sqrt();
+    let bed = volumetric::subspace::Subspace {
+        dimensions: 3,
+        origin: vec![s, 0.0, s],
+        basis: vec![s, 0.0, -s, 0.0, 1.0, 0.0],
+    };
+    bed.validate().unwrap();
+    let mut config = base_config();
+    config.push(("output", ciborium::value::Value::Text("brim".into())));
+    let wasm = run_brim_with_bed(&config, &bed).expect("brim run failed");
+    let mut model = create_model_executor(&wasm).expect("model executor");
+
+    // Chart (u, v, w) -> world: origin + u*b1 + v*b2 - w*d (the brim
+    // grows along -d, toward the sphere).
+    let at = |u: f64, v: f64, w: f64| [s - w * s + u * s, v, s - w * s - u * s];
+    assert!(occupied_at(&mut model, at(0.0, 0.0, 0.1)), "under the part");
+    assert!(occupied_at(&mut model, at(0.8, 0.0, 0.1)), "the ring");
+    assert!(occupied_at(&mut model, at(0.0, 0.8, 0.1)), "the ring in v");
+    assert!(
+        !occupied_at(&mut model, at(1.0, 0.0, 0.1)),
+        "past the reach"
+    );
+    assert!(!occupied_at(&mut model, at(0.8, 0.0, 0.3)), "past the slab");
+    assert!(
+        !occupied_at(&mut model, at(0.8, 0.0, -0.1)),
+        "outside the bed"
+    );
+
+    // The combined output keeps the part intact alongside the tilted ring.
+    let combined = run_brim_with_bed(&base_config(), &bed).expect("combined brim run failed");
+    let mut combined = create_model_executor(&combined).expect("model executor");
+    assert!(occupied_at(&mut combined, [0.0, 0.0, 0.0]), "the part");
+    assert!(occupied_at(&mut combined, at(0.8, 0.0, 0.1)), "the ring");
+}
+
+/// A non-plane subspace is rejected as a bed.
+#[test]
+fn non_plane_bed_subspace_is_rejected() {
+    let line = volumetric::subspace::Subspace::axis_aligned(vec![0.0, 0.0, 0.0], &[2]).unwrap();
+    let err = run_brim_with_bed(&base_config(), &line).expect_err("a line bed must fail");
+    assert!(err.contains("rank"), "unexpected error: {err}");
 }

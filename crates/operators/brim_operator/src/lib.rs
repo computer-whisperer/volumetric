@@ -5,21 +5,32 @@
 //!
 //! # Bed plane convention
 //!
-//! The print bed is an axis-aligned plane on a configurable axis and
-//! extreme: `axis` picks the bed normal (x, y, or z) and `extreme`
-//! picks which side of the model the bed touches. The default — axis z,
-//! extreme min — is the slicer convention: the plane `z = z_min`, the
-//! part sitting on the bed. `bed_position` overrides the plane's
-//! coordinate along the axis; the brim slab always extends `brim_height`
-//! from the bed toward the part (up from a min bed, down from a max
-//! bed). The in-plane axes are the remaining two in ascending order.
+//! The bed is a plane, selected one of two ways:
+//!
+//! - **Subspace input** (input 2, optional): a rank-2 subspace in
+//!   3-space — any orientation, not just axis-aligned (e.g. from
+//!   `model_bound_operator` or `subspace_operator`). Its chart carries
+//!   the brim field's (u, v) coordinates. The brim grows from the plane
+//!   toward the side holding the model's bounds center, whatever the
+//!   plane's own orientation, so a bounding-box face plane works
+//!   directly. When this input is wired, the config placement fields
+//!   (`axis` / `extreme` / `bed_position`) are ignored.
+//! - **Config placement** (when input 2 is empty): an axis-aligned
+//!   plane from `axis` (bed normal) and `extreme` (which side of the
+//!   model), with `bed_position` overriding the plane's coordinate.
+//!   The default — axis z, extreme min — is the slicer convention: the
+//!   part sitting on the bed. The in-plane chart axes are the remaining
+//!   two in ascending order.
+//!
+//! Either way the brim slab extends `brim_height` from the bed toward
+//! the part along the bed's unit `up` direction.
 //!
 //! # Mechanism
 //!
 //! 1. The input model is scanned through the host's `input_model_*`
 //!    sampling imports: one thin slab offset `scan_height` from the bed
-//!    toward the part, on a uniform in-plane grid covering the model
-//!    bounds plus the brim margin.
+//!    toward the part, on a uniform chart-coordinate grid covering the
+//!    projection of the model bounds plus the brim margin.
 //! 2. A Euclidean distance transform over the scanned footprint bitmap
 //!    turns it into `distance_to_footprint` per grid cell. Every contact
 //!    patch radiates independently — a sparse polka-dot contact pattern
@@ -28,9 +39,9 @@
 //! 3. The field `brim_width - distance` is baked into a
 //!    `gridfield_model_core` payload and patched into the embedded
 //!    `brim_model_template` module: a standalone 3D model occupied where
-//!    the bilinear field is >= 0 within the bed slab along the chosen
-//!    axis (the zero crossing is the brim contour, smooth at
-//!    sub-cell precision). The field is cropped to the actual brim
+//!    the bilinear field is >= 0 within `brim_height` off the bed plane
+//!    (the zero crossing is the brim contour, smooth at sub-cell
+//!    precision). The field is cropped to the actual brim
 //!    extent, so the advertised bounds — and the downstream meshing
 //!    domain — stay tight around sparse contact patterns.
 //! 4. `output: "combined"` (the default) merges the brim with the input
@@ -41,12 +52,13 @@
 //! Configuration:
 //! - `brim_width`: how far the brim radiates from the footprint.
 //! - `brim_height`: brim thickness off the bed (a few layer heights).
-//! - `axis`: bed normal, `"x"` / `"y"` / `"z"`; default `"z"`.
+//! - `axis`: bed normal, `"x"` / `"y"` / `"z"`; default `"z"`. Ignored
+//!   when the Subspace input is wired.
 //! - `extreme`: which side of the model the bed touches, `"min"` /
-//!   `"max"`; default `"min"`.
+//!   `"max"`; default `"min"`. Ignored when the Subspace input is wired.
 //! - `bed_position`: bed plane coordinate override; omitted = the
 //!   model's bound at the chosen axis/extreme. (`bed_z` is accepted as
-//!   a legacy alias.)
+//!   a legacy alias.) Ignored when the Subspace input is wired.
 //! - `scan_height`: footprint scan offset from the bed toward the part;
 //!   0 = auto (half the brim height). Raising it also catches geometry
 //!   that approaches but does not touch the bed.
@@ -76,6 +88,7 @@ use volumetric_abi::host::{
     input_model_bounds, input_model_dimensions, input_model_sample, post_output, read_input,
     report_error,
 };
+use volumetric_abi::subspace::{Subspace, decode_subspace};
 use volumetric_abi::{
     OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput, is_occupied,
 };
@@ -118,14 +131,6 @@ impl Axis {
             Axis::Z => (0, 1),
         }
     }
-
-    fn name(self) -> &'static str {
-        match self {
-            Axis::X => "x",
-            Axis::Y => "y",
-            Axis::Z => "z",
-        }
-    }
 }
 
 /// Which side of the model the bed touches.
@@ -134,6 +139,96 @@ impl Axis {
 enum Extreme {
     Min,
     Max,
+}
+
+/// The resolved bed placement: an orthonormal plane chart (origin, two
+/// in-plane basis vectors) plus the unit direction the brim grows along.
+/// The template evaluates the baked field in exactly this chart.
+struct BedPlane {
+    origin: [f64; 3],
+    b1: [f64; 3],
+    b2: [f64; 3],
+    up: [f64; 3],
+}
+
+fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+impl BedPlane {
+    /// Chart (u, v, w) to world.
+    fn embed(&self, u: f64, v: f64, w: f64) -> [f64; 3] {
+        std::array::from_fn(|i| self.origin[i] + u * self.b1[i] + v * self.b2[i] + w * self.up[i])
+    }
+
+    /// World to in-plane chart coordinates.
+    fn chart_uv(&self, p: [f64; 3]) -> (f64, f64) {
+        let rel = std::array::from_fn(|i| p[i] - self.origin[i]);
+        (dot(rel, self.b1), dot(rel, self.b2))
+    }
+
+    /// From a bed-plane subspace: its chart verbatim, growing toward the
+    /// side of the plane holding the model's bounds center (a
+    /// bounding-box face plane works regardless of its normal's sign; a
+    /// center exactly on the plane keeps the subspace's own normal).
+    fn from_subspace(subspace: &Subspace, bounds: &[f64]) -> Result<Self, String> {
+        if subspace.dimensions != 3 {
+            return Err(format!(
+                "the bed subspace must live in 3-space, got {}-space",
+                subspace.dimensions
+            ));
+        }
+        if subspace.rank() != 2 {
+            return Err(format!(
+                "the bed subspace must be a plane (rank 2), got rank {}",
+                subspace.rank()
+            ));
+        }
+        let vec3 = |v: &[f64]| -> [f64; 3] { [v[0], v[1], v[2]] };
+        let origin = vec3(&subspace.origin);
+        let normal = vec3(&subspace.normal().expect("rank 2 in 3-space has a normal"));
+        let center: [f64; 3] =
+            std::array::from_fn(|i| (bounds[2 * i] + bounds[2 * i + 1]) * 0.5 - origin[i]);
+        let up = if dot(center, normal) < 0.0 {
+            normal.map(|c| -c)
+        } else {
+            normal
+        };
+        Ok(Self {
+            origin,
+            b1: vec3(subspace.basis_vector(0)),
+            b2: vec3(subspace.basis_vector(1)),
+            up,
+        })
+    }
+
+    /// From the config placement fields: an axis-aligned plane at the
+    /// chosen extreme (or `bed_position`), origin centered in-plane,
+    /// growing toward the part (up from a min bed, down from a max bed).
+    fn from_config(cfg: &BrimConfig, bounds: &[f64]) -> Self {
+        let a = cfg.axis.index();
+        let (ua, va) = cfg.axis.plane();
+        let (bed, inward) = match cfg.extreme {
+            Extreme::Min => (bounds[2 * a], 1.0),
+            Extreme::Max => (bounds[2 * a + 1], -1.0),
+        };
+        let mut origin: [f64; 3] =
+            std::array::from_fn(|i| (bounds[2 * i] + bounds[2 * i + 1]) * 0.5);
+        origin[a] = cfg.bed_position.unwrap_or(bed);
+        let unit = |axis: usize| -> [f64; 3] {
+            let mut v = [0.0; 3];
+            v[axis] = 1.0;
+            v
+        };
+        let mut up = unit(a);
+        up[a] = inward;
+        Self {
+            origin,
+            b1: unit(ua),
+            b2: unit(va),
+            up,
+        }
+    }
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -266,9 +361,9 @@ fn plan_grid(model_uv: [f64; 4], brim_width: f64, resolution: i64) -> Result<Sca
     })
 }
 
-/// Occupancy of every lattice point on the plane `axis = scan_c`,
+/// Occupancy of every lattice point on the chart plane `w = scan_w`,
 /// sampled a bounded batch of rows per host call.
-fn scan_footprint(grid: &ScanGrid, axis: Axis, scan_c: f64) -> Result<Vec<bool>, String> {
+fn scan_footprint(grid: &ScanGrid, bed: &BedPlane, scan_w: f64) -> Result<Vec<bool>, String> {
     let ScanGrid {
         nx,
         ny,
@@ -276,7 +371,6 @@ fn scan_footprint(grid: &ScanGrid, axis: Axis, scan_c: f64) -> Result<Vec<bool>,
         min_v,
         cell,
     } = *grid;
-    let (ua, va) = axis.plane();
     let mut occupied = vec![false; nx * ny];
     let rows_per_batch = (65536 / nx).max(1);
     let mut positions = Vec::with_capacity(rows_per_batch.min(ny) * nx * 3);
@@ -287,10 +381,7 @@ fn scan_footprint(grid: &ScanGrid, axis: Axis, scan_c: f64) -> Result<Vec<bool>,
         for j in row..end {
             let v = min_v + j as f64 * cell;
             for i in 0..nx {
-                let mut p = [scan_c; 3];
-                p[ua] = min_u + i as f64 * cell;
-                p[va] = v;
-                positions.extend(p);
+                positions.extend(bed.embed(min_u + i as f64 * cell, v, scan_w));
             }
         }
         let samples = input_model_sample(0, &positions, 3)
@@ -524,14 +615,9 @@ fn take_slot_export(module: &mut walrus::Module, name: &str) -> Result<i32, Stri
 }
 
 /// Patch the baked field payload (fresh pages, base address into the
-/// payload slot) and the bed slab plus axis (directly into the config
-/// slot).
-fn patch_template(
-    payload: &[u8],
-    slab_lo: f64,
-    slab_hi: f64,
-    axis: Axis,
-) -> Result<Vec<u8>, String> {
+/// payload slot) and the bed chart plus brim height (directly into the
+/// config slot).
+fn patch_template(payload: &[u8], bed: &BedPlane, height: f64) -> Result<Vec<u8>, String> {
     let mut module =
         walrus::Module::from_buffer_with_config(TEMPLATE, &walrus::ModuleConfig::new())
             .map_err(|e| format!("failed to parse the embedded template: {e}"))?;
@@ -572,10 +658,13 @@ fn patch_template(
         },
         (base as u32).to_le_bytes().to_vec(),
     );
-    let mut config_bytes = Vec::with_capacity(24);
-    config_bytes.extend(slab_lo.to_le_bytes());
-    config_bytes.extend(slab_hi.to_le_bytes());
-    config_bytes.extend((axis.index() as u64).to_le_bytes());
+    let mut config_bytes = Vec::with_capacity(104);
+    for vec in [bed.origin, bed.b1, bed.b2, bed.up] {
+        for c in vec {
+            config_bytes.extend(c.to_le_bytes());
+        }
+    }
+    config_bytes.extend(height.to_le_bytes());
     module.data.add(
         walrus::DataKind::Active {
             memory: memory_id,
@@ -764,7 +853,11 @@ fn merge_with_input(input: &[u8], brim: &[u8], bounds: [f64; 6]) -> Result<Vec<u
 // Operator entry points
 // ---------------------------------------------------------------------------
 
-fn build_brim(input: &[u8], cfg: &BrimConfig) -> Result<Vec<u8>, String> {
+fn build_brim(
+    input: &[u8],
+    cfg: &BrimConfig,
+    bed_subspace: Option<&Subspace>,
+) -> Result<Vec<u8>, String> {
     validate(cfg)?;
 
     let dims =
@@ -780,42 +873,44 @@ fn build_brim(input: &[u8], cfg: &BrimConfig) -> Result<Vec<u8>, String> {
         return Err(format!("model bounds are not finite: {bounds:?}"));
     }
 
-    let a = cfg.axis.index();
-    let (ua, va) = cfg.axis.plane();
-    let bed = cfg.bed_position.unwrap_or(match cfg.extreme {
-        Extreme::Min => bounds[2 * a],
-        Extreme::Max => bounds[2 * a + 1],
-    });
-    // The slab and the scan reach from the bed toward the part: up from
-    // a min bed, down from a max bed.
-    let inward = match cfg.extreme {
-        Extreme::Min => 1.0,
-        Extreme::Max => -1.0,
+    let bed = match bed_subspace {
+        Some(subspace) => BedPlane::from_subspace(subspace, &bounds)?,
+        None => BedPlane::from_config(cfg, &bounds),
     };
-    let far = bed + inward * cfg.brim_height;
-    let (slab_lo, slab_hi) = (bed.min(far), bed.max(far));
-    let scan_offset = if cfg.scan_height > 0.0 {
+    let scan_w = if cfg.scan_height > 0.0 {
         cfg.scan_height
     } else {
         cfg.brim_height * 0.5
     };
-    let scan_c = bed + inward * scan_offset;
 
-    let grid = plan_grid(
-        [
-            bounds[2 * ua],
-            bounds[2 * ua + 1],
-            bounds[2 * va],
-            bounds[2 * va + 1],
-        ],
-        cfg.brim_width,
-        cfg.resolution,
-    )?;
-    let occupied = scan_footprint(&grid, cfg.axis, scan_c)?;
+    // The footprint window: the model AABB's corners projected into the
+    // bed chart (exact for axis-aligned beds, a tight enclosure for
+    // tilted ones).
+    let mut window = [
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    ];
+    for cx in 0..2 {
+        for cy in 0..2 {
+            for cz in 0..2 {
+                let corner = [bounds[cx], bounds[2 + cy], bounds[4 + cz]];
+                let (u, v) = bed.chart_uv(corner);
+                window[0] = window[0].min(u);
+                window[1] = window[1].max(u);
+                window[2] = window[2].min(v);
+                window[3] = window[3].max(v);
+            }
+        }
+    }
+
+    let grid = plan_grid(window, cfg.brim_width, cfg.resolution)?;
+    let occupied = scan_footprint(&grid, &bed, scan_w)?;
     if !occupied.iter().any(|&o| o) {
         return Err(format!(
-            "no part geometry found at scan plane {} = {scan_c}; check bed_position / scan_height",
-            cfg.axis.name()
+            "no part geometry found scanning {scan_w} off the bed plane; check the bed \
+             placement (bed_position / the bed subspace) and scan_height"
         ));
     }
 
@@ -829,21 +924,28 @@ fn build_brim(input: &[u8], cfg: &BrimConfig) -> Result<Vec<u8>, String> {
     })?;
     let payload =
         gridfield_model_core::build_payload(grid.nx as u32, grid.ny as u32, grid.bounds(), &field)?;
-    let brim = patch_template(&payload, slab_lo, slab_hi, cfg.axis)?;
+    let brim = patch_template(&payload, &bed, cfg.brim_height)?;
 
     match cfg.output {
         BrimOutput::Brim => Ok(brim),
         BrimOutput::Combined => {
+            // The union box: input bounds grown by the brim's world AABB
+            // (the chart-space crop corners crossed with the slab).
             let gb = grid.bounds();
             let mut merged_bounds = [
                 bounds[0], bounds[1], bounds[2], bounds[3], bounds[4], bounds[5],
             ];
-            merged_bounds[2 * ua] = merged_bounds[2 * ua].min(gb[0]);
-            merged_bounds[2 * ua + 1] = merged_bounds[2 * ua + 1].max(gb[1]);
-            merged_bounds[2 * va] = merged_bounds[2 * va].min(gb[2]);
-            merged_bounds[2 * va + 1] = merged_bounds[2 * va + 1].max(gb[3]);
-            merged_bounds[2 * a] = merged_bounds[2 * a].min(slab_lo);
-            merged_bounds[2 * a + 1] = merged_bounds[2 * a + 1].max(slab_hi);
+            for &u in &gb[..2] {
+                for &v in &gb[2..] {
+                    for w in [0.0, cfg.brim_height] {
+                        let p = bed.embed(u, v, w);
+                        for axis in 0..3 {
+                            merged_bounds[2 * axis] = merged_bounds[2 * axis].min(p[axis]);
+                            merged_bounds[2 * axis + 1] = merged_bounds[2 * axis + 1].max(p[axis]);
+                        }
+                    }
+                }
+            }
             merge_with_input(input, &brim, merged_bounds)
         }
     }
@@ -866,8 +968,23 @@ pub extern "C" fn run() {
         }
     };
 
+    let bed_subspace = {
+        let buf = read_input(2);
+        if buf.is_empty() {
+            None
+        } else {
+            match decode_subspace(&buf) {
+                Ok(subspace) => Some(subspace),
+                Err(e) => {
+                    report_error(&format!("input 2 is not a usable bed subspace: {e}"));
+                    return;
+                }
+            }
+        }
+    };
+
     let input = read_input(0);
-    match build_brim(&input, &cfg) {
+    match build_brim(&input, &cfg, bed_subspace.as_ref()) {
         Ok(wasm) => post_output(0, &wasm),
         Err(e) => report_error(&format!("brim generation failed: {e}")),
     }
@@ -884,8 +1001,13 @@ pub extern "C" fn get_metadata() -> i64 {
             inputs: vec![
                 OperatorMetadataInput::ModelWASM,
                 OperatorMetadataInput::CBORConfiguration(schema),
+                OperatorMetadataInput::Subspace,
             ],
-            input_names: vec!["Model".to_string(), "Config".to_string()],
+            input_names: vec![
+                "Model".to_string(),
+                "Config".to_string(),
+                "Bed Plane".to_string(),
+            ],
             outputs: vec![OperatorMetadataOutput::ModelWASM],
         }
     })

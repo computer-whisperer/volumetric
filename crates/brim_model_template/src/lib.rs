@@ -1,16 +1,17 @@
 //! The brim model template: a complete, *stateless* 3D Model ABI
-//! implementation over a baked 2D brim field extruded across a slab along
-//! a configurable bed-normal axis. `brim_operator` patches a copy of this
-//! module with the field it bakes from scanning its input model's
-//! print-bed footprint.
+//! implementation over a baked 2D brim field extruded along a bed-plane
+//! chart. `brim_operator` patches a copy of this module with the field it
+//! bakes from scanning its input model's print-bed footprint.
 //!
-//! The field is a `gridfield_model_core` payload holding
-//! `brim_width - distance_to_footprint` (world units), so its bilinear
-//! zero crossing is the brim contour: a point is occupied when its
-//! bed-normal coordinate lies in the slab `lo <= c <= hi` and the field
-//! at the two in-plane coordinates is >= 0. The in-plane axes are the
-//! two axes other than the bed-normal one, in ascending order (axis z:
-//! field over x/y; axis y: x/z; axis x: y/z).
+//! The bed plane is an arbitrary orthonormal chart: an origin, two
+//! in-plane basis vectors b1/b2, and the unit `up` direction the brim
+//! grows along (for axis-aligned beds these are unit axis vectors). The
+//! field is a `gridfield_model_core` payload over the chart's (u, v)
+//! coordinates holding `brim_width - distance_to_footprint` (world
+//! units — the chart is an isometry), so its bilinear zero crossing is
+//! the brim contour: a point is occupied when its height off the bed
+//! `w = dot(p - origin, up)` lies in `0 <= w <= height` and the field at
+//! `(dot(p - origin, b1), dot(p - origin, b2))` is >= 0.
 //!
 //! # Patch contract
 //!
@@ -20,9 +21,9 @@
 //!   in freshly reserved memory pages. The slot must be read volatilely —
 //!   its compiled initializer is zero, and a folded read would make the
 //!   template permanently empty.
-//! - `brim_config_slot() -> i32` returns the address of a 24-byte slot
-//!   holding the slab `lo` then `hi` as little-endian f64s, then the
-//!   bed-normal axis index (0 = x, 1 = y, 2 = z) as a little-endian u64.
+//! - `brim_config_slot() -> i32` returns the address of a 104-byte slot
+//!   holding 13 little-endian f64s: `origin` (3), `b1` (3), `b2` (3),
+//!   `up` (3), then the brim `height`.
 //! - An unpatched template (slots still zero) or a corrupt payload behaves
 //!   as an empty model: bounds all zero, every sample 0.0 — the ABI's
 //!   errors-read-as-outside convention.
@@ -54,12 +55,12 @@ static mut IO_BUFFER: [f64; 6] = [0.0; 6];
 struct PayloadSlot([u8; 4]);
 static PAYLOAD_SLOT: PayloadSlot = PayloadSlot([0; 4]);
 
-/// The 24-byte slab-config slot the operator patches: slab lo, slab hi
-/// as little-endian f64s, then the bed-normal axis index as a
-/// little-endian u64. Aligned so the u64 reads are well-formed.
+/// The 104-byte chart-config slot the operator patches: origin, b1, b2,
+/// up (3 f64s each), then the brim height — 13 little-endian f64s.
+/// Aligned so the u64 reads are well-formed.
 #[repr(align(8))]
-struct ConfigSlot([u8; 24]);
-static CONFIG_SLOT: ConfigSlot = ConfigSlot([0; 24]);
+struct ConfigSlot([u8; 104]);
+static CONFIG_SLOT: ConfigSlot = ConfigSlot([0; 104]);
 
 /// The patched field payload, if the slot has been filled and the header
 /// validates.
@@ -77,24 +78,17 @@ fn payload() -> Option<PayloadView<'static>> {
     PayloadView::new(bytes).ok()
 }
 
-/// The patched (lo, hi, axis) slab; (0.0, 0.0, x) while unpatched. An
-/// out-of-range axis byte is clamped — a corrupt patch degrades to a
-/// wrong-but-well-formed model rather than an out-of-bounds index.
-fn slab() -> (f64, f64, usize) {
+/// The patched bed chart (origin, b1, b2, up, height); all zeros while
+/// unpatched, which behaves as an empty model.
+fn chart() -> ([f64; 3], [f64; 3], [f64; 3], [f64; 3], f64) {
     let base = CONFIG_SLOT.0.as_ptr() as *const u64;
-    let lo = f64::from_bits(unsafe { core::ptr::read_volatile(base) });
-    let hi = f64::from_bits(unsafe { core::ptr::read_volatile(base.add(1)) });
-    let axis = (unsafe { core::ptr::read_volatile(base.add(2)) } as usize).min(2);
-    (lo, hi, axis)
+    let read = |i: usize| f64::from_bits(unsafe { core::ptr::read_volatile(base.add(i)) });
+    let vec3 = |o: usize| [read(o), read(o + 1), read(o + 2)];
+    (vec3(0), vec3(3), vec3(6), vec3(9), read(12))
 }
 
-/// The two in-plane axes for a bed-normal axis, ascending.
-fn plane(axis: usize) -> (usize, usize) {
-    match axis {
-        0 => (1, 2),
-        1 => (0, 2),
-        _ => (0, 1),
-    }
+fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
 #[unsafe(no_mangle)]
@@ -119,33 +113,44 @@ pub extern "C" fn get_io_ptr() -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn get_bounds(out_ptr: i32) {
+    // The world AABB of the oriented brim box: the 8 corners of the
+    // chart-space field bounds crossed with w in {0, height}.
     let field = payload().map(|p| p.bounds()).unwrap_or([0.0; 4]);
-    let (lo, hi, axis) = slab();
-    let (u, v) = plane(axis);
-    let mut bounds = [0.0f64; 6];
-    bounds[2 * axis] = lo;
-    bounds[2 * axis + 1] = hi;
-    bounds[2 * u] = field[0];
-    bounds[2 * u + 1] = field[1];
-    bounds[2 * v] = field[2];
-    bounds[2 * v + 1] = field[3];
-    for (i, b) in bounds.iter().enumerate() {
-        unsafe { core::ptr::write_unaligned((out_ptr as usize + i * 8) as *mut f64, *b) };
+    let (origin, b1, b2, up, height) = chart();
+    let mut min = [f64::INFINITY; 3];
+    let mut max = [f64::NEG_INFINITY; 3];
+    for &u in &field[..2] {
+        for &v in &field[2..] {
+            for w in [0.0, height] {
+                for axis in 0..3 {
+                    let c = origin[axis] + u * b1[axis] + v * b2[axis] + w * up[axis];
+                    min[axis] = min[axis].min(c);
+                    max[axis] = max[axis].max(c);
+                }
+            }
+        }
+    }
+    for axis in 0..3 {
+        let (lo, hi) = (min[axis], max[axis]);
+        unsafe {
+            core::ptr::write_unaligned((out_ptr as usize + axis * 16) as *mut f64, lo);
+            core::ptr::write_unaligned((out_ptr as usize + axis * 16 + 8) as *mut f64, hi);
+        }
     }
 }
 
-/// Occupancy at (x, y, z): inside the slab along the bed-normal axis and
-/// on the non-negative side of the baked field over the in-plane axes.
+/// Occupancy at (x, y, z): within the brim height off the bed plane and
+/// on the non-negative side of the baked field in chart coordinates.
 /// Also called directly by merge glue.
 #[unsafe(no_mangle)]
 pub extern "C" fn brim_sample(x: f64, y: f64, z: f64) -> f32 {
-    let (lo, hi, axis) = slab();
-    let p = [x, y, z];
-    if !(p[axis] >= lo && p[axis] <= hi) {
+    let (origin, b1, b2, up, height) = chart();
+    let rel = [x - origin[0], y - origin[1], z - origin[2]];
+    let w = dot(rel, up);
+    if !(w >= 0.0 && w <= height) {
         return 0.0;
     }
-    let (u, v) = plane(axis);
-    match payload().and_then(|view| view.sample(p[u], p[v])) {
+    match payload().and_then(|view| view.sample(dot(rel, b1), dot(rel, b2))) {
         Some(value) if value >= 0.0 => 1.0,
         _ => 0.0,
     }
