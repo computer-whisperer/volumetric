@@ -1,0 +1,10 @@
+[package]
+name = "island_model_template"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+voxelmask_model_core = { path = "../voxelmask_model_core" }

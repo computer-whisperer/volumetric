@@ -323,6 +323,22 @@ pub fn parse_model_exports(wasm: &[u8]) -> Result<ModelExports, String> {
     })
 }
 
+/// The memory export index of a non-Model module (e.g. a template whose
+/// memory the merge glue must address for cross-memory stores).
+pub fn find_memory_export(wasm: &[u8]) -> Result<u32, String> {
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        if let wasmparser::Payload::ExportSection(s) = payload.map_err(|e| e.to_string())? {
+            for e in s {
+                let e = e.map_err(|e| e.to_string())?;
+                if e.name == "memory" && e.kind == wasmparser::ExternalKind::Memory {
+                    return Ok(e.index);
+                }
+            }
+        }
+    }
+    Err("module missing memory export `memory`".to_string())
+}
+
 /// The function index of a named function export, for non-Model modules
 /// (e.g. a lattice template exporting its evaluator).
 pub fn find_function_export(wasm: &[u8], name: &str) -> Result<u32, String> {

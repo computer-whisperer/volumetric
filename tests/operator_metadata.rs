@@ -32,6 +32,7 @@ const OPERATORS: &[&str] = &[
     "strut_pattern_operator",
     "strut_model_operator",
     "brim_operator",
+    "island_removal_operator",
     "subspace_operator",
     "model_bound_operator",
     "slice_operator",

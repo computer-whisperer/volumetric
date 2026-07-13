@@ -2855,6 +2855,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
+name = "island_model_template"
+version = "0.1.0"
+dependencies = [
+ "voxelmask_model_core",
+]
+
+[[package]]
+name = "island_removal_operator"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "model_merge_core",
+ "serde",
+ "volumetric_abi",
+ "voxelmask_model_core",
+ "walrus",
+ "wasm-encoder 0.248.0",
+]
+
+[[package]]
 name = "itertools"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6020,6 +6040,10 @@ dependencies = [
  "wgpu",
  "winit",
 ]
+
+[[package]]
+name = "voxelmask_model_core"
+version = "0.1.0"
 
 [[package]]
 name = "walkdir"
