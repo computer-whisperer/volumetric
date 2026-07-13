@@ -1,0 +1,11 @@
+[package]
+name = "slice_operator"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+volumetric_abi = { path = "../../volumetric_abi" }
+walrus = "0.26"

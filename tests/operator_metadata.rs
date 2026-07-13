@@ -32,6 +32,7 @@ const OPERATORS: &[&str] = &[
     "brim_operator",
     "subspace_operator",
     "model_bound_operator",
+    "slice_operator",
 ];
 
 #[test]
