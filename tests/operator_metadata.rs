@@ -18,6 +18,8 @@ const OPERATORS: &[&str] = &[
     "stl_import_operator",
     "rectangular_prism_operator",
     "heightmap_extrude_operator",
+    "extrude_operator",
+    "revolve_operator",
     "image_model_operator",
     "mesh_height_operator",
     "fea_grid_mesh_operator",

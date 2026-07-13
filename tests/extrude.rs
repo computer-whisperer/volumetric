@@ -5,6 +5,7 @@
 
 #![cfg(feature = "native")]
 
+use volumetric::subspace::{Subspace, encode_subspace};
 use volumetric::wasm::{
     NativeModelExecutor, OperatorExecutor, OperatorIo, create_operator_executor,
     create_parallel_sampler,
@@ -437,4 +438,248 @@ function get_bounds_max_z() return 1.0 end
     assert_eq!(executor.dimensions(), 3);
     assert_eq!(executor.sample_nd(&[0.0, 0.0, 0.0]).unwrap(), 1.0);
     assert_eq!(executor.sample_nd(&[1.5, 0.0, 0.0]).unwrap(), 0.0);
+}
+
+/// The plane input relocates the extrusion: the circle extruded from an
+/// offset xy plane spans z in [2, 4] instead of [0, 2].
+#[test]
+fn extrude_onto_an_offset_plane() {
+    let plane = Subspace::axis_aligned(vec![0.0, 0.0, 2.0], &[0, 1]).unwrap();
+    let extruded = run_operator(
+        "extrude_operator",
+        vec![
+            circle_sketch_wasm(),
+            height_config(2.0),
+            encode_subspace(&plane),
+        ],
+    )
+    .expect("extrude onto offset plane");
+
+    let mut executor = NativeModelExecutor::new(&extruded).unwrap();
+    let bounds = executor.get_bounds_nd().unwrap();
+    assert_eq!((bounds.min(2), bounds.max(2)), (2.0, 4.0));
+    assert_eq!(executor.sample_nd(&[0.0, 0.0, 3.0]).unwrap(), 1.0);
+    assert_eq!(executor.sample_nd(&[0.0, 0.0, 1.0]).unwrap(), 0.0);
+    assert_eq!(executor.sample_nd(&[0.0, 0.0, 4.5]).unwrap(), 0.0);
+}
+
+/// A tilted plane extrudes along its oriented normal. Basis {x, (y+z)/s2}
+/// has normal (0, -1, 1)/s2; the circle sweeps that way for one unit.
+#[test]
+fn extrude_along_a_tilted_normal() {
+    let s = 0.5f64.sqrt();
+    let plane = Subspace {
+        dimensions: 3,
+        origin: vec![0.0, 0.0, 0.0],
+        basis: vec![1.0, 0.0, 0.0, 0.0, s, s],
+    };
+    plane.validate().unwrap();
+    let extruded = run_operator(
+        "extrude_operator",
+        vec![
+            circle_sketch_wasm(),
+            height_config(1.0),
+            encode_subspace(&plane),
+        ],
+    )
+    .expect("extrude along tilted normal");
+
+    let mut executor = NativeModelExecutor::new(&extruded).unwrap();
+    // Mid-sweep (w = 0.5) at the chart origin and near the circle's rim.
+    assert_eq!(
+        executor.sample_nd(&[0.0, -0.5 * s, 0.5 * s]).unwrap(),
+        1.0
+    );
+    assert_eq!(
+        executor.sample_nd(&[0.9, -0.5 * s, 0.5 * s]).unwrap(),
+        1.0
+    );
+    assert_eq!(
+        executor.sample_nd(&[1.2, -0.5 * s, 0.5 * s]).unwrap(),
+        0.0
+    );
+    // Past the sweep (w = 1.5) and behind the plane (w = -0.5).
+    assert_eq!(
+        executor.sample_nd(&[0.0, -1.5 * s, 1.5 * s]).unwrap(),
+        0.0
+    );
+    assert_eq!(executor.sample_nd(&[0.0, 0.5 * s, -0.5 * s]).unwrap(), 0.0);
+
+    // Interval bounds: chart box [-1.5, 1.5]^2 swept by (0, -s, s).
+    let bounds = executor.get_bounds_nd().unwrap();
+    assert_eq!((bounds.min(0), bounds.max(0)), (-1.5, 1.5));
+    assert!((bounds.min(1) - -2.5 * s).abs() < 1e-12, "{}", bounds.min(1));
+    assert!((bounds.max(1) - 1.5 * s).abs() < 1e-12, "{}", bounds.max(1));
+    assert!((bounds.min(2) - -1.5 * s).abs() < 1e-12, "{}", bounds.min(2));
+    assert!((bounds.max(2) - 2.5 * s).abs() < 1e-12, "{}", bounds.max(2));
+}
+
+/// With a plane wired, the profile is no longer restricted to 2D: a 1D
+/// profile (a line slice of the sphere) extrudes to a 2D ribbon.
+#[test]
+fn extrude_lifts_a_1d_profile_with_a_wired_plane() {
+    let line = Subspace::axis_aligned(vec![0.0, 0.0, 0.0], &[0]).unwrap();
+    let profile = run_operator(
+        "slice_operator",
+        vec![wasm_artifact("simple_sphere_model"), encode_subspace(&line)],
+    )
+    .expect("slice sphere to a 1D profile");
+
+    let plane = Subspace::axis_aligned(vec![0.0, 0.0], &[0]).unwrap();
+    let extruded = run_operator(
+        "extrude_operator",
+        vec![profile, Vec::new(), encode_subspace(&plane)],
+    )
+    .expect("extrude 1D profile to 2D");
+
+    let mut executor = NativeModelExecutor::new(&extruded).unwrap();
+    assert_eq!(executor.dimensions(), 2);
+    assert_eq!(executor.sample_nd(&[0.0, 0.5]).unwrap(), 1.0);
+    assert_eq!(executor.sample_nd(&[0.9, 0.5]).unwrap(), 1.0);
+    assert_eq!(executor.sample_nd(&[1.1, 0.5]).unwrap(), 0.0);
+    assert_eq!(executor.sample_nd(&[0.0, 1.5]).unwrap(), 0.0);
+    assert_eq!(executor.sample_nd(&[0.0, -0.1]).unwrap(), 0.0);
+}
+
+/// The plane's chart must match the profile: rank k in (k+1)-space.
+#[test]
+fn extrude_rejects_a_mismatched_plane() {
+    let line = Subspace::axis_aligned(vec![0.0, 0.0, 0.0], &[2]).unwrap();
+    let err = run_operator(
+        "extrude_operator",
+        vec![
+            circle_sketch_wasm(),
+            height_config(1.0),
+            encode_subspace(&line),
+        ],
+    )
+    .expect_err("a line cannot carry a 2D profile");
+    assert!(err.contains("hyperplane"), "{err}");
+
+    let plane = Subspace::axis_aligned(vec![0.0, 0.0, 0.0], &[0, 1]).unwrap();
+    let err = run_operator(
+        "extrude_operator",
+        vec![
+            wasm_artifact("simple_sphere_model"),
+            height_config(1.0),
+            encode_subspace(&plane),
+        ],
+    )
+    .expect_err("a 3-space plane cannot carry a 3D profile");
+    assert!(err.contains("hyperplane"), "{err}");
+}
+
+/// Typed channels survive the lift: a planar slice of the density-gradient
+/// cube keeps its "infill" channel when extruded back to 3D. Outside the
+/// slab the occupancy slot reads 0.
+#[test]
+fn extrude_preserves_channels() {
+    let plane = Subspace::axis_aligned(vec![0.0, 0.0, 0.0], &[0, 1]).unwrap();
+    let profile = run_operator(
+        "slice_operator",
+        vec![
+            wasm_artifact("density_gradient_model"),
+            encode_subspace(&plane),
+        ],
+    )
+    .expect("slice the gradient cube");
+    let extruded = run_operator("extrude_operator", vec![profile]).expect("extrude the slice");
+
+    let mut model = NativeModelExecutor::new(&extruded).unwrap();
+    assert_eq!(model.sample_format().channels.len(), 2);
+    let row = model.sample_channels_nd(&[0.5, 0.0, 0.5]).unwrap();
+    assert_eq!(row[0], 1.0);
+    assert!((row[1] - 0.75).abs() < 1e-6, "infill was {}", row[1]);
+    // Above the slab: occupancy forced to 0.
+    let row = model.sample_channels_nd(&[0.5, 0.0, 1.5]).unwrap();
+    assert_eq!(row[0], 0.0);
+}
+
+/// The axis input relocates the revolution: the ring profile around a line
+/// through (2, 0, 0) along z becomes a tube centered on x = 2.
+#[test]
+fn revolve_around_a_wired_offset_axis() {
+    let sketch = run_operator(
+        "lua_script_operator",
+        vec![RING_PROFILE.as_bytes().to_vec()],
+    )
+    .expect("compile ring profile");
+    let axis = Subspace::axis_aligned(vec![2.0, 0.0, 0.0], &[2]).unwrap();
+    let revolved = run_operator("revolve_operator", vec![sketch, encode_subspace(&axis)])
+        .expect("revolve around offset axis");
+
+    let mut executor = NativeModelExecutor::new(&revolved).unwrap();
+    assert_eq!(executor.dimensions(), 3);
+    let bounds = executor.get_bounds_nd().unwrap();
+    assert_eq!((bounds.min(0), bounds.max(0)), (0.75, 3.25));
+    assert_eq!((bounds.min(1), bounds.max(1)), (-1.25, 1.25));
+    assert_eq!((bounds.min(2), bounds.max(2)), (-0.25, 2.25));
+
+    assert_eq!(executor.sample_nd(&[2.75, 0.0, 1.0]).unwrap(), 1.0);
+    assert_eq!(executor.sample_nd(&[2.0, 0.75, 1.0]).unwrap(), 1.0);
+    // The hole moved with the axis: the world origin's old tube is gone.
+    assert_eq!(executor.sample_nd(&[2.0, 0.0, 1.0]).unwrap(), 0.0);
+    assert_eq!(executor.sample_nd(&[0.75, 0.0, 1.0]).unwrap(), 0.0);
+}
+
+/// Revolving around the x axis: the profile's second coordinate runs along
+/// world x and the radius spans the yz plane.
+#[test]
+fn revolve_around_the_x_axis() {
+    let sketch = run_operator(
+        "lua_script_operator",
+        vec![RING_PROFILE.as_bytes().to_vec()],
+    )
+    .expect("compile ring profile");
+    let axis = Subspace::axis_aligned(vec![0.0, 0.0, 0.0], &[0]).unwrap();
+    let revolved = run_operator("revolve_operator", vec![sketch, encode_subspace(&axis)])
+        .expect("revolve around x");
+
+    let mut executor = NativeModelExecutor::new(&revolved).unwrap();
+    let bounds = executor.get_bounds_nd().unwrap();
+    assert_eq!((bounds.min(0), bounds.max(0)), (-0.25, 2.25));
+    assert_eq!((bounds.min(1), bounds.max(1)), (-1.25, 1.25));
+    assert_eq!((bounds.min(2), bounds.max(2)), (-1.25, 1.25));
+
+    assert_eq!(executor.sample_nd(&[1.0, 0.75, 0.0]).unwrap(), 1.0);
+    assert_eq!(executor.sample_nd(&[1.0, 0.0, -0.75]).unwrap(), 1.0);
+    assert_eq!(executor.sample_nd(&[1.0, 0.2, 0.0]).unwrap(), 0.0);
+    assert_eq!(executor.sample_nd(&[-0.5, 0.75, 0.0]).unwrap(), 0.0);
+}
+
+/// The axis must have rank k-1 in (k+1)-space.
+#[test]
+fn revolve_rejects_a_mismatched_axis() {
+    let plane = Subspace::axis_aligned(vec![0.0, 0.0, 0.0], &[0, 1]).unwrap();
+    let err = run_operator(
+        "revolve_operator",
+        vec![circle_sketch_wasm(), encode_subspace(&plane)],
+    )
+    .expect_err("a plane is not a revolution axis for a 2D profile");
+    assert!(err.contains("rank 1"), "{err}");
+}
+
+/// Typed channels survive the revolution: the sliced gradient's "infill"
+/// channel reads at (r, a), so it becomes radially symmetric.
+#[test]
+fn revolve_preserves_channels() {
+    let plane = Subspace::axis_aligned(vec![0.0, 0.0, 0.0], &[0, 1]).unwrap();
+    let profile = run_operator(
+        "slice_operator",
+        vec![
+            wasm_artifact("density_gradient_model"),
+            encode_subspace(&plane),
+        ],
+    )
+    .expect("slice the gradient cube");
+    let revolved = run_operator("revolve_operator", vec![profile]).expect("revolve the slice");
+
+    let mut model = NativeModelExecutor::new(&revolved).unwrap();
+    assert_eq!(model.sample_format().channels.len(), 2);
+    // r = 0.5 in any direction reads the profile at (0.5, 0): infill 0.75.
+    for p in [[0.5, 0.0, 0.0], [0.0, -0.5, 0.0], [0.3, 0.4, 0.0]] {
+        let row = model.sample_channels_nd(&p).unwrap();
+        assert_eq!(row[0], 1.0, "at {p:?}");
+        assert!((row[1] - 0.75).abs() < 1e-6, "infill at {p:?} was {}", row[1]);
+    }
 }
