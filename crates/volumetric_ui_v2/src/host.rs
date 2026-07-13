@@ -19,7 +19,9 @@ use damascene_core::clipboard;
 use damascene_core::prelude::*;
 use damascene_core::widgets::text_input::{self, ClipboardKind};
 use damascene_wgpu::Runner;
-use damascene_winit_wgpu::host::input::{key_modifiers, map_key, pointer_button, winit_cursor};
+use damascene_winit_wgpu::host::input::{
+    key_modifiers, map_key, map_physical, pointer_button, winit_cursor,
+};
 use volumetric::Project;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -148,6 +150,7 @@ impl ApplicationHandler for Host {
             power_preference: wgpu::PowerPreference::default(),
             compatible_surface: Some(&surface),
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
         }))
         .expect("no compatible adapter");
 
@@ -193,6 +196,9 @@ impl ApplicationHandler for Host {
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 1,
+            // Auto reproduces the pre-wgpu-30 behavior: sRGB for the formats
+            // this host negotiates (no HDR surface path here).
+            color_space: wgpu::SurfaceColorSpace::Auto,
         };
         surface.configure(&device, &config);
 
@@ -337,11 +343,20 @@ impl ApplicationHandler for Host {
                         is_synthetic: false,
                         ..
                     } => {
-                        if let Some(key) = map_key(&key_event.logical_key) {
-                            for event in
-                                gfx.damascene
-                                    .key_down(key, self.modifiers, key_event.repeat)
-                            {
+                        let logical = map_key(&key_event.logical_key);
+                        let physical = map_physical(key_event.physical_key);
+                        // Dispatch when either facet is meaningful — a key
+                        // with no logical identity can still drive a
+                        // physical-facet hotkey, and vice versa.
+                        if logical != LogicalKey::Unidentified
+                            || physical != PhysicalKey::Unidentified
+                        {
+                            for event in gfx.damascene.key_down(
+                                logical,
+                                physical,
+                                self.modifiers,
+                                key_event.repeat,
+                            ) {
                                 match text_input::clipboard_request(&event) {
                                     Some(ClipboardKind::Copy) => {
                                         copy_current_selection(&gfx.damascene, &mut self.clipboard);
@@ -480,7 +495,7 @@ impl Host {
         let theme = self.app.theme();
         let palette = theme.palette().clone();
         let cx = damascene_core::BuildCx::new(&theme);
-        let mut tree = self.app.build(&cx);
+        let tree = self.app.build(&cx);
 
         gfx.damascene.set_theme(theme);
         gfx.damascene.set_hotkeys(self.app.hotkeys());
@@ -513,9 +528,9 @@ impl Host {
         );
         let prepare =
             gfx.damascene
-                .prepare(&gfx.device, &gfx.queue, &mut tree, viewport, scale_factor);
+                .prepare(&gfx.device, &gfx.queue, tree, viewport, scale_factor);
 
-        let cursor = gfx.damascene.ui_state().cursor(&tree);
+        let cursor = gfx.damascene.snapshot_cursor();
         if cursor != self.last_cursor {
             gfx.window.set_cursor(winit_cursor(cursor));
             self.last_cursor = cursor;
@@ -547,7 +562,7 @@ impl Host {
         );
 
         gfx.queue.submit(Some(encoder.finish()));
-        frame.present();
+        gfx.queue.present(frame);
 
         if prepare.needs_redraw
             || viewport_resized

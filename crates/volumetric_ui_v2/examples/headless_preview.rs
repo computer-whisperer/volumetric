@@ -213,7 +213,7 @@ fn main() {
         device
             .poll(wgpu::PollType::wait_indefinitely())
             .expect("poll");
-        let data = slice.get_mapped_range();
+        let data = slice.get_mapped_range().expect("map readback buffer");
         let mut img = image::RgbaImage::new(w, h);
         img.copy_from_slice(&data);
         img.save(positional[1]).expect("save png");

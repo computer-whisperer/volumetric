@@ -142,7 +142,7 @@ impl LinePipeline {
         // Vertex buffer layouts
         let vertex_buffers = [
             // Quad vertex (per-vertex)
-            wgpu::VertexBufferLayout {
+            Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<QuadVertex>() as u64,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &[wgpu::VertexAttribute {
@@ -150,9 +150,9 @@ impl LinePipeline {
                     offset: 0,
                     shader_location: 0, // corner
                 }],
-            },
+            }),
             // Line instance (per-instance)
-            wgpu::VertexBufferLayout {
+            Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<LineInstance>() as u64,
                 step_mode: wgpu::VertexStepMode::Instance,
                 attributes: &[
@@ -177,7 +177,7 @@ impl LinePipeline {
                         shader_location: 4, // width
                     },
                 ],
-            },
+            }),
         ];
 
         // Depth-tested pipeline

@@ -275,6 +275,7 @@ impl ApplicationHandler for WebHost {
                     power_preference: wgpu::PowerPreference::default(),
                     compatible_surface: Some(&surface),
                     force_fallback_adapter: false,
+                    apply_limit_buckets: false,
                 })
                 .await
             {
@@ -364,6 +365,9 @@ impl ApplicationHandler for WebHost {
                 alpha_mode: surface_caps.alpha_modes[0],
                 view_formats,
                 desired_maximum_frame_latency: 2,
+                // Auto reproduces the pre-wgpu-30 behavior: sRGB for the
+                // formats this host negotiates (no HDR surface path here).
+                color_space: wgpu::SurfaceColorSpace::Auto,
             };
             surface.configure(&device, &config);
 
@@ -512,11 +516,20 @@ impl ApplicationHandler for WebHost {
                 is_synthetic: false,
                 ..
             } => {
-                if let Some(key) = map_key(&key_event.logical_key) {
-                    for event in gfx
-                        .damascene
-                        .key_down(key, self.modifiers, key_event.repeat)
-                    {
+                let logical = map_key(&key_event.logical_key);
+                let physical = map_physical(key_event.physical_key);
+                // Dispatch when either facet is meaningful — a key with no
+                // logical identity can still drive a physical-facet hotkey,
+                // and vice versa.
+                if logical != LogicalKey::Unidentified
+                    || physical != PhysicalKey::Unidentified
+                {
+                    for event in gfx.damascene.key_down(
+                        logical,
+                        physical,
+                        self.modifiers,
+                        key_event.repeat,
+                    ) {
                         dispatch_event(&mut self.app, &gfx.damascene, event);
                     }
                 }
@@ -631,7 +644,7 @@ impl WebHost {
         let theme = self.app.theme();
         let palette = theme.palette().clone();
         let cx = damascene_core::BuildCx::new(&theme);
-        let mut tree = self.app.build(&cx);
+        let tree = self.app.build(&cx);
 
         gfx.damascene.set_theme(theme);
         gfx.damascene.set_hotkeys(self.app.hotkeys());
@@ -646,9 +659,9 @@ impl WebHost {
         );
         let prepare =
             gfx.damascene
-                .prepare(&gfx.device, &gfx.queue, &mut tree, viewport, scale_factor);
+                .prepare(&gfx.device, &gfx.queue, tree, viewport, scale_factor);
 
-        let cursor = gfx.damascene.ui_state().cursor(&tree);
+        let cursor = gfx.damascene.snapshot_cursor();
         if cursor != self.last_cursor {
             gfx.window.set_cursor(winit_cursor(cursor));
             self.last_cursor = cursor;
@@ -680,7 +693,7 @@ impl WebHost {
         );
 
         gfx.queue.submit(Some(encoder.finish()));
-        frame.present();
+        gfx.queue.present(frame);
 
         if prepare.needs_redraw
             || viewport_resized
@@ -1235,27 +1248,80 @@ fn trigger_download(name: &str, bytes: &[u8]) -> Result<(), String> {
 // crate carries native-only dependencies, so the browser shell keeps its
 // own copies (same winit major version, same tables).
 
-fn map_key(key: &winit::keyboard::Key) -> Option<UiKey> {
-    use winit::keyboard::{Key, NamedKey};
+/// Total mapping (no `None`): a key with no logical identity can still
+/// carry a useful physical one, so the caller decides whether to dispatch
+/// based on both facets rather than dropping the event here.
+fn map_key(key: &winit::keyboard::Key) -> LogicalKey {
+    use winit::keyboard::Key;
     match key {
-        Key::Named(NamedKey::Enter) => Some(UiKey::Enter),
-        Key::Named(NamedKey::Escape) => Some(UiKey::Escape),
-        Key::Named(NamedKey::Tab) => Some(UiKey::Tab),
-        Key::Named(NamedKey::Space) => Some(UiKey::Space),
-        Key::Named(NamedKey::ArrowUp) => Some(UiKey::ArrowUp),
-        Key::Named(NamedKey::ArrowDown) => Some(UiKey::ArrowDown),
-        Key::Named(NamedKey::ArrowLeft) => Some(UiKey::ArrowLeft),
-        Key::Named(NamedKey::ArrowRight) => Some(UiKey::ArrowRight),
-        Key::Named(NamedKey::Backspace) => Some(UiKey::Backspace),
-        Key::Named(NamedKey::Delete) => Some(UiKey::Delete),
-        Key::Named(NamedKey::Home) => Some(UiKey::Home),
-        Key::Named(NamedKey::End) => Some(UiKey::End),
-        Key::Named(NamedKey::PageUp) => Some(UiKey::PageUp),
-        Key::Named(NamedKey::PageDown) => Some(UiKey::PageDown),
-        Key::Character(s) => Some(UiKey::Character(s.to_string())),
-        Key::Named(named) => Some(UiKey::Other(format!("{named:?}"))),
-        _ => None,
+        Key::Named(named) => match map_named(named) {
+            Some(n) => LogicalKey::Named(n),
+            None => LogicalKey::Unidentified,
+        },
+        Key::Character(s) => LogicalKey::Character(s.to_string()),
+        _ => LogicalKey::Unidentified,
     }
+}
+
+/// winit and damascene both mirror the W3C `key` named set, so shared
+/// names map 1:1; names damascene does not model return `None`.
+fn map_named(named: &winit::keyboard::NamedKey) -> Option<NamedKey> {
+    use winit::keyboard::NamedKey as WinitNamedKey;
+    macro_rules! same {
+        ($($v:ident),+ $(,)?) => {
+            Some(match named {
+                $( WinitNamedKey::$v => NamedKey::$v, )+
+                _ => return None,
+            })
+        };
+    }
+    same!(
+        Alt, AltGraph, CapsLock, Control, Fn, FnLock, Meta, NumLock, ScrollLock, Shift, Super,
+        Hyper, Symbol, Enter, Tab, Space, ArrowDown, ArrowLeft, ArrowRight, ArrowUp, End, Home,
+        PageDown, PageUp, Backspace, Clear, Copy, CrSel, Cut, Delete, EraseEof, ExSel, Insert,
+        Paste, Redo, Undo, Accept, Again, Cancel, ContextMenu, Escape, Execute, Find, Help, Pause,
+        Play, Props, Select, ZoomIn, ZoomOut, Eject, Power, PrintScreen, WakeUp, AudioVolumeDown,
+        AudioVolumeMute, AudioVolumeUp, MediaPlayPause, MediaStop, MediaTrackNext,
+        MediaTrackPrevious, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15, F16,
+        F17, F18, F19, F20, F21, F22, F23, F24,
+    )
+}
+
+/// winit's `KeyCode` follows the same W3C `code` spec as damascene's
+/// `PhysicalKey`, so shared names map 1:1; the few that differ in spelling
+/// are bridged explicitly. Unmapped codes become `Unidentified`.
+fn map_physical(physical: winit::keyboard::PhysicalKey) -> PhysicalKey {
+    use winit::keyboard::KeyCode;
+    let code = match physical {
+        winit::keyboard::PhysicalKey::Code(code) => code,
+        winit::keyboard::PhysicalKey::Unidentified(_) => return PhysicalKey::Unidentified,
+    };
+    macro_rules! same {
+        ($($v:ident),+ $(,)?) => {
+            match code {
+                $( KeyCode::$v => PhysicalKey::$v, )+
+                // Spelling bridges (winit → W3C `code`).
+                KeyCode::SuperLeft => PhysicalKey::MetaLeft,
+                KeyCode::SuperRight => PhysicalKey::MetaRight,
+                KeyCode::NumpadStar => PhysicalKey::NumpadMultiply,
+                _ => PhysicalKey::Unidentified,
+            }
+        };
+    }
+    same!(
+        Backquote, Backslash, BracketLeft, BracketRight, Comma, Digit0, Digit1, Digit2, Digit3,
+        Digit4, Digit5, Digit6, Digit7, Digit8, Digit9, Equal, IntlBackslash, IntlRo, IntlYen,
+        KeyA, KeyB, KeyC, KeyD, KeyE, KeyF, KeyG, KeyH, KeyI, KeyJ, KeyK, KeyL, KeyM, KeyN, KeyO,
+        KeyP, KeyQ, KeyR, KeyS, KeyT, KeyU, KeyV, KeyW, KeyX, KeyY, KeyZ, Minus, Period, Quote,
+        Semicolon, Slash, AltLeft, AltRight, Backspace, CapsLock, ContextMenu, ControlLeft,
+        ControlRight, Enter, ShiftLeft, ShiftRight, Space, Tab, Delete, End, Help, Home, Insert,
+        PageDown, PageUp, ArrowDown, ArrowLeft, ArrowRight, ArrowUp, NumLock, Numpad0, Numpad1,
+        Numpad2, Numpad3, Numpad4, Numpad5, Numpad6, Numpad7, Numpad8, Numpad9, NumpadAdd,
+        NumpadBackspace, NumpadClear, NumpadComma, NumpadDecimal, NumpadDivide, NumpadEnter,
+        NumpadEqual, NumpadMultiply, NumpadParenLeft, NumpadParenRight, NumpadSubtract, Escape,
+        PrintScreen, ScrollLock, Pause, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13,
+        F14, F15, F16, F17, F18, F19, F20, F21, F22, F23, F24,
+    )
 }
 
 fn pointer_button(b: winit::event::MouseButton) -> Option<PointerButton> {

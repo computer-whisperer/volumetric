@@ -64,7 +64,6 @@ members = [
     "crates/operators/island_removal_operator",
     "crates/volumetric_assets",
     "crates/volumetric_renderer",
-    "crates/volumetric_ui",
     "crates/volumetric_ui_v2",
     "crates/volumetric_cli",
     "crates/volumetric_protocol",

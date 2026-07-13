@@ -33,8 +33,6 @@
 #![allow(dead_code)]
 
 mod buffer;
-#[cfg(feature = "egui-callback")]
-mod callback;
 mod camera;
 mod conversions;
 mod gbuffer;
@@ -46,8 +44,6 @@ mod types;
 pub use conversions::{convert_mesh_data, convert_points_to_point_data};
 
 pub use buffer::{DynamicBuffer, QUAD_INDICES, QUAD_VERTICES, QuadVertex, StaticBuffer};
-#[cfg(feature = "egui-callback")]
-pub use callback::SceneCallback;
 pub use camera::{Camera, CameraAction, CameraControlScheme, CameraInputState};
 pub use gbuffer::{AoTexture, GBuffer};
 pub use pipelines::{

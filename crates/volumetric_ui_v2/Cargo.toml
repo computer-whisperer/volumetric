@@ -24,15 +24,15 @@ web = [
 ]
 
 [dependencies]
-damascene-core = "0.4.5"
-damascene-wgpu = "0.4.5"
+damascene-core = "0.5.0"
+damascene-wgpu = "0.5.0"
 anyhow = "1"
 glam = "0.32"
 rfd = "0.17"
 volumetric = { path = "../../", default-features = false }
 volumetric_assets = { path = "../volumetric_assets" }
 volumetric_renderer = { path = "../volumetric_renderer" }
-wgpu = "29"
+wgpu = "30"
 winit = "0.30"
 web-time = "1"
 log = "0.4"
@@ -63,7 +63,7 @@ web-sys = { version = "0.3", optional = true, features = [
 # clipboard flow src/host.rs mirrors. wayland-data-control lets copies
 # survive the window losing focus on Wayland.
 arboard = { version = "3", features = ["wayland-data-control"] }
-damascene-winit-wgpu = "0.4.5"
+damascene-winit-wgpu = "0.5.0"
 dirs = "6"
 pollster = "0.4"
 serde = { version = "1", features = ["derive"] }
@@ -75,7 +75,7 @@ volumetric_protocol = { path = "../volumetric_protocol", features = ["client"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 volumetric_protocol = { path = "../volumetric_protocol" }
-wgpu = { version = "29", features = ["webgl"] }
+wgpu = { version = "30", features = ["webgl"] }
 
 [[bin]]
 name = "volumetric_ui_v2"

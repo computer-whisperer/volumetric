@@ -164,7 +164,7 @@ impl PointPipeline {
         // Vertex buffer layouts
         let vertex_buffers = [
             // Quad vertex (per-vertex)
-            wgpu::VertexBufferLayout {
+            Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<QuadVertex>() as u64,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &[
@@ -179,9 +179,9 @@ impl PointPipeline {
                         shader_location: 1, // uv
                     },
                 ],
-            },
+            }),
             // Point instance (per-instance)
-            wgpu::VertexBufferLayout {
+            Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<GpuPointInstance>() as u64,
                 step_mode: wgpu::VertexStepMode::Instance,
                 attributes: &[
@@ -196,7 +196,7 @@ impl PointPipeline {
                         shader_location: 3, // color
                     },
                 ],
-            },
+            }),
         ];
 
         // Depth-tested pipeline

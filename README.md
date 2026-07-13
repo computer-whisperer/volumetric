@@ -107,7 +107,7 @@ cargo build-wasm
 ### Running the GUI
 
 ```bash
-cargo run -p volumetric_ui --release
+cargo run -p volumetric_ui_v2 --release
 ```
 
 In the UI:

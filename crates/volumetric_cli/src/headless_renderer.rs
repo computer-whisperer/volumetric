@@ -138,6 +138,7 @@ impl HeadlessRenderer {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
         }))
         .context("Failed to find a suitable GPU adapter")?;
 
@@ -210,7 +211,7 @@ impl HeadlessRenderer {
             vertex: wgpu::VertexState {
                 module: &mesh_shader,
                 entry_point: Some("vs_main"),
-                buffers: &[mesh_vertex_layout],
+                buffers: &[Some(mesh_vertex_layout)],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -272,7 +273,7 @@ impl HeadlessRenderer {
             vertex: wgpu::VertexState {
                 module: &grid_shader,
                 entry_point: Some("vs_main"),
-                buffers: &[grid_vertex_layout],
+                buffers: &[Some(grid_vertex_layout)],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -540,7 +541,9 @@ impl HeadlessRenderer {
         self.device.poll(wgpu::PollType::wait_indefinitely())?;
         receiver.recv()?.context("Failed to map output buffer")?;
 
-        let data = buffer_slice.get_mapped_range();
+        let data = buffer_slice
+            .get_mapped_range()
+            .context("Failed to read mapped output buffer")?;
 
         // Remove row padding and create image
         let mut pixels = Vec::with_capacity((self.width * self.height * 4) as usize);
