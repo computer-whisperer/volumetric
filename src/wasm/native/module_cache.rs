@@ -99,11 +99,22 @@ pub fn model_cache() -> &'static ModuleCache {
 /// no periodic ticker — so every store created against this engine must set
 /// a deadline and a callback that keeps *uncancelled* stores running (see
 /// `operator_executor.rs`).
+///
+/// Shared-memory creation is enabled for the threaded operator variants
+/// (wasm32-wasip1-threads builds importing a shared memory) — the threads
+/// *proposal* is on by default, but wasmtime gates `SharedMemory` behind
+/// this extra opt-in. Plain modules are unaffected.
 pub fn operator_cache() -> &'static ModuleCache {
     static CACHE: OnceLock<ModuleCache> = OnceLock::new();
     CACHE.get_or_init(|| {
-        let engine = Engine::new(Config::new().debug_info(true).epoch_interruption(true))
-            .expect("wasmtime engine with debug_info should construct");
+        let engine = Engine::new(
+            Config::new()
+                .debug_info(true)
+                .epoch_interruption(true)
+                .wasm_threads(true)
+                .shared_memory(true),
+        )
+        .expect("wasmtime engine with debug_info should construct");
         ModuleCache::new(engine)
     })
 }
