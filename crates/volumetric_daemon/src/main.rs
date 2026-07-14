@@ -20,6 +20,12 @@ struct Args {
     /// Seconds to retain finished job results for pickup.
     #[arg(long, default_value_t = 600)]
     result_ttl_secs: u64,
+
+    /// MiB of intermediate build results kept for reuse across project runs.
+    /// Counts toward the daemon's memory footprint; size against the
+    /// container/host limit.
+    #[arg(long, default_value_t = 2048)]
+    build_cache_mb: usize,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -28,6 +34,7 @@ fn main() -> anyhow::Result<()> {
         bind: args.bind,
         max_concurrent_jobs: args.max_jobs,
         result_ttl: Duration::from_secs(args.result_ttl_secs),
+        build_cache_bytes: args.build_cache_mb << 20,
         ..Default::default()
     })?;
     eprintln!(

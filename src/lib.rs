@@ -6,7 +6,10 @@ use anyhow::Context;
 
 // wasmtime imports are now used through the wasm module
 
+pub mod build_cache;
 pub mod wasm;
+
+pub use build_cache::BuildCache;
 
 /// A triangle in 3D space with vertices and per-vertex normal vectors.
 #[derive(Clone, Debug, PartialEq)]
@@ -808,6 +811,11 @@ pub struct LoadedAsset {
     type_hint: Option<AssetTypeHint>,
     /// IDs of assets that were used to create this asset.
     precursor_ids: Vec<String>,
+    /// Blake3 of `data`, memoized on first use (step cache keys). Assets
+    /// coming out of the step cache arrive with it pre-seeded, so cached
+    /// blobs are never re-hashed. A clone made before first use re-hashes
+    /// once; clones after share the computed value.
+    content_hash: std::sync::OnceLock<[u8; 32]>,
 }
 
 impl LoadedAsset {
@@ -825,7 +833,15 @@ impl LoadedAsset {
             data: Arc::new(data),
             type_hint,
             precursor_ids,
+            content_hash: std::sync::OnceLock::new(),
         }
+    }
+
+    /// The blake3 hash of the asset's bytes, computed on first call.
+    fn content_hash(&self) -> [u8; 32] {
+        *self
+            .content_hash
+            .get_or_init(|| *blake3::hash(&self.data).as_bytes())
     }
 
     /// Returns the asset ID.
@@ -1163,6 +1179,12 @@ impl Project {
     /// `progress` receives a [`BuildProgress`] before each timeline step,
     /// naming the operator about to run with the step fraction. It is called
     /// from the executing thread itself, so it must be cheap.
+    ///
+    /// Steps are memoized through the process-global [`BuildCache`]: a step
+    /// whose operator and resolved inputs are byte-identical to a previously
+    /// executed one is served from cache instead of re-executing (see the
+    /// [`build_cache`] module docs). Progress reports one snapshot per step
+    /// either way.
     #[cfg(any(feature = "native", feature = "web"))]
     pub fn run_monitored(
         &self,
@@ -1170,6 +1192,20 @@ impl Project {
         cancel: &std::sync::atomic::AtomicBool,
         progress: &dyn Fn(BuildProgress),
     ) -> Result<Vec<LoadedAsset>, ExecutionError> {
+        self.run_monitored_with_cache(env, build_cache::global(), cancel, progress)
+    }
+
+    /// [`run_monitored`](Self::run_monitored) against a caller-supplied step
+    /// cache instead of the process-global one.
+    #[cfg(any(feature = "native", feature = "web"))]
+    pub fn run_monitored_with_cache(
+        &self,
+        env: &mut Environment,
+        cache: &BuildCache,
+        cancel: &std::sync::atomic::AtomicBool,
+        progress: &dyn Fn(BuildProgress),
+    ) -> Result<Vec<LoadedAsset>, ExecutionError> {
+        use build_cache::{CachedStep, StepKey};
         use std::sync::atomic::Ordering;
         use wasm::{OperatorExecutor, OperatorIo};
 
@@ -1180,6 +1216,7 @@ impl Project {
                 data: Arc::new(import.data.clone()),
                 type_hint: import.type_hint,
                 precursor_ids: vec![],
+                content_hash: std::sync::OnceLock::new(),
             });
         }
 
@@ -1195,22 +1232,62 @@ impl Project {
             });
 
             // Get operator bytes
-            let op_data = env
+            let op_asset = env
                 .get(&step.operator_id)
-                .ok_or_else(|| ExecutionError::NoSuchAssetId(step.operator_id.clone()))?
-                .data_arc();
+                .ok_or_else(|| ExecutionError::NoSuchAssetId(step.operator_id.clone()))?;
+            let op_hash = op_asset.content_hash();
+            let op_data = op_asset.data_arc();
+
+            // Key the step by content before touching any input bytes: on a
+            // cache hit no input blob is copied and the operator is never
+            // instantiated.
+            let mut input_hashes = Vec::with_capacity(step.inputs.len());
+            let mut precursor_ids = Vec::new();
+            for input in &step.inputs {
+                match input {
+                    ExecutionInput::AssetRef(id) => {
+                        let asset = env
+                            .get(id)
+                            .ok_or_else(|| ExecutionError::NoSuchAssetId(id.clone()))?;
+                        input_hashes.push(asset.content_hash());
+                        precursor_ids.push(id.clone());
+                    }
+                    ExecutionInput::Inline(data) => {
+                        input_hashes.push(*blake3::hash(data).as_bytes());
+                    }
+                }
+            }
+            let step_key = StepKey::new(&op_hash, &input_hashes);
+
+            if let Some(cached) = cache.get(&step_key) {
+                for (idx, output_id) in step.outputs.iter().enumerate() {
+                    if let Some((data, hash)) = cached.outputs.get(&idx) {
+                        env.insert(LoadedAsset {
+                            id: output_id.clone(),
+                            data: Arc::clone(data),
+                            type_hint: Some(
+                                cached
+                                    .declared_outputs
+                                    .get(idx)
+                                    .copied()
+                                    .unwrap_or(AssetTypeHint::Model),
+                            ),
+                            precursor_ids: precursor_ids.clone(),
+                            content_hash: std::sync::OnceLock::from(*hash),
+                        });
+                    }
+                }
+                continue;
+            }
 
             // Resolve inputs to bytes
             let mut input_bytes = Vec::new();
-            let mut precursor_ids = Vec::new();
-
             for input in &step.inputs {
                 let bytes = match input {
                     ExecutionInput::AssetRef(id) => {
                         let asset = env
                             .get(id)
                             .ok_or_else(|| ExecutionError::NoSuchAssetId(id.clone()))?;
-                        precursor_ids.push(id.clone());
                         asset.data().to_vec()
                     }
                     ExecutionInput::Inline(data) => data.clone(),
@@ -1245,12 +1322,23 @@ impl Project {
                 other => ExecutionError::Wasmtime(other.to_string()),
             })?;
 
+            // Move every produced output into a shared blob, hashed once.
+            // The cache entry keeps all produced slots (not just the ones
+            // this step maps to ids), so the memo is a pure function of
+            // (operator, inputs) regardless of a project's output mapping.
+            let mut outputs: HashMap<usize, (Arc<Vec<u8>>, [u8; 32])> =
+                HashMap::with_capacity(result.outputs.len());
+            for (idx, bytes) in result.outputs {
+                let hash = *blake3::hash(&bytes).as_bytes();
+                outputs.insert(idx, (Arc::new(bytes), hash));
+            }
+
             // Store outputs
             for (idx, output_id) in step.outputs.iter().enumerate() {
-                if let Some(output_bytes) = result.outputs.get(&idx) {
+                if let Some((data, hash)) = outputs.get(&idx) {
                     env.insert(LoadedAsset {
                         id: output_id.clone(),
-                        data: Arc::new(output_bytes.clone()),
+                        data: Arc::clone(data),
                         type_hint: Some(
                             declared_outputs
                                 .get(idx)
@@ -1258,9 +1346,18 @@ impl Project {
                                 .unwrap_or(AssetTypeHint::Model),
                         ),
                         precursor_ids: precursor_ids.clone(),
+                        content_hash: std::sync::OnceLock::from(*hash),
                     });
                 }
             }
+
+            cache.insert(
+                step_key,
+                CachedStep {
+                    outputs,
+                    declared_outputs,
+                },
+            );
         }
 
         // Collect exports. Duplicates are rejected up front so the second

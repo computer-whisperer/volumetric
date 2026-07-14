@@ -38,6 +38,10 @@ pub struct DaemonConfig {
     /// HTTP accept threads. Each long-poll status request occupies one for
     /// its wait, so this bounds concurrent pollers, not throughput.
     pub accept_threads: usize,
+    /// Byte budget for the step-result cache shared by all project runs
+    /// (`volumetric::build_cache`). Size against the container/host memory
+    /// limit: the cache retains intermediate build blobs across jobs.
+    pub build_cache_bytes: usize,
 }
 
 impl Default for DaemonConfig {
@@ -47,6 +51,7 @@ impl Default for DaemonConfig {
             max_concurrent_jobs: 4,
             result_ttl: Duration::from_secs(600),
             accept_threads: 8,
+            build_cache_bytes: volumetric::build_cache::DEFAULT_BUDGET_BYTES,
         }
     }
 }
@@ -122,6 +127,7 @@ pub fn start(config: DaemonConfig) -> anyhow::Result<DaemonHandle> {
         other => anyhow::bail!("unexpected listen address {other:?}"),
     };
     let accept_thread_count = config.accept_threads.max(1);
+    volumetric::build_cache::global().set_budget(config.build_cache_bytes);
     let state = Arc::new(DaemonState {
         jobs: Mutex::new(HashMap::new()),
         finished: Condvar::new(),
