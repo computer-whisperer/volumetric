@@ -293,7 +293,17 @@ impl ApplicationHandler for Host {
                         };
                         match state {
                             ElementState::Pressed => {
-                                gfx.session.pointer_down((lx, ly), button);
+                                // The camera only sees presses when the
+                                // viewport pane is the hover target — a
+                                // modal/menu stacked above it must not
+                                // start an orbit drag underneath.
+                                if gfx
+                                    .damascene
+                                    .ui_state()
+                                    .is_hovering_within(crate::VIEWPORT_KEY)
+                                {
+                                    gfx.session.pointer_down((lx, ly), button);
+                                }
                                 for event in
                                     gfx.damascene.pointer_down(Pointer::mouse(lx, ly, button))
                                 {
@@ -324,14 +334,23 @@ impl ApplicationHandler for Host {
                                 (-logical_y, logical_y / 50.0)
                             }
                         };
-                        if gfx.session.wheel(
-                            (lx, ly),
-                            camera_scroll_delta,
-                            self.app.camera_control_scheme(),
-                        ) {
-                            gfx.window.request_redraw();
-                        }
-                        if gfx.damascene.pointer_wheel(lx, ly, dy) {
+                        // Exclusive routing: the camera owns the wheel only
+                        // when the viewport pane is the hover target; UI
+                        // stacked above it (Add modal, menus, popovers)
+                        // takes the wheel as scroll, never as zoom.
+                        if gfx
+                            .damascene
+                            .ui_state()
+                            .is_hovering_within(crate::VIEWPORT_KEY)
+                        {
+                            if gfx.session.wheel(
+                                (lx, ly),
+                                camera_scroll_delta,
+                                self.app.camera_control_scheme(),
+                            ) {
+                                gfx.window.request_redraw();
+                            }
+                        } else if gfx.damascene.pointer_wheel(lx, ly, dy) {
                             gfx.window.request_redraw();
                         }
                     }
