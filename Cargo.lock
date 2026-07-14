@@ -5388,6 +5388,7 @@ dependencies = [
  "log",
  "rayon",
  "serde",
+ "serde_bytes",
  "thiserror 2.0.18",
  "volumetric_abi",
  "wasm-bindgen",

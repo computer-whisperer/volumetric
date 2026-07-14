@@ -89,6 +89,7 @@ serde = { version = "1", features = ["derive"] }
 wasmparser = "0.248"
 thiserror = "2"
 ciborium = "0.2"
+serde_bytes = "0.11"
 blake3 = "1"
 log = "0.4"
 glam = "0.32"

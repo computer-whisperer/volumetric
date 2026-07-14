@@ -44,6 +44,16 @@ impl StepKey {
         }
         Self(*hasher.finalize().as_bytes())
     }
+
+    /// The raw key bytes, for persistence (baked projects).
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// Reconstructs a key from persisted bytes.
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
 }
 
 /// The memoized result of one executed step: every output the operator
@@ -60,7 +70,8 @@ pub struct CachedStep {
 }
 
 impl CachedStep {
-    fn cost_bytes(&self) -> usize {
+    /// What this entry counts against the byte budget.
+    pub(crate) fn cost_bytes(&self) -> usize {
         // Fixed overhead keeps a flood of tiny entries from escaping the
         // budget on payload bytes alone.
         const ENTRY_OVERHEAD: usize = 256;
@@ -177,6 +188,17 @@ impl BuildCache {
         }
         inner.total_bytes += bytes;
         inner.evict_to_budget();
+    }
+
+    /// Raises the budget (never lowers it) so at least `additional` more
+    /// bytes fit without evicting anything currently resident. Seeding a
+    /// baked project reserves its full size up front, so a snapshot larger
+    /// than the configured budget is neither refused nor self-evicting.
+    pub fn reserve(&self, additional: usize) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.budget = inner
+            .budget
+            .max(inner.total_bytes.saturating_add(additional));
     }
 
     /// Adjusts the byte budget, evicting immediately if lowered.

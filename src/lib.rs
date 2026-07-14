@@ -6,9 +6,11 @@ use anyhow::Context;
 
 // wasmtime imports are now used through the wasm module
 
+pub mod baked;
 pub mod build_cache;
 pub mod wasm;
 
+pub use baked::{BakeCoverage, BakedResults, SeedReport};
 pub use build_cache::BuildCache;
 
 /// A triangle in 3D space with vertices and per-vertex normal vectors.
@@ -798,6 +800,13 @@ pub struct Project {
 
     /// Asset IDs to return after execution.
     pub exports: Vec<String>,
+
+    /// Optional snapshot of built step results (see the [`baked`] module).
+    /// Absent in ordinary project files; a file carrying it is a "built
+    /// copy" that opens without re-executing its cached steps. Old readers
+    /// ignore the field; files without it load as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baked: Option<baked::BakedResults>,
 }
 
 /// A loaded asset in the execution environment.
@@ -930,6 +939,7 @@ impl Project {
             imports: Vec::new(),
             timeline: Vec::new(),
             exports: Vec::new(),
+            baked: None,
         }
     }
 
@@ -940,6 +950,7 @@ impl Project {
             imports: vec![ImportedAsset::model(id.clone(), data)],
             timeline: Vec::new(),
             exports: vec![id],
+            baked: None,
         }
     }
 
@@ -1432,6 +1443,7 @@ mod tests {
             imports: vec![ImportedAsset::model("a".to_string(), vec![1, 2, 3])],
             timeline: vec![],
             exports: vec!["a".to_string(), "a".to_string()],
+            baked: None,
         };
 
         let mut env = Environment::new();
@@ -1466,6 +1478,7 @@ mod tests {
                 step("op", &["a"], &["b"]), // chained: consumes an earlier output
             ],
             exports: vec!["b".to_string()],
+            baked: None,
         };
         assert_eq!(project.validate(), vec![]);
     }
@@ -1480,6 +1493,7 @@ mod tests {
                 step("op", &[], &["later"]),
             ],
             exports: vec![],
+            baked: None,
         };
         let issues = project.validate();
         assert_eq!(
@@ -1508,6 +1522,7 @@ mod tests {
             imports: vec![],
             timeline: vec![step("ghost", &[], &["a"])],
             exports: vec![],
+            baked: None,
         };
         assert_eq!(
             project.validate(),
@@ -1529,6 +1544,7 @@ mod tests {
             ],
             timeline: vec![step("op", &[], &["m"])], // shadows the import too
             exports: vec![],
+            baked: None,
         };
         assert_eq!(
             project.validate(),
@@ -1550,6 +1566,7 @@ mod tests {
             imports: vec![ImportedAsset::model("m".to_string(), vec![1])],
             timeline: vec![],
             exports: vec!["m".to_string(), "m".to_string(), "ghost".to_string()],
+            baked: None,
         };
         assert_eq!(
             project.validate(),
@@ -1575,6 +1592,7 @@ mod tests {
                 outputs: vec!["model_b".to_string()],
             }],
             exports: vec![],
+            baked: None,
         };
 
         let assets = project.declared_assets();
