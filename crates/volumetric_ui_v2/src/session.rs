@@ -400,6 +400,10 @@ struct ViewportRenderer {
     framed_ids: Option<Vec<String>>,
     pending_frame_preview: bool,
     camera: Option<renderer::Camera>,
+    /// The viewport rect's logical size as of the last render, so camera
+    /// gestures (whose deltas arrive in logical pixels) can map drag
+    /// distance to world units 1:1.
+    viewport_logical_size: Vec2,
 }
 
 /// One output's GPU-resident preview geometry.
@@ -440,6 +444,7 @@ impl ViewportRenderer {
             framed_ids: None,
             pending_frame_preview: false,
             camera: None,
+            viewport_logical_size: Vec2::ZERO,
         }
     }
 
@@ -480,6 +485,7 @@ impl ViewportRenderer {
         let Some(rect) = logical_rect else {
             return false;
         };
+        self.viewport_logical_size = Vec2::new(rect.w, rect.h);
 
         let target_resized = self.ensure_target_for_rect(device, rect, scale_factor);
         let (w, h) = self.target.extent;
@@ -520,7 +526,7 @@ impl ViewportRenderer {
                 true
             }
             renderer::CameraAction::Pan => {
-                camera.pan(input.mouse_delta, Vec2::ZERO);
+                camera.pan(input.mouse_delta, self.viewport_logical_size);
                 true
             }
             renderer::CameraAction::Zoom => {

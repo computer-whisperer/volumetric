@@ -71,7 +71,7 @@ fn vs_main(quad: QuadVertex, line: LineInstance) -> VsOut {
     } else {
         // World-space: approximate pixel width from clip.w
         let clip_w = mix(clip_start.w, clip_end.w, t);
-        half_width_px = (width / clip_w) * uniforms.screen_size.y * 0.5;
+        half_width_px = (width / max(clip_w, 0.0001)) * uniforms.screen_size.y * 0.5;
     }
 
     // Offset in screen space

@@ -45,7 +45,7 @@ fn vs_main(in: VsIn) -> VsOut {
         half_size_px = uniforms.point_size_px * 0.5;
     } else {
         // World-space: size shrinks with distance
-        half_size_px = (uniforms.point_size_px / clip.w) * uniforms.screen_size_px.y * 0.5;
+        half_size_px = (uniforms.point_size_px / max(clip.w, 0.0001)) * uniforms.screen_size_px.y * 0.5;
     }
 
     // Convert pixel offset to clip space

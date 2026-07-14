@@ -121,20 +121,29 @@ impl Camera {
 
     /// Pan the camera (translate target in the view plane).
     ///
-    /// - `delta_screen`: Mouse delta in screen pixels
-    /// - `_viewport_size`: Viewport dimensions in pixels (unused)
-    pub fn pan(&mut self, delta_screen: Vec2, _viewport_size: Vec2) {
+    /// True 1:1 grab: one pixel of drag maps to the world span of one pixel
+    /// at the focus (target) depth — the frustum is `2·radius·tan(fov_y/2)`
+    /// world units tall across `viewport_size.y` pixels, and the scale is
+    /// uniform across x/y for square pixels. The grabbed point tracks the
+    /// cursor exactly at any zoom or window size.
+    ///
+    /// - `delta_screen`: Mouse delta, in the same pixel space as `viewport_size`
+    /// - `viewport_size`: Viewport dimensions in pixels
+    pub fn pan(&mut self, delta_screen: Vec2, viewport_size: Vec2) {
+        if viewport_size.y <= 0.0 {
+            return;
+        }
+
         // Use camera's own coordinate axes
         let right = self.right();
         let up = self.up();
 
-        // Scale movement by distance for consistent feel at any zoom level
-        // The 0.002 factor provides reasonable sensitivity
-        let scale = self.radius * 0.002;
+        // World span of one pixel at the focus depth.
+        let world_per_pixel = 2.0 * self.radius * (self.fov_y * 0.5).tan() / viewport_size.y;
 
         // Move target opposite to drag direction (scene follows mouse)
-        self.target -= right * (delta_screen.x * scale);
-        self.target += up * (delta_screen.y * scale);
+        self.target -= right * (delta_screen.x * world_per_pixel);
+        self.target += up * (delta_screen.y * world_per_pixel);
     }
 
     /// Zoom the camera (adjust distance from target).
@@ -487,6 +496,48 @@ mod tests {
         camera.fit_clip_planes();
         assert!(camera.near < 0.001);
         assert!(camera.near > 0.0);
+    }
+
+    /// Projects a world point to pointer-space pixels (x right, y down).
+    fn project_to_screen(camera: &Camera, world: Vec3, viewport: Vec2) -> Vec2 {
+        let clip = camera.view_projection_matrix(viewport.x / viewport.y) * world.extend(1.0);
+        let ndc = clip / clip.w;
+        Vec2::new(
+            (ndc.x * 0.5 + 0.5) * viewport.x,
+            (0.5 - ndc.y * 0.5) * viewport.y,
+        )
+    }
+
+    #[test]
+    fn pan_is_one_to_one_at_focus_depth() {
+        let mut camera = Camera::default();
+        let viewport = Vec2::new(800.0, 600.0);
+        // Grab the point at the focus depth (the target) and drag: it must
+        // track the cursor exactly, at any zoom or viewport size.
+        let grabbed = camera.target;
+        let before = project_to_screen(&camera, grabbed, viewport);
+
+        camera.pan(Vec2::new(60.0, 24.0), viewport);
+
+        let moved = project_to_screen(&camera, grabbed, viewport) - before;
+        assert!(
+            (moved.x - 60.0).abs() < 1e-2 && (moved.y - 24.0).abs() < 1e-2,
+            "grabbed point moved {moved:?} for a (60, 24) px drag"
+        );
+
+        // Still 1:1 after zooming in and at a different window size.
+        camera.zoom(3.0);
+        let viewport = Vec2::new(333.0, 1111.0);
+        let grabbed = camera.target;
+        let before = project_to_screen(&camera, grabbed, viewport);
+
+        camera.pan(Vec2::new(-17.0, 5.0), viewport);
+
+        let moved = project_to_screen(&camera, grabbed, viewport) - before;
+        assert!(
+            (moved.x + 17.0).abs() < 1e-2 && (moved.y - 5.0).abs() < 1e-2,
+            "grabbed point moved {moved:?} for a (-17, 5) px drag"
+        );
     }
 
     #[test]
