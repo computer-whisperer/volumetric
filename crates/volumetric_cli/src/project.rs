@@ -492,15 +492,22 @@ pub fn run_project_validate(args: ProjectValidateArgs) -> Result<()> {
 /// Runs a project to its exports, locally or — when `remote` names a daemon
 /// base URL — on a remote build daemon over `volumetric_protocol`.
 fn run_project_exports(
-    project: Project,
+    mut project: Project,
     remote: Option<&str>,
 ) -> Result<Vec<volumetric::LoadedAsset>> {
     let Some(address) = remote else {
+        // A built copy opens hot: its bake seeds the process cache and the
+        // run below serves those steps without executing them.
+        project.seed_build_cache(volumetric::build_cache::global());
         let mut env = Environment::new();
         return project
             .run(&mut env)
             .map_err(|e| anyhow::anyhow!("Project execution failed: {}", e));
     };
+
+    // The daemon's cache is shared across clients and must not trust
+    // client-supplied results; a bake would only bloat the upload.
+    project.baked = None;
 
     let client = volumetric_protocol::DaemonClient::new(address);
     client
@@ -702,6 +709,73 @@ pub fn run_project_run(args: ProjectRunArgs) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+// === Project Bake ===
+
+#[derive(Parser, Debug)]
+pub struct ProjectBakeArgs {
+    /// Project file to bake
+    #[arg(short, long)]
+    pub project: PathBuf,
+
+    /// Where to write the built copy (defaults to baking in place)
+    #[arg(short, long)]
+    pub output: Option<PathBuf>,
+}
+
+/// Builds the project locally and saves a copy with every step result
+/// embedded (a built copy): opening it later serves the whole timeline from
+/// cache instead of re-executing. An existing bake in the input is reused,
+/// so re-baking an already-built copy executes nothing.
+pub fn run_project_bake(args: ProjectBakeArgs) -> Result<()> {
+    let mut project = Project::load_from_file(&args.project).context("Failed to load project")?;
+    let cache = volumetric::build_cache::global();
+
+    let seeded = project.seed_build_cache(cache);
+    if seeded.corrupt_blobs > 0 {
+        eprintln!(
+            "warning: dropped {} corrupt blob(s) from the input file's bake",
+            seeded.corrupt_blobs
+        );
+    }
+    if seeded.seeded_steps > 0 {
+        eprintln!(
+            "Reusing {} baked step(s) from the input file",
+            seeded.seeded_steps
+        );
+    }
+
+    // Build whatever the (possibly seeded) cache can't already serve.
+    if !project.collect_baked(cache).1.is_complete() {
+        let never = std::sync::atomic::AtomicBool::new(false);
+        project
+            .run_monitored(&mut Environment::new(), &never, &|progress| {
+                eprintln!("build: {}", progress.phase)
+            })
+            .map_err(|e| anyhow::anyhow!("Project execution failed: {}", e))?;
+    }
+
+    let (baked, coverage) = project.collect_baked(cache);
+    if !coverage.is_complete() {
+        eprintln!(
+            "warning: only {}/{} steps fit the build cache budget; the rest re-run on open",
+            coverage.baked_steps, coverage.total_steps
+        );
+    }
+    let blob_bytes = baked.blob_bytes();
+    project.baked = (!baked.is_empty()).then_some(baked);
+
+    let output = args.output.unwrap_or(args.project);
+    save_project(&project, &output)?;
+    println!(
+        "Baked {}/{} step(s), {:.1} MB of results -> {}",
+        coverage.baked_steps,
+        coverage.total_steps,
+        blob_bytes as f64 / (1024.0 * 1024.0),
+        output.display()
+    );
     Ok(())
 }
 

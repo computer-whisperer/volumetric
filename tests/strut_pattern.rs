@@ -129,6 +129,7 @@ fn run_project(pattern_config: Vec<u8>, with_solve: bool) -> Vec<(String, FeaMes
         imports,
         timeline,
         exports,
+        baked: None,
     };
     let mut env = Environment::new();
     let outputs = project.run(&mut env).expect("project run failed");

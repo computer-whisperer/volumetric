@@ -138,6 +138,7 @@ fn sphere_press_matches_a_step_target_end_to_end() {
             },
         ],
         exports: vec!["designed".to_string()],
+        baked: None,
     };
 
     let mut env = Environment::new();
@@ -291,6 +292,7 @@ fn unsatisfiable_target_still_outputs_best_effort() {
             },
         ],
         exports: vec!["designed".to_string()],
+        baked: None,
     };
 
     let mut env = Environment::new();
@@ -393,6 +395,7 @@ fn strut_lattice_inverse_matches_a_step_target_end_to_end() {
             },
         ],
         exports: vec!["designed".to_string()],
+        baked: None,
     };
 
     let mut env = Environment::new();

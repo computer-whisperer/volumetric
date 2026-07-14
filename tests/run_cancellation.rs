@@ -30,6 +30,7 @@ fn cancel_interrupts_a_project_run_mid_operator() {
             outputs: vec!["out".to_string()],
         }],
         exports: vec![],
+        baked: None,
     };
 
     let cancel = Arc::new(AtomicBool::new(false));

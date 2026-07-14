@@ -61,6 +61,7 @@ fn mesh_sphere(config_bytes: Vec<u8>) -> (FeaMesh, AssetTypeHint) {
             outputs: vec!["mesh".to_string()],
         }],
         exports: vec!["mesh".to_string()],
+        baked: None,
     };
 
     let mut env = Environment::new();
@@ -171,6 +172,7 @@ fn non_model_input_reports_an_error() {
             outputs: vec!["mesh".to_string()],
         }],
         exports: vec!["mesh".to_string()],
+        baked: None,
     };
 
     let mut env = Environment::new();

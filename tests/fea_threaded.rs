@@ -114,6 +114,7 @@ fn lattice_press_project(cell_size: f64, solver_config: Vec<u8>) -> Project {
             },
         ],
         exports: vec!["solved".to_string()],
+        baked: None,
     }
 }
 

@@ -128,6 +128,7 @@ fn density_model_end_to_end() {
             },
         ],
         exports: vec!["density_model".to_string()],
+        baked: None,
     };
 
     let mut env = Environment::new();
@@ -234,6 +235,7 @@ fn unsolved_mesh_is_rejected() {
             },
         ],
         exports: vec!["density_model".to_string()],
+        baked: None,
     };
 
     let mut env = Environment::new();

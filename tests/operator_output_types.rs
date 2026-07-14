@@ -66,6 +66,7 @@ fn run_project(operator: Vec<u8>, output_ids: &[&str]) -> Vec<volumetric::Loaded
             outputs: output_ids.iter().map(|id| id.to_string()).collect(),
         }],
         exports: output_ids.iter().map(|id| id.to_string()).collect(),
+        baked: None,
     };
 
     let mut env = Environment::new();

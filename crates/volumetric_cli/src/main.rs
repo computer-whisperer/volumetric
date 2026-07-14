@@ -80,6 +80,9 @@ enum Commands {
     /// Run a project and show exported assets
     #[command(name = "project-run")]
     ProjectRun(project::ProjectRunArgs),
+    /// Build a project and save a copy with every step result embedded
+    #[command(name = "project-bake")]
+    ProjectBake(project::ProjectBakeArgs),
     /// List assets in a project
     #[command(name = "project-list")]
     ProjectList(project::ProjectListArgs),
@@ -179,7 +182,11 @@ pub fn load_wasm_bytes(path: &PathBuf, asset: Option<&str>) -> Result<Vec<u8>> {
         }
         "vproj" => {
             eprintln!("Loading project from {:?}", path);
-            let project = Project::load_from_file(path).context("Failed to load .vproj file")?;
+            let mut project =
+                Project::load_from_file(path).context("Failed to load .vproj file")?;
+            // A built copy's bake seeds the process cache, so the run below
+            // serves those steps without executing them.
+            project.seed_build_cache(volumetric::build_cache::global());
 
             // Run the project to get the exported assets
             let mut env = Environment::new();
@@ -471,6 +478,7 @@ fn main() -> Result<()> {
         Commands::ProjectValidate(args) => project::run_project_validate(args),
         Commands::ProjectExport(args) => project::run_project_export(args),
         Commands::ProjectRun(args) => project::run_project_run(args),
+        Commands::ProjectBake(args) => project::run_project_bake(args),
         Commands::ProjectList(args) => project::run_project_list(args),
     }
 }

@@ -114,6 +114,7 @@ fn box_compressed_by_sphere_end_to_end() {
             },
         ],
         exports: vec!["solved".to_string()],
+        baked: None,
     };
 
     let mut env = Environment::new();

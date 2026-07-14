@@ -97,6 +97,7 @@ fn import_project(stl: Vec<u8>, with_convert: bool) -> Project {
         ],
         timeline,
         exports,
+        baked: None,
     }
 }
 

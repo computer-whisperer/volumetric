@@ -147,6 +147,7 @@ fn designed_lattice_realizes_as_geometry_end_to_end() {
             },
         ],
         exports: vec!["designed".to_string(), "model".to_string()],
+        baked: None,
     };
 
     let mut env = Environment::new();
