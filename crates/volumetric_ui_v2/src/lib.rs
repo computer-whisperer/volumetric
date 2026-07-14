@@ -3707,17 +3707,24 @@ fn catalog_row_key(entry: &catalog::CatalogEntry) -> String {
     }
 }
 
-/// One Add-modal row: icon, display name, and the declared description.
-fn catalog_row(entry: &catalog::CatalogEntry) -> El {
-    let description = match &entry.metadata {
+/// The catalog entry's one-line status: its declared description once
+/// known, a scan/failure note until then.
+fn catalog_description(entry: &catalog::CatalogEntry) -> String {
+    match &entry.metadata {
         catalog::CatalogMetadata::Ready(metadata) => metadata.description.clone(),
         catalog::CatalogMetadata::Pending => "reading module metadata…".to_string(),
         catalog::CatalogMetadata::Failed(_) => "module metadata unavailable".to_string(),
-    };
+    }
+}
+
+/// One Add-modal search row: icon, display name, and the declared
+/// description (search results stay rows — the description column is what
+/// disambiguates near-matches).
+fn catalog_row(entry: &catalog::CatalogEntry) -> El {
     command_item([
         command_icon(catalog_icon_source(entry)),
         command_label(entry.display_name()).width(Size::Fixed(170.0)),
-        text(description)
+        text(catalog_description(entry))
             .caption()
             .muted()
             .ellipsis()
@@ -3726,13 +3733,56 @@ fn catalog_row(entry: &catalog::CatalogEntry) -> El {
     .key(catalog_row_key(entry))
 }
 
+/// Browse-grid columns; 640px modal ÷ 4 leaves room for the longest
+/// display names ("Heightmap Extrude") before the ellipsis bites.
+const ADD_GRID_COLS: usize = 4;
+const ADD_CARD_HEIGHT: f32 = 72.0;
+
+/// The browse-card recipe shared by catalog entries and the Model-WASM
+/// action: a column-axis [`command_item`] (keeping its focus, hover, and
+/// the grid's 2D arrow-nav) with the glyph over a centered label; the
+/// description rides the tooltip — cards have no room for it inline.
+fn add_card(icon_source: IconSource, label: &str, tooltip: &str, key: String) -> El {
+    command_item([
+        icon(icon_source)
+            .icon_size(tokens::ICON_LG)
+            .color(tokens::FOREGROUND),
+        text(label)
+            .caption()
+            .center_text()
+            .ellipsis()
+            .width(Size::Fill(1.0)),
+    ])
+    .axis(Axis::Column)
+    .align(Align::Center)
+    .justify(Justify::Center)
+    .gap(tokens::SPACE_2)
+    .height(Size::Fixed(ADD_CARD_HEIGHT))
+    .padding(Sides::all(tokens::SPACE_2))
+    .tooltip(tooltip)
+    .key(key)
+}
+
+/// One Add-modal browse card for a catalog entry.
+fn catalog_card(entry: &catalog::CatalogEntry) -> El {
+    add_card(
+        catalog_icon_source(entry),
+        entry.display_name(),
+        &catalog_description(entry),
+        catalog_row_key(entry),
+    )
+}
+
+const IMPORT_WASM_LABEL: &str = "Model WASM…";
+const IMPORT_WASM_BLURB: &str = "Import a compiled model module from disk.";
+
 /// The import action for external module files (not a catalog entry: it
-/// imports an arbitrary compiled model from disk).
+/// imports an arbitrary compiled model from disk) — search-row shape.
 fn import_wasm_row() -> El {
     command_item([
         command_icon("file-text"),
-        command_label("Model WASM…").width(Size::Fixed(170.0)),
-        text("Import a compiled model module from disk.")
+        command_label(IMPORT_WASM_LABEL).width(Size::Fixed(170.0)),
+        text(IMPORT_WASM_BLURB)
             .caption()
             .muted()
             .ellipsis()
@@ -3741,9 +3791,18 @@ fn import_wasm_row() -> El {
     .key(IMPORT_WASM_KEY)
 }
 
-/// Browse view: every catalog entry grouped by declared category in
-/// [`CATEGORY_ORDER`], unknown declared categories after, unscanned
-/// entries last.
+/// [`import_wasm_row`]'s browse-grid shape.
+fn import_wasm_card() -> El {
+    add_card(
+        "file-text".into_icon_source(),
+        IMPORT_WASM_LABEL,
+        IMPORT_WASM_BLURB,
+        IMPORT_WASM_KEY.to_string(),
+    )
+}
+
+/// Browse view: a card grid per declared category in [`CATEGORY_ORDER`],
+/// unknown declared categories after, unscanned entries last.
 fn add_browse_rows(app: &VolumetricUiV2) -> Vec<El> {
     let entries = app.catalog.entries();
     let mut categories: Vec<&str> = CATEGORY_ORDER.to_vec();
@@ -3767,10 +3826,11 @@ fn add_browse_rows(app: &VolumetricUiV2) -> Vec<El> {
             continue;
         }
         rows.push(menubar_label(category));
-        rows.extend(group.into_iter().map(catalog_row));
+        let mut cards: Vec<El> = group.into_iter().map(catalog_card).collect();
         if category == "Import" {
-            rows.push(import_wasm_row());
+            cards.push(import_wasm_card());
         }
+        rows.push(grid(ADD_GRID_COLS, tokens::SPACE_2, cards));
     }
 
     let unscanned: Vec<&catalog::CatalogEntry> = entries
@@ -3779,7 +3839,11 @@ fn add_browse_rows(app: &VolumetricUiV2) -> Vec<El> {
         .collect();
     if !unscanned.is_empty() {
         rows.push(menubar_label("Scanning"));
-        rows.extend(unscanned.into_iter().map(catalog_row));
+        rows.push(grid(
+            ADD_GRID_COLS,
+            tokens::SPACE_2,
+            unscanned.into_iter().map(catalog_card),
+        ));
     }
     rows
 }
@@ -5889,10 +5953,11 @@ pub fn shell_bundle(viewport: Rect) -> damascene_core::bundle::artifact::Bundle 
     damascene_core::bundle::artifact::render_bundle(&mut tree, viewport)
 }
 
-/// Every catalog entry's browse row over a catalog warmed synchronously
-/// from the bundled module bytes — the headless review sheet for each
-/// module's declared display metadata and hand-authored icon. Unlike the
-/// real Add modal, nothing is Pending and no scroll area clips the list.
+/// The Add modal's browse view (category card grids) over a catalog
+/// warmed synchronously from the bundled module bytes — the headless
+/// review sheet for each module's declared display metadata and
+/// hand-authored icon. Unlike the real Add modal, nothing is Pending and
+/// no scroll area clips the grid.
 pub fn catalog_sheet_bundle(viewport: Rect) -> damascene_core::bundle::artifact::Bundle {
     let mut app = VolumetricUiV2::default();
     let names: Vec<String> = app
@@ -5907,7 +5972,9 @@ pub fn catalog_sheet_bundle(viewport: Rect) -> damascene_core::bundle::artifact:
             .map_err(|err| err.to_string());
         app.catalog.on_metadata(name, &result);
     }
-    let mut tree = column(add_browse_rows(&app)).gap(tokens::SPACE_1);
+    // Overlay root so the cards' tooltips have a layer to mount on (the
+    // real shell provides this; the lint flags a bare column root).
+    let mut tree = overlays(column(add_browse_rows(&app)).gap(tokens::SPACE_1), []);
     damascene_core::bundle::artifact::render_bundle(&mut tree, viewport)
 }
 
