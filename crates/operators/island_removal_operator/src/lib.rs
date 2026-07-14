@@ -545,11 +545,7 @@ impl SupportTracker {
                 supported
             }
         };
-        let removed = occ
-            .iter()
-            .zip(&supported)
-            .map(|(&o, &s)| o && !s)
-            .collect();
+        let removed = occ.iter().zip(&supported).map(|(&o, &s)| o && !s).collect();
         self.prev_supported = Some(supported);
         removed
     }
@@ -568,9 +564,7 @@ fn dilate_inplane(bits: &[bool], inner_counts: &[usize]) -> Vec<bool> {
         let src = out.clone();
         for (i, o) in out.iter_mut().enumerate() {
             let c = i / stride % n;
-            *o = src[i]
-                || (c > 0 && src[i - stride])
-                || (c + 1 < n && src[i + stride]);
+            *o = src[i] || (c > 0 && src[i - stride]) || (c + 1 < n && src[i + stride]);
         }
         stride *= n;
     }
@@ -621,8 +615,12 @@ impl<'g> MaskAccumulator<'g> {
         }
 
         if removed.contains(&true) {
-            let inner_counts: Vec<usize> =
-                self.grid.inner_axes.iter().map(|&a| self.grid.counts[a]).collect();
+            let inner_counts: Vec<usize> = self
+                .grid
+                .inner_axes
+                .iter()
+                .map(|&a| self.grid.counts[a])
+                .collect();
             let ball = dilate_inplane(removed, &inner_counts);
             for i in 0..removed.len() {
                 if removed[i] {
@@ -962,9 +960,8 @@ fn merge_with_input(
 fn build_output(input: &[u8], cfg: &IslandConfig) -> Result<Vec<u8>, String> {
     validate(cfg)?;
 
-    let dims =
-        input_model_dimensions(0).ok_or_else(|| "input 0 is not a usable model".to_string())?
-            as usize;
+    let dims = input_model_dimensions(0)
+        .ok_or_else(|| "input 0 is not a usable model".to_string())? as usize;
     if !(1..=voxelmask_model_core::MAX_DIMS).contains(&dims) {
         return Err(format!(
             "island removal supports 1..={} dimensions; input has {dims}",
@@ -1142,7 +1139,11 @@ mod tests {
         let mut tracker = SupportTracker::new(&grid, mode, reach2);
         let mut out = vec![String::new(); layers.len()];
         for step in 0..layers.len() {
-            let layer = if from_max { layers.len() - 1 - step } else { step };
+            let layer = if from_max {
+                layers.len() - 1 - step
+            } else {
+                step
+            };
             out[layer] = flags_row(&tracker.push_layer(&occ_row(layers[layer])));
         }
         out
@@ -1150,10 +1151,11 @@ mod tests {
 
     /// Drive the full walk (tracker + mask accumulator) and return the
     /// sparse mask builder plus the grid.
-    fn walk_mask(layers: &[&str], mode: Mode, reach2: f64) -> (
-        voxelmask_model_core::TiledMaskBuilder,
-        ScanGrid,
-    ) {
+    fn walk_mask(
+        layers: &[&str],
+        mode: Mode,
+        reach2: f64,
+    ) -> (voxelmask_model_core::TiledMaskBuilder, ScanGrid) {
         let grid = grid_2d(layers[0].len(), layers.len());
         let mut tracker = SupportTracker::new(&grid, mode, reach2);
         let mut acc = MaskAccumulator::new(&grid);
@@ -1205,8 +1207,7 @@ mod tests {
         // degrees (reach 1.5 cells) only the first cell survives.
         let layers = [
             "#.....", //
-            "#.....",
-            "#####.",
+            "#.....", "#####.",
         ];
         let removed = walk_removed(&layers, Mode::Overhang, reach_squared(45.0), false);
         assert_eq!(removed, vec!["......", "......", "..###."]);
@@ -1223,8 +1224,7 @@ mod tests {
         let removed = walk_removed(
             &[
                 "#.....", //
-                "#..#..",
-                "#..#..",
+                "#..#..", "#..#..",
             ],
             Mode::Overhang,
             reach_squared(0.0),
@@ -1256,8 +1256,7 @@ mod tests {
         // island mode sees a detached component and removes it.
         let layers = [
             "#.....", //
-            "#..#..",
-            "#..#..",
+            "#..#..", "#..#..",
         ];
         let removed = walk_removed(&layers, Mode::Overhang, reach_squared(89.0), false);
         assert!(none_removed(&removed), "the documented overhang-mode leak");
@@ -1273,8 +1272,7 @@ mod tests {
         let removed = walk_removed(
             &[
                 "#.....", //
-                ".#....",
-                "..#...",
+                ".#....", "..#...",
             ],
             Mode::Island,
             reach_squared(45.0),
@@ -1300,8 +1298,7 @@ mod tests {
         let removed = walk_removed(
             &[
                 "......", //
-                ".##...",
-                ".##...",
+                ".##...", ".##...",
             ],
             Mode::Overhang,
             reach_squared(45.0),
@@ -1316,18 +1313,13 @@ mod tests {
         let removed = walk_removed(
             &[
                 ".#....", //
-                "......",
-                "...##.",
-                "...##.",
+                "......", "...##.", "...##.",
             ],
             Mode::Overhang,
             reach_squared(45.0),
             true,
         );
-        assert_eq!(
-            removed,
-            vec![".#....", "......", "......", "......"]
-        );
+        assert_eq!(removed, vec![".#....", "......", "......", "......"]);
     }
 
     #[test]
@@ -1335,8 +1327,7 @@ mod tests {
         let removed = walk_removed(
             &[
                 ".#....", //
-                ".#....",
-                ".#....",
+                ".#....", ".#....",
             ],
             Mode::Overhang,
             reach_squared(0.0),
@@ -1352,8 +1343,7 @@ mod tests {
         let removed = walk_removed(
             &[
                 "#..", //
-                "...",
-                "#..",
+                "...", "#..",
             ],
             Mode::Overhang,
             reach_squared(80.0),
@@ -1404,8 +1394,7 @@ mod tests {
         let (mask, grid) = walk_mask(
             &[
                 "##....", //
-                "##.#..",
-                "##....",
+                "##.#..", "##....",
             ],
             Mode::Overhang,
             reach_squared(45.0),
@@ -1425,8 +1414,7 @@ mod tests {
         let (mask, grid) = walk_mask(
             &[
                 "#.......", //
-                "#...#...",
-                "#.......",
+                "#...#...", "#.......",
             ],
             Mode::Overhang,
             reach_squared(45.0),
@@ -1465,8 +1453,7 @@ mod tests {
         // 2048 fits the 3D tiled key space (4096 per axis).
         assert!(ScanGrid::plan(&[0.0, 1.0, 0.0, 1.0, 0.0, 1.0], 2, 2048).is_ok());
         // A 4D lattice at 2048 exceeds its 2048-per-axis key space.
-        let err = ScanGrid::plan(&[0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0], 3, 2048)
-            .unwrap_err();
+        let err = ScanGrid::plan(&[0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0], 3, 2048).unwrap_err();
         assert!(err.contains("addresses at most"), "unexpected error: {err}");
     }
 

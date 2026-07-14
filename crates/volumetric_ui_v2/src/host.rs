@@ -526,9 +526,9 @@ impl Host {
             gfx.config.width as f32 / scale_factor,
             gfx.config.height as f32 / scale_factor,
         );
-        let prepare =
-            gfx.damascene
-                .prepare(&gfx.device, &gfx.queue, tree, viewport, scale_factor);
+        let prepare = gfx
+            .damascene
+            .prepare(&gfx.device, &gfx.queue, tree, viewport, scale_factor);
 
         let cursor = gfx.damascene.snapshot_cursor();
         if cursor != self.last_cursor {

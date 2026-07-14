@@ -656,7 +656,10 @@ pub enum FileAction {
     SaveProjectTo(std::path::PathBuf),
     /// Export the cached preview mesh of the named output as binary STL,
     /// with vertices multiplied by `scale` (the export modal's setting).
-    ExportMesh { id: String, scale: f32 },
+    ExportMesh {
+        id: String,
+        scale: f32,
+    },
     /// Export the named output's model WASM bytes verbatim.
     ExportWasm(String),
     /// Import a model WASM file into the project.
@@ -3704,10 +3707,13 @@ fn export_layer(app: &VolumetricUiV2) -> Option<El> {
         body.push(form_message("Scale must be a positive number."));
     }
     body.push(divider());
-    let can_export =
-        scale.is_some() && matches!(export.mesh, ExportPreviewMesh::Ready { .. });
+    let can_export = scale.is_some() && matches!(export.mesh, ExportPreviewMesh::Ready { .. });
     let confirm = button("Export STL…").primary().key(EXPORT_CONFIRM_KEY);
-    let confirm = if can_export { confirm } else { confirm.disabled() };
+    let confirm = if can_export {
+        confirm
+    } else {
+        confirm.disabled()
+    };
     body.push(
         row([
             spacer(),
@@ -7143,8 +7149,7 @@ mod tests {
             add_operator_click(&mut app, op.name);
             app.before_build();
 
-            let Some(config) = app.step_edit.as_ref().and_then(|edit| edit.config.as_ref())
-            else {
+            let Some(config) = app.step_edit.as_ref().and_then(|edit| edit.config.as_ref()) else {
                 continue;
             };
             let Some(field) = config
@@ -7172,7 +7177,13 @@ mod tests {
                 field.name
             );
             assert_eq!(
-                app.step_edit.as_ref().unwrap().config.as_ref().unwrap().buffers[&field.name],
+                app.step_edit
+                    .as_ref()
+                    .unwrap()
+                    .config
+                    .as_ref()
+                    .unwrap()
+                    .buffers[&field.name],
                 "",
                 "unset optional field shows an empty buffer"
             );

@@ -270,11 +270,7 @@ impl<'a> PayloadView<'a> {
 
     /// Lattice point count along `axis`.
     pub fn count(&self, axis: usize) -> usize {
-        u32::from_le_bytes(
-            self.bytes[16 + 4 * axis..20 + 4 * axis]
-                .try_into()
-                .unwrap(),
-        ) as usize
+        u32::from_le_bytes(self.bytes[16 + 4 * axis..20 + 4 * axis].try_into().unwrap()) as usize
     }
 
     /// `[min, max]` of `axis`.
@@ -309,8 +305,8 @@ impl<'a> PayloadView<'a> {
                 core::cmp::Ordering::Greater => hi = mid,
                 core::cmp::Ordering::Equal => {
                     let tiles_base = header_len(self.dims) + self.tile_count * 8;
-                    let byte = self
-                        .bytes[tiles_base + mid * tile_bytes(self.tile_edge, self.dims) + bit / 8];
+                    let byte = self.bytes
+                        [tiles_base + mid * tile_bytes(self.tile_edge, self.dims) + bit / 8];
                     return (byte >> (bit % 8) & 1) as f64;
                 }
             }
@@ -369,9 +365,7 @@ mod tests {
     fn dot_payload() -> Vec<u8> {
         let mut builder = TiledMaskBuilder::new(2);
         builder.set(&[17, 5]);
-        builder
-            .finish(&[40, 24], &[0.0, 39.0, 0.0, 23.0])
-            .unwrap()
+        builder.finish(&[40, 24], &[0.0, 39.0, 0.0, 23.0]).unwrap()
     }
 
     #[test]
@@ -461,10 +455,7 @@ mod tests {
         builder.set(&[10, 10, 10]);
         builder.set(&[2000, 1500, 900]);
         let payload = builder
-            .finish(
-                &[2051, 1600, 1000],
-                &[0.0, 2050.0, 0.0, 1599.0, 0.0, 999.0],
-            )
+            .finish(&[2051, 1600, 1000], &[0.0, 2050.0, 0.0, 1599.0, 0.0, 999.0])
             .unwrap();
         // Header + 2 tiles of (8-byte key + 16^3/8 bytes).
         assert_eq!(payload.len(), 20 + 20 * 3 + 2 * (8 + 512));
@@ -498,7 +489,11 @@ mod tests {
         assert!(out_of_range.finish(&[3, 3], &[0.0, 1.0, 0.0, 1.0]).is_err());
         // Axis longer than the packed tile keys can address.
         let empty = TiledMaskBuilder::new(2);
-        assert!(empty.finish(&[16 * 256 + 1, 3], &[0.0, 1.0, 0.0, 1.0]).is_err());
+        assert!(
+            empty
+                .finish(&[16 * 256 + 1, 3], &[0.0, 1.0, 0.0, 1.0])
+                .is_err()
+        );
 
         assert!(PayloadView::new(&[0u8; 12]).is_err());
         let mut bad = dot_payload();

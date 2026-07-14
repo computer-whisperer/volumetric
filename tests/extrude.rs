@@ -486,31 +486,27 @@ fn extrude_along_a_tilted_normal() {
 
     let mut executor = NativeModelExecutor::new(&extruded).unwrap();
     // Mid-sweep (w = 0.5) at the chart origin and near the circle's rim.
-    assert_eq!(
-        executor.sample_nd(&[0.0, -0.5 * s, 0.5 * s]).unwrap(),
-        1.0
-    );
-    assert_eq!(
-        executor.sample_nd(&[0.9, -0.5 * s, 0.5 * s]).unwrap(),
-        1.0
-    );
-    assert_eq!(
-        executor.sample_nd(&[1.2, -0.5 * s, 0.5 * s]).unwrap(),
-        0.0
-    );
+    assert_eq!(executor.sample_nd(&[0.0, -0.5 * s, 0.5 * s]).unwrap(), 1.0);
+    assert_eq!(executor.sample_nd(&[0.9, -0.5 * s, 0.5 * s]).unwrap(), 1.0);
+    assert_eq!(executor.sample_nd(&[1.2, -0.5 * s, 0.5 * s]).unwrap(), 0.0);
     // Past the sweep (w = 1.5) and behind the plane (w = -0.5).
-    assert_eq!(
-        executor.sample_nd(&[0.0, -1.5 * s, 1.5 * s]).unwrap(),
-        0.0
-    );
+    assert_eq!(executor.sample_nd(&[0.0, -1.5 * s, 1.5 * s]).unwrap(), 0.0);
     assert_eq!(executor.sample_nd(&[0.0, 0.5 * s, -0.5 * s]).unwrap(), 0.0);
 
     // Interval bounds: chart box [-1.5, 1.5]^2 swept by (0, -s, s).
     let bounds = executor.get_bounds_nd().unwrap();
     assert_eq!((bounds.min(0), bounds.max(0)), (-1.5, 1.5));
-    assert!((bounds.min(1) - -2.5 * s).abs() < 1e-12, "{}", bounds.min(1));
+    assert!(
+        (bounds.min(1) - -2.5 * s).abs() < 1e-12,
+        "{}",
+        bounds.min(1)
+    );
     assert!((bounds.max(1) - 1.5 * s).abs() < 1e-12, "{}", bounds.max(1));
-    assert!((bounds.min(2) - -1.5 * s).abs() < 1e-12, "{}", bounds.min(2));
+    assert!(
+        (bounds.min(2) - -1.5 * s).abs() < 1e-12,
+        "{}",
+        bounds.min(2)
+    );
     assert!((bounds.max(2) - 2.5 * s).abs() < 1e-12, "{}", bounds.max(2));
 }
 
@@ -680,6 +676,10 @@ fn revolve_preserves_channels() {
     for p in [[0.5, 0.0, 0.0], [0.0, -0.5, 0.0], [0.3, 0.4, 0.0]] {
         let row = model.sample_channels_nd(&p).unwrap();
         assert_eq!(row[0], 1.0, "at {p:?}");
-        assert!((row[1] - 0.75).abs() < 1e-6, "infill at {p:?} was {}", row[1]);
+        assert!(
+            (row[1] - 0.75).abs() < 1e-6,
+            "infill at {p:?} was {}",
+            row[1]
+        );
     }
 }

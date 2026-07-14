@@ -197,11 +197,7 @@ impl<'s, S: BatchSampler> Discovery<'s, S> {
     /// `probes` is the aperiodic interior probe count per corner-uniform
     /// coarse cell (0 disables — sub-coarse isolated features are then
     /// only found if the coarse corner grid hits them).
-    pub fn run(
-        counts: &[usize],
-        probes: usize,
-        sampler: &'s mut S,
-    ) -> Result<Occupancy, String> {
+    pub fn run(counts: &[usize], probes: usize, sampler: &'s mut S) -> Result<Occupancy, String> {
         let dims = counts.len();
         let coarse_counts: Vec<usize> = counts.iter().map(|&n| n.div_ceil(BLOCK_EDGE)).collect();
         let coarse_total = coarse_counts.iter().map(|&n| n as u64).product::<u64>();
@@ -296,10 +292,7 @@ impl<'s, S: BatchSampler> Discovery<'s, S> {
     /// Stage 1: the coarse corner grid plus interior probes; classifies
     /// every coarse cell and returns frontier seeds (per coarse index)
     /// for features only a probe saw.
-    fn stage1(
-        &mut self,
-        probes: usize,
-    ) -> Result<HashMap<usize, Vec<Vec<usize>>>, String> {
+    fn stage1(&mut self, probes: usize) -> Result<HashMap<usize, Vec<Vec<usize>>>, String> {
         let d = self.occ.dims;
         let coarse_counts = self.occ.coarse_counts.clone();
 
@@ -308,7 +301,10 @@ impl<'s, S: BatchSampler> Discovery<'s, S> {
         let mut corner = vec![0usize; d];
         loop {
             points.extend(corner.iter().map(|&c| c * BLOCK_EDGE));
-            if !advance(&mut corner, &coarse_counts.iter().map(|&n| n + 1).collect::<Vec<_>>()) {
+            if !advance(
+                &mut corner,
+                &coarse_counts.iter().map(|&n| n + 1).collect::<Vec<_>>(),
+            ) {
                 break;
             }
         }
@@ -391,11 +387,7 @@ impl<'s, S: BatchSampler> Discovery<'s, S> {
         let d = self.occ.dims;
         debug_assert_ne!(self.occ.known(&a), self.occ.known(&b));
         let value_a = self.occ.known(&a).expect("bisection endpoints sampled");
-        while a
-            .iter()
-            .zip(&b)
-            .any(|(&x, &y)| x.abs_diff(y) > 1)
-        {
+        while a.iter().zip(&b).any(|(&x, &y)| x.abs_diff(y) > 1) {
             let mid: Vec<usize> = a.iter().zip(&b).map(|(&x, &y)| x.midpoint(y)).collect();
             self.ensure(&mid)?;
             if self.occ.known(&mid) == Some(value_a) {
@@ -570,10 +562,11 @@ impl<'s, S: BatchSampler> Discovery<'s, S> {
         let mut stack: Vec<usize> = Vec::new();
         let mut component: Vec<usize> = Vec::new();
         for key in keys {
-            let coarse: Vec<usize> = (0..d).map(|a| (key >> (16 * a)) as usize & 0xFFFF).collect();
+            let coarse: Vec<usize> = (0..d)
+                .map(|a| (key >> (16 * a)) as usize & 0xFFFF)
+                .collect();
             let base: Vec<usize> = coarse.iter().map(|&c| c * BLOCK_EDGE).collect();
-            let fallback =
-                self.occ.class[self.occ.coarse_index(&coarse)] == CellClass::UniformIn;
+            let fallback = self.occ.class[self.occ.coarse_index(&coarse)] == CellClass::UniformIn;
             let block = &self.occ.blocks[&key];
 
             // Component labels over unsampled in-lattice points.
@@ -610,7 +603,10 @@ impl<'s, S: BatchSampler> Discovery<'s, S> {
                     for _a in 0..d {
                         let c = rest % BLOCK_EDGE;
                         rest /= BLOCK_EDGE;
-                        for (step, edge) in [(bit.wrapping_sub(stride), c > 0), (bit + stride, c + 1 < BLOCK_EDGE)] {
+                        for (step, edge) in [
+                            (bit.wrapping_sub(stride), c > 0),
+                            (bit + stride, c + 1 < BLOCK_EDGE),
+                        ] {
                             if !edge {
                                 continue;
                             }
@@ -691,11 +687,7 @@ mod tests {
         let occ = Discovery::run(counts, probes, &mut sampler).unwrap();
         let mut coords = vec![0usize; counts.len()];
         loop {
-            assert_eq!(
-                occ.point(&coords),
-                shape(&coords),
-                "mismatch at {coords:?}"
-            );
+            assert_eq!(occ.point(&coords), shape(&coords), "mismatch at {coords:?}");
             if !advance(&mut coords, counts) {
                 break;
             }

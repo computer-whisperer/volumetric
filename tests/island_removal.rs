@@ -69,12 +69,20 @@ fn text(v: &str) -> ciborium::value::Value {
 }
 
 fn translate(model: Vec<u8>, d: [f64; 3]) -> Vec<u8> {
-    let cfg = cbor(&[("dx", float(d[0])), ("dy", float(d[1])), ("dz", float(d[2]))]);
+    let cfg = cbor(&[
+        ("dx", float(d[0])),
+        ("dy", float(d[1])),
+        ("dz", float(d[2])),
+    ]);
     run_operator("translate_operator", vec![model, cfg]).expect("translate")
 }
 
 fn scale(model: Vec<u8>, s: [f64; 3]) -> Vec<u8> {
-    let cfg = cbor(&[("sx", float(s[0])), ("sy", float(s[1])), ("sz", float(s[2]))]);
+    let cfg = cbor(&[
+        ("sx", float(s[0])),
+        ("sy", float(s[1])),
+        ("sz", float(s[2])),
+    ]);
     run_operator("scale_operator", vec![model, cfg]).expect("scale")
 }
 
@@ -176,8 +184,7 @@ fn overhang_shaving_respects_the_angle() {
     let slab = translate(scale(cube(), [1.0, 1.0, 0.15]), [0.0, 0.0, 1.15]);
     let mushroom = union(post, slab);
 
-    let wasm =
-        run_island_removal(mushroom.clone(), &base_config()).expect("island removal failed");
+    let wasm = run_island_removal(mushroom.clone(), &base_config()).expect("island removal failed");
     let mut model = create_model_executor(&wasm).expect("model executor");
     assert!(occupied_at(&mut model, &[0.0, 0.0, 0.0]), "the post");
     assert!(
@@ -287,7 +294,10 @@ fn island_mode_keeps_overhangs_and_removes_detached_regions() {
     config.push(("mode", text("island")));
     let wasm = run_island_removal(both.clone(), &config).expect("island removal failed");
     let mut model = create_model_executor(&wasm).expect("model executor");
-    assert!(occupied_at(&mut model, &[-0.7, 0.0, 0.9]), "the tall column");
+    assert!(
+        occupied_at(&mut model, &[-0.7, 0.0, 0.9]),
+        "the tall column"
+    );
     assert!(
         !occupied_at(&mut model, &[0.7, 0.0, 0.3]),
         "the detached blob must be removed despite the column in its layers"
@@ -342,8 +352,7 @@ fn channels_pass_through() {
     // channels [Occupancy, Density]; the boolean union keeps A's format.
     let input = cube_with_floating_sphere();
 
-    let wasm =
-        run_island_removal(input.clone(), &base_config()).expect("island removal failed");
+    let wasm = run_island_removal(input.clone(), &base_config()).expect("island removal failed");
     let mut model = NativeModelExecutor::new(&wasm).expect("model executor");
     assert_eq!(model.sample_format().channels.len(), 2);
 
