@@ -23,7 +23,13 @@
 //!   xmin/xmax/ymin/ymax/zmin/zmax/none, default zmin),
 //!   `max_contact_iterations` (int, default 64 — cap on the contact
 //!   active-set sweeps; grazing rims on curved rigid bodies can need a
-//!   few dozen)
+//!   few dozen), `cg_tolerance` (float, default 1e-8 — relative residual
+//!   per CG solve; 1e-4 is measurably ~3x faster and usually converges to
+//!   the same answers), `preconditioner` (auto/schwarz, default auto —
+//!   schwarz is the two-level solver for large Bar2 frames and needs the
+//!   threaded operator build), `schwarz_target_nodes` (int, default 128),
+//!   `stress_stiffening_passes` (int, default 0 — tension-only geometric
+//!   stiffness re-solves for Bar2 frames; 1-2 captures most hammocking)
 //!
 //! Output 0: the input FeaMesh plus result fields — per-node `displacement`
 //! (3), `contact_force` (3, the interface force map), and `rotation` (3,
@@ -45,6 +51,10 @@ struct SolveOperatorConfig {
     poissons_ratio: f64,
     fixed_boundary: String,
     max_contact_iterations: u32,
+    cg_tolerance: f64,
+    preconditioner: String,
+    schwarz_target_nodes: u32,
+    stress_stiffening_passes: u32,
 }
 
 impl Default for SolveOperatorConfig {
@@ -54,6 +64,10 @@ impl Default for SolveOperatorConfig {
             poissons_ratio: 0.3,
             fixed_boundary: "zmin".to_string(),
             max_contact_iterations: 64,
+            cg_tolerance: 1e-8,
+            preconditioner: "auto".to_string(),
+            schwarz_target_nodes: 128,
+            stress_stiffening_passes: 0,
         }
     }
 }
@@ -85,6 +99,12 @@ fn run_solve(config: &SolveOperatorConfig) -> Result<FeaMesh, String> {
         },
         fixed_boundary: fea_core::FixedBoundary::parse(&config.fixed_boundary)?,
         max_contact_iterations: config.max_contact_iterations as usize,
+        cg_tolerance: config.cg_tolerance,
+        preconditioner: fea_core::PrecondChoice::parse(
+            &config.preconditioner,
+            config.schwarz_target_nodes as usize,
+        )?,
+        stress_stiffening_passes: config.stress_stiffening_passes as usize,
         ..Default::default()
     };
 
@@ -201,7 +221,7 @@ pub extern "C" fn get_metadata() -> i64 {
             OperatorMetadataInput::FeaMesh,
             OperatorMetadataInput::ModelWASM,
             OperatorMetadataInput::CBORConfiguration(
-                r#"{ youngs_modulus: float .default 1.0, poissons_ratio: float .default 0.3, fixed_boundary: "zmin" / "zmax" / "xmin" / "xmax" / "ymin" / "ymax" / "none" .default "zmin", max_contact_iterations: int .default 64 }"#
+                r#"{ youngs_modulus: float .default 1.0, poissons_ratio: float .default 0.3, fixed_boundary: "zmin" / "zmax" / "xmin" / "xmax" / "ymin" / "ymax" / "none" .default "zmin", max_contact_iterations: int .default 64, cg_tolerance: float .default 1e-8, preconditioner: "auto" / "schwarz" .default "auto", schwarz_target_nodes: int .default 128, stress_stiffening_passes: int .default 0 }"#
                     .to_string(),
             ),
         ],

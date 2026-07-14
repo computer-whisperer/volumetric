@@ -118,6 +118,31 @@ pub enum PrecondChoice {
     Schwarz(SchwarzParams),
 }
 
+impl PrecondChoice {
+    /// Parse the operator-config spelling. `schwarz_target_nodes` sizes the
+    /// Schwarz subdomains (ignored by `"auto"`).
+    #[cfg_attr(not(feature = "parallel"), allow(unused_variables))]
+    pub fn parse(s: &str, schwarz_target_nodes: usize) -> Result<Self, String> {
+        match s {
+            "auto" => Ok(Self::Auto),
+            #[cfg(feature = "parallel")]
+            "schwarz" => Ok(Self::Schwarz(SchwarzParams {
+                target_nodes: schwarz_target_nodes,
+                ..Default::default()
+            })),
+            #[cfg(not(feature = "parallel"))]
+            "schwarz" => Err(
+                "the schwarz preconditioner needs a solver build with thread \
+                 support (the threaded operator variant); this build has none"
+                    .to_string(),
+            ),
+            other => Err(format!(
+                "unknown preconditioner {other:?} (expected auto/schwarz)"
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct SolveConfig {
     pub material: Material,
@@ -1070,6 +1095,26 @@ fn contact_solve(
 mod tests {
     use super::*;
     use volumetric_abi::fea::FeaField;
+
+    #[test]
+    fn precond_choice_parses_config_spellings() {
+        assert_eq!(PrecondChoice::parse("auto", 128), Ok(PrecondChoice::Auto));
+        assert!(PrecondChoice::parse("jacobi", 128).is_err());
+
+        let schwarz = PrecondChoice::parse("schwarz", 64);
+        #[cfg(feature = "parallel")]
+        assert_eq!(
+            schwarz,
+            Ok(PrecondChoice::Schwarz(SchwarzParams {
+                target_nodes: 64,
+                ..Default::default()
+            }))
+        );
+        // Builds without thread support reject it with a pointer at the
+        // threaded variant rather than solving with the wrong preconditioner.
+        #[cfg(not(feature = "parallel"))]
+        assert!(schwarz.is_err_and(|e| e.contains("thread")));
+    }
 
     /// Build the uniform grid mesh the mesher would emit: nx*ny*nz cells of
     /// size h with the origin at (0, 0, 0). Shared with the inverse module's

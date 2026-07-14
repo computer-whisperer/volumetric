@@ -11,3 +11,8 @@ volumetric_abi = { path = "../../volumetric_abi" }
 fea_core = { path = "../../fea_core" }
 serde = { version = "1", features = ["derive"] }
 ciborium = "0.2"
+
+[features]
+# The wasm32-wasip1-threads variant build: unlocks fea_core's thread pool
+# and the schwarz preconditioner. Never enabled on wasm32-unknown-unknown.
+threaded = ["fea_core/parallel"]
