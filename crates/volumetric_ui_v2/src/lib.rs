@@ -38,6 +38,85 @@ static PIN_ICON: LazyLock<SvgIcon> = LazyLock::new(|| {
     .expect("pin icon SVG parses")
 });
 
+/// Category glyphs for Add-catalog entries — lucide path data like the
+/// icons above. A module's own declared `icon_svg` will take precedence
+/// once a parse cache lands in the catalog; until then entries draw their
+/// category's glyph (kind fallbacks: `activity` / `settings`).
+macro_rules! category_icon {
+    ($name:ident, $body:literal) => {
+        static $name: LazyLock<SvgIcon> = LazyLock::new(|| {
+            SvgIcon::parse_current_color(concat!(
+                r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#000" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">"##,
+                $body,
+                "</svg>"
+            ))
+            .expect("category icon SVG parses")
+        });
+    };
+}
+category_icon!(
+    PRIMITIVES_ICON,
+    r##"<path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/>"##
+);
+category_icon!(
+    COMBINE_ICON,
+    r##"<circle cx="9" cy="12" r="6"/><circle cx="15" cy="12" r="6"/>"##
+);
+category_icon!(
+    TRANSFORMS_ICON,
+    r##"<path d="M5 3v16h16"/><path d="m5 19 6-6"/><path d="m2 6 3-3 3 3"/><path d="m18 16 3 3-3 3"/>"##
+);
+category_icon!(
+    CONSTRUCTION_ICON,
+    r##"<circle cx="19" cy="5" r="2"/><circle cx="5" cy="19" r="2"/><path d="M5 17A12 12 0 0 1 17 5"/>"##
+);
+category_icon!(
+    LATTICE_ICON,
+    r##"<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/><path d="M3 15h18"/><path d="M9 3v18"/><path d="M15 3v18"/>"##
+);
+category_icon!(
+    FEA_ICON,
+    r##"<path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/>"##
+);
+category_icon!(
+    MESH_ICON,
+    r##"<path d="M13.73 4a2 2 0 0 0-3.46 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3z"/>"##
+);
+category_icon!(
+    FABRICATION_ICON,
+    r##"<path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><path d="M6 9V3a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v6"/><rect x="6" y="14" width="12" height="8" rx="1"/>"##
+);
+category_icon!(
+    SCRIPTING_ICON,
+    r##"<polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/>"##
+);
+
+/// The icon slot source for a catalog entry: its category's glyph, with
+/// per-kind fallbacks while the entry is unscanned or uncategorized.
+fn catalog_icon_source(entry: &catalog::CatalogEntry) -> IconSource {
+    let category = entry
+        .ready()
+        .map(|metadata| metadata.category.as_str())
+        .unwrap_or("");
+    let custom = |icon: &LazyLock<SvgIcon>| IconSource::Custom((**icon).clone());
+    match category {
+        "Primitives" => custom(&PRIMITIVES_ICON),
+        "Combine" => custom(&COMBINE_ICON),
+        "Transforms" => custom(&TRANSFORMS_ICON),
+        "Construction" => custom(&CONSTRUCTION_ICON),
+        "Lattice" => custom(&LATTICE_ICON),
+        "FEA" => custom(&FEA_ICON),
+        "Mesh" => custom(&MESH_ICON),
+        "Fabrication" => custom(&FABRICATION_ICON),
+        "Scripting" => custom(&SCRIPTING_ICON),
+        "Import" => "file-text".into_icon_source(),
+        _ => match entry.kind {
+            volumetric_assets::AssetCategory::Model => "activity".into_icon_source(),
+            volumetric_assets::AssetCategory::Operator => "settings".into_icon_source(),
+        },
+    }
+}
+
 pub mod catalog;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod host;
@@ -71,11 +150,19 @@ pub const TOGGLE_SSAO_KEY: &str = "viewport:toggle-ssao";
 pub const FRAME_PREVIEW_KEY: &str = "viewport:frame-preview";
 pub const RESET_CAMERA_KEY: &str = "viewport:reset-camera";
 
-/// Top application menubar; menu values are `file` and `add`.
+/// Top application menubar; the only menu value is `file`.
 const MENUBAR_KEY: &str = "main-menu";
-/// One-click add of a bundled asset from the Add menu.
+/// One-click add of a cataloged module from the Add modal.
 const ADD_MODEL_PREFIX: &str = "add:model:";
 const ADD_OPERATOR_PREFIX: &str = "add:operator:";
+/// The Add-catalog modal: the rail tile that opens it, its dismiss scrim,
+/// and its controlled search input.
+const ADD_OPEN_KEY: &str = "add:open";
+const ADD_DISMISS_KEY: &str = "add:dismiss";
+const ADD_SEARCH_KEY: &str = "add-search-input";
+/// Recents-rail tile for a cataloged module; the catalog kind decides
+/// whether it adds as a model import or an operator step.
+const RAIL_ADD_PREFIX: &str = "rail:add:";
 /// Pipeline accordion in the project panel; values `imports|steps|exports`.
 const PIPELINE_KEY: &str = "pipeline";
 /// Viewport overlay value pickers (controlled select widgets).
@@ -351,6 +438,32 @@ pub struct LightboxState {
     pub data: Option<LightboxData>,
     pub texture: Option<AppTexture>,
     pub colorbar: Option<AppTexture>,
+}
+
+/// The open Add-catalog modal. An empty query browses the catalog grouped
+/// by declared category; typing switches to ranked search rows.
+#[derive(Debug, Default)]
+pub struct AddModalState {
+    /// Controlled search buffer.
+    pub query: String,
+}
+
+/// How many recently added modules the rail remembers.
+const RECENT_ADDS_CAP: usize = 8;
+
+/// The recents rail's fresh-install seed: a starter kit spanning the
+/// common flows (a solid, the boolean, a transform, a generator), so the
+/// rail is useful before the user has any history.
+fn default_recent_adds() -> Vec<String> {
+    [
+        "simple_sphere_model",
+        "rectangular_prism_operator",
+        "boolean_operator",
+        "translate_operator",
+        "scale_operator",
+    ]
+    .map(str::to_string)
+    .to_vec()
 }
 
 /// The open mesh-export modal: which output, the preview geometry as a
@@ -913,6 +1026,12 @@ pub struct VolumetricUiV2 {
     /// The Add catalog: every bundled module's declared metadata, warmed
     /// from the persisted cache and background scans (see [`catalog`]).
     pub(crate) catalog: catalog::Catalog,
+    /// The Add-catalog modal, when open (holds the search buffer).
+    add_modal: Option<AddModalState>,
+    /// Catalog names of recently added modules, most recent first, capped
+    /// at [`RECENT_ADDS_CAP`] — the recents rail's tiles. Persisted in
+    /// settings; fresh installs start from a curated seed.
+    recent_adds: Vec<String>,
     preview_build_status: PreviewBuildStatus,
     pending_camera_command: Option<ViewportCameraCommand>,
     viewport_texture: Option<AppTexture>,
@@ -1003,6 +1122,8 @@ impl VolumetricUiV2 {
             operator_add_request: None,
             operator_add_inflight: None,
             catalog: catalog::Catalog::default(),
+            add_modal: None,
+            recent_adds: default_recent_adds(),
             preview_build_status: PreviewBuildStatus::Idle,
             pending_camera_command: None,
             viewport_texture: None,
@@ -2526,6 +2647,14 @@ impl VolumetricUiV2 {
             .checked_sub(1)
             .map(ProjectSelection::Import);
         self.status = format!("imported {display} as {id}");
+        self.record_recent_add(name);
+    }
+
+    /// Move `name` to the front of the recents rail (added or re-added).
+    fn record_recent_add(&mut self, name: &str) {
+        self.recent_adds.retain(|recent| recent != name);
+        self.recent_adds.insert(0, name.to_string());
+        self.recent_adds.truncate(RECENT_ADDS_CAP);
     }
 
     /// Inserts a timeline step for the named bundled operator. With a warm
@@ -2636,6 +2765,7 @@ impl VolumetricUiV2 {
             .checked_sub(1)
             .map(ProjectSelection::Step);
         self.status = format!("added {display} -> {output_id}");
+        self.record_recent_add(name);
     }
 
     /// Replaces an imported operator's bytes with the matching bundled
@@ -2892,10 +3022,13 @@ impl App for VolumetricUiV2 {
     }
 
     fn on_event(&mut self, event: UiEvent, _cx: &EventCx) {
-        // Escape closes the topmost layer: the export modal first, then any
-        // open menu/picker popover (the popover contract: the scrim handles
-        // outside clicks, the app handles Escape).
+        // Escape closes the topmost layer: the Add or export modal first,
+        // then any open menu/picker popover (the popover contract: the
+        // scrim handles outside clicks, the app handles Escape).
         if matches!(event.kind, UiEventKind::Escape) {
+            if self.add_modal.take().is_some() {
+                return;
+            }
             if self.export_dialog.take().is_some() {
                 return;
             }
@@ -3004,6 +3137,18 @@ impl App for VolumetricUiV2 {
                 return;
             }
         }
+        // Controlled editing for the Add modal's search buffer.
+        if event.target_key() == Some(ADD_SEARCH_KEY) {
+            if let Some(modal) = self.add_modal.as_mut() {
+                text_input::apply_event(
+                    &mut modal.query,
+                    &mut self.selection,
+                    &event,
+                    ADD_SEARCH_KEY,
+                );
+            }
+            return;
+        }
         // Controlled editing for the remote daemon address buffer (takes
         // effect the next time the Remote toggle is switched on).
         if event.target_key() == Some(REMOTE_ADDRESS_KEY) {
@@ -3084,18 +3229,35 @@ impl App for VolumetricUiV2 {
         if event.is_click_or_activate(IMPORT_WASM_KEY) {
             self.pending_file_action = Some(FileAction::ImportWasm);
             self.open_menu = None;
+            self.add_modal = None;
             return;
         }
 
         if event.is_click_or_activate(IMPORT_STL_KEY) {
             self.pending_file_action = Some(FileAction::ImportStl);
             self.open_menu = None;
+            self.add_modal = None;
             return;
         }
 
         if event.is_click_or_activate(IMPORT_IMAGE_KEY) {
             self.pending_file_action = Some(FileAction::ImportImage);
             self.open_menu = None;
+            self.add_modal = None;
+            return;
+        }
+
+        if event.is_click_or_activate(ADD_OPEN_KEY) {
+            self.add_modal = Some(AddModalState::default());
+            // Focus lands in the search field so typing filters immediately.
+            self.selection = Selection::caret(ADD_SEARCH_KEY, 0);
+            self.open_menu = None;
+            self.open_select = None;
+            return;
+        }
+
+        if event.is_click_or_activate(ADD_DISMISS_KEY) {
+            self.add_modal = None;
             return;
         }
 
@@ -3223,10 +3385,18 @@ impl App for VolumetricUiV2 {
             }
         } else if let Some(name) = route.strip_prefix(ADD_MODEL_PREFIX) {
             self.add_model(name);
-            self.open_menu = None;
+            self.add_modal = None;
         } else if let Some(name) = route.strip_prefix(ADD_OPERATOR_PREFIX) {
             self.add_operator(name);
-            self.open_menu = None;
+            self.add_modal = None;
+        } else if let Some(name) = route.strip_prefix(RAIL_ADD_PREFIX) {
+            // Rail tiles carry the catalog kind: models import, operators
+            // insert a step.
+            match self.catalog.get(name).map(|entry| entry.kind) {
+                Some(volumetric_assets::AssetCategory::Model) => self.add_model(name),
+                Some(volumetric_assets::AssetCategory::Operator) => self.add_operator(name),
+                None => self.status = format!("missing bundled module {name}"),
+            }
         } else if let Some(idx) = parse_index_route(route, SELECT_IMPORT_PREFIX) {
             self.selected_project_item = Some(ProjectSelection::Import(idx));
             self.status = format!("selected import {}", idx + 1);
@@ -3381,6 +3551,7 @@ pub fn shell(app: &VolumetricUiV2) -> El {
     let main = column([
         top_bar(app),
         row([
+            add_rail(app),
             viewport_pane(app),
             resize_handle(PANEL_RESIZE_KEY, Axis::Row),
             project_panel(app),
@@ -3400,6 +3571,7 @@ pub fn shell(app: &VolumetricUiV2) -> El {
             select_layer(app),
             lightbox_layer(app),
             export_layer(app),
+            add_layer(app),
         ],
     )
 }
@@ -3411,10 +3583,12 @@ fn top_bar(app: &VolumetricUiV2) -> El {
     let mut items = vec![
         icon("layout-dashboard").icon_size(tokens::ICON_SM).muted(),
         text("Volumetric").label().semibold().key("brand-title"),
-        menubar([
-            menubar_trigger(MENUBAR_KEY, "file", "File", open == Some("file")),
-            menubar_trigger(MENUBAR_KEY, "add", "Add", open == Some("add")),
-        ]),
+        menubar([menubar_trigger(
+            MENUBAR_KEY,
+            "file",
+            "File",
+            open == Some("file"),
+        )]),
         spacer(),
         run_status_chip(app),
         preview_status_chip(app),
@@ -3452,49 +3626,242 @@ fn menu_layer(app: &VolumetricUiV2) -> Option<El> {
                 menubar_item_with_icon("download", "Save Project As…").key(SAVE_PROJECT_AS_KEY),
             ],
         )),
-        "add" => Some(menubar_menu(MENUBAR_KEY, "add", add_menu_items(app))),
         _ => None,
     }
 }
 
-/// Operators reachable through Add > Import rather than the plain operator
-/// list: staging them bare (empty Blob input) would only fail the next run.
-const IMPORT_OPERATORS: [&str; 2] = ["stl_import_operator", "image_model_operator"];
+/// The left rail: the Add-catalog affordance on top, then one-click tiles
+/// for recently added modules (most recent first, persisted in settings).
+fn add_rail(app: &VolumetricUiV2) -> El {
+    let mut items = vec![
+        icon_button("plus")
+            .tooltip("Add — browse the module catalog")
+            .key(ADD_OPEN_KEY),
+        divider(),
+    ];
+    for name in &app.recent_adds {
+        // A recent that no longer exists in the catalog (renamed module,
+        // stale settings) just doesn't render.
+        let Some(entry) = app.catalog.get(name) else {
+            continue;
+        };
+        items.push(
+            icon_button(catalog_icon_source(entry))
+                .ghost()
+                .tooltip(entry.display_name())
+                .key(format!("{RAIL_ADD_PREFIX}{name}")),
+        );
+    }
+    column(items)
+        .gap(tokens::SPACE_2)
+        .padding(Sides::xy(tokens::SPACE_2, tokens::SPACE_2))
+        .align(Align::Center)
+        .width(Size::Hug)
+        .height(Size::Fill(1.0))
+}
 
-/// The Add menu body: every cataloged model and operator (one click to
-/// add), plus file-import actions for external assets. Display names come
-/// from each module's declared metadata; entries the catalog hasn't
-/// scanned yet show their module name (transient on first launch).
-fn add_menu_items(app: &VolumetricUiV2) -> Vec<El> {
-    let mut items = vec![menubar_label("Models")];
-    for entry in app.catalog.entries() {
-        if entry.kind != volumetric_assets::AssetCategory::Model {
-            continue;
-        }
-        items.push(
-            menubar_item_with_icon("activity", entry.display_name())
-                .key(format!("{ADD_MODEL_PREFIX}{}", entry.name)),
-        );
+/// Fixed presentation order for the known categories in the browse view;
+/// categories declared by modules but missing here append after, and
+/// entries without metadata yet group under a trailing "Scanning" header.
+const CATEGORY_ORDER: [&str; 10] = [
+    "Primitives",
+    "Combine",
+    "Transforms",
+    "Construction",
+    "Lattice",
+    "Mesh",
+    "FEA",
+    "Fabrication",
+    "Scripting",
+    "Import",
+];
+
+/// The declared category of an entry, if scanned and non-empty.
+fn entry_category(entry: &catalog::CatalogEntry) -> Option<&str> {
+    entry
+        .ready()
+        .map(|metadata| metadata.category.as_str())
+        .filter(|category| !category.is_empty())
+}
+
+/// The click route for a catalog row. Import-shaped operators open their
+/// file dialog (staging them bare would only fail the next run); everything
+/// else adds directly by kind.
+fn catalog_row_key(entry: &catalog::CatalogEntry) -> String {
+    match entry.name.as_str() {
+        "stl_import_operator" => IMPORT_STL_KEY.to_string(),
+        "image_model_operator" => IMPORT_IMAGE_KEY.to_string(),
+        _ => match entry.kind {
+            volumetric_assets::AssetCategory::Model => {
+                format!("{ADD_MODEL_PREFIX}{}", entry.name)
+            }
+            volumetric_assets::AssetCategory::Operator => {
+                format!("{ADD_OPERATOR_PREFIX}{}", entry.name)
+            }
+        },
     }
-    items.push(menubar_separator());
-    items.push(menubar_label("Operators"));
-    for entry in app.catalog.entries() {
-        if entry.kind != volumetric_assets::AssetCategory::Operator
-            || IMPORT_OPERATORS.contains(&entry.name.as_str())
+}
+
+/// One Add-modal row: icon, display name, and the declared description.
+fn catalog_row(entry: &catalog::CatalogEntry) -> El {
+    let description = match &entry.metadata {
+        catalog::CatalogMetadata::Ready(metadata) => metadata.description.clone(),
+        catalog::CatalogMetadata::Pending => "reading module metadata…".to_string(),
+        catalog::CatalogMetadata::Failed(_) => "module metadata unavailable".to_string(),
+    };
+    command_item([
+        command_icon(catalog_icon_source(entry)),
+        command_label(entry.display_name()).width(Size::Fixed(170.0)),
+        text(description)
+            .caption()
+            .muted()
+            .ellipsis()
+            .width(Size::Fill(1.0)),
+    ])
+    .key(catalog_row_key(entry))
+}
+
+/// The import action for external module files (not a catalog entry: it
+/// imports an arbitrary compiled model from disk).
+fn import_wasm_row() -> El {
+    command_item([
+        command_icon("file-text"),
+        command_label("Model WASM…").width(Size::Fixed(170.0)),
+        text("Import a compiled model module from disk.")
+            .caption()
+            .muted()
+            .ellipsis()
+            .width(Size::Fill(1.0)),
+    ])
+    .key(IMPORT_WASM_KEY)
+}
+
+/// Browse view: every catalog entry grouped by declared category in
+/// [`CATEGORY_ORDER`], unknown declared categories after, unscanned
+/// entries last.
+fn add_browse_rows(app: &VolumetricUiV2) -> Vec<El> {
+    let entries = app.catalog.entries();
+    let mut categories: Vec<&str> = CATEGORY_ORDER.to_vec();
+    for entry in entries {
+        if let Some(category) = entry_category(entry)
+            && !categories.contains(&category)
         {
+            categories.push(category);
+        }
+    }
+
+    let mut rows = Vec::new();
+    for category in categories {
+        let group: Vec<&catalog::CatalogEntry> = entries
+            .iter()
+            .filter(|entry| entry_category(entry) == Some(category))
+            .collect();
+        // The Import group always exists — the Model WASM action lives
+        // there even before its sibling entries are scanned.
+        if group.is_empty() && category != "Import" {
             continue;
         }
-        items.push(
-            menubar_item_with_icon("settings", entry.display_name())
-                .key(format!("{ADD_OPERATOR_PREFIX}{}", entry.name)),
-        );
+        rows.push(menubar_label(category));
+        rows.extend(group.into_iter().map(catalog_row));
+        if category == "Import" {
+            rows.push(import_wasm_row());
+        }
     }
-    items.push(menubar_separator());
-    items.push(menubar_label("Import"));
-    items.push(menubar_item_with_icon("file-text", "Model WASM…").key(IMPORT_WASM_KEY));
-    items.push(menubar_item_with_icon("file-text", "STL Mesh…").key(IMPORT_STL_KEY));
-    items.push(menubar_item_with_icon("file-text", "Image…").key(IMPORT_IMAGE_KEY));
-    items
+
+    let unscanned: Vec<&catalog::CatalogEntry> = entries
+        .iter()
+        .filter(|entry| entry_category(entry).is_none())
+        .collect();
+    if !unscanned.is_empty() {
+        rows.push(menubar_label("Scanning"));
+        rows.extend(unscanned.into_iter().map(catalog_row));
+    }
+    rows
+}
+
+/// Rank an entry against the search query: lower is better, `None` filters
+/// it out. Display-name prefix beats display-name contains beats module
+/// name, category, then description hits.
+fn add_search_score(entry: &catalog::CatalogEntry, query: &str) -> Option<u32> {
+    let display = entry.display_name().to_lowercase();
+    if display.starts_with(query) {
+        return Some(0);
+    }
+    if display.contains(query) {
+        return Some(1);
+    }
+    if entry.name.contains(query) {
+        return Some(2);
+    }
+    let metadata = entry.ready()?;
+    if metadata.category.to_lowercase().contains(query) {
+        return Some(3);
+    }
+    if metadata.description.to_lowercase().contains(query) {
+        return Some(4);
+    }
+    None
+}
+
+/// Search view: matching entries ranked by [`add_search_score`], stable by
+/// catalog order within a rank.
+fn add_search_rows(app: &VolumetricUiV2, query: &str) -> Vec<El> {
+    let query = query.to_lowercase();
+    let mut scored: Vec<(u32, usize, &catalog::CatalogEntry)> = app
+        .catalog
+        .entries()
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, entry)| add_search_score(entry, &query).map(|s| (s, idx, entry)))
+        .collect();
+    scored.sort_by_key(|(score, idx, _)| (*score, *idx));
+    let mut rows: Vec<El> = scored
+        .into_iter()
+        .map(|(_, _, entry)| catalog_row(entry))
+        .collect();
+    if "model wasm import module".contains(&query) {
+        rows.push(import_wasm_row());
+    }
+    if rows.is_empty() {
+        rows.push(text("no matches").label().muted());
+    }
+    rows
+}
+
+/// The Add-catalog modal, rendered as a root overlay layer: a search box
+/// over the cataloged modules — an empty query browses by category, typing
+/// ranks matches. Rows one-click add (or open the matching import dialog)
+/// and close the modal.
+fn add_layer(app: &VolumetricUiV2) -> Option<El> {
+    let modal = app.add_modal.as_ref()?;
+    let query = modal.query.trim();
+    let rows = if query.is_empty() {
+        add_browse_rows(app)
+    } else {
+        add_search_rows(app, query)
+    };
+    let body = [
+        text_input_with(
+            ADD_SEARCH_KEY,
+            &modal.query,
+            &app.selection,
+            TextInputOpts::default().placeholder("Search models and operators…"),
+        )
+        .width(Size::Fill(1.0)),
+        column(rows)
+            .gap(tokens::SPACE_1)
+            .width(Size::Fill(1.0))
+            .height(Size::Fixed(440.0))
+            .scrollable()
+            .scrollbar()
+            .clip(),
+    ];
+    Some(overlay([
+        scrim(ADD_DISMISS_KEY),
+        modal_panel("Add", body)
+            .width(Size::Fixed(640.0))
+            .block_pointer(),
+    ]))
 }
 
 /// The open viewport picker menu (or per-output settings popover), rendered
@@ -5772,16 +6139,21 @@ mod tests {
     #[test]
     fn menubar_opens_and_menu_item_click_closes_it() {
         let mut app = VolumetricUiV2::default();
-        dispatch(&mut app, UiEvent::synthetic_click("main-menu:menu:add"));
-        assert_eq!(app.open_menu.as_deref(), Some("add"));
+        dispatch(&mut app, UiEvent::synthetic_click("main-menu:menu:file"));
+        assert_eq!(app.open_menu.as_deref(), Some("file"));
 
-        add_model_click(&mut app, "simple_sphere_model");
+        // A menu item click acts and closes the menu.
+        dispatch(&mut app, UiEvent::synthetic_click(NEW_PROJECT_KEY));
         assert_eq!(app.open_menu, None);
-        assert_eq!(app.summary().imports, 2);
 
         // Clicking the trigger again toggles closed too.
         dispatch(&mut app, UiEvent::synthetic_click("main-menu:menu:file"));
         dispatch(&mut app, UiEvent::synthetic_click("main-menu:menu:file"));
+        assert_eq!(app.open_menu, None);
+
+        // The Add affordance opens the modal, not a menu.
+        dispatch(&mut app, UiEvent::synthetic_click(ADD_OPEN_KEY));
+        assert!(app.add_modal.is_some());
         assert_eq!(app.open_menu, None);
     }
 
@@ -7038,26 +7410,120 @@ mod tests {
         assert!(!editable_model_asset_ids(&app).contains(&mesh_id));
     }
 
+    fn collect_keys(el: &El, keys: &mut Vec<String>) {
+        if let Some(key) = &el.key {
+            keys.push(key.clone());
+        }
+        for child in &el.children {
+            collect_keys(child, keys);
+        }
+    }
+
+    /// Import-shaped operators (bare Blob inputs) route to their file
+    /// dialogs from the Add modal, never to a bare operator insert.
     #[test]
-    fn import_operators_hidden_from_plain_operator_menu() {
-        fn collect_keys(el: &El, keys: &mut Vec<String>) {
-            if let Some(key) = &el.key {
-                keys.push(key.clone());
-            }
-            for child in &el.children {
-                collect_keys(child, keys);
-            }
-        }
+    fn import_operators_route_to_file_dialogs() {
+        let mut app = VolumetricUiV2::default();
+        app.add_modal = Some(AddModalState::default());
         let mut keys = Vec::new();
-        let app = VolumetricUiV2::default();
-        for item in add_menu_items(&app) {
-            collect_keys(&item, &mut keys);
-        }
+        collect_keys(&add_layer(&app).expect("modal open"), &mut keys);
         assert!(
             !keys.contains(&format!("{ADD_OPERATOR_PREFIX}stl_import_operator")),
-            "import operators only reachable via Import"
+            "import operators only reachable via their file dialogs"
         );
-        assert!(keys.contains(&IMPORT_STL_KEY.to_string()));
+        assert!(keys.contains(&IMPORT_WASM_KEY.to_string()));
+
+        // Searching finds them under the same file-dialog routes.
+        app.add_modal = Some(AddModalState {
+            query: "stl".to_string(),
+        });
+        let mut keys = Vec::new();
+        collect_keys(&add_layer(&app).expect("modal open"), &mut keys);
+        assert!(
+            !keys.contains(&format!("{ADD_OPERATOR_PREFIX}stl_import_operator")),
+            "{keys:?}"
+        );
+    }
+
+    /// The rail opens the modal, search ranking prefers display-name
+    /// prefixes, and a row click adds and closes the modal.
+    #[test]
+    fn add_modal_searches_and_adds() {
+        let mut app = VolumetricUiV2::empty();
+        dispatch(&mut app, UiEvent::synthetic_click(ADD_OPEN_KEY));
+        assert!(app.add_modal.is_some());
+
+        // Warm two entries so search sees display metadata.
+        for name in ["simple_sphere_model", "simple_torus_model"] {
+            let asset = volumetric_assets::get_asset(name).expect("bundled");
+            let result = volumetric::operator_metadata_from_wasm_bytes(asset.bytes)
+                .map_err(|e| e.to_string());
+            app.on_module_metadata(name, result);
+        }
+        app.add_modal = Some(AddModalState {
+            query: "torus".to_string(),
+        });
+        let mut keys = Vec::new();
+        collect_keys(&add_layer(&app).expect("modal open"), &mut keys);
+        let torus_key = format!("{ADD_MODEL_PREFIX}simple_torus_model");
+        assert!(keys.contains(&torus_key), "{keys:?}");
+        assert!(!keys.contains(&format!("{ADD_MODEL_PREFIX}simple_sphere_model")));
+
+        // Clicking the row adds the model, closes the modal, records recents.
+        dispatch(&mut app, UiEvent::synthetic_click(torus_key));
+        assert_eq!(app.summary().imports, 1);
+        assert!(app.add_modal.is_none());
+        assert_eq!(
+            app.recent_adds.first().map(String::as_str),
+            Some("simple_torus_model")
+        );
+    }
+
+    /// Every category glyph parses. The statics are lazy, so without this
+    /// a malformed SVG would panic at first render after a scan lands.
+    #[test]
+    fn category_icons_parse_for_every_known_category() {
+        for category in CATEGORY_ORDER {
+            let entry = catalog::CatalogEntry {
+                name: "probe".to_string(),
+                kind: volumetric_assets::AssetCategory::Operator,
+                hash: String::new(),
+                metadata: catalog::CatalogMetadata::Ready(OperatorMetadata {
+                    name: "probe".to_string(),
+                    version: "0.0.0".to_string(),
+                    display_name: String::new(),
+                    description: String::new(),
+                    category: category.to_string(),
+                    icon_svg: String::new(),
+                    inputs: vec![],
+                    input_names: vec![],
+                    outputs: vec![],
+                }),
+            };
+            // Forces the LazyLock (and with it the parse) for each glyph.
+            let _ = catalog_icon_source(&entry);
+        }
+    }
+
+    /// Rail tiles re-add by catalog kind: a recent model tile imports it
+    /// again without the modal.
+    #[test]
+    fn rail_tile_adds_by_kind() {
+        let mut app = VolumetricUiV2::empty();
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{RAIL_ADD_PREFIX}simple_sphere_model")),
+        );
+        assert_eq!(app.summary().imports, 1, "{}", app.status);
+
+        // The default rail renders the curated seed as tiles.
+        let mut keys = Vec::new();
+        collect_keys(&add_rail(&app), &mut keys);
+        assert!(keys.contains(&ADD_OPEN_KEY.to_string()));
+        assert!(
+            keys.contains(&format!("{RAIL_ADD_PREFIX}boolean_operator")),
+            "{keys:?}"
+        );
     }
 
     #[test]

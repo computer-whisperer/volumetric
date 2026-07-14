@@ -41,6 +41,10 @@ pub struct UiSettings {
     pub auto_rebuild: bool,
     pub auto_remesh: bool,
     pub panel_width: f32,
+    /// Recents-rail tiles: catalog module names, most recent first. A
+    /// missing field takes the fresh-install seed; unknown names are
+    /// skipped at render time.
+    pub recent_adds: Vec<String>,
     /// Physical window size at last exit; 0 means "no recorded size" and
     /// leaves the shell's default alone.
     pub window_width: u32,
@@ -71,6 +75,7 @@ impl UiSettings {
             auto_rebuild: app.auto_rebuild,
             auto_remesh: app.auto_remesh,
             panel_width: app.panel_width,
+            recent_adds: app.recent_adds.clone(),
             window_width,
             window_height,
         }
@@ -109,6 +114,8 @@ impl UiSettings {
         app.auto_remesh = self.auto_remesh;
         app.panel_width = finite_or(self.panel_width, defaults.panel_width)
             .clamp(super::PANEL_WIDTH_MIN, super::PANEL_WIDTH_MAX);
+        app.recent_adds = self.recent_adds.clone();
+        app.recent_adds.truncate(super::RECENT_ADDS_CAP);
     }
 
     /// `<config dir>/volumetric/ui-v2.json`; `None` when the platform has
