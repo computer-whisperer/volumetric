@@ -47,6 +47,11 @@ pub fn run(
     // caller's fallback for a first run with no recorded size.
     let settings_path = UiSettings::config_path();
     let last_settings = settings_path.as_deref().and_then(UiSettings::load);
+    // Warm the Add catalog from the persisted metadata cache; whatever it
+    // doesn't cover fills in through background scans.
+    if let Some(cache_path) = crate::catalog::Catalog::default_cache_path() {
+        app.catalog.attach_cache(cache_path);
+    }
     let mut viewport = viewport;
     if let Some(loaded) = &last_settings {
         loaded.apply(&mut app);

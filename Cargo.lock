@@ -5462,6 +5462,7 @@ dependencies = [
  "rfd",
  "serde",
  "serde_json",
+ "sha2",
  "volumetric",
  "volumetric_assets",
  "volumetric_daemon",

@@ -38,6 +38,7 @@ static PIN_ICON: LazyLock<SvgIcon> = LazyLock::new(|| {
     .expect("pin icon SVG parses")
 });
 
+pub mod catalog;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod host;
 // The daemon-outcome mapping is shared with the web shell; the blocking
@@ -904,10 +905,14 @@ pub struct VolumetricUiV2 {
     executor_request: Option<ExecutorChoice>,
     /// An Add-menu operator click waiting for dispatch to the background
     /// worker (reading operator metadata compiles its wasm — too slow for
-    /// the UI thread). The step is inserted when the result arrives.
+    /// the UI thread). The step is inserted when the result arrives. Only
+    /// cold-catalog clicks land here; a warm catalog inserts synchronously.
     operator_add_request: Option<String>,
     /// The operator add whose metadata read is on the worker right now.
     operator_add_inflight: Option<String>,
+    /// The Add catalog: every bundled module's declared metadata, warmed
+    /// from the persisted cache and background scans (see [`catalog`]).
+    pub(crate) catalog: catalog::Catalog,
     preview_build_status: PreviewBuildStatus,
     pending_camera_command: Option<ViewportCameraCommand>,
     viewport_texture: Option<AppTexture>,
@@ -997,6 +1002,7 @@ impl VolumetricUiV2 {
             executor_request: None,
             operator_add_request: None,
             operator_add_inflight: None,
+            catalog: catalog::Catalog::default(),
             preview_build_status: PreviewBuildStatus::Idle,
             pending_camera_command: None,
             viewport_texture: None,
@@ -1706,15 +1712,17 @@ impl VolumetricUiV2 {
         Some(name)
     }
 
-    /// Host hook: an operator-add metadata read finished; wire up and insert
-    /// the step (or surface the error).
-    pub(crate) fn on_operator_metadata(
+    /// Host hook: a module metadata read finished (add-click read or
+    /// catalog warm scan — any read warms the catalog). A read the Add
+    /// flow is waiting on also inserts its step (or surfaces the error).
+    pub(crate) fn on_module_metadata(
         &mut self,
         name: &str,
         result: Result<OperatorMetadata, String>,
     ) {
+        self.catalog.on_metadata(name, &result);
         if self.operator_add_inflight.as_deref() != Some(name) {
-            return; // superseded or stale; nothing was waiting on it
+            return; // a warm scan, or superseded; nothing was waiting on it
         }
         self.operator_add_inflight = None;
         match result {
@@ -2506,6 +2514,7 @@ impl VolumetricUiV2 {
             self.status = format!("missing bundled model {name}");
             return;
         };
+        let display = self.catalog.display_name(name).to_string();
 
         let id = self.project.insert_model(asset.name, asset.bytes.to_vec());
         self.mark_project_dirty();
@@ -2516,25 +2525,35 @@ impl VolumetricUiV2 {
             .len()
             .checked_sub(1)
             .map(ProjectSelection::Import);
-        self.status = format!("imported {} as {id}", asset.display_name);
+        self.status = format!("imported {display} as {id}");
     }
 
-    /// Queues a timeline-step insert for the named bundled operator. The
-    /// operator's declared metadata drives the step's input wiring, and
-    /// reading it compiles the operator's wasm module — seconds on a cold
-    /// cache in a debug build — so the read runs on the background worker;
-    /// [`Self::on_operator_metadata`] inserts the step when it lands.
+    /// Inserts a timeline step for the named bundled operator. With a warm
+    /// catalog the declared metadata is already known and the step inserts
+    /// synchronously; otherwise the metadata read runs on the background
+    /// worker (it compiles the operator's wasm — seconds on a cold debug
+    /// cache) and [`Self::on_module_metadata`] inserts the step when it
+    /// lands.
     fn add_operator(&mut self, name: &str) {
-        let Some(asset) = volumetric_assets::get_operator(name) else {
+        if volumetric_assets::get_operator(name).is_none() {
             self.status = format!("missing bundled operator {name}");
             return;
-        };
+        }
+        if let Some(metadata) = self
+            .catalog
+            .get(name)
+            .and_then(catalog::CatalogEntry::ready)
+        {
+            let metadata = metadata.clone();
+            self.insert_operator_step(name, &metadata);
+            return;
+        }
         if self.operator_add_request.is_some() || self.operator_add_inflight.is_some() {
             self.status = "still adding the previous operator".to_string();
             return;
         }
         self.operator_add_request = Some(name.to_string());
-        self.status = format!("adding {}…", asset.display_name);
+        self.status = format!("adding {}…", self.catalog.display_name(name));
     }
 
     /// Appends a timeline step for a bundled operator whose metadata just
@@ -2547,6 +2566,7 @@ impl VolumetricUiV2 {
             self.status = format!("missing bundled operator {name}");
             return;
         };
+        let display = self.catalog.display_name(name).to_string();
         let selection = self.selected_export.clone();
 
         let typed = self.declared_assets_typed();
@@ -2582,10 +2602,7 @@ impl VolumetricUiV2 {
             .iter()
             .any(|input| matches!(input, OperatorMetadataInput::ModelWASM));
         if needs_model && primary_model.is_none() {
-            self.status = format!(
-                "{} needs a model input — add or select a model first",
-                asset.display_name
-            );
+            self.status = format!("{display} needs a model input — add or select a model first");
             return;
         }
 
@@ -2618,7 +2635,7 @@ impl VolumetricUiV2 {
             .len()
             .checked_sub(1)
             .map(ProjectSelection::Step);
-        self.status = format!("added {} -> {output_id}", asset.display_name);
+        self.status = format!("added {display} -> {output_id}");
     }
 
     /// Replaces an imported operator's bytes with the matching bundled
@@ -3435,7 +3452,7 @@ fn menu_layer(app: &VolumetricUiV2) -> Option<El> {
                 menubar_item_with_icon("download", "Save Project As…").key(SAVE_PROJECT_AS_KEY),
             ],
         )),
-        "add" => Some(menubar_menu(MENUBAR_KEY, "add", add_menu_items())),
+        "add" => Some(menubar_menu(MENUBAR_KEY, "add", add_menu_items(app))),
         _ => None,
     }
 }
@@ -3444,25 +3461,32 @@ fn menu_layer(app: &VolumetricUiV2) -> Option<El> {
 /// list: staging them bare (empty Blob input) would only fail the next run.
 const IMPORT_OPERATORS: [&str; 2] = ["stl_import_operator", "image_model_operator"];
 
-/// The Add menu body: every bundled model and operator (one click to add),
-/// plus file-import actions for external assets.
-fn add_menu_items() -> Vec<El> {
+/// The Add menu body: every cataloged model and operator (one click to
+/// add), plus file-import actions for external assets. Display names come
+/// from each module's declared metadata; entries the catalog hasn't
+/// scanned yet show their module name (transient on first launch).
+fn add_menu_items(app: &VolumetricUiV2) -> Vec<El> {
     let mut items = vec![menubar_label("Models")];
-    for asset in volumetric_assets::models() {
+    for entry in app.catalog.entries() {
+        if entry.kind != volumetric_assets::AssetCategory::Model {
+            continue;
+        }
         items.push(
-            menubar_item_with_icon("activity", asset.display_name)
-                .key(format!("{ADD_MODEL_PREFIX}{}", asset.name)),
+            menubar_item_with_icon("activity", entry.display_name())
+                .key(format!("{ADD_MODEL_PREFIX}{}", entry.name)),
         );
     }
     items.push(menubar_separator());
     items.push(menubar_label("Operators"));
-    for asset in volumetric_assets::operators() {
-        if IMPORT_OPERATORS.contains(&asset.name) {
+    for entry in app.catalog.entries() {
+        if entry.kind != volumetric_assets::AssetCategory::Operator
+            || IMPORT_OPERATORS.contains(&entry.name.as_str())
+        {
             continue;
         }
         items.push(
-            menubar_item_with_icon("settings", asset.display_name)
-                .key(format!("{ADD_OPERATOR_PREFIX}{}", asset.name)),
+            menubar_item_with_icon("settings", entry.display_name())
+                .key(format!("{ADD_OPERATOR_PREFIX}{}", entry.name)),
         );
     }
     items.push(menubar_separator());
@@ -5554,7 +5578,7 @@ mod tests {
                     .map_err(|err| err.to_string()),
                 None => Err(format!("missing bundled operator {name}")),
             };
-            app.on_operator_metadata(&name, result);
+            app.on_module_metadata(&name, result);
         }
     }
 
@@ -5569,10 +5593,15 @@ mod tests {
     /// operator actually declares at runtime: `bundled_operator_versions`
     /// (and with it the upgrade offer) reads the registry precisely so the
     /// UI never compiles all bundled operators just to learn their versions.
-    /// Compiles every bundled operator, so this is the slowest test here.
+    /// Compiles every bundled module, so this is the slowest test here.
+    /// Models go through the same executor read as operators — this is
+    /// also the proof that the catalog scan can read every bundled module.
     #[test]
     fn bundled_asset_registry_matches_declared_metadata() {
-        for asset in volumetric_assets::operators() {
+        for asset in volumetric_assets::models()
+            .iter()
+            .chain(volumetric_assets::operators())
+        {
             let metadata = volumetric::operator_metadata_from_wasm_bytes(asset.bytes)
                 .unwrap_or_else(|e| panic!("{} metadata: {e}", asset.name));
             assert_eq!(
@@ -5584,7 +5613,62 @@ mod tests {
                 "{}: declared version must equal the crate version bundled at build time",
                 asset.name
             );
+            assert!(
+                !metadata.display_name.is_empty() && !metadata.category.is_empty(),
+                "{}: bundled modules must declare catalog display metadata",
+                asset.name
+            );
         }
+    }
+
+    /// The Add flow end-to-end through the catalog: a scanned entry shows
+    /// its declared display name, and a warm-catalog operator click inserts
+    /// its step synchronously (no background metadata request).
+    #[test]
+    fn warm_catalog_names_entries_and_inserts_synchronously() {
+        let mut app = VolumetricUiV2::default();
+        assert_eq!(
+            app.catalog.display_name("simple_sphere_model"),
+            "simple_sphere_model",
+            "unscanned entries fall back to the module name"
+        );
+
+        // Pump the first scan the way the session worker would. Entry 0 is
+        // a model, so this also exercises the model get_metadata path.
+        let name = app.catalog.take_scan_request().expect("pending entries");
+        let asset = volumetric_assets::get_asset(&name).expect("bundled");
+        let result =
+            volumetric::operator_metadata_from_wasm_bytes(asset.bytes).map_err(|e| e.to_string());
+        app.on_module_metadata(&name, result);
+        assert_eq!(
+            app.catalog.display_name("simple_sphere_model"),
+            "Simple Sphere"
+        );
+
+        // Warm the catalog entry for a generator operator by hand, then
+        // click it: the step must insert without queueing a worker read.
+        let prism = "rectangular_prism_operator";
+        let metadata = volumetric::operator_metadata_from_wasm_bytes(
+            volumetric_assets::get_operator(prism)
+                .expect("bundled")
+                .bytes,
+        )
+        .expect("prism metadata");
+        app.on_module_metadata(prism, Ok(metadata));
+        let mut app = {
+            let mut fresh = VolumetricUiV2::empty();
+            std::mem::swap(&mut fresh.catalog, &mut app.catalog);
+            fresh
+        };
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{ADD_OPERATOR_PREFIX}{prism}")),
+        );
+        assert_eq!(app.summary().timeline_steps, 1, "{}", app.status);
+        assert!(
+            app.take_operator_metadata_request().is_none(),
+            "warm click must not queue a background read"
+        );
     }
 
     /// A generator operator (no model inputs) inserts into an empty project
@@ -5630,7 +5714,7 @@ mod tests {
         let asset = volumetric_assets::get_operator(&name).unwrap();
         let result =
             volumetric::operator_metadata_from_wasm_bytes(asset.bytes).map_err(|e| e.to_string());
-        app.on_operator_metadata(&name, result);
+        app.on_module_metadata(&name, result);
         assert_eq!(app.summary().timeline_steps, 1);
     }
 
@@ -6965,7 +7049,8 @@ mod tests {
             }
         }
         let mut keys = Vec::new();
-        for item in add_menu_items() {
+        let app = VolumetricUiV2::default();
+        for item in add_menu_items(&app) {
             collect_keys(&item, &mut keys);
         }
         assert!(

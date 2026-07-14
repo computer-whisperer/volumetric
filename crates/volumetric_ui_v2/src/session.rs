@@ -134,8 +134,8 @@ impl Session {
                     }
                     app.set_lightbox_data(&asset_id, &mode, result);
                 }
-                BackgroundResult::OperatorMetadataReady { name, result } => {
-                    app.on_operator_metadata(&name, result);
+                BackgroundResult::ModuleMetadataReady { name, result } => {
+                    app.on_module_metadata(&name, result);
                 }
             }
         }
@@ -183,6 +183,12 @@ impl Session {
 
         if let Some(name) = app.take_operator_metadata_request() {
             jobs.push(BackgroundJob::ReadOperatorMetadata { name });
+        }
+
+        // Catalog warm scan: one idle-priority metadata read at a time
+        // until every Add-catalog entry knows its declared metadata.
+        if let Some(name) = app.catalog.take_scan_request() {
+            jobs.push(BackgroundJob::ScanModuleMetadata { name });
         }
 
         let (status, preview_jobs) = self.viewport.preview_cache.sync(
@@ -1454,6 +1460,13 @@ pub enum BackgroundJob {
     ReadOperatorMetadata {
         name: String,
     },
+    /// Catalog warm scan: read a bundled module's (model or operator)
+    /// declared metadata so the Add catalog can display it. Same work as
+    /// [`Self::ReadOperatorMetadata`], but idle priority — nothing is
+    /// waiting on it, so it runs after previews instead of before them.
+    ScanModuleMetadata {
+        name: String,
+    },
 }
 
 /// A completed unit of background work, routed by [`Session::pre_frame`].
@@ -1480,7 +1493,10 @@ pub enum BackgroundResult {
         mode: LightboxMode,
         result: Result<LightboxData, String>,
     },
-    OperatorMetadataReady {
+    /// A module metadata read finished — from an add-click read or a
+    /// catalog warm scan; either way the catalog warms and any pending
+    /// add completes.
+    ModuleMetadataReady {
         name: String,
         result: Result<volumetric::OperatorMetadata, String>,
     },
@@ -1497,6 +1513,7 @@ pub struct JobQueue {
     previews: HashMap<String, PreviewBuildJob>,
     lightbox: Option<BackgroundJob>,
     metadata: Option<BackgroundJob>,
+    scan: Option<BackgroundJob>,
 }
 
 impl JobQueue {
@@ -1511,12 +1528,15 @@ impl JobQueue {
             lightbox @ BackgroundJob::BuildLightbox { .. } => self.lightbox = Some(lightbox),
             // One operator add is in flight at a time (the app serializes).
             metadata @ BackgroundJob::ReadOperatorMetadata { .. } => self.metadata = Some(metadata),
+            // One catalog scan is in flight at a time (the catalog serializes).
+            scan @ BackgroundJob::ScanModuleMetadata { .. } => self.scan = Some(scan),
         }
     }
 
     /// The next job to execute: a pending run first, then the lightbox (the
     /// user is actively looking at it), then operator metadata (a click is
-    /// waiting on it), then one preview.
+    /// waiting on it), then one preview, and only then a catalog warm scan
+    /// (nothing waits on those).
     pub fn pop(&mut self) -> Option<BackgroundJob> {
         if let Some(run) = self.run.take() {
             return Some(run);
@@ -1527,9 +1547,11 @@ impl JobQueue {
         if let Some(metadata) = self.metadata.take() {
             return Some(metadata);
         }
-        let id = self.previews.keys().next()?.clone();
-        let preview = self.previews.remove(&id).expect("key just observed");
-        Some(BackgroundJob::BuildPreview(preview))
+        if let Some(id) = self.previews.keys().next().cloned() {
+            let preview = self.previews.remove(&id).expect("key just observed");
+            return Some(BackgroundJob::BuildPreview(preview));
+        }
+        self.scan.take()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1537,6 +1559,7 @@ impl JobQueue {
             && self.previews.is_empty()
             && self.lightbox.is_none()
             && self.metadata.is_none()
+            && self.scan.is_none()
     }
 }
 
@@ -1631,7 +1654,15 @@ pub fn execute_job_monitored(
                     .map_err(|err| err.to_string()),
                 None => Err(format!("missing bundled operator {name}")),
             };
-            BackgroundResult::OperatorMetadataReady { name, result }
+            BackgroundResult::ModuleMetadataReady { name, result }
+        }
+        BackgroundJob::ScanModuleMetadata { name } => {
+            let result = match volumetric_assets::get_asset(&name) {
+                Some(asset) => volumetric::operator_metadata_from_wasm_bytes(asset.bytes)
+                    .map_err(|err| err.to_string()),
+                None => Err(format!("missing bundled module {name}")),
+            };
+            BackgroundResult::ModuleMetadataReady { name, result }
         }
     }
 }
@@ -3150,6 +3181,23 @@ fn point_in_rect(rect: Option<Rect>, pos: (f32, f32)) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The catalog warm-scan job reads a bundled *model's* declared
+    /// metadata through the real executor — the path the Add catalog
+    /// fills itself from.
+    #[test]
+    fn scan_job_reads_model_metadata() {
+        let result = execute_job(BackgroundJob::ScanModuleMetadata {
+            name: "simple_sphere_model".to_string(),
+        });
+        let BackgroundResult::ModuleMetadataReady { name, result } = result else {
+            panic!("scan job must produce ModuleMetadataReady");
+        };
+        assert_eq!(name, "simple_sphere_model");
+        let metadata = result.expect("sphere metadata reads");
+        assert_eq!(metadata.display_name, "Simple Sphere");
+        assert!(metadata.inputs.is_empty() && metadata.outputs.is_empty());
+    }
 
     /// A monitored ASN2 preview build must emit `PreviewProgress` snapshots
     /// through the local backend (meshing stage transitions report

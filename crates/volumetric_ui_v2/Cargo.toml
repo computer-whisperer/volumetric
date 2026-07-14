@@ -29,6 +29,7 @@ damascene-wgpu = "0.5.0"
 anyhow = "1"
 glam = "0.32"
 rfd = "0.17"
+sha2 = "0.10"
 volumetric = { path = "../../", default-features = false }
 volumetric_assets = { path = "../volumetric_assets" }
 volumetric_renderer = { path = "../volumetric_renderer" }

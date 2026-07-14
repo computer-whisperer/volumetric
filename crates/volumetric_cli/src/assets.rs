@@ -86,7 +86,7 @@ pub struct AssetsArgs {
 #[derive(Debug, Serialize)]
 struct AssetInfo {
     name: &'static str,
-    display_name: &'static str,
+    version: &'static str,
     size_bytes: usize,
 }
 
@@ -97,9 +97,11 @@ struct AssetsOutput {
 }
 
 pub fn run_assets(args: AssetsArgs) -> Result<()> {
+    // Name/version/size only: display metadata lives in each module's own
+    // `get_metadata()` (see `info --input <module.wasm>` for one module).
     let to_info = |a: &volumetric_assets::BundledAsset| AssetInfo {
         name: a.name,
-        display_name: a.display_name,
+        version: a.version,
         size_bytes: a.bytes.len(),
     };
     let output = AssetsOutput {
@@ -115,12 +117,12 @@ pub fn run_assets(args: AssetsArgs) -> Result<()> {
     } else {
         println!("Bundled models ({}):", output.models.len());
         for m in &output.models {
-            println!("  {} ({}, {} bytes)", m.name, m.display_name, m.size_bytes);
+            println!("  {} (v{}, {} bytes)", m.name, m.version, m.size_bytes);
         }
         println!();
         println!("Bundled operators ({}):", output.operators.len());
         for o in &output.operators {
-            println!("  {} ({}, {} bytes)", o.name, o.display_name, o.size_bytes);
+            println!("  {} (v{}, {} bytes)", o.name, o.version, o.size_bytes);
         }
     }
     Ok(())

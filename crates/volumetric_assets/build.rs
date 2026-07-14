@@ -7,46 +7,46 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-/// Known model crate names
-const MODELS: &[(&str, &str)] = &[
-    ("simple_sphere_model", "Simple Sphere"),
-    ("simple_torus_model", "Simple Torus"),
-    ("rounded_box_model", "Rounded Box"),
-    ("gyroid_lattice_model", "Gyroid Lattice"),
-    ("mandelbulb_model", "Mandelbulb"),
-    // A solid cube with an x-gradient density channel — the lattice
-    // operator's playground input.
-    ("density_gradient_model", "Density Gradient"),
+/// Known model crate names. Display metadata (names, descriptions,
+/// categories, icons) is NOT recorded here: every module declares its own
+/// through `get_metadata()`, and hosts read it from the bytes.
+const MODELS: &[&str] = &[
+    "simple_sphere_model",
+    "simple_torus_model",
+    "rounded_box_model",
+    "gyroid_lattice_model",
+    "mandelbulb_model",
+    "density_gradient_model",
 ];
 
-/// Known operator crate names
-const OPERATORS: &[(&str, &str)] = &[
-    ("boolean_operator", "Boolean"),
-    ("translate_operator", "Translate"),
-    ("rotation_operator", "Rotation"),
-    ("scale_operator", "Scale"),
-    ("lua_script_operator", "Lua Script"),
-    ("stl_import_operator", "STL Import"),
-    ("rectangular_prism_operator", "Rectangular Prism"),
-    ("heightmap_extrude_operator", "Heightmap Extrude"),
-    ("image_model_operator", "Image"),
-    ("extrude_operator", "Extrude"),
-    ("revolve_operator", "Revolve"),
-    ("fea_grid_mesh_operator", "FEA Grid Mesh"),
-    ("fea_solve_operator", "FEA Solve"),
-    ("fea_density_operator", "FEA Density"),
-    ("fea_inverse_operator", "FEA Inverse"),
-    ("fea_deform_operator", "FEA Deform"),
-    ("mesh_to_model_operator", "Mesh to Model"),
-    ("mesh_height_operator", "Mesh Height Query"),
-    ("lattice_operator", "Lattice"),
-    ("strut_pattern_operator", "Strut Pattern"),
-    ("strut_model_operator", "Strut Model"),
-    ("brim_operator", "Brim"),
-    ("island_removal_operator", "Island Removal"),
-    ("subspace_operator", "Subspace"),
-    ("model_bound_operator", "Model Bound"),
-    ("slice_operator", "Slice"),
+/// Known operator crate names (see the display-metadata note on [`MODELS`]).
+const OPERATORS: &[&str] = &[
+    "boolean_operator",
+    "translate_operator",
+    "rotation_operator",
+    "scale_operator",
+    "lua_script_operator",
+    "stl_import_operator",
+    "rectangular_prism_operator",
+    "heightmap_extrude_operator",
+    "image_model_operator",
+    "extrude_operator",
+    "revolve_operator",
+    "fea_grid_mesh_operator",
+    "fea_solve_operator",
+    "fea_density_operator",
+    "fea_inverse_operator",
+    "fea_deform_operator",
+    "mesh_to_model_operator",
+    "mesh_height_operator",
+    "lattice_operator",
+    "strut_pattern_operator",
+    "strut_model_operator",
+    "brim_operator",
+    "island_removal_operator",
+    "subspace_operator",
+    "model_bound_operator",
+    "slice_operator",
 ];
 
 /// Reads `version = "..."` from a bundled crate's Cargo.toml. Every bundled
@@ -113,7 +113,7 @@ fn main() {
     // allocation is materialized at every use site, so `const` registries
     // duplicated every include_bytes!() blob once per referencing function
     // (measured: +73MB on the web bundle — the whole 36.5MB library twice).
-    let mut emit = |kind: &str, subdir: &str, list: &[(&str, &str)], enabled: bool| {
+    let mut emit = |kind: &str, subdir: &str, list: &[&str], enabled: bool| {
         let array_name = format!("BUNDLED_{}S", kind.to_uppercase());
         if !enabled {
             code.push_str(&format!(
@@ -123,7 +123,7 @@ fn main() {
             return;
         }
         let mut entries = String::new();
-        for (name, display_name) in list {
+        for name in list {
             let wasm_path = wasm_dir.join(format!("{}.wasm", name));
             if wasm_path.exists() {
                 println!("cargo:rerun-if-changed={}", wasm_path.display());
@@ -134,7 +134,7 @@ fn main() {
                     wasm_path.display()
                 ));
                 entries.push_str(&format!(
-                    "    BundledAsset {{\n        name: \"{name}\",\n        display_name: \"{display_name}\",\n        version: \"{version}\",\n        bytes: {bytes_static},\n        category: AssetCategory::{kind},\n    }},\n",
+                    "    BundledAsset {{\n        name: \"{name}\",\n        version: \"{version}\",\n        bytes: {bytes_static},\n        category: AssetCategory::{kind},\n    }},\n",
                 ));
             } else {
                 missing(&wasm_path, kind, name);

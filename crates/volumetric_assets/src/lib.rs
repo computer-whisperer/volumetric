@@ -16,7 +16,7 @@
 //!
 //! // Get all available models
 //! for model in models() {
-//!     println!("{}: {} bytes", model.display_name, model.bytes.len());
+//!     println!("{}: {} bytes", model.name, model.bytes.len());
 //! }
 //!
 //! // Get a specific model by name
@@ -34,13 +34,14 @@ pub enum AssetCategory {
     Operator,
 }
 
-/// A bundled WASM asset.
+/// A bundled WASM asset: a byte source plus the identity fields hosts need
+/// without compiling the module. Display metadata (names, descriptions,
+/// categories, icons) deliberately lives in the module itself — read it
+/// via `get_metadata()`, not from this registry.
 #[derive(Debug, Clone, Copy)]
 pub struct BundledAsset {
     /// The crate/module name (e.g., "simple_sphere_model")
     pub name: &'static str,
-    /// Human-readable display name (e.g., "Simple Sphere")
-    pub display_name: &'static str,
     /// The asset crate's Cargo.toml version, read at build time. Bundled
     /// crates declare `version: env!("CARGO_PKG_VERSION")` in their runtime
     /// metadata, so this matches the declared metadata version without
@@ -112,10 +113,12 @@ mod tests {
     fn test_get_by_name() {
         // These may return None if WASM files haven't been built
         if let Some(sphere) = get_model("simple_sphere_model") {
-            assert_eq!(sphere.display_name, "Simple Sphere");
+            assert_eq!(sphere.category, AssetCategory::Model);
+            assert!(!sphere.version.is_empty());
         }
         if let Some(boolean) = get_operator("boolean_operator") {
-            assert_eq!(boolean.display_name, "Boolean");
+            assert_eq!(boolean.category, AssetCategory::Operator);
+            assert!(!boolean.version.is_empty());
         }
     }
 }
