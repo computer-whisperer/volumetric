@@ -1884,7 +1884,12 @@ pub extern "C" fn get_metadata() -> i64 {
         display_name: "Lua Script".to_string(),
         description: "Compile a restricted Lua script into a model module.".to_string(),
         category: "Scripting".to_string(),
-        icon_svg: String::new(),
+        icon_svg: volumetric_abi::icon_svg!(
+            r##"<circle cx="11" cy="13" r="7.5"/>"##,
+            r##"<circle cx="14.5" cy="9.5" r="2"/>"##,
+            r##"<circle cx="20.5" cy="3.5" r="1.5"/>"##,
+        )
+        .to_string(),
         inputs: vec![OperatorMetadataInput::LuaSource(LUA_TEMPLATE.to_string())],
         input_names: vec!["Script".to_string()],
         outputs: vec![OperatorMetadataOutput::ModelWASM],

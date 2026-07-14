@@ -222,7 +222,12 @@ pub extern "C" fn get_metadata() -> i64 {
                 "Wrap a triangle mesh as a 2D model of surface height over a lateral plane."
                     .to_string(),
             category: "Mesh".to_string(),
-            icon_svg: String::new(),
+            icon_svg: volumetric_abi::icon_svg!(
+                r##"<path d="M12 3v9"/>"##,
+                r##"<path d="m8 8 4 4 4-4"/>"##,
+                r##"<path d="M3 18c3-4 6-4 9 0s6 4 9 0"/>"##,
+            )
+            .to_string(),
             inputs: vec![
                 OperatorMetadataInput::TriMesh,
                 OperatorMetadataInput::CBORConfiguration(schema),

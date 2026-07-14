@@ -305,7 +305,8 @@ pub struct OperatorMetadata {
     pub category: String,
     /// Monochrome SVG icon source (24×24 viewBox, `currentColor` paint,
     /// lucide-style strokes); hosts tint it like a built-in icon and fall
-    /// back to a stock glyph when empty.
+    /// back to a stock glyph when empty. The [`icon_svg!`] macro wraps
+    /// bare shape elements in the canonical document header.
     #[serde(default)]
     pub icon_svg: String,
     pub inputs: Vec<OperatorMetadataInput>,
@@ -351,6 +352,27 @@ pub fn encode_metadata(metadata: &OperatorMetadata) -> Vec<u8> {
 pub fn decode_metadata(bytes: &[u8]) -> Result<OperatorMetadata, String> {
     ciborium::de::from_reader(std::io::Cursor::new(bytes))
         .map_err(|e| format!("failed to decode operator metadata CBOR: {e}"))
+}
+
+/// Wrap lucide-style shape elements in the canonical
+/// [`OperatorMetadata::icon_svg`] document header: 24×24 viewBox, 2px
+/// round strokes, no fill. Expands to a `&'static str`, so it works in
+/// `const` position and in the build scripts no_std models precompute
+/// their metadata CBOR from.
+///
+/// ```
+/// let icon = volumetric_abi::icon_svg!(r##"<circle cx="12" cy="12" r="9"/>"##);
+/// assert!(icon.starts_with("<svg ") && icon.ends_with("</svg>"));
+/// ```
+#[macro_export]
+macro_rules! icon_svg {
+    ($($body:literal),+ $(,)?) => {
+        concat!(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#000" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">"##,
+            $($body,)+
+            "</svg>"
+        )
+    };
 }
 
 /// Pack a metadata buffer's address and length into the `i64` that
@@ -614,6 +636,17 @@ mod tests {
         assert!(!is_occupied(0.5)); // strictly greater
         assert!(!is_occupied(0.3)); // the #3 disagreement case: outside, everywhere
         assert!(!is_occupied(f32::NAN));
+    }
+
+    #[test]
+    fn icon_svg_macro_wraps_bodies_in_the_canonical_header() {
+        const ICON: &str = icon_svg!(
+            r##"<circle cx="12" cy="12" r="9"/>"##,
+            r##"<path d="M3 12h18"/>"##,
+        );
+        assert!(ICON.starts_with(r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24""#));
+        assert!(ICON.contains(r##"<circle cx="12" cy="12" r="9"/><path d="M3 12h18"/>"##));
+        assert!(ICON.ends_with("</svg>"));
     }
 
     #[test]

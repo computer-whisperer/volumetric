@@ -513,7 +513,11 @@ pub extern "C" fn get_metadata() -> i64 {
             display_name: "Boolean".to_string(),
             description: "Combine two models by union, subtraction, or intersection.".to_string(),
             category: "Combine".to_string(),
-            icon_svg: String::new(),
+            icon_svg: volumetric_abi::icon_svg!(
+                r##"<rect x="3" y="3" width="12" height="12" rx="2"/>"##,
+                r##"<rect x="9" y="9" width="12" height="12" rx="2"/>"##,
+            )
+            .to_string(),
             inputs: vec![
                 OperatorMetadataInput::ModelWASM,
                 OperatorMetadataInput::ModelWASM,

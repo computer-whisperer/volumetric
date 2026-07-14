@@ -473,7 +473,12 @@ pub extern "C" fn get_metadata() -> i64 {
                 "Generate an explicit strut lattice (Bar2 mesh) filling a 3D domain model."
                     .to_string(),
             category: "Lattice".to_string(),
-            icon_svg: String::new(),
+            icon_svg: volumetric_abi::icon_svg!(
+                r##"<path d="M3 19h18"/>"##,
+                r##"<path d="m3 19 4.5-8 4.5 8 4.5-8 4.5 8"/>"##,
+                r##"<path d="M7.5 11h9"/>"##,
+            )
+            .to_string(),
             inputs: vec![
                 OperatorMetadataInput::ModelWASM,
                 OperatorMetadataInput::CBORConfiguration(schema),

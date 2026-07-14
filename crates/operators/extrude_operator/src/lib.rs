@@ -449,7 +449,12 @@ pub extern "C" fn get_metadata() -> i64 {
             description: "Sweep a profile model along a plane's normal, adding a dimension."
                 .to_string(),
             category: "Construction".to_string(),
-            icon_svg: String::new(),
+            icon_svg: volumetric_abi::icon_svg!(
+                r##"<rect x="4" y="16" width="16" height="5" rx="1"/>"##,
+                r##"<path d="M12 12V3"/>"##,
+                r##"<path d="m8 7 4-4 4 4"/>"##,
+            )
+            .to_string(),
             inputs: vec![
                 OperatorMetadataInput::ModelWASM,
                 OperatorMetadataInput::CBORConfiguration(schema),

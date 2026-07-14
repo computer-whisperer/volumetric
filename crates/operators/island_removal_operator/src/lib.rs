@@ -1099,7 +1099,13 @@ pub extern "C" fn get_metadata() -> i64 {
             display_name: "Island Removal".to_string(),
             description: "Ablate geometry unsupported along the build direction.".to_string(),
             category: "Fabrication".to_string(),
-            icon_svg: String::new(),
+            icon_svg: volumetric_abi::icon_svg!(
+                r##"<path d="M3 21h18"/>"##,
+                r##"<path d="M6 21v-5a3 3 0 0 1 6 0v5"/>"##,
+                r##"<circle cx="17.5" cy="7.5" r="2.5"/>"##,
+                r##"<path d="m21 4-7 7"/>"##,
+            )
+            .to_string(),
             inputs: vec![
                 OperatorMetadataInput::ModelWASM,
                 OperatorMetadataInput::CBORConfiguration(schema),

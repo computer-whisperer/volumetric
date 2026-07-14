@@ -1002,7 +1002,11 @@ pub extern "C" fn get_metadata() -> i64 {
             description: "Grow a print-bed adhesion brim from the first-layer footprint."
                 .to_string(),
             category: "Fabrication".to_string(),
-            icon_svg: String::new(),
+            icon_svg: volumetric_abi::icon_svg!(
+                r##"<path d="M8 14v-3a4 4 0 0 1 8 0v3"/>"##,
+                r##"<ellipse cx="12" cy="17" rx="9" ry="3"/>"##,
+            )
+            .to_string(),
             inputs: vec![
                 OperatorMetadataInput::ModelWASM,
                 OperatorMetadataInput::CBORConfiguration(schema),

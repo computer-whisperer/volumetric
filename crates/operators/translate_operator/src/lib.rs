@@ -324,7 +324,15 @@ pub extern "C" fn get_metadata() -> i64 {
             display_name: "Translate".to_string(),
             description: "Move a model by a configurable (dx, dy, dz) offset.".to_string(),
             category: "Transforms".to_string(),
-            icon_svg: String::new(),
+            icon_svg: volumetric_abi::icon_svg!(
+                r##"<path d="M12 2v20"/>"##,
+                r##"<path d="M2 12h20"/>"##,
+                r##"<path d="m9 5 3-3 3 3"/>"##,
+                r##"<path d="m9 19 3 3 3-3"/>"##,
+                r##"<path d="m5 9-3 3 3 3"/>"##,
+                r##"<path d="m19 9 3 3-3 3"/>"##,
+            )
+            .to_string(),
             inputs: vec![
                 OperatorMetadataInput::ModelWASM,
                 OperatorMetadataInput::CBORConfiguration(schema),

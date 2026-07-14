@@ -508,7 +508,12 @@ pub extern "C" fn get_metadata() -> i64 {
             display_name: "Lattice".to_string(),
             description: "Fill a 3D model with a density-modulated implicit lattice.".to_string(),
             category: "Lattice".to_string(),
-            icon_svg: String::new(),
+            icon_svg: volumetric_abi::icon_svg!(
+                r##"<path d="M3 12 12 3l9 9-9 9Z"/>"##,
+                r##"<path d="m7.5 7.5 9 9"/>"##,
+                r##"<path d="m16.5 7.5-9 9"/>"##,
+            )
+            .to_string(),
             inputs: vec![
                 OperatorMetadataInput::ModelWASM,
                 OperatorMetadataInput::CBORConfiguration(schema),

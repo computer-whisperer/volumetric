@@ -113,3 +113,14 @@ fea_core = { path = "crates/fea_core", features = ["parallel"] }
 [[example]]
 name = "profile_fea_inverse"
 required-features = ["native"]
+
+# Debug-profile wasmtime compiles wasm ~10x slower than release, and dev
+# workflows compile wasm constantly (UI run/scan jobs, module-metadata
+# reads — the heavy modules take seconds each at opt-level 0). Optimizing
+# just the codegen crates keeps `cargo build` incremental speed while
+# making every dev-build wasm compile near release speed; release builds
+# are unaffected.
+[profile.dev.package.cranelift-codegen]
+opt-level = 3
+[profile.dev.package.regalloc2]
+opt-level = 3

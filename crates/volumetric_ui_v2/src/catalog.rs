@@ -15,6 +15,7 @@
 //! runtime-loaded modules join the same enumerate → hash → cache/scan path
 //! in a later chunk.
 
+use damascene_core::SvgIcon;
 use sha2::{Digest, Sha256};
 use volumetric::OperatorMetadata;
 use volumetric_assets::AssetCategory;
@@ -43,6 +44,11 @@ pub struct CatalogEntry {
     pub hash: String,
     /// Declared metadata state.
     pub metadata: CatalogMetadata,
+    /// The declared `icon_svg`, parsed once when metadata arrives (SVG
+    /// parsing is too slow to repeat per frame). `None` when metadata is
+    /// unknown, the module declares no icon, or its SVG fails to parse
+    /// (logged; the UI falls back to the category glyph).
+    pub icon: Option<SvgIcon>,
 }
 
 impl CatalogEntry {
@@ -94,6 +100,7 @@ impl Default for Catalog {
                 kind: asset.category,
                 hash: hex_sha256(asset.bytes),
                 metadata: CatalogMetadata::Pending,
+                icon: None,
             })
             .collect();
         Self {
@@ -150,6 +157,7 @@ impl Catalog {
         };
         match result {
             Ok(metadata) => {
+                entry.icon = parse_declared_icon(metadata);
                 entry.metadata = CatalogMetadata::Ready(metadata.clone());
                 self.persist();
             }
@@ -203,6 +211,7 @@ mod persistence {
             self.cache_path = Some(path);
             for entry in &mut self.entries {
                 if let Some(metadata) = cached.remove(&entry.hash) {
+                    entry.icon = super::parse_declared_icon(&metadata);
                     entry.metadata = CatalogMetadata::Ready(metadata);
                 }
             }
@@ -274,6 +283,25 @@ mod persistence {
     }
 }
 
+/// Parse a module's declared `icon_svg`, if any. A malformed SVG is the
+/// module author's bug, not the host's: log it and show the category
+/// glyph instead.
+fn parse_declared_icon(metadata: &OperatorMetadata) -> Option<SvgIcon> {
+    if metadata.icon_svg.is_empty() {
+        return None;
+    }
+    match SvgIcon::parse_current_color(&metadata.icon_svg) {
+        Ok(icon) => Some(icon),
+        Err(err) => {
+            log::warn!(
+                "module {} declares an unparseable icon_svg: {err}",
+                metadata.name
+            );
+            None
+        }
+    }
+}
+
 fn hex_sha256(bytes: &[u8]) -> String {
     use std::fmt::Write;
     let digest = Sha256::digest(bytes);
@@ -295,7 +323,8 @@ mod tests {
             display_name: "Pretty Name".to_string(),
             description: "A test module.".to_string(),
             category: "Testing".to_string(),
-            icon_svg: String::new(),
+            icon_svg: r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#000" stroke-width="2"><circle cx="12" cy="12" r="9"/></svg>"##
+                .to_string(),
             inputs: vec![],
             input_names: vec![],
             outputs: vec![],
@@ -316,6 +345,8 @@ mod tests {
 
         catalog.on_metadata(&first, &Ok(ready_metadata(&first)));
         assert_eq!(catalog.display_name(&first), "Pretty Name");
+        // The declared icon parsed alongside the metadata.
+        assert!(catalog.get(&first).unwrap().icon.is_some());
 
         // Resolution frees the slot for the next pending entry.
         if catalog
@@ -347,6 +378,65 @@ mod tests {
         assert_eq!(catalog.display_name(&name), "Pretty Name");
     }
 
+    /// Every bundled module declares complete catalog metadata — display
+    /// name, category, and an `icon_svg` that actually parses. The guard
+    /// that keeps the hand-authored SVG strings in the module crates
+    /// honest (they're only ever parsed at render time otherwise).
+    #[test]
+    fn bundled_modules_declare_parseable_icons() {
+        let mut catalog = Catalog::default();
+        let names: Vec<String> = catalog.entries().iter().map(|e| e.name.clone()).collect();
+        // Each read compiles a module with wasmtime — seconds apiece for
+        // the heavy ones in debug builds — so read them all in parallel.
+        let results: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = names
+                .iter()
+                .map(|name| {
+                    scope.spawn(move || {
+                        let asset = volumetric_assets::get_asset(name).expect("bundled asset");
+                        volumetric::operator_metadata_from_wasm_bytes(asset.bytes)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for (name, result) in names.iter().zip(results) {
+            let metadata =
+                result.unwrap_or_else(|err| panic!("{name}: metadata read failed: {err}"));
+            assert!(!metadata.display_name.is_empty(), "{name}: no display_name");
+            assert!(!metadata.category.is_empty(), "{name}: no category");
+            assert!(!metadata.icon_svg.is_empty(), "{name}: no icon_svg");
+            catalog.on_metadata(name, &Ok(metadata));
+            assert!(
+                catalog.get(name).unwrap().icon.is_some(),
+                "{name}: icon_svg failed to parse"
+            );
+        }
+    }
+
+    /// A module declaring no icon or a malformed one gets `icon: None`
+    /// (the UI falls back to the category glyph) without failing the
+    /// entry's metadata.
+    #[test]
+    fn missing_or_malformed_icons_fall_back_without_failing_the_entry() {
+        let mut catalog = Catalog::default();
+        let Some(name) = catalog.entries().first().map(|e| e.name.clone()) else {
+            return;
+        };
+
+        let mut none_declared = ready_metadata(&name);
+        none_declared.icon_svg = String::new();
+        catalog.on_metadata(&name, &Ok(none_declared));
+        assert!(catalog.get(&name).unwrap().icon.is_none());
+
+        let mut malformed = ready_metadata(&name);
+        malformed.icon_svg = "<svg not even close".to_string();
+        catalog.on_metadata(&name, &Ok(malformed));
+        let entry = catalog.get(&name).unwrap();
+        assert!(entry.icon.is_none());
+        assert!(entry.ready().is_some());
+    }
+
     /// Ready metadata persists through the cache file and pre-fills a new
     /// catalog over the same bytes; foreign hashes survive the rewrite.
     #[test]
@@ -370,6 +460,8 @@ mod tests {
         let mut reloaded = Catalog::default();
         reloaded.attach_cache(path.clone());
         assert_eq!(reloaded.display_name(&name), "Pretty Name");
+        // Cache hits parse the declared icon too — no scan needed for it.
+        assert!(reloaded.get(&name).unwrap().icon.is_some());
         assert!(reloaded.foreign_cache.contains_key("not-a-current-module"));
         // The cache hit means nothing to scan for that entry.
         assert_ne!(reloaded.take_scan_request(), Some(name));

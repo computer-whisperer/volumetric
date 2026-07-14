@@ -8,7 +8,14 @@ fn main() {
         display_name: "Density Gradient".to_string(),
         description: "Solid cube with an x-gradient density channel, a playground input for density-driven lattices.".to_string(),
         category: "Lattice".to_string(),
-        icon_svg: String::new(),
+        icon_svg: volumetric_abi::icon_svg!(
+            r##"<path d="M4 4v16"/>"##,
+            r##"<path d="M10 4v16"/>"##,
+            r##"<path d="M15 4v16"/>"##,
+            r##"<path d="M18.5 4v16"/>"##,
+            r##"<path d="M21 4v16"/>"##,
+        )
+        .to_string(),
         inputs: vec![],
         input_names: vec![],
         outputs: vec![],

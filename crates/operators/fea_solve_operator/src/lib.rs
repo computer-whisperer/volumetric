@@ -189,7 +189,14 @@ pub extern "C" fn get_metadata() -> i64 {
         display_name: "FEA Solve".to_string(),
         description: "Compress an FEA mesh against a rigid implicit body with linear elasticity.".to_string(),
         category: "FEA".to_string(),
-        icon_svg: String::new(),
+        icon_svg: volumetric_abi::icon_svg!(
+            r##"<rect x="4" y="13" width="16" height="8" rx="1"/>"##,
+            r##"<path d="M8 3v6"/>"##,
+            r##"<path d="m6 7 2 2 2-2"/>"##,
+            r##"<path d="M16 3v6"/>"##,
+            r##"<path d="m14 7 2 2 2-2"/>"##,
+        )
+        .to_string(),
         inputs: vec![
             OperatorMetadataInput::FeaMesh,
             OperatorMetadataInput::ModelWASM,

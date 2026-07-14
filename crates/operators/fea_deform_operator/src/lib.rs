@@ -418,7 +418,11 @@ pub extern "C" fn get_metadata() -> i64 {
                 "Apply a solved mesh's displacement field to a model as a space deformation."
                     .to_string(),
             category: "FEA".to_string(),
-            icon_svg: String::new(),
+            icon_svg: volumetric_abi::icon_svg!(
+                r##"<path d="M4 4c5 3 11 3 16 0v16c-5 3-11 3-16 0Z"/>"##,
+                r##"<path d="M4 12c5 3 11 3 16 0"/>"##,
+            )
+            .to_string(),
             inputs: vec![
                 OperatorMetadataInput::ModelWASM,
                 OperatorMetadataInput::FeaMesh,

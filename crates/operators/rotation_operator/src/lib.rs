@@ -807,7 +807,11 @@ pub extern "C" fn get_metadata() -> i64 {
             display_name: "Rotation".to_string(),
             description: "Rotate a model by Euler angles in degrees.".to_string(),
             category: "Transforms".to_string(),
-            icon_svg: String::new(),
+            icon_svg: volumetric_abi::icon_svg!(
+                r##"<path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/>"##,
+                r##"<path d="M21 3v5h-5"/>"##,
+            )
+            .to_string(),
             inputs: vec![
                 OperatorMetadataInput::ModelWASM,
                 OperatorMetadataInput::CBORConfiguration(schema),

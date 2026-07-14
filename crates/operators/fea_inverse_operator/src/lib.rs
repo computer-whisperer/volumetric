@@ -238,7 +238,11 @@ pub extern "C" fn get_metadata() -> i64 {
         display_name: "FEA Inverse".to_string(),
         description: "Back out per-element stiffness matching a target interface force distribution.".to_string(),
         category: "FEA".to_string(),
-        icon_svg: String::new(),
+        icon_svg: volumetric_abi::icon_svg!(
+            r##"<path d="M9 14 4 9l5-5"/>"##,
+            r##"<path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/>"##,
+        )
+        .to_string(),
         inputs: vec![
             OperatorMetadataInput::FeaMesh,
             OperatorMetadataInput::ModelWASM,

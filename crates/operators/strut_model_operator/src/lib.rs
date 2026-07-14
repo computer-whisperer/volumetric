@@ -295,7 +295,11 @@ pub extern "C" fn get_metadata() -> i64 {
         display_name: "Strut Model".to_string(),
         description: "Realize a strut lattice as printable geometry, one capsule per strut.".to_string(),
         category: "Lattice".to_string(),
-        icon_svg: String::new(),
+        icon_svg: volumetric_abi::icon_svg!(
+            r##"<path d="M10.5 20.5 3.5 13.5a4.95 4.95 0 1 1 7-7l7 7a4.95 4.95 0 1 1-7 7Z"/>"##,
+            r##"<path d="m8.5 8.5 7 7"/>"##,
+        )
+        .to_string(),
         inputs: vec![
             OperatorMetadataInput::FeaMesh,
             OperatorMetadataInput::CBORConfiguration(

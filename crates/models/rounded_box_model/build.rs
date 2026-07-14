@@ -8,7 +8,10 @@ fn main() {
         display_name: "Rounded Box".to_string(),
         description: "Box with rounded edges centered at the origin.".to_string(),
         category: "Primitives".to_string(),
-        icon_svg: String::new(),
+        icon_svg: volumetric_abi::icon_svg!(
+            r##"<path d="M12 3c7.2 0 9 1.8 9 9s-1.8 9-9 9-9-1.8-9-9 1.8-9 9-9"/>"##,
+        )
+        .to_string(),
         inputs: vec![],
         input_names: vec![],
         outputs: vec![],

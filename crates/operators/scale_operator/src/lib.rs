@@ -338,7 +338,13 @@ pub extern "C" fn get_metadata() -> i64 {
             display_name: "Scale".to_string(),
             description: "Scale a model per axis about the origin.".to_string(),
             category: "Transforms".to_string(),
-            icon_svg: String::new(),
+            icon_svg: volumetric_abi::icon_svg!(
+                r##"<path d="M21 3 9 15"/>"##,
+                r##"<path d="M16 3h5v5"/>"##,
+                r##"<path d="M14 15H9v-5"/>"##,
+                r##"<path d="M21 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h6"/>"##,
+            )
+            .to_string(),
             inputs: vec![
                 OperatorMetadataInput::ModelWASM,
                 OperatorMetadataInput::CBORConfiguration(schema),

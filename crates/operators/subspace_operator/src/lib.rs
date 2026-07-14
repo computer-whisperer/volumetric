@@ -160,7 +160,12 @@ pub extern "C" fn get_metadata() -> i64 {
             description: "Build a point, line, plane, or frame subspace from numeric inputs."
                 .to_string(),
             category: "Construction".to_string(),
-            icon_svg: String::new(),
+            icon_svg: volumetric_abi::icon_svg!(
+                r##"<path d="m2 17 6-5h14l-6 5Z"/>"##,
+                r##"<path d="M12 13V4"/>"##,
+                r##"<path d="m9 7 3-3 3 3"/>"##,
+            )
+            .to_string(),
             inputs: vec![
                 OperatorMetadataInput::CBORConfiguration(schema),
                 OperatorMetadataInput::VecF64(3),

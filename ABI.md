@@ -192,6 +192,14 @@ enum OperatorMetadataOutput {
 }
 ```
 
+`icon_svg` is a complete SVG document: 24×24 viewBox, lucide-style 2px
+round strokes, every paint treated as `currentColor` so hosts tint it
+like a built-in icon. The `volumetric_abi::icon_svg!` macro wraps bare
+shape elements in the canonical header (usable in `const` position, and
+in the build scripts no_std models precompute their metadata CBOR from).
+Hosts fall back to a per-category stock glyph when it is empty or fails
+to parse — a bad icon never breaks cataloging.
+
 ### Operator Categories
 
 **Transform Operators** (translate, scale, rotate, boolean):

@@ -402,7 +402,16 @@ pub extern "C" fn get_metadata() -> i64 {
         description: "Turn a solved mesh's strain energy density into a variable-density model."
             .to_string(),
         category: "FEA".to_string(),
-        icon_svg: String::new(),
+        icon_svg: volumetric_abi::icon_svg!(
+            r##"<rect x="3" y="3" width="18" height="18" rx="2"/>"##,
+            r##"<path d="M12 7.5h.01"/>"##,
+            r##"<path d="M8.5 12h.01"/>"##,
+            r##"<path d="M15.5 12h.01"/>"##,
+            r##"<path d="M6.5 16.5h.01"/>"##,
+            r##"<path d="M12 16.5h.01"/>"##,
+            r##"<path d="M17.5 16.5h.01"/>"##,
+        )
+        .to_string(),
         inputs: vec![
             OperatorMetadataInput::FeaMesh,
             OperatorMetadataInput::ModelWASM,

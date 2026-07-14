@@ -294,7 +294,12 @@ pub extern "C" fn get_metadata() -> i64 {
         description: "Re-express a model in a subspace's chart as a lower-dimensional model."
             .to_string(),
         category: "Construction".to_string(),
-        icon_svg: String::new(),
+        icon_svg: volumetric_abi::icon_svg!(
+            r##"<path d="M3 13h18"/>"##,
+            r##"<path d="M21 13a9 9 0 0 1-18 0"/>"##,
+            r##"<path d="M6 6a8.5 8.5 0 0 1 12 0"/>"##,
+        )
+        .to_string(),
         inputs: vec![
             OperatorMetadataInput::ModelWASM,
             OperatorMetadataInput::Subspace,

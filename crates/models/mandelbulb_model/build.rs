@@ -8,7 +8,13 @@ fn main() {
         display_name: "Mandelbulb".to_string(),
         description: "Mandelbulb fractal solid, a 3D Mandelbrot-like set.".to_string(),
         category: "Primitives".to_string(),
-        icon_svg: String::new(),
+        icon_svg: volumetric_abi::icon_svg!(
+            r##"<circle cx="12" cy="14" r="6"/>"##,
+            r##"<circle cx="12" cy="5.5" r="2.5"/>"##,
+            r##"<circle cx="5" cy="10.5" r="2"/>"##,
+            r##"<circle cx="19" cy="10.5" r="2"/>"##,
+        )
+        .to_string(),
         inputs: vec![],
         input_names: vec![],
         outputs: vec![],

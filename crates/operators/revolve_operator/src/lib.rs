@@ -409,7 +409,13 @@ pub extern "C" fn get_metadata() -> i64 {
         display_name: "Revolve".to_string(),
         description: "Spin a profile model around an axis into a solid of revolution.".to_string(),
         category: "Construction".to_string(),
-        icon_svg: String::new(),
+        icon_svg: volumetric_abi::icon_svg!(
+            r##"<ellipse cx="12" cy="4" rx="5" ry="1.5"/>"##,
+            r##"<path d="M7 4C10 7 10 9 8 12 6 15 6 17 7 20"/>"##,
+            r##"<path d="M17 4c-3 3-3 5-1 8 2 3 2 5 1 8"/>"##,
+            r##"<path d="M7 20a5 1.5 0 0 0 10 0"/>"##,
+        )
+        .to_string(),
         inputs: vec![
             OperatorMetadataInput::ModelWASM,
             OperatorMetadataInput::Subspace,

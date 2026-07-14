@@ -210,7 +210,12 @@ pub extern "C" fn get_metadata() -> i64 {
             description: "Load an image file as a 2D scalar-field model of pixel luminance."
                 .to_string(),
             category: "Import".to_string(),
-            icon_svg: String::new(),
+            icon_svg: volumetric_abi::icon_svg!(
+                r##"<rect x="3" y="3" width="18" height="18" rx="2"/>"##,
+                r##"<circle cx="9" cy="9" r="2"/>"##,
+                r##"<path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/>"##,
+            )
+            .to_string(),
             inputs: vec![
                 OperatorMetadataInput::Blob,
                 OperatorMetadataInput::CBORConfiguration(schema),

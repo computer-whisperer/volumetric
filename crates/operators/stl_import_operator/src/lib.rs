@@ -232,7 +232,12 @@ pub extern "C" fn get_metadata() -> i64 {
             description: "Read an STL file (binary or ASCII) as an explicit triangle mesh."
                 .to_string(),
             category: "Import".to_string(),
-            icon_svg: String::new(),
+            icon_svg: volumetric_abi::icon_svg!(
+                r##"<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/>"##,
+                r##"<path d="M14 2v4a2 2 0 0 0 2 2h4"/>"##,
+                r##"<path d="m12 11-3 5h6Z"/>"##,
+            )
+            .to_string(),
             inputs: vec![
                 OperatorMetadataInput::Blob,
                 OperatorMetadataInput::CBORConfiguration(schema),

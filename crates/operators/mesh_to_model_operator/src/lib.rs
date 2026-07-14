@@ -129,7 +129,12 @@ pub extern "C" fn get_metadata() -> i64 {
         description: "Convert a triangle mesh into a sampleable model via BVH ray parity."
             .to_string(),
         category: "Mesh".to_string(),
-        icon_svg: String::new(),
+        icon_svg: volumetric_abi::icon_svg!(
+            r##"<path d="M12 3a9 9 0 0 1 0 18"/>"##,
+            r##"<path d="M12 3 5.5 7.5v9l6.5 4.5"/>"##,
+            r##"<path d="M12 3v18"/>"##,
+        )
+        .to_string(),
         inputs: vec![OperatorMetadataInput::TriMesh],
         input_names: vec!["Mesh".to_string()],
         outputs: vec![OperatorMetadataOutput::ModelWASM],

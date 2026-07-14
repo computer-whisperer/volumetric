@@ -369,7 +369,11 @@ pub extern "C" fn get_metadata() -> i64 {
                 "Turn a 2D scalar field into a 3D solid whose top surface follows the field."
                     .to_string(),
             category: "Construction".to_string(),
-            icon_svg: String::new(),
+            icon_svg: volumetric_abi::icon_svg!(
+                r##"<path d="M3 20h18"/>"##,
+                r##"<path d="m4 20 5-10 3 5 3-7 5 12"/>"##,
+            )
+            .to_string(),
             inputs: vec![
                 OperatorMetadataInput::ModelWASM,
                 OperatorMetadataInput::CBORConfiguration(schema),

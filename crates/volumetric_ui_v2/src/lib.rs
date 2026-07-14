@@ -39,9 +39,10 @@ static PIN_ICON: LazyLock<SvgIcon> = LazyLock::new(|| {
 });
 
 /// Category glyphs for Add-catalog entries — lucide path data like the
-/// icons above. A module's own declared `icon_svg` will take precedence
-/// once a parse cache lands in the catalog; until then entries draw their
-/// category's glyph (kind fallbacks: `activity` / `settings`).
+/// icons above. A module's own declared `icon_svg` (parsed once, cached
+/// on its [`catalog::CatalogEntry`]) takes precedence; these cover
+/// entries that declare none and unscanned entries (kind fallbacks:
+/// `activity` / `settings`).
 macro_rules! category_icon {
     ($name:ident, $body:literal) => {
         static $name: LazyLock<SvgIcon> = LazyLock::new(|| {
@@ -91,9 +92,13 @@ category_icon!(
     r##"<polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/>"##
 );
 
-/// The icon slot source for a catalog entry: its category's glyph, with
-/// per-kind fallbacks while the entry is unscanned or uncategorized.
+/// The icon slot source for a catalog entry: the module's own declared
+/// icon when it parsed, else its category's glyph, with per-kind
+/// fallbacks while the entry is unscanned or uncategorized.
 fn catalog_icon_source(entry: &catalog::CatalogEntry) -> IconSource {
+    if let Some(icon) = &entry.icon {
+        return IconSource::Custom(icon.clone());
+    }
     let category = entry
         .ready()
         .map(|metadata| metadata.category.as_str())
@@ -5884,6 +5889,28 @@ pub fn shell_bundle(viewport: Rect) -> damascene_core::bundle::artifact::Bundle 
     damascene_core::bundle::artifact::render_bundle(&mut tree, viewport)
 }
 
+/// Every catalog entry's browse row over a catalog warmed synchronously
+/// from the bundled module bytes — the headless review sheet for each
+/// module's declared display metadata and hand-authored icon. Unlike the
+/// real Add modal, nothing is Pending and no scroll area clips the list.
+pub fn catalog_sheet_bundle(viewport: Rect) -> damascene_core::bundle::artifact::Bundle {
+    let mut app = VolumetricUiV2::default();
+    let names: Vec<String> = app
+        .catalog
+        .entries()
+        .iter()
+        .map(|entry| entry.name.clone())
+        .collect();
+    for name in &names {
+        let asset = volumetric_assets::get_asset(name).expect("bundled asset");
+        let result = volumetric::operator_metadata_from_wasm_bytes(asset.bytes)
+            .map_err(|err| err.to_string());
+        app.catalog.on_metadata(name, &result);
+    }
+    let mut tree = column(add_browse_rows(&app)).gap(tokens::SPACE_1);
+    damascene_core::bundle::artifact::render_bundle(&mut tree, viewport)
+}
+
 /// Like [`shell_bundle`], with the mesh-export modal open over a synthetic
 /// tetrahedron — the headless-artifact view of the export dialog.
 pub fn export_modal_bundle(viewport: Rect) -> damascene_core::bundle::artifact::Bundle {
@@ -7499,6 +7526,7 @@ mod tests {
                     input_names: vec![],
                     outputs: vec![],
                 }),
+                icon: None,
             };
             // Forces the LazyLock (and with it the parse) for each glyph.
             let _ = catalog_icon_source(&entry);

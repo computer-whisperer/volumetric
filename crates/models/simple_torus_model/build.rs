@@ -8,7 +8,11 @@ fn main() {
         display_name: "Simple Torus".to_string(),
         description: "Solid torus centered at the origin.".to_string(),
         category: "Primitives".to_string(),
-        icon_svg: String::new(),
+        icon_svg: volumetric_abi::icon_svg!(
+            r##"<ellipse cx="12" cy="12" rx="9" ry="5"/>"##,
+            r##"<ellipse cx="12" cy="12" rx="4" ry="2"/>"##,
+        )
+        .to_string(),
         inputs: vec![],
         input_names: vec![],
         outputs: vec![],

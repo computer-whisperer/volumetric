@@ -172,7 +172,12 @@ pub extern "C" fn get_metadata() -> i64 {
         description: "Mesh a 3D model into a regular hex8 grid for finite-element work."
             .to_string(),
         category: "FEA".to_string(),
-        icon_svg: String::new(),
+        icon_svg: volumetric_abi::icon_svg!(
+            r##"<rect x="3" y="3" width="18" height="18" rx="1"/>"##,
+            r##"<path d="M12 3v18"/>"##,
+            r##"<path d="M3 12h18"/>"##,
+        )
+        .to_string(),
         inputs: vec![
             OperatorMetadataInput::ModelWASM,
             OperatorMetadataInput::CBORConfiguration("{ resolution: int .default 16 }".to_string()),

@@ -8,7 +8,12 @@ fn main() {
         display_name: "Gyroid Lattice".to_string(),
         description: "Finite chunk of a gyroid lattice surface.".to_string(),
         category: "Lattice".to_string(),
-        icon_svg: String::new(),
+        icon_svg: volumetric_abi::icon_svg!(
+            r##"<path d="M2 6c3.3-4 6.7-4 10 0s6.7 4 10 0"/>"##,
+            r##"<path d="M2 12c3.3-4 6.7-4 10 0s6.7 4 10 0"/>"##,
+            r##"<path d="M2 18c3.3-4 6.7-4 10 0s6.7 4 10 0"/>"##,
+        )
+        .to_string(),
         inputs: vec![],
         input_names: vec![],
         outputs: vec![],

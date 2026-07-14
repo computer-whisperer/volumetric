@@ -92,7 +92,14 @@ pub extern "C" fn get_metadata() -> i64 {
             display_name: "Model Bound".to_string(),
             description: "Select a bounding-box feature of a model, face, edge, corner, or frame, as a subspace.".to_string(),
             category: "Construction".to_string(),
-            icon_svg: String::new(),
+            icon_svg: volumetric_abi::icon_svg!(
+                r##"<path d="M3 7V5a2 2 0 0 1 2-2h2"/>"##,
+                r##"<path d="M17 3h2a2 2 0 0 1 2 2v2"/>"##,
+                r##"<path d="M21 17v2a2 2 0 0 1-2 2h-2"/>"##,
+                r##"<path d="M7 21H5a2 2 0 0 1-2-2v-2"/>"##,
+                r##"<rect x="8" y="8" width="8" height="8" rx="1"/>"##,
+            )
+            .to_string(),
             inputs: vec![
                 OperatorMetadataInput::ModelWASM,
                 OperatorMetadataInput::CBORConfiguration(schema),
