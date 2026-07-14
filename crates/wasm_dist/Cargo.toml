@@ -1,0 +1,9 @@
+[package]
+name = "wasm_dist"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Only for wasm::variant (pure byte munging) — no engine features.
+volumetric = { path = "../..", default-features = false }
+anyhow = "1"

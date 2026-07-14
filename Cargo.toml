@@ -69,6 +69,7 @@ members = [
     "crates/volumetric_protocol",
     "crates/volumetric_daemon",
     "crates/meshing_lab",
+    "crates/wasm_dist",
 ]
 
 [features]

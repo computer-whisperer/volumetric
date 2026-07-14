@@ -5675,6 +5675,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasm_dist"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "volumetric",
+]
+
+[[package]]
 name = "wasmparser"
 version = "0.245.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

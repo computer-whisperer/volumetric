@@ -41,6 +41,7 @@
 
 pub mod error;
 pub mod traits;
+pub mod variant;
 
 #[cfg(feature = "native")]
 pub mod native;

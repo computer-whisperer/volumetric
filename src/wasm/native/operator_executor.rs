@@ -716,8 +716,19 @@ pub struct NativeOperatorExecutor {
 }
 
 impl NativeOperatorExecutor {
-    /// Create a new executor from WASM bytes.
+    /// Create a new executor from WASM bytes. Packed operators (see
+    /// `wasm::variant`) run their embedded wasm32-wasip1-threads build;
+    /// set `VOLUMETRIC_DISABLE_THREADED_OPERATORS=1` to force the
+    /// single-threaded baseline for debugging or benchmarking.
     pub fn new(wasm_bytes: &[u8]) -> Result<Self, WasmBackendError> {
+        let wasm_bytes = match crate::wasm::variant::threaded_variant(wasm_bytes) {
+            Some(variant)
+                if std::env::var_os("VOLUMETRIC_DISABLE_THREADED_OPERATORS").is_none() =>
+            {
+                variant
+            }
+            _ => wasm_bytes,
+        };
         let cache = operator_cache();
         let engine = cache.engine().clone();
         let module = cache.get_or_compile(wasm_bytes)?;
@@ -1179,6 +1190,43 @@ mod tests {
             .run_cancellable(OperatorIo::new(vec![b"hello".to_vec()]), &cancel)
             .expect("threaded IO run should succeed");
         assert_eq!(io.outputs.get(&0).map(Vec::as_slice), Some(&b"hello"[..]));
+    }
+
+    /// A packed blob (baseline + embedded threaded variant) must run the
+    /// variant: the two modules post different bytes to output 0.
+    #[test]
+    fn packed_blob_runs_the_embedded_variant() {
+        let post_const = |value: &str, threaded: bool| {
+            let memory = if threaded {
+                r#"(import "env" "memory" (memory 1 2 shared))
+                   (export "memory" (memory 0))
+                   (func (export "wasi_thread_start") (param i32 i32))"#
+                    .to_string()
+            } else {
+                r#"(memory (export "memory") 1)"#.to_string()
+            };
+            wat::parse_str(format!(
+                r#"(module
+                    (import "host" "post_output" (func $post (param i32 i32 i32)))
+                    {memory}
+                    (data (i32.const 0) "{value}")
+                    (func (export "run")
+                        (call $post (i32.const 0) (i32.const 0) (i32.const 4))))"#
+            ))
+            .unwrap()
+        };
+        let packed = crate::wasm::variant::embed_threaded_variant(
+            &post_const("base", false),
+            &post_const("fast", true),
+        )
+        .unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let io = NativeOperatorExecutor::new(&packed)
+            .unwrap()
+            .run_cancellable(OperatorIo::new(vec![]), &cancel)
+            .expect("packed run should succeed");
+        assert_eq!(io.outputs.get(&0).map(Vec::as_slice), Some(&b"fast"[..]));
     }
 
     /// Metadata retrieval must read back through a shared memory export.
