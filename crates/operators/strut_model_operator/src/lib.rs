@@ -28,12 +28,12 @@
 //! The realized model carries the mesh's per-strut FEA scalars as sample
 //! channels: `sample` is unchanged occupancy, and `sample_channels` also
 //! reports, for each declared channel, the raw value of the strut that owns
-//! the sampled point. `channels` names the element fields to expose
-//! (comma-separated; empty = every scalar element field present, e.g.
-//! `radius`, `stiffness_scale`, `strain_energy_density`), each as a
-//! `Custom("fea.<name>")` channel. At most five fit alongside occupancy (the
-//! 3D IO buffer's output capacity). Values pass through raw — the transfer
-//! clips act on the geometry, not the channels.
+//! the sampled point. `channels` is the list of element fields to expose
+//! (empty = every scalar element field present, e.g. `radius`,
+//! `stiffness_scale`, `strain_energy_density`), each as a `Custom("fea.<name>")`
+//! channel. At most five fit alongside occupancy (the 3D IO buffer's output
+//! capacity). Values pass through raw — the transfer clips act on the
+//! geometry, not the channels.
 //!
 //! Mechanism: `strut_model_core::build_payload` bakes the capsules, the BVH,
 //! and the per-strut channel rows; the payload is patched into the embedded
@@ -48,7 +48,7 @@
 //!   `{ radius_exponent: float .default 4.0, scale_min: float .default 0.0,
 //!   scale_max: float .default 0.0, min_radius: float .default 0.0,
 //!   max_radius: float .default 0.0, displacement_scale: float .default 0.0,
-//!   channels: tstr .default "" }`
+//!   channels: [* tstr] }`
 //!
 //! Output 0: ModelWASM (3D; occupancy plus the passthrough channels; bounds =
 //! capsule extents).
@@ -98,10 +98,10 @@ struct StrutModelConfig {
     /// Realize node positions displaced by this multiple of the solved
     /// `displacement` field (0 = rest shape).
     displacement_scale: f64,
-    /// Comma-separated element-field names to pass through as sample channels
-    /// (empty = every scalar element field present). Each becomes a `Custom`
-    /// channel carrying the strut's raw value.
-    channels: String,
+    /// Element-field names to pass through as sample channels (empty = every
+    /// scalar element field present). Each becomes a `Custom` channel carrying
+    /// the strut's raw value.
+    channels: Vec<String>,
 }
 
 impl Default for StrutModelConfig {
@@ -113,7 +113,7 @@ impl Default for StrutModelConfig {
             min_radius: 0.0,
             max_radius: 0.0,
             displacement_scale: 0.0,
-            channels: String::new(),
+            channels: Vec::new(),
         }
     }
 }
@@ -129,12 +129,12 @@ struct Realized {
     channel_values: Vec<f32>,
 }
 
-/// The element-field scalars to pass through as channels: an explicit
-/// comma-separated list, or (empty) every scalar element field present.
-fn select_channels<'a>(mesh: &'a FeaMesh, spec: &str) -> Result<Vec<&'a FeaField>, String> {
+/// The element-field scalars to pass through as channels: an explicit list of
+/// names, or (empty) every scalar element field present.
+fn select_channels<'a>(mesh: &'a FeaMesh, spec: &[String]) -> Result<Vec<&'a FeaField>, String> {
     let requested: Vec<&str> = spec
-        .split(',')
-        .map(str::trim)
+        .iter()
+        .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .collect();
     if requested.is_empty() {
@@ -454,7 +454,7 @@ pub extern "C" fn get_metadata() -> i64 {
         inputs: vec![
             OperatorMetadataInput::FeaMesh,
             OperatorMetadataInput::CBORConfiguration(
-                "{ radius_exponent: float .default 4.0, scale_min: float .default 0.0, scale_max: float .default 0.0, min_radius: float .default 0.0, max_radius: float .default 0.0, displacement_scale: float .default 0.0, channels: tstr .default \"\" }"
+                "{ radius_exponent: float .default 4.0, scale_min: float .default 0.0, scale_max: float .default 0.0, min_radius: float .default 0.0, max_radius: float .default 0.0, displacement_scale: float .default 0.0, channels: [* tstr] }"
                     .to_string(),
             ),
         ],
@@ -672,7 +672,7 @@ mod tests {
     #[test]
     fn explicit_channels_select_and_order_fields() {
         let config = StrutModelConfig {
-            channels: "strain_energy_density, radius".to_string(),
+            channels: vec!["strain_energy_density".into(), "radius".into()],
             ..Default::default()
         };
         let realized = realize(&solved_mesh(), &config).unwrap();
@@ -699,14 +699,14 @@ mod tests {
         let mesh = solved_mesh();
 
         let missing = StrutModelConfig {
-            channels: "nope".to_string(),
+            channels: vec!["nope".into()],
             ..Default::default()
         };
         let err = realize(&mesh, &missing).unwrap_err();
         assert!(err.contains("nope"), "unexpected error: {err}");
 
         let dup = StrutModelConfig {
-            channels: "radius, radius".to_string(),
+            channels: vec!["radius".into(), "radius".into()],
             ..Default::default()
         };
         let err = realize(&mesh, &dup).unwrap_err();
@@ -720,7 +720,7 @@ mod tests {
             data: vec![0.0; 6],
         });
         let non_scalar = StrutModelConfig {
-            channels: "gradient".to_string(),
+            channels: vec!["gradient".into()],
             ..Default::default()
         };
         let err = realize(&vec_mesh, &non_scalar).unwrap_err();

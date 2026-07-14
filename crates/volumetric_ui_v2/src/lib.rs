@@ -252,6 +252,12 @@ const CONFIG_FIELD_PREFIX: &str = "cfg:";
 const VEC_INPUT_PREFIX: &str = "vec:";
 const CONFIG_BOOL_PREFIX: &str = "cfg-bool:";
 const CONFIG_ENUM_PREFIX: &str = "cfg-enum:";
+/// Array (`[* T]`) element text inputs; key `cfg-list:{field}:{index}`.
+const CONFIG_LIST_PREFIX: &str = "cfg-list:";
+/// Append an element to an array field; key `cfg-list-add:{field}`.
+const CONFIG_LIST_ADD_PREFIX: &str = "cfg-list-add:";
+/// Remove an array element; key `cfg-list-del:{field}:{index}`.
+const CONFIG_LIST_DEL_PREFIX: &str = "cfg-list-del:";
 const LUA_SOURCE_KEY: &str = "lua-source";
 const PREVIEW_RESOLUTIONS: [usize; 13] =
     [16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024];
@@ -757,7 +763,10 @@ struct StepEditState {
 struct ConfigForm {
     input_idx: usize,
     fields: Vec<ConfigField>,
+    /// Edit buffers for scalar fields, keyed by field name.
     buffers: std::collections::BTreeMap<String, String>,
+    /// Per-element edit buffers for array (`List`) fields, keyed by field name.
+    lists: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 /// Editor state for a `LuaSource` input. The `source` buffer is the edit
@@ -2315,23 +2324,36 @@ impl VolumetricUiV2 {
             Some(ExecutionInput::Inline(bytes)) => operator_config::decode(bytes),
             _ => std::collections::BTreeMap::new(),
         };
-        let buffers = fields
-            .iter()
-            .map(|field| {
+        // Array fields keep one buffer per element in `lists`; scalar fields a
+        // single buffer in `buffers`.
+        let mut buffers = std::collections::BTreeMap::new();
+        let mut lists = std::collections::BTreeMap::new();
+        for field in &fields {
+            let value = current.get(&field.name);
+            if matches!(field.ty, ConfigFieldType::List { .. }) {
+                let elements = match value.or(field.default.as_ref()) {
+                    Some(ConfigValue::List(items)) => {
+                        items.iter().map(ConfigValue::to_display_string).collect()
+                    }
+                    _ => Vec::new(),
+                };
+                lists.insert(field.name.clone(), elements);
+            } else {
                 // An unset optional field shows an empty buffer (clearing the
                 // field is how it gets unset again).
-                let text = match current.get(&field.name) {
+                let text = match value {
                     Some(value) => value.to_display_string(),
                     None if field.optional => String::new(),
                     None => field.seed_value().to_display_string(),
                 };
-                (field.name.clone(), text)
-            })
-            .collect();
+                buffers.insert(field.name.clone(), text);
+            }
+        }
         Some(ConfigForm {
             input_idx,
             fields,
             buffers,
+            lists,
         })
     }
 
@@ -2603,10 +2625,45 @@ impl VolumetricUiV2 {
         let value = if field.optional && buffer.trim().is_empty() {
             None
         } else {
-            match ConfigValue::parse(&field.ty, buffer) {
+            // `field.parse` also rejects numeric values outside the declared
+            // bounds; a rejected edit leaves the buffer untouched, uncommitted.
+            match field.parse(buffer) {
                 Some(value) => Some(value),
                 None => return,
             }
+        };
+        self.write_config_value(step_idx, config, field_name, value);
+        self.mark_project_dirty();
+    }
+
+    /// Commit an array field from its per-element buffers: parse each non-empty
+    /// element as the element type, dropping blanks; a `[+ T]` list that ends
+    /// up empty (or any element that fails to parse) leaves the config
+    /// unchanged.
+    fn commit_config_list(&mut self, step_idx: usize, config: &ConfigForm, field_name: &str) {
+        let Some(field) = config.fields.iter().find(|f| f.name == field_name) else {
+            return;
+        };
+        let ConfigFieldType::List { element, min_len } = &field.ty else {
+            return;
+        };
+        let Some(buffers) = config.lists.get(field_name) else {
+            return;
+        };
+        let mut items = Vec::new();
+        for buffer in buffers.iter().filter(|b| !b.trim().is_empty()) {
+            match ConfigValue::parse(element, buffer) {
+                Some(value) => items.push(value),
+                None => return,
+            }
+        }
+        // An empty optional list unsets the field; otherwise honor `[+ T]`.
+        let value = if items.is_empty() && field.optional {
+            None
+        } else if items.len() < *min_len {
+            return;
+        } else {
+            Some(ConfigValue::List(items))
         };
         self.write_config_value(step_idx, config, field_name, value);
         self.mark_project_dirty();
@@ -2648,6 +2705,39 @@ impl VolumetricUiV2 {
         }
         if let Some(config) = edit.config.as_ref() {
             self.commit_config_buffer(edit.step_idx, config, field_name);
+        }
+        self.step_edit = Some(edit);
+    }
+
+    /// Append a blank element to an array field and re-commit.
+    fn add_config_list_element(&mut self, field_name: &str) {
+        let Some(mut edit) = self.step_edit.take() else {
+            return;
+        };
+        if let Some(config) = edit.config.as_mut()
+            && let Some(elements) = config.lists.get_mut(field_name)
+        {
+            elements.push(String::new());
+        }
+        if let Some(config) = edit.config.as_ref() {
+            self.commit_config_list(edit.step_idx, config, field_name);
+        }
+        self.step_edit = Some(edit);
+    }
+
+    /// Remove the element at `index` from an array field and re-commit.
+    fn remove_config_list_element(&mut self, field_name: &str, index: usize) {
+        let Some(mut edit) = self.step_edit.take() else {
+            return;
+        };
+        if let Some(config) = edit.config.as_mut()
+            && let Some(elements) = config.lists.get_mut(field_name)
+            && index < elements.len()
+        {
+            elements.remove(index);
+        }
+        if let Some(config) = edit.config.as_ref() {
+            self.commit_config_list(edit.step_idx, config, field_name);
         }
         self.step_edit = Some(edit);
     }
@@ -3190,6 +3280,30 @@ impl App for VolumetricUiV2 {
                 return;
             }
         }
+        // Controlled text editing for array (List) field elements.
+        if let Some(rest) = event
+            .target_key()
+            .and_then(|key| key.strip_prefix(CONFIG_LIST_PREFIX))
+            .map(str::to_string)
+            && let Some((field_name, index)) = rest
+                .rsplit_once(':')
+                .and_then(|(n, i)| Some((n.to_string(), i.parse::<usize>().ok()?)))
+            && let Some(mut edit) = self.step_edit.take()
+        {
+            let key = format!("{CONFIG_LIST_PREFIX}{field_name}:{index}");
+            let mut changed = false;
+            if let Some(config) = edit.config.as_mut()
+                && let Some(elements) = config.lists.get_mut(&field_name)
+                && let Some(buffer) = elements.get_mut(index)
+            {
+                changed = text_input::apply_event(buffer, &mut self.selection, &event, &key);
+            }
+            if changed && let Some(config) = edit.config.as_ref() {
+                self.commit_config_list(edit.step_idx, config, &field_name);
+            }
+            self.step_edit = Some(edit);
+            return;
+        }
         // Controlled text editing for VecF64 component fields.
         if let Some(rest) = event
             .target_key()
@@ -3663,6 +3777,14 @@ impl App for VolumetricUiV2 {
         } else if let Some(rest) = route.strip_prefix(CONFIG_ENUM_PREFIX) {
             if let Some((field_name, value)) = rest.split_once(':') {
                 self.set_config_buffer(field_name, value.to_string());
+            }
+        } else if let Some(field_name) = route.strip_prefix(CONFIG_LIST_ADD_PREFIX) {
+            self.add_config_list_element(field_name);
+        } else if let Some(rest) = route.strip_prefix(CONFIG_LIST_DEL_PREFIX) {
+            if let Some((field_name, index)) = rest.rsplit_once(':')
+                && let Ok(index) = index.parse::<usize>()
+            {
+                self.remove_config_list_element(field_name, index);
             }
         }
     }
@@ -5551,12 +5673,21 @@ fn step_edit_rows(app: &VolumetricUiV2, step_idx: usize) -> Vec<El> {
     if let Some(config) = &edit.config {
         rows.push(text("Config").muted().caption().semibold());
         for field in &config.fields {
-            let buffer = config
-                .buffers
-                .get(&field.name)
-                .map(String::as_str)
-                .unwrap_or("");
-            rows.push(config_field_row(field, buffer, &app.selection));
+            if matches!(field.ty, ConfigFieldType::List { .. }) {
+                let elements = config
+                    .lists
+                    .get(&field.name)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                rows.push(config_list_field(field, elements, &app.selection));
+            } else {
+                let buffer = config
+                    .buffers
+                    .get(&field.name)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                rows.push(config_field_row(field, buffer, &app.selection));
+            }
         }
     }
 
@@ -5680,14 +5811,70 @@ fn config_field_row(field: &ConfigField, buffer: &str, selection: &Selection) ->
         )
         .width(Size::Fixed(132.0)),
     };
-    // Optional fields (CDDL `?`) are marked; clearing one unsets it and the
-    // operator's absent-field behavior applies.
-    let label = if field.optional {
-        format!("{} (optional)", field.name)
-    } else {
-        field.name.clone()
+    field_row(config_field_label(field), control).gap(tokens::SPACE_2)
+}
+
+/// A field's display label: the name, marked `(optional)` for CDDL `?`, with a
+/// `[min .. max]` suffix when the field declares numeric bounds.
+fn config_field_label(field: &ConfigField) -> String {
+    let mut label = field.name.clone();
+    if field.optional {
+        label.push_str(" (optional)");
+    }
+    let fmt = |n: f64| {
+        if n == n.trunc() {
+            format!("{}", n as i64)
+        } else {
+            format!("{n}")
+        }
     };
-    field_row(&label, control).gap(tokens::SPACE_2)
+    match (field.min, field.max) {
+        (Some(lo), Some(hi)) => label.push_str(&format!(" [{} .. {}]", fmt(lo), fmt(hi))),
+        (Some(lo), None) => label.push_str(&format!(" [\u{2265} {}]", fmt(lo))),
+        (None, Some(hi)) => label.push_str(&format!(" [\u{2264} {}]", fmt(hi))),
+        (None, None) => {}
+    }
+    label
+}
+
+/// The rich array editor: one text input per element with a remove button, and
+/// an add button. Element edits route through [`CONFIG_LIST_PREFIX`];
+/// add/remove through [`CONFIG_LIST_ADD_PREFIX`]/[`CONFIG_LIST_DEL_PREFIX`].
+fn config_list_field(field: &ConfigField, elements: &[String], selection: &Selection) -> El {
+    let name = &field.name;
+    let mut items: Vec<El> = elements
+        .iter()
+        .enumerate()
+        .map(|(i, element)| {
+            row([
+                text_input(
+                    &format!("{CONFIG_LIST_PREFIX}{name}:{i}"),
+                    element,
+                    selection,
+                )
+                .width(Size::Fill(1.0)),
+                button_with_icon("x", "")
+                    .xsmall()
+                    .secondary()
+                    .key(format!("{CONFIG_LIST_DEL_PREFIX}{name}:{i}")),
+            ])
+            .gap(tokens::SPACE_1)
+            .width(Size::Fill(1.0))
+        })
+        .collect();
+    items.push(
+        button_with_icon("plus", "Add")
+            .xsmall()
+            .secondary()
+            .width(Size::Fill(1.0))
+            .key(format!("{CONFIG_LIST_ADD_PREFIX}{name}")),
+    );
+    column([
+        text(config_field_label(field)).muted().caption(),
+        column(items).gap(tokens::SPACE_1).width(Size::Fill(1.0)),
+    ])
+    .gap(tokens::SPACE_1)
+    .width(Size::Fill(1.0))
 }
 
 fn config_enum_control(field_name: &str, options: &[String], buffer: &str) -> El {
@@ -8004,6 +8191,9 @@ mod tests {
                     app.set_config_buffer(&field_name, "hello".to_string());
                     ConfigValue::Text("hello".to_string())
                 }
+                // Array fields are edited element-by-element, not through the
+                // single-buffer setters this scalar-focused test drives.
+                ConfigFieldType::List { .. } => continue,
             };
 
             let step = &app.project().timeline()[step_idx];
@@ -8024,6 +8214,113 @@ mod tests {
             exercised,
             "expected at least one bundled operator with a config schema"
         );
+    }
+
+    /// Sets an array field's element buffers wholesale and commits, standing in
+    /// for the per-element text inputs.
+    fn set_list_elements(app: &mut VolumetricUiV2, field_name: &str, values: &[&str]) {
+        let mut edit = app.step_edit.take().expect("step edit");
+        if let Some(config) = edit.config.as_mut()
+            && let Some(elements) = config.lists.get_mut(field_name)
+        {
+            *elements = values.iter().map(|v| v.to_string()).collect();
+        }
+        if let Some(config) = edit.config.as_ref() {
+            app.commit_config_list(edit.step_idx, config, field_name);
+        }
+        app.step_edit = Some(edit);
+    }
+
+    /// The rich array editor (strut model's `channels: [* tstr]`): adding blank
+    /// elements, filling them in, and removing one all land in the step's CBOR
+    /// as an array.
+    #[test]
+    fn array_config_field_edits_as_a_cbor_array() {
+        let mut app = VolumetricUiV2::default();
+        add_operator_click(&mut app, "strut_model_operator");
+        app.before_build();
+
+        let edit = app.step_edit.as_ref().expect("step edit");
+        let config = edit.config.as_ref().expect("config form");
+        let step_idx = edit.step_idx;
+        let input_idx = config.input_idx;
+        let field_name = config
+            .fields
+            .iter()
+            .find(|f| matches!(f.ty, ConfigFieldType::List { .. }))
+            .expect("strut_model_operator declares an array field")
+            .name
+            .clone();
+
+        let channels = |app: &VolumetricUiV2| -> Option<ConfigValue> {
+            let step = &app.project().timeline()[step_idx];
+            let ExecutionInput::Inline(bytes) = &step.inputs[input_idx] else {
+                panic!("config input should be inline CBOR");
+            };
+            operator_config::decode(bytes).get(&field_name).cloned()
+        };
+        let list = |items: &[&str]| {
+            ConfigValue::List(
+                items
+                    .iter()
+                    .map(|s| ConfigValue::Text((*s).into()))
+                    .collect(),
+            )
+        };
+
+        // Default: an empty array (all-present semantics).
+        assert_eq!(channels(&app), Some(list(&[])));
+
+        // Two blank elements alone still commit as empty (blanks are dropped).
+        app.add_config_list_element(&field_name);
+        app.add_config_list_element(&field_name);
+        assert_eq!(channels(&app), Some(list(&[])));
+
+        // Filling them in yields the array, in order.
+        set_list_elements(&mut app, &field_name, &["stiffness_scale", "radius"]);
+        assert_eq!(channels(&app), Some(list(&["stiffness_scale", "radius"])));
+
+        // Removing the first element drops it.
+        app.remove_config_list_element(&field_name, 0);
+        assert_eq!(channels(&app), Some(list(&["radius"])));
+    }
+
+    /// Numeric bounds (`fea_grid_mesh`'s `resolution: int .ge 2 .le 128`) gate
+    /// edits: in-range commits, out-of-range is rejected and the last good
+    /// value stands.
+    #[test]
+    fn numeric_bounds_reject_out_of_range_edits() {
+        let mut app = VolumetricUiV2::default();
+        add_operator_click(&mut app, "fea_grid_mesh_operator");
+        app.before_build();
+
+        let edit = app.step_edit.as_ref().expect("step edit");
+        let config = edit.config.as_ref().expect("config form");
+        let step_idx = edit.step_idx;
+        let input_idx = config.input_idx;
+        let field = config
+            .fields
+            .iter()
+            .find(|f| f.name == "resolution")
+            .expect("resolution field")
+            .clone();
+        assert_eq!((field.min, field.max), (Some(2.0), Some(128.0)));
+
+        let resolution = |app: &VolumetricUiV2| -> Option<ConfigValue> {
+            let step = &app.project().timeline()[step_idx];
+            let ExecutionInput::Inline(bytes) = &step.inputs[input_idx] else {
+                panic!("config input should be inline CBOR");
+            };
+            operator_config::decode(bytes).get("resolution").cloned()
+        };
+
+        app.set_config_buffer("resolution", "32".to_string());
+        assert_eq!(resolution(&app), Some(ConfigValue::Int(32)));
+        // Below min and above max are both rejected; 32 stands.
+        app.set_config_buffer("resolution", "0".to_string());
+        assert_eq!(resolution(&app), Some(ConfigValue::Int(32)));
+        app.set_config_buffer("resolution", "9999".to_string());
+        assert_eq!(resolution(&app), Some(ConfigValue::Int(32)));
     }
 
     /// Optional (CDDL `?`) config fields start unset, appear in the CBOR only

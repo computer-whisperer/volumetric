@@ -11,8 +11,8 @@
 //!
 //! Inputs:
 //! - Input 0: ModelWASM (must be 3D)
-//! - Input 1: CBOR configuration `{ resolution: int .default 16 }` — grid
-//!   cells along the longest bounds axis (clamped to 2..=128; the other
+//! - Input 1: CBOR configuration `{ resolution: int .ge 2 .le 128 .default 16 }`
+//!   — grid cells along the longest bounds axis (clamped to 2..=128; the other
 //!   axes get the same cell size)
 //!
 //! Output 0: CBOR-encoded `FeaMesh` (hex8 elements, no fields).
@@ -180,7 +180,9 @@ pub extern "C" fn get_metadata() -> i64 {
         .to_string(),
         inputs: vec![
             OperatorMetadataInput::ModelWASM,
-            OperatorMetadataInput::CBORConfiguration("{ resolution: int .default 16 }".to_string()),
+            OperatorMetadataInput::CBORConfiguration(
+                "{ resolution: int .ge 2 .le 128 .default 16 }".to_string(),
+            ),
         ],
         input_names: vec!["Domain model".to_string(), "Config".to_string()],
         outputs: vec![OperatorMetadataOutput::FeaMesh],
