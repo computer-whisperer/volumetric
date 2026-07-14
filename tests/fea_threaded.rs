@@ -159,6 +159,26 @@ fn schwarz_config_matches_auto_solution_end_to_end() {
     );
 }
 
+/// Manual fixture writer for remote-daemon verification: writes the fine
+/// lattice-press project (schwarz config, packed operators) as a .vproj.
+///
+///   VPROJ_OUT=/tmp/lattice_schwarz.vproj cargo test --features native \
+///     --test fea_threaded write_lattice_press_vproj -- --ignored
+#[test]
+#[ignore]
+fn write_lattice_press_vproj() {
+    use ciborium::value::Value;
+    let out = std::env::var("VPROJ_OUT").expect("set VPROJ_OUT=<path>");
+    let project = lattice_press_project(
+        0.04,
+        cbor_map(&[("preconditioner", Value::Text("schwarz".into()))]),
+    );
+    project
+        .save_to_file(std::path::Path::new(&out))
+        .expect("write vproj");
+    println!("wrote {out}");
+}
+
 /// Manual timing probe (`cargo test --features native --test fea_threaded
 /// -- --ignored --nocapture`): the same fine lattice solved with each
 /// preconditioner. Set VOLUMETRIC_DISABLE_THREADED_OPERATORS=1 /
