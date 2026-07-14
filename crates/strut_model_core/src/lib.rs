@@ -10,30 +10,70 @@
 //! reads. Both sides live in this one crate, natively unit-tested, so the
 //! layout can't drift.
 //!
+//! Beyond geometry, the payload can carry per-strut *channel* values — the
+//! raw FEA element-field scalars the operator passes through — plus the
+//! opaque CBOR [`volumetric_abi::SampleFormat`] the template serves from
+//! `get_sample_format`. Channels are strut-indexed in the same leaf order as
+//! the capsules, so the strut index [`PayloadView::sample_owner`] returns
+//! indexes both the capsule and its channel row.
+//!
 //! # Payload layout (little-endian)
 //!
 //! ```text
-//! Header (64 bytes):
-//!    0  magic        u32   "STM1" (0x314D_5453)
-//!    4  strut_count  u32
-//!    8  node_count   u32
-//!   12  payload_len  u32   total byte length, header included
-//!   16  bounds       6xf64 [min_x, max_x, min_y, max_y, min_z, max_z]
-//! Nodes (node_count x 32 bytes at offset 64):
+//! Header (72 bytes):
+//!    0  magic          u32   "STM2" (0x324D_5453)
+//!    4  strut_count    u32
+//!    8  node_count     u32
+//!   12  payload_len    u32   total byte length, header included
+//!   16  bounds         6xf64 [min_x, max_x, min_y, max_y, min_z, max_z]
+//!   64  channel_count  u32   extra channels per strut (excludes occupancy)
+//!   68  format_len     u32   byte length of the trailing CBOR SampleFormat
+//! Nodes (node_count x 32 bytes at offset 72):
 //!    0  aabb_min  3xf32   capsule boxes, radius included
 //!   12  aabb_max  3xf32
 //!   24  a         u32     internal: left child; leaf: 0x8000_0000 | first
 //!   28  b         u32     internal: right child; leaf: capsule count
 //! Capsules (strut_count x 28 bytes after the nodes): 3xf32 a, 3xf32 b,
 //! f32 radius — reordered so each leaf's capsules are contiguous.
+//! Channel values (strut_count x channel_count x f32 after the capsules):
+//!   row for leaf-order strut e is channel_count f32s, same order as the
+//!   SampleFormat's extra channels.
+//! SampleFormat (format_len bytes at the very end): CBOR, stored verbatim.
 //! ```
 
-pub const MAGIC: u32 = 0x314D_5453; // "STM1"
-const HEADER_LEN: usize = 64;
+pub const MAGIC: u32 = 0x324D_5453; // "STM2"
+const HEADER_LEN: usize = 72;
 const NODE_LEN: usize = 32;
 const CAPSULE_LEN: usize = 28;
 const LEAF_FLAG: u32 = 0x8000_0000;
 const MAX_LEAF_CAPSULES: usize = 4;
+
+/// CBOR of the single-occupancy [`volumetric_abi::SampleFormat`] — the format
+/// an unpatched template (or an occupancy-only payload) reports through
+/// `get_sample_format`. Held here as literal bytes so the template stays free
+/// of the CBOR/ABI dependency; the operator crate guards it against
+/// `encode_sample_format(&SampleFormat::default())` in a unit test.
+pub const OCCUPANCY_FORMAT_CBOR: &[u8] = &[
+    161, 104, 99, 104, 97, 110, 110, 101, 108, 115, 129, 162, 100, 110, 97, 109, 101, 105, 111, 99,
+    99, 117, 112, 97, 110, 99, 121, 100, 107, 105, 110, 100, 105, 79, 99, 99, 117, 112, 97, 110,
+    99, 121,
+];
+
+/// Per-strut channel data to embed alongside the capsules. The caller builds
+/// the CBOR [`volumetric_abi::SampleFormat`] (this crate stays ABI-agnostic)
+/// and supplies one value row per strut, indexed like `capsules`.
+#[derive(Clone, Debug, Default)]
+pub struct ChannelPayload {
+    /// Number of extra channels per strut (excludes occupancy).
+    pub count: usize,
+    /// CBOR-encoded `SampleFormat` (occupancy + the extra channels), stored
+    /// verbatim and served by the template's `get_sample_format`.
+    pub format_cbor: Vec<u8>,
+    /// Per-strut values in the SAME order as `capsules`, row-major: strut `e`
+    /// occupies `values[e * count .. (e + 1) * count]`. Length must be
+    /// `capsules.len() * count`.
+    pub values: Vec<f32>,
+}
 
 /// One strut, realized as the segment `[a, b]` swept by `radius`.
 #[derive(Clone, Copy, Debug)]
@@ -44,9 +84,10 @@ pub struct Capsule {
 }
 
 /// Build the payload: BVH over the capsules' radius-inflated boxes, then
-/// leaf-ordered capsule records. Fails on an empty list and on non-finite
-/// or non-positive geometry.
-pub fn build_payload(capsules: &[Capsule]) -> Result<Vec<u8>, String> {
+/// leaf-ordered capsule records and their channel rows. Fails on an empty
+/// list, on non-finite or non-positive geometry, and on a channel-value
+/// count that doesn't match `strut_count x channel_count`.
+pub fn build_payload(capsules: &[Capsule], channels: &ChannelPayload) -> Result<Vec<u8>, String> {
     if capsules.is_empty() {
         return Err("no struts to realize".to_string());
     }
@@ -57,6 +98,14 @@ pub fn build_payload(capsules: &[Capsule]) -> Result<Vec<u8>, String> {
         if !(c.radius.is_finite() && c.radius > 0.0) {
             return Err(format!("strut {i} has invalid radius {}", c.radius));
         }
+    }
+    if channels.values.len() != capsules.len() * channels.count {
+        return Err(format!(
+            "channel values length {} does not match strut count {} x channel count {}",
+            channels.values.len(),
+            capsules.len(),
+            channels.count
+        ));
     }
 
     #[derive(Clone, Copy)]
@@ -140,7 +189,11 @@ pub fn build_payload(capsules: &[Capsule]) -> Result<Vec<u8>, String> {
         }
     }
 
-    let payload_len = HEADER_LEN + nodes.len() * NODE_LEN + capsules.len() * CAPSULE_LEN;
+    let payload_len = HEADER_LEN
+        + nodes.len() * NODE_LEN
+        + capsules.len() * CAPSULE_LEN
+        + capsules.len() * channels.count * 4
+        + channels.format_cbor.len();
     let mut out = Vec::with_capacity(payload_len);
     out.extend(MAGIC.to_le_bytes());
     out.extend((capsules.len() as u32).to_le_bytes());
@@ -149,6 +202,8 @@ pub fn build_payload(capsules: &[Capsule]) -> Result<Vec<u8>, String> {
     for v in &bounds {
         out.extend(v.to_le_bytes());
     }
+    out.extend((channels.count as u32).to_le_bytes());
+    out.extend((channels.format_cbor.len() as u32).to_le_bytes());
     for node in &nodes {
         for v in node.min {
             out.extend(v.to_le_bytes());
@@ -169,6 +224,14 @@ pub fn build_payload(capsules: &[Capsule]) -> Result<Vec<u8>, String> {
         }
         out.extend((capsule.radius as f32).to_le_bytes());
     }
+    // Channel rows, reordered to match the leaf-order capsules above.
+    for &c in &order {
+        let base = c as usize * channels.count;
+        for v in &channels.values[base..base + channels.count] {
+            out.extend(v.to_le_bytes());
+        }
+    }
+    out.extend_from_slice(&channels.format_cbor);
     debug_assert_eq!(out.len(), payload_len);
     Ok(out)
 }
@@ -177,6 +240,10 @@ pub fn build_payload(capsules: &[Capsule]) -> Result<Vec<u8>, String> {
 pub struct PayloadView<'a> {
     bytes: &'a [u8],
     node_count: usize,
+    strut_count: usize,
+    channel_count: usize,
+    format_off: usize,
+    format_len: usize,
 }
 
 impl<'a> PayloadView<'a> {
@@ -192,11 +259,24 @@ impl<'a> PayloadView<'a> {
         let strut_count = u32_at(4) as usize;
         let node_count = u32_at(8) as usize;
         let payload_len = u32_at(12) as usize;
-        let expected = HEADER_LEN + node_count * NODE_LEN + strut_count * CAPSULE_LEN;
+        let channel_count = u32_at(64) as usize;
+        let format_len = u32_at(68) as usize;
+        let format_off = HEADER_LEN
+            + node_count * NODE_LEN
+            + strut_count * CAPSULE_LEN
+            + strut_count * channel_count * 4;
+        let expected = format_off + format_len;
         if payload_len != expected || bytes.len() < expected {
             return Err("payload length mismatch");
         }
-        Ok(Self { bytes, node_count })
+        Ok(Self {
+            bytes,
+            node_count,
+            strut_count,
+            channel_count,
+            format_off,
+            format_len,
+        })
     }
 
     /// `[min_x, max_x, min_y, max_y, min_z, max_z]`.
@@ -204,6 +284,27 @@ impl<'a> PayloadView<'a> {
         std::array::from_fn(|i| {
             f64::from_le_bytes(self.bytes[16 + i * 8..24 + i * 8].try_into().unwrap())
         })
+    }
+
+    /// Number of extra channels per strut (excludes occupancy).
+    pub fn channel_count(&self) -> usize {
+        self.channel_count
+    }
+
+    /// `(offset, len)` of the embedded CBOR `SampleFormat` within these
+    /// payload bytes. The template adds the payload's base memory address to
+    /// the offset to hand `get_sample_format` a linear-memory pointer.
+    pub fn format_range(&self) -> (usize, usize) {
+        (self.format_off, self.format_len)
+    }
+
+    /// The `channel`-th extra channel value (0-based, occupancy excluded) for
+    /// the strut at leaf-order index `strut` — the index
+    /// [`Self::sample_owner`] returns. Out-of-range indices are the caller's
+    /// responsibility (the template only passes what it read from the header).
+    pub fn channel_value(&self, strut: usize, channel: usize) -> f32 {
+        let base = HEADER_LEN + self.node_count * NODE_LEN + self.strut_count * CAPSULE_LEN;
+        self.f32_at(base + (strut * self.channel_count + channel) * 4)
     }
 
     fn f32_at(&self, off: usize) -> f32 {
@@ -261,6 +362,59 @@ impl<'a> PayloadView<'a> {
         }
         false
     }
+
+    /// The leaf-order index of the strut that "owns" `p`: among the capsules
+    /// containing `p`, the one whose axis is nearest (minimum segment
+    /// distance), ties going to the lower index. `None` iff `p` is outside
+    /// every capsule (equivalently, `!is_inside(p)`). Feed the result to
+    /// [`Self::channel_value`]. Unlike [`Self::is_inside`], this visits every
+    /// containing capsule (no early-out) to find the nearest.
+    pub fn sample_owner(&self, p: [f64; 3]) -> Option<usize> {
+        if self.node_count == 0 {
+            return None;
+        }
+        let capsule_base = HEADER_LEN + self.node_count * NODE_LEN;
+        let mut stack = [0u32; 64];
+        let mut top = 0usize;
+        stack[top] = 0;
+        top += 1;
+        let mut best: Option<(usize, f64)> = None;
+
+        while top > 0 {
+            top -= 1;
+            let node = stack[top] as usize;
+            let base = HEADER_LEN + node * NODE_LEN;
+            let hit = (0..3).all(|axis| {
+                p[axis] >= self.f32_at(base + axis * 4) as f64
+                    && p[axis] <= self.f32_at(base + 12 + axis * 4) as f64
+            });
+            if !hit {
+                continue;
+            }
+            let a = self.u32_at(base + 24);
+            let b = self.u32_at(base + 28);
+            if a & LEAF_FLAG != 0 {
+                let first = (a & !LEAF_FLAG) as usize;
+                for c in first..first + b as usize {
+                    let off = capsule_base + c * CAPSULE_LEN;
+                    let ca: [f64; 3] = std::array::from_fn(|i| self.f32_at(off + i * 4) as f64);
+                    let cb: [f64; 3] =
+                        std::array::from_fn(|i| self.f32_at(off + 12 + i * 4) as f64);
+                    let radius = self.f32_at(off + 24) as f64;
+                    let d2 = segment_distance_squared(p, ca, cb);
+                    if d2 <= radius * radius && best.is_none_or(|(_, bd)| d2 < bd) {
+                        best = Some((c, d2));
+                    }
+                }
+            } else {
+                stack[top] = a;
+                top += 1;
+                stack[top] = b;
+                top += 1;
+            }
+        }
+        best.map(|(c, _)| c)
+    }
 }
 
 /// Squared distance from `p` to the segment `[a, b]` (degenerate segments
@@ -282,10 +436,15 @@ fn segment_distance_squared(p: [f64; 3], a: [f64; 3], b: [f64; 3]) -> f64 {
 mod tests {
     use super::*;
 
+    /// Occupancy-only payload (no channels) — the shape the geometry tests want.
+    fn occ_payload(capsules: &[Capsule]) -> Result<Vec<u8>, String> {
+        build_payload(capsules, &ChannelPayload::default())
+    }
+
     #[test]
     fn single_capsule_classifies_analytically() {
         // Unit segment along x at radius 0.1.
-        let payload = build_payload(&[Capsule {
+        let payload = occ_payload(&[Capsule {
             a: [0.0, 0.0, 0.0],
             b: [1.0, 0.0, 0.0],
             radius: 0.1,
@@ -307,7 +466,7 @@ mod tests {
 
     #[test]
     fn degenerate_capsule_is_a_sphere() {
-        let payload = build_payload(&[Capsule {
+        let payload = occ_payload(&[Capsule {
             a: [1.0, 2.0, 3.0],
             b: [1.0, 2.0, 3.0],
             radius: 0.5,
@@ -343,7 +502,7 @@ mod tests {
     #[test]
     fn bvh_matches_brute_force() {
         let capsules = strut_field();
-        let payload = build_payload(&capsules).unwrap();
+        let payload = occ_payload(&capsules).unwrap();
         let view = PayloadView::new(&payload).unwrap();
 
         // Brute force over the same f32-rounded capsules the payload holds.
@@ -379,7 +538,7 @@ mod tests {
     #[test]
     fn payload_round_trips_bounds() {
         let capsules = strut_field();
-        let payload = build_payload(&capsules).unwrap();
+        let payload = occ_payload(&capsules).unwrap();
         let view = PayloadView::new(&payload).unwrap();
         let bounds = view.bounds();
         for c in &capsules {
@@ -392,9 +551,9 @@ mod tests {
 
     #[test]
     fn empty_and_garbage_payloads_are_rejected() {
-        assert!(build_payload(&[]).is_err());
+        assert!(occ_payload(&[]).is_err());
         assert!(
-            build_payload(&[Capsule {
+            occ_payload(&[Capsule {
                 a: [0.0; 3],
                 b: [1.0, 0.0, 0.0],
                 radius: 0.0,
@@ -402,7 +561,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            build_payload(&[Capsule {
+            occ_payload(&[Capsule {
                 a: [f64::NAN, 0.0, 0.0],
                 b: [1.0, 0.0, 0.0],
                 radius: 0.1,
@@ -410,7 +569,7 @@ mod tests {
             .is_err()
         );
         assert!(PayloadView::new(&[0u8; 16]).is_err());
-        let mut bad = build_payload(&[Capsule {
+        let mut bad = occ_payload(&[Capsule {
             a: [0.0; 3],
             b: [1.0, 0.0, 0.0],
             radius: 0.1,
@@ -418,5 +577,88 @@ mod tests {
         .unwrap();
         bad[0] ^= 0xFF;
         assert!(PayloadView::new(&bad).is_err());
+    }
+
+    #[test]
+    fn channels_round_trip_in_leaf_order() {
+        // Three well-separated capsules with two channels each. Values are
+        // keyed to the strut so we can prove leaf reordering keeps rows glued
+        // to their capsule.
+        let capsules = vec![
+            Capsule {
+                a: [0.0, 0.0, 0.0],
+                b: [1.0, 0.0, 0.0],
+                radius: 0.1,
+            },
+            Capsule {
+                a: [0.0, 5.0, 0.0],
+                b: [1.0, 5.0, 0.0],
+                radius: 0.1,
+            },
+            Capsule {
+                a: [0.0, 10.0, 0.0],
+                b: [1.0, 10.0, 0.0],
+                radius: 0.1,
+            },
+        ];
+        let channels = ChannelPayload {
+            count: 2,
+            format_cbor: b"FORMAT-BYTES".to_vec(),
+            // strut e -> [10+e, 100+e]
+            values: vec![10.0, 100.0, 11.0, 101.0, 12.0, 102.0],
+        };
+        let payload = build_payload(&capsules, &channels).unwrap();
+        let view = PayloadView::new(&payload).unwrap();
+        assert_eq!(view.channel_count(), 2);
+
+        // The owning strut of a point on capsule e carries e's channel row,
+        // regardless of how the BVH reordered the capsules internally.
+        for (e, c) in capsules.iter().enumerate() {
+            let mid = [0.5, c.a[1], 0.0];
+            let owner = view.sample_owner(mid).expect("inside a capsule");
+            assert_eq!(view.channel_value(owner, 0), 10.0 + e as f32);
+            assert_eq!(view.channel_value(owner, 1), 100.0 + e as f32);
+        }
+
+        // The embedded format bytes round-trip via the declared range.
+        let (off, len) = view.format_range();
+        assert_eq!(&payload[off..off + len], b"FORMAT-BYTES");
+        assert_eq!(off + len, payload.len());
+
+        // Outside every capsule: no owner.
+        assert!(view.sample_owner([0.5, 2.5, 0.0]).is_none());
+    }
+
+    #[test]
+    fn sample_owner_picks_the_nearest_strut_at_a_shared_node() {
+        // Two struts meeting at the origin, forming an L in the xy-plane. A
+        // point near the +x arm's axis (but well off the +y arm) must be
+        // owned by the +x arm.
+        let capsules = vec![
+            Capsule {
+                a: [0.0, 0.0, 0.0],
+                b: [2.0, 0.0, 0.0],
+                radius: 0.3,
+            },
+            Capsule {
+                a: [0.0, 0.0, 0.0],
+                b: [0.0, 2.0, 0.0],
+                radius: 0.3,
+            },
+        ];
+        let channels = ChannelPayload {
+            count: 1,
+            format_cbor: OCCUPANCY_FORMAT_CBOR.to_vec(),
+            values: vec![7.0, 9.0], // +x arm -> 7, +y arm -> 9
+        };
+        let payload = build_payload(&capsules, &channels).unwrap();
+        let view = PayloadView::new(&payload).unwrap();
+
+        // On the +x arm's axis: distance 0 to strut 0, ~1 to strut 1.
+        let owner = view.sample_owner([1.0, 0.0, 0.0]).unwrap();
+        assert_eq!(view.channel_value(owner, 0), 7.0);
+        // On the +y arm's axis.
+        let owner = view.sample_owner([0.0, 1.0, 0.0]).unwrap();
+        assert_eq!(view.channel_value(owner, 0), 9.0);
     }
 }

@@ -268,4 +268,61 @@ fn designed_lattice_realizes_as_geometry_end_to_end() {
         stiff > 1.2 * soft,
         "expected stiffness contrast across the step: soft {soft}, stiff {stiff}"
     );
+
+    // Channel passthrough: the realized model exposes each scalar element
+    // field of the designed mesh as a sample channel, carrying the raw
+    // per-strut value of the strut that owns the sampled point.
+    let format = executor.sample_format().expect("sample format");
+    let channel_names: Vec<&str> = format.channels.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        channel_names,
+        [
+            "occupancy",
+            "radius",
+            "stiffness_scale",
+            "strain_energy_density"
+        ],
+        "declared channels"
+    );
+    let channel_idx = |name: &str| format.channels.iter().position(|c| c.name == name).unwrap();
+    let sed_field = designed
+        .element_fields
+        .iter()
+        .find(|f| f.name == "strain_energy_density")
+        .expect("designed mesh carries strain_energy_density");
+
+    // Sample channels at the stiff-side vertical strut's midpoint — on its
+    // axis, and more than half a cell from any other strut, so it is the
+    // unambiguous owner.
+    let e = vertical_strut_at(0.625);
+    let pair = designed.element(e);
+    let a = designed.node_position(pair[0] as usize);
+    let b = designed.node_position(pair[1] as usize);
+    let mid = [
+        0.5 * (a[0] + b[0]),
+        0.5 * (a[1] + b[1]),
+        0.5 * (a[2] + b[2]),
+    ];
+    let row = executor.sample_channels_nd(&mid).expect("sample channels");
+    assert_eq!(row.len(), format.channels.len());
+    assert!(row[0] > 0.5, "occupancy channel inside the strut");
+    // Values are stored and read back as f32 with no arithmetic, so equality
+    // is exact — which also proves the owning strut was selected correctly.
+    assert_eq!(row[channel_idx("radius")], base_radius as f32, "raw radius");
+    assert_eq!(
+        row[channel_idx("stiffness_scale")],
+        scale_field.data[e] as f32,
+        "raw stiffness_scale"
+    );
+    assert_eq!(
+        row[channel_idx("strain_energy_density")],
+        sed_field.data[e] as f32,
+        "raw strain_energy_density"
+    );
+
+    // Outside the solid there is no owner: occupancy 0 and every channel 0.
+    let outside = executor
+        .sample_channels_nd(&[1.3, 0.5, 0.5])
+        .expect("sample channels outside");
+    assert_eq!(outside, vec![0.0; format.channels.len()]);
 }

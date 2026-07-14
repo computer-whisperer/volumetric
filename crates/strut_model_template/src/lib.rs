@@ -7,6 +7,12 @@
 //! memoizes or mutates between `sample` calls, so instances have no
 //! warm-up and no state to invalidate.
 //!
+//! Alongside occupancy, the payload may carry per-strut channel values (raw
+//! FEA element-field scalars the operator passes through). `get_sample_format`
+//! serves the CBOR `SampleFormat` embedded in the payload, and
+//! `sample_channels` writes occupancy plus, for each extra channel, the value
+//! of the strut that owns the sampled point.
+//!
 //! # Patch contract
 //!
 //! - `strut_payload_slot() -> i32` returns the address of a 4-byte slot.
@@ -31,9 +37,11 @@
 //!    crates/operators/strut_model_operator/template/
 //! ```
 
-use strut_model_core::PayloadView;
+use strut_model_core::{OCCUPANCY_FORMAT_CBOR, PayloadView};
 
-/// Model-owned IO scratch region (2 * 3 f64s), per the Model ABI.
+/// Model-owned IO scratch region (2 * 3 f64s), per the Model ABI. The first
+/// three f64s hold the sample position; `sample_channels` writes its f32 row
+/// into the second half (up to six channels, the ABI's 3D output capacity).
 static mut IO_BUFFER: [f64; 6] = [0.0; 6];
 
 /// The 4-byte payload-base slot the operator patches. Aligned so the u32
@@ -42,12 +50,17 @@ static mut IO_BUFFER: [f64; 6] = [0.0; 6];
 struct Slot([u8; 4]);
 static PAYLOAD_SLOT: Slot = Slot([0; 4]);
 
+/// The patched payload's base address in linear memory (0 = unpatched).
+fn payload_base() -> usize {
+    // Volatile: the slot's compile-time value is zero, and the whole point
+    // is that the bytes change after compilation.
+    unsafe { core::ptr::read_volatile(PAYLOAD_SLOT.0.as_ptr() as *const u32) as usize }
+}
+
 /// The patched payload, if the slot has been filled and the header
 /// validates.
 fn payload() -> Option<PayloadView<'static>> {
-    // Volatile: the slot's compile-time value is zero, and the whole point
-    // is that the bytes change after compilation.
-    let base = unsafe { core::ptr::read_volatile(PAYLOAD_SLOT.0.as_ptr() as *const u32) } as usize;
+    let base = payload_base();
     if base == 0 {
         return None;
     }
@@ -89,5 +102,46 @@ pub extern "C" fn sample(pos_ptr: i32) -> f32 {
     match payload() {
         Some(view) if view.is_inside(p) => 1.0,
         _ => 0.0,
+    }
+}
+
+/// `(ptr, len)` of the CBOR `SampleFormat`, packed `ptr | (len << 32)`. A
+/// patched payload serves the format the operator embedded; an unpatched
+/// template reports the occupancy-only fallback.
+#[unsafe(no_mangle)]
+pub extern "C" fn get_sample_format() -> i64 {
+    let (ptr, len) = match payload() {
+        Some(view) => {
+            let (off, len) = view.format_range();
+            (payload_base() + off, len)
+        }
+        None => (
+            OCCUPANCY_FORMAT_CBOR.as_ptr() as usize,
+            OCCUPANCY_FORMAT_CBOR.len(),
+        ),
+    };
+    ((ptr as i64) & 0xFFFF_FFFF) | ((len as i64) << 32)
+}
+
+/// Write one f32 per declared channel at `out_ptr`: channel 0 is occupancy
+/// (matching `sample`), and each extra channel is the owning strut's raw
+/// field value (0 outside the solid — channels are only meaningful inside).
+#[unsafe(no_mangle)]
+pub extern "C" fn sample_channels(pos_ptr: i32, out_ptr: i32) {
+    // Read the position before touching the output region (they are disjoint
+    // halves of the IO buffer, but read-first keeps the contract explicit).
+    let p: [f64; 3] = core::array::from_fn(|i| unsafe {
+        core::ptr::read_unaligned((pos_ptr as usize + i * 8) as *const f64)
+    });
+    let write = |i: usize, v: f32| unsafe {
+        core::ptr::write_unaligned((out_ptr as usize + i * 4) as *mut f32, v);
+    };
+    let view = payload();
+    let owner = view.as_ref().and_then(|v| v.sample_owner(p));
+    write(0, if owner.is_some() { 1.0 } else { 0.0 });
+    if let Some(v) = view.as_ref() {
+        for c in 0..v.channel_count() {
+            write(1 + c, owner.map_or(0.0, |s| v.channel_value(s, c)));
+        }
     }
 }
