@@ -1881,6 +1881,10 @@ pub extern "C" fn get_metadata() -> i64 {
     volumetric_abi::metadata_reply(&METADATA, || OperatorMetadata {
         name: "lua_script_operator".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        display_name: "Lua Script".to_string(),
+        description: "Compile a restricted Lua script into a model module.".to_string(),
+        category: "Scripting".to_string(),
+        icon_svg: String::new(),
         inputs: vec![OperatorMetadataInput::LuaSource(LUA_TEMPLATE.to_string())],
         input_names: vec!["Script".to_string()],
         outputs: vec![OperatorMetadataOutput::ModelWASM],

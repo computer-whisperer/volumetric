@@ -5795,6 +5795,10 @@ mod tests {
         let metadata = volumetric::encode_metadata(&OperatorMetadata {
             name: name.to_string(),
             version: version.to_string(),
+            display_name: String::new(),
+            description: String::new(),
+            category: String::new(),
+            icon_svg: String::new(),
             inputs: vec![OperatorMetadataInput::ModelWASM],
             input_names: vec!["Model".to_string()],
             outputs: vec![volumetric::OperatorMetadataOutput::ModelWASM],

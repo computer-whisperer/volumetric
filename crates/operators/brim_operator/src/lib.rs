@@ -998,6 +998,11 @@ pub extern "C" fn get_metadata() -> i64 {
         OperatorMetadata {
             name: "brim_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            display_name: "Brim".to_string(),
+            description: "Grow a print-bed adhesion brim from the first-layer footprint."
+                .to_string(),
+            category: "Fabrication".to_string(),
+            icon_svg: String::new(),
             inputs: vec![
                 OperatorMetadataInput::ModelWASM,
                 OperatorMetadataInput::CBORConfiguration(schema),

@@ -156,6 +156,11 @@ pub extern "C" fn get_metadata() -> i64 {
         OperatorMetadata {
             name: "subspace_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            display_name: "Subspace".to_string(),
+            description: "Build a point, line, plane, or frame subspace from numeric inputs."
+                .to_string(),
+            category: "Construction".to_string(),
+            icon_svg: String::new(),
             inputs: vec![
                 OperatorMetadataInput::CBORConfiguration(schema),
                 OperatorMetadataInput::VecF64(3),

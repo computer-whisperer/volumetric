@@ -10,3 +10,6 @@ doctest = false
 
 [dependencies]
 volumetric_abi = { path = "../../volumetric_abi" }
+
+[build-dependencies]
+volumetric_abi = { path = "../../volumetric_abi" }

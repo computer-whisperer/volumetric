@@ -91,6 +91,18 @@
 //! models (channels are dropped, never silently mangled); position-only
 //! wrappers like transforms forward the format and wrap `sample_channels`
 //! exactly like `sample`.
+//!
+//! ## Optional: catalog metadata
+//!
+//! A model authored as a catalog entry (rather than produced mid-pipeline)
+//! may export `get_metadata() -> i64` exactly like an operator — `(ptr,
+//! len)` of CBOR-encoded [`OperatorMetadata`], packed with
+//! [`pack_ptr_len`] — with empty `inputs`/`outputs` and the display fields
+//! filled in. Hosts read it to list the model in Add catalogs; execution
+//! never calls it. Derived blobs may carry a stale copy inherited from the
+//! module they were built from (transform wrappers pass unknown exports
+//! through), so hosts must only treat it as authoritative for modules
+//! loaded from source files, never for pipeline outputs.
 
 use std::sync::OnceLock;
 
@@ -269,11 +281,33 @@ pub enum OperatorMetadataOutput {
     Subspace,
 }
 
-/// Metadata an operator returns from `get_metadata()`, CBOR-encoded.
+/// Metadata a module returns from `get_metadata()`, CBOR-encoded.
+///
+/// Operators must export this; models may (with empty `inputs`/`outputs`)
+/// so catalogs can display them without side tables. The display fields
+/// are what host catalogs render; all of them default to empty so metadata
+/// from modules built before they existed still decodes, and hosts treat
+/// empty as "not declared".
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct OperatorMetadata {
     pub name: String,
     pub version: String,
+    /// Human-readable catalog name (e.g. "Translate"); hosts fall back to
+    /// `name` when empty.
+    #[serde(default)]
+    pub display_name: String,
+    /// One-line summary for catalog rows/cards.
+    #[serde(default)]
+    pub description: String,
+    /// Free-form catalog grouping (e.g. "Transforms"); hosts group entries
+    /// by the verbatim string.
+    #[serde(default)]
+    pub category: String,
+    /// Monochrome SVG icon source (24×24 viewBox, `currentColor` paint,
+    /// lucide-style strokes); hosts tint it like a built-in icon and fall
+    /// back to a stock glyph when empty.
+    #[serde(default)]
+    pub icon_svg: String,
     pub inputs: Vec<OperatorMetadataInput>,
     /// Human-readable labels for `inputs`, parallel by index; hosts show
     /// `input_names[i]` next to input slot `i`. Defaulted so metadata from
@@ -285,6 +319,16 @@ pub struct OperatorMetadata {
 }
 
 impl OperatorMetadata {
+    /// The name catalogs display: `display_name`, falling back to `name`
+    /// for modules that don't declare one.
+    pub fn catalog_name(&self) -> &str {
+        if self.display_name.is_empty() {
+            &self.name
+        } else {
+            &self.display_name
+        }
+    }
+
     /// The declared label of input slot `idx`, if the operator provided a
     /// non-empty one.
     pub fn input_name(&self, idx: usize) -> Option<&str> {
@@ -441,6 +485,11 @@ mod tests {
         let metadata = OperatorMetadata {
             name: "test_operator".to_string(),
             version: "1.2.3".to_string(),
+            display_name: "Test Operator".to_string(),
+            description: "Round-trips every input kind.".to_string(),
+            category: "Testing".to_string(),
+            icon_svg: "<svg viewBox=\"0 0 24 24\"><circle cx=\"12\" cy=\"12\" r=\"9\"/></svg>"
+                .to_string(),
             inputs: vec![
                 OperatorMetadataInput::ModelWASM,
                 OperatorMetadataInput::CBORConfiguration("{ dx: float }".to_string()),
@@ -470,10 +519,12 @@ mod tests {
         assert_eq!(decoded, metadata);
         assert_eq!(metadata.input_name(0), Some("Model"));
         assert_eq!(metadata.input_name(7), None);
+        assert_eq!(metadata.catalog_name(), "Test Operator");
     }
 
-    /// Metadata CBOR from operators built before `input_names` existed
-    /// (no such map key) must still decode, with the field defaulted.
+    /// Metadata CBOR from operators built before `input_names` (and later
+    /// the display fields) existed must still decode, with the missing
+    /// fields defaulted to empty.
     #[test]
     fn metadata_without_input_names_decodes() {
         #[derive(serde::Serialize)]
@@ -499,6 +550,11 @@ mod tests {
         assert_eq!(decoded.name, "legacy");
         assert!(decoded.input_names.is_empty());
         assert_eq!(decoded.input_name(0), None);
+        assert!(decoded.display_name.is_empty());
+        assert!(decoded.description.is_empty());
+        assert!(decoded.category.is_empty());
+        assert!(decoded.icon_svg.is_empty());
+        assert_eq!(decoded.catalog_name(), "legacy");
     }
 
     #[test]

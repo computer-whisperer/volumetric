@@ -9,6 +9,7 @@
 //! Exports the N-dimensional model ABI plus the typed-channel extension:
 //! - `get_sample_format() -> i64`: [Occupancy, Density]
 //! - `sample_channels(pos_ptr: i32, out_ptr: i32)`: writes both channels
+//! - `get_metadata() -> i64`: Optional catalog metadata (CBOR, see ABI.md)
 
 use std::sync::OnceLock;
 use volumetric_abi::{ChannelKind, SampleChannel, SampleFormat};
@@ -92,4 +93,18 @@ pub extern "C" fn get_sample_format() -> i64 {
             },
         ],
     })
+}
+
+/// CBOR catalog metadata, precomputed by build.rs so the module carries no
+/// runtime CBOR encoder (most models are `no_std` on wasm32).
+static METADATA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/metadata.cbor"));
+
+/// Catalog metadata export (see ABI.md): `(ptr, len)` of CBOR-encoded
+/// `OperatorMetadata` with empty inputs/outputs, packed as `ptr | (len << 32)`.
+/// Read by host catalogs; never called during execution.
+#[unsafe(no_mangle)]
+pub extern "C" fn get_metadata() -> i64 {
+    let ptr = METADATA.as_ptr() as u32 as u64;
+    let len = METADATA.len() as u32 as u64;
+    (ptr | (len << 32)) as i64
 }

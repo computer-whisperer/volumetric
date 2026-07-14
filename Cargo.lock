@@ -2161,6 +2161,7 @@ name = "gyroid_lattice_model"
 version = "0.1.0"
 dependencies = [
  "libm",
+ "volumetric_abi",
 ]
 
 [[package]]
@@ -2849,6 +2850,7 @@ name = "mandelbulb_model"
 version = "0.1.0"
 dependencies = [
  "libm",
+ "volumetric_abi",
 ]
 
 [[package]]
@@ -4310,6 +4312,7 @@ name = "rounded_box_model"
 version = "0.1.0"
 dependencies = [
  "libm",
+ "volumetric_abi",
 ]
 
 [[package]]
@@ -4587,12 +4590,16 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 [[package]]
 name = "simple_sphere_model"
 version = "0.1.0"
+dependencies = [
+ "volumetric_abi",
+]
 
 [[package]]
 name = "simple_torus_model"
 version = "0.1.0"
 dependencies = [
  "libm",
+ "volumetric_abi",
 ]
 
 [[package]]

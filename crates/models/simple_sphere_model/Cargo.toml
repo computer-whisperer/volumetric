@@ -9,3 +9,6 @@ test = false
 doctest = false
 
 [dependencies]
+
+[build-dependencies]
+volumetric_abi = { path = "../../volumetric_abi" }

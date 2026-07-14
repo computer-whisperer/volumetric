@@ -335,6 +335,10 @@ pub extern "C" fn get_metadata() -> i64 {
         OperatorMetadata {
             name: "scale_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            display_name: "Scale".to_string(),
+            description: "Scale a model per axis about the origin.".to_string(),
+            category: "Transforms".to_string(),
+            icon_svg: String::new(),
             inputs: vec![
                 OperatorMetadataInput::ModelWASM,
                 OperatorMetadataInput::CBORConfiguration(schema),

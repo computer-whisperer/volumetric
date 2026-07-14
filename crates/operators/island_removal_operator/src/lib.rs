@@ -1096,6 +1096,10 @@ pub extern "C" fn get_metadata() -> i64 {
         OperatorMetadata {
             name: "island_removal_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            display_name: "Island Removal".to_string(),
+            description: "Ablate geometry unsupported along the build direction.".to_string(),
+            category: "Fabrication".to_string(),
+            icon_svg: String::new(),
             inputs: vec![
                 OperatorMetadataInput::ModelWASM,
                 OperatorMetadataInput::CBORConfiguration(schema),

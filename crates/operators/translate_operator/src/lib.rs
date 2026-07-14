@@ -321,6 +321,10 @@ pub extern "C" fn get_metadata() -> i64 {
         OperatorMetadata {
             name: "translate_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            display_name: "Translate".to_string(),
+            description: "Move a model by a configurable (dx, dy, dz) offset.".to_string(),
+            category: "Transforms".to_string(),
+            icon_svg: String::new(),
             inputs: vec![
                 OperatorMetadataInput::ModelWASM,
                 OperatorMetadataInput::CBORConfiguration(schema),

@@ -332,6 +332,10 @@ pub extern "C" fn get_metadata() -> i64 {
         OperatorMetadata {
             name: "rectangular_prism_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            display_name: "Rectangular Prism".to_string(),
+            description: "Generate a box model from configurable dimensions.".to_string(),
+            category: "Primitives".to_string(),
+            icon_svg: String::new(),
             inputs: vec![
                 OperatorMetadataInput::CBORConfiguration(schema),
                 OperatorMetadataInput::VecF64(3), // vector_a

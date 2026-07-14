@@ -19,6 +19,10 @@ fn operator_with_declared_outputs(outputs: Vec<OperatorMetadataOutput>) -> Vec<u
     let metadata = volumetric_abi::encode_metadata(&OperatorMetadata {
         name: "typed_outputs_test".to_string(),
         version: "0.0.0".to_string(),
+        display_name: String::new(),
+        description: String::new(),
+        category: String::new(),
+        icon_svg: String::new(),
         inputs: vec![],
         input_names: vec![],
         outputs: outputs.clone(),

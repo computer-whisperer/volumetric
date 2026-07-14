@@ -8,6 +8,7 @@
 //! - `get_bounds(out_ptr: i32)`: Writes interleaved min/max bounds
 //! - `sample(pos_ptr: i32) -> f32`: Reads position, returns density
 //! - `memory`: Linear memory export
+//! - `get_metadata() -> i64`: Optional catalog metadata (CBOR, see ABI.md)
 
 #[cfg(target_arch = "wasm32")]
 use core::panic::PanicInfo;
@@ -69,4 +70,18 @@ pub extern "C" fn sample(pos_ptr: i32) -> f32 {
     } else {
         0.0 // outside density
     }
+}
+
+/// CBOR catalog metadata, precomputed by build.rs so the module carries no
+/// runtime CBOR encoder (most models are `no_std` on wasm32).
+static METADATA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/metadata.cbor"));
+
+/// Catalog metadata export (see ABI.md): `(ptr, len)` of CBOR-encoded
+/// `OperatorMetadata` with empty inputs/outputs, packed as `ptr | (len << 32)`.
+/// Read by host catalogs; never called during execution.
+#[unsafe(no_mangle)]
+pub extern "C" fn get_metadata() -> i64 {
+    let ptr = METADATA.as_ptr() as u32 as u64;
+    let len = METADATA.len() as u32 as u64;
+    (ptr | (len << 32)) as i64
 }

@@ -174,6 +174,14 @@ enum InfoOutput {
 struct OperatorMetadataJson {
     name: String,
     version: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    display_name: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    description: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    category: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    icon_svg: String,
     inputs: Vec<InputInfo>,
     outputs: Vec<OutputInfo>,
 }
@@ -218,6 +226,10 @@ fn metadata_to_json(meta: &OperatorMetadata) -> OperatorMetadataJson {
     OperatorMetadataJson {
         name: meta.name.clone(),
         version: meta.version.clone(),
+        display_name: meta.display_name.clone(),
+        description: meta.description.clone(),
+        category: meta.category.clone(),
+        icon_svg: meta.icon_svg.clone(),
         inputs: meta
             .inputs
             .iter()
@@ -328,6 +340,18 @@ fn print_info_human(output: &InfoOutput) {
             println!("File size: {} bytes", file_size);
             println!("Name: {}", metadata.name);
             println!("Version: {}", metadata.version);
+            if !metadata.display_name.is_empty() {
+                println!("Display name: {}", metadata.display_name);
+            }
+            if !metadata.description.is_empty() {
+                println!("Description: {}", metadata.description);
+            }
+            if !metadata.category.is_empty() {
+                println!("Category: {}", metadata.category);
+            }
+            if !metadata.icon_svg.is_empty() {
+                println!("Icon: {} bytes of SVG", metadata.icon_svg.len());
+            }
             println!("Inputs:");
             for (i, input) in metadata.inputs.iter().enumerate() {
                 match input {

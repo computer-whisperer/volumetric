@@ -25,6 +25,12 @@ Models are WASM modules that define a volumetric occupancy function. They are st
 | `sample` | function | `(pos_ptr: i32) -> f32` | Sample density at position |
 | `memory` | memory | — | Linear memory for I/O buffers |
 
+### Optional Exports
+
+| Function | Signature | Purpose |
+|----------|-----------|---------|
+| `get_metadata` | `() -> i64` | Catalog metadata, same format as the operator export (empty `inputs`/`outputs`). Read by host catalogs; never called during execution. Only authoritative for modules loaded from source files — pipeline outputs may carry a stale copy inherited from a wrapped input. |
+
 ### Function Semantics
 
 #### `get_dimensions() -> u32`
@@ -149,13 +155,21 @@ Operators are WASM modules that transform or generate models. They read inputs f
 - Bits 0-31: Pointer to CBOR data in linear memory
 - Bits 32-63: Length of CBOR data
 
-The CBOR data encodes an `OperatorMetadata` struct:
+The CBOR data encodes an `OperatorMetadata` struct (authoritative
+definition and field docs in `crates/volumetric_abi`):
 
 ```rust
 struct OperatorMetadata {
     name: String,
     version: String,
+    // Display fields for host catalogs; all serde-defaulted, so metadata
+    // from modules built before they existed decodes with them empty.
+    display_name: String,       // catalog name; hosts fall back to `name`
+    description: String,        // one-line catalog summary
+    category: String,           // free-form catalog grouping
+    icon_svg: String,           // monochrome SVG (24×24, currentColor)
     inputs: Vec<OperatorMetadataInput>,
+    input_names: Vec<String>,   // labels parallel to `inputs`
     outputs: Vec<OperatorMetadataOutput>,
 }
 
@@ -165,10 +179,16 @@ enum OperatorMetadataInput {
     LuaSource(String),          // Template script
     Blob,                       // Raw binary data
     VecF64(usize),              // N f64 values
+    FeaMesh,                    // CBOR FEA mesh (explicit data)
+    TriMesh,                    // CBOR triangle mesh (explicit data)
+    Subspace,                   // CBOR affine subspace (explicit data)
 }
 
 enum OperatorMetadataOutput {
     ModelWASM,
+    FeaMesh,
+    TriMesh,
+    Subspace,
 }
 ```
 

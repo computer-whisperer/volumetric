@@ -206,6 +206,11 @@ pub extern "C" fn get_metadata() -> i64 {
         OperatorMetadata {
             name: "image_model_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            display_name: "Image".to_string(),
+            description: "Load an image file as a 2D scalar-field model of pixel luminance."
+                .to_string(),
+            category: "Import".to_string(),
+            icon_svg: String::new(),
             inputs: vec![
                 OperatorMetadataInput::Blob,
                 OperatorMetadataInput::CBORConfiguration(schema),
