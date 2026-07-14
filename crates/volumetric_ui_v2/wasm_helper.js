@@ -382,6 +382,13 @@ window.wasmOperatorCreate = function(bytes, inputs) {
                     state.error = new TextDecoder().decode(src);
                 },
 
+                // Cooperative-cancellation poll. The web host has no
+                // mid-run cancel mechanism, so this is always false — the
+                // import just has to exist for operators that poll it.
+                cancelled: function() {
+                    return 0;
+                },
+
                 // Number of dimensions of the model in an input slot
                 // (0 when the slot doesn't hold a usable model).
                 input_model_dimensions: function(idx) {

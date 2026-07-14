@@ -16,11 +16,32 @@ use std::process::Command;
 /// `threaded` feature) and packed as dual blobs.
 const THREADED_OPERATORS: &[&str] = &["fea_solve_operator", "fea_inverse_operator"];
 
-/// The threaded link needs an explicit shared-memory cap and the target's
-/// default (1 GiB) is too small for large FEA meshes. The maximum is
-/// reserved address space, not committed memory — 4 GiB costs nothing up
-/// front.
-const THREADED_RUSTFLAGS: &str = "-C link-arg=--max-memory=4294967296";
+/// Extra link flags for the threaded variants:
+/// - `--max-memory`: the target's default shared-memory cap (1 GiB) is too
+///   small for large FEA meshes; the maximum is reserved address space,
+///   not committed memory, so 4 GiB costs nothing up front.
+/// - `crt1-reactor.o`: cdylibs link no C runtime entry at all, leaving
+///   wasi-libc's thread runtime (pthread self, the thread list, main TLS)
+///   uninitialized — the first pthread-key operation then walks a garbage
+///   thread list and spins forever. The reactor crt exports `_initialize`,
+///   which the host calls once per instance before anything else.
+fn threaded_rustflags() -> String {
+    let sysroot = String::from_utf8(
+        Command::new("rustc")
+            .args(["--print", "sysroot"])
+            .output()
+            .expect("rustc --print sysroot")
+            .stdout,
+    )
+    .expect("sysroot is utf-8");
+    let crt = Path::new(sysroot.trim())
+        .join("lib/rustlib/wasm32-wasip1-threads/lib/self-contained/crt1-reactor.o");
+    assert!(crt.exists(), "missing reactor crt: {}", crt.display());
+    format!(
+        "-C link-arg=--max-memory=4294967296 -C link-arg={}",
+        crt.display()
+    )
+}
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -58,7 +79,7 @@ fn main() -> anyhow::Result<()> {
     if !rustflags.is_empty() {
         rustflags.push(' ');
     }
-    rustflags.push_str(THREADED_RUSTFLAGS);
+    rustflags.push_str(&threaded_rustflags());
     threaded.env("RUSTFLAGS", rustflags);
     run(threaded)?;
 

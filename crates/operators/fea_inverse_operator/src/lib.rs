@@ -228,6 +228,17 @@ fn run_inverse(config: &InverseOperatorConfig) -> Result<FeaMesh, String> {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn run() {
+    // Cancellation is cooperative: the solver polls the host between CG
+    // iterations. Mandatory for the threaded variant (the host cannot
+    // safely interrupt a guest thread pool) and a faster, cleaner exit
+    // for the plain build too.
+    fea_core::set_cancel_poll(volumetric_abi::host::cancelled);
+    // Threaded builds run the whole body on a host-sized rayon pool torn
+    // down before returning; plain builds call straight through.
+    volumetric_abi::threading::with_thread_pool(run_body);
+}
+
+fn run_body() {
     let config = {
         let buf = read_input(3);
         if buf.is_empty() {

@@ -5402,6 +5402,7 @@ name = "volumetric_abi"
 version = "0.1.0"
 dependencies = [
  "ciborium",
+ "rayon",
  "serde",
 ]
 

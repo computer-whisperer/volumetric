@@ -30,11 +30,14 @@ const CANCEL_POLL_PERIOD: Duration = Duration::from_millis(50);
 const THREAD_JOIN_GRACE: Duration = Duration::from_secs(2);
 
 /// State held in the WASM Store during operator execution. Threaded runs
-/// create one per instance (main + each spawned thread); the `error` and
-/// `cancelled` handles are shared across a run's stores.
+/// create one per instance (main + each spawned thread), and the IO surface
+/// (`inputs`, `outputs`, `error`) is shared across a run's stores so guest
+/// code can call host imports from whichever pool thread it lands on —
+/// rayon's `install` moves execution onto workers. Only `models` stays
+/// per-store (each thread lazily instantiates its own sampler).
 struct OperatorState {
-    inputs: Vec<Vec<u8>>,
-    outputs: HashMap<usize, Vec<u8>>,
+    inputs: Arc<Vec<Vec<u8>>>,
+    outputs: Arc<Mutex<HashMap<usize, Vec<u8>>>>,
     /// First failure of the run: an operator `host.post_error` message or a
     /// dead worker thread's report. First write wins.
     error: Arc<Mutex<Option<String>>>,
@@ -46,6 +49,7 @@ struct OperatorState {
     /// worker thread). The engine epoch is shared by every concurrently-
     /// running operator, so on an epoch bump each store's deadline callback
     /// consults this to decide whether *it* is the run being cancelled.
+    /// Exposed to the guest via `host.cancelled` for cooperative exits.
     cancelled: Arc<AtomicBool>,
 }
 
@@ -151,6 +155,8 @@ struct ThreadCtx {
     engine: Engine,
     module: Module,
     memory: SharedMemory,
+    inputs: Arc<Vec<Vec<u8>>>,
+    outputs: Arc<Mutex<HashMap<usize, Vec<u8>>>>,
     error: Arc<Mutex<Option<String>>>,
     cancelled: Arc<AtomicBool>,
     /// Guest stderr, captured via the `fd_write` stub — Rust panic messages
@@ -167,24 +173,22 @@ fn spawned_thread_main(ctx: Arc<ThreadCtx>, tid: i32, start_arg: i32) {
         let mut linker = build_linker(&ctx.engine, Some(&ctx))
             .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
         let state = OperatorState {
-            // Workers get no IO surface: inputs, outputs and model sampling
-            // are main-thread affairs; spawned threads compute on the shared
-            // memory. get_input_len reads 0 and sampling fails cleanly here.
-            inputs: Vec::new(),
-            outputs: HashMap::new(),
+            inputs: Arc::clone(&ctx.inputs),
+            outputs: Arc::clone(&ctx.outputs),
             error: Arc::clone(&ctx.error),
             models: HashMap::new(),
             cancelled: Arc::clone(&ctx.cancelled),
         };
         let mut store = Store::new(&ctx.engine, state);
         store.set_epoch_deadline(1);
-        store.epoch_deadline_callback(|ctx| {
-            if ctx.data().cancelled.load(Ordering::Relaxed) {
-                Err(wasmtime::Error::msg("operator run cancelled"))
-            } else {
-                Ok(UpdateDeadline::Continue(1))
-            }
-        });
+        // Never trap workers on cancel: guest thread pools synchronize
+        // through futexes the epoch cannot interrupt, so killing a worker
+        // mid-region would strand the threads waiting on its work — the
+        // exact deadlock cooperative cancellation (`host.cancelled`) exists
+        // to avoid. Cancelled runs exit through the guest's own poll (or
+        // the main store's trap as a backstop); workers just finish their
+        // current slice.
+        store.epoch_deadline_callback(|_| Ok(UpdateDeadline::Continue(1)));
         linker.define(&store, "env", "memory", ctx.memory.clone())?;
         let instance = linker.instantiate(&mut store, &ctx.module)?;
         let start = instance.get_typed_func::<(i32, i32), ()>(&mut store, "wasi_thread_start")?;
@@ -210,31 +214,21 @@ fn spawned_thread_main(ctx: Arc<ThreadCtx>, tid: i32, start_arg: i32) {
 }
 
 /// Join a finished run's worker threads. Well-behaved operators tear their
-/// thread pool down before returning, making this immediate; stragglers get
-/// one epoch kick (which traps compute loops) and a bounded wait. A thread
+/// thread pool down before returning, making this immediate. A thread
 /// parked in a guest futex (`memory.atomic.wait`) cannot be interrupted
-/// from the host — those are detached with a warning rather than hanging
-/// the executor.
+/// from the host, and trapping a computing worker would strand its pool's
+/// waiters — so stragglers get a bounded grace period and are then
+/// detached with a warning rather than hanging the executor.
 fn drain_threads(ctx: &ThreadCtx) {
     let handles: Vec<_> = std::mem::take(&mut *ctx.joins.lock().unwrap());
     if handles.is_empty() {
         return;
     }
 
-    let mut kicked = false;
-    let mut deadline = std::time::Instant::now() + THREAD_JOIN_GRACE;
+    let deadline = std::time::Instant::now() + THREAD_JOIN_GRACE;
     while handles.iter().any(|h| !h.is_finished()) {
         if std::time::Instant::now() > deadline {
-            if kicked {
-                break;
-            }
-            // Threads still computing hit their deadline callback on the
-            // next epoch check; `cancelled` is already true on failure
-            // paths, and setting it after a successful run is inert.
-            ctx.cancelled.store(true, Ordering::Relaxed);
-            ctx.engine.increment_epoch();
-            kicked = true;
-            deadline = std::time::Instant::now() + THREAD_JOIN_GRACE;
+            break;
         }
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -257,11 +251,18 @@ const ERRNO_INVAL: i32 = 28;
 
 /// The environ block handed to threaded guests: NUL-terminated KEY=VALUE
 /// entries. Thread-pool sizing is the only thing the guest needs from us —
-/// `available_parallelism` inside wasm has nothing to measure.
+/// `available_parallelism` inside wasm has nothing to measure. A
+/// `VOLUMETRIC_THREADS` variable in the host's own environment overrides
+/// the core count (daemon tuning, debugging).
 fn wasi_env_block() -> Vec<Vec<u8>> {
-    let threads = std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(1);
+    let threads = std::env::var("VOLUMETRIC_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(std::num::NonZeroUsize::get)
+                .unwrap_or(1)
+        });
     [
         format!("RAYON_NUM_THREADS={threads}"),
         format!("VOLUMETRIC_THREADS={threads}"),
@@ -551,8 +552,27 @@ fn build_linker(
                     return;
                 };
                 if let Some(bytes) = mem.read(&caller, ptr as usize, len.max(0) as usize) {
-                    caller.data_mut().outputs.insert(output_idx as usize, bytes);
+                    caller
+                        .data()
+                        .outputs
+                        .lock()
+                        .unwrap()
+                        .insert(output_idx as usize, bytes);
                 }
+            },
+        )
+        .map_err(instantiation)?;
+
+    // Host function: cooperative-cancellation poll. Long solves check this
+    // between iterations and unwind cleanly — for threaded operators it is
+    // the *primary* cancel path, because guest thread pools synchronize
+    // through futexes the epoch trap cannot interrupt.
+    linker
+        .func_wrap(
+            "host",
+            "cancelled",
+            |caller: Caller<'_, OperatorState>| -> i32 {
+                caller.data().cancelled.load(Ordering::Relaxed) as i32
             },
         )
         .map_err(instantiation)?;
@@ -751,8 +771,7 @@ impl NativeOperatorExecutor {
     /// module is a threaded variant.
     fn create_thread_ctx(
         &self,
-        error: &Arc<Mutex<Option<String>>>,
-        cancelled: &Arc<AtomicBool>,
+        state: &OperatorState,
     ) -> Result<Option<Arc<ThreadCtx>>, WasmBackendError> {
         let Some(memory_type) = &self.shared_memory else {
             return Ok(None);
@@ -763,11 +782,18 @@ impl NativeOperatorExecutor {
             engine: self.engine.clone(),
             module: self.module.clone(),
             memory,
-            error: Arc::clone(error),
-            cancelled: Arc::clone(cancelled),
+            inputs: Arc::clone(&state.inputs),
+            outputs: Arc::clone(&state.outputs),
+            error: Arc::clone(&state.error),
+            cancelled: Arc::clone(&state.cancelled),
             stderr: Arc::new(Mutex::new(Vec::new())),
             joins: Mutex::new(Vec::new()),
-            next_tid: AtomicI32::new(1),
+            // wasi-libc's main thread claims the low TIDs, and musl-style
+            // locks embed the owner's TID — a spawned thread reusing the
+            // main thread's ID makes those locks spin forever ("owner" is
+            // never not-self). Start well clear; the wasi-threads spec caps
+            // valid TIDs at 0x1FFFFFFF.
+            next_tid: AtomicI32::new(1024),
         })))
     }
 }
@@ -783,18 +809,20 @@ impl OperatorExecutor for NativeOperatorExecutor {
         io: OperatorIo,
         cancel: &AtomicBool,
     ) -> Result<OperatorIo, WasmBackendError> {
+        let inputs = Arc::new(io.inputs);
+        let outputs = Arc::new(Mutex::new(HashMap::new()));
         let error = Arc::new(Mutex::new(None));
         let cancelled = Arc::new(AtomicBool::new(false));
-        let thread_ctx = self.create_thread_ctx(&error, &cancelled)?;
-        let mut linker = build_linker(&self.engine, thread_ctx.as_ref())?;
-
         let state = OperatorState {
-            inputs: io.inputs,
-            outputs: HashMap::new(),
+            inputs: Arc::clone(&inputs),
+            outputs: Arc::clone(&outputs),
             error: Arc::clone(&error),
             models: HashMap::new(),
             cancelled: Arc::clone(&cancelled),
         };
+        let thread_ctx = self.create_thread_ctx(&state)?;
+        let mut linker = build_linker(&self.engine, thread_ctx.as_ref())?;
+
         let mut store = Store::new(&self.engine, state);
         // The engine has epoch interruption enabled, so the store needs a
         // deadline or it traps at the first check. The epoch only advances
@@ -819,6 +847,14 @@ impl OperatorExecutor for NativeOperatorExecutor {
         let instance = linker
             .instantiate(&mut store, &self.module)
             .map_err(|e| WasmBackendError::Instantiation(e.to_string()))?;
+
+        // Reactor protocol: crt initialization (wasi-libc's thread runtime,
+        // C constructors) must run before any other export. Only on the
+        // main instance — spawned threads initialize via wasi_thread_start.
+        if let Ok(init) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
+            init.call(&mut store, ())
+                .map_err(|e| WasmBackendError::Execution(format!("_initialize: {e}")))?;
+        }
 
         let run_func = instance
             .get_typed_func::<(), ()>(&mut store, "run")
@@ -868,13 +904,21 @@ impl OperatorExecutor for NativeOperatorExecutor {
             });
         }
 
+        // A cooperative exit (the guest saw host.cancelled and returned) is
+        // still a cancellation, whatever it wrote on its way out.
+        if cancel.load(Ordering::Relaxed) {
+            return Err(WasmBackendError::Cancelled);
+        }
         if let Some(msg) = error.lock().unwrap().take() {
             return Err(WasmBackendError::OperatorReported(msg));
         }
-        let state = store.into_data();
+        // Release the store's and thread context's handles so the input
+        // arc unwraps without copying.
+        drop(store);
+        drop(thread_ctx);
         Ok(OperatorIo {
-            inputs: state.inputs,
-            outputs: state.outputs,
+            inputs: Arc::try_unwrap(inputs).unwrap_or_else(|arc| arc.as_ref().clone()),
+            outputs: std::mem::take(&mut *outputs.lock().unwrap()),
         })
     }
 
@@ -913,6 +957,10 @@ impl OperatorExecutor for NativeOperatorExecutor {
                 "post_error",
                 |_caller: Caller<'_, ()>, _ptr: i32, _len: i32| {},
             )
+            .map_err(instantiation)?;
+
+        linker
+            .func_wrap("host", "cancelled", |_caller: Caller<'_, ()>| -> i32 { 0 })
             .map_err(instantiation)?;
 
         // Sampling imports stub to failure during metadata retrieval (there
@@ -979,6 +1027,12 @@ impl OperatorExecutor for NativeOperatorExecutor {
         let instance = linker
             .instantiate(&mut store, &self.module)
             .map_err(|e| WasmBackendError::Instantiation(e.to_string()))?;
+
+        // Reactor protocol, as in run_cancellable.
+        if let Ok(init) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
+            init.call(&mut store, ())
+                .map_err(|e| WasmBackendError::Execution(format!("_initialize: {e}")))?;
+        }
 
         let metadata_func = instance
             .get_typed_func::<(), i64>(&mut store, "get_metadata")
@@ -1190,6 +1244,74 @@ mod tests {
             .run_cancellable(OperatorIo::new(vec![b"hello".to_vec()]), &cancel)
             .expect("threaded IO run should succeed");
         assert_eq!(io.outputs.get(&0).map(Vec::as_slice), Some(&b"hello"[..]));
+    }
+
+    /// Host IO from a spawned thread: guest code runs on whichever pool
+    /// thread rayon's install lands it on, so workers see the run's inputs
+    /// and their posted outputs must reach the caller.
+    #[test]
+    fn worker_threads_share_the_runs_io_surface() {
+        let wasm = wat::parse_str(format!(
+            r#"(module
+                (import "env" "memory" (memory 1 4 shared))
+                (import "wasi" "thread-spawn" (func $spawn (param i32) (result i32)))
+                (import "host" "get_input_len" (func $len (param i32) (result i32)))
+                (import "host" "get_input_data" (func $data (param i32 i32 i32)))
+                (import "host" "post_output" (func $post (param i32 i32 i32)))
+                (export "memory" (memory 0))
+                {WAIT_FOR_COUNTER}
+                (func (export "wasi_thread_start") (param $tid i32) (param $arg i32)
+                    (local $n i32)
+                    (local.set $n (call $len (i32.const 0)))
+                    (call $data (i32.const 0) (i32.const 1024) (local.get $n))
+                    (call $post (i32.const 1) (i32.const 1024) (local.get $n))
+                    (drop (i32.atomic.rmw.add (i32.const 0) (i32.const 1))))
+                (func (export "run")
+                    (if (i32.le_s (call $spawn (i32.const 0)) (i32.const 0))
+                        (then unreachable))
+                    (call $wait_for (i32.const 1))))"#
+        ))
+        .unwrap();
+        let cancel = AtomicBool::new(false);
+        let io = NativeOperatorExecutor::new(&wasm)
+            .unwrap()
+            .run_cancellable(OperatorIo::new(vec![b"shared".to_vec()]), &cancel)
+            .expect("worker-IO run should succeed");
+        assert_eq!(io.outputs.get(&1).map(Vec::as_slice), Some(&b"shared"[..]));
+    }
+
+    /// `host.cancelled` flips once the caller's cancel flag is seen; a
+    /// guest polling it exits and the run reports Cancelled.
+    #[test]
+    fn cooperative_cancel_poll_reaches_the_guest() {
+        // Spins until host.cancelled() returns nonzero, then returns
+        // cleanly — no trap needed. Bounded by the same fuel scheme.
+        let wasm = wat::parse_str(
+            r#"(module
+                (import "host" "cancelled" (func $cancelled (result i32)))
+                (memory (export "memory") 1)
+                (func (export "run")
+                    (local $fuel i64)
+                    (local.set $fuel (i64.const 0x200000000))
+                    (loop $poll
+                        (local.set $fuel (i64.sub (local.get $fuel) (i64.const 1)))
+                        (if (i64.eqz (local.get $fuel)) (then unreachable))
+                        (br_if $poll (i32.eqz (call $cancelled))))))"#,
+        )
+        .unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancel);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            flag.store(true, Ordering::Relaxed);
+        });
+        let result = NativeOperatorExecutor::new(&wasm)
+            .unwrap()
+            .run_cancellable(OperatorIo::new(vec![]), &cancel);
+        assert!(
+            matches!(result, Err(WasmBackendError::Cancelled)),
+            "{result:?}"
+        );
     }
 
     /// A packed blob (baseline + embedded threaded variant) must run the

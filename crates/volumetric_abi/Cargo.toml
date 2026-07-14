@@ -6,3 +6,9 @@ edition = "2024"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 ciborium = "0.2"
+rayon = { version = "1", optional = true }
+
+[features]
+# Threaded operator builds (wasm32-wasip1-threads): with_thread_pool gets a
+# real rayon pool instead of a passthrough.
+threaded = ["dep:rayon"]

@@ -17,6 +17,8 @@
 //! - `post_output(idx: i32, ptr: i32, len: i32)`
 //! - `post_error(ptr: i32, len: i32)` — optional; a run that posts an error
 //!   fails with the message instead of returning outputs
+//! - `cancelled() -> i32` — optional; cooperative-cancellation poll for
+//!   long-running operators (see [`host::cancelled`])
 //!
 //! ## Model-input sampling imports
 //!
@@ -108,6 +110,7 @@ use std::sync::OnceLock;
 
 pub mod fea;
 pub mod subspace;
+pub mod threading;
 pub mod trimesh;
 
 /// The single inside/outside threshold for occupancy samples.
@@ -435,6 +438,7 @@ pub mod host {
             pub fn get_input_data(idx: i32, ptr: i32, len: i32);
             pub fn post_output(output_idx: i32, ptr: i32, len: i32);
             pub fn post_error(ptr: i32, len: i32);
+            pub fn cancelled() -> i32;
             pub fn input_model_dimensions(idx: i32) -> i32;
             pub fn input_model_bounds(idx: i32, out_ptr: i32) -> i32;
             pub fn input_model_sample(idx: i32, pos_ptr: i32, count: i32, out_ptr: i32) -> i32;
@@ -460,6 +464,15 @@ pub mod host {
     /// of producing outputs. Only the first reported error is kept.
     pub fn report_error(msg: &str) {
         unsafe { raw::post_error(msg.as_ptr() as i32, msg.len() as i32) }
+    }
+
+    /// Whether the host wants this run to stop. Long-running operators
+    /// should poll this between iterations and return early (with or
+    /// without an error) — for threaded operators it is the only reliable
+    /// cancellation path, since the host cannot safely interrupt a thread
+    /// pool from outside. Hosts without mid-run cancellation return false.
+    pub fn cancelled() -> bool {
+        unsafe { raw::cancelled() != 0 }
     }
 
     /// The dimension count of the model in input slot `idx`, or `None` if

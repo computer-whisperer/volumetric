@@ -38,7 +38,25 @@ pub use element::{ElementStiffness, Material, cube_stiffness, hex8_stiffness};
 pub use inverse::{InverseConfig, InverseResult, TargetMap, solve_inverse};
 #[cfg(feature = "parallel")]
 pub use schwarz::SchwarzParams;
+use std::sync::OnceLock;
+
 use volumetric_abi::fea::{FeaElementKind, FeaMesh};
+
+/// Cooperative-cancellation hook. Long solves poll it between CG
+/// iterations and unwind with a clean `"solve cancelled"` error when it
+/// fires. Set once per process by the embedding — the fea operators point
+/// it at the host's `cancelled` import; native harnesses leave it unset
+/// and solves run to completion.
+static CANCEL_POLL: OnceLock<fn() -> bool> = OnceLock::new();
+
+/// Install the cancellation poll. Process-wide, first caller wins.
+pub fn set_cancel_poll(poll: fn() -> bool) {
+    let _ = CANCEL_POLL.set(poll);
+}
+
+pub(crate) fn cancel_requested() -> bool {
+    CANCEL_POLL.get().is_some_and(|poll| poll())
+}
 
 /// An implicit rigid body, sampled by occupancy (the Model ABI contract).
 pub trait RigidBody {
@@ -627,6 +645,11 @@ fn solve_cg_system(
     let mut rz: f64 = r.iter().zip(&z).map(|(a, b)| a * b).sum();
 
     for iteration in 0..max_iterations {
+        // Reported as a stall; the callers' own polls disambiguate a
+        // cancellation from a genuine CgStalled before classifying.
+        if iteration % 32 == 0 && cancel_requested() {
+            return (iteration, false);
+        }
         masked_apply(&p, &mut kp);
         let pkp: f64 = p.iter().zip(&kp).map(|(a, b)| a * b).sum();
         if pkp <= 0.0 {
@@ -923,6 +946,9 @@ fn contact_solve(
     let mut forces = vec![0.0f64; n];
 
     for _ in 0..config.max_contact_iterations {
+        if cancel_requested() {
+            return Err("solve cancelled".to_string());
+        }
         stats.contact_iterations += 1;
 
         // Activate/refresh: any node whose deformed position penetrates the
@@ -998,6 +1024,11 @@ fn contact_solve(
             config.cg_max_iterations,
         );
         stats.cg_iterations += iterations;
+        // Before reading a CG failure as a stall: a cancelled poll makes
+        // solve_cg bail out early with the same (…, false) shape.
+        if cancel_requested() {
+            return Err("solve cancelled".to_string());
+        }
         if !cg_converged {
             stats.converged = false;
             stats.failure = Some(SolveFailure::CgStalled);
