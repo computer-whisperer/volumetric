@@ -125,3 +125,10 @@ required-features = ["native"]
 opt-level = 3
 [profile.dev.package.regalloc2]
 opt-level = 3
+
+# Upstream atomic-wait has no wasm32 backend, which blocks faer's thread
+# pool (spindle) on wasm32-wasip1-threads — the threaded operator builds.
+# The vendored copy adds one (wasm futex instructions); native targets
+# compile the upstream sources unchanged. See crates/vendored/atomic-wait.
+[patch.crates-io]
+atomic-wait = { path = "crates/vendored/atomic-wait" }

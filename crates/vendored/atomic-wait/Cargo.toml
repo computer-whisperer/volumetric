@@ -1,0 +1,28 @@
+# Vendored copy of atomic-wait 1.1.0 (https://github.com/m-ou-se/atomic-wait,
+# BSD-2-Clause) plus src/wasm.rs: a wasm32+atomics backend built on the
+# memory.atomic.wait32/notify instructions, which upstream lacks. Applied via
+# [patch.crates-io] in the workspace root so faer's thread pool (spindle)
+# links on wasm32-wasip1-threads. Native platforms use the upstream sources
+# unmodified.
+# Standalone (kept out of the workspace member list; consumed via [patch]).
+[workspace]
+
+[package]
+edition = "2021"
+name = "atomic-wait"
+version = "1.1.0"
+description = "Cross-platform atomic wait and wake (aka futex) functionality."
+readme = "README.md"
+license = "BSD-2-Clause"
+repository = "https://github.com/m-ou-se/atomic-wait"
+
+[target."cfg(any(target_os = \"linux\", target_os = \"android\", target_os = \"freebsd\"))".dependencies.libc]
+version = "0.2"
+
+[target."cfg(windows)".dependencies.windows-sys]
+version = "0.42.0"
+features = [
+    "Win32_System_Threading",
+    "Win32_Foundation",
+    "Win32_System_WindowsProgramming",
+]
