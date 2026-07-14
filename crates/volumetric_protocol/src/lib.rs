@@ -372,6 +372,7 @@ mod tests {
             )],
             timeline: vec![],
             exports: vec![],
+            baked: None,
         };
         let request = JobRequest::RunProject { project };
         let decoded: JobRequest = from_cbor(&to_cbor(&request)).unwrap();

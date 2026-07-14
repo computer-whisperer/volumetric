@@ -617,6 +617,11 @@ enum FileTask {
     SaveProject {
         project: Project,
         path: Option<PathBuf>,
+        /// Dialog default filename when asking for the path.
+        suggested_name: String,
+        /// What the project's embedded bake covers (`None` for lean saves);
+        /// carried through to the outcome for the status line.
+        bake: Option<volumetric::BakeCoverage>,
     },
     ExportStl {
         id: String,
@@ -647,6 +652,7 @@ enum FileOutcome {
     SavedProject {
         path: PathBuf,
         result: Result<(), String>,
+        bake: Option<volumetric::BakeCoverage>,
     },
     ImportedWasm {
         name: String,
@@ -663,6 +669,16 @@ enum FileOutcome {
     Dismissed,
 }
 
+/// Default dialog filename for a built copy: the current file's stem with
+/// a `-built` suffix, so `bracket.vproj` suggests `bracket-built.vproj`.
+fn built_copy_name(current: Option<&std::path::Path>) -> String {
+    let stem = current
+        .and_then(|path| path.file_stem())
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("project");
+    format!("{stem}-built.vproj")
+}
+
 /// Converts a queued [`FileAction`] into a self-contained [`FileTask`],
 /// snapshotting whatever app/session state the task needs (preview
 /// triangles, asset bytes, the project itself). Returns `None` when the
@@ -674,14 +690,35 @@ fn gather_file_task(
 ) -> Option<FileTask> {
     match action {
         FileAction::OpenProject => Some(FileTask::OpenProject),
-        FileAction::SaveProject => Some(FileTask::SaveProject {
-            project: app.project().clone(),
-            path: None,
-        }),
-        FileAction::SaveProjectTo(path) => Some(FileTask::SaveProject {
-            project: app.project().clone(),
-            path: Some(path),
-        }),
+        // Ordinary saves keep the file's mode: a built copy re-saves as a
+        // built copy (fresh bake), a lean file stays lean.
+        FileAction::SaveProject => {
+            let (project, bake) = app.project_for_save(app.baked_on_disk());
+            Some(FileTask::SaveProject {
+                project,
+                path: None,
+                suggested_name: "project.vproj".to_string(),
+                bake,
+            })
+        }
+        FileAction::SaveProjectTo(path) => {
+            let (project, bake) = app.project_for_save(app.baked_on_disk());
+            Some(FileTask::SaveProject {
+                project,
+                path: Some(path),
+                suggested_name: "project.vproj".to_string(),
+                bake,
+            })
+        }
+        FileAction::SaveBuiltCopy => {
+            let (project, bake) = app.project_for_save(true);
+            Some(FileTask::SaveProject {
+                project,
+                path: None,
+                suggested_name: built_copy_name(app.project_path()),
+                bake,
+            })
+        }
         FileAction::ExportMesh { id, scale } => {
             let mut triangles = session.preview_triangles(&id);
             if triangles.is_empty() {
@@ -738,13 +775,18 @@ fn perform_file_task(task: FileTask) -> FileOutcome {
             let result = Project::load_from_file(&path).map_err(|err| err.to_string());
             FileOutcome::OpenedProject { path, result }
         }
-        FileTask::SaveProject { project, path } => {
+        FileTask::SaveProject {
+            project,
+            path,
+            suggested_name,
+            bake,
+        } => {
             let path = match path {
                 Some(path) => path,
                 None => {
                     let Some(picked) = rfd::FileDialog::new()
                         .add_filter("Project", &["vproj"])
-                        .set_file_name("project.vproj")
+                        .set_file_name(suggested_name)
                         .save_file()
                     else {
                         return FileOutcome::Dismissed;
@@ -753,7 +795,7 @@ fn perform_file_task(task: FileTask) -> FileOutcome {
                 }
             };
             let result = project.save_to_file(&path).map_err(|err| err.to_string());
-            FileOutcome::SavedProject { path, result }
+            FileOutcome::SavedProject { path, result, bake }
         }
         FileTask::ExportStl { id, triangles } => {
             let Some(path) = rfd::FileDialog::new()
@@ -834,7 +876,9 @@ fn perform_file_task(task: FileTask) -> FileOutcome {
 fn apply_file_outcome(app: &mut VolumetricUiV2, outcome: FileOutcome) {
     match outcome {
         FileOutcome::OpenedProject { path, result } => app.apply_opened_project(path, result),
-        FileOutcome::SavedProject { path, result } => app.apply_saved_project(path, result),
+        FileOutcome::SavedProject { path, result, bake } => {
+            app.apply_saved_project(path, result, bake)
+        }
         FileOutcome::ImportedWasm { name, bytes } => app.import_model_wasm(&name, bytes),
         FileOutcome::ImportedBlob {
             operator_name,
@@ -1099,11 +1143,14 @@ mod tests {
         let outcome = perform_file_task(FileTask::SaveProject {
             project,
             path: Some(path.clone()),
+            suggested_name: "project.vproj".to_string(),
+            bake: None,
         });
 
         let FileOutcome::SavedProject {
             path: saved,
             result,
+            bake: _,
         } = outcome
         else {
             panic!("save task should report SavedProject");
@@ -1118,6 +1165,7 @@ mod tests {
             FileOutcome::SavedProject {
                 path: saved,
                 result: Ok(()),
+                bake: None,
             },
         );
         // A later Save re-saves in place through the worker (no dialog).

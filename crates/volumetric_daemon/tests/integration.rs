@@ -94,6 +94,7 @@ fn one_step_project(operator: Vec<u8>, steps: usize) -> Project {
         imports: vec![ImportedAsset::operator("op".to_string(), operator)],
         timeline,
         exports: (0..steps).map(|i| format!("out_{i}")).collect(),
+        baked: None,
     }
 }
 
@@ -171,6 +172,7 @@ fn run_project_reports_execution_errors() {
             outputs: vec!["out".to_string()],
         }],
         exports: vec![],
+        baked: None,
     };
     let outcome = client
         .run(

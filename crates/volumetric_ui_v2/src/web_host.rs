@@ -942,10 +942,13 @@ fn dispatch_job_with_remote(
 /// identical outcome mapping and error prefixes.
 async fn remote_run_project(
     address: &str,
-    project: volumetric::Project,
+    mut project: volumetric::Project,
     cancel: &AtomicBool,
     on_progress: &dyn Fn(volumetric::BuildProgress),
 ) -> Result<Vec<volumetric::LoadedAsset>, String> {
+    // Never ship a bake: the daemon's shared cache must not trust
+    // client-supplied results, and the blobs would only bloat the upload.
+    project.baked = None;
     let client = probed_client(address).await?;
     let outcome = client
         .run(
@@ -1023,6 +1026,9 @@ enum FileTask {
     SaveProject {
         bytes: Result<Vec<u8>, String>,
         name: String,
+        /// What the serialized project's bake covers (`None` = lean save);
+        /// carried to the outcome for the status line.
+        bake: Option<volumetric::BakeCoverage>,
     },
     ExportStl {
         id: String,
@@ -1051,6 +1057,7 @@ enum FileOutcome {
     SavedProject {
         path: PathBuf,
         result: Result<(), String>,
+        bake: Option<volumetric::BakeCoverage>,
     },
     ImportedWasm {
         name: String,
@@ -1072,20 +1079,38 @@ fn gather_file_task(
     session: &Session,
     action: FileAction,
 ) -> Option<FileTask> {
-    let save_task = |app: &VolumetricUiV2, name: String| FileTask::SaveProject {
-        bytes: app.project().to_cbor().map_err(|err| err.to_string()),
-        name,
+    // Ordinary saves keep the file's mode (a built copy re-saves as a
+    // built copy with a fresh bake); Save Built Copy forces one.
+    let save_task = |app: &VolumetricUiV2, name: String, built: bool| {
+        let (project, bake) = app.project_for_save(built);
+        FileTask::SaveProject {
+            bytes: project.to_cbor().map_err(|err| err.to_string()),
+            name,
+            bake,
+        }
     };
     match action {
         FileAction::OpenProject => Some(FileTask::OpenProject),
-        FileAction::SaveProject => Some(save_task(app, "project.vproj".to_string())),
+        FileAction::SaveProject => Some(save_task(
+            app,
+            "project.vproj".to_string(),
+            app.baked_on_disk(),
+        )),
         FileAction::SaveProjectTo(path) => {
             let name = path
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or("project.vproj")
                 .to_string();
-            Some(save_task(app, name))
+            Some(save_task(app, name, app.baked_on_disk()))
+        }
+        FileAction::SaveBuiltCopy => {
+            let stem = app
+                .project_path()
+                .and_then(|path| path.file_stem())
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("project");
+            Some(save_task(app, format!("{stem}-built.vproj"), true))
         }
         FileAction::ExportMesh { id, scale } => {
             let mut triangles = session.preview_triangles(&id);
@@ -1148,11 +1173,12 @@ async fn perform_file_task(task: FileTask) -> FileOutcome {
                 result,
             }
         }
-        FileTask::SaveProject { bytes, name } => {
+        FileTask::SaveProject { bytes, name, bake } => {
             let result = bytes.and_then(|bytes| trigger_download(&name, &bytes));
             FileOutcome::SavedProject {
                 path: PathBuf::from(name),
                 result,
+                bake,
             }
         }
         FileTask::ExportStl { id, triangles } => {
@@ -1216,7 +1242,9 @@ async fn perform_file_task(task: FileTask) -> FileOutcome {
 fn apply_file_outcome(app: &mut VolumetricUiV2, outcome: FileOutcome) {
     match outcome {
         FileOutcome::OpenedProject { path, result } => app.apply_opened_project(path, result),
-        FileOutcome::SavedProject { path, result } => app.apply_saved_project(path, result),
+        FileOutcome::SavedProject { path, result, bake } => {
+            app.apply_saved_project(path, result, bake)
+        }
         FileOutcome::ImportedWasm { name, bytes } => app.import_model_wasm(&name, bytes),
         FileOutcome::ImportedBlob {
             operator_name,

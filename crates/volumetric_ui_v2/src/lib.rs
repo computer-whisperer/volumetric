@@ -139,6 +139,7 @@ pub const NEW_PROJECT_KEY: &str = "action:new-project";
 pub const OPEN_PROJECT_KEY: &str = "action:open-project";
 pub const SAVE_PROJECT_KEY: &str = "action:save-project";
 pub const SAVE_PROJECT_AS_KEY: &str = "action:save-project-as";
+pub const SAVE_BUILT_COPY_KEY: &str = "action:save-built-copy";
 pub const IMPORT_WASM_KEY: &str = "action:import-wasm";
 pub const IMPORT_STL_KEY: &str = "action:import-stl";
 pub const IMPORT_IMAGE_KEY: &str = "action:import-image";
@@ -179,6 +180,11 @@ const SSAO_SETTINGS_KEY: &str = "view:ssao";
 const SSAO_ADJUST_PREFIX: &str = "view:ssao-adj:";
 /// Remote-build settings popover trigger and the daemon address input in it.
 const REMOTE_SETTINGS_KEY: &str = "view:remote-settings";
+
+/// Build-cache stats popover trigger; budget steppers use
+/// `view:cache-adj:{up|down}`.
+const CACHE_SETTINGS_KEY: &str = "view:cache-settings";
+const CACHE_ADJUST_PREFIX: &str = "view:cache-adj:";
 const REMOTE_ADDRESS_KEY: &str = "remote-address-input";
 /// Per-output render settings: `output:settings:{id}` opens the popover
 /// (plus `:dismiss`); mode/res routes end `:{value}` after the asset id.
@@ -773,6 +779,9 @@ pub enum FileAction {
     SaveProject,
     /// Re-save in place to the known project path (no dialog).
     SaveProjectTo(std::path::PathBuf),
+    /// Save a copy with the built step results embedded (path dialog; see
+    /// `volumetric::baked`).
+    SaveBuiltCopy,
     /// Export the cached preview mesh of the named output as binary STL,
     /// with vertices multiplied by `scale` (the export modal's setting).
     ExportMesh {
@@ -1065,6 +1074,14 @@ pub struct VolumetricUiV2 {
     /// Where the project was last opened from / saved to; Save re-saves here,
     /// Save As always asks. Cleared by New Project.
     project_path: Option<std::path::PathBuf>,
+    /// Whether the file at `project_path` carries baked results. Kept true
+    /// across re-saves (each one embeds a fresh bake) so a built copy stays
+    /// built; set on open/save, cleared by New Project.
+    baked_on_disk: bool,
+    /// The user's build-cache budget preference (persisted in settings).
+    /// The live cache budget can sit above it after a large bake was seeded
+    /// ([`volumetric::BuildCache::reserve`]).
+    cache_budget_bytes: usize,
     /// Project panel width, adjusted by the divider's resize handle.
     panel_width: f32,
     panel_drag: ResizeDrag,
@@ -1145,6 +1162,8 @@ impl VolumetricUiV2 {
             export_dialog: None,
             pending_file_action: None,
             project_path: None,
+            baked_on_disk: false,
+            cache_budget_bytes: volumetric::build_cache::DEFAULT_BUDGET_BYTES,
             panel_width: PANEL_WIDTH_DEFAULT,
             panel_drag: ResizeDrag::default(),
             operator_metadata_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -2031,13 +2050,30 @@ impl VolumetricUiV2 {
         result: Result<Project, String>,
     ) {
         match result {
-            Ok(project) => {
+            Ok(mut project) => {
+                // A built copy's bake moves into the process cache here, so
+                // the next run serves those steps without executing them.
+                let had_bake = project.baked.is_some();
+                let seed = project.seed_build_cache(volumetric::build_cache::global());
                 self.project = project;
                 self.selected_export = None;
                 self.selected_project_item = None;
                 self.clear_runtime_assets();
                 self.mark_project_dirty();
-                self.status = format!("opened {}", path.display());
+                self.status = match (had_bake, seed.corrupt_blobs) {
+                    (false, _) => format!("opened {}", path.display()),
+                    (true, 0) => format!(
+                        "opened built copy {} ({} steps ready)",
+                        path.display(),
+                        seed.seeded_steps
+                    ),
+                    (true, corrupt) => format!(
+                        "opened built copy {} ({} steps ready; {corrupt} damaged blobs dropped)",
+                        path.display(),
+                        seed.seeded_steps
+                    ),
+                };
+                self.baked_on_disk = had_bake;
                 self.project_path = Some(path);
             }
             Err(err) => self.status = format!("failed to open project: {err}"),
@@ -2046,18 +2082,88 @@ impl VolumetricUiV2 {
 
     /// Applies the result of a save the host's file worker performed
     /// off-thread; a successful save pins the path for one-click re-saves.
+    /// `bake` reports what a built-copy save embedded (`None` for a lean
+    /// save) and pins whether the file on disk is now a built copy.
     pub(crate) fn apply_saved_project(
         &mut self,
         path: std::path::PathBuf,
         result: Result<(), String>,
+        bake: Option<volumetric::BakeCoverage>,
     ) {
         match result {
             Ok(()) => {
-                self.status = format!("saved {}", path.display());
+                self.status = match bake {
+                    None => format!("saved {}", path.display()),
+                    Some(c) if c.is_complete() => format!(
+                        "saved built copy {} ({} steps embedded)",
+                        path.display(),
+                        c.baked_steps
+                    ),
+                    Some(c) => format!(
+                        "saved built copy {} ({}/{} steps embedded — run the build for a complete copy)",
+                        path.display(),
+                        c.baked_steps,
+                        c.total_steps
+                    ),
+                };
+                self.baked_on_disk = bake.is_some_and(|c| c.baked_steps > 0);
                 self.project_path = Some(path);
             }
             Err(err) => self.status = format!("failed to save project: {err}"),
         }
+    }
+
+    /// The project as it should be written by a save: a built copy gets a
+    /// fresh bake collected from the process cache (reported alongside); a
+    /// lean save is a plain clone. The in-memory project never carries a
+    /// bake (opening consumes it), so this attaches to the copy only.
+    pub(crate) fn project_for_save(
+        &self,
+        built: bool,
+    ) -> (Project, Option<volumetric::BakeCoverage>) {
+        let mut project = self.project.clone();
+        project.baked = None;
+        if !built {
+            return (project, None);
+        }
+        let (baked, coverage) = project.collect_baked(volumetric::build_cache::global());
+        project.baked = (!baked.is_empty()).then_some(baked);
+        (project, Some(coverage))
+    }
+
+    pub(crate) fn baked_on_disk(&self) -> bool {
+        self.baked_on_disk
+    }
+
+    pub(crate) fn project_path(&self) -> Option<&std::path::Path> {
+        self.project_path.as_deref()
+    }
+
+    /// Doubles or halves the build-cache budget preference and applies it
+    /// to the process cache immediately.
+    fn adjust_cache_budget(&mut self, up: bool) {
+        const MIN: usize = 64 << 20;
+        const MAX: usize = 64 << 30;
+        self.cache_budget_bytes = if up {
+            self.cache_budget_bytes.saturating_mul(2).min(MAX)
+        } else {
+            (self.cache_budget_bytes / 2).max(MIN)
+        };
+        self.set_cache_budget(self.cache_budget_bytes);
+        self.status = format!(
+            "build cache budget: {}",
+            format_mb(self.cache_budget_bytes)
+        );
+    }
+
+    /// Sets the build-cache budget preference (settings restore path).
+    pub(crate) fn set_cache_budget(&mut self, bytes: usize) {
+        self.cache_budget_bytes = bytes;
+        volumetric::build_cache::global().set_budget(bytes);
+    }
+
+    pub(crate) fn cache_budget_bytes(&self) -> usize {
+        self.cache_budget_bytes
     }
 
     /// Loads a project from disk inline and applies it. Test convenience —
@@ -2077,7 +2183,7 @@ impl VolumetricUiV2 {
             .project
             .save_to_file(path)
             .map_err(|err| err.to_string());
-        self.apply_saved_project(path.to_path_buf(), result);
+        self.apply_saved_project(path.to_path_buf(), result, None);
     }
 
     /// Status line for host-side operations (e.g. STL export results).
@@ -2963,6 +3069,7 @@ impl VolumetricUiV2 {
             // dismiss-scrim routes follow the same shape; Pick never fires.
             SSAO_SETTINGS_KEY,
             REMOTE_SETTINGS_KEY,
+            CACHE_SETTINGS_KEY,
         ] {
             let Some(action) = select::classify_event(event, key) else {
                 continue;
@@ -3203,6 +3310,7 @@ impl App for VolumetricUiV2 {
             self.clear_runtime_assets();
             self.open_menu = None;
             self.project_path = None;
+            self.baked_on_disk = false;
             self.status = "new project".to_string();
             return;
         }
@@ -3227,6 +3335,12 @@ impl App for VolumetricUiV2 {
 
         if event.is_click_or_activate(SAVE_PROJECT_AS_KEY) {
             self.pending_file_action = Some(FileAction::SaveProject);
+            self.open_menu = None;
+            return;
+        }
+
+        if event.is_click_or_activate(SAVE_BUILT_COPY_KEY) {
+            self.pending_file_action = Some(FileAction::SaveBuiltCopy);
             self.open_menu = None;
             return;
         }
@@ -3514,6 +3628,8 @@ impl App for VolumetricUiV2 {
             if let Some((field, direction)) = rest.split_once(':') {
                 self.adjust_ssao(field, direction == "up");
             }
+        } else if let Some(direction) = route.strip_prefix(CACHE_ADJUST_PREFIX) {
+            self.adjust_cache_budget(direction == "up");
         } else if let Some(rest) = route.strip_prefix(OUTPUT_ASN2_PREFIX) {
             if let Some((rest, direction)) = rest.rsplit_once(':')
                 && let Some((id, field)) = rest.rsplit_once(':')
@@ -3610,6 +3726,11 @@ fn top_bar(app: &VolumetricUiV2) -> El {
             .xsmall()
             .tooltip("Remote build settings")
             .key(REMOTE_SETTINGS_KEY),
+        icon_button("download")
+            .ghost()
+            .xsmall()
+            .tooltip("Build cache")
+            .key(CACHE_SETTINGS_KEY),
     ]);
     items.push(run_control(app));
     toolbar(items)
@@ -3629,6 +3750,7 @@ fn menu_layer(app: &VolumetricUiV2) -> Option<El> {
                 menubar_item_with_icon("folder", "Open Project…").key(OPEN_PROJECT_KEY),
                 menubar_item_with_icon("download", "Save Project").key(SAVE_PROJECT_KEY),
                 menubar_item_with_icon("download", "Save Project As…").key(SAVE_PROJECT_AS_KEY),
+                menubar_item_with_icon("download", "Save Built Copy…").key(SAVE_BUILT_COPY_KEY),
             ],
         )),
         _ => None,
@@ -3967,6 +4089,7 @@ fn select_layer(app: &VolumetricUiV2) -> Option<El> {
         )),
         SSAO_SETTINGS_KEY => Some(ssao_settings_popover(app)),
         REMOTE_SETTINGS_KEY => Some(remote_settings_popover(app)),
+        CACHE_SETTINGS_KEY => Some(cache_settings_popover(app)),
         _ => None,
     }
 }
@@ -4228,6 +4351,74 @@ fn ssao_settings_popover(app: &VolumetricUiV2) -> El {
         .gap(tokens::SPACE_2)
         .padding(tokens::SPACE_2)
         .width(Size::Fixed(240.0))]),
+    )
+}
+
+/// Human-readable size for cache figures: MB below 1 GB, GB above.
+fn format_mb(bytes: usize) -> String {
+    if bytes >= 1 << 30 {
+        format!("{:.1} GB", bytes as f64 / f64::from(1 << 30))
+    } else {
+        format!("{:.0} MB", bytes as f64 / f64::from(1 << 20))
+    }
+}
+
+/// Anchored popover with live build-cache stats and the budget stepper.
+/// Stats come straight off the process-global cache each frame; the shown
+/// budget is the live one, which can sit above the preference after a
+/// large built copy was seeded.
+fn cache_settings_popover(app: &VolumetricUiV2) -> El {
+    let stats = volumetric::build_cache::global().stats();
+    popover(
+        CACHE_SETTINGS_KEY,
+        Anchor::below_key(CACHE_SETTINGS_KEY),
+        popover_panel([column([
+            text("Build cache").label().semibold(),
+            field_row(
+                "Resident",
+                text(format!("{} in {} steps", format_mb(stats.bytes), stats.entries)).label(),
+            )
+            .gap(tokens::SPACE_2),
+            field_row(
+                "Budget",
+                row([
+                    icon_button("chevron-left")
+                        .ghost()
+                        .xsmall()
+                        .key(format!("{CACHE_ADJUST_PREFIX}down")),
+                    text(format!(
+                        "{}{}",
+                        format_mb(app.cache_budget_bytes()),
+                        if stats.budget > app.cache_budget_bytes() {
+                            format!(" (now {})", format_mb(stats.budget))
+                        } else {
+                            String::new()
+                        }
+                    ))
+                    .label()
+                    .text_align(TextAlign::Center)
+                    .width(Size::Fixed(120.0)),
+                    icon_button("chevron-right")
+                        .ghost()
+                        .xsmall()
+                        .key(format!("{CACHE_ADJUST_PREFIX}up")),
+                ])
+                .gap(tokens::SPACE_1)
+                .align(Align::Center),
+            )
+            .gap(tokens::SPACE_2),
+            field_row(
+                "Hits / misses",
+                text(format!("{} / {}", stats.hits, stats.misses)).label(),
+            )
+            .gap(tokens::SPACE_2),
+            text("Opening a built copy raises the budget to fit its results.")
+                .caption()
+                .muted(),
+        ])
+        .gap(tokens::SPACE_2)
+        .padding(tokens::SPACE_2)
+        .width(Size::Fixed(300.0))]),
     )
 }
 
@@ -7511,6 +7702,54 @@ mod tests {
         for child in &el.children {
             collect_keys(child, keys);
         }
+    }
+
+    /// Built-copy state machine: the menu action queues SaveBuiltCopy,
+    /// opening a baked file consumes the bake and flags the mode, and save
+    /// outcomes pin or clear it (a built copy re-saves built; a lean save
+    /// reverts the file to lean).
+    #[test]
+    fn built_copy_flags_follow_open_and_save() {
+        let mut app = VolumetricUiV2::default();
+        dispatch(&mut app, UiEvent::synthetic_click(SAVE_BUILT_COPY_KEY));
+        assert_eq!(app.take_file_action(), Some(FileAction::SaveBuiltCopy));
+
+        // Opening a project that carries a bake: the bake moves into the
+        // process cache (never kept resident twice) and the mode is set.
+        let mut baked_project = Project::new();
+        baked_project.baked = Some(volumetric::BakedResults::default());
+        let path = std::path::PathBuf::from("bracket.vproj");
+        app.apply_opened_project(path.clone(), Ok(baked_project));
+        assert!(app.baked_on_disk());
+        assert!(app.project().baked.is_none(), "seeding consumes the bake");
+        assert!(app.status.contains("built copy"), "{}", app.status);
+
+        // Ordinary saves keep the mode via gather (tested by flag), and the
+        // outcome pins what actually got written.
+        let full = volumetric::BakeCoverage {
+            baked_steps: 2,
+            total_steps: 2,
+        };
+        app.apply_saved_project(path.clone(), Ok(()), Some(full));
+        assert!(app.baked_on_disk());
+        assert!(app.status.contains("built copy"), "{}", app.status);
+
+        let partial = volumetric::BakeCoverage {
+            baked_steps: 1,
+            total_steps: 2,
+        };
+        app.apply_saved_project(path.clone(), Ok(()), Some(partial));
+        assert!(app.baked_on_disk());
+        assert!(app.status.contains("1/2"), "{}", app.status);
+
+        app.apply_saved_project(path, Ok(()), None);
+        assert!(!app.baked_on_disk(), "a lean save reverts the mode");
+
+        // The built-copy project snapshot never mutates the live project.
+        let (copy, coverage) = app.project_for_save(true);
+        assert!(copy.baked.is_none(), "nothing cached for an empty project");
+        assert_eq!(coverage.map(|c| c.total_steps), Some(0));
+        assert!(app.project().baked.is_none());
     }
 
     /// Import-shaped operators (bare Blob inputs) route to their file

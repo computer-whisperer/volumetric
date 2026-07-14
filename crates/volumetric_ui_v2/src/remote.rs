@@ -136,9 +136,12 @@ impl ExecutionBackend for RemoteBackend {
         cancel: &AtomicBool,
         progress: &dyn Fn(volumetric::BuildProgress),
     ) -> Result<Vec<volumetric::LoadedAsset>, String> {
-        let request = JobRequest::RunProject {
-            project: project.clone(),
-        };
+        // In-memory projects are lean (opening consumes any bake), but never
+        // ship one: the daemon's shared cache must not trust client-supplied
+        // results, and the blobs would only bloat the upload.
+        let mut project = project.clone();
+        project.baked = None;
+        let request = JobRequest::RunProject { project };
         project_exports_from_output(self.run_job(&request, cancel, progress)?)
     }
 

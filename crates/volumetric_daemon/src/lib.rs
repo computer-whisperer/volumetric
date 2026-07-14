@@ -317,7 +317,14 @@ fn submit_job(state: &Arc<DaemonState>, body: &[u8]) -> HttpResponse {
     cbor_response(&JobTicket { job_id })
 }
 
-fn run_job(state: &Arc<DaemonState>, job_id: u64, request: JobRequest, cancel: &AtomicBool) {
+fn run_job(state: &Arc<DaemonState>, job_id: u64, mut request: JobRequest, cancel: &AtomicBool) {
+    // A client-supplied bake is untrusted and unused here — the daemon never
+    // seeds its shared step cache from request payloads (results enter the
+    // cache only by being computed). Clients strip it before upload; drop it
+    // anyway so a non-stripping client doesn't bloat job memory.
+    if let JobRequest::RunProject { project } = &mut request {
+        project.baked = None;
+    }
     // One line per job start/end on stderr: enough to tell after the fact
     // what a busy daemon was doing (job kind, size, outcome, duration).
     let summary = match &request {

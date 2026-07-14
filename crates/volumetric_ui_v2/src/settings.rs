@@ -49,6 +49,9 @@ pub struct UiSettings {
     /// leaves the shell's default alone.
     pub window_width: u32,
     pub window_height: u32,
+    /// Build-cache budget preference in MiB (the live budget can sit above
+    /// it while a seeded built copy is resident).
+    pub cache_budget_mb: usize,
 }
 
 impl Default for UiSettings {
@@ -78,6 +81,7 @@ impl UiSettings {
             recent_adds: app.recent_adds.clone(),
             window_width,
             window_height,
+            cache_budget_mb: app.cache_budget_bytes() >> 20,
         }
     }
 
@@ -116,6 +120,7 @@ impl UiSettings {
             .clamp(super::PANEL_WIDTH_MIN, super::PANEL_WIDTH_MAX);
         app.recent_adds = self.recent_adds.clone();
         app.recent_adds.truncate(super::RECENT_ADDS_CAP);
+        app.set_cache_budget(self.cache_budget_mb.clamp(64, 64 << 10) << 20);
     }
 
     /// `<config dir>/volumetric/ui-v2.json`; `None` when the platform has
