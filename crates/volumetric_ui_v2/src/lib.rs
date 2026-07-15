@@ -983,6 +983,11 @@ impl PreviewPlan {
     }
 }
 
+/// Cache value for an operator import: `(byte length, decoded metadata, hex
+/// content hash)`. The length is the revalidation key; metadata is `None` when
+/// the module fails to decode; the hash always reflects the current bytes.
+type OperatorImportCacheEntry = (usize, Option<OperatorMetadata>, String);
+
 #[derive(Debug)]
 pub struct VolumetricUiV2 {
     project: Project,
@@ -1100,7 +1105,7 @@ pub struct VolumetricUiV2 {
     /// operator asset replaced by a same-length module with different
     /// metadata would serve one stale answer, which the next run corrects.
     operator_metadata_cache:
-        std::cell::RefCell<std::collections::HashMap<String, (usize, Option<OperatorMetadata>)>>,
+        std::cell::RefCell<std::collections::HashMap<String, OperatorImportCacheEntry>>,
 }
 
 impl Default for VolumetricUiV2 {
@@ -2362,9 +2367,13 @@ impl VolumetricUiV2 {
             .map(|import| import.data.clone())
     }
 
-    /// The decoded metadata of an operator import, cached (see the
+    /// Decoded metadata and hex content hash of an operator import, cached
+    /// together (both derive from the same bytes; see the
     /// `operator_metadata_cache` field for the invalidation rule).
-    fn operator_metadata_cached(&self, operator_id: &str) -> Option<OperatorMetadata> {
+    fn operator_import_info(
+        &self,
+        operator_id: &str,
+    ) -> Option<(Option<OperatorMetadata>, String)> {
         let import_len = self
             .project
             .imports()
@@ -2374,16 +2383,32 @@ impl VolumetricUiV2 {
             .len();
 
         let mut cache = self.operator_metadata_cache.borrow_mut();
-        if let Some((len, metadata)) = cache.get(operator_id)
+        if let Some((len, metadata, hash)) = cache.get(operator_id)
             && *len == import_len
         {
-            return metadata.clone();
+            return Some((metadata.clone(), hash.clone()));
         }
-        let metadata = self
-            .operator_bytes(operator_id)
-            .and_then(|bytes| volumetric::operator_metadata_from_wasm_bytes(&bytes).ok());
-        cache.insert(operator_id.to_string(), (import_len, metadata.clone()));
-        metadata
+        let bytes = self.operator_bytes(operator_id)?;
+        let metadata = volumetric::operator_metadata_from_wasm_bytes(&bytes).ok();
+        let hash = catalog::hex_sha256(&bytes);
+        cache.insert(
+            operator_id.to_string(),
+            (import_len, metadata.clone(), hash.clone()),
+        );
+        Some((metadata, hash))
+    }
+
+    /// The decoded metadata of an operator import, cached.
+    fn operator_metadata_cached(&self, operator_id: &str) -> Option<OperatorMetadata> {
+        self.operator_import_info(operator_id)?.0
+    }
+
+    /// Hex SHA-256 of an operator import's embedded bytes, cached alongside its
+    /// metadata. The upgrade offer compares it against the bundled operator's
+    /// build-time hash to catch a stale embedded copy that kept the bundled
+    /// version but drifted from the bundled bytes across a rebuild.
+    fn operator_import_hash(&self, operator_id: &str) -> Option<String> {
+        Some(self.operator_import_info(operator_id)?.1)
     }
 
     /// Declared assets with step-output hints refined by operator metadata.
@@ -5553,9 +5578,13 @@ fn import_detail_rows(app: &VolumetricUiV2, idx: usize) -> Vec<El> {
         && let Some(metadata) = app.operator_metadata_cached(&import.id)
     {
         rows.push(detail_row("Version", &metadata.version));
-        if let Some((_, bundled_version)) = operator_upgrade_offer(app, import) {
+        if let Some(upgrade) = operator_upgrade_offer(app, import) {
+            let label = match upgrade {
+                OperatorUpgrade::Version { to } => format!("Update to {to}"),
+                OperatorUpgrade::Rebuild { version } => format!("Update (rebuilt {version})"),
+            };
             rows.push(
-                button_with_icon("refresh-cw", format!("Update to {bundled_version}"))
+                button_with_icon("refresh-cw", label)
                     .secondary()
                     .xsmall()
                     .width(Size::Fill(1.0))
@@ -6098,39 +6127,44 @@ fn format_bytes(bytes: usize) -> String {
     }
 }
 
-/// Declared metadata name → version of every bundled operator, from the
-/// build-time asset registry. Operator crates declare `name: <crate name>`
-/// and `version: env!("CARGO_PKG_VERSION")` in their metadata (a convention
-/// the `bundled_asset_registry_matches_declared_metadata` test enforces), so
-/// the registry answers this without compiling any wasm — the previous
-/// implementation compiled all ~28 MB of bundled operators on first use,
-/// a ~40-second UI stall in a debug build.
-fn bundled_operator_versions() -> &'static std::collections::HashMap<String, String> {
-    static VERSIONS: LazyLock<std::collections::HashMap<String, String>> = LazyLock::new(|| {
-        volumetric_assets::operators()
-            .iter()
-            .map(|asset| (asset.name.to_string(), asset.version.to_string()))
-            .collect()
-    });
-    &VERSIONS
+/// How an imported operator differs from its bundled counterpart, when it
+/// does — the signal that a one-click update is worth offering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OperatorUpgrade {
+    /// The bundled crate declares a different version than the import.
+    Version { to: String },
+    /// Same declared version, but the embedded bytes differ from the bundled
+    /// build — a rebuild that kept the version (the stale-embedded-bytes trap).
+    Rebuild { version: String },
 }
 
-/// `(imported_version, bundled_version)` when an imported operator's
-/// declared name matches a bundled operator whose version differs —
-/// the signal that a one-click upgrade is worth offering. Projects embed
-/// operator bytes, so fixes only reach them through this path (or re-adding
-/// the operator by hand).
+/// How an imported operator is out of date relative to its bundled build, or
+/// `None` when it matches. Projects embed operator bytes, so fixes reach them
+/// only through this path (or by re-adding the operator). Both the version and
+/// the content hash come from the build-time registry (`BundledAsset`), so this
+/// never compiles bundled wasm. A version bump is the loud case; a same-version
+/// rebuild (identical version string, different bytes) is the quiet one this
+/// also catches by comparing content hashes.
 fn operator_upgrade_offer(
     app: &VolumetricUiV2,
     import: &volumetric::ImportedAsset,
-) -> Option<(String, String)> {
+) -> Option<OperatorUpgrade> {
     if import.type_hint != Some(AssetTypeHint::Operator) {
         return None;
     }
     let metadata = app.operator_metadata_cached(&import.id)?;
-    let bundled_version = bundled_operator_versions().get(&metadata.name)?;
-    (metadata.version != *bundled_version)
-        .then(|| (metadata.version.clone(), bundled_version.clone()))
+    let bundled = volumetric_assets::get_operator(&metadata.name)?;
+    if metadata.version != bundled.version {
+        return Some(OperatorUpgrade::Version {
+            to: bundled.version.to_string(),
+        });
+    }
+    // Same declared version — the bytes can still differ. Compare the import's
+    // content hash against the bundled build's hash.
+    let import_hash = app.operator_import_hash(&import.id)?;
+    (import_hash != bundled.hash).then(|| OperatorUpgrade::Rebuild {
+        version: bundled.version.to_string(),
+    })
 }
 
 fn asset_type_label(type_hint: Option<AssetTypeHint>) -> &'static str {
@@ -6431,12 +6465,14 @@ mod tests {
     }
 
     /// The asset registry's build-time name/version must match what each
-    /// operator actually declares at runtime: `bundled_operator_versions`
-    /// (and with it the upgrade offer) reads the registry precisely so the
-    /// UI never compiles all bundled operators just to learn their versions.
-    /// Compiles every bundled module, so this is the slowest test here.
-    /// Models go through the same executor read as operators — this is
-    /// also the proof that the catalog scan can read every bundled module.
+    /// operator actually declares at runtime: the upgrade offer reads the
+    /// registry (`get_operator`) precisely so the UI never compiles bundled
+    /// operators just to learn their version or hash. Also asserts the
+    /// build-time `hash` is the SHA-256 of the embedded bytes — the anchor the
+    /// same-version rebuild check compares against. Compiles every bundled
+    /// module, so this is the slowest test here. Models go through the same
+    /// executor read as operators — this is also the proof that the catalog
+    /// scan can read every bundled module.
     #[test]
     fn bundled_asset_registry_matches_declared_metadata() {
         for asset in volumetric_assets::models()
@@ -6452,6 +6488,12 @@ mod tests {
             assert_eq!(
                 metadata.version, asset.version,
                 "{}: declared version must equal the crate version bundled at build time",
+                asset.name
+            );
+            assert_eq!(
+                asset.hash,
+                catalog::hex_sha256(asset.bytes),
+                "{}: registry hash must be the SHA-256 of the bundled bytes",
                 asset.name
             );
             assert!(
@@ -6762,19 +6804,21 @@ mod tests {
             outputs: vec!["moved".to_string()],
         });
 
-        let bundled_version = bundled_operator_versions()
-            .get("translate_operator")
-            .expect("bundled translate_operator decodes")
-            .clone();
+        let bundled = volumetric_assets::get_operator("translate_operator")
+            .expect("bundled translate_operator");
         let offer = operator_upgrade_offer(&app, &app.project.imports()[0]);
-        assert_eq!(offer, Some(("0.0.1".to_string(), bundled_version)));
+        assert_eq!(
+            offer,
+            Some(OperatorUpgrade::Version {
+                to: bundled.version.to_string(),
+            }),
+        );
 
         dispatch(
             &mut app,
             UiEvent::synthetic_click(format!("{UPGRADE_IMPORT_PREFIX}0")),
         );
 
-        let bundled = volumetric_assets::get_operator("translate_operator").unwrap();
         let import = &app.project().imports()[0];
         assert_eq!(import.data, bundled.bytes);
         assert!(
@@ -6787,6 +6831,68 @@ mod tests {
             &step.inputs[0],
             ExecutionInput::AssetRef(id) if id == "part"
         ));
+    }
+
+    #[test]
+    fn same_version_rebuilt_operator_offers_rebuild() {
+        // An embedded operator whose declared version equals the bundled
+        // build's but whose bytes differ (a rebuild that kept the version):
+        // the version check is silent, so the offer must fire on the content
+        // hash instead — the stale-embedded-bytes trap.
+        let mut app = VolumetricUiV2::empty();
+        let bundled = volumetric_assets::get_operator("translate_operator")
+            .expect("bundled translate_operator");
+        app.project
+            .imports_mut()
+            .push(volumetric::ImportedAsset::operator(
+                "translate_operator".to_string(),
+                stale_operator_wasm("translate_operator", bundled.version),
+            ));
+
+        let offer = operator_upgrade_offer(&app, &app.project.imports()[0]);
+        assert_eq!(
+            offer,
+            Some(OperatorUpgrade::Rebuild {
+                version: bundled.version.to_string(),
+            }),
+            "same version, different bytes must offer a rebuild",
+        );
+
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{UPGRADE_IMPORT_PREFIX}0")),
+        );
+
+        let import = &app.project().imports()[0];
+        assert_eq!(
+            import.data, bundled.bytes,
+            "rebuild swaps in the bundled bytes"
+        );
+        assert!(
+            operator_upgrade_offer(&app, import).is_none(),
+            "up-to-date import offers nothing"
+        );
+    }
+
+    #[test]
+    fn freshly_added_operator_offers_no_upgrade() {
+        // Adding a bundled operator embeds its bytes verbatim, so version and
+        // content hash both match the registry — no spurious update button.
+        let mut app = VolumetricUiV2::default();
+        add_operator_click(&mut app, "rectangular_prism_operator");
+        let import = app
+            .project
+            .imports()
+            .iter()
+            .find(|import| {
+                app.operator_metadata_cached(&import.id)
+                    .is_some_and(|m| m.name == "rectangular_prism_operator")
+            })
+            .expect("added prism operator import");
+        assert!(
+            operator_upgrade_offer(&app, import).is_none(),
+            "a freshly added operator matches the bundle and offers no update",
+        );
     }
 
     #[test]

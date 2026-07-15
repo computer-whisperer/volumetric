@@ -3,7 +3,9 @@
 //! This scans `target/wasm32-unknown-unknown/release/` for known model and operator
 //! WASM files and generates Rust code that embeds them using `include_bytes!()`.
 
+use sha2::{Digest, Sha256};
 use std::env;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::PathBuf;
 
@@ -74,6 +76,17 @@ fn crate_version(crate_dir: &std::path::Path) -> String {
         .unwrap_or_else(|| panic!("no version in {}", manifest.display()))
 }
 
+/// Hex SHA-256 of `bytes` — the content hash bundled into each registry entry
+/// so hosts can spot a project's stale embedded copy without recompiling wasm.
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
 /// Reports a missing wasm artifact. Normally a warning (dev builds often
 /// don't need the bundle — tests, check builds), but release packaging must
 /// not silently ship an empty library: with VOLUMETRIC_ASSETS_REQUIRE set
@@ -130,13 +143,16 @@ fn main() {
             if wasm_path.exists() {
                 println!("cargo:rerun-if-changed={}", wasm_path.display());
                 let version = crate_version(&workspace_root.join(subdir).join(name));
+                let bytes = fs::read(&wasm_path)
+                    .unwrap_or_else(|e| panic!("read {}: {e}", wasm_path.display()));
+                let hash = sha256_hex(&bytes);
                 let bytes_static = format!("{}_BYTES", name.to_uppercase());
                 code.push_str(&format!(
                     "static {bytes_static}: &[u8] = include_bytes!(\"{}\");\n",
                     wasm_path.display()
                 ));
                 entries.push_str(&format!(
-                    "    BundledAsset {{\n        name: \"{name}\",\n        version: \"{version}\",\n        bytes: {bytes_static},\n        category: AssetCategory::{kind},\n    }},\n",
+                    "    BundledAsset {{\n        name: \"{name}\",\n        version: \"{version}\",\n        hash: \"{hash}\",\n        bytes: {bytes_static},\n        category: AssetCategory::{kind},\n    }},\n",
                 ));
             } else {
                 missing(&wasm_path, kind, name);

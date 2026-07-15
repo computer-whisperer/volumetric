@@ -47,6 +47,12 @@ pub struct BundledAsset {
     /// metadata, so this matches the declared metadata version without
     /// compiling the module.
     pub version: &'static str,
+    /// Hex SHA-256 of `bytes`, computed at build time. Projects embed operator
+    /// bytes verbatim, so a host can detect a stale embedded copy — even one
+    /// that kept the same `version` across a rebuild — by hashing the import
+    /// and comparing against this. The UI's
+    /// `bundled_asset_registry_matches_declared_metadata` test keeps it honest.
+    pub hash: &'static str,
     /// The raw WASM bytes
     pub bytes: &'static [u8],
     /// The category of this asset

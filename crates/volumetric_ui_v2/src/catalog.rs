@@ -302,7 +302,7 @@ fn parse_declared_icon(metadata: &OperatorMetadata) -> Option<SvgIcon> {
     }
 }
 
-fn hex_sha256(bytes: &[u8]) -> String {
+pub(crate) fn hex_sha256(bytes: &[u8]) -> String {
     use std::fmt::Write;
     let digest = Sha256::digest(bytes);
     let mut out = String::with_capacity(64);

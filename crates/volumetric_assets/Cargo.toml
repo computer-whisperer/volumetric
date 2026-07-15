@@ -8,3 +8,6 @@ description = "Bundled WASM assets for volumetric (models and operators)"
 default = ["models", "operators"]
 models = []
 operators = []
+
+[build-dependencies]
+sha2 = "0.10"
