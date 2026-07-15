@@ -130,6 +130,47 @@ impl Catalog {
             .unwrap_or(name)
     }
 
+    /// Declared metadata for a module identified by content hash — a warmed
+    /// catalog entry or the persisted foreign cache. Lets a project-embedded
+    /// operator reuse metadata the Add catalog already compiled, skipping the
+    /// wasm compile on a hit.
+    pub fn metadata_for_hash(&self, hash: &str) -> Option<&OperatorMetadata> {
+        if let Some(metadata) = self
+            .entries
+            .iter()
+            .find(|entry| entry.hash == hash)
+            .and_then(CatalogEntry::ready)
+        {
+            return Some(metadata);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(metadata) = self.foreign_cache.get(hash) {
+            return Some(metadata);
+        }
+        None
+    }
+
+    /// Record a module's declared metadata under its content hash so later
+    /// sessions serve it from the persisted cache without recompiling —
+    /// called when a project-embedded operator (absent from the bundled
+    /// registry) is read in the background. A hash already covered by a
+    /// catalog entry, or already cached identically, needs no rewrite.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn note_metadata_for_hash(&mut self, hash: String, metadata: OperatorMetadata) {
+        if self.entries.iter().any(|entry| entry.hash == hash)
+            || self.foreign_cache.get(&hash) == Some(&metadata)
+        {
+            return;
+        }
+        self.foreign_cache.insert(hash, metadata);
+        self.persist();
+    }
+
+    /// Web shell: no persisted cache (same gap as settings), so nothing to
+    /// record — every session rescans.
+    #[cfg(target_arch = "wasm32")]
+    pub fn note_metadata_for_hash(&mut self, _hash: String, _metadata: OperatorMetadata) {}
+
     /// The next module a warm scan should read: the first pending entry,
     /// one at a time (scans are idle-priority; serial keeps them out of
     /// the way of real work). Returns `None` while one is in flight.

@@ -592,6 +592,7 @@ impl Host {
             || viewport_resized
             || gfx.session.has_pending_preview()
             || gfx.session.run_in_flight()
+            || self.app.has_pending_metadata()
         {
             gfx.window.request_redraw();
         }

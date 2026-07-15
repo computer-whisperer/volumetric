@@ -137,6 +137,9 @@ impl Session {
                 BackgroundResult::ModuleMetadataReady { name, result } => {
                     app.on_module_metadata(&name, result);
                 }
+                BackgroundResult::ImportMetadataReady { id, result } => {
+                    app.on_import_metadata(&id, result);
+                }
             }
         }
 
@@ -183,6 +186,13 @@ impl Session {
 
         if let Some(name) = app.take_operator_metadata_request() {
             jobs.push(BackgroundJob::ReadOperatorMetadata { name });
+        }
+
+        // One deferred import metadata read per frame; each completion pings a
+        // repaint (the shell keeps painting while `has_pending_metadata`), so
+        // the queue drains steadily without a burst of byte-carrying jobs.
+        if let Some((id, bytes)) = app.take_import_metadata_request() {
+            jobs.push(BackgroundJob::ReadImportMetadata { id, bytes });
         }
 
         // Catalog warm scan: one idle-priority metadata read at a time
@@ -1467,6 +1477,16 @@ pub enum BackgroundJob {
     ScanModuleMetadata {
         name: String,
     },
+    /// Read a project-embedded operator's declared metadata off the UI
+    /// thread. Unlike [`Self::ReadOperatorMetadata`], the bytes travel with
+    /// the job — a project import can be a rebuilt or custom operator that
+    /// isn't in the bundled registry. Deferred by a cold `operator_import_info`
+    /// so the wasm compile never blocks the event loop; low priority, since
+    /// only panel decorations wait on it.
+    ReadImportMetadata {
+        id: String,
+        bytes: Vec<u8>,
+    },
 }
 
 /// A completed unit of background work, routed by [`Session::pre_frame`].
@@ -1500,6 +1520,12 @@ pub enum BackgroundResult {
         name: String,
         result: Result<volumetric::OperatorMetadata, String>,
     },
+    /// A deferred project-embedded operator metadata read finished; routed to
+    /// `on_import_metadata`, which fills the import's metadata cache entry.
+    ImportMetadataReady {
+        id: String,
+        result: Result<volumetric::OperatorMetadata, String>,
+    },
 }
 
 /// Coalescing job queue: the newest queued project run wins (a burst of edits
@@ -1513,6 +1539,9 @@ pub struct JobQueue {
     previews: HashMap<String, PreviewBuildJob>,
     lightbox: Option<BackgroundJob>,
     metadata: Option<BackgroundJob>,
+    /// Deferred project-import metadata reads, FIFO. Several land at once on
+    /// project open; the worker takes them one at a time after previews.
+    import_metadata: std::collections::VecDeque<BackgroundJob>,
     scan: Option<BackgroundJob>,
 }
 
@@ -1530,13 +1559,20 @@ impl JobQueue {
             metadata @ BackgroundJob::ReadOperatorMetadata { .. } => self.metadata = Some(metadata),
             // One catalog scan is in flight at a time (the catalog serializes).
             scan @ BackgroundJob::ScanModuleMetadata { .. } => self.scan = Some(scan),
+            // Import reads accumulate; the app dedups by id, so no coalescing.
+            import @ BackgroundJob::ReadImportMetadata { .. } => {
+                self.import_metadata.push_back(import)
+            }
         }
     }
 
     /// The next job to execute: a pending run first, then the lightbox (the
     /// user is actively looking at it), then operator metadata (a click is
-    /// waiting on it), then one preview, and only then a catalog warm scan
-    /// (nothing waits on those).
+    /// waiting on it), then one preview, then a deferred import metadata read,
+    /// and only then a catalog warm scan (nothing waits on those). Import
+    /// reads sit below previews so opening a project shows its geometry before
+    /// warming panel decorations — and a preceding run compiles the same
+    /// modules, so those reads then hit a warm module cache.
     pub fn pop(&mut self) -> Option<BackgroundJob> {
         if let Some(run) = self.run.take() {
             return Some(run);
@@ -1551,6 +1587,9 @@ impl JobQueue {
             let preview = self.previews.remove(&id).expect("key just observed");
             return Some(BackgroundJob::BuildPreview(preview));
         }
+        if let Some(import) = self.import_metadata.pop_front() {
+            return Some(import);
+        }
         self.scan.take()
     }
 
@@ -1559,6 +1598,7 @@ impl JobQueue {
             && self.previews.is_empty()
             && self.lightbox.is_none()
             && self.metadata.is_none()
+            && self.import_metadata.is_empty()
             && self.scan.is_none()
     }
 }
@@ -1663,6 +1703,11 @@ pub fn execute_job_monitored(
                 None => Err(format!("missing bundled module {name}")),
             };
             BackgroundResult::ModuleMetadataReady { name, result }
+        }
+        BackgroundJob::ReadImportMetadata { id, bytes } => {
+            let result = volumetric::operator_metadata_from_wasm_bytes(&bytes)
+                .map_err(|err| err.to_string());
+            BackgroundResult::ImportMetadataReady { id, result }
         }
     }
 }

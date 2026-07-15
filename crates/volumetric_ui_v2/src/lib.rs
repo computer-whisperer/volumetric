@@ -1162,6 +1162,19 @@ pub struct VolumetricUiV2 {
     /// metadata would serve one stale answer, which the next run corrects.
     operator_metadata_cache:
         std::cell::RefCell<std::collections::HashMap<String, OperatorImportCacheEntry>>,
+    /// Operator-import ids whose declared metadata still needs reading.
+    /// Reading it compiles the operator's wasm (~200ms each) — too slow for
+    /// the UI thread — so a cold [`Self::operator_import_info`] enqueues here
+    /// instead of compiling inline. The host drains one per frame into a
+    /// background [`ReadImportMetadata`](BackgroundJob) job; results land via
+    /// [`Self::on_import_metadata`]. Interior mutability so the `&self` build
+    /// path can enqueue; the memoized cache entry keeps repeat calls from
+    /// re-enqueueing.
+    import_metadata_queue: std::cell::RefCell<std::collections::VecDeque<String>>,
+    /// Import metadata reads dispatched to the worker but not yet applied.
+    /// Keeps the shell repainting until they land (see
+    /// [`Self::has_pending_metadata`]).
+    import_metadata_inflight: usize,
 }
 
 impl Default for VolumetricUiV2 {
@@ -1237,6 +1250,8 @@ impl VolumetricUiV2 {
             panel_width: PANEL_WIDTH_DEFAULT,
             panel_drag: ResizeDrag::default(),
             operator_metadata_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            import_metadata_queue: std::cell::RefCell::new(std::collections::VecDeque::new()),
+            import_metadata_inflight: 0,
         }
     }
 
@@ -1947,6 +1962,98 @@ impl VolumetricUiV2 {
         }
     }
 
+    /// Host hook: the next deferred operator-import metadata read to dispatch
+    /// to the worker, as `(import id, bytes)`. A cold
+    /// [`Self::operator_import_info`] queued it rather than compile the
+    /// operator's wasm on the UI thread; the result returns via
+    /// [`Self::on_import_metadata`]. Skips ids whose import vanished before
+    /// dispatch.
+    pub(crate) fn take_import_metadata_request(&mut self) -> Option<(String, Vec<u8>)> {
+        loop {
+            let id = self.import_metadata_queue.get_mut().pop_front()?;
+            if let Some(bytes) = self.operator_bytes(&id) {
+                self.import_metadata_inflight += 1;
+                return Some((id, bytes));
+            }
+        }
+    }
+
+    /// Host hook: a deferred operator-import metadata read finished. Fills the
+    /// import's metadata cache entry (keeping its byte length and hash) and,
+    /// on success, records the metadata under its content hash so future
+    /// sessions serve it from the persisted catalog cache without recompiling.
+    /// A failure leaves the entry's metadata `None` (no metadata shown, no
+    /// retry — a rebuilt import re-enters as a fresh hash), matching how the
+    /// catalog treats a failed scan.
+    pub(crate) fn on_import_metadata(
+        &mut self,
+        operator_id: &str,
+        result: Result<OperatorMetadata, String>,
+    ) {
+        self.import_metadata_inflight = self.import_metadata_inflight.saturating_sub(1);
+        let import_len = match self
+            .project
+            .imports()
+            .iter()
+            .find(|import| import.id == operator_id)
+        {
+            Some(import) => import.data.len(),
+            None => return, // import removed while its read was in flight
+        };
+        // The hash was taken when the entry was deferred; recompute from the
+        // bytes only if the entry is somehow gone, so the cache key stays sound.
+        let hash = self
+            .operator_metadata_cache
+            .borrow()
+            .get(operator_id)
+            .map(|(_, _, hash)| hash.clone())
+            .or_else(|| {
+                self.operator_bytes(operator_id)
+                    .map(|b| catalog::hex_sha256(&b))
+            });
+        let Some(hash) = hash else {
+            return;
+        };
+        let metadata = result.ok();
+        if let Some(metadata) = metadata.clone() {
+            self.catalog.note_metadata_for_hash(hash.clone(), metadata);
+        }
+        self.operator_metadata_cache
+            .borrow_mut()
+            .insert(operator_id.to_string(), (import_len, metadata, hash));
+    }
+
+    /// Whether operator-import metadata reads are still queued or in flight —
+    /// the shell keeps repainting while true so deferred reads drain even when
+    /// the app is otherwise idle.
+    pub(crate) fn has_pending_metadata(&self) -> bool {
+        self.import_metadata_inflight > 0 || !self.import_metadata_queue.borrow().is_empty()
+    }
+
+    /// Test helper: drive deferred operator-import metadata reads to
+    /// completion the way the session worker and `pre_frame` would, so
+    /// upgrade offers and typed outputs resolve synchronously in tests with no
+    /// running host loop. Demands metadata for every operator import first
+    /// (as `build`'s panels do), then compiles and applies each queued read.
+    #[cfg(test)]
+    fn pump_import_metadata(&mut self) {
+        let ids: Vec<String> = self
+            .project
+            .imports()
+            .iter()
+            .filter(|import| import.type_hint == Some(AssetTypeHint::Operator))
+            .map(|import| import.id.clone())
+            .collect();
+        for id in &ids {
+            let _ = self.operator_import_info(id);
+        }
+        while let Some((id, bytes)) = self.take_import_metadata_request() {
+            let result =
+                volumetric::operator_metadata_from_wasm_bytes(&bytes).map_err(|e| e.to_string());
+            self.on_import_metadata(&id, result);
+        }
+    }
+
     /// Host hook: `count` in-flight preview builds were signalled to cancel.
     pub(crate) fn on_mesh_builds_cancelled(&mut self, count: usize) {
         self.status = match count {
@@ -2431,24 +2538,37 @@ impl VolumetricUiV2 {
         &self,
         operator_id: &str,
     ) -> Option<(Option<OperatorMetadata>, String)> {
-        let import_len = self
+        let import = self
             .project
             .imports()
             .iter()
-            .find(|import| import.id == operator_id)?
-            .data
-            .len();
+            .find(|import| import.id == operator_id)?;
+        let import_len = import.data.len();
 
-        let mut cache = self.operator_metadata_cache.borrow_mut();
-        if let Some((len, metadata, hash)) = cache.get(operator_id)
-            && *len == import_len
         {
-            return Some((metadata.clone(), hash.clone()));
+            let cache = self.operator_metadata_cache.borrow();
+            if let Some((len, metadata, hash)) = cache.get(operator_id)
+                && *len == import_len
+            {
+                return Some((metadata.clone(), hash.clone()));
+            }
         }
-        let bytes = self.operator_bytes(operator_id)?;
-        let metadata = volumetric::operator_metadata_from_wasm_bytes(&bytes).ok();
-        let hash = catalog::hex_sha256(&bytes);
-        cache.insert(
+
+        // Cold entry. Hashing is cheap, but reading declared metadata compiles
+        // the operator's wasm (~200ms each) — far too slow for the UI thread.
+        // Take the hash now (it keys the cache and drives the upgrade offer),
+        // serve metadata from the catalog's content-hash cache when it's
+        // there, and otherwise defer the compile to a background read. The
+        // memoized entry (metadata `None` until the read lands) keeps the
+        // per-frame build path from re-enqueueing.
+        let hash = catalog::hex_sha256(&import.data);
+        let metadata = self.catalog.metadata_for_hash(&hash).cloned();
+        if metadata.is_none() {
+            self.import_metadata_queue
+                .borrow_mut()
+                .push_back(operator_id.to_string());
+        }
+        self.operator_metadata_cache.borrow_mut().insert(
             operator_id.to_string(),
             (import_len, metadata.clone(), hash.clone()),
         );
@@ -6876,6 +6996,10 @@ mod tests {
 
         let bundled = volumetric_assets::get_operator("translate_operator")
             .expect("bundled translate_operator");
+        // Metadata reads are deferred off the UI thread; drive them to
+        // completion so the offer resolves (a custom stale operator is not in
+        // the catalog's hash cache, so it genuinely compiles).
+        app.pump_import_metadata();
         let offer = operator_upgrade_offer(&app, &app.project.imports()[0]);
         assert_eq!(
             offer,
@@ -6889,8 +7013,11 @@ mod tests {
             UiEvent::synthetic_click(format!("{UPGRADE_IMPORT_PREFIX}0")),
         );
 
+        assert_eq!(app.project().imports()[0].data, bundled.bytes);
+        // The upgrade cleared the cache entry; pump again so the re-check sees
+        // resolved metadata (up to date) rather than a still-pending read.
+        app.pump_import_metadata();
         let import = &app.project().imports()[0];
-        assert_eq!(import.data, bundled.bytes);
         assert!(
             operator_upgrade_offer(&app, import).is_none(),
             "up-to-date import offers nothing"
@@ -6901,6 +7028,42 @@ mod tests {
             &step.inputs[0],
             ExecutionInput::AssetRef(id) if id == "part"
         ));
+    }
+
+    #[test]
+    fn cold_operator_import_metadata_defers_off_the_ui_thread() {
+        // Reading an operator import's declared metadata compiles its wasm
+        // (~200ms each) — the project-open stall this backgrounding fixes. A
+        // cold demand must queue a read and return `None`, never compile on
+        // the calling (UI) thread.
+        let mut app = VolumetricUiV2::empty();
+        app.project
+            .imports_mut()
+            .push(volumetric::ImportedAsset::operator(
+                "translate_operator".to_string(),
+                // Custom bytes: not in the catalog's content-hash cache, so it
+                // genuinely needs a compile — which must be deferred.
+                stale_operator_wasm("translate_operator", "0.0.1"),
+            ));
+
+        assert!(
+            app.operator_metadata_cached("translate_operator").is_none(),
+            "cold metadata must defer, not resolve inline"
+        );
+        assert!(
+            app.has_pending_metadata(),
+            "the demand must queue a background read"
+        );
+
+        // The worker + pre_frame path resolves it; then it's cached and the
+        // queue is drained.
+        app.pump_import_metadata();
+        assert!(!app.has_pending_metadata());
+        let metadata = app
+            .operator_metadata_cached("translate_operator")
+            .expect("metadata resolves once the read lands");
+        assert_eq!(metadata.name, "translate_operator");
+        assert_eq!(metadata.version, "0.0.1");
     }
 
     #[test]
@@ -6919,6 +7082,8 @@ mod tests {
                 stale_operator_wasm("translate_operator", bundled.version),
             ));
 
+        // Deferred metadata read; drive it so the content-hash offer resolves.
+        app.pump_import_metadata();
         let offer = operator_upgrade_offer(&app, &app.project.imports()[0]);
         assert_eq!(
             offer,
@@ -6933,11 +7098,13 @@ mod tests {
             UiEvent::synthetic_click(format!("{UPGRADE_IMPORT_PREFIX}0")),
         );
 
-        let import = &app.project().imports()[0];
         assert_eq!(
-            import.data, bundled.bytes,
+            app.project().imports()[0].data,
+            bundled.bytes,
             "rebuild swaps in the bundled bytes"
         );
+        app.pump_import_metadata();
+        let import = &app.project().imports()[0];
         assert!(
             operator_upgrade_offer(&app, import).is_none(),
             "up-to-date import offers nothing"
