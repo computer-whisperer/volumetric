@@ -171,10 +171,8 @@ fn write_lattice_press_vproj() {
     use ciborium::value::Value;
     let out = std::env::var("VPROJ_OUT").expect("set VPROJ_OUT=<path>");
     let precond = std::env::var("VPROJ_PRECOND").unwrap_or_else(|_| "schwarz".into());
-    let project = lattice_press_project(
-        0.04,
-        cbor_map(&[("preconditioner", Value::Text(precond))]),
-    );
+    let project =
+        lattice_press_project(0.04, cbor_map(&[("preconditioner", Value::Text(precond))]));
     project
         .save_to_file(std::path::Path::new(&out))
         .expect("write vproj");
