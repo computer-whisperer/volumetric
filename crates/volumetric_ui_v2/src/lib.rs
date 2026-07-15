@@ -483,6 +483,59 @@ fn default_recent_adds() -> Vec<String> {
     .to_vec()
 }
 
+/// Target unit for STL export. Engine geometry is canonically in metres;
+/// the chosen unit's [`ExportUnit::factor_text`] is the metres→unit factor
+/// written into the scale buffer, so every vertex is multiplied to land in
+/// that unit. Binary STL carries no unit metadata and slicers conventionally
+/// read it as millimetres, so `Mm` (×1000) exports true size — the default.
+/// `Custom` marks a hand-edited scale that isn't one of the presets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportUnit {
+    Mm,
+    Cm,
+    M,
+    In,
+    Custom,
+}
+
+impl ExportUnit {
+    /// The metres→unit factor written into the scale buffer, or `None` for
+    /// `Custom` (whatever the user typed stands).
+    fn factor_text(self) -> Option<&'static str> {
+        match self {
+            ExportUnit::Mm => Some("1000"),
+            ExportUnit::Cm => Some("100"),
+            ExportUnit::M => Some("1"),
+            // 1 in = 0.0254 m, so metres→inches is 1/0.0254.
+            ExportUnit::In => Some("39.3701"),
+            ExportUnit::Custom => None,
+        }
+    }
+
+    /// The preset for a route/button id (`mm`/`cm`/`m`/`in`), or `None`.
+    fn from_id(id: &str) -> Option<ExportUnit> {
+        match id {
+            "mm" => Some(ExportUnit::Mm),
+            "cm" => Some(ExportUnit::Cm),
+            "m" => Some(ExportUnit::M),
+            "in" => Some(ExportUnit::In),
+            _ => None,
+        }
+    }
+
+    /// Short label: the preset id for the four units, doubling as the size
+    /// readout suffix. A `Custom` factor has no defined unit, so `units`.
+    fn label(self) -> &'static str {
+        match self {
+            ExportUnit::Mm => "mm",
+            ExportUnit::Cm => "cm",
+            ExportUnit::M => "m",
+            ExportUnit::In => "in",
+            ExportUnit::Custom => "units",
+        }
+    }
+}
+
 /// The open mesh-export modal: which output, the preview geometry as a
 /// damascene scene handle (delivered by the session from the preview cache
 /// the frame after opening), and the export configuration being edited.
@@ -490,6 +543,9 @@ fn default_recent_adds() -> Vec<String> {
 pub struct ExportDialogState {
     pub asset_id: String,
     pub mesh: ExportPreviewMesh,
+    /// Target unit; drives the active preset highlight and the size-readout
+    /// suffix. `Custom` once the scale buffer is hand-edited off a preset.
+    pub unit: ExportUnit,
     /// Controlled scale-factor text buffer; parsed (finite, positive) at
     /// build time for the size readout and the Export button's enabled
     /// state, and again at confirm.
@@ -1543,7 +1599,8 @@ impl VolumetricUiV2 {
         self.export_dialog = Some(ExportDialogState {
             asset_id: id.to_string(),
             mesh: ExportPreviewMesh::Pending,
-            scale_text: "1".to_string(),
+            unit: ExportUnit::Mm,
+            scale_text: ExportUnit::Mm.factor_text().unwrap().to_string(),
         });
         self.open_select = None;
     }
@@ -3412,12 +3469,17 @@ impl App for VolumetricUiV2 {
         // (applied at confirm; a half-typed value just disables Export).
         if event.target_key() == Some(EXPORT_SCALE_KEY) {
             if let Some(export) = self.export_dialog.as_mut() {
-                text_input::apply_event(
+                let changed = text_input::apply_event(
                     &mut export.scale_text,
                     &mut self.selection,
                     &event,
                     EXPORT_SCALE_KEY,
                 );
+                // A hand-edited factor no longer matches a preset unit; the
+                // readout then reads in generic "units".
+                if changed {
+                    export.unit = ExportUnit::Custom;
+                }
             }
             return;
         }
@@ -3778,17 +3840,15 @@ impl App for VolumetricUiV2 {
             self.export_dialog = None;
         } else if route == EXPORT_CONFIRM_KEY {
             self.confirm_export();
-        } else if let Some(unit) = route.strip_prefix(EXPORT_UNIT_PREFIX) {
-            // Presets set the model-unit → millimetre factor (STL consumers
-            // read the file as mm).
-            let factor = match unit {
-                "mm" => Some("1"),
-                "cm" => Some("10"),
-                "m" => Some("1000"),
-                "in" => Some("25.4"),
-                _ => None,
-            };
-            if let (Some(factor), Some(export)) = (factor, self.export_dialog.as_mut()) {
+        } else if let Some(id) = route.strip_prefix(EXPORT_UNIT_PREFIX) {
+            // Presets pick the target STL unit: the metres→unit factor is
+            // written into the scale buffer. Geometry is canonically metres,
+            // and slicers read STL as mm, so `mm` (×1000) exports true size.
+            if let Some(unit) = ExportUnit::from_id(id)
+                && let Some(factor) = unit.factor_text()
+                && let Some(export) = self.export_dialog.as_mut()
+            {
+                export.unit = unit;
                 export.scale_text = factor.to_string();
             }
         } else if let Some(id) = route.strip_prefix(EXPORT_WASM_PREFIX) {
@@ -4372,17 +4432,18 @@ fn export_layer(app: &VolumetricUiV2) -> Option<El> {
                     .caption()
                     .muted(),
             );
-            // Size readout follows the scale factor live, so the preset
-            // buttons double as a sanity check on the exported dimensions.
+            // Size readout follows the scale factor live, so the unit
+            // presets double as a sanity check on the exported dimensions.
             let factor = scale.unwrap_or(1.0);
             let (min, max) = *bounds;
             let scaled_min = (min.0 * factor, min.1 * factor, min.2 * factor);
             let scaled_max = (max.0 * factor, max.1 * factor, max.2 * factor);
             body.push(
                 text(format!(
-                    "{} triangles · {} mm",
+                    "{} triangles · {} {}",
                     format_count(*triangles),
                     format_dims(scaled_min, scaled_max),
+                    export.unit.label(),
                 ))
                 .caption()
                 .muted(),
@@ -4406,29 +4467,38 @@ fn export_layer(app: &VolumetricUiV2) -> Option<El> {
     }
     body.push(divider());
     body.push(field_row("Format", text("STL · binary").label()));
-    let unit_button = |unit: &str, label: &str| {
-        button(label)
+    let unit_button = |unit: ExportUnit| {
+        let button = button(unit.label())
             .xsmall()
-            .secondary()
-            .key(format!("{EXPORT_UNIT_PREFIX}{unit}"))
+            .key(format!("{EXPORT_UNIT_PREFIX}{}", unit.label()));
+        if export.unit == unit {
+            button.primary()
+        } else {
+            button.secondary()
+        }
     };
     body.push(field_row(
-        "Scale",
+        "Unit",
         row([
-            text_input(EXPORT_SCALE_KEY, &export.scale_text, &app.selection)
-                .width(Size::Fixed(96.0)),
-            unit_button("mm", "mm"),
-            unit_button("cm", "cm"),
-            unit_button("m", "m"),
-            unit_button("in", "in"),
+            unit_button(ExportUnit::Mm),
+            unit_button(ExportUnit::Cm),
+            unit_button(ExportUnit::M),
+            unit_button(ExportUnit::In),
         ])
         .gap(tokens::SPACE_1)
         .align(Align::Center),
     ));
+    body.push(field_row(
+        "Scale",
+        text_input(EXPORT_SCALE_KEY, &export.scale_text, &app.selection).width(Size::Fixed(96.0)),
+    ));
     body.push(
-        text("Unit presets set the factor from model units to millimetres — STL is read as mm.")
-            .caption()
-            .muted(),
+        text(
+            "Geometry is in metres; the unit sets the metres→unit factor written to the \
+             STL (slicers read it as mm). Edit Scale to override the factor directly.",
+        )
+        .caption()
+        .muted(),
     );
     if scale.is_none() {
         body.push(form_message("Scale must be a positive number."));
@@ -7801,17 +7871,27 @@ mod tests {
         );
         assert_eq!(app.export_dialog_wants_mesh(), None, "delivered once");
 
-        // The inch preset rewrites the scale buffer; confirm carries it.
+        // Geometry is canonically metres, so a fresh dialog defaults to the
+        // millimetre preset (×1000) — true size for slicers that read mm.
+        {
+            let export = app.export_dialog.as_ref().unwrap();
+            assert_eq!(export.unit, ExportUnit::Mm);
+            assert_eq!(export.scale_text, "1000");
+        }
+
+        // The inch preset (metres→inches) rewrites the scale buffer and
+        // selects the unit; confirm carries the factor.
         dispatch(
             &mut app,
             UiEvent::synthetic_click(format!("{EXPORT_UNIT_PREFIX}in")),
         );
+        assert_eq!(app.export_dialog.as_ref().unwrap().unit, ExportUnit::In);
         dispatch(&mut app, UiEvent::synthetic_click(EXPORT_CONFIRM_KEY));
         assert_eq!(
             app.take_file_action(),
             Some(FileAction::ExportMesh {
                 id: exports[0].clone(),
-                scale: 25.4,
+                scale: 39.3701,
             })
         );
         assert!(app.export_dialog.is_none(), "confirm closes the modal");
