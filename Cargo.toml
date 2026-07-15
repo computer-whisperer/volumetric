@@ -40,6 +40,8 @@ members = [
     "crates/operators/subspace_operator",
     "crates/operators/model_bound_operator",
     "crates/operators/slice_operator",
+    "crates/operators/span_operator",
+    "crates/operators/intersect_operator",
     "crates/volumetric_abi",
     "crates/model_merge_core",
     "crates/lattice_model_core",

@@ -270,6 +270,207 @@ impl Subspace {
         let len = normal.iter().map(|v| v * v).sum::<f64>().sqrt();
         Some(normal.iter().map(|v| v / len).collect())
     }
+
+    /// The affine span (lattice *join*) of several subspaces: the smallest
+    /// affine subspace containing all of them. This is the "features
+    /// define a bigger feature" constructor — two points span a line,
+    /// three non-collinear points a plane, a line and an off-line point a
+    /// plane, a plane and an off-plane point the full 3-space.
+    ///
+    /// All inputs must share the ambient dimension `n`. The chart origin
+    /// is the centroid of the input origins (always a point of the span);
+    /// the basis orthonormalizes the inputs' basis vectors together with
+    /// their origin offsets, so the rank is the *honest* dimension of the
+    /// span — three collinear points yield a line, not a degenerate
+    /// "plane". Errors only on structural problems: empty input, mixed
+    /// ambient dimensions, or an invalid input.
+    pub fn span(parts: &[Subspace]) -> Result<Subspace, String> {
+        let n = Self::common_ambient(parts, "span")?;
+        // Centroid of the input origins — a point of the span, symmetric
+        // in the inputs and independent of their order.
+        let mut origin = vec![0.0; n];
+        for p in parts {
+            for (o, po) in origin.iter_mut().zip(&p.origin) {
+                *o += po;
+            }
+        }
+        for o in &mut origin {
+            *o /= parts.len() as f64;
+        }
+        // Direction vectors: every input basis vector, plus each origin's
+        // offset from the centroid (what carries "these points sit apart").
+        let mut basis: Vec<Vec<f64>> = Vec::new();
+        for p in parts {
+            for i in 0..p.rank() {
+                gram_schmidt_accept(&mut basis, p.basis_vector(i));
+            }
+            let offset: Vec<f64> = p.origin.iter().zip(&origin).map(|(a, b)| a - b).collect();
+            gram_schmidt_accept(&mut basis, &offset);
+        }
+        let subspace = Subspace {
+            dimensions: n as u32,
+            origin,
+            basis: basis.into_iter().flatten().collect(),
+        };
+        subspace.validate()?;
+        Ok(subspace)
+    }
+
+    /// The affine meet (lattice *intersection*) of several subspaces: the
+    /// largest affine subspace contained in all of them — two planes meet
+    /// in a line, a plane and a line in a point. Dual to [`Subspace::span`].
+    ///
+    /// All inputs must share the ambient dimension `n`. Each input becomes
+    /// constraint rows (its orthonormal complement, one per codimension);
+    /// the intersection is the common solution set. `tolerance` is the
+    /// world-distance slack for deciding whether the inputs actually meet:
+    /// parallel or skew inputs whose constraints disagree by more than
+    /// `tolerance` are rejected with an error rather than returning a bogus
+    /// subspace. The chart origin is the solution point nearest the input
+    /// centroid.
+    pub fn intersect(parts: &[Subspace], tolerance: f64) -> Result<Subspace, String> {
+        let n = Self::common_ambient(parts, "intersect")?;
+        // Accumulate orthonormal constraint rows c_j with target values
+        // e_j, so the intersection is { x : <c_j, x> = e_j for all j }.
+        let mut c: Vec<Vec<f64>> = Vec::new();
+        let mut e: Vec<f64> = Vec::new();
+        for p in parts {
+            let rows: Vec<Vec<f64>> = (0..p.rank()).map(|i| p.basis_vector(i).to_vec()).collect();
+            for normal in orthonormal_complement(&rows, n) {
+                let target = dot(&normal, &p.origin);
+                // Reduce the new normal against the existing constraints;
+                // a_j = <normal, c_j> because the c_j are orthonormal.
+                let mut residual = normal.clone();
+                let mut implied = 0.0;
+                for (cj, &ej) in c.iter().zip(&e) {
+                    let a = dot(&normal, cj);
+                    implied += a * ej;
+                    for (r, v) in residual.iter_mut().zip(cj) {
+                        *r -= a * v;
+                    }
+                }
+                let rnorm = norm(&residual);
+                if rnorm > INDEPENDENCE_EPSILON {
+                    // A genuinely new constraint direction.
+                    c.push(residual.iter().map(|x| x / rnorm).collect());
+                    e.push((target - implied) / rnorm);
+                } else if (target - implied).abs() > tolerance {
+                    // Same direction already constrained to a different
+                    // offset: the inputs do not share a point.
+                    return Err(
+                        "subspaces do not intersect (parallel or skew within tolerance)"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        // Origin: the solution point nearest the input centroid. Start at
+        // the centroid and remove each constraint violation along c_j;
+        // orthonormal c_j make the corrections independent, so the result
+        // satisfies every constraint exactly.
+        let mut origin = vec![0.0; n];
+        for p in parts {
+            for (o, po) in origin.iter_mut().zip(&p.origin) {
+                *o += po;
+            }
+        }
+        for o in &mut origin {
+            *o /= parts.len() as f64;
+        }
+        for (cj, &ej) in c.iter().zip(&e) {
+            let violation = dot(cj, &origin) - ej;
+            for (o, v) in origin.iter_mut().zip(cj) {
+                *o -= violation * v;
+            }
+        }
+        let subspace = Subspace {
+            dimensions: n as u32,
+            origin,
+            basis: orthonormal_complement(&c, n)
+                .into_iter()
+                .flatten()
+                .collect(),
+        };
+        subspace.validate()?;
+        Ok(subspace)
+    }
+
+    /// Validate every part and return their shared ambient dimension, or an
+    /// error naming `op` if the list is empty or the dimensions disagree.
+    fn common_ambient(parts: &[Subspace], op: &str) -> Result<usize, String> {
+        let first = parts
+            .first()
+            .ok_or_else(|| format!("{op} needs at least one subspace"))?;
+        let n = first.ambient();
+        for p in parts {
+            p.validate()?;
+            if p.ambient() != n {
+                return Err(format!(
+                    "cannot {op} subspaces of different ambient dimensions ({} and {n})",
+                    p.ambient()
+                ));
+            }
+        }
+        Ok(n)
+    }
+}
+
+/// Residual norm below which a Gram-Schmidt candidate counts as dependent
+/// (already in the span). Inputs are unit-normalized first, so this is an
+/// absolute bound on a unit-scale residual.
+const INDEPENDENCE_EPSILON: f64 = 1e-9;
+
+fn dot(a: &[f64], b: &[f64]) -> f64 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+fn norm(v: &[f64]) -> f64 {
+    dot(v, v).sqrt()
+}
+
+/// Modified Gram-Schmidt step: normalize `v`, subtract its projection onto
+/// each orthonormal vector already in `acc`, and — if a component survives
+/// — push that unit remainder and return `true`. Near-zero or dependent
+/// vectors are dropped (`false`).
+fn gram_schmidt_accept(acc: &mut Vec<Vec<f64>>, v: &[f64]) -> bool {
+    let len = norm(v);
+    if len < 1e-12 {
+        return false;
+    }
+    let mut r: Vec<f64> = v.iter().map(|x| x / len).collect();
+    for u in acc.iter() {
+        let a = dot(&r, u);
+        for (ri, ui) in r.iter_mut().zip(u) {
+            *ri -= a * ui;
+        }
+    }
+    let rnorm = norm(&r);
+    if rnorm < INDEPENDENCE_EPSILON {
+        return false;
+    }
+    for x in &mut r {
+        *x /= rnorm;
+    }
+    acc.push(r);
+    true
+}
+
+/// An orthonormal basis of the orthogonal complement of `rows` in
+/// `n`-space: orthonormalize the rows, complete the basis with the
+/// standard axes, and return the completion — the `n - rank(rows)` vectors
+/// the axes contributed.
+fn orthonormal_complement(rows: &[Vec<f64>], n: usize) -> Vec<Vec<f64>> {
+    let mut acc: Vec<Vec<f64>> = Vec::new();
+    for r in rows {
+        gram_schmidt_accept(&mut acc, r);
+    }
+    let base = acc.len();
+    for k in 0..n {
+        let mut axis = vec![0.0; n];
+        axis[k] = 1.0;
+        gram_schmidt_accept(&mut acc, &axis);
+    }
+    acc.split_off(base)
 }
 
 /// Determinant of a k x k matrix (row-major, consumed) by Gaussian
@@ -478,5 +679,121 @@ mod tests {
             basis: vec![2.0, 0.0, 0.0],
         }));
         assert!(garbage.is_err());
+    }
+
+    fn point3(x: f64, y: f64, z: f64) -> Subspace {
+        Subspace::point(vec![x, y, z])
+    }
+
+    /// A basis direction is (anti)parallel to `axis` when its cross product
+    /// with the axis vanishes.
+    fn parallel_to(v: &[f64], axis: [f64; 3]) -> bool {
+        let cross = [
+            v[1] * axis[2] - v[2] * axis[1],
+            v[2] * axis[0] - v[0] * axis[2],
+            v[0] * axis[1] - v[1] * axis[0],
+        ];
+        cross.iter().all(|c| c.abs() < 1e-9)
+    }
+
+    #[test]
+    fn span_builds_up_by_rank() {
+        // Two distinct points -> a line through them.
+        let line = Subspace::span(&[point3(0.0, 0.0, 0.0), point3(2.0, 0.0, 0.0)]).unwrap();
+        assert_eq!(line.rank(), 1);
+        assert!(parallel_to(line.basis_vector(0), [1.0, 0.0, 0.0]));
+
+        // Three non-collinear points -> the plane they define.
+        let plane = Subspace::span(&[
+            point3(0.0, 0.0, 0.0),
+            point3(1.0, 0.0, 0.0),
+            point3(0.0, 1.0, 0.0),
+        ])
+        .unwrap();
+        assert_eq!(plane.rank(), 2);
+        // Centroid of the three corners.
+        assert!(plane.project(&[1.0 / 3.0, 1.0 / 3.0, 0.0]).1 < 1e-12);
+        assert!(parallel_to(&plane.normal().unwrap(), [0.0, 0.0, 1.0]));
+
+        // A line and an off-line point -> a plane.
+        let x_axis = Subspace::axis_aligned(vec![0.0, 0.0, 0.0], &[0]).unwrap();
+        let plane2 = Subspace::span(&[x_axis, point3(0.0, 1.0, 0.0)]).unwrap();
+        assert_eq!(plane2.rank(), 2);
+        assert!(parallel_to(&plane2.normal().unwrap(), [0.0, 0.0, 1.0]));
+
+        // A plane and a point off it -> the full 3-space.
+        let xy = Subspace::axis_aligned(vec![0.0, 0.0, 0.0], &[0, 1]).unwrap();
+        let full = Subspace::span(&[xy, point3(0.0, 0.0, 5.0)]).unwrap();
+        assert_eq!(full.rank(), 3);
+    }
+
+    #[test]
+    fn span_is_honest_about_degeneracy() {
+        // Three collinear points are a line, not a fake plane.
+        let collinear = Subspace::span(&[
+            point3(0.0, 0.0, 0.0),
+            point3(1.0, 0.0, 0.0),
+            point3(2.0, 0.0, 0.0),
+        ])
+        .unwrap();
+        assert_eq!(collinear.rank(), 1);
+        assert!(parallel_to(collinear.basis_vector(0), [1.0, 0.0, 0.0]));
+
+        // A single input is returned as-is (re-anchored at its own origin).
+        let single = Subspace::span(&[point3(3.0, 4.0, 5.0)]).unwrap();
+        assert_eq!(single.rank(), 0);
+        assert_eq!(single.origin, vec![3.0, 4.0, 5.0]);
+
+        // Structural errors.
+        assert!(Subspace::span(&[]).is_err());
+        assert!(
+            Subspace::span(&[point3(0.0, 0.0, 0.0), Subspace::point(vec![0.0, 0.0])]).is_err()
+        );
+    }
+
+    #[test]
+    fn intersect_cuts_down_by_rank() {
+        let origin = vec![0.0, 0.0, 0.0];
+        let xy = Subspace::axis_aligned(origin.clone(), &[0, 1]).unwrap();
+        let xz = Subspace::axis_aligned(origin.clone(), &[0, 2]).unwrap();
+
+        // Two planes through the origin meet in the shared axis (x).
+        let line = Subspace::intersect(&[xy.clone(), xz], 1e-9).unwrap();
+        assert_eq!(line.rank(), 1);
+        assert!(parallel_to(line.basis_vector(0), [1.0, 0.0, 0.0]));
+        assert!(line.project(&origin).1 < 1e-9);
+
+        // A plane and a line piercing it meet in a point.
+        let z_axis = Subspace::axis_aligned(origin.clone(), &[2]).unwrap();
+        let point = Subspace::intersect(&[xy.clone(), z_axis], 1e-9).unwrap();
+        assert_eq!(point.rank(), 0);
+        assert!(point.origin.iter().all(|c| c.abs() < 1e-9));
+
+        // Three planes (x=1, y=2, z=3) meet in a single corner point.
+        let px = Subspace::axis_aligned(vec![1.0, 0.0, 0.0], &[1, 2]).unwrap();
+        let py = Subspace::axis_aligned(vec![0.0, 2.0, 0.0], &[0, 2]).unwrap();
+        let pz = Subspace::axis_aligned(vec![0.0, 0.0, 3.0], &[0, 1]).unwrap();
+        let corner = Subspace::intersect(&[px, py, pz], 1e-9).unwrap();
+        assert_eq!(corner.rank(), 0);
+        for (got, want) in corner.origin.iter().zip([1.0, 2.0, 3.0]) {
+            assert!((got - want).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn intersect_rejects_non_meeting_inputs() {
+        // Parallel planes at z=0 and z=1 never meet.
+        let z0 = Subspace::axis_aligned(vec![0.0, 0.0, 0.0], &[0, 1]).unwrap();
+        let z1 = Subspace::axis_aligned(vec![0.0, 0.0, 1.0], &[0, 1]).unwrap();
+        assert!(Subspace::intersect(&[z0.clone(), z1], 1e-9).is_err());
+
+        // A line parallel to a plane but offset from it never meets it.
+        let x_at_z5 = Subspace::axis_aligned(vec![0.0, 0.0, 5.0], &[0]).unwrap();
+        assert!(Subspace::intersect(&[z0.clone(), x_at_z5], 1e-9).is_err());
+
+        // A single input is returned unchanged as a point set.
+        let solo = Subspace::intersect(&[z0.clone()], 1e-9).unwrap();
+        assert_eq!(solo.rank(), 2);
+        assert!(parallel_to(&solo.normal().unwrap(), [0.0, 0.0, 1.0]));
     }
 }

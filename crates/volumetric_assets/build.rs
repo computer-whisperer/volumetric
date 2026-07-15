@@ -47,6 +47,8 @@ const OPERATORS: &[&str] = &[
     "subspace_operator",
     "model_bound_operator",
     "slice_operator",
+    "span_operator",
+    "intersect_operator",
 ];
 
 /// Reads `version = "..."` from a bundled crate's Cargo.toml. Every bundled
