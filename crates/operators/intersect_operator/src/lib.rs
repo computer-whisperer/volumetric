@@ -74,8 +74,8 @@ fn read_parts() -> Result<Vec<Subspace>, String> {
         if bytes.is_empty() {
             continue;
         }
-        let subspace =
-            decode_subspace(&bytes).map_err(|e| format!("input {idx} is not a usable subspace: {e}"))?;
+        let subspace = decode_subspace(&bytes)
+            .map_err(|e| format!("input {idx} is not a usable subspace: {e}"))?;
         parts.push(subspace);
     }
     Ok(parts)

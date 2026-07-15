@@ -2159,10 +2159,7 @@ impl VolumetricUiV2 {
             (self.cache_budget_bytes / 2).max(MIN)
         };
         self.set_cache_budget(self.cache_budget_bytes);
-        self.status = format!(
-            "build cache budget: {}",
-            format_mb(self.cache_budget_bytes)
-        );
+        self.status = format!("build cache budget: {}", format_mb(self.cache_budget_bytes));
     }
 
     /// Sets the build-cache budget preference (settings restore path).
@@ -4498,7 +4495,12 @@ fn cache_settings_popover(app: &VolumetricUiV2) -> El {
             text("Build cache").label().semibold(),
             field_row(
                 "Resident",
-                text(format!("{} in {} steps", format_mb(stats.bytes), stats.entries)).label(),
+                text(format!(
+                    "{} in {} steps",
+                    format_mb(stats.bytes),
+                    stats.entries
+                ))
+                .label(),
             )
             .gap(tokens::SPACE_2),
             field_row(
@@ -7943,8 +7945,10 @@ mod tests {
     /// dialogs from the Add modal, never to a bare operator insert.
     #[test]
     fn import_operators_route_to_file_dialogs() {
-        let mut app = VolumetricUiV2::default();
-        app.add_modal = Some(AddModalState::default());
+        let mut app = VolumetricUiV2 {
+            add_modal: Some(AddModalState::default()),
+            ..Default::default()
+        };
         let mut keys = Vec::new();
         collect_keys(&add_layer(&app).expect("modal open"), &mut keys);
         assert!(

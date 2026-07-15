@@ -173,7 +173,7 @@ fn write_lattice_press_vproj() {
     let precond = std::env::var("VPROJ_PRECOND").unwrap_or_else(|_| "schwarz".into());
     let project = lattice_press_project(
         0.04,
-        cbor_map(&[("preconditioner", Value::Text(precond.into()))]),
+        cbor_map(&[("preconditioner", Value::Text(precond))]),
     );
     project
         .save_to_file(std::path::Path::new(&out))

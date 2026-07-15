@@ -74,8 +74,8 @@ fn read_parts() -> Result<Vec<Subspace>, String> {
         if bytes.is_empty() {
             continue;
         }
-        let subspace =
-            decode_subspace(&bytes).map_err(|e| format!("input {idx} is not a usable subspace: {e}"))?;
+        let subspace = decode_subspace(&bytes)
+            .map_err(|e| format!("input {idx} is not a usable subspace: {e}"))?;
         parts.push(subspace);
     }
     Ok(parts)
@@ -123,8 +123,8 @@ pub extern "C" fn run() {
 pub extern "C" fn get_metadata() -> i64 {
     static METADATA: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     volumetric_abi::metadata_reply(&METADATA, || {
-        let schema =
-            r#"{ expect: "any" / "point" / "line" / "plane" / "frame" .default "any" }"#.to_string();
+        let schema = r#"{ expect: "any" / "point" / "line" / "plane" / "frame" .default "any" }"#
+            .to_string();
         let mut inputs = vec![OperatorMetadataInput::CBORConfiguration(schema)];
         let mut input_names = vec!["Config".to_string()];
         for i in 1..=SUBSPACE_SLOTS {

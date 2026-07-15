@@ -746,9 +746,7 @@ mod tests {
 
         // Structural errors.
         assert!(Subspace::span(&[]).is_err());
-        assert!(
-            Subspace::span(&[point3(0.0, 0.0, 0.0), Subspace::point(vec![0.0, 0.0])]).is_err()
-        );
+        assert!(Subspace::span(&[point3(0.0, 0.0, 0.0), Subspace::point(vec![0.0, 0.0])]).is_err());
     }
 
     #[test]
@@ -792,7 +790,7 @@ mod tests {
         assert!(Subspace::intersect(&[z0.clone(), x_at_z5], 1e-9).is_err());
 
         // A single input is returned unchanged as a point set.
-        let solo = Subspace::intersect(&[z0.clone()], 1e-9).unwrap();
+        let solo = Subspace::intersect(std::slice::from_ref(&z0), 1e-9).unwrap();
         assert_eq!(solo.rank(), 2);
         assert!(parallel_to(&solo.normal().unwrap(), [0.0, 0.0, 1.0]));
     }

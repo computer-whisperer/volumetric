@@ -86,7 +86,7 @@ jobs:
           path: volumetric/main
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-unknown
+          targets: wasm32-unknown-unknown, wasm32-wasip1-threads
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -97,7 +97,10 @@ jobs:
       # The volumetric_assets build script bundles the model/operator WASM
       # modules from target/wasm32-unknown-unknown/release/, and the v2 UI
       # tests assert against those bundled assets — build them first.
-      - run: cargo build-wasm
+      # wasm-dist (not bare build-wasm) also packs the wasm32-wasip1-threads
+      # fea-solver variants into their baseline blobs, so the fea_threaded
+      # tests can reach the Schwarz preconditioner's threaded solve.
+      - run: cargo wasm-dist
       - run: cargo test --workspace
 
   wasm:

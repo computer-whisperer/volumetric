@@ -107,7 +107,14 @@ fn baked_round_trip_rebuilds_from_cache_alone() {
     let mut reopened = Project::from_cbor(&bytes).expect("deserializes");
     let fresh = BuildCache::new(0);
     let report = reopened.seed_build_cache(&fresh);
-    assert_eq!((report.seeded_steps, report.corrupt_blobs, report.skipped_steps), (2, 0, 0));
+    assert_eq!(
+        (
+            report.seeded_steps,
+            report.corrupt_blobs,
+            report.skipped_steps
+        ),
+        (2, 0, 0)
+    );
     assert!(
         reopened.baked.is_none(),
         "seeding consumes the in-memory bake"
@@ -187,7 +194,11 @@ fn corrupt_blob_is_rejected_and_recomputed() {
     let fresh = BuildCache::new(0);
     let report = reopened.seed_build_cache(&fresh);
     assert_eq!(
-        (report.seeded_steps, report.corrupt_blobs, report.skipped_steps),
+        (
+            report.seeded_steps,
+            report.corrupt_blobs,
+            report.skipped_steps
+        ),
         (1, 1, 1)
     );
 
