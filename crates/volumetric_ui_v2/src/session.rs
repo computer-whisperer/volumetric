@@ -19,8 +19,8 @@ use glam::{Mat4, Vec2, Vec3};
 use volumetric_renderer as renderer;
 
 use crate::{
-    LightboxData, LightboxMode, OutputStats, PreviewBuildStatus, PreviewMeshPlan, PreviewPlan,
-    PreviewRequest, RunState, VolumetricUiV2,
+    LightboxData, LightboxMode, OutputStats, PreviewArtifactStatus, PreviewBuildStatus,
+    PreviewMeshPlan, PreviewPlan, PreviewRequest, RunState, VolumetricUiV2,
 };
 use volumetric::AssetTypeHint;
 // Model executors come from the engine's backend factory so both wasm
@@ -217,6 +217,12 @@ impl Session {
         );
         app.set_preview_build_status(status);
         app.set_output_stats(self.viewport.preview_cache.output_stats());
+        let artifact_requests = app.preview_artifact_requests();
+        app.set_preview_artifacts(
+            self.viewport
+                .preview_cache
+                .artifact_statuses(&artifact_requests),
+        );
         app.set_viewport_overflow(self.viewport.frame_overflow_message());
         jobs.extend(preview_jobs.into_iter().map(BackgroundJob::BuildPreview));
 
@@ -1231,6 +1237,44 @@ impl PreviewCache {
             .collect()
     }
 
+    /// Per-output lifecycle for each current render recipe. Querying every
+    /// materialized output is read-only: only [`Self::sync`] dispatches work,
+    /// and it receives the selected/pinned request set separately.
+    fn artifact_statuses(
+        &self,
+        requests: &[PreviewRequest],
+    ) -> std::collections::BTreeMap<String, PreviewArtifactStatus> {
+        requests
+            .iter()
+            .map(|request| {
+                let id = &request.asset_id;
+                let key = PreviewSceneKey::from(request);
+                let cached = self.entities.get(id);
+                let pending = self.pending.get(id).map(|build| &build.key) == Some(&key);
+                let failed = self
+                    .failed
+                    .get(id)
+                    .and_then(|(failed, error)| (failed == &key).then_some(error));
+                let status = if pending {
+                    if cached.is_some() {
+                        PreviewArtifactStatus::Updating
+                    } else {
+                        PreviewArtifactStatus::Building
+                    }
+                } else if let Some(error) = failed {
+                    PreviewArtifactStatus::Failed(error.clone())
+                } else if cached.map(|build| &build.key) == Some(&key) {
+                    PreviewArtifactStatus::Ready
+                } else if cached.is_some() || self.declined.get(id) == Some(&key) {
+                    PreviewArtifactStatus::Stale
+                } else {
+                    PreviewArtifactStatus::Missing
+                };
+                (id.clone(), status)
+            })
+            .collect()
+    }
+
     /// Returns the aggregate artifact status and the jobs needed to bring the
     /// currently requested viewport set up to date. Existing artifacts and
     /// in-flight builds outside that set are retained; [`Self::retain_assets`]
@@ -1456,19 +1500,29 @@ impl ExecutionBackend for LocalBackend {
         progress: &dyn Fn(volumetric::BuildProgress),
     ) -> Result<Option<Arc<volumetric::AdaptiveMeshV2Result>>, String> {
         let key = volumetric::MeshCacheKey::new(model_wasm, config);
-        if let Some(mesh) = volumetric::mesh_cache::global().get(&key) {
-            progress(volumetric::BuildProgress {
-                phase: "mesh artifact cache hit".to_string(),
-                fraction: Some(1.0),
-            });
-            return Ok(Some(mesh));
+        let artifact = volumetric::mesh_cache::global()
+            .get_or_build(key, cancel, || {
+                volumetric::generate_adaptive_mesh_v2_from_bytes_monitored(
+                    model_wasm, config, cancel, progress,
+                )
+            })
+            .map_err(format_error_chain)?;
+        if let Some(artifact) = &artifact {
+            let phase = match artifact.source {
+                volumetric::mesh_cache::MeshCacheSource::Hit => Some("mesh artifact cache hit"),
+                volumetric::mesh_cache::MeshCacheSource::Shared => {
+                    Some("shared identical in-flight mesh artifact")
+                }
+                volumetric::mesh_cache::MeshCacheSource::Built => None,
+            };
+            if let Some(phase) = phase {
+                progress(volumetric::BuildProgress {
+                    phase: phase.to_string(),
+                    fraction: Some(1.0),
+                });
+            }
         }
-
-        volumetric::generate_adaptive_mesh_v2_from_bytes_monitored(
-            model_wasm, config, cancel, progress,
-        )
-        .map(|mesh| mesh.map(|mesh| volumetric::mesh_cache::global().insert(key, mesh)))
-        .map_err(format_error_chain)
+        Ok(artifact.map(|artifact| artifact.mesh))
     }
 }
 
@@ -4139,6 +4193,43 @@ function get_bounds_max_y() return 1.5 end
             stats["a"].bounds,
             Some(((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))),
             "stats carry the entity's bounds for the dimension readout"
+        );
+    }
+
+    #[test]
+    fn per_output_artifact_status_tracks_build_update_and_failure() {
+        let mut cache = PreviewCache::default();
+        let coarse = vec![request("a", 8)];
+        assert_eq!(
+            cache.artifact_statuses(&coarse)["a"],
+            PreviewArtifactStatus::Missing
+        );
+
+        let (_, jobs) = cache.sync(&coarse, true, false);
+        assert_eq!(
+            cache.artifact_statuses(&coarse)["a"],
+            PreviewArtifactStatus::Building
+        );
+        accept_ok(&mut cache, jobs.into_iter().next().unwrap());
+        assert_eq!(
+            cache.artifact_statuses(&coarse)["a"],
+            PreviewArtifactStatus::Ready
+        );
+
+        let fine = vec![request("a", 32)];
+        let (_, jobs) = cache.sync(&fine, true, false);
+        assert_eq!(
+            cache.artifact_statuses(&fine)["a"],
+            PreviewArtifactStatus::Updating
+        );
+        let job = jobs.into_iter().next().unwrap();
+        cache.accept(PreviewBuildResult {
+            key: job.key,
+            result: Err(PreviewBuildError::Failed("mesher stopped".to_string())),
+        });
+        assert_eq!(
+            cache.artifact_statuses(&fine)["a"],
+            PreviewArtifactStatus::Failed("mesher stopped".to_string())
         );
     }
 

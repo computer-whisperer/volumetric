@@ -713,6 +713,53 @@ pub enum PreviewBuildStatus {
     },
 }
 
+/// Lifecycle of one materialized output's current preview artifact recipe.
+/// Unlike [`PreviewBuildStatus`], this is per output and remains meaningful
+/// when the output is not currently visible.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum PreviewArtifactStatus {
+    /// The output kind has no viewport representation.
+    #[default]
+    Unavailable,
+    /// Renderable, but this recipe has never been generated.
+    Missing,
+    /// Generating with no older preview to show.
+    Building,
+    /// Generating while an older completed recipe remains available.
+    Updating,
+    Ready,
+    /// A completed artifact exists for another recipe, or generation was
+    /// suppressed by manual mode/cancellation.
+    Stale,
+    Failed(String),
+}
+
+impl PreviewArtifactStatus {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Unavailable => "not previewable",
+            Self::Missing => "not generated",
+            Self::Building => "generating",
+            Self::Updating => "updating",
+            Self::Ready => "ready",
+            Self::Stale => "stale",
+            Self::Failed(_) => "failed",
+        }
+    }
+
+    fn tooltip(&self) -> &str {
+        match self {
+            Self::Unavailable => "This output kind has no viewport preview.",
+            Self::Missing => "No preview artifact has been generated for these settings.",
+            Self::Building => "Generating this output's first preview artifact.",
+            Self::Updating => "Generating new settings; the previous preview remains available.",
+            Self::Ready => "The current preview artifact is cached and ready.",
+            Self::Stale => "The cached preview does not match the current settings.",
+            Self::Failed(error) => error,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ViewportCameraCommand {
     FramePreview,
@@ -1136,6 +1183,8 @@ pub struct VolumetricUiV2 {
     pipeline_open: std::collections::BTreeSet<String>,
     /// Meshing stats per built output, mirrored from the host's preview cache.
     output_stats: std::collections::BTreeMap<String, OutputStats>,
+    /// Per-output preview artifact lifecycle, mirrored from the host cache.
+    preview_artifacts: std::collections::BTreeMap<String, PreviewArtifactStatus>,
     /// Geometry the viewport had to drop at the GPU buffer size limit,
     /// mirrored from the renderer each frame; shown as a HUD warning.
     viewport_overflow: Option<String>,
@@ -1244,6 +1293,7 @@ impl VolumetricUiV2 {
             // Steps carry the editing workflow; imports/exports start folded.
             pipeline_open: ["steps"].into_iter().map(str::to_string).collect(),
             output_stats: std::collections::BTreeMap::new(),
+            preview_artifacts: std::collections::BTreeMap::new(),
             viewport_overflow: None,
             lightbox: None,
             export_dialog: None,
@@ -1288,6 +1338,16 @@ impl VolumetricUiV2 {
 
         ids.into_iter()
             .filter_map(|id| self.runtime_assets.iter().find(|asset| asset.id() == id))
+            .filter_map(|asset| self.render_request_for_asset(asset))
+            .collect()
+    }
+
+    /// Current preview recipes for every renderable materialized output.
+    /// Used for status inspection only; unlike [`Self::preview_requests`],
+    /// this set does not cause hidden outputs to be generated.
+    pub(crate) fn preview_artifact_requests(&self) -> Vec<PreviewRequest> {
+        self.runtime_assets
+            .iter()
             .filter_map(|asset| self.render_request_for_asset(asset))
             .collect()
     }
@@ -2195,6 +2255,7 @@ impl VolumetricUiV2 {
         self.runtime_assets.clear();
         self.pinned_outputs.clear();
         self.output_overrides.clear();
+        self.preview_artifacts.clear();
         self.last_run_elapsed_ms = None;
         self.last_run_error = None;
         self.last_run_stale = false;
@@ -2377,6 +2438,13 @@ impl VolumetricUiV2 {
         stats: std::collections::BTreeMap<String, OutputStats>,
     ) {
         self.output_stats = stats;
+    }
+
+    pub(crate) fn set_preview_artifacts(
+        &mut self,
+        artifacts: std::collections::BTreeMap<String, PreviewArtifactStatus>,
+    ) {
+        self.preview_artifacts = artifacts;
     }
 
     /// Rebuilds the step editor when the selected step changes. While the same
@@ -5699,6 +5767,7 @@ fn runtime_asset_row(app: &VolumetricUiV2, asset: &LoadedAsset) -> El {
     let visible = app.output_is_visible(id);
     let render = app.output_render(id);
     let overridden = app.output_overrides.contains_key(id);
+    let artifact = app.preview_artifacts.get(id).cloned().unwrap_or_default();
 
     let pin = icon_button(&*PIN_ICON)
         .xsmall()
@@ -5728,14 +5797,16 @@ fn runtime_asset_row(app: &VolumetricUiV2, asset: &LoadedAsset) -> El {
             .width(Size::Fixed(12.0)),
         column([
             text(format!(
-                "{} · {}{}",
+                "{} · {} · {}{}",
                 asset_type_label(asset.type_hint()),
                 render.summary(),
+                artifact.label(),
                 if overridden { " *" } else { "" },
             ))
             .caption()
             .muted()
             .ellipsis()
+            .tooltip(artifact.tooltip())
             .width(Size::Fill(1.0)),
             text(id).label().ellipsis().width(Size::Fill(1.0)),
         ])

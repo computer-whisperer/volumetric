@@ -424,36 +424,44 @@ fn execute(
         }
         JobRequest::MeshModel { model_wasm, config } => {
             let key = volumetric::MeshCacheKey::new(model_wasm, config);
-            let cached = mesh_cache.get(&key);
-            if cached.is_some() {
+            let artifact = mesh_cache
+                .get_or_build(key, cancel, || {
+                    volumetric::generate_adaptive_mesh_v2_from_bytes_monitored(
+                        model_wasm,
+                        config,
+                        cancel,
+                        on_progress,
+                    )
+                })
+                // {:#} flattens the anyhow context chain into one line.
+                .map_err(|e| format!("{e:#}"))?;
+            if let Some(artifact) = &artifact {
+                let phase = match artifact.source {
+                    volumetric::mesh_cache::MeshCacheSource::Hit => "mesh artifact cache hit",
+                    volumetric::mesh_cache::MeshCacheSource::Shared => {
+                        "shared identical in-flight mesh artifact"
+                    }
+                    volumetric::mesh_cache::MeshCacheSource::Built => "mesh artifact built",
+                };
                 on_progress(volumetric::BuildProgress {
-                    phase: "mesh artifact cache hit".to_string(),
+                    phase: phase.to_string(),
                     fraction: Some(1.0),
                 });
             }
-            let result = match cached {
-                Some(mesh) => Some(mesh),
-                None => volumetric::generate_adaptive_mesh_v2_from_bytes_monitored(
-                    model_wasm,
-                    config,
-                    cancel,
-                    on_progress,
-                )
-                .map(|mesh| mesh.map(|mesh| mesh_cache.insert(key, mesh)))
-                // {:#} flattens the anyhow context chain into one line.
-                .map_err(|e| format!("{e:#}"))?,
-            };
-            match result {
-                Some(result) => Ok(Some(JobOutput::MeshModel {
-                    mesh: MeshPayload::pack(
-                        &result.vertices,
-                        &result.normals,
-                        &result.indices,
-                        result.bounds_min.into(),
-                        result.bounds_max.into(),
-                    ),
-                    stats: result.stats.clone(),
-                })),
+            match artifact {
+                Some(artifact) => {
+                    let result = artifact.mesh;
+                    Ok(Some(JobOutput::MeshModel {
+                        mesh: MeshPayload::pack(
+                            &result.vertices,
+                            &result.normals,
+                            &result.indices,
+                            result.bounds_min.into(),
+                            result.bounds_max.into(),
+                        ),
+                        stats: result.stats.clone(),
+                    }))
+                }
                 None => Ok(None),
             }
         }

@@ -234,6 +234,51 @@ fn mesh_model_returns_a_plausible_box_mesh() {
 }
 
 #[test]
+fn simultaneous_identical_mesh_jobs_share_one_daemon_build() {
+    let (handle, _client) = start_daemon(2);
+    let address = format!("http://{}", handle.addr());
+    let request = JobRequest::MeshModel {
+        model_wasm: box_model(),
+        config: volumetric::adaptive_surface_nets_2::AdaptiveMeshConfig2 {
+            base_resolution: 8,
+            max_depth: 3,
+            ..Default::default()
+        },
+    };
+    let start = std::sync::Arc::new(std::sync::Barrier::new(3));
+
+    let workers: Vec<_> = (0..2)
+        .map(|_| {
+            let address = address.clone();
+            let request = request.clone();
+            let start = std::sync::Arc::clone(&start);
+            std::thread::spawn(move || {
+                let client = DaemonClient::new(&address);
+                start.wait();
+                client
+                    .run(&request, NEVER_CANCEL, IGNORE_PROGRESS)
+                    .expect("mesh job completes")
+            })
+        })
+        .collect();
+    start.wait();
+    for worker in workers {
+        assert!(matches!(
+            worker.join().unwrap(),
+            JobOutcome::Success {
+                output: JobOutput::MeshModel { .. },
+                ..
+            }
+        ));
+    }
+
+    let stats = handle.mesh_cache_stats();
+    assert_eq!(stats.entries, 1);
+    assert_eq!(stats.coalesced, 1, "one remote job should join the other");
+    handle.shutdown();
+}
+
+#[test]
 fn cancellation_stops_queued_and_running_jobs() {
     let (handle, client) = start_daemon(1);
 
