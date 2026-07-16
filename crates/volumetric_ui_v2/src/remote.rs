@@ -59,20 +59,22 @@ pub fn project_exports_from_output(
 /// Maps a mesh job's output to the meshing result (`Ok(None)`: cancelled).
 pub fn mesh_result_from_output(
     output: Option<JobOutput>,
-) -> Result<Option<volumetric::AdaptiveMeshV2Result>, String> {
+) -> Result<Option<std::sync::Arc<volumetric::AdaptiveMeshV2Result>>, String> {
     match output {
         Some(JobOutput::MeshModel { mesh, stats }) => {
             let vertices = mesh.unpack_positions().map_err(|e| e.to_string())?;
             let normals = mesh.unpack_normals().map_err(|e| e.to_string())?;
             let indices = mesh.unpack_indices().map_err(|e| e.to_string())?;
-            Ok(Some(volumetric::AdaptiveMeshV2Result {
-                vertices,
-                normals,
-                indices,
-                bounds_min: mesh.bounds_min.into(),
-                bounds_max: mesh.bounds_max.into(),
-                stats,
-            }))
+            Ok(Some(std::sync::Arc::new(
+                volumetric::AdaptiveMeshV2Result {
+                    vertices,
+                    normals,
+                    indices,
+                    bounds_min: mesh.bounds_min.into(),
+                    bounds_max: mesh.bounds_max.into(),
+                    stats,
+                },
+            )))
         }
         Some(_) => Err("daemon returned the wrong output kind for a mesh job".to_string()),
         None => Ok(None),
@@ -151,7 +153,7 @@ impl ExecutionBackend for RemoteBackend {
         config: &AdaptiveMeshConfig2,
         cancel: &AtomicBool,
         progress: &dyn Fn(volumetric::BuildProgress),
-    ) -> Result<Option<volumetric::AdaptiveMeshV2Result>, String> {
+    ) -> Result<Option<std::sync::Arc<volumetric::AdaptiveMeshV2Result>>, String> {
         let request = JobRequest::MeshModel {
             model_wasm: model_wasm.to_vec(),
             config: config.clone(),
@@ -220,8 +222,10 @@ mod tests {
             .expect("bundled sphere model")
             .bytes
             .to_vec();
+        let source_hash = volumetric::content_fingerprint(&sphere);
         let request = PreviewRequest {
             asset_id: "sphere".to_string(),
+            source_hash,
             data: Arc::new(sphere),
             type_hint: Some(volumetric::AssetTypeHint::Model),
             precursor_ids: vec![],
@@ -245,7 +249,7 @@ mod tests {
         };
         let job = PreviewBuildJob {
             key: (&request).into(),
-            request,
+            request: request.clone(),
             cancel: Arc::new(AtomicBool::new(false)),
         };
 
@@ -259,6 +263,21 @@ mod tests {
             .map_err(|_| "preview build failed")
             .expect("sphere meshes through the daemon");
         assert!(entity.stats.triangles > 0);
+
+        // The daemon owns a content-addressed mesh layer below its short-lived
+        // job results. A second UI job with the same bytes/recipe must reuse it.
+        let hits_before = handle.mesh_cache_stats().hits;
+        let job = PreviewBuildJob {
+            key: (&request).into(),
+            request,
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        let result = execute_job_with(BackgroundJob::BuildPreview(job), &backend);
+        let BackgroundResult::PreviewComplete(preview) = result else {
+            panic!("wrong result kind");
+        };
+        assert!(preview.result.is_ok());
+        assert_eq!(handle.mesh_cache_stats().hits, hits_before + 1);
 
         handle.shutdown();
     }

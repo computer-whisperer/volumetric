@@ -12,7 +12,9 @@
 //! Job-thread panics are caught and reported as job failures — one broken
 //! operator or mesher input must not take the daemon down. Finished
 //! outcomes are retained for `result_ttl` and then swept, so a client that
-//! disappeared doesn't pin hundreds of MB of mesh forever.
+//! disappeared doesn't pin a response forever. Successful ASN2 geometry also
+//! enters a separate content-addressed, byte-budgeted mesh cache, allowing a
+//! later job to reuse the expensive artifact after the response expires.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -42,6 +44,9 @@ pub struct DaemonConfig {
     /// (`volumetric::build_cache`). Size against the container/host memory
     /// limit: the cache retains intermediate build blobs across jobs.
     pub build_cache_bytes: usize,
+    /// Byte budget for completed ASN2 mesh artifacts shared across remote
+    /// requests. This is independent of short-lived job-result retention.
+    pub mesh_cache_bytes: usize,
 }
 
 impl Default for DaemonConfig {
@@ -52,6 +57,7 @@ impl Default for DaemonConfig {
             result_ttl: Duration::from_secs(600),
             accept_threads: 8,
             build_cache_bytes: volumetric::build_cache::DEFAULT_BUDGET_BYTES,
+            mesh_cache_bytes: volumetric::mesh_cache::DEFAULT_BUDGET_BYTES,
         }
     }
 }
@@ -74,6 +80,7 @@ struct DaemonState {
     /// Counting semaphore for execution slots.
     running: Mutex<usize>,
     slot_freed: Condvar,
+    mesh_cache: volumetric::MeshCache,
     config: DaemonConfig,
 }
 
@@ -81,6 +88,7 @@ struct DaemonState {
 /// [`DaemonHandle::shutdown`] (used by tests) or let the process exit.
 pub struct DaemonHandle {
     server: Arc<tiny_http::Server>,
+    state: Arc<DaemonState>,
     addr: SocketAddr,
     accept_threads: Vec<std::thread::JoinHandle<()>>,
 }
@@ -89,6 +97,12 @@ impl DaemonHandle {
     /// The actually-bound address (resolves port 0).
     pub fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// Point-in-time generated-mesh cache counters. Useful to operators and
+    /// integration tests without coupling the wire protocol to observability.
+    pub fn mesh_cache_stats(&self) -> volumetric::mesh_cache::MeshCacheStats {
+        self.state.mesh_cache.stats()
     }
 
     /// Stops accepting requests and joins the accept threads. Jobs already
@@ -134,6 +148,7 @@ pub fn start(config: DaemonConfig) -> anyhow::Result<DaemonHandle> {
         next_job_id: AtomicU64::new(1),
         running: Mutex::new(0),
         slot_freed: Condvar::new(),
+        mesh_cache: volumetric::MeshCache::new(config.mesh_cache_bytes),
         config,
     });
 
@@ -151,6 +166,7 @@ pub fn start(config: DaemonConfig) -> anyhow::Result<DaemonHandle> {
 
     Ok(DaemonHandle {
         server,
+        state,
         addr,
         accept_threads,
     })
@@ -354,7 +370,7 @@ fn run_job(state: &Arc<DaemonState>, job_id: u64, mut request: JobRequest, cance
         };
         let started = Instant::now();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            execute(&request, cancel, &on_progress)
+            execute(&request, cancel, &on_progress, &state.mesh_cache)
         }));
         match result {
             Ok(Ok(Some(output))) => JobOutcome::Success {
@@ -393,6 +409,7 @@ fn execute(
     request: &JobRequest,
     cancel: &AtomicBool,
     on_progress: &dyn Fn(volumetric::BuildProgress),
+    mesh_cache: &volumetric::MeshCache,
 ) -> Result<Option<JobOutput>, String> {
     match request {
         JobRequest::RunProject { project } => {
@@ -406,13 +423,28 @@ fn execute(
             }
         }
         JobRequest::MeshModel { model_wasm, config } => {
-            match volumetric::generate_adaptive_mesh_v2_from_bytes_monitored(
-                model_wasm,
-                config,
-                cancel,
-                on_progress,
-            ) {
-                Ok(Some(result)) => Ok(Some(JobOutput::MeshModel {
+            let key = volumetric::MeshCacheKey::new(model_wasm, config);
+            let cached = mesh_cache.get(&key);
+            if cached.is_some() {
+                on_progress(volumetric::BuildProgress {
+                    phase: "mesh artifact cache hit".to_string(),
+                    fraction: Some(1.0),
+                });
+            }
+            let result = match cached {
+                Some(mesh) => Some(mesh),
+                None => volumetric::generate_adaptive_mesh_v2_from_bytes_monitored(
+                    model_wasm,
+                    config,
+                    cancel,
+                    on_progress,
+                )
+                .map(|mesh| mesh.map(|mesh| mesh_cache.insert(key, mesh)))
+                // {:#} flattens the anyhow context chain into one line.
+                .map_err(|e| format!("{e:#}"))?,
+            };
+            match result {
+                Some(result) => Ok(Some(JobOutput::MeshModel {
                     mesh: MeshPayload::pack(
                         &result.vertices,
                         &result.normals,
@@ -420,11 +452,9 @@ fn execute(
                         result.bounds_min.into(),
                         result.bounds_max.into(),
                     ),
-                    stats: result.stats,
+                    stats: result.stats.clone(),
                 })),
-                Ok(None) => Ok(None),
-                // {:#} flattens the anyhow context chain into one line.
-                Err(e) => Err(format!("{e:#}")),
+                None => Ok(None),
             }
         }
     }

@@ -666,6 +666,10 @@ pub enum ExecutorChoice {
 #[derive(Clone, Debug)]
 pub struct PreviewRequest {
     pub asset_id: String,
+    /// Stable identity of `data`, independent of which process allocated it.
+    /// Pointer identity is not sufficient for remote results or long-lived
+    /// generated-mesh artifacts.
+    pub source_hash: [u8; 32],
     /// The asset's raw bytes: a model WASM module, or CBOR mesh data for
     /// `AssetTypeHint::FeaMesh` outputs.
     pub data: Arc<Vec<u8>>,
@@ -1821,6 +1825,7 @@ impl VolumetricUiV2 {
         };
         Some(PreviewRequest {
             asset_id: asset.id().to_string(),
+            source_hash: asset.content_hash(),
             data: asset.data_arc(),
             type_hint: asset.type_hint(),
             precursor_ids: asset.precursor_ids().to_vec(),

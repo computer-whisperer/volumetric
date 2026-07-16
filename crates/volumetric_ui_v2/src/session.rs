@@ -201,6 +201,15 @@ impl Session {
             jobs.push(BackgroundJob::ScanModuleMetadata { name });
         }
 
+        // Artifact lifetime follows the materialized project outputs, not the
+        // selected/pinned viewport set. Merely looking at another output must
+        // neither discard a completed mesh nor cancel a costly in-flight one.
+        let live_assets: std::collections::HashMap<&str, [u8; 32]> = app
+            .runtime_assets()
+            .iter()
+            .map(|asset| (asset.id(), asset.content_hash()))
+            .collect();
+        self.viewport.preview_cache.retain_assets(&live_assets);
         let (status, preview_jobs) = self.viewport.preview_cache.sync(
             requests,
             app.auto_remesh(),
@@ -1063,8 +1072,7 @@ fn mesh_triangles(mesh: &renderer::MeshData, transform: Mat4, out: &mut Vec<volu
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PreviewSceneKey {
     pub(crate) asset_id: String,
-    data_ptr: usize,
-    data_len: usize,
+    source_hash: [u8; 32],
     plan: PreviewPlan,
 }
 
@@ -1072,8 +1080,7 @@ impl From<&PreviewRequest> for PreviewSceneKey {
     fn from(request: &PreviewRequest) -> Self {
         Self {
             asset_id: request.asset_id.clone(),
-            data_ptr: Arc::as_ptr(&request.data) as usize,
-            data_len: request.data.len(),
+            source_hash: request.source_hash,
             plan: request.plan.clone(),
         }
     }
@@ -1141,9 +1148,10 @@ impl PreviewBounds {
 /// reconcile/accept logic is unit-tested directly; each accepted build gets
 /// a monotonic revision the viewport uses to keep GPU residency in step.
 ///
-/// Keyed by asset id: each output has at most one cached entity, which is kept
-/// (stale) until a fresh build for the same asset replaces it, so a resolution
-/// or mode change never blanks an output mid-rebuild.
+/// Keyed by asset id: each materialized output has at most one cached entity,
+/// which survives viewport selection changes and is kept stale until a fresh
+/// build for the same asset replaces it. Only removal from the materialized
+/// project output set evicts it.
 #[derive(Default)]
 struct PreviewCache {
     entities: HashMap<String, CachedBuild>,
@@ -1185,6 +1193,25 @@ fn count_outputs(n: usize) -> String {
 }
 
 impl PreviewCache {
+    /// Reconciles artifact ownership against the materialized project outputs.
+    /// Visibility is intentionally absent from this operation: selected and
+    /// pinned requests decide what is submitted, never what remains cached.
+    fn retain_assets(&mut self, live: &std::collections::HashMap<&str, [u8; 32]>) {
+        self.entities
+            .retain(|id, build| live.get(id.as_str()) == Some(&build.key.source_hash));
+        self.pending.retain(|id, build| {
+            let keep = live.get(id.as_str()) == Some(&build.key.source_hash);
+            if !keep {
+                build.cancel.store(true, Ordering::Relaxed);
+            }
+            keep
+        });
+        self.failed
+            .retain(|id, (key, _)| live.get(id.as_str()) == Some(&key.source_hash));
+        self.declined
+            .retain(|id, key| live.get(id.as_str()) == Some(&key.source_hash));
+    }
+
     /// The cached scene for one output, if a build has completed for it.
     fn entity_scene(&self, id: &str) -> Option<&renderer::SceneData> {
         self.entities.get(id).map(|build| &build.entity.scene)
@@ -1204,9 +1231,10 @@ impl PreviewCache {
             .collect()
     }
 
-    /// Drops any outputs no longer requested (cancelling their in-flight
-    /// builds), then returns the aggregate build status and the jobs needed
-    /// to bring the requested set up to date.
+    /// Returns the aggregate artifact status and the jobs needed to bring the
+    /// currently requested viewport set up to date. Existing artifacts and
+    /// in-flight builds outside that set are retained; [`Self::retain_assets`]
+    /// is the only ordinary lifecycle eviction point.
     ///
     /// When `auto` is false, out-of-date outputs are counted as stale instead
     /// of dispatched; `force` (an explicit remesh request) dispatches them
@@ -1217,18 +1245,6 @@ impl PreviewCache {
         auto: bool,
         force: bool,
     ) -> (PreviewBuildStatus, Vec<PreviewBuildJob>) {
-        let desired: std::collections::HashSet<&str> =
-            requests.iter().map(|r| r.asset_id.as_str()).collect();
-        self.entities.retain(|id, _| desired.contains(id.as_str()));
-        self.pending.retain(|id, build| {
-            let keep = desired.contains(id.as_str());
-            if !keep {
-                build.cancel.store(true, Ordering::Relaxed);
-            }
-            keep
-        });
-        self.failed.retain(|id, _| desired.contains(id.as_str()));
-        self.declined.retain(|id, _| desired.contains(id.as_str()));
         if force {
             self.declined.clear();
         }
@@ -1414,7 +1430,7 @@ pub trait ExecutionBackend: Send + Sync {
         config: &volumetric::adaptive_surface_nets_2::AdaptiveMeshConfig2,
         cancel: &AtomicBool,
         progress: &dyn Fn(volumetric::BuildProgress),
-    ) -> Result<Option<volumetric::AdaptiveMeshV2Result>, String>;
+    ) -> Result<Option<Arc<volumetric::AdaptiveMeshV2Result>>, String>;
 }
 
 /// Executes in this process, on whatever thread calls it.
@@ -1438,10 +1454,20 @@ impl ExecutionBackend for LocalBackend {
         config: &volumetric::adaptive_surface_nets_2::AdaptiveMeshConfig2,
         cancel: &AtomicBool,
         progress: &dyn Fn(volumetric::BuildProgress),
-    ) -> Result<Option<volumetric::AdaptiveMeshV2Result>, String> {
+    ) -> Result<Option<Arc<volumetric::AdaptiveMeshV2Result>>, String> {
+        let key = volumetric::MeshCacheKey::new(model_wasm, config);
+        if let Some(mesh) = volumetric::mesh_cache::global().get(&key) {
+            progress(volumetric::BuildProgress {
+                phase: "mesh artifact cache hit".to_string(),
+                fraction: Some(1.0),
+            });
+            return Ok(Some(mesh));
+        }
+
         volumetric::generate_adaptive_mesh_v2_from_bytes_monitored(
             model_wasm, config, cancel, progress,
         )
+        .map(|mesh| mesh.map(|mesh| volumetric::mesh_cache::global().insert(key, mesh)))
         .map_err(format_error_chain)
     }
 }
@@ -2215,7 +2241,7 @@ pub fn preview_prelude(
 pub fn preview_postlude(
     request: &PreviewRequest,
     pending: PendingMesh,
-    mesh: volumetric::AdaptiveMeshV2Result,
+    mesh: Arc<volumetric::AdaptiveMeshV2Result>,
 ) -> PreviewEntity {
     let PendingMesh {
         config: _,
@@ -2237,7 +2263,7 @@ pub fn preview_postlude(
     scene.add_mesh(
         renderer::MeshData {
             vertices,
-            indices: Some(mesh.indices),
+            indices: Some(mesh.indices.clone()),
         },
         glam::Mat4::IDENTITY,
         renderer::MaterialId(0),
@@ -3257,8 +3283,10 @@ mod tests {
             .expect("bundled sphere model")
             .bytes
             .to_vec();
+        let source_hash = volumetric::content_fingerprint(&sphere);
         let request = PreviewRequest {
             asset_id: "sphere".to_string(),
+            source_hash,
             data: Arc::new(sphere),
             type_hint: Some(volumetric::AssetTypeHint::Model),
             precursor_ids: vec![],
@@ -3381,9 +3409,11 @@ mod tests {
     }
 
     fn fea_request(plan: PreviewPlan) -> PreviewRequest {
+        let data = volumetric::fea::encode_fea_mesh(&one_hex_mesh());
         PreviewRequest {
             asset_id: "fea".to_string(),
-            data: Arc::new(volumetric::fea::encode_fea_mesh(&one_hex_mesh())),
+            source_hash: volumetric::content_fingerprint(&data),
+            data: Arc::new(data),
             type_hint: Some(AssetTypeHint::FeaMesh),
             precursor_ids: Vec::new(),
             plan,
@@ -3521,6 +3551,7 @@ mod tests {
         let model = density_model();
         let request = PreviewRequest {
             asset_id: "density_points".to_string(),
+            source_hash: volumetric::content_fingerprint(&model),
             data: Arc::new(model),
             type_hint: None,
             precursor_ids: vec![],
@@ -3793,9 +3824,11 @@ mod tests {
     }
 
     fn request(id: &str, resolution: usize) -> PreviewRequest {
+        let data = vec![1, 2, 3];
         PreviewRequest {
             asset_id: id.to_string(),
-            data: Arc::new(vec![1, 2, 3]),
+            source_hash: volumetric::content_fingerprint(&data),
+            data: Arc::new(data),
             type_hint: None,
             precursor_ids: Vec::new(),
             plan: PreviewPlan::Model3d {
@@ -4137,9 +4170,63 @@ function get_bounds_max_y() return 1.5 end
         );
     }
 
-    /// An output that is no longer requested is evicted from the cache.
+    /// Artifact identity follows bytes, not an allocator address: remote
+    /// results and fresh project runs often wrap identical bytes in a new Arc.
     #[test]
-    fn dropping_an_output_evicts_it() {
+    fn reallocated_identical_asset_reuses_cached_artifact() {
+        let mut cache = PreviewCache::default();
+        let first = request("a", 8);
+        let (_, jobs) = cache.sync(std::slice::from_ref(&first), true, false);
+        accept_ok(&mut cache, jobs.into_iter().next().unwrap());
+
+        let mut reallocated = first.clone();
+        reallocated.data = Arc::new(first.data.as_ref().clone());
+        assert_ne!(
+            Arc::as_ptr(&first.data),
+            Arc::as_ptr(&reallocated.data),
+            "test requires a distinct allocation"
+        );
+        let (_, jobs) = cache.sync(&[reallocated], true, false);
+        assert!(jobs.is_empty(), "same content must remain a cache hit");
+    }
+
+    /// Equal-length replacements cannot alias a previous artifact merely
+    /// because an allocator happens to reuse its address.
+    #[test]
+    fn changed_same_length_asset_rebuilds() {
+        let mut cache = PreviewCache::default();
+        let first = request("a", 8);
+        let (_, jobs) = cache.sync(std::slice::from_ref(&first), true, false);
+        accept_ok(&mut cache, jobs.into_iter().next().unwrap());
+
+        let mut changed = first.clone();
+        changed.data = Arc::new(vec![9, 8, 7]);
+        changed.source_hash = volumetric::content_fingerprint(&changed.data);
+        let (_, jobs) = cache.sync(&[changed], true, false);
+        assert_eq!(jobs.len(), 1, "changed content must rebuild");
+    }
+
+    /// A successful project rerun may reuse an output id for new bytes. The
+    /// old scene must not be exposed to export/stats as if it represented the
+    /// new artifact; its canonical ASN2 mesh remains available in the lower
+    /// content-addressed mesh cache.
+    #[test]
+    fn materialized_content_change_invalidates_output_scene() {
+        let mut cache = PreviewCache::default();
+        let first = request("a", 8);
+        let (_, jobs) = cache.sync(std::slice::from_ref(&first), true, false);
+        accept_ok(&mut cache, jobs.into_iter().next().unwrap());
+        assert!(cache.entity_scene("a").is_some());
+
+        let changed_hash = volumetric::content_fingerprint(&[9, 8, 7]);
+        cache.retain_assets(&std::collections::HashMap::from([("a", changed_hash)]));
+        assert!(cache.entity_scene("a").is_none());
+    }
+
+    /// Viewport visibility does not own mesh artifacts: switching from a
+    /// two-output view to one output and back reuses both completed builds.
+    #[test]
+    fn visibility_change_retains_completed_artifacts() {
         let mut cache = PreviewCache::default();
         // Clone shared requests so each output keeps one stable Arc (and thus a
         // stable cache key) across syncs, mirroring the app's `data_arc()`.
@@ -4157,9 +4244,26 @@ function get_bounds_max_y() return 1.5 end
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].0, "a");
 
-        // "b" was evicted, so requesting it again requires a fresh build.
+        // "b" remained a valid project artifact while it was not visible.
         let (_, jobs) = cache.sync(&both, true, false);
-        assert_eq!(jobs.len(), 1);
+        assert!(jobs.is_empty(), "showing b again reuses its mesh");
+        assert_eq!(cache.visible(&both).len(), 2);
+    }
+
+    /// Project output ownership, unlike visibility, is an eviction boundary.
+    #[test]
+    fn removing_a_materialized_asset_evicts_its_artifact() {
+        let mut cache = PreviewCache::default();
+        let (a, b) = (request("a", 8), request("b", 8));
+        let both = vec![a.clone(), b.clone()];
+        let (_, jobs) = cache.sync(&both, true, false);
+        for job in jobs {
+            accept_ok(&mut cache, job);
+        }
+
+        cache.retain_assets(&std::collections::HashMap::from([("a", a.source_hash)]));
+        let (_, jobs) = cache.sync(&both, true, false);
+        assert_eq!(jobs.len(), 1, "removed b must be rebuilt if it returns");
         assert_eq!(jobs[0].key.asset_id, "b");
     }
 
@@ -4218,14 +4322,25 @@ function get_bounds_max_y() return 1.5 end
         );
     }
 
-    /// Dropping an output entirely also signals its in-flight build.
+    /// Hiding an output does not abandon its expensive in-flight artifact.
     #[test]
-    fn dropping_an_output_cancels_its_inflight_build() {
+    fn hiding_an_output_keeps_its_inflight_build() {
         let mut cache = PreviewCache::default();
         let (_, jobs) = cache.sync(&[request("a", 8)], true, false);
         let job = jobs.into_iter().next().unwrap();
 
         cache.sync(&[], true, false);
+        assert!(!job.cancel.load(Ordering::Relaxed));
+    }
+
+    /// Removing the underlying materialized output does abandon its build.
+    #[test]
+    fn removing_a_materialized_asset_cancels_its_inflight_build() {
+        let mut cache = PreviewCache::default();
+        let (_, jobs) = cache.sync(&[request("a", 8)], true, false);
+        let job = jobs.into_iter().next().unwrap();
+
+        cache.retain_assets(&std::collections::HashMap::new());
         assert!(job.cancel.load(Ordering::Relaxed));
     }
 

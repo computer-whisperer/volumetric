@@ -27,8 +27,10 @@ fn request(
     type_hint: Option<AssetTypeHint>,
     plan: PreviewPlan,
 ) -> PreviewRequest {
+    let source_hash = volumetric::content_fingerprint(&data);
     PreviewRequest {
         asset_id: id.to_string(),
+        source_hash,
         data: Arc::new(data),
         type_hint,
         precursor_ids: vec![],

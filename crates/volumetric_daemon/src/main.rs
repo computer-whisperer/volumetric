@@ -26,6 +26,10 @@ struct Args {
     /// container/host limit.
     #[arg(long, default_value_t = 2048)]
     build_cache_mb: usize,
+
+    /// MiB of completed ASN2 meshes retained for reuse across remote jobs.
+    #[arg(long, default_value_t = 2048)]
+    mesh_cache_mb: usize,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -35,6 +39,7 @@ fn main() -> anyhow::Result<()> {
         max_concurrent_jobs: args.max_jobs,
         result_ttl: Duration::from_secs(args.result_ttl_secs),
         build_cache_bytes: args.build_cache_mb << 20,
+        mesh_cache_bytes: args.mesh_cache_mb << 20,
         ..Default::default()
     })?;
     eprintln!(

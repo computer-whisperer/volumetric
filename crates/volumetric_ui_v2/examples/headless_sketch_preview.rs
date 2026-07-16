@@ -71,8 +71,10 @@ fn main() {
             },
         )
     };
+    let source_hash = volumetric::content_fingerprint(&bytes);
     let request = PreviewRequest {
         asset_id: "sketch_debug".to_string(),
+        source_hash,
         data: Arc::new(bytes),
         type_hint,
         precursor_ids: vec![],

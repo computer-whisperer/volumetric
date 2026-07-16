@@ -8,10 +8,17 @@ use anyhow::Context;
 
 pub mod baked;
 pub mod build_cache;
+pub mod mesh_cache;
 pub mod wasm;
 
 pub use baked::{BakeCoverage, BakedResults, SeedReport};
 pub use build_cache::BuildCache;
+pub use mesh_cache::{MeshCache, MeshCacheKey};
+
+/// Stable Blake3 fingerprint for immutable artifact bytes.
+pub fn content_fingerprint(bytes: &[u8]) -> [u8; 32] {
+    *blake3::hash(bytes).as_bytes()
+}
 
 /// A triangle in 3D space with vertices and per-vertex normal vectors.
 #[derive(Clone, Debug, PartialEq)]
@@ -635,6 +642,7 @@ pub fn generate_marching_cubes_mesh_from_bytes(
 }
 
 /// Result from adaptive mesh v2 generation including mesh data, bounds, and profiling stats.
+#[derive(Clone)]
 pub struct AdaptiveMeshV2Result {
     pub vertices: Vec<(f32, f32, f32)>,
     pub normals: Vec<(f32, f32, f32)>,
@@ -847,10 +855,12 @@ impl LoadedAsset {
     }
 
     /// The blake3 hash of the asset's bytes, computed on first call.
-    fn content_hash(&self) -> [u8; 32] {
+    /// Stable content fingerprint used by build- and mesh-artifact caches.
+    /// Computed once per loaded blob and shared by clones.
+    pub fn content_hash(&self) -> [u8; 32] {
         *self
             .content_hash
-            .get_or_init(|| *blake3::hash(&self.data).as_bytes())
+            .get_or_init(|| content_fingerprint(&self.data))
     }
 
     /// Returns the asset ID.
