@@ -1121,6 +1121,10 @@ pub struct VolumetricUiV2 {
     ssao_radius: f32,
     ssao_bias: f32,
     ssao_strength: f32,
+    /// Preview-capable artifacts reported by the active project run. These are
+    /// displayed read-only and never feed viewport meshing until terminal
+    /// success promotes the complete run into `runtime_assets`.
+    staged_artifacts: Vec<LoadedAsset>,
     runtime_assets: Vec<LoadedAsset>,
     last_run_elapsed_ms: Option<u128>,
     last_run_error: Option<String>,
@@ -1266,6 +1270,7 @@ impl VolumetricUiV2 {
             ssao_radius: 0.5,
             ssao_bias: 0.025,
             ssao_strength: 1.0,
+            staged_artifacts: Vec::new(),
             runtime_assets: Vec::new(),
             last_run_elapsed_ms: None,
             last_run_error: None,
@@ -2169,7 +2174,25 @@ impl VolumetricUiV2 {
         self.run_state = state;
         self.run_progress = None;
         if state == RunState::Running {
+            self.staged_artifacts.clear();
             self.status = "running project".to_string();
+        }
+    }
+
+    /// Host hook: expose a completed intermediate from the active run without
+    /// promoting it into the last-good runtime registry.
+    pub(crate) fn stage_run_artifact(&mut self, artifact: LoadedAsset) {
+        if self.run_state != RunState::Running {
+            return;
+        }
+        if let Some(existing) = self
+            .staged_artifacts
+            .iter_mut()
+            .find(|existing| existing.id() == artifact.id())
+        {
+            *existing = artifact;
+        } else {
+            self.staged_artifacts.push(artifact);
         }
     }
 
@@ -2196,6 +2219,7 @@ impl VolumetricUiV2 {
     pub(crate) fn on_run_cancelled(&mut self) {
         self.run_state = RunState::Idle;
         self.run_progress = None;
+        self.staged_artifacts.clear();
         self.last_run_stale = true;
         self.status = "run cancelled".to_string();
     }
@@ -2208,6 +2232,7 @@ impl VolumetricUiV2 {
     ) {
         self.run_state = RunState::Idle;
         self.run_progress = None;
+        self.staged_artifacts.clear();
         self.last_run_elapsed_ms = Some(elapsed_ms);
         match result {
             Ok(assets) => {
@@ -2301,6 +2326,7 @@ impl VolumetricUiV2 {
     /// whole project is replaced (new/open) — there is no stale output worth
     /// keeping on screen.
     fn clear_runtime_assets(&mut self) {
+        self.staged_artifacts.clear();
         self.runtime_assets.clear();
         self.pinned_outputs.clear();
         self.output_overrides.clear();
@@ -5790,37 +5816,80 @@ fn outputs_rows(app: &VolumetricUiV2) -> Vec<El> {
                 .destructive()
                 .padding(tokens::SPACE_2),
         );
-    } else if app.runtime_assets.is_empty() {
+    }
+
+    let staged = app
+        .staged_artifacts
+        .iter()
+        .filter(|candidate| {
+            !app.runtime_assets.iter().any(|committed| {
+                committed.id() == candidate.id()
+                    && committed.content_hash() == candidate.content_hash()
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if app.run_state == RunState::Running {
+        rows.push(detail_row(
+            "Current run",
+            app.run_progress
+                .as_ref()
+                .map(|progress| progress.phase.as_str())
+                .unwrap_or("starting"),
+        ));
+        if staged.is_empty() && app.runtime_assets.is_empty() {
+            rows.push(
+                text("Waiting for the first previewable artifact…")
+                    .muted()
+                    .small(),
+            );
+        } else if !staged.is_empty() {
+            rows.push(text("Building").caption().muted());
+            rows.push(artifact_table(app, staged, true));
+        }
+    }
+
+    if app.runtime_assets.is_empty() && app.run_state != RunState::Running {
         rows.push(
             text("Run the project to materialize artifacts.")
                 .muted()
                 .small(),
         );
-    } else {
+    } else if !app.runtime_assets.is_empty() {
         rows.push(detail_row(
-            "Last run",
+            if app.run_state == RunState::Running {
+                "Last good run"
+            } else {
+                "Last run"
+            },
             &format!(
                 "{}ms{}",
                 app.last_run_elapsed_ms.unwrap_or_default(),
                 if app.last_run_stale { " stale" } else { "" }
             ),
         ));
-        rows.push(
-            table([table_body(
-                app.runtime_assets
-                    .iter()
-                    .map(|asset| runtime_asset_row(app, asset))
-                    .collect::<Vec<_>>(),
-            )
-            .gap(tokens::SPACE_1)])
-            .width(Size::Fill(1.0)),
-        );
+        rows.push(artifact_table(
+            app,
+            app.runtime_assets.iter().collect(),
+            false,
+        ));
     }
 
     rows
 }
 
-fn runtime_asset_row(app: &VolumetricUiV2, asset: &LoadedAsset) -> El {
+fn artifact_table(app: &VolumetricUiV2, assets: Vec<&LoadedAsset>, staged: bool) -> El {
+    table([table_body(
+        assets
+            .into_iter()
+            .map(|asset| runtime_asset_row(app, asset, staged))
+            .collect::<Vec<_>>(),
+    )
+    .gap(tokens::SPACE_1)])
+    .width(Size::Fill(1.0))
+}
+
+fn runtime_asset_row(app: &VolumetricUiV2, asset: &LoadedAsset, staged: bool) -> El {
     let id = asset.id();
     let renderable = runtime_asset_is_renderable(asset);
     let pinned = app.pinned_outputs.contains(id);
@@ -5828,6 +5897,7 @@ fn runtime_asset_row(app: &VolumetricUiV2, asset: &LoadedAsset) -> El {
     let render = app.output_render(id);
     let overridden = app.output_overrides.contains_key(id);
     let artifact = app.preview_artifacts.get(id).cloned().unwrap_or_default();
+    let thumbnail_ready = app.artifact_thumbnails.contains_key(&asset.content_hash());
     let thumbnail = app
         .artifact_thumbnails
         .get(&asset.content_hash())
@@ -5841,7 +5911,7 @@ fn runtime_asset_row(app: &VolumetricUiV2, asset: &LoadedAsset) -> El {
         })
         .unwrap_or_else(|| spacer().width(Size::Fixed(36.0)).height(Size::Fixed(36.0)));
 
-    let pin = if renderable {
+    let pin = if renderable && !staged {
         let pin = icon_button(&*PIN_ICON)
             .xsmall()
             .tooltip(if pinned { "Unpin" } else { "Pin to viewport" })
@@ -5859,7 +5929,7 @@ fn runtime_asset_row(app: &VolumetricUiV2, asset: &LoadedAsset) -> El {
             "Render settings"
         })
         .key(format!("{OUTPUT_SETTINGS_PREFIX}{id}"));
-    let settings = if !renderable {
+    let settings = if !renderable || staged {
         spacer().width(Size::Fixed(24.0))
     } else if overridden {
         settings.primary()
@@ -5867,7 +5937,17 @@ fn runtime_asset_row(app: &VolumetricUiV2, asset: &LoadedAsset) -> El {
         settings.ghost()
     };
 
-    let summary = if renderable {
+    let summary = if staged {
+        format!(
+            "{} · pending commit · {}",
+            asset_type_label(asset.type_hint()),
+            if thumbnail_ready {
+                "preview ready"
+            } else {
+                "previewing"
+            }
+        )
+    } else if renderable {
         format!(
             "{} · {} · {}{}",
             asset_type_label(asset.type_hint()),
@@ -5882,7 +5962,7 @@ fn runtime_asset_row(app: &VolumetricUiV2, asset: &LoadedAsset) -> El {
             artifact.label()
         )
     };
-    let visibility = if renderable {
+    let visibility = if renderable && !staged {
         text(if visible { "●" } else { "○" })
             .caption()
             .muted()
@@ -5890,7 +5970,7 @@ fn runtime_asset_row(app: &VolumetricUiV2, asset: &LoadedAsset) -> El {
     } else {
         spacer().width(Size::Fixed(12.0))
     };
-    let view = if renderable {
+    let view = if renderable && !staged {
         icon_button(&*EYE_ICON)
             .ghost()
             .xsmall()
@@ -5909,7 +5989,11 @@ fn runtime_asset_row(app: &VolumetricUiV2, asset: &LoadedAsset) -> El {
                 .caption()
                 .muted()
                 .ellipsis()
-                .tooltip(artifact.tooltip())
+                .tooltip(if staged {
+                    "Available from the current run; committed only if the run succeeds."
+                } else {
+                    artifact.tooltip()
+                })
                 .width(Size::Fill(1.0)),
             text(id).label().ellipsis().width(Size::Fill(1.0)),
         ])
@@ -7694,6 +7778,39 @@ mod tests {
             app.summary().last_run_error.as_deref(),
             Some("broken downstream step")
         );
+    }
+
+    #[test]
+    fn staged_artifacts_are_visible_state_but_never_last_good_state() {
+        let mut app = VolumetricUiV2::default();
+        app.clear_runtime_assets();
+        app.set_run_state(RunState::Running);
+        app.stage_run_artifact(LoadedAsset::from_parts(
+            "early-model".into(),
+            b"first".to_vec(),
+            Some(AssetTypeHint::Model),
+            Vec::new(),
+        ));
+        // A repeated id replaces its staged value, mirroring Environment.
+        app.stage_run_artifact(LoadedAsset::from_parts(
+            "early-model".into(),
+            b"second".to_vec(),
+            Some(AssetTypeHint::Model),
+            Vec::new(),
+        ));
+
+        assert!(app.runtime_assets().is_empty());
+        assert_eq!(app.staged_artifacts.len(), 1);
+        assert_eq!(app.staged_artifacts[0].data(), b"second");
+        assert_eq!(
+            outputs_rows(&app).len(),
+            3,
+            "current-run status, Building label, and staged artifact table"
+        );
+
+        app.apply_run_result(Err("later step failed".into()), 11);
+        assert!(app.staged_artifacts.is_empty());
+        assert!(app.runtime_assets().is_empty());
     }
 
     #[test]

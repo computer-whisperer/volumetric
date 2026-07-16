@@ -53,9 +53,9 @@ pub struct Session {
     run_generation: u64,
     /// The in-flight run's generation and its cooperative cancel flag.
     active_run: Option<(u64, Arc<AtomicBool>)>,
-    /// Imports and step outputs reported by the active run. They are eligible
-    /// for thumbnails immediately but are promoted to the app only if the run
-    /// reaches a successful terminal result.
+    /// Imports and step outputs reported by the active run. They are displayed
+    /// provisionally and eligible for thumbnails immediately, but only a
+    /// successful terminal result promotes them into viewport/runtime state.
     staged_artifacts: Vec<volumetric::LoadedAsset>,
     /// Content-addressed thumbnail jobs currently executing on the shell's
     /// dedicated thumbnail lane.
@@ -134,7 +134,8 @@ impl Session {
                     artifact,
                 } => {
                     if self.active_run.as_ref().map(|(g, _)| *g) == Some(generation) {
-                        upsert_artifact(&mut self.staged_artifacts, artifact);
+                        upsert_artifact(&mut self.staged_artifacts, artifact.clone());
+                        app.stage_run_artifact(artifact);
                     }
                 }
                 BackgroundResult::ThumbnailComplete {
