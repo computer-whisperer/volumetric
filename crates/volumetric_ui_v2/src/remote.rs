@@ -137,6 +137,7 @@ impl ExecutionBackend for RemoteBackend {
         project: &volumetric::Project,
         cancel: &AtomicBool,
         progress: &dyn Fn(volumetric::BuildProgress),
+        artifact_ready: &dyn Fn(&volumetric::LoadedAsset),
     ) -> Result<Vec<volumetric::LoadedAsset>, String> {
         // In-memory projects are lean (opening consumes any bake), but never
         // ship one: the daemon's shared cache must not trust client-supplied
@@ -144,7 +145,14 @@ impl ExecutionBackend for RemoteBackend {
         let mut project = project.clone();
         project.baked = None;
         let request = JobRequest::RunProject { project };
-        project_exports_from_output(self.run_job(&request, cancel, progress)?)
+        let exports = project_exports_from_output(self.run_job(&request, cancel, progress)?)?;
+        // Protocol v1 returns artifacts only at terminal completion. Emit the
+        // available exports through the same host callback; future protocol
+        // event streaming can make this incremental without changing Session.
+        for export in &exports {
+            artifact_ready(export);
+        }
+        Ok(exports)
     }
 
     fn mesh_model(

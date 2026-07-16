@@ -6,7 +6,7 @@
 
 #![cfg(feature = "native")]
 
-use std::sync::atomic::AtomicBool;
+use std::{cell::RefCell, sync::atomic::AtomicBool};
 
 use volumetric::{
     BuildCache, Environment, ExecutionInput, ExecutionStep, ImportedAsset, LoadedAsset, Project,
@@ -54,6 +54,42 @@ fn run(project: &Project, cache: &BuildCache) -> Vec<LoadedAsset> {
     project
         .run_monitored_with_cache(&mut Environment::new(), cache, &never, &|_| {})
         .expect("project runs")
+}
+
+#[test]
+fn artifact_stream_is_ordered_and_identical_on_cache_hits() {
+    let mut project = Project::new();
+    project
+        .imports_mut()
+        .push(ImportedAsset::operator("echo".into(), echo_operator(0)));
+    project.imports_mut().push(ImportedAsset::new(
+        "src".into(),
+        b"model bytes".to_vec(),
+        Some(volumetric::AssetTypeHint::Model),
+    ));
+    project.timeline_mut().extend([
+        step("echo", vec![ExecutionInput::AssetRef("src".into())], "a"),
+        step("echo", vec![ExecutionInput::AssetRef("a".into())], "b"),
+    ]);
+    project.exports_mut().push("b".into());
+
+    let cache = BuildCache::new(64 << 20);
+    for expected_hits in [1, 3] {
+        let ready = RefCell::new(Vec::new());
+        let exports = project
+            .run_monitored_with_cache_and_artifacts(
+                &mut Environment::new(),
+                &cache,
+                &AtomicBool::new(false),
+                &|_| {},
+                &|artifact| ready.borrow_mut().push(artifact.id().to_string()),
+            )
+            .expect("project runs");
+
+        assert_eq!(&*ready.borrow(), &["echo", "src", "a", "b"]);
+        assert_eq!(exports[0].id(), "b");
+        assert_eq!(cache.stats().hits, expected_hits);
+    }
 }
 
 /// A two-step chain re-run unchanged: every step is served from cache, and

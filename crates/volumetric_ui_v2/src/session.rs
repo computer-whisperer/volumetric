@@ -53,6 +53,19 @@ pub struct Session {
     run_generation: u64,
     /// The in-flight run's generation and its cooperative cancel flag.
     active_run: Option<(u64, Arc<AtomicBool>)>,
+    /// Imports and step outputs reported by the active run. They are eligible
+    /// for thumbnails immediately but are promoted to the app only if the run
+    /// reaches a successful terminal result.
+    staged_artifacts: Vec<volumetric::LoadedAsset>,
+    /// Content-addressed thumbnail jobs currently executing on the shell's
+    /// dedicated thumbnail lane.
+    thumbnail_inflight: HashMap<[u8; 32], Arc<AtomicBool>>,
+    /// Deterministic thumbnail failures are suppressed by content hash so a
+    /// malformed/unsupported artifact cannot create a per-frame retry loop.
+    thumbnail_failed: std::collections::HashSet<[u8; 32]>,
+    /// Completed CPU rasters waiting for `sync` to upload them with the GPU
+    /// device/queue (which `pre_frame` intentionally does not borrow).
+    thumbnail_uploads: Vec<([u8; 32], volumetric::direct_preview::DirectPreviewRaster)>,
     /// Pointer position of an in-progress camera drag (a press that landed in
     /// the viewport rect). `None` when the pointer isn't driving the camera.
     camera_pointer: Option<(f32, f32)>,
@@ -74,6 +87,10 @@ impl Session {
             viewport: ViewportRenderer::new(device, queue, format),
             run_generation: 0,
             active_run: None,
+            staged_artifacts: Vec::new(),
+            thumbnail_inflight: HashMap::new(),
+            thumbnail_failed: std::collections::HashSet::new(),
+            thumbnail_uploads: Vec::new(),
             camera_pointer: None,
             camera_buttons: CameraButtons::default(),
             lightbox_inflight: None,
@@ -99,6 +116,7 @@ impl Session {
                 } => {
                     if self.active_run.as_ref().map(|(g, _)| *g) == Some(generation) {
                         self.active_run = None;
+                        self.staged_artifacts.clear();
                         app.apply_run_result(result, elapsed_ms);
                     }
                     // Otherwise the run was superseded or cancelled; discard it.
@@ -109,6 +127,30 @@ impl Session {
                 } => {
                     if self.active_run.as_ref().map(|(g, _)| *g) == Some(generation) {
                         app.on_run_progress(progress);
+                    }
+                }
+                BackgroundResult::ArtifactReady {
+                    generation,
+                    artifact,
+                } => {
+                    if self.active_run.as_ref().map(|(g, _)| *g) == Some(generation) {
+                        upsert_artifact(&mut self.staged_artifacts, artifact);
+                    }
+                }
+                BackgroundResult::ThumbnailComplete {
+                    source_hash,
+                    result,
+                } => {
+                    self.thumbnail_inflight.remove(&source_hash);
+                    match result {
+                        Ok(Some(raster)) => {
+                            self.thumbnail_failed.remove(&source_hash);
+                            self.thumbnail_uploads.push((source_hash, raster));
+                        }
+                        Ok(None) => {}
+                        Err(_) => {
+                            self.thumbnail_failed.insert(source_hash);
+                        }
                     }
                 }
                 BackgroundResult::PreviewProgress { progress, .. } => {
@@ -148,6 +190,7 @@ impl Session {
                 cancel.store(true, Ordering::Relaxed);
             }
             self.run_generation += 1;
+            self.staged_artifacts.clear();
             app.on_run_cancelled();
         }
 
@@ -174,6 +217,7 @@ impl Session {
 
         if app.take_pending_run() {
             self.run_generation += 1;
+            self.staged_artifacts.clear();
             let cancel = Arc::new(AtomicBool::new(false));
             self.active_run = Some((self.run_generation, cancel.clone()));
             app.set_run_state(RunState::Running);
@@ -183,6 +227,46 @@ impl Session {
                 cancel,
             });
         }
+
+        for (source_hash, raster) in self.thumbnail_uploads.drain(..) {
+            let texture = upload_rgba_texture(
+                device,
+                queue,
+                "volumetric_ui_v2::artifact_thumbnail",
+                raster.width,
+                raster.height,
+                &raster.rgba,
+            );
+            app.set_artifact_thumbnail(source_hash, texture);
+        }
+
+        let mut thumbnail_candidates = std::collections::HashSet::new();
+        for artifact in self
+            .staged_artifacts
+            .iter()
+            .chain(app.runtime_assets().iter())
+        {
+            if !matches!(artifact.type_hint(), Some(AssetTypeHint::Model) | None) {
+                continue;
+            }
+            let source_hash = artifact.content_hash();
+            if !thumbnail_candidates.insert(source_hash)
+                || app.has_artifact_thumbnail(&source_hash)
+                || self.thumbnail_inflight.contains_key(&source_hash)
+                || self.thumbnail_failed.contains(&source_hash)
+            {
+                continue;
+            }
+            let cancel = Arc::new(AtomicBool::new(false));
+            self.thumbnail_inflight.insert(source_hash, cancel.clone());
+            jobs.push(BackgroundJob::BuildThumbnail(ThumbnailBuildJob {
+                source_hash,
+                data: artifact.data_arc(),
+                cancel,
+            }));
+        }
+        self.thumbnail_failed
+            .retain(|source_hash| thumbnail_candidates.contains(source_hash));
 
         if let Some(name) = app.take_operator_metadata_request() {
             jobs.push(BackgroundJob::ReadOperatorMetadata { name });
@@ -303,6 +387,20 @@ impl Session {
 
     pub fn has_pending_preview(&self) -> bool {
         self.viewport.preview_cache.has_pending()
+    }
+
+    pub fn has_pending_thumbnail(&self) -> bool {
+        !self.thumbnail_inflight.is_empty() || !self.thumbnail_uploads.is_empty()
+    }
+
+    /// Executor replacement drops the old worker's result receiver. Cancel
+    /// and forget its thumbnail jobs so `sync` can enqueue them on the new
+    /// worker instead of leaving their hashes permanently marked in flight.
+    pub fn abandon_thumbnail_jobs(&mut self) {
+        for cancel in self.thumbnail_inflight.values() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.thumbnail_inflight.clear();
     }
 
     pub fn run_in_flight(&self) -> bool {
@@ -1442,6 +1540,12 @@ pub struct PreviewBuildResult {
     pub(crate) result: Result<PreviewEntity, PreviewBuildError>,
 }
 
+pub struct ThumbnailBuildJob {
+    pub(crate) source_hash: [u8; 32],
+    pub(crate) data: Arc<Vec<u8>>,
+    pub(crate) cancel: Arc<AtomicBool>,
+}
+
 /// Why a preview build produced no entity.
 pub enum PreviewBuildError {
     /// The build observed its cancel flag and stopped; not a failure, and
@@ -1465,6 +1569,7 @@ pub trait ExecutionBackend: Send + Sync {
         project: &volumetric::Project,
         cancel: &AtomicBool,
         progress: &dyn Fn(volumetric::BuildProgress),
+        artifact_ready: &dyn Fn(&volumetric::LoadedAsset),
     ) -> Result<Vec<volumetric::LoadedAsset>, String>;
 
     /// `Ok(None)` means the cancel flag was observed and the mesh abandoned.
@@ -1486,9 +1591,15 @@ impl ExecutionBackend for LocalBackend {
         project: &volumetric::Project,
         cancel: &AtomicBool,
         progress: &dyn Fn(volumetric::BuildProgress),
+        artifact_ready: &dyn Fn(&volumetric::LoadedAsset),
     ) -> Result<Vec<volumetric::LoadedAsset>, String> {
         project
-            .run_monitored(&mut volumetric::Environment::new(), cancel, progress)
+            .run_monitored_with_artifacts(
+                &mut volumetric::Environment::new(),
+                cancel,
+                progress,
+                artifact_ready,
+            )
             .map_err(|err| err.to_string())
     }
 
@@ -1536,6 +1647,10 @@ pub enum BackgroundJob {
         cancel: Arc<AtomicBool>,
     },
     BuildPreview(PreviewBuildJob),
+    /// Directly sample a model into a small RGBA thumbnail. Native shells
+    /// route this variant to a dedicated worker lane so it overlaps the
+    /// project run that produced the artifact.
+    BuildThumbnail(ThumbnailBuildJob),
     /// Sample an output for the inspection lightbox (a 2D field raster, or
     /// a slice through a 3D model's channel).
     BuildLightbox {
@@ -1581,6 +1696,15 @@ pub enum BackgroundResult {
     RunProgress {
         generation: u64,
         progress: volumetric::BuildProgress,
+    },
+    /// A preview-capable import or step output became available during a run.
+    ArtifactReady {
+        generation: u64,
+        artifact: volumetric::LoadedAsset,
+    },
+    ThumbnailComplete {
+        source_hash: [u8; 32],
+        result: Result<Option<volumetric::direct_preview::DirectPreviewRaster>, String>,
     },
     /// Mid-flight progress from the preview build for `asset_id`.
     PreviewProgress {
@@ -1632,6 +1756,9 @@ impl JobQueue {
             BackgroundJob::BuildPreview(preview) => {
                 // Newest job per output wins.
                 self.previews.insert(preview.key.asset_id.clone(), preview);
+            }
+            BackgroundJob::BuildThumbnail(_) => {
+                unreachable!("thumbnail jobs use the shell's dedicated lane")
             }
             // One lightbox is open at a time; newest wins.
             lightbox @ BackgroundJob::BuildLightbox { .. } => self.lightbox = Some(lightbox),
@@ -1714,12 +1841,35 @@ pub fn execute_job_monitored(
             // web_time::Instant is std::time::Instant on native and a
             // performance.now() clock on wasm32 (std's panics there).
             let start = web_time::Instant::now();
-            let result = backend.run_project(&project, &cancel, &|progress| {
-                emit(BackgroundResult::RunProgress {
-                    generation,
-                    progress,
-                })
-            });
+            let artifacts = std::cell::RefCell::new(Vec::new());
+            let result = backend
+                .run_project(
+                    &project,
+                    &cancel,
+                    &|progress| {
+                        emit(BackgroundResult::RunProgress {
+                            generation,
+                            progress,
+                        })
+                    },
+                    &|artifact| {
+                        if !is_preview_artifact(artifact) {
+                            return;
+                        }
+                        upsert_artifact(&mut artifacts.borrow_mut(), artifact.clone());
+                        emit(BackgroundResult::ArtifactReady {
+                            generation,
+                            artifact: artifact.clone(),
+                        });
+                    },
+                )
+                .map(|exports| {
+                    let mut all = artifacts.into_inner();
+                    for export in exports {
+                        upsert_artifact(&mut all, export);
+                    }
+                    all
+                });
             BackgroundResult::ProjectComplete {
                 generation,
                 result,
@@ -1748,6 +1898,20 @@ pub fn execute_job_monitored(
                 key: job.key,
                 result,
             }))
+        }
+        BackgroundJob::BuildThumbnail(job) => {
+            let result = volumetric::direct_preview::render_model_thumbnail(
+                &job.data,
+                96,
+                96,
+                40,
+                &job.cancel,
+            )
+            .map_err(format_error_chain);
+            BackgroundResult::ThumbnailComplete {
+                source_hash: job.source_hash,
+                result,
+            }
         }
         BackgroundJob::BuildLightbox {
             asset_id,
@@ -1790,6 +1954,35 @@ pub fn execute_job_monitored(
             BackgroundResult::ImportMetadataReady { id, result }
         }
     }
+}
+
+fn upsert_artifact(
+    artifacts: &mut Vec<volumetric::LoadedAsset>,
+    artifact: volumetric::LoadedAsset,
+) {
+    if let Some(existing) = artifacts
+        .iter_mut()
+        .find(|existing| existing.id() == artifact.id())
+    {
+        *existing = artifact;
+    } else {
+        artifacts.push(artifact);
+    }
+}
+
+/// Intermediate project values become UI artifacts only when the viewport has
+/// a representation for them. Explicit exports are still retained below even
+/// when they are opaque, preserving the project's declared public result.
+fn is_preview_artifact(artifact: &volumetric::LoadedAsset) -> bool {
+    matches!(
+        artifact.type_hint(),
+        Some(
+            AssetTypeHint::Model
+                | AssetTypeHint::FeaMesh
+                | AssetTypeHint::TriMesh
+                | AssetTypeHint::Subspace
+        ) | None
+    )
 }
 
 /// Samples a 2D model for the inspection lightbox: the colormapped raster
@@ -3404,6 +3597,76 @@ mod tests {
         assert!(
             steps.into_inner().unwrap().is_empty(),
             "an empty timeline has no steps to report"
+        );
+    }
+
+    #[test]
+    fn project_job_stages_previewable_intermediates_before_terminal_result() {
+        use std::sync::Mutex;
+
+        let echo = r#"(module
+            (import "host" "get_input_len" (func $len (param i32) (result i32)))
+            (import "host" "get_input_data" (func $data (param i32 i32 i32)))
+            (import "host" "post_output" (func $post (param i32 i32 i32)))
+            (memory (export "memory") 16)
+            (func (export "run")
+                (local $n i32)
+                (local.set $n (call $len (i32.const 0)))
+                (call $data (i32.const 0) (i32.const 0) (local.get $n))
+                (call $post (i32.const 0) (i32.const 0) (local.get $n))))"#
+            .as_bytes()
+            .to_vec();
+        let model = volumetric_assets::get_model("simple_sphere_model")
+            .expect("bundled sphere model")
+            .bytes
+            .to_vec();
+        let mut project = volumetric::Project::new();
+        project
+            .imports_mut()
+            .push(volumetric::ImportedAsset::operator("echo".into(), echo));
+        project.imports_mut().push(volumetric::ImportedAsset::new(
+            "source".into(),
+            model,
+            Some(AssetTypeHint::Model),
+        ));
+        project.timeline_mut().push(volumetric::ExecutionStep {
+            operator_id: "echo".into(),
+            inputs: vec![volumetric::ExecutionInput::AssetRef("source".into())],
+            outputs: vec!["intermediate".into()],
+        });
+        project.exports_mut().push("intermediate".into());
+
+        let staged = Mutex::new(Vec::new());
+        let terminal = execute_job_monitored(
+            BackgroundJob::RunProject {
+                generation: 7,
+                project,
+                cancel: Arc::new(AtomicBool::new(false)),
+            },
+            &LocalBackend,
+            &|event| {
+                if let BackgroundResult::ArtifactReady {
+                    generation,
+                    artifact,
+                } = event
+                {
+                    assert_eq!(generation, 7);
+                    staged.lock().unwrap().push(artifact.id().to_string());
+                }
+            },
+        );
+
+        assert_eq!(&*staged.lock().unwrap(), &["source", "intermediate"]);
+        let BackgroundResult::ProjectComplete {
+            result: Ok(artifacts),
+            ..
+        } = terminal
+        else {
+            panic!("project must complete successfully");
+        };
+        assert_eq!(
+            artifacts.iter().map(|asset| asset.id()).collect::<Vec<_>>(),
+            ["source", "intermediate"]
         );
     }
 

@@ -712,6 +712,7 @@ impl WebHost {
         if prepare.needs_redraw
             || viewport_resized
             || gfx.session.has_pending_preview()
+            || gfx.session.has_pending_thumbnail()
             || gfx.session.run_in_flight()
             || self.app.has_pending_metadata()
         {
@@ -836,6 +837,16 @@ fn dispatch_job_with_remote(
                     window.request_redraw();
                 };
                 let result = remote_run_project(&address, project, &cancel, &on_progress).await;
+                if let Ok(artifacts) = &result
+                    && epoch.get() == spawned_epoch
+                {
+                    for artifact in artifacts {
+                        results.borrow_mut().push(BackgroundResult::ArtifactReady {
+                            generation,
+                            artifact: artifact.clone(),
+                        });
+                    }
+                }
                 let result = BackgroundResult::ProjectComplete {
                     generation,
                     result,

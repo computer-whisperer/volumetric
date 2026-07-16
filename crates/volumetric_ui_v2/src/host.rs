@@ -32,7 +32,7 @@ use winit::window::{Window, WindowId};
 use crate::remote::RemoteBackend;
 use crate::session::{
     BackgroundJob, BackgroundResult, ExecutionBackend, JobQueue, LocalBackend, Session,
-    ViewportRenderParams, execute_job_monitored,
+    ViewportRenderParams, execute_job_monitored, execute_job_with,
 };
 use crate::settings::UiSettings;
 use crate::{ExecutorChoice, FileAction, VIEWPORT_KEY, VolumetricUiV2};
@@ -469,6 +469,7 @@ impl Host {
         // cancelled that job's bookkeeping when it requested the swap, so
         // its (lost) results were already written off.
         if let Some(choice) = self.app.take_executor_request() {
+            gfx.session.abandon_thumbnail_jobs();
             let backend: Arc<dyn ExecutionBackend> = match &choice {
                 ExecutorChoice::Local => Arc::new(LocalBackend),
                 ExecutorChoice::Remote(address) => Arc::new(RemoteBackend::new(address)),
@@ -591,6 +592,7 @@ impl Host {
         if prepare.needs_redraw
             || viewport_resized
             || gfx.session.has_pending_preview()
+            || gfx.session.has_pending_thumbnail()
             || gfx.session.run_in_flight()
             || self.app.has_pending_metadata()
         {
@@ -942,22 +944,26 @@ impl FileWorker {
     }
 }
 
-/// A single worker thread that serially executes the session's background
-/// jobs through its coalescing [`JobQueue`]: the newest queued run wins,
-/// preview jobs coalesce per output id, and the queue is re-filled from the
-/// channel before each job so a fresh run preempts remaining previews.
+/// A primary worker serially executes project/mesh/metadata jobs through its
+/// coalescing [`JobQueue`], while a second serial lane renders cheap direct
+/// thumbnails concurrently. The newest queued run wins, preview jobs coalesce
+/// per output id, and a fresh run preempts remaining full previews.
 struct BackgroundWorker {
     jobs: Sender<BackgroundJob>,
+    thumbnail_jobs: Sender<BackgroundJob>,
     results: Receiver<BackgroundResult>,
 }
 
 impl BackgroundWorker {
-    /// Spawns the worker over an execution backend — [`LocalBackend`], or a
-    /// [`RemoteBackend`] when remote build is enabled. Replacing the worker
-    /// drops this sender; the thread exits after its current job.
+    /// Spawns both lanes over an execution backend — [`LocalBackend`], or a
+    /// [`RemoteBackend`] when remote build is enabled for the primary lane.
+    /// Replacing the worker drops both senders; each thread exits after its
+    /// current job.
     fn new(backend: Arc<dyn ExecutionBackend>) -> Self {
         let (job_tx, job_rx) = mpsc::channel::<BackgroundJob>();
+        let (thumbnail_tx, thumbnail_rx) = mpsc::channel::<BackgroundJob>();
         let (result_tx, result_rx) = mpsc::channel::<BackgroundResult>();
+        let main_result_tx = result_tx.clone();
 
         thread::Builder::new()
             .name("volumetric-background-worker".to_string())
@@ -977,9 +983,9 @@ impl BackgroundWorker {
                         queue.push(job);
                     }
                     if let Some(job) = queue.pop()
-                        && result_tx
+                        && main_result_tx
                             .send(execute_job_monitored(job, backend.as_ref(), &|progress| {
-                                let _ = result_tx.send(progress);
+                                let _ = main_result_tx.send(progress);
                             }))
                             .is_err()
                     {
@@ -989,14 +995,38 @@ impl BackgroundWorker {
             })
             .expect("spawn background worker");
 
+        // Direct-sampling thumbnails have their own serial lane. They are
+        // intentionally local even when project/mesh execution is remote and
+        // can overlap the project worker without launching competing full
+        // mesh builds.
+        thread::Builder::new()
+            .name("volumetric-thumbnail-worker".to_string())
+            .spawn(move || {
+                while let Ok(job) = thumbnail_rx.recv() {
+                    let result = execute_job_with(job, &LocalBackend);
+                    if result_tx.send(result).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn thumbnail worker");
+
         Self {
             jobs: job_tx,
+            thumbnail_jobs: thumbnail_tx,
             results: result_rx,
         }
     }
 
     fn send(&self, job: BackgroundJob) {
-        let _ = self.jobs.send(job);
+        match job {
+            thumbnail @ BackgroundJob::BuildThumbnail(_) => {
+                let _ = self.thumbnail_jobs.send(thumbnail);
+            }
+            other => {
+                let _ = self.jobs.send(other);
+            }
+        }
     }
 
     fn drain_results(&self) -> Vec<BackgroundResult> {
@@ -1094,7 +1124,37 @@ fn srgb_to_linear(c: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicBool;
+    use crate::session::ThumbnailBuildJob;
+    use std::sync::{Barrier, atomic::AtomicBool};
+
+    struct BlockingProjectBackend {
+        started: Arc<Barrier>,
+        release: Arc<Barrier>,
+    }
+
+    impl ExecutionBackend for BlockingProjectBackend {
+        fn run_project(
+            &self,
+            _project: &volumetric::Project,
+            _cancel: &AtomicBool,
+            _progress: &dyn Fn(volumetric::BuildProgress),
+            _artifact_ready: &dyn Fn(&volumetric::LoadedAsset),
+        ) -> Result<Vec<volumetric::LoadedAsset>, String> {
+            self.started.wait();
+            self.release.wait();
+            Ok(Vec::new())
+        }
+
+        fn mesh_model(
+            &self,
+            _model_wasm: &[u8],
+            _config: &volumetric::adaptive_surface_nets_2::AdaptiveMeshConfig2,
+            _cancel: &AtomicBool,
+            _progress: &dyn Fn(volumetric::BuildProgress),
+        ) -> Result<Option<Arc<volumetric::AdaptiveMeshV2Result>>, String> {
+            unreachable!("this backend is only used for project-lane tests")
+        }
+    }
 
     /// End-to-end check that the shared worker executes a project off-thread and
     /// reports the result back through the channel, tagged with its generation.
@@ -1129,6 +1189,57 @@ mod tests {
         assert_eq!(generation, 7);
         let assets = result.expect("default project runs cleanly");
         assert_eq!(assets.len(), 1);
+    }
+
+    #[test]
+    fn thumbnail_lane_runs_while_project_lane_is_blocked() {
+        let started = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let worker = BackgroundWorker::new(Arc::new(BlockingProjectBackend {
+            started: started.clone(),
+            release: release.clone(),
+        }));
+        worker.send(BackgroundJob::RunProject {
+            generation: 1,
+            project: volumetric::Project::new(),
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+        started.wait();
+
+        let data = volumetric_assets::get_model("simple_sphere_model")
+            .expect("bundled sphere model")
+            .bytes
+            .to_vec();
+        let source_hash = volumetric::content_fingerprint(&data);
+        worker.send(BackgroundJob::BuildThumbnail(ThumbnailBuildJob {
+            source_hash,
+            data: Arc::new(data),
+            cancel: Arc::new(AtomicBool::new(false)),
+        }));
+
+        let mut thumbnail = None;
+        for _ in 0..300 {
+            for result in worker.drain_results() {
+                match result {
+                    BackgroundResult::ThumbnailComplete { result, .. } => thumbnail = Some(result),
+                    BackgroundResult::ProjectComplete { .. } => {
+                        panic!("project lane completed before its release barrier")
+                    }
+                    _ => {}
+                }
+            }
+            if thumbnail.is_some() {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let raster = thumbnail
+            .expect("thumbnail completed on its independent lane")
+            .expect("thumbnail render succeeds")
+            .expect("thumbnail was not cancelled");
+        assert_eq!((raster.width, raster.height), (96, 96));
+
+        release.wait();
     }
 
     /// The dialog-less re-save task writes the file and reports the saved

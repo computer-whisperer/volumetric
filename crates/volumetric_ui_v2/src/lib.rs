@@ -1185,6 +1185,11 @@ pub struct VolumetricUiV2 {
     output_stats: std::collections::BTreeMap<String, OutputStats>,
     /// Per-output preview artifact lifecycle, mirrored from the host cache.
     preview_artifacts: std::collections::BTreeMap<String, PreviewArtifactStatus>,
+    /// Content-addressed direct-sampling thumbnails. Kept across project
+    /// replacement so identical artifacts in another project reuse them;
+    /// `artifact_thumbnail_order` bounds their GPU residency.
+    artifact_thumbnails: std::collections::HashMap<[u8; 32], AppTexture>,
+    artifact_thumbnail_order: std::collections::VecDeque<[u8; 32]>,
     /// Geometry the viewport had to drop at the GPU buffer size limit,
     /// mirrored from the renderer each frame; shown as a HUD warning.
     viewport_overflow: Option<String>,
@@ -1294,6 +1299,8 @@ impl VolumetricUiV2 {
             pipeline_open: ["steps"].into_iter().map(str::to_string).collect(),
             output_stats: std::collections::BTreeMap::new(),
             preview_artifacts: std::collections::BTreeMap::new(),
+            artifact_thumbnails: std::collections::HashMap::new(),
+            artifact_thumbnail_order: std::collections::VecDeque::new(),
             viewport_overflow: None,
             lightbox: None,
             export_dialog: None,
@@ -1373,12 +1380,42 @@ impl VolumetricUiV2 {
         }
     }
 
+    /// Locate the pipeline node that defines a materialized artifact. Export
+    /// declarations take precedence, followed by step outputs and imports, so
+    /// the artifact browser can navigate intermediates as naturally as public
+    /// project results.
+    fn project_selection_for_asset(&self, id: &str) -> Option<ProjectSelection> {
+        self.project
+            .exports()
+            .iter()
+            .position(|export| export == id)
+            .map(ProjectSelection::Export)
+            .or_else(|| {
+                self.project
+                    .timeline()
+                    .iter()
+                    .position(|step| step.outputs.iter().any(|output| output == id))
+                    .map(ProjectSelection::Step)
+            })
+            .or_else(|| {
+                self.project
+                    .imports()
+                    .iter()
+                    .position(|import| import.id == id)
+                    .map(ProjectSelection::Import)
+            })
+    }
+
     /// Whether the current selection resolves to a materialized runtime output.
     /// When false, the selected node contributes nothing to the viewport (only
     /// pinned outputs render) and the inspector shows a "run to preview" hint.
     fn selection_is_renderable(&self) -> bool {
-        self.selected_render_id()
-            .is_some_and(|id| self.runtime_assets.iter().any(|asset| asset.id() == id))
+        self.selected_render_id().is_some_and(|id| {
+            self.runtime_assets
+                .iter()
+                .find(|asset| asset.id() == id)
+                .is_some_and(runtime_asset_is_renderable)
+        })
     }
 
     /// Toggles whether an output stays pinned in the viewport across selection
@@ -2190,19 +2227,31 @@ impl VolumetricUiV2 {
 
                 // Make sure the viewport shows something: if the selection points
                 // at nothing materialized, follow the primary export.
-                if !self.selection_is_renderable()
-                    && let Some(id) = self
-                        .runtime_assets
-                        .first()
-                        .map(|asset| asset.id().to_string())
-                {
-                    let export_idx = self.project.exports().iter().position(|e| *e == id);
-                    self.selected_export = Some(id);
-                    self.selected_project_item = export_idx.map(ProjectSelection::Export);
+                if !self.selection_is_renderable() {
+                    let fallback = self
+                        .project
+                        .exports
+                        .iter()
+                        .filter_map(|export| {
+                            self.runtime_assets
+                                .iter()
+                                .find(|asset| asset.id() == export)
+                        })
+                        .find(|asset| runtime_asset_is_renderable(asset))
+                        .or_else(|| {
+                            self.runtime_assets
+                                .iter()
+                                .find(|asset| runtime_asset_is_renderable(asset))
+                        })
+                        .map(|asset| asset.id().to_string());
+                    if let Some(id) = fallback {
+                        self.selected_project_item = self.project_selection_for_asset(&id);
+                        self.selected_export = Some(id);
+                    }
                 }
 
                 self.status = format!(
-                    "ran project: {} exports in {elapsed_ms}ms",
+                    "ran project: {} artifacts in {elapsed_ms}ms",
                     self.runtime_assets.len()
                 );
             }
@@ -2445,6 +2494,23 @@ impl VolumetricUiV2 {
         artifacts: std::collections::BTreeMap<String, PreviewArtifactStatus>,
     ) {
         self.preview_artifacts = artifacts;
+    }
+
+    pub(crate) fn has_artifact_thumbnail(&self, source_hash: &[u8; 32]) -> bool {
+        self.artifact_thumbnails.contains_key(source_hash)
+    }
+
+    pub(crate) fn set_artifact_thumbnail(&mut self, source_hash: [u8; 32], texture: AppTexture) {
+        const CAPACITY: usize = 256;
+        if !self.artifact_thumbnails.contains_key(&source_hash) {
+            self.artifact_thumbnail_order.push_back(source_hash);
+        }
+        self.artifact_thumbnails.insert(source_hash, texture);
+        while self.artifact_thumbnail_order.len() > CAPACITY {
+            if let Some(expired) = self.artifact_thumbnail_order.pop_front() {
+                self.artifact_thumbnails.remove(&expired);
+            }
+        }
     }
 
     /// Rebuilds the step editor when the selected step changes. While the same
@@ -3943,14 +4009,7 @@ impl App for VolumetricUiV2 {
             self.add_export(asset_id);
         } else if let Some(asset_id) = route.strip_prefix(SELECT_RUNTIME_ASSET_PREFIX) {
             self.selected_export = Some(asset_id.to_string());
-            // Fold runtime selection into the pipeline selection so the viewport
-            // follows it: a runtime asset is the output of its matching export.
-            self.selected_project_item = self
-                .project
-                .exports()
-                .iter()
-                .position(|export| export == asset_id)
-                .map(ProjectSelection::Export);
+            self.selected_project_item = self.project_selection_for_asset(asset_id);
             self.status = format!("selected runtime asset {asset_id}");
         } else if let Some(asset_id) = route.strip_prefix(TOGGLE_PIN_PREFIX) {
             self.toggle_pin(asset_id);
@@ -5635,7 +5694,7 @@ fn project_panel(app: &VolumetricUiV2) -> El {
     column([scroll([
         pipeline_accordion(app),
         divider(),
-        panel_section("Outputs", outputs_rows(app)),
+        panel_section("Artifacts", outputs_rows(app)),
         divider(),
         panel_section("Inspector", inspector_rows(app)),
     ])
@@ -5733,7 +5792,7 @@ fn outputs_rows(app: &VolumetricUiV2) -> Vec<El> {
         );
     } else if app.runtime_assets.is_empty() {
         rows.push(
-            text("Run the project to materialize exports.")
+            text("Run the project to materialize artifacts.")
                 .muted()
                 .small(),
         );
@@ -5763,17 +5822,34 @@ fn outputs_rows(app: &VolumetricUiV2) -> Vec<El> {
 
 fn runtime_asset_row(app: &VolumetricUiV2, asset: &LoadedAsset) -> El {
     let id = asset.id();
+    let renderable = runtime_asset_is_renderable(asset);
     let pinned = app.pinned_outputs.contains(id);
     let visible = app.output_is_visible(id);
     let render = app.output_render(id);
     let overridden = app.output_overrides.contains_key(id);
     let artifact = app.preview_artifacts.get(id).cloned().unwrap_or_default();
+    let thumbnail = app
+        .artifact_thumbnails
+        .get(&asset.content_hash())
+        .map(|texture| {
+            surface(texture.clone())
+                .surface_alpha(SurfaceAlpha::Straight)
+                .surface_fit(ImageFit::Contain)
+                .width(Size::Fixed(36.0))
+                .height(Size::Fixed(36.0))
+                .clip()
+        })
+        .unwrap_or_else(|| spacer().width(Size::Fixed(36.0)).height(Size::Fixed(36.0)));
 
-    let pin = icon_button(&*PIN_ICON)
-        .xsmall()
-        .tooltip(if pinned { "Unpin" } else { "Pin to viewport" })
-        .key(format!("{TOGGLE_PIN_PREFIX}{id}"));
-    let pin = if pinned { pin.primary() } else { pin.ghost() };
+    let pin = if renderable {
+        let pin = icon_button(&*PIN_ICON)
+            .xsmall()
+            .tooltip(if pinned { "Unpin" } else { "Pin to viewport" })
+            .key(format!("{TOGGLE_PIN_PREFIX}{id}"));
+        if pinned { pin.primary() } else { pin.ghost() }
+    } else {
+        spacer().width(Size::Fixed(24.0))
+    };
 
     let settings = icon_button("settings")
         .xsmall()
@@ -5783,31 +5859,58 @@ fn runtime_asset_row(app: &VolumetricUiV2, asset: &LoadedAsset) -> El {
             "Render settings"
         })
         .key(format!("{OUTPUT_SETTINGS_PREFIX}{id}"));
-    let settings = if overridden {
+    let settings = if !renderable {
+        spacer().width(Size::Fixed(24.0))
+    } else if overridden {
         settings.primary()
     } else {
         settings.ghost()
     };
 
-    table_row([
-        // Dot marks outputs currently drawn in the viewport.
+    let summary = if renderable {
+        format!(
+            "{} · {} · {}{}",
+            asset_type_label(asset.type_hint()),
+            render.summary(),
+            artifact.label(),
+            if overridden { " *" } else { "" },
+        )
+    } else {
+        format!(
+            "{} · {}",
+            asset_type_label(asset.type_hint()),
+            artifact.label()
+        )
+    };
+    let visibility = if renderable {
         text(if visible { "●" } else { "○" })
             .caption()
             .muted()
-            .width(Size::Fixed(12.0)),
+            .width(Size::Fixed(12.0))
+    } else {
+        spacer().width(Size::Fixed(12.0))
+    };
+    let view = if renderable {
+        icon_button(&*EYE_ICON)
+            .ghost()
+            .xsmall()
+            .tooltip("View")
+            .key(format!("{SELECT_RUNTIME_ASSET_PREFIX}{id}"))
+    } else {
+        spacer().width(Size::Fixed(24.0))
+    };
+
+    table_row([
+        thumbnail,
+        // Dot marks outputs currently drawn in the viewport.
+        visibility,
         column([
-            text(format!(
-                "{} · {} · {}{}",
-                asset_type_label(asset.type_hint()),
-                render.summary(),
-                artifact.label(),
-                if overridden { " *" } else { "" },
-            ))
-            .caption()
-            .muted()
-            .ellipsis()
-            .tooltip(artifact.tooltip())
-            .width(Size::Fill(1.0)),
+            text(summary)
+                .caption()
+                .muted()
+                .ellipsis()
+                .tooltip(artifact.tooltip())
+                .width(Size::Fill(1.0)),
             text(id).label().ellipsis().width(Size::Fill(1.0)),
         ])
         .gap(1.0)
@@ -5818,16 +5921,24 @@ fn runtime_asset_row(app: &VolumetricUiV2, asset: &LoadedAsset) -> El {
             .text_align(TextAlign::End)
             .width(Size::Fixed(56.0)),
         pin,
-        icon_button(&*EYE_ICON)
-            .ghost()
-            .xsmall()
-            .tooltip("View")
-            .key(format!("{SELECT_RUNTIME_ASSET_PREFIX}{id}")),
+        view,
         settings,
     ])
-    .height(Size::Fixed(36.0))
+    .height(Size::Fixed(44.0))
     .padding(Sides::xy(tokens::SPACE_2, 0.0))
     .gap(tokens::SPACE_1)
+}
+
+fn runtime_asset_is_renderable(asset: &LoadedAsset) -> bool {
+    matches!(
+        asset.type_hint(),
+        Some(
+            AssetTypeHint::Model
+                | AssetTypeHint::FeaMesh
+                | AssetTypeHint::TriMesh
+                | AssetTypeHint::Subspace
+        ) | None
+    )
 }
 
 fn import_detail_rows(app: &VolumetricUiV2, idx: usize) -> Vec<El> {
@@ -7455,6 +7566,42 @@ mod tests {
     }
 
     #[test]
+    fn artifact_browser_can_view_an_unexported_step_output() {
+        let mut app = VolumetricUiV2::default();
+        add_operator_click(&mut app, "translate_operator");
+        add_operator_click(&mut app, "translate_operator");
+        let first = app.project().timeline()[0].outputs[0].clone();
+        let second = app.project().timeline()[1].outputs[0].clone();
+        app.project.exports_mut().retain(|export| export != &first);
+        assert!(app.project.exports().contains(&second));
+
+        let model = volumetric_assets::get_model("simple_sphere_model")
+            .expect("bundled sphere model")
+            .bytes
+            .to_vec();
+        app.apply_run_result(
+            Ok(vec![
+                LoadedAsset::from_parts(
+                    first.clone(),
+                    model.clone(),
+                    Some(AssetTypeHint::Model),
+                    Vec::new(),
+                ),
+                LoadedAsset::from_parts(second, model, Some(AssetTypeHint::Model), Vec::new()),
+            ]),
+            1,
+        );
+
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{SELECT_RUNTIME_ASSET_PREFIX}{first}")),
+        );
+        assert_eq!(app.selected_project_item, Some(ProjectSelection::Step(0)));
+        assert_eq!(app.selected_render_id(), Some(first.as_str()));
+        assert_eq!(app.preview_requests()[0].asset_id, first);
+    }
+
+    #[test]
     fn pinning_keeps_an_output_visible_across_selection() {
         let (mut app, exports) = two_export_app();
 
@@ -7522,6 +7669,31 @@ mod tests {
         assert_eq!(summary.runtime_assets.len(), 1);
         assert_eq!(summary.last_run_elapsed_ms, Some(42));
         assert!(!summary.last_run_stale);
+    }
+
+    #[test]
+    fn failed_run_keeps_the_last_successful_artifact_registry() {
+        let mut app = VolumetricUiV2::default();
+        app.run_project();
+        let before = app
+            .runtime_assets()
+            .iter()
+            .map(|asset| (asset.id().to_string(), asset.content_hash()))
+            .collect::<Vec<_>>();
+
+        app.apply_run_result(Err("broken downstream step".into()), 17);
+
+        let after = app
+            .runtime_assets()
+            .iter()
+            .map(|asset| (asset.id().to_string(), asset.content_hash()))
+            .collect::<Vec<_>>();
+        assert_eq!(after, before);
+        assert!(app.summary().last_run_stale);
+        assert_eq!(
+            app.summary().last_run_error.as_deref(),
+            Some("broken downstream step")
+        );
     }
 
     #[test]

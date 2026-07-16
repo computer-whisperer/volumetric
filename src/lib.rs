@@ -8,6 +8,7 @@ use anyhow::Context;
 
 pub mod baked;
 pub mod build_cache;
+pub mod direct_preview;
 pub mod mesh_cache;
 pub mod wasm;
 
@@ -1213,7 +1214,28 @@ impl Project {
         cancel: &std::sync::atomic::AtomicBool,
         progress: &dyn Fn(BuildProgress),
     ) -> Result<Vec<LoadedAsset>, ExecutionError> {
-        self.run_monitored_with_cache(env, build_cache::global(), cancel, progress)
+        self.run_monitored_with_artifacts(env, cancel, progress, &|_| {})
+    }
+
+    /// [`run_monitored`](Self::run_monitored) plus a callback whenever an
+    /// imported or generated artifact becomes available. Step-cache hits emit
+    /// identically to freshly executed steps. The callback runs on the project
+    /// execution thread and receives a borrowed immutable artifact.
+    #[cfg(any(feature = "native", feature = "web"))]
+    pub fn run_monitored_with_artifacts(
+        &self,
+        env: &mut Environment,
+        cancel: &std::sync::atomic::AtomicBool,
+        progress: &dyn Fn(BuildProgress),
+        artifact_ready: &dyn Fn(&LoadedAsset),
+    ) -> Result<Vec<LoadedAsset>, ExecutionError> {
+        self.run_monitored_with_cache_and_artifacts(
+            env,
+            build_cache::global(),
+            cancel,
+            progress,
+            artifact_ready,
+        )
     }
 
     /// [`run_monitored`](Self::run_monitored) against a caller-supplied step
@@ -1226,19 +1248,35 @@ impl Project {
         cancel: &std::sync::atomic::AtomicBool,
         progress: &dyn Fn(BuildProgress),
     ) -> Result<Vec<LoadedAsset>, ExecutionError> {
+        self.run_monitored_with_cache_and_artifacts(env, cache, cancel, progress, &|_| {})
+    }
+
+    /// [`run_monitored_with_artifacts`](Self::run_monitored_with_artifacts)
+    /// against a caller-supplied step cache.
+    #[cfg(any(feature = "native", feature = "web"))]
+    pub fn run_monitored_with_cache_and_artifacts(
+        &self,
+        env: &mut Environment,
+        cache: &BuildCache,
+        cancel: &std::sync::atomic::AtomicBool,
+        progress: &dyn Fn(BuildProgress),
+        artifact_ready: &dyn Fn(&LoadedAsset),
+    ) -> Result<Vec<LoadedAsset>, ExecutionError> {
         use build_cache::{CachedStep, StepKey};
         use std::sync::atomic::Ordering;
         use wasm::{OperatorExecutor, OperatorIo};
 
         // Load all imports into environment
         for import in &self.imports {
-            env.insert(LoadedAsset {
+            let asset = LoadedAsset {
                 id: import.id.clone(),
                 data: Arc::new(import.data.clone()),
                 type_hint: import.type_hint,
                 precursor_ids: vec![],
                 content_hash: std::sync::OnceLock::new(),
-            });
+            };
+            artifact_ready(&asset);
+            env.insert(asset);
         }
 
         // Execute timeline steps
@@ -1283,7 +1321,7 @@ impl Project {
             if let Some(cached) = cache.get(&step_key) {
                 for (idx, output_id) in step.outputs.iter().enumerate() {
                     if let Some((data, hash)) = cached.outputs.get(&idx) {
-                        env.insert(LoadedAsset {
+                        let asset = LoadedAsset {
                             id: output_id.clone(),
                             data: Arc::clone(data),
                             type_hint: Some(
@@ -1295,7 +1333,9 @@ impl Project {
                             ),
                             precursor_ids: precursor_ids.clone(),
                             content_hash: std::sync::OnceLock::from(*hash),
-                        });
+                        };
+                        artifact_ready(&asset);
+                        env.insert(asset);
                     }
                 }
                 continue;
@@ -1357,7 +1397,7 @@ impl Project {
             // Store outputs
             for (idx, output_id) in step.outputs.iter().enumerate() {
                 if let Some((data, hash)) = outputs.get(&idx) {
-                    env.insert(LoadedAsset {
+                    let asset = LoadedAsset {
                         id: output_id.clone(),
                         data: Arc::clone(data),
                         type_hint: Some(
@@ -1368,7 +1408,9 @@ impl Project {
                         ),
                         precursor_ids: precursor_ids.clone(),
                         content_hash: std::sync::OnceLock::from(*hash),
-                    });
+                    };
+                    artifact_ready(&asset);
+                    env.insert(asset);
                 }
             }
 
