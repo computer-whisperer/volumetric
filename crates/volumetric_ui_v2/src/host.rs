@@ -1036,6 +1036,15 @@ impl BackgroundWorker {
         }
         results
     }
+
+    /// Test-only blocking wait for the next background result, bounded by
+    /// `timeout`. Wakes the instant a result lands instead of sleep-polling, so
+    /// a generous ceiling stays cheap on a fast machine yet tolerates a
+    /// CPU-starved CI runner that takes seconds to schedule the worker threads.
+    #[cfg(test)]
+    fn recv_result_timeout(&self, timeout: std::time::Duration) -> Option<BackgroundResult> {
+        self.results.recv_timeout(timeout).ok()
+    }
 }
 
 /// Dispatch a UI event to the app, attaching the runner's `UiState` so
@@ -1169,20 +1178,22 @@ mod tests {
             cancel,
         });
 
+        // Wait on the result channel with a generous ceiling rather than a tight
+        // fixed poll: a constrained CI runner can take seconds to schedule the
+        // worker thread, but we still return the instant the result lands.
         let mut completion = None;
-        for _ in 0..300 {
-            for result in worker.drain_results() {
-                if let BackgroundResult::ProjectComplete {
-                    generation, result, ..
-                } = result
-                {
-                    completion = Some((generation, result));
-                }
-            }
-            if completion.is_some() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while completion.is_none() {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
                 break;
             }
-            thread::sleep(std::time::Duration::from_millis(10));
+            if let Some(BackgroundResult::ProjectComplete {
+                generation, result, ..
+            }) = worker.recv_result_timeout(remaining)
+            {
+                completion = Some((generation, result));
+            }
         }
 
         let (generation, result) = completion.expect("worker reported a project result");
@@ -1217,21 +1228,26 @@ mod tests {
             cancel: Arc::new(AtomicBool::new(false)),
         }));
 
+        // Generous wall-clock ceiling rather than a tight fixed poll: the
+        // thumbnail runs on its own thread, but a constrained CI runner can
+        // starve it for seconds. We still break the instant it lands, and a
+        // premature ProjectComplete still trips the release-barrier guard.
         let mut thumbnail = None;
-        for _ in 0..300 {
-            for result in worker.drain_results() {
-                match result {
-                    BackgroundResult::ThumbnailComplete { result, .. } => thumbnail = Some(result),
-                    BackgroundResult::ProjectComplete { .. } => {
-                        panic!("project lane completed before its release barrier")
-                    }
-                    _ => {}
-                }
-            }
-            if thumbnail.is_some() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while thumbnail.is_none() {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
                 break;
             }
-            thread::sleep(std::time::Duration::from_millis(10));
+            match worker.recv_result_timeout(remaining) {
+                Some(BackgroundResult::ThumbnailComplete { result, .. }) => {
+                    thumbnail = Some(result)
+                }
+                Some(BackgroundResult::ProjectComplete { .. }) => {
+                    panic!("project lane completed before its release barrier")
+                }
+                _ => {}
+            }
         }
         let raster = thumbnail
             .expect("thumbnail completed on its independent lane")
