@@ -1154,6 +1154,12 @@ fn gather_file_task(
             operator_name: "stl_import_operator",
             output_base: "stl_import",
         }),
+        FileAction::ImportStep => Some(FileTask::ImportBlob {
+            filter_name: "STEP",
+            extensions: &["step", "stp"],
+            operator_name: "step_import_operator",
+            output_base: "step_import",
+        }),
         FileAction::ImportImage => Some(FileTask::ImportBlob {
             filter_name: "Images",
             extensions: &["png", "jpg", "jpeg", "bmp", "gif"],

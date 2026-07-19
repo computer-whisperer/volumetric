@@ -99,25 +99,40 @@ pub fn project_point(
             Ok([best.1, l[2]])
         }
         Surface::Nurbs(n) => {
+            // Gauss-Newton is only as good as its seed: polish from the
+            // hint AND from the best cells of a dense grid scan (a
+            // sparse scan can hand every seed to the same wrong local
+            // minimum on folded patches).
             let dom = n.domain();
-            let mut seeds: [[f64; 2]; 10] = [[0.0; 2]; 10];
-            let seed_count = if let Some(h) = hint {
-                seeds[0] = h;
-                1
-            } else {
-                // Coarse grid: pick the closest of 3x3 samples.
-                let mut k = 0;
-                for i in 0..3 {
-                    for j in 0..3 {
-                        seeds[k] = [
-                            dom[0] + (dom[1] - dom[0]) * (i as f64 + 0.5) / 3.0,
-                            dom[2] + (dom[3] - dom[2]) * (j as f64 + 0.5) / 3.0,
-                        ];
-                        k += 1;
+            let mut seeds: [[f64; 2]; 4] = [[0.0; 2]; 4];
+            let mut seed_count = 0;
+            if let Some(h) = hint {
+                seeds[seed_count] = h;
+                seed_count += 1;
+            }
+            const N: usize = 9;
+            let mut ranked: [([f64; 2], f64); 3] =
+                [([0.0; 2], f64::INFINITY); 3];
+            for i in 0..=N {
+                for j in 0..=N {
+                    let u = dom[0] + (dom[1] - dom[0]) * i as f64 / N as f64;
+                    let v = dom[2] + (dom[3] - dom[2]) * j as f64 / N as f64;
+                    let (s, _, _) = nurbs::surface_eval(n, u, v);
+                    let d = norm(sub(s, p));
+                    // Insert into the 3-best list.
+                    for slot in 0..ranked.len() {
+                        if d < ranked[slot].1 {
+                            ranked[slot..].rotate_right(1);
+                            ranked[slot] = ([u, v], d);
+                            break;
+                        }
                     }
                 }
-                k
-            };
+            }
+            for (uv, _) in ranked {
+                seeds[seed_count] = uv;
+                seed_count += 1;
+            }
             let mut best: Option<([f64; 2], f64)> = None;
             for seed in &seeds[..seed_count] {
                 if let Some((uv, d)) = nurbs_closest(n, p, *seed) {

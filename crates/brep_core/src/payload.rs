@@ -337,9 +337,11 @@ fn face_aabb(face: &Face) -> [f64; 6] {
             bb
         }
         // Curved analytics: sample a grid over the trim UV range and
-        // inflate by the largest adjacent-sample distance, which bounds
-        // the sagitta between samples with generous slack for these
-        // constant-curvature surfaces.
+        // inflate by the largest second difference — for these
+        // constant-curvature surfaces that is ~4x the single-cell
+        // sagitta, so the true surface between samples stays inside
+        // with real headroom, without the gross slack of a
+        // cell-diagonal margin.
         _ => {
             const N: usize = 17;
             let mut samples = [[0.0f64; 3]; N * N];
@@ -352,20 +354,36 @@ fn face_aabb(face: &Face) -> [f64; 6] {
                     grow(&mut bb, p);
                 }
             }
-            let mut cell = 0.0f64;
+            let mut margin = 0.0f64;
+            let mut dev = |a: [f64; 3], m: [f64; 3], b: [f64; 3]| {
+                let mid = [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5, (a[2] + b[2]) * 0.5];
+                margin = margin.max(dist(m, mid));
+            };
             for i in 0..N {
                 for j in 0..N {
-                    if i + 1 < N {
-                        cell = cell.max(dist(samples[i * N + j], samples[(i + 1) * N + j]));
+                    if i + 2 < N {
+                        dev(
+                            samples[i * N + j],
+                            samples[(i + 1) * N + j],
+                            samples[(i + 2) * N + j],
+                        );
                     }
-                    if j + 1 < N {
-                        cell = cell.max(dist(samples[i * N + j], samples[i * N + j + 1]));
+                    if j + 2 < N {
+                        dev(
+                            samples[i * N + j],
+                            samples[i * N + j + 1],
+                            samples[i * N + j + 2],
+                        );
                     }
                 }
             }
+            // The second difference is ~4x the single-cell sagitta;
+            // half of it still covers the worst-case diagonal
+            // deviation (u sagitta + v sagitta) with headroom.
+            let margin = margin * 0.5;
             for axis in 0..3 {
-                bb[axis * 2] -= cell;
-                bb[axis * 2 + 1] += cell;
+                bb[axis * 2] -= margin;
+                bb[axis * 2 + 1] += margin;
             }
             bb
         }

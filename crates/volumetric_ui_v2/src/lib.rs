@@ -147,6 +147,7 @@ pub const SAVE_PROJECT_AS_KEY: &str = "action:save-project-as";
 pub const SAVE_BUILT_COPY_KEY: &str = "action:save-built-copy";
 pub const IMPORT_WASM_KEY: &str = "action:import-wasm";
 pub const IMPORT_STL_KEY: &str = "action:import-stl";
+pub const IMPORT_STEP_KEY: &str = "action:import-step";
 pub const IMPORT_IMAGE_KEY: &str = "action:import-image";
 pub const RUN_PROJECT_KEY: &str = "action:run-project";
 pub const CANCEL_RUN_KEY: &str = "action:cancel-run";
@@ -919,6 +920,8 @@ pub enum FileAction {
     ImportWasm,
     /// Import an STL mesh via the bundled `stl_import_operator`.
     ImportStl,
+    /// Import a STEP CAD file via the bundled `step_import_operator`.
+    ImportStep,
     /// Import an image as a 2D field model via the bundled
     /// `image_model_operator`.
     ImportImage,
@@ -3945,6 +3948,13 @@ impl App for VolumetricUiV2 {
             return;
         }
 
+        if event.is_click_or_activate(IMPORT_STEP_KEY) {
+            self.pending_file_action = Some(FileAction::ImportStep);
+            self.open_menu = None;
+            self.add_modal = None;
+            return;
+        }
+
         if event.is_click_or_activate(IMPORT_IMAGE_KEY) {
             self.pending_file_action = Some(FileAction::ImportImage);
             self.open_menu = None;
@@ -4407,6 +4417,7 @@ fn entry_category(entry: &catalog::CatalogEntry) -> Option<&str> {
 fn catalog_row_key(entry: &catalog::CatalogEntry) -> String {
     match entry.name.as_str() {
         "stl_import_operator" => IMPORT_STL_KEY.to_string(),
+        "step_import_operator" => IMPORT_STEP_KEY.to_string(),
         "image_model_operator" => IMPORT_IMAGE_KEY.to_string(),
         _ => match entry.kind {
             volumetric_assets::AssetCategory::Model => {

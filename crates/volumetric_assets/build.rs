@@ -30,6 +30,7 @@ const OPERATORS: &[&str] = &[
     "lua_script_operator",
     "f64_map_merge_operator",
     "stl_import_operator",
+    "step_import_operator",
     "rectangular_prism_operator",
     "heightmap_extrude_operator",
     "image_model_operator",

@@ -1,0 +1,14 @@
+[package]
+name = "step_import_operator"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+volumetric_abi = { path = "../../volumetric_abi" }
+brep_core = { path = "../../brep_core" }
+walrus = "0.26"
+serde = { version = "1", features = ["derive"] }
+ciborium = "0.2"
