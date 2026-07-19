@@ -85,7 +85,7 @@
 //! ## Not Yet Supported
 //! - Generic for loops (`for k, v in pairs(t)`)
 //! - Tables, strings, multiple return values
-//! - Closures, recursion between helper functions
+//! - Closures, recursive helper calls
 
 use walrus::{FunctionBuilder, Module, ModuleConfig, ValType};
 
@@ -323,6 +323,147 @@ enum IrStmt {
 struct IrFunc {
     params: Vec<String>,
     body: Vec<IrStmt>,
+}
+
+fn collect_expr_calls(expr: &IrExpr, calls: &mut std::collections::BTreeSet<String>) {
+    match expr {
+        IrExpr::Number(_) | IrExpr::Var(_) => {}
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            collect_expr_calls(lhs, calls);
+            collect_expr_calls(rhs, calls);
+        }
+        IrExpr::UnaryOp { expr, .. } => collect_expr_calls(expr, calls),
+        IrExpr::MathCall { args, .. } => {
+            for arg in args {
+                collect_expr_calls(arg, calls);
+            }
+        }
+        IrExpr::FuncCall { name, args } => {
+            calls.insert(name.clone());
+            for arg in args {
+                collect_expr_calls(arg, calls);
+            }
+        }
+        IrExpr::IfThenElse {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            collect_expr_calls(cond, calls);
+            collect_expr_calls(then_expr, calls);
+            collect_expr_calls(else_expr, calls);
+        }
+    }
+}
+
+fn collect_stmt_calls(stmt: &IrStmt, calls: &mut std::collections::BTreeSet<String>) {
+    match stmt {
+        IrStmt::LocalAssign { value, .. } | IrStmt::Assign { value, .. } => {
+            collect_expr_calls(value, calls);
+        }
+        IrStmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            collect_expr_calls(cond, calls);
+            for stmt in then_body.iter().chain(else_body) {
+                collect_stmt_calls(stmt, calls);
+            }
+        }
+        IrStmt::While { cond, body } => {
+            collect_expr_calls(cond, calls);
+            for stmt in body {
+                collect_stmt_calls(stmt, calls);
+            }
+        }
+        IrStmt::RepeatUntil { body, cond } => {
+            for stmt in body {
+                collect_stmt_calls(stmt, calls);
+            }
+            collect_expr_calls(cond, calls);
+        }
+        IrStmt::NumericFor {
+            start,
+            end,
+            step,
+            body,
+            ..
+        } => {
+            collect_expr_calls(start, calls);
+            collect_expr_calls(end, calls);
+            if let Some(step) = step {
+                collect_expr_calls(step, calls);
+            }
+            for stmt in body {
+                collect_stmt_calls(stmt, calls);
+            }
+        }
+        IrStmt::Return(expr) => collect_expr_calls(expr, calls),
+        IrStmt::Break => {}
+    }
+}
+
+/// Order helpers after all helpers they call. Walrus assigns function IDs as
+/// bodies are finished, so dependency ordering gives Lua's source-independent
+/// global function lookup without relying on `HashMap` iteration order.
+fn helper_emission_order(
+    functions: &std::collections::HashMap<String, IrFunc>,
+    required_funcs: &[&str],
+) -> Result<Vec<String>, CompileError> {
+    fn visit(
+        name: &str,
+        functions: &std::collections::HashMap<String, IrFunc>,
+        required: &std::collections::BTreeSet<&str>,
+        states: &mut std::collections::HashMap<String, u8>,
+        order: &mut Vec<String>,
+    ) -> Result<(), CompileError> {
+        match states.get(name).copied() {
+            Some(2) => return Ok(()),
+            Some(1) => {
+                return Err(CompileError::Unsupported(format!(
+                    "recursive helper call involving `{name}`"
+                )));
+            }
+            _ => {}
+        }
+        states.insert(name.to_string(), 1);
+
+        let function = functions
+            .get(name)
+            .ok_or_else(|| CompileError::Unsupported(format!("unknown function: {name}")))?;
+        let mut calls = std::collections::BTreeSet::new();
+        for stmt in &function.body {
+            collect_stmt_calls(stmt, &mut calls);
+        }
+        for dependency in calls {
+            if required.contains(dependency.as_str()) {
+                return Err(CompileError::Unsupported(format!(
+                    "helper `{name}` cannot call required model function `{dependency}`"
+                )));
+            }
+            visit(&dependency, functions, required, states, order)?;
+        }
+
+        states.insert(name.to_string(), 2);
+        order.push(name.to_string());
+        Ok(())
+    }
+
+    let required: std::collections::BTreeSet<_> = required_funcs.iter().copied().collect();
+    let mut helper_names: Vec<_> = functions
+        .keys()
+        .filter(|name| !required.contains(name.as_str()))
+        .cloned()
+        .collect();
+    helper_names.sort();
+
+    let mut states = std::collections::HashMap::new();
+    let mut order = Vec::with_capacity(helper_names.len());
+    for name in helper_names {
+        visit(&name, functions, &required, &mut states, &mut order)?;
+    }
+    Ok(order)
 }
 
 // ============================================================================
@@ -1851,12 +1992,11 @@ fn compile_lua_to_wasm_with_parameters(
         Ok(None)
     }
 
-    // First, generate helper functions (non-required functions)
-    // These need to be created first so they can be called from required functions
-    for (fname, ir_func) in &functions {
-        if required_funcs.contains(&fname.as_str()) {
-            continue; // Required functions are generated separately below
-        }
+    // Generate helpers after their dependencies, then generate the required
+    // model functions that call them. This remains deterministic even though
+    // declarations are stored in a HashMap.
+    for fname in helper_emission_order(&functions, &required_funcs)? {
+        let ir_func = functions.get(&fname).expect("ordered helper must exist");
 
         // Helper functions take f64 params and return f64
         let param_types: Vec<ValType> = ir_func.params.iter().map(|_| ValType::F64).collect();
@@ -1890,7 +2030,7 @@ fn compile_lua_to_wasm_with_parameters(
         }
 
         let fid = fb.finish(param_locals, &mut module.funcs);
-        func_ids.insert(fname.clone(), fid);
+        func_ids.insert(fname, fid);
     }
 
     // Create memory for I/O buffers and export it
@@ -2236,6 +2376,44 @@ function get_bounds_max_y() return radius end
     fn fidget_spinner_reference_compiles() {
         let lua_src = include_str!("../../../../examples/fidget_spinner.lua");
         assert_valid_wasm(&compile_lua_to_wasm(lua_src).expect("compile reference spinner"));
+    }
+
+    #[test]
+    fn raspberry_pi_tray_reference_compiles() {
+        let lua_src = include_str!("../../../../examples/raspberry_pi_4_tray.lua");
+        assert_valid_wasm(&compile_lua_to_wasm(lua_src).expect("compile reference Pi tray"));
+    }
+
+    #[test]
+    fn helper_calls_are_emitted_in_dependency_order() {
+        let lua_src = r#"
+function outer(x) return inner(x) end
+function inner(x) return x*x end
+function is_inside(x, y) return outer(x) + y*y <= 1.0 end
+function get_bounds_min_x() return -1.0 end
+function get_bounds_max_x() return 1.0 end
+function get_bounds_min_y() return -1.0 end
+function get_bounds_max_y() return 1.0 end
+"#;
+        assert_valid_wasm(&compile_lua_to_wasm(lua_src).expect("compile forward helper call"));
+    }
+
+    #[test]
+    fn recursive_helper_calls_are_rejected() {
+        let lua_src = r#"
+function first(x) return second(x) end
+function second(x) return first(x) end
+function is_inside(x, y) return first(x) + y end
+function get_bounds_min_x() return -1.0 end
+function get_bounds_max_x() return 1.0 end
+function get_bounds_min_y() return -1.0 end
+function get_bounds_max_y() return 1.0 end
+"#;
+        let error = compile_lua_to_wasm(lua_src).expect_err("recursive helpers must fail");
+        assert!(
+            matches!(error, CompileError::Unsupported(ref message) if message.contains("recursive helper call")),
+            "unexpected error: {error:?}"
+        );
     }
 
     #[test]

@@ -85,6 +85,10 @@ The analysis catalog includes `sdf`, which preserves a model's occupancy while a
 world-space truncated signed-distance channel. Its configured band extends outside the part
 bounds, and the positive clamp value remains defined globally beyond the sampled field.
 
+Demand-driven Lua examples live in `examples/`. `fidget_spinner.lua` exercises compact radial
+parts, while `raspberry_pi_4_tray.lua` exercises routed mechanical clearances, thin walls,
+mounting standoffs, irregular connector openings, and repeated ventilation features.
+
 ## Demo Models
 
 The project includes several example models in `crates/models/`:
