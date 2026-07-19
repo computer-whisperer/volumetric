@@ -88,6 +88,10 @@ bounds, and the positive clamp value remains defined globally beyond the sampled
 Demand-driven Lua examples live in `examples/`. `fidget_spinner.lua` exercises compact radial
 parts, while `raspberry_pi_4_tray.lua` exercises routed mechanical clearances, thin walls,
 mounting standoffs, irregular connector openings, and repeated ventilation features.
+`raspberry_pi_4_fit.vproj` places a vendored Pi 4B reference assembly in that tray and exports
+the tray, aligned board, combined assembly, and their intersection. The `fit_interference`
+export is intended as a clearance check and meshes to an empty surface at the documented
+alignment.
 
 ## Demo Models
 

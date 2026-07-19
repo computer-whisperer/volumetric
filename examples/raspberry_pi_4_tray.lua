@@ -125,19 +125,19 @@ function connector_cutout(x, y, z)
         x, y, z,
         side_min_x, side_max_x,
         0.001 - port_clearance, 0.017 + port_clearance,
-        board_z - 0.001, board_z + 0.017
+        board_z - 0.001, board_z + 0.019
     )
     local upper_usb = box(
         x, y, z,
         side_min_x, side_max_x,
         0.018 - port_clearance, 0.034 + port_clearance,
-        board_z - 0.001, board_z + 0.017
+        board_z - 0.001, board_z + 0.019
     )
     local ethernet = box(
         x, y, z,
         side_min_x, side_max_x,
         0.036 - port_clearance, board_width + port_clearance,
-        board_z - 0.001, board_z + 0.0145
+        board_z - 0.001, board_z + 0.017
     )
 
     -- Lower edge: USB-C power, two micro-HDMI ports, and the A/V jack.
@@ -149,21 +149,21 @@ function connector_cutout(x, y, z)
     )
     local hdmi_zero = box(
         x, y, z,
-        0.026 - port_clearance, 0.035 + port_clearance,
+        0.022 - port_clearance, 0.030 + port_clearance,
         edge_min_y, edge_max_y,
-        board_z - 0.001, board_z + 0.0045
+        board_z - 0.001, board_z + 0.006
     )
     local hdmi_one = box(
         x, y, z,
-        0.040 - port_clearance, 0.049 + port_clearance,
+        0.035 - port_clearance, 0.044 + port_clearance,
         edge_min_y, edge_max_y,
-        board_z - 0.001, board_z + 0.0045
+        board_z - 0.001, board_z + 0.006
     )
     local av_jack = box(
         x, y, z,
-        0.056 - port_clearance, 0.064 + port_clearance,
+        0.050 - port_clearance, 0.058 + port_clearance,
         edge_min_y, edge_max_y,
-        board_z - 0.001, board_z + 0.007
+        board_z - 0.001, board_z + 0.0095
     )
 
     return lower_usb or upper_usb or ethernet or usb_c or hdmi_zero or hdmi_one or av_jack
