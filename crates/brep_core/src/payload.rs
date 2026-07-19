@@ -401,17 +401,29 @@ fn dist(a: Vec3, b: Vec3) -> f64 {
     norm(sub(a, b))
 }
 
-/// The 3D length of a unit UV step along each axis at the trim center,
-/// by central differences — converts the 3D suspicion tolerance into UV
-/// units for the trim boundary test.
+/// The 3D length of a unit UV step along each axis, by central
+/// differences at several spots across the trim range (the metric can
+/// vary strongly — a sphere trim reaching toward a pole) — converts
+/// the 3D suspicion tolerance into UV units for the trim boundary
+/// test. The *smallest* metric wins: it yields the widest uv_eps, so
+/// suspicion errs toward re-casting.
 fn uv_metric(view: &SurfaceView, uv: [f64; 4]) -> [f64; 2] {
-    let cu = (uv[0] + uv[1]) * 0.5;
-    let cv = (uv[2] + uv[3]) * 0.5;
     let hu = ((uv[1] - uv[0]) * 1e-3).max(1e-9);
     let hv = ((uv[3] - uv[2]) * 1e-3).max(1e-9);
-    let mu = dist(view.eval(cu + hu, cv), view.eval(cu - hu, cv)) / (2.0 * hu);
-    let mv = dist(view.eval(cu, cv + hv), view.eval(cu, cv - hv)) / (2.0 * hv);
-    [mu.max(1e-12), mv.max(1e-12)]
+    let mut metric = [f64::INFINITY; 2];
+    for (fu, fv) in [(0.5, 0.5), (0.1, 0.1), (0.1, 0.9), (0.9, 0.1), (0.9, 0.9)] {
+        let cu = uv[0] + (uv[1] - uv[0]) * fu;
+        let cv = uv[2] + (uv[3] - uv[2]) * fv;
+        let mu = dist(view.eval(cu + hu, cv), view.eval(cu - hu, cv)) / (2.0 * hu);
+        let mv = dist(view.eval(cu, cv + hv), view.eval(cu, cv - hv)) / (2.0 * hv);
+        if mu > 1e-12 {
+            metric[0] = metric[0].min(mu);
+        }
+        if mv > 1e-12 {
+            metric[1] = metric[1].min(mv);
+        }
+    }
+    [metric[0].clamp(1e-12, f64::MAX), metric[1].clamp(1e-12, f64::MAX)]
 }
 
 fn write_face(w: &mut W, face: &Face, eps_boundary: f64) -> Result<(), String> {

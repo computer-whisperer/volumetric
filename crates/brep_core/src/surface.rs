@@ -265,6 +265,13 @@ impl<'a> SurfaceView<'a> {
             }
             SurfaceView::Extrusion { frame, profile } => {
                 let n = profile.len();
+                // Closed profiles are u-periodic; unwrapped trim UVs may
+                // arrive outside [0, n-1].
+                let u = if n >= 4 && profile.point(0) == profile.point(n - 1) {
+                    u.rem_euclid((n - 1) as f64)
+                } else {
+                    u
+                };
                 let seg = (u.floor().max(0.0) as usize).min(n.saturating_sub(2));
                 let s = (u - seg as f64).clamp(0.0, 1.0);
                 let a = profile.point(seg);
@@ -382,10 +389,21 @@ impl<'a> SurfaceView<'a> {
                 let mut tangent = false;
                 let mut marker_only = false;
                 if a.abs() < 1e-14 * dir_scale2 {
-                    // Ray parallel to one ruling: linear equation.
+                    // Ray parallel to one ruling: linear equation. When
+                    // it also lies on the surface (b, c both ~0) emit a
+                    // skim marker like the cylinder's axis-parallel case.
                     if b.abs() > 1e-14 * dir_scale2 {
                         roots[0] = -c / (2.0 * b);
                         count = 1;
+                    } else if c.abs() < eps * eps {
+                        visit(Hit {
+                            t: 0.0,
+                            u: o[1].atan2(o[0]),
+                            v: o[2],
+                            counts: false,
+                            suspect: true,
+                        });
+                        return;
                     }
                 } else {
                     let disc = b * b - a * c;
@@ -488,15 +506,29 @@ impl<'a> SurfaceView<'a> {
                     let py = o[1] + t * d[1];
                     let s = ((px - prev[0]) * e[0] + (py - prev[1]) * e[1]) / (seg_len * seg_len);
                     // Half-open [0, 1) so a hit on a shared segment
-                    // endpoint counts exactly once.
+                    // endpoint counts exactly once. Grazing incidence
+                    // makes s unreliable, so it earns a re-cast.
+                    let end_eps = eps / seg_len;
+                    let grazing = denom.abs() < 1e-4 * dir_scale * seg_len;
                     if (0.0..1.0).contains(&s) {
-                        let end_eps = eps / seg_len;
                         visit(Hit {
                             t,
                             u: (i - 1) as f64 + s,
                             v: o[2] + t * d[2],
                             counts: true,
-                            suspect: s < end_eps || s > 1.0 - end_eps,
+                            suspect: grazing || s < end_eps || s > 1.0 - end_eps,
+                        });
+                    } else if s >= -end_eps && s < 1.0 + end_eps {
+                        // Missed just outside the half-open window: FP
+                        // rounding at a shared vertex can push the hit
+                        // off both adjacent segments — flag it so the
+                        // re-cast resolves the parity.
+                        visit(Hit {
+                            t,
+                            u: (i - 1) as f64 + s.clamp(0.0, 1.0),
+                            v: o[2] + t * d[2],
+                            counts: false,
+                            suspect: true,
                         });
                     }
                     prev = cur;
@@ -577,7 +609,7 @@ fn torus_hits(
     // |f| scale for the tangent-grade test: f is quartic in distance, so
     // an eps-deep graze changes it by ~ eps * |gradient| ~ eps * scale^3.
     let f_scale = {
-        let s = reach.max(norm(sub(o, [0.0; 3]))) + 1.0;
+        let s = reach.max(norm(sub(o, [0.0; 3])));
         s * s * s * eps * 8.0
     };
     let mut prev_t = t_lo;
@@ -650,7 +682,10 @@ fn nurbs_ray_hits(
     let du_margin = (domain[1] - domain[0]) * 1e-6;
     let dv_margin = (domain[3] - domain[2]) * 1e-6;
 
-    let mut roots: [(f64, f64, f64); MAX_NURBS_ROOTS] = [(0.0, 0.0, 0.0); MAX_NURBS_ROOTS];
+    // Roots carry their 3D position: dedupe compares positions, not UV,
+    // so a seam alias on a closed surface (u=0 vs u=u_max, same point)
+    // merges while two walls of a thin fold (distinct points) don't.
+    let mut roots: [(f64, [f64; 3]); MAX_NURBS_ROOTS] = [(0.0, [0.0; 3]); MAX_NURBS_ROOTS];
     let mut root_count = 0usize;
     let inv_dir: Vec3 = core::array::from_fn(|i| 1.0 / dir[i]);
 
@@ -685,6 +720,7 @@ fn nurbs_ray_hits(
 
         let mut converged = false;
         let mut singular = false;
+        let mut best_res = f64::INFINITY;
         for _ in 0..24 {
             let (p, su, sv) = nurbs::surface_eval(raw, u, v);
             let r = [
@@ -693,6 +729,7 @@ fn nurbs_ray_hits(
                 p[2] - origin[2] - t * dir[2],
             ];
             let res = norm(r);
+            best_res = best_res.min(res);
             // Solve J * [du, dv, dt] = -r with J = [su, sv, -dir].
             let det = dot(su, cross(sv, [-dir[0], -dir[1], -dir[2]]));
             if det.abs() < 1e-14 {
@@ -730,6 +767,20 @@ fn nurbs_ray_hits(
             continue;
         }
         if !converged {
+            // Came near the surface but never converged: a crossing may
+            // be hiding here. Flag for a re-cast instead of silently
+            // dropping it (parity contract: missed crossings are either
+            // even-count or flagged). Seeds whose boxes the ray merely
+            // clips stay far from the surface and don't fire this.
+            if best_res < eps * 8.0 {
+                visit(Hit {
+                    t: 0.0,
+                    u,
+                    v,
+                    counts: false,
+                    suspect: true,
+                });
+            }
             continue;
         }
         if u < domain[0] - du_margin
@@ -739,10 +790,12 @@ fn nurbs_ray_hits(
         {
             continue;
         }
-        // Dedupe: different seeds converging to the same root.
-        let dup = roots[..root_count]
-            .iter()
-            .any(|&(ru, rv, rt)| (rt - t).abs() < eps && (ru - u).abs() < du_margin * 1e3 && (rv - v).abs() < dv_margin * 1e3);
+        let (pos, su, sv) = nurbs::surface_eval(raw, u, v);
+        // Dedupe by (t, 3D position): different seeds converging to the
+        // same physical crossing, including seam aliases.
+        let dup = roots[..root_count].iter().any(|&(rt, rp)| {
+            (rt - t).abs() < eps && norm(sub(rp, pos)) < eps * 4.0
+        });
         if dup {
             continue;
         }
@@ -757,11 +810,10 @@ fn nurbs_ray_hits(
             });
             continue;
         }
-        roots[root_count] = (u, v, t);
+        roots[root_count] = (t, pos);
         root_count += 1;
 
         // Tangency check: surface normal vs ray direction.
-        let (_, su, sv) = nurbs::surface_eval(raw, u, v);
         let n = cross(su, sv);
         let n_len = norm(n);
         let grazing = n_len == 0.0 || dot(n, dir).abs() < 1e-6 * n_len * norm(dir);

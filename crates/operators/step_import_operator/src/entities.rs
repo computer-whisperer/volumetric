@@ -14,6 +14,8 @@ use brep_core::nurbs::CurveData;
 pub struct Ctx<'a> {
     pub data: &'a DataSection,
     pub scale: f64,
+    /// Plane-angle unit factor to radians (degree-based files exist).
+    pub angle_scale: f64,
 }
 
 impl<'a> Ctx<'a> {
@@ -284,7 +286,8 @@ impl<'a> Ctx<'a> {
                         .args
                         .get(3)
                         .and_then(Arg::as_f64)
-                        .ok_or_else(|| format!("#{id}: bad cone angle"))?;
+                        .ok_or_else(|| format!("#{id}: bad cone angle"))?
+                        * self.angle_scale;
                     Ok(StepSurface::Cone(frame, rad, angle))
                 }
                 "SPHERICAL_SURFACE" => Ok(StepSurface::Sphere(
@@ -598,6 +601,14 @@ pub fn length_unit_scale(data: &DataSection) -> Result<f64, String> {
             let inner_si = inner
                 .record("SI_UNIT")
                 .ok_or_else(|| format!("#{inner_id}: conversion base is not an SI unit"))?;
+            match inner_si.args.last() {
+                Some(Arg::Enum(n)) if n == "METRE" => {}
+                other => {
+                    return Err(format!(
+                        "#{inner_id}: conversion base is not a metre unit ({other:?})"
+                    ));
+                }
+            }
             let prefix = match inner_si.args.first() {
                 Some(Arg::Enum(p)) => si_prefix(p)
                     .ok_or_else(|| format!("#{inner_id}: unknown SI prefix .{p}."))?,
@@ -640,4 +651,57 @@ fn si_prefix(name: &str) -> Option<f64> {
         "ATTO" => 1e-18,
         _ => return None,
     })
+}
+
+/// The plane-angle unit's factor to radians: 1.0 for SI radian files
+/// (with prefix support), the declared conversion for degree-based
+/// exporters, and 1.0 when no plane-angle unit is declared.
+pub fn plane_angle_scale(data: &DataSection) -> Result<f64, String> {
+    let mut found: Option<f64> = None;
+    for (id, e) in &data.entities {
+        if e.record("PLANE_ANGLE_UNIT").is_none() {
+            continue;
+        }
+        let factor = if let Some(si) = e.record("SI_UNIT") {
+            let prefix = match si.args.first() {
+                Some(Arg::Enum(p)) => si_prefix(p)
+                    .ok_or_else(|| format!("#{id}: unknown SI prefix .{p}."))?,
+                _ => 1.0,
+            };
+            match si.args.last() {
+                Some(Arg::Enum(n)) if n == "RADIAN" => prefix,
+                other => {
+                    return Err(format!("#{id}: unsupported SI angle unit {other:?}"));
+                }
+            }
+        } else if let Some(cbu) = e.record("CONVERSION_BASED_UNIT") {
+            let mwu_id = cbu
+                .args
+                .get(1)
+                .and_then(Arg::as_ref_id)
+                .ok_or_else(|| format!("#{id}: conversion unit without measure"))?;
+            let mr = data.get(mwu_id)?;
+            let rec = mr
+                .records
+                .iter()
+                .find(|r| r.name.contains("MEASURE_WITH_UNIT"))
+                .ok_or_else(|| format!("#{mwu_id}: expected MEASURE_WITH_UNIT"))?;
+            rec.args
+                .first()
+                .and_then(Arg::as_f64)
+                .ok_or_else(|| format!("#{mwu_id}: bad angle measure"))?
+        } else {
+            continue;
+        };
+        match found {
+            None => found = Some(factor),
+            Some(f) if (f - factor).abs() < f.abs() * 1e-12 => {}
+            Some(f) => {
+                return Err(format!(
+                    "multiple plane-angle units in file ({f} rad and {factor} rad)"
+                ));
+            }
+        }
+    }
+    Ok(found.unwrap_or(1.0))
 }

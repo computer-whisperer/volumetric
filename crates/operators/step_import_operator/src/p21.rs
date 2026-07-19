@@ -134,6 +134,9 @@ pub fn parse(input: &str) -> Result<DataSection, String> {
 
     // Verify the file magic, then skip to DATA;
     lex.skip_ws();
+    // Tolerate a UTF-8 BOM — they do occur in the wild.
+    lex.eat_keyword("\u{FEFF}");
+    lex.skip_ws();
     if !lex.eat_keyword("ISO-10303-21;") {
         return Err("not a STEP file: missing ISO-10303-21 header".into());
     }

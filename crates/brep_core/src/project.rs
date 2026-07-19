@@ -76,8 +76,13 @@ pub fn project_point(
         }
         Surface::ExtrusionPolyline { frame, profile } => {
             let l = frame.to_local(p);
-            // Nearest point on the profile polyline in the XY plane.
-            let mut best = (f64::INFINITY, 0.0f64);
+            // Nearest point on the profile polyline in the XY plane,
+            // collecting near-ties: on a closed profile the seam point
+            // is equally close to the first and last segment, and the
+            // tie must be broken toward the hint (continuity), never by
+            // floating-point noise — a wrong pick tears the trim loop.
+            let mut cands: Vec<(f64, f64)> = Vec::new(); // (dist, u)
+            let mut best_d = f64::INFINITY;
             for i in 0..profile.len() - 1 {
                 let a = profile[i];
                 let b = profile[i + 1];
@@ -90,13 +95,37 @@ pub fn project_point(
                 };
                 let dx = l[0] - a[0] - t * e[0];
                 let dy = l[1] - a[1] - t * e[1];
-                let d2 = dx * dx + dy * dy;
-                if d2 < best.0 {
-                    best = (d2, i as f64 + t);
+                let d = (dx * dx + dy * dy).sqrt();
+                best_d = best_d.min(d);
+                cands.push((d, i as f64 + t));
+            }
+            check_residual(best_d, tol, "extrusion")?;
+            let period = if crate::ir::profile_is_closed(profile) {
+                (profile.len() - 1) as f64
+            } else {
+                0.0
+            };
+            let slack = best_d + (tol * 1e-2).max(1e-12);
+            let mut u = f64::NAN;
+            let mut u_score = f64::INFINITY;
+            for &(d, cu) in &cands {
+                if d > slack {
+                    continue;
+                }
+                let (aliased, score) = match hint {
+                    Some(h) if period > 0.0 => {
+                        let a = cu + ((h[0] - cu) / period).round() * period;
+                        (a, (a - h[0]).abs())
+                    }
+                    Some(h) => (cu, (cu - h[0]).abs()),
+                    None => (cu, cu), // no hint: lowest u wins, canonically
+                };
+                if score < u_score {
+                    u_score = score;
+                    u = aliased;
                 }
             }
-            check_residual(best.0.sqrt(), tol, "extrusion")?;
-            Ok([best.1, l[2]])
+            Ok([u, l[2]])
         }
         Surface::Nurbs(n) => {
             // Gauss-Newton is only as good as its seed: polish from the
@@ -354,6 +383,43 @@ mod tests {
             let r = (m[0] * m[0] + m[1] * m[1]).sqrt();
             assert!(10.0 - r <= 0.0100001, "sagitta {}", 10.0 - r);
         }
+    }
+
+    #[test]
+    fn closed_extrusion_projection_continues_across_seam() {
+        // A closed square profile: walking points around the corner
+        // where the profile closes (u = 4 back to u = 0) must continue
+        // u monotonically via period aliasing, never tear back to 0.
+        let profile = vec![
+            [1.0, -1.0],
+            [1.0, 1.0],
+            [-1.0, 1.0],
+            [-1.0, -1.0],
+            [1.0, -1.0],
+        ];
+        let s = Surface::ExtrusionPolyline {
+            frame: Frame::IDENTITY,
+            profile,
+        };
+        // Walk along the bottom edge (segment 3->0 seam at x = 1),
+        // starting just behind the first sample point (u = 3.1).
+        let mut hint = Some([3.05, 0.0]);
+        let mut last = 3.05;
+        for i in 0..8 {
+            let x = -0.8 + 1.7 * i as f64 / 7.0; // ends just short of the seam corner
+            let p = [x, -1.0, 0.0];
+            let uv = project_point(&s, p, hint, 1e-9).unwrap();
+            assert!(uv[0] >= last - 1e-9, "u tore back at step {i}: {} -> {}", last, uv[0]);
+            last = uv[0];
+            hint = Some(uv);
+        }
+        // Continue past the seam onto segment 0 (x = 1 wall).
+        let uv = project_point(&s, [1.0, -0.5, 0.0], hint, 1e-9).unwrap();
+        assert!(
+            uv[0] > 3.9 && uv[0] < 4.3,
+            "seam crossing must alias forward, got u = {}",
+            uv[0]
+        );
     }
 
     #[test]

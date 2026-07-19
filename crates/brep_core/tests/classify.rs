@@ -308,3 +308,125 @@ fn bounds_and_validation() {
         Affine([1.0, 0.5, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
     assert!(build_payload(&sheared).is_err());
 }
+
+#[test]
+fn closed_profile_extrusion_prism() {
+    // A closed pentagon profile swept along z: exercises the u-periodic
+    // extrusion path (seam tie-breaking during projection was the bug;
+    // here we build the unwrapped trims directly the way the importer
+    // now does, spanning the seam).
+    let corners: Vec<[f64; 2]> = (0..5)
+        .map(|i| {
+            let a = TAU * i as f64 / 5.0;
+            [2.0 * a.cos(), 2.0 * a.sin()]
+        })
+        .collect();
+    let mut profile = corners.clone();
+    profile.push(corners[0]); // closed
+    let side = Face {
+        surface: Surface::ExtrusionPolyline {
+            frame: Frame::IDENTITY,
+            profile: profile.clone(),
+        },
+        // Full period in u (5 segments), v in [-1, 1].
+        trims: vec![vec![[0.0, -1.0], [5.0, -1.0], [5.0, 1.0], [0.0, 1.0]]],
+    };
+    let cap = |z: f64| Face {
+        surface: Surface::Plane {
+            frame: Frame::from_axis_ref([0.0, 0.0, z], [0.0, 0.0, z], [1.0, 0.0, 0.0]),
+        },
+        trims: vec![corners.clone().into_iter().collect()],
+    };
+    let model = single(Solid {
+        faces: vec![side, cap(1.0), cap(-1.0)],
+    });
+    check_grid(&model, 24, [-2.0, 2.0, -2.0, 2.0, -1.0, 1.0], |p| {
+        // Point-in-pentagon (prism): even-odd in 2D.
+        let mut inside = false;
+        let n = corners.len();
+        let mut prev = corners[n - 1];
+        let mut min_edge = f64::INFINITY;
+        for &cur in &corners {
+            if (prev[1] <= p[1]) != (cur[1] <= p[1]) {
+                let t = (p[1] - prev[1]) / (cur[1] - prev[1]);
+                if prev[0] + t * (cur[0] - prev[0]) > p[0] {
+                    inside = !inside;
+                }
+            }
+            // Distance to edge for the shell.
+            let e = [cur[0] - prev[0], cur[1] - prev[1]];
+            let l2 = e[0] * e[0] + e[1] * e[1];
+            let t = (((p[0] - prev[0]) * e[0] + (p[1] - prev[1]) * e[1]) / l2).clamp(0.0, 1.0);
+            let dx = p[0] - prev[0] - t * e[0];
+            let dy = p[1] - prev[1] - t * e[1];
+            min_edge = min_edge.min((dx * dx + dy * dy).sqrt());
+            prev = cur;
+        }
+        let d = if inside {
+            (-min_edge).max(p[2].abs() - 1.0)
+        } else {
+            min_edge.max(p[2].abs() - 1.0)
+        };
+        shell(d, 1e-6)
+    });
+}
+
+#[test]
+fn closed_nurbs_cylinder_seam() {
+    // An exact rational-NURBS full cylinder (classic 9-point circle x
+    // linear), seam at u = 0 facing +x — straight into the primary
+    // parity ray. A seam crossing found by two seeds (u near 0 and u
+    // near 1) must dedupe to one crossing.
+    let w = core::f64::consts::FRAC_1_SQRT_2;
+    let circle: [([f64; 2], f64); 9] = [
+        ([1.0, 0.0], 1.0),
+        ([1.0, 1.0], w),
+        ([0.0, 1.0], 1.0),
+        ([-1.0, 1.0], w),
+        ([-1.0, 0.0], 1.0),
+        ([-1.0, -1.0], w),
+        ([0.0, -1.0], 1.0),
+        ([1.0, -1.0], w),
+        ([1.0, 0.0], 1.0),
+    ];
+    let mut ctrl = Vec::new();
+    for (xy, weight) in circle {
+        for z in [-1.0, 1.0] {
+            ctrl.push([xy[0], xy[1], z, weight]);
+        }
+    }
+    let side = Face {
+        surface: Surface::Nurbs(NurbsSurface {
+            degree_u: 2,
+            degree_v: 1,
+            nctrl_u: 9,
+            nctrl_v: 2,
+            knots_u: vec![
+                0.0, 0.0, 0.0, 0.25, 0.25, 0.5, 0.5, 0.75, 0.75, 1.0, 1.0, 1.0,
+            ],
+            knots_v: vec![0.0, 0.0, 1.0, 1.0],
+            ctrl,
+        }),
+        trims: vec![vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]],
+    };
+    let circle64: Vec<[f64; 2]> = (0..64)
+        .map(|i| {
+            let a = TAU * i as f64 / 64.0;
+            [a.cos(), a.sin()]
+        })
+        .collect();
+    let cap = |z: f64| Face {
+        surface: Surface::Plane {
+            frame: Frame::from_axis_ref([0.0, 0.0, z], [0.0, 0.0, z], [1.0, 0.0, 0.0]),
+        },
+        trims: vec![circle64.clone()],
+    };
+    let model = single(Solid {
+        faces: vec![side, cap(1.0), cap(-1.0)],
+    });
+    check_grid(&model, 24, [-1.0, 1.0, -1.0, 1.0, -1.0, 1.0], |p| {
+        let rho = (p[0] * p[0] + p[1] * p[1]).sqrt();
+        let d = (rho - 1.0).max(p[2].abs() - 1.0);
+        shell(d, 0.006)
+    });
+}

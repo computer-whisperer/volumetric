@@ -170,11 +170,34 @@ impl Surface {
     pub fn periods(&self) -> (f64, f64) {
         use core::f64::consts::TAU;
         match self {
-            Surface::Plane { .. } | Surface::ExtrusionPolyline { .. } | Surface::Nurbs(_) => {
-                (0.0, 0.0)
+            Surface::Plane { .. } | Surface::Nurbs(_) => (0.0, 0.0),
+            Surface::ExtrusionPolyline { profile, .. } => {
+                // A closed profile makes u periodic (period = segment
+                // count): the seam between first and last point is as
+                // arbitrary as a cylinder's u = 0.
+                if profile_is_closed(profile) {
+                    ((profile.len() - 1) as f64, 0.0)
+                } else {
+                    (0.0, 0.0)
+                }
             }
             Surface::Cylinder { .. } | Surface::Cone { .. } | Surface::Sphere { .. } => (TAU, 0.0),
             Surface::Torus { .. } => (TAU, TAU),
         }
     }
+}
+
+/// Whether a profile polyline's endpoints coincide (relative to its
+/// extent), making the swept surface u-periodic.
+pub fn profile_is_closed(profile: &[[f64; 2]]) -> bool {
+    if profile.len() < 4 {
+        return false;
+    }
+    let (first, last) = (profile[0], profile[profile.len() - 1]);
+    let mut extent = 0.0f64;
+    for p in profile {
+        extent = extent.max((p[0] - first[0]).abs() + (p[1] - first[1]).abs());
+    }
+    let gap = (last[0] - first[0]).abs() + (last[1] - first[1]).abs();
+    gap <= extent * 1e-6
 }

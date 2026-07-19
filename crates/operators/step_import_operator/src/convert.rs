@@ -2,7 +2,7 @@
 //! lowered to exact surfaces, edge curves flattened and projected into
 //! UV trim loops) and instances from the AP214 assembly graph.
 
-use crate::entities::{Ctx, Curve, StepEdge, StepSurface, length_unit_scale};
+use crate::entities::{Ctx, Curve, StepEdge, StepSurface, length_unit_scale, plane_angle_scale};
 use crate::p21::{Arg, DataSection};
 use brep_core::ir::{BRepModel, Face, Instance, Solid, Surface};
 use brep_core::math::{Affine, Frame, Vec3, cross, dot, norm, normalize, sub};
@@ -29,7 +29,12 @@ impl Default for Options {
 /// silently missing face would flip parity for its whole solid).
 pub fn build_model(data: &DataSection, opts: &Options) -> Result<BRepModel, String> {
     let scale = length_unit_scale(data)?;
-    let ctx = Ctx { data, scale };
+    let angle_scale = plane_angle_scale(data)?;
+    let ctx = Ctx {
+        data,
+        scale,
+        angle_scale,
+    };
     let asm = AssemblyGraph::build(data)?;
 
     let mut model = BRepModel::default();
@@ -43,6 +48,7 @@ pub fn build_model(data: &DataSection, opts: &Options) -> Result<BRepModel, Stri
             *root,
             Affine::IDENTITY,
             &label,
+            0,
             opts,
             &mut model,
             &mut solid_index,
@@ -104,29 +110,39 @@ impl AssemblyGraph {
         // the graph itself, but transforms carry translations, so use a
         // scaled context.
         let scale = length_unit_scale(data)?;
-        let ctx = Ctx { data, scale };
+        let ctx = Ctx {
+            data,
+            scale,
+            angle_scale: plane_angle_scale(data)?,
+        };
 
         let mut pd_rep = HashMap::new();
         let mut pd_name = HashMap::new();
         let mut nauo_ids = Vec::new();
         let mut cdsr_ids = Vec::new();
-        for (&id, e) in &data.entities {
+        // Sorted iteration: instance/solid order (and therefore payload
+        // bytes) must not depend on hash order — downstream caching and
+        // baked projects want reproducible output.
+        let mut ids: Vec<u64> = data.entities.keys().copied().collect();
+        ids.sort_unstable();
+        for &id in &ids {
+            let e = &data.entities[&id];
             if let Some(r) = e.simple() {
                 match r.name.as_str() {
                     "SHAPE_DEFINITION_REPRESENTATION" => {
                         // (definition: PDS, used_representation)
-                        let pds = data.deref(&r.args[0])?;
+                        let pds = data.deref(arg_at(r, 0, id)?)?;
                         let pds_r = pds
                             .simple()
                             .filter(|r| r.name == "PRODUCT_DEFINITION_SHAPE")
                             .ok_or_else(|| format!("#{id}: SDR without a PDS"))?;
-                        let def = pds_r.args[2]
+                        let def = arg_at(pds_r, 2, id)?
                             .as_ref_id()
                             .ok_or_else(|| format!("#{id}: PDS definition not a reference"))?;
                         // Only PDS of product definitions matter here
                         // (placement PDSes point at NAUOs).
                         if data.get(def)?.is("PRODUCT_DEFINITION") {
-                            let rep = r.args[1]
+                            let rep = arg_at(r, 1, id)?
                                 .as_ref_id()
                                 .ok_or_else(|| format!("#{id}: SDR rep not a reference"))?;
                             pd_rep.insert(def, rep);
@@ -161,14 +177,14 @@ impl AssemblyGraph {
         let mut nauo_cdsr: HashMap<u64, (u64, u64, u64, u64)> = HashMap::new();
         for id in cdsr_ids {
             let r = data.get(id)?.simple().ok_or("CDSR must be simple")?.clone();
-            let rr = data.deref(&r.args[0])?;
+            let rr = data.deref(arg_at(&r, 0, id)?)?;
             let rel = rr
                 .record("REPRESENTATION_RELATIONSHIP")
                 .ok_or_else(|| format!("#{id}: no REPRESENTATION_RELATIONSHIP"))?;
-            let rep_1 = rel.args[2]
+            let rep_1 = arg_at(rel, 2, id)?
                 .as_ref_id()
                 .ok_or_else(|| format!("#{id}: rep_1 not a reference"))?;
-            let rep_2 = rel.args[3]
+            let rep_2 = arg_at(rel, 3, id)?
                 .as_ref_id()
                 .ok_or_else(|| format!("#{id}: rep_2 not a reference"))?;
             let idt_id = rr
@@ -177,18 +193,19 @@ impl AssemblyGraph {
                 .and_then(Arg::as_ref_id)
                 .ok_or_else(|| format!("#{id}: no transformation"))?;
             let idt = data.get(idt_id)?.simple().ok_or("IDT must be simple")?;
-            let axis_1 = idt.args[2]
+            let axis_1 = arg_at(idt, 2, idt_id)?
                 .as_ref_id()
                 .ok_or_else(|| format!("#{idt_id}: IDT item 1 not a reference"))?;
-            let axis_2 = idt.args[3]
+            let axis_2 = arg_at(idt, 3, idt_id)?
                 .as_ref_id()
                 .ok_or_else(|| format!("#{idt_id}: IDT item 2 not a reference"))?;
             // The PDS this CDSR describes points at the NAUO.
-            let pds = data.deref(&r.args[1])?;
+            let pds = data.deref(arg_at(&r, 1, id)?)?;
             let nauo = pds
                 .simple()
                 .filter(|p| p.name == "PRODUCT_DEFINITION_SHAPE")
-                .and_then(|p| p.args[2].as_ref_id())
+                .and_then(|p| p.args.get(2))
+                .and_then(Arg::as_ref_id)
                 .ok_or_else(|| format!("#{id}: CDSR without a placement PDS"))?;
             nauo_cdsr.insert(nauo, (rep_1, rep_2, axis_1, axis_2));
         }
@@ -199,24 +216,31 @@ impl AssemblyGraph {
         for id in nauo_ids {
             let e = data.get(id)?;
             let r = e.simple().ok_or("NAUO must be simple")?;
-            let parent_pd = r.args[3]
+            let parent_pd = arg_at(r, 3, id)?
                 .as_ref_id()
                 .ok_or_else(|| format!("#{id}: NAUO relating not a reference"))?;
-            let child_pd = r.args[4]
+            let child_pd = arg_at(r, 4, id)?
                 .as_ref_id()
                 .ok_or_else(|| format!("#{id}: NAUO related not a reference"))?;
-            let label = r.args[1].as_str().unwrap_or_default().to_string();
-            let (rep_1, _rep_2, axis_1, axis_2) = *nauo_cdsr.get(&id).ok_or_else(|| {
+            let label = r.args.get(1).and_then(Arg::as_str).unwrap_or_default().to_string();
+            let (rep_1, rep_2, axis_1, axis_2) = *nauo_cdsr.get(&id).ok_or_else(|| {
                 format!("#{id}: assembly occurrence has no placement (missing CDSR)")
             })?;
             // Child-to-parent: the child-side axis maps onto the
             // parent-side axis. Which IDT item is child-side follows
-            // from which representation is the child's.
+            // from which representation is the child's — and a rep pair
+            // matching neither side would make any assignment a silent
+            // guess that inverts every placement, so it fails loudly.
             let child_rep = pd_rep.get(&child_pd).copied();
             let (child_axis, parent_axis) = if child_rep == Some(rep_1) {
                 (axis_1, axis_2)
-            } else {
+            } else if child_rep == Some(rep_2) {
                 (axis_2, axis_1)
+            } else {
+                return Err(format!(
+                    "#{id}: cannot orient assembly transform: the child \
+                     product's representation matches neither relation side"
+                ));
             };
             let fc = frame_affine(&ctx.axis2(child_axis)?);
             let fp = frame_affine(&ctx.axis2(parent_axis)?);
@@ -233,11 +257,12 @@ impl AssemblyGraph {
             child_pds.push(child_pd);
         }
 
-        let roots: Vec<u64> = pd_rep
+        let mut roots: Vec<u64> = pd_rep
             .keys()
             .copied()
             .filter(|pd| !child_pds.contains(pd))
             .collect();
+        roots.sort_unstable();
         if roots.is_empty() && !pd_rep.is_empty() {
             return Err("assembly graph has a cycle (no root product)".into());
         }
@@ -249,6 +274,14 @@ impl AssemblyGraph {
             pd_name,
         })
     }
+}
+
+/// `record.args[idx]` with a Result instead of a panic on malformed
+/// entities.
+fn arg_at<'a>(r: &'a crate::p21::Record, idx: usize, id: u64) -> Result<&'a Arg, String> {
+    r.args
+        .get(idx)
+        .ok_or_else(|| format!("#{id} {}: missing argument {idx}", r.name))
 }
 
 /// Frame -> local-to-world affine.
@@ -267,10 +300,16 @@ fn walk(
     pd: u64,
     transform: Affine,
     label: &str,
+    depth: usize,
     opts: &Options,
     model: &mut BRepModel,
     solid_index: &mut HashMap<u64, usize>,
 ) -> Result<(), String> {
+    if depth > 64 {
+        return Err(format!(
+            "assembly nesting deeper than 64 at product #{pd} — cycle in the file?"
+        ));
+    }
     if let Some(&rep) = asm.pd_rep.get(&pd) {
         // Any MANIFOLD_SOLID_BREP item of the representation is a body
         // of this product.
@@ -323,6 +362,7 @@ fn walk(
                 nauo.child_pd,
                 child_transform,
                 child_label,
+                depth + 1,
                 opts,
                 model,
                 solid_index,
