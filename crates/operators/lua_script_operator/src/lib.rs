@@ -4,6 +4,7 @@
 //!
 //! Input/Output:
 //! - Input 0: UTF-8 Lua source containing the required functions
+//! - Input 1: optional CBOR [`volumetric_abi::f64_map::F64Map`] overrides
 //! - Output 0: WASM bytes of a model module that exports the N-dimensional model ABI
 //!
 //! The script's dimensionality comes from `is_inside`'s arity:
@@ -35,6 +36,11 @@
 //! - User-defined function calls: `helper(x, y)`
 //!
 //! ## Statements
+//! - Module-scope numeric constants: `local radius = 0.01` (evaluated at
+//!   compile time, in declaration order, and visible to every function)
+//! - Routable constants: append `-- @param key="part.radius" min=0.001
+//!   max=1.0` to a numeric module constant; a missing F64Map key keeps the
+//!   literal default (the annotation itself stays on the declaration line)
 //! - Local assignment: `local x = expr`
 //! - Assignment: `x = expr`
 //! - If-then-else: `if cond then ... elseif ... else ... end`
@@ -111,6 +117,88 @@ enum CompileError {
     Unsupported(String),
     #[error("Type error: {0}")]
     Type(String),
+}
+
+/// Evaluate one module-scope constant expression. Module constants are baked
+/// into the generated model: they are deliberately numeric and side-effect
+/// free, which keeps model sampling stateless while giving scripts one shared
+/// source of truth for dimensions used by several helpers and bounds getters.
+fn eval_constant(
+    expr: &IrExpr,
+    constants: &std::collections::BTreeMap<String, f64>,
+) -> Result<f64, CompileError> {
+    let binary = |op: &IrBinOp, a: f64, b: f64| -> f64 {
+        match op {
+            IrBinOp::Add => a + b,
+            IrBinOp::Sub => a - b,
+            IrBinOp::Mul => a * b,
+            IrBinOp::Div => a / b,
+            // Lua modulo follows the divisor's sign.
+            IrBinOp::Mod => a - (a / b).floor() * b,
+            IrBinOp::Pow => a.powf(b),
+            IrBinOp::Lt => (a < b) as u8 as f64,
+            IrBinOp::Le => (a <= b) as u8 as f64,
+            IrBinOp::Gt => (a > b) as u8 as f64,
+            IrBinOp::Ge => (a >= b) as u8 as f64,
+            IrBinOp::Eq => (a == b) as u8 as f64,
+            IrBinOp::Ne => (a != b) as u8 as f64,
+            IrBinOp::And => ((a != 0.0) && (b != 0.0)) as u8 as f64,
+            IrBinOp::Or => ((a != 0.0) || (b != 0.0)) as u8 as f64,
+        }
+    };
+
+    match expr {
+        IrExpr::Number(value) => Ok(*value),
+        IrExpr::Var(name) => constants.get(name).copied().ok_or_else(|| {
+            CompileError::Type(format!(
+                "module constant references unknown or later name `{name}`"
+            ))
+        }),
+        IrExpr::BinOp { op, lhs, rhs } => Ok(binary(
+            op,
+            eval_constant(lhs, constants)?,
+            eval_constant(rhs, constants)?,
+        )),
+        IrExpr::UnaryOp { op, expr } => {
+            let value = eval_constant(expr, constants)?;
+            Ok(match op {
+                IrUnaryOp::Neg => -value,
+                IrUnaryOp::Not => (value == 0.0) as u8 as f64,
+            })
+        }
+        IrExpr::MathCall { func, args } => {
+            let args: Vec<f64> = args
+                .iter()
+                .map(|arg| eval_constant(arg, constants))
+                .collect::<Result<_, _>>()?;
+            match (func, args.as_slice()) {
+                (IrMathFunc::Abs, [x]) => Ok(x.abs()),
+                (IrMathFunc::Sqrt, [x]) => Ok(x.sqrt()),
+                (IrMathFunc::Floor, [x]) => Ok(x.floor()),
+                (IrMathFunc::Ceil, [x]) => Ok(x.ceil()),
+                (IrMathFunc::Trunc, [x]) => Ok(x.trunc()),
+                (IrMathFunc::Nearest, [x]) => Ok(x.round_ties_even()),
+                (IrMathFunc::Min, [a, b]) => Ok(a.min(*b)),
+                (IrMathFunc::Max, [a, b]) => Ok(a.max(*b)),
+                (IrMathFunc::Sin, [x]) => Ok(x.sin()),
+                (IrMathFunc::Cos, [x]) => Ok(x.cos()),
+                (IrMathFunc::Tan, [x]) => Ok(x.tan()),
+                (IrMathFunc::Exp, [x]) => Ok(x.exp()),
+                (IrMathFunc::Log, [x]) => Ok(x.ln()),
+                (IrMathFunc::Pow, [x, y]) => Ok(x.powf(*y)),
+                (IrMathFunc::Atan2, [y, x]) => Ok(y.atan2(*x)),
+                _ => Err(CompileError::Type(
+                    "invalid math call in module constant".to_string(),
+                )),
+            }
+        }
+        IrExpr::FuncCall { name, .. } => Err(CompileError::Unsupported(format!(
+            "module constant cannot call user function `{name}`"
+        ))),
+        IrExpr::IfThenElse { .. } => Err(CompileError::Unsupported(
+            "conditional expression in module constant".to_string(),
+        )),
+    }
 }
 
 // ============================================================================
@@ -263,14 +351,15 @@ fn ast_expr_to_ir(expr: &full_moon::ast::Expression) -> Result<IrExpr, CompileEr
                         let obj_name = obj_token.token().to_string();
                         let suffixes: Vec<_> = var_expr.suffixes().collect();
 
-                        if obj_name == "math" && suffixes.len() == 1 {
-                            if let Suffix::Index(Index::Dot { name, .. }) = &suffixes[0] {
-                                let const_name = name.token().to_string();
-                                match const_name.as_str() {
-                                    "pi" => return Ok(IrExpr::Number(std::f64::consts::PI)),
-                                    "huge" => return Ok(IrExpr::Number(f64::INFINITY)),
-                                    _ => {}
-                                }
+                        if obj_name == "math"
+                            && suffixes.len() == 1
+                            && let Suffix::Index(Index::Dot { name, .. }) = &suffixes[0]
+                        {
+                            let const_name = name.token().to_string();
+                            match const_name.as_str() {
+                                "pi" => return Ok(IrExpr::Number(std::f64::consts::PI)),
+                                "huge" => return Ok(IrExpr::Number(f64::INFINITY)),
+                                _ => {}
                             }
                         }
                     }
@@ -366,42 +455,42 @@ fn ast_func_call_to_ir(call: &full_moon::ast::FunctionCall) -> Result<IrExpr, Co
         let obj_name = obj_token.token().to_string();
 
         // Check for math.func pattern
-        if suffixes.len() >= 2 {
-            if let Suffix::Index(Index::Dot { name, .. }) = &suffixes[0] {
-                let method_name = name.token().to_string();
-                let args = extract_call_args_from_suffixes(&suffixes[1..])?;
+        if suffixes.len() >= 2
+            && let Suffix::Index(Index::Dot { name, .. }) = &suffixes[0]
+        {
+            let method_name = name.token().to_string();
+            let args = extract_call_args_from_suffixes(&suffixes[1..])?;
 
-                if obj_name == "math" {
-                    let func = match method_name.as_str() {
-                        "abs" => IrMathFunc::Abs,
-                        "sqrt" => IrMathFunc::Sqrt,
-                        "floor" => IrMathFunc::Floor,
-                        "ceil" => IrMathFunc::Ceil,
-                        "trunc" => IrMathFunc::Trunc,
-                        "nearest" => IrMathFunc::Nearest,
-                        "min" => IrMathFunc::Min,
-                        "max" => IrMathFunc::Max,
-                        "sin" => IrMathFunc::Sin,
-                        "cos" => IrMathFunc::Cos,
-                        "tan" => IrMathFunc::Tan,
-                        "exp" => IrMathFunc::Exp,
-                        "log" => IrMathFunc::Log,
-                        "pow" => IrMathFunc::Pow,
-                        "atan2" => IrMathFunc::Atan2,
-                        _ => {
-                            return Err(CompileError::Unsupported(format!(
-                                "unsupported math function: math.{}",
-                                method_name
-                            )));
-                        }
-                    };
-                    return Ok(IrExpr::MathCall { func, args });
-                } else {
-                    return Err(CompileError::Unsupported(format!(
-                        "unsupported module: {}",
-                        obj_name
-                    )));
-                }
+            if obj_name == "math" {
+                let func = match method_name.as_str() {
+                    "abs" => IrMathFunc::Abs,
+                    "sqrt" => IrMathFunc::Sqrt,
+                    "floor" => IrMathFunc::Floor,
+                    "ceil" => IrMathFunc::Ceil,
+                    "trunc" => IrMathFunc::Trunc,
+                    "nearest" => IrMathFunc::Nearest,
+                    "min" => IrMathFunc::Min,
+                    "max" => IrMathFunc::Max,
+                    "sin" => IrMathFunc::Sin,
+                    "cos" => IrMathFunc::Cos,
+                    "tan" => IrMathFunc::Tan,
+                    "exp" => IrMathFunc::Exp,
+                    "log" => IrMathFunc::Log,
+                    "pow" => IrMathFunc::Pow,
+                    "atan2" => IrMathFunc::Atan2,
+                    _ => {
+                        return Err(CompileError::Unsupported(format!(
+                            "unsupported math function: math.{}",
+                            method_name
+                        )));
+                    }
+                };
+                return Ok(IrExpr::MathCall { func, args });
+            } else {
+                return Err(CompileError::Unsupported(format!(
+                    "unsupported module: {}",
+                    obj_name
+                )));
             }
         }
 
@@ -429,12 +518,10 @@ fn extract_call_args_from_suffixes(
     for suffix in suffixes.iter() {
         if let Suffix::Call(call_suffix) = suffix {
             match call_suffix {
-                Call::AnonymousCall(func_args) => match func_args {
-                    FunctionArgs::Parentheses { arguments, .. } => {
-                        return arguments.iter().map(|arg| ast_expr_to_ir(arg)).collect();
-                    }
-                    _ => {}
-                },
+                Call::AnonymousCall(FunctionArgs::Parentheses { arguments, .. }) => {
+                    return arguments.iter().map(ast_expr_to_ir).collect();
+                }
+                Call::AnonymousCall(_) => {}
                 Call::MethodCall(_) => {
                     return Err(CompileError::Unsupported(
                         "method call syntax not supported".into(),
@@ -638,11 +725,36 @@ fn ast_func_to_ir(func_decl: &full_moon::ast::FunctionDeclaration) -> Result<IrF
 // Lua to WASM Compilation
 // ============================================================================
 
+#[cfg(test)]
 fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
+    compile_lua_to_wasm_with_parameters(src, &volumetric_abi::f64_map::F64Map::new())
+}
+
+fn compile_lua_to_wasm_with_parameters(
+    src: &str,
+    routed_values: &volumetric_abi::f64_map::F64Map,
+) -> Result<Vec<u8>, CompileError> {
     use full_moon::ast::Stmt;
-    use std::collections::HashMap;
+    use full_moon::node::Node;
+    use std::collections::{BTreeMap, HashMap};
     use walrus::InstrSeqBuilder;
     use walrus::ir::{BinaryOp, UnaryOp};
+
+    let parameter_specs = volumetric_abi::lua_parameters::parse(src)
+        .map_err(|error| CompileError::Type(format!("invalid parameter annotation: {error}")))?;
+    let parameter_lines: BTreeMap<_, _> = parameter_specs
+        .iter()
+        .map(|parameter| (parameter.local_name.clone(), parameter.source_line))
+        .collect();
+    let mut parameter_values = BTreeMap::new();
+    for parameter in &parameter_specs {
+        if let Some(value) = routed_values.get(&parameter.key).copied() {
+            parameter
+                .validate_value(value)
+                .map_err(CompileError::Type)?;
+            parameter_values.insert(parameter.local_name.clone(), (parameter.source_line, value));
+        }
+    }
 
     // Parse the Lua source into an AST
     let ast = full_moon::parse(src).map_err(|errors| {
@@ -654,21 +766,104 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
         CompileError::Parse(msg)
     })?;
 
-    // Extract function declarations from the AST and convert to IR
+    // Extract function declarations and evaluate module-scope numeric
+    // constants in source order. Constant expressions intentionally cannot
+    // call user functions: compilation stays deterministic and sampling the
+    // resulting model remains stateless.
     let mut functions: HashMap<String, IrFunc> = HashMap::new();
+    let mut constants: BTreeMap<String, f64> = BTreeMap::new();
+    let mut bound_parameters = std::collections::BTreeSet::new();
 
     for stmt in ast.nodes().stmts() {
-        if let Stmt::FunctionDeclaration(func_decl) = stmt {
-            let name = func_decl
-                .name()
-                .names()
-                .iter()
-                .map(|t| t.token().to_string())
-                .collect::<Vec<_>>()
-                .join(".");
+        match stmt {
+            Stmt::FunctionDeclaration(func_decl) => {
+                let name = func_decl
+                    .name()
+                    .names()
+                    .iter()
+                    .map(|t| t.token().to_string())
+                    .collect::<Vec<_>>()
+                    .join(".");
 
-            let ir_func = ast_func_to_ir(func_decl)?;
-            functions.insert(name, ir_func);
+                let ir_func = ast_func_to_ir(func_decl)?;
+                functions.insert(name, ir_func);
+            }
+            Stmt::LocalAssignment(local_assign) => {
+                let source_line = local_assign
+                    .start_position()
+                    .map(|position| position.line());
+                let names: Vec<_> = local_assign.names().iter().collect();
+                let exprs: Vec<_> = local_assign.expressions().iter().collect();
+                let mut pending = Vec::with_capacity(names.len());
+
+                // Match Lua's multiple-assignment behavior: evaluate all
+                // right-hand sides against the old environment before making
+                // any newly assigned names visible.
+                for (index, name_token) in names.iter().enumerate() {
+                    let name = name_token.token().to_string();
+                    if let Some(parameter_line) = parameter_lines
+                        .get(&name)
+                        .copied()
+                        .filter(|parameter_line| Some(*parameter_line) == source_line)
+                    {
+                        bound_parameters.insert((name.clone(), parameter_line));
+                    }
+                    let value = if let Some((parameter_line, value)) = parameter_values
+                        .get(&name)
+                        .filter(|(parameter_line, _)| Some(*parameter_line) == source_line)
+                    {
+                        bound_parameters.insert((name.clone(), *parameter_line));
+                        *value
+                    } else if let Some(expr) = exprs.get(index) {
+                        eval_constant(&ast_expr_to_ir(expr)?, &constants)?
+                    } else {
+                        0.0
+                    };
+                    pending.push((name, value));
+                }
+                constants.extend(pending);
+            }
+            Stmt::Assignment(assign) => {
+                let vars: Vec<_> = assign.variables().iter().collect();
+                let exprs: Vec<_> = assign.expressions().iter().collect();
+                let mut pending = Vec::with_capacity(vars.len());
+
+                for (index, var) in vars.iter().enumerate() {
+                    let full_moon::ast::Var::Name(name_token) = var else {
+                        return Err(CompileError::Unsupported(
+                            "complex module-scope assignment target".into(),
+                        ));
+                    };
+                    let value = if let Some(expr) = exprs.get(index) {
+                        eval_constant(&ast_expr_to_ir(expr)?, &constants)?
+                    } else {
+                        0.0
+                    };
+                    pending.push((name_token.token().to_string(), value));
+                }
+                constants.extend(pending);
+            }
+            _ => {
+                return Err(CompileError::Unsupported(
+                    "module scope supports only numeric assignments and function declarations"
+                        .into(),
+                ));
+            }
+        }
+    }
+
+    if let Some(name) = constants.keys().find(|name| functions.contains_key(*name)) {
+        return Err(CompileError::Type(format!(
+            "module name `{name}` is both a numeric constant and a function"
+        )));
+    }
+    for parameter in &parameter_specs {
+        let binding = (parameter.local_name.clone(), parameter.source_line);
+        if !bound_parameters.contains(&binding) {
+            return Err(CompileError::Type(format!(
+                "parameter `{}` does not annotate a module-scope numeric constant",
+                parameter.local_name
+            )));
         }
     }
 
@@ -696,6 +891,33 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
 
     // Create a new WASM module
     let mut module = Module::with_config(ModuleConfig::new());
+
+    fn add_constant_locals(
+        module_locals: &mut walrus::ModuleLocals,
+        constants: &BTreeMap<String, f64>,
+    ) -> (
+        HashMap<String, walrus::LocalId>,
+        Vec<(walrus::LocalId, f64)>,
+    ) {
+        let mut locals = HashMap::with_capacity(constants.len());
+        let mut initializers = Vec::with_capacity(constants.len());
+        for (name, value) in constants {
+            let local = module_locals.add(ValType::F64);
+            locals.insert(name.clone(), local);
+            initializers.push((local, *value));
+        }
+        (locals, initializers)
+    }
+
+    fn initialize_constants(
+        builder: &mut InstrSeqBuilder,
+        initializers: &[(walrus::LocalId, f64)],
+    ) {
+        for &(local, value) in initializers {
+            builder.f64_const(value);
+            builder.local_set(local);
+        }
+    }
 
     // Map of function names to their WASM function IDs (populated as we generate functions)
     let mut func_ids: HashMap<String, walrus::FunctionId> = HashMap::new();
@@ -903,9 +1125,9 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                     | IrMathFunc::Trunc
                     | IrMathFunc::Nearest => {
                         if args.len() != 1 {
-                            return Err(CompileError::Type(format!(
-                                "math function requires 1 argument"
-                            )));
+                            return Err(CompileError::Type(
+                                "math function requires 1 argument".to_string(),
+                            ));
                         }
                         emit_ir_expr(b, func_ids, &args[0], params, locals)?;
                         match func {
@@ -932,9 +1154,9 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                     }
                     IrMathFunc::Min | IrMathFunc::Max => {
                         if args.len() != 2 {
-                            return Err(CompileError::Type(format!(
-                                "math.min/max requires 2 arguments"
-                            )));
+                            return Err(CompileError::Type(
+                                "math.min/max requires 2 arguments".to_string(),
+                            ));
                         }
                         emit_ir_expr(b, func_ids, &args[0], params, locals)?;
                         emit_ir_expr(b, func_ids, &args[1], params, locals)?;
@@ -1298,42 +1520,36 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
         params: &[String],
         locals: &HashMap<String, walrus::LocalId>,
     ) -> Result<(), CompileError> {
-        match expr {
-            IrExpr::BinOp { op, lhs, rhs } => match op {
-                IrBinOp::Lt
-                | IrBinOp::Le
-                | IrBinOp::Gt
-                | IrBinOp::Ge
-                | IrBinOp::Eq
-                | IrBinOp::Ne => {
-                    emit_ir_expr(b, func_ids, lhs, params, locals)?;
-                    emit_ir_expr(b, func_ids, rhs, params, locals)?;
-                    match op {
-                        IrBinOp::Lt => {
-                            b.binop(BinaryOp::F64Lt);
-                        }
-                        IrBinOp::Le => {
-                            b.binop(BinaryOp::F64Le);
-                        }
-                        IrBinOp::Gt => {
-                            b.binop(BinaryOp::F64Gt);
-                        }
-                        IrBinOp::Ge => {
-                            b.binop(BinaryOp::F64Ge);
-                        }
-                        IrBinOp::Eq => {
-                            b.binop(BinaryOp::F64Eq);
-                        }
-                        IrBinOp::Ne => {
-                            b.binop(BinaryOp::F64Ne);
-                        }
-                        _ => unreachable!(),
-                    }
-                    return Ok(());
+        if let IrExpr::BinOp { op, lhs, rhs } = expr
+            && matches!(
+                op,
+                IrBinOp::Lt | IrBinOp::Le | IrBinOp::Gt | IrBinOp::Ge | IrBinOp::Eq | IrBinOp::Ne
+            )
+        {
+            emit_ir_expr(b, func_ids, lhs, params, locals)?;
+            emit_ir_expr(b, func_ids, rhs, params, locals)?;
+            match op {
+                IrBinOp::Lt => {
+                    b.binop(BinaryOp::F64Lt);
                 }
-                _ => {}
-            },
-            _ => {}
+                IrBinOp::Le => {
+                    b.binop(BinaryOp::F64Le);
+                }
+                IrBinOp::Gt => {
+                    b.binop(BinaryOp::F64Gt);
+                }
+                IrBinOp::Ge => {
+                    b.binop(BinaryOp::F64Ge);
+                }
+                IrBinOp::Eq => {
+                    b.binop(BinaryOp::F64Eq);
+                }
+                IrBinOp::Ne => {
+                    b.binop(BinaryOp::F64Ne);
+                }
+                _ => unreachable!(),
+            }
+            return Ok(());
         }
         // For non-comparison expressions, emit as f64 and convert to i32 (non-zero = true)
         emit_ir_expr(b, func_ids, expr, params, locals)?;
@@ -1653,12 +1869,14 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
             .map(|_| module.locals.add(ValType::F64))
             .collect();
 
-        let mut locals_map: HashMap<String, walrus::LocalId> = HashMap::new();
+        let (mut locals_map, constant_initializers) =
+            add_constant_locals(&mut module.locals, &constants);
         for (i, param_name) in ir_func.params.iter().enumerate() {
             locals_map.insert(param_name.clone(), param_locals[i]);
         }
 
         let mut ib = fb.func_body();
+        initialize_constants(&mut ib, &constant_initializers);
         let ret_expr = emit_ir_stmts(
             &mut ib,
             &func_ids,
@@ -1694,11 +1912,13 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                 let mut fb = FunctionBuilder::new(&mut module.types, &param_types, &[ValType::F64]);
                 let param_locals: Vec<walrus::LocalId> =
                     (0..dims).map(|_| module.locals.add(ValType::F64)).collect();
-                let mut locals_map: HashMap<String, walrus::LocalId> = HashMap::new();
+                let (mut locals_map, constant_initializers) =
+                    add_constant_locals(&mut module.locals, &constants);
                 for (param, &local) in ir_func.params.iter().zip(&param_locals) {
                     locals_map.insert(param.clone(), local);
                 }
                 let mut ib = fb.func_body();
+                initialize_constants(&mut ib, &constant_initializers);
                 let ret_expr = emit_ir_stmts(
                     &mut ib,
                     &func_ids,
@@ -1721,8 +1941,10 @@ fn compile_lua_to_wasm(src: &str) -> Result<Vec<u8>, CompileError> {
                     ));
                 }
                 let mut fb = FunctionBuilder::new(&mut module.types, &[], &[ValType::F64]);
-                let mut locals_map: HashMap<String, walrus::LocalId> = HashMap::new();
+                let (mut locals_map, constant_initializers) =
+                    add_constant_locals(&mut module.locals, &constants);
                 let mut ib = fb.func_body();
+                initialize_constants(&mut ib, &constant_initializers);
                 let ret_expr = emit_ir_stmts(
                     &mut ib,
                     &func_ids,
@@ -1825,7 +2047,14 @@ pub extern "C" fn run() {
             return;
         }
     };
-    let output = match compile_lua_to_wasm(src) {
+    let routed_values = match volumetric_abi::f64_map::decode(&read_input(1)) {
+        Ok(values) => values,
+        Err(error) => {
+            report_error(&format!("invalid F64Map parameters: {error}"));
+            return;
+        }
+    };
+    let output = match compile_lua_to_wasm_with_parameters(src, &routed_values) {
         Ok(w) => w,
         Err(e) => {
             report_error(&format!("Lua compile error: {e}"));
@@ -1840,9 +2069,13 @@ pub extern "C" fn run() {
 const LUA_TEMPLATE: &str = r#"-- Occupancy: return 1.0 inside, 0.0 outside (inside iff value > 0.5).
 -- For a 2D sketch (extrude input), define is_inside(x, y) and only the
 -- x/y bounds functions instead.
+local radius = 1.0 -- @param key="sphere.radius" min=0.000001
+local bounds_margin = 0.5
+local bound = radius + bounds_margin
+
 function is_inside(x, y, z)
     -- Example: unit sphere centered at origin
-    if x*x + y*y + z*z <= 1.0 then
+    if x*x + y*y + z*z <= radius*radius then
         return 1.0
     else
         return 0.0
@@ -1851,27 +2084,27 @@ end
 
 -- Bounding box functions define the region to sample
 function get_bounds_min_x()
-    return -1.5
+    return -bound
 end
 
 function get_bounds_min_y()
-    return -1.5
+    return -bound
 end
 
 function get_bounds_min_z()
-    return -1.5
+    return -bound
 end
 
 function get_bounds_max_x()
-    return 1.5
+    return bound
 end
 
 function get_bounds_max_y()
-    return 1.5
+    return bound
 end
 
 function get_bounds_max_z()
-    return 1.5
+    return bound
 end
 "#;
 
@@ -1890,8 +2123,11 @@ pub extern "C" fn get_metadata() -> i64 {
             r##"<circle cx="20.5" cy="3.5" r="1.5"/>"##,
         )
         .to_string(),
-        inputs: vec![OperatorMetadataInput::LuaSource(LUA_TEMPLATE.to_string())],
-        input_names: vec!["Script".to_string()],
+        inputs: vec![
+            OperatorMetadataInput::LuaSource(LUA_TEMPLATE.to_string()),
+            OperatorMetadataInput::F64Map,
+        ],
+        input_names: vec!["Script".to_string(), "Parameters".to_string()],
         outputs: vec![OperatorMetadataOutput::ModelWASM],
     })
 }
@@ -1906,6 +2142,119 @@ mod tests {
     fn assert_valid_wasm(bytes: &[u8]) {
         Module::from_buffer_with_config(bytes, &ModuleConfig::new())
             .expect("compiled Lua module must reparse as valid wasm");
+    }
+
+    #[test]
+    fn module_constants_compile_for_helpers_sampling_and_bounds() {
+        let lua_src = r#"
+local diameter = 2.0
+local radius = diameter / 2.0
+local margin = math.sqrt(0.0625)
+local bound = radius + margin
+
+function radial_squared(x, y)
+    return x*x + y*y
+end
+
+function is_inside(x, y)
+    return radial_squared(x, y) <= radius*radius
+end
+
+function get_bounds_min_x() return -bound end
+function get_bounds_max_x() return bound end
+function get_bounds_min_y() return -bound end
+function get_bounds_max_y() return bound end
+"#;
+
+        assert_valid_wasm(&compile_lua_to_wasm(lua_src).expect("compile shared module constants"));
+    }
+
+    #[test]
+    fn annotated_constants_accept_routed_f64_map_values() {
+        let lua_src = r#"
+local radius = 1.0 -- @param key="shared.radius" min=0.25 max=4.0
+local bound = radius + 0.5
+function is_inside(x, y) return x*x + y*y <= radius*radius end
+function get_bounds_min_x() return -bound end
+function get_bounds_max_x() return bound end
+function get_bounds_min_y() return -bound end
+function get_bounds_max_y() return bound end
+"#;
+        let routed = volumetric_abi::f64_map::F64Map::from([
+            ("shared.radius".to_string(), 2.0),
+            ("unrelated.global".to_string(), 99.0),
+        ]);
+        assert_valid_wasm(
+            &compile_lua_to_wasm_with_parameters(lua_src, &routed)
+                .expect("compile routed parameter and ignore unrelated key"),
+        );
+    }
+
+    #[test]
+    fn annotated_constants_enforce_declared_ranges() {
+        let lua_src = r#"
+local radius = 1.0 -- @param key=radius min=0.25 max=4.0
+function is_inside(x, y) return x*x + y*y <= radius*radius end
+function get_bounds_min_x() return -radius end
+function get_bounds_max_x() return radius end
+function get_bounds_min_y() return -radius end
+function get_bounds_max_y() return radius end
+"#;
+        let routed = volumetric_abi::f64_map::F64Map::from([("radius".to_string(), 5.0)]);
+        let error = compile_lua_to_wasm_with_parameters(lua_src, &routed)
+            .expect_err("out-of-range override must fail");
+        assert!(
+            matches!(error, CompileError::Type(ref message) if message.contains("above maximum")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn annotations_bind_the_exact_module_declaration() {
+        let lua_src = r#"
+local radius = 1.0
+function helper(x)
+    local radius = 2.0 -- @param key=radius
+    return x <= radius
+end
+function is_inside(x, y) return helper(x*x + y*y) end
+function get_bounds_min_x() return -radius end
+function get_bounds_max_x() return radius end
+function get_bounds_min_y() return -radius end
+function get_bounds_max_y() return radius end
+"#;
+        let routed = volumetric_abi::f64_map::F64Map::from([("radius".to_string(), 3.0)]);
+        let error = compile_lua_to_wasm_with_parameters(lua_src, &routed)
+            .expect_err("a nested annotation must not retarget a module constant");
+        assert!(
+            matches!(error, CompileError::Type(ref message) if message.contains("does not annotate a module-scope")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn fidget_spinner_reference_compiles() {
+        let lua_src = include_str!("../../../../examples/fidget_spinner.lua");
+        assert_valid_wasm(&compile_lua_to_wasm(lua_src).expect("compile reference spinner"));
+    }
+
+    #[test]
+    fn module_constants_cannot_reference_later_names() {
+        let lua_src = r#"
+local radius = diameter / 2.0
+local diameter = 2.0
+function is_inside(x, y) return x*x + y*y <= radius*radius end
+function get_bounds_min_x() return -radius end
+function get_bounds_max_x() return radius end
+function get_bounds_min_y() return -radius end
+function get_bounds_max_y() return radius end
+"#;
+
+        let err = compile_lua_to_wasm(lua_src).expect_err("forward reference must be rejected");
+        assert!(
+            matches!(err, CompileError::Type(ref message) if message.contains("later name `diameter`")),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]

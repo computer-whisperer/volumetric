@@ -91,6 +91,10 @@ category_icon!(
     SCRIPTING_ICON,
     r##"<polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/>"##
 );
+category_icon!(
+    DATA_ICON,
+    r##"<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.7 4 3 9 3s9-1.3 9-3V5"/><path d="M3 12c0 1.7 4 3 9 3s9-1.3 9-3"/>"##
+);
 
 /// The icon slot source for a catalog entry: the module's own declared
 /// icon when it parsed, else its category's glyph, with per-kind
@@ -114,6 +118,7 @@ fn catalog_icon_source(entry: &catalog::CatalogEntry) -> IconSource {
         "Mesh" => custom(&MESH_ICON),
         "Fabrication" => custom(&FABRICATION_ICON),
         "Scripting" => custom(&SCRIPTING_ICON),
+        "Data" => custom(&DATA_ICON),
         "Import" => "file-text".into_icon_source(),
         _ => match entry.kind {
             volumetric_assets::AssetCategory::Model => "activity".into_icon_source(),
@@ -236,6 +241,7 @@ const DELETE_STEP_PREFIX: &str = "project:delete-step:";
 const MOVE_STEP_UP_PREFIX: &str = "project:move-step-up:";
 const MOVE_STEP_DOWN_PREFIX: &str = "project:move-step-down:";
 const SET_STEP_MODEL_PREFIX: &str = "project:set-step-model:";
+const CLEAR_STEP_F64_MAP_PREFIX: &str = "project:clear-step-f64-map:";
 const SELECT_EXPORT_PREFIX: &str = "project:select-export:";
 const DELETE_EXPORT_PREFIX: &str = "project:delete-export:";
 const ADD_EXPORT_PREFIX: &str = "project:add-export:";
@@ -830,6 +836,7 @@ enum AssetSlotKind {
     FeaMesh,
     TriMesh,
     Subspace,
+    F64Map,
 }
 
 #[derive(Clone, Debug)]
@@ -869,6 +876,8 @@ struct StepEditState {
 #[derive(Debug)]
 struct ConfigForm {
     input_idx: usize,
+    /// Operator-declared input label (e.g. "Parameters").
+    name: Option<String>,
     fields: Vec<ConfigField>,
     /// Edit buffers for scalar fields, keyed by field name.
     buffers: std::collections::BTreeMap<String, String>,
@@ -2572,6 +2581,7 @@ impl VolumetricUiV2 {
                     OperatorMetadataInput::FeaMesh => AssetSlotKind::FeaMesh,
                     OperatorMetadataInput::TriMesh => AssetSlotKind::TriMesh,
                     OperatorMetadataInput::Subspace => AssetSlotKind::Subspace,
+                    OperatorMetadataInput::F64Map => AssetSlotKind::F64Map,
                     _ => return None,
                 };
                 Some(AssetSlot {
@@ -2602,15 +2612,49 @@ impl VolumetricUiV2 {
             })
             .collect();
 
-        let config = metadata
+        let static_config =
+            metadata
+                .inputs
+                .iter()
+                .enumerate()
+                .find_map(|(idx, input)| match input {
+                    OperatorMetadataInput::CBORConfiguration(cddl) => Some((idx, cddl.clone())),
+                    _ => None,
+                });
+        let lua_parameter_config = metadata
             .inputs
             .iter()
-            .enumerate()
-            .find_map(|(idx, input)| match input {
-                OperatorMetadataInput::CBORConfiguration(cddl) => Some((idx, cddl.clone())),
-                _ => None,
+            .position(|input| matches!(input, OperatorMetadataInput::F64Map))
+            .filter(|input_idx| {
+                matches!(step.inputs.get(*input_idx), Some(ExecutionInput::Inline(_)))
             })
-            .and_then(|(input_idx, cddl)| self.build_config_form(step, input_idx, &cddl));
+            .and_then(|input_idx| {
+                let source_input = metadata
+                    .inputs
+                    .iter()
+                    .position(|input| matches!(input, OperatorMetadataInput::LuaSource(_)))?;
+                let ExecutionInput::Inline(source) = step.inputs.get(source_input)? else {
+                    return None;
+                };
+                let source = std::str::from_utf8(source).ok()?;
+                let parameters = volumetric::lua_parameters::parse(source).ok()?;
+                (!parameters.is_empty()).then(|| {
+                    (
+                        input_idx,
+                        volumetric::lua_parameters::schema_cddl(&parameters),
+                    )
+                })
+            });
+        let config = static_config
+            .or(lua_parameter_config)
+            .and_then(|(input_idx, cddl)| {
+                self.build_config_form(
+                    step,
+                    input_idx,
+                    metadata.input_name(input_idx).map(str::to_string),
+                    &cddl,
+                )
+            });
 
         let lua = metadata
             .inputs
@@ -2645,6 +2689,7 @@ impl VolumetricUiV2 {
         &self,
         step: &volumetric::ExecutionStep,
         input_idx: usize,
+        name: Option<String>,
         cddl: &str,
     ) -> Option<ConfigForm> {
         let fields = operator_config::parse_schema(cddl).ok()?;
@@ -2682,6 +2727,7 @@ impl VolumetricUiV2 {
         }
         Some(ConfigForm {
             input_idx,
+            name,
             fields,
             buffers,
             lists,
@@ -2783,13 +2829,27 @@ impl VolumetricUiV2 {
     /// model slot also renames the step's first output after the new input and
     /// rewires exports, matching how a freshly added operator is named.
     fn set_step_model_input(&mut self, step_idx: usize, input_idx: usize, asset_id: &str) {
-        let primary_slot = self
+        let edited_slot = self
             .step_edit
             .as_ref()
             .filter(|edit| edit.step_idx == step_idx)
-            .and_then(|edit| edit.asset_slots.first().map(|slot| slot.input_idx))
-            .unwrap_or(0);
-        let rename_output = input_idx == primary_slot;
+            .and_then(|edit| {
+                edit.asset_slots
+                    .iter()
+                    .find(|slot| slot.input_idx == input_idx)
+            });
+        let rebuild_editor = edited_slot.is_some_and(|slot| slot.kind == AssetSlotKind::F64Map);
+        let primary_model_slot = self
+            .step_edit
+            .as_ref()
+            .filter(|edit| edit.step_idx == step_idx)
+            .and_then(|edit| {
+                edit.asset_slots
+                    .iter()
+                    .find(|slot| slot.kind == AssetSlotKind::Model)
+                    .map(|slot| slot.input_idx)
+            });
+        let rename_output = Some(input_idx) == primary_model_slot;
 
         let Some(step) = self.project.timeline().get(step_idx) else {
             return;
@@ -2832,6 +2892,38 @@ impl VolumetricUiV2 {
             step_idx + 1,
             input_idx + 1
         );
+        if rebuild_editor {
+            self.step_edit = self.build_step_edit(step_idx);
+        }
+    }
+
+    fn clear_step_f64_map_input(&mut self, step_idx: usize, input_idx: usize) {
+        let is_f64_map = self
+            .step_edit
+            .as_ref()
+            .filter(|edit| edit.step_idx == step_idx)
+            .is_some_and(|edit| {
+                edit.asset_slots
+                    .iter()
+                    .any(|slot| slot.input_idx == input_idx && slot.kind == AssetSlotKind::F64Map)
+            });
+        if !is_f64_map {
+            return;
+        }
+        let Some(step) = self.project.timeline_mut().get_mut(step_idx) else {
+            return;
+        };
+        let Some(input) = step.inputs.get_mut(input_idx) else {
+            return;
+        };
+        *input = ExecutionInput::Inline(
+            volumetric::f64_map::encode(&volumetric::f64_map::F64Map::new())
+                .expect("empty F64Map must encode"),
+        );
+        self.mark_project_dirty();
+        self.selected_project_item = Some(ProjectSelection::Step(step_idx));
+        self.status = format!("cleared step {} input {}", step_idx + 1, input_idx + 1);
+        self.step_edit = self.build_step_edit(step_idx);
     }
 
     /// Restores the selected step's Lua source to the operator's template.
@@ -3310,6 +3402,7 @@ impl VolumetricUiV2 {
                 fea: for_kind(AssetTypeHint::FeaMesh).as_deref(),
                 trimesh: for_kind(AssetTypeHint::TriMesh).as_deref(),
                 subspace: for_kind(AssetTypeHint::Subspace).as_deref(),
+                f64_map: for_kind(AssetTypeHint::F64Map).as_deref(),
             },
         );
 
@@ -3710,20 +3803,30 @@ impl App for VolumetricUiV2 {
         if event.target_key() == Some(LUA_SOURCE_KEY) {
             if let Some(mut edit) = self.step_edit.take() {
                 let mut changed = false;
+                let mut parameter_schema_changed = false;
                 if let Some(lua) = edit.lua.as_mut() {
+                    let old_parameters = volumetric::lua_parameters::parse(&lua.source).ok();
                     changed = text_area::apply_event(
                         &mut lua.source,
                         &mut self.selection,
                         &event,
                         LUA_SOURCE_KEY,
                     );
+                    if changed {
+                        parameter_schema_changed =
+                            old_parameters != volumetric::lua_parameters::parse(&lua.source).ok();
+                    }
                 }
                 if changed {
                     if let Some(lua) = edit.lua.as_ref() {
                         self.write_lua_source(edit.step_idx, lua);
                     }
                 }
+                let step_idx = edit.step_idx;
                 self.step_edit = Some(edit);
+                if parameter_schema_changed {
+                    self.step_edit = self.build_step_edit(step_idx);
+                }
                 return;
             }
         }
@@ -4023,6 +4126,10 @@ impl App for VolumetricUiV2 {
             parse_step_model_route(route, SET_STEP_MODEL_PREFIX)
         {
             self.set_step_model_input(step_idx, input_idx, asset_id);
+        } else if let Some((step_idx, input_idx)) =
+            parse_step_input_route(route, CLEAR_STEP_F64_MAP_PREFIX)
+        {
+            self.clear_step_f64_map_input(step_idx, input_idx);
         } else if let Some(idx) = parse_index_route(route, SELECT_EXPORT_PREFIX) {
             if let Some(export_id) = self.project.exports().get(idx) {
                 self.selected_export = Some(export_id.clone());
@@ -4272,9 +4379,10 @@ fn add_rail(app: &VolumetricUiV2) -> El {
 /// Fixed presentation order for the known categories in the browse view;
 /// categories declared by modules but missing here append after, and
 /// entries without metadata yet group under a trailing "Scanning" header.
-const CATEGORY_ORDER: [&str; 10] = [
+const CATEGORY_ORDER: [&str; 11] = [
     "Primitives",
     "Combine",
+    "Data",
     "Transforms",
     "Construction",
     "Lattice",
@@ -6121,6 +6229,7 @@ fn step_edit_rows(app: &VolumetricUiV2, step_idx: usize) -> Vec<El> {
         let meshes = step_input_options(app, step_idx, AssetSlotKind::FeaMesh);
         let trimeshes = step_input_options(app, step_idx, AssetSlotKind::TriMesh);
         let subspaces = step_input_options(app, step_idx, AssetSlotKind::Subspace);
+        let f64_maps = step_input_options(app, step_idx, AssetSlotKind::F64Map);
         rows.push(text("Inputs").muted().caption().semibold());
         for (n, slot) in edit.asset_slots.iter().enumerate() {
             let current = match step.inputs.get(slot.input_idx) {
@@ -6132,6 +6241,7 @@ fn step_edit_rows(app: &VolumetricUiV2, step_idx: usize) -> Vec<El> {
                 AssetSlotKind::FeaMesh => &meshes,
                 AssetSlotKind::TriMesh => &trimeshes,
                 AssetSlotKind::Subspace => &subspaces,
+                AssetSlotKind::F64Map => &f64_maps,
             };
             rows.push(asset_slot_selector(step_idx, slot, n, current, options));
         }
@@ -6163,7 +6273,12 @@ fn step_edit_rows(app: &VolumetricUiV2, step_idx: usize) -> Vec<El> {
     }
 
     if let Some(config) = &edit.config {
-        rows.push(text("Config").muted().caption().semibold());
+        rows.push(
+            text(config.name.as_deref().unwrap_or("Config"))
+                .muted()
+                .caption()
+                .semibold(),
+        );
         for field in &config.fields {
             if matches!(field.ty, ConfigFieldType::List { .. }) {
                 let elements = config
@@ -6233,6 +6348,7 @@ fn step_input_options(app: &VolumetricUiV2, step_idx: usize, kind: AssetSlotKind
         AssetSlotKind::FeaMesh => editable_fea_asset_ids(app),
         AssetSlotKind::TriMesh => editable_trimesh_asset_ids(app),
         AssetSlotKind::Subspace => editable_subspace_asset_ids(app),
+        AssetSlotKind::F64Map => editable_f64_map_asset_ids(app),
     };
     ids.into_iter()
         .filter(|id| !not_yet_produced.contains(id.as_str()))
@@ -6253,6 +6369,19 @@ fn asset_slot_selector(
         .clone()
         .unwrap_or_else(|| format!("Input {}", ordinal + 1));
     let mut items = vec![text(label).muted().caption().width(Size::Fill(1.0))];
+    if slot.kind == AssetSlotKind::F64Map {
+        items.push(if current.is_empty() {
+            text("Inline F64Map").muted().caption()
+        } else {
+            button_with_icon("x", "Use inline")
+                .xsmall()
+                .width(Size::Fill(1.0))
+                .key(format!(
+                    "{CLEAR_STEP_F64_MAP_PREFIX}{step_idx}:{}",
+                    slot.input_idx
+                ))
+        });
+    }
     if options.is_empty() {
         items.push(
             text(format!(
@@ -6286,6 +6415,7 @@ fn asset_slot_kind_label(kind: AssetSlotKind) -> &'static str {
         AssetSlotKind::FeaMesh => "FEA mesh",
         AssetSlotKind::TriMesh => "triangle mesh",
         AssetSlotKind::Subspace => "subspace",
+        AssetSlotKind::F64Map => "F64Map",
     }
 }
 
@@ -6634,6 +6764,7 @@ fn asset_type_label(type_hint: Option<AssetTypeHint>) -> &'static str {
         Some(AssetTypeHint::Operator) => "Operator",
         Some(AssetTypeHint::Config) => "Config",
         Some(AssetTypeHint::LuaSource) => "Lua",
+        Some(AssetTypeHint::F64Map) => "F64 Map",
         Some(AssetTypeHint::Binary) => "Binary",
         Some(AssetTypeHint::VecF64(_)) => "Vec",
         Some(AssetTypeHint::FeaMesh) => "FEA Mesh",
@@ -6651,6 +6782,7 @@ struct SlotPrimaries<'a> {
     fea: Option<&'a str>,
     trimesh: Option<&'a str>,
     subspace: Option<&'a str>,
+    f64_map: Option<&'a str>,
 }
 
 /// Builds a fresh step's inputs, one per declared operator metadata input, in
@@ -6664,6 +6796,8 @@ fn operator_step_inputs(
     let primary_model = primaries.model;
     let primary_fea = primaries.fea;
     let primary_trimesh = primaries.trimesh;
+    let primary_f64_map = primaries.f64_map;
+    let mut used_primary_f64_map = false;
     metadata
         .inputs
         .iter()
@@ -6678,6 +6812,17 @@ fn operator_step_inputs(
             }
             OperatorMetadataInput::LuaSource(template) => {
                 ExecutionInput::Inline(template.clone().into_bytes())
+            }
+            OperatorMetadataInput::F64Map => {
+                if !used_primary_f64_map && let Some(id) = primary_f64_map {
+                    used_primary_f64_map = true;
+                    ExecutionInput::AssetRef(id.to_string())
+                } else {
+                    ExecutionInput::Inline(
+                        volumetric::f64_map::encode(&volumetric::f64_map::F64Map::new())
+                            .expect("empty F64Map must encode"),
+                    )
+                }
             }
             OperatorMetadataInput::Blob => ExecutionInput::Inline(Vec::new()),
             OperatorMetadataInput::VecF64(dim) => ExecutionInput::Inline(vec![0u8; dim * 8]),
@@ -6732,6 +6877,12 @@ fn parse_step_model_route<'a>(route: &'a str, prefix: &str) -> Option<(usize, us
     let (step_idx, rest) = rest.split_once(':')?;
     let (input_idx, asset_id) = rest.split_once(':')?;
     Some((step_idx.parse().ok()?, input_idx.parse().ok()?, asset_id))
+}
+
+/// Parses a `{prefix}{step}:{input}` route.
+fn parse_step_input_route(route: &str, prefix: &str) -> Option<(usize, usize)> {
+    let (step_idx, input_idx) = route.strip_prefix(prefix)?.split_once(':')?;
+    Some((step_idx.parse().ok()?, input_idx.parse().ok()?))
 }
 
 /// Splits a target resolution into (base_resolution, max_depth). A non-zero
@@ -6819,6 +6970,13 @@ fn editable_subspace_asset_ids(app: &VolumetricUiV2) -> Vec<String> {
     app.declared_assets_typed()
         .into_iter()
         .filter_map(|(id, type_hint)| (type_hint == Some(AssetTypeHint::Subspace)).then_some(id))
+        .collect()
+}
+
+fn editable_f64_map_asset_ids(app: &VolumetricUiV2) -> Vec<String> {
+    app.declared_assets_typed()
+        .into_iter()
+        .filter_map(|(id, type_hint)| (type_hint == Some(AssetTypeHint::F64Map)).then_some(id))
         .collect()
 }
 
@@ -7193,6 +7351,146 @@ mod tests {
                 _ => assert!(matches!(input, ExecutionInput::Inline(_))),
             }
         }
+    }
+
+    #[test]
+    fn f64_map_inputs_can_be_inline_or_routed_assets() {
+        let metadata = OperatorMetadata {
+            name: "parameterized_generator".to_string(),
+            version: "0.1.0".to_string(),
+            display_name: String::new(),
+            description: String::new(),
+            category: String::new(),
+            icon_svg: String::new(),
+            inputs: vec![
+                OperatorMetadataInput::LuaSource(
+                    "local radius = 1.0 -- @param key=shared.radius".to_string(),
+                ),
+                OperatorMetadataInput::F64Map,
+            ],
+            input_names: vec!["Script".to_string(), "Parameters".to_string()],
+            outputs: vec![volumetric::OperatorMetadataOutput::ModelWASM],
+        };
+
+        let inline = operator_step_inputs(&metadata, &SlotPrimaries::default());
+        let ExecutionInput::Inline(bytes) = &inline[1] else {
+            panic!("F64Map without a producer should start inline");
+        };
+        assert!(volumetric::f64_map::decode(bytes).unwrap().is_empty());
+
+        let routed = operator_step_inputs(
+            &metadata,
+            &SlotPrimaries {
+                f64_map: Some("global_dimensions"),
+                ..SlotPrimaries::default()
+            },
+        );
+        assert!(matches!(
+            &routed[1],
+            ExecutionInput::AssetRef(id) if id == "global_dimensions"
+        ));
+
+        let merge_metadata = OperatorMetadata {
+            name: "f64_map_merge_operator".to_string(),
+            inputs: vec![OperatorMetadataInput::F64Map; 3],
+            input_names: vec![
+                "Base".to_string(),
+                "Override 1".to_string(),
+                "Override 2".to_string(),
+            ],
+            ..metadata
+        };
+        let merge_inputs = operator_step_inputs(
+            &merge_metadata,
+            &SlotPrimaries {
+                f64_map: Some("global_dimensions"),
+                ..SlotPrimaries::default()
+            },
+        );
+        assert!(matches!(
+            &merge_inputs[0],
+            ExecutionInput::AssetRef(id) if id == "global_dimensions"
+        ));
+        for input in &merge_inputs[1..] {
+            let ExecutionInput::Inline(bytes) = input else {
+                panic!("only the first F64Map slot should use the primary asset");
+            };
+            assert!(volumetric::f64_map::decode(bytes).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn lua_annotations_build_the_inline_parameter_form() {
+        let mut app = VolumetricUiV2::empty();
+        add_operator_click(&mut app, "lua_script_operator");
+        app.step_edit = app.build_step_edit(0);
+
+        let edit = app.step_edit.as_ref().expect("Lua step editor");
+        assert!(
+            edit.asset_slots
+                .iter()
+                .any(|slot| slot.kind == AssetSlotKind::F64Map)
+        );
+        let config = edit.config.as_ref().expect("annotation-derived form");
+        assert_eq!(config.name.as_deref(), Some("Parameters"));
+        let radius = config
+            .fields
+            .iter()
+            .find(|field| field.name == "sphere.radius")
+            .expect("sphere radius field");
+        assert_eq!(radius.min, Some(0.000001));
+        assert_eq!(
+            config.buffers.get("sphere.radius").map(String::as_str),
+            Some("1")
+        );
+
+        app.set_config_buffer("sphere.radius", "2".to_string());
+        let ExecutionInput::Inline(bytes) = &app.project.timeline()[0].inputs[1] else {
+            panic!("editing inline parameters must keep an inline F64Map");
+        };
+        assert_eq!(
+            volumetric::f64_map::decode(bytes).unwrap()["sphere.radius"],
+            2.0
+        );
+
+        app.project
+            .imports_mut()
+            .push(volumetric::ImportedAsset::new(
+                "global_dimensions".to_string(),
+                volumetric::f64_map::encode(&volumetric::f64_map::F64Map::from([(
+                    "sphere.radius".to_string(),
+                    3.0,
+                )]))
+                .unwrap(),
+                Some(AssetTypeHint::F64Map),
+            ));
+        app.set_step_model_input(0, 1, "global_dimensions");
+        assert!(matches!(
+            &app.project.timeline()[0].inputs[1],
+            ExecutionInput::AssetRef(id) if id == "global_dimensions"
+        ));
+        assert!(
+            app.step_edit
+                .as_ref()
+                .expect("routed Lua editor")
+                .config
+                .is_none(),
+            "a routed map should not expose an inline value form"
+        );
+
+        app.clear_step_f64_map_input(0, 1);
+        let ExecutionInput::Inline(bytes) = &app.project.timeline()[0].inputs[1] else {
+            panic!("clearing a routed F64Map must restore inline data");
+        };
+        assert!(volumetric::f64_map::decode(bytes).unwrap().is_empty());
+        assert!(
+            app.step_edit
+                .as_ref()
+                .expect("cleared Lua editor")
+                .config
+                .is_some(),
+            "restoring inline data should restore the annotation-derived form"
+        );
     }
 
     /// The app-supplied SVG glyphs (names damascene's built-in vocabulary

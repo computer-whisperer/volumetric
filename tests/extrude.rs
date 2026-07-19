@@ -99,6 +99,102 @@ fn lua_compiles_2d_sketches() {
 }
 
 #[test]
+fn lua_module_constants_are_shared_by_helpers_sampling_and_bounds() {
+    const PARAMETERIZED_SKETCH: &str = r#"
+local diameter = 2.0
+local radius = diameter / 2.0
+local clearance = 0.125
+local bound = radius + clearance
+
+function radial_squared(x, y)
+    return x*x + y*y
+end
+
+function is_inside(x, y)
+    return radial_squared(x, y) <= radius*radius
+end
+
+function get_bounds_min_x() return -bound end
+function get_bounds_max_x() return bound end
+function get_bounds_min_y() return -bound end
+function get_bounds_max_y() return bound end
+"#;
+
+    let model = run_operator(
+        "lua_script_operator",
+        vec![PARAMETERIZED_SKETCH.as_bytes().to_vec()],
+    )
+    .expect("compile parameterized sketch");
+    let mut executor = NativeModelExecutor::new(&model).unwrap();
+
+    let bounds = executor.get_bounds_nd().unwrap();
+    assert_eq!((bounds.min(0), bounds.max(0)), (-1.125, 1.125));
+    assert_eq!((bounds.min(1), bounds.max(1)), (-1.125, 1.125));
+    assert_eq!(executor.sample_nd(&[0.75, 0.5]).unwrap(), 1.0);
+    assert_eq!(executor.sample_nd(&[1.01, 0.0]).unwrap(), 0.0);
+}
+
+#[test]
+fn lua_f64_map_routes_shared_values_into_geometry_and_bounds() {
+    const ROUTED_SKETCH: &str = r#"
+local radius = 1.0 -- @param key="shared.radius" min=0.25 max=4.0
+local margin = 0.5
+local bound = radius + margin
+function is_inside(x, y) return x*x + y*y <= radius*radius end
+function get_bounds_min_x() return -bound end
+function get_bounds_max_x() return bound end
+function get_bounds_min_y() return -bound end
+function get_bounds_max_y() return bound end
+"#;
+    let values = volumetric_abi::f64_map::F64Map::from([
+        ("shared.radius".to_string(), 2.0),
+        ("shared.unused".to_string(), 123.0),
+    ]);
+    let model = run_operator(
+        "lua_script_operator",
+        vec![
+            ROUTED_SKETCH.as_bytes().to_vec(),
+            volumetric_abi::f64_map::encode(&values).unwrap(),
+        ],
+    )
+    .expect("compile sketch with routed F64Map");
+    let mut executor = NativeModelExecutor::new(&model).unwrap();
+
+    let bounds = executor.get_bounds_nd().unwrap();
+    assert_eq!((bounds.min(0), bounds.max(0)), (-2.5, 2.5));
+    assert_eq!((bounds.min(1), bounds.max(1)), (-2.5, 2.5));
+    assert_eq!(executor.sample_nd(&[1.5, 0.0]).unwrap(), 1.0);
+    assert_eq!(executor.sample_nd(&[2.1, 0.0]).unwrap(), 0.0);
+}
+
+#[test]
+fn lua_fidget_spinner_reference_has_expected_geometry() {
+    let source = include_str!("../examples/fidget_spinner.lua");
+    let model = run_operator("lua_script_operator", vec![source.as_bytes().to_vec()])
+        .expect("compile reference spinner");
+    let mut executor = NativeModelExecutor::new(&model).unwrap();
+
+    assert_eq!(executor.dimensions(), 3);
+    let bounds = executor.get_bounds_nd().unwrap();
+    assert!((bounds.min(0) + 0.0515).abs() < 1.0e-12);
+    assert!((bounds.max(0) - 0.0515).abs() < 1.0e-12);
+    assert!((bounds.max(1) - 0.046810_889_132_455_35).abs() < 1.0e-12);
+    assert_eq!(bounds.min(1), -bounds.max(1));
+    assert!((bounds.min(2) + 0.0036).abs() < 1.0e-12);
+    assert!((bounds.max(2) - 0.0036).abs() < 1.0e-12);
+
+    // Four bearing seats are empty, while the surrounding rings and the
+    // connecting web remain solid.
+    assert_eq!(executor.sample_nd(&[0.0, 0.0, 0.0]).unwrap(), 0.0);
+    assert_eq!(executor.sample_nd(&[0.035, 0.0, 0.0]).unwrap(), 0.0);
+    assert_eq!(executor.sample_nd(&[0.014, 0.0, 0.0]).unwrap(), 1.0);
+    assert_eq!(executor.sample_nd(&[0.0175, 0.0, 0.0]).unwrap(), 1.0);
+    assert_eq!(executor.sample_nd(&[0.048, 0.0, 0.0]).unwrap(), 1.0);
+    assert_eq!(executor.sample_nd(&[0.0175, 0.0, 0.004]).unwrap(), 0.0);
+    assert_eq!(executor.sample_nd(&[0.06, 0.0, 0.0]).unwrap(), 0.0);
+}
+
+#[test]
 fn sketches_refuse_3d_sampling_gracefully() {
     use volumetric::wasm::ModelExecutor;
     let sketch = circle_sketch_wasm();

@@ -1,0 +1,10 @@
+[package]
+name = "f64_map_merge_operator"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+volumetric_abi = { path = "../../volumetric_abi" }

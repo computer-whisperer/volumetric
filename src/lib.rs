@@ -182,6 +182,8 @@ pub enum AssetTypeHint {
     Config,
     /// Lua script (UTF-8 text)
     LuaSource,
+    /// CBOR-encoded flat map from strings to finite f64 values.
+    F64Map,
     /// Unknown/generic binary data
     Binary,
     /// Vector of f64 values with specified dimension (e.g., 3 for vec3)
@@ -205,6 +207,7 @@ impl std::fmt::Display for AssetTypeHint {
             AssetTypeHint::Operator => write!(f, "Operator"),
             AssetTypeHint::Config => write!(f, "Config"),
             AssetTypeHint::LuaSource => write!(f, "LuaSource"),
+            AssetTypeHint::F64Map => write!(f, "F64Map"),
             AssetTypeHint::Binary => write!(f, "Binary"),
             AssetTypeHint::VecF64(dim) => write!(f, "VecF64({dim})"),
             AssetTypeHint::FeaMesh => write!(f, "FeaMesh"),
@@ -223,6 +226,7 @@ impl From<&OperatorMetadataOutput> for AssetTypeHint {
             OperatorMetadataOutput::FeaMesh => AssetTypeHint::FeaMesh,
             OperatorMetadataOutput::TriMesh => AssetTypeHint::TriMesh,
             OperatorMetadataOutput::Subspace => AssetTypeHint::Subspace,
+            OperatorMetadataOutput::F64Map => AssetTypeHint::F64Map,
         }
     }
 }
@@ -299,6 +303,7 @@ pub use volumetric_abi::{ChannelKind, SampleChannel, SampleFormat, encode_sample
 
 // The FEA mesh value type (CBOR payload of FeaMesh-typed assets).
 pub use volumetric_abi::fea;
+pub use volumetric_abi::{f64_map, lua_parameters};
 
 // The triangle mesh value type (CBOR payload of TriMesh-typed assets).
 pub use volumetric_abi::trimesh;

@@ -51,6 +51,12 @@
 //!   the occupancy value for that position (see below)
 //! - `memory` — the linear memory the pointers above refer to
 //!
+//! `get_bounds` is the finite enclosure consumers use to traverse occupancy
+//! geometry; it is not a clipping rule or a declaration that samples outside
+//! the box are invalid. `sample` and `sample_channels` accept any finite
+//! position. Whether an extra channel remains meaningful outside occupancy or
+//! outside the geometry bounds is part of that channel kind's semantics.
+//!
 //! `sample` and `get_bounds` accept any pointer to a large-enough region of
 //! the model's memory, and the model may clobber that region during the call
 //! (transform wrappers rewrite the position in place). A caller that needs
@@ -108,7 +114,9 @@
 
 use std::sync::OnceLock;
 
+pub mod f64_map;
 pub mod fea;
+pub mod lua_parameters;
 pub mod subspace;
 pub mod threading;
 pub mod trimesh;
@@ -143,9 +151,19 @@ pub enum ChannelKind {
     /// inside.
     Density,
     /// An application-defined kind. Namespace the string (e.g.
-    /// `"myapp.temperature"`) to avoid collisions.
+    /// `"myapp.temperature"`) to avoid collisions. The kind defines its own
+    /// domain; custom channels may remain meaningful where occupancy is zero
+    /// and outside the model's advertised geometry bounds.
     Custom(String),
 }
+
+/// Conventional channel name emitted by the SDF-generation operator.
+pub const SIGNED_DISTANCE_CHANNEL_NAME: &str = "signed_distance";
+
+/// Namespaced [`ChannelKind::Custom`] identifier for a truncated signed
+/// distance field. Values are world-space distance, negative inside and
+/// positive outside, clamped to a generator-declared symmetric band.
+pub const TSDF_CHANNEL_KIND: &str = "volumetric.tsdf.v1";
 
 /// One declared per-sample channel.
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -240,6 +258,13 @@ pub enum OperatorMetadataInput {
     /// signatures. The host UI displays a multiline text editor pre-populated
     /// with this template. The script is passed as UTF-8 bytes to the operator.
     LuaSource(String),
+    /// A CBOR-encoded flat map from non-empty strings to finite f64 values.
+    ///
+    /// This is generic project data: hosts may offer an inline editor or
+    /// route an `F64Map` asset produced elsewhere in the DAG. Any names,
+    /// defaults, and ranges shown by a consumer are schema hints rather than
+    /// part of the map's wire representation.
+    F64Map,
     /// Raw binary data input (e.g., STL file data).
     ///
     /// The host UI should display a file picker allowing the user to select a
@@ -282,6 +307,8 @@ pub enum OperatorMetadataOutput {
     /// A CBOR-encoded affine subspace (see [`OperatorMetadataInput::Subspace`]);
     /// explicit data, never fed to the model executor.
     Subspace,
+    /// A CBOR-encoded flat string-to-f64 map (see [`f64_map`]).
+    F64Map,
 }
 
 /// Metadata a module returns from `get_metadata()`, CBOR-encoded.
@@ -529,6 +556,7 @@ mod tests {
                 OperatorMetadataInput::ModelWASM,
                 OperatorMetadataInput::CBORConfiguration("{ dx: float }".to_string()),
                 OperatorMetadataInput::LuaSource("-- stub".to_string()),
+                OperatorMetadataInput::F64Map,
                 OperatorMetadataInput::Blob,
                 OperatorMetadataInput::VecF64(3),
                 OperatorMetadataInput::FeaMesh,
@@ -538,6 +566,7 @@ mod tests {
                 "Model".to_string(),
                 "Config".to_string(),
                 "Script".to_string(),
+                "Values".to_string(),
                 "File".to_string(),
                 "Corner".to_string(),
                 "Mesh".to_string(),
@@ -547,13 +576,14 @@ mod tests {
                 OperatorMetadataOutput::ModelWASM,
                 OperatorMetadataOutput::FeaMesh,
                 OperatorMetadataOutput::TriMesh,
+                OperatorMetadataOutput::F64Map,
             ],
         };
 
         let decoded = decode_metadata(&encode_metadata(&metadata)).unwrap();
         assert_eq!(decoded, metadata);
         assert_eq!(metadata.input_name(0), Some("Model"));
-        assert_eq!(metadata.input_name(7), None);
+        assert_eq!(metadata.input_name(8), None);
         assert_eq!(metadata.catalog_name(), "Test Operator");
     }
 

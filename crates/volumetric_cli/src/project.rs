@@ -121,6 +121,7 @@ pub fn run_project_add_model(args: ProjectAddModelArgs) -> Result<()> {
 pub enum AssetTypeArg {
     Lua,
     Config,
+    F64Map,
     Blob,
 }
 
@@ -129,6 +130,7 @@ impl From<AssetTypeArg> for AssetTypeHint {
         match value {
             AssetTypeArg::Lua => AssetTypeHint::LuaSource,
             AssetTypeArg::Config => AssetTypeHint::Config,
+            AssetTypeArg::F64Map => AssetTypeHint::F64Map,
             AssetTypeArg::Blob => AssetTypeHint::Binary,
         }
     }
@@ -159,7 +161,7 @@ pub struct ProjectAddAssetArgs {
 
 pub fn run_project_add_asset(args: ProjectAddAssetArgs) -> Result<()> {
     let mut project = Project::load_from_file(&args.project).context("Failed to load project")?;
-    let bytes = std::fs::read(&args.input)
+    let mut bytes = std::fs::read(&args.input)
         .with_context(|| format!("Failed to read {}", args.input.display()))?;
 
     let extension = args
@@ -176,6 +178,18 @@ pub fn run_project_add_asset(args: ProjectAddAssetArgs) -> Result<()> {
             _ => AssetTypeArg::Blob,
         })
         .into();
+
+    if type_hint == AssetTypeHint::F64Map {
+        if extension == "json" {
+            let json: serde_json::Value = serde_json::from_slice(&bytes)
+                .with_context(|| format!("Failed to parse {} as JSON", args.input.display()))?;
+            bytes = encode_json_f64_map(&json, "F64Map asset")?;
+        } else {
+            volumetric_abi::f64_map::decode(&bytes)
+                .map_err(anyhow::Error::msg)
+                .context("Invalid F64Map asset")?;
+        }
+    }
 
     // Adding a wasm module as lua/blob is almost certainly a mistyped command.
     if bytes.starts_with(b"\0asm") {
@@ -272,6 +286,7 @@ pub fn input_type_label(input: &OperatorMetadataInput) -> String {
         OperatorMetadataInput::ModelWASM => "ModelWASM".to_string(),
         OperatorMetadataInput::CBORConfiguration(_) => "CBOR configuration".to_string(),
         OperatorMetadataInput::LuaSource(_) => "Lua source".to_string(),
+        OperatorMetadataInput::F64Map => "F64Map".to_string(),
         OperatorMetadataInput::Blob => "Blob".to_string(),
         OperatorMetadataInput::VecF64(dim) => format!("VecF64({dim})"),
         OperatorMetadataInput::FeaMesh => "FeaMesh".to_string(),
@@ -358,11 +373,22 @@ fn coerce_input(
             inline(cbor_bytes)
         }
 
+        (ParsedInput::Json(value), OperatorMetadataInput::F64Map) => {
+            inline(encode_json_f64_map(&value, slot_desc)?)
+        }
+
         // Lua source: a JSON string is the script text; raw bytes pass.
         (
             ParsedInput::Json(serde_json::Value::String(source)),
             OperatorMetadataInput::LuaSource(_),
         ) => inline(source.into_bytes()),
+
+        (ParsedInput::Bytes(bytes, _), OperatorMetadataInput::F64Map) => {
+            volumetric_abi::f64_map::decode(&bytes)
+                .map_err(anyhow::Error::msg)
+                .with_context(|| format!("{slot_desc} is not a valid F64Map"))?;
+            inline(bytes)
+        }
 
         // Binary slot types can't be built from JSON literals.
         (ParsedInput::Json(_), slot_type) => {
@@ -375,6 +401,22 @@ fn coerce_input(
 
         (ParsedInput::Bytes(bytes, _), _) => inline(bytes),
     }
+}
+
+fn encode_json_f64_map(value: &serde_json::Value, context: &str) -> Result<Vec<u8>> {
+    let serde_json::Value::Object(entries) = value else {
+        anyhow::bail!("{context} expects a JSON object whose values are finite numbers");
+    };
+    let mut values = volumetric_abi::f64_map::F64Map::new();
+    for (key, value) in entries {
+        let number = value
+            .as_f64()
+            .with_context(|| format!("{context}: value for `{key}` is not a number"))?;
+        values.insert(key.clone(), number);
+    }
+    volumetric_abi::f64_map::encode(&values)
+        .map_err(anyhow::Error::msg)
+        .with_context(|| format!("{context} is invalid"))
 }
 
 pub fn run_project_add_op(args: ProjectAddOpArgs) -> Result<()> {
@@ -603,6 +645,7 @@ pub fn run_project_export(args: ProjectExportArgs) -> Result<()> {
         let ext = match type_hint {
             AssetTypeHint::Model | AssetTypeHint::Operator => "wasm",
             AssetTypeHint::LuaSource => "lua",
+            AssetTypeHint::F64Map | AssetTypeHint::Config => "cbor",
             AssetTypeHint::FeaMesh => "vfea",
             AssetTypeHint::TriMesh => "vmesh",
             _ => "bin",
@@ -850,6 +893,16 @@ fn describe_step_input(
                     .unwrap_or("<non-utf8>");
                 format!("<{} bytes of Lua: {first_line}…>", bytes.len())
             }
+            Some(OperatorMetadataInput::F64Map) => {
+                match volumetric_abi::f64_map::decode(bytes)
+                    .ok()
+                    .and_then(|map| serde_json::to_string(&map).ok())
+                {
+                    Some(json) if json.len() <= 200 => json,
+                    Some(json) => format!("{}… ({} bytes of CBOR)", &json[..200], bytes.len()),
+                    None => format!("<{} bytes of invalid F64Map>", bytes.len()),
+                }
+            }
             Some(other) => format!("<{} bytes ({})>", bytes.len(), input_type_label(other)),
             None => format!("<{} bytes>", bytes.len()),
         },
@@ -1037,5 +1090,22 @@ mod tests {
             panic!("expected inline");
         };
         assert_eq!(source, b"return 1");
+    }
+
+    #[test]
+    fn f64_map_slots_accept_numeric_json_objects() {
+        let parsed =
+            parse_input("json:{\"spinner.bearing_pitch\":0.04,\"global.scale\":2}").unwrap();
+        let ExecutionInput::Inline(bytes) =
+            coerce_input(parsed, &OperatorMetadataInput::F64Map, "parameters").unwrap()
+        else {
+            panic!("expected inline F64Map");
+        };
+        let values = volumetric_abi::f64_map::decode(&bytes).unwrap();
+        assert_eq!(values["spinner.bearing_pitch"], 0.04);
+        assert_eq!(values["global.scale"], 2.0);
+
+        let invalid = parse_input("json:{\"x\":\"not numeric\"}").unwrap();
+        assert!(coerce_input(invalid, &OperatorMetadataInput::F64Map, "parameters").is_err());
     }
 }

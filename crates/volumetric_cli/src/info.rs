@@ -192,6 +192,7 @@ enum InputInfo {
     ModelWasm,
     CborConfiguration { cddl: String },
     LuaSource { template: String },
+    F64Map,
     VecF64 { dimension: usize },
     Blob,
     FeaMesh,
@@ -206,6 +207,7 @@ enum OutputInfo {
     FeaMesh,
     TriMesh,
     Subspace,
+    F64Map,
 }
 
 #[derive(Debug, Serialize)]
@@ -241,6 +243,7 @@ fn metadata_to_json(meta: &OperatorMetadata) -> OperatorMetadataJson {
                 OperatorMetadataInput::LuaSource(template) => InputInfo::LuaSource {
                     template: template.clone(),
                 },
+                OperatorMetadataInput::F64Map => InputInfo::F64Map,
                 OperatorMetadataInput::VecF64(dim) => InputInfo::VecF64 { dimension: *dim },
                 OperatorMetadataInput::Blob => InputInfo::Blob,
                 OperatorMetadataInput::FeaMesh => InputInfo::FeaMesh,
@@ -256,6 +259,7 @@ fn metadata_to_json(meta: &OperatorMetadata) -> OperatorMetadataJson {
                 OperatorMetadataOutput::FeaMesh => OutputInfo::FeaMesh,
                 OperatorMetadataOutput::TriMesh => OutputInfo::TriMesh,
                 OperatorMetadataOutput::Subspace => OutputInfo::Subspace,
+                OperatorMetadataOutput::F64Map => OutputInfo::F64Map,
             })
             .collect(),
     }
@@ -371,6 +375,7 @@ fn print_info_human(output: &InfoOutput) {
                             println!("      ...");
                         }
                     }
+                    InputInfo::F64Map => println!("  [{}] F64Map", i),
                     InputInfo::VecF64 { dimension } => {
                         println!("  [{}] VecF64({})", i, dimension);
                     }
@@ -395,6 +400,7 @@ fn print_info_human(output: &InfoOutput) {
                     OutputInfo::FeaMesh => println!("  [{}] FEA Mesh", i),
                     OutputInfo::TriMesh => println!("  [{}] Triangle Mesh", i),
                     OutputInfo::Subspace => println!("  [{}] Subspace", i),
+                    OutputInfo::F64Map => println!("  [{}] F64Map", i),
                 }
             }
         }

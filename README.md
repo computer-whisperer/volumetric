@@ -48,7 +48,7 @@ The host application manages the lifecycle of models and operators:
 
 ## Available Operators
 
-Operators are divided into two categories:
+Operators are grouped by the kind of data they transform or produce:
 
 ### Transform Operators
 Transform operators take an existing model and produce a modified version:
@@ -68,7 +68,22 @@ Generator operators create new models from configuration or external data:
 | `rectangular_prism` | Creates a box shape | CBOR config: `{width, height, depth}` |
 | `stl_import` | Converts STL mesh to volumetric model | STL blob + CBOR config: `{scale, translate, center}` |
 | `heightmap_extrude` | Extrudes a heightmap image to 3D | Image blob + CBOR config: `{width, depth, height, clip}` |
-| `lua_script` | Custom density function via Lua script | Model WASM + Lua source code |
+| `lua_script` | Custom occupancy model via restricted Lua | Lua source + optional routed `F64Map` parameters |
+
+### Data Operators
+
+Data operators compose typed values in the project DAG without invoking the model evaluator:
+
+| Operator | Description | Inputs |
+|----------|-------------|--------|
+| `f64_map_merge` | Composes shared numeric project data; later maps override earlier keys | Up to five routed `F64Map` inputs |
+
+The construction catalog also includes `subspace_fit`, which locates a local point, edge line,
+or tangent plane from a seed using bounded model probes and optional metric-grid snapping.
+
+The analysis catalog includes `sdf`, which preserves a model's occupancy while adding a
+world-space truncated signed-distance channel. Its configured band extends outside the part
+bounds, and the positive clamp value remains defined globally beyond the sampled field.
 
 ## Demo Models
 

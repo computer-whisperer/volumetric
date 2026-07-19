@@ -23,7 +23,7 @@ fn panic(_info: &PanicInfo) -> ! {
     core::arch::wasm32::unreachable()
 }
 
-const BOUND: f64 = 3.14159265; // ~pi
+const BOUND: f64 = core::f64::consts::PI;
 const THICKNESS: f64 = 0.28;
 
 const MIN_X: f64 = -BOUND;
