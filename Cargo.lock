@@ -348,6 +348,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "brep_core"
+version = "0.1.0"
+
+[[package]]
 name = "brim_model_template"
 version = "0.1.0"
 dependencies = [

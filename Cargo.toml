@@ -57,6 +57,7 @@ members = [
     "crates/deform_model_template",
     "crates/operators/fea_deform_operator",
     "crates/fea_core",
+    "crates/brep_core",
     "crates/trimesh_model_core",
     "crates/trimesh_model_template",
     "crates/trimesh_height_model_template",
