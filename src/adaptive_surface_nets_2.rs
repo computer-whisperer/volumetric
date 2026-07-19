@@ -1786,19 +1786,28 @@ fn stage3_topology_finalization(
     }
 }
 
-/// Normalize a vector, returning (0,1,0) if the vector is too small.
-pub(crate) fn normalize_or_default(v: (f64, f64, f64)) -> (f32, f32, f32) {
-    let len_sq = v.0 * v.0 + v.1 * v.1 + v.2 * v.2;
-    if len_sq > 1e-12 {
-        let inv_len = 1.0 / len_sq.sqrt();
-        (
-            (v.0 * inv_len) as f32,
-            (v.1 * inv_len) as f32,
-            (v.2 * inv_len) as f32,
-        )
-    } else {
-        (0.0, 1.0, 0.0) // Default up vector
+/// Normalize a finite, nonzero vector without imposing a world-scale-dependent
+/// magnitude cutoff. Scaling by the largest component first avoids overflow in
+/// `length_squared` for huge vectors and underflow for tiny (but valid) face
+/// normals from metre-scale meshes.
+fn try_normalize(v: (f64, f64, f64)) -> Option<(f64, f64, f64)> {
+    if !(v.0.is_finite() && v.1.is_finite() && v.2.is_finite()) {
+        return None;
     }
+    let scale = v.0.abs().max(v.1.abs()).max(v.2.abs());
+    if scale == 0.0 {
+        return None;
+    }
+    let scaled = (v.0 / scale, v.1 / scale, v.2 / scale);
+    let len = (scaled.0 * scaled.0 + scaled.1 * scaled.1 + scaled.2 * scaled.2).sqrt();
+    Some((scaled.0 / len, scaled.1 / len, scaled.2 / len))
+}
+
+/// Normalize a vector, returning (0,1,0) only for zero or non-finite input.
+pub(crate) fn normalize_or_default(v: (f64, f64, f64)) -> (f32, f32, f32) {
+    try_normalize(v)
+        .map(|n| (n.0 as f32, n.1 as f32, n.2 as f32))
+        .unwrap_or((0.0, 1.0, 0.0))
 }
 
 /// Convert Stage3Result to final IndexedMesh2 (without refinement).
@@ -1952,20 +1961,8 @@ where
     let mut candidates: Vec<((f64, f64, f64), RefineOutcome)> = Vec::with_capacity(4);
 
     // Primary direction: accumulated normal (if valid)
-    let dir_len_sq = search_direction.0 * search_direction.0
-        + search_direction.1 * search_direction.1
-        + search_direction.2 * search_direction.2;
-
-    if dir_len_sq >= 1e-12 {
-        let inv_len = 1.0 / dir_len_sq.sqrt();
-        candidates.push((
-            (
-                search_direction.0 * inv_len,
-                search_direction.1 * inv_len,
-                search_direction.2 * inv_len,
-            ),
-            RefineOutcome::Primary,
-        ));
+    if let Some(direction) = try_normalize(search_direction) {
+        candidates.push((direction, RefineOutcome::Primary));
     }
 
     // Cardinal axis fallbacks
@@ -2024,13 +2021,10 @@ where
 /// is aligned with a coordinate axis.
 fn orthonormal_basis_perpendicular_to(n: (f64, f64, f64)) -> ((f64, f64, f64), (f64, f64, f64)) {
     // Normalize input
-    let len_sq = n.0 * n.0 + n.1 * n.1 + n.2 * n.2;
-    if len_sq < 1e-12 {
+    let Some(n) = try_normalize(n) else {
         // Degenerate - return arbitrary basis
         return ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0));
-    }
-    let inv_len = 1.0 / len_sq.sqrt();
-    let n = (n.0 * inv_len, n.1 * inv_len, n.2 * inv_len);
+    };
 
     // Choose the axis that n is least aligned with
     let abs_x = n.0.abs();
@@ -2086,19 +2080,7 @@ where
     F: SamplerFn,
 {
     // Normalize direction
-    let dir_len_sq =
-        search_dir.0 * search_dir.0 + search_dir.1 * search_dir.1 + search_dir.2 * search_dir.2;
-
-    if dir_len_sq < 1e-12 {
-        return None;
-    }
-
-    let inv_len = 1.0 / dir_len_sq.sqrt();
-    let dir = (
-        search_dir.0 * inv_len,
-        search_dir.1 * inv_len,
-        search_dir.2 * inv_len,
-    );
+    let dir = try_normalize(search_dir)?;
 
     // Sample at start position
     let start_inside = sample_is_inside(sampler, start_pos.0, start_pos.1, start_pos.2, stats);
@@ -2171,16 +2153,10 @@ fn fit_plane_to_points(points: &[(f64, f64, f64)]) -> ((f64, f64, f64), f64) {
             sum_normal.2 += normal.2;
         }
 
-        let len = (sum_normal.0 * sum_normal.0
-            + sum_normal.1 * sum_normal.1
-            + sum_normal.2 * sum_normal.2)
-            .sqrt();
-        if len < 1e-12 {
+        let Some(fitted_normal) = try_normalize(sum_normal) else {
             // Degenerate - all points collinear
             return ((0.0, 1.0, 0.0), f64::MAX);
-        }
-
-        let fitted_normal = (sum_normal.0 / len, sum_normal.1 / len, sum_normal.2 / len);
+        };
 
         // Compute residual: sum of squared distances from each point to the fitted plane
         let mut residual = 0.0;
@@ -2230,11 +2206,10 @@ fn fit_plane_to_points(points: &[(f64, f64, f64)]) -> ((f64, f64, f64), f64) {
             m01 * v1.0 + m11 * v1.1 + m12 * v1.2,
             m02 * v1.0 + m12 * v1.1 + m22 * v1.2,
         );
-        let len = (new_v.0 * new_v.0 + new_v.1 * new_v.1 + new_v.2 * new_v.2).sqrt();
-        if len < 1e-12 {
+        let Some(normalized) = try_normalize(new_v) else {
             break;
-        }
-        v1 = (new_v.0 / len, new_v.1 / len, new_v.2 / len);
+        };
+        v1 = normalized;
     }
 
     // Deflate: M2 = M - λ1 * v1 * v1^T where λ1 = v1^T * M * v1
@@ -2259,9 +2234,8 @@ fn fit_plane_to_points(points: &[(f64, f64, f64)]) -> ((f64, f64, f64), f64) {
     } else {
         (-v1.1 * v1.0, 1.0 - v1.1 * v1.1, -v1.1 * v1.2)
     };
-    let len2 = (v2.0 * v2.0 + v2.1 * v2.1 + v2.2 * v2.2).sqrt();
-    if len2 > 1e-12 {
-        v2 = (v2.0 / len2, v2.1 / len2, v2.2 / len2);
+    if let Some(normalized) = try_normalize(v2) {
+        v2 = normalized;
     }
 
     for _ in 0..10 {
@@ -2270,19 +2244,17 @@ fn fit_plane_to_points(points: &[(f64, f64, f64)]) -> ((f64, f64, f64), f64) {
             d01 * v2.0 + d11 * v2.1 + d12 * v2.2,
             d02 * v2.0 + d12 * v2.1 + d22 * v2.2,
         );
-        let len = (new_v.0 * new_v.0 + new_v.1 * new_v.1 + new_v.2 * new_v.2).sqrt();
-        if len < 1e-12 {
+        let Some(normalized) = try_normalize(new_v) else {
             break;
-        }
-        v2 = (new_v.0 / len, new_v.1 / len, new_v.2 / len);
+        };
+        v2 = normalized;
         // Orthogonalize against v1
         let dot = v2.0 * v1.0 + v2.1 * v1.1 + v2.2 * v1.2;
         v2 = (v2.0 - dot * v1.0, v2.1 - dot * v1.1, v2.2 - dot * v1.2);
-        let len = (v2.0 * v2.0 + v2.1 * v2.1 + v2.2 * v2.2).sqrt();
-        if len < 1e-12 {
+        let Some(normalized) = try_normalize(v2) else {
             break;
-        }
-        v2 = (v2.0 / len, v2.1 / len, v2.2 / len);
+        };
+        v2 = normalized;
     }
 
     // The normal is perpendicular to both v1 and v2
@@ -2291,11 +2263,9 @@ fn fit_plane_to_points(points: &[(f64, f64, f64)]) -> ((f64, f64, f64), f64) {
         v1.2 * v2.0 - v1.0 * v2.2,
         v1.0 * v2.1 - v1.1 * v2.0,
     );
-    let len = (normal.0 * normal.0 + normal.1 * normal.1 + normal.2 * normal.2).sqrt();
-    if len < 1e-12 {
+    let Some(v) = try_normalize(normal) else {
         return ((0.0, 1.0, 0.0), f64::MAX);
-    }
-    let v = (normal.0 / len, normal.1 / len, normal.2 / len);
+    };
 
     // Compute residual: sum of squared distances to the fitted plane
     let mut residual = 0.0;
@@ -2347,18 +2317,9 @@ where
     F: SamplerFn,
 {
     // Normalize initial normal (our prior)
-    let n_len_sq = initial_normal.0 * initial_normal.0
-        + initial_normal.1 * initial_normal.1
-        + initial_normal.2 * initial_normal.2;
-    if n_len_sq < 1e-12 {
+    let Some(n) = try_normalize(initial_normal) else {
         return (0.0, 1.0, 0.0); // Degenerate - return up
-    }
-    let n_inv_len = 1.0 / n_len_sq.sqrt();
-    let n = (
-        initial_normal.0 * n_inv_len,
-        initial_normal.1 * n_inv_len,
-        initial_normal.2 * n_inv_len,
-    );
+    };
 
     // Compute tangent basis
     let (t1, t2) = orthonormal_basis_perpendicular_to(n);
@@ -2483,18 +2444,9 @@ where
     F: SamplerFn,
 {
     // Normalize initial normal
-    let n_len_sq = initial_normal.0 * initial_normal.0
-        + initial_normal.1 * initial_normal.1
-        + initial_normal.2 * initial_normal.2;
-    if n_len_sq < 1e-12 {
+    let Some(n) = try_normalize(initial_normal) else {
         return (0.0, 1.0, 0.0);
-    }
-    let n_inv_len = 1.0 / n_len_sq.sqrt();
-    let n = (
-        initial_normal.0 * n_inv_len,
-        initial_normal.1 * n_inv_len,
-        initial_normal.2 * n_inv_len,
-    );
+    };
 
     // Compute tangent basis
     let (t1, t2) = orthonormal_basis_perpendicular_to(n);
@@ -4119,6 +4071,85 @@ mod tests {
             normal.2.abs() < 0.1,
             "Normal Z component should be near zero, got {}",
             normal.2
+        );
+    }
+
+    #[test]
+    fn tiny_face_normals_preserve_their_direction() {
+        // A 0.1 mm right triangle has an area-weighted face normal of 1e-8.
+        // The old absolute 1e-12 squared-length cutoff replaced this valid +Z
+        // direction with the arbitrary +Y fallback.
+        let vertices = [(0.0, 0.0, 0.0), (1.0e-4, 0.0, 0.0), (0.0, 1.0e-4, 0.0)];
+        let accumulated = recompute_accumulated_normals(&vertices, &[0, 1, 2]);
+        for normal in accumulated {
+            assert_eq!(normalize_or_default(normal), (0.0, 0.0, 1.0));
+        }
+    }
+
+    #[test]
+    fn normal_refinement_accepts_tiny_accumulated_vectors() {
+        let sphere = |x: f64, y: f64, z: f64| -> f32 {
+            if x * x + y * y + z * z < 1.0e-4 {
+                1.0
+            } else {
+                0.0
+            }
+        };
+        let stats = SamplingStats::default();
+        let normal = refine_normal_via_probing(
+            (0.01, 0.0, 0.0),
+            (1.0e-10, 0.0, 0.0),
+            0.001,
+            0.002,
+            8,
+            &sphere,
+            &stats,
+        );
+        assert!(normal.0 > 0.9, "expected +X normal, got {normal:?}");
+        assert!(normal.1.abs() < 0.1 && normal.2.abs() < 0.1);
+    }
+
+    #[test]
+    fn metre_scale_pipeline_preserves_normal_directions() {
+        let config = AdaptiveMeshConfig2 {
+            base_resolution: 4,
+            discovery_probes: 0,
+            max_depth: 3,
+            vertex_refinement_iterations: 4,
+            normal_sample_iterations: 0,
+            ..Default::default()
+        };
+        let sphere = |x: f64, y: f64, z: f64| -> f32 {
+            if x * x + y * y + z * z < 1.0e-4 {
+                1.0
+            } else {
+                0.0
+            }
+        };
+
+        let result = adaptive_surface_nets_2(
+            sphere,
+            (-0.015, -0.015, -0.015),
+            (0.015, 0.015, 0.015),
+            &config,
+        );
+
+        assert!(!result.mesh.normals.is_empty());
+        assert!(
+            result
+                .mesh
+                .normals
+                .iter()
+                .any(|normal| normal.0.abs() > 0.5),
+            "metre-scale face normals collapsed away from the X axis"
+        );
+        assert!(
+            result
+                .mesh
+                .normals
+                .iter()
+                .any(|normal| normal.2.abs() > 0.5),
+            "metre-scale face normals collapsed away from the Z axis"
         );
     }
 
