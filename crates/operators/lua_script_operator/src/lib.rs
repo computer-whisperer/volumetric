@@ -1699,192 +1699,170 @@ fn compile_lua_to_wasm_with_parameters(
         Ok(())
     }
 
-    // Emit IR statements
-    fn emit_ir_stmts(
+    /// Shared context for statement emission: where `return` branches to,
+    /// which local carries the function result, and interior-mutable access
+    /// to the module local pool plus the first error raised inside walrus's
+    /// closure-based sequence builders (closures cannot propagate `Result`).
+    struct EmitEnv<'a, 'm> {
+        func_ids: &'a HashMap<String, walrus::FunctionId>,
+        module_locals: &'a std::cell::RefCell<&'m mut walrus::ModuleLocals>,
+        error: &'a std::cell::RefCell<Option<CompileError>>,
+        result_local: walrus::LocalId,
+        return_target: walrus::ir::InstrSeqId,
+    }
+
+    impl EmitEnv<'_, '_> {
+        fn fail(&self, error: CompileError) {
+            let mut slot = self.error.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(error);
+            }
+        }
+    }
+
+    /// Emit a statement sequence. `return` anywhere sets the result local
+    /// and branches to the function's exit block, so statements after a
+    /// conditional return keep executing on the untaken path; `break`
+    /// branches to the innermost loop's exit. Locals declared inside a
+    /// block stay scoped to it (branch/body maps are clones), while
+    /// assignments to outer locals write through the shared `LocalId`s.
+    fn emit_stmt_seq(
         b: &mut InstrSeqBuilder,
-        func_ids: &HashMap<String, walrus::FunctionId>,
         stmts: &[IrStmt],
+        env: &EmitEnv<'_, '_>,
         params: &[String],
         locals: &mut HashMap<String, walrus::LocalId>,
-        module_locals: &mut walrus::ModuleLocals,
-    ) -> Result<Option<IrExpr>, CompileError> {
+        loop_exit: Option<walrus::ir::InstrSeqId>,
+    ) {
         for stmt in stmts {
+            if env.error.borrow().is_some() {
+                return;
+            }
             match stmt {
                 IrStmt::LocalAssign { name, value } => {
+                    // The initializer sees the enclosing scope, not the new
+                    // local (`local x = x` reads the outer x).
+                    if let Err(error) = emit_ir_expr(b, env.func_ids, value, params, locals) {
+                        env.fail(error);
+                        return;
+                    }
                     let local_id = if let Some(&id) = locals.get(name) {
                         id
                     } else {
-                        let id = module_locals.add(ValType::F64);
+                        let id = env.module_locals.borrow_mut().add(ValType::F64);
                         locals.insert(name.clone(), id);
                         id
                     };
-                    emit_ir_expr(b, func_ids, value, params, locals)?;
                     b.local_set(local_id);
                 }
                 IrStmt::Assign { name, value } => {
-                    if let Some(&local_id) = locals.get(name) {
-                        emit_ir_expr(b, func_ids, value, params, locals)?;
-                        b.local_set(local_id);
-                    } else {
-                        return Err(CompileError::Unsupported(format!(
+                    let Some(&local_id) = locals.get(name) else {
+                        env.fail(CompileError::Unsupported(format!(
                             "assignment to unknown variable: {}",
                             name
                         )));
+                        return;
+                    };
+                    if let Err(error) = emit_ir_expr(b, env.func_ids, value, params, locals) {
+                        env.fail(error);
+                        return;
                     }
+                    b.local_set(local_id);
+                }
+                IrStmt::Return(expr) => {
+                    if let Err(error) = emit_ir_expr(b, env.func_ids, expr, params, locals) {
+                        env.fail(error);
+                        return;
+                    }
+                    b.local_set(env.result_local);
+                    b.br(env.return_target);
+                    return;
                 }
                 IrStmt::If {
                     cond,
                     then_body,
                     else_body,
                 } => {
-                    emit_ir_condition(b, func_ids, cond, params, locals)?;
-                    let params_vec: Vec<String> = params.to_vec();
-                    let then_locals = locals.clone();
-                    let else_locals = locals.clone();
-                    let func_ids_ref = func_ids;
+                    if let Err(error) = emit_ir_condition(b, env.func_ids, cond, params, locals) {
+                        env.fail(error);
+                        return;
+                    }
+                    let mut then_locals = locals.clone();
+                    let mut else_locals = locals.clone();
                     b.if_else(
-                        ValType::F64,
-                        |then_block| {
-                            // We need a dummy ModuleLocals for nested calls - this is a limitation
-                            // For now, we'll handle simple if-then-else with returns
-                            if let Some(IrStmt::Return(expr)) = then_body.first() {
-                                emit_ir_expr(
-                                    then_block,
-                                    func_ids_ref,
-                                    expr,
-                                    &params_vec,
-                                    &then_locals,
-                                )
-                                .expect("emit in then branch failed");
-                            } else {
-                                then_block.f64_const(0.0); // fallback
-                            }
+                        None,
+                        |then_b| {
+                            emit_stmt_seq(
+                                then_b,
+                                then_body,
+                                env,
+                                params,
+                                &mut then_locals,
+                                loop_exit,
+                            )
                         },
-                        |else_block| {
-                            if let Some(IrStmt::Return(expr)) = else_body.first() {
-                                emit_ir_expr(
-                                    else_block,
-                                    func_ids_ref,
-                                    expr,
-                                    &params_vec,
-                                    &else_locals,
-                                )
-                                .expect("emit in else branch failed");
-                            } else {
-                                else_block.f64_const(0.0); // fallback
-                            }
+                        |else_b| {
+                            emit_stmt_seq(
+                                else_b,
+                                else_body,
+                                env,
+                                params,
+                                &mut else_locals,
+                                loop_exit,
+                            )
                         },
                     );
-                    return Ok(None); // If statement handled the return
                 }
                 IrStmt::While { cond, body } => {
-                    let params_vec: Vec<String> = params.to_vec();
-                    let loop_locals = locals.clone();
-                    let cond = cond.clone();
-                    let body = body.clone();
-                    let func_ids_ref = func_ids;
-
-                    // While loop structure: block { loop { if !cond br exit; body; br loop } }
-                    b.block(None, |exit_block| {
-                        let exit_id = exit_block.id();
-                        exit_block.loop_(None, |loop_block| {
-                            let loop_id = loop_block.id();
-
-                            // Emit condition check - exit if false
-                            emit_ir_condition(
-                                loop_block,
-                                func_ids_ref,
-                                &cond,
-                                &params_vec,
-                                &loop_locals,
-                            )
-                            .expect("emit while condition failed");
-                            loop_block.unop(UnaryOp::I32Eqz); // Invert: exit if condition is false
-                            loop_block.br_if(exit_id);
-
-                            // Emit body statements
-                            for stmt in &body {
-                                match stmt {
-                                    IrStmt::LocalAssign { name, value }
-                                    | IrStmt::Assign { name, value } => {
-                                        if let Some(&local_id) = loop_locals.get(name) {
-                                            emit_ir_expr(
-                                                loop_block,
-                                                func_ids_ref,
-                                                value,
-                                                &params_vec,
-                                                &loop_locals,
-                                            )
-                                            .expect("emit while body assignment failed");
-                                            loop_block.local_set(local_id);
-                                        }
-                                        // If local doesn't exist, skip (limitation: can't create new locals in loop)
-                                    }
-                                    IrStmt::Break => {
-                                        loop_block.br(exit_id);
-                                    }
-                                    _ => {
-                                        // Skip unsupported statements in loop body for now
-                                    }
-                                }
+                    b.block(None, |exit_b| {
+                        let exit_id = exit_b.id();
+                        exit_b.loop_(None, |loop_b| {
+                            let loop_id = loop_b.id();
+                            if let Err(error) =
+                                emit_ir_condition(loop_b, env.func_ids, cond, params, locals)
+                            {
+                                env.fail(error);
+                                return;
                             }
-
-                            // Continue to next iteration
-                            loop_block.br(loop_id);
+                            loop_b.unop(UnaryOp::I32Eqz);
+                            loop_b.br_if(exit_id);
+                            let mut body_locals = locals.clone();
+                            emit_stmt_seq(
+                                loop_b,
+                                body,
+                                env,
+                                params,
+                                &mut body_locals,
+                                Some(exit_id),
+                            );
+                            loop_b.br(loop_id);
                         });
                     });
                 }
                 IrStmt::RepeatUntil { body, cond } => {
-                    let params_vec: Vec<String> = params.to_vec();
-                    let loop_locals = locals.clone();
-                    let cond = cond.clone();
-                    let body = body.clone();
-                    let func_ids_ref = func_ids;
-
-                    // Repeat-until structure: loop { body; if cond br exit; br loop }
-                    // Different from while: body executes first, then condition checked
-                    b.block(None, |exit_block| {
-                        let exit_id = exit_block.id();
-                        exit_block.loop_(None, |loop_block| {
-                            let loop_id = loop_block.id();
-
-                            // Emit body statements first (always executes at least once)
-                            for stmt in &body {
-                                match stmt {
-                                    IrStmt::LocalAssign { name, value }
-                                    | IrStmt::Assign { name, value } => {
-                                        if let Some(&local_id) = loop_locals.get(name) {
-                                            emit_ir_expr(
-                                                loop_block,
-                                                func_ids_ref,
-                                                value,
-                                                &params_vec,
-                                                &loop_locals,
-                                            )
-                                            .expect("emit repeat body assignment failed");
-                                            loop_block.local_set(local_id);
-                                        }
-                                    }
-                                    IrStmt::Break => {
-                                        loop_block.br(exit_id);
-                                    }
-                                    _ => {}
-                                }
+                    b.block(None, |exit_b| {
+                        let exit_id = exit_b.id();
+                        exit_b.loop_(None, |loop_b| {
+                            let loop_id = loop_b.id();
+                            // The until-condition sees the body's locals
+                            // (Lua's repeat-until scope rule).
+                            let mut body_locals = locals.clone();
+                            emit_stmt_seq(
+                                loop_b,
+                                body,
+                                env,
+                                params,
+                                &mut body_locals,
+                                Some(exit_id),
+                            );
+                            if let Err(error) =
+                                emit_ir_condition(loop_b, env.func_ids, cond, params, &body_locals)
+                            {
+                                env.fail(error);
+                                return;
                             }
-
-                            // Check condition - exit if true (until condition met)
-                            emit_ir_condition(
-                                loop_block,
-                                func_ids_ref,
-                                &cond,
-                                &params_vec,
-                                &loop_locals,
-                            )
-                            .expect("emit repeat-until condition failed");
-                            loop_block.br_if(exit_id);
-
-                            // Continue to next iteration
-                            loop_block.br(loop_id);
+                            loop_b.br_if(exit_id);
+                            loop_b.br(loop_id);
                         });
                     });
                 }
@@ -1895,101 +1873,110 @@ fn compile_lua_to_wasm_with_parameters(
                     step,
                     body,
                 } => {
-                    // Create local for loop variable
-                    let loop_var_id = module_locals.add(ValType::F64);
-                    locals.insert(var.clone(), loop_var_id);
+                    let loop_var_id = env.module_locals.borrow_mut().add(ValType::F64);
+                    let end_var_id = env.module_locals.borrow_mut().add(ValType::F64);
+                    let step_var_id = env.module_locals.borrow_mut().add(ValType::F64);
 
-                    // Also create locals for end and step to avoid re-evaluating
-                    let end_var_id = module_locals.add(ValType::F64);
-                    let step_var_id = module_locals.add(ValType::F64);
-
-                    // Initialize loop variable with start value
-                    emit_ir_expr(b, func_ids, start, params, locals)?;
+                    if let Err(error) = emit_ir_expr(b, env.func_ids, start, params, locals) {
+                        env.fail(error);
+                        return;
+                    }
                     b.local_set(loop_var_id);
-
-                    // Initialize end value
-                    emit_ir_expr(b, func_ids, end, params, locals)?;
+                    if let Err(error) = emit_ir_expr(b, env.func_ids, end, params, locals) {
+                        env.fail(error);
+                        return;
+                    }
                     b.local_set(end_var_id);
-
-                    // Initialize step value (default to 1.0)
                     if let Some(step_expr) = step {
-                        emit_ir_expr(b, func_ids, step_expr, params, locals)?;
+                        if let Err(error) = emit_ir_expr(b, env.func_ids, step_expr, params, locals)
+                        {
+                            env.fail(error);
+                            return;
+                        }
                     } else {
                         b.f64_const(1.0);
                     }
                     b.local_set(step_var_id);
 
-                    let params_vec: Vec<String> = params.to_vec();
-                    let loop_locals = locals.clone();
-                    let body = body.clone();
-                    let func_ids_ref = func_ids;
+                    b.block(None, |exit_b| {
+                        let exit_id = exit_b.id();
+                        exit_b.loop_(None, |loop_b| {
+                            let loop_id = loop_b.id();
+                            // Exit when (i - end) * step > 0: covers both
+                            // step signs with one comparison.
+                            loop_b.local_get(loop_var_id);
+                            loop_b.local_get(end_var_id);
+                            loop_b.binop(BinaryOp::F64Sub);
+                            loop_b.local_get(step_var_id);
+                            loop_b.binop(BinaryOp::F64Mul);
+                            loop_b.f64_const(0.0);
+                            loop_b.binop(BinaryOp::F64Gt);
+                            loop_b.br_if(exit_id);
 
-                    // For loop structure: block { loop { check; body; increment; br loop } }
-                    b.block(None, |exit_block| {
-                        let exit_id = exit_block.id();
-                        exit_block.loop_(None, |loop_block| {
-                            let loop_id = loop_block.id();
+                            let mut body_locals = locals.clone();
+                            body_locals.insert(var.clone(), loop_var_id);
+                            emit_stmt_seq(
+                                loop_b,
+                                body,
+                                env,
+                                params,
+                                &mut body_locals,
+                                Some(exit_id),
+                            );
 
-                            // Check condition based on step sign:
-                            // if step > 0: exit if i > end
-                            // if step < 0: exit if i < end
-                            // For simplicity, we implement: exit if (i - end) * step > 0
-                            // This works for both positive and negative steps
-                            loop_block.local_get(loop_var_id);
-                            loop_block.local_get(end_var_id);
-                            loop_block.binop(BinaryOp::F64Sub); // i - end
-                            loop_block.local_get(step_var_id);
-                            loop_block.binop(BinaryOp::F64Mul); // (i - end) * step
-                            loop_block.f64_const(0.0);
-                            loop_block.binop(BinaryOp::F64Gt); // > 0 means we should exit
-                            loop_block.br_if(exit_id);
-
-                            // Emit body statements
-                            for stmt in &body {
-                                match stmt {
-                                    IrStmt::LocalAssign { name, value }
-                                    | IrStmt::Assign { name, value } => {
-                                        if let Some(&local_id) = loop_locals.get(name) {
-                                            emit_ir_expr(
-                                                loop_block,
-                                                func_ids_ref,
-                                                value,
-                                                &params_vec,
-                                                &loop_locals,
-                                            )
-                                            .expect("emit for body assignment failed");
-                                            loop_block.local_set(local_id);
-                                        }
-                                    }
-                                    IrStmt::Break => {
-                                        loop_block.br(exit_id);
-                                    }
-                                    _ => {}
-                                }
-                            }
-
-                            // Increment: i = i + step
-                            loop_block.local_get(loop_var_id);
-                            loop_block.local_get(step_var_id);
-                            loop_block.binop(BinaryOp::F64Add);
-                            loop_block.local_set(loop_var_id);
-
-                            // Continue to next iteration
-                            loop_block.br(loop_id);
+                            loop_b.local_get(loop_var_id);
+                            loop_b.local_get(step_var_id);
+                            loop_b.binop(BinaryOp::F64Add);
+                            loop_b.local_set(loop_var_id);
+                            loop_b.br(loop_id);
                         });
                     });
                 }
-                IrStmt::Break => {
-                    // Break at the top level (outside loop body handling) is an error
-                    // Loop bodies handle break directly using exit_id
-                    return Err(CompileError::Unsupported("break outside of loop".into()));
-                }
-                IrStmt::Return(expr) => {
-                    return Ok(Some(expr.clone()));
-                }
+                IrStmt::Break => match loop_exit {
+                    Some(exit_id) => {
+                        b.br(exit_id);
+                        return;
+                    }
+                    None => {
+                        env.fail(CompileError::Unsupported("break outside of loop".into()));
+                        return;
+                    }
+                },
             }
         }
-        Ok(None)
+    }
+
+    /// Emit a complete function body: a result local (0.0 default for a
+    /// body that falls off the end), an exit block that `return` branches
+    /// to, then the result value on the stack.
+    fn emit_function_body(
+        ib: &mut InstrSeqBuilder,
+        func_ids: &HashMap<String, walrus::FunctionId>,
+        body: &[IrStmt],
+        params: &[String],
+        locals: &mut HashMap<String, walrus::LocalId>,
+        module_locals: &mut walrus::ModuleLocals,
+    ) -> Result<(), CompileError> {
+        let result_local = module_locals.add(ValType::F64);
+        ib.f64_const(0.0);
+        ib.local_set(result_local);
+        let error = std::cell::RefCell::new(None);
+        let module_locals_cell = std::cell::RefCell::new(module_locals);
+        ib.block(None, |body_b| {
+            let env = EmitEnv {
+                func_ids,
+                module_locals: &module_locals_cell,
+                error: &error,
+                result_local,
+                return_target: body_b.id(),
+            };
+            emit_stmt_seq(body_b, body, &env, params, locals, None);
+        });
+        if let Some(error) = error.into_inner() {
+            return Err(error);
+        }
+        ib.local_get(result_local);
+        Ok(())
     }
 
     // Generate helpers after their dependencies, then generate the required
@@ -2017,7 +2004,7 @@ fn compile_lua_to_wasm_with_parameters(
 
         let mut ib = fb.func_body();
         initialize_constants(&mut ib, &constant_initializers);
-        let ret_expr = emit_ir_stmts(
+        emit_function_body(
             &mut ib,
             &func_ids,
             &ir_func.body,
@@ -2025,9 +2012,6 @@ fn compile_lua_to_wasm_with_parameters(
             &mut locals_map,
             &mut module.locals,
         )?;
-        if let Some(expr) = ret_expr {
-            emit_ir_expr(&mut ib, &func_ids, &expr, &ir_func.params, &locals_map)?;
-        }
 
         let fid = fb.finish(param_locals, &mut module.funcs);
         func_ids.insert(fname, fid);
@@ -2059,7 +2043,7 @@ fn compile_lua_to_wasm_with_parameters(
                 }
                 let mut ib = fb.func_body();
                 initialize_constants(&mut ib, &constant_initializers);
-                let ret_expr = emit_ir_stmts(
+                emit_function_body(
                     &mut ib,
                     &func_ids,
                     &ir_func.body,
@@ -2067,9 +2051,6 @@ fn compile_lua_to_wasm_with_parameters(
                     &mut locals_map,
                     &mut module.locals,
                 )?;
-                if let Some(expr) = ret_expr {
-                    emit_ir_expr(&mut ib, &func_ids, &expr, &ir_func.params, &locals_map)?;
-                }
                 let fid = fb.finish(param_locals, &mut module.funcs);
                 internal_func_ids.insert(fname.to_string(), fid);
             }
@@ -2085,7 +2066,7 @@ fn compile_lua_to_wasm_with_parameters(
                     add_constant_locals(&mut module.locals, &constants);
                 let mut ib = fb.func_body();
                 initialize_constants(&mut ib, &constant_initializers);
-                let ret_expr = emit_ir_stmts(
+                emit_function_body(
                     &mut ib,
                     &func_ids,
                     &ir_func.body,
@@ -2093,9 +2074,6 @@ fn compile_lua_to_wasm_with_parameters(
                     &mut locals_map,
                     &mut module.locals,
                 )?;
-                if let Some(expr) = ret_expr {
-                    emit_ir_expr(&mut ib, &func_ids, &expr, &ir_func.params, &locals_map)?;
-                }
                 let fid = fb.finish(vec![], &mut module.funcs);
                 internal_func_ids.insert(fname.to_string(), fid);
             }
@@ -2275,6 +2253,149 @@ pub extern "C" fn get_metadata() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Instantiate a compiled 2D script and evaluate `sample` at (x, y).
+    /// Compile-and-reparse checks missed behavioral bugs (the old emitter
+    /// silently dropped statements after an `if`); these execute for real.
+    fn sample_2d(bytes: &[u8], x: f64, y: f64) -> f32 {
+        let engine = wasmtime::Engine::default();
+        let module = wasmtime::Module::new(&engine, bytes).expect("wasmtime loads module");
+        let mut store = wasmtime::Store::new(&engine, ());
+        let instance =
+            wasmtime::Instance::new(&mut store, &module, &[]).expect("instantiate model");
+        let memory = instance.get_memory(&mut store, "memory").expect("memory");
+        let io_ptr = instance
+            .get_typed_func::<(), i32>(&mut store, "get_io_ptr")
+            .expect("get_io_ptr")
+            .call(&mut store, ())
+            .expect("io ptr") as usize;
+        let mut buf = [0u8; 16];
+        buf[..8].copy_from_slice(&x.to_le_bytes());
+        buf[8..].copy_from_slice(&y.to_le_bytes());
+        memory.write(&mut store, io_ptr, &buf).expect("write pos");
+        instance
+            .get_typed_func::<i32, f32>(&mut store, "sample")
+            .expect("sample")
+            .call(&mut store, io_ptr as i32)
+            .expect("sample call")
+    }
+
+    const BOUNDS_2D: &str = "
+function get_bounds_min_x() return -1.0 end
+function get_bounds_max_x() return 1.0 end
+function get_bounds_min_y() return -1.0 end
+function get_bounds_max_y() return 1.0 end
+";
+
+    #[test]
+    fn statements_after_an_if_execute_on_the_untaken_path() {
+        let src = format!(
+            "function is_inside(x, y)
+    if x * x > 0.0001 then
+        return 0.0
+    end
+    return 1.0
+end
+{BOUNDS_2D}"
+        );
+        let wasm = compile_lua_to_wasm(&src).expect("compile");
+        assert_eq!(sample_2d(&wasm, 0.5, 0.0), 0.0);
+        assert_eq!(sample_2d(&wasm, 0.005, 0.0), 1.0);
+    }
+
+    #[test]
+    fn nested_ifs_and_multi_statement_branches_execute() {
+        let src = format!(
+            "function is_inside(x, y)
+    local qx = math.max(math.abs(x) - 0.5, 0.0)
+    local qy = math.max(math.abs(y) - 0.5, 0.0)
+    if x >= 0.0 then
+        if qx * qx + qy * qy > 0.01 then
+            return 0.0
+        end
+        return 1.0
+    end
+    if y >= 0.0 then
+        local inner = qx + qy
+        if inner > 0.2 then
+            return 0.0
+        end
+        return 1.0
+    end
+    return 0.0
+end
+{BOUNDS_2D}"
+        );
+        let wasm = compile_lua_to_wasm(&src).expect("compile");
+        // x >= 0 arm: rounded-box test.
+        assert_eq!(sample_2d(&wasm, 0.5, 0.0), 1.0);
+        assert_eq!(sample_2d(&wasm, 0.7, 0.7), 0.0);
+        // x < 0, y >= 0 arm.
+        assert_eq!(sample_2d(&wasm, -0.55, 0.1), 1.0);
+        assert_eq!(sample_2d(&wasm, -0.9, 0.1), 0.0);
+        // x < 0, y < 0 falls through both.
+        assert_eq!(sample_2d(&wasm, -0.5, -0.5), 0.0);
+    }
+
+    #[test]
+    fn return_inside_a_loop_exits_the_function() {
+        let src = format!(
+            "function is_inside(x, y)
+    for i = 1.0, 10.0 do
+        if i * 0.1 > x then
+            return 1.0
+        end
+    end
+    return 0.0
+end
+{BOUNDS_2D}"
+        );
+        let wasm = compile_lua_to_wasm(&src).expect("compile");
+        assert_eq!(sample_2d(&wasm, 0.35, 0.0), 1.0);
+        assert_eq!(sample_2d(&wasm, 2.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn break_then_post_loop_statements_execute() {
+        let src = format!(
+            "function is_inside(x, y)
+    local acc = 0.0
+    while true do
+        acc = acc + 0.25
+        if acc > x then
+            break
+        end
+    end
+    if acc > 0.6 then
+        return 1.0
+    end
+    return 0.0
+end
+{BOUNDS_2D}"
+        );
+        let wasm = compile_lua_to_wasm(&src).expect("compile");
+        // x = 0.6: loop runs until acc = 0.75 > 0.6 -> 1.0.
+        assert_eq!(sample_2d(&wasm, 0.6, 0.0), 1.0);
+        // x = 0.1: acc = 0.25 -> 0.0.
+        assert_eq!(sample_2d(&wasm, 0.1, 0.0), 0.0);
+    }
+
+    #[test]
+    fn branch_assignment_to_outer_local_persists() {
+        let src = format!(
+            "function is_inside(x, y)
+    local s = 0.0
+    if x > 0.0 then
+        s = 1.0
+    end
+    return s
+end
+{BOUNDS_2D}"
+        );
+        let wasm = compile_lua_to_wasm(&src).expect("compile");
+        assert_eq!(sample_2d(&wasm, 0.5, 0.0), 1.0);
+        assert_eq!(sample_2d(&wasm, -0.5, 0.0), 0.0);
+    }
 
     /// Reparse compiled output with walrus, which rejects type-invalid code
     /// sections — comparisons used as *values* (e.g. chained `and`) once
