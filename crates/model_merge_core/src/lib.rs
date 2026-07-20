@@ -219,30 +219,30 @@ impl MergeSections {
     /// when any merged module had one (bulk-memory requirement).
     pub fn finish(self, exports: &wasm_encoder::ExportSection, data_count: Option<u32>) -> Vec<u8> {
         let mut out = wasm_encoder::Module::new();
-        if self.types.len() > 0 {
+        if !self.types.is_empty() {
             out.section(&self.types);
         }
-        if self.funcs.len() > 0 {
+        if !self.funcs.is_empty() {
             out.section(&self.funcs);
         }
-        if self.tables.len() > 0 {
+        if !self.tables.is_empty() {
             out.section(&self.tables);
         }
-        if self.memories.len() > 0 {
+        if !self.memories.is_empty() {
             out.section(&self.memories);
         }
-        if self.globals.len() > 0 {
+        if !self.globals.is_empty() {
             out.section(&self.globals);
         }
         out.section(exports);
-        if self.elements.len() > 0 {
+        if !self.elements.is_empty() {
             out.section(&self.elements);
         }
         if let Some(count) = data_count {
             out.section(&wasm_encoder::DataCountSection { count });
         }
         out.section(&self.code);
-        if self.data.len() > 0 {
+        if !self.data.is_empty() {
             out.section(&self.data);
         }
         out.finish()
