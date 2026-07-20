@@ -140,12 +140,17 @@ impl NurbsSurface {
             ));
         }
         for k in self.knots_u.windows(2).chain(self.knots_v.windows(2)) {
-            if !(k[1] >= k[0]) {
+            if matches!(
+                k[1].partial_cmp(&k[0]),
+                None | Some(core::cmp::Ordering::Less)
+            ) {
                 return Err("knot vector not non-decreasing".into());
             }
         }
         for c in &self.ctrl {
-            if !(c[3] > 0.0) || c.iter().any(|v| !v.is_finite()) {
+            if !matches!(c[3].partial_cmp(&0.0), Some(core::cmp::Ordering::Greater))
+                || c.iter().any(|v| !v.is_finite())
+            {
                 return Err("control point non-finite or weight <= 0".into());
             }
         }

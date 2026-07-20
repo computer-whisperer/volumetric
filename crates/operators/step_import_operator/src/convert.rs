@@ -65,8 +65,8 @@ pub fn build_model(data: &DataSection, opts: &Options) -> Result<BRepModel, Stri
 /// then drop unreferenced solids.
 pub fn filter_instances(model: &mut BRepModel, include: &[String], exclude: &[String]) {
     model.instances.retain(|inst| {
-        let inc = include.is_empty() || include.iter().any(|l| *l == inst.label);
-        inc && !exclude.iter().any(|l| *l == inst.label)
+        let inc = include.is_empty() || include.contains(&inst.label);
+        inc && !exclude.contains(&inst.label)
     });
     let mut remap: HashMap<usize, usize> = HashMap::new();
     let mut solids = Vec::new();
@@ -154,8 +154,7 @@ impl AssemblyGraph {
                         // formation -> product -> name.
                         let name = (|| {
                             let formation = data.deref(r.args.get(2)?).ok()?;
-                            let product =
-                                data.deref(formation.simple()?.args.get(2)?).ok()?;
+                            let product = data.deref(formation.simple()?.args.get(2)?).ok()?;
                             let pr = product.simple()?;
                             let id_field = pr.args.first()?.as_str()?;
                             let name_field = pr.args.get(1).and_then(Arg::as_str);
@@ -222,7 +221,12 @@ impl AssemblyGraph {
             let child_pd = arg_at(r, 4, id)?
                 .as_ref_id()
                 .ok_or_else(|| format!("#{id}: NAUO related not a reference"))?;
-            let label = r.args.get(1).and_then(Arg::as_str).unwrap_or_default().to_string();
+            let label = r
+                .args
+                .get(1)
+                .and_then(Arg::as_str)
+                .unwrap_or_default()
+                .to_string();
             let (rep_1, rep_2, axis_1, axis_2) = *nauo_cdsr.get(&id).ok_or_else(|| {
                 format!("#{id}: assembly occurrence has no placement (missing CDSR)")
             })?;
@@ -250,10 +254,7 @@ impl AssemblyGraph {
                 label,
                 transform,
             });
-            children
-                .entry(parent_pd)
-                .or_default()
-                .push(nauos.len() - 1);
+            children.entry(parent_pd).or_default().push(nauos.len() - 1);
             child_pds.push(child_pd);
         }
 
@@ -278,7 +279,7 @@ impl AssemblyGraph {
 
 /// `record.args[idx]` with a Result instead of a panic on malformed
 /// entities.
-fn arg_at<'a>(r: &'a crate::p21::Record, idx: usize, id: u64) -> Result<&'a Arg, String> {
+fn arg_at(r: &crate::p21::Record, idx: usize, id: u64) -> Result<&Arg, String> {
     r.args
         .get(idx)
         .ok_or_else(|| format!("#{id} {}: missing argument {idx}", r.name))
@@ -287,9 +288,18 @@ fn arg_at<'a>(r: &'a crate::p21::Record, idx: usize, id: u64) -> Result<&'a Arg,
 /// Frame -> local-to-world affine.
 fn frame_affine(f: &Frame) -> Affine {
     Affine([
-        f.x[0], f.y[0], f.z[0], f.origin[0], //
-        f.x[1], f.y[1], f.z[1], f.origin[1], //
-        f.x[2], f.y[2], f.z[2], f.origin[2],
+        f.x[0],
+        f.y[0],
+        f.z[0],
+        f.origin[0], //
+        f.x[1],
+        f.y[1],
+        f.z[1],
+        f.origin[1], //
+        f.x[2],
+        f.y[2],
+        f.z[2],
+        f.origin[2],
     ])
 }
 
@@ -379,9 +389,7 @@ fn walk(
 fn convert_solid(ctx: &Ctx, msb_id: u64, opts: &Options) -> Result<Solid, String> {
     let mut faces = Vec::new();
     for face_id in ctx.solid_faces(msb_id)? {
-        faces.push(
-            convert_face(ctx, face_id, opts).map_err(|e| format!("face #{face_id}: {e}"))?,
-        );
+        faces.push(convert_face(ctx, face_id, opts).map_err(|e| format!("face #{face_id}: {e}"))?);
     }
     Ok(Solid { faces })
 }
@@ -435,7 +443,10 @@ fn lower_surface(s: StepSurface, opts: &Options) -> Result<Surface, String> {
         StepSurface::Extrusion(profile, dir) => {
             let dir_n = normalize(dir);
             match *profile {
-                Curve::Line { point, dir: line_dir } => {
+                Curve::Line {
+                    point,
+                    dir: line_dir,
+                } => {
                     let normal = cross(normalize(line_dir), dir_n);
                     if norm(normal) < 1e-9 {
                         return Err("extrusion of a line along itself".into());

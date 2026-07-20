@@ -110,7 +110,7 @@ fn basis_funs_ders(
             } else {
                 0.0
             };
-            let a2 = if r <= degree - 1 && ndu[degree][r] != 0.0 {
+            let a2 = if r < degree && ndu[degree][r] != 0.0 {
                 ndu[r][degree - 1] / ndu[degree][r]
             } else {
                 0.0

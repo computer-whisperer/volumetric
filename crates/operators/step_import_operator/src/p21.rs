@@ -140,8 +140,7 @@ pub fn parse(input: &str) -> Result<DataSection, String> {
     if !lex.eat_keyword("ISO-10303-21;") {
         return Err("not a STEP file: missing ISO-10303-21 header".into());
     }
-    let data_start = find_keyword(bytes, lex.pos, b"DATA;")
-        .ok_or("no DATA section")?;
+    let data_start = find_keyword(bytes, lex.pos, b"DATA;").ok_or("no DATA section")?;
     lex.pos = data_start + 5;
 
     let mut entities = HashMap::new();

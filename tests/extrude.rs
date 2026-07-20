@@ -178,7 +178,7 @@ fn lua_fidget_spinner_reference_has_expected_geometry() {
     let bounds = executor.get_bounds_nd().unwrap();
     assert!((bounds.min(0) + 0.0515).abs() < 1.0e-12);
     assert!((bounds.max(0) - 0.0515).abs() < 1.0e-12);
-    assert!((bounds.max(1) - 0.046810_889_132_455_35).abs() < 1.0e-12);
+    assert!((bounds.max(1) - 0.046_810_889_132_455_35).abs() < 1.0e-12);
     assert_eq!(bounds.min(1), -bounds.max(1));
     assert!((bounds.min(2) + 0.0036).abs() < 1.0e-12);
     assert!((bounds.max(2) - 0.0036).abs() < 1.0e-12);

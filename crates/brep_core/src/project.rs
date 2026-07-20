@@ -46,11 +46,7 @@ pub fn project_point(
             let l = frame.to_local(p);
             let rho = (l[0] * l[0] + l[1] * l[1]).sqrt();
             let expected = radius + l[2] * half_angle.tan();
-            check_residual(
-                (rho - expected).abs() * half_angle.cos(),
-                tol,
-                "cone",
-            )?;
+            check_residual((rho - expected).abs() * half_angle.cos(), tol, "cone")?;
             let u = unwrap(l[1].atan2(l[0]), hint.map(|h| h[0]), TAU);
             Ok([u, l[2]])
         }
@@ -140,8 +136,7 @@ pub fn project_point(
                 seed_count += 1;
             }
             const N: usize = 9;
-            let mut ranked: [([f64; 2], f64); 3] =
-                [([0.0; 2], f64::INFINITY); 3];
+            let mut ranked: [([f64; 2], f64); 3] = [([0.0; 2], f64::INFINITY); 3];
             for i in 0..=N {
                 for j in 0..=N {
                     let u = dom[0] + (dom[1] - dom[0]) * i as f64 / N as f64;
@@ -201,16 +196,9 @@ fn unwrap(angle: f64, hint: Option<f64>, period: f64) -> f64 {
 
 /// Gauss-Newton closest point on a NURBS surface, clamped to the domain.
 /// Returns (uv, distance).
-fn nurbs_closest(
-    n: &crate::ir::NurbsSurface,
-    p: Vec3,
-    seed: [f64; 2],
-) -> Option<([f64; 2], f64)> {
+fn nurbs_closest(n: &crate::ir::NurbsSurface, p: Vec3, seed: [f64; 2]) -> Option<([f64; 2], f64)> {
     let dom = n.domain();
-    let (mut u, mut v) = (
-        seed[0].clamp(dom[0], dom[1]),
-        seed[1].clamp(dom[2], dom[3]),
-    );
+    let (mut u, mut v) = (seed[0].clamp(dom[0], dom[1]), seed[1].clamp(dom[2], dom[3]));
     let scale_u = (dom[1] - dom[0]).max(1e-12);
     let scale_v = (dom[3] - dom[2]).max(1e-12);
     for _ in 0..50 {
@@ -275,7 +263,14 @@ pub fn flatten_bspline<C: CurveData>(curve: &C, t0: f64, t1: f64, tol: f64) -> V
     out
 }
 
-fn subdivide<C: CurveData>(curve: &C, t0: f64, t1: f64, tol: f64, depth: usize, out: &mut Vec<Vec3>) {
+fn subdivide<C: CurveData>(
+    curve: &C,
+    t0: f64,
+    t1: f64,
+    tol: f64,
+    depth: usize,
+    out: &mut Vec<Vec3>,
+) {
     let tm = (t0 + t1) * 0.5;
     let (p0, _) = nurbs::curve_eval(curve, t0);
     let (pm, _) = nurbs::curve_eval(curve, tm);
@@ -369,7 +364,10 @@ mod tests {
         for &(u, v) in &[(0.3, 1.2), (3.0, -2.0), (6.0, 3.0)] {
             let p = view.eval(u, v);
             let uv = project_point(&s, p, Some([u, v]), 1e-9).unwrap();
-            assert!((uv[0] - u).abs() < 1e-9 && (uv[1] - v).abs() < 1e-9, "({u}, {v}) -> {uv:?}");
+            assert!(
+                (uv[0] - u).abs() < 1e-9 && (uv[1] - v).abs() < 1e-9,
+                "({u}, {v}) -> {uv:?}"
+            );
         }
     }
 
@@ -409,7 +407,12 @@ mod tests {
             let x = -0.8 + 1.7 * i as f64 / 7.0; // ends just short of the seam corner
             let p = [x, -1.0, 0.0];
             let uv = project_point(&s, p, hint, 1e-9).unwrap();
-            assert!(uv[0] >= last - 1e-9, "u tore back at step {i}: {} -> {}", last, uv[0]);
+            assert!(
+                uv[0] >= last - 1e-9,
+                "u tore back at step {i}: {} -> {}",
+                last,
+                uv[0]
+            );
             last = uv[0];
             hint = Some(uv);
         }

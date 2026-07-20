@@ -169,10 +169,8 @@ impl Affine {
                 out[row * 4 + col] =
                     a[row * 4] * b[col] + a[row * 4 + 1] * b[4 + col] + a[row * 4 + 2] * b[8 + col];
             }
-            out[row * 4 + 3] = a[row * 4] * b[3]
-                + a[row * 4 + 1] * b[7]
-                + a[row * 4 + 2] * b[11]
-                + a[row * 4 + 3];
+            out[row * 4 + 3] =
+                a[row * 4] * b[3] + a[row * 4 + 1] * b[7] + a[row * 4 + 2] * b[11] + a[row * 4 + 3];
         }
         Affine(out)
     }
@@ -209,8 +207,7 @@ impl Affine {
             for col in 0..3 {
                 out[row * 4 + col] = m[col * 4 + row] * inv_s;
             }
-            out[row * 4 + 3] =
-                -(m[row] * t[0] + m[4 + row] * t[1] + m[8 + row] * t[2]) * inv_s;
+            out[row * 4 + 3] = -(m[row] * t[0] + m[4 + row] * t[1] + m[8 + row] * t[2]) * inv_s;
         }
         Ok(Affine(out))
     }

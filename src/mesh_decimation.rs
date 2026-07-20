@@ -1419,7 +1419,13 @@ mod tests {
     #[test]
     fn shading_discontinuity_pins_survive_flat_collapse() {
         let s = std::f32::consts::FRAC_1_SQRT_2;
-        let mut pinned = flat_grid(|i, j| if (i, j) == (4, 4) { (s, 0.0, s) } else { (0.0, 0.0, 1.0) });
+        let mut pinned = flat_grid(|i, j| {
+            if (i, j) == (4, 4) {
+                (s, 0.0, s)
+            } else {
+                (0.0, 0.0, 1.0)
+            }
+        });
         let mut clean = flat_grid(|_, _| (0.0, 0.0, 1.0));
         let tolerance = 0.25; // one grid cell
         decimate_mesh(&mut pinned, tolerance, 6);
@@ -1446,7 +1452,11 @@ mod tests {
         let s = std::f32::consts::FRAC_1_SQRT_2;
         let mut divergent = flat_grid(|i, j| {
             let interior = (1..8).contains(&i) && (1..8).contains(&j);
-            if interior { (s, 0.0, s) } else { (0.0, 0.0, 1.0) }
+            if interior {
+                (s, 0.0, s)
+            } else {
+                (0.0, 0.0, 1.0)
+            }
         });
         let mut clean = flat_grid(|_, _| (0.0, 0.0, 1.0));
         let tolerance = 0.25;

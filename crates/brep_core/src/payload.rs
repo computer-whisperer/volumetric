@@ -81,9 +81,7 @@ pub fn build_payload(model: &BRepModel) -> Result<Vec<u8>, String> {
 
     let mut solid_blobs = Vec::with_capacity(model.solids.len());
     for (i, solid) in model.solids.iter().enumerate() {
-        solid_blobs.push(
-            serialize_solid(solid).map_err(|e| format!("solid {i}: {e}"))?,
-        );
+        solid_blobs.push(serialize_solid(solid).map_err(|e| format!("solid {i}: {e}"))?);
     }
 
     let mut world = math::EMPTY_AABB;
@@ -218,8 +216,7 @@ fn serialize_solid(solid: &Solid) -> Result<SolidBlob, String> {
     for (i, face) in solid.faces.iter().enumerate() {
         w.pad8();
         face_offsets[i] = w.pos() as u32;
-        write_face(&mut w, face, eps_boundary)
-            .map_err(|e| format!("face {i}: {e}"))?;
+        write_face(&mut w, face, eps_boundary).map_err(|e| format!("face {i}: {e}"))?;
     }
     for (s, &face) in tree.slots.iter().enumerate() {
         w.patch_u32(slots_at + s * 4, face_offsets[face as usize]);
@@ -248,17 +245,23 @@ fn validate_face(face: &Face) -> Result<(), String> {
     }
     match &face.surface {
         Surface::Cylinder { radius, .. } | Surface::Sphere { radius, .. } => {
-            if !(*radius > 0.0) {
+            if !matches!(radius.partial_cmp(&0.0), Some(core::cmp::Ordering::Greater)) {
                 return Err(format!("non-positive radius {radius}"));
             }
         }
         Surface::Cone { radius, .. } => {
-            if !(*radius >= 0.0) {
+            if matches!(
+                radius.partial_cmp(&0.0),
+                None | Some(core::cmp::Ordering::Less)
+            ) {
                 return Err(format!("negative cone radius {radius}"));
             }
         }
         Surface::Torus { major, minor, .. } => {
-            if !(*major > 0.0) || !(*minor > 0.0) {
+            if [major, minor]
+                .iter()
+                .any(|r| !matches!(r.partial_cmp(&&0.0), Some(core::cmp::Ordering::Greater)))
+            {
                 return Err(format!("non-positive torus radii {major}/{minor}"));
             }
         }
@@ -356,7 +359,11 @@ fn face_aabb(face: &Face) -> [f64; 6] {
             }
             let mut margin = 0.0f64;
             let mut dev = |a: [f64; 3], m: [f64; 3], b: [f64; 3]| {
-                let mid = [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5, (a[2] + b[2]) * 0.5];
+                let mid = [
+                    (a[0] + b[0]) * 0.5,
+                    (a[1] + b[1]) * 0.5,
+                    (a[2] + b[2]) * 0.5,
+                ];
                 margin = margin.max(dist(m, mid));
             };
             for i in 0..N {
@@ -423,7 +430,10 @@ fn uv_metric(view: &SurfaceView, uv: [f64; 4]) -> [f64; 2] {
             metric[1] = metric[1].min(mv);
         }
     }
-    [metric[0].clamp(1e-12, f64::MAX), metric[1].clamp(1e-12, f64::MAX)]
+    [
+        metric[0].clamp(1e-12, f64::MAX),
+        metric[1].clamp(1e-12, f64::MAX),
+    ]
 }
 
 fn write_face(w: &mut W, face: &Face, eps_boundary: f64) -> Result<(), String> {
@@ -612,7 +622,17 @@ fn write_seed_boxes(w: &mut W, n: &crate::ir::NurbsSurface, seed_nu: usize, seed
 
 fn up(x: f64) -> f32 {
     let f = x as f32;
-    if (f as f64) < x { f32::from_bits(if f > 0.0 { f.to_bits() + 1 } else if f < 0.0 { f.to_bits() - 1 } else { 1 }) } else { f }
+    if (f as f64) < x {
+        f32::from_bits(if f > 0.0 {
+            f.to_bits() + 1
+        } else if f < 0.0 {
+            f.to_bits() - 1
+        } else {
+            1
+        })
+    } else {
+        f
+    }
 }
 
 fn down(x: f64) -> f32 {
@@ -675,7 +695,9 @@ impl<'a> PayloadView<'a> {
             if outside {
                 continue;
             }
-            let w2l = Affine(core::array::from_fn(|k| f64_at(self.bytes, base + 56 + k * 8)));
+            let w2l = Affine(core::array::from_fn(|k| {
+                f64_at(self.bytes, base + 56 + k * 8)
+            }));
             let q = w2l.apply(p);
             let solid = u32_at(self.bytes, base) as usize;
             let solid_off = u32_at(self.bytes, solids_off + solid * 4) as usize;
@@ -744,8 +766,7 @@ impl<'a> PayloadView<'a> {
                 let first = (a & !LEAF_FLAG) as usize;
                 for s in first..first + b as usize {
                     debug_assert!(s < face_count);
-                    let face_off =
-                        solid_off + u32_at(bytes, slots_off + s * 4) as usize;
+                    let face_off = solid_off + u32_at(bytes, slots_off + s * 4) as usize;
                     self.face_cast(
                         face_off,
                         p,

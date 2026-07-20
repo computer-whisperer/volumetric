@@ -10,6 +10,9 @@
 /// Accessor over one trim loop's UV points (owned IR or payload bytes).
 pub trait TrimLoop {
     fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
     fn point(&self, i: usize) -> [f64; 2];
 }
 
@@ -30,6 +33,9 @@ pub trait LoopSet {
     where
         Self: 'a;
     fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
     fn at(&self, i: usize) -> Self::Loop<'_>;
 }
 

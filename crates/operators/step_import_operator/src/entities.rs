@@ -45,9 +45,11 @@ impl<'a> Ctx<'a> {
 
     pub fn point(&self, id: u64) -> Result<Vec3, String> {
         let r = self.simple(id, &["CARTESIAN_POINT"])?;
-        let c = r.args.get(1).and_then(Arg::as_list).ok_or_else(|| {
-            format!("#{id} CARTESIAN_POINT: missing coordinate list")
-        })?;
+        let c = r
+            .args
+            .get(1)
+            .and_then(Arg::as_list)
+            .ok_or_else(|| format!("#{id} CARTESIAN_POINT: missing coordinate list"))?;
         if c.len() != 3 {
             return Err(format!(
                 "#{id} CARTESIAN_POINT: expected 3 coordinates, got {} (2D geometry is unsupported)",
@@ -202,7 +204,11 @@ impl<'a> Ctx<'a> {
                         r.args.get(7).and_then(Arg::as_list).unwrap_or(&[]),
                         id,
                     )?;
-                    Ok(Curve::Bspline(BsplineCurve { degree, knots, ctrl }))
+                    Ok(Curve::Bspline(BsplineCurve {
+                        degree,
+                        knots,
+                        ctrl,
+                    }))
                 }
                 other => Err(format!("#{id}: unsupported curve type {other}")),
             };
@@ -231,7 +237,11 @@ impl<'a> Ctx<'a> {
             bk.args.get(1).and_then(Arg::as_list).unwrap_or(&[]),
             id,
         )?;
-        Ok(Curve::Bspline(BsplineCurve { degree, knots, ctrl }))
+        Ok(Curve::Bspline(BsplineCurve {
+            degree,
+            knots,
+            ctrl,
+        }))
     }
 
     fn curve_ctrl(
@@ -566,8 +576,9 @@ pub fn length_unit_scale(data: &DataSection) -> Result<f64, String> {
         }
         let factor = if let Some(si) = e.record("SI_UNIT") {
             let prefix = match si.args.first() {
-                Some(Arg::Enum(p)) => si_prefix(p)
-                    .ok_or_else(|| format!("#{id}: unknown SI prefix .{p}."))?,
+                Some(Arg::Enum(p)) => {
+                    si_prefix(p).ok_or_else(|| format!("#{id}: unknown SI prefix .{p}."))?
+                }
                 _ => 1.0,
             };
             match si.args.last() {
@@ -610,8 +621,9 @@ pub fn length_unit_scale(data: &DataSection) -> Result<f64, String> {
                 }
             }
             let prefix = match inner_si.args.first() {
-                Some(Arg::Enum(p)) => si_prefix(p)
-                    .ok_or_else(|| format!("#{inner_id}: unknown SI prefix .{p}."))?,
+                Some(Arg::Enum(p)) => {
+                    si_prefix(p).ok_or_else(|| format!("#{inner_id}: unknown SI prefix .{p}."))?
+                }
                 _ => 1.0,
             };
             value * prefix * 1000.0
@@ -664,8 +676,9 @@ pub fn plane_angle_scale(data: &DataSection) -> Result<f64, String> {
         }
         let factor = if let Some(si) = e.record("SI_UNIT") {
             let prefix = match si.args.first() {
-                Some(Arg::Enum(p)) => si_prefix(p)
-                    .ok_or_else(|| format!("#{id}: unknown SI prefix .{p}."))?,
+                Some(Arg::Enum(p)) => {
+                    si_prefix(p).ok_or_else(|| format!("#{id}: unknown SI prefix .{p}."))?
+                }
                 _ => 1.0,
             };
             match si.args.last() {

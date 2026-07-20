@@ -37,7 +37,11 @@ pub struct Hit {
 pub enum Profile2<'a> {
     Slice(&'a [[f64; 2]]),
     /// `count` uv pairs of little-endian f64 starting at `offset`.
-    Raw { bytes: &'a [u8], offset: usize, count: usize },
+    Raw {
+        bytes: &'a [u8],
+        offset: usize,
+        count: usize,
+    },
 }
 
 impl Profile2<'_> {
@@ -187,12 +191,31 @@ impl SurfaceData for NurbsView<'_> {
 /// the parameterizations.
 #[derive(Clone, Copy)]
 pub enum SurfaceView<'a> {
-    Plane { frame: Frame },
-    Cylinder { frame: Frame, radius: f64 },
-    Cone { frame: Frame, radius: f64, tan_half: f64 },
-    Sphere { frame: Frame, radius: f64 },
-    Torus { frame: Frame, major: f64, minor: f64 },
-    Extrusion { frame: Frame, profile: Profile2<'a> },
+    Plane {
+        frame: Frame,
+    },
+    Cylinder {
+        frame: Frame,
+        radius: f64,
+    },
+    Cone {
+        frame: Frame,
+        radius: f64,
+        tan_half: f64,
+    },
+    Sphere {
+        frame: Frame,
+        radius: f64,
+    },
+    Torus {
+        frame: Frame,
+        major: f64,
+        minor: f64,
+    },
+    Extrusion {
+        frame: Frame,
+        profile: Profile2<'a>,
+    },
     Nurbs(NurbsView<'a>),
 }
 
@@ -793,9 +816,9 @@ fn nurbs_ray_hits(
         let (pos, su, sv) = nurbs::surface_eval(raw, u, v);
         // Dedupe by (t, 3D position): different seeds converging to the
         // same physical crossing, including seam aliases.
-        let dup = roots[..root_count].iter().any(|&(rt, rp)| {
-            (rt - t).abs() < eps && norm(sub(rp, pos)) < eps * 4.0
-        });
+        let dup = roots[..root_count]
+            .iter()
+            .any(|&(rt, rp)| (rt - t).abs() < eps && norm(sub(rp, pos)) < eps * 4.0);
         if dup {
             continue;
         }
@@ -942,7 +965,11 @@ mod tests {
         // wall (segment 1) at y=0.3, both away from segment endpoints.
         let hits = collect(&s, [0.7, -1.0, 3.0], [0.3, 1.3, 0.0]);
         assert_eq!(hits.len(), 2);
-        assert!((hits[0].u - (0.7 + 0.3 / 1.3)).abs() < 1e-9, "u={}", hits[0].u);
+        assert!(
+            (hits[0].u - (0.7 + 0.3 / 1.3)).abs() < 1e-9,
+            "u={}",
+            hits[0].u
+        );
         assert!((hits[0].v - 3.0).abs() < 1e-12);
         assert!((hits[1].u - 1.3).abs() < 1e-9, "x=1 wall at y=0.3");
     }

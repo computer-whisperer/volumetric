@@ -26,9 +26,8 @@ fn wasm_artifact(name: &str) -> Vec<u8> {
     })
 }
 
-const FIXTURE: &[u8] = include_bytes!(
-    "../crates/operators/step_import_operator/tests/fixtures/box_cylinder.step"
-);
+const FIXTURE: &[u8] =
+    include_bytes!("../crates/operators/step_import_operator/tests/fixtures/box_cylinder.step");
 
 #[test]
 fn step_fixture_imports_to_a_sampleable_solid() {

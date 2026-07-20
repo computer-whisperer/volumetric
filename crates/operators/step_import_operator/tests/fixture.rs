@@ -19,9 +19,10 @@ fn classifies_box_and_cylinder_exactly() {
     // Analytic ground truth: box [-5,5]x[-4,4]x[-3,3], cylinder
     // (x-20)^2 + y^2 <= 9, z in [-3, 9].
     let truth = |p: [f64; 3]| -> Option<bool> {
-        let in_box =
-            p[0].abs() - 5.0 < 0.0 && p[1].abs() - 4.0 < 0.0 && p[2].abs() - 3.0 < 0.0;
-        let box_d = (p[0].abs() - 5.0).max(p[1].abs() - 4.0).max(p[2].abs() - 3.0);
+        let in_box = p[0].abs() - 5.0 < 0.0 && p[1].abs() - 4.0 < 0.0 && p[2].abs() - 3.0 < 0.0;
+        let box_d = (p[0].abs() - 5.0)
+            .max(p[1].abs() - 4.0)
+            .max(p[2].abs() - 3.0);
         let rho = ((p[0] - 20.0) * (p[0] - 20.0) + p[1] * p[1]).sqrt();
         let cyl_d = (rho - 3.0).max((p[2] - 9.0).max(-3.0 - p[2]));
         let d = box_d.min(cyl_d);

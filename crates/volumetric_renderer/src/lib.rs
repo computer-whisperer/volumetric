@@ -187,7 +187,11 @@ fn flatten_meshes_within_budget(
                 .transform
                 .transform_vector3(Vec3::from(v.normal))
                 .normalize_or_zero();
-            let normal = if normal == Vec3::ZERO { Vec3::Z } else { normal };
+            let normal = if normal == Vec3::ZERO {
+                Vec3::Z
+            } else {
+                normal
+            };
             all_vertices.push(MeshVertex::colored(pos.into(), normal.into(), v.color));
         }
 

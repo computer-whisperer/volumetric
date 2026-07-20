@@ -74,7 +74,9 @@ fn strip_prompts(line: &str) -> &str {
 fn sample_points(bbox: [f64; 6], pad: f64, count: usize) -> Vec<[f64; 3]> {
     let mut state = 0x9E3779B97F4A7C15u64;
     let mut next = move || {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (state >> 11) as f64 / (1u64 << 53) as f64
     };
     (0..count)
@@ -114,7 +116,12 @@ fn agrees_with_occt_point_classification() {
     let n_solids: usize = out
         .lines()
         .find_map(|l| strip_prompts(l).strip_prefix("NSOLIDS "))
-        .unwrap_or_else(|| panic!("no NSOLIDS in DRAWEXE output: {:?}", &out[..out.len().min(800)]))
+        .unwrap_or_else(|| {
+            panic!(
+                "no NSOLIDS in DRAWEXE output: {:?}",
+                &out[..out.len().min(800)]
+            )
+        })
         .trim()
         .parse()
         .expect("parse solid count");
@@ -158,9 +165,7 @@ fn agrees_with_occt_point_classification() {
         script.push_str(&format!("puts \"PT {pi}\"\n"));
         let cands: Vec<usize> = (0..n_solids)
             .filter(|&i| {
-                (0..3).all(|a| {
-                    p[a] > boxes[i][a * 2] - pad && p[a] < boxes[i][a * 2 + 1] + pad
-                })
+                (0..3).all(|a| p[a] > boxes[i][a * 2] - pad && p[a] < boxes[i][a * 2 + 1] + pad)
             })
             .collect();
         for &i in &cands {

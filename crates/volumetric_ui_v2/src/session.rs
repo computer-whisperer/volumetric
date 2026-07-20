@@ -2521,8 +2521,7 @@ pub fn preview_postlude(
             if !(position.0.is_finite() && position.1.is_finite() && position.2.is_finite()) {
                 nonfinite_positions += 1;
             }
-            let len2 =
-                normal.0 * normal.0 + normal.1 * normal.1 + normal.2 * normal.2;
+            let len2 = normal.0 * normal.0 + normal.1 * normal.1 + normal.2 * normal.2;
             let normal = if len2.is_finite() && len2 > 1e-20 {
                 *normal
             } else {

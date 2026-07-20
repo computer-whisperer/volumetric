@@ -52,7 +52,11 @@ fn check_grid(
 }
 
 fn shell(d: f64, margin: f64) -> Option<bool> {
-    if d.abs() < margin { None } else { Some(d < 0.0) }
+    if d.abs() < margin {
+        None
+    } else {
+        Some(d < 0.0)
+    }
 }
 
 /// Square trim loop of half-extent `h` in UV.
@@ -69,7 +73,11 @@ fn cube_solid() -> Solid {
             origin[axis] = side;
             let mut z = [0.0; 3];
             z[axis] = side;
-            let x_ref = if axis == 0 { [0.0, 1.0, 0.0] } else { [1.0, 0.0, 0.0] };
+            let x_ref = if axis == 0 {
+                [0.0, 1.0, 0.0]
+            } else {
+                [1.0, 0.0, 0.0]
+            };
             faces.push(Face {
                 surface: Surface::Plane {
                     frame: Frame::from_axis_ref(origin, z, x_ref),
@@ -194,7 +202,11 @@ fn cube_with_drilled_hole() {
             origin[axis] = side;
             let mut z = [0.0; 3];
             z[axis] = side;
-            let x_ref = if axis == 0 { [0.0, 1.0, 0.0] } else { [1.0, 0.0, 0.0] };
+            let x_ref = if axis == 0 {
+                [0.0, 1.0, 0.0]
+            } else {
+                [1.0, 0.0, 0.0]
+            };
             let mut trims = square_trim(1.0);
             if axis == 2 {
                 trims.push(circle.clone());
