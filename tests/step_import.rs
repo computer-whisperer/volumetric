@@ -58,11 +58,25 @@ fn step_fixture_imports_to_a_sampleable_solid() {
     assert_eq!(executor.dimensions().unwrap(), 3);
     let bounds = executor.get_bounds_nd().unwrap();
     let bounds = bounds.as_slice();
-    // Box [-5,5]x[-4,4]x[-3,3] plus cylinder r=3 at x=20, z [-3,9];
-    // bounds are conservative but close.
-    assert!(bounds[0] < -4.99 && bounds[0] > -5.1, "min_x {}", bounds[0]);
-    assert!(bounds[1] > 22.99 && bounds[1] < 23.2, "max_x {}", bounds[1]);
-    assert!(bounds[5] > 8.99 && bounds[5] < 9.2, "max_z {}", bounds[5]);
+    // Box [-5,5]x[-4,4]x[-3,3] plus cylinder r=3 at x=20, z [-3,9], in the
+    // fixture's millimetres; the imported model is in metres. Bounds are
+    // conservative but close.
+    const M_PER_MM: f64 = 1e-3;
+    assert!(
+        bounds[0] < -4.99 * M_PER_MM && bounds[0] > -5.1 * M_PER_MM,
+        "min_x {}",
+        bounds[0]
+    );
+    assert!(
+        bounds[1] > 22.99 * M_PER_MM && bounds[1] < 23.2 * M_PER_MM,
+        "max_x {}",
+        bounds[1]
+    );
+    assert!(
+        bounds[5] > 8.99 * M_PER_MM && bounds[5] < 9.2 * M_PER_MM,
+        "max_z {}",
+        bounds[5]
+    );
 
     // The fixture geometry: box at origin, cylinder wall at x = 20.
     for (p, inside) in [
@@ -75,7 +89,8 @@ fn step_fixture_imports_to_a_sampleable_solid() {
         ([12.0, 0.0, 0.0], false),
         ([20.0, 3.2, 0.0], false),
     ] {
-        let sample = executor.sample_nd(&p).unwrap();
+        let p_m = p.map(|v| v * M_PER_MM);
+        let sample = executor.sample_nd(&p_m).unwrap();
         assert_eq!(
             is_occupied(sample),
             inside,
