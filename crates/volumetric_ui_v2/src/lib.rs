@@ -158,6 +158,7 @@ pub const REMESH_KEY: &str = "action:remesh";
 pub const TOGGLE_AUTO_REMESH_KEY: &str = "action:toggle-auto-remesh";
 pub const TOGGLE_GRID_KEY: &str = "viewport:toggle-grid";
 pub const TOGGLE_BOUNDS_KEY: &str = "viewport:toggle-bounds";
+pub const TOGGLE_TINT_KEY: &str = "viewport:toggle-tint";
 pub const TOGGLE_SSAO_KEY: &str = "viewport:toggle-ssao";
 pub const FRAME_PREVIEW_KEY: &str = "viewport:frame-preview";
 pub const RESET_CAMERA_KEY: &str = "viewport:reset-camera";
@@ -1061,6 +1062,11 @@ pub enum PreviewPlan {
         mesh: PreviewMeshPlan,
         /// Sample channel to colormap points/vertices by, when declared.
         color_channel: Option<String>,
+        /// Give the model a muted distinct tint (keyed by output id) when
+        /// it carries no surface colors of its own — distinguishes
+        /// flush-fitting parts pinned into one viewport. Part of the
+        /// cache key, like `color_channel`.
+        tint_uncolored: bool,
     },
     Sketch {
         resolution: usize,
@@ -1081,6 +1087,7 @@ impl PreviewPlan {
             Self::Model3d {
                 mesh,
                 color_channel,
+                ..
             } => match color_channel {
                 Some(channel) => format!("{} · {channel}", mesh.label()),
                 None => mesh.label(),
@@ -1129,6 +1136,9 @@ pub struct VolumetricUiV2 {
     camera_control_scheme: CameraControlScheme,
     show_grid: bool,
     show_bounds: bool,
+    /// Give uncolored models a muted per-output tint so flush-fitting
+    /// parts pinned into one viewport stay distinguishable.
+    tint_parts: bool,
     ssao: bool,
     ssao_radius: f32,
     ssao_bias: f32,
@@ -1277,6 +1287,7 @@ impl VolumetricUiV2 {
             camera_control_scheme: CameraControlScheme::default(),
             show_grid: true,
             show_bounds: false,
+            tint_parts: false,
             ssao: true,
             // Renderer defaults (renderer::RenderSettings::default()).
             ssao_radius: 0.5,
@@ -1921,6 +1932,7 @@ impl VolumetricUiV2 {
             } => PreviewPlan::Model3d {
                 mesh: PreviewMeshPlan::for_mode(*mode, *resolution, *asn2),
                 color_channel: color_channel.clone(),
+                tint_uncolored: self.tint_parts,
             },
             OutputRender::Model2d {
                 resolution,
@@ -4062,6 +4074,16 @@ impl App for VolumetricUiV2 {
             return;
         }
 
+        if event.is_click_or_activate(TOGGLE_TINT_KEY) {
+            self.tint_parts = !self.tint_parts;
+            self.status = if self.tint_parts {
+                "uncolored parts tinted".to_string()
+            } else {
+                "part tint disabled".to_string()
+            };
+            return;
+        }
+
         if event.is_click_or_activate(TOGGLE_SSAO_KEY) {
             self.ssao = !self.ssao;
             self.status = if self.ssao {
@@ -5532,6 +5554,7 @@ fn view_controls_cluster(app: &VolumetricUiV2) -> El {
     card([row([
         toggle("Grid", app.show_grid, TOGGLE_GRID_KEY),
         toggle("Bounds", app.show_bounds, TOGGLE_BOUNDS_KEY),
+        toggle("Tint", app.tint_parts, TOGGLE_TINT_KEY),
         toggle("SSAO", app.ssao, TOGGLE_SSAO_KEY),
         icon_button("chevron-down")
             .ghost()
@@ -7921,6 +7944,23 @@ mod tests {
         assert!(app.preview_requests()[0].show_bounds);
     }
 
+    #[test]
+    fn tint_toggle_flows_into_model_plans() {
+        let mut app = VolumetricUiV2::default();
+        app.run_project();
+
+        let tint_of = |app: &VolumetricUiV2| match &app.preview_requests()[0].plan {
+            PreviewPlan::Model3d { tint_uncolored, .. } => *tint_uncolored,
+            other => panic!("expected a 3D plan, got {other:?}"),
+        };
+        assert!(!tint_of(&app), "part tint defaults off");
+
+        dispatch(&mut app, UiEvent::synthetic_click(TOGGLE_TINT_KEY));
+        assert!(tint_of(&app), "toggle enables the tint in the plan");
+        dispatch(&mut app, UiEvent::synthetic_click(TOGGLE_TINT_KEY));
+        assert!(!tint_of(&app));
+    }
+
     /// Builds a two-export project and returns (app, export ids) after a run.
     fn two_export_app() -> (VolumetricUiV2, Vec<String>) {
         let mut app = VolumetricUiV2::default();
@@ -8275,6 +8315,7 @@ mod tests {
                     Asn2Settings::default()
                 ),
                 color_channel: None,
+                tint_uncolored: false,
             }
         );
         assert!(

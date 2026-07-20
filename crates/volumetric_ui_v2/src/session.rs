@@ -2413,6 +2413,7 @@ pub fn preview_prelude(
         PreviewPlan::Model3d {
             mesh,
             color_channel,
+            ..
         } => (mesh, color_channel.as_deref()),
         _ => {
             fallback_plan = PreviewMeshPlan::PointCloud { resolution: 24 };
@@ -2597,6 +2598,21 @@ fn finish_preview_scene(
                     Ok(()) => stats.detail.push("Color: model surface colors".to_string()),
                     Err(err) => stats.detail.push(format!("Color: {err}")),
                 }
+            } else if matches!(
+                &request.plan,
+                crate::PreviewPlan::Model3d {
+                    tint_uncolored: true,
+                    ..
+                }
+            ) {
+                // Uncolored model with part tinting on: a muted tint keyed
+                // by the output id keeps flush-fitting parts apart when
+                // several are pinned into one viewport.
+                let tint = part_tint(&request.asset_id);
+                tint_scene(&mut scene, tint);
+                stats
+                    .detail
+                    .push(format!("Color: part tint ({})", request.asset_id));
             }
         }
         Err(err) => {
@@ -2742,6 +2758,56 @@ fn srgb_to_linear(c: f32) -> f32 {
         c / 12.92
     } else {
         ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// A muted, deterministic tint for an uncolored part: FNV-1a over the
+/// output id (stable across sessions and platforms — pin-set changes
+/// never recolor a part) picks one of twelve pastel hues, converted to
+/// linear RGBA for the renderer.
+pub(crate) fn part_tint(id: &str) -> [f32; 4] {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in id.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    let hue = (hash % 12) as f32 * 30.0;
+
+    // HSL at fixed saturation/lightness: distinct but never garish.
+    let (saturation, lightness) = (0.45, 0.72);
+    let chroma = (1.0 - (2.0 * lightness - 1.0f32).abs()) * saturation;
+    let hue_prime = hue / 60.0;
+    let x = chroma * (1.0 - (hue_prime % 2.0 - 1.0).abs());
+    let (r, g, b) = match hue_prime as u32 {
+        0 => (chroma, x, 0.0),
+        1 => (x, chroma, 0.0),
+        2 => (0.0, chroma, x),
+        3 => (0.0, x, chroma),
+        4 => (x, 0.0, chroma),
+        _ => (chroma, 0.0, x),
+    };
+    let m = lightness - chroma / 2.0;
+    [
+        srgb_to_linear(r + m),
+        srgb_to_linear(g + m),
+        srgb_to_linear(b + m),
+        1.0,
+    ]
+}
+
+/// Sets every point instance and mesh vertex of a built scene to one flat
+/// color (the part-tint path; per-face colors go through the channel
+/// machinery instead).
+fn tint_scene(scene: &mut renderer::SceneData, color: [f32; 4]) {
+    for (points, _, _) in &mut scene.points {
+        for point in &mut points.points {
+            point.color = color;
+        }
+    }
+    for (mesh, _, _) in &mut scene.meshes {
+        for vertex in &mut mesh.vertices {
+            vertex.color = color;
+        }
     }
 }
 
@@ -3635,6 +3701,7 @@ mod tests {
                     settings: crate::Asn2Settings::default(),
                 },
                 color_channel: None,
+                tint_uncolored: false,
             },
             wireframe: false,
             show_grid: false,
@@ -3965,6 +4032,7 @@ mod tests {
             plan: PreviewPlan::Model3d {
                 mesh: PreviewMeshPlan::PointCloud { resolution: 8 },
                 color_channel: Some("density".to_string()),
+                tint_uncolored: false,
             },
             wireframe: false,
             show_bounds: false,
@@ -4014,6 +4082,7 @@ mod tests {
             plan: PreviewPlan::Model3d {
                 mesh: PreviewMeshPlan::PointCloud { resolution: 8 },
                 color_channel: Some("nope".to_string()),
+                tint_uncolored: false,
             },
             ..request
         };
@@ -4027,6 +4096,82 @@ mod tests {
             "{:?}",
             entity.stats.detail
         );
+    }
+
+    #[test]
+    fn part_tint_distinguishes_uncolored_models() {
+        // The density model declares extra channels but no color trio —
+        // an "uncolored" model for tinting purposes.
+        let model = density_model();
+        let request = |id: &str, tint: bool| PreviewRequest {
+            asset_id: id.to_string(),
+            source_hash: volumetric::content_fingerprint(&model),
+            data: Arc::new(model.clone()),
+            type_hint: None,
+            precursor_ids: vec![],
+            plan: PreviewPlan::Model3d {
+                mesh: PreviewMeshPlan::PointCloud { resolution: 8 },
+                color_channel: None,
+                tint_uncolored: tint,
+            },
+            wireframe: false,
+            show_bounds: false,
+            show_grid: false,
+            ssao: false,
+            ssao_radius: 0.1,
+            ssao_bias: 0.02,
+            ssao_strength: 1.0,
+            stale: false,
+        };
+
+        let flat_color = |entity: &PreviewEntity| -> [f32; 4] {
+            let (points, _, _) = &entity.scene.points[0];
+            let first = points.points[0].color;
+            assert!(
+                points.points.iter().all(|p| p.color == first),
+                "part tint must be flat across the model"
+            );
+            first
+        };
+
+        // Disabled: points keep the default position-gradient colors
+        // (not one flat tint).
+        let entity = build_preview_scene(&request("tray", false)).expect("preview builds");
+        let (points, _, _) = &entity.scene.points[0];
+        assert!(
+            points.points.iter().any(|p| p.color != points.points[0].color),
+            "tint off must leave the default gradient"
+        );
+
+        // Enabled: the tint is the deterministic per-id pastel, muted
+        // (never white or a saturated primary), and distinct between ids
+        // that land in different hue buckets ("tray", "lid", "board" do —
+        // see part_tint's FNV-mod-12 bucketing).
+        let mut tints = Vec::new();
+        for id in ["tray", "lid", "board"] {
+            let entity = build_preview_scene(&request(id, true)).expect("preview builds");
+            let color = flat_color(&entity);
+            assert_eq!(color, part_tint(id), "tint keyed by output id");
+            let (lo, hi) = color[0..3]
+                .iter()
+                .fold((f32::INFINITY, 0.0f32), |(lo, hi), &c| {
+                    (lo.min(c), hi.max(c))
+                });
+            assert!(hi < 0.9 && lo > 0.05, "not muted: {color:?}");
+            assert!(
+                entity
+                    .stats
+                    .detail
+                    .iter()
+                    .any(|line| line.starts_with("Color: part tint")),
+                "{:?}",
+                entity.stats.detail
+            );
+            tints.push(color.map(|c| (c * 255.0) as u8));
+        }
+        tints.sort();
+        tints.dedup();
+        assert_eq!(tints.len(), 3, "three parts, three tints: {tints:?}");
     }
 
     #[test]
@@ -4241,6 +4386,7 @@ mod tests {
             plan: PreviewPlan::Model3d {
                 mesh: PreviewMeshPlan::PointCloud { resolution },
                 color_channel: None,
+                tint_uncolored: false,
             },
             wireframe: false,
             show_bounds: false,
@@ -4882,6 +5028,7 @@ function get_bounds_max_y() return 1.5 end
                 PreviewPlan::Model3d {
                     mesh: PreviewMeshPlan::PointCloud { resolution: 32 },
                     color_channel: None,
+                    tint_uncolored: false,
                 }
             ),
             "newest job per output wins"

@@ -245,6 +245,7 @@ mod tests {
                     settings: Asn2Settings::default(),
                 },
                 color_channel: None,
+                tint_uncolored: false,
             },
             wireframe: false,
             show_grid: false,

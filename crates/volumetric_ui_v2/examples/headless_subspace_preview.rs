@@ -79,6 +79,7 @@ fn main() {
         PreviewPlan::Model3d {
             mesh: PreviewMeshPlan::MarchingCubes { resolution: 64 },
             color_channel: None,
+            tint_uncolored: false,
         },
     ))
     .expect("model preview build failed");
