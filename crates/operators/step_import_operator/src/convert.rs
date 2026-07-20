@@ -417,7 +417,11 @@ fn convert_face(ctx: &Ctx, face_id: u64, opts: &Options) -> Result<Face, String>
             .map_err(|e| format!("loop {li}: {e}"))?;
         trims.push(uv);
     }
-    Ok(Face { surface, trims })
+    Ok(Face {
+        surface,
+        trims,
+        color: None,
+    })
 }
 
 /// Lower a STEP surface to the exact `brep_core` vocabulary. Extrusions

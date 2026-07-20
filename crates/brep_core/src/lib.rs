@@ -64,7 +64,7 @@
 //! Face record:
 //!    0  surface_type u32  0 plane / 1 cylinder / 2 cone / 3 sphere /
 //!                         4 torus / 5 extrusion / 6 nurbs
-//!    4  (pad)        u32
+//!    4  color        u32  0 = unstyled, else 0xFFrrggbb (8-bit sRGB)
 //!    8  uv_eps       2xf64  UV distance per axis equivalent to the 3D
 //!                           suspicion tolerance at this face's scale
 //!   24  u_period     f64    0 = aperiodic

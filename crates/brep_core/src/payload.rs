@@ -229,6 +229,30 @@ fn serialize_solid(solid: &Solid) -> Result<SolidBlob, String> {
     })
 }
 
+/// Face color as stored in the face record: 0 = unstyled, otherwise
+/// `0xFF_rr_gg_bb` with 8-bit sRGB components (clamped to [0, 1]; the
+/// high byte distinguishes a styled black from "no color").
+fn pack_color(color: Option<[f32; 3]>) -> u32 {
+    let Some(c) = color else { return 0 };
+    let byte = |v: f32| {
+        let v = if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 };
+        (v * 255.0).round() as u32
+    };
+    0xFF00_0000 | (byte(c[0]) << 16) | (byte(c[1]) << 8) | byte(c[2])
+}
+
+/// Inverse of [`pack_color`].
+pub(crate) fn unpack_color(packed: u32) -> Option<[f32; 3]> {
+    if packed & 0xFF00_0000 == 0 {
+        return None;
+    }
+    Some([
+        ((packed >> 16) & 0xFF) as f32 / 255.0,
+        ((packed >> 8) & 0xFF) as f32 / 255.0,
+        (packed & 0xFF) as f32 / 255.0,
+    ])
+}
+
 fn validate_face(face: &Face) -> Result<(), String> {
     if face.trims.is_empty() {
         return Err("face has no trim loops".into());
@@ -453,7 +477,7 @@ fn write_face(w: &mut W, face: &Face, eps_boundary: f64) -> Result<(), String> {
         Surface::Nurbs(_) => TYPE_NURBS,
     };
     w.u32(type_id);
-    w.u32(0);
+    w.u32(pack_color(face.color));
     w.f64(eps_boundary / metric[0]);
     w.f64(eps_boundary / metric[1]);
     w.f64(u_period);
@@ -798,26 +822,7 @@ impl<'a> PayloadView<'a> {
         crossings: &mut usize,
         suspect: &mut bool,
     ) {
-        let bytes = self.bytes;
-        let uv_eps = [f64_at(bytes, face_off + 8), f64_at(bytes, face_off + 16)];
-        let u_period = f64_at(bytes, face_off + 24);
-        let v_period = f64_at(bytes, face_off + 32);
-        let trims_off = face_off + u32_at(bytes, face_off + 40) as usize;
-
-        let loop_count = u32_at(bytes, trims_off) as usize;
-        let uv_aabb: [f64; 4] = core::array::from_fn(|i| f64_at(bytes, trims_off + 8 + i * 8));
-        let region = Region {
-            loops: RawLoops {
-                bytes,
-                base: trims_off,
-                count: loop_count,
-            },
-            uv_aabb,
-            u_period,
-            v_period,
-            uv_eps,
-        };
-
+        let region = self.region_at(face_off);
         let view = self.surface_view(face_off);
         view.ray_hits(p, dir, eps_boundary, &mut |hit| {
             if hit.t < -4.0 * t_eps && !hit.suspect {
@@ -843,6 +848,148 @@ impl<'a> PayloadView<'a> {
                 *suspect = true;
             }
         });
+    }
+
+    /// The trim region of the face record at `face_off`.
+    fn region_at(&self, face_off: usize) -> Region<RawLoops<'a>> {
+        let bytes = self.bytes;
+        let uv_eps = [f64_at(bytes, face_off + 8), f64_at(bytes, face_off + 16)];
+        let u_period = f64_at(bytes, face_off + 24);
+        let v_period = f64_at(bytes, face_off + 32);
+        let trims_off = face_off + u32_at(bytes, face_off + 40) as usize;
+
+        let loop_count = u32_at(bytes, trims_off) as usize;
+        let uv_aabb: [f64; 4] = core::array::from_fn(|i| f64_at(bytes, trims_off + 8 + i * 8));
+        Region {
+            loops: RawLoops {
+                bytes,
+                base: trims_off,
+                count: loop_count,
+            },
+            uv_aabb,
+            u_period,
+            v_period,
+            uv_eps,
+        }
+    }
+
+    /// Display color of the model's nearest face at `p` (sRGB components
+    /// in [0, 1]); unstyled faces read as white. Distances are measured
+    /// to the *trimmed* faces (projections landing outside a face's trim
+    /// region are clamped to its trim boundary), across every instance.
+    /// `None` only for a payload with no reachable faces.
+    ///
+    /// This ranks faces by proximity — the NURBS distance is a polished
+    /// local minimum, not a certified bound — which is exactly enough
+    /// for color lookup at or near the surface, and deliberately plays
+    /// no part in occupancy classification.
+    pub fn nearest_color(&self, p: Vec3) -> Option<[f32; 3]> {
+        let instances_off = u32_at(self.bytes, 64) as usize;
+        let solids_off = u32_at(self.bytes, 68) as usize;
+        let mut best: Option<(f64, u32)> = None; // (world distance, packed color)
+        for i in 0..self.instance_count() {
+            let base = instances_off + i * INSTANCE_LEN;
+            let w2l = Affine(core::array::from_fn(|k| {
+                f64_at(self.bytes, base + 56 + k * 8)
+            }));
+            // world-to-local is rigid + uniform scale: its row norm is
+            // 1/s, and local distances scale back to world by s.
+            let inv_s = norm([w2l.0[0], w2l.0[1], w2l.0[2]]);
+            if !(inv_s > 0.0 && inv_s.is_finite()) {
+                continue;
+            }
+            let s = 1.0 / inv_s;
+            let q = w2l.apply(p);
+            let solid = u32_at(self.bytes, base) as usize;
+            let solid_off = u32_at(self.bytes, solids_off + solid * 4) as usize;
+            let limit_local = best.map_or(f64::INFINITY, |(d, _)| d / s);
+            if let Some((d_local, packed)) = self.solid_nearest_face(solid_off, q, limit_local) {
+                best = Some((d_local * s, packed));
+            }
+        }
+        best.map(|(_, packed)| unpack_color(packed).unwrap_or([1.0, 1.0, 1.0]))
+    }
+
+    /// Nearest face of one solid (solid-local coordinates): `(distance,
+    /// packed color)`, only when some face beats `limit`. Best-first BVH
+    /// descent pruned against the running best.
+    fn solid_nearest_face(&self, solid_off: usize, p: Vec3, limit: f64) -> Option<(f64, u32)> {
+        let bytes = self.bytes;
+        let node_count = u32_at(bytes, solid_off + 4) as usize;
+        let nodes_off = solid_off + SOLID_HEADER_LEN;
+        let slots_off = nodes_off + node_count * NODE_LEN;
+        if node_count == 0 {
+            return None;
+        }
+        let node_dist = |node: usize| -> f64 {
+            let base = nodes_off + node * NODE_LEN;
+            let mut d2 = 0.0f64;
+            for (axis, &c) in p.iter().enumerate() {
+                let lo = f32_at(bytes, base + axis * 4) as f64;
+                let hi = f32_at(bytes, base + 12 + axis * 4) as f64;
+                let gap = (lo - c).max(c - hi).max(0.0);
+                d2 += gap * gap;
+            }
+            d2.sqrt()
+        };
+
+        let mut best: Option<(f64, u32)> = None;
+        let mut bound = limit;
+        let mut stack = [(0u32, 0.0f64); 64];
+        stack[0] = (0, node_dist(0));
+        let mut top = 1usize;
+        while top > 0 {
+            top -= 1;
+            let (node, d) = stack[top];
+            if d >= bound {
+                continue;
+            }
+            let base = nodes_off + node as usize * NODE_LEN;
+            let a = u32_at(bytes, base + 24);
+            let b = u32_at(bytes, base + 28);
+            if a & LEAF_FLAG != 0 {
+                let first = (a & !LEAF_FLAG) as usize;
+                for s in first..first + b as usize {
+                    let face_off = solid_off + u32_at(bytes, slots_off + s * 4) as usize;
+                    let (fd, packed) = self.face_distance(face_off, p);
+                    if fd < bound {
+                        bound = fd;
+                        best = Some((fd, packed));
+                    }
+                }
+            } else {
+                // Nearer child popped first; the farther one re-checks
+                // its distance against the (possibly tightened) bound.
+                let (da, db) = (node_dist(a as usize), node_dist(b as usize));
+                let ordered = if da <= db { [(b, db), (a, da)] } else { [(a, da), (b, db)] };
+                for (child, dist) in ordered {
+                    if dist < bound {
+                        debug_assert!(top < stack.len(), "BVH deeper than the traversal stack");
+                        if top < stack.len() {
+                            stack[top] = (child, dist);
+                            top += 1;
+                        }
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    /// Distance from `p` to one trimmed face, with its packed color.
+    /// Off-trim projections clamp to the trim boundary (approximately —
+    /// the clamp is exact in UV, and re-measured in 3D).
+    fn face_distance(&self, face_off: usize, p: Vec3) -> (f64, u32) {
+        let view = self.surface_view(face_off);
+        let (uv, d_surf) = view.closest(p);
+        let region = self.region_at(face_off);
+        let d = if region.contains(uv[0], uv[1]).inside {
+            d_surf
+        } else {
+            let c = region.nearest_boundary_uv(uv[0], uv[1]);
+            norm(sub(p, view.eval(c[0], c[1])))
+        };
+        (d, u32_at(self.bytes, face_off + 4))
     }
 
     fn surface_view(&self, face_off: usize) -> SurfaceView<'a> {

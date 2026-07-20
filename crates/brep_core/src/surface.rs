@@ -305,6 +305,167 @@ impl<'a> SurfaceView<'a> {
         }
     }
 
+    /// Closest point on the *untrimmed* surface: `(uv, 3D distance)`.
+    /// Exact for the analytic types. NURBS polishes Gauss-Newton from the
+    /// nearest seed boxes (payload views) or a coarse domain scan (owned
+    /// views), so the result is a well-polished local minimum rather than
+    /// a guarantee — meant for ranking faces by proximity (surface-color
+    /// lookup), never for occupancy classification.
+    pub fn closest(&self, p: Vec3) -> ([f64; 2], f64) {
+        match self {
+            SurfaceView::Plane { frame } => {
+                let l = frame.to_local(p);
+                ([l[0], l[1]], l[2].abs())
+            }
+            SurfaceView::Cylinder { frame, radius } => {
+                let l = frame.to_local(p);
+                let rho = (l[0] * l[0] + l[1] * l[1]).sqrt();
+                ([l[1].atan2(l[0]), l[2]], (rho - radius).abs())
+            }
+            SurfaceView::Cone {
+                frame,
+                radius,
+                tan_half,
+            } => {
+                let l = frame.to_local(p);
+                let rho = (l[0] * l[0] + l[1] * l[1]).sqrt();
+                let k = *tan_half;
+                // Foot of the perpendicular onto the ruling line
+                // rho(v) = radius + k v in the (rho, z) half-plane,
+                // clamped to the apex where the real cone ends.
+                let mut v = (k * (rho - radius) + l[2]) / (1.0 + k * k);
+                if radius + k * v < 0.0 {
+                    v = -radius / k;
+                }
+                let dr = rho - (radius + k * v);
+                let dz = l[2] - v;
+                ([l[1].atan2(l[0]), v], (dr * dr + dz * dz).sqrt())
+            }
+            SurfaceView::Sphere { frame, radius } => {
+                let l = frame.to_local(p);
+                let r = norm(l);
+                let v = if r > 0.0 {
+                    (l[2] / r).clamp(-1.0, 1.0).asin()
+                } else {
+                    0.0
+                };
+                ([l[1].atan2(l[0]), v], (r - radius).abs())
+            }
+            SurfaceView::Torus {
+                frame,
+                major,
+                minor,
+            } => {
+                let l = frame.to_local(p);
+                let rho = (l[0] * l[0] + l[1] * l[1]).sqrt();
+                let tube = ((rho - major) * (rho - major) + l[2] * l[2]).sqrt();
+                (
+                    [l[1].atan2(l[0]), l[2].atan2(rho - major)],
+                    (tube - minor).abs(),
+                )
+            }
+            SurfaceView::Extrusion { frame, profile } => {
+                let l = frame.to_local(p);
+                let mut best = (f64::INFINITY, 0.0f64);
+                for i in 0..profile.len().saturating_sub(1) {
+                    let a = profile.point(i);
+                    let b = profile.point(i + 1);
+                    let e = [b[0] - a[0], b[1] - a[1]];
+                    let len2 = e[0] * e[0] + e[1] * e[1];
+                    let t = if len2 > 0.0 {
+                        (((l[0] - a[0]) * e[0] + (l[1] - a[1]) * e[1]) / len2).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    let dx = l[0] - a[0] - t * e[0];
+                    let dy = l[1] - a[1] - t * e[1];
+                    let d = (dx * dx + dy * dy).sqrt();
+                    if d < best.0 {
+                        best = (d, i as f64 + t);
+                    }
+                }
+                ([best.1, l[2]], best.0)
+            }
+            SurfaceView::Nurbs(view) => {
+                // Seeds: the nearest few precomputed boxes (Raw), or a
+                // coarse scan of the domain (Owned, build-side only).
+                let mut seeds: [[f64; 2]; 4] = [[0.0; 2]; 4];
+                let mut seed_count = 0usize;
+                match view {
+                    NurbsView::Raw(raw) => {
+                        let mut ranked: [(f64, [f64; 2]); 4] = [(f64::INFINITY, [0.0; 2]); 4];
+                        for s in 0..raw.seed_nu * raw.seed_nv {
+                            let base = raw.seeds_off + s * 32;
+                            let mut d2 = 0.0f64;
+                            for (axis, &c) in p.iter().enumerate() {
+                                let lo = f32_at(raw.bytes, base + axis * 4) as f64;
+                                let hi = f32_at(raw.bytes, base + 12 + axis * 4) as f64;
+                                let gap = (lo - c).max(c - hi).max(0.0);
+                                d2 += gap * gap;
+                            }
+                            for slot in 0..ranked.len() {
+                                if d2 < ranked[slot].0 {
+                                    ranked[slot..].rotate_right(1);
+                                    ranked[slot] = (
+                                        d2,
+                                        [
+                                            f32_at(raw.bytes, base + 24) as f64,
+                                            f32_at(raw.bytes, base + 28) as f64,
+                                        ],
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                        for (d2, uv) in ranked {
+                            if d2.is_finite() {
+                                seeds[seed_count] = uv;
+                                seed_count += 1;
+                            }
+                        }
+                    }
+                    NurbsView::Owned(_) => {
+                        let dom = view.domain();
+                        const N: usize = 9;
+                        let mut ranked: [(f64, [f64; 2]); 4] = [(f64::INFINITY, [0.0; 2]); 4];
+                        for i in 0..=N {
+                            for j in 0..=N {
+                                let u = dom[0] + (dom[1] - dom[0]) * i as f64 / N as f64;
+                                let v = dom[2] + (dom[3] - dom[2]) * j as f64 / N as f64;
+                                let (q, _, _) = nurbs::surface_eval(view, u, v);
+                                let d2 = {
+                                    let r = sub(q, p);
+                                    dot(r, r)
+                                };
+                                for slot in 0..ranked.len() {
+                                    if d2 < ranked[slot].0 {
+                                        ranked[slot..].rotate_right(1);
+                                        ranked[slot] = (d2, [u, v]);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        for (d2, uv) in ranked {
+                            if d2.is_finite() {
+                                seeds[seed_count] = uv;
+                                seed_count += 1;
+                            }
+                        }
+                    }
+                }
+                let mut best = ([0.0; 2], f64::INFINITY);
+                for seed in &seeds[..seed_count] {
+                    let (uv, d) = nurbs::surface_closest(view, p, *seed);
+                    if d < best.1 {
+                        best = (uv, d);
+                    }
+                }
+                best
+            }
+        }
+    }
+
     /// Report every ray–surface crossing along `origin + t * dir` to
     /// `visit(hit)`. `dir` need not be unit length. `eps` is the solid's
     /// 3D suspicion tolerance; hits of any `t` (either sign) are

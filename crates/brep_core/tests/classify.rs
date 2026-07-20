@@ -83,6 +83,7 @@ fn cube_solid() -> Solid {
                     frame: Frame::from_axis_ref(origin, z, x_ref),
                 },
                 trims: square_trim(1.0),
+                color: None,
             });
         }
     }
@@ -119,6 +120,7 @@ fn cylinder_solid_with_caps() {
             radius: 1.0,
         },
         trims: vec![vec![[0.0, -1.0], [TAU, -1.0], [TAU, 1.0], [0.0, 1.0]]],
+        color: None,
     };
     let circle: Vec<[f64; 2]> = (0..64)
         .map(|i| {
@@ -131,6 +133,7 @@ fn cylinder_solid_with_caps() {
             frame: Frame::from_axis_ref([0.0, 0.0, side_z], [0.0, 0.0, side_z], [1.0, 0.0, 0.0]),
         },
         trims: vec![circle.clone()],
+        color: None,
     });
     let [cap_a, cap_b] = caps;
     let model = single(Solid {
@@ -158,6 +161,7 @@ fn sphere_full_face() {
             [PI, FRAC_PI_2],
             [-PI, FRAC_PI_2],
         ]],
+        color: None,
     };
     let model = single(Solid { faces: vec![face] });
     check_grid(&model, 24, [-1.0, 1.0, -1.0, 1.0, -1.0, 1.0], |p| {
@@ -175,6 +179,7 @@ fn torus_full_face() {
             minor: 0.5,
         },
         trims: vec![vec![[0.0, 0.0], [TAU, 0.0], [TAU, TAU], [0.0, TAU]]],
+        color: None,
     };
     let model = single(Solid { faces: vec![face] });
     check_grid(&model, 24, [-2.5, 2.5, -2.5, 2.5, -0.5, 0.5], |p| {
@@ -216,6 +221,7 @@ fn cube_with_drilled_hole() {
                     frame: Frame::from_axis_ref(origin, z, x_ref),
                 },
                 trims,
+                color: None,
             });
         }
     }
@@ -225,6 +231,7 @@ fn cube_with_drilled_hole() {
             radius: 0.5,
         },
         trims: vec![vec![[0.0, -1.0], [TAU, -1.0], [TAU, 1.0], [0.0, 1.0]]],
+        color: None,
     });
     let model = single(Solid { faces });
     check_grid(&model, 24, [-1.0, 1.0, -1.0, 1.0, -1.0, 1.0], |p| {
@@ -289,6 +296,7 @@ fn cube_with_nurbs_top() {
             ],
         }),
         trims: vec![vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]],
+        color: None,
     });
     let model = single(solid);
     check_grid(&model, 24, [-1.0, 1.0, -1.0, 1.0, -1.0, 1.0], |p| {
@@ -342,12 +350,14 @@ fn closed_profile_extrusion_prism() {
         },
         // Full period in u (5 segments), v in [-1, 1].
         trims: vec![vec![[0.0, -1.0], [5.0, -1.0], [5.0, 1.0], [0.0, 1.0]]],
+        color: None,
     };
     let cap = |z: f64| Face {
         surface: Surface::Plane {
             frame: Frame::from_axis_ref([0.0, 0.0, z], [0.0, 0.0, z], [1.0, 0.0, 0.0]),
         },
         trims: vec![corners.clone().into_iter().collect()],
+        color: None,
     };
     let model = single(Solid {
         faces: vec![side, cap(1.0), cap(-1.0)],
@@ -420,6 +430,7 @@ fn closed_nurbs_cylinder_seam() {
             ctrl,
         }),
         trims: vec![vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]],
+        color: None,
     };
     let circle64: Vec<[f64; 2]> = (0..64)
         .map(|i| {
@@ -432,6 +443,7 @@ fn closed_nurbs_cylinder_seam() {
             frame: Frame::from_axis_ref([0.0, 0.0, z], [0.0, 0.0, z], [1.0, 0.0, 0.0]),
         },
         trims: vec![circle64.clone()],
+        color: None,
     };
     let model = single(Solid {
         faces: vec![side, cap(1.0), cap(-1.0)],

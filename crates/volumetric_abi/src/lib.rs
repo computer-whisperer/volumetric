@@ -160,6 +160,20 @@ pub enum ChannelKind {
 /// Conventional channel name emitted by the SDF-generation operator.
 pub const SIGNED_DISTANCE_CHANNEL_NAME: &str = "signed_distance";
 
+/// Namespaced [`ChannelKind::Custom`] identifier for one component of a
+/// surface-color triple. Values are sRGB in `[0.0, 1.0]`, and the color at
+/// a position is the color of the *nearest surface* of the model — defined
+/// everywhere (inside, outside, and beyond the geometry bounds), so
+/// consumers may sample it at meshed vertices that sit on or fractionally
+/// off the boundary. A model declares all three components, named by
+/// [`COLOR_CHANNEL_NAMES`] in r, g, b order; consumers locate the triple
+/// with [`SampleFormat::color_trio`].
+pub const COLOR_SRGB_CHANNEL_KIND: &str = "volumetric.color_srgb.v1";
+
+/// Conventional channel names for the sRGB surface-color triple, in
+/// declaration order (r, g, b).
+pub const COLOR_CHANNEL_NAMES: [&str; 3] = ["color_r", "color_g", "color_b"];
+
 /// Namespaced [`ChannelKind::Custom`] identifier for a truncated signed
 /// distance field. Values are world-space distance, negative inside and
 /// positive outside, clamped to a generator-declared symmetric band.
@@ -218,6 +232,23 @@ impl SampleFormat {
             }
         }
         Ok(())
+    }
+
+    /// Locate the sRGB surface-color triple: the channel indices of
+    /// [`COLOR_CHANNEL_NAMES`] in r, g, b order, when all three are
+    /// declared with kind [`COLOR_SRGB_CHANNEL_KIND`].
+    pub fn color_trio(&self) -> Option<[usize; 3]> {
+        let index_of = |name: &str| {
+            self.channels.iter().position(|c| {
+                c.name == name
+                    && matches!(&c.kind, ChannelKind::Custom(kind) if kind == COLOR_SRGB_CHANNEL_KIND)
+            })
+        };
+        Some([
+            index_of(COLOR_CHANNEL_NAMES[0])?,
+            index_of(COLOR_CHANNEL_NAMES[1])?,
+            index_of(COLOR_CHANNEL_NAMES[2])?,
+        ])
     }
 }
 
@@ -670,6 +701,44 @@ mod tests {
             ],
         };
         assert!(dup.validate().is_err());
+    }
+
+    #[test]
+    fn color_trio_located_by_name_and_kind() {
+        let color = |name: &str| SampleChannel {
+            name: name.to_string(),
+            kind: ChannelKind::Custom(COLOR_SRGB_CHANNEL_KIND.to_string()),
+        };
+        let format = SampleFormat {
+            channels: vec![
+                SampleChannel {
+                    name: "occupancy".to_string(),
+                    kind: ChannelKind::Occupancy,
+                },
+                color("color_r"),
+                color("color_g"),
+                color("color_b"),
+            ],
+        };
+        assert_eq!(format.color_trio(), Some([1, 2, 3]));
+        assert_eq!(SampleFormat::default().color_trio(), None);
+
+        // Right names with the wrong kind don't count.
+        let impostor = SampleFormat {
+            channels: vec![
+                SampleChannel {
+                    name: "occupancy".to_string(),
+                    kind: ChannelKind::Occupancy,
+                },
+                SampleChannel {
+                    name: "color_r".to_string(),
+                    kind: ChannelKind::Density,
+                },
+                color("color_g"),
+                color("color_b"),
+            ],
+        };
+        assert_eq!(impostor.color_trio(), None);
     }
 
     #[test]

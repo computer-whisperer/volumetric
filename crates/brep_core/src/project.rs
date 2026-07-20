@@ -197,33 +197,7 @@ fn unwrap(angle: f64, hint: Option<f64>, period: f64) -> f64 {
 /// Gauss-Newton closest point on a NURBS surface, clamped to the domain.
 /// Returns (uv, distance).
 fn nurbs_closest(n: &crate::ir::NurbsSurface, p: Vec3, seed: [f64; 2]) -> Option<([f64; 2], f64)> {
-    let dom = n.domain();
-    let (mut u, mut v) = (seed[0].clamp(dom[0], dom[1]), seed[1].clamp(dom[2], dom[3]));
-    let scale_u = (dom[1] - dom[0]).max(1e-12);
-    let scale_v = (dom[3] - dom[2]).max(1e-12);
-    for _ in 0..50 {
-        let (s, su, sv) = nurbs::surface_eval(n, u, v);
-        let r = sub(s, p);
-        // Normal equations for min |S(u,v) - p|^2.
-        let a = crate::math::dot(su, su);
-        let b = crate::math::dot(su, sv);
-        let c = crate::math::dot(sv, sv);
-        let g0 = crate::math::dot(su, r);
-        let g1 = crate::math::dot(sv, r);
-        let det = a * c - b * b;
-        if det.abs() < 1e-30 {
-            return Some(([u, v], norm(r)));
-        }
-        let du = -(c * g0 - b * g1) / det;
-        let dv = -(a * g1 - b * g0) / det;
-        u = (u + du).clamp(dom[0], dom[1]);
-        v = (v + dv).clamp(dom[2], dom[3]);
-        if du.abs() < 1e-12 * scale_u && dv.abs() < 1e-12 * scale_v {
-            break;
-        }
-    }
-    let (s, _, _) = nurbs::surface_eval(n, u, v);
-    Some(([u, v], norm(sub(s, p))))
+    Some(nurbs::surface_closest(n, p, seed))
 }
 
 /// Flatten a circle (full or arc, in its own frame at `radius`, from

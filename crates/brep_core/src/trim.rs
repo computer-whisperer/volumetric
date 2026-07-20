@@ -156,6 +156,70 @@ impl<S: LoopSet> Region<S> {
             near_boundary: near,
         }
     }
+
+    /// The UV point on the trim boundary nearest to `(u, v)` — in loop
+    /// coordinates (unwrapped domain), so it can be fed straight to the
+    /// surface's `eval`. Distances compare in the eps-normalized metric
+    /// (per-axis 3D-equivalent units), and on periodic axes every shifted
+    /// copy of the query competes, like [`Region::contains`]. Returns the
+    /// query itself when the region has no segments.
+    pub fn nearest_boundary_uv(&self, u: f64, v: f64) -> [f64; 2] {
+        let inv_eps = [
+            if self.uv_eps[0] > 0.0 {
+                1.0 / self.uv_eps[0]
+            } else {
+                1.0
+            },
+            if self.uv_eps[1] > 0.0 {
+                1.0 / self.uv_eps[1]
+            } else {
+                1.0
+            },
+        ];
+        let (u_shifts, nu) = period_shifts(u, self.u_period, self.uv_aabb[0], self.uv_aabb[1]);
+        let (v_shifts, nv) = period_shifts(v, self.v_period, self.uv_aabb[2], self.uv_aabb[3]);
+
+        let mut best = [u, v];
+        let mut best_d2 = f64::INFINITY;
+        for &us in &u_shifts[..nu] {
+            for &vs in &v_shifts[..nv] {
+                for i in 0..self.loops.len() {
+                    let lp = self.loops.at(i);
+                    let n = lp.len();
+                    if n == 0 {
+                        continue;
+                    }
+                    let mut prev = lp.point(n - 1);
+                    for j in 0..n {
+                        let cur = lp.point(j);
+                        let du = [
+                            (cur[0] - prev[0]) * inv_eps[0],
+                            (cur[1] - prev[1]) * inv_eps[1],
+                        ];
+                        let dp = [(us - prev[0]) * inv_eps[0], (vs - prev[1]) * inv_eps[1]];
+                        let seg_len2 = du[0] * du[0] + du[1] * du[1];
+                        let t = if seg_len2 > 0.0 {
+                            ((dp[0] * du[0] + dp[1] * du[1]) / seg_len2).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        let dx = dp[0] - t * du[0];
+                        let dy = dp[1] - t * du[1];
+                        let d2 = dx * dx + dy * dy;
+                        if d2 < best_d2 {
+                            best_d2 = d2;
+                            best = [
+                                prev[0] + t * (cur[0] - prev[0]),
+                                prev[1] + t * (cur[1] - prev[1]),
+                            ];
+                        }
+                        prev = cur;
+                    }
+                }
+            }
+        }
+        best
+    }
 }
 
 /// Candidate parameter values for a periodic axis: the input shifted so

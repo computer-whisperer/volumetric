@@ -162,6 +162,39 @@ pub fn surface_eval<S: SurfaceData>(s: &S, u: f64, v: f64) -> (Vec3, Vec3, Vec3)
     (p, s_u, s_v)
 }
 
+/// Gauss-Newton closest point on the surface from one seed, clamped to
+/// the parameter domain. Returns `(uv, distance)` — a local minimum;
+/// callers polish from several seeds and keep the best.
+pub fn surface_closest<S: SurfaceData>(s: &S, p: Vec3, seed: [f64; 2]) -> ([f64; 2], f64) {
+    let dom = s.domain();
+    let (mut u, mut v) = (seed[0].clamp(dom[0], dom[1]), seed[1].clamp(dom[2], dom[3]));
+    let scale_u = (dom[1] - dom[0]).max(1e-12);
+    let scale_v = (dom[3] - dom[2]).max(1e-12);
+    for _ in 0..50 {
+        let (q, su, sv) = surface_eval(s, u, v);
+        let r = crate::math::sub(q, p);
+        // Normal equations for min |S(u,v) - p|^2.
+        let a = crate::math::dot(su, su);
+        let b = crate::math::dot(su, sv);
+        let c = crate::math::dot(sv, sv);
+        let g0 = crate::math::dot(su, r);
+        let g1 = crate::math::dot(sv, r);
+        let det = a * c - b * b;
+        if det.abs() < 1e-30 {
+            return ([u, v], crate::math::norm(r));
+        }
+        let du = -(c * g0 - b * g1) / det;
+        let dv = -(a * g1 - b * g0) / det;
+        u = (u + du).clamp(dom[0], dom[1]);
+        v = (v + dv).clamp(dom[2], dom[3]);
+        if du.abs() < 1e-12 * scale_u && dv.abs() < 1e-12 * scale_v {
+            break;
+        }
+    }
+    let (q, _, _) = surface_eval(s, u, v);
+    ([u, v], crate::math::norm(crate::math::sub(q, p)))
+}
+
 /// Curve point and first derivative at u, rational-aware.
 pub fn curve_eval<C: CurveData>(c: &C, u: f64) -> (Vec3, Vec3) {
     let p = c.degree();

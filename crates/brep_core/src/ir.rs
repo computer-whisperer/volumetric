@@ -44,6 +44,10 @@ pub struct Face {
     /// *unwrapped*: consecutive points continue past the seam (u may run
     /// beyond one period; matching happens modulo the period).
     pub trims: Vec<Vec<[f64; 2]>>,
+    /// Display color of this face, sRGB components in `[0.0, 1.0]`
+    /// (STEP presentation styling). `None` = unstyled; the payload
+    /// stores it at 8 bits per component.
+    pub color: Option<[f32; 3]>,
 }
 
 /// An exact surface with its natural UV parameterization.
