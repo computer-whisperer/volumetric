@@ -52,6 +52,7 @@ const OPERATORS: &[&str] = &[
     "offset_operator",
     "sweep_operator",
     "cylinder_operator",
+    "coil_operator",
     "subspace_operator",
     "subspace_fit_operator",
     "model_bound_operator",

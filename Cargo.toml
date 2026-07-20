@@ -75,6 +75,8 @@ members = [
     "crates/operators/offset_operator",
     "crates/operators/sweep_operator",
     "crates/operators/cylinder_operator",
+    "crates/coil_model_template",
+    "crates/operators/coil_operator",
     "crates/volumetric_assets",
     "crates/volumetric_renderer",
     "crates/volumetric_ui_v2",

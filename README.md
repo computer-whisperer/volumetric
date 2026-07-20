@@ -59,6 +59,7 @@ Transform operators take an existing model and produce a modified version:
 | `scale` | Scales a model uniformly or non-uniformly | `{sx, sy, sz}` - scale factors |
 | `rotation` | Rotates a model around an axis | `{angle, axis}` - angle in radians and axis vector |
 | `boolean` | Combines two models with CSG operations | `{operation}` - "union", "subtract", or "intersect" |
+| `coil` | Rolls a flat model into an Archimedean spiral around the y axis (x becomes arc length, z radial depth) | `{inner_radius, gap}` - bore radius and inter-wrap clearance |
 
 ### Generator Operators
 Generator operators create new models from configuration or external data:
