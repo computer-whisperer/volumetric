@@ -1012,9 +1012,70 @@ fn collapse_flips_normals(
         if dot(orig, n_new) <= 0.0 && dot(orig, orig) > 0.0 {
             return true;
         }
+        // Pairwise mint check. The per-face anchors above allow two
+        // neighboring faces to each rotate legally yet end up folded onto
+        // each other (each within 90 degrees of its anchor, but on opposite
+        // sides). Reject any collapse that would CREATE a hard fold across
+        // one of this face's edges — pairs already opposed at entry (sharp
+        // thin-wall rims) stay collapsible. The neighbor set across the
+        // post-collapse edges is the moved siblings (old src-edges) plus the
+        // dst-ring faces those edges merge with.
+        let fold_minted = |g_fi: u32| -> bool {
+            if g_fi == fi || deleted[g_fi as usize] {
+                return false;
+            }
+            let g = faces[g_fi as usize];
+            if g.contains(&src) && g.contains(&dst) {
+                return false; // Removed by this collapse.
+            }
+            // Adjacent iff the faces share an edge after src -> dst.
+            let shared = face
+                .iter()
+                .filter(|v| g.contains(v) || (**v == src && g.contains(&dst)))
+                .count();
+            if shared < 2 {
+                return false;
+            }
+            let g_old: [[f64; 3]; 3] = [
+                positions[g[0] as usize],
+                positions[g[1] as usize],
+                positions[g[2] as usize],
+            ];
+            let mut g_new = g_old;
+            for (slot, &v) in g_new.iter_mut().zip(&g) {
+                if v == src {
+                    *slot = dst_pos;
+                }
+            }
+            let gn_old = cross(sub(g_old[1], g_old[0]), sub(g_old[2], g_old[0]));
+            let gn_new = cross(sub(g_new[1], g_new[0]), sub(g_new[2], g_new[0]));
+            let (Some(f_old), Some(f_new), Some(g_o), Some(g_n)) = (
+                normalize(n_old),
+                normalize(n_new),
+                normalize(gn_old),
+                normalize(gn_new),
+            ) else {
+                return false;
+            };
+            dot(f_new, g_n) < HARD_FOLD_DOT && dot(f_old, g_o) >= HARD_FOLD_DOT
+        };
+        for &v in &face {
+            let ring = if v == src { dst } else { v };
+            if adjacency.of(ring).iter().any(|&g_fi| fold_minted(g_fi)) {
+                return true;
+            }
+        }
+        if adjacency.of(src).iter().any(|&g_fi| fold_minted(g_fi)) {
+            return true;
+        }
     }
     false
 }
+
+/// Unit-normal dot below which two edge-adjacent faces count as folded back
+/// on each other. Matches the validity metric used by the fold regression
+/// tests; the flip guard refuses to mint new pairs below it.
+const HARD_FOLD_DOT: f64 = -0.9;
 
 #[cfg(all(test, feature = "native"))]
 mod tests {
