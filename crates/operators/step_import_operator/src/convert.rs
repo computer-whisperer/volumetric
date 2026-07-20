@@ -36,6 +36,7 @@ pub fn build_model(data: &DataSection, opts: &Options) -> Result<BRepModel, Stri
         angle_scale,
     };
     let asm = AssemblyGraph::build(data)?;
+    let colors = crate::style::collect_colors(data);
 
     let mut model = BRepModel::default();
     let mut solid_index: HashMap<u64, usize> = HashMap::new();
@@ -50,6 +51,7 @@ pub fn build_model(data: &DataSection, opts: &Options) -> Result<BRepModel, Stri
             &label,
             0,
             opts,
+            &colors,
             &mut model,
             &mut solid_index,
         )?;
@@ -312,6 +314,7 @@ fn walk(
     label: &str,
     depth: usize,
     opts: &Options,
+    colors: &HashMap<u64, [f32; 3]>,
     model: &mut BRepModel,
     solid_index: &mut HashMap<u64, usize>,
 ) -> Result<(), String> {
@@ -339,7 +342,7 @@ fn walk(
             let solid = match solid_index.get(&item_id) {
                 Some(&idx) => idx,
                 None => {
-                    let converted = convert_solid(ctx, item_id, opts)
+                    let converted = convert_solid(ctx, item_id, opts, colors)
                         .map_err(|e| format!("solid #{item_id}: {e}"))?;
                     model.solids.push(converted);
                     let idx = model.solids.len() - 1;
@@ -374,6 +377,7 @@ fn walk(
                 child_label,
                 depth + 1,
                 opts,
+                colors,
                 model,
                 solid_index,
             )?;
@@ -386,10 +390,20 @@ fn walk(
 // Solid and face conversion
 // -------------------------------------------------------------------
 
-fn convert_solid(ctx: &Ctx, msb_id: u64, opts: &Options) -> Result<Solid, String> {
+fn convert_solid(
+    ctx: &Ctx,
+    msb_id: u64,
+    opts: &Options,
+    colors: &HashMap<u64, [f32; 3]>,
+) -> Result<Solid, String> {
+    let body_color = colors.get(&msb_id).copied();
     let mut faces = Vec::new();
     for face_id in ctx.solid_faces(msb_id)? {
-        faces.push(convert_face(ctx, face_id, opts).map_err(|e| format!("face #{face_id}: {e}"))?);
+        let mut face =
+            convert_face(ctx, face_id, opts).map_err(|e| format!("face #{face_id}: {e}"))?;
+        // Face styling overrides the body style.
+        face.color = colors.get(&face_id).copied().or(body_color);
+        faces.push(face);
     }
     Ok(Solid { faces })
 }

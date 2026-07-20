@@ -35,6 +35,7 @@
 pub mod convert;
 pub mod entities;
 pub mod p21;
+pub mod style;
 
 use brep_core::ir::BRepModel;
 use walrus::{FunctionId, Module, ModuleConfig};
@@ -114,11 +115,26 @@ fn const_i32_return(module: &Module, func_id: FunctionId) -> Option<i32> {
     }
 }
 
-/// Patch a `brep_core` payload into the embedded template.
-pub fn patch_template(payload: &[u8]) -> Result<Vec<u8>, String> {
+/// Patch a `brep_core` payload into the embedded template. `has_color`
+/// keeps the typed-channel exports (`get_sample_format`,
+/// `sample_channels` — the sRGB surface-color triple); models imported
+/// without any styling drop them and stay occupancy-only.
+pub fn patch_template(payload: &[u8], has_color: bool) -> Result<Vec<u8>, String> {
     let config = ModuleConfig::new();
     let mut module = Module::from_buffer_with_config(TEMPLATE, &config)
         .map_err(|e| format!("failed to parse the embedded template: {e}"))?;
+
+    if !has_color {
+        let channel_exports: Vec<_> = module
+            .exports
+            .iter()
+            .filter(|e| e.name == "get_sample_format" || e.name == "sample_channels")
+            .map(|e| e.id())
+            .collect();
+        for id in channel_exports {
+            module.exports.delete(id);
+        }
+    }
 
     let memory_id = module
         .exports
@@ -204,9 +220,14 @@ mod operator {
                 return;
             }
         };
-        let result = import(text, &cfg)
-            .and_then(|model| brep_core::payload::build_payload(&model))
-            .and_then(|payload| patch_template(&payload));
+        let result = import(text, &cfg).and_then(|model| {
+            let has_color = model
+                .solids
+                .iter()
+                .any(|s| s.faces.iter().any(|f| f.color.is_some()));
+            let payload = brep_core::payload::build_payload(&model)?;
+            patch_template(&payload, has_color)
+        });
         match result {
             Ok(wasm) => post_output(0, &wasm),
             Err(e) => report_error(&format!("STEP import failed: {e}")),

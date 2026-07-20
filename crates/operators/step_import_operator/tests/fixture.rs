@@ -59,16 +59,75 @@ fn classifies_box_and_cylinder_exactly() {
 fn wasm_template_patches_and_validates() {
     let model = import(FIXTURE, &StepConfig::default()).unwrap();
     let payload = build_payload(&model).unwrap();
-    let wasm = step_import_operator::patch_template(&payload).expect("patch template");
+    let wasm = step_import_operator::patch_template(&payload, false).expect("patch template");
     // The patched module keeps the Model ABI exports and drops the
-    // patch-slot helper.
+    // patch-slot helper; an unstyled import also drops the typed-channel
+    // exports.
     let module = walrus::Module::from_buffer(&wasm).expect("emitted wasm parses");
     let names: Vec<&str> = module.exports.iter().map(|e| e.name.as_str()).collect();
     for required in ["sample", "get_bounds", "get_dimensions", "memory"] {
         assert!(names.contains(&required), "missing export {required}");
     }
+    for dropped in ["brep_payload_slot", "get_sample_format", "sample_channels"] {
+        assert!(!names.contains(&dropped), "export {dropped} must be dropped");
+    }
+
+    // A colored import keeps the channel exports.
+    let wasm = step_import_operator::patch_template(&payload, true).unwrap();
+    let module = walrus::Module::from_buffer(&wasm).unwrap();
+    let names: Vec<&str> = module.exports.iter().map(|e| e.name.as_str()).collect();
+    for required in ["get_sample_format", "sample_channels"] {
+        assert!(names.contains(&required), "missing export {required}");
+    }
+}
+
+const COLORED_FIXTURE: &str = include_str!("fixtures/colored_box_cylinder.step");
+
+#[test]
+fn styled_items_color_bodies_and_faces() {
+    // The fixture styles the box body red, overrides its x = -5 face
+    // green, and styles the cylinder body blue (via the pre-defined
+    // colour name).
+    let model = import(COLORED_FIXTURE, &StepConfig::default()).expect("import");
+
+    let mut seen = std::collections::HashSet::new();
+    for solid in &model.solids {
+        for face in &solid.faces {
+            if let Some(c) = face.color {
+                seen.insert(c.map(|v| (v * 255.0) as u8));
+            }
+        }
+    }
+    assert_eq!(
+        seen,
+        [[255, 0, 0], [0, 255, 0], [0, 0, 255]].into_iter().collect(),
+        "expected exactly red/green/blue faces, got {seen:?}"
+    );
+
+    // Through the payload: nearest-face color at points just off each
+    // surface (fixture is in millimetres, the model in metres).
+    let payload = build_payload(&model).unwrap();
+    let view = brep_core::payload::PayloadView::new(&payload).unwrap();
+    const MM: f64 = 1e-3;
+    for (p_mm, expect) in [
+        ([-5.1, 0.0, 0.0], [0.0, 1.0, 0.0]), // green -x face override
+        ([5.1, 0.0, 0.0], [1.0, 0.0, 0.0]),  // red body elsewhere
+        ([0.0, 4.1, 0.0], [1.0, 0.0, 0.0]),
+        ([23.1, 0.0, 3.0], [0.0, 0.0, 1.0]), // blue cylinder wall
+        ([20.0, 0.0, 9.1], [0.0, 0.0, 1.0]), // blue cylinder cap
+    ] {
+        let p = p_mm.map(|v| v * MM);
+        assert_eq!(view.nearest_color(p), Some(expect), "at {p_mm:?} mm");
+    }
+}
+
+#[test]
+fn unstyled_import_has_no_colors() {
+    let model = import(FIXTURE, &StepConfig::default()).unwrap();
     assert!(
-        !names.contains(&"brep_payload_slot"),
-        "patch slot export must be dropped"
+        model
+            .solids
+            .iter()
+            .all(|s| s.faces.iter().all(|f| f.color.is_none()))
     );
 }

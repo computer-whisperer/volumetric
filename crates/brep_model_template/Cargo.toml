@@ -8,3 +8,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 brep_core = { path = "../brep_core" }
+volumetric_abi = { path = "../volumetric_abi" }

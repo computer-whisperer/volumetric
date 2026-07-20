@@ -99,6 +99,87 @@ fn step_fixture_imports_to_a_sampleable_solid() {
     }
 }
 
+const COLORED_FIXTURE: &[u8] = include_bytes!(
+    "../crates/operators/step_import_operator/tests/fixtures/colored_box_cylinder.step"
+);
+
+#[test]
+fn colored_step_exposes_the_srgb_channel_trio() {
+    let project = Project {
+        version: 2,
+        imports: vec![ImportedAsset::operator(
+            "importer".to_string(),
+            wasm_artifact("step_import_operator"),
+        )],
+        timeline: vec![ExecutionStep {
+            operator_id: "importer".to_string(),
+            inputs: vec![
+                ExecutionInput::Inline(COLORED_FIXTURE.to_vec()),
+                ExecutionInput::Inline(Vec::new()),
+            ],
+            outputs: vec!["solid".to_string()],
+        }],
+        exports: vec!["solid".to_string()],
+        baked: None,
+    };
+    let mut env = Environment::new();
+    let exports = project.run(&mut env).expect("project run failed");
+    let solid = exports.iter().find(|e| e.id() == "solid").unwrap();
+
+    let mut executor = create_model_executor(solid.data()).expect("model instantiates");
+    let format = executor.sample_format().expect("sample format");
+    let trio = format
+        .color_trio()
+        .expect("colored import declares the sRGB trio");
+
+    // Fixture styling: box body red with a green x = -5mm face override,
+    // cylinder blue. Colors are nearest-surface, so points just off each
+    // face (in metres) resolve to that face's color; channel 0 matches
+    // plain occupancy.
+    for (p_mm, inside, expect) in [
+        ([-5.1, 0.0, 0.0], false, [0.0, 1.0, 0.0]),
+        ([-4.9, 0.0, 0.0], true, [0.0, 1.0, 0.0]),
+        ([5.1, 0.0, 0.0], false, [1.0, 0.0, 0.0]),
+        ([23.1, 0.0, 3.0], false, [0.0, 0.0, 1.0]),
+        ([22.9, 0.0, 3.0], true, [0.0, 0.0, 1.0]),
+    ] {
+        let p = p_mm.map(|v| v * 1e-3);
+        let row = executor.sample_channels_nd(&p).expect("sample_channels");
+        assert_eq!(
+            is_occupied(row[0]),
+            inside,
+            "occupancy at {p_mm:?} mm: {row:?}"
+        );
+        let rgb = trio.map(|i| row[i]);
+        assert_eq!(rgb, expect, "color at {p_mm:?} mm");
+    }
+
+    // The uncolored fixture keeps the occupancy-only default format.
+    let project = Project {
+        version: 2,
+        imports: vec![ImportedAsset::operator(
+            "importer".to_string(),
+            wasm_artifact("step_import_operator"),
+        )],
+        timeline: vec![ExecutionStep {
+            operator_id: "importer".to_string(),
+            inputs: vec![
+                ExecutionInput::Inline(FIXTURE.to_vec()),
+                ExecutionInput::Inline(Vec::new()),
+            ],
+            outputs: vec!["solid".to_string()],
+        }],
+        exports: vec!["solid".to_string()],
+        baked: None,
+    };
+    let mut env = Environment::new();
+    let exports = project.run(&mut env).expect("project run failed");
+    let solid = exports.iter().find(|e| e.id() == "solid").unwrap();
+    let mut executor = create_model_executor(solid.data()).unwrap();
+    let format = executor.sample_format().expect("sample format");
+    assert_eq!(format.channels.len(), 1, "unstyled import stays occupancy-only");
+}
+
 #[test]
 fn bad_step_reports_a_clear_error() {
     let project = Project {

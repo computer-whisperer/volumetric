@@ -92,3 +92,50 @@ pub extern "C" fn sample(pos_ptr: i32) -> f32 {
         _ => 0.0,
     }
 }
+
+/// Typed-channel format: occupancy plus the sRGB surface-color triple.
+/// The operator strips this export (and `sample_channels`) from models
+/// imported without any styling, so only actually-colored models
+/// advertise the channels.
+#[unsafe(no_mangle)]
+pub extern "C" fn get_sample_format() -> i64 {
+    static FORMAT: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    volumetric_abi::sample_format_reply(&FORMAT, || volumetric_abi::SampleFormat {
+        channels: core::iter::once(volumetric_abi::SampleChannel {
+            name: "occupancy".to_string(),
+            kind: volumetric_abi::ChannelKind::Occupancy,
+        })
+        .chain(
+            volumetric_abi::COLOR_CHANNEL_NAMES
+                .iter()
+                .map(|name| volumetric_abi::SampleChannel {
+                    name: name.to_string(),
+                    kind: volumetric_abi::ChannelKind::Custom(
+                        volumetric_abi::COLOR_SRGB_CHANNEL_KIND.to_string(),
+                    ),
+                }),
+        )
+        .collect(),
+    })
+}
+
+/// Occupancy plus nearest-face sRGB color, one f32 per channel. The
+/// color triple is NaN when the template is unpatched (errors read as
+/// "no value"); unstyled faces read as white per `nearest_color`.
+#[unsafe(no_mangle)]
+pub extern "C" fn sample_channels(pos_ptr: i32, out_ptr: i32) {
+    let p: [f64; 3] = core::array::from_fn(|i| unsafe {
+        core::ptr::read_unaligned((pos_ptr as usize + i * 8) as *const f64)
+    });
+    let (occupancy, color) = match payload() {
+        Some(view) => (
+            if view.is_inside(p) { 1.0f32 } else { 0.0 },
+            view.nearest_color(p).unwrap_or([f32::NAN; 3]),
+        ),
+        None => (0.0, [f32::NAN; 3]),
+    };
+    let row = [occupancy, color[0], color[1], color[2]];
+    for (i, v) in row.iter().enumerate() {
+        unsafe { core::ptr::write_unaligned((out_ptr as usize + i * 4) as *mut f32, *v) };
+    }
+}

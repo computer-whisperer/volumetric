@@ -356,6 +356,7 @@ name = "brep_model_template"
 version = "0.1.0"
 dependencies = [
  "brep_core",
+ "volumetric_abi",
 ]
 
 [[package]]
