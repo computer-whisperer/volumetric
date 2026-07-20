@@ -3625,6 +3625,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "offset_operator"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "ndfield_model_core",
+ "serde",
+ "volumetric_abi",
+ "walrus",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

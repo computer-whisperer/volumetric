@@ -72,6 +72,7 @@ members = [
     "crates/ndfield_model_core",
     "crates/sdf_model_template",
     "crates/operators/sdf_operator",
+    "crates/operators/offset_operator",
     "crates/volumetric_assets",
     "crates/volumetric_renderer",
     "crates/volumetric_ui_v2",

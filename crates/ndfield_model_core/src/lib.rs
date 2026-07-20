@@ -24,6 +24,8 @@
 //! multilinear interpolation. Samples outside it—including NaN positions—
 //! return `outside_value`.
 
+pub mod bake;
+
 pub const MAGIC: u32 = 0x3146_444e; // "NDF1"
 pub const MAX_DIMS: usize = 8;
 
