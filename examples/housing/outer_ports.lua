@@ -33,12 +33,15 @@ function is_inside(x, y, z)
     if y <= -0.0195 and x >= -0.011 and x <= 0.010 and z >= 0.0013 then
         return 0.0
     end
-    -- North port band: stadium opening + flush-top scoop.
+    -- North port band: USB mouth sized for the USB-IF maximum plug
+    -- overmold (12.35 x 6.5mm) plus ~0.3mm clearance — the port is
+    -- recessed ~2.6mm, so the whole wall opening must pass the overmold
+    -- envelope. 13.0mm wide, open through the top, floor at z=0.15mm
+    -- with r1.0 bottom corners; plus the flush-top scoop ledge.
     if y >= 0.0123 then
-        local sx = math.min(math.max(x, -0.0029), 0.0029)
-        local dx = x - sx
-        local dz = z - 0.0037
-        if dx * dx + dz * dz <= 0.0022 * 0.0022 then
+        local mx = math.max(math.abs(x) - 0.0055, 0.0)
+        local mz = math.max(0.00115 - z, 0.0)
+        if z >= 0.00015 and mx * mx + mz * mz <= 0.000001 then
             return 0.0
         end
         if x >= -0.007 and x <= 0.007 and z >= 0.0053 then
