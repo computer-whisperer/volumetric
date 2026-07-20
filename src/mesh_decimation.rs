@@ -19,7 +19,12 @@
 //! cannot accumulate across successive collapses).
 //! Boundary edges (open surfaces where the model meets the sampling bounds)
 //! are pinned by perpendicular constraint quadrics and may only collapse
-//! along the boundary itself.
+//! along the boundary itself. Vertices whose entry shading normal disagrees
+//! with an incident face plane (unresolved shading discontinuities from the
+//! sharp-feature stage) are frozen out of collapses so the final normal
+//! re-accumulation cannot smear their blend across large triangles — unless
+//! such vertices are pervasive (thin-strut lattices), where the pin would
+//! defeat decimation and is disabled wholesale.
 //!
 //! The collapse schedule is threshold sweeps (in the spirit of Forstmann's
 //! fast quadric simplification) rather than a global priority queue: passes
@@ -370,6 +375,7 @@ fn serial_decimate(
     quadrics: Vec<Quadric>,
     boundary_edges: std::collections::HashSet<u64>,
     boundary_vertex: Vec<bool>,
+    shading_pinned: Vec<bool>,
     budget: f64,
     ramp_passes: usize,
     cancel: &AtomicBool,
@@ -383,7 +389,7 @@ fn serial_decimate(
         quadrics,
         boundary_edges,
         boundary_vertex,
-        pinned: Vec::new(),
+        pinned: shading_pinned,
     };
     let passes = sweep.run_passes(budget, ramp_passes, cancel);
     (sweep.faces, sweep.deleted, passes)
@@ -403,6 +409,7 @@ fn parallel_decimate(
     mut quadrics: Vec<Quadric>,
     boundary_edges: std::collections::HashSet<u64>,
     boundary_vertex: Vec<bool>,
+    shading_pinned: Vec<bool>,
     budget: f64,
     ramp_passes: usize,
     cancel: &AtomicBool,
@@ -509,7 +516,10 @@ fn parallel_decimate(
                 .collect(),
             pinned: local_to_global
                 .iter()
-                .map(|&g| vertex_bucket[g as usize] == SHARED)
+                .map(|&g| {
+                    vertex_bucket[g as usize] == SHARED
+                        || shading_pinned.get(g as usize).copied().unwrap_or(false)
+                })
                 .collect(),
         };
         let passes = sweep.run_passes(budget, ramp_passes, cancel);
@@ -558,7 +568,7 @@ fn parallel_decimate(
         quadrics,
         boundary_edges,
         boundary_vertex,
-        pinned: Vec::new(),
+        pinned: shading_pinned,
     };
     let final_passes = sweep.run_passes(budget, 0, cancel);
     (sweep.faces, sweep.deleted, region_passes + final_passes)
@@ -663,6 +673,53 @@ fn decimate_mesh_impl(
         quadrics[i2 as usize].add_plane(unit_n, p0, w);
     }
 
+    // Shading-discontinuity pin: a vertex whose entry shading normal
+    // disagrees with an incident face's plane marks a shading discontinuity
+    // the sharp-feature stage could not resolve (blended feature-zone
+    // vertex, crease-pocket residue). The quadric budget puts no bound on
+    // triangle growth around it — the surrounding surface is flat, so the
+    // geometric error of collapsing it is zero — and the final normal
+    // re-accumulation would interpolate the blend across arbitrarily large
+    // collapsed triangles (measured: streaks spanning 100+ cells radiating
+    // from sub-resolution features on otherwise clean planes). Freezing the
+    // vertex out of collapses entirely keeps its halo at entry pitch:
+    // sub-cell, visually inert. Curved surfaces don't need this — there the
+    // error budget itself bounds how far normals can diverge.
+    const SHADING_PIN_DOT: f64 = 0.906_307_787; // cos 25 deg
+    let mut shading_pinned = vec![false; vertex_count];
+    let mut pinned_count = 0usize;
+    for (fi, face) in faces.iter().enumerate() {
+        let fnorm = face_normals[fi];
+        if fnorm == [0.0; 3] {
+            continue;
+        }
+        for &v in face {
+            if shading_pinned[v as usize] {
+                continue;
+            }
+            let n = mesh.normals[v as usize];
+            let n = [n.0 as f64, n.1 as f64, n.2 as f64];
+            let len = dot(n, n).sqrt();
+            if len > 0.0 && dot(n, fnorm) < SHADING_PIN_DOT * len {
+                shading_pinned[v as usize] = true;
+                pinned_count += 1;
+            }
+        }
+    }
+    // The pin protects large smooth surfaces from SPARSE contamination —
+    // prismatic models measure 1-2% divergent vertices, all sitting in
+    // one-cell halos around sharp features. When divergence is pervasive
+    // instead (thin-strut lattices measure ~60%: strut circumferences turn
+    // 25-35 deg per face and sub-resolution junctions blend whole fans),
+    // pinning would freeze most of the mesh and defeat decimation, while the
+    // blends themselves are imperceptible on screen-thin geometry. No angle
+    // threshold separates the two populations (they overlap over 45-100 deg),
+    // but the pinned FRACTION splits them by two orders of magnitude, so it
+    // picks the regime.
+    if pinned_count * 10 > vertex_count {
+        shading_pinned = Vec::new();
+    }
+
     // Boundary detection: edges with exactly one incident face. ASN2 meshes
     // are closed unless the model touches the sampling bounds, so this set is
     // usually empty.
@@ -706,6 +763,7 @@ fn decimate_mesh_impl(
             quadrics,
             boundary_edges,
             boundary_vertex,
+            shading_pinned,
             budget,
             ramp_passes,
             cancel,
@@ -718,6 +776,7 @@ fn decimate_mesh_impl(
             quadrics,
             boundary_edges,
             boundary_vertex,
+            shading_pinned,
             budget,
             ramp_passes,
             cancel,
@@ -733,6 +792,7 @@ fn decimate_mesh_impl(
             quadrics,
             boundary_edges,
             boundary_vertex,
+            shading_pinned,
             budget,
             ramp_passes,
             cancel,
@@ -1256,6 +1316,85 @@ mod tests {
             hard_fold_edge_count(&mesh.vertices, &mesh.indices),
             0,
             "decimation minted folded-back faces"
+        );
+    }
+
+    /// A flat 9x9 grid in the z=0 plane spanning [-1, 1], with per-vertex
+    /// normals supplied by the caller. Two triangles per quad, wound +Z.
+    fn flat_grid(normal_at: impl Fn(usize, usize) -> (f32, f32, f32)) -> IndexedMesh2 {
+        let n = 9usize;
+        let mut vertices = Vec::new();
+        let mut normals = Vec::new();
+        for j in 0..n {
+            for i in 0..n {
+                let x = -1.0 + 2.0 * i as f32 / (n - 1) as f32;
+                let y = -1.0 + 2.0 * j as f32 / (n - 1) as f32;
+                vertices.push((x, y, 0.0f32));
+                normals.push(normal_at(i, j));
+            }
+        }
+        let mut indices = Vec::new();
+        for j in 0..n - 1 {
+            for i in 0..n - 1 {
+                let v00 = (j * n + i) as u32;
+                let v10 = v00 + 1;
+                let v01 = v00 + n as u32;
+                let v11 = v01 + 1;
+                indices.extend_from_slice(&[v00, v10, v11, v00, v11, v01]);
+            }
+        }
+        IndexedMesh2 {
+            vertices,
+            normals,
+            indices,
+        }
+    }
+
+    /// A lone vertex whose shading normal disagrees with its (flat) fan is a
+    /// shading discontinuity: collapsing around it would smear the blend
+    /// across large triangles at re-accumulation. The pin must keep it and
+    /// its entry-pitch halo; the same mesh with clean normals collapses far
+    /// smaller and drops the vertex.
+    #[test]
+    fn shading_discontinuity_pins_survive_flat_collapse() {
+        let s = std::f32::consts::FRAC_1_SQRT_2;
+        let mut pinned = flat_grid(|i, j| if (i, j) == (4, 4) { (s, 0.0, s) } else { (0.0, 0.0, 1.0) });
+        let mut clean = flat_grid(|_, _| (0.0, 0.0, 1.0));
+        let tolerance = 0.25; // one grid cell
+        decimate_mesh(&mut pinned, tolerance, 6);
+        decimate_mesh(&mut clean, tolerance, 6);
+
+        assert!(
+            pinned.vertices.contains(&(0.0, 0.0, 0.0)),
+            "the divergent vertex must survive decimation"
+        );
+        assert!(
+            pinned.indices.len() > clean.indices.len(),
+            "the pinned halo must keep extra triangles: pinned {} <= clean {}",
+            pinned.indices.len() / 3,
+            clean.indices.len() / 3
+        );
+    }
+
+    /// When divergent vertices are pervasive (>10% — thin-strut lattices,
+    /// where strut circumferences turn faster than the pin threshold per
+    /// face), pinning would freeze the mesh and defeat decimation, so it
+    /// disables itself and collapse proceeds exactly as with clean normals.
+    #[test]
+    fn pervasive_divergence_disables_shading_pin() {
+        let s = std::f32::consts::FRAC_1_SQRT_2;
+        let mut divergent = flat_grid(|i, j| {
+            let interior = (1..8).contains(&i) && (1..8).contains(&j);
+            if interior { (s, 0.0, s) } else { (0.0, 0.0, 1.0) }
+        });
+        let mut clean = flat_grid(|_, _| (0.0, 0.0, 1.0));
+        let tolerance = 0.25;
+        decimate_mesh(&mut divergent, tolerance, 6);
+        decimate_mesh(&mut clean, tolerance, 6);
+        assert_eq!(
+            divergent.indices.len(),
+            clean.indices.len(),
+            "with the pin self-disabled the collapse sequence must match"
         );
     }
 
