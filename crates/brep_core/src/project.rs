@@ -159,10 +159,10 @@ pub fn project_point(
             }
             let mut best: Option<([f64; 2], f64)> = None;
             for seed in &seeds[..seed_count] {
-                if let Some((uv, d)) = nurbs_closest(n, p, *seed) {
-                    if best.is_none_or(|(_, bd)| d < bd) {
-                        best = Some((uv, d));
-                    }
+                if let Some((uv, d)) = nurbs_closest(n, p, *seed)
+                    && best.is_none_or(|(_, bd)| d < bd)
+                {
+                    best = Some((uv, d));
                 }
             }
             match best {

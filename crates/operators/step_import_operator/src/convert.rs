@@ -501,13 +501,13 @@ fn loop_points(ctx: &Ctx, edges: &[StepEdge], opts: &Options) -> Result<Vec<Vec3
     let mut out: Vec<Vec3> = Vec::new();
     for (i, e) in edges.iter().enumerate() {
         let pts = edge_points(ctx, e, tol).map_err(|err| format!("edge {i}: {err}"))?;
-        if let Some(last) = out.last() {
-            if norm(sub(*last, pts[0])) > join_tol {
-                return Err(format!(
-                    "edge {i} does not chain: gap {:.3e}",
-                    norm(sub(*last, pts[0]))
-                ));
-            }
+        if let Some(last) = out.last()
+            && norm(sub(*last, pts[0])) > join_tol
+        {
+            return Err(format!(
+                "edge {i} does not chain: gap {:.3e}",
+                norm(sub(*last, pts[0]))
+            ));
         }
         let skip = usize::from(!out.is_empty());
         out.extend(&pts[skip..]);

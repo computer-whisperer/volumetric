@@ -49,7 +49,7 @@ impl W {
         self.buf.extend_from_slice(&v.to_le_bytes());
     }
     fn pad8(&mut self) {
-        while self.buf.len() % 8 != 0 {
+        while !self.buf.len().is_multiple_of(8) {
             self.buf.push(0);
         }
     }
@@ -684,10 +684,10 @@ impl<'a> PayloadView<'a> {
         for i in 0..self.instance_count() {
             let base = instances_off + i * INSTANCE_LEN;
             let mut outside = false;
-            for axis in 0..3 {
+            for (axis, &c) in p.iter().enumerate() {
                 let lo = f64_at(self.bytes, base + 8 + axis * 16);
                 let hi = f64_at(self.bytes, base + 16 + axis * 16);
-                if p[axis] < lo || p[axis] > hi {
+                if c < lo || c > hi {
                     outside = true;
                     break;
                 }
