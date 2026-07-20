@@ -2586,6 +2586,17 @@ fn finish_preview_scene(
                     )),
                     Err(err) => stats.detail.push(format!("Color: {err}")),
                 }
+            } else if let Some(trio) = executor
+                .sample_format()
+                .ok()
+                .and_then(|format| format.color_trio())
+            {
+                // No scalar channel picked, but the model carries true
+                // surface colors (e.g. a styled STEP import): render them.
+                match truecolor_scene_by_trio(&mut scene, &mut executor, trio) {
+                    Ok(()) => stats.detail.push("Color: model surface colors".to_string()),
+                    Err(err) => stats.detail.push(format!("Color: {err}")),
+                }
             }
         }
         Err(err) => {
@@ -2684,6 +2695,54 @@ fn colormap_scene_by_channel(
         }
     }
     Ok((value_min, value_max))
+}
+
+/// Colors every point instance and mesh vertex by the model's declared
+/// sRGB surface-color trio, sampled at each position and converted to
+/// linear RGB for the renderer. Non-finite components fall back to white
+/// (the unstyled-surface convention).
+fn truecolor_scene_by_trio(
+    scene: &mut renderer::SceneData,
+    executor: &mut impl volumetric::wasm::ModelExecutor,
+    trio: [usize; 3],
+) -> Result<(), String> {
+    let mut color_at = |position: [f32; 3]| -> Result<[f32; 4], String> {
+        let row = executor
+            .sample_channels_nd(&[
+                f64::from(position[0]),
+                f64::from(position[1]),
+                f64::from(position[2]),
+            ])
+            .map_err(|err| err.to_string())?;
+        let mut rgba = [1.0f32; 4];
+        for (out, &idx) in rgba.iter_mut().zip(&trio) {
+            let v = row.get(idx).copied().unwrap_or(f32::NAN);
+            if v.is_finite() {
+                *out = srgb_to_linear(v.clamp(0.0, 1.0));
+            }
+        }
+        Ok(rgba)
+    };
+    for (points, _, _) in &mut scene.points {
+        for point in &mut points.points {
+            point.color = color_at(point.position)?;
+        }
+    }
+    for (mesh, _, _) in &mut scene.meshes {
+        for vertex in &mut mesh.vertices {
+            vertex.color = color_at(vertex.position)?;
+        }
+    }
+    Ok(())
+}
+
+/// One sRGB component to linear, the renderer's working space.
+fn srgb_to_linear(c: f32) -> f32 {
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
 }
 
 /// Style for the wireframe overlay: thin dark depth-tested lines. The line
