@@ -2500,12 +2500,43 @@ pub fn preview_postlude(
     stats.triangles = mesh.indices.len() / 3;
     stats.samples = mesh.stats.total_samples;
     stats.detail = asn2_stage_lines(&mesh.stats);
+    // Tripwire: build results are supposed to carry one finite unit
+    // normal per vertex (local builds do; a stale remote daemon once
+    // shipped all-degenerate normals that rendered as uniform white).
+    // Substitute +Z for anything degenerate and surface the counts.
+    let mut degenerate_normals = 0usize;
+    let mut nonfinite_positions = 0usize;
+    if mesh.normals.len() != mesh.vertices.len() {
+        stats.detail.push(format!(
+            "preview guard: normals/vertices length mismatch {} vs {}",
+            mesh.normals.len(),
+            mesh.vertices.len()
+        ));
+    }
     let vertices: Vec<renderer::MeshVertex> = mesh
         .vertices
         .iter()
         .zip(mesh.normals.iter())
-        .map(|(position, normal)| renderer::MeshVertex::new((*position).into(), (*normal).into()))
+        .map(|(position, normal)| {
+            if !(position.0.is_finite() && position.1.is_finite() && position.2.is_finite()) {
+                nonfinite_positions += 1;
+            }
+            let len2 =
+                normal.0 * normal.0 + normal.1 * normal.1 + normal.2 * normal.2;
+            let normal = if len2.is_finite() && len2 > 1e-20 {
+                *normal
+            } else {
+                degenerate_normals += 1;
+                (0.0, 0.0, 1.0)
+            };
+            renderer::MeshVertex::new((*position).into(), normal.into())
+        })
         .collect();
+    if degenerate_normals > 0 || nonfinite_positions > 0 {
+        stats.detail.push(format!(
+            "preview guard: {degenerate_normals} degenerate normals substituted,              {nonfinite_positions} non-finite positions"
+        ));
+    }
     let wireframe = mesh_edge_lines(&vertices, Some(&mesh.indices));
     let mut scene = renderer::SceneData::new();
     scene.add_mesh(

@@ -705,6 +705,21 @@ pub fn generate_adaptive_mesh_v2_from_bytes_monitored(
 
     let bounds = wasm_sampler.get_bounds()?;
     let (bounds_min, bounds_max) = bounds.as_f32();
+    // A model reporting non-finite or inverted bounds would silently
+    // poison every grid coordinate downstream; fail loudly instead.
+    {
+        let lo = [bounds_min.0, bounds_min.1, bounds_min.2];
+        let hi = [bounds_max.0, bounds_max.1, bounds_max.2];
+        for axis in 0..3 {
+            if !lo[axis].is_finite() || !hi[axis].is_finite() || lo[axis] > hi[axis] {
+                anyhow::bail!(
+                    "model reports invalid bounds on axis {axis}: [{}, {}]",
+                    lo[axis],
+                    hi[axis]
+                );
+            }
+        }
+    }
 
     // Models declare tight bounds, so their surface may lie exactly on the
     // bounding planes (a default box fills its bounds entirely). The mesher

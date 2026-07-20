@@ -181,10 +181,13 @@ fn flatten_meshes_within_budget(
         // Transform vertices (color passes through untouched)
         for v in &submitted.data.vertices {
             let pos = submitted.transform.transform_point3(Vec3::from(v.position));
+            // normalize() of a zero/degenerate normal mints NaN, which
+            // renders as uniform white downstream; substitute +Z.
             let normal = submitted
                 .transform
                 .transform_vector3(Vec3::from(v.normal))
-                .normalize();
+                .normalize_or_zero();
+            let normal = if normal == Vec3::ZERO { Vec3::Z } else { normal };
             all_vertices.push(MeshVertex::colored(pos.into(), normal.into(), v.color));
         }
 

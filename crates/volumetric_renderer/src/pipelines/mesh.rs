@@ -34,9 +34,12 @@ impl GpuMesh {
             .iter()
             .map(|v| {
                 let pos = transform.transform_point3(Vec3::from(v.position));
+                // normalize() of a zero/degenerate normal mints NaN, which
+                // renders as uniform white downstream; substitute +Z.
                 let normal = transform
                     .transform_vector3(Vec3::from(v.normal))
-                    .normalize();
+                    .normalize_or_zero();
+                let normal = if normal == Vec3::ZERO { Vec3::Z } else { normal };
                 MeshVertex::colored(pos.into(), normal.into(), v.color)
             })
             .collect();

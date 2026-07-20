@@ -48,7 +48,11 @@ struct FsOut {
 
 @fragment
 fn fs_gbuffer(in: VsOut) -> FsOut {
-    let n = normalize(in.normal_world);
+    // Degenerate interpolated normals must not reach normalize(): NaN
+    // written to the unorm color target clamps to white on many drivers
+    // and reads as a glowing, view-independent surface.
+    let n_len = length(in.normal_world);
+    let n = select(vec3<f32>(0.0, 0.0, 1.0), in.normal_world / n_len, n_len > 1e-8);
     let l = normalize(uniforms.light_dir_world);
 
     // Manifold meshes: use one-sided lighting and rely on back-face culling.
@@ -58,7 +62,7 @@ fn fs_gbuffer(in: VsOut) -> FsOut {
     let color = uniforms.base_color * in.color.rgb * (ambient + diffuse);
 
     var out: FsOut;
-    out.color = vec4<f32>(color, 1.0);
+    out.color = vec4<f32>(clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
     out.normal_enc = vec4<f32>(n * 0.5 + vec3<f32>(0.5), 1.0);
     // `in.position` is clip-space; z/w gives NDC depth in [0,1].
     let depth_value = in.position.z / in.position.w;
