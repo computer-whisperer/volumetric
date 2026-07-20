@@ -46,7 +46,10 @@ enum BooleanOpConfig {
     Intersect,
 }
 
+// deny_unknown_fields: a misspelled key (e.g. the old `operation`) must
+// error rather than silently fall back to union.
 #[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BooleanConfig {
     op: Option<BooleanOpConfig>,
 }
@@ -486,7 +489,13 @@ pub extern "C" fn run() {
             BooleanConfig::default()
         } else {
             let mut cursor = std::io::Cursor::new(&cfg_buf);
-            ciborium::de::from_reader::<BooleanConfig, _>(&mut cursor).unwrap_or_default()
+            match ciborium::de::from_reader::<BooleanConfig, _>(&mut cursor) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    report_error(&format!("invalid configuration: {e}"));
+                    return;
+                }
+            }
         }
     };
     let op = cfg.op.unwrap_or(BooleanOpConfig::Union).into();
