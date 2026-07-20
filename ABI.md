@@ -14,7 +14,7 @@ This document describes the Application Binary Interface (ABI) for WASM modules 
 
 Models are WASM modules that define a volumetric occupancy function. They are stateless and can be executed in parallel across multiple threads.
 
-> **Note:** Volumetric models are **not** signed distance fields (SDFs). The `sample` function returns an occupancy/density value where only the sign matters for geometry extraction (`> 0` = inside, `<= 0` = outside). The magnitude represents material density for future use cases, not distance to surface.
+> **Note:** Volumetric models are **not** signed distance fields (SDFs). The `sample` function returns an occupancy/density value classified against `volumetric_abi::OCCUPANCY_THRESHOLD` (0.5): strictly greater is inside, anything else (including NaN) is outside. Models emit the canonical values `1.0`/`0.0`. The magnitude carries no geometric meaning — it is reserved for future density use cases, not distance to surface.
 
 ### Required Exports
 
@@ -56,8 +56,8 @@ Reads `n` f64 values from memory at `pos_ptr` (where `n` is the number of dimens
 **Important: These are NOT signed distance fields (SDFs).**
 
 For determining geometry and mesh boundaries, the **only** relevant information is the sign:
-- `> 0.0` → point is **inside** the solid (material present)
-- `<= 0.0` → point is **outside** the solid (empty space)
+- `> 0.5` (`volumetric_abi::OCCUPANCY_THRESHOLD`, via `is_occupied`) → point is **inside** the solid (material present)
+- anything else, including `NaN` → point is **outside** the solid (empty space)
 
 The magnitude of the return value represents **material density**, not distance to surface. This density value:
 - Has no geometric meaning for surface extraction

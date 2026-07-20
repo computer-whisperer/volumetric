@@ -3,10 +3,11 @@
 //! Samples the input model's occupancy on a regular lattice (the same
 //! bake as `sdf_operator`, shared via `ndfield_model_core::bake`),
 //! derives exact lattice distances, and emits a standalone field-backed
-//! model whose occupancy value is `distance - tsdf(p)`: positive
-//! (inside) wherever the point lies within `distance` of the source
-//! solid (dilate, `distance > 0`) or deeper than `|distance|` inside it
-//! (erode, `distance < 0`). The truncation band is chosen internally as
+//! model that is inside (canonical occupancy 1.0) wherever the point
+//! lies within `distance` of the source solid (dilate, `distance > 0`)
+//! or deeper than `|distance|` inside it (erode, `distance < 0`): the
+//! baked field is `distance - tsdf(p)` and the generated `sample`
+//! classifies its zero crossing. The truncation band is chosen internally as
 //! `|distance|` plus a margin of nominal cells, so the requested offset
 //! always lies well inside the defined band — there is no band/offset
 //! mismatch to configure.
@@ -191,18 +192,20 @@ pub fn emit_model(
         (base as u32).to_le_bytes().to_vec(),
     );
 
-    // sdf_sample already has the model `sample` signature and reads its
-    // position through the pointer argument; re-export it under the ABI
-    // name. The template's occupancy+tsdf channel declaration does not
-    // describe this model, so the format export goes away entirely
-    // (exportless models default to occupancy-only).
-    let mut sample_function = None;
+    // sdf_sample has the model `sample` signature and reads its position
+    // through the pointer argument, but it returns the raw interpolated
+    // field; the ABI classifies occupancy against OCCUPANCY_THRESHOLD
+    // (0.5), so `sample` wraps it to the canonical 1.0/0.0 at the
+    // field's zero crossing. The template's occupancy+tsdf channel
+    // declaration does not describe this model, so the format export
+    // goes away entirely (exportless models default to occupancy-only).
+    let mut field_function = None;
     let mut exports_to_delete = Vec::new();
     for export in module.exports.iter() {
         match export.name.as_str() {
             "sdf_sample" => {
                 if let walrus::ExportItem::Function(function) = export.item {
-                    sample_function = Some(function);
+                    field_function = Some(function);
                 }
                 exports_to_delete.push(export.id());
             }
@@ -213,7 +216,30 @@ pub fn emit_model(
     for id in exports_to_delete {
         module.exports.delete(id);
     }
-    let sample_function = sample_function.ok_or("offset template missing sdf_sample export")?;
+    let field_function = field_function.ok_or("offset template missing sdf_sample export")?;
+
+    let mut sample_builder = walrus::FunctionBuilder::new(
+        &mut module.types,
+        &[walrus::ValType::I32],
+        &[walrus::ValType::F32],
+    );
+    let pos_ptr = module.locals.add(walrus::ValType::I32);
+    sample_builder
+        .func_body()
+        .local_get(pos_ptr)
+        .call(field_function)
+        .f32_const(0.0)
+        .binop(walrus::ir::BinaryOp::F32Gt)
+        .if_else(
+            walrus::ValType::F32,
+            |then| {
+                then.f32_const(1.0);
+            },
+            |otherwise| {
+                otherwise.f32_const(0.0);
+            },
+        );
+    let sample_function = sample_builder.finish(vec![pos_ptr], &mut module.funcs);
     module.exports.add("sample", sample_function);
 
     let mut dims_builder =
