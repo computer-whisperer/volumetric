@@ -36,13 +36,19 @@ op --operator boolean_operator --input asset:outer_e3 --input asset:ear_sw --inp
 op --operator rectangular_prism_operator --input 'json:{}' --input 'json:[0.0155,-0.0165,0.0013]' --input 'json:[0.0210,0.0115,0.02]' --output-id slot_e --no-export
 op --operator rectangular_prism_operator --input 'json:{}' --input 'json:[-0.0110,-0.0240,0.0013]' --input 'json:[0.0100,-0.0195,0.02]' --output-id slot_s --no-export
 op --operator rectangular_prism_operator --input 'json:{}' --input 'json:[-0.0210,-0.0145,0.0013]' --input 'json:[-0.0155,0.0065,0.02]' --output-id slot_w --no-export
-op --operator rectangular_prism_operator --input 'json:{}' --input 'json:[-0.0029,0.0124,0.0015]' --input 'json:[0.0029,0.0166,0.0059]' --output-id usb_box --no-export
-op --operator cylinder_operator --input 'json:{"radius":0.0022,"cap":"flat"}' --input 'json:[-0.0029,0.0124,0.0037]' --input 'json:[-0.0029,0.0166,0.0037]' --output-id usb_c1 --no-export
-op --operator cylinder_operator --input 'json:{"radius":0.0022,"cap":"flat"}' --input 'json:[0.0029,0.0124,0.0037]' --input 'json:[0.0029,0.0166,0.0037]' --output-id usb_c2 --no-export
-op --operator boolean_operator --input asset:usb_box --input asset:usb_c1 --input 'json:{"op":"union"}' --output-id usb_s1 --no-export
-op --operator boolean_operator --input asset:usb_s1 --input asset:usb_c2 --input 'json:{"op":"union"}' --output-id usb_stadium --no-export
+# USB mouth sized for the USB-IF maximum plug overmold (12.35 x 6.5mm)
+# plus ~0.3mm clearance: 13.0mm wide, open through the top, floor at
+# z=0.15mm with r1.0 bottom corners; the port is recessed ~2.6mm so the
+# whole wall opening must pass the overmold envelope.
+op --operator rectangular_prism_operator --input 'json:{}' --input 'json:[-0.0065,0.0123,0.00115]' --input 'json:[0.0065,0.0170,0.02]' --output-id usb_main --no-export
+op --operator rectangular_prism_operator --input 'json:{}' --input 'json:[-0.0055,0.0123,0.00015]' --input 'json:[0.0055,0.0170,0.02]' --output-id usb_low --no-export
+op --operator cylinder_operator --input 'json:{"radius":0.001,"cap":"flat"}' --input 'json:[-0.0055,0.0123,0.00115]' --input 'json:[-0.0055,0.0170,0.00115]' --output-id usb_r1 --no-export
+op --operator cylinder_operator --input 'json:{"radius":0.001,"cap":"flat"}' --input 'json:[0.0055,0.0123,0.00115]' --input 'json:[0.0055,0.0170,0.00115]' --output-id usb_r2 --no-export
+op --operator boolean_operator --input asset:usb_main --input asset:usb_low --input 'json:{"op":"union"}' --output-id usb_s1 --no-export
+op --operator boolean_operator --input asset:usb_s1 --input asset:usb_r1 --input 'json:{"op":"union"}' --output-id usb_s2 --no-export
+op --operator boolean_operator --input asset:usb_s2 --input asset:usb_r2 --input 'json:{"op":"union"}' --output-id usb_mouth --no-export
 op --operator rectangular_prism_operator --input 'json:{}' --input 'json:[-0.0070,0.0123,0.0053]' --input 'json:[0.0070,0.0170,0.02]' --output-id usb_scoop --no-export
-op --operator boolean_operator --input asset:usb_stadium --input asset:usb_scoop --input 'json:{"op":"union"}' --output-id slot_usb --no-export
+op --operator boolean_operator --input asset:usb_mouth --input asset:usb_scoop --input 'json:{"op":"union"}' --output-id slot_usb --no-export
 op --operator boolean_operator --input asset:swept --input asset:slot_e --input 'json:{"op":"union"}' --output-id cut1 --no-export
 op --operator boolean_operator --input asset:cut1 --input asset:slot_s --input 'json:{"op":"union"}' --output-id cut2 --no-export
 op --operator boolean_operator --input asset:cut2 --input asset:slot_w --input 'json:{"op":"union"}' --output-id cut3 --no-export
