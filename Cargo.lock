@@ -3172,6 +3172,9 @@ dependencies = [
 [[package]]
 name = "ndfield_model_core"
 version = "0.1.0"
+dependencies = [
+ "walrus",
+]
 
 [[package]]
 name = "ndk"
@@ -4950,6 +4953,17 @@ dependencies = [
  "skrifa 0.42.1",
  "yazi",
  "zeno",
+]
+
+[[package]]
+name = "sweep_operator"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "ndfield_model_core",
+ "serde",
+ "volumetric_abi",
+ "walrus",
 ]
 
 [[package]]

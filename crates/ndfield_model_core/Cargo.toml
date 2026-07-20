@@ -2,3 +2,9 @@
 name = "ndfield_model_core"
 version = "0.1.0"
 edition = "2024"
+
+[dependencies]
+walrus = { version = "0.26", optional = true }
+
+[features]
+emit = ["dep:walrus"]

@@ -25,6 +25,8 @@
 //! return `outside_value`.
 
 pub mod bake;
+#[cfg(feature = "emit")]
+pub mod emit;
 
 pub const MAGIC: u32 = 0x3146_444e; // "NDF1"
 pub const MAX_DIMS: usize = 8;

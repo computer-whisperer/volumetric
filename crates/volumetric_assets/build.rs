@@ -50,6 +50,7 @@ const OPERATORS: &[&str] = &[
     "island_removal_operator",
     "sdf_operator",
     "offset_operator",
+    "sweep_operator",
     "subspace_operator",
     "subspace_fit_operator",
     "model_bound_operator",
