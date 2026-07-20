@@ -16,9 +16,10 @@
 //! Inputs:
 //! - Input 0: Blob — the STEP file bytes
 //! - Input 1: CBOR config:
-//!   - `chord_tol` (mm, default 0.005): trim flattening tolerance
+//!   - `chord_tol` (metres, default 5e-6): trim flattening tolerance
 //!   - `scale` (default 1.0): uniform scale applied on top of the
-//!     file's declared unit (which is converted to mm automatically)
+//!     file's declared unit (which is converted to metres — the
+//!     engine's canonical unit — automatically)
 //!   - `include_labels` / `exclude_labels`: instance filters matched
 //!     against reference designators / product names ("J7", "U2")
 //!
@@ -44,7 +45,7 @@ const TEMPLATE: &[u8] = include_bytes!("../template/brep_model_template.wasm");
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(default)]
 pub struct StepConfig {
-    /// Trim-polyline chordal tolerance in mm.
+    /// Trim-polyline chordal tolerance in metres.
     pub chord_tol: f64,
     /// Extra uniform scale on top of the file's unit.
     pub scale: f64,
@@ -57,7 +58,7 @@ pub struct StepConfig {
 impl Default for StepConfig {
     fn default() -> Self {
         StepConfig {
-            chord_tol: 0.005,
+            chord_tol: 5e-6,
             scale: 1.0,
             include_labels: Vec::new(),
             exclude_labels: Vec::new(),
@@ -217,7 +218,7 @@ mod operator {
         use volumetric_abi::{OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput};
         static METADATA: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
         volumetric_abi::metadata_reply(&METADATA, || {
-            let schema = "{ chord_tol: float .default 0.005, scale: float .default 1.0, \
+            let schema = "{ chord_tol: float .default 5e-6, scale: float .default 1.0, \
                           include_labels: [* tstr], exclude_labels: [* tstr] }"
                 .to_string();
             OperatorMetadata {

@@ -9,8 +9,8 @@ use brep_core::math::{Frame, Vec3, normalize, scale as vscale};
 use brep_core::nurbs::CurveData;
 
 /// Extraction context: the parsed table plus the file's length unit as
-/// a factor to millimetres (applied to every coordinate and measure at
-/// extraction time).
+/// a factor to metres (applied to every coordinate and measure at
+/// extraction time; engine geometry is canonically in metres).
 pub struct Ctx<'a> {
     pub data: &'a DataSection,
     pub scale: f64,
@@ -563,9 +563,9 @@ impl<'a> Ctx<'a> {
 // -------------------------------------------------------------------
 
 /// Scan the whole file for the geometric context's length unit and
-/// return its factor to millimetres. OCCT exports carry exactly one
-/// global length unit; when several distinct factors appear the file is
-/// rejected rather than silently mis-scaled.
+/// return its factor to metres (the engine's canonical unit). OCCT
+/// exports carry exactly one global length unit; when several distinct
+/// factors appear the file is rejected rather than silently mis-scaled.
 pub fn length_unit_scale(data: &DataSection) -> Result<f64, String> {
     let mut found: Option<f64> = None;
     for (id, e) in &data.entities {
@@ -582,7 +582,7 @@ pub fn length_unit_scale(data: &DataSection) -> Result<f64, String> {
                 _ => 1.0,
             };
             match si.args.last() {
-                Some(Arg::Enum(n)) if n == "METRE" => prefix * 1000.0,
+                Some(Arg::Enum(n)) if n == "METRE" => prefix,
                 other => return Err(format!("#{id}: unsupported SI length unit {other:?}")),
             }
         } else if let Some(cbu) = e.record("CONVERSION_BASED_UNIT") {
@@ -626,7 +626,7 @@ pub fn length_unit_scale(data: &DataSection) -> Result<f64, String> {
                 }
                 _ => 1.0,
             };
-            value * prefix * 1000.0
+            value * prefix
         } else {
             continue;
         };
@@ -635,7 +635,7 @@ pub fn length_unit_scale(data: &DataSection) -> Result<f64, String> {
             Some(f) if (f - factor).abs() < f * 1e-12 => {}
             Some(f) => {
                 return Err(format!(
-                    "multiple length units in file ({f} mm and {factor} mm)"
+                    "multiple length units in file ({f} m and {factor} m)"
                 ));
             }
         }

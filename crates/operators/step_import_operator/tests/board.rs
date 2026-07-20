@@ -34,33 +34,36 @@ fn imports_the_representative_board() {
     let payload = brep_core::payload::build_payload(&model).expect("build payload");
     let view = brep_core::payload::PayloadView::new(&payload).unwrap();
 
-    // OCCT (DRAWEXE, `bounding`) reports the assembled model as
-    // x [-17.02, 17.02], y [-21.02, 12.84], z [-0.02, 5.28] — padded by
-    // OCCT's own box tolerance (~0.021 on every side: the PCB bottom is
-    // exactly z = 0). Both boxes are conservative, so agreement within
-    // 0.05mm per component is the meaningful check.
+    // OCCT (DRAWEXE, `bounding`) reports the assembled model, in the
+    // file's millimetres, as x [-17.02, 17.02], y [-21.02, 12.84],
+    // z [-0.02, 5.28] — padded by OCCT's own box tolerance (~0.021 on
+    // every side: the PCB bottom is exactly z = 0). We import to metres
+    // (the engine's canonical unit). Both boxes are conservative, so
+    // agreement within 0.05mm per component is the meaningful check.
     // Ours are conservative (curved-face AABBs inflate by a sampling
     // margin), so: contain OCCT's un-padded box, exceed it by < 0.6mm.
+    const M_PER_MM: f64 = 1e-3;
     let b = view.bounds();
-    let occt = [-17.02, 17.02, -21.02, 12.84, -0.02, 5.28];
+    let occt_mm = [-17.02, 17.02, -21.02, 12.84, -0.02, 5.28];
     for axis in 0..3 {
-        let (o_lo, o_hi) = (occt[axis * 2], occt[axis * 2 + 1]);
+        let o_lo = occt_mm[axis * 2] * M_PER_MM;
+        let o_hi = occt_mm[axis * 2 + 1] * M_PER_MM;
         let (lo, hi) = (b[axis * 2], b[axis * 2 + 1]);
         assert!(
-            lo <= o_lo + 0.05 && lo >= o_lo - 0.6,
+            lo <= o_lo + 0.05 * M_PER_MM && lo >= o_lo - 0.6 * M_PER_MM,
             "axis {axis} min: ours {lo} vs OCCT {o_lo}"
         );
         assert!(
-            hi >= o_hi - 0.05 && hi <= o_hi + 0.6,
+            hi >= o_hi - 0.05 * M_PER_MM && hi <= o_hi + 0.6 * M_PER_MM,
             "axis {axis} max: ours {hi} vs OCCT {o_hi}"
         );
     }
 
     // Spot classification: the board substrate around the origin is
     // solid (PCB is 1.6mm thick starting at z=0); far away is empty.
-    assert!(view.is_inside([0.0, 0.0, 0.8]), "PCB interior");
-    assert!(!view.is_inside([0.0, 0.0, 100.0]), "far above");
-    assert!(!view.is_inside([50.0, 0.0, 0.8]), "off the board");
+    assert!(view.is_inside([0.0, 0.0, 0.0008]), "PCB interior");
+    assert!(!view.is_inside([0.0, 0.0, 0.1]), "far above");
+    assert!(!view.is_inside([0.05, 0.0, 0.0008]), "off the board");
 
     // Label filtering by reference designator.
     let filtered = import(

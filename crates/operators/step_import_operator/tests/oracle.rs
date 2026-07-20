@@ -15,6 +15,11 @@ use step_import_operator::{StepConfig, import};
 
 const POINT_COUNT: usize = 2000;
 
+/// Our model is in metres (the engine's canonical unit); DRAWEXE loads
+/// the STEP file in its declared millimetres. Every coordinate crossing
+/// the OCCT boundary converts through this factor.
+const MM_PER_M: f64 = 1000.0;
+
 fn drawexe_available() -> bool {
     // -b = batch mode: no viewer window, exits on stdin EOF.
     let Ok(mut child) = Command::new("DRAWEXE")
@@ -146,15 +151,16 @@ fn agrees_with_occt_point_classification() {
                 .filter_map(|t| t.parse().ok())
                 .collect();
             assert_eq!(nums.len(), 6, "bounding format: {out:.0?}");
-            // DRAW prints xmin ymin zmin xmax ymax zmax.
-            boxes.push([nums[0], nums[3], nums[1], nums[4], nums[2], nums[5]]);
+            // DRAW prints xmin ymin zmin xmax ymax zmax, in mm.
+            boxes
+                .push([nums[0], nums[3], nums[1], nums[4], nums[2], nums[5]].map(|v| v / MM_PER_M));
         }
     }
     assert_eq!(boxes.len(), n_solids);
 
     // Pass 2: classify each point against every solid whose (padded)
     // box contains it.
-    let points = sample_points(bounds, 1.0, POINT_COUNT);
+    let points = sample_points(bounds, 1e-3, POINT_COUNT);
     let mut script = format!(
         "pload ALL\nReadStep D {}\nXGetOneShape a D\nexplode a SO\n",
         board_path()
@@ -171,9 +177,9 @@ fn agrees_with_occt_point_classification() {
         for &i in &cands {
             script.push_str(&format!(
                 "point pp {} {} {}\nputs \"CLS\"\nbclassify a_{} pp\n",
-                p[0],
-                p[1],
-                p[2],
+                p[0] * MM_PER_M,
+                p[1] * MM_PER_M,
+                p[2] * MM_PER_M,
                 i + 1
             ));
         }

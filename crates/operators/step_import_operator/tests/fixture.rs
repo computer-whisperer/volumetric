@@ -16,8 +16,10 @@ fn classifies_box_and_cylinder_exactly() {
     let payload = build_payload(&model).expect("payload");
     let view = PayloadView::new(&payload).unwrap();
 
-    // Analytic ground truth: box [-5,5]x[-4,4]x[-3,3], cylinder
-    // (x-20)^2 + y^2 <= 9, z in [-3, 9].
+    // Analytic ground truth in the fixture's millimetres: box
+    // [-5,5]x[-4,4]x[-3,3], cylinder (x-20)^2 + y^2 <= 9, z in [-3, 9].
+    // The imported model is in metres, so sample points convert at the
+    // classify call.
     let truth = |p: [f64; 3]| -> Option<bool> {
         let in_box = p[0].abs() - 5.0 < 0.0 && p[1].abs() - 4.0 < 0.0 && p[2].abs() - 3.0 < 0.0;
         let box_d = (p[0].abs() - 5.0)
@@ -45,7 +47,8 @@ fn classifies_box_and_cylinder_exactly() {
                 ];
                 let Some(expect) = truth(p) else { continue };
                 tested += 1;
-                assert_eq!(view.is_inside(p), expect, "misclassified {p:?}");
+                let p_m = p.map(|v| v * 1e-3);
+                assert_eq!(view.is_inside(p_m), expect, "misclassified {p:?}");
             }
         }
     }

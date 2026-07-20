@@ -11,15 +11,15 @@ use brep_core::project;
 use core::f64::consts::TAU;
 use std::collections::HashMap;
 
-/// Import tuning; `chord_tol` is the 3D flattening tolerance (mm) for
-/// trim polylines and lowered extrusion profiles.
+/// Import tuning; `chord_tol` is the 3D flattening tolerance (metres)
+/// for trim polylines and lowered extrusion profiles.
 pub struct Options {
     pub chord_tol: f64,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { chord_tol: 0.005 }
+        Options { chord_tol: 5e-6 }
     }
 }
 
