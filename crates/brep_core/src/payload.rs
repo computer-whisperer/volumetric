@@ -889,6 +889,20 @@ impl<'a> PayloadView<'a> {
         let mut best: Option<(f64, u32)> = None; // (world distance, packed color)
         for i in 0..self.instance_count() {
             let base = instances_off + i * INSTANCE_LEN;
+            // World-AABB prune: skip instances that cannot beat the
+            // running best (most of them, in a populated assembly).
+            let mut aabb_d2 = 0.0f64;
+            for (axis, &c) in p.iter().enumerate() {
+                let lo = f64_at(self.bytes, base + 8 + axis * 16);
+                let hi = f64_at(self.bytes, base + 16 + axis * 16);
+                let gap = (lo - c).max(c - hi).max(0.0);
+                aabb_d2 += gap * gap;
+            }
+            if let Some((bd, _)) = best
+                && aabb_d2 >= bd * bd
+            {
+                continue;
+            }
             let w2l = Affine(core::array::from_fn(|k| {
                 f64_at(self.bytes, base + 56 + k * 8)
             }));

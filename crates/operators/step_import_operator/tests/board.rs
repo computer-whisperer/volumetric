@@ -65,6 +65,49 @@ fn imports_the_representative_board() {
     assert!(!view.is_inside([0.0, 0.0, 0.1]), "far above");
     assert!(!view.is_inside([0.05, 0.0, 0.0008]), "off the board");
 
+    // The KiCad export styles nearly every body (119 of 121 solids, plus
+    // 103 per-face overrides) with a plural palette (board substrate vs
+    // pads vs connectors).
+    let mut palette = std::collections::HashSet::new();
+    let (mut styled, mut total) = (0usize, 0usize);
+    for solid in &model.solids {
+        for face in &solid.faces {
+            total += 1;
+            if let Some(c) = face.color {
+                styled += 1;
+                palette.insert(c.map(|v| (v * 255.0) as u8));
+            }
+        }
+    }
+    assert!(
+        styled * 2 > total,
+        "expected mostly styled faces, got {styled}/{total}"
+    );
+    assert!(
+        palette.len() >= 3,
+        "expected a plural palette, got {palette:?}"
+    );
+
+    // Nearest-face color queries at mesh-vertex-like points (on the PCB
+    // top surface) resolve without pathological cost and to a styled
+    // color, never the unstyled-white fallback.
+    let start = std::time::Instant::now();
+    let mut queried = 0usize;
+    for i in 0..24 {
+        for j in 0..24 {
+            let p = [
+                -0.012 + 0.024 * i as f64 / 23.0,
+                -0.015 + 0.024 * j as f64 / 23.0,
+                0.0016,
+            ];
+            let c = view.nearest_color(p).expect("board has faces");
+            assert!(c.iter().all(|v| (0.0..=1.0).contains(v)), "color {c:?}");
+            queried += 1;
+        }
+    }
+    let elapsed = start.elapsed();
+    eprintln!("nearest_color: {queried} queries in {elapsed:?}");
+
     // Label filtering by reference designator.
     let filtered = import(
         &text,
