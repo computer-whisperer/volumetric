@@ -12,6 +12,11 @@
 //! Only vertices the snap stage actually moved are split. Gate-rejected
 //! feature-zone vertices (pathological geometry) keep their blended normal
 //! and connectivity: no evidence of a real feature means no topology surgery.
+//!
+//! Triangles that resist region assignment entirely (crumpled folds and
+//! slivers in corner pockets) are quarantined: their crease corners move to
+//! dedicated pocket copies so their noise never aliases into a region's
+//! shading — see the pocket pass for why the isolation must be topological.
 
 use glam::DVec3;
 
@@ -23,7 +28,9 @@ pub struct CreaseSplitResult {
     /// through unchanged elsewhere. Unnormalized.
     pub normals: Vec<DVec3>,
     pub indices: Vec<u32>,
-    /// Extra vertex copies created (the first region reuses the base slot).
+    /// Extra vertex copies created: per-region copies (the first region
+    /// reuses the base slot) plus pocket copies quarantining region-less
+    /// triangles.
     pub split_vertices: usize,
 }
 
@@ -117,10 +124,10 @@ pub fn split_crease_vertices(
     // face scores near 1 against that region's neighboring face normals,
     // while the crumpled fold triangles that corner pockets also contain
     // (see the folded-sliver debt) score well below it in every direction —
-    // assigning those would mint copies whose re-derived normals are pure
-    // fold noise, worse than the base-slot blend they have today. Folds,
-    // zero-area slivers, and triangles with no assigned neighbor anywhere
-    // stay region-less and keep the base-slot behavior.
+    // assigning those would put their fold-noise faces into the region
+    // copies' re-derived normals. Folds, zero-area slivers, and triangles
+    // with no assigned neighbor anywhere stay region-less and are
+    // quarantined onto pocket slots after the copy rewrite below.
     const MIN_RESOLVE_DOT: f64 = 0.9;
     // Vertex -> incident triangles in compressed (CSR) form: two counting
     // passes instead of millions of per-vertex Vec allocations.
@@ -244,6 +251,38 @@ pub fn split_crease_vertices(
         }
     }
 
+    // Pocket quarantine: triangles still region-less after the fixpoint move
+    // their crease corners onto fresh per-vertex pocket slots instead of
+    // aliasing the base slots. Aliasing is not a neutral fallback: the base
+    // slot is the first region's copy, so a region-less triangle's face
+    // pollutes that region's re-derived normal AND its own corners shade
+    // with that region's normal (measured 90+ degrees off at slot corners).
+    // Worse, stage-5 decimation re-accumulates all normals from the final
+    // index topology, so any cross-region slot sharing gets re-mixed there
+    // no matter what normals are computed here — isolation must be
+    // topological. Pocket slots keep the quarantined triangles' noise
+    // confined to themselves: they re-derive their shading from their own
+    // (sub-cell, visually inert) geometry below.
+    let mut pocket_slot: Vec<u32> = vec![u32::MAX; positions.len()];
+    for (t, tri) in indices.chunks_exact(3).enumerate() {
+        if tri_region[t].is_some() || !tri.iter().any(|&v| is_crease[v as usize]) {
+            continue;
+        }
+        for k in 0..3 {
+            let v = indices[t * 3 + k] as usize;
+            if !is_crease[v] {
+                continue;
+            }
+            if pocket_slot[v] == u32::MAX {
+                positions_out.push(positions[v]);
+                normals_out.push(normals[v]);
+                pocket_slot[v] = (positions_out.len() - 1) as u32;
+                split_vertices += 1;
+            }
+            indices_out[t * 3 + k] = pocket_slot[v];
+        }
+    }
+
     // Re-derive normals from the final triangles for every vertex whose fan
     // the snap stage changed: the crease copies themselves (including reused
     // base slots and snapped-but-unsplit vertices), plus their unsplit
@@ -260,6 +299,9 @@ pub fn split_crease_vertices(
         }
         for &(_, idx) in &copy_index[v] {
             is_crease_slot[idx as usize] = true;
+        }
+        if pocket_slot[v] != u32::MAX {
+            is_crease_slot[pocket_slot[v] as usize] = true;
         }
     }
     for tri in indices_out.chunks_exact(3) {
@@ -478,10 +520,11 @@ mod tests {
     /// A crumpled fold triangle across the crease (all corners unclaimed,
     /// face normal ~45 degrees off both adjacent faces — the folded-sliver
     /// family that survives with real area at corner pockets) must NOT be
-    /// resolved to either region: assigning it would mint a copy whose
-    /// re-derived normal is fold noise. It stays on base slots.
+    /// resolved to either region — and must not alias the base slots either:
+    /// its crease corners move to pocket copies, so the region fans stay
+    /// pure and the fold shades with its own geometry.
     #[test]
-    fn fold_triangle_stays_region_less() {
+    fn fold_triangle_is_quarantined_onto_pocket_slots() {
         let (mut positions, mut indices, mut labels, mut is_crease) = crease_mesh();
         positions.push(DVec3::new(1.05, 0.5, 0.05)); // 6: fold apex off both planes
         labels.push(None);
@@ -491,11 +534,48 @@ mod tests {
         let result =
             split_crease_vertices(&positions, &carried, &indices, &labels, &is_crease, 1.0);
 
-        // Same copies as without the fold: no region resolved for it.
-        assert_eq!(result.split_vertices, 2);
-        // The fold triangle still references the base slots.
-        let fold = &result.indices[12..15];
-        assert_eq!(fold, &[2, 6, 3], "fold must keep base slots, got {fold:?}");
+        // Two per-region copies (as without the fold) plus one pocket copy
+        // per fold corner.
+        assert_eq!(result.split_vertices, 5);
+
+        // The fold references pocket slots, never the base slots, at
+        // unchanged positions.
+        let fold: Vec<u32> = result.indices[12..15].to_vec();
+        assert!(
+            fold.iter().all(|&v| v as usize >= positions.len()),
+            "fold must be quarantined onto fresh slots, got {fold:?}"
+        );
+        for (&slot, &original) in fold.iter().zip(&[2usize, 6, 3]) {
+            assert_eq!(result.positions[slot as usize], positions[original]);
+        }
+
+        // Pocket shading comes from the fold's own geometry, not a blend:
+        // the quarantined corners re-derive to the fold's face normal.
+        let fold_face = (positions[6] - positions[2]).cross(positions[3] - positions[2]);
+        for &slot in &fold {
+            assert!(
+                unsigned_angle_degrees(
+                    result.normals[slot as usize].normalize(),
+                    fold_face.normalize()
+                ) < 1e-9,
+                "pocket slot should shade with the fold's face normal"
+            );
+        }
+
+        // With the fold quarantined, the crease copies stay region-pure:
+        // exactly the face-true normals of the fold-free case.
+        let left_tri = &result.indices[0..3];
+        let right_tri = &result.indices[6..9];
+        assert!(
+            unsigned_angle_degrees(result.normals[left_tri[1] as usize].normalize(), DVec3::Z)
+                < 1e-9,
+            "left crease copy polluted by the fold"
+        );
+        assert!(
+            unsigned_angle_degrees(result.normals[right_tri[0] as usize].normalize(), DVec3::X)
+                < 1e-9,
+            "right crease copy polluted by the fold"
+        );
     }
 
     #[test]
