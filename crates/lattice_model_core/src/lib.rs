@@ -54,6 +54,15 @@ pub enum LatticeKind {
     /// cell (truncated octahedra); higher values give organic,
     /// non-repeating cells.
     Foam = 5,
+    /// One phase of N interpenetrating strut networks that interlink but
+    /// never touch. Phase `k` is a jittered simple-cubic bond network
+    /// (the same-color Delaunay bonds of the 2-colored BCC lattice,
+    /// generalized to N colors) shifted by `k/N` along the cell diagonal;
+    /// each phase jitters independently, so the phases weave through each
+    /// other as separate connected parts. Separation is guaranteed by
+    /// construction while `2 r(d) < (1 - irregularity) / N` — see
+    /// `weave_max_density` for the resulting per-phase density ceiling.
+    Weave = 6,
 }
 
 impl LatticeKind {
@@ -66,6 +75,7 @@ impl LatticeKind {
             3 => Some(Self::Honeycomb),
             4 => Some(Self::Tetra),
             5 => Some(Self::Foam),
+            6 => Some(Self::Weave),
             _ => None,
         }
     }
@@ -77,12 +87,24 @@ impl LatticeKind {
 pub struct LatticeParams {
     /// Foam site jitter: 0 keeps the periodic Kelvin cells, 1 fully
     /// randomizes cell shapes. Clamped to `[0, 1]`; non-finite reads 0.
+    /// Weave uses the same knob for its network jitter, scaled down by
+    /// the phase count to preserve phase separation.
     pub irregularity: f64,
+    /// Weave: how many interlinked phases share the cell (>= 1; other
+    /// families ignore it).
+    pub phase_count: u32,
+    /// Weave: which phase this occupancy evaluates, taken modulo
+    /// `phase_count` (other families ignore it).
+    pub phase_index: u32,
 }
 
 impl Default for LatticeParams {
     fn default() -> Self {
-        Self { irregularity: 0.3 }
+        Self {
+            irregularity: 0.3,
+            phase_count: 2,
+            phase_index: 0,
+        }
     }
 }
 
@@ -214,7 +236,94 @@ pub fn lattice_occupied(
             let t = foam_threshold(d);
             d2 - d1 <= t && d3 - d1 <= t
         }
+        LatticeKind::Weave => {
+            let jitter = if params.irregularity.is_finite() {
+                params.irregularity.clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let phases = params.phase_count.max(1);
+            let phase = params.phase_index % phases;
+            let shift = f64::from(phase) / f64::from(phases);
+            // Adjacent phases sit 1/N apart along every axis; jitter may
+            // move each network's struts by up to `amp` per axis, so this
+            // amplitude keeps pairwise clearance >= (1 - jitter) / N
+            // before strut radii are subtracted.
+            let amp = 0.5 * jitter / f64::from(phases);
+            let p = [
+                x / TAU - shift,
+                y / TAU - shift,
+                z / TAU - shift,
+            ];
+            weave_strut_distance(p, amp, phase) <= strut_radius(d)
+        }
     }
+}
+
+/// The highest per-phase density at which a Weave family with `phases`
+/// networks at the given irregularity is still guaranteed touch-free:
+/// struts of two phases meet when `2 r(d)` closes the jittered clearance
+/// `(1 - irregularity) / phases`, and `r(d) = sqrt(d / 3 pi)` while thin.
+pub fn weave_max_density(phases: u32, irregularity: f64) -> f64 {
+    let clearance = (1.0 - irregularity.clamp(0.0, 1.0)) / f64::from(phases.max(1));
+    let radius = clearance / 2.0;
+    (3.0 * core::f64::consts::PI * radius * radius).min(1.0)
+}
+
+/// The jittered site of one weave network for a cell: base plus a
+/// hash-derived displacement of up to `amp` per axis. The phase tags the
+/// hash so every network jitters independently.
+fn weave_site(base: [i64; 3], phase: u32, amp: f64) -> [f64; 3] {
+    let h = foam_hash(base[0], base[1], base[2], 0x57EA_0000 + u64::from(phase));
+    let unit = |bits: u64| -> f64 { (bits & 0x1F_FFFF) as f64 / 0xF_FFFF as f64 - 1.0 };
+    [
+        base[0] as f64 + amp * unit(h),
+        base[1] as f64 + amp * unit(h >> 21),
+        base[2] as f64 + amp * unit(h >> 42),
+    ]
+}
+
+/// Distance (in cell units) from `p` to one weave network: axis bonds
+/// between the jittered sites of `Z^3`. Every bond whose distance can be
+/// the minimum has its base in the 3x3x3 cell neighborhood — a farther
+/// bond's nearest point is one of its endpoint sites, which some
+/// neighborhood bond shares.
+fn weave_strut_distance(p: [f64; 3], amp: f64, phase: u32) -> f64 {
+    let c = p.map(|v| v.round() as i64);
+    // Sites for bases c-1 ..= c+2 per axis: neighborhood bond endpoints.
+    let mut sites = [[[0.0f64; 3]; 4]; 16];
+    let site_at = |sites: &[[[f64; 3]; 4]; 16], ix: usize, iy: usize, iz: usize| {
+        sites[iz * 4 + iy][ix]
+    };
+    for iz in 0..4 {
+        for iy in 0..4 {
+            for ix in 0..4 {
+                sites[iz * 4 + iy][ix] = weave_site(
+                    [
+                        c[0] + ix as i64 - 1,
+                        c[1] + iy as i64 - 1,
+                        c[2] + iz as i64 - 1,
+                    ],
+                    phase,
+                    amp,
+                );
+            }
+        }
+    }
+    let mut dist = f64::MAX;
+    for iz in 0..3 {
+        for iy in 0..3 {
+            for ix in 0..3 {
+                let a = site_at(&sites, ix, iy, iz);
+                for (bx, by, bz) in [(ix + 1, iy, iz), (ix, iy + 1, iz), (ix, iy, iz + 1)] {
+                    let b = site_at(&sites, bx, by, bz);
+                    let t = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+                    dist = dist.min(segment_distance(p, a, t));
+                }
+            }
+        }
+    }
+    dist
 }
 
 /// Deterministic integer hash (splitmix64-style finalizer) for foam site
@@ -488,13 +597,14 @@ fn frac_dist(u: f64) -> f64 {
 mod tests {
     use super::*;
 
-    const KINDS: [LatticeKind; 6] = [
+    const KINDS: [LatticeKind; 7] = [
         LatticeKind::Gyroid,
         LatticeKind::SchwarzP,
         LatticeKind::Struts,
         LatticeKind::Honeycomb,
         LatticeKind::Tetra,
         LatticeKind::Foam,
+        LatticeKind::Weave,
     ];
 
     /// A grid of probe points spanning several cells at odd offsets.
@@ -884,7 +994,10 @@ mod tests {
         // The fitted threshold keeps realized volume fraction close to d
         // across the sparse range, at any irregularity.
         for irr in [0.0f64, 0.3, 0.7] {
-            let params = LatticeParams { irregularity: irr };
+            let params = LatticeParams {
+                irregularity: irr,
+                ..LatticeParams::default()
+            };
             for d in [0.05f32, 0.1, 0.2] {
                 let mut hits = 0usize;
                 let mut total = 0usize;
@@ -916,7 +1029,10 @@ mod tests {
     fn foam_zero_irregularity_is_periodic_kelvin() {
         // Without jitter the sites are plain BCC, so occupancy repeats
         // with the unit cell in every direction.
-        let params = LatticeParams { irregularity: 0.0 };
+        let params = LatticeParams {
+            irregularity: 0.0,
+            ..LatticeParams::default()
+        };
         for pos in probes() {
             let base = lattice_occupied(LatticeKind::Foam, pos, 0.25, 0.25, &params);
             for shift in [[0.25, 0.0, 0.0], [0.0, -0.5, 0.0], [0.75, 0.25, -0.5]] {
@@ -934,8 +1050,14 @@ mod tests {
     fn foam_irregularity_changes_the_structure() {
         // Jitter must actually move material around (and non-finite
         // irregularity must read as 0, not poison the sites).
-        let regular = LatticeParams { irregularity: 0.0 };
-        let organic = LatticeParams { irregularity: 0.6 };
+        let regular = LatticeParams {
+            irregularity: 0.0,
+            ..LatticeParams::default()
+        };
+        let organic = LatticeParams {
+            irregularity: 0.6,
+            ..LatticeParams::default()
+        };
         let differing = probes()
             .iter()
             .filter(|&&p| {
@@ -949,6 +1071,7 @@ mod tests {
         );
         let nan = LatticeParams {
             irregularity: f64::NAN,
+            ..LatticeParams::default()
         };
         for pos in probes() {
             assert_eq!(
@@ -956,6 +1079,83 @@ mod tests {
                 lattice_occupied(LatticeKind::Foam, pos, 0.25, 0.25, &regular),
                 "NaN irregularity should read as 0"
             );
+        }
+    }
+
+    fn weave_params(phases: u32, phase: u32, irregularity: f64) -> LatticeParams {
+        LatticeParams {
+            irregularity,
+            phase_count: phases,
+            phase_index: phase,
+        }
+    }
+
+    #[test]
+    fn weave_phase_zero_covers_the_cubic_bonds() {
+        // At zero irregularity phase 0 is the unit cubic bond network
+        // through the integer points (cell units; world = 0.25 * cell).
+        for t in [0.05, 0.4, 0.9] {
+            assert!(lattice_occupied(
+                LatticeKind::Weave,
+                [0.25 * t, 0.0, 0.0],
+                0.25,
+                0.2,
+                &weave_params(3, 0, 0.0)
+            ));
+            // Phase 1 of 2 runs through the half-integer points instead.
+            assert!(lattice_occupied(
+                LatticeKind::Weave,
+                [0.25 * (0.5 + t), 0.125, 0.125],
+                0.25,
+                0.2,
+                &weave_params(2, 1, 0.0)
+            ));
+            assert!(!lattice_occupied(
+                LatticeKind::Weave,
+                [0.25 * (0.5 + t), 0.125, 0.125],
+                0.25,
+                0.2,
+                &weave_params(2, 0, 0.0)
+            ));
+        }
+    }
+
+    #[test]
+    fn weave_phase_index_wraps() {
+        for pos in probes() {
+            assert_eq!(
+                lattice_occupied(LatticeKind::Weave, pos, 0.25, 0.3, &weave_params(3, 0, 0.4)),
+                lattice_occupied(LatticeKind::Weave, pos, 0.25, 0.3, &weave_params(3, 3, 0.4)),
+                "phase index must wrap modulo the phase count at {pos:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn weave_phases_never_touch() {
+        // Just under the documented per-phase density ceiling, no probe
+        // may belong to two phases — the separation guarantee.
+        for (phases, irregularity) in [(2, 0.0), (2, 0.3), (3, 0.3), (4, 0.5)] {
+            let d = (0.9 * weave_max_density(phases, irregularity)) as f32;
+            assert!(d > 0.0, "ceiling must be positive for {phases} phases");
+            for pos in probes() {
+                let owners = (0..phases)
+                    .filter(|&k| {
+                        lattice_occupied(
+                            LatticeKind::Weave,
+                            pos,
+                            0.25,
+                            d,
+                            &weave_params(phases, k, irregularity),
+                        )
+                    })
+                    .count();
+                assert!(
+                    owners <= 1,
+                    "{phases} phases at irregularity {irregularity}: point {pos:?} \
+                     belongs to {owners} phases at density {d}"
+                );
+            }
         }
     }
 }

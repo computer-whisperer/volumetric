@@ -584,9 +584,13 @@ mod tests {
         match family {
             SkeletonFamily::Cubic => (LatticeKind::Struts, LatticeParams::default()),
             SkeletonFamily::Tetra => (LatticeKind::Tetra, LatticeParams::default()),
-            SkeletonFamily::Foam { irregularity } => {
-                (LatticeKind::Foam, LatticeParams { irregularity })
-            }
+            SkeletonFamily::Foam { irregularity } => (
+                LatticeKind::Foam,
+                LatticeParams {
+                    irregularity,
+                    ..LatticeParams::default()
+                },
+            ),
         }
     }
 

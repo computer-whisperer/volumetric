@@ -140,7 +140,15 @@ fn gyroid_fill_follows_the_density_gradient() {
 #[test]
 fn lattice_families_run_and_differ() {
     let input = wasm_artifact("density_gradient_model");
-    const FAMILIES: [&str; 6] = ["gyroid", "schwarz", "struts", "honeycomb", "tetra", "foam"];
+    const FAMILIES: [&str; 7] = [
+        "gyroid",
+        "schwarz",
+        "struts",
+        "honeycomb",
+        "tetra",
+        "foam",
+        "weave",
+    ];
     let mut signatures = Vec::new();
     for lattice in FAMILIES {
         let output = run_operator(
@@ -459,4 +467,87 @@ fn foam_irregularity_flows_through() {
     let organic = signature(0.8);
     assert!(regular.iter().any(|&b| b) && !regular.iter().all(|&b| b));
     assert_ne!(regular, organic, "irregularity should reshape the foam");
+}
+
+/// Weave phases through the operator: each phase produces material, the
+/// phases differ, and no probe point ever belongs to two phases (the
+/// separation guarantee, here exercised end-to-end).
+#[test]
+fn weave_phases_are_disjoint_through_the_operator() {
+    let input = wasm_artifact("density_gradient_model");
+    // The gradient input's density channel drives thickness, so cap it
+    // (density_max) below the 3-phase separation ceiling at irregularity
+    // 0.3 — weave_max_density(3, 0.3) ~= 0.128. Above the ceiling phases
+    // legitimately touch; the guarantee under test only holds below it.
+    let phase_config = |phases: i64, phase: i64| -> Vec<u8> {
+        cbor_config(&[
+            ("lattice", ciborium::value::Value::Text("weave".into())),
+            ("cell_size", ciborium::value::Value::Float(0.5)),
+            ("density_max", ciborium::value::Value::Float(0.11)),
+            ("irregularity", ciborium::value::Value::Float(0.3)),
+            ("phases", ciborium::value::Value::Integer(phases.into())),
+            ("phase", ciborium::value::Value::Integer(phase.into())),
+        ])
+    };
+    let mut executors: Vec<NativeModelExecutor> = (0..3)
+        .map(|k| {
+            let output = run_operator(
+                "lattice_operator",
+                vec![input.clone(), phase_config(3, k)],
+            )
+            .unwrap_or_else(|e| panic!("weave phase {k} failed: {e}"));
+            NativeModelExecutor::new(&output).expect("phase executes")
+        })
+        .collect();
+
+    let mut owners_seen = [false; 3];
+    for i in 0..9 {
+        for j in 0..9 {
+            for k in 0..9 {
+                let p = [
+                    -0.9 + 0.213 * i as f64,
+                    -0.9 + 0.229 * j as f64,
+                    -0.9 + 0.241 * k as f64,
+                ];
+                let mut owners = Vec::new();
+                for (idx, executor) in executors.iter_mut().enumerate() {
+                    if volumetric::is_occupied(executor.sample_nd(&p).unwrap()) {
+                        owners.push(idx);
+                    }
+                }
+                assert!(
+                    owners.len() <= 1,
+                    "point {p:?} belongs to phases {owners:?}"
+                );
+                for idx in owners {
+                    owners_seen[idx] = true;
+                }
+            }
+        }
+    }
+    assert_eq!(
+        owners_seen,
+        [true; 3],
+        "every phase should own some probe points"
+    );
+}
+
+/// Phase configuration is validated: the phase index must name one of the
+/// declared phases.
+#[test]
+fn weave_rejects_phase_outside_count() {
+    let input = wasm_artifact("density_gradient_model");
+    let err = run_operator(
+        "lattice_operator",
+        vec![
+            input,
+            cbor_config(&[
+                ("lattice", ciborium::value::Value::Text("weave".into())),
+                ("phases", ciborium::value::Value::Integer(2.into())),
+                ("phase", ciborium::value::Value::Integer(2.into())),
+            ]),
+        ],
+    )
+    .expect_err("phase == phases must be rejected");
+    assert!(err.contains("phase"), "{err}");
 }

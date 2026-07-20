@@ -58,6 +58,12 @@ enum LatticeKindConfig {
     /// four struts per node). `irregularity` 0 gives regular Kelvin
     /// cells; higher values organic non-repeating foam.
     Foam,
+    /// One phase of `phases` interpenetrating jittered cubic strut
+    /// networks that interlink but never touch (the same-color Delaunay
+    /// bonds of a colored BCC, generalized to N colors along the cell
+    /// diagonal). `phase` selects which network this model produces;
+    /// build each phase as its own model and combine downstream.
+    Weave,
 }
 
 impl LatticeKindConfig {
@@ -71,6 +77,7 @@ impl LatticeKindConfig {
             Self::Honeycomb => 3,
             Self::Tetra => 4,
             Self::Foam => 5,
+            Self::Weave => 6,
         }
     }
 }
@@ -88,8 +95,13 @@ struct LatticeConfig {
     density_min: f64,
     density_max: f64,
     /// Foam cell-shape jitter, 0 (regular Kelvin cells) ..= 1 (fully
-    /// organic). Other families ignore it.
+    /// organic). Weave scales it by 1/phases to keep phases separate.
+    /// Other families ignore it.
     irregularity: f64,
+    /// Weave: how many interlinked networks share the cell.
+    phases: i64,
+    /// Weave: which network this model produces (0-based).
+    phase: i64,
 }
 
 impl Default for LatticeConfig {
@@ -103,6 +115,8 @@ impl Default for LatticeConfig {
             density_min: 0.0,
             density_max: 1.0,
             irregularity: 0.3,
+            phases: 2,
+            phase: 0,
         }
     }
 }
@@ -131,6 +145,7 @@ fn patch_template(
     cell_size: f32,
     density_map: [f32; 3],
     irregularity: f32,
+    phases: [u32; 2],
 ) -> Result<Vec<u8>, String> {
     let mut module =
         walrus::Module::from_buffer_with_config(TEMPLATE, &walrus::ModuleConfig::new())
@@ -156,13 +171,16 @@ fn patch_template(
     };
     module.exports.delete(export.0);
 
-    let mut bytes = Vec::with_capacity(24);
+    let mut bytes = Vec::with_capacity(32);
     bytes.extend(kind.to_le_bytes());
     bytes.extend(cell_size.to_le_bytes());
     for value in density_map {
         bytes.extend(value.to_le_bytes());
     }
     bytes.extend(irregularity.to_le_bytes());
+    for value in phases {
+        bytes.extend(value.to_le_bytes());
+    }
     module.data.add(
         walrus::DataKind::Active {
             memory: memory_id,
@@ -412,6 +430,15 @@ fn build_lattice_model(input: &[u8], config: &LatticeConfig) -> Result<Vec<u8>, 
             config.irregularity
         ));
     }
+    if !(1..=64).contains(&config.phases) {
+        return Err(format!("phases must be in 1..=64, got {}", config.phases));
+    }
+    if !(0..config.phases).contains(&config.phase) {
+        return Err(format!(
+            "phase must be in 0..{}, got {}",
+            config.phases, config.phase
+        ));
+    }
     check_three_dimensional(input)?;
 
     let template = patch_template(
@@ -423,6 +450,7 @@ fn build_lattice_model(input: &[u8], config: &LatticeConfig) -> Result<Vec<u8>, 
             config.density_max as f32,
         ],
         config.irregularity as f32,
+        [config.phases as u32, config.phase as u32],
     )?;
 
     let a_counts = count_sections(input)?;
@@ -501,7 +529,7 @@ pub extern "C" fn run() {
 pub extern "C" fn get_metadata() -> i64 {
     static METADATA: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     volumetric_abi::metadata_reply(&METADATA, || {
-        let schema = r#"{ lattice: "gyroid" / "schwarz" / "struts" / "honeycomb" / "tetra" / "foam" .default "gyroid", cell_size: float .default 0.05, density_channel: int .default 1, uniform_density: float .default 1.0, density_gamma: float .default 1.0, density_min: float .default 0.0, density_max: float .default 1.0, irregularity: float .default 0.3 }"#.to_string();
+        let schema = r#"{ lattice: "gyroid" / "schwarz" / "struts" / "honeycomb" / "tetra" / "foam" / "weave" .default "gyroid", cell_size: float .default 0.05, density_channel: int .default 1, uniform_density: float .default 1.0, density_gamma: float .default 1.0, density_min: float .default 0.0, density_max: float .default 1.0, irregularity: float .default 0.3, phases: int .default 2, phase: int .default 0 }"#.to_string();
         OperatorMetadata {
             name: "lattice_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
