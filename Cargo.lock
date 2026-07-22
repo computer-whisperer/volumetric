@@ -2989,6 +2989,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mesh_drape_operator"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "mesh_edit_core",
+ "serde",
+ "volumetric_abi",
+]
+
+[[package]]
 name = "mesh_edit_core"
 version = "0.1.0"
 dependencies = [
@@ -5693,7 +5703,7 @@ dependencies = [
 
 [[package]]
 name = "voronoi_skeleton_operator"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ciborium",
  "lattice_model_core",
