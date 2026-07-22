@@ -2716,30 +2716,11 @@ impl VolumetricUiV2 {
             _ => std::collections::BTreeMap::new(),
         };
         // Array fields keep one buffer per element in `lists`; scalar fields a
-        // single buffer in `buffers`.
+        // single buffer in `buffers`. Group sub-fields key by dotted path;
+        // the group's own buffer holds its enablement ("true"/"false").
         let mut buffers = std::collections::BTreeMap::new();
         let mut lists = std::collections::BTreeMap::new();
-        for field in &fields {
-            let value = current.get(&field.name);
-            if matches!(field.ty, ConfigFieldType::List { .. }) {
-                let elements = match value.or(field.default.as_ref()) {
-                    Some(ConfigValue::List(items)) => {
-                        items.iter().map(ConfigValue::to_display_string).collect()
-                    }
-                    _ => Vec::new(),
-                };
-                lists.insert(field.name.clone(), elements);
-            } else {
-                // An unset optional field shows an empty buffer (clearing the
-                // field is how it gets unset again).
-                let text = match value {
-                    Some(value) => value.to_display_string(),
-                    None if field.optional => String::new(),
-                    None => field.seed_value().to_display_string(),
-                };
-                buffers.insert(field.name.clone(), text);
-            }
-        }
+        Self::seed_config_buffers(&fields, "", &current, &mut buffers, &mut lists);
         Some(ConfigForm {
             input_idx,
             name,
@@ -2747,6 +2728,52 @@ impl VolumetricUiV2 {
             buffers,
             lists,
         })
+    }
+
+    fn seed_config_buffers(
+        fields: &[ConfigField],
+        prefix: &str,
+        current: &std::collections::BTreeMap<String, ConfigValue>,
+        buffers: &mut std::collections::BTreeMap<String, String>,
+        lists: &mut std::collections::BTreeMap<String, Vec<String>>,
+    ) {
+        for field in fields {
+            let path = if prefix.is_empty() {
+                field.name.clone()
+            } else {
+                format!("{prefix}.{}", field.name)
+            };
+            let value = current.get(&path);
+            match &field.ty {
+                ConfigFieldType::Group(sub) => {
+                    // Required groups are always on; optional ones read
+                    // their marker (absent = disabled).
+                    let enabled = !field.optional
+                        || matches!(value, Some(ConfigValue::Bool(true)));
+                    buffers.insert(path.clone(), enabled.to_string());
+                    Self::seed_config_buffers(sub, &path, current, buffers, lists);
+                }
+                ConfigFieldType::List { .. } => {
+                    let elements = match value.or(field.default.as_ref()) {
+                        Some(ConfigValue::List(items)) => {
+                            items.iter().map(ConfigValue::to_display_string).collect()
+                        }
+                        _ => Vec::new(),
+                    };
+                    lists.insert(path, elements);
+                }
+                _ => {
+                    // An unset optional field shows an empty buffer (clearing
+                    // the field is how it gets unset again).
+                    let text = match value {
+                        Some(value) => value.to_display_string(),
+                        None if field.optional => String::new(),
+                        None => field.seed_value().to_display_string(),
+                    };
+                    buffers.insert(path, text);
+                }
+            }
+        }
     }
 
     fn operator_bytes(&self, operator_id: &str) -> Option<Vec<u8>> {
@@ -3085,7 +3112,7 @@ impl VolumetricUiV2 {
     }
 
     fn commit_config_buffer(&mut self, step_idx: usize, config: &ConfigForm, field_name: &str) {
-        let Some(field) = config.fields.iter().find(|f| f.name == field_name) else {
+        let Some(field) = operator_config::find_field(&config.fields, field_name) else {
             return;
         };
         let Some(buffer) = config.buffers.get(field_name) else {
@@ -3112,7 +3139,7 @@ impl VolumetricUiV2 {
     /// up empty (or any element that fails to parse) leaves the config
     /// unchanged.
     fn commit_config_list(&mut self, step_idx: usize, config: &ConfigForm, field_name: &str) {
-        let Some(field) = config.fields.iter().find(|f| f.name == field_name) else {
+        let Some(field) = operator_config::find_field(&config.fields, field_name) else {
             return;
         };
         let ConfigFieldType::List { element, min_len } = &field.ty else {
@@ -6313,23 +6340,7 @@ fn step_edit_rows(app: &VolumetricUiV2, step_idx: usize) -> Vec<El> {
                 .caption()
                 .semibold(),
         );
-        for field in &config.fields {
-            if matches!(field.ty, ConfigFieldType::List { .. }) {
-                let elements = config
-                    .lists
-                    .get(&field.name)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]);
-                rows.push(config_list_field(field, elements, &app.selection));
-            } else {
-                let buffer = config
-                    .buffers
-                    .get(&field.name)
-                    .map(String::as_str)
-                    .unwrap_or("");
-                rows.push(config_field_row(field, buffer, &app.selection));
-            }
-        }
+        push_config_rows(&config.fields, "", config, &app.selection, &mut rows);
     }
 
     if let Some(lua) = &edit.lua {
@@ -6453,19 +6464,62 @@ fn asset_slot_kind_label(kind: AssetSlotKind) -> &'static str {
     }
 }
 
-fn config_field_row(field: &ConfigField, buffer: &str, selection: &Selection) -> El {
+/// Render config fields into rows, recursing into groups: a group renders
+/// as a section header (with an enable switch when optional) followed by
+/// its sub-fields while enabled. Every control keys by the field's dotted
+/// path, so the existing commit routes resolve nested fields unchanged.
+fn push_config_rows(
+    fields: &[ConfigField],
+    prefix: &str,
+    config: &ConfigForm,
+    selection: &Selection,
+    rows: &mut Vec<El>,
+) {
+    for field in fields {
+        let path = if prefix.is_empty() {
+            field.name.clone()
+        } else {
+            format!("{prefix}.{}", field.name)
+        };
+        match &field.ty {
+            ConfigFieldType::Group(sub) => {
+                let enabled = config.buffers.get(&path).map(String::as_str) == Some("true");
+                let header = text(&field.name)
+                    .muted()
+                    .caption()
+                    .semibold()
+                    .width(Size::Fill(1.0));
+                rows.push(if field.optional {
+                    row([header, switch(format!("{CONFIG_BOOL_PREFIX}{path}"), enabled)])
+                        .gap(tokens::SPACE_2)
+                        .align(Align::Center)
+                } else {
+                    row([header])
+                });
+                if enabled {
+                    push_config_rows(sub, &path, config, selection, rows);
+                }
+            }
+            ConfigFieldType::List { .. } => {
+                let elements = config.lists.get(&path).map(Vec::as_slice).unwrap_or(&[]);
+                rows.push(config_list_field(field, &path, elements, selection));
+            }
+            _ => {
+                let buffer = config.buffers.get(&path).map(String::as_str).unwrap_or("");
+                rows.push(config_field_row(field, &path, buffer, selection));
+            }
+        }
+    }
+}
+
+fn config_field_row(field: &ConfigField, path: &str, buffer: &str, selection: &Selection) -> El {
     let control = match &field.ty {
-        ConfigFieldType::Bool => switch(
-            format!("{CONFIG_BOOL_PREFIX}{}", field.name),
-            buffer == "true",
-        ),
-        ConfigFieldType::Enum(options) => config_enum_control(&field.name, options, buffer),
-        _ => text_input(
-            &format!("{CONFIG_FIELD_PREFIX}{}", field.name),
-            buffer,
-            selection,
-        )
-        .width(Size::Fixed(132.0)),
+        ConfigFieldType::Bool => {
+            switch(format!("{CONFIG_BOOL_PREFIX}{path}"), buffer == "true")
+        }
+        ConfigFieldType::Enum(options) => config_enum_control(path, options, buffer),
+        _ => text_input(&format!("{CONFIG_FIELD_PREFIX}{path}"), buffer, selection)
+            .width(Size::Fixed(132.0)),
     };
     field_row(config_field_label(field), control).gap(tokens::SPACE_2)
 }
@@ -6496,8 +6550,13 @@ fn config_field_label(field: &ConfigField) -> String {
 /// The rich array editor: one text input per element with a remove button, and
 /// an add button. Element edits route through [`CONFIG_LIST_PREFIX`];
 /// add/remove through [`CONFIG_LIST_ADD_PREFIX`]/[`CONFIG_LIST_DEL_PREFIX`].
-fn config_list_field(field: &ConfigField, elements: &[String], selection: &Selection) -> El {
-    let name = &field.name;
+fn config_list_field(
+    field: &ConfigField,
+    path: &str,
+    elements: &[String],
+    selection: &Selection,
+) -> El {
+    let name = path;
     let mut items: Vec<El> = elements
         .iter()
         .enumerate()
@@ -7367,11 +7426,15 @@ mod tests {
                     };
                     // The default config decodes and covers every required
                     // schema field; optional fields start unset so the
-                    // operator's absent-field behavior applies.
+                    // operator's absent-field behavior applies — except
+                    // optional groups marked `.default true`, which start
+                    // enabled.
                     let fields = operator_config::parse_schema(cddl).unwrap_or_default();
                     let decoded = operator_config::decode(bytes);
                     for field in &fields {
-                        if field.optional {
+                        let default_enabled_group = matches!(field.ty, ConfigFieldType::Group(_))
+                            && field.default == Some(ConfigValue::Bool(true));
+                        if field.optional && !default_enabled_group {
                             assert!(
                                 !decoded.contains_key(&field.name),
                                 "optional {} must start unset",
@@ -9264,8 +9327,9 @@ mod tests {
                     ConfigValue::Text("hello".to_string())
                 }
                 // Array fields are edited element-by-element, not through the
-                // single-buffer setters this scalar-focused test drives.
-                ConfigFieldType::List { .. } => continue,
+                // single-buffer setters this scalar-focused test drives;
+                // groups get their own toggle/nest test below.
+                ConfigFieldType::List { .. } | ConfigFieldType::Group(_) => continue,
             };
 
             let step = &app.project().timeline()[step_idx];
@@ -9286,6 +9350,67 @@ mod tests {
             exercised,
             "expected at least one bundled operator with a config schema"
         );
+    }
+
+    /// Group config blocks (the mesh remaster requirement blocks) toggle
+    /// whole nested maps on and off, and nested fields edit through their
+    /// dotted paths — the regression behind "Invalid type: string, expected
+    /// map" was the flat parser shredding this schema into enum garbage.
+    #[test]
+    fn group_config_blocks_toggle_and_nest() {
+        let mut app = VolumetricUiV2::default();
+        add_operator_click(&mut app, "mesh_remaster_operator");
+        app.before_build();
+        let edit = app.step_edit.as_ref().expect("step edit");
+        let config = edit.config.as_ref().expect("config form");
+        let (step_idx, input_idx) = (edit.step_idx, config.input_idx);
+        assert!(
+            config
+                .fields
+                .iter()
+                .any(|f| matches!(f.ty, ConfigFieldType::Group(_))),
+            "the remaster schema parses into groups"
+        );
+        let decoded_config = |app: &VolumetricUiV2| {
+            let step = &app.project().timeline()[step_idx];
+            let ExecutionInput::Inline(bytes) = &step.inputs[input_idx] else {
+                panic!("config input should be inline CBOR");
+            };
+            operator_config::decode(bytes)
+        };
+
+        // A fresh step seeds the `.default true` surface block enabled with
+        // its defaults; the other blocks stay absent.
+        let decoded = decoded_config(&app);
+        assert_eq!(decoded.get("surface"), Some(&ConfigValue::Bool(true)));
+        assert_eq!(
+            decoded.get("surface.outside"),
+            Some(&ConfigValue::Text("project".into()))
+        );
+        assert!(!decoded.contains_key("support"));
+        assert!(!decoded.contains_key("connectivity"));
+
+        // Enabling support adds the nested map with its seeds.
+        app.toggle_config_bool("support");
+        let decoded = decoded_config(&app);
+        assert_eq!(decoded.get("support"), Some(&ConfigValue::Bool(true)));
+        assert_eq!(
+            decoded.get("support.fix"),
+            Some(&ConfigValue::Text("raise".into()))
+        );
+
+        // Nested fields edit through their dotted paths.
+        app.set_config_buffer("support.max_descent", "20".to_string());
+        assert_eq!(
+            decoded_config(&app).get("support.max_descent"),
+            Some(&ConfigValue::Float(20.0))
+        );
+
+        // Disabling surface drops the whole block from the config.
+        app.toggle_config_bool("surface");
+        let decoded = decoded_config(&app);
+        assert!(!decoded.contains_key("surface"));
+        assert!(!decoded.contains_key("surface.outside"));
     }
 
     /// Sets an array field's element buffers wholesale and commits, standing in

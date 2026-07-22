@@ -65,8 +65,9 @@
 //! - Input 0: FeaMesh (Bar2, or Point1 for surface-only) — the mesh
 //! - Input 1: ModelWASM (must be 3D) — the surface to drape onto; only
 //!   required when the `surface` block is present
-//! - Input 2: CBOR configuration (every block optional, at least one):
-//!   `{ surface: { outside: "project" / "drop" .default "project",
+//! - Input 2: CBOR configuration (every block optional, at least one;
+//!   the UI seeds new steps with `surface` enabled):
+//!   `{ ? surface: { outside: "project" / "drop" .default "project",
 //!   skin_radius_factor: float .default 1.0, chord_tolerance: float
 //!   .default 0.0 (0 = each strut's own radius), inset_factor: float
 //!   .default 0.0 (sink skin nodes below the surface by this many strut
@@ -74,11 +75,11 @@
 //!   max_distance: float .default 0.0 (0 = 4 x the median strut length;
 //!   for Point1, an eighth of the cloud's bounding diagonal),
 //!   weld_factor: float .default 1.0 (welds struts shorter than
-//!   weld_factor * radius; 0 disables) },
-//!   connectivity: { fix: "reconnect" / "prune" .default "reconnect",
+//!   weld_factor * radius; 0 disables) } .default true,
+//!   ? connectivity: { fix: "reconnect" / "prune" .default "reconnect",
 //!   max_new_strut: float .default 1.5 (x the median strut length; 0
 //!   never synthesizes) },
-//!   support: { axis: "auto" / "x" / "y" / "z" .default "auto" (auto =
+//!   ? support: { axis: "auto" / "x" / "y" / "z" .default "auto" (auto =
 //!   z), extreme: "min" / "max" .default "min" (which end of the axis
 //!   the bed is on), max_descent: float .default 0.0 (degrees below
 //!   horizontal a strut may descend from its supported end),
@@ -476,7 +477,10 @@ pub extern "C" fn run() {
 pub extern "C" fn get_metadata() -> i64 {
     static METADATA: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     volumetric_abi::metadata_reply(&METADATA, || {
-        let schema = r#"{ surface: { outside: "project" / "drop" .default "project", skin_radius_factor: float .default 1.0, chord_tolerance: float .default 0.0, inset_factor: float .default 0.0, max_distance: float .default 0.0, weld_factor: float .default 1.0 } .optional, connectivity: { fix: "reconnect" / "prune" .default "reconnect", max_new_strut: float .default 1.5 } .optional, support: { axis: "auto" / "x" / "y" / "z" .default "auto", extreme: "min" / "max" .default "min", max_descent: float .default 0.0, bed_tolerance: float .default 0.0, fix: "raise" / "drop" .default "raise" } .optional }"#
+        // Optional blocks use the CDDL `?` marker; `.default true` after a
+        // group's brace seeds fresh steps with that block enabled, so a new
+        // step drapes with defaults out of the box.
+        let schema = r#"{ ? surface: { outside: "project" / "drop" .default "project", skin_radius_factor: float .default 1.0, chord_tolerance: float .default 0.0, inset_factor: float .default 0.0, max_distance: float .default 0.0, weld_factor: float .default 1.0 } .default true, ? connectivity: { fix: "reconnect" / "prune" .default "reconnect", max_new_strut: float .default 1.5 }, ? support: { axis: "auto" / "x" / "y" / "z" .default "auto", extreme: "min" / "max" .default "min", max_descent: float .default 0.0, bed_tolerance: float .default 0.0, fix: "raise" / "drop" .default "raise" } }"#
             .to_string();
         OperatorMetadata {
             name: "mesh_remaster_operator".to_string(),

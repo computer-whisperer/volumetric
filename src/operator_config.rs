@@ -12,6 +12,7 @@
 //! { scale: float .default 1.0, center: bool .default false }
 //! { op: "union" / "subtract" / "intersect" }
 //! { ? bed_position: float }
+//! { ? surface: { outside: "project" / "drop" } .default true }
 //! ```
 //!
 //! Leaf types: `bool`, `int`, `float`, `tstr`, and small string-enum unions.
@@ -22,13 +23,21 @@
 //! A `?` occurrence marker makes a field optional: [`encode`] omits it from
 //! the config map unless a value was explicitly set, so the operator's own
 //! absent-field behavior applies (e.g. brim's auto bed placement).
+//!
+//! A braced right-hand side declares a *group*: a named sub-record encoded
+//! as a nested CBOR map (e.g. the mesh remaster operator's requirement
+//! blocks). In the flat values map a group's sub-fields live under
+//! dotted paths (`surface.outside`), and the group's own path holds a
+//! `Bool` enablement marker: an optional group is encoded only when its
+//! marker is `true` (a `.default true` after the closing brace seeds new
+//! steps with the group enabled); a required group is always encoded.
 
 use std::collections::BTreeMap;
 
 use ciborium::value::Value as CborValue;
 
 /// The type of a single configuration field.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ConfigFieldType {
     Bool,
     Int,
@@ -44,6 +53,12 @@ pub enum ConfigFieldType {
         element: Box<ConfigFieldType>,
         min_len: usize,
     },
+    /// A named sub-record (`name: { ... }`), encoded as a nested CBOR map.
+    /// Sub-fields live at dotted paths in the flat values map; the group's
+    /// own path holds a `Bool` enablement marker (see the module docs).
+    /// A group field's `default` of `Bool(true)` means an *optional* group
+    /// starts enabled.
+    Group(Vec<ConfigField>),
 }
 
 /// A concrete configuration value.
@@ -124,6 +139,8 @@ impl ConfigFieldType {
                 ConfigValue::Text(options.first().cloned().unwrap_or_default())
             }
             ConfigFieldType::List { .. } => ConfigValue::List(Vec::new()),
+            // A group's own value is its enablement marker.
+            ConfigFieldType::Group(_) => ConfigValue::Bool(false),
         }
     }
 }
@@ -154,7 +171,9 @@ impl ConfigValue {
     /// separate element buffers, but this keeps `parse` total).
     pub fn parse(ty: &ConfigFieldType, text: &str) -> Option<ConfigValue> {
         match ty {
-            ConfigFieldType::Bool => match text.trim() {
+            // A group parses like a bool: its editable value is the
+            // enablement marker driven by the section's switch.
+            ConfigFieldType::Bool | ConfigFieldType::Group(_) => match text.trim() {
                 "true" => Some(ConfigValue::Bool(true)),
                 "false" => Some(ConfigValue::Bool(false)),
                 _ => None,
@@ -209,13 +228,16 @@ pub fn parse_schema(cddl: &str) -> Result<Vec<ConfigField>, ConfigSchemaError> {
     let mut s = cddl.trim();
     s = s.strip_prefix('{').unwrap_or(s).trim();
     s = s.strip_suffix('}').unwrap_or(s).trim();
+    parse_record_body(s)
+}
 
+fn parse_record_body(s: &str) -> Result<Vec<ConfigField>, ConfigSchemaError> {
     if s.is_empty() {
         return Ok(Vec::new());
     }
 
     let mut out = Vec::new();
-    for part in s.split(',') {
+    for part in split_record_parts(s) {
         let part = part.trim();
         if part.is_empty() {
             continue;
@@ -234,6 +256,21 @@ pub fn parse_schema(cddl: &str) -> Result<Vec<ConfigField>, ConfigSchemaError> {
             return Err(ConfigSchemaError::EmptyName(part.to_string()));
         }
         let rhs = rhs.trim();
+
+        // A braced right-hand side is a group: a nested record, optionally
+        // followed by `.default true` (start enabled).
+        if rhs.starts_with('{') {
+            let (ty, default) = parse_group(rhs, part)?;
+            out.push(ConfigField {
+                name: name.to_string(),
+                ty,
+                default,
+                optional,
+                min: None,
+                max: None,
+            });
+            continue;
+        }
 
         let ann = split_type_and_annotations(rhs);
         let ty = parse_field_type(ann.ty)?;
@@ -255,6 +292,82 @@ pub fn parse_schema(cddl: &str) -> Result<Vec<ConfigField>, ConfigSchemaError> {
     }
 
     Ok(out)
+}
+
+/// Split a record body on the commas at nesting depth zero: commas inside
+/// group braces and array brackets belong to the nested type, not the
+/// record. (Quoted strings in this subset never contain braces, brackets,
+/// or commas.)
+fn split_record_parts(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '{' | '[' => depth += 1,
+            '}' | ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    parts
+}
+
+/// Parse a group right-hand side: `{ ...sub-record... }` plus an optional
+/// `.default true` / `.default false` tail (whether an optional group
+/// starts enabled).
+fn parse_group(
+    rhs: &str,
+    part: &str,
+) -> Result<(ConfigFieldType, Option<ConfigValue>), ConfigSchemaError> {
+    let mut depth = 0usize;
+    let mut close = None;
+    for (i, c) in rhs.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(close) = close else {
+        return Err(ConfigSchemaError::MalformedField(part.to_string()));
+    };
+    let sub = parse_record_body(rhs[1..close].trim())?;
+    let default = match rhs[close + 1..].trim() {
+        "" => None,
+        tail => match tail.strip_prefix(".default").map(str::trim) {
+            Some("true") => Some(ConfigValue::Bool(true)),
+            Some("false") => Some(ConfigValue::Bool(false)),
+            _ => return Err(ConfigSchemaError::UnsupportedType(tail.to_string())),
+        },
+    };
+    Ok((ConfigFieldType::Group(sub), default))
+}
+
+/// Look a field up by its (possibly dotted) path, walking group nesting.
+/// An exact name match wins at every level: Lua parameter schemas use
+/// literal dotted names (`sphere.radius`) as flat fields, so the dot only
+/// descends when no field carries the full name itself.
+pub fn find_field<'a>(fields: &'a [ConfigField], path: &str) -> Option<&'a ConfigField> {
+    if let Some(field) = fields.iter().find(|f| f.name == path) {
+        return Some(field);
+    }
+    let (head, rest) = path.split_once('.')?;
+    let field = fields.iter().find(|f| f.name == head)?;
+    match &field.ty {
+        ConfigFieldType::Group(sub) => find_field(sub, rest),
+        _ => None,
+    }
 }
 
 /// Strip one layer of surrounding double quotes: CDDL writes string and
@@ -396,53 +509,111 @@ fn parse_field_type(ty: &str) -> Result<ConfigFieldType, ConfigSchemaError> {
 /// Encode a set of values into the CBOR map an operator expects. Fields missing
 /// from `values` fall back to their declared default (or type-zero); missing
 /// *optional* fields are omitted so the operator's absent-field behavior
-/// applies.
+/// applies. Group sub-fields are looked up under dotted paths; an optional
+/// group is emitted (as a nested map) only when its marker reads `true`.
 pub fn encode(fields: &[ConfigField], values: &BTreeMap<String, ConfigValue>) -> Vec<u8> {
-    let entries: Vec<(CborValue, CborValue)> = fields
-        .iter()
-        .filter_map(|field| {
-            let value = match values.get(&field.name) {
-                Some(value) => value.clone(),
-                None if field.optional => return None,
-                None => field.seed_value(),
-            };
-            Some((CborValue::Text(field.name.clone()), value.to_cbor()))
-        })
-        .collect();
-
+    let entries = encode_entries(fields, values, "");
     let mut out = Vec::new();
     // Encoding a plain map to an in-memory buffer does not fail.
     let _ = ciborium::ser::into_writer(&CborValue::Map(entries), &mut out);
     out
 }
 
-/// Seed values for a schema: the declared default (or type-zero) per
-/// required field. Optional fields start unset.
-pub fn default_values(fields: &[ConfigField]) -> BTreeMap<String, ConfigValue> {
+fn field_path(prefix: &str, name: &str) -> String {
+    if prefix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{prefix}.{name}")
+    }
+}
+
+fn encode_entries(
+    fields: &[ConfigField],
+    values: &BTreeMap<String, ConfigValue>,
+    prefix: &str,
+) -> Vec<(CborValue, CborValue)> {
     fields
         .iter()
-        .filter(|field| !field.optional)
-        .map(|field| (field.name.clone(), field.seed_value()))
+        .filter_map(|field| {
+            let path = field_path(prefix, &field.name);
+            if let ConfigFieldType::Group(sub) = &field.ty {
+                let enabled = matches!(values.get(&path), Some(ConfigValue::Bool(true)));
+                if field.optional && !enabled {
+                    return None;
+                }
+                return Some((
+                    CborValue::Text(field.name.clone()),
+                    CborValue::Map(encode_entries(sub, values, &path)),
+                ));
+            }
+            let value = match values.get(&path) {
+                Some(value) => value.clone(),
+                None if field.optional => return None,
+                None => field.seed_value(),
+            };
+            Some((CborValue::Text(field.name.clone()), value.to_cbor()))
+        })
         .collect()
 }
 
+/// Seed values for a schema: the declared default (or type-zero) per
+/// required field, at dotted paths inside groups. Optional fields start
+/// unset; an optional group with `.default true` starts enabled (its
+/// marker is set and its sub-fields seed).
+pub fn default_values(fields: &[ConfigField]) -> BTreeMap<String, ConfigValue> {
+    let mut out = BTreeMap::new();
+    seed_defaults(fields, "", &mut out);
+    out
+}
+
+fn seed_defaults(fields: &[ConfigField], prefix: &str, out: &mut BTreeMap<String, ConfigValue>) {
+    for field in fields {
+        let path = field_path(prefix, &field.name);
+        if let ConfigFieldType::Group(sub) = &field.ty {
+            let enabled =
+                !field.optional || matches!(field.default, Some(ConfigValue::Bool(true)));
+            if !enabled {
+                continue;
+            }
+            if field.optional {
+                out.insert(path.clone(), ConfigValue::Bool(true));
+            }
+            seed_defaults(sub, &path, out);
+        } else if !field.optional {
+            out.insert(path, field.seed_value());
+        }
+    }
+}
+
 /// Best-effort decode of a CBOR config map into values, keyed by field name.
-/// Values whose CBOR type doesn't match a known scalar are skipped.
+/// Nested maps flatten to dotted paths, with a `Bool(true)` marker at the
+/// map's own path. Values whose CBOR type doesn't match a known scalar are
+/// skipped.
 pub fn decode(bytes: &[u8]) -> BTreeMap<String, ConfigValue> {
     let mut out = BTreeMap::new();
-    let Ok(CborValue::Map(entries)) = ciborium::de::from_reader::<CborValue, _>(bytes) else {
-        return out;
-    };
+    if let Ok(CborValue::Map(entries)) = ciborium::de::from_reader::<CborValue, _>(bytes) {
+        flatten_entries(&entries, "", &mut out);
+    }
+    out
+}
 
+fn flatten_entries(
+    entries: &[(CborValue, CborValue)],
+    prefix: &str,
+    out: &mut BTreeMap<String, ConfigValue>,
+) {
     for (key, value) in entries {
         let CborValue::Text(name) = key else {
             continue;
         };
-        if let Some(config_value) = cbor_to_value(&value) {
-            out.insert(name, config_value);
+        let path = field_path(prefix, name);
+        if let CborValue::Map(sub) = value {
+            out.insert(path.clone(), ConfigValue::Bool(true));
+            flatten_entries(sub, &path, out);
+        } else if let Some(config_value) = cbor_to_value(value) {
+            out.insert(path, config_value);
         }
     }
-    out
 }
 
 fn cbor_to_value(value: &CborValue) -> Option<ConfigValue> {
@@ -649,6 +820,98 @@ mod tests {
             decoded.get("channels"),
             Some(&ConfigValue::List(Vec::new()))
         );
+    }
+
+    const BLOCKS: &str = r#"{ ? surface: { outside: "project" / "drop" .default "project", skin_radius_factor: float .default 1.0 } .default true, ? support: { axis: "auto" / "x" .default "auto", max_descent: float .default 0.0 }, weld: bool .default true }"#;
+
+    #[test]
+    fn parses_nested_groups() {
+        let fields = parse_schema(BLOCKS).unwrap();
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[0].name, "surface");
+        assert!(fields[0].optional);
+        assert_eq!(fields[0].default, Some(ConfigValue::Bool(true)));
+        let ConfigFieldType::Group(sub) = &fields[0].ty else {
+            panic!("surface is a group");
+        };
+        assert_eq!(sub[0].name, "outside");
+        assert!(matches!(sub[0].ty, ConfigFieldType::Enum(_)));
+        assert_eq!(sub[1].name, "skin_radius_factor");
+        assert_eq!(sub[1].default, Some(ConfigValue::Float(1.0)));
+        assert_eq!(fields[1].name, "support");
+        assert_eq!(fields[1].default, None, "no .default tail: starts disabled");
+        assert_eq!(fields[2].name, "weld");
+        assert_eq!(fields[2].ty, ConfigFieldType::Bool);
+
+        // Dotted lookup walks the nesting.
+        assert_eq!(find_field(&fields, "surface.outside").unwrap().name, "outside");
+        assert_eq!(find_field(&fields, "weld").unwrap().name, "weld");
+        assert!(find_field(&fields, "surface.nope").is_none());
+        assert!(find_field(&fields, "weld.outside").is_none());
+
+        // Literal dotted names (Lua parameter forms) win over descent.
+        let lua = parse_schema("{ sphere.radius: float .default 1.0 }").unwrap();
+        assert_eq!(find_field(&lua, "sphere.radius").unwrap().name, "sphere.radius");
+    }
+
+    #[test]
+    fn group_defaults_seed_and_encode_as_nested_maps() {
+        let fields = parse_schema(BLOCKS).unwrap();
+        let values = default_values(&fields);
+        // The default-enabled group seeds its marker and sub-fields; the
+        // disabled one stays entirely unset.
+        assert_eq!(values.get("surface"), Some(&ConfigValue::Bool(true)));
+        assert_eq!(
+            values.get("surface.outside"),
+            Some(&ConfigValue::Text("project".into()))
+        );
+        assert!(!values.contains_key("support"));
+        assert!(!values.contains_key("support.axis"));
+
+        // Encode emits surface as a nested map, omits support, and decode
+        // round-trips the flattened form.
+        let decoded = decode(&encode(&fields, &values));
+        assert_eq!(decoded.get("surface"), Some(&ConfigValue::Bool(true)));
+        assert_eq!(
+            decoded.get("surface.skin_radius_factor"),
+            Some(&ConfigValue::Float(1.0))
+        );
+        assert!(!decoded.contains_key("support"));
+        assert_eq!(decoded.get("weld"), Some(&ConfigValue::Bool(true)));
+
+        // The raw CBOR really is a nested map (what the operator sees).
+        let raw: CborValue =
+            ciborium::de::from_reader(&encode(&fields, &values)[..]).unwrap();
+        let CborValue::Map(entries) = raw else { panic!("map") };
+        let surface = entries
+            .iter()
+            .find(|(k, _)| matches!(k, CborValue::Text(t) if t == "surface"))
+            .map(|(_, v)| v)
+            .unwrap();
+        assert!(matches!(surface, CborValue::Map(_)), "nested map, not a string");
+    }
+
+    #[test]
+    fn toggling_a_group_marker_adds_and_removes_its_map() {
+        let fields = parse_schema(BLOCKS).unwrap();
+        let mut values = default_values(&fields);
+        values.insert("support".to_string(), ConfigValue::Bool(true));
+        values.insert("support.max_descent".to_string(), ConfigValue::Float(20.0));
+        let decoded = decode(&encode(&fields, &values));
+        assert_eq!(
+            decoded.get("support.max_descent"),
+            Some(&ConfigValue::Float(20.0))
+        );
+        // Missing required sub-fields fall back to their seeds.
+        assert_eq!(
+            decoded.get("support.axis"),
+            Some(&ConfigValue::Text("auto".into()))
+        );
+        // A false marker (the switch off) omits the block again.
+        values.insert("surface".to_string(), ConfigValue::Bool(false));
+        let decoded = decode(&encode(&fields, &values));
+        assert!(!decoded.contains_key("surface"));
+        assert!(!decoded.contains_key("surface.outside"));
     }
 
     #[test]
