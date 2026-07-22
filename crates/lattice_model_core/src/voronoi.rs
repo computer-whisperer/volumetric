@@ -40,6 +40,51 @@ const WELD_TOL: f64 = 1e-6;
 /// have to hand-dedupe overlaps.
 const SITE_DEDUP_TOL: f64 = 1e-6;
 
+/// What happens where the diagram leaves the site cloud: hull cells are
+/// infinite, so their outward edges either vanish or truncate.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Boundary {
+    /// Keep only edges whose *both* endpoints are genuine Voronoi
+    /// vertices (supported by three or more site bisectors): infinite
+    /// hull edges vanish entirely and the skeleton ends at the cloud.
+    /// The natural lattice semantics — no hairs reaching for the box.
+    Trim,
+    /// Truncate infinite hull edges at the padded bounding box (endpoint
+    /// on the box). Use when something downstream cuts the rays to a
+    /// real boundary — e.g. `mesh_clip` against a domain model, which
+    /// turns them into skin-contact stubs.
+    Box,
+}
+
+/// Knobs for [`voronoi_skeleton`].
+pub struct VoronoiOptions {
+    /// How far past the sites' bounding box the clip box sits (world
+    /// units); <= 0 picks two typical spacings.
+    pub padding: f64,
+    /// What happens to infinite hull-cell edges (see [`Boundary`]).
+    pub boundary: Boundary,
+    /// [`Boundary::Trim`] only: drop edges reaching farther than
+    /// `max_reach` times the generating cell's nearest-neighbor distance
+    /// from its site. A vertex's site distance is its empty-circumsphere
+    /// radius — interior vertices sit at ~0.6-1.0 local spacings, while
+    /// the genuine-but-bulging vertices of a filled cloud's hull shell
+    /// (near-coplanar site slivers, huge empty spheres) sit at several —
+    /// so this is what makes the skeleton *end at the cloud* instead of
+    /// ballooning past it. The bound is per-cell, so density-graded
+    /// clouds trim correctly. <= 0 disables.
+    pub max_reach: f64,
+}
+
+impl Default for VoronoiOptions {
+    fn default() -> Self {
+        Self {
+            padding: 0.0,
+            boundary: Boundary::Trim,
+            max_reach: 1.5,
+        }
+    }
+}
+
 /// A computed Voronoi skeleton plus the site statistics consumers need
 /// to pick sensible defaults.
 pub struct VoronoiResult {
@@ -52,13 +97,17 @@ pub struct VoronoiResult {
     pub site_count: usize,
 }
 
-/// Build the Voronoi edge skeleton of `sites`. The diagram is bounded by
-/// the sites' axis-aligned bounding box expanded by `padding` (world
-/// units; <= 0 picks two typical spacings): infinite hull-cell edges are
-/// truncated there, interior cells never feel it. Errors on non-finite
-/// input; too-few or fully-degenerate site sets yield an empty skeleton
-/// (0 edges) rather than an error so callers can phrase the failure.
-pub fn voronoi_skeleton(sites: &[[f64; 3]], padding: f64) -> Result<VoronoiResult, String> {
+/// Build the Voronoi edge skeleton of `sites` (see [`VoronoiOptions`]
+/// for the boundary/padding/reach knobs; interior cells never feel
+/// them). Errors on non-finite input; too-few or fully-degenerate site
+/// sets yield an empty skeleton (0 edges) rather than an error so
+/// callers can phrase the failure.
+pub fn voronoi_skeleton(
+    sites: &[[f64; 3]],
+    options: &VoronoiOptions,
+) -> Result<VoronoiResult, String> {
+    let padding = options.padding;
+    let boundary = options.boundary;
     if let Some(bad) = sites.iter().find(|p| !p.iter().all(|c| c.is_finite())) {
         return Err(format!("non-finite site {bad:?}"));
     }
@@ -135,6 +184,11 @@ pub fn voronoi_skeleton(sites: &[[f64; 3]], padding: f64) -> Result<VoronoiResul
         let mut max_d2 = cell.max_dist2(site);
         let home = cell_coords(site);
         let mut plane_id = 6usize;
+        // The cell's nearest-neighbor distance (squared): the nearest
+        // site is always among the clipped candidates (its bisector
+        // bounds the cell, so the security radius can never skip it, and
+        // the ring floors can never skip its ring).
+        let mut nn_d2 = f64::INFINITY;
 
         // Expanding Chebyshev rings of grid cells, candidates within a
         // ring processed nearest-first. A site anywhere in ring r is at
@@ -167,6 +221,7 @@ pub fn voronoi_skeleton(sites: &[[f64; 3]], padding: f64) -> Result<VoronoiResul
                     break;
                 }
                 let p = kept[j as usize];
+                nn_d2 = nn_d2.min(d2);
                 let n: [f64; 3] = core::array::from_fn(|a| p[a] - site[a]);
                 let mid: [f64; 3] = core::array::from_fn(|a| 0.5 * (p[a] + site[a]));
                 let d = (0..3).map(|a| n[a] * mid[a]).sum();
@@ -183,6 +238,30 @@ pub fn voronoi_skeleton(sites: &[[f64; 3]], padding: f64) -> Result<VoronoiResul
             // means the edge lies on the box: an artifact, skip.
             if shared.len() < 2 || shared.iter().any(|&p| p < 6) {
                 continue;
+            }
+            // Trim mode: an endpoint whose generators include a box
+            // plane is a truncation of an infinite edge, not a Voronoi
+            // vertex — the edge is unsupported on that side; drop it.
+            if boundary == Boundary::Trim
+                && [va, vb].iter().any(|&v| {
+                    cell.generators[v as usize].iter().any(|&p| p < 6)
+                })
+            {
+                continue;
+            }
+            // Reach cap (Trim only): drop edges whose endpoints balloon
+            // past the cell — but an edge is kept if ANY of its cells
+            // emits it, so the bound is a union over the (up to three)
+            // adjacent cells' local scales.
+            if boundary == Boundary::Trim && options.max_reach > 0.0 {
+                let reach2 = options.max_reach * options.max_reach * nn_d2;
+                let far = |v: u32| -> bool {
+                    let p = cell.vertices[v as usize];
+                    (0..3).map(|a| (p[a] - site[a]).powi(2)).sum::<f64>() > reach2
+                };
+                if far(va) || far(vb) {
+                    continue;
+                }
             }
             let (pa, pb) = (cell.vertices[va as usize], cell.vertices[vb as usize]);
             let len2: f64 = (0..3).map(|a| (pa[a] - pb[a]).powi(2)).sum();
@@ -302,6 +381,13 @@ mod tests {
         out
     }
 
+    fn boxed_options() -> VoronoiOptions {
+        VoronoiOptions {
+            boundary: Boundary::Box,
+            ..Default::default()
+        }
+    }
+
     fn dist(a: [f64; 3], b: [f64; 3]) -> f64 {
         (0..3).map(|i| (a[i] - b[i]).powi(2)).sum::<f64>().sqrt()
     }
@@ -343,7 +429,9 @@ mod tests {
     #[test]
     fn matches_brute_force_on_random_sites() {
         let sites: Vec<[f64; 3]> = (0..24).map(|i| hash_point(i + 1)).collect();
-        let result = voronoi_skeleton(&sites, 0.0).unwrap();
+        // Box mode: the completeness claim covers every genuine vertex,
+        // including sparse-pocket ones Trim's reach cap may drop.
+        let result = voronoi_skeleton(&sites, &boxed_options()).unwrap();
         let nodes = &result.skeleton.nodes;
         assert!(!result.skeleton.edges.is_empty());
 
@@ -394,7 +482,7 @@ mod tests {
     #[test]
     fn edge_points_are_equidistant_to_three_nearest_sites() {
         let sites: Vec<[f64; 3]> = (0..40).map(|i| hash_point(i + 100)).collect();
-        let result = voronoi_skeleton(&sites, 0.0).unwrap();
+        let result = voronoi_skeleton(&sites, &VoronoiOptions::default()).unwrap();
         let skeleton = &result.skeleton;
 
         // Sample interior edges (both endpoints well inside the cloud's
@@ -443,7 +531,7 @@ mod tests {
                 }
             }
         }
-        let general = voronoi_skeleton(&sites, 0.0).unwrap().skeleton;
+        let general = voronoi_skeleton(&sites, &VoronoiOptions::default()).unwrap().skeleton;
         let foam = enumerate_skeleton(
             SkeletonFamily::Foam { irregularity: jitter },
             [0.0; 3],
@@ -506,7 +594,7 @@ mod tests {
                 }
             }
         }
-        let result = voronoi_skeleton(&sites, 0.0).unwrap();
+        let result = voronoi_skeleton(&sites, &VoronoiOptions::default()).unwrap();
         let skeleton = &result.skeleton;
 
         let inside = |p: &[f64; 3]| p.iter().all(|&c| (0.4..5.6).contains(&c));
@@ -552,17 +640,90 @@ mod tests {
     }
 
     #[test]
+    fn trim_drops_exactly_the_unsupported_hull_edges() {
+        let sites: Vec<[f64; 3]> = (0..40).map(|i| hash_point(i + 300)).collect();
+        let trim_result = voronoi_skeleton(&sites, &VoronoiOptions::default()).unwrap();
+        let (trim, spacing) = (trim_result.skeleton, trim_result.spacing);
+        let boxed = voronoi_skeleton(&sites, &boxed_options()).unwrap().skeleton;
+
+        // Every trimmed node is a genuine Voronoi vertex: equidistant to
+        // its four nearest sites (the empty sphere is implied by
+        // "nearest"). Box mode keeps truncation endpoints that fail this.
+        let vertex_spread = |node: &[f64; 3]| -> f64 {
+            let mut d: Vec<f64> = sites.iter().map(|s| dist(*node, *s)).collect();
+            d.sort_by(f64::total_cmp);
+            d[3] - d[0]
+        };
+        for node in &trim.nodes {
+            assert!(
+                vertex_spread(node) < 1e-9,
+                "trim kept non-vertex {node:?} (spread {})",
+                vertex_spread(node)
+            );
+        }
+        let truncated = boxed
+            .nodes
+            .iter()
+            .filter(|node| vertex_spread(node) > 1e-6)
+            .count();
+        assert!(truncated > 0, "box mode should keep truncated endpoints");
+
+        // Trim only ever drops: every trimmed edge exists in box mode.
+        let canonical = |sk: &Skeleton, e: &[u32; 2]| -> ([f64; 3], [f64; 3]) {
+            let (a, b) = (sk.nodes[e[0] as usize], sk.nodes[e[1] as usize]);
+            if (a[0], a[1], a[2]) <= (b[0], b[1], b[2]) {
+                (a, b)
+            } else {
+                (b, a)
+            }
+        };
+        assert!(!trim.edges.is_empty());
+        assert!(trim.edges.len() < boxed.edges.len());
+        for e in &trim.edges {
+            let (a, b) = canonical(&trim, e);
+            assert!(
+                boxed.edges.iter().any(|f| {
+                    let (c, d) = canonical(&boxed, f);
+                    dist(a, c) < 1e-9 && dist(b, d) < 1e-9
+                }),
+                "trim invented edge {a:?} -> {b:?}"
+            );
+        }
+
+        // The exact boundary claim: box mode has truncation nodes ON the
+        // clip box (bbox +- two spacings, the auto padding); trim has
+        // none. (Genuine vertices may legitimately sit far outside a
+        // scattered cloud — hull-sliver circumcenters — so "stays near
+        // the cloud" is only a property of *filled* clouds, not a rule.)
+        let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+        for s in &sites {
+            for a in 0..3 {
+                lo[a] = lo[a].min(s[a]);
+                hi[a] = hi[a].max(s[a]);
+            }
+        }
+        let on_box = |p: &[f64; 3]| {
+            (0..3).any(|a| {
+                (p[a] - (lo[a] - 2.0 * spacing)).abs() < 1e-6
+                    || (p[a] - (hi[a] + 2.0 * spacing)).abs() < 1e-6
+            })
+        };
+        assert!(boxed.nodes.iter().any(on_box), "box mode should reach the box");
+        assert!(!trim.nodes.iter().any(on_box), "trim kept a box node");
+    }
+
+    #[test]
     fn deterministic_and_dedup_tolerant() {
         let mut sites: Vec<[f64; 3]> = (0..30).map(|i| hash_point(i + 7)).collect();
-        let a = voronoi_skeleton(&sites, 0.0).unwrap();
-        let b = voronoi_skeleton(&sites, 0.0).unwrap();
+        let a = voronoi_skeleton(&sites, &VoronoiOptions::default()).unwrap();
+        let b = voronoi_skeleton(&sites, &VoronoiOptions::default()).unwrap();
         assert_eq!(a.skeleton.nodes, b.skeleton.nodes);
         assert_eq!(a.skeleton.edges, b.skeleton.edges);
 
         // Exact duplicates collapse and change nothing.
         sites.push(sites[3]);
         sites.push(sites[17]);
-        let c = voronoi_skeleton(&sites, 0.0).unwrap();
+        let c = voronoi_skeleton(&sites, &VoronoiOptions::default()).unwrap();
         assert_eq!(c.site_count, 30);
         assert_eq!(a.skeleton.nodes, c.skeleton.nodes);
         assert_eq!(a.skeleton.edges, c.skeleton.edges);
@@ -573,39 +734,45 @@ mod tests {
         // 1 or 2 sites: no all-bisector edges survive -> empty skeleton.
         for n in 1..=2 {
             let sites: Vec<[f64; 3]> = (0..n).map(|i| hash_point(i + 50)).collect();
-            let r = voronoi_skeleton(&sites, 0.0).unwrap();
+            let r = voronoi_skeleton(&sites, &boxed_options()).unwrap();
             assert!(
                 r.skeleton.edges.is_empty(),
                 "{n} sites produced {} edges",
                 r.skeleton.edges.len()
             );
         }
-        // 3 generic sites: exactly the box-truncated tri-junction line.
+        // 3 generic sites: the tri-junction line, box-truncated on both
+        // ends — so Box keeps it and Trim drops it.
         let sites: Vec<[f64; 3]> = (0..3).map(|i| hash_point(i + 50)).collect();
-        let r = voronoi_skeleton(&sites, 0.0).unwrap();
+        let r = voronoi_skeleton(&sites, &boxed_options()).unwrap();
         assert_eq!(r.skeleton.edges.len(), 1);
-        // 4 sites in general position: one vertex, four truncated rays.
+        let r = voronoi_skeleton(&sites, &VoronoiOptions::default()).unwrap();
+        assert!(r.skeleton.edges.is_empty());
+        // 4 sites in general position: one vertex, four truncated rays —
+        // all unsupported on the far side, so Trim keeps nothing.
         let sites: Vec<[f64; 3]> = (0..4).map(|i| hash_point(i + 60)).collect();
-        let r = voronoi_skeleton(&sites, 0.0).unwrap();
+        let r = voronoi_skeleton(&sites, &boxed_options()).unwrap();
         assert_eq!(r.skeleton.edges.len(), 4);
+        let r = voronoi_skeleton(&sites, &VoronoiOptions::default()).unwrap();
+        assert!(r.skeleton.edges.is_empty());
 
         // Collinear and coplanar clouds have no finite Voronoi vertices;
         // everything truncates at the box (all-bisector rule may keep
         // face-to-face edges) — just require no panic and validity.
         let line: Vec<[f64; 3]> = (0..10).map(|i| [i as f64, 0.0, 0.0]).collect();
-        voronoi_skeleton(&line, 0.0).unwrap();
+        voronoi_skeleton(&line, &VoronoiOptions::default()).unwrap();
         let plane: Vec<[f64; 3]> = (0..25)
             .map(|i| [(i % 5) as f64, (i / 5) as f64, 0.0])
             .collect();
-        voronoi_skeleton(&plane, 0.0).unwrap();
+        voronoi_skeleton(&plane, &VoronoiOptions::default()).unwrap();
 
         // All-coincident collapses to one site.
         let same = vec![[1.0, 1.0, 1.0]; 5];
-        let r = voronoi_skeleton(&same, 0.0).unwrap();
+        let r = voronoi_skeleton(&same, &VoronoiOptions::default()).unwrap();
         assert_eq!(r.site_count, 1);
         assert!(r.skeleton.edges.is_empty());
 
-        assert!(voronoi_skeleton(&[], 0.0).is_err());
-        assert!(voronoi_skeleton(&[[f64::NAN, 0.0, 0.0]], 0.0).is_err());
+        assert!(voronoi_skeleton(&[], &VoronoiOptions::default()).is_err());
+        assert!(voronoi_skeleton(&[[f64::NAN, 0.0, 0.0]], &VoronoiOptions::default()).is_err());
     }
 }
