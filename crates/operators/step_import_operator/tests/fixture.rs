@@ -81,6 +81,44 @@ fn wasm_template_patches_and_validates() {
     }
 }
 
+#[test]
+fn shell_based_surface_model_reached_over_srr() {
+    // Rewrite the box into the Onshape hybrid-export topology: the
+    // MANIFOLD_SOLID_BREP becomes a SHELL_BASED_SURFACE_MODEL around the
+    // same closed shell, parked in a separate representation that hangs
+    // off the product's rep via SHAPE_REPRESENTATION_RELATIONSHIP.
+    let from_rep = "#36 = ADVANCED_BREP_SHAPE_REPRESENTATION('',(#11,#37),#367);";
+    let from_body = "#37 = MANIFOLD_SOLID_BREP('',#38);";
+    assert!(FIXTURE.contains(from_rep) && FIXTURE.contains(from_body));
+    let text = FIXTURE
+        .replace(from_rep, "#36 = ADVANCED_BREP_SHAPE_REPRESENTATION('',(#11),#367);")
+        .replace(
+            from_body,
+            "#37 = SHELL_BASED_SURFACE_MODEL('',(#38));\n\
+             #501 = MANIFOLD_SURFACE_SHAPE_REPRESENTATION('',(#37),#367);\n\
+             #502 = SHAPE_REPRESENTATION_RELATIONSHIP('','',#36,#501);",
+        );
+
+    let model = import(&text, &StepConfig::default()).expect("import SBSM variant");
+    assert_eq!(model.solids.len(), 2);
+    assert_eq!(model.instances.len(), 2);
+
+    // The composite box classifies identically to the manifold solid.
+    let payload = build_payload(&model).expect("payload");
+    let view = PayloadView::new(&payload).unwrap();
+    for (p_mm, expect) in [
+        ([0.0, 0.0, 0.0], true),
+        ([4.9, 3.9, 2.9], true),
+        ([5.1, 0.0, 0.0], false),
+        ([0.0, 0.0, 3.1], false),
+        ([20.0, 0.0, 3.0], true), // cylinder untouched
+        ([20.0, 3.1, 3.0], false),
+    ] {
+        let p = p_mm.map(|v| v * 1e-3);
+        assert_eq!(view.is_inside(p), expect, "at {p_mm:?} mm");
+    }
+}
+
 const COLORED_FIXTURE: &str = include_str!("fixtures/colored_box_cylinder.step");
 
 #[test]

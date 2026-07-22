@@ -222,6 +222,46 @@ pub fn curve_eval<C: CurveData>(c: &C, u: f64) -> (Vec3, Vec3) {
     (pt, der)
 }
 
+/// Closest parameter on the curve to `p`: a dense domain scan (resolving
+/// every span even on many-knot curves) seeds a clamped Gauss-Newton on
+/// the perpendicularity condition. Returns `(t, distance)`.
+///
+/// Importers use this to locate edge vertices on shared curves —
+/// exporters like Onshape write edges as vertex-trimmed sub-arcs of one
+/// full curve rather than reparameterizing per edge.
+pub fn curve_closest_param<C: CurveData>(c: &C, p: Vec3) -> (f64, f64) {
+    let dom = c.domain();
+    let n = (c.nctrl() * 4).max(64);
+    let mut t = dom[0];
+    let mut best_d2 = f64::INFINITY;
+    for i in 0..=n {
+        let s = dom[0] + (dom[1] - dom[0]) * i as f64 / n as f64;
+        let (q, _) = curve_eval(c, s);
+        let r = crate::math::sub(q, p);
+        let d2 = crate::math::dot(r, r);
+        if d2 < best_d2 {
+            best_d2 = d2;
+            t = s;
+        }
+    }
+    let scale = (dom[1] - dom[0]).max(1e-12);
+    for _ in 0..50 {
+        let (q, dq) = curve_eval(c, t);
+        let r = crate::math::sub(q, p);
+        let denom = crate::math::dot(dq, dq);
+        if denom < 1e-30 {
+            break;
+        }
+        let dt = -crate::math::dot(r, dq) / denom;
+        t = (t + dt).clamp(dom[0], dom[1]);
+        if dt.abs() < 1e-14 * scale {
+            break;
+        }
+    }
+    let (q, _) = curve_eval(c, t);
+    (t, crate::math::norm(crate::math::sub(q, p)))
+}
+
 impl SurfaceData for crate::ir::NurbsSurface {
     fn degree_u(&self) -> usize {
         self.degree_u
@@ -312,6 +352,43 @@ mod tests {
             let r = (p[0] * p[0] + p[1] * p[1]).sqrt();
             assert!((r - 1.0).abs() < 1e-12, "u={u}: radius {r}");
         }
+    }
+
+    #[test]
+    fn curve_closest_param_recovers_on_curve_points() {
+        // Clamped cubic through 4 control points: pick parameters, take
+        // their curve points, and ask for them back.
+        struct C;
+        impl CurveData for C {
+            fn degree(&self) -> usize {
+                3
+            }
+            fn nctrl(&self) -> usize {
+                4
+            }
+            fn knot(&self, i: usize) -> f64 {
+                [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0][i]
+            }
+            fn ctrl(&self, i: usize) -> [f64; 4] {
+                [
+                    [0.0, 0.0, 0.0, 1.0],
+                    [1.0, 2.0, 0.0, 1.0],
+                    [2.0, -1.0, 0.5, 1.0],
+                    [3.0, 0.0, 0.0, 1.0],
+                ][i]
+            }
+        }
+        for &t in &[0.0, 0.1, 0.37, 0.5, 0.82, 1.0] {
+            let (p, _) = curve_eval(&C, t);
+            let (t_found, d) = curve_closest_param(&C, p);
+            assert!(d < 1e-10, "t={t}: distance {d}");
+            assert!((t_found - t).abs() < 1e-8, "t={t}: found {t_found}");
+        }
+        // An off-curve point still reports its true distance.
+        let (t_found, d) = curve_closest_param(&C, [1.5, 5.0, 0.0]);
+        let (q, _) = curve_eval(&C, t_found);
+        assert!((crate::math::norm(crate::math::sub(q, [1.5, 5.0, 0.0])) - d).abs() < 1e-12);
+        assert!(d > 3.0, "distance {d}");
     }
 
     #[test]

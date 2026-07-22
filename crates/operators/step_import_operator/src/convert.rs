@@ -104,6 +104,12 @@ struct AssemblyGraph {
     roots: Vec<u64>,
     /// PD -> product name (fallback label).
     pd_name: HashMap<u64, String>,
+    /// Untransformed SHAPE_REPRESENTATION_RELATIONSHIP links, both
+    /// directions. Exporters (Onshape among them) hang a product's
+    /// geometry representations off its SDR representation this way;
+    /// assembly placements use the *transformed* relationship, which is
+    /// a complex instance and deliberately not collected here.
+    rep_links: HashMap<u64, Vec<u64>>,
 }
 
 impl AssemblyGraph {
@@ -122,6 +128,7 @@ impl AssemblyGraph {
         let mut pd_name = HashMap::new();
         let mut nauo_ids = Vec::new();
         let mut cdsr_ids = Vec::new();
+        let mut rep_links: HashMap<u64, Vec<u64>> = HashMap::new();
         // Sorted iteration: instance/solid order (and therefore payload
         // bytes) must not depend on hash order — downstream caching and
         // baked projects want reproducible output.
@@ -158,6 +165,17 @@ impl AssemblyGraph {
                     }
                     "NEXT_ASSEMBLY_USAGE_OCCURRENCE" => nauo_ids.push(id),
                     "CONTEXT_DEPENDENT_SHAPE_REPRESENTATION" => cdsr_ids.push(id),
+                    "SHAPE_REPRESENTATION_RELATIONSHIP" => {
+                        // (name, description, rep_1, rep_2)
+                        let rep_1 = arg_at(r, 2, id)?
+                            .as_ref_id()
+                            .ok_or_else(|| format!("#{id}: SRR rep_1 not a reference"))?;
+                        let rep_2 = arg_at(r, 3, id)?
+                            .as_ref_id()
+                            .ok_or_else(|| format!("#{id}: SRR rep_2 not a reference"))?;
+                        rep_links.entry(rep_1).or_default().push(rep_2);
+                        rep_links.entry(rep_2).or_default().push(rep_1);
+                    }
                     "PRODUCT_DEFINITION" => {
                         // formation -> product -> name.
                         let name = (|| {
@@ -281,7 +299,27 @@ impl AssemblyGraph {
             nauos,
             roots,
             pd_name,
+            rep_links,
         })
+    }
+
+    /// `root` plus every representation transitively reachable over
+    /// untransformed SRR links, in encounter order (deterministic:
+    /// links were collected over sorted entity ids).
+    fn linked_reps(&self, root: u64) -> Vec<u64> {
+        let mut out = vec![root];
+        let mut i = 0;
+        while i < out.len() {
+            if let Some(links) = self.rep_links.get(&out[i]) {
+                for &l in links {
+                    if !out.contains(&l) {
+                        out.push(l);
+                    }
+                }
+            }
+            i += 1;
+        }
+        out
     }
 }
 
@@ -330,21 +368,50 @@ fn walk(
         ));
     }
     if let Some(&rep) = asm.pd_rep.get(&pd) {
-        // Any MANIFOLD_SOLID_BREP item of the representation is a body
-        // of this product.
-        let rep_entity = ctx.data.get(rep)?;
-        let items = rep_entity
-            .records
-            .iter()
-            .find_map(|r| r.args.get(1).and_then(Arg::as_list))
-            .unwrap_or(&[]);
-        for item in items {
-            let Some(item_id) = item.as_ref_id() else {
-                continue;
-            };
-            if !ctx.data.get(item_id)?.is("MANIFOLD_SOLID_BREP") {
-                continue;
+        // Geometry of this product: items of its representation plus of
+        // every representation attached over untransformed SRR links
+        // (Onshape parks the shape reps there; the SDR rep holds only a
+        // placement). MANIFOLD_SOLID_BREPs are bodies of their own;
+        // surface-model shells and tessellated shells together form one
+        // composite body (parity over the union of faces — correct for
+        // disjoint closed shells and for hybrid shells glued along
+        // shared boundary rings).
+        let mut msbs: Vec<u64> = Vec::new();
+        let mut shell_models: Vec<u64> = Vec::new();
+        let mut tessellated: Vec<u64> = Vec::new();
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for rep_id in asm.linked_reps(rep) {
+            let rep_entity = ctx.data.get(rep_id)?;
+            let items = rep_entity
+                .records
+                .iter()
+                .find_map(|r| r.args.get(1).and_then(Arg::as_list))
+                .unwrap_or(&[]);
+            for item in items {
+                let Some(item_id) = item.as_ref_id() else {
+                    continue;
+                };
+                if !seen.insert(item_id) {
+                    continue;
+                }
+                let e = ctx.data.get(item_id)?;
+                if e.is("MANIFOLD_SOLID_BREP") {
+                    msbs.push(item_id);
+                } else if e.is("SHELL_BASED_SURFACE_MODEL") {
+                    shell_models.push(item_id);
+                } else if e.is("TESSELLATED_SHELL") {
+                    tessellated.push(item_id);
+                }
             }
+        }
+        // With exact solids present, a tessellated rep is a redundant
+        // preview of the same bodies — importing it too would cancel
+        // their parity. Without them it is real geometry (the mesh part
+        // of a hybrid body, or a mesh-only file).
+        if !msbs.is_empty() {
+            tessellated.clear();
+        }
+        for item_id in msbs {
             let solid = match solid_index.get(&item_id) {
                 Some(&idx) => idx,
                 None => {
@@ -353,6 +420,26 @@ fn walk(
                     model.solids.push(converted);
                     let idx = model.solids.len() - 1;
                     solid_index.insert(item_id, idx);
+                    idx
+                }
+            };
+            model.instances.push(Instance {
+                solid,
+                local_to_world: transform,
+                label: label.to_string(),
+            });
+        }
+        if !shell_models.is_empty() || !tessellated.is_empty() {
+            // The composite is keyed by the product's SDR rep: shared
+            // sub-products reuse their converted body.
+            let solid = match solid_index.get(&rep) {
+                Some(&idx) => idx,
+                None => {
+                    let converted =
+                        convert_composite(ctx, &shell_models, &tessellated, opts, colors)?;
+                    model.solids.push(converted);
+                    let idx = model.solids.len() - 1;
+                    solid_index.insert(rep, idx);
                     idx
                 }
             };
@@ -410,6 +497,35 @@ fn convert_solid(
         // Face styling overrides the body style.
         face.color = colors.get(&face_id).copied().or(body_color);
         faces.push(face);
+    }
+    Ok(Solid { faces })
+}
+
+/// One body from a product's surface-model shells plus tessellated
+/// shells. Face styling falls back to the owning shell model's style
+/// (Onshape styles the SHELL_BASED_SURFACE_MODEL / TESSELLATED_SHELL
+/// entity, where OCCT solids style the MANIFOLD_SOLID_BREP).
+fn convert_composite(
+    ctx: &Ctx,
+    shell_models: &[u64],
+    tessellated: &[u64],
+    opts: &Options,
+    colors: &HashMap<u64, [f32; 3]>,
+) -> Result<Solid, String> {
+    let mut faces = Vec::new();
+    for &sm_id in shell_models {
+        let body_color = colors.get(&sm_id).copied();
+        for face_id in ctx.surface_model_faces(sm_id)? {
+            let mut face = convert_face(ctx, face_id, opts)
+                .map_err(|e| format!("surface model #{sm_id}, face #{face_id}: {e}"))?;
+            face.color = colors.get(&face_id).copied().or(body_color);
+            faces.push(face);
+        }
+    }
+    if let Some(&ts_id) = tessellated.first() {
+        return Err(format!(
+            "#{ts_id}: tessellated shells are not supported yet"
+        ));
     }
     Ok(Solid { faces })
 }
@@ -517,6 +633,19 @@ fn lower_surface(s: StepSurface, opts: &Options) -> Result<Surface, String> {
     })
 }
 
+/// Both edge vertices must actually lie on the curve for a sub-arc trim
+/// to be meaningful; a distant vertex means the curve association is
+/// wrong and would silently produce a bogus trim.
+fn check_vertex_on_curve(curve_id: u64, d0: f64, d1: f64, tol: f64) -> Result<(), String> {
+    if d0 > tol || d1 > tol {
+        return Err(format!(
+            "curve #{curve_id}: edge vertex off the curve by {:.3e}",
+            d0.max(d1)
+        ));
+    }
+    Ok(())
+}
+
 /// Flatten one loop of oriented edges into a chained, closed 3D
 /// polyline (the closing point is omitted).
 fn loop_points(ctx: &Ctx, edges: &[StepEdge], opts: &Options) -> Result<Vec<Vec3>, String> {
@@ -595,11 +724,58 @@ fn edge_points(ctx: &Ctx, e: &StepEdge, tol: f64) -> Result<Vec<Vec3>, String> {
         }
         Curve::Bspline(c) => {
             let dom = c.domain();
-            let mut pts = project::flatten_bspline(&c, dom[0], dom[1], tol);
-            if !e.forward {
-                pts.reverse();
+            let closed = {
+                let (p0, _) = brep_core::nurbs::curve_eval(&c, dom[0]);
+                let (p1, _) = brep_core::nurbs::curve_eval(&c, dom[1]);
+                norm(sub(p0, p1)) < tol * 1e-3 + 1e-9
+            };
+            if norm(sub(e.start, e.end)) < tol * 1e-3 + 1e-9 {
+                // Degenerate vertex pair: the edge covers the whole
+                // (closed) curve, like a full circle.
+                let mut pts = project::flatten_bspline(&c, dom[0], dom[1], tol);
+                if !e.forward {
+                    pts.reverse();
+                }
+                pts
+            } else {
+                // Vertices may trim the curve to a sub-arc: exporters
+                // like Onshape share one full curve between edges where
+                // OCCT reparameterizes the curve to the edge bounds.
+                // Locate both vertices and flatten the range between
+                // them, in curve orientation (start -> end when the
+                // curve runs forward along the traversal).
+                let join_tol = (tol * 10.0).max(1e-6);
+                let (t_from, t_to, reverse) = if e.forward {
+                    let (t0, d0) = brep_core::nurbs::curve_closest_param(&c, e.start);
+                    let (t1, d1) = brep_core::nurbs::curve_closest_param(&c, e.end);
+                    check_vertex_on_curve(e.curve_id, d0, d1, join_tol)?;
+                    (t0, t1, false)
+                } else {
+                    let (t0, d0) = brep_core::nurbs::curve_closest_param(&c, e.end);
+                    let (t1, d1) = brep_core::nurbs::curve_closest_param(&c, e.start);
+                    check_vertex_on_curve(e.curve_id, d0, d1, join_tol)?;
+                    (t0, t1, true)
+                };
+                let mut pts = if t_from < t_to {
+                    project::flatten_bspline(&c, t_from, t_to, tol)
+                } else if closed {
+                    // The sub-arc wraps the closed curve's seam.
+                    let mut head = project::flatten_bspline(&c, t_from, dom[1], tol);
+                    let tail = project::flatten_bspline(&c, dom[0], t_to, tol);
+                    head.extend_from_slice(&tail[1..]);
+                    head
+                } else {
+                    return Err(format!(
+                        "curve #{}: edge vertices out of order along an open curve \
+                         (t {t_from:.6} > t {t_to:.6})",
+                        e.curve_id
+                    ));
+                };
+                if reverse {
+                    pts.reverse();
+                }
+                pts
             }
-            pts
         }
     };
     // Snap the flattened ends onto the topological vertices so chaining

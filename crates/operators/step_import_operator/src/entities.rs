@@ -542,6 +542,28 @@ impl<'a> Ctx<'a> {
     pub fn solid_faces(&self, msb_id: u64) -> Result<Vec<u64>, String> {
         let r = self.simple(msb_id, &["MANIFOLD_SOLID_BREP"])?;
         let shell_id = self.ref_arg(r, 1, msb_id)?;
+        self.shell_faces(shell_id)
+    }
+
+    /// Face ids across all shells of a SHELL_BASED_SURFACE_MODEL.
+    pub fn surface_model_faces(&self, sbsm_id: u64) -> Result<Vec<u64>, String> {
+        let r = self.simple(sbsm_id, &["SHELL_BASED_SURFACE_MODEL"])?;
+        let shells = r
+            .args
+            .get(1)
+            .and_then(Arg::as_list)
+            .ok_or_else(|| format!("#{sbsm_id}: missing shell list"))?;
+        let mut faces = Vec::new();
+        for s in shells {
+            let shell_id = s
+                .as_ref_id()
+                .ok_or_else(|| format!("#{sbsm_id}: shell is not a reference"))?;
+            faces.extend(self.shell_faces(shell_id)?);
+        }
+        Ok(faces)
+    }
+
+    fn shell_faces(&self, shell_id: u64) -> Result<Vec<u64>, String> {
         let sr = self.simple(shell_id, &["CLOSED_SHELL", "OPEN_SHELL"])?;
         let faces = sr
             .args
