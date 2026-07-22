@@ -33,7 +33,10 @@ pub fn collect_colors(data: &DataSection) -> HashMap<u64, [f32; 3]> {
 
     let mut colors = HashMap::new();
     let mut overridden = HashSet::new();
-    for (pass, record_name) in ["STYLED_ITEM", "OVER_RIDING_STYLED_ITEM"].into_iter().enumerate() {
+    for (pass, record_name) in ["STYLED_ITEM", "OVER_RIDING_STYLED_ITEM"]
+        .into_iter()
+        .enumerate()
+    {
         for &id in &ids {
             let entity = &data.entities[&id];
             let Some(record) = entity.record(record_name) else {
@@ -102,16 +105,11 @@ fn surface_style_element_color(data: &DataSection, element: &Arg) -> Option<[f32
     if let Some(fill_area) = entity.record("SURFACE_STYLE_FILL_AREA") {
         let fill = data.deref(fill_area.args.first()?).ok()?;
         let style = fill.record("FILL_AREA_STYLE")?;
-        return style
-            .args
-            .get(1)?
-            .as_list()?
-            .iter()
-            .find_map(|fill_style| {
-                let e = data.deref(fill_style).ok()?;
-                let colour_record = e.record("FILL_AREA_STYLE_COLOUR")?;
-                colour(data, colour_record.args.get(1)?)
-            });
+        return style.args.get(1)?.as_list()?.iter().find_map(|fill_style| {
+            let e = data.deref(fill_style).ok()?;
+            let colour_record = e.record("FILL_AREA_STYLE_COLOUR")?;
+            colour(data, colour_record.args.get(1)?)
+        });
     }
     let rendering = entity
         .records

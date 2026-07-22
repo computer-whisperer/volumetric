@@ -65,14 +65,21 @@ impl Default for TransformConfig {
 /// Apply scale -> rotate (X, Y, Z) -> translate to every node position.
 fn transform_mesh(mesh: &FeaMesh, config: &TransformConfig) -> Result<FeaMesh, String> {
     let values = [
-        config.tx, config.ty, config.tz, config.rx_deg, config.ry_deg, config.rz_deg, config.sx,
-        config.sy, config.sz,
+        config.tx,
+        config.ty,
+        config.tz,
+        config.rx_deg,
+        config.ry_deg,
+        config.rz_deg,
+        config.sx,
+        config.sy,
+        config.sz,
     ];
     if let Some(bad) = values.iter().find(|v| !v.is_finite()) {
         return Err(format!("non-finite transform value {bad}"));
     }
     let scale = [config.sx, config.sy, config.sz];
-    if scale.iter().any(|&s| s == 0.0) {
+    if scale.contains(&0.0) {
         return Err(format!(
             "zero scale factor ({scale:?}) would flatten the mesh"
         ));
@@ -222,7 +229,10 @@ mod tests {
             ..TransformConfig::default()
         };
         let p = transform_mesh(&mesh, &config).unwrap().node_position(0);
-        assert!((p[0] - 1.0).abs() < 1e-12 && p[1].abs() < 1e-12 && p[2].abs() < 1e-12, "{p:?}");
+        assert!(
+            (p[0] - 1.0).abs() < 1e-12 && p[1].abs() < 1e-12 && p[2].abs() < 1e-12,
+            "{p:?}"
+        );
     }
 
     #[test]

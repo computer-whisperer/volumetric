@@ -236,7 +236,11 @@ fn serialize_solid(solid: &Solid) -> Result<SolidBlob, String> {
 fn pack_color(color: Option<[f32; 3]>) -> u32 {
     let Some(c) = color else { return 0 };
     let byte = |v: f32| {
-        let v = if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 };
+        let v = if v.is_finite() {
+            v.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         (v * 255.0).round() as u32
     };
     0xFF00_0000 | (byte(c[0]) << 16) | (byte(c[1]) << 8) | byte(c[2])
@@ -727,11 +731,7 @@ fn write_mesh_face(
         })
         .collect();
     let tri_bvh = bvh::build(&tri_aabbs);
-    let tris: Vec<[u32; 3]> = tri_bvh
-        .slots
-        .iter()
-        .map(|&s| m.tris[s as usize])
-        .collect();
+    let tris: Vec<[u32; 3]> = tri_bvh.slots.iter().map(|&s| m.tris[s as usize]).collect();
 
     let (seg_bvh, segs) = if boundary.is_empty() {
         (None, Vec::new())
@@ -1213,7 +1213,11 @@ impl<'a> PayloadView<'a> {
                 // Nearer child popped first; the farther one re-checks
                 // its distance against the (possibly tightened) bound.
                 let (da, db) = (node_dist(a as usize), node_dist(b as usize));
-                let ordered = if da <= db { [(b, db), (a, da)] } else { [(a, da), (b, db)] };
+                let ordered = if da <= db {
+                    [(b, db), (a, da)]
+                } else {
+                    [(a, da), (b, db)]
+                };
                 for (child, dist) in ordered {
                     if dist < bound {
                         debug_assert!(top < stack.len(), "BVH deeper than the traversal stack");
@@ -1426,10 +1430,7 @@ impl<'a> MeshRaw<'a> {
         if t_min > t_max {
             return None;
         }
-        Some((
-            u32_at(self.bytes, base + 24),
-            u32_at(self.bytes, base + 28),
-        ))
+        Some((u32_at(self.bytes, base + 24), u32_at(self.bytes, base + 28)))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1523,9 +1524,13 @@ impl<'a> MeshRaw<'a> {
         top += 1;
         while top > 0 {
             top -= 1;
-            let Some((a, b)) =
-                self.node_span(self.seg_nodes_off, stack[top] as usize, p, dir, t_floor - reach)
-            else {
+            let Some((a, b)) = self.node_span(
+                self.seg_nodes_off,
+                stack[top] as usize,
+                p,
+                dir,
+                t_floor - reach,
+            ) else {
                 continue;
             };
             if a & LEAF_FLAG == 0 {
@@ -1650,13 +1655,7 @@ mod tests {
     /// (z = 1) so the shell has an open square boundary ring.
     fn cube_mesh(open_top: bool) -> MeshSurface {
         let verts: Vec<[f64; 3]> = (0..8)
-            .map(|i| {
-                [
-                    (i & 1) as f64,
-                    ((i >> 1) & 1) as f64,
-                    ((i >> 2) & 1) as f64,
-                ]
-            })
+            .map(|i| [(i & 1) as f64, ((i >> 1) & 1) as f64, ((i >> 2) & 1) as f64])
             .collect();
         // Each face as two triangles (winding irrelevant: parity is
         // orientation-blind).
@@ -1773,7 +1772,9 @@ mod tests {
         let payload = build_payload(&model).unwrap();
         let view = PayloadView::new(&payload).unwrap();
         let c = view.nearest_color([0.5, 0.5, 1.2]).unwrap();
-        assert!((c[0] - 0.2).abs() < 0.01 && (c[1] - 0.4).abs() < 0.01 && (c[2] - 0.8).abs() < 0.01);
+        assert!(
+            (c[0] - 0.2).abs() < 0.01 && (c[1] - 0.4).abs() < 0.01 && (c[2] - 0.8).abs() < 0.01
+        );
     }
 
     #[test]

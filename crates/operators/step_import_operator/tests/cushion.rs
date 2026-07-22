@@ -105,7 +105,9 @@ fn point_triangle_dist(p: [f64; 3], t: &[[f64; 3]; 3]) -> f64 {
             return dp.abs() * n2.sqrt();
         }
     }
-    seg(p, t[0], t[1]).min(seg(p, t[1], t[2])).min(seg(p, t[2], t[0]))
+    seg(p, t[0], t[1])
+        .min(seg(p, t[1], t[2]))
+        .min(seg(p, t[2], t[0]))
 }
 
 #[test]

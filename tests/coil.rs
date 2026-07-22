@@ -5,7 +5,9 @@
 
 #![cfg(feature = "native")]
 
-use volumetric::wasm::{NativeModelExecutor, OperatorExecutor, OperatorIo, create_operator_executor};
+use volumetric::wasm::{
+    NativeModelExecutor, OperatorExecutor, OperatorIo, create_operator_executor,
+};
 
 fn wasm_artifact(name: &str) -> Vec<u8> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -70,8 +72,8 @@ fn cbor_floats(fields: &[(&str, f64)]) -> Vec<u8> {
 }
 
 fn coiled_slab() -> NativeModelExecutor {
-    let slab = run_operator("lua_script_operator", vec![SLAB.as_bytes().to_vec()])
-        .expect("compile slab");
+    let slab =
+        run_operator("lua_script_operator", vec![SLAB.as_bytes().to_vec()]).expect("compile slab");
     let coil = run_operator(
         "coil_operator",
         vec![
@@ -123,8 +125,8 @@ fn coil_bounds_cover_the_outermost_wrap() {
 
 #[test]
 fn coil_rejects_bad_config_and_non_3d_input() {
-    let slab = run_operator("lua_script_operator", vec![SLAB.as_bytes().to_vec()])
-        .expect("compile slab");
+    let slab =
+        run_operator("lua_script_operator", vec![SLAB.as_bytes().to_vec()]).expect("compile slab");
     let err = run_operator(
         "coil_operator",
         vec![slab, cbor_floats(&[("inner_radius", 0.0)])],

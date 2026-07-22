@@ -345,8 +345,7 @@ pub fn weld_coincident_nodes(mesh: &FeaMesh, tolerance: f64) -> Result<FeaMesh, 
     let mut remapped: Vec<u32> = Vec::new();
     for e in 0..mesh.element_count() {
         let nodes: Vec<u32> = mesh.element(e).iter().map(|&n| rep[n as usize]).collect();
-        if mesh.element_kind == volumetric_abi::fea::FeaElementKind::Bar2 && nodes[0] == nodes[1]
-        {
+        if mesh.element_kind == volumetric_abi::fea::FeaElementKind::Bar2 && nodes[0] == nodes[1] {
             continue;
         }
         let mut key = nodes.clone();
@@ -520,7 +519,11 @@ mod tests {
             vec![0, 1, 1, 2, 2, 3, 3, 4, 4, 5],
         );
         let welded = weld_short_bars(&mesh, &|_| 0.05).unwrap();
-        assert_eq!(welded.element_count(), 2, "the chain contracts to one joint");
+        assert_eq!(
+            welded.element_count(),
+            2,
+            "the chain contracts to one joint"
+        );
         assert_eq!(welded.node_count(), 3);
     }
 
@@ -592,7 +595,11 @@ mod tests {
         let merged = concat_meshes(&[&a, &b]).unwrap();
         assert_eq!(merged.node_count(), 3);
         assert_eq!(merged.connectivity, vec![0, 1, 2]);
-        assert_eq!(merged.node_fields.len(), 1, "only the common field survives");
+        assert_eq!(
+            merged.node_fields.len(),
+            1,
+            "only the common field survives"
+        );
         assert_eq!(merged.node_fields[0].data, vec![1.0, 2.0, 3.0]);
 
         let bars = bar_mesh(vec![0.0; 6], vec![0, 1]);

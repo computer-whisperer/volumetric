@@ -165,8 +165,7 @@ pub fn voronoi_skeleton(
     let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); dims[0] * dims[1] * dims[2]];
     for (i, q) in kept.iter().enumerate() {
         let c = cell_coords(*q);
-        buckets[(c[2] as usize * dims[1] + c[1] as usize) * dims[0] + c[0] as usize]
-            .push(i as u32);
+        buckets[(c[2] as usize * dims[1] + c[1] as usize) * dims[0] + c[0] as usize].push(i as u32);
     }
 
     // The clip box: normalized bounds plus the padding.
@@ -243,9 +242,9 @@ pub fn voronoi_skeleton(
             // plane is a truncation of an infinite edge, not a Voronoi
             // vertex — the edge is unsupported on that side; drop it.
             if boundary == Boundary::Trim
-                && [va, vb].iter().any(|&v| {
-                    cell.generators[v as usize].iter().any(|&p| p < 6)
-                })
+                && [va, vb]
+                    .iter()
+                    .any(|&v| cell.generators[v as usize].iter().any(|&p| p < 6))
             {
                 continue;
             }
@@ -442,8 +441,7 @@ mod tests {
             for j in i + 1..sites.len() {
                 for k in j + 1..sites.len() {
                     for l in k + 1..sites.len() {
-                        let Some(c) = circumcenter([sites[i], sites[j], sites[k], sites[l]])
-                        else {
+                        let Some(c) = circumcenter([sites[i], sites[j], sites[k], sites[l]]) else {
                             continue;
                         };
                         let r = dist(c, sites[i]);
@@ -531,9 +529,13 @@ mod tests {
                 }
             }
         }
-        let general = voronoi_skeleton(&sites, &VoronoiOptions::default()).unwrap().skeleton;
+        let general = voronoi_skeleton(&sites, &VoronoiOptions::default())
+            .unwrap()
+            .skeleton;
         let foam = enumerate_skeleton(
-            SkeletonFamily::Foam { irregularity: jitter },
+            SkeletonFamily::Foam {
+                irregularity: jitter,
+            },
             [0.0; 3],
             [4.0; 3],
             1.0,
@@ -557,7 +559,11 @@ mod tests {
         };
         let foam_edges = edge_set(&foam);
         let general_edges = edge_set(&general);
-        assert!(foam_edges.len() > 200, "window too small: {}", foam_edges.len());
+        assert!(
+            foam_edges.len() > 200,
+            "window too small: {}",
+            foam_edges.len()
+        );
 
         let matches = |from: &[([f64; 3], [f64; 3])], to: &[([f64; 3], [f64; 3])]| {
             from.iter()
@@ -632,7 +638,11 @@ mod tests {
         let mut deep_nodes = 0usize;
         for (node, d) in &degree {
             if deep(&skeleton.nodes[*node as usize]) {
-                assert_eq!(*d, 6, "node {:?} degree {d}", skeleton.nodes[*node as usize]);
+                assert_eq!(
+                    *d, 6,
+                    "node {:?} degree {d}",
+                    skeleton.nodes[*node as usize]
+                );
                 deep_nodes += 1;
             }
         }
@@ -708,7 +718,10 @@ mod tests {
                     || (p[a] - (hi[a] + 2.0 * spacing)).abs() < 1e-6
             })
         };
-        assert!(boxed.nodes.iter().any(on_box), "box mode should reach the box");
+        assert!(
+            boxed.nodes.iter().any(on_box),
+            "box mode should reach the box"
+        );
         assert!(!trim.nodes.iter().any(on_box), "trim kept a box node");
     }
 

@@ -90,7 +90,10 @@ fn unwind(x: f64, y: f64, z: f64, x0: f64, z0: f64, z1: f64) -> Option<[f64; 3]>
     let (inner_radius, gap) = config();
     let thickness = z1 - z0;
     let pitch = thickness + gap;
-    if !(inner_radius > 0.0) || !(pitch > 0.0) {
+    // Strictly-positive check that also rejects NaN (which fails every
+    // comparison): only `Some(Greater)` passes.
+    let positive = |v: f64| v.partial_cmp(&0.0) == Some(std::cmp::Ordering::Greater);
+    if !positive(inner_radius) || !positive(pitch) {
         return None;
     }
     let b = pitch / TAU;

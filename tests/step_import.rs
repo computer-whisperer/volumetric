@@ -177,7 +177,11 @@ fn colored_step_exposes_the_srgb_channel_trio() {
     let solid = exports.iter().find(|e| e.id() == "solid").unwrap();
     let mut executor = create_model_executor(solid.data()).unwrap();
     let format = executor.sample_format().expect("sample format");
-    assert_eq!(format.channels.len(), 1, "unstyled import stays occupancy-only");
+    assert_eq!(
+        format.channels.len(),
+        1,
+        "unstyled import stays occupancy-only"
+    );
 }
 
 #[test]

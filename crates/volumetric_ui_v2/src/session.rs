@@ -4210,7 +4210,10 @@ mod tests {
         let entity = build_preview_scene(&request("tray", false)).expect("preview builds");
         let (points, _, _) = &entity.scene.points[0];
         assert!(
-            points.points.iter().any(|p| p.color != points.points[0].color),
+            points
+                .points
+                .iter()
+                .any(|p| p.color != points.points[0].color),
             "tint off must leave the default gradient"
         );
 

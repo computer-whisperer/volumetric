@@ -203,9 +203,7 @@ pub(crate) fn enforce(
             match out.node_fields.iter_mut().find(|f| f.name == "raise") {
                 Some(f) if f.components == 1 => f.data = raise,
                 Some(_) => {
-                    return Err(
-                        "the input already has a non-scalar 'raise' node field".to_string()
-                    );
+                    return Err("the input already has a non-scalar 'raise' node field".to_string());
                 }
                 None => out.node_fields.push(FeaField {
                     name: "raise".to_string(),
@@ -228,9 +226,7 @@ pub(crate) fn enforce(
                 .map(|e| {
                     let pair = mesh.element(e);
                     let (a, b) = (pair[0] as usize, pair[1] as usize);
-                    tau[a].is_finite()
-                        && tau[b].is_finite()
-                        && (usable(a, b) || usable(b, a))
+                    tau[a].is_finite() && tau[b].is_finite() && (usable(a, b) || usable(b, a))
                 })
                 .collect();
             if keep.iter().all(|&k| k) {
@@ -280,8 +276,7 @@ mod tests {
 
     #[test]
     fn hooks_rise_to_their_support_time() {
-        let (out, dropped) =
-            enforce(&hook_chain(), &SupportConfig::default(), false).unwrap();
+        let (out, dropped) = enforce(&hook_chain(), &SupportConfig::default(), false).unwrap();
         assert!(!dropped);
         // The hook rises to the column top's height; x/y stay.
         let p = out.node_position(2);

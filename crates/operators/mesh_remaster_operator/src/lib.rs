@@ -409,8 +409,7 @@ pub(crate) fn remaster(
     }
 
     if let Some(support) = &config.support {
-        let (fixed, dropped_any) =
-            support::enforce(&out, support, config.connectivity.is_some())?;
+        let (fixed, dropped_any) = support::enforce(&out, support, config.connectivity.is_some())?;
         out = fixed;
         // Dropping unsupported struts can split a component whose bridge
         // died; one reconnection round closes it. A new tie joins two
@@ -564,7 +563,10 @@ mod tests {
         use ciborium::value::Value;
         let v = Value::Map(vec![(
             Value::Text("support".into()),
-            Value::Map(vec![(Value::Text("max_descent".into()), Value::Float(30.0))]),
+            Value::Map(vec![(
+                Value::Text("max_descent".into()),
+                Value::Float(30.0),
+            )]),
         )]);
         let mut buf = Vec::new();
         ciborium::ser::into_writer(&v, &mut buf).unwrap();
@@ -718,12 +720,7 @@ mod tests {
         let raised: Vec<usize> = (0..out.node_count())
             .filter(|&n| raise.data[n] > 1e-9)
             .collect();
-        assert_eq!(
-            raised.len(),
-            1,
-            "exactly the hook rises: {:?}",
-            raise.data
-        );
+        assert_eq!(raised.len(), 1, "exactly the hook rises: {:?}", raise.data);
         let p = out.node_position(raised[0]);
         assert!((p[0] - 0.5).abs() < 1e-9, "the hook keeps its x: {p:?}");
         assert!(
@@ -731,7 +728,11 @@ mod tests {
             "the hook rises to its neighbor's height: {p:?}"
         );
         assert_eq!(component_count(&out), 1);
-        let skin = out.element_fields.iter().find(|f| f.name == "skin").unwrap();
-        assert!(skin.data.iter().any(|&s| s == 1.0), "the fold is skin");
+        let skin = out
+            .element_fields
+            .iter()
+            .find(|f| f.name == "skin")
+            .unwrap();
+        assert!(skin.data.contains(&1.0), "the fold is skin");
     }
 }

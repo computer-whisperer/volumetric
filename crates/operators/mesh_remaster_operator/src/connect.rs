@@ -32,7 +32,9 @@ pub(crate) fn enforce(mesh: &FeaMesh, config: &ConnectivityConfig) -> Result<Fea
     }
     let mut strut_count: HashMap<u32, usize> = HashMap::new();
     for pair in mesh.connectivity.chunks_exact(2) {
-        *strut_count.entry(uf_find(&mut parent, pair[0])).or_default() += 1;
+        *strut_count
+            .entry(uf_find(&mut parent, pair[0]))
+            .or_default() += 1;
     }
     if strut_count.len() <= 1 {
         return Ok(mesh.clone());
@@ -124,8 +126,7 @@ fn plan_ties(
             for dx in -1..=1i64 {
                 for dy in -1..=1i64 {
                     for dz in -1..=1i64 {
-                        let Some(bucket) =
-                            grid.get(&[cell[0] + dx, cell[1] + dy, cell[2] + dz])
+                        let Some(bucket) = grid.get(&[cell[0] + dx, cell[1] + dy, cell[2] + dz])
                         else {
                             continue;
                         };
@@ -221,8 +222,8 @@ fn median_strut_length(mesh: &FeaMesh) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::{bar_mesh, component_count};
     use crate::ConnectivityConfig;
+    use crate::tests::{bar_mesh, component_count};
 
     #[test]
     fn connected_meshes_pass_through() {

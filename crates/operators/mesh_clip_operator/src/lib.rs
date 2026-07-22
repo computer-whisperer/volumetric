@@ -204,7 +204,10 @@ fn clip_bars(mesh: &FeaMesh, node_kept: &[bool], kept: &mut KeptBatch) -> Result
     }
 
     let lerp = |a: u32, b: u32, t: f64| -> [f64; 3] {
-        let (pa, pb) = (mesh.node_position(a as usize), mesh.node_position(b as usize));
+        let (pa, pb) = (
+            mesh.node_position(a as usize),
+            mesh.node_position(b as usize),
+        );
         core::array::from_fn(|c| pa[c] + t * (pb[c] - pa[c]))
     };
     for _ in 0..CLIP_BISECTIONS {
@@ -353,7 +356,9 @@ fn build_clipped(config: &ClipConfig) -> Result<FeaMesh, String> {
         Ok(out)
     };
 
-    let node_points: Vec<[f64; 3]> = (0..mesh.node_count()).map(|n| mesh.node_position(n)).collect();
+    let node_points: Vec<[f64; 3]> = (0..mesh.node_count())
+        .map(|n| mesh.node_position(n))
+        .collect();
     let node_kept = kept(&node_points)?;
 
     clip_mesh(&mesh, &node_kept, &mut kept, config)
@@ -425,8 +430,10 @@ mod tests {
     use volumetric_abi::fea::FeaField;
 
     /// Kept-region classifier for a sphere of radius `r` at the origin.
-    fn sphere_kept(r: f64, keep_inside: bool) -> impl FnMut(&[[f64; 3]]) -> Result<Vec<bool>, String>
-    {
+    fn sphere_kept(
+        r: f64,
+        keep_inside: bool,
+    ) -> impl FnMut(&[[f64; 3]]) -> Result<Vec<bool>, String> {
         move |points| {
             Ok(points
                 .iter()
@@ -439,7 +446,9 @@ mod tests {
         mesh: &FeaMesh,
         kept: &mut impl FnMut(&[[f64; 3]]) -> Result<Vec<bool>, String>,
     ) -> Vec<bool> {
-        let points: Vec<[f64; 3]> = (0..mesh.node_count()).map(|n| mesh.node_position(n)).collect();
+        let points: Vec<[f64; 3]> = (0..mesh.node_count())
+            .map(|n| mesh.node_position(n))
+            .collect();
         kept(&points).unwrap()
     }
 
@@ -601,10 +610,9 @@ mod tests {
             node_fields: vec![],
             element_fields: vec![],
         };
-        let mut kept_fn =
-            |points: &[[f64; 3]]| -> Result<Vec<bool>, String> {
-                Ok(points.iter().map(|p| p[0] < 1.5).collect())
-            };
+        let mut kept_fn = |points: &[[f64; 3]]| -> Result<Vec<bool>, String> {
+            Ok(points.iter().map(|p| p[0] < 1.5).collect())
+        };
         let node_kept = classify(&mesh, &mut kept_fn);
         let clipped = clip_mesh(&mesh, &node_kept, &mut kept_fn, &ClipConfig::default()).unwrap();
         assert_eq!(clipped.element_count(), 1);
@@ -614,9 +622,8 @@ mod tests {
     #[test]
     fn clipping_everything_away_is_an_error() {
         let cloud = point_cloud();
-        let mut nothing = |points: &[[f64; 3]]| -> Result<Vec<bool>, String> {
-            Ok(vec![false; points.len()])
-        };
+        let mut nothing =
+            |points: &[[f64; 3]]| -> Result<Vec<bool>, String> { Ok(vec![false; points.len()]) };
         let node_kept = classify(&cloud, &mut nothing);
         let err = clip_mesh(&cloud, &node_kept, &mut nothing, &ClipConfig::default()).unwrap_err();
         assert!(err.contains("kept no elements"), "unexpected error: {err}");

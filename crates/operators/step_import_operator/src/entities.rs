@@ -626,10 +626,7 @@ impl<'a> Ctx<'a> {
             n if n == with_link => 5,
             n if n == with_link - 1 => 4,
             n => {
-                return Err(format!(
-                    "#{id} {}: unexpected argument count {n}",
-                    r.name
-                ));
+                return Err(format!("#{id} {}: unexpected argument count {n}", r.name));
             }
         };
         let pnindex = r
@@ -719,7 +716,11 @@ impl<'a> Ctx<'a> {
                 if t.len() != 3 {
                     return Err(format!("#{id}: triangle with {} vertices", t.len()));
                 }
-                push(map(int_at(&t[0])?)?, map(int_at(&t[1])?)?, map(int_at(&t[2])?)?);
+                push(
+                    map(int_at(&t[0])?)?,
+                    map(int_at(&t[1])?)?,
+                    map(int_at(&t[2])?)?,
+                );
             }
         }
         if tris.is_empty() {

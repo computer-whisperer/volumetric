@@ -491,11 +491,8 @@ fn weave_phases_are_disjoint_through_the_operator() {
     };
     let mut executors: Vec<NativeModelExecutor> = (0..3)
         .map(|k| {
-            let output = run_operator(
-                "lattice_operator",
-                vec![input.clone(), phase_config(3, k)],
-            )
-            .unwrap_or_else(|e| panic!("weave phase {k} failed: {e}"));
+            let output = run_operator("lattice_operator", vec![input.clone(), phase_config(3, k)])
+                .unwrap_or_else(|e| panic!("weave phase {k} failed: {e}"));
             NativeModelExecutor::new(&output).expect("phase executes")
         })
         .collect();
@@ -526,8 +523,7 @@ fn weave_phases_are_disjoint_through_the_operator() {
         }
     }
     assert_eq!(
-        owners_seen,
-        [true; 3],
+        owners_seen, [true; 3],
         "every phase should own some probe points"
     );
 }

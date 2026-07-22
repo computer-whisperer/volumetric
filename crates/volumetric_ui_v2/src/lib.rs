@@ -2748,8 +2748,7 @@ impl VolumetricUiV2 {
                 ConfigFieldType::Group(sub) => {
                     // Required groups are always on; optional ones read
                     // their marker (absent = disabled).
-                    let enabled = !field.optional
-                        || matches!(value, Some(ConfigValue::Bool(true)));
+                    let enabled = !field.optional || matches!(value, Some(ConfigValue::Bool(true)));
                     buffers.insert(path.clone(), enabled.to_string());
                     Self::seed_config_buffers(sub, &path, current, buffers, lists);
                 }
@@ -6490,9 +6489,12 @@ fn push_config_rows(
                     .semibold()
                     .width(Size::Fill(1.0));
                 rows.push(if field.optional {
-                    row([header, switch(format!("{CONFIG_BOOL_PREFIX}{path}"), enabled)])
-                        .gap(tokens::SPACE_2)
-                        .align(Align::Center)
+                    row([
+                        header,
+                        switch(format!("{CONFIG_BOOL_PREFIX}{path}"), enabled),
+                    ])
+                    .gap(tokens::SPACE_2)
+                    .align(Align::Center)
                 } else {
                     row([header])
                 });
@@ -6514,9 +6516,7 @@ fn push_config_rows(
 
 fn config_field_row(field: &ConfigField, path: &str, buffer: &str, selection: &Selection) -> El {
     let control = match &field.ty {
-        ConfigFieldType::Bool => {
-            switch(format!("{CONFIG_BOOL_PREFIX}{path}"), buffer == "true")
-        }
+        ConfigFieldType::Bool => switch(format!("{CONFIG_BOOL_PREFIX}{path}"), buffer == "true"),
         ConfigFieldType::Enum(options) => config_enum_control(path, options, buffer),
         _ => text_input(&format!("{CONFIG_FIELD_PREFIX}{path}"), buffer, selection)
             .width(Size::Fixed(132.0)),

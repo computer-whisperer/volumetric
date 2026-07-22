@@ -69,7 +69,10 @@ fn wasm_template_patches_and_validates() {
         assert!(names.contains(&required), "missing export {required}");
     }
     for dropped in ["brep_payload_slot", "get_sample_format", "sample_channels"] {
-        assert!(!names.contains(&dropped), "export {dropped} must be dropped");
+        assert!(
+            !names.contains(&dropped),
+            "export {dropped} must be dropped"
+        );
     }
 
     // A colored import keeps the channel exports.
@@ -91,7 +94,10 @@ fn shell_based_surface_model_reached_over_srr() {
     let from_body = "#37 = MANIFOLD_SOLID_BREP('',#38);";
     assert!(FIXTURE.contains(from_rep) && FIXTURE.contains(from_body));
     let text = FIXTURE
-        .replace(from_rep, "#36 = ADVANCED_BREP_SHAPE_REPRESENTATION('',(#11),#367);")
+        .replace(
+            from_rep,
+            "#36 = ADVANCED_BREP_SHAPE_REPRESENTATION('',(#11),#367);",
+        )
         .replace(
             from_body,
             "#37 = SHELL_BASED_SURFACE_MODEL('',(#38));\n\
@@ -138,7 +144,9 @@ fn styled_items_color_bodies_and_faces() {
     }
     assert_eq!(
         seen,
-        [[255, 0, 0], [0, 255, 0], [0, 0, 255]].into_iter().collect(),
+        [[255, 0, 0], [0, 255, 0], [0, 0, 255]]
+            .into_iter()
+            .collect(),
         "expected exactly red/green/blue faces, got {seen:?}"
     );
 

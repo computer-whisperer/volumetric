@@ -463,11 +463,7 @@ fn subdivide_skin(
         for ((seg, &(mid, chord)), landing) in active.iter().zip(&info).zip(landings) {
             match landing {
                 Some(l) if dist(l.pos, mid) > tol_for(seg.origin, chord) => {
-                    let k = builder.push(
-                        l.pos,
-                        Source::Mid { i: seg.a, j: seg.b },
-                        Some(l.inward),
-                    );
+                    let k = builder.push(l.pos, Source::Mid { i: seg.a, j: seg.b }, Some(l.inward));
                     next.push(Seg { b: k, ..*seg });
                     next.push(Seg { a: k, ..*seg });
                 }
@@ -678,7 +674,8 @@ fn drape_bars(
             chord / 8.0
         }
     };
-    let mut skin_final = subdivide_skin(&mut builder, skin_active, &tol_for, max_distance, occupied)?;
+    let mut skin_final =
+        subdivide_skin(&mut builder, skin_active, &tol_for, max_distance, occupied)?;
 
     // Reconnect: if dropping the flat arcs severed the mesh, re-drape
     // the shortest dropped arcs whose endpoints already landed through
@@ -699,8 +696,7 @@ fn drape_bars(
         // the ties planned here are protected from that filter, so a
         // degenerate fold a tie relies on does survive.)
         for s in &skin_final {
-            if s.a != s.b && dist(builder.position(s.a), builder.position(s.b)) > degenerate_eps
-            {
+            if s.a != s.b && dist(builder.position(s.a), builder.position(s.b)) > degenerate_eps {
                 uf_union(&mut parent, s.a, s.b);
             }
         }
@@ -710,14 +706,8 @@ fn drape_bars(
                 let pair = mesh.element(e);
                 let ia = builder.try_moved(pair[0])?;
                 let ib = builder.try_moved(pair[1])?;
-                (uf_find(&mut parent, ia) != uf_find(&mut parent, ib)).then(|| {
-                    (
-                        dist(builder.position(ia), builder.position(ib)),
-                        e,
-                        ia,
-                        ib,
-                    )
-                })
+                (uf_find(&mut parent, ia) != uf_find(&mut parent, ib))
+                    .then(|| (dist(builder.position(ia), builder.position(ib)), e, ia, ib))
             })
             .collect();
         candidates.sort_by(|x, y| x.0.total_cmp(&y.0));
@@ -801,7 +791,7 @@ fn drape_bars(
             .find(|f| f.name == "radius" && f.components == 1)
         else {
             return Err(
-                "inset_factor needs a scalar 'radius' element field on the mesh".to_string()
+                "inset_factor needs a scalar 'radius' element field on the mesh".to_string(),
             );
         };
         let node_count = builder.sources.len();
@@ -979,8 +969,7 @@ fn drape_points(
         for (&n, l) in outs.iter().zip(&landings) {
             if let Some(l) = l {
                 landed[n as usize] = true;
-                working.node_positions[n as usize * 3..n as usize * 3 + 3]
-                    .copy_from_slice(&l.pos);
+                working.node_positions[n as usize * 3..n as usize * 3 + 3].copy_from_slice(&l.pos);
             }
         }
     }
@@ -1018,9 +1007,11 @@ fn drape_points(
         .collect();
     let out = mesh_edit_core::filter_elements(&working, &keep)?;
     if out.element_count() == 0 {
-        return Err("no points survived the drape — is the cloud within max_distance \
+        return Err(
+            "no points survived the drape — is the cloud within max_distance \
                     of the model?"
-            .to_string());
+                .to_string(),
+        );
     }
     Ok(out)
 }
@@ -1074,8 +1065,9 @@ pub(crate) fn drape(
     reconnect: Option<&ConnectivityConfig>,
 ) -> Result<FeaMesh, String> {
     let max_distance = resolve_max_distance(mesh, config)?;
-    let node_points: Vec<[f64; 3]> =
-        (0..mesh.node_count()).map(|n| mesh.node_position(n)).collect();
+    let node_points: Vec<[f64; 3]> = (0..mesh.node_count())
+        .map(|n| mesh.node_position(n))
+        .collect();
     let node_occ = occupied(&node_points)?;
     match mesh.element_kind {
         FeaElementKind::Point1 => drape_points(mesh, &node_occ, occupied, config, max_distance),
@@ -1100,7 +1092,9 @@ mod tests {
     }
 
     fn positions(mesh: &FeaMesh) -> Vec<[f64; 3]> {
-        (0..mesh.node_count()).map(|n| mesh.node_position(n)).collect()
+        (0..mesh.node_count())
+            .map(|n| mesh.node_position(n))
+            .collect()
     }
 
     fn field<'m>(mesh: &'m FeaMesh, name: &str) -> &'m FeaField {
@@ -1160,8 +1154,16 @@ mod tests {
             .fold(0.0f64, f64::max);
         assert!(max_r < 1.03, "nothing may stay past the surface: {max_r}");
         // The bulk strut is untouched.
-        assert!(positions(&out).iter().any(|p| dist(*p, [0.0, 0.0, 0.5]) < 1e-12));
-        assert!(positions(&out).iter().any(|p| dist(*p, [0.0, 0.0, 0.9]) < 1e-12));
+        assert!(
+            positions(&out)
+                .iter()
+                .any(|p| dist(*p, [0.0, 0.0, 0.5]) < 1e-12)
+        );
+        assert!(
+            positions(&out)
+                .iter()
+                .any(|p| dist(*p, [0.0, 0.0, 0.9]) < 1e-12)
+        );
     }
 
     #[test]
@@ -1299,7 +1301,11 @@ mod tests {
             ..ConnectivityConfig::default()
         };
         let out = drape(&mesh, &mut oracle, &config, Some(&prune)).unwrap();
-        assert_eq!(component_count(&out), 2, "prune leaves severing to connect::enforce");
+        assert_eq!(
+            component_count(&out),
+            2,
+            "prune leaves severing to connect::enforce"
+        );
     }
 
     #[test]
@@ -1398,7 +1404,11 @@ mod tests {
             );
         }
         // The bulk nodes are untouched.
-        assert!(positions(&out).iter().any(|p| dist(*p, [0.5, 0.0, -0.2]) < 1e-12));
+        assert!(
+            positions(&out)
+                .iter()
+                .any(|p| dist(*p, [0.5, 0.0, -0.2]) < 1e-12)
+        );
     }
 
     #[test]
@@ -1447,13 +1457,7 @@ mod tests {
         let hex = FeaMesh {
             element_kind: FeaElementKind::Hex8,
             node_positions: (0..8)
-                .flat_map(|i| {
-                    [
-                        (i & 1) as f64,
-                        ((i >> 1) & 1) as f64,
-                        ((i >> 2) & 1) as f64,
-                    ]
-                })
+                .flat_map(|i| [(i & 1) as f64, ((i >> 1) & 1) as f64, ((i >> 2) & 1) as f64])
                 .collect(),
             connectivity: vec![0, 1, 3, 2, 4, 5, 7, 6],
             node_fields: vec![],

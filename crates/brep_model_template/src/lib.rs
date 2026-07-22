@@ -105,16 +105,14 @@ pub extern "C" fn get_sample_format() -> i64 {
             name: "occupancy".to_string(),
             kind: volumetric_abi::ChannelKind::Occupancy,
         })
-        .chain(
-            volumetric_abi::COLOR_CHANNEL_NAMES
-                .iter()
-                .map(|name| volumetric_abi::SampleChannel {
-                    name: name.to_string(),
-                    kind: volumetric_abi::ChannelKind::Custom(
-                        volumetric_abi::COLOR_SRGB_CHANNEL_KIND.to_string(),
-                    ),
-                }),
-        )
+        .chain(volumetric_abi::COLOR_CHANNEL_NAMES.iter().map(|name| {
+            volumetric_abi::SampleChannel {
+                name: name.to_string(),
+                kind: volumetric_abi::ChannelKind::Custom(
+                    volumetric_abi::COLOR_SRGB_CHANNEL_KIND.to_string(),
+                ),
+            }
+        }))
         .collect(),
     })
 }

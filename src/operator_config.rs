@@ -570,8 +570,7 @@ fn seed_defaults(fields: &[ConfigField], prefix: &str, out: &mut BTreeMap<String
     for field in fields {
         let path = field_path(prefix, &field.name);
         if let ConfigFieldType::Group(sub) = &field.ty {
-            let enabled =
-                !field.optional || matches!(field.default, Some(ConfigValue::Bool(true)));
+            let enabled = !field.optional || matches!(field.default, Some(ConfigValue::Bool(true)));
             if !enabled {
                 continue;
             }
@@ -844,14 +843,20 @@ mod tests {
         assert_eq!(fields[2].ty, ConfigFieldType::Bool);
 
         // Dotted lookup walks the nesting.
-        assert_eq!(find_field(&fields, "surface.outside").unwrap().name, "outside");
+        assert_eq!(
+            find_field(&fields, "surface.outside").unwrap().name,
+            "outside"
+        );
         assert_eq!(find_field(&fields, "weld").unwrap().name, "weld");
         assert!(find_field(&fields, "surface.nope").is_none());
         assert!(find_field(&fields, "weld.outside").is_none());
 
         // Literal dotted names (Lua parameter forms) win over descent.
         let lua = parse_schema("{ sphere.radius: float .default 1.0 }").unwrap();
-        assert_eq!(find_field(&lua, "sphere.radius").unwrap().name, "sphere.radius");
+        assert_eq!(
+            find_field(&lua, "sphere.radius").unwrap().name,
+            "sphere.radius"
+        );
     }
 
     #[test]
@@ -880,15 +885,19 @@ mod tests {
         assert_eq!(decoded.get("weld"), Some(&ConfigValue::Bool(true)));
 
         // The raw CBOR really is a nested map (what the operator sees).
-        let raw: CborValue =
-            ciborium::de::from_reader(&encode(&fields, &values)[..]).unwrap();
-        let CborValue::Map(entries) = raw else { panic!("map") };
+        let raw: CborValue = ciborium::de::from_reader(&encode(&fields, &values)[..]).unwrap();
+        let CborValue::Map(entries) = raw else {
+            panic!("map")
+        };
         let surface = entries
             .iter()
             .find(|(k, _)| matches!(k, CborValue::Text(t) if t == "surface"))
             .map(|(_, v)| v)
             .unwrap();
-        assert!(matches!(surface, CborValue::Map(_)), "nested map, not a string");
+        assert!(
+            matches!(surface, CborValue::Map(_)),
+            "nested map, not a string"
+        );
     }
 
     #[test]

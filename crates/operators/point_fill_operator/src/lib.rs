@@ -32,7 +32,9 @@ use volumetric_abi::host::{
     input_model_bounds, input_model_dimensions, input_model_sample, post_output, read_input,
     report_error,
 };
-use volumetric_abi::{OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput, is_occupied};
+use volumetric_abi::{
+    OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput, is_occupied,
+};
 
 /// Refuse fills past this many candidate sites (matches the strut
 /// operator's cap; Voronoi consumers want far fewer).

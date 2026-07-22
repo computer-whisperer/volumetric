@@ -252,11 +252,7 @@ pub fn lattice_occupied(
             // amplitude keeps pairwise clearance >= (1 - jitter) / N
             // before strut radii are subtracted.
             let amp = 0.5 * jitter / f64::from(phases);
-            let p = [
-                x / TAU - shift,
-                y / TAU - shift,
-                z / TAU - shift,
-            ];
+            let p = [x / TAU - shift, y / TAU - shift, z / TAU - shift];
             weave_strut_distance(p, amp, phase) <= strut_radius(d)
         }
     }
@@ -294,9 +290,8 @@ fn weave_strut_distance(p: [f64; 3], amp: f64, phase: u32) -> f64 {
     let c = p.map(|v| v.round() as i64);
     // Sites for bases c-1 ..= c+2 per axis: neighborhood bond endpoints.
     let mut sites = [[[0.0f64; 3]; 4]; 16];
-    let site_at = |sites: &[[[f64; 3]; 4]; 16], ix: usize, iy: usize, iz: usize| {
-        sites[iz * 4 + iy][ix]
-    };
+    let site_at =
+        |sites: &[[[f64; 3]; 4]; 16], ix: usize, iy: usize, iz: usize| sites[iz * 4 + iy][ix];
     for iz in 0..4 {
         for iy in 0..4 {
             for ix in 0..4 {
