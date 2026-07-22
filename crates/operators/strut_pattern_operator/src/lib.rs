@@ -196,22 +196,8 @@ fn clip_skeleton(
         );
     }
 
-    if weld_length > 0.0 {
-        (positions, connectivity) = weld_short_struts(positions, connectivity, weld_length);
-        if connectivity.is_empty() {
-            return Err(format!(
-                "welding at length {weld_length} collapsed every strut \
-                 (is weld_factor * radius larger than the struts?)"
-            ));
-        }
-    }
-
-    if prune_islands {
-        (positions, connectivity) = largest_component(positions, connectivity);
-    }
-
     let strut_count = connectivity.len() / 2;
-    let mesh = FeaMesh {
+    let mut mesh = FeaMesh {
         element_kind: FeaElementKind::Bar2,
         node_positions: positions,
         connectivity,
@@ -223,139 +209,21 @@ fn clip_skeleton(
         }],
     };
     mesh.validate()?;
+
+    if weld_length > 0.0 {
+        mesh = mesh_edit_core::weld_short_bars(&mesh, &|_| weld_length)?;
+        if mesh.element_count() == 0 {
+            return Err(format!(
+                "welding at length {weld_length} collapsed every strut \
+                 (is weld_factor * radius larger than the struts?)"
+            ));
+        }
+    }
+
+    if prune_islands {
+        mesh = mesh_edit_core::largest_bar_component(&mesh)?;
+    }
     Ok(mesh)
-}
-
-/// Weld away struts shorter than `weld_length`: union-find clusters over
-/// the short edges, each cluster's nodes merge at their centroid, the
-/// contracted struts vanish, and struts left connecting the same pair of
-/// joints keep only the first copy. Repeats until no strut is short —
-/// merging joints can pull previously-long struts under the threshold.
-fn weld_short_struts(
-    mut positions: Vec<f64>,
-    mut connectivity: Vec<u32>,
-    weld_length: f64,
-) -> (Vec<f64>, Vec<u32>) {
-    loop {
-        let node_count = positions.len() / 3;
-        let mut parent: Vec<u32> = (0..node_count as u32).collect();
-        fn find(parent: &mut [u32], mut x: u32) -> u32 {
-            while parent[x as usize] != x {
-                parent[x as usize] = parent[parent[x as usize] as usize];
-                x = parent[x as usize];
-            }
-            x
-        }
-        let mut short = 0usize;
-        for pair in connectivity.chunks_exact(2) {
-            let (a, b) = (pair[0] as usize * 3, pair[1] as usize * 3);
-            let len2: f64 = (0..3)
-                .map(|c| (positions[a + c] - positions[b + c]).powi(2))
-                .sum();
-            if len2 < weld_length * weld_length {
-                short += 1;
-                let (ra, rb) = (find(&mut parent, pair[0]), find(&mut parent, pair[1]));
-                if ra != rb {
-                    let (lo, hi) = (ra.min(rb), ra.max(rb));
-                    parent[hi as usize] = lo;
-                }
-            }
-        }
-        if short == 0 {
-            return (positions, connectivity);
-        }
-
-        let mut centroid = vec![[0.0f64; 3]; node_count];
-        let mut cluster_size = vec![0usize; node_count];
-        for node in 0..node_count {
-            let root = find(&mut parent, node as u32) as usize;
-            for c in 0..3 {
-                centroid[root][c] += positions[node * 3 + c];
-            }
-            cluster_size[root] += 1;
-        }
-
-        let mut remap = vec![u32::MAX; node_count];
-        let mut new_positions: Vec<f64> = Vec::new();
-        let mut new_connectivity: Vec<u32> = Vec::new();
-        let mut seen: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
-        for pair in connectivity.chunks_exact(2) {
-            let (ra, rb) = (find(&mut parent, pair[0]), find(&mut parent, pair[1]));
-            if ra == rb {
-                continue; // contracted into a joint
-            }
-            if !seen.insert((ra.min(rb), ra.max(rb))) {
-                continue; // parallel duplicate of a kept strut
-            }
-            for root in [ra, rb] {
-                if remap[root as usize] == u32::MAX {
-                    remap[root as usize] = (new_positions.len() / 3) as u32;
-                    let size = cluster_size[root as usize] as f64;
-                    new_positions.extend(centroid[root as usize].iter().map(|s| s / size));
-                }
-                new_connectivity.push(remap[root as usize]);
-            }
-        }
-        positions = new_positions;
-        connectivity = new_connectivity;
-        if connectivity.is_empty() {
-            return (positions, connectivity);
-        }
-    }
-}
-
-/// Keep only the largest connected component (by strut count; ties break
-/// toward the component containing the lowest node index, which the
-/// union-find root ordering gives deterministically).
-fn largest_component(positions: Vec<f64>, connectivity: Vec<u32>) -> (Vec<f64>, Vec<u32>) {
-    let node_count = positions.len() / 3;
-    let mut parent: Vec<u32> = (0..node_count as u32).collect();
-    fn find(parent: &mut [u32], mut x: u32) -> u32 {
-        while parent[x as usize] != x {
-            parent[x as usize] = parent[parent[x as usize] as usize];
-            x = parent[x as usize];
-        }
-        x
-    }
-    for pair in connectivity.chunks_exact(2) {
-        let (ra, rb) = (find(&mut parent, pair[0]), find(&mut parent, pair[1]));
-        if ra != rb {
-            // Union toward the smaller root: component roots stay the
-            // lowest node index they contain.
-            let (lo, hi) = (ra.min(rb), ra.max(rb));
-            parent[hi as usize] = lo;
-        }
-    }
-
-    let mut strut_count: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
-    for pair in connectivity.chunks_exact(2) {
-        *strut_count.entry(find(&mut parent, pair[0])).or_default() += 1;
-    }
-    let Some(keep_root) = strut_count
-        .iter()
-        .max_by_key(|(root, count)| (**count, std::cmp::Reverse(**root)))
-        .map(|(root, _)| *root)
-    else {
-        return (positions, connectivity);
-    };
-
-    let mut remap = vec![u32::MAX; node_count];
-    let mut new_positions: Vec<f64> = Vec::new();
-    let mut new_connectivity: Vec<u32> = Vec::new();
-    for pair in connectivity.chunks_exact(2) {
-        if find(&mut parent, pair[0]) != keep_root {
-            continue;
-        }
-        for &node in pair {
-            if remap[node as usize] == u32::MAX {
-                remap[node as usize] = (new_positions.len() / 3) as u32;
-                let base = node as usize * 3;
-                new_positions.extend_from_slice(&positions[base..base + 3]);
-            }
-            new_connectivity.push(remap[node as usize]);
-        }
-    }
-    (new_positions, new_connectivity)
 }
 
 fn build_pattern(config: &PatternConfig) -> Result<FeaMesh, String> {
@@ -596,61 +464,6 @@ mod tests {
         let skeleton = enumerate_skeleton(SkeletonFamily::Tetra, [0.0; 3], [1.0; 3], 0.2);
         let err = clip_with(&skeleton, &mut |_| false, true).unwrap_err();
         assert!(err.contains("no struts"), "unexpected error: {err}");
-    }
-
-    #[test]
-    fn welding_collapses_short_struts_into_joints() {
-        // A "dumbbell": two long struts joined by a tiny middle edge.
-        //   0 --(1.0)-- 1 --(0.01)-- 2 --(1.0)-- 3
-        let positions = vec![
-            0.0, 0.0, 0.0, // 0
-            1.0, 0.0, 0.0, // 1
-            1.01, 0.0, 0.0, // 2
-            2.01, 0.0, 0.0, // 3
-        ];
-        let connectivity = vec![0, 1, 1, 2, 2, 3];
-        let (p, c) = weld_short_struts(positions, connectivity, 0.05);
-        assert_eq!(c.len() / 2, 2, "tiny middle edge should contract");
-        assert_eq!(p.len() / 3, 3, "nodes 1 and 2 should merge");
-        // The joint sits at the pair's centroid.
-        assert!(
-            p.chunks(3)
-                .any(|q| (q[0] - 1.005).abs() < 1e-12 && q[1] == 0.0 && q[2] == 0.0)
-        );
-    }
-
-    #[test]
-    fn welding_dedupes_parallel_struts() {
-        // A sliver triangle: welding its short edge leaves the two long
-        // edges connecting the same pair of joints; only one survives.
-        let positions = vec![
-            0.0, 0.0, 0.0, // 0
-            1.0, 0.0, 0.0, // 1
-            1.0, 0.01, 0.0, // 2
-        ];
-        let connectivity = vec![0, 1, 1, 2, 2, 0];
-        let (p, c) = weld_short_struts(positions, connectivity, 0.05);
-        assert_eq!(c.len() / 2, 1, "parallel duplicates should dedup");
-        assert_eq!(p.len() / 3, 2);
-    }
-
-    #[test]
-    fn welding_cascades_through_chains() {
-        // Three 0.04 edges chain into a 0.12 cluster: each merge pulls the
-        // next edge under the threshold, so the whole chain becomes one
-        // joint even though welding is threshold-per-pass.
-        let positions = vec![
-            0.0, 0.0, 0.0, // 0
-            1.0, 0.0, 0.0, // 1: chain start
-            1.04, 0.0, 0.0, // 2
-            1.08, 0.0, 0.0, // 3
-            1.12, 0.0, 0.0, // 4: chain end
-            2.12, 0.0, 0.0, // 5
-        ];
-        let connectivity = vec![0, 1, 1, 2, 2, 3, 3, 4, 4, 5];
-        let (p, c) = weld_short_struts(positions, connectivity, 0.05);
-        assert_eq!(c.len() / 2, 2, "the chain should contract to one joint");
-        assert_eq!(p.len() / 3, 3);
     }
 
     #[test]

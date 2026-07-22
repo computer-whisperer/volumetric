@@ -44,6 +44,7 @@ const OPERATORS: &[&str] = &[
     "mesh_to_model_operator",
     "mesh_height_operator",
     "lattice_operator",
+    "mesh_clip_operator",
     "point_fill_operator",
     "strut_pattern_operator",
     "strut_model_operator",

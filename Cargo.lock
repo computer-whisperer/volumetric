@@ -2979,6 +2979,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "mesh_clip_operator"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "mesh_edit_core",
+ "serde",
+ "volumetric_abi",
+]
+
+[[package]]
+name = "mesh_edit_core"
+version = "0.1.0"
+dependencies = [
+ "volumetric_abi",
+]
+
+[[package]]
 name = "mesh_height_operator"
 version = "0.1.0"
 dependencies = [
@@ -4950,6 +4967,7 @@ version = "0.1.0"
 dependencies = [
  "ciborium",
  "lattice_model_core",
+ "mesh_edit_core",
  "serde",
  "volumetric_abi",
 ]

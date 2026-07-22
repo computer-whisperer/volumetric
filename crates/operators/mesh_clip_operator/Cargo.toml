@@ -1,5 +1,5 @@
 [package]
-name = "strut_pattern_operator"
+name = "mesh_clip_operator"
 version = "0.1.0"
 edition = "2024"
 
@@ -8,7 +8,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 volumetric_abi = { path = "../../volumetric_abi" }
-lattice_model_core = { path = "../../lattice_model_core" }
 mesh_edit_core = { path = "../../mesh_edit_core" }
 serde = { version = "1", features = ["derive"] }
 ciborium = "0.2"
