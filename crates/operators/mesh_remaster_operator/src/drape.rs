@@ -1,20 +1,4 @@
-//! Mesh Drape Operator.
-//!
-//! Folds the parts of a strut network that protrude outside a model down
-//! onto that model's surface: the outside segments become a
-//! surface-conforming net (the "skin"), so a trimmed Voronoi lattice ends
-//! in a smooth printable face instead of open cell rims or clipped stub
-//! ends — without adding material the way a separate conforming surface
-//! lattice would.
-//!
-//! Why this is not a drum skin: draping relocates the outer cells' own
-//! struts instead of welding a second lattice on top, and the net it
-//! forms inherits the Voronoi skeleton's degree-3 vertices — a polygonal,
-//! sub-isostatic net that deforms by strut bending, far softer in-plane
-//! than a triangulated skin. The `skin` element flag and
-//! `skin_radius_factor` tune what stiffness remains (bending scales as
-//! radius^4) or hand the skin to downstream optimization separately from
-//! the bulk.
+//! The `surface` requirement: drape protruding struts onto the model.
 //!
 //! Per Bar2 strut:
 //! - both nodes inside: kept untouched (the bulk).
@@ -26,55 +10,33 @@
 //! - both nodes outside: `outside: "project"` drapes the whole strut onto
 //!   the surface; `"drop"` removes it — rims still fold down, but the
 //!   arcs tying cell tops together vanish (the most compliant surface).
+//!   Dropped arcs whose endpoints already landed through a crossing are
+//!   the reconnection pool: when the drop severs a component, the
+//!   shortest such arcs re-drape (flagged `tie`) until the mesh is one
+//!   piece again.
 //!
 //! Draped chords subdivide against the surface until they sag less than
 //! `chord_tolerance` (default: the strut's own radius), so skin struts
 //! follow curved surfaces as polylines. `inset_factor` sinks skin nodes
-//! that many strut radii below the surface so the printed strut envelope
-//! sits flush instead of half a strut proud. Nodes farther than
-//! `max_distance` from the surface are dropped with their struts rather
-//! than dragged across space (so box-mode Voronoi hairs vanish instead of
-//! piling onto the skin).
+//! below the surface so the printed strut envelope sits flush instead of
+//! half a strut proud. Nodes farther than `max_distance` from the
+//! surface are dropped with their struts rather than dragged across
+//! space (so box-mode Voronoi hairs vanish instead of piling onto the
+//! skin).
 //!
-//! Point1 clouds drape too: outside points land on the surface (or
-//! drop). Hex8 meshes are rejected — volume elements cannot fold.
-//!
-//! The model is a binary occupancy oracle (the operator ABI contract), so
-//! projection estimates a surface direction from a signed stencil of
-//! occupancy samples, marches along it to bracket the surface, and
-//! bisects — all in lock-step batched rounds, one host call per round,
-//! like the clip operator's crossing bisection.
-//!
-//! Inputs:
-//! - Input 0: FeaMesh (Bar2 or Point1) — the mesh to drape
-//! - Input 1: ModelWASM (must be 3D) — the surface to drape onto
-//! - Input 2: CBOR configuration:
-//!   `{ outside: "project" / "drop" .default "project",
-//!   skin_radius_factor: float .default 1.0 (scales the `radius` element
-//!   field on skin struts), chord_tolerance: float .default 0.0 (0 =
-//!   each strut's own radius), inset_factor: float .default 0.0 (sink
-//!   skin nodes this many strut radii below the surface — the largest
-//!   radius at the node, bulk stubs included), max_distance:
-//!   float .default 0.0 (0 = 4 x the median strut length; for Point1,
-//!   an eighth of the cloud's bounding diagonal), weld_factor: float
-//!   .default 1.0 (welds struts shorter than weld_factor * radius; 0
-//!   disables) }`
-//!
-//! Output 0: CBOR-encoded `FeaMesh` with a scalar `skin` element field
-//! (1.0 on draped elements, 0.0 on the bulk).
+//! Projection runs on the binary occupancy oracle: estimate a surface
+//! direction from a signed stencil of occupancy samples, march along it
+//! to bracket the surface, and bisect — all in lock-step batched rounds,
+//! one host call per round, like the clip operator's crossing bisection.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use volumetric_abi::fea::{FeaElementKind, FeaField, FeaMesh, decode_fea_mesh, encode_fea_mesh};
-use volumetric_abi::host::{
-    input_model_dimensions, input_model_sample, post_output, read_input, report_error,
+use volumetric_abi::fea::{FeaElementKind, FeaField, FeaMesh};
+
+use crate::{
+    ConnectivityConfig, OccupiedBatch, OutsideConfig, SurfaceConfig, add, dist, lerp3, normalize,
+    scale, sub, uf_find, uf_union,
 };
-use volumetric_abi::{
-    OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput, is_occupied,
-};
-
-/// Occupancy samples per batched host call.
-const SAMPLE_CHUNK: usize = 8192;
 
 /// Directions in the occupancy stencil used to estimate where the
 /// surface lies from a point (a Fibonacci sphere).
@@ -103,82 +65,6 @@ const MIN_STUB_FRACTION: f64 = 1e-3;
 /// Depth cap for draped-chord subdivision (up to 2^N pieces per strut).
 const MAX_DRAPE_DEPTH: usize = 4;
 
-#[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum OutsideConfig {
-    /// Drape struts with both nodes outside onto the surface.
-    Project,
-    /// Remove them; only the outside halves of crossing struts fold.
-    Drop,
-}
-
-#[derive(Clone, Copy, Debug, serde::Deserialize)]
-#[serde(default)]
-struct DrapeConfig {
-    /// What happens to struts entirely outside the model.
-    outside: OutsideConfig,
-    /// Multiplies the `radius` element field on skin struts.
-    skin_radius_factor: f64,
-    /// Draped chords subdivide until they sag off the surface by less
-    /// than this; 0 = each strut's own radius.
-    chord_tolerance: f64,
-    /// Sink skin nodes this many strut radii below the surface (the
-    /// largest radius at the node, bulk stubs included).
-    inset_factor: f64,
-    /// Nodes farther than this from the surface drop with their struts;
-    /// 0 = 4 x the median strut length.
-    max_distance: f64,
-    /// Welds struts shorter than `weld_factor * radius`; 0 disables.
-    weld_factor: f64,
-}
-
-impl Default for DrapeConfig {
-    fn default() -> Self {
-        Self {
-            outside: OutsideConfig::Project,
-            skin_radius_factor: 1.0,
-            chord_tolerance: 0.0,
-            inset_factor: 0.0,
-            max_distance: 0.0,
-            weld_factor: 1.0,
-        }
-    }
-}
-
-/// A batched occupancy oracle: for each position, whether it lies inside
-/// the model. The operator backs this with chunked host sampling; tests
-/// with analytic domains.
-type OccupiedBatch<'a> = dyn FnMut(&[[f64; 3]]) -> Result<Vec<bool>, String> + 'a;
-
-fn add(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-    core::array::from_fn(|c| a[c] + b[c])
-}
-
-fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-    core::array::from_fn(|c| a[c] - b[c])
-}
-
-fn scale(a: [f64; 3], s: f64) -> [f64; 3] {
-    core::array::from_fn(|c| a[c] * s)
-}
-
-fn norm(a: [f64; 3]) -> f64 {
-    a.iter().map(|c| c * c).sum::<f64>().sqrt()
-}
-
-fn dist(a: [f64; 3], b: [f64; 3]) -> f64 {
-    norm(sub(a, b))
-}
-
-fn lerp3(a: [f64; 3], b: [f64; 3], t: f64) -> [f64; 3] {
-    core::array::from_fn(|c| a[c] + t * (b[c] - a[c]))
-}
-
-fn normalize(a: [f64; 3]) -> Option<[f64; 3]> {
-    let len = norm(a);
-    (len > 1e-12).then(|| scale(a, 1.0 / len))
-}
-
 /// The fixed stencil: a Fibonacci sphere of unit directions.
 fn stencil_directions() -> [[f64; 3]; STENCIL_DIRS] {
     let golden = std::f64::consts::PI * (3.0 - 5.0f64.sqrt());
@@ -192,10 +78,10 @@ fn stencil_directions() -> [[f64; 3]; STENCIL_DIRS] {
 
 /// Where a point met the surface.
 #[derive(Clone, Copy)]
-struct Landing {
-    pos: [f64; 3],
+pub(crate) struct Landing {
+    pub pos: [f64; 3],
     /// Unit direction pointing into the model at the landing.
-    inward: [f64; 3],
+    pub inward: [f64; 3],
 }
 
 /// March from each point along its heading until occupancy flips away
@@ -276,7 +162,7 @@ fn march_and_bisect(
 /// re-aim along the normal estimated *at the landing* and land again
 /// (`REFINE_PASSES` times). Works from either side of the surface.
 /// Returns `None` where no surface lies within `max_distance`.
-fn project_points(
+pub(crate) fn project_points(
     points: &[[f64; 3]],
     max_distance: f64,
     occupied: &mut OccupiedBatch,
@@ -514,6 +400,13 @@ impl<'m> Builder<'m> {
         self.moved_map[node as usize]
     }
 
+    /// The landed output node for an input node, if a crossing fold
+    /// already created one.
+    fn try_moved(&self, node: u32) -> Option<u32> {
+        let m = self.moved_map[node as usize];
+        (m != u32::MAX).then_some(m)
+    }
+
     fn position(&self, i: u32) -> [f64; 3] {
         let base = i as usize * 3;
         [
@@ -525,20 +418,73 @@ impl<'m> Builder<'m> {
 }
 
 /// An output strut: two output nodes, the input element it descends from
-/// (for element fields and tolerances), and whether it is skin.
+/// (for element fields and tolerances), whether it is skin, and whether
+/// it is a reconnection tie.
 #[derive(Clone, Copy)]
 struct Seg {
     a: u32,
     b: u32,
     origin: u32,
     skin: bool,
+    tie: bool,
+}
+
+/// Drape subdivision: a chord whose midpoint hangs off the surface by
+/// more than its tolerance splits at the midpoint's own landing.
+fn subdivide_skin(
+    builder: &mut Builder,
+    mut active: Vec<Seg>,
+    tol_for: &dyn Fn(u32, f64) -> f64,
+    max_distance: f64,
+    occupied: &mut OccupiedBatch,
+) -> Result<Vec<Seg>, String> {
+    let mut done: Vec<Seg> = Vec::new();
+    for depth in 0..=MAX_DRAPE_DEPTH {
+        if active.is_empty() {
+            break;
+        }
+        if depth == MAX_DRAPE_DEPTH {
+            done.append(&mut active);
+            break;
+        }
+        let info: Vec<([f64; 3], f64)> = active
+            .iter()
+            .map(|s| {
+                let (pa, pb) = (builder.position(s.a), builder.position(s.b));
+                (lerp3(pa, pb, 0.5), dist(pa, pb))
+            })
+            .collect();
+        let landings = project_points(
+            &info.iter().map(|&(m, _)| m).collect::<Vec<_>>(),
+            max_distance,
+            occupied,
+        )?;
+        let mut next = Vec::new();
+        for ((seg, &(mid, chord)), landing) in active.iter().zip(&info).zip(landings) {
+            match landing {
+                Some(l) if dist(l.pos, mid) > tol_for(seg.origin, chord) => {
+                    let k = builder.push(
+                        l.pos,
+                        Source::Mid { i: seg.a, j: seg.b },
+                        Some(l.inward),
+                    );
+                    next.push(Seg { b: k, ..*seg });
+                    next.push(Seg { a: k, ..*seg });
+                }
+                _ => done.push(*seg),
+            }
+        }
+        active = next;
+    }
+    Ok(done)
 }
 
 fn drape_bars(
     mesh: &FeaMesh,
     node_occ: &[bool],
     occupied: &mut OccupiedBatch,
-    config: &DrapeConfig,
+    config: &SurfaceConfig,
+    reconnect: Option<&ConnectivityConfig>,
     max_distance: f64,
 ) -> Result<FeaMesh, String> {
     // Partition struts by where their nodes sit.
@@ -571,9 +517,13 @@ fn drape_bars(
             }
         }
     }
-    if config.outside == OutsideConfig::Drop {
-        flats.clear();
-    }
+    // In drop mode the flat arcs vanish from the drape but stay
+    // available as the reconnection pool.
+    let dropped_flats: Vec<usize> = if config.outside == OutsideConfig::Drop {
+        std::mem::take(&mut flats)
+    } else {
+        Vec::new()
+    };
 
     // Bisect each crossing along its strut (t from the inside node).
     {
@@ -646,6 +596,7 @@ fn drape_bars(
             b,
             origin: e as u32,
             skin: false,
+            tie: false,
         });
     }
     for x in &crossings {
@@ -672,6 +623,7 @@ fn drape_bars(
                 b: c,
                 origin: x.element as u32,
                 skin: false,
+                tie: false,
             });
             if let Some(l) = far {
                 let m = builder.moved(x.out_node, &l);
@@ -680,6 +632,7 @@ fn drape_bars(
                     b: m,
                     origin: x.element as u32,
                     skin: true,
+                    tie: false,
                 });
             }
         } else if let Some(l) = far {
@@ -691,6 +644,7 @@ fn drape_bars(
                 b: m,
                 origin: x.element as u32,
                 skin: true,
+                tie: false,
             });
         }
     }
@@ -707,11 +661,10 @@ fn drape_bars(
             b,
             origin: e as u32,
             skin: true,
+            tie: false,
         });
     }
 
-    // Drape subdivision: a chord whose midpoint hangs off the surface by
-    // more than its tolerance splits at the midpoint's own landing.
     let radius_in = mesh
         .element_fields
         .iter()
@@ -725,49 +678,77 @@ fn drape_bars(
             chord / 8.0
         }
     };
-    let mut skin_final: Vec<Seg> = Vec::new();
-    let mut active = skin_active;
-    for depth in 0..=MAX_DRAPE_DEPTH {
-        if active.is_empty() {
-            break;
+    let mut skin_final = subdivide_skin(&mut builder, skin_active, &tol_for, max_distance, occupied)?;
+
+    // Reconnect: if dropping the flat arcs severed the mesh, re-drape
+    // the shortest dropped arcs whose endpoints already landed through
+    // a crossing fold (shared rim vertices), spanning-forest style.
+    let degenerate_eps = 1e-6 * max_distance;
+    let mut tie_anchor_nodes: HashSet<u32> = HashSet::new();
+    if reconnect.is_some_and(|r| r.fix == crate::ConnectivityFix::Reconnect)
+        && !dropped_flats.is_empty()
+    {
+        let node_count = builder.sources.len() as u32;
+        let mut parent: Vec<u32> = (0..node_count).collect();
+        for s in &segs {
+            uf_union(&mut parent, s.a, s.b);
         }
-        if depth == MAX_DRAPE_DEPTH {
-            skin_final.append(&mut active);
-            break;
-        }
-        let info: Vec<([f64; 3], f64)> = active
-            .iter()
-            .map(|s| {
-                let (pa, pb) = (builder.position(s.a), builder.position(s.b));
-                (lerp3(pa, pb, 0.5), dist(pa, pb))
-            })
-            .collect();
-        let landings = project_points(
-            &info.iter().map(|&(m, _)| m).collect::<Vec<_>>(),
-            max_distance,
-            occupied,
-        )?;
-        let mut next = Vec::new();
-        for ((seg, &(mid, chord)), landing) in active.iter().zip(&info).zip(landings) {
-            match landing {
-                Some(l) if dist(l.pos, mid) > tol_for(seg.origin, chord) => {
-                    let k = builder.push(
-                        l.pos,
-                        Source::Mid { i: seg.a, j: seg.b },
-                        Some(l.inward),
-                    );
-                    next.push(Seg { b: k, ..*seg });
-                    next.push(Seg { a: k, ..*seg });
-                }
-                _ => skin_final.push(*seg),
+        // Skin segs count as connections only if they will survive the
+        // degenerate filter below — a fold collapsing to a point must
+        // not hide a severed component from the planner. (Anchors of
+        // the ties planned here are protected from that filter, so a
+        // degenerate fold a tie relies on does survive.)
+        for s in &skin_final {
+            if s.a != s.b && dist(builder.position(s.a), builder.position(s.b)) > degenerate_eps
+            {
+                uf_union(&mut parent, s.a, s.b);
             }
         }
-        active = next;
+        let mut candidates: Vec<(f64, usize, u32, u32)> = dropped_flats
+            .iter()
+            .filter_map(|&e| {
+                let pair = mesh.element(e);
+                let ia = builder.try_moved(pair[0])?;
+                let ib = builder.try_moved(pair[1])?;
+                (uf_find(&mut parent, ia) != uf_find(&mut parent, ib)).then(|| {
+                    (
+                        dist(builder.position(ia), builder.position(ib)),
+                        e,
+                        ia,
+                        ib,
+                    )
+                })
+            })
+            .collect();
+        candidates.sort_by(|x, y| x.0.total_cmp(&y.0));
+        let mut ties_active: Vec<Seg> = Vec::new();
+        for &(_, e, ia, ib) in &candidates {
+            if uf_union(&mut parent, ia, ib) {
+                ties_active.push(Seg {
+                    a: ia,
+                    b: ib,
+                    origin: e as u32,
+                    skin: true,
+                    tie: true,
+                });
+                tie_anchor_nodes.insert(ia);
+                tie_anchor_nodes.insert(ib);
+            }
+        }
+        let mut ties = subdivide_skin(&mut builder, ties_active, &tol_for, max_distance, occupied)?;
+        skin_final.append(&mut ties);
     }
+
     // Degenerate folds (straight-out struts landing on themselves)
-    // collapse to nothing even without a radius field to weld by.
+    // collapse to nothing even without a radius field to weld by —
+    // except ties and the folds anchoring them, which must survive to
+    // the weld so reconnection cannot be severed again.
     skin_final.retain(|s| {
-        s.a != s.b && dist(builder.position(s.a), builder.position(s.b)) > 1e-6 * max_distance
+        s.a != s.b
+            && (s.tie
+                || tie_anchor_nodes.contains(&s.a)
+                || tie_anchor_nodes.contains(&s.b)
+                || dist(builder.position(s.a), builder.position(s.b)) > degenerate_eps)
     });
     segs.extend(skin_final);
 
@@ -805,22 +786,9 @@ fn drape_bars(
             }
         }
     }
-    match element_fields.iter_mut().find(|f| f.name == "skin") {
-        Some(f) if f.components == 1 => {
-            for (k, s) in segs.iter().enumerate() {
-                if s.skin {
-                    f.data[k] = 1.0;
-                }
-            }
-        }
-        Some(_) => {
-            return Err("the input already has a non-scalar 'skin' element field".to_string());
-        }
-        None => element_fields.push(FeaField {
-            name: "skin".to_string(),
-            components: 1,
-            data: segs.iter().map(|s| if s.skin { 1.0 } else { 0.0 }).collect(),
-        }),
+    set_flag_field(&mut element_fields, "skin", &segs, |s| s.skin)?;
+    if reconnect.is_some() {
+        set_flag_field(&mut element_fields, "tie", &segs, |s| s.tie)?;
     }
 
     // Inset: sink every node touching a skin strut below the surface by
@@ -949,11 +917,44 @@ fn drape_bars(
     Ok(out)
 }
 
+/// Set (or create) a scalar 0/1 element field from a per-seg flag.
+fn set_flag_field(
+    element_fields: &mut Vec<FeaField>,
+    name: &str,
+    segs: &[Seg],
+    flag: impl Fn(&Seg) -> bool,
+) -> Result<(), String> {
+    match element_fields.iter_mut().find(|f| f.name == name) {
+        Some(f) if f.components == 1 => {
+            for (k, s) in segs.iter().enumerate() {
+                if flag(s) {
+                    f.data[k] = 1.0;
+                }
+            }
+            Ok(())
+        }
+        Some(_) => Err(format!(
+            "the input already has a non-scalar '{name}' element field"
+        )),
+        None => {
+            element_fields.push(FeaField {
+                name: name.to_string(),
+                components: 1,
+                data: segs
+                    .iter()
+                    .map(|s| if flag(s) { 1.0 } else { 0.0 })
+                    .collect(),
+            });
+            Ok(())
+        }
+    }
+}
+
 fn drape_points(
     mesh: &FeaMesh,
     node_occ: &[bool],
     occupied: &mut OccupiedBatch,
-    config: &DrapeConfig,
+    config: &SurfaceConfig,
     max_distance: f64,
 ) -> Result<FeaMesh, String> {
     let mut working = mesh.clone();
@@ -1024,7 +1025,7 @@ fn drape_points(
     Ok(out)
 }
 
-fn resolve_max_distance(mesh: &FeaMesh, config: &DrapeConfig) -> Result<f64, String> {
+fn resolve_max_distance(mesh: &FeaMesh, config: &SurfaceConfig) -> Result<f64, String> {
     if config.max_distance > 0.0 {
         return Ok(config.max_distance);
     }
@@ -1063,163 +1064,39 @@ fn resolve_max_distance(mesh: &FeaMesh, config: &DrapeConfig) -> Result<f64, Str
     }
 }
 
-/// Shared entry for host and tests: classify nodes, resolve the reach,
-/// dispatch by element kind.
-fn drape(
+/// The surface pass: classify nodes, resolve the reach, dispatch by
+/// element kind. `reconnect` enables re-draping dropped arcs when the
+/// connectivity requirement is present.
+pub(crate) fn drape(
     mesh: &FeaMesh,
     occupied: &mut OccupiedBatch,
-    config: &DrapeConfig,
+    config: &SurfaceConfig,
+    reconnect: Option<&ConnectivityConfig>,
 ) -> Result<FeaMesh, String> {
-    if mesh.element_count() == 0 {
-        return Err("the input mesh has no elements".to_string());
-    }
     let max_distance = resolve_max_distance(mesh, config)?;
-    let node_points: Vec<[f64; 3]> = (0..mesh.node_count()).map(|n| mesh.node_position(n)).collect();
+    let node_points: Vec<[f64; 3]> =
+        (0..mesh.node_count()).map(|n| mesh.node_position(n)).collect();
     let node_occ = occupied(&node_points)?;
     match mesh.element_kind {
         FeaElementKind::Point1 => drape_points(mesh, &node_occ, occupied, config, max_distance),
-        FeaElementKind::Bar2 => drape_bars(mesh, &node_occ, occupied, config, max_distance),
+        FeaElementKind::Bar2 => {
+            drape_bars(mesh, &node_occ, occupied, config, reconnect, max_distance)
+        }
         kind => Err(format!(
             "cannot drape {kind:?} volume elements onto a surface; clip them instead"
         )),
     }
 }
 
-fn validate_config(config: &DrapeConfig) -> Result<(), String> {
-    if !(config.skin_radius_factor.is_finite() && config.skin_radius_factor > 0.0) {
-        return Err(format!(
-            "skin_radius_factor must be positive, got {}",
-            config.skin_radius_factor
-        ));
-    }
-    for (name, v) in [
-        ("chord_tolerance", config.chord_tolerance),
-        ("inset_factor", config.inset_factor),
-        ("max_distance", config.max_distance),
-        ("weld_factor", config.weld_factor),
-    ] {
-        if !(v.is_finite() && v >= 0.0) {
-            return Err(format!("{name} must be non-negative, got {v}"));
-        }
-    }
-    Ok(())
-}
-
-fn build_draped(config: &DrapeConfig) -> Result<FeaMesh, String> {
-    validate_config(config)?;
-    let mesh = decode_fea_mesh(&read_input(0))?;
-    let dims =
-        input_model_dimensions(1).ok_or_else(|| "input 1 is not a usable model".to_string())?;
-    if dims != 3 {
-        return Err(format!(
-            "mesh drape needs a 3D model; input has {dims} dimensions"
-        ));
-    }
-    let mut occupied = |points: &[[f64; 3]]| -> Result<Vec<bool>, String> {
-        let mut out = Vec::with_capacity(points.len());
-        for chunk in points.chunks(SAMPLE_CHUNK) {
-            let positions: Vec<f64> = chunk.iter().flatten().copied().collect();
-            let samples = input_model_sample(1, &positions, 3)
-                .ok_or_else(|| "sampling the model failed".to_string())?;
-            out.extend(samples.iter().map(|&s| is_occupied(s)));
-        }
-        Ok(out)
-    };
-    drape(&mesh, &mut occupied, config)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn run() {
-    let config = {
-        let buf = read_input(2);
-        if buf.is_empty() {
-            DrapeConfig::default()
-        } else {
-            match ciborium::de::from_reader(std::io::Cursor::new(&buf)) {
-                Ok(config) => config,
-                Err(e) => {
-                    report_error(&format!("invalid configuration: {e}"));
-                    return;
-                }
-            }
-        }
-    };
-
-    match build_draped(&config) {
-        Ok(mesh) => post_output(0, &encode_fea_mesh(&mesh)),
-        Err(e) => report_error(&format!("mesh drape failed: {e}")),
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn get_metadata() -> i64 {
-    static METADATA: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-    volumetric_abi::metadata_reply(&METADATA, || {
-        let schema = r#"{ outside: "project" / "drop" .default "project", skin_radius_factor: float .default 1.0, chord_tolerance: float .default 0.0, inset_factor: float .default 0.0, max_distance: float .default 0.0, weld_factor: float .default 1.0 }"#
-            .to_string();
-        OperatorMetadata {
-            name: "mesh_drape_operator".to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            display_name: "Mesh Drape".to_string(),
-            description: "Project the struts of a lattice that protrude outside a model \
-                          onto its surface: protruding arcs fold flat into a smooth, \
-                          compliance-tunable skin."
-                .to_string(),
-            category: "Mesh".to_string(),
-            icon_svg: volumetric_abi::icon_svg!(
-                r##"<path d="M3 18c3.5-8.5 14.5-8.5 18 0"/>"##,
-                r##"<path d="M13.5 4.5 11.7 9.9"/>"##,
-                r##"<path d="M11.7 9.9 15.5 11.3"/>"##,
-                r##"<path d="M8 20l2.7-5.3"/>"##,
-                r##"<circle cx="11.7" cy="9.9" r=".4"/>"##,
-            )
-            .to_string(),
-            inputs: vec![
-                OperatorMetadataInput::FeaMesh,
-                OperatorMetadataInput::ModelWASM,
-                OperatorMetadataInput::CBORConfiguration(schema),
-            ],
-            input_names: vec![
-                "Mesh".to_string(),
-                "Surface".to_string(),
-                "Config".to_string(),
-            ],
-            outputs: vec![OperatorMetadataOutput::FeaMesh],
-        }
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Occupancy oracle for a sphere of radius `r` at the origin.
-    fn sphere(r: f64) -> impl FnMut(&[[f64; 3]]) -> Result<Vec<bool>, String> {
-        move |points| {
-            Ok(points
-                .iter()
-                .map(|p| p.iter().map(|c| c * c).sum::<f64>() < r * r)
-                .collect())
-        }
-    }
+    use crate::tests::{bar_mesh, component_count, sphere};
+    use crate::{ConnectivityFix, norm};
 
     /// Occupancy oracle for the half-space z < 0.
     fn floor() -> impl FnMut(&[[f64; 3]]) -> Result<Vec<bool>, String> {
         move |points| Ok(points.iter().map(|p| p[2] < 0.0).collect())
-    }
-
-    fn bar_mesh(nodes: &[[f64; 3]], bars: &[[u32; 2]], radius: f64) -> FeaMesh {
-        FeaMesh {
-            element_kind: FeaElementKind::Bar2,
-            node_positions: nodes.iter().flatten().copied().collect(),
-            connectivity: bars.iter().flatten().copied().collect(),
-            node_fields: vec![],
-            element_fields: vec![FeaField {
-                name: "radius".to_string(),
-                components: 1,
-                data: vec![radius; bars.len()],
-            }],
-        }
     }
 
     fn positions(mesh: &FeaMesh) -> Vec<[f64; 3]> {
@@ -1237,10 +1114,10 @@ mod tests {
     fn project_points_lands_on_the_surface_from_both_sides() {
         let mut oracle = sphere(1.0);
         let points = [
-            [0.0, 0.0, 1.5],   // outside, above the pole
-            [0.9, 0.7, -0.4],  // outside, oblique
-            [0.0, 0.0, 0.4],   // inside
-            [0.0, 0.0, 5.0],   // far out of reach
+            [0.0, 0.0, 1.5],  // outside, above the pole
+            [0.9, 0.7, -0.4], // outside, oblique
+            [0.0, 0.0, 0.4],  // inside
+            [0.0, 0.0, 5.0],  // far out of reach
         ];
         let landings = project_points(&points, 1.0, &mut oracle).unwrap();
 
@@ -1270,7 +1147,7 @@ mod tests {
             0.05,
         );
         let mut oracle = sphere(1.0);
-        let out = drape(&mesh, &mut oracle, &DrapeConfig::default()).unwrap();
+        let out = drape(&mesh, &mut oracle, &SurfaceConfig::default(), None).unwrap();
 
         assert_eq!(out.element_count(), 2, "bulk strut + surface stub");
         assert!(
@@ -1294,11 +1171,11 @@ mod tests {
         // it hugs the surface to within the strut radius.
         let mesh = bar_mesh(&[[-0.6, 0.0, 1.1], [0.6, 0.0, 1.1]], &[[0, 1]], 0.01);
         let mut oracle = sphere(1.0);
-        let config = DrapeConfig {
+        let config = SurfaceConfig {
             skin_radius_factor: 0.5,
-            ..DrapeConfig::default()
+            ..SurfaceConfig::default()
         };
-        let out = drape(&mesh, &mut oracle, &config).unwrap();
+        let out = drape(&mesh, &mut oracle, &config, None).unwrap();
 
         assert!(
             out.element_count() >= 4,
@@ -1332,20 +1209,20 @@ mod tests {
     #[test]
     fn outside_drop_removes_arcs_but_still_folds_rims() {
         let nodes = [
-            [0.5, 0.0, 0.5],   // inside
-            [1.2, 0.0, 0.5],   // outside (crossing partner)
-            [0.0, 1.05, 0.3],  // outside (flat strut)
-            [0.3, 1.05, 0.3],  // outside (flat strut)
+            [0.5, 0.0, 0.5],  // inside
+            [1.2, 0.0, 0.5],  // outside (crossing partner)
+            [0.0, 1.05, 0.3], // outside (flat strut)
+            [0.3, 1.05, 0.3], // outside (flat strut)
         ];
         let bars = [[0, 1], [2, 3]];
         let mesh = bar_mesh(&nodes, &bars, 0.02);
 
         let mut oracle = sphere(1.0);
-        let config = DrapeConfig {
+        let config = SurfaceConfig {
             outside: OutsideConfig::Drop,
-            ..DrapeConfig::default()
+            ..SurfaceConfig::default()
         };
-        let dropped = drape(&mesh, &mut oracle, &config).unwrap();
+        let dropped = drape(&mesh, &mut oracle, &config, None).unwrap();
         assert_eq!(
             dropped.element_count(),
             2,
@@ -1356,7 +1233,7 @@ mod tests {
         assert_eq!(skin.data.iter().filter(|&&s| s == 1.0).count(), 1);
 
         let mut oracle = sphere(1.0);
-        let projected = drape(&mesh, &mut oracle, &DrapeConfig::default()).unwrap();
+        let projected = drape(&mesh, &mut oracle, &SurfaceConfig::default(), None).unwrap();
         assert!(
             projected.element_count() > dropped.element_count(),
             "project mode keeps the draped arc"
@@ -1367,6 +1244,62 @@ mod tests {
             .filter(|p| (norm(**p) - 1.0).abs() < 1e-4)
             .count();
         assert!(on_surface >= 3, "flat strut + crossing land on the surface");
+    }
+
+    #[test]
+    fn dropped_arcs_reconnect_severed_components() {
+        // Two inside clusters, each crossing out through a rim vertex,
+        // tied together only by an outside arc between those vertices.
+        // Drop severs them; reconnect re-drapes the dropped arc as a tie.
+        let nodes = [
+            [0.3, 0.0, 0.5],  // inside A
+            [0.3, 0.0, 1.2],  // outside, rim vertex of A
+            [-0.3, 0.0, 0.5], // inside B
+            [-0.3, 0.0, 1.2], // outside, rim vertex of B
+        ];
+        let bars = [[0, 1], [2, 3], [1, 3]];
+        let mesh = bar_mesh(&nodes, &bars, 0.02);
+        let config = SurfaceConfig {
+            outside: OutsideConfig::Drop,
+            ..SurfaceConfig::default()
+        };
+
+        let mut oracle = sphere(1.0);
+        let severed = drape(&mesh, &mut oracle, &config, None).unwrap();
+        assert_eq!(component_count(&severed), 2, "drop alone severs the mesh");
+        assert!(
+            severed.element_fields.iter().all(|f| f.name != "tie"),
+            "no tie field without the connectivity requirement"
+        );
+
+        let mut oracle = sphere(1.0);
+        let reconnect = ConnectivityConfig::default();
+        let out = drape(&mesh, &mut oracle, &config, Some(&reconnect)).unwrap();
+        assert_eq!(component_count(&out), 1, "the tie rejoins the clusters");
+        let tie = field(&out, "tie");
+        let skin = field(&out, "skin");
+        let ties: Vec<usize> = (0..out.element_count())
+            .filter(|&e| tie.data[e] == 1.0)
+            .collect();
+        assert!(!ties.is_empty(), "the dropped arc came back as a tie");
+        for &e in &ties {
+            assert_eq!(skin.data[e], 1.0, "ties are draped skin");
+        }
+        // The tie hugs the sphere: every tie node sits on the surface.
+        for &e in &ties {
+            for &n in out.element(e) {
+                let r = norm(out.node_position(n as usize));
+                assert!((r - 1.0).abs() < 2e-2, "tie node off the surface: {r}");
+            }
+        }
+        // Prune mode must NOT re-drape ties.
+        let mut oracle = sphere(1.0);
+        let prune = ConnectivityConfig {
+            fix: ConnectivityFix::Prune,
+            ..ConnectivityConfig::default()
+        };
+        let out = drape(&mesh, &mut oracle, &config, Some(&prune)).unwrap();
+        assert_eq!(component_count(&out), 2, "prune leaves severing to connect::enforce");
     }
 
     #[test]
@@ -1392,11 +1325,11 @@ mod tests {
             data: vec![7.0, 9.0],
         });
         let mut oracle = sphere(1.0);
-        let config = DrapeConfig {
+        let config = SurfaceConfig {
             weld_factor: 0.0, // keep every node so sources stay inspectable
-            ..DrapeConfig::default()
+            ..SurfaceConfig::default()
         };
-        let out = drape(&mesh, &mut oracle, &config).unwrap();
+        let out = drape(&mesh, &mut oracle, &config, None).unwrap();
 
         let score = out.node_fields.iter().find(|f| f.name == "score").unwrap();
         assert_eq!(score.data.len(), out.node_count());
@@ -1443,11 +1376,11 @@ mod tests {
         ];
         let mesh = bar_mesh(&nodes, &[[0, 1], [2, 3]], 0.05);
         let mut oracle = floor();
-        let config = DrapeConfig {
+        let config = SurfaceConfig {
             inset_factor: 1.0,
-            ..DrapeConfig::default()
+            ..SurfaceConfig::default()
         };
-        let out = drape(&mesh, &mut oracle, &config).unwrap();
+        let out = drape(&mesh, &mut oracle, &config, None).unwrap();
 
         let skin = field(&out, "skin");
         let mut skin_nodes = std::collections::HashSet::new();
@@ -1481,12 +1414,12 @@ mod tests {
             node_fields: vec![],
             element_fields: vec![],
         };
-        let config = DrapeConfig {
+        let config = SurfaceConfig {
             max_distance: 1.0,
-            ..DrapeConfig::default()
+            ..SurfaceConfig::default()
         };
         let mut oracle = sphere(1.0);
-        let out = drape(&cloud, &mut oracle, &config).unwrap();
+        let out = drape(&cloud, &mut oracle, &config, None).unwrap();
         assert_eq!(out.element_count(), 2, "far point drops");
         assert_eq!(field(&out, "skin").data, vec![0.0, 1.0]);
         let landed = positions(&out)
@@ -1498,10 +1431,11 @@ mod tests {
         let dropped = drape(
             &cloud,
             &mut oracle,
-            &DrapeConfig {
+            &SurfaceConfig {
                 outside: OutsideConfig::Drop,
                 ..config
             },
+            None,
         )
         .unwrap();
         assert_eq!(dropped.element_count(), 1, "only the inside point stays");
@@ -1525,24 +1459,12 @@ mod tests {
             node_fields: vec![],
             element_fields: vec![],
         };
-        let err = drape(&hex, &mut floor(), &DrapeConfig::default()).unwrap_err();
+        let err = drape(&hex, &mut floor(), &SurfaceConfig::default(), None).unwrap_err();
         assert!(err.contains("volume elements"), "unexpected error: {err}");
 
         // A mesh entirely out of reach fails loudly, not silently.
         let mesh = bar_mesh(&[[0.0, 0.0, 5.0], [0.4, 0.0, 5.0]], &[[0, 1]], 0.01);
-        let err = drape(&mesh, &mut sphere(1.0), &DrapeConfig::default()).unwrap_err();
+        let err = drape(&mesh, &mut sphere(1.0), &SurfaceConfig::default(), None).unwrap_err();
         assert!(err.contains("nothing survived"), "unexpected error: {err}");
-
-        // Config validation.
-        let bad = DrapeConfig {
-            skin_radius_factor: 0.0,
-            ..DrapeConfig::default()
-        };
-        assert!(validate_config(&bad).is_err());
-        let bad = DrapeConfig {
-            inset_factor: -1.0,
-            ..DrapeConfig::default()
-        };
-        assert!(validate_config(&bad).is_err());
     }
 }
