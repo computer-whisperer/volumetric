@@ -5673,6 +5673,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "voronoi_skeleton_operator"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "lattice_model_core",
+ "mesh_edit_core",
+ "serde",
+ "volumetric_abi",
+]
+
+[[package]]
 name = "voxelmask_model_core"
 version = "0.1.0"
 

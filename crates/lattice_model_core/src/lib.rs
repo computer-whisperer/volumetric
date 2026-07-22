@@ -18,7 +18,9 @@
 //! Calibrating per-family `d -> parameter` curves (so printed foam density
 //! matches the FEA-requested density) is expected follow-up work.
 
+mod cell;
 pub mod skeleton;
+pub mod voronoi;
 
 /// The lattice families the operator offers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

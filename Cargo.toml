@@ -54,6 +54,7 @@ members = [
     "crates/operators/mesh_clip_operator",
     "crates/operators/point_fill_operator",
     "crates/operators/strut_pattern_operator",
+    "crates/operators/voronoi_skeleton_operator",
     "crates/strut_model_core",
     "crates/strut_model_template",
     "crates/operators/strut_model_operator",
