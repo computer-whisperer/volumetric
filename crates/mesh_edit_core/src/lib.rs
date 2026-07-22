@@ -232,6 +232,154 @@ pub fn largest_bar_component(mesh: &FeaMesh) -> Result<FeaMesh, String> {
     filter_elements(mesh, &keep)
 }
 
+/// Concatenate same-kind meshes: nodes, elements, and fields in input
+/// order (connectivity offset per part). Only fields present in *every*
+/// part — same name, same component count, same container — survive;
+/// the rest are dropped rather than padded with invented values. Field
+/// order follows the first part.
+pub fn concat_meshes(meshes: &[&FeaMesh]) -> Result<FeaMesh, String> {
+    let Some(first) = meshes.first() else {
+        return Err("nothing to merge (no meshes)".to_string());
+    };
+    let kind = first.element_kind;
+    if let Some(other) = meshes.iter().find(|m| m.element_kind != kind) {
+        return Err(format!(
+            "cannot merge meshes of different element kinds ({kind:?} and {:?})",
+            other.element_kind
+        ));
+    }
+
+    let mut node_positions = Vec::new();
+    let mut connectivity = Vec::new();
+    for m in meshes {
+        let offset = (node_positions.len() / 3) as u32;
+        node_positions.extend_from_slice(&m.node_positions);
+        connectivity.extend(m.connectivity.iter().map(|&n| n + offset));
+    }
+
+    let common = |pick: fn(&FeaMesh) -> &Vec<FeaField>| -> Vec<FeaField> {
+        pick(first)
+            .iter()
+            .filter(|f| {
+                meshes.iter().all(|m| {
+                    pick(m)
+                        .iter()
+                        .any(|g| g.name == f.name && g.components == f.components)
+                })
+            })
+            .map(|f| FeaField {
+                name: f.name.clone(),
+                components: f.components,
+                data: meshes
+                    .iter()
+                    .flat_map(|m| {
+                        pick(m)
+                            .iter()
+                            .find(|g| g.name == f.name)
+                            .expect("filtered to common fields")
+                            .data
+                            .iter()
+                            .copied()
+                    })
+                    .collect(),
+            })
+            .collect()
+    };
+
+    let mesh = FeaMesh {
+        element_kind: kind,
+        node_positions,
+        connectivity,
+        node_fields: common(|m| &m.node_fields),
+        element_fields: common(|m| &m.element_fields),
+    };
+    mesh.validate()?;
+    Ok(mesh)
+}
+
+/// Weld nodes lying within `tolerance` of each other into their first
+/// occurrence (positions and node fields both take the representative's
+/// values — the weld is for stitching coincident duplicates, not for
+/// moving geometry). Elements are remapped; Bar2 self-loops and exact
+/// duplicate elements (same node set) are dropped, with their element
+/// fields, and unreferenced nodes compact away.
+pub fn weld_coincident_nodes(mesh: &FeaMesh, tolerance: f64) -> Result<FeaMesh, String> {
+    if !(tolerance.is_finite() && tolerance > 0.0) {
+        return Err(format!("weld tolerance must be positive, got {tolerance}"));
+    }
+    // Representative per node: the first node within tolerance, via a
+    // tolerance-sized grid hash (27 buckets cover every candidate).
+    let mut buckets: std::collections::HashMap<[i64; 3], Vec<u32>> =
+        std::collections::HashMap::new();
+    let mut rep = vec![u32::MAX; mesh.node_count()];
+    for n in 0..mesh.node_count() {
+        let p = mesh.node_position(n);
+        let key: [i64; 3] = core::array::from_fn(|a| (p[a] / tolerance).floor() as i64);
+        'search: for dz in -1..=1i64 {
+            for dy in -1..=1i64 {
+                for dx in -1..=1i64 {
+                    let k = [key[0] + dx, key[1] + dy, key[2] + dz];
+                    if let Some(ids) = buckets.get(&k) {
+                        for &id in ids {
+                            let q = mesh.node_position(id as usize);
+                            let d2: f64 = (0..3).map(|a| (p[a] - q[a]).powi(2)).sum();
+                            if d2 < tolerance * tolerance {
+                                rep[n] = id;
+                                break 'search;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if rep[n] == u32::MAX {
+            rep[n] = n as u32;
+            buckets.entry(key).or_default().push(n as u32);
+        }
+    }
+
+    // Surviving elements: remapped, minus Bar2 self-loops and exact
+    // duplicates by (sorted) node set.
+    let mut seen: std::collections::HashSet<Vec<u32>> = std::collections::HashSet::new();
+    let mut keep_elements: Vec<u32> = Vec::new();
+    let mut remapped: Vec<u32> = Vec::new();
+    for e in 0..mesh.element_count() {
+        let nodes: Vec<u32> = mesh.element(e).iter().map(|&n| rep[n as usize]).collect();
+        if mesh.element_kind == volumetric_abi::fea::FeaElementKind::Bar2 && nodes[0] == nodes[1]
+        {
+            continue;
+        }
+        let mut key = nodes.clone();
+        key.sort_unstable();
+        if !seen.insert(key) {
+            continue;
+        }
+        keep_elements.push(e as u32);
+        remapped.extend(nodes);
+    }
+
+    // Compact representative nodes on first use.
+    let mut node_remap = vec![u32::MAX; mesh.node_count()];
+    let mut kept_nodes: Vec<u32> = Vec::new();
+    let mut connectivity = Vec::with_capacity(remapped.len());
+    for node in remapped {
+        if node_remap[node as usize] == u32::MAX {
+            node_remap[node as usize] = kept_nodes.len() as u32;
+            kept_nodes.push(node);
+        }
+        connectivity.push(node_remap[node as usize]);
+    }
+    let mesh = FeaMesh {
+        element_kind: mesh.element_kind,
+        node_positions: gather(&mesh.node_positions, 3, &kept_nodes),
+        connectivity,
+        node_fields: gather_fields(&mesh.node_fields, &kept_nodes),
+        element_fields: gather_fields(&mesh.element_fields, &keep_elements),
+    };
+    mesh.validate()?;
+    Ok(mesh)
+}
+
 /// Path-halving union-find lookup.
 fn find(parent: &mut [u32], mut x: u32) -> u32 {
     while parent[x as usize] != x {
@@ -408,6 +556,89 @@ mod tests {
         assert!(weights.iter().any(|&w| (w - 3.0).abs() < 1e-12));
         // ...and the surviving struts keep their own radii.
         assert_eq!(welded.element_fields[0].data, vec![0.001, 0.001]);
+    }
+
+    #[test]
+    fn concatenation_offsets_and_intersects_fields() {
+        let a = FeaMesh {
+            element_kind: FeaElementKind::Point1,
+            node_positions: vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            connectivity: vec![0, 1],
+            node_fields: vec![
+                FeaField {
+                    name: "weight".to_string(),
+                    components: 1,
+                    data: vec![1.0, 2.0],
+                },
+                FeaField {
+                    name: "only_in_a".to_string(),
+                    components: 1,
+                    data: vec![9.0, 9.0],
+                },
+            ],
+            element_fields: vec![],
+        };
+        let b = FeaMesh {
+            element_kind: FeaElementKind::Point1,
+            node_positions: vec![5.0, 0.0, 0.0],
+            connectivity: vec![0],
+            node_fields: vec![FeaField {
+                name: "weight".to_string(),
+                components: 1,
+                data: vec![3.0],
+            }],
+            element_fields: vec![],
+        };
+        let merged = concat_meshes(&[&a, &b]).unwrap();
+        assert_eq!(merged.node_count(), 3);
+        assert_eq!(merged.connectivity, vec![0, 1, 2]);
+        assert_eq!(merged.node_fields.len(), 1, "only the common field survives");
+        assert_eq!(merged.node_fields[0].data, vec![1.0, 2.0, 3.0]);
+
+        let bars = bar_mesh(vec![0.0; 6], vec![0, 1]);
+        let err = concat_meshes(&[&a, &bars]).unwrap_err();
+        assert!(err.contains("different element kinds"), "{err}");
+        assert!(concat_meshes(&[]).is_err());
+    }
+
+    #[test]
+    fn coincident_welding_stitches_and_dedupes() {
+        // Two 2-strut chains sharing a coincident middle joint (within
+        // tolerance), plus an exact duplicate strut.
+        let mesh = bar_mesh(
+            vec![
+                0.0, 0.0, 0.0, //
+                1.0, 0.0, 0.0, //
+                1.0, 1e-9, 0.0, // coincides with node 1
+                2.0, 0.0, 0.0, //
+                0.0, 0.0, 0.0, // coincides with node 0
+            ],
+            vec![0, 1, 2, 3, 4, 1],
+        );
+        let welded = weld_coincident_nodes(&mesh, 1e-6).unwrap();
+        // Node 2 -> 1 and node 4 -> 0; strut (4,1) becomes duplicate of
+        // (0,1) and drops.
+        assert_eq!(welded.node_count(), 3);
+        assert_eq!(welded.element_count(), 2);
+
+        // Point clouds dedupe coincident points the same way.
+        let cloud = FeaMesh {
+            element_kind: FeaElementKind::Point1,
+            node_positions: vec![0.0, 0.0, 0.0, 5e-7, 0.0, 0.0, 3.0, 0.0, 0.0],
+            connectivity: vec![0, 1, 2],
+            node_fields: vec![FeaField {
+                name: "weight".to_string(),
+                components: 1,
+                data: vec![1.0, 2.0, 3.0],
+            }],
+            element_fields: vec![],
+        };
+        let welded = weld_coincident_nodes(&cloud, 1e-6).unwrap();
+        assert_eq!(welded.element_count(), 2);
+        // First occurrence wins, fields follow it.
+        assert_eq!(welded.node_fields[0].data, vec![1.0, 3.0]);
+
+        assert!(weld_coincident_nodes(&cloud, 0.0).is_err());
     }
 
     #[test]

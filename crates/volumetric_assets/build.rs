@@ -45,6 +45,8 @@ const OPERATORS: &[&str] = &[
     "mesh_height_operator",
     "lattice_operator",
     "mesh_clip_operator",
+    "mesh_merge_operator",
+    "mesh_transform_operator",
     "point_fill_operator",
     "strut_pattern_operator",
     "voronoi_skeleton_operator",

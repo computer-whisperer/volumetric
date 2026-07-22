@@ -52,6 +52,8 @@ members = [
     "crates/operators/lattice_operator",
     "crates/mesh_edit_core",
     "crates/operators/mesh_clip_operator",
+    "crates/operators/mesh_merge_operator",
+    "crates/operators/mesh_transform_operator",
     "crates/operators/point_fill_operator",
     "crates/operators/strut_pattern_operator",
     "crates/operators/voronoi_skeleton_operator",

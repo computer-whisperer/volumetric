@@ -3007,12 +3007,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "mesh_merge_operator"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "mesh_edit_core",
+ "serde",
+ "volumetric_abi",
+]
+
+[[package]]
 name = "mesh_to_model_operator"
 version = "0.1.0"
 dependencies = [
  "trimesh_model_core",
  "volumetric_abi",
  "walrus",
+]
+
+[[package]]
+name = "mesh_transform_operator"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "serde",
+ "volumetric_abi",
 ]
 
 [[package]]
