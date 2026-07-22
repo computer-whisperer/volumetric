@@ -1185,10 +1185,12 @@ mod tests {
         });
 
         // Wait on the result channel with a generous ceiling rather than a tight
-        // fixed poll: a constrained CI runner can take seconds to schedule the
-        // worker thread, but we still return the instant the result lands.
+        // fixed poll: a constrained CI runner can take minutes to schedule the
+        // worker thread when heavyweight neighbors (operator wasm compiles) run
+        // on the sibling test threads, but we still return the instant the
+        // result lands. The ceiling exists only to turn a hang into a failure.
         let mut completion = None;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
         while completion.is_none() {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
@@ -1236,10 +1238,13 @@ mod tests {
 
         // Generous wall-clock ceiling rather than a tight fixed poll: the
         // thumbnail runs on its own thread, but a constrained CI runner can
-        // starve it for seconds. We still break the instant it lands, and a
-        // premature ProjectComplete still trips the release-barrier guard.
+        // starve it for minutes while sibling test threads compile bundled
+        // operators (observed >60s on the 2026-07 runner once the point-cloud
+        // operator fleet landed). The lane-independence claim doesn't live
+        // here — a premature ProjectComplete still trips the release-barrier
+        // guard — so the ceiling exists only to turn a hang into a failure.
         let mut thumbnail = None;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
         while thumbnail.is_none() {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
