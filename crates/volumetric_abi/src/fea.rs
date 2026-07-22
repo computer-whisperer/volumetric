@@ -36,6 +36,11 @@ pub enum FeaElementKind {
     /// cross-section data (e.g. a scalar `radius` field) rides in
     /// `element_fields`.
     Bar2,
+    /// 1-node point element (VTK vertex): a Point1 mesh is a point cloud —
+    /// e.g. the site set feeding Voronoi lattice generation. Per-point data
+    /// (weights, radii) rides in `node_fields`/`element_fields`; the FEA
+    /// solvers reject it (points carry no stiffness).
+    Point1,
 }
 
 impl FeaElementKind {
@@ -44,6 +49,7 @@ impl FeaElementKind {
         match self {
             FeaElementKind::Hex8 => 8,
             FeaElementKind::Bar2 => 2,
+            FeaElementKind::Point1 => 1,
         }
     }
 }
@@ -385,6 +391,36 @@ mod tests {
         mesh.connectivity[3] = mesh.connectivity[2]; // self-loop
         let err = mesh.validate().unwrap_err();
         assert!(err.contains("self-loop"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn point1_meshes_round_trip_and_validate() {
+        let mesh = FeaMesh {
+            element_kind: FeaElementKind::Point1,
+            node_positions: vec![
+                0.0, 0.0, 0.0, //
+                1.0, 0.0, 0.0, //
+                0.5, 1.0, 0.5,
+            ],
+            connectivity: vec![0, 1, 2],
+            node_fields: vec![FeaField {
+                name: "weight".to_string(),
+                components: 1,
+                data: vec![1.0, 2.0, 0.5],
+            }],
+            element_fields: vec![],
+        };
+        let decoded = decode_fea_mesh(&encode_fea_mesh(&mesh)).unwrap();
+        assert_eq!(decoded, mesh);
+        assert_eq!(decoded.node_count(), 3);
+        assert_eq!(decoded.element_count(), 3);
+        assert_eq!(decoded.element(2), &[2]);
+        // Point clouds have no boundary faces.
+        assert!(decoded.boundary_faces().is_empty());
+
+        let mut bad = mesh.clone();
+        bad.connectivity[1] = 9; // out-of-range node
+        assert!(bad.validate().is_err());
     }
 
     #[test]

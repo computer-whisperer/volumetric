@@ -3396,6 +3396,76 @@ fn build_fea_mesh_preview(
         }
     }
 
+    // Point1 clouds: one small octahedron marker per point, sized from
+    // the typical per-point volume so the cloud reads at any scale.
+    // Very large clouds are stride-decimated for the preview only (the
+    // full data still flows downstream); the detail line reports it.
+    let mut point_preview_note = None;
+    if mesh.element_kind == volumetric::fea::FeaElementKind::Point1 {
+        const MAX_MARKERS: usize = 150_000;
+        let count = mesh.element_count();
+        let stride = count.div_ceil(MAX_MARKERS).max(1);
+        if stride > 1 {
+            point_preview_note = Some(format!(
+                "preview shows {} of {count} points",
+                count.div_ceil(stride)
+            ));
+        }
+
+        // Extents from the (undeformed-independent) node positions.
+        let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+        for n in 0..mesh.node_count() {
+            let p = position(n as u32);
+            for a in 0..3 {
+                lo[a] = lo[a].min(p[a]);
+                hi[a] = hi[a].max(p[a]);
+            }
+        }
+        let extent: [f32; 3] = std::array::from_fn(|a| (hi[a] - lo[a]).max(0.0));
+        let volume = extent.iter().product::<f32>();
+        let spacing = if volume > 0.0 {
+            (volume / count.max(1) as f32).cbrt()
+        } else {
+            // Degenerate (coplanar/collinear/single) clouds: fall back to
+            // the largest extent, or unit scale for a single point.
+            let longest = extent.iter().cloned().fold(0.0f32, f32::max);
+            if longest > 0.0 { longest / 20.0 } else { 1.0 }
+        };
+        let radius = (spacing * 0.15).max(1e-6);
+
+        // Octahedron: 6 vertices, 8 faces, flat-shaded by face normal.
+        const AXES: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        for e in (0..count).step_by(stride) {
+            let node = mesh.element(e)[0];
+            let c = Vec3::from(position(node));
+            let color = match &color_source {
+                Some(ColorSource::Node(values)) => color_for(values[node as usize]),
+                Some(ColorSource::Element(values)) => color_for(values[e]),
+                None => [0.82, 0.85, 0.9, 1.0],
+            };
+            for sx in [1.0f32, -1.0] {
+                for sy in [1.0f32, -1.0] {
+                    for sz in [1.0f32, -1.0] {
+                        let x = c + Vec3::from(AXES[0]) * (radius * sx);
+                        let y = c + Vec3::from(AXES[1]) * (radius * sy);
+                        let z = c + Vec3::from(AXES[2]) * (radius * sz);
+                        // Wind outward: flip vertex order for negative-
+                        // parity octants.
+                        let (a, b) = if sx * sy * sz > 0.0 { (y, z) } else { (z, y) };
+                        let normal = ((a - x).cross(b - x)).normalize_or_zero();
+                        for p in [x, a, b] {
+                            vertices.push(renderer::MeshVertex::colored(
+                                p.to_array(),
+                                normal.to_array(),
+                                color,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let mut bounds = PreviewBounds {
         min: (f32::INFINITY, f32::INFINITY, f32::INFINITY),
         max: (f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY),
@@ -3420,22 +3490,23 @@ fn build_fea_mesh_preview(
         };
     }
 
-    let mut detail = vec![
-        if mesh.element_kind == volumetric::fea::FeaElementKind::Bar2 {
-            format!(
-                "FEA strut mesh: {} nodes · {} struts",
-                mesh.node_count(),
-                mesh.element_count()
-            )
-        } else {
-            format!(
-                "FEA mesh: {} nodes · {} elements · {} boundary faces",
-                mesh.node_count(),
-                mesh.element_count(),
-                faces.len()
-            )
-        },
-    ];
+    let mut detail = vec![match mesh.element_kind {
+        volumetric::fea::FeaElementKind::Bar2 => format!(
+            "FEA strut mesh: {} nodes · {} struts",
+            mesh.node_count(),
+            mesh.element_count()
+        ),
+        volumetric::fea::FeaElementKind::Point1 => {
+            format!("Point cloud: {} points", mesh.element_count())
+        }
+        volumetric::fea::FeaElementKind::Hex8 => format!(
+            "FEA mesh: {} nodes · {} elements · {} boundary faces",
+            mesh.node_count(),
+            mesh.element_count(),
+            faces.len()
+        ),
+    }];
+    detail.extend(point_preview_note);
     detail.extend(extra_detail);
     let stats = OutputStats {
         triangles: vertices.len() / 3,
@@ -4617,6 +4688,48 @@ function get_bounds_max_y() return 1.5 end
             panic!("junk must fail");
         };
         assert!(err.contains("FEA mesh"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn point1_outputs_get_a_marker_preview() {
+        use volumetric::fea::{FeaElementKind, FeaField, FeaMesh, encode_fea_mesh};
+
+        // Three points on the x axis, with a colormappable weight field.
+        let mesh = FeaMesh {
+            element_kind: FeaElementKind::Point1,
+            node_positions: vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 2.0, 0.0, 0.0],
+            connectivity: vec![0, 1, 2],
+            node_fields: vec![FeaField {
+                name: "weight".to_string(),
+                components: 1,
+                data: vec![0.0, 0.5, 1.0],
+            }],
+            element_fields: vec![],
+        };
+        let mut req = request("points", 64);
+        req.data = Arc::new(encode_fea_mesh(&mesh));
+        req.type_hint = Some(AssetTypeHint::FeaMesh);
+        let entity = build_preview_scene(&req).expect("point cloud preview");
+
+        // One octahedron (8 triangles) per point.
+        assert_eq!(entity.stats.triangles, 24);
+        // Bounds cover the raw points (markers are display-only).
+        assert_eq!(entity.bounds.min, (0.0, 0.0, 0.0));
+        assert_eq!(entity.bounds.max, (2.0, 0.0, 0.0));
+        assert!(
+            entity
+                .stats
+                .detail
+                .iter()
+                .any(|l| l.contains("Point cloud: 3 points")),
+            "stats should describe the cloud: {:?}",
+            entity.stats.detail
+        );
+        assert!(
+            entity.stats.fea_fields.contains(&"node:weight".to_string()),
+            "weight should be colormappable: {:?}",
+            entity.stats.fea_fields
+        );
     }
 
     /// Wireframe is display-only: toggling it flips the `visible` flag the

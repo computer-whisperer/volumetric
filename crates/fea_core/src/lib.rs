@@ -765,6 +765,9 @@ pub fn solve(
             Ok(contact_solve(mesh, &model, None, rigid, config)?.0)
         }
         FeaElementKind::Bar2 => Ok(frame_contact_solve(mesh, rigid, config)?.0),
+        FeaElementKind::Point1 => {
+            Err("Point1 meshes are point clouds with no elements to solve".to_string())
+        }
     }
 }
 

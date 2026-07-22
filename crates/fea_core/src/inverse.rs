@@ -190,6 +190,9 @@ pub fn solve_inverse(
         volumetric_abi::fea::FeaElementKind::Bar2 => {
             solve_inverse_frame(mesh, rigid, target, config)
         }
+        volumetric_abi::fea::FeaElementKind::Point1 => {
+            Err("Point1 meshes are point clouds with no elements to solve".to_string())
+        }
     }
 }
 

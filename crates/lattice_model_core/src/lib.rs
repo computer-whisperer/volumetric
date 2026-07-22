@@ -346,8 +346,22 @@ fn foam_hash(x: i64, y: i64, z: i64, coset: u64) -> u64 {
 /// displacement of up to `0.25 * jitter` per axis (sites stay separated
 /// even at full irregularity; the BCC nearest-neighbor gap is sqrt(3)/2).
 fn foam_site(base: [i64; 3], coset: usize, jitter: f64) -> [f64; 3] {
+    foam_site_seeded(base, coset, jitter, 0)
+}
+
+/// [`foam_site`] with a hash salt selecting alternate site sets, in cell
+/// units (multiply by the cell size for model coordinates). `seed` 0 is
+/// bit-identical to the built-in foam family's sites, so a point-fill at
+/// seed 0 reproduces the foam lattice exactly; other seeds re-jitter.
+/// Coset 0 alone is a (jittered) cubic grid; both cosets are jittered BCC.
+pub fn foam_site_seeded(base: [i64; 3], coset: usize, jitter: f64, seed: u64) -> [f64; 3] {
     let coset_offset = if coset == 0 { 0.0 } else { 0.5 };
-    let h = foam_hash(base[0], base[1], base[2], coset as u64);
+    let h = foam_hash(
+        base[0],
+        base[1],
+        base[2],
+        (coset as u64).wrapping_add(seed.wrapping_mul(2)),
+    );
     let amp = 0.25 * jitter;
     let unit = |bits: u64| -> f64 { (bits & 0x1F_FFFF) as f64 / 0xF_FFFF as f64 - 1.0 };
     [
