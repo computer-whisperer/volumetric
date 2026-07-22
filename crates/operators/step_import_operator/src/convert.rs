@@ -132,12 +132,18 @@ impl AssemblyGraph {
             if let Some(r) = e.simple() {
                 match r.name.as_str() {
                     "SHAPE_DEFINITION_REPRESENTATION" => {
-                        // (definition: PDS, used_representation)
+                        // (definition: represented_definition, used_representation).
+                        // The definition select also admits plain
+                        // PROPERTY_DEFINITIONs (Onshape hybrid exports
+                        // attach 'HYBRID_SOURCE_ID' reps this way); only
+                        // a PDS of a product definition names a shape.
                         let pds = data.deref(arg_at(r, 0, id)?)?;
-                        let pds_r = pds
+                        let Some(pds_r) = pds
                             .simple()
                             .filter(|r| r.name == "PRODUCT_DEFINITION_SHAPE")
-                            .ok_or_else(|| format!("#{id}: SDR without a PDS"))?;
+                        else {
+                            continue;
+                        };
                         let def = arg_at(pds_r, 2, id)?
                             .as_ref_id()
                             .ok_or_else(|| format!("#{id}: PDS definition not a reference"))?;
