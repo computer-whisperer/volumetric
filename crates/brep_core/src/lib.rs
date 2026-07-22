@@ -63,10 +63,11 @@
 //!    .  face records
 //! Face record:
 //!    0  surface_type u32  0 plane / 1 cylinder / 2 cone / 3 sphere /
-//!                         4 torus / 5 extrusion / 6 nurbs
+//!                         4 torus / 5 extrusion / 6 nurbs / 7 mesh
 //!    4  color        u32  0 = unstyled, else 0xFFrrggbb (8-bit sRGB)
 //!    8  uv_eps       2xf64  UV distance per axis equivalent to the 3D
 //!                           suspicion tolerance at this face's scale
+//!                           (0 for mesh faces, which have no UV space)
 //!   24  u_period     f64    0 = aperiodic
 //!   32  v_period     f64    0 = aperiodic
 //!   40  trims_off    u32    from face start
@@ -86,6 +87,19 @@
 //!                  ctrl (nctrl_u*nctrl_v x 4xf64 xyzw, v-fastest),
 //!                  seed boxes seed_nu*seed_nv x 32 bytes
 //!                  (aabb 6xf32, uv center 2xf32)
+//!       mesh       vert_count u32, tri_count u32, seg_count u32,
+//!                  node_count u32, band_max f64, seg_node_count u32 +
+//!                  pad, triangle BVH nodes (node_count x 32, same node
+//!                  layout as the solid BVH), boundary-segment BVH
+//!                  nodes (seg_node_count x 32), verts (vert_count x
+//!                  3xf64), tris (tri_count x 3xu32), boundary segs
+//!                  (seg_count x (2xu32 + f32 band)). Triangles and
+//!                  segments are in BVH leaf-contiguous order, so
+//!                  leaves index the arrays directly. A segment's band
+//!                  is the seam suspicion radius around it (the
+//!                  chordal crack against neighboring exact faces);
+//!                  `band_max` is their maximum. A mesh face's trim
+//!                  blob is empty.
 //! Trim blob:
 //!    0  loop_count u32
 //!    4  (pad)      u32

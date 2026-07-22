@@ -26,6 +26,7 @@ pub fn project_point(
 ) -> Result<[f64; 2], String> {
     use core::f64::consts::TAU;
     match surface {
+        Surface::Mesh(_) => Err("mesh faces have no UV space to project into".into()),
         Surface::Plane { frame } => {
             let l = frame.to_local(p);
             check_residual(l[2].abs(), tol, "plane")?;

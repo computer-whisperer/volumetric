@@ -581,6 +581,184 @@ impl<'a> Ctx<'a> {
 }
 
 // -------------------------------------------------------------------
+// Tessellated geometry (AP242)
+// -------------------------------------------------------------------
+
+/// Vertices (scaled to metres) and triangles of a tessellated face.
+pub struct MeshData {
+    pub verts: Vec<Vec3>,
+    pub tris: Vec<[u32; 3]>,
+}
+
+impl<'a> Ctx<'a> {
+    /// Item ids of a TESSELLATED_SHELL: `(name, (items), topological_link?)`.
+    pub fn tessellated_shell_items(&self, id: u64) -> Result<Vec<u64>, String> {
+        let r = self.simple(id, &["TESSELLATED_SHELL"])?;
+        let items = r
+            .args
+            .get(1)
+            .and_then(Arg::as_list)
+            .ok_or_else(|| format!("#{id} TESSELLATED_SHELL: missing item list"))?;
+        items
+            .iter()
+            .map(|a| {
+                a.as_ref_id()
+                    .ok_or_else(|| format!("#{id}: shell item is not a reference"))
+            })
+            .collect()
+    }
+
+    /// A TRIANGULATED_FACE or COMPLEX_TRIANGULATED_FACE as an indexed
+    /// triangle set. Handles the `pnindex` indirection (triangle indices
+    /// name per-face points, which map onto the shared coordinate list)
+    /// and lowers strips/fans to plain triangles — winding is irrelevant
+    /// downstream (parity is orientation-blind). Degenerate triangles
+    /// are dropped.
+    pub fn triangulated_face(&self, id: u64) -> Result<MeshData, String> {
+        let r = self.simple(id, &["TRIANGULATED_FACE", "COMPLEX_TRIANGULATED_FACE"])?;
+        let verts = self.coordinates_list(self.ref_arg(r, 1, id)?)?;
+        // tessellated_face attributes: name, coordinates, pnmax,
+        // normals, geometric_link (OPTIONAL — some exporters omit the
+        // slot entirely), pnindex, then triangles / strips + fans.
+        let complex = r.name == "COMPLEX_TRIANGULATED_FACE";
+        let with_link = if complex { 8 } else { 7 };
+        let pnindex_at = match r.args.len() {
+            n if n == with_link => 5,
+            n if n == with_link - 1 => 4,
+            n => {
+                return Err(format!(
+                    "#{id} {}: unexpected argument count {n}",
+                    r.name
+                ));
+            }
+        };
+        let pnindex = r
+            .args
+            .get(pnindex_at)
+            .and_then(Arg::as_list)
+            .ok_or_else(|| format!("#{id}: missing pnindex list"))?;
+        let pnindex: Vec<usize> = pnindex
+            .iter()
+            .map(|a| {
+                a.as_usize()
+                    .ok_or_else(|| format!("#{id}: non-integer pnindex entry"))
+            })
+            .collect::<Result<_, _>>()?;
+        // 1-based triangle vertex -> 0-based coordinate index.
+        let map = |v: usize| -> Result<u32, String> {
+            let k = if pnindex.is_empty() {
+                v
+            } else {
+                *pnindex
+                    .get(v.wrapping_sub(1))
+                    .ok_or_else(|| format!("#{id}: pnindex reference {v} out of range"))?
+            };
+            if k == 0 || k > verts.len() {
+                return Err(format!("#{id}: coordinate index {k} out of range"));
+            }
+            Ok((k - 1) as u32)
+        };
+        let int_at = |a: &Arg| -> Result<usize, String> {
+            a.as_usize()
+                .ok_or_else(|| format!("#{id}: non-integer vertex index"))
+        };
+
+        let mut tris: Vec<[u32; 3]> = Vec::new();
+        let mut push = |a: u32, b: u32, c: u32| {
+            if a != b && b != c && a != c {
+                tris.push([a, b, c]);
+            }
+        };
+        if complex {
+            let strips = r
+                .args
+                .get(pnindex_at + 1)
+                .and_then(Arg::as_list)
+                .ok_or_else(|| format!("#{id}: missing triangle strips"))?;
+            for strip in strips {
+                let strip = strip
+                    .as_list()
+                    .ok_or_else(|| format!("#{id}: strip is not a list"))?;
+                let idx: Vec<u32> = strip
+                    .iter()
+                    .map(|a| map(int_at(a)?))
+                    .collect::<Result<_, _>>()?;
+                for w in idx.windows(3) {
+                    push(w[0], w[1], w[2]);
+                }
+            }
+            let fans = r
+                .args
+                .get(pnindex_at + 2)
+                .and_then(Arg::as_list)
+                .ok_or_else(|| format!("#{id}: missing triangle fans"))?;
+            for fan in fans {
+                let fan = fan
+                    .as_list()
+                    .ok_or_else(|| format!("#{id}: fan is not a list"))?;
+                let idx: Vec<u32> = fan
+                    .iter()
+                    .map(|a| map(int_at(a)?))
+                    .collect::<Result<_, _>>()?;
+                if let Some((&center, rest)) = idx.split_first() {
+                    for w in rest.windows(2) {
+                        push(center, w[0], w[1]);
+                    }
+                }
+            }
+        } else {
+            let triangles = r
+                .args
+                .get(pnindex_at + 1)
+                .and_then(Arg::as_list)
+                .ok_or_else(|| format!("#{id}: missing triangle list"))?;
+            for t in triangles {
+                let t = t
+                    .as_list()
+                    .ok_or_else(|| format!("#{id}: triangle is not a list"))?;
+                if t.len() != 3 {
+                    return Err(format!("#{id}: triangle with {} vertices", t.len()));
+                }
+                push(map(int_at(&t[0])?)?, map(int_at(&t[1])?)?, map(int_at(&t[2])?)?);
+            }
+        }
+        if tris.is_empty() {
+            return Err(format!("#{id}: tessellated face with no triangles"));
+        }
+        Ok(MeshData { verts, tris })
+    }
+
+    /// `COORDINATES_LIST(name, npoints, ((x, y, z), ...))`, scaled to
+    /// metres. Points are literal coordinate triples, not references.
+    fn coordinates_list(&self, id: u64) -> Result<Vec<Vec3>, String> {
+        let r = self.simple(id, &["COORDINATES_LIST"])?;
+        let pts = r
+            .args
+            .get(2)
+            .and_then(Arg::as_list)
+            .ok_or_else(|| format!("#{id} COORDINATES_LIST: missing point list"))?;
+        let mut out = Vec::with_capacity(pts.len());
+        for (i, p) in pts.iter().enumerate() {
+            let p = p
+                .as_list()
+                .ok_or_else(|| format!("#{id}: point {i} is not a list"))?;
+            if p.len() != 3 {
+                return Err(format!("#{id}: point {i} has {} coordinates", p.len()));
+            }
+            let mut v = [0.0; 3];
+            for (k, c) in p.iter().enumerate() {
+                v[k] = c
+                    .as_f64()
+                    .ok_or_else(|| format!("#{id}: non-numeric coordinate in point {i}"))?
+                    * self.scale;
+            }
+            out.push(v);
+        }
+        Ok(out)
+    }
+}
+
+// -------------------------------------------------------------------
 // Units
 // -------------------------------------------------------------------
 

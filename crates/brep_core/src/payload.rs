@@ -23,6 +23,7 @@ pub const TYPE_SPHERE: u32 = 3;
 pub const TYPE_TORUS: u32 = 4;
 pub const TYPE_EXTRUSION: u32 = 5;
 pub const TYPE_NURBS: u32 = 6;
+pub const TYPE_MESH: u32 = 7;
 
 // ---------------------------------------------------------------------
 // Writer
@@ -254,6 +255,14 @@ pub(crate) fn unpack_color(packed: u32) -> Option<[f32; 3]> {
 }
 
 fn validate_face(face: &Face) -> Result<(), String> {
+    if let Surface::Mesh(m) = &face.surface {
+        // A mesh face is bounded by its triangulation; UV trims don't
+        // apply to it.
+        if !face.trims.is_empty() {
+            return Err("mesh face with trim loops".into());
+        }
+        return m.validate();
+    }
     if face.trims.is_empty() {
         return Err("face has no trim loops".into());
     }
@@ -304,8 +313,80 @@ fn validate_face(face: &Face) -> Result<(), String> {
             }
         }
         Surface::Plane { .. } => {}
+        Surface::Mesh(_) => unreachable!("handled above"),
     }
     Ok(())
+}
+
+/// Open boundary segments of a mesh face — edges used by exactly one
+/// triangle — in first-encounter order (deterministic payload bytes).
+fn mesh_boundary(m: &crate::ir::MeshSurface) -> Vec<[u32; 2]> {
+    use std::collections::HashMap;
+    let mut count: HashMap<(u32, u32), u32> = HashMap::new();
+    let edges = |t: &[u32; 3]| [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])];
+    for t in &m.tris {
+        for (a, b) in edges(t) {
+            *count.entry((a.min(b), a.max(b))).or_insert(0) += 1;
+        }
+    }
+    let mut seen: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for t in &m.tris {
+        for (a, b) in edges(t) {
+            let key = (a.min(b), a.max(b));
+            if count[&key] == 1 && seen.insert(key) {
+                out.push([a, b]);
+            }
+        }
+    }
+    out
+}
+
+/// Geometric seam-band estimate, per boundary segment: the mesh boundary
+/// is a chordal sampling of the exact seam curves of the neighboring
+/// faces, so the crack along a chord is bounded by that chord's sagitta.
+/// Estimated as the *smaller* second difference of the segment's two
+/// endpoints — for a densely sampled smooth curve both are ~4x the sag;
+/// at a genuine seam corner the kink inflates only the corner vertex's
+/// difference, and the min keeps straight chords beside it at zero
+/// rather than swallowing them in the corner angle.
+fn mesh_seam_bands(m: &crate::ir::MeshSurface, boundary: &[[u32; 2]]) -> Vec<f64> {
+    use std::collections::HashMap;
+    // Up to two boundary neighbors per boundary vertex; junction
+    // vertices (more than two) keep their first two — the estimate is a
+    // heuristic bound, not an exact measure.
+    let mut nbrs: HashMap<u32, ([u32; 2], u8)> = HashMap::new();
+    for s in boundary {
+        for (v, o) in [(s[0], s[1]), (s[1], s[0])] {
+            let e = nbrs.entry(v).or_insert(([0, 0], 0));
+            if (e.1 as usize) < 2 {
+                e.0[e.1 as usize] = o;
+                e.1 += 1;
+            }
+        }
+    }
+    let vertex_sd = |v: u32| -> f64 {
+        let Some(&(nb, n)) = nbrs.get(&v) else {
+            return 0.0;
+        };
+        if n != 2 {
+            return 0.0;
+        }
+        let (a, b, c) = (
+            m.verts[nb[0] as usize],
+            m.verts[v as usize],
+            m.verts[nb[1] as usize],
+        );
+        norm([
+            a[0] - 2.0 * b[0] + c[0],
+            a[1] - 2.0 * b[1] + c[1],
+            a[2] - 2.0 * b[2] + c[2],
+        ])
+    };
+    boundary
+        .iter()
+        .map(|s| vertex_sd(s[0]).min(vertex_sd(s[1])) * 0.5)
+        .collect()
 }
 
 /// UV extent of a face's trim loops.
@@ -332,6 +413,23 @@ fn trim_uv_aabb(face: &Face) -> [f64; 4] {
 /// the answer), so every branch here must over- rather than
 /// under-estimate.
 fn face_aabb(face: &Face) -> [f64; 6] {
+    if let Surface::Mesh(m) = &face.surface {
+        // Vertices bound the triangles exactly; inflate by the seam
+        // band so crack-adjacent rays still route into this face's
+        // kernel (the suspicion-scale margin is added per solid).
+        let mut bb = math::EMPTY_AABB;
+        for v in &m.verts {
+            grow(&mut bb, *v);
+        }
+        let band = mesh_seam_bands(m, &mesh_boundary(m))
+            .into_iter()
+            .fold(0.0f64, f64::max);
+        for axis in 0..3 {
+            bb[axis * 2] -= band;
+            bb[axis * 2 + 1] += band;
+        }
+        return bb;
+    }
     let view = SurfaceView::from_ir(&face.surface);
     let uv = trim_uv_aabb(face);
     let mut bb = math::EMPTY_AABB;
@@ -461,6 +559,9 @@ fn uv_metric(view: &SurfaceView, uv: [f64; 4]) -> [f64; 2] {
 }
 
 fn write_face(w: &mut W, face: &Face, eps_boundary: f64) -> Result<(), String> {
+    if let Surface::Mesh(m) = &face.surface {
+        return write_mesh_face(w, m, face.color, eps_boundary);
+    }
     let face_base = w.pos();
     let view = SurfaceView::from_ir(&face.surface);
     let uv = trim_uv_aabb(face);
@@ -475,6 +576,7 @@ fn write_face(w: &mut W, face: &Face, eps_boundary: f64) -> Result<(), String> {
         Surface::Torus { .. } => TYPE_TORUS,
         Surface::ExtrusionPolyline { .. } => TYPE_EXTRUSION,
         Surface::Nurbs(_) => TYPE_NURBS,
+        Surface::Mesh(_) => unreachable!("mesh faces take the write_mesh_face path"),
     };
     w.u32(type_id);
     w.u32(pack_color(face.color));
@@ -561,6 +663,7 @@ fn write_face(w: &mut W, face: &Face, eps_boundary: f64) -> Result<(), String> {
             }
             write_seed_boxes(w, n, seed_nu, seed_nv);
         }
+        Surface::Mesh(_) => unreachable!("mesh faces take the write_mesh_face path"),
     }
 
     w.pad8();
@@ -587,6 +690,137 @@ fn write_face(w: &mut W, face: &Face, eps_boundary: f64) -> Result<(), String> {
             w.f64(p[0]);
             w.f64(p[1]);
         }
+    }
+    Ok(())
+}
+
+/// Serialize one mesh face (layout in `lib.rs`). Triangles and boundary
+/// segments are stored in BVH leaf-contiguous order so leaves index the
+/// arrays directly — no slot table.
+fn write_mesh_face(
+    w: &mut W,
+    m: &crate::ir::MeshSurface,
+    color: Option<[f32; 3]>,
+    eps_boundary: f64,
+) -> Result<(), String> {
+    let boundary = mesh_boundary(m);
+    let bands: Vec<f64> = mesh_seam_bands(m, &boundary)
+        .into_iter()
+        .map(|b| b.max(eps_boundary * 4.0))
+        .collect();
+    let band_max = bands.iter().copied().fold(0.0f64, f64::max);
+
+    let tri_pad = eps_boundary * 4.0;
+    let tri_aabbs: Vec<[f64; 6]> = m
+        .tris
+        .iter()
+        .map(|t| {
+            let mut bb = math::EMPTY_AABB;
+            for &i in t {
+                grow(&mut bb, m.verts[i as usize]);
+            }
+            for axis in 0..3 {
+                bb[axis * 2] -= tri_pad;
+                bb[axis * 2 + 1] += tri_pad;
+            }
+            bb
+        })
+        .collect();
+    let tri_bvh = bvh::build(&tri_aabbs);
+    let tris: Vec<[u32; 3]> = tri_bvh
+        .slots
+        .iter()
+        .map(|&s| m.tris[s as usize])
+        .collect();
+
+    let (seg_bvh, segs) = if boundary.is_empty() {
+        (None, Vec::new())
+    } else {
+        let seg_aabbs: Vec<[f64; 6]> = boundary
+            .iter()
+            .zip(&bands)
+            .map(|(s, &band)| {
+                let mut bb = math::EMPTY_AABB;
+                for &i in s {
+                    grow(&mut bb, m.verts[i as usize]);
+                }
+                let pad = band + eps_boundary * 4.0;
+                for axis in 0..3 {
+                    bb[axis * 2] -= pad;
+                    bb[axis * 2 + 1] += pad;
+                }
+                bb
+            })
+            .collect();
+        let b = bvh::build(&seg_aabbs);
+        let segs: Vec<([u32; 2], f64)> = b
+            .slots
+            .iter()
+            .map(|&s| (boundary[s as usize], bands[s as usize]))
+            .collect();
+        (Some(b), segs)
+    };
+    let seg_node_count = seg_bvh.as_ref().map_or(0, |b| b.nodes.len());
+
+    let face_base = w.pos();
+    w.u32(TYPE_MESH);
+    w.u32(pack_color(color));
+    w.f64(0.0); // uv_eps (no UV space)
+    w.f64(0.0);
+    w.f64(0.0); // periods
+    w.f64(0.0);
+    let trims_off_at = w.pos();
+    w.u32(0);
+    w.u32(0);
+    debug_assert_eq!(w.pos() - face_base, FACE_HEADER_LEN);
+
+    w.u32(m.verts.len() as u32);
+    w.u32(tris.len() as u32);
+    w.u32(segs.len() as u32);
+    w.u32(tri_bvh.nodes.len() as u32);
+    w.f64(band_max);
+    w.u32(seg_node_count as u32);
+    w.u32(0);
+    let write_nodes = |w: &mut W, nodes: &[bvh::Node]| {
+        for n in nodes {
+            for v in n.min {
+                w.f32(v);
+            }
+            for v in n.max {
+                w.f32(v);
+            }
+            w.u32(n.a);
+            w.u32(n.b);
+        }
+    };
+    write_nodes(w, &tri_bvh.nodes);
+    if let Some(b) = &seg_bvh {
+        write_nodes(w, &b.nodes);
+    }
+    for v in &m.verts {
+        for c in v {
+            w.f64(*c);
+        }
+    }
+    for t in &tris {
+        for &i in t {
+            w.u32(i);
+        }
+    }
+    for (s, band) in &segs {
+        w.u32(s[0]);
+        w.u32(s[1]);
+        w.f32(up(*band)); // round toward wider: the band must contain the crack
+    }
+
+    // Empty trim blob, so the record shape matches every other face.
+    w.pad8();
+    let trims_off = w.pos() - face_base;
+    w.patch_u32(trims_off_at, trims_off as u32);
+    w.u32(0);
+    w.u32(0);
+    for _ in 0..4 {
+        w.f64(0.0);
     }
     Ok(())
 }
@@ -822,6 +1056,10 @@ impl<'a> PayloadView<'a> {
         crossings: &mut usize,
         suspect: &mut bool,
     ) {
+        if u32_at(self.bytes, face_off) == TYPE_MESH {
+            MeshRaw::at(self.bytes, face_off).cast(p, dir, t_eps, eps_boundary, crossings, suspect);
+            return;
+        }
         let region = self.region_at(face_off);
         let view = self.surface_view(face_off);
         view.ray_hits(p, dir, eps_boundary, &mut |hit| {
@@ -994,6 +1232,10 @@ impl<'a> PayloadView<'a> {
     /// Off-trim projections clamp to the trim boundary (approximately —
     /// the clamp is exact in UV, and re-measured in 3D).
     fn face_distance(&self, face_off: usize, p: Vec3) -> (f64, u32) {
+        if u32_at(self.bytes, face_off) == TYPE_MESH {
+            let d = MeshRaw::at(self.bytes, face_off).distance(p);
+            return (d, u32_at(self.bytes, face_off + 4));
+        }
         let view = self.surface_view(face_off);
         let (uv, d_surf) = view.closest(p);
         let region = self.region_at(face_off);
@@ -1071,6 +1313,506 @@ impl<'a> PayloadView<'a> {
                 SurfaceView::Plane {
                     frame: math::Frame::IDENTITY,
                 }
+            }
+        }
+    }
+}
+
+/// A mesh face read from payload bytes (layout in `lib.rs`).
+///
+/// # Parity safety
+///
+/// Same contract as the analytic kernels: transversal interior crossings
+/// count; hits within `eps` of a triangle edge, grazing-incidence hits,
+/// and near-misses beside an edge set `suspect` (an exactly-on-edge
+/// crossing may count twice or not at all — the re-cast resolves it).
+/// Rays passing within the seam band of an open boundary segment set
+/// `suspect` too: the band covers the chordal crack between this mesh
+/// and the exact faces it glues against, where a crossing can be missed
+/// entirely (odd count) without any triangle noticing.
+#[derive(Clone, Copy)]
+struct MeshRaw<'a> {
+    bytes: &'a [u8],
+    band: f64,
+    tri_count: usize,
+    seg_count: usize,
+    nodes_off: usize,
+    seg_nodes_off: usize,
+    verts_off: usize,
+    tris_off: usize,
+    segs_off: usize,
+}
+
+impl<'a> MeshRaw<'a> {
+    fn at(bytes: &'a [u8], face_off: usize) -> MeshRaw<'a> {
+        let data = face_off + FACE_HEADER_LEN;
+        let vert_count = u32_at(bytes, data) as usize;
+        let tri_count = u32_at(bytes, data + 4) as usize;
+        let seg_count = u32_at(bytes, data + 8) as usize;
+        let node_count = u32_at(bytes, data + 12) as usize;
+        let band = f64_at(bytes, data + 16);
+        let seg_node_count = u32_at(bytes, data + 24) as usize;
+        let nodes_off = data + 32;
+        let seg_nodes_off = nodes_off + node_count * NODE_LEN;
+        let verts_off = seg_nodes_off + seg_node_count * NODE_LEN;
+        let tris_off = verts_off + vert_count * 24;
+        let segs_off = tris_off + tri_count * 12;
+        MeshRaw {
+            bytes,
+            band,
+            tri_count,
+            seg_count,
+            nodes_off,
+            seg_nodes_off,
+            verts_off,
+            tris_off,
+            segs_off,
+        }
+    }
+
+    fn vert(&self, i: usize) -> Vec3 {
+        let base = self.verts_off + i * 24;
+        [
+            f64_at(self.bytes, base),
+            f64_at(self.bytes, base + 8),
+            f64_at(self.bytes, base + 16),
+        ]
+    }
+
+    fn tri(&self, i: usize) -> [Vec3; 3] {
+        let base = self.tris_off + i * 12;
+        [
+            self.vert(u32_at(self.bytes, base) as usize),
+            self.vert(u32_at(self.bytes, base + 4) as usize),
+            self.vert(u32_at(self.bytes, base + 8) as usize),
+        ]
+    }
+
+    /// Boundary segment endpoints and its seam band.
+    fn seg(&self, i: usize) -> ([Vec3; 2], f64) {
+        let base = self.segs_off + i * 12;
+        (
+            [
+                self.vert(u32_at(self.bytes, base) as usize),
+                self.vert(u32_at(self.bytes, base + 4) as usize),
+            ],
+            f32_at(self.bytes, base + 8) as f64,
+        )
+    }
+
+    /// Ray slab test against a BVH node, `(t_min, t_max)` clipped to
+    /// `[t_floor, inf)`; `None` when the ray misses the box.
+    fn node_span(
+        &self,
+        nodes_off: usize,
+        node: usize,
+        p: Vec3,
+        dir: Vec3,
+        t_floor: f64,
+    ) -> Option<(u32, u32)> {
+        let base = nodes_off + node * NODE_LEN;
+        let mut t_min = t_floor;
+        let mut t_max = f64::INFINITY;
+        for axis in 0..3 {
+            let inv = 1.0 / dir[axis];
+            let mut lo = (f32_at(self.bytes, base + axis * 4) as f64 - p[axis]) * inv;
+            let mut hi = (f32_at(self.bytes, base + 12 + axis * 4) as f64 - p[axis]) * inv;
+            if lo > hi {
+                core::mem::swap(&mut lo, &mut hi);
+            }
+            t_min = t_min.max(lo);
+            t_max = t_max.min(hi);
+        }
+        if t_min > t_max {
+            return None;
+        }
+        Some((
+            u32_at(self.bytes, base + 24),
+            u32_at(self.bytes, base + 28),
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn cast(
+        &self,
+        p: Vec3,
+        dir: Vec3,
+        t_eps: f64,
+        eps: f64,
+        crossings: &mut usize,
+        suspect: &mut bool,
+    ) {
+        let t_floor = -4.0 * t_eps;
+        let dir_len = norm(dir);
+
+        let mut stack = [0u32; 64];
+        let mut top = 0usize;
+        stack[top] = 0;
+        top += 1;
+        while top > 0 {
+            top -= 1;
+            let Some((a, b)) = self.node_span(self.nodes_off, stack[top] as usize, p, dir, t_floor)
+            else {
+                continue;
+            };
+            if a & LEAF_FLAG == 0 {
+                stack[top] = a;
+                top += 1;
+                stack[top] = b;
+                top += 1;
+                continue;
+            }
+            let first = (a & !LEAF_FLAG) as usize;
+            for i in first..first + b as usize {
+                debug_assert!(i < self.tri_count);
+                let [v0, v1, v2] = self.tri(i);
+                let e1 = sub(v1, v0);
+                let e2 = sub(v2, v0);
+                let n = math::cross(e1, e2);
+                let n_len = norm(n);
+                if n_len == 0.0 {
+                    continue; // degenerate (rejected at build; belt and braces)
+                }
+                let denom = math::dot(n, dir);
+                if denom.abs() < 1e-9 * n_len * dir_len {
+                    // In-plane ray: never a transversal crossing; a skim
+                    // along the triangle itself earns a re-cast.
+                    if math::point_triangle_dist(p, v0, v1, v2) < eps * 4.0 {
+                        *suspect = true;
+                    }
+                    continue;
+                }
+                let t = math::dot(n, sub(v0, p)) / denom;
+                let q = [p[0] + t * dir[0], p[1] + t * dir[1], p[2] + t * dir[2]];
+                let inside = math::dot(math::cross(e1, sub(q, v0)), n) >= 0.0
+                    && math::dot(math::cross(sub(v2, v1), sub(q, v1)), n) >= 0.0
+                    && math::dot(math::cross(sub(v0, v2), sub(q, v2)), n) >= 0.0;
+                let d_edge = math::point_segment_dist(q, v0, v1)
+                    .min(math::point_segment_dist(q, v1, v2))
+                    .min(math::point_segment_dist(q, v2, v0));
+                if !inside && d_edge >= eps {
+                    continue;
+                }
+                let grazing = denom.abs() < 1e-4 * n_len * dir_len;
+                let suspect_hit = grazing || d_edge < eps;
+                if t < t_floor && !suspect_hit {
+                    continue;
+                }
+                if inside && t > t_eps {
+                    *crossings += 1;
+                    if suspect_hit {
+                        *suspect = true;
+                    }
+                } else if suspect_hit || (inside && t.abs() <= t_eps) {
+                    // Near-miss beside an edge, grazing hit behind the
+                    // origin, or an on-surface query: re-cast.
+                    *suspect = true;
+                }
+            }
+        }
+
+        // Seam pass: a ray through the boundary crack crosses the solid's
+        // surface without crossing any face — flag it. Skipped when this
+        // cast is already suspect.
+        if *suspect || self.seg_count == 0 {
+            return;
+        }
+        let reach = self.band + 4.0 * t_eps;
+        let mut top = 0usize;
+        stack[top] = 0;
+        top += 1;
+        while top > 0 {
+            top -= 1;
+            let Some((a, b)) =
+                self.node_span(self.seg_nodes_off, stack[top] as usize, p, dir, t_floor - reach)
+            else {
+                continue;
+            };
+            if a & LEAF_FLAG == 0 {
+                stack[top] = a;
+                top += 1;
+                stack[top] = b;
+                top += 1;
+                continue;
+            }
+            let first = (a & !LEAF_FLAG) as usize;
+            for i in first..first + b as usize {
+                debug_assert!(i < self.seg_count);
+                let ([sa, sb], band) = self.seg(i);
+                let (t_ray, d) = ray_segment_approach(p, dir, sa, sb);
+                if d < band && t_ray > t_floor - reach {
+                    *suspect = true;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Distance from `p` to the mesh: best-first BVH descent.
+    fn distance(&self, p: Vec3) -> f64 {
+        let node_dist = |node: usize| -> f64 {
+            let base = self.nodes_off + node * NODE_LEN;
+            let mut d2 = 0.0f64;
+            for (axis, &c) in p.iter().enumerate() {
+                let lo = f32_at(self.bytes, base + axis * 4) as f64;
+                let hi = f32_at(self.bytes, base + 12 + axis * 4) as f64;
+                let gap = (lo - c).max(c - hi).max(0.0);
+                d2 += gap * gap;
+            }
+            d2.sqrt()
+        };
+        let mut best = f64::INFINITY;
+        let mut stack = [(0u32, 0.0f64); 64];
+        stack[0] = (0, node_dist(0));
+        let mut top = 1usize;
+        while top > 0 {
+            top -= 1;
+            let (node, d) = stack[top];
+            if d >= best {
+                continue;
+            }
+            let base = self.nodes_off + node as usize * NODE_LEN;
+            let a = u32_at(self.bytes, base + 24);
+            let b = u32_at(self.bytes, base + 28);
+            if a & LEAF_FLAG != 0 {
+                let first = (a & !LEAF_FLAG) as usize;
+                for i in first..first + b as usize {
+                    let [v0, v1, v2] = self.tri(i);
+                    best = best.min(math::point_triangle_dist(p, v0, v1, v2));
+                }
+            } else {
+                let (da, db) = (node_dist(a as usize), node_dist(b as usize));
+                let ordered = if da <= db {
+                    [(b, db), (a, da)]
+                } else {
+                    [(a, da), (b, db)]
+                };
+                for (child, dist) in ordered {
+                    if dist < best {
+                        debug_assert!(top < stack.len(), "BVH deeper than the traversal stack");
+                        if top < stack.len() {
+                            stack[top] = (child, dist);
+                            top += 1;
+                        }
+                    }
+                }
+            }
+        }
+        best
+    }
+}
+
+/// Closest approach between the ray `p + t * dir` (t unbounded here;
+/// the caller applies its floor) and the segment `[a, b]`: `(t at the
+/// approach, distance)`.
+fn ray_segment_approach(p: Vec3, dir: Vec3, a: Vec3, b: Vec3) -> (f64, f64) {
+    let u = sub(b, a);
+    let w0 = sub(p, a);
+    let aa = math::dot(dir, dir);
+    let bb = math::dot(dir, u);
+    let cc = math::dot(u, u);
+    let dd = math::dot(dir, w0);
+    let ee = math::dot(u, w0);
+    let den = aa * cc - bb * bb;
+    let s = if den > 1e-30 {
+        ((aa * ee - bb * dd) / den).clamp(0.0, 1.0)
+    } else if cc > 0.0 {
+        // Parallel: any s gives the same distance; project the origin.
+        (ee / cc).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let q = [a[0] + s * u[0], a[1] + s * u[1], a[2] + s * u[2]];
+    let t = if aa > 0.0 {
+        math::dot(sub(q, p), dir) / aa
+    } else {
+        0.0
+    };
+    let at = [p[0] + t * dir[0], p[1] + t * dir[1], p[2] + t * dir[2]];
+    (t, norm(sub(q, at)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{BRepModel, Face, Instance, MeshSurface, Solid};
+    use crate::math::Frame;
+
+    fn identity_instance() -> Instance {
+        Instance {
+            solid: 0,
+            local_to_world: Affine::IDENTITY,
+            label: String::new(),
+        }
+    }
+
+    /// Unit-cube triangle mesh `[0,1]^3`, optionally without the top
+    /// (z = 1) so the shell has an open square boundary ring.
+    fn cube_mesh(open_top: bool) -> MeshSurface {
+        let verts: Vec<[f64; 3]> = (0..8)
+            .map(|i| {
+                [
+                    (i & 1) as f64,
+                    ((i >> 1) & 1) as f64,
+                    ((i >> 2) & 1) as f64,
+                ]
+            })
+            .collect();
+        // Each face as two triangles (winding irrelevant: parity is
+        // orientation-blind).
+        let mut quads = vec![
+            [0u32, 1, 3, 2], // z = 0
+            [0, 1, 5, 4],    // y = 0
+            [2, 3, 7, 6],    // y = 1
+            [0, 2, 6, 4],    // x = 0
+            [1, 3, 7, 5],    // x = 1
+        ];
+        if !open_top {
+            quads.push([4, 5, 7, 6]); // z = 1
+        }
+        let tris = quads
+            .into_iter()
+            .flat_map(|q| [[q[0], q[1], q[2]], [q[0], q[2], q[3]]])
+            .collect();
+        MeshSurface { verts, tris }
+    }
+
+    fn mesh_face(m: MeshSurface, color: Option<[f32; 3]>) -> Face {
+        Face {
+            surface: Surface::Mesh(m),
+            trims: vec![],
+            color,
+        }
+    }
+
+    fn classify_grid(view: &PayloadView, expect: impl Fn([f64; 3]) -> Option<bool>) {
+        let n = 23;
+        let mut tested = 0;
+        for i in 0..n {
+            for j in 0..n {
+                for k in 0..n {
+                    let p = [
+                        -0.3 + 1.6 * i as f64 / (n - 1) as f64,
+                        -0.3 + 1.6 * j as f64 / (n - 1) as f64,
+                        -0.3 + 1.6 * k as f64 / (n - 1) as f64,
+                    ];
+                    let Some(want) = expect(p) else { continue };
+                    tested += 1;
+                    assert_eq!(view.is_inside(p), want, "at {p:?}");
+                }
+            }
+        }
+        assert!(tested > 8000, "only {tested} points tested");
+    }
+
+    fn cube_truth(p: [f64; 3]) -> Option<bool> {
+        let d = (p[0] - 0.5)
+            .abs()
+            .max((p[1] - 0.5).abs())
+            .max((p[2] - 0.5).abs())
+            - 0.5;
+        if d.abs() < 1e-9 { None } else { Some(d < 0.0) }
+    }
+
+    #[test]
+    fn closed_mesh_cube_classifies() {
+        let model = BRepModel {
+            solids: vec![Solid {
+                faces: vec![mesh_face(cube_mesh(false), None)],
+            }],
+            instances: vec![identity_instance()],
+        };
+        let payload = build_payload(&model).unwrap();
+        let view = PayloadView::new(&payload).unwrap();
+        classify_grid(&view, cube_truth);
+    }
+
+    #[test]
+    fn hybrid_mesh_with_exact_cap_classifies() {
+        // The cushion topology in miniature: an open-top mesh box glued
+        // along its boundary ring to an exact trimmed plane cap.
+        let cap = Face {
+            surface: Surface::Plane {
+                frame: Frame {
+                    origin: [0.0, 0.0, 1.0],
+                    ..Frame::IDENTITY
+                },
+            },
+            trims: vec![vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]],
+            color: None,
+        };
+        let model = BRepModel {
+            solids: vec![Solid {
+                faces: vec![mesh_face(cube_mesh(true), None), cap],
+            }],
+            instances: vec![identity_instance()],
+        };
+        let payload = build_payload(&model).unwrap();
+        let view = PayloadView::new(&payload).unwrap();
+        classify_grid(&view, cube_truth);
+        // Points straddling the seam ring specifically.
+        for (p, want) in [
+            ([0.5, 0.001, 0.999], true),
+            ([0.5, -0.001, 0.999], false),
+            ([0.5, 0.001, 1.001], false),
+            ([0.999, 0.999, 0.999], true),
+            ([1.001, 0.999, 0.999], false),
+        ] {
+            assert_eq!(view.is_inside(p), want, "at {p:?}");
+        }
+    }
+
+    #[test]
+    fn mesh_face_color_and_distance() {
+        let model = BRepModel {
+            solids: vec![Solid {
+                faces: vec![mesh_face(cube_mesh(false), Some([0.2, 0.4, 0.8]))],
+            }],
+            instances: vec![identity_instance()],
+        };
+        let payload = build_payload(&model).unwrap();
+        let view = PayloadView::new(&payload).unwrap();
+        let c = view.nearest_color([0.5, 0.5, 1.2]).unwrap();
+        assert!((c[0] - 0.2).abs() < 0.01 && (c[1] - 0.4).abs() < 0.01 && (c[2] - 0.8).abs() < 0.01);
+    }
+
+    #[test]
+    fn mesh_boundary_and_bands() {
+        let closed = cube_mesh(false);
+        assert!(mesh_boundary(&closed).is_empty());
+        let open = cube_mesh(true);
+        let boundary = mesh_boundary(&open);
+        assert_eq!(boundary.len(), 4, "open square rim");
+        // Every rim vertex is a corner here, so every segment carries
+        // the corner's second difference (erring wide is safe — it only
+        // forces re-casts).
+        for b in mesh_seam_bands(&open, &boundary) {
+            assert!((b - core::f64::consts::SQRT_2 * 0.5).abs() < 1e-12, "{b}");
+        }
+
+        // A 2x1 flat strip: boundary chords with at least one straight
+        // (collinear-neighbor) endpoint drop to zero band — the corner
+        // kink must not swallow the chords beside it.
+        let strip = MeshSurface {
+            verts: vec![
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [2.0, 1.0, 0.0],
+            ],
+            tris: vec![[0, 1, 4], [0, 4, 3], [1, 2, 5], [1, 5, 4]],
+        };
+        let boundary = mesh_boundary(&strip);
+        assert_eq!(boundary.len(), 6);
+        let bands = mesh_seam_bands(&strip, &boundary);
+        for (s, b) in boundary.iter().zip(&bands) {
+            let mid = |v: u32| v == 1 || v == 4; // straight mid-edge vertices
+            if s.iter().any(|&v| mid(v)) {
+                assert_eq!(*b, 0.0, "segment {s:?}");
+            } else {
+                assert!(*b > 0.4, "segment {s:?}: {b}");
             }
         }
     }

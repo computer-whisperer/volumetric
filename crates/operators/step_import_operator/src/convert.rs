@@ -522,10 +522,21 @@ fn convert_composite(
             faces.push(face);
         }
     }
-    if let Some(&ts_id) = tessellated.first() {
-        return Err(format!(
-            "#{ts_id}: tessellated shells are not supported yet"
-        ));
+    for &ts_id in tessellated {
+        let shell_color = colors.get(&ts_id).copied();
+        for item_id in ctx.tessellated_shell_items(ts_id)? {
+            let mesh = ctx
+                .triangulated_face(item_id)
+                .map_err(|e| format!("tessellated shell #{ts_id}, face #{item_id}: {e}"))?;
+            faces.push(Face {
+                surface: Surface::Mesh(brep_core::ir::MeshSurface {
+                    verts: mesh.verts,
+                    tris: mesh.tris,
+                }),
+                trims: vec![],
+                color: colors.get(&item_id).copied().or(shell_color),
+            });
+        }
     }
     Ok(Solid { faces })
 }

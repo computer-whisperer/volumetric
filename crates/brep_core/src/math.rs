@@ -233,6 +233,40 @@ impl Affine {
     }
 }
 
+/// Distance from `p` to the segment `[a, b]`.
+#[inline]
+pub fn point_segment_dist(p: Vec3, a: Vec3, b: Vec3) -> f64 {
+    let e = sub(b, a);
+    let len2 = dot(e, e);
+    let t = if len2 > 0.0 {
+        (dot(sub(p, a), e) / len2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    norm(sub(p, add(a, scale(e, t))))
+}
+
+/// Distance from `p` to the (filled) triangle `(v0, v1, v2)`.
+pub fn point_triangle_dist(p: Vec3, v0: Vec3, v1: Vec3, v2: Vec3) -> f64 {
+    let n = cross(sub(v1, v0), sub(v2, v0));
+    let n_len2 = dot(n, n);
+    if n_len2 > 0.0 {
+        // Projection onto the plane; inside the triangle when it sits on
+        // the inner side of all three edges.
+        let d_plane = dot(sub(p, v0), n) / n_len2;
+        let q = sub(p, scale(n, d_plane));
+        let inside = dot(cross(sub(v1, v0), sub(q, v0)), n) >= 0.0
+            && dot(cross(sub(v2, v1), sub(q, v1)), n) >= 0.0
+            && dot(cross(sub(v0, v2), sub(q, v2)), n) >= 0.0;
+        if inside {
+            return d_plane.abs() * n_len2.sqrt();
+        }
+    }
+    point_segment_dist(p, v0, v1)
+        .min(point_segment_dist(p, v1, v2))
+        .min(point_segment_dist(p, v2, v0))
+}
+
 /// Merge `b` into AABB `a` (both `[min_x, max_x, min_y, ...]`).
 pub fn aabb_union(a: [f64; 6], b: [f64; 6]) -> [f64; 6] {
     [

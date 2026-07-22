@@ -255,6 +255,14 @@ impl<'a> SurfaceView<'a> {
                 profile: Profile2::Slice(profile),
             },
             S::Nurbs(n) => SurfaceView::Nurbs(NurbsView::Owned(n)),
+            S::Mesh(_) => {
+                // Mesh faces have no UV surface; the payload dispatches
+                // them to their own kernels before building a view.
+                debug_assert!(false, "SurfaceView::from_ir on a mesh face");
+                SurfaceView::Plane {
+                    frame: Frame::IDENTITY,
+                }
+            }
         }
     }
 

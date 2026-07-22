@@ -90,6 +90,47 @@ pub enum Surface {
     /// A (possibly rational) B-spline surface. Control points are xyzw;
     /// w = 1 everywhere for polynomial surfaces.
     Nurbs(NurbsSurface),
+    /// An indexed triangle set — the face of a hybrid body whose region
+    /// was modeled as a mesh (STEP AP242 tessellated geometry). The
+    /// triangles ARE the exact definition of such a face; it has no UV
+    /// parameterization and carries no trim loops. Open boundary edges
+    /// are expected: they glue against the trim curves of neighboring
+    /// exact faces, and classification treats the (tiny) chordal crack
+    /// along that seam as a suspicion band.
+    Mesh(MeshSurface),
+}
+
+/// Triangle-set face data. Indices are 0-based into `verts`.
+#[derive(Clone, Debug)]
+pub struct MeshSurface {
+    pub verts: Vec<[f64; 3]>,
+    pub tris: Vec<[u32; 3]>,
+}
+
+impl MeshSurface {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.tris.is_empty() {
+            return Err("mesh face with no triangles".into());
+        }
+        if self.verts.len() > u32::MAX as usize {
+            return Err("mesh face with more than u32::MAX vertices".into());
+        }
+        for v in &self.verts {
+            if v.iter().any(|c| !c.is_finite()) {
+                return Err("non-finite mesh vertex".into());
+            }
+        }
+        let n = self.verts.len() as u32;
+        for t in &self.tris {
+            if t.iter().any(|&i| i >= n) {
+                return Err(format!("triangle index out of range ({t:?} vs {n} verts)"));
+            }
+            if t[0] == t[1] || t[1] == t[2] || t[0] == t[2] {
+                return Err(format!("degenerate triangle {t:?}"));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// B-spline surface data, clamped knot vectors, control net indexed
@@ -179,7 +220,7 @@ impl Surface {
     pub fn periods(&self) -> (f64, f64) {
         use core::f64::consts::TAU;
         match self {
-            Surface::Plane { .. } | Surface::Nurbs(_) => (0.0, 0.0),
+            Surface::Plane { .. } | Surface::Nurbs(_) | Surface::Mesh(_) => (0.0, 0.0),
             Surface::ExtrusionPolyline { profile, .. } => {
                 // A closed profile makes u periodic (period = segment
                 // count): the seam between first and last point is as
