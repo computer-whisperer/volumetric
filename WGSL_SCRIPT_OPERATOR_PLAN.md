@@ -1,8 +1,11 @@
 # WGSL Script Operator — Design
 
-Status: P1 LANDED 2026-07-22 — operator + template + tests + example
-ports built and green; tray port meshes via CLI in ~1s (16k triangles,
-bounding box exact). P2 (UI editor wiring) and P3 (extensions) remain.
+Status: P1 + P2 LANDED 2026-07-22 — operator + template + tests +
+example ports green; tray port meshes via CLI in ~1s (16k triangles,
+bounding box exact); UI editor generalized (ScriptForm, language-tagged)
+with WGSL parameter forms, reset-to-template, and catalog entry. P3
+(extensions) remains; in-editor span-highlighted diagnostics are open
+polish (naga's annotated text errors already flow through report_error).
 Spike evidence reproduced below so this document stands alone.
 
 P1 delivery notes (what shipped vs the plan):
