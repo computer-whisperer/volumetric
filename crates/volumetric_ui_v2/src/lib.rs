@@ -6857,6 +6857,7 @@ fn asset_type_label(type_hint: Option<AssetTypeHint>) -> &'static str {
         Some(AssetTypeHint::Operator) => "Operator",
         Some(AssetTypeHint::Config) => "Config",
         Some(AssetTypeHint::LuaSource) => "Lua",
+        Some(AssetTypeHint::WgslSource) => "WGSL",
         Some(AssetTypeHint::F64Map) => "F64 Map",
         Some(AssetTypeHint::Binary) => "Binary",
         Some(AssetTypeHint::VecF64(_)) => "Vec",
@@ -6903,7 +6904,8 @@ fn operator_step_inputs(
                     &operator_config::default_values(&fields),
                 ))
             }
-            OperatorMetadataInput::LuaSource(template) => {
+            OperatorMetadataInput::LuaSource(template)
+            | OperatorMetadataInput::WgslSource(template) => {
                 ExecutionInput::Inline(template.clone().into_bytes())
             }
             OperatorMetadataInput::F64Map => {

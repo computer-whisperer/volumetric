@@ -114,12 +114,14 @@
 
 use std::sync::OnceLock;
 
+pub mod annotations;
 pub mod f64_map;
 pub mod fea;
 pub mod lua_parameters;
 pub mod subspace;
 pub mod threading;
 pub mod trimesh;
+pub mod wgsl_parameters;
 
 /// The single inside/outside threshold for occupancy samples.
 ///
@@ -289,6 +291,13 @@ pub enum OperatorMetadataInput {
     /// signatures. The host UI displays a multiline text editor pre-populated
     /// with this template. The script is passed as UTF-8 bytes to the operator.
     LuaSource(String),
+    /// A WGSL script source input.
+    ///
+    /// Same host contract as [`OperatorMetadataInput::LuaSource`] — the
+    /// `String` is a template/stub module, the host shows a text editor, and
+    /// the script travels as UTF-8 bytes — but the source language is the
+    /// WGSL model dialect (see `wgsl_script_operator`).
+    WgslSource(String),
     /// A CBOR-encoded flat map from non-empty strings to finite f64 values.
     ///
     /// This is generic project data: hosts may offer an inline editor or

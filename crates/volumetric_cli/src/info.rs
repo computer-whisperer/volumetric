@@ -192,6 +192,7 @@ enum InputInfo {
     ModelWasm,
     CborConfiguration { cddl: String },
     LuaSource { template: String },
+    WgslSource { template: String },
     F64Map,
     VecF64 { dimension: usize },
     Blob,
@@ -241,6 +242,9 @@ fn metadata_to_json(meta: &OperatorMetadata) -> OperatorMetadataJson {
                     InputInfo::CborConfiguration { cddl: cddl.clone() }
                 }
                 OperatorMetadataInput::LuaSource(template) => InputInfo::LuaSource {
+                    template: template.clone(),
+                },
+                OperatorMetadataInput::WgslSource(template) => InputInfo::WgslSource {
                     template: template.clone(),
                 },
                 OperatorMetadataInput::F64Map => InputInfo::F64Map,
@@ -368,6 +372,15 @@ fn print_info_human(output: &InfoOutput) {
                     }
                     InputInfo::LuaSource { template } => {
                         println!("  [{}] Lua Source (template):", i);
+                        for line in template.lines().take(5) {
+                            println!("      {}", line);
+                        }
+                        if template.lines().count() > 5 {
+                            println!("      ...");
+                        }
+                    }
+                    InputInfo::WgslSource { template } => {
+                        println!("  [{}] WGSL Source (template):", i);
                         for line in template.lines().take(5) {
                             println!("      {}", line);
                         }

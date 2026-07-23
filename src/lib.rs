@@ -182,6 +182,8 @@ pub enum AssetTypeHint {
     Config,
     /// Lua script (UTF-8 text)
     LuaSource,
+    /// WGSL model-dialect script (UTF-8 text)
+    WgslSource,
     /// CBOR-encoded flat map from strings to finite f64 values.
     F64Map,
     /// Unknown/generic binary data
@@ -207,6 +209,7 @@ impl std::fmt::Display for AssetTypeHint {
             AssetTypeHint::Operator => write!(f, "Operator"),
             AssetTypeHint::Config => write!(f, "Config"),
             AssetTypeHint::LuaSource => write!(f, "LuaSource"),
+            AssetTypeHint::WgslSource => write!(f, "WgslSource"),
             AssetTypeHint::F64Map => write!(f, "F64Map"),
             AssetTypeHint::Binary => write!(f, "Binary"),
             AssetTypeHint::VecF64(dim) => write!(f, "VecF64({dim})"),

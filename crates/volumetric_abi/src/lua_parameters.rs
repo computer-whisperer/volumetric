@@ -8,8 +8,10 @@
 //!
 //! The annotation is a schema hint and an F64Map binding. It does not change
 //! the map wire format or make unannotated Lua constants externally mutable.
+//! Option grammar and validation are shared with the WGSL dialect via
+//! [`crate::annotations`].
 
-use std::collections::BTreeSet;
+use crate::annotations;
 
 /// One annotated Lua module constant.
 #[derive(Clone, Debug, PartialEq)]
@@ -28,24 +30,18 @@ pub struct LuaParameter {
 impl LuaParameter {
     /// Validate one routed value against the annotation's finite/range rules.
     pub fn validate_value(&self, value: f64) -> Result<(), String> {
-        if !value.is_finite() {
-            return Err(format!("parameter `{}` must be finite", self.key));
+        self.as_spec().validate_value(value)
+    }
+
+    fn as_spec(&self) -> annotations::ParameterSpec {
+        annotations::ParameterSpec {
+            source_line: self.source_line,
+            binding_name: self.local_name.clone(),
+            key: self.key.clone(),
+            default: self.default,
+            min: self.min,
+            max: self.max,
         }
-        if self.min.is_some_and(|min| value < min) {
-            return Err(format!(
-                "parameter `{}` value {value} is below minimum {}",
-                self.key,
-                self.min.unwrap()
-            ));
-        }
-        if self.max.is_some_and(|max| value > max) {
-            return Err(format!(
-                "parameter `{}` value {value} is above maximum {}",
-                self.key,
-                self.max.unwrap()
-            ));
-        }
-        Ok(())
     }
 }
 
@@ -55,9 +51,7 @@ impl LuaParameter {
 /// the left side of the comment. Derived values should remain ordinary module
 /// constants so both the compiler and the UI agree on the editable default.
 pub fn parse(source: &str) -> Result<Vec<LuaParameter>, String> {
-    let mut parameters = Vec::new();
-    let mut local_names = BTreeSet::new();
-    let mut keys = BTreeSet::new();
+    let mut specs = Vec::new();
 
     for (line_index, line) in source.lines().enumerate() {
         let line_number = line_index + 1;
@@ -81,96 +75,35 @@ pub fn parse(source: &str) -> Result<Vec<LuaParameter>, String> {
                 "line {line_number}: `{local_name}` is not a simple Lua identifier"
             ));
         }
-        let default = parse_finite(default.trim(), line_number, "default")?;
-
-        let mut key = local_name.to_string();
-        let mut min = None;
-        let mut max = None;
-        for option in options.split_whitespace() {
-            let (name, value) = option
-                .split_once('=')
-                .ok_or_else(|| format!("line {line_number}: invalid @param option `{option}`"))?;
-            match name {
-                "key" => {
-                    let value = value
-                        .strip_prefix('"')
-                        .and_then(|value| value.strip_suffix('"'))
-                        .unwrap_or(value);
-                    if value.is_empty() {
-                        return Err(format!(
-                            "line {line_number}: parameter key must not be empty"
-                        ));
-                    }
-                    key = value.to_string();
-                }
-                "min" => min = Some(parse_finite(value, line_number, "minimum")?),
-                "max" => max = Some(parse_finite(value, line_number, "maximum")?),
-                _ => {
-                    return Err(format!(
-                        "line {line_number}: unknown @param option `{name}`"
-                    ));
-                }
-            }
-        }
-
-        if min.zip(max).is_some_and(|(min, max)| min > max) {
-            return Err(format!(
-                "line {line_number}: parameter `{key}` minimum exceeds maximum"
-            ));
-        }
-        let parameter = LuaParameter {
-            source_line: line_number,
-            local_name: local_name.to_string(),
-            key,
+        let default = annotations::parse_finite(default.trim(), line_number, "default")?;
+        specs.push(annotations::parse_spec(
+            options,
+            line_number,
+            local_name,
             default,
-            min,
-            max,
-        };
-        parameter
-            .validate_value(default)
-            .map_err(|error| format!("line {line_number}: {error}"))?;
-
-        if !local_names.insert(parameter.local_name.clone()) {
-            return Err(format!(
-                "line {line_number}: duplicate parameter local `{}`",
-                parameter.local_name
-            ));
-        }
-        if !keys.insert(parameter.key.clone()) {
-            return Err(format!(
-                "line {line_number}: duplicate parameter key `{}`",
-                parameter.key
-            ));
-        }
-        parameters.push(parameter);
+        )?);
     }
 
-    Ok(parameters)
+    annotations::check_duplicates(&specs)?;
+    Ok(specs
+        .into_iter()
+        .map(|spec| LuaParameter {
+            source_line: spec.source_line,
+            local_name: spec.binding_name,
+            key: spec.key,
+            default: spec.default,
+            min: spec.min,
+            max: spec.max,
+        })
+        .collect())
 }
 
 /// Render parameters as the existing host configuration CDDL subset. This is
 /// a presentation/schema bridge only; F64Map remains an open flat map and may
 /// contain keys that this particular Lua consumer does not use.
 pub fn schema_cddl(parameters: &[LuaParameter]) -> String {
-    let fields = parameters
-        .iter()
-        .map(|parameter| {
-            let mut field = format!(
-                "{}: float .default {}",
-                parameter.key,
-                format_number(parameter.default)
-            );
-            if let Some(min) = parameter.min {
-                field.push_str(&format!(" .ge {}", format_number(min)));
-            }
-            if let Some(max) = parameter.max {
-                field.push_str(&format!(" .le {}", format_number(max)));
-            }
-            field
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("{{ {fields} }}")
+    let specs: Vec<_> = parameters.iter().map(LuaParameter::as_spec).collect();
+    annotations::schema_cddl(&specs)
 }
 
 fn is_lua_identifier(value: &str) -> bool {
@@ -179,24 +112,6 @@ fn is_lua_identifier(value: &str) -> bool {
         .next()
         .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
         && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
-}
-
-fn parse_finite(value: &str, line: usize, role: &str) -> Result<f64, String> {
-    let value = value
-        .parse::<f64>()
-        .map_err(|_| format!("line {line}: parameter {role} `{value}` is not a number"))?;
-    if !value.is_finite() {
-        return Err(format!("line {line}: parameter {role} must be finite"));
-    }
-    Ok(value)
-}
-
-fn format_number(value: f64) -> String {
-    if value == 0.0 {
-        "0.0".to_string()
-    } else {
-        value.to_string()
-    }
 }
 
 #[cfg(test)]
