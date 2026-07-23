@@ -13,7 +13,13 @@
 //! - Bar2: struts with both endpoints kept survive whole; crossings are
 //!   `crossing: "clip"` shortened to the surface (bisection, one fresh
 //!   node per crossing, node fields interpolated) or `crossing: "drop"`
-//!   dropped whole. Struts with no endpoint kept are dropped. After
+//!   dropped whole. Endpoint classification alone misses struts that
+//!   *tunnel* through a removed region thinner than a strut (both
+//!   endpoints kept, midsection not); `interior_samples: n` additionally
+//!   classifies n evenly spaced points along each strut and drops whole
+//!   any strut whose interior leaves the kept region — choose n so the
+//!   sample spacing (strut length / (n+1)) undercuts the thinnest gap
+//!   being cut. Struts with no endpoint kept are dropped. After
 //!   clipping, struts shorter than `weld_factor * radius` weld into
 //!   joints (needs a scalar `radius` element field; without one welding
 //!   is skipped) — see `mesh_edit_core::weld_short_bars` for why. With
@@ -29,7 +35,8 @@
 //! - Input 1: ModelWASM (must be 3D) — the clip region
 //! - Input 2: CBOR configuration:
 //!   `{ keep: "inside" / "outside" .default "inside", crossing: "clip" /
-//!   "drop" .default "clip", weld_factor: float .default 1.0 (0
+//!   "drop" .default "clip", interior_samples: int .default 0 (0
+//!   disables tunnel detection), weld_factor: float .default 1.0 (0
 //!   disables), prune_islands: bool .default false }`
 //!
 //! Output 0: the clipped CBOR-encoded `FeaMesh` (same element kind).
@@ -78,6 +85,9 @@ struct ClipConfig {
     keep: KeepConfig,
     /// Bar2 only; other kinds ignore it.
     crossing: CrossingConfig,
+    /// Bar2 only: interior points classified per strut to catch tunnels
+    /// through removed regions thinner than a strut; 0 disables.
+    interior_samples: u32,
     /// Bar2 only: weld struts shorter than `weld_factor * radius` (their
     /// own `radius` element field); 0 disables, no radius field skips.
     weld_factor: f64,
@@ -90,6 +100,7 @@ impl Default for ClipConfig {
         Self {
             keep: KeepConfig::Inside,
             crossing: CrossingConfig::Clip,
+            interior_samples: 0,
             weld_factor: 1.0,
             prune_islands: false,
         }
@@ -110,6 +121,31 @@ fn clip_mesh(
     kept: &mut KeptBatch,
     config: &ClipConfig,
 ) -> Result<FeaMesh, String> {
+    // Tunnel detection: classify interior points of every strut in one
+    // batch; a strut whose interior leaves the kept region is dropped
+    // whole in both crossing modes (a tunnel cannot be shortened into a
+    // single kept segment).
+    let tunnel: Vec<bool> =
+        if mesh.element_kind == FeaElementKind::Bar2 && config.interior_samples > 0 {
+            let n = config.interior_samples as usize;
+            let mut points = Vec::with_capacity(mesh.element_count() * n);
+            for e in 0..mesh.element_count() {
+                let pair = mesh.element(e);
+                let (a, b) = (
+                    mesh.node_position(pair[0] as usize),
+                    mesh.node_position(pair[1] as usize),
+                );
+                for i in 1..=n {
+                    let t = i as f64 / (n + 1) as f64;
+                    points.push(core::array::from_fn(|c| a[c] + t * (b[c] - a[c])));
+                }
+            }
+            let verdicts = kept(&points)?;
+            verdicts.chunks(n).map(|c| c.iter().any(|&k| !k)).collect()
+        } else {
+            vec![false; mesh.element_count()]
+        };
+
     let mut clipped = match mesh.element_kind {
         FeaElementKind::Point1 => {
             let keep: Vec<bool> = mesh
@@ -127,11 +163,11 @@ fn clip_mesh(
         }
         FeaElementKind::Bar2 if config.crossing == CrossingConfig::Drop => {
             let keep: Vec<bool> = (0..mesh.element_count())
-                .map(|e| mesh.element(e).iter().all(|&n| node_kept[n as usize]))
+                .map(|e| !tunnel[e] && mesh.element(e).iter().all(|&n| node_kept[n as usize]))
                 .collect();
             mesh_edit_core::filter_elements(mesh, &keep)?
         }
-        FeaElementKind::Bar2 => clip_bars(mesh, node_kept, kept)?,
+        FeaElementKind::Bar2 => clip_bars(mesh, node_kept, kept, &tunnel)?,
     };
 
     if clipped.element_count() == 0 {
@@ -169,7 +205,12 @@ fn clip_mesh(
 /// fresh node bisected onto the boundary (node fields interpolated at the
 /// crossing parameter), fully-dropped struts vanish. Element fields
 /// follow surviving struts.
-fn clip_bars(mesh: &FeaMesh, node_kept: &[bool], kept: &mut KeptBatch) -> Result<FeaMesh, String> {
+fn clip_bars(
+    mesh: &FeaMesh,
+    node_kept: &[bool],
+    kept: &mut KeptBatch,
+    tunnel: &[bool],
+) -> Result<FeaMesh, String> {
     // Crossing struts: (element, kept node, lost node), bisected in
     // lock-step so each round is one batched classification.
     struct Crossing {
@@ -181,7 +222,10 @@ fn clip_bars(mesh: &FeaMesh, node_kept: &[bool], kept: &mut KeptBatch) -> Result
     }
     let mut crossings: Vec<Crossing> = Vec::new();
     let mut whole: Vec<usize> = Vec::new();
-    for e in 0..mesh.element_count() {
+    for (e, &tunneling) in tunnel.iter().enumerate() {
+        if tunneling {
+            continue; // interior leaves the kept region: dropped whole
+        }
         let pair = mesh.element(e);
         match (node_kept[pair[0] as usize], node_kept[pair[1] as usize]) {
             (true, true) => whole.push(e),
@@ -335,6 +379,12 @@ fn build_clipped(config: &ClipConfig) -> Result<FeaMesh, String> {
             config.weld_factor
         ));
     }
+    if config.interior_samples > 256 {
+        return Err(format!(
+            "interior_samples capped at 256, got {}",
+            config.interior_samples
+        ));
+    }
     let mesh = decode_fea_mesh(&read_input(0))?;
     let dims =
         input_model_dimensions(1).ok_or_else(|| "input 1 is not a usable model".to_string())?;
@@ -391,7 +441,7 @@ pub extern "C" fn run() {
 pub extern "C" fn get_metadata() -> i64 {
     static METADATA: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     volumetric_abi::metadata_reply(&METADATA, || {
-        let schema = r#"{ keep: "inside" / "outside" .default "inside", crossing: "clip" / "drop" .default "clip", weld_factor: float .default 1.0, prune_islands: bool .default false }"#
+        let schema = r#"{ keep: "inside" / "outside" .default "inside", crossing: "clip" / "drop" .default "clip", interior_samples: int .default 0, weld_factor: float .default 1.0, prune_islands: bool .default false }"#
             .to_string();
         OperatorMetadata {
             name: "mesh_clip_operator".to_string(),
@@ -627,5 +677,47 @@ mod tests {
         let node_kept = classify(&cloud, &mut nothing);
         let err = clip_mesh(&cloud, &node_kept, &mut nothing, &ClipConfig::default()).unwrap_err();
         assert!(err.contains("kept no elements"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn interior_samples_drop_struts_tunneling_a_thin_gap() {
+        // Kept region: everything except a thin slab 0.55 < x < 0.65.
+        // The 2-strut path 0.0 -- 0.4 -- 1.2 has all endpoints kept, but
+        // its second strut tunnels the gap.
+        let mut slab_gap = |points: &[[f64; 3]]| -> Result<Vec<bool>, String> {
+            Ok(points
+                .iter()
+                .map(|p| !(0.55 < p[0] && p[0] < 0.65))
+                .collect())
+        };
+        let mesh = FeaMesh {
+            element_kind: FeaElementKind::Bar2,
+            node_positions: vec![0.0, 0.0, 0.0, 0.4, 0.0, 0.0, 1.2, 0.0, 0.0],
+            connectivity: vec![0, 1, 1, 2],
+            node_fields: vec![],
+            element_fields: vec![],
+        };
+        let node_kept = classify(&mesh, &mut slab_gap);
+        assert!(node_kept.iter().all(|&k| k), "all endpoints sit in bands");
+
+        // Endpoint-only classification misses the tunnel in both modes.
+        for crossing in [CrossingConfig::Clip, CrossingConfig::Drop] {
+            let config = ClipConfig {
+                crossing,
+                ..ClipConfig::default()
+            };
+            let kept = clip_mesh(&mesh, &node_kept, &mut slab_gap, &config).unwrap();
+            assert_eq!(kept.element_count(), 2, "{crossing:?} without samples");
+
+            // 15 interior samples (spacing 0.05 < gap 0.1) catch it.
+            let config = ClipConfig {
+                interior_samples: 15,
+                ..config
+            };
+            let kept = clip_mesh(&mesh, &node_kept, &mut slab_gap, &config).unwrap();
+            assert_eq!(kept.element_count(), 1, "{crossing:?} with samples");
+            let p = kept.node_position(1);
+            assert!(p[0] <= 0.4 + 1e-12, "the surviving strut is 0.0 -- 0.4");
+        }
     }
 }
