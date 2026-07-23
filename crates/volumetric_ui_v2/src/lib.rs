@@ -254,7 +254,7 @@ const TOGGLE_PIN_PREFIX: &str = "runtime:toggle-pin:";
 /// half-typed names never leak into exports/references.
 const OUTPUT_NAME_KEY: &str = "step-output-name";
 const RENAME_OUTPUT_PREFIX: &str = "project:rename-output:";
-const RESET_LUA_PREFIX: &str = "project:reset-lua:";
+const RESET_SCRIPT_PREFIX: &str = "project:reset-script:";
 const CONFIG_FIELD_PREFIX: &str = "cfg:";
 /// Text inputs for a `VecF64` operator input; value `{input_idx}:{component}`.
 const VEC_INPUT_PREFIX: &str = "vec:";
@@ -266,7 +266,7 @@ const CONFIG_LIST_PREFIX: &str = "cfg-list:";
 const CONFIG_LIST_ADD_PREFIX: &str = "cfg-list-add:";
 /// Remove an array element; key `cfg-list-del:{field}:{index}`.
 const CONFIG_LIST_DEL_PREFIX: &str = "cfg-list-del:";
-const LUA_SOURCE_KEY: &str = "lua-source";
+const SCRIPT_SOURCE_KEY: &str = "script-source";
 const PREVIEW_RESOLUTIONS: [usize; 13] =
     [16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024];
 /// Raster resolutions offered for 2D field outputs (cells along the longer
@@ -869,8 +869,9 @@ struct StepEditState {
     vecs: Vec<VecForm>,
     /// The config form, present only when the operator declares a config input.
     config: Option<ConfigForm>,
-    /// The Lua source editor, present only for a `LuaSource` input.
-    lua: Option<LuaForm>,
+    /// The script source editor, present only for a `LuaSource` or
+    /// `WgslSource` input.
+    script: Option<ScriptForm>,
     /// Edit buffer for the step's (first) output name; committed via Rename.
     output_name: String,
 }
@@ -887,12 +888,55 @@ struct ConfigForm {
     lists: std::collections::BTreeMap<String, Vec<String>>,
 }
 
-/// Editor state for a `LuaSource` input. The `source` buffer is the edit
+/// Which scripting dialect a source input carries; decides the editor
+/// label and which `@param` annotation parser derives the parameter form.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ScriptLanguage {
+    Lua,
+    Wgsl,
+}
+
+impl ScriptLanguage {
+    fn of_input(input: &OperatorMetadataInput) -> Option<ScriptLanguage> {
+        match input {
+            OperatorMetadataInput::LuaSource(_) => Some(ScriptLanguage::Lua),
+            OperatorMetadataInput::WgslSource(_) => Some(ScriptLanguage::Wgsl),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            ScriptLanguage::Lua => "Lua Script",
+            ScriptLanguage::Wgsl => "WGSL Script",
+        }
+    }
+
+    /// CDDL schema for the script's `@param` annotations (None when the
+    /// script declares none or does not parse).
+    fn parameter_schema(self, source: &str) -> Option<String> {
+        match self {
+            ScriptLanguage::Lua => {
+                let parameters = volumetric::lua_parameters::parse(source).ok()?;
+                (!parameters.is_empty())
+                    .then(|| volumetric::lua_parameters::schema_cddl(&parameters))
+            }
+            ScriptLanguage::Wgsl => {
+                let parameters = volumetric::wgsl_parameters::parse(source).ok()?;
+                (!parameters.is_empty())
+                    .then(|| volumetric::wgsl_parameters::schema_cddl(&parameters))
+            }
+        }
+    }
+}
+
+/// Editor state for a script source input. The `source` buffer is the edit
 /// source of truth; every change is written straight back to the step (no
 /// parse gate — any text is a valid script).
 #[derive(Debug)]
-struct LuaForm {
+struct ScriptForm {
     input_idx: usize,
+    language: ScriptLanguage,
     source: String,
 }
 
@@ -2636,7 +2680,7 @@ impl VolumetricUiV2 {
                     OperatorMetadataInput::CBORConfiguration(cddl) => Some((idx, cddl.clone())),
                     _ => None,
                 });
-        let lua_parameter_config = metadata
+        let script_parameter_config = metadata
             .inputs
             .iter()
             .position(|input| matches!(input, OperatorMetadataInput::F64Map))
@@ -2644,24 +2688,24 @@ impl VolumetricUiV2 {
                 matches!(step.inputs.get(*input_idx), Some(ExecutionInput::Inline(_)))
             })
             .and_then(|input_idx| {
-                let source_input = metadata
-                    .inputs
-                    .iter()
-                    .position(|input| matches!(input, OperatorMetadataInput::LuaSource(_)))?;
+                let (source_input, language) =
+                    metadata
+                        .inputs
+                        .iter()
+                        .enumerate()
+                        .find_map(|(idx, input)| {
+                            ScriptLanguage::of_input(input).map(|language| (idx, language))
+                        })?;
                 let ExecutionInput::Inline(source) = step.inputs.get(source_input)? else {
                     return None;
                 };
                 let source = std::str::from_utf8(source).ok()?;
-                let parameters = volumetric::lua_parameters::parse(source).ok()?;
-                (!parameters.is_empty()).then(|| {
-                    (
-                        input_idx,
-                        volumetric::lua_parameters::schema_cddl(&parameters),
-                    )
-                })
+                language
+                    .parameter_schema(source)
+                    .map(|schema| (input_idx, schema))
             });
         let config = static_config
-            .or(lua_parameter_config)
+            .or(script_parameter_config)
             .and_then(|(input_idx, cddl)| {
                 self.build_config_form(
                     step,
@@ -2671,22 +2715,29 @@ impl VolumetricUiV2 {
                 )
             });
 
-        let lua = metadata
+        let script = metadata
             .inputs
             .iter()
-            .position(|input| matches!(input, OperatorMetadataInput::LuaSource(_)))
-            .map(|input_idx| {
+            .enumerate()
+            .find_map(|(idx, input)| {
+                ScriptLanguage::of_input(input).map(|language| (idx, language))
+            })
+            .map(|(input_idx, language)| {
                 let source = match step.inputs.get(input_idx) {
                     Some(ExecutionInput::Inline(bytes)) => {
                         String::from_utf8_lossy(bytes).into_owned()
                     }
                     _ => String::new(),
                 };
-                LuaForm { input_idx, source }
+                ScriptForm {
+                    input_idx,
+                    language,
+                    source,
+                }
             });
 
         // Nothing editable → no step editor.
-        if asset_slots.is_empty() && vecs.is_empty() && config.is_none() && lua.is_none() {
+        if asset_slots.is_empty() && vecs.is_empty() && config.is_none() && script.is_none() {
             return None;
         }
 
@@ -2695,7 +2746,7 @@ impl VolumetricUiV2 {
             asset_slots,
             vecs,
             config,
-            lua,
+            script,
             output_name: step.outputs.first().cloned().unwrap_or_default(),
         })
     }
@@ -2967,8 +3018,8 @@ impl VolumetricUiV2 {
         self.step_edit = self.build_step_edit(step_idx);
     }
 
-    /// Restores the selected step's Lua source to the operator's template.
-    fn reset_lua_source(&mut self, step_idx: usize) {
+    /// Restores the selected step's script source to the operator's template.
+    fn reset_script_source(&mut self, step_idx: usize) {
         let Some(step) = self.project.timeline().get(step_idx) else {
             return;
         };
@@ -2979,7 +3030,8 @@ impl VolumetricUiV2 {
             return;
         };
         let Some(template) = metadata.inputs.iter().find_map(|input| match input {
-            OperatorMetadataInput::LuaSource(template) => Some(template.clone()),
+            OperatorMetadataInput::LuaSource(template)
+            | OperatorMetadataInput::WgslSource(template) => Some(template.clone()),
             _ => None,
         }) else {
             return;
@@ -2988,10 +3040,10 @@ impl VolumetricUiV2 {
             return;
         };
         if edit.step_idx == step_idx
-            && let Some(lua) = edit.lua.as_mut()
+            && let Some(script) = edit.script.as_mut()
         {
-            lua.source = template;
-            self.write_lua_source(step_idx, lua);
+            script.source = template;
+            self.write_script_source(step_idx, script);
             self.status = format!("step {} script reset to template", step_idx + 1);
         }
         self.step_edit = Some(edit);
@@ -3250,11 +3302,11 @@ impl VolumetricUiV2 {
         self.set_config_buffer(field_name, (!current).to_string());
     }
 
-    /// Writes the Lua editor's current source into the step's input bytes.
-    fn write_lua_source(&mut self, step_idx: usize, lua: &LuaForm) {
+    /// Writes the script editor's current source into the step's input bytes.
+    fn write_script_source(&mut self, step_idx: usize, script: &ScriptForm) {
         if let Some(step) = self.project.timeline_mut().get_mut(step_idx) {
-            if let Some(ExecutionInput::Inline(slot)) = step.inputs.get_mut(lua.input_idx) {
-                *slot = lua.source.clone().into_bytes();
+            if let Some(ExecutionInput::Inline(slot)) = step.inputs.get_mut(script.input_idx) {
+                *slot = script.source.clone().into_bytes();
             }
         }
         self.mark_project_dirty();
@@ -3840,27 +3892,27 @@ impl App for VolumetricUiV2 {
                 return;
             }
         }
-        // Controlled editing for the Lua source area.
-        if event.target_key() == Some(LUA_SOURCE_KEY) {
+        // Controlled editing for the script source area.
+        if event.target_key() == Some(SCRIPT_SOURCE_KEY) {
             if let Some(mut edit) = self.step_edit.take() {
                 let mut changed = false;
                 let mut parameter_schema_changed = false;
-                if let Some(lua) = edit.lua.as_mut() {
-                    let old_parameters = volumetric::lua_parameters::parse(&lua.source).ok();
+                if let Some(script) = edit.script.as_mut() {
+                    let old_schema = script.language.parameter_schema(&script.source);
                     changed = text_area::apply_event(
-                        &mut lua.source,
+                        &mut script.source,
                         &mut self.selection,
                         &event,
-                        LUA_SOURCE_KEY,
+                        SCRIPT_SOURCE_KEY,
                     );
                     if changed {
                         parameter_schema_changed =
-                            old_parameters != volumetric::lua_parameters::parse(&lua.source).ok();
+                            old_schema != script.language.parameter_schema(&script.source);
                     }
                 }
                 if changed {
-                    if let Some(lua) = edit.lua.as_ref() {
-                        self.write_lua_source(edit.step_idx, lua);
+                    if let Some(script) = edit.script.as_ref() {
+                        self.write_script_source(edit.step_idx, script);
                     }
                 }
                 let step_idx = edit.step_idx;
@@ -4174,8 +4226,8 @@ impl App for VolumetricUiV2 {
             self.delete_step(idx);
         } else if let Some(idx) = parse_index_route(route, RENAME_OUTPUT_PREFIX) {
             self.rename_step_output(idx);
-        } else if let Some(idx) = parse_index_route(route, RESET_LUA_PREFIX) {
-            self.reset_lua_source(idx);
+        } else if let Some(idx) = parse_index_route(route, RESET_SCRIPT_PREFIX) {
+            self.reset_script_source(idx);
         } else if let Some(idx) = parse_index_route(route, MOVE_STEP_UP_PREFIX) {
             self.move_step(idx, -1);
         } else if let Some(idx) = parse_index_route(route, MOVE_STEP_DOWN_PREFIX) {
@@ -6342,10 +6394,10 @@ fn step_edit_rows(app: &VolumetricUiV2, step_idx: usize) -> Vec<El> {
         push_config_rows(&config.fields, "", config, &app.selection, &mut rows);
     }
 
-    if let Some(lua) = &edit.lua {
-        rows.push(text("Script").muted().caption().semibold());
+    if let Some(script) = &edit.script {
+        rows.push(text(script.language.label()).muted().caption().semibold());
         rows.push(
-            text_area(LUA_SOURCE_KEY, &lua.source, &app.selection)
+            text_area(SCRIPT_SOURCE_KEY, &script.source, &app.selection)
                 .width(Size::Fill(1.0))
                 .height(Size::Fixed(180.0)),
         );
@@ -6354,7 +6406,7 @@ fn step_edit_rows(app: &VolumetricUiV2, step_idx: usize) -> Vec<El> {
                 .xsmall()
                 .secondary()
                 .width(Size::Fill(1.0))
-                .key(format!("{RESET_LUA_PREFIX}{step_idx}")),
+                .key(format!("{RESET_SCRIPT_PREFIX}{step_idx}")),
         );
     }
 
@@ -6857,6 +6909,7 @@ fn asset_type_label(type_hint: Option<AssetTypeHint>) -> &'static str {
         Some(AssetTypeHint::Operator) => "Operator",
         Some(AssetTypeHint::Config) => "Config",
         Some(AssetTypeHint::LuaSource) => "Lua",
+        Some(AssetTypeHint::WgslSource) => "WGSL",
         Some(AssetTypeHint::F64Map) => "F64 Map",
         Some(AssetTypeHint::Binary) => "Binary",
         Some(AssetTypeHint::VecF64(_)) => "Vec",
@@ -6903,7 +6956,8 @@ fn operator_step_inputs(
                     &operator_config::default_values(&fields),
                 ))
             }
-            OperatorMetadataInput::LuaSource(template) => {
+            OperatorMetadataInput::LuaSource(template)
+            | OperatorMetadataInput::WgslSource(template) => {
                 ExecutionInput::Inline(template.clone().into_bytes())
             }
             OperatorMetadataInput::F64Map => {
@@ -7587,6 +7641,36 @@ mod tests {
                 .config
                 .is_some(),
             "restoring inline data should restore the annotation-derived form"
+        );
+    }
+
+    #[test]
+    fn wgsl_annotations_build_the_inline_parameter_form() {
+        let mut app = VolumetricUiV2::empty();
+        add_operator_click(&mut app, "wgsl_script_operator");
+        app.step_edit = app.build_step_edit(0);
+
+        let edit = app.step_edit.as_ref().expect("WGSL step editor");
+        let script = edit.script.as_ref().expect("script source form");
+        assert_eq!(script.language, ScriptLanguage::Wgsl);
+        assert!(script.source.contains("fn scene"));
+
+        let config = edit.config.as_ref().expect("annotation-derived form");
+        assert_eq!(config.name.as_deref(), Some("Parameters"));
+        let radius = config
+            .fields
+            .iter()
+            .find(|field| field.name == "sphere.radius")
+            .expect("sphere radius field");
+        assert_eq!(radius.min, Some(0.000001));
+
+        app.set_config_buffer("sphere.radius", "2".to_string());
+        let ExecutionInput::Inline(bytes) = &app.project.timeline()[0].inputs[1] else {
+            panic!("editing inline parameters must keep an inline F64Map");
+        };
+        assert_eq!(
+            volumetric::f64_map::decode(bytes).unwrap()["sphere.radius"],
+            2.0
         );
     }
 
@@ -9697,11 +9781,11 @@ mod tests {
         assert!(app.project().exports().contains(&step.outputs[0]));
     }
 
-    /// Adds each bundled operator and, for the first one with a Lua input, edits
-    /// the source and asserts it lands in the step's input bytes.
+    /// Adds each bundled operator and, for every one with a script input,
+    /// edits the source and asserts it lands in the step's input bytes.
     #[test]
-    fn editing_lua_source_updates_step_bytes() {
-        let mut exercised = false;
+    fn editing_script_source_updates_step_bytes() {
+        let mut exercised = 0;
         for op in volumetric_assets::operators() {
             let mut app = VolumetricUiV2::default();
             add_operator_click(&mut app, op.name);
@@ -9710,7 +9794,7 @@ mod tests {
             let Some(edit) = app.step_edit.as_ref() else {
                 continue;
             };
-            if edit.lua.is_none() {
+            if edit.script.is_none() {
                 continue;
             }
 
@@ -9718,18 +9802,18 @@ mod tests {
             let new_source = "-- edited\nreturn 1\n".to_string();
             let mut edit = app.step_edit.take().unwrap();
             let input_idx = {
-                let lua = edit.lua.as_mut().unwrap();
-                lua.source = new_source.clone();
-                lua.input_idx
+                let script = edit.script.as_mut().unwrap();
+                script.source = new_source.clone();
+                script.input_idx
             };
-            let lua_source = edit.lua.as_ref().unwrap();
-            app.write_lua_source(edit.step_idx, lua_source);
+            let script_source = edit.script.as_ref().unwrap();
+            app.write_script_source(edit.step_idx, script_source);
             let step_idx = edit.step_idx;
             app.step_edit = Some(edit);
 
             let step = &app.project().timeline()[step_idx];
             let ExecutionInput::Inline(bytes) = &step.inputs[input_idx] else {
-                panic!("lua input should be inline bytes");
+                panic!("script input should be inline bytes");
             };
             assert_eq!(
                 bytes.as_slice(),
@@ -9737,12 +9821,11 @@ mod tests {
                 "operator {}",
                 op.name
             );
-            exercised = true;
-            break;
+            exercised += 1;
         }
         assert!(
-            exercised,
-            "expected at least one bundled operator with a Lua input"
+            exercised >= 2,
+            "expected both script operators to be exercised, got {exercised}"
         );
     }
 }

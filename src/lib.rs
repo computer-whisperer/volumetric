@@ -182,6 +182,8 @@ pub enum AssetTypeHint {
     Config,
     /// Lua script (UTF-8 text)
     LuaSource,
+    /// WGSL model-dialect script (UTF-8 text)
+    WgslSource,
     /// CBOR-encoded flat map from strings to finite f64 values.
     F64Map,
     /// Unknown/generic binary data
@@ -207,6 +209,7 @@ impl std::fmt::Display for AssetTypeHint {
             AssetTypeHint::Operator => write!(f, "Operator"),
             AssetTypeHint::Config => write!(f, "Config"),
             AssetTypeHint::LuaSource => write!(f, "LuaSource"),
+            AssetTypeHint::WgslSource => write!(f, "WgslSource"),
             AssetTypeHint::F64Map => write!(f, "F64Map"),
             AssetTypeHint::Binary => write!(f, "Binary"),
             AssetTypeHint::VecF64(dim) => write!(f, "VecF64({dim})"),
@@ -303,7 +306,7 @@ pub use volumetric_abi::{ChannelKind, SampleChannel, SampleFormat, encode_sample
 
 // The FEA mesh value type (CBOR payload of FeaMesh-typed assets).
 pub use volumetric_abi::fea;
-pub use volumetric_abi::{f64_map, lua_parameters};
+pub use volumetric_abi::{f64_map, lua_parameters, wgsl_parameters};
 
 // The triangle mesh value type (CBOR payload of TriMesh-typed assets).
 pub use volumetric_abi::trimesh;
@@ -1051,7 +1054,7 @@ impl Project {
             "rotation_operator" => "rotated",
             "scale_operator" => "scaled",
             "boolean_operator" => "boolean_result",
-            "lua_script_operator" => "scripted",
+            "lua_script_operator" | "wgsl_script_operator" => "scripted",
             _ => {
                 let base = operator_crate_name
                     .strip_suffix("_operator")

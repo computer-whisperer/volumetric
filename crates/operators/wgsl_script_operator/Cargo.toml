@@ -1,0 +1,16 @@
+[package]
+name = "wgsl_script_operator"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+volumetric_abi = { path = "../../volumetric_abi" }
+walrus = "0.26"
+naga = { version = "30.0.0", features = ["wgsl-in"] }
+thiserror = "2"
+
+[dev-dependencies]
+wasmtime = "44"

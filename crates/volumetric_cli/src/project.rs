@@ -120,6 +120,7 @@ pub fn run_project_add_model(args: ProjectAddModelArgs) -> Result<()> {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum AssetTypeArg {
     Lua,
+    Wgsl,
     Config,
     F64Map,
     Blob,
@@ -129,6 +130,7 @@ impl From<AssetTypeArg> for AssetTypeHint {
     fn from(value: AssetTypeArg) -> Self {
         match value {
             AssetTypeArg::Lua => AssetTypeHint::LuaSource,
+            AssetTypeArg::Wgsl => AssetTypeHint::WgslSource,
             AssetTypeArg::Config => AssetTypeHint::Config,
             AssetTypeArg::F64Map => AssetTypeHint::F64Map,
             AssetTypeArg::Blob => AssetTypeHint::Binary,
@@ -174,6 +176,7 @@ pub fn run_project_add_asset(args: ProjectAddAssetArgs) -> Result<()> {
         .r#type
         .unwrap_or(match extension.as_str() {
             "lua" => AssetTypeArg::Lua,
+            "wgsl" => AssetTypeArg::Wgsl,
             "cbor" => AssetTypeArg::Config,
             _ => AssetTypeArg::Blob,
         })
@@ -286,6 +289,7 @@ pub fn input_type_label(input: &OperatorMetadataInput) -> String {
         OperatorMetadataInput::ModelWASM => "ModelWASM".to_string(),
         OperatorMetadataInput::CBORConfiguration(_) => "CBOR configuration".to_string(),
         OperatorMetadataInput::LuaSource(_) => "Lua source".to_string(),
+        OperatorMetadataInput::WgslSource(_) => "WGSL source".to_string(),
         OperatorMetadataInput::F64Map => "F64Map".to_string(),
         OperatorMetadataInput::Blob => "Blob".to_string(),
         OperatorMetadataInput::VecF64(dim) => format!("VecF64({dim})"),
@@ -645,6 +649,7 @@ pub fn run_project_export(args: ProjectExportArgs) -> Result<()> {
         let ext = match type_hint {
             AssetTypeHint::Model | AssetTypeHint::Operator => "wasm",
             AssetTypeHint::LuaSource => "lua",
+            AssetTypeHint::WgslSource => "wgsl",
             AssetTypeHint::F64Map | AssetTypeHint::Config => "cbor",
             AssetTypeHint::FeaMesh => "vfea",
             AssetTypeHint::TriMesh => "vmesh",

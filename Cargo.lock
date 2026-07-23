@@ -6548,6 +6548,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "wgsl_model_template"
+version = "0.1.0"
+dependencies = [
+ "libm",
+]
+
+[[package]]
+name = "wgsl_script_operator"
+version = "0.1.0"
+dependencies = [
+ "naga",
+ "thiserror 2.0.18",
+ "volumetric_abi",
+ "walrus",
+ "wasmtime",
+]
+
+[[package]]
 name = "wide"
 version = "0.7.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
