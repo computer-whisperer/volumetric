@@ -17,11 +17,19 @@
 //! displacement <= 0.25 cells per axis, so sites never collide); `seed`
 //! selects alternate jitters (0 = the foam family's).
 //!
+//! `phase_x`/`phase_y`/`phase_z` (cell units, -1..=1) rigidly shift the
+//! whole site lattice before the domain clip. Jitter is keyed to the cell
+//! index, so two fills differing only in phase are exact translates of
+//! each other — e.g. phase 0 and phase 0.25 on each axis yield a pair of
+//! interleaved lattices offset by 1/4 cell, each conformal to the domain.
+//!
 //! Inputs:
 //! - Input 0: ModelWASM (must be 3D) — the domain to fill
 //! - Input 1: CBOR configuration:
 //!   `{ pattern: "grid" / "bcc" .default "bcc", cell_size: float .default
-//!   0.05, irregularity: float .default 0.3, seed: int .default 0 }`
+//!   0.05, irregularity: float .default 0.3, seed: int .default 0,
+//!   phase_x: float .default 0.0, phase_y: float .default 0.0,
+//!   phase_z: float .default 0.0 }`
 //!
 //! Output 0: CBOR-encoded Point1 `FeaMesh` (no fields; per-site data such
 //! as Voronoi weights can be attached by downstream operators).
@@ -63,6 +71,17 @@ struct FillConfig {
     /// Jitter-hash salt: 0 is the foam family's site set, other values
     /// alternate jitters of the same pattern.
     seed: i64,
+    /// Lattice phase per axis in cell units (-1..=1): rigidly shifts the
+    /// site lattice before the domain clip.
+    phase_x: f64,
+    phase_y: f64,
+    phase_z: f64,
+}
+
+impl FillConfig {
+    fn phase(&self) -> [f64; 3] {
+        [self.phase_x, self.phase_y, self.phase_z]
+    }
 }
 
 impl Default for FillConfig {
@@ -72,18 +91,31 @@ impl Default for FillConfig {
             cell_size: 0.05,
             irregularity: 0.3,
             seed: 0,
+            phase_x: 0.0,
+            phase_y: 0.0,
+            phase_z: 0.0,
         }
     }
 }
 
+/// Per-axis cell margin covering the furthest a site can stray from its
+/// base cell corner: coset offset (0.5) + jitter (0.25) + |phase|.
+fn cell_margin(config: &FillConfig) -> i64 {
+    let phase_max = config.phase().iter().fold(0.0f64, |m, p| m.max(p.abs()));
+    (0.75 + phase_max).ceil() as i64
+}
+
 /// Enumerate every candidate site (model coordinates) whose cell touches
-/// the box `[lo, hi]` expanded by one cell — jitter and the coset offset
-/// keep a cell's site within one cell of its base, so no site that could
-/// land inside the box is missed. Deterministic order.
+/// the box `[lo, hi]` expanded by [`cell_margin`] — jitter, the coset
+/// offset, and the phase keep a cell's site within that many cells of its
+/// base, so no site that could land inside the box is missed.
+/// Deterministic order.
 fn enumerate_sites(lo: [f64; 3], hi: [f64; 3], config: &FillConfig) -> Vec<[f64; 3]> {
     let cell = config.cell_size;
-    let cell_lo: [i64; 3] = core::array::from_fn(|a| (lo[a] / cell).floor() as i64 - 1);
-    let cell_hi: [i64; 3] = core::array::from_fn(|a| (hi[a] / cell).ceil() as i64 + 1);
+    let margin = cell_margin(config);
+    let phase = config.phase();
+    let cell_lo: [i64; 3] = core::array::from_fn(|a| (lo[a] / cell).floor() as i64 - margin);
+    let cell_hi: [i64; 3] = core::array::from_fn(|a| (hi[a] / cell).ceil() as i64 + margin);
     let cosets: &[usize] = match config.pattern {
         PatternConfig::Grid => &[0],
         PatternConfig::Bcc => &[0, 1],
@@ -95,7 +127,7 @@ fn enumerate_sites(lo: [f64; 3], hi: [f64; 3], config: &FillConfig) -> Vec<[f64;
                 for &coset in cosets {
                     let s =
                         foam_site_seeded([i, j, k], coset, config.irregularity, config.seed as u64);
-                    sites.push([s[0] * cell, s[1] * cell, s[2] * cell]);
+                    sites.push(core::array::from_fn(|a| (s[a] + phase[a]) * cell));
                 }
             }
         }
@@ -140,6 +172,16 @@ fn build_points(config: &FillConfig) -> Result<FeaMesh, String> {
     if config.seed < 0 {
         return Err(format!("seed must be non-negative, got {}", config.seed));
     }
+    if config
+        .phase()
+        .iter()
+        .any(|p| !(p.is_finite() && (-1.0..=1.0).contains(p)))
+    {
+        return Err(format!(
+            "phase must be in -1..=1 per axis (cell units), got {:?}",
+            config.phase()
+        ));
+    }
 
     let dims =
         input_model_dimensions(0).ok_or_else(|| "input 0 is not a usable model".to_string())?;
@@ -160,8 +202,9 @@ fn build_points(config: &FillConfig) -> Result<FeaMesh, String> {
         PatternConfig::Grid => 1,
         PatternConfig::Bcc => 2,
     };
+    let margin_cells = 1 + 2 * cell_margin(config) as u64;
     let estimate: u64 = (0..3)
-        .map(|a| ((hi[a] - lo[a]) / config.cell_size).ceil().max(0.0) as u64 + 3)
+        .map(|a| ((hi[a] - lo[a]) / config.cell_size).ceil().max(0.0) as u64 + margin_cells)
         .product::<u64>()
         .saturating_mul(sites_per_cell);
     if estimate > MAX_POINTS {
@@ -219,7 +262,7 @@ pub extern "C" fn run() {
 pub extern "C" fn get_metadata() -> i64 {
     static METADATA: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     volumetric_abi::metadata_reply(&METADATA, || {
-        let schema = r#"{ pattern: "grid" / "bcc" .default "bcc", cell_size: float .default 0.05, irregularity: float .default 0.3, seed: int .default 0 }"#
+        let schema = r#"{ pattern: "grid" / "bcc" .default "bcc", cell_size: float .default 0.05, irregularity: float .default 0.3, seed: int .default 0, phase_x: float .default 0.0, phase_y: float .default 0.0, phase_z: float .default 0.0 }"#
             .to_string();
         OperatorMetadata {
             name: "point_fill_operator".to_string(),
@@ -269,6 +312,7 @@ mod tests {
             cell_size: 0.5,
             irregularity: 0.0,
             seed: 0,
+            ..FillConfig::default()
         };
         let sites = enumerate_sites([0.0, 0.0, 0.0], [2.0, 2.0, 2.0], &config);
         assert!(!sites.is_empty());
@@ -290,6 +334,7 @@ mod tests {
             cell_size: 1.0,
             irregularity: 0.0,
             seed: 0,
+            ..FillConfig::default()
         };
         let sites = enumerate_sites([0.0, 0.0, 0.0], [3.0, 3.0, 3.0], &config);
         // Nearest-neighbor distance in plain BCC is sqrt(3)/2 * cell.
@@ -316,6 +361,7 @@ mod tests {
             cell_size: 1.0,
             irregularity: 0.8,
             seed: 0,
+            ..FillConfig::default()
         };
         let lo = [0.0, 0.0, 0.0];
         let hi = [4.0, 4.0, 4.0];
@@ -349,12 +395,46 @@ mod tests {
     }
 
     #[test]
+    fn phase_rigidly_translates_the_lattice() {
+        let base = FillConfig {
+            pattern: PatternConfig::Bcc,
+            cell_size: 0.5,
+            irregularity: 0.6,
+            seed: 0,
+            ..FillConfig::default()
+        };
+        let phased = FillConfig {
+            phase_x: 0.25,
+            phase_y: 0.25,
+            phase_z: 0.25,
+            ..base
+        };
+        let lo = [0.0, 0.0, 0.0];
+        let hi = [2.0, 2.0, 2.0];
+        let a = enumerate_sites(lo, hi, &base);
+        let b = enumerate_sites(lo, hi, &phased);
+        // The phased enumeration walks a wider cell margin, so compare on
+        // the common interior: every base site, shifted by 1/4 cell, must
+        // appear in the phased set.
+        let shift = 0.25 * base.cell_size;
+        for p in &a {
+            let expect: [f64; 3] = core::array::from_fn(|i| p[i] + shift);
+            assert!(
+                b.iter()
+                    .any(|q| (0..3).all(|i| (q[i] - expect[i]).abs() < 1e-12)),
+                "no phased site at {expect:?} (base site {p:?})"
+            );
+        }
+    }
+
+    #[test]
     fn filtered_sites_assemble_into_a_valid_point1_mesh() {
         let config = FillConfig {
             pattern: PatternConfig::Bcc,
             cell_size: 0.25,
             irregularity: 0.3,
             seed: 0,
+            ..FillConfig::default()
         };
         let all = enumerate_sites([-1.0, -1.0, -1.0], [1.0, 1.0, 1.0], &config);
         let kept = sphere_filter(all.clone(), [0.0, 0.0, 0.0], 1.0);
