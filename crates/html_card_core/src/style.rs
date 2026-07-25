@@ -172,21 +172,22 @@ fn parse_spacing(token: &str) -> Option<f64> {
         return parse_arbitrary_px(arb);
     }
     let steps: f64 = token.parse().ok()?;
-    (steps >= 0.0).then_some(steps * 4.0)
+    (steps.is_finite() && steps >= 0.0).then_some(steps * 4.0)
 }
 
-/// `10px` / `1.5rem` / `0` → px.
+/// `10px` / `1.5rem` / `0` → px (finite, non-negative only).
 fn parse_arbitrary_px(value: &str) -> Option<f64> {
     if value == "0" {
         return Some(0.0);
     }
-    if let Some(px) = value.strip_suffix("px") {
-        return px.parse().ok();
-    }
-    if let Some(rem) = value.strip_suffix("rem") {
-        return rem.parse::<f64>().ok().map(|r| r * 16.0);
-    }
-    None
+    let px = if let Some(px) = value.strip_suffix("px") {
+        px.parse::<f64>().ok()?
+    } else if let Some(rem) = value.strip_suffix("rem") {
+        rem.parse::<f64>().ok()? * 16.0
+    } else {
+        return None;
+    };
+    (px.is_finite() && px >= 0.0).then_some(px)
 }
 
 /// Width/height-style token → taffy dimension (`24`, `full`, `1/2`,
@@ -414,12 +415,14 @@ pub fn resolve_classes(
             continue;
         }
         if let Some(rest) = class.strip_prefix("border-") {
-            if let Ok(width) = rest.parse::<f64>() {
+            let parse_width =
+                |w: &str| w.parse::<f64>().ok().filter(|w| w.is_finite() && *w >= 0.0);
+            if let Some(width) = parse_width(rest) {
                 boxed.border_px = [width; 4];
                 continue;
             }
             let (side, width) = match rest.split_once('-') {
-                Some((side, w)) => (side, w.parse::<f64>().ok()),
+                Some((side, w)) => (side, parse_width(w)),
                 None => (rest, Some(1.0)),
             };
             let apply: Option<&[usize]> = match side {
@@ -857,6 +860,17 @@ mod tests {
         assert_eq!(s.text.tone, Tone::Dark);
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("inline"), "{}", errors[0]);
+    }
+
+    #[test]
+    fn non_finite_and_negative_values_error() {
+        for class in ["border--2", "border-NaN", "border-inf", "w-[infpx]", "rounded-[NaNpx]", "p-[-4px]"] {
+            let (_, errors) = resolve(&[class]);
+            assert!(
+                errors.iter().any(|e| e.contains(class)),
+                "{class} accepted silently: {errors:?}"
+            );
+        }
     }
 
     #[test]

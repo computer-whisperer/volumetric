@@ -18,6 +18,10 @@ pub struct Word {
     pub width_px: f64,
     /// Width of one space in this word's style (used when joining).
     pub space_px: f64,
+    /// Continues the previous word with no intervening space — an inline
+    /// run boundary fell mid-word (`<b>Hel</b>lo`). Never a wrap point
+    /// and never separated by a space.
+    pub joins_prev: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -79,11 +83,9 @@ pub fn shape_paragraph(
     let mut ascent_px = 0.0f64;
     let mut descent_px = 0.0f64;
 
-    // Pending word fragments (nbsp joins fragments of different styles
-    // into one unbreakable word; represented as consecutive Words merged
-    // at paint time — here we simply emit them as one Word per style
-    // fragment glued by a `joined` marker on width bookkeeping).
-    let mut pending_space = false;
+    // Set when the previous run ended mid-word: the next fragment glues
+    // onto it with no space and no wrap opportunity (`<b>Hel</b>lo`).
+    let mut pending_join = false;
 
     for (run_idx, run) in runs.iter().enumerate() {
         let face = faces.face(run.style.bold);
@@ -97,23 +99,22 @@ pub fn shape_paragraph(
         // Split on collapsible whitespace; nbsp stays inside words.
         let mut chars = transformed.chars().peekable();
         let mut current = String::new();
-        let mut flush =
-            |current: &mut String, tokens: &mut Vec<Token>, pending_space: &mut bool| {
-                if current.is_empty() {
-                    return;
-                }
-                let word = shape_word(current, run.style, face, &metrics, missing);
-                if *pending_space {
-                    // keep: spacing handled at wrap time via space_px
-                }
-                *pending_space = false;
-                tokens.push(Token::Word(word));
-                current.clear();
-            };
+        let mut flush = |current: &mut String,
+                         tokens: &mut Vec<Token>,
+                         pending_join: &mut bool| {
+            if current.is_empty() {
+                return;
+            }
+            let word = shape_word(current, run.style, face, &metrics, missing, *pending_join);
+            *pending_join = false;
+            tokens.push(Token::Word(word));
+            current.clear();
+        };
         while let Some(c) = chars.next() {
             if c.is_whitespace() && c != '\u{a0}' {
-                flush(&mut current, &mut tokens, &mut pending_space);
-                pending_space = true;
+                flush(&mut current, &mut tokens, &mut pending_join);
+                // Explicit whitespace cancels any pending cross-run glue.
+                pending_join = false;
                 while chars.peek().is_some_and(|c| c.is_whitespace() && *c != '\u{a0}') {
                     chars.next();
                 }
@@ -121,10 +122,14 @@ pub fn shape_paragraph(
                 current.push(c);
             }
         }
-        flush(&mut current, &mut tokens, &mut pending_space);
+        if !current.is_empty() {
+            flush(&mut current, &mut tokens, &mut pending_join);
+            // The run ended mid-word: the next run's first fragment glues.
+            pending_join = true;
+        }
         if breaks_after_run.get(run_idx).copied().unwrap_or(false) {
             tokens.push(Token::Break);
-            pending_space = false;
+            pending_join = false;
         }
     }
 
@@ -170,6 +175,7 @@ fn shape_word(
     face: &Face,
     metrics: &FontMetrics,
     missing: &mut Vec<char>,
+    joins_prev: bool,
 ) -> Word {
     let mut glyphs = Vec::with_capacity(text.chars().count());
     for c in text.chars() {
@@ -192,6 +198,7 @@ fn shape_word(
         style,
         width_px,
         space_px,
+        joins_prev,
     }
 }
 
@@ -203,14 +210,16 @@ pub struct Line {
 }
 
 /// Greedy word wrap at `avail_px` (`f64::INFINITY` for no wrapping).
-/// The first word of a line always fits, however wide.
+/// The first word of a line always fits, however wide; glued chains
+/// (`joins_prev`) wrap as one unit.
 pub fn break_lines(paragraph: &Paragraph, avail_px: f64) -> Vec<Line> {
+    let tokens = &paragraph.tokens;
     let mut lines: Vec<Line> = Vec::new();
     let mut current = Line {
         words: Vec::new(),
         width_px: 0.0,
     };
-    for (idx, token) in paragraph.tokens.iter().enumerate() {
+    for (idx, token) in tokens.iter().enumerate() {
         match token {
             Token::Break => {
                 lines.push(std::mem::replace(
@@ -222,13 +231,29 @@ pub fn break_lines(paragraph: &Paragraph, avail_px: f64) -> Vec<Line> {
                 ));
             }
             Token::Word(word) => {
+                if word.joins_prev && !current.words.is_empty() {
+                    // Mid-word continuation: same line, no space.
+                    current.words.push((idx, current.width_px));
+                    current.width_px += word.width_px;
+                    continue;
+                }
+                // Wrap decision considers the whole glued chain.
+                let mut chain = word.width_px;
+                let mut j = idx + 1;
+                while let Some(Token::Word(next)) = tokens.get(j) {
+                    if !next.joins_prev {
+                        break;
+                    }
+                    chain += next.width_px;
+                    j += 1;
+                }
                 let space = if current.words.is_empty() {
                     0.0
                 } else {
                     word.space_px
                 };
-                let candidate = current.width_px + space + word.width_px;
-                if !current.words.is_empty() && candidate > avail_px + 1e-6 {
+                if !current.words.is_empty() && current.width_px + space + chain > avail_px + 1e-6
+                {
                     lines.push(std::mem::replace(
                         &mut current,
                         Line {
@@ -240,7 +265,7 @@ pub fn break_lines(paragraph: &Paragraph, avail_px: f64) -> Vec<Line> {
                     current.width_px = word.width_px;
                 } else {
                     current.words.push((idx, current.width_px + space));
-                    current.width_px = candidate;
+                    current.width_px += space + word.width_px;
                 }
             }
         }
@@ -258,16 +283,25 @@ pub fn measure(paragraph: &Paragraph, avail_px: f64) -> (f64, f64) {
     (width, lines.len() as f64 * paragraph.line_height_px)
 }
 
-/// Width of the longest single word (min-content).
+/// Width of the longest unbreakable unit — a word or glued chain
+/// (min-content).
 pub fn min_content_width(paragraph: &Paragraph) -> f64 {
-    paragraph
-        .tokens
-        .iter()
-        .filter_map(|t| match t {
-            Token::Word(w) => Some(w.width_px),
-            Token::Break => None,
-        })
-        .fold(0.0, f64::max)
+    let mut longest = 0.0f64;
+    let mut chain = 0.0f64;
+    for token in &paragraph.tokens {
+        match token {
+            Token::Word(w) if w.joins_prev && chain > 0.0 => chain += w.width_px,
+            Token::Word(w) => {
+                longest = longest.max(chain);
+                chain = w.width_px;
+            }
+            Token::Break => {
+                longest = longest.max(chain);
+                chain = 0.0;
+            }
+        }
+    }
+    longest.max(chain)
 }
 
 /// Per-glyph positions of one word laid at `(pen_x, baseline_y)` (px,
@@ -404,6 +438,58 @@ mod tests {
             _ => unreachable!(),
         };
         assert_eq!(up[0], f.regular.glyph_index('U').unwrap());
+    }
+
+    #[test]
+    fn adjacent_runs_glue_without_a_space() {
+        // <p><b>Hel</b>lo</p>: the run boundary falls mid-word.
+        let mut missing = Vec::new();
+        let bold = TextStyle {
+            bold: true,
+            ..TextStyle::default()
+        };
+        let p = shape_paragraph(
+            &[
+                Run { text: "Hel", style: bold },
+                Run { text: "lo world", style: TextStyle::default() },
+            ],
+            &[false, false],
+            TextAlign::Left,
+            &fonts(),
+            &mut missing,
+        );
+        let joins: Vec<bool> = p
+            .tokens
+            .iter()
+            .filter_map(|t| match t {
+                Token::Word(w) => Some(w.joins_prev),
+                Token::Break => None,
+            })
+            .collect();
+        assert_eq!(joins, [false, true, false]);
+
+        // The glued pair measures as fragment widths with no space, and
+        // wraps as one unit: at a width fitting only the chain, "world"
+        // drops to line 2 and "Hel"+"lo" stay together.
+        let widths: Vec<f64> = p
+            .tokens
+            .iter()
+            .filter_map(|t| match t {
+                Token::Word(w) => Some(w.width_px),
+                Token::Break => None,
+            })
+            .collect();
+        let chain = widths[0] + widths[1];
+        let (w, _) = measure(&p, chain + 1.0);
+        // Two lines: the glued chain, then "world" (whichever is wider).
+        assert!((w - chain.max(widths[2])).abs() < 1e-9, "measured {w}");
+        let lines = break_lines(&p, chain + 1.0);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].words.len(), 2);
+        // Second fragment sits flush against the first (no space).
+        assert!((lines[0].words[1].1 - widths[0]).abs() < 1e-9);
+        // Min-content counts the glued chain as one unbreakable unit.
+        assert!((min_content_width(&p) - chain.max(widths[2])).abs() < 1e-9);
     }
 
     #[test]

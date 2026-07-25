@@ -41,6 +41,7 @@ pub fn parse_fragment(html: &str) -> Result<Element, String> {
     let mut parser = Parser {
         bytes: html.as_bytes(),
         pos: 0,
+        depth: 0,
         errors: Vec::new(),
     };
     let mut roots = Vec::new();
@@ -75,9 +76,14 @@ pub fn parse_fragment(html: &str) -> Result<Element, String> {
     }
 }
 
+/// Nesting deeper than any real card markup; a cap keeps the recursive
+/// parser (and every recursive consumer of the tree) off the stack limit.
+const MAX_DEPTH: usize = 128;
+
 struct Parser<'a> {
     bytes: &'a [u8],
     pos: usize,
+    depth: usize,
     errors: Vec<String>,
 }
 
@@ -95,6 +101,17 @@ impl Parser<'_> {
     }
 
     fn error(&mut self, msg: String) {
+        // A pathological input (a large non-HTML paste) can generate one
+        // error per byte; past a generous cap, stop parsing outright so
+        // error collection stays linear.
+        if self.errors.len() >= 64 {
+            if self.errors.len() == 64 {
+                self.errors
+                    .push("too many errors — stopping here".to_string());
+            }
+            self.pos = self.bytes.len();
+            return;
+        }
         let line = self.line();
         self.errors.push(format!("line {line}: {msg}"));
     }
@@ -168,7 +185,7 @@ impl Parser<'_> {
     fn decode_text_char(&mut self) -> Option<char> {
         let rest = self.rest();
         if rest[0] == b'&' {
-            let end = rest.iter().position(|&b| b == b';');
+            let end = rest[..rest.len().min(14)].iter().position(|&b| b == b';');
             let entity = end.map(|e| &rest[1..e]);
             let decoded = match entity {
                 Some(b"amp") => Some('&'),
@@ -226,6 +243,11 @@ impl Parser<'_> {
     }
 
     fn parse_element(&mut self) -> Option<Node> {
+        if self.depth >= MAX_DEPTH {
+            self.error(format!("markup nested deeper than {MAX_DEPTH} levels"));
+            self.pos = self.bytes.len();
+            return None;
+        }
         self.pos += 1; // consume '<'
         let tag = self.read_name();
         if tag.is_empty() {
@@ -293,7 +315,9 @@ impl Parser<'_> {
             }));
         }
         let mut children = Vec::new();
+        self.depth += 1;
         self.parse_nodes(Some(&lowered), &mut children);
+        self.depth -= 1;
         Some(Node::Element(Element {
             tag: lowered,
             classes,
@@ -406,5 +430,24 @@ mod tests {
     fn line_numbers_locate_errors() {
         let err = parse_fragment("<div>\n\n<video></video>\n</div>").unwrap_err();
         assert!(err.contains("line 3"), "{err}");
+    }
+
+    #[test]
+    fn deep_nesting_errors_instead_of_overflowing() {
+        let html = format!("{}x{}", "<div>".repeat(20_000), "</div>".repeat(20_000));
+        let err = parse_fragment(&html).unwrap_err();
+        assert!(err.contains("nested deeper"), "{err}");
+    }
+
+    #[test]
+    fn pathological_error_floods_terminate_quickly() {
+        // 200KB of bare ampersands: capped error collection keeps this
+        // linear instead of quadratic-in-input.
+        let html = format!("<p>{}</p>", "& ".repeat(100_000));
+        let start = std::time::Instant::now();
+        let err = parse_fragment(&html).unwrap_err();
+        assert!(start.elapsed().as_secs_f64() < 2.0, "took {:?}", start.elapsed());
+        assert!(err.contains("too many errors"), "{err}");
+        assert!(err.lines().count() <= 65, "{} lines", err.lines().count());
     }
 }

@@ -13,6 +13,35 @@ use volumetric::{
     OperatorMetadataOutput, Project,
 };
 
+#[test]
+fn output_ids_for_stays_unique_within_one_call() {
+    // Two extra outputs whose declared names sanitize to the same suffix
+    // must still get distinct asset ids.
+    let metadata = OperatorMetadata {
+        name: "op".to_string(),
+        version: "0.0.0".to_string(),
+        display_name: String::new(),
+        description: String::new(),
+        category: String::new(),
+        icon_svg: String::new(),
+        inputs: vec![],
+        input_names: vec![],
+        outputs: vec![
+            OperatorMetadataOutput::ModelWASM,
+            OperatorMetadataOutput::ModelWASM,
+            OperatorMetadataOutput::ModelWASM,
+        ],
+        output_names: vec!["Main".to_string(), "Aux+".to_string(), "Aux-".to_string()],
+    };
+    let project = volumetric::Project::new();
+    let ids = project.output_ids_for("card".to_string(), &metadata);
+    assert_eq!(ids.len(), 3);
+    let unique: std::collections::BTreeSet<&String> = ids.iter().collect();
+    assert_eq!(unique.len(), 3, "duplicate ids: {ids:?}");
+    assert_eq!(ids[0], "card");
+    assert_eq!(ids[1], "card_aux_");
+}
+
 /// A minimal operator that declares `outputs` in its metadata and posts one
 /// 4-byte blob per entry when run.
 fn operator_with_declared_outputs(outputs: Vec<OperatorMetadataOutput>) -> Vec<u8> {

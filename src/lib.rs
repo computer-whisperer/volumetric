@@ -1115,21 +1115,27 @@ impl Project {
     /// append their declared [`OperatorMetadata::output_name`] (or `2`,
     /// `3`, … when unnamed) — e.g. `card`, `card_plate`.
     pub fn output_ids_for(&self, first: String, metadata: &OperatorMetadata) -> Vec<String> {
-        (0..metadata.outputs.len().max(1))
-            .map(|idx| {
-                if idx == 0 {
-                    return first.clone();
-                }
-                let suffix = metadata
-                    .output_name(idx)
-                    .map(|name| {
-                        name.to_lowercase()
-                            .replace(|c: char| !c.is_ascii_alphanumeric(), "_")
-                    })
-                    .unwrap_or_else(|| (idx + 1).to_string());
-                self.unique_asset_id(&format!("{first}_{suffix}"))
-            })
-            .collect()
+        let mut ids = vec![first.clone()];
+        for idx in 1..metadata.outputs.len().max(1) {
+            let suffix = metadata
+                .output_name(idx)
+                .map(|name| {
+                    name.to_lowercase()
+                        .replace(|c: char| !c.is_ascii_alphanumeric(), "_")
+                })
+                .unwrap_or_else(|| (idx + 1).to_string());
+            // Unique against the project AND against the ids minted in
+            // this call (unique_asset_id can't see the latter — two
+            // outputs whose names sanitize equal would otherwise collide).
+            let mut id = self.unique_asset_id(&format!("{first}_{suffix}"));
+            let mut n = 2;
+            while ids.contains(&id) {
+                id = self.unique_asset_id(&format!("{first}_{suffix}_{n}"));
+                n += 1;
+            }
+            ids.push(id);
+        }
+        ids
     }
 
     /// Returns the imports.
