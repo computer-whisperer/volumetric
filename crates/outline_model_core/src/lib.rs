@@ -201,12 +201,13 @@ impl<'a> PayloadView<'a> {
         if !(x >= min_x && x <= max_x && y >= min_y && y <= max_y) {
             return false; // also rejects NaN coordinates
         }
-        let band = if max_y > min_y {
-            (((y - min_y) / (max_y - min_y) * self.band_count as f64) as usize)
-                .min(self.band_count - 1)
-        } else {
-            0
-        };
+        // Bit-identical to the build side's band assignment: recompute
+        // band_h with the same expression and divide by it, so a query at
+        // a boundary-exact y lands within the band range its crossing
+        // segments were referenced from. (0/0 -> NaN casts to 0; x/0 ->
+        // inf saturates and clamps — both match the build-side clamping.)
+        let band_h = (max_y - min_y) / self.band_count as f64;
+        let band = (((y - min_y) / band_h) as usize).min(self.band_count - 1);
         let entry = HEADER_LEN + band * BAND_ENTRY_LEN;
         let u32_at = |off: usize| -> Option<u32> {
             Some(u32::from_le_bytes(self.bytes.get(off..off + 4)?.try_into().unwrap()))
@@ -323,6 +324,41 @@ mod tests {
             let cy = i as f64 * 3.0;
             assert!(view.contains(0.0, cy), "center of square {i}");
             assert!(!view.contains(0.0, cy + 1.5), "gap above square {i}");
+        }
+    }
+
+    #[test]
+    fn band_boundary_exact_queries_read_inside() {
+        // Regression: the query-side band index must be computed with the
+        // exact FP expression the build side used, or a query at a
+        // bit-exact band boundary lands one band low and misses the
+        // crossing segments — a strictly interior point reading as
+        // outside. These constants are a found divergence of the old
+        // two-expression form: 30 rects -> 120 segments -> 15 bands over
+        // y [0, 7502.8]; at k in {3, 6, 12, 13} the old query computed
+        // band k-1 while the build assigned the bottom-edge segments
+        // starting at band k.
+        let rect = |x0: f64, y0: f64, y1: f64| {
+            vec![[x0, y0], [x0 + 10.0, y0], [x0 + 10.0, y1], [x0, y1]]
+        };
+        let mut contours = vec![rect(0.0, 0.0, 100.0), rect(0.0, 7402.8, 7502.8)];
+        for i in 0..24 {
+            let y0 = 150.0 + i as f64 * 280.0;
+            contours.push(rect(0.0, y0, y0 + 100.0));
+        }
+        // Matches build_payload's band choice for the final segment count;
+        // if that heuristic changes, these ys stop being boundary-exact and
+        // the test degrades to a plain interior check.
+        let band_h = 7502.8 / ((30 * 4) / 8) as f64;
+        let boundary_ys: Vec<f64> = [3.0, 6.0, 12.0, 13.0].iter().map(|k| k * band_h).collect();
+        for &y in &boundary_ys {
+            contours.push(rect(20.0, y, y + 200.0));
+        }
+        let payload = build_payload(&contours).unwrap();
+        let view = PayloadView::new(&payload).unwrap();
+        for &y in &boundary_ys {
+            assert!(view.contains(25.0, y), "bottom edge on band boundary y={y}");
+            assert!(view.contains(25.0, y + 100.0), "interior above boundary y={y}");
         }
     }
 
