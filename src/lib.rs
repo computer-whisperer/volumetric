@@ -1080,14 +1080,15 @@ impl Project {
         id
     }
 
-    /// Inserts an operator and execution step into the project.
+    /// Inserts an operator and execution step into the project. Every
+    /// output id becomes an export (callers that want an intermediate
+    /// hidden remove it from `exports_mut` afterwards).
     pub fn insert_operation(
         &mut self,
         op_id_base: &str,
         op_data: Vec<u8>,
         inputs: Vec<ExecutionInput>,
         output_ids: Vec<String>,
-        export_id: String,
     ) {
         let op_id = self.unique_asset_id(op_id_base);
 
@@ -1095,17 +1096,40 @@ impl Project {
         self.imports
             .push(ImportedAsset::operator(op_id.clone(), op_data));
 
+        for output_id in &output_ids {
+            if !self.exports.contains(output_id) {
+                self.exports.push(output_id.clone());
+            }
+        }
+
         // Add the execution step
         self.timeline.push(ExecutionStep {
             operator_id: op_id,
             inputs,
             outputs: output_ids,
         });
+    }
 
-        // Add to exports
-        if !self.exports.contains(&export_id) {
-            self.exports.push(export_id);
-        }
+    /// Output ids for every output an operator declares: slot 0 keeps
+    /// `first` (normally a [`Self::default_output_name`] id), further slots
+    /// append their declared [`OperatorMetadata::output_name`] (or `2`,
+    /// `3`, … when unnamed) — e.g. `card`, `card_plate`.
+    pub fn output_ids_for(&self, first: String, metadata: &OperatorMetadata) -> Vec<String> {
+        (0..metadata.outputs.len().max(1))
+            .map(|idx| {
+                if idx == 0 {
+                    return first.clone();
+                }
+                let suffix = metadata
+                    .output_name(idx)
+                    .map(|name| {
+                        name.to_lowercase()
+                            .replace(|c: char| !c.is_ascii_alphanumeric(), "_")
+                    })
+                    .unwrap_or_else(|| (idx + 1).to_string());
+                self.unique_asset_id(&format!("{first}_{suffix}"))
+            })
+            .collect()
     }
 
     /// Returns the imports.

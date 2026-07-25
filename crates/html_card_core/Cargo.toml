@@ -1,0 +1,9 @@
+[package]
+name = "html_card_core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+outline_model_core = { path = "../outline_model_core" }
+text_render_core = { path = "../text_render_core" }
+taffy = "0.12"

@@ -387,6 +387,12 @@ pub struct OperatorMetadata {
     #[serde(default)]
     pub input_names: Vec<String>,
     pub outputs: Vec<OperatorMetadataOutput>,
+    /// Human-readable labels for `outputs`, parallel by index (e.g. "Ink",
+    /// "Plate"). Hosts label output slots with them and derive default
+    /// asset ids for multi-output operators. Defaulted like `input_names`,
+    /// and single-output operators normally leave it empty.
+    #[serde(default)]
+    pub output_names: Vec<String>,
 }
 
 impl OperatorMetadata {
@@ -404,6 +410,15 @@ impl OperatorMetadata {
     /// non-empty one.
     pub fn input_name(&self, idx: usize) -> Option<&str> {
         self.input_names
+            .get(idx)
+            .map(String::as_str)
+            .filter(|name| !name.is_empty())
+    }
+
+    /// The declared label of output slot `idx`, if the operator provided a
+    /// non-empty one.
+    pub fn output_name(&self, idx: usize) -> Option<&str> {
+        self.output_names
             .get(idx)
             .map(String::as_str)
             .filter(|name| !name.is_empty())
@@ -618,6 +633,7 @@ mod tests {
                 OperatorMetadataOutput::TriMesh,
                 OperatorMetadataOutput::F64Map,
             ],
+            output_names: vec![],
         };
 
         let decoded = decode_metadata(&encode_metadata(&metadata)).unwrap();
@@ -646,6 +662,7 @@ mod tests {
                 version: "0.1.0".to_string(),
                 inputs: vec![OperatorMetadataInput::ModelWASM],
                 outputs: vec![OperatorMetadataOutput::ModelWASM],
+                output_names: vec![],
             },
             &mut old,
         )

@@ -3360,14 +3360,12 @@ impl VolumetricUiV2 {
         };
         inputs[blob_slot] = ExecutionInput::Inline(blob);
 
-        let output_id = self.project.default_output_name(output_base, None);
-        self.project.insert_operation(
-            asset.name,
-            asset.bytes.to_vec(),
-            inputs,
-            vec![output_id.clone()],
-            output_id.clone(),
-        );
+        let output_ids = self
+            .project
+            .output_ids_for(self.project.default_output_name(output_base, None), &metadata);
+        let output_id = output_ids[0].clone();
+        self.project
+            .insert_operation(asset.name, asset.bytes.to_vec(), inputs, output_ids);
 
         self.mark_project_dirty();
         self.selected_export = Some(output_id.clone());
@@ -3485,9 +3483,12 @@ impl VolumetricUiV2 {
             return;
         }
 
-        let output_id = self
-            .project
-            .default_output_name(asset.name, primary_model.as_deref());
+        let output_ids = self.project.output_ids_for(
+            self.project
+                .default_output_name(asset.name, primary_model.as_deref()),
+            metadata,
+        );
+        let output_id = output_ids[0].clone();
         let inputs = operator_step_inputs(
             metadata,
             &SlotPrimaries {
@@ -3499,13 +3500,8 @@ impl VolumetricUiV2 {
             },
         );
 
-        self.project.insert_operation(
-            asset.name,
-            asset.bytes.to_vec(),
-            inputs,
-            vec![output_id.clone()],
-            output_id.clone(),
-        );
+        self.project
+            .insert_operation(asset.name, asset.bytes.to_vec(), inputs, output_ids);
         self.mark_project_dirty();
 
         self.selected_export = Some(output_id.clone());
@@ -7521,6 +7517,7 @@ mod tests {
             ],
             input_names: vec!["Script".to_string(), "Parameters".to_string()],
             outputs: vec![volumetric::OperatorMetadataOutput::ModelWASM],
+            output_names: vec![],
         };
 
         let inline = operator_step_inputs(&metadata, &SlotPrimaries::default());
@@ -7714,6 +7711,7 @@ mod tests {
             inputs: vec![OperatorMetadataInput::ModelWASM],
             input_names: vec!["Model".to_string()],
             outputs: vec![volumetric::OperatorMetadataOutput::ModelWASM],
+            output_names: vec![],
         });
         let data: String = metadata.iter().map(|b| format!("\\{b:02x}")).collect();
         let packed = 1024_i64 | ((metadata.len() as i64) << 32);
@@ -9237,6 +9235,7 @@ mod tests {
                     inputs: vec![],
                     input_names: vec![],
                     outputs: vec![],
+                    output_names: vec![],
                 }),
                 icon: None,
             };

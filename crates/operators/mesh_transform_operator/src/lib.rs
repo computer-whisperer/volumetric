@@ -174,6 +174,7 @@ pub extern "C" fn get_metadata() -> i64 {
             ],
             input_names: vec!["Mesh".to_string(), "Config".to_string()],
             outputs: vec![OperatorMetadataOutput::FeaMesh],
+            output_names: vec![],
         }
     })
 }

@@ -16,6 +16,7 @@ fn main() {
         inputs: vec![],
         input_names: vec![],
         outputs: vec![],
+        output_names: vec![],
     };
     let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
     std::fs::write(

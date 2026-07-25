@@ -67,6 +67,7 @@ pub extern "C" fn get_metadata() -> i64 {
             "Override 4".to_string(),
         ],
         outputs: vec![OperatorMetadataOutput::F64Map],
+        output_names: vec![],
     })
 }
 

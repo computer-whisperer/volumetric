@@ -26,6 +26,7 @@ fn operator_with_declared_outputs(outputs: Vec<OperatorMetadataOutput>) -> Vec<u
         inputs: vec![],
         input_names: vec![],
         outputs: outputs.clone(),
+        output_names: vec![],
     });
 
     let data: String = metadata.iter().map(|b| format!("\\{b:02x}")).collect();

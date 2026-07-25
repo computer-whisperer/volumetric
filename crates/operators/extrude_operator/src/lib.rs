@@ -466,6 +466,7 @@ pub extern "C" fn get_metadata() -> i64 {
                 "Plane".to_string(),
             ],
             outputs: vec![OperatorMetadataOutput::ModelWASM],
+            output_names: vec![],
         }
     })
 }

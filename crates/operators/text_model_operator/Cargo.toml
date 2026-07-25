@@ -9,7 +9,7 @@ crate-type = ["cdylib"]
 [dependencies]
 volumetric_abi = { path = "../../volumetric_abi" }
 outline_model_core = { path = "../../outline_model_core" }
+text_render_core = { path = "../../text_render_core" }
 walrus = "0.26"
 serde = { version = "1", features = ["derive"] }
 ciborium = "0.2"
-ttf-parser = "0.25"

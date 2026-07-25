@@ -128,6 +128,7 @@ pub extern "C" fn get_metadata() -> i64 {
             inputs,
             input_names,
             outputs: vec![OperatorMetadataOutput::FeaMesh],
+            output_names: vec![],
         }
     })
 }

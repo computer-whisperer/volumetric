@@ -23,6 +23,7 @@ const OPERATORS: &[&str] = &[
     "revolve_operator",
     "image_model_operator",
     "text_model_operator",
+    "html_card_operator",
     "mesh_height_operator",
     "fea_grid_mesh_operator",
     "fea_solve_operator",

@@ -538,6 +538,7 @@ pub extern "C" fn get_metadata() -> i64 {
                 "Config".to_string(),
             ],
             outputs: vec![OperatorMetadataOutput::ModelWASM],
+            output_names: vec![],
         }
     })
 }

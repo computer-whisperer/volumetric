@@ -2218,6 +2218,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "grid"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b40ca9252762c466af32d0b1002e91e4e1bc5398f77455e55474deb466355ff5"
+
+[[package]]
 name = "gridfield_model_core"
 version = "0.1.0"
 
@@ -2330,6 +2336,27 @@ name = "hermit-abi"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
+
+[[package]]
+name = "html_card_core"
+version = "0.1.0"
+dependencies = [
+ "outline_model_core",
+ "taffy",
+ "text_render_core",
+]
+
+[[package]]
+name = "html_card_operator"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "html_card_core",
+ "outline_model_core",
+ "serde",
+ "volumetric_abi",
+ "walrus",
+]
 
 [[package]]
 name = "httpdate"
@@ -5119,6 +5146,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "taffy"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "340a09581f29809fc0df82a3955501dc7f2a21f887e5d1c13dbe288fe1c0bef4"
+dependencies = [
+ "arrayvec",
+ "grid",
+ "serde",
+ "slotmap",
+]
+
+[[package]]
 name = "target-lexicon"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5153,9 +5192,16 @@ dependencies = [
  "ciborium",
  "outline_model_core",
  "serde",
- "ttf-parser",
+ "text_render_core",
  "volumetric_abi",
  "walrus",
+]
+
+[[package]]
+name = "text_render_core"
+version = "0.1.0"
+dependencies = [
+ "ttf-parser",
 ]
 
 [[package]]

@@ -2247,6 +2247,7 @@ pub extern "C" fn get_metadata() -> i64 {
         ],
         input_names: vec!["Script".to_string(), "Parameters".to_string()],
         outputs: vec![OperatorMetadataOutput::ModelWASM],
+        output_names: vec![],
     })
 }
 

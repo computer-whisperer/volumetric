@@ -369,6 +369,7 @@ mod tests {
             inputs: vec![],
             input_names: vec![],
             outputs: vec![],
+            output_names: vec![],
         }
     }
 

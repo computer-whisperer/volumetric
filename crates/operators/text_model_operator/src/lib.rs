@@ -39,7 +39,8 @@
 
 use std::collections::BTreeSet;
 
-use ttf_parser::{Face, GlyphId, OutlineBuilder};
+use text_render_core::ttf_parser::{Face, GlyphId};
+use text_render_core::{outline_glyph_into, pair_kerning, run_width};
 use volumetric_abi::host::{post_output, read_input, report_error};
 use volumetric_abi::{OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput};
 use walrus::{FunctionId, Module, ModuleConfig};
@@ -83,124 +84,6 @@ impl Default for TextConfig {
             letter_spacing: 0.0,
         }
     }
-}
-
-/// Collects one glyph's outline as flattened contours in model space.
-///
-/// Flattening decisions run in font units (`tol2` is a squared font-unit
-/// tolerance); emitted points are `(p + offset) * scale`.
-struct GlyphContours {
-    offset: [f64; 2],
-    scale: f64,
-    tol2: f64,
-    cursor: [f64; 2],
-    current: Vec<[f64; 2]>,
-    contours: Vec<Vec<[f64; 2]>>,
-}
-
-impl GlyphContours {
-    fn push(&mut self, p: [f64; 2]) {
-        self.current
-            .push([(p[0] + self.offset[0]) * self.scale, (p[1] + self.offset[1]) * self.scale]);
-    }
-
-    fn flush(&mut self) {
-        // Degenerate contours (fewer than 3 distinct points) can't enclose
-        // area; drop them rather than failing the whole conversion — some
-        // fonts do contain stray anchor-only contours.
-        let mut distinct = self.current.clone();
-        distinct.dedup();
-        if distinct.first() == distinct.last() {
-            distinct.pop();
-        }
-        if distinct.len() >= 3 {
-            self.contours.push(std::mem::take(&mut self.current));
-        } else {
-            self.current.clear();
-        }
-    }
-
-    fn flatten_quad(&mut self, p0: [f64; 2], p1: [f64; 2], p2: [f64; 2], depth: u32) {
-        // Max deviation of a quadratic from its chord is |p1 - mid(p0,p2)|/2.
-        let dx = p1[0] - (p0[0] + p2[0]) * 0.5;
-        let dy = p1[1] - (p0[1] + p2[1]) * 0.5;
-        if depth >= 16 || (dx * dx + dy * dy) * 0.25 <= self.tol2 {
-            self.push(p2);
-            return;
-        }
-        let mid = |a: [f64; 2], b: [f64; 2]| [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5];
-        let (a, b) = (mid(p0, p1), mid(p1, p2));
-        let m = mid(a, b);
-        self.flatten_quad(p0, a, m, depth + 1);
-        self.flatten_quad(m, b, p2, depth + 1);
-    }
-
-    fn flatten_cubic(&mut self, p0: [f64; 2], p1: [f64; 2], p2: [f64; 2], p3: [f64; 2], depth: u32) {
-        // Standard cubic flatness bound: deviation² <= (max(d1²)+max(d2²))/16
-        // with d1 = 3p1 - 2p0 - p3, d2 = 3p2 - p0 - 2p3 (per component).
-        let d1x = 3.0 * p1[0] - 2.0 * p0[0] - p3[0];
-        let d1y = 3.0 * p1[1] - 2.0 * p0[1] - p3[1];
-        let d2x = 3.0 * p2[0] - p0[0] - 2.0 * p3[0];
-        let d2y = 3.0 * p2[1] - p0[1] - 2.0 * p3[1];
-        let dev2 = (d1x * d1x).max(d2x * d2x) + (d1y * d1y).max(d2y * d2y);
-        if depth >= 16 || dev2 <= 16.0 * self.tol2 {
-            self.push(p3);
-            return;
-        }
-        let mid = |a: [f64; 2], b: [f64; 2]| [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5];
-        let (a, b, c) = (mid(p0, p1), mid(p1, p2), mid(p2, p3));
-        let (ab, bc) = (mid(a, b), mid(b, c));
-        let m = mid(ab, bc);
-        self.flatten_cubic(p0, a, ab, m, depth + 1);
-        self.flatten_cubic(m, bc, c, p3, depth + 1);
-    }
-}
-
-impl OutlineBuilder for GlyphContours {
-    fn move_to(&mut self, x: f32, y: f32) {
-        self.flush();
-        self.cursor = [x as f64, y as f64];
-        self.push(self.cursor);
-    }
-
-    fn line_to(&mut self, x: f32, y: f32) {
-        self.cursor = [x as f64, y as f64];
-        self.push(self.cursor);
-    }
-
-    fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
-        let p0 = self.cursor;
-        let p1 = [x1 as f64, y1 as f64];
-        let p2 = [x as f64, y as f64];
-        self.flatten_quad(p0, p1, p2, 0);
-        self.cursor = p2;
-    }
-
-    fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
-        let p0 = self.cursor;
-        let p3 = [x as f64, y as f64];
-        self.flatten_cubic(p0, [x1 as f64, y1 as f64], [x2 as f64, y2 as f64], p3, 0);
-        self.cursor = p3;
-    }
-
-    fn close(&mut self) {
-        self.flush();
-    }
-}
-
-/// Horizontal `kern`-table adjustment between two glyphs, in font units.
-fn pair_kerning(face: &Face, left: GlyphId, right: GlyphId) -> f64 {
-    let Some(kern) = face.tables().kern else {
-        return 0.0;
-    };
-    for subtable in kern.subtables {
-        if subtable.horizontal && !subtable.variable {
-            if let Some(v) = subtable.glyphs_kerning(left, right) {
-                return v as f64;
-            }
-        }
-    }
-    0.0
 }
 
 /// Lay the text out and return the flattened contours in model space.
@@ -265,13 +148,7 @@ fn text_contours(cfg: &TextConfig, font_bytes: &[u8]) -> Result<Vec<Vec<[f64; 2]
     let mut contours: Vec<Vec<[f64; 2]>> = Vec::new();
     for (line_idx, glyphs) in lines.iter().enumerate() {
         // Measure, then place: `align` needs the line width first.
-        let mut width = 0.0f64;
-        for (i, &glyph) in glyphs.iter().enumerate() {
-            if i > 0 {
-                width += letter_spacing + pair_kerning(&face, glyphs[i - 1], glyph);
-            }
-            width += face.glyph_hor_advance(glyph).unwrap_or(0) as f64;
-        }
+        let width = run_width(&face, glyphs, letter_spacing);
         let line_x = match cfg.align.as_str() {
             "left" => 0.0,
             "center" => -width / 2.0,
@@ -284,18 +161,15 @@ fn text_contours(cfg: &TextConfig, font_bytes: &[u8]) -> Result<Vec<Vec<[f64; 2]
             if i > 0 {
                 pen_x += letter_spacing + pair_kerning(&face, glyphs[i - 1], glyph);
             }
-            let mut sink = GlyphContours {
-                offset: [pen_x, baseline_y],
+            outline_glyph_into(
+                &face,
+                glyph,
+                [pen_x, baseline_y],
                 scale,
-                tol2: (CHORD_TOL_EM * upem) * (CHORD_TOL_EM * upem),
-                cursor: [0.0, 0.0],
-                current: Vec::new(),
-                contours: std::mem::take(&mut contours),
-            };
-            face.outline_glyph(glyph, &mut sink);
-            sink.flush();
-            contours = sink.contours;
-            pen_x += face.glyph_hor_advance(glyph).unwrap_or(0) as f64;
+                CHORD_TOL_EM * upem,
+                &mut contours,
+            );
+            pen_x += text_render_core::advance(&face, glyph);
         }
     }
     if contours.is_empty() {
@@ -455,6 +329,7 @@ pub extern "C" fn get_metadata() -> i64 {
             ],
             input_names: vec!["Config".to_string(), "Font (TTF, optional)".to_string()],
             outputs: vec![OperatorMetadataOutput::ModelWASM],
+            output_names: vec![],
         }
     })
 }

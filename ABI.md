@@ -171,6 +171,9 @@ struct OperatorMetadata {
     inputs: Vec<OperatorMetadataInput>,
     input_names: Vec<String>,   // labels parallel to `inputs`
     outputs: Vec<OperatorMetadataOutput>,
+    output_names: Vec<String>,  // labels parallel to `outputs` (serde-defaulted);
+                                // hosts label output slots and derive default
+                                // asset ids from them for multi-output operators
 }
 
 enum OperatorMetadataInput {

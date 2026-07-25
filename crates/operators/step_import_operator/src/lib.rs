@@ -261,6 +261,7 @@ mod operator {
                 ],
                 input_names: vec!["STEP file".to_string(), "Config".to_string()],
                 outputs: vec![OperatorMetadataOutput::ModelWASM],
+                output_names: vec![],
             }
         })
     }
