@@ -409,7 +409,7 @@ pub extern "C" fn run() {
 pub extern "C" fn get_metadata() -> i64 {
     static METADATA: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     volumetric_abi::metadata_reply(&METADATA, || {
-        let schema = r#"{ scale: float .default 1.0, field: text .default "displacement", boundary_skin: float .default 0.0 }"#.to_string();
+        let schema = r#"{ scale: float .default 1.0, field: tstr .default "displacement", boundary_skin: float .default 0.0 }"#.to_string();
         OperatorMetadata {
             name: "fea_deform_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
