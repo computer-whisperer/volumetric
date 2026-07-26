@@ -1538,6 +1538,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fea_bundle"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "fea_core",
+ "serde",
+ "serde_bytes",
+ "volumetric_abi",
+]
+
+[[package]]
 name = "fea_core"
 version = "0.1.0"
 dependencies = [
@@ -1584,9 +1595,32 @@ name = "fea_inverse_operator"
 version = "0.1.0"
 dependencies = [
  "ciborium",
+ "fea_bundle",
  "fea_core",
  "serde",
  "volumetric_abi",
+]
+
+[[package]]
+name = "fea_solution_import_operator"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "fea_bundle",
+ "fea_core",
+ "serde",
+ "volumetric_abi",
+]
+
+[[package]]
+name = "fea_solve_cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "fea_bundle",
+ "fea_core",
+ "volumetric",
 ]
 
 [[package]]
@@ -5683,6 +5717,7 @@ dependencies = [
  "bytemuck",
  "ciborium",
  "clap",
+ "fea_bundle",
  "glam 0.32.1",
  "image",
  "pollster",

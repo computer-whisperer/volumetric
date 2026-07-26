@@ -8,3 +8,7 @@ target/
 
 # Local scratch projects saved from the GUI
 /*.vproj
+
+# FEA external-solve bundles (fea-export / fea-solve artifacts)
+*.fea-problem.cbor
+*.fea-solution.cbor

@@ -57,7 +57,7 @@
 //! floor). Compare `target_force` against `contact_force` to judge the
 //! residual mismatch.
 
-use volumetric_abi::fea::{FeaField, FeaMesh, decode_fea_mesh, encode_fea_mesh};
+use volumetric_abi::fea::{FeaMesh, decode_fea_mesh, encode_fea_mesh};
 use volumetric_abi::host::{
     input_model_dimensions, input_model_sample, post_output, read_input, report_error,
 };
@@ -100,15 +100,6 @@ impl Default for InverseOperatorConfig {
             schwarz_target_nodes: 128,
             stress_stiffening_passes: 0,
         }
-    }
-}
-
-/// Replace-or-append a field, so re-running on an already-solved mesh
-/// doesn't accumulate duplicates.
-fn upsert(fields: &mut Vec<FeaField>, field: FeaField) {
-    match fields.iter_mut().find(|f| f.name == field.name) {
-        Some(existing) => *existing = field,
-        None => fields.push(field),
     }
 }
 
@@ -172,56 +163,7 @@ fn run_inverse(config: &InverseOperatorConfig) -> Result<FeaMesh, String> {
     // contact_force carries the residual mismatch for inspection.
     let result = fea_core::solve_inverse(&mesh, &mut rigid, &mut target, &inverse_config)?;
 
-    upsert(
-        &mut mesh.element_fields,
-        FeaField {
-            name: "stiffness_scale".to_string(),
-            components: 1,
-            data: result.stiffness_scale,
-        },
-    );
-    upsert(
-        &mut mesh.node_fields,
-        FeaField {
-            name: "target_force".to_string(),
-            components: 1,
-            data: result.target_force,
-        },
-    );
-    upsert(
-        &mut mesh.node_fields,
-        FeaField {
-            name: "displacement".to_string(),
-            components: 3,
-            data: result.solve.displacement,
-        },
-    );
-    if let Some(rotation) = result.solve.rotation {
-        upsert(
-            &mut mesh.node_fields,
-            FeaField {
-                name: "rotation".to_string(),
-                components: 3,
-                data: rotation,
-            },
-        );
-    }
-    upsert(
-        &mut mesh.node_fields,
-        FeaField {
-            name: "contact_force".to_string(),
-            components: 3,
-            data: result.solve.contact_force,
-        },
-    );
-    upsert(
-        &mut mesh.element_fields,
-        FeaField {
-            name: "strain_energy_density".to_string(),
-            components: 1,
-            data: result.solve.strain_energy_density,
-        },
-    );
+    fea_bundle::apply_inverse_result(&mut mesh, result);
     mesh.validate()?;
     Ok(mesh)
 }

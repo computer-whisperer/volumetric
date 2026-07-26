@@ -543,7 +543,7 @@ impl StiffnessModel for FrameModel {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{FixedBoundary, SolveConfig, solve, solve_cg};
     use volumetric_abi::fea::{FeaElementKind, FeaField, FeaMesh};
@@ -595,7 +595,7 @@ mod tests {
 
     /// A cubic lattice: nodes on an n^3 grid, struts along the three axis
     /// directions — representative strut-mesh topology for apply scaling.
-    fn cubic_lattice(n: usize) -> FeaMesh {
+    pub(crate) fn cubic_lattice(n: usize) -> FeaMesh {
         let idx = |i: usize, j: usize, k: usize| (i * n * n + j * n + k) as u32;
         let mut node_positions = Vec::new();
         for i in 0..n {

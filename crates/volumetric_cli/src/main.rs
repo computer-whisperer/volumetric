@@ -28,6 +28,7 @@ use volumetric::{
 
 mod assets;
 mod camera;
+mod fea;
 mod headless_renderer;
 mod info;
 mod project;
@@ -71,6 +72,9 @@ enum Commands {
     /// Add an operator execution to a project
     #[command(name = "project-add-op")]
     ProjectAddOp(project::ProjectAddOpArgs),
+    /// Merge typed values into an existing step's configuration
+    #[command(name = "project-set-config")]
+    ProjectSetConfig(project::ProjectSetConfigArgs),
     /// Check a project for structural problems without running it
     #[command(name = "project-validate")]
     ProjectValidate(project::ProjectValidateArgs),
@@ -86,6 +90,12 @@ enum Commands {
     /// List assets in a project
     #[command(name = "project-list")]
     ProjectList(project::ProjectListArgs),
+    /// Export an FEA step's inputs as a problem bundle for external solvers
+    #[command(name = "fea-export")]
+    FeaExport(fea::FeaExportArgs),
+    /// Adopt an externally-solved FEA solution bundle into a project
+    #[command(name = "fea-import")]
+    FeaImport(fea::FeaImportArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -475,10 +485,13 @@ fn main() -> Result<()> {
         Commands::ProjectAddModel(args) => project::run_project_add_model(args),
         Commands::ProjectAddAsset(args) => project::run_project_add_asset(args),
         Commands::ProjectAddOp(args) => project::run_project_add_op(args),
+        Commands::ProjectSetConfig(args) => project::run_project_set_config(args),
         Commands::ProjectValidate(args) => project::run_project_validate(args),
         Commands::ProjectExport(args) => project::run_project_export(args),
         Commands::ProjectRun(args) => project::run_project_run(args),
         Commands::ProjectBake(args) => project::run_project_bake(args),
         Commands::ProjectList(args) => project::run_project_list(args),
+        Commands::FeaExport(args) => fea::run_fea_export(args),
+        Commands::FeaImport(args) => fea::run_fea_import(args),
     }
 }

@@ -26,6 +26,10 @@ struct InverseOperatorConfig {
     min_scale: f64,
     column_size: f64,
     max_contact_iterations: u32,
+    cg_tolerance: f64,
+    preconditioner: String,
+    schwarz_target_nodes: u32,
+    stress_stiffening_passes: u32,
 }
 
 impl Default for InverseOperatorConfig {
@@ -40,6 +44,10 @@ impl Default for InverseOperatorConfig {
             min_scale: 0.01,
             column_size: 0.0,
             max_contact_iterations: 64,
+            cg_tolerance: 1e-8,
+            preconditioner: "auto".to_string(),
+            schwarz_target_nodes: 128,
+            stress_stiffening_passes: 0,
         }
     }
 }
@@ -109,15 +117,16 @@ fn main() {
             .unwrap_or(f64::NAN)
     };
 
-    // Experiment knobs: override the CG tolerance (default 1e-8) to measure
-    // how tight the inner solves actually need to be; PROFILE_SCHWARZ=<nodes>
-    // switches to the two-level Schwarz preconditioner with that subdomain
-    // size (needs fea_core's `parallel` feature).
+    // Experiment knobs, each overriding the project's own config: the CG
+    // tolerance (PROFILE_CG_TOL) to measure how tight the inner solves
+    // actually need to be, and PROFILE_SCHWARZ=<nodes>[,bj] to force the
+    // two-level Schwarz preconditioner with that subdomain size (`bj` swaps
+    // the dense subdomain solves for block-Jacobi at the fine level; needs
+    // fea_core's `parallel` feature). Unset, the project config drives —
+    // the harness replays exactly what the operator would do.
     let cg_tolerance = std::env::var("PROFILE_CG_TOL")
         .ok()
         .and_then(|s| s.parse().ok());
-    // PROFILE_SCHWARZ=<nodes>[,bj] — `bj` swaps the dense subdomain solves
-    // for block-Jacobi at the fine level (coarse space unchanged).
     let preconditioner = match std::env::var("PROFILE_SCHWARZ") {
         Ok(spec) => {
             let (nodes, dense) = match spec.split_once(',') {
@@ -129,7 +138,11 @@ fn main() {
                 direct_local: dense,
             })
         }
-        Err(_) => fea_core::PrecondChoice::Auto,
+        Err(_) => fea_core::PrecondChoice::parse(
+            &config.preconditioner,
+            config.schwarz_target_nodes as usize,
+        )
+        .expect("project config preconditioner"),
     };
     let inverse_config = fea_core::InverseConfig {
         solve: fea_core::SolveConfig {
@@ -139,7 +152,7 @@ fn main() {
             },
             fixed_boundary: fea_core::FixedBoundary::parse(&config.fixed_boundary)
                 .expect("fixed_boundary"),
-            cg_tolerance: cg_tolerance.unwrap_or(fea_core::SolveConfig::default().cg_tolerance),
+            cg_tolerance: cg_tolerance.unwrap_or(config.cg_tolerance),
             // PROFILE_MAX_CONTACT overrides the project's contact cap.
             max_contact_iterations: std::env::var("PROFILE_MAX_CONTACT")
                 .ok()
@@ -149,7 +162,7 @@ fn main() {
             stress_stiffening_passes: std::env::var("PROFILE_PASSES")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(0),
+                .unwrap_or(config.stress_stiffening_passes as usize),
             preconditioner,
             ..Default::default()
         },

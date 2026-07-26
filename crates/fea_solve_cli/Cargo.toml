@@ -1,0 +1,15 @@
+[package]
+name = "fea_solve_cli"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "fea-solve"
+path = "src/main.rs"
+
+[dependencies]
+volumetric = { path = "../.." }
+fea_core = { path = "../fea_core", features = ["parallel"] }
+fea_bundle = { path = "../fea_bundle" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }

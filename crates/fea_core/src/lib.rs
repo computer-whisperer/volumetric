@@ -33,6 +33,7 @@ pub mod frame;
 pub mod inverse;
 #[cfg(feature = "parallel")]
 pub mod schwarz;
+pub mod verify;
 
 pub use element::{ElementStiffness, Material, cube_stiffness, hex8_stiffness};
 pub use inverse::{InverseConfig, InverseResult, TargetMap, solve_inverse};
@@ -682,7 +683,7 @@ fn solve_cg_system(
 /// starting point *away* from the body's side (`sign` = +1 when the body
 /// presses from the axis' positive side). Scans in `h`-steps to bracket the
 /// boundary, then bisects. Returns the surface's coordinate along `axis`.
-fn rigid_contact_surface(
+pub(crate) fn rigid_contact_surface(
     rigid: &mut dyn RigidBody,
     inside: [f64; 3],
     axis: usize,
@@ -882,17 +883,30 @@ pub(crate) fn adjoint_solve(
 /// `frame` is the concrete model when the elements are Bar2 struts — the
 /// Schwarz preconditioner assembles subdomain matrices from struts and so
 /// cannot be built from the type-erased stiffness action alone.
-fn contact_solve(
+/// The contact problem's frame: the glued-face constraint mask and the
+/// rigid-surface scan geometry. Shared by the solver and the solution
+/// verifier so an external solution is judged against bit-identical
+/// definitions of "glued", "penetrating", and "settled".
+pub(crate) struct ContactFrame {
+    pub(crate) contact_axis: usize,
+    pub(crate) contact_sign: f64,
+    pub(crate) scan_limit: usize,
+    /// Activation/drift slack: penetration (and prescribed-value drift)
+    /// within this distance is tolerated so rim nodes don't cycle.
+    pub(crate) slack: f64,
+    /// Glued-face constraint mask (all dofs of glued nodes), length
+    /// `node_count * dpn`.
+    pub(crate) constrained: Vec<bool>,
+    pub(crate) fixed_node: Vec<bool>,
+}
+
+pub(crate) fn contact_frame(
     mesh: &FeaMesh,
-    model: &dyn StiffnessModel,
-    frame: Option<&frame::FrameModel>,
-    rigid: &mut dyn RigidBody,
-    config: &SolveConfig,
-) -> Result<(SolveResult, SolveInternals), String> {
-    let dpn = model.dofs_per_node();
+    dpn: usize,
+    h: f64,
+    fixed_boundary: FixedBoundary,
+) -> ContactFrame {
     let node_count = mesh.node_count();
-    let n = node_count * dpn;
-    let h = model.length_scale();
 
     // Mesh bounding box (for the fixed face and the contact scan limit).
     let mut lo = [f64::INFINITY; 3];
@@ -907,14 +921,13 @@ fn contact_solve(
     // The rigid body presses toward the glued face: contact acts along the
     // fixed boundary's axis, with the body approaching from the opposite
     // side (glued at min → body on the positive side pressing negative).
-    let (contact_axis, contact_sign) = config.fixed_boundary.contact_axis();
+    let (contact_axis, contact_sign) = fixed_boundary.contact_axis();
     let scan_limit = ((hi[contact_axis] - lo[contact_axis]) / h).ceil() as usize + 4;
 
     // Base constraints: the glued face.
-    let mut constrained = vec![false; n];
-    let mut prescribed = vec![0.0f64; n];
+    let mut constrained = vec![false; node_count * dpn];
     let mut fixed_node = vec![false; node_count];
-    if let Some((axis, take_min)) = config.fixed_boundary.axis() {
+    if let Some((axis, take_min)) = fixed_boundary.axis() {
         let face = if take_min { lo[axis] } else { hi[axis] };
         for node in 0..node_count {
             if (mesh.node_position(node)[axis] - face).abs() < h * 1e-3 {
@@ -925,6 +938,38 @@ fn contact_solve(
             }
         }
     }
+    ContactFrame {
+        contact_axis,
+        contact_sign,
+        scan_limit,
+        slack: h * 1e-3,
+        constrained,
+        fixed_node,
+    }
+}
+
+fn contact_solve(
+    mesh: &FeaMesh,
+    model: &dyn StiffnessModel,
+    frame: Option<&frame::FrameModel>,
+    rigid: &mut dyn RigidBody,
+    config: &SolveConfig,
+) -> Result<(SolveResult, SolveInternals), String> {
+    let dpn = model.dofs_per_node();
+    let node_count = mesh.node_count();
+    let n = node_count * dpn;
+    let h = model.length_scale();
+
+    let contact = contact_frame(mesh, dpn, h, config.fixed_boundary);
+    let ContactFrame {
+        contact_axis,
+        contact_sign,
+        scan_limit,
+        slack,
+        mut constrained,
+        fixed_node,
+    } = contact;
+    let mut prescribed = vec![0.0f64; n];
 
     // Unmasked preconditioner assemblies; the constraint-dependent masking
     // and factoring happen per contact iteration. The Schwarz preconditioner
@@ -962,7 +1007,6 @@ fn contact_solve(
         // re-prescribed when it has drifted. Penetration (and drift) within
         // a small slack is tolerated; without both, rim nodes cycle
         // activate/release forever and the active set never settles.
-        let slack = h * 1e-3;
         let mut set_changes = 0usize;
         for node in 0..node_count {
             if fixed_node[node] {

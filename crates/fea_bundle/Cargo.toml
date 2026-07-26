@@ -1,0 +1,11 @@
+[package]
+name = "fea_bundle"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+fea_core = { path = "../fea_core" }
+volumetric_abi = { path = "../volumetric_abi" }
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+ciborium = "0.2"
