@@ -3360,9 +3360,10 @@ impl VolumetricUiV2 {
         };
         inputs[blob_slot] = ExecutionInput::Inline(blob);
 
-        let output_ids = self
-            .project
-            .output_ids_for(self.project.default_output_name(output_base, None), &metadata);
+        let output_ids = self.project.output_ids_for(
+            self.project.default_output_name(output_base, None),
+            &metadata,
+        );
         let output_id = output_ids[0].clone();
         self.project
             .insert_operation(asset.name, asset.bytes.to_vec(), inputs, output_ids);

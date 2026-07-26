@@ -6,7 +6,9 @@
 #![cfg(feature = "native")]
 
 use ciborium::value::Value;
-use volumetric::wasm::{NativeModelExecutor, OperatorExecutor, OperatorIo, create_operator_executor};
+use volumetric::wasm::{
+    NativeModelExecutor, OperatorExecutor, OperatorIo, create_operator_executor,
+};
 
 fn wasm_artifact(name: &str) -> Vec<u8> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -105,7 +107,8 @@ fn card_produces_registered_ink_and_plate() {
 
 #[test]
 fn dark_chip_knocks_out_light_text() {
-    let html = r#"<div class="p-4"><div class="bg-black p-4"><p class="text-white">OK</p></div></div>"#;
+    let html =
+        r#"<div class="p-4"><div class="bg-black p-4"><p class="text-white">OK</p></div></div>"#;
     let (ink, _) = card_models(html, &[]);
     let mut exec = NativeModelExecutor::new(&ink).unwrap();
 
@@ -126,7 +129,10 @@ fn dark_chip_knocks_out_light_text() {
         }
         x_px += 0.25;
     }
-    assert!(holes > 5, "expected glyph knockout, got {holes} empty samples");
+    assert!(
+        holes > 5,
+        "expected glyph knockout, got {holes} empty samples"
+    );
 }
 
 #[test]
@@ -186,7 +192,7 @@ fn plate_and_ink_extrude_into_3d() {
             ],
         )
         .unwrap_or_else(|e| panic!("{name} extrudes: {e}"));
-        let mut exec = NativeModelExecutor::new(outputs.get(&0).unwrap()).unwrap();
+        let exec = NativeModelExecutor::new(outputs.get(&0).unwrap()).unwrap();
         assert_eq!(exec.dimensions(), 3, "{name}");
     }
 }

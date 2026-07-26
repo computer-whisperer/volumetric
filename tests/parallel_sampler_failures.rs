@@ -8,7 +8,7 @@
 #![cfg(feature = "native")]
 
 use volumetric::adaptive_surface_nets_2::AdaptiveMeshConfig2;
-use volumetric::wasm::{create_parallel_sampler, ParallelModelSampler};
+use volumetric::wasm::{ParallelModelSampler, create_parallel_sampler};
 
 /// A 3D model over bounds [-1, 1]³ that occupies the x <= 0 half and TRAPS
 /// (unreachable) for any sample with x > 0.
@@ -71,5 +71,8 @@ fn meshing_a_trapping_model_succeeds_and_meshes_the_healthy_half() {
         .fold(f32::INFINITY, f32::min);
     // The occupied half spans x in [-1, 0]; allow one padded-grid cell of
     // meshing slack on either side.
-    assert!(min_x < -0.9 && max_x < 0.15, "mesh should cover [-1, 0], got [{min_x}, {max_x}]");
+    assert!(
+        min_x < -0.9 && max_x < 0.15,
+        "mesh should cover [-1, 0], got [{min_x}, {max_x}]"
+    );
 }

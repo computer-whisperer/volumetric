@@ -18,9 +18,6 @@
 
 mod js_bindings;
 
-#[cfg(feature = "web")]
-pub use js_bindings::*;
-
 use crate::wasm::error::WasmBackendError;
 use crate::wasm::traits::{
     ModelBounds, ModelBoundsNd, ModelExecutor, OperatorExecutor, OperatorIo, ParallelModelSampler,

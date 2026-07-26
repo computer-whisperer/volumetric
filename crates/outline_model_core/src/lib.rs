@@ -165,7 +165,11 @@ impl<'a> PayloadView<'a> {
             return Err("empty outline payload");
         }
         let fixed = HEADER_LEN
-            .checked_add(band_count.checked_mul(BAND_ENTRY_LEN).ok_or("band overflow")?)
+            .checked_add(
+                band_count
+                    .checked_mul(BAND_ENTRY_LEN)
+                    .ok_or("band overflow")?,
+            )
             .and_then(|n| n.checked_add(segment_count.checked_mul(SEGMENT_LEN)?))
             .ok_or("payload size overflow")?;
         if payload_len < fixed || (payload_len - fixed) % 4 != 0 || bytes.len() < payload_len {
@@ -187,10 +191,14 @@ impl<'a> PayloadView<'a> {
     }
 
     fn segment(&self, idx: usize) -> [f64; 4] {
-        let off = HEADER_LEN + self.band_count * BAND_ENTRY_LEN + self.ref_count * 4
-            + idx * SEGMENT_LEN;
+        let off =
+            HEADER_LEN + self.band_count * BAND_ENTRY_LEN + self.ref_count * 4 + idx * SEGMENT_LEN;
         std::array::from_fn(|i| {
-            f64::from_le_bytes(self.bytes[off + i * 8..off + (i + 1) * 8].try_into().unwrap())
+            f64::from_le_bytes(
+                self.bytes[off + i * 8..off + (i + 1) * 8]
+                    .try_into()
+                    .unwrap(),
+            )
         })
     }
 
@@ -210,13 +218,18 @@ impl<'a> PayloadView<'a> {
         let band = (((y - min_y) / band_h) as usize).min(self.band_count - 1);
         let entry = HEADER_LEN + band * BAND_ENTRY_LEN;
         let u32_at = |off: usize| -> Option<u32> {
-            Some(u32::from_le_bytes(self.bytes.get(off..off + 4)?.try_into().unwrap()))
+            Some(u32::from_le_bytes(
+                self.bytes.get(off..off + 4)?.try_into().unwrap(),
+            ))
         };
         let Some((start, len)) = u32_at(entry).zip(u32_at(entry + 4)) else {
             return false;
         };
         let (start, len) = (start as usize, len as usize);
-        if start.checked_add(len).is_none_or(|end| end > self.ref_count) {
+        if start
+            .checked_add(len)
+            .is_none_or(|end| end > self.ref_count)
+        {
             return false;
         }
 
@@ -338,9 +351,8 @@ mod tests {
         // y [0, 7502.8]; at k in {3, 6, 12, 13} the old query computed
         // band k-1 while the build assigned the bottom-edge segments
         // starting at band k.
-        let rect = |x0: f64, y0: f64, y1: f64| {
-            vec![[x0, y0], [x0 + 10.0, y0], [x0 + 10.0, y1], [x0, y1]]
-        };
+        let rect =
+            |x0: f64, y0: f64, y1: f64| vec![[x0, y0], [x0 + 10.0, y0], [x0 + 10.0, y1], [x0, y1]];
         let mut contours = vec![rect(0.0, 0.0, 100.0), rect(0.0, 7402.8, 7502.8)];
         for i in 0..24 {
             let y0 = 150.0 + i as f64 * 280.0;
@@ -358,7 +370,10 @@ mod tests {
         let view = PayloadView::new(&payload).unwrap();
         for &y in &boundary_ys {
             assert!(view.contains(25.0, y), "bottom edge on band boundary y={y}");
-            assert!(view.contains(25.0, y + 100.0), "interior above boundary y={y}");
+            assert!(
+                view.contains(25.0, y + 100.0),
+                "interior above boundary y={y}"
+            );
         }
     }
 
@@ -371,9 +386,7 @@ mod tests {
         assert!(build_payload(&[vec![[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]]]).is_err());
         assert!(build_payload(&[vec![[0.0, 0.0], [f64::NAN, 1.0], [1.0, 1.0]]]).is_err());
         // Duplicate consecutive points collapse; a triangle must survive.
-        assert!(
-            build_payload(&[vec![[0.0, 0.0], [0.0, 0.0], [4.0, 0.0], [0.0, 4.0]]]).is_ok()
-        );
+        assert!(build_payload(&[vec![[0.0, 0.0], [0.0, 0.0], [4.0, 0.0], [0.0, 4.0]]]).is_ok());
     }
 
     #[test]

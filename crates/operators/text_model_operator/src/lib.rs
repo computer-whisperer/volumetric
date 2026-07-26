@@ -95,7 +95,10 @@ fn text_contours(cfg: &TextConfig, font_bytes: &[u8]) -> Result<Vec<Vec<[f64; 2]
         return Err(format!("line_height must be > 0, got {}", cfg.line_height));
     }
     if !cfg.letter_spacing.is_finite() {
-        return Err(format!("letter_spacing must be finite, got {}", cfg.letter_spacing));
+        return Err(format!(
+            "letter_spacing must be finite, got {}",
+            cfg.letter_spacing
+        ));
     }
     if !matches!(cfg.align.as_str(), "left" | "center" | "right") {
         return Err(format!(

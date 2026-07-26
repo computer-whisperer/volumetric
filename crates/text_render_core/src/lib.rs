@@ -65,7 +65,14 @@ impl GlyphSink<'_> {
         self.flatten_quad(m, b, p2, depth + 1);
     }
 
-    fn flatten_cubic(&mut self, p0: [f64; 2], p1: [f64; 2], p2: [f64; 2], p3: [f64; 2], depth: u32) {
+    fn flatten_cubic(
+        &mut self,
+        p0: [f64; 2],
+        p1: [f64; 2],
+        p2: [f64; 2],
+        p3: [f64; 2],
+        depth: u32,
+    ) {
         // Standard cubic flatness bound: deviation² <= (max(d1²)+max(d2²))/16
         // with d1 = 3p1 - 2p0 - p3, d2 = 3p2 - p0 - 2p3 (per component).
         let d1x = 3.0 * p1[0] - 2.0 * p0[0] - p3[0];

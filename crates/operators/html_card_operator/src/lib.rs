@@ -202,8 +202,9 @@ pub extern "C" fn get_metadata() -> i64 {
             name: "html_card_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             display_name: "HTML Card".to_string(),
-            description: "Render an HTML+Tailwind fragment as ink and plate 2D models for label cards."
-                .to_string(),
+            description:
+                "Render an HTML+Tailwind fragment as ink and plate 2D models for label cards."
+                    .to_string(),
             category: "Primitives".to_string(),
             icon_svg: volumetric_abi::icon_svg!(
                 r##"<rect x="3" y="4" width="18" height="16" rx="2"/>"##,

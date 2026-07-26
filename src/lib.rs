@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+#[cfg(feature = "native")]
 use std::path::Path;
 use std::sync::Arc;
 

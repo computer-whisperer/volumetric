@@ -6,7 +6,9 @@
 #![cfg(feature = "native")]
 
 use ciborium::value::Value;
-use volumetric::wasm::{NativeModelExecutor, OperatorExecutor, OperatorIo, create_operator_executor};
+use volumetric::wasm::{
+    NativeModelExecutor, OperatorExecutor, OperatorIo, create_operator_executor,
+};
 
 fn wasm_artifact(name: &str) -> Vec<u8> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -72,8 +74,14 @@ fn text_renders_as_a_centered_2d_model() {
     // Default anchor "center": the tight bounding box centers on the
     // origin; a capital at em size 1.0 stands roughly 0.7 tall.
     let [min_x, max_x, min_y, max_y] = bounds_2d(&mut executor);
-    assert!((min_x + max_x).abs() < 1e-9, "x not centered: [{min_x}, {max_x}]");
-    assert!((min_y + max_y).abs() < 1e-9, "y not centered: [{min_y}, {max_y}]");
+    assert!(
+        (min_x + max_x).abs() < 1e-9,
+        "x not centered: [{min_x}, {max_x}]"
+    );
+    assert!(
+        (min_y + max_y).abs() < 1e-9,
+        "y not centered: [{min_y}, {max_y}]"
+    );
     let (w, h) = (max_x - min_x, max_y - min_y);
     assert!((0.5..0.9).contains(&h), "cap height {h}");
     assert!(w < h, "an I should be narrow, got {w}x{h}");
@@ -115,7 +123,10 @@ fn multiline_right_align_hangs_from_the_baseline() {
 
     // Right-aligned at the origin: outlines end essentially at x = 0.
     assert!(max_x <= 0.05, "right edge at {max_x}");
-    assert!(min_x < -1.0, "\"World\" should reach well left, got {min_x}");
+    assert!(
+        min_x < -1.0,
+        "\"World\" should reach well left, got {min_x}"
+    );
     // First line's caps rise above its baseline at y = 0; the second line
     // sits one line_height (default 1.2 em) below, with no descenders.
     assert!((0.5..0.9).contains(&max_y), "cap top {max_y}");
@@ -133,7 +144,10 @@ fn letter_spacing_widens_by_the_gap_count() {
     let base = width(&[]);
     let spaced = width(&[("letter_spacing", Value::Float(0.5))]);
     // One inter-glyph gap in "AB": exactly 0.5 em wider.
-    assert!((spaced - base - 0.5).abs() < 1e-9, "base {base}, spaced {spaced}");
+    assert!(
+        (spaced - base - 0.5).abs() < 1e-9,
+        "base {base}, spaced {spaced}"
+    );
 }
 
 #[test]
@@ -163,11 +177,8 @@ fn garbage_font_is_rejected() {
 
 #[test]
 fn unsupported_characters_are_reported() {
-    let err = run_operator(
-        "text_model_operator",
-        vec![text_config("a\u{2603}b", &[])],
-    )
-    .expect_err("snowman is not in Liberation Sans");
+    let err = run_operator("text_model_operator", vec![text_config("a\u{2603}b", &[])])
+        .expect_err("snowman is not in Liberation Sans");
     assert!(err.contains('\u{2603}'), "{err}");
 }
 

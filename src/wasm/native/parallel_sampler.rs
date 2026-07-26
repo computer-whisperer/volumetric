@@ -22,11 +22,7 @@ struct ThreadLocalContext {
 }
 
 impl ThreadLocalContext {
-    fn new(
-        engine: &Engine,
-        module: &Module,
-        dimensions: u32,
-    ) -> Result<Self, WasmBackendError> {
+    fn new(engine: &Engine, module: &Module, dimensions: u32) -> Result<Self, WasmBackendError> {
         let mut store = Store::new(engine, ());
         let instance = Instance::new(&mut store, module, &[])
             .map_err(|e| WasmBackendError::Instantiation(e.to_string()))?;

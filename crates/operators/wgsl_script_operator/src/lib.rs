@@ -565,7 +565,7 @@ fn scene(p: vec3<f64>) -> bool {
             }),
             (
                 "cross(vec3<f64>(x, y, 0.0), vec3<f64>(0.0, x, y)).x",
-                |x, y| y * y,
+                |_x, y| y * y,
             ),
             ("normalize(vec2<f64>(x, y)).x", |x, y: f64| {
                 x / (x * x + y * y).sqrt()

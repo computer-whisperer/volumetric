@@ -59,10 +59,20 @@ enum BuildKind {
 }
 
 /// Lay out and paint `root` at `width_px` CSS pixels wide.
-pub fn render(root: &Element, width_px: f64, fonts: &dyn FaceSource) -> Result<CardGeometry, String> {
+pub fn render(
+    root: &Element,
+    width_px: f64,
+    fonts: &dyn FaceSource,
+) -> Result<CardGeometry, String> {
     let mut errors = Vec::new();
     let mut missing = Vec::new();
-    let built = build_node(root, &TextStyle::default(), fonts, &mut errors, &mut missing);
+    let built = build_node(
+        root,
+        &TextStyle::default(),
+        fonts,
+        &mut errors,
+        &mut missing,
+    );
 
     missing.sort_unstable();
     missing.dedup();
@@ -103,14 +113,16 @@ pub fn render(root: &Element, width_px: f64, fonts: &dyn FaceSource) -> Result<C
             }
             let avail = known.width.map(f64::from).unwrap_or(match available.width {
                 AvailableSpace::Definite(w) => w as f64,
-                AvailableSpace::MinContent => return {
-                    let w = min_content_width(paragraph);
-                    let (_, h) = text::measure(paragraph, w);
-                    Size {
-                        width: w as f32,
-                        height: h as f32,
-                    }
-                },
+                AvailableSpace::MinContent => {
+                    return {
+                        let w = min_content_width(paragraph);
+                        let (_, h) = text::measure(paragraph, w);
+                        Size {
+                            width: w as f32,
+                            height: h as f32,
+                        }
+                    };
+                }
                 AvailableSpace::MaxContent => f64::INFINITY,
             });
             let (w, h) = text::measure(paragraph, avail);
@@ -123,7 +135,10 @@ pub fn render(root: &Element, width_px: f64, fonts: &dyn FaceSource) -> Result<C
     .map_err(|e| format!("layout failed: {e}"))?;
 
     let root_layout = *tree.layout(taffy_root).map_err(|e| e.to_string())?;
-    let (card_w, card_h) = (root_layout.size.width as f64, root_layout.size.height as f64);
+    let (card_w, card_h) = (
+        root_layout.size.width as f64,
+        root_layout.size.height as f64,
+    );
 
     let mut painter = Painter {
         tree: &tree,
@@ -149,7 +164,11 @@ pub fn render(root: &Element, width_px: f64, fonts: &dyn FaceSource) -> Result<C
 
 /// Recenter on the card's middle and scale to a model width of
 /// `width_model`: (x, y) → ((x - w/2) s, (y + h/2) s).
-pub fn to_model_space(contours: &[Contour], geometry: &CardGeometry, width_model: f64) -> Vec<Contour> {
+pub fn to_model_space(
+    contours: &[Contour],
+    geometry: &CardGeometry,
+    width_model: f64,
+) -> Vec<Contour> {
     let s = width_model / geometry.width_px;
     contours
         .iter()
@@ -204,7 +223,14 @@ fn build_node(
     if is_text_block {
         let mut runs = Vec::new();
         let mut breaks = Vec::new();
-        collect_runs(&el.children, &style.text, &el.tag, &mut runs, &mut breaks, errors);
+        collect_runs(
+            &el.children,
+            &style.text,
+            &el.tag,
+            &mut runs,
+            &mut breaks,
+            errors,
+        );
         let paragraph = shape_paragraph(&runs, &breaks, style.text.align, fonts, missing);
         // Border widths participate in taffy sizing.
         apply_border_to_taffy(&mut style);
@@ -255,12 +281,18 @@ fn collect_runs<'a>(
     for child in children {
         match child {
             Node::Text(t) => {
-                runs.push(Run { text: t, style: *style });
+                runs.push(Run {
+                    text: t,
+                    style: *style,
+                });
                 breaks.push(false);
             }
             Node::Element(el) if el.tag == "br" => {
                 if breaks.is_empty() {
-                    runs.push(Run { text: "", style: *style });
+                    runs.push(Run {
+                        text: "",
+                        style: *style,
+                    });
                     breaks.push(true);
                 } else {
                     *breaks.last_mut().unwrap() = true;
@@ -353,8 +385,13 @@ impl Painter<'_> {
                 (Ctx::Ink, _) => Some(false),
             };
             if let Some(positive) = positive {
-                self.ink
-                    .extend(border_ring(abs, size, boxed.border_px, boxed.radius_px, positive));
+                self.ink.extend(border_ring(
+                    abs,
+                    size,
+                    boxed.border_px,
+                    boxed.radius_px,
+                    positive,
+                ));
             }
         }
 
@@ -385,7 +422,9 @@ impl Painter<'_> {
         let content_x = abs[0] + (layout.border.left + layout.padding.left) as f64;
         let content_y = abs[1] + (layout.border.top + layout.padding.top) as f64;
         let content_w = layout.size.width as f64
-            - (layout.border.left + layout.border.right + layout.padding.left
+            - (layout.border.left
+                + layout.border.right
+                + layout.padding.left
                 + layout.padding.right) as f64;
 
         let lines = break_lines(paragraph, content_w + 1e-6);
@@ -627,7 +666,10 @@ mod tests {
             }
             x += 0.25;
         }
-        assert!(ink_hits > 3, "glyph should print on the panel, got {ink_hits}");
+        assert!(
+            ink_hits > 3,
+            "glyph should print on the panel, got {ink_hits}"
+        );
     }
 
     #[test]

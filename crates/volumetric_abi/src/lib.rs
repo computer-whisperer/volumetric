@@ -662,7 +662,6 @@ mod tests {
                 version: "0.1.0".to_string(),
                 inputs: vec![OperatorMetadataInput::ModelWASM],
                 outputs: vec![OperatorMetadataOutput::ModelWASM],
-                output_names: vec![],
             },
             &mut old,
         )
@@ -671,6 +670,7 @@ mod tests {
         let decoded = decode_metadata(&old).unwrap();
         assert_eq!(decoded.name, "legacy");
         assert!(decoded.input_names.is_empty());
+        assert!(decoded.output_names.is_empty());
         assert_eq!(decoded.input_name(0), None);
         assert!(decoded.display_name.is_empty());
         assert!(decoded.description.is_empty());

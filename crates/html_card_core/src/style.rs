@@ -122,10 +122,7 @@ fn parse_tone(token: &str) -> Option<Tone> {
         "black" => return Some(Tone::Dark),
         _ => {}
     }
-    if let Some(hex) = token
-        .strip_prefix("[#")
-        .and_then(|t| t.strip_suffix(']'))
-    {
+    if let Some(hex) = token.strip_prefix("[#").and_then(|t| t.strip_suffix(']')) {
         let expand = |s: &str| u8::from_str_radix(&format!("{s}{s}"), 16).ok();
         let (r, g, b) = match hex.len() {
             3 => (
@@ -182,10 +179,8 @@ fn parse_arbitrary_px(value: &str) -> Option<f64> {
     }
     let px = if let Some(px) = value.strip_suffix("px") {
         px.parse::<f64>().ok()?
-    } else if let Some(rem) = value.strip_suffix("rem") {
-        rem.parse::<f64>().ok()? * 16.0
     } else {
-        return None;
+        value.strip_suffix("rem")?.parse::<f64>().ok()? * 16.0
     };
     (px.is_finite() && px >= 0.0).then_some(px)
 }
@@ -194,7 +189,7 @@ fn parse_arbitrary_px(value: &str) -> Option<f64> {
 /// `[120px]`, `auto`).
 fn parse_dimension(token: &str) -> Option<Dimension> {
     match token {
-        "full" => return Some(percent(1.0)),
+        "full" => return Some(percent(1.0_f32)),
         "auto" => return Some(auto()),
         _ => {}
     }
@@ -509,7 +504,7 @@ fn resolve_layout_class(
         "flex-1" => {
             style.flex_grow = 1.0;
             style.flex_shrink = 1.0;
-            style.flex_basis = length(0.0);
+            style.flex_basis = length(0.0_f32);
         }
         "flex-auto" => {
             style.flex_grow = 1.0;
@@ -571,7 +566,7 @@ fn resolve_prefixed_layout_class(
     if let Some(rest) = class.strip_prefix("grid-cols-") {
         return match rest.parse::<usize>() {
             Ok(n) if (1..=12).contains(&n) => {
-                style.grid_template_columns = vec![fr(1.0); n];
+                style.grid_template_columns = vec![fr(1.0_f32); n];
                 true
             }
             _ => bad(class),
@@ -643,7 +638,12 @@ fn resolve_prefixed_layout_class(
             // Not a spacing token (e.g. this was never a p-/m- class at
             // all, like "pointer-events-none") — fall through unless it
             // really looked like one.
-            if token == "!" || token.chars().next().is_some_and(|c| c.is_ascii_digit() || c == '[') {
+            if token == "!"
+                || token
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_digit() || c == '[')
+            {
                 return bad(class);
             }
             continue;
@@ -771,11 +771,11 @@ mod tests {
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(s.taffy.display, Display::Flex);
         assert_eq!(s.taffy.flex_direction, FlexDirection::Column);
-        assert_eq!(s.taffy.gap.width, length(8.0));
-        assert_eq!(s.taffy.padding.top, length(16.0));
-        assert_eq!(s.taffy.padding.left, length(24.0)); // px-6 wins over p-4
-        assert_eq!(s.taffy.size.width, length(256.0));
-        assert_eq!(s.taffy.size.height, percent(1.0));
+        assert_eq!(s.taffy.gap.width, length(8.0_f32));
+        assert_eq!(s.taffy.padding.top, length(16.0_f32));
+        assert_eq!(s.taffy.padding.left, length(24.0_f32)); // px-6 wins over p-4
+        assert_eq!(s.taffy.size.width, length(256.0_f32));
+        assert_eq!(s.taffy.size.height, percent(1.0_f32));
         assert_eq!(s.taffy.margin.left, auto());
         assert_eq!(s.taffy.flex_grow, 1.0);
     }
@@ -786,8 +786,8 @@ mod tests {
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(s.taffy.display, Display::Grid);
         assert_eq!(s.taffy.grid_template_columns.len(), 3);
-        assert_eq!(s.taffy.gap.width, length(4.0));
-        assert_eq!(s.taffy.gap.height, length(0.0));
+        assert_eq!(s.taffy.gap.width, length(4.0_f32));
+        assert_eq!(s.taffy.gap.height, length(0.0_f32));
     }
 
     #[test]
@@ -829,8 +829,8 @@ mod tests {
     fn arbitrary_values_parse() {
         let (s, errors) = resolve(&["w-[120px]", "p-[0.5rem]", "text-[10px]", "rounded-[3px]"]);
         assert!(errors.is_empty(), "{errors:?}");
-        assert_eq!(s.taffy.size.width, length(120.0));
-        assert_eq!(s.taffy.padding.top, length(8.0));
+        assert_eq!(s.taffy.size.width, length(120.0_f32));
+        assert_eq!(s.taffy.padding.top, length(8.0_f32));
         assert_eq!(s.text.font_px, 10.0);
         assert_eq!(s.text.line_height_px, 15.0);
         assert_eq!(s.boxed.radius_px, 3.0);
@@ -864,7 +864,14 @@ mod tests {
 
     #[test]
     fn non_finite_and_negative_values_error() {
-        for class in ["border--2", "border-NaN", "border-inf", "w-[infpx]", "rounded-[NaNpx]", "p-[-4px]"] {
+        for class in [
+            "border--2",
+            "border-NaN",
+            "border-inf",
+            "w-[infpx]",
+            "rounded-[NaNpx]",
+            "p-[-4px]",
+        ] {
             let (_, errors) = resolve(&[class]);
             assert!(
                 errors.iter().any(|e| e.contains(class)),

@@ -69,10 +69,10 @@ pub fn parse_fragment(html: &str) -> Result<Element, String> {
             &bad.tag[1..]
         )),
         (None, _) => Err("the fragment contains no elements".to_string()),
-        (Some(_), Some(_)) => {
-            Err("the fragment has multiple top-level elements — wrap the card in a single root element"
-                .to_string())
-        }
+        (Some(_), Some(_)) => Err(
+            "the fragment has multiple top-level elements — wrap the card in a single root element"
+                .to_string(),
+        ),
     }
 }
 
@@ -97,7 +97,10 @@ impl Parser<'_> {
     }
 
     fn line(&self) -> usize {
-        1 + self.bytes[..self.pos].iter().filter(|&&b| b == b'\n').count()
+        1 + self.bytes[..self.pos]
+            .iter()
+            .filter(|&&b| b == b'\n')
+            .count()
     }
 
     fn error(&mut self, msg: String) {
@@ -446,7 +449,11 @@ mod tests {
         let html = format!("<p>{}</p>", "& ".repeat(100_000));
         let start = std::time::Instant::now();
         let err = parse_fragment(&html).unwrap_err();
-        assert!(start.elapsed().as_secs_f64() < 2.0, "took {:?}", start.elapsed());
+        assert!(
+            start.elapsed().as_secs_f64() < 2.0,
+            "took {:?}",
+            start.elapsed()
+        );
         assert!(err.contains("too many errors"), "{err}");
         assert!(err.lines().count() <= 65, "{} lines", err.lines().count());
     }

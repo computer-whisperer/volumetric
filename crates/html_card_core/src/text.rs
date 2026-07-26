@@ -99,9 +99,7 @@ pub fn shape_paragraph(
         // Split on collapsible whitespace; nbsp stays inside words.
         let mut chars = transformed.chars().peekable();
         let mut current = String::new();
-        let mut flush = |current: &mut String,
-                         tokens: &mut Vec<Token>,
-                         pending_join: &mut bool| {
+        let mut flush = |current: &mut String, tokens: &mut Vec<Token>, pending_join: &mut bool| {
             if current.is_empty() {
                 return;
             }
@@ -115,7 +113,10 @@ pub fn shape_paragraph(
                 flush(&mut current, &mut tokens, &mut pending_join);
                 // Explicit whitespace cancels any pending cross-run glue.
                 pending_join = false;
-                while chars.peek().is_some_and(|c| c.is_whitespace() && *c != '\u{a0}') {
+                while chars
+                    .peek()
+                    .is_some_and(|c| c.is_whitespace() && *c != '\u{a0}')
+                {
                     chars.next();
                 }
             } else {
@@ -252,8 +253,7 @@ pub fn break_lines(paragraph: &Paragraph, avail_px: f64) -> Vec<Line> {
                 } else {
                     word.space_px
                 };
-                if !current.words.is_empty() && current.width_px + space + chain > avail_px + 1e-6
-                {
+                if !current.words.is_empty() && current.width_px + space + chain > avail_px + 1e-6 {
                     lines.push(std::mem::replace(
                         &mut current,
                         Line {
@@ -429,7 +429,13 @@ mod tests {
                 style: TextStyle::default(),
             },
         ];
-        let p = shape_paragraph(&runs, &[true, false], TextAlign::Left, &fonts(), &mut missing);
+        let p = shape_paragraph(
+            &runs,
+            &[true, false],
+            TextAlign::Left,
+            &fonts(),
+            &mut missing,
+        );
         assert!(matches!(p.tokens[1], Token::Break));
         // Uppercase "UP" shaped: U and P glyphs differ from lowercase.
         let f = fonts();
@@ -450,8 +456,14 @@ mod tests {
         };
         let p = shape_paragraph(
             &[
-                Run { text: "Hel", style: bold },
-                Run { text: "lo world", style: TextStyle::default() },
+                Run {
+                    text: "Hel",
+                    style: bold,
+                },
+                Run {
+                    text: "lo world",
+                    style: TextStyle::default(),
+                },
             ],
             &[false, false],
             TextAlign::Left,
