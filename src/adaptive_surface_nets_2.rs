@@ -2414,13 +2414,11 @@ where
     // For the prior: n = 1*n + 0*t1 + 0*t2 (no deviation)
     // For measurement: measured ≈ dot*n + measured_dev_t1*t1 + measured_dev_t2*t2
     // Blended: we interpolate the t1/t2 components
-    let blended = (
+    (
         n.0 + blended_dev_t1 * t1.0 + blended_dev_t2 * t2.0,
         n.1 + blended_dev_t1 * t1.1 + blended_dev_t2 * t2.1,
         n.2 + blended_dev_t1 * t1.2 + blended_dev_t2 * t2.2,
-    );
-
-    blended
+    )
 }
 
 // =============================================================================

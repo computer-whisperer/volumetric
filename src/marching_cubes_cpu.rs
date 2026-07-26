@@ -573,7 +573,7 @@ mod tests {
             for n in tri.normals {
                 let len2 = n.0 * n.0 + n.1 * n.1 + n.2 * n.2;
                 total += 1;
-                if !(len2.is_finite()) || len2 < 0.25 || len2 > 4.0 {
+                if !len2.is_finite() || !(0.25..=4.0).contains(&len2) {
                     bad += 1;
                 }
             }

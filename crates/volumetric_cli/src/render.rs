@@ -333,9 +333,9 @@ fn convert_to_gpu_vertices(
         .collect()
 }
 
-fn output_path_for_view(base_path: &PathBuf, view: ViewAngle, num_views: usize) -> PathBuf {
+fn output_path_for_view(base_path: &std::path::Path, view: ViewAngle, num_views: usize) -> PathBuf {
     if num_views == 1 {
-        return base_path.clone();
+        return base_path.to_path_buf();
     }
 
     let stem = base_path
