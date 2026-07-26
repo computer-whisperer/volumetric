@@ -204,6 +204,9 @@ impl ModelExecutor for WebModelExecutor {
 pub struct WebParallelSampler {
     handle: JsWasmHandle,
     bounds: ModelBoundsNd,
+    /// Samples the JS bridge reported as errored (NaN), read as "outside".
+    /// Cell is fine under the single-threaded Sync assertion below.
+    errors: std::cell::Cell<u64>,
 }
 
 #[cfg(feature = "web")]
@@ -223,7 +226,11 @@ impl WebParallelSampler {
                 return Err(e);
             }
         };
-        Ok(Self { handle, bounds })
+        Ok(Self {
+            handle,
+            bounds,
+            errors: std::cell::Cell::new(0),
+        })
     }
 }
 
@@ -239,6 +246,7 @@ impl ParallelModelSampler for WebParallelSampler {
     fn sample(&self, x: f64, y: f64, z: f64) -> f32 {
         let result = wasm_model_sample(self.handle, x, y, z);
         if result.is_nan() {
+            self.errors.set(self.errors.get() + 1);
             0.0 // Return 0 (outside) on error
         } else {
             result
@@ -247,6 +255,10 @@ impl ParallelModelSampler for WebParallelSampler {
 
     fn get_bounds(&self) -> Result<ModelBounds, WasmBackendError> {
         bounds_3d(&self.bounds)
+    }
+
+    fn sample_traps(&self) -> u64 {
+        self.errors.get()
     }
 }
 

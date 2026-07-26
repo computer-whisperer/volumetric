@@ -772,7 +772,7 @@ pub fn generate_adaptive_mesh_v2_from_bytes_monitored(
         bounds_max.2 as f64,
     );
 
-    let sampler = move |x: f64, y: f64, z: f64| -> f32 {
+    let sampler = |x: f64, y: f64, z: f64| -> f32 {
         if x < clamp_min.0
             || x > clamp_max.0
             || y < clamp_min.1
@@ -790,6 +790,37 @@ pub fn generate_adaptive_mesh_v2_from_bytes_monitored(
     ) else {
         return Ok(None);
     };
+
+    // A sampling thread that couldn't instantiate the model reported
+    // "outside" for everything it touched without consulting the model, so
+    // the mesh is corrupt (typically with timing-dependent holes), not
+    // approximate. This is an environment failure — commonly memory or
+    // address-space exhaustion; note wasmtime reserves gigabytes of
+    // *virtual* address space per thread-local instance, so `ulimit -v`
+    // trips it while actual RSS stays small.
+    let init_failures = wasm_sampler.instantiation_failures();
+    if init_failures > 0 {
+        let detail = wasm_sampler
+            .instantiation_failure_detail()
+            .unwrap_or_else(|| "no detail captured".to_string());
+        anyhow::bail!(
+            "mesh discarded: {init_failures} sampling thread(s) could not instantiate the \
+             model, so their samples were fabricated as \"outside\" ({detail}). This is an \
+             environment failure (out of memory or address space — wasmtime reserves \
+             virtual address space far beyond its actual RSS, so `ulimit -v` breaks it), \
+             not a model error."
+        );
+    }
+
+    // Model-level traps read as "outside" per the ABI; the mesh is valid
+    // under that reading, but the author should know it happened.
+    let sample_traps = wasm_sampler.sample_traps();
+    if sample_traps > 0 {
+        eprintln!(
+            "warning: {sample_traps} sample(s) trapped inside the model and were read as \
+             \"outside\"; geometry may be missing wherever the model errors"
+        );
+    }
 
     Ok(Some(AdaptiveMeshV2Result {
         vertices: result.mesh.vertices,

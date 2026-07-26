@@ -158,20 +158,50 @@ pub trait ModelExecutor: Send {
 /// concurrently. Implementations typically use thread-local WASM instances that
 /// share a pre-compiled module.
 ///
-/// The `sample` method intentionally returns `f32` directly (not `Result`) because:
-/// 1. It's called millions of times during meshing and error handling overhead matters
-/// 2. The implementation can log/handle errors internally and return a default (0.0)
-/// 3. The meshing algorithms are designed to handle occasional bad samples gracefully
+/// The `sample` method intentionally returns `f32` directly (not `Result`) —
+/// it is called millions of times during meshing, so per-call error plumbing
+/// would be pure overhead. Failures are recorded instead of reported: the
+/// failing call returns 0.0 ("outside"), and the counters below say what
+/// happened afterwards. The two kinds are NOT equivalent: a model-level error
+/// ([`Self::sample_traps`]) reads as outside per the ABI, but an executor
+/// that couldn't even be created ([`Self::instantiation_failures`]) fabricates
+/// "outside" for entire threads' worth of samples without consulting the
+/// model — bulk consumers must check it when done and discard their output
+/// if it is nonzero. (Learned the hard way: under an address-space limit,
+/// meshing silently produced timing-dependent partial meshes for a correct
+/// model.)
 pub trait ParallelModelSampler: Send + Sync {
     /// Sample the occupancy at a point.
     ///
     /// Classify the result with [`volumetric_abi::is_occupied`] (inside iff
     /// `> 0.5`). On error, implementations return 0.0 — errors read as
-    /// "outside".
+    /// "outside" — and record the failure in the counters below.
     fn sample(&self, x: f64, y: f64, z: f64) -> f32;
 
     /// Get the bounding box of the model.
     fn get_bounds(&self) -> Result<ModelBounds, WasmBackendError>;
+
+    /// How many times a per-thread sampling context could not be created
+    /// (typically memory or address-space exhaustion). Every `sample` call
+    /// on an affected thread returned "outside" without consulting the
+    /// model, so nonzero means bulk output built from this sampler is
+    /// corrupt — not approximate — and must be discarded. Backends without
+    /// this failure mode report 0.
+    fn instantiation_failures(&self) -> u64 {
+        0
+    }
+
+    /// The first instantiation-failure error, for diagnostics.
+    fn instantiation_failure_detail(&self) -> Option<String> {
+        None
+    }
+
+    /// How many `sample` calls failed inside the model itself (a wasm trap
+    /// or bridge error) and were read as "outside" per the ABI. Worth
+    /// surfacing to the user; does not by itself invalidate the output.
+    fn sample_traps(&self) -> u64 {
+        0
+    }
 }
 
 /// I/O state for operator execution.

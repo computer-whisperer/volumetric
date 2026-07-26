@@ -22,23 +22,31 @@ struct ThreadLocalContext {
 }
 
 impl ThreadLocalContext {
-    fn new(engine: &Engine, module: &Module, dimensions: u32) -> Option<Self> {
+    fn new(
+        engine: &Engine,
+        module: &Module,
+        dimensions: u32,
+    ) -> Result<Self, WasmBackendError> {
         let mut store = Store::new(engine, ());
-        let instance = Instance::new(&mut store, module, &[]).ok()?;
+        let instance = Instance::new(&mut store, module, &[])
+            .map_err(|e| WasmBackendError::Instantiation(e.to_string()))?;
 
-        let memory = instance.get_memory(&mut store, "memory")?;
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .ok_or_else(|| WasmBackendError::MissingExport("memory".to_string()))?;
         let get_io_ptr = instance
             .get_typed_func::<(), i32>(&mut store, "get_io_ptr")
-            .ok()?;
+            .map_err(|e| WasmBackendError::MissingExport(format!("get_io_ptr: {e}")))?;
         let sample = instance
             .get_typed_func::<i32, f32>(&mut store, "sample")
-            .ok()?;
+            .map_err(|e| WasmBackendError::MissingExport(format!("sample: {e}")))?;
 
-        let io_ptr = get_io_ptr.call(&mut store, ()).ok()?;
-        super::model_executor::validate_io_ptr(io_ptr, dimensions, memory.data_size(&store))
-            .ok()?;
+        let io_ptr = get_io_ptr
+            .call(&mut store, ())
+            .map_err(|e| WasmBackendError::Execution(e.to_string()))?;
+        super::model_executor::validate_io_ptr(io_ptr, dimensions, memory.data_size(&store))?;
 
-        Some(Self {
+        Ok(Self {
             store,
             memory,
             dimensions,
@@ -47,7 +55,7 @@ impl ThreadLocalContext {
         })
     }
 
-    fn sample(&mut self, x: f64, y: f64, z: f64) -> f32 {
+    fn sample(&mut self, x: f64, y: f64, z: f64) -> Result<f32, wasmtime::Error> {
         // Write position into the model's IO buffer (pad extra dims with zeros)
         {
             let mem_data = self.memory.data_mut(&mut self.store);
@@ -65,10 +73,9 @@ impl ThreadLocalContext {
             }
         }
 
-        // Call sample
-        self.sample
-            .call(&mut self.store, self.io_ptr)
-            .unwrap_or(0.0)
+        // Call sample. Traps unwind only this activation; the store stays
+        // usable for subsequent calls.
+        self.sample.call(&mut self.store, self.io_ptr)
     }
 }
 
@@ -87,6 +94,14 @@ pub struct NativeParallelSampler {
     module: Module,
     dimensions: u32,
     bounds: ModelBoundsNd,
+    /// Threads whose sampling instance failed to instantiate (each such
+    /// thread's samples all read as "outside" — see the trait docs; bulk
+    /// consumers must reject their output when this is nonzero).
+    init_failures: AtomicU64,
+    /// The first instantiation error, for diagnostics.
+    init_failure_detail: std::sync::Mutex<Option<String>>,
+    /// Sample calls that trapped inside the model (read as "outside").
+    traps: AtomicU64,
 }
 
 impl NativeParallelSampler {
@@ -117,6 +132,9 @@ impl NativeParallelSampler {
             module,
             dimensions,
             bounds,
+            init_failures: AtomicU64::new(0),
+            init_failure_detail: std::sync::Mutex::new(None),
+            traps: AtomicU64::new(0),
         })
     }
 
@@ -198,9 +216,12 @@ impl NativeParallelSampler {
 impl ParallelModelSampler for NativeParallelSampler {
     fn sample(&self, x: f64, y: f64, z: f64) -> f32 {
         // Thread-local storage for the WASM context.
-        // Stores (sampler_id, context) so we can detect when to reinitialize.
+        // Stores (sampler_id, Option<context>) so we can detect when to
+        // reinitialize; `None` context records a failed instantiation so a
+        // doomed run doesn't retry it once per sample. `init_failures`
+        // therefore counts failing threads, not failing samples.
         thread_local! {
-            static CONTEXT: std::cell::RefCell<Option<(u64, ThreadLocalContext)>> =
+            static CONTEXT: std::cell::RefCell<Option<(u64, Option<ThreadLocalContext>)>> =
                 const { std::cell::RefCell::new(None) };
         }
 
@@ -214,16 +235,34 @@ impl ParallelModelSampler for NativeParallelSampler {
             };
 
             if needs_init {
-                match ThreadLocalContext::new(&self.engine, &self.module, self.dimensions) {
-                    Some(ctx) => *opt = Some((self.id, ctx)),
-                    None => return 0.0,
-                }
+                let ctx = match ThreadLocalContext::new(&self.engine, &self.module, self.dimensions)
+                {
+                    Ok(ctx) => Some(ctx),
+                    Err(e) => {
+                        self.init_failures.fetch_add(1, Ordering::Relaxed);
+                        self.init_failure_detail
+                            .lock()
+                            .unwrap()
+                            .get_or_insert_with(|| e.to_string());
+                        None
+                    }
+                };
+                *opt = Some((self.id, ctx));
             }
 
-            if let Some((_, ctx)) = opt.as_mut() {
-                ctx.sample(x, y, z)
-            } else {
-                0.0
+            match opt.as_mut() {
+                Some((_, Some(ctx))) => match ctx.sample(x, y, z) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        self.traps.fetch_add(1, Ordering::Relaxed);
+                        0.0
+                    }
+                },
+                // Instantiation failed on this thread (recorded above):
+                // there is no instance to consult, so the value is
+                // fabricated. Bulk callers reject the run via
+                // `instantiation_failures`.
+                _ => 0.0,
             }
         })
     }
@@ -236,5 +275,17 @@ impl ParallelModelSampler for NativeParallelSampler {
             )));
         }
         Ok(self.bounds.to_3d())
+    }
+
+    fn instantiation_failures(&self) -> u64 {
+        self.init_failures.load(Ordering::Relaxed)
+    }
+
+    fn instantiation_failure_detail(&self) -> Option<String> {
+        self.init_failure_detail.lock().unwrap().clone()
+    }
+
+    fn sample_traps(&self) -> u64 {
+        self.traps.load(Ordering::Relaxed)
     }
 }
