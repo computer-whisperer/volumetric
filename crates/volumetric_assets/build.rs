@@ -43,6 +43,7 @@ const OPERATORS: &[&str] = &[
     "fea_solve_operator",
     "fea_density_operator",
     "fea_inverse_operator",
+    "fea_print_drag_operator",
     "fea_solution_import_operator",
     "fea_deform_operator",
     "mesh_to_model_operator",

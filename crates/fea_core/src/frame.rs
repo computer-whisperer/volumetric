@@ -312,6 +312,16 @@ impl FrameModel {
         self.struts[e].volume
     }
 
+    /// The strut's local-frame internal end forces `[f1, m1, f2, m2]` at
+    /// the global solution `x` (component 0 = axial/twist, 1-2 = the
+    /// transverse axes). Tension shows as `f2[0] > 0` — the end force on
+    /// node 1 points along +x' under stretch. Feeds the print-drag stress
+    /// recovery.
+    pub(crate) fn strut_local_forces(&self, e: usize, x: &[f64]) -> [[f64; 3]; 4] {
+        let s = &self.struts[e];
+        local_forces(s, &self.gather_local(s, x))
+    }
+
     /// Refresh the geometric (stress-stiffening) terms from the axial
     /// forces at solution `u` — one Picard pass of the beam-column
     /// nonlinearity. The elongation uses the von Karman (second-order)

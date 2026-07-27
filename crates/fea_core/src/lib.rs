@@ -28,6 +28,7 @@
 //! The linear solves are matrix-free Jacobi-preconditioned conjugate
 //! gradient over the free dofs.
 
+pub mod drag;
 pub mod element;
 pub mod frame;
 pub mod inverse;
@@ -35,6 +36,7 @@ pub mod inverse;
 pub mod schwarz;
 pub mod verify;
 
+pub use drag::{DragConfig, DragResult, solve_drag};
 pub use element::{ElementStiffness, Material, cube_stiffness, hex8_stiffness};
 pub use inverse::{InverseConfig, InverseResult, TargetMap, solve_inverse};
 #[cfg(feature = "parallel")]

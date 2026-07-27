@@ -14,7 +14,11 @@ use std::process::Command;
 
 /// Operators additionally built for wasm32-wasip1-threads (with their
 /// `threaded` feature) and packed as dual blobs.
-const THREADED_OPERATORS: &[&str] = &["fea_solve_operator", "fea_inverse_operator"];
+const THREADED_OPERATORS: &[&str] = &[
+    "fea_solve_operator",
+    "fea_inverse_operator",
+    "fea_print_drag_operator",
+];
 
 /// Extra link flags for the threaded variants:
 /// - `--max-memory`: the target's default shared-memory cap (1 GiB) is too

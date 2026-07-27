@@ -1602,6 +1602,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fea_print_drag_operator"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "fea_bundle",
+ "fea_core",
+ "serde",
+ "volumetric_abi",
+]
+
+[[package]]
 name = "fea_solution_import_operator"
 version = "0.1.0"
 dependencies = [

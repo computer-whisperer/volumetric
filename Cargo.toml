@@ -36,6 +36,7 @@ members = [
     "crates/operators/fea_solve_operator",
     "crates/operators/fea_density_operator",
     "crates/operators/fea_inverse_operator",
+    "crates/operators/fea_print_drag_operator",
     "crates/operators/fea_solution_import_operator",
     "crates/operators/mesh_to_model_operator",
     "crates/operators/image_model_operator",

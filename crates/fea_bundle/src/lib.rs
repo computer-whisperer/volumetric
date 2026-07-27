@@ -20,7 +20,7 @@
 //! requirement — but v1 producers emit exactly one case ("seating") and v1
 //! consumers reject anything else, loudly.
 
-use fea_core::InverseResult;
+use fea_core::{DragResult, InverseResult};
 use serde::{Deserialize, Serialize};
 use volumetric_abi::fea::{FeaField, FeaMesh};
 
@@ -274,6 +274,71 @@ pub fn apply_inverse_result(mesh: &mut FeaMesh, result: InverseResult) {
             name: "strain_energy_density".to_string(),
             components: 1,
             data: result.solve.strain_energy_density,
+        },
+    );
+}
+
+/// Write a [`DragResult`] onto its mesh exactly the way
+/// `fea_print_drag_operator` does — element fields `radius` (the designed
+/// radii, replacing the input design), `utilization`, `axial_force`, and
+/// `strain_energy_density`; node fields `displacement`, `rotation`, and
+/// `drag_force`. Kept beside [`apply_inverse_result`] so a future
+/// print-drag load case in the bundle line reuses the same field shape.
+pub fn apply_drag_result(mesh: &mut FeaMesh, result: DragResult) {
+    upsert(
+        &mut mesh.element_fields,
+        FeaField {
+            name: "radius".to_string(),
+            components: 1,
+            data: result.radius,
+        },
+    );
+    upsert(
+        &mut mesh.element_fields,
+        FeaField {
+            name: "utilization".to_string(),
+            components: 1,
+            data: result.utilization,
+        },
+    );
+    upsert(
+        &mut mesh.element_fields,
+        FeaField {
+            name: "axial_force".to_string(),
+            components: 1,
+            data: result.axial_force,
+        },
+    );
+    upsert(
+        &mut mesh.element_fields,
+        FeaField {
+            name: "strain_energy_density".to_string(),
+            components: 1,
+            data: result.strain_energy_density,
+        },
+    );
+    upsert(
+        &mut mesh.node_fields,
+        FeaField {
+            name: "displacement".to_string(),
+            components: 3,
+            data: result.displacement,
+        },
+    );
+    upsert(
+        &mut mesh.node_fields,
+        FeaField {
+            name: "rotation".to_string(),
+            components: 3,
+            data: result.rotation,
+        },
+    );
+    upsert(
+        &mut mesh.node_fields,
+        FeaField {
+            name: "drag_force".to_string(),
+            components: 3,
+            data: result.drag_force,
         },
     );
 }
