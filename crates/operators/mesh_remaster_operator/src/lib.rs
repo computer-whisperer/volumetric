@@ -42,9 +42,11 @@
 //! Pass order is chosen so later passes only violate earlier
 //! requirements when physically forced: surface first (it decides which
 //! outside arcs survive and hands the dropped ones to reconnection),
-//! connectivity second, support last. Raising only moves nodes, so it
-//! can break neither of the first two — where it pulls skin off the
-//! surface, the printer is overruling cosmetics. The one destructive
+//! connectivity second, support last. Raising only moves nodes (plus a
+//! weld of the struts it collapses — a vertical hook lands exactly on
+//! its supporter), so it can break neither of the first two — where it
+//! pulls skin off the surface, the printer is overruling cosmetics; a
+//! weld only ever contracts the graph. The one destructive
 //! interaction — `support.fix: "drop"` can split a component by
 //! removing a bridge — is closed by re-running connectivity once; a tie
 //! between two supported nodes can never create new unsupported
@@ -411,6 +413,9 @@ pub(crate) fn remaster(
     if let Some(support) = &config.support {
         let (fixed, dropped_any) = support::enforce(&out, support, config.connectivity.is_some())?;
         out = fixed;
+        if support.fix == SupportFix::Raise {
+            out = weld_raise_collapses(&out, config.surface.as_ref())?;
+        }
         // Dropping unsupported struts can split a component whose bridge
         // died; one reconnection round closes it. A new tie joins two
         // supported nodes, so at the default max_descent 0 it is always
@@ -421,6 +426,51 @@ pub(crate) fn remaster(
         if dropped_any && let Some(connectivity) = &config.connectivity {
             out = connect::enforce(&out, connectivity)?;
         }
+    }
+    Ok(out)
+}
+
+/// Raising lands a hanging node exactly on its support plane, so a strut
+/// with no horizontal reach collapses to a point — at any `max_descent`,
+/// since the support floor cannot decay over zero distance — and a
+/// near-vertical strut shrinks nearly as far. Contract the collapses the
+/// way draping does: struts shorter than `weld_factor * radius` weld
+/// into a joint, and true point-collapses weld even without a radius
+/// field (a zero-length strut is fatal to downstream FEA). Welding moves
+/// a joint by at most the weld length — inside the joint sphere the
+/// struts share — so support validity holds to strut-radius tolerance.
+fn weld_raise_collapses(
+    mesh: &FeaMesh,
+    surface: Option<&SurfaceConfig>,
+) -> Result<FeaMesh, String> {
+    // Point-collapse epsilon: far below any strut, far above coordinate
+    // rounding at the mesh's own scale.
+    let mut lo = [f64::INFINITY; 3];
+    let mut hi = [f64::NEG_INFINITY; 3];
+    for i in 0..mesh.node_count() {
+        let p = mesh.node_position(i);
+        for c in 0..3 {
+            lo[c] = lo[c].min(p[c]);
+            hi[c] = hi[c].max(p[c]);
+        }
+    }
+    let diag = (0..3).map(|c| (hi[c] - lo[c]).powi(2)).sum::<f64>().sqrt();
+    let degenerate_eps = 1e-9 * diag;
+
+    let weld_factor = surface.map_or(SurfaceConfig::default().weld_factor, |s| s.weld_factor);
+    let radius = (weld_factor > 0.0)
+        .then(|| {
+            mesh.element_fields
+                .iter()
+                .find(|f| f.name == "radius" && f.components == 1)
+        })
+        .flatten();
+    let out = mesh_edit_core::weld_short_bars(mesh, &|e| match radius {
+        Some(rf) => (rf.data[e] * weld_factor).max(degenerate_eps),
+        None => degenerate_eps,
+    })?;
+    if out.element_count() == 0 {
+        return Err("raising collapsed every strut into the weld".to_string());
     }
     Ok(out)
 }
@@ -735,5 +785,64 @@ mod tests {
             .find(|f| f.name == "skin")
             .unwrap();
         assert!(skin.data.contains(&1.0), "the fold is skin");
+    }
+
+    /// A hook hanging straight below its supporter has zero horizontal
+    /// reach, so at any max_descent the raise lands it exactly on the
+    /// supporting node; a near-vertical hook shrinks nearly as far. The
+    /// post-raise weld must contract both (a zero-length strut is fatal
+    /// to downstream FEA) instead of shipping them.
+    #[test]
+    fn raise_welds_collapsed_vertical_hooks() {
+        let nodes = [
+            [0.0, 0.0, 0.0],  // bed
+            [0.0, 0.0, 1.0],  // top of the column
+            [0.0, 0.0, 0.4],  // hook straight below the top
+            [0.02, 0.0, 0.5], // near-vertical hook: raises to length ~0.023
+        ];
+        let bars = [[0, 1], [1, 2], [1, 3]];
+        let mesh = bar_mesh(&nodes, &bars, 0.05);
+        let config = RemasterConfig {
+            support: Some(SupportConfig {
+                max_descent: 30.0,
+                ..SupportConfig::default()
+            }),
+            ..RemasterConfig::default()
+        };
+        let out = remaster(&mesh, None, &config).unwrap();
+        for pair in out.connectivity.chunks_exact(2) {
+            let (a, b) = (pair[0] as usize, pair[1] as usize);
+            let d = dist(out.node_position(a), out.node_position(b));
+            assert!(d > 1e-9, "degenerate strut survived: {a}-{b} length {d}");
+        }
+        assert_eq!(
+            out.element_count(),
+            1,
+            "both hooks weld into the column top"
+        );
+    }
+
+    /// Point-collapses weld away even without a radius field to size
+    /// the weld by.
+    #[test]
+    fn raise_welds_point_collapses_without_radius_field() {
+        let mesh = FeaMesh {
+            element_kind: FeaElementKind::Bar2,
+            node_positions: vec![
+                0.0, 0.0, 0.0, // bed
+                0.0, 0.0, 1.0, // top of the column
+                0.0, 0.0, 0.4, // hook straight below the top
+            ],
+            connectivity: vec![0, 1, 1, 2],
+            node_fields: vec![],
+            element_fields: vec![],
+        };
+        let config = RemasterConfig {
+            support: Some(SupportConfig::default()),
+            ..RemasterConfig::default()
+        };
+        let out = remaster(&mesh, None, &config).unwrap();
+        assert_eq!(out.element_count(), 1, "the collapsed hook welds away");
+        assert_eq!(out.node_count(), 2);
     }
 }
