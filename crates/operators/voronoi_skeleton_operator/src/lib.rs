@@ -1,43 +1,4 @@
-//! Voronoi Skeleton Operator.
-//!
-//! Builds the Voronoi edge skeleton of a point cloud: every input point
-//! becomes a cell seed, and the output Bar2 [`FeaMesh`] is the strut
-//! network along the boundaries where three or more cells meet — the
-//! same construction behind the built-in foam lattice, but with the site
-//! set under user control (see `lattice_model_core::voronoi`). A
-//! `point_fill_operator` bcc cloud at seed 0 reproduces the foam family's
-//! skeleton exactly; edited clouds (clipped, merged, transformed) make
-//! foams the built-in family can't.
-//!
-//! Hull cells are infinite; `boundary` picks what happens to their
-//! outward edges. The default `"trim"` keeps only edges supported by
-//! genuine Voronoi vertices on both ends AND within `max_reach` local
-//! spacings of their cell's site — infinite hull edges vanish and the
-//! hull shell's ballooning vertices (near-coplanar site slivers with
-//! huge empty circumspheres) are cut, so the skeleton simply ends at the
-//! cloud. `"box"` instead truncates hull edges at the cloud's bounding
-//! box plus `padding` (endpoints on the box, no reach cap), for when a
-//! downstream `mesh_clip_operator` should cut the rays to a real domain
-//! surface as skin-contact stubs. There is deliberately no domain input:
-//! clip the output against a model with `mesh_clip_operator` — before or
-//! after editing — which also welds the boundary stubs clipping creates.
-//!
-//! Removing sites from a cloud makes the *neighboring cells grow* into
-//! the vacated space (locally coarser foam); it does not cut holes. For
-//! holes, clip the Bar2 output instead.
-//!
-//! Inputs:
-//! - Input 0: FeaMesh (must be Point1) — the cell seed sites
-//! - Input 1: CBOR configuration:
-//!   `{ boundary: "trim" / "box" .default "trim", max_reach: float
-//!   .default 1.5 (trim: cap on edge reach in units of each cell's
-//!   nearest-neighbor distance; 0 disables), radius: float .default 0.0
-//!   (0 = typical spacing / 10), weld_factor: float .default 1.0 (welds
-//!   struts shorter than weld_factor * radius; 0 disables), padding:
-//!   float .default 0.0 (0 = two typical spacings) }`
-//!
-//! Output 0: CBOR-encoded Bar2 `FeaMesh` with a uniform scalar `radius`
-//! element field.
+#![doc = include_str!("../README.md")]
 
 use lattice_model_core::voronoi::{Boundary, VoronoiOptions, voronoi_skeleton};
 use volumetric_abi::fea::{FeaElementKind, FeaField, FeaMesh, decode_fea_mesh, encode_fea_mesh};
@@ -219,6 +180,7 @@ pub extern "C" fn get_metadata() -> i64 {
         OperatorMetadata {
             name: "voronoi_skeleton_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            docs: include_str!("../README.md").to_string(),
             display_name: "Voronoi Skeleton".to_string(),
             description: "Build the Voronoi cell-edge strut network (Bar2 mesh) of a \
                           point cloud of cell seeds."

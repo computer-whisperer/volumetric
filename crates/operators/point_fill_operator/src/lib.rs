@@ -267,6 +267,7 @@ pub extern "C" fn get_metadata() -> i64 {
         OperatorMetadata {
             name: "point_fill_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            docs: String::new(),
             display_name: "Point Fill".to_string(),
             description: "Fill a 3D domain model with a point cloud (Point1 mesh) — \
                           Voronoi cell seeds and other site sets."

@@ -519,6 +519,7 @@ pub extern "C" fn get_metadata() -> i64 {
         OperatorMetadata {
             name: "boolean_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            docs: String::new(),
             display_name: "Boolean".to_string(),
             description: "Combine two models by union, subtraction, or intersection.".to_string(),
             category: "Combine".to_string(),

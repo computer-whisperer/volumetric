@@ -1,98 +1,4 @@
-//! Mesh Remaster Operator.
-//!
-//! Reworks a strut lattice against composable *requirements*, solved
-//! jointly in one operator so their fixes cannot silently undo each
-//! other. Each requirement is an optional config block; at least one
-//! must be present:
-//!
-//! - `surface` — fold the parts of the network that protrude outside a
-//!   model down onto that model's surface (the drape pass). The outside
-//!   segments become a surface-conforming net (the "skin"), so a trimmed
-//!   Voronoi lattice ends in a smooth printable face instead of open
-//!   cell rims — without adding material the way a separate conforming
-//!   surface lattice would. Draping relocates the outer cells' own
-//!   struts and the net inherits the skeleton's degree-3 vertices: a
-//!   polygonal, sub-isostatic net that deforms by strut bending, far
-//!   softer in-plane than a triangulated skin. `skin_radius_factor`
-//!   tunes what stiffness remains (bending scales as radius^4) and the
-//!   `skin` element flag hands the net to downstream optimization.
-//! - `connectivity` — no floating fragments (they make FEA singular and
-//!   fall off prints). Fix `"reconnect"` re-drapes the cheapest arcs the
-//!   surface pass dropped until everything is one component (a spanning
-//!   forest over components, shortest arcs first), then synthesizes
-//!   direct ties for pieces with no dropped arc to reuse (up to
-//!   `max_new_strut` x the median strut length); whatever nothing can
-//!   reach is pruned. Fix `"prune"` keeps the largest component only.
-//!   Reconnection struts are flagged in a `tie` element field.
-//! - `support` — printable along the build axis on a resin printer:
-//!   overhangs are fine, hooks toward the bed are not. A piece fails
-//!   exactly where it appears in a slice unattached to already-cured
-//!   material; on the strut graph that is sub-level-set connectivity —
-//!   ascend the build axis and every node must connect to the bed
-//!   through nodes at or below its own height (`max_descent` degrees of
-//!   per-strut slack models in-slice cohesion; the slack deliberately
-//!   does not compound across struts). Fix `"raise"` projects the
-//!   descent out of invalid struts — unsupported nodes rise straight up
-//!   (x/y preserved) by the minimum that makes every support path
-//!   monotone, a hanging hook flattening into a fan; the raise distance
-//!   lands in a `raise` node field for inspection. Fix `"drop"` removes
-//!   unsupported struts instead — transitively, like the voxel island
-//!   remover, but exact and graph-aware.
-//!
-//! Pass order is chosen so later passes only violate earlier
-//! requirements when physically forced: surface first (it decides which
-//! outside arcs survive and hands the dropped ones to reconnection),
-//! connectivity second, support last. Raising only moves nodes (plus a
-//! weld of the struts it collapses — a vertical hook lands exactly on
-//! its supporter), so it can break neither of the first two — where it
-//! pulls skin off the surface, the printer is overruling cosmetics; a
-//! weld only ever contracts the graph. The one destructive
-//! interaction — `support.fix: "drop"` can split a component by
-//! removing a bridge — is closed by re-running connectivity once; a tie
-//! between two supported nodes can never create new unsupported
-//! geometry, so no further rounds are needed.
-//!
-//! The model is a binary occupancy oracle (the operator ABI contract),
-//! so surface projection estimates a direction from a signed stencil of
-//! occupancy samples, marches along it to bracket the surface, and
-//! bisects — all in lock-step batched rounds, one host call per round.
-//! Connectivity and support are pure graph passes and never touch the
-//! model; with no `surface` block the Surface input may stay unwired.
-//!
-//! Point1 clouds accept the `surface` requirement only (outside points
-//! land or drop); Hex8 meshes are rejected — volume elements cannot
-//! fold. Node positions are always 3D.
-//!
-//! Inputs:
-//! - Input 0: FeaMesh (Bar2, or Point1 for surface-only) — the mesh
-//! - Input 1: ModelWASM (must be 3D) — the surface to drape onto; only
-//!   required when the `surface` block is present
-//! - Input 2: CBOR configuration (every block optional, at least one;
-//!   the UI seeds new steps with `surface` enabled):
-//!   `{ ? surface: { outside: "project" / "drop" .default "project",
-//!   skin_radius_factor: float .default 1.0, chord_tolerance: float
-//!   .default 0.0 (0 = each strut's own radius), inset_factor: float
-//!   .default 0.0 (sink skin nodes below the surface by this many strut
-//!   radii — the largest radius at the node, bulk stubs included),
-//!   max_distance: float .default 0.0 (0 = 4 x the median strut length;
-//!   for Point1, an eighth of the cloud's bounding diagonal),
-//!   weld_factor: float .default 1.0 (welds struts shorter than
-//!   weld_factor * radius; 0 disables) } .default true,
-//!   ? connectivity: { fix: "reconnect" / "prune" .default "reconnect",
-//!   max_new_strut: float .default 1.5 (x the median strut length; 0
-//!   never synthesizes) },
-//!   ? support: { axis: "auto" / "x" / "y" / "z" .default "auto" (auto =
-//!   z), extreme: "min" / "max" .default "min" (which end of the axis
-//!   the bed is on), max_descent: float .default 0.0 (degrees below
-//!   horizontal a strut may descend from its supported end),
-//!   bed_tolerance: float .default 0.0 (0 = 1e-4 x the axis extent;
-//!   nodes this close to the extreme seed as bed-supported),
-//!   fix: "raise" / "drop" .default "raise" } }`
-//!
-//! Output 0: CBOR-encoded `FeaMesh`. The surface pass adds a scalar
-//! `skin` element field (1.0 on draped elements), connectivity adds
-//! `tie` (1.0 on reconnection struts), and support raising adds a
-//! `raise` node field (the distance each node rose).
+#![doc = include_str!("../README.md")]
 
 mod connect;
 mod drape;
@@ -534,6 +440,7 @@ pub extern "C" fn get_metadata() -> i64 {
         OperatorMetadata {
             name: "mesh_remaster_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            docs: include_str!("../README.md").to_string(),
             display_name: "Mesh Remaster".to_string(),
             description: "Rework a strut lattice against composable requirements: drape \
                           protruding struts onto a model surface as a compliance-tunable \

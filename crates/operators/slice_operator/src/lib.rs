@@ -290,6 +290,7 @@ pub extern "C" fn get_metadata() -> i64 {
     volumetric_abi::metadata_reply(&METADATA, || OperatorMetadata {
         name: "slice_operator".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        docs: String::new(),
         display_name: "Slice".to_string(),
         description: "Re-express a model in a subspace's chart as a lower-dimensional model."
             .to_string(),

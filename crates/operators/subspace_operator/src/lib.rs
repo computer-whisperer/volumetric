@@ -156,6 +156,7 @@ pub extern "C" fn get_metadata() -> i64 {
         OperatorMetadata {
             name: "subspace_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            docs: String::new(),
             display_name: "Subspace".to_string(),
             description: "Build a point, line, plane, or frame subspace from numeric inputs."
                 .to_string(),

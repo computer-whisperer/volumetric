@@ -804,6 +804,7 @@ pub extern "C" fn get_metadata() -> i64 {
         OperatorMetadata {
             name: "rotation_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            docs: String::new(),
             display_name: "Rotation".to_string(),
             description: "Rotate a model by Euler angles in degrees.".to_string(),
             category: "Transforms".to_string(),

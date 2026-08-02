@@ -5,6 +5,7 @@ fn main() {
     let metadata = volumetric_abi::OperatorMetadata {
         name: "rounded_box_model".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        docs: String::new(),
         display_name: "Rounded Box".to_string(),
         description: "Box with rounded edges centered at the origin.".to_string(),
         category: "Primitives".to_string(),

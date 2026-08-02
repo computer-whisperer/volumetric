@@ -317,6 +317,7 @@ pub extern "C" fn get_metadata() -> i64 {
         OperatorMetadata {
             name: "text_model_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            docs: String::new(),
             display_name: "Text".to_string(),
             description: "Render text as a filled 2D outline model, ready to extrude.".to_string(),
             category: "Primitives".to_string(),

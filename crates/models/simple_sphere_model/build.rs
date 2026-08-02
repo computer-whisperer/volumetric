@@ -5,6 +5,7 @@ fn main() {
     let metadata = volumetric_abi::OperatorMetadata {
         name: "simple_sphere_model".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        docs: String::new(),
         display_name: "Simple Sphere".to_string(),
         description: "Solid unit sphere centered at the origin.".to_string(),
         category: "Primitives".to_string(),

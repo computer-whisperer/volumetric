@@ -156,6 +156,7 @@ pub extern "C" fn get_metadata() -> i64 {
         OperatorMetadata {
             name: "mesh_transform_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            docs: String::new(),
             display_name: "Mesh Transform".to_string(),
             description: "Scale, rotate, and translate a mesh's nodes (points, struts, \
                           volumes)."

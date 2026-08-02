@@ -209,6 +209,7 @@ pub extern "C" fn get_metadata() -> i64 {
         OperatorMetadata {
         name: "fea_inverse_operator".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        docs: String::new(),
         display_name: "FEA Inverse".to_string(),
         description: "Back out per-element stiffness matching a target interface force distribution.".to_string(),
         category: "FEA".to_string(),

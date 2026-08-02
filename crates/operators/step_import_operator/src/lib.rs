@@ -245,6 +245,7 @@ mod operator {
             OperatorMetadata {
                 name: "step_import_operator".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
+                docs: String::new(),
                 display_name: "STEP".to_string(),
                 description: "Load a STEP CAD file as an exact solid model (no tessellation)."
                     .to_string(),

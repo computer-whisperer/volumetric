@@ -381,6 +381,15 @@ pub struct OperatorMetadata {
     /// bare shape elements in the canonical document header.
     #[serde(default)]
     pub icon_svg: String,
+    /// Full self-description as markdown (README style): what the operator
+    /// models, each configuration parameter's physical meaning, units, and
+    /// typical values, output fields, and failure modes. Rendered by host
+    /// UIs and printed by the CLI; empty means undocumented. Convention:
+    /// the crate keeps one `README.md` serving as both the rustdoc header
+    /// (`#![doc = include_str!("../README.md")]`) and this field, so the
+    /// docs cannot drift from the module.
+    #[serde(default)]
+    pub docs: String,
     pub inputs: Vec<OperatorMetadataInput>,
     /// Human-readable labels for `inputs`, parallel by index; hosts show
     /// `input_names[i]` next to input slot `i`. Defaulted so metadata from

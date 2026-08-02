@@ -114,6 +114,7 @@ pub extern "C" fn get_metadata() -> i64 {
         OperatorMetadata {
             name: "mesh_merge_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            docs: String::new(),
             display_name: "Mesh Merge".to_string(),
             description: "Concatenate same-kind meshes (points, struts, volumes), \
                           optionally welding coincident nodes."

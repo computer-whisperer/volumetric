@@ -1,40 +1,4 @@
-//! FEA Solve Operator.
-//!
-//! Compresses an FEA mesh against a rigid implicit body with linear
-//! elasticity (see `fea_core` for scope: Hooke's law, quasi-static single
-//! pose, active-set contact). The rigid body is sampled where the user
-//! placed it — position it already interpenetrating the mesh, in the fully
-//! pressed pose. Contact presses along the `fixed_boundary` axis, toward
-//! the glued face (glue zmin, press with a body from +z; glue ymin, press
-//! from +y; ...).
-//!
-//! The element formulation follows the mesh's kind:
-//! - Hex8 (from `fea_grid_mesh_operator`): uniform-grid solid elements; an
-//!   optional `stiffness_scale` element field scales element stiffness.
-//! - Bar2 (an explicit strut lattice): 3D frame elements with a circular
-//!   section from the required `radius` element field; `stiffness_scale`
-//!   multiplies a strut's Young's modulus.
-//!
-//! Inputs:
-//! - Input 0: FeaMesh
-//! - Input 1: ModelWASM — the rigid body (must be 3D)
-//! - Input 2: CBOR configuration: `youngs_modulus` (float, default 1.0),
-//!   `poissons_ratio` (float, default 0.3), `fixed_boundary` (enum of
-//!   xmin/xmax/ymin/ymax/zmin/zmax/none, default zmin),
-//!   `max_contact_iterations` (int, default 64 — cap on the contact
-//!   active-set sweeps; grazing rims on curved rigid bodies can need a
-//!   few dozen), `cg_tolerance` (float, default 1e-8 — relative residual
-//!   per CG solve; 1e-4 is measurably ~3x faster and usually converges to
-//!   the same answers), `preconditioner` (auto/schwarz, default auto —
-//!   schwarz is the two-level solver for large Bar2 frames and needs the
-//!   threaded operator build), `schwarz_target_nodes` (int, default 128),
-//!   `stress_stiffening_passes` (int, default 0 — tension-only geometric
-//!   stiffness re-solves for Bar2 frames; 1-2 captures most hammocking)
-//!
-//! Output 0: the input FeaMesh plus result fields — per-node `displacement`
-//! (3), `contact_force` (3, the interface force map), and `rotation` (3,
-//! Bar2 frame meshes only), per-element `strain_energy_density` (1, energy
-//! per unit element volume: cell volume for Hex8, strut volume for Bar2).
+#![doc = include_str!("../README.md")]
 
 use volumetric_abi::fea::{FeaField, FeaMesh, decode_fea_mesh, encode_fea_mesh};
 use volumetric_abi::host::{
@@ -217,6 +181,7 @@ pub extern "C" fn get_metadata() -> i64 {
         OperatorMetadata {
         name: "fea_solve_operator".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        docs: include_str!("../README.md").to_string(),
         display_name: "FEA Solve".to_string(),
         description: "Compress an FEA mesh against a rigid implicit body with linear elasticity.".to_string(),
         category: "FEA".to_string(),

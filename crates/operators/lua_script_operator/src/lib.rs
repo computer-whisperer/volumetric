@@ -2232,6 +2232,7 @@ pub extern "C" fn get_metadata() -> i64 {
     volumetric_abi::metadata_reply(&METADATA, || OperatorMetadata {
         name: "lua_script_operator".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        docs: String::new(),
         display_name: "Lua Script".to_string(),
         description: "Compile a restricted Lua script into a model module.".to_string(),
         category: "Scripting".to_string(),

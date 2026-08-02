@@ -533,6 +533,7 @@ pub extern "C" fn get_metadata() -> i64 {
         OperatorMetadata {
             name: "lattice_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            docs: String::new(),
             display_name: "Lattice".to_string(),
             description: "Fill a 3D model with a density-modulated implicit lattice.".to_string(),
             category: "Lattice".to_string(),

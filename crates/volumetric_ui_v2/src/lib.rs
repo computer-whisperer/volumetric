@@ -246,6 +246,7 @@ const SET_STEP_MODEL_PREFIX: &str = "project:set-step-model:";
 const CLEAR_STEP_F64_MAP_PREFIX: &str = "project:clear-step-f64-map:";
 const SELECT_EXPORT_PREFIX: &str = "project:select-export:";
 const DELETE_EXPORT_PREFIX: &str = "project:delete-export:";
+const TOGGLE_OPERATOR_DOCS_KEY: &str = "project:toggle-operator-docs";
 const ADD_EXPORT_PREFIX: &str = "project:add-export:";
 const SELECT_RUNTIME_ASSET_PREFIX: &str = "runtime:select-asset:";
 const TOGGLE_PIN_PREFIX: &str = "runtime:toggle-pin:";
@@ -1251,6 +1252,8 @@ pub struct VolumetricUiV2 {
     open_select: Option<String>,
     /// Expanded pipeline accordion sections (`imports` | `steps` | `exports`).
     pipeline_open: std::collections::BTreeSet<String>,
+    /// Whether the inspector shows the selected operator's docs (README).
+    operator_docs_open: bool,
     /// Meshing stats per built output, mirrored from the host's preview cache.
     output_stats: std::collections::BTreeMap<String, OutputStats>,
     /// Per-output preview artifact lifecycle, mirrored from the host cache.
@@ -1339,6 +1342,7 @@ impl VolumetricUiV2 {
             ssao_strength: 1.0,
             staged_artifacts: Vec::new(),
             runtime_assets: Vec::new(),
+            operator_docs_open: false,
             last_run_elapsed_ms: None,
             last_run_error: None,
             last_run_stale: false,
@@ -4243,6 +4247,8 @@ impl App for VolumetricUiV2 {
             }
             self.selected_project_item = Some(ProjectSelection::Export(idx));
             self.status = format!("selected export {}", idx + 1);
+        } else if route == TOGGLE_OPERATOR_DOCS_KEY {
+            self.operator_docs_open = !self.operator_docs_open;
         } else if let Some(idx) = parse_index_route(route, DELETE_EXPORT_PREFIX) {
             self.delete_export(idx);
         } else if let Some(asset_id) = route.strip_prefix(ADD_EXPORT_PREFIX) {
@@ -6273,6 +6279,9 @@ fn import_detail_rows(app: &VolumetricUiV2, idx: usize) -> Vec<El> {
         && let Some(metadata) = app.operator_metadata_cached(&import.id)
     {
         rows.push(detail_row("Version", &metadata.version));
+        if !metadata.docs.is_empty() {
+            rows.extend(operator_docs_rows(app, &metadata.docs));
+        }
         if let Some(upgrade) = operator_upgrade_offer(app, import) {
             let label = match upgrade {
                 OperatorUpgrade::Version { to } => format!("Update to {to}"),
@@ -6309,6 +6318,11 @@ fn step_detail_rows(app: &VolumetricUiV2, idx: usize) -> Vec<El> {
     ];
     for output_id in &step.outputs {
         rows.extend(asset_warning_rows(app, output_id));
+    }
+    if let Some(metadata) = app.operator_metadata_cached(&step.operator_id)
+        && !metadata.docs.is_empty()
+    {
+        rows.extend(operator_docs_rows(app, &metadata.docs));
     }
 
     rows.extend(step_edit_rows(app, idx));
@@ -6856,6 +6870,43 @@ fn empty_project_row(label: &str) -> El {
     table_row([text(label).muted().caption().width(Size::Fill(1.0))])
         .height(Size::Fixed(28.0))
         .padding(Sides::xy(tokens::SPACE_2, 0.0))
+}
+
+/// The docs toggle plus (when open) the docs body for an operator's
+/// README-style self-description. Markdown is drawn as styled plain text
+/// until the damascene 0.6 upgrade brings the markdown renderer; the
+/// READMEs are hard-wrapped, so unwrapped lines stay readable.
+fn operator_docs_rows(app: &VolumetricUiV2, docs: &str) -> Vec<El> {
+    let mut rows = vec![
+        button_with_icon(
+            "book-open",
+            if app.operator_docs_open {
+                "Hide docs"
+            } else {
+                "Docs"
+            },
+        )
+        .secondary()
+        .xsmall()
+        .width(Size::Fill(1.0))
+        .key(TOGGLE_OPERATOR_DOCS_KEY),
+    ];
+    if app.operator_docs_open {
+        for line in docs.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let el = if let Some(h) = line.strip_prefix("# ") {
+                text(h).small()
+            } else if let Some(h) = line.strip_prefix("## ") {
+                text(h).small().muted()
+            } else {
+                text(line).caption().muted()
+            };
+            rows.push(el);
+        }
+    }
+    rows
 }
 
 /// One cautionary line per advisory the producing operator posted on the
@@ -7545,6 +7596,7 @@ mod tests {
         let metadata = OperatorMetadata {
             name: "parameterized_generator".to_string(),
             version: "0.1.0".to_string(),
+            docs: String::new(),
             display_name: String::new(),
             description: String::new(),
             category: String::new(),
@@ -7744,6 +7796,7 @@ mod tests {
         let metadata = volumetric::encode_metadata(&OperatorMetadata {
             name: name.to_string(),
             version: version.to_string(),
+            docs: String::new(),
             display_name: String::new(),
             description: String::new(),
             category: String::new(),
@@ -9268,6 +9321,7 @@ mod tests {
                 metadata: catalog::CatalogMetadata::Ready(OperatorMetadata {
                     name: "probe".to_string(),
                     version: "0.0.0".to_string(),
+                    docs: String::new(),
                     display_name: String::new(),
                     description: String::new(),
                     category: category.to_string(),

@@ -89,6 +89,7 @@ pub extern "C" fn get_metadata() -> i64 {
         OperatorMetadata {
             name: "model_bound_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            docs: String::new(),
             display_name: "Model Bound".to_string(),
             description: "Select a bounding-box feature of a model, face, edge, corner, or frame, as a subspace.".to_string(),
             category: "Construction".to_string(),

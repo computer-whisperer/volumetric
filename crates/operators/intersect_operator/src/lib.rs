@@ -132,6 +132,7 @@ pub extern "C" fn get_metadata() -> i64 {
         OperatorMetadata {
             name: "intersect_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            docs: String::new(),
             display_name: "Intersect".to_string(),
             description:
                 "Affine meet of subspaces: the largest subspace inside them all (plane ∩ plane → line)."

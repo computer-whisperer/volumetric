@@ -176,6 +176,7 @@ pub extern "C" fn get_metadata() -> i64 {
         OperatorMetadata {
         name: "fea_solution_import_operator".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        docs: String::new(),
         display_name: "FEA Solution Import".to_string(),
         description: "Adopt an externally-solved FEA solution after verifying \
                       its equilibrium against the live mesh and rigid body."

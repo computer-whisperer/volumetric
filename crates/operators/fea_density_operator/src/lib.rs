@@ -398,6 +398,7 @@ pub extern "C" fn get_metadata() -> i64 {
     volumetric_abi::metadata_reply(&METADATA, || OperatorMetadata {
         name: "fea_density_operator".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        docs: String::new(),
         display_name: "FEA Density".to_string(),
         description: "Turn a solved mesh's strain energy density into a variable-density model."
             .to_string(),

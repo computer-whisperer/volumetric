@@ -446,6 +446,7 @@ pub extern "C" fn get_metadata() -> i64 {
         OperatorMetadata {
             name: "mesh_clip_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            docs: String::new(),
             display_name: "Mesh Clip".to_string(),
             description: "Clip a mesh (points, struts, volumes) against a model: \
                           keep the inside or the outside."

@@ -5,6 +5,7 @@ fn main() {
     let metadata = volumetric_abi::OperatorMetadata {
         name: "mandelbulb_model".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        docs: String::new(),
         display_name: "Mandelbulb".to_string(),
         description: "Mandelbulb fractal solid, a 3D Mandelbrot-like set.".to_string(),
         category: "Primitives".to_string(),

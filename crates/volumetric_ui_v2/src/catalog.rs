@@ -361,6 +361,7 @@ mod tests {
         OperatorMetadata {
             name: name.to_string(),
             version: "0.0.0".to_string(),
+            docs: String::new(),
             display_name: "Pretty Name".to_string(),
             description: "A test module.".to_string(),
             category: "Testing".to_string(),

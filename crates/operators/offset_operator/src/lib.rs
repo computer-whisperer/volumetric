@@ -160,6 +160,7 @@ pub extern "C" fn get_metadata() -> i64 {
     volumetric_abi::metadata_reply(&METADATA, || OperatorMetadata {
         name: "offset_operator".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        docs: String::new(),
         display_name: "Offset".to_string(),
         description: "Dilate or erode a model by a signed distance via a baked distance field."
             .to_string(),

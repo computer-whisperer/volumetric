@@ -168,6 +168,7 @@ pub extern "C" fn get_metadata() -> i64 {
     volumetric_abi::metadata_reply(&METADATA, || OperatorMetadata {
         name: "fea_grid_mesh_operator".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        docs: String::new(),
         display_name: "FEA Grid Mesh".to_string(),
         description: "Mesh a 3D model into a regular hex8 grid for finite-element work."
             .to_string(),

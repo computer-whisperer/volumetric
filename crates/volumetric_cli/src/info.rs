@@ -182,6 +182,8 @@ struct OperatorMetadataJson {
     category: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     icon_svg: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    docs: String,
     inputs: Vec<InputInfo>,
     outputs: Vec<OutputInfo>,
 }
@@ -233,6 +235,7 @@ fn metadata_to_json(meta: &OperatorMetadata) -> OperatorMetadataJson {
         description: meta.description.clone(),
         category: meta.category.clone(),
         icon_svg: meta.icon_svg.clone(),
+        docs: meta.docs.clone(),
         inputs: meta
             .inputs
             .iter()
@@ -359,6 +362,12 @@ fn print_info_human(output: &InfoOutput) {
             }
             if !metadata.icon_svg.is_empty() {
                 println!("Icon: {} bytes of SVG", metadata.icon_svg.len());
+            }
+            if !metadata.docs.is_empty() {
+                println!("Docs:");
+                for line in metadata.docs.lines() {
+                    println!("  {}", line);
+                }
             }
             println!("Inputs:");
             for (i, input) in metadata.inputs.iter().enumerate() {

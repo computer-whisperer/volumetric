@@ -5,6 +5,7 @@ fn main() {
     let metadata = volumetric_abi::OperatorMetadata {
         name: "density_gradient_model".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        docs: String::new(),
         display_name: "Density Gradient".to_string(),
         description: "Solid cube with an x-gradient density channel, a playground input for density-driven lattices.".to_string(),
         category: "Lattice".to_string(),

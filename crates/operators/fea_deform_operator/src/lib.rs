@@ -413,6 +413,7 @@ pub extern "C" fn get_metadata() -> i64 {
         OperatorMetadata {
             name: "fea_deform_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            docs: String::new(),
             display_name: "FEA Deform".to_string(),
             description:
                 "Apply a solved mesh's displacement field to a model as a space deformation."

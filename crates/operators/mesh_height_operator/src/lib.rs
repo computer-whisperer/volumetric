@@ -217,6 +217,7 @@ pub extern "C" fn get_metadata() -> i64 {
         OperatorMetadata {
             name: "mesh_height_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            docs: String::new(),
             display_name: "Mesh Height Query".to_string(),
             description:
                 "Wrap a triangle mesh as a 2D model of surface height over a lateral plane."

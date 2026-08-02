@@ -336,6 +336,7 @@ pub extern "C" fn get_metadata() -> i64 {
         OperatorMetadata {
             name: "strut_pattern_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            docs: String::new(),
             display_name: "Strut Pattern".to_string(),
             description:
                 "Generate an explicit strut lattice (Bar2 mesh) filling a 3D domain model."

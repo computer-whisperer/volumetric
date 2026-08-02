@@ -378,6 +378,7 @@ pub extern "C" fn get_metadata() -> i64 {
         OperatorMetadata {
             name: "coil_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            docs: String::new(),
             display_name: "Coil".to_string(),
             description: "Roll a flat model into an Archimedean spiral around the y axis."
                 .to_string(),

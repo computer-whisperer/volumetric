@@ -270,6 +270,7 @@ pub extern "C" fn get_metadata() -> i64 {
         OperatorMetadata {
         name: "sweep_operator".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        docs: String::new(),
         display_name: "Sweep".to_string(),
         description:
             "Extrude occupancy along an axis (directional sweep/shadow), optionally clamped at a plane."

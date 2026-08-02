@@ -1,61 +1,4 @@
-//! FEA Print Drag Operator.
-//!
-//! Designs the "spine" a strut lattice needs to survive being swished
-//! through a resin bath during large-format printing. The lattice acts as
-//! a sieve collecting fluid drag over its whole surface; the integrated
-//! load must flow through the strut network to the fixed (build-plate)
-//! face, and the struts on that load path carry the summed tension of
-//! everything downstream of them. The design loop (see `fea_core::drag`)
-//! grows per-strut radii — floored at the as-designed radius — until
-//! every strut's tensile fiber stress sits under an allowable, so the
-//! reinforcement concentrates along the dominant load paths and leaves
-//! the rest of the lattice untouched.
-//!
-//! The pass is qualitative: only the ratio `drag_pressure /
-//! allowable_stress` matters, and it is the severity dial. The drag is
-//! `drag_pressure` per unit projected frontal area per strut, lumped to
-//! the end nodes, pointing away from the fixed face by default (the
-//! pull-out stroke — the tension case that tears parts; push-back is
-//! compression, where lattice flexibility is tolerated).
-//!
-//! Inputs:
-//! - Input 0: FeaMesh (Bar2 strut lattice with a `radius` element field;
-//!   an existing `stiffness_scale` field participates in load
-//!   distribution unchanged)
-//! - Input 1: CBOR configuration: `youngs_modulus` (float, default 1.0),
-//!   `poissons_ratio` (float, default 0.3), `fixed_boundary` (enum of
-//!   xmin/xmax/ymin/ymax/zmin/zmax, default zmin — the build-plate face;
-//!   "none" is rejected, the drag load needs a reaction point),
-//!   `drag_pressure` (float, default 1.0 — drag force per unit projected
-//!   frontal area), `allowable_stress` (float, default 1.0 — tensile
-//!   fiber stress ceiling), `max_iterations` (int, default 20 — sizing
-//!   iterations, one forward solve each), `tolerance` (float, default
-//!   0.02 — accept when max utilization <= 1 + tolerance), `exponent`
-//!   (float, default 0.5 — radius update damping), `max_radius_scale`
-//!   (float, default 10.0 — growth cap as a multiple of each strut's
-//!   original radius), `load_direction_x`/`_y`/`_z` (floats, default all
-//!   0.0 = auto: away from the fixed face; need not be unit length),
-//!   `cg_tolerance` (float, default
-//!   1e-8), `preconditioner` (auto/schwarz, default auto — schwarz needs
-//!   the threaded operator build), `schwarz_target_nodes` (int, default
-//!   128), `stress_stiffening_passes` (int, default 0 — tension-only
-//!   geometric stiffness re-solves; the pull stroke tensions the load
-//!   path, so 1-2 passes capture the taut-string effect).
-//!
-//! Output 0: the input FeaMesh with the designed per-element `radius`
-//! (replacing the input design, never below it), plus `utilization` (1,
-//! tensile fiber stress over the allowable), `axial_force` (1, tension
-//! positive — the load-path visualization), `strain_energy_density` (1),
-//! and per-node `displacement` (3), `rotation` (3), `drag_force` (3, the
-//! applied load).
-//!
-//! The result is best-effort: if a strut pins at `max_radius_scale` and
-//! stays over-utilized, the lattice topology has no adequate load path to
-//! thicken — the loop stops early and emits its best iterate, with the
-//! over-unity `utilization` field marking where the demanded spine does
-//! not fit, and posts a `host.post_warning` advisory naming the saturated
-//! strut count, peak utilization, and the severity ratio to turn down.
-//! The fix is upstream geometry or severity, not more iterations.
+#![doc = include_str!("../README.md")]
 
 use volumetric_abi::fea::{FeaMesh, decode_fea_mesh, encode_fea_mesh};
 use volumetric_abi::host::{post_output, read_input, report_error};
@@ -90,7 +33,7 @@ impl Default for PrintDragOperatorConfig {
             fixed_boundary: "zmin".to_string(),
             drag_pressure: 1.0,
             allowable_stress: 1.0,
-            max_iterations: 20,
+            max_iterations: 40,
             tolerance: 0.02,
             exponent: 0.5,
             max_radius_scale: 10.0,
@@ -139,27 +82,76 @@ fn run_drag(config: &PrintDragOperatorConfig) -> Result<FeaMesh, String> {
         },
     };
 
-    // Non-convergence is not an error: a strut pinned at max_radius_scale
-    // means the lattice topology lacks an adequate load path — emit the
-    // best iterate; the over-unity utilization field carries where the
-    // spine falls short. It IS worth a loud advisory: without one, the
-    // only symptom is a maxed-out radius field and a garbage-magnitude
-    // displacement view.
+    // Non-convergence is not an error — the best iterate ships either way
+    // — but each failure mode deserves its own loud advisory: saturation
+    // means the lattice topology cannot fit the demanded spine, a plateau
+    // means the design is effectively complete just above the acceptance
+    // line, and an iteration-cap exit means sizing was still moving.
     let result = fea_core::solve_drag(&mesh, &drag_config)?;
     if !result.converged {
-        let saturated = result.saturated;
-        let strut_count = mesh.element_count();
+        let peak = result.max_utilization;
+        let message = if result.saturated > 0 {
+            format!(
+                "spine sizing cannot fit: {} of {} strut(s) pinned at \
+                 max_radius_scale ({}x) with peak utilization {peak:.3e} after \
+                 {} iteration(s). The severity dial is drag_pressure / \
+                 allowable_stress (currently {:.3e}); lower it toward the \
+                 physical ratio or rework the upstream geometry — more \
+                 iterations will not help.",
+                result.saturated,
+                mesh.element_count(),
+                config.max_radius_scale,
+                result.iterations,
+                config.drag_pressure / config.allowable_stress,
+            )
+        } else if result.plateaued {
+            format!(
+                "spine sizing plateaued at peak utilization {peak:.3e} \
+                 (acceptance {:.3}) after {} iteration(s): the design stopped \
+                 improving and is effectively complete — accept the best \
+                 iterate, or loosen `tolerance` to make this exit quietly.",
+                1.0 + config.tolerance,
+                result.iterations,
+            )
+        } else {
+            format!(
+                "spine sizing stopped at max_iterations ({}) with peak \
+                 utilization {peak:.3e} still improving — raise \
+                 max_iterations to continue sizing.",
+                config.max_iterations,
+            )
+        };
+        volumetric_abi::host::post_warning(&message);
+    }
+
+    // The displacement field scales with drag_pressure / youngs_modulus on
+    // the as-designed radii; at qualitative parameters it can dwarf the
+    // part while the (scale-free) radius/utilization design is perfectly
+    // healthy. Say so before someone reads the deformed view literally.
+    let max_u = result
+        .displacement
+        .chunks_exact(3)
+        .map(|u| (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt())
+        .fold(0.0f64, f64::max);
+    let diagonal = {
+        let mut lo = [f64::INFINITY; 3];
+        let mut hi = [f64::NEG_INFINITY; 3];
+        for p in mesh.node_positions.chunks_exact(3) {
+            for c in 0..3 {
+                lo[c] = lo[c].min(p[c]);
+                hi[c] = hi[c].max(p[c]);
+            }
+        }
+        (0..3).map(|c| (hi[c] - lo[c]).powi(2)).sum::<f64>().sqrt()
+    };
+    if diagonal > 0.0 && max_u > diagonal {
         volumetric_abi::host::post_warning(&format!(
-            "spine sizing did not converge after {} iteration(s): {saturated} of \
-             {strut_count} strut(s) pinned at max_radius_scale ({}x) with peak \
-             utilization {:.3e} — the demanded spine does not fit this lattice. \
-             The severity dial is drag_pressure / allowable_stress (currently \
-             {:.3e}); lower it toward the physical ratio or rework the upstream \
-             geometry. More iterations will not help.",
-            result.iterations,
-            config.max_radius_scale,
-            result.max_utilization,
-            config.drag_pressure / config.allowable_stress,
+            "the displacement field is qualitative at these parameters: max \
+             |u| = {max_u:.3e} exceeds the part (diagonal {diagonal:.3e}). \
+             Displacement scales with drag_pressure / youngs_modulus — set \
+             youngs_modulus to a physical modulus (~1e9 Pa for green resin) \
+             to read real deflections. The radius/utilization design is \
+             unaffected.",
         ));
     }
 
@@ -209,6 +201,7 @@ pub extern "C" fn get_metadata() -> i64 {
         OperatorMetadata {
         name: "fea_print_drag_operator".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        docs: include_str!("../README.md").to_string(),
         display_name: "FEA Print Drag".to_string(),
         description: "Grow the strut radii a lattice needs to survive resin print-drag tension.".to_string(),
         category: "FEA".to_string(),
@@ -221,7 +214,7 @@ pub extern "C" fn get_metadata() -> i64 {
         inputs: vec![
             OperatorMetadataInput::FeaMesh,
             OperatorMetadataInput::CBORConfiguration(
-                r#"{ youngs_modulus: float .default 1.0, poissons_ratio: float .default 0.3, fixed_boundary: "zmin" / "zmax" / "xmin" / "xmax" / "ymin" / "ymax" .default "zmin", drag_pressure: float .default 1.0, allowable_stress: float .default 1.0, max_iterations: int .default 20, tolerance: float .default 0.02, exponent: float .default 0.5, max_radius_scale: float .default 10.0, load_direction_x: float .default 0.0, load_direction_y: float .default 0.0, load_direction_z: float .default 0.0, cg_tolerance: float .default 1e-8, preconditioner: "auto" / "schwarz" .default "auto", schwarz_target_nodes: int .default 128, stress_stiffening_passes: int .default 0 }"#
+                r#"{ youngs_modulus: float .default 1.0, poissons_ratio: float .default 0.3, fixed_boundary: "zmin" / "zmax" / "xmin" / "xmax" / "ymin" / "ymax" .default "zmin", drag_pressure: float .default 1.0, allowable_stress: float .default 1.0, max_iterations: int .default 40, tolerance: float .default 0.02, exponent: float .default 0.5, max_radius_scale: float .default 10.0, load_direction_x: float .default 0.0, load_direction_y: float .default 0.0, load_direction_z: float .default 0.0, cg_tolerance: float .default 1e-8, preconditioner: "auto" / "schwarz" .default "auto", schwarz_target_nodes: int .default 128, stress_stiffening_passes: int .default 0 }"#
                     .to_string(),
             ),
         ],

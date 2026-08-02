@@ -815,6 +815,7 @@ pub extern "C" fn get_metadata() -> i64 {
         OperatorMetadata {
             name: "subspace_fit_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            docs: String::new(),
             display_name: "Fit Subspace".to_string(),
             description: "Fit a local point, edge line, or tangent plane from a seed using bounded model probes.".to_string(),
             category: "Construction".to_string(),

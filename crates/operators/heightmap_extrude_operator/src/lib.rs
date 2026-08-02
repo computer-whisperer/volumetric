@@ -364,6 +364,7 @@ pub extern "C" fn get_metadata() -> i64 {
         OperatorMetadata {
             name: "heightmap_extrude_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            docs: String::new(),
             display_name: "Heightmap Extrude".to_string(),
             description:
                 "Turn a 2D scalar field into a 3D solid whose top surface follows the field."

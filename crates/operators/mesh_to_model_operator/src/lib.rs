@@ -125,6 +125,7 @@ pub extern "C" fn get_metadata() -> i64 {
     volumetric_abi::metadata_reply(&METADATA, || OperatorMetadata {
         name: "mesh_to_model_operator".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        docs: String::new(),
         display_name: "Mesh to Model".to_string(),
         description: "Convert a triangle mesh into a sampleable model via BVH ray parity."
             .to_string(),

@@ -389,6 +389,7 @@ pub extern "C" fn get_metadata() -> i64 {
         OperatorMetadata {
             name: "sdf_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            docs: String::new(),
             display_name: "Generate SDF".to_string(),
             description: "Bake globally defined occupancy + truncated signed-distance channels from model occupancy (replacing other extra channels).".to_string(),
             category: "Analysis".to_string(),
