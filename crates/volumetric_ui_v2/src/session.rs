@@ -3196,7 +3196,12 @@ fn build_fea_mesh_preview(
     };
 
     // Deformed configuration: positions + displacement x exaggeration;
-    // connectivity (and thus the boundary) is unchanged.
+    // connectivity (and thus the boundary) is unchanged. Garbage-magnitude
+    // fields (a solve run with qualitative unit parameters, a diverged
+    // contact loop) would scatter the nodes over a cloud thousands of
+    // times the part size, so a displacement that dwarfs the part draws
+    // rescaled-to-fit instead — the deformation *shape* stays readable and
+    // the detail line names the substitution.
     if want_deformed
         && let Some(displacement) = mesh
             .node_fields
@@ -3208,14 +3213,38 @@ fn build_fea_mesh_preview(
             .chunks_exact(3)
             .map(|u| (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt())
             .fold(0.0f64, f64::max);
-        if (exaggeration - 1.0).abs() > 1e-9 {
+        let diag = {
+            let mut lo = [f64::INFINITY; 3];
+            let mut hi = [f64::NEG_INFINITY; 3];
+            for p in mesh.node_positions.chunks_exact(3) {
+                for c in 0..3 {
+                    lo[c] = lo[c].min(p[c]);
+                    hi[c] = hi[c].max(p[c]);
+                }
+            }
+            (0..3).map(|c| (hi[c] - lo[c]).powi(2)).sum::<f64>().sqrt()
+        };
+        // Clamp when the deformed cloud would span more than twice the
+        // part; draw it at a quarter-diagonal instead.
+        let requested = max_u * exaggeration;
+        let scale = if diag > 0.0 && requested > 2.0 * diag {
+            0.25 * diag / max_u
+        } else {
+            exaggeration
+        };
+        if scale != exaggeration {
+            extra_detail.push(format!(
+                "max |u| = {max_u:.4} dwarfs the part (diagonal {diag:.4}) — \
+                 deformation drawn rescaled x{scale:.3e}, not to scale"
+            ));
+        } else if (exaggeration - 1.0).abs() > 1e-9 {
             extra_detail.push(format!("deformed x{exaggeration} · max |u| = {max_u:.4}"));
         } else {
             extra_detail.push(format!("deformed view · max |u| = {max_u:.4}"));
         }
         let data = displacement.data.clone();
         for (p, u) in mesh.node_positions.iter_mut().zip(&data) {
-            *p += u * exaggeration;
+            *p += u * scale;
         }
     }
     if let Some(contact) = mesh
@@ -4691,6 +4720,62 @@ function get_bounds_max_y() return 1.5 end
             panic!("junk must fail");
         };
         assert!(err.contains("FEA mesh"), "unexpected error: {err}");
+    }
+
+    /// A displacement field that dwarfs the part (a qualitative solve run
+    /// with unit parameters, a diverged contact loop) must not scatter the
+    /// deformed preview over a cloud thousands of times the part size: it
+    /// draws rescaled to a fraction of the part diagonal, and the detail
+    /// line says so.
+    #[test]
+    fn garbage_magnitude_displacement_draws_rescaled() {
+        use volumetric::fea::{FeaElementKind, FeaField, FeaMesh, encode_fea_mesh};
+
+        let mesh = FeaMesh {
+            element_kind: FeaElementKind::Hex8,
+            node_positions: vec![
+                0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, //
+                0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0,
+            ],
+            connectivity: (0..8).collect(),
+            node_fields: vec![FeaField {
+                name: "displacement".to_string(),
+                components: 3,
+                // 1000x the unit part, as a unit-parameter drag solve emits.
+                data: (0..8).flat_map(|_| [0.0, 0.0, 1000.0]).collect(),
+            }],
+            element_fields: vec![],
+        };
+        let mut req = request("fea_exploded", 64);
+        req.data = Arc::new(encode_fea_mesh(&mesh));
+        req.type_hint = Some(AssetTypeHint::FeaMesh);
+        let entity = build_preview_scene(&req).expect("clamped fea preview");
+
+        // Drawn displacement = a quarter of the sqrt(3) diagonal, not 1000.
+        let diag = 3.0f32.sqrt();
+        assert!(
+            (entity.bounds.max.2 - (1.0 + 0.25 * diag)).abs() < 1e-3,
+            "deformation must be clamped to the part scale, got max z {}",
+            entity.bounds.max.2
+        );
+        assert!(
+            entity
+                .stats
+                .detail
+                .iter()
+                .any(|l| l.contains("not to scale")),
+            "detail should flag the rescale: {:?}",
+            entity.stats.detail
+        );
+
+        // An honest-magnitude field on the same mesh stays true to scale.
+        let mut honest = mesh.clone();
+        honest.node_fields[0].data = (0..8).flat_map(|_| [0.0, 0.0, 1.0]).collect();
+        let mut req = request("fea_honest", 64);
+        req.data = Arc::new(encode_fea_mesh(&honest));
+        req.type_hint = Some(AssetTypeHint::FeaMesh);
+        let entity = build_preview_scene(&req).expect("honest fea preview");
+        assert_eq!(entity.bounds.max.2, 2.0, "true-scale deformation kept");
     }
 
     #[test]
