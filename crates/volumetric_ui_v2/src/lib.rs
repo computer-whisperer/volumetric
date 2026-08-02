@@ -6873,9 +6873,8 @@ fn empty_project_row(label: &str) -> El {
 }
 
 /// The docs toggle plus (when open) the docs body for an operator's
-/// README-style self-description. Markdown is drawn as styled plain text
-/// until the damascene 0.6 upgrade brings the markdown renderer; the
-/// READMEs are hard-wrapped, so unwrapped lines stay readable.
+/// README-style self-description, rendered by the damascene markdown
+/// transformer.
 fn operator_docs_rows(app: &VolumetricUiV2, docs: &str) -> Vec<El> {
     let mut rows = vec![
         button_with_icon(
@@ -6892,19 +6891,7 @@ fn operator_docs_rows(app: &VolumetricUiV2, docs: &str) -> Vec<El> {
         .key(TOGGLE_OPERATOR_DOCS_KEY),
     ];
     if app.operator_docs_open {
-        for line in docs.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let el = if let Some(h) = line.strip_prefix("# ") {
-                text(h).small()
-            } else if let Some(h) = line.strip_prefix("## ") {
-                text(h).small().muted()
-            } else {
-                text(line).caption().muted()
-            };
-            rows.push(el);
-        }
+        rows.push(damascene_markdown::md(docs));
     }
     rows
 }

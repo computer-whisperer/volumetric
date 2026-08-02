@@ -632,6 +632,7 @@ mod tests {
             category: "Testing".to_string(),
             icon_svg: "<svg viewBox=\"0 0 24 24\"><circle cx=\"12\" cy=\"12\" r=\"9\"/></svg>"
                 .to_string(),
+            docs: "# Test Operator\n\nRound-trips every input kind.".to_string(),
             inputs: vec![
                 OperatorMetadataInput::ModelWASM,
                 OperatorMetadataInput::CBORConfiguration("{ dx: float }".to_string()),
