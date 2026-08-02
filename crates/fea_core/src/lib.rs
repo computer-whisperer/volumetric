@@ -139,7 +139,30 @@ pub enum PrecondChoice {
     Schwarz(SchwarzParams),
 }
 
+/// Node count above which `auto` selects the Schwarz preconditioner for
+/// Bar2 frames in thread-capable builds. Measured on a 47k-strut frame
+/// (~24k nodes): Schwarz ~1.5-2.5x over block-Jacobi, and the gap grows
+/// with size; below this the dense subdomain setup would dominate.
+#[cfg(feature = "parallel")]
+const SCHWARZ_AUTO_NODES: usize = 10_000;
+
 impl PrecondChoice {
+    /// Resolve `Auto` by problem size: large Bar2 frames take Schwarz in
+    /// thread-capable builds, everything else keeps block-Jacobi. Explicit
+    /// choices pass through unchanged.
+    pub fn resolve(self, element_kind: FeaElementKind, node_count: usize) -> Self {
+        #[cfg(feature = "parallel")]
+        if self == PrecondChoice::Auto
+            && element_kind == FeaElementKind::Bar2
+            && node_count >= SCHWARZ_AUTO_NODES
+        {
+            return PrecondChoice::Schwarz(SchwarzParams::default());
+        }
+        #[cfg(not(feature = "parallel"))]
+        let _ = (element_kind, node_count);
+        self
+    }
+
     /// Parse the operator-config spelling. `schwarz_target_nodes` sizes the
     /// Schwarz subdomains (ignored by `"auto"`).
     #[cfg_attr(not(feature = "parallel"), allow(unused_variables))]
@@ -981,7 +1004,10 @@ fn contact_solve(
     let diag = model.diagonal();
     let blocks = model.node_blocks();
     #[cfg(feature = "parallel")]
-    let schwarz_precond = match (config.preconditioner, frame) {
+    let schwarz_precond = match (
+        config.preconditioner.resolve(mesh.element_kind, node_count),
+        frame,
+    ) {
         (PrecondChoice::Schwarz(params), Some(frame_model)) => {
             schwarz::SchwarzPrecond::build(mesh, frame_model, &constrained, params)
         }
@@ -1175,6 +1201,33 @@ fn contact_solve(
 mod tests {
     use super::*;
     use volumetric_abi::fea::FeaField;
+
+    /// `auto` resolves by problem size: only large Bar2 frames in
+    /// thread-capable builds pick Schwarz; explicit choices pass through.
+    #[test]
+    fn auto_preconditioner_resolves_by_size() {
+        let small = PrecondChoice::Auto.resolve(FeaElementKind::Bar2, 100);
+        assert_eq!(small, PrecondChoice::Auto);
+        let hexes = PrecondChoice::Auto.resolve(FeaElementKind::Hex8, 1_000_000);
+        assert_eq!(hexes, PrecondChoice::Auto);
+        let large = PrecondChoice::Auto.resolve(FeaElementKind::Bar2, 80_000);
+        #[cfg(feature = "parallel")]
+        assert_eq!(
+            large,
+            PrecondChoice::Schwarz(SchwarzParams::default()),
+            "large Bar2 frames must get the Schwarz preconditioner"
+        );
+        #[cfg(not(feature = "parallel"))]
+        assert_eq!(large, PrecondChoice::Auto);
+        #[cfg(feature = "parallel")]
+        {
+            let explicit = PrecondChoice::Schwarz(SchwarzParams {
+                target_nodes: 7,
+                ..Default::default()
+            });
+            assert_eq!(explicit.resolve(FeaElementKind::Bar2, 100), explicit);
+        }
+    }
 
     #[test]
     fn precond_choice_parses_config_spellings() {

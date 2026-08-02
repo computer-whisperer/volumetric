@@ -36,6 +36,10 @@
 //! over-utilized, the lattice topology has no adequate load path to
 //! thicken (the returned `saturated` count and `converged` flag report
 //! this loudly) — the fix is upstream geometry, not more iterations.
+//! Near optimality the fully-stressed update oscillates (thickening the
+//! peak strut shifts load to a neighbor whose peak pops right back), so
+//! the loop also exits once the best peak stops improving, reported via
+//! `plateaued` — that exit is a finished design, not a failure.
 
 use crate::frame::FrameModel;
 use crate::{
@@ -122,6 +126,13 @@ pub struct DragResult {
     pub saturated: usize,
     /// True when max utilization reached `1 + tolerance`.
     pub converged: bool,
+    /// True when the loop stopped because the best peak utilization quit
+    /// improving (the fully-stressed update oscillates near optimality:
+    /// thickening the peak strut shifts load to a neighbor whose peak pops
+    /// right back). With `saturated == 0` this means the design is
+    /// effectively complete, just above the acceptance line — not a
+    /// spine-does-not-fit failure.
+    pub plateaued: bool,
     /// Cumulative CG cost over all iterations and stiffening passes.
     pub stats: SolveStats,
 }
@@ -315,6 +326,72 @@ fn set_radius_field(mesh: &mut FeaMesh, radii: &[f64]) {
     field.data = radii.to_vec();
 }
 
+/// Relative improvement of the best peak utilization that counts as
+/// progress; anything less for [`PLATEAU_STALL_ITERATIONS`] consecutive
+/// iterations ends the sizing loop. Mid-design sizing improves the peak
+/// by whole percents per iteration; the sub-0.3% crawl only appears in
+/// the near-optimal whack-a-mole regime, where finishing the last
+/// fraction of a percent costs a forward solve per basis point.
+const PLATEAU_IMPROVEMENT: f64 = 3e-3;
+const PLATEAU_STALL_ITERATIONS: u32 = 3;
+
+/// CG tolerance floor for intermediate sizing solves: the loop only ranks
+/// stresses against a few-percent acceptance band, so ~0.1% relative
+/// residual is plenty. The final returned fields re-solve at the
+/// configured tolerance.
+const LOOSE_SIZING_CG_TOLERANCE: f64 = 1e-3;
+
+/// One full design evaluation: assemble the frame at `radii`, apply the
+/// drag load, forward-solve at `solve`'s tolerance, and package the
+/// resulting fields.
+fn evaluate_design(
+    work: &mut FeaMesh,
+    geometry: &[StrutGeometry],
+    radii: &[f64],
+    direction: [f64; 3],
+    config: &DragConfig,
+    solve: &SolveConfig,
+    node_count: usize,
+) -> Result<(Iterate, usize), String> {
+    set_radius_field(work, radii);
+    let mut model = FrameModel::new(work, solve.material)?;
+    // Glued-face constraints only — contact_frame's scan geometry is
+    // unused (there is no rigid body).
+    let constrained =
+        contact_frame(work, 6, model.length_scale(), solve.fixed_boundary).constrained;
+    let (rhs, drag_force) =
+        build_drag_load(geometry, radii, direction, config.drag_pressure, node_count);
+    let (u, cg_iterations) = drag_forward(work, &mut model, &constrained, &rhs, solve)?;
+
+    let (tensile, axial) = strut_stresses(&model, radii, &u);
+    let utilization: Vec<f64> = tensile
+        .iter()
+        .map(|s| s / config.allowable_stress)
+        .collect();
+    let max_utilization = utilization.iter().copied().fold(0.0f64, f64::max);
+
+    let mut displacement = Vec::with_capacity(node_count * 3);
+    let mut rotation = Vec::with_capacity(node_count * 3);
+    for node in 0..node_count {
+        displacement.extend_from_slice(&u[node * 6..node * 6 + 3]);
+        rotation.extend_from_slice(&u[node * 6 + 3..node * 6 + 6]);
+    }
+    let strain_energy_density = model.energy_density(&u);
+    Ok((
+        Iterate {
+            radius: radii.to_vec(),
+            utilization,
+            axial_force: axial,
+            drag_force,
+            displacement,
+            rotation,
+            strain_energy_density,
+            max_utilization,
+        },
+        cg_iterations,
+    ))
+}
+
 /// Design the strut radii that survive the print-drag tension. See the
 /// module docs for the model; the returned result carries the final
 /// forward solve's fields for inspection.
@@ -378,6 +455,7 @@ pub fn solve_drag(mesh: &FeaMesh, config: &DragConfig) -> Result<DragResult, Str
             max_utilization: 0.0,
             saturated: 0,
             converged: true,
+            plateaued: false,
             stats: SolveStats {
                 converged: true,
                 ..Default::default()
@@ -405,60 +483,74 @@ pub fn solve_drag(mesh: &FeaMesh, config: &DragConfig) -> Result<DragResult, Str
     let mut stats = SolveStats::default();
     let mut iterations = 0;
     let mut best: Option<Iterate> = None;
+
+    // Resolve `auto` by problem size once, for every solve in the loop.
+    let mut solve = config.solve;
+    solve.preconditioner = solve.preconditioner.resolve(mesh.element_kind, node_count);
+    // Intermediate sizing solves only rank stresses against a
+    // few-percent acceptance band, so they run at a loosened CG
+    // tolerance; the returned fields come from one final solve of the
+    // best design at the configured tolerance (below). NOT under stress
+    // stiffening: the linear first pass can sag orders of magnitude
+    // beyond the stiffened answer, so a loose residual relative to it
+    // corrupts the prestress and with it every downstream stress.
+    let sizing_cg_tolerance = if solve.stress_stiffening_passes == 0 {
+        solve.cg_tolerance.max(LOOSE_SIZING_CG_TOLERANCE)
+    } else {
+        solve.cg_tolerance
+    };
+    let sizing_solve = SolveConfig {
+        cg_tolerance: sizing_cg_tolerance,
+        ..solve
+    };
+
+    let mut stalled = 0u32;
+    let mut plateaued = false;
     let converged = loop {
         if cancel_requested() {
             return Err("solve cancelled".to_string());
         }
         iterations += 1;
-        set_radius_field(&mut work, &radii);
-        let mut model = FrameModel::new(&work, config.solve.material)?;
-        // Glued-face constraints only — contact_frame's scan geometry is
-        // unused (there is no rigid body).
-        let constrained =
-            contact_frame(&work, 6, model.length_scale(), config.solve.fixed_boundary).constrained;
-        let (rhs, drag_force) = build_drag_load(
+        let (iterate, cg_iterations) = evaluate_design(
+            &mut work,
             &geometry,
             &radii,
             direction,
-            config.drag_pressure,
+            config,
+            &sizing_solve,
             node_count,
-        );
-        let (u, cg_iterations) =
-            drag_forward(&work, &mut model, &constrained, &rhs, &config.solve)?;
+        )?;
         stats.cg_iterations += cg_iterations;
+        let max_utilization = iterate.max_utilization;
+        let utilization = iterate.utilization.clone();
 
-        let (tensile, axial) = strut_stresses(&model, &radii, &u);
-        let utilization: Vec<f64> = tensile
-            .iter()
-            .map(|s| s / config.allowable_stress)
-            .collect();
-        let max_utilization = utilization.iter().copied().fold(0.0f64, f64::max);
-
-        let mut displacement = Vec::with_capacity(node_count * 3);
-        let mut rotation = Vec::with_capacity(node_count * 3);
-        for node in 0..node_count {
-            displacement.extend_from_slice(&u[node * 6..node * 6 + 3]);
-            rotation.extend_from_slice(&u[node * 6 + 3..node * 6 + 6]);
+        // Plateau tracking: only a meaningful improvement of the best
+        // peak resets the stall counter; the best iterate itself keeps
+        // any improvement.
+        if best
+            .as_ref()
+            .is_none_or(|b| max_utilization < b.max_utilization * (1.0 - PLATEAU_IMPROVEMENT))
+        {
+            stalled = 0;
+        } else {
+            stalled += 1;
         }
-        let strain_energy_density = model.energy_density(&u);
         if best
             .as_ref()
             .is_none_or(|b| max_utilization < b.max_utilization)
         {
-            best = Some(Iterate {
-                radius: radii.clone(),
-                utilization: utilization.clone(),
-                axial_force: axial,
-                drag_force,
-                displacement,
-                rotation,
-                strain_energy_density,
-                max_utilization,
-            });
+            best = Some(iterate);
         }
 
         if max_utilization <= 1.0 + config.tolerance {
             break true;
+        }
+        if stalled >= PLATEAU_STALL_ITERATIONS {
+            // The peak has quit improving: the update is cycling load
+            // between near-critical struts (or creeping below any useful
+            // rate). Every further iteration would buy the same nothing.
+            plateaued = true;
+            break false;
         }
         if iterations >= config.max_iterations {
             break false;
@@ -484,7 +576,24 @@ pub fn solve_drag(mesh: &FeaMesh, config: &DragConfig) -> Result<DragResult, Str
         }
     };
 
-    let best = best.expect("at least one iterate ran");
+    let mut best = best.expect("at least one iterate ran");
+    // Acceptance was judged at the loosened tolerance (its stress error
+    // sits well inside the acceptance band); refresh the returned fields
+    // at the configured tolerance so the emitted result is as accurate
+    // as the caller asked for. The loop verdict stands.
+    if solve.cg_tolerance < sizing_solve.cg_tolerance {
+        let (refreshed, cg_iterations) = evaluate_design(
+            &mut work,
+            &geometry,
+            &best.radius.clone(),
+            direction,
+            config,
+            &solve,
+            node_count,
+        )?;
+        stats.cg_iterations += cg_iterations;
+        best = refreshed;
+    }
     let saturated = best
         .radius
         .iter()
@@ -507,6 +616,7 @@ pub fn solve_drag(mesh: &FeaMesh, config: &DragConfig) -> Result<DragResult, Str
         max_utilization: best.max_utilization,
         saturated,
         converged,
+        plateaued,
         stats,
     })
 }
@@ -747,6 +857,37 @@ mod tests {
         );
         assert!(result.radius[0] >= r_spine && result.radius[1] >= r_sail);
         assert_eq!(result.saturated, 0);
+    }
+
+    /// Progress too slow to matter must end the loop, not burn
+    /// max_iterations: with a nearly-flat update exponent the peak
+    /// improves by well under PLATEAU_IMPROVEMENT per iteration, so the
+    /// stall counter fires after a handful of solves and reports the
+    /// plateau (distinct from saturation — nothing is pinned).
+    #[test]
+    fn stalled_progress_plateaus_out_early() {
+        let (r_spine, r_sail, p) = (0.04, 0.03, 0.2);
+        let mesh = t_mesh(r_spine, r_sail);
+        let allowable = t_spine_stress(p, r_spine, r_sail) / 4.0;
+        let result = solve_drag(
+            &mesh,
+            &DragConfig {
+                drag_pressure: p,
+                allowable_stress: allowable,
+                max_iterations: 50,
+                exponent: 0.0001,
+                ..config()
+            },
+        )
+        .unwrap();
+        assert!(!result.converged);
+        assert!(result.plateaued, "stalled loop must report the plateau");
+        assert_eq!(result.saturated, 0, "nothing is pinned in a crawl");
+        assert!(
+            result.iterations <= PLATEAU_STALL_ITERATIONS as usize + 2,
+            "stall must end the loop after a handful of iterations, ran {}",
+            result.iterations
+        );
     }
 
     #[test]
