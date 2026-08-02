@@ -541,6 +541,14 @@ pub fn run_project_validate(args: ProjectValidateArgs) -> Result<()> {
 
 // === Project Export ===
 
+/// Prints a step's non-fatal warnings to stderr, attributed to the asset
+/// that carries them. Shared by every path that surfaces a built asset.
+pub(crate) fn print_asset_warnings(asset: &volumetric::LoadedAsset) {
+    for warning in asset.warnings() {
+        eprintln!("warning [{}]: {}", asset.id(), warning);
+    }
+}
+
 /// Runs a project to its exports, locally or — when `remote` names a daemon
 /// base URL — on a remote build daemon over `volumetric_protocol`.
 pub(crate) fn run_project_exports(
@@ -552,8 +560,9 @@ pub(crate) fn run_project_exports(
         // run below serves those steps without executing them.
         project.seed_build_cache(volumetric::build_cache::global());
         let mut env = Environment::new();
+        let never = std::sync::atomic::AtomicBool::new(false);
         return project
-            .run(&mut env)
+            .run_monitored_with_artifacts(&mut env, &never, &|_| {}, &print_asset_warnings)
             .map_err(|e| anyhow::anyhow!("Project execution failed: {}", e));
     };
 
@@ -579,6 +588,7 @@ pub(crate) fn run_project_exports(
         } => Ok(exports
             .into_iter()
             .map(volumetric_protocol::ExportedAsset::into_loaded)
+            .inspect(print_asset_warnings)
             .collect()),
         volumetric_protocol::JobOutcome::Success { .. } => Err(anyhow::anyhow!(
             "daemon returned the wrong output kind for a project run"
@@ -805,9 +815,12 @@ pub fn run_project_bake(args: ProjectBakeArgs) -> Result<()> {
     if !project.collect_baked(cache).1.is_complete() {
         let never = std::sync::atomic::AtomicBool::new(false);
         project
-            .run_monitored(&mut Environment::new(), &never, &|progress| {
-                eprintln!("build: {}", progress.phase)
-            })
+            .run_monitored_with_artifacts(
+                &mut Environment::new(),
+                &never,
+                &|progress| eprintln!("build: {}", progress.phase),
+                &print_asset_warnings,
+            )
             .map_err(|e| anyhow::anyhow!("Project execution failed: {}", e))?;
     }
 

@@ -29,7 +29,8 @@ use js_bindings::{
     wasm_model_get_dimensions, wasm_model_get_sample_format, wasm_model_has_sample_channels,
     wasm_model_sample, wasm_model_sample_channels_nd, wasm_model_sample_nd, wasm_operator_create,
     wasm_operator_destroy, wasm_operator_get_error, wasm_operator_get_metadata,
-    wasm_operator_get_output, wasm_operator_get_output_indices, wasm_operator_run,
+    wasm_operator_get_output, wasm_operator_get_output_indices, wasm_operator_get_warnings,
+    wasm_operator_run,
 };
 #[cfg(feature = "web")]
 use volumetric_abi::SampleFormat;
@@ -319,10 +320,11 @@ impl OperatorExecutor for WebOperatorExecutor {
             });
         }
 
-        // Collect outputs
+        // Collect outputs and any posted warnings
         let mut result = OperatorIo {
             inputs: io.inputs,
             outputs: std::collections::HashMap::new(),
+            warnings: wasm_operator_get_warnings(handle),
         };
 
         let output_indices = wasm_operator_get_output_indices(handle);

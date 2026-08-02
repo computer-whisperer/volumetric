@@ -156,6 +156,10 @@ pub struct ExportedAsset {
     pub data: Vec<u8>,
     pub type_hint: Option<AssetTypeHint>,
     pub precursor_ids: Vec<String>,
+    /// Non-fatal advisories from the producing step. Defaulted so peers
+    /// predating warnings still interoperate.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 impl ExportedAsset {
@@ -165,11 +169,13 @@ impl ExportedAsset {
             data: asset.data().to_vec(),
             type_hint: asset.type_hint(),
             precursor_ids: asset.precursor_ids().to_vec(),
+            warnings: asset.warnings().to_vec(),
         }
     }
 
     pub fn into_loaded(self) -> LoadedAsset {
         LoadedAsset::from_parts(self.id, self.data, self.type_hint, self.precursor_ids)
+            .with_warnings(self.warnings)
     }
 }
 
@@ -390,6 +396,7 @@ mod tests {
             data: vec![9, 8, 7],
             type_hint: Some(AssetTypeHint::FeaMesh),
             precursor_ids: vec!["a".to_string()],
+            warnings: vec!["sizing stopped short".to_string()],
         };
         let loaded = wire.clone().into_loaded();
         let back = ExportedAsset::from_loaded(&loaded);
@@ -397,5 +404,6 @@ mod tests {
         assert_eq!(back.data, wire.data);
         assert_eq!(back.type_hint, wire.type_hint);
         assert_eq!(back.precursor_ids, wire.precursor_ids);
+        assert_eq!(back.warnings, wire.warnings);
     }
 }

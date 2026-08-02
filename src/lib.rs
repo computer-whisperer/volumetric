@@ -884,6 +884,11 @@ pub struct LoadedAsset {
     type_hint: Option<AssetTypeHint>,
     /// IDs of assets that were used to create this asset.
     precursor_ids: Vec<String>,
+    /// Non-fatal advisories the producing operator posted via
+    /// `host.post_warning` (empty for imports and warning-free steps).
+    /// Replayed from the step cache and bakes, so a warning survives
+    /// however the result is reused.
+    warnings: Vec<String>,
     /// Blake3 of `data`, memoized on first use (step cache keys). Assets
     /// coming out of the step cache arrive with it pre-seeded, so cached
     /// blobs are never re-hashed. A clone made before first use re-hashes
@@ -906,8 +911,15 @@ impl LoadedAsset {
             data: Arc::new(data),
             type_hint,
             precursor_ids,
+            warnings: Vec::new(),
             content_hash: std::sync::OnceLock::new(),
         }
+    }
+
+    /// The same asset carrying the producing step's warnings.
+    pub fn with_warnings(mut self, warnings: Vec<String>) -> Self {
+        self.warnings = warnings;
+        self
     }
 
     /// The blake3 hash of the asset's bytes, computed on first call.
@@ -942,6 +954,11 @@ impl LoadedAsset {
     /// Returns the IDs of assets that were used to create this asset.
     pub fn precursor_ids(&self) -> &[String] {
         &self.precursor_ids
+    }
+
+    /// Non-fatal advisories the producing operator posted, in call order.
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
     }
 
     /// Returns the raw bytes if this looks like a model (by type hint).
@@ -1358,6 +1375,7 @@ impl Project {
                 data: Arc::new(import.data.clone()),
                 type_hint: import.type_hint,
                 precursor_ids: vec![],
+                warnings: vec![],
                 content_hash: std::sync::OnceLock::new(),
             };
             artifact_ready(&asset);
@@ -1417,6 +1435,7 @@ impl Project {
                                     .unwrap_or(AssetTypeHint::Model),
                             ),
                             precursor_ids: precursor_ids.clone(),
+                            warnings: cached.warnings.clone(),
                             content_hash: std::sync::OnceLock::from(*hash),
                         };
                         artifact_ready(&asset);
@@ -1492,6 +1511,7 @@ impl Project {
                                 .unwrap_or(AssetTypeHint::Model),
                         ),
                         precursor_ids: precursor_ids.clone(),
+                        warnings: result.warnings.clone(),
                         content_hash: std::sync::OnceLock::from(*hash),
                     };
                     artifact_ready(&asset);
@@ -1504,6 +1524,7 @@ impl Project {
                 CachedStep {
                     outputs,
                     declared_outputs,
+                    warnings: result.warnings,
                 },
             );
         }

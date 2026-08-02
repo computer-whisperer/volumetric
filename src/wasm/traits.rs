@@ -211,6 +211,11 @@ pub struct OperatorIo {
     pub inputs: Vec<Vec<u8>>,
     /// Output data indexed by output slot, populated after execution.
     pub outputs: HashMap<usize, Vec<u8>>,
+    /// Non-fatal advisories the operator posted via `host.post_warning`,
+    /// in call order. The run succeeded and the outputs stand; these tell
+    /// the author about best-effort results (a design loop that stopped
+    /// short, a guarantee met only partially).
+    pub warnings: Vec<String>,
 }
 
 impl OperatorIo {
@@ -219,6 +224,7 @@ impl OperatorIo {
         Self {
             inputs,
             outputs: HashMap::new(),
+            warnings: Vec::new(),
         }
     }
 
@@ -256,6 +262,9 @@ impl OperatorIo {
 /// - `post_error(ptr: i32, len: i32)` - Report a failure with a UTF-8 message.
 ///   A run that posts an error fails with the message instead of returning
 ///   outputs; only the first posted error is kept.
+/// - `post_warning(ptr: i32, len: i32)` - Report a non-fatal advisory with a
+///   UTF-8 message. The run still succeeds; warnings are collected in call
+///   order into [`OperatorIo::warnings`].
 /// - `input_model_dimensions(i32) -> i32`, `input_model_bounds(i32, i32) ->
 ///   i32`, `input_model_sample(i32, i32, i32, i32) -> i32` - Evaluate a
 ///   `ModelWASM` input without instantiating it inside the operator; the

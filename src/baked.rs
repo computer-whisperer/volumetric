@@ -54,6 +54,10 @@ pub struct BakedStep {
     pub outputs: Vec<(u32, [u8; 32])>,
     /// Output type hints declared by the operator's metadata.
     pub declared_outputs: Vec<AssetTypeHint>,
+    /// Non-fatal advisories the operator posted during the baked run.
+    /// Defaulted so bakes written before warnings existed still load.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// The optional step-result snapshot embedded in a `.vproj`.
@@ -174,6 +178,7 @@ impl Project {
                 key: *key.as_bytes(),
                 outputs,
                 declared_outputs: entry.declared_outputs.clone(),
+                warnings: entry.warnings.clone(),
             });
 
             for (idx, output_id) in step.outputs.iter().enumerate() {
@@ -255,6 +260,7 @@ impl Project {
                 CachedStep {
                     outputs,
                     declared_outputs: step.declared_outputs,
+                    warnings: step.warnings,
                 },
             ));
         }

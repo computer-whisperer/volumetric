@@ -53,7 +53,9 @@
 //! stays over-utilized, the lattice topology has no adequate load path to
 //! thicken — the loop stops early and emits its best iterate, with the
 //! over-unity `utilization` field marking where the demanded spine does
-//! not fit. The fix is upstream geometry, not more iterations.
+//! not fit, and posts a `host.post_warning` advisory naming the saturated
+//! strut count, peak utilization, and the severity ratio to turn down.
+//! The fix is upstream geometry or severity, not more iterations.
 
 use volumetric_abi::fea::{FeaMesh, decode_fea_mesh, encode_fea_mesh};
 use volumetric_abi::host::{post_output, read_input, report_error};
@@ -140,8 +142,26 @@ fn run_drag(config: &PrintDragOperatorConfig) -> Result<FeaMesh, String> {
     // Non-convergence is not an error: a strut pinned at max_radius_scale
     // means the lattice topology lacks an adequate load path — emit the
     // best iterate; the over-unity utilization field carries where the
-    // spine falls short.
+    // spine falls short. It IS worth a loud advisory: without one, the
+    // only symptom is a maxed-out radius field and a garbage-magnitude
+    // displacement view.
     let result = fea_core::solve_drag(&mesh, &drag_config)?;
+    if !result.converged {
+        let saturated = result.saturated;
+        let strut_count = mesh.element_count();
+        volumetric_abi::host::post_warning(&format!(
+            "spine sizing did not converge after {} iteration(s): {saturated} of \
+             {strut_count} strut(s) pinned at max_radius_scale ({}x) with peak \
+             utilization {:.3e} — the demanded spine does not fit this lattice. \
+             The severity dial is drag_pressure / allowable_stress (currently \
+             {:.3e}); lower it toward the physical ratio or rework the upstream \
+             geometry. More iterations will not help.",
+            result.iterations,
+            config.max_radius_scale,
+            result.max_utilization,
+            config.drag_pressure / config.allowable_stress,
+        ));
+    }
 
     fea_bundle::apply_drag_result(&mut mesh, result);
     mesh.validate()?;

@@ -67,6 +67,10 @@ pub struct CachedStep {
     /// Output type hints declared by the operator's metadata (may be
     /// shorter than the produced slots; consumers fall back to `Model`).
     pub declared_outputs: Vec<AssetTypeHint>,
+    /// Non-fatal advisories the operator posted during the memoized run.
+    /// Part of the memo: a cache hit replays them onto its assets, so a
+    /// best-effort result stays flagged however often it is reused.
+    pub warnings: Vec<String>,
 }
 
 impl CachedStep {
@@ -82,6 +86,7 @@ impl CachedStep {
                 .values()
                 .map(|(data, _)| data.len() + OUTPUT_OVERHEAD)
                 .sum::<usize>()
+            + self.warnings.iter().map(String::len).sum::<usize>()
     }
 }
 
@@ -249,6 +254,7 @@ mod tests {
         CachedStep {
             outputs: HashMap::from([(0, (Arc::new(vec![0u8; len]), [0u8; 32]))]),
             declared_outputs: Vec::new(),
+            warnings: Vec::new(),
         }
     }
 

@@ -17,6 +17,8 @@
 //! - `post_output(idx: i32, ptr: i32, len: i32)`
 //! - `post_error(ptr: i32, len: i32)` — optional; a run that posts an error
 //!   fails with the message instead of returning outputs
+//! - `post_warning(ptr: i32, len: i32)` — optional; non-fatal advisory the
+//!   host attaches to the step's outputs (see [`host::post_warning`])
 //! - `cancelled() -> i32` — optional; cooperative-cancellation poll for
 //!   long-running operators (see [`host::cancelled`])
 //!
@@ -520,6 +522,7 @@ pub mod host {
             pub fn get_input_data(idx: i32, ptr: i32, len: i32);
             pub fn post_output(output_idx: i32, ptr: i32, len: i32);
             pub fn post_error(ptr: i32, len: i32);
+            pub fn post_warning(ptr: i32, len: i32);
             pub fn cancelled() -> i32;
             pub fn input_model_dimensions(idx: i32) -> i32;
             pub fn input_model_bounds(idx: i32, out_ptr: i32) -> i32;
@@ -546,6 +549,19 @@ pub mod host {
     /// of producing outputs. Only the first reported error is kept.
     pub fn report_error(msg: &str) {
         unsafe { raw::post_error(msg.as_ptr() as i32, msg.len() as i32) }
+    }
+
+    /// Report a non-fatal advisory to the host: the run still succeeds and
+    /// its outputs stand, but the author should know something (a design
+    /// loop that stopped short, a quality guarantee met only best-effort).
+    /// Hosts collect warnings in call order and attach them to the step's
+    /// outputs — through result caches and bakes — so they resurface
+    /// wherever the result is reused. NOTE: calling this makes the module
+    /// import `host.post_warning`, which hosts older than the import reject
+    /// at instantiation; only call it from operators built alongside their
+    /// host.
+    pub fn post_warning(msg: &str) {
+        unsafe { raw::post_warning(msg.as_ptr() as i32, msg.len() as i32) }
     }
 
     /// Whether the host wants this run to stop. Long-running operators

@@ -20,6 +20,7 @@
 //! - `wasmOperatorCreate(bytes: Uint8Array, inputs: Array<Uint8Array>): number` - Create operator
 //! - `wasmOperatorRun(handle: number): boolean` - Run the operator
 //! - `wasmOperatorGetError(handle: number): string | null` - Get reported error, if any
+//! - `wasmOperatorGetWarnings(handle: number): string[]` - Get posted warnings, in call order
 //! - `wasmOperatorGetOutput(handle: number, idx: number): Uint8Array | null` - Get output data
 //! - `wasmOperatorGetOutputIndices(handle: number): number[]` - Get indices of outputs
 //! - `wasmOperatorGetMetadata(handle: number): Uint8Array | null` - Get metadata
@@ -114,6 +115,11 @@ extern "C" {
     /// if any. Returns None when the operator did not report an error.
     #[wasm_bindgen(js_name = wasmOperatorGetError)]
     pub fn wasm_operator_get_error(handle: JsWasmHandle) -> Option<String>;
+
+    /// Get the non-fatal advisories the operator posted via
+    /// `host.post_warning`, in call order (empty when none).
+    #[wasm_bindgen(js_name = wasmOperatorGetWarnings)]
+    pub fn wasm_operator_get_warnings(handle: JsWasmHandle) -> Vec<String>;
 
     /// Get the output data at the given index.
     /// Returns the output bytes or None if no output at that index.

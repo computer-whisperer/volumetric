@@ -41,6 +41,21 @@ fn const_operator() -> Vec<u8> {
         .to_vec()
 }
 
+/// Posts a fixed blob to output 0 after a `post_warning` advisory.
+fn warning_operator() -> Vec<u8> {
+    r#"(module
+        (import "host" "post_output" (func $post (param i32 i32 i32)))
+        (import "host" "post_warning" (func $warn (param i32 i32)))
+        (memory (export "memory") 1)
+        (data (i32.const 0) "\de\ad\be\ef")
+        (data (i32.const 16) "stopped short")
+        (func (export "run")
+            (call $warn (i32.const 16) (i32.const 13))
+            (call $post (i32.const 0) (i32.const 0) (i32.const 4))))"#
+        .as_bytes()
+        .to_vec()
+}
+
 fn step(operator_id: &str, inputs: Vec<ExecutionInput>, output: &str) -> ExecutionStep {
     ExecutionStep {
         operator_id: operator_id.to_string(),
@@ -244,4 +259,26 @@ fn identical_intermediate_cuts_off_downstream_reruns() {
         (1, 3),
         "'const' re-runs but 'echo' hits on the unchanged intermediate"
     );
+}
+
+/// Warnings are part of the memo: the executing run attaches them to the
+/// step's outputs, and a cache hit replays them identically — a
+/// best-effort result stays flagged however often it is reused.
+#[test]
+fn warnings_attach_to_outputs_and_replay_from_cache() {
+    let mut project = Project::new();
+    project
+        .imports_mut()
+        .push(ImportedAsset::operator("warns".into(), warning_operator()));
+    project.timeline_mut().push(step("warns", vec![], "out"));
+    project.exports_mut().push("out".into());
+
+    let cache = BuildCache::new(64 << 20);
+    let built = run(&project, &cache);
+    assert_eq!(built[0].data(), b"\xde\xad\xbe\xef");
+    assert_eq!(built[0].warnings(), ["stopped short"]);
+
+    let again = run(&project, &cache);
+    assert_eq!(cache.stats().hits, 1, "second run must come from the cache");
+    assert_eq!(again[0].warnings(), ["stopped short"]);
 }

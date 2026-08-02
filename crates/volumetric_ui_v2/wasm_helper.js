@@ -327,6 +327,7 @@ window.wasmOperatorCreate = function(bytes, inputs) {
             instance: null,
             module: null,
             error: null,
+            warnings: [],
             // Lazily-created model entries backing the input_model_*
             // sampling imports, keyed by input slot. null records a failed
             // creation so a bad input isn't recompiled on every call.
@@ -380,6 +381,16 @@ window.wasmOperatorCreate = function(bytes, inputs) {
                     const memory = state.instance.exports.memory;
                     const src = new Uint8Array(memory.buffer, ptr, len);
                     state.error = new TextDecoder().decode(src);
+                },
+
+                // Report a non-fatal advisory (UTF-8 message in WASM
+                // memory). The run still succeeds; kept in call order.
+                post_warning: function(ptr, len) {
+                    if (!state.instance) return;
+
+                    const memory = state.instance.exports.memory;
+                    const src = new Uint8Array(memory.buffer, ptr, len);
+                    state.warnings.push(new TextDecoder().decode(src));
                 },
 
                 // Cooperative-cancellation poll. The web host has no
@@ -501,6 +512,14 @@ window.wasmOperatorGetError = function(handle) {
     const state = operatorInstances.get(handle);
     if (!state) return null;
     return state.error;
+};
+
+// Get the non-fatal warnings the operator posted via host.post_warning
+// Returns an array of strings (empty when none)
+window.wasmOperatorGetWarnings = function(handle) {
+    const state = operatorInstances.get(handle);
+    if (!state) return [];
+    return state.warnings.slice();
 };
 
 // Get the number of outputs produced

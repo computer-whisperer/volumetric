@@ -6035,6 +6035,23 @@ fn outputs_rows(app: &VolumetricUiV2) -> Vec<El> {
         );
     }
 
+    // Non-fatal advisories from the last run's operators (best-effort
+    // results). The run succeeded, so these get a cautionary alert, not a
+    // destructive one; per-output details repeat them on selection.
+    let warned: Vec<El> = app
+        .runtime_assets
+        .iter()
+        .flat_map(|asset| {
+            asset
+                .warnings()
+                .iter()
+                .map(|warning| alert_description(format!("{}: {}", asset.id(), warning)))
+        })
+        .collect();
+    if !warned.is_empty() {
+        rows.push(alert(warned).warning().padding(tokens::SPACE_2));
+    }
+
     let staged = app
         .staged_artifacts
         .iter()
@@ -6290,6 +6307,9 @@ fn step_detail_rows(app: &VolumetricUiV2, idx: usize) -> Vec<El> {
         detail_row("Operator", &step.operator_id),
         detail_row("Outputs", &step.outputs.join(", ")),
     ];
+    for output_id in &step.outputs {
+        rows.extend(asset_warning_rows(app, output_id));
+    }
 
     rows.extend(step_edit_rows(app, idx));
 
@@ -6673,6 +6693,7 @@ fn export_detail_rows(app: &VolumetricUiV2, idx: usize) -> Vec<El> {
     {
         rows.push(detail_row("Precursors", &asset.precursor_ids().join(", ")));
     }
+    rows.extend(asset_warning_rows(app, export_id));
     rows.push(
         button_with_icon("x", "Delete")
             .destructive()
@@ -6835,6 +6856,24 @@ fn empty_project_row(label: &str) -> El {
     table_row([text(label).muted().caption().width(Size::Fill(1.0))])
         .height(Size::Fixed(28.0))
         .padding(Sides::xy(tokens::SPACE_2, 0.0))
+}
+
+/// One cautionary line per advisory the producing operator posted on the
+/// materialized output with this id (empty when the asset is absent or
+/// clean).
+fn asset_warning_rows(app: &VolumetricUiV2, asset_id: &str) -> Vec<El> {
+    let Some(asset) = app
+        .runtime_assets
+        .iter()
+        .find(|asset| asset.id() == asset_id)
+    else {
+        return Vec::new();
+    };
+    asset
+        .warnings()
+        .iter()
+        .map(|warning| text(warning).warning().caption())
+        .collect()
 }
 
 fn detail_row(label: &str, value: &str) -> El {

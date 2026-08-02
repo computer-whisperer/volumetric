@@ -200,8 +200,14 @@ pub fn load_wasm_bytes(path: &PathBuf, asset: Option<&str>) -> Result<Vec<u8>> {
 
             // Run the project to get the exported assets
             let mut env = Environment::new();
+            let never = std::sync::atomic::AtomicBool::new(false);
             let exports = project
-                .run(&mut env)
+                .run_monitored_with_artifacts(
+                    &mut env,
+                    &never,
+                    &|_| {},
+                    &project::print_asset_warnings,
+                )
                 .map_err(|e| anyhow::anyhow!("Project execution failed: {}", e))?;
 
             let model_exports: Vec<_> = exports.iter().filter(|e| e.as_model().is_some()).collect();

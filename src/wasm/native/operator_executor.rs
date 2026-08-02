@@ -41,6 +41,8 @@ struct OperatorState {
     /// First failure of the run: an operator `host.post_error` message or a
     /// dead worker thread's report. First write wins.
     error: Arc<Mutex<Option<String>>>,
+    /// Non-fatal `host.post_warning` advisories, in call order.
+    warnings: Arc<Mutex<Vec<String>>>,
     /// Lazily-created model executors backing the `input_model_*` sampling
     /// imports, keyed by input slot. `None` records a failed creation so a
     /// bad input isn't recompiled on every call.
@@ -158,6 +160,7 @@ struct ThreadCtx {
     inputs: Arc<Vec<Vec<u8>>>,
     outputs: Arc<Mutex<HashMap<usize, Vec<u8>>>>,
     error: Arc<Mutex<Option<String>>>,
+    warnings: Arc<Mutex<Vec<String>>>,
     cancelled: Arc<AtomicBool>,
     /// Guest stderr, captured via the `fd_write` stub — Rust panic messages
     /// from the guest arrive here.
@@ -176,6 +179,7 @@ fn spawned_thread_main(ctx: Arc<ThreadCtx>, tid: i32, start_arg: i32) {
             inputs: Arc::clone(&ctx.inputs),
             outputs: Arc::clone(&ctx.outputs),
             error: Arc::clone(&ctx.error),
+            warnings: Arc::clone(&ctx.warnings),
             models: HashMap::new(),
             cancelled: Arc::clone(&ctx.cancelled),
         };
@@ -689,6 +693,25 @@ fn build_linker(
         )
         .map_err(instantiation)?;
 
+    // Host function: report a non-fatal advisory (UTF-8 message in WASM
+    // memory). The run still succeeds; warnings collect in call order.
+    linker
+        .func_wrap(
+            "host",
+            "post_warning",
+            |mut caller: Caller<'_, OperatorState>, ptr: i32, len: i32| {
+                let Some(mem) = GuestMem::from_caller(&mut caller) else {
+                    return;
+                };
+                let Some(bytes) = mem.read(&caller, ptr as usize, len.max(0) as usize) else {
+                    return;
+                };
+                let msg = String::from_utf8_lossy(&bytes).into_owned();
+                caller.data().warnings.lock().unwrap().push(msg);
+            },
+        )
+        .map_err(instantiation)?;
+
     if let Some(ctx) = threads {
         add_wasi_stubs(
             &mut linker,
@@ -785,6 +808,7 @@ impl NativeOperatorExecutor {
             inputs: Arc::clone(&state.inputs),
             outputs: Arc::clone(&state.outputs),
             error: Arc::clone(&state.error),
+            warnings: Arc::clone(&state.warnings),
             cancelled: Arc::clone(&state.cancelled),
             stderr: Arc::new(Mutex::new(Vec::new())),
             joins: Mutex::new(Vec::new()),
@@ -812,11 +836,13 @@ impl OperatorExecutor for NativeOperatorExecutor {
         let inputs = Arc::new(io.inputs);
         let outputs = Arc::new(Mutex::new(HashMap::new()));
         let error = Arc::new(Mutex::new(None));
+        let warnings = Arc::new(Mutex::new(Vec::new()));
         let cancelled = Arc::new(AtomicBool::new(false));
         let state = OperatorState {
             inputs: Arc::clone(&inputs),
             outputs: Arc::clone(&outputs),
             error: Arc::clone(&error),
+            warnings: Arc::clone(&warnings),
             models: HashMap::new(),
             cancelled: Arc::clone(&cancelled),
         };
@@ -919,6 +945,7 @@ impl OperatorExecutor for NativeOperatorExecutor {
         Ok(OperatorIo {
             inputs: Arc::try_unwrap(inputs).unwrap_or_else(|arc| arc.as_ref().clone()),
             outputs: std::mem::take(&mut *outputs.lock().unwrap()),
+            warnings: std::mem::take(&mut *warnings.lock().unwrap()),
         })
     }
 
@@ -955,6 +982,14 @@ impl OperatorExecutor for NativeOperatorExecutor {
             .func_wrap(
                 "host",
                 "post_error",
+                |_caller: Caller<'_, ()>, _ptr: i32, _len: i32| {},
+            )
+            .map_err(instantiation)?;
+
+        linker
+            .func_wrap(
+                "host",
+                "post_warning",
                 |_caller: Caller<'_, ()>, _ptr: i32, _len: i32| {},
             )
             .map_err(instantiation)?;
@@ -1349,6 +1384,34 @@ mod tests {
             .run_cancellable(OperatorIo::new(vec![]), &cancel)
             .expect("packed run should succeed");
         assert_eq!(io.outputs.get(&0).map(Vec::as_slice), Some(&b"fast"[..]));
+    }
+
+    /// `host.post_warning` advisories collect in call order and the run
+    /// still succeeds with its outputs — unlike `post_error`, which fails
+    /// the run.
+    #[test]
+    fn posted_warnings_collect_without_failing_the_run() {
+        let wasm = wat::parse_str(
+            r#"(module
+                (import "host" "post_output" (func $post (param i32 i32 i32)))
+                (import "host" "post_warning" (func $warn (param i32 i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "first")
+                (data (i32.const 16) "second")
+                (data (i32.const 32) "out")
+                (func (export "run")
+                    (call $warn (i32.const 0) (i32.const 5))
+                    (call $warn (i32.const 16) (i32.const 6))
+                    (call $post (i32.const 0) (i32.const 32) (i32.const 3))))"#,
+        )
+        .unwrap();
+        let cancel = AtomicBool::new(false);
+        let io = NativeOperatorExecutor::new(&wasm)
+            .unwrap()
+            .run_cancellable(OperatorIo::new(vec![]), &cancel)
+            .expect("a warned run still succeeds");
+        assert_eq!(io.outputs.get(&0).map(Vec::as_slice), Some(&b"out"[..]));
+        assert_eq!(io.warnings, ["first", "second"]);
     }
 
     /// Metadata retrieval must read back through a shared memory export.

@@ -256,3 +256,43 @@ fn cbor_compatibility_with_unbaked_files() {
     assert!(loaded.baked.is_none());
     assert_eq!(loaded.timeline().len(), 2);
 }
+
+/// Warnings ride the bake: a built copy reopened in a fresh process still
+/// flags its best-effort steps without re-executing them.
+#[test]
+fn warnings_survive_the_bake_round_trip() {
+    let mut project = Project::new();
+    project.imports_mut().push(ImportedAsset::operator(
+        "warns".into(),
+        r#"(module
+            (import "host" "post_output" (func $post (param i32 i32 i32)))
+            (import "host" "post_warning" (func $warn (param i32 i32)))
+            (memory (export "memory") 1)
+            (data (i32.const 0) "\de\ad\be\ef")
+            (data (i32.const 16) "stopped short")
+            (func (export "run")
+                (call $warn (i32.const 16) (i32.const 13))
+                (call $post (i32.const 0) (i32.const 0) (i32.const 4))))"#
+            .as_bytes()
+            .to_vec(),
+    ));
+    project.timeline_mut().push(step("warns", vec![], "out"));
+    project.exports_mut().push("out".into());
+
+    let cache = BuildCache::new(64 << 20);
+    let built = run(&project, &cache);
+    assert_eq!(built[0].warnings(), ["stopped short"]);
+
+    let (baked, coverage) = project.collect_baked(&cache);
+    assert!(coverage.is_complete());
+    let mut saved = project.clone();
+    saved.baked = Some(baked);
+    let bytes = saved.to_cbor().expect("serializes");
+
+    let mut reopened = Project::from_cbor(&bytes).expect("deserializes");
+    let fresh = BuildCache::new(0);
+    reopened.seed_build_cache(&fresh);
+    let rebuilt = run(&reopened, &fresh);
+    assert_eq!(fresh.stats().hits, 1, "the step must come from the bake");
+    assert_eq!(rebuilt[0].warnings(), ["stopped short"]);
+}
