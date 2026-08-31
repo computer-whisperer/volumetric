@@ -616,6 +616,9 @@ fn lower_surface(s: StepSurface, opts: &Options) -> Result<Surface, String> {
                         Curve::Circle { frame, radius } => {
                             project::flatten_circle(frame, *radius, 0.0, TAU, opts.chord_tol)
                         }
+                        Curve::Ellipse { frame, a, b } => {
+                            project::flatten_ellipse(frame, *a, *b, 0.0, TAU, opts.chord_tol)
+                        }
                         Curve::Bspline(c) => {
                             let dom = c.domain();
                             project::flatten_bspline(c, dom[0], dom[1], opts.chord_tol)
@@ -689,50 +692,56 @@ fn loop_points(ctx: &Ctx, edges: &[StepEdge], opts: &Options) -> Result<Vec<Vec3
     Ok(out)
 }
 
+/// Flatten the arc of a circle/ellipse `(a cos t, b sin t)` in `frame`
+/// between the edge's vertices, from its start vertex to its end vertex.
+/// Coincident vertices mean the edge covers the whole closed curve.
+fn conic_arc_points(frame: &Frame, a: f64, b: f64, e: &StepEdge, tol: f64) -> Vec<Vec3> {
+    let t_of = |p: Vec3| {
+        let l = frame.to_local(p);
+        (l[1] / b).atan2(l[0] / a)
+    };
+    let t_start = t_of(e.start);
+    let full = norm(sub(e.start, e.end)) < tol * 1e-3 + 1e-9;
+    // Sweep CCW in the curve frame when the curve runs forward along
+    // the traversal, CW otherwise.
+    let (t0, t1) = if full {
+        (t_start, t_start + TAU)
+    } else {
+        let mut t_end = t_of(e.end);
+        if e.forward {
+            if t_end <= t_start {
+                t_end += TAU;
+            }
+            (t_start, t_end)
+        } else {
+            if t_end >= t_start {
+                t_end -= TAU;
+            }
+            (t_start, t_end)
+        }
+    };
+    let (lo, hi, reversed) = if full && !e.forward {
+        (t_start - TAU, t_start, true)
+    } else if t1 >= t0 {
+        (t0, t1, false)
+    } else {
+        (t1, t0, true)
+    };
+    let mut pts = project::flatten_ellipse(frame, a, b, lo, hi, tol);
+    if reversed {
+        pts.reverse();
+    }
+    pts
+}
+
 /// Flatten one oriented edge into 3D points from its start vertex to
 /// its end vertex.
 fn edge_points(ctx: &Ctx, e: &StepEdge, tol: f64) -> Result<Vec<Vec3>, String> {
     let curve = ctx.curve(e.curve_id)?;
     let mut pts = match curve {
         Curve::Line { .. } => vec![e.start, e.end],
-        Curve::Circle { frame, radius } => {
-            let a_of = |p: Vec3| {
-                let l = frame.to_local(p);
-                l[1].atan2(l[0])
-            };
-            let a_start = a_of(e.start);
-            let full = norm(sub(e.start, e.end)) < tol * 1e-3 + 1e-9;
-            // Sweep CCW in the circle frame when the curve runs forward
-            // along the traversal, CW otherwise.
-            let (a0, a1) = if full {
-                (a_start, a_start + TAU)
-            } else {
-                let mut a_end = a_of(e.end);
-                if e.forward {
-                    if a_end <= a_start {
-                        a_end += TAU;
-                    }
-                    (a_start, a_end)
-                } else {
-                    if a_end >= a_start {
-                        a_end -= TAU;
-                    }
-                    (a_start, a_end)
-                }
-            };
-            let (lo, hi, reversed) = if full && !e.forward {
-                (a_start - TAU, a_start, true)
-            } else if a1 >= a0 {
-                (a0, a1, false)
-            } else {
-                (a1, a0, true)
-            };
-            let mut pts = project::flatten_circle(&frame, radius, lo, hi, tol);
-            if reversed {
-                pts.reverse();
-            }
-            pts
-        }
+        Curve::Circle { frame, radius } => conic_arc_points(&frame, radius, radius, e, tol),
+        Curve::Ellipse { frame, a, b } => conic_arc_points(&frame, a, b, e, tol),
         Curve::Bspline(c) => {
             let dom = c.domain();
             let closed = {

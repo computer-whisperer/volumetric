@@ -114,8 +114,22 @@ impl<'a> Ctx<'a> {
 
 /// A bounded 3D curve in importer form (pre-flattening).
 pub enum Curve {
-    Line { point: Vec3, dir: Vec3 },
-    Circle { frame: Frame, radius: f64 },
+    Line {
+        point: Vec3,
+        dir: Vec3,
+    },
+    Circle {
+        frame: Frame,
+        radius: f64,
+    },
+    /// `(a cos t, b sin t)` in `frame`: `a` along x, `b` along y (STEP
+    /// semi_axis_1/semi_axis_2, in that order — not necessarily
+    /// major/minor).
+    Ellipse {
+        frame: Frame,
+        a: f64,
+        b: f64,
+    },
     Bspline(BsplineCurve),
 }
 
@@ -189,6 +203,23 @@ impl<'a> Ctx<'a> {
                         .ok_or_else(|| format!("#{id} CIRCLE: bad radius"))?
                         * self.scale;
                     Ok(Curve::Circle { frame, radius })
+                }
+                "ELLIPSE" => {
+                    // (name, position, semi_axis_1, semi_axis_2)
+                    let frame = self.axis2(self.ref_arg(r, 1, id)?)?;
+                    let semi = |idx: usize| -> Result<f64, String> {
+                        r.args
+                            .get(idx)
+                            .and_then(Arg::as_f64)
+                            .filter(|v| *v > 0.0)
+                            .map(|v| v * self.scale)
+                            .ok_or_else(|| format!("#{id} ELLIPSE: bad semi-axis"))
+                    };
+                    Ok(Curve::Ellipse {
+                        frame,
+                        a: semi(2)?,
+                        b: semi(3)?,
+                    })
                 }
                 "B_SPLINE_CURVE_WITH_KNOTS" => {
                     // (name, degree, ctrl, form, closed, self_int,

@@ -211,18 +211,41 @@ pub fn flatten_circle(
     a1: f64,
     tol: f64,
 ) -> Vec<Vec3> {
-    let span = (a1 - a0).abs();
-    // Sagitta s = r (1 - cos(h/2)) <= tol per step h.
-    let max_step = if tol >= radius {
+    flatten_ellipse(frame, radius, radius, a0, a1, tol)
+}
+
+/// Flatten an ellipse arc `(a cos t, b sin t)` in its own frame from
+/// parameter `t0` to `t1` (t1 > t0) into 3D points at chordal tolerance
+/// `tol`. Endpoints are included. `a`/`b` are the semi-axes along the
+/// frame's x/y; a circle is the `a == b` case.
+pub fn flatten_ellipse(
+    frame: &crate::math::Frame,
+    a: f64,
+    b: f64,
+    t0: f64,
+    t1: f64,
+    tol: f64,
+) -> Vec<Vec3> {
+    let span = (t1 - t0).abs();
+    // Uniform parameter steps sized for the worst point of the curve:
+    // curvature peaks at major/minor^2 (major-axis ends) and speed at
+    // |r'| <= major, so a step h covers arc length <= major*h with
+    // sagitta <= kappa L^2/8 = major^3 h^2 / (8 minor^2). Solving for
+    // tol gives h = (minor/major) * sqrt(8 tol/major), i.e. the exact
+    // circle step at the major radius scaled by minor/major (equal to
+    // it for a circle).
+    let major = a.max(b);
+    let minor = a.min(b);
+    let max_step = if tol >= major || minor <= 0.0 {
         span
     } else {
-        2.0 * (1.0 - tol / radius).acos()
+        2.0 * (1.0 - tol / major).acos() * (minor / major)
     };
     let steps = ((span / max_step).ceil() as usize).clamp(1, 4096);
     (0..=steps)
         .map(|i| {
-            let a = a0 + span * i as f64 / steps as f64;
-            frame.to_world([radius * a.cos(), radius * a.sin(), 0.0])
+            let t = t0 + span * i as f64 / steps as f64;
+            frame.to_world([a * t.cos(), b * t.sin(), 0.0])
         })
         .collect()
 }
@@ -356,6 +379,35 @@ mod tests {
             let r = (m[0] * m[0] + m[1] * m[1]).sqrt();
             assert!(10.0 - r <= 0.0100001, "sagitta {}", 10.0 - r);
         }
+    }
+
+    #[test]
+    fn ellipse_flattening_respects_tolerance() {
+        // Eccentric ellipse (a/b = 5): the curvature at the major-axis
+        // ends is 25x the circle-of-radius-a curvature, which is where
+        // a naive circle step count would overshoot the tolerance.
+        let (a, b, tol) = (10.0, 2.0, 0.01);
+        let pts = flatten_ellipse(&Frame::IDENTITY, a, b, 0.0, TAU, tol);
+        assert!(pts.len() < 4096, "hit the step clamp: {}", pts.len());
+        let steps = pts.len() - 1;
+        for (i, w) in pts.windows(2).enumerate() {
+            let t0 = TAU * i as f64 / steps as f64;
+            let t1 = TAU * (i + 1) as f64 / steps as f64;
+            let chord = sub(w[1], w[0]);
+            let len2 = crate::math::dot(chord, chord);
+            for k in 1..16 {
+                let t = t0 + (t1 - t0) * k as f64 / 16.0;
+                let p = [a * t.cos(), b * t.sin(), 0.0];
+                let s = crate::math::dot(sub(p, w[0]), chord) / len2;
+                let foot = crate::math::add(w[0], crate::math::scale(chord, s));
+                let dev = norm(sub(p, foot));
+                assert!(dev <= tol * 1.0001, "chord {i}: deviation {dev}");
+            }
+        }
+        // And the degenerate case is exactly the circle.
+        let c = flatten_circle(&Frame::IDENTITY, 10.0, 0.0, TAU, 0.01);
+        let e = flatten_ellipse(&Frame::IDENTITY, 10.0, 10.0, 0.0, TAU, 0.01);
+        assert_eq!(c, e);
     }
 
     #[test]
