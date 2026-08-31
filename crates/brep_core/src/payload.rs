@@ -25,6 +25,26 @@ pub const TYPE_EXTRUSION: u32 = 5;
 pub const TYPE_NURBS: u32 = 6;
 pub const TYPE_MESH: u32 = 7;
 
+/// One surface hit seen by a diagnostic cast ([`PayloadView::trace_cast`]).
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct CastTrace {
+    /// Face record offset within the payload (stable id for one payload).
+    pub face_off: usize,
+    /// `TYPE_*` surface kind.
+    pub type_id: u32,
+    pub t: f64,
+    pub u: f64,
+    pub v: f64,
+    pub counts: bool,
+    pub suspect: bool,
+    /// Trim verdict at (u, v).
+    pub inside: bool,
+    pub near_boundary: bool,
+    /// Whether the hit incremented the crossing count.
+    pub counted: bool,
+}
+
 // ---------------------------------------------------------------------
 // Writer
 // ---------------------------------------------------------------------
@@ -973,7 +993,7 @@ impl<'a> PayloadView<'a> {
     fn solid_parity(&self, solid_off: usize, p: Vec3) -> bool {
         let mut parity = false;
         for dir in RAY_DIRS {
-            let (par, suspect) = self.cast(solid_off, p, dir);
+            let (par, suspect) = self.cast(solid_off, p, dir, &mut |_| {});
             parity = par;
             if !suspect {
                 break;
@@ -982,7 +1002,36 @@ impl<'a> PayloadView<'a> {
         parity
     }
 
-    fn cast(&self, solid_off: usize, p: Vec3, dir: Vec3) -> (bool, bool) {
+    /// Diagnostic cast against instance `instance` from world point `p`
+    /// along `dir`: every surface hit that reaches the trim test is
+    /// reported to `trace` (mesh faces report nothing), and the cast's
+    /// (parity, suspect) verdict is returned. Not used by classification.
+    #[doc(hidden)]
+    pub fn trace_cast(
+        &self,
+        instance: usize,
+        p: Vec3,
+        dir: Vec3,
+        trace: &mut dyn FnMut(CastTrace),
+    ) -> (bool, bool) {
+        let instances_off = u32_at(self.bytes, 64) as usize;
+        let solids_off = u32_at(self.bytes, 68) as usize;
+        let base = instances_off + instance * INSTANCE_LEN;
+        let w2l = Affine(core::array::from_fn(|k| {
+            f64_at(self.bytes, base + 56 + k * 8)
+        }));
+        let solid = u32_at(self.bytes, base) as usize;
+        let solid_off = u32_at(self.bytes, solids_off + solid * 4) as usize;
+        self.cast(solid_off, w2l.apply(p), dir, trace)
+    }
+
+    fn cast(
+        &self,
+        solid_off: usize,
+        p: Vec3,
+        dir: Vec3,
+        trace: &mut dyn FnMut(CastTrace),
+    ) -> (bool, bool) {
         let bytes = self.bytes;
         let face_count = u32_at(bytes, solid_off) as usize;
         let node_count = u32_at(bytes, solid_off + 4) as usize;
@@ -1033,6 +1082,7 @@ impl<'a> PayloadView<'a> {
                         eps_boundary,
                         &mut crossings,
                         &mut suspect,
+                        trace,
                     );
                 }
             } else {
@@ -1055,8 +1105,10 @@ impl<'a> PayloadView<'a> {
         eps_boundary: f64,
         crossings: &mut usize,
         suspect: &mut bool,
+        trace: &mut dyn FnMut(CastTrace),
     ) {
-        if u32_at(self.bytes, face_off) == TYPE_MESH {
+        let type_id = u32_at(self.bytes, face_off);
+        if type_id == TYPE_MESH {
             MeshRaw::at(self.bytes, face_off).cast(p, dir, t_eps, eps_boundary, crossings, suspect);
             return;
         }
@@ -1067,6 +1119,18 @@ impl<'a> PayloadView<'a> {
                 return;
             }
             let th = region.contains(hit.u, hit.v);
+            trace(CastTrace {
+                face_off,
+                type_id,
+                t: hit.t,
+                u: hit.u,
+                v: hit.v,
+                counts: hit.counts,
+                suspect: hit.suspect,
+                inside: th.inside,
+                near_boundary: th.near_boundary,
+                counted: hit.counts && th.inside && hit.t > t_eps,
+            });
             if hit.counts && th.inside && hit.t > t_eps {
                 *crossings += 1;
                 if hit.suspect || th.near_boundary {

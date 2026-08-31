@@ -177,3 +177,42 @@ fn unstyled_import_has_no_colors() {
             .all(|s| s.faces.iter().all(|f| f.color.is_none()))
     );
 }
+
+#[test]
+fn trace_cast_explains_parity() {
+    // The diagnostic trace must agree with classification: along the
+    // primary ray, the counted hits it reports have the parity of the
+    // verdict whenever the cast is not suspect (a suspect cast defers to
+    // the fallback directions, so its own parity is not the verdict).
+    let model = import(FIXTURE, &StepConfig::default()).unwrap();
+    let payload = build_payload(&model).unwrap();
+    let view = PayloadView::new(&payload).unwrap();
+    let mut checked = 0;
+    for &(x, y, z) in &[
+        (0.0, 0.0, 0.0),
+        (4.9, 3.9, 2.9),
+        (5.1, 0.0, 0.0),
+        (20.0, 0.0, 3.0),
+        (20.0, 2.9, 8.9),
+        (20.0, 3.1, 3.0),
+        (12.0, 0.0, 0.0),
+    ] {
+        let p = [x * 1e-3, y * 1e-3, z * 1e-3];
+        // Both instances get the same test; the box and cylinder do not
+        // overlap, so the model verdict is the OR of the per-instance ones.
+        let mut any_inside = false;
+        for inst in 0..2 {
+            let mut counted = 0;
+            let (parity, suspect) = view.trace_cast(inst, p, brep_core::RAY_DIRS[0], &mut |h| {
+                counted += usize::from(h.counted);
+            });
+            if !suspect {
+                assert_eq!(parity, counted % 2 == 1, "trace parity at {p:?}");
+                any_inside |= parity;
+                checked += 1;
+            }
+        }
+        assert_eq!(any_inside, view.is_inside(p), "verdict at {p:?}");
+    }
+    assert!(checked >= 10, "only {checked} non-suspect casts");
+}
