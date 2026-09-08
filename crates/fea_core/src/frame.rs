@@ -242,6 +242,8 @@ fn local_forces(s: &Strut, v: &[[f64; 3]; 4]) -> [[f64; 3]; 4] {
 }
 
 impl FrameModel {
+    /// Used by the Schwarz preconditioner (`parallel` feature) and tests.
+    #[cfg(any(test, feature = "parallel"))]
     pub(crate) fn strut_count(&self) -> usize {
         self.struts.len()
     }
@@ -254,6 +256,7 @@ impl FrameModel {
     /// order: node0 translations, node0 rotations, node1 translations,
     /// node1 rotations), column-probed out of local_forces so every
     /// coupling and sign comes from the ground-truth kernel.
+    #[cfg(any(test, feature = "parallel"))]
     pub(crate) fn element_stiffness(&self, e: usize) -> [[f64; 12]; 12] {
         let s = &self.struts[e];
         // Columns in the strut frame first.
