@@ -235,7 +235,8 @@ pub struct ProjectAddOpArgs {
     pub operator: String,
 
     /// One per declared input slot: "asset:id", "json:{...}", "file:path",
-    /// "data:base64", or "none" to leave an optional slot unwired
+    /// "data:base64", or "none" to leave an optional slot unwired. Repeat
+    /// for a slot that accepts one or more inputs (see `info`)
     #[arg(short, long)]
     pub input: Vec<String>,
 
@@ -322,10 +323,23 @@ fn describe_declared_inputs(metadata: &OperatorMetadata) -> String {
                 .input_name(i)
                 .map(|n| format!("{n} "))
                 .unwrap_or_default();
-            format!("  [{i}] {name}({})", input_type_label(input))
+            let arity = if metadata.variadic_slot() == Some(i) {
+                ", one or more"
+            } else {
+                ""
+            };
+            format!("  [{i}] {name}({}{arity})", input_type_label(input))
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// "3" or "at least 3": how many inputs the operator's declaration takes.
+fn expected_input_count(metadata: &OperatorMetadata) -> String {
+    match metadata.variadic_slot() {
+        Some(_) => format!("at least {}", metadata.inputs.len()),
+        None => metadata.inputs.len().to_string(),
+    }
 }
 
 /// Check a parsed input against its declared slot type, coercing where the
@@ -442,12 +456,12 @@ pub fn run_project_add_op(args: ProjectAddOpArgs) -> Result<()> {
 
     let metadata = volumetric::operator_metadata_from_wasm_bytes(&op_bytes)
         .map_err(|e| anyhow::anyhow!("Failed to read operator metadata: {e}"))?;
-    if args.input.len() != metadata.inputs.len() {
+    let count = args.input.len();
+    if !metadata.accepts_input_count(count) {
         anyhow::bail!(
-            "{op_name} expects {} input(s), got {}:\n{}\n(pass `{UNWIRED_SPEC}` for an \
+            "{op_name} expects {} input(s), got {count}:\n{}\n(pass `{UNWIRED_SPEC}` for an \
              optional slot you want to leave unwired)",
-            metadata.inputs.len(),
-            args.input.len(),
+            expected_input_count(&metadata),
             describe_declared_inputs(&metadata)
         );
     }
@@ -455,10 +469,13 @@ pub fn run_project_add_op(args: ProjectAddOpArgs) -> Result<()> {
     let inputs: Vec<ExecutionInput> = args
         .input
         .iter()
-        .zip(metadata.inputs.iter().enumerate())
-        .map(|(spec, (idx, slot))| {
+        .enumerate()
+        .map(|(idx, spec)| {
+            let slot = metadata
+                .input_type(idx, count)
+                .expect("input count was checked against the declaration");
             let name = metadata
-                .input_name(idx)
+                .input_label(idx, count)
                 .map(|n| format!(" ({n})"))
                 .unwrap_or_default();
             let slot_desc = format!("input [{idx}]{name}");
@@ -966,14 +983,15 @@ fn describe_steps(project: &Project) -> Vec<StepDetail> {
                 .and_then(|import| {
                     volumetric::operator_metadata_from_wasm_bytes(&import.data).ok()
                 });
+            let count = step.inputs.len();
             let inputs = step
                 .inputs
                 .iter()
                 .enumerate()
                 .map(|(idx, input)| {
-                    let slot = metadata.as_ref().and_then(|m| m.inputs.get(idx));
-                    let name = metadata.as_ref().and_then(|m| m.input_name(idx));
-                    describe_step_input(input, slot, name)
+                    let slot = metadata.as_ref().and_then(|m| m.input_type(idx, count));
+                    let name = metadata.as_ref().and_then(|m| m.input_label(idx, count));
+                    describe_step_input(input, slot, name.as_deref())
                 })
                 .collect();
             StepDetail {
@@ -1232,12 +1250,13 @@ pub fn run_project_set_config(args: ProjectSetConfigArgs) -> Result<()> {
 
     let step = &mut project.timeline[step_index];
     anyhow::ensure!(
-        step.inputs.len() == metadata.inputs.len(),
+        metadata.accepts_input_count(step.inputs.len()),
         "step {step_index} has {} input(s) but {operator_id} declares {}; \
          the project predates the operator version — re-add the step first",
         step.inputs.len(),
-        metadata.inputs.len()
+        expected_input_count(&metadata)
     );
+    let slot = metadata.input_of_slot(slot, step.inputs.len());
     let mut values = match &step.inputs[slot] {
         ExecutionInput::Inline(bytes) if !bytes.is_empty() => operator_config::decode(bytes),
         _ => operator_config::default_values(&fields),
@@ -1289,6 +1308,33 @@ mod tests {
 
     fn vec3_slot() -> OperatorMetadataInput {
         OperatorMetadataInput::VecF64(3)
+    }
+
+    /// Count-mismatch errors name the variadic slot and the "at least"
+    /// arity, so the hint matches what `--input` repetition means.
+    #[test]
+    fn variadic_declarations_describe_their_arity() {
+        let metadata = OperatorMetadata {
+            name: "nary".to_string(),
+            version: "0.0.0".to_string(),
+            display_name: String::new(),
+            description: String::new(),
+            category: String::new(),
+            icon_svg: String::new(),
+            docs: String::new(),
+            inputs: vec![
+                OperatorMetadataInput::ModelWASM,
+                OperatorMetadataInput::CBORConfiguration("{ op: tstr }".to_string()),
+            ],
+            variadic_input: Some(0),
+            input_names: vec!["Model".to_string(), "Config".to_string()],
+            outputs: vec![],
+            output_names: vec![],
+        };
+        assert_eq!(expected_input_count(&metadata), "at least 2");
+        let described = describe_declared_inputs(&metadata);
+        assert!(described.contains("[0] Model (ModelWASM, one or more)"), "{described}");
+        assert!(described.contains("[1] Config (CBOR configuration)"), "{described}");
     }
 
     #[test]

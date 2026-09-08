@@ -244,6 +244,8 @@ const MOVE_STEP_UP_PREFIX: &str = "project:move-step-up:";
 const MOVE_STEP_DOWN_PREFIX: &str = "project:move-step-down:";
 const SET_STEP_MODEL_PREFIX: &str = "project:set-step-model:";
 const CLEAR_STEP_F64_MAP_PREFIX: &str = "project:clear-step-f64-map:";
+const ADD_STEP_INPUT_PREFIX: &str = "project:add-step-input:";
+const REMOVE_STEP_INPUT_PREFIX: &str = "project:remove-step-input:";
 const SELECT_EXPORT_PREFIX: &str = "project:select-export:";
 const DELETE_EXPORT_PREFIX: &str = "project:delete-export:";
 const TOGGLE_OPERATOR_DOCS_KEY: &str = "project:toggle-operator-docs";
@@ -846,8 +848,37 @@ enum AssetSlotKind {
 struct AssetSlot {
     input_idx: usize,
     kind: AssetSlotKind,
-    /// The operator-declared label for this slot, when its metadata names it.
+    /// The operator-declared label for this slot, when its metadata names it
+    /// (numbered within a variadic block: "Model 2").
     name: Option<String>,
+}
+
+/// A step's variadic input block as the editor's Add/Remove act on it —
+/// captured when the editor is built so the handlers need no metadata read.
+#[derive(Debug)]
+struct VariadicBlock {
+    /// Step input indices currently in the block (never empty).
+    range: std::ops::Range<usize>,
+    /// The picker kind when the block takes assets: Add wires the first
+    /// eligible asset the block doesn't use yet.
+    kind: Option<AssetSlotKind>,
+    /// What Add inserts when no asset applies: the slot's fresh default, or
+    /// an unwired entry for an asset block with nothing left to offer.
+    fresh: ExecutionInput,
+}
+
+impl AssetSlotKind {
+    /// The picker kind for a declared input type, if the slot takes an asset.
+    fn of_input(input: &OperatorMetadataInput) -> Option<Self> {
+        match input {
+            OperatorMetadataInput::ModelWASM => Some(AssetSlotKind::Model),
+            OperatorMetadataInput::FeaMesh => Some(AssetSlotKind::FeaMesh),
+            OperatorMetadataInput::TriMesh => Some(AssetSlotKind::TriMesh),
+            OperatorMetadataInput::Subspace => Some(AssetSlotKind::Subspace),
+            OperatorMetadataInput::F64Map => Some(AssetSlotKind::F64Map),
+            _ => None,
+        }
+    }
 }
 
 /// Edit buffers for one `VecF64` input: one text field per component,
@@ -873,6 +904,8 @@ struct StepEditState {
     /// The script source editor, present only for a `LuaSource` or
     /// `WgslSource` input.
     script: Option<ScriptForm>,
+    /// The growable input block, when the operator declares a variadic slot.
+    variadic: Option<VariadicBlock>,
     /// Edit buffer for the step's (first) output name; committed via Rename.
     output_name: String,
 }
@@ -2634,33 +2667,37 @@ impl VolumetricUiV2 {
         let op_bytes = self.operator_bytes(&step.operator_id)?;
         let metadata = volumetric::operator_metadata_from_wasm_bytes(&op_bytes).ok()?;
 
-        let asset_slots: Vec<AssetSlot> = metadata
-            .inputs
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, input)| {
-                let kind = match input {
-                    OperatorMetadataInput::ModelWASM => AssetSlotKind::Model,
-                    OperatorMetadataInput::FeaMesh => AssetSlotKind::FeaMesh,
-                    OperatorMetadataInput::TriMesh => AssetSlotKind::TriMesh,
-                    OperatorMetadataInput::Subspace => AssetSlotKind::Subspace,
-                    OperatorMetadataInput::F64Map => AssetSlotKind::F64Map,
-                    _ => return None,
-                };
+        // Forms index the step's inputs; a variadic block shifts the slots
+        // declared after it, so declared indices go through `at`.
+        let count = step.inputs.len();
+        let at = |slot: usize| metadata.input_of_slot(slot, count);
+        let variadic = metadata.variadic_slot().map(|slot| {
+            let kind = AssetSlotKind::of_input(&metadata.inputs[slot]);
+            VariadicBlock {
+                range: metadata
+                    .variadic_range(count)
+                    .expect("a declared variadic slot has a block"),
+                kind,
+                fresh: match kind {
+                    Some(_) => ExecutionInput::Inline(Vec::new()),
+                    None => operator_step_inputs(&metadata, &SlotPrimaries::default())[slot].clone(),
+                },
+            }
+        });
+        let asset_slots: Vec<AssetSlot> = (0..count)
+            .filter_map(|idx| {
+                let kind = AssetSlotKind::of_input(metadata.input_type(idx, count)?)?;
                 Some(AssetSlot {
                     input_idx: idx,
                     kind,
-                    name: metadata.input_name(idx).map(str::to_string),
+                    name: metadata.input_label(idx, count),
                 })
             })
             .collect();
 
-        let vecs: Vec<VecForm> = metadata
-            .inputs
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, input)| {
-                let OperatorMetadataInput::VecF64(dim) = input else {
+        let vecs: Vec<VecForm> = (0..count)
+            .filter_map(|idx| {
+                let OperatorMetadataInput::VecF64(dim) = metadata.input_type(idx, count)? else {
                     return None;
                 };
                 let values = match step.inputs.get(idx) {
@@ -2669,7 +2706,7 @@ impl VolumetricUiV2 {
                 };
                 Some(VecForm {
                     input_idx: idx,
-                    name: metadata.input_name(idx).map(str::to_string),
+                    name: metadata.input_label(idx, count),
                     buffers: values.iter().map(|v| format!("{v}")).collect(),
                 })
             })
@@ -2680,14 +2717,17 @@ impl VolumetricUiV2 {
                 .inputs
                 .iter()
                 .enumerate()
-                .find_map(|(idx, input)| match input {
-                    OperatorMetadataInput::CBORConfiguration(cddl) => Some((idx, cddl.clone())),
+                .find_map(|(slot, input)| match input {
+                    OperatorMetadataInput::CBORConfiguration(cddl) => {
+                        Some((at(slot), cddl.clone()))
+                    }
                     _ => None,
                 });
         let script_parameter_config = metadata
             .inputs
             .iter()
             .position(|input| matches!(input, OperatorMetadataInput::F64Map))
+            .map(at)
             .filter(|input_idx| {
                 matches!(step.inputs.get(*input_idx), Some(ExecutionInput::Inline(_)))
             })
@@ -2697,8 +2737,8 @@ impl VolumetricUiV2 {
                         .inputs
                         .iter()
                         .enumerate()
-                        .find_map(|(idx, input)| {
-                            ScriptLanguage::of_input(input).map(|language| (idx, language))
+                        .find_map(|(slot, input)| {
+                            ScriptLanguage::of_input(input).map(|language| (at(slot), language))
                         })?;
                 let ExecutionInput::Inline(source) = step.inputs.get(source_input)? else {
                     return None;
@@ -2714,7 +2754,7 @@ impl VolumetricUiV2 {
                 self.build_config_form(
                     step,
                     input_idx,
-                    metadata.input_name(input_idx).map(str::to_string),
+                    metadata.input_label(input_idx, count),
                     &cddl,
                 )
             });
@@ -2723,8 +2763,8 @@ impl VolumetricUiV2 {
             .inputs
             .iter()
             .enumerate()
-            .find_map(|(idx, input)| {
-                ScriptLanguage::of_input(input).map(|language| (idx, language))
+            .find_map(|(slot, input)| {
+                ScriptLanguage::of_input(input).map(|language| (at(slot), language))
             })
             .map(|(input_idx, language)| {
                 let source = match step.inputs.get(input_idx) {
@@ -2751,6 +2791,7 @@ impl VolumetricUiV2 {
             vecs,
             config,
             script,
+            variadic,
             output_name: step.outputs.first().cloned().unwrap_or_default(),
         })
     }
@@ -2991,6 +3032,69 @@ impl VolumetricUiV2 {
         if rebuild_editor {
             self.step_edit = self.build_step_edit(step_idx);
         }
+    }
+
+    /// The open editor's variadic block for `step_idx`, if any.
+    fn edited_variadic_block(&self, step_idx: usize) -> Option<&VariadicBlock> {
+        self.step_edit
+            .as_ref()
+            .filter(|edit| edit.step_idx == step_idx)
+            .and_then(|edit| edit.variadic.as_ref())
+    }
+
+    /// Appends an entry to the edited step's variadic input block, wired to
+    /// the first eligible asset the block doesn't use yet (the first
+    /// eligible asset when all are used; the block's fresh default when
+    /// none exists).
+    fn add_step_variadic_input(&mut self, step_idx: usize) {
+        let Some(block) = self.edited_variadic_block(step_idx) else {
+            return;
+        };
+        let (range, kind, fresh) = (block.range.clone(), block.kind, block.fresh.clone());
+        let Some(step) = self.project.timeline().get(step_idx) else {
+            return;
+        };
+        let input = kind
+            .and_then(|kind| {
+                let used: std::collections::HashSet<&str> = step.inputs[range.clone()]
+                    .iter()
+                    .filter_map(|input| match input {
+                        ExecutionInput::AssetRef(id) => Some(id.as_str()),
+                        ExecutionInput::Inline(_) => None,
+                    })
+                    .collect();
+                let options = step_input_options(self, step_idx, kind);
+                options
+                    .iter()
+                    .find(|id| !used.contains(id.as_str()))
+                    .or(options.first())
+                    .map(|id| ExecutionInput::AssetRef(id.clone()))
+            })
+            .unwrap_or(fresh);
+        self.project.timeline_mut()[step_idx]
+            .inputs
+            .insert(range.end, input);
+        self.mark_project_dirty();
+        self.step_edit = self.build_step_edit(step_idx);
+        self.status = format!("step {} input {} added", step_idx + 1, range.end + 1);
+    }
+
+    /// Drops one entry of the edited step's variadic input block; the block
+    /// keeps at least one entry (the declaration's minimum).
+    fn remove_step_variadic_input(&mut self, step_idx: usize, input_idx: usize) {
+        let Some(range) = self
+            .edited_variadic_block(step_idx)
+            .map(|block| block.range.clone())
+        else {
+            return;
+        };
+        if !range.contains(&input_idx) || range.len() <= 1 {
+            return;
+        }
+        self.project.timeline_mut()[step_idx].inputs.remove(input_idx);
+        self.mark_project_dirty();
+        self.step_edit = self.build_step_edit(step_idx);
+        self.status = format!("step {} input {} removed", step_idx + 1, input_idx + 1);
     }
 
     fn clear_step_f64_map_input(&mut self, step_idx: usize, input_idx: usize) {
@@ -3522,9 +3626,10 @@ impl VolumetricUiV2 {
 
     /// Replaces an imported operator's bytes with the matching bundled
     /// build (the offer surfaced by [`operator_upgrade_offer`]). Steps keep
-    /// referencing the import by id; if the new metadata declares more
-    /// inputs than a step carries, the missing slots are appended with
-    /// defaults (fewer: extras truncated) so upgraded steps stay runnable.
+    /// referencing the import by id; a step whose input count the new
+    /// declaration accepts is left alone, otherwise missing slots are
+    /// appended with defaults (extras truncated) so upgraded steps stay
+    /// runnable.
     fn upgrade_import(&mut self, idx: usize) {
         let Some(import) = self.project.imports().get(idx) else {
             return;
@@ -3547,7 +3652,8 @@ impl VolumetricUiV2 {
 
         let fresh_inputs = operator_step_inputs(&new_metadata, &SlotPrimaries::default());
         for step in self.project.timeline_mut() {
-            if step.operator_id != import_id {
+            if step.operator_id != import_id || new_metadata.accepts_input_count(step.inputs.len())
+            {
                 continue;
             }
             step.inputs.truncate(fresh_inputs.len());
@@ -4241,6 +4347,12 @@ impl App for VolumetricUiV2 {
             parse_step_input_route(route, CLEAR_STEP_F64_MAP_PREFIX)
         {
             self.clear_step_f64_map_input(step_idx, input_idx);
+        } else if let Some(step_idx) = parse_index_route(route, ADD_STEP_INPUT_PREFIX) {
+            self.add_step_variadic_input(step_idx);
+        } else if let Some((step_idx, input_idx)) =
+            parse_step_input_route(route, REMOVE_STEP_INPUT_PREFIX)
+        {
+            self.remove_step_variadic_input(step_idx, input_idx);
         } else if let Some(idx) = parse_index_route(route, SELECT_EXPORT_PREFIX) {
             if let Some(export_id) = self.project.exports().get(idx) {
                 self.selected_export = Some(export_id.clone());
@@ -6401,6 +6513,7 @@ fn step_edit_rows(app: &VolumetricUiV2, step_idx: usize) -> Vec<El> {
         let subspaces = step_input_options(app, step_idx, AssetSlotKind::Subspace);
         let f64_maps = step_input_options(app, step_idx, AssetSlotKind::F64Map);
         rows.push(text("Inputs").muted().caption().semibold());
+        let block = edit.variadic.as_ref();
         for (n, slot) in edit.asset_slots.iter().enumerate() {
             let current = match step.inputs.get(slot.input_idx) {
                 Some(ExecutionInput::AssetRef(id)) => id.as_str(),
@@ -6413,7 +6526,20 @@ fn step_edit_rows(app: &VolumetricUiV2, step_idx: usize) -> Vec<El> {
                 AssetSlotKind::Subspace => &subspaces,
                 AssetSlotKind::F64Map => &f64_maps,
             };
-            rows.push(asset_slot_selector(step_idx, slot, n, current, options));
+            let in_block = block.is_some_and(|block| block.range.contains(&slot.input_idx));
+            let removable = in_block && block.is_some_and(|block| block.range.len() > 1);
+            rows.push(asset_slot_selector(
+                step_idx, slot, n, current, options, removable,
+            ));
+            if in_block && block.is_some_and(|block| block.range.end == slot.input_idx + 1) {
+                rows.push(
+                    button_with_icon("plus", format!("Add {}", asset_slot_kind_label(slot.kind)))
+                        .xsmall()
+                        .secondary()
+                        .width(Size::Fill(1.0))
+                        .key(format!("{ADD_STEP_INPUT_PREFIX}{step_idx}")),
+                );
+            }
         }
     }
 
@@ -6511,18 +6637,38 @@ fn step_input_options(app: &VolumetricUiV2, step_idx: usize, kind: AssetSlotKind
 
 /// An asset input slot: a labelled column of full-width buttons, one per
 /// available asset of the slot's kind, with the current target highlighted.
+/// A removable entry (one of several in a variadic block) carries a remove
+/// button beside its label.
 fn asset_slot_selector(
     step_idx: usize,
     slot: &AssetSlot,
     ordinal: usize,
     current: &str,
     options: &[String],
+    removable: bool,
 ) -> El {
     let label = slot
         .name
         .clone()
         .unwrap_or_else(|| format!("Input {}", ordinal + 1));
-    let mut items = vec![text(label).muted().caption().width(Size::Fill(1.0))];
+    let label = text(label).muted().caption().width(Size::Fill(1.0));
+    let mut items = vec![if removable {
+        row([
+            label,
+            button_with_icon("x", "")
+                .xsmall()
+                .secondary()
+                .key(format!(
+                    "{REMOVE_STEP_INPUT_PREFIX}{step_idx}:{}",
+                    slot.input_idx
+                )),
+        ])
+        .gap(tokens::SPACE_1)
+        .align(Align::Center)
+        .width(Size::Fill(1.0))
+    } else {
+        label
+    }];
     if slot.kind == AssetSlotKind::F64Map {
         items.push(if current.is_empty() {
             text("Inline F64Map").muted().caption()
@@ -6790,13 +6936,13 @@ fn step_rows(app: &VolumetricUiV2) -> Vec<El> {
             for (input_idx, input) in step.inputs.iter().enumerate() {
                 let label = metadata
                     .as_ref()
-                    .and_then(|m| m.input_name(input_idx))
-                    .unwrap_or("input");
+                    .and_then(|m| m.input_label(input_idx, step.inputs.len()))
+                    .unwrap_or_else(|| "input".to_string());
                 let value = match input {
                     ExecutionInput::AssetRef(id) => id.clone(),
                     inline => inline.display(),
                 };
-                rows.push(project_note_row(label, &value));
+                rows.push(project_note_row(&label, &value));
             }
             for output in &step.outputs {
                 rows.push(project_note_row("output", output));
@@ -7290,6 +7436,143 @@ mod tests {
     /// handlers don't read event-time geometry, so tests don't need one.
     fn dispatch(app: &mut VolumetricUiV2, event: UiEvent) {
         app.on_event(event, &EventCx::new());
+    }
+
+    /// A minimal operator module (WAT, which the executor accepts) whose
+    /// metadata declares slot 0 variadic: one or more models, then a config.
+    fn variadic_operator_wat() -> Vec<u8> {
+        let metadata = OperatorMetadata {
+            name: "nary_test".to_string(),
+            version: "0.0.0".to_string(),
+            display_name: String::new(),
+            description: String::new(),
+            category: String::new(),
+            icon_svg: String::new(),
+            docs: String::new(),
+            inputs: vec![
+                OperatorMetadataInput::ModelWASM,
+                OperatorMetadataInput::CBORConfiguration(
+                    "{ op: tstr .default \"union\" }".to_string(),
+                ),
+            ],
+            variadic_input: Some(0),
+            input_names: vec!["Model".to_string(), "Config".to_string()],
+            outputs: vec![volumetric::OperatorMetadataOutput::ModelWASM],
+            output_names: vec![],
+        };
+        let cbor = volumetric::encode_metadata(&metadata);
+        let data: String = cbor.iter().map(|b| format!("\\{b:02x}")).collect();
+        format!(
+            r#"(module
+                (memory (export "memory") 1)
+                (data (i32.const 1024) "{data}")
+                (func (export "run"))
+                (func (export "get_metadata") (result i64)
+                    (i64.or (i64.const 1024) (i64.shl (i64.const {}) (i64.const 32)))))"#,
+            cbor.len()
+        )
+        .into_bytes()
+    }
+
+    /// The step editor grows and shrinks a variadic input block: Add wires
+    /// the first model the block doesn't use yet and the slots declared
+    /// after the block shift along; Remove drops an entry but never the
+    /// last one, and never a fixed slot.
+    #[test]
+    fn variadic_block_grows_and_shrinks_in_the_step_editor() {
+        // Start empty: the default project seeds a sphere import, which
+        // would otherwise be the picker's first unused asset.
+        let mut app = VolumetricUiV2 {
+            project: Project::new(),
+            ..Default::default()
+        };
+        let sphere = volumetric_assets::get_model("simple_sphere_model")
+            .expect("bundled sphere model")
+            .bytes
+            .to_vec();
+        app.project
+            .imports_mut()
+            .push(volumetric::ImportedAsset::operator(
+                "nary".to_string(),
+                variadic_operator_wat(),
+            ));
+        for id in ["a", "b", "c"] {
+            app.project
+                .imports_mut()
+                .push(volumetric::ImportedAsset::model(id.to_string(), sphere.clone()));
+        }
+        app.project.timeline_mut().push(volumetric::ExecutionStep {
+            operator_id: "nary".to_string(),
+            inputs: vec![
+                ExecutionInput::AssetRef("a".to_string()),
+                ExecutionInput::Inline(Vec::new()),
+            ],
+            outputs: vec!["out".to_string()],
+        });
+        app.step_edit = app.build_step_edit(0);
+
+        let edit = app.step_edit.as_ref().expect("step editor");
+        let slots: Vec<_> = edit
+            .asset_slots
+            .iter()
+            .map(|slot| (slot.input_idx, slot.name.clone()))
+            .collect();
+        assert_eq!(slots, vec![(0, Some("Model 1".to_string()))]);
+        let block = edit.variadic.as_ref().expect("variadic block");
+        assert_eq!((block.range.clone(), block.kind), (0..1, Some(AssetSlotKind::Model)));
+        assert_eq!(edit.config.as_ref().map(|config| config.input_idx), Some(1));
+
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{ADD_STEP_INPUT_PREFIX}0")),
+        );
+        let inputs = &app.project.timeline()[0].inputs;
+        assert_eq!(inputs.len(), 3);
+        assert!(
+            matches!(&inputs[1], ExecutionInput::AssetRef(id) if id == "b"),
+            "{inputs:?}"
+        );
+        assert!(matches!(&inputs[2], ExecutionInput::Inline(_)));
+        let edit = app.step_edit.as_ref().expect("editor rebuilt");
+        let names: Vec<_> = edit.asset_slots.iter().map(|slot| slot.name.clone()).collect();
+        assert_eq!(
+            names,
+            vec![Some("Model 1".to_string()), Some("Model 2".to_string())]
+        );
+        assert_eq!(edit.variadic.as_ref().map(|block| block.range.clone()), Some(0..2));
+        assert_eq!(edit.config.as_ref().map(|config| config.input_idx), Some(2));
+
+        app.add_step_variadic_input(0);
+        assert!(matches!(
+            &app.project.timeline()[0].inputs[2],
+            ExecutionInput::AssetRef(id) if id == "c"
+        ));
+
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{REMOVE_STEP_INPUT_PREFIX}0:0")),
+        );
+        let wired = |app: &VolumetricUiV2| -> Vec<String> {
+            app.project.timeline()[0]
+                .inputs
+                .iter()
+                .filter_map(|input| match input {
+                    ExecutionInput::AssetRef(id) => Some(id.clone()),
+                    ExecutionInput::Inline(_) => None,
+                })
+                .collect()
+        };
+        assert_eq!(wired(&app), vec!["b", "c"]);
+
+        app.remove_step_variadic_input(0, 1);
+        app.remove_step_variadic_input(0, 0);
+        assert_eq!(wired(&app), vec!["b"], "the block keeps its last entry");
+        app.remove_step_variadic_input(0, 1);
+        assert_eq!(
+            app.project.timeline()[0].inputs.len(),
+            2,
+            "the config slot is not part of the block"
+        );
     }
 
     /// Click the Add-menu entry for the named bundled model.

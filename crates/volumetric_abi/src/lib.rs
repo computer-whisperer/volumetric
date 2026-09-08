@@ -448,7 +448,7 @@ impl OperatorMetadata {
     }
 
     /// The variadic slot index, when it names a declared slot.
-    fn variadic_slot(&self) -> Option<usize> {
+    pub fn variadic_slot(&self) -> Option<usize> {
         self.variadic_input.filter(|&slot| slot < self.inputs.len())
     }
 
