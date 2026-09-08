@@ -11,21 +11,7 @@
 //! the template's channel-format export is dropped (the model is
 //! occupancy-only).
 
-fn const_i32_return(module: &walrus::Module, function: walrus::FunctionId) -> Option<i32> {
-    let local = match &module.funcs.get(function).kind {
-        walrus::FunctionKind::Local(local) => local,
-        _ => return None,
-    };
-    let block = local.block(local.entry_block());
-    match block.instrs.as_slice() {
-        [(walrus::ir::Instr::Const(constant), _)] => match constant.value {
-            walrus::ir::Value::I32(value) => Some(value),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
+use model_wrap_core::const_i32_return;
 fn take_slot_export(module: &mut walrus::Module, name: &str) -> Result<i32, String> {
     let export = module
         .exports

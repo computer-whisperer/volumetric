@@ -4,22 +4,7 @@
 //! bakes contours: `text_model_operator`, `html_card_operator`,
 //! `path_sketch_operator`.
 
-/// Read the constant a trivial `() -> i32` function returns.
-fn const_i32_return(module: &walrus::Module, function: walrus::FunctionId) -> Option<i32> {
-    let local = match &module.funcs.get(function).kind {
-        walrus::FunctionKind::Local(local) => local,
-        _ => return None,
-    };
-    let block = local.block(local.entry_block());
-    match block.instrs.as_slice() {
-        [(walrus::ir::Instr::Const(constant), _)] => match constant.value {
-            walrus::ir::Value::I32(value) => Some(value),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
+use model_wrap_core::const_i32_return;
 /// Patch `payload` (from [`crate::build_payload`]) into `template`, the
 /// `outline_model_template` binary the calling operator embeds. The payload
 /// lands in freshly reserved memory pages, its base address is written into

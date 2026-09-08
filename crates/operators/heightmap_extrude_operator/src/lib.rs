@@ -47,6 +47,7 @@
 
 use walrus::{FunctionBuilder, FunctionId, MemoryId, Module, ModuleConfig, ValType};
 
+use model_wrap_core::const_i32_return;
 use volumetric_abi::{OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput};
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -85,25 +86,6 @@ const WRAPPED_FUNCTIONS: &[&str] = &["get_dimensions", "get_io_ptr", "get_bounds
 
 /// Channel exports removed outright: the extruded model is occupancy-only.
 const DROPPED_FUNCTIONS: &[&str] = &["get_sample_format", "sample_channels"];
-
-/// Read the constant a trivial `() -> i32` function returns, if its body is
-/// a single `i32.const`. Every model generator emits `get_dimensions` this
-/// way, so this is how the operator checks the input is 2D without being
-/// able to instantiate it.
-fn const_i32_return(module: &Module, func_id: FunctionId) -> Option<i32> {
-    let local = match &module.funcs.get(func_id).kind {
-        walrus::FunctionKind::Local(local) => local,
-        _ => return None,
-    };
-    let block = local.block(local.entry_block());
-    match block.instrs.as_slice() {
-        [(walrus::ir::Instr::Const(c), _)] => match c.value {
-            walrus::ir::Value::I32(v) => Some(v),
-            _ => None,
-        },
-        _ => None,
-    }
-}
 
 /// Transform the input 2D field WASM into its heightmap extrusion.
 fn transform_wasm(input_bytes: &[u8], cfg: HeightmapExtrudeConfig) -> Result<Vec<u8>, String> {

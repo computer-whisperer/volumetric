@@ -60,6 +60,7 @@
 //!    crates/operators/strut_model_operator/template/
 //! ```
 
+use model_wrap_core::const_i32_return;
 use strut_model_core::{Capsule, ChannelPayload};
 use volumetric_abi::fea::{FeaElementKind, FeaField, FeaMesh, decode_fea_mesh};
 use volumetric_abi::host::{post_output, read_input, report_error};
@@ -67,7 +68,7 @@ use volumetric_abi::{
     ChannelKind, OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput, SampleChannel,
     SampleFormat, encode_sample_format,
 };
-use walrus::{FunctionId, Module, ModuleConfig};
+use walrus::{Module, ModuleConfig};
 
 /// Most passthrough channels the 3D model IO buffer can carry: it holds
 /// `2 * dims` f64s, so the output half fits `dims * 2 = 6` f32s at `dims = 3`.
@@ -326,22 +327,6 @@ fn realize(mesh: &FeaMesh, config: &StrutModelConfig) -> Result<Realized, String
         channel_names,
         channel_values,
     })
-}
-
-/// Read the constant a trivial `() -> i32` function returns.
-fn const_i32_return(module: &Module, func_id: FunctionId) -> Option<i32> {
-    let local = match &module.funcs.get(func_id).kind {
-        walrus::FunctionKind::Local(local) => local,
-        _ => return None,
-    };
-    let block = local.block(local.entry_block());
-    match block.instrs.as_slice() {
-        [(walrus::ir::Instr::Const(c), _)] => match c.value {
-            walrus::ir::Value::I32(v) => Some(v),
-            _ => None,
-        },
-        _ => None,
-    }
 }
 
 fn patch_template(payload: &[u8]) -> Result<Vec<u8>, String> {

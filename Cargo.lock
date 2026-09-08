@@ -397,6 +397,7 @@ dependencies = [
  "ciborium",
  "gridfield_model_core",
  "model_merge_core",
+ "model_wrap_core",
  "serde",
  "volumetric_abi",
  "walrus",
@@ -618,6 +619,7 @@ version = "0.1.0"
 dependencies = [
  "ciborium",
  "model_merge_core",
+ "model_wrap_core",
  "serde",
  "volumetric_abi",
  "walrus",
@@ -1479,6 +1481,7 @@ name = "extrude_operator"
 version = "0.1.0"
 dependencies = [
  "ciborium",
+ "model_wrap_core",
  "serde",
  "volumetric_abi",
  "walrus",
@@ -1622,6 +1625,7 @@ dependencies = [
  "ciborium",
  "deform_model_core",
  "model_merge_core",
+ "model_wrap_core",
  "serde",
  "volumetric_abi",
  "walrus",
@@ -1634,6 +1638,7 @@ version = "0.1.0"
 dependencies = [
  "ciborium",
  "fea_core",
+ "model_wrap_core",
  "serde",
  "volumetric_abi",
  "walrus",
@@ -2429,6 +2434,7 @@ name = "heightmap_extrude_operator"
 version = "0.1.0"
 dependencies = [
  "ciborium",
+ "model_wrap_core",
  "serde",
  "volumetric_abi",
  "walrus",
@@ -2600,6 +2606,7 @@ dependencies = [
  "ciborium",
  "gridfield_model_core",
  "image",
+ "model_wrap_core",
  "serde",
  "volumetric_abi",
  "walrus",
@@ -2710,6 +2717,7 @@ version = "0.1.0"
 dependencies = [
  "ciborium",
  "model_merge_core",
+ "model_wrap_core",
  "serde",
  "volumetric_abi",
  "voxelmask_model_core",
@@ -2877,6 +2885,7 @@ version = "0.1.0"
 dependencies = [
  "ciborium",
  "model_merge_core",
+ "model_wrap_core",
  "serde",
  "volumetric_abi",
  "walrus",
@@ -3129,6 +3138,7 @@ name = "mesh_height_operator"
 version = "0.1.0"
 dependencies = [
  "ciborium",
+ "model_wrap_core",
  "serde",
  "trimesh_model_core",
  "volumetric_abi",
@@ -3159,6 +3169,7 @@ dependencies = [
 name = "mesh_to_model_operator"
 version = "0.1.0"
 dependencies = [
+ "model_wrap_core",
  "trimesh_model_core",
  "volumetric_abi",
  "walrus",
@@ -3383,6 +3394,7 @@ dependencies = [
 name = "ndfield_model_core"
 version = "0.1.0"
 dependencies = [
+ "model_wrap_core",
  "walrus",
 ]
 
@@ -3909,6 +3921,7 @@ dependencies = [
 name = "outline_model_core"
 version = "0.1.0"
 dependencies = [
+ "model_wrap_core",
  "walrus",
 ]
 
@@ -4605,6 +4618,7 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 name = "revolve_operator"
 version = "0.1.0"
 dependencies = [
+ "model_wrap_core",
  "volumetric_abi",
  "walrus",
 ]
@@ -4795,6 +4809,7 @@ version = "0.1.0"
 dependencies = [
  "ciborium",
  "model_merge_core",
+ "model_wrap_core",
  "ndfield_model_core",
  "serde",
  "volumetric_abi",
@@ -5007,6 +5022,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 name = "slice_operator"
 version = "0.1.0"
 dependencies = [
+ "model_wrap_core",
  "volumetric_abi",
  "walrus",
 ]
@@ -5122,6 +5138,7 @@ version = "0.3.0"
 dependencies = [
  "brep_core",
  "ciborium",
+ "model_wrap_core",
  "serde",
  "volumetric_abi",
  "walrus",
@@ -5160,6 +5177,7 @@ name = "strut_model_operator"
 version = "0.1.0"
 dependencies = [
  "ciborium",
+ "model_wrap_core",
  "serde",
  "strut_model_core",
  "volumetric_abi",

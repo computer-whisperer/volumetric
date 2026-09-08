@@ -29,13 +29,14 @@
 //!
 //! Output 0: ModelWASM with the two-channel sample format.
 
+use model_wrap_core::const_i32_return;
 use volumetric_abi::fea::{FeaMesh, decode_fea_mesh};
 use volumetric_abi::host::{post_output, read_input, report_error};
 use volumetric_abi::{
     ChannelKind, OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput, SampleChannel,
     SampleFormat, encode_sample_format,
 };
-use walrus::{FunctionBuilder, FunctionId, MemoryId, Module, ModuleConfig, ValType};
+use walrus::{FunctionBuilder, MemoryId, Module, ModuleConfig, ValType};
 
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(default)]
@@ -127,23 +128,6 @@ fn build_density_grid(mesh: &FeaMesh, config: &DensityConfig) -> Result<DensityG
         dims,
         values,
     })
-}
-
-/// Read the constant a trivial `() -> i32` function returns (how every model
-/// generator emits `get_dimensions`).
-fn const_i32_return(module: &Module, func_id: FunctionId) -> Option<i32> {
-    let local = match &module.funcs.get(func_id).kind {
-        walrus::FunctionKind::Local(local) => local,
-        _ => return None,
-    };
-    let block = local.block(local.entry_block());
-    match block.instrs.as_slice() {
-        [(walrus::ir::Instr::Const(c), _)] => match c.value {
-            walrus::ir::Value::I32(v) => Some(v),
-            _ => None,
-        },
-        _ => None,
-    }
 }
 
 /// Wrap the model with the density channel. See the module docs.

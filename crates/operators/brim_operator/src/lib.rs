@@ -84,6 +84,7 @@ use wasm_encoder::{BlockType, ExportKind, ExportSection, Function, Instruction, 
 use model_merge_core::{
     MergeSections, OffsetReencoder, count_sections, find_function_export, parse_model_exports,
 };
+use model_wrap_core::const_i32_return;
 use volumetric_abi::host::{
     input_model_bounds, input_model_dimensions, input_model_sample, post_output, read_input,
     report_error,
@@ -579,22 +580,6 @@ fn crop_field(field: Vec<f32>, grid: ScanGrid) -> Option<(Vec<f32>, ScanGrid)> {
 // ---------------------------------------------------------------------------
 // Template patching and model merging
 // ---------------------------------------------------------------------------
-
-/// Read the constant a trivial `() -> i32` function returns.
-fn const_i32_return(module: &walrus::Module, func_id: walrus::FunctionId) -> Option<i32> {
-    let local = match &module.funcs.get(func_id).kind {
-        walrus::FunctionKind::Local(local) => local,
-        _ => return None,
-    };
-    let block = local.block(local.entry_block());
-    match block.instrs.as_slice() {
-        [(walrus::ir::Instr::Const(c), _)] => match c.value {
-            walrus::ir::Value::I32(v) => Some(v),
-            _ => None,
-        },
-        _ => None,
-    }
-}
 
 /// The patch slot's address, then drop the helper export — it is not part
 /// of the Model ABI.

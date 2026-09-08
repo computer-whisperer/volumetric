@@ -10,6 +10,7 @@ crate-type = ["cdylib"]
 volumetric_abi = { path = "../../volumetric_abi" }
 gridfield_model_core = { path = "../../gridfield_model_core" }
 walrus = "0.26"
+model_wrap_core = { path = "../../model_wrap_core" }
 serde = { version = "1", features = ["derive"] }
 ciborium = "0.2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif"] }

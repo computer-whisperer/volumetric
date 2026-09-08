@@ -25,6 +25,7 @@ use model_merge_core::{
     MergeSections, OffsetReencoder, count_sections, find_function_export, find_memory_export,
     parse_model_exports,
 };
+use model_wrap_core::const_i32_return;
 use volumetric_abi::host::{
     cancelled, input_model_bounds, input_model_dimensions, input_model_sample, post_output,
     read_input, report_error,
@@ -73,21 +74,6 @@ where
 // ---------------------------------------------------------------------------
 // Generated-model template patching and merge glue
 // ---------------------------------------------------------------------------
-
-fn const_i32_return(module: &walrus::Module, function: walrus::FunctionId) -> Option<i32> {
-    let local = match &module.funcs.get(function).kind {
-        walrus::FunctionKind::Local(local) => local,
-        _ => return None,
-    };
-    let block = local.block(local.entry_block());
-    match block.instrs.as_slice() {
-        [(walrus::ir::Instr::Const(constant), _)] => match constant.value {
-            walrus::ir::Value::I32(value) => Some(value),
-            _ => None,
-        },
-        _ => None,
-    }
-}
 
 fn take_slot_export(module: &mut walrus::Module, name: &str) -> Result<i32, String> {
     let export = module

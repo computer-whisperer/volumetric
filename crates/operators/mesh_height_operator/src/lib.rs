@@ -35,10 +35,11 @@
 //!    crates/operators/mesh_height_operator/template/
 //! ```
 
+use model_wrap_core::const_i32_return;
 use volumetric_abi::host::{post_output, read_input, report_error};
 use volumetric_abi::trimesh::decode_tri_mesh;
 use volumetric_abi::{OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput};
-use walrus::{FunctionId, Module, ModuleConfig};
+use walrus::{Module, ModuleConfig};
 
 /// The prebuilt template module (see the module docs for regeneration).
 const TEMPLATE: &[u8] = include_bytes!("../template/trimesh_height_model_template.wasm");
@@ -92,22 +93,6 @@ impl HeightConfig {
         out[4..8].copy_from_slice(&surface.to_le_bytes());
         out[8..12].copy_from_slice(&(self.miss as f32).to_le_bytes());
         Ok(out)
-    }
-}
-
-/// Read the constant a trivial `() -> i32` function returns.
-fn const_i32_return(module: &Module, func_id: FunctionId) -> Option<i32> {
-    let local = match &module.funcs.get(func_id).kind {
-        walrus::FunctionKind::Local(local) => local,
-        _ => return None,
-    };
-    let block = local.block(local.entry_block());
-    match block.instrs.as_slice() {
-        [(walrus::ir::Instr::Const(c), _)] => match c.value {
-            walrus::ir::Value::I32(v) => Some(v),
-            _ => None,
-        },
-        _ => None,
     }
 }
 

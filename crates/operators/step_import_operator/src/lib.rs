@@ -32,13 +32,14 @@
 //!    crates/operators/step_import_operator/template/
 //! ```
 
+use model_wrap_core::const_i32_return;
 pub mod convert;
 pub mod entities;
 pub mod p21;
 pub mod style;
 
 use brep_core::ir::BRepModel;
-use walrus::{FunctionId, Module, ModuleConfig};
+use walrus::{Module, ModuleConfig};
 
 /// The prebuilt template module (see the module docs for regeneration).
 const TEMPLATE: &[u8] = include_bytes!("../template/brep_model_template.wasm");
@@ -97,22 +98,6 @@ pub fn import(step_text: &str, cfg: &StepConfig) -> Result<BRepModel, String> {
         // origin" means.
     }
     Ok(model)
-}
-
-/// Read the constant a trivial `() -> i32` function returns.
-fn const_i32_return(module: &Module, func_id: FunctionId) -> Option<i32> {
-    let local = match &module.funcs.get(func_id).kind {
-        walrus::FunctionKind::Local(local) => local,
-        _ => return None,
-    };
-    let block = local.block(local.entry_block());
-    match block.instrs.as_slice() {
-        [(walrus::ir::Instr::Const(c), _)] => match c.value {
-            walrus::ir::Value::I32(v) => Some(v),
-            _ => None,
-        },
-        _ => None,
-    }
 }
 
 /// Patch a `brep_core` payload into the embedded template. `has_color`

@@ -13,4 +13,5 @@ model_merge_core = { path = "../../model_merge_core" }
 serde = { version = "1", features = ["derive"] }
 ciborium = "0.2"
 walrus = "0.26"
+model_wrap_core = { path = "../../model_wrap_core" }
 wasm-encoder = { version = "0.248", features = ["wasmparser"] }

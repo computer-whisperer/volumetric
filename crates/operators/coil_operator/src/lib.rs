@@ -33,6 +33,7 @@ use model_merge_core::{
     MergeSections, OffsetReencoder, count_sections, find_function_export, find_memory_export,
     parse_model_exports,
 };
+use model_wrap_core::const_i32_return;
 use volumetric_abi::host::{post_output, read_input, report_error};
 use volumetric_abi::{OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput};
 
@@ -55,22 +56,6 @@ impl Default for CoilConfig {
             inner_radius: 0.005,
             gap: 0.001,
         }
-    }
-}
-
-/// Read the constant a trivial `() -> i32` function returns.
-fn const_i32_return(module: &walrus::Module, func_id: walrus::FunctionId) -> Option<i32> {
-    let local = match &module.funcs.get(func_id).kind {
-        walrus::FunctionKind::Local(local) => local,
-        _ => return None,
-    };
-    let block = local.block(local.entry_block());
-    match block.instrs.as_slice() {
-        [(walrus::ir::Instr::Const(c), _)] => match c.value {
-            walrus::ir::Value::I32(v) => Some(v),
-            _ => None,
-        },
-        _ => None,
     }
 }
 

@@ -90,6 +90,7 @@
 //! with the input bounds — outside it the mask reads 0, so those bounds
 //! are exact.
 
+use model_wrap_core::const_i32_return;
 mod discovery;
 
 use wasm_encoder::{BlockType, ExportKind, ExportSection, Function, Instruction, MemArg, ValType};
@@ -658,22 +659,6 @@ impl<'g> MaskAccumulator<'g> {
 // ---------------------------------------------------------------------------
 // Template patching and model merging
 // ---------------------------------------------------------------------------
-
-/// Read the constant a trivial `() -> i32` function returns.
-fn const_i32_return(module: &walrus::Module, func_id: walrus::FunctionId) -> Option<i32> {
-    let local = match &module.funcs.get(func_id).kind {
-        walrus::FunctionKind::Local(local) => local,
-        _ => return None,
-    };
-    let block = local.block(local.entry_block());
-    match block.instrs.as_slice() {
-        [(walrus::ir::Instr::Const(c), _)] => match c.value {
-            walrus::ir::Value::I32(v) => Some(v),
-            _ => None,
-        },
-        _ => None,
-    }
-}
 
 /// The patch slot's address, then drop the helper export — the merged
 /// module exports only the glue and the input's ABI surface.
