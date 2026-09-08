@@ -20,6 +20,7 @@ members = [
     "crates/models/mandelbulb_model",
     "crates/models/density_gradient_model",
     "crates/operators/translate_operator",
+    "crates/operators/pattern_operator",
     "crates/operators/boolean_operator",
     "crates/operators/rotation_operator",
     "crates/operators/scale_operator",

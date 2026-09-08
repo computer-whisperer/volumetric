@@ -26,8 +26,10 @@ Body:
   the cuts stay crisp.
 
 Cuts (all subtract from the rounded body):
-- Wheel wells: four flat-cap cylinders r 10.5 along z, |z| 9..20, at
-  the axle positions (x +-25, y 9). Central spine z -9..9 stays solid.
+- Wheel wells: one flat-cap cylinder r 10.5 along z, z 9..20, at the
+  front-right axle position (x 25, y 9), patterned to all four corners
+  (mirror across z = 0, then repeated 50 mm back). Central spine z -9..9
+  stays solid.
 - Side windows: a two-subpath sketch (x, y) extruded z -25..25, minus
   an inner slab |z| <= 14.8, leaving 1.2 mm-deep recesses on both flanks.
 - Windscreen / rear window: axis-aligned prisms rotated about z to the
@@ -35,14 +37,15 @@ Cuts (all subtract from the rounded body):
   half sits outside, the inner half recesses 1.2 mm.
 
 Additions (union):
-- Axles: cylinders r 1.5 along z, z -17.5..17.5, at (+-25, 9).
+- Axles: a cylinder r 1.5 along z, z -17.5..17.5, at (25, 9), repeated
+  at x -25.
 - Wheels: a tyre section sketch (r, a) revolved about z at the origin:
   tyre r 9, width 8, r 1.5 shoulder arcs, two tread grooves, a hub
-  dish on the outer face with a centre boss. Right wheels are
-  translated to z +14; left wheels are `scale` sz = -1 first (mirror)
-  so the dish faces out.
-- Headlights: round-cap cylinders r 2.5 along x at the nose, y 17,
-  z +-9.
+  dish on the outer face with a centre boss. The wheel is translated to
+  the front-right hub (25, 9, 14) and patterned like the wells; the
+  mirror across z = 0 turns the dish outward on the left side.
+- Headlights: a round-cap cylinder r 2.5 along x at the nose, y 17,
+  z 9, mirrored across z = 0.
 
 Exports: `body` (rounded, cut body), `wheel` (one wheel at the origin),
 `car` (the assembly).
@@ -69,8 +72,11 @@ on a plane at x = 45 mm whose basis order gives a -x normal, extruded
 - An optional operator input (the revolve axis) is left unwired with
   `--input none` on `project-add-op`.
 - Booleans take any number of models before the config (a variadic
-  slot; repeat `--input`), so the four wheel wells, the five body cuts
-  and the eight-part assembly are one step each instead of chains.
+  slot; repeat `--input`), so the five body cuts and the four-part
+  assembly are one step each instead of chains.
+- Symmetric parts are stated once: `pattern_operator` places the wheel
+  well, wheel, axle and headlight copies (mirror across the centre plane
+  and a linear repeat to the rear axle) as one single-memory step each.
 - Operator modules are shared between steps that run the same build
   (`Project::insert_operation` reuses a byte-identical import, and
   loading merges duplicates from older files), so this project is a

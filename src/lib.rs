@@ -1105,6 +1105,7 @@ impl Project {
             "translate_operator" => "translated",
             "rotation_operator" => "rotated",
             "scale_operator" => "scaled",
+            "pattern_operator" => "patterned",
             "boolean_operator" => "boolean_result",
             "lua_script_operator" | "wgsl_script_operator" => "scripted",
             _ => {

@@ -29,13 +29,12 @@ op --operator boolean_operator --input asset:side_solid --input asset:plan_solid
 op --operator offset_operator --input asset:body_sharp --input 'json:{"distance":-0.0015,"resolution":256}' --output-id body_eroded --no-export
 op --operator offset_operator --input asset:body_eroded --input 'json:{"distance":0.0015,"resolution":256}' --output-id body_round --no-export
 
-# --- Wheel wells: per-side flat cylinders r 10.5 along z at the axle lines.
+# --- Wheel wells: one flat cylinder r 10.5 along z at the front-right axle
+# line, mirrored across the centre plane and repeated at the rear axle.
+FOUR_CORNERS='json:{"mirror":{"axis":"z"},"linear":{"count":2,"dx":-0.05}}'
 WELL='json:{"radius":0.0105,"cap":"flat"}'
-op --operator cylinder_operator --input "$WELL" --input 'json:[0.025,0.009,0.009]'  --input 'json:[0.025,0.009,0.020]'  --output-id well_fr --no-export
-op --operator cylinder_operator --input "$WELL" --input 'json:[0.025,0.009,-0.009]' --input 'json:[0.025,0.009,-0.020]' --output-id well_fl --no-export
-op --operator cylinder_operator --input "$WELL" --input 'json:[-0.025,0.009,0.009]' --input 'json:[-0.025,0.009,0.020]' --output-id well_rr --no-export
-op --operator cylinder_operator --input "$WELL" --input 'json:[-0.025,0.009,-0.009]' --input 'json:[-0.025,0.009,-0.020]' --output-id well_rl --no-export
-op --operator boolean_operator --input asset:well_fr --input asset:well_fl --input asset:well_rr --input asset:well_rl --input "$UNION" --output-id wells --no-export
+op --operator cylinder_operator --input "$WELL" --input 'json:[0.025,0.009,0.009]' --input 'json:[0.025,0.009,0.020]' --output-id well_fr --no-export
+op --operator pattern_operator --input asset:well_fr --input "$FOUR_CORNERS" --output-id wells --no-export
 
 # --- Side window recesses: sketch extruded through, minus the inner slab.
 # Side windows (x, y): rear rectangle, front window raked parallel to the windscreen.
@@ -63,27 +62,25 @@ op --operator extrude_operator --input asset:grille_sketch --input 'json:{"heigh
 # One subtract step: the rounded body minus every cut.
 op --operator boolean_operator --input asset:body_round --input asset:wells --input asset:window_recess --input asset:windscreen --input asset:rear_window --input asset:grille --input "$SUB" --output-id body
 
-# --- Axles and headlights.
+# --- Axles and headlights: the front axle repeated at the rear, the right
+# headlight mirrored to the left.
 AXLE='json:{"radius":0.0015,"cap":"flat"}'
-op --operator cylinder_operator --input "$AXLE" --input 'json:[0.025,0.009,-0.0175]'  --input 'json:[0.025,0.009,0.0175]'  --output-id axle_f --no-export
-op --operator cylinder_operator --input "$AXLE" --input 'json:[-0.025,0.009,-0.0175]' --input 'json:[-0.025,0.009,0.0175]' --output-id axle_r --no-export
+op --operator cylinder_operator --input "$AXLE" --input 'json:[0.025,0.009,-0.0175]' --input 'json:[0.025,0.009,0.0175]' --output-id axle_f --no-export
+op --operator pattern_operator --input asset:axle_f --input 'json:{"linear":{"count":2,"dx":-0.05}}' --output-id axles --no-export
 LAMP='json:{"radius":0.0025,"cap":"round"}'
-op --operator cylinder_operator --input "$LAMP" --input 'json:[0.036,0.017,0.009]'  --input 'json:[0.0395,0.017,0.009]'  --output-id lamp_r --no-export
-op --operator cylinder_operator --input "$LAMP" --input 'json:[0.036,0.017,-0.009]' --input 'json:[0.0395,0.017,-0.009]' --output-id lamp_l --no-export
+op --operator cylinder_operator --input "$LAMP" --input 'json:[0.036,0.017,0.009]' --input 'json:[0.0395,0.017,0.009]' --output-id lamp_r --no-export
+op --operator pattern_operator --input asset:lamp_r --input 'json:{"mirror":{"axis":"z"}}' --output-id lamps --no-export
 
-# --- Wheels: revolve about z at the origin (outer face +z), mirror for the
-# left side, translate to the four hubs.
+# --- Wheels: revolve about z at the origin (outer face +z), move to the
+# front-right hub, then mirror across the centre plane and repeat at the rear.
 # Tyre section (r, a): r 9, width 8, r1.5 shoulders, two 1.2 x 1.0 grooves,
 # a hub dish 1.2 deep on the outer (+a) face with a centre boss left standing.
 op --operator path_sketch_operator --input 'json:{"path":"M 0 -0.004 H 0.0075 A 0.0015 0.0015 0 0 1 0.009 -0.0025 V -0.002 H 0.008 V -0.0008 H 0.009 V 0.0008 H 0.008 V 0.002 H 0.009 V 0.0025 A 0.0015 0.0015 0 0 1 0.0075 0.004 H 0.0055 V 0.0028 H 0.0018 V 0.004 H 0 Z"}' --output-id wheel_sketch --no-export
 op --operator revolve_operator --input asset:wheel_sketch --input none --output-id wheel
-op --operator scale_operator --input asset:wheel --input 'json:{"sz":-1.0}' --output-id wheel_mirrored --no-export
 op --operator translate_operator --input asset:wheel --input 'json:{"dx":0.025,"dy":0.009,"dz":0.014}' --output-id wheel_fr --no-export
-op --operator translate_operator --input asset:wheel --input 'json:{"dx":-0.025,"dy":0.009,"dz":0.014}' --output-id wheel_rr --no-export
-op --operator translate_operator --input asset:wheel_mirrored --input 'json:{"dx":0.025,"dy":0.009,"dz":-0.014}' --output-id wheel_fl --no-export
-op --operator translate_operator --input asset:wheel_mirrored --input 'json:{"dx":-0.025,"dy":0.009,"dz":-0.014}' --output-id wheel_rl --no-export
+op --operator pattern_operator --input asset:wheel_fr --input "$FOUR_CORNERS" --output-id wheels --no-export
 
 # --- Assembly: one union of the body and every attached part.
-op --operator boolean_operator --input asset:body --input asset:axle_f --input asset:axle_r --input asset:lamp_r --input asset:lamp_l --input asset:wheel_fr --input asset:wheel_rr --input asset:wheel_fl --input asset:wheel_rl --input "$UNION" --output-id car
+op --operator boolean_operator --input asset:body --input asset:axles --input asset:lamps --input asset:wheels --input "$UNION" --output-id car
 
 $V project-run --project $P

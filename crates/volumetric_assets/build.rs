@@ -27,6 +27,7 @@ const OPERATORS: &[&str] = &[
     "translate_operator",
     "rotation_operator",
     "scale_operator",
+    "pattern_operator",
     "lua_script_operator",
     "wgsl_script_operator",
     "f64_map_merge_operator",
