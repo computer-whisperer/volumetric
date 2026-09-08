@@ -1486,7 +1486,7 @@ dependencies = [
 
 [[package]]
 name = "f64_map_merge_operator"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "volumetric_abi",
 ]
@@ -2665,7 +2665,7 @@ dependencies = [
 
 [[package]]
 name = "intersect_operator"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ciborium",
  "serde",
@@ -3137,7 +3137,7 @@ dependencies = [
 
 [[package]]
 name = "mesh_merge_operator"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ciborium",
  "mesh_edit_core",
@@ -5057,7 +5057,7 @@ dependencies = [
 
 [[package]]
 name = "span_operator"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ciborium",
  "serde",

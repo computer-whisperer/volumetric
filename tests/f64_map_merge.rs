@@ -36,20 +36,16 @@ fn map(entries: &[(&str, f64)]) -> Vec<u8> {
 }
 
 #[test]
-fn metadata_declares_five_maps_and_a_typed_map_output() {
+fn metadata_declares_a_variadic_map_slot_and_a_typed_map_output() {
     let metadata =
         volumetric::operator_metadata_from_wasm_bytes(&wasm_artifact("f64_map_merge_operator"))
             .expect("merge metadata");
     assert_eq!(metadata.name, "f64_map_merge_operator");
-    assert_eq!(metadata.inputs.len(), 5);
-    assert!(
-        metadata
-            .inputs
-            .iter()
-            .all(|input| matches!(input, OperatorMetadataInput::F64Map))
-    );
-    assert_eq!(metadata.input_name(0), Some("Base"));
-    assert_eq!(metadata.input_name(4), Some("Override 4"));
+    assert_eq!(metadata.inputs, vec![OperatorMetadataInput::F64Map]);
+    assert_eq!(metadata.variadic_slot(), Some(0));
+    assert!(metadata.accepts_input_count(1));
+    assert!(metadata.accepts_input_count(5));
+    assert_eq!(metadata.input_label(4, 5).as_deref(), Some("Map 5"));
     assert_eq!(metadata.outputs, vec![OperatorMetadataOutput::F64Map]);
 }
 

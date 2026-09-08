@@ -1,9 +1,8 @@
 //! Mesh Merge Operator.
 //!
-//! Concatenates up to four same-kind meshes ([`FeaMesh`]: point clouds,
-//! strut networks, volume meshes) into one, in slot order — union for
-//! explicit meshes. Unwired slots are skipped; merging is associative,
-//! so chain nodes for more parts.
+//! Concatenates any number of same-kind meshes ([`FeaMesh`]: point
+//! clouds, strut networks, volume meshes) into one, in slot order — union
+//! for explicit meshes. Unwired entries are skipped.
 //!
 //! Only fields present in *every* wired part (same name, component
 //! count, and container) survive the merge; the rest are dropped rather
@@ -19,17 +18,13 @@
 //! Inputs:
 //! - Input 0: CBOR configuration:
 //!   `{ weld_tolerance: float .default 0.0 }`
-//! - Inputs 1-4: FeaMesh (optional slots) — the meshes to merge
+//! - Inputs 1..: FeaMesh, one or more (a variadic slot) — the meshes to merge
 //!
 //! Output 0: the merged CBOR-encoded `FeaMesh`.
 
 use volumetric_abi::fea::{FeaMesh, decode_fea_mesh, encode_fea_mesh};
-use volumetric_abi::host::{post_output, read_input, report_error};
+use volumetric_abi::host::{input_count, post_output, read_input, report_error};
 use volumetric_abi::{OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput};
-
-/// Number of mesh input slots. Unwired ones are ignored; merging is
-/// associative, so more parts than this can be chained across nodes.
-const MESH_SLOTS: usize = 4;
 
 #[derive(Clone, Copy, Debug, serde::Deserialize)]
 #[serde(default)]
@@ -56,7 +51,7 @@ fn build_merged(config: &MergeConfig) -> Result<FeaMesh, String> {
     }
 
     let mut parts: Vec<FeaMesh> = Vec::new();
-    for idx in 1..=MESH_SLOTS {
+    for idx in 1..input_count() {
         let bytes = read_input(idx as i32);
         if bytes.is_empty() {
             continue;
@@ -105,12 +100,6 @@ pub extern "C" fn get_metadata() -> i64 {
     static METADATA: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     volumetric_abi::metadata_reply(&METADATA, || {
         let schema = r#"{ weld_tolerance: float .default 0.0 }"#.to_string();
-        let mut inputs = vec![OperatorMetadataInput::CBORConfiguration(schema)];
-        let mut input_names = vec!["Config".to_string()];
-        for i in 1..=MESH_SLOTS {
-            inputs.push(OperatorMetadataInput::FeaMesh);
-            input_names.push(format!("Mesh {i}"));
-        }
         OperatorMetadata {
             name: "mesh_merge_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -126,9 +115,12 @@ pub extern "C" fn get_metadata() -> i64 {
                 r##"<path d="m20 20-5-5"/>"##,
             )
             .to_string(),
-            inputs,
-            variadic_input: None,
-            input_names,
+            inputs: vec![
+                OperatorMetadataInput::CBORConfiguration(schema),
+                OperatorMetadataInput::FeaMesh,
+            ],
+            variadic_input: Some(1),
+            input_names: vec!["Config".to_string(), "Mesh".to_string()],
             outputs: vec![OperatorMetadataOutput::FeaMesh],
             output_names: vec![],
         }

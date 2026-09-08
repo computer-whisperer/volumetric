@@ -1,21 +1,15 @@
 //! Generic composition operator for [`volumetric_abi::f64_map::F64Map`]
 //! project data.
 //!
-//! Inputs 0 through 4 are optional F64Maps. They are merged from left to
-//! right, so a value in a later slot replaces the same key from every earlier
-//! slot. Missing and empty inputs are the identity. This right-biased union is
-//! associative, allowing larger compositions to be chained without changing
-//! their meaning.
+//! The inputs are F64Maps, one or more (a variadic slot). They are merged
+//! from left to right, so a value in a later entry replaces the same key
+//! from every earlier one. Empty (unwired) entries are the identity.
 //!
 //! Output 0 is the deterministically encoded merged F64Map.
 
 use volumetric_abi::f64_map::{F64Map, decode, encode};
-use volumetric_abi::host::{post_output, read_input, report_error};
+use volumetric_abi::host::{input_count, post_output, read_input, report_error};
 use volumetric_abi::{OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput};
-
-/// A fixed arity keeps operator metadata and project steps simple. Merge is
-/// associative, so projects needing more sources can chain nodes.
-const MAP_SLOTS: usize = 5;
 
 fn merge_encoded_inputs(inputs: &[Vec<u8>]) -> Result<Vec<u8>, String> {
     let mut merged = F64Map::new();
@@ -32,7 +26,7 @@ fn merge_encoded_inputs(inputs: &[Vec<u8>]) -> Result<Vec<u8>, String> {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn run() {
-    let inputs: Vec<Vec<u8>> = (0..MAP_SLOTS)
+    let inputs: Vec<Vec<u8>> = (0..input_count())
         .map(|index| read_input(index as i32))
         .collect();
     match merge_encoded_inputs(&inputs) {
@@ -59,15 +53,9 @@ pub extern "C" fn get_metadata() -> i64 {
             r##"<path d="M11 12h7M11 16h7"/>"##,
         )
         .to_string(),
-        inputs: vec![OperatorMetadataInput::F64Map; MAP_SLOTS],
-        variadic_input: None,
-        input_names: vec![
-            "Base".to_string(),
-            "Override 1".to_string(),
-            "Override 2".to_string(),
-            "Override 3".to_string(),
-            "Override 4".to_string(),
-        ],
+        inputs: vec![OperatorMetadataInput::F64Map],
+        variadic_input: Some(0),
+        input_names: vec!["Map".to_string()],
         outputs: vec![OperatorMetadataOutput::F64Map],
         output_names: vec![],
     })
