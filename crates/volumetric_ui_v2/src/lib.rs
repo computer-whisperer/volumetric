@@ -6270,10 +6270,12 @@ fn import_detail_rows(app: &VolumetricUiV2, idx: usize) -> Vec<El> {
         return vec![text("Selected import no longer exists.").muted().small()];
     };
 
+    let dependents = import_dependents(app, &import.id);
     let mut rows = vec![
         detail_row("Kind", asset_type_label(import.type_hint)),
         detail_row("Asset", &import.id),
         detail_row("Bytes", &import.data.len().to_string()),
+        detail_row("Used by", &count_steps(dependents)),
     ];
     if import.type_hint == Some(AssetTypeHint::Operator)
         && let Some(metadata) = app.operator_metadata_cached(&import.id)
@@ -6297,13 +6299,38 @@ fn import_detail_rows(app: &VolumetricUiV2, idx: usize) -> Vec<El> {
         }
     }
     rows.push(
-        button_with_icon("x", "Delete")
+        button_with_icon("x", import_delete_label(dependents))
             .destructive()
             .xsmall()
             .width(Size::Fill(1.0))
             .key(format!("{DELETE_IMPORT_PREFIX}{idx}")),
     );
     rows
+}
+
+/// Steps that run `asset_id` as their operator or read it as an input.
+/// Operators are shared — every step running the same build references
+/// one import — so deleting an import takes all of these steps with it.
+fn import_dependents(app: &VolumetricUiV2, asset_id: &str) -> usize {
+    app.project
+        .timeline()
+        .iter()
+        .filter(|step| step_depends_on_asset(step, asset_id))
+        .count()
+}
+
+/// "1 step" / "3 steps".
+fn count_steps(n: usize) -> String {
+    format!("{n} step{}", if n == 1 { "" } else { "s" })
+}
+
+/// Delete button label for an import, warning about what goes with it.
+fn import_delete_label(dependents: usize) -> String {
+    if dependents == 0 {
+        "Delete".to_string()
+    } else {
+        format!("Delete with {}", count_steps(dependents))
+    }
 }
 
 fn step_detail_rows(app: &VolumetricUiV2, idx: usize) -> Vec<El> {
@@ -8017,6 +8044,30 @@ mod tests {
         let options1 = step_input_options(&app, 1, AssetSlotKind::Model);
         assert!(options1.contains(&step0_out), "upstream output available");
         assert!(!options1.contains(&step1_out), "own output excluded");
+    }
+
+    #[test]
+    fn adding_the_same_operator_twice_shares_one_import() {
+        let mut app = VolumetricUiV2::default();
+        add_operator_click(&mut app, first_operator_name());
+        add_operator_click(&mut app, first_operator_name());
+
+        let summary = app.summary();
+        assert_eq!(summary.timeline_steps, 2);
+        assert_eq!(summary.imports, 2, "the model plus one shared operator");
+        let ops: Vec<_> = app
+            .project()
+            .timeline()
+            .iter()
+            .map(|step| step.operator_id.clone())
+            .collect();
+        assert_eq!(ops[0], ops[1]);
+
+        // The shared import's detail says how much a delete would take.
+        assert_eq!(import_dependents(&app, &ops[0]), 2);
+        assert_eq!(import_delete_label(2), "Delete with 2 steps");
+        assert_eq!(import_delete_label(1), "Delete with 1 step");
+        assert_eq!(import_delete_label(0), "Delete");
     }
 
     #[test]

@@ -66,7 +66,9 @@ back into the nose: three 0.8 mm slots below the headlights.
 
 - An optional operator input (the revolve axis) has no unwired spelling
   on `project-add-op`; `--input 'data:'` (empty bytes) is what works.
-- Each `project-add-op` embeds a fresh copy of the operator module, so a
-  55-step project is ~99 MB on disk (the housing examples are the same).
+- Operator modules are shared between steps that run the same build
+  (`Project::insert_operation` reuses a byte-identical import, and
+  loading merges duplicates from older files), so this 55-step project
+  is 28 MB rather than the 99 MB it was with one copy per step.
 - `json:` float fields must be float literals; `sketch-raster` on a
   Lua sketch step is the fast way to check a profile before extruding.

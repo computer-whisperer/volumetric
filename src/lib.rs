@@ -1129,21 +1129,29 @@ impl Project {
         id
     }
 
-    /// Inserts an operator and execution step into the project. Every
-    /// output id becomes an export (callers that want an intermediate
-    /// hidden remove it from `exports_mut` afterwards).
+    /// Inserts an execution step for an operator. The operator module is
+    /// imported unless an operator import with byte-identical data already
+    /// exists: every step running the same build of an operator shares one
+    /// import, so a fifty-step project carries each operator once. Returns
+    /// the import id the step references. Every output id becomes an export
+    /// (callers that want an intermediate hidden remove it from
+    /// `exports_mut` afterwards).
     pub fn insert_operation(
         &mut self,
         op_id_base: &str,
         op_data: Vec<u8>,
         inputs: Vec<ExecutionInput>,
         output_ids: Vec<String>,
-    ) {
-        let op_id = self.unique_asset_id(op_id_base);
-
-        // Add the operator as an import
-        self.imports
-            .push(ImportedAsset::operator(op_id.clone(), op_data));
+    ) -> String {
+        let existing = self
+            .operator_import_with_data(&op_data)
+            .map(str::to_string);
+        let op_id = existing.unwrap_or_else(|| {
+            let op_id = self.unique_asset_id(op_id_base);
+            self.imports
+                .push(ImportedAsset::operator(op_id.clone(), op_data));
+            op_id
+        });
 
         for output_id in &output_ids {
             if !self.exports.contains(output_id) {
@@ -1151,12 +1159,70 @@ impl Project {
             }
         }
 
-        // Add the execution step
         self.timeline.push(ExecutionStep {
-            operator_id: op_id,
+            operator_id: op_id.clone(),
             inputs,
             outputs: output_ids,
         });
+        op_id
+    }
+
+    /// Id of the operator import whose bytes equal `data`, if any.
+    fn operator_import_with_data(&self, data: &[u8]) -> Option<&str> {
+        self.imports
+            .iter()
+            .find(|import| {
+                import.type_hint == Some(AssetTypeHint::Operator) && import.data == data
+            })
+            .map(|import| import.id.as_str())
+    }
+
+    /// Merges operator imports with byte-identical data into the first of
+    /// each group and re-points the timeline at the survivor. Projects
+    /// saved before [`Self::insert_operation`] shared imports carry one
+    /// operator copy per step (a fifty-step file was ~100 MB); loading
+    /// normalizes them so the next save is compact. Only operators are
+    /// merged — two imports of the same model are two assets the user
+    /// placed on purpose. Exports naming a removed import are dropped.
+    /// Returns the number of imports removed.
+    pub fn dedupe_operator_imports(&mut self) -> usize {
+        let mut survivor_by_hash: std::collections::HashMap<[u8; 32], String> =
+            std::collections::HashMap::new();
+        let mut renamed: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for import in &self.imports {
+            if import.type_hint != Some(AssetTypeHint::Operator) {
+                continue;
+            }
+            let hash = *blake3::hash(&import.data).as_bytes();
+            match survivor_by_hash.get(&hash) {
+                Some(survivor) => {
+                    renamed.insert(import.id.clone(), survivor.clone());
+                }
+                None => {
+                    survivor_by_hash.insert(hash, import.id.clone());
+                }
+            }
+        }
+        if renamed.is_empty() {
+            return 0;
+        }
+
+        self.imports.retain(|import| !renamed.contains_key(&import.id));
+        for step in &mut self.timeline {
+            if let Some(survivor) = renamed.get(&step.operator_id) {
+                step.operator_id = survivor.clone();
+            }
+            for input in &mut step.inputs {
+                if let ExecutionInput::AssetRef(id) = input
+                    && let Some(survivor) = renamed.get(id)
+                {
+                    *id = survivor.clone();
+                }
+            }
+        }
+        self.exports.retain(|id| !renamed.contains_key(id));
+        renamed.len()
     }
 
     /// Output ids for every output an operator declares: slot 0 keeps
@@ -1565,10 +1631,14 @@ impl Project {
         Ok(bytes)
     }
 
-    /// Deserializes a project from CBOR format.
+    /// Deserializes a project from CBOR format. Duplicate operator imports
+    /// are merged on the way in (see [`Self::dedupe_operator_imports`]), so
+    /// a project is in canonical form from the moment it is loaded.
     pub fn from_cbor(bytes: &[u8]) -> Result<Self, std::io::Error> {
-        ciborium::from_reader(bytes)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+        let mut project: Self = ciborium::from_reader(bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        project.dedupe_operator_imports();
+        Ok(project)
     }
 
     /// Saves the project to a file in CBOR format.
@@ -1760,6 +1830,62 @@ mod tests {
                 .any(|(id, hint)| id == "model_a" && *hint == Some(AssetTypeHint::Model))
         );
         assert!(assets.iter().any(|(id, _)| id == "model_b"));
+    }
+
+    #[test]
+    fn insert_operation_shares_one_import_per_operator_build() {
+        let mut p = Project::new();
+        let first = p.insert_operation("boolean_operator", vec![1, 2, 3], vec![], vec!["a".into()]);
+        let second =
+            p.insert_operation("boolean_operator", vec![1, 2, 3], vec![], vec!["b".into()]);
+        // A different build of the same operator is a different import.
+        let other = p.insert_operation("boolean_operator", vec![9, 9, 9], vec![], vec!["c".into()]);
+
+        assert_eq!(first, "boolean_operator");
+        assert_eq!(second, first);
+        assert_eq!(other, "boolean_operator_2");
+        assert_eq!(p.imports().len(), 2);
+        let ops: Vec<_> = p.timeline().iter().map(|s| s.operator_id.as_str()).collect();
+        assert_eq!(ops, ["boolean_operator", "boolean_operator", "boolean_operator_2"]);
+        assert!(p.validate().is_empty());
+    }
+
+    #[test]
+    fn loading_merges_duplicate_operator_imports() {
+        // A project saved before imports were shared: one operator copy per
+        // step. Identical *model* imports are distinct assets and stay.
+        let project = Project {
+            version: 2,
+            imports: vec![
+                ImportedAsset::model("m".into(), vec![0]),
+                ImportedAsset::model("m_2".into(), vec![0]),
+                ImportedAsset::operator("op".into(), vec![1, 2]),
+                ImportedAsset::operator("op_2".into(), vec![1, 2]),
+                ImportedAsset::operator("other".into(), vec![3]),
+                ImportedAsset::operator("op_3".into(), vec![1, 2]),
+            ],
+            timeline: vec![
+                step("op", &["m"], &["a"]),
+                step("op_2", &["a", "m_2"], &["b"]),
+                step("other", &["b"], &["c"]),
+                step("op_3", &["c"], &["d"]),
+            ],
+            exports: vec!["d".into(), "op_2".into()],
+            baked: None,
+        };
+
+        let loaded = Project::from_cbor(&project.to_cbor().unwrap()).unwrap();
+
+        let ids: Vec<_> = loaded.imports().iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, ["m", "m_2", "op", "other"]);
+        let ops: Vec<_> = loaded.timeline().iter().map(|s| s.operator_id.as_str()).collect();
+        assert_eq!(ops, ["op", "op", "other", "op"]);
+        assert_eq!(loaded.exports(), ["d"]);
+        assert!(loaded.validate().is_empty());
+        // Idempotent: a canonical project is untouched by a second pass.
+        let mut again = loaded.clone();
+        assert_eq!(again.dedupe_operator_imports(), 0);
+        assert_eq!(again.imports().len(), 4);
     }
 
     #[test]

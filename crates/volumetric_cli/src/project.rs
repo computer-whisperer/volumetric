@@ -466,7 +466,7 @@ pub fn run_project_add_op(args: ProjectAddOpArgs) -> Result<()> {
     // rest get its declared-name suffixes (e.g. `card`, `card_plate`).
     let output_ids = project.output_ids_for(output_id, &metadata);
 
-    project.insert_operation(&op_name, op_bytes, inputs, output_ids.clone());
+    let import_id = project.insert_operation(&op_name, op_bytes, inputs, output_ids.clone());
 
     // Remove the auto-added exports if --no-export was specified
     if args.no_export {
@@ -477,8 +477,9 @@ pub fn run_project_add_op(args: ProjectAddOpArgs) -> Result<()> {
     save_project(&project, &output_path)?;
 
     println!(
-        "Added operator '{}' with output{} '{}'",
+        "Added operator '{}' (import '{}') with output{} '{}'",
         op_name,
+        import_id,
         if output_ids.len() > 1 { "s" } else { "" },
         output_ids.join("', '")
     );
