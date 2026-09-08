@@ -2,7 +2,9 @@
 
 A hand-sized toy car (80 x 32 x 37 mm) built entirely from the operator
 catalog, as a capability test of the CAD-style construction path:
-2D Lua sketches -> extrude / revolve -> booleans -> offset rounding.
+2D path sketches -> extrude / revolve -> booleans -> offset rounding.
+Every sketch is one `path_sketch_operator` step with inline SVG path data
+(the exercise's first gap, originally hand-written Lua half-planes).
 `build.sh` rebuilds `toy_car.vproj` at the repo root from scratch
 (`cargo build --release -p volumetric_cli` first) and runs it.
 
@@ -12,11 +14,11 @@ Coordinate frame (engine convention): +x right = car length, nose at
 ## Construction
 
 Body:
-- `side_profile.lua` (x, y): chassis slab y 6..23 mm with a full-round
-  nose (disk r 8.5 at x 31.5), cabin trapezoid y 23..37 with a raked
+- Side sketch (x, y): chassis slab y 6..23 mm with a full-round nose
+  (arc r 8.5 at x 31.5), cabin trapezoid y 23..37 with a raked
   windscreen (6,23)->(-2,37) and rear slope (-28,23)->(-24,37).
   Extruded across z via a `subspace` plane at z = -16 mm, height 32.
-- `plan_profile.lua` (x, z): rounded rectangle 80 x 32, corner r 6.
+- Plan sketch (x, z): 80 x 32 rectangle with `round` 6 mm corners.
   Extruded down (-y normal) through the side extrude; intersect gives
   the two-view body.
 - Rounding: `offset` -1.5 mm then +1.5 mm (morphological opening) at
@@ -26,16 +28,16 @@ Body:
 Cuts (all subtract from the rounded body):
 - Wheel wells: four flat-cap cylinders r 10.5 along z, |z| 9..20, at
   the axle positions (x +-25, y 9). Central spine z -9..9 stays solid.
-- Side windows: `windows.lua` (x, y) extruded z -25..25, minus an inner
-  slab |z| <= 14.8, leaving 1.2 mm-deep recesses on both flanks.
+- Side windows: a two-subpath sketch (x, y) extruded z -25..25, minus
+  an inner slab |z| <= 14.8, leaving 1.2 mm-deep recesses on both flanks.
 - Windscreen / rear window: axis-aligned prisms rotated about z to the
   face rake (29.7 deg / 164.1 deg) and translated to the face midpoint;
   half sits outside, the inner half recesses 1.2 mm.
 
 Additions (union):
 - Axles: cylinders r 1.5 along z, z -17.5..17.5, at (+-25, 9).
-- Wheels: `wheel_profile.lua` (r, a) revolved about z at the origin:
-  tyre r 9, width 8, shoulder round r 1.5, two tread grooves, a hub
+- Wheels: a tyre section sketch (r, a) revolved about z at the origin:
+  tyre r 9, width 8, r 1.5 shoulder arcs, two tread grooves, a hub
   dish on the outer face with a centre boss. Right wheels are
   translated to z +14; left wheels are `scale` sz = -1 first (mirror)
   so the dish faces out.
@@ -45,9 +47,9 @@ Additions (union):
 Exports: `body` (rounded, cut body), `wheel` (one wheel at the origin),
 `car` (the assembly).
 
-Grille: `grille.lua` sketched in the front view (chart (z, y)) on a
-plane at x = 45 mm whose basis order gives a -x normal, extruded 9 mm
-back into the nose: three 0.8 mm slots below the headlights.
+Grille: three slot subpaths sketched in the front view (chart (z, y))
+on a plane at x = 45 mm whose basis order gives a -x normal, extruded
+9 mm back into the nose: 0.8 mm slots below the headlights.
 
 ## Meshing and printing
 
@@ -70,5 +72,7 @@ back into the nose: three 0.8 mm slots below the headlights.
   (`Project::insert_operation` reuses a byte-identical import, and
   loading merges duplicates from older files), so this 55-step project
   is 28 MB rather than the 99 MB it was with one copy per step.
-- `json:` float fields must be float literals; `sketch-raster` on a
-  Lua sketch step is the fast way to check a profile before extruding.
+- `json:` float fields must be float literals; `sketch-raster` is the
+  fast way to check a profile before extruding, but it only reaches
+  exported assets, so drop `--no-export` on the sketch step while
+  iterating.

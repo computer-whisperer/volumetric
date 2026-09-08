@@ -1,6 +1,6 @@
 #!/bin/bash
-# Rebuild toy_car.vproj: a hand-sized toy car from sketches, extrude/revolve,
-# booleans and offset rounding (all coordinates metres; see README.md).
+# Rebuild toy_car.vproj: a hand-sized toy car from path sketches, extrude/
+# revolve, booleans and offset rounding (all coordinates metres; see README.md).
 set -e
 L="$(cd "$(dirname "$0")" && pwd)"
 cd "$L/../.."
@@ -8,11 +8,6 @@ V=./target/release/volumetric_cli
 P=toy_car.vproj
 rm -f $P
 $V project-new --output $P >/dev/null
-$V project-add-asset --project $P --input $L/side_profile.lua --asset-id side_lua >/dev/null
-$V project-add-asset --project $P --input $L/plan_profile.lua --asset-id plan_lua >/dev/null
-$V project-add-asset --project $P --input $L/windows.lua --asset-id windows_lua >/dev/null
-$V project-add-asset --project $P --input $L/wheel_profile.lua --asset-id wheel_lua >/dev/null
-$V project-add-asset --project $P --input $L/grille.lua --asset-id grille_lua >/dev/null
 
 op() { $V project-add-op --project $P "$@" >/dev/null; }
 PLANE='json:{"kind":"plane"}'
@@ -21,10 +16,12 @@ SUB='json:{"op":"subtract"}'
 ISECT='json:{"op":"intersect"}'
 
 # --- Body: side profile x plan outline (two-view intersection), then rounded.
-op --operator lua_script_operator --input asset:side_lua --input 'json:{}' --output-id side_sketch --no-export
+# Side view (x, y): chassis slab with a full-round nose and a raked cabin.
+op --operator path_sketch_operator --input 'json:{"path":"M -0.040 0.006 H 0.0315 A 0.0085 0.0085 0 0 1 0.0315 0.023 H 0.006 L -0.002 0.037 H -0.024 L -0.028 0.023 H -0.040 Z"}' --output-id side_sketch --no-export
 op --operator subspace_operator --input "$PLANE" --input 'json:[0.0,0.0,-0.016]' --input 'json:[1.0,0.0,0.0]' --input 'json:[0.0,1.0,0.0]' --output-id side_plane --no-export
 op --operator extrude_operator --input asset:side_sketch --input 'json:{"height":0.032}' --input asset:side_plane --output-id side_solid --no-export
-op --operator lua_script_operator --input asset:plan_lua --input 'json:{}' --output-id plan_sketch --no-export
+# Plan view (x, z): 80 x 32 rectangle with 6mm corner rounds.
+op --operator path_sketch_operator --input 'json:{"path":"M -0.040 -0.016 H 0.040 V 0.016 H -0.040 Z","round":0.006}' --output-id plan_sketch --no-export
 # Plane basis (x, z) has normal x cross z = -y: extrude downward from y = 45mm.
 op --operator subspace_operator --input "$PLANE" --input 'json:[0.0,0.045,0.0]' --input 'json:[1.0,0.0,0.0]' --input 'json:[0.0,0.0,1.0]' --output-id plan_plane --no-export
 op --operator extrude_operator --input asset:plan_sketch --input 'json:{"height":0.05}' --input asset:plan_plane --output-id plan_solid --no-export
@@ -43,7 +40,8 @@ op --operator boolean_operator --input asset:well_rr --input asset:well_rl --inp
 op --operator boolean_operator --input asset:wells_f --input asset:wells_r --input "$UNION" --output-id wells --no-export
 
 # --- Side window recesses: sketch extruded through, minus the inner slab.
-op --operator lua_script_operator --input asset:windows_lua --input 'json:{}' --output-id windows_sketch --no-export
+# Side windows (x, y): rear rectangle, front window raked parallel to the windscreen.
+op --operator path_sketch_operator --input 'json:{"path":"M -0.025 0.025 H -0.012 V 0.035 H -0.025 Z M -0.009 0.025 H 0.003 L -0.002714 0.035 H -0.009 Z"}' --output-id windows_sketch --no-export
 op --operator subspace_operator --input "$PLANE" --input 'json:[0.0,0.0,-0.025]' --input 'json:[1.0,0.0,0.0]' --input 'json:[0.0,1.0,0.0]' --output-id windows_plane --no-export
 op --operator extrude_operator --input asset:windows_sketch --input 'json:{"height":0.05}' --input asset:windows_plane --output-id windows_through --no-export
 op --operator rectangular_prism_operator --input 'json:{}' --input 'json:[-0.05,0.0,-0.0148]' --input 'json:[0.05,0.05,0.0148]' --output-id inner_slab --no-export
@@ -60,7 +58,7 @@ op --operator translate_operator --input asset:rw_tilted --input 'json:{"dx":-0.
 
 # --- Grille: front-view sketch on the yz plane at x = 45mm, extruded 9mm
 # back into the nose (basis (z, y) has normal z cross y = -x).
-op --operator lua_script_operator --input asset:grille_lua --input 'json:{}' --output-id grille_sketch --no-export
+op --operator path_sketch_operator --input 'json:{"path":"M -0.007 0.0096 H 0.007 V 0.0104 H -0.007 Z M -0.007 0.0111 H 0.007 V 0.0119 H -0.007 Z M -0.007 0.0126 H 0.007 V 0.0134 H -0.007 Z"}' --output-id grille_sketch --no-export
 op --operator subspace_operator --input "$PLANE" --input 'json:[0.045,0.0,0.0]' --input 'json:[0.0,0.0,1.0]' --input 'json:[0.0,1.0,0.0]' --output-id grille_plane --no-export
 op --operator extrude_operator --input asset:grille_sketch --input 'json:{"height":0.009}' --input asset:grille_plane --output-id grille --no-export
 
@@ -80,7 +78,9 @@ op --operator cylinder_operator --input "$LAMP" --input 'json:[0.036,0.017,-0.00
 
 # --- Wheels: revolve about z at the origin (outer face +z), mirror for the
 # left side, translate to the four hubs.
-op --operator lua_script_operator --input asset:wheel_lua --input 'json:{}' --output-id wheel_sketch --no-export
+# Tyre section (r, a): r 9, width 8, r1.5 shoulders, two 1.2 x 1.0 grooves,
+# a hub dish 1.2 deep on the outer (+a) face with a centre boss left standing.
+op --operator path_sketch_operator --input 'json:{"path":"M 0 -0.004 H 0.0075 A 0.0015 0.0015 0 0 1 0.009 -0.0025 V -0.002 H 0.008 V -0.0008 H 0.009 V 0.0008 H 0.008 V 0.002 H 0.009 V 0.0025 A 0.0015 0.0015 0 0 1 0.0075 0.004 H 0.0055 V 0.0028 H 0.0018 V 0.004 H 0 Z"}' --output-id wheel_sketch --no-export
 op --operator revolve_operator --input asset:wheel_sketch --input 'data:' --output-id wheel
 op --operator scale_operator --input asset:wheel --input 'json:{"sz":-1.0}' --output-id wheel_mirrored --no-export
 op --operator translate_operator --input asset:wheel --input 'json:{"dx":0.025,"dy":0.009,"dz":0.014}' --output-id wheel_fr --no-export
