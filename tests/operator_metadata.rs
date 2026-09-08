@@ -9,46 +9,24 @@
 
 use volumetric::operator_metadata_from_wasm_bytes;
 
-const OPERATORS: &[&str] = &[
-    "boolean_operator",
-    "translate_operator",
-    "rotation_operator",
-    "scale_operator",
-    "lua_script_operator",
-    "f64_map_merge_operator",
-    "stl_import_operator",
-    "rectangular_prism_operator",
-    "heightmap_extrude_operator",
-    "extrude_operator",
-    "revolve_operator",
-    "image_model_operator",
-    "text_model_operator",
-    "html_card_operator",
-    "mesh_height_operator",
-    "fea_grid_mesh_operator",
-    "fea_solve_operator",
-    "fea_density_operator",
-    "fea_inverse_operator",
-    "fea_print_drag_operator",
-    "fea_deform_operator",
-    "mesh_to_model_operator",
-    "lattice_operator",
-    "strut_pattern_operator",
-    "strut_model_operator",
-    "brim_operator",
-    "island_removal_operator",
-    "sdf_operator",
-    "subspace_operator",
-    "subspace_fit_operator",
-    "model_bound_operator",
-    "slice_operator",
-    "span_operator",
-    "intersect_operator",
-];
+/// Every operator crate under `crates/operators/` — the directory is the
+/// source of truth for what is bundled, so a new operator is covered
+/// without editing a list here (a missing artifact fails the test).
+fn operator_names() -> Vec<String> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/operators");
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("listing {}: {e}", dir.display()))
+        .map(|entry| entry.expect("directory entry").file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with("_operator"))
+        .collect();
+    names.sort();
+    assert!(names.len() > 40, "unexpectedly few operators: {names:?}");
+    names
+}
 
 #[test]
 fn every_operator_metadata_decodes() {
-    for name in OPERATORS {
+    for name in &operator_names() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("target/wasm32-unknown-unknown/release")
             .join(format!("{name}.wasm"));
@@ -81,7 +59,7 @@ fn every_operator_metadata_decodes() {
         for (idx, input) in metadata.inputs.iter().enumerate() {
             if let volumetric::OperatorMetadataInput::CBORConfiguration(schema) = input {
                 let parsed = volumetric::operator_config::parse_schema(schema);
-                if *name != "stl_import_operator" {
+                if name != "stl_import_operator" {
                     parsed.unwrap_or_else(|e| {
                         panic!("{name}: config schema (input {idx}) failed to parse: {e:?}")
                     });
