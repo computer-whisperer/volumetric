@@ -68,10 +68,13 @@ on a plane at x = 45 mm whose basis order gives a -x normal, extruded
 
 - An optional operator input (the revolve axis) is left unwired with
   `--input none` on `project-add-op`.
+- Booleans take any number of models before the config (a variadic
+  slot; repeat `--input`), so the four wheel wells, the five body cuts
+  and the eight-part assembly are one step each instead of chains.
 - Operator modules are shared between steps that run the same build
   (`Project::insert_operation` reuses a byte-identical import, and
-  loading merges duplicates from older files), so this 55-step project
-  is 28 MB rather than the 99 MB it was with one copy per step.
+  loading merges duplicates from older files), so this project is a
+  fraction of the size it would be with one operator copy per step.
 - `json:` float fields must be float literals; `sketch-raster` is the
   fast way to check a profile before extruding, but it only reaches
   exported assets, so drop `--no-export` on the sketch step while

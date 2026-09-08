@@ -58,7 +58,7 @@ Transform operators take an existing model and produce a modified version:
 | `translate` | Moves a model in 3D space | `{dx, dy, dz}` - displacement in each axis |
 | `scale` | Scales a model uniformly or non-uniformly | `{sx, sy, sz}` - scale factors |
 | `rotation` | Rotates a model around an axis | `{angle, axis}` - angle in radians and axis vector |
-| `boolean` | Combines two models with CSG operations | `{op}` - "union", "subtract", or "intersect" |
+| `boolean` | Union, intersection, or subtraction of one or more models (one flat step, not a chain) | `{op}` - "union", "subtract", or "intersect" |
 | `coil` | Rolls a flat model into an Archimedean spiral around the y axis (x becomes arc length, z radial depth) | `{inner_radius, gap}` - bore radius and inter-wrap clearance |
 
 ### Generator Operators
@@ -78,7 +78,7 @@ Data operators compose typed values in the project DAG without invoking the mode
 
 | Operator | Description | Inputs |
 |----------|-------------|--------|
-| `f64_map_merge` | Composes shared numeric project data; later maps override earlier keys | Up to five routed `F64Map` inputs |
+| `f64_map_merge` | Composes shared numeric project data; later maps override earlier keys | Any number of routed `F64Map` inputs (one variadic slot) |
 
 The construction catalog also includes `subspace_fit`, which locates a local point, edge line,
 or tangent plane from a seed using bounded model probes and optional metric-grid snapping.

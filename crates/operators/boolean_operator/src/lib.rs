@@ -1,46 +1,40 @@
-//! Boolean operator.
+#![doc = include_str!("../README.md")]
 //!
 //! Host/operator ABI: see the `volumetric_abi` crate.
 //!
-//! Generated Model ABI (N-dimensional):
-//! - `get_dimensions() -> u32`: Passed through from model A
-//! - `get_io_ptr() -> i32`: Passed through from model A (whose memory is the
-//!   exported one); B's buffer is obtained by calling B's own `get_io_ptr`
-//! - `get_bounds(out_ptr: i32)`: Combines bounds from both models based on operation
-//! - `sample(pos_ptr: i32) -> f32`: Combines densities from both models
-//! - `memory`: First memory from merged modules
+//! Inputs: one or more `ModelWASM` slots (the variadic block, slot 0)
+//! followed by the CBOR configuration (schema declared in metadata). The
+//! step's input count comes from `host::input_count`; the config is the
+//! last input and every earlier non-empty input is a model.
 //!
-//! Typed sample channels follow model A: when A declares a sample format,
-//! the output passes `get_sample_format` through and emits a
-//! `sample_channels` wrapper that keeps A's channel row with channel 0
-//! replaced by the combined occupancy. B contributes occupancy only — in
-//! regions where only B is solid (union), the other channels hold
-//! whatever A reports at that position. A format-less A yields the
-//! implicit occupancy-only output regardless of B's channels.
-//!
-//! Behavior:
-//! - Reads WASM model A bytes from input 0
-//! - Reads WASM model B bytes from input 1
-//! - Reads CBOR configuration from input 2 (schema declared in metadata)
-//! - Produces a merged WASM model with sample/bounds implementing union/subtract/intersect
+//! Generated Model ABI (N-dimensional), for models m_0 .. m_{k-1}:
+//! - `get_dimensions() -> u32`: passed through from m_0
+//! - `get_io_ptr() -> i32`: passed through from m_0 (whose memory is the
+//!   exported one); every other model's buffer is obtained by calling its
+//!   own `get_io_ptr`
+//! - `get_bounds(out_ptr: i32)`: m_0's bounds folded with every other
+//!   model's per the operation, `2 * n` values at run time (no fixed
+//!   dimension count in the glue)
+//! - `sample(pos_ptr: i32) -> f32`: the combined occupancy, evaluating the
+//!   models in order with an early exit
+//! - `sample_channels` / `get_sample_format`: m_0's, with channel 0
+//!   replaced by the combined occupancy, when m_0 declares a format
+//! - `memory`: m_0's
 
 use wasm_encoder::{
-    CodeSection, ExportKind, ExportSection, Function, FunctionSection, Instruction, TypeSection,
-    ValType,
+    BlockType, ExportKind, ExportSection, Function, Instruction, MemArg, ValType,
 };
 
+use model_merge_core::{
+    MergeSections, ModelExports, OffsetReencoder, SectionCounts, count_sections,
+    parse_model_exports,
+};
+use volumetric_abi::host::{input_count, post_output, read_input, report_error};
 use volumetric_abi::{OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BooleanOp {
-    Union,
-    Subtract,
-    Intersect,
-}
-
-#[derive(Clone, Copy, Debug, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
-enum BooleanOpConfig {
+enum BooleanOp {
     Union,
     Subtract,
     Intersect,
@@ -51,445 +45,422 @@ enum BooleanOpConfig {
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BooleanConfig {
-    op: Option<BooleanOpConfig>,
+    op: Option<BooleanOp>,
 }
 
 impl Default for BooleanConfig {
     fn default() -> Self {
         Self {
-            op: Some(BooleanOpConfig::Union),
+            op: Some(BooleanOp::Union),
         }
     }
 }
 
-impl From<BooleanOpConfig> for BooleanOp {
-    fn from(value: BooleanOpConfig) -> Self {
-        match value {
-            BooleanOpConfig::Union => BooleanOp::Union,
-            BooleanOpConfig::Subtract => BooleanOp::Subtract,
-            BooleanOpConfig::Intersect => BooleanOp::Intersect,
+/// One appended model's export indices, rebased into the merged module.
+#[derive(Clone, Copy)]
+struct Part {
+    sample: u32,
+    get_bounds: u32,
+    get_io_ptr: u32,
+    memory: u32,
+}
+
+impl Part {
+    fn rebased(exports: &ModelExports, offsets: &SectionCounts) -> Self {
+        Self {
+            sample: exports.sample + offsets.funcs,
+            get_bounds: exports.get_bounds + offsets.funcs,
+            get_io_ptr: exports.get_io_ptr + offsets.funcs,
+            memory: exports.memory + offsets.memories,
         }
     }
 }
 
-use model_merge_core::{MergeSections, OffsetReencoder, count_sections, parse_model_exports};
-use volumetric_abi::host::{post_output, read_input, report_error};
-
-/// Add get_dimensions wrapper that passes through from model A
-fn add_get_dimensions_wrapper(
-    types: &mut TypeSection,
-    funcs: &mut FunctionSection,
-    code: &mut CodeSection,
-    exports: &mut ExportSection,
-    a_idx: u32,
-) {
-    let ty = types.len();
-    types.ty().function([], [ValType::I32]);
-    funcs.function(ty);
-
-    let mut f = Function::new([]);
-    f.instruction(&Instruction::Call(a_idx));
-    f.instruction(&Instruction::End);
-    code.function(&f);
-
-    let func_index = funcs.len() - 1;
-    exports.export("get_dimensions", ExportKind::Func, func_index);
-}
-
-/// Add get_bounds wrapper that combines bounds from both models.
-///
-/// The merged module keeps both models' memories, so each model's get_bounds
-/// writes into its *own* memory. A shares the module's exported memory, so it
-/// writes straight to `out_ptr`; B writes into its own IO buffer (obtained by
-/// calling B's `get_io_ptr`, index `b_io_idx`) in `b_mem_idx`. The combined
-/// result is stored to `out_ptr` in A's memory.
-#[allow(clippy::too_many_arguments)]
-fn add_get_bounds_wrapper(
-    types: &mut TypeSection,
-    funcs: &mut FunctionSection,
-    code: &mut CodeSection,
-    exports: &mut ExportSection,
-    a_idx: u32,
-    b_idx: u32,
-    b_io_idx: u32,
-    op: BooleanOp,
-    a_mem_idx: u32,
-    b_mem_idx: u32,
-) {
-    let ty = types.len();
-    types.ty().function([ValType::I32], []);
-    funcs.function(ty);
-
-    // Locals: out_ptr (param 0), A's bounds (1-6), B's bounds (7-12), b_io (13)
-    let locals = vec![
-        (6, ValType::F64), // a_min_x, a_max_x, a_min_y, a_max_y, a_min_z, a_max_z
-        (6, ValType::F64), // b_min_x, b_max_x, b_min_y, b_max_y, b_min_z, b_max_z
-        (1, ValType::I32), // B's IO buffer pointer
-    ];
-    let mut f = Function::new(locals);
-
-    // Call A's get_bounds directly into out_ptr (A's memory is exported)
-    f.instruction(&Instruction::LocalGet(0));
-    f.instruction(&Instruction::Call(a_idx));
-
-    if op != BooleanOp::Subtract {
-        // For subtract, A's bounds at out_ptr are already the answer.
-        // Otherwise load A's bounds into locals before overwriting out_ptr.
-        for i in 0..6 {
-            f.instruction(&Instruction::LocalGet(0));
-            f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
-                offset: (i * 8) as u64,
-                align: 3,
-                memory_index: a_mem_idx,
-            }));
-            f.instruction(&Instruction::LocalSet(1 + i)); // locals 1-6 are A's bounds
-        }
-
-        // b_io = B's get_io_ptr()
-        f.instruction(&Instruction::Call(b_io_idx));
-        f.instruction(&Instruction::LocalSet(13));
-
-        // Call B's get_bounds into B's own IO buffer
-        f.instruction(&Instruction::LocalGet(13));
-        f.instruction(&Instruction::Call(b_idx));
-
-        // Load B's bounds (B wrote into its own memory)
-        for i in 0..6 {
-            f.instruction(&Instruction::LocalGet(13));
-            f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
-                offset: (i * 8) as u64,
-                align: 3,
-                memory_index: b_mem_idx,
-            }));
-            f.instruction(&Instruction::LocalSet(7 + i)); // locals 7-12 are B's bounds
-        }
-
-        // Combine bounds based on operation
-        // Format: min_x(0), max_x(1), min_y(2), max_y(3), min_z(4), max_z(5)
-        for i in 0..6 {
-            let is_min = i % 2 == 0;
-            f.instruction(&Instruction::LocalGet(0)); // out_ptr
-            f.instruction(&Instruction::LocalGet(1 + i)); // A's bound
-            f.instruction(&Instruction::LocalGet(7 + i)); // B's bound
-
-            match (op, is_min) {
-                (BooleanOp::Union, true) => f.instruction(&Instruction::F64Min), // min of mins
-                (BooleanOp::Union, false) => f.instruction(&Instruction::F64Max), // max of maxs
-                (BooleanOp::Intersect, true) => f.instruction(&Instruction::F64Max), // max of mins
-                (BooleanOp::Intersect, false) => f.instruction(&Instruction::F64Min), // min of maxs
-                (BooleanOp::Subtract, _) => unreachable!(),
-            };
-
-            f.instruction(&Instruction::F64Store(wasm_encoder::MemArg {
-                offset: (i * 8) as u64,
-                align: 3,
-                memory_index: a_mem_idx,
-            }));
-        }
-    }
-
-    f.instruction(&Instruction::End);
-    code.function(&f);
-
-    let func_index = funcs.len() - 1;
-    exports.export("get_bounds", ExportKind::Func, func_index);
-}
-
-/// Copy `dims_bytes` (local `dims_local`) bytes of position from A's
-/// memory at the pointer in `pos_local` into B's IO buffer (local
-/// `b_io_local`): B's code reads its *own* memory. Must run before A's
-/// sample executes — the ABI allows a model to clobber its position
-/// buffer.
-fn emit_copy_position_to_b(
-    f: &mut Function,
-    pos_local: u32,
-    dims_local: u32,
-    i_local: u32,
-    b_io_local: u32,
-    a_mem_idx: u32,
-    b_mem_idx: u32,
-) {
-    // for (i = 0; i < dims_bytes; i += 8)
-    //     B_mem[b_io + i] = A_mem[pos + i]
-    f.instruction(&Instruction::I32Const(0));
-    f.instruction(&Instruction::LocalSet(i_local));
-    f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
-    f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
-    f.instruction(&Instruction::LocalGet(i_local));
-    f.instruction(&Instruction::LocalGet(dims_local));
-    f.instruction(&Instruction::I32GeS);
-    f.instruction(&Instruction::BrIf(1));
-    f.instruction(&Instruction::LocalGet(b_io_local));
-    f.instruction(&Instruction::LocalGet(i_local));
-    f.instruction(&Instruction::I32Add); // dest address in B's memory
-    f.instruction(&Instruction::LocalGet(pos_local));
-    f.instruction(&Instruction::LocalGet(i_local));
-    f.instruction(&Instruction::I32Add); // src address in A's memory
-    f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
+fn f64_at(memory: u32) -> MemArg {
+    MemArg {
         offset: 0,
         align: 3,
-        memory_index: a_mem_idx,
-    }));
-    f.instruction(&Instruction::F64Store(wasm_encoder::MemArg {
-        offset: 0,
-        align: 3,
-        memory_index: b_mem_idx,
-    }));
-    f.instruction(&Instruction::LocalGet(i_local));
-    f.instruction(&Instruction::I32Const(8));
-    f.instruction(&Instruction::I32Add);
-    f.instruction(&Instruction::LocalSet(i_local));
-    f.instruction(&Instruction::Br(0));
-    f.instruction(&Instruction::End);
-    f.instruction(&Instruction::End);
-}
-
-/// Combine A's occupancy (a boolean i32 already on the stack) with B's:
-/// calls B's sample on the position previously copied into B's IO buffer
-/// (local `b_io_local`) and leaves the combined boolean i32 on the stack.
-/// Classification uses the shared occupancy contract (`volumetric_abi`:
-/// OCCUPANCY_THRESHOLD).
-fn emit_combine_with_b(f: &mut Function, b_idx: u32, b_io_local: u32, op: BooleanOp) {
-    f.instruction(&Instruction::LocalGet(b_io_local));
-    f.instruction(&Instruction::Call(b_idx));
-    f.instruction(&Instruction::F32Const(0.5.into()));
-    f.instruction(&Instruction::F32Gt);
-    match op {
-        // a && !b
-        BooleanOp::Subtract => {
-            f.instruction(&Instruction::I32Eqz);
-            f.instruction(&Instruction::I32And);
-        }
-        // a || b
-        BooleanOp::Union => {
-            f.instruction(&Instruction::I32Or);
-        }
-        // a && b
-        BooleanOp::Intersect => {
-            f.instruction(&Instruction::I32And);
-        }
+        memory_index: memory,
     }
 }
 
-/// Add sample wrapper that combines densities from both models.
-///
-/// The caller writes the position into the module's exported memory (A's), so
-/// A's sample can read `pos_ptr` directly. B's code reads its *own* memory,
-/// so the wrapper copies `dims * 8` bytes from A's memory at `pos_ptr` into
-/// B's IO buffer (obtained by calling B's `get_io_ptr`, index `b_io_idx`),
-/// then calls B with that pointer. The copy happens before calling A because
-/// the ABI allows a model's sample to clobber its position buffer.
-#[allow(clippy::too_many_arguments)]
-fn add_sample_wrapper(
-    types: &mut TypeSection,
-    funcs: &mut FunctionSection,
-    code: &mut CodeSection,
-    exports: &mut ExportSection,
-    a_idx: u32,
-    b_idx: u32,
-    b_io_idx: u32,
-    a_dims_idx: u32,
-    op: BooleanOp,
-    a_mem_idx: u32,
-    b_mem_idx: u32,
-) {
-    let ty = types.len();
-    types.ty().function([ValType::I32], [ValType::F32]);
-    funcs.function(ty);
-
-    // Locals: pos_ptr (param 0), dims_bytes (1), i (2), b_io (3)
-    let mut f = Function::new([(3, ValType::I32)]);
-
-    // dims_bytes = get_dimensions() * 8
-    f.instruction(&Instruction::Call(a_dims_idx));
-    f.instruction(&Instruction::I32Const(3));
-    f.instruction(&Instruction::I32Shl);
-    f.instruction(&Instruction::LocalSet(1));
-
-    // b_io = B's get_io_ptr()
-    f.instruction(&Instruction::Call(b_io_idx));
-    f.instruction(&Instruction::LocalSet(3));
-
-    emit_copy_position_to_b(&mut f, 0, 1, 2, 3, a_mem_idx, b_mem_idx);
-
-    // Call A's sample with pos_ptr; a_bool = (a_occupancy > 0.5). The
-    // generated model emits canonical 1.0/0.0.
-    f.instruction(&Instruction::LocalGet(0));
-    f.instruction(&Instruction::Call(a_idx));
-    f.instruction(&Instruction::F32Const(0.5.into()));
-    f.instruction(&Instruction::F32Gt);
-    emit_combine_with_b(&mut f, b_idx, 3, op);
-
-    // Convert boolean i32 to f32 0.0/1.0
-    f.instruction(&Instruction::F32ConvertI32S);
-    f.instruction(&Instruction::End);
-    code.function(&f);
-
-    let func_index = funcs.len() - 1;
-    exports.export("sample", ExportKind::Func, func_index);
-}
-
-/// Add sample_channels wrapper: A's full channel row with channel 0
-/// replaced by the combined occupancy. B contributes occupancy only (via
-/// its plain `sample`), so the output keeps model A's declared format.
-///
-/// As in the sample wrapper, the position is copied into B's IO buffer
-/// before A runs — A's `sample_channels` may clobber its position buffer.
-#[allow(clippy::too_many_arguments)]
-fn add_sample_channels_wrapper(
-    types: &mut TypeSection,
-    funcs: &mut FunctionSection,
-    code: &mut CodeSection,
-    exports: &mut ExportSection,
-    a_channels_idx: u32,
-    b_idx: u32,
-    b_io_idx: u32,
-    a_dims_idx: u32,
-    op: BooleanOp,
-    a_mem_idx: u32,
-    b_mem_idx: u32,
-) {
-    let ty = types.len();
-    types.ty().function([ValType::I32, ValType::I32], []);
-    funcs.function(ty);
-
-    // Locals: pos_ptr (param 0), out_ptr (param 1), dims_bytes (2), i (3),
-    // b_io (4)
-    let mut f = Function::new([(3, ValType::I32)]);
-
-    // dims_bytes = get_dimensions() * 8
-    f.instruction(&Instruction::Call(a_dims_idx));
-    f.instruction(&Instruction::I32Const(3));
-    f.instruction(&Instruction::I32Shl);
-    f.instruction(&Instruction::LocalSet(2));
-
-    // b_io = B's get_io_ptr()
-    f.instruction(&Instruction::Call(b_io_idx));
-    f.instruction(&Instruction::LocalSet(4));
-
-    emit_copy_position_to_b(&mut f, 0, 2, 3, 4, a_mem_idx, b_mem_idx);
-
-    // A.sample_channels(pos_ptr, out_ptr) fills the full row.
-    f.instruction(&Instruction::LocalGet(0));
-    f.instruction(&Instruction::LocalGet(1));
-    f.instruction(&Instruction::Call(a_channels_idx));
-
-    // out[0] = combine(out[0] > 0.5, B)
-    let out_mem = wasm_encoder::MemArg {
+fn f32_at(memory: u32) -> MemArg {
+    MemArg {
         offset: 0,
         align: 2,
-        memory_index: a_mem_idx,
-    };
-    f.instruction(&Instruction::LocalGet(1));
-    f.instruction(&Instruction::LocalGet(1));
-    f.instruction(&Instruction::F32Load(out_mem));
-    f.instruction(&Instruction::F32Const(0.5.into()));
-    f.instruction(&Instruction::F32Gt);
-    emit_combine_with_b(&mut f, b_idx, 4, op);
-    f.instruction(&Instruction::F32ConvertI32S);
-    f.instruction(&Instruction::F32Store(out_mem));
-    f.instruction(&Instruction::End);
-    code.function(&f);
-
-    let func_index = funcs.len() - 1;
-    exports.export("sample_channels", ExportKind::Func, func_index);
+        memory_index: memory,
+    }
 }
 
-fn merge_models(a_wasm: &[u8], b_wasm: &[u8], op: BooleanOp) -> Result<Vec<u8>, String> {
-    let a_counts = count_sections(a_wasm)?;
-    let b_counts = count_sections(b_wasm)?;
+/// The glue a wrapper needs: the first model's exports (its memory is the
+/// merged module's), and every other model to fold in.
+struct Glue<'a> {
+    first: &'a ModelExports,
+    others: &'a [Part],
+    op: BooleanOp,
+}
 
-    let a_exports = parse_model_exports(a_wasm)?;
-    let b_exports = parse_model_exports(b_wasm)?;
-
-    let mut sections = MergeSections::default();
-    sections.append_module(a_wasm, &mut OffsetReencoder::identity())?;
-    sections.append_module(b_wasm, &mut OffsetReencoder::after(&a_counts))?;
-
-    // Build exports with wrappers.
-    let mut exports = ExportSection::new();
-
-    // Export memory from model A
-    exports.export("memory", ExportKind::Memory, a_exports.memory);
-
-    add_get_dimensions_wrapper(
-        &mut sections.types,
-        &mut sections.funcs,
-        &mut sections.code,
-        &mut exports,
-        a_exports.get_dimensions,
-    );
-
-    // The merged model's IO buffer is A's: A's memory is the exported one, so
-    // A's get_io_ptr already points where callers need to write positions.
-    exports.export("get_io_ptr", ExportKind::Func, a_exports.get_io_ptr);
-
-    add_get_bounds_wrapper(
-        &mut sections.types,
-        &mut sections.funcs,
-        &mut sections.code,
-        &mut exports,
-        a_exports.get_bounds,
-        b_exports.get_bounds + a_counts.funcs,
-        b_exports.get_io_ptr + a_counts.funcs,
-        op,
-        a_exports.memory,
-        b_exports.memory + a_counts.memories,
-    );
-
-    add_sample_wrapper(
-        &mut sections.types,
-        &mut sections.funcs,
-        &mut sections.code,
-        &mut exports,
-        a_exports.sample,
-        b_exports.sample + a_counts.funcs,
-        b_exports.get_io_ptr + a_counts.funcs,
-        a_exports.get_dimensions,
-        op,
-        a_exports.memory,
-        b_exports.memory + a_counts.memories,
-    );
-
-    // Typed channels follow model A: pass its format through and keep its
-    // channel row with channel 0 replaced by the combined occupancy.
-    if let (Some(get_sample_format), Some(sample_channels)) =
-        (a_exports.get_sample_format, a_exports.sample_channels)
-    {
-        exports.export("get_sample_format", ExportKind::Func, get_sample_format);
-        add_sample_channels_wrapper(
-            &mut sections.types,
-            &mut sections.funcs,
-            &mut sections.code,
-            &mut exports,
-            sample_channels,
-            b_exports.sample + a_counts.funcs,
-            b_exports.get_io_ptr + a_counts.funcs,
-            a_exports.get_dimensions,
-            op,
-            a_exports.memory,
-            b_exports.memory + a_counts.memories,
-        );
+impl Glue<'_> {
+    fn first_memory(&self) -> u32 {
+        self.first.memory
     }
 
-    let data_count =
-        (a_counts.has_data_count || b_counts.has_data_count).then(|| a_counts.data + b_counts.data);
+    /// Emits `get_dimensions`, passed through from the first model.
+    fn add_get_dimensions(&self, sections: &mut MergeSections, exports: &mut ExportSection) {
+        let ty = sections.types.len();
+        sections.types.ty().function([], [ValType::I32]);
+        sections.funcs.function(ty);
+        let mut f = Function::new([]);
+        f.instruction(&Instruction::Call(self.first.get_dimensions));
+        f.instruction(&Instruction::End);
+        sections.code.function(&f);
+        exports.export("get_dimensions", ExportKind::Func, sections.funcs.len() - 1);
+    }
+
+    /// Emits `get_bounds(out_ptr)`: the first model writes into `out_ptr`
+    /// directly (its memory is the exported one). Subtraction keeps that
+    /// box; otherwise every other model writes its own IO buffer and each
+    /// of the `2 * n` values folds into `out_ptr` — minimum slots take the
+    /// min (union) or max (intersect) of the pair, maximum slots the
+    /// reverse. The count comes from `get_dimensions` at run time.
+    fn add_get_bounds(&self, sections: &mut MergeSections, exports: &mut ExportSection) {
+        let ty = sections.types.len();
+        sections.types.ty().function([ValType::I32], []);
+        sections.funcs.function(ty);
+
+        // Locals: out_ptr (param 0), n_bytes (1), io (2), j (3), a (4), b (5)
+        const OUT: u32 = 0;
+        const N_BYTES: u32 = 1;
+        const IO: u32 = 2;
+        const J: u32 = 3;
+        const A: u32 = 4;
+        const B: u32 = 5;
+        let mut f = Function::new([(3, ValType::I32), (2, ValType::F64)]);
+
+        f.instruction(&Instruction::LocalGet(OUT));
+        f.instruction(&Instruction::Call(self.first.get_bounds));
+
+        if self.op != BooleanOp::Subtract {
+            // n_bytes = 2 * dims * 8
+            f.instruction(&Instruction::Call(self.first.get_dimensions));
+            f.instruction(&Instruction::I32Const(4));
+            f.instruction(&Instruction::I32Shl);
+            f.instruction(&Instruction::LocalSet(N_BYTES));
+
+            for part in self.others {
+                f.instruction(&Instruction::Call(part.get_io_ptr));
+                f.instruction(&Instruction::LocalSet(IO));
+                f.instruction(&Instruction::LocalGet(IO));
+                f.instruction(&Instruction::Call(part.get_bounds));
+
+                // for (j = 0; j < n_bytes; j += 8) out[j] = fold(out[j], io[j])
+                f.instruction(&Instruction::I32Const(0));
+                f.instruction(&Instruction::LocalSet(J));
+                f.instruction(&Instruction::Block(BlockType::Empty));
+                f.instruction(&Instruction::Loop(BlockType::Empty));
+                f.instruction(&Instruction::LocalGet(J));
+                f.instruction(&Instruction::LocalGet(N_BYTES));
+                f.instruction(&Instruction::I32GeS);
+                f.instruction(&Instruction::BrIf(1));
+
+                // store address, then the two operands into locals
+                f.instruction(&Instruction::LocalGet(OUT));
+                f.instruction(&Instruction::LocalGet(J));
+                f.instruction(&Instruction::I32Add);
+                f.instruction(&Instruction::LocalGet(OUT));
+                f.instruction(&Instruction::LocalGet(J));
+                f.instruction(&Instruction::I32Add);
+                f.instruction(&Instruction::F64Load(f64_at(self.first_memory())));
+                f.instruction(&Instruction::LocalSet(A));
+                f.instruction(&Instruction::LocalGet(IO));
+                f.instruction(&Instruction::LocalGet(J));
+                f.instruction(&Instruction::I32Add);
+                f.instruction(&Instruction::F64Load(f64_at(part.memory)));
+                f.instruction(&Instruction::LocalSet(B));
+
+                // select(min-slot ? low : high): slot j/8 is a minimum when
+                // even, i.e. when bit 3 of the byte offset is clear.
+                let (low, high) = match self.op {
+                    BooleanOp::Union => (Instruction::F64Min, Instruction::F64Max),
+                    BooleanOp::Intersect => (Instruction::F64Max, Instruction::F64Min),
+                    BooleanOp::Subtract => unreachable!("subtract keeps the first box"),
+                };
+                f.instruction(&Instruction::LocalGet(A));
+                f.instruction(&Instruction::LocalGet(B));
+                f.instruction(&low);
+                f.instruction(&Instruction::LocalGet(A));
+                f.instruction(&Instruction::LocalGet(B));
+                f.instruction(&high);
+                f.instruction(&Instruction::LocalGet(J));
+                f.instruction(&Instruction::I32Const(8));
+                f.instruction(&Instruction::I32And);
+                f.instruction(&Instruction::I32Eqz);
+                f.instruction(&Instruction::Select);
+                f.instruction(&Instruction::F64Store(f64_at(self.first_memory())));
+
+                f.instruction(&Instruction::LocalGet(J));
+                f.instruction(&Instruction::I32Const(8));
+                f.instruction(&Instruction::I32Add);
+                f.instruction(&Instruction::LocalSet(J));
+                f.instruction(&Instruction::Br(0));
+                f.instruction(&Instruction::End);
+                f.instruction(&Instruction::End);
+            }
+        }
+
+        f.instruction(&Instruction::End);
+        sections.code.function(&f);
+        exports.export("get_bounds", ExportKind::Func, sections.funcs.len() - 1);
+    }
+
+    /// Copies the position at `pos` (first model's memory, `dims_bytes`
+    /// long) into every other model's IO buffer, recording each buffer in
+    /// `io_locals`. Each model's code reads its own memory, and this runs
+    /// before the first model samples because the ABI lets a model clobber
+    /// its position buffer.
+    fn emit_copy_positions(
+        &self,
+        f: &mut Function,
+        pos: u32,
+        dims_bytes: u32,
+        i: u32,
+        io_locals: &[u32],
+    ) {
+        for (part, &io) in self.others.iter().zip(io_locals) {
+            f.instruction(&Instruction::Call(part.get_io_ptr));
+            f.instruction(&Instruction::LocalSet(io));
+
+            // for (i = 0; i < dims_bytes; i += 8) part_mem[io + i] = mem[pos + i]
+            f.instruction(&Instruction::I32Const(0));
+            f.instruction(&Instruction::LocalSet(i));
+            f.instruction(&Instruction::Block(BlockType::Empty));
+            f.instruction(&Instruction::Loop(BlockType::Empty));
+            f.instruction(&Instruction::LocalGet(i));
+            f.instruction(&Instruction::LocalGet(dims_bytes));
+            f.instruction(&Instruction::I32GeS);
+            f.instruction(&Instruction::BrIf(1));
+            f.instruction(&Instruction::LocalGet(io));
+            f.instruction(&Instruction::LocalGet(i));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalGet(pos));
+            f.instruction(&Instruction::LocalGet(i));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::F64Load(f64_at(self.first_memory())));
+            f.instruction(&Instruction::F64Store(f64_at(part.memory)));
+            f.instruction(&Instruction::LocalGet(i));
+            f.instruction(&Instruction::I32Const(8));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalSet(i));
+            f.instruction(&Instruction::Br(0));
+            f.instruction(&Instruction::End);
+            f.instruction(&Instruction::End);
+        }
+    }
+
+    /// Folds every other model's occupancy into `acc` (an i32 boolean local
+    /// already holding the first model's), stopping as soon as the answer
+    /// is decided: a union at the first occupied model, an intersection at
+    /// the first empty one, a subtraction at the first model that carves
+    /// the point away. Classification uses the shared occupancy contract
+    /// (`volumetric_abi`: OCCUPANCY_THRESHOLD).
+    fn emit_combine_others(&self, f: &mut Function, acc: u32, io_locals: &[u32]) {
+        f.instruction(&Instruction::Block(BlockType::Empty));
+        match self.op {
+            BooleanOp::Union => {
+                f.instruction(&Instruction::LocalGet(acc));
+                f.instruction(&Instruction::BrIf(0));
+                for (part, &io) in self.others.iter().zip(io_locals) {
+                    f.instruction(&Instruction::LocalGet(io));
+                    f.instruction(&Instruction::Call(part.sample));
+                    f.instruction(&Instruction::F32Const(0.5.into()));
+                    f.instruction(&Instruction::F32Gt);
+                    f.instruction(&Instruction::LocalTee(acc));
+                    f.instruction(&Instruction::BrIf(0));
+                }
+            }
+            BooleanOp::Intersect => {
+                f.instruction(&Instruction::LocalGet(acc));
+                f.instruction(&Instruction::I32Eqz);
+                f.instruction(&Instruction::BrIf(0));
+                for (part, &io) in self.others.iter().zip(io_locals) {
+                    f.instruction(&Instruction::LocalGet(io));
+                    f.instruction(&Instruction::Call(part.sample));
+                    f.instruction(&Instruction::F32Const(0.5.into()));
+                    f.instruction(&Instruction::F32Gt);
+                    f.instruction(&Instruction::LocalTee(acc));
+                    f.instruction(&Instruction::I32Eqz);
+                    f.instruction(&Instruction::BrIf(0));
+                }
+            }
+            BooleanOp::Subtract => {
+                f.instruction(&Instruction::LocalGet(acc));
+                f.instruction(&Instruction::I32Eqz);
+                f.instruction(&Instruction::BrIf(0));
+                for (part, &io) in self.others.iter().zip(io_locals) {
+                    f.instruction(&Instruction::LocalGet(io));
+                    f.instruction(&Instruction::Call(part.sample));
+                    f.instruction(&Instruction::F32Const(0.5.into()));
+                    f.instruction(&Instruction::F32Gt);
+                    f.instruction(&Instruction::If(BlockType::Empty));
+                    f.instruction(&Instruction::I32Const(0));
+                    f.instruction(&Instruction::LocalSet(acc));
+                    f.instruction(&Instruction::Br(1));
+                    f.instruction(&Instruction::End);
+                }
+            }
+        }
+        f.instruction(&Instruction::End);
+    }
+
+    /// Emits `sample(pos_ptr) -> f32`: positions are copied to every other
+    /// model first, then the first model samples `pos_ptr` in place and
+    /// the rest fold in with an early exit.
+    fn add_sample(&self, sections: &mut MergeSections, exports: &mut ExportSection) {
+        let ty = sections.types.len();
+        sections.types.ty().function([ValType::I32], [ValType::F32]);
+        sections.funcs.function(ty);
+
+        // Locals: pos_ptr (param 0), dims_bytes (1), i (2), acc (3), io… (4..)
+        const POS: u32 = 0;
+        const DIMS_BYTES: u32 = 1;
+        const I: u32 = 2;
+        const ACC: u32 = 3;
+        let io_locals: Vec<u32> = (0..self.others.len() as u32).map(|k| 4 + k).collect();
+        let mut f = Function::new([(3 + self.others.len() as u32, ValType::I32)]);
+
+        f.instruction(&Instruction::Call(self.first.get_dimensions));
+        f.instruction(&Instruction::I32Const(3));
+        f.instruction(&Instruction::I32Shl);
+        f.instruction(&Instruction::LocalSet(DIMS_BYTES));
+        self.emit_copy_positions(&mut f, POS, DIMS_BYTES, I, &io_locals);
+
+        f.instruction(&Instruction::LocalGet(POS));
+        f.instruction(&Instruction::Call(self.first.sample));
+        f.instruction(&Instruction::F32Const(0.5.into()));
+        f.instruction(&Instruction::F32Gt);
+        f.instruction(&Instruction::LocalSet(ACC));
+        self.emit_combine_others(&mut f, ACC, &io_locals);
+
+        f.instruction(&Instruction::LocalGet(ACC));
+        f.instruction(&Instruction::F32ConvertI32S);
+        f.instruction(&Instruction::End);
+        sections.code.function(&f);
+        exports.export("sample", ExportKind::Func, sections.funcs.len() - 1);
+    }
+
+    /// Emits `sample_channels(pos_ptr, out_ptr)`: the first model's full
+    /// channel row with channel 0 replaced by the combined occupancy. As in
+    /// `sample`, positions are copied out before the first model runs.
+    fn add_sample_channels(
+        &self,
+        sections: &mut MergeSections,
+        exports: &mut ExportSection,
+        first_channels: u32,
+    ) {
+        let ty = sections.types.len();
+        sections
+            .types
+            .ty()
+            .function([ValType::I32, ValType::I32], []);
+        sections.funcs.function(ty);
+
+        // Locals: pos_ptr (0), out_ptr (1), dims_bytes (2), i (3), acc (4), io… (5..)
+        const POS: u32 = 0;
+        const OUT: u32 = 1;
+        const DIMS_BYTES: u32 = 2;
+        const I: u32 = 3;
+        const ACC: u32 = 4;
+        let io_locals: Vec<u32> = (0..self.others.len() as u32).map(|k| 5 + k).collect();
+        let mut f = Function::new([(3 + self.others.len() as u32, ValType::I32)]);
+
+        f.instruction(&Instruction::Call(self.first.get_dimensions));
+        f.instruction(&Instruction::I32Const(3));
+        f.instruction(&Instruction::I32Shl);
+        f.instruction(&Instruction::LocalSet(DIMS_BYTES));
+        self.emit_copy_positions(&mut f, POS, DIMS_BYTES, I, &io_locals);
+
+        f.instruction(&Instruction::LocalGet(POS));
+        f.instruction(&Instruction::LocalGet(OUT));
+        f.instruction(&Instruction::Call(first_channels));
+
+        let out_mem = f32_at(self.first_memory());
+        f.instruction(&Instruction::LocalGet(OUT));
+        f.instruction(&Instruction::F32Load(out_mem));
+        f.instruction(&Instruction::F32Const(0.5.into()));
+        f.instruction(&Instruction::F32Gt);
+        f.instruction(&Instruction::LocalSet(ACC));
+        self.emit_combine_others(&mut f, ACC, &io_locals);
+
+        f.instruction(&Instruction::LocalGet(OUT));
+        f.instruction(&Instruction::LocalGet(ACC));
+        f.instruction(&Instruction::F32ConvertI32S);
+        f.instruction(&Instruction::F32Store(out_mem));
+        f.instruction(&Instruction::End);
+        sections.code.function(&f);
+        exports.export("sample_channels", ExportKind::Func, sections.funcs.len() - 1);
+    }
+}
+
+/// Merges `models` (at least one) into one module whose exports implement
+/// `op` over all of them.
+fn merge_models(models: &[Vec<u8>], op: BooleanOp) -> Result<Vec<u8>, String> {
+    let mut sections = MergeSections::default();
+    let mut offsets = SectionCounts::default();
+    let mut first = None;
+    let mut others = Vec::new();
+    for (index, wasm) in models.iter().enumerate() {
+        let counts = count_sections(wasm).map_err(|e| format!("model {index}: {e}"))?;
+        let exports = parse_model_exports(wasm).map_err(|e| format!("model {index}: {e}"))?;
+        sections
+            .append_module(wasm, &mut OffsetReencoder::after(&offsets))
+            .map_err(|e| format!("model {index}: {e}"))?;
+        if index == 0 {
+            first = Some(exports);
+        } else {
+            others.push(Part::rebased(&exports, &offsets));
+        }
+        offsets.extend(&counts);
+    }
+    let first = first.ok_or_else(|| "no models to merge".to_string())?;
+    let glue = Glue {
+        first: &first,
+        others: &others,
+        op,
+    };
+
+    let mut exports = ExportSection::new();
+    // The merged model's memory and IO buffer are the first model's: its
+    // get_io_ptr already points where callers write positions.
+    exports.export("memory", ExportKind::Memory, first.memory);
+    exports.export("get_io_ptr", ExportKind::Func, first.get_io_ptr);
+    glue.add_get_dimensions(&mut sections, &mut exports);
+    glue.add_get_bounds(&mut sections, &mut exports);
+    glue.add_sample(&mut sections, &mut exports);
+    if let (Some(get_sample_format), Some(sample_channels)) =
+        (first.get_sample_format, first.sample_channels)
+    {
+        exports.export("get_sample_format", ExportKind::Func, get_sample_format);
+        glue.add_sample_channels(&mut sections, &mut exports, sample_channels);
+    }
+
+    let data_count = offsets.has_data_count.then_some(offsets.data);
     Ok(sections.finish(&exports, data_count))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn run() {
-    let a_buf = read_input(0);
-
-    let b_buf = read_input(1);
+    let count = input_count();
+    if count < 2 {
+        report_error("boolean needs at least one model input followed by the config");
+        return;
+    }
 
     let cfg = {
-        let cfg_buf = read_input(2);
+        let cfg_buf = read_input(count as i32 - 1);
         if cfg_buf.is_empty() {
             BooleanConfig::default()
         } else {
-            let mut cursor = std::io::Cursor::new(&cfg_buf);
-            match ciborium::de::from_reader::<BooleanConfig, _>(&mut cursor) {
+            match ciborium::de::from_reader::<BooleanConfig, _>(std::io::Cursor::new(&cfg_buf)) {
                 Ok(cfg) => cfg,
                 Err(e) => {
                     report_error(&format!("invalid configuration: {e}"));
@@ -498,16 +469,22 @@ pub extern "C" fn run() {
             }
         }
     };
-    let op = cfg.op.unwrap_or(BooleanOpConfig::Union).into();
+    let op = cfg.op.unwrap_or(BooleanOp::Union);
 
-    let output = match merge_models(&a_buf, &b_buf, op) {
-        Ok(out) => out,
-        Err(e) => {
-            report_error(&format!("model merge failed: {e}"));
-            return;
-        }
-    };
-    post_output(0, &output);
+    // Unwired entries in the model block read back empty and are skipped.
+    let models: Vec<Vec<u8>> = (0..count - 1)
+        .map(|idx| read_input(idx as i32))
+        .filter(|bytes| !bytes.is_empty())
+        .collect();
+    if models.is_empty() {
+        report_error("no models wired (connect at least one model input)");
+        return;
+    }
+
+    match merge_models(&models, op) {
+        Ok(output) => post_output(0, &output),
+        Err(e) => report_error(&format!("model merge failed: {e}")),
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -519,9 +496,10 @@ pub extern "C" fn get_metadata() -> i64 {
         OperatorMetadata {
             name: "boolean_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
-            docs: String::new(),
+            docs: include_str!("../README.md").to_string(),
             display_name: "Boolean".to_string(),
-            description: "Combine two models by union, subtraction, or intersection.".to_string(),
+            description: "Union, intersection, or subtraction of one or more models (subtract: the first minus the rest)."
+                .to_string(),
             category: "Combine".to_string(),
             icon_svg: volumetric_abi::icon_svg!(
                 r##"<rect x="3" y="3" width="12" height="12" rx="2"/>"##,
@@ -530,15 +508,10 @@ pub extern "C" fn get_metadata() -> i64 {
             .to_string(),
             inputs: vec![
                 OperatorMetadataInput::ModelWASM,
-                OperatorMetadataInput::ModelWASM,
                 OperatorMetadataInput::CBORConfiguration(schema),
             ],
-            variadic_input: None,
-            input_names: vec![
-                "Model A".to_string(),
-                "Model B".to_string(),
-                "Config".to_string(),
-            ],
+            variadic_input: Some(0),
+            input_names: vec!["Model".to_string(), "Config".to_string()],
             outputs: vec![OperatorMetadataOutput::ModelWASM],
             output_names: vec![],
         }

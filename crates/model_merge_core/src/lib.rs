@@ -1,10 +1,11 @@
 //! Module-merge plumbing for operators that combine WASM models.
 //!
-//! Merging two import-free modules works by appending every index-space
-//! section of module B after module A's, with B's internal references
-//! rebased by A's section counts ([`OffsetReencoder`]); each module keeps
-//! its own memory (the output is multi-memory). The consuming operator then
-//! emits its own glue/wrapper functions and the export section.
+//! Merging import-free modules works by appending every index-space
+//! section of each module after the previous ones', with its internal
+//! references rebased by the running section counts ([`OffsetReencoder`]);
+//! each module keeps its own memory (the output is multi-memory). The
+//! consuming operator then emits its own glue/wrapper functions and the
+//! export section.
 //!
 //! Extracted from `boolean_operator`, shared with `lattice_operator`.
 
@@ -22,6 +23,21 @@ pub struct SectionCounts {
     pub elements: u32,
     pub data: u32,
     pub has_data_count: bool,
+}
+
+impl SectionCounts {
+    /// Adds another module's counts, so the sum places the next module
+    /// after every module counted so far.
+    pub fn extend(&mut self, other: &SectionCounts) {
+        self.types += other.types;
+        self.funcs += other.funcs;
+        self.globals += other.globals;
+        self.tables += other.tables;
+        self.memories += other.memories;
+        self.elements += other.elements;
+        self.data += other.data;
+        self.has_data_count |= other.has_data_count;
+    }
 }
 
 pub fn count_sections(wasm: &[u8]) -> Result<SectionCounts, String> {
@@ -72,22 +88,17 @@ pub struct OffsetReencoder {
     pub global_offset: u32,
     pub table_offset: u32,
     pub memory_offset: u32,
+    pub data_offset: u32,
 }
 
 impl OffsetReencoder {
     /// Identity mapping — for the first module of a merge.
     pub fn identity() -> Self {
-        Self {
-            type_offset: 0,
-            func_offset: 0,
-            global_offset: 0,
-            table_offset: 0,
-            memory_offset: 0,
-        }
+        Self::after(&SectionCounts::default())
     }
 
-    /// Offsets that place a module after `counts` (a previously appended
-    /// module's section counts).
+    /// Offsets that place a module after `counts` (the summed section
+    /// counts of the modules appended before it).
     pub fn after(counts: &SectionCounts) -> Self {
         Self {
             type_offset: counts.types,
@@ -95,6 +106,7 @@ impl OffsetReencoder {
             global_offset: counts.globals,
             table_offset: counts.tables,
             memory_offset: counts.memories,
+            data_offset: counts.data,
         }
     }
 }
@@ -135,7 +147,7 @@ impl wasm_encoder::reencode::Reencode for OffsetReencoder {
     }
 
     fn data_index(&mut self, data: u32) -> Result<u32, wasm_encoder::reencode::Error<Self::Error>> {
-        Ok(data)
+        Ok(self.data_offset + data)
     }
 
     fn element_index(

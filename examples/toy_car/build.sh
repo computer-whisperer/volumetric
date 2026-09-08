@@ -35,9 +35,7 @@ op --operator cylinder_operator --input "$WELL" --input 'json:[0.025,0.009,0.009
 op --operator cylinder_operator --input "$WELL" --input 'json:[0.025,0.009,-0.009]' --input 'json:[0.025,0.009,-0.020]' --output-id well_fl --no-export
 op --operator cylinder_operator --input "$WELL" --input 'json:[-0.025,0.009,0.009]' --input 'json:[-0.025,0.009,0.020]' --output-id well_rr --no-export
 op --operator cylinder_operator --input "$WELL" --input 'json:[-0.025,0.009,-0.009]' --input 'json:[-0.025,0.009,-0.020]' --output-id well_rl --no-export
-op --operator boolean_operator --input asset:well_fr --input asset:well_fl --input "$UNION" --output-id wells_f --no-export
-op --operator boolean_operator --input asset:well_rr --input asset:well_rl --input "$UNION" --output-id wells_r --no-export
-op --operator boolean_operator --input asset:wells_f --input asset:wells_r --input "$UNION" --output-id wells --no-export
+op --operator boolean_operator --input asset:well_fr --input asset:well_fl --input asset:well_rr --input asset:well_rl --input "$UNION" --output-id wells --no-export
 
 # --- Side window recesses: sketch extruded through, minus the inner slab.
 # Side windows (x, y): rear rectangle, front window raked parallel to the windscreen.
@@ -62,11 +60,8 @@ op --operator path_sketch_operator --input 'json:{"path":"M -0.007 0.0096 H 0.00
 op --operator subspace_operator --input "$PLANE" --input 'json:[0.045,0.0,0.0]' --input 'json:[0.0,0.0,1.0]' --input 'json:[0.0,1.0,0.0]' --output-id grille_plane --no-export
 op --operator extrude_operator --input asset:grille_sketch --input 'json:{"height":0.009}' --input asset:grille_plane --output-id grille --no-export
 
-op --operator boolean_operator --input asset:body_round --input asset:wells --input "$SUB" --output-id body_c1 --no-export
-op --operator boolean_operator --input asset:body_c1 --input asset:window_recess --input "$SUB" --output-id body_c2 --no-export
-op --operator boolean_operator --input asset:body_c2 --input asset:windscreen --input "$SUB" --output-id body_c3 --no-export
-op --operator boolean_operator --input asset:body_c3 --input asset:rear_window --input "$SUB" --output-id body_c4 --no-export
-op --operator boolean_operator --input asset:body_c4 --input asset:grille --input "$SUB" --output-id body
+# One subtract step: the rounded body minus every cut.
+op --operator boolean_operator --input asset:body_round --input asset:wells --input asset:window_recess --input asset:windscreen --input asset:rear_window --input asset:grille --input "$SUB" --output-id body
 
 # --- Axles and headlights.
 AXLE='json:{"radius":0.0015,"cap":"flat"}'
@@ -88,14 +83,7 @@ op --operator translate_operator --input asset:wheel --input 'json:{"dx":-0.025,
 op --operator translate_operator --input asset:wheel_mirrored --input 'json:{"dx":0.025,"dy":0.009,"dz":-0.014}' --output-id wheel_fl --no-export
 op --operator translate_operator --input asset:wheel_mirrored --input 'json:{"dx":-0.025,"dy":0.009,"dz":-0.014}' --output-id wheel_rl --no-export
 
-# --- Assembly.
-op --operator boolean_operator --input asset:body --input asset:axle_f --input "$UNION" --output-id a1 --no-export
-op --operator boolean_operator --input asset:a1 --input asset:axle_r --input "$UNION" --output-id a2 --no-export
-op --operator boolean_operator --input asset:a2 --input asset:lamp_r --input "$UNION" --output-id a3 --no-export
-op --operator boolean_operator --input asset:a3 --input asset:lamp_l --input "$UNION" --output-id a4 --no-export
-op --operator boolean_operator --input asset:a4 --input asset:wheel_fr --input "$UNION" --output-id a5 --no-export
-op --operator boolean_operator --input asset:a5 --input asset:wheel_rr --input "$UNION" --output-id a6 --no-export
-op --operator boolean_operator --input asset:a6 --input asset:wheel_fl --input "$UNION" --output-id a7 --no-export
-op --operator boolean_operator --input asset:a7 --input asset:wheel_rl --input "$UNION" --output-id car
+# --- Assembly: one union of the body and every attached part.
+op --operator boolean_operator --input asset:body --input asset:axle_f --input asset:axle_r --input asset:lamp_r --input asset:lamp_l --input asset:wheel_fr --input asset:wheel_rr --input asset:wheel_fl --input asset:wheel_rl --input "$UNION" --output-id car
 
 $V project-run --project $P

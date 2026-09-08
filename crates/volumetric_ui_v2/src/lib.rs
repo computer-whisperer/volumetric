@@ -8070,6 +8070,9 @@ mod tests {
         let _ = &*PIN_ICON;
     }
 
+    /// The bundled boolean declares a variadic model block: a fresh step
+    /// starts with one numbered entry, and Add grows the block ahead of
+    /// the config.
     #[test]
     fn step_editor_labels_slots_with_declared_names() {
         let mut app = VolumetricUiV2::default();
@@ -8080,13 +8083,29 @@ mod tests {
         );
         app.before_build();
 
+        let slot_names = |app: &VolumetricUiV2| -> Vec<Option<String>> {
+            app.step_edit
+                .as_ref()
+                .expect("step editor state")
+                .asset_slots
+                .iter()
+                .map(|slot| slot.name.clone())
+                .collect()
+        };
+        assert_eq!(slot_names(&app), vec![Some("Model 1".to_string())]);
+
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{ADD_STEP_INPUT_PREFIX}0")),
+        );
+        assert_eq!(
+            slot_names(&app),
+            vec![Some("Model 1".to_string()), Some("Model 2".to_string())]
+        );
         let edit = app.step_edit.as_ref().expect("step editor state");
-        let names: Vec<Option<&str>> = edit
-            .asset_slots
-            .iter()
-            .map(|slot| slot.name.as_deref())
-            .collect();
-        assert_eq!(names, vec![Some("Model A"), Some("Model B")]);
+        assert_eq!(edit.config.as_ref().map(|config| config.input_idx), Some(2));
+        assert_eq!(edit.config.as_ref().and_then(|config| config.name.as_deref()), Some("Config"));
+        assert_eq!(app.project.timeline()[0].inputs.len(), 3);
     }
 
     /// A minimal operator (WAT text — the executor compiles it directly)
