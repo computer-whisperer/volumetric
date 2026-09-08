@@ -8,8 +8,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 volumetric_abi = { path = "../../volumetric_abi" }
-outline_model_core = { path = "../../outline_model_core" }
+outline_model_core = { path = "../../outline_model_core", features = ["emit"] }
 html_card_core = { path = "../../html_card_core" }
-walrus = "0.26"
 serde = { version = "1", features = ["derive"] }
 ciborium = "0.2"

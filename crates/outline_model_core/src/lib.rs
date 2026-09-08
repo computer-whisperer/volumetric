@@ -40,6 +40,10 @@
 //! bounds-guarded at query time, and anything malformed reads as outside —
 //! the ABI's errors-read-as-outside convention.
 
+#[cfg(feature = "emit")]
+pub mod emit;
+pub mod flatten;
+
 pub const MAGIC: u32 = 0x314C_544F; // "OTL1"
 const HEADER_LEN: usize = 48;
 const BAND_ENTRY_LEN: usize = 8;

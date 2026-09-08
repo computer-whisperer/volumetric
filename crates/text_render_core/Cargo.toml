@@ -4,4 +4,5 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+outline_model_core = { path = "../outline_model_core" }
 ttf-parser = "0.25"
