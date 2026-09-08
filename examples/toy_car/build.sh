@@ -44,14 +44,13 @@ op --operator extrude_operator --input asset:windows_sketch --input 'json:{"heig
 op --operator rectangular_prism_operator --input 'json:{}' --input 'json:[-0.05,0.0,-0.0148]' --input 'json:[0.05,0.05,0.0148]' --output-id inner_slab --no-export
 op --operator boolean_operator --input asset:windows_through --input asset:inner_slab --input "$SUB" --output-id window_recess --no-export
 
-# --- Windscreen and rear window: prisms rotated to the face rake about z,
-# then moved to the face midpoint (half outside, half recessing 1.2mm).
+# --- Windscreen and rear window: prisms built at the origin, posed in one
+# step each: raked about z to the face angle, then moved to the face
+# midpoint (half outside, half recessing 1.2mm).
 op --operator rectangular_prism_operator --input 'json:{"mode":"position_size"}' --input 'json:[0.0,0.0,0.0]' --input 'json:[0.0024,0.011,0.024]' --output-id ws_box --no-export
-op --operator rotation_operator --input asset:ws_box --input 'json:{"rz_deg":29.745}' --output-id ws_tilted --no-export
-op --operator translate_operator --input asset:ws_tilted --input 'json:{"dx":0.002,"dy":0.030,"dz":0.0}' --output-id windscreen --no-export
+op --operator pose_operator --input asset:ws_box --input 'json:{"rotate":{"rz_deg":29.745},"translate":{"dx":0.002,"dy":0.030}}' --output-id windscreen --no-export
 op --operator rectangular_prism_operator --input 'json:{"mode":"position_size"}' --input 'json:[0.0,0.0,0.0]' --input 'json:[0.0024,0.009,0.024]' --output-id rw_box --no-export
-op --operator rotation_operator --input asset:rw_box --input 'json:{"rz_deg":164.055}' --output-id rw_tilted --no-export
-op --operator translate_operator --input asset:rw_tilted --input 'json:{"dx":-0.026,"dy":0.030,"dz":0.0}' --output-id rear_window --no-export
+op --operator pose_operator --input asset:rw_box --input 'json:{"rotate":{"rz_deg":164.055},"translate":{"dx":-0.026,"dy":0.030}}' --output-id rear_window --no-export
 
 # --- Grille: front-view sketch on the yz plane at x = 45mm, extruded 9mm
 # back into the nose (basis (z, y) has normal z cross y = -x).

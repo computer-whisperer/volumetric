@@ -59,6 +59,7 @@ Transform operators take an existing model and produce a modified version:
 | `scale` | Scales a model uniformly or non-uniformly | `{sx, sy, sz}` - scale factors |
 | `rotation` | Rotates a model about the origin | `{rx_deg, ry_deg, rz_deg}` - Euler angles in degrees, applied X then Y then Z |
 | `pattern` | Repeats a model as mirrored, linear and circular copies in one single-memory step | `{mirror, linear, circular}` - optional blocks, composed in that order |
+| `pose` | Scales and rotates a model about a pivot (origin, bounds centre, or a point), then moves it | `{pivot, scale, rotate, translate}` - optional blocks |
 | `boolean` | Union, intersection, or subtraction of one or more models (one flat step, not a chain) | `{op}` - "union", "subtract", or "intersect" |
 | `coil` | Rolls a flat model into an Archimedean spiral around the y axis (x becomes arc length, z radial depth) | `{inner_radius, gap}` - bore radius and inter-wrap clearance |
 

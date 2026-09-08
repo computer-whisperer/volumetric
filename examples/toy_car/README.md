@@ -32,9 +32,9 @@ Cuts (all subtract from the rounded body):
   stays solid.
 - Side windows: a two-subpath sketch (x, y) extruded z -25..25, minus
   an inner slab |z| <= 14.8, leaving 1.2 mm-deep recesses on both flanks.
-- Windscreen / rear window: axis-aligned prisms rotated about z to the
-  face rake (29.7 deg / 164.1 deg) and translated to the face midpoint;
-  half sits outside, the inner half recesses 1.2 mm.
+- Windscreen / rear window: axis-aligned prisms posed in one step each,
+  rotated about z to the face rake (29.7 deg / 164.1 deg) and moved to
+  the face midpoint; half sits outside, the inner half recesses 1.2 mm.
 
 Additions (union):
 - Axles: a cylinder r 1.5 along z, z -17.5..17.5, at (25, 9), repeated
@@ -77,6 +77,8 @@ on a plane at x = 45 mm whose basis order gives a -x normal, extruded
 - Symmetric parts are stated once: `pattern_operator` places the wheel
   well, wheel, axle and headlight copies (mirror across the centre plane
   and a linear repeat to the rear axle) as one single-memory step each.
+- Placing a part is one step: `pose_operator` rotates the window prisms
+  about a pivot and moves them, where rotate-then-translate was two.
 - Operator modules are shared between steps that run the same build
   (`Project::insert_operation` reuses a byte-identical import, and
   loading merges duplicates from older files), so this project is a
