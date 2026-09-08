@@ -275,6 +275,7 @@ fn metadata_to_json(meta: &OperatorMetadata) -> OperatorMetadataJson {
 fn format_input(input: &ExecutionInput) -> String {
     match input {
         ExecutionInput::AssetRef(id) => format!("asset:{}", id),
+        ExecutionInput::Inline(d) if d.is_empty() => "none (unwired)".to_string(),
         ExecutionInput::Inline(d) => format!("inline:{} bytes", d.len()),
     }
 }

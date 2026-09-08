@@ -275,10 +275,13 @@ pub enum ExecutionInput {
 }
 
 impl ExecutionInput {
-    /// Returns a display-friendly description of this input.
+    /// Returns a display-friendly description of this input. Empty inline
+    /// bytes are how every host leaves an optional slot unwired (the
+    /// operator sees an empty input), so they read as such.
     pub fn display(&self) -> String {
         match self {
             ExecutionInput::AssetRef(id) => format!("Asset: {}", id),
+            ExecutionInput::Inline(data) if data.is_empty() => "Unwired".to_string(),
             ExecutionInput::Inline(data) => format!("Inline ({} bytes)", data.len()),
         }
     }

@@ -81,7 +81,7 @@ op --operator cylinder_operator --input "$LAMP" --input 'json:[0.036,0.017,-0.00
 # Tyre section (r, a): r 9, width 8, r1.5 shoulders, two 1.2 x 1.0 grooves,
 # a hub dish 1.2 deep on the outer (+a) face with a centre boss left standing.
 op --operator path_sketch_operator --input 'json:{"path":"M 0 -0.004 H 0.0075 A 0.0015 0.0015 0 0 1 0.009 -0.0025 V -0.002 H 0.008 V -0.0008 H 0.009 V 0.0008 H 0.008 V 0.002 H 0.009 V 0.0025 A 0.0015 0.0015 0 0 1 0.0075 0.004 H 0.0055 V 0.0028 H 0.0018 V 0.004 H 0 Z"}' --output-id wheel_sketch --no-export
-op --operator revolve_operator --input asset:wheel_sketch --input 'data:' --output-id wheel
+op --operator revolve_operator --input asset:wheel_sketch --input none --output-id wheel
 op --operator scale_operator --input asset:wheel --input 'json:{"sz":-1.0}' --output-id wheel_mirrored --no-export
 op --operator translate_operator --input asset:wheel --input 'json:{"dx":0.025,"dy":0.009,"dz":0.014}' --output-id wheel_fr --no-export
 op --operator translate_operator --input asset:wheel --input 'json:{"dx":-0.025,"dy":0.009,"dz":0.014}' --output-id wheel_rr --no-export

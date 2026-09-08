@@ -66,8 +66,8 @@ on a plane at x = 45 mm whose basis order gives a -x normal, extruded
 
 ## CLI notes from the exercise
 
-- An optional operator input (the revolve axis) has no unwired spelling
-  on `project-add-op`; `--input 'data:'` (empty bytes) is what works.
+- An optional operator input (the revolve axis) is left unwired with
+  `--input none` on `project-add-op`.
 - Operator modules are shared between steps that run the same build
   (`Project::insert_operation` reuses a byte-identical import, and
   loading merges duplicates from older files), so this 55-step project

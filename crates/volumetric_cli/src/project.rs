@@ -234,7 +234,8 @@ pub struct ProjectAddOpArgs {
     #[arg(long)]
     pub operator: String,
 
-    /// Input asset IDs or literal values (format: "asset:id", "json:{...}", or "data:base64")
+    /// One per declared input slot: "asset:id", "json:{...}", "file:path",
+    /// "data:base64", or "none" to leave an optional slot unwired
     #[arg(short, long)]
     pub input: Vec<String>,
 
@@ -258,10 +259,21 @@ enum ParsedInput {
     Json(serde_json::Value),
     /// Raw bytes from `file:` or `data:`, with the spec form kept for errors.
     Bytes(Vec<u8>, &'static str),
+    /// `none`: the slot stays unwired (empty inline bytes, which is what
+    /// the GUI stores for a slot it has nothing to wire and what operators
+    /// with optional inputs test for). Any slot type accepts it; a slot the
+    /// operator requires fails at run time with the operator's message.
+    Unwired,
 }
 
+/// The spelling that leaves a slot unwired. A bare word, so an asset that
+/// happens to be called `none` needs the `asset:` prefix.
+const UNWIRED_SPEC: &str = "none";
+
 fn parse_input(s: &str) -> Result<ParsedInput> {
-    if let Some(rest) = s.strip_prefix("asset:") {
+    if s == UNWIRED_SPEC {
+        Ok(ParsedInput::Unwired)
+    } else if let Some(rest) = s.strip_prefix("asset:") {
         Ok(ParsedInput::Asset(rest.to_string()))
     } else if let Some(rest) = s.strip_prefix("json:") {
         let json_value: serde_json::Value =
@@ -328,6 +340,7 @@ fn coerce_input(
     let inline = |bytes| Ok(ExecutionInput::Inline(bytes));
     match (parsed, slot) {
         (ParsedInput::Asset(id), _) => Ok(ExecutionInput::AssetRef(id)),
+        (ParsedInput::Unwired, _) => inline(Vec::new()),
 
         // VecF64: raw little-endian f64s. Accept a JSON array of the right
         // arity, or raw bytes of exactly the right length.
@@ -431,7 +444,8 @@ pub fn run_project_add_op(args: ProjectAddOpArgs) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to read operator metadata: {e}"))?;
     if args.input.len() != metadata.inputs.len() {
         anyhow::bail!(
-            "{op_name} expects {} input(s), got {}:\n{}",
+            "{op_name} expects {} input(s), got {}:\n{}\n(pass `{UNWIRED_SPEC}` for an \
+             optional slot you want to leave unwired)",
             metadata.inputs.len(),
             args.input.len(),
             describe_declared_inputs(&metadata)
@@ -893,6 +907,9 @@ fn describe_step_input(
     let label = name.map(|n| format!("{n} = ")).unwrap_or_default();
     let body = match input {
         ExecutionInput::AssetRef(id) => format!("asset:{id}"),
+        ExecutionInput::Inline(bytes) if bytes.is_empty() => {
+            format!("{UNWIRED_SPEC} (unwired)")
+        }
         ExecutionInput::Inline(bytes) => match slot {
             Some(OperatorMetadataInput::CBORConfiguration(_)) => {
                 match ciborium::from_reader::<ciborium::value::Value, _>(bytes.as_slice())
@@ -1306,6 +1323,26 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("23 bytes"), "{err}");
+    }
+
+    #[test]
+    fn none_leaves_any_slot_unwired() {
+        for slot in [
+            OperatorMetadataInput::Subspace,
+            OperatorMetadataInput::ModelWASM,
+            OperatorMetadataInput::Blob,
+            OperatorMetadataInput::CBORConfiguration(String::new()),
+        ] {
+            let parsed = parse_input("none").unwrap();
+            let input = coerce_input(parsed, &slot, "input [1]").unwrap();
+            assert!(
+                matches!(&input, ExecutionInput::Inline(bytes) if bytes.is_empty()),
+                "{slot:?} -> {input:?}"
+            );
+        }
+        // The bare word is reserved; an asset called `none` takes the prefix.
+        let parsed = parse_input("asset:none").unwrap();
+        assert!(matches!(parsed, ParsedInput::Asset(ref id) if id == "none"));
     }
 
     #[test]
