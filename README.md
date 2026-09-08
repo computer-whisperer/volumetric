@@ -70,6 +70,7 @@ Generator operators create new models from configuration or external data:
 | `stl_import` | Converts STL mesh to volumetric model | STL blob + CBOR config: `{scale, translate, center}` |
 | `heightmap_extrude` | Extrudes a heightmap image to 3D | Image blob + CBOR config: `{width, depth, height, clip}` |
 | `lua_script` | Custom occupancy model via restricted Lua | Lua source + optional routed `F64Map` parameters |
+| `path_sketch` | Fills SVG path data (lines, curves, arcs, holes) as a 2D sketch for extrude/revolve | CBOR config: `{path, flip_y, round, chord_tolerance}` |
 
 ### Data Operators
 

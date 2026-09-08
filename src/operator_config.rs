@@ -296,14 +296,17 @@ fn parse_record_body(s: &str) -> Result<Vec<ConfigField>, ConfigSchemaError> {
 
 /// Split a record body on the commas at nesting depth zero: commas inside
 /// group braces and array brackets belong to the nested type, not the
-/// record. (Quoted strings in this subset never contain braces, brackets,
-/// or commas.)
+/// record, and commas inside a quoted default (`.default "M0,0 H1"`)
+/// belong to the string.
 fn split_record_parts(s: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0usize;
+    let mut quoted = false;
     let mut start = 0;
     for (i, c) in s.char_indices() {
         match c {
+            '"' => quoted = !quoted,
+            _ if quoted => {}
             '{' | '[' => depth += 1,
             '}' | ']' => depth = depth.saturating_sub(1),
             ',' if depth == 0 => {
@@ -315,6 +318,26 @@ fn split_record_parts(s: &str) -> Vec<&str> {
     }
     parts.push(&s[start..]);
     parts
+}
+
+/// Whitespace tokens, except that a double-quoted string is one token
+/// (quotes included) however many spaces it holds.
+fn annotation_tokens(s: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    let mut rest = s;
+    loop {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            return tokens;
+        }
+        let end = if let Some(inner) = rest.strip_prefix('"') {
+            inner.find('"').map(|close| close + 2).unwrap_or(rest.len())
+        } else {
+            rest.find(char::is_whitespace).unwrap_or(rest.len())
+        };
+        tokens.push(&rest[..end]);
+        rest = &rest[end..];
+    }
 }
 
 /// Parse a group right-hand side: `{ ...sub-record... }` plus an optional
@@ -402,7 +425,7 @@ fn split_type_and_annotations(rhs: &str) -> FieldAnnotations<'_> {
         let mut default = None;
         let mut min = None;
         let mut max = None;
-        let tokens: Vec<&str> = rhs[start..].split_whitespace().collect();
+        let tokens = annotation_tokens(&rhs[start..]);
         let mut i = 0;
         while i < tokens.len() {
             match tokens[i] {
@@ -677,6 +700,21 @@ mod tests {
                 .unwrap();
         assert_eq!(fields[0].default, Some(ConfigValue::Text("z".to_string())));
         assert_eq!(fields[1].default, Some(ConfigValue::Text("hi".to_string())));
+    }
+
+    #[test]
+    fn quoted_defaults_may_contain_spaces_and_commas() {
+        let fields = parse_schema(
+            r#"{ path: tstr .default "M0,0 H1 V1 Z", round: float .default 0.0 }"#,
+        )
+        .unwrap();
+        assert_eq!(fields.len(), 2);
+        assert_eq!(
+            fields[0].default,
+            Some(ConfigValue::Text("M0,0 H1 V1 Z".to_string()))
+        );
+        assert_eq!(fields[1].name, "round");
+        assert_eq!(fields[1].default, Some(ConfigValue::Float(0.0)));
     }
 
     #[test]

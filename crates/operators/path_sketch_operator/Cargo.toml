@@ -1,0 +1,16 @@
+[package]
+name = "path_sketch_operator"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+volumetric_abi = { path = "../../volumetric_abi" }
+outline_model_core = { path = "../../outline_model_core", features = ["emit"] }
+serde = { version = "1", features = ["derive"] }
+ciborium = "0.2"
+
+[dev-dependencies]
+walrus = "0.26"
