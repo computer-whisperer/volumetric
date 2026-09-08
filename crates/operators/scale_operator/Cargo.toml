@@ -1,6 +1,6 @@
 [package]
 name = "scale_operator"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [lib]
@@ -10,4 +10,4 @@ crate-type = ["cdylib"]
 volumetric_abi = { path = "../../volumetric_abi" }
 serde = { version = "1", features = ["derive"] }
 ciborium = "0.2"
-walrus = "0.26"
+model_wrap_core = { path = "../../model_wrap_core" }

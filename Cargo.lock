@@ -3210,6 +3210,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "model_wrap_core"
+version = "0.1.0"
+dependencies = [
+ "walrus",
+]
+
+[[package]]
 name = "moxcms"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4620,12 +4627,12 @@ dependencies = [
 
 [[package]]
 name = "rotation_operator"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ciborium",
+ "model_wrap_core",
  "serde",
  "volumetric_abi",
- "walrus",
 ]
 
 [[package]]
@@ -4730,12 +4737,12 @@ dependencies = [
 
 [[package]]
 name = "scale_operator"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ciborium",
+ "model_wrap_core",
  "serde",
  "volumetric_abi",
- "walrus",
 ]
 
 [[package]]
@@ -5596,12 +5603,12 @@ dependencies = [
 
 [[package]]
 name = "translate_operator"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ciborium",
+ "model_wrap_core",
  "serde",
  "volumetric_abi",
- "walrus",
 ]
 
 [[package]]
