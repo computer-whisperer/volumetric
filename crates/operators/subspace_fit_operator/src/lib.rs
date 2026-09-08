@@ -830,6 +830,7 @@ pub extern "C" fn get_metadata() -> i64 {
                 OperatorMetadataInput::VecF64(3),
                 OperatorMetadataInput::CBORConfiguration(schema),
             ],
+            variadic_input: None,
             input_names: vec![
                 "Model".to_string(),
                 "Seed".to_string(),

@@ -145,6 +145,7 @@ pub extern "C" fn get_metadata() -> i64 {
             )
             .to_string(),
             inputs,
+            variadic_input: None,
             input_names,
             outputs: vec![OperatorMetadataOutput::Subspace],
             output_names: vec![],

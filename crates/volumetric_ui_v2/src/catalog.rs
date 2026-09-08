@@ -368,6 +368,7 @@ mod tests {
             icon_svg: r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#000" stroke-width="2"><circle cx="12" cy="12" r="9"/></svg>"##
                 .to_string(),
             inputs: vec![],
+            variadic_input: None,
             input_names: vec![],
             outputs: vec![],
             output_names: vec![],

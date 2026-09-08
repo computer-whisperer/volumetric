@@ -173,6 +173,7 @@ pub extern "C" fn get_metadata() -> i64 {
                 OperatorMetadataInput::VecF64(3),
                 OperatorMetadataInput::VecF64(3),
             ],
+            variadic_input: None,
             input_names: vec![
                 "Config".to_string(),
                 "Origin".to_string(),

@@ -26,6 +26,7 @@ fn output_ids_for_stays_unique_within_one_call() {
         category: String::new(),
         icon_svg: String::new(),
         inputs: vec![],
+        variadic_input: None,
         input_names: vec![],
         outputs: vec![
             OperatorMetadataOutput::ModelWASM,
@@ -55,6 +56,7 @@ fn operator_with_declared_outputs(outputs: Vec<OperatorMetadataOutput>) -> Vec<u
         category: String::new(),
         icon_svg: String::new(),
         inputs: vec![],
+        variadic_input: None,
         input_names: vec![],
         outputs: outputs.clone(),
         output_names: vec![],

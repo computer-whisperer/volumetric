@@ -197,6 +197,7 @@ pub extern "C" fn get_metadata() -> i64 {
                     .to_string(),
             ),
         ],
+        variadic_input: None,
         input_names: vec![
             "Mesh".to_string(),
             "Rigid body".to_string(),

@@ -185,6 +185,9 @@ struct OperatorMetadataJson {
     #[serde(skip_serializing_if = "String::is_empty")]
     docs: String,
     inputs: Vec<InputInfo>,
+    /// Index of the input slot that accepts one or more values, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    variadic_input: Option<usize>,
     outputs: Vec<OutputInfo>,
 }
 
@@ -258,6 +261,7 @@ fn metadata_to_json(meta: &OperatorMetadata) -> OperatorMetadataJson {
                 OperatorMetadataInput::Subspace => InputInfo::Subspace,
             })
             .collect(),
+        variadic_input: meta.variadic_input,
         outputs: meta
             .outputs
             .iter()
@@ -415,6 +419,9 @@ fn print_info_human(output: &InfoOutput) {
                         println!("  [{}] Subspace", i);
                     }
                 }
+            }
+            if let Some(slot) = metadata.variadic_input {
+                println!("  [{}] accepts one or more inputs", slot);
             }
             println!("Outputs:");
             for (i, output) in metadata.outputs.iter().enumerate() {

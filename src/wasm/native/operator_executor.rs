@@ -492,6 +492,16 @@ fn build_linker(
         )
         .map_err(instantiation)?;
 
+    // Host function: how many input slots the step carries (optional
+    // import; variadic operators size their input block from it)
+    linker
+        .func_wrap(
+            "host",
+            "get_input_count",
+            |caller: Caller<'_, OperatorState>| -> i32 { caller.data().inputs.len() as i32 },
+        )
+        .map_err(instantiation)?;
+
     // Host function: copy input data into WASM memory
     linker
         .func_wrap(
@@ -971,6 +981,10 @@ impl OperatorExecutor for NativeOperatorExecutor {
             .map_err(instantiation)?;
 
         linker
+            .func_wrap("host", "get_input_count", |_caller: Caller<'_, ()>| -> i32 { 0 })
+            .map_err(instantiation)?;
+
+        linker
             .func_wrap(
                 "host",
                 "post_output",
@@ -1252,6 +1266,32 @@ mod tests {
             }
             other => panic!("expected a worker-death failure, got {other:?}"),
         }
+    }
+
+    /// `get_input_count` reports the step's slot count — including empty
+    /// (unwired) slots, which `get_input_len` alone cannot tell from the
+    /// end of the inputs — and reads as 0 while probing metadata.
+    #[test]
+    fn input_count_reports_every_slot() {
+        let wasm = wat::parse_str(
+            r#"(module
+                (import "host" "get_input_count" (func $count (result i32)))
+                (import "host" "post_output" (func $post (param i32 i32 i32)))
+                (memory (export "memory") 1)
+                (func (export "run")
+                    (i32.store8 (i32.const 1024) (call $count))
+                    (call $post (i32.const 0) (i32.const 1024) (i32.const 1)))
+                (func (export "get_metadata") (result i64)
+                    (i32.store8 (i32.const 1024) (call $count))
+                    (i64.or (i64.const 1024) (i64.shl (i64.const 1) (i64.const 32)))))"#,
+        )
+        .unwrap();
+        let mut executor = NativeOperatorExecutor::new(&wasm).unwrap();
+        let io = executor
+            .run(OperatorIo::new(vec![b"a".to_vec(), Vec::new(), b"c".to_vec()]))
+            .expect("run should succeed");
+        assert_eq!(io.outputs.get(&0).map(Vec::as_slice), Some(&[3u8][..]));
+        assert_eq!(executor.get_metadata().unwrap(), vec![0u8]);
     }
 
     /// The host IO imports must work against a shared memory (a distinct

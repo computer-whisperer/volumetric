@@ -14,6 +14,8 @@
 //! Imports the host provides (module `"host"`), wrapped safely in [`host`]:
 //! - `get_input_len(idx: i32) -> u32`
 //! - `get_input_data(idx: i32, ptr: i32, len: i32)`
+//! - `get_input_count() -> i32` — optional; how many input slots the step
+//!   carries (see [`host::input_count`] and [`OperatorMetadata::variadic_input`])
 //! - `post_output(idx: i32, ptr: i32, len: i32)`
 //! - `post_error(ptr: i32, len: i32)` — optional; a run that posts an error
 //!   fails with the message instead of returning outputs
@@ -391,6 +393,16 @@ pub struct OperatorMetadata {
     #[serde(default)]
     pub docs: String,
     pub inputs: Vec<OperatorMetadataInput>,
+    /// Index into `inputs` of the one slot that accepts one or more values
+    /// (`None`: every slot takes exactly one). A step wires as many inputs
+    /// as it likes at that position and the slots after it shift along, so
+    /// a step's input count is `inputs.len() - 1 + k` for `k >= 1` entries
+    /// in the block; the helpers below own that arithmetic. The operator
+    /// learns `k` from [`host::input_count`] and skips empty (unwired)
+    /// entries. Defaulted so metadata built before the field existed still
+    /// decodes as fixed-arity.
+    #[serde(default)]
+    pub variadic_input: Option<usize>,
     /// Human-readable labels for `inputs`, parallel by index; hosts show
     /// `input_names[i]` next to input slot `i`. Defaulted so metadata from
     /// operators built before this field existed still decodes (they get an
@@ -433,6 +445,76 @@ impl OperatorMetadata {
             .get(idx)
             .map(String::as_str)
             .filter(|name| !name.is_empty())
+    }
+
+    /// The variadic slot index, when it names a declared slot.
+    fn variadic_slot(&self) -> Option<usize> {
+        self.variadic_input.filter(|&slot| slot < self.inputs.len())
+    }
+
+    /// Whether a step carrying `count` inputs fits this declaration: exactly
+    /// one per slot, or at least one per slot when a slot is variadic.
+    pub fn accepts_input_count(&self, count: usize) -> bool {
+        match self.variadic_slot() {
+            Some(_) => count >= self.inputs.len(),
+            None => count == self.inputs.len(),
+        }
+    }
+
+    /// How many entries beyond one-per-slot a `count`-input step carries in
+    /// the variadic block (0 for fixed-arity operators or a count that
+    /// doesn't fit).
+    fn extra_inputs(&self, count: usize) -> usize {
+        match self.variadic_slot() {
+            Some(_) if count >= self.inputs.len() => count - self.inputs.len(),
+            _ => 0,
+        }
+    }
+
+    /// The declared slot that input `idx` of a `count`-input step maps to,
+    /// or `None` past the declaration. A count that doesn't fit maps
+    /// positionally, so hosts can still describe a malformed step.
+    pub fn slot_of_input(&self, idx: usize, count: usize) -> Option<usize> {
+        let extra = self.extra_inputs(count);
+        let slot = match self.variadic_slot() {
+            Some(variadic) if idx > variadic => idx.saturating_sub(extra).max(variadic),
+            _ => idx,
+        };
+        (slot < self.inputs.len()).then_some(slot)
+    }
+
+    /// The step input index where declared slot `slot` starts in a
+    /// `count`-input step (its first entry, for the variadic slot).
+    pub fn input_of_slot(&self, slot: usize, count: usize) -> usize {
+        match self.variadic_slot() {
+            Some(variadic) if slot > variadic => slot + self.extra_inputs(count),
+            _ => slot,
+        }
+    }
+
+    /// The step input indices occupying the variadic block of a
+    /// `count`-input step, or `None` for fixed-arity operators.
+    pub fn variadic_range(&self, count: usize) -> Option<std::ops::Range<usize>> {
+        let variadic = self.variadic_slot()?;
+        Some(variadic..variadic + 1 + self.extra_inputs(count))
+    }
+
+    /// The declared input type of input `idx` in a `count`-input step.
+    pub fn input_type(&self, idx: usize, count: usize) -> Option<&OperatorMetadataInput> {
+        self.slot_of_input(idx, count).map(|slot| &self.inputs[slot])
+    }
+
+    /// Label for input `idx` of a `count`-input step: the slot's declared
+    /// name, numbered within the variadic block ("Model 2").
+    pub fn input_label(&self, idx: usize, count: usize) -> Option<String> {
+        let slot = self.slot_of_input(idx, count)?;
+        let name = self.input_name(slot)?;
+        match self.variadic_range(count) {
+            Some(range) if range.contains(&idx) => {
+                Some(format!("{name} {}", idx - range.start + 1))
+            }
+            _ => Some(name.to_string()),
+        }
     }
 }
 
@@ -529,6 +611,7 @@ pub mod host {
         unsafe extern "C" {
             pub fn get_input_len(idx: i32) -> u32;
             pub fn get_input_data(idx: i32, ptr: i32, len: i32);
+            pub fn get_input_count() -> i32;
             pub fn post_output(output_idx: i32, ptr: i32, len: i32);
             pub fn post_error(ptr: i32, len: i32);
             pub fn post_warning(ptr: i32, len: i32);
@@ -547,6 +630,17 @@ pub mod host {
             unsafe { raw::get_input_data(idx, buf.as_mut_ptr() as i32, len as i32) };
         }
         buf
+    }
+
+    /// How many input slots the running step carries — the upper bound for
+    /// [`read_input`] indices, and for an operator with a variadic slot
+    /// ([`crate::OperatorMetadata::variadic_input`]) the only way to learn
+    /// how many entries it received. NOTE: calling this makes the module
+    /// import `host.get_input_count`, which hosts older than the import
+    /// reject at instantiation; only call it from operators built alongside
+    /// their host.
+    pub fn input_count() -> usize {
+        unsafe { raw::get_input_count() }.max(0) as usize
     }
 
     /// Post `data` as the contents of output slot `idx`.
@@ -643,6 +737,7 @@ mod tests {
                 OperatorMetadataInput::FeaMesh,
                 OperatorMetadataInput::TriMesh,
             ],
+            variadic_input: None,
             input_names: vec![
                 "Model".to_string(),
                 "Config".to_string(),
@@ -703,6 +798,94 @@ mod tests {
         assert!(decoded.category.is_empty());
         assert!(decoded.icon_svg.is_empty());
         assert_eq!(decoded.catalog_name(), "legacy");
+    }
+
+    fn variadic(inputs: Vec<OperatorMetadataInput>, variadic_input: Option<usize>) -> OperatorMetadata {
+        OperatorMetadata {
+            name: "v".to_string(),
+            version: "0.0.0".to_string(),
+            display_name: String::new(),
+            description: String::new(),
+            category: String::new(),
+            icon_svg: String::new(),
+            docs: String::new(),
+            input_names: inputs
+                .iter()
+                .map(|input| match input {
+                    OperatorMetadataInput::ModelWASM => "Model".to_string(),
+                    OperatorMetadataInput::CBORConfiguration(_) => "Config".to_string(),
+                    _ => "Other".to_string(),
+                })
+                .collect(),
+            inputs,
+            variadic_input,
+            outputs: vec![OperatorMetadataOutput::ModelWASM],
+            output_names: vec![],
+        }
+    }
+
+    /// Fixed-arity metadata: exact count, positional mapping, plain labels.
+    #[test]
+    fn fixed_arity_maps_positionally() {
+        let m = variadic(
+            vec![
+                OperatorMetadataInput::ModelWASM,
+                OperatorMetadataInput::CBORConfiguration(String::new()),
+            ],
+            None,
+        );
+        assert!(m.accepts_input_count(2));
+        assert!(!m.accepts_input_count(1));
+        assert!(!m.accepts_input_count(3));
+        assert_eq!(m.slot_of_input(1, 2), Some(1));
+        assert_eq!(m.slot_of_input(2, 2), None);
+        assert_eq!(m.input_of_slot(1, 2), 1);
+        assert_eq!(m.variadic_range(2), None);
+        assert_eq!(m.input_label(0, 2).as_deref(), Some("Model"));
+    }
+
+    /// A variadic slot in the middle: the slots after it shift by the
+    /// block's extra entries, labels number the block, and a fresh
+    /// one-per-slot step is the minimum.
+    #[test]
+    fn variadic_block_shifts_later_slots() {
+        let m = variadic(
+            vec![
+                OperatorMetadataInput::CBORConfiguration(String::new()),
+                OperatorMetadataInput::ModelWASM,
+                OperatorMetadataInput::CBORConfiguration(String::new()),
+            ],
+            Some(1),
+        );
+        assert!(!m.accepts_input_count(2));
+        assert!(m.accepts_input_count(3));
+        assert!(m.accepts_input_count(6));
+        // Six inputs: config, four models, config.
+        assert_eq!(m.variadic_range(6), Some(1..5));
+        assert_eq!(m.slot_of_input(0, 6), Some(0));
+        assert_eq!(m.slot_of_input(1, 6), Some(1));
+        assert_eq!(m.slot_of_input(4, 6), Some(1));
+        assert_eq!(m.slot_of_input(5, 6), Some(2));
+        assert_eq!(m.slot_of_input(6, 6), None);
+        assert_eq!(m.input_of_slot(2, 6), 5);
+        assert_eq!(m.input_of_slot(1, 6), 1);
+        assert_eq!(m.input_label(3, 6).as_deref(), Some("Model 3"));
+        assert_eq!(m.input_label(5, 6).as_deref(), Some("Config"));
+        // The minimum step has one entry in the block.
+        assert_eq!(m.variadic_range(3), Some(1..2));
+        assert_eq!(m.slot_of_input(2, 3), Some(2));
+        // A count that doesn't fit describes positionally.
+        assert_eq!(m.slot_of_input(1, 2), Some(1));
+        assert_eq!(m.variadic_range(2), Some(1..2));
+    }
+
+    /// A variadic index past the declaration is ignored rather than trusted.
+    #[test]
+    fn out_of_range_variadic_index_is_fixed_arity() {
+        let m = variadic(vec![OperatorMetadataInput::ModelWASM], Some(3));
+        assert!(m.accepts_input_count(1));
+        assert!(!m.accepts_input_count(2));
+        assert_eq!(m.variadic_range(1), None);
     }
 
     #[test]

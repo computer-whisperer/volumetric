@@ -140,6 +140,7 @@ Operators are WASM modules that transform or generate models. They read inputs f
 |----------|-----------|---------|
 | `get_input_len` | `(idx: i32) -> u32` | Get byte length of input at index |
 | `get_input_data` | `(idx: i32, ptr: i32, len: i32)` | Copy input data to WASM memory |
+| `get_input_count` | `() -> i32` | Optional: how many input slots the step carries (variadic operators size their input block from it; 0 while probing metadata) |
 | `post_output` | `(output_idx: i32, ptr: i32, len: i32)` | Post output data to host |
 
 ### Required Exports
@@ -169,6 +170,10 @@ struct OperatorMetadata {
     category: String,           // free-form catalog grouping
     icon_svg: String,           // monochrome SVG (24×24, currentColor)
     inputs: Vec<OperatorMetadataInput>,
+    variadic_input: Option<usize>, // serde-defaulted: index of the one slot that
+                                // accepts one or more inputs; a step's extra
+                                // inputs sit at that position and later slots
+                                // shift along (helpers on the struct do the math)
     input_names: Vec<String>,   // labels parallel to `inputs`
     outputs: Vec<OperatorMetadataOutput>,
     output_names: Vec<String>,  // labels parallel to `outputs` (serde-defaulted);

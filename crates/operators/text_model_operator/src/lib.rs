@@ -256,6 +256,7 @@ pub extern "C" fn get_metadata() -> i64 {
                 OperatorMetadataInput::CBORConfiguration(schema),
                 OperatorMetadataInput::Blob,
             ],
+            variadic_input: None,
             input_names: vec!["Config".to_string(), "Font (TTF, optional)".to_string()],
             outputs: vec![OperatorMetadataOutput::ModelWASM],
             output_names: vec![],

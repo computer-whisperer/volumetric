@@ -260,6 +260,7 @@ mod operator {
                     OperatorMetadataInput::Blob,
                     OperatorMetadataInput::CBORConfiguration(schema),
                 ],
+                variadic_input: None,
                 input_names: vec!["STEP file".to_string(), "Config".to_string()],
                 outputs: vec![OperatorMetadataOutput::ModelWASM],
                 output_names: vec![],

@@ -347,6 +347,7 @@ pub extern "C" fn get_metadata() -> i64 {
                 OperatorMetadataInput::VecF64(3), // vector_a
                 OperatorMetadataInput::VecF64(3), // vector_b
             ],
+            variadic_input: None,
             input_names: vec![
                 "Config".to_string(),
                 "Vector A (corner or center)".to_string(),

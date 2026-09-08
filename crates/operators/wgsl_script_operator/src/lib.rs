@@ -224,6 +224,7 @@ pub extern "C" fn get_metadata() -> i64 {
             OperatorMetadataInput::WgslSource(WGSL_TEMPLATE.to_string()),
             OperatorMetadataInput::F64Map,
         ],
+        variadic_input: None,
         input_names: vec!["Script".to_string(), "Parameters".to_string()],
         outputs: vec![OperatorMetadataOutput::ModelWASM],
         output_names: vec![],

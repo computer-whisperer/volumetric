@@ -143,6 +143,7 @@ pub extern "C" fn get_metadata() -> i64 {
                 OperatorMetadataInput::Blob,
                 OperatorMetadataInput::CBORConfiguration(schema),
             ],
+            variadic_input: None,
             input_names: vec!["HTML".to_string(), "Config".to_string()],
             outputs: vec![
                 OperatorMetadataOutput::ModelWASM,

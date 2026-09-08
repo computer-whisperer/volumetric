@@ -60,6 +60,7 @@ pub extern "C" fn get_metadata() -> i64 {
         )
         .to_string(),
         inputs: vec![OperatorMetadataInput::F64Map; MAP_SLOTS],
+        variadic_input: None,
         input_names: vec![
             "Base".to_string(),
             "Override 1".to_string(),

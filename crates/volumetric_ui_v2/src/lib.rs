@@ -7621,6 +7621,7 @@ mod tests {
                 ),
                 OperatorMetadataInput::F64Map,
             ],
+            variadic_input: None,
             input_names: vec!["Script".to_string(), "Parameters".to_string()],
             outputs: vec![volumetric::OperatorMetadataOutput::ModelWASM],
             output_names: vec![],
@@ -7647,6 +7648,7 @@ mod tests {
         let merge_metadata = OperatorMetadata {
             name: "f64_map_merge_operator".to_string(),
             inputs: vec![OperatorMetadataInput::F64Map; 3],
+            variadic_input: None,
             input_names: vec![
                 "Base".to_string(),
                 "Override 1".to_string(),
@@ -7816,6 +7818,7 @@ mod tests {
             category: String::new(),
             icon_svg: String::new(),
             inputs: vec![OperatorMetadataInput::ModelWASM],
+            variadic_input: None,
             input_names: vec!["Model".to_string()],
             outputs: vec![volumetric::OperatorMetadataOutput::ModelWASM],
             output_names: vec![],
@@ -9365,6 +9368,7 @@ mod tests {
                     category: category.to_string(),
                     icon_svg: String::new(),
                     inputs: vec![],
+                    variadic_input: None,
                     input_names: vec![],
                     outputs: vec![],
                     output_names: vec![],

@@ -185,6 +185,7 @@ pub extern "C" fn get_metadata() -> i64 {
                 "{ resolution: int .ge 2 .le 128 .default 16 }".to_string(),
             ),
         ],
+        variadic_input: None,
         input_names: vec!["Domain model".to_string(), "Config".to_string()],
         outputs: vec![OperatorMetadataOutput::FeaMesh],
         output_names: vec![],

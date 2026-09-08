@@ -352,6 +352,7 @@ pub extern "C" fn get_metadata() -> i64 {
                 OperatorMetadataInput::ModelWASM,
                 OperatorMetadataInput::CBORConfiguration(schema),
             ],
+            variadic_input: None,
             input_names: vec!["Domain model".to_string(), "Config".to_string()],
             outputs: vec![OperatorMetadataOutput::FeaMesh],
             output_names: vec![],

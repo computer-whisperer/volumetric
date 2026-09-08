@@ -137,6 +137,7 @@ pub extern "C" fn get_metadata() -> i64 {
         )
         .to_string(),
         inputs: vec![OperatorMetadataInput::TriMesh],
+        variadic_input: None,
         input_names: vec!["Mesh".to_string()],
         outputs: vec![OperatorMetadataOutput::ModelWASM],
         output_names: vec![],

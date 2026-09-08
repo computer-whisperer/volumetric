@@ -14,6 +14,7 @@ fn main() {
         )
         .to_string(),
         inputs: vec![],
+        variadic_input: None,
         input_names: vec![],
         outputs: vec![],
         output_names: vec![],

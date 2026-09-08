@@ -420,6 +420,7 @@ pub extern "C" fn get_metadata() -> i64 {
                 "{ min_density: float .default 0.2, max_density: float .default 1.0 }".to_string(),
             ),
         ],
+        variadic_input: None,
         input_names: vec![
             "Solved mesh".to_string(),
             "Geometry model".to_string(),

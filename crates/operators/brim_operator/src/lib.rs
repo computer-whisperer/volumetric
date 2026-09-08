@@ -1013,6 +1013,7 @@ pub extern "C" fn get_metadata() -> i64 {
                 OperatorMetadataInput::CBORConfiguration(schema),
                 OperatorMetadataInput::Subspace,
             ],
+            variadic_input: None,
             input_names: vec![
                 "Model".to_string(),
                 "Config".to_string(),

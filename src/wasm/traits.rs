@@ -259,6 +259,8 @@ impl OperatorIo {
 /// - `post_output(i32, i32, i32)` - Post output data from WASM memory
 ///
 /// # Optional WASM Imports (from "host")
+/// - `get_input_count() -> i32` - How many input slots the step carries;
+///   operators with a variadic slot size their input block from it.
 /// - `post_error(ptr: i32, len: i32)` - Report a failure with a UTF-8 message.
 ///   A run that posts an error fails with the message instead of returning
 ///   outputs; only the first posted error is kept.

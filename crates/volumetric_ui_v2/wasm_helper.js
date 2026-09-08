@@ -352,6 +352,12 @@ window.wasmOperatorCreate = function(bytes, inputs) {
                     return input ? input.length : 0;
                 },
 
+                // How many input slots the step carries (variadic
+                // operators size their input block from it)
+                get_input_count: function() {
+                    return state.inputs.length;
+                },
+
                 // Copy input data into WASM memory at ptr
                 get_input_data: function(idx, ptr, len) {
                     const input = state.inputs[idx];
