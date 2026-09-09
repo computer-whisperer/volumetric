@@ -25,7 +25,6 @@ use model_merge_core::{
     MergeSections, OffsetReencoder, count_sections, find_function_export, find_memory_export,
     parse_model_exports,
 };
-use model_wrap_core::const_i32_return;
 use volumetric_abi::host::{
     cancelled, input_model_bounds, input_model_dimensions, input_model_sample, post_output,
     read_input, report_error,
@@ -34,8 +33,6 @@ use volumetric_abi::{
     OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput, is_occupied,
 };
 use wasm_encoder::{ExportKind, ExportSection, Function, Instruction, MemArg, ValType};
-
-static TEMPLATE: &[u8] = include_bytes!("../template/sdf_model_template.wasm");
 
 #[derive(Clone, Copy, Debug, serde::Deserialize)]
 #[serde(default)]
@@ -72,64 +69,8 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// Generated-model template patching and merge glue
+// Merge glue: the patched field template beside the source model
 // ---------------------------------------------------------------------------
-
-fn take_slot_export(module: &mut walrus::Module, name: &str) -> Result<i32, String> {
-    let export = module
-        .exports
-        .iter()
-        .find(|export| export.name == name)
-        .map(|export| (export.id(), export.item))
-        .ok_or_else(|| format!("SDF template missing {name} export"))?;
-    let address = match export.1 {
-        walrus::ExportItem::Function(function) => const_i32_return(module, function)
-            .ok_or_else(|| format!("SDF template {name} is not a constant function"))?,
-        _ => return Err(format!("SDF template {name} is not a function")),
-    };
-    module.exports.delete(export.0);
-    Ok(address)
-}
-
-fn patch_template(payload: &[u8]) -> Result<Vec<u8>, String> {
-    let mut module =
-        walrus::Module::from_buffer_with_config(TEMPLATE, &walrus::ModuleConfig::new())
-            .map_err(|error| format!("failed to parse embedded SDF template: {error}"))?;
-    let memory_id = module
-        .exports
-        .iter()
-        .find(|export| export.name == "memory")
-        .and_then(|export| match export.item {
-            walrus::ExportItem::Memory(memory) => Some(memory),
-            _ => None,
-        })
-        .ok_or("SDF template missing memory export")?;
-    let payload_slot = take_slot_export(&mut module, "sdf_payload_slot")?;
-    let base = {
-        let memory = module.memories.get_mut(memory_id);
-        let base = memory.initial * 65_536;
-        memory.initial += (payload.len() as u64).div_ceil(65_536);
-        if let Some(maximum) = memory.maximum {
-            memory.maximum = Some(maximum.max(memory.initial));
-        }
-        base
-    };
-    module.data.add(
-        walrus::DataKind::Active {
-            memory: memory_id,
-            offset: walrus::ConstExpr::Value(walrus::ir::Value::I32(base as i32)),
-        },
-        payload.to_vec(),
-    );
-    module.data.add(
-        walrus::DataKind::Active {
-            memory: memory_id,
-            offset: walrus::ConstExpr::Value(walrus::ir::Value::I32(payload_slot)),
-        },
-        (base as u32).to_le_bytes().to_vec(),
-    );
-    Ok(module.emit_wasm())
-}
 
 fn add_bounds_glue(
     sections: &mut MergeSections,
@@ -341,7 +282,7 @@ fn build_output(source: &[u8], config: &SdfConfig) -> Result<Vec<u8>, String> {
         input_model_sample(0, positions, dimensions)
             .ok_or_else(|| "input model sampling failed".to_string())
     })?;
-    let template = patch_template(&payload)?;
+    let template = ndfield_model_core::emit::patch_payload(&payload)?;
     merge_with_source(source, &template, dimensions, &source_bounds)
 }
 

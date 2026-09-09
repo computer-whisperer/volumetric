@@ -3449,6 +3449,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nrrd_core"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4846,11 +4853,9 @@ version = "0.1.0"
 dependencies = [
  "ciborium",
  "model_merge_core",
- "model_wrap_core",
  "ndfield_model_core",
  "serde",
  "volumetric_abi",
- "walrus",
  "wasm-encoder 0.248.0",
 ]
 
@@ -5887,6 +5892,17 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "volume_import_operator"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "ndfield_model_core",
+ "nrrd_core",
+ "serde",
+ "volumetric_abi",
+]
 
 [[package]]
 name = "volumetric"

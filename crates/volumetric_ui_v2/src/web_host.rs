@@ -1198,6 +1198,12 @@ fn gather_file_task(
             operator_name: "point_cloud_import_operator",
             output_base: "point_cloud",
         }),
+        FileAction::ImportVolume => Some(FileTask::ImportBlob {
+            filter_name: "NRRD volumes",
+            extensions: &["nrrd"],
+            operator_name: "volume_import_operator",
+            output_base: "volume",
+        }),
     }
 }
 

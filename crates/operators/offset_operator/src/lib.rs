@@ -28,13 +28,8 @@
 //!
 //! Output 0: ModelWASM (input dimensionality).
 //!
-//! The embedded template binary is `sdf_model_template` (the same file
-//! `sdf_operator` embeds), regenerated with:
-//! ```text
-//! cargo build --release --target wasm32-unknown-unknown -p sdf_model_template
-//! cp target/wasm32-unknown-unknown/release/sdf_model_template.wasm \
-//!    crates/operators/offset_operator/template/
-//! ```
+//! The field evaluator template is the one `ndfield_model_core::emit`
+//! embeds.
 
 use ndfield_model_core::bake::{DEFAULT_BAND_CELLS, FieldGrid, bake_tsdf, sample_occupancy};
 use volumetric_abi::host::{
@@ -46,8 +41,6 @@ use volumetric_abi::{
 };
 
 /// The prebuilt template module (see the module docs for regeneration).
-const TEMPLATE: &[u8] = include_bytes!("../template/sdf_model_template.wasm");
-
 #[derive(Clone, Copy, Debug, serde::Deserialize)]
 #[serde(default)]
 pub struct OffsetConfig {
@@ -113,7 +106,12 @@ pub fn emit_model(
     dimensions: usize,
     out_bounds: &[f64],
 ) -> Result<Vec<u8>, String> {
-    ndfield_model_core::emit::emit_field_model(TEMPLATE, payload, dimensions, out_bounds)
+    ndfield_model_core::emit::emit_field_model(
+        payload,
+        dimensions,
+        out_bounds,
+        ndfield_model_core::emit::FieldSign::PositiveInside,
+    )
 }
 
 #[unsafe(no_mangle)]

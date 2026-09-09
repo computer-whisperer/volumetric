@@ -1,0 +1,9 @@
+[package]
+name = "nrrd_core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# gzip framing around the volume samples (pure-Rust miniz_oxide backend, so
+# the same code serves the wasm operators and the native hosts).
+flate2 = "1"

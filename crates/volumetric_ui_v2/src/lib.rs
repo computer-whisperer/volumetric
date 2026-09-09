@@ -152,6 +152,7 @@ pub const IMPORT_STEP_KEY: &str = "action:import-step";
 pub const IMPORT_IMAGE_KEY: &str = "action:import-image";
 pub const IMPORT_PLY_KEY: &str = "action:import-ply";
 pub const IMPORT_POINT_CLOUD_KEY: &str = "action:import-point-cloud";
+pub const IMPORT_VOLUME_KEY: &str = "action:import-volume";
 pub const RUN_PROJECT_KEY: &str = "action:run-project";
 pub const CANCEL_RUN_KEY: &str = "action:cancel-run";
 pub const TOGGLE_AUTO_REBUILD_KEY: &str = "action:toggle-auto-rebuild";
@@ -1066,6 +1067,9 @@ pub enum FileAction {
     /// Import a point-cloud file (PLY) as a Point1 cloud via the bundled
     /// `point_cloud_import_operator`.
     ImportPointCloud,
+    /// Import a sampled volume (NRRD) as a solid via the bundled
+    /// `volume_import_operator`.
+    ImportVolume,
 }
 
 /// What an output *is*, for view purposes: each kind gets its own render
@@ -4249,6 +4253,13 @@ impl App for VolumetricUiV2 {
             return;
         }
 
+        if event.is_click_or_activate(IMPORT_VOLUME_KEY) {
+            self.pending_file_action = Some(FileAction::ImportVolume);
+            self.open_menu = None;
+            self.add_modal = None;
+            return;
+        }
+
         if event.is_click_or_activate(ADD_OPEN_KEY) {
             self.add_modal = Some(AddModalState::default());
             // Focus lands in the search field so typing filters immediately.
@@ -4733,6 +4744,7 @@ fn catalog_row_key(entry: &catalog::CatalogEntry) -> String {
         "image_model_operator" => IMPORT_IMAGE_KEY.to_string(),
         "ply_import_operator" => IMPORT_PLY_KEY.to_string(),
         "point_cloud_import_operator" => IMPORT_POINT_CLOUD_KEY.to_string(),
+        "volume_import_operator" => IMPORT_VOLUME_KEY.to_string(),
         _ => match entry.kind {
             volumetric_assets::AssetCategory::Model => {
                 format!("{ADD_MODEL_PREFIX}{}", entry.name)
@@ -9592,6 +9604,8 @@ mod tests {
         assert_eq!(app.take_file_action(), Some(FileAction::ImportPly));
         dispatch(&mut app, UiEvent::synthetic_click(IMPORT_POINT_CLOUD_KEY));
         assert_eq!(app.take_file_action(), Some(FileAction::ImportPointCloud));
+        dispatch(&mut app, UiEvent::synthetic_click(IMPORT_VOLUME_KEY));
+        assert_eq!(app.take_file_action(), Some(FileAction::ImportVolume));
     }
 
     #[test]

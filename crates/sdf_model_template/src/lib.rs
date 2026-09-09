@@ -15,13 +15,14 @@
 //! - `get_io_ptr()` returns a buffer large enough for the maximum supported
 //!   position/bounds row and channel output.
 //!
-//! Regenerate the operator's checked-in template after changing this crate or
-//! the read side of `ndfield_model_core`:
+//! Regenerate the checked-in template (one copy, embedded by
+//! `ndfield_model_core::emit` for every operator) after changing this crate
+//! or the read side of `ndfield_model_core`:
 //!
 //! ```text
 //! cargo build --release --target wasm32-unknown-unknown -p sdf_model_template
 //! cp target/wasm32-unknown-unknown/release/sdf_model_template.wasm \
-//!    crates/operators/sdf_operator/template/
+//!    crates/ndfield_model_core/template/
 //! ```
 
 use std::sync::OnceLock;
