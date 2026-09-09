@@ -704,10 +704,9 @@ mod tests {
 
     #[test]
     fn quoted_defaults_may_contain_spaces_and_commas() {
-        let fields = parse_schema(
-            r#"{ path: tstr .default "M0,0 H1 V1 Z", round: float .default 0.0 }"#,
-        )
-        .unwrap();
+        let fields =
+            parse_schema(r#"{ path: tstr .default "M0,0 H1 V1 Z", round: float .default 0.0 }"#)
+                .unwrap();
         assert_eq!(fields.len(), 2);
         assert_eq!(
             fields[0].default,

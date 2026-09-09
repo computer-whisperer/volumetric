@@ -1333,8 +1333,14 @@ mod tests {
         };
         assert_eq!(expected_input_count(&metadata), "at least 2");
         let described = describe_declared_inputs(&metadata);
-        assert!(described.contains("[0] Model (ModelWASM, one or more)"), "{described}");
-        assert!(described.contains("[1] Config (CBOR configuration)"), "{described}");
+        assert!(
+            described.contains("[0] Model (ModelWASM, one or more)"),
+            "{described}"
+        );
+        assert!(
+            described.contains("[1] Config (CBOR configuration)"),
+            "{described}"
+        );
     }
 
     #[test]

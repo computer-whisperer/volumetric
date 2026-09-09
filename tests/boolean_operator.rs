@@ -209,10 +209,16 @@ fn intersect_of_three_models_needs_all() {
 fn subtract_removes_every_later_model_from_the_first() {
     // sphere − torus − box: only sphere points clear of both remain.
     let merged = merge(vec![sphere(), torus(), rounded_box()], "subtract");
-    assert!(!inside(&merged, IN_ALL_THREE), "point in torus and box kept");
+    assert!(
+        !inside(&merged, IN_ALL_THREE),
+        "point in torus and box kept"
+    );
     // (0, 0.5, 0) is inside the box core and the sphere, and 1.1 from the
     // torus ring: carved by the box alone.
-    assert!(!inside(&merged, (0.0, 0.5, 0.0)), "point carved by the box kept");
+    assert!(
+        !inside(&merged, (0.0, 0.5, 0.0)),
+        "point carved by the box kept"
+    );
     // (0, 0.9, 0) is past the box's y reach (0.6 core + 0.2 round) and off
     // the torus: survives.
     assert!(inside(&merged, SPHERE_ONLY), "sphere-only point lost");
@@ -228,7 +234,10 @@ fn subtract_removes_every_later_model_from_the_first() {
         (bounds.min.1, bounds.max.1),
         (bounds.min.2, bounds.max.2),
     ] {
-        assert!((min + 1.0).abs() < 1e-9 && (max - 1.0).abs() < 1e-9, "{bounds:?}");
+        assert!(
+            (min + 1.0).abs() < 1e-9 && (max - 1.0).abs() < 1e-9,
+            "{bounds:?}"
+        );
     }
 }
 
@@ -282,8 +291,9 @@ fn two_d_models_merge_with_two_d_bounds() {
 
 #[test]
 fn metadata_declares_a_variadic_model_block() {
-    let metadata = volumetric::operator_metadata_from_wasm_bytes(&wasm_artifact("boolean_operator"))
-        .expect("boolean metadata");
+    let metadata =
+        volumetric::operator_metadata_from_wasm_bytes(&wasm_artifact("boolean_operator"))
+            .expect("boolean metadata");
     assert_eq!(metadata.variadic_slot(), Some(0));
     assert!(metadata.accepts_input_count(2));
     assert!(metadata.accepts_input_count(9));

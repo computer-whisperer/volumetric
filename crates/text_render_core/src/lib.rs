@@ -10,8 +10,8 @@
 //!
 //! Re-exports `ttf_parser` so every consumer shapes with the same version.
 
-pub use ttf_parser;
 use outline_model_core::flatten;
+pub use ttf_parser;
 use ttf_parser::{Face, GlyphId, OutlineBuilder};
 
 /// Collects one glyph's outline as flattened contours in target space.
@@ -80,7 +80,14 @@ impl OutlineBuilder for GlyphSink<'_> {
         let p0 = self.cursor;
         let p3 = [x as f64, y as f64];
         let mut points = Vec::new();
-        flatten::cubic(p0, [x1 as f64, y1 as f64], [x2 as f64, y2 as f64], p3, self.tol, &mut points);
+        flatten::cubic(
+            p0,
+            [x1 as f64, y1 as f64],
+            [x2 as f64, y2 as f64],
+            p3,
+            self.tol,
+            &mut points,
+        );
         for p in points {
             self.push(p);
         }

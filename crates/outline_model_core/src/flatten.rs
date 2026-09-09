@@ -145,7 +145,10 @@ mod tests {
             })
             .collect();
         assert!(max_deviation(p0, &out, &samples) <= tol * 1.01);
-        assert!(out.len() > 4, "a 10-unit-tall parabola needs several chords");
+        assert!(
+            out.len() > 4,
+            "a 10-unit-tall parabola needs several chords"
+        );
     }
 
     #[test]

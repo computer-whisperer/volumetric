@@ -128,7 +128,11 @@ fn transform_wasm(input_bytes: &[u8], cfg: &PoseConfig) -> Result<Vec<u8>, Strin
 
     let map = Affine::translation([-center[0], -center[1], -center[2]])
         .then(&Affine::scaling([scale.sx, scale.sy, scale.sz]))
-        .then(&Affine::euler_deg(rotate.rx_deg, rotate.ry_deg, rotate.rz_deg))
+        .then(&Affine::euler_deg(
+            rotate.rx_deg,
+            rotate.ry_deg,
+            rotate.rz_deg,
+        ))
         .then(&Affine::translation(center))
         .then(&Affine::translation(offset));
     if spatial == 2 && !map.preserves_prefix(2) {

@@ -21,9 +21,7 @@
 //!   replaced by the combined occupancy, when m_0 declares a format
 //! - `memory`: m_0's
 
-use wasm_encoder::{
-    BlockType, ExportKind, ExportSection, Function, Instruction, MemArg, ValType,
-};
+use wasm_encoder::{BlockType, ExportKind, ExportSection, Function, Instruction, MemArg, ValType};
 
 use model_merge_core::{
     MergeSections, ModelExports, OffsetReencoder, SectionCounts, count_sections,
@@ -397,7 +395,11 @@ impl Glue<'_> {
         f.instruction(&Instruction::F32Store(out_mem));
         f.instruction(&Instruction::End);
         sections.code.function(&f);
-        exports.export("sample_channels", ExportKind::Func, sections.funcs.len() - 1);
+        exports.export(
+            "sample_channels",
+            ExportKind::Func,
+            sections.funcs.len() - 1,
+        );
     }
 }
 

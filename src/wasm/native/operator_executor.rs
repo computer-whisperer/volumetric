@@ -981,7 +981,11 @@ impl OperatorExecutor for NativeOperatorExecutor {
             .map_err(instantiation)?;
 
         linker
-            .func_wrap("host", "get_input_count", |_caller: Caller<'_, ()>| -> i32 { 0 })
+            .func_wrap(
+                "host",
+                "get_input_count",
+                |_caller: Caller<'_, ()>| -> i32 { 0 },
+            )
             .map_err(instantiation)?;
 
         linker
@@ -1288,7 +1292,11 @@ mod tests {
         .unwrap();
         let mut executor = NativeOperatorExecutor::new(&wasm).unwrap();
         let io = executor
-            .run(OperatorIo::new(vec![b"a".to_vec(), Vec::new(), b"c".to_vec()]))
+            .run(OperatorIo::new(vec![
+                b"a".to_vec(),
+                Vec::new(),
+                b"c".to_vec(),
+            ]))
             .expect("run should succeed");
         assert_eq!(io.outputs.get(&0).map(Vec::as_slice), Some(&[3u8][..]));
         assert_eq!(executor.get_metadata().unwrap(), vec![0u8]);

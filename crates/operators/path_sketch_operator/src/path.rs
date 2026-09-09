@@ -342,15 +342,24 @@ mod tests {
     fn absolute_and_relative_lines() {
         let sp = one("M 1 2 l 3 4 L 0 0 z");
         assert_eq!(sp.start, [1.0, 2.0]);
-        assert_eq!(sp.pieces, [Piece::Line([4.0, 6.0]), Piece::Line([0.0, 0.0])]);
+        assert_eq!(
+            sp.pieces,
+            [Piece::Line([4.0, 6.0]), Piece::Line([0.0, 0.0])]
+        );
     }
 
     #[test]
     fn implicit_repetition_after_a_move_draws_lines() {
         let sp = one("M0 0 1 1 2 2");
-        assert_eq!(sp.pieces, [Piece::Line([1.0, 1.0]), Piece::Line([2.0, 2.0])]);
+        assert_eq!(
+            sp.pieces,
+            [Piece::Line([1.0, 1.0]), Piece::Line([2.0, 2.0])]
+        );
         let sp = one("m1 1 1 1 1 1");
-        assert_eq!(sp.pieces, [Piece::Line([2.0, 2.0]), Piece::Line([3.0, 3.0])]);
+        assert_eq!(
+            sp.pieces,
+            [Piece::Line([2.0, 2.0]), Piece::Line([3.0, 3.0])]
+        );
     }
 
     #[test]
@@ -444,8 +453,16 @@ mod tests {
     fn errors_name_the_problem() {
         assert!(parse("L 1 2").unwrap_err().contains("start with a move"));
         assert!(parse("M 1").unwrap_err().contains("expects a point"));
-        assert!(parse("M 0 0 X 1").unwrap_err().contains("unknown path command `X`"));
-        assert!(parse("M 0 0 A 1 1 0 2 0 3 3").unwrap_err().contains("large-arc flag"));
+        assert!(
+            parse("M 0 0 X 1")
+                .unwrap_err()
+                .contains("unknown path command `X`")
+        );
+        assert!(
+            parse("M 0 0 A 1 1 0 2 0 3 3")
+                .unwrap_err()
+                .contains("large-arc flag")
+        );
         assert!(parse("M 0 0 Z 1 1").unwrap_err().contains("after Z"));
         assert!(parse("").unwrap_err().contains("draws nothing"));
         assert!(parse("M 1 2").unwrap_err().contains("draws nothing"));

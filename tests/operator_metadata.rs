@@ -16,7 +16,13 @@ fn operator_names() -> Vec<String> {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/operators");
     let mut names: Vec<String> = std::fs::read_dir(&dir)
         .unwrap_or_else(|e| panic!("listing {}: {e}", dir.display()))
-        .map(|entry| entry.expect("directory entry").file_name().to_string_lossy().into_owned())
+        .map(|entry| {
+            entry
+                .expect("directory entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
         .filter(|name| name.ends_with("_operator"))
         .collect();
     names.sort();

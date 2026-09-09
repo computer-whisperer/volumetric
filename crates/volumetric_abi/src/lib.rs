@@ -501,7 +501,8 @@ impl OperatorMetadata {
 
     /// The declared input type of input `idx` in a `count`-input step.
     pub fn input_type(&self, idx: usize, count: usize) -> Option<&OperatorMetadataInput> {
-        self.slot_of_input(idx, count).map(|slot| &self.inputs[slot])
+        self.slot_of_input(idx, count)
+            .map(|slot| &self.inputs[slot])
     }
 
     /// Label for input `idx` of a `count`-input step: the slot's declared
@@ -800,7 +801,10 @@ mod tests {
         assert_eq!(decoded.catalog_name(), "legacy");
     }
 
-    fn variadic(inputs: Vec<OperatorMetadataInput>, variadic_input: Option<usize>) -> OperatorMetadata {
+    fn variadic(
+        inputs: Vec<OperatorMetadataInput>,
+        variadic_input: Option<usize>,
+    ) -> OperatorMetadata {
         OperatorMetadata {
             name: "v".to_string(),
             version: "0.0.0".to_string(),

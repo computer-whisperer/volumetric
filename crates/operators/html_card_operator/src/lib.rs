@@ -74,8 +74,14 @@ fn generate(html: &str, cfg: &CardConfig) -> Result<(Vec<u8>, Vec<u8>), String> 
     }
     let ink = html_card_core::to_model_space(&geometry.ink, &geometry, cfg.width);
     let plate = html_card_core::to_model_space(&geometry.plate, &geometry, cfg.width);
-    let ink_wasm = outline_model_core::emit::patch_template(TEMPLATE, &outline_model_core::build_payload(&ink)?)?;
-    let plate_wasm = outline_model_core::emit::patch_template(TEMPLATE, &outline_model_core::build_payload(&plate)?)?;
+    let ink_wasm = outline_model_core::emit::patch_template(
+        TEMPLATE,
+        &outline_model_core::build_payload(&ink)?,
+    )?;
+    let plate_wasm = outline_model_core::emit::patch_template(
+        TEMPLATE,
+        &outline_model_core::build_payload(&plate)?,
+    )?;
     Ok((ink_wasm, plate_wasm))
 }
 

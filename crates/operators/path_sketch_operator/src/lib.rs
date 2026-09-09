@@ -157,7 +157,17 @@ fn subpath_polyline(sp: &Subpath, tol: f64) -> (Vec<Point>, Vec<bool>) {
                 large,
                 sweep,
                 end,
-            } => arc_points(pos, rx, ry, rotation_deg, large, sweep, end, tol, &mut points),
+            } => arc_points(
+                pos,
+                rx,
+                ry,
+                rotation_deg,
+                large,
+                sweep,
+                end,
+                tol,
+                &mut points,
+            ),
         }
         let added = points.len() - before;
         straight.extend(std::iter::repeat_n(piece.is_line(), added));
@@ -279,7 +289,10 @@ fn control_diagonal(subpaths: &[Subpath]) -> f64 {
 /// for `outline_model_core::build_payload`.
 pub fn sketch_contours(cfg: &SketchConfig) -> Result<Vec<Vec<Point>>, String> {
     if !(cfg.round.is_finite() && cfg.round >= 0.0) {
-        return Err(format!("round must be a finite length >= 0, got {}", cfg.round));
+        return Err(format!(
+            "round must be a finite length >= 0, got {}",
+            cfg.round
+        ));
     }
     if !(cfg.chord_tolerance.is_finite() && cfg.chord_tolerance >= 0.0) {
         return Err(format!(
@@ -422,8 +435,14 @@ mod tests {
         let inside = classifier(&c);
         assert!(inside(0.5, 0.5));
         assert!(inside(0.3, 0.01), "flat bottom edge is untouched");
-        assert!(inside(0.1, 0.1), "inside the fillet arc (0.14 from its centre)");
-        assert!(!inside(0.05, 0.05), "outside the fillet arc (0.21 from its centre)");
+        assert!(
+            inside(0.1, 0.1),
+            "inside the fillet arc (0.14 from its centre)"
+        );
+        assert!(
+            !inside(0.05, 0.05),
+            "outside the fillet arc (0.21 from its centre)"
+        );
         assert!(!inside(0.02, 0.02), "the old corner is gone");
         assert!(!inside(0.98, 0.98), "every corner is filleted");
     }
@@ -495,7 +514,10 @@ mod tests {
         let mut c = cfg("M0 0 A1 1 0 0 1 2 0 Z");
         c.flip_y = true;
         let inside = classifier(&c);
-        assert!(inside(1.0, 0.5), "on a y-down canvas sweep=1 bulged this way");
+        assert!(
+            inside(1.0, 0.5),
+            "on a y-down canvas sweep=1 bulged this way"
+        );
     }
 
     #[test]
@@ -534,8 +556,17 @@ mod tests {
         let wasm = generate(&SketchConfig::default()).unwrap();
         let module = walrus::Module::from_buffer(&wasm).expect("emitted wasm parses");
         let names: Vec<&str> = module.exports.iter().map(|e| e.name.as_str()).collect();
-        for required in ["sample", "get_bounds", "get_dimensions", "get_io_ptr", "memory"] {
-            assert!(names.contains(&required), "missing export {required}: {names:?}");
+        for required in [
+            "sample",
+            "get_bounds",
+            "get_dimensions",
+            "get_io_ptr",
+            "memory",
+        ] {
+            assert!(
+                names.contains(&required),
+                "missing export {required}: {names:?}"
+            );
         }
         assert!(!names.contains(&"outline_payload_slot"));
     }
