@@ -240,7 +240,11 @@ impl From<&OperatorMetadataOutput> for AssetTypeHint {
 pub struct ImportedAsset {
     /// Unique identifier for this asset within the project.
     pub id: String,
-    /// Raw binary data (the asset blob).
+    /// Raw binary data (the asset blob). Encoded as a CBOR byte string;
+    /// files written before September 2026 carry it as a per-element
+    /// integer array (about 1.7x the size, and far slower to decode),
+    /// which this same derive still reads.
+    #[serde(with = "serde_bytes")]
     pub data: Vec<u8>,
     /// Optional type hint for UI validation and display.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -270,8 +274,9 @@ impl ImportedAsset {
 pub enum ExecutionInput {
     /// Reference to an asset by ID.
     AssetRef(String),
-    /// Inline embedded data (raw bytes).
-    Inline(Vec<u8>),
+    /// Inline embedded data (raw bytes; byte-string encoded like
+    /// [`ImportedAsset::data`], legacy integer arrays still read).
+    Inline(#[serde(with = "serde_bytes")] Vec<u8>),
 }
 
 impl ExecutionInput {
@@ -1666,6 +1671,114 @@ impl Default for Project {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Looks up `key` in a CBOR map value.
+    fn field<'a>(value: &'a ciborium::Value, key: &str) -> &'a ciborium::Value {
+        let ciborium::Value::Map(entries) = value else {
+            panic!("expected a CBOR map, got {value:?}");
+        };
+        entries
+            .iter()
+            .find(|(k, _)| matches!(k, ciborium::Value::Text(t) if t == key))
+            .map(|(_, v)| v)
+            .unwrap_or_else(|| panic!("no field {key:?} in {value:?}"))
+    }
+
+    /// The pre-September-2026 encoding: every byte string as a CBOR array
+    /// of small integers.
+    fn bytes_to_integer_arrays(value: ciborium::Value) -> ciborium::Value {
+        use ciborium::Value;
+        match value {
+            Value::Bytes(bytes) => Value::Array(
+                bytes
+                    .into_iter()
+                    .map(|b| Value::Integer(b.into()))
+                    .collect(),
+            ),
+            Value::Array(items) => {
+                Value::Array(items.into_iter().map(bytes_to_integer_arrays).collect())
+            }
+            Value::Map(entries) => Value::Map(
+                entries
+                    .into_iter()
+                    .map(|(k, v)| (bytes_to_integer_arrays(k), bytes_to_integer_arrays(v)))
+                    .collect(),
+            ),
+            other => other,
+        }
+    }
+
+    fn blob_project() -> (Project, Vec<u8>) {
+        let blob: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
+        let project = Project {
+            version: 2,
+            imports: vec![ImportedAsset::new(
+                "blob".to_string(),
+                blob.clone(),
+                Some(AssetTypeHint::Binary),
+            )],
+            timeline: vec![ExecutionStep {
+                operator_id: "op".to_string(),
+                inputs: vec![
+                    ExecutionInput::Inline(vec![7, 200, 0]),
+                    ExecutionInput::AssetRef("blob".to_string()),
+                ],
+                outputs: vec!["out".to_string()],
+            }],
+            exports: vec![],
+            baked: None,
+        };
+        (project, blob)
+    }
+
+    #[test]
+    fn asset_blobs_encode_as_cbor_byte_strings() {
+        let (project, blob) = blob_project();
+        let value: ciborium::Value =
+            ciborium::from_reader(project.to_cbor().unwrap().as_slice()).unwrap();
+
+        let ciborium::Value::Array(imports) = field(&value, "imports") else {
+            panic!("imports is not an array");
+        };
+        assert!(
+            matches!(field(&imports[0], "data"), ciborium::Value::Bytes(b) if *b == blob),
+            "import data must be a CBOR byte string"
+        );
+
+        let ciborium::Value::Array(timeline) = field(&value, "timeline") else {
+            panic!("timeline is not an array");
+        };
+        let ciborium::Value::Array(inputs) = field(&timeline[0], "inputs") else {
+            panic!("inputs is not an array");
+        };
+        assert!(
+            matches!(field(&inputs[0], "Inline"), ciborium::Value::Bytes(b) if *b == [7, 200, 0]),
+            "inline input must be a CBOR byte string"
+        );
+    }
+
+    #[test]
+    fn from_cbor_reads_legacy_integer_array_blobs() {
+        let (project, blob) = blob_project();
+        let current = project.to_cbor().unwrap();
+        let value: ciborium::Value = ciborium::from_reader(current.as_slice()).unwrap();
+        let mut legacy = Vec::new();
+        ciborium::into_writer(&bytes_to_integer_arrays(value), &mut legacy).unwrap();
+        assert!(
+            legacy.len() > current.len(),
+            "legacy encoding should be larger"
+        );
+
+        let decoded = Project::from_cbor(&legacy).unwrap();
+        assert_eq!(decoded.imports[0].id, "blob");
+        assert_eq!(decoded.imports[0].data, blob);
+        assert_eq!(decoded.imports[0].type_hint, Some(AssetTypeHint::Binary));
+        match &decoded.timeline[0].inputs[0] {
+            ExecutionInput::Inline(data) => assert_eq!(data, &[7, 200, 0]),
+            other => panic!("expected an inline input, got {other:?}"),
+        }
+        assert_eq!(decoded.to_cbor().unwrap(), current);
+    }
 
     #[test]
     fn exporting_same_asset_twice_is_an_error() {
