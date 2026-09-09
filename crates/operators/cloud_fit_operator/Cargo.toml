@@ -1,0 +1,16 @@
+[package]
+name = "cloud_fit_operator"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+volumetric_abi = { path = "../../volumetric_abi" }
+cloud_core = { path = "../../cloud_core" }
+serde = { version = "1", features = ["derive"] }
+ciborium = "0.2"
+
+[dev-dependencies]
+point_cloud_import_operator = { path = "../point_cloud_import_operator" }

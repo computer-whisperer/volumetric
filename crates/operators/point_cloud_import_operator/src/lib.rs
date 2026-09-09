@@ -18,8 +18,12 @@
 
 use ply_core::convert::{place, vertices};
 use ply_core::{is_ply, read_ply};
-use volumetric_abi::fea::{FeaElementKind, FeaField, FeaMesh, encode_fea_mesh};
+#[cfg(target_arch = "wasm32")]
+use volumetric_abi::fea::encode_fea_mesh;
+use volumetric_abi::fea::{FeaElementKind, FeaField, FeaMesh};
+#[cfg(target_arch = "wasm32")]
 use volumetric_abi::host::{post_output, post_warning, read_input, report_error};
+#[cfg(target_arch = "wasm32")]
 use volumetric_abi::{OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput};
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -91,6 +95,7 @@ fn subsample(data: &[f64], components: usize, stride: usize) -> Vec<f64> {
         .collect()
 }
 
+#[cfg(target_arch = "wasm32")]
 #[unsafe(no_mangle)]
 pub extern "C" fn run() {
     let bytes = read_input(0);
@@ -121,6 +126,7 @@ pub extern "C" fn run() {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
 #[unsafe(no_mangle)]
 pub extern "C" fn get_metadata() -> i64 {
     static METADATA: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();

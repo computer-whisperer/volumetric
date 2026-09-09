@@ -16,7 +16,9 @@
 
 use ndfield_model_core::emit::{FieldSign, emit_field_model};
 use nrrd_core::{Nrrd, read_nrrd};
+#[cfg(target_arch = "wasm32")]
 use volumetric_abi::host::{post_output, post_warning, read_input, report_error};
+#[cfg(target_arch = "wasm32")]
 use volumetric_abi::{OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput};
 
 /// Which side of `threshold` is solid.
@@ -377,6 +379,7 @@ pub fn emit(volume: &Volume) -> Result<Vec<u8>, String> {
     )
 }
 
+#[cfg(target_arch = "wasm32")]
 #[unsafe(no_mangle)]
 pub extern "C" fn run() {
     let bytes = read_input(0);
@@ -426,6 +429,7 @@ pub extern "C" fn run() {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
 #[unsafe(no_mangle)]
 pub extern "C" fn get_metadata() -> i64 {
     static METADATA: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();

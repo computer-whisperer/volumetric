@@ -590,6 +590,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "cloud_core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "cloud_fit_operator"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "cloud_core",
+ "point_cloud_import_operator",
+ "serde",
+ "volumetric_abi",
+]
+
+[[package]]
+name = "cloud_normals_operator"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "cloud_core",
+ "serde",
+ "volumetric_abi",
+]
+
+[[package]]
 name = "cobs"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

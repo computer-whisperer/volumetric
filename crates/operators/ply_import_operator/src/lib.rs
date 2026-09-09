@@ -17,8 +17,12 @@
 
 use ply_core::convert::{faces, place, vertices};
 use ply_core::read_ply;
+#[cfg(target_arch = "wasm32")]
 use volumetric_abi::host::{post_output, post_warning, read_input, report_error};
-use volumetric_abi::trimesh::{TriMesh, encode_tri_mesh};
+use volumetric_abi::trimesh::TriMesh;
+#[cfg(target_arch = "wasm32")]
+use volumetric_abi::trimesh::encode_tri_mesh;
+#[cfg(target_arch = "wasm32")]
 use volumetric_abi::{OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput};
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -64,6 +68,7 @@ pub fn import(bytes: &[u8], config: &PlyImportConfig) -> Result<(TriMesh, usize)
     Ok((mesh, face_data.skipped))
 }
 
+#[cfg(target_arch = "wasm32")]
 #[unsafe(no_mangle)]
 pub extern "C" fn run() {
     let bytes = read_input(0);
@@ -94,6 +99,7 @@ pub extern "C" fn run() {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
 #[unsafe(no_mangle)]
 pub extern "C" fn get_metadata() -> i64 {
     static METADATA: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
