@@ -766,6 +766,44 @@ struct RunExport {
     asset_id: String,
     type_hint: String,
     size_bytes: usize,
+    /// The decoded content of a small typed value (see [`asset_value_json`]);
+    /// absent for bulk values.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<serde_json::Value>,
+}
+
+/// The decoded content of a small typed value, for readers that want the
+/// numbers rather than the byte count: a Subspace as its chart (`origin`
+/// and `basis` rows in the ambient space), an F64Map as its entries, a
+/// VecF64 as its components. Bulk values (models, meshes, blobs) have no
+/// JSON form and yield `None`, as does a value that fails to decode.
+pub(crate) fn asset_value_json(asset: &volumetric::LoadedAsset) -> Option<serde_json::Value> {
+    use volumetric::AssetTypeHint;
+    match asset.type_hint()? {
+        AssetTypeHint::Subspace => {
+            let subspace = volumetric::subspace::decode_subspace(asset.data()).ok()?;
+            let basis: Vec<&[f64]> = subspace.basis.chunks(subspace.ambient().max(1)).collect();
+            Some(serde_json::json!({
+                "dimensions": subspace.dimensions,
+                "rank": subspace.rank(),
+                "origin": subspace.origin,
+                "basis": basis,
+            }))
+        }
+        AssetTypeHint::F64Map => {
+            let map = volumetric::f64_map::decode(asset.data()).ok()?;
+            serde_json::to_value(map).ok()
+        }
+        AssetTypeHint::VecF64(_) => {
+            let values: Vec<f64> = asset
+                .data()
+                .chunks_exact(8)
+                .map(|chunk| f64::from_le_bytes(chunk.try_into().expect("8-byte chunk")))
+                .collect();
+            Some(serde_json::Value::from(values))
+        }
+        _ => None,
+    }
 }
 
 pub fn run_project_run(args: ProjectRunArgs) -> Result<()> {
@@ -782,6 +820,7 @@ pub fn run_project_run(args: ProjectRunArgs) -> Result<()> {
                 .map(|h| h.to_string())
                 .unwrap_or_else(|| "Binary".to_string()),
             size_bytes: e.data().len(),
+            value: asset_value_json(e),
         })
         .collect();
 
@@ -802,6 +841,9 @@ pub fn run_project_run(args: ProjectRunArgs) -> Result<()> {
                 "  {} ({}, {} bytes)",
                 result.asset_id, result.type_hint, result.size_bytes
             );
+            if let Some(value) = &result.value {
+                println!("    {value}");
+            }
         }
     }
 
@@ -1308,6 +1350,56 @@ mod tests {
 
     fn vec3_slot() -> OperatorMetadataInput {
         OperatorMetadataInput::VecF64(3)
+    }
+
+    /// `project-run --json` carries the numbers of small values so a reader
+    /// never needs a CBOR decoder: a Subspace as origin plus basis rows, an
+    /// F64Map as its entries, a VecF64 as its components; bulk values stay
+    /// size-only.
+    #[test]
+    fn small_values_decode_to_json() {
+        use volumetric::AssetTypeHint;
+        let asset = |type_hint, data: Vec<u8>| {
+            volumetric::LoadedAsset::from_parts("v".to_string(), data, Some(type_hint), vec![])
+        };
+
+        let plane = volumetric::subspace::Subspace {
+            dimensions: 3,
+            origin: vec![1.0, 2.0, 3.0],
+            basis: vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        };
+        let value = asset_value_json(&asset(
+            AssetTypeHint::Subspace,
+            volumetric::subspace::encode_subspace(&plane),
+        ))
+        .expect("subspace decodes");
+        assert_eq!(value["dimensions"], 3);
+        assert_eq!(value["rank"], 2);
+        assert_eq!(value["origin"], serde_json::json!([1.0, 2.0, 3.0]));
+        assert_eq!(
+            value["basis"],
+            serde_json::json!([[1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+        );
+
+        let mut map = volumetric::f64_map::F64Map::new();
+        map.insert("radius".to_string(), 0.0235);
+        map.insert("inliers".to_string(), 6189.0);
+        let value = asset_value_json(&asset(
+            AssetTypeHint::F64Map,
+            volumetric::f64_map::encode(&map).unwrap(),
+        ))
+        .expect("f64 map decodes");
+        assert_eq!(value, serde_json::json!({"inliers": 6189.0, "radius": 0.0235}));
+
+        let mut bytes = Vec::new();
+        for v in [0.5f64, -1.0, 2.0] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let value = asset_value_json(&asset(AssetTypeHint::VecF64(3), bytes)).expect("vec decodes");
+        assert_eq!(value, serde_json::json!([0.5, -1.0, 2.0]));
+
+        assert!(asset_value_json(&asset(AssetTypeHint::Binary, vec![1, 2, 3])).is_none());
+        assert!(asset_value_json(&asset(AssetTypeHint::Subspace, vec![0xff])).is_none());
     }
 
     /// Count-mismatch errors name the variadic slot and the "at least"
