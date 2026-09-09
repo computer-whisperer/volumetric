@@ -7,13 +7,14 @@ publish = false
 [features]
 default = ["native"]
 # Desktop shell: wasmtime engine backend, winit window, worker threads.
-native = ["volumetric/native"]
+native = ["volumetric/native", "volumetric_preview/native"]
 # Browser shell: JS-bridge engine backend, canvas + async GPU setup,
 # inline job execution. Build with
 # `--target wasm32-unknown-unknown --no-default-features --features web`
 # (index.html's data-trunk rust link carries these flags for trunk builds).
 web = [
     "volumetric/web",
+    "volumetric_preview/web",
     "volumetric_protocol/web-client",
     "dep:wasm-bindgen",
     "dep:wasm-bindgen-futures",
@@ -33,6 +34,7 @@ rfd = "0.17"
 sha2 = "0.10"
 volumetric = { path = "../../", default-features = false }
 volumetric_assets = { path = "../volumetric_assets" }
+volumetric_preview = { path = "../volumetric_preview", default-features = false }
 volumetric_renderer = { path = "../volumetric_renderer" }
 wgpu = "30"
 winit = "0.30"
