@@ -147,6 +147,7 @@ pub const SAVE_PROJECT_AS_KEY: &str = "action:save-project-as";
 pub const SAVE_BUILT_COPY_KEY: &str = "action:save-built-copy";
 pub const IMPORT_WASM_KEY: &str = "action:import-wasm";
 pub const IMPORT_STL_KEY: &str = "action:import-stl";
+pub const IMPORT_3MF_KEY: &str = "action:import-3mf";
 pub const IMPORT_STEP_KEY: &str = "action:import-step";
 pub const IMPORT_IMAGE_KEY: &str = "action:import-image";
 pub const RUN_PROJECT_KEY: &str = "action:run-project";
@@ -220,12 +221,14 @@ const OUTPUT_INSPECT_PREFIX: &str = "output:inspect:";
 const LIGHTBOX_KEY: &str = "lightbox";
 /// Mesh export modal: `output:export-mesh:{id}` opens it for an output.
 /// Inside, the scrim and Cancel emit `export:dismiss`, the primary button
-/// `export:confirm`, unit presets `export:unit:{mm|cm|m|in}`, and the scale
-/// factor is a controlled text input at `export:scale`.
+/// `export:confirm`, format buttons `export:format:{stl|3mf}`, unit presets
+/// `export:unit:{mm|cm|m|in}`, and the scale factor is a controlled text
+/// input at `export:scale`.
 const EXPORT_MESH_PREFIX: &str = "output:export-mesh:";
 const EXPORT_DISMISS_KEY: &str = "export:dismiss";
 const EXPORT_CONFIRM_KEY: &str = "export:confirm";
 const EXPORT_SCALE_KEY: &str = "export:scale";
+const EXPORT_FORMAT_PREFIX: &str = "export:format:";
 const EXPORT_UNIT_PREFIX: &str = "export:unit:";
 const EXPORT_SCENE_KEY: &str = "export:scene";
 const EXPORT_WASM_PREFIX: &str = "output:wasm:";
@@ -494,12 +497,13 @@ fn default_recent_adds() -> Vec<String> {
     .to_vec()
 }
 
-/// Target unit for STL export. Engine geometry is canonically in metres;
+/// Target unit for mesh export. Engine geometry is canonically in metres;
 /// the chosen unit's [`ExportUnit::factor_text`] is the metres→unit factor
 /// written into the scale buffer, so every vertex is multiplied to land in
 /// that unit. Binary STL carries no unit metadata and slicers conventionally
-/// read it as millimetres, so `Mm` (×1000) exports true size — the default.
-/// `Custom` marks a hand-edited scale that isn't one of the presets.
+/// read it as millimetres, so `Mm` (×1000) exports true size — the default;
+/// a 3MF is labelled with the unit as well. `Custom` marks a hand-edited
+/// scale that isn't one of the presets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportUnit {
     Mm,
@@ -545,6 +549,51 @@ impl ExportUnit {
             ExportUnit::Custom => "units",
         }
     }
+
+    /// The unit a 3MF export is labelled with. A hand-edited factor has no
+    /// defined unit; millimetres is what every slicer would assume anyway.
+    fn threemf_unit(self) -> volumetric::threemf::Unit {
+        use volumetric::threemf::Unit;
+        match self {
+            ExportUnit::Mm | ExportUnit::Custom => Unit::Millimeter,
+            ExportUnit::Cm => Unit::Centimeter,
+            ExportUnit::M => Unit::Meter,
+            ExportUnit::In => Unit::Inch,
+        }
+    }
+}
+
+/// Mesh export container. STL is a bare binary triangle soup that slicers
+/// read as millimetres; 3MF carries the unit and the welded topology.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportFormat {
+    Stl,
+    ThreeMf,
+}
+
+impl ExportFormat {
+    fn from_id(id: &str) -> Option<ExportFormat> {
+        match id {
+            "stl" => Some(ExportFormat::Stl),
+            "3mf" => Some(ExportFormat::ThreeMf),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ExportFormat::Stl => "STL",
+            ExportFormat::ThreeMf => "3MF",
+        }
+    }
+
+    /// The route/button id, doubling as the file extension.
+    pub fn extension(self) -> &'static str {
+        match self {
+            ExportFormat::Stl => "stl",
+            ExportFormat::ThreeMf => "3mf",
+        }
+    }
 }
 
 /// The open mesh-export modal: which output, the preview geometry as a
@@ -554,6 +603,7 @@ impl ExportUnit {
 pub struct ExportDialogState {
     pub asset_id: String,
     pub mesh: ExportPreviewMesh,
+    pub format: ExportFormat,
     /// Target unit; drives the active preset highlight and the size-readout
     /// suffix. `Custom` once the scale buffer is hand-edited off a preset.
     pub unit: ExportUnit,
@@ -975,8 +1025,8 @@ struct ScriptForm {
 }
 
 /// A file operation the app has requested. The host owns the native file
-/// dialogs (and, for STL, the cached preview meshes), so the app queues the
-/// intent and the host drains it via `take_file_action`.
+/// dialogs (and, for mesh export, the cached preview meshes), so the app
+/// queues the intent and the host drains it via `take_file_action`.
 #[derive(Clone, Debug, PartialEq)]
 pub enum FileAction {
     OpenProject,
@@ -987,11 +1037,14 @@ pub enum FileAction {
     /// Save a copy with the built step results embedded (path dialog; see
     /// `volumetric::baked`).
     SaveBuiltCopy,
-    /// Export the cached preview mesh of the named output as binary STL,
-    /// with vertices multiplied by `scale` (the export modal's setting).
+    /// Export the cached preview mesh of the named output in `format`, with
+    /// vertices multiplied by `scale` (the export modal's setting); `unit`
+    /// labels a 3MF (STL carries none).
     ExportMesh {
         id: String,
         scale: f32,
+        format: ExportFormat,
+        unit: volumetric::threemf::Unit,
     },
     /// Export the named output's model WASM bytes verbatim.
     ExportWasm(String),
@@ -999,6 +1052,8 @@ pub enum FileAction {
     ImportWasm,
     /// Import an STL mesh via the bundled `stl_import_operator`.
     ImportStl,
+    /// Import a 3MF package via the bundled `threemf_import_operator`.
+    ImportThreeMf,
     /// Import a STEP CAD file via the bundled `step_import_operator`.
     ImportStep,
     /// Import an image as a 2D field model via the bundled
@@ -1824,6 +1879,7 @@ impl VolumetricUiV2 {
         self.export_dialog = Some(ExportDialogState {
             asset_id: id.to_string(),
             mesh: ExportPreviewMesh::Pending,
+            format: ExportFormat::Stl,
             unit: ExportUnit::Mm,
             scale_text: ExportUnit::Mm.factor_text().unwrap().to_string(),
         });
@@ -1877,6 +1933,8 @@ impl VolumetricUiV2 {
         self.pending_file_action = Some(FileAction::ExportMesh {
             id: export.asset_id.clone(),
             scale,
+            format: export.format,
+            unit: export.unit.threemf_unit(),
         });
         self.export_dialog = None;
     }
@@ -2680,7 +2738,9 @@ impl VolumetricUiV2 {
                 kind,
                 fresh: match kind {
                     Some(_) => ExecutionInput::Inline(Vec::new()),
-                    None => operator_step_inputs(&metadata, &SlotPrimaries::default())[slot].clone(),
+                    None => {
+                        operator_step_inputs(&metadata, &SlotPrimaries::default())[slot].clone()
+                    }
                 },
             }
         });
@@ -3091,7 +3151,9 @@ impl VolumetricUiV2 {
         if !range.contains(&input_idx) || range.len() <= 1 {
             return;
         }
-        self.project.timeline_mut()[step_idx].inputs.remove(input_idx);
+        self.project.timeline_mut()[step_idx]
+            .inputs
+            .remove(input_idx);
         self.mark_project_dirty();
         self.step_edit = self.build_step_edit(step_idx);
         self.status = format!("step {} input {} removed", step_idx + 1, input_idx + 1);
@@ -4145,6 +4207,13 @@ impl App for VolumetricUiV2 {
             return;
         }
 
+        if event.is_click_or_activate(IMPORT_3MF_KEY) {
+            self.pending_file_action = Some(FileAction::ImportThreeMf);
+            self.open_menu = None;
+            self.add_modal = None;
+            return;
+        }
+
         if event.is_click_or_activate(IMPORT_STEP_KEY) {
             self.pending_file_action = Some(FileAction::ImportStep);
             self.open_menu = None;
@@ -4450,6 +4519,12 @@ impl App for VolumetricUiV2 {
             self.export_dialog = None;
         } else if route == EXPORT_CONFIRM_KEY {
             self.confirm_export();
+        } else if let Some(id) = route.strip_prefix(EXPORT_FORMAT_PREFIX) {
+            if let Some(format) = ExportFormat::from_id(id)
+                && let Some(export) = self.export_dialog.as_mut()
+            {
+                export.format = format;
+            }
         } else if let Some(id) = route.strip_prefix(EXPORT_UNIT_PREFIX) {
             // Presets pick the target STL unit: the metres→unit factor is
             // written into the scale buffer. Geometry is canonically metres,
@@ -4632,6 +4707,7 @@ fn entry_category(entry: &catalog::CatalogEntry) -> Option<&str> {
 fn catalog_row_key(entry: &catalog::CatalogEntry) -> String {
     match entry.name.as_str() {
         "stl_import_operator" => IMPORT_STL_KEY.to_string(),
+        "threemf_import_operator" => IMPORT_3MF_KEY.to_string(),
         "step_import_operator" => IMPORT_STEP_KEY.to_string(),
         "image_model_operator" => IMPORT_IMAGE_KEY.to_string(),
         _ => match entry.kind {
@@ -5016,8 +5092,8 @@ fn lightbox_layer(app: &VolumetricUiV2) -> Option<El> {
 }
 
 /// The mesh-export modal: an orbitable `chart3d` preview of the export
-/// geometry over the export configuration (scale factor with unit presets)
-/// and the Cancel/Export actions. 3MF joins the format row when it lands.
+/// geometry over the export configuration (format, scale factor with unit
+/// presets) and the Cancel/Export actions.
 fn export_layer(app: &VolumetricUiV2) -> Option<El> {
     let export = app.export_dialog.as_ref()?;
     let scale = parse_export_scale(&export.scale_text);
@@ -5078,7 +5154,25 @@ fn export_layer(app: &VolumetricUiV2) -> Option<El> {
         }
     }
     body.push(divider());
-    body.push(field_row("Format", text("STL · binary").label()));
+    let format_button = |format: ExportFormat| {
+        let button = button(format.label())
+            .xsmall()
+            .key(format!("{EXPORT_FORMAT_PREFIX}{}", format.extension()));
+        if export.format == format {
+            button.primary()
+        } else {
+            button.secondary()
+        }
+    };
+    body.push(field_row(
+        "Format",
+        row([
+            format_button(ExportFormat::Stl),
+            format_button(ExportFormat::ThreeMf),
+        ])
+        .gap(tokens::SPACE_1)
+        .align(Align::Center),
+    ));
     let unit_button = |unit: ExportUnit| {
         let button = button(unit.label())
             .xsmall()
@@ -5105,10 +5199,16 @@ fn export_layer(app: &VolumetricUiV2) -> Option<El> {
         text_input(EXPORT_SCALE_KEY, &export.scale_text, &app.selection).width(Size::Fixed(96.0)),
     ));
     body.push(
-        text(
-            "Geometry is in metres; the unit sets the metres→unit factor written to the \
-             STL (slicers read it as mm). Edit Scale to override the factor directly.",
-        )
+        text(match export.format {
+            ExportFormat::Stl => {
+                "Geometry is in metres; the unit sets the metres→unit factor written to the \
+                 STL (slicers read it as mm). Edit Scale to override the factor directly."
+            }
+            ExportFormat::ThreeMf => {
+                "Geometry is in metres; the unit sets the metres→unit factor and labels the \
+                 3MF, so slicers open it at true size. A hand-edited Scale is labelled mm."
+            }
+        })
         .caption()
         .muted(),
     );
@@ -5117,7 +5217,9 @@ fn export_layer(app: &VolumetricUiV2) -> Option<El> {
     }
     body.push(divider());
     let can_export = scale.is_some() && matches!(export.mesh, ExportPreviewMesh::Ready { .. });
-    let confirm = button("Export STL…").primary().key(EXPORT_CONFIRM_KEY);
+    let confirm = button(format!("Export {}…", export.format.label()))
+        .primary()
+        .key(EXPORT_CONFIRM_KEY);
     let confirm = if can_export {
         confirm
     } else {
@@ -6655,13 +6757,10 @@ fn asset_slot_selector(
     let mut items = vec![if removable {
         row([
             label,
-            button_with_icon("x", "")
-                .xsmall()
-                .secondary()
-                .key(format!(
-                    "{REMOVE_STEP_INPUT_PREFIX}{step_idx}:{}",
-                    slot.input_idx
-                )),
+            button_with_icon("x", "").xsmall().secondary().key(format!(
+                "{REMOVE_STEP_INPUT_PREFIX}{step_idx}:{}",
+                slot.input_idx
+            )),
         ])
         .gap(tokens::SPACE_1)
         .align(Align::Center)
@@ -7499,7 +7598,10 @@ mod tests {
         for id in ["a", "b", "c"] {
             app.project
                 .imports_mut()
-                .push(volumetric::ImportedAsset::model(id.to_string(), sphere.clone()));
+                .push(volumetric::ImportedAsset::model(
+                    id.to_string(),
+                    sphere.clone(),
+                ));
         }
         app.project.timeline_mut().push(volumetric::ExecutionStep {
             operator_id: "nary".to_string(),
@@ -7519,7 +7621,10 @@ mod tests {
             .collect();
         assert_eq!(slots, vec![(0, Some("Model 1".to_string()))]);
         let block = edit.variadic.as_ref().expect("variadic block");
-        assert_eq!((block.range.clone(), block.kind), (0..1, Some(AssetSlotKind::Model)));
+        assert_eq!(
+            (block.range.clone(), block.kind),
+            (0..1, Some(AssetSlotKind::Model))
+        );
         assert_eq!(edit.config.as_ref().map(|config| config.input_idx), Some(1));
 
         dispatch(
@@ -7534,12 +7639,19 @@ mod tests {
         );
         assert!(matches!(&inputs[2], ExecutionInput::Inline(_)));
         let edit = app.step_edit.as_ref().expect("editor rebuilt");
-        let names: Vec<_> = edit.asset_slots.iter().map(|slot| slot.name.clone()).collect();
+        let names: Vec<_> = edit
+            .asset_slots
+            .iter()
+            .map(|slot| slot.name.clone())
+            .collect();
         assert_eq!(
             names,
             vec![Some("Model 1".to_string()), Some("Model 2".to_string())]
         );
-        assert_eq!(edit.variadic.as_ref().map(|block| block.range.clone()), Some(0..2));
+        assert_eq!(
+            edit.variadic.as_ref().map(|block| block.range.clone()),
+            Some(0..2)
+        );
         assert_eq!(edit.config.as_ref().map(|config| config.input_idx), Some(2));
 
         app.add_step_variadic_input(0);
@@ -8104,7 +8216,12 @@ mod tests {
         );
         let edit = app.step_edit.as_ref().expect("step editor state");
         assert_eq!(edit.config.as_ref().map(|config| config.input_idx), Some(2));
-        assert_eq!(edit.config.as_ref().and_then(|config| config.name.as_deref()), Some("Config"));
+        assert_eq!(
+            edit.config
+                .as_ref()
+                .and_then(|config| config.name.as_deref()),
+            Some("Config")
+        );
         assert_eq!(app.project.timeline()[0].inputs.len(), 3);
     }
 
@@ -9343,18 +9460,30 @@ mod tests {
         }
 
         // The inch preset (metres→inches) rewrites the scale buffer and
-        // selects the unit; confirm carries the factor.
+        // selects the unit; the format buttons pick the container; confirm
+        // carries the factor, the format, and the 3MF unit label.
         dispatch(
             &mut app,
             UiEvent::synthetic_click(format!("{EXPORT_UNIT_PREFIX}in")),
         );
         assert_eq!(app.export_dialog.as_ref().unwrap().unit, ExportUnit::In);
+        assert_eq!(
+            app.export_dialog.as_ref().unwrap().format,
+            ExportFormat::Stl,
+            "STL is the default container"
+        );
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{EXPORT_FORMAT_PREFIX}3mf")),
+        );
         dispatch(&mut app, UiEvent::synthetic_click(EXPORT_CONFIRM_KEY));
         assert_eq!(
             app.take_file_action(),
             Some(FileAction::ExportMesh {
                 id: exports[0].clone(),
                 scale: 39.3701,
+                format: ExportFormat::ThreeMf,
+                unit: volumetric::threemf::Unit::Inch,
             })
         );
         assert!(app.export_dialog.is_none(), "confirm closes the modal");
@@ -9396,6 +9525,29 @@ mod tests {
         dispatch(&mut app, UiEvent::synthetic_click(EXPORT_CONFIRM_KEY));
         assert_eq!(app.take_file_action(), None, "bad scale refuses");
 
+        // A hand-edited factor has no preset unit; a 3MF labels it mm.
+        app.export_dialog.as_mut().unwrap().scale_text = "500".to_string();
+        app.export_dialog.as_mut().unwrap().unit = ExportUnit::Custom;
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{EXPORT_FORMAT_PREFIX}3mf")),
+        );
+        dispatch(&mut app, UiEvent::synthetic_click(EXPORT_CONFIRM_KEY));
+        assert_eq!(
+            app.take_file_action(),
+            Some(FileAction::ExportMesh {
+                id: exports[0].clone(),
+                scale: 500.0,
+                format: ExportFormat::ThreeMf,
+                unit: volumetric::threemf::Unit::Millimeter,
+            })
+        );
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{EXPORT_MESH_PREFIX}{}", exports[0])),
+        );
+        app.set_export_mesh(&exports[0], &[]);
+
         // Dismiss closes without queueing anything.
         dispatch(&mut app, UiEvent::synthetic_click(EXPORT_DISMISS_KEY));
         assert!(app.export_dialog.is_none());
@@ -9409,6 +9561,8 @@ mod tests {
         assert_eq!(app.take_file_action(), Some(FileAction::ImportWasm));
         dispatch(&mut app, UiEvent::synthetic_click(IMPORT_STL_KEY));
         assert_eq!(app.take_file_action(), Some(FileAction::ImportStl));
+        dispatch(&mut app, UiEvent::synthetic_click(IMPORT_3MF_KEY));
+        assert_eq!(app.take_file_action(), Some(FileAction::ImportThreeMf));
         dispatch(&mut app, UiEvent::synthetic_click(IMPORT_IMAGE_KEY));
         assert_eq!(app.take_file_action(), Some(FileAction::ImportImage));
     }

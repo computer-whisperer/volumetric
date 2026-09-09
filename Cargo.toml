@@ -29,6 +29,7 @@ members = [
     "crates/operators/wgsl_script_operator",
     "crates/operators/f64_map_merge_operator",
     "crates/operators/stl_import_operator",
+    "crates/operators/threemf_import_operator",
     "crates/operators/step_import_operator",
     "crates/operators/rectangular_prism_operator",
     "crates/operators/heightmap_extrude_operator",
@@ -51,6 +52,7 @@ members = [
     "crates/operators/span_operator",
     "crates/operators/intersect_operator",
     "crates/volumetric_abi",
+    "crates/threemf_core",
     "crates/model_merge_core",
     "crates/model_wrap_core",
     "crates/lattice_model_core",
@@ -121,6 +123,7 @@ normal-diagnostic = []
 
 [dependencies]
 volumetric_abi = { path = "crates/volumetric_abi" }
+threemf_core = { path = "crates/threemf_core" }
 wasmtime = { version = "44", optional = true }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }

@@ -51,7 +51,9 @@ use crate::session::{
     PreviewBuildError, PreviewBuildResult, PreviewEntity, PreviewStage, Session,
     ViewportRenderParams, execute_job_monitored, preview_postlude, preview_prelude,
 };
-use crate::{ExecutorChoice, FileAction, PreviewRequest, VIEWPORT_KEY, VolumetricUiV2};
+use crate::{
+    ExecutorChoice, ExportFormat, FileAction, PreviewRequest, VIEWPORT_KEY, VolumetricUiV2,
+};
 
 /// The canvas element the shell binds to; declared by `index.html`.
 const CANVAS_ID: &str = "volumetric_canvas";
@@ -1042,9 +1044,11 @@ enum FileTask {
         /// carried to the outcome for the status line.
         bake: Option<volumetric::BakeCoverage>,
     },
-    ExportStl {
+    ExportMesh {
         id: String,
         triangles: Vec<volumetric::Triangle>,
+        format: ExportFormat,
+        unit: volumetric::threemf::Unit,
     },
     ExportWasm {
         id: String,
@@ -1124,7 +1128,12 @@ fn gather_file_task(
                 .unwrap_or("project");
             Some(save_task(app, format!("{stem}-built.vproj"), true))
         }
-        FileAction::ExportMesh { id, scale } => {
+        FileAction::ExportMesh {
+            id,
+            scale,
+            format,
+            unit,
+        } => {
             let mut triangles = session.preview_triangles(&id);
             if triangles.is_empty() {
                 app.set_status(format!(
@@ -1133,7 +1142,12 @@ fn gather_file_task(
                 return None;
             }
             crate::scale_triangles(&mut triangles, scale);
-            Some(FileTask::ExportStl { id, triangles })
+            Some(FileTask::ExportMesh {
+                id,
+                triangles,
+                format,
+                unit,
+            })
         }
         FileAction::ExportWasm(id) => {
             let Some(bytes) = app
@@ -1153,6 +1167,12 @@ fn gather_file_task(
             extensions: &["stl"],
             operator_name: "stl_import_operator",
             output_base: "stl_import",
+        }),
+        FileAction::ImportThreeMf => Some(FileTask::ImportBlob {
+            filter_name: "3MF",
+            extensions: &["3mf"],
+            operator_name: "threemf_import_operator",
+            output_base: "threemf_import",
         }),
         FileAction::ImportStep => Some(FileTask::ImportBlob {
             filter_name: "STEP",
@@ -1199,14 +1219,29 @@ async fn perform_file_task(task: FileTask) -> FileOutcome {
                 bake,
             }
         }
-        FileTask::ExportStl { id, triangles } => {
-            let bytes = volumetric::stl::triangles_to_binary_stl_bytes(&triangles, "volumetric");
-            let name = format!("{id}.stl");
-            match trigger_download(&name, &bytes) {
+        FileTask::ExportMesh {
+            id,
+            triangles,
+            format,
+            unit,
+        } => {
+            let name = format!("{id}.{}", format.extension());
+            let bytes = match format {
+                ExportFormat::Stl => Ok(volumetric::stl::triangles_to_binary_stl_bytes(
+                    &triangles,
+                    "volumetric",
+                )),
+                ExportFormat::ThreeMf => {
+                    volumetric::threemf::triangles_to_3mf_bytes(&triangles, unit, &id)
+                }
+            };
+            match bytes.and_then(|bytes| trigger_download(&name, &bytes)) {
                 Ok(()) => {
                     FileOutcome::Status(format!("exported {} triangles as {name}", triangles.len()))
                 }
-                Err(err) => FileOutcome::Status(format!("failed to export STL: {err}")),
+                Err(err) => {
+                    FileOutcome::Status(format!("failed to export {}: {err}", format.label()))
+                }
             }
         }
         FileTask::ExportWasm { id, bytes } => {

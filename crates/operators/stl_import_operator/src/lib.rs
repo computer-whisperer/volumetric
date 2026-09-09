@@ -5,9 +5,9 @@
 //! meshes import as-is; converting a (watertight) mesh into an implicit
 //! solid is `mesh_to_model_operator`'s job.
 //!
-//! Vertices are welded by exact coordinate equality: STL stores each
-//! triangle's corners independently as f32, so corners that coincide in
-//! the file coincide bit-for-bit and share one vertex in the mesh.
+//! Vertices are welded by exact coordinate equality ([`TriMesh::from_soup`]):
+//! STL stores each triangle's corners independently as f32, so corners that
+//! coincide in the file coincide bit-for-bit and share one vertex in the mesh.
 //!
 //! Inputs:
 //! - Input 0: Blob — STL file bytes
@@ -168,28 +168,13 @@ fn build_mesh(mut soup: Vec<[f64; 9]>, config: &StlImportConfig) -> Result<TriMe
         }
     }
 
-    // Weld exactly-equal corners into shared vertices.
-    let mut vertex_ids: std::collections::HashMap<[u64; 3], u32> = std::collections::HashMap::new();
-    let mut positions: Vec<f64> = Vec::new();
-    let mut indices: Vec<u32> = Vec::with_capacity(soup.len() * 3);
-    for tri in &soup {
-        for corner in 0..3 {
-            let p = [tri[corner * 3], tri[corner * 3 + 1], tri[corner * 3 + 2]];
-            let key = [p[0].to_bits(), p[1].to_bits(), p[2].to_bits()];
-            let id = *vertex_ids.entry(key).or_insert_with(|| {
-                positions.extend(p);
-                (positions.len() / 3 - 1) as u32
-            });
-            indices.push(id);
-        }
-    }
-
-    let mesh = TriMesh {
-        positions,
-        indices,
-        vertex_fields: vec![],
-        face_fields: vec![],
-    };
+    let mesh = TriMesh::from_soup(soup.iter().map(|tri| {
+        [
+            [tri[0], tri[1], tri[2]],
+            [tri[3], tri[4], tri[5]],
+            [tri[6], tri[7], tri[8]],
+        ]
+    }));
     mesh.validate()?;
     Ok(mesh)
 }

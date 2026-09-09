@@ -23,7 +23,7 @@ use volumetric::{
     generate_adaptive_mesh_v2_from_bytes,
     mesh_decimation::DecimationConfig,
     sharp_features::SharpFeatureConfig,
-    stl,
+    stl, threemf,
 };
 
 mod assets;
@@ -108,9 +108,16 @@ pub struct MeshArgs {
     #[arg(long)]
     asset: Option<String>,
 
-    /// Output STL file path
+    /// Output mesh file path: `.3mf` writes a 3MF package, anything else
+    /// binary STL
     #[arg(short, long)]
     output: PathBuf,
+
+    /// Output length unit. Geometry is in metres; coordinates are scaled
+    /// to this unit and a 3MF is labelled with it (STL carries no unit, and
+    /// slicers read it as millimetres)
+    #[arg(long, value_enum, default_value_t = MeshUnit::M)]
+    unit: MeshUnit,
 
     /// Base resolution for coarse grid discovery (default: 8)
     #[arg(long, default_value = "8")]
@@ -164,6 +171,42 @@ pub struct MeshArgs {
     /// Suppress profiling output
     #[arg(short, long)]
     quiet: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum MeshUnit {
+    M,
+    Mm,
+    Cm,
+    In,
+}
+
+impl MeshUnit {
+    /// Metres → unit factor applied to every vertex.
+    fn factor(self) -> f32 {
+        match self {
+            MeshUnit::M => 1.0,
+            MeshUnit::Mm => 1000.0,
+            MeshUnit::Cm => 100.0,
+            MeshUnit::In => 1.0 / 0.0254,
+        }
+    }
+
+    fn threemf(self) -> threemf::Unit {
+        match self {
+            MeshUnit::M => threemf::Unit::Meter,
+            MeshUnit::Mm => threemf::Unit::Millimeter,
+            MeshUnit::Cm => threemf::Unit::Centimeter,
+            MeshUnit::In => threemf::Unit::Inch,
+        }
+    }
+}
+
+/// Whether an output path asks for a 3MF package (by extension).
+fn wants_3mf(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("3mf"))
 }
 
 /// Load model WASM bytes from a `.wasm` file or a `.vproj` project.
@@ -455,8 +498,9 @@ fn run_mesh(args: MeshArgs) -> Result<()> {
         print_stats_summary(&result.stats);
     }
 
-    // Convert to triangles and export STL
-    let triangles = indexed_mesh_to_triangles(&result.vertices, &result.normals, &result.indices);
+    // Convert to triangles and export
+    let mut triangles =
+        indexed_mesh_to_triangles(&result.vertices, &result.normals, &result.indices);
 
     if triangles.is_empty() {
         eprintln!(
@@ -464,13 +508,34 @@ fn run_mesh(args: MeshArgs) -> Result<()> {
              may have missed its struts entirely — try a higher --max-depth."
         );
     }
+    let factor = args.unit.factor();
+    if factor != 1.0 {
+        for triangle in &mut triangles {
+            for vertex in &mut triangle.vertices {
+                vertex.0 *= factor;
+                vertex.1 *= factor;
+                vertex.2 *= factor;
+            }
+        }
+    }
     println!(
-        "Exporting {} triangles to {:?}",
+        "Exporting {} triangles to {:?} ({:?})",
         triangles.len(),
-        args.output
+        args.output,
+        args.unit
     );
-    stl::write_binary_stl(&args.output, &triangles, "volumetric_cli")
-        .context("Failed to write STL file")?;
+    if wants_3mf(&args.output) {
+        let title = args
+            .output
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("volumetric");
+        threemf::write_3mf_file(&args.output, &triangles, args.unit.threemf(), title)
+            .context("Failed to write 3MF file")?;
+    } else {
+        stl::write_binary_stl(&args.output, &triangles, "volumetric_cli")
+            .context("Failed to write STL file")?;
+    }
 
     println!("Done!");
     Ok(())

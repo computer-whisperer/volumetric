@@ -1,0 +1,13 @@
+[package]
+name = "threemf_core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+volumetric_abi = { path = "../volumetric_abi" }
+# Raw deflate/inflate for the ZIP container. Already in the tree (png via
+# image); pure Rust, so the same code serves the wasm operator and the
+# native/web hosts.
+miniz_oxide = "0.8"
+# XML parsing for the model parts. Already in the tree (usvg).
+roxmltree = "0.21"

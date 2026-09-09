@@ -351,6 +351,7 @@ pub mod operator_config;
 pub(crate) mod parallel_iter;
 pub mod sharp_features;
 pub mod stl;
+pub mod threemf;
 
 /// Sample points from the WASM volumetric model
 #[cfg(feature = "native")]
@@ -1148,9 +1149,7 @@ impl Project {
         inputs: Vec<ExecutionInput>,
         output_ids: Vec<String>,
     ) -> String {
-        let existing = self
-            .operator_import_with_data(&op_data)
-            .map(str::to_string);
+        let existing = self.operator_import_with_data(&op_data).map(str::to_string);
         let op_id = existing.unwrap_or_else(|| {
             let op_id = self.unique_asset_id(op_id_base);
             self.imports
@@ -1176,9 +1175,7 @@ impl Project {
     fn operator_import_with_data(&self, data: &[u8]) -> Option<&str> {
         self.imports
             .iter()
-            .find(|import| {
-                import.type_hint == Some(AssetTypeHint::Operator) && import.data == data
-            })
+            .find(|import| import.type_hint == Some(AssetTypeHint::Operator) && import.data == data)
             .map(|import| import.id.as_str())
     }
 
@@ -1213,7 +1210,8 @@ impl Project {
             return 0;
         }
 
-        self.imports.retain(|import| !renamed.contains_key(&import.id));
+        self.imports
+            .retain(|import| !renamed.contains_key(&import.id));
         for step in &mut self.timeline {
             if let Some(survivor) = renamed.get(&step.operator_id) {
                 step.operator_id = survivor.clone();
@@ -1850,8 +1848,15 @@ mod tests {
         assert_eq!(second, first);
         assert_eq!(other, "boolean_operator_2");
         assert_eq!(p.imports().len(), 2);
-        let ops: Vec<_> = p.timeline().iter().map(|s| s.operator_id.as_str()).collect();
-        assert_eq!(ops, ["boolean_operator", "boolean_operator", "boolean_operator_2"]);
+        let ops: Vec<_> = p
+            .timeline()
+            .iter()
+            .map(|s| s.operator_id.as_str())
+            .collect();
+        assert_eq!(
+            ops,
+            ["boolean_operator", "boolean_operator", "boolean_operator_2"]
+        );
         assert!(p.validate().is_empty());
     }
 
@@ -1883,7 +1888,11 @@ mod tests {
 
         let ids: Vec<_> = loaded.imports().iter().map(|i| i.id.as_str()).collect();
         assert_eq!(ids, ["m", "m_2", "op", "other"]);
-        let ops: Vec<_> = loaded.timeline().iter().map(|s| s.operator_id.as_str()).collect();
+        let ops: Vec<_> = loaded
+            .timeline()
+            .iter()
+            .map(|s| s.operator_id.as_str())
+            .collect();
         assert_eq!(ops, ["op", "op", "other", "op"]);
         assert_eq!(loaded.exports(), ["d"]);
         assert!(loaded.validate().is_empty());

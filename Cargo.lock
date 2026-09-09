@@ -5445,6 +5445,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "threemf_core"
+version = "0.1.0"
+dependencies = [
+ "miniz_oxide",
+ "roxmltree 0.21.1",
+ "volumetric_abi",
+]
+
+[[package]]
+name = "threemf_import_operator"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "serde",
+ "threemf_core",
+ "volumetric_abi",
+]
+
+[[package]]
 name = "tiff"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5858,6 +5877,7 @@ dependencies = [
  "serde",
  "serde_bytes",
  "thiserror 2.0.18",
+ "threemf_core",
  "volumetric_abi",
  "wasm-bindgen",
  "wasmparser 0.248.0",

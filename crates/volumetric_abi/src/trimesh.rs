@@ -28,6 +28,34 @@ pub struct TriMesh {
 }
 
 impl TriMesh {
+    /// Builds an indexed mesh from a triangle soup, welding corners that
+    /// coincide bit-for-bit into shared vertices. That is the right weld
+    /// for formats that store each corner independently (STL): corners
+    /// that were one vertex in the source are exact duplicates, while
+    /// merely close ones stay distinct. Winding is kept as given; no fields.
+    pub fn from_soup(triangles: impl IntoIterator<Item = [[f64; 3]; 3]>) -> TriMesh {
+        let mut vertex_ids: std::collections::HashMap<[u64; 3], u32> =
+            std::collections::HashMap::new();
+        let mut positions: Vec<f64> = Vec::new();
+        let mut indices: Vec<u32> = Vec::new();
+        for tri in triangles {
+            for p in tri {
+                let key = [p[0].to_bits(), p[1].to_bits(), p[2].to_bits()];
+                let id = *vertex_ids.entry(key).or_insert_with(|| {
+                    positions.extend(p);
+                    (positions.len() / 3 - 1) as u32
+                });
+                indices.push(id);
+            }
+        }
+        TriMesh {
+            positions,
+            indices,
+            vertex_fields: vec![],
+            face_fields: vec![],
+        }
+    }
+
     pub fn vertex_count(&self) -> usize {
         self.positions.len() / 3
     }
@@ -188,6 +216,24 @@ mod tests {
         assert_eq!(decoded.vertex_count(), 4);
         assert_eq!(decoded.triangle_count(), 2);
         assert_eq!(decoded.bounds(), Some([0.0, 1.0, 0.0, 1.0, 0.0, 1.0]));
+    }
+
+    #[test]
+    fn from_soup_welds_exact_corners_only() {
+        let mesh = TriMesh::from_soup([
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            [[1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+            // A corner off by one ulp is a different vertex.
+            [
+                [0.0, 0.0, 0.0],
+                [1.0 + f64::EPSILON, 0.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+        ]);
+        assert_eq!(mesh.vertex_count(), 5);
+        assert_eq!(mesh.indices, vec![0, 1, 2, 1, 0, 3, 0, 4, 3]);
+        mesh.validate().unwrap();
+        assert_eq!(TriMesh::from_soup([]).triangle_count(), 0);
     }
 
     #[test]

@@ -13,7 +13,7 @@ The project explores a "model-as-code" paradigm where a 3D physical model is def
 
 - `src/`: The host application (Orchestrator). Built with Rust, `wasmtime` for execution, and `egui` for the UI.
 - `crates/models/`: Example model definitions (Sphere, Torus, Mandelbulb, etc.).
-- `crates/operators/`: Modules that transform or combine models. Includes **Transform Operators** (translate, scale, rotation, boolean) and **Generator Operators** (rectangular_prism, stl_import, heightmap_extrude, lua_script).
+- `crates/operators/`: Modules that transform or combine models. Includes **Transform Operators** (translate, scale, rotation, boolean) and **Generator Operators** (rectangular_prism, stl_import, threemf_import, heightmap_extrude, lua_script).
 
 ## Architecture
 
@@ -69,7 +69,8 @@ Generator operators create new models from configuration or external data:
 | Operator | Description | Inputs |
 |----------|-------------|--------|
 | `rectangular_prism` | Creates a box shape | CBOR config: `{width, height, depth}` |
-| `stl_import` | Converts STL mesh to volumetric model | STL blob + CBOR config: `{scale, translate, center}` |
+| `stl_import` | Reads an STL file as an explicit triangle mesh (`TriMesh`; chain `mesh_to_model` for a solid) | STL blob + CBOR config: `{scale, translate, center}` |
+| `threemf_import` | Reads a 3MF package as a triangle mesh in metres (file unit honoured; build items, components, and cross-part `p:path` references resolved) | 3MF blob + CBOR config: `{scale, center, item}` |
 | `heightmap_extrude` | Extrudes a heightmap image to 3D | Image blob + CBOR config: `{width, depth, height, clip}` |
 | `lua_script` | Custom occupancy model via restricted Lua | Lua source + optional routed `F64Map` parameters |
 | `path_sketch` | Fills SVG path data (lines, curves, arcs, holes) as a 2D sketch for extrude/revolve | CBOR config: `{path, flip_y, round, chord_tolerance}` |
@@ -152,17 +153,19 @@ cargo run -p volumetric_cli --release -- <COMMAND>
 
 #### Mesh Command
 
-Generate STL meshes from volumetric models:
+Generate STL or 3MF meshes from volumetric models:
 
 ```bash
 volumetric_cli mesh -i <file> -o <output.stl>
+volumetric_cli mesh -i <file> -o <output.3mf> --unit mm
 ```
 
 **Arguments:**
 - `-i, --input <file>` - Input file: either a `.wasm` model or a `.vproj` project file
-- `-o, --output <file>` - Output STL file path
+- `-o, --output <file>` - Output mesh path; a `.3mf` extension writes a 3MF package, anything else binary STL
 
 **Options:**
+- `--unit <m|mm|cm|in>` - Output length unit (default: `m`). Geometry is in metres; coordinates are scaled to this unit, and a 3MF is labelled with it so slicers open it at true size. STL carries no unit and slicers read it as millimetres, so `--unit mm` exports true size there too
 - `--base-resolution <n>` - Coarse grid resolution (default: 8)
 - `--max-depth <n>` - Refinement depth (default: 4). Effective resolution = base × 2^depth
 - `--vertex-refinement <n>` - Vertex position refinement iterations (default: 12)
@@ -183,6 +186,9 @@ volumetric_cli mesh -i model.wasm -o output.stl --max-depth 3 --normal-refinemen
 
 # Mesh a project file
 volumetric_cli mesh -i scene.vproj -o scene.stl
+
+# A slicer-ready 3MF, labelled in millimetres
+volumetric_cli mesh -i scene.vproj -o scene.3mf --unit mm
 
 # High-quality mesh with sharp edge preservation (for CAD-like models)
 volumetric_cli mesh -i box.wasm -o box.stl --sharp-edges --sharp-angle 30
