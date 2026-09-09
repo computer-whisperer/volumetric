@@ -782,6 +782,18 @@ fn gather_file_task(
             operator_name: "image_model_operator",
             output_base: "image",
         }),
+        FileAction::ImportPly => Some(FileTask::ImportBlob {
+            filter_name: "PLY",
+            extensions: &["ply"],
+            operator_name: "ply_import_operator",
+            output_base: "ply_import",
+        }),
+        FileAction::ImportPointCloud => Some(FileTask::ImportBlob {
+            filter_name: "Point clouds",
+            extensions: &["ply"],
+            operator_name: "point_cloud_import_operator",
+            output_base: "point_cloud",
+        }),
     }
 }
 

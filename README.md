@@ -71,6 +71,8 @@ Generator operators create new models from configuration or external data:
 | `rectangular_prism` | Creates a box shape | CBOR config: `{width, height, depth}` |
 | `stl_import` | Reads an STL file as an explicit triangle mesh (`TriMesh`; chain `mesh_to_model` for a solid) | STL blob + CBOR config: `{scale, translate, center}` |
 | `threemf_import` | Reads a 3MF package as a triangle mesh in metres (file unit honoured; build items, components, and cross-part `p:path` references resolved) | 3MF blob + CBOR config: `{scale, center, item}` |
+| `ply_import` | Reads a PLY mesh (ASCII or binary) as a triangle mesh; vertex colours and normals ride along as the `color` and `normal` vertex fields | PLY blob + CBOR config: `{scale, center, fields}` |
+| `point_cloud_import` | Reads a point-cloud file (PLY) as a Point1 cloud with `color` and `normal` node fields, for the point operators and the coloured cloud preview | PLY blob + CBOR config: `{scale, center, stride, fields}` |
 | `heightmap_extrude` | Extrudes a heightmap image to 3D | Image blob + CBOR config: `{width, depth, height, clip}` |
 | `lua_script` | Custom occupancy model via restricted Lua | Lua source + optional routed `F64Map` parameters |
 | `path_sketch` | Fills SVG path data (lines, curves, arcs, holes) as a 2D sketch for extrude/revolve | CBOR config: `{path, flip_y, round, chord_tolerance}` |

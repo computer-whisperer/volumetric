@@ -66,6 +66,16 @@ pub const HEX8_FACES: [[usize; 4]; 6] = [
     [1, 2, 6, 5],
 ];
 
+/// Conventional name of the per-node (or per-vertex, on a `TriMesh`)
+/// colour field: 3 components, sRGB in `[0.0, 1.0]`. Importers of coloured
+/// scans and meshes emit it; previews render it directly instead of
+/// colormapping it.
+pub const COLOR_FIELD_NAME: &str = "color";
+
+/// Conventional name of the per-node (or per-vertex) unit-normal field:
+/// 3 components, as carried by scan formats and mesh exporters.
+pub const NORMAL_FIELD_NAME: &str = "normal";
+
 /// A named data array attached to nodes or elements.
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct FeaField {

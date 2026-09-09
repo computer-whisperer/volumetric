@@ -4106,6 +4106,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
+name = "ply_core"
+version = "0.1.0"
+dependencies = [
+ "volumetric_abi",
+]
+
+[[package]]
+name = "ply_import_operator"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "ply_core",
+ "serde",
+ "volumetric_abi",
+]
+
+[[package]]
 name = "png"
 version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4116,6 +4133,16 @@ dependencies = [
  "fdeflate",
  "flate2",
  "miniz_oxide",
+]
+
+[[package]]
+name = "point_cloud_import_operator"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "ply_core",
+ "serde",
+ "volumetric_abi",
 ]
 
 [[package]]
@@ -5981,6 +6008,7 @@ dependencies = [
  "image",
  "js-sys",
  "log",
+ "point_cloud_import_operator",
  "pollster",
  "rfd",
  "serde",

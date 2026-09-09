@@ -34,6 +34,8 @@ const OPERATORS: &[&str] = &[
     "f64_map_merge_operator",
     "stl_import_operator",
     "threemf_import_operator",
+    "ply_import_operator",
+    "point_cloud_import_operator",
     "step_import_operator",
     "rectangular_prism_operator",
     "heightmap_extrude_operator",

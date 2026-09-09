@@ -2797,6 +2797,13 @@ fn srgb_to_linear(c: f32) -> f32 {
     }
 }
 
+/// One channel of a mesh or cloud `color` field (sRGB in `[0, 1]`, see
+/// `volumetric::fea::COLOR_FIELD_NAME`) as the linear value the renderer
+/// expects; out-of-range values clamp.
+fn field_channel_to_linear(c: f64) -> f32 {
+    srgb_to_linear(c.clamp(0.0, 1.0) as f32)
+}
+
 /// A muted, deterministic tint for an uncolored part: FNV-1a over the
 /// output id (stable across sessions and platforms — pin-set changes
 /// never recolor a part) picks one of twelve pastel hues, converted to
@@ -3150,10 +3157,16 @@ fn build_fea_mesh_preview(
 
     // Every colormappable field, mirrored to the settings popover's picker
     // through the stats.
+    // (The `color` and `normal` fields are rendered directly, not
+    // colormapped, so they stay out of the picker.)
     let fea_fields: Vec<String> = mesh
         .node_fields
         .iter()
         .filter(|f| f.components == 1 || f.components == 3)
+        .filter(|f| {
+            f.name != volumetric::fea::COLOR_FIELD_NAME
+                && f.name != volumetric::fea::NORMAL_FIELD_NAME
+        })
         .map(|f| format!("node:{}", f.name))
         .chain(
             mesh.element_fields
@@ -3461,73 +3474,47 @@ fn build_fea_mesh_preview(
         }
     }
 
-    // Point1 clouds: one small octahedron marker per point, sized from
-    // the typical per-point volume so the cloud reads at any scale.
-    // Very large clouds are stride-decimated for the preview only (the
-    // full data still flows downstream); the detail line reports it.
-    let mut point_preview_note = None;
+    // Point1 clouds go through the point pipeline: one screen-space dot
+    // per point, coloured by the chosen colormap field, else by the
+    // cloud's own `color` field (a scanned cloud's RGB), else neutral.
+    // Every point is submitted; the retained upload reports any dropped
+    // at the GPU buffer limit.
+    let mut points: Vec<renderer::PointInstance> = Vec::new();
+    let mut point_detail = None;
     if mesh.element_kind == volumetric::fea::FeaElementKind::Point1 {
-        const MAX_MARKERS: usize = 150_000;
         let count = mesh.element_count();
-        let stride = count.div_ceil(MAX_MARKERS).max(1);
-        if stride > 1 {
-            point_preview_note = Some(format!(
-                "preview shows {} of {count} points",
-                count.div_ceil(stride)
-            ));
-        }
-
-        // Extents from the (undeformed-independent) node positions.
-        let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
-        for n in 0..mesh.node_count() {
-            let p = position(n as u32);
-            for a in 0..3 {
-                lo[a] = lo[a].min(p[a]);
-                hi[a] = hi[a].max(p[a]);
-            }
-        }
-        let extent: [f32; 3] = std::array::from_fn(|a| (hi[a] - lo[a]).max(0.0));
-        let volume = extent.iter().product::<f32>();
-        let spacing = if volume > 0.0 {
-            (volume / count.max(1) as f32).cbrt()
-        } else {
-            // Degenerate (coplanar/collinear/single) clouds: fall back to
-            // the largest extent, or unit scale for a single point.
-            let longest = extent.iter().cloned().fold(0.0f32, f32::max);
-            if longest > 0.0 { longest / 20.0 } else { 1.0 }
-        };
-        let radius = (spacing * 0.15).max(1e-6);
-
-        // Octahedron: 6 vertices, 8 faces, flat-shaded by face normal.
-        const AXES: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-        for e in (0..count).step_by(stride) {
+        let rgb = mesh
+            .node_fields
+            .iter()
+            .find(|f| f.name == volumetric::fea::COLOR_FIELD_NAME && f.components == 3);
+        points.reserve(count);
+        for e in 0..count {
             let node = mesh.element(e)[0];
-            let c = Vec3::from(position(node));
-            let color = match &color_source {
-                Some(ColorSource::Node(values)) => color_for(values[node as usize]),
-                Some(ColorSource::Element(values)) => color_for(values[e]),
-                None => [0.82, 0.85, 0.9, 1.0],
-            };
-            for sx in [1.0f32, -1.0] {
-                for sy in [1.0f32, -1.0] {
-                    for sz in [1.0f32, -1.0] {
-                        let x = c + Vec3::from(AXES[0]) * (radius * sx);
-                        let y = c + Vec3::from(AXES[1]) * (radius * sy);
-                        let z = c + Vec3::from(AXES[2]) * (radius * sz);
-                        // Wind outward: flip vertex order for negative-
-                        // parity octants.
-                        let (a, b) = if sx * sy * sz > 0.0 { (y, z) } else { (z, y) };
-                        let normal = ((a - x).cross(b - x)).normalize_or_zero();
-                        for p in [x, a, b] {
-                            vertices.push(renderer::MeshVertex::colored(
-                                p.to_array(),
-                                normal.to_array(),
-                                color,
-                            ));
-                        }
-                    }
+            let color = match (&color_source, rgb) {
+                (Some(ColorSource::Node(values)), _) => color_for(values[node as usize]),
+                (Some(ColorSource::Element(values)), _) => color_for(values[e]),
+                (None, Some(field)) => {
+                    let c = &field.data[node as usize * 3..node as usize * 3 + 3];
+                    [
+                        field_channel_to_linear(c[0]),
+                        field_channel_to_linear(c[1]),
+                        field_channel_to_linear(c[2]),
+                        1.0,
+                    ]
                 }
-            }
+                (None, None) => [0.82, 0.85, 0.9, 1.0],
+            };
+            points.push(renderer::PointInstance {
+                position: position(node),
+                color,
+            });
+        }
+        if rgb.is_some() {
+            point_detail = Some(if color_source.is_some() {
+                "the cloud's colours are hidden by the colormap".to_string()
+            } else {
+                "coloured by the cloud's color field".to_string()
+            });
         }
     }
 
@@ -3571,10 +3558,11 @@ fn build_fea_mesh_preview(
             faces.len()
         ),
     }];
-    detail.extend(point_preview_note);
+    detail.extend(point_detail);
     detail.extend(extra_detail);
     let stats = OutputStats {
         triangles: vertices.len() / 3,
+        points: points.len(),
         detail,
         fea_fields,
         mesh_ms: build_start.elapsed().as_secs_f64() * 1000.0,
@@ -3592,12 +3580,28 @@ fn build_fea_mesh_preview(
             renderer::MaterialId(0),
         );
     }
+    let is_cloud = !points.is_empty();
+    if is_cloud {
+        // Dense scans read better as fine dots; sparse site sets as
+        // markers you can see.
+        let size = if points.len() > 200_000 { 2.5 } else { 5.0 };
+        scene.add_points(
+            renderer::PointData { points },
+            glam::Mat4::IDENTITY,
+            renderer::PointStyle {
+                size,
+                size_mode: renderer::WidthMode::ScreenSpace,
+                shape: renderer::PointShape::Circle,
+                depth_mode: renderer::DepthMode::Normal,
+            },
+        );
+    }
 
     Ok(PreviewEntity {
         scene,
         bounds,
         stats,
-        wireframe_lines: Some(renderer::LineData { segments }),
+        wireframe_lines: (!is_cloud).then_some(renderer::LineData { segments }),
         subspace: None,
     })
 }
@@ -3617,19 +3621,40 @@ fn build_tri_mesh_preview(
         [p[0] as f32, p[1] as f32, p[2] as f32]
     };
 
+    // Per-vertex colours (a scanned or painted mesh's `color` field) tint
+    // the corners; otherwise the plain material shows.
+    let rgb = mesh
+        .vertex_fields
+        .iter()
+        .find(|f| f.name == volumetric::trimesh::COLOR_FIELD_NAME && f.components == 3);
+    let color_of = |vertex: u32| -> [f32; 4] {
+        match rgb {
+            Some(field) => {
+                let c = &field.data[vertex as usize * 3..vertex as usize * 3 + 3];
+                [
+                    field_channel_to_linear(c[0]),
+                    field_channel_to_linear(c[1]),
+                    field_channel_to_linear(c[2]),
+                    1.0,
+                ]
+            }
+            None => [1.0; 4],
+        }
+    };
+
     let mut vertices: Vec<renderer::MeshVertex> = Vec::with_capacity(mesh.triangle_count() * 6);
-    let mut emit = |a: [f32; 3], b: [f32; 3], c: [f32; 3]| {
+    let mut emit = |corners: [u32; 3]| {
+        let [a, b, c] = corners.map(position);
         let (ab, ac) = (Vec3::from(b) - Vec3::from(a), Vec3::from(c) - Vec3::from(a));
         let normal = ab.cross(ac).normalize_or_zero().to_array();
-        for p in [a, b, c] {
-            vertices.push(renderer::MeshVertex::new(p, normal));
+        for (v, p) in corners.into_iter().zip([a, b, c]) {
+            vertices.push(renderer::MeshVertex::colored(p, normal, color_of(v)));
         }
     };
     for t in 0..mesh.triangle_count() {
         let [i, j, k] = mesh.triangle(t);
-        let (a, b, c) = (position(i), position(j), position(k));
-        emit(a, b, c);
-        emit(a, c, b); // back face, so open meshes show from both sides
+        emit([i, j, k]);
+        emit([i, k, j]); // back face, so open meshes show from both sides
     }
 
     let mut seen = std::collections::HashSet::new();
@@ -3658,13 +3683,17 @@ fn build_tri_mesh_preview(
         },
     };
 
+    let mut detail = vec![format!(
+        "triangle mesh: {} vertices · {} triangles",
+        mesh.vertex_count(),
+        mesh.triangle_count()
+    )];
+    if rgb.is_some() {
+        detail.push("coloured by the mesh's color field".to_string());
+    }
     let stats = OutputStats {
         triangles: vertices.len() / 3,
-        detail: vec![format!(
-            "triangle mesh: {} vertices · {} triangles",
-            mesh.vertex_count(),
-            mesh.triangle_count()
-        )],
+        detail,
         mesh_ms: build_start.elapsed().as_secs_f64() * 1000.0,
         ..Default::default()
     };
@@ -4349,6 +4378,141 @@ mod tests {
         );
     }
 
+    /// A three-point cloud carrying an sRGB `color` field and a scalar.
+    fn colored_cloud_request(color_field: Option<&str>) -> PreviewRequest {
+        let mesh = volumetric::fea::FeaMesh {
+            element_kind: volumetric::fea::FeaElementKind::Point1,
+            node_positions: vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 2.0, 0.0],
+            connectivity: vec![0, 1, 2],
+            node_fields: vec![
+                volumetric::fea::FeaField {
+                    name: volumetric::fea::COLOR_FIELD_NAME.to_string(),
+                    components: 3,
+                    data: vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.5, 0.5, 0.5],
+                },
+                volumetric::fea::FeaField {
+                    name: "confidence".to_string(),
+                    components: 1,
+                    data: vec![0.0, 0.5, 1.0],
+                },
+            ],
+            element_fields: vec![],
+        };
+        let data = volumetric::fea::encode_fea_mesh(&mesh);
+        PreviewRequest {
+            asset_id: "cloud".to_string(),
+            source_hash: volumetric::content_fingerprint(&data),
+            data: Arc::new(data),
+            type_hint: Some(AssetTypeHint::FeaMesh),
+            precursor_ids: Vec::new(),
+            plan: PreviewPlan::FeaMesh {
+                deformed: false,
+                exaggeration_tenths: 10,
+                color_field: color_field.map(str::to_string),
+            },
+            wireframe: false,
+            show_bounds: false,
+            show_grid: true,
+            ssao: false,
+            ssao_radius: 0.5,
+            ssao_bias: 0.025,
+            ssao_strength: 1.0,
+            stale: false,
+        }
+    }
+
+    #[test]
+    fn point_cloud_preview_draws_points_in_the_colour_field() {
+        let entity = build_preview_scene(&colored_cloud_request(None)).expect("cloud preview");
+        assert!(
+            entity.scene.meshes.is_empty(),
+            "clouds are points, not markers"
+        );
+        assert!(entity.wireframe_lines.is_none());
+        let (points, _, style) = &entity.scene.points[0];
+        assert_eq!(points.points.len(), 3);
+        assert_eq!(entity.stats.points, 3);
+        assert_eq!(style.size_mode, renderer::WidthMode::ScreenSpace);
+        // sRGB (1, 0, 0) and (0, 1, 0) are unchanged by linearisation; the
+        // grey lands at the linear value of sRGB 0.5.
+        assert_eq!(points.points[0].color, [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(points.points[1].color, [0.0, 1.0, 0.0, 1.0]);
+        assert!((points.points[2].color[0] - 0.2140).abs() < 1e-3);
+        assert_eq!(points.points[0].position, [0.0, 0.0, 0.0]);
+        assert_eq!(points.points[2].position, [0.0, 2.0, 0.0]);
+        assert!((entity.bounds.max.1 - 2.0).abs() < 1e-6);
+        // The colour field is rendered, not offered for colormapping.
+        assert_eq!(entity.stats.fea_fields, vec!["node:confidence".to_string()]);
+        assert!(
+            entity
+                .stats
+                .detail
+                .iter()
+                .any(|line| line.contains("coloured by the cloud")),
+            "{:?}",
+            entity.stats.detail
+        );
+    }
+
+    #[test]
+    fn point_cloud_colormap_overrides_the_colour_field() {
+        let entity = build_preview_scene(&colored_cloud_request(Some("node:confidence")))
+            .expect("cloud preview");
+        let (points, _, _) = &entity.scene.points[0];
+        let [r, g, b] = volumetric::viridis(0.0);
+        assert_eq!(points.points[0].color, [r, g, b, 1.0]);
+        let [r, g, b] = volumetric::viridis(1.0);
+        assert_eq!(points.points[2].color, [r, g, b, 1.0]);
+        assert!(
+            entity
+                .stats
+                .detail
+                .iter()
+                .any(|line| line.contains("hidden by the colormap")),
+            "{:?}",
+            entity.stats.detail
+        );
+    }
+
+    #[test]
+    fn tri_mesh_preview_tints_corners_from_the_colour_field() {
+        let mesh = volumetric::trimesh::TriMesh {
+            positions: vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            indices: vec![0, 1, 2],
+            vertex_fields: vec![volumetric::fea::FeaField {
+                name: volumetric::trimesh::COLOR_FIELD_NAME.to_string(),
+                components: 3,
+                data: vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            }],
+            face_fields: vec![],
+        };
+        let data = volumetric::trimesh::encode_tri_mesh(&mesh);
+        let mut request = colored_cloud_request(None);
+        request.asset_id = "mesh".to_string();
+        request.source_hash = volumetric::content_fingerprint(&data);
+        request.data = Arc::new(data);
+        request.type_hint = Some(AssetTypeHint::TriMesh);
+        let entity = build_preview_scene(&request).expect("mesh preview");
+        let mesh = &entity.scene.meshes[0].0;
+        // Front and back faces, three corners each, tinted by vertex.
+        assert_eq!(mesh.vertices.len(), 6);
+        assert_eq!(mesh.vertices[0].color, [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(mesh.vertices[1].color, [0.0, 1.0, 0.0, 1.0]);
+        assert_eq!(mesh.vertices[2].color, [0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(
+            mesh.vertices[4].color,
+            [0.0, 0.0, 1.0, 1.0],
+            "back face keeps corner colours"
+        );
+        assert!(
+            entity
+                .stats
+                .detail
+                .iter()
+                .any(|l| l.contains("coloured by the mesh"))
+        );
+    }
+
     #[test]
     fn fea_preview_reports_colorable_fields_and_colors_nodes() {
         let request = fea_request(PreviewPlan::FeaMesh {
@@ -4824,10 +4988,11 @@ function get_bounds_max_y() return 1.5 end
     }
 
     #[test]
-    fn point1_outputs_get_a_marker_preview() {
+    fn point1_outputs_get_a_point_preview() {
         use volumetric::fea::{FeaElementKind, FeaField, FeaMesh, encode_fea_mesh};
 
-        // Three points on the x axis, with a colormappable weight field.
+        // Three points on the x axis, with a colormappable weight field and
+        // no colour field of their own.
         let mesh = FeaMesh {
             element_kind: FeaElementKind::Point1,
             node_positions: vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 2.0, 0.0, 0.0],
@@ -4844,9 +5009,18 @@ function get_bounds_max_y() return 1.5 end
         req.type_hint = Some(AssetTypeHint::FeaMesh);
         let entity = build_preview_scene(&req).expect("point cloud preview");
 
-        // One octahedron (8 triangles) per point.
-        assert_eq!(entity.stats.triangles, 24);
-        // Bounds cover the raw points (markers are display-only).
+        // One point-pipeline instance per point, in the neutral colour,
+        // and nothing in the mesh pass.
+        assert_eq!(entity.stats.triangles, 0);
+        assert_eq!(entity.stats.points, 3);
+        assert!(entity.scene.meshes.is_empty());
+        let (points, _, style) = &entity.scene.points[0];
+        assert_eq!(points.points.len(), 3);
+        assert_eq!(points.points[1].position, [1.0, 0.0, 0.0]);
+        assert_eq!(points.points[1].color, [0.82, 0.85, 0.9, 1.0]);
+        assert_eq!(style.size, 5.0, "sparse clouds get the larger dot");
+        assert!(entity.wireframe_lines.is_none());
+        // Bounds cover the raw points (dots are display-only).
         assert_eq!(entity.bounds.min, (0.0, 0.0, 0.0));
         assert_eq!(entity.bounds.max, (2.0, 0.0, 0.0));
         assert!(

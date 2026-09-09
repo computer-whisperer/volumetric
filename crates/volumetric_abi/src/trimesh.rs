@@ -13,6 +13,7 @@
 //! ignore winding.
 
 pub use crate::fea::FeaField as MeshField;
+pub use crate::fea::{COLOR_FIELD_NAME, NORMAL_FIELD_NAME};
 
 /// An explicit triangle mesh.
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]

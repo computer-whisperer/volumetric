@@ -1,0 +1,13 @@
+[package]
+name = "point_cloud_import_operator"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+volumetric_abi = { path = "../../volumetric_abi" }
+ply_core = { path = "../../ply_core" }
+serde = { version = "1", features = ["derive"] }
+ciborium = "0.2"

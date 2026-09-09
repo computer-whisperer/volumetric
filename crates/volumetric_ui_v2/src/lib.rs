@@ -150,6 +150,8 @@ pub const IMPORT_STL_KEY: &str = "action:import-stl";
 pub const IMPORT_3MF_KEY: &str = "action:import-3mf";
 pub const IMPORT_STEP_KEY: &str = "action:import-step";
 pub const IMPORT_IMAGE_KEY: &str = "action:import-image";
+pub const IMPORT_PLY_KEY: &str = "action:import-ply";
+pub const IMPORT_POINT_CLOUD_KEY: &str = "action:import-point-cloud";
 pub const RUN_PROJECT_KEY: &str = "action:run-project";
 pub const CANCEL_RUN_KEY: &str = "action:cancel-run";
 pub const TOGGLE_AUTO_REBUILD_KEY: &str = "action:toggle-auto-rebuild";
@@ -1059,6 +1061,11 @@ pub enum FileAction {
     /// Import an image as a 2D field model via the bundled
     /// `image_model_operator`.
     ImportImage,
+    /// Import a PLY mesh via the bundled `ply_import_operator`.
+    ImportPly,
+    /// Import a point-cloud file (PLY) as a Point1 cloud via the bundled
+    /// `point_cloud_import_operator`.
+    ImportPointCloud,
 }
 
 /// What an output *is*, for view purposes: each kind gets its own render
@@ -4228,6 +4235,20 @@ impl App for VolumetricUiV2 {
             return;
         }
 
+        if event.is_click_or_activate(IMPORT_PLY_KEY) {
+            self.pending_file_action = Some(FileAction::ImportPly);
+            self.open_menu = None;
+            self.add_modal = None;
+            return;
+        }
+
+        if event.is_click_or_activate(IMPORT_POINT_CLOUD_KEY) {
+            self.pending_file_action = Some(FileAction::ImportPointCloud);
+            self.open_menu = None;
+            self.add_modal = None;
+            return;
+        }
+
         if event.is_click_or_activate(ADD_OPEN_KEY) {
             self.add_modal = Some(AddModalState::default());
             // Focus lands in the search field so typing filters immediately.
@@ -4710,6 +4731,8 @@ fn catalog_row_key(entry: &catalog::CatalogEntry) -> String {
         "threemf_import_operator" => IMPORT_3MF_KEY.to_string(),
         "step_import_operator" => IMPORT_STEP_KEY.to_string(),
         "image_model_operator" => IMPORT_IMAGE_KEY.to_string(),
+        "ply_import_operator" => IMPORT_PLY_KEY.to_string(),
+        "point_cloud_import_operator" => IMPORT_POINT_CLOUD_KEY.to_string(),
         _ => match entry.kind {
             volumetric_assets::AssetCategory::Model => {
                 format!("{ADD_MODEL_PREFIX}{}", entry.name)
@@ -9565,6 +9588,10 @@ mod tests {
         assert_eq!(app.take_file_action(), Some(FileAction::ImportThreeMf));
         dispatch(&mut app, UiEvent::synthetic_click(IMPORT_IMAGE_KEY));
         assert_eq!(app.take_file_action(), Some(FileAction::ImportImage));
+        dispatch(&mut app, UiEvent::synthetic_click(IMPORT_PLY_KEY));
+        assert_eq!(app.take_file_action(), Some(FileAction::ImportPly));
+        dispatch(&mut app, UiEvent::synthetic_click(IMPORT_POINT_CLOUD_KEY));
+        assert_eq!(app.take_file_action(), Some(FileAction::ImportPointCloud));
     }
 
     #[test]
