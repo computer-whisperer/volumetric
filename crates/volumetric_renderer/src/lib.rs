@@ -36,6 +36,8 @@ mod buffer;
 mod camera;
 mod conversions;
 mod gbuffer;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod offscreen;
 mod pipelines;
 mod scene;
 pub mod test_scenes;
@@ -44,7 +46,9 @@ mod types;
 pub use conversions::{convert_mesh_data, convert_points_to_point_data};
 
 pub use buffer::{DynamicBuffer, QUAD_INDICES, QUAD_VERTICES, QuadVertex, StaticBuffer};
-pub use camera::{Camera, CameraAction, CameraControlScheme, CameraInputState};
+pub use camera::{
+    Camera, CameraAction, CameraControlScheme, CameraInputState, CameraView, Pinhole, ViewDirection,
+};
 pub use gbuffer::{AoTexture, GBuffer};
 pub use pipelines::{
     CompositePipeline, GpuLines, GpuMesh, GpuPoints, LinePipeline, MeshPipeline, MeshUniforms,
@@ -537,6 +541,23 @@ impl Renderer {
         settings: &RenderSettings,
         target: &wgpu::TextureView,
     ) {
+        let aspect = self.viewport_size.0 as f32 / self.viewport_size.1 as f32;
+        let view = CameraView::from_camera(camera, aspect);
+        self.render_view(device, queue, encoder, &view, settings, target)
+    }
+
+    /// [`render`](Self::render) with an explicit view and projection — a
+    /// pinhole camera from a posed photograph, or any matrices the orbit
+    /// camera cannot express.
+    pub fn render_view(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &CameraView,
+        settings: &RenderSettings,
+        target: &wgpu::TextureView,
+    ) {
         // Update grid lines if settings changed (must be before borrowing self.gpu)
         self.update_grid_cache(settings);
 
@@ -565,8 +586,7 @@ impl Renderer {
             return;
         };
 
-        let aspect = self.viewport_size.0 as f32 / self.viewport_size.1 as f32;
-        let view_proj = camera.view_projection_matrix(aspect);
+        let view_proj = view.view_projection();
         let view_proj_array = view_proj.to_cols_array_2d();
         let screen_size = [self.viewport_size.0 as f32, self.viewport_size.1 as f32];
 

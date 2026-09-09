@@ -201,82 +201,48 @@ volumetric_cli mesh -i box.wasm -o box.stl --sharp-edges --sharp-angle 30
 
 #### Render Command
 
-Generate PNG images from volumetric models using headless wgpu rendering:
+Draw a model, or the exports of a project, to PNG through the same preview
+path as the GUI viewport: 3D models are meshed with the adaptive surface
+nets plan, 2D sketches raster to flat quads, point clouds draw as coloured
+points, FEA and triangle meshes as their explicit data, and Subspace values
+as gizmos sized by the scene.
 
 ```bash
-volumetric_cli render -i <file> -o <output.png>
+volumetric_cli render -i <model.wasm | project.vproj> -o <output.png>
 ```
 
-**Arguments:**
-- `-i, --input <file>` - Input file: either a `.wasm` model or a `.vproj` project file
-- `-o, --output <file>` - Output PNG file path (view suffix added for multiple views)
+**Scene:**
+- `--asset <id>` - Draw only this export (repeatable; default: every renderable export)
+- `--resolution <N>` - Meshing resolution for models and raster size for sketches (default: 128)
+- `--no-sharp`, `--no-simplify` - Mesh without sharp-feature reconstruction or decimation
+- `--color-channel <name>` - Colormap models by a declared sample channel
+- `--color-field node:<name>` - Colormap FEA meshes and point clouds by a field
+- `--wireframe` - Overlay mesh edges
+- `--grid <m>` - Ground grid spacing in metres (default: 1.0; 0 disables)
+- `--no-ssao` - Disable ambient occlusion
+- `--background <hex>` - Background colour (default: 2d2d2d)
+- `--width`, `--height` - Image size (default: 1024 x 1024)
 
-**Options:**
-- `--width <n>` - Image width in pixels (default: 1024)
-- `--height <n>` - Image height in pixels (default: 1024)
-- `--views <views>` - Comma-separated views: front, back, left, right, top, bottom, iso, iso-back, all (default: iso)
-- `--background <hex>` - Background color as hex, e.g., 2d2d2d (default: 2d2d2d)
-- `--color <hex>` - Mesh base color as hex, e.g., 6699cc (default: 6699cc)
-- `--grid <spacing>` - Reference grid spacing in meters, 0 to disable (default: 1.0)
-- `--grid-color <hex>` - Grid color as hex, e.g., 555555 (default: 555555)
-- `--base-resolution <n>`, `--max-depth <n>`, `--sharp-edges`, etc. - Same meshing options as the mesh command
-- `-q, --quiet` - Suppress profiling output
-
-**Projection & Camera Options:**
-- `--projection <type>` - Projection type: `perspective` or `ortho` (default: perspective)
-- `--fov <degrees>` - Field of view for perspective projection (default: 45)
-- `--ortho-scale <units>` - Orthographic vertical scale in world units (auto-computed if 0)
-- `--camera-pos <x,y,z>` - Custom camera position (overrides --views)
-- `--camera-target <x,y,z>` - Look-at point (default: model center)
-- `--camera-up <x,y,z>` - Up vector (default: 0,1,0)
-- `--near <distance>` - Near clipping plane distance (default: auto-computed)
-- `--far <distance>` - Far clipping plane distance (default: auto-computed)
-
-**Rendering Mode Options:**
-- `--wireframe` - Render mesh edges instead of filled triangles
-- `--wireframe-color <hex>` - Wireframe line color (default: ffffff)
-- `--recalc-normals` - Recompute smooth normals from mesh geometry (useful for imported STLs with bad normals)
+**Camera** (one of):
+- `--views <list>` - Preset directions framed to the scene: front, back, left, right, top, bottom, iso, iso-back, all (default: iso; several views write one file each, suffixed)
+- `--camera-pos x,y,z [--camera-target x,y,z] [--camera-up x,y,z] [--fov deg]` - An explicit pose
+- `--intrinsics fx,fy,cx,cy --pose m00,...,m23` - A pinhole camera in OpenCV convention (pixel origin top-left, camera z forward); the pose is the rows of its 3x4 camera-to-world matrix and the image is `--width` x `--height`
+- `--projection ortho [--ortho-scale h]` - Orthographic instead of perspective (presets and poses)
+- `--near`, `--far` - Clip planes (default: from the scene)
 
 **Examples:**
 ```bash
-# Single isometric view
-volumetric_cli render -i model.wasm -o render.png
+# Every export of a project from the isometric preset
+volumetric_cli render -i chair.vproj -o chair.png
 
-# Multiple views
-volumetric_cli render -i model.wasm -o render.png --views front,iso,top
+# Three views of a scan and a fitted axis
+volumetric_cli render -i chair.vproj --asset scan --asset lift_axis -o chair.png --views front,top,iso
 
-# All views at high resolution
-volumetric_cli render -i model.wasm -o render.png --views all --width 2048 --height 2048
-
-# Custom colors
-volumetric_cli render -i model.wasm -o out.png --background ffffff --color 4488aa
-
-# With 0.5m reference grid
-volumetric_cli render -i model.wasm -o out.png --grid 0.5
-
-# Without grid
-volumetric_cli render -i model.wasm -o out.png --grid 0
-
-# Orthographic projection (parallel lines don't converge)
-volumetric_cli render -i model.wasm -o out.png --projection ortho
-
-# Wide-angle perspective (90° FOV)
-volumetric_cli render -i model.wasm -o out.png --fov 90
-
-# Wireframe rendering
-volumetric_cli render -i model.wasm -o out.png --wireframe --wireframe-color 00ff00
-
-# Custom camera position
-volumetric_cli render -i model.wasm -o out.png --camera-pos 5,3,5 --camera-target 0,0,0
-
-# Combined: orthographic + wireframe + custom camera
-volumetric_cli render -i model.wasm -o out.png --projection ortho --wireframe --camera-pos 10,10,10
-
-# Close-up wireframe inspection with custom clip planes
-volumetric_cli render -i model.wasm -o out.png --wireframe --camera-pos 0.5,0.5,0.5 --near 0.01 --far 10
+# Through one of the scan's rectified photographs (960 x 960)
+volumetric_cli render -i chair.vproj -o view.png --width 960 --height 960 \
+    --intrinsics 414.8,415.1,484.2,488.6 \
+    --pose 0.726,-0.475,0.497,0.881,-0.014,-0.733,-0.681,-1.031,0.687,0.487,-0.538,-2.186
 ```
-
-The CLI outputs detailed profiling statistics showing per-stage timing and sample counts, useful for performance analysis.
 
 #### Project Commands
 

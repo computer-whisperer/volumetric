@@ -14,6 +14,7 @@ use std::sync::{
     mpsc::{self, Receiver, Sender},
 };
 use std::thread;
+use volumetric_preview::srgb_to_linear;
 
 use damascene_core::clipboard;
 use damascene_core::prelude::*;
@@ -1173,18 +1174,10 @@ mod primary {
 fn bg_color(palette: &damascene_core::Palette) -> wgpu::Color {
     let c = palette.background;
     wgpu::Color {
-        r: srgb_to_linear(c.r as f64 / 255.0),
-        g: srgb_to_linear(c.g as f64 / 255.0),
-        b: srgb_to_linear(c.b as f64 / 255.0),
+        r: f64::from(srgb_to_linear(c.r / 255.0)),
+        g: f64::from(srgb_to_linear(c.g / 255.0)),
+        b: f64::from(srgb_to_linear(c.b / 255.0)),
         a: c.a as f64 / 255.0,
-    }
-}
-
-fn srgb_to_linear(c: f64) -> f64 {
-    if c <= 0.04045 {
-        c / 12.92
-    } else {
-        ((c + 0.055) / 1.055).powf(2.4)
     }
 }
 

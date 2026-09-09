@@ -1,602 +1,940 @@
-//! Render subcommand for generating PNG images from volumetric models
+//! `render`: draws a model, or the exports of a project, to PNG through the
+//! same preview path as the GUI viewport (`volumetric_preview`): 3D models
+//! meshed with the adaptive surface nets plan, 2D sketches as flat rasters,
+//! FEA meshes and point clouds as their explicit data, triangle meshes as
+//! they are, Subspace values as gizmos sized by the whole scene. The frame
+//! an agent reads headlessly is the frame a person sees in the viewport.
+//!
+//! Cameras: preset directions framed to the scene, an explicit pose with a
+//! field of view, or a pinhole with intrinsics and an OpenCV camera-to-world
+//! pose, which is how a scan's photographs are looked through.
+
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
-use glam::Vec3;
-use std::path::PathBuf;
+use glam::{Mat4, Vec3, Vec4};
 
-use volumetric::generate_adaptive_mesh_v2_from_bytes;
-
-use crate::camera::{CameraSetup, ProjectionType, ViewAngle, parse_views};
-use crate::headless_renderer::{
-    GridVertex, HeadlessRenderer, MeshVertex, Uniforms, WireframeOptions,
+use volumetric::{AssetTypeHint, LoadedAsset, Project};
+use volumetric_preview::{
+    Asn2Settings, PreviewBounds, PreviewEntity, PreviewMeshPlan, PreviewPlan, PreviewRenderMode,
+    PreviewRequest, build_preview_scene, srgb_to_linear, submit_subspace_gizmo, wireframe_style,
 };
-use crate::{build_mesh_config, load_wasm_bytes};
+use volumetric_renderer::{
+    Camera, CameraView, GridPlanes, Pinhole, RenderSettings, ViewDirection, offscreen::Offscreen,
+};
 
-/// Projection type for CLI argument parsing
-#[derive(Debug, Clone, Copy, ValueEnum, Default)]
+#[derive(Parser, Debug)]
+pub struct RenderArgs {
+    /// Input file: a .wasm model or a .vproj project
+    #[arg(short, long)]
+    pub input: PathBuf,
+
+    /// For .vproj inputs: an export to draw (repeatable; default: every
+    /// renderable export)
+    #[arg(long = "asset")]
+    pub assets: Vec<String>,
+
+    /// Output PNG path (a view suffix is added when several views render)
+    #[arg(short, long)]
+    pub output: PathBuf,
+
+    #[arg(long, default_value_t = 1024)]
+    pub width: u32,
+
+    #[arg(long, default_value_t = 1024)]
+    pub height: u32,
+
+    /// Comma-separated preset views: front, back, left, right, top, bottom,
+    /// iso, iso-back, all
+    #[arg(long, default_value = "iso")]
+    pub views: String,
+
+    /// Background colour as hex sRGB (e.g. 2d2d2d)
+    #[arg(long, default_value = "2d2d2d")]
+    pub background: String,
+
+    /// Camera position x,y,z (an explicit camera replaces --views)
+    #[arg(long, allow_hyphen_values = true)]
+    pub camera_pos: Option<String>,
+
+    /// Look-at point x,y,z (default: the scene centre)
+    #[arg(long, allow_hyphen_values = true)]
+    pub camera_target: Option<String>,
+
+    /// Up vector x,y,z
+    #[arg(long, default_value = "0,1,0", allow_hyphen_values = true)]
+    pub camera_up: String,
+
+    /// Vertical field of view in degrees (perspective)
+    #[arg(long, default_value_t = 45.0)]
+    pub fov: f32,
+
+    /// Pinhole intrinsics fx,fy,cx,cy in pixels of the --width x --height
+    /// image (with --pose)
+    #[arg(long, allow_hyphen_values = true)]
+    pub intrinsics: Option<String>,
+
+    /// Camera-to-world pose as 12 numbers, the rows of a 3x4 matrix, OpenCV
+    /// convention: x right, y down, z forward (with --intrinsics)
+    #[arg(long, allow_hyphen_values = true)]
+    pub pose: Option<String>,
+
+    #[arg(long, value_enum, default_value_t = ProjectionArg::Perspective)]
+    pub projection: ProjectionArg,
+
+    /// Orthographic frame height in world units (0 = fit the scene)
+    #[arg(long, default_value_t = 0.0)]
+    pub ortho_scale: f32,
+
+    /// Near clip distance (default: from the scene)
+    #[arg(long)]
+    pub near: Option<f32>,
+
+    /// Far clip distance (default: from the scene)
+    #[arg(long)]
+    pub far: Option<f32>,
+
+    /// Meshing resolution for 3D models and raster size for 2D sketches
+    #[arg(long, default_value_t = 128)]
+    pub resolution: usize,
+
+    /// Mesh models without sharp-feature reconstruction
+    #[arg(long)]
+    pub no_sharp: bool,
+
+    /// Mesh models without the decimation pass
+    #[arg(long)]
+    pub no_simplify: bool,
+
+    /// Colormap models by a declared sample channel
+    #[arg(long)]
+    pub color_channel: Option<String>,
+
+    /// Colormap FEA meshes and point clouds by a field, e.g. node:confidence
+    #[arg(long)]
+    pub color_field: Option<String>,
+
+    /// Overlay mesh edges
+    #[arg(long)]
+    pub wireframe: bool,
+
+    /// Ground grid spacing in metres (0 disables)
+    #[arg(long, default_value_t = 1.0)]
+    pub grid: f32,
+
+    /// Disable ambient occlusion
+    #[arg(long)]
+    pub no_ssao: bool,
+
+    /// Suppress per-asset statistics
+    #[arg(short, long)]
+    pub quiet: bool,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum ProjectionArg {
-    #[default]
     Perspective,
     Ortho,
 }
 
-#[derive(Parser, Debug)]
-pub struct RenderArgs {
-    /// Input file: either a .wasm model or a .vproj project file
-    #[arg(short, long)]
-    pub input: PathBuf,
-
-    /// For .vproj inputs with multiple exports: which exported asset to render
-    #[arg(long)]
-    pub asset: Option<String>,
-
-    /// Output PNG file path (view suffix added for multiple views)
-    #[arg(short, long)]
-    pub output: PathBuf,
-
-    /// Image width in pixels
-    #[arg(long, default_value = "1024")]
-    pub width: u32,
-
-    /// Image height in pixels
-    #[arg(long, default_value = "1024")]
-    pub height: u32,
-
-    /// Comma-separated views: front, back, left, right, top, bottom, iso, iso-back, all
-    #[arg(long, default_value = "iso")]
-    pub views: String,
-
-    /// Background color as hex (e.g., 2d2d2d)
-    #[arg(long, default_value = "2d2d2d")]
-    pub background: String,
-
-    /// Mesh base color as hex (e.g., 6699cc)
-    #[arg(long, default_value = "6699cc")]
-    pub color: String,
-
-    /// Base resolution for coarse grid discovery
-    #[arg(long, default_value = "8")]
-    pub base_resolution: usize,
-
-    /// Maximum refinement depth
-    #[arg(long, default_value = "4")]
-    pub max_depth: usize,
-
-    /// Aperiodic interior probes per corner-uniform discovery cell
-    /// (default: 8, 0 to disable)
-    #[arg(long, default_value = "8")]
-    pub discovery_probes: usize,
-
-    /// Vertex refinement iterations
-    #[arg(long, default_value = "12")]
-    pub vertex_refinement: usize,
-
-    /// Normal refinement iterations
-    #[arg(long, default_value = "12")]
-    pub normal_refinement: usize,
-
-    /// Normal epsilon fraction
-    #[arg(long, default_value = "0.1")]
-    pub normal_epsilon: f32,
-
-    /// Enable sharp feature reconstruction (region-based edge/corner snapping)
-    #[arg(long)]
-    pub sharp_edges: bool,
-
-    /// Sharp features: max same-region normal jump between adjacent vertices
-    /// in degrees (default: 15)
-    #[arg(long, default_value = "15.0")]
-    pub sharp_angle: f64,
-
-    /// Disable the decimation post-pass (stage 5 quadric simplification)
-    #[arg(long)]
-    pub no_simplify: bool,
-
-    /// Decimation error budget, as a fraction of the finest cell size
-    #[arg(long, default_value = "1.0")]
-    pub simplify_tolerance: f64,
-
-    /// Constrain vertex refinement to each vertex's own grid edge. Prevents
-    /// refinement from capturing a neighboring parallel surface — use for
-    /// thin-walled lattices whose sheets visually bond together
-    #[arg(long)]
-    pub edge_constrained: bool,
-
-    /// Suppress profiling output
-    #[arg(short, long)]
-    pub quiet: bool,
-
-    /// Reference grid spacing in meters (0 to disable)
-    #[arg(long, default_value = "1.0")]
-    pub grid: f32,
-
-    /// Grid color as hex (e.g., 555555)
-    #[arg(long, default_value = "555555")]
-    pub grid_color: String,
-
-    // === New rendering mode options ===
-    /// Projection type: perspective or ortho
-    #[arg(long, value_enum, default_value = "perspective")]
-    pub projection: ProjectionArg,
-
-    /// Orthographic vertical scale in world units (auto-computed if omitted or 0)
-    #[arg(long, default_value = "0.0")]
-    pub ortho_scale: f32,
-
-    /// Field of view for perspective projection in degrees
-    #[arg(long, default_value = "45.0")]
-    pub fov: f32,
-
-    /// Render edges instead of filled triangles
-    #[arg(long)]
-    pub wireframe: bool,
-
-    /// Wireframe line color as hex (e.g., ffffff)
-    #[arg(long, default_value = "ffffff")]
-    pub wireframe_color: String,
-
-    /// Recompute smooth normals from mesh geometry
-    #[arg(long)]
-    pub recalc_normals: bool,
-
-    /// Camera position as x,y,z (overrides --views)
-    #[arg(long)]
-    pub camera_pos: Option<String>,
-
-    /// Look-at point as x,y,z (default: model center)
-    #[arg(long)]
-    pub camera_target: Option<String>,
-
-    /// Up vector as x,y,z (default: 0,1,0)
-    #[arg(long, default_value = "0,1,0")]
-    pub camera_up: String,
-
-    /// Near clipping plane distance (default: auto-computed from scene)
-    #[arg(long)]
-    pub near: Option<f32>,
-
-    /// Far clipping plane distance (default: auto-computed from scene)
-    #[arg(long)]
-    pub far: Option<f32>,
+/// How each asset is turned into a preview.
+struct PlanOptions {
+    resolution: usize,
+    sharp: bool,
+    simplify: bool,
+    color_channel: Option<String>,
+    color_field: Option<String>,
+    wireframe: bool,
 }
 
-fn parse_hex_color(hex: &str) -> Result<[f32; 3]> {
-    let hex = hex.trim_start_matches('#');
-    if hex.len() != 6 {
-        anyhow::bail!(
-            "Invalid hex color: expected 6 characters, got {}",
-            hex.len()
-        );
+/// A preset direction, framed to the scene like the viewport's view menu.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ViewPreset {
+    Front,
+    Back,
+    Left,
+    Right,
+    Top,
+    Bottom,
+    Iso,
+    IsoBack,
+}
+
+impl ViewPreset {
+    const ALL: [Self; 8] = [
+        Self::Front,
+        Self::Back,
+        Self::Left,
+        Self::Right,
+        Self::Top,
+        Self::Bottom,
+        Self::Iso,
+        Self::IsoBack,
+    ];
+
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::Front => "front",
+            Self::Back => "back",
+            Self::Left => "left",
+            Self::Right => "right",
+            Self::Top => "top",
+            Self::Bottom => "bottom",
+            Self::Iso => "iso",
+            Self::IsoBack => "iso-back",
+        }
     }
-    let r = u8::from_str_radix(&hex[0..2], 16).context("Invalid red component")?;
-    let g = u8::from_str_radix(&hex[2..4], 16).context("Invalid green component")?;
-    let b = u8::from_str_radix(&hex[4..6], 16).context("Invalid blue component")?;
-    Ok([r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0])
-}
 
-/// Parse a Vec3 from "x,y,z" format
-fn parse_vec3(s: &str) -> Result<Vec3> {
-    let parts: Vec<&str> = s.split(',').collect();
-    if parts.len() != 3 {
-        anyhow::bail!("Invalid vec3 format: expected 'x,y,z', got '{}'", s);
+    fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|preset| preset.suffix() == name)
     }
-    let x: f32 = parts[0].trim().parse().context("Invalid x component")?;
-    let y: f32 = parts[1].trim().parse().context("Invalid y component")?;
-    let z: f32 = parts[2].trim().parse().context("Invalid z component")?;
-    Ok(Vec3::new(x, y, z))
+
+    /// The orbit camera for this preset, framed to `min..max` at `fov_y`.
+    fn camera(self, min: Vec3, max: Vec3, fov_y: f32) -> Camera {
+        let mut camera = Camera::new((min + max) * 0.5, 1.0);
+        camera.fov_y = fov_y;
+        let direction = match self {
+            Self::Front => ViewDirection::Front,
+            Self::Back => ViewDirection::Back,
+            Self::Left => ViewDirection::Left,
+            Self::Right => ViewDirection::Right,
+            Self::Top => ViewDirection::Top,
+            Self::Bottom => ViewDirection::Bottom,
+            Self::Iso | Self::IsoBack => ViewDirection::Isometric,
+        };
+        camera.view_from_direction(direction);
+        if self == Self::IsoBack {
+            camera.theta += std::f32::consts::PI;
+        }
+        camera.focus_on(min, max);
+        camera.fit_clip_planes();
+        camera
+    }
 }
 
-/// Recalculate smooth normals from mesh geometry using area-weighted face normals
-fn recalculate_normals(vertices: &[(f32, f32, f32)], indices: &[u32]) -> Vec<(f32, f32, f32)> {
-    let mut normals = vec![Vec3::ZERO; vertices.len()];
-
-    // Accumulate area-weighted face normals for each vertex
-    for tri in indices.chunks(3) {
-        if tri.len() != 3 {
+/// Parses a comma-separated view list; `all` expands to every preset.
+fn parse_views(list: &str) -> Result<Vec<ViewPreset>> {
+    let mut views = Vec::new();
+    for name in list.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+        if name == "all" {
+            views.extend(ViewPreset::ALL);
             continue;
         }
-        let i0 = tri[0] as usize;
-        let i1 = tri[1] as usize;
-        let i2 = tri[2] as usize;
-
-        let v0 = Vec3::new(vertices[i0].0, vertices[i0].1, vertices[i0].2);
-        let v1 = Vec3::new(vertices[i1].0, vertices[i1].1, vertices[i1].2);
-        let v2 = Vec3::new(vertices[i2].0, vertices[i2].1, vertices[i2].2);
-
-        let e1 = v1 - v0;
-        let e2 = v2 - v0;
-
-        // Cross product gives area-weighted normal (length = 2 * triangle area)
-        let face_normal = e1.cross(e2);
-
-        // Accumulate to each vertex of the triangle
-        normals[i0] += face_normal;
-        normals[i1] += face_normal;
-        normals[i2] += face_normal;
+        let preset = ViewPreset::parse(name).with_context(|| {
+            format!(
+                "unknown view '{name}'; expected one of {}",
+                ViewPreset::ALL
+                    .iter()
+                    .map(|p| p.suffix())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
+        views.push(preset);
     }
+    if views.is_empty() {
+        anyhow::bail!("--views names no view");
+    }
+    Ok(views)
+}
 
-    // Normalize all vertex normals
-    normals
-        .into_iter()
-        .map(|n| {
-            let normalized = n.normalize_or_zero();
-            // Fall back to up vector if zero normal
-            let n = if normalized == Vec3::ZERO {
-                Vec3::Y
-            } else {
-                normalized
+/// Where the frame is drawn from.
+enum CameraMode {
+    Presets(Vec<ViewPreset>),
+    Pose {
+        eye: Vec3,
+        target: Option<Vec3>,
+        up: Vec3,
+    },
+    Pinhole {
+        pinhole: Pinhole,
+        camera_to_world: Mat4,
+    },
+}
+
+fn camera_mode(args: &RenderArgs) -> Result<CameraMode> {
+    match (&args.intrinsics, &args.pose) {
+        (Some(intrinsics), Some(pose)) => {
+            if args.camera_pos.is_some() {
+                anyhow::bail!(
+                    "--camera-pos and --intrinsics/--pose are different cameras; give one"
+                );
+            }
+            if args.projection == ProjectionArg::Ortho {
+                anyhow::bail!("a pinhole camera is perspective; drop --projection ortho");
+            }
+            let k = parse_floats(intrinsics, 4).context("Invalid --intrinsics")?;
+            let m = parse_floats(pose, 12).context("Invalid --pose")?;
+            let pinhole = Pinhole {
+                fx: k[0],
+                fy: k[1],
+                cx: k[2],
+                cy: k[3],
+                width: args.width,
+                height: args.height,
             };
-            (n.x, n.y, n.z)
-        })
-        .collect()
+            let camera_to_world = Mat4::from_cols(
+                Vec4::new(m[0], m[4], m[8], 0.0),
+                Vec4::new(m[1], m[5], m[9], 0.0),
+                Vec4::new(m[2], m[6], m[10], 0.0),
+                Vec4::new(m[3], m[7], m[11], 1.0),
+            );
+            Ok(CameraMode::Pinhole {
+                pinhole,
+                camera_to_world,
+            })
+        }
+        (None, None) => match &args.camera_pos {
+            Some(pos) => Ok(CameraMode::Pose {
+                eye: parse_vec3(pos).context("Invalid --camera-pos")?,
+                target: args
+                    .camera_target
+                    .as_deref()
+                    .map(parse_vec3)
+                    .transpose()
+                    .context("Invalid --camera-target")?,
+                up: parse_vec3(&args.camera_up).context("Invalid --camera-up")?,
+            }),
+            None => Ok(CameraMode::Presets(parse_views(&args.views)?)),
+        },
+        _ => anyhow::bail!("--intrinsics and --pose go together"),
+    }
 }
 
-fn compute_bounds(vertices: &[(f32, f32, f32)]) -> (Vec3, Vec3) {
-    let mut min = Vec3::splat(f32::INFINITY);
-    let mut max = Vec3::splat(f32::NEG_INFINITY);
-
-    for &(x, y, z) in vertices {
-        min = min.min(Vec3::new(x, y, z));
-        max = max.max(Vec3::new(x, y, z));
+/// Near and far planes enclosing `min..max` as seen from `eye` along
+/// `forward`: the near plane sits at half the nearest corner's depth but
+/// never below a thousandth of the scene, the far plane at twice the
+/// farthest corner's.
+fn clip_planes_for(eye: Vec3, forward: Vec3, min: Vec3, max: Vec3) -> (f32, f32) {
+    let extent = (max - min).length().max(1e-6);
+    let (mut nearest, mut farthest) = (f32::INFINITY, f32::NEG_INFINITY);
+    for i in 0..8 {
+        let corner = Vec3::new(
+            if i & 1 == 0 { min.x } else { max.x },
+            if i & 2 == 0 { min.y } else { max.y },
+            if i & 4 == 0 { min.z } else { max.z },
+        );
+        let depth = (corner - eye).dot(forward);
+        nearest = nearest.min(depth);
+        farthest = farthest.max(depth);
     }
-
-    (min, max)
+    let near = (nearest * 0.5).max(extent * 1e-3);
+    let far = (farthest * 2.0).max(near * 10.0);
+    (near, far)
 }
 
-/// Generate grid line vertices on the XZ plane at y=0
-fn generate_grid_vertices(
-    bounds_min: Vec3,
-    bounds_max: Vec3,
-    spacing: f32,
-    color: [f32; 3],
-) -> Vec<GridVertex> {
-    let mut vertices = Vec::new();
+/// The frames to draw: a file suffix (for several) and the view for each.
+fn frames(
+    mode: CameraMode,
+    args: &RenderArgs,
+    bounds: PreviewBounds,
+) -> Result<Vec<(Option<&'static str>, CameraView)>> {
+    let min = Vec3::from(bounds.min);
+    let max = Vec3::from(bounds.max);
+    let aspect = args.width as f32 / args.height as f32;
+    let fov_y = args.fov.to_radians();
+    let ortho_height = |default: f32| {
+        if args.ortho_scale > 0.0 {
+            args.ortho_scale
+        } else {
+            default
+        }
+    };
+    let clip = |eye: Vec3, forward: Vec3, default: (f32, f32)| {
+        let scene = clip_planes_for(eye, forward, min, max);
+        (
+            args.near
+                .unwrap_or(if default.0 > 0.0 { default.0 } else { scene.0 }),
+            args.far
+                .unwrap_or(if default.1 > 0.0 { default.1 } else { scene.1 }),
+        )
+    };
 
-    // Extend grid slightly beyond model bounds, snapped to grid spacing
-    let margin = spacing;
-    let x_min = ((bounds_min.x - margin) / spacing).floor() * spacing;
-    let x_max = ((bounds_max.x + margin) / spacing).ceil() * spacing;
-    let z_min = ((bounds_min.z - margin) / spacing).floor() * spacing;
-    let z_max = ((bounds_max.z + margin) / spacing).ceil() * spacing;
-
-    // Place grid at y=0 or at the bottom of model bounds if model is above y=0
-    let y = 0.0_f32.min(bounds_min.y);
-
-    // Determine which lines are major (every 5 units) vs minor
-    let major_spacing = spacing * 5.0;
-    let major_color = color;
-    let minor_color = [color[0] * 0.6, color[1] * 0.6, color[2] * 0.6];
-
-    // Generate lines parallel to Z axis (varying X)
-    let mut x = x_min;
-    while x <= x_max + 0.001 {
-        let is_major =
-            (x / major_spacing).abs().fract() < 0.01 || (x / major_spacing).abs().fract() > 0.99;
-        let line_color = if is_major { major_color } else { minor_color };
-
-        vertices.push(GridVertex {
-            position: [x, y, z_min],
-            _pad0: 0.0,
-            color: line_color,
-            _pad1: 0.0,
-        });
-        vertices.push(GridVertex {
-            position: [x, y, z_max],
-            _pad0: 0.0,
-            color: line_color,
-            _pad1: 0.0,
-        });
-
-        x += spacing;
-    }
-
-    // Generate lines parallel to X axis (varying Z)
-    let mut z = z_min;
-    while z <= z_max + 0.001 {
-        let is_major =
-            (z / major_spacing).abs().fract() < 0.01 || (z / major_spacing).abs().fract() > 0.99;
-        let line_color = if is_major { major_color } else { minor_color };
-
-        vertices.push(GridVertex {
-            position: [x_min, y, z],
-            _pad0: 0.0,
-            color: line_color,
-            _pad1: 0.0,
-        });
-        vertices.push(GridVertex {
-            position: [x_max, y, z],
-            _pad0: 0.0,
-            color: line_color,
-            _pad1: 0.0,
-        });
-
-        z += spacing;
-    }
-
-    vertices
+    Ok(match mode {
+        CameraMode::Presets(presets) => {
+            let several = presets.len() > 1;
+            presets
+                .into_iter()
+                .map(|preset| {
+                    let camera = preset.camera(min, max, fov_y);
+                    let eye = camera.eye_position();
+                    let (near, far) = clip(eye, camera.forward(), (camera.near, camera.far));
+                    let view = match args.projection {
+                        ProjectionArg::Perspective => CameraView::look_at(
+                            eye,
+                            camera.target,
+                            Vec3::Y,
+                            fov_y,
+                            aspect,
+                            near,
+                            far,
+                        ),
+                        ProjectionArg::Ortho => CameraView::look_at_orthographic(
+                            eye,
+                            camera.target,
+                            Vec3::Y,
+                            ortho_height((max - min).length() * 1.1),
+                            aspect,
+                            near,
+                            far,
+                        ),
+                    };
+                    (several.then_some(preset.suffix()), view)
+                })
+                .collect()
+        }
+        CameraMode::Pose { eye, target, up } => {
+            let target = target.unwrap_or((min + max) * 0.5);
+            let forward = (target - eye).normalize_or_zero();
+            if forward == Vec3::ZERO {
+                anyhow::bail!("--camera-pos coincides with the look-at point");
+            }
+            let (near, far) = clip(eye, forward, (0.0, 0.0));
+            let view = match args.projection {
+                ProjectionArg::Perspective => {
+                    CameraView::look_at(eye, target, up, fov_y, aspect, near, far)
+                }
+                ProjectionArg::Ortho => CameraView::look_at_orthographic(
+                    eye,
+                    target,
+                    up,
+                    ortho_height((max - min).length() * 1.1),
+                    aspect,
+                    near,
+                    far,
+                ),
+            };
+            vec![(None, view)]
+        }
+        CameraMode::Pinhole {
+            pinhole,
+            camera_to_world,
+        } => {
+            let eye = camera_to_world.transform_point3(Vec3::ZERO);
+            let forward = camera_to_world.transform_vector3(Vec3::Z).normalize();
+            let (near, far) = clip(eye, forward, (0.0, 0.0));
+            vec![(
+                None,
+                CameraView::pinhole(&pinhole, camera_to_world, near, far),
+            )]
+        }
+    })
 }
 
-fn convert_to_gpu_vertices(
-    vertices: &[(f32, f32, f32)],
-    normals: &[(f32, f32, f32)],
-) -> Vec<MeshVertex> {
-    vertices
-        .iter()
-        .zip(normals.iter())
-        .map(|(&(px, py, pz), &(nx, ny, nz))| MeshVertex {
-            position: [px, py, pz],
-            _pad0: 0.0,
-            normal: [nx, ny, nz],
-            _pad1: 0.0,
-        })
-        .collect()
+/// The renderable exports of the input: a model file as one asset, a
+/// project's exports filtered to the kinds that have a picture and to
+/// `wanted` when given.
+fn load_renderable_assets(input: &Path, wanted: &[String]) -> Result<Vec<LoadedAsset>> {
+    let extension = input
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let assets = match extension.as_str() {
+        "wasm" => {
+            let bytes = std::fs::read(input).context("Failed to read WASM file")?;
+            crate::assets::ensure_wasm(&bytes, "model", &input.display().to_string())?;
+            let id = input
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("model")
+                .to_string();
+            vec![LoadedAsset::from_parts(
+                id,
+                bytes,
+                Some(AssetTypeHint::Model),
+                vec![],
+            )]
+        }
+        "vproj" => {
+            let project = Project::load_from_file(input).context("Failed to load .vproj file")?;
+            crate::project::run_project_exports(project, None)?
+        }
+        _ => anyhow::bail!(
+            "Unknown file extension: {:?}. Expected .wasm or .vproj",
+            extension
+        ),
+    };
+    select_assets(assets, wanted)
 }
 
-fn output_path_for_view(base_path: &std::path::Path, view: ViewAngle, num_views: usize) -> PathBuf {
-    if num_views == 1 {
-        return base_path.to_path_buf();
-    }
+fn is_renderable(asset: &LoadedAsset) -> bool {
+    matches!(
+        asset.type_hint(),
+        Some(
+            AssetTypeHint::Model
+                | AssetTypeHint::FeaMesh
+                | AssetTypeHint::TriMesh
+                | AssetTypeHint::Subspace
+        ) | None
+    )
+}
 
-    let stem = base_path
+/// Keeps the renderable assets, or exactly the `wanted` ids, each of which
+/// must exist and be renderable.
+fn select_assets(assets: Vec<LoadedAsset>, wanted: &[String]) -> Result<Vec<LoadedAsset>> {
+    let available = || {
+        assets
+            .iter()
+            .filter(|a| is_renderable(a))
+            .map(|a| a.id())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if wanted.is_empty() {
+        let renderable: Vec<LoadedAsset> = assets
+            .iter()
+            .filter(|a| is_renderable(a))
+            .cloned()
+            .collect();
+        if renderable.is_empty() {
+            anyhow::bail!("nothing to draw: no model, mesh, cloud or subspace export");
+        }
+        return Ok(renderable);
+    }
+    let mut selected = Vec::with_capacity(wanted.len());
+    for id in wanted {
+        let asset = assets
+            .iter()
+            .find(|a| a.id() == id)
+            .with_context(|| format!("no export named '{id}'. Available: {}", available()))?;
+        if !is_renderable(asset) {
+            anyhow::bail!(
+                "export '{id}' is {}, which has no picture. Available: {}",
+                asset
+                    .type_hint()
+                    .map(|h| h.to_string())
+                    .unwrap_or_else(|| "untyped".to_string()),
+                available()
+            );
+        }
+        selected.push(asset.clone());
+    }
+    Ok(selected)
+}
+
+/// The viewport's recipe for an asset of this kind, with the CLI's
+/// resolution and colour choices.
+fn preview_request(asset: &LoadedAsset, options: &PlanOptions) -> PreviewRequest {
+    let plan = match asset.type_hint() {
+        Some(AssetTypeHint::FeaMesh) => PreviewPlan::FeaMesh {
+            deformed: true,
+            exaggeration_tenths: 10,
+            color_field: options.color_field.clone(),
+        },
+        Some(AssetTypeHint::TriMesh) => PreviewPlan::TriMesh,
+        Some(AssetTypeHint::Subspace) => PreviewPlan::Subspace,
+        _ => match volumetric::model_dimensions_static(asset.data()) {
+            Some(2) => PreviewPlan::Sketch {
+                resolution: options.resolution,
+                color_channel: options.color_channel.clone(),
+            },
+            _ => PreviewPlan::Model3d {
+                mesh: PreviewMeshPlan::for_mode(
+                    PreviewRenderMode::AdaptiveSurfaceNets2,
+                    options.resolution,
+                    Asn2Settings {
+                        sharp_edges: options.sharp,
+                        simplify: options.simplify,
+                        ..Asn2Settings::default()
+                    },
+                ),
+                color_channel: options.color_channel.clone(),
+                tint_uncolored: false,
+            },
+        },
+    };
+    PreviewRequest {
+        asset_id: asset.id().to_string(),
+        source_hash: asset.content_hash(),
+        data: asset.data_arc(),
+        type_hint: asset.type_hint(),
+        precursor_ids: vec![],
+        plan,
+        wireframe: options.wireframe,
+        show_grid: false,
+        show_bounds: false,
+        ssao: false,
+        ssao_radius: 0.5,
+        ssao_bias: 0.025,
+        ssao_strength: 1.0,
+        stale: false,
+    }
+}
+
+fn report(id: &str, entity: &PreviewEntity) {
+    let (lo, hi) = (entity.bounds.min, entity.bounds.max);
+    eprintln!(
+        "{id}: {} triangles, {} points, bounds ({:.3}, {:.3}, {:.3})..({:.3}, {:.3}, {:.3}), {:.0} ms",
+        entity.stats.triangles,
+        entity.stats.points,
+        lo.0,
+        lo.1,
+        lo.2,
+        hi.0,
+        hi.1,
+        hi.2,
+        entity.stats.mesh_ms
+    );
+    for line in &entity.stats.detail {
+        eprintln!("  {line}");
+    }
+}
+
+fn parse_floats(s: &str, count: usize) -> Result<Vec<f32>> {
+    let values: Vec<f32> = s
+        .split(',')
+        .map(|part| part.trim().parse::<f32>())
+        .collect::<std::result::Result<_, _>>()
+        .with_context(|| format!("expected {count} comma-separated numbers, got '{s}'"))?;
+    if values.len() != count {
+        anyhow::bail!(
+            "expected {count} comma-separated numbers, got {}",
+            values.len()
+        );
+    }
+    Ok(values)
+}
+
+fn parse_vec3(s: &str) -> Result<Vec3> {
+    let v = parse_floats(s, 3)?;
+    Ok(Vec3::new(v[0], v[1], v[2]))
+}
+
+/// A hex sRGB colour as the linear RGBA the renderer clears with.
+fn parse_hex_color(hex: &str) -> Result<[f32; 4]> {
+    let hex = hex.trim_start_matches('#');
+    if hex.len() != 6 {
+        anyhow::bail!("expected 6 hex digits, got '{hex}'");
+    }
+    let channel = |i: usize| -> Result<f32> {
+        let byte = u8::from_str_radix(&hex[i..i + 2], 16)
+            .with_context(|| format!("invalid hex colour '{hex}'"))?;
+        Ok(srgb_to_linear(f32::from(byte) / 255.0))
+    };
+    Ok([channel(0)?, channel(2)?, channel(4)?, 1.0])
+}
+
+/// `base` with `_suffix` before the extension when a suffix is given.
+fn output_path(base: &Path, suffix: Option<&str>) -> PathBuf {
+    let Some(suffix) = suffix else {
+        return base.to_path_buf();
+    };
+    let stem = base
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("render");
-    let ext = base_path
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("png");
-
-    let new_name = format!("{}_{}.{}", stem, view.suffix(), ext);
-
-    base_path
-        .parent()
-        .map(|p| p.join(&new_name))
-        .unwrap_or_else(|| PathBuf::from(&new_name))
+    let extension = base.extension().and_then(|e| e.to_str()).unwrap_or("png");
+    base.with_file_name(format!("{stem}_{suffix}.{extension}"))
 }
 
 pub fn run_render(args: RenderArgs) -> Result<()> {
-    // Parse colors
-    let background_color = parse_hex_color(&args.background).context("Invalid background color")?;
-    let base_color = parse_hex_color(&args.color).context("Invalid mesh color")?;
-    let grid_color = parse_hex_color(&args.grid_color).context("Invalid grid color")?;
-    let wireframe_color =
-        parse_hex_color(&args.wireframe_color).context("Invalid wireframe color")?;
-
-    // Build projection type from CLI args
-    let projection = match args.projection {
-        ProjectionArg::Perspective => {
-            let fov_y = args.fov.to_radians();
-            ProjectionType::Perspective { fov_y }
-        }
-        ProjectionArg::Ortho => {
-            // Warn if user specified fov with ortho
-            if args.fov != 45.0 {
-                eprintln!("Warning: --fov is ignored with orthographic projection");
-            }
-            ProjectionType::Orthographic {
-                scale: args.ortho_scale,
-            }
-        }
-    };
-
-    // Parse custom camera if specified
-    let custom_camera_pos = args
-        .camera_pos
-        .as_ref()
-        .map(|s| parse_vec3(s))
-        .transpose()
-        .context("Invalid --camera-pos")?;
-    let custom_camera_target = args
-        .camera_target
-        .as_ref()
-        .map(|s| parse_vec3(s))
-        .transpose()
-        .context("Invalid --camera-target")?;
-    let camera_up = parse_vec3(&args.camera_up).context("Invalid --camera-up")?;
-
-    // Determine if we're using custom camera or predefined views
-    let use_custom_camera = custom_camera_pos.is_some();
-
-    // Parse views (only used if not using custom camera)
-    let views = if use_custom_camera {
-        if args.views != "iso" {
-            eprintln!("Warning: --views is ignored when using --camera-pos");
-        }
-        vec![ViewAngle::Iso] // Dummy, won't be used
-    } else {
-        let v = parse_views(&args.views);
-        if v.is_empty() {
-            anyhow::bail!("No valid views specified");
-        }
-        v
-    };
-
-    if use_custom_camera {
-        println!("Using custom camera position");
-    } else {
-        println!(
-            "Rendering {} view(s): {:?}",
-            views.len(),
-            views.iter().map(|v| v.suffix()).collect::<Vec<_>>()
-        );
+    let background = parse_hex_color(&args.background).context("Invalid --background")?;
+    let mode = camera_mode(&args)?;
+    if args.width == 0 || args.height == 0 {
+        anyhow::bail!("--width and --height must be positive");
     }
 
-    // Load WASM and generate mesh
-    let wasm_bytes = load_wasm_bytes(&args.input, args.asset.as_deref())?;
-    println!("Loaded {} bytes", wasm_bytes.len());
-
-    let config = build_mesh_config(
-        args.base_resolution,
-        args.max_depth,
-        args.discovery_probes,
-        args.vertex_refinement,
-        args.normal_refinement,
-        args.normal_epsilon,
-        args.sharp_edges,
-        args.sharp_angle,
-        (!args.no_simplify).then_some(args.simplify_tolerance),
-        args.edge_constrained,
-    );
-
-    let effective_res = config.base_resolution * (1 << config.max_depth);
-    println!(
-        "Meshing with resolution {}³ (base={}, depth={})",
-        effective_res, config.base_resolution, config.max_depth
-    );
-
-    let mesh_result = generate_adaptive_mesh_v2_from_bytes(&wasm_bytes, &config)
-        .context("Mesh generation failed")?;
-
-    if !args.quiet {
-        println!(
-            "Generated {} vertices, {} triangles",
-            mesh_result.vertices.len(),
-            mesh_result.indices.len() / 3
-        );
-    }
-
-    // Apply normal recalculation if requested
-    let normals = if args.recalc_normals {
-        if !args.quiet {
-            println!("Recalculating normals from mesh geometry");
-        }
-        recalculate_normals(&mesh_result.vertices, &mesh_result.indices)
-    } else {
-        mesh_result.normals.clone()
+    let assets = load_renderable_assets(&args.input, &args.assets)?;
+    let options = PlanOptions {
+        resolution: args.resolution,
+        sharp: !args.no_sharp,
+        simplify: !args.no_simplify,
+        color_channel: args.color_channel.clone(),
+        color_field: args.color_field.clone(),
+        wireframe: args.wireframe,
     };
 
-    // Convert to GPU format
-    let gpu_vertices = convert_to_gpu_vertices(&mesh_result.vertices, &normals);
-    let (bounds_min, bounds_max) = compute_bounds(&mesh_result.vertices);
-
-    if !args.quiet {
-        println!(
-            "Bounds: min=({:.3}, {:.3}, {:.3}) max=({:.3}, {:.3}, {:.3})",
-            bounds_min.x, bounds_min.y, bounds_min.z, bounds_max.x, bounds_max.y, bounds_max.z
-        );
+    let mut entities: Vec<PreviewEntity> = Vec::with_capacity(assets.len());
+    for asset in &assets {
+        let request = preview_request(asset, &options);
+        let entity = build_preview_scene(&request)
+            .map_err(|err| anyhow::anyhow!("{}: {err}", asset.id()))?;
+        if !args.quiet {
+            report(asset.id(), &entity);
+        }
+        entities.push(entity);
     }
-
-    // Generate grid vertices if grid spacing > 0 and not wireframe mode
-    let grid_vertices = if args.grid > 0.0 && !args.wireframe {
-        let gv = generate_grid_vertices(bounds_min, bounds_max, args.grid, grid_color);
-        if !args.quiet {
-            println!("Generated {} grid line segments", gv.len() / 2);
-        }
-        Some(gv)
-    } else {
-        if args.wireframe && args.grid > 0.0 && !args.quiet {
-            println!("Note: Grid is disabled in wireframe mode");
-        }
-        None
-    };
-
-    // Build wireframe options
-    let wireframe_options = if args.wireframe {
-        if !args.quiet {
-            println!("Wireframe mode enabled");
-        }
-        Some(WireframeOptions {
-            color: wireframe_color,
+    // Frame the geometry; a Subspace gizmo is infinite and only carries a
+    // placeholder box around its chart origin, which sizes the frame when
+    // nothing else is drawn.
+    let bounds = entities
+        .iter()
+        .filter(|entity| entity.subspace.is_none())
+        .map(|entity| entity.bounds)
+        .reduce(PreviewBounds::union)
+        .or_else(|| {
+            entities
+                .iter()
+                .map(|entity| entity.bounds)
+                .reduce(PreviewBounds::union)
         })
-    } else {
-        None
+        .context("nothing to draw")?;
+    let frames = frames(mode, &args, bounds)?;
+
+    let offscreen = Offscreen::new().map_err(anyhow::Error::msg)?;
+    if !args.quiet {
+        eprintln!("GPU: {}", offscreen.adapter_name());
+    }
+    let mut renderer = offscreen.renderer(args.width, args.height);
+    let resident: Vec<_> = entities
+        .iter()
+        .map(|entity| renderer.create_retained_scene(offscreen.device(), &entity.scene))
+        .collect();
+
+    let mut settings = RenderSettings {
+        background_color: background,
+        ssao_enabled: !args.no_ssao,
+        ..RenderSettings::default()
     };
-
-    // Initialize renderer
-    println!(
-        "Initializing headless renderer ({}x{})",
-        args.width, args.height
-    );
-    let renderer = HeadlessRenderer::new(args.width, args.height)?;
-
-    let aspect = args.width as f32 / args.height as f32;
-
-    // Light direction: upper-front-right
-    let light_dir = Vec3::new(0.5, 0.7, 0.5).normalize();
-
-    // Compute fog parameters based on scene size
-    let scene_size = (bounds_max - bounds_min).length();
-    let center = (bounds_min + bounds_max) * 0.5;
-
-    // Render based on camera mode
-    if use_custom_camera {
-        // Custom camera mode - single output
-        let camera_pos = custom_camera_pos.unwrap();
-        let camera_target = custom_camera_target.unwrap_or(center);
-
-        let camera = CameraSetup::from_pose(
-            camera_pos,
-            camera_target,
-            camera_up,
-            projection,
-            bounds_min,
-            bounds_max,
-        )
-        .with_clip_planes(args.near, args.far);
-        let view_proj = camera.view_proj(aspect);
-
-        println!("Rendering to {:?}", args.output);
-
-        let uniforms = Uniforms {
-            view_proj: view_proj.to_cols_array_2d(),
-            camera_pos: camera.position.to_array(),
-            _pad0: 0.0,
-            light_dir: light_dir.to_array(),
-            _pad1: 0.0,
-            base_color,
-            rim_strength: 0.4,
-            sky_color: [0.95, 0.96, 0.98],
-            fog_density: 0.5 / scene_size,
-            ground_color: [0.4, 0.42, 0.45],
-            fog_start: scene_size * 0.5,
-        };
-
-        renderer.render_to_png(
-            &gpu_vertices,
-            &mesh_result.indices,
-            &uniforms,
-            background_color,
-            grid_vertices.as_deref(),
-            wireframe_options.as_ref(),
-            &args.output,
-        )?;
+    if args.grid > 0.0 {
+        let extent = (Vec3::from(bounds.max) - Vec3::from(bounds.min)).length();
+        settings.grid.planes = GridPlanes::XZ;
+        settings.grid.spacing = args.grid;
+        settings.grid.extent = (extent * 2.0).max(args.grid * 10.0);
     } else {
-        // Predefined views mode
-        for view in &views {
-            let output_path = output_path_for_view(&args.output, *view, views.len());
-            println!("Rendering {} view to {:?}", view.suffix(), output_path);
-
-            let camera = CameraSetup::auto_frame(bounds_min, bounds_max, *view, projection)
-                .with_clip_planes(args.near, args.far);
-            let view_proj = camera.view_proj(aspect);
-
-            let uniforms = Uniforms {
-                view_proj: view_proj.to_cols_array_2d(),
-                camera_pos: camera.position.to_array(),
-                _pad0: 0.0,
-                light_dir: light_dir.to_array(),
-                _pad1: 0.0,
-                base_color,
-                rim_strength: 0.4,
-                sky_color: [0.95, 0.96, 0.98],
-                fog_density: 0.5 / scene_size,
-                ground_color: [0.4, 0.42, 0.45],
-                fog_start: scene_size * 0.5,
-            };
-
-            renderer.render_to_png(
-                &gpu_vertices,
-                &mesh_result.indices,
-                &uniforms,
-                background_color,
-                grid_vertices.as_deref(),
-                wireframe_options.as_ref(),
-                &output_path,
-            )?;
-        }
+        settings.grid.planes = GridPlanes::NONE;
     }
 
-    println!("Done!");
+    for (suffix, view) in frames {
+        for (scene, entity) in resident.iter().zip(&entities) {
+            for mesh in &scene.meshes {
+                renderer.submit_retained_mesh(mesh);
+            }
+            for lines in &scene.lines {
+                renderer.submit_retained_lines(lines);
+            }
+            for points in &scene.points {
+                renderer.submit_retained_points(points);
+            }
+            if args.wireframe
+                && let Some(lines) = &entity.wireframe_lines
+            {
+                renderer.submit_lines(lines, Mat4::IDENTITY, wireframe_style());
+            }
+            if let Some(subspace) = &entity.subspace {
+                submit_subspace_gizmo(&mut renderer, subspace, bounds);
+            }
+        }
+        let rgba = offscreen
+            .render_rgba(&mut renderer, &view, &settings)
+            .map_err(anyhow::Error::msg)?;
+        if let Some(overflow) = renderer.frame_overflow() {
+            eprintln!(
+                "warning: dropped {} of {} triangles, {} lines and {} points at the GPU buffer limit",
+                overflow.dropped_triangles,
+                overflow.total_triangles,
+                overflow.dropped_lines,
+                overflow.dropped_points
+            );
+        }
+        let path = output_path(&args.output, suffix);
+        image::RgbaImage::from_raw(args.width, args.height, rgba)
+            .context("frame size mismatch")?
+            .save(&path)
+            .with_context(|| format!("Failed to write {}", path.display()))?;
+        println!("Wrote {}", path.display());
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn asset(id: &str, type_hint: Option<AssetTypeHint>) -> LoadedAsset {
+        LoadedAsset::from_parts(id.to_string(), vec![1, 2, 3], type_hint, vec![])
+    }
+
+    #[test]
+    fn views_parse_and_name_their_files() {
+        let views = parse_views("front, iso-back").unwrap();
+        assert_eq!(views, vec![ViewPreset::Front, ViewPreset::IsoBack]);
+        assert_eq!(parse_views("all").unwrap().len(), 8);
+        assert!(
+            parse_views("sideways")
+                .unwrap_err()
+                .to_string()
+                .contains("sideways")
+        );
+        assert!(parse_views(" , ").is_err());
+
+        assert_eq!(
+            output_path(Path::new("out/render.png"), Some("top")),
+            PathBuf::from("out/render_top.png")
+        );
+        assert_eq!(
+            output_path(Path::new("render.png"), None),
+            PathBuf::from("render.png")
+        );
+    }
+
+    /// Every preset looks at the scene centre from outside the box.
+    #[test]
+    fn presets_frame_the_scene() {
+        let (min, max) = (Vec3::new(-1.0, 0.0, -2.0), Vec3::new(1.0, 1.0, 2.0));
+        for preset in ViewPreset::ALL {
+            let camera = preset.camera(min, max, 0.8);
+            assert_eq!(camera.target, (min + max) * 0.5);
+            let eye = camera.eye_position();
+            assert!(
+                eye.x < min.x
+                    || eye.x > max.x
+                    || eye.y < min.y
+                    || eye.y > max.y
+                    || eye.z < min.z
+                    || eye.z > max.z,
+                "{preset:?} eye {eye} inside"
+            );
+        }
+        let iso = ViewPreset::Iso.camera(min, max, 0.8).eye_position();
+        let back = ViewPreset::IsoBack.camera(min, max, 0.8).eye_position();
+        assert!((iso.x + back.x).abs() < 1e-4 && (iso.z + back.z).abs() < 1e-4);
+    }
+
+    #[test]
+    fn clip_planes_enclose_the_scene() {
+        let (min, max) = (Vec3::splat(-1.0), Vec3::splat(1.0));
+        let (near, far) = clip_planes_for(Vec3::new(0.0, 0.0, 5.0), Vec3::NEG_Z, min, max);
+        assert!(near > 0.0 && near < 4.0, "near {near}");
+        assert!(far > 6.0, "far {far}");
+        // Inside the box the near plane stays positive.
+        let (near, _) = clip_planes_for(Vec3::ZERO, Vec3::NEG_Z, min, max);
+        assert!(near > 0.0);
+    }
+
+    #[test]
+    fn assets_are_selected_by_id_and_kind() {
+        let all = vec![
+            asset("scan", Some(AssetTypeHint::Model)),
+            asset("axis", Some(AssetTypeHint::Subspace)),
+            asset("fit", Some(AssetTypeHint::F64Map)),
+            asset("cloud", Some(AssetTypeHint::FeaMesh)),
+        ];
+        let ids = |assets: &[LoadedAsset]| {
+            assets
+                .iter()
+                .map(|a| a.id().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(&select_assets(all.clone(), &[]).unwrap()),
+            ["scan", "axis", "cloud"]
+        );
+        assert_eq!(
+            ids(&select_assets(all.clone(), &["cloud".to_string(), "scan".to_string()]).unwrap()),
+            ["cloud", "scan"]
+        );
+        let missing = select_assets(all.clone(), &["nope".to_string()]).unwrap_err();
+        assert!(
+            missing.to_string().contains("scan, axis, cloud"),
+            "{missing}"
+        );
+        let wrong = select_assets(all, &["fit".to_string()]).unwrap_err();
+        assert!(wrong.to_string().contains("F64Map"), "{wrong}");
+        assert!(select_assets(vec![asset("fit", Some(AssetTypeHint::F64Map))], &[]).is_err());
+    }
+
+    #[test]
+    fn plans_follow_the_asset_kind() {
+        let options = PlanOptions {
+            resolution: 64,
+            sharp: false,
+            simplify: true,
+            color_channel: None,
+            color_field: Some("node:confidence".to_string()),
+            wireframe: true,
+        };
+        let sphere = volumetric_assets::get_model("simple_sphere_model").expect("bundled sphere");
+        let model = LoadedAsset::from_parts(
+            "sphere".to_string(),
+            sphere.bytes.to_vec(),
+            Some(AssetTypeHint::Model),
+            vec![],
+        );
+        let request = preview_request(&model, &options);
+        match request.plan {
+            PreviewPlan::Model3d {
+                mesh:
+                    PreviewMeshPlan::AdaptiveSurfaceNets2 {
+                        target_resolution,
+                        settings,
+                        ..
+                    },
+                ..
+            } => {
+                assert_eq!(target_resolution, 64);
+                assert!(!settings.sharp_edges && settings.simplify);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(request.wireframe);
+
+        match preview_request(&asset("cloud", Some(AssetTypeHint::FeaMesh)), &options).plan {
+            PreviewPlan::FeaMesh { color_field, .. } => {
+                assert_eq!(color_field.as_deref(), Some("node:confidence"))
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            preview_request(&asset("axis", Some(AssetTypeHint::Subspace)), &options).plan,
+            PreviewPlan::Subspace
+        );
+        assert_eq!(
+            preview_request(&asset("mesh", Some(AssetTypeHint::TriMesh)), &options).plan,
+            PreviewPlan::TriMesh
+        );
+    }
+
+    #[test]
+    fn pinhole_pose_rows_build_the_camera_to_world_matrix() {
+        let args = RenderArgs::parse_from([
+            "render",
+            "-i",
+            "x.vproj",
+            "-o",
+            "x.png",
+            "--intrinsics",
+            "400,410,320,240",
+            "--pose",
+            "1,0,0,5, 0,1,0,6, 0,0,1,7",
+        ]);
+        match camera_mode(&args).unwrap() {
+            CameraMode::Pinhole {
+                pinhole,
+                camera_to_world,
+            } => {
+                assert_eq!(
+                    (pinhole.fx, pinhole.fy, pinhole.cx, pinhole.cy),
+                    (400.0, 410.0, 320.0, 240.0)
+                );
+                assert_eq!(
+                    camera_to_world.transform_point3(Vec3::ZERO),
+                    Vec3::new(5.0, 6.0, 7.0)
+                );
+                assert_eq!(camera_to_world.transform_vector3(Vec3::Z), Vec3::Z);
+            }
+            _ => panic!("expected a pinhole camera"),
+        }
+        let half = RenderArgs::parse_from([
+            "render",
+            "-i",
+            "x.vproj",
+            "-o",
+            "x.png",
+            "--pose",
+            "1,0,0,0,0,1,0,0,0,0,1,0",
+        ]);
+        assert!(camera_mode(&half).is_err());
+    }
+
+    #[test]
+    fn background_is_linearised() {
+        let white = parse_hex_color("ffffff").unwrap();
+        assert!((white[0] - 1.0).abs() < 1e-6);
+        let grey = parse_hex_color("#808080").unwrap();
+        assert!(grey[0] > 0.2 && grey[0] < 0.22, "{grey:?}");
+        assert!(parse_hex_color("12345").is_err());
+    }
 }

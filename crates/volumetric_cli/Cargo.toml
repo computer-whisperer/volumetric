@@ -8,12 +8,11 @@ volumetric = { path = "../../" }
 fea_bundle = { path = "../fea_bundle" }
 volumetric_abi = { path = "../volumetric_abi" }
 volumetric_assets = { path = "../volumetric_assets" }
+volumetric_preview = { path = "../volumetric_preview" }
 volumetric_protocol = { path = "../volumetric_protocol", features = ["client"] }
+volumetric_renderer = { path = "../volumetric_renderer" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-wgpu = "30"
-pollster = "0.4"
-bytemuck = { version = "1", features = ["derive"] }
 glam = "0.32"
 image = { version = "0.25", default-features = false, features = ["png"] }
 serde = { version = "1", features = ["derive"] }

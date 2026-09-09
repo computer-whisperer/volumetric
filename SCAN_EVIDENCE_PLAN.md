@@ -1,6 +1,6 @@
 # Scan Evidence — Design and Plan
 
-Status: ratified 2026-09-09. Step 0 in progress. Steps A–D pending.
+Status: ratified 2026-09-09. Step 0 landed 2026-09-09. Steps A–D pending.
 
 ## Why
 
@@ -63,7 +63,7 @@ photos, and to export a printable or manufacturable mesh.
 
 | Step | Content | Size | Status |
 |---|---|---|---|
-| 0 | Values in `project-run --json`; one `render` for a whole project scene with an explicit pinhole camera | 2 days | in progress |
+| 0 | Values in `project-run --json`; one `render` for a whole project scene with an explicit pinhole camera | 2 days | landed |
 | A | `view_core`: ViewSet value with provenance, manifest import, look-through render, depth residual | 4 days | pending |
 | B | `cv_core`: ArUco detection, PnP, focal; `view-solve` CLI, operator, GUI drop-a-still | 5 days | pending |
 | C | Marker-map refinement with the pose track; TSDF fusion operator | 5 days | pending |
@@ -112,18 +112,20 @@ render -i <model.wasm | project.vproj> -o out.png
        [--width --height --background hex]
        [--resolution N --no-sharp --no-simplify]      model meshing plan
        [--color-channel name | --color-field node:name]
-       [--wireframe --no-grid --ssao] [-q]
+       [--wireframe --grid m --no-ssao] [-q]
 ```
 
 Models are meshed with the GUI's ASN2 plan, triangle meshes and 2D
 sketches draw as they do in the viewport, point clouds draw as points with
 their colours, Subspaces draw as gizmos sized by the union bounds. Per
-asset, the stats (triangles, points, bounds) go to stderr. The three
+asset, the stats (triangles, points, bounds) go to stderr. The four
 `headless_*_preview` examples in the UI crate are superseded and deleted.
 
 Tests are GPU-free: the pinhole camera projects a known world point to a
-known pixel; asset selection and plan choice are unit-tested; the scene
-assembly runs `build_preview_scene` on small fixtures.
+known pixel; asset selection, plan choice and pose parsing are
+unit-tested. Verified on real data: the chairbase1 cloud rendered through
+scan view 600's intrinsics and pose overlays the photograph, so the
+OpenCV convention is right end to end.
 
 ## Step A — ViewSet
 

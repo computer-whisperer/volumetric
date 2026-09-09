@@ -4,7 +4,7 @@
 
 #![allow(dead_code)]
 
-use glam::{Mat4, Vec2, Vec3};
+use glam::{Mat4, Vec2, Vec3, Vec4};
 
 /// A camera that orbits around a target point.
 ///
@@ -557,5 +557,202 @@ mod tests {
         };
         camera.orbit(0.0, 1.0);
         assert!(camera.phi < std::f32::consts::PI);
+    }
+}
+
+/// What a frame is drawn with: the world-to-camera transform and the
+/// projection, as matrices. The orbit [`Camera`] produces one per frame; a
+/// [`Pinhole`] from a posed photograph produces one directly, which is how
+/// a scan's views are looked through.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CameraView {
+    pub view: Mat4,
+    pub projection: Mat4,
+}
+
+impl CameraView {
+    pub fn from_camera(camera: &Camera, aspect: f32) -> Self {
+        Self {
+            view: camera.view_matrix(),
+            projection: camera.projection_matrix(aspect),
+        }
+    }
+
+    /// A perspective camera at `eye` looking at `target`, `fov_y` in
+    /// radians.
+    pub fn look_at(
+        eye: Vec3,
+        target: Vec3,
+        up: Vec3,
+        fov_y: f32,
+        aspect: f32,
+        near: f32,
+        far: f32,
+    ) -> Self {
+        Self {
+            view: Mat4::look_at_rh(eye, target, up),
+            projection: Mat4::perspective_rh(fov_y, aspect, near, far),
+        }
+    }
+
+    /// An orthographic camera at `eye` looking at `target`, whose frame is
+    /// `height` world units tall.
+    pub fn look_at_orthographic(
+        eye: Vec3,
+        target: Vec3,
+        up: Vec3,
+        height: f32,
+        aspect: f32,
+        near: f32,
+        far: f32,
+    ) -> Self {
+        let half_h = height * 0.5;
+        let half_w = half_h * aspect;
+        Self {
+            view: Mat4::look_at_rh(eye, target, up),
+            projection: Mat4::orthographic_rh(-half_w, half_w, -half_h, half_h, near, far),
+        }
+    }
+
+    /// A pinhole camera posed by `camera_to_world` (OpenCV convention, see
+    /// [`Pinhole`]).
+    pub fn pinhole(pinhole: &Pinhole, camera_to_world: Mat4, near: f32, far: f32) -> Self {
+        Self {
+            view: camera_to_world.inverse(),
+            projection: pinhole.projection(near, far),
+        }
+    }
+
+    pub fn view_projection(&self) -> Mat4 {
+        self.projection * self.view
+    }
+
+    /// The pixel a world point lands on in a `width` x `height` image
+    /// (origin top-left, +y down), or `None` when it is behind the camera.
+    pub fn project(&self, world: Vec3, width: u32, height: u32) -> Option<Vec2> {
+        let clip = self.view_projection() * world.extend(1.0);
+        if clip.w <= 0.0 {
+            return None;
+        }
+        let ndc = clip.truncate() / clip.w;
+        Some(Vec2::new(
+            (ndc.x + 1.0) * 0.5 * width as f32,
+            (1.0 - ndc.y) * 0.5 * height as f32,
+        ))
+    }
+}
+
+/// A pinhole camera in OpenCV convention: pixel coordinates have their
+/// origin at the image's top-left corner with +u right and +v down, and
+/// camera coordinates are +x right, +y down, +z forward into the scene.
+/// Scan and photogrammetry tools export intrinsics and camera-to-world
+/// poses in exactly this frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Pinhole {
+    pub fx: f32,
+    pub fy: f32,
+    pub cx: f32,
+    pub cy: f32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Pinhole {
+    /// The projection from OpenCV camera coordinates to wgpu clip space
+    /// (x right, y up, depth 0 at `near` and 1 at `far`). The principal
+    /// point offset shears the frustum, so an off-centre `cx, cy` is
+    /// honoured exactly.
+    pub fn projection(&self, near: f32, far: f32) -> Mat4 {
+        let (w, h) = (self.width as f32, self.height as f32);
+        Mat4::from_cols(
+            Vec4::new(2.0 * self.fx / w, 0.0, 0.0, 0.0),
+            Vec4::new(0.0, -2.0 * self.fy / h, 0.0, 0.0),
+            Vec4::new(
+                2.0 * self.cx / w - 1.0,
+                1.0 - 2.0 * self.cy / h,
+                far / (far - near),
+                1.0,
+            ),
+            Vec4::new(0.0, 0.0, -far * near / (far - near), 0.0),
+        )
+    }
+
+    /// Vertical field of view in radians.
+    pub fn fov_y(&self) -> f32 {
+        2.0 * (self.height as f32 / (2.0 * self.fy)).atan()
+    }
+}
+
+#[cfg(test)]
+mod view_tests {
+    use super::*;
+
+    fn pinhole() -> Pinhole {
+        Pinhole {
+            fx: 1000.0,
+            fy: 1000.0,
+            cx: 480.0,
+            cy: 270.0,
+            width: 960,
+            height: 540,
+        }
+    }
+
+    /// A point in front of an unposed pinhole lands on the OpenCV pixel
+    /// `(fx x / z + cx, fy y / z + cy)`, +v down.
+    #[test]
+    fn pinhole_projects_to_opencv_pixels() {
+        let view = CameraView::pinhole(&pinhole(), Mat4::IDENTITY, 0.1, 10.0);
+        let pixel = view
+            .project(Vec3::new(0.1, 0.05, 2.0), 960, 540)
+            .expect("in front");
+        assert!((pixel.x - 530.0).abs() < 1e-3, "{pixel}");
+        assert!((pixel.y - 295.0).abs() < 1e-3, "{pixel}");
+        assert!(view.project(Vec3::new(0.0, 0.0, -1.0), 960, 540).is_none());
+    }
+
+    /// The pose places the camera: a world point given in the posed
+    /// camera's own coordinates lands where the unposed one would.
+    #[test]
+    fn pinhole_pose_is_camera_to_world() {
+        let camera_to_world = Mat4::from_rotation_translation(
+            glam::Quat::from_rotation_y(std::f32::consts::FRAC_PI_2),
+            Vec3::new(1.0, 2.0, 3.0),
+        );
+        let in_camera = Vec3::new(0.1, 0.05, 2.0);
+        let world = camera_to_world.transform_point3(in_camera);
+        let view = CameraView::pinhole(&pinhole(), camera_to_world, 0.1, 10.0);
+        let pixel = view.project(world, 960, 540).expect("in front");
+        assert!((pixel.x - 530.0).abs() < 1e-2, "{pixel}");
+        assert!((pixel.y - 295.0).abs() < 1e-2, "{pixel}");
+    }
+
+    /// Depth runs from 0 at the near plane to 1 at the far plane, and an
+    /// off-centre principal point moves the optical axis, not the frame.
+    #[test]
+    fn pinhole_depth_and_principal_point() {
+        let projection = pinhole().projection(0.5, 8.0);
+        let at = |z: f32| {
+            let clip = projection * Vec4::new(0.0, 0.0, z, 1.0);
+            clip.z / clip.w
+        };
+        assert!(at(0.5).abs() < 1e-6);
+        assert!((at(8.0) - 1.0).abs() < 1e-6);
+
+        let shifted = Pinhole {
+            cx: 100.0,
+            ..pinhole()
+        };
+        let view = CameraView::pinhole(&shifted, Mat4::IDENTITY, 0.1, 10.0);
+        let axis = view.project(Vec3::new(0.0, 0.0, 1.0), 960, 540).unwrap();
+        assert!((axis.x - 100.0).abs() < 1e-3 && (axis.y - 270.0).abs() < 1e-3);
+    }
+
+    /// The orbit camera and its explicit view agree.
+    #[test]
+    fn camera_view_matches_the_orbit_camera() {
+        let camera = Camera::new(Vec3::new(1.0, 0.5, -2.0), 3.0);
+        let view = CameraView::from_camera(&camera, 1.5);
+        assert_eq!(view.view_projection(), camera.view_projection_matrix(1.5));
     }
 }

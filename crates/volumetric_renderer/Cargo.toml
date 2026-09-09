@@ -9,6 +9,7 @@ bytemuck = { version = "1", features = ["derive"] }
 glam = "0.32"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+pollster = "0.4"
 wgpu = "30"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

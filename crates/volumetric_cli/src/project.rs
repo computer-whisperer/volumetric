@@ -1389,7 +1389,10 @@ mod tests {
             volumetric::f64_map::encode(&map).unwrap(),
         ))
         .expect("f64 map decodes");
-        assert_eq!(value, serde_json::json!({"inliers": 6189.0, "radius": 0.0235}));
+        assert_eq!(
+            value,
+            serde_json::json!({"inliers": 6189.0, "radius": 0.0235})
+        );
 
         let mut bytes = Vec::new();
         for v in [0.5f64, -1.0, 2.0] {

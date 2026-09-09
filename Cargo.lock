@@ -5979,21 +5979,20 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
- "bytemuck",
  "ciborium",
  "clap",
  "fea_bundle",
  "glam 0.32.1",
  "image",
- "pollster",
  "serde",
  "serde_json",
  "volumetric",
  "volumetric_abi",
  "volumetric_assets",
+ "volumetric_preview",
  "volumetric_protocol",
+ "volumetric_renderer",
  "wasmtime",
- "wgpu",
 ]
 
 [[package]]
@@ -6008,6 +6007,17 @@ dependencies = [
  "volumetric",
  "volumetric_protocol",
  "wat",
+]
+
+[[package]]
+name = "volumetric_preview"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "glam 0.32.1",
+ "volumetric",
+ "volumetric_renderer",
+ "web-time",
 ]
 
 [[package]]
@@ -6032,6 +6042,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "glam 0.32.1",
+ "pollster",
  "wgpu",
 ]
 
@@ -6049,10 +6060,8 @@ dependencies = [
  "damascene-winit-wgpu",
  "dirs",
  "glam 0.32.1",
- "image",
  "js-sys",
  "log",
- "point_cloud_import_operator",
  "pollster",
  "rfd",
  "serde",
@@ -6061,6 +6070,7 @@ dependencies = [
  "volumetric",
  "volumetric_assets",
  "volumetric_daemon",
+ "volumetric_preview",
  "volumetric_protocol",
  "volumetric_renderer",
  "wasm-bindgen",

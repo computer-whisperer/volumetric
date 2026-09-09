@@ -27,9 +27,7 @@ use volumetric::{
 };
 
 mod assets;
-mod camera;
 mod fea;
-mod headless_renderer;
 mod info;
 mod project;
 mod raster;

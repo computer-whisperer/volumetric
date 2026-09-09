@@ -91,10 +91,7 @@ path = "src/bin/dump_v2_shell.rs"
 required-features = ["native"]
 
 [dev-dependencies]
-image = { version = "0.25", default-features = false, features = ["png"] }
 # Hand-assemble tiny 2D field models in session tests.
 wat = "1"
 # In-process daemon for the remote-backend end-to-end tests.
 volumetric_daemon = { path = "../volumetric_daemon" }
-# The point-cloud importer as a library, for the headless cloud preview example.
-point_cloud_import_operator = { path = "../operators/point_cloud_import_operator" }
