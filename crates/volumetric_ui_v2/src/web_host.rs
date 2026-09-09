@@ -1134,7 +1134,7 @@ fn gather_file_task(
             format,
             unit,
         } => {
-            let mut triangles = session.preview_triangles(&id);
+            let mut triangles = session.export_triangles(&id, app.runtime_assets());
             if triangles.is_empty() {
                 app.set_status(format!(
                     "no preview mesh for {id} — view it in a mesh render mode first"

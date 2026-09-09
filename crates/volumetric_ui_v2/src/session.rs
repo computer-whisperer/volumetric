@@ -311,11 +311,11 @@ impl Session {
         app.set_viewport_overflow(self.viewport.frame_overflow_message());
         jobs.extend(preview_jobs.into_iter().map(BackgroundJob::BuildPreview));
 
-        // Export modal: deliver the cached preview mesh the sync after the
+        // Export modal: deliver the export geometry the sync after the
         // modal opens. A synchronous copy, not a re-mesh — empty means no
         // cached mesh and the modal explains instead.
         if let Some(asset_id) = app.export_dialog_wants_mesh().map(str::to_string) {
-            let triangles = self.preview_triangles(&asset_id);
+            let triangles = self.export_triangles(&asset_id, app.runtime_assets());
             app.set_export_mesh(&asset_id, &triangles);
         }
 
@@ -408,9 +408,30 @@ impl Session {
         self.active_run.is_some()
     }
 
-    /// World-space triangles of an output's cached preview mesh, for STL
-    /// export. Empty when the output isn't cached or was meshed as points.
-    pub fn preview_triangles(&self, id: &str) -> Vec<volumetric::Triangle> {
+    /// World-space triangles of an output for mesh export. An explicit
+    /// triangle-mesh value exports as the value itself: its preview draws
+    /// every face twice (a back face, so open meshes show from both sides),
+    /// which a slicer reads as a zero-volume solid. Everything else exports
+    /// its cached preview mesh — the meshed geometry exists nowhere else.
+    /// Empty when nothing is available.
+    pub fn export_triangles(
+        &self,
+        id: &str,
+        assets: &[volumetric::LoadedAsset],
+    ) -> Vec<volumetric::Triangle> {
+        if let Some(asset) = assets
+            .iter()
+            .find(|asset| asset.id() == id && asset.type_hint() == Some(AssetTypeHint::TriMesh))
+            && let Ok(mesh) = volumetric::trimesh::decode_tri_mesh(asset.data())
+        {
+            return tri_mesh_triangles(&mesh);
+        }
+        self.preview_triangles(id)
+    }
+
+    /// World-space triangles of an output's cached preview mesh. Empty when
+    /// the output isn't cached or was meshed as points.
+    fn preview_triangles(&self, id: &str) -> Vec<volumetric::Triangle> {
         let Some(scene) = self.viewport.preview_cache.entity_scene(id) else {
             return Vec::new();
         };
@@ -1142,7 +1163,22 @@ fn upload_rgba_texture(
     damascene_wgpu::app_texture(texture)
 }
 
-/// Expands a (possibly indexed) render mesh into world-space STL triangles.
+/// Expands a triangle-mesh value into export triangles, winding kept, one
+/// face per triangle.
+fn tri_mesh_triangles(mesh: &volumetric::trimesh::TriMesh) -> Vec<volumetric::Triangle> {
+    let corner = |vertex: u32| -> (f32, f32, f32) {
+        let p = mesh.position(vertex as usize);
+        (p[0] as f32, p[1] as f32, p[2] as f32)
+    };
+    (0..mesh.triangle_count())
+        .map(|t| {
+            let [a, b, c] = mesh.triangle(t);
+            volumetric::Triangle::new([corner(a), corner(b), corner(c)])
+        })
+        .collect()
+}
+
+/// Expands a (possibly indexed) render mesh into world-space export triangles.
 fn mesh_triangles(mesh: &renderer::MeshData, transform: Mat4, out: &mut Vec<volumetric::Triangle>) {
     let corner = |idx: usize| -> Option<((f32, f32, f32), (f32, f32, f32))> {
         let vertex = mesh.vertices.get(idx)?;
@@ -4691,7 +4727,9 @@ function get_bounds_max_y() return 1.5 end
         );
 
         // A triangle mesh — including a non-manifold single triangle —
-        // renders double-sided with a full wireframe.
+        // renders double-sided with a full wireframe. Export never takes
+        // that doubled preview: the value expands to one face per triangle,
+        // winding kept (a doubled mesh is a zero-volume solid to a slicer).
         use volumetric::trimesh::{TriMesh, encode_tri_mesh};
         let tri = TriMesh {
             positions: vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
@@ -4699,6 +4737,13 @@ function get_bounds_max_y() return 1.5 end
             vertex_fields: vec![],
             face_fields: vec![],
         };
+        let exported = tri_mesh_triangles(&tri);
+        assert_eq!(exported.len(), 1, "one face per triangle");
+        assert_eq!(
+            exported[0].vertices,
+            [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)]
+        );
+        assert_eq!(exported[0].face_normal(), (0.0, 0.0, 1.0), "winding kept");
         let mut req = request("tri", 64);
         req.data = Arc::new(encode_tri_mesh(&tri));
         req.type_hint = Some(AssetTypeHint::TriMesh);
