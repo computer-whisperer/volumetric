@@ -5940,6 +5940,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "view_solve_operator"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "cv_core",
+ "image",
+ "serde",
+ "volumetric_abi",
+]
+
+[[package]]
 name = "volume_import_operator"
 version = "0.1.0"
 dependencies = [
@@ -5957,6 +5968,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "ciborium",
+ "cv_core",
  "dashmap",
  "fea_core",
  "glam 0.32.1",

@@ -34,6 +34,7 @@ members = [
     "crates/operators/point_cloud_import_operator",
     "crates/operators/volume_import_operator",
     "crates/operators/cloud_fit_operator",
+    "crates/operators/view_solve_operator",
     "crates/operators/cloud_normals_operator",
     "crates/operators/step_import_operator",
     "crates/operators/rectangular_prism_operator",
@@ -156,6 +157,7 @@ js-sys = { version = "0.3", optional = true }
 web-time = "1"
 
 [dev-dependencies]
+cv_core = { path = "crates/cv_core" }
 # Hand-assemble tiny test models in integration tests (already in the tree
 # via wasmtime).
 wat = "1"

@@ -1,0 +1,16 @@
+[package]
+name = "view_solve_operator"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+volumetric_abi = { path = "../../volumetric_abi" }
+cv_core = { path = "../../cv_core" }
+# Decoding the still: the formats a phone or a scanner hands over, plus
+# PNM for hand-made test pictures.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "pnm"] }
+serde = { version = "1", features = ["derive"] }
+ciborium = "0.2"

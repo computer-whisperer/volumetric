@@ -288,6 +288,22 @@ the map belongs to another setup. On the chair-phone stills it agrees with
 COLMAP to 1.3 cm median (3 cm worst) and 0.3 degrees, at 0.6 s per 12 MP
 picture.
 
+The same solve is the `view_solve_operator` (Solve Still), so a still
+can be a project step: inputs are the view set, the picture blob and a
+config (`id`, `dictionary`, `focal_px`, `k1`, `fov_deg`, `solve_focal`,
+`solve_distortion`, `embed_image`); the output is the set with the posed
+view appended, and the step's warnings carry the solve's summary line and
+its cautions. In the GUI, Solve Still in the Add catalog (or Import Still)
+opens a file dialog, adds the step wired to the project's view set, and
+after a run the Views section lists the still with its `rms` and `cards`
+tags, ready to look through.
+
+```bash
+volumetric_cli project-add-asset -p chair.vproj -i IMG_0042.jpg --type blob --asset-id still_42
+volumetric_cli project-add-op -p chair.vproj --operator view_solve_operator \
+    -i asset:views -i asset:still_42 -i 'json:{"id":"phone_42"}' --output-id views_with_still
+```
+
 Selection flags: `--id` (repeatable), `--stride`, `--near x,y,z --radius r`,
 `--max`, `--eye left|right|both`, `--split train|test`, `--no-images`,
 `--no-depth`, `--no-masks`; provenance labels `--session`, `--rig`,

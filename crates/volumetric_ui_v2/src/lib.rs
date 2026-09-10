@@ -158,6 +158,7 @@ pub const IMPORT_IMAGE_KEY: &str = "action:import-image";
 pub const IMPORT_PLY_KEY: &str = "action:import-ply";
 pub const IMPORT_POINT_CLOUD_KEY: &str = "action:import-point-cloud";
 pub const IMPORT_VOLUME_KEY: &str = "action:import-volume";
+pub const IMPORT_STILL_KEY: &str = "action:import-still";
 pub const RUN_PROJECT_KEY: &str = "action:run-project";
 pub const CANCEL_RUN_KEY: &str = "action:cancel-run";
 pub const TOGGLE_AUTO_REBUILD_KEY: &str = "action:toggle-auto-rebuild";
@@ -685,6 +686,7 @@ enum AssetSlotKind {
     TriMesh,
     Subspace,
     F64Map,
+    ViewSet,
 }
 
 #[derive(Clone, Debug)]
@@ -719,6 +721,7 @@ impl AssetSlotKind {
             OperatorMetadataInput::TriMesh => Some(AssetSlotKind::TriMesh),
             OperatorMetadataInput::Subspace => Some(AssetSlotKind::Subspace),
             OperatorMetadataInput::F64Map => Some(AssetSlotKind::F64Map),
+            OperatorMetadataInput::ViewSet => Some(AssetSlotKind::ViewSet),
             _ => None,
         }
     }
@@ -860,6 +863,9 @@ pub enum FileAction {
     /// Import a sampled volume (NRRD) as a solid via the bundled
     /// `volume_import_operator`.
     ImportVolume,
+    /// A photograph of the subject with the marker cards in view, posed
+    /// against the view set's map by a `view_solve` step.
+    ImportStill,
 }
 
 /// What an output *is*, for view purposes: each kind gets its own render
@@ -3451,8 +3457,17 @@ impl VolumetricUiV2 {
             }
         };
         // Import operators take no model inputs, so the primary-model id is
-        // never referenced; the schema-derived config defaults are what matter.
-        let mut inputs = operator_step_inputs(&metadata, &SlotPrimaries::default());
+        // never referenced; the schema-derived config defaults are what
+        // matter. A still's solver also wants the view set with the marker
+        // map: the first one in the project.
+        let viewset = editable_viewset_asset_ids(self).into_iter().next();
+        let mut inputs = operator_step_inputs(
+            &metadata,
+            &SlotPrimaries {
+                viewset: viewset.as_deref(),
+                ..SlotPrimaries::default()
+            },
+        );
         let Some(blob_slot) = metadata
             .inputs
             .iter()
@@ -3601,6 +3616,7 @@ impl VolumetricUiV2 {
                 trimesh: for_kind(AssetTypeHint::TriMesh).as_deref(),
                 subspace: for_kind(AssetTypeHint::Subspace).as_deref(),
                 f64_map: for_kind(AssetTypeHint::F64Map).as_deref(),
+                viewset: for_kind(AssetTypeHint::ViewSet).as_deref(),
             },
         );
 
@@ -4190,6 +4206,13 @@ impl App for VolumetricUiV2 {
             return;
         }
 
+        if event.is_click_or_activate(IMPORT_STILL_KEY) {
+            self.pending_file_action = Some(FileAction::ImportStill);
+            self.open_menu = None;
+            self.add_modal = None;
+            return;
+        }
+
         if event.is_click_or_activate(ADD_OPEN_KEY) {
             self.add_modal = Some(AddModalState::default());
             // Focus lands in the search field so typing filters immediately.
@@ -4685,6 +4708,7 @@ fn catalog_row_key(entry: &catalog::CatalogEntry) -> String {
         "ply_import_operator" => IMPORT_PLY_KEY.to_string(),
         "point_cloud_import_operator" => IMPORT_POINT_CLOUD_KEY.to_string(),
         "volume_import_operator" => IMPORT_VOLUME_KEY.to_string(),
+        "view_solve_operator" => IMPORT_STILL_KEY.to_string(),
         _ => match entry.kind {
             volumetric_assets::AssetCategory::Model => {
                 format!("{ADD_MODEL_PREFIX}{}", entry.name)
@@ -6729,6 +6753,7 @@ fn step_edit_rows(app: &VolumetricUiV2, step_idx: usize) -> Vec<El> {
         let trimeshes = step_input_options(app, step_idx, AssetSlotKind::TriMesh);
         let subspaces = step_input_options(app, step_idx, AssetSlotKind::Subspace);
         let f64_maps = step_input_options(app, step_idx, AssetSlotKind::F64Map);
+        let viewsets = step_input_options(app, step_idx, AssetSlotKind::ViewSet);
         rows.push(text("Inputs").muted().caption().semibold());
         let block = edit.variadic.as_ref();
         for (n, slot) in edit.asset_slots.iter().enumerate() {
@@ -6742,6 +6767,7 @@ fn step_edit_rows(app: &VolumetricUiV2, step_idx: usize) -> Vec<El> {
                 AssetSlotKind::TriMesh => &trimeshes,
                 AssetSlotKind::Subspace => &subspaces,
                 AssetSlotKind::F64Map => &f64_maps,
+                AssetSlotKind::ViewSet => &viewsets,
             };
             let in_block = block.is_some_and(|block| block.range.contains(&slot.input_idx));
             let removable = in_block && block.is_some_and(|block| block.range.len() > 1);
@@ -6846,6 +6872,7 @@ fn step_input_options(app: &VolumetricUiV2, step_idx: usize, kind: AssetSlotKind
         AssetSlotKind::TriMesh => editable_trimesh_asset_ids(app),
         AssetSlotKind::Subspace => editable_subspace_asset_ids(app),
         AssetSlotKind::F64Map => editable_f64_map_asset_ids(app),
+        AssetSlotKind::ViewSet => editable_viewset_asset_ids(app),
     };
     ids.into_iter()
         .filter(|id| !not_yet_produced.contains(id.as_str()))
@@ -6930,6 +6957,7 @@ fn asset_slot_kind_label(kind: AssetSlotKind) -> &'static str {
         AssetSlotKind::TriMesh => "triangle mesh",
         AssetSlotKind::Subspace => "subspace",
         AssetSlotKind::F64Map => "F64Map",
+        AssetSlotKind::ViewSet => "view set",
     }
 }
 
@@ -7391,6 +7419,7 @@ struct SlotPrimaries<'a> {
     trimesh: Option<&'a str>,
     subspace: Option<&'a str>,
     f64_map: Option<&'a str>,
+    viewset: Option<&'a str>,
 }
 
 /// Builds a fresh step's inputs, one per declared operator metadata input, in
@@ -7450,9 +7479,10 @@ fn operator_step_inputs(
                 Some(id) => ExecutionInput::AssetRef(id.to_string()),
                 None => ExecutionInput::Inline(Vec::new()),
             },
-            // View sets are imported assets with no producer yet; the step
-            // editor's picker wires one in.
-            OperatorMetadataInput::ViewSet => ExecutionInput::Inline(Vec::new()),
+            OperatorMetadataInput::ViewSet => match primaries.viewset {
+                Some(id) => ExecutionInput::AssetRef(id.to_string()),
+                None => ExecutionInput::Inline(Vec::new()),
+            },
         })
         .collect()
 }
@@ -7562,6 +7592,13 @@ fn editable_subspace_asset_ids(app: &VolumetricUiV2) -> Vec<String> {
     app.declared_assets_typed()
         .into_iter()
         .filter_map(|(id, type_hint)| (type_hint == Some(AssetTypeHint::Subspace)).then_some(id))
+        .collect()
+}
+
+fn editable_viewset_asset_ids(app: &VolumetricUiV2) -> Vec<String> {
+    app.declared_assets_typed()
+        .into_iter()
+        .filter_map(|(id, type_hint)| (type_hint == Some(AssetTypeHint::ViewSet)).then_some(id))
         .collect()
 }
 
@@ -9670,6 +9707,8 @@ mod tests {
         assert_eq!(app.take_file_action(), Some(FileAction::ImportPointCloud));
         dispatch(&mut app, UiEvent::synthetic_click(IMPORT_VOLUME_KEY));
         assert_eq!(app.take_file_action(), Some(FileAction::ImportVolume));
+        dispatch(&mut app, UiEvent::synthetic_click(IMPORT_STILL_KEY));
+        assert_eq!(app.take_file_action(), Some(FileAction::ImportStill));
     }
 
     #[test]
@@ -10732,5 +10771,40 @@ mod tests {
         let mut keys = Vec::new();
         collect_keys(&tree, &mut keys);
         assert!(!keys.iter().any(|key| key.starts_with(LOOK_THROUGH_PREFIX)));
+    }
+
+    /// Dropping a still on a project with a view set adds a Solve Still
+    /// step wired to that set, with the picture inline and a config; the
+    /// step editor offers the set in a view-set picker.
+    #[test]
+    fn importing_a_still_wires_the_solver_to_the_view_set() {
+        let mut app = app_with_viewset();
+        app.import_blob_asset("view_solve_operator", "still", vec![0xFF, 0xD8, 0xFF]);
+        let step = app.project.timeline().last().expect("a step was added");
+        assert_eq!(step.inputs.len(), 3);
+        assert!(
+            matches!(&step.inputs[0], ExecutionInput::AssetRef(id) if id == "views"),
+            "the first view set is wired in: {:?}",
+            step.inputs[0]
+        );
+        assert!(matches!(&step.inputs[1], ExecutionInput::Inline(b) if b == &[0xFF, 0xD8, 0xFF]));
+        assert!(matches!(&step.inputs[2], ExecutionInput::Inline(bytes) if !bytes.is_empty()));
+        assert!(step.outputs[0].starts_with("still"));
+        let idx = app.project.timeline().len() - 1;
+        assert_eq!(
+            step_input_options(&app, idx, AssetSlotKind::ViewSet),
+            vec!["views".to_string()]
+        );
+        assert_eq!(
+            AssetSlotKind::of_input(&OperatorMetadataInput::ViewSet),
+            Some(AssetSlotKind::ViewSet)
+        );
+
+        // Without a view set the slot stays unwired for the picker.
+        let mut bare = VolumetricUiV2::default();
+        bare.import_blob_asset("view_solve_operator", "still", vec![1, 2, 3]);
+        let step = bare.project.timeline().last().unwrap();
+        assert!(matches!(&step.inputs[0], ExecutionInput::Inline(b) if b.is_empty()));
+        assert!(step_input_options(&bare, 0, AssetSlotKind::ViewSet).is_empty());
     }
 }

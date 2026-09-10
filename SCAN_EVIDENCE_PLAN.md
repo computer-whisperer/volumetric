@@ -1,6 +1,6 @@
 # Scan Evidence — Design and Plan
 
-Status: ratified 2026-09-09. Step 0 landed 2026-09-09. Step A landed 2026-09-09 (value, import, CLI, GUI). Step B: cv_core + view-solve landed 2026-09-10, operator/GUI pending; C–D pending.
+Status: ratified 2026-09-09. Step 0 landed 2026-09-09. Step A landed 2026-09-09 (value, import, CLI, GUI). Step B landed 2026-09-10 (cv_core, view-solve, view_solve_operator, GUI Import Still); C–D pending.
 
 ## Why
 
@@ -65,7 +65,7 @@ photos, and to export a printable or manufacturable mesh.
 |---|---|---|---|
 | 0 | Values in `project-run --json`; one `render` for a whole project scene with an explicit pinhole camera | 2 days | landed |
 | A | `view_core`: ViewSet value with provenance, manifest import, look-through render, depth residual | 4 days | landed |
-| B | `cv_core`: ArUco detection, PnP, focal; `view-solve` CLI, operator, GUI drop-a-still | 5 days | cv_core + view-solve landed; operator/GUI pending |
+| B | `cv_core`: ArUco detection, PnP, focal; `view-solve` CLI, operator, GUI drop-a-still | 5 days | landed |
 | C | Marker-map refinement with the pose track; TSDF fusion operator | 5 days | pending |
 | D | Evidence audits: coverage, subject motion, frame quality, grouping | 3 days | pending |
 
@@ -223,8 +223,13 @@ Landed 2026-09-09, over the same preview path the CLI's `render` uses (`render -
 
 ## Step B — solve a still from the cards
 
-Status: `cv_core` and `view-solve` landed 2026-09-10; operator and GUI
-pending. Validated on the 22 chair-phone stills COLMAP registered:
+Status: landed 2026-09-10 — `cv_core`, `view-solve`, the
+`view_solve_operator` (the same `cv_core::still` pipeline, 1.3 s per
+12 MP still through the wasm path) and the GUI's Import Still flow (a
+Solve Still step wired to the project's view set; the step's warnings
+carry the solve summary, and the Views section lists the still with its
+`rms` and `cards` tags). Validated on the 22 chair-phone stills COLMAP
+registered:
 every card OpenCV found is found (plus two it missed), corners agree with
 OpenCV's to 0.4–1.1 px median, poses agree with COLMAP's to 1.3 cm median
 / 3.2 cm worst and 0.27° median / 0.85° worst with the focal and k1
@@ -298,10 +303,15 @@ corners (`obs_stills.json`).
 
 ### Operator and GUI
 
-`view_solve_operator` (ViewSet + image blob + config → ViewSet with the
-new view) so a still becomes a project step, and the GUI's drop-a-still
-flow: import the picture, add the step, look through the result with the
-detections drawn. Sequenced after the CLI validates on the stills.
+`view_solve_operator` (ViewSet + picture blob + config → ViewSet with the
+new view) runs `cv_core::still`, the pipeline the command runs, and
+posts the solve summary and cautions as step warnings. The GUI's Import
+Still (Solve Still in the Add catalog) opens a file dialog and adds the
+step wired to the project's first view set, with a view-set picker in
+the step editor for any other; the posed still then appears in the Views
+section with its `rms` and `cards` tags and can be looked through, where
+the map's marker squares over the photograph's cards are the visual
+check of the solve.
 
 ## Step C — marker map and fusion
 

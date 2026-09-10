@@ -804,6 +804,12 @@ fn gather_file_task(
             operator_name: "volume_import_operator",
             output_base: "volume",
         }),
+        FileAction::ImportStill => Some(FileTask::ImportBlob {
+            filter_name: "Stills",
+            extensions: &["jpg", "jpeg", "png"],
+            operator_name: "view_solve_operator",
+            output_base: "still",
+        }),
     }
 }
 

@@ -1,21 +1,20 @@
 //! `view-solve`: pose a still from the marker cards it shows, against the
-//! marker map a view set carries, and append it to the set.
+//! marker map a view set carries, and append it to the set. The pipeline
+//! is `cv_core::still`, shared with the `view_solve` operator; this
+//! command adds the file handling, the report and the annotated picture.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use cv_core::detect::{DetectParams, Detection, detect};
+use cv_core::detect::Detection;
 use cv_core::dict::Dictionary;
-use cv_core::exif::{Exif, focal_px_from_fov, read_exif};
 use cv_core::gray::Gray;
-use cv_core::pnp::{PoseSolve, SolveOptions, solve_view};
+use cv_core::still::{StillOptions, StillSolve, append_view, solve_still};
 use serde::Serialize;
 use view_core::image::{Rgb, decode_rgb};
 use volumetric::{AssetTypeHint, Project};
-use volumetric_abi::viewset::{
-    CameraModel, Distortion, View, ViewSet, decode_viewset, encode_viewset,
-};
+use volumetric_abi::viewset::{CameraModel, Distortion, ViewSet, decode_viewset, encode_viewset};
 
 use crate::views::{find_viewset_asset, project_assets};
 
@@ -47,7 +46,7 @@ pub struct ViewSolveArgs {
     pub dictionary: String,
 
     /// Known intrinsics fx,fy,cx,cy[,k1[,k2]] in pixels; without them the
-    /// focal is seeded from EXIF or --fov-deg and solved
+    /// focal is seeded from EXIF or --fov-deg and solved with k1
     #[arg(long, allow_hyphen_values = true)]
     pub intrinsics: Option<String>,
 
@@ -104,6 +103,13 @@ struct SeedReport {
 }
 
 #[derive(Serialize)]
+struct MapMarker {
+    id: u32,
+    size_m: f64,
+    corners: [[f64; 3]; 4],
+}
+
+#[derive(Serialize)]
 struct DetectionReport {
     id: u32,
     in_map: bool,
@@ -144,13 +150,6 @@ struct PoseReport {
 }
 
 #[derive(Serialize)]
-struct MapMarker {
-    id: u32,
-    size_m: f64,
-    corners: [[f64; 3]; 4],
-}
-
-#[derive(Serialize)]
 struct SolveReport {
     image: String,
     width: u32,
@@ -187,46 +186,24 @@ fn load_set(args: &ViewSolveArgs) -> Result<(ViewSet, Option<String>)> {
     }
 }
 
-/// The camera to start from: explicit intrinsics, else the EXIF 35 mm
-/// equivalent, else the field of view; the principal point at the
-/// centre.
-fn seed_camera(
-    args: &ViewSolveArgs,
-    exif: Option<&Exif>,
-    width: u32,
-    height: u32,
-) -> Result<(CameraModel, String)> {
-    let (cx, cy) = (f64::from(width) * 0.5, f64::from(height) * 0.5);
-    if let Some(text) = &args.intrinsics {
-        let values: Vec<f64> = text
-            .split(',')
-            .map(|v| v.trim().parse::<f64>())
-            .collect::<Result<_, _>>()
-            .context("Invalid --intrinsics: expected fx,fy,cx,cy[,k1[,k2]]")?;
-        if values.len() < 4 || values.len() > 6 {
-            bail!("Invalid --intrinsics: expected fx,fy,cx,cy[,k1[,k2]]");
-        }
-        let mut camera =
-            CameraModel::pinhole(width, height, values[0], values[1], values[2], values[3]);
-        if values.len() > 4 {
-            camera.distortion = Distortion::Radial {
-                k: values[4..].to_vec(),
-                p: [0.0, 0.0],
-            };
-        }
-        return Ok((camera, "--intrinsics".to_string()));
+/// `fx,fy,cx,cy[,k1[,k2]]` as a camera model (sized later, by the still).
+fn parse_intrinsics(text: &str) -> Result<CameraModel> {
+    let values: Vec<f64> = text
+        .split(',')
+        .map(|v| v.trim().parse::<f64>())
+        .collect::<Result<_, _>>()
+        .context("Invalid --intrinsics: expected fx,fy,cx,cy[,k1[,k2]]")?;
+    if values.len() < 4 || values.len() > 6 {
+        bail!("Invalid --intrinsics: expected fx,fy,cx,cy[,k1[,k2]]");
     }
-    if let Some(f) = exif.and_then(|e| e.focal_px(width, height)) {
-        return Ok((
-            CameraModel::pinhole(width, height, f, f, cx, cy),
-            "EXIF 35 mm equivalent".to_string(),
-        ));
+    let mut camera = CameraModel::pinhole(1, 1, values[0], values[1], values[2], values[3]);
+    if values.len() > 4 {
+        camera.distortion = Distortion::Radial {
+            k: values[4..].to_vec(),
+            p: [0.0, 0.0],
+        };
     }
-    let f = focal_px_from_fov(args.fov_deg, width);
-    Ok((
-        CameraModel::pinhole(width, height, f, f, cx, cy),
-        format!("{}° field of view", args.fov_deg),
-    ))
+    Ok(camera)
 }
 
 /// Draws the detections on the photograph.
@@ -279,52 +256,6 @@ fn disc(image: &mut Rgb, centre: [f64; 2], radius: i64, colour: [u8; 3]) {
     }
 }
 
-/// Warnings a reader should weigh the pose by. The residual threshold
-/// scales with the picture: a marker map triangulated to a few
-/// millimetres leaves a few pixels at 12 MP.
-fn warnings(solve: &PoseSolve, width: u32, height: u32) -> Vec<String> {
-    let mut out = Vec::new();
-    let residual_limit = (0.0015 * f64::from(width.max(height))).max(3.0);
-    let used = solve.markers.iter().filter(|m| m.corners_used > 0).count();
-    if used < 2 {
-        out.push("pose from a single marker: the planar ambiguity is unresolved".to_string());
-    }
-    if let Some(f) = &solve.focal
-        && f.std > 0.05 * f.value
-    {
-        out.push(format!(
-            "focal weakly constrained ({:.0} ± {:.0} px): the cards lie in one plane seen square-on",
-            f.value, f.std
-        ));
-    }
-    if solve.rms_px > residual_limit {
-        out.push(format!(
-            "large residual ({:.1} px rms over {:.1} px): distortion, a moved card, or a map from another setup",
-            solve.rms_px, residual_limit
-        ));
-    }
-    out
-}
-
-/// The index of a camera equal to `camera` in the set, or the index it
-/// would get when appended.
-fn camera_index(set: &mut ViewSet, camera: &CameraModel) -> u32 {
-    let same = |a: &CameraModel, b: &CameraModel| {
-        a.width == b.width
-            && a.height == b.height
-            && (a.fx - b.fx).abs() < 1e-9
-            && (a.fy - b.fy).abs() < 1e-9
-            && (a.cx - b.cx).abs() < 1e-9
-            && (a.cy - b.cy).abs() < 1e-9
-            && a.distortion == b.distortion
-    };
-    if let Some(i) = set.cameras.iter().position(|c| same(c, camera)) {
-        return i as u32;
-    }
-    set.cameras.push(camera.clone());
-    (set.cameras.len() - 1) as u32
-}
-
 fn stem(path: &Path) -> String {
     path.file_stem()
         .and_then(|s| s.to_str())
@@ -332,60 +263,31 @@ fn stem(path: &Path) -> String {
         .to_string()
 }
 
-pub fn run_view_solve(args: ViewSolveArgs) -> Result<()> {
-    let (mut set, asset_id) = load_set(&args)?;
-    let dict = Dictionary::by_name(&args.dictionary).with_context(|| {
-        format!(
-            "unknown dictionary '{}'; expected 5x5_100 or 4x4_50",
-            args.dictionary
-        )
-    })?;
-    let bytes = std::fs::read(&args.image)
-        .with_context(|| format!("Failed to read {}", args.image.display()))?;
-    let photo = decode_rgb(&bytes)?;
-    let gray = Gray::from_rgb8(photo.width, photo.height, &photo.pixels);
-    let exif = read_exif(&bytes);
-    let (seed, source) = seed_camera(&args, exif.as_ref(), photo.width, photo.height)?;
-    let view_id = args.id.clone().unwrap_or_else(|| stem(&args.image));
-    if set.views.iter().any(|v| v.id == view_id) {
-        bail!("the set already has a view '{view_id}'; choose another --id");
-    }
-
-    let detections = detect(&gray, &dict, &DetectParams::default());
+fn report_of(
+    args: &ViewSolveArgs,
+    photo: &Rgb,
+    set: &ViewSet,
+    solve: &StillSolve,
+    view_id: &str,
+) -> SolveReport {
     let in_map = |id: u32| set.markers.iter().any(|m| m.id == id);
-    // Unknown intrinsics: the focal and the first radial term come from
-    // the cards (a phone's barrel distortion is several pixels at the
-    // edges of a 12 MP still).
-    let options = SolveOptions {
-        solve_focal: args.solve_focal || args.intrinsics.is_none(),
-        solve_distortion: args.solve_distortion || args.intrinsics.is_none(),
-        ..SolveOptions::default()
-    };
-    let solved = solve_view(&seed, &set.markers, &detections, &options);
-
-    if let Some(path) = &args.annotate {
-        let drawn = annotate(&photo, &detections, &set);
-        std::fs::write(path, drawn.to_png()?)
-            .with_context(|| format!("Failed to write {}", path.display()))?;
-    }
-
     let mut report = SolveReport {
         image: args.image.display().to_string(),
         width: photo.width,
         height: photo.height,
-        dictionary: dict.name.to_string(),
-        exif: exif.as_ref().map(|e| ExifReport {
+        dictionary: args.dictionary.clone(),
+        exif: solve.exif.as_ref().map(|e| ExifReport {
             make: e.make.clone(),
             model: e.model.clone(),
             focal_mm: e.focal_mm,
             focal_35mm: e.focal_35mm,
         }),
         seed: SeedReport {
-            fx: seed.fx,
-            fy: seed.fy,
-            cx: seed.cx,
-            cy: seed.cy,
-            source,
+            fx: solve.seed.fx,
+            fy: solve.seed.fy,
+            cx: solve.seed.cx,
+            cy: solve.seed.cy,
+            source: solve.seed_source.clone(),
         },
         map: set
             .markers
@@ -396,7 +298,8 @@ pub fn run_view_solve(args: ViewSolveArgs) -> Result<()> {
                 corners: m.corners,
             })
             .collect(),
-        detections: detections
+        detections: solve
+            .detections
             .iter()
             .map(|d| DetectionReport {
                 id: d.id,
@@ -410,18 +313,17 @@ pub fn run_view_solve(args: ViewSolveArgs) -> Result<()> {
             .collect(),
         pose: None,
         error: None,
-        view_id: view_id.clone(),
+        view_id: view_id.to_string(),
         saved: None,
     };
-
-    match &solved {
-        Ok(solve) => {
+    match &solve.pose {
+        Ok(pose) => {
             report.pose = Some(PoseReport {
-                camera_to_world: solve.camera_to_world,
-                position: solve.position(),
-                rms_px: solve.rms_px,
-                corners_used: solve.corners_used,
-                markers: solve
+                camera_to_world: pose.camera_to_world,
+                position: pose.position(),
+                rms_px: pose.rms_px,
+                corners_used: pose.corners_used,
+                markers: pose
                     .markers
                     .iter()
                     .map(|m| MarkerReport {
@@ -430,36 +332,72 @@ pub fn run_view_solve(args: ViewSolveArgs) -> Result<()> {
                         corners_used: m.corners_used,
                     })
                     .collect(),
-                fx: solve.camera.fx,
-                fy: solve.camera.fy,
-                cx: solve.camera.cx,
-                cy: solve.camera.cy,
-                focal: solve.focal.map(|e| EstimateReport {
+                fx: pose.camera.fx,
+                fy: pose.camera.fy,
+                cx: pose.camera.cx,
+                cy: pose.camera.cy,
+                focal: pose.focal.map(|e| EstimateReport {
                     value: e.value,
                     std: e.std,
                 }),
-                k1: solve.k1.map(|e| EstimateReport {
+                k1: pose.k1.map(|e| EstimateReport {
                     value: e.value,
                     std: e.std,
                 }),
-                warnings: warnings(solve, photo.width, photo.height),
+                warnings: solve.warnings.clone(),
             });
         }
         Err(err) => report.error = Some(err.clone()),
     }
+    report
+}
+
+pub fn run_view_solve(args: ViewSolveArgs) -> Result<()> {
+    let (mut set, asset_id) = load_set(&args)?;
+    let dictionary = Dictionary::by_name(&args.dictionary).with_context(|| {
+        format!(
+            "unknown dictionary '{}'; expected 5x5_100 or 4x4_50",
+            args.dictionary
+        )
+    })?;
+    let bytes = std::fs::read(&args.image)
+        .with_context(|| format!("Failed to read {}", args.image.display()))?;
+    let photo = decode_rgb(&bytes)?;
+    let gray = Gray::from_rgb8(photo.width, photo.height, &photo.pixels);
+    let view_id = args.id.clone().unwrap_or_else(|| stem(&args.image));
+    if set.views.iter().any(|v| v.id == view_id) {
+        bail!("the set already has a view '{view_id}'; choose another --id");
+    }
+
+    let options = StillOptions {
+        dictionary,
+        intrinsics: args
+            .intrinsics
+            .as_deref()
+            .map(parse_intrinsics)
+            .transpose()?,
+        fov_deg: args.fov_deg,
+        solve_focal: args.solve_focal,
+        solve_distortion: args.solve_distortion,
+        ..StillOptions::default()
+    };
+    let solve = solve_still(&gray, &bytes, &set, &options);
+
+    if let Some(path) = &args.annotate {
+        let drawn = annotate(&photo, &solve.detections, &set);
+        std::fs::write(path, drawn.to_png()?)
+            .with_context(|| format!("Failed to write {}", path.display()))?;
+    }
+
+    let mut report = report_of(&args, &photo, &set, &solve, &view_id);
 
     // Append the view unless told not to.
-    if let Ok(solve) = &solved
+    if let Ok(pose) = &solve.pose
         && !args.dry_run
         && (args.output.is_some() || asset_id.is_some())
     {
-        let camera = camera_index(&mut set, &solve.camera);
-        let mut view = View::posed(view_id.clone(), camera, solve.camera_to_world);
-        view.image = Some(bytes.clone());
-        view.tags = vec!["still".to_string(), "solved:markers".to_string()];
-        view.tags.extend(args.tags.iter().cloned());
-        set.views.push(view);
-        set.validate().map_err(anyhow::Error::msg)?;
+        append_view(&mut set, &view_id, pose, Some(bytes.clone()), &args.tags)
+            .map_err(anyhow::Error::msg)?;
         let encoded = encode_viewset(&set);
         if let Some(output) = &args.output {
             std::fs::write(output, &encoded)
@@ -586,42 +524,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn seeds_follow_intrinsics_exif_then_fov() {
-        let base = ViewSolveArgs {
-            project: None,
-            input: None,
-            views: None,
-            image: PathBuf::from("still.jpg"),
-            id: None,
-            dictionary: "5x5_100".to_string(),
-            intrinsics: None,
-            fov_deg: 90.0,
-            solve_focal: false,
-            solve_distortion: false,
-            annotate: None,
-            tags: Vec::new(),
-            output: None,
-            dry_run: true,
-            json: false,
-        };
-        let (cam, source) = seed_camera(&base, None, 1000, 500).unwrap();
-        assert!((cam.fx - 500.0).abs() < 1e-9 && (cam.cx, cam.cy) == (500.0, 250.0));
-        assert!(source.contains("90"));
-
-        let exif = Exif {
-            focal_35mm: Some(36.0),
-            ..Exif::default()
-        };
-        let (cam, source) = seed_camera(&base, Some(&exif), 1000, 500).unwrap();
-        assert_eq!(cam.fx, 1000.0);
-        assert!(source.contains("EXIF"));
-
-        let explicit = ViewSolveArgs {
-            intrinsics: Some("800,810,500,250,0.01".to_string()),
-            ..base
-        };
-        let (cam, _) = seed_camera(&explicit, Some(&exif), 1000, 500).unwrap();
-        assert_eq!((cam.fx, cam.fy), (800.0, 810.0));
+    fn intrinsics_parse_with_optional_distortion() {
+        let cam = parse_intrinsics("800,810,500,250,0.01").unwrap();
+        assert_eq!(
+            (cam.fx, cam.fy, cam.cx, cam.cy),
+            (800.0, 810.0, 500.0, 250.0)
+        );
         assert_eq!(
             cam.distortion,
             Distortion::Radial {
@@ -629,11 +537,12 @@ mod tests {
                 p: [0.0, 0.0]
             }
         );
-        let bad = ViewSolveArgs {
-            intrinsics: Some("1,2".to_string()),
-            ..explicit
-        };
-        assert!(seed_camera(&bad, None, 10, 10).is_err());
+        assert_eq!(
+            parse_intrinsics("1,2,3,4").unwrap().distortion,
+            Distortion::None
+        );
+        assert!(parse_intrinsics("1,2").is_err());
+        assert!(parse_intrinsics("a,b,c,d").is_err());
         assert_eq!(stem(Path::new("stills/00007.jpg")), "00007");
     }
 
@@ -642,6 +551,7 @@ mod tests {
     #[test]
     fn a_rendered_board_solves_and_appends_a_view() {
         use cv_core::board::{Render, render, square_marker};
+        use volumetric_abi::viewset::View;
         let dir = std::env::temp_dir().join(format!("view_solve_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let truth = CameraModel::pinhole(1280, 960, 1000.0, 1000.0, 640.0, 480.0);
@@ -712,33 +622,16 @@ mod tests {
         assert_eq!(solved.views.len(), 1);
         let (added, camera) = solved.view("board").unwrap();
         assert!(added.image.is_some());
-        assert_eq!(added.tags, vec!["still", "solved:markers", "test"]);
+        assert_eq!(
+            added.tags[..2],
+            ["still".to_string(), "solved:markers".to_string()]
+        );
+        assert_eq!(added.tags.last().map(String::as_str), Some("test"));
         let (angle, dist) =
             cv_core::pnp::pose_difference(&added.camera_to_world, &view.camera_to_world);
         assert!(angle < 0.01 && dist < 0.02, "{angle} rad, {dist} m");
         assert!((camera.fx - 1000.0).abs() < 15.0, "{}", camera.fx);
         assert!(dir.join("annotated.png").exists());
         std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn cameras_are_shared_when_equal() {
-        let mut set = ViewSet {
-            schema: 1,
-            world: Default::default(),
-            provenance: Default::default(),
-            cameras: vec![CameraModel::pinhole(10, 10, 5.0, 5.0, 5.0, 5.0)],
-            views: Vec::new(),
-            markers: Vec::new(),
-        };
-        assert_eq!(
-            camera_index(&mut set, &CameraModel::pinhole(10, 10, 5.0, 5.0, 5.0, 5.0)),
-            0
-        );
-        assert_eq!(
-            camera_index(&mut set, &CameraModel::pinhole(10, 10, 6.0, 6.0, 5.0, 5.0)),
-            1
-        );
-        assert_eq!(set.cameras.len(), 2);
     }
 }
