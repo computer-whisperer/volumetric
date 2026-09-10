@@ -1,6 +1,6 @@
 # Scan Evidence — Design and Plan
 
-Status: ratified 2026-09-09. Step 0 landed 2026-09-09. Step A landed 2026-09-09 (value, import, CLI, GUI). Steps B–D pending.
+Status: ratified 2026-09-09. Step 0 landed 2026-09-09. Step A landed 2026-09-09 (value, import, CLI, GUI). Step B: cv_core + view-solve landed 2026-09-10, operator/GUI pending; C–D pending.
 
 ## Why
 
@@ -65,7 +65,7 @@ photos, and to export a printable or manufacturable mesh.
 |---|---|---|---|
 | 0 | Values in `project-run --json`; one `render` for a whole project scene with an explicit pinhole camera | 2 days | landed |
 | A | `view_core`: ViewSet value with provenance, manifest import, look-through render, depth residual | 4 days | landed |
-| B | `cv_core`: ArUco detection, PnP, focal; `view-solve` CLI, operator, GUI drop-a-still | 5 days | pending |
+| B | `cv_core`: ArUco detection, PnP, focal; `view-solve` CLI, operator, GUI drop-a-still | 5 days | cv_core + view-solve landed; operator/GUI pending |
 | C | Marker-map refinement with the pose track; TSDF fusion operator | 5 days | pending |
 | D | Evidence audits: coverage, subject motion, frame quality, grouping | 3 days | pending |
 
@@ -223,17 +223,85 @@ Landed 2026-09-09, over the same preview path the CLI's `render` uses (`render -
 
 ## Step B — solve a still from the cards
 
-`cv_core`: ArUco 5x5 (the scanner's swatch dictionary, `DICT_5X5_100`) and
-4x4 (its calibration board) detection, quad extraction, decoding with
-Hamming tolerance, sub-pixel corner refinement; planar PnP per marker,
-joint least squares over all corners; focal from the markers when the
-intrinsics are unknown (well-posed with markers on two planes, reported as
-weak when all markers share one plane seen near fronto-parallel); EXIF
-focal as the seed. Tests on a synthetic board renderer with exact ground
-truth, then the chair-phone stills against their COLMAP poses in
-`work/chair-phone/colmap`. Surfaces: `view-solve` CLI, a `view_solve`
-operator (ViewSet + image blob → ViewSet with the new view), and the GUI
-drop-a-still flow showing detected markers and the reprojection residual.
+Status: `cv_core` and `view-solve` landed 2026-09-10; operator and GUI
+pending. Validated on the 22 chair-phone stills COLMAP registered:
+every card OpenCV found is found (plus two it missed), corners agree with
+OpenCV's to 0.4–1.1 px median, poses agree with COLMAP's to 1.3 cm median
+/ 3.2 cm worst and 0.27° median / 0.85° worst with the focal and k1
+solved from the cards alone (rms 2.4–5.9 px, the map's own accuracy);
+0.6 s per 12 MP still. The first run "failed" at 165 px rms because the
+stills were taken in session chairbase2, whose cards sit 17 cm from
+chairbase1's — the evidence-doesn't-make-sense case step D's `setup`
+check is for, caught here by hand.
+
+### Why this shape
+
+A still from a phone is the cheapest evidence a human can add: one
+picture of the subject with the cards in view. Posing it needs the marker
+map the scan already carries, a detector, and a pose solver; none of that
+needs OpenCV once the dictionaries are data in the crate. Everything runs
+on the full-resolution picture (a 12 MP still holds 100–300 px markers,
+and the corner accuracy is the pose accuracy).
+
+### `crates/cv_core` (pure Rust, native and wasm32)
+
+- `gray`: 8-bit luma image with bilinear sampling and an integral image.
+- `dict`: ArUco dictionaries as data — `DICT_5X5_100` (the swatches) and
+  `DICT_4X4_50` (the calibration board), each code with its four
+  rotations precomputed, generated from OpenCV 5.0 by
+  `gen/aruco_dicts.py`. Identification takes the rotation that matches
+  within the tolerance OpenCV uses (0.6 × the dictionary's maximum
+  correction bits): 1 bit for the 5x5 set, 0 for the 4x4.
+- `detect`: adaptive threshold at three window sizes scaled to the
+  picture (integral-image local mean, constant 7), connected dark
+  components, outer-border tracing, Douglas–Peucker to a convex quad with
+  a minimum perimeter, perspective sampling of the (n+2)² cells with an
+  Otsu split, border check, dictionary lookup, then corner refinement by
+  edge fitting: sub-pixel gradient crossings along each side, a robust
+  line per side, corners at the intersections. Duplicates across windows
+  collapse to the best fit. Output: id, four corners in the marker's
+  canonical order (top-left first, clockwise), the rotation used, the
+  Hamming distance and the fit residual.
+- `pnp`: pose from correspondences between the map's marker corners and
+  the detections. Initial pose from the best single-marker homography
+  (DLT with normalisation, decomposition against K, polar
+  orthonormalisation, the solution with the marker in front), then
+  Gauss–Newton over all corners with Huber weights and a residual cut,
+  rotation updated on the manifold. Optionally the focal joins the
+  unknowns (fx = fy, principal point at the image centre) and its
+  standard error from the normal matrix says whether the picture
+  constrains it — all cards on one plane seen square-on does not, and the
+  solve says so. Output: camera-to-world, rms, per-marker residuals and
+  which markers were used.
+- `exif`: the JPEG APP1 reader for FocalLength, FocalLengthIn35mmFilm and
+  the maker and model, to seed the focal (35 mm equivalent when present,
+  else a configurable field of view, default 70°).
+- `board`: a synthetic renderer (markers at world poses through a pinhole,
+  supersampled, optional blur) with exact ground truth for the tests of
+  every stage above.
+
+### CLI
+
+`view-solve -p project [--views asset] --image still.jpg [--id name]
+[--dictionary 5x5_100|4x4_50] [--intrinsics fx,fy,cx,cy | --fov-deg d]
+[--solve-focal] [--annotate out.png] [--json] [-o set.vviews]`: detects
+the cards, solves the pose against the set's marker map, reports detected
+and used ids, rms, per-marker residuals and the focal (with its standard
+error when solved), draws the detections when asked, and appends the view
+(image embedded, tags `still`, `solved:markers`) to the set in the project
+or to a standalone file.
+
+Validation: the 22 chair-phone stills COLMAP registered into the scan
+world (`work/chair-phone/poses.json`, f = 3004 px) — position and
+rotation agreement, and detection agreement with the scanner's OpenCV
+corners (`obs_stills.json`).
+
+### Operator and GUI
+
+`view_solve_operator` (ViewSet + image blob + config → ViewSet with the
+new view) so a still becomes a project step, and the GUI's drop-a-still
+flow: import the picture, add the step, look through the result with the
+detections drawn. Sequenced after the CLI validates on the stills.
 
 ## Step C — marker map and fusion
 

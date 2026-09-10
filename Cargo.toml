@@ -114,6 +114,7 @@ members = [
     "crates/volumetric_renderer",
     "crates/volumetric_preview",
     "crates/view_core",
+    "crates/cv_core",
     "crates/volumetric_ui_v2",
     "crates/volumetric_cli",
     "crates/volumetric_protocol",

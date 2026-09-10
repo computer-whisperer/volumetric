@@ -1041,6 +1041,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
+name = "cv_core"
+version = "0.1.0"
+dependencies = [
+ "volumetric_abi",
+]
+
+[[package]]
 name = "cylinder_operator"
 version = "0.1.0"
 dependencies = [
@@ -5993,6 +6000,7 @@ dependencies = [
  "base64",
  "ciborium",
  "clap",
+ "cv_core",
  "fea_bundle",
  "glam 0.32.1",
  "image",

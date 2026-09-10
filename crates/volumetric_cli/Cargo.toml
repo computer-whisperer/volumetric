@@ -9,6 +9,7 @@ fea_bundle = { path = "../fea_bundle" }
 volumetric_abi = { path = "../volumetric_abi" }
 volumetric_assets = { path = "../volumetric_assets" }
 view_core = { path = "../view_core" }
+cv_core = { path = "../cv_core" }
 volumetric_preview = { path = "../volumetric_preview" }
 volumetric_protocol = { path = "../volumetric_protocol", features = ["client"] }
 volumetric_renderer = { path = "../volumetric_renderer" }

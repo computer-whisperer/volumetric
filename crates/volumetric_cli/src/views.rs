@@ -195,33 +195,44 @@ pub(crate) fn project_assets(path: &Path, run: bool) -> Result<Vec<LoadedAsset>>
     Ok(assets)
 }
 
-/// The view set named by `wanted` among `assets`, or the only one.
-pub(crate) fn find_viewset(assets: &[LoadedAsset], wanted: Option<&str>) -> Result<ViewSet> {
+/// The view set asset named by `wanted` among `assets`, or the only one.
+pub(crate) fn find_viewset_asset<'a>(
+    assets: &'a [LoadedAsset],
+    wanted: Option<&str>,
+) -> Result<&'a LoadedAsset> {
     let sets: Vec<&LoadedAsset> = assets
         .iter()
         .filter(|a| a.type_hint() == Some(AssetTypeHint::ViewSet))
         .collect();
-    let asset = match wanted {
+    match wanted {
         Some(id) => sets
             .iter()
             .find(|a| a.id() == id)
             .copied()
-            .ok_or_else(|| anyhow!("no view set asset '{id}'. Available: {}", ids(&sets)))?,
+            .ok_or_else(|| anyhow!("no view set asset '{id}'. Available: {}", ids(&sets))),
         None => match sets.as_slice() {
-            [] => bail!("the project has no view set; add one with view-import"),
-            [only] => only,
+            [] => bail!("no view set asset in the project"),
+            [only] => Ok(only),
             _ => bail!("several view sets; choose one with --views: {}", ids(&sets)),
         },
-    };
-    decode_viewset(asset.data())
-        .map_err(|err| anyhow!("view set '{}' is invalid: {err}", asset.id()))
+    }
 }
 
+/// Asset ids joined for an error message.
 fn ids(assets: &[&LoadedAsset]) -> String {
-    assets.iter().map(|a| a.id()).collect::<Vec<_>>().join(", ")
+    assets
+        .iter()
+        .map(|a| a.id().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
-/// Loads a view set from a `.vviews` file or a project.
+/// The view set named by `wanted` among `assets`, or the only one.
+pub(crate) fn find_viewset(assets: &[LoadedAsset], wanted: Option<&str>) -> Result<ViewSet> {
+    let asset = find_viewset_asset(assets, wanted)?;
+    decode_viewset(asset.data()).map_err(|err| anyhow!("asset '{}': {err}", asset.id()))
+}
+
 fn load_viewset(input: &Path, asset: Option<&str>) -> Result<ViewSet> {
     let extension = input
         .extension()

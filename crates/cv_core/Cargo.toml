@@ -1,0 +1,14 @@
+[package]
+name = "cv_core"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Computer vision on a picture's pixels, pure Rust so it runs natively
+# and inside operator modules: ArUco marker detection with sub-pixel
+# corners, pose (and focal) from the markers of a view set's map, EXIF
+# focal seeds, and a synthetic board renderer for exact-ground-truth
+# tests.
+
+[dependencies]
+volumetric_abi = { path = "../volumetric_abi" }

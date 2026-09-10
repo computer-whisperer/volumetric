@@ -9,7 +9,7 @@
 //! - `sample`: Sample occupancy values at points
 //! - `assets`: List the models and operators bundled into the binary
 //! - `project-*`: Create, validate and manipulate .vproj project files
-//! - `view-*`: Import, list and check posed-image view sets
+//! - `view-*`: Import, list, check and extend posed-image view sets
 //!
 //! Model and operator arguments accept either a filesystem path or the name
 //! of a bundled asset (see `assets`).
@@ -33,6 +33,7 @@ mod info;
 mod project;
 mod raster;
 mod render;
+mod solve;
 mod views;
 
 #[derive(Parser, Debug)]
@@ -105,6 +106,9 @@ enum Commands {
     /// Compare a model against the depth maps of a project's view set
     #[command(name = "view-residual")]
     ViewResidual(views::ViewResidualArgs),
+    /// Pose a still from the marker cards it shows and append it to a view set
+    #[command(name = "view-solve")]
+    ViewSolve(solve::ViewSolveArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -576,5 +580,6 @@ fn main() -> Result<()> {
         Commands::ViewImport(args) => views::run_view_import(args),
         Commands::ViewList(args) => views::run_view_list(args),
         Commands::ViewResidual(args) => views::run_view_residual(args),
+        Commands::ViewSolve(args) => solve::run_view_solve(args),
     }
 }
