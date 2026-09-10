@@ -227,6 +227,8 @@ volumetric_cli render -i <model.wasm | project.vproj> -o <output.png>
 - `--views <list>` - Preset directions framed to the scene: front, back, left, right, top, bottom, iso, iso-back, all (default: iso; several views write one file each, suffixed)
 - `--camera-pos x,y,z [--camera-target x,y,z] [--camera-up x,y,z] [--fov deg]` - An explicit pose
 - `--intrinsics fx,fy,cx,cy --pose m00,...,m23` - A pinhole camera in OpenCV convention (pixel origin top-left, camera z forward); the pose is the rows of its 3x4 camera-to-world matrix and the image is `--width` x `--height`
+- `--through <view id>` (or `<views asset>:<view id>`) - The camera of a view in the project's view set, at the view's image size unless `--width`/`--height` scale it
+- `--overlay blend|edge|side|checker [--overlay-alpha a] [--overlay-tile px]` - With `--through`, composite the render over the view's photograph
 - `--projection ortho [--ortho-scale h]` - Orthographic instead of perspective (presets and poses)
 - `--near`, `--far` - Clip planes (default: from the scene)
 
@@ -242,7 +244,40 @@ volumetric_cli render -i chair.vproj --asset scan --asset lift_axis -o chair.png
 volumetric_cli render -i chair.vproj -o view.png --width 960 --height 960 \
     --intrinsics 414.8,415.1,484.2,488.6 \
     --pose 0.726,-0.475,0.497,0.881,-0.014,-0.733,-0.681,-1.031,0.687,0.487,-0.538,-2.186
+
+# The same through the project's view set, blended over the photograph
+volumetric_cli render -i chair.vproj -o view.png --through 00600_l --overlay blend
 ```
+
+#### View Set Commands
+
+Posed images with depth are evidence a model can be checked against. A
+view set (`ViewSet` asset, `.vviews` file) carries cameras, per-view
+poses in the OpenCV convention, the embedded photograph, 16-bit depth map
+and subject mask of each view, the marker map that posed them, and a
+provenance record.
+
+```bash
+# Embed a selection of a dataset: the scanner's cameras.json or nerfstudio's transforms.json
+volumetric_cli view-import --manifest datasets/chair/cameras.json -p chair.vproj \
+    --eye left --near 1.8,-1.9,-3.0 --radius 1.4 --stride 60 --max 8 --field chair-markers
+
+# Or write a standalone file, by view id
+volumetric_cli view-import --manifest cameras.json -o views.vviews --id 00600_l --id 00003_l
+
+# What a set holds
+volumetric_cli view-list -i chair.vproj [--asset views] [--json]
+
+# How far the model's surface sits from each view's depth map: coverage,
+# median and p90 residual per view and pooled, with residual images
+volumetric_cli view-residual -p chair.vproj --model chair_solid -o residuals/ [--json]
+```
+
+Selection flags: `--id` (repeatable), `--stride`, `--near x,y,z --radius r`,
+`--max`, `--eye left|right|both`, `--split train|test`, `--no-images`,
+`--no-depth`, `--no-masks`; provenance labels `--session`, `--rig`,
+`--field`, `--setup`. `project-add-asset --type viewset` adds a `.vviews`
+file to a project.
 
 #### Project Commands
 

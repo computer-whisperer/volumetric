@@ -204,6 +204,7 @@ enum InputInfo {
     FeaMesh,
     TriMesh,
     Subspace,
+    ViewSet,
 }
 
 #[derive(Debug, Serialize)]
@@ -214,6 +215,7 @@ enum OutputInfo {
     TriMesh,
     Subspace,
     F64Map,
+    ViewSet,
 }
 
 #[derive(Debug, Serialize)]
@@ -259,6 +261,7 @@ fn metadata_to_json(meta: &OperatorMetadata) -> OperatorMetadataJson {
                 OperatorMetadataInput::FeaMesh => InputInfo::FeaMesh,
                 OperatorMetadataInput::TriMesh => InputInfo::TriMesh,
                 OperatorMetadataInput::Subspace => InputInfo::Subspace,
+                OperatorMetadataInput::ViewSet => InputInfo::ViewSet,
             })
             .collect(),
         variadic_input: meta.variadic_input,
@@ -271,6 +274,7 @@ fn metadata_to_json(meta: &OperatorMetadata) -> OperatorMetadataJson {
                 OperatorMetadataOutput::TriMesh => OutputInfo::TriMesh,
                 OperatorMetadataOutput::Subspace => OutputInfo::Subspace,
                 OperatorMetadataOutput::F64Map => OutputInfo::F64Map,
+                OperatorMetadataOutput::ViewSet => OutputInfo::ViewSet,
             })
             .collect(),
     }
@@ -418,6 +422,9 @@ fn print_info_human(output: &InfoOutput) {
                     InputInfo::Subspace => {
                         println!("  [{}] Subspace", i);
                     }
+                    InputInfo::ViewSet => {
+                        println!("  [{}] View Set", i);
+                    }
                 }
             }
             if let Some(slot) = metadata.variadic_input {
@@ -431,6 +438,7 @@ fn print_info_human(output: &InfoOutput) {
                     OutputInfo::TriMesh => println!("  [{}] Triangle Mesh", i),
                     OutputInfo::Subspace => println!("  [{}] Subspace", i),
                     OutputInfo::F64Map => println!("  [{}] F64Map", i),
+                    OutputInfo::ViewSet => println!("  [{}] View Set", i),
                 }
             }
         }

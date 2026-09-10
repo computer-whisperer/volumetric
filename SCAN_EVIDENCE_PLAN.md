@@ -1,6 +1,6 @@
 # Scan Evidence — Design and Plan
 
-Status: ratified 2026-09-09. Step 0 landed 2026-09-09. Steps A–D pending.
+Status: ratified 2026-09-09. Step 0 landed 2026-09-09. Step A: value, import and CLI landed 2026-09-09; GUI pending. Steps B–D pending.
 
 ## Why
 
@@ -64,7 +64,7 @@ photos, and to export a printable or manufacturable mesh.
 | Step | Content | Size | Status |
 |---|---|---|---|
 | 0 | Values in `project-run --json`; one `render` for a whole project scene with an explicit pinhole camera | 2 days | landed |
-| A | `view_core`: ViewSet value with provenance, manifest import, look-through render, depth residual | 4 days | pending |
+| A | `view_core`: ViewSet value with provenance, manifest import, look-through render, depth residual | 4 days | CLI landed; GUI pending |
 | B | `cv_core`: ArUco detection, PnP, focal; `view-solve` CLI, operator, GUI drop-a-still | 5 days | pending |
 | C | Marker-map refinement with the pose track; TSDF fusion operator | 5 days | pending |
 | D | Evidence audits: coverage, subject motion, frame quality, grouping | 3 days | pending |
@@ -129,18 +129,75 @@ OpenCV convention is right end to end.
 
 ## Step A — ViewSet
 
-Value (CBOR, `AssetTypeHint::ViewSet`): shared or per-view intrinsics with
-a distortion model enum (none, radial, kb4), image size, per-view
-camera-to-world pose (OpenCV convention: x right, y down, z forward),
-optional embedded image, depth (16-bit, unit in metres) and mask blobs, the
-marker map (id, size, world corners), the world frame declaration (metres,
-up axis) and the provenance record. Import from the scanner's
-`cameras.json` and nerfstudio `transforms.json`; subset selection by view
-ids, stride, or nearest-to-a-point. CLI: `view-import`, `view-list`,
-`render --through <view> --overlay blend|edge|side|checker`,
-`view-residual` (rendered depth against the view's depth map: coverage,
-median, p90, residual image). GUI: views panel with thumbnails, frustum
-gizmos, look-through with a photo underlay.
+Status: value, import and CLI landed 2026-09-09; the GUI panel is pending.
+Verified on chairbase1: eight left views imported in 10 MB; the TSDF model
+rendered through view 600 overlays its photograph (blend, edge, checker);
+`view-residual` against the same model reports 82% coverage and a 5 mm
+median on view 600, which is the per-frame stereo depth noise the scanner
+documents, not a model error.
+
+### Value
+
+`volumetric_abi::viewset` (CBOR, `AssetTypeHint::ViewSet`,
+`OperatorMetadataInput/Output::ViewSet`), schema 1:
+
+- `world`: up axis (world units are always metres).
+- `provenance`: `session`, `rig` (calibration id or hash), `field` (marker
+  field id), `setup` (subject setup id), `tools` (producer strings),
+  `captured` (ISO time). Empty strings mean unknown; step D's combinators
+  will refuse to merge sets whose non-empty `field` or `setup` differ.
+- `cameras`: intrinsics shared by views — `width`, `height`, `fx`, `fy`,
+  `cx`, `cy` and a `distortion` enum: `None`, `Radial { k, p }` (OpenCV
+  k1..k3, p1, p2), `KannalaBrandt { k }` (the Index's fisheye).
+- `views`: `id`, `camera` index, `camera_to_world` (3x4 row-major, OpenCV:
+  x right, y down, z forward), optional `time` (seconds), optional
+  embedded `image` (PNG/JPEG bytes), `depth` (16-bit PNG bytes) with
+  `depth_unit_m`, `mask` (PNG, nonzero = subject), and `tags` (eye,
+  split, whatever the source knew).
+- `markers`: `id`, `size_m`, four world `corners`.
+
+Camera math lives beside the type so operators can use it: project a
+camera-space point to a pixel (with distortion), a pixel to a unit ray
+(inverting the distortion), and the pose helpers (position, forward,
+world projection, unprojection at a depth).
+
+### Import
+
+`crates/view_core` (native): reads the scanner's `cameras.json` (schema
+2, with `depth/` and optional `masks/` files beside `images/`) and
+nerfstudio `transforms.json` (OpenGL camera axes converted; `fl_x`..`cy`
+global or per frame; `depth_file_path`; units assumed metres unless
+`depth_unit_m` and `world_unit_m` extensions say otherwise), selects a
+subset (`ids`, `stride`, `near` point + radius, `max`, `eye`, `split`),
+and embeds the chosen files. The 1542-view chair dataset is 2 GB; a
+project carries the twenty to forty views a task needs.
+
+### CLI
+
+- `view-import --manifest <json> [-o set.vviews] [-p project --asset-id
+  views]` with the selection flags and provenance labels.
+- `view-list -i <set | project> [--asset id] [--json]`: cameras, views
+  (id, position, forward, what is embedded), markers, provenance.
+- `render --through <views asset>:<view id> [--overlay blend|edge|side|
+  checker] [--overlay-alpha a]`: the frame through that view's camera,
+  composited with its photograph; the image size defaults to the
+  camera's.
+- `view-residual -i project --views <asset> --model <asset> [--view id]...
+  [--stride n] [--band m] [--json] [-o dir]`: for each view with depth,
+  the model's surface along every valid pixel's ray within `band` of the
+  scan depth, found by marching occupancy and bisecting the transition.
+  Reports coverage (pixels whose ray meets the model near the scan
+  surface), median and p90 absolute residual, mean (bias) and rms, per
+  view and pooled, and writes a residual image per view (blue in front,
+  red behind, grey unmatched).
+
+### GUI
+
+Views panel listing a ViewSet's views with thumbnails, frustum gizmos in
+the viewport, and look-through: the viewport camera takes the view's
+pinhole and the photograph underlays the frame at a chosen opacity.
+Sequenced last in this step; the value, import and CLI land first so the
+acceptance task can start.
 
 ## Step B — solve a still from the cards
 

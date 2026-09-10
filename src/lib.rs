@@ -201,6 +201,9 @@ pub enum AssetTypeHint {
     /// CBOR-encoded affine subspace with an orthonormal chart (explicit
     /// data; never handed to the model executor)
     Subspace,
+    /// CBOR-encoded set of posed images with cameras, depth maps and a
+    /// marker map (explicit data; never handed to the model executor)
+    ViewSet,
 }
 
 impl std::fmt::Display for AssetTypeHint {
@@ -217,6 +220,7 @@ impl std::fmt::Display for AssetTypeHint {
             AssetTypeHint::FeaMesh => write!(f, "FeaMesh"),
             AssetTypeHint::TriMesh => write!(f, "TriMesh"),
             AssetTypeHint::Subspace => write!(f, "Subspace"),
+            AssetTypeHint::ViewSet => write!(f, "ViewSet"),
         }
     }
 }
@@ -231,6 +235,7 @@ impl From<&OperatorMetadataOutput> for AssetTypeHint {
             OperatorMetadataOutput::TriMesh => AssetTypeHint::TriMesh,
             OperatorMetadataOutput::Subspace => AssetTypeHint::Subspace,
             OperatorMetadataOutput::F64Map => AssetTypeHint::F64Map,
+            OperatorMetadataOutput::ViewSet => AssetTypeHint::ViewSet,
         }
     }
 }

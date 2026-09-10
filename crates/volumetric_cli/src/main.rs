@@ -9,6 +9,7 @@
 //! - `sample`: Sample occupancy values at points
 //! - `assets`: List the models and operators bundled into the binary
 //! - `project-*`: Create, validate and manipulate .vproj project files
+//! - `view-*`: Import, list and check posed-image view sets
 //!
 //! Model and operator arguments accept either a filesystem path or the name
 //! of a bundled asset (see `assets`).
@@ -32,6 +33,7 @@ mod info;
 mod project;
 mod raster;
 mod render;
+mod views;
 
 #[derive(Parser, Debug)]
 #[command(name = "volumetric_cli")]
@@ -94,6 +96,15 @@ enum Commands {
     /// Adopt an externally-solved FEA solution bundle into a project
     #[command(name = "fea-import")]
     FeaImport(fea::FeaImportArgs),
+    /// Import a selection of a posed-image dataset (cameras.json or transforms.json) as a view set
+    #[command(name = "view-import")]
+    ViewImport(views::ViewImportArgs),
+    /// Describe a view set: cameras, views, markers, provenance
+    #[command(name = "view-list")]
+    ViewList(views::ViewListArgs),
+    /// Compare a model against the depth maps of a project's view set
+    #[command(name = "view-residual")]
+    ViewResidual(views::ViewResidualArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -562,5 +573,8 @@ fn main() -> Result<()> {
         Commands::ProjectList(args) => project::run_project_list(args),
         Commands::FeaExport(args) => fea::run_fea_export(args),
         Commands::FeaImport(args) => fea::run_fea_import(args),
+        Commands::ViewImport(args) => views::run_view_import(args),
+        Commands::ViewList(args) => views::run_view_list(args),
+        Commands::ViewResidual(args) => views::run_view_residual(args),
     }
 }

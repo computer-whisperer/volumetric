@@ -5922,6 +5922,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
+name = "view_core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "image",
+ "rayon",
+ "serde_json",
+ "volumetric_abi",
+]
+
+[[package]]
 name = "volume_import_operator"
 version = "0.1.0"
 dependencies = [
@@ -5964,6 +5975,7 @@ dependencies = [
  "ciborium",
  "rayon",
  "serde",
+ "serde_bytes",
 ]
 
 [[package]]
@@ -5986,6 +5998,7 @@ dependencies = [
  "image",
  "serde",
  "serde_json",
+ "view_core",
  "volumetric",
  "volumetric_abi",
  "volumetric_assets",

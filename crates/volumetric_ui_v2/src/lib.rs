@@ -6999,6 +6999,7 @@ fn asset_type_label(type_hint: Option<AssetTypeHint>) -> &'static str {
         Some(AssetTypeHint::FeaMesh) => "FEA Mesh",
         Some(AssetTypeHint::TriMesh) => "Tri Mesh",
         Some(AssetTypeHint::Subspace) => "Subspace",
+        Some(AssetTypeHint::ViewSet) => "Views",
         None => "Asset",
     }
 }
@@ -7071,6 +7072,9 @@ fn operator_step_inputs(
                 Some(id) => ExecutionInput::AssetRef(id.to_string()),
                 None => ExecutionInput::Inline(Vec::new()),
             },
+            // View sets are imported assets with no producer yet; the step
+            // editor's picker wires one in.
+            OperatorMetadataInput::ViewSet => ExecutionInput::Inline(Vec::new()),
         })
         .collect()
 }

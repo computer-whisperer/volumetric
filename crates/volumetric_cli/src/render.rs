@@ -15,7 +15,10 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use glam::{Mat4, Vec3, Vec4};
 
+use view_core::image::{Rgb, decode_rgb};
+use view_core::overlay::{Overlay, compose};
 use volumetric::{AssetTypeHint, LoadedAsset, Project};
+use volumetric_abi::viewset::Distortion;
 use volumetric_preview::{
     Asn2Settings, PreviewBounds, PreviewEntity, PreviewMeshPlan, PreviewPlan, PreviewRenderMode,
     PreviewRequest, build_preview_scene, srgb_to_linear, submit_subspace_gizmo, wireframe_style,
@@ -39,11 +42,13 @@ pub struct RenderArgs {
     #[arg(short, long)]
     pub output: PathBuf,
 
-    #[arg(long, default_value_t = 1024)]
-    pub width: u32,
+    /// Image width (default: 1024, or the view's camera with --through)
+    #[arg(long)]
+    pub width: Option<u32>,
 
-    #[arg(long, default_value_t = 1024)]
-    pub height: u32,
+    /// Image height (default: 1024, or the view's camera with --through)
+    #[arg(long)]
+    pub height: Option<u32>,
 
     /// Comma-separated preset views: front, back, left, right, top, bottom,
     /// iso, iso-back, all
@@ -79,6 +84,24 @@ pub struct RenderArgs {
     /// convention: x right, y down, z forward (with --intrinsics)
     #[arg(long, allow_hyphen_values = true)]
     pub pose: Option<String>,
+
+    /// Look through a view of the project's view set: `<view id>` or
+    /// `<views asset>:<view id>`
+    #[arg(long)]
+    pub through: Option<String>,
+
+    /// With --through: composite the render over the photograph as blend,
+    /// edge, side or checker
+    #[arg(long)]
+    pub overlay: Option<String>,
+
+    /// Render opacity for the blend overlay
+    #[arg(long, default_value_t = 0.5)]
+    pub overlay_alpha: f32,
+
+    /// Tile size in pixels for the checker overlay
+    #[arg(long, default_value_t = 64)]
+    pub overlay_tile: u32,
 
     #[arg(long, value_enum, default_value_t = ProjectionArg::Perspective)]
     pub projection: ProjectionArg,
@@ -251,9 +274,47 @@ enum CameraMode {
         pinhole: Pinhole,
         camera_to_world: Mat4,
     },
+    /// A view of the project's view set, resolved to a pinhole once the
+    /// project is loaded.
+    Through {
+        asset: Option<String>,
+        view: String,
+    },
+}
+
+/// The 3x4 rows of a camera-to-world pose as a matrix.
+fn pose_matrix(m: &[f64; 12]) -> Mat4 {
+    let m: Vec<f32> = m.iter().map(|v| *v as f32).collect();
+    Mat4::from_cols(
+        Vec4::new(m[0], m[4], m[8], 0.0),
+        Vec4::new(m[1], m[5], m[9], 0.0),
+        Vec4::new(m[2], m[6], m[10], 0.0),
+        Vec4::new(m[3], m[7], m[11], 1.0),
+    )
 }
 
 fn camera_mode(args: &RenderArgs) -> Result<CameraMode> {
+    if let Some(through) = &args.through {
+        if args.camera_pos.is_some() || args.intrinsics.is_some() || args.pose.is_some() {
+            anyhow::bail!(
+                "--through is a camera of its own; drop --camera-pos, --intrinsics and --pose"
+            );
+        }
+        if args.projection == ProjectionArg::Ortho {
+            anyhow::bail!("a view's camera is perspective; drop --projection ortho");
+        }
+        let (asset, view) = match through.split_once(':') {
+            Some((asset, view)) => (Some(asset.to_string()), view.to_string()),
+            None => (None, through.clone()),
+        };
+        if view.is_empty() {
+            anyhow::bail!("--through needs a view id");
+        }
+        return Ok(CameraMode::Through { asset, view });
+    }
+    if args.overlay.is_some() {
+        anyhow::bail!("--overlay composites over a view's photograph; give --through");
+    }
     match (&args.intrinsics, &args.pose) {
         (Some(intrinsics), Some(pose)) => {
             if args.camera_pos.is_some() {
@@ -271,15 +332,11 @@ fn camera_mode(args: &RenderArgs) -> Result<CameraMode> {
                 fy: k[1],
                 cx: k[2],
                 cy: k[3],
-                width: args.width,
-                height: args.height,
+                width: args.width.unwrap_or(1024),
+                height: args.height.unwrap_or(1024),
             };
-            let camera_to_world = Mat4::from_cols(
-                Vec4::new(m[0], m[4], m[8], 0.0),
-                Vec4::new(m[1], m[5], m[9], 0.0),
-                Vec4::new(m[2], m[6], m[10], 0.0),
-                Vec4::new(m[3], m[7], m[11], 1.0),
-            );
+            let rows: [f64; 12] = std::array::from_fn(|i| f64::from(m[i]));
+            let camera_to_world = pose_matrix(&rows);
             Ok(CameraMode::Pinhole {
                 pinhole,
                 camera_to_world,
@@ -328,11 +385,12 @@ fn clip_planes_for(eye: Vec3, forward: Vec3, min: Vec3, max: Vec3) -> (f32, f32)
 fn frames(
     mode: CameraMode,
     args: &RenderArgs,
+    (width, height): (u32, u32),
     bounds: PreviewBounds,
 ) -> Result<Vec<(Option<&'static str>, CameraView)>> {
     let min = Vec3::from(bounds.min);
     let max = Vec3::from(bounds.max);
-    let aspect = args.width as f32 / args.height as f32;
+    let aspect = width as f32 / height as f32;
     let fov_y = args.fov.to_radians();
     let ortho_height = |default: f32| {
         if args.ortho_scale > 0.0 {
@@ -419,18 +477,25 @@ fn frames(
                 CameraView::pinhole(&pinhole, camera_to_world, near, far),
             )]
         }
+        CameraMode::Through { .. } => {
+            anyhow::bail!("a --through camera must be resolved against the project first")
+        }
     })
 }
 
 /// The renderable exports of the input: a model file as one asset, a
 /// project's exports filtered to the kinds that have a picture and to
-/// `wanted` when given.
-fn load_renderable_assets(input: &Path, wanted: &[String]) -> Result<Vec<LoadedAsset>> {
+/// `wanted` when given, plus a project's imported assets.
+fn load_renderable_assets(
+    input: &Path,
+    wanted: &[String],
+) -> Result<(Vec<LoadedAsset>, Vec<LoadedAsset>)> {
     let extension = input
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
+    let mut imports = Vec::new();
     let assets = match extension.as_str() {
         "wasm" => {
             let bytes = std::fs::read(input).context("Failed to read WASM file")?;
@@ -449,6 +514,7 @@ fn load_renderable_assets(input: &Path, wanted: &[String]) -> Result<Vec<LoadedA
         }
         "vproj" => {
             let project = Project::load_from_file(input).context("Failed to load .vproj file")?;
+            imports = crate::views::imports_of(&project);
             crate::project::run_project_exports(project, None)?
         }
         _ => anyhow::bail!(
@@ -456,7 +522,7 @@ fn load_renderable_assets(input: &Path, wanted: &[String]) -> Result<Vec<LoadedA
             extension
         ),
     };
-    select_assets(assets, wanted)
+    Ok((select_assets(assets, wanted)?, imports))
 }
 
 fn is_renderable(asset: &LoadedAsset) -> bool {
@@ -597,7 +663,7 @@ fn parse_floats(s: &str, count: usize) -> Result<Vec<f32>> {
     Ok(values)
 }
 
-fn parse_vec3(s: &str) -> Result<Vec3> {
+pub(crate) fn parse_vec3(s: &str) -> Result<Vec3> {
     let v = parse_floats(s, 3)?;
     Ok(Vec3::new(v[0], v[1], v[2]))
 }
@@ -632,11 +698,73 @@ fn output_path(base: &Path, suffix: Option<&str>) -> PathBuf {
 pub fn run_render(args: RenderArgs) -> Result<()> {
     let background = parse_hex_color(&args.background).context("Invalid --background")?;
     let mode = camera_mode(&args)?;
-    if args.width == 0 || args.height == 0 {
+    let (assets, imports) = load_renderable_assets(&args.input, &args.assets)?;
+
+    // A view's camera fixes the image size and the projection; explicit
+    // sizes scale its intrinsics so smaller renders stay aligned.
+    let mut photo: Option<Rgb> = None;
+    let mut size = (args.width.unwrap_or(1024), args.height.unwrap_or(1024));
+    let mode = match mode {
+        CameraMode::Through { asset, view } => {
+            let all: Vec<LoadedAsset> = imports.iter().chain(assets.iter()).cloned().collect();
+            let set = crate::views::find_viewset(&all, asset.as_deref())?;
+            let (view, camera) = set.view(&view).with_context(|| {
+                format!(
+                    "no view '{view}' in the view set. Views: {}",
+                    set.views
+                        .iter()
+                        .map(|v| v.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?;
+            if camera.distortion != Distortion::None {
+                eprintln!(
+                    "warning: view {} has lens distortion, which the render ignores; the overlay is approximate",
+                    view.id
+                );
+            }
+            size = (
+                args.width.unwrap_or(camera.width),
+                args.height.unwrap_or(camera.height),
+            );
+            let sx = size.0 as f64 / f64::from(camera.width);
+            let sy = size.1 as f64 / f64::from(camera.height);
+            if args.overlay.is_some() {
+                let bytes = view.image.as_deref().with_context(|| {
+                    format!(
+                        "view {} carries no photograph; import it with images",
+                        view.id
+                    )
+                })?;
+                photo = Some(decode_rgb(bytes)?.resized(size.0, size.1)?);
+            }
+            CameraMode::Pinhole {
+                pinhole: Pinhole {
+                    fx: (camera.fx * sx) as f32,
+                    fy: (camera.fy * sy) as f32,
+                    cx: (camera.cx * sx) as f32,
+                    cy: (camera.cy * sy) as f32,
+                    width: size.0,
+                    height: size.1,
+                },
+                camera_to_world: pose_matrix(&view.camera_to_world),
+            }
+        }
+        other => other,
+    };
+    let overlay = match &args.overlay {
+        Some(name) => Some(
+            Overlay::parse(name, args.overlay_alpha, args.overlay_tile).with_context(|| {
+                format!("unknown overlay '{name}'; expected blend, edge, side or checker")
+            })?,
+        ),
+        None => None,
+    };
+    if size.0 == 0 || size.1 == 0 {
         anyhow::bail!("--width and --height must be positive");
     }
 
-    let assets = load_renderable_assets(&args.input, &args.assets)?;
     let options = PlanOptions {
         resolution: args.resolution,
         sharp: !args.no_sharp,
@@ -671,24 +799,34 @@ pub fn run_render(args: RenderArgs) -> Result<()> {
                 .reduce(PreviewBounds::union)
         })
         .context("nothing to draw")?;
-    let frames = frames(mode, &args, bounds)?;
+    let frames = frames(mode, &args, size, bounds)?;
 
     let offscreen = Offscreen::new().map_err(anyhow::Error::msg)?;
     if !args.quiet {
         eprintln!("GPU: {}", offscreen.adapter_name());
     }
-    let mut renderer = offscreen.renderer(args.width, args.height);
+    let mut renderer = offscreen.renderer(size.0, size.1);
     let resident: Vec<_> = entities
         .iter()
         .map(|entity| renderer.create_retained_scene(offscreen.device(), &entity.scene))
         .collect();
 
+    // An overlay keys the render's geometry off a sentinel background, so
+    // nothing but geometry may touch the frame.
+    const SENTINEL: [f32; 4] = [1.0, 0.0, 1.0, 1.0];
     let mut settings = RenderSettings {
-        background_color: background,
+        background_color: if overlay.is_some() {
+            SENTINEL
+        } else {
+            background
+        },
         ssao_enabled: !args.no_ssao,
         ..RenderSettings::default()
     };
-    if args.grid > 0.0 {
+    if overlay.is_some() {
+        settings.show_axis_indicator = false;
+    }
+    if args.grid > 0.0 && overlay.is_none() {
         let extent = (Vec3::from(bounds.max) - Vec3::from(bounds.min)).length();
         settings.grid.planes = GridPlanes::XZ;
         settings.grid.spacing = args.grid;
@@ -730,10 +868,31 @@ pub fn run_render(args: RenderArgs) -> Result<()> {
             );
         }
         let path = output_path(&args.output, suffix);
-        image::RgbaImage::from_raw(args.width, args.height, rgba)
-            .context("frame size mismatch")?
-            .save(&path)
-            .with_context(|| format!("Failed to write {}", path.display()))?;
+        match (&overlay, &photo) {
+            (Some(overlay), Some(photo)) => {
+                let covered: Vec<bool> = rgba
+                    .chunks_exact(4)
+                    .map(|px| px[0] != 255 || px[1] != 0 || px[2] != 255)
+                    .collect();
+                let render = Rgb {
+                    width: size.0,
+                    height: size.1,
+                    pixels: rgba
+                        .chunks_exact(4)
+                        .flat_map(|px| [px[0], px[1], px[2]])
+                        .collect(),
+                };
+                let composed = compose(photo, &render, &covered, *overlay)?;
+                std::fs::write(&path, composed.to_png()?)
+                    .with_context(|| format!("Failed to write {}", path.display()))?;
+            }
+            _ => {
+                image::RgbaImage::from_raw(size.0, size.1, rgba)
+                    .context("frame size mismatch")?
+                    .save(&path)
+                    .with_context(|| format!("Failed to write {}", path.display()))?;
+            }
+        }
         println!("Wrote {}", path.display());
     }
     Ok(())

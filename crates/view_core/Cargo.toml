@@ -1,0 +1,16 @@
+[package]
+name = "view_core"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Native tooling around the ViewSet value: importing posed-image datasets
+# from their manifests, decoding the images they carry, comparing a model
+# against their depth maps, and compositing renders over photographs.
+
+[dependencies]
+volumetric_abi = { path = "../volumetric_abi" }
+anyhow = "1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+rayon = "1"
+serde_json = "1"

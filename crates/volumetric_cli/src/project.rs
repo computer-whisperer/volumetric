@@ -124,6 +124,8 @@ pub enum AssetTypeArg {
     Config,
     F64Map,
     Blob,
+    /// A view set written by `view-import`.
+    ViewSet,
 }
 
 impl From<AssetTypeArg> for AssetTypeHint {
@@ -134,6 +136,7 @@ impl From<AssetTypeArg> for AssetTypeHint {
             AssetTypeArg::Config => AssetTypeHint::Config,
             AssetTypeArg::F64Map => AssetTypeHint::F64Map,
             AssetTypeArg::Blob => AssetTypeHint::Binary,
+            AssetTypeArg::ViewSet => AssetTypeHint::ViewSet,
         }
     }
 }
@@ -178,10 +181,16 @@ pub fn run_project_add_asset(args: ProjectAddAssetArgs) -> Result<()> {
             "lua" => AssetTypeArg::Lua,
             "wgsl" => AssetTypeArg::Wgsl,
             "cbor" => AssetTypeArg::Config,
+            "vviews" => AssetTypeArg::ViewSet,
             _ => AssetTypeArg::Blob,
         })
         .into();
 
+    if type_hint == AssetTypeHint::ViewSet {
+        volumetric_abi::viewset::decode_viewset(&bytes)
+            .map_err(anyhow::Error::msg)
+            .context("Invalid view set asset")?;
+    }
     if type_hint == AssetTypeHint::F64Map {
         if extension == "json" {
             let json: serde_json::Value = serde_json::from_slice(&bytes)
@@ -309,6 +318,7 @@ pub fn input_type_label(input: &OperatorMetadataInput) -> String {
         OperatorMetadataInput::FeaMesh => "FeaMesh".to_string(),
         OperatorMetadataInput::TriMesh => "TriMesh".to_string(),
         OperatorMetadataInput::Subspace => "Subspace".to_string(),
+        OperatorMetadataInput::ViewSet => "ViewSet".to_string(),
     }
 }
 
@@ -418,6 +428,13 @@ fn coerce_input(
             volumetric_abi::f64_map::decode(&bytes)
                 .map_err(anyhow::Error::msg)
                 .with_context(|| format!("{slot_desc} is not a valid F64Map"))?;
+            inline(bytes)
+        }
+
+        (ParsedInput::Bytes(bytes, _), OperatorMetadataInput::ViewSet) => {
+            volumetric_abi::viewset::decode_viewset(&bytes)
+                .map_err(anyhow::Error::msg)
+                .with_context(|| format!("{slot_desc} is not a valid view set"))?;
             inline(bytes)
         }
 
@@ -701,6 +718,7 @@ pub fn run_project_export(args: ProjectExportArgs) -> Result<()> {
             AssetTypeHint::F64Map | AssetTypeHint::Config => "cbor",
             AssetTypeHint::FeaMesh => "vfea",
             AssetTypeHint::TriMesh => "vmesh",
+            AssetTypeHint::ViewSet => "vviews",
             _ => "bin",
         };
 
