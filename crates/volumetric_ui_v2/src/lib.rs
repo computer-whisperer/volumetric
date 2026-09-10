@@ -5823,6 +5823,11 @@ fn look_through_photo_layer(app: &VolumetricUiV2) -> Option<El> {
         image(photo)
             .image_fit(ImageFit::Contain)
             .fill_size()
+            // An image quad's alpha is its tint's alpha: Damascene folds
+            // the El's opacity into the tint colour and writes an identity
+            // tint when there is none, so an untinted image ignores
+            // `opacity`. White keeps the picture's colours.
+            .image_tint(Color::srgb_u8(255, 255, 255))
             .opacity(f32::from(app.photo_opacity_percent) / 100.0),
     )
 }
@@ -10697,6 +10702,23 @@ mod tests {
         collect_keys(&tree, &mut keys);
         assert!(keys.contains(&EXIT_LOOK_KEY.to_string()));
         assert!(keys.contains(&PHOTO_OPACITY_SELECT_KEY.to_string()));
+        // The photo layer is a full-size image whose opacity travels in a
+        // white tint (Damascene drops an untinted image's opacity).
+        fn photo_layers(el: &El, out: &mut Vec<(f32, bool)>) {
+            if el.image.is_some() && el.width == Size::Fill(1.0) {
+                out.push((el.opacity, el.image_tint.is_some()));
+            }
+            for child in &el.children {
+                photo_layers(child, out);
+            }
+        }
+        let mut layers = Vec::new();
+        photo_layers(&tree, &mut layers);
+        assert_eq!(layers.len(), 1, "one photo layer");
+        assert!(
+            (layers[0].0 - 0.5).abs() < 1e-6 && layers[0].1,
+            "{layers:?}"
+        );
         let bundle = damascene_core::bundle::artifact::render_bundle(
             &mut tree,
             Rect::new(0.0, 0.0, 1280.0, 800.0),
