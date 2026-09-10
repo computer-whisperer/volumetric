@@ -8,7 +8,8 @@
 //! colormapped by a sample channel; 2D models raster to flat quads; FEA
 //! meshes, point clouds and triangle meshes draw their explicit data;
 //! Subspace values draw as gizmos sized by the whole scene
-//! ([`submit_subspace_gizmo`]).
+//! ([`submit_subspace_gizmo`]); ViewSet values draw their cameras as
+//! frustums, and one view can be looked through ([`ViewFrame`]).
 //!
 //! Everything here is window-free and GPU-free until submission, so the
 //! same code builds the viewport's scene, the CLI's PNG, and the tests.
@@ -22,6 +23,7 @@ use volumetric_renderer as renderer;
 
 mod gizmo;
 mod scene;
+mod views;
 
 pub use gizmo::submit_subspace_gizmo;
 pub use scene::{
@@ -29,6 +31,10 @@ pub use scene::{
     build_preview_scene_monitored, build_preview_scene_with, field_channel_to_linear,
     format_error_chain, part_tint, preview_postlude, preview_prelude, srgb_to_linear,
     wireframe_style,
+};
+pub use views::{
+    FRUSTUM_DEPTH_M, LookThrough, ViewFrame, clip_planes_for, frustum_segments, highlight_lines,
+    pose_matrix, submit_view_highlight, viewset_detail,
 };
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -312,6 +318,8 @@ pub enum PreviewPlan {
     },
     TriMesh,
     Subspace,
+    /// Every view's frustum and every marker's square.
+    ViewSet,
 }
 
 impl PreviewPlan {
@@ -338,6 +346,7 @@ impl PreviewPlan {
             },
             Self::TriMesh => "Triangle mesh".to_string(),
             Self::Subspace => "Subspace".to_string(),
+            Self::ViewSet => "Views".to_string(),
         }
     }
 }

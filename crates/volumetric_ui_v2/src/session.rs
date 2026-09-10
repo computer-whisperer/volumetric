@@ -19,9 +19,10 @@ use glam::{Mat4, Vec2, Vec3};
 use volumetric_renderer as renderer;
 
 pub use volumetric_preview::{
-    ExecutionBackend, LocalBackend, PendingMesh, PreviewBounds, PreviewEntity, PreviewStage,
-    build_preview_scene, build_preview_scene_cancellable, build_preview_scene_monitored,
-    build_preview_scene_with, preview_postlude, preview_prelude, submit_subspace_gizmo,
+    ExecutionBackend, LocalBackend, LookThrough, PendingMesh, PreviewBounds, PreviewEntity,
+    PreviewStage, ViewFrame, build_preview_scene, build_preview_scene_cancellable,
+    build_preview_scene_monitored, build_preview_scene_with, preview_postlude, preview_prelude,
+    submit_subspace_gizmo, submit_view_highlight,
 };
 use volumetric_preview::{format_error_chain, wireframe_style};
 
@@ -222,6 +223,10 @@ impl Session {
         scale_factor: f32,
     ) -> Vec<BackgroundJob> {
         let mut jobs = Vec::new();
+
+        if self.viewport.take_look_through_left() {
+            app.exit_look_through();
+        }
 
         if app.take_pending_run() {
             self.run_generation += 1;
@@ -558,6 +563,12 @@ struct ViewportRenderer {
     framed_ids: Option<Vec<String>>,
     pending_frame_preview: bool,
     camera: Option<renderer::Camera>,
+    /// The frame of the view looked through in the last frame, so leaving
+    /// look-through can seed the orbit camera from it.
+    look_through: Option<ViewFrame>,
+    /// Camera input arrived during look-through: the viewport has already
+    /// moved to the orbit camera, and the app must follow (`sync` tells it).
+    look_through_left: bool,
     /// The viewport rect's logical size as of the last render, so camera
     /// gestures (whose deltas arrive in logical pixels) can map drag
     /// distance to world units 1:1.
@@ -583,6 +594,9 @@ pub struct ViewportRenderParams<'a> {
     pub scale_factor: f32,
     pub clear_color: wgpu::Color,
     pub preview_requests: Vec<PreviewRequest>,
+    /// The view being looked through, when the app is in look-through: the
+    /// frame replaces the orbit camera and its frustum is highlighted.
+    pub look_through: Option<LookThrough>,
 }
 
 impl ViewportRenderer {
@@ -602,6 +616,8 @@ impl ViewportRenderer {
             framed_ids: None,
             pending_frame_preview: false,
             camera: None,
+            look_through: None,
+            look_through_left: false,
             viewport_logical_size: Vec2::ZERO,
         }
     }
@@ -638,6 +654,7 @@ impl ViewportRenderer {
             scale_factor,
             clear_color,
             preview_requests,
+            look_through,
         } = params;
 
         let Some(rect) = logical_rect else {
@@ -650,23 +667,65 @@ impl ViewportRenderer {
 
         self.renderer.set_viewport_size(device, w, h);
         self.submit_scene(device, &preview_requests);
+        let view = match &look_through {
+            Some(look) => {
+                submit_view_highlight(&mut self.renderer, &look.frustum);
+                self.look_through = Some(look.frame);
+                let bounds = self.scene_bounds.unwrap_or(PreviewBounds {
+                    min: (-1.0, -1.0, -1.0),
+                    max: (1.0, 1.0, 1.0),
+                });
+                look.frame.camera_view(w, h, bounds)
+            }
+            None => {
+                if let Some(frame) = self.look_through.take() {
+                    self.continue_from(frame);
+                }
+                let camera = self
+                    .camera
+                    .get_or_insert_with(renderer::test_scenes::create_test_camera);
+                camera.fit_clip_planes();
+                renderer::CameraView::from_camera(camera, w as f32 / h.max(1) as f32)
+            }
+        };
+
+        let settings = render_settings(preview_requests.first(), clear_color);
+        self.renderer
+            .render_view(device, queue, encoder, &view, &settings, &self.target.view);
+        self.renderer.end_frame();
+        target_resized
+    }
+
+    /// Seeds the orbit camera from a looked-through view: the same eye,
+    /// looking down the optical axis at the scene centre's depth (or a
+    /// scene-sized distance when the centre is behind the camera).
+    fn continue_from(&mut self, frame: ViewFrame) {
+        let eye = frame.eye();
+        let forward = frame.forward();
+        let distance = match self.scene_bounds {
+            Some(bounds) => {
+                let centre = (bounds.min_vec3() + bounds.max_vec3()) * 0.5;
+                let diagonal = (bounds.max_vec3() - bounds.min_vec3()).length();
+                let depth = (centre - eye).dot(forward);
+                if depth > diagonal * 0.05 {
+                    depth
+                } else {
+                    diagonal.max(0.1)
+                }
+            }
+            None => 1.0,
+        };
         let camera = self
             .camera
             .get_or_insert_with(renderer::test_scenes::create_test_camera);
+        camera.look_from(eye, eye + forward * distance);
         camera.fit_clip_planes();
-        let camera = camera.clone();
+    }
 
-        let settings = render_settings(preview_requests.first(), clear_color);
-        self.renderer.render(
-            device,
-            queue,
-            encoder,
-            &camera,
-            &settings,
-            &self.target.view,
-        );
-        self.renderer.end_frame();
-        target_resized
+    /// Whether camera input has moved the viewport off a looked-through
+    /// view since the last call; the app leaves look-through in step.
+    fn take_look_through_left(&mut self) -> bool {
+        std::mem::take(&mut self.look_through_left)
     }
 
     fn apply_camera_input(
@@ -674,6 +733,12 @@ impl ViewportRenderer {
         input: &renderer::CameraInputState,
         scheme: renderer::CameraControlScheme,
     ) -> bool {
+        // Orbiting, panning or zooming a photograph's viewpoint leaves it:
+        // the orbit camera takes over from the view's pose.
+        if let Some(frame) = self.look_through.take() {
+            self.continue_from(frame);
+            self.look_through_left = true;
+        }
         let Some(camera) = &mut self.camera else {
             return false;
         };
@@ -714,6 +779,7 @@ impl ViewportRenderer {
             crate::ViewportCameraCommand::FramePreview => self.frame_preview(),
             crate::ViewportCameraCommand::Reset => {
                 self.camera = Some(renderer::test_scenes::create_test_camera());
+                self.look_through = None;
                 self.pending_frame_preview = false;
             }
         }

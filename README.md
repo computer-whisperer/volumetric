@@ -212,7 +212,7 @@ volumetric_cli render -i <model.wasm | project.vproj> -o <output.png>
 ```
 
 **Scene:**
-- `--asset <id>` - Draw only this export (repeatable; default: every renderable export)
+- `--asset <id>` - Draw only this asset (repeatable; default: every renderable export; an import such as a view set draws only when named)
 - `--resolution <N>` - Meshing resolution for models and raster size for sketches (default: 128)
 - `--no-sharp`, `--no-simplify` - Mesh without sharp-feature reconstruction or decimation
 - `--color-channel <name>` - Colormap models by a declared sample channel
@@ -278,6 +278,17 @@ Selection flags: `--id` (repeatable), `--stride`, `--near x,y,z --radius r`,
 `--no-depth`, `--no-masks`; provenance labels `--session`, `--rig`,
 `--field`, `--setup`. `project-add-asset --type viewset` adds a `.vviews`
 file to a project.
+
+A view set in the viewport draws every view's frustum (0.1 m deep, with a
+tick marking the picture's up) and the marker squares, and the project
+panel's Views section lists the views with thumbnails, tags and depth or
+mask marks. The eye button looks through a view: the viewport takes the
+view's camera, letterboxed to its aspect, with the photograph over the
+frame at a chosen opacity (0–100%) and that frustum highlighted. Orbiting,
+panning or zooming leaves the view and continues from its viewpoint; Reset
+or the Leave button leaves it too. Headlessly, `render --asset views` draws
+the same frustums beside whichever exports are named (imports draw only
+when asked for by id).
 
 #### Project Commands
 

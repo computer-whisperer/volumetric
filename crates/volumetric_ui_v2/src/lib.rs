@@ -8,15 +8,16 @@ use std::sync::{Arc, LazyLock};
 use volumetric::operator_config::{ConfigField, ConfigFieldType, ConfigValue};
 use volumetric::{
     AssetTypeHint, ExecutionInput, LoadedAsset, OperatorMetadata, OperatorMetadataInput, Project,
-    operator_config,
+    operator_config, viewset,
 };
 pub use volumetric_preview::{
-    Asn2Settings, BoundsCorners, OutputStats, PreviewMeshPlan, PreviewPlan, PreviewRenderMode,
-    PreviewRequest, format_count,
+    Asn2Settings, BoundsCorners, LookThrough, OutputStats, PreviewMeshPlan, PreviewPlan,
+    PreviewRenderMode, PreviewRequest, format_count, viewset_detail,
 };
 use volumetric_renderer::CameraControlScheme;
 
 use damascene_core::SvgIcon;
+use damascene_core::image::Image;
 use damascene_core::prelude::*;
 // The scene mesh lives in damascene's pinned glam (a different major than
 // this crate's own `glam` dep) — build its types through `scene::glam`.
@@ -170,6 +171,17 @@ pub const TOGGLE_TINT_KEY: &str = "viewport:toggle-tint";
 pub const TOGGLE_SSAO_KEY: &str = "viewport:toggle-ssao";
 pub const FRAME_PREVIEW_KEY: &str = "viewport:frame-preview";
 pub const RESET_CAMERA_KEY: &str = "viewport:reset-camera";
+pub const EXIT_LOOK_KEY: &str = "viewport:exit-look";
+/// `{prefix}{asset id}:{view id}`: look through a view, or leave it when it
+/// is the one looked through. View ids carry no `:`; asset ids may.
+const LOOK_THROUGH_PREFIX: &str = "views:look:";
+const PHOTO_OPACITY_SELECT_KEY: &str = "views:opacity";
+/// Photograph opacity choices while looking through a view, percent.
+const PHOTO_OPACITIES: [u8; 5] = [0, 25, 50, 75, 100];
+/// Thumbnails decoded per panel build; the rest wait a frame.
+const VIEW_THUMBNAILS_PER_BUILD: usize = 2;
+/// Longest side of a view thumbnail, pixels.
+const VIEW_THUMBNAIL_PX: u32 = 96;
 
 /// Top application menubar; the only menu value is `file`.
 const MENUBAR_KEY: &str = "main-menu";
@@ -649,6 +661,16 @@ pub struct ProjectSummary {
     pub last_run_stale: bool,
     pub run_state: RunState,
     pub auto_rebuild: bool,
+    /// The view looked through, when the viewport is in look-through.
+    pub look_through: Option<String>,
+}
+
+/// The view the viewport looks through: its camera replaces the orbit
+/// camera and its photograph overlays the frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LookThroughState {
+    pub asset_id: String,
+    pub view_id: String,
 }
 
 /// Editing state for the selected operator step's config input: the parsed
@@ -854,6 +876,8 @@ pub enum OutputKind {
     TriMesh,
     /// An affine subspace value: point/line/plane gizmo.
     Subspace,
+    /// A view set: camera frustums and marker squares.
+    ViewSet,
 }
 
 /// FEA-specific view settings.
@@ -911,6 +935,8 @@ pub enum OutputRender {
     /// Subspace gizmos have no settings yet; the extent adapts to the
     /// scene.
     Subspace,
+    /// View sets draw their frustums at a fixed size; no settings yet.
+    ViewSet,
 }
 
 impl OutputRender {
@@ -921,6 +947,7 @@ impl OutputRender {
             Self::FeaMesh(_) => OutputKind::FeaMesh,
             Self::TriMesh { .. } => OutputKind::TriMesh,
             Self::Subspace => OutputKind::Subspace,
+            Self::ViewSet => OutputKind::ViewSet,
         }
     }
 
@@ -953,6 +980,7 @@ impl OutputRender {
             },
             Self::TriMesh { .. } => "triangle mesh".to_string(),
             Self::Subspace => "subspace".to_string(),
+            Self::ViewSet => "views".to_string(),
         }
     }
 
@@ -961,7 +989,7 @@ impl OutputRender {
         match self {
             Self::Model3d { wireframe, .. } | Self::TriMesh { wireframe } => *wireframe,
             Self::FeaMesh(fea) => fea.wireframe,
-            Self::Model2d { .. } | Self::Subspace => false,
+            Self::Model2d { .. } | Self::Subspace | Self::ViewSet => false,
         }
     }
 }
@@ -1053,6 +1081,23 @@ pub struct VolumetricUiV2 {
     preview_build_status: PreviewBuildStatus,
     pending_camera_command: Option<ViewportCameraCommand>,
     viewport_texture: Option<AppTexture>,
+    /// The view being looked through: the viewport takes its camera and
+    /// shows its photograph.
+    look_through: Option<LookThroughState>,
+    /// Photograph opacity over the viewport while looking through, percent.
+    photo_opacity_percent: u8,
+    /// Decoded view sets by content hash: decoding pulls megabytes of
+    /// pictures through CBOR, so once per asset, not per frame.
+    viewset_cache: std::cell::RefCell<std::collections::HashMap<[u8; 32], Arc<viewset::ViewSet>>>,
+    /// View thumbnails by (content hash, view id); `None` marks a picture
+    /// that did not decode, so it is not retried.
+    view_thumbnails:
+        std::cell::RefCell<std::collections::HashMap<([u8; 32], String), Option<Image>>>,
+    /// The looked-through view's full photograph, decoded once per view.
+    look_photo: std::cell::RefCell<Option<(([u8; 32], String), Option<Image>)>>,
+    /// A panel build left thumbnails undecoded for lack of budget; the
+    /// shell schedules another frame.
+    view_thumbnails_pending: std::cell::Cell<bool>,
     /// Global text selection/focus for controlled text inputs (config fields).
     selection: Selection,
     /// Editor state (model slots + config form) for the selected step, if any.
@@ -1190,6 +1235,12 @@ impl VolumetricUiV2 {
             artifact_thumbnails: std::collections::HashMap::new(),
             artifact_thumbnail_order: std::collections::VecDeque::new(),
             viewport_overflow: None,
+            look_through: None,
+            photo_opacity_percent: 50,
+            viewset_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            view_thumbnails: std::cell::RefCell::new(std::collections::HashMap::new()),
+            look_photo: std::cell::RefCell::new(None),
+            view_thumbnails_pending: std::cell::Cell::new(false),
             lightbox: None,
             export_dialog: None,
             pending_file_action: None,
@@ -1317,6 +1368,138 @@ impl VolumetricUiV2 {
         }
     }
 
+    /// The decoded view set of a runtime asset, cached by content hash.
+    fn viewset_of(&self, asset: &LoadedAsset) -> Option<Arc<viewset::ViewSet>> {
+        if asset.type_hint() != Some(AssetTypeHint::ViewSet) {
+            return None;
+        }
+        let hash = asset.content_hash();
+        if let Some(set) = self.viewset_cache.borrow().get(&hash) {
+            return Some(set.clone());
+        }
+        let set = Arc::new(viewset::decode_viewset(asset.data()).ok()?);
+        self.viewset_cache.borrow_mut().insert(hash, set.clone());
+        Some(set)
+    }
+
+    /// The view set the Views section lists: the looked-through one, else
+    /// the selected one, else the first pinned one.
+    fn active_viewset(&self) -> Option<(&LoadedAsset, Arc<viewset::ViewSet>)> {
+        let mut candidates: Vec<&str> = Vec::new();
+        if let Some(look) = &self.look_through {
+            candidates.push(&look.asset_id);
+        }
+        if let Some(id) = self.selected_render_id() {
+            candidates.push(id);
+        }
+        candidates.extend(self.pinned_outputs.iter().map(String::as_str));
+        candidates.into_iter().find_map(|id| {
+            let asset = self.runtime_assets.iter().find(|asset| asset.id() == id)?;
+            let set = self.viewset_of(asset)?;
+            Some((asset, set))
+        })
+    }
+
+    /// Looks through a view, or leaves it when it is the one looked
+    /// through. Unknown views are refused with a status line.
+    fn toggle_look_through(&mut self, asset_id: &str, view_id: &str) {
+        let same = self
+            .look_through
+            .as_ref()
+            .is_some_and(|look| look.asset_id == asset_id && look.view_id == view_id);
+        if same {
+            self.exit_look_through();
+            return;
+        }
+        let known = self
+            .runtime_assets
+            .iter()
+            .find(|asset| asset.id() == asset_id)
+            .and_then(|asset| self.viewset_of(asset))
+            .is_some_and(|set| set.view(view_id).is_some());
+        if !known {
+            self.status = format!("no view {view_id} in {asset_id}");
+            return;
+        }
+        self.look_through = Some(LookThroughState {
+            asset_id: asset_id.to_string(),
+            view_id: view_id.to_string(),
+        });
+        self.status = format!("looking through {view_id}");
+    }
+
+    /// Leaves look-through; the viewport continues from the view's pose.
+    pub(crate) fn exit_look_through(&mut self) {
+        if self.look_through.take().is_some() {
+            self.status = "left the photograph's viewpoint".to_string();
+        }
+    }
+
+    /// What the viewport renders through while looking through a view:
+    /// its frame and the frustum to highlight. `None` off look-through or
+    /// when the view is gone.
+    pub fn look_through_frame(&self) -> Option<LookThrough> {
+        let look = self.look_through.as_ref()?;
+        let asset = self
+            .runtime_assets
+            .iter()
+            .find(|asset| asset.id() == look.asset_id)?;
+        let set = self.viewset_of(asset)?;
+        let (view, camera) = set.view(&look.view_id)?;
+        Some(LookThrough::of(view, camera))
+    }
+
+    /// The looked-through view's photograph, decoded once per view.
+    fn look_photo(&self) -> Option<Image> {
+        let look = self.look_through.as_ref()?;
+        let asset = self
+            .runtime_assets
+            .iter()
+            .find(|asset| asset.id() == look.asset_id)?;
+        let key = (asset.content_hash(), look.view_id.clone());
+        if let Some((cached, image)) = &*self.look_photo.borrow()
+            && *cached == key
+        {
+            return image.clone();
+        }
+        let set = self.viewset_of(asset)?;
+        let (view, _) = set.view(&look.view_id)?;
+        let image = view
+            .image
+            .as_deref()
+            .and_then(|bytes| decode_image(bytes, None));
+        *self.look_photo.borrow_mut() = Some((key, image.clone()));
+        image
+    }
+
+    /// A view's thumbnail, decoded on demand within a per-build `budget`;
+    /// `None` while it waits its turn or when the picture does not decode.
+    fn view_thumbnail(
+        &self,
+        hash: [u8; 32],
+        view: &viewset::View,
+        budget: &mut usize,
+    ) -> Option<Image> {
+        let key = (hash, view.id.clone());
+        if let Some(entry) = self.view_thumbnails.borrow().get(&key) {
+            return entry.clone();
+        }
+        let bytes = view.image.as_deref()?;
+        if *budget == 0 {
+            self.view_thumbnails_pending.set(true);
+            return None;
+        }
+        *budget -= 1;
+        let image = decode_image(bytes, Some(VIEW_THUMBNAIL_PX));
+        self.view_thumbnails.borrow_mut().insert(key, image.clone());
+        image
+    }
+
+    /// Whether the last panel build left thumbnails to decode.
+    pub fn has_pending_view_thumbnails(&self) -> bool {
+        self.view_thumbnails_pending.get()
+    }
+
     /// Whether an output is currently drawn in the viewport (pinned, or the
     /// resolvable selection).
     fn output_is_visible(&self, id: &str) -> bool {
@@ -1336,6 +1519,7 @@ impl VolumetricUiV2 {
             Some(AssetTypeHint::FeaMesh) => OutputKind::FeaMesh,
             Some(AssetTypeHint::TriMesh) => OutputKind::TriMesh,
             Some(AssetTypeHint::Subspace) => OutputKind::Subspace,
+            Some(AssetTypeHint::ViewSet) => OutputKind::ViewSet,
             _ => {
                 let data = asset.data_arc();
                 let key = (Arc::as_ptr(&data) as usize, data.len());
@@ -1375,6 +1559,7 @@ impl VolumetricUiV2 {
             OutputKind::FeaMesh => OutputRender::FeaMesh(FeaRender::default()),
             OutputKind::TriMesh => OutputRender::TriMesh { wireframe: false },
             OutputKind::Subspace => OutputRender::Subspace,
+            OutputKind::ViewSet => OutputRender::ViewSet,
         }
     }
 
@@ -1476,7 +1661,9 @@ impl VolumetricUiV2 {
                 wireframe
             }
             OutputRender::FeaMesh(fea) => &mut fea.wireframe,
-            OutputRender::Model2d { .. } | OutputRender::Subspace => return,
+            OutputRender::Model2d { .. } | OutputRender::Subspace | OutputRender::ViewSet => {
+                return;
+            }
         };
         *slot = !*slot;
         let state = if *slot { "on" } else { "off" };
@@ -1779,6 +1966,7 @@ impl VolumetricUiV2 {
                     | AssetTypeHint::FeaMesh
                     | AssetTypeHint::TriMesh
                     | AssetTypeHint::Subspace
+                    | AssetTypeHint::ViewSet
             ) | None
         ) {
             return None;
@@ -1811,6 +1999,7 @@ impl VolumetricUiV2 {
             },
             OutputRender::TriMesh { .. } => PreviewPlan::TriMesh,
             OutputRender::Subspace => PreviewPlan::Subspace,
+            OutputRender::ViewSet => PreviewPlan::ViewSet,
         };
         Some(PreviewRequest {
             asset_id: asset.id().to_string(),
@@ -2136,6 +2325,25 @@ impl VolumetricUiV2 {
                     .collect();
                 self.pinned_outputs.retain(|id| live.contains(id));
                 self.output_overrides.retain(|id, _| live.contains(id));
+                if self
+                    .look_through
+                    .as_ref()
+                    .is_some_and(|look| !live.contains(&look.asset_id))
+                {
+                    self.look_through = None;
+                }
+                let live_hashes: std::collections::HashSet<[u8; 32]> = self
+                    .runtime_assets
+                    .iter()
+                    .filter(|asset| asset.type_hint() == Some(AssetTypeHint::ViewSet))
+                    .map(|asset| asset.content_hash())
+                    .collect();
+                self.viewset_cache
+                    .borrow_mut()
+                    .retain(|hash, _| live_hashes.contains(hash));
+                self.view_thumbnails
+                    .borrow_mut()
+                    .retain(|(hash, _), _| live_hashes.contains(hash));
 
                 // Make sure the viewport shows something: if the selection points
                 // at nothing materialized, follow the primary export.
@@ -2206,6 +2414,7 @@ impl VolumetricUiV2 {
             last_run_stale: self.last_run_stale,
             run_state: self.run_state,
             auto_rebuild: self.auto_rebuild,
+            look_through: self.look_through.as_ref().map(|look| look.view_id.clone()),
         }
     }
 
@@ -3598,6 +3807,7 @@ impl VolumetricUiV2 {
             MODE_SELECT_KEY,
             RESOLUTION_SELECT_KEY,
             CAMERA_SELECT_KEY,
+            PHOTO_OPACITY_SELECT_KEY,
             // Not value pickers (controls live inside), but the trigger and
             // dismiss-scrim routes follow the same shape; Pick never fires.
             SSAO_SETTINGS_KEY,
@@ -3634,6 +3844,13 @@ impl VolumetricUiV2 {
                         CAMERA_SELECT_KEY => {
                             if let Some(scheme) = camera_control_scheme_from_route(&value) {
                                 self.set_camera_control_scheme(scheme);
+                            }
+                        }
+                        PHOTO_OPACITY_SELECT_KEY => {
+                            if let Ok(percent) = value.parse::<u8>() {
+                                self.photo_opacity_percent = percent.min(100);
+                                self.status =
+                                    format!("photograph at {}%", self.photo_opacity_percent);
                             }
                         }
                         _ => unreachable!(),
@@ -4101,7 +4318,13 @@ impl App for VolumetricUiV2 {
 
         if event.is_click_or_activate(RESET_CAMERA_KEY) {
             self.pending_camera_command = Some(ViewportCameraCommand::Reset);
+            self.exit_look_through();
             self.status = "camera reset".to_string();
+            return;
+        }
+
+        if event.is_click_or_activate(EXIT_LOOK_KEY) {
+            self.exit_look_through();
             return;
         }
 
@@ -4183,6 +4406,10 @@ impl App for VolumetricUiV2 {
             self.selected_export = Some(asset_id.to_string());
             self.selected_project_item = self.project_selection_for_asset(asset_id);
             self.status = format!("selected runtime asset {asset_id}");
+        } else if let Some(rest) = route.strip_prefix(LOOK_THROUGH_PREFIX) {
+            if let Some((asset_id, view_id)) = rest.rsplit_once(':') {
+                self.toggle_look_through(asset_id, view_id);
+            }
         } else if let Some(asset_id) = route.strip_prefix(TOGGLE_PIN_PREFIX) {
             self.toggle_pin(asset_id);
         } else if let Some(rest) = route.strip_prefix(OUTPUT_SETTINGS_PREFIX) {
@@ -4727,6 +4954,12 @@ fn select_layer(app: &VolumetricUiV2) -> Option<El> {
                 )
             }),
         )),
+        PHOTO_OPACITY_SELECT_KEY => Some(select_menu(
+            PHOTO_OPACITY_SELECT_KEY,
+            PHOTO_OPACITIES
+                .into_iter()
+                .map(|percent| (percent.to_string(), format!("{percent}% photograph"))),
+        )),
         SSAO_SETTINGS_KEY => Some(ssao_settings_popover(app)),
         REMOTE_SETTINGS_KEY => Some(remote_settings_popover(app)),
         CACHE_SETTINGS_KEY => Some(cache_settings_popover(app)),
@@ -5204,6 +5437,9 @@ fn output_settings_popover(app: &VolumetricUiV2, id: &str) -> El {
         OutputRender::Subspace => {
             body.push(text("Subspace gizmo · no settings yet").caption().muted());
         }
+        OutputRender::ViewSet => {
+            body.push(text("Camera frustums · no settings yet").caption().muted());
+        }
     }
     if let Some(stats) = app.output_stats.get(id) {
         body.push(divider());
@@ -5569,9 +5805,26 @@ fn asn2_stepper_row(id: &str, field: &str, label: &str, value: &str) -> El {
 /// corner, a status HUD along the bottom. Only keyed controls hit-test, so
 /// camera input passes through everywhere else.
 fn viewport_pane(app: &VolumetricUiV2) -> El {
-    stack([viewport_placeholder(app), viewport_overlay(app)])
-        .width(Size::Fill(1.0))
-        .height(Size::Fill(1.0))
+    let mut layers = vec![viewport_placeholder(app)];
+    layers.extend(look_through_photo_layer(app));
+    layers.push(viewport_overlay(app));
+    stack(layers).width(Size::Fill(1.0)).height(Size::Fill(1.0))
+}
+
+/// The looked-through view's photograph over the viewport, in the same
+/// letterbox the render uses (a `Contain` fit), at the chosen opacity.
+/// Unkeyed, so pointer input still reaches the camera.
+fn look_through_photo_layer(app: &VolumetricUiV2) -> Option<El> {
+    if app.photo_opacity_percent == 0 {
+        return None;
+    }
+    let photo = app.look_photo()?;
+    Some(
+        image(photo)
+            .image_fit(ImageFit::Contain)
+            .fill_size()
+            .opacity(f32::from(app.photo_opacity_percent) / 100.0),
+    )
 }
 
 fn viewport_overlay(app: &VolumetricUiV2) -> El {
@@ -5594,7 +5847,7 @@ fn view_controls_cluster(app: &VolumetricUiV2) -> El {
             button.secondary()
         }
     };
-    card([row([
+    let mut controls = vec![
         toggle("Grid", app.show_grid, TOGGLE_GRID_KEY),
         toggle("Bounds", app.show_bounds, TOGGLE_BOUNDS_KEY),
         toggle("Tint", app.tint_parts, TOGGLE_TINT_KEY),
@@ -5604,6 +5857,26 @@ fn view_controls_cluster(app: &VolumetricUiV2) -> El {
             .xsmall()
             .tooltip("SSAO settings")
             .key(SSAO_SETTINGS_KEY),
+    ];
+    if let Some(look) = &app.look_through {
+        controls.push(vertical_separator().height(Size::Fixed(20.0)));
+        controls.push(
+            button(format!("Leave {}", look.view_id))
+                .xsmall()
+                .primary()
+                .tooltip("Leave the photograph's viewpoint (orbiting also leaves it)")
+                .key(EXIT_LOOK_KEY),
+        );
+        controls.push(
+            select_trigger(
+                PHOTO_OPACITY_SELECT_KEY,
+                format!("{}% photo", app.photo_opacity_percent),
+            )
+            .width(Size::Fixed(96.0)),
+        );
+        controls.push(vertical_separator().height(Size::Fixed(20.0)));
+    }
+    controls.extend([
         button("Frame")
             .xsmall()
             .secondary()
@@ -5626,13 +5899,12 @@ fn view_controls_cluster(app: &VolumetricUiV2) -> El {
             camera_scheme_short_label(app.camera_control_scheme),
         )
         .width(Size::Fixed(104.0)),
-    ])
-    .gap(tokens::SPACE_1)
-    .align(Align::Center)])
-    .padding(tokens::SPACE_1)
-    // Hug, not the card's default Fill: anything wider is a click-eating
-    // band over the viewport (keyed controls win the stack hit-test).
-    .width(Size::Hug)
+    ]);
+    card([row(controls).gap(tokens::SPACE_1).align(Align::Center)])
+        .padding(tokens::SPACE_1)
+        // Hug, not the card's default Fill: anything wider is a click-eating
+        // band over the viewport (keyed controls win the stack hit-test).
+        .width(Size::Hug)
 }
 
 /// One-line readout at the bottom of the viewport. Unkeyed, so it never
@@ -5891,22 +6163,119 @@ fn viewport_placeholder(app: &VolumetricUiV2) -> El {
 /// The single project panel: pipeline spine (imports → steps → exports),
 /// materialized outputs, and the inspector for the current selection.
 fn project_panel(app: &VolumetricUiV2) -> El {
-    column([scroll([
+    let mut sections = vec![
         pipeline_accordion(app),
         divider(),
         panel_section("Artifacts", outputs_rows(app)),
         divider(),
-        panel_section("Inspector", inspector_rows(app)),
-    ])
-    .key("project-panel-scroll")
-    .gap(tokens::SPACE_3)
-    // Gutter so keyboard focus rings on full-width rows aren't clipped
-    // by the scroll's horizontal scissor.
-    .px(tokens::RING_WIDTH)])
+    ];
+    if let Some(views) = views_section(app) {
+        sections.push(views);
+        sections.push(divider());
+    }
+    sections.push(panel_section("Inspector", inspector_rows(app)));
+    column([scroll(sections)
+        .key("project-panel-scroll")
+        .gap(tokens::SPACE_3)
+        // Gutter so keyboard focus rings on full-width rows aren't clipped
+        // by the scroll's horizontal scissor, and a reserved thumb gutter so
+        // the scrollbar never sits on a row's right-hand control.
+        .px(tokens::RING_WIDTH)
+        .scrollbar_gutter()])
     .width(Size::Fixed(app.panel_width))
     .height(Size::Fill(1.0))
     .padding(tokens::SPACE_3)
     .gap(tokens::SPACE_2)
+}
+
+/// The Views section: the active view set's counts and provenance, then a
+/// row per view with its thumbnail, tags and a Look button. Absent when no
+/// view set is in the viewport.
+fn views_section(app: &VolumetricUiV2) -> Option<El> {
+    app.view_thumbnails_pending.set(false);
+    let (asset, set) = app.active_viewset()?;
+    let hash = asset.content_hash();
+    let mut rows: Vec<El> = viewset_detail(&set)
+        .into_iter()
+        .map(|line| text(line).muted().caption())
+        .collect();
+    let mut budget = VIEW_THUMBNAILS_PER_BUILD;
+    for view in &set.views {
+        rows.push(view_row(app, asset.id(), hash, view, &mut budget));
+    }
+    Some(panel_section(&format!("Views · {}", asset.id()), rows))
+}
+
+fn view_row(
+    app: &VolumetricUiV2,
+    asset_id: &str,
+    hash: [u8; 32],
+    view: &viewset::View,
+    budget: &mut usize,
+) -> El {
+    let looking = app
+        .look_through
+        .as_ref()
+        .is_some_and(|look| look.asset_id == asset_id && look.view_id == view.id);
+    let thumbnail = match app.view_thumbnail(hash, view, budget) {
+        Some(picture) => image(picture)
+            .image_fit(ImageFit::Contain)
+            .width(Size::Fixed(48.0))
+            .height(Size::Fixed(36.0))
+            .clip(),
+        None => spacer().width(Size::Fixed(48.0)).height(Size::Fixed(36.0)),
+    };
+    let mut marks: Vec<El> = view
+        .tags
+        .iter()
+        .filter(|tag| !tag.starts_with("frame:"))
+        .map(|tag| badge(tag.clone()).muted().xsmall())
+        .collect();
+    if view.depth.is_some() {
+        marks.push(badge("depth").xsmall());
+    }
+    if view.mask.is_some() {
+        marks.push(badge("mask").xsmall());
+    }
+    let look = icon_button(&*EYE_ICON)
+        .xsmall()
+        .tooltip(if looking {
+            "Leave this view"
+        } else {
+            "Look through this view"
+        })
+        .key(format!("{LOOK_THROUGH_PREFIX}{asset_id}:{}", view.id));
+    let look = if looking {
+        look.primary()
+    } else {
+        look.ghost()
+    };
+    row([
+        thumbnail,
+        column([
+            text(view.id.clone()).small().semibold().ellipsis(),
+            row(marks).gap(tokens::SPACE_1),
+        ])
+        .gap(tokens::SPACE_1)
+        .width(Size::Fill(1.0)),
+        look,
+    ])
+    .gap(tokens::SPACE_2)
+    .align(Align::Center)
+    .width(Size::Fill(1.0))
+}
+
+/// Decodes an embedded JPEG or PNG for display, downscaled so its longer
+/// side is at most `max_px` when given.
+fn decode_image(bytes: &[u8], max_px: Option<u32>) -> Option<Image> {
+    let decoded = ::image::load_from_memory(bytes).ok()?;
+    let decoded = match max_px {
+        Some(px) => decoded.thumbnail(px, px),
+        None => decoded,
+    };
+    let rgb = decoded.to_rgb8();
+    let (width, height) = rgb.dimensions();
+    Some(Image::from_rgb8(width, height, rgb.into_raw()))
 }
 
 fn panel_section(title: &str, body: Vec<El>) -> El {
@@ -6180,6 +6549,8 @@ fn runtime_asset_row(app: &VolumetricUiV2, asset: &LoadedAsset, staged: bool) ->
                 .caption()
                 .muted()
                 .ellipsis()
+                // Keyed so the tooltip has a hit target of its own.
+                .key(format!("runtime:summary:{id}"))
                 .tooltip(if staged {
                     "Available from the current run; committed only if the run succeeds."
                 } else {
@@ -6202,6 +6573,7 @@ fn runtime_asset_row(app: &VolumetricUiV2, asset: &LoadedAsset, staged: bool) ->
     .height(Size::Fixed(44.0))
     .padding(Sides::xy(tokens::SPACE_2, 0.0))
     .gap(tokens::SPACE_1)
+    .align(Align::Center)
 }
 
 fn runtime_asset_is_renderable(asset: &LoadedAsset) -> bool {
@@ -6212,6 +6584,7 @@ fn runtime_asset_is_renderable(asset: &LoadedAsset) -> bool {
                 | AssetTypeHint::FeaMesh
                 | AssetTypeHint::TriMesh
                 | AssetTypeHint::Subspace
+                | AssetTypeHint::ViewSet
         ) | None
     )
 }
@@ -10145,5 +10518,197 @@ mod tests {
             exercised >= 2,
             "expected both script operators to be exercised, got {exercised}"
         );
+    }
+
+    /// A view set of four posed views: the first three carry a 4x3 PNG,
+    /// the first also depth and a mask, the last no picture.
+    fn viewset_asset(id: &str) -> LoadedAsset {
+        let mut png = Vec::new();
+        ::image::RgbImage::from_pixel(4, 3, ::image::Rgb([200, 120, 40]))
+            .write_to(
+                &mut std::io::Cursor::new(&mut png),
+                ::image::ImageFormat::Png,
+            )
+            .expect("png encodes");
+        let posed = |id: &str, x: f64| {
+            viewset::View::posed(
+                id,
+                0,
+                [
+                    1.0, 0.0, 0.0, x, //
+                    0.0, 1.0, 0.0, 0.0, //
+                    0.0, 0.0, 1.0, -2.0, //
+                ],
+            )
+        };
+        let mut v1 = posed("v1", 0.0);
+        v1.image = Some(png.clone());
+        v1.depth = Some(vec![0, 0]);
+        v1.depth_unit_m = 1e-4;
+        v1.mask = Some(vec![0]);
+        v1.tags = vec!["left".to_string(), "frame:1".to_string()];
+        let mut v2 = posed("v2", 0.2);
+        v2.image = Some(png.clone());
+        let mut v3 = posed("v3", 0.4);
+        v3.image = Some(png);
+        let v4 = posed("v4", 0.6);
+        let set = viewset::ViewSet {
+            schema: 1,
+            world: viewset::WorldFrame::default(),
+            provenance: viewset::Provenance {
+                setup: "bench".to_string(),
+                ..Default::default()
+            },
+            cameras: vec![viewset::CameraModel::pinhole(4, 3, 4.0, 4.0, 2.0, 1.5)],
+            views: vec![v1, v2, v3, v4],
+            markers: Vec::new(),
+        };
+        LoadedAsset::from_parts(
+            id.to_string(),
+            viewset::encode_viewset(&set),
+            Some(AssetTypeHint::ViewSet),
+            Vec::new(),
+        )
+    }
+
+    /// An app whose project imports the view set and whose last run
+    /// materialized it, the way a `view-import -p` project opens.
+    fn app_with_viewset() -> VolumetricUiV2 {
+        let mut app = VolumetricUiV2::default();
+        let asset = viewset_asset("views");
+        app.project.imports_mut().push(volumetric::ImportedAsset {
+            id: asset.id().to_string(),
+            data: asset.data().to_vec(),
+            type_hint: asset.type_hint(),
+        });
+        app.apply_run_result(Ok(vec![asset]), 1);
+        app
+    }
+
+    #[test]
+    fn look_through_follows_the_views_routes() {
+        let mut app = app_with_viewset();
+        // The run's fallback selection lands on the view set (it renders),
+        // which makes it the active set with nothing looked through.
+        assert_eq!(
+            app.active_viewset()
+                .map(|(asset, _)| asset.id().to_string()),
+            Some("views".to_string())
+        );
+        assert!(app.look_through_frame().is_none());
+        assert_eq!(app.preview_requests()[0].plan, PreviewPlan::ViewSet);
+
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{LOOK_THROUGH_PREFIX}views:v1")),
+        );
+        assert_eq!(app.summary().look_through.as_deref(), Some("v1"));
+        let look = app.look_through_frame().expect("looked-through frame");
+        assert_eq!(look.frame.pinhole.width, 4);
+        assert_eq!(look.frame.eye(), glam::Vec3::new(0.0, 0.0, -2.0));
+        assert_eq!(look.frustum.segments.len(), 9);
+        assert!(app.look_photo().is_some(), "the view's PNG decodes");
+
+        // Looking through the same view leaves it; another view switches.
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{LOOK_THROUGH_PREFIX}views:v1")),
+        );
+        assert_eq!(app.summary().look_through, None);
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{LOOK_THROUGH_PREFIX}views:v4")),
+        );
+        assert_eq!(app.summary().look_through.as_deref(), Some("v4"));
+        assert!(app.look_photo().is_none(), "v4 carries no picture");
+
+        // Reset leaves it and still resets the camera.
+        dispatch(&mut app, UiEvent::synthetic_click(RESET_CAMERA_KEY));
+        assert_eq!(app.summary().look_through, None);
+        assert_eq!(
+            app.take_camera_command(),
+            Some(ViewportCameraCommand::Reset)
+        );
+
+        // Unknown views are refused; the exit key is harmless when idle.
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{LOOK_THROUGH_PREFIX}views:nope")),
+        );
+        assert_eq!(app.summary().look_through, None);
+        assert!(app.status.contains("no view nope"), "{}", app.status);
+        dispatch(&mut app, UiEvent::synthetic_click(EXIT_LOOK_KEY));
+
+        // The opacity picker.
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{PHOTO_OPACITY_SELECT_KEY}:option:75")),
+        );
+        assert_eq!(app.photo_opacity_percent, 75);
+
+        // A run that drops the asset drops the look-through with it.
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{LOOK_THROUGH_PREFIX}views:v2")),
+        );
+        assert!(app.look_through.is_some());
+        app.apply_run_result(Ok(Vec::new()), 1);
+        assert_eq!(app.look_through, None);
+        assert!(app.viewset_cache.borrow().is_empty());
+    }
+
+    #[test]
+    fn views_section_lists_views_and_decodes_thumbnails_lazily() {
+        let mut app = app_with_viewset();
+        let hash = app.runtime_assets()[0].content_hash();
+
+        let tree = shell(&app);
+        let mut keys = Vec::new();
+        collect_keys(&tree, &mut keys);
+        for view in ["v1", "v2", "v3", "v4"] {
+            assert!(
+                keys.contains(&format!("{LOOK_THROUGH_PREFIX}views:{view}")),
+                "{view} row"
+            );
+        }
+        assert!(!keys.contains(&EXIT_LOOK_KEY.to_string()));
+        // Three pictures, two decoded per build: one waits a frame.
+        assert!(app.has_pending_view_thumbnails());
+        assert_eq!(app.view_thumbnails.borrow().len(), 2);
+        let _ = shell(&app);
+        assert!(!app.has_pending_view_thumbnails());
+        assert_eq!(app.view_thumbnails.borrow().len(), 3);
+        assert!(
+            app.view_thumbnails
+                .borrow()
+                .get(&(hash, "v1".to_string()))
+                .is_some_and(Option::is_some)
+        );
+
+        // Looking through a view adds the leave button and the opacity
+        // picker; the shell still lints clean with the photo layer up and
+        // the panel scrolling.
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click(format!("{LOOK_THROUGH_PREFIX}views:v1")),
+        );
+        let mut tree = shell(&app);
+        let mut keys = Vec::new();
+        collect_keys(&tree, &mut keys);
+        assert!(keys.contains(&EXIT_LOOK_KEY.to_string()));
+        assert!(keys.contains(&PHOTO_OPACITY_SELECT_KEY.to_string()));
+        let bundle = damascene_core::bundle::artifact::render_bundle(
+            &mut tree,
+            Rect::new(0.0, 0.0, 1280.0, 800.0),
+        );
+        assert!(bundle.lint.findings.is_empty(), "{}", bundle.lint.text());
+
+        // Without a view set in the viewport there is no section.
+        let mut app = VolumetricUiV2::default();
+        app.apply_run_result(Ok(Vec::new()), 1);
+        let tree = shell(&app);
+        let mut keys = Vec::new();
+        collect_keys(&tree, &mut keys);
+        assert!(!keys.iter().any(|key| key.starts_with(LOOK_THROUGH_PREFIX)));
     }
 }

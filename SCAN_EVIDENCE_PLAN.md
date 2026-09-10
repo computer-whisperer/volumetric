@@ -1,6 +1,6 @@
 # Scan Evidence — Design and Plan
 
-Status: ratified 2026-09-09. Step 0 landed 2026-09-09. Step A: value, import and CLI landed 2026-09-09; GUI pending. Steps B–D pending.
+Status: ratified 2026-09-09. Step 0 landed 2026-09-09. Step A landed 2026-09-09 (value, import, CLI, GUI). Steps B–D pending.
 
 ## Why
 
@@ -64,7 +64,7 @@ photos, and to export a printable or manufacturable mesh.
 | Step | Content | Size | Status |
 |---|---|---|---|
 | 0 | Values in `project-run --json`; one `render` for a whole project scene with an explicit pinhole camera | 2 days | landed |
-| A | `view_core`: ViewSet value with provenance, manifest import, look-through render, depth residual | 4 days | CLI landed; GUI pending |
+| A | `view_core`: ViewSet value with provenance, manifest import, look-through render, depth residual | 4 days | landed |
 | B | `cv_core`: ArUco detection, PnP, focal; `view-solve` CLI, operator, GUI drop-a-still | 5 days | pending |
 | C | Marker-map refinement with the pose track; TSDF fusion operator | 5 days | pending |
 | D | Evidence audits: coverage, subject motion, frame quality, grouping | 3 days | pending |
@@ -129,7 +129,7 @@ OpenCV convention is right end to end.
 
 ## Step A — ViewSet
 
-Status: value, import and CLI landed 2026-09-09; the GUI panel is pending.
+Status: landed 2026-09-09 (value, import and CLI, then the GUI).
 Verified on chairbase1: eight left views imported in 10 MB; the TSDF model
 rendered through view 600 overlays its photograph (blend, edge, checker);
 `view-residual` against the same model reports 82% coverage and a 5 mm
@@ -193,11 +193,33 @@ project carries the twenty to forty views a task needs.
 
 ### GUI
 
-Views panel listing a ViewSet's views with thumbnails, frustum gizmos in
-the viewport, and look-through: the viewport camera takes the view's
-pinhole and the photograph underlays the frame at a chosen opacity.
-Sequenced last in this step; the value, import and CLI land first so the
-acceptance task can start.
+Landed 2026-09-09, over the same preview path the CLI's `render` uses (`render --asset views` draws the frustums headlessly; `chairbase1/demo/6_frustums_iso_top_through.jpg` shows them beside the model and through view 3):
+
+- **Frustums.** `PreviewPlan::ViewSet` builds a `PreviewEntity` of retained
+  lines: per view the four edges from the eye to the image corners at a
+  fixed 0.1 m, the image rectangle, and a tick on its top edge (which way is
+  up); a point at each eye; each marker as its square. Bounds are the union
+  of eyes and corners, so Frame includes the cameras. A ViewSet counts as
+  renderable everywhere an asset is pinned, selected or rendered, in the
+  viewport and in `render`.
+- **Views section.** The project panel grows a "Views" section whenever a
+  ViewSet is in the viewport: a provenance line (views, cameras, field,
+  setup), then a row per view with a thumbnail, id, tags, depth and mask
+  marks, and a Look button. Thumbnails decode lazily, a couple per frame,
+  and are cached by content hash and view id as Damascene images.
+- **Look-through.** App state names the view being looked through and a
+  photo opacity (0–100% picker). The viewport then renders through the
+  view's pinhole, its intrinsics scaled and shifted into the letterbox the
+  viewport gives the camera's aspect, and the photograph sits over the
+  viewport in the same letterbox (Damascene `Contain` fit) at that opacity,
+  unkeyed so it never takes pointer input. The looked-through frustum is
+  drawn highlighted. Clip planes come from the scene bounds along the view
+  axis, as in `render`. Any orbit, pan or zoom leaves look-through and
+  seeds the orbit camera from the view's pose, so the user continues from
+  the photograph's viewpoint; Look again or Reset also leaves it.
+- **Caches.** Decoded ViewSets are cached per content hash in the app, like
+  the model dimension probe; the session reuses the retained frustum lines
+  across frames like any other entity.
 
 ## Step B — solve a still from the cards
 

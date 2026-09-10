@@ -6073,6 +6073,7 @@ dependencies = [
  "damascene-winit-wgpu",
  "dirs",
  "glam 0.32.1",
+ "image",
  "js-sys",
  "log",
  "pollster",

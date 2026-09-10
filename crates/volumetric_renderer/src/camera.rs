@@ -190,6 +190,24 @@ impl Camera {
         self.radius = self.radius.clamp(0.1, 1000.0);
     }
 
+    /// Orbit `target` from `eye`: the pose a posed photograph hands over
+    /// when the user leaves it for the orbit camera. Roll is lost (the
+    /// orbit camera keeps world +y up) and the pitch stays off the poles.
+    pub fn look_from(&mut self, eye: Vec3, target: Vec3) {
+        let offset = eye - target;
+        let radius = offset.length();
+        if radius.is_nan() || radius <= 1e-6 {
+            return;
+        }
+        self.target = target;
+        self.radius = radius;
+        self.phi = (offset.y / radius)
+            .clamp(-1.0, 1.0)
+            .acos()
+            .clamp(0.01, std::f32::consts::PI - 0.01);
+        self.theta = offset.x.atan2(offset.z);
+    }
+
     /// Focus on a point with specified distance.
     pub fn focus_on_point(&mut self, point: Vec3, distance: f32) {
         self.target = point;
@@ -680,6 +698,33 @@ impl Pinhole {
     /// Vertical field of view in radians.
     pub fn fov_y(&self) -> f32 {
         2.0 * (self.height as f32 / (2.0 * self.fy)).atan()
+    }
+}
+
+#[cfg(test)]
+mod look_from_tests {
+    use super::*;
+
+    #[test]
+    fn look_from_round_trips_the_eye() {
+        let mut camera = Camera::default();
+        let eye = Vec3::new(1.5, 0.8, -2.0);
+        let target = Vec3::new(0.2, 0.1, 0.3);
+        camera.look_from(eye, target);
+        assert!(
+            (camera.eye_position() - eye).length() < 1e-4,
+            "{:?}",
+            camera.eye_position()
+        );
+        assert!((camera.target - target).length() < 1e-6);
+        assert!((camera.forward() - (target - eye).normalize()).length() < 1e-4);
+
+        // Straight down keeps off the pole; a zero distance is ignored.
+        camera.look_from(Vec3::new(0.0, 3.0, 0.0), Vec3::ZERO);
+        assert!(camera.phi >= 0.01 && camera.radius == 3.0);
+        let before = camera.clone();
+        camera.look_from(Vec3::ONE, Vec3::ONE);
+        assert_eq!(camera.radius, before.radius);
     }
 }
 

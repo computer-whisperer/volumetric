@@ -324,6 +324,7 @@ pub use volumetric_abi::{f64_map, lua_parameters, wgsl_parameters};
 
 // The triangle mesh value type (CBOR payload of TriMesh-typed assets).
 pub use volumetric_abi::trimesh;
+pub use volumetric_abi::viewset;
 
 // The affine subspace value type (CBOR payload of Subspace-typed assets).
 pub use volumetric_abi::subspace;

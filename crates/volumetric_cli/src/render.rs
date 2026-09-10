@@ -2,8 +2,9 @@
 //! same preview path as the GUI viewport (`volumetric_preview`): 3D models
 //! meshed with the adaptive surface nets plan, 2D sketches as flat rasters,
 //! FEA meshes and point clouds as their explicit data, triangle meshes as
-//! they are, Subspace values as gizmos sized by the whole scene. The frame
-//! an agent reads headlessly is the frame a person sees in the viewport.
+//! they are, Subspace values as gizmos sized by the whole scene, view sets
+//! as camera frustums. The frame an agent reads headlessly is the frame a
+//! person sees in the viewport.
 //!
 //! Cameras: preset directions framed to the scene, an explicit pose with a
 //! field of view, or a pinhole with intrinsics and an OpenCV camera-to-world
@@ -13,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
-use glam::{Mat4, Vec3, Vec4};
+use glam::{Mat4, Vec3};
 
 use view_core::image::{Rgb, decode_rgb};
 use view_core::overlay::{Overlay, compose};
@@ -21,7 +22,8 @@ use volumetric::{AssetTypeHint, LoadedAsset, Project};
 use volumetric_abi::viewset::Distortion;
 use volumetric_preview::{
     Asn2Settings, PreviewBounds, PreviewEntity, PreviewMeshPlan, PreviewPlan, PreviewRenderMode,
-    PreviewRequest, build_preview_scene, srgb_to_linear, submit_subspace_gizmo, wireframe_style,
+    PreviewRequest, build_preview_scene, clip_planes_for, pose_matrix, srgb_to_linear,
+    submit_subspace_gizmo, wireframe_style,
 };
 use volumetric_renderer::{
     Camera, CameraView, GridPlanes, Pinhole, RenderSettings, ViewDirection, offscreen::Offscreen,
@@ -33,8 +35,8 @@ pub struct RenderArgs {
     #[arg(short, long)]
     pub input: PathBuf,
 
-    /// For .vproj inputs: an export to draw (repeatable; default: every
-    /// renderable export)
+    /// For .vproj inputs: an asset to draw (repeatable; default: every
+    /// renderable export; imports such as a view set draw only when named)
     #[arg(long = "asset")]
     pub assets: Vec<String>,
 
@@ -283,16 +285,6 @@ enum CameraMode {
 }
 
 /// The 3x4 rows of a camera-to-world pose as a matrix.
-fn pose_matrix(m: &[f64; 12]) -> Mat4 {
-    let m: Vec<f32> = m.iter().map(|v| *v as f32).collect();
-    Mat4::from_cols(
-        Vec4::new(m[0], m[4], m[8], 0.0),
-        Vec4::new(m[1], m[5], m[9], 0.0),
-        Vec4::new(m[2], m[6], m[10], 0.0),
-        Vec4::new(m[3], m[7], m[11], 1.0),
-    )
-}
-
 fn camera_mode(args: &RenderArgs) -> Result<CameraMode> {
     if let Some(through) = &args.through {
         if args.camera_pos.is_some() || args.intrinsics.is_some() || args.pose.is_some() {
@@ -357,28 +349,6 @@ fn camera_mode(args: &RenderArgs) -> Result<CameraMode> {
         },
         _ => anyhow::bail!("--intrinsics and --pose go together"),
     }
-}
-
-/// Near and far planes enclosing `min..max` as seen from `eye` along
-/// `forward`: the near plane sits at half the nearest corner's depth but
-/// never below a thousandth of the scene, the far plane at twice the
-/// farthest corner's.
-fn clip_planes_for(eye: Vec3, forward: Vec3, min: Vec3, max: Vec3) -> (f32, f32) {
-    let extent = (max - min).length().max(1e-6);
-    let (mut nearest, mut farthest) = (f32::INFINITY, f32::NEG_INFINITY);
-    for i in 0..8 {
-        let corner = Vec3::new(
-            if i & 1 == 0 { min.x } else { max.x },
-            if i & 2 == 0 { min.y } else { max.y },
-            if i & 4 == 0 { min.z } else { max.z },
-        );
-        let depth = (corner - eye).dot(forward);
-        nearest = nearest.min(depth);
-        farthest = farthest.max(depth);
-    }
-    let near = (nearest * 0.5).max(extent * 1e-3);
-    let far = (farthest * 2.0).max(near * 10.0);
-    (near, far)
 }
 
 /// The frames to draw: a file suffix (for several) and the view for each.
@@ -483,9 +453,9 @@ fn frames(
     })
 }
 
-/// The renderable exports of the input: a model file as one asset, a
-/// project's exports filtered to the kinds that have a picture and to
-/// `wanted` when given, plus a project's imported assets.
+/// The assets to draw and a project's imports: a model file as one asset,
+/// or a project's exports filtered to the kinds that have a picture and to
+/// `wanted` when given (which may also name imports).
 fn load_renderable_assets(
     input: &Path,
     wanted: &[String],
@@ -522,7 +492,8 @@ fn load_renderable_assets(
             extension
         ),
     };
-    Ok((select_assets(assets, wanted)?, imports))
+    let selected = select_assets(assets, &imports, wanted)?;
+    Ok((selected, imports))
 }
 
 fn is_renderable(asset: &LoadedAsset) -> bool {
@@ -533,16 +504,23 @@ fn is_renderable(asset: &LoadedAsset) -> bool {
                 | AssetTypeHint::FeaMesh
                 | AssetTypeHint::TriMesh
                 | AssetTypeHint::Subspace
+                | AssetTypeHint::ViewSet
         ) | None
     )
 }
 
-/// Keeps the renderable assets, or exactly the `wanted` ids, each of which
-/// must exist and be renderable.
-fn select_assets(assets: Vec<LoadedAsset>, wanted: &[String]) -> Result<Vec<LoadedAsset>> {
+/// Keeps the renderable exports, or exactly the `wanted` ids, each of which
+/// must exist among the exports or the imports and be renderable. Imports
+/// (a scan's view set, say) only draw when asked for by id.
+fn select_assets(
+    assets: Vec<LoadedAsset>,
+    imports: &[LoadedAsset],
+    wanted: &[String],
+) -> Result<Vec<LoadedAsset>> {
     let available = || {
         assets
             .iter()
+            .chain(imports)
             .filter(|a| is_renderable(a))
             .map(|a| a.id())
             .collect::<Vec<_>>()
@@ -555,7 +533,10 @@ fn select_assets(assets: Vec<LoadedAsset>, wanted: &[String]) -> Result<Vec<Load
             .cloned()
             .collect();
         if renderable.is_empty() {
-            anyhow::bail!("nothing to draw: no model, mesh, cloud or subspace export");
+            anyhow::bail!(
+                "nothing to draw: no model, mesh, cloud, subspace or view set export. Imports draw when named with --asset: {}",
+                available()
+            );
         }
         return Ok(renderable);
     }
@@ -564,10 +545,11 @@ fn select_assets(assets: Vec<LoadedAsset>, wanted: &[String]) -> Result<Vec<Load
         let asset = assets
             .iter()
             .find(|a| a.id() == id)
-            .with_context(|| format!("no export named '{id}'. Available: {}", available()))?;
+            .or_else(|| imports.iter().find(|a| a.id() == id))
+            .with_context(|| format!("no asset named '{id}'. Available: {}", available()))?;
         if !is_renderable(asset) {
             anyhow::bail!(
-                "export '{id}' is {}, which has no picture. Available: {}",
+                "asset '{id}' is {}, which has no picture. Available: {}",
                 asset
                     .type_hint()
                     .map(|h| h.to_string())
@@ -591,6 +573,7 @@ fn preview_request(asset: &LoadedAsset, options: &PlanOptions) -> PreviewRequest
         },
         Some(AssetTypeHint::TriMesh) => PreviewPlan::TriMesh,
         Some(AssetTypeHint::Subspace) => PreviewPlan::Subspace,
+        Some(AssetTypeHint::ViewSet) => PreviewPlan::ViewSet,
         _ => match volumetric::model_dimensions_static(asset.data()) {
             Some(2) => PreviewPlan::Sketch {
                 resolution: options.resolution,
@@ -706,7 +689,17 @@ pub fn run_render(args: RenderArgs) -> Result<()> {
     let mut size = (args.width.unwrap_or(1024), args.height.unwrap_or(1024));
     let mode = match mode {
         CameraMode::Through { asset, view } => {
-            let all: Vec<LoadedAsset> = imports.iter().chain(assets.iter()).cloned().collect();
+            // Imports and the drawn assets overlap when an import was named
+            // with --asset; one copy each.
+            let all: Vec<LoadedAsset> = imports
+                .iter()
+                .chain(
+                    assets
+                        .iter()
+                        .filter(|a| !imports.iter().any(|i| i.id() == a.id())),
+                )
+                .cloned()
+                .collect();
             let set = crate::views::find_viewset(&all, asset.as_deref())?;
             let (view, camera) = set.view(&view).with_context(|| {
                 format!(
@@ -971,28 +964,46 @@ mod tests {
             asset("fit", Some(AssetTypeHint::F64Map)),
             asset("cloud", Some(AssetTypeHint::FeaMesh)),
         ];
+        let imports = vec![
+            asset("views", Some(AssetTypeHint::ViewSet)),
+            asset("config", Some(AssetTypeHint::Config)),
+        ];
         let ids = |assets: &[LoadedAsset]| {
             assets
                 .iter()
                 .map(|a| a.id().to_string())
                 .collect::<Vec<_>>()
         };
+        // Exports draw by default; an import draws only when named.
         assert_eq!(
-            ids(&select_assets(all.clone(), &[]).unwrap()),
+            ids(&select_assets(all.clone(), &imports, &[]).unwrap()),
             ["scan", "axis", "cloud"]
         );
         assert_eq!(
-            ids(&select_assets(all.clone(), &["cloud".to_string(), "scan".to_string()]).unwrap()),
-            ["cloud", "scan"]
+            ids(&select_assets(
+                all.clone(),
+                &imports,
+                &["cloud".to_string(), "scan".to_string(), "views".to_string()]
+            )
+            .unwrap()),
+            ["cloud", "scan", "views"]
         );
-        let missing = select_assets(all.clone(), &["nope".to_string()]).unwrap_err();
+        let missing = select_assets(all.clone(), &imports, &["nope".to_string()]).unwrap_err();
         assert!(
-            missing.to_string().contains("scan, axis, cloud"),
+            missing.to_string().contains("scan, axis, cloud, views"),
             "{missing}"
         );
-        let wrong = select_assets(all, &["fit".to_string()]).unwrap_err();
+        let wrong = select_assets(all.clone(), &imports, &["fit".to_string()]).unwrap_err();
         assert!(wrong.to_string().contains("F64Map"), "{wrong}");
-        assert!(select_assets(vec![asset("fit", Some(AssetTypeHint::F64Map))], &[]).is_err());
+        let wrong = select_assets(all, &imports, &["config".to_string()]).unwrap_err();
+        assert!(wrong.to_string().contains("no picture"), "{wrong}");
+        let none = select_assets(
+            vec![asset("fit", Some(AssetTypeHint::F64Map))],
+            &imports,
+            &[],
+        )
+        .unwrap_err();
+        assert!(none.to_string().contains("--asset: views"), "{none}");
     }
 
     #[test]

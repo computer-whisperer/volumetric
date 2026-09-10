@@ -111,6 +111,9 @@ pub fn preview_prelude(
     if request.type_hint == Some(AssetTypeHint::Subspace) {
         return build_subspace_preview(request, build_start).map(done);
     }
+    if request.type_hint == Some(AssetTypeHint::ViewSet) {
+        return crate::views::build_viewset_preview(request, build_start).map(done);
+    }
 
     // 2D sketches get a flat raster preview; the 3D mesh plans don't apply.
     let dims = volumetric::model_dimensions_from_bytes(request.data.as_slice())

@@ -690,6 +690,7 @@ impl WebHost {
                 label: Some("volumetric_ui_v2::web_encoder"),
             });
 
+        let look_through = self.app.look_through_frame();
         let viewport_rect = gfx.damascene.rect_of_key(VIEWPORT_KEY);
         let viewport_resized = gfx.session.render(ViewportRenderParams {
             device: &gfx.device,
@@ -699,6 +700,7 @@ impl WebHost {
             scale_factor,
             clear_color: bg_color(&palette),
             preview_requests,
+            look_through,
         });
         gfx.damascene.render(
             &gfx.device,
@@ -718,6 +720,7 @@ impl WebHost {
             || gfx.session.has_pending_thumbnail()
             || gfx.session.run_in_flight()
             || self.app.has_pending_metadata()
+            || self.app.has_pending_view_thumbnails()
         {
             gfx.window.request_redraw();
         }
