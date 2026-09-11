@@ -321,8 +321,8 @@ fn load_viewset(input: &Path, asset: Option<&str>) -> Result<ViewSet> {
         .unwrap_or("")
         .to_lowercase();
     if extension == "vproj" {
-        // Imports carry view sets today; exports may once operators produce
-        // them, so run the project only when the imports have none.
+        // An imported set answers without a run; only when the imports have
+        // none is the project run for a set an operator produces.
         let imports = project_assets(input, false)?;
         if imports
             .iter()

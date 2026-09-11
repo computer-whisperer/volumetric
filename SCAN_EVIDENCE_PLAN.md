@@ -6,8 +6,9 @@ the survey card and splats. Step 0 landed 2026-09-09. Step A landed
 view-solve, view_solve_operator, GUI Import Still). C2 (card detection)
 landed 2026-09-11. C3 (survey bundle) landed 2026-09-11 together with the
 parts of C1 it needed (schema 2, `view-import --stills`, Sony focus keys);
-C1's remaining audits fold into D. C4, S (splats), P (Python bindings)
-and D (audits) pending; order S1, S2, P, C4, D, S3.
+C1's remaining audits fold into D. S1 (splat value, import, listing,
+points) landed 2026-09-11. C4, S2, S3, P (Python bindings) and D (audits)
+pending; order S2, P, C4, D, S3.
 
 ## Why
 
@@ -130,7 +131,7 @@ printable or manufacturable mesh.
 | C2 | Card detection: AprilTag 36h11 as data, ChArUco corners refined, pyramid search for 26 MP frames, observations stored per view | 3 days | landed |
 | C3 | Survey bundle: cameras per focus key, poses, corners free, scale from the card, uncertainties; `view-survey`, operator, GUI | 4 days | landed |
 | C4 | Trainer bridges: dataset export in the schema-2 layout with a box seed; `.npz` TSDF import | 2 days | pending |
-| S1 | Splat value, 3DGS PLY import, `splat-list`, splat to point cloud | 2 days | pending |
+| S1 | Splat value, 3DGS PLY import, `splat-list`, splat to point cloud | 2 days | landed |
 | S2 | Splat rendering in the viewport and `render`, look-through over the photograph | 4 days | pending |
 | S3 | Photometric audit: the splat rendered through each view against its photograph | 2 days | pending |
 | P | Python bindings (PyO3, maturin) over cv_core, view_core, the survey, splats and projects | 3 days | pending |
@@ -631,6 +632,36 @@ audit, and its depth output is how fusion can return here later.
   and the SH0 colour, filtered by opacity, scale and a bounds or
   near-marker radius, so `cloud_fit`, `cloud_normals` and the section
   tools apply to the splat directly.
+
+**S1 status (landed 2026-09-11).** `volumetric_abi::splat` as designed,
+with the columns as little-endian `f32` byte strings through a serde
+adapter (a CBOR float array would be five bytes a value and slow to
+decode); `normals` is an empty column rather than an option; the world
+frame and `Provenance` are the view set's types. Deviations: the
+importer takes the training view set as an optional second input and
+copies its world frame and provenance and hashes its bytes (blake3, the
+engine's content fingerprint) into `views_hash`, so the link to the
+evidence is made by the DAG rather than typed; the config strings
+override where set. The points operator emits a Point1 `FeaMesh` (the
+engine's point-cloud value; the plan's "TriMesh point cloud" was a
+slip), with `opacity` and `scale` fields beside `normal` and `color`,
+and takes the view set as an optional input for `near.marker`. Its
+`bounds` group is six scalars because the config parser has no
+fixed-length arrays (`stl_import`'s `translate: [float, float, float]`
+fails the same parse today; unchanged here). File extension `.vsplat`;
+`project-add-asset` validates it; the GUI's Import menu has Splat
+(`.ply`) and the step editor a splat slot. Findings: the
+chairbase-dslr-0-2dgs run's third log-scale is a full third axis
+(median ratio 1.01 to the others), so `auto` reads it as 3D Gaussians,
+which is what the parameters are; its normals are all zero and are
+dropped; its quaternions are unnormalised (median norm 1.19) and are
+normalised at use. The survey now sets the set's `world.up` to the card
+normal (it left the intake's default), which the splat inherits.
+Validation: import, listing and points in 2 s; 345 k of 595 k primitives
+at or above half opacity, 1.2 mm median from the trainer's TSDF surface
+cloud and it from them (4.5 mm at p99); SH0 colours match the trainer's
+`red green blue`. Demo project
+`sessions/chairbase-dslr-0/demo/chairbase_dslr0_splat.vproj`.
 
 ### S2. Rendering
 

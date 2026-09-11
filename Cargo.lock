@@ -5199,6 +5199,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "splat_import_operator"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "ciborium",
+ "ply_core",
+ "serde",
+ "volumetric_abi",
+]
+
+[[package]]
+name = "splat_points_operator"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "serde",
+ "volumetric_abi",
+]
+
+[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5997,6 +6017,7 @@ dependencies = [
  "glam 0.32.1",
  "js-sys",
  "log",
+ "ply_core",
  "rayon",
  "serde",
  "serde_bytes",

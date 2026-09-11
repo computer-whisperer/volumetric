@@ -122,6 +122,7 @@ pub mod annotations;
 pub mod f64_map;
 pub mod fea;
 pub mod lua_parameters;
+pub mod splat;
 pub mod subspace;
 pub mod threading;
 pub mod trimesh;
@@ -338,6 +339,10 @@ pub enum OperatorMetadataInput {
     /// marker map (see [`crate::viewset`]); explicit data, not a sampleable
     /// field.
     ViewSet,
+    /// A CBOR-encoded Gaussian splat (see [`splat`]): a trained set of
+    /// oriented Gaussians or surfels with colour; explicit data, never fed
+    /// to the model executor.
+    Splat,
 }
 
 /// Output slot declaration in an operator's metadata.
@@ -362,6 +367,9 @@ pub enum OperatorMetadataOutput {
     /// [`OperatorMetadataInput::ViewSet`]); explicit data, never fed to the
     /// model executor.
     ViewSet,
+    /// A CBOR-encoded Gaussian splat (see [`OperatorMetadataInput::Splat`]);
+    /// explicit data, never fed to the model executor.
+    Splat,
 }
 
 /// Metadata a module returns from `get_metadata()`, CBOR-encoded.
@@ -747,6 +755,7 @@ mod tests {
                 OperatorMetadataInput::FeaMesh,
                 OperatorMetadataInput::TriMesh,
                 OperatorMetadataInput::ViewSet,
+                OperatorMetadataInput::Splat,
             ],
             variadic_input: None,
             input_names: vec![
@@ -759,6 +768,7 @@ mod tests {
                 "Mesh".to_string(),
                 "Surface".to_string(),
                 "Views".to_string(),
+                "Splat".to_string(),
             ],
             outputs: vec![
                 OperatorMetadataOutput::ModelWASM,
@@ -766,6 +776,7 @@ mod tests {
                 OperatorMetadataOutput::TriMesh,
                 OperatorMetadataOutput::F64Map,
                 OperatorMetadataOutput::ViewSet,
+                OperatorMetadataOutput::Splat,
             ],
             output_names: vec![],
         };
@@ -773,7 +784,7 @@ mod tests {
         let decoded = decode_metadata(&encode_metadata(&metadata)).unwrap();
         assert_eq!(decoded, metadata);
         assert_eq!(metadata.input_name(0), Some("Model"));
-        assert_eq!(metadata.input_name(9), None);
+        assert_eq!(metadata.input_name(10), None);
         assert_eq!(metadata.catalog_name(), "Test Operator");
     }
 

@@ -159,6 +159,7 @@ pub const IMPORT_PLY_KEY: &str = "action:import-ply";
 pub const IMPORT_POINT_CLOUD_KEY: &str = "action:import-point-cloud";
 pub const IMPORT_VOLUME_KEY: &str = "action:import-volume";
 pub const IMPORT_STILL_KEY: &str = "action:import-still";
+pub const IMPORT_SPLAT_KEY: &str = "action:import-splat";
 pub const RUN_PROJECT_KEY: &str = "action:run-project";
 pub const CANCEL_RUN_KEY: &str = "action:cancel-run";
 pub const TOGGLE_AUTO_REBUILD_KEY: &str = "action:toggle-auto-rebuild";
@@ -687,6 +688,7 @@ enum AssetSlotKind {
     Subspace,
     F64Map,
     ViewSet,
+    Splat,
 }
 
 #[derive(Clone, Debug)]
@@ -722,6 +724,7 @@ impl AssetSlotKind {
             OperatorMetadataInput::Subspace => Some(AssetSlotKind::Subspace),
             OperatorMetadataInput::F64Map => Some(AssetSlotKind::F64Map),
             OperatorMetadataInput::ViewSet => Some(AssetSlotKind::ViewSet),
+            OperatorMetadataInput::Splat => Some(AssetSlotKind::Splat),
             _ => None,
         }
     }
@@ -866,6 +869,9 @@ pub enum FileAction {
     /// A photograph of the subject with the marker cards in view, posed
     /// against the view set's map by a `view_solve` step.
     ImportStill,
+    /// Import a trained Gaussian splat (3DGS PLY) via the bundled
+    /// `splat_import_operator`.
+    ImportSplat,
 }
 
 /// What an output *is*, for view purposes: each kind gets its own render
@@ -3617,6 +3623,7 @@ impl VolumetricUiV2 {
                 subspace: for_kind(AssetTypeHint::Subspace).as_deref(),
                 f64_map: for_kind(AssetTypeHint::F64Map).as_deref(),
                 viewset: for_kind(AssetTypeHint::ViewSet).as_deref(),
+                splat: for_kind(AssetTypeHint::Splat).as_deref(),
             },
         );
 
@@ -4213,6 +4220,13 @@ impl App for VolumetricUiV2 {
             return;
         }
 
+        if event.is_click_or_activate(IMPORT_SPLAT_KEY) {
+            self.pending_file_action = Some(FileAction::ImportSplat);
+            self.open_menu = None;
+            self.add_modal = None;
+            return;
+        }
+
         if event.is_click_or_activate(ADD_OPEN_KEY) {
             self.add_modal = Some(AddModalState::default());
             // Focus lands in the search field so typing filters immediately.
@@ -4709,6 +4723,7 @@ fn catalog_row_key(entry: &catalog::CatalogEntry) -> String {
         "point_cloud_import_operator" => IMPORT_POINT_CLOUD_KEY.to_string(),
         "volume_import_operator" => IMPORT_VOLUME_KEY.to_string(),
         "view_solve_operator" => IMPORT_STILL_KEY.to_string(),
+        "splat_import_operator" => IMPORT_SPLAT_KEY.to_string(),
         _ => match entry.kind {
             volumetric_assets::AssetCategory::Model => {
                 format!("{ADD_MODEL_PREFIX}{}", entry.name)
@@ -6769,6 +6784,7 @@ fn step_edit_rows(app: &VolumetricUiV2, step_idx: usize) -> Vec<El> {
         let subspaces = step_input_options(app, step_idx, AssetSlotKind::Subspace);
         let f64_maps = step_input_options(app, step_idx, AssetSlotKind::F64Map);
         let viewsets = step_input_options(app, step_idx, AssetSlotKind::ViewSet);
+        let splats = step_input_options(app, step_idx, AssetSlotKind::Splat);
         rows.push(text("Inputs").muted().caption().semibold());
         let block = edit.variadic.as_ref();
         for (n, slot) in edit.asset_slots.iter().enumerate() {
@@ -6783,6 +6799,7 @@ fn step_edit_rows(app: &VolumetricUiV2, step_idx: usize) -> Vec<El> {
                 AssetSlotKind::Subspace => &subspaces,
                 AssetSlotKind::F64Map => &f64_maps,
                 AssetSlotKind::ViewSet => &viewsets,
+                AssetSlotKind::Splat => &splats,
             };
             let in_block = block.is_some_and(|block| block.range.contains(&slot.input_idx));
             let removable = in_block && block.is_some_and(|block| block.range.len() > 1);
@@ -6888,6 +6905,7 @@ fn step_input_options(app: &VolumetricUiV2, step_idx: usize, kind: AssetSlotKind
         AssetSlotKind::Subspace => editable_subspace_asset_ids(app),
         AssetSlotKind::F64Map => editable_f64_map_asset_ids(app),
         AssetSlotKind::ViewSet => editable_viewset_asset_ids(app),
+        AssetSlotKind::Splat => editable_splat_asset_ids(app),
     };
     ids.into_iter()
         .filter(|id| !not_yet_produced.contains(id.as_str()))
@@ -6973,6 +6991,7 @@ fn asset_slot_kind_label(kind: AssetSlotKind) -> &'static str {
         AssetSlotKind::Subspace => "subspace",
         AssetSlotKind::F64Map => "F64Map",
         AssetSlotKind::ViewSet => "view set",
+        AssetSlotKind::Splat => "splat",
     }
 }
 
@@ -7421,6 +7440,7 @@ fn asset_type_label(type_hint: Option<AssetTypeHint>) -> &'static str {
         Some(AssetTypeHint::TriMesh) => "Tri Mesh",
         Some(AssetTypeHint::Subspace) => "Subspace",
         Some(AssetTypeHint::ViewSet) => "Views",
+        Some(AssetTypeHint::Splat) => "Splat",
         None => "Asset",
     }
 }
@@ -7435,6 +7455,7 @@ struct SlotPrimaries<'a> {
     subspace: Option<&'a str>,
     f64_map: Option<&'a str>,
     viewset: Option<&'a str>,
+    splat: Option<&'a str>,
 }
 
 /// Builds a fresh step's inputs, one per declared operator metadata input, in
@@ -7495,6 +7516,10 @@ fn operator_step_inputs(
                 None => ExecutionInput::Inline(Vec::new()),
             },
             OperatorMetadataInput::ViewSet => match primaries.viewset {
+                Some(id) => ExecutionInput::AssetRef(id.to_string()),
+                None => ExecutionInput::Inline(Vec::new()),
+            },
+            OperatorMetadataInput::Splat => match primaries.splat {
                 Some(id) => ExecutionInput::AssetRef(id.to_string()),
                 None => ExecutionInput::Inline(Vec::new()),
             },
@@ -7614,6 +7639,13 @@ fn editable_viewset_asset_ids(app: &VolumetricUiV2) -> Vec<String> {
     app.declared_assets_typed()
         .into_iter()
         .filter_map(|(id, type_hint)| (type_hint == Some(AssetTypeHint::ViewSet)).then_some(id))
+        .collect()
+}
+
+fn editable_splat_asset_ids(app: &VolumetricUiV2) -> Vec<String> {
+    app.declared_assets_typed()
+        .into_iter()
+        .filter_map(|(id, type_hint)| (type_hint == Some(AssetTypeHint::Splat)).then_some(id))
         .collect()
 }
 
@@ -9724,6 +9756,8 @@ mod tests {
         assert_eq!(app.take_file_action(), Some(FileAction::ImportVolume));
         dispatch(&mut app, UiEvent::synthetic_click(IMPORT_STILL_KEY));
         assert_eq!(app.take_file_action(), Some(FileAction::ImportStill));
+        dispatch(&mut app, UiEvent::synthetic_click(IMPORT_SPLAT_KEY));
+        assert_eq!(app.take_file_action(), Some(FileAction::ImportSplat));
     }
 
     #[test]

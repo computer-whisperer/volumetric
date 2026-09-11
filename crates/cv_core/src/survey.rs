@@ -1495,6 +1495,9 @@ pub fn survey(set: &mut ViewSet, options: &SurveyOptions) -> Result<SurveyReport
         spec: spec.clone(),
         corners: board_corners,
     });
+    // The world is the card's frame with z towards the cameras: for a card
+    // lying flat under the subject, the way a session is shot, that is up.
+    set.world.up = [0.0, 0.0, 1.0];
     set.provenance.tools.push(format!(
         "volumetric view-survey ({} frames, rms {:.2} px)",
         slots.len(),
@@ -2126,6 +2129,7 @@ mod tests {
             .count();
         assert!(card_frames >= 4, "{card_frames} full card frames");
         let report = survey(&mut set, &SurveyOptions::default()).unwrap();
+        assert_eq!(set.world.up, [0.0, 0.0, 1.0], "the card normal is up");
         for line in &report.log {
             eprintln!("{line}");
         }

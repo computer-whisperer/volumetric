@@ -1214,6 +1214,12 @@ fn gather_file_task(
             operator_name: "view_solve_operator",
             output_base: "still",
         }),
+        FileAction::ImportSplat => Some(FileTask::ImportBlob {
+            filter_name: "Splats",
+            extensions: &["ply"],
+            operator_name: "splat_import_operator",
+            output_base: "splat",
+        }),
     }
 }
 

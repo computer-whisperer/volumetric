@@ -73,6 +73,8 @@ Generator operators create new models from configuration or external data:
 | `threemf_import` | Reads a 3MF package as a triangle mesh in metres (file unit honoured; build items, components, and cross-part `p:path` references resolved) | 3MF blob + CBOR config: `{scale, center, item}` |
 | `ply_import` | Reads a PLY mesh (ASCII or binary) as a triangle mesh; vertex colours and normals ride along as the `color` and `normal` vertex fields | PLY blob + CBOR config: `{scale, center, fields}` |
 | `point_cloud_import` | Reads a point-cloud file (PLY) as a Point1 cloud with `color` and `normal` node fields, for the point operators and the coloured cloud preview | PLY blob + CBOR config: `{scale, center, stride, fields}` |
+| `splat_import` | Reads a trained Gaussian splat in the 3DGS PLY layout (centres, log-scales, quaternions, logit opacities, SH colour to degree 3, normals when nonzero) as a `Splat` value; `kind` auto-detects surfels from a thin or absent third scale | PLY blob + CBOR config: `{kind, scale, center, session, field, setup, views_hash, training}` |
+| `splat_points` | The centres of a splat's primitives as a Point1 cloud with `normal`, `color`, `opacity` and `scale` node fields, filtered by opacity, scale, a box, or a radius around a point or a solved marker | Splat + optional ViewSet + CBOR config: `{min_opacity, max_scale, min_scale, stride, bounds, near}` |
 | `volume_import` | Reads a sampled volume (NRRD: a TSDF, a CT threshold, any regular grid) as a solid with the `signed_distance` channel Generate SDF bakes; NaN samples are unobserved and fill in where the scan encloses them | NRRD blob + CBOR config: `{scale, center, threshold, inside, band, unobserved, crop, stride}` |
 | `cloud_fit` | Fits a plane, line, point, sphere or cylinder to a point cloud (RANSAC + least squares) as a Subspace for Slice/Extrude/Revolve/Span/Intersect, plus an F64Map of radius, extents, inliers and rms; an optional seed Subspace narrows the search or is refined | FeaMesh + optional Subspace + CBOR config: `{kind, normal, tolerance, search_radius, trials}` |
 | `cloud_normals` | Estimates a unit normal per node from its nearest neighbours and stores it as the `normal` field (what a cylinder fit needs) | FeaMesh + CBOR config: `{neighbours, orient}` |
@@ -296,6 +298,18 @@ volumetric_cli view-import --stills sessions/chairbase-dslr-0 -p chair.vproj \
 # scale and its plane the world frame
 volumetric_cli view-survey -p chair.vproj [--views set] [--f-scale 1.5] [--reject-px 3] \
     [--min-card 8] [--report survey.json] [--dry-run] [--json]
+
+# The trained splat back from the GPU service: import it as a step, then
+# describe it (count, kind, SH degree, bounds, opacity and scale quantiles)
+volumetric_cli project-add-asset -p chair.vproj -i runs/chair-2dgs/splat.ply --type blob --asset-id splat_ply
+volumetric_cli project-add-op -p chair.vproj --operator splat_import_operator \
+    -i asset:splat_ply -i asset:views -i 'json:{"training":"gsplat 2dgs 15k"}' --output-id splat
+volumetric_cli splat-list -i chair.vproj [--asset splat] [--json]
+
+# The splat's opaque centres as a cloud with normals and colours, near a
+# solved swatch, for cloud_fit and the section tools
+volumetric_cli project-add-op -p chair.vproj --operator splat_points_operator \
+    -i asset:splat -i asset:views -i 'json:{"min_opacity":0.5,"near":{"marker":"7","radius":0.3}}' --output-id base_cloud
 ```
 
 `view-solve` detects ArUco markers (`5x5_100` swatches or the `4x4_50`
@@ -392,6 +406,27 @@ Selection flags: `--id` (repeatable), `--stride`, `--near x,y,z --radius r`,
 `--no-depth`, `--no-masks`; provenance labels `--session`, `--rig`,
 `--field`, `--setup`. `project-add-asset --type viewset` adds a `.vviews`
 file to a project.
+
+The trained splat comes back as a `Splat` value (`.vsplat` file): the
+centres, log-scales, quaternions, logit opacities and SH colour as the
+trainer stored them, packed as `f32` byte strings (90 MB for 595 k
+Gaussians at degree 2, decoded in milliseconds), with the world frame and
+provenance of the view set it was trained from and that set's content
+hash, so an audit can say which evidence a splat explains. `splat_import`
+(Splat Import, also the GUI's Import menu) reads the 3DGS PLY layout from
+any trainer that writes it, detecting surfels from a thin or absent third
+scale; `splat-list` prints the count, kind, SH degree, the centres'
+bounds at the 1st and 99th percentiles, and opacity and scale quantiles;
+`splat_points` (Splat Points) turns the opaque primitives into a Point1
+cloud with `normal` (a surfel's third axis, a Gaussian's smallest-scale
+axis), `color`, `opacity` and `scale` fields, filtered by opacity, scale,
+a box or a radius around a point or a solved marker, so Cloud Fit and the
+section tools measure the splat directly. On the chairbase-dslr-0 run
+(594 823 primitives, degree 2) the import, listing and points take two
+seconds; 345 k primitives are at or above half opacity, and their centres
+sit 1.2 mm median from the trainer's own TSDF surface cloud, whose points
+in turn are 1.2 mm median (4.5 mm at the 99th percentile) from the
+nearest opaque centre. Rendering the splat is step S2.
 
 A view set in the viewport draws every view's frustum (0.1 m deep, with a
 tick marking the picture's up) and the marker squares, and the project

@@ -126,6 +126,8 @@ pub enum AssetTypeArg {
     Blob,
     /// A view set written by `view-import`.
     ViewSet,
+    /// A splat written by `project-export` (`.vsplat`).
+    Splat,
 }
 
 impl From<AssetTypeArg> for AssetTypeHint {
@@ -137,6 +139,7 @@ impl From<AssetTypeArg> for AssetTypeHint {
             AssetTypeArg::F64Map => AssetTypeHint::F64Map,
             AssetTypeArg::Blob => AssetTypeHint::Binary,
             AssetTypeArg::ViewSet => AssetTypeHint::ViewSet,
+            AssetTypeArg::Splat => AssetTypeHint::Splat,
         }
     }
 }
@@ -182,6 +185,7 @@ pub fn run_project_add_asset(args: ProjectAddAssetArgs) -> Result<()> {
             "wgsl" => AssetTypeArg::Wgsl,
             "cbor" => AssetTypeArg::Config,
             "vviews" => AssetTypeArg::ViewSet,
+            "vsplat" => AssetTypeArg::Splat,
             _ => AssetTypeArg::Blob,
         })
         .into();
@@ -190,6 +194,11 @@ pub fn run_project_add_asset(args: ProjectAddAssetArgs) -> Result<()> {
         volumetric_abi::viewset::decode_viewset(&bytes)
             .map_err(anyhow::Error::msg)
             .context("Invalid view set asset")?;
+    }
+    if type_hint == AssetTypeHint::Splat {
+        volumetric_abi::splat::decode_splat(&bytes)
+            .map_err(anyhow::Error::msg)
+            .context("Invalid splat asset")?;
     }
     if type_hint == AssetTypeHint::F64Map {
         if extension == "json" {
@@ -319,6 +328,7 @@ pub fn input_type_label(input: &OperatorMetadataInput) -> String {
         OperatorMetadataInput::TriMesh => "TriMesh".to_string(),
         OperatorMetadataInput::Subspace => "Subspace".to_string(),
         OperatorMetadataInput::ViewSet => "ViewSet".to_string(),
+        OperatorMetadataInput::Splat => "Splat".to_string(),
     }
 }
 
@@ -435,6 +445,13 @@ fn coerce_input(
             volumetric_abi::viewset::decode_viewset(&bytes)
                 .map_err(anyhow::Error::msg)
                 .with_context(|| format!("{slot_desc} is not a valid view set"))?;
+            inline(bytes)
+        }
+
+        (ParsedInput::Bytes(bytes, _), OperatorMetadataInput::Splat) => {
+            volumetric_abi::splat::decode_splat(&bytes)
+                .map_err(anyhow::Error::msg)
+                .with_context(|| format!("{slot_desc} is not a valid splat"))?;
             inline(bytes)
         }
 
@@ -719,6 +736,7 @@ pub fn run_project_export(args: ProjectExportArgs) -> Result<()> {
             AssetTypeHint::FeaMesh => "vfea",
             AssetTypeHint::TriMesh => "vmesh",
             AssetTypeHint::ViewSet => "vviews",
+            AssetTypeHint::Splat => "vsplat",
             _ => "bin",
         };
 

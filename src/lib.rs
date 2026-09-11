@@ -204,6 +204,10 @@ pub enum AssetTypeHint {
     /// CBOR-encoded set of posed images with cameras, depth maps and a
     /// marker map (explicit data; never handed to the model executor)
     ViewSet,
+    /// CBOR-encoded Gaussian splat: a trained set of oriented Gaussians or
+    /// surfels with colour (explicit data; never handed to the model
+    /// executor)
+    Splat,
 }
 
 impl std::fmt::Display for AssetTypeHint {
@@ -221,6 +225,7 @@ impl std::fmt::Display for AssetTypeHint {
             AssetTypeHint::TriMesh => write!(f, "TriMesh"),
             AssetTypeHint::Subspace => write!(f, "Subspace"),
             AssetTypeHint::ViewSet => write!(f, "ViewSet"),
+            AssetTypeHint::Splat => write!(f, "Splat"),
         }
     }
 }
@@ -236,6 +241,7 @@ impl From<&OperatorMetadataOutput> for AssetTypeHint {
             OperatorMetadataOutput::Subspace => AssetTypeHint::Subspace,
             OperatorMetadataOutput::F64Map => AssetTypeHint::F64Map,
             OperatorMetadataOutput::ViewSet => AssetTypeHint::ViewSet,
+            OperatorMetadataOutput::Splat => AssetTypeHint::Splat,
         }
     }
 }
@@ -325,6 +331,9 @@ pub use volumetric_abi::{f64_map, lua_parameters, wgsl_parameters};
 // The triangle mesh value type (CBOR payload of TriMesh-typed assets).
 pub use volumetric_abi::trimesh;
 pub use volumetric_abi::viewset;
+
+// The Gaussian splat value type (CBOR payload of Splat-typed assets).
+pub use volumetric_abi::splat;
 
 // The affine subspace value type (CBOR payload of Subspace-typed assets).
 pub use volumetric_abi::subspace;

@@ -41,6 +41,8 @@ const OPERATORS: &[&str] = &[
     "view_solve_operator",
     "view_detect_operator",
     "survey_operator",
+    "splat_import_operator",
+    "splat_points_operator",
     "cloud_normals_operator",
     "step_import_operator",
     "rectangular_prism_operator",

@@ -35,6 +35,7 @@ mod project;
 mod raster;
 mod render;
 mod solve;
+mod splat;
 mod survey;
 mod views;
 
@@ -115,6 +116,8 @@ enum Commands {
     ViewDetect(observe::ViewDetectArgs),
     /// Survey a detected view set: cameras, poses and the marker field
     ViewSurvey(survey::ViewSurveyArgs),
+    /// Describe a trained splat: count, kind, bounds, opacity and scale quantiles, provenance
+    SplatList(splat::SplatListArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -589,5 +592,6 @@ fn main() -> Result<()> {
         Commands::ViewSolve(args) => solve::run_view_solve(args),
         Commands::ViewDetect(args) => observe::run_view_detect(args),
         Commands::ViewSurvey(args) => survey::run_view_survey(args),
+        Commands::SplatList(args) => splat::run_splat_list(args),
     }
 }

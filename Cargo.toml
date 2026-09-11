@@ -37,6 +37,8 @@ members = [
     "crates/operators/view_solve_operator",
     "crates/operators/view_detect_operator",
     "crates/operators/survey_operator",
+    "crates/operators/splat_import_operator",
+    "crates/operators/splat_points_operator",
     "crates/operators/cloud_normals_operator",
     "crates/operators/step_import_operator",
     "crates/operators/rectangular_prism_operator",
@@ -160,6 +162,7 @@ web-time = "1"
 
 [dev-dependencies]
 cv_core = { path = "crates/cv_core" }
+ply_core = { path = "crates/ply_core" }
 # Hand-assemble tiny test models in integration tests (already in the tree
 # via wasmtime).
 wat = "1"
