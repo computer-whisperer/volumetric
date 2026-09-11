@@ -50,6 +50,17 @@ impl Rgb {
         })
     }
 
+    /// The image as JPEG bytes at `quality` (1 to 100).
+    pub fn to_jpeg(&self, quality: u8) -> Result<Vec<u8>> {
+        let buffer = image::RgbImage::from_raw(self.width, self.height, self.pixels.clone())
+            .ok_or_else(|| anyhow!("pixel buffer does not match the image size"))?;
+        let mut out = std::io::Cursor::new(Vec::new());
+        let encoder =
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality.clamp(1, 100));
+        buffer.write_with_encoder(encoder).context("encode JPEG")?;
+        Ok(out.into_inner())
+    }
+
     /// The image as PNG bytes.
     pub fn to_png(&self) -> Result<Vec<u8>> {
         let buffer = image::RgbImage::from_raw(self.width, self.height, self.pixels.clone())
@@ -60,6 +71,15 @@ impl Rgb {
             .context("encode PNG")?;
         Ok(out.into_inner())
     }
+}
+
+/// The width and height of an encoded picture, read from its header.
+pub fn dimensions_of(bytes: &[u8]) -> Result<(u32, u32)> {
+    image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .context("read picture header")?
+        .into_dimensions()
+        .context("read picture size")
 }
 
 /// Z-depth in metres per pixel; NaN where the map has no measurement.

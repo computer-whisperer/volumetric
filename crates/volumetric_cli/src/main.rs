@@ -35,6 +35,7 @@ mod project;
 mod raster;
 mod render;
 mod solve;
+mod survey;
 mod views;
 
 #[derive(Parser, Debug)]
@@ -112,6 +113,8 @@ enum Commands {
     ViewSolve(solve::ViewSolveArgs),
     /// Detect the swatches, the survey card and its corners in a set's pictures
     ViewDetect(observe::ViewDetectArgs),
+    /// Survey a detected view set: cameras, poses and the marker field
+    ViewSurvey(survey::ViewSurveyArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -585,5 +588,6 @@ fn main() -> Result<()> {
         Commands::ViewResidual(args) => views::run_view_residual(args),
         Commands::ViewSolve(args) => solve::run_view_solve(args),
         Commands::ViewDetect(args) => observe::run_view_detect(args),
+        Commands::ViewSurvey(args) => survey::run_view_survey(args),
     }
 }

@@ -1044,6 +1044,7 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 name = "cv_core"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "volumetric_abi",
 ]
 
@@ -5298,6 +5299,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "survey_operator"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "cv_core",
+ "serde",
+ "volumetric_abi",
+]
+
+[[package]]
 name = "svgtypes"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5933,6 +5944,7 @@ name = "view_core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cv_core",
  "image",
  "rayon",
  "serde_json",

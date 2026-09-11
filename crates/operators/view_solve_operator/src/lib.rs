@@ -250,7 +250,7 @@ mod tests {
         ));
         let set = ViewSet {
             board: None,
-            schema: 1,
+            schema: 2,
             world: Default::default(),
             provenance: Default::default(),
             cameras: vec![truth.clone()],
@@ -268,7 +268,7 @@ mod tests {
         let solved = solve(&bytes, &picture, &config).unwrap();
         assert_eq!(solved.view_id, "phone");
         let (added, camera) = solved.set.view("phone").unwrap();
-        let (angle, dist) = pose_difference(&added.camera_to_world, &view.camera_to_world);
+        let (angle, dist) = pose_difference(added.pose().unwrap(), view.pose().unwrap());
         assert!(angle < 0.002 && dist < 0.003, "{angle} rad, {dist} m");
         assert_eq!(camera.fx, 1000.0);
         assert!(added.image.is_some());

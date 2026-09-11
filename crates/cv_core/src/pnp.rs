@@ -144,11 +144,31 @@ fn planar_pose(camera: &CameraModel, corners: &[Correspondence]) -> Option<Rigid
     if corners.len() < 4 {
         return None;
     }
-    // A frame on the marker's plane: origin at corner 0, u along corner
-    // 1, v the in-plane perpendicular, w the normal.
+    // A frame on the points' plane: origin at corner 0, u towards the
+    // farthest point, v towards the point farthest off that line, w the
+    // normal. (A marker's corners 0, 1, 3 would do; the card's first
+    // three corners are collinear.)
     let origin = corners[0].world;
-    let u = normalized(sub(corners[1].world, origin));
-    let v0 = sub(corners[3].world, origin);
+    let far = corners
+        .iter()
+        .max_by(|a, b| norm(sub(a.world, origin)).total_cmp(&norm(sub(b.world, origin))))?
+        .world;
+    if norm(sub(far, origin)) < 1e-12 {
+        return None;
+    }
+    let u = normalized(sub(far, origin));
+    let off_line = |p: [f64; 3]| {
+        let d = sub(p, origin);
+        norm(sub(d, scale(u, dot(d, u))))
+    };
+    let side = corners
+        .iter()
+        .max_by(|a, b| off_line(a.world).total_cmp(&off_line(b.world)))?
+        .world;
+    if off_line(side) < 1e-12 {
+        return None;
+    }
+    let v0 = sub(side, origin);
     let v = normalized(sub(v0, scale(u, dot(v0, u))));
     let w = cross(u, v);
     let plane: Vec<[f64; 2]> = corners
@@ -642,7 +662,7 @@ mod tests {
         let markers = floor_markers();
         let found = detections(&camera, &view, &markers, 0.0);
         let solve = solve_view(&camera, &markers, &found, &SolveOptions::default()).unwrap();
-        let (angle, dist) = pose_difference(&solve.camera_to_world, &view.camera_to_world);
+        let (angle, dist) = pose_difference(&solve.camera_to_world, view.pose().unwrap());
         assert!(
             angle < 1e-6 && dist < 1e-6,
             "{angle} rad, {dist} m, rms {}",
@@ -654,7 +674,7 @@ mod tests {
         // With 0.3 px of corner noise the pose holds to millimetres.
         let noisy = detections(&camera, &view, &markers, 0.3);
         let solve = solve_view(&camera, &markers, &noisy, &SolveOptions::default()).unwrap();
-        let (angle, dist) = pose_difference(&solve.camera_to_world, &view.camera_to_world);
+        let (angle, dist) = pose_difference(&solve.camera_to_world, view.pose().unwrap());
         assert!(angle < 0.002 && dist < 0.003, "{angle} rad, {dist} m");
         assert!(solve.rms_px < 0.5, "{}", solve.rms_px);
         assert_eq!(solve.markers.len(), 5);
@@ -667,14 +687,14 @@ mod tests {
             &SolveOptions::default(),
         )
         .unwrap();
-        let (angle, dist) = pose_difference(&one.camera_to_world, &view.camera_to_world);
+        let (angle, dist) = pose_difference(&one.camera_to_world, view.pose().unwrap());
         assert!(angle < 1e-3 && dist < 2e-3, "{angle} rad, {dist} m");
 
         // A wild corner is cut and the pose survives.
         let mut spoiled = found.clone();
         spoiled[2].corners[1][0] += 40.0;
         let solve = solve_view(&camera, &markers, &spoiled, &SolveOptions::default()).unwrap();
-        let (angle, dist) = pose_difference(&solve.camera_to_world, &view.camera_to_world);
+        let (angle, dist) = pose_difference(&solve.camera_to_world, view.pose().unwrap());
         assert!(angle < 1e-4 && dist < 1e-4, "{angle} rad, {dist} m");
         assert_eq!(solve.corners_used, 19);
         assert_eq!(
@@ -707,7 +727,7 @@ mod tests {
         assert!((focal.value - 1000.0).abs() < 8.0, "{focal:?}");
         assert!(focal.std < 10.0, "{focal:?}");
         assert!((solve.camera.fx - focal.value).abs() < 1e-9);
-        let (angle, dist) = pose_difference(&solve.camera_to_world, &view.camera_to_world);
+        let (angle, dist) = pose_difference(&solve.camera_to_world, view.pose().unwrap());
         assert!(angle < 0.01 && dist < 0.02, "{angle} rad, {dist} m");
 
         // Square-on to the floor the focal trades against the height: the

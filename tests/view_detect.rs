@@ -89,7 +89,7 @@ fn scene() -> ViewSet {
     ));
     let mut with_picture = view.clone();
     with_picture.image = Some(picture);
-    let blind = View::posed("blind", 0, view.camera_to_world);
+    let blind = View::posed("blind", 0, view.camera_to_world.unwrap());
     ViewSet {
         cameras: vec![camera],
         views: vec![with_picture, blind],

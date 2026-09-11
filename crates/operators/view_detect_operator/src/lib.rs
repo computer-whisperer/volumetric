@@ -130,6 +130,15 @@ pub fn detect(set_bytes: &[u8], config: &ViewDetectConfig) -> Result<Detected, S
             .map_err(|e| format!("view '{}': the picture does not decode: {e}", view.id))?
             .to_rgb8();
         let (width, height) = decoded.dimensions();
+        let camera = &set.cameras[view.camera as usize];
+        if (width, height) != (camera.width, camera.height) {
+            return Err(format!(
+                "view '{}': the embedded picture is {width}x{height} but its camera is {}x{}; \
+                 detection needs the full picture (import the stills with --embed full, or run \
+                 view-detect on the command line, which reads the originals)",
+                view.id, camera.width, camera.height
+            ));
+        }
         let gray = Gray::from_rgb8(width, height, decoded.as_raw());
         let seen = observe(&gray, &options);
         let mut parts: Vec<String> = options
@@ -295,7 +304,10 @@ mod tests {
         with_picture.image = Some(picture);
         let set = ViewSet {
             cameras: vec![camera],
-            views: vec![with_picture, View::posed("blind", 0, view.camera_to_world)],
+            views: vec![
+                with_picture,
+                View::posed("blind", 0, view.camera_to_world.unwrap()),
+            ],
             ..ViewSet::default()
         };
         let found = detect(&encode_viewset(&set), &ViewDetectConfig::default()).unwrap();

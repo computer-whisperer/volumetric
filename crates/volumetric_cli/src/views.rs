@@ -1,7 +1,8 @@
 //! View sets on the command line: `view-import` embeds a selection of a
-//! posed-image dataset into a `.vviews` file or a project, `view-list`
-//! describes one, and `view-residual` compares a model against the depth
-//! maps its views carry.
+//! posed-image dataset, or a directory of stills straight from a camera,
+//! into a `.vviews` file or a project, `view-list` describes one, and
+//! `view-residual` compares a model against the depth maps its views
+//! carry.
 
 use std::path::{Path, PathBuf};
 
@@ -10,7 +11,7 @@ use clap::{Parser, ValueEnum};
 use serde::Serialize;
 use view_core::image::{decode_depth, decode_mask};
 use view_core::residual::{ResidualStats, Search, depth_residual, residual_image};
-use view_core::{Eye, Labels, Selection, import_manifest};
+use view_core::{Embed, Eye, Labels, Selection, StillsOptions, import_manifest, import_stills};
 use volumetric::wasm::ParallelModelSampler;
 use volumetric::{AssetTypeHint, ImportedAsset, LoadedAsset, Project};
 use volumetric_abi::viewset::{Distortion, ViewSet, decode_viewset, encode_viewset};
@@ -22,12 +23,50 @@ pub enum EyeArg {
     Both,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum EmbedArg {
+    /// The original files
+    Full,
+    /// Reduced JPEGs; detection and export read the originals
+    Preview,
+    /// Only the references to the originals
+    None,
+}
+
 #[derive(Parser, Debug)]
 pub struct ViewImportArgs {
     /// The dataset manifest: the scanner's cameras.json or nerfstudio's
     /// transforms.json (files are read relative to it)
-    #[arg(short, long)]
-    pub manifest: PathBuf,
+    #[arg(short, long, conflicts_with = "stills")]
+    pub manifest: Option<PathBuf>,
+
+    /// A directory of stills straight from a camera: one unposed view per
+    /// picture, a camera per focus setting, for view-detect and
+    /// view-survey
+    #[arg(long)]
+    pub stills: Option<PathBuf>,
+
+    /// With --stills: file extensions that are stills (repeatable)
+    #[arg(long = "ext", default_values_t = ["jpg".to_string(), "jpeg".to_string()])]
+    pub extensions: Vec<String>,
+
+    /// With --stills: how much of each picture the set carries
+    #[arg(long, value_enum, default_value_t = EmbedArg::Preview)]
+    pub embed: EmbedArg,
+
+    /// With --stills --embed preview: the preview's longer side, pixels
+    #[arg(long, default_value_t = 1600)]
+    pub preview_px: u32,
+
+    /// With --stills: the sensor width in mm for the focal seed, when the
+    /// body is not one the intake knows
+    #[arg(long)]
+    pub sensor_mm: Option<f64>,
+
+    /// With --stills: horizontal field of view in degrees to seed the
+    /// focal when a picture gives no focal length
+    #[arg(long, default_value_t = 70.0)]
+    pub fov_deg: f64,
 
     /// Write the view set here (.vviews)
     #[arg(short, long)]
@@ -97,6 +136,73 @@ pub fn run_view_import(args: ViewImportArgs) -> Result<()> {
     if args.output.is_none() && args.project.is_none() {
         bail!("give --output, --project, or both");
     }
+    let labels = Labels {
+        session: args.session.clone(),
+        rig: args.rig.clone(),
+        field: args.field.clone(),
+        setup: args.setup.clone(),
+    };
+    let set = match (&args.manifest, &args.stills) {
+        (None, Some(dir)) => {
+            let options = StillsOptions {
+                extensions: args.extensions.clone(),
+                embed: match args.embed {
+                    EmbedArg::Full => Embed::Full,
+                    EmbedArg::Preview => Embed::Preview,
+                    EmbedArg::None => Embed::None,
+                },
+                preview_px: args.preview_px,
+                sensor_mm: args.sensor_mm,
+                fov_deg: args.fov_deg,
+                labels,
+                ..StillsOptions::default()
+            };
+            let (set, report) = import_stills(dir, &options)?;
+            println!(
+                "Imported {} stills from {}: {} camera(s), {:.1} MB embedded",
+                report.total,
+                dir.display(),
+                set.cameras.len(),
+                report.bytes as f64 / 1e6
+            );
+            for (i, (key, n)) in report.cameras.iter().enumerate() {
+                let c = &set.cameras[i];
+                println!(
+                    "  camera {i} '{key}': {n} frames, {}x{}, focal seed {:.0} px",
+                    c.width, c.height, c.fx
+                );
+            }
+            for w in &report.warnings {
+                println!("  note: {w}");
+            }
+            set
+        }
+        (Some(manifest), None) => import_from_manifest(&args, manifest, labels)?,
+        _ => bail!("give --manifest or --stills"),
+    };
+    let bytes = encode_viewset(&set);
+    if let Some(output) = &args.output {
+        std::fs::write(output, &bytes)
+            .with_context(|| format!("Failed to write {}", output.display()))?;
+        println!("Wrote {} ({} bytes)", output.display(), bytes.len());
+    }
+    if let Some(path) = &args.project {
+        let mut project = Project::load_from_file(path).context("Failed to load project")?;
+        let asset_id = project.unique_asset_id(&args.asset_id);
+        project.imports_mut().push(ImportedAsset::new(
+            asset_id.clone(),
+            bytes,
+            Some(AssetTypeHint::ViewSet),
+        ));
+        project
+            .save_to_file(path)
+            .with_context(|| format!("Failed to save {}", path.display()))?;
+        println!("Added ViewSet asset '{asset_id}' to {}", path.display());
+    }
+    Ok(())
+}
+
+fn import_from_manifest(args: &ViewImportArgs, manifest: &Path, labels: Labels) -> Result<ViewSet> {
     let near = args
         .near
         .as_deref()
@@ -123,14 +229,7 @@ pub fn run_view_import(args: ViewImportArgs) -> Result<()> {
         depth: !args.no_depth,
         masks: !args.no_masks,
     };
-    let labels = Labels {
-        session: args.session.clone(),
-        rig: args.rig.clone(),
-        field: args.field.clone(),
-        setup: args.setup.clone(),
-    };
-    let (set, report) = import_manifest(&args.manifest, &selection, &labels)?;
-    let bytes = encode_viewset(&set);
+    let (set, report) = import_manifest(manifest, &selection, &labels)?;
     println!(
         "Imported {} of {} views from {}: {} images, {} depth maps, {} masks, {:.1} MB embedded; {} camera(s), {} markers",
         report.selected,
@@ -143,25 +242,7 @@ pub fn run_view_import(args: ViewImportArgs) -> Result<()> {
         set.cameras.len(),
         set.markers.len()
     );
-    if let Some(output) = &args.output {
-        std::fs::write(output, &bytes)
-            .with_context(|| format!("Failed to write {}", output.display()))?;
-        println!("Wrote {} ({} bytes)", output.display(), bytes.len());
-    }
-    if let Some(path) = &args.project {
-        let mut project = Project::load_from_file(path).context("Failed to load project")?;
-        let asset_id = project.unique_asset_id(&args.asset_id);
-        project.imports_mut().push(ImportedAsset::new(
-            asset_id.clone(),
-            bytes,
-            Some(AssetTypeHint::ViewSet),
-        ));
-        project
-            .save_to_file(path)
-            .with_context(|| format!("Failed to save {}", path.display()))?;
-        println!("Added ViewSet asset '{asset_id}' to {}", path.display());
-    }
-    Ok(())
+    Ok(set)
 }
 
 /// A project's imported assets as loaded assets.
@@ -280,14 +361,19 @@ struct CameraSummary {
     cx: f64,
     cy: f64,
     distortion: String,
+    label: String,
+    /// The radial terms, when the lens has any.
+    k: Vec<f64>,
 }
 
 #[derive(Serialize)]
 struct ViewSummary {
     id: String,
     camera: u32,
-    position: [f64; 3],
-    forward: [f64; 3],
+    /// Absent for a view not yet posed.
+    position: Option<[f64; 3]>,
+    forward: Option<[f64; 3]>,
+    camera_to_world: Option<[f64; 12]>,
     image: bool,
     depth: bool,
     mask: bool,
@@ -301,7 +387,8 @@ struct SetSummary {
     provenance: volumetric_abi::viewset::Provenance,
     cameras: Vec<CameraSummary>,
     views: Vec<ViewSummary>,
-    markers: usize,
+    markers: Vec<volumetric_abi::viewset::Marker>,
+    board: Option<volumetric_abi::viewset::Board>,
 }
 
 fn distortion_label(distortion: &Distortion) -> String {
@@ -330,6 +417,12 @@ fn summarize(set: &ViewSet) -> SetSummary {
                 cx: c.cx,
                 cy: c.cy,
                 distortion: distortion_label(&c.distortion),
+                label: c.label.clone(),
+                k: match &c.distortion {
+                    Distortion::Radial { k, .. } => k.clone(),
+                    Distortion::KannalaBrandt { k } => k.to_vec(),
+                    Distortion::None => Vec::new(),
+                },
             })
             .collect(),
         views: set
@@ -340,13 +433,15 @@ fn summarize(set: &ViewSet) -> SetSummary {
                 camera: v.camera,
                 position: v.position(),
                 forward: v.forward(),
+                camera_to_world: v.camera_to_world,
                 image: v.image.is_some(),
                 depth: v.depth.is_some(),
                 mask: v.mask.is_some(),
                 tags: v.tags.clone(),
             })
             .collect(),
-        markers: set.markers.len(),
+        markers: set.markers.clone(),
+        board: set.board.clone(),
     }
 }
 
@@ -363,7 +458,7 @@ pub fn run_view_list(args: ViewListArgs) -> Result<()> {
         summary.schema,
         summary.views.len(),
         summary.cameras.len(),
-        summary.markers,
+        summary.markers.len(),
         summary.up[0],
         summary.up[1],
         summary.up[2]
@@ -383,16 +478,17 @@ pub fn run_view_list(args: ViewListArgs) -> Result<()> {
     }
     println!("Views:");
     for v in &summary.views {
+        let pose = match (v.position, v.forward) {
+            (Some(p), Some(f)) => format!(
+                "at ({:+.3}, {:+.3}, {:+.3}) looking ({:+.2}, {:+.2}, {:+.2})",
+                p[0], p[1], p[2], f[0], f[1], f[2]
+            ),
+            _ => "unposed".to_string(),
+        };
         println!(
-            "  {:<12} cam {} at ({:+.3}, {:+.3}, {:+.3}) looking ({:+.2}, {:+.2}, {:+.2}) {}{}{} {}",
+            "  {:<12} cam {} {pose} {}{}{} {}",
             v.id,
             v.camera,
-            v.position[0],
-            v.position[1],
-            v.position[2],
-            v.forward[0],
-            v.forward[1],
-            v.forward[2],
             if v.image { "image " } else { "" },
             if v.depth { "depth " } else { "" },
             if v.mask { "mask " } else { "" },
@@ -667,7 +763,7 @@ mod tests {
         let summary = summarize(&set);
         assert_eq!(summary.views.len(), 2);
         assert_eq!(summary.cameras[0].distortion, "none");
-        assert_eq!(summary.views[1].forward, [0.0, 0.0, 1.0]);
+        assert_eq!(summary.views[1].forward, Some([0.0, 0.0, 1.0]));
         assert!(!summary.views[0].depth);
     }
 }

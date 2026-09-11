@@ -19,8 +19,9 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The schema this module writes and accepts.
-pub const VIEWSET_SCHEMA: u32 = 1;
+/// The schema this module writes. Schema 1 (every view posed, no shot
+/// state) is read and upgraded.
+pub const VIEWSET_SCHEMA: u32 = 2;
 
 /// Posed images, their cameras, the marker map that posed them, and where
 /// they came from.
@@ -72,11 +73,19 @@ pub struct Provenance {
     pub tools: Vec<String>,
     /// When the capture happened (ISO 8601), if known.
     pub captured: String,
+    /// The directory the views' `source` paths are relative to, when the
+    /// pictures live outside the set.
+    #[serde(default)]
+    pub origin: String,
 }
 
 /// A pinhole camera in the OpenCV convention, with its lens distortion.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CameraModel {
+    /// What the camera is, for people: the body, lens and focus setting
+    /// the intake keyed it by. Empty when unknown.
+    #[serde(default)]
+    pub label: String,
     pub width: u32,
     pub height: u32,
     pub fx: f64,
@@ -108,8 +117,10 @@ pub struct View {
     /// Index into [`ViewSet::cameras`].
     pub camera: u32,
     /// Camera-to-world transform, the rows of a 3x4 matrix: camera axes as
-    /// columns, camera position as the last column.
-    pub camera_to_world: [f64; 12],
+    /// columns, camera position as the last column. `None` for a view not
+    /// yet posed (a still straight from the camera).
+    #[serde(default)]
+    pub camera_to_world: Option<[f64; 12]>,
     /// Seconds from the session's start, when known.
     pub time: Option<f64>,
     /// The photograph, PNG or JPEG encoded.
@@ -128,6 +139,60 @@ pub struct View {
     /// What detection found in the photograph.
     #[serde(default)]
     pub observations: Option<Observations>,
+    /// The camera's state when the picture was taken, from its metadata.
+    #[serde(default)]
+    pub shot: Option<Shot>,
+    /// Where the original picture is, relative to the provenance's
+    /// `origin`, when the embedded picture is reduced or absent.
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+/// A camera's state for one exposure, as its metadata reports it. Zero
+/// or empty means unknown.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Shot {
+    pub make: String,
+    pub model: String,
+    pub lens: String,
+    /// Physical focal length, millimetres.
+    pub focal_mm: f64,
+    pub f_number: f64,
+    pub exposure_s: f64,
+    pub iso: u32,
+    /// `manual`, `dmf`, `af-s`, `af-c`, `af-a`, or empty.
+    pub focus_mode: String,
+    /// The lens focus encoder, when the maker note gives it (Sony: 80 to
+    /// 255, 255 at infinity).
+    pub focus_position: Option<u32>,
+    /// Image stabilisation, when the maker note gives it.
+    pub stabilisation: Option<bool>,
+    /// The EXIF orientation value, 1 for upright; 0 when absent.
+    pub orientation: u32,
+}
+
+impl Shot {
+    /// Focus that stays put between frames: manual and direct manual
+    /// focus, or any setting whose mode is unknown.
+    pub fn focus_is_held(&self) -> bool {
+        !self.focus_mode.starts_with("af")
+    }
+
+    /// The key frames with the same intrinsics share: body, lens, focus
+    /// mode and focus position. An autofocus frame focuses anew each time
+    /// and gets a key of its own, from `view_id`.
+    pub fn camera_key(&self, view_id: &str) -> String {
+        let focus = match self.focus_position {
+            Some(p) => format!("{}:{p}", self.focus_mode),
+            None => self.focus_mode.clone(),
+        };
+        let mut key = format!("{}:{}:{}:{focus}", self.make, self.model, self.lens);
+        if !self.focus_is_held() {
+            key.push(':');
+            key.push_str(view_id);
+        }
+        key
+    }
 }
 
 /// A printed target card at a known place in the world.
@@ -499,6 +564,7 @@ impl CameraModel {
     /// An ideal pinhole with no distortion.
     pub fn pinhole(width: u32, height: u32, fx: f64, fy: f64, cx: f64, cy: f64) -> Self {
         Self {
+            label: String::new(),
             width,
             height,
             fx,
@@ -656,9 +722,17 @@ impl View {
     /// A view at `camera_to_world` with nothing embedded.
     pub fn posed(id: impl Into<String>, camera: u32, camera_to_world: [f64; 12]) -> Self {
         Self {
+            camera_to_world: Some(camera_to_world),
+            ..Self::unposed(id, camera)
+        }
+    }
+
+    /// A view with no pose yet and nothing embedded.
+    pub fn unposed(id: impl Into<String>, camera: u32) -> Self {
+        Self {
             id: id.into(),
             camera,
-            camera_to_world,
+            camera_to_world: None,
             time: None,
             image: None,
             depth: None,
@@ -666,79 +740,90 @@ impl View {
             mask: None,
             tags: Vec::new(),
             observations: None,
+            shot: None,
+            source: None,
         }
     }
 
+    /// The camera-to-world pose, when the view has one.
+    pub fn pose(&self) -> Option<&[f64; 12]> {
+        self.camera_to_world.as_ref()
+    }
+
     /// The camera position in the world.
-    pub fn position(&self) -> [f64; 3] {
-        let m = &self.camera_to_world;
-        [m[3], m[7], m[11]]
+    pub fn position(&self) -> Option<[f64; 3]> {
+        self.pose().map(|m| [m[3], m[7], m[11]])
     }
 
     /// Camera axis `i` (0 = right, 1 = down, 2 = forward) in the world.
-    pub fn axis(&self, i: usize) -> [f64; 3] {
-        let m = &self.camera_to_world;
-        [m[i], m[4 + i], m[8 + i]]
+    pub fn axis(&self, i: usize) -> Option<[f64; 3]> {
+        self.pose().map(|m| [m[i], m[4 + i], m[8 + i]])
     }
 
     /// The direction the camera looks along, in the world.
-    pub fn forward(&self) -> [f64; 3] {
+    pub fn forward(&self) -> Option<[f64; 3]> {
         self.axis(2)
     }
 
     /// A camera-space point in the world.
-    pub fn to_world(&self, point: [f64; 3]) -> [f64; 3] {
-        let m = &self.camera_to_world;
+    pub fn to_world(&self, point: [f64; 3]) -> Option<[f64; 3]> {
+        let m = self.pose()?;
         let [x, y, z] = point;
-        [
+        Some([
             m[0] * x + m[1] * y + m[2] * z + m[3],
             m[4] * x + m[5] * y + m[6] * z + m[7],
             m[8] * x + m[9] * y + m[10] * z + m[11],
-        ]
+        ])
     }
 
     /// A world point in camera space (the rotation is orthonormal, so its
     /// transpose inverts it).
-    pub fn to_camera(&self, point: [f64; 3]) -> [f64; 3] {
-        let m = &self.camera_to_world;
+    pub fn to_camera(&self, point: [f64; 3]) -> Option<[f64; 3]> {
+        let m = self.pose()?;
         let d = [point[0] - m[3], point[1] - m[7], point[2] - m[11]];
-        [
+        Some([
             m[0] * d[0] + m[4] * d[1] + m[8] * d[2],
             m[1] * d[0] + m[5] * d[1] + m[9] * d[2],
             m[2] * d[0] + m[6] * d[1] + m[10] * d[2],
-        ]
+        ])
     }
 
-    /// The pixel a world point lands on through `camera`.
+    /// The pixel a world point lands on through `camera`; `None` when the
+    /// view is unposed or the point is behind it.
     pub fn project(&self, camera: &CameraModel, world: [f64; 3]) -> Option<[f64; 2]> {
-        camera.project(self.to_camera(world))
+        camera.project(self.to_camera(world)?)
     }
 
     /// The world point a pixel sees at z-depth `depth`.
-    pub fn unproject(&self, camera: &CameraModel, pixel: [f64; 2], depth: f64) -> [f64; 3] {
+    pub fn unproject(&self, camera: &CameraModel, pixel: [f64; 2], depth: f64) -> Option<[f64; 3]> {
         self.to_world(camera.point_at_depth(pixel, depth))
     }
 
     /// The world-space unit direction a pixel looks along.
-    pub fn ray(&self, camera: &CameraModel, pixel: [f64; 2]) -> [f64; 3] {
+    pub fn ray(&self, camera: &CameraModel, pixel: [f64; 2]) -> Option<[f64; 3]> {
         let d = camera.ray(pixel);
-        let m = &self.camera_to_world;
-        normalized([
+        let m = self.pose()?;
+        Some(normalized([
             m[0] * d[0] + m[1] * d[1] + m[2] * d[2],
             m[4] * d[0] + m[5] * d[1] + m[6] * d[2],
             m[8] * d[0] + m[9] * d[1] + m[10] * d[2],
-        ])
+        ]))
     }
 
     fn validate_pose(&self) -> Result<(), String> {
-        if self.camera_to_world.iter().any(|v| !v.is_finite()) {
+        let Some(m) = &self.camera_to_world else {
+            return Ok(());
+        };
+        if m.iter().any(|v| !v.is_finite()) {
             return Err("pose has a non-finite entry".to_string());
         }
         // Columns of the rotation must be orthonormal.
         for i in 0..3 {
             for j in i..3 {
                 let expected = if i == j { 1.0 } else { 0.0 };
-                if (dot(self.axis(i), self.axis(j)) - expected).abs() > 1e-4 {
+                let a = [m[i], m[4 + i], m[8 + i]];
+                let b = [m[j], m[4 + j], m[8 + j]];
+                if (dot(a, b) - expected).abs() > 1e-4 {
                     return Err("pose rotation is not orthonormal".to_string());
                 }
             }
@@ -771,10 +856,14 @@ pub fn encode_viewset(set: &ViewSet) -> Vec<u8> {
     out
 }
 
-/// Decodes and validates a view set.
+/// Decodes and validates a view set. A schema-1 set (every view posed,
+/// no shot state) reads as schema 2.
 pub fn decode_viewset(bytes: &[u8]) -> Result<ViewSet, String> {
-    let set: ViewSet = ciborium::de::from_reader(std::io::Cursor::new(bytes))
+    let mut set: ViewSet = ciborium::de::from_reader(std::io::Cursor::new(bytes))
         .map_err(|e| format!("failed to decode view set CBOR: {e}"))?;
+    if set.schema == 1 {
+        set.schema = VIEWSET_SCHEMA;
+    }
     set.validate()?;
     Ok(set)
 }
@@ -874,9 +963,9 @@ mod tests {
     fn poses_move_points_both_ways() {
         let view = View::posed("v", 0, posed());
         let camera = &cameras()[0];
-        assert_eq!(view.position(), [1.0, 2.0, 3.0]);
-        assert_eq!(view.forward(), [1.0, 0.0, -0.0].map(|v| v * 1.0));
-        let world = view.unproject(camera, [484.0, 488.0], 2.0);
+        assert_eq!(view.position(), Some([1.0, 2.0, 3.0]));
+        assert_eq!(view.forward(), Some([1.0, 0.0, -0.0].map(|v| v * 1.0)));
+        let world = view.unproject(camera, [484.0, 488.0], 2.0).unwrap();
         // The optical axis looks along world +x from (1, 2, 3).
         assert!(
             (world[0] - 3.0).abs() < 1e-12
@@ -886,13 +975,15 @@ mod tests {
         );
         let pixel = view.project(camera, world).unwrap();
         assert!((pixel[0] - 484.0).abs() < 1e-9 && (pixel[1] - 488.0).abs() < 1e-9);
-        let back = view.to_camera(view.to_world([0.3, -0.2, 1.7]));
+        let back = view
+            .to_camera(view.to_world([0.3, -0.2, 1.7]).unwrap())
+            .unwrap();
         assert!(
             (back[0] - 0.3).abs() < 1e-12
                 && (back[1] + 0.2).abs() < 1e-12
                 && (back[2] - 1.7).abs() < 1e-12
         );
-        let ray = view.ray(camera, [484.0, 488.0]);
+        let ray = view.ray(camera, [484.0, 488.0]).unwrap();
         assert!((ray[0] - 1.0).abs() < 1e-9, "{ray:?}");
     }
 
@@ -1019,12 +1110,17 @@ mod tests {
         if let ciborium::Value::Map(map) = &mut value {
             strip(map, "board");
             for (k, v) in map.iter_mut() {
+                if k.as_text() == Some("schema") {
+                    *v = ciborium::Value::Integer(1.into());
+                }
                 if k.as_text() == Some("views")
                     && let ciborium::Value::Array(views) = v
                 {
                     for view in views {
                         if let ciborium::Value::Map(fields) = view {
                             strip(fields, "observations");
+                            strip(fields, "shot");
+                            strip(fields, "source");
                         }
                     }
                 }
@@ -1033,8 +1129,55 @@ mod tests {
         let mut bytes = Vec::new();
         ciborium::ser::into_writer(&value, &mut bytes).unwrap();
         let old = decode_viewset(&bytes).unwrap();
+        assert_eq!(old.schema, VIEWSET_SCHEMA);
         assert!(old.board.is_none());
         assert!(old.views[0].observations.is_none());
+        assert!(old.views[0].shot.is_none() && old.views[0].source.is_none());
+        assert_eq!(old.views[0].camera_to_world, Some(identity_pose()));
+    }
+
+    #[test]
+    fn unposed_views_and_shots_round_trip() {
+        let mut set = ViewSet {
+            cameras: vec![CameraModel::pinhole(100, 80, 90.0, 90.0, 50.0, 40.0)],
+            views: vec![View::unposed("raw", 0)],
+            ..ViewSet::default()
+        };
+        set.views[0].source = Some("DSC00001.JPG".to_string());
+        set.views[0].shot = Some(Shot {
+            make: "SONY".to_string(),
+            model: "ILCE-6700".to_string(),
+            lens: "FE 50mm F1.8".to_string(),
+            focal_mm: 50.0,
+            f_number: 8.0,
+            exposure_s: 0.004,
+            iso: 5000,
+            focus_mode: "manual".to_string(),
+            focus_position: Some(170),
+            stabilisation: Some(false),
+            orientation: 1,
+        });
+        set.provenance.origin = "/stills".to_string();
+        let view = &set.views[0];
+        assert!(view.pose().is_none() && view.position().is_none());
+        assert!(view.project(&set.cameras[0], [0.0, 0.0, 1.0]).is_none());
+        assert!(view.ray(&set.cameras[0], [1.0, 1.0]).is_none());
+        let shot = view.shot.as_ref().unwrap();
+        assert_eq!(
+            shot.camera_key("raw"),
+            "SONY:ILCE-6700:FE 50mm F1.8:manual:170"
+        );
+        let af = Shot {
+            focus_mode: "af-s".to_string(),
+            ..shot.clone()
+        };
+        assert_eq!(
+            af.camera_key("raw"),
+            "SONY:ILCE-6700:FE 50mm F1.8:af-s:170:raw"
+        );
+        assert!(!af.focus_is_held() && shot.focus_is_held());
+        let back = decode_viewset(&encode_viewset(&set)).unwrap();
+        assert_eq!(back, set);
     }
 
     #[test]
@@ -1056,7 +1199,7 @@ mod tests {
         assert!(bad.validate().unwrap_err().contains("camera 9"));
 
         let mut bad = set.clone();
-        bad.views[0].camera_to_world[0] = 2.0;
+        bad.views[0].camera_to_world.as_mut().unwrap()[0] = 2.0;
         assert!(bad.validate().unwrap_err().contains("orthonormal"));
 
         let mut bad = set.clone();
@@ -1068,7 +1211,7 @@ mod tests {
         assert!(bad.validate().unwrap_err().contains("fx"));
 
         let mut bad = set;
-        bad.schema = 2;
+        bad.schema = 3;
         assert!(decode_viewset(&encode_viewset(&bad)).is_err());
     }
 }

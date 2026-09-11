@@ -589,7 +589,7 @@ mod tests {
         std::fs::write(&image, rgb.to_png().unwrap()).unwrap();
         let set = ViewSet {
             board: None,
-            schema: 1,
+            schema: 2,
             world: Default::default(),
             provenance: Default::default(),
             cameras: vec![truth.clone()],
@@ -629,7 +629,7 @@ mod tests {
         );
         assert_eq!(added.tags.last().map(String::as_str), Some("test"));
         let (angle, dist) =
-            cv_core::pnp::pose_difference(&added.camera_to_world, &view.camera_to_world);
+            cv_core::pnp::pose_difference(added.pose().unwrap(), view.pose().unwrap());
         assert!(angle < 0.01 && dist < 0.02, "{angle} rad, {dist} m");
         assert!((camera.fx - 1000.0).abs() < 15.0, "{}", camera.fx);
         assert!(dir.join("annotated.png").exists());

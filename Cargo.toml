@@ -36,6 +36,7 @@ members = [
     "crates/operators/cloud_fit_operator",
     "crates/operators/view_solve_operator",
     "crates/operators/view_detect_operator",
+    "crates/operators/survey_operator",
     "crates/operators/cloud_normals_operator",
     "crates/operators/step_import_operator",
     "crates/operators/rectangular_prism_operator",
@@ -181,6 +182,11 @@ required-features = ["native"]
 [profile.dev.package.cranelift-codegen]
 opt-level = 3
 [profile.dev.package.regalloc2]
+opt-level = 3
+# The survey bundle factorises dense normal matrices of a thousand
+# unknowns per iteration; unoptimised that turns a two-second test into
+# minutes.
+[profile.dev.package.cv_core]
 opt-level = 3
 
 # Upstream atomic-wait has no wasm32 backend, which blocks faer's thread

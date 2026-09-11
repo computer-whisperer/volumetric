@@ -16,6 +16,7 @@ use cv_core::gray::Gray;
 use cv_core::observe::{ObserveOptions, Observed, observe};
 use serde::Serialize;
 use view_core::image::{Rgb, decode_rgb};
+use view_core::stills::full_picture;
 use volumetric::{AssetTypeHint, Project};
 use volumetric_abi::viewset::{Board, BoardSpec, ViewSet, decode_viewset, encode_viewset};
 
@@ -415,14 +416,14 @@ pub(crate) fn detect_set(
     let mut skipped = Vec::new();
     for i in indices {
         let id = set.views[i].id.clone();
-        let Some(bytes) = set.views[i].image.as_ref() else {
+        if set.views[i].image.is_none() && set.views[i].source.is_none() {
             skipped.push(id);
             continue;
-        };
-        let photo = match decode_rgb(bytes) {
+        }
+        let photo = match full_picture(set, &set.views[i]).and_then(|bytes| decode_rgb(&bytes)) {
             Ok(photo) => photo,
             Err(err) => {
-                eprintln!("view '{id}': picture does not decode: {err}");
+                eprintln!("view '{id}': no picture to detect in: {err:#}");
                 skipped.push(id);
                 continue;
             }
@@ -593,7 +594,10 @@ mod tests {
         with_picture.image = Some(photo.to_png().unwrap());
         let mut set = ViewSet {
             cameras: vec![camera],
-            views: vec![with_picture, View::posed("blind", 0, view.camera_to_world)],
+            views: vec![
+                with_picture,
+                View::posed("blind", 0, view.camera_to_world.unwrap()),
+            ],
             ..ViewSet::default()
         };
         let options = ObserveOptions::default();

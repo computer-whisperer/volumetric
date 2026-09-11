@@ -212,9 +212,10 @@ fn select<'a>(candidates: &'a [Candidate], selection: &Selection) -> Result<Vec<
         })
         .filter(|c| {
             selection.near.is_none_or(|(point, radius)| {
-                let p = c.view.position();
-                let d = [p[0] - point[0], p[1] - point[1], p[2] - point[2]];
-                (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() <= radius
+                c.view.position().is_some_and(|p| {
+                    let d = [p[0] - point[0], p[1] - point[1], p[2] - point[2]];
+                    (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() <= radius
+                })
             })
         })
         .collect();
@@ -431,6 +432,7 @@ fn read_nerfstudio(json: &Value, base: &Path) -> Result<(ViewSet, Vec<Candidate>
             Distortion::Radial { k: radial, p }
         };
         Ok(CameraModel {
+            label: String::new(),
             width: w,
             height: h,
             fx,
@@ -573,7 +575,7 @@ mod tests {
         assert!(report.bytes > 0);
         assert_eq!(set.cameras[0].fx, 400.0);
         assert_eq!(set.cameras[0].cy, 2.5);
-        assert_eq!(set.views[0].position(), [1.0, 0.0, 0.0]);
+        assert_eq!(set.views[0].position(), Some([1.0, 0.0, 0.0]));
         assert!(set.views[0].tags.contains(&"frame:1".to_string()));
         assert_eq!(set.views[0].depth_unit_m, 1e-4);
         assert_eq!(set.markers.len(), 1);
@@ -598,7 +600,7 @@ mod tests {
         };
         let (set, _) = import_manifest(&manifest, &near, &labels).unwrap();
         assert_eq!(set.views.len(), 3);
-        assert!(set.views.iter().all(|v| v.position()[0] >= 4.0));
+        assert!(set.views.iter().all(|v| v.position().unwrap()[0] >= 4.0));
         let missing = Selection {
             ids: vec!["nope".to_string()],
             ..Selection::default()
@@ -641,9 +643,9 @@ mod tests {
         );
         assert_eq!(set.cameras[1].fx, 500.0);
         // OpenGL's camera looks along -z; in OpenCV it looks along +z.
-        assert_eq!(set.views[0].forward(), [0.0, 0.0, -1.0]);
-        assert_eq!(set.views[0].axis(1), [0.0, -1.0, 0.0]);
-        assert_eq!(set.views[0].position(), [1.0, 2.0, 3.0]);
+        assert_eq!(set.views[0].forward(), Some([0.0, 0.0, -1.0]));
+        assert_eq!(set.views[0].axis(1), Some([0.0, -1.0, 0.0]));
+        assert_eq!(set.views[0].position(), Some([1.0, 2.0, 3.0]));
         assert_eq!(set.views[1].camera, 1);
         let _ = std::fs::remove_dir_all(&dir);
     }

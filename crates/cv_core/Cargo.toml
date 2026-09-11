@@ -12,3 +12,4 @@ publish = false
 
 [dependencies]
 volumetric_abi = { path = "../volumetric_abi" }
+serde = { version = "1", features = ["derive"] }

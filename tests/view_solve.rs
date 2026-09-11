@@ -81,7 +81,7 @@ fn scene() -> (View, Vec<u8>, ViewSet) {
     ));
     let set = ViewSet {
         board: None,
-        schema: 1,
+        schema: 2,
         world: Default::default(),
         provenance: Default::default(),
         cameras: vec![truth],
@@ -151,7 +151,7 @@ fn a_still_is_posed_and_appended_through_wasm() {
     assert_eq!(solved.views.len(), 1);
     assert_eq!(solved.markers.len(), 5, "the map survives");
     let (added, camera) = solved.view("phone").unwrap();
-    let (angle, dist) = pose_difference(&added.camera_to_world, &truth.camera_to_world);
+    let (angle, dist) = pose_difference(added.pose().unwrap(), truth.pose().unwrap());
     assert!(angle < 0.002 && dist < 0.003, "{angle} rad, {dist} m");
     assert_eq!(camera.fx, 1000.0);
     assert!(added.image.is_some());

@@ -45,12 +45,12 @@ fn corner_at_depth(view: &View, camera: &CameraModel, pixel: [f64; 2], depth: f6
     let [x, y, z] = camera.point_at_depth(pixel, depth);
     let limit = depth * 4.0;
     let clamped = [x.clamp(-limit, limit), y.clamp(-limit, limit), z];
-    v3(view.to_world(clamped))
+    v3(view.to_world(clamped).expect("a posed view"))
 }
 
 /// A view's frustum: the four edges from the eye to the image corners at
 /// `depth`, the image rectangle, and a tick off the middle of its top edge
-/// showing which way is up in the picture.
+/// showing which way is up in the picture. An unposed view has none.
 pub fn frustum_segments(
     view: &View,
     camera: &CameraModel,
@@ -58,7 +58,10 @@ pub fn frustum_segments(
     color: [f32; 4],
 ) -> Vec<renderer::LineSegment> {
     let (w, h) = (f64::from(camera.width), f64::from(camera.height));
-    let eye = v3(view.position());
+    let Some(eye) = view.position() else {
+        return Vec::new();
+    };
+    let eye = v3(eye);
     let corners =
         [[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]].map(|px| corner_at_depth(view, camera, px, depth));
     let mut out = Vec::with_capacity(9);
@@ -91,6 +94,9 @@ pub fn observation_lines(view: &View, camera: &CameraModel) -> Vec<renderer::Lin
     let Some(obs) = &view.observations else {
         return Vec::new();
     };
+    if view.pose().is_none() {
+        return Vec::new();
+    }
     let at = |px: [f64; 2]| corner_at_depth(view, camera, px, FRUSTUM_DEPTH_M);
     let mut out = Vec::with_capacity(4 * obs.markers.len() + 2 * obs.board.len());
     for m in &obs.markers {
@@ -156,10 +162,12 @@ pub(crate) fn build_viewset_preview(
             extend(&mut bounds, Vec3::from(s.end));
         }
         segments.extend(frustum);
-        points.push(renderer::PointInstance {
-            position: v3(view.position()).to_array(),
-            color: VIEW_COLOR,
-        });
+        if let Some(eye) = view.position() {
+            points.push(renderer::PointInstance {
+                position: v3(eye).to_array(),
+                color: VIEW_COLOR,
+            });
+        }
     }
     for marker in &set.markers {
         let corners = marker.corners.map(v3);
@@ -252,8 +260,9 @@ pub struct ViewFrame {
 }
 
 impl ViewFrame {
-    pub fn of(view: &View, camera: &CameraModel) -> Self {
-        Self {
+    /// `None` for an unposed view: there is nowhere to look from.
+    pub fn of(view: &View, camera: &CameraModel) -> Option<Self> {
+        Some(Self {
             pinhole: Pinhole {
                 fx: camera.fx as f32,
                 fy: camera.fy as f32,
@@ -262,8 +271,8 @@ impl ViewFrame {
                 width: camera.width,
                 height: camera.height,
             },
-            camera_to_world: pose_matrix(&view.camera_to_world),
-        }
+            camera_to_world: pose_matrix(view.pose()?),
+        })
     }
 
     pub fn eye(&self) -> Vec3 {
@@ -367,13 +376,12 @@ pub struct LookThrough {
 }
 
 impl LookThrough {
-    pub fn of(view: &View, camera: &CameraModel) -> Self {
+    /// `None` for an unposed view.
+    pub fn of(view: &View, camera: &CameraModel) -> Option<Self> {
+        let frame = ViewFrame::of(view, camera)?;
         let mut frustum = highlight_lines(view, camera);
         frustum.segments.extend(observation_lines(view, camera));
-        Self {
-            frame: ViewFrame::of(view, camera),
-            frustum,
-        }
+        Some(Self { frame, frustum })
     }
 }
 
@@ -440,8 +448,14 @@ mod tests {
         assert_eq!(lines[4].color, TAG_OBS_COLOR);
         assert_eq!(lines[8].color, CORNER_OBS_COLOR);
         // Look-through carries them with the frustum.
-        let look = LookThrough::of(&view, &camera);
+        let look = LookThrough::of(&view, &camera).unwrap();
         assert_eq!(look.frustum.segments.len(), 9 + 10);
+        // Unposed, the view draws nothing and cannot be looked through.
+        let mut raw = view.clone();
+        raw.camera_to_world = None;
+        assert!(observation_lines(&raw, &camera).is_empty());
+        assert!(frustum_segments(&raw, &camera, 1.0, VIEW_COLOR).is_empty());
+        assert!(LookThrough::of(&raw, &camera).is_none());
     }
 
     /// A camera at z = -2 looking along world -z, with the picture's up
@@ -463,7 +477,7 @@ mod tests {
         view.image = Some(vec![1, 2, 3]);
         ViewSet {
             board: None,
-            schema: 1,
+            schema: 2,
             world: WorldFrame::default(),
             provenance: Provenance {
                 field: "cards".to_string(),
@@ -548,7 +562,7 @@ mod tests {
     fn letterbox_keeps_the_projection_true() {
         let set = set();
         let (view, camera) = set.view("v").unwrap();
-        let frame = ViewFrame::of(view, camera);
+        let frame = ViewFrame::of(view, camera).unwrap();
         assert_eq!(frame.eye(), Vec3::new(0.0, 0.0, -2.0));
         assert_eq!(frame.forward(), Vec3::NEG_Z);
         assert_eq!(frame.up(), Vec3::Y);

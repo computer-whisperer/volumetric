@@ -4,8 +4,10 @@ Status: ratified 2026-09-09; reframed 2026-09-11 for stills-only capture,
 the survey card and splats. Step 0 landed 2026-09-09. Step A landed
 2026-09-09 (value, import, CLI, GUI). Step B landed 2026-09-10 (cv_core,
 view-solve, view_solve_operator, GUI Import Still). C2 (card detection)
-landed 2026-09-11. C1, C3, C4, S (splats), P (Python bindings) and D
-(audits) pending; order C3, S1, S2, P, C1, C4, D, S3.
+landed 2026-09-11. C3 (survey bundle) landed 2026-09-11 together with the
+parts of C1 it needed (schema 2, `view-import --stills`, Sony focus keys);
+C1's remaining audits fold into D. C4, S (splats), P (Python bindings)
+and D (audits) pending; order S1, S2, P, C4, D, S3.
 
 ## Why
 
@@ -124,9 +126,9 @@ printable or manufacturable mesh.
 | 0 | Values in `project-run --json`; one `render` for a whole project scene with an explicit pinhole camera | 2 days | landed |
 | A | `view_core`: ViewSet value with provenance, manifest import, look-through render, depth residual | 4 days | landed |
 | B | `cv_core`: ArUco detection, PnP, focal; `view-solve` CLI, operator, GUI drop-a-still | 5 days | landed |
-| C1 | Still intake: a view set from a directory of stills, camera keys from EXIF and the Sony maker note, intake audits | 2 days | pending |
+| C1 | Still intake: a view set from a directory of stills, camera keys from EXIF and the Sony maker note, intake audits | 2 days | landed with C3 (audits → D) |
 | C2 | Card detection: AprilTag 36h11 as data, ChArUco corners refined, pyramid search for 26 MP frames, observations stored per view | 3 days | landed |
-| C3 | Survey bundle: cameras per focus key, poses, corners free, scale from the card, uncertainties; `view-survey`, operator, GUI | 4 days | pending |
+| C3 | Survey bundle: cameras per focus key, poses, corners free, scale from the card, uncertainties; `view-survey`, operator, GUI | 4 days | landed |
 | C4 | Trainer bridges: dataset export in the schema-2 layout with a box seed; `.npz` TSDF import | 2 days | pending |
 | S1 | Splat value, 3DGS PLY import, `splat-list`, splat to point cloud | 2 days | pending |
 | S2 | Splat rendering in the viewport and `render`, look-through over the photograph | 4 days | pending |
@@ -136,8 +138,9 @@ printable or manufacturable mesh.
 
 Proposed order: C2, C3 (the survey is the stage the agent starts from and
 its oracle is fresh), S1, S2 (the splat is what it ends with and cannot
-be seen here today), P (once there are kernels worth binding), C1, C4, D,
-S3. Items that need no format decision (the frame-datum operator and
+be seen here today), P (once there are kernels worth binding), C4, D,
+S3. (C1 was to follow P, but C3 has no input without it: the stills
+intake landed with C3.) Items that need no format decision (the frame-datum operator and
 `measure` command under "Later") can land at any time.
 
 ## Step 0 — see and read
@@ -419,6 +422,23 @@ bundle with an analytic Jacobian, and the intake and export around them.
   on (the principal point moves per shot), ISO above a threshold, mixed
   orientations, frames without EXIF. The report lists frames per key.
 
+Status: landed 2026-09-11 with C3, except the intake audits, which go
+with D. `view-import --stills DIR [--ext jpg] [--embed preview|full|none]
+[--preview-px 1600] [--sensor-mm] [--fov-deg]`; `view_core::stills`.
+ViewSet schema 2: `camera_to_world: Option`, `shot: Option<Shot>`,
+`source: Option<String>` relative to `provenance.origin`,
+`CameraModel.label` (the camera key); schema-1 sets decode as schema 2.
+`cv_core::exif` reads the exposure tags and the Sony maker note (focus
+mode 0x201b, SteadyShot 0xb026, focus position from the deciphered block
+0x9402 at byte 0x2d); keys are `make:model:lens:mode:position`, an
+autofocus frame's key ends in its own id. On chairbase-dslr-0 the keys
+match the shim's for all 79 frames (one at manual:154, 78 at manual:170;
+the a6700 seeds 13 833 px from 50 mm over 23.5 mm times 1.05 for focus
+breathing). The intake warns on autofocus, stabilisation, ISO above
+3200, mixed orientations, missing EXIF, and keys with under three
+frames. `view-detect` reads the original through `source` when the
+embedded picture is reduced; the operator refuses reduced pictures.
+
 ### C2. Card detection
 
 Status: landed 2026-09-11 (`cv_core::{dict, detect, charuco, blur,
@@ -519,6 +539,39 @@ corner.
   `work/pcb-dslr-1/survey.json` (`--reject-px 5 --f-scale 2.5 --min-card
   6`: 36 frames, 2.37 px). Targets: poses within 0.2 mm and 0.02°, map
   corners within 0.1 mm, the same frames rejected.
+
+Status: landed 2026-09-11. `cv_core::survey` (`SurveyOptions`,
+`survey(&mut ViewSet) -> SurveyReport`, `SurveyReport::to_f64_map`),
+`view-survey`, `survey_operator` (Survey Field; ViewSet + config →
+ViewSet, F64Map). As designed, with three additions found on the way:
+single observations beyond `outlier_px` (10) are dropped before frames
+over `reject_px`, since one detector slip of 28 px on a swatch corner
+otherwise costs the whole frame; the uncertainties are expressed in the
+card's datum (the S-transformation of the gauge-free pseudo-inverse onto
+inner constraints over the card's corners), which a Monte Carlo over the
+noise confirms (card scatter 0.037 mm against sigma 0.035, swatches 0.36
+against 0.32, f 7.6 against 9.9) where inner constraints over all points
+had put a uniform 0.25 mm on every card corner; and each view gets a
+position and angle sigma from its 6x6 covariance block, so a frame on
+two swatches at two metres (5 mm, 0.15°) is told apart from one on the
+card (3 mm, 0.05°, dominated by the principal point). The planar-field
+degeneracy is the principal point: ±9 px in cy at 0.5 px noise, and every
+pose tilts with it; the plan's pose target of 0.2 mm and 0.02° was not
+achievable by either solver and is replaced by agreement within the
+reported sigmas. Validation on chairbase-dslr-0: 74 of 79 posed (the shim
+73; we also pose DSC00151), 0.90 px rms on our detections, f 13 985 ± 12
+(shim 13 960), pp (3081 ± 3, 2092 ± 9) (shim 3079, 2107), card corners
+0.024 mm median from the shim's, planarity 0.026 mm, along span 179.36
+(calipers 179.44), swatch sides 0.05–0.2 mm larger than the shim's (our
+corners sit ~0.5 px outside OpenCV's saddle-biased ones; a caliper on a
+swatch is the arbiter). On the shim's own detections: 0.70 px rms (shim
+0.72), card 0.003 mm, poses 1.7 mm median apart along the pp tilt. Five
+seconds natively for 74 stills (dense normal equations, ~940 unknowns).
+The synthetic tests cover the Jacobian against central differences,
+Cholesky, Horn's rigid fit on planar points, the field to truth, the
+Monte Carlo, and a frame with scrambled observations. Noted for D:
+blurred frames (DSC00149, DSC00169) get many more card corners than
+OpenCV accepts, with shifts up to 16 px, and land at 2.3–2.6 px rms.
 
 ### C4. Trainer bridges
 

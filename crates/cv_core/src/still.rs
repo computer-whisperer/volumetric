@@ -295,7 +295,7 @@ mod tests {
         ];
         let set = ViewSet {
             board: None,
-            schema: 1,
+            schema: 2,
             world: Default::default(),
             provenance: Default::default(),
             cameras: vec![truth.clone()],
@@ -326,7 +326,7 @@ mod tests {
         assert_eq!(solve.in_map(&set), 5);
         assert!(solve.seed_source.contains("field of view"));
         let pose = solve.pose.as_ref().unwrap();
-        let (angle, dist) = pose_difference(&pose.camera_to_world, &view.camera_to_world);
+        let (angle, dist) = pose_difference(&pose.camera_to_world, view.pose().unwrap());
         assert!(angle < 0.01 && dist < 0.02, "{angle} rad, {dist} m");
         assert!((pose.camera.fx - 1000.0).abs() < 15.0, "{}", pose.camera.fx);
         assert!(solve.warnings.is_empty(), "{:?}", solve.warnings);

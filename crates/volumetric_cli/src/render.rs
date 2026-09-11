@@ -741,7 +741,10 @@ pub fn run_render(args: RenderArgs) -> Result<()> {
                     width: size.0,
                     height: size.1,
                 },
-                camera_to_world: pose_matrix(&view.camera_to_world),
+                camera_to_world: pose_matrix(
+                    view.pose()
+                        .with_context(|| format!("view '{}' is not posed", view.id))?,
+                ),
             }
         }
         other => other,

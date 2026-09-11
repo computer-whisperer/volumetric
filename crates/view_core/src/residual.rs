@@ -107,8 +107,17 @@ pub fn depth_residual(
 ) -> Residual {
     let (width, height) = (depth.width, depth.height);
     let stride = search.stride.max(1);
-    let origin = view.position();
-    let forward = view.forward();
+    let (Some(origin), Some(forward)) = (view.position(), view.forward()) else {
+        // An unposed view measures nothing: every pixel off the lattice.
+        return Residual {
+            view_id: view.id.clone(),
+            width,
+            height,
+            stride,
+            values: vec![f32::NAN; (width * height) as usize],
+            stats: ResidualStats::from_residuals(0, &[]),
+        };
+    };
 
     let rows: Vec<Vec<(u32, f32)>> = (0..height)
         .step_by(stride as usize)
@@ -127,7 +136,7 @@ pub fn depth_residual(
                     continue;
                 }
                 let pixel = [f64::from(x) + 0.5, f64::from(y) + 0.5];
-                let dir = view.ray(camera, pixel);
+                let dir = view.ray(camera, pixel).expect("posed");
                 let cos = dir[0] * forward[0] + dir[1] * forward[1] + dir[2] * forward[2];
                 if cos <= 1e-6 {
                     continue;

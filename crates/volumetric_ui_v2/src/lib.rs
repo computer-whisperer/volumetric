@@ -1452,7 +1452,7 @@ impl VolumetricUiV2 {
             .find(|asset| asset.id() == look.asset_id)?;
         let set = self.viewset_of(asset)?;
         let (view, camera) = set.view(&look.view_id)?;
-        Some(LookThrough::of(view, camera))
+        LookThrough::of(view, camera)
     }
 
     /// The looked-through view's photograph, decoded once per view.
@@ -6260,6 +6260,9 @@ fn view_row(
         .filter(|tag| !tag.starts_with("frame:"))
         .map(|tag| badge(tag.clone()).muted().xsmall())
         .collect();
+    if view.pose().is_none() {
+        marks.insert(0, badge("unposed").xsmall());
+    }
     if view.depth.is_some() {
         marks.push(badge("depth").xsmall());
     }
@@ -10624,7 +10627,7 @@ mod tests {
         let v4 = posed("v4", 0.6);
         let set = viewset::ViewSet {
             board: None,
-            schema: 1,
+            schema: 2,
             world: viewset::WorldFrame::default(),
             provenance: viewset::Provenance {
                 setup: "bench".to_string(),

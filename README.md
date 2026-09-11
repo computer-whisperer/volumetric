@@ -284,6 +284,18 @@ volumetric_cli view-solve -p chair.vproj --image IMG_0042.jpg [--intrinsics fx,f
 volumetric_cli view-detect -p chair.vproj [--views set] [--card card.json | --no-card] \
     [--dictionary 5x5_100|4x4_50|none] [--search-px 1600] [--annotate dir/] [--dry-run] [--json]
 volumetric_cli view-detect --image DSC00123.JPG [--image ...] --json
+
+# Stills straight from the camera: one unposed view per picture, a camera
+# per focus setting (Sony maker note), previews embedded and the originals
+# referenced, ready for view-detect and view-survey
+volumetric_cli view-import --stills sessions/chairbase-dslr-0 -p chair.vproj \
+    [--embed preview|full|none] [--preview-px 1600] [--sensor-mm 23.5] [--session s --field f]
+
+# Survey a detected set: one camera model per focus setting, a pose per
+# view, the card and swatch corners as points; the card's calipers set the
+# scale and its plane the world frame
+volumetric_cli view-survey -p chair.vproj [--views set] [--f-scale 1.5] [--reject-px 3] \
+    [--min-card 8] [--report survey.json] [--dry-run] [--json]
 ```
 
 `view-solve` detects ArUco markers (`5x5_100` swatches or the `4x4_50`
@@ -329,6 +341,45 @@ report line per view in the step's warnings. In the GUI a detected view's
 row shows its corner or marker count, and looking through the view draws
 the observations over the photograph: swatches amber, tags cyan, card
 corners as magenta crosses.
+
+`view-import --stills` is the intake for a session of stills straight
+from the camera: one unposed view per picture with its shot state (body,
+lens, focal, aperture, shutter, ISO, orientation, and from a Sony maker
+note the focus mode, focus position and stabilisation), one camera per
+focus setting seeded from the focal length over the sensor width, a
+quarter-scale preview embedded and the original referenced by path so
+`view-detect` reads it at full resolution. The set's schema is 2: a
+view's pose is optional, and unposed views draw no frustum and are listed
+as such.
+
+`view-survey` is the survey itself, the mature form of the scanner's
+`idx-survey`: from the observations on the views it solves one camera
+model per focus setting (focal, principal point, two radial terms), a
+pose per view, and every card and swatch corner as a free point. Each
+camera is first calibrated on its frames that show most of the card,
+frames are posed on the card, swatch corners triangulated and further
+frames posed on them until nothing grows; then Levenberg–Marquardt with
+an analytic Jacobian on the dense normal equations under a soft-L1 loss,
+one scale residual holding the card's column spans to the caliper pitch,
+one card frame held as the gauge and the world re-based afterwards on a
+rigid fit of the nominal card (origin at the card, x along the columns, z
+towards the cameras). Rounds drop single observations the fit leaves far
+out (a corner the detector put on the wrong edge) and then frames over
+`--reject-px`, and solve again. Uncertainties come from the gauge-free
+pseudo-inverse of the normal matrix carried into the card's datum: a
+sigma per card corner and swatch, a standard error per intrinsic, and a
+position and angle sigma per view, which is what tells a reader that a
+frame on two swatches at two metres is posed but hardly constrained. On
+chairbase-dslr-0 it poses 74 of 79 stills at 0.90 px rms (0.38 median),
+solves all 110 card corners planar to 0.026 mm with the along span 0.09 mm
+under the calipers, and agrees with the scanner's survey to 0.024 mm on
+the card corners, 0.1–0.3 mm on the swatches near the card and within the
+reported sigmas on the far ones; run on the scanner's own detections it
+fits them at 0.70 px against the scanner's 0.72 and matches its card to
+0.003 mm, with the poses 1.7 mm apart along the principal point's
+uncertainty (±9 px, the weakly known parameter of a planar field). Five
+seconds for 74 stills. The same solve is the `survey_operator` (Survey
+Field): view set and config in, the posed set and an F64Map report out.
 
 ```bash
 volumetric_cli project-add-asset -p chair.vproj -i IMG_0042.jpg --type blob --asset-id still_42

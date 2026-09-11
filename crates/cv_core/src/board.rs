@@ -137,7 +137,8 @@ pub fn render_board(
 }
 
 /// Renders markers of one family and boards (each of its own family) as
-/// seen by `view` through `camera`; the nearest surface wins.
+/// seen by `view` through `camera`; the nearest surface wins. The view
+/// must be posed.
 pub fn render_scene(
     camera: &CameraModel,
     view: &View,
@@ -148,7 +149,7 @@ pub fn render_scene(
 ) -> Gray {
     let n = dict.size;
     let cells = f64::from(n + 2);
-    let eye = view.position();
+    let eye = view.position().expect("render_scene needs a posed view");
     let cards: Vec<Card> = markers
         .iter()
         .map(|m| Card::new(m, dict.code(m.id).expect("marker id in dictionary")))
@@ -157,7 +158,7 @@ pub fn render_scene(
     let mut out = Gray::new(camera.width, camera.height);
     let ss = options.supersample.max(1);
     let luma_at = |px: [f64; 2]| -> u8 {
-        let dir = view.ray(camera, px);
+        let dir = view.ray(camera, px).expect("posed");
         let mut nearest: Option<(f64, u8)> = None;
         for card in &cards {
             if let Some((t, luma)) = card.hit(eye, dir, n, cells, options)
@@ -391,7 +392,7 @@ mod tests {
             marker_m: 0.007,
             ..BoardSpec::survey_card()
         };
-        let origin = view.unproject(&camera, [20.0, 20.0], 1.0);
+        let origin = view.unproject(&camera, [20.0, 20.0], 1.0).unwrap();
         let board = PlacedBoard::new(spec.clone(), origin, [1.0, 0.0, 0.0], [0.0, -1.0, 0.0]);
         let picture = render_board(&camera, &view, &board, &Render::default());
         assert_eq!(picture.get(2, 2), 128, "background");
