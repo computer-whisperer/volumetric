@@ -73,6 +73,31 @@ impl Gray {
         (a * (1.0 - tx) + b * tx) * (1.0 - ty) + (c * (1.0 - tx) + d * tx) * ty
     }
 
+    /// The picture reduced by an integer factor, each pixel the mean of
+    /// a `factor x factor` block (a trailing partial block is dropped).
+    /// Continuous coordinates scale exactly: `x` here is `x * factor` in
+    /// the original.
+    pub fn downsampled(&self, factor: u32) -> Gray {
+        let factor = factor.max(1);
+        let (w, h) = (self.width / factor, self.height / factor);
+        let mut out = Gray::new(w, h);
+        let area = f64::from(factor * factor);
+        for y in 0..h {
+            for x in 0..w {
+                let mut sum = 0u32;
+                for dy in 0..factor {
+                    let row = ((y * factor + dy) * self.width + x * factor) as usize;
+                    sum += self.pixels[row..row + factor as usize]
+                        .iter()
+                        .map(|&v| u32::from(v))
+                        .sum::<u32>();
+                }
+                out.pixels[(y * w + x) as usize] = (f64::from(sum) / area).round() as u8;
+            }
+        }
+        out
+    }
+
     pub fn integral(&self) -> Integral {
         let w = self.width as usize + 1;
         let h = self.height as usize + 1;

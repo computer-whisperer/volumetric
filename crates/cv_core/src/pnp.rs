@@ -623,6 +623,7 @@ mod tests {
             .iter()
             .map(|m| Detection {
                 id: m.id,
+                family: "5x5_100",
                 corners: m.corners.map(|c| {
                     let p = view.project(camera, c).unwrap();
                     [p[0] + jitter(), p[1] + jitter()]

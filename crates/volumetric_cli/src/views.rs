@@ -612,6 +612,7 @@ mod tests {
 
     fn set_asset(id: &str, views: &[&str]) -> LoadedAsset {
         let mut set = ViewSet {
+            board: None,
             cameras: vec![CameraModel::pinhole(4, 4, 2.0, 2.0, 2.0, 2.0)],
             ..ViewSet::default()
         };

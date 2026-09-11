@@ -1,9 +1,9 @@
-//! A synthetic picture of markers with exact ground truth: cards placed in
-//! the world, rendered through a view's camera by ray casting, so every
-//! stage of detection and solving can be tested against known corners
-//! and poses.
+//! A synthetic picture of markers and boards with exact ground truth:
+//! cards and a ChArUco board placed in the world, rendered through a
+//! view's camera by ray casting, so every stage of detection and solving
+//! can be tested against known corners and poses.
 
-use volumetric_abi::viewset::{CameraModel, Marker, View};
+use volumetric_abi::viewset::{BoardSpec, CameraModel, Marker, View};
 
 use crate::dict::Dictionary;
 use crate::gray::Gray;
@@ -61,6 +61,51 @@ impl Default for Render {
     }
 }
 
+/// A ChArUco board placed in the world: its top-left outer corner at
+/// `origin`, `right` along its columns and `down` along its rows (unit
+/// vectors), the family's codes for its markers.
+#[derive(Clone, Debug)]
+pub struct PlacedBoard {
+    pub spec: BoardSpec,
+    pub origin: [f64; 3],
+    pub right: [f64; 3],
+    pub down: [f64; 3],
+}
+
+impl PlacedBoard {
+    pub fn new(spec: BoardSpec, origin: [f64; 3], right: [f64; 3], down: [f64; 3]) -> Self {
+        Self {
+            spec,
+            origin,
+            right: normalized(right),
+            down: normalized(down),
+        }
+    }
+
+    /// A board point in the world.
+    pub fn to_world(&self, board: [f64; 2]) -> [f64; 3] {
+        add(
+            add(self.origin, scale(self.right, board[0])),
+            scale(self.down, board[1]),
+        )
+    }
+
+    /// An interior corner in the world.
+    pub fn corner_world(&self, id: u32) -> Option<[f64; 3]> {
+        self.spec.corner(id).map(|c| self.to_world(c))
+    }
+
+    /// A marker as the map would carry it.
+    pub fn marker(&self, id: u32) -> Option<Marker> {
+        let corners = self.spec.marker_corners(id)?;
+        Some(Marker {
+            id,
+            size_m: self.spec.marker_m,
+            corners: corners.map(|c| self.to_world(c)),
+        })
+    }
+}
+
 /// Renders `markers` (whose ids the dictionary must know) as seen by
 /// `view` through `camera`.
 pub fn render(
@@ -70,6 +115,37 @@ pub fn render(
     dict: &Dictionary,
     options: &Render,
 ) -> Gray {
+    render_scene(camera, view, markers, dict, &[], options)
+}
+
+/// Renders a board alone.
+pub fn render_board(
+    camera: &CameraModel,
+    view: &View,
+    board: &PlacedBoard,
+    options: &Render,
+) -> Gray {
+    let dict = Dictionary::by_name(&board.spec.family).expect("known family");
+    render_scene(
+        camera,
+        view,
+        &[],
+        &dict,
+        std::slice::from_ref(board),
+        options,
+    )
+}
+
+/// Renders markers of one family and boards (each of its own family) as
+/// seen by `view` through `camera`; the nearest surface wins.
+pub fn render_scene(
+    camera: &CameraModel,
+    view: &View,
+    markers: &[Marker],
+    dict: &Dictionary,
+    boards: &[PlacedBoard],
+    options: &Render,
+) -> Gray {
     let n = dict.size;
     let cells = f64::from(n + 2);
     let eye = view.position();
@@ -77,6 +153,7 @@ pub fn render(
         .iter()
         .map(|m| Card::new(m, dict.code(m.id).expect("marker id in dictionary")))
         .collect();
+    let patches: Vec<BoardPatch> = boards.iter().map(BoardPatch::new).collect();
     let mut out = Gray::new(camera.width, camera.height);
     let ss = options.supersample.max(1);
     let luma_at = |px: [f64; 2]| -> u8 {
@@ -84,6 +161,13 @@ pub fn render(
         let mut nearest: Option<(f64, u8)> = None;
         for card in &cards {
             if let Some((t, luma)) = card.hit(eye, dir, n, cells, options)
+                && nearest.is_none_or(|(best, _)| t < best)
+            {
+                nearest = Some((t, luma));
+            }
+        }
+        for patch in &patches {
+            if let Some((t, luma)) = patch.hit(eye, dir, options)
                 && nearest.is_none_or(|(best, _)| t < best)
             {
                 nearest = Some((t, luma));
@@ -149,11 +233,11 @@ struct Card {
     u: [f64; 3],
     v: [f64; 3],
     normal: [f64; 3],
-    code: u32,
+    code: u64,
 }
 
 impl Card {
-    fn new(marker: &Marker, code: u32) -> Self {
+    fn new(marker: &Marker, code: u64) -> Self {
         let u = sub(marker.corners[1], marker.corners[0]);
         let v = sub(marker.corners[3], marker.corners[0]);
         Self {
@@ -213,9 +297,123 @@ impl Card {
     }
 }
 
+/// A board as a plane patch with its family's codes.
+struct BoardPatch<'a> {
+    board: &'a PlacedBoard,
+    normal: [f64; 3],
+    dict: Dictionary,
+    size: [f64; 2],
+}
+
+impl<'a> BoardPatch<'a> {
+    fn new(board: &'a PlacedBoard) -> Self {
+        Self {
+            board,
+            normal: normalized(cross(board.right, board.down)),
+            dict: Dictionary::by_name(&board.spec.family).expect("known family"),
+            size: board.spec.size_m(),
+        }
+    }
+
+    fn hit(&self, eye: [f64; 3], dir: [f64; 3], options: &Render) -> Option<(f64, u8)> {
+        let denom = dot(dir, self.normal);
+        if denom.abs() < 1e-9 {
+            return None;
+        }
+        let t = dot(sub(self.board.origin, eye), self.normal) / denom;
+        if t <= 0.0 {
+            return None;
+        }
+        let p = sub(add(eye, scale(dir, t)), self.board.origin);
+        let (u, v) = (dot(p, self.board.right), dot(p, self.board.down));
+        let spec = &self.board.spec;
+        // A paper margin of one square around the board.
+        let (mx, my) = (
+            options.margin_cells * spec.pitch_x_m,
+            options.margin_cells * spec.pitch_y_m,
+        );
+        if u < -mx || u > self.size[0] + mx || v < -my || v > self.size[1] + my {
+            return None;
+        }
+        if u < 0.0 || u >= self.size[0] || v < 0.0 || v >= self.size[1] {
+            return Some((t, options.paper));
+        }
+        let col = (u / spec.pitch_x_m).floor() as u32;
+        let row = (v / spec.pitch_y_m).floor() as u32;
+        if (row + col) % 2 == 0 {
+            return Some((t, options.ink));
+        }
+        let Some(id) = spec.marker_at(row, col) else {
+            return Some((t, options.paper));
+        };
+        let corners = spec.marker_corners(id).expect("marker on the board");
+        let (a, b) = (
+            (u - corners[0][0]) / spec.marker_m,
+            (v - corners[0][1]) / spec.marker_m,
+        );
+        if !(0.0..1.0).contains(&a) || !(0.0..1.0).contains(&b) {
+            return Some((t, options.paper));
+        }
+        let n = self.dict.size;
+        let cells = f64::from(n + 2);
+        let (cc, cr) = ((a * cells).floor() as u32, (b * cells).floor() as u32);
+        let dark = if cc == 0 || cr == 0 || cc == n + 1 || cr == n + 1 {
+            true
+        } else {
+            let code = self.dict.code(id).expect("marker id in family");
+            (code >> (n * n - 1 - ((cr - 1) * n + (cc - 1)))) & 1 == 0
+        };
+        Some((t, if dark { options.ink } else { options.paper }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_board_renders_squares_and_tags_where_the_spec_says() {
+        // 12 px per nominal square, straight down: the card spans
+        // 144 x 132 px from (20, 20).
+        let camera = CameraModel::pinhole(200, 180, 1200.0, 1200.0, 100.0, 90.0);
+        let view = View::posed(
+            "top",
+            0,
+            [
+                1.0, 0.0, 0.0, 0.0, //
+                0.0, -1.0, 0.0, 0.0, //
+                0.0, 0.0, -1.0, 1.0, //
+            ],
+        );
+        let spec = BoardSpec {
+            pitch_x_m: 0.01,
+            pitch_y_m: 0.01,
+            marker_m: 0.007,
+            ..BoardSpec::survey_card()
+        };
+        let origin = view.unproject(&camera, [20.0, 20.0], 1.0);
+        let board = PlacedBoard::new(spec.clone(), origin, [1.0, 0.0, 0.0], [0.0, -1.0, 0.0]);
+        let picture = render_board(&camera, &view, &board, &Render::default());
+        assert_eq!(picture.get(2, 2), 128, "background");
+        assert_eq!(picture.get(20 + 6, 20 + 6), 20, "square (0, 0) is ink");
+        assert_eq!(picture.get(20 + 12, 20), 235, "square (0, 1) paper corner");
+        assert_eq!(picture.get(20 + 12 + 6, 20 + 2), 20, "its tag's border");
+        assert_eq!(picture.get(20 + 12 * 12 + 2, 20 + 2), 235, "paper margin");
+        // The projected corner 0 is the square boundary at (32, 32).
+        let c0 = view
+            .project(&camera, board.corner_world(0).unwrap())
+            .unwrap();
+        assert!(
+            (c0[0] - 32.0).abs() < 1e-9 && (c0[1] - 32.0).abs() < 1e-9,
+            "{c0:?}"
+        );
+        let m = board.marker(100).unwrap();
+        let tl = view.project(&camera, m.corners[0]).unwrap();
+        assert!(
+            (tl[0] - 33.8).abs() < 1e-9 && (tl[1] - 21.8).abs() < 1e-9,
+            "{tl:?}"
+        );
+    }
 
     #[test]
     fn a_card_renders_its_border_and_bits() {

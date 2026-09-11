@@ -6266,6 +6266,16 @@ fn view_row(
     if view.mask.is_some() {
         marks.push(badge("mask").xsmall());
     }
+    // What detection found, on a row of its own: the tag row is full, and
+    // the card corners are what the survey rests on; the full count is in
+    // the view-detect report.
+    let found = view.observations.as_ref().map(|obs| {
+        if obs.board.is_empty() {
+            format!("{} markers", obs.markers.len())
+        } else {
+            format!("{} corners", obs.board.len())
+        }
+    });
     let look = icon_button(&*EYE_ICON)
         .xsmall()
         .tooltip(if looking {
@@ -6279,14 +6289,16 @@ fn view_row(
     } else {
         look.ghost()
     };
+    let mut lines = vec![
+        text(view.id.clone()).small().semibold().ellipsis(),
+        row(marks).gap(tokens::SPACE_1),
+    ];
+    if let Some(found) = found {
+        lines.push(row([badge(found).xsmall()]));
+    }
     row([
         thumbnail,
-        column([
-            text(view.id.clone()).small().semibold().ellipsis(),
-            row(marks).gap(tokens::SPACE_1),
-        ])
-        .gap(tokens::SPACE_1)
-        .width(Size::Fill(1.0)),
+        column(lines).gap(tokens::SPACE_1).width(Size::Fill(1.0)),
         look,
     ])
     .gap(tokens::SPACE_2)
@@ -10591,12 +10603,27 @@ mod tests {
         v1.depth_unit_m = 1e-4;
         v1.mask = Some(vec![0]);
         v1.tags = vec!["left".to_string(), "frame:1".to_string()];
+        v1.observations = Some(viewset::Observations {
+            markers: vec![viewset::MarkerObs {
+                id: 3,
+                family: "5x5_100".to_string(),
+                corners: [[1.0, 1.0], [3.0, 1.0], [3.0, 3.0], [1.0, 3.0]],
+                fit_px: 0.2,
+            }],
+            board: vec![viewset::CornerObs {
+                id: 0,
+                pixel: [2.0, 2.0],
+                fit_px: 0.1,
+            }],
+            blur_px: Some(1.25),
+        });
         let mut v2 = posed("v2", 0.2);
         v2.image = Some(png.clone());
         let mut v3 = posed("v3", 0.4);
         v3.image = Some(png);
         let v4 = posed("v4", 0.6);
         let set = viewset::ViewSet {
+            board: None,
             schema: 1,
             world: viewset::WorldFrame::default(),
             provenance: viewset::Provenance {
@@ -10650,7 +10677,9 @@ mod tests {
         let look = app.look_through_frame().expect("looked-through frame");
         assert_eq!(look.frame.pinhole.width, 4);
         assert_eq!(look.frame.eye(), glam::Vec3::new(0.0, 0.0, -2.0));
-        assert_eq!(look.frustum.segments.len(), 9);
+        // The frustum's nine segments, and v1's observations: a marker's
+        // four sides and a card corner's cross.
+        assert_eq!(look.frustum.segments.len(), 9 + 4 + 2);
         assert!(app.look_photo().is_some(), "the view's PNG decodes");
 
         // Looking through the same view leaves it; another view switches.

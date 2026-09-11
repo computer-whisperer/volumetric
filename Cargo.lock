@@ -5940,6 +5940,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "view_detect_operator"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "cv_core",
+ "image",
+ "serde",
+ "volumetric_abi",
+]
+
+[[package]]
 name = "view_solve_operator"
 version = "0.1.0"
 dependencies = [

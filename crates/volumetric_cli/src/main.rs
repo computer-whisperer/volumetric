@@ -30,6 +30,7 @@ use volumetric::{
 mod assets;
 mod fea;
 mod info;
+mod observe;
 mod project;
 mod raster;
 mod render;
@@ -109,6 +110,8 @@ enum Commands {
     /// Pose a still from the marker cards it shows and append it to a view set
     #[command(name = "view-solve")]
     ViewSolve(solve::ViewSolveArgs),
+    /// Detect the swatches, the survey card and its corners in a set's pictures
+    ViewDetect(observe::ViewDetectArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -581,5 +584,6 @@ fn main() -> Result<()> {
         Commands::ViewList(args) => views::run_view_list(args),
         Commands::ViewResidual(args) => views::run_view_residual(args),
         Commands::ViewSolve(args) => solve::run_view_solve(args),
+        Commands::ViewDetect(args) => observe::run_view_detect(args),
     }
 }

@@ -39,6 +39,7 @@ const OPERATORS: &[&str] = &[
     "volume_import_operator",
     "cloud_fit_operator",
     "view_solve_operator",
+    "view_detect_operator",
     "cloud_normals_operator",
     "step_import_operator",
     "rectangular_prism_operator",

@@ -277,6 +277,13 @@ volumetric_cli view-residual -p chair.vproj --model chair_solid -o residuals/ [-
 # intrinsics are unknown; --annotate draws the detections)
 volumetric_cli view-solve -p chair.vproj --image IMG_0042.jpg [--intrinsics fx,fy,cx,cy[,k1]] \
     [--fov-deg 70] [--annotate cards.png] [--dry-run] [--json]
+
+# Find the swatches, the survey card's tags and its interior corners in every
+# picture of a set and store them on the views (the survey solves from them);
+# or report on loose pictures with --image
+volumetric_cli view-detect -p chair.vproj [--views set] [--card card.json | --no-card] \
+    [--dictionary 5x5_100|4x4_50|none] [--search-px 1600] [--annotate dir/] [--dry-run] [--json]
+volumetric_cli view-detect --image DSC00123.JPG [--image ...] --json
 ```
 
 `view-solve` detects ArUco markers (`5x5_100` swatches or the `4x4_50`
@@ -297,6 +304,31 @@ its cautions. In the GUI, Solve Still in the Add catalog (or Import Still)
 opens a file dialog, adds the step wired to the project's view set, and
 after a run the Views section lists the still with its `rms` and `cards`
 tags, ready to look through.
+
+`view-detect` is the survey's first stage. It reads every family in one
+pass (the `5x5_100` swatches and the survey card's AprilTag `36h11` tags;
+`4x4_50` for the calibration board), searching for quads on the picture
+reduced to about 1600 px and reading every corner and cell at full
+resolution; the card's interior corners are placed from the decoded tags
+beside them (or from the board as a whole where none is) and settled on
+the saddle point of the grey picture, and refused where the four squares
+around them do not show the chessboard; marker corners come from robust
+quadratic fits of each edge, so a curled card or the lens bending an edge
+does not shift them; edge blur is measured across the markers as a
+frame-quality number. Each view gets `observations` (markers with their
+fit residual, card corners with the distance the refinement moved them,
+the blur), and the set records the card spec. The default card is the
+survey card; `--card` reads either this crate's spec or the scanner's
+`card.json`. On the 79 stills of the chairbase-dslr-0 session it finds
+every card corner OpenCV's ChArUco detector found and 69 % more,
+agreeing with it to 0.13 px median; swatch corners agree to 1 px, with
+half of that OpenCV's own inward bias on blurred corners; a 26 MP still
+takes 0.2 s. The same detection is the `view_detect_operator` (Detect
+Cards): view set and config in, view set with observations out, one
+report line per view in the step's warnings. In the GUI a detected view's
+row shows its corner or marker count, and looking through the view draws
+the observations over the photograph: swatches amber, tags cyan, card
+corners as magenta crosses.
 
 ```bash
 volumetric_cli project-add-asset -p chair.vproj -i IMG_0042.jpg --type blob --asset-id still_42

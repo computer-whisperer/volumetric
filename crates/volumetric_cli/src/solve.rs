@@ -232,7 +232,7 @@ fn annotate(photo: &Rgb, detections: &[Detection], set: &ViewSet) -> Rgb {
     out
 }
 
-fn line(image: &mut Rgb, a: [f64; 2], b: [f64; 2], colour: [u8; 3], thickness: i64) {
+pub(crate) fn line(image: &mut Rgb, a: [f64; 2], b: [f64; 2], colour: [u8; 3], thickness: i64) {
     let steps = ((b[0] - a[0]).abs().max((b[1] - a[1]).abs()).ceil() as usize).max(1);
     for s in 0..=steps {
         let t = s as f64 / steps as f64;
@@ -241,7 +241,7 @@ fn line(image: &mut Rgb, a: [f64; 2], b: [f64; 2], colour: [u8; 3], thickness: i
     }
 }
 
-fn disc(image: &mut Rgb, centre: [f64; 2], radius: i64, colour: [u8; 3]) {
+pub(crate) fn disc(image: &mut Rgb, centre: [f64; 2], radius: i64, colour: [u8; 3]) {
     let (cx, cy) = (centre[0].floor() as i64, centre[1].floor() as i64);
     for dy in -radius..=radius {
         for dx in -radius..=radius {
@@ -356,7 +356,7 @@ pub fn run_view_solve(args: ViewSolveArgs) -> Result<()> {
     let (mut set, asset_id) = load_set(&args)?;
     let dictionary = Dictionary::by_name(&args.dictionary).with_context(|| {
         format!(
-            "unknown dictionary '{}'; expected 5x5_100 or 4x4_50",
+            "unknown dictionary '{}'; expected 5x5_100, 4x4_50 or 36h11",
             args.dictionary
         )
     })?;
@@ -588,6 +588,7 @@ mod tests {
         let image = dir.join("board.png");
         std::fs::write(&image, rgb.to_png().unwrap()).unwrap();
         let set = ViewSet {
+            board: None,
             schema: 1,
             world: Default::default(),
             provenance: Default::default(),

@@ -155,7 +155,7 @@ pub fn solve_still(gray: &Gray, file: &[u8], set: &ViewSet, options: &StillOptio
         read_exif(file)
     };
     let (seed, seed_source) = seed_camera(options, exif.as_ref(), gray.width, gray.height);
-    let detections = detect(gray, &options.dictionary, &options.detect);
+    let detections = detect(gray, &[&options.dictionary], &options.detect);
     let unknown = options.intrinsics.is_none();
     let pose = solve_view(
         &seed,
@@ -294,6 +294,7 @@ mod tests {
             square_marker(49, [-0.05, 0.65, 0.0], 0.16, right, floor_down),
         ];
         let set = ViewSet {
+            board: None,
             schema: 1,
             world: Default::default(),
             provenance: Default::default(),

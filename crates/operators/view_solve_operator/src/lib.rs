@@ -74,7 +74,7 @@ pub fn solve(set_bytes: &[u8], picture: &[u8], config: &ViewSolveConfig) -> Resu
     let mut set = decode_viewset(set_bytes)?;
     let dictionary = Dictionary::by_name(&config.dictionary).ok_or_else(|| {
         format!(
-            "unknown dictionary '{}'; expected 5x5_100 or 4x4_50",
+            "unknown dictionary '{}'; expected 5x5_100, 4x4_50 or 36h11",
             config.dictionary
         )
     })?;
@@ -249,6 +249,7 @@ mod tests {
             &Render::default(),
         ));
         let set = ViewSet {
+            board: None,
             schema: 1,
             world: Default::default(),
             provenance: Default::default(),

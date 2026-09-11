@@ -80,6 +80,7 @@ fn scene() -> (View, Vec<u8>, ViewSet) {
         &Render::default(),
     ));
     let set = ViewSet {
+        board: None,
         schema: 1,
         world: Default::default(),
         provenance: Default::default(),

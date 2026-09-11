@@ -1,6 +1,10 @@
-//! ArUco marker detection: local threshold, dark components, outer
-//! borders, quads, perspective sampling, dictionary lookup and sub-pixel
-//! corners by edge fitting.
+//! Marker detection: local threshold, dark components, outer borders,
+//! quads, sub-pixel corners by edge fitting, perspective sampling and
+//! dictionary lookup, for every family asked for in one pass.
+//!
+//! Large pictures are searched for quads on a reduction (a 26 MP still's
+//! marker cells are tens of pixels, beyond any local-threshold window),
+//! and every corner is refined and every cell read at full resolution.
 //!
 //! Corners come out in the marker's canonical order (top-left first,
 //! clockwise as printed) in the view set's pixel convention (pixel
@@ -35,8 +39,12 @@ pub struct DetectParams {
     /// A quad's shortest side over its longest must reach this: slivers
     /// are never markers.
     pub min_aspect: f64,
-    /// Refine the corners on the grey picture after identification.
+    /// Refine the corners on the grey picture by fitting the edges.
     pub refine: bool,
+    /// Quads are searched on the picture reduced to about this many
+    /// pixels on its longer side (0 = full resolution); corners and cells
+    /// are always read at full resolution.
+    pub search_px: u32,
 }
 
 impl Default for DetectParams {
@@ -51,6 +59,7 @@ impl Default for DetectParams {
             border_error_rate: 0.35,
             min_aspect: 0.15,
             refine: true,
+            search_px: 1600,
         }
     }
 }
@@ -59,6 +68,8 @@ impl Default for DetectParams {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Detection {
     pub id: u32,
+    /// The dictionary the id is from: `5x5_100`, `4x4_50` or `36h11`.
+    pub family: &'static str,
     /// Canonical order: top-left, top-right, bottom-right, bottom-left.
     pub corners: [[f64; 2]; 4],
     /// Clockwise quarter turns the picture showed the marker at.
@@ -105,28 +116,77 @@ pub fn auto_windows(width: u32, height: u32) -> Vec<u32> {
     out
 }
 
-/// Finds the dictionary's markers in the picture.
-pub fn detect(gray: &Gray, dict: &Dictionary, params: &DetectParams) -> Vec<Detection> {
+/// The integer reduction that brings the longer side to about
+/// `search_px` (1 when it already is, or when `search_px` is 0).
+pub fn search_factor(width: u32, height: u32, search_px: u32) -> u32 {
+    if search_px == 0 {
+        return 1;
+    }
+    let longer = f64::from(width.max(height));
+    ((longer / f64::from(search_px)).round() as u32).max(1)
+}
+
+/// Finds the dictionaries' markers in the picture: one search, each quad
+/// read against every family, the nearest code wins.
+pub fn detect(gray: &Gray, dicts: &[&Dictionary], params: &DetectParams) -> Vec<Detection> {
+    let Some(min_cells) = dicts.iter().map(|d| d.size + 2).min() else {
+        return Vec::new();
+    };
+    let factor = search_factor(gray.width, gray.height, params.search_px);
+    let reduced;
+    let search: &Gray = if factor > 1 {
+        reduced = gray.downsampled(factor);
+        &reduced
+    } else {
+        gray
+    };
     let windows = if params.windows.is_empty() {
-        auto_windows(gray.width, gray.height)
+        auto_windows(search.width, search.height)
     } else {
         params.windows.clone()
     };
-    let longer = f64::from(gray.width.max(gray.height));
-    // Every cell needs a couple of pixels to read.
-    let min_side = 2.0 * f64::from(dict.size + 2);
+    let longer = f64::from(search.width.max(search.height));
+    // Every cell needs a couple of pixels to read, at full resolution;
+    // on the reduction a quad only has to be findable.
+    let min_side_full = 2.0 * f64::from(min_cells);
+    let min_side = (min_side_full / f64::from(factor)).max(6.0);
     let min_perimeter = (params.min_perimeter_rate * longer).max(4.0 * min_side);
     let max_side = params.max_side_rate * longer;
+    let scale = f64::from(factor);
     let mut found = Vec::new();
     for window in windows {
-        let binary = gray.threshold_local(window, params.threshold_constant);
+        let binary = search.threshold_local(window, params.threshold_constant);
         for quad in quads(&binary, params, min_perimeter, max_side, min_side) {
-            if let Some(detection) = decode(gray, &quad, dict, params) {
+            let quad = quad.map(|p| [p[0] * scale, p[1] * scale]);
+            if shortest_side(&quad) < min_side_full {
+                continue;
+            }
+            // The reduction's corners are off by up to a reduced pixel;
+            // the edge search reaches that much further.
+            let (quad, fit_px) = if params.refine {
+                // A second pass from the settled quad reaches the whole
+                // of a side the first pass only found part of.
+                let (once, fit) = refine_quad(gray, &quad, scale - 1.0);
+                if fit < shortest_side(&quad) && (0..4).any(|i| distance(once[i], quad[i]) > 2.0) {
+                    refine_quad(gray, &once, 0.0)
+                } else {
+                    (once, fit)
+                }
+            } else {
+                (quad, 0.0)
+            };
+            if let Some(detection) = decode(gray, &quad, fit_px, dicts, params) {
                 found.push(detection);
             }
         }
     }
     dedupe(found)
+}
+
+fn shortest_side(quad: &[[f64; 2]; 4]) -> f64 {
+    (0..4)
+        .map(|i| distance(quad[i], quad[(i + 1) % 4]))
+        .fold(f64::INFINITY, f64::min)
 }
 
 /// Candidate quads: the outer borders of dark components that
@@ -293,8 +353,12 @@ fn trace_outer_border(
     points
 }
 
-/// Douglas–Peucker on a closed contour, split at the point farthest from
-/// the first; `Some` only when exactly four vertices remain.
+/// Douglas–Peucker on a closed contour, split at its first point and the
+/// point farthest from it; the two split points stay vertices only where
+/// the contour actually turns (the first point is wherever raster order
+/// found the component, which on a nearly level top edge is tens of
+/// pixels from the corner). `Some` only when exactly four vertices
+/// remain.
 fn approximate_quad(contour: &[[f64; 2]], epsilon: f64) -> Option<[[f64; 2]; 4]> {
     if contour.len() < 4 {
         return None;
@@ -310,6 +374,21 @@ fn approximate_quad(contour: &[[f64; 2]], epsilon: f64) -> Option<[[f64; 2]; 4]>
     douglas_peucker(contour, a, b, epsilon, &mut vertices);
     vertices.push(b);
     douglas_peucker_wrapped(contour, b, a, epsilon, &mut vertices);
+    // Drop a split point that lies on the line between its neighbours.
+    for split in [b, a] {
+        if vertices.len() < 4 {
+            break;
+        }
+        let k = vertices
+            .iter()
+            .position(|&v| v == split)
+            .expect("split is a vertex");
+        let n = vertices.len();
+        let (prev, next) = (vertices[(k + n - 1) % n], vertices[(k + 1) % n]);
+        if point_line_distance(contour[split], contour[prev], contour[next]) <= epsilon {
+            vertices.remove(k);
+        }
+    }
     if vertices.len() != 4 {
         return None;
     }
@@ -522,15 +601,47 @@ fn otsu(values: &[f64]) -> f64 {
     best
 }
 
-/// Reads a quad's cells, checks its border, identifies it and refines
-/// its corners.
+/// Reads a quad's cells at each family's grid, checks the border and
+/// identifies it; the corners come out in the marker's canonical order.
 fn decode(
     gray: &Gray,
     quad: &[[f64; 2]; 4],
-    dict: &Dictionary,
+    fit_px: f64,
+    dicts: &[&Dictionary],
     params: &DetectParams,
 ) -> Option<Detection> {
-    let n = dict.size;
+    let mut best: Option<(crate::dict::Identification, &Dictionary)> = None;
+    for dict in dicts {
+        let Some(bits) = read_cells(gray, quad, dict.size, params) else {
+            continue;
+        };
+        if let Some(found) = dict.identify(bits)
+            && best.is_none_or(|(b, _)| found.distance < b.distance)
+        {
+            best = Some((found, dict));
+        }
+    }
+    let (found, dict) = best?;
+    let k = found.rotation as usize;
+    let corners = [
+        quad[k],
+        quad[(k + 1) % 4],
+        quad[(k + 2) % 4],
+        quad[(k + 3) % 4],
+    ];
+    Some(Detection {
+        id: found.id,
+        family: dict.name,
+        corners,
+        rotation: found.rotation,
+        distance: found.distance,
+        fit_px,
+    })
+}
+
+/// The inner `n x n` bits of a quad read as an `(n + 2)`-cell grid with a
+/// dark border, or `None` when the border is not dark enough.
+fn read_cells(gray: &Gray, quad: &[[f64; 2]; 4], n: u32, params: &DetectParams) -> Option<u64> {
     let cells = n + 2;
     let side = f64::from(cells);
     let canonical = [[0.0, 0.0], [side, 0.0], [side, side], [0.0, side]];
@@ -571,7 +682,7 @@ fn decode(
     if f64::from(border_errors) > params.border_error_rate * f64::from(border_cells) * 2.0 {
         return None;
     }
-    let mut bits = 0u32;
+    let mut bits = 0u64;
     for r in 0..n {
         for c in 0..n {
             if white(r + 1, c + 1) {
@@ -579,49 +690,56 @@ fn decode(
             }
         }
     }
-    let found = dict.identify(bits)?;
-    let k = found.rotation as usize;
-    let ordered = [
-        quad[k],
-        quad[(k + 1) % 4],
-        quad[(k + 2) % 4],
-        quad[(k + 3) % 4],
-    ];
-    let (corners, fit_px) = if params.refine {
-        refine_corners(gray, &ordered)
-    } else {
-        (ordered, 0.0)
-    };
-    Some(Detection {
-        id: found.id,
-        corners,
-        rotation: found.rotation,
-        distance: found.distance,
-        fit_px,
-    })
+    Some(bits)
 }
 
-/// Sub-pixel corners: along each side, the gradient crossing on the
-/// normal at many points, a robust line through them, and the corners
-/// at the intersections of adjacent lines.
-pub fn refine_corners(gray: &Gray, quad: &[[f64; 2]; 4]) -> ([[f64; 2]; 4], f64) {
-    let mut lines = Vec::with_capacity(4);
+/// Sub-pixel corners: along each side, the paper-to-ink crossing on the
+/// inward normal at many points, a robust quadratic through them (a
+/// curled card bows an edge by pixels, the lens by one), and each corner
+/// at the intersection of straight lines through the edge points of the
+/// half-sides meeting there; the rms of the edge points to their curves
+/// comes back as the fit. The edge search reaches `slack` pixels further
+/// for a quad found on a reduced picture.
+fn refine_quad(gray: &Gray, quad: &[[f64; 2]; 4], slack: f64) -> ([[f64; 2]; 4], f64) {
+    let mut sides: Vec<Curve> = Vec::with_capacity(4);
     let mut residual_sq = 0.0;
     let mut residual_n = 0usize;
+    // A refinement that cannot fit reports a fit as bad as the quad is
+    // big, so a candidate it failed on never outranks one it settled.
+    let unfit = shortest_side(quad).max(1.0);
+    let centre = [
+        quad.iter().map(|p| p[0]).sum::<f64>() * 0.25,
+        quad.iter().map(|p| p[1]).sum::<f64>() * 0.25,
+    ];
     for i in 0..4 {
         let (a, b) = (quad[i], quad[(i + 1) % 4]);
         let len = distance(a, b);
         if len < 4.0 {
-            return (*quad, 0.0);
+            return (*quad, unfit);
         }
         let dir = [(b[0] - a[0]) / len, (b[1] - a[1]) / len];
-        let normal = [-dir[1], dir[0]];
-        let count = ((len / 4.0) as usize).clamp(8, 40);
-        let reach = (len * 0.1).clamp(2.0, 12.0);
+        // The normal pointing into the marker, so the crossing looked for
+        // is the border's outer edge, paper to ink, and not a bit's.
+        let mut normal = [-dir[1], dir[0]];
+        let mid = [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5];
+        if (centre[0] - mid[0]) * normal[0] + (centre[1] - mid[1]) * normal[1] < 0.0 {
+            normal = [-normal[0], -normal[1]];
+        }
+        let count = ((len / 4.0) as usize).clamp(8, 60);
+        // The search stays inside the border cell on the inside and the
+        // quiet zone outside; the smallest cell any family has is an
+        // eighth of the side.
+        let cell = len / 8.0;
+        let reach = ((len * 0.1).clamp(2.0, 12.0) + slack)
+            .min(1.2 * cell)
+            .max(1.5);
         const STEP: f64 = 0.5;
         let mut points: Vec<[f64; 2]> = Vec::with_capacity(count);
+        // Clear of the corners, where blur rounds the edge: six pixels
+        // or four percent of the side, whichever is more.
+        let t_min = (6.0 / len).max(0.04);
         for k in 0..count {
-            let t = 0.15 + 0.7 * k as f64 / (count - 1) as f64;
+            let t = t_min + (1.0 - 2.0 * t_min) * k as f64 / (count - 1) as f64;
             let p = [a[0] + dir[0] * t * len, a[1] + dir[1] * t * len];
             let steps = (reach / STEP) as i64;
             let profile: Vec<f64> = (-steps..=steps)
@@ -630,14 +748,13 @@ pub fn refine_corners(gray: &Gray, quad: &[[f64; 2]; 4]) -> ([[f64; 2]; 4], f64)
                     gray.sample(p[0] + normal[0] * d, p[1] + normal[1] * d)
                 })
                 .collect();
-            // Gradient magnitude by central differences; peak with a
-            // parabolic refinement.
+            // The darkening gradient inward, by central differences.
             let grad: Vec<f64> = (0..profile.len())
                 .map(|j| {
                     if j == 0 || j + 1 == profile.len() {
                         0.0
                     } else {
-                        (profile[j + 1] - profile[j - 1]).abs()
+                        (profile[j - 1] - profile[j + 1]).max(0.0)
                     }
                 })
                 .collect();
@@ -669,74 +786,322 @@ pub fn refine_corners(gray: &Gray, quad: &[[f64; 2]; 4]) -> ([[f64; 2]; 4], f64)
             points.push([p[0] + normal[0] * s, p[1] + normal[1] * s]);
         }
         if points.len() < 4 {
-            return (*quad, 0.0);
+            return (*quad, unfit);
         }
-        let Some((line, rms, used)) = fit_line(&points) else {
-            return (*quad, 0.0);
+        let Some((curve, rms, used)) = fit_curve(a, dir, normal, len, &points) else {
+            return (*quad, unfit);
         };
         residual_sq += rms * rms * used as f64;
         residual_n += used;
-        lines.push(line);
+        sides.push(curve);
     }
     let mut corners = *quad;
     for i in 0..4 {
-        let prev = &lines[(i + 3) % 4];
-        let this = &lines[i];
-        if let Some(p) = intersect(prev, this) {
-            corners[i] = p;
-        }
+        // Side i - 1 ends at corner i, side i starts there. The corner is
+        // where the edges arrive, so each is a straight line through the
+        // edge points of the half of the side nearest the corner (a curled
+        // card bows an edge by several pixels, and lifts most at a corner;
+        // the lens bends it by one), falling back to the whole side's
+        // tangent when the half has too few points.
+        let (prev, this) = (&sides[(i + 3) % 4], &sides[i]);
+        let end = prev
+            .local_line(false)
+            .unwrap_or_else(|| prev.tangent_at_end());
+        let start = this
+            .local_line(true)
+            .unwrap_or_else(|| this.tangent_at_start());
+        corners[i] = intersect(&end, &start)
+            .or_else(|| intersect(&prev.straight(), &this.straight()))
+            .unwrap_or(quad[i]);
     }
     let fit = if residual_n > 0 {
         (residual_sq / residual_n as f64).sqrt()
     } else {
         0.0
     };
+    // A side whose points mostly went missing, that bends more than a
+    // card can curl, or corners that left the quad altogether are no
+    // refinement: keep the quad and report a fit as bad as it is. A poor
+    // fit alone keeps the corners; the fit says what they are worth.
+    let shortest = shortest_side(quad);
+    let moved = (0..4)
+        .map(|i| distance(corners[i], quad[i]))
+        .fold(0.0, f64::max);
+    let thin = sides.iter().any(|s| s.points.len() * 3 < s.looked * 2);
+    let curled = sides.iter().any(|s| s.bend() > 0.05 * s.len);
+    if thin || curled || moved > 0.2 * shortest {
+        return (*quad, unfit.max(fit));
+    }
     (corners, fit)
+}
+
+/// One side's edge as a quadratic in the side's frame: origin at the
+/// quad's corner, `t` along the side, `n` along the normal; the edge
+/// sits at `n = c0 + c1 t + c2 t²`.
+struct Curve {
+    origin: [f64; 2],
+    dir: [f64; 2],
+    normal: [f64; 2],
+    len: f64,
+    c: [f64; 3],
+    /// The straight line through the same points, `n = l0 + l1 t`.
+    l: [f64; 2],
+    /// The edge points kept, in the side's frame.
+    points: Vec<(f64, f64)>,
+    looked: usize,
+}
+
+impl Curve {
+    fn point(&self, t: f64) -> [f64; 2] {
+        let n = self.c[0] + self.c[1] * t + self.c[2] * t * t;
+        [
+            self.origin[0] + self.dir[0] * t + self.normal[0] * n,
+            self.origin[1] + self.dir[1] * t + self.normal[1] * n,
+        ]
+    }
+
+    fn tangent(&self, t: f64) -> Line {
+        let slope = self.c[1] + 2.0 * self.c[2] * t;
+        let d = [
+            self.dir[0] + self.normal[0] * slope,
+            self.dir[1] + self.normal[1] * slope,
+        ];
+        let l = (d[0] * d[0] + d[1] * d[1]).sqrt();
+        (self.point(t), [d[0] / l, d[1] / l])
+    }
+
+    fn tangent_at_start(&self) -> Line {
+        self.tangent(0.0)
+    }
+
+    /// A straight line through the kept points in the first (or last)
+    /// half of the side, when there are six or more of them.
+    fn local_line(&self, at_start: bool) -> Option<Line> {
+        let (lo, hi) = if at_start {
+            (0.0, self.len * 0.5)
+        } else {
+            (self.len * 0.5, self.len)
+        };
+        let pts: Vec<(f64, f64)> = self
+            .points
+            .iter()
+            .copied()
+            .filter(|(t, _)| *t >= lo && *t <= hi)
+            .collect();
+        if pts.len() < 6 {
+            return None;
+        }
+        let n = pts.len() as f64;
+        let (st, sn) = pts.iter().fold((0.0, 0.0), |a, (t, v)| (a.0 + t, a.1 + v));
+        let (mt, mn) = (st / n, sn / n);
+        let (mut stt, mut stn) = (0.0, 0.0);
+        for (t, v) in &pts {
+            stt += (t - mt) * (t - mt);
+            stn += (t - mt) * (v - mn);
+        }
+        if stt < 1e-9 {
+            return None;
+        }
+        let slope = stn / stt;
+        let d = [
+            self.dir[0] + self.normal[0] * slope,
+            self.dir[1] + self.normal[1] * slope,
+        ];
+        let l = (d[0] * d[0] + d[1] * d[1]).sqrt().max(1e-12);
+        Some((
+            [
+                self.origin[0] + self.dir[0] * mt + self.normal[0] * mn,
+                self.origin[1] + self.dir[1] * mt + self.normal[1] * mn,
+            ],
+            [d[0] / l, d[1] / l],
+        ))
+    }
+
+    /// The straight-line fit through the same edge points.
+    fn straight(&self) -> Line {
+        let d = [
+            self.dir[0] + self.normal[0] * self.l[1],
+            self.dir[1] + self.normal[1] * self.l[1],
+        ];
+        let n = (d[0] * d[0] + d[1] * d[1]).sqrt().max(1e-12);
+        (
+            [
+                self.origin[0] + self.normal[0] * self.l[0],
+                self.origin[1] + self.normal[1] * self.l[0],
+            ],
+            [d[0] / n, d[1] / n],
+        )
+    }
+
+    /// How far the quadratic bends from its straight fit over the side.
+    fn bend(&self) -> f64 {
+        let mid = self.len * 0.5;
+        ((self.c[0] + self.c[1] * mid + self.c[2] * mid * mid) - (self.l[0] + self.l[1] * mid))
+            .abs()
+    }
+
+    fn tangent_at_end(&self) -> Line {
+        self.tangent(self.len)
+    }
+}
+
+/// Least-squares quadratic through the edge points in the side's frame,
+/// refit once without the outliers; the curve, its rms and the points
+/// kept. Fewer than six points get a straight line.
+fn fit_curve(
+    origin: [f64; 2],
+    dir: [f64; 2],
+    normal: [f64; 2],
+    len: f64,
+    points: &[[f64; 2]],
+) -> Option<(Curve, f64, usize)> {
+    let local: Vec<(f64, f64)> = points
+        .iter()
+        .map(|p| {
+            let d = [p[0] - origin[0], p[1] - origin[1]];
+            (
+                d[0] * dir[0] + d[1] * dir[1],
+                d[0] * normal[0] + d[1] * normal[1],
+            )
+        })
+        .collect();
+    let fit = |pts: &[(f64, f64)], quadratic: bool| -> Option<([f64; 3], Vec<f64>)> {
+        let quadratic = quadratic && pts.len() >= 6;
+        // Normal equations in t scaled to the side, for conditioning.
+        let s = 1.0 / len.max(1.0);
+        let k = if quadratic { 3 } else { 2 };
+        let mut ata = [[0.0; 3]; 3];
+        let mut atb = [0.0; 3];
+        for &(t, n) in pts {
+            let row = [1.0, t * s, (t * s) * (t * s)];
+            for i in 0..k {
+                for j in 0..k {
+                    ata[i][j] += row[i] * row[j];
+                }
+                atb[i] += row[i] * n;
+            }
+        }
+        let c = if quadratic {
+            let inv = crate::linalg::mat3_inverse(&ata)?;
+            let mut c = [0.0; 3];
+            for i in 0..3 {
+                for j in 0..3 {
+                    c[i] += inv[i][j] * atb[j];
+                }
+            }
+            [c[0], c[1] * s, c[2] * s * s]
+        } else {
+            let det = ata[0][0] * ata[1][1] - ata[0][1] * ata[1][0];
+            if det.abs() < 1e-12 {
+                return None;
+            }
+            let c0 = (atb[0] * ata[1][1] - ata[0][1] * atb[1]) / det;
+            let c1 = (ata[0][0] * atb[1] - ata[1][0] * atb[0]) / det;
+            [c0, c1 * s, 0.0]
+        };
+        let residuals = pts
+            .iter()
+            .map(|&(t, n)| n - (c[0] + c[1] * t + c[2] * t * t))
+            .collect();
+        Some((c, residuals))
+    };
+    // Two passes of rejection on a robust scale (the median absolute
+    // deviation), so a run of points on something touching the marker
+    // (a black chair leg against a black border) is dropped even when
+    // it is a third of the side.
+    let mut kept = local.clone();
+    for _ in 0..2 {
+        let (_, residuals) = fit(&kept, true)?;
+        let mut abs: Vec<f64> = residuals.iter().map(|r| r.abs()).collect();
+        abs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mad = abs[abs.len() / 2];
+        let cut = (3.0 * 1.4826 * mad).max(0.3);
+        let next: Vec<(f64, f64)> = kept
+            .iter()
+            .zip(&residuals)
+            .filter(|(_, r)| r.abs() <= cut)
+            .map(|(p, _)| *p)
+            .collect();
+        if next.len() == kept.len() {
+            break;
+        }
+        kept = next;
+    }
+    if kept.len() < 3 || kept.len() * 2 < local.len() {
+        return None;
+    }
+    let (c, residuals) = fit(&kept, true)?;
+    let (l, _) = fit(&kept, false)?;
+    let rms = (residuals.iter().map(|r| r * r).sum::<f64>() / residuals.len() as f64).sqrt();
+    let used = kept.len();
+    Some((
+        Curve {
+            origin,
+            dir,
+            normal,
+            len,
+            c,
+            l: [l[0], l[1]],
+            looked: local.len(),
+            points: kept,
+        },
+        rms,
+        used,
+    ))
+}
+
+/// The corner near `start` where every gradient in the
+/// `(2 half + 1)`-pixel window is orthogonal to the offset from it (the
+/// `cornerSubPix` iteration, the window moving with the estimate): the
+/// intersection of the edges meeting there, or a chessboard's saddle
+/// point. `None` when the window is flat or the iteration wanders off
+/// by more than the window.
+pub fn refine_saddle(
+    gray: &Gray,
+    start: [f64; 2],
+    half: u32,
+    iterations: u32,
+    epsilon: f64,
+) -> Option<[f64; 2]> {
+    let half_i = half as i64;
+    let sigma2 = (f64::from(half) / std::f64::consts::SQRT_2).powi(2);
+    let mut q = start;
+    for _ in 0..iterations {
+        let (mut a, mut b, mut c) = (0.0, 0.0, 0.0);
+        let (mut bx, mut by) = (0.0, 0.0);
+        for j in -half_i..=half_i {
+            for i in -half_i..=half_i {
+                let (x, y) = (q[0] + i as f64, q[1] + j as f64);
+                let gx = (gray.sample(x + 1.0, y) - gray.sample(x - 1.0, y)) * 0.5;
+                let gy = (gray.sample(x, y + 1.0) - gray.sample(x, y - 1.0)) * 0.5;
+                let w = (-((i * i + j * j) as f64) / sigma2).exp();
+                let (gxx, gxy, gyy) = (w * gx * gx, w * gx * gy, w * gy * gy);
+                a += gxx;
+                b += gxy;
+                c += gyy;
+                bx += gxx * x + gxy * y;
+                by += gxy * x + gyy * y;
+            }
+        }
+        let det = a * c - b * b;
+        if det.abs() < 1e-9 || !det.is_finite() {
+            return None;
+        }
+        let next = [(c * bx - b * by) / det, (a * by - b * bx) / det];
+        let step = distance(next, q);
+        if !step.is_finite() || distance(next, start) > f64::from(half) {
+            return None;
+        }
+        q = next;
+        if step < epsilon {
+            break;
+        }
+    }
+    Some(q)
 }
 
 /// A line as a point and a unit direction.
 type Line = ([f64; 2], [f64; 2]);
-
-/// Total-least-squares line through the points, refit once without the
-/// outliers; the line, its rms distance and the points kept.
-fn fit_line(points: &[[f64; 2]]) -> Option<(Line, f64, usize)> {
-    let fit = |pts: &[[f64; 2]]| -> Option<(Line, Vec<f64>)> {
-        let n = pts.len() as f64;
-        let cx = pts.iter().map(|p| p[0]).sum::<f64>() / n;
-        let cy = pts.iter().map(|p| p[1]).sum::<f64>() / n;
-        let (mut sxx, mut sxy, mut syy) = (0.0, 0.0, 0.0);
-        for p in pts {
-            let (dx, dy) = (p[0] - cx, p[1] - cy);
-            sxx += dx * dx;
-            sxy += dx * dy;
-            syy += dy * dy;
-        }
-        // Principal direction of the 2x2 covariance.
-        let theta = 0.5 * (2.0 * sxy).atan2(sxx - syy);
-        let dir = [theta.cos(), theta.sin()];
-        let normal = [-dir[1], dir[0]];
-        let residuals: Vec<f64> = pts
-            .iter()
-            .map(|p| (p[0] - cx) * normal[0] + (p[1] - cy) * normal[1])
-            .collect();
-        Some((([cx, cy], dir), residuals))
-    };
-    let (_, residuals) = fit(points)?;
-    let rms = (residuals.iter().map(|r| r * r).sum::<f64>() / residuals.len() as f64).sqrt();
-    let cut = (2.5 * rms).max(0.3);
-    let kept: Vec<[f64; 2]> = points
-        .iter()
-        .zip(&residuals)
-        .filter(|(_, r)| r.abs() <= cut)
-        .map(|(p, _)| *p)
-        .collect();
-    if kept.len() < 3 {
-        return None;
-    }
-    let (line, residuals) = fit(&kept)?;
-    let rms = (residuals.iter().map(|r| r * r).sum::<f64>() / residuals.len() as f64).sqrt();
-    Some((line, rms, kept.len()))
-}
 
 fn intersect(a: &Line, b: &Line) -> Option<[f64; 2]> {
     let (p, d) = a;
@@ -769,7 +1134,7 @@ fn dedupe(mut found: Vec<Detection>) -> Vec<Detection> {
             kept.push(d);
         }
     }
-    kept.sort_by_key(|d| d.id);
+    kept.sort_by_key(|d| (d.id, d.family));
     kept
 }
 
@@ -820,9 +1185,10 @@ mod tests {
         tolerance: f64,
     ) {
         let dict = Dictionary::aruco_5x5_100();
-        let found = detect(picture, &dict, &DetectParams::default());
+        let found = detect(picture, &[&dict], &DetectParams::default());
         let ids: Vec<u32> = found.iter().map(|d| d.id).collect();
         assert_eq!(ids, vec![0, 1, 2, 5, 49], "{found:?}");
+        assert!(found.iter().all(|d| d.family == "5x5_100"));
         let mut errors = Vec::new();
         for (d, m) in found.iter().zip(markers) {
             for j in 0..4 {
@@ -861,7 +1227,8 @@ mod tests {
                 ..Render::default()
             },
         );
-        check(&clean, &camera, &view, &markers, 0.2);
+        // A clean render quantises its edges to a sixth of a pixel.
+        check(&clean, &camera, &view, &markers, 0.3);
         let blurred = render(
             &camera,
             &view,
@@ -876,18 +1243,50 @@ mod tests {
         // The turned marker's top edge runs up the picture, a quarter
         // turn counter-clockwise, which is three clockwise; the others
         // are upright.
-        let found = detect(&clean, &dict, &DetectParams::default());
+        let found = detect(&clean, &[&dict], &DetectParams::default());
         assert_eq!(found.iter().find(|d| d.id == 5).unwrap().rotation, 3);
         assert_eq!(found.iter().find(|d| d.id == 0).unwrap().rotation, 0);
-        // The wrong dictionary finds nothing.
-        assert!(
-            detect(
-                &clean,
-                &Dictionary::aruco_4x4_50(),
-                &DetectParams::default()
-            )
-            .is_empty()
+        // The wrong dictionary finds nothing; asking for both families
+        // finds the same five as swatches.
+        let board = Dictionary::aruco_4x4_50();
+        assert!(detect(&clean, &[&board], &DetectParams::default()).is_empty());
+        let both = detect(&clean, &[&board, &dict], &DetectParams::default());
+        assert_eq!(both.len(), 5);
+        assert!(both.iter().all(|d| d.family == "5x5_100"));
+    }
+
+    #[test]
+    fn a_large_picture_is_searched_reduced_and_read_in_full() {
+        // The same scene at 3200 x 2400 (f = 2500): the search runs at
+        // half size and the corners still come out at full accuracy.
+        let (_, view, markers) = scene();
+        let camera = CameraModel::pinhole(3200, 2400, 2500.0, 2500.0, 1600.0, 1200.0);
+        let dict = Dictionary::aruco_5x5_100();
+        let picture = render(
+            &camera,
+            &view,
+            &markers,
+            &dict,
+            &Render {
+                blur_sigma: 1.0,
+                ..Render::default()
+            },
         );
+        assert_eq!(search_factor(3200, 2400, 1600), 2);
+        assert_eq!(search_factor(6192, 4128, 1600), 4);
+        assert_eq!(search_factor(1280, 960, 1600), 1);
+        assert_eq!(search_factor(6192, 4128, 0), 1);
+        check(&picture, &camera, &view, &markers, 0.35);
+        // Full-resolution search finds the same markers.
+        let full = detect(
+            &picture,
+            &[&dict],
+            &DetectParams {
+                search_px: 0,
+                ..DetectParams::default()
+            },
+        );
+        assert_eq!(full.len(), 5);
     }
 
     #[test]

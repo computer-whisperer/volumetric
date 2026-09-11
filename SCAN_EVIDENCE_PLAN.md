@@ -1,31 +1,55 @@
 # Scan Evidence — Design and Plan
 
-Status: ratified 2026-09-09. Step 0 landed 2026-09-09. Step A landed 2026-09-09 (value, import, CLI, GUI). Step B landed 2026-09-10 (cv_core, view-solve, view_solve_operator, GUI Import Still); C–D pending.
+Status: ratified 2026-09-09; reframed 2026-09-11 for stills-only capture,
+the survey card and splats. Step 0 landed 2026-09-09. Step A landed
+2026-09-09 (value, import, CLI, GUI). Step B landed 2026-09-10 (cv_core,
+view-solve, view_solve_operator, GUI Import Still). C2 (card detection)
+landed 2026-09-11. C1, C3, C4, S (splats), P (Python bindings) and D
+(audits) pending; order C3, S1, S2, P, C1, C4, D, S3.
 
 ## Why
 
 Volumetric's purpose is to let an agent that cannot hold a tape measure do
 ordinary modelling work from physical evidence a human collects. The
-scanning project (`~/workspace/playground/index_scanner`, a Valve Index
-used as a stereo scanner on a lighthouse-tracked pose, with printed ArUco
-target cards on and around the subject) is the evidence pipeline; its
-Python scripts are the interim exploration of what is practical. The
-persistent tooling for everything from "files on disk" to a model lives
-here.
+evidence is now a set of stills: a camera (a Sony a6700 with a 50 mm lens,
+or a phone) photographs the subject on and around a marker field, and one
+rigid reference in the field, the survey card, gives the scale and the
+datum. A bundle over the card's chessboard corners and the swatch corners
+solves the cameras, the poses and every corner as a free point, to a few
+hundredths of a millimetre on the card and a few tenths across a metre of
+field. Nothing but the camera, the printed card and a caliper is needed.
+(Until 2026-09-10 the evidence came from a Valve Index used as a stereo
+scanner on a lighthouse-tracked pose; the stills survey beats its map by
+an order of magnitude and needs no rig, so the Index path is dropped.)
 
-Two interfaces, one code path. The CLI is the agent's interface: it must
-let the agent see, measure, build and verify headlessly. The GUI is the
-human's audit of what the agent accepted and produced. Whatever the CLI
-renders or solves, the GUI shows through the same crates, so the frame the
-agent looked at is the frame the human sees.
+The scanning project (`~/workspace/playground/index_scanner`, Python) is
+a temporary shim: it is where each stage is prototyped, and its cached
+outputs are the oracles for the Rust version. What lands here is the
+mature form of the same concepts, and the shim is retired stage by stage.
+The one stage that stays outside is Gaussian-splat training (gsplat on a
+CUDA node, with SAM 2 masks): it is the GPU service of the pipeline.
+Volumetric prepares its input, imports its output, and represents and
+renders the splat itself, so the agent can see and audit what came back.
 
-Acceptance task: "build the rest of the office chair" from the chairbase1
-scan (`/ceph/christian/index_scanner/sessions/chairbase1`, plus the run
-`runs/chairbase1-2dgs-mask` and the phone stills in
-`work/chair-phone`). The scan covers the star base, casters, gas lift and
-tilt mechanism with its seat-mount plate. The task is to add seat, back
-and arms that mount on that plate, verified against the scan and the
-photos, and to export a printable or manufacturable mesh.
+The goal state: an agent is handed volumetric and a directory of stills
+and manages everything from there, with the GPU service as one remote
+step. Two interfaces, one code path. The CLI is the agent's interface: it
+must let the agent see, measure, build and verify headlessly. The GUI is
+the human's audit of what the agent accepted and produced. Whatever the
+CLI renders or solves, the GUI shows through the same crates. Python
+bindings expose the same kernels for exploration and validation, and
+never carry logic of their own.
+
+Acceptance task: "build the rest of the office chair" from the
+chairbase-dslr-0 session (`sessions/chairbase-dslr-0`: 79 a6700 stills of
+the star base on the survey card; `work/chairbase-dslr-0/{detections,
+survey}.json` from the shim; `runs/chairbase-dslr-0-2dgs` the trained
+splat, its TSDF and surface cloud; all under
+`/ceph/christian/index_scanner`). The task is to survey the stills here,
+export the dataset, train on the cluster, bring the splat back, check it
+against the photographs, measure the base, and add seat, back and arms
+that mount on its plate, verified against the evidence, exported as a
+printable or manufacturable mesh.
 
 ## Decision record
 
@@ -35,13 +59,21 @@ photos, and to export a printable or manufacturable mesh.
    subset of a dataset, and the marker map. Because: real datasets are
    1542 views, 1.7 GB of images and 340 MB of depth; a project embeds a
    curated subset, and the marker map is what poses a new still.
-2. **The marker pipeline comes into volumetric.** In: ArUco detection with
-   sub-pixel refinement, PnP and focal solving, radial and fisheye
-   (Kannala-Brandt) models, marker-map refinement against a pose track,
-   TSDF fusion from posed depth, later stereo matching. Out: capture,
-   device calibration, hand-eye, structure from motion (the cards replace
-   it), splat training (CUDA). Because: the target cards are what turn a
-   photo into evidence, and none of the "in" items needs hardware or a GPU.
+2. **The marker pipeline comes into volumetric (revised 2026-09-11).** In:
+   still intake with EXIF and maker-note camera keys, ArUco and AprilTag
+   detection with sub-pixel refinement, ChArUco corner localisation, PnP
+   and focal solving, radial and fisheye (Kannala-Brandt) models, the
+   survey bundle (cameras per focus setting, poses, corners as free
+   points, scale from the card), the trainer's dataset export, and the
+   trained splat as a value with rendering and photometric audits. Out:
+   capture, device calibration, structure from motion and SIFT seeding,
+   SAM 2, splat training. Dropped from the 2026-09-09 list: marker-map
+   refinement against the lighthouse track (no lighthouse; the survey
+   replaces it) and TSDF fusion from posed depth (no depth source any
+   more; fusion happens in the trainer, and may return here as depth
+   rendered from the splat, see "Later"). Because: the target card and
+   the survey card are what turn photographs into evidence, and none of
+   the "in" items needs hardware or a GPU.
 3. **Provenance and audits are first-class.** Evidence values carry a
    provenance record (session, rig calibration hash with noise model,
    marker field id, subject setup id, tool versions). Combinators refuse
@@ -49,15 +81,41 @@ photos, and to export a printable or manufacturable mesh.
    an explicit alignment step with a residual. Statistical audits compare
    residuals to the rig's declared noise and surface as warnings on the
    existing warning channel; categorical mismatches are step errors.
-4. **Formats at the boundary.** Heavy artefacts use standards: PLY, NRRD,
-   16-bit PNG depth, PNG/JPEG images. The posed-image manifest is imported
-   from the scanner's `cameras.json` (schema 2) and from nerfstudio
+4. **Formats at the boundary.** Heavy artefacts use standards: PLY (clouds
+   and the 3DGS splat layout), NRRD and numpy `.npz` for grids, 16-bit
+   PNG depth, PNG/JPEG images. The posed-image manifest is imported from
+   the shim's `cameras.json` (schema 2) and from nerfstudio
    `transforms.json` with two documented extensions (world units are
-   metres, `depth_unit_m`). The marker map is produced by volumetric, not
-   imported, once step C lands. Specs live in this repo, since it is the
-   consumer.
+   metres, `depth_unit_m`), and exported in the schema-2 layout for the
+   trainer. The marker map is produced by volumetric, by the survey, not
+   imported. Specs live in this repo, since it is the consumer.
 5. **Values print.** Any small value (Subspace, F64Map) is readable from
    the CLI without a decoder. The agent reads numbers, not sizes.
+6. **The shim is the oracle, then retired (2026-09-11).** Each stage lands
+   validated against the shim's cached output for the same session
+   (`detections.json`, `survey.json`, the trainer's `metrics.json`), the
+   way step B was validated against COLMAP and OpenCV. Once a stage is
+   validated the shim's version is not extended; the shim keeps capture
+   and GPU dispatch until a GPU-service step exists here.
+7. **Splats are an evidence value (2026-09-11).** A `Splat` value (3D
+   Gaussians or 2D surfels: means, scales, rotations, opacities, spherical
+   harmonics, provenance naming the view set it was trained from) is
+   imported from the trainer's PLY, drawn in the viewport and by `render`
+   with sorted alpha blending, looked through over the photographs, and
+   converted to a point cloud with normals for the fit tools. Rejected:
+   treating the splat as an opaque blob and working only from the
+   trainer's TSDF surface. Because: the splat is the pipeline's product,
+   the photographs are its ground truth, and comparing the two per view
+   is the audit that says whether the geometry can be trusted.
+8. **Python bindings over the same kernels (2026-09-11).** A PyO3 module
+   exposes detection, pose solving, the survey, view sets, splats and
+   project runs on numpy types. The CLI stays the canonical agent surface
+   and the operator the durable pipeline stage; the bindings are the
+   workbench for validation loops and plots, and the way the shim can
+   call volumetric's kernels instead of its own. Because: the exploration
+   half of this work is Python by reflex, and a per-call process with
+   bespoke flags and JSON shapes is friction that in-process arrays are
+   not.
 
 ## Steps
 
@@ -66,12 +124,21 @@ photos, and to export a printable or manufacturable mesh.
 | 0 | Values in `project-run --json`; one `render` for a whole project scene with an explicit pinhole camera | 2 days | landed |
 | A | `view_core`: ViewSet value with provenance, manifest import, look-through render, depth residual | 4 days | landed |
 | B | `cv_core`: ArUco detection, PnP, focal; `view-solve` CLI, operator, GUI drop-a-still | 5 days | landed |
-| C | Marker-map refinement with the pose track; TSDF fusion operator | 5 days | pending |
-| D | Evidence audits: coverage, subject motion, frame quality, grouping | 3 days | pending |
+| C1 | Still intake: a view set from a directory of stills, camera keys from EXIF and the Sony maker note, intake audits | 2 days | pending |
+| C2 | Card detection: AprilTag 36h11 as data, ChArUco corners refined, pyramid search for 26 MP frames, observations stored per view | 3 days | landed |
+| C3 | Survey bundle: cameras per focus key, poses, corners free, scale from the card, uncertainties; `view-survey`, operator, GUI | 4 days | pending |
+| C4 | Trainer bridges: dataset export in the schema-2 layout with a box seed; `.npz` TSDF import | 2 days | pending |
+| S1 | Splat value, 3DGS PLY import, `splat-list`, splat to point cloud | 2 days | pending |
+| S2 | Splat rendering in the viewport and `render`, look-through over the photograph | 4 days | pending |
+| S3 | Photometric audit: the splat rendered through each view against its photograph | 2 days | pending |
+| P | Python bindings (PyO3, maturin) over cv_core, view_core, the survey, splats and projects | 3 days | pending |
+| D | Evidence audits for still sets: intake, detection, survey, setup, coverage, photometric, physical | 3 days | pending |
 
-Items that need no format decision (0, and the frame-datum operator and
-`measure` command listed under "later") can land at any time. A, B and D
-build on the ViewSet value.
+Proposed order: C2, C3 (the survey is the stage the agent starts from and
+its oracle is fresh), S1, S2 (the splat is what it ends with and cannot
+be seen here today), P (once there are kernels worth binding), C1, C4, D,
+S3. Items that need no format decision (the frame-datum operator and
+`measure` command under "Later") can land at any time.
 
 ## Step 0 — see and read
 
@@ -313,44 +380,301 @@ section with its `rms` and `cards` tags and can be looked through, where
 the map's marker squares over the photograph's cards are the visual
 check of the solve.
 
-## Step C — marker map and fusion
+## Step C — the survey (replaces the lighthouse map refinement)
 
-Marker-map refinement: per-frame poses and marker world corners solved
-jointly against the lighthouse pose track with a loose prior, robust loss,
-hand-rolled sparse Levenberg–Marquardt (tens of markers, thousands of
-frames). Replaces the scanner's scan step and produces the per-frame
-residuals the audits need. TSDF fusion from a ViewSet with depth as an
-operator, removing the npz-to-NRRD detour.
+### Why this shape
+
+The shim's `idx-survey` showed what a still session can give: 73 of 79
+frames posed at 0.72 px rms, the glued card planar to 0.031 mm over 110
+corners, fourteen swatches at 0.1–0.34 mm sigma across a 0.9 m field, the
+card's caliper span reproduced to 0.06 %. Every part of that is CPU work
+on detections, and `cv_core` already has the quad finder, the marker
+decoder, sub-pixel edge refinement, PnP and a robust Gauss-Newton. What
+is missing is the AprilTag family, chessboard corners, triangulation, a
+bundle with an analytic Jacobian, and the intake and export around them.
+
+### C1. Still intake
+
+- `view-import --stills DIR [--glob '*.JPG'] [--embed full|preview|none]
+  [--session s --setup s --field s]`: one view per still, unposed. Each
+  view carries `source` (the path, relative to the set's origin) and the
+  original's content hash in provenance; `--embed preview` (default)
+  keeps a quarter-scale JPEG for look-through and thumbnails, `full` the
+  original, `none` only the reference. Commands that need full resolution
+  (detection, export) read `source` when the embedded image is reduced
+  and fail with the path when the file is gone.
+- ViewSet schema 2: `camera_to_world` becomes optional (unposed views draw
+  no frustum and are listed as such), `shot: Option<Shot>` (iso,
+  exposure_s, aperture, focus mode, focus position, stabilisation,
+  orientation) and `observations: Option<Observations>` (C2) per view.
+  Schema-1 sets decode as posed with no shot.
+- Camera keys: `make:model:focus` from EXIF, with the Sony maker note
+  read for the focus position (block 0x9402 deciphered, byte 0x2d), focus
+  mode (tag 0x201b) and SteadyShot, as `sonyexif.py` does; one
+  `CameraModel` per key seeded from the focal length and the sensor width
+  (23.5 mm for the a6700; the 35 mm equivalent or `--fov-deg` otherwise),
+  principal point at the centre, k1 = k2 = 0. Autofocus frames each get
+  their own key.
+- Intake warnings: autofocus frames (cannot share a model), stabilisation
+  on (the principal point moves per shot), ISO above a threshold, mixed
+  orientations, frames without EXIF. The report lists frames per key.
+
+### C2. Card detection
+
+Status: landed 2026-09-11 (`cv_core::{dict, detect, charuco, blur,
+observe}`, `view-detect`, `view_detect_operator`, the observation overlay
+in look-through). Validated against the shim on chairbase-dslr-0 (79
+stills): every card corner OpenCV found is found (1984 of 1984) plus 1361
+more, agreeing to 0.13 px median, 0.98 px at the 99th percentile; swatch
+corners agree to 1.0 px median, of which about 0.5 px is OpenCV's
+`cornerSubPix` pulling a blurred L-corner inward (measured on renders:
+0.3σ of the blur), so the shim's survey, fitted to those corners, is
+itself offset; the caliper check on the swatches' printed size in C3 is
+the arbiter. On pcb-dslr-1 (the board on the card, f/4) 0.10 px median
+with the defocused frames' corners disagreeing by tens of pixels on both
+sides. The chair-phone stills still pose within 1.3 cm median of COLMAP.
+Detection is 0.2 s per 26 MP still. Two things the validation taught:
+the contour's first pixel in raster order must not be kept as a quad
+vertex (on a level edge it sits tens of pixels from the corner), and a
+straight edge fit is wrong on real cards, which curl by several pixels
+over a side; the marker corners come from the edge points nearest each
+corner.
+
+- `cv_core::dict` gains AprilTag 36h11 as data (587 codes of 36 bits in a
+  6x6 grid, generated by `gen/aruco_dicts.py` from OpenCV's
+  `DICT_APRILTAG_36h11`, tolerance from the family's correction bits as
+  for the ArUco sets); the quad pipeline is unchanged. Since the card's
+  tags carry ids 100–165 and the swatches 0–59, a detection run reports
+  both families from one pass over the quads.
+- `cv_core::charuco`: a `BoardSpec` (squares across and down, pitch across
+  and down from the calipers, marker size, family, first id; the card is
+  12x11 at 17.944 x 17.745 mm, ids from 100) and the corner localisation.
+  Each decoded tag gives a board-to-image homography; the interior
+  corners of its neighbouring squares are predicted from it and refined
+  by the saddle-point iteration (gradient orthogonality over a window
+  scaled to the square's size in pixels, the `cornerSubPix` method); a
+  corner with one decoded tag beside it is accepted (the board-on-the-card
+  case that took pcb-dslr-1 from 16 to 50 usable frames); a corner whose
+  refinement leaves the prediction by more than a fraction of the square
+  is dropped. Output per corner: id (row-major over the interior),
+  pixel, and the fit residual.
+- Pyramid: quads are found on a reduction to about 1600 px on the long
+  side (a 26 MP frame at 0.5–1 m holds cells the adaptive threshold's
+  windows cannot see at full size) and every sample and refinement runs
+  at full resolution. The swatch detector gets the same treatment.
+- `Observations { markers: [(id, corners, fit_px)], board: [(corner_id,
+  pixel, fit_px)], blur_px: Option<f64> }` stored per view, so the GUI
+  can draw detections over the photograph in look-through without
+  detecting again. `blur_px` is the error-function edge sigma over the
+  detected markers' edges (the shim's `edge_blur`), the frame-quality
+  number step D uses.
+- `view-detect -p project --views set [--card spec.json] [--annotate dir]
+  [--json]` and `view_detect_operator` (ViewSet + config → ViewSet) run
+  it for every view; the CLI prints per-view counts and residuals.
+- Oracle: `work/chairbase-dslr-0/detections.json` (79 frames) and
+  `work/pcb-dslr-1/detections.json` (one tag per corner). Targets: the
+  same corner ids found, card corners within 0.3 px median of the shim's,
+  swatch corners within 0.5 px (the shim measured 0.5–0.6 px scatter
+  frame to frame, so agreement beyond that is not measurable).
+
+### C3. Survey bundle
+
+- `cv_core::survey`. Unknowns: per camera key f, cx, cy, k1, k2; per view
+  a rotation vector and translation; per point (card corners, swatch
+  corners) a free 3D position. Residuals: reprojection of every
+  observation, and one scale residual, the mean of the solved column
+  spans of the card against the caliper pitch times the span, heavily
+  weighted. Gauge: one card frame held during the solve, then the world
+  re-based by a rigid fit of the nominal card onto the solved corners
+  (origin at the first interior corner, x along the columns, z from the
+  card towards the cameras), so no single corner defines the frame.
+- Initialisation as the shim does it: PnP on the nominal card for frames
+  with enough card corners (the planar solver on all points, then robust
+  refinement with the worst dropped; the mirrored planar solution is the
+  failure to guard against), swatch corners triangulated from posed
+  frames (linear multi-view, in front of every camera), remaining frames
+  posed on solved points, repeated until nothing grows. Points seen once
+  stay out of the bundle (known only along a ray).
+- Solver: Levenberg-Marquardt with an analytic Jacobian and dense normal
+  equations (about a thousand unknowns for eighty stills; the Schur
+  complement over points when phone video brings hundreds of frames),
+  soft-L1 at 1.5 px, rounds that drop frames over `reject_px` rms and
+  extend again. Uncertainty from (JᵀJ)⁺σ² with the gauge freed: per point
+  sigma, per camera the focal's standard error.
+- Output: the ViewSet posed, its cameras replaced by the solved model per
+  key, the swatches in `markers` with solved corners and sizes, and a
+  `board` entry (spec, solved corners with sigma, planarity) for the card;
+  plus an F64Map report: observations, rms, median, inlier rms, per-frame
+  rms, card planarity, span across against the caliper, swatch side
+  lengths, per-camera intrinsics with their standard errors, frames
+  rejected. Views posed get tags `solved:survey` and `rms:<px>`.
+- `view-survey -p project --views set [--card spec] [--f-scale 1.5]
+  [--reject-px 3] [--min-card 8] [--json]` and `survey_operator`
+  (ViewSet + config → ViewSet, F64Map). GUI: a catalog entry; the Views
+  section shows the rms tag; frustums, swatches and the card draw once
+  posed.
+- Oracle: `work/chairbase-dslr-0/survey.json` (73 posed, 0.72 px rms,
+  0.31 median, planarity 0.031 mm, along span 179.34 mm against 179.44
+  by caliper, swatches 59.66–59.99 mm, f 13 960 px at focus 170) and
+  `work/pcb-dslr-1/survey.json` (`--reject-px 5 --f-scale 2.5 --min-card
+  6`: 36 frames, 2.37 px). Targets: poses within 0.2 mm and 0.02°, map
+  corners within 0.1 mm, the same frames rejected.
+
+### C4. Trainer bridges
+
+- `splat-export -p project --views set -o dir [--scale 0.5] [--holdout
+  10] [--seed box|none] [--near-marker id]`, native: the trainer's
+  dataset. `cameras.json` schema 2 with one K (the first camera key's
+  model at `scale`, distortion removed), every view remapped through its
+  own model into that pinhole as `images/NNNNN_l.jpg`, `mask_l.png` the
+  valid area, `init.ply` a box seed (a 1 cm grid over the card and field
+  bounds to 0.25 m up), `markers.json` with the card's outer corners as
+  pseudo-marker 1000 so `--near-markers 1000` works, and a holdout split.
+  The agent runs the cluster script itself until a GPU-service step
+  exists (see "Later").
+- Import back: `splat.ply` (S1), `cloud.ply` (the PLY import), and
+  `tsdf.npz` through `volume-import --npz`: a reader for the zip-of-npy
+  container (`tsdf`, `weight`, `origin`, `voxel`, `trunc`) into the
+  volume value the NRRD import produces, with a crop to given bounds or a
+  stride at import, since the chairbase-dslr-0 grid is 2.7 GB at 1 mm.
+  The TSDF is the route to a mesh through volumetric's own mesher; the
+  trainer's surface cloud is the usual route to measurements.
+
+## Step S — splats
+
+### Why this shape
+
+The trained splat is the pipeline's product. Today nothing outside the
+trainer can show it; its held-out renders are the only audit, and the
+TSDF surface it fuses is a derivative with its own noise (0.5–0.8 mm and
+a bulge on grazing flanks, per the shim's measurements). Drawing the
+splat in the viewport over the photograph it was trained on, through the
+camera that took it, is the check that says where the geometry can be
+trusted. The same renderer, run through every view, is the photometric
+audit, and its depth output is how fusion can return here later.
+
+### S1. Value and import
+
+- `volumetric_abi::splat`, CBOR, `AssetTypeHint::Splat`,
+  `OperatorMetadataInput/Output::Splat`, schema 1: `world`,
+  `provenance` (plus the content hash of the view set it was trained
+  from and the trainer's arguments), `kind` (`Gaussian3d` or
+  `Surfel2d`), `sh_degree`, `count`, and packed f32 columns: `means`
+  (3N), `scales` (3N, logarithmic; surfels carry a third scale near
+  zero), `quats` (4N, w x y z), `opacities` (N, logit), `sh0` (3N),
+  `sh_rest` (3N·((d+1)²−1), channel-major as the 3DGS PLY stores it),
+  `normals` optional (3N). Six hundred thousand Gaussians at degree 2 are
+  about 90 MB, an ordinary asset since the blob format landed.
+- `splat_import_operator` (blob + config → Splat) reads the 3DGS PLY
+  layout through `ply_core` (`x y z`, `f_dc_*`, `f_rest_*`, `opacity`,
+  `scale_*`, `rot_*`, `nx ny nz` when present); `kind` from the config
+  with a default from the third scale. The GUI's Import menu and the
+  CLI's project add both take it.
+- `splat-list -i <splat | project> [--asset id] [--json]`: count, kind,
+  SH degree, bounds at the 1st and 99th percentile of the means, opacity
+  and scale quantiles, provenance.
+- `splat_points_operator` (Splat + config → TriMesh point cloud): centres
+  with normals (a surfel's third axis; a Gaussian's smallest-scale axis)
+  and the SH0 colour, filtered by opacity, scale and a bounds or
+  near-marker radius, so `cloud_fit`, `cloud_normals` and the section
+  tools apply to the splat directly.
+
+### S2. Rendering
+
+- `volumetric_renderer` gains a `splat` pipeline: per-Gaussian instance
+  data (mean, scale, rotation, opacity, SH coefficients), the 2D
+  covariance from the projected 3D covariance in the vertex shader (the
+  EWA splatting Jacobian), the SH colour evaluated there from the view
+  direction, a quad sized to three sigmas, a Gaussian falloff times the
+  opacity in the fragment, premultiplied alpha blended back to front,
+  depth tested against the scene's depth at the centre and never written,
+  drawn after the composite pass with the lines and points (the point
+  pipeline's overlay variant is the template). Sorting: view-space depth
+  keys radix-sorted on the CPU into the index buffer, redone when the
+  view direction turns by a few degrees or the eye moves, kept otherwise;
+  a GPU sort when a scene demands it. The same code runs on the web
+  target with the sort on the main thread under a budget.
+- `volumetric_preview`: `PreviewPlan::Splat` builds a retained GPU splat
+  with bounds from the means' percentiles and the count in the stats.
+- GUI and CLI: a splat draws wherever a cloud would, in the viewport and
+  in `render`. Look-through with the photograph at 50 % over the splat is
+  the visual audit; `render --through set:view --asset splat` produces
+  the trainer's evaluation render headlessly.
+- Surfels are drawn as thin ellipsoids first; the exact ray–surfel
+  intersection of 2DGS is a follow-up if the thin-ellipsoid result is
+  visibly wrong at grazing angles.
+
+### S3. Photometric audit
+
+`view-photometric -p project --views set --splat splat [--view id]...
+[--holdout] [--scale s] [--json] [-o dir]`: the splat rendered through
+each view at the training scale against its photograph, PSNR and mean
+absolute error inside the mask (or the whole frame), the affine-fitted
+PSNR the trainer reports, and a residual image per view. On
+chairbase-dslr-0 the trainer's `metrics.json` says 28.2 dB on the seven
+held-out views and 32.0 on the training views; the command reproduces
+those within the JPEG round trip. An operator variant emits the numbers
+as an F64Map for step D.
+
+## Step P — Python bindings
+
+`crates/volumetric_py`: a PyO3 module `volumetric` built with maturin
+(abi3), installed into the shim's venv (Python 3.14; confirm PyO3's
+support on landing). Surface, all on numpy types: `detect(gray,
+dictionary)`, `detect_board(gray, spec)`, `solve_pose(camera, markers,
+detections, options)`, `survey(viewset, options) -> (viewset, report)`,
+`ViewSet.load/save` with views, cameras, markers and poses as arrays and
+`view.image()` decoded, `Splat.load(path)` returning its columns,
+`Project.open/run/values`, and `render(...)` returning an image through
+the native offscreen path. The bindings wrap crate functions one to one;
+a feature that exists only in Python is a bug. The shim's tests against
+OpenCV become the bindings' tests.
 
 ## Step D — evidence audits
 
 | Check | Signal | Catches |
 |---|---|---|
-| Card drift | Per-marker world position as a time series, step detection against corner noise | A swatch kicked or a sheet curling |
-| Pose against markers | Lighthouse pose versus marker-solved pose per frame | Base station moved, universe change, occlusion |
-| Calibration | Reprojection residual trend with radius, stereo epipolar residual | Wrong or stale intrinsics and extrinsics |
-| Subject motion | Fuse first and second half separately, register, compare to surface noise | Subject nudged mid-capture |
-| Time offset | Residual correlated with camera velocity | Frame and pose clock skew |
-| Coverage | View count and angular spread per surface region of the subject bound | Unrepresentative capture, answered before fusion |
-| Frame quality | Blur sigma, exposure, near-duplicate poses | Frames that add noise, not information |
-| Physical sanity | Floor plane exists and is up, marker sizes match the sheet spec, plausible scale | Unit and convention errors |
+| Intake | Camera key per view, autofocus frames, stabilisation, ISO, orientation | Frames that cannot share a camera model |
+| Detection | Corners per frame, `blur_px` from marker edges, card corners seen once | Defocused frames (pcb-dslr-1 at f/4), motion blur |
+| Survey | Per-frame rms trend, per-point sigma, card planarity against 0.03 mm, span against the caliper, swatch sides against the sheet spec, focal standard error | A wrong pitch, a moved swatch, a mirrored pose, a mixed focus setting |
+| Setup | The still's cards against the set's map (step B's rms) | A map from another setup (the chairbase1/chairbase2 mix-up) |
+| Coverage | Per subject region: view count, elevation and azimuth spread, before training | A one-elevation capture (the chair-leg phantom ridge) |
+| Photometric | S3 per view: PSNR outliers against the set's median | Views the splat cannot explain: motion, exposure, a moved subject |
+| Physical | The card's normal is up, swatch sizes, plausible scale | Unit and convention errors |
 
 Audit operators emit an F64Map of named metrics plus warnings; the same
-checks run natively on a raw session directory for the capture-time loop.
+checks run natively on a directory of stills for the capture-time loop.
 
 ## Later, not scheduled
 
+- A GPU-service step: a project step whose execution is a remote job on
+  the daemon's progress and cancel channels, so training becomes a step
+  the agent runs from here. Until then the agent runs the shim's cluster
+  script on the exported dataset.
+- Fusion returns through the splat: expected depth rendered from the
+  splat through every view, integrated into a TSDF here, with the
+  cosine-of-incidence weighting the shim's results ask for.
+- SIFT seeding (COLMAP triangulation against fixed poses) stays outside;
+  the box seed is the default since seed density did not move the shim's
+  results.
+- Exact 2DGS ray–surfel rendering; compressed splat formats.
 - `frame_align` operator: pose a model from one rank-3 Subspace frame to
   another, so a scan can be brought into a datum frame built from fits.
 - `measure` command: volume, area, centroid, clearance and interference
   between two models.
 - Pick and project through a view; magnified crop with a pixel grid.
-- Stereo matching in Rust, native only.
 - Colour projection from views onto models; visual hull.
 
 ## References
 
-- Scanner session layout and formats: `index_scanner/README.md`,
-  `index_scanner/splat.py` (cameras.json schema 2), `index_scanner/phone.py`.
-- Real data: `/ceph/christian/index_scanner/{sessions,runs,datasets}/chairbase1`.
+- Shim (oracle) code: `index_scanner/survey.py` (bundle, gauge, report),
+  `board.py` (card spec, ChArUco detection), `sonyexif.py` (focus key),
+  `phone.py` (`edge_blur`, `export_dataset`), `splat.py`
+  (`write_splat_ply`, cameras.json schema 2), `splat_train.py` (what a
+  run writes: `splat.ply`, `cloud.ply`, `tsdf.npz`, `metrics.json`,
+  `renders/`), `calib/card.json` (the card with its caliper pitches).
+- Real data, all under `/ceph/christian/index_scanner`:
+  `sessions/chairbase-dslr-0` and `sessions/pcb-dslr-1` (stills),
+  `work/<name>/{detections,survey,markers}.json`, `runs/chairbase-dslr-0-2dgs`.
+  Earlier: `sessions/chairbase1` and `chairbase2`, `work/chair-phone`.
 - Previous arcs (PLY, NRRD, cloud fit): commits 2bfa345, 3f2ebf1, e226286.

@@ -311,6 +311,7 @@ fn read_scanner(json: &Value, base: &Path) -> Result<(ViewSet, Vec<Candidate>)> 
         .unwrap_or(1e-4);
 
     let mut set = ViewSet {
+        board: None,
         cameras: vec![camera],
         ..ViewSet::default()
     };

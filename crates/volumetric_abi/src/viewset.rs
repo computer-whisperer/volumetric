@@ -34,6 +34,9 @@ pub struct ViewSet {
     pub views: Vec<View>,
     /// The marker map: printed target cards at known world positions.
     pub markers: Vec<Marker>,
+    /// The survey card, when the set was detected or surveyed against one.
+    #[serde(default)]
+    pub board: Option<Board>,
 }
 
 /// The world the poses live in. Units are always metres.
@@ -122,6 +125,9 @@ pub struct View {
     pub mask: Option<Vec<u8>>,
     /// What the source knew about the view: eye, split, and so on.
     pub tags: Vec<String>,
+    /// What detection found in the photograph.
+    #[serde(default)]
+    pub observations: Option<Observations>,
 }
 
 /// A printed target card at a known place in the world.
@@ -133,6 +139,231 @@ pub struct Marker {
     pub corners: [[f64; 3]; 4],
 }
 
+/// A ChArUco board: a chessboard whose white squares carry a marker each.
+/// Board coordinates have the origin at the board's top-left outer corner,
+/// x along the columns and y down the rows, in metres, with the printed
+/// pitch measured separately along each axis.
+///
+/// Squares are black where row + column is even; the markers sit centred
+/// in the white squares in row-major order from `first_id`; the interior
+/// corners are numbered row-major, corner `row * (squares_x - 1) + col`
+/// at `((col + 1) * pitch_x, (row + 1) * pitch_y)`. This is OpenCV's
+/// `CharucoBoard` layout, which the printed cards follow.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BoardSpec {
+    pub squares_x: u32,
+    pub squares_y: u32,
+    /// Square pitch along x (the columns), metres.
+    pub pitch_x_m: f64,
+    /// Square pitch along y (the rows), metres.
+    pub pitch_y_m: f64,
+    /// Marker side, metres.
+    pub marker_m: f64,
+    /// The marker family: `36h11`, `5x5_100` or `4x4_50`.
+    pub family: String,
+    /// The first marker's id; ids run row-major over the white squares.
+    pub first_id: u32,
+}
+
+impl BoardSpec {
+    /// The survey card: 12 x 11 squares of 0.7 in with 12.7 mm AprilTag
+    /// 36h11 markers from id 100, at the pitches the calipers measured on
+    /// the glued print (along the feed 17.944 mm, across 17.745 mm).
+    pub fn survey_card() -> Self {
+        Self {
+            squares_x: 12,
+            squares_y: 11,
+            pitch_x_m: 0.0179443,
+            pitch_y_m: 0.0177451,
+            marker_m: 0.0127,
+            family: "36h11".to_string(),
+            first_id: 100,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.squares_x < 2 || self.squares_y < 2 {
+            return Err("a board needs at least two squares each way".to_string());
+        }
+        for (name, value) in [
+            ("pitch_x_m", self.pitch_x_m),
+            ("pitch_y_m", self.pitch_y_m),
+            ("marker_m", self.marker_m),
+        ] {
+            if !(value.is_finite() && value > 0.0) {
+                return Err(format!("board {name} must be finite and positive"));
+            }
+        }
+        if self.marker_m >= self.pitch_x_m.min(self.pitch_y_m) {
+            return Err("board markers must be smaller than the squares".to_string());
+        }
+        if self.family.is_empty() {
+            return Err("board family is empty".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn n_markers(&self) -> u32 {
+        self.squares_x * self.squares_y / 2
+    }
+
+    /// Interior corners: `(squares_x - 1) * (squares_y - 1)`.
+    pub fn n_corners(&self) -> u32 {
+        (self.squares_x - 1) * (self.squares_y - 1)
+    }
+
+    /// The board's outer size, metres.
+    pub fn size_m(&self) -> [f64; 2] {
+        [
+            f64::from(self.squares_x) * self.pitch_x_m,
+            f64::from(self.squares_y) * self.pitch_y_m,
+        ]
+    }
+
+    /// The (row, column) of the white square carrying the marker.
+    pub fn marker_square(&self, id: u32) -> Option<(u32, u32)> {
+        let k = id.checked_sub(self.first_id)?;
+        if k >= self.n_markers() {
+            return None;
+        }
+        // Each row holds squares_x / 2 white squares, alternating start.
+        let per_row = self.squares_x / 2;
+        let (row, col) = if self.squares_x % 2 == 0 {
+            let row = k / per_row;
+            (row, 2 * (k % per_row) + (row + 1) % 2)
+        } else {
+            // Odd widths alternate between (w - 1) / 2 and (w + 1) / 2
+            // white squares per row; walk the rows.
+            let mut remaining = k;
+            let mut row = 0;
+            loop {
+                let count = if row % 2 == 0 {
+                    self.squares_x / 2
+                } else {
+                    self.squares_x.div_ceil(2)
+                };
+                if remaining < count {
+                    break (row, 2 * remaining + (row + 1) % 2);
+                }
+                remaining -= count;
+                row += 1;
+            }
+        };
+        Some((row, col))
+    }
+
+    /// The marker's id in the white square at (row, column), if any.
+    pub fn marker_at(&self, row: u32, col: u32) -> Option<u32> {
+        if row >= self.squares_y || col >= self.squares_x || (row + col) % 2 == 0 {
+            return None;
+        }
+        let mut k = 0;
+        for r in 0..row {
+            k += if r % 2 == 0 {
+                self.squares_x / 2
+            } else {
+                self.squares_x.div_ceil(2)
+            };
+        }
+        k += col / 2;
+        Some(self.first_id + k)
+    }
+
+    /// A marker's corners in board coordinates, in the dictionary's order
+    /// (top-left, top-right, bottom-right, bottom-left as printed).
+    pub fn marker_corners(&self, id: u32) -> Option<[[f64; 2]; 4]> {
+        let (row, col) = self.marker_square(id)?;
+        let inset_x = (self.pitch_x_m - self.marker_m) * 0.5;
+        let inset_y = (self.pitch_y_m - self.marker_m) * 0.5;
+        let x0 = f64::from(col) * self.pitch_x_m + inset_x;
+        let y0 = f64::from(row) * self.pitch_y_m + inset_y;
+        let m = self.marker_m;
+        Some([[x0, y0], [x0 + m, y0], [x0 + m, y0 + m], [x0, y0 + m]])
+    }
+
+    /// An interior corner's board coordinates.
+    pub fn corner(&self, id: u32) -> Option<[f64; 2]> {
+        if id >= self.n_corners() {
+            return None;
+        }
+        let cols = self.squares_x - 1;
+        let (row, col) = (id / cols, id % cols);
+        Some([
+            f64::from(col + 1) * self.pitch_x_m,
+            f64::from(row + 1) * self.pitch_y_m,
+        ])
+    }
+
+    /// The interior corners at the four corners of a square, as
+    /// (corner id, board coordinates), clockwise from the square's
+    /// top-left; a square on the board's edge has fewer.
+    pub fn corners_of_square(&self, row: u32, col: u32) -> Vec<(u32, [f64; 2])> {
+        let cols = self.squares_x - 1;
+        let mut out = Vec::with_capacity(4);
+        for (dr, dc) in [(0, 0), (0, 1), (1, 1), (1, 0)] {
+            let (gy, gx) = (row + dr, col + dc);
+            if gy == 0 || gx == 0 || gy > self.squares_y - 1 || gx > self.squares_x - 1 {
+                continue;
+            }
+            let id = (gy - 1) * cols + (gx - 1);
+            out.push((id, self.corner(id).expect("interior corner")));
+        }
+        out
+    }
+}
+
+/// The survey card in a set: its spec, and its interior corners in the
+/// world once a survey has solved them (empty until then).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Board {
+    pub spec: BoardSpec,
+    pub corners: Vec<BoardCorner>,
+}
+
+/// A solved interior corner of the board.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BoardCorner {
+    pub id: u32,
+    pub position: [f64; 3],
+    /// Standard error of the position from the survey, metres.
+    pub sigma_m: f64,
+}
+
+/// What detection found in one photograph, in the set's pixel
+/// convention (pixel centres at +0.5).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Observations {
+    /// Markers of every family, swatches and the card's tags alike.
+    pub markers: Vec<MarkerObs>,
+    /// The board's interior corners.
+    pub board: Vec<CornerObs>,
+    /// Edge blur across the markers' edges, pixels (the worse of the two
+    /// picture axes), when there were edges to measure.
+    pub blur_px: Option<f64>,
+}
+
+/// A marker seen in a photograph.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MarkerObs {
+    pub id: u32,
+    /// `36h11`, `5x5_100` or `4x4_50`.
+    pub family: String,
+    /// In the dictionary's order (top-left first, clockwise as printed).
+    pub corners: [[f64; 2]; 4],
+    /// RMS distance of the fitted edge points to the fitted sides.
+    pub fit_px: f64,
+}
+
+/// A board corner seen in a photograph.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CornerObs {
+    pub id: u32,
+    pub pixel: [f64; 2],
+    /// How far the sub-pixel refinement moved the corner from where the
+    /// neighbouring markers predicted it.
+    pub fit_px: f64,
+}
+
 impl Default for ViewSet {
     fn default() -> Self {
         Self {
@@ -142,6 +373,7 @@ impl Default for ViewSet {
             cameras: Vec::new(),
             views: Vec::new(),
             markers: Vec::new(),
+            board: None,
         }
     }
 }
@@ -197,6 +429,55 @@ impl ViewSet {
             }
             if marker.corners.iter().flatten().any(|c| !c.is_finite()) {
                 return Err(format!("marker {} has a non-finite corner", marker.id));
+            }
+        }
+        if let Some(board) = &self.board {
+            board.spec.validate()?;
+            for corner in &board.corners {
+                if corner.id >= board.spec.n_corners() {
+                    return Err(format!(
+                        "board corner {} is beyond the board's {} corners",
+                        corner.id,
+                        board.spec.n_corners()
+                    ));
+                }
+                if corner.position.iter().any(|c| !c.is_finite()) || !corner.sigma_m.is_finite() {
+                    return Err(format!("board corner {} is not finite", corner.id));
+                }
+            }
+        }
+        for view in &self.views {
+            let Some(obs) = &view.observations else {
+                continue;
+            };
+            for m in &obs.markers {
+                if m.corners.iter().flatten().any(|c| !c.is_finite()) || !m.fit_px.is_finite() {
+                    return Err(format!(
+                        "view {:?}: marker {} observation is not finite",
+                        view.id, m.id
+                    ));
+                }
+            }
+            for c in &obs.board {
+                if c.pixel.iter().any(|v| !v.is_finite()) || !c.fit_px.is_finite() {
+                    return Err(format!(
+                        "view {:?}: board corner {} observation is not finite",
+                        view.id, c.id
+                    ));
+                }
+                if let Some(board) = &self.board
+                    && c.id >= board.spec.n_corners()
+                {
+                    return Err(format!(
+                        "view {:?}: board corner {} is beyond the board's {} corners",
+                        view.id,
+                        c.id,
+                        board.spec.n_corners()
+                    ));
+                }
+            }
+            if obs.blur_px.is_some_and(|b| !(b.is_finite() && b >= 0.0)) {
+                return Err(format!("view {:?}: blur is not finite", view.id));
             }
         }
         Ok(())
@@ -384,6 +665,7 @@ impl View {
             depth_unit_m: 0.0,
             mask: None,
             tags: Vec::new(),
+            observations: None,
         }
     }
 
@@ -534,6 +816,7 @@ mod tests {
     fn round_trips_with_embedded_bytes() {
         let image = vec![200u8; 10_000];
         let mut set = ViewSet {
+            board: None,
             cameras: cameras(),
             markers: vec![Marker {
                 id: 7,
@@ -614,8 +897,150 @@ mod tests {
     }
 
     #[test]
+    fn the_survey_card_lays_out_as_opencv_prints_it() {
+        // Values from OpenCV's CharucoBoard for the card (legacy pattern
+        // off): squares 17.78 mm nominal, markers 12.7 mm.
+        let mut card = BoardSpec::survey_card();
+        card.pitch_x_m = 0.01778;
+        card.pitch_y_m = 0.01778;
+        assert_eq!((card.n_markers(), card.n_corners()), (66, 110));
+        let close =
+            |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).abs() < 1e-9 && (a[1] - b[1]).abs() < 1e-9;
+        assert!(close(card.corner(0).unwrap(), [0.01778, 0.01778]));
+        assert!(close(card.corner(1).unwrap(), [0.03556, 0.01778]));
+        assert!(close(card.corner(11).unwrap(), [0.01778, 0.03556]));
+        assert!(close(card.corner(109).unwrap(), [0.19558, 0.1778]));
+        assert!(card.corner(110).is_none());
+        // Marker 100 sits in square (row 0, col 1); 106 starts row 1 at
+        // col 0; 112 starts row 2 at col 1; 165 is the last, (10, 11).
+        assert_eq!(card.marker_square(100), Some((0, 1)));
+        assert_eq!(card.marker_square(103), Some((0, 7)));
+        assert_eq!(card.marker_square(106), Some((1, 0)));
+        assert_eq!(card.marker_square(111), Some((1, 10)));
+        assert_eq!(card.marker_square(112), Some((2, 1)));
+        assert_eq!(card.marker_square(165), Some((10, 11)));
+        assert_eq!(card.marker_square(166), None);
+        assert_eq!(card.marker_square(99), None);
+        for id in 100..166 {
+            let (r, c) = card.marker_square(id).unwrap();
+            assert_eq!(card.marker_at(r, c), Some(id));
+        }
+        assert_eq!(card.marker_at(0, 0), None);
+        let m100 = card.marker_corners(100).unwrap();
+        assert!(close(m100[0], [0.02032, 0.00254]), "{m100:?}");
+        assert!(close(m100[2], [0.03302, 0.01524]), "{m100:?}");
+        let m106 = card.marker_corners(106).unwrap();
+        assert!(close(m106[0], [0.00254, 0.02032]), "{m106:?}");
+        // Square (0, 1) has interior corners at its bottom-right and
+        // bottom-left only: ids 1 and 0.
+        let around = card.corners_of_square(0, 1);
+        assert_eq!(
+            around.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![1, 0]
+        );
+        let around = card.corners_of_square(3, 4);
+        assert_eq!(
+            around.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![2 * 11 + 3, 2 * 11 + 4, 3 * 11 + 4, 3 * 11 + 3]
+        );
+        // An odd width alternates the white count per row.
+        let odd = BoardSpec {
+            squares_x: 7,
+            squares_y: 5,
+            first_id: 0,
+            ..BoardSpec::survey_card()
+        };
+        assert_eq!(odd.n_markers(), 17);
+        assert_eq!(odd.marker_square(0), Some((0, 1)));
+        assert_eq!(odd.marker_square(2), Some((0, 5)));
+        assert_eq!(odd.marker_square(3), Some((1, 0)));
+        assert_eq!(odd.marker_square(6), Some((1, 6)));
+        assert_eq!(odd.marker_square(7), Some((2, 1)));
+        for id in 0..17 {
+            let (r, c) = odd.marker_square(id).unwrap();
+            assert_eq!((r + c) % 2, 1);
+            assert_eq!(odd.marker_at(r, c), Some(id));
+        }
+        assert!(BoardSpec::survey_card().validate().is_ok());
+        assert!(
+            BoardSpec {
+                marker_m: 0.02,
+                ..BoardSpec::survey_card()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn observations_and_the_board_round_trip_and_default_absent() {
+        let mut set = ViewSet {
+            cameras: vec![CameraModel::pinhole(100, 80, 90.0, 90.0, 50.0, 40.0)],
+            views: vec![View::posed("a", 0, identity_pose())],
+            board: Some(Board {
+                spec: BoardSpec::survey_card(),
+                corners: vec![BoardCorner {
+                    id: 3,
+                    position: [0.1, 0.2, 0.0],
+                    sigma_m: 1e-4,
+                }],
+            }),
+            ..ViewSet::default()
+        };
+        set.views[0].observations = Some(Observations {
+            markers: vec![MarkerObs {
+                id: 100,
+                family: "36h11".to_string(),
+                corners: [[1.0, 2.0], [3.0, 2.0], [3.0, 4.0], [1.0, 4.0]],
+                fit_px: 0.1,
+            }],
+            board: vec![CornerObs {
+                id: 7,
+                pixel: [10.5, 20.5],
+                fit_px: 0.3,
+            }],
+            blur_px: Some(1.2),
+        });
+        let back = decode_viewset(&encode_viewset(&set)).unwrap();
+        assert_eq!(back, set);
+        // A corner beyond the board is caught, in the set and in a view.
+        let mut bad = set.clone();
+        bad.board.as_mut().unwrap().corners[0].id = 110;
+        assert!(bad.validate().is_err());
+        let mut bad = set.clone();
+        bad.views[0].observations.as_mut().unwrap().board[0].id = 110;
+        assert!(bad.validate().is_err());
+        // Without the fields (an older encoding) both come back absent.
+        let mut value: ciborium::Value =
+            ciborium::de::from_reader(std::io::Cursor::new(encode_viewset(&set))).unwrap();
+        let strip = |map: &mut Vec<(ciborium::Value, ciborium::Value)>, key: &str| {
+            map.retain(|(k, _)| k.as_text() != Some(key));
+        };
+        if let ciborium::Value::Map(map) = &mut value {
+            strip(map, "board");
+            for (k, v) in map.iter_mut() {
+                if k.as_text() == Some("views")
+                    && let ciborium::Value::Array(views) = v
+                {
+                    for view in views {
+                        if let ciborium::Value::Map(fields) = view {
+                            strip(fields, "observations");
+                        }
+                    }
+                }
+            }
+        }
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&value, &mut bytes).unwrap();
+        let old = decode_viewset(&bytes).unwrap();
+        assert!(old.board.is_none());
+        assert!(old.views[0].observations.is_none());
+    }
+
+    #[test]
     fn validation_catches_structural_faults() {
         let mut set = ViewSet {
+            board: None,
             cameras: cameras(),
             ..ViewSet::default()
         };

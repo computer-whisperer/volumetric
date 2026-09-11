@@ -17,6 +17,14 @@ pub const FRUSTUM_DEPTH_M: f64 = 0.1;
 const VIEW_COLOR: [f32; 4] = [0.35, 0.85, 0.95, 0.9];
 const VIEW_HIGHLIGHT_COLOR: [f32; 4] = [1.0, 0.72, 0.2, 1.0];
 const MARKER_COLOR: [f32; 4] = [1.0, 0.72, 0.2, 0.85];
+/// Observed swatches in look-through: amber like the map's markers.
+const SWATCH_OBS_COLOR: [f32; 4] = [1.0, 0.72, 0.2, 0.95];
+/// Observed card tags in look-through.
+const TAG_OBS_COLOR: [f32; 4] = [0.35, 0.85, 0.95, 0.95];
+/// Observed card corners in look-through.
+const CORNER_OBS_COLOR: [f32; 4] = [1.0, 0.3, 1.0, 0.95];
+/// Half-size of a corner's cross, pixels of the photograph.
+const CORNER_CROSS_PX: f64 = 6.0;
 
 fn v3(p: [f64; 3]) -> Vec3 {
     Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32)
@@ -71,6 +79,37 @@ pub fn highlight_lines(view: &View, camera: &CameraModel) -> renderer::LineData 
     renderer::LineData {
         segments: frustum_segments(view, camera, FRUSTUM_DEPTH_M, VIEW_HIGHLIGHT_COLOR),
     }
+}
+
+/// What detection found in the photograph, as lines on the view's
+/// picture plane at the frustum's depth: each marker's quad (swatches
+/// amber, the card's tags cyan) and a cross at each card corner. Looked
+/// through the view they land on the photograph's own cards, which is
+/// the visual check of the detection; from elsewhere they sit in the
+/// frustum's rectangle.
+pub fn observation_lines(view: &View, camera: &CameraModel) -> Vec<renderer::LineSegment> {
+    let Some(obs) = &view.observations else {
+        return Vec::new();
+    };
+    let at = |px: [f64; 2]| corner_at_depth(view, camera, px, FRUSTUM_DEPTH_M);
+    let mut out = Vec::with_capacity(4 * obs.markers.len() + 2 * obs.board.len());
+    for m in &obs.markers {
+        let color = if m.family == "36h11" {
+            TAG_OBS_COLOR
+        } else {
+            SWATCH_OBS_COLOR
+        };
+        for i in 0..4 {
+            out.push(segment(at(m.corners[i]), at(m.corners[(i + 1) % 4]), color));
+        }
+    }
+    for c in &obs.board {
+        let [x, y] = c.pixel;
+        let r = CORNER_CROSS_PX;
+        out.push(segment(at([x - r, y]), at([x + r, y]), CORNER_OBS_COLOR));
+        out.push(segment(at([x, y - r]), at([x, y + r]), CORNER_OBS_COLOR));
+    }
+    out
 }
 
 /// Draws a view's highlight over everything, per frame.
@@ -322,14 +361,18 @@ pub fn clip_planes_for(eye: Vec3, forward: Vec3, min: Vec3, max: Vec3) -> (f32, 
 #[derive(Clone)]
 pub struct LookThrough {
     pub frame: ViewFrame,
+    /// The highlighted frustum and the view's observations, drawn over
+    /// everything.
     pub frustum: renderer::LineData,
 }
 
 impl LookThrough {
     pub fn of(view: &View, camera: &CameraModel) -> Self {
+        let mut frustum = highlight_lines(view, camera);
+        frustum.segments.extend(observation_lines(view, camera));
         Self {
             frame: ViewFrame::of(view, camera),
-            frustum: highlight_lines(view, camera),
+            frustum,
         }
     }
 }
@@ -340,6 +383,66 @@ mod tests {
     use std::sync::Arc;
     use volumetric::AssetTypeHint;
     use volumetric::viewset::{Marker, Provenance, WorldFrame, encode_viewset};
+
+    #[test]
+    fn observations_draw_on_the_picture_plane() {
+        use volumetric::viewset::{CornerObs, MarkerObs, Observations};
+        let camera = CameraModel::pinhole(640, 480, 500.0, 500.0, 320.0, 240.0);
+        let mut view = looking_away();
+        assert!(observation_lines(&view, &camera).is_empty());
+        view.observations = Some(Observations {
+            markers: vec![
+                MarkerObs {
+                    id: 3,
+                    family: "5x5_100".to_string(),
+                    corners: [
+                        [100.0, 100.0],
+                        [200.0, 100.0],
+                        [200.0, 200.0],
+                        [100.0, 200.0],
+                    ],
+                    fit_px: 0.2,
+                },
+                MarkerObs {
+                    id: 100,
+                    family: "36h11".to_string(),
+                    corners: [
+                        [300.0, 300.0],
+                        [340.0, 300.0],
+                        [340.0, 340.0],
+                        [300.0, 340.0],
+                    ],
+                    fit_px: 0.2,
+                },
+            ],
+            board: vec![CornerObs {
+                id: 0,
+                pixel: [400.5, 120.5],
+                fit_px: 0.3,
+            }],
+            blur_px: None,
+        });
+        let lines = observation_lines(&view, &camera);
+        assert_eq!(lines.len(), 4 + 4 + 2);
+        // Every segment end projects back to the pixel it came from.
+        let world = |p: [f32; 3]| [f64::from(p[0]), f64::from(p[1]), f64::from(p[2])];
+        let back = view.project(&camera, world(lines[0].start)).unwrap();
+        assert!(
+            (back[0] - 100.0).abs() < 1e-3 && (back[1] - 100.0).abs() < 1e-3,
+            "{back:?}"
+        );
+        let back = view.project(&camera, world(lines[8].start)).unwrap();
+        assert!(
+            (back[0] - (400.5 - CORNER_CROSS_PX)).abs() < 1e-3,
+            "{back:?}"
+        );
+        assert_eq!(lines[0].color, SWATCH_OBS_COLOR);
+        assert_eq!(lines[4].color, TAG_OBS_COLOR);
+        assert_eq!(lines[8].color, CORNER_OBS_COLOR);
+        // Look-through carries them with the frustum.
+        let look = LookThrough::of(&view, &camera);
+        assert_eq!(look.frustum.segments.len(), 9 + 10);
+    }
 
     /// A camera at z = -2 looking along world -z, with the picture's up
     /// along world +y (OpenCV: camera y is down, so the pose flips y).
@@ -359,6 +462,7 @@ mod tests {
         let mut view = looking_away();
         view.image = Some(vec![1, 2, 3]);
         ViewSet {
+            board: None,
             schema: 1,
             world: WorldFrame::default(),
             provenance: Provenance {
