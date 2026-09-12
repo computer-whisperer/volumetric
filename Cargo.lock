@@ -597,6 +597,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cloud_distance_operator"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "cloud_core",
+ "serde",
+ "volumetric_abi",
+]
+
+[[package]]
 name = "cloud_fit_operator"
 version = "0.1.0"
 dependencies = [

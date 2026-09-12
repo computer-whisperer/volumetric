@@ -37,24 +37,28 @@ op --operator path_sketch_operator --input 'json:{"path":"M 0 0.133 H 0.054 V 0.
 op --operator revolve_operator --input asset:column_sketch --input none --output-id column --no-export
 
 # --- One arm along +x: plan outline (x, y) extruded up, intersected with
-# the elevation (x, z) extruded across, then rounded 6 mm.
-# Plan: half-width 25 at the hub, 34 at r 250, a 25 round at the tip r 335.
-op --operator path_sketch_operator --input 'json:{"path":"M 0.04 -0.025 L 0.25 -0.034 L 0.31 -0.025 A 0.025 0.025 0 0 1 0.31 0.025 L 0.25 0.034 L 0.04 0.025 Z"}' --output-id arm_plan_sketch --no-export
+# the elevation (x, z) extruded across, then rounded 5 mm. Both profiles
+# are the refuse2 cloud's (PLAN.md, measurements): the arm is 28 wide at
+# the hub, 50 at r 260, 30 at the socket, and its top falls from 166 at
+# the hub to 128 at r 300 and 90 at r 340, where the caster socket hangs.
+op --operator path_sketch_operator --input 'json:{"path":"M 0.04 -0.014 L 0.14 -0.015 L 0.20 -0.022 L 0.26 -0.025 L 0.30 -0.022 L 0.335 -0.015 A 0.015 0.015 0 0 1 0.335 0.015 L 0.30 0.022 L 0.26 0.025 L 0.20 0.022 L 0.14 0.015 L 0.04 0.014 Z"}' --output-id arm_plan_sketch --no-export
 op --operator extrude_operator --input asset:arm_plan_sketch --input 'json:{"height":0.2}' --input none --output-id arm_plan --no-export
-# Elevation: top 168 at the hub falling to 140 at r 270 and 100 at the
-# tip; 22 thick. Plane (x, z) at y = +50 with normal x cross z = -y, so the
-# 100 extrude spans y -50..50.
-op --operator path_sketch_operator --input 'json:{"path":"M 0.04 0.146 L 0.04 0.168 L 0.15 0.160 L 0.27 0.140 L 0.335 0.100 L 0.335 0.080 L 0.27 0.118 L 0.15 0.138 Z"}' --output-id arm_side_sketch --no-export
+# Elevation: the measured top, and an underside 18 thick at the hub, 26
+# at mid-arm, 22 at the tip (unseen by every camera; assumed). Plane
+# (x, z) at y = +50 with normal x cross z = -y, so the 100 extrude spans
+# y -50..50.
+op --operator path_sketch_operator --input 'json:{"path":"M 0.04 0.148 L 0.04 0.166 L 0.10 0.165 L 0.14 0.162 L 0.18 0.156 L 0.20 0.150 L 0.22 0.144 L 0.24 0.140 L 0.26 0.137 L 0.28 0.134 L 0.30 0.128 L 0.32 0.115 L 0.34 0.092 L 0.35 0.078 L 0.35 0.060 L 0.33 0.070 L 0.31 0.098 L 0.29 0.108 L 0.26 0.111 L 0.22 0.118 L 0.18 0.130 L 0.14 0.140 L 0.10 0.147 Z"}' --output-id arm_side_sketch --no-export
 op --operator subspace_operator --input "$PLANE" --input 'json:[0.0,0.05,0.0]' --input 'json:[1.0,0.0,0.0]' --input 'json:[0.0,0.0,1.0]' --output-id arm_side_plane --no-export
 op --operator extrude_operator --input asset:arm_side_sketch --input 'json:{"height":0.1}' --input asset:arm_side_plane --output-id arm_side --no-export
 op --operator boolean_operator --input asset:arm_plan --input asset:arm_side --input "$ISECT" --output-id arm_sharp --no-export
-op --operator offset_operator --input asset:arm_sharp --input 'json:{"distance":-0.006,"resolution":256}' --output-id arm_eroded --no-export
-op --operator offset_operator --input asset:arm_eroded --input 'json:{"distance":0.006,"resolution":256}' --output-id arm_round --no-export
+op --operator offset_operator --input asset:arm_sharp --input 'json:{"distance":-0.005,"resolution":256}' --output-id arm_eroded --no-export
+op --operator offset_operator --input asset:arm_eroded --input 'json:{"distance":0.005,"resolution":256}' --output-id arm_round --no-export
 
-# --- Caster at the tip: a stem into the arm and a 65 wheel, 24 wide,
-# trailing 15 outward (the swivel state in the scan is arbitrary).
-op --operator cylinder_operator --input 'json:{"radius":0.011}' --input 'json:[0.315,0.0,0.045]' --input 'json:[0.315,0.0,0.11]' --output-id stem --no-export
-op --operator cylinder_operator --input 'json:{"radius":0.0325}' --input 'json:[0.33,-0.012,0.033]' --input 'json:[0.33,0.012,0.033]' --output-id wheel --no-export
+# --- Caster at the socket (r 340): a stem down from the arm tip and a 65
+# wheel, 24 wide, trailing 20 outward (the swivel state in the scan is
+# arbitrary; the cloud's wheels sit at r 360).
+op --operator cylinder_operator --input 'json:{"radius":0.011}' --input 'json:[0.34,0.0,0.03]' --input 'json:[0.34,0.0,0.085]' --output-id stem --no-export
+op --operator cylinder_operator --input 'json:{"radius":0.0325}' --input 'json:[0.36,-0.012,0.0325]' --input 'json:[0.36,0.012,0.0325]' --output-id wheel --no-export
 op --operator boolean_operator --input asset:arm_round --input asset:stem --input asset:wheel --input "$UNION" --output-id arm --no-export
 op --operator pattern_operator --input asset:arm --input 'json:{"circular":{"count":5,"axis":"z"}}' --output-id arms --no-export
 

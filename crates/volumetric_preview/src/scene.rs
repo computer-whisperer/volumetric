@@ -798,18 +798,20 @@ fn build_fea_mesh_preview(
     let mut mesh = volumetric::fea::decode_fea_mesh(request.data.as_slice())?;
     let faces = mesh.boundary_faces();
 
-    let (want_deformed, exaggeration, color_field) = match &request.plan {
+    let (want_deformed, exaggeration, color_field, fixed_range) = match &request.plan {
         PreviewPlan::FeaMesh {
             deformed,
             exaggeration_tenths,
             color_field,
+            color_range,
         } => (
             *deformed,
             f64::from(*exaggeration_tenths) / 10.0,
             color_field.clone(),
+            *color_range,
         ),
         // Plan/kind mismatch (shouldn't happen): the default view.
-        _ => (true, 1.0, None),
+        _ => (true, 1.0, None, None),
     };
 
     // Every colormappable field, mirrored to the settings popover's picker
@@ -885,15 +887,26 @@ fn build_fea_mesh_preview(
                 hi = hi.max(v);
             }
         }
-        if lo > hi { (0.0, 0.0) } else { (lo, hi) }
+        match fixed_range {
+            Some(range) => (range.lo(), range.hi()),
+            None if lo > hi => (0.0, 0.0),
+            None => (lo, hi),
+        }
     });
     if let (Some(field), Some((lo, hi))) = (&color_field, color_range) {
-        extra_detail.push(format!("colormap {field} {lo:.4} .. {hi:.4} (viridis)"));
+        extra_detail.push(format!(
+            "colormap {field} {lo:.4} .. {hi:.4} (viridis{})",
+            if fixed_range.is_some() {
+                ", clamped"
+            } else {
+                ""
+            }
+        ));
     }
     let color_for = |value: f64| -> [f32; 4] {
         let (lo, hi) = color_range.unwrap_or((0.0, 0.0));
         let t = if hi > lo {
-            ((value - lo) / (hi - lo)) as f32
+            (((value - lo) / (hi - lo)) as f32).clamp(0.0, 1.0)
         } else {
             0.5
         };

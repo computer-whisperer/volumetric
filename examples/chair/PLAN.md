@@ -90,6 +90,8 @@ undersides are missing and every "bottom" below is a silhouette.
 | 5 | B | `pattern` (and every wrapper reading dimensionality statically) refused a boolean's output: the glue passed `get_dimensions` through by a call | boolean emits the first model's constant (model_merge_core `const_i32_export`) |
 | 6 | V | No way to take some views of a surveyed set into a project: `view-import`'s filters apply to manifests only, and a `.vviews` could not be subset or have its pictures re-embedded | `view-select` (ids in order, posed, tags, nearness, stride, cap; `--embed keep/full/preview/none` through each view's source) |
 | 7 | V | `render --through` ignores the surveyed lens distortion (k1 −0.147, k2 0.255 on the a6700 at 50 mm), so an overlay is a few pixels off away from the centre at 1548 px wide | open: warp the render through the camera's distortion, or undistort the photograph once at import |
+| 8 | V | No numeric cloud-to-model residual: an operator can sample only occupancy, not a model's channels, so the SDF operator's distance could not be read at the cloud's points | `cloud_distance` operator: bakes a signed distance lattice from occupancy (exact EDT in cloud_core), reads it at every node as the `distance` field, F64Map summary with band fractions; `audit.sh` |
+| 9 | V | The field colormap spans the data's range, so one unmodelled part (a lever 180 mm out) hides every other residual | `render --color-range lo,hi`, a clamped span carried in the preview plan (the GUI's control is still to come) |
 | 3 | B | Operators without READMEs: cylinder, revolve, extrude, subspace, sweep, slice, model_bound, mesh_to_model | write as each is used |
 | 4 | B | No path sweep (a tube along a curve): the arms need one | two-view intersection (toy car) or an SDF script; decide in B |
 
@@ -120,3 +122,46 @@ undersides are missing and every "bottom" below is a silhouette.
   photographs; the near arm in DSC00754 shows the arm's underside curving
   up towards the caster where the model's is a straight offset, and the
   arm is wider than modelled near the tip.
+- 2026-09-12: the residual audit against the unmasked full-run cloud
+  `runs/chairbase-dslr-1-refuse2/cloud.ply` (481 113 points; clipped to
+  the base's box above the carpet, 238 934) at 3.5 mm cells. What it
+  showed of the first base: the arms were too wide at the hub (the cloud's
+  edges 5–10 mm inside the model), too high mid-arm, and ended 20–30 mm
+  short of the caster sockets (the socket band and casters 15 mm and more
+  outside); the hub, lift and rail within a cell; the bracket's ends and
+  the levers, knob and caster bodies unmodelled (yellow beyond 15 mm).
+  The arm rebuilt to the cloud's own profile, measured per arm in a 20 mm
+  strip along its centreline (r 0.06 → 0.34: top 166, 165, 162, 156, 150,
+  144, 140, 137, 134, 128, 115, 90 mm; width 28, 30, 44, 50, 44, 30; the
+  socket at r 0.34, top 70–90 mm; wheels at r 0.36 below 50 mm): the arms
+  now read within 5 mm along their length; the sockets 5–10 mm. Arm
+  azimuths from this cloud: −153.7°, −82.8°, −11.0°, 61.8°, 135.7°
+  (spacing 70.9–73.9°); the spread is the one-sided surface coverage
+  biasing each centreline by a few millimetres, not the casting, and 72°
+  stays the model's spacing. Star centre from the hub rim's circle (0.260,
+  0.152) against the lift tube's (0.256, 0.149): 4 mm apart, the same
+  bias; the lift axis stays the datum.
+- 2026-09-12: `audit.sh` measures per zone (an annulus for the arms, a
+  cylinder for the column, a box above z 0.40 for the mechanism; each
+  zone's cloud clipped and measured on its own). First base against the
+  corrected one, fraction of the zone's points within 5 / 10 / 20 mm of
+  the model, median absolute distance, fraction inside the model:
+
+  | zone | points | first: 5 / 10 / 20 mm | p50 | inside | corrected: 5 / 10 / 20 mm | p50 | inside |
+  |---|---|---|---|---|---|---|---|
+  | arms | 110 834 | 0.70 / 0.87 / 0.95 | 3.0 | 0.35 | 0.69 / 0.91 / 0.95 | 3.1 | 0.22 |
+  | column | 33 911 | 0.81 / 0.91 / 0.94 | 1.9 | 0.48 | 0.80 / 0.91 / 0.94 | 1.9 | 0.43 |
+  | mechanism | 76 147 | 0.35 / 0.49 / 0.67 | 10.7 | 0.24 | 0.35 / 0.49 / 0.67 | 10.7 | 0.29 |
+  | all | 238 934 | 0.55 / 0.68 / 0.77 | 4.2 | 0.30 | 0.54 / 0.70 / 0.78 | 4.3 | 0.25 |
+
+  Reading: the arm rewrite moved the arms' 10 mm band from 0.87 to 0.91
+  and their inside fraction from 0.35 to 0.22 (the first arms were fat;
+  a surface cloud on a right model reads about half inside), but the
+  5 mm band did not move: the corrected arms now sit a few millimetres
+  small, most likely the 5 mm opening at 1.4 mm cells and the cloud's
+  own outward bias, to be checked with the arm slab section before
+  touching the numbers again. The column is right to a cell. The
+  mechanism is the worst zone by far (median 10.7 mm, a third within
+  5 mm): the boxes are crude, the levers, knob and bracket ends are
+  absent; it is the next target, then the casters (bodies and hoods,
+  wheels at r 0.36).

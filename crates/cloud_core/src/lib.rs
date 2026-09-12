@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 
+pub mod distance;
 pub mod normals;
 
 pub type Vec3 = [f64; 3];

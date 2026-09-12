@@ -2782,6 +2782,7 @@ mod tests {
                 deformed: false,
                 exaggeration_tenths: 10,
                 color_field: color_field.map(str::to_string),
+                color_range: None,
             },
             wireframe: false,
             show_bounds: false,
@@ -2892,6 +2893,7 @@ mod tests {
             deformed: false,
             exaggeration_tenths: 10,
             color_field: Some("node:temp".to_string()),
+            color_range: None,
         });
         let entity = build_preview_scene(&request).expect("fea preview builds");
 
@@ -2931,6 +2933,7 @@ mod tests {
             deformed: true,
             exaggeration_tenths: 20,
             color_field: Some("element:stiffness_scale".to_string()),
+            color_range: None,
         });
         let entity = build_preview_scene(&request).expect("fea preview builds");
 
@@ -2972,6 +2975,7 @@ mod tests {
             deformed: false,
             exaggeration_tenths: 10,
             color_field: Some("element:radius".to_string()),
+            color_range: None,
         });
         request.data = Arc::new(encode_fea_mesh(&mesh));
         let entity = build_preview_scene(&request).expect("bar2 preview builds");
@@ -3033,6 +3037,7 @@ mod tests {
             deformed: false,
             exaggeration_tenths: 10,
             color_field: Some("node:not_a_field".to_string()),
+            color_range: None,
         });
         let entity = build_preview_scene(&request).expect("fea preview builds");
         let mesh = &entity.scene.meshes[0].0;

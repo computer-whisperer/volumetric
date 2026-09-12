@@ -318,6 +318,9 @@ pub enum PreviewPlan {
         deformed: bool,
         exaggeration_tenths: u16,
         color_field: Option<String>,
+        /// The values the colormap spans; `None` spans the field's own
+        /// range. Values beyond it take the end colours.
+        color_range: Option<ColorRange>,
     },
     TriMesh,
     Subspace,
@@ -325,6 +328,33 @@ pub enum PreviewPlan {
     ViewSet,
     /// The Gaussians themselves, blended back to front.
     Splat,
+}
+
+/// A fixed colormap span in millionths of the field's unit (micrometres
+/// for a distance in metres), integers so a plan stays `Eq` for the
+/// preview cache key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ColorRange {
+    pub lo_micro: i64,
+    pub hi_micro: i64,
+}
+
+impl ColorRange {
+    /// From the field's units; `lo` must be below `hi`.
+    pub fn new(lo: f64, hi: f64) -> Option<Self> {
+        (lo.is_finite() && hi.is_finite() && lo < hi).then(|| Self {
+            lo_micro: (lo * 1e6).round() as i64,
+            hi_micro: (hi * 1e6).round() as i64,
+        })
+    }
+
+    pub fn lo(self) -> f64 {
+        self.lo_micro as f64 * 1e-6
+    }
+
+    pub fn hi(self) -> f64 {
+        self.hi_micro as f64 * 1e-6
+    }
 }
 
 impl PreviewPlan {

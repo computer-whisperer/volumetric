@@ -78,6 +78,7 @@ Generator operators create new models from configuration or external data:
 | `volume_import` | Reads a sampled volume (NRRD: a TSDF, a CT threshold, any regular grid) as a solid with the `signed_distance` channel Generate SDF bakes; NaN samples are unobserved and fill in where the scan encloses them | NRRD blob + CBOR config: `{scale, center, threshold, inside, band, unobserved, crop, stride}` |
 | `cloud_fit` | Fits a plane, line, point, sphere or cylinder to a point cloud (RANSAC + least squares) as a Subspace for Slice/Extrude/Revolve/Span/Intersect, plus an F64Map of radius, extents, inliers and rms; an optional seed Subspace narrows the search or is refined | FeaMesh + optional Subspace + CBOR config: `{kind, normal, tolerance, search_radius, trials}` |
 | `cloud_normals` | Estimates a unit normal per node from its nearest neighbours and stores it as the `normal` field (what a cylinder fit needs) | FeaMesh + CBOR config: `{neighbours, orient}` |
+| `cloud_distance` | Measures a cloud against a model: the signed distance of every node to the surface as the `distance` field (negative inside), plus an F64Map summary (count, inside fraction, abs p50/p90/p99, extremes); the audit of a model built from a scan | FeaMesh + Model + CBOR config: `{resolution, field}` |
 | `heightmap_extrude` | Extrudes a heightmap image to 3D | Image blob + CBOR config: `{width, depth, height, clip}` |
 | `lua_script` | Custom occupancy model via restricted Lua | Lua source + optional routed `F64Map` parameters |
 | `path_sketch` | Fills SVG path data (lines, curves, arcs, holes) as a 2D sketch for extrude/revolve | CBOR config: `{path, flip_y, round, chord_tolerance}` |
@@ -219,6 +220,7 @@ volumetric_cli render -i <model.wasm | project.vproj> -o <output.png>
 - `--no-sharp`, `--no-simplify` - Mesh without sharp-feature reconstruction or decimation
 - `--color-channel <name>` - Colormap models by a declared sample channel
 - `--color-field node:<name>` - Colormap FEA meshes and point clouds by a field
+- `--color-range lo,hi` - With `--color-field`: the values the colormap spans, in the field's units; values beyond take the end colours (default: the field's own range). `--color-field node:distance --color-range -0.01,0.01` reads a cloud-to-model audit at ±10 mm
 - `--wireframe` - Overlay mesh edges
 - `--grid <m>` - Ground grid spacing in metres (default: 1.0; 0 disables)
 - `--no-ssao` - Disable ambient occlusion

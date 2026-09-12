@@ -44,6 +44,7 @@ const OPERATORS: &[&str] = &[
     "splat_import_operator",
     "splat_points_operator",
     "cloud_normals_operator",
+    "cloud_distance_operator",
     "step_import_operator",
     "rectangular_prism_operator",
     "heightmap_extrude_operator",

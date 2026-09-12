@@ -21,9 +21,9 @@ use view_core::overlay::{Overlay, compose};
 use volumetric::{AssetTypeHint, LoadedAsset, Project};
 use volumetric_abi::viewset::Distortion;
 use volumetric_preview::{
-    Asn2Settings, PreviewBounds, PreviewEntity, PreviewMeshPlan, PreviewPlan, PreviewRenderMode,
-    PreviewRequest, build_preview_scene, clip_planes_for, pose_matrix, srgb_to_linear,
-    submit_subspace_gizmo, wireframe_style,
+    Asn2Settings, ColorRange, PreviewBounds, PreviewEntity, PreviewMeshPlan, PreviewPlan,
+    PreviewRenderMode, PreviewRequest, build_preview_scene, clip_planes_for, pose_matrix,
+    srgb_to_linear, submit_subspace_gizmo, wireframe_style,
 };
 use volumetric_renderer::{
     Camera, CameraView, GridPlanes, Pinhole, RenderSettings, ViewDirection, offscreen::Offscreen,
@@ -146,6 +146,12 @@ pub struct RenderArgs {
     #[arg(long)]
     pub color_field: Option<String>,
 
+    /// With --color-field: the values the colormap spans, lo,hi in the
+    /// field's units; values beyond take the end colours (default: the
+    /// field's own range)
+    #[arg(long, allow_hyphen_values = true)]
+    pub color_range: Option<String>,
+
     /// Overlay mesh edges
     #[arg(long)]
     pub wireframe: bool,
@@ -176,6 +182,7 @@ struct PlanOptions {
     simplify: bool,
     color_channel: Option<String>,
     color_field: Option<String>,
+    color_range: Option<ColorRange>,
     wireframe: bool,
 }
 
@@ -639,6 +646,7 @@ fn preview_request(asset: &LoadedAsset, options: &PlanOptions) -> PreviewRequest
             deformed: true,
             exaggeration_tenths: 10,
             color_field: options.color_field.clone(),
+            color_range: options.color_range,
         },
         Some(AssetTypeHint::TriMesh) => PreviewPlan::TriMesh,
         Some(AssetTypeHint::Subspace) => PreviewPlan::Subspace,
@@ -831,12 +839,23 @@ pub fn run_render(args: RenderArgs) -> Result<()> {
         anyhow::bail!("--width and --height must be positive");
     }
 
+    let color_range = match &args.color_range {
+        Some(text) => {
+            let v = parse_floats(text, 2).context("Invalid --color-range")?;
+            Some(
+                ColorRange::new(f64::from(v[0]), f64::from(v[1]))
+                    .context("--color-range needs lo below hi")?,
+            )
+        }
+        None => None,
+    };
     let options = PlanOptions {
         resolution: args.resolution,
         sharp: !args.no_sharp,
         simplify: !args.no_simplify,
         color_channel: args.color_channel.clone(),
         color_field: args.color_field.clone(),
+        color_range,
         wireframe: args.wireframe,
     };
 
@@ -1121,6 +1140,7 @@ mod tests {
             simplify: true,
             color_channel: None,
             color_field: Some("node:confidence".to_string()),
+            color_range: None,
             wireframe: true,
         };
         let sphere = volumetric_assets::get_model("simple_sphere_model").expect("bundled sphere");

@@ -2020,6 +2020,7 @@ impl VolumetricUiV2 {
                 deformed: fea.deformed,
                 exaggeration_tenths: fea.exaggeration_tenths,
                 color_field: fea.color_field.clone(),
+                color_range: None,
             },
             OutputRender::TriMesh { .. } => PreviewPlan::TriMesh,
             OutputRender::Subspace => PreviewPlan::Subspace,
