@@ -561,6 +561,15 @@ impl Renderer {
         self.frame_retained_splats.push(splat.clone());
     }
 
+    /// Waits for every submitted splat's order to be current for `view`:
+    /// what a frame that is read back needs, where a shown frame would
+    /// take the previous order and catch up.
+    pub fn settle_splats(&self, queue: &wgpu::Queue, view: &CameraView) {
+        for splat in &self.frame_retained_splats {
+            splat.settle_for(queue, view);
+        }
+    }
+
     /// Execute all rendering for the frame.
     ///
     /// This performs all render passes in order:

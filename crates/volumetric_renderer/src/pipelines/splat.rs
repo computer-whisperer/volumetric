@@ -7,8 +7,11 @@
 //! for the view, whenever the camera has turned or moved enough for the
 //! order to change; between sorts only the camera uniforms are refreshed.
 //! Sorting on the CPU keeps the pipeline within WebGL2's limits (no
-//! storage buffers, no compute); a scene of six hundred thousand
-//! Gaussians re-sorts in a few tens of milliseconds.
+//! storage buffers, no compute). Natively the first sort is done in
+//! place (in parallel over the primitives) so the splat appears at once,
+//! and later sorts run on a background thread while frames keep drawing
+//! the previous order, landing when they finish; on the web every sort
+//! is in place on the one thread.
 
 use std::sync::{Arc, Mutex};
 
@@ -173,15 +176,134 @@ fn project_pixel(view: Mat4, proj: Mat4, screen: [f32; 2], p: Vec3) -> Vec2 {
     )
 }
 
-/// The per-view sort state of a retained splat.
-struct SortState {
-    /// The view's depth axis and eye at the last sort, `None` before the
-    /// first.
-    last: Option<(Vec3, Vec3)>,
+/// The scratch a sort works in, moved to the sorting thread and back so
+/// the hundreds of megabytes are allocated once.
+#[derive(Default)]
+struct SortScratch {
     keys: Vec<u32>,
     order: Vec<u32>,
     scratch: Vec<u32>,
     staging: Vec<GpuSplatInstance>,
+}
+
+/// A sort in flight on a background thread, for the view it was started
+/// for.
+#[cfg(not(target_arch = "wasm32"))]
+struct PendingSort {
+    target: (Vec3, Vec3),
+    handle: std::thread::JoinHandle<SortScratch>,
+}
+
+/// The per-view sort state of a retained splat.
+struct SortState {
+    /// The view's depth axis and eye at the last sort that reached the
+    /// GPU, `None` before the first.
+    last: Option<(Vec3, Vec3)>,
+    /// The scratch, when no sort is using it.
+    scratch: Option<SortScratch>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pending: Option<PendingSort>,
+}
+
+/// What a sort needs of the view: the matrices, the eye, and whether the
+/// projection is orthographic.
+#[derive(Clone, Copy)]
+struct SortView {
+    view: Mat4,
+    row_w: Vec4,
+    orthographic: bool,
+    eye: Vec3,
+}
+
+impl SortView {
+    fn of(view: &CameraView) -> Self {
+        let inverse = view.view.inverse();
+        Self {
+            view: view.view,
+            row_w: Vec4::new(
+                view.projection.x_axis.w,
+                view.projection.y_axis.w,
+                view.projection.z_axis.w,
+                view.projection.w_axis.w,
+            ),
+            orthographic: view.projection.w_axis.w == 1.0 && view.projection.z_axis.w == 0.0,
+            eye: inverse.w_axis.truncate(),
+        }
+    }
+}
+
+/// Runs `f(start, slice)` over `items` in parallel chunks natively, in
+/// one call on the web.
+fn for_each_chunk<T: Send>(items: &mut [T], f: impl Fn(usize, &mut [T]) + Sync) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let threads = std::thread::available_parallelism()
+            .map_or(4, |n| n.get())
+            .clamp(1, 16);
+        let chunk = items.len().div_ceil(threads).max(1);
+        std::thread::scope(|scope| {
+            for (k, part) in items.chunks_mut(chunk).enumerate() {
+                let f = &f;
+                scope.spawn(move || f(k * chunk, part));
+            }
+        });
+    }
+    #[cfg(target_arch = "wasm32")]
+    f(0, items);
+}
+
+/// Sorts `n` primitives of `data` back to front for `view` and evaluates
+/// their colours into `scratch.staging`.
+fn sort_into(data: &SplatData, n: usize, view: &SortView, mut scratch: SortScratch) -> SortScratch {
+    let SortScratch {
+        keys,
+        order,
+        scratch: ping,
+        staging,
+    } = &mut scratch;
+    keys.resize(n, 0);
+    for_each_chunk(keys, |start, part| {
+        for (k, key) in part.iter_mut().enumerate() {
+            let p = data.positions[start + k];
+            let t = view.view * Vec3::from(p).extend(1.0);
+            let depth = if view.orthographic {
+                -t.z
+            } else {
+                view.row_w.dot(t)
+            };
+            // Descending depth: far primitives first. Flip the sortable
+            // bits so an ascending radix sort yields that.
+            *key = !sortable_bits(depth);
+        }
+    });
+    radix_sort_indices(keys, order, ping);
+    let per_point = data.sh_per_point();
+    staging.resize(n, GpuSplatInstance::zeroed());
+    let order: &[u32] = order;
+    for_each_chunk(staging, |start, part| {
+        for (k, instance) in part.iter_mut().enumerate() {
+            let i = order[start + k] as usize;
+            let p = data.positions[i];
+            let dir = (Vec3::from(p) - view.eye).normalize_or_zero();
+            // Trainers fit the SH colour to the photographs' sRGB values and
+            // blend those as plain numbers; so does the splat layer, which
+            // the composite linearises afterwards.
+            let color = evaluate_sh(
+                data.sh_degree,
+                &data.sh[i * per_point..(i + 1) * per_point],
+                dir.to_array(),
+            );
+            let a = data.axes[i];
+            *instance = GpuSplatInstance {
+                position: [p[0], p[1], p[2], data.opacities[i]],
+                axis_u: [a[0], a[1], a[2], 0.0],
+                axis_v: [a[3], a[4], a[5], 0.0],
+                axis_w: [a[6], a[7], a[8], 0.0],
+                color: [color[0], color[1], color[2], 1.0],
+            };
+        }
+    });
+    scratch
 }
 
 /// A splat resident on the GPU, drawn by reference each frame. Created by
@@ -208,80 +330,137 @@ impl GpuSplat {
         self.count == 0
     }
 
-    /// Sorts the primitives back to front for `view` and evaluates their
-    /// colours, uploading the result, when the view has turned or moved
-    /// enough since the last sort. Returns whether it sorted.
+    /// Whether `view` has turned or moved enough from `since` to change
+    /// the order.
+    fn needs_resort(&self, since: (Vec3, Vec3), axis: Vec3, eye: Vec3) -> bool {
+        let (last_axis, last_eye) = since;
+        let turned = last_axis.dot(axis).abs() < RESORT_ANGLE_COS;
+        let moved = (eye - last_eye).length() > RESORT_MOVE_FRACTION * self.extent.max(1e-3);
+        turned || moved
+    }
+
+    /// Keeps the primitives sorted back to front for `view`, with their
+    /// colours evaluated for it: lands a finished background sort, and
+    /// starts one when the view has turned or moved enough since the order
+    /// on the GPU was made (the first sort, before anything is on the
+    /// GPU, runs in place). Returns whether an order reached the GPU.
     pub fn sort_for(&self, queue: &wgpu::Queue, view: &CameraView) -> bool {
         if self.count == 0 {
             return false;
         }
-        let inverse = view.view.inverse();
-        let eye = inverse.w_axis.truncate();
+        let sort_view = SortView::of(view);
         let axis = Vec3::new(view.view.x_axis.z, view.view.y_axis.z, view.view.z_axis.z)
             .normalize_or_zero();
+        let target = (axis, sort_view.eye);
+        let n = self.count as usize;
         let mut sort = self.sort.lock().expect("splat sort state");
-        if let Some((last_axis, last_eye)) = sort.last {
-            let turned = last_axis.dot(axis).abs() < RESORT_ANGLE_COS;
-            let moved = (eye - last_eye).length() > RESORT_MOVE_FRACTION * self.extent.max(1e-3);
-            if !turned && !moved {
-                return false;
+        let mut landed = false;
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if sort
+                .pending
+                .as_ref()
+                .is_some_and(|p| p.handle.is_finished())
+            {
+                let pending = sort.pending.take().expect("checked");
+                let scratch = pending.handle.join().expect("splat sort thread");
+                queue.write_buffer(
+                    &self.instance_buffer,
+                    0,
+                    bytemuck::cast_slice(&scratch.staging[..n]),
+                );
+                sort.last = Some(pending.target);
+                sort.scratch = Some(scratch);
+                landed = true;
+            }
+            if sort.pending.is_some() {
+                return landed;
             }
         }
-        sort.last = Some((axis, eye));
 
-        let n = self.count as usize;
-        let data = &self.data;
-        let orthographic = view.projection.w_axis.w == 1.0 && view.projection.z_axis.w == 0.0;
-        let row_w = Vec4::new(
-            view.projection.x_axis.w,
-            view.projection.y_axis.w,
-            view.projection.z_axis.w,
-            view.projection.w_axis.w,
-        );
-        let SortState {
-            keys,
-            order,
-            scratch,
-            staging,
-            ..
-        } = &mut *sort;
-        keys.clear();
-        keys.reserve(n);
-        for p in &data.positions[..n] {
-            let t = view.view * Vec3::from(*p).extend(1.0);
-            let depth = if orthographic { -t.z } else { row_w.dot(t) };
-            // Descending depth: far primitives first. Flip the sortable
-            // bits so an ascending radix sort yields that.
-            keys.push(!sortable_bits(depth));
-        }
-        radix_sort_indices(keys, order, scratch);
-
-        staging.clear();
-        staging.reserve(n);
-        let per_point = data.sh_per_point();
-        for &i in order.iter() {
-            let i = i as usize;
-            let p = data.positions[i];
-            let dir = (Vec3::from(p) - eye).normalize_or_zero();
-            // Trainers fit the SH colour to the photographs' sRGB values and
-            // blend those as plain numbers; so does the splat layer, which
-            // the composite linearises afterwards.
-            let color = evaluate_sh(
-                data.sh_degree,
-                &data.sh[i * per_point..(i + 1) * per_point],
-                dir.to_array(),
+        let Some(last) = sort.last else {
+            // Nothing on the GPU yet: sort now so the splat appears.
+            let scratch = sort_into(
+                &self.data,
+                n,
+                &sort_view,
+                sort.scratch.take().unwrap_or_default(),
             );
-            let a = data.axes[i];
-            staging.push(GpuSplatInstance {
-                position: [p[0], p[1], p[2], data.opacities[i]],
-                axis_u: [a[0], a[1], a[2], 0.0],
-                axis_v: [a[3], a[4], a[5], 0.0],
-                axis_w: [a[6], a[7], a[8], 0.0],
-                color: [color[0], color[1], color[2], 1.0],
-            });
+            queue.write_buffer(
+                &self.instance_buffer,
+                0,
+                bytemuck::cast_slice(&scratch.staging[..n]),
+            );
+            sort.last = Some(target);
+            sort.scratch = Some(scratch);
+            return true;
+        };
+        if !self.needs_resort(last, axis, sort_view.eye) {
+            return landed;
         }
-        queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(staging));
-        true
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let data = self.data.clone();
+            let scratch = sort.scratch.take().unwrap_or_default();
+            let handle = std::thread::Builder::new()
+                .name("splat sort".to_string())
+                .spawn(move || sort_into(&data, n, &sort_view, scratch))
+                .expect("spawn splat sort thread");
+            sort.pending = Some(PendingSort { target, handle });
+            landed
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let scratch = sort_into(
+                &self.data,
+                n,
+                &sort_view,
+                sort.scratch.take().unwrap_or_default(),
+            );
+            queue.write_buffer(
+                &self.instance_buffer,
+                0,
+                bytemuck::cast_slice(&scratch.staging[..n]),
+            );
+            sort.last = Some(target);
+            sort.scratch = Some(scratch);
+            true
+        }
+    }
+
+    /// Brings the order on the GPU up to date with `view` before returning:
+    /// lands a sort in flight, then sorts in place if the view still asks
+    /// for it. For frames that are read back rather than shown.
+    pub fn settle_for(&self, queue: &wgpu::Queue, view: &CameraView) {
+        // Each call lands a finished sort and, when the order it landed is
+        // already stale for `view`, starts the next; the loop ends only
+        // after a call that left nothing in flight, which means the order
+        // on the GPU is current.
+        loop {
+            self.sort_for(queue, view);
+            if !self.sort_pending() {
+                break;
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// Whether a background sort is in flight (a host may keep repainting
+    /// until it lands).
+    pub fn sort_pending(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.sort
+                .lock()
+                .expect("splat sort state")
+                .pending
+                .is_some()
+        }
+        #[cfg(target_arch = "wasm32")]
+        false
     }
 }
 
@@ -636,10 +815,9 @@ impl SplatPipeline {
             extent,
             sort: Mutex::new(SortState {
                 last: None,
-                keys: Vec::new(),
-                order: Vec::new(),
-                scratch: Vec::new(),
-                staging: Vec::new(),
+                scratch: Some(SortScratch::default()),
+                #[cfg(not(target_arch = "wasm32"))]
+                pending: None,
             }),
             dropped,
         }

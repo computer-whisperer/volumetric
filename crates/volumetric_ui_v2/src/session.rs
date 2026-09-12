@@ -406,6 +406,15 @@ impl Session {
         !self.thumbnail_inflight.is_empty() || !self.thumbnail_uploads.is_empty()
     }
 
+    /// A splat is being re-sorted for the camera on a background thread;
+    /// the order lands on the next frame, so the shell keeps painting.
+    pub fn has_pending_splat_sort(&self) -> bool {
+        self.viewport
+            .resident
+            .values()
+            .any(|resident| resident.scene.splats.iter().any(|s| s.sort_pending()))
+    }
+
     /// Executor replacement drops the old worker's result receiver. Cancel
     /// and forget its thumbnail jobs so `sync` can enqueue them on the new
     /// worker instead of leaving their hashes permanently marked in flight.

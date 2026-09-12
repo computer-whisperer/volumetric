@@ -720,7 +720,17 @@ subject mask, 40.0, 41.3, 38.9, 46.1 dB over the frame, silhouette IoU
 0.93, 0.93, 0.89, 0.89; affine-fitted to the photographs 27.8, 27.0,
 30.4, 33.8 dB against the trainer's 28.6, 27.4, 31.7, 34.8 (its
 `metrics.json` mean 28.6 over seven). The surfel intersection is the
-last 2 dB of that. Not done: the viewport's reference grid lies in the
+last 2 dB of that. Follow-up the same day on chairbase-dslr-1-refuse
+(4.17 M surfels, no subject mask): a 550 ms single-threaded re-sort on
+every two degrees of orbit gave 1–2 fps, and the CLI's offscreen device
+was dropping 817 k primitives at wgpu's default 256 MiB buffer limit.
+Now the first sort runs in place in parallel (255 ms), later sorts on a
+background thread (~200 ms, frames stay at 12–36 ms), the GUI keeps
+painting while one is in flight, `render` settles the order before a
+readback, and the offscreen device takes the adapter's buffer limit as
+the GUI does. Instances are 80 bytes (334 MB for that splat); halving
+that with half-float axes is the next step if uploads dominate on a
+weaker link. Not done: the viewport's reference grid lies in the
 renderer's XZ plane while a surveyed world is z-up, so the grid cuts
 through a splat and a view set at an angle (it also drew the "streaks"
 in the first comparisons); a settings toggle for kernel radius and

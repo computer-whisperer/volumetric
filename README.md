@@ -434,7 +434,12 @@ through a view over its photograph. The renderer keeps each splat as a
 GPU resident whose instances are rewritten back to front, with the
 spherical-harmonic colour evaluated for the view, whenever the camera
 turns by two degrees or moves by two percent of the splat's extent;
-between sorts only the camera uniforms change. The vertex shader
+between sorts only the camera uniforms change. The first sort runs in
+place, in parallel over the primitives, so the splat appears at once;
+later sorts run on a background thread while frames keep drawing the
+previous order and land when done (a four-million-primitive splat draws
+in 12 ms and re-sorts in 200 ms without a stall; `render` waits for the
+order before reading a frame back). The vertex shader
 projects each primitive's covariance through the view's Jacobian into a
 screen ellipse (EWA splatting) and sizes a quad to three sigmas; the
 fragment weights a 3D Gaussian by the projected Gaussian and a surfel by
