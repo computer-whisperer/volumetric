@@ -386,6 +386,7 @@ impl Session {
                 .ensure_target_for_rect(device, rect, scale_factor);
         }
         app.set_viewport_texture(self.viewport.app_texture());
+        app.set_viewport_size(self.viewport_rect.map(|rect| (rect.w, rect.h)));
         jobs
     }
 

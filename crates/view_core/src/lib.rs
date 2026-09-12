@@ -13,6 +13,7 @@ pub mod manifest;
 pub mod overlay;
 pub mod residual;
 pub mod stills;
+pub mod text;
 
 pub mod crop;
 pub mod detect;

@@ -36,8 +36,9 @@ pub use scene::{
 };
 pub use splats::{splat_data, splat_detail};
 pub use views::{
-    FRUSTUM_DEPTH_M, Framed, LookThrough, ViewFrame, clip_planes_for, frustum_segments,
-    highlight_lines, observation_lines, pose_matrix, submit_view_highlight, viewset_detail,
+    FRUSTUM_DEPTH_M, Framed, LookThrough, MarkKind, MarkLabel, ViewFrame, clip_planes_for,
+    frustum_segments, highlight_lines, mark_labels, observation_lines, pick_cross_px, pose_matrix,
+    submit_view_highlight, viewset_detail,
 };
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

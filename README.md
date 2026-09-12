@@ -253,7 +253,7 @@ volumetric_cli render -i <model.wasm | project.vproj> -o <output.png>
 - `--intrinsics fx,fy,cx,cy --pose m00,...,m23` - A pinhole camera in OpenCV convention (pixel origin top-left, camera z forward); the pose is the rows of its 3x4 camera-to-world matrix and the image is `--width` x `--height`
 - `--through <view id>` (or `<views asset>:<view id>`) - The camera of a view in the project's view set, at the view's image size unless `--width`/`--height` scale it
 - `--overlay blend|edge|side|checker [--overlay-alpha a] [--overlay-tile px]` - With `--through`, composite the render over the photograph as shot. The render is drawn through the view's lens (a pinhole frame warped by the camera's distortion model), so it lands on the photograph's own pixels, the ones `view-crop`, `view-pick` and `view-triangulate` measure in; GUI look-through draws the same way
-- `--marks` - With `--through`, draw what the view observed over the finished frame, as GUI look-through does: marker quads (swatches amber, card tags cyan), card corners (magenta crosses), recorded picks (a green cross for a fit pick, an orange diagonal one for a check) and contour traces (green)
+- `--marks` - With `--through`, draw what the view observed over the finished frame, as GUI look-through does: marker quads (swatches amber, card tags cyan), card corners (magenta crosses), recorded picks (a green cross for a fit pick, an orange diagonal one for a check) and contour traces (green), each pick and contour named beside its mark
 - `--projection ortho [--ortho-scale h]` - Orthographic instead of perspective (presets and poses)
 - `--near`, `--far` - Clip planes (default: from the scene)
 

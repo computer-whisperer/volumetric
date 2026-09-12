@@ -11,8 +11,8 @@ use volumetric::{
     operator_config, viewset,
 };
 pub use volumetric_preview::{
-    Asn2Settings, BoundsCorners, LookThrough, OutputStats, PreviewMeshPlan, PreviewPlan,
-    PreviewRenderMode, PreviewRequest, format_count, viewset_detail,
+    Asn2Settings, BoundsCorners, LookThrough, MarkKind, MarkLabel, OutputStats, PreviewMeshPlan,
+    PreviewPlan, PreviewRenderMode, PreviewRequest, format_count, mark_labels, viewset_detail,
 };
 use volumetric_renderer::CameraControlScheme;
 
@@ -1113,6 +1113,9 @@ pub struct VolumetricUiV2 {
         std::cell::RefCell<std::collections::HashMap<([u8; 32], String), Option<Image>>>,
     /// The looked-through view's full photograph, decoded once per view.
     look_photo: std::cell::RefCell<Option<(([u8; 32], String), Option<Image>)>>,
+    /// The viewport's logical size as of the last frame, so labels can be
+    /// placed over the photograph's letterbox; `None` before a frame.
+    viewport_size: Option<(f32, f32)>,
     /// A panel build left thumbnails undecoded for lack of budget; the
     /// shell schedules another frame.
     view_thumbnails_pending: std::cell::Cell<bool>,
@@ -1258,6 +1261,7 @@ impl VolumetricUiV2 {
             viewset_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             view_thumbnails: std::cell::RefCell::new(std::collections::HashMap::new()),
             look_photo: std::cell::RefCell::new(None),
+            viewport_size: None,
             view_thumbnails_pending: std::cell::Cell::new(false),
             lightbox: None,
             export_dialog: None,
@@ -1465,6 +1469,45 @@ impl VolumetricUiV2 {
         let set = self.viewset_of(asset)?;
         let (view, camera) = set.view(&look.view_id)?;
         LookThrough::of(view, camera)
+    }
+
+    /// The viewport's logical size, from the shell each frame.
+    pub fn set_viewport_size(&mut self, size: Option<(f32, f32)>) {
+        self.viewport_size = size;
+    }
+
+    /// The names of the looked-through view's picks and contours, each at
+    /// its place in the viewport: the photograph's pixel through the
+    /// letterbox the photo layer and the render share (a `Contain` fit).
+    /// Empty off look-through or before the viewport has a size.
+    fn look_through_labels(&self) -> Vec<(MarkLabel, f32, f32)> {
+        let (Some(look), Some((w, h))) = (&self.look_through, self.viewport_size) else {
+            return Vec::new();
+        };
+        let Some(asset) = self
+            .runtime_assets
+            .iter()
+            .find(|asset| asset.id() == look.asset_id)
+        else {
+            return Vec::new();
+        };
+        let Some(set) = self.viewset_of(asset) else {
+            return Vec::new();
+        };
+        let Some((view, camera)) = set.view(&look.view_id) else {
+            return Vec::new();
+        };
+        let (cw, ch) = (camera.width as f32, camera.height as f32);
+        let scale = (w / cw).min(h / ch);
+        let (ox, oy) = ((w - cw * scale) * 0.5, (h - ch * scale) * 0.5);
+        mark_labels(view, camera)
+            .into_iter()
+            .map(|label| {
+                let x = label.pixel[0] as f32 * scale + ox;
+                let y = label.pixel[1] as f32 * scale + oy;
+                (label, x, y)
+            })
+            .collect()
     }
 
     /// The looked-through photograph as shot (the render is drawn through
@@ -5865,6 +5908,7 @@ fn asn2_stepper_row(id: &str, field: &str, label: &str, value: &str) -> El {
 fn viewport_pane(app: &VolumetricUiV2) -> El {
     let mut layers = vec![viewport_placeholder(app)];
     layers.extend(look_through_photo_layer(app));
+    layers.extend(look_through_label_layer(app));
     layers.push(viewport_overlay(app));
     stack(layers).width(Size::Fill(1.0)).height(Size::Fill(1.0))
 }
@@ -5888,6 +5932,31 @@ fn look_through_photo_layer(app: &VolumetricUiV2) -> Option<El> {
             .image_tint(Color::srgb_u8(255, 255, 255))
             .opacity(f32::from(app.photo_opacity_percent) / 100.0),
     )
+}
+
+/// Half the height of a label chip, so a label centres on its mark.
+const MARK_LABEL_HALF_HEIGHT: f32 = 9.0;
+
+/// The looked-through view's pick and contour names beside their marks,
+/// coloured as the marks are. Unkeyed, so pointer input still reaches
+/// the camera.
+fn look_through_label_layer(app: &VolumetricUiV2) -> Option<El> {
+    let labels = app.look_through_labels();
+    if labels.is_empty() {
+        return None;
+    }
+    let chips = labels.into_iter().map(|(label, x, y)| {
+        let chip = badge(label.text).xsmall();
+        // The theme's tints stand in for the marks' colours: success
+        // for a fit pick, warning for a check, the default for a contour.
+        let chip = match label.kind {
+            MarkKind::Fit => chip.success(),
+            MarkKind::Check => chip.warning(),
+            MarkKind::Contour => chip,
+        };
+        column([chip.translate(x, y - MARK_LABEL_HALF_HEIGHT)]).fill_size()
+    });
+    Some(stack(chips).fill_size())
 }
 
 fn viewport_overlay(app: &VolumetricUiV2) -> El {
@@ -10900,6 +10969,8 @@ mod tests {
             texts.contains(&"hole_a, hole_b (check), rim (contour)".to_string()),
             "{texts:?}"
         );
+        // Off look-through no label chips float over the viewport.
+        assert!(!texts.contains(&"hole_a".to_string()), "{texts:?}");
         // Three pictures, two decoded per build: one waits a frame.
         assert!(app.has_pending_view_thumbnails());
         assert_eq!(app.view_thumbnails.borrow().len(), 2);
@@ -10920,11 +10991,36 @@ mod tests {
             &mut app,
             UiEvent::synthetic_click(format!("{LOOK_THROUGH_PREFIX}views:v1")),
         );
+        app.set_viewport_size(Some((400.0, 300.0)));
         let mut tree = shell(&app);
         let mut keys = Vec::new();
         collect_keys(&tree, &mut keys);
         assert!(keys.contains(&EXIT_LOOK_KEY.to_string()));
         assert!(keys.contains(&PHOTO_OPACITY_SELECT_KEY.to_string()));
+        // The picks' names float beside their marks: the 4 x 3 picture
+        // fills the 400 x 300 viewport at 100 px per pixel, and hole_a at
+        // (1.5, 1.5) gets its chip a cross-and-a-bit to the right (the
+        // minimum 8 px cross times 1.3), centred on its row.
+        fn chips(el: &El, out: &mut Vec<(String, (f32, f32))>) {
+            if let Some(text) = &el.text
+                && el.translate != (0.0, 0.0)
+            {
+                out.push((text.clone(), el.translate));
+            }
+            for child in &el.children {
+                chips(child, out);
+            }
+        }
+        let mut found = Vec::new();
+        chips(&tree, &mut found);
+        let names: Vec<&str> = found.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(names, ["hole_a", "hole_b", "rim"], "{found:?}");
+        let (x, y) = found[0].1;
+        assert!(
+            (x - (1.5 + 8.0 * 1.3) * 100.0).abs() < 0.5
+                && (y - (150.0 - MARK_LABEL_HALF_HEIGHT)).abs() < 0.5,
+            "{found:?}"
+        );
         // The photo layer is a full-size image whose opacity travels in a
         // white tint (Damascene drops an untinted image's opacity).
         fn photo_layers(el: &El, out: &mut Vec<(f32, bool)>) {

@@ -140,7 +140,7 @@ measurement feedback. All evidence paths above are under
 | S1 | Splat value, 3DGS PLY import, `splat-list`, splat to point cloud | 2 days | landed |
 | S2 | Splat rendering in the viewport and `render`, look-through over the photograph | 4 days | landed |
 | S3 | Photometric audit: the splat rendered through each view against its photograph | 2 days | pending |
-| P | Python bindings (PyO3, maturin) over cv_core, view_core, the survey, splats and projects | 3 days | P1..P4 landed 2026-09-12 (P4: render drawn through the lens); open: pick labels and recording in the GUI |
+| P | Python bindings (PyO3, maturin) over cv_core, view_core, the survey, splats and projects | 3 days | P1..P5 landed 2026-09-12 (P4: render drawn through the lens; P5: mark labels); open: recording picks in the GUI |
 | D | Evidence audits for still sets: intake, detection, survey, setup, coverage, photometric, physical | 3 days | pending |
 
 Proposed order: C2, C3 (the survey is the stage the agent starts from and
@@ -970,6 +970,21 @@ size: the recorded picks' crosses centre on the recorded pixels within
 crosses on the printed card as shot (a 6329 x 4220 pinhole frame warped
 to 6192 x 4128). Open: recording picks by clicking in the GUI, which
 this makes a plain pixel read.
+
+P5 — mark labels (landed 2026-09-12). `volumetric_preview::mark_labels`
+names each recorded pick and contour beside its mark (a cross-and-a-bit
+to the right of a pick, at a contour's first point) with a `MarkKind`
+for colour; the GUI floats them as badge chips over the viewport
+(success for a fit pick, warning for a check; placed through the
+letterbox the photo layer uses, from the viewport size the shell hands
+the app each frame; unkeyed so the camera keeps its input), and the
+headless `--marks` frame draws them with `view_core::text`, a 5 x 7
+bitmap font on a dark box, scaled with the frame so a 6000-pixel still
+reads when viewed small. The crop rulers share that font (their own
+three-wide digits deleted). Deliberately not a renderer text pass: the
+GUI has Damascene's text and the headless frame is a CPU pixel buffer
+at the end, so a GPU glyph atlas would serve neither. Open: recording
+picks from the GUI.
 
 Tests (`crates/volumetric_py/tests`, pytest in the shim's venv): a
 cylinder built and run, its mesh bounds checked; a synthetic board

@@ -77,6 +77,12 @@ def test_marks_draw_the_views_observations_and_picks(chair_views):
     x, y = 600 * 774 / 6192, 400 * 516 / 4128
     patch = marked.image[int(y) - 3: int(y) + 4, int(x) - 3: int(x) + 4, :3].astype(int)
     assert ((patch[..., 1] > 200) & (patch[..., 0] < 200)).any(), "no green on the pick"
+    # The pick's name sits just right of its cross: a dark label box with
+    # green ink, a cross-and-a-bit (41 px * 1.3 at full size) to the right.
+    lx = int(x + 41 * 1.3 * 774 / 6192)
+    strip = marked.image[int(y) - 6: int(y) + 7, lx: lx + 40, :3].astype(int)
+    assert (strip.max(axis=2) <= 24).sum() > 50, "no label box"
+    assert ((strip[..., 1] > 200) & (strip[..., 0] < 200)).any(), "no label ink"
     check = v.render(p, through="views:DSC00730", marks=True, width=774, height=516, resolution=32, grid=0.0)
     x, y = 5600 * 774 / 6192, 3700 * 516 / 4128
     patch = check.image[int(y) - 3: int(y) + 4, int(x) - 3: int(x) + 4, :3].astype(int)

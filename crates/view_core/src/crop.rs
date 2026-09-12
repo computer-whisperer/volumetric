@@ -58,47 +58,20 @@ pub struct Crop {
     pub projected: Vec<Option<[f64; 2]>>,
 }
 
-/// Compact numeric rulers, independent of installed fonts. Coordinates
+/// A ruler number: the shared bitmap font on a dark box. Coordinates
 /// remain in the original image's pixels even for a magnified crop.
 fn ruler_number(out: &mut Rgb, x: u32, y: u32, number: u32, scale: u32) {
-    const DIGITS: [[u8; 5]; 10] = [
-        [7, 5, 5, 5, 7],
-        [2, 6, 2, 2, 7],
-        [7, 1, 7, 4, 7],
-        [7, 1, 7, 1, 7],
-        [5, 5, 7, 1, 1],
-        [7, 4, 7, 1, 7],
-        [7, 4, 7, 5, 7],
-        [7, 1, 1, 1, 1],
-        [7, 5, 7, 5, 7],
-        [7, 5, 7, 1, 7],
-    ];
-    let text = number.to_string();
-    for py in 0..7 * scale {
-        for px in 0..(text.len() as u32 * 4 + 1) * scale {
-            if x + px < out.width && y + py < out.height {
-                out.set(x + px, y + py, [20, 20, 20]);
+    crate::text::draw_label(
+        &number.to_string(),
+        i64::from(x),
+        i64::from(y),
+        scale,
+        |px, py, lit| {
+            if px < out.width && py < out.height {
+                out.set(px, py, if lit { GRID_MAJOR } else { [20, 20, 20] });
             }
-        }
-    }
-    for (i, digit) in text.bytes().enumerate() {
-        for (row, bits) in DIGITS[(digit - b'0') as usize].iter().enumerate() {
-            for col in 0..3 {
-                if bits & (4 >> col) == 0 {
-                    continue;
-                }
-                for dy in 0..scale {
-                    for dx in 0..scale {
-                        let px = x + (1 + i as u32 * 4 + col) * scale + dx;
-                        let py = y + (1 + row as u32) * scale + dy;
-                        if px < out.width && py < out.height {
-                            out.set(px, py, GRID_MAJOR);
-                        }
-                    }
-                }
-            }
-        }
-    }
+        },
+    );
 }
 
 /// Crop `picture` (the view's original, at the camera's size) around the
@@ -198,18 +171,18 @@ pub fn crop(
     let mut next_x = 0;
     for &u in &verticals {
         let x = (u - u0) * scale + 2;
-        let width = (u.to_string().len() as u32 * 4 + 2) * label_scale;
+        let width = crate::text::text_size(&u.to_string(), label_scale).0 + 2 * label_scale;
         if x >= next_x && x + width <= out.width {
             ruler_number(&mut out, x, 2, u, label_scale);
             next_x = x + width;
         }
     }
-    let mut next_y = 8 * label_scale;
+    let mut next_y = 9 * label_scale;
     for &v in &horizontals {
         let y = (v - v0) * scale + 2;
-        if y >= next_y && y + 7 * label_scale <= out.height {
+        if y >= next_y && y + 9 * label_scale <= out.height {
             ruler_number(&mut out, 2, y, v, label_scale);
-            next_y = y + 8 * label_scale;
+            next_y = y + 10 * label_scale;
         }
     }
     Ok(Crop {

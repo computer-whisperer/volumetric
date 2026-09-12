@@ -108,7 +108,8 @@ an overlay; `resolution`, `sharp`, `simplify`, `color_field`,
 `color_range`, `wireframe`, `background`, `up`, `projection="ortho"`
 with `ortho_scale`, `grid`, `ssao` as the CLI's flags; `marks=True`
 draws what the looked-through view observed (markers, card corners,
-recorded picks and contours) over the frame, as the GUI does. Needs a GPU (or a
+recorded picks and contours, named beside their marks) over the frame,
+as the GUI does. Needs a GPU (or a
 software adapter wgpu accepts).
 
 ## Pictures and markers

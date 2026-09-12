@@ -20,9 +20,10 @@ use view_core::image::{Rgb, decode_rgb};
 use view_core::overlay::compose;
 use volumetric::{AssetTypeHint, LoadedAsset};
 use volumetric_preview::{
-    Asn2Settings, PreviewBounds, PreviewEntity, PreviewMeshPlan, PreviewPlan, PreviewRenderMode,
-    PreviewRequest, ViewFrame, build_preview_scene, clip_planes_for, observation_lines,
-    srgb_to_linear, submit_subspace_gizmo, submit_view_highlight, wireframe_style,
+    Asn2Settings, MarkLabel, PreviewBounds, PreviewEntity, PreviewMeshPlan, PreviewPlan,
+    PreviewRenderMode, PreviewRequest, ViewFrame, build_preview_scene, clip_planes_for,
+    mark_labels, observation_lines, srgb_to_linear, submit_subspace_gizmo, submit_view_highlight,
+    wireframe_style,
 };
 use volumetric_renderer::{
     Camera, CameraView, GridPlanes, LineData, RenderSettings, ViewDirection, Warp,
@@ -599,6 +600,8 @@ pub fn render(
     // sizes scale its intrinsics so smaller renders stay aligned.
     let mut photo: Option<Rgb> = None;
     let mut marks: Option<LineData> = None;
+    // The marks' names, at output pixels.
+    let mut labels: Vec<MarkLabel> = Vec::new();
     let mut lens: Option<Warp> = None;
     let mut size = (
         options.width.unwrap_or(1024),
@@ -640,6 +643,15 @@ pub fn render(
                 marks = Some(LineData {
                     segments: observation_lines(view, view_camera),
                 });
+                let sx = size.0 as f64 / f64::from(view_camera.width);
+                let sy = size.1 as f64 / f64::from(view_camera.height);
+                labels = mark_labels(view, view_camera)
+                    .into_iter()
+                    .map(|mut label| {
+                        label.pixel = [label.pixel[0] * sx, label.pixel[1] * sy];
+                        label
+                    })
+                    .collect();
             }
             if options.overlay.is_some() {
                 let bytes = view.image.as_deref().with_context(|| {
@@ -848,7 +860,30 @@ pub fn render(
                 let lines = offscreen
                     .render_rgba(&mut renderer, &view, &marks_settings)
                     .map_err(anyhow::Error::msg)?;
-                over(rgba, &lines)
+                let mut rgba = over(rgba, &lines);
+                // Names beside the marks, the font scaled with the frame
+                // so they read when a large frame is viewed small.
+                let scale = (size.0 / 600).max(1);
+                for label in &labels {
+                    let (_, height) = view_core::text::text_size(&label.text, scale);
+                    let half = i64::from(height / 2 + scale);
+                    let ink = label.kind.srgb8();
+                    view_core::text::draw_label(
+                        &label.text,
+                        label.pixel[0].round() as i64,
+                        label.pixel[1].round() as i64 - half,
+                        scale,
+                        |x, y, lit| {
+                            if x < size.0 && y < size.1 {
+                                let i = ((y * size.0 + x) * 4) as usize;
+                                let color = if lit { ink } else { [20, 20, 20] };
+                                rgba[i..i + 3].copy_from_slice(&color);
+                                rgba[i + 3] = 255;
+                            }
+                        },
+                    );
+                }
+                rgba
             }
             None => rgba,
         };

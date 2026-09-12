@@ -97,6 +97,80 @@ pub fn highlight_lines(view: &View, camera: &CameraModel) -> renderer::LineData 
     }
 }
 
+/// A name drawn beside a mark in the photograph: the GUI sets it as
+/// text over the viewport, the headless frame draws it into the pixels.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MarkLabel {
+    pub text: String,
+    /// The label's left edge, vertically centred, in the photograph's
+    /// pixels: just right of the cross, or at a contour's first point.
+    pub pixel: [f64; 2],
+    pub kind: MarkKind,
+}
+
+/// What a mark is, for its colour and shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarkKind {
+    Fit,
+    Check,
+    Contour,
+}
+
+impl MarkKind {
+    /// The mark's colour in linear RGBA, as the lines are drawn.
+    pub fn color(self) -> [f32; 4] {
+        match self {
+            MarkKind::Fit => PICK_FIT_COLOR,
+            MarkKind::Check => PICK_CHECK_COLOR,
+            MarkKind::Contour => CONTOUR_COLOR,
+        }
+    }
+
+    /// The mark's colour as 8-bit sRGB, for text drawn into pixels.
+    pub fn srgb8(self) -> [u8; 3] {
+        let c = self.color();
+        [c[0], c[1], c[2]].map(|v| (v.max(0.0).powf(1.0 / 2.2) * 255.0).round() as u8)
+    }
+}
+
+/// Half-size of a pick's cross in the photograph's pixels.
+pub fn pick_cross_px(camera: &CameraModel) -> f64 {
+    (f64::from(camera.width) * PICK_CROSS_FRACTION).max(PICK_CROSS_MIN_PX)
+}
+
+/// The names of a view's recorded picks and contours, placed beside
+/// their marks. Nothing for an unposed view or one without observations.
+pub fn mark_labels(view: &View, camera: &CameraModel) -> Vec<MarkLabel> {
+    let Some(obs) = &view.observations else {
+        return Vec::new();
+    };
+    if view.pose().is_none() {
+        return Vec::new();
+    }
+    let gap = pick_cross_px(camera) * 1.3;
+    let mut out = Vec::with_capacity(obs.features.len() + obs.contours.len());
+    for f in &obs.features {
+        out.push(MarkLabel {
+            text: f.name.clone(),
+            pixel: [f.pixel[0] + gap, f.pixel[1]],
+            kind: match f.role {
+                PickRole::Fit => MarkKind::Fit,
+                PickRole::Check => MarkKind::Check,
+            },
+        });
+    }
+    for c in &obs.contours {
+        if let Some(first) = c.pixels.first() {
+            out.push(MarkLabel {
+                text: c.name.clone(),
+                pixel: [first[0] + gap * 0.5, first[1]],
+                kind: MarkKind::Contour,
+            });
+        }
+    }
+    out
+}
+
 /// What detection found in the photograph, as lines on the view's
 /// picture plane at the frustum's depth: each marker's quad (swatches
 /// amber, the card's tags cyan) and a cross at each card corner. Looked
@@ -133,7 +207,7 @@ pub fn observation_lines(view: &View, camera: &CameraModel) -> Vec<renderer::Lin
     // stays visible under it.
     for f in &obs.features {
         let [x, y] = f.pixel;
-        let r = (f64::from(camera.width) * PICK_CROSS_FRACTION).max(PICK_CROSS_MIN_PX);
+        let r = pick_cross_px(camera);
         let gap = r * 0.25;
         let (color, arms): ([f32; 4], [[[f64; 2]; 2]; 4]) = match f.role {
             PickRole::Fit => (
@@ -676,10 +750,23 @@ mod tests {
         // Look-through carries them with the frustum.
         let look = LookThrough::of(&view, &camera).unwrap();
         assert_eq!(look.frustum.segments.len(), 9 + 20);
+        // Labels sit just right of each cross and at a contour's start.
+        let labels = mark_labels(&view, &camera);
+        assert_eq!(labels.len(), 3);
+        assert_eq!(labels[0].text, "hole_a");
+        assert_eq!(labels[0].kind, MarkKind::Fit);
+        assert!(labels[0].pixel[0] > 50.0 + PICK_CROSS_MIN_PX && labels[0].pixel[1] == 60.0);
+        assert_eq!(labels[1].kind, MarkKind::Check);
+        assert_eq!(
+            (labels[2].text.as_str(), labels[2].kind),
+            ("rim", MarkKind::Contour)
+        );
+        assert_eq!(MarkKind::Fit.srgb8(), [168, 255, 177]);
         // Unposed, the view draws nothing and cannot be looked through.
         let mut raw = view.clone();
         raw.camera_to_world = None;
         assert!(observation_lines(&raw, &camera).is_empty());
+        assert!(mark_labels(&raw, &camera).is_empty());
         assert!(frustum_segments(&raw, &camera, 1.0, VIEW_COLOR).is_empty());
         assert!(LookThrough::of(&raw, &camera).is_none());
     }
