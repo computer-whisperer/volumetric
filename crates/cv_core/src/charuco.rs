@@ -20,7 +20,8 @@ use volumetric_abi::viewset::BoardSpec;
 use crate::detect::{Detection, apply_homography, homography, refine_saddle};
 use crate::gray::Gray;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct CornerParams {
     /// Refinement half-window as a fraction of the square's size in
     /// pixels, clamped to the two bounds below.
@@ -59,7 +60,7 @@ impl Default for CornerParams {
 }
 
 /// An interior corner found in a picture.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct LocatedCorner {
     pub id: u32,
     pub pixel: [f64; 2],

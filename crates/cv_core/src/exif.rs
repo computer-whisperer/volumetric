@@ -8,7 +8,7 @@
 use volumetric_abi::viewset::Shot;
 
 /// What a picture says about the camera that took it.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
 pub struct Exif {
     pub make: Option<String>,
     pub model: Option<String>,

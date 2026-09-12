@@ -34,7 +34,8 @@ pub fn square_marker(
 }
 
 /// Rendering choices.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Render {
     /// Background luma.
     pub background: u8,

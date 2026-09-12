@@ -1,0 +1,103 @@
+# volumetric (Python)
+
+volumetric's kernels from Python, one to one: projects (build, run,
+read the exports as arrays), view sets and splats, marker detection, the
+still solve and the survey. A PyO3 extension module built with maturin;
+the package is `volumetric`, the module `volumetric._volumetric`.
+
+The CLI stays the canonical agent surface and the operator the durable
+pipeline stage; this is the workbench for validation loops and plots,
+and the way the scanner's Python can call volumetric's kernels instead of
+its own. Anything the CLI does through a library call the bindings do
+through the same call (`volumetric::project_edit` holds the shared
+project-editing rules), so a feature that exists only here is a bug.
+
+## Build
+
+```sh
+source path/to/venv/bin/activate      # Python >= 3.12; numpy
+pip install maturin
+maturin develop --release -m crates/volumetric_py/Cargo.toml
+python -m pytest crates/volumetric_py/tests
+```
+
+The crate is a workspace member, so `cargo build --workspace` and clippy
+cover it (a Python interpreter is needed at build time for pyo3's
+configuration). Its Rust tests are disabled (`[lib] test = false`): an
+extension module has no libpython to link a test binary against, and the
+tests are pytest. Tests needing the chair evidence skip when
+`$SCAN/sessions/chairbase-dslr-1-all/demo/chair_views.vviews` is absent
+(`SCAN` defaults to `/ceph/christian/index_scanner`).
+
+## Projects
+
+```python
+import volumetric as v
+
+p = v.Project()
+p.add_op("cylinder_operator", [{"radius": 0.05}, [0, 0, 0], [0, 0, 0.2]], output="post")
+p.add_op("cylinder_operator", [{"radius": 0.05}, [0.1, 0, 0], [0.1, 0, 0.2]], output="post2", export=False)
+p.add_op("boolean_operator", ["post", "post2", {"op": "union"}], output="both")
+out = p.run()                       # {id: Asset}, the exports
+mesh = out["both"].mesh(max_depth=4)  # a Model meshed: nodes (n,3), elements (m,3), node_fields["normal"]
+p.save("posts.vproj")
+```
+
+- `Project()`, `Project.open(path)`, `Project.from_bytes(b)`, `.save(path)`,
+  `.to_bytes()`, `.asset_ids()`, `.exports`, `.steps()`, `.validate()`.
+- `.add_model(wasm, id=None)`; `.add_asset(data, kind, id=None)` with kind
+  `lua`, `wgsl`, `config`, `f64map` (a dict is accepted), `blob`, `viewset`
+  or `splat`; `v.models()` / `v.model_bytes(name)` for the bundled models.
+- `.add_op(operator, inputs, output=None, export=True)`: `operator` is a
+  bundled name (`v.operators()`), a `.wasm` path or wasm bytes. Each input
+  is an asset id (`str`), `None` (unwired), `bytes` (raw) or a JSON-like
+  value coerced by the slot's declared type: a dict for a CBOR
+  configuration or an F64Map, a list for a VecF64, as the CLI's `json:`
+  form. Errors name the slot. `v.operator_info(name)` shows the slots
+  (with the configuration's CDDL), outputs and docs.
+- `.run(remote=None)` runs every step (on a daemon at `http://host:port`
+  when `remote` is given) and returns the exports. `Asset.kind`,
+  `.bytes`, `.warnings`; `.value` decodes an F64Map (dict), a VecF64
+  (float array) or a Subspace (dict with `origin` and `basis` arrays);
+  `.mesh(...)` gives a FeaMesh or TriMesh as arrays, or meshes a Model
+  with the adaptive surface nets (`base_resolution`, `max_depth`,
+  `sharp_edges`, `sharp_angle`, `simplify`); `.viewset()` and `.splat()`
+  decode those kinds.
+
+## Pictures and markers
+
+```python
+gray = v.Gray.open("DSC00742.JPG")            # or Gray(array), Gray.from_rgb(array), Gray.decode(bytes)
+found = v.detect(gray, ["5x5_100", "36h11"])   # [{id, family, corners, rotation, distance, fit_px}]
+obs = v.observe(gray)                          # swatches + survey card: detections, corners, blur, observations
+solve = v.solve_still(gray, views, file=open("DSC00742.JPG", "rb").read())  # pose against a view set's field
+solved, report = v.survey(views, rounds=6)     # the survey; report is SurveyReport as a dict
+```
+
+Options are keyword arguments over the crate's defaults (`DetectParams`
+for `detect`, `SurveyOptions` for `survey`, `Render` for the renderers);
+an unknown name is an error. `observe` takes `detect=` and `corners=`
+dicts for its two parameter blocks, `board=False` to skip the card.
+
+`render_board(camera, camera_to_world, origin, right, down, spec=None)`
+and `render_markers(camera, camera_to_world, markers, family)` are
+`cv_core`'s synthetic renderers, for tests that need a picture with a
+known answer; `survey_card()` and `board_corners()` describe the card.
+
+## View sets and splats
+
+`ViewSet.load(path)` / `.decode(bytes)` / `.save` / `.encode`; `.views`
+(each a `View`: `id`, `camera`, `camera_to_world` (3,4) or None,
+`position`, `tags`, `shot`, `observations`, `picture()` bytes, `image()`
+(h,w,3), `depth()`, `mask()`, `as_dict()`), `.view(id)`, `.cameras`
+(`Camera`: `width height fx fy cx cy distortion`, constructible),
+`.poses()` (n,3,4) with NaN for unposed, `.markers` (dicts),
+`.marker_ids()`, `.marker_corners()` (n,4,3), `.board`, `.world_up`,
+`.provenance`.
+
+`Splat.load(path)` / `.decode(bytes)`: `means`, `scales`, `quats`,
+`opacities`, `sh0`, `sh_rest` (n,3,k), `normals` or None, `kind`,
+`sh_degree`, `count`.
+
+Poses are camera-to-world 3x4 row-major: columns are the camera's right,
+down and forward axes in the world and its position.

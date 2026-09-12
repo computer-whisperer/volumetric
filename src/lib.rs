@@ -369,6 +369,7 @@ pub mod marching_cubes_cpu;
 pub mod mesh_decimation;
 pub mod operator_config;
 pub(crate) mod parallel_iter;
+pub mod project_edit;
 pub mod sharp_features;
 pub mod stl;
 pub mod threemf;

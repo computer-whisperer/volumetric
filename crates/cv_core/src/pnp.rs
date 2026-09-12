@@ -51,7 +51,7 @@ impl Default for SolveOptions {
 }
 
 /// One marker's part in the fit.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct MarkerFit {
     pub id: u32,
     pub rms_px: f64,
@@ -60,14 +60,14 @@ pub struct MarkerFit {
 }
 
 /// A fitted parameter with its standard error from the normal matrix.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
 pub struct Estimate {
     pub value: f64,
     pub std: f64,
 }
 
 /// The result of a pose solve.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct PoseSolve {
     pub camera_to_world: [f64; 12],
     /// The camera the residuals were measured with: the input, or with the

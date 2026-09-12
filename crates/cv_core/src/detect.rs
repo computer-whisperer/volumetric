@@ -16,7 +16,8 @@ use crate::linalg::smallest_eigenvector;
 
 /// Detector choices; the defaults follow OpenCV's, with thresholds scaled
 /// to the picture instead of fixed.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct DetectParams {
     /// Local-threshold window sizes, pixels; empty picks three from the
     /// picture size (1/100, 1/50 and 1/25 of the shorter side).
@@ -65,7 +66,7 @@ impl Default for DetectParams {
 }
 
 /// One marker found in a picture.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct Detection {
     pub id: u32,
     /// The dictionary the id is from: `5x5_100`, `4x4_50` or `36h11`.

@@ -7,8 +7,9 @@ view-solve, view_solve_operator, GUI Import Still). C2 (card detection)
 landed 2026-09-11. C3 (survey bundle) landed 2026-09-11 together with the
 parts of C1 it needed (schema 2, `view-import --stills`, Sony focus keys);
 C1's remaining audits fold into D. S1 (splat value, import, listing,
-points) and S2 (splat rendering) landed 2026-09-11. C4, S3, P (Python
-bindings) and D (audits) pending; order P, C4, D, S3.
+points) and S2 (splat rendering) landed 2026-09-11, P1 (Python bindings:
+projects, cv, view sets, splats) 2026-09-12. C4, S3, P2 and D (audits)
+pending; order C4, D, P2, S3.
 
 ## Why
 
@@ -139,7 +140,7 @@ measurement feedback. All evidence paths above are under
 | S1 | Splat value, 3DGS PLY import, `splat-list`, splat to point cloud | 2 days | landed |
 | S2 | Splat rendering in the viewport and `render`, look-through over the photograph | 4 days | landed |
 | S3 | Photometric audit: the splat rendered through each view against its photograph | 2 days | pending |
-| P | Python bindings (PyO3, maturin) over cv_core, view_core, the survey, splats and projects | 3 days | pending |
+| P | Python bindings (PyO3, maturin) over cv_core, view_core, the survey, splats and projects | 3 days | P1 landed 2026-09-12; P2 (render, set_config, import_stills) pending |
 | D | Evidence audits for still sets: intake, detection, survey, setup, coverage, photometric, physical | 3 days | pending |
 
 Proposed order: C2, C3 (the survey is the stage the agent starts from and
@@ -756,16 +757,81 @@ as an F64Map for step D.
 ## Step P — Python bindings
 
 `crates/volumetric_py`: a PyO3 module `volumetric` built with maturin
-(abi3), installed into the shim's venv (Python 3.14; confirm PyO3's
-support on landing). Surface, all on numpy types: `detect(gray,
-dictionary)`, `detect_board(gray, spec)`, `solve_pose(camera, markers,
-detections, options)`, `survey(viewset, options) -> (viewset, report)`,
-`ViewSet.load/save` with views, cameras, markers and poses as arrays and
-`view.image()` decoded, `Splat.load(path)` returning its columns,
-`Project.open/run/values`, and `render(...)` returning an image through
-the native offscreen path. The bindings wrap crate functions one to one;
-a feature that exists only in Python is a bug. The shim's tests against
-OpenCV become the bindings' tests.
+(abi3, Python ≥ 3.12; pyo3 0.29 + numpy 0.29, Python 3.14 in the shim's
+venv). The bindings wrap crate functions one to one; a feature that
+exists only in Python is a bug, and so is logic copied out of the CLI:
+where the CLI held the only copy (operator input coercion, asset value
+decoding, add-op naming) it moves into the `volumetric` crate as
+`volumetric::project_edit`, and the CLI calls that. The shim's tests
+against OpenCV become the bindings' tests.
+
+Layout: `Cargo.toml` (`[lib] name = "_volumetric"`, cdylib, `test =
+false` — an `extension-module` cdylib cannot link a test binary, tests
+are pytest), `pyproject.toml` (maturin, `python-source = "python"`,
+module `volumetric._volumetric`), `python/volumetric/__init__.py`
+(re-export only), `src/{lib,project,cv,viewset,splat}.rs`, `tests/*.py`.
+Build: `maturin develop --release -m crates/volumetric_py/Cargo.toml`
+inside the venv (maturin is pip-installed there).
+
+Surface, first increment (P1, landed 2026-09-12; 16 pytest cases, the
+chair demo set surveyed from Python matches the CLI's poses within 4 mm):
+
+- `Project()`, `Project.open(path)`, `.save(path)`, `.to_bytes()`,
+  `Project.from_bytes(b)`; `.asset_ids()`, `.exports`, `.steps()`.
+- `.add_model(wasm, id=None) -> id`; `.add_asset(data, kind, id=None) ->
+  id` with kind one of `lua wgsl config f64map blob viewset splat` (the
+  CLI's names; ViewSet/Splat/F64Map bytes are validated, a JSON dict for
+  `f64map` is encoded).
+- `.add_op(operator, inputs, output=None, export=True) -> [output ids]`:
+  `operator` a bundled name or a path; each input is an asset id (`str`),
+  `None` (unwired), `bytes` (raw), or a JSON-like value (`dict`, `list`,
+  number, string) coerced by the slot's declared type exactly as the CLI's
+  `json:` form is.
+- `.run(remote=None) -> dict[id, Asset]` (the exports); `Asset.id`,
+  `.kind` (the type hint's display name), `.bytes`, `.warnings`, `.value`
+  (F64Map → dict, VecF64 → float64 array, Subspace → dict with `origin`
+  and `basis` arrays, else None), `.mesh()` (FeaMesh/TriMesh → `Mesh`
+  with `nodes` (n,3), `elements` (m,k) uint32, `node_fields` and
+  `element_fields` dicts of (n,c) arrays), `.viewset()`, `.splat()`.
+- `operators() -> [name]`, `operator_info(name) -> dict` (name, version,
+  description, inputs as labels, outputs, docs, variadic).
+- `Gray(array)` from a uint8 (h,w) array, `Gray.decode(bytes)` from a
+  JPEG/PNG; `.array` (h,w) uint8 view copy; `.width/.height`.
+- `detect(gray, families=["5x5_100"], **DetectParams) -> [dict]`: `id,
+  family, corners, rotation, distance, fit_px` (dicts: detections are
+  small, and the shim's code already reads them that way).
+- `observe(gray, swatches="5x5_100", board="survey_card") -> Observed`:
+  `.markers` (Detections), `.corners` (board corners: `id, pixel (2,),
+  fit_px`), `.observations` (the view-set Observations as a dict).
+- `ViewSet.load(path)`, `.decode(bytes)`, `.save(path)`, `.encode()`;
+  `.views` (`View`: `id, camera, camera_to_world (3,4) or None, tags,
+  time, source, shot dict, observations dict, image() -> (h,w,3) uint8
+  decoded from the embedded picture, picture bytes`), `.cameras`
+  (`Camera`: `label width height fx fy cx cy distortion dict`),
+  `.markers` (`id`, `size_m`, `corners (4,3)`), `.board` (spec dict +
+  corners (id, position, sigma)), `.poses()` (n,3,4) with NaN rows for
+  unposed views, `.world_up`, `.provenance` dict.
+- `solve_still(gray, file_bytes, viewset, **StillOptions) -> StillSolve`
+  (`seed` Camera, `seed_source`, `detections`, `pose` (camera_to_world,
+  camera, rms_px, markers used, focal/k1 estimates) or `error`,
+  `warnings`); `survey(viewset, **SurveyOptions) -> (ViewSet, report
+  dict)` where the report is `SurveyReport` as JSON.
+- `Splat.load(path)`, `.decode(bytes)`: `kind, sh_degree, count, means
+  (n,3), scales (n,3), quats (n,4), opacities (n,), sh0 (n,3), sh_rest
+  (n,k,3), normals (n,3) or None, world_up, provenance`.
+- `render_board(...)` from cv_core's synthetic renderer, so the shim's
+  synthetic-scene tests can be ported without OpenCV.
+
+Deferred to P2: `render(...)` through the native offscreen path (needs
+the CLI's render command factored into a library entry first),
+`Project.set_config`, `import_stills`, `ViewSet` mutation (poses from
+Python), `Asset.model` sampling.
+
+Tests (`crates/volumetric_py/tests`, pytest in the shim's venv): a
+cylinder built and run, its mesh bounds checked; a synthetic board
+rendered, detected and observed; a real chairbase still detected and
+solved against `chair_views.vviews`; survey on the ten-view demo set
+reproducing the CLI's numbers.
 
 ## Step D — evidence audits
 

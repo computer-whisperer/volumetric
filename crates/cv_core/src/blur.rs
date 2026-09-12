@@ -13,7 +13,7 @@ use crate::gray::Gray;
 /// Blur across the picture's horizontal and vertical marker edges,
 /// pixels, as the medians over all profiles that fitted; `None` where no
 /// edge of that direction was measurable.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize)]
 pub struct EdgeBlur {
     /// Across edges that run left to right (blur along the picture's y).
     pub horizontal: Option<f64>,

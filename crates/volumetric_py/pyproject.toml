@@ -1,0 +1,21 @@
+[build-system]
+requires = ["maturin>=1.15,<2"]
+build-backend = "maturin"
+
+[project]
+name = "volumetric"
+version = "0.1.0"
+description = "volumetric's kernels from Python: projects, view sets, splats, marker detection and the survey"
+requires-python = ">=3.12"
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.maturin]
+python-source = "python"
+module-name = "volumetric._volumetric"
+features = ["pyo3/extension-module"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

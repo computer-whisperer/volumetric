@@ -11,6 +11,12 @@ The project explores a "model-as-code" paradigm where a 3D physical model is def
 
 ## Project Structure
 
+**From Python:** `crates/volumetric_py` is a PyO3 module (`import volumetric`)
+over the same kernels: build and run projects with exports as numpy arrays,
+read view sets and splats, detect markers, solve stills and run the survey.
+See [its README](crates/volumetric_py/README.md).
+
+
 **Model authoring direction:** use `wgsl_script_operator` for new scripted
 models. Lua is deprecated and retained for existing projects; new modelling
 work and scripting improvements should target WGSL. The WGSL dialect uses

@@ -25,7 +25,8 @@ use crate::linalg::{
 use crate::pnp::{Correspondence, SolveOptions, solve_pose};
 
 /// Solver choices.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct SurveyOptions {
     /// The family the swatches are printed in; other marker observations
     /// (the card's tags) are not points.

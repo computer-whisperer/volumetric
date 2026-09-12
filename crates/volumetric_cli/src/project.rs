@@ -5,10 +5,8 @@ use clap::{Parser, ValueEnum};
 use serde::Serialize;
 use std::path::PathBuf;
 
-use volumetric::{
-    AssetTypeHint, Environment, ExecutionInput, ImportedAsset, OperatorMetadata,
-    OperatorMetadataInput, Project,
-};
+use volumetric::project_edit::{self, InputValue, expected_input_count, input_type_label};
+use volumetric::{AssetTypeHint, Environment, ExecutionInput, OperatorMetadataInput, Project};
 
 use crate::assets::{resolve_model_spec, resolve_operator_spec};
 
@@ -178,46 +176,14 @@ pub fn run_project_add_asset(args: ProjectAddAssetArgs) -> Result<()> {
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
-    let type_hint: AssetTypeHint = args
-        .r#type
-        .unwrap_or(match extension.as_str() {
-            "lua" => AssetTypeArg::Lua,
-            "wgsl" => AssetTypeArg::Wgsl,
-            "cbor" => AssetTypeArg::Config,
-            "vviews" => AssetTypeArg::ViewSet,
-            "vsplat" => AssetTypeArg::Splat,
-            _ => AssetTypeArg::Blob,
-        })
-        .into();
-
-    if type_hint == AssetTypeHint::ViewSet {
-        volumetric_abi::viewset::decode_viewset(&bytes)
-            .map_err(anyhow::Error::msg)
-            .context("Invalid view set asset")?;
-    }
-    if type_hint == AssetTypeHint::Splat {
-        volumetric_abi::splat::decode_splat(&bytes)
-            .map_err(anyhow::Error::msg)
-            .context("Invalid splat asset")?;
-    }
-    if type_hint == AssetTypeHint::F64Map {
-        if extension == "json" {
-            let json: serde_json::Value = serde_json::from_slice(&bytes)
-                .with_context(|| format!("Failed to parse {} as JSON", args.input.display()))?;
-            bytes = encode_json_f64_map(&json, "F64Map asset")?;
-        } else {
-            volumetric_abi::f64_map::decode(&bytes)
-                .map_err(anyhow::Error::msg)
-                .context("Invalid F64Map asset")?;
-        }
-    }
-
-    // Adding a wasm module as lua/blob is almost certainly a mistyped command.
-    if bytes.starts_with(b"\0asm") {
-        anyhow::bail!(
-            "{} is a WASM module; use project-add-model (or project-add-op for operators)",
-            args.input.display()
-        );
+    let type_hint: AssetTypeHint = match args.r#type {
+        Some(kind) => kind.into(),
+        None => project_edit::asset_kind_for_extension(&extension),
+    };
+    if type_hint == AssetTypeHint::F64Map && extension == "json" {
+        let json: serde_json::Value = serde_json::from_slice(&bytes)
+            .with_context(|| format!("Failed to parse {} as JSON", args.input.display()))?;
+        bytes = project_edit::encode_json_f64_map(&json, "F64Map asset")?;
     }
 
     let asset_id_base = args.asset_id.unwrap_or_else(|| {
@@ -227,10 +193,8 @@ pub fn run_project_add_asset(args: ProjectAddAssetArgs) -> Result<()> {
             .unwrap_or("asset")
             .to_string()
     });
-    let asset_id = project.unique_asset_id(&asset_id_base);
-    project
-        .imports_mut()
-        .push(ImportedAsset::new(asset_id.clone(), bytes, Some(type_hint)));
+    let asset_id = project_edit::add_asset(&mut project, &asset_id_base, type_hint, bytes)
+        .with_context(|| format!("{} is not a usable {type_hint} asset", args.input.display()))?;
 
     let output_path = args.output.unwrap_or(args.project);
     save_project(&project, &output_path)?;
@@ -271,272 +235,56 @@ pub struct ProjectAddOpArgs {
     pub no_export: bool,
 }
 
-/// A CLI input spec, parsed but not yet checked against the operator's
-/// declared input slot type.
-enum ParsedInput {
-    Asset(String),
-    Json(serde_json::Value),
-    /// Raw bytes from `file:` or `data:`, with the spec form kept for errors.
-    Bytes(Vec<u8>, &'static str),
-    /// `none`: the slot stays unwired (empty inline bytes, which is what
-    /// the GUI stores for a slot it has nothing to wire and what operators
-    /// with optional inputs test for). Any slot type accepts it; a slot the
-    /// operator requires fails at run time with the operator's message.
-    Unwired,
-}
-
 /// The spelling that leaves a slot unwired. A bare word, so an asset that
 /// happens to be called `none` needs the `asset:` prefix.
 const UNWIRED_SPEC: &str = "none";
 
-fn parse_input(s: &str) -> Result<ParsedInput> {
+/// A CLI input spec — "asset:id", "json:{...}", "file:path", "data:base64",
+/// "none" or a bare asset id — as the value the library coerces.
+fn parse_input(s: &str) -> Result<InputValue> {
     if s == UNWIRED_SPEC {
-        Ok(ParsedInput::Unwired)
+        Ok(InputValue::Unwired)
     } else if let Some(rest) = s.strip_prefix("asset:") {
-        Ok(ParsedInput::Asset(rest.to_string()))
+        Ok(InputValue::Asset(rest.to_string()))
     } else if let Some(rest) = s.strip_prefix("json:") {
         let json_value: serde_json::Value =
             serde_json::from_str(rest).context("Failed to parse JSON")?;
-        Ok(ParsedInput::Json(json_value))
+        Ok(InputValue::Json(json_value))
     } else if let Some(rest) = s.strip_prefix("file:") {
         let bytes =
             std::fs::read(rest).with_context(|| format!("Failed to read file: {}", rest))?;
-        Ok(ParsedInput::Bytes(bytes, "file:"))
+        Ok(InputValue::Bytes(bytes))
     } else if let Some(rest) = s.strip_prefix("data:") {
         use base64::{Engine, engine::general_purpose::STANDARD};
         let bytes = STANDARD
             .decode(rest)
             .context("Failed to decode base64 data")?;
-        Ok(ParsedInput::Bytes(bytes, "data:"))
+        Ok(InputValue::Bytes(bytes))
     } else {
         // Default: treat as asset ID
-        Ok(ParsedInput::Asset(s.to_string()))
+        Ok(InputValue::Asset(s.to_string()))
     }
-}
-
-/// Short human label for a declared operator input slot type.
-pub fn input_type_label(input: &OperatorMetadataInput) -> String {
-    match input {
-        OperatorMetadataInput::ModelWASM => "ModelWASM".to_string(),
-        OperatorMetadataInput::CBORConfiguration(_) => "CBOR configuration".to_string(),
-        OperatorMetadataInput::LuaSource(_) => "Lua source".to_string(),
-        OperatorMetadataInput::WgslSource(_) => "WGSL source".to_string(),
-        OperatorMetadataInput::F64Map => "F64Map".to_string(),
-        OperatorMetadataInput::Blob => "Blob".to_string(),
-        OperatorMetadataInput::VecF64(dim) => format!("VecF64({dim})"),
-        OperatorMetadataInput::FeaMesh => "FeaMesh".to_string(),
-        OperatorMetadataInput::TriMesh => "TriMesh".to_string(),
-        OperatorMetadataInput::Subspace => "Subspace".to_string(),
-        OperatorMetadataInput::ViewSet => "ViewSet".to_string(),
-        OperatorMetadataInput::Splat => "Splat".to_string(),
-    }
-}
-
-/// One line per declared input slot, for count-mismatch errors.
-fn describe_declared_inputs(metadata: &OperatorMetadata) -> String {
-    metadata
-        .inputs
-        .iter()
-        .enumerate()
-        .map(|(i, input)| {
-            let name = metadata
-                .input_name(i)
-                .map(|n| format!("{n} "))
-                .unwrap_or_default();
-            let arity = if metadata.variadic_slot() == Some(i) {
-                ", one or more"
-            } else {
-                ""
-            };
-            format!("  [{i}] {name}({}{arity})", input_type_label(input))
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// "3" or "at least 3": how many inputs the operator's declaration takes.
-fn expected_input_count(metadata: &OperatorMetadata) -> String {
-    match metadata.variadic_slot() {
-        Some(_) => format!("at least {}", metadata.inputs.len()),
-        None => metadata.inputs.len().to_string(),
-    }
-}
-
-/// Check a parsed input against its declared slot type, coercing where the
-/// intent is unambiguous (JSON array -> VecF64 raw bytes, JSON string ->
-/// Lua source bytes). Asset references always pass — they resolve at run
-/// time.
-fn coerce_input(
-    parsed: ParsedInput,
-    slot: &OperatorMetadataInput,
-    slot_desc: &str,
-) -> Result<ExecutionInput> {
-    let inline = |bytes| Ok(ExecutionInput::Inline(bytes));
-    match (parsed, slot) {
-        (ParsedInput::Asset(id), _) => Ok(ExecutionInput::AssetRef(id)),
-        (ParsedInput::Unwired, _) => inline(Vec::new()),
-
-        // VecF64: raw little-endian f64s. Accept a JSON array of the right
-        // arity, or raw bytes of exactly the right length.
-        (
-            ParsedInput::Json(serde_json::Value::Array(items)),
-            OperatorMetadataInput::VecF64(dim),
-        ) => {
-            if items.len() != *dim {
-                anyhow::bail!(
-                    "{slot_desc} expects VecF64({dim}) but the JSON array has {} element(s)",
-                    items.len()
-                );
-            }
-            let mut bytes = Vec::with_capacity(dim * 8);
-            for (i, item) in items.iter().enumerate() {
-                let v = item.as_f64().with_context(|| {
-                    format!("{slot_desc}: JSON array element {i} ({item}) is not a number")
-                })?;
-                bytes.extend_from_slice(&v.to_le_bytes());
-            }
-            inline(bytes)
-        }
-        (ParsedInput::Json(other), OperatorMetadataInput::VecF64(dim)) => {
-            anyhow::bail!(
-                "{slot_desc} expects VecF64({dim}): pass json:[x,y,..] with {dim} numbers, \
-                 got JSON {other}"
-            );
-        }
-        (ParsedInput::Bytes(bytes, form), OperatorMetadataInput::VecF64(dim)) => {
-            if bytes.len() != dim * 8 {
-                anyhow::bail!(
-                    "{slot_desc} expects VecF64({dim}) = {} raw little-endian bytes, but the \
-                     {form} input has {} bytes (tip: json:[x,y,..] also works)",
-                    dim * 8,
-                    bytes.len()
-                );
-            }
-            inline(bytes)
-        }
-
-        // CBOR configuration: JSON converts, raw bytes pass through as
-        // pre-encoded CBOR.
-        (ParsedInput::Json(value), OperatorMetadataInput::CBORConfiguration(_)) => {
-            let mut cbor_bytes = Vec::new();
-            ciborium::into_writer(&value, &mut cbor_bytes)
-                .context("Failed to convert JSON to CBOR")?;
-            inline(cbor_bytes)
-        }
-
-        (ParsedInput::Json(value), OperatorMetadataInput::F64Map) => {
-            inline(encode_json_f64_map(&value, slot_desc)?)
-        }
-
-        // Lua source: a JSON string is the script text; raw bytes pass.
-        (
-            ParsedInput::Json(serde_json::Value::String(source)),
-            OperatorMetadataInput::LuaSource(_),
-        ) => inline(source.into_bytes()),
-
-        (ParsedInput::Bytes(bytes, _), OperatorMetadataInput::F64Map) => {
-            volumetric_abi::f64_map::decode(&bytes)
-                .map_err(anyhow::Error::msg)
-                .with_context(|| format!("{slot_desc} is not a valid F64Map"))?;
-            inline(bytes)
-        }
-
-        (ParsedInput::Bytes(bytes, _), OperatorMetadataInput::ViewSet) => {
-            volumetric_abi::viewset::decode_viewset(&bytes)
-                .map_err(anyhow::Error::msg)
-                .with_context(|| format!("{slot_desc} is not a valid view set"))?;
-            inline(bytes)
-        }
-
-        (ParsedInput::Bytes(bytes, _), OperatorMetadataInput::Splat) => {
-            volumetric_abi::splat::decode_splat(&bytes)
-                .map_err(anyhow::Error::msg)
-                .with_context(|| format!("{slot_desc} is not a valid splat"))?;
-            inline(bytes)
-        }
-
-        // Binary slot types can't be built from JSON literals.
-        (ParsedInput::Json(_), slot_type) => {
-            anyhow::bail!(
-                "{slot_desc} expects {} — pass an asset reference (asset:<id>) or raw bytes \
-                 (file:<path> / data:<base64>), not JSON",
-                input_type_label(slot_type)
-            );
-        }
-
-        (ParsedInput::Bytes(bytes, _), _) => inline(bytes),
-    }
-}
-
-fn encode_json_f64_map(value: &serde_json::Value, context: &str) -> Result<Vec<u8>> {
-    let serde_json::Value::Object(entries) = value else {
-        anyhow::bail!("{context} expects a JSON object whose values are finite numbers");
-    };
-    let mut values = volumetric_abi::f64_map::F64Map::new();
-    for (key, value) in entries {
-        let number = value
-            .as_f64()
-            .with_context(|| format!("{context}: value for `{key}` is not a number"))?;
-        values.insert(key.clone(), number);
-    }
-    volumetric_abi::f64_map::encode(&values)
-        .map_err(anyhow::Error::msg)
-        .with_context(|| format!("{context} is invalid"))
 }
 
 pub fn run_project_add_op(args: ProjectAddOpArgs) -> Result<()> {
     let mut project = Project::load_from_file(&args.project).context("Failed to load project")?;
     let (op_name, op_bytes) = resolve_operator_spec(&args.operator)?;
-
-    let metadata = volumetric::operator_metadata_from_wasm_bytes(&op_bytes)
-        .map_err(|e| anyhow::anyhow!("Failed to read operator metadata: {e}"))?;
-    let count = args.input.len();
-    if !metadata.accepts_input_count(count) {
-        anyhow::bail!(
-            "{op_name} expects {} input(s), got {count}:\n{}\n(pass `{UNWIRED_SPEC}` for an \
-             optional slot you want to leave unwired)",
-            expected_input_count(&metadata),
-            describe_declared_inputs(&metadata)
-        );
-    }
-
-    let inputs: Vec<ExecutionInput> = args
+    let inputs = args
         .input
         .iter()
-        .enumerate()
-        .map(|(idx, spec)| {
-            let slot = metadata
-                .input_type(idx, count)
-                .expect("input count was checked against the declaration");
-            let name = metadata
-                .input_label(idx, count)
-                .map(|n| format!(" ({n})"))
-                .unwrap_or_default();
-            let slot_desc = format!("input [{idx}]{name}");
-            coerce_input(parse_input(spec)?, slot, &slot_desc)
-        })
-        .collect::<Result<_>>()?;
-
-    // Get primary input for naming
-    let primary_input = inputs.iter().find_map(|i| match i {
-        ExecutionInput::AssetRef(id) => Some(id.as_str()),
-        _ => None,
-    });
-
-    let output_id = args
-        .output_id
-        .unwrap_or_else(|| project.default_output_name(&op_name, primary_input));
-
-    // One output id per declared output: --output-id names slot 0, the
-    // rest get its declared-name suffixes (e.g. `card`, `card_plate`).
-    let output_ids = project.output_ids_for(output_id, &metadata);
-
-    let import_id = project.insert_operation(&op_name, op_bytes, inputs, output_ids.clone());
-
-    // Remove the auto-added exports if --no-export was specified
-    if args.no_export {
-        project.exports_mut().retain(|id| !output_ids.contains(id));
-    }
+        .map(|spec| parse_input(spec))
+        .collect::<Result<Vec<_>>>()?;
+    let project_edit::AddedOperation {
+        import_id,
+        output_ids,
+    } = project_edit::add_operation(
+        &mut project,
+        &op_name,
+        op_bytes,
+        inputs,
+        args.output_id,
+        !args.no_export,
+    )?;
 
     let output_path = args.output.unwrap_or(args.project);
     save_project(&project, &output_path)?;
@@ -813,35 +561,6 @@ struct RunExport {
 /// and `basis` rows in the ambient space), an F64Map as its entries, a
 /// VecF64 as its components. Bulk values (models, meshes, blobs) have no
 /// JSON form and yield `None`, as does a value that fails to decode.
-pub(crate) fn asset_value_json(asset: &volumetric::LoadedAsset) -> Option<serde_json::Value> {
-    use volumetric::AssetTypeHint;
-    match asset.type_hint()? {
-        AssetTypeHint::Subspace => {
-            let subspace = volumetric::subspace::decode_subspace(asset.data()).ok()?;
-            let basis: Vec<&[f64]> = subspace.basis.chunks(subspace.ambient().max(1)).collect();
-            Some(serde_json::json!({
-                "dimensions": subspace.dimensions,
-                "rank": subspace.rank(),
-                "origin": subspace.origin,
-                "basis": basis,
-            }))
-        }
-        AssetTypeHint::F64Map => {
-            let map = volumetric::f64_map::decode(asset.data()).ok()?;
-            serde_json::to_value(map).ok()
-        }
-        AssetTypeHint::VecF64(_) => {
-            let values: Vec<f64> = asset
-                .data()
-                .chunks_exact(8)
-                .map(|chunk| f64::from_le_bytes(chunk.try_into().expect("8-byte chunk")))
-                .collect();
-            Some(serde_json::Value::from(values))
-        }
-        _ => None,
-    }
-}
-
 pub fn run_project_run(args: ProjectRunArgs) -> Result<()> {
     let project = Project::load_from_file(&args.project).context("Failed to load project")?;
 
@@ -856,7 +575,7 @@ pub fn run_project_run(args: ProjectRunArgs) -> Result<()> {
                 .map(|h| h.to_string())
                 .unwrap_or_else(|| "Binary".to_string()),
             size_bytes: e.data().len(),
-            value: asset_value_json(e),
+            value: project_edit::asset_value_json(e),
         })
         .collect();
 
@@ -1384,196 +1103,24 @@ pub fn run_project_set_config(args: ProjectSetConfigArgs) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn vec3_slot() -> OperatorMetadataInput {
-        OperatorMetadataInput::VecF64(3)
-    }
-
-    /// `project-run --json` carries the numbers of small values so a reader
-    /// never needs a CBOR decoder: a Subspace as origin plus basis rows, an
-    /// F64Map as its entries, a VecF64 as its components; bulk values stay
-    /// size-only.
+    /// The spec forms: prefixes pick the value kind, a bare word is an
+    /// asset id, and `none` is reserved (an asset called `none` takes the
+    /// prefix).
     #[test]
-    fn small_values_decode_to_json() {
-        use volumetric::AssetTypeHint;
-        let asset = |type_hint, data: Vec<u8>| {
-            volumetric::LoadedAsset::from_parts("v".to_string(), data, Some(type_hint), vec![])
-        };
-
-        let plane = volumetric::subspace::Subspace {
-            dimensions: 3,
-            origin: vec![1.0, 2.0, 3.0],
-            basis: vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
-        };
-        let value = asset_value_json(&asset(
-            AssetTypeHint::Subspace,
-            volumetric::subspace::encode_subspace(&plane),
-        ))
-        .expect("subspace decodes");
-        assert_eq!(value["dimensions"], 3);
-        assert_eq!(value["rank"], 2);
-        assert_eq!(value["origin"], serde_json::json!([1.0, 2.0, 3.0]));
-        assert_eq!(
-            value["basis"],
-            serde_json::json!([[1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
-        );
-
-        let mut map = volumetric::f64_map::F64Map::new();
-        map.insert("radius".to_string(), 0.0235);
-        map.insert("inliers".to_string(), 6189.0);
-        let value = asset_value_json(&asset(
-            AssetTypeHint::F64Map,
-            volumetric::f64_map::encode(&map).unwrap(),
-        ))
-        .expect("f64 map decodes");
-        assert_eq!(
-            value,
-            serde_json::json!({"inliers": 6189.0, "radius": 0.0235})
-        );
-
-        let mut bytes = Vec::new();
-        for v in [0.5f64, -1.0, 2.0] {
-            bytes.extend_from_slice(&v.to_le_bytes());
-        }
-        let value = asset_value_json(&asset(AssetTypeHint::VecF64(3), bytes)).expect("vec decodes");
-        assert_eq!(value, serde_json::json!([0.5, -1.0, 2.0]));
-
-        assert!(asset_value_json(&asset(AssetTypeHint::Binary, vec![1, 2, 3])).is_none());
-        assert!(asset_value_json(&asset(AssetTypeHint::Subspace, vec![0xff])).is_none());
-    }
-
-    /// Count-mismatch errors name the variadic slot and the "at least"
-    /// arity, so the hint matches what `--input` repetition means.
-    #[test]
-    fn variadic_declarations_describe_their_arity() {
-        let metadata = OperatorMetadata {
-            name: "nary".to_string(),
-            version: "0.0.0".to_string(),
-            display_name: String::new(),
-            description: String::new(),
-            category: String::new(),
-            icon_svg: String::new(),
-            docs: String::new(),
-            inputs: vec![
-                OperatorMetadataInput::ModelWASM,
-                OperatorMetadataInput::CBORConfiguration("{ op: tstr }".to_string()),
-            ],
-            variadic_input: Some(0),
-            input_names: vec!["Model".to_string(), "Config".to_string()],
-            outputs: vec![],
-            output_names: vec![],
-        };
-        assert_eq!(expected_input_count(&metadata), "at least 2");
-        let described = describe_declared_inputs(&metadata);
+    fn specs_parse_to_input_values() {
+        assert!(matches!(parse_input("none").unwrap(), InputValue::Unwired));
         assert!(
-            described.contains("[0] Model (ModelWASM, one or more)"),
-            "{described}"
+            matches!(parse_input("asset:none").unwrap(), InputValue::Asset(ref id) if id == "none")
         );
+        assert!(matches!(parse_input("post").unwrap(), InputValue::Asset(ref id) if id == "post"));
+        assert!(matches!(
+            parse_input("json:[0.25,-0.26,0.25]").unwrap(),
+            InputValue::Json(serde_json::Value::Array(ref items)) if items.len() == 3
+        ));
         assert!(
-            described.contains("[1] Config (CBOR configuration)"),
-            "{described}"
+            matches!(parse_input("data:AQID").unwrap(), InputValue::Bytes(ref b) if b == &[1, 2, 3])
         );
-    }
-
-    #[test]
-    fn json_arrays_coerce_to_vecf64_bytes() {
-        let parsed = parse_input("json:[0.25,-0.26,0.25]").unwrap();
-        let ExecutionInput::Inline(bytes) =
-            coerce_input(parsed, &vec3_slot(), "input [1]").unwrap()
-        else {
-            panic!("expected inline bytes");
-        };
-        assert_eq!(bytes.len(), 24);
-        let decoded: Vec<f64> = bytes
-            .chunks_exact(8)
-            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
-            .collect();
-        assert_eq!(decoded, vec![0.25, -0.26, 0.25]);
-    }
-
-    #[test]
-    fn vecf64_inputs_reject_shape_mismatches() {
-        let wrong_arity = parse_input("json:[1,2]").unwrap();
-        let err = coerce_input(wrong_arity, &vec3_slot(), "input [1]")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("2 element(s)"), "{err}");
-
-        let not_an_array = parse_input("json:{\"x\":1}").unwrap();
-        assert!(coerce_input(not_an_array, &vec3_slot(), "input [1]").is_err());
-
-        let wrong_len = ParsedInput::Bytes(vec![0u8; 23], "data:");
-        let err = coerce_input(wrong_len, &vec3_slot(), "input [1]")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("23 bytes"), "{err}");
-    }
-
-    #[test]
-    fn none_leaves_any_slot_unwired() {
-        for slot in [
-            OperatorMetadataInput::Subspace,
-            OperatorMetadataInput::ModelWASM,
-            OperatorMetadataInput::Blob,
-            OperatorMetadataInput::CBORConfiguration(String::new()),
-        ] {
-            let parsed = parse_input("none").unwrap();
-            let input = coerce_input(parsed, &slot, "input [1]").unwrap();
-            assert!(
-                matches!(&input, ExecutionInput::Inline(bytes) if bytes.is_empty()),
-                "{slot:?} -> {input:?}"
-            );
-        }
-        // The bare word is reserved; an asset called `none` takes the prefix.
-        let parsed = parse_input("asset:none").unwrap();
-        assert!(matches!(parsed, ParsedInput::Asset(ref id) if id == "none"));
-    }
-
-    #[test]
-    fn json_is_rejected_for_binary_slots() {
-        let parsed = parse_input("json:{\"op\":\"union\"}").unwrap();
-        let err = coerce_input(parsed, &OperatorMetadataInput::ModelWASM, "input [0]")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("ModelWASM"), "{err}");
-    }
-
-    #[test]
-    fn config_and_lua_slots_accept_json() {
-        let config = parse_input("json:{\"op\":\"intersect\"}").unwrap();
-        let ExecutionInput::Inline(cbor) = coerce_input(
-            config,
-            &OperatorMetadataInput::CBORConfiguration(String::new()),
-            "c",
-        )
-        .unwrap() else {
-            panic!("expected inline");
-        };
-        let value: ciborium::value::Value = ciborium::from_reader(cbor.as_slice()).unwrap();
-        assert!(format!("{value:?}").contains("intersect"));
-
-        let lua = parse_input("json:\"return 1\"").unwrap();
-        let ExecutionInput::Inline(source) =
-            coerce_input(lua, &OperatorMetadataInput::LuaSource(String::new()), "l").unwrap()
-        else {
-            panic!("expected inline");
-        };
-        assert_eq!(source, b"return 1");
-    }
-
-    #[test]
-    fn f64_map_slots_accept_numeric_json_objects() {
-        let parsed =
-            parse_input("json:{\"spinner.bearing_pitch\":0.04,\"global.scale\":2}").unwrap();
-        let ExecutionInput::Inline(bytes) =
-            coerce_input(parsed, &OperatorMetadataInput::F64Map, "parameters").unwrap()
-        else {
-            panic!("expected inline F64Map");
-        };
-        let values = volumetric_abi::f64_map::decode(&bytes).unwrap();
-        assert_eq!(values["spinner.bearing_pitch"], 0.04);
-        assert_eq!(values["global.scale"], 2.0);
-
-        let invalid = parse_input("json:{\"x\":\"not numeric\"}").unwrap();
-        assert!(coerce_input(invalid, &OperatorMetadataInput::F64Map, "parameters").is_err());
+        assert!(parse_input("json:{not json").is_err());
+        assert!(parse_input("file:/no/such/file").is_err());
     }
 }
