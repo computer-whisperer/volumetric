@@ -24,6 +24,8 @@ use volumetric_renderer as renderer;
 
 mod assembly;
 mod gizmo;
+
+pub use assembly::{joint_axis_half, joint_axis_lines, joint_axis_style};
 mod scene;
 mod splats;
 mod views;
@@ -432,6 +434,32 @@ pub struct PreviewEntity {
     /// under. An assembly keys each part by its unposed mesh, so a state
     /// change re-uploads nothing.
     pub mesh_keys: Vec<Option<[u8; 32]>>,
+    /// For an assembly: the value itself and which part each `scene.meshes`
+    /// entry belongs to, so a host can re-pose the meshes for a state of
+    /// its own (a drag) and hand the state back.
+    pub articulated: Option<Arc<Articulated>>,
+}
+
+/// An assembly behind a preview entity.
+pub struct Articulated {
+    pub assembly: Arc<volumetric::mechanism::Assembly>,
+    /// The part index of each of the entity's meshes, in mesh order.
+    pub part_of_mesh: Vec<usize>,
+}
+
+impl Articulated {
+    /// The transform of each mesh at `state` (the meshes' own order).
+    pub fn mesh_transforms(
+        &self,
+        state: &volumetric::f64_map::F64Map,
+    ) -> Result<Vec<glam::Mat4>, String> {
+        let poses = self.assembly.mechanism.pose(state)?;
+        Ok(self
+            .part_of_mesh
+            .iter()
+            .map(|&part| glam::Mat4::from_cols_array(&poses[part].to_cols_array_f32()))
+            .collect())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

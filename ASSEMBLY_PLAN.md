@@ -246,9 +246,44 @@ variant and everything downstream, which only calls `pose` and
   assembly's own bounds and drawn as retained lines; nothing needs the
   per-frame form yet).
 
+## P3 as built (2026-09-12)
+
+- `Mechanism::pull(state, part, local, target, iterations)`: the state
+  that brings a point of a part (in the part's rest coordinates) nearest a
+  world target, Levenberg-Marquardt on `velocity` with Marquardt's
+  per-joint diagonal damping (a shared scalar damping crushed the
+  per-degree revolute rows under the per-metre prismatic ones), every step
+  clamped to the ranges. `clamp_state`. Python `Mechanism.pull`.
+- Preview: `PreviewEntity.articulated` (`Articulated { assembly,
+  part_of_mesh }`, `mesh_transforms(state)`), `joint_axis_lines`,
+  `joint_axis_half`, `joint_axis_style` exported.
+- Session: the primary button pressed over a part of a resident
+  assembly, when the control scheme leaves that button to the scene
+  (every scheme but Maya's Alt-drag), starts a part drag: the last
+  frame's camera gives the pointer ray, the nearest triangle hit (all
+  resident assemblies, at their current, possibly overridden, poses)
+  names the part and the grabbed point, and each pointer move pulls the
+  grabbed point to the pointer on the plane of the grab (same NDC depth)
+  with six solver steps, drawing the parts under the solved poses and the
+  axes as immediate lines at once. Release hands the state to the app;
+  the override keeps drawing the dragged pose until the rebuilt entity
+  (a new revision) lands.
+- App: `apply_assembly_state` writes the state into the inline F64Map of
+  the step producing the output (a routed state is refused with a status
+  line), refreshes an open editor's form, and marks the project dirty so
+  the ordinary auto-rebuild re-runs the assemble step. Viewport hint:
+  "drag a part to pose it".
+- Tests: `pull` (reaches, clamps, ignores a point on the axis, refuses a
+  non-part); the pointer ray and the mesh hit against an orthographic
+  camera; the dragged state landing in the assemble step's slot with the
+  form refreshed and the project dirty.
+- Not done: per-part resolution scaling (each part still meshes at its
+  own grid over its own bounds; fine at the default 64, several times the
+  fused model's cost at 256).
+
 ## Ledger
 
-- 2026-09-12: ratified; P1 landed 203fbca; P2 landed 79367af.
+- 2026-09-12: ratified; P1 landed 203fbca; P2 landed 79367af; P3 landed (commit below).
 - 2026-09-12: the viewport never requested an Assembly (its request
   filter kept its own kind list): fixed f5a53ad, the three copies of the
   list collapsed onto `runtime_asset_is_renderable`, pinned by a test.

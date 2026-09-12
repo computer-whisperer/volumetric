@@ -570,6 +570,126 @@ impl Mechanism {
     }
 }
 
+impl Mechanism {
+    /// Every state clamped into its joint's range.
+    pub fn clamp_state(&self, state: &F64Map) -> F64Map {
+        state
+            .iter()
+            .map(|(key, value)| {
+                let clamped = match self.joints.iter().find(|j| j.name == *key) {
+                    Some(joint) => value.clamp(joint.min, joint.max),
+                    None => *value,
+                };
+                (key.clone(), clamped)
+            })
+            .collect()
+    }
+
+    /// The state that brings `local`, a point of `part` in the part's own
+    /// (rest) coordinates, as near `target` (world) as the joints allow,
+    /// starting from `state`: Levenberg-Marquardt on [`velocity`]
+    /// (`velocity`) with per-joint damping, `iterations` steps at most,
+    /// every step clamped to the ranges.
+    /// This is what a drag solves each time the pointer moves.
+    pub fn pull(
+        &self,
+        state: &F64Map,
+        part: &str,
+        local: [f64; 3],
+        target: [f64; 3],
+        iterations: usize,
+    ) -> Result<F64Map, String> {
+        let index = self
+            .parts
+            .iter()
+            .position(|p| p == part)
+            .ok_or_else(|| format!("`{part}` is not a part of the mechanism"))?;
+        let keys: Vec<String> = self.state_keys().iter().map(|k| k.to_string()).collect();
+        let mut state = self.clamp_state(state);
+        for key in &keys {
+            let default = self.joints.iter().find(|j| j.name == *key).unwrap().default;
+            state.entry(key.clone()).or_insert(default);
+        }
+        for _ in 0..iterations {
+            let x = self.pose(&state)?[index].apply(local);
+            let r = [target[0] - x[0], target[1] - x[1], target[2] - x[2]];
+            let miss = (r[0] * r[0] + r[1] * r[1] + r[2] * r[2]).sqrt();
+            if miss < 1e-9 {
+                break;
+            }
+            let j = self.velocity(&state, part, x)?;
+            // Normal equations in the joints, (JᵀJ + Λ) Δq = Jᵀ r, with
+            // Marquardt's diagonal damping Λ = μ diag(JᵀJ) so a joint in
+            // degrees and one in metres are damped alike (a shared scalar
+            // would crush whichever has the smaller unit).
+            let n = keys.len();
+            let mut a = vec![0.0; n * n];
+            let mut b = vec![0.0; n];
+            for (p, jp) in j.iter().enumerate() {
+                b[p] = jp[0] * r[0] + jp[1] * r[1] + jp[2] * r[2];
+                for (q, jq) in j.iter().enumerate() {
+                    a[p * n + q] = jp[0] * jq[0] + jp[1] * jq[1] + jp[2] * jq[2];
+                }
+            }
+            let largest = (0..n).map(|p| a[p * n + p]).fold(0.0, f64::max);
+            if largest <= 0.0 {
+                break;
+            }
+            for p in 0..n {
+                a[p * n + p] += 1e-3 * a[p * n + p] + 1e-12 * largest;
+            }
+            let Some(dq) = solve_dense(a, b) else {
+                break;
+            };
+            for (key, dq) in keys.iter().zip(dq) {
+                if let Some(value) = state.get_mut(key) {
+                    *value += dq;
+                }
+            }
+            state = self.clamp_state(&state);
+        }
+        Ok(state)
+    }
+}
+
+/// `a x = b` for a dense n x n system (row major) by Gaussian elimination
+/// with partial pivoting; `None` when singular.
+fn solve_dense(mut a: Vec<f64>, mut b: Vec<f64>) -> Option<Vec<f64>> {
+    let n = b.len();
+    for col in 0..n {
+        let pivot =
+            (col..n).max_by(|&p, &q| a[p * n + col].abs().total_cmp(&a[q * n + col].abs()))?;
+        if a[pivot * n + col].abs() < 1e-300 {
+            return None;
+        }
+        if pivot != col {
+            for k in 0..n {
+                a.swap(pivot * n + k, col * n + k);
+            }
+            b.swap(pivot, col);
+        }
+        for row in col + 1..n {
+            let f = a[row * n + col] / a[col * n + col];
+            if f == 0.0 {
+                continue;
+            }
+            for k in col..n {
+                a[row * n + k] -= f * a[col * n + k];
+            }
+            b[row] -= f * b[col];
+        }
+    }
+    let mut x = vec![0.0; n];
+    for row in (0..n).rev() {
+        let mut sum = b[row];
+        for k in row + 1..n {
+            sum -= a[row * n + k] * x[k];
+        }
+        x[row] = sum / a[row * n + row];
+    }
+    x.iter().all(|v| v.is_finite()).then_some(x)
+}
+
 /// CBOR-encode a mechanism.
 pub fn encode_mechanism(mechanism: &Mechanism) -> Vec<u8> {
     let mut out = Vec::new();
@@ -941,6 +1061,42 @@ mod tests {
         let column = mech.velocity(&base, "column", [1.0, 1.0, 0.0]).unwrap();
         assert_eq!(column[1], [0.0; 3]);
         assert_eq!(column[2], [0.0; 3]);
+    }
+
+    #[test]
+    fn pull_turns_the_joints_that_reach_the_target_and_stays_in_range() {
+        let mech = chair();
+        // A seat point 1 m out along x at rest, pulled to +y: the swivel
+        // turns a quarter turn (the tilt axis is along x and cannot help).
+        let pulled = mech
+            .pull(&F64Map::new(), "seat", [2.0, 0.0, 1.0], [1.0, 1.0, 1.0], 20)
+            .unwrap();
+        assert!((pulled["swivel"] - 90.0).abs() < 1e-6, "{pulled:?}");
+        assert!(pulled["tilt"].abs() < 1e-6, "{pulled:?}");
+        // Pulled straight up beyond the lift's 0.2 m range: the lift stops
+        // at its maximum and the rest of the miss stays.
+        let pulled = mech
+            .pull(&F64Map::new(), "seat", [2.0, 0.0, 1.0], [2.0, 0.0, 2.0], 20)
+            .unwrap();
+        assert!((pulled["lift"] - 0.2).abs() < 1e-9, "{pulled:?}");
+        // The rest point of the column can be pulled nowhere useful: the
+        // column has only the swivel, and a point on its axis has no
+        // velocity, so the state stays put.
+        let pulled = mech
+            .pull(
+                &F64Map::new(),
+                "column",
+                [1.0, 0.0, 0.5],
+                [1.0, 0.0, 3.0],
+                5,
+            )
+            .unwrap();
+        assert_eq!(pulled["swivel"], 0.0);
+        assert!(
+            mech.pull(&F64Map::new(), "wheel", [0.0; 3], [0.0; 3], 1)
+                .unwrap_err()
+                .contains("not a part")
+        );
     }
 
     #[test]

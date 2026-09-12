@@ -153,6 +153,28 @@ impl Mechanism {
         array2(py, rows.into_iter().flatten().collect(), 3)
     }
 
+    /// The state that brings `local`, a point of `part` in the part's own
+    /// (rest) coordinates, as near `target` (world) as the joints allow,
+    /// from `state` (the assembly's defaults when omitted): what a drag
+    /// solves each time the pointer moves.
+    #[pyo3(signature = (part, local, target, state=None, iterations=8))]
+    fn pull<'py>(
+        &self,
+        py: Python<'py>,
+        part: &str,
+        local: [f64; 3],
+        target: [f64; 3],
+        state: Option<&Bound<'py, PyDict>>,
+        iterations: usize,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let state = self.state_of(state)?;
+        let pulled = self
+            .inner
+            .pull(&state, part, local, target, iterations)
+            .map_err(invalid)?;
+        to_py(py, &pulled)
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "Mechanism({} parts, {} joints, states {:?})",

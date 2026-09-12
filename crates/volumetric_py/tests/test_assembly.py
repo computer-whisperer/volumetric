@@ -50,6 +50,11 @@ def test_mechanism_and_assembly_round_trip_with_kinematics():
     np.testing.assert_allclose(vel[0], [-3.0 * np.pi / 180.0, 0.0, 0.0], atol=1e-12)
     np.testing.assert_allclose(mech.velocity("a", [1.0, 0.0, 0.0]), [[0.0, 0.0, 0.0]])
 
+    # Pulling b's rest point (3, 0, 0) to (0, 3, 0) turns the swivel a
+    # quarter turn; beyond the range it stops at the limit.
+    pulled = mech.pull("b", [3.0, 0.0, 0.0], [0.0, 3.0, 0.0], iterations=40)
+    assert abs(pulled["swivel"] - 90.0) < 1e-6
+
     asm = out["chair"].assembly()
     assert out["chair"].kind == "Assembly" and out["chair_model"].kind == "Model"
     assert asm.parts == ["a", "b"] and len(asm) == 2

@@ -3067,6 +3067,60 @@ impl VolumetricUiV2 {
         Some((metadata, hash))
     }
 
+    /// A state dragged in the viewport for an assembly output: written
+    /// into the inline F64Map of the step that produces it, so the
+    /// ordinary edit path re-runs the project with it. A state routed
+    /// from another asset is left alone (the drag then shows but cannot
+    /// stick), and the status says so.
+    pub(crate) fn apply_assembly_state(
+        &mut self,
+        asset_id: &str,
+        state: volumetric::f64_map::F64Map,
+    ) {
+        let Some(step_idx) = self
+            .project
+            .timeline()
+            .iter()
+            .position(|step| step.outputs.iter().any(|output| output == asset_id))
+        else {
+            return;
+        };
+        let step = &self.project.timeline()[step_idx];
+        let Some(metadata) = self.operator_metadata_cached(&step.operator_id) else {
+            return;
+        };
+        let count = step.inputs.len();
+        let Some(slot) = metadata
+            .inputs
+            .iter()
+            .position(|input| matches!(input, OperatorMetadataInput::F64Map))
+        else {
+            return;
+        };
+        let input_idx = metadata.input_of_slot(slot, count);
+        if !matches!(step.inputs.get(input_idx), Some(ExecutionInput::Inline(_))) {
+            self.status = format!("{asset_id}: the state is routed from an asset; edit that");
+            return;
+        }
+        let Ok(bytes) = volumetric::f64_map::encode(&state) else {
+            return;
+        };
+        if let Some(step) = self.project.timeline_mut().get_mut(step_idx)
+            && let Some(input) = step.inputs.get_mut(input_idx)
+        {
+            *input = ExecutionInput::Inline(bytes);
+        }
+        if self.step_edit.as_ref().map(|edit| edit.step_idx) == Some(step_idx) {
+            self.step_edit = self.build_step_edit(step_idx);
+        }
+        let summary: Vec<String> = state
+            .iter()
+            .map(|(key, value)| format!("{key} {value:.3}"))
+            .collect();
+        self.status = format!("{asset_id}: {}", summary.join(", "));
+        self.mark_project_dirty();
+    }
+
     /// The bytes of a declared asset: a materialized step output from the
     /// last run, else an import.
     fn declared_asset_bytes(&self, id: &str) -> Option<Arc<Vec<u8>>> {
@@ -5293,7 +5347,7 @@ fn export_layer(app: &VolumetricUiV2) -> Option<El> {
                     .height(Size::Fixed(320.0)),
             );
             body.push(
-                text("drag to orbit · shift-drag to pan · wheel to zoom")
+                text("drag to orbit · shift-drag to pan · wheel to zoom · drag a part to pose it")
                     .caption()
                     .muted(),
             );
@@ -8724,6 +8778,60 @@ mod tests {
             app.output_render("chair").summary(),
             "assembly · ASN2 · 64^3"
         );
+    }
+
+    #[test]
+    fn a_dragged_state_lands_in_the_assemble_steps_slot() {
+        use volumetric::mechanism::{Axis, Joint, JointKind, Mechanism, encode_mechanism};
+        let mut app = VolumetricUiV2::default();
+        add_operator_click(&mut app, "assemble_operator");
+        let mechanism = Mechanism::new(
+            vec!["a".to_string()],
+            vec![Joint {
+                name: "slide".to_string(),
+                kind: JointKind::Prismatic,
+                parent: "world".to_string(),
+                child: "a".to_string(),
+                axis: Some(Axis {
+                    origin: [0.0; 3],
+                    direction: [1.0, 0.0, 0.0],
+                }),
+                min: 0.0,
+                max: 2.0,
+                default: 0.0,
+                drive: None,
+            }],
+        );
+        app.project
+            .imports_mut()
+            .push(volumetric::ImportedAsset::new(
+                "mech".to_string(),
+                encode_mechanism(&mechanism),
+                Some(AssetTypeHint::Mechanism),
+            ));
+        app.set_step_model_input(0, 0, "mech");
+        app.step_edit = app.build_step_edit(0);
+        app.last_run_stale = false;
+
+        let assembly_id = app.project.timeline()[0].outputs[0].clone();
+        let state = volumetric::f64_map::F64Map::from([("slide".to_string(), 1.25)]);
+        app.apply_assembly_state(&assembly_id, state);
+
+        let inputs = &app.project.timeline()[0].inputs;
+        let ExecutionInput::Inline(bytes) = &inputs[inputs.len() - 1] else {
+            panic!("the state slot stays inline");
+        };
+        assert_eq!(volumetric::f64_map::decode(bytes).unwrap()["slide"], 1.25);
+        assert!(app.last_run_stale, "a dragged state re-runs the project");
+        let config = app.step_edit.as_ref().unwrap().config.as_ref().unwrap();
+        assert_eq!(
+            config.buffers.get("slide").map(String::as_str),
+            Some("1.25")
+        );
+        assert!(app.status.contains("slide 1.250"), "{}", app.status);
+
+        // An unknown output is ignored.
+        app.apply_assembly_state("nothing", volumetric::f64_map::F64Map::new());
     }
 
     #[test]

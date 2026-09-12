@@ -18,13 +18,16 @@ use damascene_core::prelude::*;
 use glam::{Mat4, Vec2, Vec3};
 use volumetric_renderer as renderer;
 
+use volumetric::f64_map::F64Map;
 pub use volumetric_preview::{
     ExecutionBackend, Framed, LocalBackend, LookThrough, PendingMesh, PreviewBounds, PreviewEntity,
     PreviewStage, ViewFrame, build_preview_scene, build_preview_scene_cancellable,
     build_preview_scene_monitored, build_preview_scene_with, preview_postlude, preview_prelude,
     submit_subspace_gizmo, submit_view_highlight,
 };
-use volumetric_preview::{format_error_chain, wireframe_style};
+use volumetric_preview::{
+    format_error_chain, joint_axis_half, joint_axis_lines, joint_axis_style, wireframe_style,
+};
 
 use crate::{
     LightboxData, LightboxMode, OutputStats, PreviewArtifactStatus, PreviewBuildStatus,
@@ -226,6 +229,9 @@ impl Session {
 
         if self.viewport.take_look_through_left() {
             app.exit_look_through();
+        }
+        for (asset_id, state) in self.viewport.take_state_edits() {
+            app.apply_assembly_state(&asset_id, state);
         }
 
         if app.take_pending_run() {
@@ -464,17 +470,46 @@ impl Session {
         triangles
     }
 
-    /// A pointer press: starts a camera drag when it lands in the viewport.
-    pub fn pointer_down(&mut self, pos: (f32, f32), button: PointerButton) {
+    /// A pointer press: starts a camera drag when it lands in the viewport,
+    /// or a part drag when the primary button lands on a part of an
+    /// assembly and the control scheme leaves that button to the scene.
+    pub fn pointer_down(
+        &mut self,
+        pos: (f32, f32),
+        button: PointerButton,
+        modifiers: KeyModifiers,
+        scheme: renderer::CameraControlScheme,
+    ) {
         self.camera_buttons.set(button, true);
-        if point_in_rect(self.viewport_rect, pos) {
-            self.camera_pointer = Some(pos);
+        let Some(rect) = self
+            .viewport_rect
+            .filter(|_| point_in_rect(self.viewport_rect, pos))
+        else {
+            return;
+        };
+        self.camera_pointer = Some(pos);
+        if button != PointerButton::Primary {
+            return;
+        }
+        let input = renderer::CameraInputState {
+            left_down: true,
+            shift_down: modifiers.shift,
+            ctrl_down: modifiers.ctrl,
+            alt_down: modifiers.alt,
+            ..Default::default()
+        };
+        if scheme.determine_action(&input) == renderer::CameraAction::None {
+            self.viewport.begin_part_drag(pos, rect);
         }
     }
 
-    /// A pointer release: ends the camera drag once no buttons remain down.
+    /// A pointer release: ends the camera drag once no buttons remain down,
+    /// and a part drag, whose state goes to the app at the next sync.
     pub fn pointer_up(&mut self, button: PointerButton) {
         self.camera_buttons.set(button, false);
+        if button == PointerButton::Primary {
+            self.viewport.end_part_drag();
+        }
         if !self.camera_buttons.any() {
             self.camera_pointer = None;
         }
@@ -494,6 +529,13 @@ impl Session {
         if !self.camera_buttons.any() {
             return false;
         }
+        if self.viewport.drag.is_some() {
+            self.camera_pointer = Some(pos);
+            return match self.viewport_rect {
+                Some(rect) => self.viewport.drag_part(pos, rect),
+                None => false,
+            };
+        }
         let input = renderer::CameraInputState {
             left_down: self.camera_buttons.primary,
             middle_down: self.camera_buttons.middle,
@@ -509,8 +551,10 @@ impl Session {
         changed
     }
 
-    /// The pointer left the window: abandon any camera drag.
+    /// The pointer left the window: abandon any camera drag; a part drag
+    /// ends where it is.
     pub fn pointer_left(&mut self) {
+        self.viewport.end_part_drag();
         self.camera_pointer = None;
         self.camera_buttons = CameraButtons::default();
     }
@@ -592,6 +636,38 @@ struct ViewportRenderer {
     /// gestures (whose deltas arrive in logical pixels) can map drag
     /// distance to world units 1:1.
     viewport_logical_size: Vec2,
+    /// The camera the last frame was drawn with, for picking.
+    last_view: Option<renderer::CameraView>,
+    /// A part drag in progress.
+    drag: Option<PartDrag>,
+    /// Assemblies drawn at a state of the viewport's own (a drag, or a
+    /// state handed back and not yet rebuilt), by output id.
+    posed: HashMap<String, PosedOverride>,
+    /// States handed back by finished drags, for the app at the next sync.
+    state_edits: Vec<(String, F64Map)>,
+}
+
+/// A part being dragged: the pose is solved for the pointer each move and
+/// drawn at once; the state goes to the app on release.
+struct PartDrag {
+    asset_id: String,
+    part: String,
+    /// The grabbed point in the part's own (rest) coordinates.
+    local: [f64; 3],
+    /// The grabbed point's depth (NDC z) at the grab, so the target stays
+    /// on the plane the part was grabbed at.
+    ndc_z: f32,
+    state: F64Map,
+}
+
+/// An assembly's parts posed by the viewport rather than by its entity.
+struct PosedOverride {
+    /// The entity revision the override was made against; a newer build
+    /// (the handed-back state, rebuilt) replaces it.
+    revision: u64,
+    state: F64Map,
+    transforms: Vec<Mat4>,
+    axes: renderer::LineData,
 }
 
 /// One output's GPU-resident preview geometry.
@@ -642,6 +718,10 @@ impl ViewportRenderer {
             look_framed: None,
             look_through_left: false,
             viewport_logical_size: Vec2::ZERO,
+            last_view: None,
+            drag: None,
+            posed: HashMap::new(),
+            state_edits: Vec::new(),
         }
     }
 
@@ -731,6 +811,7 @@ impl ViewportRenderer {
         };
 
         let settings = render_settings(preview_requests.first(), clear_color);
+        self.last_view = Some(view);
         self.renderer
             .render_view(device, queue, encoder, &view, &settings, &self.target.view);
         self.renderer.end_frame();
@@ -843,6 +924,154 @@ impl ViewportRenderer {
         self.renderer.frame_overflow().map(overflow_message)
     }
 
+    /// The ray through the pointer at `pos` (logical, inside `rect`) for
+    /// the last frame's camera: origin, direction, and the view-projection
+    /// with its inverse.
+    fn pointer_ray(&self, pos: (f32, f32), rect: Rect) -> Option<(Vec3, Vec3, Mat4, Mat4)> {
+        pointer_ray(&self.last_view?, pos, rect)
+    }
+
+    /// The world point under the pointer at NDC depth `ndc_z`.
+    fn pointer_at_depth(&self, pos: (f32, f32), rect: Rect, ndc_z: f32) -> Option<Vec3> {
+        let (_, _, _, inv) = self.pointer_ray(pos, rect)?;
+        let nx = (pos.0 - rect.x) / rect.w * 2.0 - 1.0;
+        let ny = 1.0 - (pos.1 - rect.y) / rect.h * 2.0;
+        let p = inv.project_point3(Vec3::new(nx, ny, ndc_z));
+        p.is_finite().then_some(p)
+    }
+
+    /// Starts dragging the assembly part under the pointer, if any: the
+    /// nearest hit among the resident assemblies' meshes, at their current
+    /// (possibly overridden) poses. Returns whether a drag began.
+    fn begin_part_drag(&mut self, pos: (f32, f32), rect: Rect) -> bool {
+        let Some((origin, dir, vp, _)) = self.pointer_ray(pos, rect) else {
+            return false;
+        };
+        let mut best: Option<(f32, String, usize, Vec3)> = None;
+        for id in self.resident.keys() {
+            let Some((entity, _)) = self.preview_cache.entity(id) else {
+                continue;
+            };
+            let Some(articulated) = &entity.articulated else {
+                continue;
+            };
+            let override_transforms = self.posed.get(id).map(|p| &p.transforms);
+            for (i, (mesh, transform, _)) in entity.scene.meshes.iter().enumerate() {
+                if i >= articulated.part_of_mesh.len() {
+                    break;
+                }
+                let transform = override_transforms
+                    .and_then(|t| t.get(i))
+                    .copied()
+                    .unwrap_or(*transform);
+                if let Some(t) = ray_mesh_distance(origin, dir, mesh, transform)
+                    && best.as_ref().is_none_or(|(bt, ..)| t < *bt)
+                {
+                    best = Some((t, id.clone(), i, origin + dir * t));
+                }
+            }
+        }
+        let Some((_, asset_id, mesh_index, hit)) = best else {
+            return false;
+        };
+        let Some((entity, _)) = self.preview_cache.entity(&asset_id) else {
+            return false;
+        };
+        let articulated = entity
+            .articulated
+            .as_ref()
+            .expect("picked an articulated entity");
+        let part = articulated.assembly.parts[articulated.part_of_mesh[mesh_index]]
+            .name
+            .clone();
+        let state = self
+            .posed
+            .get(&asset_id)
+            .map(|p| p.state.clone())
+            .unwrap_or_else(|| articulated.assembly.state.clone());
+        let transform = self
+            .posed
+            .get(&asset_id)
+            .and_then(|p| p.transforms.get(mesh_index))
+            .copied()
+            .unwrap_or(entity.scene.meshes[mesh_index].1);
+        let local = transform.inverse().project_point3(hit);
+        let clip = vp * hit.extend(1.0);
+        if clip.w <= 0.0 {
+            return false;
+        }
+        self.drag = Some(PartDrag {
+            asset_id,
+            part,
+            local: [local.x as f64, local.y as f64, local.z as f64],
+            ndc_z: clip.z / clip.w,
+            state,
+        });
+        true
+    }
+
+    /// Advances the part drag to the pointer: the state that brings the
+    /// grabbed point nearest the pointer's position on the grab plane,
+    /// drawn at once. Returns whether the scene changed.
+    fn drag_part(&mut self, pos: (f32, f32), rect: Rect) -> bool {
+        let Some(drag) = self.drag.as_ref() else {
+            return false;
+        };
+        let (asset_id, part, local, ndc_z) = (
+            drag.asset_id.clone(),
+            drag.part.clone(),
+            drag.local,
+            drag.ndc_z,
+        );
+        let Some(target) = self.pointer_at_depth(pos, rect, ndc_z) else {
+            return false;
+        };
+        let Some((entity, revision)) = self.preview_cache.entity(&asset_id) else {
+            return false;
+        };
+        let Some(articulated) = entity.articulated.clone() else {
+            return false;
+        };
+        let bounds = entity.bounds;
+        let mechanism = &articulated.assembly.mechanism;
+        let target = [target.x as f64, target.y as f64, target.z as f64];
+        let Some(drag) = self.drag.as_mut() else {
+            return false;
+        };
+        let Ok(state) = mechanism.pull(&drag.state, &part, local, target, 6) else {
+            return false;
+        };
+        let (Ok(transforms), Ok(poses)) =
+            (articulated.mesh_transforms(&state), mechanism.pose(&state))
+        else {
+            return false;
+        };
+        let axes = joint_axis_lines(mechanism, &poses, joint_axis_half(&bounds));
+        drag.state = state.clone();
+        self.posed.insert(
+            asset_id,
+            PosedOverride {
+                revision,
+                state,
+                transforms,
+                axes,
+            },
+        );
+        true
+    }
+
+    /// Ends a part drag: its state goes to the app at the next sync; the
+    /// override keeps drawing the dragged pose until the rebuild lands.
+    fn end_part_drag(&mut self) {
+        if let Some(drag) = self.drag.take() {
+            self.state_edits.push((drag.asset_id, drag.state));
+        }
+    }
+
+    fn take_state_edits(&mut self) -> Vec<(String, F64Map)> {
+        std::mem::take(&mut self.state_edits)
+    }
+
     /// The retained scene of an entity: meshes with a stable identity
     /// (an assembly's parts) come from `part_meshes`, uploaded once per
     /// identity; everything else is uploaded for this entity.
@@ -950,6 +1179,15 @@ impl ViewportRenderer {
             .flat_map(|resident| resident.part_keys.iter().copied())
             .collect();
         self.part_meshes.retain(|key, _| live_parts.contains(key));
+        // A rebuilt entity carries the handed-back state: its own poses
+        // take over from the override.
+        let revisions: HashMap<&str, u64> =
+            visible.iter().map(|(id, rev, ..)| (*id, *rev)).collect();
+        self.posed.retain(|id, posed| {
+            revisions
+                .get(id.as_str())
+                .is_some_and(|rev| *rev == posed.revision)
+        });
         for (id, revision, wireframe, entity) in visible {
             if self
                 .resident
@@ -983,11 +1221,25 @@ impl ViewportRenderer {
                     &wireframe_style(),
                 );
             }
-            for (mesh, transform) in &resident.scene.meshes {
-                self.renderer.submit_retained_mesh(mesh, *transform);
+            let posed = self.posed.get(id);
+            for (i, (mesh, transform)) in resident.scene.meshes.iter().enumerate() {
+                let transform = posed
+                    .and_then(|p| p.transforms.get(i))
+                    .copied()
+                    .unwrap_or(*transform);
+                self.renderer.submit_retained_mesh(mesh, transform);
             }
-            for lines in &resident.scene.lines {
-                self.renderer.submit_retained_lines(lines);
+            match posed {
+                // The joint axes follow the override's poses.
+                Some(posed) => {
+                    self.renderer
+                        .submit_lines(&posed.axes, Mat4::IDENTITY, joint_axis_style());
+                }
+                None => {
+                    for lines in &resident.scene.lines {
+                        self.renderer.submit_retained_lines(lines);
+                    }
+                }
             }
             for points in &resident.scene.points {
                 self.renderer.submit_retained_points(points);
@@ -1339,6 +1591,13 @@ impl PreviewCache {
     /// The cached scene for one output, if a build has completed for it.
     fn entity_scene(&self, id: &str) -> Option<&renderer::SceneData> {
         self.entities.get(id).map(|build| &build.entity.scene)
+    }
+
+    /// The cached entity of an output, with its build revision.
+    fn entity(&self, id: &str) -> Option<(&PreviewEntity, u64)> {
+        self.entities
+            .get(id)
+            .map(|build| (&build.entity, build.revision))
     }
 
     /// Meshing stats for every cached output, keyed by asset id. The
@@ -2259,6 +2518,82 @@ fn viewport_extent(rect: Rect, scale_factor: f32) -> (u32, u32) {
     let w = (rect.w * scale_factor).ceil().max(1.0) as u32;
     let h = (rect.h * scale_factor).ceil().max(1.0) as u32;
     (w, h)
+}
+
+/// The ray through the pointer at `pos` (logical, inside `rect`) for a
+/// camera: origin on the near plane, direction, and the view-projection
+/// with its inverse.
+fn pointer_ray(
+    view: &renderer::CameraView,
+    pos: (f32, f32),
+    rect: Rect,
+) -> Option<(Vec3, Vec3, Mat4, Mat4)> {
+    if rect.w <= 0.0 || rect.h <= 0.0 {
+        return None;
+    }
+    let nx = (pos.0 - rect.x) / rect.w * 2.0 - 1.0;
+    let ny = 1.0 - (pos.1 - rect.y) / rect.h * 2.0;
+    let vp = view.view_projection();
+    let inv = vp.inverse();
+    let near = inv.project_point3(Vec3::new(nx, ny, 0.0));
+    let far = inv.project_point3(Vec3::new(nx, ny, 1.0));
+    let dir = (far - near).normalize_or_zero();
+    if dir == Vec3::ZERO || !near.is_finite() {
+        return None;
+    }
+    Some((near, dir, vp, inv))
+}
+
+/// The distance along the ray to the nearest triangle of `mesh` drawn
+/// under `transform` (Möller–Trumbore, both faces), or `None` for a miss.
+fn ray_mesh_distance(
+    origin: Vec3,
+    dir: Vec3,
+    mesh: &renderer::MeshData,
+    transform: Mat4,
+) -> Option<f32> {
+    let vertex =
+        |i: u32| transform.transform_point3(Vec3::from(mesh.vertices[i as usize].position));
+    let mut best: Option<f32> = None;
+    let mut test = |a: Vec3, b: Vec3, c: Vec3| {
+        let (e1, e2) = (b - a, c - a);
+        let p = dir.cross(e2);
+        let det = e1.dot(p);
+        if det.abs() < 1e-12 {
+            return;
+        }
+        let inv = 1.0 / det;
+        let s = origin - a;
+        let u = s.dot(p) * inv;
+        if !(0.0..=1.0).contains(&u) {
+            return;
+        }
+        let q = s.cross(e1);
+        let v = dir.dot(q) * inv;
+        if v < 0.0 || u + v > 1.0 {
+            return;
+        }
+        let t = e2.dot(q) * inv;
+        if t > 1e-6 && best.is_none_or(|b| t < b) {
+            best = Some(t);
+        }
+    };
+    match &mesh.indices {
+        Some(indices) => {
+            for tri in indices.chunks_exact(3) {
+                test(vertex(tri[0]), vertex(tri[1]), vertex(tri[2]));
+            }
+        }
+        None => {
+            for i in (0..mesh.vertices.len() as u32).step_by(3) {
+                if (i + 2) as usize >= mesh.vertices.len() {
+                    break;
+                }
+                test(vertex(i), vertex(i + 1), vertex(i + 2));
+            }
+        }
+    }
+    best
 }
 
 fn point_in_rect(rect: Option<Rect>, pos: (f32, f32)) -> bool {
@@ -3183,6 +3518,7 @@ mod tests {
             stats: OutputStats::default(),
             wireframe_lines: None,
             mesh_keys: Vec::new(),
+            articulated: None,
             subspace: None,
         }
     }
@@ -3913,5 +4249,80 @@ function get_bounds_max_y() return 1.5 end
             "newest job per output wins"
         );
         assert!(queue.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod pick_tests {
+    use super::*;
+
+    fn triangle_at(z: f32) -> renderer::MeshData {
+        let v = |x: f32, y: f32| renderer::MeshVertex::new([x, y, z], [0.0, 0.0, 1.0]);
+        renderer::MeshData {
+            vertices: vec![v(-1.0, -1.0), v(1.0, -1.0), v(0.0, 1.0)],
+            indices: None,
+        }
+    }
+
+    #[test]
+    fn the_pointer_ray_and_the_mesh_hit_agree_with_the_camera() {
+        // Looking straight down z from z = 5, a 4-unit-tall orthographic
+        // frame over a 100 x 100 viewport: the pointer's x maps 2 units per
+        // half width, the ray runs down -z from the near plane.
+        let view = renderer::CameraView::look_at_orthographic(
+            Vec3::new(0.0, 0.0, 5.0),
+            Vec3::ZERO,
+            Vec3::Y,
+            4.0,
+            1.0,
+            0.1,
+            10.0,
+        );
+        let rect = Rect {
+            x: 10.0,
+            y: 20.0,
+            w: 100.0,
+            h: 100.0,
+        };
+        let (origin, dir, vp, inv) = pointer_ray(&view, (85.0, 70.0), rect).expect("a ray");
+        assert!(
+            (origin.x - 1.0).abs() < 1e-5 && origin.y.abs() < 1e-5,
+            "{origin:?}"
+        );
+        assert!((origin.z - 4.9).abs() < 1e-4, "{origin:?}");
+        assert!((dir - Vec3::NEG_Z).length() < 1e-6, "{dir:?}");
+        // The inverse takes a clip point back to where it came from.
+        let clip = vp * Vec3::new(1.0, 0.0, 0.0).extend(1.0);
+        let back = inv.project_point3(clip.truncate() / clip.w);
+        assert!(
+            (back - Vec3::new(1.0, 0.0, 0.0)).length() < 1e-4,
+            "{back:?}"
+        );
+
+        // A triangle in the z = 0 plane is hit 4.9 along the ray when the
+        // pointer is over it, missed when it is not, and hit at its posed
+        // position when drawn under a transform.
+        let (origin, dir, ..) = pointer_ray(&view, (60.0, 70.0), rect).unwrap();
+        let t = ray_mesh_distance(origin, dir, &triangle_at(0.0), Mat4::IDENTITY).expect("hit");
+        assert!((t - 4.9).abs() < 1e-4, "{t}");
+        assert!(
+            ray_mesh_distance(
+                origin,
+                dir,
+                &triangle_at(0.0),
+                Mat4::from_translation(Vec3::X * 3.0)
+            )
+            .is_none()
+        );
+        let (origin, dir, ..) = pointer_ray(&view, (110.0, 70.0), rect).unwrap();
+        assert!(
+            ray_mesh_distance(
+                origin,
+                dir,
+                &triangle_at(0.0),
+                Mat4::from_translation(Vec3::X * 2.0)
+            )
+            .is_some()
+        );
     }
 }

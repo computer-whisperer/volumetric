@@ -478,7 +478,12 @@ impl ApplicationHandler for WebHost {
                             .ui_state()
                             .is_hovering_within(crate::VIEWPORT_KEY)
                         {
-                            gfx.session.pointer_down((lx, ly), button);
+                            gfx.session.pointer_down(
+                                (lx, ly),
+                                button,
+                                self.modifiers,
+                                self.app.camera_control_scheme(),
+                            );
                         }
                         for event in gfx.damascene.pointer_down(Pointer::mouse(lx, ly, button)) {
                             dispatch_event(&mut self.app, &gfx.damascene, event);

@@ -342,6 +342,7 @@ pub(crate) fn build_viewset_preview(
         stats,
         wireframe_lines: None,
         mesh_keys: Vec::new(),
+        articulated: None,
         subspace: None,
     })
 }

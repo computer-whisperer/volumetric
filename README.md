@@ -110,7 +110,9 @@ given in world coordinates at rest, and a part's pose is the product of its chai
 motions, root first. The state is an `F64Map` keyed by joint name (degrees or metres); a
 joint with a `drive` follows another at a ratio and is not a state. The viewport meshes each
 part of an assembly once and draws it under its pose with the joints' axes, so a state change
-re-meshes nothing.
+re-meshes nothing; the assemble step's state slot is a form of the joints' ranges, and
+dragging a part in the viewport poses it (the joints that can reach the pointer move, within
+their ranges) and writes the state back into that slot.
 
 | Operator | Description | Inputs |
 |----------|-------------|--------|

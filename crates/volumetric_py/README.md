@@ -183,7 +183,9 @@ joint motions. `Mechanism.load(path)` / `.decode(bytes)` / `.save` /
 (n,3,4) array (missing keys take their defaults, out-of-range values are
 refused), `.velocity(part, point, state=None)` the world velocity of a
 point on a part per unit rate of each state as a (k,3) array (the
-Jacobian a drag solves against). `Assembly.load` / `.decode` / `.save` /
+Jacobian a drag solves against), `.pull(part, local, target, state=None,
+iterations=8)` the state that brings a point of a part nearest a world
+target (what the viewport solves while a part is dragged). `Assembly.load` / `.decode` / `.save` /
 `.encode`; `.mechanism`, `.parts`, `.part_model(name)` (the unposed wasm),
 `.state`, `.poses()` (n,3,4). Build them with the `mechanism_operator`
 and `assemble_operator` steps (the operator READMEs give the config).

@@ -24,6 +24,16 @@ const PRISMATIC_COLOR: [f32; 4] = [0.3, 0.75, 1.0, 1.0];
 /// Axis line half-length as a fraction of the scene's diagonal.
 const AXIS_HALF_FRACTION: f32 = 0.35;
 
+/// The half-length the joint axes are drawn with for a scene of `bounds`.
+pub fn joint_axis_half(bounds: &PreviewBounds) -> f32 {
+    let diagonal = (bounds.max_vec3() - bounds.min_vec3()).length();
+    if diagonal.is_finite() && diagonal > 0.0 {
+        diagonal * AXIS_HALF_FRACTION
+    } else {
+        1.0
+    }
+}
+
 /// What the postlude needs to finish an assembly once its parts' meshes
 /// exist.
 pub struct PendingAssembly {
@@ -119,7 +129,8 @@ pub fn joint_axis_lines(mechanism: &Mechanism, poses: &[Rigid], half: f32) -> re
     renderer::LineData { segments }
 }
 
-fn axis_style() -> renderer::LineStyle {
+/// The style the joint axes are drawn in.
+pub fn joint_axis_style() -> renderer::LineStyle {
     renderer::LineStyle {
         width: 2.0,
         width_mode: renderer::WidthMode::ScreenSpace,
@@ -163,7 +174,7 @@ struct BuiltPart {
 /// joints' axes; the wireframe overlay carries every part's edges, posed.
 fn place(
     request: &PreviewRequest,
-    assembly: &Assembly,
+    assembly: &Arc<Assembly>,
     poses: &[Mat4],
     built: Vec<BuiltPart>,
     mut stats: OutputStats,
@@ -171,11 +182,14 @@ fn place(
 ) -> PreviewEntity {
     let mut scene = renderer::SceneData::new();
     let mut mesh_keys = Vec::new();
+    let mut part_of_mesh = Vec::new();
     let mut wireframe = renderer::LineData {
         segments: Vec::new(),
     };
     let mut bounds: Option<PreviewBounds> = None;
-    for ((part, pose), mut built) in assembly.parts.iter().zip(poses).zip(built) {
+    for (part_index, ((part, pose), mut built)) in
+        assembly.parts.iter().zip(poses).zip(built).enumerate()
+    {
         let tint = part_tint(&part.name);
         if let Some(mut mesh) = built.mesh.take() {
             for vertex in &mut mesh.vertices {
@@ -183,6 +197,7 @@ fn place(
             }
             scene.add_mesh(mesh, *pose, renderer::MaterialId(0));
             mesh_keys.push(built.key);
+            part_of_mesh.push(part_index);
         }
         if let Some(mut points) = built.points.take() {
             for point in &mut points.points {
@@ -218,17 +233,12 @@ fn place(
         min: (-1.0, -1.0, -1.0),
         max: (1.0, 1.0, 1.0),
     });
-    let diagonal = (bounds.max_vec3() - bounds.min_vec3()).length();
-    let half = if diagonal.is_finite() && diagonal > 0.0 {
-        diagonal * AXIS_HALF_FRACTION
-    } else {
-        1.0
-    };
+    let half = joint_axis_half(&bounds);
     let rigid_poses = assembly.poses();
     scene.add_lines(
         joint_axis_lines(&assembly.mechanism, &rigid_poses, half),
         Mat4::IDENTITY,
-        axis_style(),
+        joint_axis_style(),
     );
     stats
         .detail
@@ -243,6 +253,10 @@ fn place(
         stats,
         wireframe_lines: (!wireframe.segments.is_empty()).then_some(wireframe),
         mesh_keys,
+        articulated: Some(Arc::new(crate::Articulated {
+            assembly: assembly.clone(),
+            part_of_mesh,
+        })),
         subspace: None,
     }
 }
@@ -412,7 +426,7 @@ pub fn build_mechanism_preview(
     scene.add_lines(
         joint_axis_lines(&mechanism, &poses, half),
         Mat4::IDENTITY,
-        axis_style(),
+        joint_axis_style(),
     );
     let stats = OutputStats {
         detail: mechanism_detail(&mechanism, &mechanism.default_state()),
@@ -428,6 +442,7 @@ pub fn build_mechanism_preview(
         stats,
         wireframe_lines: None,
         mesh_keys: Vec::new(),
+        articulated: None,
         subspace: None,
     })
 }
