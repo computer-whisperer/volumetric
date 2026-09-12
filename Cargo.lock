@@ -6180,6 +6180,7 @@ dependencies = [
  "volumetric_assets",
  "volumetric_preview",
  "volumetric_protocol",
+ "volumetric_render",
  "volumetric_renderer",
  "wasmtime",
 ]
@@ -6231,6 +6232,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cv_core",
+ "glam 0.32.1",
  "numpy",
  "pyo3",
  "pythonize",
@@ -6241,6 +6243,21 @@ dependencies = [
  "volumetric_abi",
  "volumetric_assets",
  "volumetric_protocol",
+ "volumetric_render",
+]
+
+[[package]]
+name = "volumetric_render"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "glam 0.32.1",
+ "view_core",
+ "volumetric",
+ "volumetric_abi",
+ "volumetric_assets",
+ "volumetric_preview",
+ "volumetric_renderer",
 ]
 
 [[package]]

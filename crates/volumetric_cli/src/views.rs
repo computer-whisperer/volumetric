@@ -429,26 +429,11 @@ fn import_from_manifest(args: &ViewImportArgs, manifest: &Path, labels: Labels) 
 }
 
 /// A project's imported assets as loaded assets.
-pub(crate) fn imports_of(project: &Project) -> Vec<LoadedAsset> {
-    project
-        .imports()
-        .iter()
-        .map(|import| {
-            LoadedAsset::from_parts(
-                import.id.clone(),
-                import.data.clone(),
-                import.type_hint,
-                vec![],
-            )
-        })
-        .collect()
-}
-
 /// Every asset of a project as loaded assets: imports first, then the
 /// exports of a run when `run` is set.
 pub(crate) fn project_assets(path: &Path, run: bool) -> Result<Vec<LoadedAsset>> {
     let project = Project::load_from_file(path).context("Failed to load project")?;
-    let mut assets = imports_of(&project);
+    let mut assets = volumetric::asset_query::imports_as_assets(&project);
     if run {
         for export in crate::project::run_project_exports(project, None)? {
             if !assets.iter().any(|a| a.id() == export.id()) {
@@ -459,30 +444,19 @@ pub(crate) fn project_assets(path: &Path, run: bool) -> Result<Vec<LoadedAsset>>
     Ok(assets)
 }
 
-/// The view set asset named by `wanted` among `assets`, or the only one.
+/// The view set asset named by `wanted` among `assets`, or the only one,
+/// with the flag that names one in the error for several.
 pub(crate) fn find_viewset_asset<'a>(
     assets: &'a [LoadedAsset],
     wanted: Option<&str>,
 ) -> Result<&'a LoadedAsset> {
-    let sets: Vec<&LoadedAsset> = assets
-        .iter()
-        .filter(|a| a.type_hint() == Some(AssetTypeHint::ViewSet))
-        .collect();
-    match wanted {
-        Some(id) => sets
-            .iter()
-            .find(|a| a.id() == id)
-            .copied()
-            .ok_or_else(|| anyhow!("no view set asset '{id}'. Available: {}", ids(&sets))),
-        None => match sets.as_slice() {
-            [] => bail!("no view set asset in the project"),
-            [only] => Ok(only),
-            _ => bail!(
-                "several view sets; select one with --views <asset> (for render, --through <asset>:<view>). Available: {}",
-                ids(&sets)
-            ),
-        },
-    }
+    volumetric::asset_query::viewset_asset(assets, wanted).map_err(|err| {
+        if err.starts_with("several view sets") {
+            anyhow!("{err} (select one with --views <asset>; for render, --through <asset>:<view>)")
+        } else {
+            anyhow!(err)
+        }
+    })
 }
 
 /// Asset ids joined for an error message.
@@ -494,7 +468,6 @@ fn ids(assets: &[&LoadedAsset]) -> String {
         .join(", ")
 }
 
-/// The view set named by `wanted` among `assets`, or the only one.
 pub(crate) fn find_viewset(assets: &[LoadedAsset], wanted: Option<&str>) -> Result<ViewSet> {
     let asset = find_viewset_asset(assets, wanted)?;
     decode_viewset(asset.data()).map_err(|err| anyhow!("asset '{}': {err}", asset.id()))

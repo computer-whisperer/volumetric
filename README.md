@@ -15,6 +15,10 @@ The project explores a "model-as-code" paradigm where a 3D physical model is def
 over the same kernels: build and run projects with exports as numpy arrays,
 read view sets and splats, detect markers, solve stills and run the survey.
 See [its README](crates/volumetric_py/README.md).
+`crates/volumetric_render` is the headless frame both the CLI's `render` and
+the bindings' `render` call: assets, a camera (presets, an explicit eye, a
+pinhole, or a surveyed photograph with an overlay) and options in, RGBA
+frames and a report out.
 
 
 **Model authoring direction:** use `wgsl_script_operator` for new scripted

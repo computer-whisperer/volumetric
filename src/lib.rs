@@ -365,6 +365,7 @@ pub fn operator_metadata_from_wasm_bytes(
 }
 
 pub mod adaptive_surface_nets_2;
+pub mod asset_query;
 pub mod marching_cubes_cpu;
 pub mod mesh_decimation;
 pub mod operator_config;

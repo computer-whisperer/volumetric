@@ -18,6 +18,8 @@ volumetric_abi = { path = "../volumetric_abi" }
 volumetric_assets = { path = "../volumetric_assets" }
 volumetric_protocol = { path = "../volumetric_protocol", features = ["client"] }
 view_core = { path = "../view_core" }
+volumetric_render = { path = "../volumetric_render" }
+glam = "0.32"
 cv_core = { path = "../cv_core" }
 pyo3 = { version = "0.29", features = ["abi3-py312", "extension-module"] }
 numpy = "0.29"

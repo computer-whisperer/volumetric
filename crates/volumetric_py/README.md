@@ -79,6 +79,23 @@ These are the calls behind `view-pick`, `view-triangulate` and `sample`
 in Python instead. `examples/chair_photo`'s committed measurement replays
 through them to the same points, ray misses and check-view errors.
 
+## Frames
+
+```python
+r = v.render(p, views="iso,top", width=1024, height=768)          # the project is run; r.frames (h,w,4) per preset
+r = v.render(out_assets, camera=([1, 1, 1], [0, 0, 0]))            # assets from a run, an explicit eye and target
+r = v.render(p, through="views:DSC00742", overlay="edge")          # a surveyed photograph, the render composited
+r.image, r.names, r.report                                          # first frame, preset names, stats / up / GPU / notes
+```
+
+The same call as the CLI's `render` (`volumetric_render`): presets, an
+explicit camera, a pinhole (`pinhole={"fx", "fy", "cx", "cy",
+"camera_to_world"}`), or a view of a view set with its photograph under
+an overlay; `resolution`, `sharp`, `simplify`, `color_field`,
+`color_range`, `wireframe`, `background`, `up`, `projection="ortho"`
+with `ortho_scale`, `grid`, `ssao` as the CLI's flags. Needs a GPU (or a
+software adapter wgpu accepts).
+
 ## Pictures and markers
 
 ```python

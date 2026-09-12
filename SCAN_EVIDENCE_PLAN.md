@@ -140,7 +140,7 @@ measurement feedback. All evidence paths above are under
 | S1 | Splat value, 3DGS PLY import, `splat-list`, splat to point cloud | 2 days | landed |
 | S2 | Splat rendering in the viewport and `render`, look-through over the photograph | 4 days | landed |
 | S3 | Photometric audit: the splat rendered through each view against its photograph | 2 days | pending |
-| P | Python bindings (PyO3, maturin) over cv_core, view_core, the survey, splats and projects | 3 days | P1+P2 landed 2026-09-12; P3 (render, add_views, crop, set_config, observations value) pending |
+| P | Python bindings (PyO3, maturin) over cv_core, view_core, the survey, splats and projects | 3 days | P1+P2+P3a landed 2026-09-12; P3b (add_views, crop, set_config, observations value) pending |
 | D | Evidence audits for still sets: intake, detection, survey, setup, coverage, photometric, physical | 3 days | pending |
 
 Proposed order: C2, C3 (the survey is the stage the agent starts from and
@@ -828,9 +828,26 @@ P2 (landed 2026-09-12): `View.project/cast/ray`, `ViewSet.triangulate`
 `ViewSet.detect(...)` (`view_core::detect`, shared with `view-detect`),
 `card_spec`. The chair_photo measurement report replays exactly.
 
-Deferred to P3: `render(...)` through the native offscreen path (needs
-the CLI's render command factored into a library entry first),
-`Project.add_views` (view-select), `View.crop`, `Project.set_config`,
+P3a — the render refactor (landed 2026-09-12; the CLI's overlays and
+sections re-rendered pixel-identical). `crates/volumetric_render`
+(native only; `volumetric_renderer::offscreen` is not built for wasm32)
+holds the headless frame: `render(assets, imports, CameraSpec,
+&RenderOptions) -> Rendered { frames: Vec<Frame{suffix, width, height,
+rgba}>, report }` with `CameraSpec::{Presets, LookAt, Pinhole, Through}`,
+`RenderOptions` (size, projection, fov, ortho scale, clip, up, background,
+grid, ssao, overlay, `PlanOptions` for meshing and colour) and the report
+(per-entity stats, up and its source, GPU, notes such as rectification
+and buffer overflow) returned, not printed. `ViewPreset`, `parse_views`,
+`select_assets`, `preview_request`, `world_up` and `frames` move there
+with their tests; `imports_as_assets` and `viewset_asset` move to
+`volumetric::asset_query` for every host. The CLI's `render` keeps its
+flags, the flag-conflict checks, PNG writing and the printed report.
+Python: `render(project | [Asset], assets=None, views="iso", camera=None,
+pinhole=None, through=None, overlay=None, **RenderOptions) -> Rendered`
+with `.images` (h,w,4) uint8 per frame, `.names`, `.image` (the first)
+and `.report`.
+
+Deferred to P3b: `Project.add_views` (view-select), `View.crop`, `Project.set_config`,
 `ViewSet` mutation (poses from Python), observations as a first-class
 value (named feature picks and contours on the view set — an ABI decision).
 

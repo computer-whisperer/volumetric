@@ -418,7 +418,7 @@ pub struct PreviewEntity {
     pub subspace: Option<volumetric::subspace::Subspace>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PreviewBounds {
     pub min: (f32, f32, f32),
     pub max: (f32, f32, f32),

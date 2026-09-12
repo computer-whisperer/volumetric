@@ -14,6 +14,7 @@ required-features = ["native"]
 [workspace]
 members = [
     "crates/volumetric_py",
+    "crates/volumetric_render",
     "crates/models/simple_sphere_model",
     "crates/models/simple_torus_model",
     "crates/models/rounded_box_model",

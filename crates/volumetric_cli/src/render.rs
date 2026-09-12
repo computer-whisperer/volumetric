@@ -1,32 +1,19 @@
-//! `render`: draws a model, or the exports of a project, to PNG through the
-//! same preview path as the GUI viewport (`volumetric_preview`): 3D models
-//! meshed with the adaptive surface nets plan, 2D sketches as flat rasters,
-//! FEA meshes and point clouds as their explicit data, triangle meshes as
-//! they are, Subspace values as gizmos sized by the whole scene, view sets
-//! as camera frustums. The frame an agent reads headlessly is the frame a
-//! person sees in the viewport.
-//!
-//! Cameras: preset directions framed to the scene, an explicit pose with a
-//! field of view, or a pinhole with intrinsics and an OpenCV camera-to-world
-//! pose, which is how a scan's photographs are looked through.
+//! `render`: draws a model, or the exports of a project, to PNG through
+//! `volumetric_render`, the headless frame the GUI viewport also shows
+//! (see that crate for what each asset kind becomes). This command is the
+//! flags, the PNG files and the printed report.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
-use glam::{Mat4, Quat, Vec3};
+use glam::Vec3;
 
-use view_core::image::{Rgb, decode_rgb};
-use view_core::overlay::{Overlay, compose, rectify_photo};
 use volumetric::{AssetTypeHint, LoadedAsset, Project};
-use volumetric_abi::viewset::Distortion;
-use volumetric_preview::{
-    Asn2Settings, ColorRange, PreviewBounds, PreviewEntity, PreviewMeshPlan, PreviewPlan,
-    PreviewRenderMode, PreviewRequest, build_preview_scene, clip_planes_for, pose_matrix,
-    srgb_to_linear, submit_subspace_gizmo, wireframe_style,
-};
-use volumetric_renderer::{
-    Camera, CameraView, GridPlanes, Pinhole, RenderSettings, ViewDirection, offscreen::Offscreen,
+use volumetric_preview::pose_matrix;
+use volumetric_render::{
+    CameraSpec, ColorRange, Overlay, Pinhole, PlanOptions, Projection, RenderOptions,
+    background_from_hex, parse_views, select_assets,
 };
 
 #[derive(Parser, Debug)]
@@ -175,142 +162,9 @@ pub enum ProjectionArg {
     Ortho,
 }
 
-/// How each asset is turned into a preview.
-struct PlanOptions {
-    resolution: usize,
-    sharp: bool,
-    simplify: bool,
-    color_channel: Option<String>,
-    color_field: Option<String>,
-    color_range: Option<ColorRange>,
-    wireframe: bool,
-}
-
-/// A preset direction, framed to the scene like the viewport's view menu.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum ViewPreset {
-    Front,
-    Back,
-    Left,
-    Right,
-    Top,
-    Bottom,
-    Iso,
-    IsoBack,
-}
-
-impl ViewPreset {
-    const ALL: [Self; 8] = [
-        Self::Front,
-        Self::Back,
-        Self::Left,
-        Self::Right,
-        Self::Top,
-        Self::Bottom,
-        Self::Iso,
-        Self::IsoBack,
-    ];
-
-    fn suffix(self) -> &'static str {
-        match self {
-            Self::Front => "front",
-            Self::Back => "back",
-            Self::Left => "left",
-            Self::Right => "right",
-            Self::Top => "top",
-            Self::Bottom => "bottom",
-            Self::Iso => "iso",
-            Self::IsoBack => "iso-back",
-        }
-    }
-
-    fn parse(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|preset| preset.suffix() == name)
-    }
-
-    /// The eye and target of this preset framed to `min..max` at `fov_y`
-    /// in a world whose up is `up`: the orbit camera's y-up framing turned
-    /// by the rotation taking +y to `up`, so `top` looks down `up` and
-    /// `front` looks along the horizontal the viewport's front would.
-    fn framed(self, min: Vec3, max: Vec3, fov_y: f32, up: Vec3) -> (Vec3, Vec3) {
-        let camera = self.camera(min, max, fov_y);
-        let turn = Quat::from_rotation_arc(Vec3::Y, up);
-        let target = camera.target;
-        (target + turn * (camera.eye_position() - target), target)
-    }
-
-    /// The orbit camera for this preset, framed to `min..max` at `fov_y`.
-    fn camera(self, min: Vec3, max: Vec3, fov_y: f32) -> Camera {
-        let mut camera = Camera::new((min + max) * 0.5, 1.0);
-        camera.fov_y = fov_y;
-        let direction = match self {
-            Self::Front => ViewDirection::Front,
-            Self::Back => ViewDirection::Back,
-            Self::Left => ViewDirection::Left,
-            Self::Right => ViewDirection::Right,
-            Self::Top => ViewDirection::Top,
-            Self::Bottom => ViewDirection::Bottom,
-            Self::Iso | Self::IsoBack => ViewDirection::Isometric,
-        };
-        camera.view_from_direction(direction);
-        if self == Self::IsoBack {
-            camera.theta += std::f32::consts::PI;
-        }
-        camera.focus_on(min, max);
-        camera.fit_clip_planes();
-        camera
-    }
-}
-
-/// Parses a comma-separated view list; `all` expands to every preset.
-fn parse_views(list: &str) -> Result<Vec<ViewPreset>> {
-    let mut views = Vec::new();
-    for name in list.split(',').map(str::trim).filter(|n| !n.is_empty()) {
-        if name == "all" {
-            views.extend(ViewPreset::ALL);
-            continue;
-        }
-        let preset = ViewPreset::parse(name).with_context(|| {
-            format!(
-                "unknown view '{name}'; expected one of {}",
-                ViewPreset::ALL
-                    .iter()
-                    .map(|p| p.suffix())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        })?;
-        views.push(preset);
-    }
-    if views.is_empty() {
-        anyhow::bail!("--views names no view");
-    }
-    Ok(views)
-}
-
-/// Where the frame is drawn from.
-enum CameraMode {
-    Presets(Vec<ViewPreset>),
-    Pose {
-        eye: Vec3,
-        target: Option<Vec3>,
-        /// `--camera-up`, or the world's up when not given.
-        up: Option<Vec3>,
-    },
-    Pinhole {
-        pinhole: Pinhole,
-        camera_to_world: Mat4,
-    },
-    /// A view of the project's view set, resolved to a pinhole once the
-    /// project is loaded.
-    Through {
-        asset: Option<String>,
-        view: String,
-    },
-}
-
-/// The 3x4 rows of a camera-to-world pose as a matrix.
-fn camera_mode(args: &RenderArgs) -> Result<CameraMode> {
+/// The camera the flags describe, with the flag conflicts refused here so
+/// the messages name the flags.
+fn camera_mode(args: &RenderArgs) -> Result<CameraSpec> {
     if let Some(through) = &args.through {
         if args.camera_pos.is_some() || args.intrinsics.is_some() || args.pose.is_some() {
             anyhow::bail!(
@@ -327,7 +181,7 @@ fn camera_mode(args: &RenderArgs) -> Result<CameraMode> {
         if view.is_empty() {
             anyhow::bail!("--through needs a view id");
         }
-        return Ok(CameraMode::Through { asset, view });
+        return Ok(CameraSpec::Through { asset, view });
     }
     if args.overlay.is_some() {
         anyhow::bail!("--overlay composites over a view's photograph; give --through");
@@ -353,14 +207,13 @@ fn camera_mode(args: &RenderArgs) -> Result<CameraMode> {
                 height: args.height.unwrap_or(1024),
             };
             let rows: [f64; 12] = std::array::from_fn(|i| f64::from(m[i]));
-            let camera_to_world = pose_matrix(&rows);
-            Ok(CameraMode::Pinhole {
+            Ok(CameraSpec::Pinhole {
                 pinhole,
-                camera_to_world,
+                camera_to_world: pose_matrix(&rows),
             })
         }
         (None, None) => match &args.camera_pos {
-            Some(pos) => Ok(CameraMode::Pose {
+            Some(pos) => Ok(CameraSpec::LookAt {
                 eye: parse_vec3(pos).context("Invalid --camera-pos")?,
                 target: args
                     .camera_target
@@ -375,156 +228,72 @@ fn camera_mode(args: &RenderArgs) -> Result<CameraMode> {
                     .transpose()
                     .context("Invalid --camera-up")?,
             }),
-            None => Ok(CameraMode::Presets(parse_views(&args.views)?)),
+            None => Ok(CameraSpec::Presets(
+                parse_views(&args.views).context("Invalid --views")?,
+            )),
         },
         _ => anyhow::bail!("--intrinsics and --pose go together"),
     }
 }
 
-/// The world's up for the frame: `--up`, else the up the drawn view sets
-/// and splats were surveyed in (the first found), else +y, with a note of
-/// where it came from.
-fn world_up(args: &RenderArgs, assets: &[LoadedAsset]) -> Result<(Vec3, String)> {
-    if let Some(up) = &args.up {
-        let up = parse_vec3(up).context("Invalid --up")?;
-        let unit = up.normalize_or_zero();
-        if unit == Vec3::ZERO {
-            anyhow::bail!("--up must not be zero");
-        }
-        return Ok((unit, "--up".to_string()));
-    }
-    for asset in assets {
-        let up = match asset.type_hint() {
-            Some(AssetTypeHint::Splat) => {
-                volumetric::splat::decode_splat(asset.data())
-                    .map_err(|err| anyhow::anyhow!("asset '{}': {err}", asset.id()))?
-                    .world
-                    .up
-            }
-            Some(AssetTypeHint::ViewSet) => {
-                volumetric_abi::viewset::decode_viewset(asset.data())
-                    .map_err(|err| anyhow::anyhow!("asset '{}': {err}", asset.id()))?
-                    .world
-                    .up
-            }
-            _ => continue,
-        };
-        let up = Vec3::new(up[0] as f32, up[1] as f32, up[2] as f32).normalize_or_zero();
-        if up != Vec3::ZERO {
-            return Ok((up, format!("asset '{}'", asset.id())));
-        }
-    }
-    Ok((Vec3::Y, "default".to_string()))
-}
-
-/// The ground grid's plane for a world whose up is `up`: the coordinate
-/// plane most nearly perpendicular to it.
-fn grid_planes_for(up: Vec3) -> GridPlanes {
-    let a = up.abs();
-    if a.z >= a.x && a.z >= a.y {
-        GridPlanes::XY
-    } else if a.x >= a.y {
-        GridPlanes::YZ
-    } else {
-        GridPlanes::XZ
-    }
-}
-
-/// The frames to draw: a file suffix (for several) and the view for each.
-fn frames(
-    mode: CameraMode,
-    args: &RenderArgs,
-    (width, height): (u32, u32),
-    bounds: PreviewBounds,
-    world_up: Vec3,
-) -> Result<Vec<(Option<&'static str>, CameraView)>> {
-    let min = Vec3::from(bounds.min);
-    let max = Vec3::from(bounds.max);
-    let aspect = width as f32 / height as f32;
-    let fov_y = args.fov.to_radians();
-    let ortho_height = |default: f32| {
-        if args.ortho_scale > 0.0 {
-            args.ortho_scale
-        } else {
-            default
-        }
+/// The frame options the flags describe.
+fn render_options(args: &RenderArgs) -> Result<RenderOptions> {
+    let overlay = match &args.overlay {
+        Some(name) => Some(
+            Overlay::parse(name, args.overlay_alpha, args.overlay_tile).with_context(|| {
+                format!("unknown overlay '{name}'; expected blend, edge, side or checker")
+            })?,
+        ),
+        None => None,
     };
-    let clip = |eye: Vec3, forward: Vec3, default: (f32, f32)| {
-        let scene = clip_planes_for(eye, forward, min, max);
-        (
-            args.near
-                .unwrap_or(if default.0 > 0.0 { default.0 } else { scene.0 }),
-            args.far
-                .unwrap_or(if default.1 > 0.0 { default.1 } else { scene.1 }),
-        )
+    let color_range = match &args.color_range {
+        Some(text) => {
+            let v = parse_floats(text, 2).context("Invalid --color-range")?;
+            Some(
+                ColorRange::new(f64::from(v[0]), f64::from(v[1]))
+                    .context("--color-range needs lo below hi")?,
+            )
+        }
+        None => None,
     };
-
-    Ok(match mode {
-        CameraMode::Presets(presets) => {
-            let several = presets.len() > 1;
-            presets
-                .into_iter()
-                .map(|preset| {
-                    let (eye, target) = preset.framed(min, max, fov_y, world_up);
-                    let forward = (target - eye).normalize();
-                    let (near, far) = clip(eye, forward, (0.0, 0.0));
-                    let view = match args.projection {
-                        ProjectionArg::Perspective => {
-                            CameraView::look_at(eye, target, world_up, fov_y, aspect, near, far)
-                        }
-                        ProjectionArg::Ortho => CameraView::look_at_orthographic(
-                            eye,
-                            target,
-                            world_up,
-                            ortho_height((max - min).length() * 1.1),
-                            aspect,
-                            near,
-                            far,
-                        ),
-                    };
-                    (several.then_some(preset.suffix()), view)
-                })
-                .collect()
-        }
-        CameraMode::Pose { eye, target, up } => {
-            let up = up.unwrap_or(world_up);
-            let target = target.unwrap_or((min + max) * 0.5);
-            let forward = (target - eye).normalize_or_zero();
-            if forward == Vec3::ZERO {
-                anyhow::bail!("--camera-pos coincides with the look-at point");
+    let up = match &args.up {
+        Some(up) => {
+            let up = parse_vec3(up).context("Invalid --up")?;
+            if up.normalize_or_zero() == Vec3::ZERO {
+                anyhow::bail!("--up must not be zero");
             }
-            let (near, far) = clip(eye, forward, (0.0, 0.0));
-            let view = match args.projection {
-                ProjectionArg::Perspective => {
-                    CameraView::look_at(eye, target, up, fov_y, aspect, near, far)
-                }
-                ProjectionArg::Ortho => CameraView::look_at_orthographic(
-                    eye,
-                    target,
-                    up,
-                    ortho_height((max - min).length() * 1.1),
-                    aspect,
-                    near,
-                    far,
-                ),
-            };
-            vec![(None, view)]
+            Some(up)
         }
-        CameraMode::Pinhole {
-            pinhole,
-            camera_to_world,
-        } => {
-            let eye = camera_to_world.transform_point3(Vec3::ZERO);
-            let forward = camera_to_world.transform_vector3(Vec3::Z).normalize();
-            let (near, far) = clip(eye, forward, (0.0, 0.0));
-            vec![(
-                None,
-                CameraView::pinhole(&pinhole, camera_to_world, near, far),
-            )]
-        }
-        CameraMode::Through { .. } => {
-            anyhow::bail!("a --through camera must be resolved against the project first")
-        }
+        None => None,
+    };
+    if args.width == Some(0) || args.height == Some(0) {
+        anyhow::bail!("--width and --height must be positive");
+    }
+    Ok(RenderOptions {
+        width: args.width,
+        height: args.height,
+        projection: match args.projection {
+            ProjectionArg::Perspective => Projection::Perspective,
+            ProjectionArg::Ortho => Projection::Orthographic,
+        },
+        fov_deg: args.fov,
+        ortho_scale: args.ortho_scale,
+        near: args.near,
+        far: args.far,
+        up,
+        background: background_from_hex(&args.background).context("Invalid --background")?,
+        grid: args.grid,
+        ssao: !args.no_ssao,
+        plan: PlanOptions {
+            resolution: args.resolution,
+            sharp: !args.no_sharp,
+            simplify: !args.no_simplify,
+            color_channel: args.color_channel.clone(),
+            color_field: args.color_field.clone(),
+            color_range,
+            wireframe: args.wireframe,
+        },
+        overlay,
     })
 }
 
@@ -559,7 +328,7 @@ fn load_renderable_assets(
         }
         "vproj" => {
             let project = Project::load_from_file(input).context("Failed to load .vproj file")?;
-            imports = crate::views::imports_of(&project);
+            imports = volumetric::asset_query::imports_as_assets(&project);
             crate::project::run_project_exports(project, None)?
         }
         _ => anyhow::bail!(
@@ -567,146 +336,9 @@ fn load_renderable_assets(
             extension
         ),
     };
-    let selected = select_assets(assets, &imports, wanted)?;
+    let selected = select_assets(assets, &imports, wanted)
+        .map_err(|err| anyhow::anyhow!("{err:#} (imports draw when named with --asset)"))?;
     Ok((selected, imports))
-}
-
-fn is_renderable(asset: &LoadedAsset) -> bool {
-    matches!(
-        asset.type_hint(),
-        Some(
-            AssetTypeHint::Model
-                | AssetTypeHint::FeaMesh
-                | AssetTypeHint::TriMesh
-                | AssetTypeHint::Subspace
-                | AssetTypeHint::ViewSet
-                | AssetTypeHint::Splat
-        ) | None
-    )
-}
-
-/// Keeps the renderable exports, or exactly the `wanted` ids, each of which
-/// must exist among the exports or the imports and be renderable. Imports
-/// (a scan's view set, say) only draw when asked for by id.
-fn select_assets(
-    assets: Vec<LoadedAsset>,
-    imports: &[LoadedAsset],
-    wanted: &[String],
-) -> Result<Vec<LoadedAsset>> {
-    let available = || {
-        assets
-            .iter()
-            .chain(imports)
-            .filter(|a| is_renderable(a))
-            .map(|a| a.id())
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    if wanted.is_empty() {
-        let renderable: Vec<LoadedAsset> = assets
-            .iter()
-            .filter(|a| is_renderable(a))
-            .cloned()
-            .collect();
-        if renderable.is_empty() {
-            anyhow::bail!(
-                "nothing to draw: no model, mesh, cloud, subspace or view set export. Imports draw when named with --asset: {}",
-                available()
-            );
-        }
-        return Ok(renderable);
-    }
-    let mut selected = Vec::with_capacity(wanted.len());
-    for id in wanted {
-        let asset = assets
-            .iter()
-            .find(|a| a.id() == id)
-            .or_else(|| imports.iter().find(|a| a.id() == id))
-            .with_context(|| format!("no asset named '{id}'. Available: {}", available()))?;
-        if !is_renderable(asset) {
-            anyhow::bail!(
-                "asset '{id}' is {}, which has no picture. Available: {}",
-                asset
-                    .type_hint()
-                    .map(|h| h.to_string())
-                    .unwrap_or_else(|| "untyped".to_string()),
-                available()
-            );
-        }
-        selected.push(asset.clone());
-    }
-    Ok(selected)
-}
-
-/// The viewport's recipe for an asset of this kind, with the CLI's
-/// resolution and colour choices.
-fn preview_request(asset: &LoadedAsset, options: &PlanOptions) -> PreviewRequest {
-    let plan = match asset.type_hint() {
-        Some(AssetTypeHint::FeaMesh) => PreviewPlan::FeaMesh {
-            deformed: true,
-            exaggeration_tenths: 10,
-            color_field: options.color_field.clone(),
-            color_range: options.color_range,
-        },
-        Some(AssetTypeHint::TriMesh) => PreviewPlan::TriMesh,
-        Some(AssetTypeHint::Subspace) => PreviewPlan::Subspace,
-        Some(AssetTypeHint::ViewSet) => PreviewPlan::ViewSet,
-        Some(AssetTypeHint::Splat) => PreviewPlan::Splat,
-        _ => match volumetric::model_dimensions_static(asset.data()) {
-            Some(2) => PreviewPlan::Sketch {
-                resolution: options.resolution,
-                color_channel: options.color_channel.clone(),
-            },
-            _ => PreviewPlan::Model3d {
-                mesh: PreviewMeshPlan::for_mode(
-                    PreviewRenderMode::AdaptiveSurfaceNets2,
-                    options.resolution,
-                    Asn2Settings {
-                        sharp_edges: options.sharp,
-                        simplify: options.simplify,
-                        ..Asn2Settings::default()
-                    },
-                ),
-                color_channel: options.color_channel.clone(),
-                tint_uncolored: false,
-            },
-        },
-    };
-    PreviewRequest {
-        asset_id: asset.id().to_string(),
-        source_hash: asset.content_hash(),
-        data: asset.data_arc(),
-        type_hint: asset.type_hint(),
-        precursor_ids: vec![],
-        plan,
-        wireframe: options.wireframe,
-        show_grid: false,
-        show_bounds: false,
-        ssao: false,
-        ssao_radius: 0.5,
-        ssao_bias: 0.025,
-        ssao_strength: 1.0,
-        stale: false,
-    }
-}
-
-fn report(id: &str, entity: &PreviewEntity) {
-    let (lo, hi) = (entity.bounds.min, entity.bounds.max);
-    eprintln!(
-        "{id}: {} triangles, {} points, bounds ({:.3}, {:.3}, {:.3})..({:.3}, {:.3}, {:.3}), {:.0} ms",
-        entity.stats.triangles,
-        entity.stats.points,
-        lo.0,
-        lo.1,
-        lo.2,
-        hi.0,
-        hi.1,
-        hi.2,
-        entity.stats.mesh_ms
-    );
-    for line in &entity.stats.detail {
-        eprintln!("  {line}");
-    }
 }
 
 pub(crate) fn parse_floats(s: &str, count: usize) -> Result<Vec<f32>> {
@@ -729,20 +361,6 @@ pub(crate) fn parse_vec3(s: &str) -> Result<Vec3> {
     Ok(Vec3::new(v[0], v[1], v[2]))
 }
 
-/// A hex sRGB colour as the linear RGBA the renderer clears with.
-fn parse_hex_color(hex: &str) -> Result<[f32; 4]> {
-    let hex = hex.trim_start_matches('#');
-    if hex.len() != 6 {
-        anyhow::bail!("expected 6 hex digits, got '{hex}'");
-    }
-    let channel = |i: usize| -> Result<f32> {
-        let byte = u8::from_str_radix(&hex[i..i + 2], 16)
-            .with_context(|| format!("invalid hex colour '{hex}'"))?;
-        Ok(srgb_to_linear(f32::from(byte) / 255.0))
-    };
-    Ok([channel(0)?, channel(2)?, channel(4)?, 1.0])
-}
-
 /// `base` with `_suffix` before the extension when a suffix is given.
 fn output_path(base: &Path, suffix: Option<&str>) -> PathBuf {
     let Some(suffix) = suffix else {
@@ -757,246 +375,53 @@ fn output_path(base: &Path, suffix: Option<&str>) -> PathBuf {
 }
 
 pub fn run_render(args: RenderArgs) -> Result<()> {
-    let background = parse_hex_color(&args.background).context("Invalid --background")?;
-    let mode = camera_mode(&args)?;
+    let camera = camera_mode(&args)?;
+    let options = render_options(&args)?;
     let (assets, imports) = load_renderable_assets(&args.input, &args.assets)?;
-
-    // A view's camera fixes the image size and the projection; explicit
-    // sizes scale its intrinsics so smaller renders stay aligned.
-    let mut photo: Option<Rgb> = None;
-    let mut size = (args.width.unwrap_or(1024), args.height.unwrap_or(1024));
-    let mode = match mode {
-        CameraMode::Through { asset, view } => {
-            // Imports and the drawn assets overlap when an import was named
-            // with --asset; one copy each.
-            let all: Vec<LoadedAsset> = imports
-                .iter()
-                .chain(
-                    assets
-                        .iter()
-                        .filter(|a| !imports.iter().any(|i| i.id() == a.id())),
-                )
-                .cloned()
-                .collect();
-            let set = crate::views::find_viewset(&all, asset.as_deref())?;
-            let (view, camera) = set.view(&view).with_context(|| {
-                format!(
-                    "no view '{view}' in the view set. Views: {}",
-                    set.views
-                        .iter()
-                        .map(|v| v.id.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            })?;
-            size = (
-                args.width.unwrap_or(camera.width),
-                args.height.unwrap_or(camera.height),
-            );
-            let sx = size.0 as f64 / f64::from(camera.width);
-            let sy = size.1 as f64 / f64::from(camera.height);
-            if args.overlay.is_some() {
-                let bytes = view.image.as_deref().with_context(|| {
-                    format!(
-                        "view {} carries no photograph; import it with images",
-                        view.id
-                    )
-                })?;
-                photo = Some(rectify_photo(
-                    &decode_rgb(bytes)?.resized(size.0, size.1)?,
-                    camera,
-                )?);
-                if camera.distortion != Distortion::None {
-                    eprintln!(
-                        "view {}: photograph rectified to the render's pinhole projection",
-                        view.id
-                    );
-                }
-            }
-            CameraMode::Pinhole {
-                pinhole: Pinhole {
-                    fx: (camera.fx * sx) as f32,
-                    fy: (camera.fy * sy) as f32,
-                    cx: (camera.cx * sx) as f32,
-                    cy: (camera.cy * sy) as f32,
-                    width: size.0,
-                    height: size.1,
-                },
-                camera_to_world: pose_matrix(
-                    view.pose()
-                        .with_context(|| format!("view '{}' is not posed", view.id))?,
-                ),
-            }
-        }
-        other => other,
-    };
-    let overlay = match &args.overlay {
-        Some(name) => Some(
-            Overlay::parse(name, args.overlay_alpha, args.overlay_tile).with_context(|| {
-                format!("unknown overlay '{name}'; expected blend, edge, side or checker")
-            })?,
-        ),
-        None => None,
-    };
-    if size.0 == 0 || size.1 == 0 {
-        anyhow::bail!("--width and --height must be positive");
-    }
-
-    let color_range = match &args.color_range {
-        Some(text) => {
-            let v = parse_floats(text, 2).context("Invalid --color-range")?;
-            Some(
-                ColorRange::new(f64::from(v[0]), f64::from(v[1]))
-                    .context("--color-range needs lo below hi")?,
-            )
-        }
-        None => None,
-    };
-    let options = PlanOptions {
-        resolution: args.resolution,
-        sharp: !args.no_sharp,
-        simplify: !args.no_simplify,
-        color_channel: args.color_channel.clone(),
-        color_field: args.color_field.clone(),
-        color_range,
-        wireframe: args.wireframe,
-    };
-
-    let mut entities: Vec<PreviewEntity> = Vec::with_capacity(assets.len());
-    for asset in &assets {
-        let request = preview_request(asset, &options);
-        let entity = build_preview_scene(&request)
-            .map_err(|err| anyhow::anyhow!("{}: {err}", asset.id()))?;
-        if !args.quiet {
-            report(asset.id(), &entity);
-        }
-        entities.push(entity);
-    }
-    // Frame the geometry; a Subspace gizmo is infinite and only carries a
-    // placeholder box around its chart origin, which sizes the frame when
-    // nothing else is drawn.
-    let bounds = entities
-        .iter()
-        .filter(|entity| entity.subspace.is_none())
-        .map(|entity| entity.bounds)
-        .reduce(PreviewBounds::union)
-        .or_else(|| {
-            entities
-                .iter()
-                .map(|entity| entity.bounds)
-                .reduce(PreviewBounds::union)
-        })
-        .context("nothing to draw")?;
-    let (up, up_source) = world_up(&args, &assets)?;
+    let rendered = volumetric_render::render(&assets, &imports, camera, &options)?;
+    let report = &rendered.report;
     if !args.quiet {
-        eprintln!("up: ({}, {}, {}) from {up_source}", up.x, up.y, up.z);
-    }
-    let frames = frames(mode, &args, size, bounds, up)?;
-
-    let offscreen = Offscreen::new().map_err(anyhow::Error::msg)?;
-    if !args.quiet {
-        eprintln!("GPU: {}", offscreen.adapter_name());
-    }
-    let mut renderer = offscreen.renderer(size.0, size.1);
-    let resident: Vec<_> = entities
-        .iter()
-        .map(|entity| renderer.create_retained_scene(offscreen.device(), &entity.scene))
-        .collect();
-
-    // An overlay reads the render's coverage from its alpha channel: the
-    // background is transparent black, surfaces are opaque, and a splat's
-    // fading edge is in between, so nothing but geometry may touch the
-    // frame.
-    const SENTINEL: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
-    let mut settings = RenderSettings {
-        background_color: if overlay.is_some() {
-            SENTINEL
-        } else {
-            background
-        },
-        ssao_enabled: !args.no_ssao,
-        ..RenderSettings::default()
-    };
-    if overlay.is_some() {
-        settings.show_axis_indicator = false;
-    }
-    if args.grid > 0.0 && overlay.is_none() {
-        let extent = (Vec3::from(bounds.max) - Vec3::from(bounds.min)).length();
-        settings.grid.planes = grid_planes_for(up);
-        settings.grid.spacing = args.grid;
-        settings.grid.extent = (extent * 2.0).max(args.grid * 10.0);
-    } else {
-        settings.grid.planes = GridPlanes::NONE;
-    }
-
-    for (suffix, view) in frames {
-        for (scene, entity) in resident.iter().zip(&entities) {
-            for mesh in &scene.meshes {
-                renderer.submit_retained_mesh(mesh);
-            }
-            for lines in &scene.lines {
-                renderer.submit_retained_lines(lines);
-            }
-            for points in &scene.points {
-                renderer.submit_retained_points(points);
-            }
-            for splat in &scene.splats {
-                renderer.submit_retained_splat(splat);
-            }
-            if args.wireframe
-                && let Some(lines) = &entity.wireframe_lines
-            {
-                renderer.submit_lines(lines, Mat4::IDENTITY, wireframe_style());
-            }
-            if let Some(subspace) = &entity.subspace {
-                submit_subspace_gizmo(&mut renderer, subspace, bounds);
-            }
-        }
-        let rgba = offscreen
-            .render_rgba(&mut renderer, &view, &settings)
-            .map_err(anyhow::Error::msg)?;
-        if let Some(overflow) = renderer.frame_overflow() {
+        for entity in &report.entities {
+            let (lo, hi) = (entity.bounds.min, entity.bounds.max);
             eprintln!(
-                "warning: dropped {} of {} triangles, {} lines, {} points and {} splat primitives at the GPU buffer limit",
-                overflow.dropped_triangles,
-                overflow.total_triangles,
-                overflow.dropped_lines,
-                overflow.dropped_points,
-                overflow.dropped_splats
+                "{}: {} triangles, {} points, bounds ({:.3}, {:.3}, {:.3})..({:.3}, {:.3}, {:.3}), {:.0} ms",
+                entity.id,
+                entity.triangles,
+                entity.points,
+                lo.0,
+                lo.1,
+                lo.2,
+                hi.0,
+                hi.1,
+                hi.2,
+                entity.mesh_ms
             );
-        }
-        let path = output_path(&args.output, suffix);
-        match (&overlay, &photo) {
-            (Some(overlay), Some(photo)) => {
-                let covered: Vec<f32> = rgba
-                    .chunks_exact(4)
-                    .map(|px| f32::from(px[3]) / 255.0)
-                    .collect();
-                // Colours are premultiplied over the transparent background;
-                // divide the coverage back out.
-                let render = Rgb {
-                    width: size.0,
-                    height: size.1,
-                    pixels: rgba
-                        .chunks_exact(4)
-                        .flat_map(|px| {
-                            let a = f32::from(px[3]).max(1.0);
-                            [px[0], px[1], px[2]]
-                                .map(|c| (f32::from(c) * 255.0 / a).round().min(255.0) as u8)
-                        })
-                        .collect(),
-                };
-                let composed = compose(photo, &render, &covered, *overlay)?;
-                std::fs::write(&path, composed.to_png()?)
-                    .with_context(|| format!("Failed to write {}", path.display()))?;
-            }
-            _ => {
-                image::RgbaImage::from_raw(size.0, size.1, rgba)
-                    .context("frame size mismatch")?
-                    .save(&path)
-                    .with_context(|| format!("Failed to write {}", path.display()))?;
+            for line in &entity.detail {
+                eprintln!("  {line}");
             }
         }
+        eprintln!(
+            "up: ({}, {}, {}) from {}",
+            report.up.x,
+            report.up.y,
+            report.up.z,
+            if report.up_source == "options" {
+                "--up"
+            } else {
+                &report.up_source
+            }
+        );
+        eprintln!("GPU: {}", report.gpu);
+    }
+    for note in &report.notes {
+        eprintln!("{note}");
+    }
+    for frame in &rendered.frames {
+        let path = output_path(&args.output, frame.suffix);
+        image::RgbaImage::from_raw(frame.width, frame.height, frame.rgba.clone())
+            .context("frame size mismatch")?
+            .save(&path)
+            .with_context(|| format!("Failed to write {}", path.display()))?;
         println!("Wrote {}", path.display());
     }
     Ok(())
@@ -1005,24 +430,10 @@ pub fn run_render(args: RenderArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn asset(id: &str, type_hint: Option<AssetTypeHint>) -> LoadedAsset {
-        LoadedAsset::from_parts(id.to_string(), vec![1, 2, 3], type_hint, vec![])
-    }
+    use clap::Parser;
 
     #[test]
-    fn views_parse_and_name_their_files() {
-        let views = parse_views("front, iso-back").unwrap();
-        assert_eq!(views, vec![ViewPreset::Front, ViewPreset::IsoBack]);
-        assert_eq!(parse_views("all").unwrap().len(), 8);
-        assert!(
-            parse_views("sideways")
-                .unwrap_err()
-                .to_string()
-                .contains("sideways")
-        );
-        assert!(parse_views(" , ").is_err());
-
+    fn several_views_name_their_files() {
         assert_eq!(
             output_path(Path::new("out/render.png"), Some("top")),
             PathBuf::from("out/render_top.png")
@@ -1033,175 +444,22 @@ mod tests {
         );
     }
 
-    /// Every preset looks at the scene centre from outside the box.
-    #[test]
-    fn presets_frame_the_scene() {
-        let (min, max) = (Vec3::new(-1.0, 0.0, -2.0), Vec3::new(1.0, 1.0, 2.0));
-        for preset in ViewPreset::ALL {
-            let camera = preset.camera(min, max, 0.8);
-            assert_eq!(camera.target, (min + max) * 0.5);
-            let eye = camera.eye_position();
-            assert!(
-                eye.x < min.x
-                    || eye.x > max.x
-                    || eye.y < min.y
-                    || eye.y > max.y
-                    || eye.z < min.z
-                    || eye.z > max.z,
-                "{preset:?} eye {eye} inside"
-            );
-        }
-        let iso = ViewPreset::Iso.camera(min, max, 0.8).eye_position();
-        let back = ViewPreset::IsoBack.camera(min, max, 0.8).eye_position();
-        assert!((iso.x + back.x).abs() < 1e-4 && (iso.z + back.z).abs() < 1e-4);
-    }
-
-    /// In a z-up world `top` looks down z and `front` stays horizontal.
-    #[test]
-    fn presets_follow_the_world_up() {
-        let (min, max) = (Vec3::new(-1.0, -2.0, 0.0), Vec3::new(1.0, 2.0, 1.0));
-        let centre = (min + max) * 0.5;
-        let (eye, target) = ViewPreset::Top.framed(min, max, 0.8, Vec3::Z);
-        assert_eq!(target, centre);
-        assert!(eye.z > max.z, "top eye {eye} not above the scene");
-        assert!((eye.x - centre.x).abs() < 0.1 && (eye.y - centre.y).abs() < 0.1);
-        let (eye, _) = ViewPreset::Front.framed(min, max, 0.8, Vec3::Z);
-        assert!((eye.z - centre.z).abs() < 1e-3, "front eye {eye} not level");
-        // The y-up framing is the orbit camera's own.
-        let (eye, _) = ViewPreset::Iso.framed(min, max, 0.8, Vec3::Y);
-        assert!((eye - ViewPreset::Iso.camera(min, max, 0.8).eye_position()).length() < 1e-4);
-        assert!(grid_planes_for(Vec3::Z).xy && grid_planes_for(Vec3::Y).xz);
-        assert!(grid_planes_for(Vec3::NEG_X).yz);
-    }
-
-    #[test]
-    fn clip_planes_enclose_the_scene() {
-        let (min, max) = (Vec3::splat(-1.0), Vec3::splat(1.0));
-        let (near, far) = clip_planes_for(Vec3::new(0.0, 0.0, 5.0), Vec3::NEG_Z, min, max);
-        assert!(near > 0.0 && near < 4.0, "near {near}");
-        assert!(far > 6.0, "far {far}");
-        // Inside the box the near plane stays positive.
-        let (near, _) = clip_planes_for(Vec3::ZERO, Vec3::NEG_Z, min, max);
-        assert!(near > 0.0);
-    }
-
-    #[test]
-    fn assets_are_selected_by_id_and_kind() {
-        let all = vec![
-            asset("scan", Some(AssetTypeHint::Model)),
-            asset("axis", Some(AssetTypeHint::Subspace)),
-            asset("fit", Some(AssetTypeHint::F64Map)),
-            asset("cloud", Some(AssetTypeHint::FeaMesh)),
-        ];
-        let imports = vec![
-            asset("views", Some(AssetTypeHint::ViewSet)),
-            asset("config", Some(AssetTypeHint::Config)),
-        ];
-        let ids = |assets: &[LoadedAsset]| {
-            assets
-                .iter()
-                .map(|a| a.id().to_string())
-                .collect::<Vec<_>>()
-        };
-        // Exports draw by default; an import draws only when named.
-        assert_eq!(
-            ids(&select_assets(all.clone(), &imports, &[]).unwrap()),
-            ["scan", "axis", "cloud"]
-        );
-        assert_eq!(
-            ids(&select_assets(
-                all.clone(),
-                &imports,
-                &["cloud".to_string(), "scan".to_string(), "views".to_string()]
-            )
-            .unwrap()),
-            ["cloud", "scan", "views"]
-        );
-        let missing = select_assets(all.clone(), &imports, &["nope".to_string()]).unwrap_err();
-        assert!(
-            missing.to_string().contains("scan, axis, cloud, views"),
-            "{missing}"
-        );
-        let wrong = select_assets(all.clone(), &imports, &["fit".to_string()]).unwrap_err();
-        assert!(wrong.to_string().contains("F64Map"), "{wrong}");
-        let wrong = select_assets(all, &imports, &["config".to_string()]).unwrap_err();
-        assert!(wrong.to_string().contains("no picture"), "{wrong}");
-        let none = select_assets(
-            vec![asset("fit", Some(AssetTypeHint::F64Map))],
-            &imports,
-            &[],
-        )
-        .unwrap_err();
-        assert!(none.to_string().contains("--asset: views"), "{none}");
-    }
-
-    #[test]
-    fn plans_follow_the_asset_kind() {
-        let options = PlanOptions {
-            resolution: 64,
-            sharp: false,
-            simplify: true,
-            color_channel: None,
-            color_field: Some("node:confidence".to_string()),
-            color_range: None,
-            wireframe: true,
-        };
-        let sphere = volumetric_assets::get_model("simple_sphere_model").expect("bundled sphere");
-        let model = LoadedAsset::from_parts(
-            "sphere".to_string(),
-            sphere.bytes.to_vec(),
-            Some(AssetTypeHint::Model),
-            vec![],
-        );
-        let request = preview_request(&model, &options);
-        match request.plan {
-            PreviewPlan::Model3d {
-                mesh:
-                    PreviewMeshPlan::AdaptiveSurfaceNets2 {
-                        target_resolution,
-                        settings,
-                        ..
-                    },
-                ..
-            } => {
-                assert_eq!(target_resolution, 64);
-                assert!(!settings.sharp_edges && settings.simplify);
-            }
-            other => panic!("{other:?}"),
-        }
-        assert!(request.wireframe);
-
-        match preview_request(&asset("cloud", Some(AssetTypeHint::FeaMesh)), &options).plan {
-            PreviewPlan::FeaMesh { color_field, .. } => {
-                assert_eq!(color_field.as_deref(), Some("node:confidence"))
-            }
-            other => panic!("{other:?}"),
-        }
-        assert_eq!(
-            preview_request(&asset("axis", Some(AssetTypeHint::Subspace)), &options).plan,
-            PreviewPlan::Subspace
-        );
-        assert_eq!(
-            preview_request(&asset("mesh", Some(AssetTypeHint::TriMesh)), &options).plan,
-            PreviewPlan::TriMesh
-        );
+    fn parse(extra: &[&str]) -> RenderArgs {
+        let mut argv = vec!["render", "-i", "x.vproj", "-o", "x.png"];
+        argv.extend_from_slice(extra);
+        RenderArgs::parse_from(argv)
     }
 
     #[test]
     fn pinhole_pose_rows_build_the_camera_to_world_matrix() {
-        let args = RenderArgs::parse_from([
-            "render",
-            "-i",
-            "x.vproj",
-            "-o",
-            "x.png",
+        let args = parse(&[
             "--intrinsics",
             "400,410,320,240",
             "--pose",
             "1,0,0,5, 0,1,0,6, 0,0,1,7",
         ]);
         match camera_mode(&args).unwrap() {
-            CameraMode::Pinhole {
+            CameraSpec::Pinhole {
                 pinhole,
                 camera_to_world,
             } => {
@@ -1217,24 +475,40 @@ mod tests {
             }
             _ => panic!("expected a pinhole camera"),
         }
-        let half = RenderArgs::parse_from([
-            "render",
-            "-i",
-            "x.vproj",
-            "-o",
-            "x.png",
-            "--pose",
-            "1,0,0,0,0,1,0,0,0,0,1,0",
-        ]);
-        assert!(camera_mode(&half).is_err());
+        assert!(camera_mode(&parse(&["--pose", "1,0,0,0,0,1,0,0,0,0,1,0"])).is_err());
     }
 
+    /// Flag conflicts are refused by name; the rest maps onto the library.
     #[test]
-    fn background_is_linearised() {
-        let white = parse_hex_color("ffffff").unwrap();
-        assert!((white[0] - 1.0).abs() < 1e-6);
-        let grey = parse_hex_color("#808080").unwrap();
-        assert!(grey[0] > 0.2 && grey[0] < 0.22, "{grey:?}");
-        assert!(parse_hex_color("12345").is_err());
+    fn flags_map_onto_the_library_options() {
+        let through = parse(&[
+            "--through",
+            "photos:DSC01",
+            "--overlay",
+            "edge",
+            "--no-ssao",
+        ]);
+        assert_eq!(
+            camera_mode(&through).unwrap(),
+            CameraSpec::Through {
+                asset: Some("photos".to_string()),
+                view: "DSC01".to_string()
+            }
+        );
+        let options = render_options(&through).unwrap();
+        assert_eq!(options.overlay, Some(Overlay::Edge));
+        assert!(!options.ssao && options.plan.sharp && options.width.is_none());
+        let err = camera_mode(&parse(&["--through", "v", "--camera-pos", "0,0,1"])).unwrap_err();
+        assert!(err.to_string().contains("--through"), "{err}");
+        let err = camera_mode(&parse(&["--overlay", "edge"])).unwrap_err();
+        assert!(err.to_string().contains("--through"), "{err}");
+        let presets = camera_mode(&parse(&["--views", "top,front"])).unwrap();
+        assert!(matches!(presets, CameraSpec::Presets(ref v) if v.len() == 2));
+        assert!(render_options(&parse(&["--up", "0,0,0"])).is_err());
+        assert!(render_options(&parse(&["--color-range", "1,0"])).is_err());
+        let ortho =
+            render_options(&parse(&["--projection", "ortho", "--ortho-scale", "2"])).unwrap();
+        assert_eq!(ortho.projection, Projection::Orthographic);
+        assert_eq!(ortho.ortho_scale, 2.0);
     }
 }

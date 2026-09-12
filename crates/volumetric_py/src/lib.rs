@@ -13,6 +13,7 @@ use serde::de::DeserializeOwned;
 
 mod cv;
 mod project;
+mod render;
 mod splat;
 mod viewset;
 
@@ -127,6 +128,7 @@ fn _volumetric(m: &Bound<'_, PyModule>) -> PyResult<()> {
     cv::register(m)?;
     viewset::register(m)?;
     splat::register(m)?;
+    render::register(m)?;
     let names: Vec<String> = m
         .dir()?
         .iter()

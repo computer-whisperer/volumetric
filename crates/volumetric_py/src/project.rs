@@ -16,7 +16,7 @@ use crate::{array2, from_py, invalid, runtime, to_py};
 /// A `.vproj`: imports, a timeline of operator steps and the ids exported.
 #[pyclass(module = "volumetric")]
 pub struct Project {
-    inner: volumetric::Project,
+    pub(crate) inner: volumetric::Project,
 }
 
 fn op_bytes(operator: &Bound<'_, PyAny>) -> PyResult<(String, Vec<u8>)> {
@@ -232,7 +232,7 @@ impl Project {
     }
 }
 
-fn run_exports(
+pub(crate) fn run_exports(
     project: &mut volumetric::Project,
     remote: Option<&str>,
 ) -> PyResult<Vec<LoadedAsset>> {
@@ -279,7 +279,7 @@ fn run_exports(
 /// One exported asset of a run.
 #[pyclass(module = "volumetric")]
 pub struct Asset {
-    inner: LoadedAsset,
+    pub(crate) inner: LoadedAsset,
 }
 
 #[pymethods]

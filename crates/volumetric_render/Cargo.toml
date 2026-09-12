@@ -1,0 +1,17 @@
+[package]
+name = "volumetric_render"
+version = "0.1.0"
+edition = "2024"
+description = "The headless frame: a project's assets drawn through the viewport's preview path to RGBA, from a preset, an explicit camera, a pinhole or a surveyed photograph"
+
+[dependencies]
+volumetric = { path = "../../" }
+volumetric_abi = { path = "../volumetric_abi" }
+volumetric_preview = { path = "../volumetric_preview" }
+volumetric_renderer = { path = "../volumetric_renderer" }
+view_core = { path = "../view_core" }
+anyhow = "1"
+glam = "0.32"
+
+[dev-dependencies]
+volumetric_assets = { path = "../volumetric_assets" }
