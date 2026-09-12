@@ -32,6 +32,11 @@ const ASN2_ARTIFACT_VERSION: u32 = 1;
 pub struct MeshCacheKey([u8; 32]);
 
 impl MeshCacheKey {
+    /// The key's bytes, for callers that fold it into their own identity.
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
     pub fn new(model_wasm: &[u8], config: &AdaptiveMeshConfig2) -> Self {
         // Thread count is an execution-resource choice, not part of the
         // generated geometry recipe. ASN2 is deterministic across worker

@@ -1,6 +1,7 @@
 //! `volumetric._volumetric`: the extension module. Each submodule wraps one
 //! crate's functions one to one — projects (`volumetric`), pictures and
-//! markers (`cv_core`), view sets and splats (`volumetric_abi`). Small
+//! markers (`cv_core`), view sets, splats, mechanisms and assemblies
+//! (`volumetric_abi`). Small
 //! results come back as dicts and lists (`pythonize`), large ones as numpy
 //! arrays; options structs take keyword arguments over their defaults.
 
@@ -12,6 +13,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 mod cv;
+mod mechanism;
 mod project;
 mod render;
 mod splat;
@@ -128,6 +130,7 @@ fn _volumetric(m: &Bound<'_, PyModule>) -> PyResult<()> {
     cv::register(m)?;
     viewset::register(m)?;
     splat::register(m)?;
+    mechanism::register(m)?;
     render::register(m)?;
     let names: Vec<String> = m
         .dir()?

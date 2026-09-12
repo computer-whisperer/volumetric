@@ -130,6 +130,7 @@ pub(crate) fn build_splat_preview(
         },
         stats,
         wireframe_lines: None,
+        mesh_keys: Vec::new(),
         subspace: None,
     })
 }

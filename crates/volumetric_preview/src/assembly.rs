@@ -29,6 +29,22 @@ const AXIS_HALF_FRACTION: f32 = 0.35;
 pub struct PendingAssembly {
     assembly: Arc<Assembly>,
     poses: Vec<Mat4>,
+    /// Each part's mesh identity: its mesh-cache key folded with its name
+    /// (the tint is baked into the vertices).
+    keys: Vec<[u8; 32]>,
+}
+
+/// The identity of a part's ASN2 mesh as uploaded: the mesh-cache key of
+/// its bytes and recipe, folded with the part's name.
+fn part_mesh_key(
+    name: &str,
+    model: &[u8],
+    config: &volumetric::adaptive_surface_nets_2::AdaptiveMeshConfig2,
+) -> [u8; 32] {
+    let key = volumetric::MeshCacheKey::new(model, config);
+    let mut bytes = key.as_bytes().to_vec();
+    bytes.extend_from_slice(name.as_bytes());
+    volumetric::content_fingerprint(&bytes)
 }
 
 /// A part's pose as the renderer's matrix.
@@ -139,6 +155,8 @@ struct BuiltPart {
     points: Option<renderer::PointData>,
     wireframe: Option<renderer::LineData>,
     bounds: ((f32, f32, f32), (f32, f32, f32)),
+    /// The mesh's identity for GPU residency, when it has a stable one.
+    key: Option<[u8; 32]>,
 }
 
 /// Places every built part under its pose, tinted by name, and draws the
@@ -152,6 +170,7 @@ fn place(
     build_start: web_time::Instant,
 ) -> PreviewEntity {
     let mut scene = renderer::SceneData::new();
+    let mut mesh_keys = Vec::new();
     let mut wireframe = renderer::LineData {
         segments: Vec::new(),
     };
@@ -163,6 +182,7 @@ fn place(
                 vertex.color = tint;
             }
             scene.add_mesh(mesh, *pose, renderer::MaterialId(0));
+            mesh_keys.push(built.key);
         }
         if let Some(mut points) = built.points.take() {
             for point in &mut points.points {
@@ -222,6 +242,7 @@ fn place(
         bounds,
         stats,
         wireframe_lines: (!wireframe.segments.is_empty()).then_some(wireframe),
+        mesh_keys,
         subspace: None,
     }
 }
@@ -257,6 +278,7 @@ pub fn build_assembly_preview(
                     points: Some(renderer::convert_points_to_point_data(&points)),
                     wireframe: None,
                     bounds: (min, max),
+                    key: None,
                 })
             })
             .collect::<Result<_, String>>()?,
@@ -278,6 +300,7 @@ pub fn build_assembly_preview(
                     points: None,
                     wireframe: Some(wireframe),
                     bounds: (min, max),
+                    key: None,
                 })
             })
             .collect::<Result<_, String>>()?,
@@ -293,10 +316,19 @@ pub fn build_assembly_preview(
                     config: config.clone(),
                 })
                 .collect();
+            let keys = assembly
+                .parts
+                .iter()
+                .map(|part| part_mesh_key(&part.name, &part.model, &config))
+                .collect();
             return Ok(PreviewStage::NeedsMesh(
                 crate::scene::PendingMesh::assembly(
                     jobs,
-                    PendingAssembly { assembly, poses },
+                    PendingAssembly {
+                        assembly,
+                        poses,
+                        keys,
+                    },
                     stats,
                     build_start,
                 ),
@@ -323,7 +355,8 @@ pub fn finish_assembly_preview(
 ) -> PreviewEntity {
     let built = meshes
         .iter()
-        .map(|mesh| {
+        .zip(&pending.keys)
+        .map(|(mesh, key)| {
             stats.triangles += mesh.indices.len() / 3;
             stats.samples += mesh.stats.total_samples;
             let vertices = mesh_vertices(mesh, &mut stats);
@@ -336,6 +369,7 @@ pub fn finish_assembly_preview(
                 points: None,
                 wireframe: Some(wireframe),
                 bounds: (mesh.bounds_min, mesh.bounds_max),
+                key: Some(*key),
             }
         })
         .collect();
@@ -393,6 +427,7 @@ pub fn build_mechanism_preview(
         },
         stats,
         wireframe_lines: None,
+        mesh_keys: Vec::new(),
         subspace: None,
     })
 }

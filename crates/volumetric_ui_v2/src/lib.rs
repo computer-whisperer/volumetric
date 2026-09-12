@@ -2436,6 +2436,21 @@ impl VolumetricUiV2 {
                 self.last_run_stale = false;
                 self.runtime_assets = assets;
 
+                // A step editor whose form waits on an asset this run made
+                // (an assemble step's state form needs its mechanism) gets
+                // it now; an editor that already has a form keeps its
+                // in-progress buffers.
+                if let Some(edit) = &self.step_edit
+                    && edit.config.is_none()
+                {
+                    let step_idx = edit.step_idx;
+                    if let Some(rebuilt) = self.build_step_edit(step_idx)
+                        && rebuilt.config.is_some()
+                    {
+                        self.step_edit = Some(rebuilt);
+                    }
+                }
+
                 // Drop pins and render overrides for outputs this run no
                 // longer produces.
                 let live: std::collections::BTreeSet<String> = self
@@ -2861,8 +2876,34 @@ impl VolumetricUiV2 {
                     .parameter_schema(source)
                     .map(|schema| (input_idx, schema))
             });
+        // A step with a Mechanism input (Assemble) shows its state as a
+        // form built from the mechanism's joints: one ranged number per
+        // state, once the mechanism has been built or imported.
+        let mechanism_parameter_config = metadata
+            .inputs
+            .iter()
+            .position(|input| matches!(input, OperatorMetadataInput::F64Map))
+            .map(at)
+            .filter(|input_idx| {
+                matches!(step.inputs.get(*input_idx), Some(ExecutionInput::Inline(_)))
+            })
+            .and_then(|input_idx| {
+                let mechanism_slot = metadata
+                    .inputs
+                    .iter()
+                    .position(|input| matches!(input, OperatorMetadataInput::Mechanism))?;
+                let ExecutionInput::AssetRef(id) = step.inputs.get(at(mechanism_slot))? else {
+                    return None;
+                };
+                let bytes = self.declared_asset_bytes(id)?;
+                let mechanism = volumetric::mechanism::decode_mechanism(&bytes).ok()?;
+                let specs = mechanism.parameter_specs();
+                (!specs.is_empty())
+                    .then(|| (input_idx, volumetric::annotations::schema_cddl(&specs)))
+            });
         let config = static_config
             .or(script_parameter_config)
+            .or(mechanism_parameter_config)
             .and_then(|(input_idx, cddl)| {
                 self.build_config_form(
                     step,
@@ -3034,6 +3075,22 @@ impl VolumetricUiV2 {
             (import_len, metadata.clone(), hash.clone()),
         );
         Some((metadata, hash))
+    }
+
+    /// The bytes of a declared asset: a materialized step output from the
+    /// last run, else an import.
+    fn declared_asset_bytes(&self, id: &str) -> Option<Arc<Vec<u8>>> {
+        self.runtime_assets
+            .iter()
+            .find(|asset| asset.id() == id)
+            .map(|asset| asset.data_arc())
+            .or_else(|| {
+                self.project
+                    .imports()
+                    .iter()
+                    .find(|import| import.id == id)
+                    .map(|import| Arc::new(import.data.clone()))
+            })
     }
 
     /// The decoded metadata of an operator import, cached.
@@ -8534,6 +8591,73 @@ mod tests {
                 .is_some(),
             "restoring inline data should restore the annotation-derived form"
         );
+    }
+
+    #[test]
+    fn an_assemble_steps_state_form_comes_from_its_mechanism() {
+        use volumetric::mechanism::{Axis, Joint, JointKind, Mechanism, encode_mechanism};
+        // The default app seeds a sphere, the part; without a mechanism to
+        // read, the state slot is a plain map.
+        let mut app = VolumetricUiV2::default();
+        add_operator_click(&mut app, "assemble_operator");
+        app.step_edit = app.build_step_edit(0);
+        assert!(app.step_edit.as_ref().unwrap().config.is_none());
+
+        // With one imported and wired, the form lists its states.
+        let mechanism = Mechanism::new(
+            vec!["a".to_string(), "b".to_string()],
+            vec![
+                Joint {
+                    name: "mount".to_string(),
+                    kind: JointKind::Fixed,
+                    parent: "world".to_string(),
+                    child: "a".to_string(),
+                    axis: None,
+                    min: 0.0,
+                    max: 0.0,
+                    default: 0.0,
+                    drive: None,
+                },
+                Joint {
+                    name: "swivel".to_string(),
+                    kind: JointKind::Revolute,
+                    parent: "a".to_string(),
+                    child: "b".to_string(),
+                    axis: Some(Axis {
+                        origin: [0.0; 3],
+                        direction: [0.0, 0.0, 1.0],
+                    }),
+                    min: -180.0,
+                    max: 180.0,
+                    default: 10.0,
+                    drive: None,
+                },
+            ],
+        );
+        app.project
+            .imports_mut()
+            .push(volumetric::ImportedAsset::new(
+                "mech".to_string(),
+                encode_mechanism(&mechanism),
+                Some(AssetTypeHint::Mechanism),
+            ));
+        app.set_step_model_input(0, 0, "mech");
+        app.step_edit = app.build_step_edit(0);
+        let edit = app.step_edit.as_ref().expect("assemble step editor");
+        let config = edit.config.as_ref().expect("mechanism-derived state form");
+        assert_eq!(config.name.as_deref(), Some("State"));
+        assert_eq!(config.fields.len(), 1, "one state, the swivel");
+        let swivel = &config.fields[0];
+        assert_eq!(swivel.name, "swivel");
+        assert_eq!((swivel.min, swivel.max), (Some(-180.0), Some(180.0)));
+        assert_eq!(config.buffers.get("swivel").map(String::as_str), Some("10"));
+
+        app.set_config_buffer("swivel", "45".to_string());
+        let state_idx = app.project.timeline()[0].inputs.len() - 1;
+        let ExecutionInput::Inline(bytes) = &app.project.timeline()[0].inputs[state_idx] else {
+            panic!("editing the state must keep an inline F64Map");
+        };
+        assert_eq!(volumetric::f64_map::decode(bytes).unwrap()["swivel"], 45.0);
     }
 
     #[test]

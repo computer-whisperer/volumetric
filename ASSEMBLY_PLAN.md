@@ -215,6 +215,37 @@ variant and everything downstream, which only calls `pose` and
   test for posed joint axes; `operator_metadata` sees the three
   operators.
 
+## P2 as built (2026-09-12)
+
+- Renderer: a retained mesh keeps its vertices as given and takes its
+  transform per draw (an instance vertex buffer of model matrices, slot 0
+  the identity for the immediate soup; normals take the rotation, so
+  rigid or uniform-scale poses only). `RetainedScene.meshes` pairs each
+  mesh with its transform; `submit_retained_mesh(mesh, transform)`;
+  `create_retained_mesh(device, &MeshData)`.
+- Preview: `PreviewEntity.mesh_keys`, a stable identity per mesh (an
+  assembly part's mesh-cache key folded with its name). The session keeps
+  `part_meshes` by key across entity revisions and only re-submits a
+  re-posed part under its new transform; a state change re-meshes and
+  re-uploads nothing. The joint axes (and the wireframe edges) are still
+  rebuilt per state; both are cheap.
+- GUI: an assemble step's inline F64Map slot shows a form built from the
+  wired mechanism's `parameter_specs` (one ranged number per state, the
+  range in the label, the same form scripts get), once the mechanism is
+  built or imported; a run that produces the mechanism gives an open
+  editor its form without touching an existing form's buffers. Sliders
+  were not added: the config form's numeric fields are text inputs
+  everywhere, and a slider widget is a form-wide feature for its own arc.
+- Python: `Mechanism` (load/decode/save/encode, parts, joints,
+  state_keys, default_state, ranges, pose(state) → (n,3,4),
+  velocity(part, point, state) → (k,3)) and `Assembly` (mechanism, parts,
+  part_model, state, poses); `Asset.mechanism()` / `.assembly()`;
+  `test_assembly.py` builds the two-sphere assembly through the operators
+  and checks the kinematics.
+- Not done: joint gizmos regenerated per frame (they are sized to the
+  assembly's own bounds and drawn as retained lines; nothing needs the
+  per-frame form yet).
+
 ## Ledger
 
-- 2026-09-12: ratified; P1 landed 203fbca.
+- 2026-09-12: ratified; P1 landed 203fbca; P2 landed (commit below).

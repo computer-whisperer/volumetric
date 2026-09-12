@@ -426,6 +426,12 @@ pub struct PreviewEntity {
     /// Gizmo geometry is generated at submit time so its extent can follow
     /// the whole scene's bounds, not this entity's own.
     pub subspace: Option<volumetric::subspace::Subspace>,
+    /// A stable identity per `scene.meshes` entry (parallel; empty when
+    /// none has one): the same key means the same vertices, so a host may
+    /// keep the GPU resident and only change the transform it is drawn
+    /// under. An assembly keys each part by its unposed mesh, so a state
+    /// change re-uploads nothing.
+    pub mesh_keys: Vec<Option<[u8; 32]>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

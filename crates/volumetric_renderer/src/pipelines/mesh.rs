@@ -8,10 +8,11 @@ use wgpu::util::DeviceExt;
 
 use crate::{DynamicBuffer, MeshData, MeshVertex};
 
-/// A mesh resident on the GPU: world-space vertices (the transform is
-/// applied at creation) uploaded once and drawn by reference each frame,
-/// so rebuilding a preview is the only time its dense buffers travel to
-/// the device. Created by [`GpuMesh::new`]; drawn via
+/// A mesh resident on the GPU: its vertices as given (the transform is
+/// applied per draw), uploaded once and drawn by reference each frame with
+/// whatever pose the frame submits, so re-posing a part costs nothing and
+/// rebuilding a preview is the only time its dense buffers travel to the
+/// device. Created by [`GpuMesh::new`]; drawn via
 /// `Renderer::submit_retained_mesh`.
 pub struct GpuMesh {
     vertex_buffer: wgpu::Buffer,
@@ -25,26 +26,23 @@ pub struct GpuMesh {
 }
 
 impl GpuMesh {
-    /// Uploads `data`, transformed to world space, clamping to the
-    /// device's `max_buffer_size` limit (keeping the largest renderable
-    /// triangle prefix and reporting what was dropped).
-    pub fn new(device: &wgpu::Device, data: &MeshData, transform: Mat4) -> Self {
+    /// Uploads `data` as given, clamping to the device's `max_buffer_size`
+    /// limit (keeping the largest renderable triangle prefix and reporting
+    /// what was dropped).
+    pub fn new(device: &wgpu::Device, data: &MeshData) -> Self {
         let mut vertices: Vec<MeshVertex> = data
             .vertices
             .iter()
             .map(|v| {
-                let pos = transform.transform_point3(Vec3::from(v.position));
                 // normalize() of a zero/degenerate normal mints NaN, which
                 // renders as uniform white downstream; substitute +Z.
-                let normal = transform
-                    .transform_vector3(Vec3::from(v.normal))
-                    .normalize_or_zero();
+                let normal = Vec3::from(v.normal).normalize_or_zero();
                 let normal = if normal == Vec3::ZERO {
                     Vec3::Z
                 } else {
                     normal
                 };
-                MeshVertex::colored(pos.into(), normal.into(), v.color)
+                MeshVertex::colored(v.position, normal.into(), v.color)
             })
             .collect();
         let mut indices = data.indices.clone();
@@ -154,6 +152,21 @@ impl PartialEq for MeshUniforms {
     }
 }
 
+/// One draw's model matrix, column major, read as an instance attribute.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+struct ModelInstance {
+    columns: [[f32; 4]; 4],
+}
+
+impl ModelInstance {
+    fn of(transform: Mat4) -> Self {
+        Self {
+            columns: transform.to_cols_array_2d(),
+        }
+    }
+}
+
 /// Pipeline for rendering meshes to the G-buffer.
 pub struct MeshPipeline {
     pipeline: wgpu::RenderPipeline,
@@ -162,6 +175,9 @@ pub struct MeshPipeline {
     bind_group: wgpu::BindGroup,
     vertex_buffer: DynamicBuffer<MeshVertex>,
     index_buffer: DynamicBuffer<u32>,
+    /// Slot 0 the identity for the immediate soup, then one entry per
+    /// retained mesh submitted this frame.
+    instance_buffer: DynamicBuffer<ModelInstance>,
     cached_uniforms: Option<MeshUniforms>,
 }
 
@@ -205,35 +221,64 @@ impl MeshPipeline {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<MeshVertex>() as u64,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &[
-                        // position
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32x3,
-                            offset: 0,
-                            shader_location: 0,
-                        },
-                        // normal — offset 16, not 12: MeshVertex pads the
-                        // position out to 16 bytes (_pad0), so the normal
-                        // starts one f32 later than a packed layout would.
-                        // Reading at 12 fed the shader (_pad0, nx, ny),
-                        // which turned exactly-axis-aligned normals into
-                        // normalize((0,0,0)) = NaN.
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32x3,
-                            offset: std::mem::offset_of!(MeshVertex, normal) as u64,
-                            shader_location: 1,
-                        },
-                        // vertex color (multiplied into the base color)
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32x4,
-                            offset: std::mem::offset_of!(MeshVertex, color) as u64,
-                            shader_location: 2,
-                        },
-                    ],
-                })],
+                buffers: &[
+                    Some(wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<MeshVertex>() as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &[
+                            // position
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x3,
+                                offset: 0,
+                                shader_location: 0,
+                            },
+                            // normal — offset 16, not 12: MeshVertex pads the
+                            // position out to 16 bytes (_pad0), so the normal
+                            // starts one f32 later than a packed layout would.
+                            // Reading at 12 fed the shader (_pad0, nx, ny),
+                            // which turned exactly-axis-aligned normals into
+                            // normalize((0,0,0)) = NaN.
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x3,
+                                offset: std::mem::offset_of!(MeshVertex, normal) as u64,
+                                shader_location: 1,
+                            },
+                            // vertex color (multiplied into the base color)
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x4,
+                                offset: std::mem::offset_of!(MeshVertex, color) as u64,
+                                shader_location: 2,
+                            },
+                        ],
+                    }),
+                    // The draw's model matrix, one instance per draw.
+                    Some(wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<ModelInstance>() as u64,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &[
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x4,
+                                offset: 0,
+                                shader_location: 3,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x4,
+                                offset: 16,
+                                shader_location: 4,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x4,
+                                offset: 32,
+                                shader_location: 5,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x4,
+                                offset: 48,
+                                shader_location: 6,
+                            },
+                        ],
+                    }),
+                ],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -313,6 +358,10 @@ impl MeshPipeline {
             wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             "mesh_index_buffer",
         );
+        let instance_buffer = DynamicBuffer::new(
+            wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            "mesh_instance_buffer",
+        );
 
         Self {
             pipeline,
@@ -321,6 +370,7 @@ impl MeshPipeline {
             bind_group,
             vertex_buffer,
             index_buffer,
+            instance_buffer,
             cached_uniforms: None,
         }
     }
@@ -349,6 +399,29 @@ impl MeshPipeline {
         self.index_buffer.upload(device, queue, indices);
     }
 
+    /// Upload this frame's retained meshes' transforms (slot 0 stays the
+    /// identity for the immediate soup). Call before the pass that draws
+    /// them.
+    pub fn upload_transforms(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        transforms: &[Mat4],
+    ) {
+        let instances: Vec<ModelInstance> = std::iter::once(Mat4::IDENTITY)
+            .chain(transforms.iter().copied())
+            .map(ModelInstance::of)
+            .collect();
+        self.instance_buffer.upload(device, queue, &instances);
+    }
+
+    /// The instance buffer slice of entry `index` (0 = identity).
+    fn instance_slice(&self, index: usize) -> Option<wgpu::BufferSlice<'_>> {
+        let stride = std::mem::size_of::<ModelInstance>() as u64;
+        let start = index as u64 * stride;
+        Some(self.instance_buffer.buffer()?.slice(start..start + stride))
+    }
+
     /// Record the G-buffer render pass.
     ///
     /// This renders meshes to the G-buffer textures (color, normal, depth).
@@ -363,6 +436,10 @@ impl MeshPipeline {
         if let Some(buffer) = self.vertex_buffer.buffer() {
             render_pass.set_vertex_buffer(0, buffer.slice(..));
         }
+        let Some(identity) = self.instance_slice(0) else {
+            return;
+        };
+        render_pass.set_vertex_buffer(1, identity);
 
         if use_indices && !self.index_buffer.is_empty() {
             if let Some(buffer) = self.index_buffer.buffer() {
@@ -374,8 +451,10 @@ impl MeshPipeline {
         }
     }
 
-    /// Draw retained meshes into the G-buffer pass. Shares the immediate
-    /// path's pipeline and uniforms (retained vertices are world-space).
+    /// Draw retained meshes into the G-buffer pass, each under the
+    /// transform uploaded for it by [`upload_transforms`](Self::upload_transforms)
+    /// (in the same order). Shares the immediate path's pipeline and
+    /// uniforms.
     pub fn render_retained<'a>(
         &'a self,
         render_pass: &mut wgpu::RenderPass<'a>,
@@ -387,10 +466,14 @@ impl MeshPipeline {
 
         render_pass.set_pipeline(&self.pipeline);
         render_pass.set_bind_group(0, &self.bind_group, &[]);
-        for mesh in meshes {
+        for (i, mesh) in meshes.iter().enumerate() {
             if mesh.draw_count == 0 {
                 continue;
             }
+            let Some(instance) = self.instance_slice(i + 1) else {
+                return;
+            };
+            render_pass.set_vertex_buffer(1, instance);
             render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
             match &mesh.index_buffer {
                 Some(indices) => {

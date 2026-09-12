@@ -526,6 +526,16 @@ impl Asset {
         crate::splat::Splat::decode(self.inner.data())
     }
 
+    /// A `Mechanism` asset decoded.
+    fn mechanism(&self) -> PyResult<crate::mechanism::Mechanism> {
+        crate::mechanism::Mechanism::decode(self.inner.data())
+    }
+
+    /// An `Assembly` asset decoded.
+    fn assembly(&self) -> PyResult<crate::mechanism::Assembly> {
+        crate::mechanism::Assembly::decode(self.inner.data())
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "Asset({:?}, {}, {} bytes)",

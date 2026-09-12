@@ -65,8 +65,8 @@ p.save("posts.vproj")
   (float array) or a Subspace (dict with `origin` and `basis` arrays);
   `.mesh(...)` gives a FeaMesh or TriMesh as arrays, or meshes a Model
   with the adaptive surface nets (`base_resolution`, `max_depth`,
-  `sharp_edges`, `sharp_angle`, `simplify`); `.viewset()` and `.splat()`
-  decode those kinds.
+  `sharp_edges`, `sharp_angle`, `simplify`); `.viewset()`, `.splat()`,
+  `.mechanism()` and `.assembly()` decode those kinds.
 
 ## Measuring in photographs
 
@@ -171,6 +171,22 @@ lines' coordinates and each world mark's `projected` pixel; `.png()` and
 
 Poses are camera-to-world 3x4 row-major: columns are the camera's right,
 down and forward axes in the world and its position.
+
+## Mechanisms and assemblies
+
+An articulated assembly (`ASSEMBLY_PLAN.md`): parts joined by fixed,
+revolute and prismatic joints, authored in the world frame at rest with
+axes in world coordinates at rest, posed by the product of each chain's
+joint motions. `Mechanism.load(path)` / `.decode(bytes)` / `.save` /
+`.encode`; `.parts`, `.joints` (dicts), `.state_keys`, `.default_state`,
+`.ranges`; `.pose(state=None)` gives every part's world <- part map as an
+(n,3,4) array (missing keys take their defaults, out-of-range values are
+refused), `.velocity(part, point, state=None)` the world velocity of a
+point on a part per unit rate of each state as a (k,3) array (the
+Jacobian a drag solves against). `Assembly.load` / `.decode` / `.save` /
+`.encode`; `.mechanism`, `.parts`, `.part_model(name)` (the unposed wasm),
+`.state`, `.poses()` (n,3,4). Build them with the `mechanism_operator`
+and `assemble_operator` steps (the operator READMEs give the config).
 
 Pixel coordinates passed to `triangulate`, `with_picks`, `with_contours`,
 and `View.crop` (center and marks) accept two-element lists as well as

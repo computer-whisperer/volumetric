@@ -20,6 +20,13 @@ struct VsIn {
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) color: vec4<f32>,
+    // The draw's model matrix, one instance per draw: identity for the
+    // immediate soup (already world-space), a retained mesh's pose
+    // otherwise. Rigid or uniform-scale only: normals take its rotation.
+    @location(3) model_0: vec4<f32>,
+    @location(4) model_1: vec4<f32>,
+    @location(5) model_2: vec4<f32>,
+    @location(6) model_3: vec4<f32>,
 };
 
 struct VsOut {
@@ -30,9 +37,10 @@ struct VsOut {
 
 @vertex
 fn vs_main(in: VsIn) -> VsOut {
+    let model = mat4x4<f32>(in.model_0, in.model_1, in.model_2, in.model_3);
     var out: VsOut;
-    out.position = uniforms.view_proj * vec4<f32>(in.position, 1.0);
-    out.normal_world = in.normal;
+    out.position = uniforms.view_proj * model * vec4<f32>(in.position, 1.0);
+    out.normal_world = mat3x3<f32>(model[0].xyz, model[1].xyz, model[2].xyz) * in.normal;
     out.color = in.color;
     return out;
 }

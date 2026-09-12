@@ -795,8 +795,8 @@ pub fn render(
     let mut out = Vec::with_capacity(frames.len());
     for (suffix, view) in frames {
         for (scene, entity) in resident.iter().zip(&entities) {
-            for mesh in &scene.meshes {
-                renderer.submit_retained_mesh(mesh);
+            for (mesh, transform) in &scene.meshes {
+                renderer.submit_retained_mesh(mesh, *transform);
             }
             for lines in &scene.lines {
                 renderer.submit_retained_lines(lines);

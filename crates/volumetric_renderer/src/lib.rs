@@ -128,7 +128,8 @@ impl GeometryOverflow {
 /// [`Renderer::submit_retained_mesh`] and friends.
 #[derive(Default)]
 pub struct RetainedScene {
-    pub meshes: Vec<std::sync::Arc<GpuMesh>>,
+    /// Each mesh with the transform it is drawn under.
+    pub meshes: Vec<(std::sync::Arc<GpuMesh>, Mat4)>,
     pub lines: Vec<std::sync::Arc<GpuLines>>,
     pub points: Vec<std::sync::Arc<GpuPoints>>,
     pub splats: Vec<std::sync::Arc<GpuSplat>>,
@@ -292,6 +293,8 @@ pub struct Renderer {
     // Retained geometry submitted for the current frame (GPU-resident;
     // no per-frame CPU flatten or upload)
     frame_retained_meshes: Vec<std::sync::Arc<GpuMesh>>,
+    /// The transform of each retained mesh submitted this frame, in order.
+    frame_retained_transforms: Vec<Mat4>,
     frame_retained_lines: Vec<std::sync::Arc<GpuLines>>,
     frame_retained_points: Vec<std::sync::Arc<GpuPoints>>,
     frame_retained_splats: Vec<std::sync::Arc<GpuSplat>>,
@@ -320,6 +323,7 @@ impl Renderer {
             frame_lines: Vec::new(),
             frame_points: Vec::new(),
             frame_retained_meshes: Vec::new(),
+            frame_retained_transforms: Vec::new(),
             frame_retained_lines: Vec::new(),
             frame_retained_points: Vec::new(),
             frame_retained_splats: Vec::new(),
@@ -520,7 +524,7 @@ impl Renderer {
                 .meshes
                 .iter()
                 .map(|(mesh, transform, _)| {
-                    std::sync::Arc::new(GpuMesh::new(device, mesh, *transform))
+                    (std::sync::Arc::new(GpuMesh::new(device, mesh)), *transform)
                 })
                 .collect(),
             lines: scene
@@ -580,9 +584,22 @@ impl Renderer {
         )))
     }
 
-    /// Submit a retained mesh for this frame.
-    pub fn submit_retained_mesh(&mut self, mesh: &std::sync::Arc<GpuMesh>) {
+    /// Uploads one mesh as a retained GPU resident, its vertices as
+    /// given; the transform comes at submission. `None` before
+    /// [`initialize`](Self::initialize).
+    pub fn create_retained_mesh(
+        &self,
+        device: &wgpu::Device,
+        mesh: &MeshData,
+    ) -> Option<std::sync::Arc<GpuMesh>> {
+        self.gpu.as_ref()?;
+        Some(std::sync::Arc::new(GpuMesh::new(device, mesh)))
+    }
+
+    /// Submit a retained mesh for this frame, drawn under `transform`.
+    pub fn submit_retained_mesh(&mut self, mesh: &std::sync::Arc<GpuMesh>, transform: Mat4) {
         self.frame_retained_meshes.push(mesh.clone());
+        self.frame_retained_transforms.push(transform);
     }
 
     /// Submit a retained line batch for this frame.
@@ -709,6 +726,8 @@ impl Renderer {
                 );
             self.frame_overflow.dropped_triangles += dropped;
             self.frame_overflow.total_triangles += total;
+            gpu.mesh_pipeline
+                .upload_transforms(device, queue, &self.frame_retained_transforms);
 
             // Upload mesh data
             gpu.mesh_pipeline
@@ -1272,6 +1291,7 @@ impl Renderer {
         self.frame_lines.clear();
         self.frame_points.clear();
         self.frame_retained_meshes.clear();
+        self.frame_retained_transforms.clear();
         self.frame_retained_lines.clear();
         self.frame_retained_points.clear();
         self.frame_retained_splats.clear();

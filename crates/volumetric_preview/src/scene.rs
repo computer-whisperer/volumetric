@@ -419,6 +419,7 @@ fn finish_preview_scene(
         },
         stats,
         wireframe_lines,
+        mesh_keys: Vec::new(),
         subspace: None,
     }
 }
@@ -850,6 +851,7 @@ fn build_sketch_preview(
         },
         stats,
         wireframe_lines: None,
+        mesh_keys: Vec::new(),
         subspace: None,
     })
 }
@@ -1340,6 +1342,7 @@ fn build_fea_mesh_preview(
         bounds,
         stats,
         wireframe_lines: (!is_cloud).then_some(renderer::LineData { segments }),
+        mesh_keys: Vec::new(),
         subspace: None,
     })
 }
@@ -1451,6 +1454,7 @@ fn build_tri_mesh_preview(
         bounds,
         stats,
         wireframe_lines: Some(renderer::LineData { segments }),
+        mesh_keys: Vec::new(),
         subspace: None,
     })
 }
@@ -1494,6 +1498,7 @@ fn build_subspace_preview(
         },
         stats,
         wireframe_lines: None,
+        mesh_keys: Vec::new(),
         subspace: Some(subspace),
     })
 }

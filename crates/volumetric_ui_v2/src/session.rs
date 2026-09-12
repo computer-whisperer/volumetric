@@ -565,6 +565,11 @@ struct ViewportRenderer {
     /// only the handles are submitted — the dense geometry never travels to
     /// the device again until a rebuild lands.
     resident: HashMap<String, ResidentEntity>,
+    /// Retained meshes shared by identity across entity revisions (an
+    /// assembly's parts): a re-posed part is re-submitted under its new
+    /// transform, never re-uploaded. Entries live while a resident refers
+    /// to them.
+    part_meshes: HashMap<[u8; 32], Arc<renderer::GpuMesh>>,
     /// Union bounds of the currently composited scene, for the Frame command.
     scene_bounds: Option<PreviewBounds>,
     /// The set of output ids the camera was last framed against. The camera
@@ -594,6 +599,8 @@ struct ResidentEntity {
     /// The cache revision these buffers were uploaded from.
     revision: u64,
     scene: renderer::RetainedScene,
+    /// The keys of the meshes in `scene` shared through `part_meshes`.
+    part_keys: Vec<[u8; 32]>,
     /// The prebuilt edge wireframe, uploaded lazily the first frame the
     /// (display-only) toggle asks for it, then kept for the entity's
     /// lifetime so toggling stays free.
@@ -626,6 +633,7 @@ impl ViewportRenderer {
             surface_format: format,
             preview_cache: PreviewCache::default(),
             resident: HashMap::new(),
+            part_meshes: HashMap::new(),
             scene_bounds: None,
             framed_ids: None,
             pending_frame_preview: false,
@@ -835,6 +843,55 @@ impl ViewportRenderer {
         self.renderer.frame_overflow().map(overflow_message)
     }
 
+    /// The retained scene of an entity: meshes with a stable identity
+    /// (an assembly's parts) come from `part_meshes`, uploaded once per
+    /// identity; everything else is uploaded for this entity.
+    fn retained_scene_for(
+        renderer: &renderer::Renderer,
+        part_meshes: &mut HashMap<[u8; 32], Arc<renderer::GpuMesh>>,
+        device: &wgpu::Device,
+        entity: &PreviewEntity,
+    ) -> (renderer::RetainedScene, Vec<[u8; 32]>) {
+        if entity.mesh_keys.iter().all(Option::is_none) {
+            return (
+                renderer.create_retained_scene(device, &entity.scene),
+                Vec::new(),
+            );
+        }
+        let rest = renderer::SceneData {
+            meshes: Vec::new(),
+            lines: entity.scene.lines.clone(),
+            points: entity.scene.points.clone(),
+            splats: entity.scene.splats.clone(),
+        };
+        let mut scene = renderer.create_retained_scene(device, &rest);
+        let mut part_keys = Vec::new();
+        for (i, (mesh, transform, _)) in entity.scene.meshes.iter().enumerate() {
+            let key = entity.mesh_keys.get(i).copied().flatten();
+            let gpu = match key {
+                Some(key) => {
+                    part_keys.push(key);
+                    match part_meshes.get(&key) {
+                        Some(gpu) => gpu.clone(),
+                        None => {
+                            let Some(gpu) = renderer.create_retained_mesh(device, mesh) else {
+                                continue;
+                            };
+                            part_meshes.insert(key, gpu.clone());
+                            gpu
+                        }
+                    }
+                }
+                None => match renderer.create_retained_mesh(device, mesh) {
+                    Some(gpu) => gpu,
+                    None => continue,
+                },
+            };
+            scene.meshes.push((gpu, *transform));
+        }
+        (scene, part_keys)
+    }
+
     /// Submits the current output set for rendering, reconciling GPU
     /// residency with the preview cache: an output's retained buffers are
     /// created when its build revision changes and merely re-submitted (by
@@ -887,17 +944,30 @@ impl ViewportRenderer {
             visible.iter().map(|(id, ..)| *id).collect();
         self.resident
             .retain(|id, _| visible_ids.contains(id.as_str()));
+        let live_parts: std::collections::HashSet<[u8; 32]> = self
+            .resident
+            .values()
+            .flat_map(|resident| resident.part_keys.iter().copied())
+            .collect();
+        self.part_meshes.retain(|key, _| live_parts.contains(key));
         for (id, revision, wireframe, entity) in visible {
             if self
                 .resident
                 .get(id)
                 .is_none_or(|resident| resident.revision != revision)
             {
+                let (scene, part_keys) = Self::retained_scene_for(
+                    &self.renderer,
+                    &mut self.part_meshes,
+                    device,
+                    entity,
+                );
                 self.resident.insert(
                     id.to_string(),
                     ResidentEntity {
                         revision,
-                        scene: self.renderer.create_retained_scene(device, &entity.scene),
+                        scene,
+                        part_keys,
                         wireframe: None,
                     },
                 );
@@ -917,8 +987,8 @@ impl ViewportRenderer {
                     &wireframe_style(),
                 );
             }
-            for mesh in &resident.scene.meshes {
-                self.renderer.submit_retained_mesh(mesh);
+            for (mesh, transform) in &resident.scene.meshes {
+                self.renderer.submit_retained_mesh(mesh, *transform);
             }
             for lines in &resident.scene.lines {
                 self.renderer.submit_retained_lines(lines);
@@ -3128,6 +3198,7 @@ mod tests {
             },
             stats: OutputStats::default(),
             wireframe_lines: None,
+            mesh_keys: Vec::new(),
             subspace: None,
         }
     }
