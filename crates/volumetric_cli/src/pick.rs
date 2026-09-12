@@ -112,14 +112,23 @@ fn ruler_number(out: &mut Rgb, x: u32, y: u32, number: u32, scale: u32) {
     }
 }
 
-fn parse2(s: &str, what: &str) -> Result<[f64; 2]> {
-    let v = crate::render::parse_floats(s, 2).with_context(|| format!("Invalid {what}"))?;
-    Ok([f64::from(v[0]), f64::from(v[1])])
-}
-
-fn parse3(s: &str, what: &str) -> Result<[f64; 3]> {
-    let v = crate::render::parse_floats(s, 3).with_context(|| format!("Invalid {what}"))?;
-    Ok([f64::from(v[0]), f64::from(v[1]), f64::from(v[2])])
+// Measurement kernels use f64; routing their coordinates through the
+// renderer's f32 parser loses small changes during iterative fitting.
+fn parse_coordinates<const N: usize>(s: &str, what: &str) -> Result<[f64; N]> {
+    let values = s
+        .split(',')
+        .map(|part| part.trim().parse::<f64>())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("Invalid {what}: expected {N} comma-separated numbers"))?;
+    if values.iter().any(|v| !v.is_finite()) {
+        bail!("Invalid {what}: coordinates must be finite");
+    }
+    values.try_into().map_err(|v: Vec<f64>| {
+        anyhow!(
+            "Invalid {what}: expected {N} comma-separated numbers, got {}",
+            v.len()
+        )
+    })
 }
 
 /// The view and its camera, posed or not.
@@ -149,7 +158,7 @@ pub fn run_view_crop(args: ViewCropArgs) -> Result<()> {
             camera.height
         );
     }
-    let centre = parse2(&args.center, "--center")?;
+    let centre = parse_coordinates::<2>(&args.center, "--center")?;
     let (w, h) = args
         .size
         .split_once('x')
@@ -211,10 +220,10 @@ pub fn run_view_crop(args: ViewCropArgs) -> Result<()> {
         }
     };
     for mark in &args.marks {
-        cross(&mut out, parse2(mark, "--mark")?, MARK);
+        cross(&mut out, parse_coordinates::<2>(mark, "--mark")?, MARK);
     }
     for mark in &args.world_marks {
-        let world = parse3(mark, "--mark-world")?;
+        let world = parse_coordinates::<3>(mark, "--mark-world")?;
         match view.project(camera, world) {
             Some(pixel) => {
                 println!(
@@ -421,7 +430,10 @@ pub fn run_view_pick(args: ViewPickArgs) -> Result<()> {
     } else if let Some(id) = &args.plane {
         Some(plane_of(&load_subspace(&args.input, id)?, id)?)
     } else if let (Some(p), Some(n)) = (&args.plane_point, &args.plane_normal) {
-        Some((parse3(p, "--plane-point")?, parse3(n, "--plane-normal")?))
+        Some((
+            parse_coordinates::<3>(p, "--plane-point")?,
+            parse_coordinates::<3>(n, "--plane-normal")?,
+        ))
     } else {
         None
     };
@@ -433,7 +445,7 @@ pub fn run_view_pick(args: ViewPickArgs) -> Result<()> {
     let eye = view.position().context("the view is not posed")?;
     let mut picked = Vec::new();
     for text in &args.pixels {
-        let pixel = parse2(text, "--pixel")?;
+        let pixel = parse_coordinates::<2>(text, "--pixel")?;
         let (p0, n) = plane.expect("checked above");
         let d = view.ray(camera, pixel).context("the view is not posed")?;
         let denom = n[0] * d[0] + n[1] * d[1] + n[2] * d[2];
@@ -460,7 +472,7 @@ pub fn run_view_pick(args: ViewPickArgs) -> Result<()> {
     }
     let mut projected = Vec::new();
     for text in &args.points {
-        let world = parse3(text, "--point")?;
+        let world = parse_coordinates::<3>(text, "--point")?;
         projected.push(Projected {
             world,
             pixel: view.project(camera, world),
@@ -594,7 +606,7 @@ pub fn run_view_triangulate(args: ViewTriangulateArgs) -> Result<()> {
             .split_once(':')
             .with_context(|| format!("--ray must be VIEW:u,v, got '{text}'"))?;
         let (view, camera) = view_of(&set, id)?;
-        let pixel = parse2(pixel, "--ray pixel")?;
+        let pixel = parse_coordinates::<2>(pixel, "--ray pixel")?;
         let origin = view
             .position()
             .with_context(|| format!("view '{id}' is not posed"))?;
@@ -647,4 +659,20 @@ pub fn run_view_triangulate(args: ViewTriangulateArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn measurement_coordinates_preserve_f64_precision() {
+        assert_eq!(
+            parse_coordinates::<3>("1000000.001, -0.000000001, 6191.123456789", "point").unwrap(),
+            [1000000.001_f64, -0.000000001, 6191.123456789]
+        );
+        for bad in ["NaN,0", "inf,0", "1", "1,2,3", "x,0"] {
+            assert!(parse_coordinates::<2>(bad, "pixel").is_err());
+        }
+    }
 }

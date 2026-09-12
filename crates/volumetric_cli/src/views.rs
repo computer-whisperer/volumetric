@@ -477,7 +477,10 @@ pub(crate) fn find_viewset_asset<'a>(
         None => match sets.as_slice() {
             [] => bail!("no view set asset in the project"),
             [only] => Ok(only),
-            _ => bail!("several view sets; choose one with --views: {}", ids(&sets)),
+            _ => bail!(
+                "several view sets; select one with --views <asset> (for render, --through <asset>:<view>). Available: {}",
+                ids(&sets)
+            ),
         },
     }
 }

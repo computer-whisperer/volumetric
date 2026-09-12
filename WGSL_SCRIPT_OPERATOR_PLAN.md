@@ -23,6 +23,10 @@ P1 delivery notes (what shipped vs the plan):
 - WGSL abstract-float gotcha worth documenting for authors: an
   unannotated `let x = 0.012;` concretizes to f32 — annotate module-alias
   `float` (f64) on `let`/`var` bindings with literal initializers.
+  Builtins can concretize their arguments before that annotation applies:
+  `let x: float = select(-0.050, -0.065, condition);` still produces f32.
+  Use `select(float(-0.050), float(-0.065), condition)` to select f64 values.
+  This was reproduced while building the chair mechanism in September 2026.
 - `volumetric_abi::annotations` now hosts the shared @param option
   grammar; `lua_parameters` delegates to it, `wgsl_parameters` is the
   twin. `WgslSource` metadata input + `AssetTypeHint::WgslSource` +
