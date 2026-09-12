@@ -3,12 +3,53 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use numpy::{PyArray1, PyArray2, PyArray3};
+use numpy::{PyArray1, PyArray2, PyArray3, PyReadonlyArray2};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
+use view_core::measure::{Plane, cast, triangulate_picks};
 use volumetric_abi::viewset::{self as abi, CameraModel, Distortion};
 
-use crate::{array2, array3, from_py, invalid, runtime, to_py};
+use crate::{array2, array3, from_py, invalid, runtime, to_py, vec3_from_py};
+
+/// Rows of an (n,k) array as fixed-size points.
+pub(crate) fn rows<const K: usize>(
+    array: &PyReadonlyArray2<'_, f64>,
+    what: &str,
+) -> PyResult<Vec<[f64; K]>> {
+    let view = array.as_array();
+    if view.ncols() != K {
+        return Err(invalid(format!("{what} is an (n,{K}) array")));
+    }
+    Ok(view
+        .rows()
+        .into_iter()
+        .map(|r| {
+            let mut out = [0.0; K];
+            for (o, v) in out.iter_mut().zip(r.iter()) {
+                *o = *v;
+            }
+            out
+        })
+        .collect())
+}
+
+/// A plane from `plane=(point, normal)` or `z=height`.
+fn plane_arg(plane: Option<&Bound<'_, PyAny>>, z: Option<f64>) -> PyResult<Plane> {
+    match (plane, z) {
+        (Some(p), None) => {
+            let (point, normal): (Bound<'_, PyAny>, Bound<'_, PyAny>) = p
+                .extract()
+                .map_err(|_| invalid("plane is a (point, normal) pair"))?;
+            Ok(Plane {
+                point: vec3_from_py(&point, "the plane's point")?,
+                normal: vec3_from_py(&normal, "the plane's normal")?,
+            })
+        }
+        (None, Some(z)) => Ok(Plane::at_z(z)),
+        (None, None) => Err(invalid("casting needs plane=(point, normal) or z=height")),
+        (Some(_), Some(_)) => Err(invalid("give plane= or z=, not both")),
+    }
+}
 
 /// A view set: cameras, views (photographs with poses and observations)
 /// and the marker field they were measured against.
@@ -144,6 +185,80 @@ impl ViewSet {
             .flat_map(|m| m.corners.iter().flatten().copied())
             .collect();
         array3(py, data, 4, 3)
+    }
+
+    /// A feature picked in two or more views, `{view_id: (u, v)}`,
+    /// triangulated: the world point (3,) and each pick's ray miss in
+    /// metres, in the dict's order.
+    fn triangulate<'py>(
+        &self,
+        py: Python<'py>,
+        picks: &Bound<'py, PyDict>,
+    ) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
+        let mut list = Vec::new();
+        for (key, value) in picks.iter() {
+            let id: String = key
+                .extract()
+                .map_err(|_| invalid("pick keys are view ids"))?;
+            let pixel: (f64, f64) = value
+                .extract()
+                .map_err(|_| invalid(format!("pick for `{id}` is a (u, v) pixel")))?;
+            list.push((id, [pixel.0, pixel.1]));
+        }
+        let (point, gaps) = triangulate_picks(&self.inner, &list).map_err(invalid)?;
+        Ok((
+            PyArray1::from_slice(py, &point),
+            PyArray1::from_vec(py, gaps),
+        ))
+    }
+
+    /// Detect markers (and the card) in every view's picture — or the
+    /// named `ids` — and return the set with the observations stored, plus
+    /// one report dict per picture (`id, width, height, detections,
+    /// corners, blur, seconds`) and the ids skipped for want of a picture.
+    /// `swatches` is a family name or None; `card` is the survey card
+    /// unless a spec dict, JSON text, a path to a card.json, or False;
+    /// `detect` and `corners` take parameter overrides.
+    #[pyo3(signature = (ids=None, swatches="5x5_100", card=None, detect=None, corners=None))]
+    fn detect<'py>(
+        &self,
+        py: Python<'py>,
+        ids: Option<Vec<String>>,
+        swatches: Option<&str>,
+        card: Option<&Bound<'py, PyAny>>,
+        detect: Option<&Bound<'py, PyDict>>,
+        corners: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<(ViewSet, Vec<Bound<'py, PyDict>>, Vec<String>)> {
+        let options = cv_core::ObserveOptions {
+            swatches: swatches.map(crate::cv::dictionary).transpose()?,
+            board: crate::cv::card_arg(card)?,
+            detect: crate::options_from_dict(detect)?,
+            corners: crate::options_from_dict(corners)?,
+        };
+        if options.swatches.is_none() && options.board.is_none() {
+            return Err(invalid("nothing to look for: give swatches or a card"));
+        }
+        let mut set = (*self.inner).clone();
+        let ids = ids.unwrap_or_default();
+        let outcome = py
+            .detach(|| view_core::detect::detect_views(&mut set, &ids, &options, |_, _| {}))
+            .map_err(runtime)?;
+        let reports = outcome
+            .pictures
+            .iter()
+            .map(|d| {
+                let r = PyDict::new(py);
+                r.set_item("id", &d.id)?;
+                r.set_item("width", d.width)?;
+                r.set_item("height", d.height)?;
+                r.set_item("detections", to_py(py, &d.seen.detections)?)?;
+                r.set_item("corners", to_py(py, &d.seen.corners)?)?;
+                r.set_item("blur", to_py(py, &d.seen.blur)?)?;
+                r.set_item("seconds", d.seconds)?;
+                Ok(r)
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        Ok((ViewSet::wrap(set), reports, outcome.skipped))
     }
 
     /// The survey card (spec and solved corners) as a dict, or None.
@@ -285,6 +400,16 @@ impl View {
     fn view(&self) -> &abi::View {
         &self.set.views[self.index]
     }
+
+    fn view_and_camera(&self) -> PyResult<(&abi::View, &CameraModel)> {
+        let view = self.view();
+        let camera = self
+            .set
+            .cameras
+            .get(view.camera as usize)
+            .ok_or_else(|| runtime("view names a camera the set does not have"))?;
+        Ok((view, camera))
+    }
 }
 
 #[pymethods]
@@ -358,6 +483,63 @@ impl View {
             .as_ref()
             .map(|o| to_py(py, o))
             .transpose()
+    }
+
+    /// World points (n,3) projected through the camera and its
+    /// distortion, (n,2); NaN rows for points behind the camera.
+    fn project<'py>(
+        &self,
+        py: Python<'py>,
+        points: PyReadonlyArray2<'py, f64>,
+    ) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let (view, camera) = self.view_and_camera()?;
+        let mut out = Vec::new();
+        for p in rows::<3>(&points, "points")? {
+            match view.project(camera, p) {
+                Some(px) => out.extend_from_slice(&px),
+                None => out.extend([f64::NAN, f64::NAN]),
+            }
+        }
+        array2(py, out, 2)
+    }
+
+    /// The world-space unit directions pixels (n,2) look along, (n,3).
+    fn ray<'py>(
+        &self,
+        py: Python<'py>,
+        pixels: PyReadonlyArray2<'py, f64>,
+    ) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let (view, camera) = self.view_and_camera()?;
+        let mut out = Vec::new();
+        for px in rows::<2>(&pixels, "pixels")? {
+            let d = view
+                .ray(camera, px)
+                .ok_or_else(|| invalid("the view is not posed"))?;
+            out.extend_from_slice(&d);
+        }
+        array2(py, out, 3)
+    }
+
+    /// Pixels (n,2) cast onto a plane — `plane=(point, normal)` or
+    /// `z=height` — as world points (n,3) and their depths (n,).
+    #[pyo3(signature = (pixels, plane=None, z=None))]
+    fn cast<'py>(
+        &self,
+        py: Python<'py>,
+        pixels: PyReadonlyArray2<'py, f64>,
+        plane: Option<&Bound<'py, PyAny>>,
+        z: Option<f64>,
+    ) -> PyResult<(Bound<'py, PyArray2<f64>>, Bound<'py, PyArray1<f64>>)> {
+        let plane = plane_arg(plane, z)?;
+        let (view, camera) = self.view_and_camera()?;
+        let mut world = Vec::new();
+        let mut depths = Vec::new();
+        for px in rows::<2>(&pixels, "pixels")? {
+            let hit = cast(view, camera, px, &plane).map_err(invalid)?;
+            world.extend_from_slice(&hit.world);
+            depths.push(hit.depth);
+        }
+        Ok((array2(py, world, 3)?, PyArray1::from_vec(py, depths)))
     }
 
     /// The embedded picture's bytes (JPEG/PNG), or None.

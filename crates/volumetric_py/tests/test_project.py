@@ -96,3 +96,17 @@ def test_bundled_model_is_an_import():
     mid = p.add_model(v.model_bytes("simple_sphere_model"), id="ball")
     assert mid == "ball"
     assert ("ball", "Model") in p.asset_ids()
+
+
+def test_models_sample_in_process():
+    p = cylinder_project()
+    post = p.run()["post"]
+    assert post.dimensions == 3
+    lo, hi = post.bounds()                                   # the operator pads its bounds
+    assert (lo <= [-0.05, -0.05, 0.0]).all() and (hi >= [0.05, 0.05, 0.2]).all()
+    assert (hi - lo < 0.4).all()
+    points = np.array([[0, 0, 0.1], [0.04, 0, 0.1], [0.06, 0, 0.1], [0, 0, 0.25]])
+    assert post.occupied(points).tolist() == [True, True, False, False]
+    assert (post.sample(points) > 0.5).tolist() == [True, True, False, False]
+    with pytest.raises(ValueError, match=r"\(n,3\)"):
+        post.sample(np.zeros((2, 2)))

@@ -9,6 +9,8 @@ use cv_core::{
 use numpy::{PyArray2, PyReadonlyArray2, PyReadonlyArray3};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
+use view_core::detect::card_spec_from_json;
+use view_core::stills::{StillsOptions, import_stills as import_stills_core};
 use volumetric_abi::viewset::{BoardSpec, Marker};
 
 use crate::viewset::{Camera, ViewSet};
@@ -99,7 +101,7 @@ impl Gray {
     }
 }
 
-fn dictionary(name: &str) -> PyResult<Dictionary> {
+pub(crate) fn dictionary(name: &str) -> PyResult<Dictionary> {
     Dictionary::by_name(name).ok_or_else(|| {
         invalid(format!(
             "unknown marker family `{name}` (5x5_100, 4x4_50, 36h11)"
@@ -108,24 +110,34 @@ fn dictionary(name: &str) -> PyResult<Dictionary> {
 }
 
 /// A board spec from `"survey_card"` or an absent argument (the survey
-/// card), `False` (no board) or a dict of `BoardSpec` fields.
+/// card), `False` (no board), a dict of `BoardSpec` fields, JSON text
+/// (either the ABI's shape or the scanner's card.json), or the path of
+/// such a file.
 fn board_spec(value: Option<&Bound<'_, PyAny>>) -> PyResult<Option<BoardSpec>> {
     match value {
         None => Ok(Some(BoardSpec::survey_card())),
         Some(v) if v.is_none() => Ok(Some(BoardSpec::survey_card())),
         Some(v) if matches!(v.extract::<bool>(), Ok(false)) => Ok(None),
         Some(v) => {
-            if let Ok(name) = v.extract::<String>() {
-                if name == "survey_card" {
+            if let Ok(text) = v.extract::<String>() {
+                if text == "survey_card" {
                     return Ok(Some(BoardSpec::survey_card()));
                 }
-                return Err(invalid(format!(
-                    "unknown board `{name}`; pass \"survey_card\", False or a dict of BoardSpec fields"
-                )));
+                let json = if text.trim_start().starts_with('{') {
+                    text
+                } else {
+                    std::fs::read_to_string(&text)
+                        .map_err(|e| invalid(format!("card `{text}`: {e}")))?
+                };
+                return card_spec_from_json(&json).map(Some).map_err(invalid);
             }
             Ok(Some(from_py::<BoardSpec>(v)?))
         }
     }
+}
+
+pub(crate) fn card_arg(value: Option<&Bound<'_, PyAny>>) -> PyResult<Option<BoardSpec>> {
+    board_spec(value)
 }
 
 /// Find markers of the given families. Keyword arguments are
@@ -323,6 +335,39 @@ fn render_board<'py>(
     Ok(Gray { inner: picture })
 }
 
+/// A card spec as a dict from `"survey_card"`, a dict, JSON text or a
+/// card.json path.
+#[pyfunction]
+#[pyo3(signature = (card=None))]
+fn card_spec<'py>(
+    py: Python<'py>,
+    card: Option<&Bound<'py, PyAny>>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let spec = board_spec(card)?.ok_or_else(|| invalid("card_spec needs a card"))?;
+    to_py(py, &spec)
+}
+
+/// Import a directory of stills as an unposed view set: one view per
+/// picture, cameras seeded from EXIF (or `fov_deg`), pictures embedded per
+/// `embed` (`"preview"`, `"full"`, `"none"`). Keyword arguments are
+/// `StillsOptions` fields (`extensions`, `embed`, `preview_px`,
+/// `preview_quality`, `sensor_mm`, `fov_deg`, `labels`). Returns the set
+/// and the report as a dict.
+#[pyfunction]
+#[pyo3(signature = (dir, **options))]
+fn import_stills<'py>(
+    py: Python<'py>,
+    dir: &str,
+    options: Option<&Bound<'py, PyDict>>,
+) -> PyResult<(ViewSet, Bound<'py, PyAny>)> {
+    let options: StillsOptions = options_from_kwargs(options)?;
+    let dir = std::path::PathBuf::from(dir);
+    let (set, report) = py
+        .detach(|| import_stills_core(&dir, &options))
+        .map_err(runtime)?;
+    Ok((ViewSet::wrap(set), to_py(py, &report)?))
+}
+
 /// The survey card's spec as a dict.
 #[pyfunction]
 fn survey_card<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
@@ -356,6 +401,8 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(render_markers, m)?)?;
     m.add_function(wrap_pyfunction!(render_board, m)?)?;
     m.add_function(wrap_pyfunction!(survey_card, m)?)?;
+    m.add_function(wrap_pyfunction!(card_spec, m)?)?;
+    m.add_function(wrap_pyfunction!(import_stills, m)?)?;
     m.add_function(wrap_pyfunction!(board_corners, m)?)?;
     Ok(())
 }

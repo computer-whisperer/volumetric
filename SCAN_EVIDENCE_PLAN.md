@@ -7,9 +7,9 @@ view-solve, view_solve_operator, GUI Import Still). C2 (card detection)
 landed 2026-09-11. C3 (survey bundle) landed 2026-09-11 together with the
 parts of C1 it needed (schema 2, `view-import --stills`, Sony focus keys);
 C1's remaining audits fold into D. S1 (splat value, import, listing,
-points) and S2 (splat rendering) landed 2026-09-11, P1 (Python bindings:
-projects, cv, view sets, splats) 2026-09-12. C4, S3, P2 and D (audits)
-pending; order C4, D, P2, S3.
+points) and S2 (splat rendering) landed 2026-09-11, P1+P2 (Python bindings:
+projects, cv, view sets, splats, measuring, sampling, intake) 2026-09-12.
+C4, S3, P3 and D (audits) pending; order C4, D, P3, S3.
 
 ## Why
 
@@ -140,7 +140,7 @@ measurement feedback. All evidence paths above are under
 | S1 | Splat value, 3DGS PLY import, `splat-list`, splat to point cloud | 2 days | landed |
 | S2 | Splat rendering in the viewport and `render`, look-through over the photograph | 4 days | landed |
 | S3 | Photometric audit: the splat rendered through each view against its photograph | 2 days | pending |
-| P | Python bindings (PyO3, maturin) over cv_core, view_core, the survey, splats and projects | 3 days | P1 landed 2026-09-12; P2 (render, set_config, import_stills) pending |
+| P | Python bindings (PyO3, maturin) over cv_core, view_core, the survey, splats and projects | 3 days | P1+P2 landed 2026-09-12; P3 (render, add_views, crop, set_config, observations value) pending |
 | D | Evidence audits for still sets: intake, detection, survey, setup, coverage, photometric, physical | 3 days | pending |
 
 Proposed order: C2, C3 (the survey is the stage the agent starts from and
@@ -822,10 +822,17 @@ chair demo set surveyed from Python matches the CLI's poses within 4 mm):
 - `render_board(...)` from cv_core's synthetic renderer, so the shim's
   synthetic-scene tests can be ported without OpenCV.
 
-Deferred to P2: `render(...)` through the native offscreen path (needs
+P2 (landed 2026-09-12): `View.project/cast/ray`, `ViewSet.triangulate`
+(`view_core::measure`, shared with `view-pick`/`view-triangulate`),
+`Asset.sample/occupied/bounds/dimensions`, `import_stills(dir, **StillsOptions)`,
+`ViewSet.detect(...)` (`view_core::detect`, shared with `view-detect`),
+`card_spec`. The chair_photo measurement report replays exactly.
+
+Deferred to P3: `render(...)` through the native offscreen path (needs
 the CLI's render command factored into a library entry first),
-`Project.set_config`, `import_stills`, `ViewSet` mutation (poses from
-Python), `Asset.model` sampling.
+`Project.add_views` (view-select), `View.crop`, `Project.set_config`,
+`ViewSet` mutation (poses from Python), observations as a first-class
+value (named feature picks and contours on the view set — an ABI decision).
 
 Tests (`crates/volumetric_py/tests`, pytest in the shim's venv): a
 cylinder built and run, its mesh bounds checked; a synthetic board

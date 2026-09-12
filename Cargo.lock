@@ -6072,9 +6072,11 @@ name = "view_core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cloud_core",
  "cv_core",
  "image",
  "rayon",
+ "serde",
  "serde_json",
  "volumetric_abi",
 ]

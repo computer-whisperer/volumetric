@@ -87,7 +87,8 @@ impl Default for Selection {
 }
 
 /// Provenance the importer cannot read from the manifest.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Labels {
     pub session: Option<String>,
     pub rig: Option<String>,

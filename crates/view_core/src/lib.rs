@@ -14,6 +14,9 @@ pub mod overlay;
 pub mod residual;
 pub mod stills;
 
+pub mod detect;
+pub mod measure;
+
 pub use manifest::{
     Eye, ImportReport, Labels, ManifestKind, Selection, import_manifest, select_views,
 };

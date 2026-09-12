@@ -64,6 +64,21 @@ p.save("posts.vproj")
   `sharp_edges`, `sharp_angle`, `simplify`); `.viewset()` and `.splat()`
   decode those kinds.
 
+## Measuring in photographs
+
+```python
+view = views.view("DSC00755")
+px = view.project(points)                  # (n,3) world -> (n,2) pixels through the distortion; NaN behind
+world, depth = view.cast(px, z=0.0)        # pixels onto a plane: z=height or plane=(point, normal)
+point, gaps = views.triangulate({"DSC00755": (3728, 919), "DSC00758": (2513, 2011)})  # metres, ray misses
+values = asset.sample(points); inside = asset.occupied(points); lo, hi = asset.bounds()  # a Model, in process
+```
+
+These are the calls behind `view-pick`, `view-triangulate` and `sample`
+(`view_core::measure`), so a script that shelled out per feature can loop
+in Python instead. `examples/chair_photo`'s committed measurement replays
+through them to the same points, ray misses and check-view errors.
+
 ## Pictures and markers
 
 ```python
@@ -73,6 +88,19 @@ obs = v.observe(gray)                          # swatches + survey card: detecti
 solve = v.solve_still(gray, views, file=open("DSC00742.JPG", "rb").read())  # pose against a view set's field
 solved, report = v.survey(views, rounds=6)     # the survey; report is SurveyReport as a dict
 ```
+
+The survey from a directory of stills:
+
+```python
+views, report = v.import_stills("/photos", embed="preview", labels={"session": "chair"})  # StillsOptions kwargs
+views, reports, skipped = views.detect(swatches="5x5_100", card="card.json")            # observations on the views
+solved, report = v.survey(views)
+```
+
+`ViewSet.detect` stores each picture's markers, card corners and blur on
+its view (`view.observations`) and the card's spec on the set; `card`
+takes the survey card by default, a spec dict, JSON text, a card.json
+path or `False`. `card_spec(...)` shows what a card argument parses to.
 
 Options are keyword arguments over the crate's defaults (`DetectParams`
 for `detect`, `SurveyOptions` for `survey`, `Render` for the renderers);

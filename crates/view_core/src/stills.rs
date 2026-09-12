@@ -14,7 +14,8 @@ use crate::image::{decode_rgb, dimensions_of};
 use crate::manifest::Labels;
 
 /// How much of each picture the set carries.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Embed {
     /// The original file.
     Full,
@@ -25,7 +26,8 @@ pub enum Embed {
     None,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct StillsOptions {
     /// Files with these extensions (case-insensitive) are stills.
     pub extensions: Vec<String>,
@@ -58,7 +60,7 @@ impl Default for StillsOptions {
 }
 
 /// What the import found, for the report.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
 pub struct StillsReport {
     pub total: usize,
     /// Views per camera key, in the cameras' order.

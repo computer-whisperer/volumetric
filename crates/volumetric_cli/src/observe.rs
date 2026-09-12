@@ -15,10 +15,10 @@ use cv_core::dict::Dictionary;
 use cv_core::gray::Gray;
 use cv_core::observe::{ObserveOptions, Observed, observe};
 use serde::Serialize;
+use view_core::detect::{Detected, card_spec_from_json, detect_views};
 use view_core::image::{Rgb, decode_rgb};
-use view_core::stills::full_picture;
 use volumetric::{AssetTypeHint, Project};
-use volumetric_abi::viewset::{Board, BoardSpec, ViewSet, decode_viewset, encode_viewset};
+use volumetric_abi::viewset::{BoardSpec, ViewSet, decode_viewset, encode_viewset};
 
 use crate::views::{find_viewset_asset, project_assets};
 
@@ -132,44 +132,11 @@ struct DetectReport {
     saved: Option<String>,
 }
 
-/// A card spec from JSON in either this crate's shape or the scanner's
-/// `card.json` (`square_m`, `square_x_m`/`square_y_m`, `dictionary`).
+/// A card spec from a JSON file (see `view_core::detect::card_spec_from_json`).
 pub fn read_card_spec(path: &Path) -> Result<BoardSpec> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read {}", path.display()))?;
-    let value: serde_json::Value =
-        serde_json::from_str(&text).with_context(|| format!("{} is not JSON", path.display()))?;
-    let spec = if value.get("pitch_x_m").is_some() {
-        serde_json::from_value::<BoardSpec>(value)
-            .with_context(|| format!("{} is not a board spec", path.display()))?
-    } else {
-        let num = |key: &str| -> Option<f64> { value.get(key).and_then(|v| v.as_f64()) };
-        let int = |key: &str| -> Option<u32> {
-            value.get(key).and_then(|v| v.as_u64()).map(|v| v as u32)
-        };
-        let square = num("square_m");
-        let family = value
-            .get("dictionary")
-            .and_then(|v| v.as_str())
-            .context("card.json has no dictionary")?;
-        let dict = Dictionary::by_name(family)
-            .with_context(|| format!("unknown marker family '{family}' in {}", path.display()))?;
-        BoardSpec {
-            squares_x: int("squares_x").context("card.json has no squares_x")?,
-            squares_y: int("squares_y").context("card.json has no squares_y")?,
-            pitch_x_m: num("square_x_m")
-                .or(square)
-                .context("card.json has no square_m")?,
-            pitch_y_m: num("square_y_m")
-                .or(square)
-                .context("card.json has no square_m")?,
-            marker_m: num("marker_m").context("card.json has no marker_m")?,
-            family: dict.name.to_string(),
-            first_id: int("first_id").unwrap_or(0),
-        }
-    };
-    spec.validate().map_err(anyhow::Error::msg)?;
-    Ok(spec)
+    card_spec_from_json(&text).with_context(|| format!("{} is not a card spec", path.display()))
 }
 
 fn options_of(args: &ViewDetectArgs) -> Result<ObserveOptions> {
@@ -206,10 +173,23 @@ fn observe_picture(name: &str, photo: &Rgb, options: &ObserveOptions) -> (Observ
     let start = Instant::now();
     let gray = Gray::from_rgb8(photo.width, photo.height, &photo.pixels);
     let seen = observe(&gray, options);
-    let report = PictureReport {
-        picture: name.to_string(),
+    let detected = Detected {
+        id: name.to_string(),
         width: photo.width,
         height: photo.height,
+        seen,
+        seconds: start.elapsed().as_secs_f64(),
+    };
+    let report = picture_report(&detected, options);
+    (detected.seen, report)
+}
+
+fn picture_report(detected: &Detected, options: &ObserveOptions) -> PictureReport {
+    let seen = &detected.seen;
+    PictureReport {
+        picture: detected.id.clone(),
+        width: detected.width,
+        height: detected.height,
         markers: seen
             .detections
             .iter()
@@ -242,12 +222,10 @@ fn observe_picture(name: &str, photo: &Rgb, options: &ObserveOptions) -> (Observ
             worst: seen.blur.worst(),
             profiles: seen.blur.profiles,
         },
-        seconds: start.elapsed().as_secs_f64(),
-    };
-    (seen, report)
+        seconds: detected.seconds,
+    }
 }
 
-/// Draws the detections on the photograph.
 fn annotate(photo: &Rgb, seen: &Observed, options: &ObserveOptions) -> Rgb {
     let mut out = photo.clone();
     let thickness = ((photo.width.max(photo.height) as f64) / 1000.0)
@@ -403,55 +381,33 @@ pub(crate) fn detect_set(
     annotate_dir: Option<&Path>,
     print: bool,
 ) -> Result<(Vec<PictureReport>, Vec<String>)> {
-    let mut indices: Vec<usize> = (0..set.views.len()).collect();
-    if !view_ids.is_empty() {
-        for id in view_ids {
-            if !set.views.iter().any(|v| &v.id == id) {
-                bail!("no view '{id}' in the set");
-            }
-        }
-        indices.retain(|&i| view_ids.contains(&set.views[i].id));
-    }
     let mut pictures = Vec::new();
-    let mut skipped = Vec::new();
-    for i in indices {
-        let id = set.views[i].id.clone();
-        if set.views[i].image.is_none() && set.views[i].source.is_none() {
-            skipped.push(id);
-            continue;
-        }
-        let photo = match full_picture(set, &set.views[i]).and_then(|bytes| decode_rgb(&bytes)) {
-            Ok(photo) => photo,
-            Err(err) => {
-                eprintln!("view '{id}': no picture to detect in: {err:#}");
-                skipped.push(id);
-                continue;
-            }
-        };
-        let (seen, picture) = observe_picture(&id, &photo, options);
+    let mut failure: Option<anyhow::Error> = None;
+    let outcome = detect_views(set, view_ids, options, |detected, photo| {
+        let report = picture_report(detected, options);
         if print {
-            print_picture(&picture);
+            print_picture(&report);
         }
-        if let Some(dir) = annotate_dir {
-            let out = dir.join(format!("{id}_detect.png"));
-            std::fs::write(&out, annotate(&photo, &seen, options).to_png()?)
-                .with_context(|| format!("Failed to write {}", out.display()))?;
+        if let Some(dir) = annotate_dir
+            && failure.is_none()
+        {
+            let out = dir.join(format!("{}_detect.png", detected.id));
+            let written = annotate(photo, &detected.seen, options)
+                .to_png()
+                .and_then(|png| {
+                    std::fs::write(&out, png)
+                        .with_context(|| format!("Failed to write {}", out.display()))
+                });
+            if let Err(err) = written {
+                failure = Some(err);
+            }
         }
-        set.views[i].observations = Some(seen.to_observations());
-        pictures.push(picture);
+        pictures.push(report);
+    })?;
+    if let Some(err) = failure {
+        return Err(err);
     }
-    if let Some(spec) = &options.board {
-        // Solved corners survive only for the same card.
-        let corners = match set.board.take() {
-            Some(board) if &board.spec == spec => board.corners,
-            _ => Vec::new(),
-        };
-        set.board = Some(Board {
-            spec: spec.clone(),
-            corners,
-        });
-    }
-    Ok((pictures, skipped))
+    Ok((pictures, outcome.skipped))
 }
 
 fn stem(path: &Path) -> String {

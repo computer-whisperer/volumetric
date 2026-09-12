@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use numpy::{PyArray1, PyArray2, PyUntypedArrayMethods};
+use numpy::{PyArray1, PyArray2, PyReadonlyArray2, PyUntypedArrayMethods};
 use pyo3::IntoPyObjectExt;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
@@ -433,6 +433,49 @@ impl Asset {
         }
     }
 
+    /// A model's dimensionality (3 for a volume, 2 for a sketch).
+    #[getter]
+    fn dimensions(&self) -> PyResult<u32> {
+        Ok(self.executor()?.dimensions())
+    }
+
+    /// A model's bounds as (min, max) arrays of its dimensionality.
+    fn bounds<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
+        let mut executor = self.executor()?;
+        let bounds = executor.get_bounds_nd().map_err(runtime)?;
+        let n = bounds.dimensions();
+        let lo: Vec<f64> = (0..n).map(|i| bounds.min(i)).collect();
+        let hi: Vec<f64> = (0..n).map(|i| bounds.max(i)).collect();
+        Ok((PyArray1::from_vec(py, lo), PyArray1::from_vec(py, hi)))
+    }
+
+    /// A model's occupancy value at points (n,k), (n,) float32: inside
+    /// where > 0.5 (see `occupied`).
+    fn sample<'py>(
+        &self,
+        py: Python<'py>,
+        points: PyReadonlyArray2<'py, f64>,
+    ) -> PyResult<Bound<'py, PyArray1<f32>>> {
+        Ok(PyArray1::from_vec(py, self.values(py, points)?))
+    }
+
+    /// Whether a model is occupied at points (n,k), (n,) bool.
+    fn occupied<'py>(
+        &self,
+        py: Python<'py>,
+        points: PyReadonlyArray2<'py, f64>,
+    ) -> PyResult<Bound<'py, PyArray1<bool>>> {
+        let flags: Vec<bool> = self
+            .values(py, points)?
+            .into_iter()
+            .map(volumetric::is_occupied)
+            .collect();
+        Ok(PyArray1::from_vec(py, flags))
+    }
+
     /// A `ViewSet` asset decoded.
     fn viewset(&self) -> PyResult<crate::viewset::ViewSet> {
         crate::viewset::ViewSet::decode(self.inner.data())
@@ -450,6 +493,39 @@ impl Asset {
             self.kind(),
             self.inner.data().len()
         )
+    }
+}
+
+impl Asset {
+    fn values(&self, py: Python<'_>, points: PyReadonlyArray2<'_, f64>) -> PyResult<Vec<f32>> {
+        let mut executor = self.executor()?;
+        let k = executor.dimensions() as usize;
+        let view = points.as_array();
+        if view.ncols() != k {
+            return Err(invalid(format!(
+                "{} is {k}D: points are (n,{k})",
+                self.inner.id()
+            )));
+        }
+        let pts: Vec<Vec<f64>> = view.rows().into_iter().map(|r| r.to_vec()).collect();
+        py.detach(move || {
+            pts.iter()
+                .map(|p| executor.sample_nd(p))
+                .collect::<Result<Vec<f32>, _>>()
+        })
+        .map_err(runtime)
+    }
+
+    fn executor(&self) -> PyResult<volumetric::wasm::native::NativeModelExecutor> {
+        if self.inner.type_hint() != Some(AssetTypeHint::Model) {
+            return Err(invalid(format!(
+                "{} is {}, not a model",
+                self.inner.id(),
+                self.kind()
+            )));
+        }
+        volumetric::wasm::native::NativeModelExecutor::new(self.inner.data())
+            .map_err(|e| runtime(format!("failed to instantiate {}: {e}", self.inner.id())))
     }
 }
 

@@ -13,6 +13,7 @@ use clap::Parser;
 use serde::Serialize;
 use view_core::full_picture;
 use view_core::image::{Rgb, decode_rgb};
+use view_core::measure::{Plane, cast, chart, plane_of, triangulate_picks};
 use volumetric::AssetTypeHint;
 use volumetric_abi::subspace::{Subspace, decode_subspace};
 use volumetric_abi::viewset::{CameraModel, View, ViewSet};
@@ -372,43 +373,6 @@ fn load_subspace(input: &Path, id: &str) -> Result<Subspace> {
     decode_subspace(asset.data()).map_err(|e| anyhow!("asset '{id}': {e}"))
 }
 
-fn plane_of(subspace: &Subspace, id: &str) -> Result<([f64; 3], [f64; 3])> {
-    if subspace.ambient() != 3 || subspace.rank() != 2 {
-        bail!(
-            "asset '{id}' is a rank {} subspace in {}-space, not a plane",
-            subspace.rank(),
-            subspace.ambient()
-        );
-    }
-    let n = subspace.normal().context("the plane has no normal")?;
-    Ok((
-        [subspace.origin[0], subspace.origin[1], subspace.origin[2]],
-        [n[0], n[1], n[2]],
-    ))
-}
-
-/// Coordinates of `p` in a subspace's chart: along each basis vector,
-/// then along the normal for a plane in 3-space.
-fn chart(subspace: &Subspace, p: [f64; 3]) -> Vec<f64> {
-    let d = [
-        p[0] - subspace.origin[0],
-        p[1] - subspace.origin[1],
-        p[2] - subspace.origin[2],
-    ];
-    let mut out: Vec<f64> = (0..subspace.rank())
-        .map(|i| {
-            let b = subspace.basis_vector(i);
-            b[0] * d[0] + b[1] * d[1] + b[2] * d[2]
-        })
-        .collect();
-    if subspace.rank() == 2
-        && let Some(n) = subspace.normal()
-    {
-        out.push(n[0] * d[0] + n[1] * d[1] + n[2] * d[2]);
-    }
-    out
-}
-
 pub fn run_view_pick(args: ViewPickArgs) -> Result<()> {
     let set = load_viewset(&args.input, args.views.as_deref())?;
     let (view, camera) = view_of(&set, &args.view)?;
@@ -425,15 +389,15 @@ pub fn run_view_pick(args: ViewPickArgs) -> Result<()> {
         }
         None => None,
     };
-    let plane: Option<([f64; 3], [f64; 3])> = if let Some(z) = args.plane_z {
-        Some(([0.0, 0.0, z], [0.0, 0.0, 1.0]))
+    let plane: Option<Plane> = if let Some(z) = args.plane_z {
+        Some(Plane::at_z(z))
     } else if let Some(id) = &args.plane {
-        Some(plane_of(&load_subspace(&args.input, id)?, id)?)
+        Some(plane_of(&load_subspace(&args.input, id)?).map_err(|e| anyhow!("asset '{id}': {e}"))?)
     } else if let (Some(p), Some(n)) = (&args.plane_point, &args.plane_normal) {
-        Some((
-            parse_coordinates::<3>(p, "--plane-point")?,
-            parse_coordinates::<3>(n, "--plane-normal")?,
-        ))
+        Some(Plane {
+            point: parse_coordinates::<3>(p, "--plane-point")?,
+            normal: parse_coordinates::<3>(n, "--plane-normal")?,
+        })
     } else {
         None
     };
@@ -442,32 +406,16 @@ pub fn run_view_pick(args: ViewPickArgs) -> Result<()> {
             "casting pixels needs a plane: --plane-z, --plane, or --plane-point with --plane-normal"
         );
     }
-    let eye = view.position().context("the view is not posed")?;
     let mut picked = Vec::new();
     for text in &args.pixels {
         let pixel = parse_coordinates::<2>(text, "--pixel")?;
-        let (p0, n) = plane.expect("checked above");
-        let d = view.ray(camera, pixel).context("the view is not posed")?;
-        let denom = n[0] * d[0] + n[1] * d[1] + n[2] * d[2];
-        if denom.abs() < 1e-9 {
-            bail!("pixel ({}, {}) looks along the plane", pixel[0], pixel[1]);
-        }
-        let t =
-            (n[0] * (p0[0] - eye[0]) + n[1] * (p0[1] - eye[1]) + n[2] * (p0[2] - eye[2])) / denom;
-        if t <= 0.0 {
-            bail!(
-                "pixel ({}, {}) meets the plane behind the camera",
-                pixel[0],
-                pixel[1]
-            );
-        }
-        let world = [eye[0] + t * d[0], eye[1] + t * d[1], eye[2] + t * d[2]];
-        let depth = view.to_camera(world).map(|c| c[2]).unwrap_or(t);
+        let plane = plane.as_ref().expect("checked above");
+        let hit = cast(view, camera, pixel, plane).map_err(anyhow::Error::msg)?;
         picked.push(Picked {
             pixel,
-            world,
-            depth,
-            chart: frame.as_ref().map(|f| chart(f, world)),
+            world: hit.world,
+            depth: hit.depth,
+            chart: frame.as_ref().map(|f| chart(f, hit.world)),
         });
     }
     let mut projected = Vec::new();
@@ -563,33 +511,6 @@ pub struct ViewTriangulateArgs {
 
 /// The point nearest every ray in the least-squares sense, and each
 /// ray's distance from it.
-pub fn triangulate(rays: &[([f64; 3], [f64; 3])]) -> Option<([f64; 3], Vec<f64>)> {
-    // Sum over rays of (I - d dᵀ)(x - o) = 0.
-    let mut a = [[0.0f64; 3]; 3];
-    let mut b = [0.0f64; 3];
-    for (o, d) in rays {
-        for i in 0..3 {
-            for j in 0..3 {
-                let p = if i == j { 1.0 } else { 0.0 } - d[i] * d[j];
-                a[i][j] += p;
-                b[i] += p * o[j];
-            }
-        }
-    }
-    let x = cloud_core::solve(a.iter().map(|r| r.to_vec()).collect(), b.to_vec())?;
-    let x = [x[0], x[1], x[2]];
-    let gaps = rays
-        .iter()
-        .map(|(o, d)| {
-            let v = [x[0] - o[0], x[1] - o[1], x[2] - o[2]];
-            let t = v[0] * d[0] + v[1] * d[1] + v[2] * d[2];
-            let r = [v[0] - t * d[0], v[1] - t * d[1], v[2] - t * d[2]];
-            (r[0] * r[0] + r[1] * r[1] + r[2] * r[2]).sqrt()
-        })
-        .collect();
-    Some((x, gaps))
-}
-
 pub fn run_view_triangulate(args: ViewTriangulateArgs) -> Result<()> {
     if args.rays.len() < 2 {
         bail!("triangulation needs at least two --ray VIEW:u,v");
@@ -599,22 +520,15 @@ pub fn run_view_triangulate(args: ViewTriangulateArgs) -> Result<()> {
         Some(id) => Some(load_subspace(&args.input, id)?),
         None => None,
     };
-    let mut rays = Vec::new();
     let mut labels = Vec::new();
     for text in &args.rays {
         let (id, pixel) = text
             .split_once(':')
             .with_context(|| format!("--ray must be VIEW:u,v, got '{text}'"))?;
-        let (view, camera) = view_of(&set, id)?;
         let pixel = parse_coordinates::<2>(pixel, "--ray pixel")?;
-        let origin = view
-            .position()
-            .with_context(|| format!("view '{id}' is not posed"))?;
-        let direction = view.ray(camera, pixel).context("unposed")?;
-        rays.push((origin, direction));
         labels.push((id.to_string(), pixel));
     }
-    let (point, gaps) = triangulate(&rays).context("the rays are parallel")?;
+    let (point, gaps) = triangulate_picks(&set, &labels).map_err(anyhow::Error::msg)?;
     let chart_coords = frame.as_ref().map(|f| chart(f, point));
     if args.json {
         #[derive(Serialize)]
