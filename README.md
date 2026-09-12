@@ -108,7 +108,8 @@ An articulated assembly is a tree of parts joined by fixed, revolute and prismat
 (`ASSEMBLY_PLAN.md`). Parts are authored in the world frame at the rest state, joint axes are
 given in world coordinates at rest, and a part's pose is the product of its chain's joint
 motions, root first. The state is an `F64Map` keyed by joint name (degrees or metres); a
-joint with a `drive` follows another at a ratio and is not a state. The viewport meshes each
+joint with a `drive` follows another at a ratio and is not a state; a `continuous` revolute
+joint (a swivel, a wheel) turns without limit. The viewport meshes each
 part of an assembly once and draws it under its pose with the joints' axes, so a state change
 re-meshes nothing; the assemble step's state slot is a form of the joints' ranges, and
 dragging a part in the viewport poses it (the joints that can reach the pointer move, within

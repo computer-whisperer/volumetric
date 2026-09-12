@@ -46,6 +46,8 @@ struct JointConfig {
     default: f64,
     #[serde(default)]
     drive: Option<Drive>,
+    #[serde(default)]
+    continuous: bool,
 }
 
 fn fixed() -> JointKind {
@@ -124,6 +126,7 @@ fn build(cfg: MechanismConfig, axes: &[Vec<u8>]) -> Result<Mechanism, String> {
                 max: j.max,
                 default: j.default,
                 drive: j.drive,
+                continuous: j.continuous,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -158,7 +161,7 @@ pub extern "C" fn run() {
 pub extern "C" fn get_metadata() -> i64 {
     static METADATA: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     volumetric_abi::metadata_reply(&METADATA, || {
-        let schema = r#"{ parts: [* tstr], joints: [* { name: tstr, kind: "fixed" / "revolute" / "prismatic" .default "fixed", parent: tstr .default "world", child: tstr, ? axis: { origin: [float, float, float], direction: [float, float, float] }, ? axis_input: uint, min: float .default 0.0, max: float .default 0.0, default: float .default 0.0, ? drive: { joint: tstr, ratio: float, offset: float .default 0.0 } }] }"#.to_string();
+        let schema = r#"{ parts: [* tstr], joints: [* { name: tstr, kind: "fixed" / "revolute" / "prismatic" .default "fixed", parent: tstr .default "world", child: tstr, ? axis: { origin: [float, float, float], direction: [float, float, float] }, ? axis_input: uint, min: float .default 0.0, max: float .default 0.0, default: float .default 0.0, continuous: bool .default false, ? drive: { joint: tstr, ratio: float, offset: float .default 0.0 } }] }"#.to_string();
         OperatorMetadata {
             name: "mechanism_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),

@@ -106,6 +106,11 @@ pub struct Joint {
     pub default: f64,
     #[serde(default)]
     pub drive: Option<Drive>,
+    /// A revolute joint that turns without limit (a swivel, a wheel): the
+    /// range is ignored, any finite angle is a valid state, and a drag wraps
+    /// the angle into (-180, 180] so it stays readable.
+    #[serde(default)]
+    pub continuous: bool,
 }
 
 impl Joint {
@@ -113,6 +118,17 @@ impl Joint {
     /// not driven by another joint).
     pub fn is_state(&self) -> bool {
         self.kind != JointKind::Fixed && self.drive.is_none()
+    }
+
+    /// Whether the joint's value is confined to `min..=max`.
+    pub fn has_range(&self) -> bool {
+        self.kind != JointKind::Fixed && !self.continuous
+    }
+
+    /// An angle wrapped into (-180, 180].
+    pub fn wrap_degrees(value: f64) -> f64 {
+        let w = value.rem_euclid(360.0);
+        if w > 180.0 { w - 360.0 } else { w }
     }
 }
 
@@ -320,12 +336,20 @@ impl Mechanism {
                         return Err(format!("joint `{}`: {what} must be finite", joint.name));
                     }
                 }
-                if !(joint.min <= joint.default && joint.default <= joint.max) {
+                if joint.has_range() && !(joint.min <= joint.default && joint.default <= joint.max)
+                {
                     return Err(format!(
                         "joint `{}`: default {} is outside [{}, {}]",
                         joint.name, joint.default, joint.min, joint.max
                     ));
                 }
+            }
+            if joint.continuous && joint.kind != JointKind::Revolute {
+                return Err(format!(
+                    "joint `{}` is {} and cannot be continuous (only a revolute joint turns without limit)",
+                    joint.name,
+                    joint.kind.name()
+                ));
             }
             if let Some(drive) = &joint.drive {
                 if joint.kind == JointKind::Fixed {
@@ -427,8 +451,8 @@ impl Mechanism {
                 binding_name: j.name.clone(),
                 key: j.name.clone(),
                 default: j.default,
-                min: Some(j.min),
-                max: Some(j.max),
+                min: j.has_range().then_some(j.min),
+                max: j.has_range().then_some(j.max),
             })
             .collect()
     }
@@ -457,7 +481,7 @@ impl Mechanism {
                 if !value.is_finite() {
                     return Err(format!("state `{}` must be finite", joint.name));
                 }
-                if value < joint.min || value > joint.max {
+                if joint.has_range() && (value < joint.min || value > joint.max) {
                     return Err(format!(
                         "state `{}` = {value} is outside [{}, {}]",
                         joint.name, joint.min, joint.max
@@ -571,14 +595,16 @@ impl Mechanism {
 }
 
 impl Mechanism {
-    /// Every state clamped into its joint's range.
+    /// Every state clamped into its joint's range; a continuous joint's
+    /// angle is wrapped into (-180, 180] instead.
     pub fn clamp_state(&self, state: &F64Map) -> F64Map {
         state
             .iter()
             .map(|(key, value)| {
                 let clamped = match self.joints.iter().find(|j| j.name == *key) {
-                    Some(joint) => value.clamp(joint.min, joint.max),
-                    None => *value,
+                    Some(joint) if joint.continuous => Joint::wrap_degrees(*value),
+                    Some(joint) if joint.has_range() => value.clamp(joint.min, joint.max),
+                    _ => *value,
                 };
                 (key.clone(), clamped)
             })
@@ -817,6 +843,7 @@ mod tests {
             max: 180.0,
             default: 0.0,
             drive: None,
+            continuous: false,
         }
     }
 
@@ -1096,6 +1123,56 @@ mod tests {
             mech.pull(&F64Map::new(), "wheel", [0.0; 3], [0.0; 3], 1)
                 .unwrap_err()
                 .contains("not a part")
+        );
+    }
+
+    #[test]
+    fn a_continuous_joint_turns_without_limit_and_wraps_when_pulled() {
+        let mut mech = chair();
+        mech.joints[0].continuous = true;
+        mech.joints[0].min = 0.0;
+        mech.joints[0].max = 0.0;
+        mech.validate().unwrap();
+        // Any angle is a state; the form gets no bounds for it.
+        assert_eq!(
+            mech.joint_values(&state(&[("swivel", 1000.0)])).unwrap()[0],
+            1000.0
+        );
+        let spec = &mech.parameter_specs()[0];
+        assert_eq!(
+            (spec.key.as_str(), spec.min, spec.max),
+            ("swivel", None, None)
+        );
+        assert_eq!(
+            mech.clamp_state(&state(&[("swivel", 1000.0)]))["swivel"],
+            -80.0
+        );
+        assert_eq!(Joint::wrap_degrees(180.0), 180.0);
+        assert_eq!(Joint::wrap_degrees(-180.0), 180.0);
+        assert_eq!(Joint::wrap_degrees(540.0), 180.0);
+        // Pulled across the seam: from 170 degrees to a target at 200, the
+        // drag lands at -160 rather than stopping at 180.
+        let pulled = mech
+            .pull(
+                &state(&[("swivel", 170.0)]),
+                "column",
+                [2.0, 0.0, 0.5],
+                [
+                    1.0 + 200f64.to_radians().cos(),
+                    200f64.to_radians().sin(),
+                    0.5,
+                ],
+                20,
+            )
+            .unwrap();
+        assert!((pulled["swivel"] + 160.0).abs() < 1e-6, "{pulled:?}");
+        // Only a revolute joint can be continuous.
+        let mut lift = chair();
+        lift.joints[1].continuous = true;
+        assert!(
+            lift.validate()
+                .unwrap_err()
+                .contains("cannot be continuous")
         );
     }
 

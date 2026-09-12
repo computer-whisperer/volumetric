@@ -152,7 +152,8 @@ done
 # sliding along the lift axis (the scan's height is the rest, 0; the lift
 # is assumed to have 20 mm below it and 80 above), the tilt mechanism
 # swivelling on the piston about the same axis, and each caster swivelling
-# about its stem and rolling about its axle. Axes in world coordinates at
+# about its stem and rolling about its axle (the turning joints are
+# continuous: no range). Axes in world coordinates at
 # rest: the stem of arm k at r 340 and the axle at r 360, z 32.5, across
 # the arm.
 MECH=$(python3 - <<PY
@@ -166,7 +167,7 @@ joints = [
     {"name": "lift", "kind": "prismatic", "parent": "hub_tube", "child": "piston",
      "axis": {"origin": [ax, ay, 0.0], "direction": z}, "min": -0.02, "max": 0.08},
     {"name": "swivel", "kind": "revolute", "parent": "piston", "child": "mechanism",
-     "axis": {"origin": [ax, ay, 0.0], "direction": z}, "min": -180.0, "max": 180.0},
+     "axis": {"origin": [ax, ay, 0.0], "direction": z}, "continuous": True},
 ]
 for k in range(5):
     t = math.radians(72 * k - 10.4)
@@ -174,10 +175,10 @@ for k in range(5):
     parts += [f"stem_{k}", f"wheel_{k}"]
     joints.append({"name": f"caster_{k}", "kind": "revolute", "parent": "arms", "child": f"stem_{k}",
                    "axis": {"origin": [ax + 0.34 * c, ay + 0.34 * s, 0.0], "direction": z},
-                   "min": -180.0, "max": 180.0})
+                   "continuous": True})
     joints.append({"name": f"roll_{k}", "kind": "revolute", "parent": f"stem_{k}", "child": f"wheel_{k}",
                    "axis": {"origin": [ax + 0.36 * c, ay + 0.36 * s, 0.0325], "direction": [-s, c, 0.0]},
-                   "min": -180.0, "max": 180.0})
+                   "continuous": True})
 print(json.dumps({"parts": parts, "joints": joints}))
 PY
 )

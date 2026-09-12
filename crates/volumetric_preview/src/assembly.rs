@@ -466,6 +466,7 @@ mod tests {
             max: 180.0,
             default: 0.0,
             drive: None,
+            continuous: false,
         };
         let mechanism = Mechanism::new(
             ["a", "b", "c"].map(str::to_string).to_vec(),

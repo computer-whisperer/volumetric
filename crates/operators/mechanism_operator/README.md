@@ -29,7 +29,10 @@ local frames to author, and the rest state is the state as photographed.
     lift axis drives the joint directly. With every axis inline, leave the
     Axes slot unwired (`--input none` from the CLI).
   - `min`, `max`, `default`: the range and rest value of a moving joint
-    (defaults 0). The state form's sliders and a drag's clamp use them.
+    (defaults 0). The state form's bounds and a drag's clamp use them.
+  - `continuous: true`: a revolute joint that turns without limit (a
+    swivel, a wheel). The range is ignored, any angle is a state, and a
+    drag wraps the angle into (-180, 180]; a typed value is kept as typed.
   - `drive { joint, ratio, offset }`: a coupling. The joint's value is
     `ratio * value(joint) + offset` and it is not a state of its own: a
     synchro-tilt back that follows the seat at half the angle.
@@ -43,7 +46,7 @@ pivot on it:
 { "parts": ["column", "seat"],
   "joints": [
     { "name": "swivel", "kind": "revolute", "child": "column",
-      "axis_input": 0, "min": -180.0, "max": 180.0 },
+      "axis_input": 0, "continuous": true },
     { "name": "tilt", "kind": "revolute", "parent": "column", "child": "seat",
       "axis": { "origin": [0.26, 0.15, 0.45], "direction": [1.0, 0.0, 0.0] },
       "min": -5.0, "max": 20.0 } ] }

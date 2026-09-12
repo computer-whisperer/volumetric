@@ -86,7 +86,11 @@ variant and everything downstream, which only calls `pose` and
   `drive: { joint, ratio, offset }` and are not states.
 - Joint kinds: `fixed`, `revolute` (angle in degrees about an axis),
   `prismatic` (distance along an axis). A cylindrical joint is two joints
-  on one axis. Each joint: `name`, `parent` (a part or `world`), `child`,
+  on one axis. A revolute joint marked `continuous` turns without limit:
+  its range is ignored, any angle is a state, and a drag wraps the angle
+  into (-180, 180] (a typed value is kept as typed). Chosen over a
+  sin/cos pair state, which would only move the seam into a unit-circle
+  constraint the solver, the form and the config would all carry. Each joint: `name`, `parent` (a part or `world`), `child`,
   `axis` (`{ origin, direction }` inline, or a Subspace input by index),
   `min`, `max`, `default`, optional `drive`. The tree must be a tree with
   every part reached once.
@@ -280,6 +284,15 @@ variant and everything downstream, which only calls `pose` and
 - Not done: per-part resolution scaling (each part still meshes at its
   own grid over its own bounds; fine at the default 64, several times the
   fused model's cost at 256).
+
+## Continuous joints (2026-09-12)
+
+`Joint.continuous` (revolute only; validated), `Joint::has_range`,
+`Joint::wrap_degrees`; validation, `joint_values`, `parameter_specs` and
+`clamp_state` honour it; the mechanism operator's config and README carry
+it; the chair's swivel, caster swivels and rolls are continuous. Test:
+any angle accepted, no form bounds, a pull from 170° to a target at 200°
+lands at −160° instead of stopping at 180°.
 
 ## Ledger
 

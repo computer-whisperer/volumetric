@@ -8662,6 +8662,7 @@ mod tests {
                     max: 0.0,
                     default: 0.0,
                     drive: None,
+                    continuous: false,
                 },
                 Joint {
                     name: "swivel".to_string(),
@@ -8676,6 +8677,7 @@ mod tests {
                     max: 180.0,
                     default: 10.0,
                     drive: None,
+                    continuous: false,
                 },
             ],
         );
@@ -8726,6 +8728,7 @@ mod tests {
                 max: 180.0,
                 default: 0.0,
                 drive: None,
+                continuous: false,
             }],
         );
         let sphere = volumetric_assets::get_model("simple_sphere_model")
@@ -8800,6 +8803,7 @@ mod tests {
                 max: 2.0,
                 default: 0.0,
                 drive: None,
+                continuous: false,
             }],
         );
         app.project

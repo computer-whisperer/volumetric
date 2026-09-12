@@ -178,7 +178,8 @@ An articulated assembly (`ASSEMBLY_PLAN.md`): parts joined by fixed,
 revolute and prismatic joints, authored in the world frame at rest with
 axes in world coordinates at rest, posed by the product of each chain's
 joint motions. `Mechanism.load(path)` / `.decode(bytes)` / `.save` /
-`.encode`; `.parts`, `.joints` (dicts), `.state_keys`, `.default_state`,
+`.encode`; `.parts`, `.joints` (dicts; a `continuous` revolute joint has
+no range), `.state_keys`, `.default_state`,
 `.ranges`; `.pose(state=None)` gives every part's world <- part map as an
 (n,3,4) array (missing keys take their defaults, out-of-range values are
 refused), `.velocity(part, point, state=None)` the world velocity of a
