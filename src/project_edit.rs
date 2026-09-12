@@ -375,6 +375,208 @@ pub fn vec_f64(bytes: &[u8]) -> Vec<f64> {
         .collect()
 }
 
+/// Select a timeline step by 0-based index or operator-id substring (which
+/// must match exactly one step).
+pub fn select_step(project: &Project, selector: &str) -> Result<usize> {
+    if let Ok(idx) = selector.parse::<usize>() {
+        anyhow::ensure!(
+            idx < project.timeline.len(),
+            "step index {idx} out of range; the timeline has {} step(s)",
+            project.timeline.len()
+        );
+        return Ok(idx);
+    }
+    let matches: Vec<usize> = project
+        .timeline
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.operator_id.contains(selector))
+        .map(|(i, _)| i)
+        .collect();
+    match matches.as_slice() {
+        [only] => Ok(*only),
+        [] => anyhow::bail!(
+            "no timeline step's operator id contains {selector:?}; steps: {}",
+            project
+                .timeline
+                .iter()
+                .enumerate()
+                .map(|(i, s)| format!("{i}:{}", s.operator_id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        many => anyhow::bail!(
+            "{selector:?} matches {} steps ({}); use an index",
+            many.len(),
+            many.iter()
+                .map(|i| format!("{i}:{}", project.timeline[*i].operator_id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// Coerce a JSON literal to a schema-typed config value. Integers promote to
+/// floats for `Float` fields — the raw JSON→CBOR path can't do this (it has
+/// no schema), and operators reject CBOR ints in f64 fields.
+pub fn json_config_value(
+    field: &crate::operator_config::ConfigField,
+    value: &serde_json::Value,
+    path: &str,
+) -> Result<crate::operator_config::ConfigValue> {
+    use crate::operator_config::{ConfigFieldType, ConfigValue};
+
+    fn scalar(ty: &ConfigFieldType, value: &serde_json::Value, path: &str) -> Result<ConfigValue> {
+        match ty {
+            ConfigFieldType::Bool => value
+                .as_bool()
+                .map(ConfigValue::Bool)
+                .with_context(|| format!("{path}: expected a bool, got {value}")),
+            ConfigFieldType::Int => value
+                .as_i64()
+                .map(ConfigValue::Int)
+                .with_context(|| format!("{path}: expected an integer, got {value}")),
+            ConfigFieldType::Float => value
+                .as_f64()
+                .map(ConfigValue::Float)
+                .with_context(|| format!("{path}: expected a number, got {value}")),
+            ConfigFieldType::Text => value
+                .as_str()
+                .map(|s| ConfigValue::Text(s.to_string()))
+                .with_context(|| format!("{path}: expected a string, got {value}")),
+            ConfigFieldType::Enum(options) => {
+                let s = value
+                    .as_str()
+                    .with_context(|| format!("{path}: expected a string, got {value}"))?;
+                anyhow::ensure!(
+                    options.iter().any(|o| o == s),
+                    "{path}: {s:?} is not one of {}",
+                    options.join("/")
+                );
+                Ok(ConfigValue::Text(s.to_string()))
+            }
+            ConfigFieldType::List { element, min_len } => {
+                let items = value
+                    .as_array()
+                    .with_context(|| format!("{path}: expected an array, got {value}"))?;
+                anyhow::ensure!(
+                    items.len() >= *min_len,
+                    "{path}: needs at least {min_len} element(s), got {}",
+                    items.len()
+                );
+                items
+                    .iter()
+                    .map(|item| scalar(element, item, path))
+                    .collect::<Result<Vec<_>>>()
+                    .map(ConfigValue::List)
+            }
+            ConfigFieldType::Group(_) => {
+                // A bool toggles an optional group's enablement marker;
+                // sub-fields are set through their dotted paths.
+                value.as_bool().map(ConfigValue::Bool).with_context(|| {
+                    format!(
+                        "{path} is a config group: pass true/false to toggle it, \
+                         or set sub-fields via dotted paths ({path}.<field>)"
+                    )
+                })
+            }
+        }
+    }
+
+    let value = scalar(&field.ty, value, path)?;
+    anyhow::ensure!(
+        field.in_bounds(&value),
+        "{path}: {value:?} is outside the declared bounds [{}, {}]",
+        field.min.map_or("-inf".into(), |v| v.to_string()),
+        field.max.map_or("+inf".into(), |v| v.to_string()),
+    );
+    Ok(value)
+}
+
+/// One field a [`set_config`] call changed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConfigChange {
+    pub path: String,
+    /// The value before, as its debug form; None when unset.
+    pub previous: Option<String>,
+    pub value: String,
+}
+
+/// Merge `updates` (field path → JSON value, checked against the
+/// operator's declared schema) into the configuration input of the step
+/// `selector` picks. Returns the step index and what changed.
+pub fn set_config(
+    project: &mut Project,
+    selector: &str,
+    updates: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(usize, Vec<ConfigChange>)> {
+    use crate::operator_config;
+
+    let step_index = select_step(project, selector)?;
+    let operator_id = project.timeline[step_index].operator_id.clone();
+    let op_bytes = project
+        .imports
+        .iter()
+        .find(|a| a.id == operator_id)
+        .map(|a| a.data.clone())
+        .with_context(|| format!("operator asset {operator_id:?} not found in project imports"))?;
+    let metadata = crate::operator_metadata_from_wasm_bytes(&op_bytes)
+        .map_err(|e| anyhow::anyhow!("Failed to read operator metadata: {e}"))?;
+
+    let (slot, cddl) = metadata
+        .inputs
+        .iter()
+        .enumerate()
+        .find_map(|(i, input)| match input {
+            OperatorMetadataInput::CBORConfiguration(schema) => Some((i, schema.clone())),
+            _ => None,
+        })
+        .with_context(|| format!("{operator_id} declares no configuration input"))?;
+    let fields = operator_config::parse_schema(&cddl)
+        .map_err(|e| anyhow::anyhow!("{operator_id}'s config schema failed to parse: {e}"))?;
+
+    let step = &mut project.timeline[step_index];
+    anyhow::ensure!(
+        metadata.accepts_input_count(step.inputs.len()),
+        "step {step_index} has {} input(s) but {operator_id} declares {}; \
+         the project predates the operator version — re-add the step first",
+        step.inputs.len(),
+        expected_input_count(&metadata)
+    );
+    let slot = metadata.input_of_slot(slot, step.inputs.len());
+    let mut values = match &step.inputs[slot] {
+        ExecutionInput::Inline(bytes) if !bytes.is_empty() => operator_config::decode(bytes),
+        _ => operator_config::default_values(&fields),
+    };
+    anyhow::ensure!(
+        !updates.is_empty(),
+        "config object is empty; nothing to set"
+    );
+
+    let mut changes = Vec::with_capacity(updates.len());
+    for (path, json_value) in updates {
+        let field = operator_config::find_field(&fields, path).with_context(|| {
+            format!(
+                "{operator_id} has no config field {path:?}; fields: {}",
+                fields
+                    .iter()
+                    .map(|f| f.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
+        let value = json_config_value(field, json_value, path)?;
+        let previous = values.insert(path.clone(), value.clone());
+        changes.push(ConfigChange {
+            path: path.clone(),
+            previous: previous.map(|p| format!("{p:?}")),
+            value: format!("{value:?}"),
+        });
+    }
+    step.inputs[slot] = ExecutionInput::Inline(operator_config::encode(&fields, &values));
+    Ok((step_index, changes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

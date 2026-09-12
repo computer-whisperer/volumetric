@@ -1,6 +1,7 @@
 """View sets and the survey on the chair evidence."""
 
 import numpy as np
+import pytest
 
 import volumetric as v
 
@@ -38,3 +39,34 @@ def test_encode_decode_round_trip(chair_views, tmp_path):
     again = v.ViewSet.load(str(path))
     assert again.encode() == chair_views.encode()
     assert v.ViewSet.decode(chair_views.encode()).views[3].id == chair_views.views[3].id
+
+
+def test_select_keeps_named_views_and_reembeds(chair_views):
+    a, b = chair_views.views[3].id, chair_views.views[0].id
+    two = chair_views.select(ids=[a, b], embed="none")
+    assert [v.id for v in two.views] == [a, b]
+    assert two.views[0].picture() is None and len(two.cameras) == 1
+    assert two.provenance["tools"][-1].endswith("(2 of 10 views)")
+    every_third = chair_views.select(stride=3, posed=True)
+    assert len(every_third) == 4 and every_third.views[0].picture() is not None
+    small = chair_views.select(ids=["DSC00742"], embed="preview", preview_px=400)
+    assert small.views[0].image().shape[1] == 400
+    with pytest.raises(ValueError):
+        chair_views.select(tags=["no-such-tag"])
+    with pytest.raises(ValueError, match="embed"):
+        chair_views.select(embed="thumbnail")
+
+
+def test_crop_reads_the_original_with_marks(chair_views):
+    view = chair_views.view("DSC00742")
+    corner = chair_views.marker_corners()[0, 0]
+    px = view.project(corner[None])[0]
+    c = view.crop(center=tuple(px), size=(200, 100), scale=2, grid=50, marks=[tuple(px)], world_marks=[corner])
+    assert c.image.shape == (200, 400, 3) and c.image.dtype == np.uint8
+    assert c.end[0] - c.origin[0] == 200 and c.scale == 2
+    assert all(u % 50 == 0 and c.origin[0] <= u < c.end[0] for u in c.verticals)
+    (projected,) = c.projected
+    assert abs(projected[0] - px[0]) < 1e-9
+    assert c.png()[:8] == b"\x89PNG\r\n\x1a\n"
+    behind = view.crop(center=(100, 100), world_marks=[view.position + [0, 0, 1.0]])
+    assert behind.projected == [None]

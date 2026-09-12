@@ -53,7 +53,7 @@ pub enum Eye {
 
 /// Which views to embed. Filters apply in order: eye and split tags, ids,
 /// nearness, then every `stride`th survivor, then at most `max`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Selection {
     /// Exact view ids to keep; empty keeps every view.
     pub ids: Vec<String>,

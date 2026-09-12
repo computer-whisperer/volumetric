@@ -55,6 +55,10 @@ p.save("posts.vproj")
   configuration or an F64Map, a list for a VecF64, as the CLI's `json:`
   form. Errors name the slot. `v.operator_info(name)` shows the slots
   (with the configuration's CDDL), outputs and docs.
+- `.add_views(viewset, id="views")` imports a view set for look-through
+  and `render(through=)`; `.set_config(step, {field: value})` merges
+  schema-checked values into a step's configuration (`step` is an index or
+  an operator-id substring) and returns what changed.
 - `.run(remote=None)` runs every step (on a daemon at `http://host:port`
   when `remote` is given) and returns the exports. `Asset.kind`,
   `.bytes`, `.warnings`; `.value` decodes an F64Map (dict), a VecF64
@@ -139,6 +143,15 @@ known answer; `survey_card()` and `board_corners()` describe the card.
 `.poses()` (n,3,4) with NaN for unposed, `.markers` (dicts),
 `.marker_ids()`, `.marker_corners()` (n,4,3), `.board`, `.world_up`,
 `.provenance`.
+
+`ViewSet.select(ids=, stride=, near=, radius=, max=, posed=, tags=,
+embed=, preview_px=)` is `view-select`: a subset as a set of its own with
+its pictures re-embedded (`keep`, `full`, `preview`, `none`).
+`View.crop(center, size=, scale=, grid=, marks=, world_marks=)` is
+`view-crop`: a magnified crop of the original with a labelled grid and
+crosses, as a `Crop` with `image` (h,w,3), `origin`/`end`, the grid
+lines' coordinates and each world mark's `projected` pixel; `.png()` and
+`.save(path)`.
 
 `Splat.load(path)` / `.decode(bytes)`: `means`, `scales`, `quats`,
 `opacities`, `sh0`, `sh_rest` (n,3,k), `normals` or None, `kind`,

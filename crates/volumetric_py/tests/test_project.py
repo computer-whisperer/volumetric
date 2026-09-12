@@ -110,3 +110,25 @@ def test_models_sample_in_process():
     assert (post.sample(points) > 0.5).tolist() == [True, True, False, False]
     with pytest.raises(ValueError, match=r"\(n,3\)"):
         post.sample(np.zeros((2, 2)))
+
+
+def test_set_config_changes_a_step():
+    p = cylinder_project()
+    changes = p.set_config("cylinder", {"radius": 0.1})
+    assert changes == {"radius": ("Float(0.05)", "Float(0.1)")}
+    lo, hi = p.run()["post"].bounds()
+    assert hi[0] - lo[0] >= 0.2
+    assert p.set_config(0, {"radius": 0.02})["radius"][1] == "Float(0.02)"
+    with pytest.raises(ValueError, match="no config field"):
+        p.set_config(0, {"radii": 1.0})
+    with pytest.raises(ValueError, match="out of range"):
+        p.set_config(5, {"radius": 1.0})
+    with pytest.raises(ValueError, match="expected a number"):
+        p.set_config(0, {"radius": "big"})
+
+
+def test_add_views_imports_a_view_set(chair_views):
+    p = cylinder_project()
+    assert p.add_views(chair_views.select(ids=["DSC00742"], embed="none"), id="photos") == "photos"
+    assert ("photos", "ViewSet") in p.asset_ids()
+    assert p.add_views(chair_views) == "views"

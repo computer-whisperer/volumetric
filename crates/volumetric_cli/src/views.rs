@@ -12,10 +12,8 @@ use clap::{Parser, ValueEnum};
 use serde::Serialize;
 use view_core::image::{decode_depth, decode_mask};
 use view_core::residual::{ResidualStats, Search, depth_residual, residual_image};
-use view_core::{
-    Embed, Eye, Labels, Selection, StillsOptions, embed_pictures, import_manifest, import_stills,
-    select_views,
-};
+use view_core::subset::{Reembed, SubsetOptions, subset};
+use view_core::{Embed, Eye, Labels, Selection, StillsOptions, import_manifest, import_stills};
 use volumetric::wasm::ParallelModelSampler;
 use volumetric::{AssetTypeHint, ImportedAsset, LoadedAsset, Project};
 use volumetric_abi::viewset::{Distortion, ViewSet, decode_viewset, encode_viewset};
@@ -301,35 +299,19 @@ pub fn run_view_select(args: ViewSelectArgs) -> Result<()> {
         split: args.split.clone(),
         ..Selection::default()
     };
-    let candidates: Vec<&volumetric_abi::viewset::View> = set
-        .views
-        .iter()
-        .filter(|view| !args.posed || view.camera_to_world.is_some())
-        .filter(|view| args.tags.iter().all(|tag| view.tags.contains(tag)))
-        .collect();
-    let chosen = select_views(&candidates, &selection)?;
-    let mut selected = ViewSet {
-        views: chosen.into_iter().cloned().collect(),
-        ..set.clone()
+    let options = SubsetOptions {
+        selection,
+        posed: args.posed,
+        tags: args.tags.clone(),
+        embed: match args.embed {
+            ReembedArg::Keep => Reembed::Keep,
+            ReembedArg::Full => Reembed::Full,
+            ReembedArg::Preview => Reembed::Preview,
+            ReembedArg::None => Reembed::None,
+        },
+        preview_px: args.preview_px,
     };
-    let embedded = match args.embed {
-        ReembedArg::Keep => selected
-            .views
-            .iter()
-            .map(|v| v.image.as_ref().map_or(0, Vec::len))
-            .sum(),
-        ReembedArg::Full => embed_pictures(&mut selected, Embed::Full, args.preview_px, 88)?,
-        ReembedArg::Preview => embed_pictures(&mut selected, Embed::Preview, args.preview_px, 88)?,
-        ReembedArg::None => embed_pictures(&mut selected, Embed::None, args.preview_px, 88)?,
-    };
-    selected.provenance.tools.push(format!(
-        "volumetric view-select ({} of {} views)",
-        selected.views.len(),
-        set.views.len()
-    ));
-    selected
-        .validate()
-        .map_err(|err| anyhow!("selected set is invalid: {err}"))?;
+    let (selected, embedded) = subset(&set, &options)?;
     let posed = selected
         .views
         .iter()

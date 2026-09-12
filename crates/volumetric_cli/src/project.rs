@@ -5,7 +5,7 @@ use clap::{Parser, ValueEnum};
 use serde::Serialize;
 use std::path::PathBuf;
 
-use volumetric::project_edit::{self, InputValue, expected_input_count, input_type_label};
+use volumetric::project_edit::{self, InputValue, input_type_label};
 use volumetric::{AssetTypeHint, Environment, ExecutionInput, OperatorMetadataInput, Project};
 
 use crate::assets::{resolve_model_spec, resolve_operator_spec};
@@ -899,197 +899,25 @@ pub struct ProjectSetConfigArgs {
     pub output: Option<PathBuf>,
 }
 
-/// Coerce a JSON literal to a schema-typed config value. Integers promote to
-/// floats for `Float` fields — the raw JSON→CBOR path can't do this (it has
-/// no schema), and operators reject CBOR ints in f64 fields.
-fn json_config_value(
-    field: &volumetric::operator_config::ConfigField,
-    value: &serde_json::Value,
-    path: &str,
-) -> Result<volumetric::operator_config::ConfigValue> {
-    use volumetric::operator_config::{ConfigFieldType, ConfigValue};
-
-    fn scalar(ty: &ConfigFieldType, value: &serde_json::Value, path: &str) -> Result<ConfigValue> {
-        match ty {
-            ConfigFieldType::Bool => value
-                .as_bool()
-                .map(ConfigValue::Bool)
-                .with_context(|| format!("{path}: expected a bool, got {value}")),
-            ConfigFieldType::Int => value
-                .as_i64()
-                .map(ConfigValue::Int)
-                .with_context(|| format!("{path}: expected an integer, got {value}")),
-            ConfigFieldType::Float => value
-                .as_f64()
-                .map(ConfigValue::Float)
-                .with_context(|| format!("{path}: expected a number, got {value}")),
-            ConfigFieldType::Text => value
-                .as_str()
-                .map(|s| ConfigValue::Text(s.to_string()))
-                .with_context(|| format!("{path}: expected a string, got {value}")),
-            ConfigFieldType::Enum(options) => {
-                let s = value
-                    .as_str()
-                    .with_context(|| format!("{path}: expected a string, got {value}"))?;
-                anyhow::ensure!(
-                    options.iter().any(|o| o == s),
-                    "{path}: {s:?} is not one of {}",
-                    options.join("/")
-                );
-                Ok(ConfigValue::Text(s.to_string()))
-            }
-            ConfigFieldType::List { element, min_len } => {
-                let items = value
-                    .as_array()
-                    .with_context(|| format!("{path}: expected an array, got {value}"))?;
-                anyhow::ensure!(
-                    items.len() >= *min_len,
-                    "{path}: needs at least {min_len} element(s), got {}",
-                    items.len()
-                );
-                items
-                    .iter()
-                    .map(|item| scalar(element, item, path))
-                    .collect::<Result<Vec<_>>>()
-                    .map(ConfigValue::List)
-            }
-            ConfigFieldType::Group(_) => {
-                // A bool toggles an optional group's enablement marker;
-                // sub-fields are set through their dotted paths.
-                value.as_bool().map(ConfigValue::Bool).with_context(|| {
-                    format!(
-                        "{path} is a config group: pass true/false to toggle it, \
-                         or set sub-fields via dotted paths ({path}.<field>)"
-                    )
-                })
-            }
-        }
-    }
-
-    let value = scalar(&field.ty, value, path)?;
-    anyhow::ensure!(
-        field.in_bounds(&value),
-        "{path}: {value:?} is outside the declared bounds [{}, {}]",
-        field.min.map_or("-inf".into(), |v| v.to_string()),
-        field.max.map_or("+inf".into(), |v| v.to_string()),
-    );
-    Ok(value)
-}
-
-/// Select a timeline step by 0-based index or operator-id substring (which
-/// must match exactly one step).
-pub(crate) fn select_step(project: &Project, selector: &str) -> Result<usize> {
-    if let Ok(idx) = selector.parse::<usize>() {
-        anyhow::ensure!(
-            idx < project.timeline.len(),
-            "step index {idx} out of range; the timeline has {} step(s)",
-            project.timeline.len()
-        );
-        return Ok(idx);
-    }
-    let matches: Vec<usize> = project
-        .timeline
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| s.operator_id.contains(selector))
-        .map(|(i, _)| i)
-        .collect();
-    match matches.as_slice() {
-        [only] => Ok(*only),
-        [] => anyhow::bail!(
-            "no timeline step's operator id contains {selector:?}; steps: {}",
-            project
-                .timeline
-                .iter()
-                .enumerate()
-                .map(|(i, s)| format!("{i}:{}", s.operator_id))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        many => anyhow::bail!(
-            "{selector:?} matches {} steps ({}); use an index",
-            many.len(),
-            many.iter()
-                .map(|i| format!("{i}:{}", project.timeline[*i].operator_id))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    }
-}
+pub(crate) use volumetric::project_edit::select_step;
 
 pub fn run_project_set_config(args: ProjectSetConfigArgs) -> Result<()> {
-    use volumetric::operator_config;
-
     let mut project = Project::load_from_file(&args.project).context("Failed to load project")?;
-    let step_index = select_step(&project, &args.step)?;
-
-    let operator_id = project.timeline[step_index].operator_id.clone();
-    let op_bytes = project
-        .imports
-        .iter()
-        .find(|a| a.id == operator_id)
-        .map(|a| a.data.clone())
-        .with_context(|| format!("operator asset {operator_id:?} not found in project imports"))?;
-    let metadata = volumetric::operator_metadata_from_wasm_bytes(&op_bytes)
-        .map_err(|e| anyhow::anyhow!("Failed to read operator metadata: {e}"))?;
-
-    let (slot, cddl) = metadata
-        .inputs
-        .iter()
-        .enumerate()
-        .find_map(|(i, input)| match input {
-            OperatorMetadataInput::CBORConfiguration(schema) => Some((i, schema.clone())),
-            _ => None,
-        })
-        .with_context(|| format!("{operator_id} declares no configuration input"))?;
-    let fields = operator_config::parse_schema(&cddl)
-        .map_err(|e| anyhow::anyhow!("{operator_id}'s config schema failed to parse: {e}"))?;
-
-    let step = &mut project.timeline[step_index];
-    anyhow::ensure!(
-        metadata.accepts_input_count(step.inputs.len()),
-        "step {step_index} has {} input(s) but {operator_id} declares {}; \
-         the project predates the operator version — re-add the step first",
-        step.inputs.len(),
-        expected_input_count(&metadata)
-    );
-    let slot = metadata.input_of_slot(slot, step.inputs.len());
-    let mut values = match &step.inputs[slot] {
-        ExecutionInput::Inline(bytes) if !bytes.is_empty() => operator_config::decode(bytes),
-        _ => operator_config::default_values(&fields),
-    };
-
     let updates: serde_json::Value =
         serde_json::from_str(&args.config).context("config is not valid JSON")?;
     let serde_json::Value::Object(entries) = updates else {
         anyhow::bail!("config must be a JSON object of field: value pairs");
     };
-    anyhow::ensure!(
-        !entries.is_empty(),
-        "config object is empty; nothing to set"
-    );
-
-    for (path, json_value) in &entries {
-        let field = operator_config::find_field(&fields, path).with_context(|| {
-            format!(
-                "{operator_id} has no config field {path:?}; fields: {}",
-                fields
-                    .iter()
-                    .map(|f| f.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        })?;
-        let value = json_config_value(field, json_value, path)?;
-        let previous = values.insert(path.clone(), value.clone());
+    let (step_index, changes) = project_edit::set_config(&mut project, &args.step, &entries)?;
+    for change in &changes {
         println!(
-            "{path}: {} -> {value:?}",
-            previous.map_or("(unset)".to_string(), |p| format!("{p:?}"))
+            "{}: {} -> {}",
+            change.path,
+            change.previous.as_deref().unwrap_or("(unset)"),
+            change.value
         );
     }
-
-    step.inputs[slot] = ExecutionInput::Inline(operator_config::encode(&fields, &values));
-
+    let operator_id = project.timeline[step_index].operator_id.clone();
     let output = args.output.unwrap_or(args.project);
     save_project(&project, &output)?;
     println!(

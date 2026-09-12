@@ -140,7 +140,7 @@ measurement feedback. All evidence paths above are under
 | S1 | Splat value, 3DGS PLY import, `splat-list`, splat to point cloud | 2 days | landed |
 | S2 | Splat rendering in the viewport and `render`, look-through over the photograph | 4 days | landed |
 | S3 | Photometric audit: the splat rendered through each view against its photograph | 2 days | pending |
-| P | Python bindings (PyO3, maturin) over cv_core, view_core, the survey, splats and projects | 3 days | P1+P2+P3a landed 2026-09-12; P3b (add_views, crop, set_config, observations value) pending |
+| P | Python bindings (PyO3, maturin) over cv_core, view_core, the survey, splats and projects | 3 days | P1+P2+P3a+P3b landed 2026-09-12; observations-as-a-value pending (design) |
 | D | Evidence audits for still sets: intake, detection, survey, setup, coverage, photometric, physical | 3 days | pending |
 
 Proposed order: C2, C3 (the survey is the stage the agent starts from and
@@ -847,7 +847,12 @@ pinhole=None, through=None, overlay=None, **RenderOptions) -> Rendered`
 with `.images` (h,w,4) uint8 per frame, `.names`, `.image` (the first)
 and `.report`.
 
-Deferred to P3b: `Project.add_views` (view-select), `View.crop`, `Project.set_config`,
+P3b (landed 2026-09-12): `ViewSet.select` (`view_core::subset`, shared
+with `view-select`), `View.crop` (`view_core::crop`, shared with
+`view-crop`), `Project.add_views`, `Project.set_config`
+(`project_edit::set_config`, shared with `project-set-config`).
+
+Deferred: 
 `ViewSet` mutation (poses from Python), observations as a first-class
 value (named feature picks and contours on the view set — an ABI decision).
 

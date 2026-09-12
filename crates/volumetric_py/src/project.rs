@@ -181,6 +181,44 @@ impl Project {
         project_edit::add_asset(&mut self.inner, base, kind, bytes).map_err(invalid)
     }
 
+    /// Import a view set (for look-through, audits and `render(through=)`)
+    /// and return its id.
+    #[pyo3(signature = (views, id="views"))]
+    fn add_views(&mut self, views: &crate::viewset::ViewSet, id: &str) -> PyResult<String> {
+        let bytes = volumetric_abi::viewset::encode_viewset(&views.inner);
+        project_edit::add_asset(&mut self.inner, id, AssetTypeHint::ViewSet, bytes).map_err(invalid)
+    }
+
+    /// Merge `updates` (field path → value, checked against the operator's
+    /// declared schema; group sub-fields use dotted paths) into the
+    /// configuration of the step `step` picks: a 0-based index, or a
+    /// substring of the step's operator id matching exactly one step.
+    /// Returns what changed as `{path: (previous, value)}`.
+    fn set_config<'py>(
+        &mut self,
+        py: Python<'py>,
+        step: &Bound<'py, PyAny>,
+        updates: &Bound<'py, PyDict>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let selector = if let Ok(index) = step.extract::<usize>() {
+            index.to_string()
+        } else {
+            step.extract::<String>()
+                .map_err(|_| invalid("step is an index or an operator-id substring"))?
+        };
+        let updates: serde_json::Value = from_py(updates.as_any())?;
+        let serde_json::Value::Object(entries) = updates else {
+            return Err(invalid("updates is a dict of field: value"));
+        };
+        let (_, changes) =
+            project_edit::set_config(&mut self.inner, &selector, &entries).map_err(invalid)?;
+        let out = PyDict::new(py);
+        for change in changes {
+            out.set_item(change.path, (change.previous, change.value))?;
+        }
+        Ok(out)
+    }
+
     /// Append a step. `operator` is a bundled name, a `.wasm` path or wasm
     /// bytes; `inputs` has one entry per declared slot: an asset id
     /// (`str`), `None` to leave an optional slot unwired, `bytes` to pass

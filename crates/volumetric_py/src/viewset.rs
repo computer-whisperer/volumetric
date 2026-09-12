@@ -3,10 +3,13 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use numpy::{PyArray1, PyArray2, PyArray3, PyReadonlyArray2};
+use numpy::{PyArray1, PyArray2, PyArray3, PyArrayMethods, PyReadonlyArray2};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
+use view_core::crop::{CropOptions, crop, picture_of};
+use view_core::manifest::{Eye, Selection};
 use view_core::measure::{Plane, cast, triangulate_picks};
+use view_core::subset::{Reembed, SubsetOptions, subset};
 use volumetric_abi::viewset::{self as abi, CameraModel, Distortion};
 
 use crate::{array2, array3, from_py, invalid, runtime, to_py, vec3_from_py};
@@ -259,6 +262,66 @@ impl ViewSet {
             })
             .collect::<PyResult<Vec<_>>>()?;
         Ok((ViewSet::wrap(set), reports, outcome.skipped))
+    }
+
+    /// A subset of the views as a set of its own (cameras, markers and the
+    /// card shared), the views a project carries for look-through: by
+    /// `ids` (in that order), every `stride`th, within `radius` metres of
+    /// `near`, at most `max` (0 = all), `posed` only, carrying every one of
+    /// `tags`; `embed` says what each kept view carries: `"keep"`,
+    /// `"full"`, `"preview"` (a JPEG `preview_px` wide) or `"none"`.
+    #[pyo3(signature = (ids=None, stride=1, near=None, radius=0.5, max=0, posed=false, tags=None, eye="both", split=None, embed="keep", preview_px=1600))]
+    #[allow(clippy::too_many_arguments)]
+    fn select<'py>(
+        &self,
+        py: Python<'py>,
+        ids: Option<Vec<String>>,
+        stride: usize,
+        near: Option<&Bound<'py, PyAny>>,
+        radius: f64,
+        max: usize,
+        posed: bool,
+        tags: Option<Vec<String>>,
+        eye: &str,
+        split: Option<String>,
+        embed: &str,
+        preview_px: u32,
+    ) -> PyResult<ViewSet> {
+        let options = SubsetOptions {
+            selection: Selection {
+                ids: ids.unwrap_or_default(),
+                stride: stride.max(1),
+                near: near
+                    .map(|n| vec3_from_py(n, "near").map(|p| (p, radius)))
+                    .transpose()?,
+                max,
+                eye: match eye {
+                    "left" => Eye::Left,
+                    "right" => Eye::Right,
+                    "both" => Eye::Both,
+                    other => return Err(invalid(format!("eye `{other}`: left, right or both"))),
+                },
+                split,
+                ..Selection::default()
+            },
+            posed,
+            tags: tags.unwrap_or_default(),
+            embed: match embed {
+                "keep" => Reembed::Keep,
+                "full" => Reembed::Full,
+                "preview" => Reembed::Preview,
+                "none" => Reembed::None,
+                other => {
+                    return Err(invalid(format!(
+                        "embed `{other}`: keep, full, preview or none"
+                    )));
+                }
+            },
+            preview_px,
+        };
+        let set = Arc::clone(&self.inner);
+        let (selected, _) = py.detach(move || subset(&set, &options)).map_err(invalid)?;
+        Ok(ViewSet::wrap(selected))
     }
 
     /// The survey card (spec and solved corners) as a dict, or None.
@@ -542,6 +605,60 @@ impl View {
         Ok((array2(py, world, 3)?, PyArray1::from_vec(py, depths)))
     }
 
+    /// A magnified crop of the view's original picture (read through its
+    /// source when only a preview is embedded) around `center` (u, v):
+    /// `size` (w, h) original pixels at integer `scale`, a labelled grid
+    /// every `grid` pixels (0 = none), cyan crosses at `marks` pixels and
+    /// magenta crosses where `world_marks` points land. Returns a `Crop`.
+    #[pyo3(signature = (center, size=(600, 400), scale=3, grid=50, marks=None, world_marks=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn crop<'py>(
+        &self,
+        py: Python<'py>,
+        center: &Bound<'py, PyAny>,
+        size: (u32, u32),
+        scale: u32,
+        grid: u32,
+        marks: Option<Vec<(f64, f64)>>,
+        world_marks: Option<Vec<Bound<'py, PyAny>>>,
+    ) -> PyResult<Crop> {
+        let centre: (f64, f64) = center
+            .extract()
+            .map_err(|_| invalid("center is a (u, v) pixel"))?;
+        let options = CropOptions {
+            centre: [centre.0, centre.1],
+            size,
+            scale,
+            grid,
+            marks: marks
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(u, v)| [u, v])
+                .collect(),
+            world_marks: world_marks
+                .unwrap_or_default()
+                .iter()
+                .map(|p| vec3_from_py(p, "a world mark"))
+                .collect::<PyResult<_>>()?,
+        };
+        let (view, camera) = self.view_and_camera()?;
+        let picture = picture_of(&self.set, view).map_err(runtime)?;
+        let out = crop(view, camera, &picture, &options).map_err(invalid)?;
+        Ok(Crop {
+            image: array3(py, out.image.pixels, out.image.width as usize, 3)?.unbind(),
+            origin: out.origin,
+            end: out.end,
+            scale: out.scale,
+            verticals: out.verticals,
+            horizontals: out.horizontals,
+            projected: out
+                .projected
+                .iter()
+                .map(|p| p.map(|p| (p[0], p[1])))
+                .collect(),
+        })
+    }
+
     /// The embedded picture's bytes (JPEG/PNG), or None.
     fn picture<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
         self.view().image.as_ref().map(|b| PyBytes::new(py, b))
@@ -612,7 +729,59 @@ impl View {
     }
 }
 
+/// A crop of a view's picture: `image` (h,w,3) uint8, the original pixels
+/// it covers as `origin`..`end`, its `scale`, the grid lines' original
+/// coordinates (`verticals`, `horizontals`) and each world mark's pixel
+/// (`projected`, None when behind the camera).
+#[pyclass(module = "volumetric")]
+pub struct Crop {
+    #[pyo3(get)]
+    image: Py<PyArray3<u8>>,
+    #[pyo3(get)]
+    origin: (u32, u32),
+    #[pyo3(get)]
+    end: (u32, u32),
+    #[pyo3(get)]
+    scale: u32,
+    #[pyo3(get)]
+    verticals: Vec<u32>,
+    #[pyo3(get)]
+    horizontals: Vec<u32>,
+    #[pyo3(get)]
+    projected: Vec<Option<(f64, f64)>>,
+}
+
+#[pymethods]
+impl Crop {
+    /// The crop as PNG bytes.
+    fn png<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let image = self.image.bind(py).readonly();
+        let view = image.as_array();
+        let (h, w, _) = view.dim();
+        let rgb = view_core::image::Rgb {
+            width: w as u32,
+            height: h as u32,
+            pixels: view.iter().copied().collect(),
+        };
+        Ok(PyBytes::new(py, &rgb.to_png().map_err(runtime)?))
+    }
+
+    /// Write the crop as a PNG.
+    fn save(&self, py: Python<'_>, path: &str) -> PyResult<()> {
+        let bytes = self.png(py)?;
+        std::fs::write(path, bytes.as_bytes()).map_err(runtime)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Crop(({}, {})..({}, {}) at {}x)",
+            self.origin.0, self.origin.1, self.end.0, self.end.1, self.scale
+        )
+    }
+}
+
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<Crop>()?;
     m.add_class::<ViewSet>()?;
     m.add_class::<Camera>()?;
     m.add_class::<View>()?;

@@ -11,8 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use serde::Serialize;
-use view_core::full_picture;
-use view_core::image::{Rgb, decode_rgb};
+use view_core::crop::{CropOptions, crop, picture_of};
 use view_core::measure::{Plane, cast, chart, plane_of, triangulate_picks};
 use volumetric::AssetTypeHint;
 use volumetric_abi::subspace::{Subspace, decode_subspace};
@@ -65,54 +64,6 @@ pub struct ViewCropArgs {
     pub output: PathBuf,
 }
 
-const GRID: [u8; 3] = [255, 170, 40];
-const GRID_MAJOR: [u8; 3] = [255, 230, 120];
-const MARK: [u8; 3] = [60, 220, 255];
-const WORLD_MARK: [u8; 3] = [255, 70, 200];
-
-/// Compact numeric rulers, independent of installed fonts. Coordinates
-/// remain in the original image's pixels even for a magnified crop.
-fn ruler_number(out: &mut Rgb, x: u32, y: u32, number: u32, scale: u32) {
-    const DIGITS: [[u8; 5]; 10] = [
-        [7, 5, 5, 5, 7],
-        [2, 6, 2, 2, 7],
-        [7, 1, 7, 4, 7],
-        [7, 1, 7, 1, 7],
-        [5, 5, 7, 1, 1],
-        [7, 4, 7, 1, 7],
-        [7, 4, 7, 5, 7],
-        [7, 1, 1, 1, 1],
-        [7, 5, 7, 5, 7],
-        [7, 5, 7, 1, 7],
-    ];
-    let text = number.to_string();
-    for py in 0..7 * scale {
-        for px in 0..(text.len() as u32 * 4 + 1) * scale {
-            if x + px < out.width && y + py < out.height {
-                out.set(x + px, y + py, [20, 20, 20]);
-            }
-        }
-    }
-    for (i, digit) in text.bytes().enumerate() {
-        for (row, bits) in DIGITS[(digit - b'0') as usize].iter().enumerate() {
-            for col in 0..3 {
-                if bits & (4 >> col) == 0 {
-                    continue;
-                }
-                for dy in 0..scale {
-                    for dx in 0..scale {
-                        let px = x + (1 + i as u32 * 4 + col) * scale + dx;
-                        let py = y + (1 + row as u32) * scale + dy;
-                        if px < out.width && py < out.height {
-                            out.set(px, py, GRID_MAJOR);
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
 // Measurement kernels use f64; routing their coordinates through the
 // renderer's f32 parser loses small changes during iterative fitting.
 fn parse_coordinates<const N: usize>(s: &str, what: &str) -> Result<[f64; N]> {
@@ -149,132 +100,66 @@ fn view_of<'a>(set: &'a ViewSet, id: &str) -> Result<(&'a View, &'a CameraModel)
 pub fn run_view_crop(args: ViewCropArgs) -> Result<()> {
     let set = load_viewset(&args.input, args.views.as_deref())?;
     let (view, camera) = view_of(&set, &args.view)?;
-    let picture = decode_rgb(&full_picture(&set, view)?)?;
-    if (picture.width, picture.height) != (camera.width, camera.height) {
-        bail!(
-            "the picture is {}x{} but the camera is {}x{}",
-            picture.width,
-            picture.height,
-            camera.width,
-            camera.height
-        );
-    }
-    let centre = parse_coordinates::<2>(&args.center, "--center")?;
+    let picture = picture_of(&set, view)?;
     let (w, h) = args
         .size
         .split_once('x')
         .and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?)))
         .filter(|(w, h)| *w > 0 && *h > 0)
         .context("--size must be WxH in pixels")?;
-    let scale = args.scale.max(1);
-    let u0 = (centre[0] - f64::from(w) / 2.0)
-        .round()
-        .clamp(0.0, f64::from(picture.width - 1)) as u32;
-    let v0 = (centre[1] - f64::from(h) / 2.0)
-        .round()
-        .clamp(0.0, f64::from(picture.height - 1)) as u32;
-    let u1 = (u0 + w).min(picture.width);
-    let v1 = (v0 + h).min(picture.height);
-    let (cw, ch) = ((u1 - u0) * scale, (v1 - v0) * scale);
-    let mut out = Rgb::new(cw, ch);
-    for y in 0..ch {
-        for x in 0..cw {
-            out.set(x, y, picture.get(u0 + x / scale, v0 + y / scale));
-        }
-    }
-    // The grid, on the original's multiples so coordinates read directly.
-    let mut verticals = Vec::new();
-    let mut horizontals = Vec::new();
-    if args.grid > 0 {
-        let g = args.grid;
-        let mut u = u0.div_ceil(g) * g;
-        while u < u1 {
-            let major = (u / g) % 5 == 0;
-            let x = (u - u0) * scale;
-            for y in 0..ch {
-                out.set(x, y, if major { GRID_MAJOR } else { GRID });
-            }
-            verticals.push(u);
-            u += g;
-        }
-        let mut v = v0.div_ceil(g) * g;
-        while v < v1 {
-            let major = (v / g) % 5 == 0;
-            let y = (v - v0) * scale;
-            for x in 0..cw {
-                out.set(x, y, if major { GRID_MAJOR } else { GRID });
-            }
-            horizontals.push(v);
-            v += g;
-        }
-    }
-    let cross = |out: &mut Rgb, p: [f64; 2], colour: [u8; 3]| {
-        let x = ((p[0] - f64::from(u0)) * f64::from(scale)).round();
-        let y = ((p[1] - f64::from(v0)) * f64::from(scale)).round();
-        let arm = 6 * scale as i64;
-        for d in -arm..=arm {
-            for (px, py) in [(x as i64 + d, y as i64), (x as i64, y as i64 + d)] {
-                if px >= 0 && py >= 0 && (px as u32) < cw && (py as u32) < ch && d.abs() > 1 {
-                    out.set(px as u32, py as u32, colour);
-                }
-            }
-        }
+    let options = CropOptions {
+        centre: parse_coordinates::<2>(&args.center, "--center")?,
+        size: (w, h),
+        scale: args.scale,
+        grid: args.grid,
+        marks: args
+            .marks
+            .iter()
+            .map(|m| parse_coordinates::<2>(m, "--mark"))
+            .collect::<Result<_>>()?,
+        world_marks: args
+            .world_marks
+            .iter()
+            .map(|m| parse_coordinates::<3>(m, "--mark-world"))
+            .collect::<Result<_>>()?,
     };
-    for mark in &args.marks {
-        cross(&mut out, parse_coordinates::<2>(mark, "--mark")?, MARK);
-    }
-    for mark in &args.world_marks {
-        let world = parse_coordinates::<3>(mark, "--mark-world")?;
-        match view.project(camera, world) {
-            Some(pixel) => {
-                println!(
-                    "world ({:.4}, {:.4}, {:.4}) -> pixel ({:.1}, {:.1})",
-                    world[0], world[1], world[2], pixel[0], pixel[1]
-                );
-                cross(&mut out, pixel, WORLD_MARK);
-            }
+    let out = crop(view, camera, &picture, &options)?;
+    for (world, pixel) in options.world_marks.iter().zip(&out.projected) {
+        match pixel {
+            Some(pixel) => println!(
+                "world ({:.4}, {:.4}, {:.4}) -> pixel ({:.1}, {:.1})",
+                world[0], world[1], world[2], pixel[0], pixel[1]
+            ),
             None => println!(
                 "world ({:.4}, {:.4}, {:.4}) is behind the camera or the view is unposed",
                 world[0], world[1], world[2]
             ),
         }
     }
-    let label_scale = 3;
-    // Keep labels readable when the requested grid is finer than a label.
-    let mut next_x = 0;
-    for &u in &verticals {
-        let x = (u - u0) * scale + 2;
-        let width = (u.to_string().len() as u32 * 4 + 2) * label_scale;
-        if x >= next_x && x + width <= out.width {
-            ruler_number(&mut out, x, 2, u, label_scale);
-            next_x = x + width;
-        }
-    }
-    let mut next_y = 8 * label_scale;
-    for &v in &horizontals {
-        let y = (v - v0) * scale + 2;
-        if y >= next_y && y + 7 * label_scale <= out.height {
-            ruler_number(&mut out, 2, y, v, label_scale);
-            next_y = y + 8 * label_scale;
-        }
-    }
-    std::fs::write(&args.output, out.to_png()?)
+    std::fs::write(&args.output, out.image.to_png()?)
         .with_context(|| format!("Failed to write {}", args.output.display()))?;
     println!(
-        "Wrote {}: pixels ({u0}, {v0})..({u1}, {v1}) of {} at {scale}x, {cw}x{ch}",
+        "Wrote {}: pixels ({}, {})..({}, {}) of {} at {}x, {}x{}",
         args.output.display(),
+        out.origin.0,
+        out.origin.1,
+        out.end.0,
+        out.end.1,
         args.view,
+        out.scale,
+        out.image.width,
+        out.image.height
     );
     if args.grid > 0 {
         println!(
             "grid every {} px; verticals at u = {}; horizontals at v = {} (every fifth brighter)",
             args.grid,
-            verticals
+            out.verticals
                 .iter()
                 .map(|u| u.to_string())
                 .collect::<Vec<_>>()
                 .join(", "),
-            horizontals
+            out.horizontals
                 .iter()
                 .map(|v| v.to_string())
                 .collect::<Vec<_>>()
