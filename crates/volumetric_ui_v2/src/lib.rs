@@ -2070,17 +2070,7 @@ impl VolumetricUiV2 {
     /// Builds a render request for a single runtime asset, or `None` when it is
     /// not renderable (models and FEA meshes are).
     fn render_request_for_asset(&self, asset: &LoadedAsset) -> Option<PreviewRequest> {
-        if !matches!(
-            asset.type_hint(),
-            Some(
-                AssetTypeHint::Model
-                    | AssetTypeHint::FeaMesh
-                    | AssetTypeHint::TriMesh
-                    | AssetTypeHint::Subspace
-                    | AssetTypeHint::ViewSet
-                    | AssetTypeHint::Splat
-            ) | None
-        ) {
+        if !runtime_asset_is_renderable(asset) {
             return None;
         }
 
@@ -6873,7 +6863,8 @@ fn runtime_asset_row(app: &VolumetricUiV2, asset: &LoadedAsset, staged: bool) ->
     .align(Align::Center)
 }
 
-fn runtime_asset_is_renderable(asset: &LoadedAsset) -> bool {
+/// Whether the viewport has a representation for an asset of this kind.
+pub(crate) fn runtime_asset_is_renderable(asset: &LoadedAsset) -> bool {
     matches!(
         asset.type_hint(),
         Some(
@@ -8658,6 +8649,81 @@ mod tests {
             panic!("editing the state must keep an inline F64Map");
         };
         assert_eq!(volumetric::f64_map::decode(bytes).unwrap()["swivel"], 45.0);
+    }
+
+    #[test]
+    fn assembly_and_mechanism_outputs_get_preview_requests() {
+        use volumetric::mechanism::{
+            Assembly, AssemblyPart, Axis, Joint, JointKind, Mechanism, encode_assembly,
+            encode_mechanism,
+        };
+        let mechanism = Mechanism::new(
+            vec!["a".to_string()],
+            vec![Joint {
+                name: "spin".to_string(),
+                kind: JointKind::Revolute,
+                parent: "world".to_string(),
+                child: "a".to_string(),
+                axis: Some(Axis {
+                    origin: [0.0; 3],
+                    direction: [0.0, 0.0, 1.0],
+                }),
+                min: -180.0,
+                max: 180.0,
+                default: 0.0,
+                drive: None,
+            }],
+        );
+        let sphere = volumetric_assets::get_model("simple_sphere_model")
+            .expect("bundled sphere")
+            .bytes
+            .to_vec();
+        let assembly = Assembly::new(
+            mechanism.clone(),
+            vec![AssemblyPart {
+                name: "a".to_string(),
+                model: sphere,
+            }],
+            &volumetric::f64_map::F64Map::new(),
+        )
+        .unwrap();
+
+        let mut app = VolumetricUiV2::empty();
+        app.runtime_assets = vec![
+            LoadedAsset::from_parts(
+                "mech".to_string(),
+                encode_mechanism(&mechanism),
+                Some(AssetTypeHint::Mechanism),
+                vec![],
+            ),
+            LoadedAsset::from_parts(
+                "chair".to_string(),
+                encode_assembly(&assembly),
+                Some(AssetTypeHint::Assembly),
+                vec![],
+            ),
+        ];
+        app.pinned_outputs = ["mech", "chair"].map(String::from).into_iter().collect();
+        let requests = app.preview_requests();
+        assert_eq!(requests.len(), 2, "both outputs are renderable");
+        let plan_of = |id: &str| {
+            requests
+                .iter()
+                .find(|request| request.asset_id == id)
+                .map(|request| request.plan.clone())
+                .expect(id)
+        };
+        assert_eq!(plan_of("mech"), PreviewPlan::Mechanism);
+        assert!(
+            matches!(plan_of("chair"), PreviewPlan::Assembly { .. }),
+            "{:?}",
+            plan_of("chair")
+        );
+        assert_eq!(app.output_kind("chair"), OutputKind::Assembly);
+        assert_eq!(
+            app.output_render("chair").summary(),
+            "assembly · ASN2 · 64^3"
+        );
     }
 
     #[test]

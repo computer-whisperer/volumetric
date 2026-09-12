@@ -1911,19 +1911,7 @@ fn upsert_artifact(
 /// a representation for them. Explicit exports are still retained below even
 /// when they are opaque, preserving the project's declared public result.
 fn is_preview_artifact(artifact: &volumetric::LoadedAsset) -> bool {
-    matches!(
-        artifact.type_hint(),
-        Some(
-            AssetTypeHint::Model
-                | AssetTypeHint::FeaMesh
-                | AssetTypeHint::TriMesh
-                | AssetTypeHint::Subspace
-                | AssetTypeHint::ViewSet
-                | AssetTypeHint::Splat
-                | AssetTypeHint::Assembly
-                | AssetTypeHint::Mechanism
-        ) | None
-    )
+    crate::runtime_asset_is_renderable(artifact)
 }
 
 /// Samples a 2D model for the inspection lightbox: the colormapped raster
