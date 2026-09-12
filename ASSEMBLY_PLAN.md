@@ -248,4 +248,4 @@ variant and everything downstream, which only calls `pose` and
 
 ## Ledger
 
-- 2026-09-12: ratified; P1 landed 203fbca; P2 landed (commit below).
+- 2026-09-12: ratified; P1 landed 203fbca; P2 landed 79367af.
