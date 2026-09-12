@@ -176,6 +176,8 @@ impl Project {
             AssetTypeHint::F64Map => "values",
             AssetTypeHint::ViewSet => "views",
             AssetTypeHint::Splat => "splat",
+            AssetTypeHint::Mechanism => "mechanism",
+            AssetTypeHint::Assembly => "assembly",
             _ => "asset",
         });
         project_edit::add_asset(&mut self.inner, base, kind, bytes).map_err(invalid)

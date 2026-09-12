@@ -22,6 +22,7 @@ use glam::Vec3;
 use volumetric::{AssetTypeHint, adaptive_surface_nets_2};
 use volumetric_renderer as renderer;
 
+mod assembly;
 mod gizmo;
 mod scene;
 mod splats;
@@ -29,7 +30,7 @@ mod views;
 
 pub use gizmo::submit_subspace_gizmo;
 pub use scene::{
-    PendingMesh, PreviewStage, build_preview_scene, build_preview_scene_cancellable,
+    MeshJob, PendingMesh, PreviewStage, build_preview_scene, build_preview_scene_cancellable,
     build_preview_scene_monitored, build_preview_scene_with, field_channel_to_linear,
     format_error_chain, part_tint, preview_postlude, preview_prelude, srgb_to_linear,
     wireframe_style,
@@ -329,6 +330,12 @@ pub enum PreviewPlan {
     ViewSet,
     /// The Gaussians themselves, blended back to front.
     Splat,
+    /// Every part under its pose, meshed by `mesh`, with the joints' axes.
+    Assembly {
+        mesh: PreviewMeshPlan,
+    },
+    /// A mechanism's joint axes at rest.
+    Mechanism,
 }
 
 /// A fixed colormap span in millionths of the field's unit (micrometres
@@ -384,6 +391,8 @@ impl PreviewPlan {
             Self::Subspace => "Subspace".to_string(),
             Self::ViewSet => "Views".to_string(),
             Self::Splat => "Splat".to_string(),
+            Self::Assembly { mesh } => format!("Assembly · {}", mesh.label()),
+            Self::Mechanism => "Mechanism".to_string(),
         }
     }
 }

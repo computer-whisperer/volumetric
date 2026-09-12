@@ -206,6 +206,8 @@ enum InputInfo {
     Subspace,
     ViewSet,
     Splat,
+    Mechanism,
+    Assembly,
 }
 
 #[derive(Debug, Serialize)]
@@ -218,6 +220,8 @@ enum OutputInfo {
     F64Map,
     ViewSet,
     Splat,
+    Mechanism,
+    Assembly,
 }
 
 #[derive(Debug, Serialize)]
@@ -265,6 +269,8 @@ fn metadata_to_json(meta: &OperatorMetadata) -> OperatorMetadataJson {
                 OperatorMetadataInput::Subspace => InputInfo::Subspace,
                 OperatorMetadataInput::ViewSet => InputInfo::ViewSet,
                 OperatorMetadataInput::Splat => InputInfo::Splat,
+                OperatorMetadataInput::Mechanism => InputInfo::Mechanism,
+                OperatorMetadataInput::Assembly => InputInfo::Assembly,
             })
             .collect(),
         variadic_input: meta.variadic_input,
@@ -279,6 +285,8 @@ fn metadata_to_json(meta: &OperatorMetadata) -> OperatorMetadataJson {
                 OperatorMetadataOutput::F64Map => OutputInfo::F64Map,
                 OperatorMetadataOutput::ViewSet => OutputInfo::ViewSet,
                 OperatorMetadataOutput::Splat => OutputInfo::Splat,
+                OperatorMetadataOutput::Mechanism => OutputInfo::Mechanism,
+                OperatorMetadataOutput::Assembly => OutputInfo::Assembly,
             })
             .collect(),
     }
@@ -432,6 +440,8 @@ fn print_info_human(output: &InfoOutput) {
                     InputInfo::Splat => {
                         println!("  [{}] Splat", i);
                     }
+                    InputInfo::Mechanism => println!("  [{}] Mechanism", i),
+                    InputInfo::Assembly => println!("  [{}] Assembly", i),
                 }
             }
             if let Some(slot) = metadata.variadic_input {
@@ -447,6 +457,8 @@ fn print_info_human(output: &InfoOutput) {
                     OutputInfo::F64Map => println!("  [{}] F64Map", i),
                     OutputInfo::ViewSet => println!("  [{}] View Set", i),
                     OutputInfo::Splat => println!("  [{}] Splat", i),
+                    OutputInfo::Mechanism => println!("  [{}] Mechanism", i),
+                    OutputInfo::Assembly => println!("  [{}] Assembly", i),
                 }
             }
         }

@@ -1,0 +1,9 @@
+[package]
+name = "assembly_core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+volumetric_abi = { path = "../volumetric_abi" }
+model_wrap_core = { path = "../model_wrap_core" }
+model_merge_core = { path = "../model_merge_core" }

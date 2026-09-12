@@ -1854,6 +1854,8 @@ fn is_preview_artifact(artifact: &volumetric::LoadedAsset) -> bool {
                 | AssetTypeHint::Subspace
                 | AssetTypeHint::ViewSet
                 | AssetTypeHint::Splat
+                | AssetTypeHint::Assembly
+                | AssetTypeHint::Mechanism
         ) | None
     )
 }

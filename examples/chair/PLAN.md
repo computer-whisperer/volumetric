@@ -30,7 +30,7 @@ under `/ceph/christian/index_scanner`.
 | E | Evidence project: survey the stills here, import the splat as surfels, the TSDF cloud and the splat's points; check our frame against the trainer's | done (`evidence.sh`; poses 0.33 mm median from the trainer's) |
 | L | Look: renders of the splat and cloud from canonical directions and through the photographs, enough to name every part and its rough size | done (presets, through-views, ortho slab sections) |
 | M | Measure: ground plane, lift axis and radius, hub, arm count/length/rise, caster positions and wheel size, column heights, plate outline and hole pattern | done except the bracket's hole pattern and the levers |
-| B | Build: `examples/chair/base.sh` → `chair_base.vproj`, parts from the catalog (sketch, extrude, revolve, cylinder, booleans, offset) placed on the measured datums | first version: column, five arms with casters, rail and bracket boxes |
+| B | Build: `examples/chair/base.sh` → `chair_base.vproj`, parts from the catalog (sketch, extrude, revolve, cylinder, booleans, offset) placed on the measured datums | column, five arms, casters, rail and bracket; since 2026-09-12 an articulated assembly (`chair`: lift, swivel, caster swivels and rolls) beside the posed union (`chair_model`) |
 | V | Verify: model over the photographs through the surveyed views; point-to-model distances from the cloud; residuals recorded | first version: edge overlays through three views and sections over the cloud (`verify.sh`); numeric residuals pending |
 
 Gaps found on the way go in the table below, with the step that met them.
@@ -126,6 +126,18 @@ undersides are missing and every "bottom" below is a silhouette.
 | 4 | B | No path sweep (a tube along a curve): the arms need one | two-view intersection (toy car) or an SDF script; decide in B |
 
 ## Log
+
+- 2026-09-12: the base is an articulated assembly (`ASSEMBLY_PLAN.md`,
+  P1). `base.sh` builds thirteen parts in the base frame and poses each
+  into the survey's frame (the hub and tube split from the piston at
+  z 0.25; a stem and a wheel per arm, posed by arm azimuth), then a
+  mechanism of twelve states: `lift` (prismatic along the lift axis,
+  −20..80 mm assumed about the photographed height), `swivel` (the
+  mechanism about the same axis), `caster_k` (about each stem) and
+  `roll_k` (about each axle at r 0.36, z 0.0325). `chair` is the
+  Assembly, `chair_model` the parts at rest as one model (was
+  `base_world`; verify.sh and audit.sh follow). Through DSC00742 the
+  edge overlay is the same as before the split.
 
 - 2026-09-11: survey here of the 44 stills: all posed, 0.371 px rms, f
   6904.4 ± 1.1 px (the shim: 6904.4), card along span 179.32 mm against

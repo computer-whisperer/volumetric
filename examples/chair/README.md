@@ -14,10 +14,12 @@ volumetric_cli`; the scanner tree is expected at `$SCAN`, default
   imports the trained splat (as surfels) and its TSDF surface cloud:
   `chair_evidence.vproj`, about 120 MB, in the session's demo directory.
 - `base.sh` rebuilds `chair_base.vproj` at the repo root from the catalog
-  (revolved column, two-view arms patterned five times, box mechanism) and
-  runs it. Exports `base` (base frame: floor origin under the lift axis,
-  z up, one arm along +x) and `base_world` (posed into the survey's card
-  frame).
-- `verify.sh [evidence.vproj]` draws `base_world` through three surveyed
+  (revolved hub and piston, two-view arms patterned five times, box
+  mechanism, a stem and a wheel per caster), poses every part into the
+  survey's card frame and runs it. Exports `chair`, the articulated
+  assembly (lift, swivel, and a swivel and a roll per caster: twelve
+  states, the scan's pose the rest state), and `chair_model`, the parts
+  at rest as one model.
+- `verify.sh [evidence.vproj]` draws `chair_model` through three surveyed
   photographs as an edge overlay, and in plan and elevation sections over
   the scan's cloud, under `target/chair/`.

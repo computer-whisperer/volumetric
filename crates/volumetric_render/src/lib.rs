@@ -321,6 +321,8 @@ pub fn is_renderable(asset: &LoadedAsset) -> bool {
                 | AssetTypeHint::Subspace
                 | AssetTypeHint::ViewSet
                 | AssetTypeHint::Splat
+                | AssetTypeHint::Assembly
+                | AssetTypeHint::Mechanism
         ) | None
     )
 }
@@ -392,6 +394,18 @@ pub fn preview_request(asset: &LoadedAsset, options: &PlanOptions) -> PreviewReq
         Some(AssetTypeHint::Subspace) => PreviewPlan::Subspace,
         Some(AssetTypeHint::ViewSet) => PreviewPlan::ViewSet,
         Some(AssetTypeHint::Splat) => PreviewPlan::Splat,
+        Some(AssetTypeHint::Mechanism) => PreviewPlan::Mechanism,
+        Some(AssetTypeHint::Assembly) => PreviewPlan::Assembly {
+            mesh: PreviewMeshPlan::for_mode(
+                PreviewRenderMode::AdaptiveSurfaceNets2,
+                options.resolution,
+                Asn2Settings {
+                    sharp_edges: options.sharp,
+                    simplify: options.simplify,
+                    ..Asn2Settings::default()
+                },
+            ),
+        },
         _ => match volumetric::model_dimensions_static(asset.data()) {
             Some(2) => PreviewPlan::Sketch {
                 resolution: options.resolution,

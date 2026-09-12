@@ -122,6 +122,7 @@ pub mod annotations;
 pub mod f64_map;
 pub mod fea;
 pub mod lua_parameters;
+pub mod mechanism;
 pub mod splat;
 pub mod subspace;
 pub mod threading;
@@ -343,6 +344,13 @@ pub enum OperatorMetadataInput {
     /// oriented Gaussians or surfels with colour; explicit data, never fed
     /// to the model executor.
     Splat,
+    /// A CBOR-encoded mechanism (see [`mechanism`]): parts joined by
+    /// joints; explicit data, never fed to the model executor.
+    Mechanism,
+    /// A CBOR-encoded assembly (see [`mechanism`]): a mechanism with its
+    /// part models and one state; explicit data, never fed to the model
+    /// executor as a whole.
+    Assembly,
 }
 
 /// Output slot declaration in an operator's metadata.
@@ -370,6 +378,10 @@ pub enum OperatorMetadataOutput {
     /// A CBOR-encoded Gaussian splat (see [`OperatorMetadataInput::Splat`]);
     /// explicit data, never fed to the model executor.
     Splat,
+    /// A CBOR-encoded mechanism (see [`OperatorMetadataInput::Mechanism`]).
+    Mechanism,
+    /// A CBOR-encoded assembly (see [`OperatorMetadataInput::Assembly`]).
+    Assembly,
 }
 
 /// Metadata a module returns from `get_metadata()`, CBOR-encoded.

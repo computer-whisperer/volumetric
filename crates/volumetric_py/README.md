@@ -46,8 +46,8 @@ p.save("posts.vproj")
 - `Project()`, `Project.open(path)`, `Project.from_bytes(b)`, `.save(path)`,
   `.to_bytes()`, `.asset_ids()`, `.exports`, `.steps()`, `.validate()`.
 - `.add_model(wasm, id=None)`; `.add_asset(data, kind, id=None)` with kind
-  `lua`, `wgsl`, `config`, `f64map` (a dict is accepted), `blob`, `viewset`
-  or `splat`; `v.models()` / `v.model_bytes(name)` for the bundled models.
+  `lua`, `wgsl`, `config`, `f64map` (a dict is accepted), `blob`, `viewset`,
+  `splat`, `mechanism` or `assembly`; `v.models()` / `v.model_bytes(name)` for the bundled models.
 - `.add_op(operator, inputs, output=None, export=True)`: `operator` is a
   bundled name (`v.operators()`), a `.wasm` path or wasm bytes. Each input
   is an asset id (`str`), `None` (unwired), `bytes` (raw) or a JSON-like

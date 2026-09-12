@@ -190,6 +190,10 @@ enum OperatorMetadataInput {
     FeaMesh,                    // CBOR FEA mesh (explicit data)
     TriMesh,                    // CBOR triangle mesh (explicit data)
     Subspace,                   // CBOR affine subspace (explicit data)
+    ViewSet,                    // CBOR posed images (explicit data)
+    Splat,                      // CBOR Gaussian splat (explicit data)
+    Mechanism,                  // CBOR joint tree (explicit data)
+    Assembly,                   // CBOR mechanism + part models + state (explicit data)
 }
 
 enum OperatorMetadataOutput {
@@ -197,6 +201,11 @@ enum OperatorMetadataOutput {
     FeaMesh,
     TriMesh,
     Subspace,
+    F64Map,
+    ViewSet,
+    Splat,
+    Mechanism,
+    Assembly,
 }
 ```
 

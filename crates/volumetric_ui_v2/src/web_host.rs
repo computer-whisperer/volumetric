@@ -991,21 +991,25 @@ async fn remote_mesh_preview(
     on_progress: &dyn Fn(volumetric::BuildProgress),
 ) -> Result<Option<PreviewEntity>, String> {
     let client = probed_client(address).await?;
-    let outcome = client
-        .run(
-            &JobRequest::MeshModel {
-                model_wasm: request.data.to_vec(),
-                config: pending.config.clone(),
-            },
-            &|| cancel.load(Ordering::Relaxed),
-            on_progress,
-        )
-        .await
-        .map_err(|err| format!("remote build at {address}: {err}"))?;
-    let Some(mesh) = mesh_result_from_output(output_from_outcome(outcome)?)? else {
-        return Ok(None);
-    };
-    Ok(Some(preview_postlude(request, pending, mesh)))
+    let mut meshes = Vec::with_capacity(pending.jobs.len());
+    for job in &pending.jobs {
+        let outcome = client
+            .run(
+                &JobRequest::MeshModel {
+                    model_wasm: job.data.to_vec(),
+                    config: job.config.clone(),
+                },
+                &|| cancel.load(Ordering::Relaxed),
+                on_progress,
+            )
+            .await
+            .map_err(|err| format!("remote build at {address}: {err}"))?;
+        let Some(mesh) = mesh_result_from_output(output_from_outcome(outcome)?)? else {
+            return Ok(None);
+        };
+        meshes.push(mesh);
+    }
+    Ok(Some(preview_postlude(request, pending, meshes)))
 }
 
 /// The async analogue of `RemoteBackend`'s lazy reachability +

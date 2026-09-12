@@ -689,6 +689,8 @@ enum AssetSlotKind {
     F64Map,
     ViewSet,
     Splat,
+    Mechanism,
+    Assembly,
 }
 
 #[derive(Clone, Debug)]
@@ -725,6 +727,8 @@ impl AssetSlotKind {
             OperatorMetadataInput::F64Map => Some(AssetSlotKind::F64Map),
             OperatorMetadataInput::ViewSet => Some(AssetSlotKind::ViewSet),
             OperatorMetadataInput::Splat => Some(AssetSlotKind::Splat),
+            OperatorMetadataInput::Mechanism => Some(AssetSlotKind::Mechanism),
+            OperatorMetadataInput::Assembly => Some(AssetSlotKind::Assembly),
             _ => None,
         }
     }
@@ -892,6 +896,10 @@ pub enum OutputKind {
     ViewSet,
     /// A Gaussian splat: the primitives blended back to front.
     Splat,
+    /// An assembly: every part under its pose, with the joints' axes.
+    Assembly,
+    /// A mechanism on its own: its joints' axes at rest.
+    Mechanism,
 }
 
 /// FEA-specific view settings.
@@ -953,6 +961,15 @@ pub enum OutputRender {
     ViewSet,
     /// Splats draw at their trained opacity; no settings yet.
     Splat,
+    /// Assemblies mesh every part by the model plans (ASN2 at its
+    /// defaults), posed and tinted by part.
+    Assembly {
+        mode: PreviewRenderMode,
+        resolution: usize,
+        wireframe: bool,
+    },
+    /// Mechanisms draw their joint axes; no settings yet.
+    Mechanism,
 }
 
 impl OutputRender {
@@ -965,6 +982,8 @@ impl OutputRender {
             Self::Subspace => OutputKind::Subspace,
             Self::ViewSet => OutputKind::ViewSet,
             Self::Splat => OutputKind::Splat,
+            Self::Assembly { .. } => OutputKind::Assembly,
+            Self::Mechanism => OutputKind::Mechanism,
         }
     }
 
@@ -999,15 +1018,25 @@ impl OutputRender {
             Self::Subspace => "subspace".to_string(),
             Self::ViewSet => "views".to_string(),
             Self::Splat => "splat".to_string(),
+            Self::Assembly {
+                mode, resolution, ..
+            } => format!("assembly · {} · {}^3", mode.label(), resolution),
+            Self::Mechanism => "mechanism".to_string(),
         }
     }
 
     /// The display-only wireframe overlay flag, where the kind has one.
     fn wireframe(&self) -> bool {
         match self {
-            Self::Model3d { wireframe, .. } | Self::TriMesh { wireframe } => *wireframe,
+            Self::Model3d { wireframe, .. }
+            | Self::TriMesh { wireframe }
+            | Self::Assembly { wireframe, .. } => *wireframe,
             Self::FeaMesh(fea) => fea.wireframe,
-            Self::Model2d { .. } | Self::Subspace | Self::ViewSet | Self::Splat => false,
+            Self::Model2d { .. }
+            | Self::Subspace
+            | Self::ViewSet
+            | Self::Splat
+            | Self::Mechanism => false,
         }
     }
 }
@@ -1584,6 +1613,8 @@ impl VolumetricUiV2 {
             Some(AssetTypeHint::Subspace) => OutputKind::Subspace,
             Some(AssetTypeHint::ViewSet) => OutputKind::ViewSet,
             Some(AssetTypeHint::Splat) => OutputKind::Splat,
+            Some(AssetTypeHint::Assembly) => OutputKind::Assembly,
+            Some(AssetTypeHint::Mechanism) => OutputKind::Mechanism,
             _ => {
                 let data = asset.data_arc();
                 let key = (Arc::as_ptr(&data) as usize, data.len());
@@ -1625,6 +1656,12 @@ impl VolumetricUiV2 {
             OutputKind::Subspace => OutputRender::Subspace,
             OutputKind::ViewSet => OutputRender::ViewSet,
             OutputKind::Splat => OutputRender::Splat,
+            OutputKind::Assembly => OutputRender::Assembly {
+                mode: self.render_mode,
+                resolution: self.preview_resolution,
+                wireframe: false,
+            },
+            OutputKind::Mechanism => OutputRender::Mechanism,
         }
     }
 
@@ -1691,7 +1728,9 @@ impl VolumetricUiV2 {
 
     fn set_output_mode(&mut self, id: &str, mode: PreviewRenderMode) {
         let mut render = self.output_render(id);
-        let OutputRender::Model3d { mode: slot, .. } = &mut render else {
+        let (OutputRender::Model3d { mode: slot, .. } | OutputRender::Assembly { mode: slot, .. }) =
+            &mut render
+        else {
             return;
         };
         *slot = mode;
@@ -1703,6 +1742,9 @@ impl VolumetricUiV2 {
         let mut render = self.output_render(id);
         match &mut render {
             OutputRender::Model3d {
+                resolution: slot, ..
+            }
+            | OutputRender::Assembly {
                 resolution: slot, ..
             } => {
                 *slot = resolution;
@@ -1722,14 +1764,15 @@ impl VolumetricUiV2 {
     fn toggle_output_wireframe(&mut self, id: &str) {
         let mut render = self.output_render(id);
         let slot = match &mut render {
-            OutputRender::Model3d { wireframe, .. } | OutputRender::TriMesh { wireframe } => {
-                wireframe
-            }
+            OutputRender::Model3d { wireframe, .. }
+            | OutputRender::TriMesh { wireframe }
+            | OutputRender::Assembly { wireframe, .. } => wireframe,
             OutputRender::FeaMesh(fea) => &mut fea.wireframe,
             OutputRender::Model2d { .. }
             | OutputRender::Subspace
             | OutputRender::ViewSet
-            | OutputRender::Splat => {
+            | OutputRender::Splat
+            | OutputRender::Mechanism => {
                 return;
             }
         };
@@ -2071,6 +2114,12 @@ impl VolumetricUiV2 {
             OutputRender::Subspace => PreviewPlan::Subspace,
             OutputRender::ViewSet => PreviewPlan::ViewSet,
             OutputRender::Splat => PreviewPlan::Splat,
+            OutputRender::Assembly {
+                mode, resolution, ..
+            } => PreviewPlan::Assembly {
+                mesh: PreviewMeshPlan::for_mode(*mode, *resolution, Asn2Settings::default()),
+            },
+            OutputRender::Mechanism => PreviewPlan::Mechanism,
         };
         Some(PreviewRequest {
             asset_id: asset.id().to_string(),
@@ -3683,6 +3732,8 @@ impl VolumetricUiV2 {
                 f64_map: for_kind(AssetTypeHint::F64Map).as_deref(),
                 viewset: for_kind(AssetTypeHint::ViewSet).as_deref(),
                 splat: for_kind(AssetTypeHint::Splat).as_deref(),
+                mechanism: for_kind(AssetTypeHint::Mechanism).as_deref(),
+                assembly: for_kind(AssetTypeHint::Assembly).as_deref(),
             },
         );
 
@@ -5541,6 +5592,25 @@ fn output_settings_popover(app: &VolumetricUiV2, id: &str) -> El {
         OutputRender::Splat => {
             body.push(text("Gaussian splat · no settings yet").caption().muted());
         }
+        OutputRender::Assembly {
+            mode,
+            resolution,
+            wireframe,
+        } => {
+            body.extend(mode_resolution_rows(id, *mode, *resolution));
+            if *mode != PreviewRenderMode::Points {
+                body.push(
+                    field_row(
+                        "Wireframe",
+                        switch(format!("{OUTPUT_WIREFRAME_PREFIX}{id}"), *wireframe),
+                    )
+                    .gap(tokens::SPACE_2),
+                );
+            }
+        }
+        OutputRender::Mechanism => {
+            body.push(text("Joint axes · no settings yet").caption().muted());
+        }
     }
     if let Some(stats) = app.output_stats.get(id) {
         body.push(divider());
@@ -5626,40 +5696,7 @@ fn model3d_settings(
     wireframe: bool,
     color_channel: Option<&str>,
 ) -> Vec<El> {
-    let mode_buttons = row(PreviewRenderMode::ALL.into_iter().map(|preset| {
-        let button = button(preset.label())
-            .xsmall()
-            .tooltip(preset.full_label())
-            .key(format!("{OUTPUT_MODE_PREFIX}{id}:{}", preset.route_name()));
-        if mode == preset {
-            button.primary()
-        } else {
-            button.secondary()
-        }
-    }))
-    .gap(tokens::SPACE_1);
-    // Two rows: the preset ladder is too wide for one popover line.
-    let resolution_buttons = column(PREVIEW_RESOLUTIONS.chunks(5).map(|chunk| {
-        row(chunk.iter().map(|&preset| {
-            let button = button(format!("{preset}^3"))
-                .xsmall()
-                .key(format!("{OUTPUT_RESOLUTION_PREFIX}{id}:{preset}"));
-            if resolution == preset {
-                button.primary()
-            } else {
-                button.secondary()
-            }
-        }))
-        .gap(tokens::SPACE_1)
-    }))
-    .gap(tokens::SPACE_1);
-
-    let mut body = vec![
-        text("Render Mode").caption().muted(),
-        mode_buttons,
-        text("Resolution").caption().muted(),
-        resolution_buttons,
-    ];
+    let mut body = mode_resolution_rows(id, mode, resolution);
     if mode != PreviewRenderMode::Points {
         body.push(
             field_row(
@@ -5761,6 +5798,45 @@ fn model3d_settings(
         );
     }
     body
+}
+
+/// The render-mode and resolution button rows shared by models and
+/// assemblies.
+fn mode_resolution_rows(id: &str, mode: PreviewRenderMode, resolution: usize) -> Vec<El> {
+    let mode_buttons = row(PreviewRenderMode::ALL.into_iter().map(|preset| {
+        let button = button(preset.label())
+            .xsmall()
+            .tooltip(preset.full_label())
+            .key(format!("{OUTPUT_MODE_PREFIX}{id}:{}", preset.route_name()));
+        if mode == preset {
+            button.primary()
+        } else {
+            button.secondary()
+        }
+    }))
+    .gap(tokens::SPACE_1);
+    // Two rows: the preset ladder is too wide for one popover line.
+    let resolution_buttons = column(PREVIEW_RESOLUTIONS.chunks(5).map(|chunk| {
+        row(chunk.iter().map(|&preset| {
+            let button = button(format!("{preset}^3"))
+                .xsmall()
+                .key(format!("{OUTPUT_RESOLUTION_PREFIX}{id}:{preset}"));
+            if resolution == preset {
+                button.primary()
+            } else {
+                button.secondary()
+            }
+        }))
+        .gap(tokens::SPACE_1)
+    }))
+    .gap(tokens::SPACE_1);
+
+    vec![
+        text("Render Mode").caption().muted(),
+        mode_buttons,
+        text("Resolution").caption().muted(),
+        resolution_buttons,
+    ]
 }
 
 /// The "Color by" channel picker rows, for outputs whose model declares
@@ -6750,6 +6826,8 @@ fn runtime_asset_is_renderable(asset: &LoadedAsset) -> bool {
                 | AssetTypeHint::Subspace
                 | AssetTypeHint::ViewSet
                 | AssetTypeHint::Splat
+                | AssetTypeHint::Assembly
+                | AssetTypeHint::Mechanism
         ) | None
     )
 }
@@ -6891,6 +6969,8 @@ fn step_edit_rows(app: &VolumetricUiV2, step_idx: usize) -> Vec<El> {
         let f64_maps = step_input_options(app, step_idx, AssetSlotKind::F64Map);
         let viewsets = step_input_options(app, step_idx, AssetSlotKind::ViewSet);
         let splats = step_input_options(app, step_idx, AssetSlotKind::Splat);
+        let mechanisms = step_input_options(app, step_idx, AssetSlotKind::Mechanism);
+        let assemblies = step_input_options(app, step_idx, AssetSlotKind::Assembly);
         rows.push(text("Inputs").muted().caption().semibold());
         let block = edit.variadic.as_ref();
         for (n, slot) in edit.asset_slots.iter().enumerate() {
@@ -6906,6 +6986,8 @@ fn step_edit_rows(app: &VolumetricUiV2, step_idx: usize) -> Vec<El> {
                 AssetSlotKind::F64Map => &f64_maps,
                 AssetSlotKind::ViewSet => &viewsets,
                 AssetSlotKind::Splat => &splats,
+                AssetSlotKind::Mechanism => &mechanisms,
+                AssetSlotKind::Assembly => &assemblies,
             };
             let in_block = block.is_some_and(|block| block.range.contains(&slot.input_idx));
             let removable = in_block && block.is_some_and(|block| block.range.len() > 1);
@@ -7012,6 +7094,8 @@ fn step_input_options(app: &VolumetricUiV2, step_idx: usize, kind: AssetSlotKind
         AssetSlotKind::F64Map => editable_f64_map_asset_ids(app),
         AssetSlotKind::ViewSet => editable_viewset_asset_ids(app),
         AssetSlotKind::Splat => editable_splat_asset_ids(app),
+        AssetSlotKind::Mechanism => editable_typed_asset_ids(app, AssetTypeHint::Mechanism),
+        AssetSlotKind::Assembly => editable_typed_asset_ids(app, AssetTypeHint::Assembly),
     };
     ids.into_iter()
         .filter(|id| !not_yet_produced.contains(id.as_str()))
@@ -7098,6 +7182,8 @@ fn asset_slot_kind_label(kind: AssetSlotKind) -> &'static str {
         AssetSlotKind::F64Map => "F64Map",
         AssetSlotKind::ViewSet => "view set",
         AssetSlotKind::Splat => "splat",
+        AssetSlotKind::Mechanism => "mechanism",
+        AssetSlotKind::Assembly => "assembly",
     }
 }
 
@@ -7547,6 +7633,8 @@ fn asset_type_label(type_hint: Option<AssetTypeHint>) -> &'static str {
         Some(AssetTypeHint::Subspace) => "Subspace",
         Some(AssetTypeHint::ViewSet) => "Views",
         Some(AssetTypeHint::Splat) => "Splat",
+        Some(AssetTypeHint::Mechanism) => "Mechanism",
+        Some(AssetTypeHint::Assembly) => "Assembly",
         None => "Asset",
     }
 }
@@ -7562,6 +7650,8 @@ struct SlotPrimaries<'a> {
     f64_map: Option<&'a str>,
     viewset: Option<&'a str>,
     splat: Option<&'a str>,
+    mechanism: Option<&'a str>,
+    assembly: Option<&'a str>,
 }
 
 /// Builds a fresh step's inputs, one per declared operator metadata input, in
@@ -7626,6 +7716,14 @@ fn operator_step_inputs(
                 None => ExecutionInput::Inline(Vec::new()),
             },
             OperatorMetadataInput::Splat => match primaries.splat {
+                Some(id) => ExecutionInput::AssetRef(id.to_string()),
+                None => ExecutionInput::Inline(Vec::new()),
+            },
+            OperatorMetadataInput::Mechanism => match primaries.mechanism {
+                Some(id) => ExecutionInput::AssetRef(id.to_string()),
+                None => ExecutionInput::Inline(Vec::new()),
+            },
+            OperatorMetadataInput::Assembly => match primaries.assembly {
                 Some(id) => ExecutionInput::AssetRef(id.to_string()),
                 None => ExecutionInput::Inline(Vec::new()),
             },
@@ -7749,9 +7847,14 @@ fn editable_viewset_asset_ids(app: &VolumetricUiV2) -> Vec<String> {
 }
 
 fn editable_splat_asset_ids(app: &VolumetricUiV2) -> Vec<String> {
+    editable_typed_asset_ids(app, AssetTypeHint::Splat)
+}
+
+/// The declared assets carrying exactly `kind`.
+fn editable_typed_asset_ids(app: &VolumetricUiV2, kind: AssetTypeHint) -> Vec<String> {
     app.declared_assets_typed()
         .into_iter()
-        .filter_map(|(id, type_hint)| (type_hint == Some(AssetTypeHint::Splat)).then_some(id))
+        .filter_map(|(id, type_hint)| (type_hint == Some(kind)).then_some(id))
         .collect()
 }
 

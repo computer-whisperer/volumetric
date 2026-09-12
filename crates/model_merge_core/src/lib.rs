@@ -7,7 +7,12 @@
 //! consuming operator then emits its own glue/wrapper functions and the
 //! export section.
 //!
-//! Extracted from `boolean_operator`, shared with `lattice_operator`.
+//! Extracted from `boolean_operator`, shared with `lattice_operator`; the
+//! boolean glue itself lives in [`combine`].
+
+pub mod combine;
+
+pub use combine::{Combine, combine_models};
 
 use wasm_encoder::{CodeSection, FunctionSection, TypeSection};
 

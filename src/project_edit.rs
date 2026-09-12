@@ -43,6 +43,8 @@ pub fn input_type_label(input: &OperatorMetadataInput) -> String {
         OperatorMetadataInput::Subspace => "Subspace".to_string(),
         OperatorMetadataInput::ViewSet => "ViewSet".to_string(),
         OperatorMetadataInput::Splat => "Splat".to_string(),
+        OperatorMetadataInput::Mechanism => "Mechanism".to_string(),
+        OperatorMetadataInput::Assembly => "Assembly".to_string(),
     }
 }
 
@@ -205,6 +207,8 @@ pub const ASSET_KINDS: &[(&str, AssetTypeHint)] = &[
     ("blob", AssetTypeHint::Binary),
     ("viewset", AssetTypeHint::ViewSet),
     ("splat", AssetTypeHint::Splat),
+    ("mechanism", AssetTypeHint::Mechanism),
+    ("assembly", AssetTypeHint::Assembly),
 ];
 
 /// The kind an asset file of this extension imports as by default.
@@ -215,6 +219,8 @@ pub fn asset_kind_for_extension(extension: &str) -> AssetTypeHint {
         "cbor" => AssetTypeHint::Config,
         "vviews" => AssetTypeHint::ViewSet,
         "vsplat" => AssetTypeHint::Splat,
+        "vmech" => AssetTypeHint::Mechanism,
+        "vasm" => AssetTypeHint::Assembly,
         _ => AssetTypeHint::Binary,
     }
 }
@@ -245,6 +251,16 @@ pub fn validate_asset_bytes(kind: AssetTypeHint, bytes: &[u8]) -> Result<()> {
             volumetric_abi::splat::decode_splat(bytes)
                 .map_err(anyhow::Error::msg)
                 .context("Invalid splat asset")?;
+        }
+        AssetTypeHint::Mechanism => {
+            volumetric_abi::mechanism::decode_mechanism(bytes)
+                .map_err(anyhow::Error::msg)
+                .context("Invalid mechanism asset")?;
+        }
+        AssetTypeHint::Assembly => {
+            volumetric_abi::mechanism::decode_assembly(bytes)
+                .map_err(anyhow::Error::msg)
+                .context("Invalid assembly asset")?;
         }
         AssetTypeHint::F64Map => {
             volumetric_abi::f64_map::decode(bytes)

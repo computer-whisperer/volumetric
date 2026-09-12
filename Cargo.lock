@@ -221,6 +221,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "assemble_operator"
+version = "0.1.0"
+dependencies = [
+ "assembly_core",
+ "volumetric_abi",
+]
+
+[[package]]
+name = "assembly_core"
+version = "0.1.0"
+dependencies = [
+ "model_merge_core",
+ "model_wrap_core",
+ "volumetric_abi",
+]
+
+[[package]]
+name = "assembly_model_operator"
+version = "0.1.0"
+dependencies = [
+ "assembly_core",
+ "ciborium",
+ "serde",
+ "volumetric_abi",
+]
+
+[[package]]
 name = "async-trait"
 version = "0.1.89"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -357,8 +384,6 @@ dependencies = [
  "model_merge_core",
  "serde",
  "volumetric_abi",
- "wasm-encoder 0.248.0",
- "wasmparser 0.248.0",
 ]
 
 [[package]]
@@ -3136,6 +3161,15 @@ checksum = "a06de3016e9fae57a36fd14dba131fccf49f74b40b7fbdb472f96e361ec71a08"
 dependencies = [
  "autocfg",
  "rawpointer",
+]
+
+[[package]]
+name = "mechanism_operator"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "serde",
+ "volumetric_abi",
 ]
 
 [[package]]

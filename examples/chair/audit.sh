@@ -21,14 +21,14 @@ mkdir -p $O
 rm -f $P
 
 $V project-new --output $P >/dev/null
-$V project-export -p "$BASE" --asset base_world -o $O >/dev/null
-$V project-add-model -p $P -i $O/base_world.wasm --asset-id base_world >/dev/null
+$V project-export -p "$BASE" --asset chair_model -o $O >/dev/null
+$V project-add-model -p $P -i $O/chair_model.wasm --asset-id chair_model >/dev/null
 $V project-add-asset -p $P -i "$CLOUD" --type blob --asset-id cloud_ply >/dev/null
 $V project-add-op -p $P --operator point_cloud_import_operator -i asset:cloud_ply -i none --output-id cloud --no-export >/dev/null
 # The base's neighbourhood, above the carpet (z > 12 mm).
 $V project-add-op -p $P --operator rectangular_prism_operator -i 'json:{}' -i 'json:[-0.15,-0.25,0.012]' -i 'json:[0.65,0.55,0.5]' --output-id region --no-export >/dev/null
 $V project-add-op -p $P --operator mesh_clip_operator -i asset:cloud -i asset:region -i 'json:{"keep":"inside"}' --output-id near --no-export >/dev/null
-$V project-add-op -p $P --operator cloud_distance_operator -i asset:near -i asset:base_world -i 'json:{"resolution":256}' --output-id audit >/dev/null
+$V project-add-op -p $P --operator cloud_distance_operator -i asset:near -i asset:chair_model -i 'json:{"resolution":256}' --output-id audit >/dev/null
 
 # Per zone, about the lift axis (0.2569, 0.1509): the arms in an annulus
 # r 70..400 mm from z 80 to 200 (above the caster sockets), the casters
@@ -48,10 +48,10 @@ $V project-add-op -p $P --operator boolean_operator -i asset:casters_outer -i as
 # residual (carpet fuzz reaches 60 mm in an unmasked cloud) stays out,
 # so this is the number for the parts that are modelled; parts that are
 # not show only in the colour maps.
-$V project-add-op -p $P --operator offset_operator -i asset:base_world -i 'json:{"distance":0.03,"resolution":192}' --output-id shell_zone --no-export >/dev/null
+$V project-add-op -p $P --operator offset_operator -i asset:chair_model -i 'json:{"distance":0.03,"resolution":192}' --output-id shell_zone --no-export >/dev/null
 for zone in arms casters column mechanism shell; do
     $V project-add-op -p $P --operator mesh_clip_operator -i asset:near -i asset:${zone}_zone -i 'json:{"keep":"inside"}' --output-id ${zone}_cloud --no-export >/dev/null
-    $V project-add-op -p $P --operator cloud_distance_operator -i asset:${zone}_cloud -i asset:base_world -i 'json:{"resolution":256}' --output-id ${zone}_audit >/dev/null
+    $V project-add-op -p $P --operator cloud_distance_operator -i asset:${zone}_cloud -i asset:chair_model -i 'json:{"resolution":256}' --output-id ${zone}_audit >/dev/null
 done
 $V project-run -p $P --json > $O/audit.json
 python3 - "$O/audit.json" <<'PY'

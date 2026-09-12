@@ -1,9 +1,12 @@
 #!/bin/bash
 # Rebuild chair_base.vproj: the office-chair base (five-arm star, gas lift,
 # tilt mechanism) from the chairbase-dslr-1 scan's measurements (PLAN.md).
-# Base frame: origin on the floor under the lift axis, z up, arm 0 along +x.
-# `base_world` is the same model posed into the survey's card frame, for
-# checking against the scan (verify.sh). All coordinates metres.
+# Parts are built in the base frame (origin on the floor under the lift
+# axis, z up, arm 0 along +x), then each is posed into the survey's card
+# frame and the articulated assembly is made there: `chair` (the Assembly:
+# lift, swivel, and a swivel and a roll per caster) and `chair_model` (the
+# parts posed at the rest state as one model, for verify.sh and audit.sh).
+# All coordinates metres.
 set -e
 L="$(cd "$(dirname "$0")" && pwd)"
 cd "$L/../.."
@@ -14,7 +17,7 @@ $V project-new --output $P >/dev/null
 
 # The evidence's photographs (evidence.sh writes the selection): ten
 # surveyed views of the base, so the model can be looked through them
-# here (`render -i chair_base.vproj --asset base_world --through DSC00742
+# here (`render -i chair_base.vproj --asset chair_model --through DSC00742
 # --overlay edge`) and in the GUI.
 SCAN=${SCAN:-/ceph/christian/index_scanner}
 VIEWS=${CHAIR_VIEWS:-$SCAN/sessions/chairbase-dslr-1-all/demo/chair_views.vviews}
@@ -30,12 +33,15 @@ UNION='json:{"op":"union"}'
 ISECT='json:{"op":"intersect"}'
 SUB='json:{"op":"subtract"}'
 
-# --- Hub and gas lift: one section revolved about z (sketch x = radius,
-# sketch y = height). Hub r 54 from z 133 to 170 with a chamfer to the
-# collar at 178; collar r 30 to 190; lift outer tube r 25.5 to 265; inner
-# tube r 15 to the mechanism at 410.
-op --operator path_sketch_operator --input 'json:{"path":"M 0 0.133 H 0.054 V 0.170 L 0.048 0.178 H 0.030 V 0.190 H 0.0255 V 0.265 H 0.015 V 0.410 H 0 Z"}' --output-id column_sketch --no-export
-op --operator revolve_operator --input asset:column_sketch --input none --output-id column --no-export
+# --- Hub and gas lift: two sections revolved about z (sketch x = radius,
+# sketch y = height). The hub and outer tube: hub r 54 from z 133 to 170
+# with a chamfer to the collar at 178; collar r 30 to 190; lift outer tube
+# r 25.5 to 265. The piston (the lift's moving part): r 15 from inside the
+# tube at 250 to the mechanism at 410.
+op --operator path_sketch_operator --input 'json:{"path":"M 0 0.133 H 0.054 V 0.170 L 0.048 0.178 H 0.030 V 0.190 H 0.0255 V 0.265 H 0 Z"}' --output-id hub_tube_sketch --no-export
+op --operator revolve_operator --input asset:hub_tube_sketch --input none --output-id hub_tube_base --no-export
+op --operator path_sketch_operator --input 'json:{"path":"M 0 0.250 H 0.015 V 0.410 H 0 Z"}' --output-id piston_sketch --no-export
+op --operator revolve_operator --input asset:piston_sketch --input none --output-id piston_base --no-export
 
 # --- One arm along +x: plan outline (x, y) extruded up, intersected with
 # the elevation (x, z) extruded across, then rounded 5 mm. Both profiles
@@ -57,11 +63,12 @@ op --operator offset_operator --input asset:arm_eroded --input 'json:{"distance"
 
 # --- Caster at the socket (r 340): a stem down from the arm tip and a 65
 # wheel, 24 wide, trailing 20 outward (the swivel state in the scan is
-# arbitrary; the cloud's wheels sit at r 360).
-op --operator cylinder_operator --input 'json:{"radius":0.011}' --input 'json:[0.34,0.0,0.03]' --input 'json:[0.34,0.0,0.085]' --output-id stem --no-export
-op --operator cylinder_operator --input 'json:{"radius":0.0325}' --input 'json:[0.36,-0.012,0.0325]' --input 'json:[0.36,0.012,0.0325]' --output-id wheel --no-export
-op --operator boolean_operator --input asset:arm_round --input asset:stem --input asset:wheel --input "$UNION" --output-id arm --no-export
-op --operator pattern_operator --input asset:arm --input 'json:{"circular":{"count":5,"axis":"z"}}' --output-id arms --no-export
+# arbitrary; the cloud's wheels sit at r 360). Built once for arm 0; each
+# arm's copy is posed into the world below, a part of its own so it can
+# swivel and roll.
+op --operator cylinder_operator --input 'json:{"radius":0.011}' --input 'json:[0.34,0.0,0.03]' --input 'json:[0.34,0.0,0.085]' --output-id stem_base --no-export
+op --operator cylinder_operator --input 'json:{"radius":0.0325}' --input 'json:[0.36,-0.012,0.0325]' --input 'json:[0.36,0.012,0.0325]' --output-id wheel_base --no-export
+op --operator pattern_operator --input asset:arm_round --input 'json:{"circular":{"count":5,"axis":"z"}}' --output-id arms_base --no-export
 
 # --- Tilt mechanism, built in its own frame (u along the rail, v across
 # to the left, w up; origin on the lift axis at z 0.456) from the
@@ -117,11 +124,64 @@ op --operator cylinder_operator --input "$HOLE8" --input 'json:[-0.0025,-0.0568,
 op --operator boolean_operator --input asset:bar_body --input asset:slot_a1 --input asset:slot_a2 --input asset:slot_a3 --input asset:slot_b1 --input asset:slot_b2 --input asset:slot_b3 --input asset:bar_hole_a --input asset:bar_hole_b --input "$SUB" --output-id bar_cut --no-export
 op --operator pose_operator --input asset:bar_cut --input 'json:{"rotate":{"rz_deg":-1.0},"translate":{"dx":-0.0515,"dz":0.0069}}' --output-id bracket --no-export
 op --operator boolean_operator --input asset:rail --input asset:bracket --input "$UNION" --output-id mechanism_u --no-export
-op --operator pose_operator --input asset:mechanism_u --input 'json:{"rotate":{"rz_deg":60.8},"translate":{"dz":0.456}}' --output-id mechanism --no-export
+# Posed into the world below: 60.8 deg in the base frame is 50.4 deg in
+# the survey's, 0.456 up the lift axis.
+WORLD_MECH='json:{"rotate":{"rz_deg":50.4},"translate":{"dx":0.2569,"dy":0.1509,"dz":0.456}}'
 
-# --- Assembly, and the same posed into the scan's frame: arm 0 sits at
-# azimuth -10.4 deg, the lift axis at (0.2569, 0.1509).
-op --operator boolean_operator --input asset:column --input asset:arms --input asset:mechanism --input "$UNION" --output-id base
-op --operator pose_operator --input asset:base --input 'json:{"rotate":{"rz_deg":-10.4},"translate":{"dx":0.2569,"dy":0.1509}}' --output-id base_world
+# --- Into the scan's frame: arm 0 sits at azimuth -10.4 deg, the lift
+# axis at (0.2569, 0.1509). Every part is posed there at the rest state
+# (the state as photographed), and the casters are five copies each of
+# the stem and the wheel, one per arm.
+AX=0.2569
+AY=0.1509
+WORLD='json:{"rotate":{"rz_deg":-10.4},"translate":{"dx":0.2569,"dy":0.1509}}'
+op --operator pose_operator --input asset:arms_base --input "$WORLD" --output-id arms --no-export
+op --operator pose_operator --input asset:hub_tube_base --input "$WORLD" --output-id hub_tube --no-export
+op --operator pose_operator --input asset:piston_base --input "$WORLD" --output-id piston --no-export
+op --operator pose_operator --input asset:mechanism_u --input "$WORLD_MECH" --output-id mechanism --no-export
+PARTS="--input asset:arms --input asset:hub_tube --input asset:piston --input asset:mechanism"
+for k in 0 1 2 3 4; do
+    AZ=$(python3 -c "print(72 * $k - 10.4)")
+    CASTER="json:{\"rotate\":{\"rz_deg\":$AZ},\"translate\":{\"dx\":$AX,\"dy\":$AY}}"
+    op --operator pose_operator --input asset:stem_base --input "$CASTER" --output-id stem_$k --no-export
+    op --operator pose_operator --input asset:wheel_base --input "$CASTER" --output-id wheel_$k --no-export
+    PARTS="$PARTS --input asset:stem_$k --input asset:wheel_$k"
+done
+
+# --- The mechanism: the star and hub fixed to the floor, the piston
+# sliding along the lift axis (the scan's height is the rest, 0; the lift
+# is assumed to have 20 mm below it and 80 above), the tilt mechanism
+# swivelling on the piston about the same axis, and each caster swivelling
+# about its stem and rolling about its axle. Axes in world coordinates at
+# rest: the stem of arm k at r 340 and the axle at r 360, z 32.5, across
+# the arm.
+MECH=$(python3 - <<PY
+import json, math
+ax, ay = $AX, $AY
+z = [0.0, 0.0, 1.0]
+parts = ["arms", "hub_tube", "piston", "mechanism"]
+joints = [
+    {"name": "ground", "child": "arms"},
+    {"name": "hub", "parent": "arms", "child": "hub_tube"},
+    {"name": "lift", "kind": "prismatic", "parent": "hub_tube", "child": "piston",
+     "axis": {"origin": [ax, ay, 0.0], "direction": z}, "min": -0.02, "max": 0.08},
+    {"name": "swivel", "kind": "revolute", "parent": "piston", "child": "mechanism",
+     "axis": {"origin": [ax, ay, 0.0], "direction": z}, "min": -180.0, "max": 180.0},
+]
+for k in range(5):
+    t = math.radians(72 * k - 10.4)
+    c, s = math.cos(t), math.sin(t)
+    parts += [f"stem_{k}", f"wheel_{k}"]
+    joints.append({"name": f"caster_{k}", "kind": "revolute", "parent": "arms", "child": f"stem_{k}",
+                   "axis": {"origin": [ax + 0.34 * c, ay + 0.34 * s, 0.0], "direction": z},
+                   "min": -180.0, "max": 180.0})
+    joints.append({"name": f"roll_{k}", "kind": "revolute", "parent": f"stem_{k}", "child": f"wheel_{k}",
+                   "axis": {"origin": [ax + 0.36 * c, ay + 0.36 * s, 0.0325], "direction": [-s, c, 0.0]},
+                   "min": -180.0, "max": 180.0})
+print(json.dumps({"parts": parts, "joints": joints}))
+PY
+)
+op --operator mechanism_operator --input "json:$MECH" --input none --output-id chair_mechanism --no-export
+op --operator assemble_operator --input asset:chair_mechanism $PARTS --input 'json:{}' --output-id chair
 
 $V project-run --project $P

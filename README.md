@@ -102,6 +102,22 @@ Generator operators create new models from configuration or external data:
 | `lua_script` | Deprecated; retained for existing projects | Lua source + optional routed `F64Map` parameters |
 | `path_sketch` | Fills SVG path data (lines, curves, arcs, holes) as a 2D sketch for extrude/revolve | CBOR config: `{path, flip_y, round, chord_tolerance}` |
 
+### Assembly Operators
+
+An articulated assembly is a tree of parts joined by fixed, revolute and prismatic joints
+(`ASSEMBLY_PLAN.md`). Parts are authored in the world frame at the rest state, joint axes are
+given in world coordinates at rest, and a part's pose is the product of its chain's joint
+motions, root first. The state is an `F64Map` keyed by joint name (degrees or metres); a
+joint with a `drive` follows another at a ratio and is not a state. The viewport meshes each
+part of an assembly once and draws it under its pose with the joints' axes, so a state change
+re-meshes nothing.
+
+| Operator | Description | Inputs |
+|----------|-------------|--------|
+| `mechanism` | The parts and joints (kind, parent, child, axis, range, default, coupling); an axis may be routed from a measured Subspace (a fitted lift axis) | CBOR config: `{parts, joints}` + optional Subspace axes (one variadic slot) |
+| `assemble` | The model group: the mechanism, one model per part and a state make an `Assembly`, and the parts posed at that state make one model (outputs `assembly` and `model`) | Mechanism + models (one variadic slot) + `F64Map` state |
+| `assembly_model` | One part of an assembly by name, or the union, posed at the assembly's state or another | Assembly + CBOR config: `{part}` + optional `F64Map` state |
+
 ### Data Operators
 
 Data operators compose typed values in the project DAG without invoking the model evaluator:

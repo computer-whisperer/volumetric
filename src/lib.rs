@@ -208,6 +208,12 @@ pub enum AssetTypeHint {
     /// surfels with colour (explicit data; never handed to the model
     /// executor)
     Splat,
+    /// CBOR-encoded mechanism: parts joined by joints (explicit data; never
+    /// handed to the model executor)
+    Mechanism,
+    /// CBOR-encoded assembly: a mechanism with its part models and one
+    /// state (explicit data; never handed to the model executor as a whole)
+    Assembly,
 }
 
 impl std::fmt::Display for AssetTypeHint {
@@ -226,6 +232,8 @@ impl std::fmt::Display for AssetTypeHint {
             AssetTypeHint::Subspace => write!(f, "Subspace"),
             AssetTypeHint::ViewSet => write!(f, "ViewSet"),
             AssetTypeHint::Splat => write!(f, "Splat"),
+            AssetTypeHint::Mechanism => write!(f, "Mechanism"),
+            AssetTypeHint::Assembly => write!(f, "Assembly"),
         }
     }
 }
@@ -242,6 +250,8 @@ impl From<&OperatorMetadataOutput> for AssetTypeHint {
             OperatorMetadataOutput::F64Map => AssetTypeHint::F64Map,
             OperatorMetadataOutput::ViewSet => AssetTypeHint::ViewSet,
             OperatorMetadataOutput::Splat => AssetTypeHint::Splat,
+            OperatorMetadataOutput::Mechanism => AssetTypeHint::Mechanism,
+            OperatorMetadataOutput::Assembly => AssetTypeHint::Assembly,
         }
     }
 }
@@ -334,6 +344,8 @@ pub use volumetric_abi::viewset;
 
 // The Gaussian splat value type (CBOR payload of Splat-typed assets).
 pub use volumetric_abi::splat;
+// The articulated-assembly value types (Mechanism and Assembly assets).
+pub use volumetric_abi::mechanism;
 
 // The affine subspace value type (CBOR payload of Subspace-typed assets).
 pub use volumetric_abi::subspace;

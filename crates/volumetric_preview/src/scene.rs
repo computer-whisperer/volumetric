@@ -55,12 +55,15 @@ pub fn build_preview_scene_monitored(
         None => Ok(None),
         Some(PreviewStage::Done(entity)) => Ok(Some(*entity)),
         Some(PreviewStage::NeedsMesh(pending)) => {
-            let Some(mesh) =
-                backend.mesh_model(request.data.as_slice(), &pending.config, cancel, progress)?
-            else {
-                return Ok(None);
-            };
-            Ok(Some(preview_postlude(request, pending, mesh)))
+            let mut meshes = Vec::with_capacity(pending.jobs.len());
+            for job in &pending.jobs {
+                let Some(mesh) = backend.mesh_model(&job.data, &job.config, cancel, progress)?
+                else {
+                    return Ok(None);
+                };
+                meshes.push(mesh);
+            }
+            Ok(Some(preview_postlude(request, pending, meshes)))
         }
     }
 }
@@ -76,13 +79,41 @@ pub enum PreviewStage {
     NeedsMesh(PendingMesh),
 }
 
-/// The ASN2 meshing request plus everything the postlude needs to finish
-/// the preview once a mesh exists.
-pub struct PendingMesh {
+/// One ASN2 meshing job: a model and its recipe.
+pub struct MeshJob {
+    pub data: Arc<Vec<u8>>,
     pub config: volumetric::adaptive_surface_nets_2::AdaptiveMeshConfig2,
-    color_channel: Option<String>,
+}
+
+/// The ASN2 meshing jobs plus everything the postlude needs to finish the
+/// preview once their meshes exist: one job for a model, one per part for
+/// an assembly.
+pub struct PendingMesh {
+    pub jobs: Vec<MeshJob>,
+    finish: PendingFinish,
     stats: OutputStats,
     build_start: web_time::Instant,
+}
+
+enum PendingFinish {
+    Model { color_channel: Option<String> },
+    Assembly(crate::assembly::PendingAssembly),
+}
+
+impl PendingMesh {
+    pub(crate) fn assembly(
+        jobs: Vec<MeshJob>,
+        pending: crate::assembly::PendingAssembly,
+        stats: OutputStats,
+        build_start: web_time::Instant,
+    ) -> Self {
+        Self {
+            jobs,
+            finish: PendingFinish::Assembly(pending),
+            stats,
+            build_start,
+        }
+    }
 }
 
 /// Everything of a preview build except the ASN2 meshing pass. `Ok(None)`
@@ -116,6 +147,12 @@ pub fn preview_prelude(
     }
     if request.type_hint == Some(AssetTypeHint::Splat) {
         return crate::splats::build_splat_preview(request, build_start).map(done);
+    }
+    if request.type_hint == Some(AssetTypeHint::Assembly) {
+        return crate::assembly::build_assembly_preview(request, build_start).map(Some);
+    }
+    if request.type_hint == Some(AssetTypeHint::Mechanism) {
+        return crate::assembly::build_mechanism_preview(request, build_start).map(done);
     }
 
     // 2D sketches get a flat raster preview; the 3D mesh plans don't apply.
@@ -185,8 +222,13 @@ pub fn preview_prelude(
                 .adaptive_surface_nets_config()
                 .ok_or_else(|| "missing adaptive surface nets config".to_string())?;
             return Ok(Some(PreviewStage::NeedsMesh(PendingMesh {
-                config,
-                color_channel: color_channel.map(str::to_string),
+                jobs: vec![MeshJob {
+                    data: Arc::clone(&request.data),
+                    config,
+                }],
+                finish: PendingFinish::Model {
+                    color_channel: color_channel.map(str::to_string),
+                },
                 stats,
                 build_start,
             })));
@@ -204,23 +246,66 @@ pub fn preview_prelude(
     )))))
 }
 
-/// Finishes a preview once the ASN2 mesh exists: scene assembly plus the
-/// shared colormap/stats tail. Purely local — the pending state carries
-/// everything the prelude gathered.
+/// Finishes a preview once the ASN2 meshes exist (one per job, in job
+/// order): scene assembly plus the shared colormap/stats tail. Purely
+/// local — the pending state carries everything the prelude gathered.
 pub fn preview_postlude(
     request: &PreviewRequest,
     pending: PendingMesh,
-    mesh: Arc<volumetric::AdaptiveMeshV2Result>,
+    meshes: Vec<Arc<volumetric::AdaptiveMeshV2Result>>,
 ) -> PreviewEntity {
     let PendingMesh {
-        config: _,
-        color_channel,
+        jobs: _,
+        finish,
         mut stats,
         build_start,
     } = pending;
+    let color_channel = match finish {
+        PendingFinish::Model { color_channel } => color_channel,
+        PendingFinish::Assembly(pending) => {
+            return crate::assembly::finish_assembly_preview(
+                request,
+                pending,
+                &meshes,
+                stats,
+                build_start,
+            );
+        }
+    };
+    let mesh = meshes
+        .into_iter()
+        .next()
+        .expect("a model preview has exactly one meshing job");
     stats.triangles = mesh.indices.len() / 3;
     stats.samples = mesh.stats.total_samples;
     stats.detail = asn2_stage_lines(&mesh.stats);
+    let vertices = mesh_vertices(&mesh, &mut stats);
+    let wireframe = mesh_edge_lines(&vertices, Some(&mesh.indices));
+    let mut scene = renderer::SceneData::new();
+    scene.add_mesh(
+        renderer::MeshData {
+            vertices,
+            indices: Some(mesh.indices.clone()),
+        },
+        glam::Mat4::IDENTITY,
+        renderer::MaterialId(0),
+    );
+    finish_preview_scene(
+        request,
+        scene,
+        Some(wireframe),
+        (mesh.bounds_min, mesh.bounds_max),
+        color_channel,
+        stats,
+        build_start,
+    )
+}
+
+/// The renderer's vertices of an ASN2 mesh, with the preview guards.
+pub(crate) fn mesh_vertices(
+    mesh: &volumetric::AdaptiveMeshV2Result,
+    stats: &mut OutputStats,
+) -> Vec<renderer::MeshVertex> {
     // Tripwire: build results are supposed to carry one finite unit
     // normal per vertex (local builds do; a stale remote daemon once
     // shipped all-degenerate normals that rendered as uniform white).
@@ -254,28 +339,11 @@ pub fn preview_postlude(
         .collect();
     if degenerate_normals > 0 || nonfinite_positions > 0 {
         stats.detail.push(format!(
-            "preview guard: {degenerate_normals} degenerate normals substituted,              {nonfinite_positions} non-finite positions"
+            "preview guard: {degenerate_normals} degenerate normals substituted, \
+             {nonfinite_positions} non-finite positions"
         ));
     }
-    let wireframe = mesh_edge_lines(&vertices, Some(&mesh.indices));
-    let mut scene = renderer::SceneData::new();
-    scene.add_mesh(
-        renderer::MeshData {
-            vertices,
-            indices: Some(mesh.indices.clone()),
-        },
-        glam::Mat4::IDENTITY,
-        renderer::MaterialId(0),
-    );
-    finish_preview_scene(
-        request,
-        scene,
-        Some(wireframe),
-        (mesh.bounds_min, mesh.bounds_max),
-        color_channel,
-        stats,
-        build_start,
-    )
+    vertices
 }
 
 /// The tail every 3D preview shares: channel discovery + colormap, timing,
@@ -553,7 +621,7 @@ pub fn wireframe_style() -> renderer::LineStyle {
 /// Unique edges of a mesh as line segments. With an index buffer, edges are
 /// deduplicated by index pair; for triangle soup, by quantized endpoint
 /// positions.
-fn mesh_edge_lines(
+pub(crate) fn mesh_edge_lines(
     vertices: &[renderer::MeshVertex],
     indices: Option<&[u32]>,
 ) -> renderer::LineData {
@@ -1430,7 +1498,9 @@ fn build_subspace_preview(
     })
 }
 
-fn triangles_to_mesh_vertices(triangles: &[volumetric::Triangle]) -> Vec<renderer::MeshVertex> {
+pub(crate) fn triangles_to_mesh_vertices(
+    triangles: &[volumetric::Triangle],
+) -> Vec<renderer::MeshVertex> {
     let mut out = Vec::with_capacity(triangles.len() * 3);
 
     for tri in triangles {

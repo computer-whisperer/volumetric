@@ -126,6 +126,10 @@ pub enum AssetTypeArg {
     ViewSet,
     /// A splat written by `project-export` (`.vsplat`).
     Splat,
+    /// A mechanism written by `project-export` (`.vmech`).
+    Mechanism,
+    /// An assembly written by `project-export` (`.vasm`).
+    Assembly,
 }
 
 impl From<AssetTypeArg> for AssetTypeHint {
@@ -138,6 +142,8 @@ impl From<AssetTypeArg> for AssetTypeHint {
             AssetTypeArg::Blob => AssetTypeHint::Binary,
             AssetTypeArg::ViewSet => AssetTypeHint::ViewSet,
             AssetTypeArg::Splat => AssetTypeHint::Splat,
+            AssetTypeArg::Mechanism => AssetTypeHint::Mechanism,
+            AssetTypeArg::Assembly => AssetTypeHint::Assembly,
         }
     }
 }
@@ -485,6 +491,8 @@ pub fn run_project_export(args: ProjectExportArgs) -> Result<()> {
             AssetTypeHint::TriMesh => "vmesh",
             AssetTypeHint::ViewSet => "vviews",
             AssetTypeHint::Splat => "vsplat",
+            AssetTypeHint::Mechanism => "vmech",
+            AssetTypeHint::Assembly => "vasm",
             _ => "bin",
         };
 

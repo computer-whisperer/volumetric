@@ -1,6 +1,6 @@
 [package]
-name = "boolean_operator"
-version = "0.2.0"
+name = "mechanism_operator"
+version = "0.1.0"
 edition = "2024"
 
 [lib]
@@ -8,6 +8,5 @@ crate-type = ["cdylib"]
 
 [dependencies]
 volumetric_abi = { path = "../../volumetric_abi" }
-model_merge_core = { path = "../../model_merge_core" }
 serde = { version = "1", features = ["derive"] }
 ciborium = "0.2"
