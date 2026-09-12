@@ -11,9 +11,17 @@ The project explores a "model-as-code" paradigm where a 3D physical model is def
 
 ## Project Structure
 
+**Model authoring direction:** use `wgsl_script_operator` for new scripted
+models. Lua is deprecated and retained for existing projects; new modelling
+work and scripting improvements should target WGSL. The WGSL dialect uses
+`scene(p: vec3<f64>) -> bool` (or `vec2<f64>` for a sketch), `bounds_min`,
+`bounds_max`, and annotated `override` parameters routed from an `F64Map`.
+See [the WGSL authoring guide](WGSL_SCRIPT_OPERATOR_PLAN.md#source-conventions-the-dialect)
+and [the photo-based chair example](examples/chair_photo/README.md).
+
 - `src/`: The host application (Orchestrator). Built with Rust, `wasmtime` for execution, and `egui` for the UI.
 - `crates/models/`: Example model definitions (Sphere, Torus, Mandelbulb, etc.).
-- `crates/operators/`: Modules that transform or combine models. Includes **Transform Operators** (translate, scale, rotation, boolean) and **Generator Operators** (rectangular_prism, stl_import, threemf_import, heightmap_extrude, lua_script).
+- `crates/operators/`: Modules that transform or combine models. Includes **Transform Operators** (translate, scale, rotation, boolean) and **Generator Operators** (rectangular_prism, stl_import, threemf_import, heightmap_extrude, wgsl_script).
 
 ## Architecture
 
@@ -80,7 +88,8 @@ Generator operators create new models from configuration or external data:
 | `cloud_normals` | Estimates a unit normal per node from its nearest neighbours and stores it as the `normal` field (what a cylinder fit needs) | FeaMesh + CBOR config: `{neighbours, orient}` |
 | `cloud_distance` | Measures a cloud against a model: the signed distance of every node to the surface as the `distance` field (negative inside), plus an F64Map summary (count, inside fraction, abs p50/p90/p99, extremes); the audit of a model built from a scan | FeaMesh + Model + CBOR config: `{resolution, field}` |
 | `heightmap_extrude` | Extrudes a heightmap image to 3D | Image blob + CBOR config: `{width, depth, height, clip}` |
-| `lua_script` | Custom occupancy model via restricted Lua | Lua source + optional routed `F64Map` parameters |
+| `wgsl_script` | Preferred scripted occupancy model via the f64 WGSL model dialect | WGSL source + optional routed `F64Map` parameters |
+| `lua_script` | Deprecated; retained for existing projects | Lua source + optional routed `F64Map` parameters |
 | `path_sketch` | Fills SVG path data (lines, curves, arcs, holes) as a 2D sketch for extrude/revolve | CBOR config: `{path, flip_y, round, chord_tolerance}` |
 
 ### Data Operators
@@ -233,7 +242,7 @@ volumetric_cli render -i <model.wasm | project.vproj> -o <output.png>
 - `--camera-pos x,y,z [--camera-target x,y,z] [--camera-up x,y,z] [--fov deg]` - An explicit pose
 - `--intrinsics fx,fy,cx,cy --pose m00,...,m23` - A pinhole camera in OpenCV convention (pixel origin top-left, camera z forward); the pose is the rows of its 3x4 camera-to-world matrix and the image is `--width` x `--height`
 - `--through <view id>` (or `<views asset>:<view id>`) - The camera of a view in the project's view set, at the view's image size unless `--width`/`--height` scale it
-- `--overlay blend|edge|side|checker [--overlay-alpha a] [--overlay-tile px]` - With `--through`, composite the render over the view's photograph
+- `--overlay blend|edge|side|checker [--overlay-alpha a] [--overlay-tile px]` - With `--through`, composite the render over the photograph rectified to the camera's ideal pinhole projection. GUI look-through uses the same rectification; original-pixel measurements (`view-crop`, `view-pick`, `view-triangulate`) still use the original distorted photograph
 - `--projection ortho [--ortho-scale h]` - Orthographic instead of perspective (presets and poses)
 - `--near`, `--far` - Clip planes (default: from the scene)
 

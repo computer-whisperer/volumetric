@@ -35,6 +35,10 @@ P1 delivery notes (what shipped vs the plan):
 
 ## Decision record
 
+**Reaffirmed 2026-09-12 (user):** Lua is deprecated; WGSL is the focus
+for new modelling work and agent tooling. The chair photo dogfood uses
+WGSL. Existing Lua projects remain supported by the frozen operator.
+
 **Ratified direction:** a new `wgsl_script_operator` compiles a restricted
 WGSL module into a model-ABI wasm module, replacing the planned Lua
 overhaul as the scripting path for models. The frontend is naga 30's

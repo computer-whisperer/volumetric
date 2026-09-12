@@ -17,7 +17,7 @@ use clap::{Parser, ValueEnum};
 use glam::{Mat4, Quat, Vec3};
 
 use view_core::image::{Rgb, decode_rgb};
-use view_core::overlay::{Overlay, compose};
+use view_core::overlay::{Overlay, compose, rectify_photo};
 use volumetric::{AssetTypeHint, LoadedAsset, Project};
 use volumetric_abi::viewset::Distortion;
 use volumetric_preview::{
@@ -789,12 +789,6 @@ pub fn run_render(args: RenderArgs) -> Result<()> {
                         .join(", ")
                 )
             })?;
-            if camera.distortion != Distortion::None {
-                eprintln!(
-                    "warning: view {} has lens distortion, which the render ignores; the overlay is approximate",
-                    view.id
-                );
-            }
             size = (
                 args.width.unwrap_or(camera.width),
                 args.height.unwrap_or(camera.height),
@@ -808,7 +802,16 @@ pub fn run_render(args: RenderArgs) -> Result<()> {
                         view.id
                     )
                 })?;
-                photo = Some(decode_rgb(bytes)?.resized(size.0, size.1)?);
+                photo = Some(rectify_photo(
+                    &decode_rgb(bytes)?.resized(size.0, size.1)?,
+                    camera,
+                )?);
+                if camera.distortion != Distortion::None {
+                    eprintln!(
+                        "view {}: photograph rectified to the render's pinhole projection",
+                        view.id
+                    );
+                }
             }
             CameraMode::Pinhole {
                 pinhole: Pinhole {

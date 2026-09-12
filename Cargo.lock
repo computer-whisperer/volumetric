@@ -6156,6 +6156,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "view_core",
  "volumetric",
  "volumetric_assets",
  "volumetric_daemon",

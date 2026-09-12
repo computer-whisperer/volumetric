@@ -35,24 +35,29 @@ Volumetric prepares its input, imports its output, and represents and
 renders the splat itself, so the agent can see and audit what came back.
 
 The goal state: an agent is handed volumetric and a directory of stills
-and manages everything from there, with the GPU service as one remote
-step. Two interfaces, one code path. The CLI is the agent's interface: it
+and manages everything from there. The current dogfood prioritizes useful
+modelling from photographs alone; the GPU service is an optional source
+of additional evidence. Two interfaces, one code path. The CLI is the agent's interface: it
 must let the agent see, measure, build and verify headlessly. The GUI is
 the human's audit of what the agent accepted and produced. Whatever the
 CLI renders or solves, the GUI shows through the same crates. Python
 bindings expose the same kernels for exploration and validation, and
 never carry logic of their own.
 
-Acceptance task: "build the rest of the office chair" from the
-chairbase-dslr-0 session (`sessions/chairbase-dslr-0`: 79 a6700 stills of
-the star base on the survey card; `work/chairbase-dslr-0/{detections,
-survey}.json` from the shim; `runs/chairbase-dslr-0-2dgs` the trained
-splat, its TSDF and surface cloud; all under
-`/ceph/christian/index_scanner`). The task is to survey the stills here,
-export the dataset, train on the cluster, bring the splat back, check it
-against the photographs, measure the base, and add seat, back and arms
-that mount on its plate, verified against the evidence, exported as a
-printable or manufacturable mesh.
+Acceptance task updated 2026-09-12 (user): dogfood a clean-slate chair-base
+model from `sessions/chairbase-dslr-1`, starting with the upper mounting
+interface. Priority order: improve volumetric's agent tooling, establish
+a repeatable workflow requiring minimal human measurements, then progress
+the specialty chair accepting the user's wheelchair cushions. Survey the
+44 bright JPEGs in volumetric, recover features from multiple views, build
+in WGSL, and check the geometry against the photos. The previous
+`examples/chair` work is deliberately excluded; the new example lives in
+`examples/chair_photo`. Splats and clouds in `runs/chairbase-dslr-1-all-refuse`
+remain available, but their use is not a prerequisite. This supersedes the
+older session-0 acceptance sequence requiring remote training, because
+the DSLR capture is easier to repeat than CUDA reconstruction or manual
+measurement feedback. All evidence paths above are under
+`/ceph/christian/index_scanner`.
 
 ## Decision record
 

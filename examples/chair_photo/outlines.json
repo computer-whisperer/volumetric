@@ -1,0 +1,14 @@
+{
+  "description": "Approximate visible silhouette and aperture extremities picked in DSC00755. Cast onto the measured datum, or its parallel plane through the aperture center. These do not determine sheet thickness or exact bend profiles.",
+  "view": "DSC00755",
+  "cross_outline": [[3660, 842], [3803, 887], [3322, 1996], [3183, 1950]],
+  "rail_outline": [[2300, 890], [3444, 1246], [3357, 1483], [2185, 1076]],
+  "apertures": {
+    "cross_a": {"long": [[3741, 890], [3716, 949]], "wide": [[3698, 906], [3756, 932]]},
+    "cross_b": {"long": [[3308, 1859], [3280, 1930]], "wide": [[3268, 1881], [3327, 1906]]},
+    "rail_a": {"long": [[2580, 1011], [2677, 1044]], "wide": [[2634, 1010], [2619, 1051]]},
+    "rail_b": {"long": [[2507, 1140], [2607, 1174]], "wide": [[2566, 1138], [2549, 1179]]},
+    "cross_a_inner": {"wide": [[3609, 1143], [3658, 1161]]},
+    "cross_b_inner": {"wide": [[3389, 1646], [3436, 1664]]}
+  }
+}

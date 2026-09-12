@@ -1467,7 +1467,8 @@ impl VolumetricUiV2 {
         LookThrough::of(view, camera)
     }
 
-    /// The looked-through view's photograph, decoded once per view.
+    /// The looked-through photograph, rectified to the viewport's pinhole
+    /// projection and decoded once per view.
     fn look_photo(&self) -> Option<Image> {
         let look = self.look_through.as_ref()?;
         let asset = self
@@ -1481,11 +1482,13 @@ impl VolumetricUiV2 {
             return image.clone();
         }
         let set = self.viewset_of(asset)?;
-        let (view, _) = set.view(&look.view_id)?;
+        let (view, camera) = set.view(&look.view_id)?;
         let image = view
             .image
             .as_deref()
-            .and_then(|bytes| decode_image(bytes, None));
+            .and_then(|bytes| view_core::image::decode_rgb(bytes).ok())
+            .and_then(|photo| view_core::overlay::rectify_photo(&photo, camera).ok())
+            .map(|photo| Image::from_rgb8(photo.width, photo.height, photo.pixels));
         *self.look_photo.borrow_mut() = Some((key, image.clone()));
         image
     }
@@ -10709,6 +10712,37 @@ mod tests {
         });
         app.apply_run_result(Ok(vec![asset]), 1);
         app
+    }
+
+    #[test]
+    fn look_through_rectifies_the_photo_to_the_viewport_camera() {
+        let asset = viewset_asset("views");
+        let mut set = viewset::decode_viewset(asset.data()).unwrap();
+        let mut camera = viewset::CameraModel::pinhole(200, 200, 100.0, 100.0, 100.0, 100.0);
+        camera.distortion = viewset::Distortion::Radial {
+            k: vec![0.5],
+            p: [0.0; 2],
+        };
+        set.cameras[0] = camera;
+        let mut photo = view_core::image::Rgb::new(200, 200);
+        for y in 0..200 {
+            for x in 0..200 {
+                photo.set(x, y, [x as u8, y as u8, 100]);
+            }
+        }
+        set.views[0].image = Some(photo.to_png().unwrap());
+        let asset = LoadedAsset::from_parts(
+            "views".to_string(),
+            viewset::encode_viewset(&set),
+            Some(AssetTypeHint::ViewSet),
+            Vec::new(),
+        );
+        let mut app = VolumetricUiV2::default();
+        app.apply_run_result(Ok(vec![asset]), 1);
+        app.toggle_look_through("views", "v1");
+        let image = app.look_photo().expect("rectified photo");
+        let index = (100 * 200 + 160) * 4;
+        assert_eq!(&image.pixels()[index..index + 4], &[171, 100, 100, 255]);
     }
 
     #[test]

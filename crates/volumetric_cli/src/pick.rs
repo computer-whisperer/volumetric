@@ -69,6 +69,49 @@ const GRID_MAJOR: [u8; 3] = [255, 230, 120];
 const MARK: [u8; 3] = [60, 220, 255];
 const WORLD_MARK: [u8; 3] = [255, 70, 200];
 
+/// Compact numeric rulers, independent of installed fonts. Coordinates
+/// remain in the original image's pixels even for a magnified crop.
+fn ruler_number(out: &mut Rgb, x: u32, y: u32, number: u32, scale: u32) {
+    const DIGITS: [[u8; 5]; 10] = [
+        [7, 5, 5, 5, 7],
+        [2, 6, 2, 2, 7],
+        [7, 1, 7, 4, 7],
+        [7, 1, 7, 1, 7],
+        [5, 5, 7, 1, 1],
+        [7, 4, 7, 1, 7],
+        [7, 4, 7, 5, 7],
+        [7, 1, 1, 1, 1],
+        [7, 5, 7, 5, 7],
+        [7, 5, 7, 1, 7],
+    ];
+    let text = number.to_string();
+    for py in 0..7 * scale {
+        for px in 0..(text.len() as u32 * 4 + 1) * scale {
+            if x + px < out.width && y + py < out.height {
+                out.set(x + px, y + py, [20, 20, 20]);
+            }
+        }
+    }
+    for (i, digit) in text.bytes().enumerate() {
+        for (row, bits) in DIGITS[(digit - b'0') as usize].iter().enumerate() {
+            for col in 0..3 {
+                if bits & (4 >> col) == 0 {
+                    continue;
+                }
+                for dy in 0..scale {
+                    for dx in 0..scale {
+                        let px = x + (1 + i as u32 * 4 + col) * scale + dx;
+                        let py = y + (1 + row as u32) * scale + dy;
+                        if px < out.width && py < out.height {
+                            out.set(px, py, GRID_MAJOR);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn parse2(s: &str, what: &str) -> Result<[f64; 2]> {
     let v = crate::render::parse_floats(s, 2).with_context(|| format!("Invalid {what}"))?;
     Ok([f64::from(v[0]), f64::from(v[1])])
@@ -186,13 +229,31 @@ pub fn run_view_crop(args: ViewCropArgs) -> Result<()> {
             ),
         }
     }
+    let label_scale = 3;
+    // Keep labels readable when the requested grid is finer than a label.
+    let mut next_x = 0;
+    for &u in &verticals {
+        let x = (u - u0) * scale + 2;
+        let width = (u.to_string().len() as u32 * 4 + 2) * label_scale;
+        if x >= next_x && x + width <= out.width {
+            ruler_number(&mut out, x, 2, u, label_scale);
+            next_x = x + width;
+        }
+    }
+    let mut next_y = 8 * label_scale;
+    for &v in &horizontals {
+        let y = (v - v0) * scale + 2;
+        if y >= next_y && y + 7 * label_scale <= out.height {
+            ruler_number(&mut out, 2, y, v, label_scale);
+            next_y = y + 8 * label_scale;
+        }
+    }
     std::fs::write(&args.output, out.to_png()?)
         .with_context(|| format!("Failed to write {}", args.output.display()))?;
     println!(
-        "Wrote {}: {} pixels ({u0}, {v0})..({u1}, {v1}) of {} at {scale}x, {cw}x{ch}",
+        "Wrote {}: pixels ({u0}, {v0})..({u1}, {v1}) of {} at {scale}x, {cw}x{ch}",
         args.output.display(),
         args.view,
-        w * h
     );
     if args.grid > 0 {
         println!(

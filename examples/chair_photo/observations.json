@@ -1,0 +1,14 @@
+{
+  "description": "Approximate centers of the top aperture rims, picked by Codex from full-resolution volumetric view-crop output. Slot centers are apparent outline midpoints; these are not precision metrology. Coordinates are original 6192x4128 JPEG pixels.",
+  "fit_views": ["DSC00755", "DSC00758"],
+  "check_views": ["DSC00756"],
+  "pixel_uncertainty": 3.0,
+  "features": {
+    "cross_a": {"DSC00755": [3728, 919], "DSC00758": [2513, 2011], "DSC00756": [4187, 2030]},
+    "cross_a_inner": {"DSC00755": [3634, 1154], "DSC00758": [2507, 1744], "DSC00756": [3877, 2111]},
+    "cross_b_inner": {"DSC00755": [3413, 1655], "DSC00758": [2491, 1197], "DSC00756": [3213, 2258]},
+    "cross_b": {"DSC00755": [3296, 1895], "DSC00758": [2485, 943], "DSC00756": [2899, 2315]},
+    "rail_a": {"DSC00755": [2627, 1030], "DSC00758": [3528, 1490], "DSC00756": [3358, 1278]},
+    "rail_b": {"DSC00755": [2558, 1158], "DSC00758": [3514, 1341], "DSC00756": [3187, 1312]}
+  }
+}

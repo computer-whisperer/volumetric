@@ -25,6 +25,7 @@ web = [
 ]
 
 [dependencies]
+view_core = { path = "../view_core" }
 damascene-core = "0.6.0"
 damascene-markdown = "0.6.0"
 damascene-wgpu = "0.6.0"
