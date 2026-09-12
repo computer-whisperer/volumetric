@@ -61,7 +61,7 @@ def test_crop_reads_the_original_with_marks(chair_views):
     view = chair_views.view("DSC00742")
     corner = chair_views.marker_corners()[0, 0]
     px = view.project(corner[None])[0]
-    c = view.crop(center=tuple(px), size=(200, 100), scale=2, grid=50, marks=[tuple(px)], world_marks=[corner])
+    c = view.crop(center=px.tolist(), size=(200, 100), scale=2, grid=50, marks=[px.tolist()], world_marks=[corner])
     assert c.image.shape == (200, 400, 3) and c.image.dtype == np.uint8
     assert c.end[0] - c.origin[0] == 200 and c.scale == 2
     assert all(u % 50 == 0 and c.origin[0] <= u < c.end[0] for u in c.verticals)

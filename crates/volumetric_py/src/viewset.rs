@@ -203,10 +203,10 @@ impl ViewSet {
             let id: String = key
                 .extract()
                 .map_err(|_| invalid("pick keys are view ids"))?;
-            let pixel: (f64, f64) = value
+            let pixel: [f64; 2] = value
                 .extract()
                 .map_err(|_| invalid(format!("pick for `{id}` is a (u, v) pixel")))?;
-            list.push((id, [pixel.0, pixel.1]));
+            list.push((id, pixel));
         }
         let (point, gaps) = triangulate_picks(&self.inner, &list).map_err(invalid)?;
         Ok((
@@ -347,10 +347,10 @@ impl ViewSet {
                     let view: String = view
                         .extract()
                         .map_err(|_| invalid("view ids are strings"))?;
-                    let (u, v): (f64, f64) = pixel.extract().map_err(|_| {
+                    let pixel: [f64; 2] = pixel.extract().map_err(|_| {
                         invalid(format!("pick `{name}` in `{view}` is a (u, v) pixel"))
                     })?;
-                    set.record_pick(&view, &name, [u, v], role)
+                    set.record_pick(&view, &name, pixel, role)
                         .map_err(invalid)?;
                 }
             }
@@ -375,15 +375,10 @@ impl ViewSet {
                 let view: String = view
                     .extract()
                     .map_err(|_| invalid("view ids are strings"))?;
-                let pixels: Vec<(f64, f64)> = pixels.extract().map_err(|_| {
+                let pixels: Vec<[f64; 2]> = pixels.extract().map_err(|_| {
                     invalid(format!("contour `{name}` in `{view}` is a list of (u, v)"))
                 })?;
-                set.record_contour(
-                    &view,
-                    &name,
-                    pixels.into_iter().map(|(u, v)| [u, v]).collect(),
-                )
-                .map_err(invalid)?;
+                set.record_contour(&view, &name, pixels).map_err(invalid)?;
             }
         }
         Ok(ViewSet::wrap(set))
@@ -772,22 +767,18 @@ impl View {
         size: (u32, u32),
         scale: u32,
         grid: u32,
-        marks: Option<Vec<(f64, f64)>>,
+        marks: Option<Vec<[f64; 2]>>,
         world_marks: Option<Vec<Bound<'py, PyAny>>>,
     ) -> PyResult<Crop> {
-        let centre: (f64, f64) = center
+        let centre: [f64; 2] = center
             .extract()
             .map_err(|_| invalid("center is a (u, v) pixel"))?;
         let options = CropOptions {
-            centre: [centre.0, centre.1],
+            centre,
             size,
             scale,
             grid,
-            marks: marks
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(u, v)| [u, v])
-                .collect(),
+            marks: marks.unwrap_or_default(),
             world_marks: world_marks
                 .unwrap_or_default()
                 .iter()

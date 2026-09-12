@@ -124,9 +124,8 @@ fn field() -> (ViewSet, Vec<(u32, [[f64; 3]; 4])>, Vec<[f64; 12]>) {
         let inside =
             |uv: [f64; 2]| uv[0] > 10.0 && uv[0] < 2990.0 && uv[1] > 10.0 && uv[1] < 1990.0;
         let mut obs = Observations {
-            markers: Vec::new(),
-            board: Vec::new(),
             blur_px: Some(0.9),
+            ..Default::default()
         };
         for (id, x) in card.iter().enumerate() {
             if let Some(uv) = view.project(&truth, *x)

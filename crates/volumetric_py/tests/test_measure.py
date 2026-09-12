@@ -50,7 +50,7 @@ def test_chair_photo_report_replays_exactly():
     obs = json.loads((HERE / "observations.json").read_text())
     report = json.loads((HERE / "measurement-report.json").read_text())
     for name, picks in obs["features"].items():
-        point, gaps = views.triangulate({k: tuple(picks[k]) for k in obs["fit_views"]})
+        point, gaps = views.triangulate({k: picks[k] for k in obs["fit_views"]})
         assert np.linalg.norm(point - report["features"][name]["world"]) < 1e-9
         assert np.allclose(gaps, report["features"][name]["gaps"])
         (check,) = obs["check_views"]
@@ -99,9 +99,9 @@ def test_recorded_picks_replay_the_chair_photo_report():
         pytest.skip("chair_photo survey not built")
     obs = json.loads((HERE / "observations.json").read_text())
     report = json.loads((HERE / "measurement-report.json").read_text())
-    fit = {name: {view: tuple(px) for view, px in picks.items() if view in obs["fit_views"]}
+    fit = {name: {view: px for view, px in picks.items() if view in obs["fit_views"]}
            for name, picks in obs["features"].items()}
-    check = {name: {view: tuple(px) for view, px in picks.items() if view in obs["check_views"]}
+    check = {name: {view: px for view, px in picks.items() if view in obs["check_views"]}
              for name, picks in obs["features"].items()}
     views = v.ViewSet.load(str(survey)).with_picks(fit, check=check)
     recorded = views.picks()
@@ -131,10 +131,23 @@ def test_picks_and_contours_validate(chair_views):
         one.fit_picks(["lone"])
     with pytest.raises(ValueError, match="no view"):
         chair_views.with_picks({"x": {"nope": (1.0, 1.0)}})
-    traced = chair_views.with_contours({"rim": {a: [(1.0, 2.0), (3.0, 4.0)], b: [(5.0, 6.0)]}})
+    traced = chair_views.with_contours({"rim": {a: [[1.0, 2.0], [3.0, 4.0]], b: [(5.0, 6.0)]}})
     assert traced.contours() == {"rim": {a: [(1.0, 2.0), (3.0, 4.0)], b: [(5.0, 6.0)]}}
     with pytest.raises(ValueError, match="empty"):
         chair_views.with_contours({"rim": {a: []}})
     # Detection replaces the automatic observations and keeps the picks.
     detected, _, _ = one.detect(ids=[a], swatches="5x5_100", card=str(HERE / "card.json"))
     assert detected.picks() == one.picks() and detected.view(a).observations["markers"]
+
+
+@pytest.mark.parametrize("pixel", [[1], [1, 2, 3], [1, "bad"]])
+def test_malformed_pixel_sequences_are_rejected(chair_views, pixel):
+    view = chair_views.views[0]
+    with pytest.raises(ValueError, match="pixel"):
+        chair_views.with_picks({"hole": {view.id: pixel}})
+    with pytest.raises(ValueError, match="pixel"):
+        chair_views.triangulate({view.id: pixel})
+    with pytest.raises(ValueError, match="contour"):
+        chair_views.with_contours({"rim": {view.id: [pixel]}})
+    with pytest.raises(ValueError, match="center"):
+        view.crop(center=pixel)

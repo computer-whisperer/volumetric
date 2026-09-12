@@ -171,3 +171,7 @@ lines' coordinates and each world mark's `projected` pixel; `.png()` and
 
 Poses are camera-to-world 3x4 row-major: columns are the camera's right,
 down and forward axes in the world and its position.
+
+Pixel coordinates passed to `triangulate`, `with_picks`, `with_contours`,
+and `View.crop` (center and marks) accept two-element lists as well as
+tuples, so observations loaded from JSON can be passed directly.
