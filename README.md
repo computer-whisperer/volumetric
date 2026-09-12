@@ -227,6 +227,7 @@ volumetric_cli render -i <model.wasm | project.vproj> -o <output.png>
 
 **Camera** (one of):
 - `--views <list>` - Preset directions framed to the scene: front, back, left, right, top, bottom, iso, iso-back, all (default: iso; several views write one file each, suffixed)
+- `--up x,y,z` - The world's up: orients the presets, the ground grid and the default `--camera-up` (default: the up of a drawn view set or splat, so a surveyed scene renders z up; else 0,1,0)
 - `--camera-pos x,y,z [--camera-target x,y,z] [--camera-up x,y,z] [--fov deg]` - An explicit pose
 - `--intrinsics fx,fy,cx,cy --pose m00,...,m23` - A pinhole camera in OpenCV convention (pixel origin top-left, camera z forward); the pose is the rows of its 3x4 camera-to-world matrix and the image is `--width` x `--height`
 - `--through <view id>` (or `<views asset>:<view id>`) - The camera of a view in the project's view set, at the view's image size unless `--width`/`--height` scale it

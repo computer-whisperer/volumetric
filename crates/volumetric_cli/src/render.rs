@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Quat, Vec3};
 
 use view_core::image::{Rgb, decode_rgb};
 use view_core::overlay::{Overlay, compose};
@@ -57,6 +57,12 @@ pub struct RenderArgs {
     #[arg(long, default_value = "iso")]
     pub views: String,
 
+    /// The world's up direction x,y,z: orients the preset views, the ground
+    /// grid and the default --camera-up (default: the up of a drawn view set
+    /// or splat, else 0,1,0)
+    #[arg(long, allow_hyphen_values = true)]
+    pub up: Option<String>,
+
     /// Background colour as hex sRGB (e.g. 2d2d2d)
     #[arg(long, default_value = "2d2d2d")]
     pub background: String,
@@ -69,9 +75,9 @@ pub struct RenderArgs {
     #[arg(long, allow_hyphen_values = true)]
     pub camera_target: Option<String>,
 
-    /// Up vector x,y,z
-    #[arg(long, default_value = "0,1,0", allow_hyphen_values = true)]
-    pub camera_up: String,
+    /// Up vector x,y,z of the explicit camera (default: --up)
+    #[arg(long, allow_hyphen_values = true)]
+    pub camera_up: Option<String>,
 
     /// Vertical field of view in degrees (perspective)
     #[arg(long, default_value_t = 45.0)]
@@ -215,6 +221,17 @@ impl ViewPreset {
         Self::ALL.into_iter().find(|preset| preset.suffix() == name)
     }
 
+    /// The eye and target of this preset framed to `min..max` at `fov_y`
+    /// in a world whose up is `up`: the orbit camera's y-up framing turned
+    /// by the rotation taking +y to `up`, so `top` looks down `up` and
+    /// `front` looks along the horizontal the viewport's front would.
+    fn framed(self, min: Vec3, max: Vec3, fov_y: f32, up: Vec3) -> (Vec3, Vec3) {
+        let camera = self.camera(min, max, fov_y);
+        let turn = Quat::from_rotation_arc(Vec3::Y, up);
+        let target = camera.target;
+        (target + turn * (camera.eye_position() - target), target)
+    }
+
     /// The orbit camera for this preset, framed to `min..max` at `fov_y`.
     fn camera(self, min: Vec3, max: Vec3, fov_y: f32) -> Camera {
         let mut camera = Camera::new((min + max) * 0.5, 1.0);
@@ -270,7 +287,8 @@ enum CameraMode {
     Pose {
         eye: Vec3,
         target: Option<Vec3>,
-        up: Vec3,
+        /// `--camera-up`, or the world's up when not given.
+        up: Option<Vec3>,
     },
     Pinhole {
         pinhole: Pinhole,
@@ -343,11 +361,65 @@ fn camera_mode(args: &RenderArgs) -> Result<CameraMode> {
                     .map(parse_vec3)
                     .transpose()
                     .context("Invalid --camera-target")?,
-                up: parse_vec3(&args.camera_up).context("Invalid --camera-up")?,
+                up: args
+                    .camera_up
+                    .as_deref()
+                    .map(parse_vec3)
+                    .transpose()
+                    .context("Invalid --camera-up")?,
             }),
             None => Ok(CameraMode::Presets(parse_views(&args.views)?)),
         },
         _ => anyhow::bail!("--intrinsics and --pose go together"),
+    }
+}
+
+/// The world's up for the frame: `--up`, else the up the drawn view sets
+/// and splats were surveyed in (the first found), else +y, with a note of
+/// where it came from.
+fn world_up(args: &RenderArgs, assets: &[LoadedAsset]) -> Result<(Vec3, String)> {
+    if let Some(up) = &args.up {
+        let up = parse_vec3(up).context("Invalid --up")?;
+        let unit = up.normalize_or_zero();
+        if unit == Vec3::ZERO {
+            anyhow::bail!("--up must not be zero");
+        }
+        return Ok((unit, "--up".to_string()));
+    }
+    for asset in assets {
+        let up = match asset.type_hint() {
+            Some(AssetTypeHint::Splat) => {
+                volumetric::splat::decode_splat(asset.data())
+                    .map_err(|err| anyhow::anyhow!("asset '{}': {err}", asset.id()))?
+                    .world
+                    .up
+            }
+            Some(AssetTypeHint::ViewSet) => {
+                volumetric_abi::viewset::decode_viewset(asset.data())
+                    .map_err(|err| anyhow::anyhow!("asset '{}': {err}", asset.id()))?
+                    .world
+                    .up
+            }
+            _ => continue,
+        };
+        let up = Vec3::new(up[0] as f32, up[1] as f32, up[2] as f32).normalize_or_zero();
+        if up != Vec3::ZERO {
+            return Ok((up, format!("asset '{}'", asset.id())));
+        }
+    }
+    Ok((Vec3::Y, "default".to_string()))
+}
+
+/// The ground grid's plane for a world whose up is `up`: the coordinate
+/// plane most nearly perpendicular to it.
+fn grid_planes_for(up: Vec3) -> GridPlanes {
+    let a = up.abs();
+    if a.z >= a.x && a.z >= a.y {
+        GridPlanes::XY
+    } else if a.x >= a.y {
+        GridPlanes::YZ
+    } else {
+        GridPlanes::XZ
     }
 }
 
@@ -357,6 +429,7 @@ fn frames(
     args: &RenderArgs,
     (width, height): (u32, u32),
     bounds: PreviewBounds,
+    world_up: Vec3,
 ) -> Result<Vec<(Option<&'static str>, CameraView)>> {
     let min = Vec3::from(bounds.min);
     let max = Vec3::from(bounds.max);
@@ -385,23 +458,17 @@ fn frames(
             presets
                 .into_iter()
                 .map(|preset| {
-                    let camera = preset.camera(min, max, fov_y);
-                    let eye = camera.eye_position();
-                    let (near, far) = clip(eye, camera.forward(), (camera.near, camera.far));
+                    let (eye, target) = preset.framed(min, max, fov_y, world_up);
+                    let forward = (target - eye).normalize();
+                    let (near, far) = clip(eye, forward, (0.0, 0.0));
                     let view = match args.projection {
-                        ProjectionArg::Perspective => CameraView::look_at(
-                            eye,
-                            camera.target,
-                            Vec3::Y,
-                            fov_y,
-                            aspect,
-                            near,
-                            far,
-                        ),
+                        ProjectionArg::Perspective => {
+                            CameraView::look_at(eye, target, world_up, fov_y, aspect, near, far)
+                        }
                         ProjectionArg::Ortho => CameraView::look_at_orthographic(
                             eye,
-                            camera.target,
-                            Vec3::Y,
+                            target,
+                            world_up,
                             ortho_height((max - min).length() * 1.1),
                             aspect,
                             near,
@@ -413,6 +480,7 @@ fn frames(
                 .collect()
         }
         CameraMode::Pose { eye, target, up } => {
+            let up = up.unwrap_or(world_up);
             let target = target.unwrap_or((min + max) * 0.5);
             let forward = (target - eye).normalize_or_zero();
             if forward == Vec3::ZERO {
@@ -797,7 +865,11 @@ pub fn run_render(args: RenderArgs) -> Result<()> {
                 .reduce(PreviewBounds::union)
         })
         .context("nothing to draw")?;
-    let frames = frames(mode, &args, size, bounds)?;
+    let (up, up_source) = world_up(&args, &assets)?;
+    if !args.quiet {
+        eprintln!("up: ({}, {}, {}) from {up_source}", up.x, up.y, up.z);
+    }
+    let frames = frames(mode, &args, size, bounds, up)?;
 
     let offscreen = Offscreen::new().map_err(anyhow::Error::msg)?;
     if !args.quiet {
@@ -828,7 +900,7 @@ pub fn run_render(args: RenderArgs) -> Result<()> {
     }
     if args.grid > 0.0 && overlay.is_none() {
         let extent = (Vec3::from(bounds.max) - Vec3::from(bounds.min)).length();
-        settings.grid.planes = GridPlanes::XZ;
+        settings.grid.planes = grid_planes_for(up);
         settings.grid.spacing = args.grid;
         settings.grid.extent = (extent * 2.0).max(args.grid * 10.0);
     } else {
@@ -960,6 +1032,24 @@ mod tests {
         let iso = ViewPreset::Iso.camera(min, max, 0.8).eye_position();
         let back = ViewPreset::IsoBack.camera(min, max, 0.8).eye_position();
         assert!((iso.x + back.x).abs() < 1e-4 && (iso.z + back.z).abs() < 1e-4);
+    }
+
+    /// In a z-up world `top` looks down z and `front` stays horizontal.
+    #[test]
+    fn presets_follow_the_world_up() {
+        let (min, max) = (Vec3::new(-1.0, -2.0, 0.0), Vec3::new(1.0, 2.0, 1.0));
+        let centre = (min + max) * 0.5;
+        let (eye, target) = ViewPreset::Top.framed(min, max, 0.8, Vec3::Z);
+        assert_eq!(target, centre);
+        assert!(eye.z > max.z, "top eye {eye} not above the scene");
+        assert!((eye.x - centre.x).abs() < 0.1 && (eye.y - centre.y).abs() < 0.1);
+        let (eye, _) = ViewPreset::Front.framed(min, max, 0.8, Vec3::Z);
+        assert!((eye.z - centre.z).abs() < 1e-3, "front eye {eye} not level");
+        // The y-up framing is the orbit camera's own.
+        let (eye, _) = ViewPreset::Iso.framed(min, max, 0.8, Vec3::Y);
+        assert!((eye - ViewPreset::Iso.camera(min, max, 0.8).eye_position()).length() < 1e-4);
+        assert!(grid_planes_for(Vec3::Z).xy && grid_planes_for(Vec3::Y).xz);
+        assert!(grid_planes_for(Vec3::NEG_X).yz);
     }
 
     #[test]

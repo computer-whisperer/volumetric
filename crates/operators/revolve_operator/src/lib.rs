@@ -388,7 +388,7 @@ pub extern "C" fn get_metadata() -> i64 {
     volumetric_abi::metadata_reply(&METADATA, || OperatorMetadata {
         name: "revolve_operator".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-        docs: String::new(),
+        docs: include_str!("../README.md").to_string(),
         display_name: "Revolve".to_string(),
         description: "Spin a profile model around an axis into a solid of revolution.".to_string(),
         category: "Construction".to_string(),

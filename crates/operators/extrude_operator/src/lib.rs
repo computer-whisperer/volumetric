@@ -427,7 +427,7 @@ pub extern "C" fn get_metadata() -> i64 {
         OperatorMetadata {
             name: "extrude_operator".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
-            docs: String::new(),
+            docs: include_str!("../README.md").to_string(),
             display_name: "Extrude".to_string(),
             description: "Sweep a profile model along a plane's normal, adding a dimension."
                 .to_string(),

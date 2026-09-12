@@ -272,7 +272,7 @@ pub extern "C" fn get_metadata() -> i64 {
     volumetric_abi::metadata_reply(&METADATA, || OperatorMetadata {
         name: "cylinder_operator".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-        docs: String::new(),
+        docs: include_str!("../README.md").to_string(),
         display_name: "Cylinder".to_string(),
         description: "Analytic cylinder or capsule between two axis endpoints.".to_string(),
         category: "Primitives".to_string(),
