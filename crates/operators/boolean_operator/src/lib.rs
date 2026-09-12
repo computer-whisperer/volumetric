@@ -26,8 +26,8 @@
 use wasm_encoder::{BlockType, ExportKind, ExportSection, Function, Instruction, MemArg, ValType};
 
 use model_merge_core::{
-    MergeSections, ModelExports, OffsetReencoder, SectionCounts, const_i32_export,
-    count_sections, parse_model_exports,
+    MergeSections, ModelExports, OffsetReencoder, SectionCounts, const_i32_export, count_sections,
+    parse_model_exports,
 };
 use volumetric_abi::host::{input_count, post_output, read_input, report_error};
 use volumetric_abi::{OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput};
@@ -435,7 +435,8 @@ fn merge_models(models: &[Vec<u8>], op: BooleanOp) -> Result<Vec<u8>, String> {
         offsets.extend(&counts);
     }
     let first = first.ok_or_else(|| "no models to merge".to_string())?;
-    let dims = const_i32_export(&models[0], "get_dimensions").map_err(|e| format!("model 0: {e}"))?;
+    let dims =
+        const_i32_export(&models[0], "get_dimensions").map_err(|e| format!("model 0: {e}"))?;
     let glue = Glue {
         first: &first,
         others: &others,
