@@ -154,3 +154,70 @@ impl Offscreen {
         Ok(rgba)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{SceneData, SplatData, SplatStyle};
+    use glam::{Mat4, Vec3};
+    use std::sync::Arc;
+
+    /// One opaque red Gaussian, 20 cm across, at the origin, seen from
+    /// 1.5 m: the frame's centre is red, its corner is the background.
+    /// Skipped where no GPU adapter is available.
+    #[test]
+    fn a_gaussian_renders_as_a_red_disc() {
+        let Ok(offscreen) = Offscreen::new() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let (w, h) = (128u32, 96u32);
+        let mut renderer = offscreen.renderer(w, h);
+        let data = SplatData {
+            surfels: false,
+            positions: vec![[0.0, 0.0, 0.0]],
+            axes: vec![[0.1, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.1]],
+            opacities: vec![1.0],
+            sh_degree: 0,
+            sh: vec![1.0 / 0.282_094_79, -0.5 / 0.282_094_79, -0.5 / 0.282_094_79],
+        };
+        let mut scene = SceneData::new();
+        scene.add_splat(Arc::new(data), Mat4::IDENTITY, SplatStyle::default());
+        let resident = renderer.create_retained_scene(offscreen.device(), &scene);
+        assert_eq!(resident.splats.len(), 1);
+        let view = CameraView::look_at(
+            Vec3::new(0.0, 0.0, 1.5),
+            Vec3::ZERO,
+            Vec3::Y,
+            0.8,
+            w as f32 / h as f32,
+            0.1,
+            10.0,
+        );
+        let settings = RenderSettings {
+            background_color: [0.0, 0.0, 1.0, 1.0],
+            ssao_enabled: false,
+            show_axis_indicator: false,
+            ..RenderSettings::default()
+        };
+        for _ in 0..2 {
+            for splat in &resident.splats {
+                renderer.submit_retained_splat(splat);
+            }
+            let rgba = offscreen
+                .render_rgba(&mut renderer, &view, &settings)
+                .unwrap();
+            let px = |x: u32, y: u32| {
+                let i = ((y * w + x) * 4) as usize;
+                [rgba[i], rgba[i + 1], rgba[i + 2]]
+            };
+            let centre = px(w / 2, h / 2);
+            let corner = px(2, 2);
+            assert!(centre[0] > 200 && centre[2] < 60, "centre {centre:?}");
+            assert!(corner[2] > 200 && corner[0] < 30, "corner {corner:?}");
+            // The footprint fades with distance from the centre.
+            let edge = px(w / 2 + 12, h / 2);
+            assert!(edge[0] < centre[0] && edge[2] > centre[2], "edge {edge:?}");
+        }
+    }
+}

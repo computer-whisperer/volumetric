@@ -505,6 +505,7 @@ fn is_renderable(asset: &LoadedAsset) -> bool {
                 | AssetTypeHint::TriMesh
                 | AssetTypeHint::Subspace
                 | AssetTypeHint::ViewSet
+                | AssetTypeHint::Splat
         ) | None
     )
 }
@@ -574,6 +575,7 @@ fn preview_request(asset: &LoadedAsset, options: &PlanOptions) -> PreviewRequest
         Some(AssetTypeHint::TriMesh) => PreviewPlan::TriMesh,
         Some(AssetTypeHint::Subspace) => PreviewPlan::Subspace,
         Some(AssetTypeHint::ViewSet) => PreviewPlan::ViewSet,
+        Some(AssetTypeHint::Splat) => PreviewPlan::Splat,
         _ => match volumetric::model_dimensions_static(asset.data()) {
             Some(2) => PreviewPlan::Sketch {
                 resolution: options.resolution,
@@ -807,9 +809,11 @@ pub fn run_render(args: RenderArgs) -> Result<()> {
         .map(|entity| renderer.create_retained_scene(offscreen.device(), &entity.scene))
         .collect();
 
-    // An overlay keys the render's geometry off a sentinel background, so
-    // nothing but geometry may touch the frame.
-    const SENTINEL: [f32; 4] = [1.0, 0.0, 1.0, 1.0];
+    // An overlay reads the render's coverage from its alpha channel: the
+    // background is transparent black, surfaces are opaque, and a splat's
+    // fading edge is in between, so nothing but geometry may touch the
+    // frame.
+    const SENTINEL: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
     let mut settings = RenderSettings {
         background_color: if overlay.is_some() {
             SENTINEL
@@ -842,6 +846,9 @@ pub fn run_render(args: RenderArgs) -> Result<()> {
             for points in &scene.points {
                 renderer.submit_retained_points(points);
             }
+            for splat in &scene.splats {
+                renderer.submit_retained_splat(splat);
+            }
             if args.wireframe
                 && let Some(lines) = &entity.wireframe_lines
             {
@@ -856,26 +863,33 @@ pub fn run_render(args: RenderArgs) -> Result<()> {
             .map_err(anyhow::Error::msg)?;
         if let Some(overflow) = renderer.frame_overflow() {
             eprintln!(
-                "warning: dropped {} of {} triangles, {} lines and {} points at the GPU buffer limit",
+                "warning: dropped {} of {} triangles, {} lines, {} points and {} splat primitives at the GPU buffer limit",
                 overflow.dropped_triangles,
                 overflow.total_triangles,
                 overflow.dropped_lines,
-                overflow.dropped_points
+                overflow.dropped_points,
+                overflow.dropped_splats
             );
         }
         let path = output_path(&args.output, suffix);
         match (&overlay, &photo) {
             (Some(overlay), Some(photo)) => {
-                let covered: Vec<bool> = rgba
+                let covered: Vec<f32> = rgba
                     .chunks_exact(4)
-                    .map(|px| px[0] != 255 || px[1] != 0 || px[2] != 255)
+                    .map(|px| f32::from(px[3]) / 255.0)
                     .collect();
+                // Colours are premultiplied over the transparent background;
+                // divide the coverage back out.
                 let render = Rgb {
                     width: size.0,
                     height: size.1,
                     pixels: rgba
                         .chunks_exact(4)
-                        .flat_map(|px| [px[0], px[1], px[2]])
+                        .flat_map(|px| {
+                            let a = f32::from(px[3]).max(1.0);
+                            [px[0], px[1], px[2]]
+                                .map(|c| (f32::from(c) * 255.0 / a).round().min(255.0) as u8)
+                        })
                         .collect(),
                 };
                 let composed = compose(photo, &render, &covered, *overlay)?;

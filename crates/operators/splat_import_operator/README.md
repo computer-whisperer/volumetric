@@ -40,8 +40,10 @@ gsplat, 2DGS) is read; a PLY without `f_dc_*`, `opacity`, `scale_*` and
 
 - `kind` (default `auto`): `gaussian`, `surfel`, or `auto`, which reads
   surfels when the third scale is under a hundredth of the other two for
-  most primitives (or absent). A trainer's 2DGS mode that keeps a full
-  third scale reads as Gaussians, which is what its parameters are.
+  most primitives (or absent). gsplat's 2DGS mode trains two scales and
+  exports the third untrained at its initial value, so its files look
+  like Gaussians to `auto`: pass `surfel` for a run from it (the
+  trainer's `args.json` says which mode it ran).
 - `scale` (default 1): multiplier applied to the centres and the scales
   on the way in, for a splat trained in a scaled frame. Must be positive.
 - `center` (default off): translate the centres so their bounding box is

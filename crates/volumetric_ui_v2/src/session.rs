@@ -893,6 +893,9 @@ impl ViewportRenderer {
             for points in &resident.scene.points {
                 self.renderer.submit_retained_points(points);
             }
+            for splat in &resident.scene.splats {
+                self.renderer.submit_retained_splat(splat);
+            }
             if wireframe && let Some(lines) = &resident.wireframe {
                 self.renderer.submit_retained_lines(lines);
             }
@@ -1005,6 +1008,12 @@ fn overflow_message(overflow: &renderer::GeometryOverflow) -> String {
         dropped.push(format!(
             "{} points",
             crate::format_count(overflow.dropped_points)
+        ));
+    }
+    if overflow.dropped_splats > 0 {
+        dropped.push(format!(
+            "{} splat primitives",
+            crate::format_count(overflow.dropped_splats)
         ));
     }
     let limit_mib = overflow.max_buffer_bytes / (1024 * 1024);
@@ -1810,6 +1819,8 @@ fn is_preview_artifact(artifact: &volumetric::LoadedAsset) -> bool {
                 | AssetTypeHint::FeaMesh
                 | AssetTypeHint::TriMesh
                 | AssetTypeHint::Subspace
+                | AssetTypeHint::ViewSet
+                | AssetTypeHint::Splat
         ) | None
     )
 }
@@ -2353,6 +2364,7 @@ mod tests {
             total_triangles: 1_951_244,
             dropped_lines: 1_200,
             dropped_points: 0,
+            dropped_splats: 0,
             max_buffer_bytes: 256 * 1024 * 1024,
         });
         assert_eq!(

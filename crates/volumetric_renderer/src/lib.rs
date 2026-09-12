@@ -51,14 +51,15 @@ pub use camera::{
 };
 pub use gbuffer::{AoTexture, GBuffer};
 pub use pipelines::{
-    CompositePipeline, GpuLines, GpuMesh, GpuPoints, LinePipeline, MeshPipeline, MeshUniforms,
-    PointPipeline, SsaoPipeline, SsaoUniforms,
+    CompositePipeline, GpuLines, GpuMesh, GpuPoints, GpuSplat, LinePipeline, MeshPipeline,
+    MeshUniforms, PointPipeline, SplatCompositePipeline, SplatPipeline, SplatUniforms,
+    SsaoPipeline, SsaoUniforms, evaluate_sh, project_covariance,
 };
 pub use scene::{SceneData, SceneDrawData};
 pub use types::{
     AxisIndicator, DepthMode, GridPlanes, GridSettings, LineData, LineInstance, LinePattern,
     LineSegment, LineStyle, MaterialId, MeshData, MeshVertex, PointData, PointInstance, PointShape,
-    PointStyle, RenderSettings, WidthMode,
+    PointStyle, RenderSettings, SplatData, SplatStyle, WidthMode,
 };
 
 use glam::{Mat4, Vec3};
@@ -104,6 +105,8 @@ pub struct GeometryOverflow {
     pub dropped_lines: usize,
     /// Point instances dropped across the depth-tested and overlay passes.
     pub dropped_points: usize,
+    /// Splat primitives dropped (retained splats are clamped at creation).
+    pub dropped_splats: usize,
     /// The device's buffer size limit the frame was clamped to.
     pub max_buffer_bytes: u64,
 }
@@ -111,7 +114,10 @@ pub struct GeometryOverflow {
 impl GeometryOverflow {
     /// Whether anything was actually dropped.
     pub fn any(&self) -> bool {
-        self.dropped_triangles > 0 || self.dropped_lines > 0 || self.dropped_points > 0
+        self.dropped_triangles > 0
+            || self.dropped_lines > 0
+            || self.dropped_points > 0
+            || self.dropped_splats > 0
     }
 }
 
@@ -125,6 +131,7 @@ pub struct RetainedScene {
     pub meshes: Vec<std::sync::Arc<GpuMesh>>,
     pub lines: Vec<std::sync::Arc<GpuLines>>,
     pub points: Vec<std::sync::Arc<GpuPoints>>,
+    pub splats: Vec<std::sync::Arc<GpuSplat>>,
 }
 
 /// Drops trailing items that don't fit in one buffer of `max_bytes`;
@@ -239,6 +246,8 @@ struct GpuResources {
     composite_pipeline: CompositePipeline,
     line_pipeline: LinePipeline,
     point_pipeline: PointPipeline,
+    splat_pipeline: SplatPipeline,
+    splat_composite_pipeline: SplatCompositePipeline,
 
     // Textures
     gbuffer: GBuffer,
@@ -247,6 +256,7 @@ struct GpuResources {
     // Bind groups (recreated on resize)
     ssao_bind_group: wgpu::BindGroup,
     composite_bind_group: wgpu::BindGroup,
+    splat_composite_bind_group: wgpu::BindGroup,
 
     // Sampler
     sampler: wgpu::Sampler,
@@ -276,6 +286,7 @@ pub struct Renderer {
     frame_retained_meshes: Vec<std::sync::Arc<GpuMesh>>,
     frame_retained_lines: Vec<std::sync::Arc<GpuLines>>,
     frame_retained_points: Vec<std::sync::Arc<GpuPoints>>,
+    frame_retained_splats: Vec<std::sync::Arc<GpuSplat>>,
 
     // Grid line cache (regenerated when settings change)
     cached_grid_lines: Vec<LineSegment>,
@@ -301,6 +312,7 @@ impl Renderer {
             frame_retained_meshes: Vec::new(),
             frame_retained_lines: Vec::new(),
             frame_retained_points: Vec::new(),
+            frame_retained_splats: Vec::new(),
             cached_grid_lines: Vec::new(),
             cached_grid_settings_hash: 0,
             capabilities: None,
@@ -324,6 +336,8 @@ impl Renderer {
         let composite_pipeline = CompositePipeline::new(device, self.surface_format);
         let line_pipeline = LinePipeline::new(device, self.surface_format);
         let point_pipeline = PointPipeline::new(device, self.surface_format);
+        let splat_pipeline = SplatPipeline::new(device, GBuffer::SPLAT_LAYER_FORMAT);
+        let splat_composite_pipeline = SplatCompositePipeline::new(device, self.surface_format);
 
         // Create textures
         let gbuffer = GBuffer::new(
@@ -351,6 +365,8 @@ impl Renderer {
             ssao_pipeline.create_bind_group(device, &gbuffer.normal_view, &gbuffer.depth_view);
         let composite_bind_group =
             composite_pipeline.create_bind_group(device, &gbuffer.color_view, &ao_texture.view);
+        let splat_composite_bind_group =
+            splat_composite_pipeline.create_bind_group(device, &gbuffer.splat_view);
 
         self.gpu = Some(GpuResources {
             mesh_pipeline,
@@ -358,10 +374,13 @@ impl Renderer {
             composite_pipeline,
             line_pipeline,
             point_pipeline,
+            splat_pipeline,
+            splat_composite_pipeline,
             gbuffer,
             ao_texture,
             ssao_bind_group,
             composite_bind_group,
+            splat_composite_bind_group,
             sampler,
         });
     }
@@ -402,6 +421,9 @@ impl Renderer {
                 &gpu.gbuffer.color_view,
                 &gpu.ao_texture.view,
             );
+            gpu.splat_composite_bind_group = gpu
+                .splat_composite_pipeline
+                .create_bind_group(device, &gpu.gbuffer.splat_view);
         }
     }
 
@@ -485,6 +507,18 @@ impl Renderer {
                     ))
                 })
                 .collect(),
+            splats: scene
+                .splats
+                .iter()
+                .map(|(splat, transform, style)| {
+                    std::sync::Arc::new(gpu.splat_pipeline.create_retained(
+                        device,
+                        splat.clone(),
+                        *transform,
+                        style,
+                    ))
+                })
+                .collect(),
         }
     }
 
@@ -519,6 +553,12 @@ impl Renderer {
     /// Submit a retained point batch for this frame.
     pub fn submit_retained_points(&mut self, points: &std::sync::Arc<GpuPoints>) {
         self.frame_retained_points.push(points.clone());
+    }
+
+    /// Submit a retained splat for this frame. It is drawn after the
+    /// depth-tested lines and points, blended back to front over them.
+    pub fn submit_retained_splat(&mut self, splat: &std::sync::Arc<GpuSplat>) {
+        self.frame_retained_splats.push(splat.clone());
     }
 
     /// Execute all rendering for the frame.
@@ -580,6 +620,9 @@ impl Renderer {
         }
         for points in &self.frame_retained_points {
             self.frame_overflow.dropped_points += points.dropped;
+        }
+        for splat in &self.frame_retained_splats {
+            self.frame_overflow.dropped_splats += splat.dropped;
         }
 
         let Some(gpu) = &mut self.gpu else {
@@ -936,6 +979,73 @@ impl Renderer {
         }
 
         // =================================================================
+        // Splats: sorted back to front, depth-tested at their centres
+        // against everything drawn so far, blended over it.
+        // =================================================================
+        if !self.frame_retained_splats.is_empty() {
+            let GpuResources {
+                splat_pipeline,
+                splat_composite_pipeline,
+                splat_composite_bind_group,
+                gbuffer,
+                ..
+            } = gpu;
+            for splat in &self.frame_retained_splats {
+                splat_pipeline.prepare_retained(queue, splat, view, screen_size);
+            }
+            // Into the layer: the trainer's arithmetic, sRGB values blended
+            // as numbers.
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("splat_pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &gbuffer.splat_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &gbuffer.depth_stencil_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                for splat in &self.frame_retained_splats {
+                    splat_pipeline.render_retained(&mut pass, splat);
+                }
+            }
+            // Over the scene, linearised for the target.
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("splat_composite_pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: target,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                splat_composite_pipeline.render(&mut pass, splat_composite_bind_group);
+            }
+        }
+
+        // =================================================================
         // Pass 7-8: Overlay Lines and Points (no depth test)
         // =================================================================
         {
@@ -1091,6 +1201,7 @@ impl Renderer {
         self.frame_retained_meshes.clear();
         self.frame_retained_lines.clear();
         self.frame_retained_points.clear();
+        self.frame_retained_splats.clear();
     }
 
     /// Geometry the most recent [`render`](Self::render) dropped because it

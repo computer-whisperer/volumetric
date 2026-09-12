@@ -1,7 +1,10 @@
+use std::sync::Arc;
+
 use glam::Mat4;
 
 use crate::{
     Camera, LineData, LineStyle, MaterialId, MeshData, PointData, PointStyle, RenderSettings,
+    SplatData, SplatStyle,
 };
 
 /// Data for a single frame's rendering.
@@ -13,6 +16,9 @@ pub struct SceneData {
     pub lines: Vec<(LineData, Mat4, LineStyle)>,
     /// Points to render.
     pub points: Vec<(PointData, Mat4, PointStyle)>,
+    /// Gaussian splats to render (shared, since a splat is tens of
+    /// megabytes and scenes are cloned).
+    pub splats: Vec<(Arc<SplatData>, Mat4, SplatStyle)>,
 }
 
 impl SceneData {
@@ -36,9 +42,17 @@ impl SceneData {
         self.points.push((points, transform, style));
     }
 
+    /// Add a splat to the scene.
+    pub fn add_splat(&mut self, splat: Arc<SplatData>, transform: Mat4, style: SplatStyle) {
+        self.splats.push((splat, transform, style));
+    }
+
     /// Check if the scene is empty.
     pub fn is_empty(&self) -> bool {
-        self.meshes.is_empty() && self.lines.is_empty() && self.points.is_empty()
+        self.meshes.is_empty()
+            && self.lines.is_empty()
+            && self.points.is_empty()
+            && self.splats.is_empty()
     }
 
     /// Clear all scene data.
@@ -46,6 +60,7 @@ impl SceneData {
         self.meshes.clear();
         self.lines.clear();
         self.points.clear();
+        self.splats.clear();
     }
 }
 

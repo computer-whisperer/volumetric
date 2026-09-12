@@ -18,6 +18,10 @@ pub struct GBuffer {
     /// Hardware depth-stencil for depth testing
     pub depth_stencil_texture: wgpu::Texture,
     pub depth_stencil_view: wgpu::TextureView,
+    /// The splat layer: Gaussians blended among themselves in their
+    /// trainer's value space before being laid over the scene.
+    pub splat_texture: wgpu::Texture,
+    pub splat_view: wgpu::TextureView,
     /// Current size
     pub size: (u32, u32),
     /// Format for the color attachment (matches surface format)
@@ -25,6 +29,9 @@ pub struct GBuffer {
 }
 
 impl GBuffer {
+    /// Half floats so hundreds of blended layers do not quantise.
+    pub const SPLAT_LAYER_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
     /// Create a new G-buffer with the given size and color format.
     pub fn new(
         device: &wgpu::Device,
@@ -99,6 +106,18 @@ impl GBuffer {
         let depth_stencil_view =
             depth_stencil_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
+        let splat_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gbuffer_splat_layer"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: Self::SPLAT_LAYER_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let splat_view = splat_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
         Self {
             color_texture,
             color_view,
@@ -108,6 +127,8 @@ impl GBuffer {
             depth_view,
             depth_stencil_texture,
             depth_stencil_view,
+            splat_texture,
+            splat_view,
             size,
             color_format,
         }

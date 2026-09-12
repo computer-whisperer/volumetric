@@ -172,6 +172,96 @@ pub struct PointInstance {
     pub color: [f32; 4], // RGBA with alpha
 }
 
+/// A Gaussian splat as the renderer draws it: world-space centres and
+/// covariances, activated opacities, and spherical-harmonic colour. Built
+/// once from a splat value; the renderer sorts and colours it per view.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SplatData {
+    /// Flat surfels (2DGS: each pixel's ray is intersected with the
+    /// surfel's plane) rather than 3D Gaussians (EWA projection).
+    pub surfels: bool,
+    /// World centres, one per primitive.
+    pub positions: Vec<[f32; 3]>,
+    /// The three scaled local axes of each primitive in world coordinates
+    /// (`R · diag(s)`, column by column, xyz each): the covariance is their
+    /// outer-product sum. A surfel's third axis is zero.
+    pub axes: Vec<[f32; 9]>,
+    /// Opacity per primitive in `[0, 1]`.
+    pub opacities: Vec<f32>,
+    /// Spherical-harmonic degree of the colour, 0 to 3.
+    pub sh_degree: u32,
+    /// Colour coefficients per primitive: the three degree-0 values, then
+    /// the `(d + 1)² − 1` higher coefficients of red, then green, then
+    /// blue.
+    pub sh: Vec<f32>,
+}
+
+impl SplatData {
+    pub fn len(&self) -> usize {
+        self.positions.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.positions.is_empty()
+    }
+
+    /// The world covariance of primitive `i` as `xx, xy, xz, yy, yz, zz`.
+    pub fn covariance(&self, i: usize) -> [f32; 6] {
+        let a = &self.axes[i];
+        let dot = |r: usize, c: usize| (0..3).map(|k| a[3 * k + r] * a[3 * k + c]).sum::<f32>();
+        [
+            dot(0, 0),
+            dot(0, 1),
+            dot(0, 2),
+            dot(1, 1),
+            dot(1, 2),
+            dot(2, 2),
+        ]
+    }
+
+    /// Coefficients per primitive in `sh`.
+    pub fn sh_per_point(&self) -> usize {
+        3 * ((self.sh_degree + 1) * (self.sh_degree + 1)) as usize
+    }
+
+    /// The largest axis of the positions' bounding box, for deciding when a
+    /// camera has moved enough to re-sort.
+    pub fn extent(&self) -> f32 {
+        let mut lo = [f32::INFINITY; 3];
+        let mut hi = [f32::NEG_INFINITY; 3];
+        for p in &self.positions {
+            for k in 0..3 {
+                lo[k] = lo[k].min(p[k]);
+                hi[k] = hi[k].max(p[k]);
+            }
+        }
+        if self.positions.is_empty() {
+            0.0
+        } else {
+            (0..3).map(|k| hi[k] - lo[k]).fold(0.0, f32::max)
+        }
+    }
+}
+
+/// How a splat is drawn.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SplatStyle {
+    /// Standard deviations the footprint reaches (3 covers 99 %).
+    pub kernel_radius: f32,
+    /// Multiplier on every primitive's opacity, for fading a splat against
+    /// a photograph.
+    pub opacity_scale: f32,
+}
+
+impl Default for SplatStyle {
+    fn default() -> Self {
+        Self {
+            kernel_radius: 3.0,
+            opacity_scale: 1.0,
+        }
+    }
+}
+
 /// Point rendering style.
 #[derive(Clone, Debug)]
 pub struct PointStyle {

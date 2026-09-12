@@ -890,6 +890,8 @@ pub enum OutputKind {
     Subspace,
     /// A view set: camera frustums and marker squares.
     ViewSet,
+    /// A Gaussian splat: the primitives blended back to front.
+    Splat,
 }
 
 /// FEA-specific view settings.
@@ -949,6 +951,8 @@ pub enum OutputRender {
     Subspace,
     /// View sets draw their frustums at a fixed size; no settings yet.
     ViewSet,
+    /// Splats draw at their trained opacity; no settings yet.
+    Splat,
 }
 
 impl OutputRender {
@@ -960,6 +964,7 @@ impl OutputRender {
             Self::TriMesh { .. } => OutputKind::TriMesh,
             Self::Subspace => OutputKind::Subspace,
             Self::ViewSet => OutputKind::ViewSet,
+            Self::Splat => OutputKind::Splat,
         }
     }
 
@@ -993,6 +998,7 @@ impl OutputRender {
             Self::TriMesh { .. } => "triangle mesh".to_string(),
             Self::Subspace => "subspace".to_string(),
             Self::ViewSet => "views".to_string(),
+            Self::Splat => "splat".to_string(),
         }
     }
 
@@ -1001,7 +1007,7 @@ impl OutputRender {
         match self {
             Self::Model3d { wireframe, .. } | Self::TriMesh { wireframe } => *wireframe,
             Self::FeaMesh(fea) => fea.wireframe,
-            Self::Model2d { .. } | Self::Subspace | Self::ViewSet => false,
+            Self::Model2d { .. } | Self::Subspace | Self::ViewSet | Self::Splat => false,
         }
     }
 }
@@ -1532,6 +1538,7 @@ impl VolumetricUiV2 {
             Some(AssetTypeHint::TriMesh) => OutputKind::TriMesh,
             Some(AssetTypeHint::Subspace) => OutputKind::Subspace,
             Some(AssetTypeHint::ViewSet) => OutputKind::ViewSet,
+            Some(AssetTypeHint::Splat) => OutputKind::Splat,
             _ => {
                 let data = asset.data_arc();
                 let key = (Arc::as_ptr(&data) as usize, data.len());
@@ -1572,6 +1579,7 @@ impl VolumetricUiV2 {
             OutputKind::TriMesh => OutputRender::TriMesh { wireframe: false },
             OutputKind::Subspace => OutputRender::Subspace,
             OutputKind::ViewSet => OutputRender::ViewSet,
+            OutputKind::Splat => OutputRender::Splat,
         }
     }
 
@@ -1673,7 +1681,10 @@ impl VolumetricUiV2 {
                 wireframe
             }
             OutputRender::FeaMesh(fea) => &mut fea.wireframe,
-            OutputRender::Model2d { .. } | OutputRender::Subspace | OutputRender::ViewSet => {
+            OutputRender::Model2d { .. }
+            | OutputRender::Subspace
+            | OutputRender::ViewSet
+            | OutputRender::Splat => {
                 return;
             }
         };
@@ -1979,6 +1990,7 @@ impl VolumetricUiV2 {
                     | AssetTypeHint::TriMesh
                     | AssetTypeHint::Subspace
                     | AssetTypeHint::ViewSet
+                    | AssetTypeHint::Splat
             ) | None
         ) {
             return None;
@@ -2012,6 +2024,7 @@ impl VolumetricUiV2 {
             OutputRender::TriMesh { .. } => PreviewPlan::TriMesh,
             OutputRender::Subspace => PreviewPlan::Subspace,
             OutputRender::ViewSet => PreviewPlan::ViewSet,
+            OutputRender::Splat => PreviewPlan::Splat,
         };
         Some(PreviewRequest {
             asset_id: asset.id().to_string(),
@@ -5479,6 +5492,9 @@ fn output_settings_popover(app: &VolumetricUiV2, id: &str) -> El {
         OutputRender::ViewSet => {
             body.push(text("Camera frustums · no settings yet").caption().muted());
         }
+        OutputRender::Splat => {
+            body.push(text("Gaussian splat · no settings yet").caption().muted());
+        }
     }
     if let Some(stats) = app.output_stats.get(id) {
         body.push(divider());
@@ -6644,6 +6660,7 @@ fn runtime_asset_is_renderable(asset: &LoadedAsset) -> bool {
                 | AssetTypeHint::TriMesh
                 | AssetTypeHint::Subspace
                 | AssetTypeHint::ViewSet
+                | AssetTypeHint::Splat
         ) | None
     )
 }

@@ -13,10 +13,14 @@ mod composite;
 mod line;
 mod mesh;
 mod point;
+mod splat;
 mod ssao;
 
 pub use composite::CompositePipeline;
 pub use line::{GpuLines, LinePipeline};
 pub use mesh::{GpuMesh, MeshPipeline, MeshUniforms};
 pub use point::{GpuPoints, PointPipeline};
+pub use splat::{
+    GpuSplat, SplatCompositePipeline, SplatPipeline, SplatUniforms, evaluate_sh, project_covariance,
+};
 pub use ssao::{SsaoPipeline, SsaoUniforms};

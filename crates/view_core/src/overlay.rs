@@ -33,9 +33,12 @@ impl Overlay {
     }
 }
 
-/// Composes `render` (with `covered` marking its pixels that hold
-/// geometry) over `photo`, which must be the same size.
-pub fn compose(photo: &Rgb, render: &Rgb, covered: &[bool], overlay: Overlay) -> Result<Rgb> {
+/// Composes `render` over `photo`, which must be the same size.
+/// `coverage` is how much of each render pixel is geometry, in `[0, 1]`:
+/// 1 on a surface, a fraction on a splat's fading edge, 0 where the
+/// background shows. Blend weights by it; the other modes count a pixel
+/// as geometry above one half.
+pub fn compose(photo: &Rgb, render: &Rgb, coverage: &[f32], overlay: Overlay) -> Result<Rgb> {
     if photo.width != render.width || photo.height != render.height {
         bail!(
             "photograph is {}x{} but the render is {}x{}",
@@ -45,22 +48,24 @@ pub fn compose(photo: &Rgb, render: &Rgb, covered: &[bool], overlay: Overlay) ->
             render.height
         );
     }
-    if covered.len() != (photo.width * photo.height) as usize {
+    if coverage.len() != (photo.width * photo.height) as usize {
         bail!("coverage mask does not match the image");
     }
     let (w, h) = (photo.width, photo.height);
-    let at = |x: u32, y: u32| covered[(y * w + x) as usize];
+    let at = |x: u32, y: u32| coverage[(y * w + x) as usize] > 0.5;
     Ok(match overlay {
         Overlay::Blend { alpha } => {
             let alpha = alpha.clamp(0.0, 1.0);
             let mut out = photo.clone();
             for y in 0..h {
                 for x in 0..w {
-                    if at(x, y) {
+                    let weight = alpha * coverage[(y * w + x) as usize].clamp(0.0, 1.0);
+                    if weight > 0.0 {
                         let p = photo.get(x, y);
                         let r = render.get(x, y);
                         let mix = |i: usize| {
-                            (f32::from(p[i]) * (1.0 - alpha) + f32::from(r[i]) * alpha) as u8
+                            (f32::from(p[i]) * (1.0 - weight) + f32::from(r[i]) * weight).round()
+                                as u8
                         };
                         out.set(x, y, [mix(0), mix(1), mix(2)]);
                     }
@@ -129,16 +134,16 @@ pub fn compose(photo: &Rgb, render: &Rgb, covered: &[bool], overlay: Overlay) ->
 mod tests {
     use super::*;
 
-    fn images() -> (Rgb, Rgb, Vec<bool>) {
+    fn images() -> (Rgb, Rgb, Vec<f32>) {
         let mut photo = Rgb::new(4, 4);
         let mut render = Rgb::new(4, 4);
-        let mut covered = vec![false; 16];
+        let mut covered = vec![0.0; 16];
         for y in 0..4 {
             for x in 0..4 {
                 photo.set(x, y, [100, 100, 100]);
                 let inside = (1..3).contains(&x) && (1..3).contains(&y);
                 render.set(x, y, if inside { [200, 0, 0] } else { [10, 10, 10] });
-                covered[(y * 4 + x) as usize] = inside;
+                covered[(y * 4 + x) as usize] = if inside { 1.0 } else { 0.0 };
             }
         }
         (photo, render, covered)
@@ -152,6 +157,11 @@ mod tests {
         assert_eq!(blend.get(0, 0), [100, 100, 100]);
         let half = compose(&photo, &render, &covered, Overlay::Blend { alpha: 0.5 }).unwrap();
         assert_eq!(half.get(1, 1), [150, 50, 50]);
+        // A fading edge (a splat's) blends by its coverage.
+        let mut fading = covered.clone();
+        fading[5] = 0.5;
+        let faded = compose(&photo, &render, &fading, Overlay::Blend { alpha: 1.0 }).unwrap();
+        assert_eq!(faded.get(1, 1), [150, 50, 50]);
 
         let edge = compose(&photo, &render, &covered, Overlay::Edge).unwrap();
         assert_eq!(edge.get(1, 1), [255, 96, 0]);

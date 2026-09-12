@@ -7,8 +7,8 @@ view-solve, view_solve_operator, GUI Import Still). C2 (card detection)
 landed 2026-09-11. C3 (survey bundle) landed 2026-09-11 together with the
 parts of C1 it needed (schema 2, `view-import --stills`, Sony focus keys);
 C1's remaining audits fold into D. S1 (splat value, import, listing,
-points) landed 2026-09-11. C4, S2, S3, P (Python bindings) and D (audits)
-pending; order S2, P, C4, D, S3.
+points) and S2 (splat rendering) landed 2026-09-11. C4, S3, P (Python
+bindings) and D (audits) pending; order P, C4, D, S3.
 
 ## Why
 
@@ -132,7 +132,7 @@ printable or manufacturable mesh.
 | C3 | Survey bundle: cameras per focus key, poses, corners free, scale from the card, uncertainties; `view-survey`, operator, GUI | 4 days | landed |
 | C4 | Trainer bridges: dataset export in the schema-2 layout with a box seed; `.npz` TSDF import | 2 days | pending |
 | S1 | Splat value, 3DGS PLY import, `splat-list`, splat to point cloud | 2 days | landed |
-| S2 | Splat rendering in the viewport and `render`, look-through over the photograph | 4 days | pending |
+| S2 | Splat rendering in the viewport and `render`, look-through over the photograph | 4 days | landed |
 | S3 | Photometric audit: the splat rendered through each view against its photograph | 2 days | pending |
 | P | Python bindings (PyO3, maturin) over cv_core, view_core, the survey, splats and projects | 3 days | pending |
 | D | Evidence audits for still sets: intake, detection, survey, setup, coverage, photometric, physical | 3 days | pending |
@@ -687,6 +687,44 @@ cloud and it from them (4.5 mm at p99); SH0 colours match the trainer's
 - Surfels are drawn as thin ellipsoids first; the exact ray–surfel
   intersection of 2DGS is a follow-up if the thin-ellipsoid result is
   visibly wrong at grazing angles.
+
+**S2 status (landed 2026-09-11).** As designed, with these findings.
+Sorting is on the CPU (radix on the view-space depth, the SH colour
+evaluated per primitive at the same pass) into a rewritten instance
+buffer, re-done when the view axis turns 2° or the eye moves 2 % of the
+extent; the 3DGS instance layout carries the three scaled world axes
+(80 bytes) rather than a covariance, so the vertex shader forms the 2D
+covariance as the outer-product sum of the projected axes and the
+fragment can intersect a surfel's plane. Surfels use the exact 2DGS
+evaluation from the start: the thin-ellipsoid draft drew an edge-on
+surfel as a line the length of its 3σ footprint (the projected
+covariance integrates the disc's density along the ray; the intersection
+lands far from the centre and contributes nothing), which was not
+"visibly wrong at grazing angles" but wrong on every silhouette, so the
+follow-up came forward. Two colour-space facts settled by measurement
+against gsplat's held-out renders: trainers fit and blend sRGB values as
+plain numbers, so the splats blend on their own half-float layer in that
+space and the layer is linearised once over the scene (blending in
+linear light was 1.5 dB and 40 % of mean brightness off); and the
+chairbase-dslr-0-2dgs run must be read as surfels, since gsplat's 2DGS
+trains two scales and exports an untrained third (drawn as Gaussians it
+was 7 points of silhouette IoU and 3 dB worse). The CLI's overlay now
+takes the render's coverage from the alpha channel (transparent-black
+sentinel, colours un-premultiplied) instead of a magenta test, so a
+splat's fading edge blends by its opacity. A stray-primitive cull (before
+the near plane, outside 1.3 × the frame, or wider than two frames) is in
+the vertex shader. Validation: `render --intrinsics --pose` with the
+trainer's own cameras against its held-out panels (frames 133, 143, 154,
+166; 3096 × 2064; the grid off): 34.9, 34.8, 33.0, 36.2 dB inside the
+subject mask, 40.0, 41.3, 38.9, 46.1 dB over the frame, silhouette IoU
+0.93, 0.93, 0.89, 0.89; affine-fitted to the photographs 27.8, 27.0,
+30.4, 33.8 dB against the trainer's 28.6, 27.4, 31.7, 34.8 (its
+`metrics.json` mean 28.6 over seven). The surfel intersection is the
+last 2 dB of that. Not done: the viewport's reference grid lies in the
+renderer's XZ plane while a surveyed world is z-up, so the grid cuts
+through a splat and a view set at an angle (it also drew the "streaks"
+in the first comparisons); a settings toggle for kernel radius and
+opacity scale; a GPU sort for scenes past a few million primitives.
 
 ### S3. Photometric audit
 

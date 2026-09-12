@@ -426,7 +426,35 @@ section tools measure the splat directly. On the chairbase-dslr-0 run
 seconds; 345 k primitives are at or above half opacity, and their centres
 sit 1.2 mm median from the trainer's own TSDF surface cloud, whose points
 in turn are 1.2 mm median (4.5 mm at the 99th percentile) from the
-nearest opaque centre. Rendering the splat is step S2.
+nearest opaque centre. gsplat's 2DGS mode trains two scales and exports
+an untrained third, so a run from it is imported with `kind: surfel`.
+
+A splat draws wherever a cloud would: in the viewport, in `render`, and
+through a view over its photograph. The renderer keeps each splat as a
+GPU resident whose instances are rewritten back to front, with the
+spherical-harmonic colour evaluated for the view, whenever the camera
+turns by two degrees or moves by two percent of the splat's extent;
+between sorts only the camera uniforms change. The vertex shader
+projects each primitive's covariance through the view's Jacobian into a
+screen ellipse (EWA splatting) and sizes a quad to three sigmas; the
+fragment weights a 3D Gaussian by the projected Gaussian and a surfel by
+the 2DGS rule, the pixel's ray intersected with the surfel's plane and
+measured in the surfel's frame, with the half-pixel screen-space
+low-pass, so a surfel seen edge-on fades instead of drawing a line.
+Primitives are depth-tested at their centres against the scene and never
+write depth. Splats blend among themselves in the value space the trainer
+used (sRGB values as numbers, on a half-float layer) and the layer is
+linearised over the scene, so the same arithmetic as the trainer's
+reaches the frame. Sorting stays on the CPU so the pipeline runs within
+WebGL2's limits. Against gsplat's own renders of the four held-out views
+of chairbase-dslr-0 (its cameras, its scale), `render --intrinsics
+--pose` matches at 33–36 dB inside the subject mask and 39–46 dB over the
+frame, and its affine-fitted PSNR to the photographs is within 0.4–1.3 dB
+of the trainer's on every view (28.6, 27.4, 31.7, 34.8 dB there). Six
+hundred thousand primitives render in well under a second after the
+sort. `render --through <view> --overlay blend` composites the splat over
+the photograph by the render's coverage, which the alpha channel now
+carries (a splat's fading edge blends by its opacity; surfaces fully).
 
 A view set in the viewport draws every view's frustum (0.1 m deep, with a
 tick marking the picture's up) and the marker squares, and the project
