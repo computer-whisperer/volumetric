@@ -12,10 +12,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use serde::Serialize;
 use view_core::crop::{CropOptions, crop, picture_of};
-use view_core::measure::{Plane, cast, chart, plane_of, triangulate_picks};
+use view_core::measure::{Plane, cast, chart, fit_feature, plane_of, triangulate_picks};
 use volumetric::AssetTypeHint;
 use volumetric_abi::subspace::{Subspace, decode_subspace};
-use volumetric_abi::viewset::{CameraModel, View, ViewSet};
+use volumetric_abi::viewset::{CameraModel, PickRole, View, ViewSet};
 
 use crate::views::{load_viewset, project_assets};
 
@@ -209,6 +209,21 @@ pub struct ViewPickArgs {
     #[arg(long, allow_hyphen_values = true)]
     pub plane_normal: Option<String>,
 
+    /// Record the one --pixel as a feature pick of this name in the view
+    /// (replacing a pick of that name there) and save the set: a .vviews
+    /// input is rewritten (or --output), a project's asset is updated
+    #[arg(long)]
+    pub record: Option<String>,
+
+    /// With --record: the pick is a check (held out of triangulation and
+    /// compared against the fitted point), not a fit
+    #[arg(long)]
+    pub check: bool,
+
+    /// With --record: write the set here instead of over the input
+    #[arg(short, long)]
+    pub output: Option<PathBuf>,
+
     /// Also give every result in this project asset's chart: a frame or
     /// plane Subspace (coordinates along its basis vectors, then along its
     /// normal for a plane)
@@ -286,6 +301,36 @@ pub fn run_view_pick(args: ViewPickArgs) -> Result<()> {
     } else {
         None
     };
+    if let Some(name) = &args.record {
+        let [pixel] = args.pixels.as_slice() else {
+            bail!("--record names one pick: give exactly one --pixel");
+        };
+        let pixel = parse_coordinates::<2>(pixel, "--pixel")?;
+        let role = if args.check {
+            PickRole::Check
+        } else {
+            PickRole::Fit
+        };
+        let mut set = set.clone();
+        set.record_pick(&view.id, name, pixel, role)
+            .map_err(anyhow::Error::msg)?;
+        let where_ = crate::views::store_viewset(
+            &set,
+            &args.input,
+            args.views.as_deref(),
+            args.output.as_deref(),
+        )?;
+        println!(
+            "recorded {} pick {name:?} at ({:.1}, {:.1}) in view {} -> {where_}",
+            if args.check { "check" } else { "fit" },
+            pixel[0],
+            pixel[1],
+            view.id
+        );
+        if plane.is_none() {
+            return Ok(());
+        }
+    }
     if !args.pixels.is_empty() && plane.is_none() {
         bail!(
             "casting pixels needs a plane: --plane-z, --plane, or --plane-point with --plane-normal"
@@ -381,8 +426,17 @@ pub struct ViewTriangulateArgs {
     #[arg(long)]
     pub views: Option<String>,
 
+    /// Fit this recorded feature from its picks (repeatable; see
+    /// `view-pick --record`)
+    #[arg(long = "feature")]
+    pub features: Vec<String>,
+
+    /// Fit every recorded feature
+    #[arg(long)]
+    pub all_features: bool,
+
     /// The same feature seen in a view, as VIEW:u,v (at least two)
-    #[arg(long = "ray", required = true)]
+    #[arg(long = "ray")]
     pub rays: Vec<String>,
 
     /// Also give the result in this project asset's chart (a plane or
@@ -397,14 +451,20 @@ pub struct ViewTriangulateArgs {
 /// The point nearest every ray in the least-squares sense, and each
 /// ray's distance from it.
 pub fn run_view_triangulate(args: ViewTriangulateArgs) -> Result<()> {
-    if args.rays.len() < 2 {
-        bail!("triangulation needs at least two --ray VIEW:u,v");
-    }
     let set = load_viewset(&args.input, args.views.as_deref())?;
     let frame = match &args.frame {
         Some(id) => Some(load_subspace(&args.input, id)?),
         None => None,
     };
+    if args.all_features || !args.features.is_empty() {
+        if !args.rays.is_empty() {
+            bail!("--ray and recorded features are different inputs; give one");
+        }
+        return fit_recorded(&set, &args, frame.as_ref());
+    }
+    if args.rays.len() < 2 {
+        bail!("triangulation needs at least two --ray VIEW:u,v (or --feature / --all-features)");
+    }
     let mut labels = Vec::new();
     for text in &args.rays {
         let (id, pixel) = text
@@ -456,6 +516,96 @@ pub fn run_view_triangulate(args: ViewTriangulateArgs) -> Result<()> {
             pixel[1],
             gap * 1000.0
         );
+    }
+    Ok(())
+}
+
+/// Fit recorded features and print each with its picks' misses and errors.
+fn fit_recorded(set: &ViewSet, args: &ViewTriangulateArgs, frame: Option<&Subspace>) -> Result<()> {
+    let names: Vec<String> = if args.all_features {
+        set.picks().keys().cloned().collect()
+    } else {
+        args.features.clone()
+    };
+    if names.is_empty() {
+        bail!("no feature picks recorded in the set");
+    }
+    #[derive(Serialize)]
+    struct Out {
+        name: String,
+        world: [f64; 3],
+        #[serde(skip_serializing_if = "Option::is_none")]
+        chart: Option<Vec<f64>>,
+        max_gap: f64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max_check_px: Option<f64>,
+        picks: Vec<view_core::measure::PickReport>,
+    }
+    let mut fits = Vec::new();
+    for name in &names {
+        // Every recorded feature: one that cannot be fitted yet is noted,
+        // not fatal; a named feature must fit.
+        let fit = match fit_feature(set, name) {
+            Ok(fit) => fit,
+            Err(err) if args.all_features => {
+                eprintln!("{name}: {err}");
+                continue;
+            }
+            Err(err) => bail!(err),
+        };
+        fits.push(Out {
+            name: fit.name.clone(),
+            world: fit.world,
+            chart: frame.map(|f| chart(f, fit.world)),
+            max_gap: fit.max_gap(),
+            max_check_px: fit.max_check_px(),
+            picks: fit.picks,
+        });
+    }
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&fits)?);
+        return Ok(());
+    }
+    for fit in &fits {
+        println!(
+            "{}: world ({:.4}, {:.4}, {:.4}){}; worst ray miss {:.2} mm{}",
+            fit.name,
+            fit.world[0],
+            fit.world[1],
+            fit.world[2],
+            match &fit.chart {
+                Some(c) => format!(
+                    "  chart ({})",
+                    c.iter()
+                        .map(|v| format!("{:+.4}", v))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                None => String::new(),
+            },
+            fit.max_gap * 1000.0,
+            match fit.max_check_px {
+                Some(px) => format!(", worst check {px:.1} px"),
+                None => String::new(),
+            }
+        );
+        for pick in &fit.picks {
+            println!(
+                "  {} {:?} ({:.1}, {:.1}): {}",
+                pick.view,
+                pick.role,
+                pick.pixel[0],
+                pick.pixel[1],
+                match (pick.gap, pick.error_px) {
+                    (Some(gap), Some(px)) => format!(
+                        "ray passes {:.2} mm from the point, reprojects {px:.1} px off",
+                        gap * 1000.0
+                    ),
+                    (None, Some(px)) => format!("reprojects {px:.1} px off"),
+                    _ => "behind the camera".to_string(),
+                }
+            );
+        }
     }
     Ok(())
 }

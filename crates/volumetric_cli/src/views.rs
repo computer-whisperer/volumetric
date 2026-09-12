@@ -455,6 +455,50 @@ pub(crate) fn find_viewset(assets: &[LoadedAsset], wanted: Option<&str>) -> Resu
     decode_viewset(asset.data()).map_err(|err| anyhow!("asset '{}': {err}", asset.id()))
 }
 
+/// Save a set back where `load_viewset` read it from: a `.vviews` file
+/// (or `output`), or the named (or only) view set asset of a project.
+/// Returns where it went.
+pub(crate) fn store_viewset(
+    set: &ViewSet,
+    input: &Path,
+    asset: Option<&str>,
+    output: Option<&Path>,
+) -> Result<String> {
+    let bytes = encode_viewset(set);
+    if let Some(output) = output {
+        std::fs::write(output, &bytes)
+            .with_context(|| format!("Failed to write {}", output.display()))?;
+        return Ok(output.display().to_string());
+    }
+    let extension = input
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if extension != "vproj" {
+        std::fs::write(input, &bytes)
+            .with_context(|| format!("Failed to write {}", input.display()))?;
+        return Ok(input.display().to_string());
+    }
+    let mut project = Project::load_from_file(input).context("Failed to load project")?;
+    let imports = volumetric::asset_query::imports_as_assets(&project);
+    let id = find_viewset_asset(&imports, asset)
+        .context("a recorded pick goes into an imported view set")?
+        .id()
+        .to_string();
+    let import = project
+        .imports_mut()
+        .iter_mut()
+        .find(|i| i.id == id)
+        .context("view set import vanished")?;
+    import.data = bytes;
+    import.type_hint = Some(AssetTypeHint::ViewSet);
+    project
+        .save_to_file(input)
+        .with_context(|| format!("Failed to save {}", input.display()))?;
+    Ok(format!("{} asset '{id}'", input.display()))
+}
+
 pub(crate) fn load_viewset(input: &Path, asset: Option<&str>) -> Result<ViewSet> {
     let extension = input
         .extension()

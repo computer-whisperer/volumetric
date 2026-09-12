@@ -100,7 +100,14 @@ pub fn detect_views(
         let start = Instant::now();
         let gray = Gray::from_rgb8(photo.width, photo.height, &photo.pixels);
         let seen = observe(&gray, options);
-        set.views[i].observations = Some(seen.to_observations());
+        // Detection replaces what was measured automatically; picks and
+        // contours were made by hand and stay.
+        let mut observations = seen.to_observations();
+        if let Some(previous) = set.views[i].observations.take() {
+            observations.features = previous.features;
+            observations.contours = previous.contours;
+        }
+        set.views[i].observations = Some(observations);
         let detected = Detected {
             id,
             width: photo.width,

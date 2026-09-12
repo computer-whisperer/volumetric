@@ -8,9 +8,9 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use view_core::crop::{CropOptions, crop, picture_of};
 use view_core::manifest::{Eye, Selection};
-use view_core::measure::{Plane, cast, triangulate_picks};
+use view_core::measure::{Plane, cast, fit_feature, triangulate_picks};
 use view_core::subset::{Reembed, SubsetOptions, subset};
-use volumetric_abi::viewset::{self as abi, CameraModel, Distortion};
+use volumetric_abi::viewset::{self as abi, CameraModel, Distortion, PickRole};
 
 use crate::{array2, array3, from_py, invalid, runtime, to_py, vec3_from_py};
 
@@ -324,6 +324,152 @@ impl ViewSet {
         Ok(ViewSet::wrap(selected))
     }
 
+    /// The set with feature picks recorded: `picks` is `{name: {view_id:
+    /// (u, v)}}` of fit picks and `check` the same shape for held-out
+    /// picks; a pick replaces one of the same name in that view.
+    #[pyo3(signature = (picks, check=None))]
+    fn with_picks<'py>(
+        &self,
+        picks: &Bound<'py, PyDict>,
+        check: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<ViewSet> {
+        let mut set = (*self.inner).clone();
+        for (dict, role) in [(Some(picks), PickRole::Fit), (check, PickRole::Check)] {
+            let Some(dict) = dict else { continue };
+            for (name, per_view) in dict.iter() {
+                let name: String = name
+                    .extract()
+                    .map_err(|_| invalid("pick names are strings"))?;
+                let per_view = per_view
+                    .cast::<PyDict>()
+                    .map_err(|_| invalid(format!("picks for `{name}` are {{view_id: (u, v)}}")))?;
+                for (view, pixel) in per_view.iter() {
+                    let view: String = view
+                        .extract()
+                        .map_err(|_| invalid("view ids are strings"))?;
+                    let (u, v): (f64, f64) = pixel.extract().map_err(|_| {
+                        invalid(format!("pick `{name}` in `{view}` is a (u, v) pixel"))
+                    })?;
+                    set.record_pick(&view, &name, [u, v], role)
+                        .map_err(invalid)?;
+                }
+            }
+        }
+        Ok(ViewSet::wrap(set))
+    }
+
+    /// The set with contour traces recorded: `{name: {view_id: [(u, v),
+    /// ..]}}`; a trace replaces one of the same name in that view.
+    fn with_contours<'py>(&self, contours: &Bound<'py, PyDict>) -> PyResult<ViewSet> {
+        let mut set = (*self.inner).clone();
+        for (name, per_view) in contours.iter() {
+            let name: String = name
+                .extract()
+                .map_err(|_| invalid("contour names are strings"))?;
+            let per_view = per_view.cast::<PyDict>().map_err(|_| {
+                invalid(format!(
+                    "contours for `{name}` are {{view_id: [(u, v), ..]}}"
+                ))
+            })?;
+            for (view, pixels) in per_view.iter() {
+                let view: String = view
+                    .extract()
+                    .map_err(|_| invalid("view ids are strings"))?;
+                let pixels: Vec<(f64, f64)> = pixels.extract().map_err(|_| {
+                    invalid(format!("contour `{name}` in `{view}` is a list of (u, v)"))
+                })?;
+                set.record_contour(
+                    &view,
+                    &name,
+                    pixels.into_iter().map(|(u, v)| [u, v]).collect(),
+                )
+                .map_err(invalid)?;
+            }
+        }
+        Ok(ViewSet::wrap(set))
+    }
+
+    /// The recorded feature picks: `{name: {view_id: {"pixel": (u, v),
+    /// "role": "fit" | "check"}}}`.
+    fn picks<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let out = PyDict::new(py);
+        for (name, picks) in self.inner.picks() {
+            let per_view = PyDict::new(py);
+            for (view, pixel, role) in picks {
+                let d = PyDict::new(py);
+                d.set_item("pixel", (pixel[0], pixel[1]))?;
+                d.set_item("role", role_name(role))?;
+                per_view.set_item(view, d)?;
+            }
+            out.set_item(name, per_view)?;
+        }
+        Ok(out)
+    }
+
+    /// The recorded contours: `{name: {view_id: [(u, v), ..]}}`.
+    fn contours<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let out = PyDict::new(py);
+        for (name, traces) in self.inner.contours() {
+            let per_view = PyDict::new(py);
+            for (view, pixels) in traces {
+                let pts: Vec<(f64, f64)> = pixels.iter().map(|p| (p[0], p[1])).collect();
+                per_view.set_item(view, pts)?;
+            }
+            out.set_item(name, per_view)?;
+        }
+        Ok(out)
+    }
+
+    /// Recorded features triangulated from their fit picks: `{name:
+    /// {"world": (3,), "max_gap": m, "max_check_px": px or None, "picks":
+    /// [{view, pixel, role, gap, projected, error_px}]}}`. With `names`,
+    /// those features (an error when one cannot be fitted); without,
+    /// every recorded feature, one that cannot be fitted carrying
+    /// `{"error": why}` instead.
+    #[pyo3(signature = (names=None))]
+    fn fit_picks<'py>(
+        &self,
+        py: Python<'py>,
+        names: Option<Vec<String>>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let strict = names.is_some();
+        let names = names.unwrap_or_else(|| self.inner.picks().keys().cloned().collect());
+        let out = PyDict::new(py);
+        for name in names {
+            match fit_feature(&self.inner, &name) {
+                Ok(fit) => {
+                    let d = PyDict::new(py);
+                    d.set_item("world", PyArray1::from_slice(py, &fit.world))?;
+                    d.set_item("max_gap", fit.max_gap())?;
+                    d.set_item("max_check_px", fit.max_check_px())?;
+                    let picks: Vec<Bound<'py, PyDict>> = fit
+                        .picks
+                        .iter()
+                        .map(|p| {
+                            let r = PyDict::new(py);
+                            r.set_item("view", &p.view)?;
+                            r.set_item("pixel", (p.pixel[0], p.pixel[1]))?;
+                            r.set_item("role", role_name(p.role))?;
+                            r.set_item("gap", p.gap)?;
+                            r.set_item("projected", p.projected.map(|q| (q[0], q[1])))?;
+                            r.set_item("error_px", p.error_px)?;
+                            Ok(r)
+                        })
+                        .collect::<PyResult<_>>()?;
+                    d.set_item("picks", picks)?;
+                    out.set_item(name, d)?;
+                }
+                Err(err) if strict => return Err(invalid(err)),
+                Err(err) => {
+                    let d = PyDict::new(py);
+                    d.set_item("error", err)?;
+                    out.set_item(name, d)?;
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// The survey card (spec and solved corners) as a dict, or None.
     #[getter]
     fn board<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
@@ -348,6 +494,13 @@ impl ViewSet {
             self.inner.cameras.len(),
             self.inner.markers.len()
         )
+    }
+}
+
+fn role_name(role: PickRole) -> &'static str {
+    match role {
+        PickRole::Fit => "fit",
+        PickRole::Check => "check",
     }
 }
 

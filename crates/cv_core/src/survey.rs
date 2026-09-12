@@ -1941,6 +1941,8 @@ mod tests {
                 markers: Vec::new(),
                 board: Vec::new(),
                 blur_px: None,
+                features: Vec::new(),
+                contours: Vec::new(),
             };
             for (id, x) in card.iter().enumerate() {
                 if let Some((uv, _, _)) = project(&intr, pose.apply(*x))

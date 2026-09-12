@@ -89,3 +89,52 @@ def test_import_stills_makes_an_unposed_set(tmp_path):
     assert views.provenance["session"] == "test"
     with pytest.raises(ValueError, match="unknown field"):
         v.import_stills(str(tmp_path), preview="none")
+
+
+def test_recorded_picks_replay_the_chair_photo_report():
+    """The other session's picks, recorded on the views instead of in
+    JSON, fit to the report's points with the check view's errors."""
+    survey = HERE / "work/survey.vviews"
+    if not survey.exists():
+        pytest.skip("chair_photo survey not built")
+    obs = json.loads((HERE / "observations.json").read_text())
+    report = json.loads((HERE / "measurement-report.json").read_text())
+    fit = {name: {view: tuple(px) for view, px in picks.items() if view in obs["fit_views"]}
+           for name, picks in obs["features"].items()}
+    check = {name: {view: tuple(px) for view, px in picks.items() if view in obs["check_views"]}
+             for name, picks in obs["features"].items()}
+    views = v.ViewSet.load(str(survey)).with_picks(fit, check=check)
+    recorded = views.picks()
+    assert recorded["cross_a"]["DSC00756"]["role"] == "check"
+    assert len(recorded) == 6 and all(len(p) == 3 for p in recorded.values())
+    fits = views.fit_picks()
+    for name, f in fits.items():
+        ref = report["features"][name]
+        assert np.linalg.norm(f["world"] - ref["world"]) < 1e-9
+        assert abs(f["max_gap"] - max(ref["gaps"])) < 1e-12
+        (check_view,) = obs["check_views"]
+        assert abs(f["max_check_px"] - ref["reprojections"][check_view]["error_px"]) < 1e-3
+        roles = {p["view"]: p["role"] for p in f["picks"]}
+        assert roles[check_view] == "check" and sum(r == "fit" for r in roles.values()) == 2
+    # Picks survive encoding and selection, and a re-detection.
+    again = v.ViewSet.decode(views.encode())
+    assert again.picks() == recorded
+    subset = views.select(ids=["DSC00755"], embed="none")
+    assert set(subset.picks()) == set(recorded) and all(list(p) == ["DSC00755"] for p in subset.picks().values())
+
+
+def test_picks_and_contours_validate(chair_views):
+    a, b = chair_views.views[0].id, chair_views.views[1].id
+    one = chair_views.with_picks({"lone": {a: (10.0, 20.0)}})
+    assert one.fit_picks()["lone"]["error"].startswith("feature \"lone\" has 1 fit pick")
+    with pytest.raises(ValueError, match="needs two"):
+        one.fit_picks(["lone"])
+    with pytest.raises(ValueError, match="no view"):
+        chair_views.with_picks({"x": {"nope": (1.0, 1.0)}})
+    traced = chair_views.with_contours({"rim": {a: [(1.0, 2.0), (3.0, 4.0)], b: [(5.0, 6.0)]}})
+    assert traced.contours() == {"rim": {a: [(1.0, 2.0), (3.0, 4.0)], b: [(5.0, 6.0)]}}
+    with pytest.raises(ValueError, match="empty"):
+        chair_views.with_contours({"rim": {a: []}})
+    # Detection replaces the automatic observations and keeps the picks.
+    detected, _, _ = one.detect(ids=[a], swatches="5x5_100", card=str(HERE / "card.json"))
+    assert detected.picks() == one.picks() and detected.view(a).observations["markers"]

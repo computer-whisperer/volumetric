@@ -429,6 +429,8 @@ mod tests {
                 fit_px: 0.3,
             }],
             blur_px: None,
+            features: Vec::new(),
+            contours: Vec::new(),
         });
         let lines = observation_lines(&view, &camera);
         assert_eq!(lines.len(), 4 + 4 + 2);

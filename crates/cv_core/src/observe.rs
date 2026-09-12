@@ -83,6 +83,8 @@ impl Observed {
                 })
                 .collect(),
             blur_px: self.blur.worst(),
+            features: Vec::new(),
+            contours: Vec::new(),
         }
     }
 }

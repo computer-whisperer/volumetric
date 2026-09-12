@@ -140,7 +140,7 @@ measurement feedback. All evidence paths above are under
 | S1 | Splat value, 3DGS PLY import, `splat-list`, splat to point cloud | 2 days | landed |
 | S2 | Splat rendering in the viewport and `render`, look-through over the photograph | 4 days | landed |
 | S3 | Photometric audit: the splat rendered through each view against its photograph | 2 days | pending |
-| P | Python bindings (PyO3, maturin) over cv_core, view_core, the survey, splats and projects | 3 days | P1+P2+P3a+P3b landed 2026-09-12; observations-as-a-value pending (design) |
+| P | Python bindings (PyO3, maturin) over cv_core, view_core, the survey, splats and projects | 3 days | P1..P3c landed 2026-09-12; open: GUI look-through drawing picks and contours |
 | D | Evidence audits for still sets: intake, detection, survey, setup, coverage, photometric, physical | 3 days | pending |
 
 Proposed order: C2, C3 (the survey is the stage the agent starts from and
@@ -852,9 +852,27 @@ with `view-select`), `View.crop` (`view_core::crop`, shared with
 `view-crop`), `Project.add_views`, `Project.set_config`
 (`project_edit::set_config`, shared with `project-set-config`).
 
-Deferred: 
-`ViewSet` mutation (poses from Python), observations as a first-class
-value (named feature picks and contours on the view set — an ABI decision).
+P3c — observations as a value (landed 2026-09-12; the chair_photo picks
+recorded on the views fit to the report's numbers). A
+session's feature picks and contour traces live with the photograph they
+were made in, not in example JSON: `Observations` (per view) gains
+`features: Vec<FeatureObs { name, pixel, role: Fit | Check }>` and
+`contours: Vec<ContourObs { name, pixels }>`, both `serde(default)` so
+every existing set reads unchanged (schema stays 2). A pick survives
+`select`, is validated with the set (finite pixels, non-empty names), and
+is what the GUI look-through can draw later. Set-level operations follow
+from it in `view_core::measure`: `picks(set)` gathers a name's picks
+across views; `fit_feature(set, name)` triangulates the fit picks and
+reports each ray's miss and each check pick's reprojection error;
+`fit_features(set)` does every name. Chosen over a separate observations
+asset kind because that would touch the type hints, the GUI and the
+operators for no gain over the per-view record. CLI: `view-pick --record
+NAME [--check]` stores a pick (into the file or the project's asset);
+`view-triangulate --features [NAME..]` fits recorded picks. Python:
+`ViewSet.with_picks({name: {view: (u, v)}}, check=...)`,
+`.with_contours({name: {view: [(u, v), ..]}})`, `.picks()`,
+`.contours()`, `.fit_picks(names=None)`. Follow-up (not this step): the
+GUI look-through drawing picks and contours.
 
 Tests (`crates/volumetric_py/tests`, pytest in the shim's venv): a
 cylinder built and run, its mesh bounds checked; a synthetic board

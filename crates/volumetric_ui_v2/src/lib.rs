@@ -10674,6 +10674,8 @@ mod tests {
                 fit_px: 0.1,
             }],
             blur_px: Some(1.25),
+            features: Vec::new(),
+            contours: Vec::new(),
         });
         let mut v2 = posed("v2", 0.2);
         v2.image = Some(png.clone());

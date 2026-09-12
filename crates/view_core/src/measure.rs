@@ -3,8 +3,10 @@
 //! and coordinates in a datum's chart. The CLI's `view-pick` and
 //! `view-triangulate` and the Python bindings are the same calls.
 
+use std::collections::BTreeMap;
 use volumetric_abi::subspace::Subspace;
-use volumetric_abi::viewset::{CameraModel, View, ViewSet};
+
+use volumetric_abi::viewset::{CameraModel, PickRole, View, ViewSet};
 
 /// A plane by a point on it and its normal.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -166,6 +168,106 @@ pub fn triangulate_picks(
     triangulate(&rays).ok_or_else(|| "the rays are parallel".to_string())
 }
 
+/// One pick's part in a feature fit.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct PickReport {
+    pub view: String,
+    pub pixel: [f64; 2],
+    pub role: PickRole,
+    /// For a fit pick: how far its ray passes from the point, metres.
+    pub gap: Option<f64>,
+    /// Where the fitted point projects in this view, if in front of it.
+    pub projected: Option<[f64; 2]>,
+    /// Distance from the pick to the projection, pixels.
+    pub error_px: Option<f64>,
+}
+
+/// A named feature triangulated from its recorded picks.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct FeatureFit {
+    pub name: String,
+    pub world: [f64; 3],
+    pub picks: Vec<PickReport>,
+}
+
+impl FeatureFit {
+    /// The largest ray miss among the fit picks, metres.
+    pub fn max_gap(&self) -> f64 {
+        self.picks.iter().filter_map(|p| p.gap).fold(0.0, f64::max)
+    }
+
+    /// The largest reprojection error among the check picks, pixels.
+    pub fn max_check_px(&self) -> Option<f64> {
+        self.picks
+            .iter()
+            .filter(|p| p.role == PickRole::Check)
+            .filter_map(|p| p.error_px)
+            .reduce(f64::max)
+    }
+}
+
+/// Triangulate a recorded feature from its fit picks and report every
+/// pick: the fit picks' ray misses and every pick's reprojection error.
+pub fn fit_feature(set: &ViewSet, name: &str) -> Result<FeatureFit, String> {
+    let picks = set.picks();
+    let picks = picks
+        .get(name)
+        .ok_or_else(|| format!("no picks recorded for feature {name:?}"))?;
+    let fit: Vec<(String, [f64; 2])> = picks
+        .iter()
+        .filter(|(_, _, role)| *role == PickRole::Fit)
+        .map(|(view, pixel, _)| (view.clone(), *pixel))
+        .collect();
+    if fit.len() < 2 {
+        return Err(format!(
+            "feature {name:?} has {} fit pick(s); triangulation needs two views",
+            fit.len()
+        ));
+    }
+    let (world, gaps) = triangulate_picks(set, &fit)?;
+    let mut gap_of = fit
+        .iter()
+        .zip(gaps)
+        .map(|((view, _), gap)| (view.clone(), gap));
+    let reports = picks
+        .iter()
+        .map(|(view_id, pixel, role)| {
+            let gap = if *role == PickRole::Fit {
+                gap_of.next().map(|(_, g)| g)
+            } else {
+                None
+            };
+            let projected = set
+                .view(view_id)
+                .and_then(|(view, camera)| view.project(camera, world));
+            let error_px =
+                projected.map(|p| ((p[0] - pixel[0]).powi(2) + (p[1] - pixel[1]).powi(2)).sqrt());
+            PickReport {
+                view: view_id.clone(),
+                pixel: *pixel,
+                role: *role,
+                gap,
+                projected,
+                error_px,
+            }
+        })
+        .collect();
+    Ok(FeatureFit {
+        name: name.to_string(),
+        world,
+        picks: reports,
+    })
+}
+
+/// Every recorded feature fitted, by name; a feature with fewer than two
+/// fit picks is reported as an error under its name.
+pub fn fit_features(set: &ViewSet) -> BTreeMap<String, Result<FeatureFit, String>> {
+    set.picks()
+        .keys()
+        .map(|name| (name.clone(), fit_feature(set, name)))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,6 +298,40 @@ mod tests {
         }
         assert!(gaps.iter().all(|g| *g < 1e-9));
         assert!(triangulate_picks(&set, &picks[..1]).is_err());
+    }
+
+    #[test]
+    fn recorded_picks_fit_and_check() {
+        let mut set = set();
+        set.views.push(View::posed(
+            "c",
+            0,
+            [1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.3, 0.0, 0.0, -1.0, 1.0],
+        ));
+        let target = [0.1, -0.05, 0.3];
+        for id in ["a", "b", "c"] {
+            let (view, camera) = set.view(id).unwrap();
+            let mut pixel = view.project(camera, target).unwrap();
+            let role = if id == "c" {
+                pixel[0] += 3.0; // a deliberately off check pick
+                PickRole::Check
+            } else {
+                PickRole::Fit
+            };
+            set.record_pick(id, "hole", pixel, role).unwrap();
+        }
+        let fit = fit_feature(&set, "hole").unwrap();
+        assert!((fit.world[0] - target[0]).abs() < 1e-9);
+        assert!(fit.max_gap() < 1e-9);
+        assert!((fit.max_check_px().unwrap() - 3.0).abs() < 1e-6);
+        assert_eq!(fit.picks.len(), 3);
+        assert_eq!(fit.picks[2].role, PickRole::Check);
+        assert!(fit.picks[2].gap.is_none() && fit.picks[0].gap.is_some());
+        assert!(fit_feature(&set, "missing").is_err());
+        set.record_pick("a", "lone", [1.0, 1.0], PickRole::Fit)
+            .unwrap();
+        let all = fit_features(&set);
+        assert!(all["hole"].is_ok() && all["lone"].as_ref().unwrap_err().contains("needs two"));
     }
 
     #[test]

@@ -405,6 +405,43 @@ pub struct Observations {
     /// Edge blur across the markers' edges, pixels (the worse of the two
     /// picture axes), when there were edges to measure.
     pub blur_px: Option<f64>,
+    /// Named feature picks made in this picture (a hole's centre, a
+    /// corner): the observations a feature is triangulated from, or
+    /// checked against. One per name per view.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<FeatureObs>,
+    /// Named contour traces made in this picture (a rim, a silhouette):
+    /// samples along an edge, not matching points across views. One per
+    /// name per view.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contours: Vec<ContourObs>,
+}
+
+/// What a feature pick is for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PickRole {
+    /// Triangulated from.
+    #[default]
+    Fit,
+    /// Held out: the fitted point is projected back and compared.
+    Check,
+}
+
+/// A named feature picked in a photograph.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FeatureObs {
+    pub name: String,
+    pub pixel: [f64; 2],
+    #[serde(default)]
+    pub role: PickRole,
+}
+
+/// A named contour traced in a photograph.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ContourObs {
+    pub name: String,
+    pub pixels: Vec<[f64; 2]>,
 }
 
 /// A marker seen in a photograph.
@@ -427,6 +464,102 @@ pub struct CornerObs {
     /// How far the sub-pixel refinement moved the corner from where the
     /// neighbouring markers predicted it.
     pub fit_px: f64,
+}
+
+impl ViewSet {
+    /// Record a feature pick in a view, replacing one of the same name
+    /// there. The view's observations are created when it has none.
+    pub fn record_pick(
+        &mut self,
+        view_id: &str,
+        name: &str,
+        pixel: [f64; 2],
+        role: PickRole,
+    ) -> Result<(), String> {
+        let view = self
+            .views
+            .iter_mut()
+            .find(|v| v.id == view_id)
+            .ok_or_else(|| format!("no view '{view_id}' in the set"))?;
+        if name.is_empty() {
+            return Err("a pick needs a name".to_string());
+        }
+        if pixel.iter().any(|v| !v.is_finite()) {
+            return Err(format!("pick {name:?} in '{view_id}' is not finite"));
+        }
+        let obs = view.observations.get_or_insert_with(Observations::default);
+        obs.features.retain(|f| f.name != name);
+        obs.features.push(FeatureObs {
+            name: name.to_string(),
+            pixel,
+            role,
+        });
+        Ok(())
+    }
+
+    /// Record a contour trace in a view, replacing one of the same name
+    /// there.
+    pub fn record_contour(
+        &mut self,
+        view_id: &str,
+        name: &str,
+        pixels: Vec<[f64; 2]>,
+    ) -> Result<(), String> {
+        let view = self
+            .views
+            .iter_mut()
+            .find(|v| v.id == view_id)
+            .ok_or_else(|| format!("no view '{view_id}' in the set"))?;
+        if name.is_empty() {
+            return Err("a contour needs a name".to_string());
+        }
+        if pixels.is_empty() || pixels.iter().flatten().any(|v| !v.is_finite()) {
+            return Err(format!(
+                "contour {name:?} in '{view_id}' is empty or not finite"
+            ));
+        }
+        let obs = view.observations.get_or_insert_with(Observations::default);
+        obs.contours.retain(|c| c.name != name);
+        obs.contours.push(ContourObs {
+            name: name.to_string(),
+            pixels,
+        });
+        Ok(())
+    }
+
+    /// Every feature pick by name: `(view id, pixel, role)` in view order.
+    pub fn picks(&self) -> std::collections::BTreeMap<String, Vec<(String, [f64; 2], PickRole)>> {
+        let mut out: std::collections::BTreeMap<String, Vec<(String, [f64; 2], PickRole)>> =
+            Default::default();
+        for view in &self.views {
+            let Some(obs) = &view.observations else {
+                continue;
+            };
+            for f in &obs.features {
+                out.entry(f.name.clone())
+                    .or_default()
+                    .push((view.id.clone(), f.pixel, f.role));
+            }
+        }
+        out
+    }
+
+    /// Every contour by name: `(view id, pixels)` in view order.
+    pub fn contours(&self) -> std::collections::BTreeMap<String, Vec<(String, Vec<[f64; 2]>)>> {
+        let mut out: std::collections::BTreeMap<String, Vec<(String, Vec<[f64; 2]>)>> =
+            Default::default();
+        for view in &self.views {
+            let Some(obs) = &view.observations else {
+                continue;
+            };
+            for c in &obs.contours {
+                out.entry(c.name.clone())
+                    .or_default()
+                    .push((view.id.clone(), c.pixels.clone()));
+            }
+        }
+        out
+    }
 }
 
 impl Default for ViewSet {
@@ -520,6 +653,42 @@ impl ViewSet {
                     return Err(format!(
                         "view {:?}: marker {} observation is not finite",
                         view.id, m.id
+                    ));
+                }
+            }
+            let mut names = std::collections::HashSet::new();
+            for f in &obs.features {
+                if f.name.is_empty() {
+                    return Err(format!("view {:?}: a feature pick has no name", view.id));
+                }
+                if !names.insert(f.name.as_str()) {
+                    return Err(format!(
+                        "view {:?}: feature {:?} is picked twice",
+                        view.id, f.name
+                    ));
+                }
+                if f.pixel.iter().any(|v| !v.is_finite()) {
+                    return Err(format!(
+                        "view {:?}: feature {:?} pick is not finite",
+                        view.id, f.name
+                    ));
+                }
+            }
+            let mut names = std::collections::HashSet::new();
+            for c in &obs.contours {
+                if c.name.is_empty() {
+                    return Err(format!("view {:?}: a contour has no name", view.id));
+                }
+                if !names.insert(c.name.as_str()) {
+                    return Err(format!(
+                        "view {:?}: contour {:?} is traced twice",
+                        view.id, c.name
+                    ));
+                }
+                if c.pixels.is_empty() || c.pixels.iter().flatten().any(|v| !v.is_finite()) {
+                    return Err(format!(
+                        "view {:?}: contour {:?} is empty or not finite",
+                        view.id, c.name
                     ));
                 }
             }
@@ -872,6 +1041,69 @@ pub fn decode_viewset(bytes: &[u8]) -> Result<ViewSet, String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn picks_and_contours_round_trip_and_validate() {
+        let mut set = ViewSet {
+            cameras: vec![CameraModel::pinhole(4, 4, 2.0, 2.0, 2.0, 2.0)],
+            ..ViewSet::default()
+        };
+        set.views.push(View::unposed("a", 0));
+        set.views.push(View::unposed("b", 0));
+        set.record_pick("a", "hole", [1.0, 2.0], PickRole::Fit)
+            .unwrap();
+        set.record_pick("b", "hole", [3.0, 4.0], PickRole::Check)
+            .unwrap();
+        set.record_pick("a", "hole", [1.5, 2.0], PickRole::Fit)
+            .unwrap(); // replaces
+        set.record_contour("a", "rim", vec![[0.0, 0.0], [1.0, 0.0]])
+            .unwrap();
+        assert!(
+            set.record_pick("c", "hole", [0.0, 0.0], PickRole::Fit)
+                .is_err()
+        );
+        assert!(set.record_pick("a", "", [0.0, 0.0], PickRole::Fit).is_err());
+        assert!(
+            set.record_pick("a", "x", [f64::NAN, 0.0], PickRole::Fit)
+                .is_err()
+        );
+        assert!(set.record_contour("a", "rim", vec![]).is_err());
+        let picks = set.picks();
+        assert_eq!(
+            picks["hole"],
+            vec![
+                ("a".to_string(), [1.5, 2.0], PickRole::Fit),
+                ("b".to_string(), [3.0, 4.0], PickRole::Check)
+            ]
+        );
+        assert_eq!(set.contours()["rim"][0].1.len(), 2);
+        let again = decode_viewset(&encode_viewset(&set)).unwrap();
+        assert_eq!(again.picks(), picks);
+        // A duplicate name in one view is refused by validation.
+        let mut bad = set.clone();
+        bad.views[0]
+            .observations
+            .as_mut()
+            .unwrap()
+            .features
+            .push(FeatureObs {
+                name: "hole".to_string(),
+                pixel: [0.0, 0.0],
+                role: PickRole::Fit,
+            });
+        assert!(bad.validate().unwrap_err().contains("picked twice"));
+        // A set without the fields still decodes (they default empty).
+        let plain = ViewSet {
+            cameras: vec![CameraModel::pinhole(4, 4, 2.0, 2.0, 2.0, 2.0)],
+            ..ViewSet::default()
+        };
+        assert!(
+            decode_viewset(&encode_viewset(&plain))
+                .unwrap()
+                .picks()
+                .is_empty()
+        );
+    }
+
     fn identity_pose() -> [f64; 12] {
         [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]
     }
@@ -1091,6 +1323,8 @@ mod tests {
                 fit_px: 0.3,
             }],
             blur_px: Some(1.2),
+            features: Vec::new(),
+            contours: Vec::new(),
         });
         let back = decode_viewset(&encode_viewset(&set)).unwrap();
         assert_eq!(back, set);

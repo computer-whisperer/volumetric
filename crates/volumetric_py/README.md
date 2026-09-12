@@ -78,6 +78,15 @@ point, gaps = views.triangulate({"DSC00755": (3728, 919), "DSC00758": (2513, 201
 values = asset.sample(points); inside = asset.occupied(points); lo, hi = asset.bounds()  # a Model, in process
 ```
 
+Picks live with the photograph they were made in, not in a script's
+JSON: `views.with_picks({name: {view: (u, v)}}, check={...})` records
+them on the views (`picks()` reads them back, `with_contours` /
+`contours()` for traced rims), and `views.fit_picks()` triangulates every
+recorded feature, reporting each fit pick's ray miss and each check
+pick's reprojection error. Picks survive `encode`, `select` and
+`detect`; the CLI records them with `view-pick --record NAME [--check]`
+and fits them with `view-triangulate --all-features`.
+
 These are the calls behind `view-pick`, `view-triangulate` and `sample`
 (`view_core::measure`), so a script that shelled out per feature can loop
 in Python instead. `examples/chair_photo`'s committed measurement replays
