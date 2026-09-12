@@ -22,7 +22,7 @@ geometry and motion are assumptions until observed.
 ## Replay
 
 From the repository root, with Rust's `wasm32-unknown-unknown` target and
-Python with NumPy and SciPy installed:
+Python 3.11 or newer with NumPy and SciPy installed:
 
 ```sh
 cargo build --release --target wasm32-unknown-unknown \
@@ -163,5 +163,9 @@ and exact contact surfaces remain unresolved.
 - Browser GUI check: `cargo check -p volumetric_ui_v2 --target
   wasm32-unknown-unknown --no-default-features --features web` passes.
 - Full workspace tests were run; the metadata failure above prevents an
-  all-green result. Sandbox-only localhost binding failures are checked
-  separately with host networking. Logs are retained under `work/`.
+  all-green result. The sandbox run also encountered localhost binding
+  failures, the software-GPU failure above, and a UI worker stack overflow.
+  All nine daemon integration tests, the complete UI target (146 tests),
+  and the renderer regression pass with host networking/GPU access.
+  The stack overflow did not reproduce in that UI rerun; its cause is
+  unresolved. Logs are retained under `work/`.
