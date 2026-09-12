@@ -956,12 +956,8 @@ impl ViewportRenderer {
                 .get(id)
                 .is_none_or(|resident| resident.revision != revision)
             {
-                let (scene, part_keys) = Self::retained_scene_for(
-                    &self.renderer,
-                    &mut self.part_meshes,
-                    device,
-                    entity,
-                );
+                let (scene, part_keys) =
+                    Self::retained_scene_for(&self.renderer, &mut self.part_meshes, device, entity);
                 self.resident.insert(
                     id.to_string(),
                     ResidentEntity {
