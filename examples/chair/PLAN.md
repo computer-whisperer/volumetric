@@ -165,3 +165,30 @@ undersides are missing and every "bottom" below is a silhouette.
   5 mm): the boxes are crude, the levers, knob and bracket ends are
   absent; it is the next target, then the casters (bodies and hoods,
   wheels at r 0.36).
+- 2026-09-12: the full-set cloud `runs/chairbase-dslr-1-all-refuse/
+  cloud.ply` (2 367 623 points, 192 stills) against the same base. Its
+  base surfaces read the same as refuse2's (the arm slab sections are
+  indistinguishable; the column median 1.8 against 1.7 mm) but it carries
+  far more room: carpet fuzz to 60 mm high inside the base's box, mounds
+  at the box corners, floor patches. With the zones on the carpet the
+  arms' 5 mm band read 0.58 against refuse2's 0.70 for that reason alone.
+  Zones now start above the carpet (arms from z 0.04, column from 0.12)
+  and a shell zone (points within 30 mm of the model, by `offset`) gives
+  the number for the modelled parts on either cloud. The arm slab at
+  ±10 mm shows the arm within 5 mm along its length, 3 mm small around
+  r 0.15–0.20, and the model beyond the cloud over the last 60 mm to the
+  socket (the tip dips too early); the caster hoods are not in the model.
+  With the arms zone above the sockets (z 0.08) and the casters in a
+  zone of their own, fraction within 5 / 10 / 20 mm and median:
+
+  | zone | refuse2 | all-refuse |
+  |---|---|---|
+  | arms | 0.75 / 0.98 / 1.00, 2.8 mm (99 048) | 0.66 / 0.92 / 0.97, 3.4 mm (179 947) |
+  | column | 0.90 / 1.00 / 1.00, 1.7 mm | 0.85 / 0.98 / 1.00, 1.8 mm |
+  | mechanism | 0.35 / 0.49 / 0.67, 10.7 mm | 0.25 / 0.41 / 0.63, 14.2 mm |
+  | casters | 0.16 / 0.27 / 0.52, 19.2 mm | 0.15 / 0.25 / 0.39, 29.7 mm |
+
+  The arms and column are right to a cell on both clouds; the full-set
+  cloud carries nearly twice the points in the arm zone (haze along the
+  arms and carpet near the sockets), which is its extra residual. The
+  casters and the mechanism are the model's remaining errors.
