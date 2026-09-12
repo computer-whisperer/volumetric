@@ -283,7 +283,7 @@ variant and everything downstream, which only calls `pose` and
 
 ## Ledger
 
-- 2026-09-12: ratified; P1 landed 203fbca; P2 landed 79367af; P3 landed (commit below).
+- 2026-09-12: ratified; P1 landed 203fbca; P2 landed 79367af; P3 landed 4f78e4d.
 - 2026-09-12: the viewport never requested an Assembly (its request
   filter kept its own kind list): fixed f5a53ad, the three copies of the
   list collapsed onto `runtime_asset_is_renderable`, pinned by a test.
