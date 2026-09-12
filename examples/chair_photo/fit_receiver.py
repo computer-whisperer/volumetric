@@ -23,6 +23,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--work', type=Path, default=HERE/'work')
     parser.add_argument('--audit', action='store_true', help='Write original-pixel crops with observed and projected mouth samples')
+    parser.add_argument('--backend', choices=['cli', 'python'], default='cli')
+    parser.add_argument('--views', type=Path, help='Annotated view set; Python backend reads its receiver_mouth contour')
+    parser.add_argument('--output', type=Path, help='Report destination (default: work/receiver-fit.json)')
     args = parser.parse_args()
     work = args.work.resolve()
     report = json.loads((work/'measurements.json').read_text())
@@ -30,6 +33,13 @@ def main():
     origin = np.array(report['frame']['origin'])
     basis = np.array(report['frame']['basis'])
     survey = work/'survey.vviews'
+    if args.views and args.backend != 'python':
+        parser.error('--views requires --backend python')
+    if args.backend == 'python':
+        import volumetric as v
+        native_views = v.ViewSet.load(str(args.views or survey))
+        if args.views:
+            observations['contours'] = native_views.contours()['receiver_mouth']
 
     def geometry(p):
         # Fit variables: center (mm), extrinsic XYZ rotations (degrees),
@@ -40,6 +50,10 @@ def main():
 
     def samples(p, view):
         center, axes = geometry(p)
+        if args.backend == 'python':
+            points, _ = native_views.view(view).cast(
+                np.array(observations['contours'][view], dtype=float), plane=(center, axes[2]))
+            return (points-center) @ axes[:2].T * 1000
         call = ['view-pick','-i',survey,'--view',view,'--plane-point',vector(center),
                 '--plane-normal',vector(axes[2]),'--json']
         for pixel in observations['contours'][view]:
@@ -86,7 +100,7 @@ def main():
         'limitations':'Residuals are distances on the fitted rim plane, not accuracy bounds. Manual traces share camera calibration. Opening below lead-in and insertion depth are not measured by this fit.',
         'optimizer':{'evaluations':result.nfev,'message':result.message,'radius_at_capsule_bound':bool(p[8]>.999)},
         'profile_note':'Rounded rectangle fit reaches capsule limit when radius_at_capsule_bound is true; radius is then constrained rather than independently resolved. The mouth normal does not prove insertion direction.'}
-    (work/'receiver-fit.json').write_text(json.dumps(output,indent=2)+'\n')
+    (args.output or work/'receiver-fit.json').write_text(json.dumps(output,indent=2)+'\n')
     print(json.dumps({k:v for k,v in output.items() if k not in ['residuals','world_frame']},indent=2))
     print({v:{k:r[k] for k in ['rms_mm','max_abs_mm']} for v,r in stats.items()})
     if args.audit:
@@ -99,7 +113,7 @@ def main():
         for view in observations['fit_views']+observations['check_views']:
             pixels=observations['contours'][view]
             extent=np.ptp(pixels,axis=0)+140
-            command=['view-crop','-i',survey,'--view',view,'--center',vector(np.mean(pixels,axis=0)),
+            command=['view-crop','-i',args.views or survey,'--view',view,'--center',vector(np.mean(pixels,axis=0)),
                      '--size',f'{int(extent[0])}x{int(extent[1])}','--scale','2','--grid','0',
                      '-o',work/f'rim-audit-{view}.png']
             for pixel in pixels: command+=['--mark',vector(pixel)]

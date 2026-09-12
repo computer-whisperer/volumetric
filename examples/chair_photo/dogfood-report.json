@@ -1,0 +1,36 @@
+{
+  "feature_delta_mm": {
+    "cross_a": 6.895602406260462e-12,
+    "cross_a_inner": 2.0206364052201327e-13,
+    "cross_b": 5.068034343838441e-12,
+    "cross_b_inner": 1.7111937024914371e-12,
+    "rail_a": 4.644396126208126e-13,
+    "rail_b": 1.5641935306571066e-12
+  },
+  "feature_fit_seconds": 0.0002028099843300879,
+  "check_errors_px": {
+    "cross_a": 6.748277481411436,
+    "cross_a_inner": 3.1103455952291656,
+    "cross_b": 3.306394277783053,
+    "cross_b_inner": 3.1747168075342174,
+    "rail_a": 2.8839703831233185,
+    "rail_b": 3.825448961094699
+  },
+  "check_note": "Check views are excluded from feature triangulation, but participate in the shared camera survey. Their predicted positions were inspected during picking; this is an additional-view consistency check, not blind validation.",
+  "contour_roles": "Fit/check membership remains in receiver-observations.json; ViewSet contours do not encode roles.",
+  "receiver_python_seconds": 0.5275480090058409,
+  "receiver_cli_seconds": 10.428297553036828,
+  "receiver_reference": "fresh CLI fit",
+  "receiver_delta_mm": {
+    "mouth_width_mm": 1.7408297026122455e-12,
+    "mouth_depth_mm": 9.841016890277388e-13,
+    "mouth_corner_radius_mm": 4.920508445138694e-13
+  },
+  "receiver_center_delta_mm": 1.0680812026337955e-12,
+  "wgsl_parameter_edit_limitation": "wgsl_script_operator declares no configuration input",
+  "project_run_seconds": 0.4531406000023708,
+  "void_audit": "16 solids x 10 void probes clear; receiver walls and column positive controls pass",
+  "receiver_world_origin_delta_mm": 1.1253850591815437e-12,
+  "receiver_basis_max_delta": 2.9745650387269507e-13,
+  "timing_note": "First paired run, including subprocess startup; single observation, not a controlled benchmark."
+}

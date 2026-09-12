@@ -278,3 +278,10 @@ receiver, assembly measurements, and routed model parameters.
   the existing `operator_metadata` strict-bound parser failure remains.
   The earlier UI stack overflow did not recur in this run. Logs and all
   diagnostic images remain under the ignored `work/` directory.
+
+## Python workbench and persisted observations
+
+[The P1–P5 dogfood report](DOGFOOD.md) documents the in-process receiver fit,
+observation-bearing project, labelled lens-true overlays, reproduction command,
+and remaining workflow gaps. `dogfood.py` compares against this example's
+accepted geometry and writes separate artifacts under `work/dogfood/`.
