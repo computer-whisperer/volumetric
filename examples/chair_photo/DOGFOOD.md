@@ -92,5 +92,6 @@ using defaults for fields it does not populate.
 
 35 Python tests pass with host GPU access. The sandbox workspace run reached
 the daemon integration tests, where binding localhost ports was denied.
-The host rerun is recorded in work/workspace-tests-host.log; the sandbox log
-is work/workspace-tests.log. The change introduces no unrelated cleanup.
+`cargo test --workspace` passed with host access, including doctests. The host
+run is recorded in work/workspace-tests-host.log; the sandbox log is
+work/workspace-tests.log. The change introduces no unrelated cleanup.
