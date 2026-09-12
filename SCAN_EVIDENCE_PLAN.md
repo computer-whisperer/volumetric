@@ -887,6 +887,69 @@ overlay would otherwise fade them with the render), with the frame's
 clip planes reaching the picture plane. Open: labels by the crosses
 (the renderer draws no text), and recording picks from the GUI.
 
+P4 — lens-true look-through (proposed 2026-09-12, not yet ratified).
+Today the photograph is bent to the render: `rectify_photo` resamples
+it into the camera's ideal pinhole and the GUI, the CLI overlay and the
+Python `render` all show that resampled picture. The proposal inverts
+it: the render is bent to the photograph, which is then shown as shot,
+at its own pixels. Why: picks, crops and every measurement are in the
+original pixels, so the picture on screen and the picture measured
+become the same one (recording a pick by clicking in the GUI then needs
+no un-rectifying of the click); a fisheye's corners stay on the picture
+instead of being cut by the one pinhole a rectified image must fit; and
+the resample of a 25-megapixel still on the CPU goes away.
+
+Mechanism: one post-process warp pass in `volumetric_renderer`. The
+frame is rendered as today through an ideal pinhole, into an internal
+colour texture instead of the target, at an *overscan* size: the pinhole
+frame that covers the undistorted image of the output's boundary (for
+the chair's DSLR, k1 = -0.147, the corners move 79 px on 6192, so the
+overscan is about 1.3% a side; pincushion needs none). A final
+full-screen pass writes the target: for each output pixel it looks up
+where that pixel's ray lands in the pinhole frame and samples the
+colour there bilinearly. Meshes, splats, grid, frustum and mark lines
+all pass through the same warp, so straight edges bend as the lens
+bends them, which per-vertex distortion in the vertex shaders could not
+do for long segments (grid lines, frustum edges, splat quads).
+
+The lens math stays in one place. The warp is a coarse grid of source
+coordinates (one sample every 16 output pixels, interpolated in the
+shader from a small `Rg32Float` texture with manual bilinear taps, since
+32-bit float textures are not filterable everywhere and 16-bit floats
+lose pixels at 6000 px), computed on the CPU by
+`CameraModel::undistort` in the ABI. The shader knows nothing of
+radial, tangential or Kannala-Brandt terms, and a future lens model
+works unchanged. Fisheye rays beyond about 76 degrees off axis (the
+`corner_at_depth` clamp) have no pinhole image: those output pixels
+take the background, and the note says so. A camera with
+`Distortion::None` gets no warp pass at all, so every existing render
+stays byte-identical.
+
+Where it goes: `volumetric_renderer::Warp { source, output, grid }` and
+a `WarpPipeline` (full-screen triangle, one bind group), an internal
+frame texture that the composite, splat and overlay passes target when
+a warp is set, the g-buffer sized to the source. `volumetric_preview`
+builds the warp: `ViewFrame` carries the `CameraModel`; `warp(width,
+height)` returns the overscan pinhole for the camera view and the grid,
+letterbox included (the GUI's `Contain` fit and the CLI's scaled frame
+are the same formula with a scale and an offset). The GUI session
+passes it with the look-through frame; the photo layer shows the
+decoded picture as is; `Offscreen::render_rgba` takes it and sizes the
+target to the output. `rectify_photo` and the "photograph rectified"
+note are deleted; the README's `--overlay` line changes to say the
+render is drawn through the lens.
+
+Verification: (1) a synthetic camera with k1 = -0.3 and a world square
+at a known pose, rendered as lines: each corner's pixel in the output
+matches `CameraModel::project` of the world corner within a pixel; (2)
+the chair verify renders and chair_photo overlays, whose cameras carry
+distortion, differ from today only by the lens bend, and a
+`Distortion::None` camera renders byte-identical; (3) through DSC00755
+with `--marks`, the card quads at the frame corners (79 px of lens
+shift) land on the card's printed edges in the untouched photograph.
+Cost: one extra full-screen pass and a slightly larger frame; nothing
+per vertex. Estimate one day.
+
 Tests (`crates/volumetric_py/tests`, pytest in the shim's venv): a
 cylinder built and run, its mesh bounds checked; a synthetic board
 rendered, detected and observed; a real chairbase still detected and
