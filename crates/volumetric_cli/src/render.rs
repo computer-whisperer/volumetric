@@ -709,7 +709,7 @@ fn report(id: &str, entity: &PreviewEntity) {
     }
 }
 
-fn parse_floats(s: &str, count: usize) -> Result<Vec<f32>> {
+pub(crate) fn parse_floats(s: &str, count: usize) -> Result<Vec<f32>> {
     let values: Vec<f32> = s
         .split(',')
         .map(|part| part.trim().parse::<f32>())

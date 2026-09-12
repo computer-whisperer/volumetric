@@ -80,6 +80,35 @@ undersides are missing and every "bottom" below is a silhouette.
   axis): rail u −0.07..0.23, v −0.017..0.043; bracket at u ≈ −0.075, 230
   long, ≈ 30 wide, top at 0.456 (photograph DSC00742 for the bracket);
   two levers on bellows stalks and a tension knob not modelled.
+- Mechanism, second pass (the mounting features, from the photographs).
+  Frame: u along the rail (50.4° in the world), v across to the left, w
+  up, origin on the lift axis at z 0.456. Hole centres read on
+  magnified crops of DSC00742 and DSC00760 and triangulated (rays meet
+  within 0.6 mm; the picture scale at the mechanism is 0.136 mm per
+  pixel):
+
+  | feature | u | v | w | size |
+  |---|---|---|---|---|
+  | bracket slot A (+v end tab) | −51.0 | +104.6 | +7.8 | 10 × 12.5 along v |
+  | bracket hole 1 | −52.7 | +53.1 | (+6.9) | Ø8 |
+  | bracket hole 2 | −54.0 | −56.8 | (+6.9) | Ø8 |
+  | bracket slot B (−v end tab) | −54.5 | −108.9 | +5.5 | 10 × 12.5 along v |
+  | rail slot, +v | +121.3 | +11.0 | −1.9 | 18 × 8 along u |
+  | rail slot, −v | +121.0 | −18.4 | −2.0 | 18 × 8 along u |
+  | dimple A (not a hole) | +45.8 | −2.8 | −3.3 at the bottom | Ø14 |
+  | dimple B (not a hole) | +99.4 | −5.0 | −2.6 at the bottom | Ø14 |
+
+  All in millimetres. Surfaces from plane fits on clipped patches of the
+  refuse2 cloud (0.8–1.1 mm rms): the bracket's middle is level, top at
+  w +6.9, 26 wide at u −51.5 and skewed −1.0°; its end tabs are formed,
+  A rising 3.4° outward from a crease at v +85, B stepping down 2.5 mm at
+  v −88 and rising 6.7°. The rail's flat top is 50 wide (v −23..+27),
+  from u −33 to +187, level: the two slots triangulate to one height, and
+  the 3.65° cross tilt the top-face fits showed came from the dimples and
+  the folds (the rail-top patches disagreed with each other by 2–3 mm).
+  Triangulated hole "centres" sit a millimetre or two below the surface
+  (the far inner edge is what one sees), so heights of surfaces come from
+  the patch fits and positions from the triangulations.
 
 ## Gaps
 
@@ -92,6 +121,7 @@ undersides are missing and every "bottom" below is a silhouette.
 | 7 | V | `render --through` ignores the surveyed lens distortion (k1 −0.147, k2 0.255 on the a6700 at 50 mm), so an overlay is a few pixels off away from the centre at 1548 px wide | open: warp the render through the camera's distortion, or undistort the photograph once at import |
 | 8 | V | No numeric cloud-to-model residual: an operator can sample only occupancy, not a model's channels, so the SDF operator's distance could not be read at the cloud's points | `cloud_distance` operator: bakes a signed distance lattice from occupancy (exact EDT in cloud_core), reads it at every node as the `distance` field, F64Map summary with band fractions; `audit.sh` |
 | 9 | V | The field colormap spans the data's range, so one unmodelled part (a lever 180 mm out) hides every other residual | `render --color-range lo,hi`, a clamped span carried in the preview plan (the GUI's control is still to come) |
+| 10 | M | A bolt hole is crisp in a photograph and blurred to nothing in the cloud, and nothing let an agent read a picture at full resolution with coordinates, or turn a pixel into a world point | `view-crop` (magnified crop with a pixel grid, crosses at pixels and at projected world points), `view-pick` (pixels cast onto a plane, world points into pixels, results in a frame's chart, distortion honoured), `view-triangulate` (a feature picked in two or more views, with each ray's miss distance) |
 | 3 | B | Operators without READMEs: cylinder, revolve, extrude, subspace, sweep, slice, model_bound, mesh_to_model | write as each is used |
 | 4 | B | No path sweep (a tube along a curve): the arms need one | two-view intersection (toy car) or an SDF script; decide in B |
 
@@ -192,3 +222,19 @@ undersides are missing and every "bottom" below is a silhouette.
   cloud carries nearly twice the points in the arm zone (haze along the
   arms and carpet near the sockets), which is its extra residual. The
   casters and the mechanism are the model's remaining errors.
+- 2026-09-12: the mechanism rebuilt around its mounting features (user:
+  the dimples are not through-holes; the four bracket holes and the two
+  rail slots are the real ones). Measured with the new `view-crop`,
+  `view-pick` and `view-triangulate` (gap 10) and patch fits, table in
+  Measurements. Every feature projected back into DSC00760 lands inside
+  its hole. Two wrong turns on the way, both caught by the tools: the
+  first hole sizes assumed 0.2 mm per pixel where the picture is 0.136
+  at this depth (fixed from the triangulated depth); the first heights
+  came from casting onto the whole top's fitted plane, whose 3.45° tilt
+  was the bracket's end tabs and the dimples, and the oblique view showed
+  slot B 6 mm off until the features were triangulated instead.
+  Mechanism zone within 5 / 10 / 20 mm: 0.35 / 0.49 / 0.67 (boxes) →
+  0.55 / 0.63 / 0.70, median 10.7 → 3.4 mm; the rest of that zone is the
+  levers, the knob and the rail's internals, none of them mating
+  surfaces. Not modelled on purpose: the rail's internal parts, the lever
+  stalks, the knob, the bracket's underside.

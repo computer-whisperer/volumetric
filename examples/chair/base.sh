@@ -28,6 +28,7 @@ op() { $V project-add-op --project $P "$@" >/dev/null; }
 PLANE='json:{"kind":"plane"}'
 UNION='json:{"op":"union"}'
 ISECT='json:{"op":"intersect"}'
+SUB='json:{"op":"subtract"}'
 
 # --- Hub and gas lift: one section revolved about z (sketch x = radius,
 # sketch y = height). Hub r 54 from z 133 to 170 with a chamfer to the
@@ -62,15 +63,61 @@ op --operator cylinder_operator --input 'json:{"radius":0.0325}' --input 'json:[
 op --operator boolean_operator --input asset:arm_round --input asset:stem --input asset:wheel --input "$UNION" --output-id arm --no-export
 op --operator pattern_operator --input asset:arm --input 'json:{"circular":{"count":5,"axis":"z"}}' --output-id arms --no-export
 
-# --- Tilt mechanism as two boxes in its rail frame (u along the rail,
-# v across, origin on the lift axis), then turned to the rail's azimuth of
-# 60.8 deg in the base frame (50.4 in the world, from a line fit to the
-# top faces): rail 300 x 60 x 46 with the lift under its first quarter,
-# top at 456; the seat bracket 30 x 230 x 8 across its near end.
-op --operator rectangular_prism_operator --input 'json:{}' --input 'json:[-0.07,-0.017,0.41]' --input 'json:[0.23,0.043,0.456]' --output-id rail_box --no-export
-op --operator rectangular_prism_operator --input 'json:{}' --input 'json:[-0.09,-0.115,0.448]' --input 'json:[-0.06,0.115,0.456]' --output-id bar_box --no-export
-op --operator boolean_operator --input asset:rail_box --input asset:bar_box --input "$UNION" --output-id mechanism_u --no-export
-op --operator pose_operator --input asset:mechanism_u --input 'json:{"rotate":{"rz_deg":60.8}}' --output-id mechanism --no-export
+# --- Tilt mechanism, built in its own frame (u along the rail, v across
+# to the left, w up; origin on the lift axis at z 0.456) from the
+# photographs: hole centres triangulated from DSC00742 and DSC00760 (rays
+# meet within 0.6 mm), surfaces from plane fits on clipped patches of the
+# refuse2 cloud (PLAN.md). The rail's flat top is 50 wide from u -33 to
+# +187 with the lever housing to 232, level: the two slots triangulate to
+# one height, and the 3.65 deg the cloud's top-face fit showed was the
+# dimples and the folds. Two dimples (14 wide,
+# 3.5 deep, not through) at (46, -3) and (99, -5), and two 18 x 8
+# mounting slots along the rail at u 121, v +11 and v -18. The seat
+# bracket is a level 26 x 236 bar at u -51.5, skewed -1 deg, top 6.9 mm
+# above the origin, with an 8 hole 53 and 57 mm each side and a formed
+# end tab each side carrying a 10 x 12.5 slot: tab A (+v) rises 3.4 deg
+# from a crease at v 85, tab B (-v) steps down 2.5 mm at v -88 and rises
+# 6.7 deg. The frame sits at 60.8 deg in the base frame.
+op --operator rectangular_prism_operator --input 'json:{}' --input 'json:[-0.033,-0.023,-0.046]' --input 'json:[0.187,0.027,0.0]' --output-id rail_body --no-export
+op --operator rectangular_prism_operator --input 'json:{}' --input 'json:[0.187,-0.030,-0.046]' --input 'json:[0.232,0.030,0.0]' --output-id rail_housing --no-export
+RECESS='json:{"radius":0.0068}'
+op --operator cylinder_operator --input "$RECESS" --input 'json:[0.0458,-0.0028,-0.0035]' --input 'json:[0.0458,-0.0028,0.02]' --output-id rail_recess_a --no-export
+op --operator cylinder_operator --input "$RECESS" --input 'json:[0.0994,-0.0050,-0.0035]' --input 'json:[0.0994,-0.0050,0.02]' --output-id rail_recess_b --no-export
+# The slots: 18 x 8 stadiums along u, through the top.
+RSLOT='json:{"radius":0.004}'
+op --operator cylinder_operator --input "$RSLOT" --input 'json:[0.1163,0.0110,-0.05]' --input 'json:[0.1163,0.0110,0.02]' --output-id rslot_a1 --no-export
+op --operator cylinder_operator --input "$RSLOT" --input 'json:[0.1263,0.0110,-0.05]' --input 'json:[0.1263,0.0110,0.02]' --output-id rslot_a2 --no-export
+op --operator rectangular_prism_operator --input 'json:{}' --input 'json:[0.1163,0.0070,-0.05]' --input 'json:[0.1263,0.0150,0.02]' --output-id rslot_a3 --no-export
+op --operator cylinder_operator --input "$RSLOT" --input 'json:[0.1160,-0.0184,-0.05]' --input 'json:[0.1160,-0.0184,0.02]' --output-id rslot_b1 --no-export
+op --operator cylinder_operator --input "$RSLOT" --input 'json:[0.1260,-0.0184,-0.05]' --input 'json:[0.1260,-0.0184,0.02]' --output-id rslot_b2 --no-export
+op --operator rectangular_prism_operator --input 'json:{}' --input 'json:[0.1160,-0.0224,-0.05]' --input 'json:[0.1260,-0.0144,0.02]' --output-id rslot_b3 --no-export
+op --operator boolean_operator --input asset:rail_body --input asset:rail_housing --input "$UNION" --output-id rail_solid --no-export
+op --operator boolean_operator --input asset:rail_solid --input asset:rail_recess_a --input asset:rail_recess_b --input asset:rslot_a1 --input asset:rslot_a2 --input asset:rslot_a3 --input asset:rslot_b1 --input asset:rslot_b2 --input asset:rslot_b3 --input "$SUB" --output-id rail_flat --no-export
+op --operator pose_operator --input asset:rail_flat --input 'json:{}' --output-id rail --no-export
+# The bracket, built on its own centreline (u = 0, top at w 0) then
+# skewed and moved to u -51.5, top to +6.9. 4 mm plate.
+op --operator rectangular_prism_operator --input 'json:{}' --input 'json:[-0.013,-0.085,-0.004]' --input 'json:[0.013,0.085,0.0]' --output-id bar_mid --no-export
+op --operator rectangular_prism_operator --input 'json:{}' --input 'json:[-0.013,0.085,-0.004]' --input 'json:[0.013,0.118,0.0]' --output-id tab_a_flat --no-export
+op --operator pose_operator --input asset:tab_a_flat --input 'json:{"pivot":{"at":"point","px":0.0,"py":0.085,"pz":0.0},"rotate":{"rx_deg":3.4}}' --output-id tab_a --no-export
+op --operator rectangular_prism_operator --input 'json:{}' --input 'json:[-0.013,-0.118,-0.0065]' --input 'json:[0.013,-0.085,-0.0025]' --output-id tab_b_flat --no-export
+op --operator pose_operator --input asset:tab_b_flat --input 'json:{"pivot":{"at":"point","px":0.0,"py":-0.088,"pz":-0.0025},"rotate":{"rx_deg":-6.7}}' --output-id tab_b --no-export
+op --operator boolean_operator --input asset:bar_mid --input asset:tab_a --input asset:tab_b --input "$UNION" --output-id bar_body --no-export
+SLOT_END='json:{"radius":0.005}'
+HOLE8='json:{"radius":0.004}'
+# Slot A centred (0.0005, 0.1046) in the bar's frame (skew removed), B at
+# (-0.0030, -0.1089): 10 x 12.5, the long way along v.
+op --operator cylinder_operator --input "$SLOT_END" --input 'json:[0.0005,0.10335,-0.03]' --input 'json:[0.0005,0.10335,0.03]' --output-id slot_a1 --no-export
+op --operator cylinder_operator --input "$SLOT_END" --input 'json:[0.0005,0.10585,-0.03]' --input 'json:[0.0005,0.10585,0.03]' --output-id slot_a2 --no-export
+op --operator rectangular_prism_operator --input 'json:{}' --input 'json:[-0.0045,0.10335,-0.03]' --input 'json:[0.0055,0.10585,0.03]' --output-id slot_a3 --no-export
+op --operator cylinder_operator --input "$SLOT_END" --input 'json:[-0.003,-0.10765,-0.03]' --input 'json:[-0.003,-0.10765,0.03]' --output-id slot_b1 --no-export
+op --operator cylinder_operator --input "$SLOT_END" --input 'json:[-0.003,-0.11015,-0.03]' --input 'json:[-0.003,-0.11015,0.03]' --output-id slot_b2 --no-export
+op --operator rectangular_prism_operator --input 'json:{}' --input 'json:[-0.008,-0.11015,-0.03]' --input 'json:[0.002,-0.10765,0.03]' --output-id slot_b3 --no-export
+op --operator cylinder_operator --input "$HOLE8" --input 'json:[-0.0012,0.0531,-0.03]' --input 'json:[-0.0012,0.0531,0.03]' --output-id bar_hole_a --no-export
+op --operator cylinder_operator --input "$HOLE8" --input 'json:[-0.0025,-0.0568,-0.03]' --input 'json:[-0.0025,-0.0568,0.03]' --output-id bar_hole_b --no-export
+op --operator boolean_operator --input asset:bar_body --input asset:slot_a1 --input asset:slot_a2 --input asset:slot_a3 --input asset:slot_b1 --input asset:slot_b2 --input asset:slot_b3 --input asset:bar_hole_a --input asset:bar_hole_b --input "$SUB" --output-id bar_cut --no-export
+op --operator pose_operator --input asset:bar_cut --input 'json:{"rotate":{"rz_deg":-1.0},"translate":{"dx":-0.0515,"dz":0.0069}}' --output-id bracket --no-export
+op --operator boolean_operator --input asset:rail --input asset:bracket --input "$UNION" --output-id mechanism_u --no-export
+op --operator pose_operator --input asset:mechanism_u --input 'json:{"rotate":{"rz_deg":60.8},"translate":{"dz":0.456}}' --output-id mechanism --no-export
 
 # --- Assembly, and the same posed into the scan's frame: arm 0 sits at
 # azimuth -10.4 deg, the lift axis at (0.2569, 0.1509).

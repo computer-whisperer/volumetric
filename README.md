@@ -280,6 +280,22 @@ volumetric_cli view-select -i survey.vviews -p chair.vproj --id DSC00730 --id DS
 # What a set holds
 volumetric_cli view-list -i chair.vproj [--asset views] [--json]
 
+# A detail of a view's original picture, magnified with a pixel grid whose
+# coordinates are printed, crosses at pixels and at world points projected
+# through the camera (the check that a modelled feature sits on the real one)
+volumetric_cli view-crop -i chair.vproj --view DSC00742 --center 3300,1900 --size 600x400     --scale 3 --grid 50 [--mark u,v] [--mark-world x,y,z] -o detail.png
+
+# Pixels cast onto a plane as world points (a horizontal plane, a project's
+# fitted plane, or a point and normal), and world points into pixels, with
+# the lens distortion honoured; --frame gives the results in a plane's or
+# frame's own chart
+volumetric_cli view-pick -i chair.vproj --view DSC00742 --pixel 3310,1905 --pixel 3560,1890     --plane top_face [--plane-z 0.456] [--frame rail_frame] [--point x,y,z] [--json]
+
+# The 3D point of a feature picked in two or more views, with each ray's
+# miss distance (a bolt hole seen from above and from the side, say)
+volumetric_cli view-triangulate -i chair.vproj --ray DSC00742:2478,3003 --ray DSC00760:3193,829 \
+    [--frame rail_frame] [--json]
+
 # How far the model's surface sits from each view's depth map: coverage,
 # median and p90 residual per view and pooled, with residual images
 volumetric_cli view-residual -p chair.vproj --model chair_solid -o residuals/ [--json]

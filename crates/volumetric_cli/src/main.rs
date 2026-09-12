@@ -31,6 +31,7 @@ mod assets;
 mod fea;
 mod info;
 mod observe;
+mod pick;
 mod project;
 mod raster;
 mod render;
@@ -109,6 +110,15 @@ enum Commands {
     /// Describe a view set: cameras, views, markers, provenance
     #[command(name = "view-list")]
     ViewList(views::ViewListArgs),
+    /// Write a magnified crop of a view's original picture with a pixel grid, to read a detail at full resolution
+    #[command(name = "view-crop")]
+    ViewCrop(pick::ViewCropArgs),
+    /// Cast pixels of a view onto a plane as world points, or project world points into the view, through the surveyed camera
+    #[command(name = "view-pick")]
+    ViewPick(pick::ViewPickArgs),
+    /// The 3D point a feature picked in two or more views sits at, from the surveyed cameras
+    #[command(name = "view-triangulate")]
+    ViewTriangulate(pick::ViewTriangulateArgs),
     /// Compare a model against the depth maps of a project's view set
     #[command(name = "view-residual")]
     ViewResidual(views::ViewResidualArgs),
@@ -592,6 +602,9 @@ fn main() -> Result<()> {
         Commands::ViewImport(args) => views::run_view_import(args),
         Commands::ViewSelect(args) => views::run_view_select(args),
         Commands::ViewList(args) => views::run_view_list(args),
+        Commands::ViewCrop(args) => pick::run_view_crop(args),
+        Commands::ViewPick(args) => pick::run_view_pick(args),
+        Commands::ViewTriangulate(args) => pick::run_view_triangulate(args),
         Commands::ViewResidual(args) => views::run_view_residual(args),
         Commands::ViewSolve(args) => solve::run_view_solve(args),
         Commands::ViewDetect(args) => observe::run_view_detect(args),

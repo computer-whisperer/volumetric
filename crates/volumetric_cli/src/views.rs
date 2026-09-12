@@ -497,7 +497,7 @@ pub(crate) fn find_viewset(assets: &[LoadedAsset], wanted: Option<&str>) -> Resu
     decode_viewset(asset.data()).map_err(|err| anyhow!("asset '{}': {err}", asset.id()))
 }
 
-fn load_viewset(input: &Path, asset: Option<&str>) -> Result<ViewSet> {
+pub(crate) fn load_viewset(input: &Path, asset: Option<&str>) -> Result<ViewSet> {
     let extension = input
         .extension()
         .and_then(|e| e.to_str())

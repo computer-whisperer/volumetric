@@ -6066,6 +6066,7 @@ dependencies = [
  "base64",
  "ciborium",
  "clap",
+ "cloud_core",
  "cv_core",
  "fea_bundle",
  "glam 0.32.1",
