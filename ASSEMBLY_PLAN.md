@@ -285,7 +285,7 @@ variant and everything downstream, which only calls `pose` and
   own grid over its own bounds; fine at the default 64, several times the
   fused model's cost at 256).
 
-## Continuous joints (2026-09-12)
+## Continuous joints (2026-09-12, b7ac290)
 
 `Joint.continuous` (revolute only; validated), `Joint::has_range`,
 `Joint::wrap_degrees`; validation, `joint_values`, `parameter_specs` and
