@@ -366,3 +366,102 @@ pub fn find_function_export(wasm: &[u8], name: &str) -> Result<u32, String> {
     }
     Err(format!("module missing function export `{name}`"))
 }
+
+/// The constant a trivial `() -> i32` function export returns, when its
+/// body is a single `i32.const` (how every generator writes
+/// `get_dimensions`), or `None` when the function computes it. The module
+/// must import nothing, so the export index is the index into the code
+/// section.
+pub fn const_i32_export(wasm: &[u8], name: &str) -> Result<Option<i32>, String> {
+    let index = find_function_export(wasm, name)?;
+    let mut bodies = 0u32;
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        match payload.map_err(|e| e.to_string())? {
+            wasmparser::Payload::ImportSection(s) => {
+                if s.count() > 0 {
+                    return Err("Model must not import anything".to_string());
+                }
+            }
+            wasmparser::Payload::CodeSectionEntry(body) => {
+                if bodies == index {
+                    let mut ops = body.get_operators_reader().map_err(|e| e.to_string())?;
+                    let mut value = None;
+                    let mut count = 0;
+                    while !ops.eof() {
+                        count += 1;
+                        match (count, ops.read().map_err(|e| e.to_string())?) {
+                            (1, wasmparser::Operator::I32Const { value: v }) => value = Some(v),
+                            (2, wasmparser::Operator::End) => {}
+                            _ => return Ok(None),
+                        }
+                    }
+                    return Ok(if count == 2 { value } else { None });
+                }
+                bodies += 1;
+            }
+            _ => {}
+        }
+    }
+    Err(format!("module export `{name}` has no body"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_encoder::{
+        CodeSection, ExportKind, ExportSection, Function, FunctionSection, Instruction, Module,
+        TypeSection, ValType,
+    };
+
+    /// A module exporting `get_dimensions` with the given body, and a
+    /// second function `other` returning 7 first so the export index is
+    /// not zero.
+    fn module(body: &[Instruction<'_>]) -> Vec<u8> {
+        let mut types = TypeSection::new();
+        types.ty().function([], [ValType::I32]);
+        let mut funcs = FunctionSection::new();
+        funcs.function(0);
+        funcs.function(0);
+        let mut code = CodeSection::new();
+        let mut other = Function::new([]);
+        other.instruction(&Instruction::I32Const(7));
+        other.instruction(&Instruction::End);
+        code.function(&other);
+        let mut f = Function::new([]);
+        for instruction in body {
+            f.instruction(instruction);
+        }
+        f.instruction(&Instruction::End);
+        code.function(&f);
+        let mut exports = ExportSection::new();
+        exports.export("other", ExportKind::Func, 0);
+        exports.export("get_dimensions", ExportKind::Func, 1);
+        let mut module = Module::new();
+        module
+            .section(&types)
+            .section(&funcs)
+            .section(&exports)
+            .section(&code);
+        module.finish()
+    }
+
+    #[test]
+    fn constant_dimensions_are_read() {
+        let wasm = module(&[Instruction::I32Const(3)]);
+        assert_eq!(const_i32_export(&wasm, "get_dimensions"), Ok(Some(3)));
+        assert_eq!(const_i32_export(&wasm, "other"), Ok(Some(7)));
+    }
+
+    #[test]
+    fn computed_dimensions_are_none() {
+        let wasm = module(&[Instruction::Call(0)]);
+        assert_eq!(const_i32_export(&wasm, "get_dimensions"), Ok(None));
+        let wasm = module(&[
+            Instruction::I32Const(1),
+            Instruction::I32Const(2),
+            Instruction::I32Add,
+        ]);
+        assert_eq!(const_i32_export(&wasm, "get_dimensions"), Ok(None));
+        assert!(const_i32_export(&wasm, "missing").is_err());
+    }
+}

@@ -27,11 +27,11 @@ under `/ceph/christian/index_scanner`.
 
 | Step | What | Status |
 |---|---|---|
-| E | Evidence project: survey the stills here, import the splat as surfels, the TSDF cloud and the splat's points; check our frame against the trainer's | in progress |
-| L | Look: renders of the splat and cloud from canonical directions and through the photographs, enough to name every part and its rough size | pending |
-| M | Measure: ground plane, lift axis and radius, hub, arm count/length/rise, caster positions and wheel size, column heights, plate outline and hole pattern | pending |
-| B | Build: `examples/chair/base.sh` → `chair_base.vproj`, parts from the catalog (sketch, extrude, revolve, cylinder, booleans, offset) placed on the measured datums | pending |
-| V | Verify: model over the photographs through the surveyed views; point-to-model distances from the cloud; residuals recorded | pending |
+| E | Evidence project: survey the stills here, import the splat as surfels, the TSDF cloud and the splat's points; check our frame against the trainer's | done (`evidence.sh`; poses 0.33 mm median from the trainer's) |
+| L | Look: renders of the splat and cloud from canonical directions and through the photographs, enough to name every part and its rough size | done (presets, through-views, ortho slab sections) |
+| M | Measure: ground plane, lift axis and radius, hub, arm count/length/rise, caster positions and wheel size, column heights, plate outline and hole pattern | done except the bracket's hole pattern and the levers |
+| B | Build: `examples/chair/base.sh` → `chair_base.vproj`, parts from the catalog (sketch, extrude, revolve, cylinder, booleans, offset) placed on the measured datums | first version: column, five arms with casters, rail and bracket boxes |
+| V | Verify: model over the photographs through the surveyed views; point-to-model distances from the cloud; residuals recorded | first version: edge overlays through three views and sections over the cloud (`verify.sh`); numeric residuals pending |
 
 Gaps found on the way go in the table below, with the step that met them.
 Each is fixed in volumetric as a separate commit when it blocks; noted
@@ -69,17 +69,25 @@ undersides are missing and every "bottom" below is a silhouette.
 - Casters: wheel bodies z 0 to 0.073 (diameter ≈ 65–70 mm, swivelled, so
   the wheel centre sits 0.30–0.34 from the axis); lowest points −8 mm
   (carpet compression).
-- Mechanism (points above z 0.40): centre (0.297, 0.239), i.e. 65 mm from
-  the lift axis; a rail ≈ 310 mm long at 65.9° azimuth with holes and
-  slots along it, a cross bar with a bolt hole at each end, two levers on
-  bellows stalks and a tension knob (see `cb1/sec_top_plate_splat.png`).
+- Mechanism: the top faces selected with a box (rectangular_prism z
+  0.448–0.49 over the mechanism, `mesh_clip` keep inside, 43 363 points),
+  then `cloud_fit`: line (20 mm tolerance) → the rail's direction (0.638,
+  0.770), azimuth 50.4°, extent 303 mm, through (0.299, 0.222) at z 0.455,
+  18 091 inliers; plane (4 mm) → the top face at z 0.456, level to 1.6°,
+  33 068 inliers. (A first PCA over every point above z 0.40 said 65.9°;
+  the seat bracket across the rail's end biased it. Fit the feature, not
+  the cloud.) In the rail frame (u along, v across, origin on the lift
+  axis): rail u −0.07..0.23, v −0.017..0.043; bracket at u ≈ −0.075, 230
+  long, ≈ 30 wide, top at 0.456 (photograph DSC00742 for the bracket);
+  two levers on bellows stalks and a tension knob not modelled.
 
 ## Gaps
 
 | # | Met in | Gap | Fix |
 |---|---|---|---|
 | 1 | L | `render` presets and grid assume y up; a surveyed world is z up, so `top` gave an elevation | `--up`, defaulted from the drawn view set or splat |
-| 2 | L, M | No numeric probe of a cloud from the CLI: radial profile about an axis, azimuth histogram, wedge/slab percentiles, cluster centres; done with numpy on the PLY (oracle) | design after B, from the list of queries actually needed |
+| 2 | L, M | No numeric probe of a cloud from the CLI: radial profile about an axis, azimuth histogram, wedge/slab percentiles, cluster centres; done with numpy on the PLY (oracle). Region selection does exist: a box model + `mesh_clip` keeps the points inside, and `cloud_fit` on the selection gives lines, planes, cylinders with extents | design after B, from the list of queries actually needed |
+| 5 | B | `pattern` (and every wrapper reading dimensionality statically) refused a boolean's output: the glue passed `get_dimensions` through by a call | boolean emits the first model's constant (model_merge_core `const_i32_export`) |
 | 3 | B | Operators without READMEs: cylinder, revolve, extrude, subspace, sweep, slice, model_bound, mesh_to_model | write as each is used |
 | 4 | B | No path sweep (a tube along a curve): the arms need one | two-view intersection (toy car) or an SDF script; decide in B |
 
@@ -88,3 +96,13 @@ undersides are missing and every "bottom" below is a silhouette.
 - 2026-09-11: survey here of the 44 stills: all posed, 0.371 px rms, f
   6904.4 ± 1.1 px (the shim: 6904.4), card along span 179.32 mm against
   179.44 by caliper, planarity 0.030 mm.
+- 2026-09-11: `base.sh` first version (25 steps, 8.6 s): the edge overlay
+  through DSC00730/00742/00750 follows the arms, hub, lift and casters to
+  within a few pixels at 1548 px wide; the rail and bracket outlines sit
+  on the photograph's after the line fit replaced the PCA azimuth. Not
+  modelled: the caster hoods and swivel state, the levers and their
+  stalks, the tension knob, the rail's holes and slots, the bracket's
+  bolt holes. Next: the bracket's hole pattern (what the seat mounts to),
+  the underside of the arms (unseen by every camera; assume the tube
+  section symmetric about the visible top), numeric residuals cloud →
+  model.

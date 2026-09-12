@@ -20,7 +20,10 @@ model entries are skipped; the step fails when no model is wired.
 ## Bounds and dimensions
 
 The result's dimension count is the first model's; every input must agree
-(a 2D sketch unions with 2D sketches, a solid with solids). Bounds are the
+(a 2D sketch unions with 2D sketches, a solid with solids). When the first
+model states its count as a constant, so does the result, which is what
+Pattern, Pose, Extrude and the other wrappers read, so a boolean can sit
+anywhere in a chain. Bounds are the
 enclosure of every input for `union`, the intersection of every input's
 box for `intersect`, and the first model's box for `subtract`.
 

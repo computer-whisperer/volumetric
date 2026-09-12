@@ -8,7 +8,9 @@
 //! last input and every earlier non-empty input is a model.
 //!
 //! Generated Model ABI (N-dimensional), for models m_0 .. m_{k-1}:
-//! - `get_dimensions() -> u32`: passed through from m_0
+//! - `get_dimensions() -> u32`: m_0's constant when it has one (so the
+//!   wrappers that read dimensionality statically can follow a boolean),
+//!   else passed through from m_0
 //! - `get_io_ptr() -> i32`: passed through from m_0 (whose memory is the
 //!   exported one); every other model's buffer is obtained by calling its
 //!   own `get_io_ptr`
@@ -24,8 +26,8 @@
 use wasm_encoder::{BlockType, ExportKind, ExportSection, Function, Instruction, MemArg, ValType};
 
 use model_merge_core::{
-    MergeSections, ModelExports, OffsetReencoder, SectionCounts, count_sections,
-    parse_model_exports,
+    MergeSections, ModelExports, OffsetReencoder, SectionCounts, const_i32_export,
+    count_sections, parse_model_exports,
 };
 use volumetric_abi::host::{input_count, post_output, read_input, report_error};
 use volumetric_abi::{OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput};
@@ -96,6 +98,11 @@ struct Glue<'a> {
     first: &'a ModelExports,
     others: &'a [Part],
     op: BooleanOp,
+    /// The first model's dimensionality when its `get_dimensions` is a
+    /// constant, so the merged module's is one too and the wrappers that
+    /// read it statically (pattern, pose, extrude, ...) can follow a
+    /// boolean.
+    dims: Option<i32>,
 }
 
 impl Glue<'_> {
@@ -103,13 +110,17 @@ impl Glue<'_> {
         self.first.memory
     }
 
-    /// Emits `get_dimensions`, passed through from the first model.
+    /// Emits `get_dimensions`: the first model's constant when it has one
+    /// (so the result stays statically readable), else a call through.
     fn add_get_dimensions(&self, sections: &mut MergeSections, exports: &mut ExportSection) {
         let ty = sections.types.len();
         sections.types.ty().function([], [ValType::I32]);
         sections.funcs.function(ty);
         let mut f = Function::new([]);
-        f.instruction(&Instruction::Call(self.first.get_dimensions));
+        match self.dims {
+            Some(dims) => f.instruction(&Instruction::I32Const(dims)),
+            None => f.instruction(&Instruction::Call(self.first.get_dimensions)),
+        };
         f.instruction(&Instruction::End);
         sections.code.function(&f);
         exports.export("get_dimensions", ExportKind::Func, sections.funcs.len() - 1);
@@ -424,10 +435,12 @@ fn merge_models(models: &[Vec<u8>], op: BooleanOp) -> Result<Vec<u8>, String> {
         offsets.extend(&counts);
     }
     let first = first.ok_or_else(|| "no models to merge".to_string())?;
+    let dims = const_i32_export(&models[0], "get_dimensions").map_err(|e| format!("model 0: {e}"))?;
     let glue = Glue {
         first: &first,
         others: &others,
         op,
+        dims,
     };
 
     let mut exports = ExportSection::new();

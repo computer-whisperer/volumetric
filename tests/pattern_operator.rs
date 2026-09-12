@@ -365,3 +365,30 @@ fn metadata_declares_three_optional_blocks() {
         );
     }
 }
+
+/// A boolean's output keeps a constant `get_dimensions`, so a pattern (or
+/// any wrapper that reads dimensionality statically) can follow a union.
+#[test]
+fn pattern_follows_a_boolean() {
+    let pair = run_operator(
+        "boolean_operator",
+        vec![
+            sphere(),
+            sphere_at(0.0, 3.0, 0.0),
+            encode(map(vec![("op", text("union"))])),
+        ],
+    )
+    .expect("union of two spheres");
+    let row = pattern(
+        pair,
+        vec![("linear", map(vec![("count", int(2)), ("dx", float(4.0))]))],
+    )
+    .expect("pattern after a boolean");
+    let mut executor = NativeModelExecutor::new(&row).unwrap();
+    for (x, y) in [(0.0, 0.0), (0.0, 3.0), (4.0, 0.0), (4.0, 3.0)] {
+        assert!(inside(&mut executor, &[x, y, 0.0]), "copy at ({x}, {y})");
+    }
+    assert!(!inside(&mut executor, &[2.0, 1.5, 0.0]));
+    assert_bounds(&mut executor, 0, -1.0, 5.0);
+    assert_bounds(&mut executor, 1, -1.0, 4.0);
+}
