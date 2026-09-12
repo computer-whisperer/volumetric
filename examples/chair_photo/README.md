@@ -1,11 +1,12 @@
-# Chair mounting interface from photographs
+# Chair base from photographs
 
 Clean-slate dogfood of volumetric, independent of `examples/chair`.
 
 Priority: improve agent modelling tools, make the photo-to-CAD process
-repeatable, then recover useful chair geometry. This first milestone is
-the upper mounting interface, checked in multiple photographs. Hidden
-geometry and motion are assumptions until observed.
+repeatable, then recover useful chair geometry. The accepted upper mounting
+interface is preserved in `mount.vproj`; the second milestone extends it to
+a representative complete base in `base.vproj`, with a separately fitted
+backrest receiver. Hidden geometry and motion remain assumptions.
 
 ## Evidence and scope
 
@@ -101,8 +102,8 @@ and parameters in a separate work directory.
 
 The model contains the crossbar and main upper rail, with six apertures.
 It is an initial interface reference, not the complete chair-base assembly
-or a fabrication drawing. The gas lift, star base, casters, controls,
-rear cap, and mechanism housing are not yet modelled.
+or a fabrication drawing. The extended `base.vproj` adds the gas lift, star base, casters, controls,
+receiver, and mechanism housing as described below.
 
 The hole centers and end-pad heights come from triangulation. Aperture
 sizes and silhouettes come from approximate photo picks; matching slots
@@ -169,3 +170,109 @@ and exact contact surfaces remain unresolved.
   and the renderer regression pass with host networking/GPU access.
   The stack overflow did not reproduce in that UI rerun; its cause is
   unresolved. Logs are retained under `work/`.
+
+
+## Extended assembly and backrest receiver
+
+Continue after the original measurement stage:
+
+```sh
+python3 examples/chair_photo/fit_receiver.py --audit
+python3 examples/chair_photo/measure_assembly.py
+python3 examples/chair_photo/build_assembly.py --render
+python3 examples/chair_photo/audit_assembly.py
+```
+
+All four scripts accept `--work`. The build refreshes `mount.vproj` from
+its existing measurements, then writes `base.vproj` with 16 separate WGSL
+exports. The accepted six aperture positions and datum are unchanged.
+The project embeds six audit photographs. Outputs include `base_iso.png`,
+four `base-overlay-*.png` photos, and `backrest-detail_{iso,top}.png`.
+Native sampling checks that all exported solids leave the six mounting
+holes and four receiver-axis probe positions clear; positive probes also
+check that the receiver walls and column actually exist.
+
+The receiver is a hollow socket, with a lead-in around its entry mouth,
+a side clamp knob, and separately exported visible pin/fastener geometry.
+`backrest_mouth_frame` records its fitted entry plane.
+`rear_pin_reference_frame` records the observed transverse pin station;
+it does not assert that this is the complete tilt mechanism.
+
+`receiver-observations.json` traces the outer entry rim in three fitted
+views (55, 58, 60), checked in 56. `fit_receiver.py` fits a common plane
+and rounded rectangular profile without pretending that contour samples
+are matching physical points across images. Every ray/plane intersection
+uses volumetric; SciPy fits the Euclidean plane/profile parameters.
+
+Approximate receiver results:
+
+| Quantity | Result |
+|---|---:|
+| Entry mouth width × depth | 39 × 18 mm |
+| Mouth center in accepted mounting frame | X −0.1, Y 274.9, Z 7.0 mm |
+| Fitted mouth-plane rotation about local X | 6.9° |
+| Visible rear pin-cap center | X −34.3, Y 260.0, Z −35.0 mm |
+| Shared rim-fit RMS, by view | 0.49–0.68 mm |
+
+The radius reaches the capsule limit (half the short dimension); this is
+an active profile constraint, not an independent radius measurement.
+Fitting each view separately on the common plane gives widths about
+37.0–39.6 mm and depths 17.5–19.4 mm. That disagreement is more informative
+than the shared residual alone: these are approximate mouth dimensions,
+not a proven mating clearance. Residuals are equally weighted millimetres
+on the plane, not equally weighted pixel errors under foreshortening.
+Predictions were inspected while refining the manual traces; the fourth
+view is a consistency check, not blind validation.
+
+The narrower throat below the rounded lead-in is not resolved. The model
+assumes a 1 mm inset per side, a 3 mm lead-in depth, a 65 mm open socket
+length, and a throat perpendicular to the mouth. The mouth normal itself
+does **not** establish the insertion direction. These parameters are
+explicitly named `assumed_*`; the 65 mm opening in the model is not a
+claim of usable insertion depth. The receiver's actual internal stop,
+clamp screw intrusion, tilt range, and linkage remain unresolved.
+Opposite pin caps and shafts are symmetric approximations; the visible
+cap positions retain all three measured coordinates.
+
+The remaining base is intentionally representative. Measurements support
+about 336 mm star radius, a 48 mm lower column, a 27 mm upper rod, and a
+266 mm column collar height above the survey datum. Four caster joints
+constrain a common circle (2.5 mm radial RMS); fivefold symmetry supplies
+the occluded fifth arm. Floor height, curved arm sections, hub shape,
+wheel dimensions and caster fork details are approximate. Four caster
+yaws come from apparent wheel centers at an assumed 25 mm axle height;
+the hidden fifth yaw and all caster trails are assumed. Control-paddle
+centers were triangulated, while stems and paddle profiles are simplified.
+No dynamic articulation or internal spring/locking mechanism is asserted.
+
+`receiver-report.json` and `assembly-report.json` preserve measurement
+snapshots. The replay in a separate work directory reproduces the fitted
+receiver, assembly measurements, and routed model parameters.
+
+## Additional tooling findings and verification
+
+- **Fixed:** photo measurement arguments were parsed as f32 before being
+  passed to f64 kernels. They now retain f64 precision and reject nonfinite
+  coordinates. The regression covers a millimetre offset at a large world
+  coordinate and fractional image coordinates; all 29 CLI tests pass.
+- **Documented WGSL trap:** a typed f64 `let` does not prevent `select`
+  from concretizing literal arguments as f32. Explicit `float(...)`
+  arguments fix it; the authoring guide now gives the working form.
+- **Fixed diagnostic:** with multiple embedded view sets, `render --through`
+  needs `views:DSC00755` or `assembly_photos:DSC00762`. The shared CLI error
+  previously suggested `--views`, which selects preset render views in this
+  command. It now explains both selection forms; the assembly script uses
+  qualified IDs.
+- **Remaining authoring gap:** persistent multi-view feature and contour
+  observations still live in example JSON, and the fitter orchestrates many
+  CLI calls. A native observation/fit value would improve reuse.
+- **Rendering:** final audit renders disable mesh sharpening and
+  simplification for denser curved surfaces. An initial suspicion of missing
+  longitudinal column surfaces was withdrawn after isolated comparisons:
+  the silhouette is continuous in all four modes. Cap/collar faceting differs;
+  these images do not establish a missing-surface bug.
+- **Verification:** critical void checks and positive occupancy controls pass.
+  Full workspace tests were run with host networking and GPU access; only
+  the existing `operator_metadata` strict-bound parser failure remains.
+  The earlier UI stack overflow did not recur in this run. Logs and all
+  diagnostic images remain under the ignored `work/` directory.

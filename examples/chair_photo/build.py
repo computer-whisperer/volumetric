@@ -10,6 +10,15 @@ from scipy.spatial.transform import Rotation
 from measure import HERE, cli, vector
 
 
+def add_operator(project, operator, inputs, output, exported=False):
+    command = ["project-add-op", "-p", project, "--operator", operator, "--output-id", output]
+    for item in inputs:
+        command += ["--input", item if isinstance(item, str) else "json:" + json.dumps(item)]
+    if not exported:
+        command += ["--no-export"]
+    cli(*command)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--work", type=Path, default=HERE / "work")
@@ -52,12 +61,7 @@ def main():
     cli("project-add-asset", "-p", project, "-i", HERE / "mount.wgsl", "--type", "wgsl", "--asset-id", "mount_source")
 
     def op(operator, inputs, output, exported=False):
-        command = ["project-add-op", "-p", project, "--operator", operator, "--output-id", output]
-        for item in inputs:
-            command += ["--input", item if isinstance(item, str) else "json:" + json.dumps(item)]
-        if not exported:
-            command += ["--no-export"]
-        cli(*command)
+        add_operator(project, operator, inputs, output, exported)
 
     frame = report["frame"]
     op("subspace_operator", [{"kind": "frame"}, frame["origin"], *frame["basis"][:2]], "mount_frame")

@@ -1,0 +1,151 @@
+{
+  "description": "Approximate representative base geometry; receiver rim is fitted separately. Collar centers are apparent ellipse centers, not point fiducials. Pin cap centers are matched on the same visible side in views 55 and 60.",
+  "features": {
+    "column_collar": {
+      "DSC00753": [
+        3327,
+        2472
+      ],
+      "DSC00762": [
+        2960,
+        1750
+      ]
+    },
+    "rear_pin": {
+      "DSC00755": [
+        2099,
+        1210
+      ],
+      "DSC00760": [
+        2262,
+        2523
+      ]
+    },
+    "rear_upper_fastener": {
+      "DSC00755": [
+        2168,
+        1156
+      ],
+      "DSC00760": [
+        2345,
+        2299
+      ]
+    },
+    "rear_lower_fastener": {
+      "DSC00755": [
+        2206,
+        1281
+      ],
+      "DSC00760": [
+        2380,
+        2545
+      ]
+    },
+    "rear_control": {
+      "DSC00755": [
+        1998,
+        2130
+      ],
+      "DSC00762": [
+        1405,
+        835
+      ]
+    },
+    "lift_control": {
+      "DSC00755": [
+        2555,
+        2360
+      ],
+      "DSC00762": [
+        1965,
+        1140
+      ]
+    },
+    "tilt_control": {
+      "DSC00755": [
+        3120,
+        890
+      ],
+      "DSC00753": [
+        4460,
+        2220
+      ]
+    }
+  },
+  "star_endpoints": {
+    "view": "DSC00755",
+    "description": "Apparent centers of four visible caster swivel joints; assumed coplanar and equidistant from the measured column axis. Fifth is occluded.",
+    "pixels": [
+      [
+        2425,
+        3590
+      ],
+      [
+        4290,
+        3320
+      ],
+      [
+        4430,
+        1710
+      ],
+      [
+        1700,
+        2095
+      ]
+    ]
+  },
+  "column_widths": {
+    "view": "DSC00753",
+    "outer": [
+      [
+        3150,
+        2520
+      ],
+      [
+        3500,
+        2520
+      ]
+    ],
+    "rod": [
+      [
+        3231,
+        2190
+      ],
+      [
+        3432,
+        2190
+      ]
+    ]
+  },
+  "wheel_centers": {
+    "view": "DSC00755",
+    "assumed_height_m": 0.025,
+    "description": "Apparent wheel centers at assumed axle height; only caster yaw is inferred, trail remains 18 mm.",
+    "pixels": {
+      "1": [
+        1800,
+        2260
+      ],
+      "2": [
+        2580,
+        3740
+      ],
+      "3": [
+        4420,
+        3425
+      ],
+      "4": [
+        4490,
+        1870
+      ]
+    }
+  },
+  "knob_center": {
+    "view": "DSC00758",
+    "pixel": [
+      4130,
+      1840
+    ],
+    "assumed_face_x_m": 0.073
+  }
+}
