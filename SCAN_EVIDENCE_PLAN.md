@@ -140,7 +140,7 @@ measurement feedback. All evidence paths above are under
 | S1 | Splat value, 3DGS PLY import, `splat-list`, splat to point cloud | 2 days | landed |
 | S2 | Splat rendering in the viewport and `render`, look-through over the photograph | 4 days | landed |
 | S3 | Photometric audit: the splat rendered through each view against its photograph | 2 days | pending |
-| P | Python bindings (PyO3, maturin) over cv_core, view_core, the survey, splats and projects | 3 days | P1..P3c landed 2026-09-12; open: GUI look-through drawing picks and contours |
+| P | Python bindings (PyO3, maturin) over cv_core, view_core, the survey, splats and projects | 3 days | P1..P3d landed 2026-09-12; open: pick labels and recording in the GUI |
 | D | Evidence audits for still sets: intake, detection, survey, setup, coverage, photometric, physical | 3 days | pending |
 
 Proposed order: C2, C3 (the survey is the stage the agent starts from and
@@ -871,8 +871,21 @@ NAME [--check]` stores a pick (into the file or the project's asset);
 `view-triangulate --features [NAME..]` fits recorded picks. Python:
 `ViewSet.with_picks({name: {view: (u, v)}}, check=...)`,
 `.with_contours({name: {view: [(u, v), ..]}})`, `.picks()`,
-`.contours()`, `.fit_picks(names=None)`. Follow-up (not this step): the
-GUI look-through drawing picks and contours.
+`.contours()`, `.fit_picks(names=None)`.
+
+P3d — marks drawn (landed 2026-09-12). `volumetric_preview::observation_lines`
+draws a view's recorded picks (fit: green upright cross; check: orange
+diagonal cross, each with a gap at the picked pixel) and contour traces
+(green polylines) with the marker quads and card corners on the picture
+plane, so GUI look-through shows them over the photograph; the cross is
+sized by the camera's width (1/150, floor 8 px) so it stays legible when
+a 6000-pixel still is shown at screen size. The Views panel row names a
+view's picks and contours as the legend. The headless frame gets the
+same lines as `render --marks` / `render(marks=True)`, drawn in a second
+lines-only pass composited over the finished frame at full strength (an
+overlay would otherwise fade them with the render), with the frame's
+clip planes reaching the picture plane. Open: labels by the crosses
+(the renderer draws no text), and recording picks from the GUI.
 
 Tests (`crates/volumetric_py/tests`, pytest in the shim's venv): a
 cylinder built and run, its mesh bounds checked; a synthetic board

@@ -6327,12 +6327,29 @@ fn view_row(
     } else {
         look.ghost()
     };
+    // Recorded picks and contours by name, a check pick marked as such:
+    // the legend for the crosses and traces drawn in look-through.
+    let recorded = view.observations.as_ref().and_then(|obs| {
+        let mut names: Vec<String> = obs
+            .features
+            .iter()
+            .map(|f| match f.role {
+                viewset::PickRole::Fit => f.name.clone(),
+                viewset::PickRole::Check => format!("{} (check)", f.name),
+            })
+            .collect();
+        names.extend(obs.contours.iter().map(|c| format!("{} (contour)", c.name)));
+        (!names.is_empty()).then(|| names.join(", "))
+    });
     let mut lines = vec![
         text(view.id.clone()).small().semibold().ellipsis(),
         row(marks).gap(tokens::SPACE_1),
     ];
     if let Some(found) = found {
         lines.push(row([badge(found).xsmall()]));
+    }
+    if let Some(recorded) = recorded {
+        lines.push(text(recorded).caption().muted().ellipsis());
     }
     row([
         thumbnail,
@@ -10674,8 +10691,22 @@ mod tests {
                 fit_px: 0.1,
             }],
             blur_px: Some(1.25),
-            features: Vec::new(),
-            contours: Vec::new(),
+            features: vec![
+                viewset::FeatureObs {
+                    name: "hole_a".to_string(),
+                    pixel: [1.5, 1.5],
+                    role: viewset::PickRole::Fit,
+                },
+                viewset::FeatureObs {
+                    name: "hole_b".to_string(),
+                    pixel: [2.5, 1.5],
+                    role: viewset::PickRole::Check,
+                },
+            ],
+            contours: vec![viewset::ContourObs {
+                name: "rim".to_string(),
+                pixels: vec![[0.5, 0.5], [3.5, 0.5]],
+            }],
         });
         let mut v2 = posed("v2", 0.2);
         v2.image = Some(png.clone());
@@ -10769,8 +10800,9 @@ mod tests {
         assert_eq!(look.frame.pinhole.width, 4);
         assert_eq!(look.frame.eye(), glam::Vec3::new(0.0, 0.0, -2.0));
         // The frustum's nine segments, and v1's observations: a marker's
-        // four sides and a card corner's cross.
-        assert_eq!(look.frustum.segments.len(), 9 + 4 + 2);
+        // four sides, a card corner's cross, two picks of four arms each
+        // and a two-point contour.
+        assert_eq!(look.frustum.segments.len(), 9 + 4 + 2 + 8 + 1);
         assert!(app.look_photo().is_some(), "the view's PNG decodes");
 
         // Looking through the same view leaves it; another view switches.
@@ -10836,6 +10868,22 @@ mod tests {
             );
         }
         assert!(!keys.contains(&EXIT_LOOK_KEY.to_string()));
+        // v1's recorded picks and contour are named on its row, the check
+        // and the contour marked as such.
+        fn collect_texts(el: &El, out: &mut Vec<String>) {
+            if let Some(text) = &el.text {
+                out.push(text.clone());
+            }
+            for child in &el.children {
+                collect_texts(child, out);
+            }
+        }
+        let mut texts = Vec::new();
+        collect_texts(&tree, &mut texts);
+        assert!(
+            texts.contains(&"hole_a, hole_b (check), rim (contour)".to_string()),
+            "{texts:?}"
+        );
         // Three pictures, two decoded per build: one waits a frame.
         assert!(app.has_pending_view_thumbnails());
         assert_eq!(app.view_thumbnails.borrow().len(), 2);

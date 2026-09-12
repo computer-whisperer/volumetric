@@ -106,7 +106,9 @@ explicit camera, a pinhole (`pinhole={"fx", "fy", "cx", "cy",
 "camera_to_world"}`), or a view of a view set with its photograph under
 an overlay; `resolution`, `sharp`, `simplify`, `color_field`,
 `color_range`, `wireframe`, `background`, `up`, `projection="ortho"`
-with `ortho_scale`, `grid`, `ssao` as the CLI's flags. Needs a GPU (or a
+with `ortho_scale`, `grid`, `ssao` as the CLI's flags; `marks=True`
+draws what the looked-through view observed (markers, card corners,
+recorded picks and contours) over the frame, as the GUI does. Needs a GPU (or a
 software adapter wgpu accepts).
 
 ## Pictures and markers

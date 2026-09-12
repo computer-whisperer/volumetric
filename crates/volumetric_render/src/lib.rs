@@ -22,11 +22,11 @@ use volumetric::{AssetTypeHint, LoadedAsset};
 use volumetric_abi::viewset::Distortion;
 use volumetric_preview::{
     Asn2Settings, PreviewBounds, PreviewEntity, PreviewMeshPlan, PreviewPlan, PreviewRenderMode,
-    PreviewRequest, build_preview_scene, clip_planes_for, srgb_to_linear, submit_subspace_gizmo,
-    wireframe_style,
+    PreviewRequest, build_preview_scene, clip_planes_for, observation_lines, srgb_to_linear,
+    submit_subspace_gizmo, submit_view_highlight, wireframe_style,
 };
 use volumetric_renderer::{
-    Camera, CameraView, GridPlanes, RenderSettings, ViewDirection, offscreen::Offscreen,
+    Camera, CameraView, GridPlanes, LineData, RenderSettings, ViewDirection, offscreen::Offscreen,
 };
 
 pub use view_core::overlay::Overlay;
@@ -99,6 +99,10 @@ pub struct RenderOptions {
     pub plan: PlanOptions,
     /// With a `Through` camera: composite the render over the photograph.
     pub overlay: Option<Overlay>,
+    /// With a `Through` camera: draw what the view observed (marker
+    /// quads, card corners, recorded picks and contours) over the frame,
+    /// as the GUI's look-through does.
+    pub marks: bool,
 }
 
 impl Default for RenderOptions {
@@ -117,6 +121,7 @@ impl Default for RenderOptions {
             ssao: true,
             plan: PlanOptions::default(),
             overlay: None,
+            marks: false,
         }
     }
 }
@@ -560,6 +565,25 @@ fn frames(
     })
 }
 
+/// `src` (premultiplied RGBA over a transparent ground) over `dst`.
+fn over(mut dst: Vec<u8>, src: &[u8]) -> Vec<u8> {
+    for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+        let a = f32::from(s[3]) / 255.0;
+        if a <= 0.0 {
+            continue;
+        }
+        for c in 0..3 {
+            d[c] = (f32::from(s[c]) + f32::from(d[c]) * (1.0 - a))
+                .round()
+                .min(255.0) as u8;
+        }
+        d[3] = (f32::from(s[3]) + f32::from(d[3]) * (1.0 - a))
+            .round()
+            .min(255.0) as u8;
+    }
+    dst
+}
+
 /// Draw `assets` (a project's selected exports, or one model) from
 /// `camera` with `options`. `imports` are the project's imports, where a
 /// `Through` camera finds its view set when the set is not among the
@@ -574,6 +598,7 @@ pub fn render(
     // A view's camera fixes the image size and the projection; explicit
     // sizes scale its intrinsics so smaller renders stay aligned.
     let mut photo: Option<Rgb> = None;
+    let mut marks: Option<LineData> = None;
     let mut size = (
         options.width.unwrap_or(1024),
         options.height.unwrap_or(1024),
@@ -612,6 +637,11 @@ pub fn render(
             );
             let sx = size.0 as f64 / f64::from(view_camera.width);
             let sy = size.1 as f64 / f64::from(view_camera.height);
+            if options.marks {
+                marks = Some(LineData {
+                    segments: observation_lines(view, view_camera),
+                });
+            }
             if options.overlay.is_some() {
                 let bytes = view.image.as_deref().with_context(|| {
                     format!(
@@ -689,6 +719,19 @@ pub fn render(
                 .reduce(PreviewBounds::union)
         })
         .context("nothing to draw")?;
+    // The marks sit on the picture plane close to the eye; the clip
+    // planes must reach them as they do in the GUI, where the view set's
+    // frustum is part of the scene.
+    let bounds = marks.iter().flat_map(|m| &m.segments).fold(bounds, |b, s| {
+        b.union(PreviewBounds {
+            min: (s.start[0], s.start[1], s.start[2]),
+            max: (s.start[0], s.start[1], s.start[2]),
+        })
+        .union(PreviewBounds {
+            min: (s.end[0], s.end[1], s.end[2]),
+            max: (s.end[0], s.end[1], s.end[2]),
+        })
+    });
     let (up, up_source) = world_up(options.up, assets)?;
     let frames = frames(camera, options, size, bounds, up)?;
 
@@ -792,6 +835,26 @@ pub fn render(
                     .collect()
             }
             _ => rgba,
+        };
+        // The marks go over the finished frame, overlay included, at full
+        // strength: a pick is judged against the photograph, not faded
+        // with the render. Drawn alone over a transparent ground.
+        let rgba = match &marks {
+            Some(marks) => {
+                submit_view_highlight(&mut renderer, marks);
+                let mut marks_settings = RenderSettings {
+                    background_color: SENTINEL,
+                    ssao_enabled: false,
+                    show_axis_indicator: false,
+                    ..RenderSettings::default()
+                };
+                marks_settings.grid.planes = GridPlanes::NONE;
+                let lines = offscreen
+                    .render_rgba(&mut renderer, &view, &marks_settings)
+                    .map_err(anyhow::Error::msg)?;
+                over(rgba, &lines)
+            }
+            None => rgba,
         };
         out.push(Frame {
             suffix,

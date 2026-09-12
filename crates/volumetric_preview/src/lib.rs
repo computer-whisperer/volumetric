@@ -37,7 +37,7 @@ pub use scene::{
 pub use splats::{splat_data, splat_detail};
 pub use views::{
     FRUSTUM_DEPTH_M, LookThrough, ViewFrame, clip_planes_for, frustum_segments, highlight_lines,
-    pose_matrix, submit_view_highlight, viewset_detail,
+    observation_lines, pose_matrix, submit_view_highlight, viewset_detail,
 };
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

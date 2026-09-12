@@ -65,13 +65,15 @@ fn vec3_opt(value: Option<&Bound<'_, PyAny>>, what: &str) -> PyResult<Option<Vec
 /// named). The rest are `RenderOptions` and `PlanOptions`: `background`
 /// hex sRGB, `up`, `projection` (`perspective`/`ortho`), `fov`,
 /// `ortho_scale`, `near`, `far`, `grid`, `ssao`, `resolution`, `sharp`,
-/// `simplify`, `color_channel`, `color_field`, `color_range`, `wireframe`.
+/// `simplify`, `color_channel`, `color_field`, `color_range`, `wireframe`;
+/// `marks` draws what a looked-through view observed (markers, card
+/// corners, recorded picks and contours) over the frame.
 #[pyfunction]
 #[pyo3(signature = (source, assets=None, views=None, camera=None, pinhole=None, through=None,
     overlay=None, overlay_alpha=0.5, overlay_tile=64, width=None, height=None,
     projection="perspective", fov=45.0, ortho_scale=0.0, near=None, far=None, up=None,
     background="2d2d2d", grid=1.0, ssao=true, resolution=128, sharp=true, simplify=true,
-    color_channel=None, color_field=None, color_range=None, wireframe=false))]
+    color_channel=None, color_field=None, color_range=None, wireframe=false, marks=false))]
 #[allow(clippy::too_many_arguments)]
 fn render<'py>(
     py: Python<'py>,
@@ -102,6 +104,7 @@ fn render<'py>(
     color_field: Option<String>,
     color_range: Option<(f64, f64)>,
     wireframe: bool,
+    marks: bool,
 ) -> PyResult<Rendered> {
     // What to draw.
     let (exports, imports): (Vec<LoadedAsset>, Vec<LoadedAsset>) =
@@ -249,6 +252,7 @@ fn render<'py>(
             wireframe,
         },
         overlay,
+        marks,
     };
 
     let rendered = py

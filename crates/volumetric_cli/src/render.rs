@@ -143,6 +143,11 @@ pub struct RenderArgs {
     #[arg(long)]
     pub wireframe: bool,
 
+    /// With --through: draw what the view observed (marker quads, card
+    /// corners, recorded picks and contours) over the frame
+    #[arg(long)]
+    pub marks: bool,
+
     /// Ground grid spacing in metres (0 disables)
     #[arg(long, default_value_t = 1.0)]
     pub grid: f32,
@@ -294,6 +299,7 @@ fn render_options(args: &RenderArgs) -> Result<RenderOptions> {
             wireframe: args.wireframe,
         },
         overlay,
+        marks: args.marks,
     })
 }
 

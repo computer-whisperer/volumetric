@@ -3,7 +3,7 @@
 //! view, and the highlight of that view among the others.
 
 use glam::{Mat4, Vec3, Vec4};
-use volumetric::viewset::{CameraModel, View, ViewSet, decode_viewset};
+use volumetric::viewset::{CameraModel, PickRole, View, ViewSet, decode_viewset};
 use volumetric_renderer as renderer;
 use volumetric_renderer::{CameraView, Pinhole};
 
@@ -25,6 +25,19 @@ const TAG_OBS_COLOR: [f32; 4] = [0.35, 0.85, 0.95, 0.95];
 const CORNER_OBS_COLOR: [f32; 4] = [1.0, 0.3, 1.0, 0.95];
 /// Half-size of a corner's cross, pixels of the photograph.
 const CORNER_CROSS_PX: f64 = 6.0;
+/// A recorded fit pick: an upright cross in green.
+const PICK_FIT_COLOR: [f32; 4] = [0.4, 1.0, 0.45, 1.0];
+/// A recorded check pick: a diagonal cross in orange, so a held-out
+/// pick reads differently from one the feature is fitted from.
+const PICK_CHECK_COLOR: [f32; 4] = [1.0, 0.5, 0.15, 1.0];
+/// A recorded contour, as a polyline through its pixels.
+const CONTOUR_COLOR: [f32; 4] = [0.4, 1.0, 0.45, 0.9];
+/// Half-size of a pick's cross as a fraction of the picture's width, with
+/// a floor in pixels: a pick is one of a few and is what the eye is asked
+/// to judge, so it stays legible when a 6000-pixel still is shown at
+/// screen size (40 px on a DSLR frame, 8 px on a webcam's).
+const PICK_CROSS_FRACTION: f64 = 1.0 / 150.0;
+const PICK_CROSS_MIN_PX: f64 = 8.0;
 
 fn v3(p: [f64; 3]) -> Vec3 {
     Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32)
@@ -114,6 +127,48 @@ pub fn observation_lines(view: &View, camera: &CameraModel) -> Vec<renderer::Lin
         let r = CORNER_CROSS_PX;
         out.push(segment(at([x - r, y]), at([x + r, y]), CORNER_OBS_COLOR));
         out.push(segment(at([x, y - r]), at([x, y + r]), CORNER_OBS_COLOR));
+    }
+    // Recorded picks: a fit pick is an upright cross, a check pick a
+    // diagonal one, each with a gap at the centre so the pixel picked
+    // stays visible under it.
+    for f in &obs.features {
+        let [x, y] = f.pixel;
+        let r = (f64::from(camera.width) * PICK_CROSS_FRACTION).max(PICK_CROSS_MIN_PX);
+        let gap = r * 0.25;
+        let (color, arms): ([f32; 4], [[[f64; 2]; 2]; 4]) = match f.role {
+            PickRole::Fit => (
+                PICK_FIT_COLOR,
+                [
+                    [[x - r, y], [x - gap, y]],
+                    [[x + gap, y], [x + r, y]],
+                    [[x, y - r], [x, y - gap]],
+                    [[x, y + gap], [x, y + r]],
+                ],
+            ),
+            PickRole::Check => {
+                let (d, g) = (
+                    r * std::f64::consts::FRAC_1_SQRT_2,
+                    gap * std::f64::consts::FRAC_1_SQRT_2,
+                );
+                (
+                    PICK_CHECK_COLOR,
+                    [
+                        [[x - d, y - d], [x - g, y - g]],
+                        [[x + g, y + g], [x + d, y + d]],
+                        [[x - d, y + d], [x - g, y + g]],
+                        [[x + g, y - g], [x + d, y - d]],
+                    ],
+                )
+            }
+        };
+        for [a, b] in arms {
+            out.push(segment(at(a), at(b), color));
+        }
+    }
+    for c in &obs.contours {
+        for pair in c.pixels.windows(2) {
+            out.push(segment(at(pair[0]), at(pair[1]), CONTOUR_COLOR));
+        }
     }
     out
 }
@@ -394,7 +449,7 @@ mod tests {
 
     #[test]
     fn observations_draw_on_the_picture_plane() {
-        use volumetric::viewset::{CornerObs, MarkerObs, Observations};
+        use volumetric::viewset::{ContourObs, CornerObs, FeatureObs, MarkerObs, Observations};
         let camera = CameraModel::pinhole(640, 480, 500.0, 500.0, 320.0, 240.0);
         let mut view = looking_away();
         assert!(observation_lines(&view, &camera).is_empty());
@@ -429,11 +484,27 @@ mod tests {
                 fit_px: 0.3,
             }],
             blur_px: None,
-            features: Vec::new(),
-            contours: Vec::new(),
+            features: vec![
+                FeatureObs {
+                    name: "hole_a".to_string(),
+                    pixel: [50.0, 60.0],
+                    role: PickRole::Fit,
+                },
+                FeatureObs {
+                    name: "hole_b".to_string(),
+                    pixel: [70.0, 60.0],
+                    role: PickRole::Check,
+                },
+            ],
+            contours: vec![ContourObs {
+                name: "rim".to_string(),
+                pixels: vec![[10.0, 10.0], [20.0, 10.0], [20.0, 20.0]],
+            }],
         });
         let lines = observation_lines(&view, &camera);
-        assert_eq!(lines.len(), 4 + 4 + 2);
+        // Marker quads, the corner's cross, four arms per pick, and the
+        // contour's two segments.
+        assert_eq!(lines.len(), 4 + 4 + 2 + 4 + 4 + 2);
         // Every segment end projects back to the pixel it came from.
         let world = |p: [f32; 3]| [f64::from(p[0]), f64::from(p[1]), f64::from(p[2])];
         let back = view.project(&camera, world(lines[0].start)).unwrap();
@@ -449,9 +520,30 @@ mod tests {
         assert_eq!(lines[0].color, SWATCH_OBS_COLOR);
         assert_eq!(lines[4].color, TAG_OBS_COLOR);
         assert_eq!(lines[8].color, CORNER_OBS_COLOR);
+        // The fit pick's first arm ends short of the pixel; the check
+        // pick's arms are diagonal; the contour follows its pixels.
+        assert_eq!(lines[10].color, PICK_FIT_COLOR);
+        let back = view.project(&camera, world(lines[10].end)).unwrap();
+        assert!(
+            (back[0] - (50.0 - PICK_CROSS_MIN_PX * 0.25)).abs() < 1e-3
+                && (back[1] - 60.0).abs() < 1e-3,
+            "{back:?}"
+        );
+        assert_eq!(lines[14].color, PICK_CHECK_COLOR);
+        let back = view.project(&camera, world(lines[14].start)).unwrap();
+        assert!(
+            (back[0] - 70.0).abs() > 5.0 && (back[1] - 60.0).abs() > 5.0,
+            "{back:?}"
+        );
+        assert_eq!(lines[18].color, CONTOUR_COLOR);
+        let back = view.project(&camera, world(lines[19].end)).unwrap();
+        assert!(
+            (back[0] - 20.0).abs() < 1e-3 && (back[1] - 20.0).abs() < 1e-3,
+            "{back:?}"
+        );
         // Look-through carries them with the frustum.
         let look = LookThrough::of(&view, &camera).unwrap();
-        assert_eq!(look.frustum.segments.len(), 9 + 10);
+        assert_eq!(look.frustum.segments.len(), 9 + 20);
         // Unposed, the view draws nothing and cannot be looked through.
         let mut raw = view.clone();
         raw.camera_to_world = None;
