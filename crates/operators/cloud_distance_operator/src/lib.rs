@@ -269,7 +269,7 @@ pub extern "C" fn get_metadata() -> i64 {
     static METADATA: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     volumetric_abi::metadata_reply(&METADATA, || {
         let schema =
-            r#"{ resolution: int .ge 16 .le 256 .default 128, field: tstr .default "distance", band: float .gt 0.0 .default 0.005 }"#
+            r#"{ resolution: int .ge 16 .le 256 .default 128, field: tstr .default "distance", band: float .ge 0.0001 .default 0.005 }"#
                 .to_string();
         OperatorMetadata {
             name: "cloud_distance_operator".to_string(),
