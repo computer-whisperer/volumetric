@@ -14,5 +14,9 @@ pub mod overlay;
 pub mod residual;
 pub mod stills;
 
-pub use manifest::{Eye, ImportReport, Labels, ManifestKind, Selection, import_manifest};
-pub use stills::{Embed, StillsOptions, StillsReport, full_picture, import_stills};
+pub use manifest::{
+    Eye, ImportReport, Labels, ManifestKind, Selection, import_manifest, select_views,
+};
+pub use stills::{
+    Embed, StillsOptions, StillsReport, embed_pictures, full_picture, import_stills, preview_jpeg,
+};

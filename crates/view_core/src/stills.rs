@@ -146,17 +146,10 @@ fn read_still(path: &Path, options: &StillsOptions) -> Result<Still> {
             (w, h, Some(bytes))
         }
         Embed::Preview => {
-            let photo = decode_rgb(&bytes).with_context(|| format!("{name}: does not decode"))?;
-            let long = photo.width.max(photo.height);
-            let scale = f64::from(options.preview_px.max(1)) / f64::from(long);
-            let preview = if scale < 1.0 {
-                let w = ((f64::from(photo.width) * scale).round() as u32).max(1);
-                let h = ((f64::from(photo.height) * scale).round() as u32).max(1);
-                photo.resized(w, h)?.to_jpeg(options.preview_quality)?
-            } else {
-                bytes
-            };
-            (photo.width, photo.height, Some(preview))
+            let (w, h) = dimensions_of(&bytes).with_context(|| format!("{name}: not a picture"))?;
+            let preview = preview_jpeg(bytes, options.preview_px, options.preview_quality)
+                .with_context(|| format!("{name}: does not decode"))?;
+            (w, h, Some(preview))
         }
     };
     Ok(Still {
@@ -352,6 +345,58 @@ fn build_set(
     Ok((set, report))
 }
 
+/// A picture reduced to `preview_px` on its longer side as a JPEG of
+/// `quality`; a picture already that small is returned as it is.
+pub fn preview_jpeg(bytes: Vec<u8>, preview_px: u32, quality: u8) -> Result<Vec<u8>> {
+    let (width, height) = dimensions_of(&bytes)?;
+    let long = width.max(height);
+    let scale = f64::from(preview_px.max(1)) / f64::from(long);
+    if scale >= 1.0 {
+        return Ok(bytes);
+    }
+    let photo = decode_rgb(&bytes)?;
+    let w = ((f64::from(width) * scale).round() as u32).max(1);
+    let h = ((f64::from(height) * scale).round() as u32).max(1);
+    photo.resized(w, h)?.to_jpeg(quality)
+}
+
+/// Re-embeds every view's picture as `embed` says: the original through
+/// [`full_picture`], a preview of it, or nothing but the reference. Returns
+/// the bytes embedded.
+pub fn embed_pictures(
+    set: &mut ViewSet,
+    embed: Embed,
+    preview_px: u32,
+    quality: u8,
+) -> Result<usize> {
+    let pictures: Vec<Result<Option<Vec<u8>>>> = set
+        .views
+        .par_iter()
+        .map(|view| match embed {
+            Embed::None => Ok(None),
+            Embed::Full => full_picture(set, view).map(Some),
+            Embed::Preview => {
+                if let Some(bytes) = &view.image
+                    && dimensions_of(bytes).is_ok_and(|(w, h)| w.max(h) <= preview_px)
+                {
+                    return Ok(Some(bytes.clone()));
+                }
+                let bytes = full_picture(set, view)?;
+                preview_jpeg(bytes, preview_px, quality)
+                    .with_context(|| format!("view '{}': the picture does not decode", view.id))
+                    .map(Some)
+            }
+        })
+        .collect();
+    let mut embedded = 0;
+    for (view, picture) in set.views.iter_mut().zip(pictures) {
+        let picture = picture?;
+        embedded += picture.as_ref().map_or(0, Vec::len);
+        view.image = picture;
+    }
+    Ok(embedded)
+}
+
 /// The picture of a view at the camera's full resolution: the embedded
 /// one when it is full size, else the original read through `source`
 /// from the provenance's origin.
@@ -455,6 +500,26 @@ mod tests {
                 .origin
                 .ends_with(dir.file_name().unwrap().to_str().unwrap())
         );
+        // Re-embedding reads the originals through the sources: previews
+        // of the asked size, the full files, or nothing again.
+        let mut again = bare.clone();
+        let bytes = embed_pictures(&mut again, Embed::Preview, 400, 80).unwrap();
+        assert!(bytes > 0);
+        assert_eq!(
+            dimensions_of(again.views[1].image.as_ref().unwrap()).unwrap(),
+            (400, 300)
+        );
+        // A picture already small enough is kept as it is.
+        let kept = again.views[1].image.clone();
+        embed_pictures(&mut again, Embed::Preview, 400, 80).unwrap();
+        assert_eq!(again.views[1].image, kept);
+        embed_pictures(&mut again, Embed::Full, 400, 80).unwrap();
+        assert_eq!(
+            dimensions_of(again.views[0].image.as_ref().unwrap()).unwrap(),
+            (800, 600)
+        );
+        assert_eq!(embed_pictures(&mut again, Embed::None, 400, 80).unwrap(), 0);
+        assert!(again.views.iter().all(|v| v.image.is_none()));
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(import_stills(&dir, &StillsOptions::default()).is_err());
     }

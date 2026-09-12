@@ -268,6 +268,13 @@ volumetric_cli view-import --manifest datasets/chair/cameras.json -p chair.vproj
 # Or write a standalone file, by view id
 volumetric_cli view-import --manifest cameras.json -o views.vviews --id 00600_l --id 00003_l
 
+# A subset of a set (a surveyed one, say) into a project or a file: by id
+# (kept in that order), posed only, tags, nearness, stride, cap; pictures
+# kept as they are, re-read from the originals as full files or previews,
+# or dropped
+volumetric_cli view-select -i survey.vviews -p chair.vproj --id DSC00730 --id DSC00742 \
+    --posed --embed preview [--preview-px 1600] [--near x,y,z --radius r] [--stride n] [--max n]
+
 # What a set holds
 volumetric_cli view-list -i chair.vproj [--asset views] [--json]
 

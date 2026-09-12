@@ -1,8 +1,9 @@
 //! View sets on the command line: `view-import` embeds a selection of a
 //! posed-image dataset, or a directory of stills straight from a camera,
-//! into a `.vviews` file or a project, `view-list` describes one, and
-//! `view-residual` compares a model against the depth maps its views
-//! carry.
+//! into a `.vviews` file or a project, `view-select` takes a subset of a
+//! set (a surveyed one, say) into a file or a project with its pictures
+//! re-embedded, `view-list` describes one, and `view-residual` compares a
+//! model against the depth maps its views carry.
 
 use std::path::{Path, PathBuf};
 
@@ -11,7 +12,10 @@ use clap::{Parser, ValueEnum};
 use serde::Serialize;
 use view_core::image::{decode_depth, decode_mask};
 use view_core::residual::{ResidualStats, Search, depth_residual, residual_image};
-use view_core::{Embed, Eye, Labels, Selection, StillsOptions, import_manifest, import_stills};
+use view_core::{
+    Embed, Eye, Labels, Selection, StillsOptions, embed_pictures, import_manifest, import_stills,
+    select_views,
+};
 use volumetric::wasm::ParallelModelSampler;
 use volumetric::{AssetTypeHint, ImportedAsset, LoadedAsset, Project};
 use volumetric_abi::viewset::{Distortion, ViewSet, decode_viewset, encode_viewset};
@@ -180,15 +184,194 @@ pub fn run_view_import(args: ViewImportArgs) -> Result<()> {
         (Some(manifest), None) => import_from_manifest(&args, manifest, labels)?,
         _ => bail!("give --manifest or --stills"),
     };
-    let bytes = encode_viewset(&set);
-    if let Some(output) = &args.output {
+    write_viewset(
+        &set,
+        args.output.as_deref(),
+        args.project.as_deref(),
+        &args.asset_id,
+    )
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ReembedArg {
+    /// Whatever each view carries now
+    Keep,
+    /// The original files, read through each view's source
+    Full,
+    /// Reduced JPEGs of the originals
+    Preview,
+    /// Only the references to the originals
+    None,
+}
+
+#[derive(Parser, Debug)]
+pub struct ViewSelectArgs {
+    /// A .vviews file or a .vproj project whose view set to select from
+    #[arg(short, long)]
+    pub input: PathBuf,
+
+    /// For projects with several view sets: which one
+    #[arg(long)]
+    pub views: Option<String>,
+
+    /// Keep only this view id (repeatable; the output keeps this order)
+    #[arg(long = "id")]
+    pub ids: Vec<String>,
+
+    /// Keep only posed views
+    #[arg(long)]
+    pub posed: bool,
+
+    /// Keep views carrying this tag (repeatable; every tag must be present)
+    #[arg(long = "tag")]
+    pub tags: Vec<String>,
+
+    /// Keep views whose camera lies within --radius of this point x,y,z
+    #[arg(long, allow_hyphen_values = true)]
+    pub near: Option<String>,
+
+    #[arg(long, default_value_t = 1.0)]
+    pub radius: f64,
+
+    /// Keep every Nth view after the other filters
+    #[arg(long, default_value_t = 1)]
+    pub stride: usize,
+
+    /// At most this many views (0 = no cap)
+    #[arg(long, default_value_t = 0)]
+    pub max: usize,
+
+    #[arg(long, value_enum, default_value_t = EyeArg::Both)]
+    pub eye: EyeArg,
+
+    /// Keep views tagged with this split (train, test)
+    #[arg(long)]
+    pub split: Option<String>,
+
+    /// What picture each kept view carries
+    #[arg(long, value_enum, default_value_t = ReembedArg::Keep)]
+    pub embed: ReembedArg,
+
+    /// With --embed preview: the preview's longer side, pixels
+    #[arg(long, default_value_t = 1600)]
+    pub preview_px: u32,
+
+    /// Write the selected set here (.vviews)
+    #[arg(short, long)]
+    pub output: Option<PathBuf>,
+
+    /// Add the selected set to this project as an imported asset
+    #[arg(short, long)]
+    pub project: Option<PathBuf>,
+
+    /// Asset id in the project
+    #[arg(long, default_value = "views")]
+    pub asset_id: String,
+}
+
+/// `view-select`: a subset of a set, by id, pose, tag, nearness, stride
+/// and cap, with its pictures kept, re-read from the originals as full
+/// files or previews, or dropped; written as a file and/or into a project.
+pub fn run_view_select(args: ViewSelectArgs) -> Result<()> {
+    if args.output.is_none() && args.project.is_none() {
+        bail!("give --output, --project, or both");
+    }
+    let set = load_viewset(&args.input, args.views.as_deref())?;
+    let near = args
+        .near
+        .as_deref()
+        .map(|s| {
+            let v = crate::render::parse_vec3(s).context("Invalid --near")?;
+            Ok::<_, anyhow::Error>((
+                [f64::from(v.x), f64::from(v.y), f64::from(v.z)],
+                args.radius,
+            ))
+        })
+        .transpose()?;
+    let selection = Selection {
+        ids: args.ids.clone(),
+        stride: args.stride.max(1),
+        near,
+        max: args.max,
+        eye: match args.eye {
+            EyeArg::Left => Eye::Left,
+            EyeArg::Right => Eye::Right,
+            EyeArg::Both => Eye::Both,
+        },
+        split: args.split.clone(),
+        ..Selection::default()
+    };
+    let candidates: Vec<&volumetric_abi::viewset::View> = set
+        .views
+        .iter()
+        .filter(|view| !args.posed || view.camera_to_world.is_some())
+        .filter(|view| args.tags.iter().all(|tag| view.tags.contains(tag)))
+        .collect();
+    let chosen = select_views(&candidates, &selection)?;
+    let mut selected = ViewSet {
+        views: chosen.into_iter().cloned().collect(),
+        ..set.clone()
+    };
+    let embedded = match args.embed {
+        ReembedArg::Keep => selected
+            .views
+            .iter()
+            .map(|v| v.image.as_ref().map_or(0, Vec::len))
+            .sum(),
+        ReembedArg::Full => embed_pictures(&mut selected, Embed::Full, args.preview_px, 88)?,
+        ReembedArg::Preview => embed_pictures(&mut selected, Embed::Preview, args.preview_px, 88)?,
+        ReembedArg::None => embed_pictures(&mut selected, Embed::None, args.preview_px, 88)?,
+    };
+    selected.provenance.tools.push(format!(
+        "volumetric view-select ({} of {} views)",
+        selected.views.len(),
+        set.views.len()
+    ));
+    selected
+        .validate()
+        .map_err(|err| anyhow!("selected set is invalid: {err}"))?;
+    let posed = selected
+        .views
+        .iter()
+        .filter(|v| v.camera_to_world.is_some())
+        .count();
+    println!(
+        "Selected {} of {} views ({} posed): {}; {:.1} MB of pictures embedded",
+        selected.views.len(),
+        set.views.len(),
+        posed,
+        selected
+            .views
+            .iter()
+            .map(|v| v.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        embedded as f64 / 1e6
+    );
+    write_viewset(
+        &selected,
+        args.output.as_deref(),
+        args.project.as_deref(),
+        &args.asset_id,
+    )
+}
+
+/// Writes a set to a `.vviews` file and/or into a project as an import.
+fn write_viewset(
+    set: &ViewSet,
+    output: Option<&Path>,
+    project: Option<&Path>,
+    asset_id: &str,
+) -> Result<()> {
+    let bytes = encode_viewset(set);
+    if let Some(output) = output {
         std::fs::write(output, &bytes)
             .with_context(|| format!("Failed to write {}", output.display()))?;
         println!("Wrote {} ({} bytes)", output.display(), bytes.len());
     }
-    if let Some(path) = &args.project {
+    if let Some(path) = project {
         let mut project = Project::load_from_file(path).context("Failed to load project")?;
-        let asset_id = project.unique_asset_id(&args.asset_id);
+        let asset_id = project.unique_asset_id(asset_id);
         project.imports_mut().push(ImportedAsset::new(
             asset_id.clone(),
             bytes,

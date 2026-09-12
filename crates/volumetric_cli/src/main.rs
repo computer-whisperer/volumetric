@@ -103,6 +103,9 @@ enum Commands {
     /// Import a selection of a posed-image dataset (cameras.json or transforms.json) as a view set
     #[command(name = "view-import")]
     ViewImport(views::ViewImportArgs),
+    /// Take a subset of a view set (by id, pose, tag, nearness, stride, cap) into a file or a project, its pictures kept, re-embedded or dropped
+    #[command(name = "view-select")]
+    ViewSelect(views::ViewSelectArgs),
     /// Describe a view set: cameras, views, markers, provenance
     #[command(name = "view-list")]
     ViewList(views::ViewListArgs),
@@ -587,6 +590,7 @@ fn main() -> Result<()> {
         Commands::FeaExport(args) => fea::run_fea_export(args),
         Commands::FeaImport(args) => fea::run_fea_import(args),
         Commands::ViewImport(args) => views::run_view_import(args),
+        Commands::ViewSelect(args) => views::run_view_select(args),
         Commands::ViewList(args) => views::run_view_list(args),
         Commands::ViewResidual(args) => views::run_view_residual(args),
         Commands::ViewSolve(args) => solve::run_view_solve(args),

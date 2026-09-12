@@ -12,6 +12,18 @@ P=chair_base.vproj
 rm -f $P
 $V project-new --output $P >/dev/null
 
+# The evidence's photographs (evidence.sh writes the selection): ten
+# surveyed views of the base, so the model can be looked through them
+# here (`render -i chair_base.vproj --asset base_world --through DSC00742
+# --overlay edge`) and in the GUI.
+SCAN=${SCAN:-/ceph/christian/index_scanner}
+VIEWS=${CHAIR_VIEWS:-$SCAN/sessions/chairbase-dslr-1-all/demo/chair_views.vviews}
+if [ -f "$VIEWS" ]; then
+    $V project-add-asset -p $P -i "$VIEWS" --type view-set --asset-id views >/dev/null
+else
+    echo "no $VIEWS; building without the photographs (run evidence.sh first)"
+fi
+
 op() { $V project-add-op --project $P "$@" >/dev/null; }
 PLANE='json:{"kind":"plane"}'
 UNION='json:{"op":"union"}'

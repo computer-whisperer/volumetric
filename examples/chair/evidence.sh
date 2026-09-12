@@ -36,3 +36,17 @@ $V project-add-op -p "$P" --operator splat_points_operator -i asset:splat -i ass
 
 $V project-run -p "$P" | tail -4
 $V splat-list -i "$P" | head -3
+
+# The full shoot (192 stills, the 44 above among them) surveyed as a
+# standalone set, and ten of its views, previews embedded, for the base
+# project (base.sh loads them): the top-down, three low elevations and
+# six around the high ring.
+ALL=$SCAN/sessions/chairbase-dslr-1-all
+A=$ALL/demo/chair_survey_all.vviews
+mkdir -p "$ALL/demo"
+$V view-import --stills "$ALL" --embed none -o "$A" | tail -1
+$V view-detect -i "$A" -o "$A" | tail -1
+$V view-survey -i "$A" -o "$A" --report "${A%.vviews}_survey.json" | grep -E '^(survey done|camera):'
+$V view-select -i "$A" --posed --embed preview -o "$ALL/demo/chair_views.vviews" \
+    --id DSC00742 --id DSC00730 --id DSC00754 --id DSC00723 --id DSC00739 \
+    --id DSC00749 --id DSC00727 --id DSC00745 --id DSC00760 --id DSC00731

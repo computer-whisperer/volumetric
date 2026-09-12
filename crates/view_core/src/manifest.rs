@@ -196,23 +196,42 @@ pub fn import_manifest(
 }
 
 fn select<'a>(candidates: &'a [Candidate], selection: &Selection) -> Result<Vec<&'a Candidate>> {
-    let has_tag = |view: &View, tag: &str| view.tags.iter().any(|t| t == tag);
-    let mut kept: Vec<&Candidate> = candidates
-        .iter()
-        .filter(|c| match selection.eye {
-            Eye::Both => true,
-            Eye::Left => has_tag(&c.view, "left") || !has_tag(&c.view, "right"),
-            Eye::Right => has_tag(&c.view, "right") || !has_tag(&c.view, "left"),
+    let views: Vec<&View> = candidates.iter().map(|c| &c.view).collect();
+    let chosen = select_views(&views, selection)?;
+    Ok(chosen
+        .into_iter()
+        .map(|view| {
+            candidates
+                .iter()
+                .find(|c| std::ptr::eq(&c.view, view))
+                .expect("a chosen view is one of the candidates")
         })
-        .filter(|c| {
+        .collect())
+}
+
+/// The views of `views` the selection keeps, in the selection's order:
+/// the eye and split tags, nearness to a point, then the named ids (in
+/// the order given), every `stride`th survivor, and at most `max`. An
+/// empty result is an error.
+pub fn select_views<'a>(views: &[&'a View], selection: &Selection) -> Result<Vec<&'a View>> {
+    let has_tag = |view: &View, tag: &str| view.tags.iter().any(|t| t == tag);
+    let mut kept: Vec<&View> = views
+        .iter()
+        .copied()
+        .filter(|view| match selection.eye {
+            Eye::Both => true,
+            Eye::Left => has_tag(view, "left") || !has_tag(view, "right"),
+            Eye::Right => has_tag(view, "right") || !has_tag(view, "left"),
+        })
+        .filter(|view| {
             selection
                 .split
                 .as_deref()
-                .is_none_or(|split| has_tag(&c.view, split))
+                .is_none_or(|split| has_tag(view, split))
         })
-        .filter(|c| {
+        .filter(|view| {
             selection.near.is_none_or(|(point, radius)| {
-                c.view.position().is_some_and(|p| {
+                view.position().is_some_and(|p| {
                     let d = [p[0] - point[0], p[1] - point[1], p[2] - point[2]];
                     (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() <= radius
                 })
@@ -222,11 +241,11 @@ fn select<'a>(candidates: &'a [Candidate], selection: &Selection) -> Result<Vec<
     if !selection.ids.is_empty() {
         let mut by_id = Vec::with_capacity(selection.ids.len());
         for id in &selection.ids {
-            let candidate = kept
+            let view = kept
                 .iter()
-                .find(|c| c.view.id == *id)
+                .find(|view| view.id == *id)
                 .ok_or_else(|| anyhow!("no view {id:?} passes the filters"))?;
-            by_id.push(*candidate);
+            by_id.push(*view);
         }
         kept = by_id;
     }

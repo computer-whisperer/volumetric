@@ -88,6 +88,8 @@ undersides are missing and every "bottom" below is a silhouette.
 | 1 | L | `render` presets and grid assume y up; a surveyed world is z up, so `top` gave an elevation | `--up`, defaulted from the drawn view set or splat |
 | 2 | L, M | No numeric probe of a cloud from the CLI: radial profile about an axis, azimuth histogram, wedge/slab percentiles, cluster centres; done with numpy on the PLY (oracle). Region selection does exist: a box model + `mesh_clip` keeps the points inside, and `cloud_fit` on the selection gives lines, planes, cylinders with extents | design after B, from the list of queries actually needed |
 | 5 | B | `pattern` (and every wrapper reading dimensionality statically) refused a boolean's output: the glue passed `get_dimensions` through by a call | boolean emits the first model's constant (model_merge_core `const_i32_export`) |
+| 6 | V | No way to take some views of a surveyed set into a project: `view-import`'s filters apply to manifests only, and a `.vviews` could not be subset or have its pictures re-embedded | `view-select` (ids in order, posed, tags, nearness, stride, cap; `--embed keep/full/preview/none` through each view's source) |
+| 7 | V | `render --through` ignores the surveyed lens distortion (k1 −0.147, k2 0.255 on the a6700 at 50 mm), so an overlay is a few pixels off away from the centre at 1548 px wide | open: warp the render through the camera's distortion, or undistort the photograph once at import |
 | 3 | B | Operators without READMEs: cylinder, revolve, extrude, subspace, sweep, slice, model_bound, mesh_to_model | write as each is used |
 | 4 | B | No path sweep (a tube along a curve): the arms need one | two-view intersection (toy car) or an SDF script; decide in B |
 
@@ -106,3 +108,15 @@ undersides are missing and every "bottom" below is a silhouette.
   the underside of the arms (unseen by every camera; assume the tube
   section symmetric about the visible top), numeric residuals cloud →
   model.
+- 2026-09-11: the full shoot `chairbase-dslr-1-all` (192 stills, the 44
+  among them) surveyed here: 182 posed at 1.17 px rms (the shim 186 at
+  1.49), f 6900 ± 1.4 px, card corners 0.033 mm median from the shim's,
+  poses 2.0 mm / 0.08° median from the shim's over 180 frames (the dark
+  and blurred frames of the wider set). Ten of its views (the top-down
+  DSC00742, low DSC00730/54/23, the high ring DSC00739/49/27/45/60/31)
+  are loaded into `chair_base.vproj` by `base.sh`, previews embedded, so
+  `render --through` works on the base project itself and the GUI shows
+  the photographs. Through them: arms, hub and casters follow the
+  photographs; the near arm in DSC00754 shows the arm's underside curving
+  up towards the caster where the model's is a straight offset, and the
+  arm is wider than modelled near the tip.
