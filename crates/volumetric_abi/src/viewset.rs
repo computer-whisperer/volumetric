@@ -817,15 +817,34 @@ impl CameraModel {
         match &self.distortion {
             Distortion::None => (xd, yd),
             Distortion::Radial { .. } => {
-                // Fixed-point iteration on x = (xd - tangential(x)) / radial(x),
-                // which converges for the mild distortion of real lenses.
+                // Newton on distort(x) = xd with a finite-difference
+                // Jacobian, from the ideal lens. A fixed-point iteration
+                // converges only while 3 k1 r^2 stays small, which a
+                // strong lens or a frame's far corner breaks; Newton
+                // converges wherever the lens is invertible.
                 let (mut x, mut y) = (xd, yd);
                 for _ in 0..25 {
                     let (dx, dy) = self.distort(x, y);
-                    let (nx, ny) = (x + (xd - dx), y + (yd - dy));
-                    let moved = (nx - x).abs().max((ny - y).abs());
-                    (x, y) = (nx, ny);
-                    if moved < 1e-12 {
+                    let (rx, ry) = (dx - xd, dy - yd);
+                    if rx.abs().max(ry.abs()) < 1e-13 {
+                        break;
+                    }
+                    let h = 1e-7 * (1.0 + x.abs().max(y.abs()));
+                    let (dxx, dyx) = self.distort(x + h, y);
+                    let (dxy, dyy) = self.distort(x, y + h);
+                    let j = [
+                        (dxx - dx) / h,
+                        (dxy - dx) / h,
+                        (dyx - dy) / h,
+                        (dyy - dy) / h,
+                    ];
+                    let det = j[0] * j[3] - j[1] * j[2];
+                    if !det.is_finite() || det.abs() < 1e-18 {
+                        break;
+                    }
+                    let (sx, sy) = ((j[3] * rx - j[1] * ry) / det, (j[0] * ry - j[2] * rx) / det);
+                    (x, y) = (x - sx, y - sy);
+                    if sx.abs().max(sy.abs()) < 1e-13 {
                         break;
                     }
                 }
@@ -1189,6 +1208,32 @@ mod tests {
         }
         assert!(cameras()[0].project([0.0, 0.0, -1.0]).is_none());
         assert!((cameras()[0].fov_y() - 2.0 * (480.0f64 / 415.0).atan()).abs() < 1e-12);
+
+        // A strong lens at a far corner (pincushion k1 = 0.5, 1.4 off
+        // axis; barrel k1 = -0.3 with tangential terms): the inverse
+        // still lands, where a fixed-point iteration diverged.
+        let mut strong = CameraModel::pinhole(200, 200, 100.0, 100.0, 100.0, 100.0);
+        for distortion in [
+            Distortion::Radial {
+                k: vec![0.5],
+                p: [0.0; 2],
+            },
+            Distortion::Radial {
+                k: vec![-0.3, 0.1],
+                p: [0.01, -0.005],
+            },
+        ] {
+            strong.distortion = distortion;
+            for pixel in [[1.0, 1.0], [199.0, 30.0], [100.0, 199.0]] {
+                let point = strong.point_at_depth(pixel, 1.0);
+                let back = strong.project(point).expect("in front");
+                assert!(
+                    (back[0] - pixel[0]).abs() < 1e-8 && (back[1] - pixel[1]).abs() < 1e-8,
+                    "{:?}: {pixel:?} -> {point:?} -> {back:?}",
+                    strong.distortion
+                );
+            }
+        }
     }
 
     #[test]

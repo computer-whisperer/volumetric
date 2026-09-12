@@ -19,7 +19,7 @@ use glam::{Mat4, Vec2, Vec3};
 use volumetric_renderer as renderer;
 
 pub use volumetric_preview::{
-    ExecutionBackend, LocalBackend, LookThrough, PendingMesh, PreviewBounds, PreviewEntity,
+    ExecutionBackend, Framed, LocalBackend, LookThrough, PendingMesh, PreviewBounds, PreviewEntity,
     PreviewStage, ViewFrame, build_preview_scene, build_preview_scene_cancellable,
     build_preview_scene_monitored, build_preview_scene_with, preview_postlude, preview_prelude,
     submit_subspace_gizmo, submit_view_highlight,
@@ -575,6 +575,10 @@ struct ViewportRenderer {
     /// The frame of the view looked through in the last frame, so leaving
     /// look-through can seed the orbit camera from it.
     look_through: Option<ViewFrame>,
+    /// The looked-through frame drawn through its lens, for the viewport
+    /// size it was built for: the lens warp is a grid of undistorted
+    /// positions, rebuilt only when the view or the size changes.
+    look_framed: Option<((u32, u32), Framed)>,
     /// Camera input arrived during look-through: the viewport has already
     /// moved to the orbit camera, and the app must follow (`sync` tells it).
     look_through_left: bool,
@@ -626,6 +630,7 @@ impl ViewportRenderer {
             pending_frame_preview: false,
             camera: None,
             look_through: None,
+            look_framed: None,
             look_through_left: false,
             viewport_logical_size: Vec2::ZERO,
         }
@@ -679,14 +684,32 @@ impl ViewportRenderer {
         let view = match &look_through {
             Some(look) => {
                 submit_view_highlight(&mut self.renderer, &look.frustum);
-                self.look_through = Some(look.frame);
+                if self.look_through.as_ref() != Some(&look.frame)
+                    || self
+                        .look_framed
+                        .as_ref()
+                        .is_none_or(|(size, _)| *size != (w, h))
+                {
+                    self.look_framed = Some(((w, h), look.frame.framed(w, h)));
+                }
+                self.look_through = Some(look.frame.clone());
                 let bounds = self.scene_bounds.unwrap_or(PreviewBounds {
                     min: (-1.0, -1.0, -1.0),
                     max: (1.0, 1.0, 1.0),
                 });
-                look.frame.camera_view(w, h, bounds)
+                // The photograph is shown as shot; the render is drawn
+                // through its lens.
+                let framed = &self.look_framed.as_ref().expect("built above").1;
+                if let Err(err) = self.renderer.set_warp(device, framed.warp.as_ref()) {
+                    log::warn!("look-through lens: {err}");
+                }
+                look.frame.camera_view(framed, bounds)
             }
             None => {
+                self.look_framed = None;
+                if let Err(err) = self.renderer.set_warp(device, None) {
+                    log::warn!("look-through lens: {err}");
+                }
                 if let Some(frame) = self.look_through.take() {
                     self.continue_from(frame);
                 }

@@ -1,81 +1,11 @@
 //! Compositing a render over the photograph it was taken through, so a
-//! reader can judge where the model and the picture agree.
+//! reader can judge where the model and the picture agree. The render
+//! is drawn through the photograph's lens (the renderer's warp), so the
+//! photograph is used as shot.
 
 use anyhow::{Result, bail};
-use volumetric_abi::viewset::{CameraModel, Distortion};
 
 use crate::image::Rgb;
-
-/// Resample the photograph into the camera's ideal pinhole projection,
-/// matching the renderer. The input may be a preview or resized original;
-/// output dimensions stay the same. Pixels outside the source are black.
-/// Measurement commands continue to use original, distorted coordinates.
-pub fn rectify_photo(photo: &Rgb, camera: &CameraModel) -> Result<Rgb> {
-    camera.validate().map_err(anyhow::Error::msg)?;
-    if photo.width == 0
-        || photo.height == 0
-        || photo.pixels.len() != photo.width as usize * photo.height as usize * 3
-    {
-        bail!("invalid photograph dimensions or pixel buffer");
-    }
-    if camera.distortion == Distortion::None {
-        return Ok(photo.clone());
-    }
-    let sx = f64::from(photo.width) / f64::from(camera.width);
-    let sy = f64::from(photo.height) / f64::from(camera.height);
-    let mut out = Rgb::new(photo.width, photo.height);
-    for y in 0..photo.height {
-        for x in 0..photo.width {
-            // Destination is undistorted. Project its pinhole ray through
-            // the real lens to find the corresponding source pixel.
-            let ray = [
-                ((f64::from(x) + 0.5) / sx - camera.cx) / camera.fx,
-                ((f64::from(y) + 0.5) / sy - camera.cy) / camera.fy,
-                1.0,
-            ];
-            let Some([u, v]) = camera.project(ray) else {
-                continue;
-            };
-            // Camera pixels are centered at +0.5; array indices at zero.
-            let (u, v) = (u * sx - 0.5, v * sy - 0.5);
-            if !u.is_finite()
-                || !v.is_finite()
-                || u < -0.5
-                || v < -0.5
-                || u >= f64::from(photo.width) - 0.5
-                || v >= f64::from(photo.height) - 0.5
-            {
-                continue;
-            }
-            let (u, v) = (
-                u.clamp(0.0, f64::from(photo.width - 1)),
-                v.clamp(0.0, f64::from(photo.height - 1)),
-            );
-            let (x0, y0) = (u.floor() as u32, v.floor() as u32);
-            let (x1, y1) = (
-                (x0 + 1).min(photo.width - 1),
-                (y0 + 1).min(photo.height - 1),
-            );
-            let (fx, fy) = (u - f64::from(x0), v - f64::from(y0));
-            let taps = [
-                (photo.get(x0, y0), (1.0 - fx) * (1.0 - fy)),
-                (photo.get(x1, y0), fx * (1.0 - fy)),
-                (photo.get(x0, y1), (1.0 - fx) * fy),
-                (photo.get(x1, y1), fx * fy),
-            ];
-            let mut pixel = [0u8; 3];
-            for (c, value) in pixel.iter_mut().enumerate() {
-                *value = taps
-                    .iter()
-                    .map(|(rgb, w)| f64::from(rgb[c]) * w)
-                    .sum::<f64>()
-                    .round() as u8;
-            }
-            out.set(x, y, pixel);
-        }
-    }
-    Ok(out)
-}
 
 /// How the render and the photograph are combined.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -205,76 +135,6 @@ pub fn compose(photo: &Rgb, render: &Rgb, coverage: &[f32], overlay: Overlay) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn rectification_matches_analytic_radial_projection_at_full_and_preview_size() {
-        let mut camera = CameraModel::pinhole(200, 200, 100.0, 100.0, 100.0, 100.0);
-        camera.distortion = Distortion::Radial {
-            k: vec![0.5],
-            p: [0.0; 2],
-        };
-        for size in [200, 100] {
-            let mut photo = Rgb::new(size, size);
-            for y in 0..size {
-                for x in 0..size {
-                    photo.set(x, y, [x as u8, y as u8, 100]);
-                }
-            }
-            let rectified = rectify_photo(&photo, &camera).unwrap();
-            // Pixel centers: full-size destination (160.5,100.5)
-            // samples at array index (171.073,100.092); half-size
-            // destination (80.5,50.5) samples at (85.676,50.093).
-            let (x, y, expected) = if size == 200 {
-                (160, 100, 171)
-            } else {
-                (80, 50, 86)
-            };
-            assert_eq!(rectified.get(x, y), [expected, y as u8, 100]);
-            assert_eq!(rectified.get(0, 0), [0, 0, 0], "outside source");
-            camera.distortion = Distortion::None;
-            assert_eq!(rectify_photo(&photo, &camera).unwrap(), photo);
-            camera.distortion = Distortion::Radial {
-                k: vec![0.5],
-                p: [0.0; 2],
-            };
-        }
-    }
-
-    #[test]
-    fn rectification_uses_fisheye_projection_and_checks_buffers() {
-        let mut camera = CameraModel::pinhole(200, 200, 100.0, 100.0, 100.0, 100.0);
-        camera.distortion = Distortion::KannalaBrandt { k: [0.0; 4] };
-        let mut photo = Rgb::new(200, 200);
-        for y in 0..200 {
-            for x in 0..200 {
-                photo.set(x, y, [x as u8, y as u8, 0]);
-            }
-        }
-        let out = rectify_photo(&photo, &camera).unwrap();
-        // Equidistant lens at ideal (.805,.005); source array x≈167.28.
-        assert_eq!(out.get(180, 100), [167, 100, 0]);
-        photo.pixels.pop();
-        assert!(rectify_photo(&photo, &camera).is_err());
-    }
-
-    #[test]
-    fn rectification_preserves_fractional_centers_with_tangential_distortion() {
-        let mut camera = CameraModel::pinhole(400, 240, 180.0, 190.0, 181.7, 113.9);
-        camera.distortion = Distortion::Radial {
-            k: vec![],
-            p: [0.05, -0.03],
-        };
-        let mut photo = Rgb::new(200, 60); // anisotropic preview scaling
-        for y in 0..60 {
-            for x in 0..200 {
-                photo.set(x, y, [x as u8, (3 * y) as u8, 107]);
-            }
-        }
-        let out = rectify_photo(&photo, &camera).unwrap();
-        // Brown tangential terms evaluated independently at ideal sensor
-        // coordinate (301,162), then scaled back to preview array indices.
-        assert_eq!(out.get(150, 40), [148, 123, 107]);
-    }
 
     fn images() -> (Rgb, Rgb, Vec<f32>) {
         let mut photo = Rgb::new(4, 4);

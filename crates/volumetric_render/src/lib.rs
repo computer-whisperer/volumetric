@@ -17,16 +17,16 @@ use anyhow::{Context, Result};
 use glam::{Mat4, Quat, Vec3};
 
 use view_core::image::{Rgb, decode_rgb};
-use view_core::overlay::{compose, rectify_photo};
+use view_core::overlay::compose;
 use volumetric::{AssetTypeHint, LoadedAsset};
-use volumetric_abi::viewset::Distortion;
 use volumetric_preview::{
     Asn2Settings, PreviewBounds, PreviewEntity, PreviewMeshPlan, PreviewPlan, PreviewRenderMode,
-    PreviewRequest, build_preview_scene, clip_planes_for, observation_lines, srgb_to_linear,
-    submit_subspace_gizmo, submit_view_highlight, wireframe_style,
+    PreviewRequest, ViewFrame, build_preview_scene, clip_planes_for, observation_lines,
+    srgb_to_linear, submit_subspace_gizmo, submit_view_highlight, wireframe_style,
 };
 use volumetric_renderer::{
-    Camera, CameraView, GridPlanes, LineData, RenderSettings, ViewDirection, offscreen::Offscreen,
+    Camera, CameraView, GridPlanes, LineData, RenderSettings, ViewDirection, Warp,
+    offscreen::Offscreen,
 };
 
 pub use view_core::overlay::Overlay;
@@ -284,7 +284,7 @@ pub struct RenderReport {
     /// Where the up came from: `options`, an asset's id, or `default`.
     pub up_source: String,
     pub gpu: String,
-    /// Advisories: a photograph rectified for the overlay, geometry dropped
+    /// Advisories: a frame drawn through a view's lens, geometry dropped
     /// at the GPU buffer limit.
     pub notes: Vec<String>,
 }
@@ -599,6 +599,7 @@ pub fn render(
     // sizes scale its intrinsics so smaller renders stay aligned.
     let mut photo: Option<Rgb> = None;
     let mut marks: Option<LineData> = None;
+    let mut lens: Option<Warp> = None;
     let mut size = (
         options.width.unwrap_or(1024),
         options.height.unwrap_or(1024),
@@ -635,8 +636,6 @@ pub fn render(
                 options.width.unwrap_or(view_camera.width),
                 options.height.unwrap_or(view_camera.height),
             );
-            let sx = size.0 as f64 / f64::from(view_camera.width);
-            let sy = size.1 as f64 / f64::from(view_camera.height);
             if options.marks {
                 marks = Some(LineData {
                     segments: observation_lines(view, view_camera),
@@ -649,30 +648,24 @@ pub fn render(
                         view.id
                     )
                 })?;
-                photo = Some(rectify_photo(
-                    &decode_rgb(bytes)?.resized(size.0, size.1)?,
-                    view_camera,
-                )?);
-                if view_camera.distortion != Distortion::None {
-                    notes.push(format!(
-                        "view {}: photograph rectified to the render's pinhole projection",
-                        view.id
-                    ));
-                }
+                photo = Some(decode_rgb(bytes)?.resized(size.0, size.1)?);
             }
+            // The frame is drawn through the view's lens: the scene
+            // renders through the overscan pinhole and the warp bends it
+            // into the photograph's own pixels.
+            let frame = ViewFrame::of(view, view_camera)
+                .with_context(|| format!("view '{}' is not posed", view.id))?;
+            let framed = frame.framed_stretched(size.0, size.1);
+            if let Some(warp) = &framed.warp {
+                notes.push(format!(
+                    "view {}: drawn through the lens ({} x {} pinhole frame warped to {} x {})",
+                    view.id, warp.source.0, warp.source.1, size.0, size.1
+                ));
+            }
+            lens = framed.warp;
             CameraSpec::Pinhole {
-                pinhole: Pinhole {
-                    fx: (view_camera.fx * sx) as f32,
-                    fy: (view_camera.fy * sy) as f32,
-                    cx: (view_camera.cx * sx) as f32,
-                    cy: (view_camera.cy * sy) as f32,
-                    width: size.0,
-                    height: size.1,
-                },
-                camera_to_world: pose_matrix(
-                    view.pose()
-                        .with_context(|| format!("view '{}' is not posed", view.id))?,
-                ),
+                pinhole: framed.pinhole,
+                camera_to_world: frame.camera_to_world,
             }
         }
         other => {
@@ -738,6 +731,9 @@ pub fn render(
     let offscreen = Offscreen::new().map_err(anyhow::Error::msg)?;
     let gpu = offscreen.adapter_name();
     let mut renderer = offscreen.renderer(size.0, size.1);
+    renderer
+        .set_warp(offscreen.device(), lens.as_ref())
+        .map_err(anyhow::Error::msg)?;
     let resident: Vec<_> = entities
         .iter()
         .map(|entity| renderer.create_retained_scene(offscreen.device(), &entity.scene))

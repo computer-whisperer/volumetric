@@ -57,9 +57,11 @@ Outputs in `work/`:
 - `check-DSC007*.png`: picked pixels (cyan) and projected 3D centers
   (magenta); labels use original full-resolution image coordinates.
 - `overlay-DSC007*.png`, `mount_iso.png`, `mount_top.png`: render outputs
-  when `--render` is supplied. Overlay photographs are rectified to the
-  pinhole camera used by the renderer; their coordinates differ from the
-  original-pixel `check-*` crops.
+  when `--render` is supplied. Since 2026-09-12 the renderer draws the
+  model through the camera's lens, so overlay photographs are shown as
+  shot and share the original-pixel coordinates of the `check-*` crops
+  (before that, overlays were rectified to the renderer's pinhole and the
+  two differed).
 
 ## What the first measurement establishes
 

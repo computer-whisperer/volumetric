@@ -1467,8 +1467,8 @@ impl VolumetricUiV2 {
         LookThrough::of(view, camera)
     }
 
-    /// The looked-through photograph, rectified to the viewport's pinhole
-    /// projection and decoded once per view.
+    /// The looked-through photograph as shot (the render is drawn through
+    /// its lens), decoded once per view.
     fn look_photo(&self) -> Option<Image> {
         let look = self.look_through.as_ref()?;
         let asset = self
@@ -1482,12 +1482,11 @@ impl VolumetricUiV2 {
             return image.clone();
         }
         let set = self.viewset_of(asset)?;
-        let (view, camera) = set.view(&look.view_id)?;
+        let (view, _) = set.view(&look.view_id)?;
         let image = view
             .image
             .as_deref()
             .and_then(|bytes| view_core::image::decode_rgb(bytes).ok())
-            .and_then(|photo| view_core::overlay::rectify_photo(&photo, camera).ok())
             .map(|photo| Image::from_rgb8(photo.width, photo.height, photo.pixels));
         *self.look_photo.borrow_mut() = Some((key, image.clone()));
         image
@@ -10747,8 +10746,10 @@ mod tests {
         app
     }
 
+    /// The photograph is shown as shot, its lens and all: the render is
+    /// what bends to it.
     #[test]
-    fn look_through_rectifies_the_photo_to_the_viewport_camera() {
+    fn look_through_shows_the_photo_as_shot() {
         let asset = viewset_asset("views");
         let mut set = viewset::decode_viewset(asset.data()).unwrap();
         let mut camera = viewset::CameraModel::pinhole(200, 200, 100.0, 100.0, 100.0, 100.0);
@@ -10773,9 +10774,24 @@ mod tests {
         let mut app = VolumetricUiV2::default();
         app.apply_run_result(Ok(vec![asset]), 1);
         app.toggle_look_through("views", "v1");
-        let image = app.look_photo().expect("rectified photo");
+        let image = app.look_photo().expect("the photo");
         let index = (100 * 200 + 160) * 4;
-        assert_eq!(&image.pixels()[index..index + 4], &[171, 100, 100, 255]);
+        assert_eq!(&image.pixels()[index..index + 4], &[160, 100, 100, 255]);
+        // Its frame bends the render to the lens.
+        let look = app.look_through_frame().unwrap();
+        let framed = look.frame.framed(200, 200);
+        assert!(framed.warp.is_some(), "a real lens warps the render");
+        // Pincushion (k1 > 0): the corners push out, the overscan is
+        // smaller than the output and the pinhole's centre moves in.
+        assert!(
+            framed.pinhole.width <= 200 && framed.pinhole.cx < 100.0,
+            "{:?} {:?}",
+            framed.pinhole,
+            framed
+                .warp
+                .as_ref()
+                .map(|w| (w.source, w.lookup(100.0, 100.0), w.lookup(1.0, 1.0)))
+        );
     }
 
     #[test]

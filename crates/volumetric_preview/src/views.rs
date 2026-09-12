@@ -3,9 +3,9 @@
 //! view, and the highlight of that view among the others.
 
 use glam::{Mat4, Vec3, Vec4};
-use volumetric::viewset::{CameraModel, PickRole, View, ViewSet, decode_viewset};
+use volumetric::viewset::{CameraModel, Distortion, PickRole, View, ViewSet, decode_viewset};
 use volumetric_renderer as renderer;
-use volumetric_renderer::{CameraView, Pinhole};
+use volumetric_renderer::{CameraView, Pinhole, Warp};
 
 use crate::{OutputStats, PreviewBounds, PreviewEntity, PreviewRequest};
 
@@ -307,12 +307,34 @@ pub fn viewset_detail(set: &ViewSet) -> Vec<String> {
 }
 
 /// One view's camera as the viewport takes it: the pinhole at the image's
-/// own size and the camera-to-world pose.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// own size, the lens it was shot through, and the camera-to-world pose.
+#[derive(Clone, Debug, PartialEq)]
 pub struct ViewFrame {
     pub pinhole: Pinhole,
+    pub camera: CameraModel,
     pub camera_to_world: Mat4,
 }
+
+/// A frame drawn through a view's lens: the pinhole the scene renders
+/// through, and the warp that bends that render into the photograph's
+/// own pixels. `warp` is `None` for an ideal lens, when the pinhole is
+/// the output frame itself.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Framed {
+    pub pinhole: Pinhole,
+    pub warp: Option<Warp>,
+}
+
+/// Rays further off axis than this, in normalised camera coordinates
+/// (about 76 degrees), have no pinhole image: a fisheye's rim.
+const LENS_LIMIT: f64 = 4.0;
+/// Output pixels between warp grid samples; the lens is smooth at this
+/// scale, so bilinear interpolation between samples is exact to well
+/// under a pixel.
+const WARP_STEP_PX: u32 = 16;
+/// Points along each edge of the output frame whose undistorted images
+/// bound the pinhole frame.
+const WARP_EDGE_SAMPLES: u32 = 64;
 
 impl ViewFrame {
     /// `None` for an unposed view: there is nowhere to look from.
@@ -326,8 +348,141 @@ impl ViewFrame {
                 width: camera.width,
                 height: camera.height,
             },
+            camera: camera.clone(),
             camera_to_world: pose_matrix(view.pose()?),
         })
+    }
+
+    /// The frame for a `width` x `height` output with the picture
+    /// letterboxed in it (the GUI's `Contain` fit), drawn through the lens.
+    pub fn framed(&self, width: u32, height: u32) -> Framed {
+        let (cw, ch) = (
+            f64::from(self.pinhole.width),
+            f64::from(self.pinhole.height),
+        );
+        let (w, h) = (f64::from(width.max(1)), f64::from(height.max(1)));
+        let scale = (w / cw).min(h / ch);
+        let ox = (w - cw * scale) * 0.5;
+        let oy = (h - ch * scale) * 0.5;
+        self.framed_with(width.max(1), height.max(1), [scale, scale], [ox, oy])
+    }
+
+    /// The frame for a `width` x `height` output with the picture
+    /// stretched to fill it (the headless render's scaled frame), drawn
+    /// through the lens.
+    pub fn framed_stretched(&self, width: u32, height: u32) -> Framed {
+        let (cw, ch) = (
+            f64::from(self.pinhole.width),
+            f64::from(self.pinhole.height),
+        );
+        let (w, h) = (f64::from(width.max(1)), f64::from(height.max(1)));
+        self.framed_with(width.max(1), height.max(1), [w / cw, h / ch], [0.0, 0.0])
+    }
+
+    /// The frame for an output in which camera pixel `q` sits at `q *
+    /// scale + offset`. An ideal lens gives that pinhole and no warp. A
+    /// real lens gives the pinhole of the *overscan* frame, the ideal
+    /// image of the output's boundary, and the warp from the output's
+    /// pixels into it.
+    fn framed_with(&self, width: u32, height: u32, scale: [f64; 2], offset: [f64; 2]) -> Framed {
+        let camera = &self.camera;
+        // Camera pixel `q` sits at `(q - origin) * scale + shift` in a
+        // frame: the output has the letterbox shift, the overscan frame
+        // its own origin and no shift.
+        let scaled =
+            |frame_width: u32, frame_height: u32, origin: [f64; 2], shift: [f64; 2]| Pinhole {
+                fx: (camera.fx * scale[0]) as f32,
+                fy: (camera.fy * scale[1]) as f32,
+                cx: ((camera.cx - origin[0]) * scale[0] + shift[0]) as f32,
+                cy: ((camera.cy - origin[1]) * scale[1] + shift[1]) as f32,
+                width: frame_width,
+                height: frame_height,
+            };
+        if camera.distortion == Distortion::None {
+            return Framed {
+                pinhole: scaled(width, height, [0.0, 0.0], offset),
+                warp: None,
+            };
+        }
+        // The ideal pinhole pixel an output pixel's ray goes through, in
+        // camera pixel units; `None` off the lens's limit or where the
+        // lens model does not invert cleanly (far outside the picture).
+        let ideal = |x: f64, y: f64| -> Option<[f64; 2]> {
+            let q = [(x - offset[0]) / scale[0], (y - offset[1]) / scale[1]];
+            let [xn, yn, _] = camera.point_at_depth(q, 1.0);
+            if !(xn.is_finite() && yn.is_finite()) || xn.abs() > LENS_LIMIT || yn.abs() > LENS_LIMIT
+            {
+                return None;
+            }
+            let back = camera.project([xn, yn, 1.0])?;
+            if (back[0] - q[0]).abs() > 0.05 || (back[1] - q[1]).abs() > 0.05 {
+                return None;
+            }
+            Some([camera.fx * xn + camera.cx, camera.fy * yn + camera.cy])
+        };
+        // The overscan: the ideal image of the output's boundary, padded
+        // a pixel, in camera pixels.
+        let (w, h) = (f64::from(width), f64::from(height));
+        let mut min = [f64::INFINITY; 2];
+        let mut max = [f64::NEG_INFINITY; 2];
+        for i in 0..=WARP_EDGE_SAMPLES {
+            let t = f64::from(i) / f64::from(WARP_EDGE_SAMPLES);
+            for p in [[t * w, 0.0], [t * w, h], [0.0, t * h], [w, t * h]] {
+                if let Some(u) = ideal(p[0], p[1]) {
+                    min = [min[0].min(u[0]), min[1].min(u[1])];
+                    max = [max[0].max(u[0]), max[1].max(u[1])];
+                }
+            }
+        }
+        // A boundary wholly beyond the lens's limit (a fisheye wider than
+        // the limit) leaves the overscan at the limit itself; a partly
+        // mapped one is clipped to it.
+        let limit = [
+            [
+                camera.cx - camera.fx * LENS_LIMIT,
+                camera.cy - camera.fy * LENS_LIMIT,
+            ],
+            [
+                camera.cx + camera.fx * LENS_LIMIT,
+                camera.cy + camera.fy * LENS_LIMIT,
+            ],
+        ];
+        if !(min[0].is_finite() && max[0].is_finite() && min[1].is_finite() && max[1].is_finite()) {
+            (min, max) = limit.into();
+        }
+        min = [min[0].max(limit[0][0]), min[1].max(limit[0][1])];
+        max = [max[0].min(limit[1][0]), max[1].min(limit[1][1])];
+        let origin = [min[0] - 1.0, min[1] - 1.0];
+        let source = (
+            ((max[0] + 1.0 - origin[0]) * scale[0]).ceil().max(1.0) as u32,
+            ((max[1] + 1.0 - origin[1]) * scale[1]).ceil().max(1.0) as u32,
+        );
+        let columns = width.div_ceil(WARP_STEP_PX) + 1;
+        let rows = height.div_ceil(WARP_STEP_PX) + 1;
+        let mut grid = Vec::with_capacity((columns * rows) as usize);
+        for j in 0..rows {
+            let y = f64::from(j) * h / f64::from(rows - 1);
+            for i in 0..columns {
+                let x = f64::from(i) * w / f64::from(columns - 1);
+                grid.push(match ideal(x, y) {
+                    Some(u) => [
+                        ((u[0] - origin[0]) * scale[0]) as f32,
+                        ((u[1] - origin[1]) * scale[1]) as f32,
+                    ],
+                    None => [-1.0, -1.0],
+                });
+            }
+        }
+        Framed {
+            pinhole: scaled(source.0, source.1, origin, [0.0, 0.0]),
+            warp: Some(Warp {
+                source,
+                output: (width, height),
+                columns,
+                rows,
+                grid,
+            }),
+        }
     }
 
     pub fn eye(&self) -> Vec3 {
@@ -346,25 +501,6 @@ impl ViewFrame {
             .normalize()
     }
 
-    /// The pinhole for a `width` x `height` frame: the camera's image scaled
-    /// uniformly to fit and centred, so the picture sits in a letterbox and
-    /// the projection stays true.
-    pub fn letterboxed(&self, width: u32, height: u32) -> Pinhole {
-        let (cw, ch) = (self.pinhole.width as f32, self.pinhole.height as f32);
-        let (w, h) = (width.max(1) as f32, height.max(1) as f32);
-        let scale = (w / cw).min(h / ch);
-        let ox = (w - cw * scale) * 0.5;
-        let oy = (h - ch * scale) * 0.5;
-        Pinhole {
-            fx: self.pinhole.fx * scale,
-            fy: self.pinhole.fy * scale,
-            cx: self.pinhole.cx * scale + ox,
-            cy: self.pinhole.cy * scale + oy,
-            width: width.max(1),
-            height: height.max(1),
-        }
-    }
-
     /// The near and far planes that keep `bounds` in view from the eye.
     pub fn clip_planes(&self, bounds: PreviewBounds) -> (f32, f32) {
         clip_planes_for(
@@ -375,16 +511,12 @@ impl ViewFrame {
         )
     }
 
-    /// The view and projection for a `width` x `height` frame that keeps
-    /// `bounds` between the clip planes.
-    pub fn camera_view(&self, width: u32, height: u32, bounds: PreviewBounds) -> CameraView {
+    /// The view and projection for a frame that keeps `bounds` between
+    /// the clip planes: a `Framed`'s pinhole, from [`framed`](Self::framed)
+    /// or [`framed_stretched`](Self::framed_stretched).
+    pub fn camera_view(&self, framed: &Framed, bounds: PreviewBounds) -> CameraView {
         let (near, far) = self.clip_planes(bounds);
-        CameraView::pinhole(
-            &self.letterboxed(width, height),
-            self.camera_to_world,
-            near,
-            far,
-        )
+        CameraView::pinhole(&framed.pinhole, self.camera_to_world, near, far)
     }
 }
 
@@ -662,14 +794,22 @@ mod tests {
         assert_eq!(frame.up(), Vec3::Y);
 
         // A 1000 x 300 viewport: the 400 x 300 picture scales by 1 and
-        // sits 300 px in.
-        let boxed = frame.letterboxed(1000, 300);
+        // sits 300 px in. An ideal lens needs no warp.
+        let framed = frame.framed(1000, 300);
+        let boxed = &framed.pinhole;
         assert_eq!((boxed.fx, boxed.fy), (400.0, 400.0));
         assert_eq!((boxed.cx, boxed.cy), (500.0, 150.0));
+        assert_eq!(framed.warp, None);
         // A 200 x 600 viewport: scale 0.5, the picture is 200 x 150 at
         // y = 225.
-        let boxed = frame.letterboxed(200, 600);
+        let boxed = frame.framed(200, 600).pinhole;
         assert_eq!((boxed.fx, boxed.cx, boxed.cy), (200.0, 100.0, 300.0));
+        // Stretched to 800 x 300: x doubles, y stays.
+        let stretched = frame.framed_stretched(800, 300).pinhole;
+        assert_eq!(
+            (stretched.fx, stretched.fy, stretched.cx, stretched.cy),
+            (800.0, 400.0, 400.0, 150.0)
+        );
 
         // A world point that lands on camera pixel (300, 150) lands on
         // the same picture pixel scaled and offset in the viewport.
@@ -679,7 +819,7 @@ mod tests {
             min: (-1.0, -1.0, -5.0),
             max: (1.0, 1.0, -3.0),
         };
-        let cv = frame.camera_view(1000, 300, bounds);
+        let cv = frame.camera_view(&frame.framed(1000, 300), bounds);
         let px = cv
             .project(Vec3::from(world.map(|v| v as f32)), 1000, 300)
             .unwrap();
@@ -690,5 +830,86 @@ mod tests {
 
         let (near, far) = frame.clip_planes(bounds);
         assert!(near > 0.0 && near < 1.0 && far > 3.0, "{near} {far}");
+    }
+
+    /// Through a barrel lens the frame renders with an overscan and a
+    /// warp: a world point's pixel in the photograph, taken through the
+    /// warp, lands on the point's ideal pinhole pixel in the overscan
+    /// frame, both letterboxed and stretched; a straight line stays
+    /// straight in the overscan frame, so the render bends only at the
+    /// warp.
+    #[test]
+    fn a_lens_frame_warps_the_output_onto_the_pinhole_render() {
+        let mut set = set();
+        set.cameras[0].distortion = Distortion::Radial {
+            k: vec![-0.3, 0.1],
+            p: [0.001, -0.0005],
+        };
+        let (view, camera) = set.view("v").unwrap();
+        let frame = ViewFrame::of(view, camera).unwrap();
+        // Barrel: the corners pull in, so the ideal image of the frame's
+        // boundary reaches beyond the picture.
+        let framed = frame.framed(400, 300);
+        let warp = framed.warp.as_ref().expect("a real lens warps");
+        assert_eq!(warp.output, (400, 300));
+        assert!(
+            warp.source.0 > 400 && warp.source.1 > 300,
+            "{:?}",
+            warp.source
+        );
+        assert_eq!(framed.pinhole.width, warp.source.0);
+        assert!(framed.pinhole.cx > 200.0, "the overscan shifts the centre");
+        let bounds = PreviewBounds {
+            min: (-2.0, -2.0, -6.0),
+            max: (2.0, 2.0, -3.0),
+        };
+        for (framed, size, offset) in [
+            (frame.framed(400, 300), (400u32, 300u32), (0.0f64, 0.0f64)),
+            (frame.framed(1000, 300), (1000, 300), (300.0, 0.0)),
+            (frame.framed_stretched(800, 300), (800, 300), (0.0, 0.0)),
+        ] {
+            let warp = framed.warp.as_ref().unwrap();
+            let cv = frame.camera_view(&framed, bounds);
+            for world in [[0.5, 0.0, -4.0], [-0.8, 0.6, -4.0], [0.4, -0.3, -3.2]] {
+                // Where the photograph has the point.
+                let [u, v] = view.project(camera, world).unwrap();
+                let sx = f64::from(size.0 - 2 * offset.0 as u32) / 400.0;
+                let sy = f64::from(size.1) / 300.0;
+                let out = [u * sx + offset.0, v * sy + offset.1];
+                // Where the warp reads for that output pixel.
+                let src = warp
+                    .lookup(out[0] as f32, out[1] as f32)
+                    .expect("inside the lens limit");
+                // Where the pinhole render has the point.
+                let px = cv
+                    .project(
+                        Vec3::from(world.map(|c| c as f32)),
+                        warp.source.0,
+                        warp.source.1,
+                    )
+                    .unwrap();
+                // Within a tenth of a pixel: the grid interpolates the
+                // lens between samples 16 px apart, and this lens is
+                // twice as strong at the corners as the chair's DSLR.
+                assert!(
+                    (f64::from(px.x) - f64::from(src[0])).abs() < 0.1
+                        && (f64::from(px.y) - f64::from(src[1])).abs() < 0.1,
+                    "{size:?} {world:?}: warp reads {src:?}, render has {px:?}"
+                );
+            }
+        }
+        // The lens limit: a wildly off-axis output pixel has no image.
+        let mut fish = set.clone();
+        fish.cameras[0].distortion = Distortion::KannalaBrandt {
+            k: [0.0, 0.0, 0.0, 0.0],
+        };
+        // 180 degrees across the 400 px width.
+        fish.cameras[0].fx = 127.0;
+        fish.cameras[0].fy = 127.0;
+        let (view, camera) = fish.view("v").unwrap();
+        let framed = ViewFrame::of(view, camera).unwrap().framed(400, 300);
+        let warp = framed.warp.as_ref().unwrap();
+        assert!(warp.lookup(200.0, 150.0).is_some());
+        assert!(warp.lookup(1.0, 1.0).is_none(), "beyond 76 degrees");
     }
 }

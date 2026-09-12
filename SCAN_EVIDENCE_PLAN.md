@@ -140,7 +140,7 @@ measurement feedback. All evidence paths above are under
 | S1 | Splat value, 3DGS PLY import, `splat-list`, splat to point cloud | 2 days | landed |
 | S2 | Splat rendering in the viewport and `render`, look-through over the photograph | 4 days | landed |
 | S3 | Photometric audit: the splat rendered through each view against its photograph | 2 days | pending |
-| P | Python bindings (PyO3, maturin) over cv_core, view_core, the survey, splats and projects | 3 days | P1..P3d landed 2026-09-12; open: pick labels and recording in the GUI |
+| P | Python bindings (PyO3, maturin) over cv_core, view_core, the survey, splats and projects | 3 days | P1..P4 landed 2026-09-12 (P4: render drawn through the lens); open: pick labels and recording in the GUI |
 | D | Evidence audits for still sets: intake, detection, survey, setup, coverage, photometric, physical | 3 days | pending |
 
 Proposed order: C2, C3 (the survey is the stage the agent starts from and
@@ -887,12 +887,12 @@ overlay would otherwise fade them with the render), with the frame's
 clip planes reaching the picture plane. Open: labels by the crosses
 (the renderer draws no text), and recording picks from the GUI.
 
-P4 — lens-true look-through (proposed 2026-09-12, not yet ratified).
-Today the photograph is bent to the render: `rectify_photo` resamples
-it into the camera's ideal pinhole and the GUI, the CLI overlay and the
-Python `render` all show that resampled picture. The proposal inverts
-it: the render is bent to the photograph, which is then shown as shot,
-at its own pixels. Why: picks, crops and every measurement are in the
+P4 — lens-true look-through (ratified and landed 2026-09-12). Before
+it the photograph was bent to the render: `rectify_photo` resampled it
+into the camera's ideal pinhole and the GUI, the CLI overlay and the
+Python `render` all showed that resampled picture. Now the render is
+bent to the photograph, which is shown as shot, at its own pixels. Why:
+picks, crops and every measurement are in the
 original pixels, so the picture on screen and the picture measured
 become the same one (recording a pick by clicking in the GUI then needs
 no un-rectifying of the click); a fisheye's corners stay on the picture
@@ -948,7 +948,28 @@ distortion, differ from today only by the lens bend, and a
 with `--marks`, the card quads at the frame corners (79 px of lens
 shift) land on the card's printed edges in the untouched photograph.
 Cost: one extra full-screen pass and a slightly larger frame; nothing
-per vertex. Estimate one day.
+per vertex.
+
+As built: `volumetric_renderer::{Warp, GpuWarp, WarpPipeline}` and
+`Renderer::set_warp` (the g-buffer follows the warp's source size, the
+last pass writes the viewport); `volumetric_preview::ViewFrame` carries
+the `CameraModel`, `framed(w, h)` (letterboxed, the GUI) and
+`framed_stretched(w, h)` (the headless frame) return a `Framed { pinhole,
+warp }`, the overscan bounded by the lens limit of 76 degrees and the
+grid 16 output pixels apart, exact to a tenth of a pixel on a lens twice
+the DSLR's. The GUI session caches the `Framed` per view and viewport
+size; the headless render notes "drawn through the lens". Deleted:
+`rectify_photo` and its tests. The ABI's radial `undistort` became a
+Newton iteration: the fixed-point one diverged at a strong lens's frame
+corner (3 k1 r^2 past 1), which the frame boundary of a pincushion test
+lens hit. Verified: the renderer's identity warp is pixel-identical to
+no warp and a shifted grid moves a disc as it says; the preview's world
+points pass through the warp onto their pinhole pixels; DSC00755 at full
+size: the recorded picks' crosses centre on the recorded pixels within
+0.5 px and the card 1972 px off centre has its tag quads and corner
+crosses on the printed card as shot (a 6329 x 4220 pinhole frame warped
+to 6192 x 4128). Open: recording picks by clicking in the GUI, which
+this makes a plain pixel read.
 
 Tests (`crates/volumetric_py/tests`, pytest in the shim's venv): a
 cylinder built and run, its mesh bounds checked; a synthetic board

@@ -51,9 +51,9 @@ pub use camera::{
 };
 pub use gbuffer::{AoTexture, GBuffer};
 pub use pipelines::{
-    CompositePipeline, GpuLines, GpuMesh, GpuPoints, GpuSplat, LinePipeline, MeshPipeline,
+    CompositePipeline, GpuLines, GpuMesh, GpuPoints, GpuSplat, GpuWarp, LinePipeline, MeshPipeline,
     MeshUniforms, PointPipeline, SplatCompositePipeline, SplatPipeline, SplatUniforms,
-    SsaoPipeline, SsaoUniforms, evaluate_sh, project_covariance,
+    SsaoPipeline, SsaoUniforms, Warp, WarpPipeline, evaluate_sh, project_covariance,
 };
 pub use scene::{SceneData, SceneDrawData};
 pub use types::{
@@ -248,6 +248,7 @@ struct GpuResources {
     point_pipeline: PointPipeline,
     splat_pipeline: SplatPipeline,
     splat_composite_pipeline: SplatCompositePipeline,
+    warp_pipeline: WarpPipeline,
 
     // Textures
     gbuffer: GBuffer,
@@ -270,8 +271,15 @@ pub struct Renderer {
     // Surface format for the render target
     surface_format: wgpu::TextureFormat,
 
-    // Viewport size
+    // Viewport size: the frame written
     viewport_size: (u32, u32),
+
+    // The lens warp, when a frame is drawn through a real lens: the
+    // scene renders into an internal frame of the warp's source size and
+    // the last pass writes the viewport through the warp. GPU state is
+    // built on first use and dropped when the warp changes.
+    warp: Option<Warp>,
+    warp_gpu: Option<GpuWarp>,
 
     // GPU resources (initialized lazily)
     gpu: Option<GpuResources>,
@@ -305,6 +313,8 @@ impl Renderer {
         Self {
             surface_format,
             viewport_size: (1, 1),
+            warp: None,
+            warp_gpu: None,
             gpu: None,
             frame_meshes: Vec::new(),
             frame_lines: Vec::new(),
@@ -338,15 +348,12 @@ impl Renderer {
         let point_pipeline = PointPipeline::new(device, self.surface_format);
         let splat_pipeline = SplatPipeline::new(device, GBuffer::SPLAT_LAYER_FORMAT);
         let splat_composite_pipeline = SplatCompositePipeline::new(device, self.surface_format);
+        let warp_pipeline = WarpPipeline::new(device, self.surface_format);
 
         // Create textures
-        let gbuffer = GBuffer::new(
-            device,
-            self.viewport_size.0,
-            self.viewport_size.1,
-            self.surface_format,
-        );
-        let ao_texture = AoTexture::new(device, self.viewport_size.0, self.viewport_size.1);
+        let (width, height) = self.internal_size();
+        let gbuffer = GBuffer::new(device, width, height, self.surface_format);
+        let ao_texture = AoTexture::new(device, width, height);
 
         // Create sampler
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -376,6 +383,7 @@ impl Renderer {
             point_pipeline,
             splat_pipeline,
             splat_composite_pipeline,
+            warp_pipeline,
             gbuffer,
             ao_texture,
             ssao_bind_group,
@@ -401,16 +409,48 @@ impl Renderer {
         if self.viewport_size == new_size {
             return;
         }
-
         self.viewport_size = new_size;
+        self.resize_internal(device);
+    }
 
-        // Resize GPU resources if initialized
+    /// Draw the next frames through `warp` (`None`: straight to the
+    /// viewport). The viewport must be the warp's output size when a
+    /// frame is rendered; the scene renders at its source size. An
+    /// invalid warp is refused and the frames go straight.
+    pub fn set_warp(&mut self, device: &wgpu::Device, warp: Option<&Warp>) -> Result<(), String> {
+        if self.warp.as_ref() == warp {
+            return Ok(());
+        }
+        let checked = match warp {
+            Some(warp) => warp.validate().map(|()| Some(warp.clone())),
+            None => Ok(None),
+        };
+        self.warp = checked.clone().unwrap_or(None);
+        self.warp_gpu = None;
+        self.resize_internal(device);
+        checked.map(|_| ())
+    }
+
+    pub fn warp(&self) -> Option<&Warp> {
+        self.warp.as_ref()
+    }
+
+    /// The size the scene renders at: the warp's source, else the viewport.
+    fn internal_size(&self) -> (u32, u32) {
+        self.warp
+            .as_ref()
+            .map_or(self.viewport_size, |warp| warp.source)
+    }
+
+    /// Size the g-buffer and AO textures to the internal size and rebind.
+    fn resize_internal(&mut self, device: &wgpu::Device) {
+        let (width, height) = self.internal_size();
         if let Some(gpu) = &mut self.gpu {
-            gpu.gbuffer.resize_if_needed(device, new_size.0, new_size.1);
-            gpu.ao_texture
-                .resize_if_needed(device, new_size.0, new_size.1);
-
-            // Recreate bind groups with new texture views
+            let resized = gpu.gbuffer.resize_if_needed(device, width, height);
+            gpu.ao_texture.resize_if_needed(device, width, height);
+            if !resized {
+                return;
+            }
             gpu.ssao_bind_group = gpu.ssao_pipeline.create_bind_group(
                 device,
                 &gpu.gbuffer.normal_view,
@@ -427,7 +467,7 @@ impl Renderer {
         }
     }
 
-    /// Get the current viewport size.
+    /// Get the current viewport size: the frame written.
     pub fn viewport_size(&self) -> (u32, u32) {
         self.viewport_size
     }
@@ -634,13 +674,24 @@ impl Renderer {
             self.frame_overflow.dropped_splats += splat.dropped;
         }
 
+        // Through a lens the scene renders into the warp's own frame and
+        // the last pass writes the target; otherwise straight to it.
+        let internal_size = self.internal_size();
+        if let (Some(warp), None, Some(gpu)) = (&self.warp, &self.warp_gpu, &self.gpu) {
+            self.warp_gpu = Some(gpu.warp_pipeline.create(device, queue, warp));
+        }
         let Some(gpu) = &mut self.gpu else {
             return;
+        };
+        let final_target = target;
+        let target: &wgpu::TextureView = match &self.warp_gpu {
+            Some(warp) => &warp.frame_view,
+            None => target,
         };
 
         let view_proj = view.view_projection();
         let view_proj_array = view_proj.to_cols_array_2d();
-        let screen_size = [self.viewport_size.0 as f32, self.viewport_size.1 as f32];
+        let screen_size = [internal_size.0 as f32, internal_size.1 as f32];
 
         // =================================================================
         // Pass 1: Mesh G-Buffer
@@ -1199,6 +1250,19 @@ impl Renderer {
                     point_pipeline.render_retained(&mut pass, batch);
                 }
             }
+        }
+
+        // =================================================================
+        // Pass 9: the lens warp, the internal frame written to the target
+        // =================================================================
+        if let Some(warp) = &self.warp_gpu {
+            gpu.warp_pipeline.render(
+                queue,
+                encoder,
+                warp,
+                settings.background_color,
+                final_target,
+            );
         }
     }
 

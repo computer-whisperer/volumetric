@@ -15,6 +15,7 @@ mod mesh;
 mod point;
 mod splat;
 mod ssao;
+mod warp;
 
 pub use composite::CompositePipeline;
 pub use line::{GpuLines, LinePipeline};
@@ -24,3 +25,4 @@ pub use splat::{
     GpuSplat, SplatCompositePipeline, SplatPipeline, SplatUniforms, evaluate_sh, project_covariance,
 };
 pub use ssao::{SsaoPipeline, SsaoUniforms};
+pub use warp::{GpuWarp, Warp, WarpPipeline};

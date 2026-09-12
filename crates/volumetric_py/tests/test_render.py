@@ -60,8 +60,11 @@ def test_through_a_photograph_with_an_overlay(chair_views):
 def test_marks_draw_the_views_observations_and_picks(chair_views):
     # A pick recorded on the view is drawn over the finished overlay: a
     # green cross for a fit pick, an orange diagonal one for a check.
-    picked = chair_views.with_picks({"hole": {"DSC00742": (3000.0, 2000.0)}},
-                                    check={"hole": {"DSC00730": (3100.0, 2100.0)}})
+    # Picks near a corner, where the lens moves pixels by some 60 px at
+    # full size: the cross must land on the pick as recorded in the
+    # photograph, not on its ideal pinhole position.
+    picked = chair_views.with_picks({"hole": {"DSC00742": (600.0, 400.0)}},
+                                    check={"hole": {"DSC00730": (5600.0, 3700.0)}})
     p = v.Project()
     p.add_views(picked, id="views")
     p.add_op("cylinder_operator", [{"radius": 0.026}, [0.2569, 0.1509, 0.0], [0.2569, 0.1509, 0.45]], output="column")
@@ -70,10 +73,11 @@ def test_marks_draw_the_views_observations_and_picks(chair_views):
     changed = (np.abs(marked.image.astype(int) - plain.image.astype(int)).sum(axis=2) > 0)
     assert 500 < changed.sum() < 0.2 * changed.size  # marker quads and a cross, not a wash
     # The cross is centred on the pick: its arms are green there and above.
-    x, y = 3000 * 774 / 6192, 2000 * 516 / 4128
-    patch = marked.image[int(y) - 8: int(y) + 8, int(x) - 8: int(x) + 8, :3].astype(int)
-    assert ((patch[..., 1] > 200) & (patch[..., 0] < 200)).any(), "no green near the pick"
+    assert any("through the lens" in note for note in marked.report["notes"]), marked.report["notes"]
+    x, y = 600 * 774 / 6192, 400 * 516 / 4128
+    patch = marked.image[int(y) - 3: int(y) + 4, int(x) - 3: int(x) + 4, :3].astype(int)
+    assert ((patch[..., 1] > 200) & (patch[..., 0] < 200)).any(), "no green on the pick"
     check = v.render(p, through="views:DSC00730", marks=True, width=774, height=516, resolution=32, grid=0.0)
-    x, y = 3100 * 774 / 6192, 2100 * 516 / 4128
-    patch = check.image[int(y) - 8: int(y) + 8, int(x) - 8: int(x) + 8, :3].astype(int)
-    assert ((patch[..., 0] > 200) & (patch[..., 2] < 150) & (patch[..., 1] < 230)).any(), "no orange near the check"
+    x, y = 5600 * 774 / 6192, 3700 * 516 / 4128
+    patch = check.image[int(y) - 3: int(y) + 4, int(x) - 3: int(x) + 4, :3].astype(int)
+    assert ((patch[..., 0] > 200) & (patch[..., 2] < 150) & (patch[..., 1] < 230)).any(), "no orange on the check"

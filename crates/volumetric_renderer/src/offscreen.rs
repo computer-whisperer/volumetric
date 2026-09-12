@@ -166,7 +166,7 @@ impl Offscreen {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{SceneData, SplatData, SplatStyle};
+    use crate::{SceneData, SplatData, SplatStyle, Warp};
     use glam::{Mat4, Vec3};
     use std::sync::Arc;
 
@@ -227,6 +227,100 @@ mod tests {
             let edge = px(w / 2 + 12, h / 2);
             assert!(edge[0] < centre[0] && edge[2] > centre[2], "edge {edge:?}");
         }
+    }
+
+    /// Through the identity warp a frame is the straight frame, pixel for
+    /// pixel; through a warp whose grid shifts the source right by 20
+    /// pixels the disc moves left by 20, and an unmapped corner takes the
+    /// background. Skipped where no GPU adapter is available.
+    #[test]
+    fn the_lens_warp_moves_the_frame_as_its_grid_says() {
+        let Ok(offscreen) = Offscreen::new() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let (w, h) = (128u32, 96u32);
+        let mut renderer = offscreen.renderer(w, h);
+        let data = SplatData {
+            surfels: false,
+            positions: vec![[0.0, 0.0, 0.0]],
+            axes: vec![[0.1, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.1]],
+            opacities: vec![1.0],
+            sh_degree: 0,
+            sh: vec![1.0 / 0.282_094_79, -0.5 / 0.282_094_79, -0.5 / 0.282_094_79],
+        };
+        let mut scene = SceneData::new();
+        scene.add_splat(Arc::new(data), Mat4::IDENTITY, SplatStyle::default());
+        let resident = renderer.create_retained_scene(offscreen.device(), &scene);
+        let view = CameraView::look_at(
+            Vec3::new(0.0, 0.0, 1.5),
+            Vec3::ZERO,
+            Vec3::Y,
+            0.8,
+            w as f32 / h as f32,
+            0.1,
+            10.0,
+        );
+        let mut settings = RenderSettings {
+            background_color: [0.0, 0.0, 1.0, 1.0],
+            ssao_enabled: false,
+            show_axis_indicator: false,
+            ..RenderSettings::default()
+        };
+        settings.grid.planes = crate::GridPlanes::NONE;
+        let frame = |renderer: &mut Renderer| {
+            for splat in &resident.splats {
+                renderer.submit_retained_splat(splat);
+            }
+            offscreen.render_rgba(renderer, &view, &settings).unwrap()
+        };
+        let straight = frame(&mut renderer);
+        renderer
+            .set_warp(offscreen.device(), Some(&Warp::identity(w, h)))
+            .unwrap();
+        let identity = frame(&mut renderer);
+        assert_eq!(straight, identity, "the identity warp changes pixels");
+
+        // Source 20 px wider; output pixel x samples source x + 20, but
+        // the top-left grid corner is unmapped.
+        let (columns, rows) = (3, 3);
+        let mut grid: Vec<[f32; 2]> = (0..rows)
+            .flat_map(|j| {
+                (0..columns).map(move |i| {
+                    [
+                        i as f32 * w as f32 / (columns - 1) as f32 + 20.0,
+                        j as f32 * h as f32 / (rows - 1) as f32,
+                    ]
+                })
+            })
+            .collect();
+        grid[0] = [-1.0, -1.0];
+        let shifted = Warp {
+            source: (w + 20, h),
+            output: (w, h),
+            columns,
+            rows,
+            grid,
+        };
+        assert_eq!(shifted.lookup(64.0, 48.0), Some([84.0, 48.0]));
+        assert_eq!(shifted.lookup(1.0, 1.0), None);
+        renderer
+            .set_warp(offscreen.device(), Some(&shifted))
+            .unwrap();
+        let moved = frame(&mut renderer);
+        let px = |rgba: &[u8], x: u32, y: u32| {
+            let i = ((y * w + x) * 4) as usize;
+            [rgba[i], rgba[i + 1], rgba[i + 2]]
+        };
+        // The disc is centred in the source frame, at x = 74 of 148;
+        // output x samples source x + 20, so it shows at output 54.
+        let row: Vec<u8> = (0..w).map(|x| px(&moved, x, h / 2)[0]).collect();
+        assert!(px(&moved, 54, h / 2)[0] > 200, "{row:?}");
+        assert!(px(&moved, 84, h / 2)[0] < 60, "{row:?}");
+        assert!(px(&straight, 64, h / 2)[0] > 200);
+        assert_eq!(px(&moved, 1, 1), [0, 0, 255], "unmapped corner");
+        renderer.set_warp(offscreen.device(), None).unwrap();
+        assert_eq!(frame(&mut renderer), straight);
     }
 }
 
