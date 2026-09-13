@@ -83,7 +83,8 @@ python3 examples/chair_photo/audit_assembly.py \
   Python assembly test passes. The workspace run exposed a missing prerequisite:
   `fea_threaded::schwarz_config_matches_auto_solution_end_to_end` requires the
   packed threaded solver WASM, which is absent here. The no-fail-fast run is
-  recorded in `work/assembly-workspace-all-tests.log`; the first run is
+  recorded in `work/assembly-workspace-all-tests.log`: all other non-ignored tests
+  and doctests passed. The first run is
   `work/assembly-workspace-tests.log`. No FEA toolchain changes are part of this migration.
 - Inspected rest and moved assembly renders, the DSC00760 rest overlay and
   the receiver closeup. Known meshing faceting remains; geometry was not refit.
@@ -103,7 +104,8 @@ value (the example exports ownership/posed coordinates), and joint-axis guides
 are long and clutter photo overlays. Selective or hidden guides would improve
 inspection. The prototype does not change those engine APIs.
 
-Cleanup: shared the accepted mounting-parameter calculation between build.py
+Cleanup: corrected the assembly plan’s state count (13 with independent tilt,
+12 without). Shared the accepted mounting-parameter calculation between build.py
 and the new native build; removed the old flat CLI build path and updated its
 audit/dogfood callers. Corrected historical metadata-test status in the notes.
 Unrelated toy_car edits and existing screen/print artifacts remain untouched.

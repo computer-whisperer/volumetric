@@ -39,7 +39,8 @@ variadic Subspace slots named by index in the config, inline axes allowed.
   the preview must rebuild.
 - Concrete need: the chair base has a swivel about the lift axis, the
   gas lift (prismatic), the tilt on the mechanism's pivot, and five
-  casters each with a swivel and a roll: twelve states. The toy car's
+  casters each with a swivel and a roll: thirteen independent states if
+  tilt is included, twelve with tilt fixed. The toy car's
   wheels roll. All revolute or prismatic; the chair's synchro-tilt (back
   and seat at a fixed ratio) is a coupling, not a new joint kind. No
   closed chain anywhere in sight.
