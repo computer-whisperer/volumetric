@@ -1,0 +1,169 @@
+{
+  "target": {
+    "key": "36h11:100:12x11",
+    "family": "36h11",
+    "first_id": 100,
+    "marker_count": 66,
+    "card_spec": "chair_photo/card.json",
+    "identity": "The same physical printed card in chairbase-dslr-1 and printed-backrest-20260912; confirmed by Christian on 2026-09-12.",
+    "calibration_provenance": "Measured anisotropic square pitch imported from index_scanner calibration metadata. card_spec is the canonical numeric calibration in this repository.",
+    "reuse": "Match family and allocated ID range, then reuse this physical card calibration. A reprint requires a new ID allocation and calibration. Detection identifies the card; it does not measure its printed scale.",
+    "card_spec_sha256": "d6722b6ddd77daa1db93f7f3c75c87a7f55aec00ed0a39ea7eea79e14d36487a"
+  },
+  "frame": {
+    "origin": [
+      -0.16357602496911822,
+      -0.07974687709444875,
+      0.165544563664618
+    ],
+    "basis": [
+      [
+        -0.061684464154164974,
+        -0.9979006887105147,
+        0.01972922586149216
+      ],
+      [
+        0.03340034576628828,
+        0.017691986899041823,
+        0.9992854499602485
+      ],
+      [
+        -0.9975366879391985,
+        0.062299350483326604,
+        0.0322389073116585
+      ]
+    ]
+  },
+  "features": {
+    "label_low": {
+      "world": [
+        -0.08860244622578219,
+        -0.13348020020992252,
+        0.15871360934400297
+      ],
+      "gaps_m": [
+        0.00031012035566056154,
+        0.0003101203556606244
+      ],
+      "check_error_px": {
+        "DSC00843": 9.097759432387305,
+        "DSC00855": 6.706518688977124
+      },
+      "local_mm": [
+        48.861045672492175,
+        -5.272579057171177,
+        -78.35666905517334
+      ]
+    },
+    "label_high": {
+      "world": [
+        -0.08425405404366548,
+        -0.05719616843823891,
+        0.16361700398923237
+      ],
+      "gaps_m": [
+        0.0008185267449581122,
+        0.0008185267449581124
+      ],
+      "check_error_px": {
+        "DSC00843": 21.63262330300197,
+        "DSC00855": 39.357347536954975
+      },
+      "local_mm": [
+        -27.434330231327955,
+        1.1221657603403994,
+        -77.78382407327737
+      ]
+    },
+    "plain_low": {
+      "world": [
+        -0.28825642591941925,
+        -0.12607084080489178,
+        0.1659739963263944
+      ],
+      "gaps_m": [
+        0.0011392892029514128,
+        0.001139289202951395
+      ],
+      "check_error_px": {
+        "DSC00843": 20.749097416075774,
+        "DSC00855": 43.276961867315045
+      },
+      "local_mm": [
+        53.92603138757425,
+        -4.554805650445511,
+        121.5011658037004
+      ]
+    },
+    "plain_high": {
+      "world": [
+        -0.28306796845448073,
+        -0.05035831467781089,
+        0.16942285742063032
+      ],
+      "gaps_m": [
+        0.0011564993688865112,
+        0.0011564993688866051
+      ],
+      "check_error_px": {
+        "DSC00843": 41.41700559561255,
+        "DSC00855": 75.16098549283215
+      },
+      "local_mm": [
+        -21.879554437670933,
+        0.4043923536147303,
+        121.15351784292912
+      ]
+    },
+    "tube_low": {
+      "world": [
+        -0.17133141132713703,
+        -0.20520967382947647,
+        0.16802505484174945
+      ],
+      "gaps_m": [
+        2.0173764446579498e-05,
+        2.0173764446637137e-05
+      ],
+      "check_error_px": {},
+      "local_mm": [
+        125.72673629191547,
+        -1.3877787807814457e-14,
+        1.7618285302889447e-16
+      ]
+    },
+    "tube_high": {
+      "world": [
+        -0.1558206386110994,
+        0.04571591964057897,
+        0.16306407248748653
+      ],
+      "gaps_m": [
+        5.9399340789724224e-05,
+        5.939934078968182e-05
+      ],
+      "check_error_px": {},
+      "local_mm": [
+        -125.72673629191547,
+        -1.3877787807814457e-14,
+        -1.0706496453294356e-15
+      ]
+    }
+  },
+  "dimensions_mm": {
+    "tube_length": 251.45347258383094,
+    "tube_apparent_diameter": 22.098416288215702,
+    "bolt_width": 76.26673150106181,
+    "bolt_height": 199.46973296707006
+  },
+  "label": {
+    "width_in": 15,
+    "length_in": 15,
+    "lateral_depths_in": [
+      6,
+      6
+    ],
+    "serial": "BDR-00044"
+  },
+  "limitations": "Approximate manual socket-center picks. Additional-view bolt disagreement is reported, not suppressed; target RMS and ray misses are not hardware accuracy bounds. Tube diameter is a silhouette width projected onto a horizontal plane through the tube center. Shell contour, plate thickness, tube wall, threads and clamp travel are unmeasured."
+}

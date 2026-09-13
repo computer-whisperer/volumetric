@@ -1,10 +1,13 @@
 # Custom chair — engineering starting point
 
-This is a discussion brief, not a ratified chair design or fabrication release.
-The base is now an articulated reference assembly. The next design is an upper
-chair that supports the user's existing wheelchair cushions. Cushion geometry,
-loaded thickness, intended users/load, posture goals, fabrication process and
-required adjustment ranges are still awaiting user input.
+The first upper-chair iteration is now authorized and implemented in
+[CONCEPT_A.md](CONCEPT_A.md) and `build_concept.py`. It accepts 14–20 inch
+cushions on a supported tray, with 14 and 22 inch carrier variants, arm supports,
+and a yoke for the photographed printed-backrest hardware. Available fabrication
+includes sheet metal, bent tubing/extrusions, small FDM and Carbon printing
+(410 x 256 x 460 mm). Loaded cushion thickness, intended loads, posture goals
+and required seat-height range remain unresolved. The concept selects provisional
+sections and travels for layout; it does not establish strength or safe use.
 
 ## Interfaces we can design against
 
@@ -33,7 +36,7 @@ placement needs the intended occupied-seat reference and resulting load case.
 `plot_interfaces.py` (optional Matplotlib dependency) regenerates the PNG/SVG
 interface map in work/ from the measurement reports.
 
-## Proposed decomposition to discuss
+## Interface responsibilities retained in concept A
 
 1. **Cushion carrier:** its support surface and retention features follow the
    actual cushion's required underside support and removable cover/interface.
@@ -55,17 +58,17 @@ purchased mechanism → lift → star → casters. The backrest adds a separate
 moment through its spine and receiver. This decomposition lets us revise one
 interface without remaking the cushion carrier.
 
-## Decisions that determine geometry
+## Inputs still needed to refine geometry
 
 - Which cushion(s): outline, underside support shape, loaded thickness, cover
-  overhang and required attachment/retention. Does one chair accept multiple
-  sizes/products, or one selected cushion?
+  overhang and required attachment/retention within the specified 14–20 inch
+  family. The goal is one chair accepting multiple sizes.
 - Intended user/load range and use: transfers, leaning, recline, side loading,
   adjustable arm supports, foot support, or other specialty requirements.
 - Required loaded seat-height range, seat depth/fore-aft position, seat angle,
   backrest angle/height, and their adjustment versus fixed settings.
-- Available processes and materials for structural pieces, prototype process,
-  and whether a replaceable metal adapter/tongue is acceptable.
+- Specific metal and printed materials, joint details and prototype process
+  within the fabrication options already specified.
 
 The key stack is the support height at a joint state plus adapter/pan offset
 plus the **loaded** cushion thickness. The photographed 460 mm datum is not the
@@ -73,21 +76,20 @@ mechanism's minimum height. The assembly's -20..+80 mm exploration range is not
 a measured gas-lift specification. A tall cushion can change whether this base
 is suitable even if the bolt pattern fits.
 
-## First useful downstream modelling pass
+## Next engineering iteration
 
-After those inputs, model the actual cushion support envelope and a simple
-carrier/adapter envelope; place them relative to the measured holes and lift
-axis. Set named cushion-seat and backrest datums owned by their moving parts.
-Use the joint tree to check reach and interference in candidate settings. Keep
+The first carrier, adapters, named attached datums and backrest/arm adjustments
+are modelled. Refine the cushion underside and occupied-seat reference from the
+actual products, and check reach and interference across candidate settings. Keep
 backrest tilt fixed until the physical linkage is characterized; do not invent
 synchro-tilt ratios from these still photographs.
 
-Before choosing structural section sizes, establish load cases and check the
+Before finalizing structural section sizes, establish load cases and check the
 carrier's bending, bolt-group loads and local pull-through, receiver/spine
 bending and retention, and whole-chair stability over caster orientations and
 recline. Current kinematics enforce neither ground contact nor stability, and
-rigid motion is not a strength calculation. No material thickness, rated load,
-or safety margin has been selected in this brief.
+rigid motion is not a strength calculation. Concept A assigns provisional
+thicknesses for layout; no rated load or safety margin has been established.
 
 Favor evidence that repeats: cushion drawings/CAD already in use, photographs
 showing each mechanism extreme and underside, and a reusable interface coupon.

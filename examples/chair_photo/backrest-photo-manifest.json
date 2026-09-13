@@ -1,0 +1,132 @@
+{
+  "method": "Full-resolution embedded camera JPEG extracted from each ARW with rawpy; original camera pixel coordinates.",
+  "photos": [
+    {
+      "source": "/ceph/christian/Photos/library/2026/2026-09-12/DSC00841.ARW",
+      "sha256": "154742dcb6e5c33ad8089bfd2f40660f79af1af4bbd28227faec7dbf8201233b",
+      "jpeg": "DSC00841.JPG",
+      "jpeg_sha256": "96fe72ee4a4adef8238bb4d460e25e7300e21c92abccc804d1e5ceebf095b26c",
+      "jpeg_codestream_sha256": "0c6ad96408c0afa30b80b087de3f8266f0110c0b09b5e2eb8f7cb587b128552f"
+    },
+    {
+      "source": "/ceph/christian/Photos/library/2026/2026-09-12/DSC00842.ARW",
+      "sha256": "43ed40cdf055b4d2c823700164d792ac543353afa8191e50279dd524a5b6debf",
+      "jpeg": "DSC00842.JPG",
+      "jpeg_sha256": "b04305c7e5af7317ba42008761e517263887d70eb2fd1e00bda15dad69326ccd",
+      "jpeg_codestream_sha256": "bf6ec96200a891eb15439af365e960ec47cb082edcfb0d21b3b8d7b79b39605b"
+    },
+    {
+      "source": "/ceph/christian/Photos/library/2026/2026-09-12/DSC00843.ARW",
+      "sha256": "474d51a32fe8418010027df516f7db8ddd39529f2a4222ca77737fed9bb72f4b",
+      "jpeg": "DSC00843.JPG",
+      "jpeg_sha256": "84f1c7288eaccb7f9902ccfe0eb0ade40034f8e4c74c56959399029abb055395",
+      "jpeg_codestream_sha256": "ac7ab82a7df27ba1e70a0e68b166e1a1ecedd467671e8591a687ca92f93b9633"
+    },
+    {
+      "source": "/ceph/christian/Photos/library/2026/2026-09-12/DSC00844.ARW",
+      "sha256": "908c13cb0ac81cf1f32bec83357b3a69c9e25f6131ef74e15a51227e9848cd06",
+      "jpeg": "DSC00844.JPG",
+      "jpeg_sha256": "5c8a05c1e596f98854f3f414b762e35c6aefc0dc90a16ce0d0653fc9515b68d8",
+      "jpeg_codestream_sha256": "7dd492c1a57db70c8dee4da098c01605d416f1971b9bce0924d89be50c7baea0"
+    },
+    {
+      "source": "/ceph/christian/Photos/library/2026/2026-09-12/DSC00845.ARW",
+      "sha256": "b151cfe641aca70f9f01a450f84b8b45a16aed232dd0794b5b832d128a87c8ac",
+      "jpeg": "DSC00845.JPG",
+      "jpeg_sha256": "0107e837688925ca9047cc1999651573cc0582124c4cf9b897656878d40ac397",
+      "jpeg_codestream_sha256": "6a3ed2a36f2ddde0788144077f4cf88fd258985fbf685dd5d0081bb1a8988901"
+    },
+    {
+      "source": "/ceph/christian/Photos/library/2026/2026-09-12/DSC00846.ARW",
+      "sha256": "964966e9c4fd073d80a01626f8ef3ab412dddbd2aca5153b5608489d3cb037f6",
+      "jpeg": "DSC00846.JPG",
+      "jpeg_sha256": "0e7c9d7fec35bb972370188e2975ed7ed223c4620179e3aae4a5faf6e9886fa9",
+      "jpeg_codestream_sha256": "e14a85862e2fbd18a704c3be780a0d5d97cc19d931eeae9853e7889e38bedb92"
+    },
+    {
+      "source": "/ceph/christian/Photos/library/2026/2026-09-12/DSC00847.ARW",
+      "sha256": "3f44086d0185d524352e99ec1113cf8eca115704d0c42326bba3b402f1175e3a",
+      "jpeg": "DSC00847.JPG",
+      "jpeg_sha256": "5278d2ad3eeedafef41cdb28ca57cb3ad32d93e5d40f37b1161ed3e597761bdc",
+      "jpeg_codestream_sha256": "6cc202dedbb879e67d5f3a33ab55811316543f3358ce085c45d8d2b178603ba1"
+    },
+    {
+      "source": "/ceph/christian/Photos/library/2026/2026-09-12/DSC00848.ARW",
+      "sha256": "765f180559fbbe38f8573a7cfb22f24c698d075f731a5f33f675c18fcce6a701",
+      "jpeg": "DSC00848.JPG",
+      "jpeg_sha256": "a00d78029975c8f867db5af0e248a27cfd25ee27330fb0da17b47daa0380321d",
+      "jpeg_codestream_sha256": "23a94fb1e3f02cded1d90c31634bf7cdf8495919a824653453e85c6f58b173fe"
+    },
+    {
+      "source": "/ceph/christian/Photos/library/2026/2026-09-12/DSC00849.ARW",
+      "sha256": "267ec32be7fde8b636b1346bb908bd4b41dd96b5625b0d7a7956d7f20758d876",
+      "jpeg": "DSC00849.JPG",
+      "jpeg_sha256": "a03328f6b7ae6a870c26af28626d0ff50c9ba27af26efb32a88692c3ed5e1544",
+      "jpeg_codestream_sha256": "703739a9d974c85c9b690962f83dba7460c75df9a89b9a87e25a33cdb6eb863a"
+    },
+    {
+      "source": "/ceph/christian/Photos/library/2026/2026-09-12/DSC00850.ARW",
+      "sha256": "7c8b9d5bd85b01b5bbb819498cdd343d4c9a16ada202b855d649e815f308cc47",
+      "jpeg": "DSC00850.JPG",
+      "jpeg_sha256": "11b713d20deec37952d385711d3161e03ed8800bb3b42e16324c43991f21af58",
+      "jpeg_codestream_sha256": "9962afa3fd118333dd29554b7a52e09c265be401897cff8bcb6df4da4cd3223c"
+    },
+    {
+      "source": "/ceph/christian/Photos/library/2026/2026-09-12/DSC00851.ARW",
+      "sha256": "42ef05ce34a99ad8763cfc4b1ece9cc1f06a7b35dd23b0fce2e70890be38f9e5",
+      "jpeg": "DSC00851.JPG",
+      "jpeg_sha256": "15896e8c6272bc021efc77d3bfdd101f3c9a4ca3e344c10deb048975ab7c2f9b",
+      "jpeg_codestream_sha256": "4f735d71b221a090fc77ef879f7187fe7f680d51d09eb4730589d78d94ef39b3"
+    },
+    {
+      "source": "/ceph/christian/Photos/library/2026/2026-09-12/DSC00852.ARW",
+      "sha256": "71767de4e49d2d9a603c4136ca9faf48663957eb1d0d46e4a41a9b611b0c2771",
+      "jpeg": "DSC00852.JPG",
+      "jpeg_sha256": "cee1b38f00702e2157a08261e5a368d693a69925acc5cd3626f42458c14f17a5",
+      "jpeg_codestream_sha256": "a11d72b81cce0b9b8d45972e0eeabb7ba3da5cc6d5e75b4966fe3f9d567550be"
+    },
+    {
+      "source": "/ceph/christian/Photos/library/2026/2026-09-12/DSC00853.ARW",
+      "sha256": "3cb16cd5f85abc97598081b2ecaae94e47385b8bcaa35e31cca91618f78c4b4a",
+      "jpeg": "DSC00853.JPG",
+      "jpeg_sha256": "22f4dfbf8453f016aedce5270dd2f3df66ff8b70dae733563c5d1a2ad456a3bf",
+      "jpeg_codestream_sha256": "0a1a61361bd27fe3ac2919b84e424e22b9f1d19ed9baa6b5c4d40acd7c7f8230"
+    },
+    {
+      "source": "/ceph/christian/Photos/library/2026/2026-09-12/DSC00854.ARW",
+      "sha256": "58c2cb93b6b9985bab362ea082c5b6e54e9f79925968230ac298c6a06edc073c",
+      "jpeg": "DSC00854.JPG",
+      "jpeg_sha256": "7f34f84744e9125030b90f5dc64e20278c0a935c7570fdd13797d8939b6dfc7f",
+      "jpeg_codestream_sha256": "fb7073f5fede44225f8ffcd2d7dd31c23fd8f501f2b2332c9fafd7797db1f784"
+    },
+    {
+      "source": "/ceph/christian/Photos/library/2026/2026-09-12/DSC00855.ARW",
+      "sha256": "007c667eec7430f2c9fb1976909fb26948f81860dbe6bd7651523952b18c16d8",
+      "jpeg": "DSC00855.JPG",
+      "jpeg_sha256": "3e6dec2848982dd0a8b1d77679bffd230ef1734c7b848bc87e0194e7d3da7ced",
+      "jpeg_codestream_sha256": "8b4333bf655238ef03567b8adadf56497f97565723f57f97402b9db65cad727f"
+    },
+    {
+      "source": "/ceph/christian/Photos/library/2026/2026-09-12/DSC00856.ARW",
+      "sha256": "d822a1747c6701e60574420ae5e33374b6c02f901b600eed784424d50da87c59",
+      "jpeg": "DSC00856.JPG",
+      "jpeg_sha256": "b05515ebef28a29db499775206da8d408b1cb15b589d31714a89ff7f49e92774",
+      "jpeg_codestream_sha256": "563d86b6c0820b7f05f8b9a2576ea016b07a90e3156ac9ddc1535afce52b842c"
+    },
+    {
+      "source": "/ceph/christian/Photos/library/2026/2026-09-12/DSC00857.ARW",
+      "sha256": "74f9a54354db38809f555ebd4972aac60221c0ed2bd1872852fd246d1d101090",
+      "jpeg": "DSC00857.JPG",
+      "jpeg_sha256": "b0009b87430a3fe9d7462a8bfaa4396e867ef9d2cc8e469847c408c9188fc2b8",
+      "jpeg_codestream_sha256": "e40281338b4d8f2ad3101d7a06499bf275ae40ceb525ed84122ec9ad5b02ba20"
+    },
+    {
+      "source": "/ceph/christian/Photos/library/2026/2026-09-12/DSC00858.ARW",
+      "sha256": "941fce5296421414a597682d3ccdc0013a3659ae4bd0c3ca96f286f16c8352f9",
+      "jpeg": "DSC00858.JPG",
+      "jpeg_sha256": "8592cb34d592b7e4605bf3610e6ddf7f062be1766b07558088a909d28768e634",
+      "jpeg_codestream_sha256": "bded5b7ea8956d0f4f8613cd9cad45eb3d9dbeeb0cd2212c5e6bb738b48c5c06"
+    }
+  ],
+  "hash_note": "Source ARW hashes are exact. jpeg_sha256 records the initial extraction. Re-extraction validation uses jpeg_codestream_sha256, excluding APP/COM metadata before the scan: LibRaw-generated EXIF contains a few variable bytes. All 18 compressed image streams matched exactly across re-extraction; pixels are never rotated or recompressed."
+}

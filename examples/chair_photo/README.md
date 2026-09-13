@@ -296,3 +296,64 @@ receiver, assembly measurements, and routed model parameters.
 observation-bearing project, labelled lens-true overlays, reproduction command,
 and remaining workflow gaps. `dogfood.py` compares against this example's
 accepted geometry and writes separate artifacts under `work/dogfood/`.
+
+## Custom chair concept A and printed backrest evidence
+
+`CONCEPT_A.md` records the first authorized upper-chair layout and its unresolved
+engineering questions. `build_concept.py` preserves the existing base's 22 part
+models and joints, then adds a tray, frame, arm supports and backrest support.
+WGSL defines the new geometry; Mechanism/Assemble defines its adjustments.
+The cushion and backrest shell are explicit clearance proxies in the assembly.
+
+The 18 backrest ARWs have full-resolution embedded camera JPEGs. Extraction uses
+rawpy, without changing EXIF orientation or pixel coordinates. For this session
+rawpy is available in the sibling scanner's virtualenv; it is only a decoder
+dependency, not a scanner reconstruction or camera solution. With the native
+volumetric Python package installed (see DOGFOOD.md for this workspace setup):
+
+```sh
+# Use any Python environment with rawpy installed for this one intake command.
+/home/christian/workspace/playground/index_scanner/.venv/bin/python \
+    examples/chair_photo/intake_backrest.py
+python3 examples/chair_photo/measure_backrest.py --survey
+python3 examples/chair_photo/build_concept.py --render
+python3 examples/chair_photo/audit_concept.py
+python3 examples/chair_photo/build_concept.py --inches 14
+python3 examples/chair_photo/audit_concept.py --inches 14
+python3 examples/chair_photo/build_concept.py --inches 22
+python3 examples/chair_photo/audit_concept.py --inches 22
+```
+
+`--work` for intake/measurement selects the backrest directory (default
+`work/backrest`); for build/audit it selects the base work directory (default
+`work`). `--source` relocates the original ARWs, checked against the saved hashes.
+JPEG replay verifies the compressed image stream independently of variable
+LibRaw EXIF bytes; see the manifest hash note.
+`--survey` repeats native photo intake/detection/calibration; omit it to reuse
+surveyed views with the same saved target identity and calibration hash.
+Observation picks are specific to these photographs and must be replaced for a
+new subject. The reusable target inventory is `examples/calibration-targets.json`:
+family `36h11`, allocation beginning at ID 100 identifies the same physical card
+and selects `card.json`'s measured scale. This is an example-level inventory,
+not yet an engine-wide automatic calibration registry.
+
+Main outputs:
+
+- `work/backrest/hardware.vviews`: native persisted fit/check picks and photographs.
+- `backrest-report.json`: committed approximate dimensions, frame, provenance and
+  additional-view errors. Check residuals reach 75 px despite the 0.108 px card
+  RMS; do not use the bolt rectangle as a precision manufacturing specification.
+- `work/concept/chair-20.vproj` and `.vasm`: default 20 inch carrier assembly;
+  `.json` records dimensions, state, attached frames and candidate print bounds.
+- `chair-14.*` / `chair-22.*`: size variants. This changes tray size and rail
+  length; it does not imply a telescoping sheet-metal seat.
+- `chair-20-front.png`, `-rear.png`, `-underside.png`: native engineering renders
+  with the cushion envelope omitted for visibility.
+- `chair-20-audit.json`: geometry and motion checks, not structural qualification.
+
+`build_concept.py --state examples/chair_photo/concept-state.json` writes `chair-20-posed.*` without overwriting the
+rest build. Example state: `{"arm_inset":0.075,"left_arm_height":0.08,
+"right_arm_height":0.08,"backrest_height":0.08}`. Distances are metres; the base's
+revolutes remain degrees. Symmetric arm inset is coupled for CAD setup only;
+no mechanical linkage is proposed. All upper parts, including the cushion
+proxy, follow the measured base's lift/swivel through their assembly parents.

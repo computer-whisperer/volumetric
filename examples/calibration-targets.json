@@ -1,0 +1,14 @@
+{
+  "targets": [
+    {
+      "key": "36h11:100:12x11",
+      "family": "36h11",
+      "first_id": 100,
+      "marker_count": 66,
+      "card_spec": "chair_photo/card.json",
+      "identity": "The same physical printed card in chairbase-dslr-1 and printed-backrest-20260912; confirmed by Christian on 2026-09-12.",
+      "calibration_provenance": "Measured anisotropic square pitch imported from index_scanner calibration metadata. card_spec is the canonical numeric calibration in this repository.",
+      "reuse": "Match family and allocated ID range, then reuse this physical card calibration. A reprint requires a new ID allocation and calibration. Detection identifies the card; it does not measure its printed scale."
+    }
+  ]
+}

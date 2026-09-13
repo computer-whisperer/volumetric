@@ -1,0 +1,120 @@
+{
+  "description": "Socket centers on the four visible button-head fasteners. Original encoded JPEG coordinates (6192x4128), not EXIF-rotated display coordinates. Approximate manual picks; the centers lie above the mounting plate. No claim about screw thread, preload, or plate thickness.",
+  "fit_views": [
+    "DSC00845",
+    "DSC00847"
+  ],
+  "features": {
+    "label_low": {
+      "DSC00845": [
+        3674,
+        2454
+      ],
+      "DSC00847": [
+        2710,
+        1675
+      ],
+      "DSC00843": [
+        3635,
+        945
+      ],
+      "DSC00855": [
+        3588,
+        892
+      ]
+    },
+    "label_high": {
+      "DSC00845": [
+        3728,
+        3105
+      ],
+      "DSC00847": [
+        3236,
+        1248
+      ],
+      "DSC00843": [
+        3736,
+        1455
+      ],
+      "DSC00855": [
+        3329,
+        1194
+      ]
+    },
+    "plain_low": {
+      "DSC00845": [
+        5061,
+        2382
+      ],
+      "DSC00847": [
+        1750,
+        609
+      ],
+      "DSC00843": [
+        5036,
+        1038
+      ],
+      "DSC00855": [
+        5058,
+        1284
+      ]
+    },
+    "plain_high": {
+      "DSC00845": [
+        5120,
+        2970
+      ],
+      "DSC00847": [
+        2237,
+        248
+      ],
+      "DSC00843": [
+        5180,
+        1527
+      ],
+      "DSC00855": [
+        4858,
+        1640
+      ]
+    },
+    "tube_low": {
+      "DSC00845": [
+        4240,
+        1812
+      ],
+      "DSC00847": [
+        1774,
+        1587
+      ]
+    },
+    "tube_high": {
+      "DSC00845": [
+        4350,
+        3885
+      ],
+      "DSC00847": [
+        3495,
+        371
+      ]
+    }
+  },
+  "check_views": [
+    "DSC00843",
+    "DSC00855"
+  ],
+  "tube_width": {
+    "view": "DSC00845",
+    "pixels": [
+      [
+        4180,
+        2200
+      ],
+      [
+        4334,
+        2200
+      ]
+    ],
+    "method": "Silhouette edges projected onto horizontal plane at mean triangulated tube-end height."
+  },
+  "check_note": "Approximate check picks made in crops displaying fit projections; not blind validation. Shared camera survey uses all views."
+}

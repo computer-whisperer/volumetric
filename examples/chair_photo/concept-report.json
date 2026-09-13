@@ -1,0 +1,102 @@
+{
+  "concept": "A",
+  "date": "2026-09-12",
+  "variants": {
+    "14": {
+      "parts": 53,
+      "states": 16,
+      "base_parts_byte_identical": 22,
+      "support_samples": 31684,
+      "support_fraction_at_0_1mm_below_top": 0.995896982704204,
+      "fastener_head_clearance_mm": 0.3,
+      "minimum_designed_telescoping_overlap_mm": 50,
+      "motion_checks": "independent translations, coupling, cushion owner pass",
+      "limitations": "Deterministic samples can miss small intersections. Openings are sampled, not integrated. No strength, clamp retention, bend/weld process, ergonomic fit or occupied stability validation.",
+      "sampled_clearance_pairs": 31,
+      "pair_samples": 650000
+    },
+    "20": {
+      "parts": 53,
+      "states": 16,
+      "base_parts_byte_identical": 22,
+      "support_samples": 64516,
+      "support_fraction_at_0_1mm_below_top": 0.9978919957839916,
+      "fastener_head_clearance_mm": 0.3,
+      "minimum_designed_telescoping_overlap_mm": 50,
+      "motion_checks": "independent translations, coupling, cushion owner pass",
+      "limitations": "Deterministic samples can miss small intersections. Openings are sampled, not integrated. No strength, clamp retention, bend/weld process, ergonomic fit or occupied stability validation.",
+      "sampled_clearance_pairs": 31,
+      "pair_samples": 600000
+    },
+    "22": {
+      "parts": 53,
+      "states": 16,
+      "base_parts_byte_identical": 22,
+      "support_samples": 78400,
+      "support_fraction_at_0_1mm_below_top": 0.9983418367346939,
+      "fastener_head_clearance_mm": 0.3,
+      "minimum_designed_telescoping_overlap_mm": 50,
+      "motion_checks": "independent translations, coupling, cushion owner pass",
+      "limitations": "Deterministic samples can miss small intersections. Openings are sampled, not integrated. No strength, clamp retention, bend/weld process, ergonomic fit or occupied stability validation.",
+      "sampled_clearance_pairs": 31,
+      "pair_samples": 600000
+    }
+  },
+  "posed_part_bytes_identical": 53,
+  "posed_interfaces": "all origins follow their assembly owner",
+  "printed_parts": {
+    "left_arm_guide": {
+      "local_size_mm": [
+        145.00000000000003,
+        51.99999999999999,
+        26.00000000000002
+      ],
+      "fits_carbon_axis_aligned": true
+    },
+    "left_arm_pad": {
+      "local_size_mm": [
+        69.99999999999996,
+        230.0,
+        20.000000000000018
+      ],
+      "fits_carbon_axis_aligned": true
+    },
+    "right_arm_guide": {
+      "local_size_mm": [
+        145.00000000000003,
+        51.99999999999999,
+        26.00000000000002
+      ],
+      "fits_carbon_axis_aligned": true
+    },
+    "right_arm_pad": {
+      "local_size_mm": [
+        69.99999999999996,
+        230.0,
+        20.000000000000018
+      ],
+      "fits_carbon_axis_aligned": true
+    },
+    "backrest_yoke": {
+      "local_size_mm": [
+        230.0,
+        81.00000000000001,
+        47.00000000000004
+      ],
+      "fits_carbon_axis_aligned": true
+    }
+  },
+  "photo_replay": {
+    "images": 18,
+    "rms_px": 0.10790545673621241,
+    "card_identity": "36h11:100:12x11",
+    "raw_and_coding_stream_hashes": "pass",
+    "native_survey_and_persisted_fit_check_picks": "pass"
+  },
+  "verification": {
+    "python": "36 passed; PYTHONPATH=examples/chair_photo/work/python python3 -m pytest -q crates/volumetric_py/tests",
+    "workspace": "cargo test --workspace --no-fail-fast: one failing target, all other nonignored tests and doctests pass",
+    "known_failure": "volumetric::fea_threaded::schwarz_config_matches_auto_solution_end_to_end: packed solver lacks required thread support; unchanged preexisting fixture failure",
+    "render": "front/rear/underside native renders inspected at resolution256; flange artifacts remain"
+  }
+}
