@@ -2,6 +2,7 @@
 alias float = f64;
 alias vec2d = vec2<f64>;
 alias vec3d = vec3<f64>;
+// 0 body, 1 rod, 2 star, 3..7 forks, 8..12 wheel pairs.
 override part: float = 0; // @param key="part"
 override radius: float = 0.336; // @param key="star_radius"
 override joint_z: float = 0.052; // @param key="joint_height"
@@ -20,10 +21,13 @@ fn cylinder(p: vec3d, r: float, lo: float, hi: float) -> bool {
 fn scene(p: vec3d) -> bool {
     if part < 0.5 {
         return cylinder(p, outer_radius, 0.035, collar_z)
-            || cylinder(p, outer_radius+0.001, collar_z-0.004, collar_z)
-            || cylinder(p, rod_radius, collar_z, top_z);
+            || cylinder(p, outer_radius+0.001, collar_z-0.004, collar_z);
     }
     if part < 1.5 {
+        // Hidden overlap supports the provisional +80 mm lift sweep.
+        return cylinder(p, rod_radius, collar_z-0.080, top_z);
+    }
+    if part < 2.5 {
         if cylinder(p, 0.047, hub_z-0.07, hub_z) { return !cylinder(p, outer_radius, 0.0, hub_z+0.01); }
         for (var i: i32=0; i<5; i=i+1) {
             let angle = phase + float(i)*1.2566370614359172;
@@ -41,28 +45,32 @@ fn scene(p: vec3d) -> bool {
         }
         return false;
     }
-    // One twin-wheel swivel caster per exported instance. Wheel orientation
-    // and fork details are representative, not recovered articulation.
-    let angle=phase+(part-2.0)*1.2566370614359172;
+    // Rest shape retained; fork and wheel pair move as distinct rigid parts.
+    let index=select(part-3.0,part-8.0,part>=7.5);
+    let angle=phase+index*1.2566370614359172;
     let at=vec3d(radius*cos(angle),radius*sin(angle),0.0);
     let d=p-at;
     let yaw=angle+caster_yaw;
     let q=vec3d(d.x*cos(yaw)+d.y*sin(yaw),-d.x*sin(yaw)+d.y*cos(yaw),d.z);
-    if cylinder(q,0.012,joint_z-0.014,joint_z+0.014) { return true; }
+    if part < 7.5 {
+        return cylinder(q,0.012,joint_z-0.014,joint_z+0.014)
+            || (q.x>=-0.010 && q.x<=0.035 && abs(q.y)<=0.007 && q.z>=wheel_radius && q.z<=joint_z-0.005);
+    }
     let wheel=vec2d(q.x-0.018,q.z-wheel_radius);
     let rim=dot(wheel,wheel)<=wheel_radius*wheel_radius;
-    if rim && abs(q.y)>=0.005 && abs(q.y)<=0.022 { return true; }
-    return q.x>=-0.010 && q.x<=0.035 && abs(q.y)<=0.007 && q.z>=wheel_radius && q.z<=joint_z-0.005;
+    return rim && abs(q.y)>=0.005 && abs(q.y)<=0.022;
 }
 fn bounds_min() -> vec3d {
     if part < 0.5 { return vec3d(-outer_radius-0.002,-outer_radius-0.002,0.035); }
-    if part < 1.5 { return vec3d(-radius-0.025,-radius-0.025,0.0); }
-    let angle=phase+(part-2.0)*1.2566370614359172;
+    if part < 1.5 { return vec3d(-rod_radius,-rod_radius,collar_z-0.080); }
+    if part < 2.5 { return vec3d(-radius-0.025,-radius-0.025,0.0); }
+    let angle=phase+select(part-3.0,part-8.0,part>=7.5)*1.2566370614359172;
     return vec3d(radius*cos(angle)-0.055,radius*sin(angle)-0.055,0.0);
 }
 fn bounds_max() -> vec3d {
-    if part < 0.5 { return vec3d(outer_radius+0.002,outer_radius+0.002,top_z); }
-    if part < 1.5 { return vec3d(radius+0.025,radius+0.025,hub_z+0.02); }
-    let angle=phase+(part-2.0)*1.2566370614359172;
+    if part < 0.5 { return vec3d(outer_radius+0.002,outer_radius+0.002,collar_z); }
+    if part < 1.5 { return vec3d(rod_radius,rod_radius,top_z); }
+    if part < 2.5 { return vec3d(radius+0.025,radius+0.025,hub_z+0.02); }
+    let angle=phase+select(part-3.0,part-8.0,part>=7.5)*1.2566370614359172;
     return vec3d(radius*cos(angle)+0.055,radius*sin(angle)+0.055,joint_z+0.02);
 }

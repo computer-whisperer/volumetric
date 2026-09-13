@@ -13,6 +13,7 @@ from time import perf_counter
 
 import numpy as np
 import volumetric as v
+from audit_assembly import posed_parts
 
 HERE = Path(__file__).resolve().parent
 
@@ -96,8 +97,11 @@ def main():
     start = perf_counter()
     exports = project.run()
     report['project_run_seconds'] = perf_counter()-start
-    solids = {name: asset for name, asset in exports.items() if asset.kind == 'Model'}
-    assert len(solids) == 16
+    assembly_value = exports['chair_base'].assembly()
+    np.testing.assert_allclose(assembly_value.poses(), np.tile(np.eye(3,4),(len(assembly_value),1,1)),
+                               atol=1e-12, err_msg='Photo dogfood requires the rest-state base')
+    solids = posed_parts(exports['chair_base'])
+    assert len(solids) == 22
     z = np.array(baseline['frame']['basis'][2])
     points = [np.array(feature['world']) - z*.001 for feature in baseline['features'].values()]
     origin = np.array(reference['world_frame']['origin'])
@@ -107,15 +111,15 @@ def main():
         assert not asset.occupied(np.array(points)).any(), name
     assert solids['backrest_receiver'].occupied(origin + np.array([[.025, 0, -.002], [.026, 0, -.030]]) @ basis).all()
     assembly = read(work/'assembly-measurements.json')
-    assert solids['gas_lift'].occupied(np.array([[*assembly['column']['ground_axis_xy'], .30]])).all()
-    report['void_audit'] = '16 solids x 10 void probes clear; receiver walls and column positive controls pass'
+    assert solids['gas_lift_rod'].occupied(np.array([[*assembly['column']['ground_axis_xy'], .30]])).all()
+    report['void_audit'] = '22 parts x 10 void probes clear; receiver walls and column positive controls pass'
     (out/'report.json').write_text(json.dumps(report, indent=2)+'\n')
     if args.render:
         from PIL import Image
         report['renders'] = {}
         for view in ['DSC00755', 'DSC00756', 'DSC00760']:
             start = perf_counter()
-            frame = v.render(project, through=f'{evidence_id}:{view}', overlay='edge', marks=True,
+            frame = v.render(project, assets=['chair_base'], through=f'{evidence_id}:{view}', overlay='edge', marks=True,
                              width=1548, height=1032, resolution=96, sharp=False, simplify=False, grid=0, ssao=False)
             Image.fromarray(frame.image).save(out/f'overlay-{view}.png')
             report['renders'][view] = {'seconds': perf_counter()-start, 'report': frame.report}

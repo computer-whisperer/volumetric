@@ -19,7 +19,7 @@ Its mating opening needs its own plane, profile, and insertion direction.
 
 ## Completed milestone
 
-The 16-part WGSL base, receiver fit, additional observations, replay scripts,
+The initial 16-part WGSL base, receiver fit, additional observations, replay scripts,
 and native occupancy audit are implemented. See README.md for results and
 limitations. Accepted mounting parameters remain unchanged; continuation
 fit results and parameters reproduce in work/replay. The receiver entry
@@ -29,8 +29,8 @@ kinematics are unresolved. Keep these distinctions when designing a mate.
 
 CLI measurement coordinates now remain f64, and the multiple-view-set error
 explains the render-specific selector. The WGSL guide records the select
-literal-concretization trap. CLI 29 tests pass; host full workspace tests
-fail only the pre-existing operator_metadata strict-bound parser test.
+literal-concretization trap. That historical metadata failure was fixed in 356606d; the later Python dogfood
+passed all 35 Python tests and the full host workspace suite.
 
 A suspected missing longitudinal column surface was withdrawn after four
 isolated render comparisons and independent image review. Continuous
@@ -42,3 +42,7 @@ not a demonstrated engine bug fix.
 Cleanup: shared project-add-operator orchestration between the two build
 scripts; no change to deprecated Lua. Unrelated toy_car edits, prints,
 and screen captures were present before this arc and remain untouched.
+
+The current base is a 22-part, 12-state Assembly. ARTICULATION.md records its
+kinematic assumptions and migration checks; CHAIR_DESIGN.md starts the upper
+chair discussion. The split preserves the rest shape and accepted hole datums.

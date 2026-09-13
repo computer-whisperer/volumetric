@@ -185,17 +185,26 @@ python3 examples/chair_photo/build_assembly.py --render
 python3 examples/chair_photo/audit_assembly.py
 ```
 
-All four scripts accept `--work`. The build refreshes `mount.vproj` from
-its existing measurements, then writes `base.vproj` with 16 separate WGSL
-exports. The accepted six aperture positions and datum are unchanged.
-The project embeds six audit photographs. Outputs include `base_iso.png`,
-four `base-overlay-*.png` photos, and `backrest-detail_{iso,top}.png`.
-Native sampling checks that all exported solids leave the six mounting
-holes and four receiver-axis probe positions clear; positive probes also
-check that the receiver walls and column actually exist.
+All four scripts accept `--work`. The build and audit now require the volumetric
+Python package (see `crates/volumetric_py/README.md`), NumPy, SciPy and Pillow
+for rendering. The build derives the accepted mount parameters directly from
+the measurements and writes `base.vproj`, exporting `chair_base` (a 22-part
+Assembly) and `chair_base_model` (its posed union). It also saves `base.vasm`,
+`base.vmech`, and `base-interfaces.json` with interface ownership and posed frames.
+The six mounting aperture positions and rest shape are preserved.
+
+The project embeds six annotated audit photographs. Rendering writes
+`base_iso.png`, three `base-overlay-*.png` photos (55, 56, 60), and
+`base-backrest-detail.png`. The audit checks every part and the union for the
+six hole/four receiver voids, tests positive controls, and checks motion,
+continuous rotation, pull and Jacobians. See [ARTICULATION.md](ARTICULATION.md)
+for assumptions, the rest-shape comparison and posed-build commands.
+
+[CHAIR_DESIGN.md](CHAIR_DESIGN.md) starts the downstream cushion carrier,
+base adapter and backrest design discussion.
 
 The receiver is a hollow socket, with a lead-in around its entry mouth,
-a side clamp knob, and separately exported visible pin/fastener geometry.
+a side clamp knob, and separate visible pin/fastener parts in the assembly.
 `backrest_mouth_frame` records its fitted entry plane.
 `rear_pin_reference_frame` records the observed transverse pin station;
 it does not assert that this is the complete tilt mechanism.
@@ -261,7 +270,9 @@ receiver, assembly measurements, and routed model parameters.
   from concretizing literal arguments as f32. Explicit `float(...)`
   arguments fix it; the authoring guide now gives the working form.
 - **Fixed diagnostic:** with multiple embedded view sets, `render --through`
-  needs `views:DSC00755` or `assembly_photos:DSC00762`. The shared CLI error
+  needs an asset-qualified view name such as `views:DSC00755` (the old
+  flat build also had `assembly_photos:DSC00762`; the assembly build consolidates
+  these photos into `views`). The shared CLI error
   previously suggested `--views`, which selects preset render views in this
   command. It now explains both selection forms; the assembly script uses
   qualified IDs.

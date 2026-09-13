@@ -1,0 +1,115 @@
+{
+  "parts": 22,
+  "states": [
+    "lift",
+    "swivel",
+    "caster_1_swivel",
+    "caster_1_roll",
+    "caster_2_swivel",
+    "caster_2_roll",
+    "caster_3_swivel",
+    "caster_3_roll",
+    "caster_4_swivel",
+    "caster_4_roll",
+    "caster_5_swivel",
+    "caster_5_roll"
+  ],
+  "critical_void_count": 10,
+  "void_audit": "All parts and the rest union clear all probes; receiver/body/rod positive controls pass",
+  "limitations": "Geometry checks only; stroke, wheel coupling and ground contact are not measured or validated.",
+  "rest_comparison": {
+    "crossbar": {
+      "samples": 12000,
+      "occupied": 501,
+      "mismatches": 0
+    },
+    "rail": {
+      "samples": 12000,
+      "occupied": 690,
+      "mismatches": 0
+    },
+    "gas_lift": {
+      "samples": 12000,
+      "occupied": 2827,
+      "mismatches": 0
+    },
+    "star_base": {
+      "samples": 12000,
+      "occupied": 147,
+      "mismatches": 0
+    },
+    "caster_1": {
+      "samples": 12000,
+      "occupied": 536,
+      "mismatches": 0
+    },
+    "caster_2": {
+      "samples": 12000,
+      "occupied": 545,
+      "mismatches": 0
+    },
+    "caster_3": {
+      "samples": 12000,
+      "occupied": 614,
+      "mismatches": 0
+    },
+    "caster_4": {
+      "samples": 12000,
+      "occupied": 578,
+      "mismatches": 0
+    },
+    "caster_5": {
+      "samples": 12000,
+      "occupied": 558,
+      "mismatches": 0
+    },
+    "mechanism_housing": {
+      "samples": 12000,
+      "occupied": 550,
+      "mismatches": 0
+    },
+    "rear_pins": {
+      "samples": 12000,
+      "occupied": 1050,
+      "mismatches": 0
+    },
+    "backrest_clamp_knob": {
+      "samples": 12000,
+      "occupied": 2020,
+      "mismatches": 0
+    },
+    "rear_control": {
+      "samples": 12000,
+      "occupied": 99,
+      "mismatches": 0
+    },
+    "lift_control": {
+      "samples": 12000,
+      "occupied": 75,
+      "mismatches": 0
+    },
+    "tilt_control": {
+      "samples": 12000,
+      "occupied": 42,
+      "mismatches": 0
+    },
+    "backrest_receiver": {
+      "samples": 12000,
+      "occupied": 2104,
+      "mismatches": 0
+    }
+  },
+  "motion_checks": {
+    "state": {
+      "lift": 0.06,
+      "swivel": 37.0,
+      "caster_1_swivel": 43.0,
+      "caster_1_roll": 725.0
+    },
+    "lift_swivel_caster_oracles": "pass",
+    "moved_voids": "clear in all 22 parts",
+    "pull_error_m": 7.031806913549081e-12,
+    "velocity_finite_difference": "all 12 state derivatives agree"
+  },
+  "posed_artifact": "Identical part WASM, expected poses and owned interface frames; canonical assembly remains at rest"
+}

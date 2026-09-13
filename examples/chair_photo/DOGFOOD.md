@@ -1,7 +1,9 @@
 # Python and persisted-evidence dogfood — 2026-09-12
 
 This pass exercises Fable's P1–P5 additions against the accepted chair base.
-It reuses the photos-only camera survey and existing observations; it adds no
+This historical report describes the 16-export baseline. The script now accepts
+the 22-part articulated base described in ARTICULATION.md and extracts its
+parts through Assembly Model. It reuses the photos-only camera survey and existing observations; it adds no
 new chair measurements and does not change the accepted geometry.
 
 ## Repeat
@@ -18,7 +20,7 @@ python3 examples/chair_photo/dogfood.py --benchmark-cli --render
 
 - `evidence.vviews`: four full-photo views, six named hole picks with fit/check
   roles, and the traced receiver mouth in four views.
-- `base-evidence.vproj`: the 16-part WGSL assembly with that view set and a
+- `base-evidence.vproj`: the current WGSL assembly with that view set and a
   provenance blob containing the original observation descriptions and roles.
 - `receiver-python.json`, optionally `receiver-cli.json`: the same SciPy
   optimization through either native Python ray casting or the CLI.

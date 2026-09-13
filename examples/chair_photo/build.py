@@ -19,13 +19,7 @@ def add_operator(project, operator, inputs, output, exported=False):
     cli(*command)
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--work", type=Path, default=HERE / "work")
-    parser.add_argument("--render", action="store_true")
-    args = parser.parse_args()
-    work = args.work.resolve()
-    report = json.loads((work / "measurements.json").read_text())
+def mount_parameters(report):
     params = {"assumed_thickness": 0.0025, "assumed_bend_start": 0.083,
               "assumed_bend_end": 0.094, "assumed_rail_start": 0.014}
     for name, feature in report["features"].items():
@@ -49,6 +43,17 @@ def main():
         for target, source in [("length", "long_mm"), ("width", "wide_mm")]:
             params[f"{prefix}_slot_{target}"] = float(np.mean([apertures[n][source] for n in names]) / 1000)
     params["cross_hole_diameter"] = float(np.mean([apertures[n]["wide_mm"] for n in ["cross_a_inner", "cross_b_inner"]]) / 1000)
+    return params
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--work", type=Path, default=HERE / "work")
+    parser.add_argument("--render", action="store_true")
+    args = parser.parse_args()
+    work = args.work.resolve()
+    report = json.loads((work / "measurements.json").read_text())
+    params = mount_parameters(report)
     (work / "parameters.json").write_text(json.dumps(params, indent=2) + "\n")
 
     project = work / "mount.vproj"
