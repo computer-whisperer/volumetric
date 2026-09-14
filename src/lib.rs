@@ -3,12 +3,12 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+#[cfg(any(feature = "native", feature = "web"))]
 use anyhow::Context;
-
-// wasmtime imports are now used through the wasm module
 
 pub mod baked;
 pub mod build_cache;
+#[cfg(any(feature = "native", feature = "web"))]
 pub mod direct_preview;
 pub mod mesh_cache;
 pub mod wasm;
@@ -382,6 +382,7 @@ pub mod marching_cubes_cpu;
 pub mod mesh_decimation;
 pub mod operator_config;
 pub(crate) mod parallel_iter;
+#[cfg(any(feature = "native", feature = "web"))]
 pub mod project_edit;
 pub mod sharp_features;
 pub mod stl;
@@ -1036,11 +1037,13 @@ impl Environment {
     }
 
     /// Inserts an asset into the environment.
+    #[cfg(any(feature = "native", feature = "web"))]
     fn insert(&mut self, asset: LoadedAsset) {
         self.assets.insert(asset.id.clone(), asset);
     }
 
     /// Removes and returns an asset by ID.
+    #[cfg(any(feature = "native", feature = "web"))]
     fn remove(&mut self, id: &str) -> Option<LoadedAsset> {
         self.assets.remove(id)
     }

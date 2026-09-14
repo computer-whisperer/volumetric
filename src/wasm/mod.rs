@@ -76,6 +76,7 @@ pub use web::{WebModelExecutor, WebOperatorExecutor, WebParallelSampler};
 ///
 /// Early N-dimensional models predate `get_io_ptr` (the host used to write
 /// into hardcoded low-memory offsets); those also need a rebuild.
+#[cfg(any(feature = "native", feature = "web"))]
 fn reject_legacy_model(wasm_bytes: &[u8]) -> Result<(), WasmBackendError> {
     let mut has_sample = false;
     let mut has_is_inside = false;
@@ -193,7 +194,7 @@ pub fn create_operator_executor(
     ))
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "native", feature = "web")))]
 mod tests {
     use super::*;
 
