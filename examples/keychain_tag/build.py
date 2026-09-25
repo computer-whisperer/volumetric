@@ -1,9 +1,10 @@
-"""Build the keychain sleeve and the tag's envelope from the measurements.
+"""Build the keychain bodies and the tag's envelope from the measurements.
 
 Reads work/measurements.json (measure.py), writes work/parameters.json, the
-project work/keychain.vproj (the sleeve in the tag frame, the tag envelope
-posed into the survey's world with a few photographs for overlay audits),
-and the printable work/keychain_sleeve.3mf / .stl in millimetres.
+project work/keychain.vproj (the rigid sleeve and the TPU bumper in the tag
+frame, the tag envelope posed into the survey's world with a few
+photographs for overlay audits), and the printable
+work/keychain_{sleeve,bumper}.3mf / .stl in millimetres.
 
     python3 examples/keychain_tag/build.py [--work DIR] [--render]
 """
@@ -19,6 +20,9 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 CLI = ROOT / "target/release/volumetric_cli"
+
+# The bodies: (asset, WGSL part).
+BODIES = [("sleeve", 1.0), ("bumper", 2.0)]
 
 # Photographs kept in the project for overlays: views all round the tag.
 AUDIT_VIEWS = ["DSC02139", "DSC02143", "DSC02147", "DSC02150", "DSC02152"]
@@ -68,23 +72,24 @@ def sample_lines(project, asset, lines):
 
 
 def report_fit(project, params, work):
-    """Interference between the tag envelope and the sleeve, sampled along x
-    lines through the tag: none is the fit; the lip's overlap onto the face
-    and the detent's reach over the back face are the retention."""
+    """Interference between the tag envelope and each body, sampled along x
+    lines through the tag: none is the fit. The lips' overlaps onto the face
+    and back (and the sleeve's detent) are the retention."""
     lines = []
     for y in np.linspace(-0.5, 0.5, 13) * params["measured_width"]:
         for z in np.linspace(0.0002, params["measured_height"] - 0.0002, 12):
             half = 0.5 * params["measured_length"] + 0.004
             lines.append(f"{-half},{y},{z} : {half},{y},{z} : 400")
-    tag = sample_lines(project, "tag_local", lines)
-    sleeve = sample_lines(project, "sleeve", lines)
     occupied = lambda rows: np.array([r["occupied"] for r in rows])
-    t, s = occupied(tag["samples"]), occupied(sleeve["samples"])
-    fit = {"points": int(len(t)), "tag_points": int(t.sum()), "interference_points": int((t & s).sum())}
+    t = occupied(sample_lines(project, "tag_local", lines)["samples"])
+    fit = {"points": int(len(t)), "tag_points": int(t.sum())}
+    for body, _ in BODIES:
+        b = occupied(sample_lines(project, body, lines)["samples"])
+        fit[f"{body}_interference_points"] = int((t & b).sum())
+        print(f"fit: {fit[f'{body}_interference_points']} of {fit['tag_points']} tag points inside the {body}")
     (work / "fit.json").write_text(json.dumps(fit, indent=2) + "\n")
-    print(f"fit: {fit['interference_points']} of {fit['tag_points']} tag points inside the sleeve")
-    if fit["interference_points"]:
-        raise SystemExit("the sleeve cuts into the tag envelope")
+    if any(fit[f"{body}_interference_points"] for body, _ in BODIES):
+        raise SystemExit("a body cuts into the tag envelope")
 
 
 def main() -> int:
@@ -117,7 +122,8 @@ def main() -> int:
             command.append("--no-export")
         cli(*command)
 
-    op("wgsl_script_operator", ["asset:keychain_source", {**params, "part": 1.0}], "sleeve", exported=True)
+    for body, part in BODIES:
+        op("wgsl_script_operator", ["asset:keychain_source", {**params, "part": part}], body, exported=True)
     op("wgsl_script_operator", ["asset:keychain_source", {**params, "part": 0.0}], "tag_local", exported=True)
     frame = report["frame"]
     pose = {"rotate": {"rx_deg": 0.0, "ry_deg": 0.0, "rz_deg": frame["yaw_deg"]},
@@ -126,16 +132,18 @@ def main() -> int:
     (work / "project-run.json").write_text(cli("project-run", "-p", project, "--json"))
 
     report_fit(project, params, work)
-    for suffix in ("3mf", "stl"):
-        print(cli("mesh", "-i", project, "--asset", "sleeve", "--unit", "mm", "--base-resolution", "16",
-                  "--max-depth", "5", "-q", "-o", work / f"keychain_sleeve.{suffix}").strip())
+    for body, _ in BODIES:
+        for suffix in ("3mf", "stl"):
+            print(cli("mesh", "-i", project, "--asset", body, "--unit", "mm", "--base-resolution", "16",
+                      "--max-depth", "5", "-q", "-o", work / f"keychain_{body}.{suffix}").strip())
     if args.render:
         for view in AUDIT_VIEWS:
             print(cli("render", "-i", project, "--asset", "tag_world", "--through", view, "--overlay", "edge",
                       "--up", "0,0,1", "--width", "2400", "--height", "1600", "--resolution", "256",
                       "--grid", "0", "--no-ssao", "-o", work / f"overlay-{view}.png").strip())
-        print(cli("render", "-i", project, "--asset", "sleeve", "--views", "iso,top,bottom,front",
-                  "--resolution", "256", "--grid", "0", "-o", work / "sleeve.png").strip())
+        for body, _ in BODIES:
+            print(cli("render", "-i", project, "--asset", body, "--views", "iso,iso-back,top,bottom",
+                      "--up", "0,0,1", "--resolution", "256", "--grid", "0", "-o", work / f"{body}.png").strip())
     print(f"Built {project}")
     return 0
 

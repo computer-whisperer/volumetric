@@ -3,9 +3,14 @@
 // the plain end, -x the end with the hanger slot), z out of the back.
 //
 // part 0: the tag's measured envelope (for fit checks and photo overlays)
-// part 1: the sleeve. The tag slides in from +x, display first against the
-//         front lip; a tongue in the back plate carries a detent that drops
-//         behind the tag's back face. Keyring lug on the closed -x end.
+// part 1: the sleeve (rigid: PLA/PETG). The tag slides in from +x, display
+//         first against the front lip; a tongue in the back plate carries a
+//         detent that drops behind the tag's back face. Keyring lug on the
+//         closed -x end.
+// part 2: the bumper (TPU). A full surround hugging the tag's envelope: a
+//         lip all round the display face and a frame over the back face;
+//         the back opening stretches over the tag. Keyring lug at -x on the
+//         display side.
 //
 // measured_* come from measure.py (work/measurements.json); assumed_* are
 // design choices, not observations.
@@ -44,6 +49,16 @@ override lug_reach: float = 0.0095; // @param key="assumed_lug_reach"
 override lug_width: float = 0.014; // @param key="assumed_lug_width"
 override lug_thickness: float = 0.004; // @param key="assumed_lug_thickness"
 override hole_diameter: float = 0.005; // @param key="assumed_hole_diameter"
+
+// The bumper.
+override tpu_clearance: float = 0.0; // @param key="assumed_tpu_clearance"
+override tpu_wall: float = 0.0015; // @param key="assumed_tpu_wall"
+override tpu_front: float = 0.0010; // @param key="assumed_tpu_front_thickness"
+override tpu_front_lip: float = 0.0010; // @param key="assumed_tpu_front_overlap"
+override tpu_back: float = 0.0012; // @param key="assumed_tpu_back_thickness"
+override tpu_back_lip: float = 0.0020; // @param key="assumed_tpu_back_overlap"
+override tpu_chamfer: float = 0.0006; // @param key="assumed_tpu_chamfer"
+override tpu_lug_thickness: float = 0.0035; // @param key="assumed_tpu_lug_thickness"
 
 // Signed distance to a rectangle of half-size h with corner radius r.
 fn rounded_rect(p: vec2d, h: vec2d, r: float) -> float {
@@ -137,8 +152,55 @@ fn detent(p: vec3d) -> bool {
     return p.x <= x1 && p.z >= bottom + (p.x - x0) / (x1 - x0) * detent_depth;
 }
 
+// The bumper's outer half-size at height z: the envelope plus clearance and
+// wall, held at the face's and the back's outline across the lips, less a
+// chamfer at the two faces.
+fn bumper_outer(z: float) -> vec2d {
+    let z0 = -tpu_front;
+    let z1 = tag_height + tpu_clearance + tpu_back;
+    let h = tag_half(clamp(z, 0.0, tag_height)) + vec2d(tpu_clearance + tpu_wall, tpu_clearance + tpu_wall);
+    let cut = max(tpu_chamfer - min(z - z0, z1 - z), 0.0);
+    return h - vec2d(cut, cut);
+}
+
+fn bumper(p: vec3d) -> bool {
+    let z0 = -tpu_front;
+    let z1 = tag_height + tpu_clearance + tpu_back;
+    if p.z < z0 || p.z > z1 { return false; }
+    let r = tag_radius + tpu_clearance + tpu_wall;
+    let shell = rounded_rect(p.xy, bumper_outer(p.z), r) <= 0.0;
+    // Lug off the -x end on the display side (the print bed side).
+    let face_end = -bumper_outer(0.0).x;
+    let hole_x = face_end + edge_radius - lug_reach + 0.5 * lug_width;
+    var lug = false;
+    if !shell && p.x < face_end + r && p.z <= z0 + tpu_lug_thickness {
+        let q = p.xy - vec2d(hole_x, 0.0);
+        lug = (length(q) <= 0.5 * lug_width || (p.x >= hole_x && abs(p.y) <= 0.5 * lug_width))
+            && length(q) > 0.5 * hole_diameter;
+    }
+    if !shell && !lug { return false; }
+    // The pocket: the envelope itself, plus clearance.
+    if p.z >= 0.0 && p.z <= tag_height + tpu_clearance
+        && rounded_rect(p.xy, tag_half(min(p.z, tag_height)) + vec2d(tpu_clearance, tpu_clearance),
+                        tag_radius + tpu_clearance) <= 0.0 {
+        return false;
+    }
+    // The display window: the face's outline less the front lip's overlap.
+    if p.z < 0.0 && rounded_rect(p.xy, 0.5 * vec2d(face_length, face_width) - vec2d(tpu_front_lip, tpu_front_lip),
+                                 max(tag_radius - tpu_front_lip, 0.001)) <= 0.0 {
+        return false;
+    }
+    // The back opening: the back face's outline less the back lip's overlap.
+    if p.z > tag_height && rounded_rect(p.xy, 0.5 * vec2d(back_length, back_width) - vec2d(tpu_back_lip, tpu_back_lip),
+                                        max(tag_radius - tpu_back_lip, 0.001)) <= 0.0 {
+        return false;
+    }
+    return true;
+}
+
 fn scene(p: vec3d) -> bool {
     if part < 0.5 { return tag(p); }
+    if part > 1.5 { return bumper(p); }
     return sleeve(p) || detent(p);
 }
 
@@ -146,12 +208,20 @@ fn bounds_min() -> vec3d {
     if part < 0.5 {
         return vec3d(-0.5 * tag_length, -0.5 * tag_width, 0.0) - vec3d(0.001, 0.001, 0.001);
     }
+    if part > 1.5 {
+        let h = bumper_outer(0.5 * tag_height);
+        return vec3d(-bumper_outer(0.0).x - lug_reach, -h.y, -tpu_front) - vec3d(0.001, 0.001, 0.001);
+    }
     return vec3d(closed_end() - lug_reach, -pocket_half().y - wall, -lip_thickness) - vec3d(0.001, 0.001, 0.001);
 }
 
 fn bounds_max() -> vec3d {
     if part < 0.5 {
         return vec3d(0.5 * tag_length, 0.5 * tag_width, tag_height) + vec3d(0.001, 0.001, 0.001);
+    }
+    if part > 1.5 {
+        let h = bumper_outer(0.5 * tag_height);
+        return vec3d(bumper_outer(0.0).x, h.y, tag_height + tpu_clearance + tpu_back) + vec3d(0.001, 0.001, 0.001);
     }
     return vec3d(open_end(), pocket_half().y + wall, pocket_top() + back_plate) + vec3d(0.001, 0.001, 0.001);
 }

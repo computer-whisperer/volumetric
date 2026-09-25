@@ -1,6 +1,6 @@
-# Keychain sleeve for a Bluetooth e-paper tag
+# Keychain bodies for a Bluetooth e-paper tag
 
-A slide-in keychain body for a white Bluetooth e-paper shelf label, designed
+Two keychain bodies, a rigid slide-in sleeve and a TPU bumper, for a white Bluetooth e-paper shelf label, designed
 from 21 raw stills of the tag lying display-down on the survey card
 (`/ceph/christian/Photos/library/2026/2026-09-25/DSC02137.ARW` to
 `DSC02157.ARW`, Sony a6700 + Viltrox 25 mm).
@@ -17,7 +17,7 @@ cargo build --release -p volumetric_cli
 bash examples/keychain_tag/survey.sh            # raws -> survey.vviews
 python examples/keychain_tag/hull.py            # visual-hull sections
 python examples/keychain_tag/measure.py         # -> work/measurements.json
-python examples/keychain_tag/build.py [--render] # -> work/keychain.vproj, keychain_sleeve.{3mf,stl}
+python examples/keychain_tag/build.py [--render] # -> work/keychain.vproj, keychain_{sleeve,bumper}.{3mf,stl}
 ```
 
 A full replay from the raws into a fresh work directory reproduced every
@@ -85,14 +85,42 @@ the sleeve covers them.
 Print back-plate down; the front lip then overhangs the pocket by about
 1.3 mm, which prints without support. PETG gives the tongue its spring.
 
+## The bumper (TPU)
+
+`keychain.wgsl` part 2, overall 82.1 × 38.7 × 15.9 mm, 5.7 cm³, with a
+full surround and no entry slot:
+
+- Pocket: the measured envelope itself (the tapered two-stage shape of
+  part 0) at 0 clearance. The envelope is an outer bound of the tag, so
+  that is snug, not tight. Raise `assumed_tpu_clearance` if a print grips
+  too hard.
+- Walls 1.5 mm following the taper, 0.6 mm chamfers at both faces.
+- Front lip 1.0 mm thick, all round the display face, overlapping its
+  outline by 1.0 mm (window 67.5 × 32.4 mm).
+- Back frame 1.2 mm thick, overlapping the back face's outline by 2.0 mm
+  (opening 53.6 × 28.8 mm). Fitting: seat the display in the front lip,
+  then stretch the back frame over. The opening's perimeter is about
+  163 mm against the tag's largest outline of about 207 mm, so the TPU
+  stretches roughly 27 % while the tag goes in. Soft TPU (95A or lower)
+  helps.
+- Keyring lug off the −x end on the display side, 3.5 mm thick, Ø5 mm
+  hole.
+- Check: 0 of 49,576 envelope points fall inside the bumper. The
+  superslicer check passes: manifold, one part. Decimation leaves the
+  volume within 0.01 % of the unsimplified mesh.
+
+Print display face down: the lug and front lip lie on the bed, the walls
+lean in at most about 31° from vertical, and the back frame's 2 mm
+overhang is the only bridge.
+
 ## Assumed, not observed
 
 - The display face was on the card, so its bezel width is unseen. The
   1.0 mm lip assumes the display's active area starts at least that far
   inside the face outline.
-- Clearance 0.3 mm, walls, lip, tongue and detent sizes, the lug, and
-  the tag's 3 mm corner radius are design choices (`assumed_*` in the
-  WGSL).
+- Clearances (0.3 mm sleeve, 0 bumper), walls, lips, the tongue and
+  detent, the lugs, and the tag's 3 mm corner radius are design choices
+  (`assumed_*` in the WGSL).
 - The envelope model (part 0) is a two-stage taper through the hull's
   outlines. It is a fit check, not the tag's true shape.
 
