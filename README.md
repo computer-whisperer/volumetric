@@ -324,6 +324,15 @@ volumetric_cli view-list -i chair.vproj [--asset views] [--json]
 # through the camera (the check that a modelled feature sits on the real one)
 volumetric_cli view-crop -i chair.vproj --view DSC00742 --center 3300,1900 --size 600x400     --scale 3 --grid 50 [--mark u,v] [--mark-world x,y,z] -o detail.png
 
+# A view resampled onto a world plane as a metric image with a millimetre
+# grid: points on the plane read off in mm; rectify several views at one
+# height and edges on that plane agree while edges off it slide apart (a
+# plane sweep finds a height); a vertical plane gives a true-scale elevation
+volumetric_cli view-rectify -i survey.vviews --view DSC02150 --plane-z 0.0137 \
+    --u-range 0.068,0.152 --v-range -0.120,-0.072 [--mm-per-px 0.05] [--grid-mm 1] -o plan.png
+volumetric_cli view-rectify -i survey.vviews --view DSC02144 --plane-point 0,-0.1153,0 \
+    --u-axis 1,0,0 --v-axis 0,0,1 --u-range 0.066,0.152 --v-range -0.002,0.018 -o side.png
+
 # Pixels cast onto a plane as world points (a horizontal plane, a project's
 # fitted plane, or a point and normal), and world points into pixels, with
 # the lens distortion honoured; --frame gives the results in a plane's or
@@ -354,7 +363,9 @@ volumetric_cli view-detect --image DSC00123.JPG [--image ...] --json
 
 # Stills straight from the camera: one unposed view per picture, a camera
 # per focus setting (Sony maker note), previews embedded and the originals
-# referenced, ready for view-detect and view-survey
+# referenced, ready for view-detect and view-survey. JPEGs developed from
+# raws without EXIF read it from the raw of the same name beside them
+# (.ARW/.DNG)
 volumetric_cli view-import --stills sessions/chairbase-dslr-0 -p chair.vproj \
     [--embed preview|full|none] [--preview-px 1600] [--sensor-mm 23.5] [--session s --field f]
 

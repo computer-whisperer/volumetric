@@ -113,6 +113,9 @@ enum Commands {
     /// Write a magnified crop of a view's original picture with a pixel grid, to read a detail at full resolution
     #[command(name = "view-crop")]
     ViewCrop(pick::ViewCropArgs),
+    /// Resample a view's picture onto a world plane as a metric image with a millimetre grid: read points on the plane in millimetres, or sweep a height across views until an edge agrees
+    #[command(name = "view-rectify")]
+    ViewRectify(pick::ViewRectifyArgs),
     /// Cast pixels of a view onto a plane as world points, or project world points into the view, through the surveyed camera
     #[command(name = "view-pick")]
     ViewPick(pick::ViewPickArgs),
@@ -603,6 +606,7 @@ fn main() -> Result<()> {
         Commands::ViewSelect(args) => views::run_view_select(args),
         Commands::ViewList(args) => views::run_view_list(args),
         Commands::ViewCrop(args) => pick::run_view_crop(args),
+        Commands::ViewRectify(args) => pick::run_view_rectify(args),
         Commands::ViewPick(args) => pick::run_view_pick(args),
         Commands::ViewTriangulate(args) => pick::run_view_triangulate(args),
         Commands::ViewResidual(args) => views::run_view_residual(args),

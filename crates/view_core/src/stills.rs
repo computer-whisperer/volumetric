@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use cv_core::exif::{Exif, focal_px_from_fov, read_exif};
+use cv_core::exif::{Exif, focal_px_from_fov, read_exif, read_raw_exif};
 use rayon::prelude::*;
 use volumetric_abi::viewset::{CameraModel, Provenance, View, ViewSet};
 
@@ -137,7 +137,7 @@ fn read_still(path: &Path, options: &StillsOptions) -> Result<Still> {
         .and_then(|n| n.to_str())
         .ok_or_else(|| anyhow!("{} has no usable file name", path.display()))?
         .to_string();
-    let exif = read_exif(&bytes);
+    let exif = read_exif(&bytes).or_else(|| raw_sidecar_exif(path));
     let (width, height, image) = match options.embed {
         Embed::None => {
             let (w, h) = dimensions_of(&bytes).with_context(|| format!("{name}: not a picture"))?;
@@ -160,6 +160,21 @@ fn read_still(path: &Path, options: &StillsOptions) -> Result<Still> {
         height,
         exif,
         image,
+    })
+}
+
+/// Raw extensions whose files carry the shooting EXIF of a developed JPEG.
+const RAW_EXTENSIONS: [&str; 4] = ["ARW", "arw", "DNG", "dng"];
+
+/// The EXIF of the raw beside a developed picture (same stem), for stills
+/// developed from raws by a tool that writes no EXIF of its own.
+fn raw_sidecar_exif(path: &Path) -> Option<Exif> {
+    RAW_EXTENSIONS.iter().find_map(|ext| {
+        let raw = path.with_extension(ext);
+        // Reads the whole raw: the maker note sits wherever the camera put it.
+        std::fs::read(&raw)
+            .ok()
+            .and_then(|bytes| read_raw_exif(&bytes))
     })
 }
 
@@ -303,7 +318,7 @@ fn build_set(
     }
     if no_exif > 0 {
         report.warnings.push(format!(
-            "{no_exif} frames carry no EXIF: their camera is seeded from the field of view and keyed 'unknown'"
+            "{no_exif} frames carry no EXIF (nor a raw of the same name beside them): their camera is seeded from the field of view and keyed 'unknown'"
         ));
     }
     if no_focus > 0 && no_exif < report.total {

@@ -18,6 +18,7 @@ pub mod text;
 pub mod crop;
 pub mod detect;
 pub mod measure;
+pub mod rectify;
 pub mod subset;
 
 pub use manifest::{

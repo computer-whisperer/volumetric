@@ -104,6 +104,12 @@ pub fn read_exif(jpeg: &[u8]) -> Option<Exif> {
     None
 }
 
+/// The EXIF of a TIFF-based raw (Sony ARW, DNG, ...): the file is itself the
+/// TIFF structure a JPEG's APP1 segment wraps, offsets and maker note alike.
+pub fn read_raw_exif(raw: &[u8]) -> Option<Exif> {
+    parse_tiff(raw)
+}
+
 /// A TIFF structure: the bytes and their byte order.
 struct Tiff<'a> {
     bytes: &'a [u8],
@@ -244,17 +250,26 @@ fn parse_tiff(bytes: &[u8]) -> Option<Exif> {
     Some(exif)
 }
 
-/// Sony's maker note: a 12-byte `SONY DSC ` header, then an IFD whose
-/// offsets are relative to the TIFF header. Focus mode is tag 0x201b,
+/// Sony's maker note: an IFD whose offsets are relative to the TIFF
+/// header, after a 12-byte `SONY DSC ` header in a JPEG and bare in a raw
+/// (ARW). Focus mode is tag 0x201b,
 /// SteadyShot 0xb026, and the focus position byte 0x2d of the enciphered
 /// block 0x9402 (located on the ILCE-6700 by matching exiftool's
 /// FocusPosition2 over 75 frames).
 fn read_sony_maker_note(tiff: &Tiff, at: usize, len: usize, exif: &mut Exif) -> Option<()> {
     let head = tiff.bytes.get(at..at + len.min(12))?;
-    if !head.starts_with(b"SONY") {
+    let ifd_at = if head.starts_with(b"SONY") {
+        at + 12
+    } else if exif
+        .make
+        .as_deref()
+        .is_some_and(|m| m.eq_ignore_ascii_case("SONY"))
+    {
+        at
+    } else {
         return None;
-    }
-    for e in tiff.ifd(at + 12)? {
+    };
+    for e in tiff.ifd(ifd_at)? {
         match e.tag {
             0x201B => {
                 let mode = *tiff.bytes.get(e.data_at)?;
@@ -300,11 +315,26 @@ pub fn encipher(i: u8) -> u8 {
 mod tests {
     use super::*;
 
-    /// A JPEG header with one APP1 EXIF segment: IFD0 holding Make, the
-    /// orientation and the Exif pointer; the Exif IFD holding FocalLength
-    /// 6.59 mm, a 26 mm equivalent, f/8, 1/250 s, ISO 5000 and a Sony
-    /// maker note (manual focus at position 170, SteadyShot off).
+    /// A JPEG header with one APP1 EXIF segment holding [`tiff`] with the
+    /// maker note's `SONY DSC ` header, as a camera JPEG carries it.
     fn jpeg(little: bool) -> Vec<u8> {
+        let t = tiff(little, b"OnePlus\0", true);
+        let mut out = vec![0xFF, 0xD8];
+        let payload_len = 2 + 6 + t.len();
+        out.extend_from_slice(&[0xFF, 0xE1]);
+        out.extend_from_slice(&(payload_len as u16).to_be_bytes());
+        out.extend_from_slice(b"Exif\0\0");
+        out.extend_from_slice(&t);
+        out.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02]);
+        out
+    }
+
+    /// A TIFF structure: IFD0 holding Make, the orientation and the Exif
+    /// pointer; the Exif IFD holding FocalLength 6.59 mm, a 26 mm
+    /// equivalent, f/8, 1/250 s, ISO 5000 and a Sony maker note (manual
+    /// focus at position 170, SteadyShot off), with its `SONY DSC ` header
+    /// or bare as a raw (ARW) carries it.
+    fn tiff(little: bool, make: &[u8], note_header: bool) -> Vec<u8> {
         let u16b = |v: u16| {
             if little {
                 v.to_le_bytes()
@@ -337,7 +367,6 @@ mod tests {
         // IFD0 at 8: three entries.
         t.extend_from_slice(&u16b(3));
         let make_at = 8 + 2 + 3 * 12 + 4;
-        let make = b"OnePlus\0";
         entry(&mut t, 0x010F, 2, make.len() as u32, u32b(make_at as u32));
         entry(&mut t, 0x0112, 3, 1, inline16(1));
         let exif_at = make_at + make.len();
@@ -358,7 +387,8 @@ mod tests {
         entry(&mut t, 0x8827, 3, 1, inline16(5000));
         entry(&mut t, 0x920A, 5, 1, u32b(focal_at as u32));
         // Maker note: 12-byte header, a 3-entry IFD, then the block.
-        let block_at = note_at + 12 + 2 + 3 * 12 + 4;
+        let header = if note_header { 12 } else { 0 };
+        let block_at = note_at + header + 2 + 3 * 12 + 4;
         let note_len = block_at + 0x40 - note_at;
         entry(&mut t, 0x927C, 7, note_len as u32, u32b(note_at as u32));
         entry(&mut t, 0xA405, 3, 1, inline16(26));
@@ -371,7 +401,9 @@ mod tests {
         t.extend_from_slice(&u32b(1));
         t.extend_from_slice(&u32b(250));
         assert_eq!(t.len(), note_at);
-        t.extend_from_slice(b"SONY DSC \0\0\0");
+        if note_header {
+            t.extend_from_slice(b"SONY DSC \0\0\0");
+        }
         t.extend_from_slice(&u16b(3));
         entry(&mut t, 0x201B, 1, 1, [0, 0, 0, 0]);
         entry(&mut t, 0x9402, 7, 0x40, u32b(block_at as u32));
@@ -381,15 +413,20 @@ mod tests {
         let mut block = [0u8; 0x40];
         block[0x2D] = encipher(170);
         t.extend_from_slice(&block);
+        t
+    }
 
-        let mut out = vec![0xFF, 0xD8];
-        let payload_len = 2 + 6 + t.len();
-        out.extend_from_slice(&[0xFF, 0xE1]);
-        out.extend_from_slice(&(payload_len as u16).to_be_bytes());
-        out.extend_from_slice(b"Exif\0\0");
-        out.extend_from_slice(&t);
-        out.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02]);
-        out
+    #[test]
+    fn a_raw_is_its_own_tiff_with_a_bare_maker_note() {
+        for little in [true, false] {
+            let exif = read_raw_exif(&tiff(little, b"SONY\0", false)).unwrap();
+            assert_eq!(exif.make.as_deref(), Some("SONY"));
+            assert_eq!(exif.focus_mode.as_deref(), Some("manual"));
+            assert_eq!(exif.focus_position, Some(170));
+            // A bare note is only read as Sony's when the make says so.
+            let other = read_raw_exif(&tiff(little, b"OnePlus\0", false)).unwrap();
+            assert_eq!(other.focus_position, None);
+        }
     }
 
     #[test]

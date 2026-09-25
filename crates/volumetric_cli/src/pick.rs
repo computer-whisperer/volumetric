@@ -170,6 +170,132 @@ pub fn run_view_crop(args: ViewCropArgs) -> Result<()> {
 }
 
 #[derive(Parser, Debug)]
+pub struct ViewRectifyArgs {
+    /// A .vviews file or a .vproj project
+    #[arg(short, long)]
+    pub input: PathBuf,
+
+    /// For projects with several view sets: which one
+    #[arg(long)]
+    pub views: Option<String>,
+
+    /// The view whose original picture to resample
+    #[arg(long)]
+    pub view: String,
+
+    /// The plane: horizontal at this height (world x, y as its axes)
+    #[arg(long, allow_hyphen_values = true)]
+    pub plane_z: Option<f64>,
+
+    /// The plane: its chart origin (with --u-axis and --v-axis)
+    #[arg(long, allow_hyphen_values = true)]
+    pub plane_point: Option<String>,
+
+    /// The chart's first axis, a world direction (made unit length)
+    #[arg(long, allow_hyphen_values = true)]
+    pub u_axis: Option<String>,
+
+    /// The chart's second axis (made orthogonal to the first, unit length)
+    #[arg(long, allow_hyphen_values = true)]
+    pub v_axis: Option<String>,
+
+    /// The window along the first axis, u0,u1 in metres
+    #[arg(long, allow_hyphen_values = true)]
+    pub u_range: String,
+
+    /// The window along the second axis, v0,v1 in metres
+    #[arg(long, allow_hyphen_values = true)]
+    pub v_range: String,
+
+    /// Output resolution, millimetres per pixel
+    #[arg(long, default_value_t = 0.05)]
+    pub mm_per_px: f64,
+
+    /// Grid spacing in millimetres (0 = none); every fifth line is brighter
+    /// and labelled in millimetres
+    #[arg(long, default_value_t = 1.0)]
+    pub grid_mm: f64,
+
+    /// Draw a cross where the view's ray through this world point x,y,z
+    /// meets the plane (repeatable)
+    #[arg(long = "mark-world", allow_hyphen_values = true)]
+    pub world_marks: Vec<String>,
+
+    /// Output PNG
+    #[arg(short, long)]
+    pub output: PathBuf,
+}
+
+pub fn run_view_rectify(args: ViewRectifyArgs) -> Result<()> {
+    use view_core::rectify::{RectifyOptions, rectify};
+    let set = load_viewset(&args.input, args.views.as_deref())?;
+    let (view, camera) = view_of(&set, &args.view)?;
+    let picture = picture_of(&set, view)?;
+    let unit = |a: [f64; 3], what: &str| -> Result<[f64; 3]> {
+        let n = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt();
+        if n < 1e-12 {
+            bail!("{what} must be non-zero");
+        }
+        Ok([a[0] / n, a[1] / n, a[2] / n])
+    };
+    let (origin, u_axis, v_axis) = match (args.plane_z, &args.plane_point) {
+        (Some(z), None) => ([0.0, 0.0, z], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+        (None, Some(point)) => {
+            let u = unit(
+                parse_coordinates::<3>(args.u_axis.as_deref().unwrap_or("1,0,0"), "--u-axis")?,
+                "--u-axis",
+            )?;
+            let v = parse_coordinates::<3>(args.v_axis.as_deref().unwrap_or("0,1,0"), "--v-axis")?;
+            let d = u[0] * v[0] + u[1] * v[1] + u[2] * v[2];
+            let v = unit(
+                [v[0] - d * u[0], v[1] - d * u[1], v[2] - d * u[2]],
+                "--v-axis",
+            )?;
+            (parse_coordinates::<3>(point, "--plane-point")?, u, v)
+        }
+        _ => bail!("give the plane as --plane-z or as --plane-point with --u-axis/--v-axis"),
+    };
+    let options = RectifyOptions {
+        origin,
+        u_axis,
+        v_axis,
+        u_range: parse_coordinates::<2>(&args.u_range, "--u-range")?,
+        v_range: parse_coordinates::<2>(&args.v_range, "--v-range")?,
+        resolution: args.mm_per_px / 1000.0,
+        grid: args.grid_mm / 1000.0,
+        world_marks: args
+            .world_marks
+            .iter()
+            .map(|m| parse_coordinates::<3>(m, "--mark-world"))
+            .collect::<Result<_>>()?,
+    };
+    let out = rectify(view, camera, &picture, &options)?;
+    std::fs::write(&args.output, out.image.to_png()?)
+        .with_context(|| format!("Failed to write {}", args.output.display()))?;
+    println!(
+        "Wrote {}: {} on the plane through ({:.4}, {:.4}, {:.4}), u {:?}, v {:?}, {}x{} at {} mm/px (column 0 = u {:.1} mm, row 0 = v {:.1} mm; v runs up the image){}",
+        args.output.display(),
+        args.view,
+        origin[0],
+        origin[1],
+        origin[2],
+        u_axis,
+        v_axis,
+        out.image.width,
+        out.image.height,
+        args.mm_per_px,
+        options.u_range[0] * 1000.0,
+        options.v_range[1] * 1000.0,
+        if out.unseen > 0 {
+            format!(", {} pixels unseen (black)", out.unseen)
+        } else {
+            String::new()
+        }
+    );
+    Ok(())
+}
+
+#[derive(Parser, Debug)]
 pub struct ViewPickArgs {
     /// A .vviews file or a .vproj project (a project also supplies planes
     /// and frames by asset id)
