@@ -4,3 +4,13 @@ build-wasm = "build --release --target wasm32-unknown-unknown -p simple_sphere_m
 # build-wasm plus the wasm32-wasip1-threads fea-solver variants, packed into
 # their baseline blobs (crates/wasm_dist). Use this when fea operators matter.
 wasm-dist = "run -p wasm_dist --"
+
+[env]
+# In debug builds wasmtime compiles a module's functions on rayon workers, and
+# a worker waiting on one half of a split runs other pending work on top of
+# its stack. With several modules compiling at once (the UI tests) that
+# nesting reaches about 7,000 unoptimized frames and overflows the default
+# 2 MB thread stack: roughly one `cargo test -p volumetric_ui_v2` run in
+# three aborted with "stack overflow". Applies to what cargo runs (test,
+# run), not to built binaries.
+RUST_MIN_STACK = "16777216"
