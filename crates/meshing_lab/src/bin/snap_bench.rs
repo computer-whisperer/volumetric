@@ -22,7 +22,7 @@ use meshing_lab::oracle::{
     standard_rotation,
 };
 use meshing_lab::render::{frame_bounds, render_plain, render_segments, render_smooth_png};
-use meshing_lab::segmentation::{SegmentationConfig, segment_regions};
+use meshing_lab::segmentation::{SegmentationConfig, SmoothFaces, segment_regions};
 use meshing_lab::snap::{SnapConfig, SnapKind, snap_feature_vertices};
 use std::path::PathBuf;
 use volumetric::adaptive_surface_nets_2::IndexedMesh2;
@@ -142,13 +142,18 @@ fn run_case(
 ) {
     let m = mesh_shape_with_margin(shape, max_depth, margin_frac);
     let fits = m.ring_fits(1);
-    let seg = segment_regions(&m.adjacency, &fits, &SegmentationConfig::default());
+    let seg_config = SegmentationConfig::default();
+    let seg = segment_regions(&m.adjacency, &fits, &seg_config);
 
     let sampler = |p: DVec3| shape.is_inside(p);
     let result = snap_feature_vertices(
         &m.positions,
         &m.adjacency,
-        &seg.labels,
+        SmoothFaces {
+            labels: &seg.labels,
+            fits: &fits,
+            config: &seg_config,
+        },
         m.cell,
         &SnapConfig::default(),
         Some(&sampler),

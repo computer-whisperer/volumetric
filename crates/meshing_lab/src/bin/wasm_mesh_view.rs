@@ -18,6 +18,8 @@
 //! manually and reports per-vertex labels/snap outcomes plus, for the band's
 //! post-weld triangles, which edges are feature edges and each corner's
 //! feature degree — what decimation and the final normal split will act on.
+//! Adding `--dump-snaps <file>` writes every stage-4 vertex's snap outcome
+//! (`-`/`e`/`c`, position before, position after) for diffing two builds.
 
 use glam::DVec3;
 use meshing_lab::render;
@@ -28,6 +30,66 @@ use volumetric::sharp_features::{
     SharpFeatureConfig, adjacency, cleanup, feature_edges, fit, segmentation, snap,
 };
 
+/// The sharp stages up to the snap, re-run on a stage-4 mesh exactly as
+/// `apply_sharp_features` runs them, with every intermediate kept for the
+/// debug reports.
+struct SharpStages {
+    cell: f64,
+    fits: Vec<Option<fit::VertexFit>>,
+    seg: segmentation::Segmentation,
+    snapped: snap::SnapResult,
+}
+
+fn rerun_sharp_stages(
+    wasm_bytes: &[u8],
+    result: &volumetric::AdaptiveMeshV2Result,
+    positions: &[DVec3],
+    normals: &[DVec3],
+    config: &SharpFeatureConfig,
+) -> SharpStages {
+    // The cell size the sharp stage saw: the largest edge of the grid cell.
+    let size = result.stats.cell_size;
+    let cell = size.0.max(size.1).max(size.2);
+
+    let (bmin, bmax) = (result.bounds_min, result.bounds_max);
+    let sampler_impl = volumetric::wasm::create_parallel_sampler(wasm_bytes).unwrap();
+    let is_inside = |p: DVec3| -> bool {
+        use volumetric::wasm::ParallelModelSampler;
+        if p.x < bmin.0 as f64
+            || p.x > bmax.0 as f64
+            || p.y < bmin.1 as f64
+            || p.y > bmax.1 as f64
+            || p.z < bmin.2 as f64
+            || p.z > bmax.2 as f64
+        {
+            return false;
+        }
+        sampler_impl.sample(p.x, p.y, p.z) > 0.5
+    };
+
+    let adjacency = adjacency::MeshAdjacency::build(positions.len(), &result.indices);
+    let fits = fit::ring_fits(positions, &adjacency, normals, cell, 1);
+    let seg = segmentation::segment_regions(&adjacency, &fits, &config.segmentation);
+    let snapped = snap::snap_feature_vertices(
+        positions,
+        &adjacency,
+        segmentation::SmoothFaces {
+            labels: &seg.labels,
+            fits: &fits,
+            config: &config.segmentation,
+        },
+        cell,
+        &config.snap,
+        Some(&is_inside),
+    );
+    SharpStages {
+        cell,
+        fits,
+        seg,
+        snapped,
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let value_positions: Vec<usize> = [
@@ -35,6 +97,7 @@ fn main() {
         "--simplify-tolerance",
         "--dump-near",
         "--debug-corner",
+        "--dump-snaps",
     ]
     .iter()
     .filter_map(|flag| args.iter().position(|a| a == flag).map(|i| i + 1))
@@ -192,39 +255,14 @@ fn main() {
         let target = DVec3::new(cx, cy, cz);
         let near = |p: DVec3| (p - target).abs().max_element() < r;
 
-        // The cell size the sharp stage saw: the largest edge of the grid cell.
-        let (bmin, bmax) = (result.bounds_min, result.bounds_max);
-        let size = result.stats.cell_size;
-        let cell = size.0.max(size.1).max(size.2);
-        println!("debug-corner: cell={cell:.6} target={target:?} r={r}");
-
-        let sampler_impl = volumetric::wasm::create_parallel_sampler(&wasm_bytes).unwrap();
-        let is_inside = |p: DVec3| -> bool {
-            use volumetric::wasm::ParallelModelSampler;
-            if p.x < bmin.0 as f64
-                || p.x > bmax.0 as f64
-                || p.y < bmin.1 as f64
-                || p.y > bmax.1 as f64
-                || p.z < bmin.2 as f64
-                || p.z > bmax.2 as f64
-            {
-                return false;
-            }
-            sampler_impl.sample(p.x, p.y, p.z) > 0.5
-        };
-
         let sharp_config = SharpFeatureConfig::default();
-        let adj = adjacency::MeshAdjacency::build(positions.len(), indices);
-        let fits = fit::ring_fits(&positions, &adj, &normals, cell, 1);
-        let seg = segmentation::segment_regions(&adj, &fits, &sharp_config.segmentation);
-        let snapped = snap::snap_feature_vertices(
-            &positions,
-            &adj,
-            &seg.labels,
+        let SharpStages {
             cell,
-            &sharp_config.snap,
-            Some(&is_inside),
-        );
+            fits,
+            seg,
+            snapped,
+        } = rerun_sharp_stages(&wasm_bytes, &result, &positions, &normals, &sharp_config);
+        println!("debug-corner: cell={cell:.6} target={target:?} r={r}");
 
         // Name regions by their mean carried normal (cube faces -> axes).
         let mut region_normal: Vec<DVec3> = vec![DVec3::ZERO; seg.region_count];
@@ -265,6 +303,32 @@ fn main() {
             snapped.stats.rejected_verify,
             snapped.stats.rejected_nonfinite,
         );
+
+        // Every stage-4 vertex's snap outcome, one line each in vertex
+        // order, for comparing two builds of the snap stage.
+        if let Some(path) = args
+            .iter()
+            .position(|a| a == "--dump-snaps")
+            .and_then(|i| args.get(i + 1))
+        {
+            use std::fmt::Write;
+            let mut out = String::new();
+            for v in 0..positions.len() {
+                let kind = match snapped.snapped[v] {
+                    Some(snap::SnapKind::Edge) => 'e',
+                    Some(snap::SnapKind::Corner) => 'c',
+                    None => '-',
+                };
+                let (p, q) = (positions[v], snapped.positions[v]);
+                writeln!(
+                    out,
+                    "{kind} {} {} {} {} {} {}",
+                    p.x, p.y, p.z, q.x, q.y, q.z
+                )
+                .unwrap();
+            }
+            std::fs::write(path, out).expect("write snap dump");
+        }
 
         // Per-vertex: stage-4 state -> snap outcome.
         let mut band: Vec<usize> = (0..positions.len())
@@ -639,35 +703,17 @@ fn main() {
     // vertex did.
     if args.iter().any(|a| a == "--debug-rim") {
         assert!(!sharp, "--debug-rim requires --no-sharp");
-        let size = result.stats.cell_size;
-        let cell = size.0.max(size.1).max(size.2);
-        let sampler_impl = volumetric::wasm::create_parallel_sampler(&wasm_bytes).unwrap();
-        let (bmin, bmax) = (result.bounds_min, result.bounds_max);
-        let is_inside = |p: DVec3| -> bool {
-            use volumetric::wasm::ParallelModelSampler;
-            if p.x < bmin.0 as f64
-                || p.x > bmax.0 as f64
-                || p.y < bmin.1 as f64
-                || p.y > bmax.1 as f64
-                || p.z < bmin.2 as f64
-                || p.z > bmax.2 as f64
-            {
-                return false;
-            }
-            sampler_impl.sample(p.x, p.y, p.z) > 0.5
-        };
-        let adj = adjacency::MeshAdjacency::build(positions.len(), indices);
-        let fits = fit::ring_fits(&positions, &adj, &normals, cell, 1);
-        let seg_cfg = segmentation::SegmentationConfig::default();
-        let seg = segmentation::segment_regions(&adj, &fits, &seg_cfg);
-        let snap_cfg = snap::SnapConfig::default();
-        let snapped = snap::snap_feature_vertices(
-            &positions,
-            &adj,
-            &seg.labels,
+        let SharpStages {
             cell,
-            &snap_cfg,
-            Some(&is_inside),
+            fits,
+            seg,
+            snapped,
+        } = rerun_sharp_stages(
+            &wasm_bytes,
+            &result,
+            &positions,
+            &normals,
+            &SharpFeatureConfig::default(),
         );
         println!(
             "debug-rim: {} regions | candidates {} snapped {}+{} rejects: sides {} parallel {} move {} verify {} nonfinite {}",

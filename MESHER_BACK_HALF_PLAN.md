@@ -290,6 +290,183 @@ a blow-up. The sphere is identical; the cube went from 2,770 to its 12.
   leaves a folded pocket (seen on an off-grid box at 64). Decimation now
   neither grows nor removes these.
 - Creases whose two sides share a region are still not snapped (the lug
-  hole's rim is a clean-shaded sawtooth). Next step: local sides in the
-  snap stage.
+  hole's rim is a clean-shaded sawtooth). Done since: see "Next step: local
+  sides in the snap stage" below.
 - Needles: no triangle-shape term in decimation.
+
+## Next step: local sides in the snap stage
+
+Status: built, 2026-10-02. The design below was written before the first
+edit and is kept as written; "As built: local sides" after it has the
+results and the three places the build departed from it.
+
+### Why
+
+The snap stage moves a feature-zone vertex onto the line where two smooth
+faces meet. It finds the faces by gathering the nearby vertices that
+segmentation assigned to a smooth region, grouping them **by region
+label**, and fitting one plane per label (`gather_side_planes` in
+`sharp_features/snap.rs`).
+
+A region label is global. Region growth steps from vertex to vertex wherever
+the fitted normals turn by less than 15°, so two faces that meet at a sharp
+crease in one place get the same label if they are joined smoothly anywhere
+else. Then the crease has one label on both sides, the two faces are pooled
+into one "side", its plane fit fails, and the vertex is left where it was.
+
+Measured on the keychain sleeve at 512 (`wasm_mesh_view --debug-corner` at
+three points round the lug hole's top rim): the hole's wall and the lug's
+top face both carry region 0, the two-vertex band between them is unclaimed,
+and none of it snaps. The whole mesh has 435 candidates rejected for having
+fewer than two sides. Any part with an edge that is filleted along some of
+its length and sharp along the rest has the same problem.
+
+### Target
+
+A side is local: a set of nearby on-face vertices that are connected to
+each other *inside the gather ball* without crossing a crease.
+
+1. **One home for the growth gate.** `segmentation.rs` gets a function for
+   "these two fitted vertices may belong to one face" (fitted normals
+   within `max_normal_jump_deg`). Region growth uses it, and so does snap.
+2. **Sides by local connectivity.** In `gather_side_planes`, the claimed
+   vertices inside the ball are split into connected components over the
+   mesh edges that pass the growth gate. Each component is a side: plane
+   fit, support gate and residual gate as today. Labels are only used to
+   tell claimed from unclaimed.
+   Two claimed neighbours have different labels only if the gate fails
+   between them, so local components are always a refinement of the labels:
+   nothing that was two sides becomes one.
+3. **Candidates.** Today: unclaimed vertices, plus claimed vertices with a
+   neighbour of a different label (a grid-aligned crease leaves no unclaimed
+   band). The second rule becomes "a claimed neighbour the growth gate
+   fails against", which covers the same-label case too.
+4. Everything after the sides (intersection, movement clamp, refinement
+   against the sampler, verification, weld, feature edges, decimation,
+   normal split) is unchanged.
+
+`snap_feature_vertices` takes the fits and the segmentation config in
+addition to the labels.
+
+### The one known risk, and how it is decided
+
+Splitting can also separate two pieces of the *same* face that today pool
+under one label, when they are connected only outside the ball (a groove
+narrower than the ball, an unclaimed streak across a face). Two such pieces
+could each fall under the six-vertex support gate, or be picked as the two
+best-supported sides and rejected as parallel.
+
+This is measured before anything is built on it: dump the per-vertex snap
+outcome from the old and the new code on the six reference models and count
+the vertices that snapped before and no longer do. If that count is not
+negligible, pieces are merged again where they fit one plane within the
+side residual gate; the first candidate rule for that is "pool by label
+first, split a label only when its pooled fit fails".
+
+### Done means
+
+- The lug hole's rim on the sleeve snaps (512), and the count of candidates
+  rejected for sides drops.
+- No vertex that snapped before stays unsnapped, bar a negligible count
+  explained case by case.
+- Reference table (six models, sharp and sharp + simplify): open edges stay
+  0; non-manifold edges, folds and off-surface area do not grow beyond what
+  the newly snapped creases account for; volume moves toward the model.
+- Sharp-off outputs stay byte-identical (this stage does not run there).
+- Tests: a part-filleted crease whose two faces share one label snaps onto
+  the crease line; a single-label crease with no unclaimed band snaps.
+
+### Not in this step
+
+- Small-radius curved sides. A side is a plane fit with a residual gate of
+  0.1 cell over a three-cell ball, which a cylinder passes only above a
+  radius of about 14 cells. The lug hole is 15 cells at 512 and 7.5 at 256,
+  so at 256 its rim is expected to stay unsnapped for that separate reason.
+- Snap and weld debris, needles (see "Still open" above).
+
+### As built: local sides
+
+Commands as for the back half: `mesh --sharp-edges` with and without
+`--no-simplify`; sleeve and bumper at 512, the rest at 256. Per-vertex snap
+outcomes come from `wasm_mesh_view --debug-corner 9,9,9,0 --dump-snaps
+<file>` run with the build before and after.
+
+#### Results
+
+Snapped vertices, before → after, and what changed per vertex:
+
+| | snapped | no longer snapped | newly snapped | same vertex, other target |
+|---|---:|---:|---:|---:|
+| sleeve | 9,673 → 9,876 | 0 | 203 | 0 |
+| bumper | 16,573 → 19,439 | 0 | 2,866 | 4 |
+| toy car | 12,391 → 12,981 | 0 | 590 | 2 |
+| cube | 6,000 → 6,000 | 0 | 0 | 0 |
+| tray | 11,061 → 11,085 | 0 | 24 | 0 |
+
+(The six "other target" vertices were edge snaps and are now corner snaps:
+a third side appeared.)
+
+- The lug hole's top rim on the sleeve snaps all the way round (193 of the
+  203; close-up renders before and after: ragged rim, clean circle).
+  Candidates rejected for sides on the sleeve: 435 → 239.
+- The bumper's gains lie along straight creases at three heights (z = 3.3,
+  10.2 and 13.6 mm), down its long sides and across its ends, that were left
+  as sawtooth before.
+- Reference table, sharp and sharp + simplify: open edges 0 throughout;
+  non-manifold edges unchanged on every model (sleeve 4, bumper 1 / 0, car
+  75 / 59, tray 4); cube and sphere unchanged; the four sharp-off outputs
+  byte-identical.
+- Hard folds rise with the snapped count: sleeve 273 → 318, bumper 584 →
+  624, car 1,846 → 1,880, tray 356 → 376 (sharp, no simplify). On the
+  sleeve all 45 new ones are on the newly snapped rim, which now has 44;
+  the three rims that already snapped have 36, 46 and 48. A snapped curved
+  rim carries that many folds today wherever it is; that is the snap and
+  weld debris still open above, not something new.
+- Largest deviation on the sleeve 0.08 → 0.37 cell (99th percentile
+  unchanged at 0.025). Bumper sharp + simplify volume 5,705.6 → 5,716.3
+  against 5,711.0 for the undecimated mesh: from 0.09 % under to 0.09 %
+  over. Not chased.
+- At 256 the lug hole's rim is unchanged: three of the seven or eight
+  feature-zone vertices at each point checked snap, before and after. The
+  hole is 7.5 cells in radius there and its wall fails the plane fit, as
+  "Not in this step" expected.
+
+#### Where the build departed from the design
+
+1. **Sides are pooled by label first and split only when the pooled fit
+   fails.** Splitting every label into local pieces (the design) gained the
+   same creases but lost 67 snapped vertices on the car and 15 on the tray:
+   one face broken into pieces inside the ball, each short of support or
+   picked as a parallel pair. This was the fallback the design named.
+2. **A piece of a split region is a side only if its plane passes within
+   the movement clamp of the vertex.** With label-first sides the car still
+   lost 12: a piece of a face three cells away, with the most support, was
+   picked ahead of the near side. Applying the same test to every side (not
+   only pieces) was tried and rejected: it gains about 950 more snaps on the
+   car and takes its non-manifold edges from 75 to 160.
+3. **A snap that uses a piece must find every side's surface at the target**
+   (`sides_meet_at` in `snap.rs`). At this scale a tight fillet looks like a
+   crease. On the tray, pockets end in a fillet of about four cells; its two
+   flanks came out as two sides, their planes meet 1.4 cells beyond the
+   fillet, on the top face, and the rim vertices were pulled there (four new
+   non-manifold edges, 45 folds, from 13 snaps). The existing check along the
+   mean normal passes because the top face does run through that point. The
+   new check probes each side separately, on whichever side of the other
+   faces its surface is (behind them at a convex edge, in front at a concave
+   one). With it the tray's non-manifold edges are back to 4.
+
+   Applying this check to every snap, not only to pieces, would reject 196
+   (sleeve), 375 (car) and 282 (tray) vertices that snap today and takes the
+   tray's folds from 356 to 249. That is a lead for the debris work, not
+   part of this step.
+
+#### Also noticed
+
+- `refine_target` shifts its probe line to the material side of the other
+  sides. That is right at a convex edge. At a concave edge the probe then
+  runs inside the other face's material, finds no boundary, and that side
+  contributes no correction. On the sleeve about half of all snaps (4,867
+  of 9,673) have a side that goes unrefined; with the shift tried both ways
+  196 do. Flat faces lose nothing by it; a concave edge against a curved
+  face keeps the plane fit's secant error. `sides_meet_at` tries both
+  shifts; refinement could do the same.

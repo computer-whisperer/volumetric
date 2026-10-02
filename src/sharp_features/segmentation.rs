@@ -52,6 +52,47 @@ impl Default for SegmentationConfig {
     }
 }
 
+/// Whether two fitted vertices can lie on one smooth face: their fitted
+/// normals differ by no more than the growth gate. Region growth steps only
+/// between neighbors that pass, and snapping tells the two sides of a crease
+/// apart by the neighbors that do not.
+pub fn on_one_face(a: &VertexFit, b: &VertexFit, config: &SegmentationConfig) -> bool {
+    unsigned_angle_degrees(a.normal, b.normal) <= config.max_normal_jump_deg
+}
+
+/// The smooth faces as the snap stage reads them: which vertices lie on one,
+/// and which mesh edges stay on one.
+///
+/// Region labels alone do not answer the second question. A label is global:
+/// two faces that meet at a crease here share a label if they are joined
+/// smoothly anywhere else (an edge filleted along part of its length, a hole
+/// tangent to a wall). The growth gate between two neighbors is local.
+#[derive(Clone, Copy)]
+pub struct SmoothFaces<'a> {
+    pub labels: &'a [Option<u32>],
+    pub fits: &'a [Option<VertexFit>],
+    pub config: &'a SegmentationConfig,
+}
+
+impl SmoothFaces<'_> {
+    /// Whether `v` was claimed by a smooth region.
+    pub fn claimed(&self, v: u32) -> bool {
+        self.labels[v as usize].is_some()
+    }
+
+    /// Whether neighbors `u` and `w` are both claimed and the growth gate
+    /// passes between them, i.e. the edge between them stays on one face.
+    pub fn joined(&self, u: u32, w: u32) -> bool {
+        if !(self.claimed(u) && self.claimed(w)) {
+            return false;
+        }
+        match (&self.fits[u as usize], &self.fits[w as usize]) {
+            (Some(a), Some(b)) => on_one_face(a, b, self.config),
+            _ => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Segmentation {
     /// Region id per vertex; `None` for unclaimed (feature-zone) vertices.
@@ -107,7 +148,7 @@ pub fn segment_regions(
                 if fit_w.residual_cells > config.max_grow_residual_cells {
                     continue;
                 }
-                if unsigned_angle_degrees(fit_u.normal, fit_w.normal) > config.max_normal_jump_deg {
+                if !on_one_face(fit_u, fit_w, config) {
                     continue;
                 }
                 labels[w as usize] = Some(region);
@@ -142,33 +183,9 @@ pub fn segment_regions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sharp_features::adjacency::grid_mesh;
     use crate::sharp_features::fit::ring_fits;
     use glam::DVec3;
-
-    /// Triangulated (nx x ny) vertex grid; `pos` maps grid coordinates to 3D.
-    fn grid_mesh(
-        nx: usize,
-        ny: usize,
-        pos: impl Fn(usize, usize) -> DVec3,
-    ) -> (Vec<DVec3>, Vec<u32>) {
-        let mut positions = Vec::with_capacity(nx * ny);
-        for j in 0..ny {
-            for i in 0..nx {
-                positions.push(pos(i, j));
-            }
-        }
-        let mut indices = Vec::new();
-        for j in 0..ny - 1 {
-            for i in 0..nx - 1 {
-                let a = (j * nx + i) as u32;
-                let b = a + 1;
-                let c = a + nx as u32;
-                let d = c + 1;
-                indices.extend_from_slice(&[a, b, c, b, d, c]);
-            }
-        }
-        (positions, indices)
-    }
 
     fn segment_grid(positions: &[DVec3], indices: &[u32]) -> Segmentation {
         let adjacency = MeshAdjacency::build(positions.len(), indices);

@@ -1,13 +1,18 @@
 //! Feature snapping: move feature-zone vertices onto the sharp edge or corner
-//! implied by the smooth regions around them.
+//! implied by the smooth faces around them.
 //!
-//! For each candidate vertex (unclaimed, or claimed with a neighbor claimed
-//! by a different region), claimed vertices of each adjacent region are
-//! gathered within a small radius. These are face-pure *by construction* (the
-//! region label came from connectivity, not from geometric separation of a
-//! mixed sample cloud — the failure mode of every per-vertex probing attempt).
-//! One plane is fitted per side; two sides intersect in the local edge line,
+//! For each candidate vertex (unclaimed, or claimed with a claimed neighbor
+//! on another face), the claimed vertices within a small radius are gathered
+//! and sorted into sides, one per face. These are face-pure *by construction*
+//! (a side comes from connectivity, not from geometric separation of a mixed
+//! sample cloud — the failure mode of every per-vertex probing attempt). One
+//! plane is fitted per side; two sides intersect in the local edge line,
 //! three in a corner point, and the vertex is projected onto it.
+//!
+//! A side is normally a region's vertices. Region labels are global, though,
+//! and two faces that meet at a crease here carry one label when they are
+//! joined smoothly somewhere else (see [`SmoothFaces`]). So a region that no
+//! single plane fits is split into the pieces connected inside the radius.
 //!
 //! Robustness contract: snapping is opt-in per vertex behind a chain of gates
 //! (side support, side fit residual, intersection conditioning, movement
@@ -22,13 +27,14 @@ use glam::DVec3;
 use crate::sharp_features::OccupancyFn;
 use crate::sharp_features::adjacency::MeshAdjacency;
 use crate::sharp_features::fit::fit_plane;
+use crate::sharp_features::segmentation::SmoothFaces;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct SnapConfig {
-    /// Radius (cell units) around the vertex for gathering region points.
+    /// Radius (cell units) around the vertex for gathering face points.
     pub gather_radius_cells: f64,
-    /// Minimum claimed vertices per region side for that side to qualify.
+    /// Minimum claimed vertices on a side for that side to qualify.
     pub min_side_points: usize,
     /// Maximum RMS plane-fit residual (cell units) for a side to qualify.
     pub max_side_residual_cells: f64,
@@ -91,7 +97,7 @@ pub struct SnapStats {
     pub candidates: usize,
     pub snapped_edges: usize,
     pub snapped_corners: usize,
-    /// Fewer than two qualifying region sides.
+    /// Fewer than two qualifying sides.
     pub rejected_sides: usize,
     /// Two sides too close to parallel for a stable edge line.
     pub rejected_parallel: usize,
@@ -119,6 +125,8 @@ struct SidePlane {
     normal: DVec3,
     centroid: DVec3,
     support: usize,
+    /// The side is one piece of a region that no single plane fitted.
+    split: bool,
 }
 
 /// What one candidate evaluation produced, folded into [`SnapStats`] and the
@@ -144,13 +152,13 @@ enum SnapAttempt {
 pub fn snap_feature_vertices(
     positions: &[DVec3],
     adjacency: &MeshAdjacency,
-    labels: &[Option<u32>],
+    faces: SmoothFaces,
     cell: f64,
     config: &SnapConfig,
     sampler: Option<&dyn OccupancyFn>,
 ) -> SnapResult {
     static NEVER: AtomicBool = AtomicBool::new(false);
-    snap_feature_vertices_cancellable(positions, adjacency, labels, cell, config, sampler, &NEVER)
+    snap_feature_vertices_cancellable(positions, adjacency, faces, cell, config, sampler, &NEVER)
 }
 
 /// [`snap_feature_vertices`], checking `cancel` before each candidate.
@@ -162,27 +170,26 @@ pub fn snap_feature_vertices(
 pub fn snap_feature_vertices_cancellable(
     positions: &[DVec3],
     adjacency: &MeshAdjacency,
-    labels: &[Option<u32>],
+    faces: SmoothFaces,
     cell: f64,
     config: &SnapConfig,
     sampler: Option<&dyn OccupancyFn>,
     cancel: &AtomicBool,
 ) -> SnapResult {
-    // Candidates are the feature-zone (unclaimed) vertices, plus
-    // region-boundary vertices: when the sampling grid aligns with a feature,
-    // the sawtooth amplitude collapses below the segmentation residual gates
-    // and two regions grow into direct contact with no unclaimed band between
-    // them. A claimed vertex with a differently-claimed neighbor sits on a
-    // feature all the same. (That regime is also exactly when near-feature
-    // vertex positions are accurate, so gathering from them is sound.)
+    // Candidates are the feature-zone (unclaimed) vertices, plus claimed
+    // vertices with a claimed neighbor on another face: when the sampling
+    // grid aligns with a feature, the sawtooth amplitude collapses below the
+    // segmentation residual gates and two faces grow into direct contact with
+    // no unclaimed band between them. Such a vertex sits on a feature all the
+    // same. (That regime is also exactly when near-feature vertex positions
+    // are accurate, so gathering from them is sound.)
     let is_candidate = |v: usize| -> bool {
-        match labels[v] {
-            None => true,
-            Some(a) => adjacency
-                .neighbors(v as u32)
+        let v = v as u32;
+        !faces.claimed(v)
+            || adjacency
+                .neighbors(v)
                 .iter()
-                .any(|&u| matches!(labels[u as usize], Some(b) if b != a)),
-        }
+                .any(|&u| faces.claimed(u) && !faces.joined(v, u))
     };
     let candidate_mask = crate::parallel_iter::map_range(0..positions.len(), is_candidate);
     let candidates: Vec<u32> = candidate_mask
@@ -196,7 +203,7 @@ pub fn snap_feature_vertices_cancellable(
             return (v, false, SnapAttempt::Cancelled);
         }
         let (corner_fallback, attempt) = snap_one(
-            v as usize, positions, adjacency, labels, cell, config, sampler,
+            v as usize, positions, adjacency, faces, cell, config, sampler,
         );
         (v, corner_fallback, attempt)
     });
@@ -241,13 +248,13 @@ fn snap_one(
     v: usize,
     positions: &[DVec3],
     adjacency: &MeshAdjacency,
-    labels: &[Option<u32>],
+    faces: SmoothFaces,
     cell: f64,
     config: &SnapConfig,
     sampler: Option<&dyn OccupancyFn>,
 ) -> (bool, SnapAttempt) {
     // Around corners the unclaimed pool is wider than along edges, pushing
-    // each region's claimed vertices further away; one retry with a larger
+    // each face's claimed vertices further away; one retry with a larger
     // gather radius recovers those without loosening the common case.
     const RETRY_GATHER_SCALE: f64 = 1.75;
     let gather_radii = [
@@ -262,7 +269,7 @@ fn snap_one(
         planes = gather_side_planes(
             positions,
             adjacency,
-            labels,
+            faces,
             v,
             origin,
             radius_cells,
@@ -281,7 +288,7 @@ fn snap_one(
     // Try a corner when three sides qualify, falling back to the
     // best-supported edge pair when the corner solve is ill-conditioned
     // or its target is out of movement range (vertices along an edge near
-    // a corner see three regions but belong on the edge line).
+    // a corner see three faces but belong on the edge line).
     let max_move = config.max_move_cells * cell;
     let mut target: Option<(DVec3, SnapKind)> = None;
     if planes.len() >= 3 {
@@ -344,19 +351,37 @@ fn snap_one(
             if !(inside_ok && outside_ok) {
                 return (corner_fallback, SnapAttempt::RejectedVerify);
             }
+
+            // Sides that are pieces of one region were told apart only by
+            // what lies inside the gather radius, and at that scale a tight
+            // fillet looks like a crease: its two flanks come out as two
+            // sides, and their planes meet beyond the fillet, at a corner the
+            // model does not have. The check above cannot see that when a
+            // third face passes through the same point. So such a snap has to
+            // show that every side's surface is really there.
+            let from_split = planes.iter().take(outward.len()).any(|side| side.split);
+            if from_split && !sides_meet_at(p, &outward, cell, config, is_inside) {
+                return (corner_fallback, SnapAttempt::RejectedVerify);
+            }
         }
     }
 
     (corner_fallback, SnapAttempt::Snapped(p, kind))
 }
 
-/// Gather claimed vertices per region within `radius_cells` of `origin` and
-/// fit one qualifying plane per side (enough support, tight fit).
+/// Gather the claimed vertices within `radius_cells` of `origin`, sort them
+/// into sides, and fit one qualifying plane per side (enough support, tight
+/// fit).
+///
+/// A side is a region's gathered vertices when one plane fits them all. When
+/// it does not, the region covers more than one face here, and each piece of
+/// it that is connected inside the radius ([`connected_pieces`]) is a side of
+/// its own.
 #[allow(clippy::too_many_arguments)]
 fn gather_side_planes(
     positions: &[DVec3],
     adjacency: &MeshAdjacency,
-    labels: &[Option<u32>],
+    faces: SmoothFaces,
     v: usize,
     origin: DVec3,
     radius_cells: f64,
@@ -366,41 +391,121 @@ fn gather_side_planes(
     let ring_depth = radius_cells.ceil() as usize + 1;
     let radius = radius_cells * cell;
 
-    let mut sides: Vec<(u32, Vec<DVec3>)> = Vec::new();
+    let mut regions: Vec<(u32, Vec<u32>)> = Vec::new();
     for u in adjacency.k_ring(v as u32, ring_depth) {
-        let Some(label) = labels[u as usize] else {
+        let Some(label) = faces.labels[u as usize] else {
             continue;
         };
-        let p = positions[u as usize];
-        if (p - origin).length() > radius {
+        if (positions[u as usize] - origin).length() > radius {
             continue;
         }
-        match sides.iter_mut().find(|(l, _)| *l == label) {
-            Some((_, pts)) => pts.push(p),
-            None => sides.push((label, vec![p])),
+        match regions.iter_mut().find(|(l, _)| *l == label) {
+            Some((_, members)) => members.push(u),
+            None => regions.push((label, vec![u])),
         }
     }
 
+    // A snap target lies on its sides' planes and within the movement clamp
+    // of the vertex, so a plane passing further away than the clamp cannot
+    // take part in an accepted snap.
+    let reach = config.max_move_cells * cell;
+    let in_reach = |plane: &SidePlane| plane.normal.dot(plane.centroid - origin).abs() <= reach;
+
     let mut planes: Vec<SidePlane> = Vec::new();
-    for (_, pts) in &sides {
-        if pts.len() < config.min_side_points {
+    for (_, members) in &regions {
+        if let Some(plane) = side_plane(positions, members, cell, config) {
+            planes.push(plane);
             continue;
         }
-        let Some(fit) = fit_plane(pts) else {
-            continue;
-        };
-        if fit.rms_residual / cell > config.max_side_residual_cells {
+        let pieces = connected_pieces(adjacency, faces, members);
+        if pieces.len() < 2 {
             continue;
         }
-        // PCA normal sign is arbitrary; the intersection solves are
-        // sign-agnostic and verification orients per-side later.
-        planes.push(SidePlane {
-            normal: fit.normal,
-            centroid: fit.centroid,
-            support: pts.len(),
-        });
+        // Only the pieces in reach become sides. A region that had to be
+        // split is bigger than one face here, and its other pieces can be
+        // faces at the far edge of the radius that have nothing to do with
+        // this vertex; with more support than a near side they would be
+        // picked ahead of it.
+        planes.extend(
+            pieces
+                .iter()
+                .filter_map(|piece| side_plane(positions, piece, cell, config))
+                .filter(in_reach)
+                .map(|plane| SidePlane {
+                    split: true,
+                    ..plane
+                }),
+        );
     }
     planes
+}
+
+/// The plane through one side's vertices, if the side qualifies: enough
+/// support and a tight fit.
+fn side_plane(
+    positions: &[DVec3],
+    members: &[u32],
+    cell: f64,
+    config: &SnapConfig,
+) -> Option<SidePlane> {
+    if members.len() < config.min_side_points {
+        return None;
+    }
+    let pts: Vec<DVec3> = members.iter().map(|&u| positions[u as usize]).collect();
+    let fit = fit_plane(&pts)?;
+    if fit.rms_residual / cell > config.max_side_residual_cells {
+        return None;
+    }
+    // PCA normal sign is arbitrary; the intersection solves are
+    // sign-agnostic and verification orients per-side later.
+    Some(SidePlane {
+        normal: fit.normal,
+        centroid: fit.centroid,
+        support: pts.len(),
+        split: false,
+    })
+}
+
+/// Split `members` into the pieces connected through mesh edges that stay on
+/// one face ([`SmoothFaces::joined`]), using `members` only. Connections that
+/// exist only outside the set do not count: that is what separates the two
+/// faces of a crease when they are joined smoothly somewhere else. Pieces
+/// come out in the order of their first member.
+fn connected_pieces(
+    adjacency: &MeshAdjacency,
+    faces: SmoothFaces,
+    members: &[u32],
+) -> Vec<Vec<u32>> {
+    let mut by_vertex: Vec<(u32, usize)> = members.iter().copied().zip(0..).collect();
+    by_vertex.sort_unstable();
+    let mut parent: Vec<usize> = (0..members.len()).collect();
+    fn root(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    for (i, &u) in members.iter().enumerate() {
+        for &w in adjacency.neighbors(u) {
+            if w <= u || !faces.joined(u, w) {
+                continue;
+            }
+            if let Ok(at) = by_vertex.binary_search_by_key(&w, |&(vertex, _)| vertex) {
+                let (a, b) = (root(&mut parent, i), root(&mut parent, by_vertex[at].1));
+                parent[a.max(b)] = a.min(b);
+            }
+        }
+    }
+    let mut pieces: Vec<(usize, Vec<u32>)> = Vec::new();
+    for (i, &u) in members.iter().enumerate() {
+        let piece = root(&mut parent, i);
+        match pieces.iter_mut().find(|(p, _)| *p == piece) {
+            Some((_, vertices)) => vertices.push(u),
+            None => pieces.push((piece, vec![u])),
+        }
+    }
+    pieces.into_iter().map(|(_, vertices)| vertices).collect()
 }
 
 /// Refine a plane-intersection target onto the model's actual occupancy
@@ -484,6 +589,46 @@ fn refine_target(
     p
 }
 
+/// Whether every side's actual surface passes by `target`: the check that a
+/// snap target sits where its sides really meet, not where their fitted
+/// planes would meet if extended.
+///
+/// For each side, the occupancy boundary must cross a short probe along the
+/// side's normal. The probe is shifted off the target, away from the other
+/// sides' surfaces, so that it crosses this side's surface only. Which way
+/// that is depends on the edge: behind the other side at a convex edge, in
+/// front of it at a concave one. Both are tried.
+fn sides_meet_at(
+    target: DVec3,
+    outward: &[DVec3],
+    cell: f64,
+    config: &SnapConfig,
+    is_inside: &dyn Fn(DVec3) -> bool,
+) -> bool {
+    let bracket = config.refine_bracket_cells * cell;
+    let offset_len = config.refine_offset_cells * cell;
+    outward.iter().enumerate().all(|(i, &n)| {
+        let others: Vec<DVec3> = outward
+            .iter()
+            .enumerate()
+            .filter(|&(j, _)| j != i)
+            .map(|(_, &m)| m)
+            .collect();
+        (0..1usize << others.len()).any(|signs| {
+            let shift: DVec3 = others
+                .iter()
+                .enumerate()
+                .map(|(k, &m)| if signs >> k & 1 == 0 { -m } else { m })
+                .sum();
+            let Some(shift) = shift.try_normalize() else {
+                return false;
+            };
+            let base = target + shift * offset_len;
+            is_inside(base - n * bracket) && !is_inside(base + n * bracket)
+        })
+    })
+}
+
 /// Orient a side plane normal to point out of the material, determined by one
 /// sampler probe from the side centroid.
 fn orient_outward(side: &SidePlane, is_inside: &dyn Fn(DVec3) -> bool, delta: f64) -> DVec3 {
@@ -543,7 +688,8 @@ fn intersect_three_planes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sharp_features::fit::ring_fits;
+    use crate::sharp_features::adjacency::grid_mesh;
+    use crate::sharp_features::fit::{VertexFit, ring_fits};
     use crate::sharp_features::segmentation::{SegmentationConfig, segment_regions};
 
     fn plane(normal: DVec3, centroid: DVec3) -> SidePlane {
@@ -551,6 +697,7 @@ mod tests {
             normal: normal.normalize(),
             centroid,
             support: 10,
+            split: false,
         }
     }
 
@@ -634,39 +781,195 @@ mod tests {
         assert_eq!(p, target);
     }
 
+    /// No sampler exists for a synthetic mesh, so nothing can be verified.
+    fn unverified() -> SnapConfig {
+        SnapConfig {
+            verify_delta_cells: 0.0,
+            ..SnapConfig::default()
+        }
+    }
+
+    /// A pocket cut into a slab (top face z = 0), seen at its inside corner:
+    /// walls x = 0 and y = 0, joined by a fillet of radius `fillet`.
+    fn pocket_corner(fillet: f64) -> impl Fn(DVec3) -> bool + Send + Sync {
+        move |p: DVec3| {
+            let in_fillet = p.x < fillet
+                && p.y < fillet
+                && (p.x - fillet).powi(2) + (p.y - fillet).powi(2) > fillet * fillet;
+            let in_pocket = p.x >= 0.0 && p.y >= 0.0 && !in_fillet;
+            p.z <= 0.0 && !in_pocket
+        }
+    }
+
+    /// Convex and concave edges alike: the top face meets each wall at a
+    /// convex edge, the walls meet each other at a concave one.
+    #[test]
+    fn sides_meet_at_a_real_corner() {
+        let config = SnapConfig::default();
+        let model = pocket_corner(0.0);
+        let sides = [DVec3::X, DVec3::Y, DVec3::Z];
+        assert!(sides_meet_at(DVec3::ZERO, &sides, 1.0, &config, &model));
+        // Along the concave edge between the two walls, below the top face.
+        let on_edge = DVec3::new(0.0, 0.0, -5.0);
+        assert!(sides_meet_at(on_edge, &sides[..2], 1.0, &config, &model));
+        // Along a convex edge between the top face and one wall.
+        let on_rim = DVec3::new(0.0, 5.0, 0.0);
+        assert!(sides_meet_at(
+            on_rim,
+            &[DVec3::X, DVec3::Z],
+            1.0,
+            &config,
+            &model
+        ));
+    }
+
+    /// The walls of a filleted pocket never meet: their planes cross at a
+    /// point inside the material, on the top face, where neither wall is.
+    /// (The inside/outside check along the mean normal passes there, because
+    /// the top face does run through the point.)
+    #[test]
+    fn sides_do_not_meet_beyond_a_fillet() {
+        let config = SnapConfig::default();
+        let model = pocket_corner(4.0);
+        let sides = [DVec3::X, DVec3::Y, DVec3::Z];
+        let mean = DVec3::ONE.normalize() * config.verify_delta_cells;
+        assert!(
+            model(-mean) && !model(mean),
+            "the mean-normal check should pass"
+        );
+        assert!(!sides_meet_at(DVec3::ZERO, &sides, 1.0, &config, &model));
+        // Clear of the fillet the same walls are found again.
+        let on_rim = DVec3::new(0.0, 8.0, 0.0);
+        assert!(sides_meet_at(
+            on_rim,
+            &[DVec3::X, DVec3::Z],
+            1.0,
+            &config,
+            &model
+        ));
+    }
+
+    /// A target off the feature fails too: one side's surface is elsewhere.
+    #[test]
+    fn sides_do_not_meet_off_the_edge() {
+        let config = SnapConfig::default();
+        let model = pocket_corner(0.0);
+        let off_rim = DVec3::new(-1.5, 5.0, 0.0);
+        assert!(!sides_meet_at(
+            off_rim,
+            &[DVec3::X, DVec3::Z],
+            1.0,
+            &config,
+            &model
+        ));
+    }
+
+    /// The mesh of a sharp pocket corner, all under one label, so its faces
+    /// are told apart as pieces. Against a model with that sharp corner the
+    /// corner vertex snaps. Against a model whose pocket walls are joined by a
+    /// fillet it must not: the wall the mesh suggests is not there.
+    #[test]
+    fn sides_split_from_one_region_must_meet_in_the_model() {
+        // Four patches: the top face round the pocket (two), and its walls.
+        let patches = [
+            (
+                grid_mesh(7, 13, |i, j| {
+                    DVec3::new(i as f64 - 6.0, j as f64 - 6.0, 0.0)
+                }),
+                DVec3::Z,
+            ),
+            (
+                grid_mesh(7, 7, |i, j| DVec3::new(i as f64, j as f64 - 6.0, 0.0)),
+                DVec3::Z,
+            ),
+            (
+                grid_mesh(7, 7, |i, j| DVec3::new(0.0, i as f64, -(j as f64))),
+                DVec3::X,
+            ),
+            (
+                grid_mesh(7, 7, |i, j| DVec3::new(i as f64, 0.0, -(j as f64))),
+                DVec3::Y,
+            ),
+        ];
+        // Weld the patches along their shared edges; a shared vertex keeps
+        // the normal of the first patch that has it.
+        let mut index_of = std::collections::HashMap::new();
+        let (mut positions, mut indices, mut normals) = (Vec::new(), Vec::new(), Vec::new());
+        for ((patch_positions, patch_indices), normal) in &patches {
+            let remap: Vec<u32> = patch_positions
+                .iter()
+                .map(|p| {
+                    let key = (p.x as i64, p.y as i64, p.z as i64);
+                    *index_of.entry(key).or_insert_with(|| {
+                        positions.push(*p);
+                        normals.push(*normal);
+                        positions.len() as u32 - 1
+                    })
+                })
+                .collect();
+            indices.extend(patch_indices.iter().map(|&i| remap[i as usize]));
+        }
+        let adjacency = MeshAdjacency::build(positions.len(), &indices);
+        let labels = vec![Some(0); positions.len()];
+        let fits: Vec<Option<VertexFit>> = normals
+            .iter()
+            .map(|&normal| {
+                Some(VertexFit {
+                    normal,
+                    residual_cells: 0.0,
+                })
+            })
+            .collect();
+        let seg_config = SegmentationConfig::default();
+        let faces = SmoothFaces {
+            labels: &labels,
+            fits: &fits,
+            config: &seg_config,
+        };
+        let corner = index_of[&(0, 0, 0)] as usize;
+
+        for (fillet, snaps) in [(0.0, true), (4.0, false)] {
+            let model = pocket_corner(fillet);
+            let result = snap_feature_vertices(
+                &positions,
+                &adjacency,
+                faces,
+                1.0,
+                &SnapConfig::default(),
+                Some(&model),
+            );
+            assert_eq!(
+                result.snapped[corner].is_some(),
+                snaps,
+                "fillet {fillet}: {:?}",
+                result.stats
+            );
+        }
+    }
+
     /// End-to-end on the synthetic tent: crease vertices must land exactly on
     /// the analytic crease line.
     #[test]
     fn tent_crease_vertices_snap_onto_the_crease_line() {
         let crease = 7usize;
         let n = 15usize;
-        let mut positions = Vec::new();
-        for j in 0..n {
-            for i in 0..n {
-                positions.push(if i <= crease {
-                    DVec3::new(i as f64, j as f64, 0.0)
-                } else {
-                    DVec3::new(crease as f64, j as f64, (i - crease) as f64)
-                });
+        let (positions, indices) = grid_mesh(n, n, |i, j| {
+            if i <= crease {
+                DVec3::new(i as f64, j as f64, 0.0)
+            } else {
+                DVec3::new(crease as f64, j as f64, (i - crease) as f64)
             }
-        }
-        let mut indices = Vec::new();
-        for j in 0..n - 1 {
-            for i in 0..n - 1 {
-                let a = (j * n + i) as u32;
-                let (b, c, d) = (a + 1, a + n as u32, a + n as u32 + 1);
-                indices.extend_from_slice(&[a, b, c, b, d, c]);
-            }
-        }
+        });
         let adjacency = MeshAdjacency::build(positions.len(), &indices);
         let fits = ring_fits(&positions, &adjacency, &[], 1.0, 1);
-        let seg = segment_regions(&adjacency, &fits, &SegmentationConfig::default());
-
-        let config = SnapConfig {
-            verify_delta_cells: 0.0, // no sampler for a synthetic mesh
-            ..SnapConfig::default()
+        let seg_config = SegmentationConfig::default();
+        let seg = segment_regions(&adjacency, &fits, &seg_config);
+        let faces = SmoothFaces {
+            labels: &seg.labels,
+            fits: &fits,
+            config: &seg_config,
         };
-        let result = snap_feature_vertices(&positions, &adjacency, &seg.labels, 1.0, &config, None);
+        let result = snap_feature_vertices(&positions, &adjacency, faces, 1.0, &unverified(), None);
 
         // The crease is the line x = 7, z = 0. Crease-column vertices away
         // from the open boundary must snap onto it exactly (planar sides).
@@ -690,5 +993,228 @@ mod tests {
         }
         assert!(checked >= 5, "too few crease vertices exercised");
         assert_eq!(result.stats.rejected_nonfinite, 0);
+    }
+
+    /// An edge that is sharp along part of its length and filleted along the
+    /// rest: region growth walks round the fillet, so the two faces carry one
+    /// label, and the sharp part has that label on both sides. It must snap
+    /// all the same.
+    #[test]
+    fn crease_between_two_faces_of_one_region_snaps() {
+        // Profile across the edge, by arc length `s` from the crease: flat
+        // (z = 0) for s < 0, vertical (x = 20) for s > 0, joined by a fillet
+        // of radius `r`. Sampled half a step off the crease, so no vertex
+        // sits on it and the mesh cuts the corner as a mesher's would.
+        let profile = |s: f64, r: f64| -> (f64, f64) {
+            let half_arc = 0.25 * std::f64::consts::PI * r;
+            if s < -half_arc {
+                (20.0 - r + s + half_arc, 0.0)
+            } else if s > half_arc {
+                (20.0, r + s - half_arc)
+            } else {
+                let theta = (s + half_arc) / r;
+                (20.0 - r + r * theta.sin(), r - r * theta.cos())
+            }
+        };
+        // Sharp for rows 0..15, then the fillet grows to a radius of ten
+        // cells (a turn of under 6 degrees per step) and stays there.
+        let radius = |j: usize| (j as f64 - 14.0).clamp(0.0, 10.0);
+        let (nx, ny) = (40usize, 37usize);
+        let (positions, indices) = grid_mesh(nx, ny, |i, j| {
+            let s = i as f64 - 19.5;
+            let r = radius(j);
+            let (x, z) = if r == 0.0 {
+                if s < 0.0 { (20.0 + s, 0.0) } else { (20.0, s) }
+            } else {
+                profile(s, r)
+            };
+            DVec3::new(x, j as f64, z)
+        });
+        let adjacency = MeshAdjacency::build(positions.len(), &indices);
+        let fits = ring_fits(&positions, &adjacency, &[], 1.0, 1);
+        let seg_config = SegmentationConfig::default();
+        let seg = segment_regions(&adjacency, &fits, &seg_config);
+
+        // The premise: one region covers both faces beside the sharp part.
+        let flat = seg.labels[5 * nx + 10].expect("flat face claimed");
+        let vertical = seg.labels[5 * nx + 30].expect("vertical face claimed");
+        assert_eq!(
+            flat, vertical,
+            "the fillet should join the two faces into one region"
+        );
+
+        let faces = SmoothFaces {
+            labels: &seg.labels,
+            fits: &fits,
+            config: &seg_config,
+        };
+        let result = snap_feature_vertices(&positions, &adjacency, faces, 1.0, &unverified(), None);
+
+        // Both columns beside the sharp crease land on it: x = 20, z = 0.
+        for j in 3..=10 {
+            for i in [19, 20] {
+                let v = j * nx + i;
+                assert_eq!(
+                    seg.labels[v], None,
+                    "({i},{j}) should be in the feature zone"
+                );
+                assert_eq!(
+                    result.snapped[v],
+                    Some(SnapKind::Edge),
+                    "({i},{j}) was not snapped: {:?}",
+                    result.stats
+                );
+                let p = result.positions[v];
+                assert!(
+                    (p.x - 20.0).abs() < 1e-9 && p.z.abs() < 1e-9,
+                    "({i},{j}) landed off the crease: {p:?}"
+                );
+            }
+        }
+    }
+
+    /// Hand-made fits and labels for a grid: `face(i, j)` gives a vertex's
+    /// label and fitted normal, or `None` for an unclaimed vertex.
+    fn hand_segmented(
+        nx: usize,
+        ny: usize,
+        face: impl Fn(usize, usize) -> Option<(u32, DVec3)>,
+    ) -> (Vec<Option<u32>>, Vec<Option<VertexFit>>) {
+        let mut labels = Vec::new();
+        let mut fits = Vec::new();
+        for j in 0..ny {
+            for i in 0..nx {
+                let claimed = face(i, j);
+                labels.push(claimed.map(|(label, _)| label));
+                fits.push(claimed.map(|(_, normal)| VertexFit {
+                    normal,
+                    residual_cells: 0.0,
+                }));
+            }
+        }
+        (labels, fits)
+    }
+
+    /// A grid-aligned crease leaves no unclaimed band: the two faces are
+    /// claimed right up to each other. When they also share a label, the only
+    /// sign of the crease is the growth gate failing between neighbors. Those
+    /// neighbors must be candidates, and must snap.
+    #[test]
+    fn single_label_crease_without_an_unclaimed_band_snaps() {
+        let crease = 7usize;
+        let n = 15usize;
+        let (positions, indices) = grid_mesh(n, n, |i, j| {
+            if i <= crease {
+                DVec3::new(i as f64, j as f64, 0.0)
+            } else {
+                DVec3::new(crease as f64, j as f64, (i - crease) as f64)
+            }
+        });
+        let adjacency = MeshAdjacency::build(positions.len(), &indices);
+        let (labels, fits) = hand_segmented(n, n, |i, _| {
+            Some((0, if i <= crease { DVec3::Z } else { DVec3::X }))
+        });
+        let seg_config = SegmentationConfig::default();
+        let faces = SmoothFaces {
+            labels: &labels,
+            fits: &fits,
+            config: &seg_config,
+        };
+        let result = snap_feature_vertices(&positions, &adjacency, faces, 1.0, &unverified(), None);
+
+        // Candidates are the two columns the crease runs between, no more.
+        assert_eq!(result.stats.candidates, 2 * n);
+        for j in 3..n - 3 {
+            for i in [crease, crease + 1] {
+                let v = j * n + i;
+                assert_eq!(
+                    result.snapped[v],
+                    Some(SnapKind::Edge),
+                    "({i},{j}) was not snapped: {:?}",
+                    result.stats
+                );
+                let p = result.positions[v];
+                assert!(
+                    (p.x - 7.0).abs() < 1e-9 && p.z.abs() < 1e-9,
+                    "({i},{j}) landed off the crease: {p:?}"
+                );
+            }
+            assert_eq!(
+                result.snapped[j * n + 3],
+                None,
+                "a face vertex must not move"
+            );
+        }
+    }
+
+    /// A step two cells high: lower tread, riser, upper tread, with both
+    /// treads under one label (they are parallel, and joined somewhere out of
+    /// view). Seen from the lower crease, the upper tread has more gathered
+    /// vertices than the thinly claimed lower one, but its plane passes two
+    /// cells away, beyond the movement clamp. Splitting the label must not
+    /// put it in the lower tread's place as a side.
+    #[test]
+    fn a_side_out_of_reach_does_not_outrank_a_near_one() {
+        let (nx, ny) = (18usize, 15usize);
+        let (positions, indices) = grid_mesh(nx, ny, |i, j| {
+            let y = j as f64;
+            match i {
+                0..=7 => DVec3::new(i as f64, y, 0.0),
+                _ => DVec3::new((i - 1) as f64, y, 2.0),
+            }
+        });
+        let adjacency = MeshAdjacency::build(positions.len(), &indices);
+        let row = 7usize;
+        let (labels, fits) = hand_segmented(nx, ny, |i, j| match i {
+            // Lower tread: claimed only in a small patch beside the crease.
+            5..=6 if j.abs_diff(row) <= 1 => Some((0, DVec3::Z)),
+            0..=6 => None,
+            // Riser: the two crease columns, which both lie in its plane.
+            7..=8 => Some((1, DVec3::X)),
+            _ => Some((0, DVec3::Z)),
+        });
+        let seg_config = SegmentationConfig::default();
+        let faces = SmoothFaces {
+            labels: &labels,
+            fits: &fits,
+            config: &seg_config,
+        };
+
+        // The premise: from the lower crease the upper tread outnumbers the
+        // lower one, and each would qualify as a side on support.
+        let v = row * nx + 7;
+        let config = unverified();
+        let count = |upper: bool| {
+            adjacency
+                .k_ring(v as u32, 4)
+                .into_iter()
+                .filter(|&u| {
+                    let p = positions[u as usize];
+                    labels[u as usize] == Some(0)
+                        && (p.z > 1.0) == upper
+                        && (p - positions[v]).length() <= 3.0
+                })
+                .count()
+        };
+        assert!(
+            count(false) >= config.min_side_points,
+            "lower: {}",
+            count(false)
+        );
+        assert!(
+            count(true) > count(false),
+            "upper {} vs lower {}",
+            count(true),
+            count(false)
+        );
+
+        let result = snap_feature_vertices(&positions, &adjacency, faces, 1.0, &config, None);
+        assert_eq!(
+            result.snapped[v],
+            Some(SnapKind::Edge),
+            "{:?}",
+            result.stats
+        );
+        assert!((result.positions[v] - DVec3::new(7.0, row as f64, 0.0)).length() < 1e-9);
     }
 }

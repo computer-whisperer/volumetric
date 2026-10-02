@@ -15,10 +15,11 @@
 //!    shrinks with cell size) and by fit residual. Feature-zone vertices stay
 //!    unclaimed.
 //! 3. **Snap** ([`snap::snap_feature_vertices`]): each feature candidate
-//!    (unclaimed vertex, or region-boundary vertex where grid alignment left
-//!    no unclaimed band) gathers nearby claimed vertices per adjacent region
-//!    — face-pure *by construction* — fits one plane per side, and projects
-//!    onto the intersection (edge line or corner point).
+//!    (unclaimed vertex, or face-boundary vertex where grid alignment left
+//!    no unclaimed band) gathers nearby claimed vertices, splits them into
+//!    the sides that are connected without crossing a crease — face-pure *by
+//!    construction* — fits one plane per side, and projects onto the
+//!    intersection (edge line or corner point).
 //! 4. **Weld** ([`cleanup::weld_snapped_vertices`]): cross-band vertex pairs
 //!    that landed on the same feature point merge, collapsing the folded
 //!    slivers between them.
@@ -165,7 +166,11 @@ pub fn apply_sharp_features_cancellable(
     let snapped = snap::snap_feature_vertices_cancellable(
         &positions_v,
         &adjacency,
-        &seg.labels,
+        segmentation::SmoothFaces {
+            labels: &seg.labels,
+            fits: &fits,
+            config: &config.segmentation,
+        },
         cell,
         &config.snap,
         Some(is_inside),

@@ -77,6 +77,31 @@ pub fn unique_edges(indices: &[u32]) -> Vec<(u32, u32)> {
     edges
 }
 
+/// Test fixture: a triangulated `nx` by `ny` vertex grid, with `pos` mapping
+/// grid coordinates to 3D. Vertex `(i, j)` has index `j * nx + i`.
+#[cfg(test)]
+pub(crate) fn grid_mesh(
+    nx: usize,
+    ny: usize,
+    pos: impl Fn(usize, usize) -> glam::DVec3,
+) -> (Vec<glam::DVec3>, Vec<u32>) {
+    let mut positions = Vec::with_capacity(nx * ny);
+    for j in 0..ny {
+        for i in 0..nx {
+            positions.push(pos(i, j));
+        }
+    }
+    let mut indices = Vec::new();
+    for j in 0..ny - 1 {
+        for i in 0..nx - 1 {
+            let a = (j * nx + i) as u32;
+            let (b, c, d) = (a + 1, a + nx as u32, a + nx as u32 + 1);
+            indices.extend_from_slice(&[a, b, c, b, d, c]);
+        }
+    }
+    (positions, indices)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
