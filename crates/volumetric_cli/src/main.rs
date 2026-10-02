@@ -177,8 +177,9 @@ pub struct MeshArgs {
     #[arg(long, default_value = "12")]
     vertex_refinement: usize,
 
-    /// Normal refinement iterations (default: 12, 0 to disable)
-    #[arg(long, default_value = "12")]
+    /// Normal refinement iterations (default: 0, off). Vertex normals are
+    /// not written to STL or 3MF, so this only costs samples here
+    #[arg(long, default_value = "0")]
     normal_refinement: usize,
 
     /// Normal epsilon fraction (default: 0.1)
@@ -199,7 +200,7 @@ pub struct MeshArgs {
     no_simplify: bool,
 
     /// Decimation error budget, as a fraction of the finest cell size
-    #[arg(long, default_value = "1.0")]
+    #[arg(long, default_value_t = DecimationConfig::default().error_tolerance_cells)]
     simplify_tolerance: f64,
 
     /// Constrain vertex refinement to each vertex's own grid edge. Prevents

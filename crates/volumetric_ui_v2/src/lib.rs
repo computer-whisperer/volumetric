@@ -987,7 +987,7 @@ impl OutputRender {
         }
     }
 
-    /// One-line summary for the outputs table ("ASN2 · 64^3", "2D raster
+    /// One-line summary for the outputs table ("ASN2 · 64", "2D raster
     /// · 256", …).
     fn summary(&self) -> String {
         match self {
@@ -997,8 +997,8 @@ impl OutputRender {
                 color_channel,
                 ..
             } => match color_channel {
-                Some(channel) => format!("{} · {}^3 · {channel}", mode.label(), resolution),
-                None => format!("{} · {}^3", mode.label(), resolution),
+                Some(channel) => format!("{} · {} · {channel}", mode.label(), resolution),
+                None => format!("{} · {}", mode.label(), resolution),
             },
             Self::Model2d {
                 resolution,
@@ -1020,7 +1020,7 @@ impl OutputRender {
             Self::Splat => "splat".to_string(),
             Self::Assembly {
                 mode, resolution, ..
-            } => format!("assembly · {} · {}^3", mode.label(), resolution),
+            } => format!("assembly · {} · {}", mode.label(), resolution),
             Self::Mechanism => "mechanism".to_string(),
         }
     }
@@ -1699,8 +1699,8 @@ impl VolumetricUiV2 {
             "edgec" => asn2.edge_constrained_refinement = !asn2.edge_constrained_refinement,
             "simp" => asn2.simplify = !asn2.simplify,
             "simptol" => {
-                let next = i32::from(asn2.simplify_tolerance_tenths) + if up { 1 } else { -1 };
-                asn2.simplify_tolerance_tenths = next.clamp(1, 30) as u16;
+                let next = i32::from(asn2.simplify_tolerance_hundredths) + if up { 5 } else { -5 };
+                asn2.simplify_tolerance_hundredths = next.clamp(5, 300) as u16;
             }
             "angle" => {
                 let next = i32::from(asn2.sharp_angle_degrees) + if up { 5 } else { -5 };
@@ -1748,7 +1748,7 @@ impl VolumetricUiV2 {
                 resolution: slot, ..
             } => {
                 *slot = resolution;
-                self.status = format!("{id}: {resolution}^3");
+                self.status = format!("{id}: resolution {resolution}");
             }
             OutputRender::Model2d {
                 resolution: slot, ..
@@ -4030,7 +4030,7 @@ impl VolumetricUiV2 {
 
     fn set_preview_resolution(&mut self, resolution: usize) {
         self.preview_resolution = resolution;
-        self.status = format!("preview resolution: {resolution}^3");
+        self.status = format!("preview resolution: {resolution}");
     }
 
     /// Folds trigger/dismiss/pick events for the three viewport pickers
@@ -5193,7 +5193,7 @@ fn select_layer(app: &VolumetricUiV2) -> Option<El> {
             RESOLUTION_SELECT_KEY,
             PREVIEW_RESOLUTIONS
                 .into_iter()
-                .map(|resolution| (resolution.to_string(), format!("{resolution}^3 voxels"))),
+                .map(|resolution| (resolution.to_string(), format!("{resolution} cells"))),
         )),
         CAMERA_SELECT_KEY => Some(select_menu(
             CAMERA_SELECT_KEY,
@@ -5858,7 +5858,10 @@ fn model3d_settings(
                 id,
                 "simptol",
                 "Tolerance (cells)",
-                &format!("{:.1}", f64::from(asn2.simplify_tolerance_tenths) / 10.0),
+                &format!(
+                    "{:.2}",
+                    f64::from(asn2.simplify_tolerance_hundredths) / 100.0
+                ),
             ));
         }
         if asn2.sharp_edges {
@@ -5919,7 +5922,7 @@ fn mode_resolution_rows(id: &str, mode: PreviewRenderMode, resolution: usize) ->
     // Two rows: the preset ladder is too wide for one popover line.
     let resolution_buttons = column(PREVIEW_RESOLUTIONS.chunks(5).map(|chunk| {
         row(chunk.iter().map(|&preset| {
-            let button = button(format!("{preset}^3"))
+            let button = button(preset.to_string())
                 .xsmall()
                 .key(format!("{OUTPUT_RESOLUTION_PREFIX}{id}:{preset}"));
             if resolution == preset {
@@ -6198,11 +6201,8 @@ fn view_controls_cluster(app: &VolumetricUiV2) -> El {
             .key(RESET_CAMERA_KEY),
         vertical_separator().height(Size::Fixed(20.0)),
         select_trigger(MODE_SELECT_KEY, app.render_mode.label()).width(Size::Fixed(90.0)),
-        select_trigger(
-            RESOLUTION_SELECT_KEY,
-            format!("{}^3", app.preview_resolution),
-        )
-        .width(Size::Fixed(84.0)),
+        select_trigger(RESOLUTION_SELECT_KEY, app.preview_resolution.to_string())
+            .width(Size::Fixed(84.0)),
         select_trigger(
             CAMERA_SELECT_KEY,
             camera_scheme_short_label(app.camera_control_scheme),
@@ -8777,10 +8777,7 @@ mod tests {
             plan_of("chair")
         );
         assert_eq!(app.output_kind("chair"), OutputKind::Assembly);
-        assert_eq!(
-            app.output_render("chair").summary(),
-            "assembly · ASN2 · 64^3"
-        );
+        assert_eq!(app.output_render("chair").summary(), "assembly · ASN2 · 64");
     }
 
     #[test]
@@ -9792,9 +9789,9 @@ mod tests {
             UiEvent::synthetic_click(format!("{OUTPUT_ASN2_PREFIX}{id}:edgec:up")),
         );
         // Simplify defaults on; toggling twice round-trips, and the
-        // tolerance stepper moves in tenths of a cell.
+        // tolerance stepper moves in twentieths of a cell.
         assert!(asn2.simplify);
-        assert_eq!(asn2.simplify_tolerance_tenths, 10);
+        assert_eq!(asn2.simplify_tolerance_hundredths, 10);
         dispatch(
             &mut app,
             UiEvent::synthetic_click(format!("{OUTPUT_ASN2_PREFIX}{id}:simp:up")),
@@ -9851,7 +9848,7 @@ mod tests {
         let sharp = config.sharp_features.expect("sharp features enabled");
         assert!((sharp.segmentation.max_normal_jump_deg - 20.0).abs() < 1e-9);
         let decimation = config.decimation.expect("simplify enabled");
-        assert!((decimation.error_tolerance_cells - 1.1).abs() < 1e-9);
+        assert!((decimation.error_tolerance_cells - 0.15).abs() < 1e-9);
     }
 
     #[test]

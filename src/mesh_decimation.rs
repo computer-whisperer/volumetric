@@ -44,6 +44,13 @@ pub struct DecimationConfig {
     /// Maximum allowed surface deviation, as a fraction of the finest
     /// meshing cell size (so the budget self-scales with resolution).
     /// Larger values collapse more aggressively.
+    ///
+    /// The measured deviation follows it closely (99th percentile about
+    /// equal to the budget on curved surfaces), and it is one-sided: chords
+    /// cut inside convex surfaces, so volume shrinks. Flat regions collapse
+    /// fully at any budget; on curved ones the triangle count goes as the
+    /// inverse of the budget. The default of a tenth of a cell keeps the
+    /// volume within about 0.2 % (a full cell loses 1-3 %).
     pub error_tolerance_cells: f64,
     /// Number of threshold-ramp passes before the full-budget convergence
     /// passes. More passes prefer cheaper collapses first (slightly better
@@ -54,7 +61,7 @@ pub struct DecimationConfig {
 impl Default for DecimationConfig {
     fn default() -> Self {
         Self {
-            error_tolerance_cells: 1.0,
+            error_tolerance_cells: 0.1,
             ramp_passes: 6,
         }
     }

@@ -22,10 +22,11 @@ fn main() {
         .map(|v| v.parse().unwrap())
         .unwrap_or(0);
 
-    let simplify_tolerance: Option<f64> = args
-        .iter()
-        .position(|a| a == "--simplify")
-        .map(|i| args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(1.0));
+    let simplify_tolerance: Option<f64> = args.iter().position(|a| a == "--simplify").map(|i| {
+        args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(
+            volumetric::mesh_decimation::DecimationConfig::default().error_tolerance_cells,
+        )
+    });
 
     let wasm_bytes = std::fs::read(wasm_path).expect("read wasm");
     let config = AdaptiveMeshConfig2 {

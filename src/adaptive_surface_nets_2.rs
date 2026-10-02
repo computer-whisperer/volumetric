@@ -1,7 +1,10 @@
 //! # Adaptive Surface Nets v2 - Architecture & Implementation
 //!
-//! A complete rewrite of the adaptive surface net sampler with proper organization,
-//! documentation, and a well-defined algorithm.
+//! The mesher. The name is historical: vertices sit on grid edges and cells
+//! are triangulated from the marching-cubes tables (stage 2), not with one
+//! vertex per cell as in surface nets. What it adds to marching cubes is the
+//! adaptive descent to the surface, vertices bisected onto it, and the
+//! optional sharp-feature and decimation stages.
 //!
 //! ## Problem Statement
 //!
@@ -244,16 +247,19 @@ pub struct AdaptiveMeshConfig2 {
 
     /// Number of binary search iterations for normal refinement probing.
     ///
-    /// When set to 0, accumulated face normals are used directly (fast, good for
-    /// most cases).
+    /// When set to 0 (the default), accumulated face normals are used
+    /// directly.
     ///
     /// When set to > 0, normals are refined by probing the surface in tangent
     /// directions and fitting a plane to the discovered surface points. This
-    /// provides smoother normals, especially on curved surfaces. Each probe uses
-    /// this many binary search iterations to find the surface crossing.
+    /// provides smoother normals on curved surfaces. Each probe uses this
+    /// many binary search iterations to find the surface crossing.
     ///
-    /// Typical values: 0 (disabled), 4-8 (good quality).
-    /// Higher values give more precise surface point locations but cost more samples.
+    /// Probing more than doubles the sample count, and its result survives
+    /// only when the mesh is neither decimated (stage 5 re-accumulates every
+    /// normal from the decimated triangles) nor written to STL or 3MF (which
+    /// store no vertex normals). On struts a few cells thick the probes
+    /// cross to the far side and make the normals worse.
     pub normal_sample_iterations: usize,
 
     /// Probe distance for normal refinement (fraction of cell size).
@@ -301,8 +307,7 @@ impl Default for AdaptiveMeshConfig2 {
             max_depth: 4,
             discovery_probes: 8,
             vertex_refinement_iterations: 12,
-            // Enable normal refinement by default - probing works well with binary samplers
-            normal_sample_iterations: 12,
+            normal_sample_iterations: 0,
             normal_epsilon_frac: 0.1,
             num_threads: 0,
             sharp_features: None, // Disabled by default

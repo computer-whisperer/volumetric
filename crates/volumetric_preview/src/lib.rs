@@ -111,8 +111,9 @@ pub struct Asn2Settings {
     /// within the tolerance budget, cutting the grid-pitch triangle counts
     /// of flat and gently curved regions while preserving topology.
     pub simplify: bool,
-    /// Decimation error budget, in tenths of the finest cell size (1-30).
-    pub simplify_tolerance_tenths: u16,
+    /// Decimation error budget, in hundredths of the finest cell size
+    /// (5-300).
+    pub simplify_tolerance_hundredths: u16,
     /// Aperiodic interior probes per corner-uniform discovery cell (0
     /// disables). Catches geometry thinner than the coarse discovery grid's
     /// pitch — lattice struts sitting between corner samples — that the
@@ -133,7 +134,7 @@ impl Default for Asn2Settings {
             sharp_angle_degrees: 15,
             edge_constrained_refinement: false,
             simplify: true,
-            simplify_tolerance_tenths: 10,
+            simplify_tolerance_hundredths: 10,
             discovery_probes: 8,
             base_resolution: 0,
         }
@@ -211,7 +212,7 @@ impl PreviewMeshPlan {
                 base_resolution,
                 max_depth,
                 ..
-            } => format!("ASN2 {target_resolution}^3 ({base_resolution} x 2^{max_depth})"),
+            } => format!("ASN2 {target_resolution} ({base_resolution} x 2^{max_depth})"),
         }
     }
 
@@ -245,7 +246,8 @@ impl PreviewMeshPlan {
             decimation: settings
                 .simplify
                 .then(|| volumetric::mesh_decimation::DecimationConfig {
-                    error_tolerance_cells: f64::from(settings.simplify_tolerance_tenths) / 10.0,
+                    error_tolerance_cells: f64::from(settings.simplify_tolerance_hundredths)
+                        / 100.0,
                     ..Default::default()
                 }),
         })

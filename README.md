@@ -29,7 +29,7 @@ work and scripting improvements should target WGSL. The WGSL dialect uses
 See [the WGSL authoring guide](WGSL_SCRIPT_OPERATOR_PLAN.md#source-conventions-the-dialect)
 and [the photo-based chair example](examples/chair_photo/README.md).
 
-- `src/`: The host application (Orchestrator). Built with Rust, `wasmtime` for execution, and `egui` for the UI.
+- `src/`: The host library (Orchestrator): project runs, `wasmtime` execution, and the mesher. The GUI is `crates/volumetric_ui_v2` (damascene on wgpu); `crates/volumetric_cli` is the command-line tool.
 - `crates/models/`: Example model definitions (Sphere, Torus, Mandelbulb, etc.).
 - `crates/operators/`: Modules that transform or combine models. Includes **Transform Operators** (translate, scale, rotation, boolean) and **Generator Operators** (rectangular_prism, stl_import, threemf_import, heightmap_extrude, wgsl_script).
 
@@ -61,7 +61,7 @@ Operators export:
 ### 3. The Orchestrator (Host)
 The host application manages the lifecycle of models and operators:
 - **Project DAG**: Manages a sequence of operations to build complex scenes.
-- **Rendering**: Implements both Point Cloud sampling and Marching Cubes (CPU-based) to visualize the WASM-defined volumes.
+- **Meshing**: Turns a model into triangles on an adaptive grid of cubic cells (`src/adaptive_surface_nets_2.rs`): vertices refined onto the surface by bisection, optional sharp-edge reconstruction and decimation. The preview also offers plain marching cubes and point-cloud modes.
 - **Bytecode Manipulation**: Orchestrates the execution of Operators to generate new model bytecode on the fly.
 
 ## Available Operators
@@ -187,7 +187,7 @@ cargo run -p volumetric_ui_v2 --release
 In the UI:
 1.  **Demos**: Load pre-built models from the "Demo" panel.
 2.  **Operations**: Apply operators like "Translate" or "Boolean" to transform your models.
-3.  **Visualization**: Toggle between Point Cloud and Marching Cubes rendering modes.
+3.  **Visualization**: Pick the preview mode (adaptive mesh, marching cubes, point cloud) and its resolution in the viewport toolbar.
 
 ### Running the CLI
 
@@ -216,12 +216,12 @@ volumetric_cli mesh -i <file> -o <output.3mf> --unit mm
 - `--max-depth <n>` - Refinement depth (default: 4). The longest axis is meshed at base × 2^depth cells; cells are cubic, so shorter axes get proportionally fewer
 - `--discovery-probes <n>` - Interior probes per uniform discovery cell, catching geometry thinner than the coarse grid (default: 8, 0 to disable)
 - `--vertex-refinement <n>` - Vertex position refinement iterations (default: 12)
-- `--normal-refinement <n>` - Normal estimation iterations (default: 12, use 0 to disable)
+- `--normal-refinement <n>` - Normal estimation iterations (default: 0, off; STL and 3MF store no vertex normals)
 - `--normal-epsilon <f>` - Normal probe distance as fraction of cell size (default: 0.1)
 - `--sharp-edges` - Enable sharp feature reconstruction (edge and corner snapping)
 - `--sharp-angle <degrees>` - Largest normal jump between neighbouring vertices of one smooth region (default: 15)
 - `--no-simplify` - Skip the decimation pass
-- `--simplify-tolerance <f>` - Decimation error budget as a fraction of the cell size (default: 1.0)
+- `--simplify-tolerance <f>` - Decimation error budget as a fraction of the cell size (default: 0.1)
 - `--edge-constrained` - Refine each vertex along its own grid edge only (for thin-walled lattices)
 - `-q, --quiet` - Suppress profiling output
 
@@ -230,8 +230,8 @@ volumetric_cli mesh -i <file> -o <output.3mf> --unit mm
 # Mesh a WASM model with default settings (128 cells along its longest axis)
 volumetric_cli mesh -i simple_torus_model.wasm -o torus.stl
 
-# Faster meshing with lower resolution and no normal refinement
-volumetric_cli mesh -i model.wasm -o output.stl --max-depth 3 --normal-refinement 0
+# Faster meshing with lower resolution and no decimation pass
+volumetric_cli mesh -i model.wasm -o output.stl --max-depth 3 --no-simplify
 
 # Mesh a project file
 volumetric_cli mesh -i scene.vproj -o scene.stl

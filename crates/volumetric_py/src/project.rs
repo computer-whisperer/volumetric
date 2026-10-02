@@ -387,7 +387,7 @@ impl Asset {
     /// `sharp_angle` degrees) and simplified to `simplify` cells of error
     /// unless None. A model's mesh carries its normals as the `normal`
     /// node field.
-    #[pyo3(signature = (base_resolution=8, max_depth=4, sharp_edges=false, sharp_angle=15.0, simplify=Some(1.0)))]
+    #[pyo3(signature = (base_resolution=8, max_depth=4, sharp_edges=false, sharp_angle=15.0, simplify=Some(0.1)))]
     fn mesh(
         &self,
         py: Python<'_>,

@@ -67,7 +67,7 @@ fn main() {
         .position(|a| a == "--simplify-tolerance")
         .and_then(|i| args.get(i + 1))
         .and_then(|v| v.parse().ok())
-        .unwrap_or(1.0);
+        .unwrap_or(volumetric::mesh_decimation::DecimationConfig::default().error_tolerance_cells);
     let config = AdaptiveMeshConfig2 {
         base_resolution: 8,
         discovery_probes: 8,
