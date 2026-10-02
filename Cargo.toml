@@ -184,6 +184,14 @@ fea_core = { path = "crates/fea_core", features = ["parallel"] }
 name = "profile_fea_inverse"
 required-features = ["native"]
 
+# Every file in `tests/` links its own copy of wasmtime, and with full
+# debug info each of those binaries is 320 MB, 83 % of it DWARF from
+# crates outside the workspace. Without it they are 101 MB and a debug
+# build is 40 % faster. Workspace crates keep full debug info; frames
+# inside dependencies still show function names, without line numbers.
+[profile.dev.package."*"]
+debug = false
+
 # Debug-profile wasmtime compiles wasm ~10x slower than release, and dev
 # workflows compile wasm constantly (UI run/scan jobs, module-metadata
 # reads — the heavy modules take seconds each at opt-level 0). Optimizing
