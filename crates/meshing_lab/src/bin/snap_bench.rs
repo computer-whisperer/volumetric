@@ -12,7 +12,7 @@
 
 use glam::{DQuat, DVec3};
 use meshing_lab::cleanup::{
-    CleanupConfig, boundary_edge_count, inward_facing_count, weld_snapped_vertices,
+    CleanupConfig, boundary_edge_count, clean_up_snaps, inward_facing_count,
 };
 use meshing_lab::feature_edges::FeatureEdges;
 use meshing_lab::harness::mesh_shape_with_margin;
@@ -254,7 +254,8 @@ fn run_case(
     }
 
     // -------- Cleanup: weld the collapsed band --------
-    let cleaned = weld_snapped_vertices(
+    let cleaned = clean_up_snaps(
+        &m.positions,
         &result.positions,
         &m.indices,
         &result.snapped,
@@ -268,8 +269,11 @@ fn run_case(
         cleaned_normals[cleaned.remap[v] as usize] += m.mesh_normals[v];
     }
     println!(
-        "  cleanup: welded {} vertices, dropped {} triangles",
-        cleaned.welded_vertices, cleaned.dropped_triangles
+        "  cleanup: retracted {} snaps, welded {} vertices, dropped {} triangles, flipped {} caps",
+        cleaned.retracted.len(),
+        cleaned.welded_vertices,
+        cleaned.dropped_triangles,
+        cleaned.flipped_caps
     );
 
     // Region labels carried through the weld, for the segment render.

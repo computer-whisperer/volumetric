@@ -473,9 +473,10 @@ a third side appeared.)
 
 ## Next step: snap and weld debris
 
-Status: design, 2026-10-02, written after the measurements below and before
-the rebuild. The measurements came from throwaway experiments in the working
-tree; none of that code is kept as it stands.
+Status: built, 2026-10-02. The design below was written after the
+measurements it quotes and before the rebuild, and is kept as written; "As
+built: debris" after it has the results and where the build departed from it.
+(The measurements came from throwaway experiments in the working tree.)
 
 ### What the debris is
 
@@ -623,4 +624,137 @@ Same commands and models as before.
 - Snapping more of what is rejected today. The car at 256 has about as
   many unsnapped candidates as snapped ones (features one or two cells
   thick); that is resolution, not debris.
+
+### As built: debris
+
+Two instruments. The reference table is the `mesh` CLI's STL output, as
+before. The stage counts come from `wasm_mesh_view --dump-stages` and
+`crates/meshing_lab/scripts/sharp_stages.py` (new, see its header), run on
+the build before and after; they see each vertex's snap outcome, which an STL
+does not. The two count folds slightly differently (the tray: 38 and 22).
+
+#### Results
+
+Reference table, before → after:
+
+| | non-manifold edges | folds > 135° | needles (< 1°) | triangles |
+|---|---:|---:|---:|---:|
+| sleeve, sharp | 4 → 0 | 318 → 8 | 341 → 1 | 918,154 → 918,150 |
+| sleeve, sharp + simplify | 4 → 0 | 154 → 2 | 281 → 181 | 1,716 → 1,362 |
+| bumper, sharp | 1 → 0 | 624 → 3 | 468 → 1 | 708,196 → 708,208 |
+| bumper, sharp + simplify | 0 → 0 | 292 → 3 | 238 → 69 | 3,054 → 2,476 |
+| toy car, sharp | 75 → 1 | 1,880 → 56 | 2,161 → 25 | 300,448 → 300,514 |
+| toy car, sharp + simplify | 59 → 1 | 1,158 → 15 | 992 → 184 | 21,662 → 18,690 |
+| tray, sharp | 4 → 0 | 376 → 38 | 107 → 9 | 335,502 → 335,510 |
+| tray, sharp + simplify | 4 → 0 | 265 → 24 | 173 → 131 | 3,790 → 3,128 |
+
+- Open edges 0 throughout. Cube and sphere unchanged (the cube is still 12
+  triangles). The four sharp-off outputs are byte-identical.
+- `superslicer --info` on the sharp + simplify 3MF: all four are manifold and
+  one part. Before, the tray came out as two parts and the car as not
+  manifold (15 open edges, three parts).
+- The sharp stage takes 347 → 209 ms on the sleeve, 130 → 109 ms on the
+  tray and 111 → 155 ms on the car (median of five). Total samples are up
+  2 % on the sleeve and 6 % on the car.
+- Decimated meshes are 14–21 % smaller on the four part models. The likely
+  reason, not measured: a sliver's edges are feature edges, so the crease
+  vertices beside it had more than two and were held as corners.
+- Volume after decimation is closer to the undecimated mesh: sleeve 0.14 %
+  under → 0.11 % under, bumper 0.09 % over → 0.01 % under.
+- Largest deviation on the sleeve 0.37 → 0.17 cell. The car's 99th
+  percentile 0.23 → 0.17 cell, and its sample points with no model surface
+  within four cells (the spikes) 5 → 1 of 3,000.
+
+Stage counts, before → after:
+
+| | snapped | retracted | facing inward | slivers | corner points |
+|---|---:|---:|---:|---:|---:|
+| sleeve | 9,876 → 9,853 | 22 | 55 → 2 | 449 → 4 | 22 → 22 |
+| bumper | 19,439 → 19,413 | 25 | 96 → 1 | 674 → 16 | 6 → 5 |
+| toy car | 12,981 → 12,620 | 404 | 488 → 16 | 3,232 → 31 | 74 → 75 |
+| tray | 11,085 → 10,965 | 71 | 205 → 8 | 290 → 12 | 38 → 36 |
+| cube | 6,000 → 6,000 | 0 | 0 → 0 | 0 → 0 | 8 → 8 |
+
+- Snaps lost to the side measurement: 1 / 1 / 56 / 89. The tray's are the
+  pocket-corner targets of cause 3, in groups of three round each pocket.
+- Snaps kept with a different target: 294 / 1,923 / 2,968 / 391 moved by more
+  than 0.05 cell, and 0 / 6 / 212 / 181 by more than a quarter cell. The
+  tray's 181 are along vertical edges at its right-hand end, where one wall
+  curves away from the edge: the plane fitted to that wall put the old
+  target a quarter cell out in the open.
+- What is left facing inward is thin (under a quarter cell): caps whose flip
+  was refused.
+
+#### Against "Done means"
+
+Met: open edges; non-manifold edges (0 / 0 / 1 / 0); triangles facing inward;
+sharp-off outputs; the cube's and the sleeve's corners; every test listed.
+Folds are under a tenth of before on three models and at a tenth on the tray.
+
+Not met: **corners**. Three on the tray, one on the bumper and three on the
+car are gone (others appeared: the car's total went up by one). They are real
+corners, each made by a single corner snap, and each now ends about half a
+cell short. The sequence at the one followed through (tray, a notch in the
+outer wall): a vertex one row back from the notch has only two qualifying
+sides, and they give it an edge a full cell away instead of the one it is
+0.4 from; that snap turns a triangle and is retracted; with it back in
+place, a triangle of the corner vertex beside it is turned, and the corner
+snap is retracted too. Open.
+
+#### Where the build departed from the design
+
+1. **A side is measured with a probe that adapts.** The design took over
+   the fixed probe of `sides_meet_at` (a quarter cell off the target, three
+   quarters deep either way). Requiring that of every snap lost real
+   creases, found by sampling the model where the lost snaps were:
+   - *Edges sharper than a right angle.* The sleeve has a 65° edge, 16 mm
+     long. Behind either face the material is a thin wedge, and a probe
+     three quarters of a cell deep comes out through the other face. All
+     196 snaps along it and its two corners were rejected. Now each end of
+     the probe is halved until it is in material (or in the open), and the
+     shift is taken within the side's own plane.
+   - *Targets outside the edge.* Where a wall curves away below the edge,
+     its fitted plane is tilted and the plane intersection lies up to a
+     third of a cell outside the real edge. The other face is then not
+     under the target, nor under a quarter-cell shift from it. Now shifts of
+     a half and a whole cell are tried as well. (The old code accepted such
+     targets where they were: off the surface.)
+
+   The estimate in the last step's record, that this check would reject 196
+   / 375 / 282 snaps and that those were debris, was wrong about what they
+   were: most were real creases the probe could not see.
+2. **The check for turned triangles runs on the welded positions**, inside
+   the cleanup stage, with the weld's clusters recomputed after each round of
+   retractions. The design had the same order; the point is that it shares
+   the weld's own test for "will be dropped" and the flip's own test for "is
+   a cap", so the three steps cannot disagree about a triangle.
+3. **Cap flips end by never remaking an edge a flip has removed.** Four
+   snapped vertices on one line, with two flattened triangles back to back,
+   trade places for ever otherwise. (A first version with a flip budget
+   spent it there and left other caps unflipped; a second, requiring each
+   flip to shorten the caps' long edges, refused the chains of flips that
+   carry a vertex across a fan of thin triangles.)
+4. **A corner that is not found in the model falls back to the edge** of the
+   two best-supported sides, as a corner out of range already did. Sound,
+   tested, and without measurable effect on the reference models.
+5. **Corner capture was not kept.** With the cap flip in place it saved two
+   corners (one on the tray, one on the bumper) of 139, left the folds
+   unchanged, and raised the car's retractions from 143 to 168.
+6. `cleanup::weld_snapped_vertices` is now `cleanup::clean_up_snaps`, and
+   reports the retracted vertices. `SharpFeatureStats` and `MeshingStats2`
+   count them, and count as snapped only what stays snapped.
+
+#### Still open
+
+- The seven corners above. The root is the choice of sides: the two
+  best-supported, not the two nearest.
+- Caps whose flip is refused because the face across the long edge is as
+  thin as the cap (36 on the car, 11 on the tray, 6 on the sleeve, 1 on the
+  bumper): they are what is left facing inward.
+- Edge snaps that move more than a cell (129 / 26 / 1,087 / 278 kept): rows
+  behind the band collapsing onto the crease. Harmless where they are kept,
+  and the source of most retractions (22 of 22, 17 of 25, 239 of 404 and 68
+  of 71 retracted snaps had moved more than three quarters of a cell).
+- Small-radius curved sides, needles in decimated meshes (181 / 69 / 184 /
+  131 left), the remote daemon: as before.
 

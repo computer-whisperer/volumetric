@@ -924,6 +924,8 @@ pub struct MeshingStats2 {
     pub sharp_snapped_edges: usize,
     /// Vertices snapped onto fitted corner points
     pub sharp_snapped_corners: usize,
+    /// Snaps undone because they turned a triangle over
+    pub sharp_retracted_snaps: usize,
     /// Vertices merged by the feature-band weld
     pub sharp_welded_vertices: usize,
     /// Triangles dropped because welding collapsed them
@@ -3311,6 +3313,7 @@ where
         sharp_candidates: sharp_stats.candidates,
         sharp_snapped_edges: sharp_stats.snapped_edges,
         sharp_snapped_corners: sharp_stats.snapped_corners,
+        sharp_retracted_snaps: sharp_stats.retracted_snaps,
         sharp_welded_vertices: sharp_stats.welded_vertices,
         sharp_dropped_triangles: sharp_stats.dropped_triangles,
         sharp_feature_edges: sharp_stats.feature_edges,

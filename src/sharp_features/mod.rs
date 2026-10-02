@@ -19,10 +19,12 @@
 //!    no unclaimed band) gathers nearby claimed vertices, splits them into
 //!    the sides that are connected without crossing a crease — face-pure *by
 //!    construction* — fits one plane per side, and projects onto the
-//!    intersection (edge line or corner point).
-//! 4. **Weld** ([`cleanup::weld_snapped_vertices`]): cross-band vertex pairs
-//!    that landed on the same feature point merge, collapsing the folded
-//!    slivers between them.
+//!    intersection (edge line or corner point). The sampler then locates
+//!    that point on the model's own surfaces, or rejects it.
+//! 4. **Cleanup** ([`cleanup::clean_up_snaps`]): snaps that turn a
+//!    triangle over are undone; cross-band vertex pairs that landed on the
+//!    same feature point merge; and the triangles the snap flattened onto a
+//!    feature are removed.
 //! 5. **Feature edges** ([`feature_edges::FeatureEdges::classify`]): the
 //!    edges of the welded mesh whose faces meet at more than the crease
 //!    angle. Decimation keeps crease vertices on their crease with it.
@@ -34,12 +36,13 @@
 //! Positions coincide, so the surface stays geometrically sealed.
 //!
 //! Robustness contract: every snap sits behind a chain of gates (side
-//! support, side residual, intersection conditioning, movement clamp, sampler
-//! verification). Any gate failing leaves the vertex where the mesher put it,
-//! so pathological geometry (fractals, sub-cell features) degrades to the
-//! unsnapped mesh, never to an invalid one. Watertightness is preserved:
-//! welding only merges vertices, and only triangles that lose an edge to a
-//! merge are dropped.
+//! support, side residual, intersection conditioning, movement clamp, every
+//! side found in the model, no triangle turned over). Any gate failing leaves
+//! the vertex where the mesher put it, so pathological geometry (fractals,
+//! sub-cell features) degrades to the unsnapped mesh, never to an invalid
+//! one. Watertightness is preserved: welding only merges vertices, triangles
+//! are dropped only when they lose an edge to a merge or cancel in pairs,
+//! and an edge flip replaces two triangles by two.
 //!
 //! Development history, oracle benchmarks, and research notes live in
 //! `crates/meshing_lab`, whose benchmarks run against these exact modules.
@@ -89,11 +92,17 @@ pub struct SharpFeatureConfig {
 pub struct SharpFeatureStats {
     /// Smooth regions found by segmentation.
     pub regions: usize,
-    /// Feature-zone (unclaimed) vertices considered for snapping.
+    /// Vertices considered for snapping: the feature zone (unclaimed), and
+    /// claimed vertices beside another face.
     pub candidates: usize,
+    /// Vertices on an edge line in the output (snapped and not retracted).
     pub snapped_edges: usize,
+    /// Vertices on a corner point in the output (snapped and not retracted).
     pub snapped_corners: usize,
+    /// Snaps undone in cleanup because they turned a triangle over.
+    pub retracted_snaps: usize,
     pub welded_vertices: usize,
+    /// Triangles the weld collapsed, plus cancelling pairs.
     pub dropped_triangles: usize,
     /// Feature edges found on the welded mesh.
     pub feature_edges: usize,
@@ -180,7 +189,8 @@ pub fn apply_sharp_features_cancellable(
         return None;
     }
 
-    let cleaned = cleanup::weld_snapped_vertices(
+    let cleaned = cleanup::clean_up_snaps(
+        &positions_v,
         &snapped.positions,
         indices,
         &snapped.snapped,
@@ -207,6 +217,13 @@ pub fn apply_sharp_features_cancellable(
         return None;
     }
 
+    let retracted = |kind: snap::SnapKind| {
+        cleaned
+            .retracted
+            .iter()
+            .filter(|&&v| snapped.snapped[v as usize] == Some(kind))
+            .count()
+    };
     Some(SharpFeatureOutput {
         positions: crate::parallel_iter::map_range(0..cleaned.positions.len(), |i| {
             let p = cleaned.positions[i];
@@ -220,8 +237,9 @@ pub fn apply_sharp_features_cancellable(
         stats: SharpFeatureStats {
             regions: seg.region_count,
             candidates: snapped.stats.candidates,
-            snapped_edges: snapped.stats.snapped_edges,
-            snapped_corners: snapped.stats.snapped_corners,
+            snapped_edges: snapped.stats.snapped_edges - retracted(snap::SnapKind::Edge),
+            snapped_corners: snapped.stats.snapped_corners - retracted(snap::SnapKind::Corner),
+            retracted_snaps: cleaned.retracted.len(),
             welded_vertices: cleaned.welded_vertices,
             dropped_triangles: cleaned.dropped_triangles,
             feature_edges: feature_edges.len(),

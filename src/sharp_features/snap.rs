@@ -14,11 +14,18 @@
 //! joined smoothly somewhere else (see [`SmoothFaces`]). So a region that no
 //! single plane fits is split into the pieces connected inside the radius.
 //!
+//! The fitted planes only say where to look. The target itself is where the
+//! model's own surfaces meet: every side is measured against the sampler
+//! ([`locate_on_sides`]), and a side whose surface is not there (a plane
+//! extended past the end of its face) rejects the snap.
+//!
 //! Robustness contract: snapping is opt-in per vertex behind a chain of gates
 //! (side support, side fit residual, intersection conditioning, movement
-//! clamp, sampler verification). Any gate failing leaves the vertex exactly
-//! where the mesher put it, so pathological geometry (fractals, sub-cell
-//! features) degrades to the current mesh, never to an invalid one.
+//! clamp, every side found in the model). Any gate failing leaves the vertex
+//! exactly where the mesher put it, so pathological geometry (fractals,
+//! sub-cell features) degrades to the current mesh, never to an invalid one.
+//! The last gate needs the neighbors' outcomes and so sits in the cleanup
+//! stage: a snap that turns a triangle over is undone there.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -47,24 +54,23 @@ pub struct SnapConfig {
     /// Snaps moving the vertex further than this (cell units) are rejected;
     /// real feature-zone vertices sit within about a cell of the feature.
     pub max_move_cells: f64,
-    /// Sampler verification probe distance (cell units): the snapped position
-    /// must have material just inside and none just outside along the mean
-    /// side normal. Set to 0 to disable (e.g. when no sampler is available).
-    pub verify_delta_cells: f64,
-    /// Bisection iterations for sampler refinement of the snap target. The
-    /// fitted side planes are secants on curved faces (a plane through a
-    /// cylinder-rim arc sits inside the true tangent), which biases the
-    /// intersection target inward and modulates with grid alignment — visible
-    /// as rim wobble. Refinement bisects the occupancy boundary along each
-    /// side's outward normal so the target lands on the model's actual
-    /// surfaces instead of on the fitted planes. 0 disables (also disabled
-    /// when no sampler is available); exact for planar faces either way.
+    /// Bisection iterations for measuring each side's surface at the snap
+    /// target. The fitted side planes are secants on curved faces (a plane
+    /// through a cylinder-rim arc sits inside the true tangent), which biases
+    /// the intersection target inward and modulates with grid alignment,
+    /// visible as rim wobble; and a plane says nothing about where its face
+    /// ends. Bisecting the occupancy boundary along each side's outward
+    /// normal puts the target on the model's actual surfaces, and rejects it
+    /// when one of them is not there. 0 disables the measurement, as does
+    /// having no sampler; snaps then go to the plane intersection unchecked.
     pub refine_iterations: usize,
-    /// Bisection bracket half-width (cell units) around the plane-fit target.
+    /// How far (cell units) from the plane-fit target a side's surface may
+    /// be and still be found: the bisection starts this far either side.
     pub refine_bracket_cells: f64,
     /// While bisecting one side, the probe line is shifted this far (cell
-    /// units) to the material side of the *other* sides, so it crosses only
-    /// the surface being refined.
+    /// units) off the target along the side, away from the surfaces of the
+    /// *other* sides, so it crosses only the surface being measured. Twice
+    /// and four times this are tried when the side is not found.
     pub refine_offset_cells: f64,
 }
 
@@ -77,7 +83,6 @@ impl Default for SnapConfig {
             min_dihedral_deg: 10.0,
             min_corner_det: 0.05,
             max_move_cells: 1.5,
-            verify_delta_cells: 0.6,
             refine_iterations: 12,
             refine_bracket_cells: 0.75,
             refine_offset_cells: 0.25,
@@ -93,7 +98,8 @@ pub enum SnapKind {
 
 #[derive(Clone, Debug, Default)]
 pub struct SnapStats {
-    /// Unclaimed vertices considered.
+    /// Vertices considered: unclaimed ones, and claimed ones beside another
+    /// face.
     pub candidates: usize,
     pub snapped_edges: usize,
     pub snapped_corners: usize,
@@ -101,12 +107,13 @@ pub struct SnapStats {
     pub rejected_sides: usize,
     /// Two sides too close to parallel for a stable edge line.
     pub rejected_parallel: usize,
-    /// Corner attempts whose three normals were too close to coplanar; these
-    /// fall back to an edge attempt rather than being rejected outright.
+    /// Corner attempts that did not hold (three normals too close to
+    /// coplanar, corner out of movement range, or not found in the model);
+    /// these fall back to an edge attempt rather than being rejected outright.
     pub corner_fallbacks: usize,
     /// Snap target further than the movement clamp.
     pub rejected_move: usize,
-    /// Snap target failed the sampler surface check.
+    /// A side's surface was not found in the model at the snap target.
     pub rejected_verify: usize,
     /// Snap target had non-finite coordinates.
     pub rejected_nonfinite: usize,
@@ -115,8 +122,7 @@ pub struct SnapStats {
 pub struct SnapResult {
     /// Vertex positions with snapped updates applied.
     pub positions: Vec<DVec3>,
-    /// What happened to each vertex (`None` for untouched, including all
-    /// claimed vertices).
+    /// What happened to each vertex (`None` for untouched).
     pub snapped: Vec<Option<SnapKind>>,
     pub stats: SnapStats,
 }
@@ -125,8 +131,6 @@ struct SidePlane {
     normal: DVec3,
     centroid: DVec3,
     support: usize,
-    /// The side is one piece of a region that no single plane fitted.
-    split: bool,
 }
 
 /// What one candidate evaluation produced, folded into [`SnapStats`] and the
@@ -145,10 +149,11 @@ enum SnapAttempt {
     Cancelled,
 }
 
-/// Snap unclaimed vertices onto locally fitted feature lines/points.
+/// Snap feature candidates onto locally fitted feature lines/points.
 ///
 /// `sampler` is the model's binary occupancy function; when provided (and
-/// `verify_delta_cells > 0`), every snap target is verified against it.
+/// `refine_iterations > 0`), every snap target is located in the model with
+/// it, or rejected.
 pub fn snap_feature_vertices(
     positions: &[DVec3],
     adjacency: &MeshAdjacency,
@@ -242,7 +247,7 @@ pub fn snap_feature_vertices_cancellable(
 }
 
 /// Evaluate one candidate vertex: gather side planes, solve the feature
-/// intersection, refine and verify against the sampler. Reads only shared
+/// intersection, and locate it in the model with the sampler. Reads only shared
 /// immutable inputs, so candidates evaluate in parallel.
 fn snap_one(
     v: usize,
@@ -285,88 +290,66 @@ fn snap_one(
     }
     planes.sort_by_key(|p| std::cmp::Reverse(p.support));
 
-    // Try a corner when three sides qualify, falling back to the
-    // best-supported edge pair when the corner solve is ill-conditioned
-    // or its target is out of movement range (vertices along an edge near
-    // a corner see three faces but belong on the edge line).
+    // A plane-intersection target is good when it is finite, within the
+    // movement clamp, and (with a sampler) where the model's own surfaces
+    // meet: the planes were fitted to vertices some way off, so the sides are
+    // found in the model at the target and the target moved onto them. The
+    // clamp applies to where that ends up.
     let max_move = config.max_move_cells * cell;
-    let mut target: Option<(DVec3, SnapKind)> = None;
-    if planes.len() >= 3 {
-        match intersect_three_planes(&planes[0], &planes[1], &planes[2], config.min_corner_det) {
-            Some(p) if p.is_finite() && (p - origin).length() <= max_move => {
-                target = Some((p, SnapKind::Corner));
-            }
-            _ => corner_fallback = true,
+    let settle = |target: DVec3, sides: &[SidePlane]| -> Result<DVec3, SnapAttempt> {
+        if !target.is_finite() {
+            return Err(SnapAttempt::RejectedNonfinite);
         }
-    }
-    if target.is_none() {
-        let max_dot = (config.min_dihedral_deg.to_radians()).cos();
-        match intersect_two_planes(origin, &planes[0], &planes[1], max_dot) {
-            Some(p) => target = Some((p, SnapKind::Edge)),
-            None => return (corner_fallback, SnapAttempt::RejectedParallel),
+        if (target - origin).length() > max_move {
+            return Err(SnapAttempt::RejectedMove);
         }
-    }
-    let (mut p, kind) = target.unwrap();
-
-    if !p.is_finite() {
-        return (corner_fallback, SnapAttempt::RejectedNonfinite);
-    }
-    if (p - origin).length() > max_move {
-        return (corner_fallback, SnapAttempt::RejectedMove);
-    }
-
-    if let Some(is_inside) = sampler {
-        // The gather/refine helpers predate the parallel driver and take the
-        // plain closure trait; upcast once here.
+        let Some(is_inside) = sampler.filter(|_| config.refine_iterations > 0) else {
+            return Ok(target);
+        };
+        // The probing helpers predate the parallel driver and take the plain
+        // closure trait; upcast once here.
         let is_inside: &dyn Fn(DVec3) -> bool = is_inside;
         // PCA normals have arbitrary sign; orient each participating side
         // outward with one probe at its own centroid (far from the
         // feature, so the probe is unambiguous).
-        let delta = config.verify_delta_cells.max(0.5) * cell;
-        let outward: Vec<DVec3> = planes
+        let outward: Vec<DVec3> = sides
             .iter()
-            .take(if kind == SnapKind::Corner { 3 } else { 2 })
-            .map(|s| orient_outward(s, is_inside, delta))
+            .map(|side| orient_outward(side, is_inside, ORIENT_PROBE_CELLS * cell))
             .collect();
-
-        // Refine the target onto the model's actual occupancy boundary.
-        // The clamp is re-checked because refinement moves the target;
-        // exceeding it falls back to the already-clamped plane target.
-        if config.refine_iterations > 0 {
-            let refined = refine_target(p, &outward, cell, config, is_inside);
-            if refined.is_finite() && (refined - origin).length() <= max_move {
-                p = refined;
-            }
+        let located = locate_on_sides(target, &outward, cell, config, is_inside)
+            .ok_or(SnapAttempt::RejectedVerify)?;
+        if !located.is_finite() {
+            return Err(SnapAttempt::RejectedNonfinite);
         }
-
-        // Verify: material just inside, none just outside along the mean
-        // outward side normal.
-        if config.verify_delta_cells > 0.0 {
-            let delta = config.verify_delta_cells * cell;
-            let Some(b) = outward.iter().sum::<DVec3>().try_normalize() else {
-                return (corner_fallback, SnapAttempt::RejectedVerify);
-            };
-            let inside_ok = is_inside(p - b * delta);
-            let outside_ok = !is_inside(p + b * delta);
-            if !(inside_ok && outside_ok) {
-                return (corner_fallback, SnapAttempt::RejectedVerify);
-            }
-
-            // Sides that are pieces of one region were told apart only by
-            // what lies inside the gather radius, and at that scale a tight
-            // fillet looks like a crease: its two flanks come out as two
-            // sides, and their planes meet beyond the fillet, at a corner the
-            // model does not have. The check above cannot see that when a
-            // third face passes through the same point. So such a snap has to
-            // show that every side's surface is really there.
-            let from_split = planes.iter().take(outward.len()).any(|side| side.split);
-            if from_split && !sides_meet_at(p, &outward, cell, config, is_inside) {
-                return (corner_fallback, SnapAttempt::RejectedVerify);
-            }
+        if (located - origin).length() > max_move {
+            return Err(SnapAttempt::RejectedMove);
         }
+        Ok(located)
+    };
+
+    // Try a corner when three sides qualify, and fall back to the
+    // best-supported edge pair when it does not hold: the solve is
+    // ill-conditioned, or the corner is out of movement range (vertices along
+    // an edge near a corner see three faces but belong on the edge line), or
+    // the three faces do not meet there in the model.
+    if planes.len() >= 3 {
+        let corner =
+            intersect_three_planes(&planes[0], &planes[1], &planes[2], config.min_corner_det)
+                .and_then(|target| settle(target, &planes[..3]).ok());
+        if let Some(p) = corner {
+            return (false, SnapAttempt::Snapped(p, SnapKind::Corner));
+        }
+        corner_fallback = true;
     }
-
-    (corner_fallback, SnapAttempt::Snapped(p, kind))
+    let max_dot = (config.min_dihedral_deg.to_radians()).cos();
+    let attempt = match intersect_two_planes(origin, &planes[0], &planes[1], max_dot) {
+        Some(target) => match settle(target, &planes[..2]) {
+            Ok(p) => SnapAttempt::Snapped(p, SnapKind::Edge),
+            Err(rejected) => rejected,
+        },
+        None => SnapAttempt::RejectedParallel,
+    };
+    (corner_fallback, attempt)
 }
 
 /// Gather the claimed vertices within `radius_cells` of `origin`, sort them
@@ -430,11 +413,7 @@ fn gather_side_planes(
             pieces
                 .iter()
                 .filter_map(|piece| side_plane(positions, piece, cell, config))
-                .filter(in_reach)
-                .map(|plane| SidePlane {
-                    split: true,
-                    ..plane
-                }),
+                .filter(in_reach),
         );
     }
     planes
@@ -462,7 +441,6 @@ fn side_plane(
         normal: fit.normal,
         centroid: fit.centroid,
         support: pts.len(),
-        split: false,
     })
 }
 
@@ -508,66 +486,46 @@ fn connected_pieces(
     pieces.into_iter().map(|(_, vertices)| vertices).collect()
 }
 
-/// Refine a plane-intersection target onto the model's actual occupancy
-/// boundary. For each side, bisect along its outward normal, with the probe
-/// line shifted slightly to the material side of the other sides so it
-/// crosses only the surface being refined. Planar faces refine to themselves
-/// (up to bisection resolution); on curved faces this replaces the fitted
-/// plane's secant with the true surface. Sides whose bracket doesn't straddle
-/// the boundary contribute no correction, so a bad bracket can never make the
-/// target worse than the plane intersection it started from.
-fn refine_target(
+/// Move a plane-intersection target onto the place where the model's own
+/// surfaces meet, or return `None` when one of them is not there.
+///
+/// Each side is measured ([`measure_side`]) and the target moves to where
+/// the measured surfaces meet. On a flat face that is the fitted plane again;
+/// on a curved one it replaces the plane, which is a secant, with the
+/// surface.
+///
+/// A side that cannot be measured has no surface at the target. Its fitted
+/// plane was extended past the end of its face (onto the far side of a
+/// fillet, say), and the planes meet at a point the model does not have.
+fn locate_on_sides(
     target: DVec3,
     outward: &[DVec3],
     cell: f64,
     config: &SnapConfig,
     is_inside: &dyn Fn(DVec3) -> bool,
-) -> DVec3 {
-    let bracket = config.refine_bracket_cells * cell;
-    let offset_len = config.refine_offset_cells * cell;
+) -> Option<DVec3> {
     let mut p = target;
     // Two rounds: the solve is exact for planar faces, the second round
     // cleans up what curvature shifted under the first round's probes.
     for _ in 0..2 {
-        // Measure each side's signed offset: how far p must move along the
-        // side's outward normal to sit on that side's surface.
-        let mut measured: Vec<(DVec3, f64)> = Vec::new();
+        // Each side's signed offset: how far p must move along the side's
+        // outward normal to sit on that side's surface.
+        let mut measured: Vec<(DVec3, f64)> = Vec::with_capacity(outward.len());
         for (i, &n) in outward.iter().enumerate() {
-            let inward_rest: DVec3 = outward
+            let others: Vec<DVec3> = outward
                 .iter()
                 .enumerate()
                 .filter(|&(j, _)| j != i)
-                .map(|(_, &m)| -m)
-                .sum();
-            let Some(offset_dir) = inward_rest.try_normalize() else {
-                continue;
-            };
-            let base = p + offset_dir * offset_len;
-            let (mut lo, mut hi) = (-bracket, bracket);
-            if !is_inside(base + n * lo) || is_inside(base + n * hi) {
-                continue;
-            }
-            for _ in 0..config.refine_iterations {
-                let mid = 0.5 * (lo + hi);
-                if is_inside(base + n * mid) {
-                    lo = mid;
-                } else {
-                    hi = mid;
-                }
-            }
-            // The crossing was measured on the offset probe line; adding the
-            // offset's normal component back expresses it as a constraint at
-            // p itself (offset_dir isn't perpendicular to n unless the sides
-            // are orthogonal).
-            measured.push((n, 0.5 * (lo + hi) + n.dot(offset_dir) * offset_len));
+                .map(|(_, &m)| m)
+                .collect();
+            measured.push((n, measure_side(p, n, &others, cell, config, is_inside)?));
         }
         // Solve the joint constraints n_i . (p' - p) = d_i with minimal
-        // movement — the same solves as the plane intersections, but against
+        // movement: the same solves as the plane intersections, but against
         // measured surface positions instead of fitted planes. Conditioning
         // was already gated when the target was accepted; the guards here
         // only protect against division blow-ups.
         match measured.as_slice() {
-            [(n, d)] => p += *n * *d,
             [(n1, d1), (n2, d2)] => {
                 let dot = n1.dot(*n2);
                 let det = 1.0 - dot * dot;
@@ -586,48 +544,76 @@ fn refine_target(
             _ => {}
         }
     }
-    p
+    Some(p)
 }
 
-/// Whether every side's actual surface passes by `target`: the check that a
-/// snap target sits where its sides really meet, not where their fitted
-/// planes would meet if extended.
+/// How far `p` is from one side's surface, along that side's outward normal
+/// `n`: the occupancy boundary is bisected on a probe line through a point
+/// near `p`. `None` when no boundary is found.
 ///
-/// For each side, the occupancy boundary must cross a short probe along the
-/// side's normal. The probe is shifted off the target, away from the other
-/// sides' surfaces, so that it crosses this side's surface only. Which way
-/// that is depends on the edge: behind the other side at a convex edge, in
-/// front of it at a concave one. Both are tried.
-fn sides_meet_at(
-    target: DVec3,
-    outward: &[DVec3],
+/// The probe line is shifted off `p` within the side's own plane, away from
+/// the edge, so that it crosses this side's surface and not the `others`.
+/// Which way that is depends on the edge: behind the other sides at a convex
+/// edge, in front of them at a concave one. Both are tried. So are longer
+/// shifts: a plane fitted to a curved face can put `p` a third of a cell
+/// outside the real edge, and the short shift then does not reach the face.
+///
+/// The bracket is the furthest the surface may be from the plane. It is not
+/// always possible to probe that far: at an edge sharper than a right angle
+/// the material behind the surface is a thin wedge (and at a sharp concave
+/// one, so is the space in front), and a probe that deep comes out the other
+/// side. So each end of the probe is halved until it is in material, or in
+/// the open, down to a sixteenth of the bracket. With the default bracket
+/// and shift that finds the faces of an edge down to about 20 degrees.
+fn measure_side(
+    p: DVec3,
+    n: DVec3,
+    others: &[DVec3],
     cell: f64,
     config: &SnapConfig,
     is_inside: &dyn Fn(DVec3) -> bool,
-) -> bool {
+) -> Option<f64> {
     let bracket = config.refine_bracket_cells * cell;
-    let offset_len = config.refine_offset_cells * cell;
-    outward.iter().enumerate().all(|(i, &n)| {
-        let others: Vec<DVec3> = outward
+    let reaches = [1.0, 0.5, 0.25, 0.125, 0.0625].map(|part| part * bracket);
+    let shifts = [1.0, 2.0, 4.0].map(|times| times * config.refine_offset_cells * cell);
+    let probes = shifts
+        .into_iter()
+        .flat_map(|distance| (0..1usize << others.len()).map(move |signs| (distance, signs)));
+    for (distance, signs) in probes {
+        let away: DVec3 = others
             .iter()
             .enumerate()
-            .filter(|&(j, _)| j != i)
-            .map(|(_, &m)| m)
-            .collect();
-        (0..1usize << others.len()).any(|signs| {
-            let shift: DVec3 = others
-                .iter()
-                .enumerate()
-                .map(|(k, &m)| if signs >> k & 1 == 0 { -m } else { m })
-                .sum();
-            let Some(shift) = shift.try_normalize() else {
-                return false;
-            };
-            let base = target + shift * offset_len;
-            is_inside(base - n * bracket) && !is_inside(base + n * bracket)
-        })
-    })
+            .map(|(k, &m)| if signs >> k & 1 == 0 { -m } else { m })
+            .sum();
+        let Some(shift) = (away - n * away.dot(n)).try_normalize() else {
+            continue;
+        };
+        let base = p + shift * distance;
+        let inside = reaches.into_iter().find(|&d| is_inside(base - n * d));
+        let outside = reaches.into_iter().find(|&d| !is_inside(base + n * d));
+        let (Some(inside), Some(outside)) = (inside, outside) else {
+            continue;
+        };
+        let (mut lo, mut hi) = (-inside, outside);
+        for _ in 0..config.refine_iterations {
+            let mid = 0.5 * (lo + hi);
+            if is_inside(base + n * mid) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        // The shift is perpendicular to `n`, so the crossing on the probe
+        // line is the side's offset at `p` itself.
+        return Some(0.5 * (lo + hi));
+    }
+    None
 }
+
+/// How far (cell units) from a side's centroid the probe that orients its
+/// normal is taken: far enough to clear the surface, short enough to stay
+/// inside a wall two cells thick.
+const ORIENT_PROBE_CELLS: f64 = 0.6;
 
 /// Orient a side plane normal to point out of the material, determined by one
 /// sampler probe from the side centroid.
@@ -697,7 +683,6 @@ mod tests {
             normal: normal.normalize(),
             centroid,
             support: 10,
-            split: false,
         }
     }
 
@@ -736,57 +721,97 @@ mod tests {
         assert!(intersect_three_planes(&a, &b, &c, 0.05).is_none());
     }
 
-    /// Refinement must pull a plane-fit target off its secant onto the true
+    /// Locating must pull a plane-fit target off its secant onto the true
     /// curved surface: cylinder rim, radius 20 cells, cap at z = 10.
     #[test]
-    fn refine_lands_on_curved_rim() {
+    fn target_is_located_on_a_curved_rim() {
         let config = SnapConfig::default();
         let is_inside = |p: DVec3| p.x * p.x + p.y * p.y <= 400.0 && p.z <= 10.0;
         // Plane-fit target with the observed failure mode: pulled inward
         // radially (secant bias), slightly off the cap too.
         let target = DVec3::new(19.8, 0.0, 9.95);
         let outward = [DVec3::X, DVec3::Z]; // barrel side, cap side
-        let p = refine_target(target, &outward, 1.0, &config, &is_inside);
+        let p = locate_on_sides(target, &outward, 1.0, &config, &is_inside).unwrap();
         assert!(
             (p - DVec3::new(20.0, 0.0, 10.0)).length() < 5e-3,
-            "refined point should land on the rim, got {p:?}"
+            "located point should land on the rim, got {p:?}"
         );
     }
 
-    /// Non-orthogonal sides: the probe-line offset has a component along the
-    /// refined side's normal, which the update must compensate for.
+    /// Non-orthogonal sides: the probe-line shift has a component along the
+    /// measured side's normal, which the update must compensate for.
     #[test]
-    fn refine_is_exact_for_planar_non_orthogonal_wedge() {
+    fn locating_is_exact_for_a_planar_non_orthogonal_wedge() {
         let config = SnapConfig::default();
         // Wedge z <= 0 AND x + z <= 0; edge along the y axis through origin.
         let is_inside = |p: DVec3| p.z <= 0.0 && p.x + p.z <= 0.0;
         let outward = [DVec3::Z, DVec3::new(1.0, 0.0, 1.0).normalize()];
         let target = DVec3::new(0.12, 0.3, -0.07);
-        let p = refine_target(target, &outward, 1.0, &config, &is_inside);
+        let p = locate_on_sides(target, &outward, 1.0, &config, &is_inside).unwrap();
         assert!(
             (p - DVec3::new(0.0, 0.3, 0.0)).length() < 5e-3,
-            "refined point should land on the wedge edge, got {p:?}"
+            "located point should land on the wedge edge, got {p:?}"
         );
     }
 
-    /// A bracket that doesn't straddle the boundary must contribute no
-    /// correction: the target comes back unchanged, never worse.
+    /// A wedge of material under the plane z = 0, `degrees` wide at its edge
+    /// (the y axis), with its outward normals.
+    fn wedge(degrees: f64) -> (impl Fn(DVec3) -> bool, [DVec3; 2]) {
+        let (sin, cos) = degrees.to_radians().sin_cos();
+        let slanted = DVec3::new(sin, 0.0, -cos);
+        (
+            move |p: DVec3| p.z <= 0.0 && p.dot(slanted) <= 0.0,
+            [DVec3::Z, slanted],
+        )
+    }
+
+    /// At an edge sharper than a right angle the material behind each face
+    /// is thinner than the bracket: a probe of full depth comes out through
+    /// the other face. The faces must be found all the same.
     #[test]
-    fn refine_without_boundary_in_bracket_is_identity() {
+    fn sides_are_located_at_a_sharp_wedge() {
+        let config = SnapConfig::default();
+        for degrees in [120.0, 65.0, 30.0] {
+            let (model, outward) = wedge(degrees);
+            let target = DVec3::new(-0.05, 0.3, 0.04);
+            let p = locate_on_sides(target, &outward, 1.0, &config, &model)
+                .unwrap_or_else(|| panic!("{degrees} degree wedge: sides not found"));
+            assert!(
+                (p - DVec3::new(0.0, 0.3, 0.0)).length() < 5e-3,
+                "{degrees} degree wedge: located {p:?}"
+            );
+        }
+    }
+
+    /// A plane fitted to a face that curves away below the edge is tilted,
+    /// and puts the target outside the real edge: here a third of a cell out
+    /// past a wall, level with the top face. The top face is then not under
+    /// the target, nor under the usual shift from it. It has to be found.
+    /// (The wall is still measured a quarter cell down and carried up along
+    /// the tilted normal, which leaves 0.06 of a cell.)
+    #[test]
+    fn sides_are_located_from_a_target_outside_the_edge() {
+        let config = SnapConfig::default();
+        // A block: top face z = 0, wall x = 0, material at x <= 0.
+        let model = |p: DVec3| p.z <= 0.0 && p.x <= 0.0;
+        let tilted_wall = DVec3::new(0.97, 0.0, -0.23).normalize();
+        let target = DVec3::new(0.34, 0.5, 0.0);
+        let p = locate_on_sides(target, &[tilted_wall, DVec3::Z], 1.0, &config, &model).unwrap();
+        assert!((p - DVec3::new(0.0, 0.5, 0.0)).length() < 0.07, "{p:?}");
+    }
+
+    /// With no boundary inside the bracket there is nothing to locate the
+    /// target on.
+    #[test]
+    fn a_target_with_no_surface_near_it_is_not_located() {
         let config = SnapConfig::default();
         let is_inside = |_: DVec3| true; // deep inside material
         let outward = [DVec3::X, DVec3::Z];
         let target = DVec3::new(1.0, 2.0, 3.0);
-        let p = refine_target(target, &outward, 1.0, &config, &is_inside);
-        assert_eq!(p, target);
-    }
-
-    /// No sampler exists for a synthetic mesh, so nothing can be verified.
-    fn unverified() -> SnapConfig {
-        SnapConfig {
-            verify_delta_cells: 0.0,
-            ..SnapConfig::default()
-        }
+        assert_eq!(
+            locate_on_sides(target, &outward, 1.0, &config, &is_inside),
+            None
+        );
     }
 
     /// A pocket cut into a slab (top face z = 0), seen at its inside corner:
@@ -802,74 +827,78 @@ mod tests {
     }
 
     /// Convex and concave edges alike: the top face meets each wall at a
-    /// convex edge, the walls meet each other at a concave one.
+    /// convex edge, the walls meet each other at a concave one, where the
+    /// probe for one wall has to run in front of the other, not behind it.
     #[test]
-    fn sides_meet_at_a_real_corner() {
+    fn sides_are_located_at_convex_and_concave_edges() {
         let config = SnapConfig::default();
         let model = pocket_corner(0.0);
+        let located = |target: DVec3, sides: &[DVec3]| {
+            locate_on_sides(target, sides, 1.0, &config, &model).expect("sides found")
+        };
         let sides = [DVec3::X, DVec3::Y, DVec3::Z];
-        assert!(sides_meet_at(DVec3::ZERO, &sides, 1.0, &config, &model));
+        assert!(located(DVec3::new(0.1, -0.1, 0.05), &sides).length() < 5e-3);
         // Along the concave edge between the two walls, below the top face.
         let on_edge = DVec3::new(0.0, 0.0, -5.0);
-        assert!(sides_meet_at(on_edge, &sides[..2], 1.0, &config, &model));
+        let near_edge = on_edge + DVec3::new(0.12, -0.07, 0.0);
+        assert!((located(near_edge, &sides[..2]) - on_edge).length() < 5e-3);
         // Along a convex edge between the top face and one wall.
         let on_rim = DVec3::new(0.0, 5.0, 0.0);
-        assert!(sides_meet_at(
-            on_rim,
-            &[DVec3::X, DVec3::Z],
-            1.0,
-            &config,
-            &model
-        ));
+        let near_rim = on_rim + DVec3::new(-0.1, 0.0, 0.08);
+        assert!((located(near_rim, &[DVec3::X, DVec3::Z]) - on_rim).length() < 5e-3);
     }
 
     /// The walls of a filleted pocket never meet: their planes cross at a
     /// point inside the material, on the top face, where neither wall is.
-    /// (The inside/outside check along the mean normal passes there, because
-    /// the top face does run through the point.)
     #[test]
-    fn sides_do_not_meet_beyond_a_fillet() {
+    fn walls_joined_by_a_fillet_are_not_located_where_their_planes_cross() {
         let config = SnapConfig::default();
         let model = pocket_corner(4.0);
         let sides = [DVec3::X, DVec3::Y, DVec3::Z];
-        let mean = DVec3::ONE.normalize() * config.verify_delta_cells;
-        assert!(
-            model(-mean) && !model(mean),
-            "the mean-normal check should pass"
+        assert_eq!(
+            locate_on_sides(DVec3::ZERO, &sides, 1.0, &config, &model),
+            None
         );
-        assert!(!sides_meet_at(DVec3::ZERO, &sides, 1.0, &config, &model));
-        // Clear of the fillet the same walls are found again.
-        let on_rim = DVec3::new(0.0, 8.0, 0.0);
-        assert!(sides_meet_at(
-            on_rim,
-            &[DVec3::X, DVec3::Z],
-            1.0,
-            &config,
-            &model
-        ));
     }
 
-    /// A target off the feature fails too: one side's surface is elsewhere.
+    /// One wall's plane, extended past where the wall turns into the fillet.
+    /// Just past it the plane is a poor fit and the wall's real surface is
+    /// still in reach: the target moves onto the rim of the fillet. Further
+    /// on there is no wall to find.
     #[test]
-    fn sides_do_not_meet_off_the_edge() {
+    fn a_wall_extended_past_its_end_is_followed_or_not_found() {
+        let config = SnapConfig::default();
+        let model = pocket_corner(4.0);
+        let sides = [DVec3::X, DVec3::Z];
+        let locate =
+            |y: f64| locate_on_sides(DVec3::new(0.0, y, 0.0), &sides, 1.0, &config, &model);
+        // Clear of the fillet the wall is where its plane says.
+        assert!((locate(8.0).unwrap() - DVec3::new(0.0, 8.0, 0.0)).length() < 5e-3);
+        // The fillet's rim is the circle of radius 4 about (4, 4).
+        let on_rim = locate(2.0).expect("the wall is 0.54 cells away");
+        assert!((on_rim - DVec3::new(4.0 - 12f64.sqrt(), 2.0, 0.0)).length() < 5e-3);
+        assert_eq!(locate(1.0), None, "the wall is 1.35 cells away");
+    }
+
+    /// A target off the feature is not located either: one side's surface is
+    /// elsewhere.
+    #[test]
+    fn a_target_off_the_edge_is_not_located() {
         let config = SnapConfig::default();
         let model = pocket_corner(0.0);
         let off_rim = DVec3::new(-1.5, 5.0, 0.0);
-        assert!(!sides_meet_at(
-            off_rim,
-            &[DVec3::X, DVec3::Z],
-            1.0,
-            &config,
-            &model
-        ));
+        assert_eq!(
+            locate_on_sides(off_rim, &[DVec3::X, DVec3::Z], 1.0, &config, &model),
+            None
+        );
     }
 
-    /// The mesh of a sharp pocket corner, all under one label, so its faces
-    /// are told apart as pieces. Against a model with that sharp corner the
-    /// corner vertex snaps. Against a model whose pocket walls are joined by a
-    /// fillet it must not: the wall the mesh suggests is not there.
+    /// The mesh of a sharp pocket corner, with its faces told apart as pieces
+    /// of one region. Against a model with that sharp corner the corner
+    /// vertex snaps. Against a model whose pocket walls are joined by a fillet
+    /// it must not: the walls the mesh suggests do not meet there.
     #[test]
-    fn sides_split_from_one_region_must_meet_in_the_model() {
+    fn a_corner_the_model_does_not_have_is_not_snapped_to() {
         // Four patches: the top face round the pocket (two), and its walls.
         let patches = [
             (
@@ -945,6 +974,30 @@ mod tests {
                 result.stats
             );
         }
+
+        // One step along the rim from the corner, the corner is still within
+        // reach, and it is tried first. Against a model with only the wall
+        // this vertex is on, there is no corner; but there is the rim, and
+        // the vertex belongs on it.
+        let on_rim = index_of[&(1, 0, 0)] as usize;
+        let one_wall = |p: DVec3| p.z <= 0.0 && p.y < 0.0;
+        let result = snap_feature_vertices(
+            &positions,
+            &adjacency,
+            faces,
+            1.0,
+            &SnapConfig::default(),
+            Some(&one_wall),
+        );
+        assert!(result.stats.corner_fallbacks > 0, "{:?}", result.stats);
+        assert_eq!(
+            result.snapped[on_rim],
+            Some(SnapKind::Edge),
+            "{:?}",
+            result.stats
+        );
+        let p = result.positions[on_rim];
+        assert!((p - DVec3::new(1.0, 0.0, 0.0)).length() < 5e-3, "{p:?}");
     }
 
     /// End-to-end on the synthetic tent: crease vertices must land exactly on
@@ -969,7 +1022,14 @@ mod tests {
             fits: &fits,
             config: &seg_config,
         };
-        let result = snap_feature_vertices(&positions, &adjacency, faces, 1.0, &unverified(), None);
+        let result = snap_feature_vertices(
+            &positions,
+            &adjacency,
+            faces,
+            1.0,
+            &SnapConfig::default(),
+            None,
+        );
 
         // The crease is the line x = 7, z = 0. Crease-column vertices away
         // from the open boundary must snap onto it exactly (planar sides).
@@ -1048,7 +1108,14 @@ mod tests {
             fits: &fits,
             config: &seg_config,
         };
-        let result = snap_feature_vertices(&positions, &adjacency, faces, 1.0, &unverified(), None);
+        let result = snap_feature_vertices(
+            &positions,
+            &adjacency,
+            faces,
+            1.0,
+            &SnapConfig::default(),
+            None,
+        );
 
         // Both columns beside the sharp crease land on it: x = 20, z = 0.
         for j in 3..=10 {
@@ -1120,7 +1187,14 @@ mod tests {
             fits: &fits,
             config: &seg_config,
         };
-        let result = snap_feature_vertices(&positions, &adjacency, faces, 1.0, &unverified(), None);
+        let result = snap_feature_vertices(
+            &positions,
+            &adjacency,
+            faces,
+            1.0,
+            &SnapConfig::default(),
+            None,
+        );
 
         // Candidates are the two columns the crease runs between, no more.
         assert_eq!(result.stats.candidates, 2 * n);
@@ -1183,7 +1257,7 @@ mod tests {
         // The premise: from the lower crease the upper tread outnumbers the
         // lower one, and each would qualify as a side on support.
         let v = row * nx + 7;
-        let config = unverified();
+        let config = SnapConfig::default();
         let count = |upper: bool| {
             adjacency
                 .k_ring(v as u32, 4)

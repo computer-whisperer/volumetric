@@ -18,8 +18,8 @@
 //! manually and reports per-vertex labels/snap outcomes plus, for the band's
 //! post-weld triangles, which edges are feature edges and each corner's
 //! feature degree — what decimation and the final normal split will act on.
-//! Adding `--dump-snaps <file>` writes every stage-4 vertex's snap outcome
-//! (`-`/`e`/`c`, position before, position after) for diffing two builds.
+//! Adding `--dump-stages <dir>` writes the whole mesh at each sharp stage as
+//! raw arrays (see the code for the list), for analysis outside this tool.
 
 use glam::DVec3;
 use meshing_lab::render;
@@ -97,7 +97,7 @@ fn main() {
         "--simplify-tolerance",
         "--dump-near",
         "--debug-corner",
-        "--dump-snaps",
+        "--dump-stages",
     ]
     .iter()
     .filter_map(|flag| args.iter().position(|a| a == flag).map(|i| i + 1))
@@ -304,32 +304,6 @@ fn main() {
             snapped.stats.rejected_nonfinite,
         );
 
-        // Every stage-4 vertex's snap outcome, one line each in vertex
-        // order, for comparing two builds of the snap stage.
-        if let Some(path) = args
-            .iter()
-            .position(|a| a == "--dump-snaps")
-            .and_then(|i| args.get(i + 1))
-        {
-            use std::fmt::Write;
-            let mut out = String::new();
-            for v in 0..positions.len() {
-                let kind = match snapped.snapped[v] {
-                    Some(snap::SnapKind::Edge) => 'e',
-                    Some(snap::SnapKind::Corner) => 'c',
-                    None => '-',
-                };
-                let (p, q) = (positions[v], snapped.positions[v]);
-                writeln!(
-                    out,
-                    "{kind} {} {} {} {} {} {}",
-                    p.x, p.y, p.z, q.x, q.y, q.z
-                )
-                .unwrap();
-            }
-            std::fs::write(path, out).expect("write snap dump");
-        }
-
         // Per-vertex: stage-4 state -> snap outcome.
         let mut band: Vec<usize> = (0..positions.len())
             .filter(|&v| near(positions[v]) || near(snapped.positions[v]))
@@ -370,7 +344,8 @@ fn main() {
         }
 
         // Weld and classify, exactly as apply_sharp_features does.
-        let cleaned = cleanup::weld_snapped_vertices(
+        let cleaned = cleanup::clean_up_snaps(
+            &positions,
             &snapped.positions,
             indices,
             &snapped.snapped,
@@ -389,6 +364,64 @@ fn main() {
             &sharp_config.feature_edges,
         );
         let degree = features.degrees(cleaned.positions.len());
+
+        // Every stage as raw little-endian arrays, for locating what the
+        // snap and weld leave behind: stage-4 positions, normals and
+        // triangles; each vertex's class (`e`/`c` snapped to an edge/corner,
+        // `r` snapped and retracted, `u` unclaimed and left, `k` claimed
+        // candidate left, `f` on a face) and position after the snap; the
+        // weld's vertex map; the welded positions and triangles.
+        if let Some(dir) = args
+            .iter()
+            .position(|a| a == "--dump-stages")
+            .and_then(|i| args.get(i + 1))
+        {
+            let dir = PathBuf::from(dir);
+            std::fs::create_dir_all(&dir).expect("create dump dir");
+            let adjacency = adjacency::MeshAdjacency::build(positions.len(), indices);
+            let faces = segmentation::SmoothFaces {
+                labels: &seg.labels,
+                fits: &fits,
+                config: &sharp_config.segmentation,
+            };
+            let class: Vec<u8> = (0..positions.len() as u32)
+                .map(|v| match snapped.snapped[v as usize] {
+                    Some(_) if cleaned.retracted.binary_search(&v).is_ok() => b'r',
+                    Some(snap::SnapKind::Edge) => b'e',
+                    Some(snap::SnapKind::Corner) => b'c',
+                    None if !faces.claimed(v) => b'u',
+                    None if adjacency
+                        .neighbors(v)
+                        .iter()
+                        .any(|&u| faces.claimed(u) && !faces.joined(v, u)) =>
+                    {
+                        b'k'
+                    }
+                    None => b'f',
+                })
+                .collect();
+            let points = |points: &[DVec3]| -> Vec<u8> {
+                points
+                    .iter()
+                    .flat_map(|p| [p.x, p.y, p.z])
+                    .flat_map(f64::to_le_bytes)
+                    .collect()
+            };
+            let ints =
+                |ints: &[u32]| -> Vec<u8> { ints.iter().flat_map(|i| i.to_le_bytes()).collect() };
+            let write = |name: &str, bytes: Vec<u8>| {
+                std::fs::write(dir.join(name), bytes).expect("write stage dump");
+            };
+            write("before.f64", points(&positions));
+            write("normals.f64", points(&normals));
+            write("tris.u32", ints(indices));
+            write("class.u8", class);
+            write("after.f64", points(&snapped.positions));
+            write("remap.u32", ints(&cleaned.remap));
+            write("welded.f64", points(&cleaned.positions));
+            write("welded_tris.u32", ints(&cleaned.indices));
+            write("cell.txt", format!("{cell}\n").into_bytes());
+        }
 
         // Band triangles with their feature edges (`=` between the corners
         // they join) and each corner's feature degree: 0 smooth, 2 on a

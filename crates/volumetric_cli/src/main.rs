@@ -464,6 +464,7 @@ fn print_stats_summary(stats: &MeshingStats2) {
             "  Snapped:             {} edge + {} corner",
             stats.sharp_snapped_edges, stats.sharp_snapped_corners
         );
+        println!("  Retracted snaps:     {}", stats.sharp_retracted_snaps);
         println!("  Welded vertices:     {}", stats.sharp_welded_vertices);
         println!("  Dropped triangles:   {}", stats.sharp_dropped_triangles);
         println!("  Feature edges:       {}", stats.sharp_feature_edges);
