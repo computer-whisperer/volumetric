@@ -470,3 +470,157 @@ a third side appeared.)
   196 do. Flat faces lose nothing by it; a concave edge against a curved
   face keeps the plane fit's secant error. `sides_meet_at` tries both
   shifts; refinement could do the same.
+
+## Next step: snap and weld debris
+
+Status: design, 2026-10-02, written after the measurements below and before
+the rebuild. The measurements came from throwaway experiments in the working
+tree; none of that code is kept as it stands.
+
+### What the debris is
+
+"Debris" is what a sharp mesh carries that the model does not have: hard
+folds (two neighbouring triangles more than 135° apart), triangles facing
+into the material, edges shared by more than two triangles, and the spikes
+and cut corners these show up as. After the last step the reference models
+had 318 / 624 / 1,880 / 376 folds (sleeve / bumper / toy car / tray; sharp,
+no simplify) and 4 / 1 / 75 / 4 non-manifold edges.
+
+Every fold and non-manifold edge on those four models was sorted by what
+the snap stage had done to the vertices around it (`wasm_mesh_view
+--dump-stages`, then a script over the dump). There are four causes, and
+one experiment per cause confirmed each:
+
+1. **Slivers along a crease** (79–87 % of the folds on sleeve, bumper and
+   car; 28 % on the tray). Both rows of the band between two faces are
+   snapped onto the crease line. Where two of them land more than the weld
+   radius apart they stay separate vertices, and the band triangle between
+   them has all three corners on the crease. It has next to no area and an
+   arbitrary normal. The weld already removes these when they have exactly
+   zero area (`flip_zero_area_caps`); on a curved rim, or with the last
+   digits of the bisection, they have a little. Treating every triangle with
+   all three corners snapped and a height under the weld radius the same way
+   took the folds from 328 / 613 / 1,913 / 506 to 71 / 114 / 522 / 384. The
+   3–4 % that were left were cut off by the function's eight-round limit:
+   it flips at most every second or third sliver of a chain per round.
+2. **Triangle pairs folded onto each other** (67 of the car's 73
+   non-manifold edges, and all of the others'). The weld joins two snapped
+   vertices that were not connected by an edge, and the two triangles
+   between them end up on the same three vertices, facing opposite ways.
+   Removing such pairs took the non-manifold edges from 2 / 1 / 73 / 4 to
+   0 / 0 / 6 / 0.
+3. **Targets the model does not have.** A side's fitted plane can be
+   extended past the end of its face. The clearest case is the tray's
+   pocket corners, seen from above: a vertex on the fillet arc gets the
+   straight wall beyond the tangent point as a side and is moved 1.3 cells
+   onto the extension of that wall, into the top face. The existing check
+   (inside just behind the target, outside just in front, along the mean of
+   the side normals) passes, because the target is on the top face. This is
+   the false corner of the last step again, for sides that are not pieces.
+   Requiring every side's surface to be found at the target removed all 74
+   folds of this kind on the tray and rejected 231 / 9 / 729 / 280 of the
+   snaps.
+4. **Snaps that overtake a neighbour.** A vertex is moved up to 1.5 cells,
+   and its neighbours move differently or not at all, so it can cross the
+   far edge of one of its own triangles and turn that triangle over. Two
+   common shapes: a vertex one row back from the crease that was a snap
+   candidate while its row-mates were not; and a vertex pulled to a corner
+   past a nearer vertex that only reached the edge. Undoing the snaps that
+   turn a triangle over (the vertex that moved furthest, repeated until
+   nothing is turned) took triangles facing into the material from
+   28 / 41 / 250 / 105 to 1 / 5 / 1 / 5 and the folds to 8 / 23 / 37 / 10,
+   for 17–33 / 33–37 / 215–238 / 83–116 snaps undone. It does not cascade.
+   What remains is beside the slivers cut off in cause 1.
+
+### Target
+
+Two changes, one in each stage.
+
+**Snap: a target is where the model's surfaces meet, or it is rejected.**
+`refine_target`, the mean-normal check and `sides_meet_at` become one step,
+`locate_on_sides`. Each side is measured: the occupancy boundary is bisected
+along the side's normal, on a probe line shifted off the target to whichever
+side of the other faces has this face's surface alone (behind them at a
+convex edge, in front at a concave one). The target moves to where the
+measured surfaces meet.
+
+- A side with no boundary inside the bracket has no surface there, and the
+  snap is rejected. That is cause 3.
+- A measured target beyond the movement clamp is rejected. (Today the
+  unmeasured plane target is kept in that case.)
+- Concave sides are measured like convex ones. Today about half of all
+  snaps have a side that is never refined (see "Also noticed" above).
+- The mean-normal check is deleted. With every side measured it rejected
+  one or two vertices per model in the experiment.
+- `SidePlane::split` and `SnapConfig::verify_delta_cells` go with it. The
+  probe that orients a side normal keeps its 0.6 cell as a constant.
+
+**Weld: the snap's result is made into a valid mesh, in four steps.**
+`cleanup.rs` is rebuilt around this; the present `weld_snapped_vertices`
+and `flip_zero_area_caps` are deleted first.
+
+1. *Retract.* Snapped vertices within the weld radius are clustered as
+   today. Then every stage-4 triangle that touches a snapped vertex is
+   compared with itself before the snap. If it has turned by more than 90°
+   and is not about to be removed by steps 2–4, the snapped vertex of it
+   that moved furthest is put back where the mesher had it. Cluster and
+   check again until nothing is turned. This is the last gate of the snap's
+   contract: a snap that cannot be fitted into the mesh is not made.
+2. *Weld.* One vertex per cluster, triangles with two corners in one
+   cluster dropped. As today.
+3. *Cancel.* Two triangles on the same three vertices with opposite
+   winding are both removed. Every edge of the pair loses two faces, so no
+   edge is opened.
+4. *Flip caps.* A cap is a triangle with a snapped vertex within the weld
+   radius of the opposite edge, and not within that radius of either end of
+   it: the vertex is on that edge, and the triangle is what is left of a
+   face that the snap flattened. The edge is flipped, so the cap and the
+   face across the edge become two triangles that cover that face and meet
+   at the vertex. This is `flip_zero_area_caps` with "zero area" replaced by
+   "within the weld radius", which is the same tolerance the weld uses for
+   two vertices being one. It covers cause 1 and the thin turned-over
+   triangles of cause 4 (a vertex pulled just across an edge of a face it
+   lies in). It runs from a work list over an edge map of the triangles
+   near snapped vertices, so a chain of any length is finished, and a flip
+   that would turn a triangle over is not made.
+
+### To be decided by measurement
+
+- **Corner capture.** When a vertex is pulled to a corner from distance
+  *d*, every edge-snapped vertex whose target is within *d* of that corner
+  would go to the corner too, so that order along the edge is kept. In the
+  experiment this kept more corner snaps but did not change the folds, and
+  the retraction still lost 7 of the tray's 38 corners with it (9 without).
+  Those corners are where three faces meet around a notch, and what turns
+  over there is a thin triangle of the kind step 4 now flips. Measure the
+  corners kept with step 4 in place, with and without capture, and keep
+  capture only if it saves corners.
+
+### Done means
+
+Same commands and models as before.
+
+- Reference table, sharp and sharp + simplify: open edges 0; non-manifold
+  edges at most 0 / 0 / 2 / 0; folds on sharp, no simplify, under a tenth
+  of today's.
+- Triangles facing into the material (new column, from the stage dump): at
+  most a handful per model.
+- No corner of the cube, sleeve or tray is lost: the count of distinct
+  corner points does not drop except where a lost corner is shown to be a
+  false one.
+- Snaps lost against today are accounted for by the two rejections above,
+  with a sample of them looked at.
+- Sharp-off outputs byte-identical.
+- Tests: a sliver chain along a curved crease is flipped away, whatever
+  its length; a cancelling pair is removed and the mesh stays closed; a
+  target on the extension of a wall past a fillet is rejected; a concave
+  side is measured; a snap that overtakes a fixed neighbour is retracted
+  and its neighbours' snaps stay.
+
+### Not in this step
+
+- Small-radius curved sides, needles, the remote daemon (see above).
+- Snapping more of what is rejected today. The car at 256 has about as
+  many unsnapped candidates as snapped ones (features one or two cells
+  thick); that is resolution, not debris.
+
