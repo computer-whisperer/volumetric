@@ -1077,6 +1077,44 @@ fn collapse_flips_normals(
 /// tests; the flip guard refuses to mint new pairs below it.
 const HARD_FOLD_DOT: f64 = -0.9;
 
+/// Interior edges whose two incident faces are folded back on each other
+/// (unit-normal dot below [`HARD_FOLD_DOT`]). A clean mesh has none.
+#[cfg(test)]
+pub(crate) fn hard_fold_edge_count(vertices: &[(f32, f32, f32)], indices: &[u32]) -> usize {
+    let positions: Vec<[f64; 3]> = vertices
+        .iter()
+        .map(|&(x, y, z)| [x as f64, y as f64, z as f64])
+        .collect();
+    let normals: Vec<Option<[f64; 3]>> = indices
+        .chunks_exact(3)
+        .map(|t| {
+            let (p0, p1, p2) = (
+                positions[t[0] as usize],
+                positions[t[1] as usize],
+                positions[t[2] as usize],
+            );
+            normalize(cross(sub(p1, p0), sub(p2, p0)))
+        })
+        .collect();
+    let mut edge_faces: std::collections::HashMap<u64, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (fi, t) in indices.chunks_exact(3).enumerate() {
+        for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+            edge_faces.entry(edge_key(a, b)).or_default().push(fi);
+        }
+    }
+    edge_faces
+        .values()
+        .filter(|faces| {
+            faces.len() == 2
+                && match (normals[faces[0]], normals[faces[1]]) {
+                    (Some(n0), Some(n1)) => dot(n0, n1) < HARD_FOLD_DOT,
+                    _ => false,
+                }
+        })
+        .count()
+}
+
 #[cfg(all(test, feature = "native"))]
 mod tests {
     use super::*;
@@ -1306,43 +1344,6 @@ mod tests {
         for (_, count) in edge_face_counts(&mesh.indices) {
             assert_eq!(count, 2);
         }
-    }
-
-    /// Interior edges whose two incident faces are folded back on each other
-    /// (unit-normal dot < -0.9). A clean decimation of a clean mesh has none.
-    fn hard_fold_edge_count(vertices: &[(f32, f32, f32)], indices: &[u32]) -> usize {
-        let positions: Vec<[f64; 3]> = vertices
-            .iter()
-            .map(|&(x, y, z)| [x as f64, y as f64, z as f64])
-            .collect();
-        let normals: Vec<Option<[f64; 3]>> = indices
-            .chunks_exact(3)
-            .map(|t| {
-                let (p0, p1, p2) = (
-                    positions[t[0] as usize],
-                    positions[t[1] as usize],
-                    positions[t[2] as usize],
-                );
-                normalize(cross(sub(p1, p0), sub(p2, p0)))
-            })
-            .collect();
-        let mut edge_faces: std::collections::HashMap<u64, Vec<usize>> =
-            std::collections::HashMap::new();
-        for (fi, t) in indices.chunks_exact(3).enumerate() {
-            for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
-                edge_faces.entry(edge_key(a, b)).or_default().push(fi);
-            }
-        }
-        edge_faces
-            .values()
-            .filter(|faces| {
-                faces.len() == 2
-                    && match (normals[faces[0]], normals[faces[1]]) {
-                        (Some(n0), Some(n1)) => dot(n0, n1) < -0.9,
-                        _ => false,
-                    }
-            })
-            .count()
     }
 
     /// Regression test for decimation-minted flipped slivers (foam lattices,

@@ -193,18 +193,10 @@ fn main() {
         let target = DVec3::new(cx, cy, cz);
         let near = |p: DVec3| (p - target).abs().max_element() < r;
 
-        // Production cell size: padded extent / finest cells (mid-cell pad).
+        // The cell size the sharp stage saw: the largest edge of the grid cell.
         let (bmin, bmax) = (result.bounds_min, result.bounds_max);
-        let finest = (8usize << max_depth) as f64;
-        let pad_frac = 2.5 / (finest - 5.0);
-        let cell = [
-            (bmax.0 - bmin.0) as f64,
-            (bmax.1 - bmin.1) as f64,
-            (bmax.2 - bmin.2) as f64,
-        ]
-        .iter()
-        .map(|e| e * (1.0 + 2.0 * pad_frac) / finest)
-        .fold(0.0f64, f64::max);
+        let size = result.stats.cell_size;
+        let cell = size.0.max(size.1).max(size.2);
         println!("debug-corner: cell={cell:.6} target={target:?} r={r}");
 
         let sampler_impl = volumetric::wasm::create_parallel_sampler(&wasm_bytes).unwrap();
@@ -680,7 +672,8 @@ fn main() {
     // vertex did.
     if args.iter().any(|a| a == "--debug-rim") {
         assert!(!sharp, "--debug-rim requires --no-sharp");
-        let cell = 3.1875 / (8usize << max_depth) as f64; // padded xy span
+        let size = result.stats.cell_size;
+        let cell = size.0.max(size.1).max(size.2);
         let sampler_impl = volumetric::wasm::create_parallel_sampler(&wasm_bytes).unwrap();
         let (bmin, bmax) = (result.bounds_min, result.bounds_max);
         let is_inside = |p: DVec3| -> bool {

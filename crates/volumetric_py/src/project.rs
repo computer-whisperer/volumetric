@@ -382,7 +382,7 @@ impl Asset {
 
     /// A `FeaMesh` or `TriMesh` as arrays; a `Model` meshed with the
     /// adaptive surface nets the CLI's `mesh` uses, at `base_resolution ·
-    /// 2^max_depth` cells across its bounds (128 by default), with sharp
+    /// 2^max_depth` cubic cells along its longest axis (128 by default), with sharp
     /// edges recovered when `sharp_edges` (creases sharper than
     /// `sharp_angle` degrees) and simplified to `simplify` cells of error
     /// unless None. A model's mesh carries its normals as the `normal`

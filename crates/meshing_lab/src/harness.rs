@@ -34,7 +34,7 @@ pub fn mesh_shape(shape: &dyn OracleShape, max_depth: usize) -> MeshedShape<'_> 
 }
 
 /// [`mesh_shape`] with an explicit bounds margin fraction. The production
-/// path pads by ~2 finest cells (fraction `2 / effective_resolution`), which
+/// path pads by 2.5 finest cells (`MeshGrid::padded`), which
 /// aligns features with the grid very differently than a generous margin --
 /// benchmark both.
 pub fn mesh_shape_with_margin(
@@ -59,9 +59,6 @@ pub fn mesh_shape_with_margin(
         edge_constrained_refinement: false,
         decimation: None,
     };
-    let finest_cells = config.base_resolution * (1 << config.max_depth);
-    let cell = (hi - lo).max_element() / finest_cells as f64;
-
     let result = adaptive_surface_nets_2(
         |x, y, z| {
             if shape.is_inside(DVec3::new(x, y, z)) {
@@ -74,6 +71,9 @@ pub fn mesh_shape_with_margin(
         (hi.x as f32, hi.y as f32, hi.z as f32),
         &config,
     );
+
+    let size = result.stats.cell_size;
+    let cell = size.0.max(size.1).max(size.2);
 
     let positions: Vec<DVec3> = result
         .mesh

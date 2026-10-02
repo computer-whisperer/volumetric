@@ -157,11 +157,13 @@ pub struct MeshArgs {
     #[arg(long, value_enum, default_value_t = MeshUnit::M)]
     unit: MeshUnit,
 
-    /// Base resolution for coarse grid discovery (default: 8)
+    /// Coarse discovery cells along the model's longest axis (default: 8).
+    /// Cells are cubic, so shorter axes get proportionally fewer
     #[arg(long, default_value = "8")]
     base_resolution: usize,
 
-    /// Maximum refinement depth (default: 4, effective resolution = base * 2^depth)
+    /// Maximum refinement depth (default: 4): the longest axis is meshed at
+    /// base * 2^depth cells
     #[arg(long, default_value = "4")]
     max_depth: usize,
 
@@ -377,7 +379,10 @@ fn print_stats_summary(stats: &MeshingStats2) {
     );
     println!("Vertices:        {}", stats.total_vertices);
     println!("Triangles:       {}", stats.total_triangles);
-    println!("Resolution:      {}³", stats.effective_resolution);
+    println!(
+        "Grid:            {} x {} x {} cells",
+        stats.grid_cells.0, stats.grid_cells.1, stats.grid_cells.2
+    );
     println!();
     println!("Stage breakdown:");
     println!(
@@ -523,7 +528,7 @@ fn run_mesh(args: MeshArgs) -> Result<()> {
 
     let effective_res = config.base_resolution * (1 << config.max_depth);
     println!(
-        "Meshing with resolution {}³ (base={}, depth={})",
+        "Meshing with {} cells along the longest axis (base={}, depth={})",
         effective_res, config.base_resolution, config.max_depth
     );
 

@@ -212,19 +212,22 @@ volumetric_cli mesh -i <file> -o <output.3mf> --unit mm
 
 **Options:**
 - `--unit <m|mm|cm|in>` - Output length unit (default: `m`). Geometry is in metres; coordinates are scaled to this unit, and a 3MF is labelled with it so slicers open it at true size. STL carries no unit and slicers read it as millimetres, so `--unit mm` exports true size there too
-- `--base-resolution <n>` - Coarse grid resolution (default: 8)
-- `--max-depth <n>` - Refinement depth (default: 4). Effective resolution = base × 2^depth
+- `--base-resolution <n>` - Coarse discovery cells along the model's longest axis (default: 8)
+- `--max-depth <n>` - Refinement depth (default: 4). The longest axis is meshed at base × 2^depth cells; cells are cubic, so shorter axes get proportionally fewer
+- `--discovery-probes <n>` - Interior probes per uniform discovery cell, catching geometry thinner than the coarse grid (default: 8, 0 to disable)
 - `--vertex-refinement <n>` - Vertex position refinement iterations (default: 12)
 - `--normal-refinement <n>` - Normal estimation iterations (default: 12, use 0 to disable)
 - `--normal-epsilon <f>` - Normal probe distance as fraction of cell size (default: 0.1)
-- `--sharp-edges` - Enable sharp edge detection and vertex duplication for hard edges
-- `--sharp-angle <degrees>` - Angle threshold for sharp edge detection (default: 20)
-- `--sharp-residual <f>` - Residual multiplier for sharp edge clustering (default: 4.0)
+- `--sharp-edges` - Enable sharp feature reconstruction (edge and corner snapping)
+- `--sharp-angle <degrees>` - Largest normal jump between neighbouring vertices of one smooth region (default: 15)
+- `--no-simplify` - Skip the decimation pass
+- `--simplify-tolerance <f>` - Decimation error budget as a fraction of the cell size (default: 1.0)
+- `--edge-constrained` - Refine each vertex along its own grid edge only (for thin-walled lattices)
 - `-q, --quiet` - Suppress profiling output
 
 **Examples:**
 ```bash
-# Mesh a WASM model with default settings (128³ effective resolution)
+# Mesh a WASM model with default settings (128 cells along its longest axis)
 volumetric_cli mesh -i simple_torus_model.wasm -o torus.stl
 
 # Faster meshing with lower resolution and no normal refinement
@@ -254,7 +257,7 @@ volumetric_cli render -i <model.wasm | project.vproj> -o <output.png>
 
 **Scene:**
 - `--asset <id>` - Draw only this asset (repeatable; default: every renderable export; an import such as a view set draws only when named)
-- `--resolution <N>` - Meshing resolution for models and raster size for sketches (default: 128)
+- `--resolution <N>` - Meshing resolution for models (cells along the longest axis) and raster size for sketches (default: 128)
 - `--no-sharp`, `--no-simplify` - Mesh without sharp-feature reconstruction or decimation
 - `--color-channel <name>` - Colormap models by a declared sample channel
 - `--color-field node:<name>` - Colormap FEA meshes and point clouds by a field

@@ -85,7 +85,8 @@
 //!
 //! ### Stage 1: Coarse Grid Discovery
 //! Sample the volume at low resolution to find regions containing the surface.
-//! - Grid of `base_resolution³` samples
+//! - Grid of cubic cells, `base_resolution` along the longest axis of the
+//!   bounds (see [`MeshGrid`])
 //! - Identify "mixed" edges (inside→outside transitions)
 //! - Output: Initial work queue of coarse mixed cells WITH pre-sampled corners
 //!
@@ -215,10 +216,13 @@ impl<F> SamplerFn for F where F: Fn(f64, f64, f64) -> f32 {}
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct AdaptiveMeshConfig2 {
-    /// Base grid resolution for initial discovery (e.g., 8 means 8³ coarse cells)
+    /// Coarse discovery cells along the longest axis of the bounds (8 means
+    /// 8³ coarse cells on cubic bounds; shorter axes get proportionally
+    /// fewer, see [`MeshGrid`])
     pub base_resolution: usize,
 
-    /// Maximum refinement depth (total resolution = base_resolution * 2^max_depth)
+    /// Maximum refinement depth (finest cells along the longest axis =
+    /// base_resolution * 2^max_depth)
     pub max_depth: usize,
 
     /// Aperiodic interior probes per corner-uniform stage-1 cell (0 disables).
@@ -308,6 +312,118 @@ impl Default for AdaptiveMeshConfig2 {
     }
 }
 
+/// The sampling lattice: where the cell corners sit in world space.
+///
+/// Cells are (near-)cubic. `base_resolution * 2^max_depth` finest cells span
+/// the longest axis; every other axis gets the whole number of cells nearest
+/// to its extent at that cell size, and its cell edge is the extent divided
+/// by that count. So a cell is exactly cubic when the extents are
+/// commensurate and otherwise within `0.5 / count` of it on that axis; only
+/// an axis thinner than half a cell stretches further (one cell spanning
+/// it), which keeps a sheet thinner than the grid pitch meshable.
+///
+/// Every length the pipeline expresses "in cells" (refinement search, sharp
+/// feature radii, the decimation budget) assumes this: on a stretched grid
+/// one cell is a different distance along each axis, and a refinement move
+/// of one cell on the coarse axis carries a vertex past several of its
+/// neighbours on the fine one, folding the mesh.
+///
+/// The octree needs a whole number of depth-0 cells per axis, so the grid
+/// may run past the bounds on the max side of the shorter axes by less than
+/// one depth-0 cell.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MeshGrid {
+    /// World position of the finest-level corner (0, 0, 0).
+    pub origin: (f64, f64, f64),
+    /// Finest-level cell edge length per axis.
+    pub cell_size: (f64, f64, f64),
+    /// Depth-0 cells per axis.
+    pub base_cells: (usize, usize, usize),
+    /// Refinement depth: a depth-0 cell spans `2^max_depth` finest cells.
+    pub max_depth: usize,
+}
+
+impl MeshGrid {
+    /// A grid whose planes lie on the bounds: corner 0 on `bounds_min`, and
+    /// `bounds_max` a whole number of cells along each axis.
+    pub fn tiling(
+        bounds_min: (f64, f64, f64),
+        bounds_max: (f64, f64, f64),
+        config: &AdaptiveMeshConfig2,
+    ) -> Self {
+        Self::layout(bounds_min, bounds_max, config, 0)
+    }
+
+    /// A grid for a model whose surface may lie on its declared bounds: the
+    /// bounds planes sit mid-cell, 2.5 finest cells inside the grid, on both
+    /// sides of every axis. Used with a sampler that reads "outside" beyond
+    /// the bounds, so the mesher sees those transitions with samples on
+    /// either side and geometry cut off by the bounds stays as far from the
+    /// corner planes as an interior surface can be.
+    pub fn padded(
+        bounds_min: (f64, f64, f64),
+        bounds_max: (f64, f64, f64),
+        config: &AdaptiveMeshConfig2,
+    ) -> Self {
+        Self::layout(bounds_min, bounds_max, config, 5)
+    }
+
+    /// `margin_cells` finest cells per axis lie outside the bounds, half of
+    /// them on each side (0 for a tiling grid, 5 for a padded one).
+    fn layout(
+        bounds_min: (f64, f64, f64),
+        bounds_max: (f64, f64, f64),
+        config: &AdaptiveMeshConfig2,
+        margin_cells: usize,
+    ) -> Self {
+        let depth_cells = 1usize << config.max_depth;
+        let longest_cells = config.base_resolution * depth_cells;
+        let extent = [
+            bounds_max.0 - bounds_min.0,
+            bounds_max.1 - bounds_min.1,
+            bounds_max.2 - bounds_min.2,
+        ];
+        let longest = extent[0].max(extent[1]).max(extent[2]);
+        // Cells across the longest extent itself, margin excluded.
+        let longest_inner = longest_cells.saturating_sub(margin_cells).max(1);
+        let cell = longest / longest_inner as f64;
+
+        let axis = |extent: f64, min: f64| -> (f64, f64, usize) {
+            // Whole cells across this extent; `as usize` saturates, and maps
+            // the NaN of a zero-sized model to 0.
+            let inner = ((extent / cell).round() as usize).clamp(1, longest_inner);
+            let cell_size = if extent > 0.0 {
+                extent / inner as f64
+            } else {
+                cell
+            };
+            let base = (inner + margin_cells).div_ceil(depth_cells);
+            (min - 0.5 * margin_cells as f64 * cell_size, cell_size, base)
+        };
+        let (x, y, z) = (
+            axis(extent[0], bounds_min.0),
+            axis(extent[1], bounds_min.1),
+            axis(extent[2], bounds_min.2),
+        );
+        Self {
+            origin: (x.0, y.0, z.0),
+            cell_size: (x.1, y.1, z.1),
+            base_cells: (x.2, y.2, z.2),
+            max_depth: config.max_depth,
+        }
+    }
+
+    /// Finest-level cells per axis.
+    pub fn finest_cells(&self) -> (usize, usize, usize) {
+        let depth_cells = 1usize << self.max_depth;
+        (
+            self.base_cells.0 * depth_cells,
+            self.base_cells.1 * depth_cells,
+            self.base_cells.2 * depth_cells,
+        )
+    }
+}
+
 /// A unique identifier for a cuboid at a specific position and depth.
 ///
 /// Uses explicit (x, y, z, depth) representation for clarity and debuggability.
@@ -365,7 +481,7 @@ impl CuboidId {
     ///
     /// # Arguments
     /// * `dx, dy, dz` - Direction offset (-1, 0, or 1)
-    /// * `max_cells` - Number of cells at this depth level (original grid)
+    /// * `max_cells` - Number of cells per axis at this depth level (original grid)
     /// * `boundary_expansion` - Number of extra cells to allow beyond the grid on each side
     ///   (e.g., 1 means allow cells from -1 to max_cells inclusive)
     pub fn neighbor(
@@ -373,20 +489,19 @@ impl CuboidId {
         dx: i32,
         dy: i32,
         dz: i32,
-        max_cells: i32,
+        max_cells: (i32, i32, i32),
         boundary_expansion: i32,
     ) -> Option<CuboidId> {
         let nx = self.x + dx;
         let ny = self.y + dy;
         let nz = self.z + dz;
         let min_valid = -boundary_expansion;
-        let max_valid = max_cells + boundary_expansion;
         if nx >= min_valid
-            && nx < max_valid
+            && nx < max_cells.0 + boundary_expansion
             && ny >= min_valid
-            && ny < max_valid
+            && ny < max_cells.1 + boundary_expansion
             && nz >= min_valid
-            && nz < max_valid
+            && nz < max_cells.2 + boundary_expansion
         {
             Some(CuboidId::new(nx, ny, nz, self.depth))
         } else {
@@ -781,8 +896,10 @@ pub struct MeshingStats2 {
     pub total_vertices: usize,
     pub total_triangles: usize,
 
-    /// Configuration used
-    pub effective_resolution: usize,
+    /// The grid meshed on: finest-level cells and cell edge length per axis
+    /// (see [`MeshGrid`])
+    pub grid_cells: (usize, usize, usize),
+    pub cell_size: (f64, f64, f64),
 
     /// Stage 4.5: Sharp feature reconstruction (when enabled)
     pub stage4_5_time_secs: f64,
@@ -927,7 +1044,10 @@ impl MeshingStats2 {
         );
         println!("  Total vertices: {}", self.total_vertices);
         println!("  Total triangles: {}", self.total_triangles);
-        println!("  Effective resolution: {}³", self.effective_resolution);
+        println!(
+            "  Grid: {} x {} x {} cells",
+            self.grid_cells.0, self.grid_cells.1, self.grid_cells.2
+        );
         println!("================================================");
     }
 }
@@ -1025,50 +1145,57 @@ where
 /// This ensures surface detection at boundaries where the model meets empty space.
 ///
 /// # Algorithm
-/// 1. Create an expanded grid of (base_resolution + 3)³ sample points
-///    - Covers cells from -1 to base_resolution (inclusive)
+/// 1. Create an expanded grid of (base cells + 3) sample points per axis
+///    - Covers cells from -1 to the base cell count (inclusive)
 /// 2. Sample all corner points to determine inside/outside state
 /// 3. For each cell, check if corners have mixed states (surface crosses cell)
 /// 4. Return WorkQueueEntry for each mixed cell with all 8 corners known
 fn stage1_coarse_discovery<F>(
     sampler: &F,
-    bounds_min: (f64, f64, f64),
-    bounds_max: (f64, f64, f64),
+    grid: &MeshGrid,
     config: &AdaptiveMeshConfig2,
     stats: &SamplingStats,
 ) -> Vec<WorkQueueEntry>
 where
     F: SamplerFn,
 {
-    let res = config.base_resolution;
-
     // Expand the grid by 1 cell on each side to detect surfaces at the boundary.
     // This handles models that perfectly fill their advertised bounds.
     // Grid now covers cells from -1 to res (inclusive), so res+2 cells per axis.
-    let expanded_cells = res + 2;
-    let num_corners = expanded_cells + 1; // res + 3 corners per axis
-
-    // Cell size at depth 0 (coarsest level) - based on original bounds
-    let cell_size = (
-        (bounds_max.0 - bounds_min.0) / res as f64,
-        (bounds_max.1 - bounds_min.1) / res as f64,
-        (bounds_max.2 - bounds_min.2) / res as f64,
+    let expanded_cells = (
+        grid.base_cells.0 + 2,
+        grid.base_cells.1 + 2,
+        grid.base_cells.2 + 2,
+    );
+    // res + 3 corners per axis
+    let num_corners = (
+        expanded_cells.0 + 1,
+        expanded_cells.1 + 1,
+        expanded_cells.2 + 1,
     );
 
-    // Expanded bounds: start one cell before bounds_min
+    // Cell size at depth 0 (coarsest level)
+    let depth_cells = (1usize << grid.max_depth) as f64;
+    let cell_size = (
+        grid.cell_size.0 * depth_cells,
+        grid.cell_size.1 * depth_cells,
+        grid.cell_size.2 * depth_cells,
+    );
+
+    // Expanded bounds: start one cell before the grid origin
     let expanded_min = (
-        bounds_min.0 - cell_size.0,
-        bounds_min.1 - cell_size.1,
-        bounds_min.2 - cell_size.2,
+        grid.origin.0 - cell_size.0,
+        grid.origin.1 - cell_size.1,
+        grid.origin.2 - cell_size.2,
     );
 
     // Sample all corner points into a 3D array
     // Layout: corners[z][y][x] for cache-friendly Z-slice iteration
-    let mut corners = vec![vec![vec![false; num_corners]; num_corners]; num_corners];
+    let mut corners = vec![vec![vec![false; num_corners.0]; num_corners.1]; num_corners.2];
 
-    for iz in 0..num_corners {
-        for iy in 0..num_corners {
-            for ix in 0..num_corners {
+    for iz in 0..num_corners.2 {
+        for iy in 0..num_corners.1 {
+            for ix in 0..num_corners.0 {
                 let x = expanded_min.0 + ix as f64 * cell_size.0;
                 let y = expanded_min.1 + iy as f64 * cell_size.1;
                 let z = expanded_min.2 + iz as f64 * cell_size.2;
@@ -1082,9 +1209,9 @@ where
     // Cell indices now go from -1 to res (i.e., 0..expanded_cells in array coords)
     let mut work_queue = Vec::new();
 
-    for iz in 0..expanded_cells {
-        for iy in 0..expanded_cells {
-            for ix in 0..expanded_cells {
+    for iz in 0..expanded_cells.2 {
+        for iy in 0..expanded_cells.1 {
+            for ix in 0..expanded_cells.0 {
                 // Gather the 8 corner samples for this cell using canonical corner ordering
                 let cell_corners: [bool; 8] = [
                     corners[iz][iy][ix],             // corner 0: (0,0,0)
@@ -1400,14 +1527,14 @@ fn shared_corners_with_neighbor(dx: i32, dy: i32, dz: i32) -> [(usize, usize); 4
 /// # Arguments
 /// * `current` - The current work queue entry
 /// * `dx, dy, dz` - Direction to the neighbor
-/// * `max_cells` - Number of cells at this depth level (original grid)
+/// * `max_cells` - Number of cells per axis at this depth level (original grid)
 /// * `boundary_expansion` - Number of extra cells to allow beyond the grid on each side
 fn create_neighbor_entry(
     current: &WorkQueueEntry,
     dx: i32,
     dy: i32,
     dz: i32,
-    max_cells: i32,
+    max_cells: (i32, i32, i32),
     boundary_expansion: i32,
 ) -> Option<WorkQueueEntry> {
     let neighbor_cuboid = current
@@ -1526,7 +1653,7 @@ fn process_work_entry<F>(
     bounds_min: (f64, f64, f64),
     cell_size: (f64, f64, f64),
     max_depth: u8,
-    base_res: i32,
+    base_cells: (i32, i32, i32),
     visited: &DashSet<CuboidId>,
     stats: &SamplingStats,
 ) -> ProcessedEntry
@@ -1580,7 +1707,11 @@ where
         emit_triangles_for_cell(&entry.cuboid, corner_mask, max_depth, &mut triangles, stats);
 
         // Expand to neighbors (frontier expansion)
-        let cells_at_depth = base_res * (1i32 << current_depth);
+        let cells_at_depth = (
+            base_cells.0 << current_depth,
+            base_cells.1 << current_depth,
+            base_cells.2 << current_depth,
+        );
 
         const NEIGHBOR_DIRS: [(i32, i32, i32); 6] = [
             (-1, 0, 0),
@@ -1611,13 +1742,10 @@ where
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn stage2_subdivision_and_emission<F>(
     initial_queue: Vec<WorkQueueEntry>,
     sampler: &F,
-    bounds_min: (f64, f64, f64),
-    cell_size: (f64, f64, f64),
-    config: &AdaptiveMeshConfig2,
+    grid: &MeshGrid,
     stats: &SamplingStats,
     cancel: &AtomicBool,
     progress: &dyn Fn(crate::BuildProgress),
@@ -1625,8 +1753,13 @@ fn stage2_subdivision_and_emission<F>(
 where
     F: SamplerFn,
 {
-    let max_depth = config.max_depth as u8;
-    let base_res = config.base_resolution as i32;
+    let max_depth = grid.max_depth as u8;
+    let base_cells = (
+        grid.base_cells.0 as i32,
+        grid.base_cells.1 as i32,
+        grid.base_cells.2 as i32,
+    );
+    let (bounds_min, cell_size) = (grid.origin, grid.cell_size);
 
     // Deduplication set: tracks CuboidIds we've already processed or queued
     let visited: DashSet<CuboidId> = DashSet::new();
@@ -1678,7 +1811,7 @@ where
                 };
             }
             process_work_entry(
-                entry, sampler, bounds_min, cell_size, max_depth, base_res, &visited, stats,
+                entry, sampler, bounds_min, cell_size, max_depth, base_cells, &visited, stats,
             )
         });
 
@@ -2931,6 +3064,8 @@ fn stage5_decimation(
 /// * `bounds_max` - Maximum corner of bounding box
 /// * `config` - Algorithm configuration
 ///
+/// Meshes on [`MeshGrid::tiling`] of the bounds.
+///
 /// # Returns
 /// A MeshingResult2 containing the indexed mesh and detailed profiling statistics
 pub fn adaptive_surface_nets_2<F>(
@@ -2966,19 +3101,21 @@ pub fn adaptive_surface_nets_2_cancellable<F>(
 where
     F: SamplerFn,
 {
-    adaptive_surface_nets_2_monitored(sampler, bounds_min, bounds_max, config, cancel, &|_| {})
+    let f64s = |v: (f32, f32, f32)| (v.0 as f64, v.1 as f64, v.2 as f64);
+    let grid = MeshGrid::tiling(f64s(bounds_min), f64s(bounds_max), config);
+    adaptive_surface_nets_2_monitored(sampler, &grid, config, cancel, &|_| {})
 }
 
-/// [`adaptive_surface_nets_2_cancellable`] with progress reporting:
-/// `progress` receives a [`crate::BuildProgress`] at every stage transition,
+/// [`adaptive_surface_nets_2_cancellable`] on an explicit [`MeshGrid`]
+/// (`config`'s `base_resolution` and `max_depth` are already folded into it)
+/// and with progress reporting: `progress` receives a [`crate::BuildProgress`] at every stage transition,
 /// plus throttled live cell counts during subdivision (the stage whose
 /// duration is least predictable). Fractions are omitted — an adaptive
 /// mesher cannot estimate its total work up front. The callback runs on the
 /// meshing thread itself, so it must be cheap.
 pub fn adaptive_surface_nets_2_monitored<F>(
     sampler: F,
-    bounds_min: (f32, f32, f32),
-    bounds_max: (f32, f32, f32),
+    grid: &MeshGrid,
     config: &AdaptiveMeshConfig2,
     cancel: &AtomicBool,
     progress: &dyn Fn(crate::BuildProgress),
@@ -2995,33 +3132,13 @@ where
     let total_start = Instant::now();
     let stats = SamplingStats::default();
 
-    // Convert bounds to f64 for internal calculations
-    let bounds_min_f64 = (
-        bounds_min.0 as f64,
-        bounds_min.1 as f64,
-        bounds_min.2 as f64,
-    );
-    let bounds_max_f64 = (
-        bounds_max.0 as f64,
-        bounds_max.1 as f64,
-        bounds_max.2 as f64,
-    );
-
-    // Calculate cell size at finest level (per-axis for non-cubic bounds)
-    // Total cells at finest level = base_resolution * 2^max_depth
-    let finest_cells_per_axis = config.base_resolution * (1 << config.max_depth);
-    let cell_size = (
-        (bounds_max_f64.0 - bounds_min_f64.0) / finest_cells_per_axis as f64,
-        (bounds_max_f64.1 - bounds_min_f64.1) / finest_cells_per_axis as f64,
-        (bounds_max_f64.2 - bounds_min_f64.2) / finest_cells_per_axis as f64,
-    );
+    let (bounds_min_f64, cell_size) = (grid.origin, grid.cell_size);
 
     // Stage 1: Coarse grid discovery
     report("discovering surface".to_string());
     let stage1_start = Instant::now();
     let samples_before_stage1 = stats.total_samples.load(Ordering::Relaxed);
-    let initial_work_queue =
-        stage1_coarse_discovery(&sampler, bounds_min_f64, bounds_max_f64, config, &stats);
+    let initial_work_queue = stage1_coarse_discovery(&sampler, grid, config, &stats);
     let stage1_time = stage1_start.elapsed().as_secs_f64();
     let stage1_samples = stats.total_samples.load(Ordering::Relaxed) - samples_before_stage1;
     let stage1_probe_seeds = initial_work_queue
@@ -3042,9 +3159,7 @@ where
     let sparse_triangles = stage2_subdivision_and_emission(
         initial_work_queue,
         &sampler,
-        bounds_min_f64,
-        cell_size,
-        config,
+        grid,
         &stats,
         cancel,
         progress,
@@ -3156,7 +3271,8 @@ where
         total_samples,
         total_vertices: mesh.vertices.len(),
         total_triangles: mesh.indices.len() / 3,
-        effective_resolution: finest_cells_per_axis,
+        grid_cells: grid.finest_cells(),
+        cell_size,
         stage4_5_time_secs: stage4_5_time,
         sharp_regions: sharp_stats.regions,
         sharp_candidates: sharp_stats.candidates,
@@ -3202,6 +3318,169 @@ mod tests {
         let config = AdaptiveMeshConfig2::default();
         assert_eq!(config.base_resolution, 8);
         assert_eq!(config.max_depth, 4);
+    }
+
+    // =========================================================================
+    // Grid Tests
+    // =========================================================================
+
+    fn grid_config(base_resolution: usize, max_depth: usize) -> AdaptiveMeshConfig2 {
+        AdaptiveMeshConfig2 {
+            base_resolution,
+            max_depth,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn grid_of_cubic_bounds_is_the_resolution_cubed() {
+        let grid = MeshGrid::tiling((-1.0, -1.0, -1.0), (1.0, 1.0, 1.0), &grid_config(8, 3));
+        assert_eq!(grid.origin, (-1.0, -1.0, -1.0));
+        assert_eq!(grid.base_cells, (8, 8, 8));
+        assert_eq!(grid.finest_cells(), (64, 64, 64));
+        assert_eq!(grid.cell_size, (2.0 / 64.0, 2.0 / 64.0, 2.0 / 64.0));
+    }
+
+    /// The longest axis gets the full resolution; the others get cells of the
+    /// same size (to within half a cell over their extent), and the grid
+    /// planes still land on the bounds.
+    #[test]
+    fn grid_cells_are_near_cubic_on_stretched_bounds() {
+        // The keychain sleeve's proportions: 84.3 x 41.9 x 18.6.
+        let (lo, hi) = ((0.0, 0.0, 0.0), (84.3, 41.9, 18.6));
+        let grid = MeshGrid::tiling(lo, hi, &grid_config(16, 5));
+        let cell = 84.3 / 512.0;
+        assert_eq!(grid.cell_size.0, cell);
+        for (size, extent) in [(grid.cell_size.1, 41.9), (grid.cell_size.2, 18.6)] {
+            let cells = extent / size;
+            assert!((cells - cells.round()).abs() < 1e-9, "bounds on a plane");
+            assert!(
+                (size / cell - 1.0).abs() <= 0.5 / cells,
+                "near-cubic: {size}"
+            );
+        }
+        // Whole depth-0 cells cover each extent, with less than one to spare.
+        let finest = grid.finest_cells();
+        assert_eq!(grid.base_cells.0, 16);
+        for (count, size, extent) in [
+            (finest.1, grid.cell_size.1, 41.9),
+            (finest.2, grid.cell_size.2, 18.6),
+        ] {
+            let covered = count as f64 * size;
+            assert!(covered >= extent - 1e-9);
+            assert!(covered < extent + 32.0 * size);
+        }
+    }
+
+    /// A padded grid puts both bounds planes of every axis mid-cell, 2.5
+    /// finest cells in from where the grid starts.
+    #[test]
+    fn padded_grid_puts_bounds_planes_mid_cell() {
+        for hi in [(2.0, 1.0, 1.0), (84.3, 41.9, 18.6), (1.0, 1.0, 1.0)] {
+            let lo = (0.0, 0.0, 0.0);
+            let grid = MeshGrid::padded(lo, hi, &grid_config(8, 5));
+            let axes = [
+                (grid.origin.0, grid.cell_size.0, hi.0),
+                (grid.origin.1, grid.cell_size.1, hi.1),
+                (grid.origin.2, grid.cell_size.2, hi.2),
+            ];
+            for (origin, size, max) in axes {
+                let min_plane = (0.0 - origin) / size;
+                let max_plane = (max - origin) / size;
+                assert!((min_plane - 2.5).abs() < 1e-9, "min plane at {min_plane}");
+                assert!(
+                    (max_plane - max_plane.floor() - 0.5).abs() < 1e-6,
+                    "max plane at {max_plane}"
+                );
+            }
+            // The longest axis spends exactly the configured resolution.
+            assert_eq!(grid.finest_cells().0, 256);
+            assert!((grid.cell_size.0 - hi.0 / 251.0).abs() < 1e-12);
+        }
+    }
+
+    /// An axis thinner than half a cell gets one cell spanning it, so a sheet
+    /// below the grid pitch still has a sample plane through it.
+    #[test]
+    fn grid_spans_a_sub_cell_axis_with_one_cell() {
+        let grid = MeshGrid::padded((0.0, 0.0, 0.0), (100.0, 50.0, 0.1), &grid_config(8, 4));
+        assert_eq!(grid.cell_size.2, 0.1);
+        assert_eq!(grid.base_cells.2, 1);
+        // A flat (zero-extent) axis keeps a usable cell size.
+        let flat = MeshGrid::tiling((0.0, 0.0, 0.0), (1.0, 1.0, 0.0), &grid_config(8, 0));
+        assert_eq!(flat.cell_size.2, 1.0 / 8.0);
+    }
+
+    /// A slab with the keychain sleeve's proportions (4.5 : 2.2 : 1) and
+    /// rounded edges five longest-axis cells in radius.
+    fn rounded_slab(x: f64, y: f64, z: f64) -> f32 {
+        let r = 3.2;
+        let q = (
+            (x.abs() - 40.13 + r).max(0.0),
+            (y.abs() - 19.87 + r).max(0.0),
+            (z.abs() - 8.31 + r).max(0.0),
+        );
+        let inside = (q.0 * q.0 + q.1 * q.1 + q.2 * q.2).sqrt() < r;
+        if inside { 1.0 } else { 0.0 }
+    }
+
+    const SLAB_BOUNDS: ((f32, f32, f32), (f32, f32, f32)) =
+        ((-42.0, -21.0, -9.3), (42.0, 21.0, 9.3));
+
+    fn free_refinement_config() -> AdaptiveMeshConfig2 {
+        AdaptiveMeshConfig2 {
+            base_resolution: 8,
+            max_depth: 4,
+            vertex_refinement_iterations: 12,
+            normal_sample_iterations: 0,
+            ..Default::default()
+        }
+    }
+
+    /// Regression for the folded-back triangles on stretched models (the
+    /// keychain sleeve, 2026-10). Free refinement moves each vertex up to
+    /// one longest cell from its edge midpoint; with the bounds split into
+    /// the same number of cells along every axis that was several cells
+    /// along the short axis, and on the rounded edges turning between the
+    /// long and the short axis the vertices overtook each other (see
+    /// `stretched_grid_folds_the_same_slab`). On near-cubic cells they stay
+    /// in order.
+    #[test]
+    fn free_refinement_on_a_stretched_slab_makes_no_fold_backs() {
+        let (lo, hi) = SLAB_BOUNDS;
+        let result = adaptive_surface_nets_2(rounded_slab, lo, hi, &free_refinement_config());
+        assert!(result.mesh.indices.len() > 3000, "the slab meshed");
+        assert_eq!(result.stats.grid_cells, (128, 64, 32));
+        assert_eq!(
+            crate::mesh_decimation::hard_fold_edge_count(
+                &result.mesh.vertices,
+                &result.mesh.indices
+            ),
+            0
+        );
+    }
+
+    /// The control for the test above: the same slab on the grid the mesher
+    /// used to build (128 cells along every axis) does fold. If this stops
+    /// failing, the test above no longer shows that cell shape matters.
+    #[test]
+    fn stretched_grid_folds_the_same_slab() {
+        let config = free_refinement_config();
+        let stretched = MeshGrid {
+            origin: (-42.0, -21.0, -9.3),
+            cell_size: (84.0 / 128.0, 42.0 / 128.0, 18.6 / 128.0),
+            base_cells: (8, 8, 8),
+            max_depth: 4,
+        };
+        let result =
+            adaptive_surface_nets_2_monitored(rounded_slab, &stretched, &config, &NEVER, &|_| {})
+                .expect("not cancelled");
+        assert!(
+            crate::mesh_decimation::hard_fold_edge_count(
+                &result.mesh.vertices,
+                &result.mesh.indices
+            ) > 100
+        );
     }
 
     // =========================================================================
@@ -3267,8 +3546,7 @@ mod tests {
 
         let _ = stage1_coarse_discovery(
             &sphere_sampler,
-            (-2.0, -2.0, -2.0),
-            (2.0, 2.0, 2.0),
+            &MeshGrid::tiling((-2.0, -2.0, -2.0), (2.0, 2.0, 2.0), &config),
             &config,
             &stats,
         );
@@ -3296,8 +3574,7 @@ mod tests {
 
         let work_queue = stage1_coarse_discovery(
             &sphere_sampler,
-            (-2.0, -2.0, -2.0),
-            (2.0, 2.0, 2.0),
+            &MeshGrid::tiling((-2.0, -2.0, -2.0), (2.0, 2.0, 2.0), &config),
             &config,
             &stats,
         );
@@ -3346,8 +3623,7 @@ mod tests {
 
         let work_queue = stage1_coarse_discovery(
             &tiny_sphere,
-            (-1.0, -1.0, -1.0),
-            (1.0, 1.0, 1.0),
+            &MeshGrid::tiling((-1.0, -1.0, -1.0), (1.0, 1.0, 1.0), &config),
             &config,
             &stats,
         );
@@ -3377,8 +3653,7 @@ mod tests {
         };
         let work_queue = stage1_coarse_discovery(
             &thin_slab_sampler,
-            (0.0, 0.0, 0.0),
-            (1.0, 1.0, 1.0),
+            &MeshGrid::tiling((0.0, 0.0, 0.0), (1.0, 1.0, 1.0), &blind),
             &blind,
             &stats,
         );
@@ -3393,8 +3668,7 @@ mod tests {
         };
         let work_queue = stage1_coarse_discovery(
             &thin_slab_sampler,
-            (0.0, 0.0, 0.0),
-            (1.0, 1.0, 1.0),
+            &MeshGrid::tiling((0.0, 0.0, 0.0), (1.0, 1.0, 1.0), &probing),
             &probing,
             &stats,
         );
@@ -3474,8 +3748,7 @@ mod tests {
 
         let work_queue = stage1_coarse_discovery(
             &half_space,
-            (0.0, 0.0, 0.0),
-            (1.0, 1.0, 1.0),
+            &MeshGrid::tiling((0.0, 0.0, 0.0), (1.0, 1.0, 1.0), &config),
             &config,
             &stats,
         );
@@ -3594,23 +3867,14 @@ mod tests {
         let bounds_min = (-2.0, -2.0, -2.0);
         let bounds_max = (2.0, 2.0, 2.0);
 
-        // Calculate cell size at finest level (per-axis)
-        let finest_cells = config.base_resolution * (1 << config.max_depth);
-        let cell_size = (
-            (bounds_max.0 - bounds_min.0) / finest_cells as f64,
-            (bounds_max.1 - bounds_min.1) / finest_cells as f64,
-            (bounds_max.2 - bounds_min.2) / finest_cells as f64,
-        );
+        let grid = MeshGrid::tiling(bounds_min, bounds_max, &config);
 
-        let initial_queue =
-            stage1_coarse_discovery(&sphere_sampler, bounds_min, bounds_max, &config, &stats);
+        let initial_queue = stage1_coarse_discovery(&sphere_sampler, &grid, &config, &stats);
 
         let triangles = stage2_subdivision_and_emission(
             initial_queue,
             &sphere_sampler,
-            bounds_min,
-            cell_size,
-            &config,
+            &grid,
             &stats,
             &NEVER,
             &|_| {},
@@ -3812,36 +4076,25 @@ mod tests {
 
         let bounds_min = (-1.5, -1.5, -1.5);
         let bounds_max = (1.5, 1.5, 1.5);
-        let finest_cells = config.base_resolution * (1 << config.max_depth);
-        let cell_size = (
-            (bounds_max.0 - bounds_min.0) / finest_cells as f64,
-            (bounds_max.1 - bounds_min.1) / finest_cells as f64,
-            (bounds_max.2 - bounds_min.2) / finest_cells as f64,
-        );
+        let grid = MeshGrid::tiling(bounds_min, bounds_max, &config);
 
         let stats1 = SamplingStats::default();
-        let initial_queue1 =
-            stage1_coarse_discovery(&sphere_sampler, bounds_min, bounds_max, &config, &stats1);
+        let initial_queue1 = stage1_coarse_discovery(&sphere_sampler, &grid, &config, &stats1);
         let triangles1 = stage2_subdivision_and_emission(
             initial_queue1,
             &sphere_sampler,
-            bounds_min,
-            cell_size,
-            &config,
+            &grid,
             &stats1,
             &NEVER,
             &|_| {},
         );
 
         let stats2 = SamplingStats::default();
-        let initial_queue2 =
-            stage1_coarse_discovery(&sphere_sampler, bounds_min, bounds_max, &config, &stats2);
+        let initial_queue2 = stage1_coarse_discovery(&sphere_sampler, &grid, &config, &stats2);
         let triangles2 = stage2_subdivision_and_emission(
             initial_queue2,
             &sphere_sampler,
-            bounds_min,
-            cell_size,
-            &config,
+            &grid,
             &stats2,
             &NEVER,
             &|_| {},
@@ -3868,15 +4121,9 @@ mod tests {
         let stats = SamplingStats::default();
         let bounds_min = (-1.0, -1.0, -1.0);
         let bounds_max = (1.0, 1.0, 1.0);
-        let finest_cells = config.base_resolution * (1 << config.max_depth);
-        let cell_size = (
-            (bounds_max.0 - bounds_min.0) / finest_cells as f64,
-            (bounds_max.1 - bounds_min.1) / finest_cells as f64,
-            (bounds_max.2 - bounds_min.2) / finest_cells as f64,
-        );
+        let grid = MeshGrid::tiling(bounds_min, bounds_max, &config);
 
-        let initial_queue =
-            stage1_coarse_discovery(&empty_sampler, bounds_min, bounds_max, &config, &stats);
+        let initial_queue = stage1_coarse_discovery(&empty_sampler, &grid, &config, &stats);
 
         // Empty space should produce no mixed cells
         assert!(
@@ -3887,9 +4134,7 @@ mod tests {
         let triangles = stage2_subdivision_and_emission(
             initial_queue,
             &empty_sampler,
-            bounds_min,
-            cell_size,
-            &config,
+            &grid,
             &stats,
             &NEVER,
             &|_| {},
@@ -4323,7 +4568,7 @@ mod tests {
             s.stage4_5_time_secs,
             s.stage5_time_secs,
             s.stage5_passes,
-            res = s.effective_resolution,
+            res = s.grid_cells.0,
         );
         println!(
             "  vertices {} triangles {} | sharp: {} regions, {} candidates, \
