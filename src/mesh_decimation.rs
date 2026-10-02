@@ -19,12 +19,17 @@
 //! cannot accumulate across successive collapses).
 //! Boundary edges (open surfaces where the model meets the sampling bounds)
 //! are pinned by perpendicular constraint quadrics and may only collapse
-//! along the boundary itself. Vertices whose entry shading normal disagrees
-//! with an incident face plane (unresolved shading discontinuities from the
-//! sharp-feature stage) are frozen out of collapses so the final normal
-//! re-accumulation cannot smear their blend across large triangles — unless
-//! such vertices are pervasive (thin-strut lattices), where the pin would
-//! defeat decimation and is disabled wholesale.
+//! along the boundary itself.
+//!
+//! Creases are kept one of two ways. With a feature-edge set (the
+//! sharp-feature stage's, see [`crate::sharp_features::feature_edges`]) a
+//! crease vertex may only collapse along its crease and a corner not at
+//! all; the set is kept current through the collapses and handed back for
+//! the final normal split. Without one, vertices whose entry shading normal
+//! disagrees with an incident face plane are frozen out of collapses so the
+//! normal re-accumulation cannot smear their blend across large triangles —
+//! unless such vertices are pervasive (thin-strut lattices), where the pin
+//! would defeat decimation and is disabled wholesale.
 //!
 //! The collapse schedule is threshold sweeps (in the spirit of Forstmann's
 //! fast quadric simplification) rather than a global priority queue: passes
@@ -34,6 +39,8 @@
 
 use crate::adaptive_surface_nets_2::IndexedMesh2;
 use crate::parallel_iter;
+use crate::sharp_features::feature_edges::{FeatureEdges, edge_key, feature_degrees};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use web_time::Instant;
 
@@ -168,12 +175,6 @@ fn normalize(v: [f64; 3]) -> Option<[f64; 3]> {
     Some([v[0] / len, v[1] / len, v[2] / len])
 }
 
-#[inline]
-fn edge_key(a: u32, b: u32) -> u64 {
-    let (lo, hi) = if a < b { (a, b) } else { (b, a) };
-    ((hi as u64) << 32) | lo as u64
-}
-
 /// Compressed vertex→face adjacency, rebuilt once per pass.
 struct VertexFaces {
     starts: Vec<u32>,
@@ -231,12 +232,22 @@ struct SweepMesh {
     quadrics: Vec<Quadric>,
     boundary_edges: std::collections::HashSet<u64>,
     boundary_vertex: Vec<bool>,
-    /// Pinned vertices take part in no collapse at all (neither endpoint).
-    /// The parallel path pins region-seam vertices: with both endpoints
+    /// Pinned vertices take part in no collapse at all (neither endpoint):
+    /// shading discontinuities without a feature set, sharp turns of a
+    /// crease with one (see [`feature_kinks`]).
+    /// The parallel path also pins region-seam vertices: with both endpoints
     /// unpinned, every face adjacent to either endpoint is inside the
     /// region, so link-condition and flip-guard reads are complete and no
     /// cross-region state is touched. Empty = nothing pinned.
     pinned: Vec<bool>,
+    /// Edges a crease runs along, kept current through collapses. A vertex
+    /// on a crease moves only along it, like a border vertex along its
+    /// border, so the crease keeps its line while its vertex count drops.
+    feature_edges: HashSet<u64>,
+    /// Feature edges meeting at each vertex: 0 for a smooth vertex, 2 on a
+    /// crease, anything else a corner, which never moves. Empty = the mesh
+    /// has no feature set.
+    feature_degree: Vec<u8>,
 }
 
 impl SweepMesh {
@@ -295,8 +306,18 @@ impl SweepMesh {
                     // boundary edge (which implies the target is boundary too).
                     let edge_is_boundary = !self.boundary_edges.is_empty()
                         && self.boundary_edges.contains(&edge_key(a, b));
-                    let can_move =
-                        |src: u32| !self.boundary_vertex[src as usize] || edge_is_boundary;
+                    // Feature rule: a crease vertex may only slide along
+                    // its crease; a corner stays where it is.
+                    let edge_is_feature = !self.feature_degree.is_empty()
+                        && self.feature_edges.contains(&edge_key(a, b));
+                    let can_move = |src: u32| {
+                        (!self.boundary_vertex[src as usize] || edge_is_boundary)
+                            && match self.feature_degree.get(src as usize) {
+                                None | Some(0) => true,
+                                Some(2) => edge_is_feature,
+                                Some(_) => false,
+                            }
+                    };
 
                     // Subset placement: try the cheaper direction first.
                     let err_a_to_b = combined_error(&self.quadrics, a, b, &self.positions);
@@ -332,6 +353,9 @@ impl SweepMesh {
                     });
 
                     if let Some((src, dst)) = chosen {
+                        if edge_is_feature {
+                            self.slide_feature_vertex(src, dst, &adjacency);
+                        }
                         self.quadrics[dst as usize] = {
                             let mut q = self.quadrics[dst as usize];
                             q.add(&self.quadrics[src as usize]);
@@ -373,6 +397,41 @@ impl SweepMesh {
     }
 }
 
+impl SweepMesh {
+    /// Crease vertex `src` is about to collapse onto `dst` along their
+    /// feature edge: its other feature edge, to `far`, becomes `dst`-`far`.
+    /// Must run before the faces are rewritten (it reads `src`'s fan).
+    fn slide_feature_vertex(&mut self, src: u32, dst: u32, adjacency: &VertexFaces) {
+        let mut far = None;
+        'fan: for &fi in adjacency.of(src) {
+            if self.deleted[fi as usize] {
+                continue;
+            }
+            for &x in &self.faces[fi as usize] {
+                if x != src && x != dst && self.feature_edges.contains(&edge_key(src, x)) {
+                    far = Some(x);
+                    break 'fan;
+                }
+            }
+        }
+        self.feature_edges.remove(&edge_key(src, dst));
+        self.feature_degree[src as usize] = 0;
+        let Some(far) = far else {
+            // Only possible if the set and the faces disagree; the crease
+            // then simply ends at `dst`.
+            self.feature_degree[dst as usize] -= 1;
+            return;
+        };
+        self.feature_edges.remove(&edge_key(src, far));
+        if !self.feature_edges.insert(edge_key(dst, far)) {
+            // `dst`-`far` was a feature edge already (the three formed a
+            // triangle of creases): both ends lose one.
+            self.feature_degree[dst as usize] -= 1;
+            self.feature_degree[far as usize] -= 1;
+        }
+    }
+}
+
 /// Single-threaded decimation over the whole face set.
 #[allow(clippy::type_complexity)]
 fn serial_decimate(
@@ -383,11 +442,13 @@ fn serial_decimate(
     boundary_edges: std::collections::HashSet<u64>,
     boundary_vertex: Vec<bool>,
     shading_pinned: Vec<bool>,
+    feature_edges: HashSet<u64>,
     budget: f64,
     ramp_passes: usize,
     cancel: &AtomicBool,
-) -> (Vec<[u32; 3]>, Vec<bool>, usize) {
+) -> (Vec<[u32; 3]>, Vec<bool>, HashSet<u64>, usize) {
     let deleted = vec![false; faces.len()];
+    let feature_degree = feature_degrees_or_none(&feature_edges, positions.len());
     let mut sweep = SweepMesh {
         positions,
         faces,
@@ -397,9 +458,68 @@ fn serial_decimate(
         boundary_edges,
         boundary_vertex,
         pinned: shading_pinned,
+        feature_edges,
+        feature_degree,
     };
     let passes = sweep.run_passes(budget, ramp_passes, cancel);
-    (sweep.faces, sweep.deleted, passes)
+    (sweep.faces, sweep.deleted, sweep.feature_edges, passes)
+}
+
+/// Cosine of the turn beyond which a crease vertex counts as a corner: its
+/// two feature edges leave it less than 135 degrees apart.
+const FEATURE_KINK_DOT: f64 = -0.707_106_781;
+
+/// Crease vertices (two feature edges) where the crease turns sharply.
+///
+/// Counting feature edges finds a corner where three creases meet. But the
+/// snap stage can leave a folded sliver at a corner that hides one of the
+/// three, and the corner then looks like a crease vertex and would slide
+/// off along one of the other two, cutting the corner by a cell. The turn
+/// gives it away. So does the sawtooth of a feature that never snapped,
+/// which must stay at cell pitch too. A resolved curved crease turns by one
+/// cell over its radius per vertex, far below this.
+///
+/// These are frozen for the whole run (taken at entry, before chords of a
+/// curved crease grow long enough to look like turns).
+fn feature_kinks(feature_edges: &HashSet<u64>, positions: &[[f64; 3]]) -> Vec<bool> {
+    use crate::sharp_features::feature_edges::edge_vertices;
+    // Up to two feature neighbours per vertex, and how many it has in all.
+    let mut neighbours = vec![([u32::MAX; 2], 0u8); positions.len()];
+    for &key in feature_edges {
+        let (a, b) = edge_vertices(key);
+        for (v, other) in [(a, b), (b, a)] {
+            let (slots, count) = &mut neighbours[v as usize];
+            if (*count as usize) < 2 {
+                slots[*count as usize] = other;
+            }
+            *count = count.saturating_add(1);
+        }
+    }
+    neighbours
+        .iter()
+        .enumerate()
+        .map(|(v, &(slots, count))| {
+            if count != 2 {
+                return false;
+            }
+            let to = |n: u32| normalize(sub(positions[n as usize], positions[v]));
+            match (to(slots[0]), to(slots[1])) {
+                (Some(d0), Some(d1)) => dot(d0, d1) > FEATURE_KINK_DOT,
+                // A feature edge without length: nothing to slide along.
+                _ => true,
+            }
+        })
+        .collect()
+}
+
+/// Per-vertex feature degrees, or empty (the sweep's "no feature set") when
+/// there are no feature edges.
+fn feature_degrees_or_none(feature_edges: &HashSet<u64>, vertex_count: usize) -> Vec<u8> {
+    if feature_edges.is_empty() {
+        Vec::new()
+    } else {
+        feature_degrees(feature_edges, vertex_count)
+    }
 }
 
 /// Parallel decimation: partition faces by centroid into a spatial grid, pin
@@ -417,11 +537,13 @@ fn parallel_decimate(
     boundary_edges: std::collections::HashSet<u64>,
     boundary_vertex: Vec<bool>,
     shading_pinned: Vec<bool>,
+    feature_edges: HashSet<u64>,
     budget: f64,
     ramp_passes: usize,
     cancel: &AtomicBool,
-) -> (Vec<[u32; 3]>, Vec<bool>, usize) {
+) -> (Vec<[u32; 3]>, Vec<bool>, HashSet<u64>, usize) {
     let vertex_count = positions.len();
+    let feature_degree = feature_degrees_or_none(&feature_edges, vertex_count);
 
     // ~8 buckets per worker so uneven surface density still load-balances.
     let workers = std::thread::available_parallelism()
@@ -503,6 +625,22 @@ fn parallel_decimate(
             }
             local
         };
+        // The region's feature edges: those on its own faces. An unpinned
+        // vertex has all its faces here, so all its feature edges too, and
+        // its global degree is its degree in the region.
+        let local_feature_edges: HashSet<u64> = if feature_degree.is_empty() {
+            HashSet::new()
+        } else {
+            let mut local = HashSet::new();
+            for (face, global_face) in local_faces.iter().zip(&bucket_faces) {
+                for k in 0..3 {
+                    if feature_edges.contains(&edge_key(global_face[k], global_face[(k + 1) % 3])) {
+                        local.insert(edge_key(face[k], face[(k + 1) % 3]));
+                    }
+                }
+            }
+            local
+        };
         let deleted = vec![false; local_faces.len()];
         let mut sweep = SweepMesh {
             positions: local_to_global
@@ -528,6 +666,15 @@ fn parallel_decimate(
                         || shading_pinned.get(g as usize).copied().unwrap_or(false)
                 })
                 .collect(),
+            feature_edges: local_feature_edges,
+            feature_degree: if feature_degree.is_empty() {
+                Vec::new()
+            } else {
+                local_to_global
+                    .iter()
+                    .map(|&g| feature_degree[g as usize])
+                    .collect()
+            },
         };
         let passes = sweep.run_passes(budget, ramp_passes, cancel);
         let mut survivors: Vec<[u32; 3]> = Vec::new();
@@ -538,11 +685,20 @@ fn parallel_decimate(
                 survivor_normals.push(sweep.original_normals[fi]);
             }
         }
+        let surviving_feature_edges: Vec<u64> = sweep
+            .feature_edges
+            .iter()
+            .map(|&key| {
+                let (a, b) = crate::sharp_features::feature_edges::edge_vertices(key);
+                edge_key(local_to_global[a as usize], local_to_global[b as usize])
+            })
+            .collect();
         (
             survivors,
             survivor_normals,
             local_to_global,
             sweep.quadrics,
+            surviving_feature_edges,
             passes,
         )
     });
@@ -553,8 +709,15 @@ fn parallel_decimate(
     let mut merged: Vec<[u32; 3]> = Vec::new();
     let mut merged_normals: Vec<[f64; 3]> = Vec::new();
     let mut region_passes = 0usize;
-    for (survivors, survivor_normals, local_to_global, local_quadrics, passes) in results {
+    // Every feature edge lies on a face of some region, so the regions'
+    // surviving sets together are the whole set (an edge between two seam
+    // vertices is reported, unchanged, by each region that has a face on it).
+    let mut feature_edges: HashSet<u64> = HashSet::new();
+    for (survivors, survivor_normals, local_to_global, local_quadrics, region_features, passes) in
+        results
+    {
         region_passes = region_passes.max(passes);
+        feature_edges.extend(region_features);
         for (local, &global) in local_to_global.iter().enumerate() {
             if vertex_bucket[global as usize] != SHARED {
                 quadrics[global as usize] = local_quadrics[local];
@@ -567,6 +730,7 @@ fn parallel_decimate(
     // Final serial passes dissolve the seams. No ramp: seam neighborhoods
     // are still at grid pitch, and everything else is already converged.
     let deleted = vec![false; merged.len()];
+    let feature_degree = feature_degrees_or_none(&feature_edges, vertex_count);
     let mut sweep = SweepMesh {
         positions,
         faces: merged,
@@ -576,9 +740,16 @@ fn parallel_decimate(
         boundary_edges,
         boundary_vertex,
         pinned: shading_pinned,
+        feature_edges,
+        feature_degree,
     };
     let final_passes = sweep.run_passes(budget, 0, cancel);
-    (sweep.faces, sweep.deleted, region_passes + final_passes)
+    (
+        sweep.faces,
+        sweep.deleted,
+        sweep.feature_edges,
+        region_passes + final_passes,
+    )
 }
 
 /// Face count above which the native build partitions the mesh into spatial
@@ -595,21 +766,27 @@ pub fn decimate_mesh(
     ramp_passes: usize,
 ) -> DecimationStats {
     static NEVER: AtomicBool = AtomicBool::new(false);
-    decimate_mesh_cancellable(mesh, error_tolerance, ramp_passes, &NEVER)
+    decimate_mesh_cancellable(mesh, None, error_tolerance, ramp_passes, &NEVER)
 }
 
 /// [`decimate_mesh`], checking `cancel` between collapse passes. On
 /// cancellation the remaining passes are skipped but the mesh is still
 /// compacted, so it stays valid (just less decimated than requested);
 /// callers that cancel are expected to discard the result anyway.
+///
+/// `features`, when given, are the mesh's feature edges: crease vertices
+/// then collapse only along their crease and corners stay, the shading pin
+/// is not used, and the set comes back renumbered to the decimated mesh.
 pub fn decimate_mesh_cancellable(
     mesh: &mut IndexedMesh2,
+    features: Option<&mut FeatureEdges>,
     error_tolerance: f64,
     ramp_passes: usize,
     cancel: &AtomicBool,
 ) -> DecimationStats {
     decimate_mesh_impl(
         mesh,
+        features,
         error_tolerance,
         ramp_passes,
         PARALLEL_FACE_THRESHOLD,
@@ -619,6 +796,7 @@ pub fn decimate_mesh_cancellable(
 
 fn decimate_mesh_impl(
     mesh: &mut IndexedMesh2,
+    features: Option<&mut FeatureEdges>,
     error_tolerance: f64,
     ramp_passes: usize,
     parallel_threshold: usize,
@@ -681,10 +859,10 @@ fn decimate_mesh_impl(
     }
 
     // Shading-discontinuity pin: a vertex whose entry shading normal
-    // disagrees with an incident face's plane marks a shading discontinuity
-    // the sharp-feature stage could not resolve (blended feature-zone
-    // vertex, crease-pocket residue). The quadric budget puts no bound on
-    // triangle growth around it — the surrounding surface is flat, so the
+    // disagrees with an incident face's plane sits on a crease that the
+    // mesh shades with one blended normal (this path runs without the
+    // sharp-feature stage). The quadric budget puts no bound on triangle
+    // growth around it — the surrounding surface is flat, so the
     // geometric error of collapsing it is zero — and the final normal
     // re-accumulation would interpolate the blend across arbitrarily large
     // collapsed triangles (measured: streaks spanning 100+ cells radiating
@@ -692,10 +870,17 @@ fn decimate_mesh_impl(
     // vertex out of collapses entirely keeps its halo at entry pitch:
     // sub-cell, visually inert. Curved surfaces don't need this — there the
     // error budget itself bounds how far normals can diverge.
+    //
+    // With a feature set the discontinuities are already edges of that set,
+    // and their vertices are held by the feature rule instead.
     const SHADING_PIN_DOT: f64 = 0.906_307_787; // cos 25 deg
+    let use_shading_pin = features.is_none();
     let mut shading_pinned = vec![false; vertex_count];
     let mut pinned_count = 0usize;
     for (fi, face) in faces.iter().enumerate() {
+        if !use_shading_pin {
+            break;
+        }
         let fnorm = face_normals[fi];
         if fnorm == [0.0; 3] {
             continue;
@@ -723,8 +908,15 @@ fn decimate_mesh_impl(
     // threshold separates the two populations (they overlap over 45-100 deg),
     // but the pinned FRACTION splits them by two orders of magnitude, so it
     // picks the regime.
-    if pinned_count * 10 > vertex_count {
+    if pinned_count * 10 > vertex_count || !use_shading_pin {
         shading_pinned = Vec::new();
+    }
+    let feature_edges: HashSet<u64> = match &features {
+        Some(features) => (**features).clone().into_keys(),
+        None => HashSet::new(),
+    };
+    if !feature_edges.is_empty() {
+        shading_pinned = feature_kinks(&feature_edges, &positions);
     }
 
     // Boundary detection: edges with exactly one incident face. ASN2 meshes
@@ -762,7 +954,7 @@ fn decimate_mesh_impl(
     let budget = error_tolerance * error_tolerance;
 
     #[cfg(feature = "native")]
-    let (faces, deleted, passes_run) = if faces.len() >= parallel_threshold {
+    let (faces, deleted, feature_edges, passes_run) = if faces.len() >= parallel_threshold {
         parallel_decimate(
             positions,
             faces,
@@ -771,6 +963,7 @@ fn decimate_mesh_impl(
             boundary_edges,
             boundary_vertex,
             shading_pinned,
+            feature_edges,
             budget,
             ramp_passes,
             cancel,
@@ -784,13 +977,14 @@ fn decimate_mesh_impl(
             boundary_edges,
             boundary_vertex,
             shading_pinned,
+            feature_edges,
             budget,
             ramp_passes,
             cancel,
         )
     };
     #[cfg(not(feature = "native"))]
-    let (faces, deleted, passes_run) = {
+    let (faces, deleted, feature_edges, passes_run) = {
         let _ = parallel_threshold;
         serial_decimate(
             positions,
@@ -800,6 +994,7 @@ fn decimate_mesh_impl(
             boundary_edges,
             boundary_vertex,
             shading_pinned,
+            feature_edges,
             budget,
             ramp_passes,
             cancel,
@@ -841,6 +1036,9 @@ fn decimate_mesh_impl(
         .collect();
     mesh.vertices = new_vertices;
     mesh.indices = new_indices;
+    if let Some(features) = features {
+        *features = FeatureEdges::from_keys(feature_edges).remapped(&remap);
+    }
 
     stats.vertices_after = mesh.vertices.len();
     stats.triangles_after = mesh.indices.len() / 3;
@@ -1215,7 +1413,7 @@ mod tests {
         );
         let before = mesh.indices.len() / 3;
         let cancel = AtomicBool::new(true);
-        let stats = decimate_mesh_cancellable(&mut mesh, cell(3), 6, &cancel);
+        let stats = decimate_mesh_cancellable(&mut mesh, None, cell(3), 6, &cancel);
         assert_eq!(stats.passes_run, 0);
         assert_eq!(stats.triangles_after, before, "no collapses ran");
         assert_eq!(mesh.indices.len() / 3, before);
@@ -1419,6 +1617,126 @@ mod tests {
         }
     }
 
+    /// Two flat sheets meeting at a 90-degree crease along y: the +z sheet
+    /// over x in [-m, 0] and the +x sheet hanging from it down to z = -m.
+    /// One vertex per position (the crease is not split).
+    fn tent(m: usize) -> IndexedMesh2 {
+        let (cols, rows) = (2 * m + 1, m + 1);
+        let mut vertices = Vec::new();
+        for j in 0..rows {
+            for i in 0..cols {
+                vertices.push(if i <= m {
+                    (i as f32 - m as f32, j as f32, 0.0)
+                } else {
+                    (0.0, j as f32, -((i - m) as f32))
+                });
+            }
+        }
+        let mut indices = Vec::new();
+        for j in 0..rows - 1 {
+            for i in 0..cols - 1 {
+                let v00 = (j * cols + i) as u32;
+                let v10 = v00 + 1;
+                let v01 = v00 + cols as u32;
+                let v11 = v01 + 1;
+                indices.extend_from_slice(&[v00, v10, v11, v00, v11, v01]);
+            }
+        }
+        IndexedMesh2 {
+            normals: vec![(0.0, 0.0, 0.0); vertices.len()],
+            vertices,
+            indices,
+        }
+    }
+
+    fn classify(mesh: &IndexedMesh2) -> FeatureEdges {
+        let positions: Vec<glam::DVec3> = mesh
+            .vertices
+            .iter()
+            .map(|&(x, y, z)| glam::DVec3::new(x as f64, y as f64, z as f64))
+            .collect();
+        FeatureEdges::classify(&positions, &mesh.indices, &Default::default())
+    }
+
+    /// Whether every face still lies in one of the tent's two sheets.
+    fn faces_stay_in_their_sheets(mesh: &IndexedMesh2) -> bool {
+        (0..mesh.indices.len() / 3).all(|t| {
+            let p = |k: usize| {
+                let (x, y, z) = mesh.vertices[mesh.indices[t * 3 + k] as usize];
+                [x as f64, y as f64, z as f64]
+            };
+            normalize(cross(sub(p(1), p(0)), sub(p(2), p(0))))
+                .is_some_and(|n| n[2] > 0.999 || n[0] > 0.999)
+        })
+    }
+
+    /// What must hold after decimating the tent with its crease as a feature:
+    /// every face still lies in one of the two sheets, the crease has thinned
+    /// out, and the feature set handed back is exactly the crease of the
+    /// decimated mesh. The last is the point: the planes' quadrics already
+    /// keep a clean crease in shape, but only a set kept current through the
+    /// collapses tells the normal split where the crease now runs.
+    fn assert_tent_kept_its_crease(mesh: &IndexedMesh2, features: &FeatureEdges, m: usize) {
+        assert!(faces_stay_in_their_sheets(mesh), "a face left its sheet");
+        assert!(
+            mesh.indices.len() / 3 < m * m / 4,
+            "the sheets collapsed: {} triangles",
+            mesh.indices.len() / 3
+        );
+        assert!(
+            (1..m / 2).contains(&features.len()),
+            "the crease thinned out but is still there: {} of {m} edges",
+            features.len()
+        );
+        assert_eq!(features, &classify(mesh), "the set is the mesh's crease");
+    }
+
+    #[test]
+    fn crease_vertices_slide_along_their_crease_only() {
+        let m = 12;
+        let mut mesh = tent(m);
+        let mut features = classify(&mesh);
+        assert_eq!(features.len(), m, "the crease, one edge per row");
+        decimate_mesh_cancellable(&mut mesh, Some(&mut features), 0.01, 6, &NEVER);
+        assert_tent_kept_its_crease(&mesh, &features, m);
+    }
+
+    /// The same through the region-parallel path: the feature set is split
+    /// across regions and merged back.
+    #[test]
+    fn parallel_path_keeps_the_crease_and_merges_the_feature_set() {
+        let m = 40;
+        let mut mesh = tent(m);
+        let mut features = classify(&mesh);
+        decimate_mesh_impl(&mut mesh, Some(&mut features), 0.01, 6, 0, &NEVER);
+        assert_tent_kept_its_crease(&mesh, &features, m);
+    }
+
+    /// A corner, where three creases meet, stays at any budget; without the
+    /// feature set the same cube loses vertices.
+    #[test]
+    fn a_corner_where_three_creases_meet_never_moves() {
+        let (positions, indices) = crate::sharp_features::feature_edges::unit_cube();
+        let cube = IndexedMesh2 {
+            vertices: positions
+                .iter()
+                .map(|p| (p.x as f32, p.y as f32, p.z as f32))
+                .collect(),
+            normals: vec![(0.0, 0.0, 0.0); positions.len()],
+            indices,
+        };
+        let mut mesh = cube.clone();
+        let mut features = classify(&mesh);
+        decimate_mesh_cancellable(&mut mesh, Some(&mut features), 10.0, 6, &NEVER);
+        assert_eq!(mesh.vertices.len(), 8);
+        assert_eq!(mesh.indices.len() / 3, 12);
+        assert_eq!(features.len(), 12);
+
+        let mut unruled = cube;
+        decimate_mesh_cancellable(&mut unruled, None, 10.0, 6, &NEVER);
+        assert!(unruled.vertices.len() < 8);
+    }
+
     /// A lone vertex whose shading normal disagrees with its (flat) fan is a
     /// shading discontinuity: collapsing around it would smear the blend
     /// across large triangles at re-accumulation. The pin must keep it and
@@ -1490,8 +1808,8 @@ mod tests {
         let mut serial = mesh_sampler(sampler, 3);
         let mut parallel = serial.clone();
         // usize::MAX forces the serial path, 0 forces region partitioning.
-        decimate_mesh_impl(&mut serial, cell(3), 6, usize::MAX, &NEVER);
-        decimate_mesh_impl(&mut parallel, cell(3), 6, 0, &NEVER);
+        decimate_mesh_impl(&mut serial, None, cell(3), 6, usize::MAX, &NEVER);
+        decimate_mesh_impl(&mut parallel, None, cell(3), 6, 0, &NEVER);
 
         assert!(parallel.indices.len() < serial.indices.len() * 3 / 2);
         // Same manifold guarantees as the serial path.
@@ -1522,7 +1840,7 @@ mod tests {
             3,
         );
         let before = mesh.indices.len() / 3;
-        decimate_mesh_impl(&mut mesh, cell(3), 6, 0, &NEVER);
+        decimate_mesh_impl(&mut mesh, None, cell(3), 6, 0, &NEVER);
         assert!(mesh.indices.len() / 3 < before);
         assert_eq!(component_count(mesh.vertices.len(), &mesh.indices), 1);
         let counts = edge_face_counts(&mesh.indices);

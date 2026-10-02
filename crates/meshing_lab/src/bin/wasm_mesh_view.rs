@@ -15,16 +15,18 @@
 //! `--dump-near x,y,z,r` prints final vertices+normals within `r` (inf-norm)
 //! of a point, flagging normals that aren't axis-aligned (useful on cubes).
 //! `--debug-corner x,y,z,r` (with `--no-sharp`) re-runs the sharp stages
-//! manually and reports per-vertex labels/snap outcomes plus the post-weld
-//! triangle-region assignment for the band — the workflow that root-caused
-//! the corner "dog ears" (region-less corner cap triangles).
+//! manually and reports per-vertex labels/snap outcomes plus, for the band's
+//! post-weld triangles, which edges are feature edges and each corner's
+//! feature degree — what decimation and the final normal split will act on.
 
 use glam::DVec3;
 use meshing_lab::render;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use volumetric::adaptive_surface_nets_2::AdaptiveMeshConfig2;
-use volumetric::sharp_features::{SharpFeatureConfig, adjacency, cleanup, fit, segmentation, snap};
+use volumetric::sharp_features::{
+    SharpFeatureConfig, adjacency, cleanup, feature_edges, fit, segmentation, snap,
+};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -179,9 +181,6 @@ fn main() {
     // Re-run the sharp pipeline stage by stage and dump per-stage state
     // near a point: --debug-corner x,y,z,r  (requires --no-sharp so the
     // meshed result is the raw stage-4 mesh, exactly what stage 4.5 sees).
-    // The triangle-region report replicates the crease split's INITIAL
-    // assignment (claimed corners + tie-break); the production code then
-    // resolves region-less crease-touching triangles geometrically.
     if let Some(spec) = args
         .iter()
         .position(|a| a == "--debug-corner")
@@ -306,7 +305,7 @@ fn main() {
             );
         }
 
-        // Weld + carry, exactly as apply_sharp_features does.
+        // Weld and classify, exactly as apply_sharp_features does.
         let cleaned = cleanup::weld_snapped_vertices(
             &snapped.positions,
             indices,
@@ -314,23 +313,26 @@ fn main() {
             cell,
             &sharp_config.cleanup,
         );
-        let mut welded_normals = vec![DVec3::ZERO; cleaned.positions.len()];
         let mut welded_labels: Vec<Option<u32>> = vec![None; cleaned.positions.len()];
-        let mut is_crease = vec![false; cleaned.positions.len()];
         for v in 0..positions.len() {
-            let out = cleaned.remap[v] as usize;
-            welded_normals[out] += normals[v];
             if let Some(label) = seg.labels[v] {
-                welded_labels[out] = Some(label);
-            }
-            if snapped.snapped[v].is_some() {
-                is_crease[out] = true;
+                welded_labels[cleaned.remap[v] as usize] = Some(label);
             }
         }
+        let features = feature_edges::FeatureEdges::classify(
+            &cleaned.positions,
+            &cleaned.indices,
+            &sharp_config.feature_edges,
+        );
+        let degree = features.degrees(cleaned.positions.len());
 
-        // Replicate the crease-split triangle-region assignment (the tie-break
-        // in split_crease_vertices) and report it for band triangles.
-        println!("--- post-weld band triangles (region assignment):");
+        // Band triangles with their feature edges (`=` between the corners
+        // they join) and each corner's feature degree: 0 smooth, 2 on a
+        // crease, anything else a corner that decimation will not move.
+        println!(
+            "--- post-weld band triangles ({} feature edges in the mesh):",
+            features.len()
+        );
         for (t, tri) in cleaned.indices.chunks_exact(3).enumerate() {
             let (a, b, c) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
             if !(near(cleaned.positions[a])
@@ -339,62 +341,26 @@ fn main() {
             {
                 continue;
             }
-            let mut candidates: Vec<(u32, DVec3)> = Vec::new();
-            for &v in tri {
-                if let Some(label) = welded_labels[v as usize] {
-                    match candidates.iter_mut().find(|(l, _)| *l == label) {
-                        Some((_, n)) => *n += welded_normals[v as usize],
-                        None => candidates.push((label, welded_normals[v as usize])),
-                    }
-                }
-            }
-            let face = (cleaned.positions[b] - cleaned.positions[a])
-                .cross(cleaned.positions[c] - cleaned.positions[a]);
-            let fn_unit = face.normalize_or_zero();
-            let assigned = match candidates.len() {
-                0 => "NONE(base-slot)".to_string(),
-                1 => region_name(candidates[0].0),
-                _ => {
-                    let winner = candidates
-                        .iter()
-                        .max_by(|(_, na), (_, nb)| {
-                            let da = face.dot(na.normalize_or_zero());
-                            let db = face.dot(nb.normalize_or_zero());
-                            da.total_cmp(&db)
-                        })
-                        .map(|&(l, _)| l)
-                        .unwrap();
-                    let opts: Vec<String> = candidates
-                        .iter()
-                        .map(|&(l, n)| {
-                            format!(
-                                "{}:{:+.2}",
-                                region_name(l),
-                                fn_unit.dot(n.normalize_or_zero())
-                            )
-                        })
-                        .collect();
-                    format!("TIE[{}]=>{}", opts.join(" "), region_name(winner))
-                }
-            };
-            let crease_corners: Vec<String> = tri
-                .iter()
-                .map(|&v| {
-                    let m = if is_crease[v as usize] { "*" } else { "" };
-                    let l = match welded_labels[v as usize] {
+            let fn_unit = (cleaned.positions[b] - cleaned.positions[a])
+                .cross(cleaned.positions[c] - cleaned.positions[a])
+                .normalize_or_zero();
+            let corners: Vec<String> = (0..3)
+                .map(|k| {
+                    let (v, next) = (tri[k], tri[(k + 1) % 3]);
+                    let label = match welded_labels[v as usize] {
                         Some(l) => region_name(l),
                         None => "UNCL".into(),
                     };
-                    format!("v{v}{m}({l})")
+                    let join = if features.contains(v, next) { "=" } else { " " };
+                    format!("v{v}({label},d{}){join}", degree[v as usize])
                 })
                 .collect();
             println!(
-                "  t{t:<6} fn=({:+.2},{:+.2},{:+.2}) {} corners: {}",
+                "  t{t:<6} fn=({:+.2},{:+.2},{:+.2}) corners: {}",
                 fn_unit.x,
                 fn_unit.y,
                 fn_unit.z,
-                assigned,
-                crease_corners.join(" "),
+                corners.join(" "),
             );
         }
     }
@@ -402,7 +368,8 @@ fn main() {
     // Optional exact-truth check for a z-aligned cylinder (r=1, z in 0..1):
     // per-vertex distance to the true surface, plus rim-band accuracy.
     if args.iter().any(|a| a == "--cyl-truth") {
-        let cell = 3.0 / (8usize << max_depth) as f64; // xy span / finest cells
+        let size = result.stats.cell_size;
+        let cell = size.0.max(size.1).max(size.2);
         let mut surf: Vec<f64> = Vec::new();
         let mut rim: Vec<f64> = Vec::new();
         for p in &positions {

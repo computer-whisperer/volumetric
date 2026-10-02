@@ -84,7 +84,15 @@
 //!    11: corners 3-7, min=(x+1, y+1, z)
 //! ```
 //!
-//! ## Algorithm Overview (4 Stages)
+//! ## Algorithm Overview
+//!
+//! Stages 1 to 4 build the mesh and are described here. The optional later
+//! stages have their own modules: 4.5 snaps vertices onto sharp edges and
+//! corners and marks the edges creases run along
+//! ([`crate::sharp_features`]), 5 decimates ([`crate::mesh_decimation`]),
+//! and 6 splits the shading normals at the creases
+//! ([`crate::sharp_features::normals`]). The mesh is one connected surface,
+//! one vertex per position, until stage 6.
 //!
 //! ### Stage 1: Coarse Grid Discovery
 //! Sample the volume at low resolution to find regions containing the surface.
@@ -142,7 +150,7 @@
 //!    to refine the intersection point
 //! 3. For confusing/ambiguous results, keep the vertex at its original position
 //! 4. If good refinement result, proceed to refine normal with additional bisections
-//! - Output: Final vertex positions and smoothed normals
+//! - Output: Refined vertex positions and smoothed normals
 //!
 //! ## Winding Consistency & Ambiguous Cases
 //!
@@ -920,7 +928,9 @@ pub struct MeshingStats2 {
     pub sharp_welded_vertices: usize,
     /// Triangles dropped because welding collapsed them
     pub sharp_dropped_triangles: usize,
-    /// Vertex copies created for per-region crease shading
+    /// Feature edges (creases) found on the welded mesh
+    pub sharp_feature_edges: usize,
+    /// Vertex copies created at feature edges for crease shading (stage 6)
     pub sharp_crease_splits: usize,
 
     /// Stage 5: decimation (when enabled)
@@ -2869,7 +2879,10 @@ where
 }
 
 /// Stage 4.5: sharp feature reconstruction (region segmentation, feature
-/// snapping, band weld). See [`crate::sharp_features`] for the pipeline.
+/// snapping, band weld, feature-edge classification). See
+/// [`crate::sharp_features`] for the pipeline. The mesh it returns is still
+/// one connected surface; its creases are split for shading only after
+/// decimation (stage 6).
 ///
 /// Sampler probes made for snap verification are counted in `stats`.
 fn stage4_5_sharp_features<F>(
@@ -2879,7 +2892,11 @@ fn stage4_5_sharp_features<F>(
     cell_size: (f64, f64, f64),
     stats: &SamplingStats,
     cancel: &AtomicBool,
-) -> Option<(IndexedMesh2, crate::sharp_features::SharpFeatureStats)>
+) -> Option<(
+    IndexedMesh2,
+    crate::sharp_features::feature_edges::FeatureEdges,
+    crate::sharp_features::SharpFeatureStats,
+)>
 where
     F: SamplerFn,
 {
@@ -2907,7 +2924,7 @@ where
         }),
         indices: out.indices,
     };
-    Some((mesh, out.stats))
+    Some((mesh, out.feature_edges, out.stats))
 }
 
 /// Convert Stage4Result to IndexedMesh2 (when sharp feature processing is skipped)
@@ -3044,6 +3061,7 @@ where
 /// Returns (time_secs, passes_run, triangles_before); zeros when disabled.
 fn stage5_decimation(
     mesh: &mut IndexedMesh2,
+    features: Option<&mut crate::sharp_features::feature_edges::FeatureEdges>,
     config: &AdaptiveMeshConfig2,
     cell_size: (f64, f64, f64),
     cancel: &AtomicBool,
@@ -3054,6 +3072,7 @@ fn stage5_decimation(
     let min_cell = cell_size.0.min(cell_size.1).min(cell_size.2);
     let stats = crate::mesh_decimation::decimate_mesh_cancellable(
         mesh,
+        features,
         decimation.error_tolerance_cells * min_cell,
         decimation.ramp_passes,
         cancel,
@@ -3094,7 +3113,7 @@ where
 /// `None` once the flag is observed set — the mesh under construction is
 /// discarded, there is no partial result. Cancellation latency is bounded by
 /// the longest unchecked span (the stage-3 parallel sorts and the serial
-/// sharp-feature phases: segmentation, weld, crease split): a few seconds at
+/// sharp-feature phases: segmentation, weld, the final normal split): a few seconds at
 /// high resolution.
 pub fn adaptive_surface_nets_2_cancellable<F>(
     sampler: F,
@@ -3218,22 +3237,25 @@ where
 
     // Stage 4.5: Sharp feature reconstruction (when enabled)
     let stage4_5_start = Instant::now();
-    let (mut mesh, sharp_stats) = if let Some(ref sharp_config) = config.sharp_features {
-        report("reconstructing sharp features".to_string());
-        stage4_5_sharp_features(
-            stage4_result,
-            sharp_config,
-            &sampler,
-            cell_size,
-            &stats,
-            cancel,
-        )?
-    } else {
-        (
-            stage4_result_to_mesh(stage4_result),
-            crate::sharp_features::SharpFeatureStats::default(),
-        )
-    };
+    let (mut mesh, mut feature_edges, sharp_stats) =
+        if let Some(ref sharp_config) = config.sharp_features {
+            report("reconstructing sharp features".to_string());
+            let (mesh, feature_edges, sharp_stats) = stage4_5_sharp_features(
+                stage4_result,
+                sharp_config,
+                &sampler,
+                cell_size,
+                &stats,
+                cancel,
+            )?;
+            (mesh, Some(feature_edges), sharp_stats)
+        } else {
+            (
+                stage4_result_to_mesh(stage4_result),
+                None,
+                crate::sharp_features::SharpFeatureStats::default(),
+            )
+        };
     let stage4_5_time = stage4_5_start.elapsed().as_secs_f64();
 
     if cancel.load(Ordering::Relaxed) {
@@ -3245,11 +3267,17 @@ where
         report(format!("decimating {} triangles", mesh.indices.len() / 3));
     }
     let (stage5_time, stage5_passes, stage5_triangles_before) =
-        stage5_decimation(&mut mesh, config, cell_size, cancel);
+        stage5_decimation(&mut mesh, feature_edges.as_mut(), config, cell_size, cancel);
 
     if cancel.load(Ordering::Relaxed) {
         return None;
     }
+
+    // Stage 6: split shading normals along the feature edges. Last, so the
+    // mesh stays one connected surface through decimation.
+    let crease_splits = feature_edges.as_ref().map_or(0, |feature_edges| {
+        crate::sharp_features::normals::split_normals_at_features(&mut mesh, feature_edges)
+    });
 
     let total_time = total_start.elapsed().as_secs_f64();
     let total_samples = stats.total_samples.load(Ordering::Relaxed);
@@ -3285,7 +3313,8 @@ where
         sharp_snapped_corners: sharp_stats.snapped_corners,
         sharp_welded_vertices: sharp_stats.welded_vertices,
         sharp_dropped_triangles: sharp_stats.dropped_triangles,
-        sharp_crease_splits: sharp_stats.crease_splits,
+        sharp_feature_edges: sharp_stats.feature_edges,
+        sharp_crease_splits: crease_splits,
         stage5_time_secs: stage5_time,
         stage5_passes,
         stage5_triangles_before,
@@ -3486,6 +3515,92 @@ mod tests {
                 &result.mesh.indices
             ) > 100
         );
+    }
+
+    // =========================================================================
+    // Sharp + Simplify Tests
+    // =========================================================================
+
+    /// Undirected edges used by exactly one triangle once vertices at the
+    /// same position are merged: real gaps, not crease copies.
+    fn open_edges_by_position(mesh: &IndexedMesh2) -> usize {
+        let key = |v: u32| {
+            let (x, y, z) = mesh.vertices[v as usize];
+            (x.to_bits(), y.to_bits(), z.to_bits())
+        };
+        let mut uses = std::collections::HashMap::new();
+        for tri in mesh.indices.chunks_exact(3) {
+            for k in 0..3 {
+                let (a, b) = (key(tri[k]), key(tri[(k + 1) % 3]));
+                *uses
+                    .entry(if a <= b { (a, b) } else { (b, a) })
+                    .or_insert(0usize) += 1;
+            }
+        }
+        uses.values().filter(|&&n| n == 1).count()
+    }
+
+    /// Regression for the tearing of sharp + simplify meshes (2026-10): the
+    /// crease split used to run before decimation, each side of a crease
+    /// then decimated as a separate border, and the sides came apart (2,192
+    /// open edges on a plain box). The split now runs last. A box must come
+    /// out closed, a few dozen triangles from sixteen thousand, and shaded
+    /// flat face by face.
+    #[test]
+    fn sharp_and_simplified_box_is_closed_small_and_crisp() {
+        // Off the grid planes and not a cube, so nothing lines up by luck.
+        let half = glam::DVec3::new(0.713, 0.527, 0.391);
+        let slab = move |x: f64, y: f64, z: f64| -> f32 {
+            let inside = x.abs() < half.x && y.abs() < half.y && z.abs() < half.z;
+            if inside { 1.0 } else { 0.0 }
+        };
+        let config = AdaptiveMeshConfig2 {
+            base_resolution: 8,
+            max_depth: 3,
+            sharp_features: Some(SharpFeatureConfig::default()),
+            decimation: Some(crate::mesh_decimation::DecimationConfig::default()),
+            ..Default::default()
+        };
+        let result = adaptive_surface_nets_2(slab, (-0.9, -0.9, -0.9), (0.9, 0.9, 0.9), &config);
+        let mesh = &result.mesh;
+        assert_eq!(open_edges_by_position(mesh), 0, "torn");
+        // 12 triangles would be exact. The snap stage still leaves a folded
+        // sliver or two at some corners of an off-grid box, and those keep
+        // their handful of vertices.
+        let triangles = mesh.indices.len() / 3;
+        assert!(triangles <= 60, "{triangles} triangles");
+
+        let position = |v: u32| {
+            let (x, y, z) = mesh.vertices[v as usize];
+            glam::DVec3::new(x as f64, y as f64, z as f64)
+        };
+        for sx in [-1.0, 1.0] {
+            for sy in [-1.0, 1.0] {
+                for sz in [-1.0, 1.0] {
+                    let corner = half * glam::DVec3::new(sx, sy, sz);
+                    assert!(
+                        (0..mesh.vertices.len() as u32)
+                            .any(|v| (position(v) - corner).length() < 1e-3),
+                        "corner {corner:?} was not recovered"
+                    );
+                }
+            }
+        }
+        // Crisp: by area, the surface shades with its own face's normal.
+        let (mut crisp, mut total) = (0.0, 0.0);
+        for tri in mesh.indices.chunks_exact(3) {
+            let face =
+                (position(tri[1]) - position(tri[0])).cross(position(tri[2]) - position(tri[0]));
+            let flat = tri.iter().all(|&v| {
+                let (x, y, z) = mesh.normals[v as usize];
+                glam::DVec3::new(x as f64, y as f64, z as f64).dot(face.normalize()) > 0.9998
+            });
+            total += face.length();
+            if flat {
+                crisp += face.length();
+            }
+        }
+        assert!(crisp / total > 0.999, "crisp fraction {}", crisp / total);
     }
 
     // =========================================================================

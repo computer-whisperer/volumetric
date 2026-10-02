@@ -8,6 +8,12 @@
 //! feature zone. Only triangles that lose a vertex to welding (two corners
 //! mapping to the same output vertex) are dropped; that cannot open a hole,
 //! because every neighbor sharing a welded edge sees the same collapse.
+//!
+//! The weld can leave a "cap": a triangle whose three vertices lie on one
+//! line (two welded vertices along a feature and a third between them). It
+//! has no area and no normal, and it hides the two-face edge the feature
+//! actually runs along. [`flip_zero_area_caps`] removes it by flipping its
+//! long edge, which changes no geometry.
 
 use crate::sharp_features::snap::SnapKind;
 use glam::DVec3;
@@ -37,6 +43,8 @@ pub struct CleanupResult {
     pub remap: Vec<u32>,
     pub welded_vertices: usize,
     pub dropped_triangles: usize,
+    /// Zero-area caps removed by an edge flip.
+    pub flipped_caps: usize,
 }
 
 /// Weld snapped vertices within the configured radius and drop collapsed
@@ -58,6 +66,7 @@ pub fn weld_snapped_vertices(
             remap: (0..positions.len() as u32).collect(),
             welded_vertices: 0,
             dropped_triangles: 0,
+            flipped_caps: 0,
         };
     }
 
@@ -171,13 +180,136 @@ pub fn weld_snapped_vertices(
         new_indices.extend_from_slice(&[a, b, c]);
     }
 
+    let flipped_caps = flip_zero_area_caps(&new_positions, &mut new_indices);
+
     CleanupResult {
         positions: new_positions,
         indices: new_indices,
         remap,
         welded_vertices,
         dropped_triangles,
+        flipped_caps,
     }
+}
+
+/// A triangle's unit normal, or `None` when it has no usable area: its
+/// height over its longest edge is under a millionth of that edge.
+pub fn face_unit_normal(a: DVec3, b: DVec3, c: DVec3) -> Option<DVec3> {
+    let cross = (b - a).cross(c - a);
+    let longest_sq = (b - a)
+        .length_squared()
+        .max((c - b).length_squared())
+        .max((a - c).length_squared());
+    // |cross| = longest edge x height.
+    (cross.length_squared() > 1e-12 * longest_sq * longest_sq).then(|| cross.normalize())
+}
+
+/// Remove zero-area caps: triangles `(a, b, c)` with `b` on the segment
+/// `a`-`c`. The cap and the face on the other side of `a`-`c` (third vertex
+/// `z`) are replaced by `(a, b, z)` and `(b, c, z)`, which cover exactly the
+/// same surface. Returns how many were removed.
+///
+/// A cap is left alone when the flip is not clean: its long edge is not
+/// shared with exactly one other face, or `b`-`z` is an edge already.
+pub fn flip_zero_area_caps(positions: &[DVec3], indices: &mut [u32]) -> usize {
+    let corners =
+        |indices: &[u32], t: usize| [indices[t * 3], indices[t * 3 + 1], indices[t * 3 + 2]];
+    let is_cap = |indices: &[u32], t: usize| {
+        let [a, b, c] = corners(indices, t).map(|v| positions[v as usize]);
+        face_unit_normal(a, b, c).is_none()
+    };
+    let tri_count = indices.len() / 3;
+    let mut flipped = 0usize;
+    // A flip can expose another cap behind it (a run of collinear vertices),
+    // so repeat; each round removes at least one or stops.
+    for _ in 0..8 {
+        let caps: Vec<usize> = (0..tri_count).filter(|&t| is_cap(indices, t)).collect();
+        if caps.is_empty() {
+            break;
+        }
+        // Faces around the caps' vertices, found in one scan.
+        let mut around: HashMap<u32, Vec<u32>> = HashMap::new();
+        for &t in &caps {
+            for v in corners(indices, t) {
+                around.entry(v).or_default();
+            }
+        }
+        for t in 0..tri_count {
+            for v in corners(indices, t) {
+                if let Some(faces) = around.get_mut(&v) {
+                    faces.push(t as u32);
+                }
+            }
+        }
+
+        let mut touched: Vec<bool> = vec![false; tri_count];
+        let mut flipped_this_round = 0usize;
+        for &t in &caps {
+            if touched[t] {
+                continue;
+            }
+            // Rotate so `b` is the vertex opposite the longest edge.
+            let tri = corners(indices, t);
+            let longest = (0..3)
+                .max_by(|&i, &j| {
+                    let len = |k: usize| {
+                        (positions[tri[(k + 1) % 3] as usize] - positions[tri[k] as usize])
+                            .length_squared()
+                    };
+                    len(i).total_cmp(&len(j))
+                })
+                .expect("three edges");
+            let (a, c, b) = (tri[longest], tri[(longest + 1) % 3], tri[(longest + 2) % 3]);
+            let (pa, pb, pc) = (
+                positions[a as usize],
+                positions[b as usize],
+                positions[c as usize],
+            );
+            let along = (pb - pa).dot(pc - pa);
+            if !(along > 0.0 && along < (pc - pa).length_squared()) {
+                continue; // `b` coincides with an end: not a cap
+            }
+            // The one other face on edge a-c.
+            let mut across = around[&a].iter().copied().filter(|&f| {
+                f as usize != t && !touched[f as usize] && corners(indices, f as usize).contains(&c)
+            });
+            let (Some(f), None) = (across.next(), across.next()) else {
+                continue;
+            };
+            let f = f as usize;
+            let face = corners(indices, f);
+            let Some(&z) = face.iter().find(|&&v| v != a && v != c) else {
+                continue;
+            };
+            let b_meets_z = around[&b]
+                .iter()
+                .any(|&g| !touched[g as usize] && corners(indices, g as usize).contains(&z));
+            if z == b || b_meets_z {
+                continue;
+            }
+            // `face` runs p -> q -> z with {p, q} = {a, c}; b goes between.
+            let k = face.iter().position(|&v| v == z).expect("z is a corner");
+            let (p, q) = (face[(k + 1) % 3], face[(k + 2) % 3]);
+            indices[t * 3..t * 3 + 3].copy_from_slice(&[p, b, z]);
+            indices[f * 3..f * 3 + 3].copy_from_slice(&[b, q, z]);
+            // Adjacency around these vertices is stale until the next round.
+            for v in [a, b, c, z] {
+                if let Some(faces) = around.get(&v) {
+                    for &g in faces {
+                        touched[g as usize] = true;
+                    }
+                }
+            }
+            touched[t] = true;
+            touched[f] = true;
+            flipped_this_round += 1;
+        }
+        flipped += flipped_this_round;
+        if flipped_this_round == 0 {
+            break;
+        }
+    }
+    flipped
 }
 
 /// Number of boundary edges: undirected edges used by exactly one triangle.
@@ -225,6 +357,58 @@ pub fn inward_facing_count(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A square (0,1,2,3) whose bottom edge 0-1 carries a midpoint vertex 4
+    /// used only by the triangle below it: the cap (0, 4, 1) sits between
+    /// the square's lower triangle and the triangles under the edge.
+    #[test]
+    fn cap_is_flipped_away_without_changing_the_surface() {
+        let positions = vec![
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(2.0, 0.0, 0.0),
+            DVec3::new(2.0, 2.0, 0.0),
+            DVec3::new(0.0, 2.0, 0.0),
+            DVec3::new(1.0, 0.0, 0.0),  // on edge 0-1
+            DVec3::new(1.0, -1.0, 0.0), // below
+        ];
+        let mut indices = vec![
+            0, 1, 2, // above the edge, on the long side
+            0, 2, 3, //
+            0, 4, 1, // the cap
+            0, 5, 4, // below, meeting the midpoint
+            4, 5, 1, //
+        ];
+        let area = |indices: &[u32]| -> f64 {
+            indices
+                .chunks_exact(3)
+                .map(|t| {
+                    let p = |k: usize| positions[t[k] as usize];
+                    (p(1) - p(0)).cross(p(2) - p(0)).z / 2.0
+                })
+                .sum()
+        };
+        let before = area(&indices);
+        let outline = boundary_edge_count(&indices);
+        assert_eq!(flip_zero_area_caps(&positions, &mut indices), 1);
+        assert_eq!(indices.len(), 15, "two triangles replaced by two");
+        assert!((area(&indices) - before).abs() < 1e-12);
+        for t in indices.chunks_exact(3) {
+            let p = |k: usize| positions[t[k] as usize];
+            assert!(
+                (p(1) - p(0)).cross(p(2) - p(0)).z > 0.1,
+                "every triangle has area and faces up: {t:?}"
+            );
+        }
+        assert_eq!(boundary_edge_count(&indices), outline, "same outline");
+    }
+
+    #[test]
+    fn mesh_without_caps_is_untouched() {
+        let (positions, mut indices) = tetrahedron();
+        let before = indices.clone();
+        assert_eq!(flip_zero_area_caps(&positions, &mut indices), 0);
+        assert_eq!(indices, before);
+    }
 
     // A closed tetrahedron: 4 vertices, 4 triangles, watertight.
     fn tetrahedron() -> (Vec<DVec3>, Vec<u32>) {

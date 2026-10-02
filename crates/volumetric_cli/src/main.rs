@@ -466,6 +466,7 @@ fn print_stats_summary(stats: &MeshingStats2) {
         );
         println!("  Welded vertices:     {}", stats.sharp_welded_vertices);
         println!("  Dropped triangles:   {}", stats.sharp_dropped_triangles);
+        println!("  Feature edges:       {}", stats.sharp_feature_edges);
         println!("  Crease splits:       {}", stats.sharp_crease_splits);
     }
 

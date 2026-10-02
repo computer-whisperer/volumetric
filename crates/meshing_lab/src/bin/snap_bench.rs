@@ -14,8 +14,9 @@ use glam::{DQuat, DVec3};
 use meshing_lab::cleanup::{
     CleanupConfig, boundary_edge_count, inward_facing_count, weld_snapped_vertices,
 };
-use meshing_lab::crease::split_crease_vertices;
+use meshing_lab::feature_edges::FeatureEdges;
 use meshing_lab::harness::mesh_shape_with_margin;
+use meshing_lab::normals::split_normals_at_features;
 use meshing_lab::oracle::{
     BoxShape, CylinderShape, MandelbulbShape, OracleShape, PolygonPrism, Rotated, SphereShape,
     standard_rotation,
@@ -24,6 +25,15 @@ use meshing_lab::render::{frame_bounds, render_plain, render_segments, render_sm
 use meshing_lab::segmentation::{SegmentationConfig, segment_regions};
 use meshing_lab::snap::{SnapConfig, SnapKind, snap_feature_vertices};
 use std::path::PathBuf;
+use volumetric::adaptive_surface_nets_2::IndexedMesh2;
+
+/// The mesh after the shading split, in the benchmark's own vector type.
+struct SplitMesh {
+    positions: Vec<DVec3>,
+    normals: Vec<DVec3>,
+    indices: Vec<u32>,
+    split_vertices: usize,
+}
 
 fn main() {
     let mut depths: Vec<usize> = Vec::new();
@@ -257,25 +267,44 @@ fn run_case(
         cleaned.welded_vertices, cleaned.dropped_triangles
     );
 
-    // -------- Crease split: per-region shading normals --------
+    // Region labels carried through the weld, for the segment render.
     let mut cleaned_labels: Vec<Option<u32>> = vec![None; cleaned.positions.len()];
-    let mut is_crease = vec![false; cleaned.positions.len()];
     for v in 0..m.positions.len() {
         if let Some(l) = seg.labels[v] {
             cleaned_labels[cleaned.remap[v] as usize] = Some(l);
         }
-        if result.snapped[v].is_some() {
-            is_crease[cleaned.remap[v] as usize] = true;
-        }
     }
-    let split = split_crease_vertices(
-        &cleaned.positions,
-        &cleaned_normals,
-        &cleaned.indices,
-        &cleaned_labels,
-        &is_crease,
-        m.cell,
-    );
+
+    // -------- Feature edges and the shading split at them --------
+    // (No decimation in between here: this benchmarks the snap, not stage 5.)
+    let features =
+        FeatureEdges::classify(&cleaned.positions, &cleaned.indices, &Default::default());
+    let feature_degree = features.degrees(cleaned.positions.len());
+    // "Crease" slots: the vertices on feature edges and the copies made of them.
+    let is_crease: Vec<bool> = feature_degree.iter().map(|&d| d > 0).collect();
+    let mut split_mesh = IndexedMesh2 {
+        vertices: cleaned
+            .positions
+            .iter()
+            .map(|p| (p.x as f32, p.y as f32, p.z as f32))
+            .collect(),
+        normals: cleaned_normals
+            .iter()
+            .map(|n| {
+                let n = n.normalize_or_zero();
+                (n.x as f32, n.y as f32, n.z as f32)
+            })
+            .collect(),
+        indices: cleaned.indices.clone(),
+    };
+    let split_vertices = split_normals_at_features(&mut split_mesh, &features);
+    let to_dvec3 = |v: &(f32, f32, f32)| DVec3::new(v.0 as f64, v.1 as f64, v.2 as f64);
+    let split = SplitMesh {
+        positions: split_mesh.vertices.iter().map(to_dvec3).collect(),
+        normals: split_mesh.normals.iter().map(to_dvec3).collect(),
+        indices: split_mesh.indices,
+        split_vertices,
+    };
 
     // Geometric seal: the split adds topological boundary edges along
     // creases, but every one must have a position-coincident partner, or the
@@ -313,8 +342,10 @@ fn run_case(
         }
     }
     print!(
-        "  crease split: {} copies | unsealed boundary edges {}",
-        split.split_vertices, unsealed
+        "  feature edges: {} | split: {} copies | unsealed boundary edges {}",
+        features.len(),
+        split.split_vertices,
+        unsealed
     );
     if crease_normal_errs.is_empty() {
         println!();
@@ -407,7 +438,7 @@ fn run_case(
         render_plain(&m.positions, &m.indices, bounds, &before);
         render_plain(&cleaned.positions, &cleaned.indices, bounds, &after);
 
-        // Smooth-shaded pair: blended single normals vs per-region copies.
+        // Smooth-shaded pair: blended single normals vs per-fan copies.
         // This is where crease shading quality shows; flat renders hide it.
         let blended = dir.join(format!("{}_d{}_smooth_blended.png", slug, max_depth));
         let crisp = dir.join(format!("{}_d{}_smooth_split.png", slug, max_depth));
