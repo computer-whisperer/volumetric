@@ -96,8 +96,17 @@ and keeps `focus` and `distance`.
 
 Every gesture is defined by a **gesture point** `P`: the world point under
 the cursor when the gesture starts, from the pick service (section 6). When
-the cursor is over background, `P` is where the cursor ray meets the plane
-through `focus` facing the camera.
+the cursor is over background, the centre `C` of the scene's bounds stands
+in for the missing surface: an orbit takes `P = C`, so the model turns in
+place wherever the press landed (with `C` outside the view, `P` is the
+middle of the view at `C`'s depth, so what is on screen stays there); a pan
+or zoom takes `P` where the cursor ray reaches `C`'s depth. Without a
+scene, or with `C` behind a perspective eye, `focus` takes `C`'s place.
+
+Rejected: anchoring a background orbit on the focus-plane point under the
+cursor (built first, 2026-10-05). It keeps one rule for every gesture, but
+the pivot is then a point of empty space, far from the part once cursor
+zooms have moved the focus, and the model swings around it.
 
 | Gesture | Behaviour | Invariant (unit-tested) |
 |---|---|---|
@@ -303,7 +312,7 @@ drags, and it works for any geometry source.
 
 Known limit: lines, points and splats are not geometry sources. They do
 not write the surface target, so a pick over a point-cloud or splat
-preview finds nothing and navigation falls back to the focus plane. Giving
+preview finds nothing and navigation treats it as background (section 3). Giving
 them a depth-only source is the fix if that fallback feels wrong in use;
 it needs a second pass for them, because WebGL2 cannot blend one colour
 target while writing another unblended.

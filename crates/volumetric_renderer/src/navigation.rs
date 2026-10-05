@@ -3,12 +3,13 @@
 //! A [`CameraControlScheme`] says which buttons mean which gesture; the
 //! [`Navigator`] carries a gesture from press to release. Every gesture is
 //! anchored on the world point under the cursor when it starts (from a
-//! pick of the last frame, or the focus plane where the pick found
-//! nothing), and that point stays under the cursor while the gesture runs.
+//! pick of the last frame), and that point stays under the cursor while
+//! the gesture runs. Where the pick found nothing the scene stands in:
+//! an orbit pivots on its centre, a pan or zoom works at its depth.
 
 use glam::{Vec2, Vec3};
 
-use crate::{Camera, OrbitMode};
+use crate::{Camera, OrbitMode, Projection};
 
 /// Camera control schemes matching popular 3D applications.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -162,6 +163,9 @@ pub struct Cursor {
     pub ndc: Vec2,
     /// The world point the last frame drew there, if it drew a surface.
     pub picked: Option<Vec3>,
+    /// The centre of the scene's bounds, if there is a scene: what a
+    /// gesture over background works about.
+    pub scene_center: Option<Vec3>,
 }
 
 struct Gesture {
@@ -186,20 +190,44 @@ pub struct Navigator {
 }
 
 impl Navigator {
-    /// The point a gesture starting at `cursor` is anchored on: the
-    /// picked surface point when it is in front of the eye, else where
-    /// the cursor's ray meets the plane through the focus.
-    fn anchor(camera: &Camera, cursor: Cursor, aspect: f32) -> (Vec3, f32) {
+    /// The point a gesture starting at `cursor` is anchored on, and its
+    /// depth in front of the eye: the picked surface point when there is
+    /// one in front of the eye.
+    ///
+    /// Over background the scene's centre stands in for the missing
+    /// surface. An orbit pivots on the centre itself, so the model turns
+    /// in place wherever the press landed; with the centre out of view it
+    /// pivots on the middle of the view at the centre's depth, so what is
+    /// on screen stays there. A pan or zoom is anchored where the
+    /// cursor's ray reaches the centre's depth. Without a scene, or with
+    /// its centre behind a perspective eye, the focus takes the centre's place.
+    fn anchor(camera: &Camera, action: CameraAction, cursor: Cursor, aspect: f32) -> (Vec3, f32) {
         if let Some(point) = cursor.picked {
             let depth = camera.depth_of(point);
             if depth.is_finite() && depth > 0.0 {
                 return (point, depth);
             }
         }
-        (
-            camera.point_at(cursor.ndc, aspect, camera.distance),
-            camera.distance,
-        )
+        let (center, depth) = cursor
+            .scene_center
+            .map(|center| (center, camera.depth_of(center)))
+            .filter(|&(_, depth)| {
+                depth.is_finite() && (depth > 0.0 || camera.projection == Projection::Orthographic)
+            })
+            .unwrap_or((camera.focus, camera.distance));
+        if action != CameraAction::Orbit {
+            return (camera.point_at(cursor.ndc, aspect, depth), depth);
+        }
+        let edge =
+            camera.point_at(Vec2::ONE, aspect, depth) - camera.point_at(Vec2::ZERO, aspect, depth);
+        let offset = center - camera.point_at(Vec2::ZERO, aspect, depth);
+        let in_view = offset.dot(camera.right()).abs() <= edge.dot(camera.right())
+            && offset.dot(camera.up()).abs() <= edge.dot(camera.up());
+        if in_view {
+            (center, depth)
+        } else {
+            (camera.point_at(Vec2::ZERO, aspect, depth), depth)
+        }
     }
 
     /// Advances a drag by `delta_px` (x right, y down). `cursor` is where
@@ -223,7 +251,8 @@ impl Navigator {
         }
         self.transition = None;
         if self.gesture.as_ref().is_none_or(|g| g.action != action) {
-            let (anchor, depth) = Self::anchor(camera, cursor, viewport_px.x / viewport_px.y);
+            let (anchor, depth) =
+                Self::anchor(camera, action, cursor, viewport_px.x / viewport_px.y);
             self.gesture = Some(Gesture {
                 action,
                 anchor,
@@ -265,7 +294,7 @@ impl Navigator {
         zoom_limits: (f32, f32),
     ) {
         self.transition = None;
-        let (anchor, _) = Self::anchor(camera, cursor, aspect);
+        let (anchor, _) = Self::anchor(camera, CameraAction::Zoom, cursor, aspect);
         camera.zoom_about(anchor, ZOOM_STEP.powf(steps), zoom_limits);
     }
 
@@ -306,7 +335,7 @@ impl Navigator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Projection, StandardView};
+    use crate::StandardView;
 
     const VIEWPORT: Vec2 = Vec2::new(800.0, 600.0);
     const LIMITS: (f32, f32) = (0.01, 100.0);
@@ -340,6 +369,7 @@ mod tests {
             let cursor = Cursor {
                 ndc: ndc_of(at),
                 picked: Some(picked),
+                scene_center: None,
             };
             let mut navigator = Navigator::default();
             for _ in 0..10 {
@@ -368,6 +398,7 @@ mod tests {
             let cursor = Cursor {
                 ndc: ndc_of(at),
                 picked: Some(picked),
+                scene_center: None,
             };
             let mut navigator = Navigator::default();
             for _ in 0..4 {
@@ -401,6 +432,7 @@ mod tests {
                 Cursor {
                     ndc: ndc_of(at),
                     picked: Some(picked),
+                    scene_center: None,
                 },
                 VIEWPORT.x / VIEWPORT.y,
                 LIMITS,
@@ -408,7 +440,8 @@ mod tests {
             assert!(camera.distance < start.distance * 0.75);
             assert!((on_screen(&camera, picked) - at).length() < 0.1);
 
-            // Background: the focus-plane point under the cursor stays.
+            // Background, no scene: the focus-plane point under the cursor
+            // stays.
             let mut camera = start.clone();
             let ndc = Vec2::new(0.5, 0.25);
             let on_plane = camera.point_at(ndc, VIEWPORT.x / VIEWPORT.y, camera.distance);
@@ -416,7 +449,11 @@ mod tests {
             navigator.wheel(
                 &mut camera,
                 -2.0,
-                Cursor { ndc, picked: None },
+                Cursor {
+                    ndc,
+                    picked: None,
+                    scene_center: None,
+                },
                 VIEWPORT.x / VIEWPORT.y,
                 LIMITS,
             );
@@ -425,16 +462,80 @@ mod tests {
         }
     }
 
-    /// A pick behind the eye is not an anchor; the focus plane is used.
+    /// Over background an orbit pivots on the scene's centre, not on a
+    /// point of empty space under the cursor; a pan or zoom is anchored
+    /// under the cursor at the centre's depth.
     #[test]
-    fn a_pick_behind_the_eye_falls_back_to_the_focus_plane() {
+    fn background_gestures_work_about_the_scene() {
+        for start in cameras() {
+            let center = start.focus + start.forward() * 0.6 + start.right() * 0.3;
+            let cursor = Cursor {
+                ndc: Vec2::new(-0.9, 0.8),
+                picked: None,
+                scene_center: Some(center),
+            };
+            let aspect = VIEWPORT.x / VIEWPORT.y;
+            let depth = start.depth_of(center);
+
+            let (pivot, pivot_depth) =
+                Navigator::anchor(&start, CameraAction::Orbit, cursor, aspect);
+            assert_eq!(pivot, center);
+            assert!((pivot_depth - depth).abs() < 1e-5);
+
+            let mut camera = start.clone();
+            let at = on_screen(&camera, center);
+            let mut navigator = Navigator::default();
+            for _ in 0..10 {
+                navigator.drag(
+                    &mut camera,
+                    CameraAction::Orbit,
+                    cursor,
+                    Vec2::new(-9.0, 14.0),
+                    VIEWPORT,
+                    OrbitMode::Turntable,
+                    LIMITS,
+                );
+            }
+            assert!((on_screen(&camera, center) - at).length() < 0.1);
+
+            for action in [CameraAction::Pan, CameraAction::Zoom] {
+                let (anchor, anchor_depth) = Navigator::anchor(&start, action, cursor, aspect);
+                assert!((anchor - start.point_at(cursor.ndc, aspect, depth)).length() < 1e-5);
+                assert!((anchor_depth - depth).abs() < 1e-5);
+            }
+        }
+    }
+
+    /// With the scene's centre out of view, a background orbit pivots on
+    /// the middle of the view at the centre's depth.
+    #[test]
+    fn a_background_orbit_keeps_an_off_screen_scene_out_of_it() {
+        for camera in cameras() {
+            let aspect = VIEWPORT.x / VIEWPORT.y;
+            let center = camera.point_at(Vec2::new(1.5, 0.0), aspect, 3.0);
+            let cursor = Cursor {
+                ndc: Vec2::new(0.2, 0.2),
+                picked: None,
+                scene_center: Some(center),
+            };
+            let (pivot, _) = Navigator::anchor(&camera, CameraAction::Orbit, cursor, aspect);
+            let depth = camera.depth_of(center);
+            assert!((pivot - camera.point_at(Vec2::ZERO, aspect, depth)).length() < 1e-5);
+        }
+    }
+
+    /// A pick behind the eye is not an anchor; without a scene the focus
+    /// is used.
+    #[test]
+    fn a_pick_behind_the_eye_falls_back_to_the_focus() {
         let camera = Camera::default();
         let behind = camera.eye() - camera.forward();
         let cursor = Cursor {
             ndc: Vec2::ZERO,
             picked: Some(behind),
+            scene_center: None,
         };
-        let (anchor, depth) = Navigator::anchor(&camera, cursor, 1.0);
+        let (anchor, depth) = Navigator::anchor(&camera, CameraAction::Orbit, cursor, 1.0);
         assert!((anchor - camera.focus).length() < 1e-5);
         assert_eq!(depth, camera.distance);
     }
@@ -447,10 +548,12 @@ mod tests {
         let first = Cursor {
             ndc: Vec2::ZERO,
             picked: Some(Vec3::new(0.1, 0.0, 0.0)),
+            scene_center: None,
         };
         let second = Cursor {
             ndc: Vec2::ZERO,
             picked: Some(Vec3::new(0.0, 0.0, 0.5)),
+            scene_center: None,
         };
         let drag = |navigator: &mut Navigator, camera: &mut Camera, action, cursor| {
             navigator.drag(
@@ -509,6 +612,7 @@ mod tests {
             Cursor {
                 ndc: Vec2::ZERO,
                 picked: None,
+                scene_center: None,
             },
             Vec2::ONE,
             VIEWPORT,

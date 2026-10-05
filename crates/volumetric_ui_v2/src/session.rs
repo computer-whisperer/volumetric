@@ -971,6 +971,9 @@ impl ViewportRenderer {
                 1.0 - (pos.1 - rect.y) / rect.h.max(1.0) * 2.0,
             ),
             picked,
+            scene_center: self
+                .scene_bounds
+                .map(|bounds| (bounds.min_vec3() + bounds.max_vec3()) * 0.5),
         }
     }
 
@@ -4665,8 +4668,9 @@ mod navigation_tests {
         }
     }
 
-    /// A press on empty background anchors on the focus plane, and a
-    /// standard-view command travels to the exact view over a few frames.
+    /// An orbit pressed on empty background turns the scene about its
+    /// own centre, and a standard-view command travels to the exact view
+    /// over a few frames.
     #[test]
     fn background_presses_and_view_commands() {
         let Some(mut rig) = Rig::new() else {
@@ -4681,7 +4685,29 @@ mod navigation_tests {
             renderer::CameraControlScheme::Blender,
         );
         assert_eq!(rig.session.press_pick, None, "the corner is background");
+        let center = Vec3::new(0.0, 0.0, 0.5);
+        rig.session.viewport.scene_bounds = Some(PreviewBounds {
+            min: (-0.5, -0.5, 0.0),
+            max: (0.5, 0.5, 1.0),
+        });
+        let before = rig.pointer_over(center);
+        let mut at = corner;
+        for _ in 0..6 {
+            at = (at.0 + 11.0, at.1 + 6.0);
+            assert!(rig.session.pointer_moved(
+                gpu(&rig.offscreen),
+                at,
+                KeyModifiers::default(),
+                navigation(renderer::OrbitMode::Turntable),
+            ));
+        }
         rig.session.pointer_up(PointerButton::Middle);
+        rig.frame(false);
+        let after = rig.pointer_over(center);
+        assert!(
+            distance(after, before) < 1.0,
+            "the scene's centre moved from {before:?} to {after:?}"
+        );
 
         rig.session
             .viewport
