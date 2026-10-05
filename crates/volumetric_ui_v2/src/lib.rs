@@ -14,7 +14,7 @@ pub use volumetric_preview::{
     Asn2Settings, BoundsCorners, LookThrough, MarkKind, MarkLabel, OutputStats, PreviewMeshPlan,
     PreviewPlan, PreviewRenderMode, PreviewRequest, format_count, mark_labels, viewset_detail,
 };
-use volumetric_renderer::CameraControlScheme;
+use volumetric_renderer::{CameraControlScheme, OrbitMode, StandardView};
 
 use damascene_core::SvgIcon;
 use damascene_core::image::Image;
@@ -172,7 +172,6 @@ pub const TOGGLE_BOUNDS_KEY: &str = "viewport:toggle-bounds";
 pub const TOGGLE_TINT_KEY: &str = "viewport:toggle-tint";
 pub const TOGGLE_SSAO_KEY: &str = "viewport:toggle-ssao";
 pub const FRAME_PREVIEW_KEY: &str = "viewport:frame-preview";
-pub const RESET_CAMERA_KEY: &str = "viewport:reset-camera";
 pub const EXIT_LOOK_KEY: &str = "viewport:exit-look";
 /// `{prefix}{asset id}:{view id}`: look through a view, or leave it when it
 /// is the one looked through. View ids carry no `:`; asset ids may.
@@ -204,6 +203,12 @@ const PIPELINE_KEY: &str = "pipeline";
 const MODE_SELECT_KEY: &str = "view:mode";
 const RESOLUTION_SELECT_KEY: &str = "view:res";
 const CAMERA_SELECT_KEY: &str = "view:camera";
+/// The camera menu: the standard views, then the projection, orbit-mode
+/// and reset actions (`VIEW_MENU_*`).
+const VIEW_SELECT_KEY: &str = "view:standard";
+const VIEW_MENU_PROJECTION: &str = "projection";
+const VIEW_MENU_ORBIT: &str = "orbit";
+const VIEW_MENU_RESET: &str = "reset";
 /// SSAO parameter popover trigger; steppers use `view:ssao-adj:{field}:{dir}`.
 const SSAO_SETTINGS_KEY: &str = "view:ssao";
 const SSAO_ADJUST_PREFIX: &str = "view:ssao-adj:";
@@ -611,6 +616,8 @@ pub enum ViewportCameraCommand {
     FramePreview,
     /// Return the camera to its default pose.
     Reset,
+    /// Turn to a standard view, keeping what is framed.
+    View(StandardView),
 }
 
 /// Lifecycle of the (host-driven) asynchronous project run.
@@ -1066,6 +1073,10 @@ pub struct VolumetricUiV2 {
     render_mode: PreviewRenderMode,
     preview_resolution: usize,
     camera_control_scheme: CameraControlScheme,
+    /// How an orbit drag turns the camera.
+    orbit_mode: OrbitMode,
+    /// Whether the viewport camera projects orthographically.
+    orthographic: bool,
     show_grid: bool,
     show_bounds: bool,
     /// Give uncolored models a muted per-output tint so flush-fitting
@@ -1239,6 +1250,8 @@ impl VolumetricUiV2 {
             render_mode: PreviewRenderMode::AdaptiveSurfaceNets2,
             preview_resolution: 64,
             camera_control_scheme: CameraControlScheme::default(),
+            orbit_mode: OrbitMode::default(),
+            orthographic: false,
             show_grid: true,
             show_bounds: false,
             tint_parts: false,
@@ -2146,6 +2159,18 @@ impl VolumetricUiV2 {
 
     pub fn camera_control_scheme(&self) -> CameraControlScheme {
         self.camera_control_scheme
+    }
+
+    /// How pointer input drives the viewport camera.
+    pub fn navigation(&self) -> session::Navigation {
+        session::Navigation {
+            scheme: self.camera_control_scheme,
+            orbit_mode: self.orbit_mode,
+        }
+    }
+
+    pub fn orthographic(&self) -> bool {
+        self.orthographic
     }
 
     pub(crate) fn set_preview_build_status(&mut self, status: PreviewBuildStatus) {
@@ -4041,6 +4066,7 @@ impl VolumetricUiV2 {
             MODE_SELECT_KEY,
             RESOLUTION_SELECT_KEY,
             CAMERA_SELECT_KEY,
+            VIEW_SELECT_KEY,
             PHOTO_OPACITY_SELECT_KEY,
             // Not value pickers (controls live inside), but the trigger and
             // dismiss-scrim routes follow the same shape; Pick never fires.
@@ -4080,6 +4106,7 @@ impl VolumetricUiV2 {
                                 self.set_camera_control_scheme(scheme);
                             }
                         }
+                        VIEW_SELECT_KEY => self.pick_view_menu(&value),
                         PHOTO_OPACITY_SELECT_KEY => {
                             if let Ok(percent) = value.parse::<u8>() {
                                 self.photo_opacity_percent = percent.min(100);
@@ -4096,6 +4123,43 @@ impl VolumetricUiV2 {
             return true;
         }
         false
+    }
+
+    /// One entry of the camera menu: a standard view to turn to, or one
+    /// of the projection, orbit-mode and reset actions.
+    fn pick_view_menu(&mut self, value: &str) {
+        match value {
+            VIEW_MENU_PROJECTION => {
+                self.orthographic = !self.orthographic;
+                self.status = if self.orthographic {
+                    "orthographic projection".to_string()
+                } else {
+                    "perspective projection".to_string()
+                };
+            }
+            VIEW_MENU_ORBIT => {
+                self.orbit_mode = match self.orbit_mode {
+                    OrbitMode::Turntable => OrbitMode::Free,
+                    OrbitMode::Free => OrbitMode::Turntable,
+                };
+                self.status = match self.orbit_mode {
+                    OrbitMode::Turntable => "turntable orbit: the horizon stays level".to_string(),
+                    OrbitMode::Free => "free orbit".to_string(),
+                };
+            }
+            VIEW_MENU_RESET => {
+                self.pending_camera_command = Some(ViewportCameraCommand::Reset);
+                self.exit_look_through();
+                self.status = "camera reset".to_string();
+            }
+            _ => {
+                if let Some(view) = standard_view_from_route(value) {
+                    self.pending_camera_command = Some(ViewportCameraCommand::View(view));
+                    self.exit_look_through();
+                    self.status = format!("{} view", view.name().to_lowercase());
+                }
+            }
+        }
     }
 
     fn set_camera_control_scheme(&mut self, scheme: CameraControlScheme) {
@@ -4561,13 +4625,6 @@ impl App for VolumetricUiV2 {
         if event.is_click_or_activate(FRAME_PREVIEW_KEY) {
             self.pending_camera_command = Some(ViewportCameraCommand::FramePreview);
             self.status = "framing preview".to_string();
-            return;
-        }
-
-        if event.is_click_or_activate(RESET_CAMERA_KEY) {
-            self.pending_camera_command = Some(ViewportCameraCommand::Reset);
-            self.exit_look_through();
-            self.status = "camera reset".to_string();
             return;
         }
 
@@ -5203,6 +5260,32 @@ fn select_layer(app: &VolumetricUiV2) -> Option<El> {
                     camera_scheme_tooltip(scheme),
                 )
             }),
+        )),
+        VIEW_SELECT_KEY => Some(select_menu(
+            VIEW_SELECT_KEY,
+            StandardView::ALL
+                .into_iter()
+                .map(|view| (view.name().to_lowercase(), view.name()))
+                // The actions are named for what picking them switches to.
+                .chain([
+                    (
+                        VIEW_MENU_PROJECTION.to_string(),
+                        if app.orthographic {
+                            "Perspective projection"
+                        } else {
+                            "Orthographic projection"
+                        },
+                    ),
+                    (
+                        VIEW_MENU_ORBIT.to_string(),
+                        if app.orbit_mode == OrbitMode::Free {
+                            "Turntable orbit"
+                        } else {
+                            "Free orbit"
+                        },
+                    ),
+                    (VIEW_MENU_RESET.to_string(), "Reset camera"),
+                ]),
         )),
         PHOTO_OPACITY_SELECT_KEY => Some(select_menu(
             PHOTO_OPACITY_SELECT_KEY,
@@ -6194,11 +6277,7 @@ fn view_controls_cluster(app: &VolumetricUiV2) -> El {
             .secondary()
             .tooltip("Frame the preview in view")
             .key(FRAME_PREVIEW_KEY),
-        button("Reset")
-            .xsmall()
-            .secondary()
-            .tooltip("Reset the camera to its default pose")
-            .key(RESET_CAMERA_KEY),
+        select_trigger(VIEW_SELECT_KEY, "View").width(Size::Fixed(64.0)),
         vertical_separator().height(Size::Fixed(20.0)),
         select_trigger(MODE_SELECT_KEY, app.render_mode.label()).width(Size::Fixed(90.0)),
         select_trigger(RESOLUTION_SELECT_KEY, app.preview_resolution.to_string())
@@ -7888,6 +7967,12 @@ fn camera_control_scheme_from_route(name: &str) -> Option<CameraControlScheme> {
         .iter()
         .copied()
         .find(|scheme| camera_scheme_route_name(*scheme) == name)
+}
+
+fn standard_view_from_route(name: &str) -> Option<StandardView> {
+    StandardView::ALL
+        .into_iter()
+        .find(|view| view.name().to_lowercase() == name)
 }
 
 fn camera_scheme_short_label(scheme: CameraControlScheme) -> &'static str {
@@ -9741,11 +9826,51 @@ mod tests {
         assert!((request.ssao_radius - 0.5 / 1.5).abs() < 1e-6);
         assert!((request.ssao_strength - 1.25).abs() < 1e-6);
 
-        dispatch(&mut app, UiEvent::synthetic_click(RESET_CAMERA_KEY));
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click("view:standard:option:reset"),
+        );
         assert_eq!(
             app.take_camera_command(),
             Some(ViewportCameraCommand::Reset)
         );
+    }
+
+    /// The camera menu's views raise camera commands, and its projection
+    /// and orbit-mode entries change what the session is told.
+    #[test]
+    fn view_controls_drive_the_camera_settings() {
+        let mut app = VolumetricUiV2::default();
+        assert!(!app.orthographic());
+        assert_eq!(app.navigation().orbit_mode, OrbitMode::Turntable);
+
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click("view:standard:option:top"),
+        );
+        assert_eq!(
+            app.take_camera_command(),
+            Some(ViewportCameraCommand::View(StandardView::Top))
+        );
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click("view:standard:option:isometric"),
+        );
+        assert_eq!(
+            app.take_camera_command(),
+            Some(ViewportCameraCommand::View(StandardView::Isometric))
+        );
+
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click("view:standard:option:projection"),
+        );
+        assert!(app.orthographic());
+        let orbit = || UiEvent::synthetic_click("view:standard:option:orbit");
+        dispatch(&mut app, orbit());
+        assert_eq!(app.navigation().orbit_mode, OrbitMode::Free);
+        dispatch(&mut app, orbit());
+        assert_eq!(app.navigation().orbit_mode, OrbitMode::Turntable);
     }
 
     #[test]
@@ -11306,7 +11431,10 @@ mod tests {
         assert!(app.look_photo().is_none(), "v4 carries no picture");
 
         // Reset leaves it and still resets the camera.
-        dispatch(&mut app, UiEvent::synthetic_click(RESET_CAMERA_KEY));
+        dispatch(
+            &mut app,
+            UiEvent::synthetic_click("view:standard:option:reset"),
+        );
         assert_eq!(app.summary().look_through, None);
         assert_eq!(
             app.take_camera_command(),

@@ -374,122 +374,62 @@ pub struct GridSettings {
     pub minor_color: [f32; 4],
     /// Lines between major lines
     pub subdivisions: u32,
-    /// Color for X axis line
-    pub x_axis_color: [f32; 4],
-    /// Color for Z axis line (on XZ plane)
-    pub z_axis_color: [f32; 4],
+    /// Colors of the lines along the world X, Y and Z axes
+    pub axis_colors: [[f32; 4]; 3],
 }
 
 impl Default for GridSettings {
     fn default() -> Self {
         Self {
-            planes: GridPlanes::XZ, // Ground plane only
+            planes: GridPlanes::XY, // The ground plane: +Z is up
             spacing: 1.0,
             extent: 10.0,
             major_color: [0.5, 0.5, 0.5, 0.8],
             minor_color: [0.3, 0.3, 0.3, 0.4],
             subdivisions: 5,
-            x_axis_color: [0.8, 0.2, 0.2, 1.0], // Red
-            z_axis_color: [0.2, 0.2, 0.8, 1.0], // Blue
+            axis_colors: [
+                [0.8, 0.2, 0.2, 1.0], // X red
+                [0.2, 0.7, 0.2, 1.0], // Y green
+                [0.2, 0.2, 0.8, 1.0], // Z blue
+            ],
         }
     }
 }
 
 impl GridSettings {
-    /// Generate line segments for the grid.
+    /// Generate line segments for the grid: on each enabled plane, lines
+    /// along both of its axes, the two through the origin in their axis's
+    /// color.
     pub fn generate_lines(&self) -> Vec<LineSegment> {
         let mut lines = Vec::new();
         let n = (self.extent / self.spacing) as i32;
-
-        if self.planes.xz {
-            // Ground plane (y = 0)
+        let planes = [
+            (self.planes.xy, 0, 1),
+            (self.planes.xz, 0, 2),
+            (self.planes.yz, 1, 2),
+        ];
+        for (_, a, b) in planes.into_iter().filter(|(enabled, ..)| *enabled) {
             for i in -n..=n {
-                let pos = i as f32 * self.spacing;
-                let is_major = i % self.subdivisions as i32 == 0;
-                let is_axis = i == 0;
-
-                // Line parallel to X axis (varying Z)
-                let color_z = if is_axis {
-                    self.x_axis_color
-                } else if is_major {
-                    self.major_color
-                } else {
-                    self.minor_color
-                };
-                lines.push(LineSegment {
-                    start: [-self.extent, 0.0, pos],
-                    end: [self.extent, 0.0, pos],
-                    color: color_z,
-                });
-
-                // Line parallel to Z axis (varying X)
-                let color_x = if is_axis {
-                    self.z_axis_color
-                } else if is_major {
-                    self.major_color
-                } else {
-                    self.minor_color
-                };
-                lines.push(LineSegment {
-                    start: [pos, 0.0, -self.extent],
-                    end: [pos, 0.0, self.extent],
-                    color: color_x,
-                });
+                let offset = i as f32 * self.spacing;
+                // A line along `along`, displaced by `offset` on `across`.
+                for (along, across) in [(a, b), (b, a)] {
+                    let color = if i == 0 {
+                        self.axis_colors[along]
+                    } else if i % self.subdivisions as i32 == 0 {
+                        self.major_color
+                    } else {
+                        self.minor_color
+                    };
+                    let mut start = [0.0; 3];
+                    let mut end = [0.0; 3];
+                    start[along] = -self.extent;
+                    end[along] = self.extent;
+                    start[across] = offset;
+                    end[across] = offset;
+                    lines.push(LineSegment { start, end, color });
+                }
             }
         }
-
-        if self.planes.xy {
-            // XY plane (z = 0)
-            for i in -n..=n {
-                let pos = i as f32 * self.spacing;
-                let is_major = i % self.subdivisions as i32 == 0;
-                let color = if is_major {
-                    self.major_color
-                } else {
-                    self.minor_color
-                };
-
-                // Line parallel to X
-                lines.push(LineSegment {
-                    start: [-self.extent, pos, 0.0],
-                    end: [self.extent, pos, 0.0],
-                    color,
-                });
-                // Line parallel to Y
-                lines.push(LineSegment {
-                    start: [pos, -self.extent, 0.0],
-                    end: [pos, self.extent, 0.0],
-                    color,
-                });
-            }
-        }
-
-        if self.planes.yz {
-            // YZ plane (x = 0)
-            for i in -n..=n {
-                let pos = i as f32 * self.spacing;
-                let is_major = i % self.subdivisions as i32 == 0;
-                let color = if is_major {
-                    self.major_color
-                } else {
-                    self.minor_color
-                };
-
-                // Line parallel to Y
-                lines.push(LineSegment {
-                    start: [0.0, -self.extent, pos],
-                    end: [0.0, self.extent, pos],
-                    color,
-                });
-                // Line parallel to Z
-                lines.push(LineSegment {
-                    start: [0.0, pos, -self.extent],
-                    end: [0.0, pos, self.extent],
-                    color,
-                });
-            }
-        }
-
         lines
     }
 }

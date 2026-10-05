@@ -32,7 +32,7 @@ use winit::window::{Window, WindowId};
 
 use crate::remote::RemoteBackend;
 use crate::session::{
-    BackgroundJob, BackgroundResult, ExecutionBackend, JobQueue, LocalBackend, Session,
+    BackgroundJob, BackgroundResult, ExecutionBackend, Gpu, JobQueue, LocalBackend, Session,
     ViewportRenderParams, execute_job_monitored, execute_job_with,
 };
 use crate::settings::UiSettings;
@@ -263,9 +263,13 @@ impl ApplicationHandler for Host {
                         let ly = position.y as f32 / scale;
                         self.last_pointer = Some((lx, ly));
                         if gfx.session.pointer_moved(
+                            Gpu {
+                                device: &gfx.device,
+                                queue: &gfx.queue,
+                            },
                             (lx, ly),
                             self.modifiers,
-                            self.app.camera_control_scheme(),
+                            self.app.navigation(),
                         ) {
                             gfx.window.request_redraw();
                         }
@@ -304,6 +308,10 @@ impl ApplicationHandler for Host {
                                     .is_hovering_within(crate::VIEWPORT_KEY)
                                 {
                                     gfx.session.pointer_down(
+                                        Gpu {
+                                            device: &gfx.device,
+                                            queue: &gfx.queue,
+                                        },
                                         (lx, ly),
                                         button,
                                         self.modifiers,
@@ -350,9 +358,12 @@ impl ApplicationHandler for Host {
                             .is_hovering_within(crate::VIEWPORT_KEY)
                         {
                             if gfx.session.wheel(
+                                Gpu {
+                                    device: &gfx.device,
+                                    queue: &gfx.queue,
+                                },
                                 (lx, ly),
                                 camera_scroll_delta,
-                                self.app.camera_control_scheme(),
                             ) {
                                 gfx.window.request_redraw();
                             }
@@ -584,6 +595,7 @@ impl Host {
             clear_color: bg_color(&palette),
             preview_requests,
             look_through,
+            orthographic: self.app.orthographic(),
         });
         gfx.damascene.render(
             &gfx.device,
@@ -601,6 +613,7 @@ impl Host {
             || viewport_resized
             || gfx.session.has_pending_preview()
             || gfx.session.has_pending_thumbnail()
+            || gfx.session.camera_animating()
             || gfx.session.has_pending_splat_sort()
             || gfx.session.run_in_flight()
             || self.app.has_pending_metadata()

@@ -14,7 +14,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use volumetric_renderer::CameraControlScheme;
+use volumetric_renderer::{CameraControlScheme, OrbitMode};
 
 use crate::{ExecutorChoice, PreviewRenderMode, VolumetricUiV2};
 
@@ -28,6 +28,10 @@ pub struct UiSettings {
     /// Camera scheme by [`CameraControlScheme::name`]; unknown names keep
     /// the app default.
     pub camera_control_scheme: String,
+    /// Orbit drags turn freely instead of as a turntable.
+    pub free_orbit: bool,
+    /// The viewport camera projects orthographically.
+    pub orthographic: bool,
     /// Preview mesher by its route name (`points` | `marching-cubes` |
     /// `asn2`); unknown names keep the app default.
     pub render_mode: String,
@@ -67,6 +71,8 @@ impl UiSettings {
             remote_address: app.remote_address.clone(),
             remote_build: app.remote_build,
             camera_control_scheme: app.camera_control_scheme.name().to_string(),
+            free_orbit: app.orbit_mode == OrbitMode::Free,
+            orthographic: app.orthographic,
             render_mode: app.render_mode.route_name().to_string(),
             preview_resolution: app.preview_resolution,
             show_grid: app.show_grid,
@@ -104,6 +110,12 @@ impl UiSettings {
         {
             app.camera_control_scheme = *scheme;
         }
+        app.orbit_mode = if self.free_orbit {
+            OrbitMode::Free
+        } else {
+            OrbitMode::Turntable
+        };
+        app.orthographic = self.orthographic;
         if let Some(mode) = PreviewRenderMode::from_route_name(&self.render_mode) {
             app.render_mode = mode;
         }
@@ -198,6 +210,8 @@ mod tests {
         let settings = UiSettings {
             remote_address: "http://daemon:7373".to_string(),
             camera_control_scheme: "Maya".to_string(),
+            free_orbit: true,
+            orthographic: true,
             render_mode: "points".to_string(),
             preview_resolution: 128,
             show_grid: false,

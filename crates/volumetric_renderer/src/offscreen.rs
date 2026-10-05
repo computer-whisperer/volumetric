@@ -178,11 +178,7 @@ impl Offscreen {
     /// What the last frame `renderer` drew has at `pixel`, waiting for the
     /// answer. `None` when there is no frame or the pixel is outside it.
     pub fn pick(&self, renderer: &mut Renderer, pixel: (u32, u32)) -> Option<Pick> {
-        renderer.request_pick(&self.device, &self.queue, pixel);
-        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
-        renderer
-            .pick_result(&self.device, &self.queue)
-            .filter(|pick| pick.pixel == pixel)
+        renderer.pick_now(&self.device, &self.queue, pixel)
     }
 }
 

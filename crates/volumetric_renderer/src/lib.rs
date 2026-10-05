@@ -31,6 +31,7 @@ mod buffer;
 mod camera;
 mod conversions;
 mod gbuffer;
+mod navigation;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod offscreen;
 mod pick;
@@ -44,9 +45,8 @@ mod frame_tests;
 
 pub use conversions::{convert_mesh_data, convert_points_to_point_data};
 
-pub use camera::{
-    Camera, CameraAction, CameraControlScheme, CameraInputState, CameraView, Pinhole, ViewDirection,
-};
+pub use camera::{Camera, CameraView, OrbitMode, Pinhole, Projection, StandardView};
+pub use navigation::{CameraAction, CameraControlScheme, CameraInputState, Cursor, Navigator};
 pub use pick::Pick;
 pub use pipelines::{
     GpuLines, GpuMesh, GpuPoints, GpuSplat, Warp, evaluate_sh, project_covariance,
@@ -138,6 +138,9 @@ struct SubmittedPoints {
     transform: Mat4,
     style: PointStyle,
 }
+
+/// The direction the fixed light shines from.
+pub(crate) const LIGHT_DIRECTION: [f32; 3] = [0.4, -0.2, 0.7];
 
 /// The grid's lines are their own batch, one pixel wide.
 const GRID_STYLE: LineStyle = LineStyle {
@@ -626,7 +629,9 @@ impl Renderer {
         self.resolve.write_uniforms(
             queue,
             &ResolveUniforms {
-                light_dir_world: [0.4, 0.7, 0.2],
+                // From above (+Z), a little to the +X, -Y side: the MVP's
+                // light, carried over to a z-up world.
+                light_dir_world: LIGHT_DIRECTION,
                 ao_enabled: ao_enabled as u32,
                 base_tint: [0.85, 0.9, 1.0],
                 _pad0: 0.0,
@@ -873,6 +878,32 @@ impl Renderer {
             self.request_pick(device, queue, pixel);
         }
         self.picker.latest()
+    }
+
+    /// What the last rendered frame drew at `pixel`, waiting for the
+    /// answer: for a press that must know now what it landed on. `None`
+    /// when there is no frame or the pixel is outside it.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn pick_now(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pixel: (u32, u32),
+    ) -> Option<Pick> {
+        self.last_frame?;
+        // The read asked for here may be queued behind one in flight:
+        // landing that one issues ours, which the second wait lands.
+        self.request_pick(device, queue, pixel);
+        for _ in 0..2 {
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            if let Some(pick) = self.pick_result(device, queue)
+                && pick.pixel == pixel
+                && !self.picker.busy()
+            {
+                return Some(pick);
+            }
+        }
+        None
     }
 
     /// Update the grid line cache if settings have changed.

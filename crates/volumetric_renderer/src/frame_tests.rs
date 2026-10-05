@@ -106,7 +106,7 @@ fn a_lit_surface_resolves_to_the_lighting_models_value() {
         assert_eq!(info.overflow, None);
 
         // Facing +Z under the fixed light: ambient plus the diffuse term.
-        let n_dot_l = Vec3::new(0.4, 0.7, 0.2).normalize().z;
+        let n_dot_l = Vec3::from(crate::LIGHT_DIRECTION).normalize().z;
         let shade = 0.22 + 0.78 * n_dot_l;
         let expected = [0.85, 0.9, 1.0].map(|tint: f32| srgb_byte(0.25 * tint * shade));
         let centre = pixel(&rgba, W / 2, H / 2);
@@ -365,9 +365,7 @@ fn dump_the_test_scene() {
     for points in &scene.points {
         renderer.submit_retained_points(points);
     }
-    let mut camera = crate::test_scenes::create_test_camera();
-    camera.fit_clip_planes();
-    let view = CameraView::from_camera(&camera, w as f32 / h as f32);
+    let view = crate::test_scenes::create_test_camera().view(w as f32 / h as f32, None);
     let (rgba, _) = offscreen
         .render_rgba(&mut renderer, &view, &RenderSettings::default())
         .unwrap();

@@ -26,7 +26,7 @@ use volumetric_preview::{
     wireframe_style,
 };
 use volumetric_renderer::{
-    Camera, CameraView, GridPlanes, LineData, MaterialId, ObjectId, RenderSettings, ViewDirection,
+    Camera, CameraView, GridPlanes, LineData, MaterialId, ObjectId, RenderSettings, StandardView,
     Warp, offscreen::Offscreen,
 };
 
@@ -170,36 +170,30 @@ impl ViewPreset {
         Self::ALL.into_iter().find(|preset| preset.suffix() == name)
     }
 
-    /// The eye and target of this preset framed to `min..max` at `fov_y`
-    /// in a world whose up is `up`: the orbit camera's y-up framing turned
-    /// by the rotation taking +y to `up`, so `top` looks down `up` and
-    /// `front` looks along the horizontal the viewport's front would.
-    pub fn framed(self, min: Vec3, max: Vec3, fov_y: f32, up: Vec3) -> (Vec3, Vec3) {
-        let camera = self.camera(min, max, fov_y);
-        let turn = Quat::from_rotation_arc(Vec3::Y, up);
-        let target = camera.target;
-        (target + turn * (camera.eye_position() - target), target)
-    }
-
-    /// The orbit camera for this preset, framed to `min..max` at `fov_y`.
-    pub fn camera(self, min: Vec3, max: Vec3, fov_y: f32) -> Camera {
-        let mut camera = Camera::new((min + max) * 0.5, 1.0);
-        camera.fov_y = fov_y;
-        let direction = match self {
-            Self::Front => ViewDirection::Front,
-            Self::Back => ViewDirection::Back,
-            Self::Left => ViewDirection::Left,
-            Self::Right => ViewDirection::Right,
-            Self::Top => ViewDirection::Top,
-            Self::Bottom => ViewDirection::Bottom,
-            Self::Iso | Self::IsoBack => ViewDirection::Isometric,
+    /// The camera of this preset, framed to `min..max` at `fov_y` for a
+    /// frame of `aspect`, in a world whose up is `up`: the viewport's
+    /// z-up standard view, turned by the rotation taking +z to `up`, so
+    /// `top` looks down `up` and `front` stays horizontal.
+    pub fn camera(self, min: Vec3, max: Vec3, fov_y: f32, aspect: f32, up: Vec3) -> Camera {
+        let standard = match self {
+            Self::Front => StandardView::Front,
+            Self::Back => StandardView::Back,
+            Self::Left => StandardView::Left,
+            Self::Right => StandardView::Right,
+            Self::Top => StandardView::Top,
+            Self::Bottom => StandardView::Bottom,
+            Self::Iso | Self::IsoBack => StandardView::Isometric,
         };
-        camera.view_from_direction(direction);
+        let mut orientation = standard.orientation();
         if self == Self::IsoBack {
-            camera.theta += std::f32::consts::PI;
+            orientation = Quat::from_rotation_z(std::f32::consts::PI) * orientation;
         }
-        camera.focus_on(min, max);
-        camera.fit_clip_planes();
+        let mut camera = Camera {
+            orientation: Quat::from_rotation_arc(Vec3::Z, up) * orientation,
+            fov_y,
+            ..Camera::default()
+        };
+        camera.frame(min, max, aspect);
         camera
     }
 }
@@ -445,7 +439,7 @@ pub fn preview_request(asset: &LoadedAsset, options: &PlanOptions) -> PreviewReq
 }
 
 /// The world's up for the frame: the option, else the up the drawn view
-/// sets and splats were surveyed in (the first found), else +y, with a
+/// sets and splats were surveyed in (the first found), else +z, with a
 /// note of where it came from.
 pub fn world_up(up: Option<Vec3>, assets: &[LoadedAsset]) -> Result<(Vec3, String)> {
     if let Some(up) = up {
@@ -476,7 +470,7 @@ pub fn world_up(up: Option<Vec3>, assets: &[LoadedAsset]) -> Result<(Vec3, Strin
             return Ok((up, format!("asset '{}'", asset.id())));
         }
     }
-    Ok((Vec3::Y, "default".to_string()))
+    Ok((Vec3::Z, "default".to_string()))
 }
 
 /// The ground grid's plane for a world whose up is `up`: the coordinate
@@ -543,10 +537,12 @@ fn frames(
             presets
                 .into_iter()
                 .map(|preset| {
-                    let (eye, target) = preset.framed(min, max, fov_y, world_up);
+                    // The camera's own up: exact for `top` and `bottom`,
+                    // where the world's up is the view direction.
+                    let camera = preset.camera(min, max, fov_y, aspect, world_up);
                     (
                         several.then_some(preset.suffix()),
-                        look(eye, target, world_up),
+                        look(camera.eye(), camera.focus, camera.up()),
                     )
                 })
                 .collect()
@@ -946,11 +942,11 @@ mod tests {
     /// Every preset looks at the scene centre from outside the box.
     #[test]
     fn presets_frame_the_scene() {
-        let (min, max) = (Vec3::new(-1.0, 0.0, -2.0), Vec3::new(1.0, 1.0, 2.0));
+        let (min, max) = (Vec3::new(-1.0, -2.0, 0.0), Vec3::new(1.0, 2.0, 1.0));
         for preset in ViewPreset::ALL {
-            let camera = preset.camera(min, max, 0.8);
-            assert_eq!(camera.target, (min + max) * 0.5);
-            let eye = camera.eye_position();
+            let camera = preset.camera(min, max, 0.8, 1.5, Vec3::Z);
+            assert_eq!(camera.focus, (min + max) * 0.5);
+            let eye = camera.eye();
             assert!(
                 eye.x < min.x
                     || eye.x > max.x
@@ -961,25 +957,47 @@ mod tests {
                 "{preset:?} eye {eye} inside"
             );
         }
-        let iso = ViewPreset::Iso.camera(min, max, 0.8).eye_position();
-        let back = ViewPreset::IsoBack.camera(min, max, 0.8).eye_position();
-        assert!((iso.x + back.x).abs() < 1e-4 && (iso.z + back.z).abs() < 1e-4);
+        // The back three-quarter view is the front one turned half way
+        // round the vertical through the centre.
+        let centre = (min + max) * 0.5;
+        let iso = ViewPreset::Iso.camera(min, max, 0.8, 1.5, Vec3::Z).eye() - centre;
+        let back = ViewPreset::IsoBack
+            .camera(min, max, 0.8, 1.5, Vec3::Z)
+            .eye()
+            - centre;
+        assert!((iso.x + back.x).abs() < 1e-4 && (iso.y + back.y).abs() < 1e-4);
+        assert!((iso.z - back.z).abs() < 1e-4 && iso.z > 0.0);
     }
 
-    /// In a z-up world `top` looks down z and `front` stays horizontal.
+    /// `top` looks straight down the world's up and `front` stays
+    /// horizontal, in the default z-up world and in a y-up one.
     #[test]
     fn presets_follow_the_world_up() {
         let (min, max) = (Vec3::new(-1.0, -2.0, 0.0), Vec3::new(1.0, 2.0, 1.0));
         let centre = (min + max) * 0.5;
-        let (eye, target) = ViewPreset::Top.framed(min, max, 0.8, Vec3::Z);
-        assert_eq!(target, centre);
-        assert!(eye.z > max.z, "top eye {eye} not above the scene");
-        assert!((eye.x - centre.x).abs() < 0.1 && (eye.y - centre.y).abs() < 0.1);
-        let (eye, _) = ViewPreset::Front.framed(min, max, 0.8, Vec3::Z);
-        assert!((eye.z - centre.z).abs() < 1e-3, "front eye {eye} not level");
-        // The y-up framing is the orbit camera's own.
-        let (eye, _) = ViewPreset::Iso.framed(min, max, 0.8, Vec3::Y);
-        assert!((eye - ViewPreset::Iso.camera(min, max, 0.8).eye_position()).length() < 1e-4);
+        let top = ViewPreset::Top.camera(min, max, 0.8, 1.5, Vec3::Z);
+        assert!((top.forward() - Vec3::NEG_Z).length() < 1e-5);
+        assert!((top.eye() - centre).truncate().length() < 1e-4);
+        assert!(
+            top.eye().z > max.z,
+            "top eye {} not above the scene",
+            top.eye()
+        );
+        let front = ViewPreset::Front.camera(min, max, 0.8, 1.5, Vec3::Z);
+        assert!(
+            (front.eye().z - centre.z).abs() < 1e-4,
+            "front eye not level"
+        );
+        assert!((front.forward() - Vec3::Y).length() < 1e-5);
+
+        let top = ViewPreset::Top.camera(min, max, 0.8, 1.5, Vec3::Y);
+        assert!((top.forward() - Vec3::NEG_Y).length() < 1e-5);
+        let front = ViewPreset::Front.camera(min, max, 0.8, 1.5, Vec3::Y);
+        assert!(
+            front.forward().y.abs() < 1e-5,
+            "front not level in a y-up world"
+        );
+
         assert!(grid_planes_for(Vec3::Z).xy && grid_planes_for(Vec3::Y).xz);
         assert!(grid_planes_for(Vec3::NEG_X).yz);
     }

@@ -80,6 +80,9 @@ pub struct Session {
     /// Pointer position of an in-progress camera drag (a press that landed in
     /// the viewport rect). `None` when the pointer isn't driving the camera.
     camera_pointer: Option<(f32, f32)>,
+    /// The world point the last press landed on, until the camera gesture
+    /// it starts has taken it as its anchor.
+    press_pick: Option<Vec3>,
     camera_buttons: CameraButtons,
     /// The viewport widget's rect from the last completed layout, used to
     /// hit-test camera input and to size the render target between frames.
@@ -103,6 +106,7 @@ impl Session {
             thumbnail_failed: std::collections::HashSet::new(),
             thumbnail_uploads: Vec::new(),
             camera_pointer: None,
+            press_pick: None,
             camera_buttons: CameraButtons::default(),
             lightbox_inflight: None,
             colorbar_texture: None,
@@ -475,6 +479,7 @@ impl Session {
     /// assembly and the control scheme leaves that button to the scene.
     pub fn pointer_down(
         &mut self,
+        gpu: Gpu<'_>,
         pos: (f32, f32),
         button: PointerButton,
         modifiers: KeyModifiers,
@@ -488,6 +493,8 @@ impl Session {
             return;
         };
         self.camera_pointer = Some(pos);
+        // What the press landed on anchors the camera gesture it starts.
+        self.press_pick = self.viewport.pick_at(gpu, pos, rect);
         if button != PointerButton::Primary {
             return;
         }
@@ -512,6 +519,8 @@ impl Session {
         }
         if !self.camera_buttons.any() {
             self.camera_pointer = None;
+            self.press_pick = None;
+            self.viewport.navigator.release();
         }
     }
 
@@ -519,10 +528,23 @@ impl Session {
     /// the camera changed (the shell should schedule a frame).
     pub fn pointer_moved(
         &mut self,
+        gpu: Gpu<'_>,
         pos: (f32, f32),
         modifiers: KeyModifiers,
-        scheme: renderer::CameraControlScheme,
+        navigation: Navigation,
     ) -> bool {
+        // The web cannot wait for a pick at the press, so it keeps one
+        // warm for wherever the pointer hovers.
+        #[cfg(target_arch = "wasm32")]
+        if !self.camera_buttons.any()
+            && let Some(rect) = self
+                .viewport_rect
+                .filter(|_| point_in_rect(self.viewport_rect, pos))
+        {
+            self.viewport.request_hover_pick(gpu, pos, rect);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = gpu;
         let Some((last_x, last_y)) = self.camera_pointer else {
             return false;
         };
@@ -546,7 +568,16 @@ impl Session {
             mouse_delta: Vec2::new(pos.0 - last_x, pos.1 - last_y),
             scroll_delta: 0.0,
         };
-        let changed = self.viewport.apply_camera_input(&input, scheme);
+        // The gesture is anchored where the pointer was before this move:
+        // on the first move, that is the press and what it landed on.
+        let cursor = self.viewport_rect.map(|rect| {
+            self.viewport
+                .cursor((last_x, last_y), rect, self.press_pick.take())
+        });
+        let changed = match cursor {
+            Some(cursor) => self.viewport.drag_camera(&input, cursor, navigation),
+            None => false,
+        };
         self.camera_pointer = Some(pos);
         changed
     }
@@ -556,22 +587,30 @@ impl Session {
     pub fn pointer_left(&mut self) {
         self.viewport.end_part_drag();
         self.camera_pointer = None;
+        self.press_pick = None;
+        self.viewport.navigator.release();
         self.camera_buttons = CameraButtons::default();
     }
 
     /// A wheel scroll: zooms the camera when the pointer is over the viewport.
     /// Returns whether the camera consumed the scroll.
-    pub fn wheel(
-        &mut self,
-        pos: (f32, f32),
-        scroll_delta: f32,
-        scheme: renderer::CameraControlScheme,
-    ) -> bool {
-        if !point_in_rect(self.viewport_rect, pos) {
+    pub fn wheel(&mut self, gpu: Gpu<'_>, pos: (f32, f32), scroll_delta: f32) -> bool {
+        let Some(rect) = self
+            .viewport_rect
+            .filter(|_| point_in_rect(self.viewport_rect, pos))
+        else {
             return false;
-        }
-        self.viewport.zoom_camera(scroll_delta, scheme);
+        };
+        let picked = self.viewport.pick_at(gpu, pos, rect);
+        let cursor = self.viewport.cursor(pos, rect, picked);
+        self.viewport.zoom_camera(scroll_delta, cursor);
         true
+    }
+
+    /// Whether the camera is part-way through an animated view change:
+    /// the shell keeps drawing frames while it is.
+    pub fn camera_animating(&self) -> bool {
+        self.viewport.navigator.animating()
     }
 }
 
@@ -626,7 +665,14 @@ struct ViewportRenderer {
     /// mere resolution/mode tweak of the same set.
     framed_ids: Option<Vec<String>>,
     pending_frame_preview: bool,
-    camera: Option<renderer::Camera>,
+    camera: renderer::Camera,
+    navigator: renderer::Navigator,
+    /// When the camera's animation was last advanced.
+    last_tick: Option<web_time::Instant>,
+    /// The target's aspect ratio and pixels per logical pixel as of the
+    /// last render, for camera gestures and picks.
+    aspect: f32,
+    scale_factor: f32,
     /// The frame of the view looked through in the last frame, so leaving
     /// look-through can seed the orbit camera from it.
     look_through: Option<ViewFrame>,
@@ -699,6 +745,22 @@ pub struct ViewportRenderParams<'a> {
     /// The view being looked through, when the app is in look-through: the
     /// frame replaces the orbit camera and its frustum is highlighted.
     pub look_through: Option<LookThrough>,
+    /// Whether the viewport camera projects orthographically.
+    pub orthographic: bool,
+}
+
+/// The device a session call may draw or pick with.
+#[derive(Clone, Copy)]
+pub struct Gpu<'a> {
+    pub device: &'a wgpu::Device,
+    pub queue: &'a wgpu::Queue,
+}
+
+/// How pointer input drives the camera: the app's settings.
+#[derive(Clone, Copy)]
+pub struct Navigation {
+    pub scheme: renderer::CameraControlScheme,
+    pub orbit_mode: renderer::OrbitMode,
 }
 
 impl ViewportRenderer {
@@ -719,7 +781,11 @@ impl ViewportRenderer {
             scene_bounds: None,
             framed_ids: None,
             pending_frame_preview: false,
-            camera: None,
+            camera: renderer::test_scenes::create_test_camera(),
+            navigator: renderer::Navigator::default(),
+            last_tick: None,
+            aspect: 1.0,
+            scale_factor: 1.0,
             look_through: None,
             look_framed: None,
             look_through_left: false,
@@ -764,6 +830,7 @@ impl ViewportRenderer {
             clear_color,
             preview_requests,
             look_through,
+            orthographic,
         } = params;
 
         let Some(rect) = logical_rect else {
@@ -773,6 +840,8 @@ impl ViewportRenderer {
 
         let target_resized = self.ensure_target_for_rect(device, rect, scale_factor);
         let (w, h) = self.target.extent;
+        self.aspect = w as f32 / h.max(1) as f32;
+        self.scale_factor = scale_factor;
 
         self.renderer.set_viewport_size(device, w, h);
         self.submit_scene(device, &preview_requests);
@@ -808,11 +877,19 @@ impl ViewportRenderer {
                 if let Some(frame) = self.look_through.take() {
                     self.continue_from(frame);
                 }
-                let camera = self
-                    .camera
-                    .get_or_insert_with(renderer::test_scenes::create_test_camera);
-                camera.fit_clip_planes();
-                renderer::CameraView::from_camera(camera, w as f32 / h.max(1) as f32)
+                let now = web_time::Instant::now();
+                let dt = self
+                    .last_tick
+                    .map_or(0.0, |last| now.duration_since(last).as_secs_f32());
+                self.last_tick = Some(now);
+                // A stalled frame must not swallow a whole transition.
+                self.navigator.tick(&mut self.camera, dt.min(0.1));
+                self.camera.projection = if orthographic {
+                    renderer::Projection::Orthographic
+                } else {
+                    renderer::Projection::Perspective
+                };
+                self.camera.view(self.aspect, self.scene_extent())
             }
         };
 
@@ -824,9 +901,9 @@ impl ViewportRenderer {
         target_resized
     }
 
-    /// Seeds the orbit camera from a looked-through view: the same eye,
-    /// looking down the optical axis at the scene centre's depth (or a
-    /// scene-sized distance when the centre is behind the camera).
+    /// Seeds the viewport camera from a looked-through view: the same eye
+    /// and roll, looking down the optical axis at the scene centre's depth
+    /// (or a scene-sized distance when the centre is behind the camera).
     fn continue_from(&mut self, frame: ViewFrame) {
         let eye = frame.eye();
         let forward = frame.forward();
@@ -843,11 +920,58 @@ impl ViewportRenderer {
             }
             None => 1.0,
         };
-        let camera = self
-            .camera
-            .get_or_insert_with(renderer::test_scenes::create_test_camera);
-        camera.look_from(eye, eye + forward * distance);
-        camera.fit_clip_planes();
+        self.camera
+            .look_from(eye, eye + forward * distance, frame.up());
+    }
+
+    /// The composited scene's bounds as corners.
+    fn scene_extent(&self) -> Option<(Vec3, Vec3)> {
+        self.scene_bounds
+            .map(|bounds| (bounds.min_vec3(), bounds.max_vec3()))
+    }
+
+    /// The target pixel under `pos` (logical, inside `rect`).
+    fn pixel_at(&self, pos: (f32, f32), rect: Rect) -> (u32, u32) {
+        let (w, h) = self.target.extent;
+        let x = ((pos.0 - rect.x) * self.scale_factor).max(0.0) as u32;
+        let y = ((pos.1 - rect.y) * self.scale_factor).max(0.0) as u32;
+        (x.min(w.saturating_sub(1)), y.min(h.saturating_sub(1)))
+    }
+
+    /// The world point the last frame drew under `pos`, if it drew a
+    /// surface there. Native waits for the answer; the web takes the hover
+    /// pick when it was asked close enough to `pos` to stand in for it.
+    fn pick_at(&mut self, gpu: Gpu<'_>, pos: (f32, f32), rect: Rect) -> Option<Vec3> {
+        let pixel = self.pixel_at(pos, rect);
+        #[cfg(not(target_arch = "wasm32"))]
+        let pick = self.renderer.pick_now(gpu.device, gpu.queue, pixel);
+        #[cfg(target_arch = "wasm32")]
+        let pick = self
+            .renderer
+            .pick_result(gpu.device, gpu.queue)
+            .filter(|pick| {
+                const NEAR_PX: u32 = 8;
+                pick.pixel.0.abs_diff(pixel.0) <= NEAR_PX
+                    && pick.pixel.1.abs_diff(pixel.1) <= NEAR_PX
+            });
+        pick?.world
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn request_hover_pick(&mut self, gpu: Gpu<'_>, pos: (f32, f32), rect: Rect) {
+        let pixel = self.pixel_at(pos, rect);
+        self.renderer.request_pick(gpu.device, gpu.queue, pixel);
+    }
+
+    /// A gesture's cursor: `pos` in the viewport and what was picked there.
+    fn cursor(&self, pos: (f32, f32), rect: Rect, picked: Option<Vec3>) -> renderer::Cursor {
+        renderer::Cursor {
+            ndc: Vec2::new(
+                (pos.0 - rect.x) / rect.w.max(1.0) * 2.0 - 1.0,
+                1.0 - (pos.1 - rect.y) / rect.h.max(1.0) * 2.0,
+            ),
+            picked,
+        }
     }
 
     /// Whether camera input has moved the viewport off a looked-through
@@ -856,59 +980,76 @@ impl ViewportRenderer {
         std::mem::take(&mut self.look_through_left)
     }
 
-    fn apply_camera_input(
+    /// Advances a camera drag anchored at `cursor`. Returns whether the
+    /// camera moved.
+    fn drag_camera(
         &mut self,
         input: &renderer::CameraInputState,
-        scheme: renderer::CameraControlScheme,
+        cursor: renderer::Cursor,
+        navigation: Navigation,
     ) -> bool {
-        // Orbiting, panning or zooming a photograph's viewpoint leaves it:
-        // the orbit camera takes over from the view's pose.
+        let action = navigation.scheme.determine_action(input);
+        if action == renderer::CameraAction::None {
+            self.navigator.release();
+            return false;
+        }
+        self.leave_look_through();
+        self.navigator.drag(
+            &mut self.camera,
+            action,
+            cursor,
+            input.mouse_delta,
+            self.viewport_logical_size,
+            navigation.orbit_mode,
+            zoom_limits(self.scene_bounds),
+        )
+    }
+
+    /// Zooms about what is under `cursor`; positive `scroll_delta` zooms
+    /// in.
+    fn zoom_camera(&mut self, scroll_delta: f32, cursor: renderer::Cursor) {
+        self.leave_look_through();
+        self.navigator.wheel(
+            &mut self.camera,
+            scroll_delta * 0.5,
+            cursor,
+            self.aspect,
+            zoom_limits(self.scene_bounds),
+        );
+    }
+
+    /// Orbiting, panning or zooming a photograph's viewpoint leaves it:
+    /// the viewport camera takes over from the view's pose.
+    fn leave_look_through(&mut self) {
         if let Some(frame) = self.look_through.take() {
             self.continue_from(frame);
             self.look_through_left = true;
         }
-        let Some(camera) = &mut self.camera else {
-            return false;
-        };
-
-        match scheme.determine_action(input) {
-            renderer::CameraAction::Orbit => {
-                camera.orbit(-input.mouse_delta.x * 0.01, -input.mouse_delta.y * 0.01);
-                true
-            }
-            renderer::CameraAction::Pan => {
-                camera.pan(input.mouse_delta, self.viewport_logical_size);
-                true
-            }
-            renderer::CameraAction::Zoom => {
-                let zoom_delta = if input.scroll_delta != 0.0 {
-                    input.scroll_delta * 0.5
-                } else {
-                    input.mouse_delta.x * 0.02
-                };
-                let (min_radius, max_radius) = zoom_limits(self.scene_bounds);
-                camera.zoom_clamped(zoom_delta, min_radius, max_radius);
-                true
-            }
-            renderer::CameraAction::None => false,
-        }
-    }
-
-    fn zoom_camera(&mut self, scroll_delta: f32, scheme: renderer::CameraControlScheme) {
-        let input = renderer::CameraInputState {
-            scroll_delta,
-            ..Default::default()
-        };
-        let _ = self.apply_camera_input(&input, scheme);
     }
 
     fn apply_camera_command(&mut self, command: crate::ViewportCameraCommand) {
+        // The animation starts now, not at the last frame drawn.
+        self.last_tick = None;
         match command {
             crate::ViewportCameraCommand::FramePreview => self.frame_preview(),
             crate::ViewportCameraCommand::Reset => {
-                self.camera = Some(renderer::test_scenes::create_test_camera());
+                let mut to = renderer::test_scenes::create_test_camera();
+                to.projection = self.camera.projection;
+                if let Some((min, max)) = self.scene_extent() {
+                    to.frame(min, max, self.aspect);
+                }
+                self.navigator.transition_to(&self.camera, to);
                 self.look_through = None;
                 self.pending_frame_preview = false;
+            }
+            crate::ViewportCameraCommand::View(view) => {
+                // From a photograph's viewpoint, turn from its pose.
+                if let Some(frame) = self.look_through.take() {
+                    self.continue_from(frame);
+                }
+                let mut to = self.camera.clone();
+                to.set_view(view);
+                self.navigator.transition_to(&self.camera, to);
             }
         }
     }
@@ -1135,10 +1276,6 @@ impl ViewportRenderer {
             self.resident.clear();
             // Nothing materialized yet: keep the placeholder scene, don't
             // disturb the camera the user may already have moved.
-            if self.scene_bounds.is_none() {
-                self.camera
-                    .get_or_insert_with(renderer::test_scenes::create_test_camera);
-            }
             let scene = self.placeholder.get_or_insert_with(|| {
                 self.renderer
                     .create_retained_scene(device, &renderer::test_scenes::create_test_scene())
@@ -1169,9 +1306,14 @@ impl ViewportRenderer {
         self.scene_bounds = Some(bounds);
         let reframe = self.pending_frame_preview || self.framed_ids.as_ref() != Some(&ids);
         if reframe {
-            let mut camera = self.camera.take().unwrap_or_default();
-            camera.focus_on(bounds.min_vec3(), bounds.max_vec3());
-            self.camera = Some(camera);
+            let mut framed = self.camera.clone();
+            framed.frame(bounds.min_vec3(), bounds.max_vec3(), self.aspect);
+            if self.pending_frame_preview {
+                // Asked for: travel there. A changed output set just lands.
+                self.navigator.transition_to(&self.camera, framed);
+            } else {
+                self.camera = framed;
+            }
             self.framed_ids = Some(ids);
             self.pending_frame_preview = false;
         }
@@ -4337,5 +4479,227 @@ mod pick_tests {
             )
             .is_some()
         );
+    }
+}
+
+/// The session's camera input, end to end and headless: a real frame of
+/// the placeholder scene, real picks of it, and pointer events through
+/// the same entry points the shells call.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod navigation_tests {
+    use super::*;
+    use renderer::offscreen::Offscreen;
+
+    const RECT: Rect = Rect {
+        x: 100.0,
+        y: 50.0,
+        w: 400.0,
+        h: 300.0,
+    };
+    const SCALE: f32 = 2.0;
+    /// The centre of the placeholder cube's top face.
+    const CUBE_TOP: Vec3 = Vec3::new(0.0, 0.0, 1.0);
+
+    struct Rig {
+        offscreen: Offscreen,
+        session: Session,
+    }
+
+    impl Rig {
+        /// `None` (and a note) where no GPU adapter is available.
+        fn new() -> Option<Self> {
+            let Ok(offscreen) = Offscreen::new() else {
+                eprintln!("no GPU adapter; skipping");
+                return None;
+            };
+            let session = Session::new(offscreen.device(), Offscreen::FORMAT);
+            let mut rig = Self { offscreen, session };
+            rig.frame(false);
+            Some(rig)
+        }
+
+        fn frame(&mut self, orthographic: bool) {
+            let (device, queue) = (self.offscreen.device(), self.offscreen.queue());
+            let mut encoder = device.create_command_encoder(&Default::default());
+            self.session.render(ViewportRenderParams {
+                device,
+                queue,
+                encoder: &mut encoder,
+                logical_rect: Some(RECT),
+                scale_factor: SCALE,
+                clear_color: wgpu::Color::BLACK,
+                preview_requests: Vec::new(),
+                look_through: None,
+                orthographic,
+            });
+            queue.submit([encoder.finish()]);
+        }
+
+        /// Where the last frame drew `world`, in the pointer's logical
+        /// coordinates.
+        fn pointer_over(&self, world: Vec3) -> (f32, f32) {
+            let (w, h) = (
+                (RECT.w * SCALE).ceil() as u32,
+                (RECT.h * SCALE).ceil() as u32,
+            );
+            let px = self
+                .session
+                .viewport
+                .last_view
+                .expect("a frame was drawn")
+                .project(world, w, h)
+                .expect("in front of the camera");
+            (RECT.x + px.x / SCALE, RECT.y + px.y / SCALE)
+        }
+    }
+
+    fn gpu(offscreen: &Offscreen) -> Gpu<'_> {
+        Gpu {
+            device: offscreen.device(),
+            queue: offscreen.queue(),
+        }
+    }
+
+    fn navigation(orbit_mode: renderer::OrbitMode) -> Navigation {
+        Navigation {
+            scheme: renderer::CameraControlScheme::Blender,
+            orbit_mode,
+        }
+    }
+
+    fn distance(a: (f32, f32), b: (f32, f32)) -> f32 {
+        (a.0 - b.0).hypot(a.1 - b.1)
+    }
+
+    /// A press on the cube picks the surface point under the pointer, and
+    /// orbiting pivots on it: after the drag it is still under the press
+    /// position, in both orbit modes and both projections.
+    #[test]
+    fn orbiting_pivots_on_the_surface_under_the_press() {
+        for orthographic in [false, true] {
+            for mode in [renderer::OrbitMode::Turntable, renderer::OrbitMode::Free] {
+                let Some(mut rig) = Rig::new() else {
+                    return;
+                };
+                rig.frame(orthographic);
+                let press = rig.pointer_over(CUBE_TOP);
+                rig.session.pointer_down(
+                    gpu(&rig.offscreen),
+                    press,
+                    PointerButton::Middle,
+                    KeyModifiers::default(),
+                    renderer::CameraControlScheme::Blender,
+                );
+                let picked = rig
+                    .session
+                    .press_pick
+                    .expect("the press landed on the cube");
+                assert!((picked - CUBE_TOP).length() < 0.02, "picked {picked}");
+
+                let before = rig.session.viewport.camera.clone();
+                let mut at = press;
+                for _ in 0..6 {
+                    at = (at.0 + 9.0, at.1 - 5.0);
+                    assert!(rig.session.pointer_moved(
+                        gpu(&rig.offscreen),
+                        at,
+                        KeyModifiers::default(),
+                        navigation(mode),
+                    ));
+                }
+                rig.session.pointer_up(PointerButton::Middle);
+                assert_ne!(rig.session.viewport.camera.orientation, before.orientation);
+                rig.frame(orthographic);
+                let after = rig.pointer_over(picked);
+                assert!(
+                    distance(after, press) < 1.0,
+                    "{mode:?} ortho {orthographic}: pivot moved from {press:?} to {after:?}"
+                );
+            }
+        }
+    }
+
+    /// The wheel zooms about the surface point under the pointer, and a
+    /// Shift+middle drag carries the grabbed surface point with it.
+    #[test]
+    fn zooming_and_panning_hold_the_surface_under_the_pointer() {
+        for orthographic in [false, true] {
+            let Some(mut rig) = Rig::new() else {
+                return;
+            };
+            rig.frame(orthographic);
+            let over = rig.pointer_over(CUBE_TOP);
+            let far = rig.session.viewport.camera.distance;
+            assert!(rig.session.wheel(gpu(&rig.offscreen), over, 4.0));
+            assert!(rig.session.viewport.camera.distance < far * 0.85);
+            rig.frame(orthographic);
+            assert!(
+                distance(rig.pointer_over(CUBE_TOP), over) < 1.0,
+                "ortho {orthographic}: zoom moved the point under the pointer"
+            );
+
+            let shift = KeyModifiers {
+                shift: true,
+                ..KeyModifiers::default()
+            };
+            rig.session.pointer_down(
+                gpu(&rig.offscreen),
+                over,
+                PointerButton::Middle,
+                shift,
+                renderer::CameraControlScheme::Blender,
+            );
+            let to = (over.0 - 40.0, over.1 + 25.0);
+            assert!(rig.session.pointer_moved(
+                gpu(&rig.offscreen),
+                to,
+                shift,
+                navigation(renderer::OrbitMode::Turntable),
+            ));
+            rig.session.pointer_up(PointerButton::Middle);
+            rig.frame(orthographic);
+            assert!(
+                distance(rig.pointer_over(CUBE_TOP), to) < 1.0,
+                "ortho {orthographic}: the grabbed point left the pointer"
+            );
+        }
+    }
+
+    /// A press on empty background anchors on the focus plane, and a
+    /// standard-view command travels to the exact view over a few frames.
+    #[test]
+    fn background_presses_and_view_commands() {
+        let Some(mut rig) = Rig::new() else {
+            return;
+        };
+        let corner = (RECT.x + 3.0, RECT.y + 3.0);
+        rig.session.pointer_down(
+            gpu(&rig.offscreen),
+            corner,
+            PointerButton::Middle,
+            KeyModifiers::default(),
+            renderer::CameraControlScheme::Blender,
+        );
+        assert_eq!(rig.session.press_pick, None, "the corner is background");
+        rig.session.pointer_up(PointerButton::Middle);
+
+        rig.session
+            .viewport
+            .apply_camera_command(crate::ViewportCameraCommand::View(
+                renderer::StandardView::Top,
+            ));
+        assert!(rig.session.camera_animating());
+        let started = std::time::Instant::now();
+        while rig.session.camera_animating() {
+            assert!(
+                started.elapsed().as_secs() < 5,
+                "the transition never ended"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            rig.frame(false);
+        }
+        let camera = &rig.session.viewport.camera;
+        assert!((camera.forward() - Vec3::NEG_Z).length() < 1e-6);
+        assert!((camera.up() - Vec3::Y).length() < 1e-6);
     }
 }

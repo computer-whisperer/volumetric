@@ -167,7 +167,7 @@ pub fn create_test_scene() -> SceneData {
     // Add a cube
     scene.add_mesh(
         create_test_cube(1.0),
-        Mat4::from_translation(Vec3::new(0.0, 0.5, 0.0)),
+        Mat4::from_translation(Vec3::new(0.0, 0.0, 0.5)),
         MaterialId(0),
     );
 
@@ -186,8 +186,8 @@ pub fn create_test_scene() -> SceneData {
     // Add a wireframe box
     scene.add_lines(
         create_wireframe_box(
-            Vec3::new(-1.5, 0.0, -1.5),
-            Vec3::new(1.5, 2.0, 1.5),
+            Vec3::new(-1.5, -1.5, 0.0),
+            Vec3::new(1.5, 1.5, 2.0),
             [0.5, 0.5, 0.5, 0.5],
         ),
         Mat4::IDENTITY,
@@ -220,13 +220,9 @@ pub fn create_test_scene() -> SceneData {
 /// Create a default camera positioned to view the test scene.
 pub fn create_test_camera() -> Camera {
     Camera {
-        target: Vec3::new(0.0, 0.5, 0.0),
-        radius: 5.0,
-        theta: std::f32::consts::FRAC_PI_4,
-        phi: std::f32::consts::FRAC_PI_4,
-        fov_y: std::f32::consts::FRAC_PI_3,
-        near: 0.1,
-        far: 100.0,
+        focus: Vec3::new(0.0, 0.0, 0.5),
+        distance: 8.0,
+        ..Camera::default()
     }
 }
 

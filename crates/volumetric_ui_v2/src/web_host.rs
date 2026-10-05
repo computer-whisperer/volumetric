@@ -48,7 +48,7 @@ use volumetric_protocol::{JobRequest, WebDaemonClient};
 
 use crate::remote::{mesh_result_from_output, output_from_outcome, project_exports_from_output};
 use crate::session::{
-    BackgroundJob, BackgroundResult, ExecutionBackend, JobQueue, LocalBackend, PendingMesh,
+    BackgroundJob, BackgroundResult, ExecutionBackend, Gpu, JobQueue, LocalBackend, PendingMesh,
     PreviewBuildError, PreviewBuildResult, PreviewEntity, PreviewStage, Session,
     ViewportRenderParams, execute_job_monitored, preview_postlude, preview_prelude,
 };
@@ -439,9 +439,13 @@ impl ApplicationHandler for WebHost {
                 let ly = position.y as f32 / scale;
                 self.last_pointer = Some((lx, ly));
                 if gfx.session.pointer_moved(
+                    Gpu {
+                        device: &gfx.device,
+                        queue: &gfx.queue,
+                    },
                     (lx, ly),
                     self.modifiers,
-                    self.app.camera_control_scheme(),
+                    self.app.navigation(),
                 ) {
                     gfx.window.request_redraw();
                 }
@@ -479,6 +483,10 @@ impl ApplicationHandler for WebHost {
                             .is_hovering_within(crate::VIEWPORT_KEY)
                         {
                             gfx.session.pointer_down(
+                                Gpu {
+                                    device: &gfx.device,
+                                    queue: &gfx.queue,
+                                },
                                 (lx, ly),
                                 button,
                                 self.modifiers,
@@ -519,9 +527,12 @@ impl ApplicationHandler for WebHost {
                     .is_hovering_within(crate::VIEWPORT_KEY)
                 {
                     if gfx.session.wheel(
+                        Gpu {
+                            device: &gfx.device,
+                            queue: &gfx.queue,
+                        },
                         (lx, ly),
                         camera_scroll_delta,
-                        self.app.camera_control_scheme(),
                     ) {
                         gfx.window.request_redraw();
                     }
@@ -706,6 +717,7 @@ impl WebHost {
             clear_color: bg_color(&palette),
             preview_requests,
             look_through,
+            orthographic: self.app.orthographic(),
         });
         gfx.damascene.render(
             &gfx.device,
@@ -723,6 +735,7 @@ impl WebHost {
             || viewport_resized
             || gfx.session.has_pending_preview()
             || gfx.session.has_pending_thumbnail()
+            || gfx.session.camera_animating()
             || gfx.session.has_pending_splat_sort()
             || gfx.session.run_in_flight()
             || self.app.has_pending_metadata()

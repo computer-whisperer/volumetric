@@ -1,7 +1,7 @@
 # Volumetric Renderer: Target Design
 
-Status: **target design, being built** (written 2026-10-05; step 1 of
-section 11 is built). This file
+Status: **target design, being built** (written 2026-10-05; steps 1 and 2
+of section 11 are built). This file
 replaces the May 2026 MVP architecture notes. It is the ground truth for the
 renderer overhaul: where the code and this file disagree during the rebuild,
 this file wins until it is deliberately revised.
@@ -66,10 +66,13 @@ pub struct Camera {
   switching projection keeps the apparent size at the focus.
 - Orientation is stored, never derived from a look-at with a fixed up
   vector, so looking straight down is an ordinary pose: Top is exactly top.
-- Clip planes are fitted to the scene bounds as seen from the eye
-  (`volumetric_preview::clip_planes_for` already does this for look-through
-  and the CLI). The orbit-radius-relative planes go away, because zooming to
-  the cursor makes `distance` a poor proxy for where the scene is.
+- Clip planes follow `distance` (near at 0.005 of it), with the far plane
+  pushed out to hold the scene's bounds; an orthographic frame also sees
+  behind the eye. (Revised 2026-10-05 from "fitted to the scene bounds
+  only": zooming about a point scales `distance` together with the eye's
+  distance to that point, so `distance` stays a good measure of how
+  closely the user is looking, and a distance-relative near plane is what
+  keeps an approached surface from being clipped at any part scale.)
 
 `CameraView` (view and projection matrices) and `Pinhole` stay as they are:
 they are how look-through and the CLI hand the renderer a view.
@@ -288,8 +291,9 @@ reads it back asynchronously. `Renderer::pick_result()` returns the latest answe
 
 - The G-buffer of the last rendered frame is retained, so picking does not
   need a new frame.
-- The host requests a pick as the pointer moves over the viewport, so a
-  button press finds the answer already there instead of waiting a frame.
+- A native host waits for the pick at the press (`pick_now`, well under a
+  frame). The web cannot wait, so it requests a pick as the pointer moves
+  over the viewport and a press takes the answer already there.
 - An integer colour target is used because WebGL2 cannot read back depth
   attachments but guarantees integer read-back. The path is the same on
   every backend.
@@ -387,9 +391,14 @@ measured properties of rendered frames, not stored images.
    source with object and material ids, a resolve pass at lighting parity
    with today, per-batch line and point styles, and the pick pass. Verify
    the three WebGL2 items in section 8.
-2. **Camera and navigation.** Z-up everywhere; the new `Camera` and
+2. **Camera and navigation (built 2026-10-05).** Z-up everywhere; the new `Camera` and
    `Navigator`; pick-driven orbit (turntable and free), zoom and pan;
    standard views, projection toggle and framing; GUI controls and shortcuts.
+   Left for later steps: hosts still submit every mesh as
+   `ObjectId::NONE`, and dragging an assembly part still finds the part
+   with the CPU ray test; the toolbar's View menu (standard views,
+   projection, orbit mode, reset) is a placeholder for step 5's panel; the
+   web build's hover-tracked pick has not been exercised in a browser.
 3. **Widgets.** Grid pass, axis lines, view gizmo with hit-testing, scale
    readout.
 4. **Shading.** Lighting rig and material table, AO rewrite, edge lines,
