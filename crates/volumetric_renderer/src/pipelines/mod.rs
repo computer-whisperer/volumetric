@@ -1,28 +1,17 @@
-//! Render pipeline implementations.
-//!
-//! This module contains the GPU pipeline implementations for each render pass:
-//! - Mesh G-buffer rendering
-//! - SSAO computation
-//! - Final compositing
-//! - Line rendering
-//! - Point rendering
+//! GPU pipelines, one per kind of pass.
 
-#![allow(dead_code)]
-
-mod composite;
+mod fullscreen;
 mod line;
 mod mesh;
 mod point;
 mod splat;
-mod ssao;
 mod warp;
 
-pub use composite::CompositePipeline;
-pub use line::{GpuLines, LinePipeline};
-pub use mesh::{GpuMesh, MeshPipeline, MeshUniforms};
-pub use point::{GpuPoints, PointPipeline};
-pub use splat::{
-    GpuSplat, SplatCompositePipeline, SplatPipeline, SplatUniforms, evaluate_sh, project_covariance,
+pub(crate) use fullscreen::{
+    AoUniforms, FullscreenPass, PickUniforms, ResolveUniforms, ao_pass, pick_pass, resolve_pass,
 };
-pub use ssao::{SsaoPipeline, SsaoUniforms};
+pub use line::{GpuLines, LinePipeline};
+pub use mesh::{GpuMesh, MeshDraw, MeshPipeline};
+pub use point::{GpuPointInstance, GpuPoints, PointPipeline};
+pub use splat::{GpuSplat, SplatCompositePipeline, SplatPipeline, evaluate_sh, project_covariance};
 pub use warp::{GpuWarp, Warp, WarpPipeline};

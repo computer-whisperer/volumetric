@@ -2,8 +2,6 @@
 //!
 //! Provides a resizable buffer that grows as needed to accommodate data uploads.
 
-#![allow(dead_code)]
-
 use bytemuck::{Pod, Zeroable};
 use std::marker::PhantomData;
 use wgpu::util::DeviceExt;
@@ -47,11 +45,6 @@ impl<T: Pod> DynamicBuffer<T> {
     /// Check if the buffer is empty.
     pub fn is_empty(&self) -> bool {
         self.len == 0
-    }
-
-    /// Get the current capacity in elements.
-    pub fn capacity(&self) -> usize {
-        self.capacity
     }
 
     /// The most elements a buffer of `T` may hold under the device's
@@ -113,113 +106,11 @@ impl<T: Pod> DynamicBuffer<T> {
         self.len = count;
         count
     }
-
-    /// Upload data starting at a specific offset (in elements).
-    /// Does not resize the buffer - caller must ensure capacity.
-    pub fn upload_at(&mut self, queue: &wgpu::Queue, offset: usize, data: &[T]) {
-        if data.is_empty() {
-            return;
-        }
-
-        if let Some(buffer) = &self.buffer {
-            let byte_offset = (offset * std::mem::size_of::<T>()) as u64;
-            queue.write_buffer(buffer, byte_offset, bytemuck::cast_slice(data));
-        }
-
-        // Update len if we wrote past the current end
-        self.len = self.len.max(offset + data.len());
-    }
-
-    /// Clear the buffer contents (sets len to 0 but keeps allocation).
-    pub fn clear(&mut self) {
-        self.len = 0;
-    }
-}
-
-/// A uniform buffer with change detection.
-///
-/// Only uploads to GPU when the data has changed.
-pub struct UniformBuffer<T: Pod + PartialEq> {
-    buffer: Option<wgpu::Buffer>,
-    cached_value: Option<T>,
-    label: &'static str,
-}
-
-impl<T: Pod + PartialEq> UniformBuffer<T> {
-    /// Create a new uniform buffer with the given label.
-    pub fn new(label: &'static str) -> Self {
-        Self {
-            buffer: None,
-            cached_value: None,
-            label,
-        }
-    }
-
-    /// Get the underlying buffer, creating it if needed.
-    pub fn get_or_create(&mut self, device: &wgpu::Device) -> &wgpu::Buffer {
-        if self.buffer.is_none() {
-            self.buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(self.label),
-                size: std::mem::size_of::<T>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }));
-        }
-        self.buffer.as_ref().unwrap()
-    }
-
-    /// Get the underlying buffer if it exists.
-    pub fn buffer(&self) -> Option<&wgpu::Buffer> {
-        self.buffer.as_ref()
-    }
-
-    /// Upload data if it has changed. Returns true if upload occurred.
-    pub fn upload_if_changed(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        value: &T,
-    ) -> bool {
-        // Check if value changed
-        if let Some(cached) = &self.cached_value
-            && cached == value
-        {
-            return false;
-        }
-
-        // Ensure buffer exists
-        self.get_or_create(device);
-
-        // Upload
-        if let Some(buffer) = &self.buffer {
-            queue.write_buffer(buffer, 0, bytemuck::bytes_of(value));
-        }
-
-        self.cached_value = Some(*value);
-        true
-    }
-
-    /// Force upload regardless of whether value changed.
-    pub fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, value: &T) {
-        self.get_or_create(device);
-
-        if let Some(buffer) = &self.buffer {
-            queue.write_buffer(buffer, 0, bytemuck::bytes_of(value));
-        }
-
-        self.cached_value = Some(*value);
-    }
-
-    /// Get the cached value, if any.
-    pub fn cached_value(&self) -> Option<&T> {
-        self.cached_value.as_ref()
-    }
 }
 
 /// A static buffer that is created once with initial data.
 pub struct StaticBuffer<T: Pod> {
     buffer: wgpu::Buffer,
-    len: usize,
     _marker: PhantomData<T>,
 }
 
@@ -239,7 +130,6 @@ impl<T: Pod> StaticBuffer<T> {
 
         Self {
             buffer,
-            len: data.len(),
             _marker: PhantomData,
         }
     }
@@ -247,16 +137,6 @@ impl<T: Pod> StaticBuffer<T> {
     /// Get the underlying buffer.
     pub fn buffer(&self) -> &wgpu::Buffer {
         &self.buffer
-    }
-
-    /// Get the number of elements.
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    /// Check if empty.
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
     }
 }
 

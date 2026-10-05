@@ -3,8 +3,7 @@ use std::sync::Arc;
 use glam::Mat4;
 
 use crate::{
-    Camera, LineData, LineStyle, MaterialId, MeshData, PointData, PointStyle, RenderSettings,
-    SplatData, SplatStyle,
+    LineData, LineStyle, MaterialId, MeshData, PointData, PointStyle, SplatData, SplatStyle,
 };
 
 /// Data for a single frame's rendering.
@@ -62,19 +61,4 @@ impl SceneData {
         self.points.clear();
         self.splats.clear();
     }
-}
-
-/// Draw data for rendering a scene into a target viewport.
-#[derive(Clone)]
-pub struct SceneDrawData {
-    /// Scene geometry to render.
-    pub scene: SceneData,
-    /// Camera for viewing.
-    pub camera: Camera,
-    /// Render settings.
-    pub settings: RenderSettings,
-    /// Viewport size in pixels.
-    pub viewport_size: [u32; 2],
-    /// Target texture format.
-    pub target_format: wgpu::TextureFormat,
 }

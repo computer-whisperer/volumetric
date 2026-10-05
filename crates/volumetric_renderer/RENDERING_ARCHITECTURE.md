@@ -1,6 +1,7 @@
 # Volumetric Renderer: Target Design
 
-Status: **target design, not yet built** (written 2026-10-05). This file
+Status: **target design, being built** (written 2026-10-05; step 1 of
+section 11 is built). This file
 replaces the May 2026 MVP architecture notes. It is the ground truth for the
 renderer overhaul: where the code and this file disagree during the rebuild,
 this file wins until it is deliberately revised.
@@ -97,7 +98,7 @@ through `focus` facing the camera.
 
 | Gesture | Behaviour | Invariant (unit-tested) |
 |---|---|---|
-| Orbit | Rotate the camera rigidly about `P`. Turntable: yaw about world Z, pitch about the camera's right axis, elevation limited to exactly ±90 degrees | `P` does not move on screen; the horizon stays level |
+| Orbit | Rotate the camera rigidly about `P`. Turntable: yaw about world Z, pitch about the camera's right axis, elevation limited to exactly ±90 degrees | `P` does not move on screen; in turntable mode the horizon stays level |
 | Zoom (wheel or drag) | Scale by `s` about `P`: `distance *= s`, `focus = P + s * (focus - P)` | `P` stays under the cursor, in both projections |
 | Pan | Translate in the view plane at `P`'s depth | `P` tracks the cursor 1:1 |
 | Frame | Fit the bounding sphere to the narrower of the two field-of-view angles | The whole scene is inside the frame at any aspect ratio |
@@ -107,8 +108,10 @@ through `focus` facing the camera.
 Rotation about `P` by `R` is `focus = P + R * (focus - P)`,
 `orientation = R * orientation`.
 
-Free (trackball) orbit is not built now. Storing a quaternion keeps it
-possible, and lets a look-through handover keep the photograph's roll.
+Orbit has two modes, a user setting: **turntable** (the default, above) and
+**free**, where the drag rotates about the camera's own right and up axes
+through `P` with no elevation limit and no level horizon. Both keep `P`
+fixed on screen. Standard views and Frame behave the same in either mode.
 
 ### Where the code lives
 
@@ -140,12 +143,19 @@ possible, and lets a look-through handover keep the photograph's roll.
 |---|---|---|
 | Albedo | `Rgba8Unorm` | rgb: base colour; a: material index |
 | Normal | `Rgb10a2Unorm` | rgb: world normal; a: 0 means "no normal supplied, reconstruct from depth" |
-| Object id | `R32Uint` | `ObjectId` of the draw; 0 is background |
-| Depth | `Depth24Plus`, sampled | Hardware depth; linear depth is recovered through the inverse projection |
+| Surface | `Rg32Uint` | r: `ObjectId` of the draw, 0 is background; g: the bits of the fragment's depth as `f32`, 1.0 is background |
+| Depth | `Depth24Plus` | Hardware depth, for depth testing only |
 
-No lighting happens while the G-buffer is filled. The separate float
-"depth as colour" target of the MVP is gone: passes sample the depth
-attachment directly, which WebGL2 allows.
+No lighting happens while the G-buffer is filled.
+
+Depth is carried twice, and later passes read it from the surface target,
+never from the depth attachment. (Revised 2026-10-05, replacing "passes
+sample the depth attachment": measured on a GLES adapter under WebGL2
+limits, wgpu cannot translate a plain read of a depth texture to GLSL,
+neither `textureLoad` nor a non-comparison sampler. An integer colour
+target is renderable and loadable on every backend with no extension, and
+holds the value exactly. Rejected: a float colour target for depth, which
+needs `EXT_color_buffer_float` on WebGL2.)
 
 ### Geometry sources
 
@@ -164,6 +174,13 @@ so sources compose with each other and with everything drawn afterwards.
 2. **Ambient occlusion** on linear depth, followed by a depth-aware blur.
    The radius is a fraction of the scene's bounding diagonal, clamped in
    screen space, so it is right for a 20 mm part and a 2 m assembly alike.
+   (Until step 4 the MVP's occlusion shader is kept, ported to the new
+   G-buffer. It compares non-linear depth against a fixed bias. With the
+   viewport's clip planes (near 0.005 and far 100 orbit distances) the
+   default bias of 0.025 is only exceeded by an occluder nearer than about
+   a sixth of the orbit distance, so by that arithmetic it registers no
+   local occlusion at all. The frame test has to lower the bias to see an
+   effect.)
 3. **Resolve**: lighting × AO, edge lines, background, tone map, into a
    display-referred intermediate.
 4. **FXAA** into the scene target.
@@ -264,9 +281,9 @@ contract would not change.
 
 ## 6. Picking
 
-`Renderer::request_pick(pixel)` renders one texel of the retained G-buffer
-(object id and depth) into a 1×1 `Rgba32Uint` target and reads it back
-asynchronously. `Renderer::pick_result()` returns the latest answer as
+`Renderer::request_pick(pixel)` copies one texel of the retained G-buffer's
+surface target (object id and depth) into a 1×1 `Rgba32Uint` target and
+reads it back asynchronously. `Renderer::pick_result()` returns the latest answer as
 `Pick { object: ObjectId, world: Option<Vec3> }`.
 
 - The G-buffer of the last rendered frame is retained, so picking does not
@@ -279,6 +296,13 @@ asynchronously. `Renderer::pick_result()` returns the latest answer as
 
 This replaces the per-press CPU ray-versus-every-triangle test for part
 drags, and it works for any geometry source.
+
+Known limit: lines, points and splats are not geometry sources. They do
+not write the surface target, so a pick over a point-cloud or splat
+preview finds nothing and navigation falls back to the focus plane. Giving
+them a depth-only source is the fix if that fallback feels wrong in use;
+it needs a second pass for them, because WebGL2 cannot blend one colour
+target while writing another unblended.
 
 ## 7. Host API
 
@@ -310,9 +334,13 @@ Nothing in the core frame needs compute shaders or float colour targets.
 | Ambient occlusion | Fewer samples, half resolution |
 | Image sources / direct raytracing | Unavailable at first: the caster is CPU-parallel and the web build has no workers |
 
-To verify on the GL backend before relying on them: sampling `Depth24Plus`
-in a later pass, `Rgb10a2Unorm` as a render target, and `Rgba32Uint`
-read-back.
+Measured 2026-10-05 on a GLES adapter under WebGL2 limits (the frame
+tests run every scenario there as well as on the default adapter):
+`Rgb10a2Unorm` and `Rg32Uint` render targets and the `Rgba32Uint`
+read-back work; sampling `Depth24Plus` does not, which is why depth lives
+in the surface target. A native GLES adapter is the nearest stand-in for
+WebGL2 that runs headless, not WebGL2 itself: the browser build still
+needs one manual check.
 
 ## 9. Contract for direct raytracing (follow-up)
 
@@ -323,8 +351,8 @@ renderer, and the renderer's obligations to it are fixed here:
 - an **image source** accepts a depth image in the frame's own view and
   projection, with optional normal, colour and id images, at a resolution
   that may be lower than the frame's;
-- it is written with fragment depth, so it composes with meshes, the grid,
-  lines and overlays;
+- it is written with fragment depth and into the surface target, so it
+  composes with meshes, the grid, lines and overlays;
 - where no normal is supplied, the resolve pass reconstructs it from depth,
   so a depth-only caster is fully shaded, occluded and edge-lined;
 - picking works on it unchanged;
@@ -355,13 +383,13 @@ Each step lands on its own with its tests. Headless frames through the
 existing `Offscreen` harness are the verification instrument: tests assert
 measured properties of rendered frames, not stored images.
 
-1. **Frame core.** Delete the old frame; build the G-buffer, the mesh
+1. **Frame core (built 2026-10-05).** Delete the old frame; build the G-buffer, the mesh
    source with object and material ids, a resolve pass at lighting parity
    with today, per-batch line and point styles, and the pick pass. Verify
    the three WebGL2 items in section 8.
 2. **Camera and navigation.** Z-up everywhere; the new `Camera` and
-   `Navigator`; pick-driven orbit, zoom and pan; standard views, projection
-   toggle and framing; GUI controls and shortcuts.
+   `Navigator`; pick-driven orbit (turntable and free), zoom and pan;
+   standard views, projection toggle and framing; GUI controls and shortcuts.
 3. **Widgets.** Grid pass, axis lines, view gizmo with hit-testing, scale
    readout.
 4. **Shading.** Lighting rig and material table, AO rewrite, edge lines,
@@ -370,12 +398,12 @@ measured properties of rendered frames, not stored images.
    (migrating the stored SSAO radius from metres to a relative value); CLI
    and Python options; documentation.
 
-## 12. Open questions
+## 12. Rulings on former open questions (2026-10-05)
 
-1. Turntable is the default orbit. Is a free-orbit mode wanted in this arc
-   or left for later?
-2. Changing `render --up` to default to Z changes the output of scripts
-   that rely on the Y default. Examples in this repository will be updated;
-   is there anything outside it?
-3. Should the grid sit at z = 0 always, or optionally at the bottom of the
-   scene bounds (a "print bed" mode)?
+1. Free orbit is built in this arc, as a setting beside turntable.
+2. `render --up` defaults to Z; nothing outside this repository depends on
+   the Y default, so the break is made without a compatibility path.
+3. The grid is always at z = 0. No print-bed mode.
+4. The viewport configuration menu is in scope and is more than a list of
+   toggles: step 5 designs it as a proper panel (navigation, lighting,
+   grid, gizmo, quality) when the settings it exposes exist.

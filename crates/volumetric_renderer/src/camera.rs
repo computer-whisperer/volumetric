@@ -2,8 +2,6 @@
 //!
 //! Uses spherical coordinates for intuitive 3D navigation around a target point.
 
-#![allow(dead_code)]
-
 use glam::{Mat4, Vec2, Vec3, Vec4};
 
 /// A camera that orbits around a target point.
@@ -409,56 +407,6 @@ pub struct CameraInputState {
     pub mouse_delta: Vec2,
     /// Scroll wheel delta (positive = zoom in)
     pub scroll_delta: f32,
-}
-
-/// Camera uniform data for GPU upload.
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct CameraUniforms {
-    /// View-projection matrix
-    pub view_proj: [[f32; 4]; 4],
-    /// Inverse view-projection matrix (for unprojection)
-    pub inv_view_proj: [[f32; 4]; 4],
-    /// View matrix
-    pub view: [[f32; 4]; 4],
-    /// Camera position in world space
-    pub eye_position: [f32; 3],
-    pub _pad0: f32,
-    /// Camera forward direction
-    pub forward: [f32; 3],
-    pub _pad1: f32,
-}
-
-impl CameraUniforms {
-    /// Create camera uniforms from a camera and aspect ratio.
-    pub fn from_camera(camera: &Camera, aspect: f32) -> Self {
-        let view = camera.view_matrix();
-        let proj = camera.projection_matrix(aspect);
-        let view_proj = proj * view;
-        let inv_view_proj = view_proj.inverse();
-        let eye = camera.eye_position();
-        let forward = camera.forward();
-
-        Self {
-            view_proj: view_proj.to_cols_array_2d(),
-            inv_view_proj: inv_view_proj.to_cols_array_2d(),
-            view: view.to_cols_array_2d(),
-            eye_position: eye.into(),
-            _pad0: 0.0,
-            forward: forward.into(),
-            _pad1: 0.0,
-        }
-    }
-}
-
-impl PartialEq for CameraUniforms {
-    fn eq(&self, other: &Self) -> bool {
-        self.view_proj == other.view_proj
-            && self.inv_view_proj == other.inv_view_proj
-            && self.view == other.view
-            && self.eye_position == other.eye_position
-            && self.forward == other.forward
-    }
 }
 
 #[cfg(test)]

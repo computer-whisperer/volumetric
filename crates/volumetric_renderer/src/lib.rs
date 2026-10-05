@@ -1,36 +1,31 @@
-//! Unified rendering engine for volumetric UI.
+//! The rendering engine shared by the GUI viewport and headless renders.
 //!
-//! This module provides a high-quality rendering system supporting simultaneous
-//! mesh, line, and point rendering on both native and WebGPU backends.
+//! A frame is deferred: geometry sources fill a G-buffer (albedo, normal,
+//! object id, depth) with no lighting; later passes read it. The design,
+//! including what is not built yet, is in `RENDERING_ARCHITECTURE.md`.
 //!
-//! # Architecture
+//! Passes, in order:
 //!
-//! The renderer uses a multi-pass deferred rendering approach:
+//! 1. **G-buffer fill**: retained meshes.
+//! 2. **Ambient occlusion** from depth and normals.
+//! 3. **Resolve**: lights the G-buffer into the target.
+//! 4. **Depth-tested lines and points** (the grid among them).
+//! 5. **Splats**: their own layer, then composited.
+//! 6. **Overlay lines and points** (no depth test).
+//! 7. **Lens warp**, when the frame is drawn through a real lens.
 //!
-//! 1. **Mesh G-Buffer Pass**: Renders meshes to color, normal, and depth buffers
-//! 2. **SSAO Pass**: Computes screen-space ambient occlusion
-//! 3. **Composite Pass**: Combines mesh color with AO
-//! 4. **Grid Pass**: Renders depth-tested grid lines
-//! 5. **Line Pass**: Renders depth-tested scene lines
-//! 6. **Point Pass**: Renders depth-tested scene points
-//! 7. **Overlay Passes**: Renders overlay lines/points (no depth test)
-//! 8. **Axis Indicator Pass**: Mini-viewport in corner
-//!
-//! # Usage
+//! The G-buffer outlives the frame: [`Renderer::request_pick`] reads the
+//! object and world point under a pixel of the last frame.
 //!
 //! ```ignore
-//! let mut renderer = Renderer::new(surface_format);
-//! renderer.initialize(&device, &queue, &adapter);
+//! let mut renderer = Renderer::new(&device, surface_format);
+//! let mesh = renderer.create_retained_mesh(&device, &mesh_data);
 //!
 //! // Each frame:
-//! renderer.submit_mesh(&mesh_data, transform, material);
+//! renderer.submit_retained_mesh(&mesh, transform, object, material);
 //! renderer.submit_lines(&line_data, transform, style);
-//! renderer.submit_points(&point_data, transform, style);
-//! renderer.render(&device, &queue, &camera, &settings, &target_view);
-//! renderer.end_frame();
+//! let info = renderer.render(&device, &queue, &mut encoder, &view, &settings, &target);
 //! ```
-
-#![allow(dead_code)]
 
 mod buffer;
 mod camera;
@@ -38,56 +33,43 @@ mod conversions;
 mod gbuffer;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod offscreen;
+mod pick;
 mod pipelines;
 mod scene;
 pub mod test_scenes;
 mod types;
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod frame_tests;
+
 pub use conversions::{convert_mesh_data, convert_points_to_point_data};
 
-pub use buffer::{DynamicBuffer, QUAD_INDICES, QUAD_VERTICES, QuadVertex, StaticBuffer};
 pub use camera::{
     Camera, CameraAction, CameraControlScheme, CameraInputState, CameraView, Pinhole, ViewDirection,
 };
-pub use gbuffer::{AoTexture, GBuffer};
+pub use pick::Pick;
 pub use pipelines::{
-    CompositePipeline, GpuLines, GpuMesh, GpuPoints, GpuSplat, GpuWarp, LinePipeline, MeshPipeline,
-    MeshUniforms, PointPipeline, SplatCompositePipeline, SplatPipeline, SplatUniforms,
-    SsaoPipeline, SsaoUniforms, Warp, WarpPipeline, evaluate_sh, project_covariance,
+    GpuLines, GpuMesh, GpuPoints, GpuSplat, Warp, evaluate_sh, project_covariance,
 };
-pub use scene::{SceneData, SceneDrawData};
+pub use scene::SceneData;
 pub use types::{
-    AxisIndicator, DepthMode, GridPlanes, GridSettings, LineData, LineInstance, LinePattern,
-    LineSegment, LineStyle, MaterialId, MeshData, MeshVertex, PointData, PointInstance, PointShape,
+    DepthMode, GridPlanes, GridSettings, LineData, LineInstance, LinePattern, LineSegment,
+    LineStyle, MaterialId, MeshData, MeshVertex, ObjectId, PointData, PointInstance, PointShape,
     PointStyle, RenderSettings, SplatData, SplatStyle, WidthMode,
 };
 
+use std::sync::Arc;
+
+use buffer::{DynamicBuffer, QUAD_INDICES, QUAD_VERTICES, QuadVertex, StaticBuffer};
+use bytemuck::Zeroable;
+use gbuffer::GBuffer;
 use glam::{Mat4, Vec3};
-
-/// Renderer capabilities detected from the GPU adapter.
-#[derive(Clone, Debug)]
-pub struct RendererCapabilities {
-    /// Maximum texture dimension
-    pub max_texture_size: u32,
-    /// Recommended SSAO sample count for this platform
-    pub recommended_ssao_samples: u32,
-    /// Whether running on WebGPU
-    pub is_web: bool,
-}
-
-impl RendererCapabilities {
-    /// Detect capabilities from the given adapter.
-    pub fn detect(adapter: &wgpu::Adapter) -> Self {
-        let limits = adapter.limits();
-        let is_web = cfg!(target_arch = "wasm32");
-
-        Self {
-            max_texture_size: limits.max_texture_dimension_2d,
-            recommended_ssao_samples: if is_web { 8 } else { 16 },
-            is_web,
-        }
-    }
-}
+use pick::{FrameRecord, Picker};
+use pipelines::{
+    AoUniforms, FullscreenPass, GpuPointInstance, GpuWarp, LinePipeline, MeshDraw, MeshPipeline,
+    PointPipeline, ResolveUniforms, SplatCompositePipeline, SplatPipeline, WarpPipeline, ao_pass,
+    resolve_pass,
+};
 
 /// Geometry dropped from a frame because it would have exceeded the
 /// device's `max_buffer_size` limit (creating a larger buffer is a wgpu
@@ -129,149 +111,54 @@ impl GeometryOverflow {
 #[derive(Default)]
 pub struct RetainedScene {
     /// Each mesh with the transform it is drawn under.
-    pub meshes: Vec<(std::sync::Arc<GpuMesh>, Mat4)>,
-    pub lines: Vec<std::sync::Arc<GpuLines>>,
-    pub points: Vec<std::sync::Arc<GpuPoints>>,
-    pub splats: Vec<std::sync::Arc<GpuSplat>>,
+    pub meshes: Vec<(Arc<GpuMesh>, Mat4)>,
+    pub lines: Vec<Arc<GpuLines>>,
+    pub points: Vec<Arc<GpuPoints>>,
+    pub splats: Vec<Arc<GpuSplat>>,
 }
 
-/// Drops trailing items that don't fit in one buffer of `max_bytes`;
-/// returns how many were dropped.
-fn truncate_to_buffer_budget<T>(items: &mut Vec<T>, max_bytes: u64) -> usize {
-    let max_items = (max_bytes / std::mem::size_of::<T>().max(1) as u64) as usize;
-    if items.len() <= max_items {
-        return 0;
-    }
-    let dropped = items.len() - max_items;
-    items.truncate(max_items);
-    dropped
+/// What a rendered frame reports back.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FrameInfo {
+    /// Geometry dropped at the device's buffer size limit; `None` when
+    /// everything fit.
+    pub overflow: Option<GeometryOverflow>,
 }
 
-/// A submitted mesh for the current frame.
-struct SubmittedMesh {
-    data: MeshData,
-    transform: Mat4,
-    #[allow(dead_code)]
-    material: MaterialId,
-}
-
-/// Flattens submitted meshes into one world-space vertex (and index) soup,
-/// dropping whole meshes once either buffer budget would overflow — a
-/// partially uploaded indexed mesh would render as garbage, and buffers
-/// past the device limit are a validation panic. Earlier meshes keep
-/// rendering. Returns `(vertices, indices, use_indices, dropped_triangles,
-/// total_triangles)`.
-fn flatten_meshes_within_budget(
-    meshes: &[SubmittedMesh],
-    max_vertices: usize,
-    max_indices: usize,
-) -> (Vec<MeshVertex>, Vec<u32>, bool, usize, usize) {
-    let mut all_vertices = Vec::new();
-    let mut all_indices = Vec::new();
-    let mut use_indices = false;
-    let mut dropped_triangles = 0usize;
-    let mut total_triangles = 0usize;
-
-    for submitted in meshes {
-        let vertex_count = submitted.data.vertices.len();
-        let index_count = submitted.data.indices.as_ref().map_or(0, |i| i.len());
-        let triangle_count = if submitted.data.indices.is_some() {
-            index_count / 3
-        } else {
-            vertex_count / 3
-        };
-        total_triangles += triangle_count;
-        if all_vertices.len() + vertex_count > max_vertices
-            || all_indices.len() + index_count > max_indices
-        {
-            dropped_triangles += triangle_count;
-            continue;
-        }
-
-        let base_vertex = all_vertices.len() as u32;
-
-        // Transform vertices (color passes through untouched)
-        for v in &submitted.data.vertices {
-            let pos = submitted.transform.transform_point3(Vec3::from(v.position));
-            // normalize() of a zero/degenerate normal mints NaN, which
-            // renders as uniform white downstream; substitute +Z.
-            let normal = submitted
-                .transform
-                .transform_vector3(Vec3::from(v.normal))
-                .normalize_or_zero();
-            let normal = if normal == Vec3::ZERO {
-                Vec3::Z
-            } else {
-                normal
-            };
-            all_vertices.push(MeshVertex::colored(pos.into(), normal.into(), v.color));
-        }
-
-        // Handle indices
-        if let Some(indices) = &submitted.data.indices {
-            use_indices = true;
-            for &idx in indices {
-                all_indices.push(base_vertex + idx);
-            }
-        }
-    }
-
-    (
-        all_vertices,
-        all_indices,
-        use_indices,
-        dropped_triangles,
-        total_triangles,
-    )
-}
-
-/// A submitted line batch for the current frame.
+/// A line batch submitted for the current frame.
 struct SubmittedLines {
     data: LineData,
     transform: Mat4,
     style: LineStyle,
 }
 
-/// A submitted point batch for the current frame.
+/// A point batch submitted for the current frame.
 struct SubmittedPoints {
     data: PointData,
     transform: Mat4,
     style: PointStyle,
 }
 
-/// GPU resources for the renderer.
-struct GpuResources {
-    // Pipelines
-    mesh_pipeline: MeshPipeline,
-    ssao_pipeline: SsaoPipeline,
-    composite_pipeline: CompositePipeline,
-    line_pipeline: LinePipeline,
-    point_pipeline: PointPipeline,
-    splat_pipeline: SplatPipeline,
-    splat_composite_pipeline: SplatCompositePipeline,
-    warp_pipeline: WarpPipeline,
+/// The grid's lines are their own batch, one pixel wide.
+const GRID_STYLE: LineStyle = LineStyle {
+    width: 1.0,
+    width_mode: WidthMode::ScreenSpace,
+    pattern: LinePattern::Solid,
+    depth_mode: DepthMode::Normal,
+};
 
-    // Textures
-    gbuffer: GBuffer,
-    ao_texture: AoTexture,
-
-    // Bind groups (recreated on resize)
-    ssao_bind_group: wgpu::BindGroup,
-    composite_bind_group: wgpu::BindGroup,
-    splat_composite_bind_group: wgpu::BindGroup,
-
-    // Sampler
-    sampler: wgpu::Sampler,
+fn clear_color(color: [f32; 4]) -> wgpu::Color {
+    wgpu::Color {
+        r: color[0] as f64,
+        g: color[1] as f64,
+        b: color[2] as f64,
+        a: color[3] as f64,
+    }
 }
 
-/// Main renderer that manages all GPU resources and rendering.
-///
-/// The renderer provides a unified interface for submitting geometry each frame
-/// and handles all GPU resource management internally.
+/// The renderer: pipelines, the G-buffer, and the geometry submitted for
+/// the next frame.
 pub struct Renderer {
-    // Surface format for the render target
-    surface_format: wgpu::TextureFormat,
-
     // Viewport size: the frame written
     viewport_size: (u32, u32),
 
@@ -282,129 +169,112 @@ pub struct Renderer {
     warp: Option<Warp>,
     warp_gpu: Option<GpuWarp>,
 
-    // GPU resources (initialized lazily)
-    gpu: Option<GpuResources>,
+    mesh_pipeline: MeshPipeline,
+    ao: FullscreenPass,
+    resolve: FullscreenPass,
+    line_pipeline: LinePipeline,
+    point_pipeline: PointPipeline,
+    splat_pipeline: SplatPipeline,
+    splat_composite_pipeline: SplatCompositePipeline,
+    warp_pipeline: WarpPipeline,
+    picker: Picker,
 
-    // Submitted geometry for current frame
-    frame_meshes: Vec<SubmittedMesh>,
+    gbuffer: GBuffer,
+    // Bind groups over the G-buffer's views (recreated on resize)
+    gbuffer_bindings: GBufferBindings,
+
+    // Geometry submitted for the current frame
+    frame_meshes: Vec<MeshDraw>,
     frame_lines: Vec<SubmittedLines>,
     frame_points: Vec<SubmittedPoints>,
-
-    // Retained geometry submitted for the current frame (GPU-resident;
-    // no per-frame CPU flatten or upload)
-    frame_retained_meshes: Vec<std::sync::Arc<GpuMesh>>,
-    /// The transform of each retained mesh submitted this frame, in order.
-    frame_retained_transforms: Vec<Mat4>,
-    frame_retained_lines: Vec<std::sync::Arc<GpuLines>>,
-    frame_retained_points: Vec<std::sync::Arc<GpuPoints>>,
-    frame_retained_splats: Vec<std::sync::Arc<GpuSplat>>,
+    frame_retained_lines: Vec<Arc<GpuLines>>,
+    frame_retained_points: Vec<Arc<GpuPoints>>,
+    frame_retained_splats: Vec<Arc<GpuSplat>>,
 
     // Grid line cache (regenerated when settings change)
     cached_grid_lines: Vec<LineSegment>,
     cached_grid_settings_hash: u64,
 
-    // Capabilities
-    capabilities: Option<RendererCapabilities>,
+    // The view the G-buffer was last filled with, for picking.
+    last_frame: Option<FrameRecord>,
+    // A pick asked for while another was in flight; only the newest waits.
+    queued_pick: Option<(u32, u32)>,
+}
 
-    // Geometry dropped by the last render() because of device buffer limits
-    frame_overflow: GeometryOverflow,
+/// The bind groups of the passes that read the G-buffer.
+struct GBufferBindings {
+    ao: wgpu::BindGroup,
+    resolve: wgpu::BindGroup,
+    pick: wgpu::BindGroup,
+    splat_composite: wgpu::BindGroup,
 }
 
 impl Renderer {
-    /// Create a new renderer.
-    pub fn new(surface_format: wgpu::TextureFormat) -> Self {
+    /// Creates a renderer drawing into targets of `surface_format`.
+    pub fn new(device: &wgpu::Device, surface_format: wgpu::TextureFormat) -> Self {
+        let ao = ao_pass(device);
+        let resolve = resolve_pass(device, surface_format);
+        let splat_composite_pipeline = SplatCompositePipeline::new(device, surface_format);
+        let picker = Picker::new(device);
+        let gbuffer = GBuffer::new(device, 1, 1);
+        let gbuffer_bindings = Self::bind_gbuffer(
+            device,
+            &gbuffer,
+            &ao,
+            &resolve,
+            &picker,
+            &splat_composite_pipeline,
+        );
         Self {
-            surface_format,
             viewport_size: (1, 1),
             warp: None,
             warp_gpu: None,
-            gpu: None,
+            mesh_pipeline: MeshPipeline::new(device),
+            ao,
+            resolve,
+            line_pipeline: LinePipeline::new(device, surface_format),
+            point_pipeline: PointPipeline::new(device, surface_format),
+            splat_pipeline: SplatPipeline::new(device, GBuffer::SPLAT_LAYER_FORMAT),
+            splat_composite_pipeline,
+            warp_pipeline: WarpPipeline::new(device, surface_format),
+            picker,
+            gbuffer,
+            gbuffer_bindings,
             frame_meshes: Vec::new(),
             frame_lines: Vec::new(),
             frame_points: Vec::new(),
-            frame_retained_meshes: Vec::new(),
-            frame_retained_transforms: Vec::new(),
             frame_retained_lines: Vec::new(),
             frame_retained_points: Vec::new(),
             frame_retained_splats: Vec::new(),
             cached_grid_lines: Vec::new(),
             cached_grid_settings_hash: 0,
-            capabilities: None,
-            frame_overflow: GeometryOverflow::default(),
+            last_frame: None,
+            queued_pick: None,
         }
     }
 
-    /// Initialize GPU resources. Call this once after creation.
-    /// The adapter is optional - if not provided, capabilities detection is skipped.
-    pub fn initialize(
-        &mut self,
+    fn bind_gbuffer(
         device: &wgpu::Device,
-        _queue: &wgpu::Queue,
-        adapter: Option<&wgpu::Adapter>,
-    ) {
-        self.capabilities = adapter.map(RendererCapabilities::detect);
-
-        // Create pipelines
-        let mesh_pipeline = MeshPipeline::new(device, self.surface_format);
-        let ssao_pipeline = SsaoPipeline::new(device);
-        let composite_pipeline = CompositePipeline::new(device, self.surface_format);
-        let line_pipeline = LinePipeline::new(device, self.surface_format);
-        let point_pipeline = PointPipeline::new(device, self.surface_format);
-        let splat_pipeline = SplatPipeline::new(device, GBuffer::SPLAT_LAYER_FORMAT);
-        let splat_composite_pipeline = SplatCompositePipeline::new(device, self.surface_format);
-        let warp_pipeline = WarpPipeline::new(device, self.surface_format);
-
-        // Create textures
-        let (width, height) = self.internal_size();
-        let gbuffer = GBuffer::new(device, width, height, self.surface_format);
-        let ao_texture = AoTexture::new(device, width, height);
-
-        // Create sampler
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("renderer_sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-            ..Default::default()
-        });
-
-        // Create bind groups
-        let ssao_bind_group =
-            ssao_pipeline.create_bind_group(device, &gbuffer.normal_view, &gbuffer.depth_view);
-        let composite_bind_group =
-            composite_pipeline.create_bind_group(device, &gbuffer.color_view, &ao_texture.view);
-        let splat_composite_bind_group =
-            splat_composite_pipeline.create_bind_group(device, &gbuffer.splat_view);
-
-        self.gpu = Some(GpuResources {
-            mesh_pipeline,
-            ssao_pipeline,
-            composite_pipeline,
-            line_pipeline,
-            point_pipeline,
-            splat_pipeline,
-            splat_composite_pipeline,
-            warp_pipeline,
-            gbuffer,
-            ao_texture,
-            ssao_bind_group,
-            composite_bind_group,
-            splat_composite_bind_group,
-            sampler,
-        });
-    }
-
-    /// Check if the renderer has been initialized.
-    pub fn is_initialized(&self) -> bool {
-        self.gpu.is_some()
-    }
-
-    /// Get the renderer capabilities.
-    pub fn capabilities(&self) -> Option<&RendererCapabilities> {
-        self.capabilities.as_ref()
+        gbuffer: &GBuffer,
+        ao: &FullscreenPass,
+        resolve: &FullscreenPass,
+        picker: &Picker,
+        splat_composite: &SplatCompositePipeline,
+    ) -> GBufferBindings {
+        GBufferBindings {
+            ao: ao.bind(device, &[&gbuffer.normal_view, &gbuffer.surface_view]),
+            resolve: resolve.bind(
+                device,
+                &[
+                    &gbuffer.albedo_view,
+                    &gbuffer.normal_view,
+                    &gbuffer.surface_view,
+                    &gbuffer.ao_view,
+                ],
+            ),
+            pick: picker.bind(device, &gbuffer.surface_view),
+            splat_composite: splat_composite.create_bind_group(device, &gbuffer.splat_view),
+        }
     }
 
     /// Set the viewport size. Call when the window is resized.
@@ -446,29 +316,22 @@ impl Renderer {
             .map_or(self.viewport_size, |warp| warp.source)
     }
 
-    /// Size the g-buffer and AO textures to the internal size and rebind.
+    /// Size the G-buffer to the internal size and rebind. Its old contents
+    /// go with it, so there is nothing to pick until the next frame.
     fn resize_internal(&mut self, device: &wgpu::Device) {
         let (width, height) = self.internal_size();
-        if let Some(gpu) = &mut self.gpu {
-            let resized = gpu.gbuffer.resize_if_needed(device, width, height);
-            gpu.ao_texture.resize_if_needed(device, width, height);
-            if !resized {
-                return;
-            }
-            gpu.ssao_bind_group = gpu.ssao_pipeline.create_bind_group(
-                device,
-                &gpu.gbuffer.normal_view,
-                &gpu.gbuffer.depth_view,
-            );
-            gpu.composite_bind_group = gpu.composite_pipeline.create_bind_group(
-                device,
-                &gpu.gbuffer.color_view,
-                &gpu.ao_texture.view,
-            );
-            gpu.splat_composite_bind_group = gpu
-                .splat_composite_pipeline
-                .create_bind_group(device, &gpu.gbuffer.splat_view);
+        if !self.gbuffer.resize_if_needed(device, width, height) {
+            return;
         }
+        self.gbuffer_bindings = Self::bind_gbuffer(
+            device,
+            &self.gbuffer,
+            &self.ao,
+            &self.resolve,
+            &self.picker,
+            &self.splat_composite_pipeline,
+        );
+        self.last_frame = None;
     }
 
     /// Get the current viewport size: the frame written.
@@ -476,19 +339,8 @@ impl Renderer {
         self.viewport_size
     }
 
-    /// Submit mesh geometry for this frame.
-    pub fn submit_mesh(&mut self, mesh: &MeshData, transform: Mat4, material: MaterialId) {
-        if mesh.vertices.is_empty() {
-            return;
-        }
-        self.frame_meshes.push(SubmittedMesh {
-            data: mesh.clone(),
-            transform,
-            material,
-        });
-    }
-
-    /// Submit line segments for this frame.
+    /// Submit line segments for this frame, drawn with their own style.
+    /// For small dynamic batches; retain anything large.
     pub fn submit_lines(&mut self, lines: &LineData, transform: Mat4, style: LineStyle) {
         if lines.segments.is_empty() {
             return;
@@ -500,7 +352,8 @@ impl Renderer {
         });
     }
 
-    /// Submit points for this frame.
+    /// Submit points for this frame, drawn with their own style. For
+    /// small dynamic batches; retain anything large.
     pub fn submit_points(&mut self, points: &PointData, transform: Mat4, style: PointStyle) {
         if points.points.is_empty() {
             return;
@@ -512,38 +365,28 @@ impl Renderer {
         });
     }
 
-    /// Uploads a scene's geometry as retained GPU residents (transforms
-    /// applied now, on the CPU, once). The empty scene is returned before
-    /// [`initialize`](Self::initialize).
+    /// Uploads a scene's geometry as retained GPU residents (line, point
+    /// and splat transforms applied now, on the CPU, once; a mesh keeps
+    /// its transform for submission).
     pub fn create_retained_scene(&self, device: &wgpu::Device, scene: &SceneData) -> RetainedScene {
-        let Some(gpu) = &self.gpu else {
-            return RetainedScene::default();
-        };
         RetainedScene {
             meshes: scene
                 .meshes
                 .iter()
-                .map(|(mesh, transform, _)| {
-                    (std::sync::Arc::new(GpuMesh::new(device, mesh)), *transform)
-                })
+                .map(|(mesh, transform, _)| (self.create_retained_mesh(device, mesh), *transform))
                 .collect(),
             lines: scene
                 .lines
                 .iter()
                 .map(|(lines, transform, style)| {
-                    std::sync::Arc::new(gpu.line_pipeline.create_retained(
-                        device,
-                        &lines.segments,
-                        *transform,
-                        style,
-                    ))
+                    self.create_retained_lines(device, lines, *transform, style)
                 })
                 .collect(),
             points: scene
                 .points
                 .iter()
                 .map(|(points, transform, style)| {
-                    std::sync::Arc::new(gpu.point_pipeline.create_retained(
+                    Arc::new(self.point_pipeline.create_retained(
                         device,
                         &points.points,
                         *transform,
@@ -555,7 +398,7 @@ impl Renderer {
                 .splats
                 .iter()
                 .map(|(splat, transform, style)| {
-                    std::sync::Arc::new(gpu.splat_pipeline.create_retained(
+                    Arc::new(self.splat_pipeline.create_retained(
                         device,
                         splat.clone(),
                         *transform,
@@ -566,55 +409,56 @@ impl Renderer {
         }
     }
 
-    /// Uploads one line batch as a retained GPU resident. `None` before
-    /// [`initialize`](Self::initialize).
+    /// Uploads one line batch as a retained GPU resident.
     pub fn create_retained_lines(
         &self,
         device: &wgpu::Device,
         lines: &LineData,
         transform: Mat4,
         style: &LineStyle,
-    ) -> Option<std::sync::Arc<GpuLines>> {
-        let gpu = self.gpu.as_ref()?;
-        Some(std::sync::Arc::new(gpu.line_pipeline.create_retained(
-            device,
-            &lines.segments,
-            transform,
-            style,
-        )))
+    ) -> Arc<GpuLines> {
+        Arc::new(
+            self.line_pipeline
+                .create_retained(device, &lines.segments, transform, style),
+        )
     }
 
     /// Uploads one mesh as a retained GPU resident, its vertices as
-    /// given; the transform comes at submission. `None` before
-    /// [`initialize`](Self::initialize).
-    pub fn create_retained_mesh(
-        &self,
-        device: &wgpu::Device,
-        mesh: &MeshData,
-    ) -> Option<std::sync::Arc<GpuMesh>> {
-        self.gpu.as_ref()?;
-        Some(std::sync::Arc::new(GpuMesh::new(device, mesh)))
+    /// given; the transform comes at submission.
+    pub fn create_retained_mesh(&self, device: &wgpu::Device, mesh: &MeshData) -> Arc<GpuMesh> {
+        Arc::new(GpuMesh::new(device, mesh))
     }
 
     /// Submit a retained mesh for this frame, drawn under `transform`.
-    pub fn submit_retained_mesh(&mut self, mesh: &std::sync::Arc<GpuMesh>, transform: Mat4) {
-        self.frame_retained_meshes.push(mesh.clone());
-        self.frame_retained_transforms.push(transform);
+    /// `object` is what a pick at its pixels reports.
+    pub fn submit_retained_mesh(
+        &mut self,
+        mesh: &Arc<GpuMesh>,
+        transform: Mat4,
+        object: ObjectId,
+        material: MaterialId,
+    ) {
+        self.frame_meshes.push(MeshDraw {
+            mesh: mesh.clone(),
+            transform,
+            object,
+            material,
+        });
     }
 
     /// Submit a retained line batch for this frame.
-    pub fn submit_retained_lines(&mut self, lines: &std::sync::Arc<GpuLines>) {
+    pub fn submit_retained_lines(&mut self, lines: &Arc<GpuLines>) {
         self.frame_retained_lines.push(lines.clone());
     }
 
     /// Submit a retained point batch for this frame.
-    pub fn submit_retained_points(&mut self, points: &std::sync::Arc<GpuPoints>) {
+    pub fn submit_retained_points(&mut self, points: &Arc<GpuPoints>) {
         self.frame_retained_points.push(points.clone());
     }
 
     /// Submit a retained splat for this frame. It is drawn after the
     /// depth-tested lines and points, blended back to front over them.
-    pub fn submit_retained_splat(&mut self, splat: &std::sync::Arc<GpuSplat>) {
+    pub fn submit_retained_splat(&mut self, splat: &Arc<GpuSplat>) {
         self.frame_retained_splats.push(splat.clone());
     }
 
@@ -627,35 +471,10 @@ impl Renderer {
         }
     }
 
-    /// Execute all rendering for the frame.
-    ///
-    /// This performs all render passes in order:
-    /// 1. Mesh G-Buffer
-    /// 2. SSAO
-    /// 3. Composite (to offscreen target)
-    /// 4. Grid lines (depth-tested)
-    /// 5. Scene lines (depth-tested)
-    /// 6. Scene points (depth-tested)
-    /// 7. Overlay lines
-    /// 8. Overlay points
+    /// Renders the submitted geometry with `view` into `target` and
+    /// forgets the submissions. `view` is explicit matrices: the orbit
+    /// camera's, a posed photograph's pinhole, or any other.
     pub fn render(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        encoder: &mut wgpu::CommandEncoder,
-        camera: &Camera,
-        settings: &RenderSettings,
-        target: &wgpu::TextureView,
-    ) {
-        let aspect = self.viewport_size.0 as f32 / self.viewport_size.1 as f32;
-        let view = CameraView::from_camera(camera, aspect);
-        self.render_view(device, queue, encoder, &view, settings, target)
-    }
-
-    /// [`render`](Self::render) with an explicit view and projection — a
-    /// pinhole camera from a posed photograph, or any matrices the orbit
-    /// camera cannot express.
-    pub fn render_view(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -663,43 +482,36 @@ impl Renderer {
         view: &CameraView,
         settings: &RenderSettings,
         target: &wgpu::TextureView,
-    ) {
-        // Update grid lines if settings changed (must be before borrowing self.gpu)
+    ) -> FrameInfo {
         self.update_grid_cache(settings);
 
         // Buffers larger than the device limit are a wgpu validation panic,
-        // so every geometry class is clamped to it below; whatever gets
-        // dropped is reported through frame_overflow().
-        let max_buffer_bytes = device.limits().max_buffer_size;
-        self.frame_overflow = GeometryOverflow {
-            max_buffer_bytes,
+        // so every geometry class is clamped to it; whatever gets dropped
+        // is reported. Retained geometry was clamped at creation.
+        let mut overflow = GeometryOverflow {
+            max_buffer_bytes: device.limits().max_buffer_size,
             ..GeometryOverflow::default()
         };
-        // Retained geometry was clamped at creation; fold what it dropped
-        // into this frame's report.
-        for mesh in &self.frame_retained_meshes {
-            self.frame_overflow.dropped_triangles += mesh.dropped_triangles;
-            self.frame_overflow.total_triangles += mesh.total_triangles;
+        for draw in &self.frame_meshes {
+            overflow.dropped_triangles += draw.mesh.dropped_triangles;
+            overflow.total_triangles += draw.mesh.total_triangles;
         }
         for lines in &self.frame_retained_lines {
-            self.frame_overflow.dropped_lines += lines.dropped;
+            overflow.dropped_lines += lines.dropped;
         }
         for points in &self.frame_retained_points {
-            self.frame_overflow.dropped_points += points.dropped;
+            overflow.dropped_points += points.dropped;
         }
         for splat in &self.frame_retained_splats {
-            self.frame_overflow.dropped_splats += splat.dropped;
+            overflow.dropped_splats += splat.dropped;
         }
 
         // Through a lens the scene renders into the warp's own frame and
         // the last pass writes the target; otherwise straight to it.
         let internal_size = self.internal_size();
-        if let (Some(warp), None, Some(gpu)) = (&self.warp, &self.warp_gpu, &self.gpu) {
-            self.warp_gpu = Some(gpu.warp_pipeline.create(device, queue, warp));
+        if let (Some(warp), None) = (&self.warp, &self.warp_gpu) {
+            self.warp_gpu = Some(self.warp_pipeline.create(device, queue, warp));
         }
-        let Some(gpu) = &mut self.gpu else {
-            return;
-        };
         let final_target = target;
         let target: &wgpu::TextureView = match &self.warp_gpu {
             Some(warp) => &warp.frame_view,
@@ -710,185 +522,142 @@ impl Renderer {
         let view_proj_array = view_proj.to_cols_array_2d();
         let screen_size = [internal_size.0 as f32, internal_size.1 as f32];
 
-        // =================================================================
-        // Pass 1: Mesh G-Buffer
-        // =================================================================
-        let has_meshes = !self.frame_meshes.is_empty() || !self.frame_retained_meshes.is_empty();
-        if has_meshes {
-            // Collect immediate mesh vertices (transformed), keeping within
-            // what one vertex/index buffer may hold. Retained meshes are
-            // already GPU-resident and skip all of this.
-            let (all_vertices, all_indices, use_indices, dropped, total) =
-                flatten_meshes_within_budget(
-                    &self.frame_meshes,
-                    (max_buffer_bytes / std::mem::size_of::<MeshVertex>() as u64) as usize,
-                    (max_buffer_bytes / std::mem::size_of::<u32>() as u64) as usize,
-                );
-            self.frame_overflow.dropped_triangles += dropped;
-            self.frame_overflow.total_triangles += total;
-            gpu.mesh_pipeline
-                .upload_transforms(device, queue, &self.frame_retained_transforms);
+        // ---- Uploads. Everything is written before any pass is encoded;
+        // each batch has buffers of its own.
+        self.mesh_pipeline
+            .prepare(device, queue, view_proj, &self.frame_meshes);
 
-            // Upload mesh data
-            gpu.mesh_pipeline
-                .upload_vertices(device, queue, &all_vertices);
-            if use_indices {
-                gpu.mesh_pipeline
-                    .upload_indices(device, queue, &all_indices);
-            }
+        self.line_pipeline.begin_frame();
+        let grid: Vec<LineInstance> = self
+            .cached_grid_lines
+            .iter()
+            .map(|segment| LineInstance::from_segment(segment, GRID_STYLE.width))
+            .collect();
+        overflow.dropped_lines += self.line_pipeline.upload_immediate(
+            device,
+            queue,
+            &grid,
+            &GRID_STYLE,
+            view_proj_array,
+            screen_size,
+        );
+        for submitted in &self.frame_lines {
+            let instances: Vec<LineInstance> = submitted
+                .data
+                .segments
+                .iter()
+                .map(|segment| {
+                    let world = LineSegment {
+                        start: submitted
+                            .transform
+                            .transform_point3(Vec3::from(segment.start))
+                            .into(),
+                        end: submitted
+                            .transform
+                            .transform_point3(Vec3::from(segment.end))
+                            .into(),
+                        color: segment.color,
+                    };
+                    LineInstance::from_segment(&world, submitted.style.width)
+                })
+                .collect();
+            overflow.dropped_lines += self.line_pipeline.upload_immediate(
+                device,
+                queue,
+                &instances,
+                &submitted.style,
+                view_proj_array,
+                screen_size,
+            );
+        }
 
-            // Update mesh uniforms
-            let mesh_uniforms = MeshUniforms {
-                view_proj: view_proj_array,
-                light_dir_world: [0.4, 0.7, 0.2],
-                _pad0: 0.0,
-                base_color: [0.85, 0.9, 1.0],
-                _pad1: 0.0,
-            };
-            gpu.mesh_pipeline.update_uniforms(queue, &mesh_uniforms);
+        self.point_pipeline.begin_frame();
+        for submitted in &self.frame_points {
+            let instances: Vec<GpuPointInstance> = submitted
+                .data
+                .points
+                .iter()
+                .map(|point| GpuPointInstance {
+                    position: submitted
+                        .transform
+                        .transform_point3(Vec3::from(point.position))
+                        .into(),
+                    _pad: 0.0,
+                    color: point.color,
+                })
+                .collect();
+            overflow.dropped_points += self.point_pipeline.upload_immediate(
+                device,
+                queue,
+                &instances,
+                &submitted.style,
+                view_proj_array,
+                screen_size,
+            );
+        }
 
-            // G-buffer render pass
-            {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("mesh_gbuffer_pass"),
-                    color_attachments: &[
-                        Some(wgpu::RenderPassColorAttachment {
-                            view: &gpu.gbuffer.color_view,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color {
-                                    r: settings.background_color[0] as f64,
-                                    g: settings.background_color[1] as f64,
-                                    b: settings.background_color[2] as f64,
-                                    a: settings.background_color[3] as f64,
-                                }),
-                                store: wgpu::StoreOp::Store,
-                            },
-                            depth_slice: None,
-                        }),
-                        Some(wgpu::RenderPassColorAttachment {
-                            view: &gpu.gbuffer.normal_view,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                                store: wgpu::StoreOp::Store,
-                            },
-                            depth_slice: None,
-                        }),
-                        Some(wgpu::RenderPassColorAttachment {
-                            view: &gpu.gbuffer.depth_view,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
-                                store: wgpu::StoreOp::Store,
-                            },
-                            depth_slice: None,
-                        }),
-                    ],
-                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: &gpu.gbuffer.depth_stencil_view,
-                        depth_ops: Some(wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(1.0),
-                            store: wgpu::StoreOp::Store,
-                        }),
-                        stencil_ops: None,
-                    }),
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
+        for batch in &self.frame_retained_lines {
+            self.line_pipeline
+                .write_retained_uniforms(queue, batch, view_proj_array, screen_size);
+        }
+        for batch in &self.frame_retained_points {
+            self.point_pipeline
+                .write_retained_uniforms(queue, batch, view_proj_array, screen_size);
+        }
+        for splat in &self.frame_retained_splats {
+            self.splat_pipeline
+                .prepare_retained(queue, splat, view, screen_size);
+        }
 
-                gpu.mesh_pipeline.render(&mut pass, use_indices);
-                gpu.mesh_pipeline
-                    .render_retained(&mut pass, &self.frame_retained_meshes);
-            }
-
-            // =================================================================
-            // Pass 2: SSAO
-            // =================================================================
-            if settings.ssao_enabled {
-                let ssao_uniforms = SsaoUniforms {
+        let ao_enabled = settings.ssao_enabled && !self.frame_meshes.is_empty();
+        if ao_enabled {
+            self.ao.write_uniforms(
+                queue,
+                &AoUniforms {
                     view_proj: view_proj_array,
                     inv_view_proj: view_proj.inverse().to_cols_array_2d(),
-                    screen_size_px: screen_size,
                     radius: settings.ssao_radius,
                     bias: settings.ssao_bias,
                     strength: settings.ssao_strength,
-                    _pad0: [0.0; 7],
-                };
-                gpu.ssao_pipeline.update_uniforms(queue, &ssao_uniforms);
-
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("ssao_pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &gpu.ao_texture.view,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
-                            store: wgpu::StoreOp::Store,
-                        },
-                        depth_slice: None,
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-
-                gpu.ssao_pipeline.render(&mut pass, &gpu.ssao_bind_group);
-            } else {
-                // Ensure AO is neutral when disabled
-                let _ = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("ssao_disabled_clear"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &gpu.ao_texture.view,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
-                            store: wgpu::StoreOp::Store,
-                        },
-                        depth_slice: None,
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-            }
+                    ..AoUniforms::zeroed()
+                },
+            );
         }
+        self.resolve.write_uniforms(
+            queue,
+            &ResolveUniforms {
+                light_dir_world: [0.4, 0.7, 0.2],
+                ao_enabled: ao_enabled as u32,
+                base_tint: [0.85, 0.9, 1.0],
+                _pad0: 0.0,
+            },
+        );
 
-        // =================================================================
-        // Pass 3: Composite to final target
-        // =================================================================
+        // ---- G-buffer fill. Always run, so a frame with no geometry
+        // still leaves a cleared G-buffer for the later passes and picks.
         {
-            // When there are no meshes, the depth buffer was never initialized.
-            // We need to clear it in that case for subsequent passes (lines/points).
-            let depth_load_op = if has_meshes {
-                wgpu::LoadOp::Load // Keep depth from mesh pass
-            } else {
-                wgpu::LoadOp::Clear(1.0) // Clear to far plane
-            };
-
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("composite_pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target,
+            let attachment = |view, clear| {
+                Some(wgpu::RenderPassColorAttachment {
+                    view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: settings.background_color[0] as f64,
-                            g: settings.background_color[1] as f64,
-                            b: settings.background_color[2] as f64,
-                            a: settings.background_color[3] as f64,
-                        }),
+                        load: wgpu::LoadOp::Clear(clear),
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
-                })],
+                })
+            };
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("gbuffer_pass"),
+                color_attachments: &[
+                    attachment(&self.gbuffer.albedo_view, wgpu::Color::TRANSPARENT),
+                    attachment(&self.gbuffer.normal_view, wgpu::Color::TRANSPARENT),
+                    attachment(&self.gbuffer.surface_view, GBuffer::SURFACE_CLEAR),
+                ],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &gpu.gbuffer.depth_stencil_view,
+                    view: &self.gbuffer.depth_view,
                     depth_ops: Some(wgpu::Operations {
-                        load: depth_load_op,
+                        load: wgpu::LoadOp::Clear(1.0),
                         store: wgpu::StoreOp::Store,
                     }),
                     stencil_ops: None,
@@ -897,188 +666,38 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-
-            if has_meshes {
-                gpu.composite_pipeline
-                    .render(&mut pass, &gpu.composite_bind_group);
-            }
+            self.mesh_pipeline.render(&mut pass, &self.frame_meshes);
         }
 
-        // =================================================================
-        // Pass 4-6: Lines and Points (depth-tested)
-        // =================================================================
-        {
-            // Collect and prepare all depth-tested line instances
-            let mut all_line_segments: Vec<LineSegment> = Vec::new();
-            let mut line_style = LineStyle {
-                width: 1.0,
-                width_mode: WidthMode::ScreenSpace,
-                pattern: LinePattern::Solid,
-                depth_mode: DepthMode::Normal,
-            };
-
-            // Add grid lines
-            if !self.cached_grid_lines.is_empty() {
-                all_line_segments.extend_from_slice(&self.cached_grid_lines);
-            }
-
-            // Add scene lines (depth-tested)
-            for submitted in &self.frame_lines {
-                if submitted.style.depth_mode == DepthMode::Normal {
-                    line_style = submitted.style.clone();
-                    for seg in &submitted.data.segments {
-                        let start = submitted.transform.transform_point3(Vec3::from(seg.start));
-                        let end = submitted.transform.transform_point3(Vec3::from(seg.end));
-                        all_line_segments.push(LineSegment {
-                            start: start.into(),
-                            end: end.into(),
-                            color: seg.color,
-                        });
-                    }
-                }
-            }
-
-            // Collect and prepare all depth-tested point instances
-            let mut all_point_instances: Vec<PointInstance> = Vec::new();
-            let mut point_style = PointStyle {
-                size: 4.0,
-                size_mode: WidthMode::ScreenSpace,
-                shape: PointShape::Circle,
-                depth_mode: DepthMode::Normal,
-            };
-
-            for submitted in &self.frame_points {
-                if submitted.style.depth_mode == DepthMode::Normal {
-                    point_style = submitted.style.clone();
-                    for pt in &submitted.data.points {
-                        let pos = submitted
-                            .transform
-                            .transform_point3(Vec3::from(pt.position));
-                        all_point_instances.push(PointInstance {
-                            position: pos.into(),
-                            color: pt.color,
-                        });
-                    }
-                }
-            }
-
-            // Upload all data before starting the render pass (split borrow)
-            let GpuResources {
-                line_pipeline,
-                point_pipeline,
-                gbuffer,
-                ..
-            } = gpu;
-
-            if !all_line_segments.is_empty() {
-                let mut instances =
-                    LinePipeline::prepare_instances(&all_line_segments, &line_style);
-                self.frame_overflow.dropped_lines +=
-                    truncate_to_buffer_budget(&mut instances, max_buffer_bytes);
-                line_pipeline.upload_instances(device, queue, &instances, DepthMode::Normal);
-                let uniforms =
-                    LinePipeline::create_uniforms(view_proj_array, screen_size, &line_style);
-                line_pipeline.update_uniforms(queue, &uniforms, DepthMode::Normal);
-            }
-
-            if !all_point_instances.is_empty() {
-                let mut instances = PointPipeline::prepare_instances(&all_point_instances);
-                self.frame_overflow.dropped_points +=
-                    truncate_to_buffer_budget(&mut instances, max_buffer_bytes);
-                point_pipeline.upload_instances(device, queue, &instances, DepthMode::Normal);
-                let uniforms =
-                    PointPipeline::create_uniforms(view_proj_array, screen_size, &point_style);
-                point_pipeline.update_uniforms(queue, &uniforms, DepthMode::Normal);
-            }
-
-            // Refresh retained batches' per-frame camera uniforms
-            for batch in &self.frame_retained_lines {
-                if batch.depth_mode() == DepthMode::Normal {
-                    line_pipeline.write_retained_uniforms(
-                        queue,
-                        batch,
-                        view_proj_array,
-                        screen_size,
-                    );
-                }
-            }
-            for batch in &self.frame_retained_points {
-                if batch.depth_mode() == DepthMode::Normal {
-                    point_pipeline.write_retained_uniforms(
-                        queue,
-                        batch,
-                        view_proj_array,
-                        screen_size,
-                    );
-                }
-            }
-
-            // Now start the render pass
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("forward_pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &gbuffer.depth_stencil_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-
-            // Render all uploaded data
-            if !all_line_segments.is_empty() {
-                line_pipeline.render(&mut pass, DepthMode::Normal);
-            }
-            if !all_point_instances.is_empty() {
-                point_pipeline.render(&mut pass, DepthMode::Normal);
-            }
-            for batch in &self.frame_retained_lines {
-                if batch.depth_mode() == DepthMode::Normal {
-                    line_pipeline.render_retained(&mut pass, batch);
-                }
-            }
-            for batch in &self.frame_retained_points {
-                if batch.depth_mode() == DepthMode::Normal {
-                    point_pipeline.render_retained(&mut pass, batch);
-                }
-            }
+        // ---- Ambient occlusion, then the resolve onto the background.
+        if ao_enabled {
+            self.ao.run(
+                encoder,
+                &self.gbuffer_bindings.ao,
+                &self.gbuffer.ao_view,
+                wgpu::Color::WHITE,
+            );
         }
+        self.resolve.run(
+            encoder,
+            &self.gbuffer_bindings.resolve,
+            target,
+            clear_color(settings.background_color),
+        );
 
-        // =================================================================
-        // Splats: sorted back to front, depth-tested at their centres
+        // ---- Depth-tested lines and points, over the lit scene.
+        self.draw_lines_and_points(encoder, target, DepthMode::Normal);
+
+        // ---- Splats: sorted back to front, depth-tested at their centres
         // against everything drawn so far, blended over it.
-        // =================================================================
         if !self.frame_retained_splats.is_empty() {
-            let GpuResources {
-                splat_pipeline,
-                splat_composite_pipeline,
-                splat_composite_bind_group,
-                gbuffer,
-                ..
-            } = gpu;
-            for splat in &self.frame_retained_splats {
-                splat_pipeline.prepare_retained(queue, splat, view, screen_size);
-            }
             // Into the layer: the trainer's arithmetic, sRGB values blended
             // as numbers.
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("splat_pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &gbuffer.splat_view,
+                        view: &self.gbuffer.splat_view,
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -1087,7 +706,7 @@ impl Renderer {
                         depth_slice: None,
                     })],
                     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: &gbuffer.depth_stencil_view,
+                        view: &self.gbuffer.depth_view,
                         depth_ops: Some(wgpu::Operations {
                             load: wgpu::LoadOp::Load,
                             store: wgpu::StoreOp::Store,
@@ -1099,7 +718,7 @@ impl Renderer {
                     multiview_mask: None,
                 });
                 for splat in &self.frame_retained_splats {
-                    splat_pipeline.render_retained(&mut pass, splat);
+                    self.splat_pipeline.render_retained(&mut pass, splat);
                 }
             }
             // Over the scene, linearised for the target.
@@ -1120,162 +739,17 @@ impl Renderer {
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
-                splat_composite_pipeline.render(&mut pass, splat_composite_bind_group);
+                self.splat_composite_pipeline
+                    .render(&mut pass, &self.gbuffer_bindings.splat_composite);
             }
         }
 
-        // =================================================================
-        // Pass 7-8: Overlay Lines and Points (no depth test)
-        // =================================================================
-        {
-            // Collect and prepare all overlay line instances
-            let mut all_line_segments: Vec<LineSegment> = Vec::new();
-            let mut line_style = LineStyle {
-                width: 2.0,
-                width_mode: WidthMode::ScreenSpace,
-                pattern: LinePattern::Solid,
-                depth_mode: DepthMode::Overlay,
-            };
+        // ---- Overlay lines and points (no depth test).
+        self.draw_lines_and_points(encoder, target, DepthMode::Overlay);
 
-            for submitted in &self.frame_lines {
-                if submitted.style.depth_mode == DepthMode::Overlay {
-                    line_style = submitted.style.clone();
-                    for seg in &submitted.data.segments {
-                        let start = submitted.transform.transform_point3(Vec3::from(seg.start));
-                        let end = submitted.transform.transform_point3(Vec3::from(seg.end));
-                        all_line_segments.push(LineSegment {
-                            start: start.into(),
-                            end: end.into(),
-                            color: seg.color,
-                        });
-                    }
-                }
-            }
-
-            // Collect and prepare all overlay point instances
-            let mut all_point_instances: Vec<PointInstance> = Vec::new();
-            let mut point_style = PointStyle {
-                size: 4.0,
-                size_mode: WidthMode::ScreenSpace,
-                shape: PointShape::Circle,
-                depth_mode: DepthMode::Overlay,
-            };
-
-            for submitted in &self.frame_points {
-                if submitted.style.depth_mode == DepthMode::Overlay {
-                    point_style = submitted.style.clone();
-                    for pt in &submitted.data.points {
-                        let pos = submitted
-                            .transform
-                            .transform_point3(Vec3::from(pt.position));
-                        all_point_instances.push(PointInstance {
-                            position: pos.into(),
-                            color: pt.color,
-                        });
-                    }
-                }
-            }
-
-            // Upload all data before starting the render pass (split borrow)
-            let GpuResources {
-                line_pipeline,
-                point_pipeline,
-                gbuffer,
-                ..
-            } = gpu;
-
-            if !all_line_segments.is_empty() {
-                let mut instances =
-                    LinePipeline::prepare_instances(&all_line_segments, &line_style);
-                self.frame_overflow.dropped_lines +=
-                    truncate_to_buffer_budget(&mut instances, max_buffer_bytes);
-                line_pipeline.upload_instances(device, queue, &instances, DepthMode::Overlay);
-                let uniforms =
-                    LinePipeline::create_uniforms(view_proj_array, screen_size, &line_style);
-                line_pipeline.update_uniforms(queue, &uniforms, DepthMode::Overlay);
-            }
-
-            if !all_point_instances.is_empty() {
-                let mut instances = PointPipeline::prepare_instances(&all_point_instances);
-                self.frame_overflow.dropped_points +=
-                    truncate_to_buffer_budget(&mut instances, max_buffer_bytes);
-                point_pipeline.upload_instances(device, queue, &instances, DepthMode::Overlay);
-                let uniforms =
-                    PointPipeline::create_uniforms(view_proj_array, screen_size, &point_style);
-                point_pipeline.update_uniforms(queue, &uniforms, DepthMode::Overlay);
-            }
-
-            // Refresh retained batches' per-frame camera uniforms
-            for batch in &self.frame_retained_lines {
-                if batch.depth_mode() == DepthMode::Overlay {
-                    line_pipeline.write_retained_uniforms(
-                        queue,
-                        batch,
-                        view_proj_array,
-                        screen_size,
-                    );
-                }
-            }
-            for batch in &self.frame_retained_points {
-                if batch.depth_mode() == DepthMode::Overlay {
-                    point_pipeline.write_retained_uniforms(
-                        queue,
-                        batch,
-                        view_proj_array,
-                        screen_size,
-                    );
-                }
-            }
-
-            // Now start the render pass
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("overlay_pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &gbuffer.depth_stencil_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Discard,
-                    }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-
-            // Render all uploaded data
-            if !all_line_segments.is_empty() {
-                line_pipeline.render(&mut pass, DepthMode::Overlay);
-            }
-            if !all_point_instances.is_empty() {
-                point_pipeline.render(&mut pass, DepthMode::Overlay);
-            }
-            for batch in &self.frame_retained_lines {
-                if batch.depth_mode() == DepthMode::Overlay {
-                    line_pipeline.render_retained(&mut pass, batch);
-                }
-            }
-            for batch in &self.frame_retained_points {
-                if batch.depth_mode() == DepthMode::Overlay {
-                    point_pipeline.render_retained(&mut pass, batch);
-                }
-            }
-        }
-
-        // =================================================================
-        // Pass 9: the lens warp, the internal frame written to the target
-        // =================================================================
+        // ---- The lens warp: the internal frame written to the target.
         if let Some(warp) = &self.warp_gpu {
-            gpu.warp_pipeline.render(
+            self.warp_pipeline.render(
                 queue,
                 encoder,
                 warp,
@@ -1283,25 +757,122 @@ impl Renderer {
                 final_target,
             );
         }
-    }
 
-    /// Clear frame state for next frame.
-    pub fn end_frame(&mut self) {
+        self.last_frame = Some(FrameRecord {
+            inv_view_proj: view_proj.inverse(),
+            size: internal_size,
+        });
         self.frame_meshes.clear();
         self.frame_lines.clear();
         self.frame_points.clear();
-        self.frame_retained_meshes.clear();
-        self.frame_retained_transforms.clear();
         self.frame_retained_lines.clear();
         self.frame_retained_points.clear();
         self.frame_retained_splats.clear();
+
+        FrameInfo {
+            overflow: overflow.any().then_some(overflow),
+        }
     }
 
-    /// Geometry the most recent [`render`](Self::render) dropped because it
-    /// exceeded the device's buffer size limit; `None` when everything fit.
-    /// Valid until the next `render` call (surviving `end_frame`).
-    pub fn frame_overflow(&self) -> Option<&GeometryOverflow> {
-        self.frame_overflow.any().then_some(&self.frame_overflow)
+    /// One pass over `target` drawing every line and point batch of
+    /// `depth_mode`, immediate then retained.
+    fn draw_lines_and_points(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        depth_mode: DepthMode,
+    ) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some(match depth_mode {
+                DepthMode::Normal => "forward_pass",
+                DepthMode::Overlay => "overlay_pass",
+            }),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &self.gbuffer.depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        self.line_pipeline.render_immediate(&mut pass, depth_mode);
+        self.point_pipeline.render_immediate(&mut pass, depth_mode);
+        for batch in &self.frame_retained_lines {
+            if batch.depth_mode() == depth_mode {
+                self.line_pipeline.render_retained(&mut pass, batch);
+            }
+        }
+        for batch in &self.frame_retained_points {
+            if batch.depth_mode() == depth_mode {
+                self.point_pipeline.render_retained(&mut pass, batch);
+            }
+        }
+    }
+
+    /// Asks what the last rendered frame drew at `pixel` of its target
+    /// (origin top-left). The answer arrives through
+    /// [`pick_result`](Self::pick_result) a moment later; asking again
+    /// before then replaces the question still waiting. Call between
+    /// frames, after the frame's commands were submitted: the read is
+    /// submitted at once and sees the G-buffer as it then stands.
+    pub fn request_pick(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, pixel: (u32, u32)) {
+        if self.picker.busy() {
+            self.queued_pick = Some(pixel);
+            return;
+        }
+        let Some(frame) = self.last_frame else {
+            return;
+        };
+        // Through a lens the target pixel shows some other pixel of the
+        // internal frame, or none.
+        let source = match &self.warp {
+            Some(warp) => {
+                let Some([x, y]) = warp.lookup(pixel.0 as f32 + 0.5, pixel.1 as f32 + 0.5) else {
+                    return;
+                };
+                if x < 0.0 || y < 0.0 {
+                    return;
+                }
+                (x as u32, y as u32)
+            }
+            None => pixel,
+        };
+        if source.0 >= frame.size.0 || source.1 >= frame.size.1 {
+            return;
+        }
+        self.picker.request(
+            device,
+            queue,
+            &self.gbuffer_bindings.pick,
+            frame,
+            pixel,
+            source,
+        );
+    }
+
+    /// The most recent pick to have landed, without waiting; `None` until
+    /// the first does. Its `pixel` says which request it answers.
+    pub fn pick_result(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> Option<Pick> {
+        self.picker.poll(device);
+        if !self.picker.busy()
+            && let Some(pixel) = self.queued_pick.take()
+        {
+            self.request_pick(device, queue, pixel);
+        }
+        self.picker.latest()
     }
 
     /// Update the grid line cache if settings have changed.
@@ -1327,200 +898,5 @@ impl Renderer {
         settings.subdivisions.hash(&mut hasher);
 
         hasher.finish()
-    }
-
-    /// Get the number of meshes submitted this frame.
-    pub fn mesh_count(&self) -> usize {
-        self.frame_meshes.len()
-    }
-
-    /// Get the number of line batches submitted this frame.
-    pub fn line_batch_count(&self) -> usize {
-        self.frame_lines.len()
-    }
-
-    /// Get the number of point batches submitted this frame.
-    pub fn point_batch_count(&self) -> usize {
-        self.frame_points.len()
-    }
-
-    /// Get total number of line segments submitted this frame.
-    pub fn line_segment_count(&self) -> usize {
-        self.frame_lines.iter().map(|l| l.data.segments.len()).sum()
-    }
-
-    /// Get total number of points submitted this frame.
-    pub fn point_count(&self) -> usize {
-        self.frame_points.iter().map(|p| p.data.points.len()).sum()
-    }
-
-    /// Get the number of grid lines.
-    pub fn grid_line_count(&self) -> usize {
-        self.cached_grid_lines.len()
-    }
-}
-
-/// Generate axis indicator lines for rendering.
-///
-/// Creates three line segments representing the X, Y, and Z axes,
-/// transformed by the camera's rotation for display in a corner viewport.
-pub fn generate_axis_indicator_lines(
-    camera: &Camera,
-    indicator: &AxisIndicator,
-) -> Vec<LineSegment> {
-    // Get the camera's view rotation
-    let view = camera.view_matrix();
-
-    // Extract rotation from view matrix (inverse of camera rotation)
-    // We want to show world axes as seen from the camera's perspective
-    let (_scale, rotation, _translation) = view.to_scale_rotation_translation();
-    let inv_rotation = rotation.inverse();
-
-    // Transform world axes to view space
-    let x_dir = inv_rotation * Vec3::X;
-    let y_dir = inv_rotation * Vec3::Y;
-    let z_dir = inv_rotation * Vec3::Z;
-
-    let origin = Vec3::ZERO;
-    let len = 1.0; // Normalized length, will be scaled by viewport
-
-    vec![
-        LineSegment {
-            start: origin.into(),
-            end: (origin + x_dir * len).into(),
-            color: indicator.x_color,
-        },
-        LineSegment {
-            start: origin.into(),
-            end: (origin + y_dir * len).into(),
-            color: indicator.y_color,
-        },
-        LineSegment {
-            start: origin.into(),
-            end: (origin + z_dir * len).into(),
-            color: indicator.z_color,
-        },
-    ]
-}
-
-/// Compute an orthographic projection for the axis indicator.
-pub fn axis_indicator_projection() -> Mat4 {
-    Mat4::orthographic_rh(-1.5, 1.5, -1.5, 1.5, -10.0, 10.0)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_renderer_creation() {
-        let renderer = Renderer::new(wgpu::TextureFormat::Bgra8Unorm);
-        assert_eq!(renderer.viewport_size(), (1, 1));
-        assert_eq!(renderer.mesh_count(), 0);
-        assert!(!renderer.is_initialized());
-    }
-
-    #[test]
-    fn test_submit_mesh() {
-        let mut renderer = Renderer::new(wgpu::TextureFormat::Bgra8Unorm);
-
-        let mesh = MeshData {
-            vertices: vec![MeshVertex::new([0.0, 0.0, 0.0], [0.0, 1.0, 0.0])],
-            indices: None,
-        };
-
-        renderer.submit_mesh(&mesh, Mat4::IDENTITY, MaterialId(0));
-        assert_eq!(renderer.mesh_count(), 1);
-
-        renderer.end_frame();
-        assert_eq!(renderer.mesh_count(), 0);
-    }
-
-    #[test]
-    fn test_grid_generation() {
-        let settings = GridSettings::default();
-        let lines = settings.generate_lines();
-
-        // With default settings (extent=10, spacing=1), we should have
-        // 21 lines in each direction (from -10 to +10) times 2 (X and Z parallel)
-        // = 42 lines on XZ plane
-        assert!(!lines.is_empty());
-    }
-
-    #[test]
-    fn test_axis_indicator_generation() {
-        let camera = Camera::default();
-        let indicator = AxisIndicator::default();
-        let lines = generate_axis_indicator_lines(&camera, &indicator);
-
-        assert_eq!(lines.len(), 3); // X, Y, Z axes
-    }
-
-    fn submitted(vertex_count: usize, indexed: bool) -> SubmittedMesh {
-        let vertices = vec![MeshVertex::new([0.0; 3], [0.0, 1.0, 0.0]); vertex_count];
-        let indices = indexed.then(|| (0..vertex_count as u32).collect());
-        SubmittedMesh {
-            data: MeshData { vertices, indices },
-            transform: Mat4::IDENTITY,
-            material: MaterialId(0),
-        }
-    }
-
-    /// A mesh that would overflow the vertex budget is dropped whole;
-    /// meshes around it still render, with indices rebased past the gap.
-    #[test]
-    fn flatten_drops_only_meshes_that_overflow_the_budget() {
-        let meshes = [
-            submitted(12, true),
-            submitted(99, true),
-            submitted(21, true),
-        ];
-        let (vertices, indices, use_indices, dropped_triangles, total_triangles) =
-            flatten_meshes_within_budget(&meshes, 50, usize::MAX);
-
-        assert_eq!(total_triangles, 4 + 33 + 7);
-        assert_eq!(dropped_triangles, 33);
-        assert_eq!(vertices.len(), 33);
-        assert!(use_indices);
-        // The third mesh's indices are rebased onto the compacted soup.
-        assert_eq!(indices[12], 12);
-        assert_eq!(*indices.last().unwrap(), 32);
-    }
-
-    /// The index budget is enforced independently of the vertex budget.
-    #[test]
-    fn flatten_enforces_the_index_budget() {
-        let meshes = [submitted(12, true), submitted(12, true)];
-        let (vertices, indices, _, dropped_triangles, total_triangles) =
-            flatten_meshes_within_budget(&meshes, usize::MAX, 15);
-
-        assert_eq!(total_triangles, 8);
-        assert_eq!(dropped_triangles, 4);
-        assert_eq!(vertices.len(), 12);
-        assert_eq!(indices.len(), 12);
-    }
-
-    /// Everything fits: nothing dropped and no overflow to report.
-    #[test]
-    fn flatten_within_budget_drops_nothing() {
-        let meshes = [submitted(12, false), submitted(18, false)];
-        let (vertices, indices, use_indices, dropped_triangles, total_triangles) =
-            flatten_meshes_within_budget(&meshes, 30, 30);
-
-        assert_eq!((vertices.len(), indices.len()), (30, 0));
-        assert!(!use_indices);
-        assert_eq!(dropped_triangles, 0);
-        assert_eq!(total_triangles, 10);
-        assert!(!GeometryOverflow::default().any());
-    }
-
-    /// Instance lists clamp to whole buffers' worth of elements.
-    #[test]
-    fn truncate_to_buffer_budget_clamps_by_bytes() {
-        let mut items: Vec<u32> = (0..100).collect();
-        // 40 bytes = 10 u32s.
-        assert_eq!(truncate_to_buffer_budget(&mut items, 40), 90);
-        assert_eq!(items.len(), 10);
-        assert_eq!(truncate_to_buffer_budget(&mut items, 40), 0);
     }
 }

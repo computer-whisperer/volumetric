@@ -62,16 +62,6 @@ impl Default for PointUniforms {
     }
 }
 
-impl PartialEq for PointUniforms {
-    fn eq(&self, other: &Self) -> bool {
-        self.view_proj == other.view_proj
-            && self.screen_size_px == other.screen_size_px
-            && (self.point_size_px - other.point_size_px).abs() < f32::EPSILON
-            && self.size_mode == other.size_mode
-            && self.shape == other.shape
-    }
-}
-
 /// A point batch resident on the GPU: world-space instances uploaded once
 /// (at build time), drawn by reference each frame. Owns its uniform buffer
 /// and bind group (per-batch style + per-frame camera); the renderer
@@ -94,15 +84,15 @@ impl GpuPoints {
     }
 }
 
-/// Immediate-mode GPU state for one depth mode's point pass. Each pass needs
-/// its own buffers: `queue.write_buffer` executes at submit, before any
-/// encoded pass runs, so uploads for a later pass into shared buffers would
-/// clobber an earlier pass's data.
+/// One immediate batch's GPU state. Every batch of a frame needs its own
+/// buffers: `queue.write_buffer` executes at submit, before any encoded
+/// pass runs, so a second batch written into shared buffers would clobber
+/// the first. Slots are reused frame to frame.
 struct ImmediatePoints {
     instance_buffer: DynamicBuffer<GpuPointInstance>,
     uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
-    cached_uniforms: Option<PointUniforms>,
+    depth_mode: DepthMode,
 }
 
 /// Pipeline for rendering points as screen-aligned quads.
@@ -116,16 +106,10 @@ pub struct PointPipeline {
     quad_vertex_buffer: StaticBuffer<QuadVertex>,
     /// Static quad index buffer
     quad_index_buffer: StaticBuffer<u16>,
-    /// Per-depth-mode immediate state, indexed by [`slot_index`].
-    immediate: [ImmediatePoints; 2],
-}
-
-/// The [`PointPipeline::immediate`] slot for a depth mode.
-fn slot_index(depth_mode: DepthMode) -> usize {
-    match depth_mode {
-        DepthMode::Normal => 0,
-        DepthMode::Overlay => 1,
-    }
+    /// Immediate batch slots; the first `immediate_used` hold this
+    /// frame's batches, in submission order.
+    immediate: Vec<ImmediatePoints>,
+    immediate_used: usize,
 }
 
 impl PointPipeline {
@@ -229,7 +213,7 @@ impl PointPipeline {
                 conservative: false,
             },
             depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth24Plus,
+                format: crate::GBuffer::DEPTH_FORMAT,
                 depth_write_enabled: Some(true),
                 depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: wgpu::StencilState::default(),
@@ -270,7 +254,7 @@ impl PointPipeline {
                 conservative: false,
             },
             depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth24Plus,
+                format: crate::GBuffer::DEPTH_FORMAT,
                 depth_write_enabled: Some(false),
                 depth_compare: Some(wgpu::CompareFunction::Always),
                 stencil: wgpu::StencilState::default(),
@@ -279,32 +263,6 @@ impl PointPipeline {
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
             cache: None,
-        });
-
-        // Per-depth-mode immediate buffers
-        let immediate = std::array::from_fn(|_| {
-            let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("point_uniform_buffer"),
-                contents: bytemuck::bytes_of(&PointUniforms::default()),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            });
-            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("point_uniform_bg"),
-                layout: &bind_group_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform_buffer.as_entire_binding(),
-                }],
-            });
-            ImmediatePoints {
-                instance_buffer: DynamicBuffer::new(
-                    wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                    "point_instance_buffer",
-                ),
-                uniform_buffer,
-                bind_group,
-                cached_uniforms: None,
-            }
         });
 
         // Static quad buffers
@@ -327,41 +285,64 @@ impl PointPipeline {
             bind_group_layout,
             quad_vertex_buffer,
             quad_index_buffer,
-            immediate,
+            immediate: Vec::new(),
+            immediate_used: 0,
         }
     }
 
-    /// Update a depth mode's uniforms if they have changed.
-    pub fn update_uniforms(
-        &mut self,
-        queue: &wgpu::Queue,
-        uniforms: &PointUniforms,
-        depth_mode: DepthMode,
-    ) {
-        let slot = &mut self.immediate[slot_index(depth_mode)];
-        if slot.cached_uniforms.as_ref() == Some(uniforms) {
-            return;
-        }
-        queue.write_buffer(&slot.uniform_buffer, 0, bytemuck::bytes_of(uniforms));
-        slot.cached_uniforms = Some(*uniforms);
+    /// Forgets the previous frame's immediate batches (their slots stay
+    /// allocated).
+    pub fn begin_frame(&mut self) {
+        self.immediate_used = 0;
     }
 
-    /// Prepare GPU instances from point data.
-    pub fn prepare_instances(points: &[PointInstance]) -> Vec<GpuPointInstance> {
-        points.iter().map(GpuPointInstance::from).collect()
-    }
-
-    /// Upload point instances for a depth mode's pass to the GPU.
-    pub fn upload_instances(
+    /// Uploads one immediate batch with its own style, to be drawn by
+    /// [`render_immediate`](Self::render_immediate) in the pass matching
+    /// the style's depth mode. Returns how many instances did not fit the
+    /// device's buffer size limit.
+    pub fn upload_immediate(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         instances: &[GpuPointInstance],
-        depth_mode: DepthMode,
-    ) {
-        self.immediate[slot_index(depth_mode)]
-            .instance_buffer
-            .upload(device, queue, instances);
+        style: &PointStyle,
+        view_proj: [[f32; 4]; 4],
+        screen_size_px: [f32; 2],
+    ) -> usize {
+        if instances.is_empty() {
+            return 0;
+        }
+        if self.immediate_used == self.immediate.len() {
+            let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("point_uniform_buffer"),
+                contents: bytemuck::bytes_of(&PointUniforms::default()),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("point_uniform_bg"),
+                layout: &self.bind_group_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                }],
+            });
+            self.immediate.push(ImmediatePoints {
+                instance_buffer: DynamicBuffer::new(
+                    wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    "point_instance_buffer",
+                ),
+                uniform_buffer,
+                bind_group,
+                depth_mode: style.depth_mode,
+            });
+        }
+        let slot = &mut self.immediate[self.immediate_used];
+        self.immediate_used += 1;
+        slot.depth_mode = style.depth_mode;
+        let uploaded = slot.instance_buffer.upload(device, queue, instances);
+        let uniforms = Self::create_uniforms(view_proj, screen_size_px, style);
+        queue.write_buffer(&slot.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+        instances.len() - uploaded
     }
 
     /// Create uniforms from view-proj matrix, screen size, and style.
@@ -473,35 +454,33 @@ impl PointPipeline {
         render_pass.draw_indexed(0..6, 0, 0..batch.count);
     }
 
-    /// Record a depth mode's point render pass.
-    pub fn render<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>, depth_mode: DepthMode) {
-        let slot = &self.immediate[slot_index(depth_mode)];
-        if slot.instance_buffer.is_empty() {
-            return;
-        }
-
+    /// Draws this frame's immediate batches of `depth_mode`, in submission
+    /// order, each with its own style.
+    pub fn render_immediate<'a>(
+        &'a self,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        depth_mode: DepthMode,
+    ) {
         let pipeline = match depth_mode {
             DepthMode::Normal => &self.depth_pipeline,
             DepthMode::Overlay => &self.overlay_pipeline,
         };
-
-        render_pass.set_pipeline(pipeline);
-        render_pass.set_bind_group(0, &slot.bind_group, &[]);
-        render_pass.set_vertex_buffer(0, self.quad_vertex_buffer.buffer().slice(..));
-        if let Some(instance_buffer) = slot.instance_buffer.buffer() {
-            render_pass.set_vertex_buffer(1, instance_buffer.slice(..));
+        for slot in &self.immediate[..self.immediate_used] {
+            let Some(instances) = slot.instance_buffer.buffer() else {
+                continue;
+            };
+            if slot.depth_mode != depth_mode || slot.instance_buffer.is_empty() {
+                continue;
+            }
+            render_pass.set_pipeline(pipeline);
+            render_pass.set_bind_group(0, &slot.bind_group, &[]);
+            render_pass.set_vertex_buffer(0, self.quad_vertex_buffer.buffer().slice(..));
+            render_pass.set_vertex_buffer(1, instances.slice(..));
+            render_pass.set_index_buffer(
+                self.quad_index_buffer.buffer().slice(..),
+                wgpu::IndexFormat::Uint16,
+            );
+            render_pass.draw_indexed(0..6, 0, 0..slot.instance_buffer.len() as u32);
         }
-        render_pass.set_index_buffer(
-            self.quad_index_buffer.buffer().slice(..),
-            wgpu::IndexFormat::Uint16,
-        );
-
-        // Draw: 6 indices per quad, N instances
-        render_pass.draw_indexed(0..6, 0, 0..slot.instance_buffer.len() as u32);
-    }
-
-    /// Get the number of point instances currently uploaded for a depth mode.
-    pub fn instance_count(&self, depth_mode: DepthMode) -> usize {
-        self.immediate[slot_index(depth_mode)].instance_buffer.len()
     }
 }

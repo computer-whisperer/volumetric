@@ -26,8 +26,8 @@ use volumetric_preview::{
     wireframe_style,
 };
 use volumetric_renderer::{
-    Camera, CameraView, GridPlanes, LineData, RenderSettings, ViewDirection, Warp,
-    offscreen::Offscreen,
+    Camera, CameraView, GridPlanes, LineData, MaterialId, ObjectId, RenderSettings, ViewDirection,
+    Warp, offscreen::Offscreen,
 };
 
 pub use view_core::overlay::Overlay;
@@ -780,9 +780,6 @@ pub fn render(
         ssao_enabled: options.ssao,
         ..RenderSettings::default()
     };
-    if overlay.is_some() {
-        settings.show_axis_indicator = false;
-    }
     if options.grid > 0.0 && overlay.is_none() {
         let extent = (Vec3::from(bounds.max) - Vec3::from(bounds.min)).length();
         settings.grid.planes = grid_planes_for(up);
@@ -796,7 +793,12 @@ pub fn render(
     for (suffix, view) in frames {
         for (scene, entity) in resident.iter().zip(&entities) {
             for (mesh, transform) in &scene.meshes {
-                renderer.submit_retained_mesh(mesh, *transform);
+                renderer.submit_retained_mesh(
+                    mesh,
+                    *transform,
+                    ObjectId::NONE,
+                    MaterialId::default(),
+                );
             }
             for lines in &scene.lines {
                 renderer.submit_retained_lines(lines);
@@ -816,10 +818,10 @@ pub fn render(
                 submit_subspace_gizmo(&mut renderer, subspace, bounds);
             }
         }
-        let rgba = offscreen
+        let (rgba, info) = offscreen
             .render_rgba(&mut renderer, &view, &settings)
             .map_err(anyhow::Error::msg)?;
-        if let Some(overflow) = renderer.frame_overflow() {
+        if let Some(overflow) = info.overflow {
             notes.push(format!(
                 "dropped {} of {} triangles, {} lines, {} points and {} splat primitives at the GPU buffer limit",
                 overflow.dropped_triangles,
@@ -867,11 +869,10 @@ pub fn render(
                 let mut marks_settings = RenderSettings {
                     background_color: SENTINEL,
                     ssao_enabled: false,
-                    show_axis_indicator: false,
                     ..RenderSettings::default()
                 };
                 marks_settings.grid.planes = GridPlanes::NONE;
-                let lines = offscreen
+                let (lines, _) = offscreen
                     .render_rgba(&mut renderer, &view, &marks_settings)
                     .map_err(anyhow::Error::msg)?;
                 let mut rgba = over(rgba, &lines);

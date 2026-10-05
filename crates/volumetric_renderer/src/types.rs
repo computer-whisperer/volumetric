@@ -2,8 +2,6 @@
 //!
 //! Defines render primitives (mesh, line, point data) and their associated styles.
 
-#![allow(dead_code)]
-
 use bytemuck::{Pod, Zeroable};
 
 // ============================================================================
@@ -49,9 +47,21 @@ impl MeshVertex {
     }
 }
 
-/// Material identifier for meshes.
+/// Material identifier for meshes: an index into the frame's material
+/// table (0..=255), carried through the G-buffer.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct MaterialId(pub u32);
+
+/// What a mesh draw is, to whoever asks what is under a pixel: written to
+/// the G-buffer and handed back by a pick. The host chooses the
+/// numbering; [`ObjectId::NONE`] is the background and any draw the host
+/// does not care to tell apart.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ObjectId(pub u32);
+
+impl ObjectId {
+    pub const NONE: Self = Self(0);
+}
 
 // ============================================================================
 // Line Types
@@ -485,40 +495,6 @@ impl GridSettings {
 }
 
 // ============================================================================
-// Axis Indicator
-// ============================================================================
-
-/// Configuration for the axis indicator widget.
-#[derive(Clone, Debug)]
-pub struct AxisIndicator {
-    /// Screen position (normalized, 0-1, from bottom-left)
-    pub position: [f32; 2],
-    /// Size in pixels
-    pub size: f32,
-    /// X axis color (red)
-    pub x_color: [f32; 4],
-    /// Y axis color (green)
-    pub y_color: [f32; 4],
-    /// Z axis color (blue)
-    pub z_color: [f32; 4],
-    /// Whether to show axis labels
-    pub show_labels: bool,
-}
-
-impl Default for AxisIndicator {
-    fn default() -> Self {
-        Self {
-            position: [0.92, 0.08], // Bottom-right corner
-            size: 60.0,
-            x_color: [1.0, 0.2, 0.2, 1.0], // Red
-            y_color: [0.2, 1.0, 0.2, 1.0], // Green
-            z_color: [0.2, 0.2, 1.0, 1.0], // Blue
-            show_labels: true,
-        }
-    }
-}
-
-// ============================================================================
 // Render Settings
 // ============================================================================
 
@@ -527,8 +503,6 @@ impl Default for AxisIndicator {
 pub struct RenderSettings {
     /// Enable SSAO (screen-space ambient occlusion)
     pub ssao_enabled: bool,
-    /// SSAO sample count (8 for web, 16 for native)
-    pub ssao_samples: u32,
     /// SSAO radius in world units
     pub ssao_radius: f32,
     /// SSAO bias
@@ -537,26 +511,18 @@ pub struct RenderSettings {
     pub ssao_strength: f32,
     /// Grid settings
     pub grid: GridSettings,
-    /// Axis indicator settings
-    pub axis_indicator: AxisIndicator,
-    /// Show axis indicator
-    pub show_axis_indicator: bool,
     /// Background color
     pub background_color: [f32; 4],
 }
 
 impl Default for RenderSettings {
     fn default() -> Self {
-        let is_web = cfg!(target_arch = "wasm32");
         Self {
             ssao_enabled: true,
-            ssao_samples: if is_web { 8 } else { 16 },
             ssao_radius: 0.5,
             ssao_bias: 0.025,
             ssao_strength: 1.0,
             grid: GridSettings::default(),
-            axis_indicator: AxisIndicator::default(),
-            show_axis_indicator: true,
             background_color: [0.1, 0.1, 0.1, 1.0],
         }
     }

@@ -222,7 +222,7 @@ impl ApplicationHandler for Host {
         }
 
         self.gfx = Some(Gfx {
-            session: Session::new(&device, &queue, format),
+            session: Session::new(&device, format),
             damascene,
             surface,
             queue,

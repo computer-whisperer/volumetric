@@ -4,7 +4,7 @@
 
 use std::sync::mpsc;
 
-use crate::{CameraView, RenderSettings, Renderer};
+use crate::{CameraView, FrameInfo, Pick, RenderSettings, Renderer};
 
 /// A GPU device with no surface, and the readback path that turns a frame
 /// into bytes.
@@ -21,8 +21,18 @@ impl Offscreen {
 
     /// Opens the highest-performance adapter available with no window.
     pub fn new() -> Result<Self, String> {
+        Self::open(wgpu::Backends::all(), false)
+    }
+
+    /// Opens a GLES adapter under WebGL2's limits: the nearest thing to
+    /// the web build's fallback backend that runs without a browser.
+    pub fn new_webgl2_like() -> Result<Self, String> {
+        Self::open(wgpu::Backends::GL, true)
+    }
+
+    fn open(backends: wgpu::Backends, webgl2_limits: bool) -> Result<Self, String> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
+            backends,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -32,15 +42,20 @@ impl Offscreen {
             apply_limit_buckets: false,
         }))
         .map_err(|err| format!("no GPU adapter for offscreen rendering: {err}"))?;
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("volumetric offscreen"),
+        let required_limits = if webgl2_limits {
+            wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits())
+        } else {
             // A splat of a few million primitives passes wgpu's 256 MiB
             // default buffer ceiling; take what the hardware allows, as the
             // GUI does. The renderer clamps to the granted limit.
-            required_limits: wgpu::Limits {
+            wgpu::Limits {
                 max_buffer_size: adapter.limits().max_buffer_size,
                 ..wgpu::Limits::default()
-            },
+            }
+        };
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("volumetric offscreen"),
+            required_limits,
             ..Default::default()
         }))
         .map_err(|err| format!("GPU device: {err}"))?;
@@ -66,21 +81,20 @@ impl Offscreen {
     /// A renderer initialised on this device and sized to `width` x
     /// `height` pixels.
     pub fn renderer(&self, width: u32, height: u32) -> Renderer {
-        let mut renderer = Renderer::new(Self::FORMAT);
+        let mut renderer = Renderer::new(&self.device, Self::FORMAT);
         renderer.set_viewport_size(&self.device, width, height);
-        renderer.initialize(&self.device, &self.queue, Some(&self.adapter));
         renderer
     }
 
     /// Draws the geometry submitted to `renderer` with `view` and returns
-    /// the frame as RGBA8 rows, top row first, `width * height * 4` bytes.
-    /// Ends the renderer's frame; its overflow report stays readable.
+    /// the frame as RGBA8 rows, top row first, `width * height * 4` bytes,
+    /// with what the frame reported.
     pub fn render_rgba(
         &self,
         renderer: &mut Renderer,
         view: &CameraView,
         settings: &RenderSettings,
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<(Vec<u8>, FrameInfo), String> {
         let (width, height) = renderer.viewport_size();
         let extent = wgpu::Extent3d {
             width,
@@ -101,7 +115,7 @@ impl Offscreen {
 
         renderer.settle_splats(&self.queue, view);
         let mut encoder = self.device.create_command_encoder(&Default::default());
-        renderer.render_view(
+        let info = renderer.render(
             &self.device,
             &self.queue,
             &mut encoder,
@@ -109,7 +123,6 @@ impl Offscreen {
             settings,
             &target_view,
         );
-        renderer.end_frame();
 
         // Rows in the copy buffer are padded to the copy alignment.
         let unpadded = width * 4;
@@ -159,7 +172,17 @@ impl Offscreen {
         for row in data.chunks_exact(padded as usize) {
             rgba.extend_from_slice(&row[..unpadded as usize]);
         }
-        Ok(rgba)
+        Ok((rgba, info))
+    }
+
+    /// What the last frame `renderer` drew has at `pixel`, waiting for the
+    /// answer. `None` when there is no frame or the pixel is outside it.
+    pub fn pick(&self, renderer: &mut Renderer, pixel: (u32, u32)) -> Option<Pick> {
+        renderer.request_pick(&self.device, &self.queue, pixel);
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        renderer
+            .pick_result(&self.device, &self.queue)
+            .filter(|pick| pick.pixel == pixel)
     }
 }
 
@@ -205,14 +228,13 @@ mod tests {
         let settings = RenderSettings {
             background_color: [0.0, 0.0, 1.0, 1.0],
             ssao_enabled: false,
-            show_axis_indicator: false,
             ..RenderSettings::default()
         };
         for _ in 0..2 {
             for splat in &resident.splats {
                 renderer.submit_retained_splat(splat);
             }
-            let rgba = offscreen
+            let (rgba, _) = offscreen
                 .render_rgba(&mut renderer, &view, &settings)
                 .unwrap();
             let px = |x: u32, y: u32| {
@@ -264,7 +286,6 @@ mod tests {
         let mut settings = RenderSettings {
             background_color: [0.0, 0.0, 1.0, 1.0],
             ssao_enabled: false,
-            show_axis_indicator: false,
             ..RenderSettings::default()
         };
         settings.grid.planes = crate::GridPlanes::NONE;
@@ -272,7 +293,7 @@ mod tests {
             for splat in &resident.splats {
                 renderer.submit_retained_splat(splat);
             }
-            offscreen.render_rgba(renderer, &view, &settings).unwrap()
+            offscreen.render_rgba(renderer, &view, &settings).unwrap().0
         };
         let straight = frame(&mut renderer);
         renderer
@@ -389,7 +410,6 @@ mod bench {
         );
         let settings = RenderSettings {
             ssao_enabled: false,
-            show_axis_indicator: false,
             ..RenderSettings::default()
         };
         for (label, angle) in [

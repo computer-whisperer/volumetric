@@ -1,16 +1,7 @@
-// Mesh G-buffer rendering shader
-//
-// Renders triangle meshes to the G-buffer with:
-// - Color: Lit diffuse color
-// - Normal: World-space normal encoded to [0,1]
-// - Depth: NDC depth for SSAO sampling
+// Mesh geometry source: fills the G-buffer. No lighting here.
 
 struct Uniforms {
     view_proj: mat4x4<f32>,
-    light_dir_world: vec3<f32>,
-    _pad0: f32,
-    base_color: vec3<f32>,
-    _pad1: f32,
 };
 
 @group(0) @binding(0)
@@ -20,19 +11,21 @@ struct VsIn {
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) color: vec4<f32>,
-    // The draw's model matrix, one instance per draw: identity for the
-    // immediate soup (already world-space), a retained mesh's pose
-    // otherwise. Rigid or uniform-scale only: normals take its rotation.
+    // Per draw, one instance each: the model matrix (rigid or
+    // uniform-scale only: normals take its rotation), then the object id
+    // and material index.
     @location(3) model_0: vec4<f32>,
     @location(4) model_1: vec4<f32>,
     @location(5) model_2: vec4<f32>,
     @location(6) model_3: vec4<f32>,
+    @location(7) ids: vec2<u32>,
 };
 
 struct VsOut {
     @builtin(position) position: vec4<f32>,
     @location(0) normal_world: vec3<f32>,
     @location(1) color: vec4<f32>,
+    @location(2) @interpolate(flat) ids: vec2<u32>,
 };
 
 @vertex
@@ -42,38 +35,33 @@ fn vs_main(in: VsIn) -> VsOut {
     out.position = uniforms.view_proj * model * vec4<f32>(in.position, 1.0);
     out.normal_world = mat3x3<f32>(model[0].xyz, model[1].xyz, model[2].xyz) * in.normal;
     out.color = in.color;
+    out.ids = in.ids;
     return out;
 }
 
 struct FsOut {
-    @location(0) color: vec4<f32>,
-    // Encoded normal in 0..1 for sampling
-    @location(1) normal_enc: vec4<f32>,
-    // Store fragment depth (0..1, wgpu NDC Z range) for SSAO sampling
-    // Output as vec4 for compatibility with both R32Float and Rgba16Float formats
-    @location(2) depth: vec4<f32>,
+    // rgb: base colour, square-root encoded so 8 bits hold the darks;
+    // a: material index / 255.
+    @location(0) albedo: vec4<f32>,
+    // rgb: world normal mapped to 0..1; a: 1 = a normal was supplied.
+    @location(1) normal: vec4<f32>,
+    // r: object id; g: the bits of this fragment's depth.
+    @location(2) surface: vec2<u32>,
 };
 
 @fragment
 fn fs_gbuffer(in: VsOut) -> FsOut {
-    // Degenerate interpolated normals must not reach normalize(): NaN
-    // written to the unorm color target clamps to white on many drivers
-    // and reads as a glowing, view-independent surface.
+    // A degenerate interpolated normal must not reach a division: NaN in
+    // a unorm target clamps to white on many drivers.
     let n_len = length(in.normal_world);
     let n = select(vec3<f32>(0.0, 0.0, 1.0), in.normal_world / n_len, n_len > 1e-8);
-    let l = normalize(uniforms.light_dir_world);
-
-    // Manifold meshes: use one-sided lighting and rely on back-face culling.
-    let ndotl = max(dot(n, l), 0.0);
-    let ambient = 0.22;
-    let diffuse = 0.78 * ndotl;
-    let color = uniforms.base_color * in.color.rgb * (ambient + diffuse);
 
     var out: FsOut;
-    out.color = vec4<f32>(clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
-    out.normal_enc = vec4<f32>(n * 0.5 + vec3<f32>(0.5), 1.0);
-    // `in.position` is clip-space; z/w gives NDC depth in [0,1].
-    let depth_value = in.position.z / in.position.w;
-    out.depth = vec4<f32>(depth_value, 0.0, 0.0, 1.0);
+    out.albedo = vec4<f32>(
+        sqrt(clamp(in.color.rgb, vec3<f32>(0.0), vec3<f32>(1.0))),
+        f32(in.ids.y) / 255.0,
+    );
+    out.normal = vec4<f32>(n * 0.5 + vec3<f32>(0.5), 1.0);
+    out.surface = vec2<u32>(in.ids.x, bitcast<u32>(in.position.z));
     return out;
 }

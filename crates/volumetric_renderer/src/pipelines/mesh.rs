@@ -1,18 +1,17 @@
-//! Mesh G-buffer rendering pipeline.
-//!
-//! Renders triangle meshes to the G-buffer with deferred shading data.
+//! The mesh geometry source: retained triangle meshes drawn into the
+//! G-buffer.
 
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
 
-use crate::{DynamicBuffer, MeshData, MeshVertex};
+use crate::{DynamicBuffer, GBuffer, MaterialId, MeshData, MeshVertex, ObjectId};
 
 /// A mesh resident on the GPU: its vertices as given (the transform is
 /// applied per draw), uploaded once and drawn by reference each frame with
 /// whatever pose the frame submits, so re-posing a part costs nothing and
 /// rebuilding a preview is the only time its dense buffers travel to the
-/// device. Created by [`GpuMesh::new`]; drawn via
+/// device. Created by `Renderer::create_retained_mesh`; drawn via
 /// `Renderer::submit_retained_mesh`.
 pub struct GpuMesh {
     vertex_buffer: wgpu::Buffer,
@@ -121,70 +120,35 @@ fn clamp_mesh_to_budget(
     }
 }
 
-/// Uniform data for mesh rendering.
+/// One draw's instance data: the model matrix, column major, then the
+/// object id and material index the G-buffer carries for it.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
-pub struct MeshUniforms {
-    pub view_proj: [[f32; 4]; 4],
-    pub light_dir_world: [f32; 3],
-    pub _pad0: f32,
-    pub base_color: [f32; 3],
-    pub _pad1: f32,
+struct DrawInstance {
+    model: [[f32; 4]; 4],
+    ids: [u32; 2],
+    _pad: [u32; 2],
 }
 
-impl Default for MeshUniforms {
-    fn default() -> Self {
-        Self {
-            view_proj: Mat4::IDENTITY.to_cols_array_2d(),
-            light_dir_world: [0.4, 0.7, 0.2],
-            _pad0: 0.0,
-            base_color: [0.85, 0.9, 1.0],
-            _pad1: 0.0,
-        }
-    }
+/// A retained mesh submitted for a frame.
+pub struct MeshDraw {
+    pub mesh: std::sync::Arc<GpuMesh>,
+    pub transform: Mat4,
+    pub object: ObjectId,
+    pub material: MaterialId,
 }
 
-impl PartialEq for MeshUniforms {
-    fn eq(&self, other: &Self) -> bool {
-        self.view_proj == other.view_proj
-            && self.light_dir_world == other.light_dir_world
-            && self.base_color == other.base_color
-    }
-}
-
-/// One draw's model matrix, column major, read as an instance attribute.
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Pod, Zeroable)]
-struct ModelInstance {
-    columns: [[f32; 4]; 4],
-}
-
-impl ModelInstance {
-    fn of(transform: Mat4) -> Self {
-        Self {
-            columns: transform.to_cols_array_2d(),
-        }
-    }
-}
-
-/// Pipeline for rendering meshes to the G-buffer.
+/// The mesh geometry source: draws retained meshes into the G-buffer.
 pub struct MeshPipeline {
     pipeline: wgpu::RenderPipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
     uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
-    vertex_buffer: DynamicBuffer<MeshVertex>,
-    index_buffer: DynamicBuffer<u32>,
-    /// Slot 0 the identity for the immediate soup, then one entry per
-    /// retained mesh submitted this frame.
-    instance_buffer: DynamicBuffer<ModelInstance>,
-    cached_uniforms: Option<MeshUniforms>,
+    /// One entry per mesh drawn this frame, in draw order.
+    instance_buffer: DynamicBuffer<DrawInstance>,
 }
 
 impl MeshPipeline {
-    /// Create a new mesh pipeline.
-    pub fn new(device: &wgpu::Device, color_format: wgpu::TextureFormat) -> Self {
-        // Shader
+    pub fn new(device: &wgpu::Device) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("mesh_gbuffer_shader"),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
@@ -192,12 +156,11 @@ impl MeshPipeline {
             ))),
         });
 
-        // Bind group layout
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("mesh_uniform_bgl"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                visibility: wgpu::ShaderStages::VERTEX,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -206,15 +169,19 @@ impl MeshPipeline {
                 count: None,
             }],
         });
-
-        // Pipeline layout
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("mesh_gbuffer_pipeline_layout"),
             bind_group_layouts: &[Some(&bind_group_layout)],
             immediate_size: 0,
         });
 
-        // Render pipeline
+        let target = |format| {
+            Some(wgpu::ColorTargetState {
+                format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })
+        };
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("mesh_gbuffer_pipeline"),
             layout: Some(&pipeline_layout),
@@ -225,25 +192,19 @@ impl MeshPipeline {
                     Some(wgpu::VertexBufferLayout {
                         array_stride: std::mem::size_of::<MeshVertex>() as u64,
                         step_mode: wgpu::VertexStepMode::Vertex,
+                        // Offsets come from the struct: MeshVertex pads the
+                        // position and normal out to 16 bytes each.
                         attributes: &[
-                            // position
                             wgpu::VertexAttribute {
                                 format: wgpu::VertexFormat::Float32x3,
-                                offset: 0,
+                                offset: std::mem::offset_of!(MeshVertex, position) as u64,
                                 shader_location: 0,
                             },
-                            // normal — offset 16, not 12: MeshVertex pads the
-                            // position out to 16 bytes (_pad0), so the normal
-                            // starts one f32 later than a packed layout would.
-                            // Reading at 12 fed the shader (_pad0, nx, ny),
-                            // which turned exactly-axis-aligned normals into
-                            // normalize((0,0,0)) = NaN.
                             wgpu::VertexAttribute {
                                 format: wgpu::VertexFormat::Float32x3,
                                 offset: std::mem::offset_of!(MeshVertex, normal) as u64,
                                 shader_location: 1,
                             },
-                            // vertex color (multiplied into the base color)
                             wgpu::VertexAttribute {
                                 format: wgpu::VertexFormat::Float32x4,
                                 offset: std::mem::offset_of!(MeshVertex, color) as u64,
@@ -251,9 +212,8 @@ impl MeshPipeline {
                             },
                         ],
                     }),
-                    // The draw's model matrix, one instance per draw.
                     Some(wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<ModelInstance>() as u64,
+                        array_stride: std::mem::size_of::<DrawInstance>() as u64,
                         step_mode: wgpu::VertexStepMode::Instance,
                         attributes: &[
                             wgpu::VertexAttribute {
@@ -276,6 +236,11 @@ impl MeshPipeline {
                                 offset: 48,
                                 shader_location: 6,
                             },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Uint32x2,
+                                offset: std::mem::offset_of!(DrawInstance, ids) as u64,
+                                shader_location: 7,
+                            },
                         ],
                     }),
                 ],
@@ -285,28 +250,9 @@ impl MeshPipeline {
                 module: &shader,
                 entry_point: Some("fs_gbuffer"),
                 targets: &[
-                    // Color output
-                    Some(wgpu::ColorTargetState {
-                        format: color_format,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    }),
-                    // Normal output
-                    Some(wgpu::ColorTargetState {
-                        format: wgpu::TextureFormat::Rgba8Unorm,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    }),
-                    // Depth output (for SSAO)
-                    // Use Rgba16Float on web for better compatibility
-                    Some(wgpu::ColorTargetState {
-                        #[cfg(target_arch = "wasm32")]
-                        format: wgpu::TextureFormat::Rgba16Float,
-                        #[cfg(not(target_arch = "wasm32"))]
-                        format: wgpu::TextureFormat::R32Float,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    }),
+                    target(GBuffer::ALBEDO_FORMAT),
+                    target(GBuffer::NORMAL_FORMAT),
+                    target(GBuffer::SURFACE_FORMAT),
                 ],
                 compilation_options: Default::default(),
             }),
@@ -320,7 +266,7 @@ impl MeshPipeline {
                 conservative: false,
             },
             depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth24Plus,
+                format: GBuffer::DEPTH_FORMAT,
                 depth_write_enabled: Some(true),
                 depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: wgpu::StencilState::default(),
@@ -331,15 +277,11 @@ impl MeshPipeline {
             cache: None,
         });
 
-        // Uniform buffer
-        let uniforms = MeshUniforms::default();
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("mesh_uniform_buffer"),
-            contents: bytemuck::bytes_of(&uniforms),
+            contents: bytemuck::bytes_of(&Mat4::IDENTITY.to_cols_array_2d()),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
-
-        // Bind group
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("mesh_uniform_bg"),
             layout: &bind_group_layout,
@@ -349,131 +291,58 @@ impl MeshPipeline {
             }],
         });
 
-        // Vertex and index buffers
-        let vertex_buffer = DynamicBuffer::new(
-            wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            "mesh_vertex_buffer",
-        );
-        let index_buffer = DynamicBuffer::new(
-            wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-            "mesh_index_buffer",
-        );
-        let instance_buffer = DynamicBuffer::new(
-            wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            "mesh_instance_buffer",
-        );
-
         Self {
             pipeline,
-            bind_group_layout,
             uniform_buffer,
             bind_group,
-            vertex_buffer,
-            index_buffer,
-            instance_buffer,
-            cached_uniforms: None,
+            instance_buffer: DynamicBuffer::new(
+                wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                "mesh_instance_buffer",
+            ),
         }
     }
 
-    /// Update uniforms if they have changed.
-    pub fn update_uniforms(&mut self, queue: &wgpu::Queue, uniforms: &MeshUniforms) {
-        if self.cached_uniforms.as_ref() == Some(uniforms) {
-            return;
-        }
-        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(uniforms));
-        self.cached_uniforms = Some(*uniforms);
-    }
-
-    /// Upload vertex data.
-    pub fn upload_vertices(
+    /// Uploads the frame's camera and one instance per draw. Call before
+    /// the pass that [`render`](Self::render)s the same draws.
+    pub fn prepare(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        vertices: &[MeshVertex],
+        view_proj: Mat4,
+        draws: &[MeshDraw],
     ) {
-        self.vertex_buffer.upload(device, queue, vertices);
-    }
-
-    /// Upload index data.
-    pub fn upload_indices(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, indices: &[u32]) {
-        self.index_buffer.upload(device, queue, indices);
-    }
-
-    /// Upload this frame's retained meshes' transforms (slot 0 stays the
-    /// identity for the immediate soup). Call before the pass that draws
-    /// them.
-    pub fn upload_transforms(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        transforms: &[Mat4],
-    ) {
-        let instances: Vec<ModelInstance> = std::iter::once(Mat4::IDENTITY)
-            .chain(transforms.iter().copied())
-            .map(ModelInstance::of)
+        queue.write_buffer(
+            &self.uniform_buffer,
+            0,
+            bytemuck::bytes_of(&view_proj.to_cols_array_2d()),
+        );
+        let instances: Vec<DrawInstance> = draws
+            .iter()
+            .map(|draw| DrawInstance {
+                model: draw.transform.to_cols_array_2d(),
+                ids: [draw.object.0, draw.material.0],
+                _pad: [0; 2],
+            })
             .collect();
         self.instance_buffer.upload(device, queue, &instances);
     }
 
-    /// The instance buffer slice of entry `index` (0 = identity).
-    fn instance_slice(&self, index: usize) -> Option<wgpu::BufferSlice<'_>> {
-        let stride = std::mem::size_of::<ModelInstance>() as u64;
-        let start = index as u64 * stride;
-        Some(self.instance_buffer.buffer()?.slice(start..start + stride))
-    }
-
-    /// Record the G-buffer render pass.
-    ///
-    /// This renders meshes to the G-buffer textures (color, normal, depth).
-    pub fn render<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>, use_indices: bool) {
-        if self.vertex_buffer.is_empty() {
-            return;
-        }
-
-        render_pass.set_pipeline(&self.pipeline);
-        render_pass.set_bind_group(0, &self.bind_group, &[]);
-
-        if let Some(buffer) = self.vertex_buffer.buffer() {
-            render_pass.set_vertex_buffer(0, buffer.slice(..));
-        }
-        let Some(identity) = self.instance_slice(0) else {
+    /// Draws `draws` into a G-buffer pass, each under the instance
+    /// [`prepare`](Self::prepare) uploaded for it.
+    pub fn render<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>, draws: &'a [MeshDraw]) {
+        let Some(instances) = self.instance_buffer.buffer() else {
             return;
         };
-        render_pass.set_vertex_buffer(1, identity);
-
-        if use_indices && !self.index_buffer.is_empty() {
-            if let Some(buffer) = self.index_buffer.buffer() {
-                render_pass.set_index_buffer(buffer.slice(..), wgpu::IndexFormat::Uint32);
-                render_pass.draw_indexed(0..self.index_buffer.len() as u32, 0, 0..1);
-            }
-        } else {
-            render_pass.draw(0..self.vertex_buffer.len() as u32, 0..1);
-        }
-    }
-
-    /// Draw retained meshes into the G-buffer pass, each under the
-    /// transform uploaded for it by [`upload_transforms`](Self::upload_transforms)
-    /// (in the same order). Shares the immediate path's pipeline and
-    /// uniforms.
-    pub fn render_retained<'a>(
-        &'a self,
-        render_pass: &mut wgpu::RenderPass<'a>,
-        meshes: &'a [std::sync::Arc<GpuMesh>],
-    ) {
-        if meshes.is_empty() {
-            return;
-        }
-
+        let stride = std::mem::size_of::<DrawInstance>() as u64;
         render_pass.set_pipeline(&self.pipeline);
         render_pass.set_bind_group(0, &self.bind_group, &[]);
-        for (i, mesh) in meshes.iter().enumerate() {
+        for (i, draw) in draws.iter().enumerate().take(self.instance_buffer.len()) {
+            let mesh = &draw.mesh;
             if mesh.draw_count == 0 {
                 continue;
             }
-            let Some(instance) = self.instance_slice(i + 1) else {
-                return;
-            };
-            render_pass.set_vertex_buffer(1, instance);
+            let start = i as u64 * stride;
+            render_pass.set_vertex_buffer(1, instances.slice(start..start + stride));
             render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
             match &mesh.index_buffer {
                 Some(indices) => {
@@ -483,16 +352,6 @@ impl MeshPipeline {
                 None => render_pass.draw(0..mesh.draw_count, 0..1),
             }
         }
-    }
-
-    /// Get the number of vertices currently uploaded.
-    pub fn vertex_count(&self) -> usize {
-        self.vertex_buffer.len()
-    }
-
-    /// Get the number of indices currently uploaded.
-    pub fn index_count(&self) -> usize {
-        self.index_buffer.len()
     }
 }
 

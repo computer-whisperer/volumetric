@@ -391,7 +391,7 @@ impl ApplicationHandler for WebHost {
             }
 
             *gfx_slot.borrow_mut() = Some(Gfx {
-                session: Session::new(&device, &queue, render_format),
+                session: Session::new(&device, render_format),
                 damascene,
                 surface,
                 queue,

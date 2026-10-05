@@ -93,9 +93,9 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
+    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         Self {
-            viewport: ViewportRenderer::new(device, queue, format),
+            viewport: ViewportRenderer::new(device, format),
             run_generation: 0,
             active_run: None,
             staged_artifacts: Vec::new(),
@@ -614,6 +614,11 @@ struct ViewportRenderer {
     /// transform, never re-uploaded. Entries live while a resident refers
     /// to them.
     part_meshes: HashMap<[u8; 32], Arc<renderer::GpuMesh>>,
+    /// The placeholder scene drawn while nothing is materialized, uploaded
+    /// the first time it is needed.
+    placeholder: Option<renderer::RetainedScene>,
+    /// What the last rendered frame reported.
+    last_frame: renderer::FrameInfo,
     /// Union bounds of the currently composited scene, for the Frame command.
     scene_bounds: Option<PreviewBounds>,
     /// The set of output ids the camera was last framed against. The camera
@@ -697,9 +702,8 @@ pub struct ViewportRenderParams<'a> {
 }
 
 impl ViewportRenderer {
-    fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
-        let mut renderer = renderer::Renderer::new(format);
-        renderer.initialize(device, queue, None);
+    fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+        let renderer = renderer::Renderer::new(device, format);
 
         let target = ViewportTarget::new(device, (1, 1), format);
 
@@ -710,6 +714,8 @@ impl ViewportRenderer {
             preview_cache: PreviewCache::default(),
             resident: HashMap::new(),
             part_meshes: HashMap::new(),
+            placeholder: None,
+            last_frame: renderer::FrameInfo::default(),
             scene_bounds: None,
             framed_ids: None,
             pending_frame_preview: false,
@@ -812,9 +818,9 @@ impl ViewportRenderer {
 
         let settings = render_settings(preview_requests.first(), clear_color);
         self.last_view = Some(view);
-        self.renderer
-            .render_view(device, queue, encoder, &view, &settings, &self.target.view);
-        self.renderer.end_frame();
+        self.last_frame =
+            self.renderer
+                .render(device, queue, encoder, &view, &settings, &self.target.view);
         target_resized
     }
 
@@ -921,7 +927,7 @@ impl ViewportRenderer {
     /// A user-facing description of geometry the last rendered frame had to
     /// drop at the device's buffer size limit; `None` when everything fit.
     fn frame_overflow_message(&self) -> Option<String> {
-        self.renderer.frame_overflow().map(overflow_message)
+        self.last_frame.overflow.as_ref().map(overflow_message)
     }
 
     /// The ray through the pointer at `pos` (logical, inside `rect`) for
@@ -1103,18 +1109,13 @@ impl ViewportRenderer {
                     match part_meshes.get(&key) {
                         Some(gpu) => gpu.clone(),
                         None => {
-                            let Some(gpu) = renderer.create_retained_mesh(device, mesh) else {
-                                continue;
-                            };
+                            let gpu = renderer.create_retained_mesh(device, mesh);
                             part_meshes.insert(key, gpu.clone());
                             gpu
                         }
                     }
                 }
-                None => match renderer.create_retained_mesh(device, mesh) {
-                    Some(gpu) => gpu,
-                    None => continue,
-                },
+                None => renderer.create_retained_mesh(device, mesh),
             };
             scene.meshes.push((gpu, *transform));
         }
@@ -1127,7 +1128,7 @@ impl ViewportRenderer {
     /// handle) every other frame. Also updates camera framing — the union
     /// bounds are framed when the output set changes or a Frame command is
     /// pending, otherwise the user's view is left alone. When nothing is
-    /// cached yet the immediate-mode placeholder test scene is drawn.
+    /// cached yet the placeholder test scene is drawn.
     fn submit_scene(&mut self, device: &wgpu::Device, requests: &[PreviewRequest]) {
         let visible = self.preview_cache.visible(requests);
         if visible.is_empty() {
@@ -1138,16 +1139,23 @@ impl ViewportRenderer {
                 self.camera
                     .get_or_insert_with(renderer::test_scenes::create_test_camera);
             }
-            let scene = renderer::test_scenes::create_test_scene();
-            for (mesh, transform, material) in &scene.meshes {
-                self.renderer.submit_mesh(mesh, *transform, *material);
-            }
-            for (lines, transform, style) in &scene.lines {
-                self.renderer.submit_lines(lines, *transform, style.clone());
-            }
-            for (points, transform, style) in &scene.points {
+            let scene = self.placeholder.get_or_insert_with(|| {
                 self.renderer
-                    .submit_points(points, *transform, style.clone());
+                    .create_retained_scene(device, &renderer::test_scenes::create_test_scene())
+            });
+            for (mesh, transform) in &scene.meshes {
+                self.renderer.submit_retained_mesh(
+                    mesh,
+                    *transform,
+                    renderer::ObjectId::NONE,
+                    renderer::MaterialId::default(),
+                );
+            }
+            for lines in &scene.lines {
+                self.renderer.submit_retained_lines(lines);
+            }
+            for points in &scene.points {
+                self.renderer.submit_retained_points(points);
             }
             return;
         }
@@ -1214,12 +1222,12 @@ impl ViewportRenderer {
                 && resident.wireframe.is_none()
                 && let Some(lines) = &entity.wireframe_lines
             {
-                resident.wireframe = self.renderer.create_retained_lines(
+                resident.wireframe = Some(self.renderer.create_retained_lines(
                     device,
                     lines,
                     glam::Mat4::IDENTITY,
                     &wireframe_style(),
-                );
+                ));
             }
             let posed = self.posed.get(id);
             for (i, (mesh, transform)) in resident.scene.meshes.iter().enumerate() {
@@ -1227,7 +1235,12 @@ impl ViewportRenderer {
                     .and_then(|p| p.transforms.get(i))
                     .copied()
                     .unwrap_or(*transform);
-                self.renderer.submit_retained_mesh(mesh, transform);
+                self.renderer.submit_retained_mesh(
+                    mesh,
+                    transform,
+                    renderer::ObjectId::NONE,
+                    renderer::MaterialId::default(),
+                );
             }
             match posed {
                 // The joint axes follow the override's poses.

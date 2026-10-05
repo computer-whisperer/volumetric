@@ -16,7 +16,7 @@
 use std::sync::{Arc, Mutex};
 
 use bytemuck::{Pod, Zeroable};
-use glam::{Mat3, Mat4, Vec2, Vec3, Vec4};
+use glam::{Mat3, Mat4, Vec3, Vec4};
 use wgpu::util::DeviceExt;
 
 use crate::{
@@ -168,9 +168,10 @@ pub fn project_covariance(
 }
 
 /// The pixel a world point lands on (x right, y down), for the tests.
-fn project_pixel(view: Mat4, proj: Mat4, screen: [f32; 2], p: Vec3) -> Vec2 {
+#[cfg(test)]
+fn project_pixel(view: Mat4, proj: Mat4, screen: [f32; 2], p: Vec3) -> glam::Vec2 {
     let clip = proj * view * p.extend(1.0);
-    Vec2::new(
+    glam::Vec2::new(
         (clip.x / clip.w + 1.0) * 0.5 * screen[0],
         (1.0 - clip.y / clip.w) * 0.5 * screen[1],
     )
@@ -354,6 +355,8 @@ impl GpuSplat {
         let target = (axis, sort_view.eye);
         let n = self.count as usize;
         let mut sort = self.sort.lock().expect("splat sort state");
+        // Only the native path below, with its background sorts, sets it.
+        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
         let mut landed = false;
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -735,7 +738,7 @@ impl SplatPipeline {
             // Tested at the centre's depth against the scene, never written:
             // the blend order is the sort's, not the depth buffer's.
             depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth24Plus,
+                format: crate::GBuffer::DEPTH_FORMAT,
                 depth_write_enabled: Some(false),
                 depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: wgpu::StencilState::default(),

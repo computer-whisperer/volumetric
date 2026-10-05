@@ -2,11 +2,9 @@
 //!
 //! Provides sample geometry for verifying the renderer works correctly.
 
-#![allow(dead_code)]
-
 use super::{
     Camera, DepthMode, LineData, LineSegment, LineStyle, MaterialId, MeshData, MeshVertex,
-    PointData, PointInstance, PointShape, PointStyle, RenderSettings, SceneData, WidthMode,
+    PointData, PointInstance, PointShape, PointStyle, SceneData, WidthMode,
 };
 use glam::{Mat4, Vec3};
 
@@ -229,21 +227,6 @@ pub fn create_test_camera() -> Camera {
         fov_y: std::f32::consts::FRAC_PI_3,
         near: 0.1,
         far: 100.0,
-    }
-}
-
-/// Create default render settings for testing.
-pub fn create_test_settings() -> RenderSettings {
-    RenderSettings {
-        ssao_enabled: true,
-        ssao_samples: 16,
-        ssao_radius: 0.5,
-        ssao_bias: 0.025,
-        ssao_strength: 1.0,
-        grid: super::GridSettings::default(),
-        axis_indicator: super::AxisIndicator::default(),
-        show_axis_indicator: true,
-        background_color: [0.1, 0.1, 0.12, 1.0],
     }
 }
 
