@@ -1,10 +1,11 @@
 # Volumetric Renderer: Target Design
 
-Status: **target design, being built** (written 2026-10-05; steps 1 to 4
-of section 11 are built). This file
-replaces the May 2026 MVP architecture notes. It is the ground truth for the
-renderer overhaul: where the code and this file disagree during the rebuild,
-this file wins until it is deliberately revised.
+Status: **built** (written 2026-10-05 as the target design; all five steps
+of section 11 were built the same day). This file replaces the May 2026 MVP
+architecture notes and now describes the renderer as it is; where it was
+revised while building, the revision and its reason are recorded in place.
+Direct model raytracing (section 9) is the follow-up project and is not
+built.
 
 ## 1. Scope
 
@@ -379,17 +380,29 @@ target while writing another unblended.
 renderer.submit_retained_mesh(&mesh, transform, object_id, material_id);
 renderer.submit_retained_lines(&lines);   // points, splats likewise
 renderer.submit_lines(&data, transform, style); // small dynamic batches
-let info: FrameInfo = renderer.render(&mut encoder, &FrameDesc { view, settings, target });
+let info: FrameInfo = renderer.render(&device, &queue, &mut encoder, &view, &settings, &target);
 renderer.request_pick(pixel);
 ```
 
 `FrameInfo` carries what a frame reports back: geometry dropped at device
 buffer limits (today's `GeometryOverflow`) and the grid's current spacing.
 
-`RenderSettings` groups `LightingRig`, AO, edges, anti-aliasing,
-`GridSettings`, gizmo and background settings. The GUI persists them and
-exposes them in a viewport settings panel; headless renders set them from
-options.
+`RenderSettings` groups the `LightingRig`, the material table, occlusion,
+edges, anti-aliasing, `GridSettings`, the gizmo, the background and the
+pixel scale.
+
+The GUI holds a `ViewportSettings` value (projection, grid visibility,
+axes and density, gizmo, `LightingPreset`, edges and their strength,
+occlusion and its radius and strength, anti-aliasing). The view settings
+panel behind the viewport toolbar's gear edits it, with the navigation
+settings (mouse controls, orbit mode) beside it; the settings file keeps
+it; the session turns it into `RenderSettings` each frame. Viewport-wide
+settings used to ride on each output's preview request, where the first
+output's copy won and a viewport with no outputs fell back to defaults.
+
+Headless renders set the same things from `RenderOptions`: `lighting`,
+`edges`, `antialias`, `supersample`, with matching CLI flags and Python
+keywords.
 
 ## 8. WebGL2
 
@@ -475,9 +488,24 @@ measured properties of rendered frames, not stored images.
    hosts give every mesh material 0. Not built: half-resolution occlusion
    on WebGL2 (it takes half the samples instead). Supersampling is a
    fixed 2x in the headless render, with no option yet.
-5. **Settings and parity.** Viewport settings panel and persistence
-   (migrating the stored SSAO radius from metres to a relative value); CLI
-   and Python options; documentation.
+5. **Settings and parity (built 2026-10-05).** The GUI's view settings
+   panel (section 7) and its persistence; the lighting, edge, anti-aliasing
+   and supersampling options of the headless render, the CLI and the
+   Python binding; documentation.
+
+Left open at the end of the arc:
+
+- every mesh is drawn with material 0: nothing assigns materials yet, and
+  the panel has no material controls;
+- dragging an assembly part still finds the part with a CPU ray test
+  instead of the pick's object id;
+- picks do not see lines, points or splats (section 6);
+- the headless `--grid` is a fixed spacing in metres, not the automatic
+  one;
+- on WebGL2 occlusion takes half the samples instead of running at half
+  resolution;
+- the web build's hover-tracked pick and the WebGL2 path as a whole have
+  been exercised on a native GLES adapter, not in a browser.
 
 ## 12. Rulings on former open questions (2026-10-05)
 

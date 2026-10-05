@@ -196,11 +196,7 @@ mod tests {
             precursor_ids: vec![],
             plan: crate::PreviewPlan::Splat,
             wireframe: false,
-            show_grid: false,
             show_bounds: false,
-            ssao: false,
-            ssao_radius: 0.06,
-            ssao_strength: 1.0,
             stale: false,
         };
         let entity = crate::build_preview_scene(&request).unwrap();

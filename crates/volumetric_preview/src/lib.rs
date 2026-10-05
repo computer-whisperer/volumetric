@@ -291,15 +291,9 @@ pub struct PreviewRequest {
     /// Overlay the mesh edges as lines (display-only; not part of the mesh
     /// cache key, so toggling never re-meshes).
     pub wireframe: bool,
-    pub show_grid: bool,
     /// Overlay each output's wasm-reported bounding box (display-only,
     /// like `wireframe`).
     pub show_bounds: bool,
-    pub ssao: bool,
-    /// How far occluders are looked for, as a fraction of the scene's
-    /// diagonal.
-    pub ssao_radius: f32,
-    pub ssao_strength: f32,
     pub stale: bool,
 }
 

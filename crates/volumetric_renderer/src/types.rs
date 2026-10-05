@@ -456,6 +456,57 @@ impl Default for LightingRig {
     }
 }
 
+/// The lighting rigs offered by name.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum LightingPreset {
+    /// Key, fill and rim under a soft sky: the default.
+    #[default]
+    Studio,
+    /// Mostly ambient, with little difference between faces: for reading
+    /// colours and edge lines rather than form.
+    Flat,
+    /// One light at the camera: every face is lit by how squarely it
+    /// faces the viewer.
+    Headlight,
+}
+
+impl LightingPreset {
+    pub const ALL: [Self; 3] = [Self::Studio, Self::Flat, Self::Headlight];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Studio => "studio",
+            Self::Flat => "flat",
+            Self::Headlight => "headlight",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|preset| preset.name() == name)
+    }
+
+    pub fn rig(self) -> LightingRig {
+        let light = |direction, intensity: f32| Light {
+            direction,
+            color: [intensity; 3],
+        };
+        let off = light([0.0, 0.0, 1.0], 0.0);
+        match self {
+            Self::Studio => LightingRig::default(),
+            Self::Flat => LightingRig {
+                lights: [light([-0.3, 0.4, 0.85], 0.22), off, off],
+                sky: [0.66; 3],
+                ground: [0.52; 3],
+            },
+            Self::Headlight => LightingRig {
+                lights: [light([0.0, 0.0, 1.0], 0.72), off, off],
+                sky: [0.2; 3],
+                ground: [0.2; 3],
+            },
+        }
+    }
+}
+
 /// How a surface answers the light. [`MaterialId`] indexes the frame's
 /// table of these.
 #[derive(Copy, Clone, Debug, PartialEq)]

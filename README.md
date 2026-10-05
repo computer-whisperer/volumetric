@@ -188,6 +188,8 @@ In the UI:
 1.  **Demos**: Load pre-built models from the "Demo" panel.
 2.  **Operations**: Apply operators like "Translate" or "Boolean" to transform your models.
 3.  **Visualization**: Pick the preview mode (adaptive mesh, marching cubes, point cloud) and its resolution in the viewport toolbar.
+4.  **Navigation**: The world is Z-up. Orbit turns about the point under the cursor (the model's centre when the cursor is off the model), the wheel zooms toward the cursor, and pan carries the point you grabbed. The gizmo in the viewport's corner shows the axes: click an end for that standard view (again for the opposite one), or drag on it to orbit. The **View** menu has the standard views and the camera reset; **Frame** fits the scene.
+5.  **View settings**: The gear in the viewport toolbar opens the view settings: mouse controls (Blender, OnShape, Fusion 360, SolidWorks or Maya), turntable or free orbit, perspective or orthographic projection, the grid (axis lines, density), the gizmo, the lighting (studio, flat, headlight), edge lines, ambient occlusion and anti-aliasing. They are saved with the application's other preferences.
 
 ### Running the CLI
 
@@ -265,6 +267,10 @@ volumetric_cli render -i <model.wasm | project.vproj> -o <output.png>
 - `--wireframe` - Overlay mesh edges
 - `--grid <m>` - Ground grid spacing in metres (default: 1.0; 0 disables)
 - `--no-ssao` - Disable ambient occlusion
+- `--lighting studio|flat|headlight` - The lights: a key, fill and rim fixed to the camera (default), mostly ambient, or one light at the camera
+- `--no-edges` - Draw no edge lines at silhouettes, creases and part boundaries
+- `--no-antialias` - Disable anti-aliasing
+- `--supersample <n>` - Draw the frame n times larger per side and scale it down (default: 2; 1 disables; at most 4). Frames through a lens (`--through`), with `--overlay` or `--marks`, or of a splat are always drawn at their own size, so they stay comparable pixel for pixel with photographs
 - `--background <hex>` - Background colour (default: 2d2d2d)
 - `--width`, `--height` - Image size (default: 1024 x 1024)
 

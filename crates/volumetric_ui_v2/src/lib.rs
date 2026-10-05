@@ -14,7 +14,7 @@ pub use volumetric_preview::{
     Asn2Settings, BoundsCorners, LookThrough, MarkKind, MarkLabel, OutputStats, PreviewMeshPlan,
     PreviewPlan, PreviewRenderMode, PreviewRequest, format_count, mark_labels, viewset_detail,
 };
-use volumetric_renderer::{CameraControlScheme, OrbitMode, StandardView};
+use volumetric_renderer::{CameraControlScheme, LightingPreset, OrbitMode, StandardView};
 
 use damascene_core::SvgIcon;
 use damascene_core::image::Image;
@@ -167,10 +167,8 @@ pub const TOGGLE_REMOTE_BUILD_KEY: &str = "action:toggle-remote-build";
 pub const CANCEL_MESH_KEY: &str = "action:cancel-mesh";
 pub const REMESH_KEY: &str = "action:remesh";
 pub const TOGGLE_AUTO_REMESH_KEY: &str = "action:toggle-auto-remesh";
-pub const TOGGLE_GRID_KEY: &str = "viewport:toggle-grid";
 pub const TOGGLE_BOUNDS_KEY: &str = "viewport:toggle-bounds";
 pub const TOGGLE_TINT_KEY: &str = "viewport:toggle-tint";
-pub const TOGGLE_SSAO_KEY: &str = "viewport:toggle-ssao";
 pub const FRAME_PREVIEW_KEY: &str = "viewport:frame-preview";
 pub const EXIT_LOOK_KEY: &str = "viewport:exit-look";
 /// `{prefix}{asset id}:{view id}`: look through a view, or leave it when it
@@ -202,16 +200,14 @@ const PIPELINE_KEY: &str = "pipeline";
 /// Viewport overlay value pickers (controlled select widgets).
 const MODE_SELECT_KEY: &str = "view:mode";
 const RESOLUTION_SELECT_KEY: &str = "view:res";
-const CAMERA_SELECT_KEY: &str = "view:camera";
-/// The camera menu: the standard views, then the projection, orbit-mode
-/// and reset actions (`VIEW_MENU_*`).
+/// The camera menu: the standard views, then the reset action.
 const VIEW_SELECT_KEY: &str = "view:standard";
-const VIEW_MENU_PROJECTION: &str = "projection";
-const VIEW_MENU_ORBIT: &str = "orbit";
 const VIEW_MENU_RESET: &str = "reset";
-/// SSAO parameter popover trigger; steppers use `view:ssao-adj:{field}:{dir}`.
-const SSAO_SETTINGS_KEY: &str = "view:ssao";
-const SSAO_ADJUST_PREFIX: &str = "view:ssao-adj:";
+/// The view settings panel's trigger. Its controls route as
+/// `view:set:{option}` (a switch), `view:set:{option}:{value}` (a choice)
+/// or `view:set:{option}:{up|down}` (a stepper).
+const VIEW_SETTINGS_KEY: &str = "view:settings";
+const VIEW_SET_PREFIX: &str = "view:set:";
 /// Remote-build settings popover trigger and the daemon address input in it.
 const REMOTE_SETTINGS_KEY: &str = "view:remote-settings";
 
@@ -1075,17 +1071,12 @@ pub struct VolumetricUiV2 {
     camera_control_scheme: CameraControlScheme,
     /// How an orbit drag turns the camera.
     orbit_mode: OrbitMode,
-    /// Whether the viewport camera projects orthographically.
-    orthographic: bool,
-    show_grid: bool,
+    /// How the viewport is drawn: the view settings panel's state.
+    viewport: ViewportSettings,
     show_bounds: bool,
     /// Give uncolored models a muted per-output tint so flush-fitting
     /// parts pinned into one viewport stay distinguishable.
     tint_parts: bool,
-    ssao: bool,
-    /// A fraction of the scene's diagonal.
-    ssao_radius: f32,
-    ssao_strength: f32,
     /// Preview-capable artifacts reported by the active project run. These are
     /// displayed read-only and never feed viewport meshing until terminal
     /// success promotes the complete run into `runtime_assets`.
@@ -1253,14 +1244,9 @@ impl VolumetricUiV2 {
             preview_resolution: 64,
             camera_control_scheme: CameraControlScheme::default(),
             orbit_mode: OrbitMode::default(),
-            orthographic: false,
-            show_grid: true,
+            viewport: ViewportSettings::default(),
             show_bounds: false,
             tint_parts: false,
-            ssao: true,
-            // Renderer defaults (renderer::RenderSettings::default()).
-            ssao_radius: 0.06,
-            ssao_strength: 1.0,
             staged_artifacts: Vec::new(),
             runtime_assets: Vec::new(),
             operator_docs_open: false,
@@ -2134,27 +2120,9 @@ impl VolumetricUiV2 {
             precursor_ids: asset.precursor_ids().to_vec(),
             plan,
             wireframe: render.wireframe(),
-            show_grid: self.show_grid,
             show_bounds: self.show_bounds,
-            ssao: self.ssao,
-            ssao_radius: self.ssao_radius,
-            ssao_strength: self.ssao_strength,
             stale: self.last_run_stale,
         })
-    }
-
-    /// Adjusts one SSAO parameter; `up` steps the value up. The radius
-    /// steps geometrically.
-    fn adjust_ssao(&mut self, field: &str, up: bool) {
-        let scale = if up { 1.5 } else { 1.0 / 1.5 };
-        match field {
-            "radius" => self.ssao_radius = (self.ssao_radius * scale).clamp(0.01, 0.3),
-            "strength" => {
-                let delta = if up { 0.25 } else { -0.25 };
-                self.ssao_strength = (self.ssao_strength + delta).clamp(0.5, 4.0);
-            }
-            _ => {}
-        }
     }
 
     pub fn camera_control_scheme(&self) -> CameraControlScheme {
@@ -2169,8 +2137,114 @@ impl VolumetricUiV2 {
         }
     }
 
-    pub fn orthographic(&self) -> bool {
-        self.orthographic
+    /// How the viewport is drawn.
+    pub fn viewport_settings(&self) -> ViewportSettings {
+        self.viewport
+    }
+
+    /// One control of the view settings panel: `option` is what follows
+    /// [`VIEW_SET_PREFIX`] in its route.
+    fn set_view_option(&mut self, option: &str) {
+        let (name, value) = option.split_once(':').unwrap_or((option, ""));
+        let up = value == "up";
+        let step = |value: f32, by: f32, min: f32, max: f32| {
+            (value + if up { by } else { -by }).clamp(min, max)
+        };
+        let on_off = |on: bool| if on { "on" } else { "off" };
+        let view = &mut self.viewport;
+        self.status = match name {
+            "scheme" => {
+                let Some(scheme) = camera_control_scheme_from_route(value) else {
+                    return;
+                };
+                self.camera_control_scheme = scheme;
+                format!("camera controls: {}", scheme.name())
+            }
+            "orbit" => {
+                self.orbit_mode = if value == "free" {
+                    OrbitMode::Free
+                } else {
+                    OrbitMode::Turntable
+                };
+                match self.orbit_mode {
+                    OrbitMode::Turntable => "turntable orbit: the horizon stays level".to_string(),
+                    OrbitMode::Free => "free orbit".to_string(),
+                }
+            }
+            "projection" => {
+                view.orthographic = value == "ortho";
+                if view.orthographic {
+                    "orthographic projection".to_string()
+                } else {
+                    "perspective projection".to_string()
+                }
+            }
+            "grid" => {
+                view.show_grid = !view.show_grid;
+                format!("grid {}", on_off(view.show_grid))
+            }
+            "axes" => {
+                view.show_axes = !view.show_axes;
+                format!("axis lines {}", on_off(view.show_axes))
+            }
+            "density" => {
+                let Some(density) = GridDensity::from_name(value) else {
+                    return;
+                };
+                view.grid_density = density;
+                format!("grid density: {value}")
+            }
+            "gizmo" => {
+                view.show_gizmo = !view.show_gizmo;
+                format!("view gizmo {}", on_off(view.show_gizmo))
+            }
+            "lighting" => {
+                let Some(lighting) = LightingPreset::from_name(value) else {
+                    return;
+                };
+                view.lighting = lighting;
+                format!("lighting: {value}")
+            }
+            "edges" => {
+                view.edges = !view.edges;
+                format!("edge lines {}", on_off(view.edges))
+            }
+            "edge-strength" => {
+                view.edge_opacity = step(view.edge_opacity, 0.1, 0.15, 0.95);
+                format!("edge lines at {:.0}%", view.edge_opacity * 100.0)
+            }
+            "ao" => {
+                view.ao = !view.ao;
+                format!("ambient occlusion {}", on_off(view.ao))
+            }
+            "ao-radius" => {
+                // Geometric: the useful range spans a decade.
+                let scale = if up { 1.5 } else { 1.0 / 1.5 };
+                view.ao_radius = (view.ao_radius * scale).clamp(0.01, 0.3);
+                format!(
+                    "occlusion radius {:.1}% of the scene",
+                    view.ao_radius * 100.0
+                )
+            }
+            "ao-strength" => {
+                view.ao_strength = step(view.ao_strength, 0.25, 0.5, 4.0);
+                format!("occlusion strength {:.2}", view.ao_strength)
+            }
+            "antialias" => {
+                view.antialiasing = !view.antialiasing;
+                format!("anti-aliasing {}", on_off(view.antialiasing))
+            }
+            "defaults" => {
+                // The projection is where the user is looking from, not a
+                // look: it stays.
+                *view = ViewportSettings {
+                    orthographic: view.orthographic,
+                    ..ViewportSettings::default()
+                };
+                "view settings reset".to_string()
+            }
+            _ => return,
+        };
     }
 
     pub(crate) fn set_preview_build_status(&mut self, status: PreviewBuildStatus) {
@@ -2550,9 +2624,9 @@ impl VolumetricUiV2 {
             render_mode: self.render_mode,
             preview_resolution: self.preview_resolution,
             camera_control_scheme: self.camera_control_scheme,
-            show_grid: self.show_grid,
+            show_grid: self.viewport.show_grid,
             show_bounds: self.show_bounds,
-            ssao: self.ssao,
+            ssao: self.viewport.ao,
             runtime_assets: self
                 .runtime_assets
                 .iter()
@@ -4062,19 +4136,18 @@ impl VolumetricUiV2 {
         self.status = format!("preview resolution: {resolution}");
     }
 
-    /// Folds trigger/dismiss/pick events for the three viewport pickers
-    /// (render mode, resolution, camera scheme) into app state. Returns true
+    /// Folds trigger/dismiss/pick events for the viewport pickers (render
+    /// mode, resolution, standard view) and popovers into app state. Returns true
     /// when the event belonged to one of them.
     fn handle_view_select(&mut self, event: &UiEvent) -> bool {
         for key in [
             MODE_SELECT_KEY,
             RESOLUTION_SELECT_KEY,
-            CAMERA_SELECT_KEY,
             VIEW_SELECT_KEY,
             PHOTO_OPACITY_SELECT_KEY,
             // Not value pickers (controls live inside), but the trigger and
             // dismiss-scrim routes follow the same shape; Pick never fires.
-            SSAO_SETTINGS_KEY,
+            VIEW_SETTINGS_KEY,
             REMOTE_SETTINGS_KEY,
             CACHE_SETTINGS_KEY,
         ] {
@@ -4105,11 +4178,6 @@ impl VolumetricUiV2 {
                                 self.set_preview_resolution(resolution);
                             }
                         }
-                        CAMERA_SELECT_KEY => {
-                            if let Some(scheme) = camera_control_scheme_from_route(&value) {
-                                self.set_camera_control_scheme(scheme);
-                            }
-                        }
                         VIEW_SELECT_KEY => self.pick_view_menu(&value),
                         PHOTO_OPACITY_SELECT_KEY => {
                             if let Ok(percent) = value.parse::<u8>() {
@@ -4129,28 +4197,10 @@ impl VolumetricUiV2 {
         false
     }
 
-    /// One entry of the camera menu: a standard view to turn to, or one
-    /// of the projection, orbit-mode and reset actions.
+    /// One entry of the camera menu: a standard view to turn to, or the
+    /// reset action.
     fn pick_view_menu(&mut self, value: &str) {
         match value {
-            VIEW_MENU_PROJECTION => {
-                self.orthographic = !self.orthographic;
-                self.status = if self.orthographic {
-                    "orthographic projection".to_string()
-                } else {
-                    "perspective projection".to_string()
-                };
-            }
-            VIEW_MENU_ORBIT => {
-                self.orbit_mode = match self.orbit_mode {
-                    OrbitMode::Turntable => OrbitMode::Free,
-                    OrbitMode::Free => OrbitMode::Turntable,
-                };
-                self.status = match self.orbit_mode {
-                    OrbitMode::Turntable => "turntable orbit: the horizon stays level".to_string(),
-                    OrbitMode::Free => "free orbit".to_string(),
-                };
-            }
             VIEW_MENU_RESET => {
                 self.pending_camera_command = Some(ViewportCameraCommand::Reset);
                 self.exit_look_through();
@@ -4164,11 +4214,6 @@ impl VolumetricUiV2 {
                 }
             }
         }
-    }
-
-    fn set_camera_control_scheme(&mut self, scheme: CameraControlScheme) {
-        self.camera_control_scheme = scheme;
-        self.status = format!("camera controls: {}", scheme.name());
     }
 }
 
@@ -4586,16 +4631,6 @@ impl App for VolumetricUiV2 {
             return;
         }
 
-        if event.is_click_or_activate(TOGGLE_GRID_KEY) {
-            self.show_grid = !self.show_grid;
-            self.status = if self.show_grid {
-                "grid enabled".to_string()
-            } else {
-                "grid hidden".to_string()
-            };
-            return;
-        }
-
         if event.is_click_or_activate(TOGGLE_BOUNDS_KEY) {
             self.show_bounds = !self.show_bounds;
             self.status = if self.show_bounds {
@@ -4612,16 +4647,6 @@ impl App for VolumetricUiV2 {
                 "uncolored parts tinted".to_string()
             } else {
                 "part tint disabled".to_string()
-            };
-            return;
-        }
-
-        if event.is_click_or_activate(TOGGLE_SSAO_KEY) {
-            self.ssao = !self.ssao;
-            self.status = if self.ssao {
-                "SSAO enabled".to_string()
-            } else {
-                "SSAO disabled".to_string()
             };
             return;
         }
@@ -4782,10 +4807,8 @@ impl App for VolumetricUiV2 {
             {
                 self.set_output_fea_field(id, Some(format!("{container}:{name}")));
             }
-        } else if let Some(rest) = route.strip_prefix(SSAO_ADJUST_PREFIX) {
-            if let Some((field, direction)) = rest.split_once(':') {
-                self.adjust_ssao(field, direction == "up");
-            }
+        } else if let Some(option) = route.strip_prefix(VIEW_SET_PREFIX) {
+            self.set_view_option(option);
         } else if let Some(direction) = route.strip_prefix(CACHE_ADJUST_PREFIX) {
             self.adjust_cache_budget(direction == "up");
         } else if let Some(rest) = route.strip_prefix(OUTPUT_ASN2_PREFIX) {
@@ -5256,40 +5279,12 @@ fn select_layer(app: &VolumetricUiV2) -> Option<El> {
                 .into_iter()
                 .map(|resolution| (resolution.to_string(), format!("{resolution} cells"))),
         )),
-        CAMERA_SELECT_KEY => Some(select_menu(
-            CAMERA_SELECT_KEY,
-            CameraControlScheme::ALL.iter().copied().map(|scheme| {
-                (
-                    camera_scheme_route_name(scheme),
-                    camera_scheme_tooltip(scheme),
-                )
-            }),
-        )),
         VIEW_SELECT_KEY => Some(select_menu(
             VIEW_SELECT_KEY,
             StandardView::ALL
                 .into_iter()
                 .map(|view| (view.name().to_lowercase(), view.name()))
-                // The actions are named for what picking them switches to.
-                .chain([
-                    (
-                        VIEW_MENU_PROJECTION.to_string(),
-                        if app.orthographic {
-                            "Perspective projection"
-                        } else {
-                            "Orthographic projection"
-                        },
-                    ),
-                    (
-                        VIEW_MENU_ORBIT.to_string(),
-                        if app.orbit_mode == OrbitMode::Free {
-                            "Turntable orbit"
-                        } else {
-                            "Free orbit"
-                        },
-                    ),
-                    (VIEW_MENU_RESET.to_string(), "Reset camera"),
-                ]),
+                .chain([(VIEW_MENU_RESET.to_string(), "Reset camera")]),
         )),
         PHOTO_OPACITY_SELECT_KEY => Some(select_menu(
             PHOTO_OPACITY_SELECT_KEY,
@@ -5297,7 +5292,7 @@ fn select_layer(app: &VolumetricUiV2) -> Option<El> {
                 .into_iter()
                 .map(|percent| (percent.to_string(), format!("{percent}% photograph"))),
         )),
-        SSAO_SETTINGS_KEY => Some(ssao_settings_popover(app)),
+        VIEW_SETTINGS_KEY => Some(view_settings_popover(app)),
         REMOTE_SETTINGS_KEY => Some(remote_settings_popover(app)),
         CACHE_SETTINGS_KEY => Some(cache_settings_popover(app)),
         _ => None,
@@ -5562,15 +5557,40 @@ fn export_layer(app: &VolumetricUiV2) -> Option<El> {
 
 /// Anchored popover with SSAO parameter steppers. Steppers keep it open;
 /// outside click or Escape dismisses.
-fn ssao_settings_popover(app: &VolumetricUiV2) -> El {
-    let stepper = |field: &str, label: &str, value: String| {
+/// The view settings panel: how the viewport is navigated and drawn.
+/// Every control routes through [`VolumetricUiV2::set_view_option`].
+fn view_settings_popover(app: &VolumetricUiV2) -> El {
+    let view = &app.viewport;
+    let route = |option: &str| format!("{VIEW_SET_PREFIX}{option}");
+    let section = |title: &str| text(title).caption().muted();
+    let toggle = |label: &str, option: &str, on: bool| {
+        field_row(label, switch(route(option), on)).gap(tokens::SPACE_2)
+    };
+    // One of several: the chosen one is the primary button.
+    let choices = |option: &str, values: &[(&str, &str)], chosen: &str| {
+        row(values.iter().map(|(value, label)| {
+            let button = button(*label)
+                .xsmall()
+                .key(route(&format!("{option}:{value}")));
+            if *value == chosen {
+                button.primary()
+            } else {
+                button.secondary()
+            }
+        }))
+        .gap(tokens::SPACE_1)
+    };
+    let choice = |label: &str, option: &str, values: &[(&str, &str)], chosen: &str| {
+        field_row(label, choices(option, values, chosen)).gap(tokens::SPACE_2)
+    };
+    let stepper = |label: &str, option: &str, value: String| {
         field_row(
             label,
             row([
                 icon_button("chevron-left")
                     .ghost()
                     .xsmall()
-                    .key(format!("{SSAO_ADJUST_PREFIX}{field}:down")),
+                    .key(route(&format!("{option}:down"))),
                 text(value)
                     .label()
                     .text_align(TextAlign::Center)
@@ -5578,28 +5598,110 @@ fn ssao_settings_popover(app: &VolumetricUiV2) -> El {
                 icon_button("chevron-right")
                     .ghost()
                     .xsmall()
-                    .key(format!("{SSAO_ADJUST_PREFIX}{field}:up")),
+                    .key(route(&format!("{option}:up"))),
             ])
             .gap(tokens::SPACE_1)
             .align(Align::Center),
         )
         .gap(tokens::SPACE_2)
     };
+
+    let scheme = app.camera_control_scheme;
+    let schemes: Vec<(&str, &str)> = CameraControlScheme::ALL
+        .iter()
+        .map(|&scheme| {
+            (
+                camera_scheme_route_name(scheme),
+                camera_scheme_short_label(scheme),
+            )
+        })
+        .collect();
+    let mut body = vec![
+        section("Navigation"),
+        choices("scheme", &schemes, camera_scheme_route_name(scheme)),
+        text(camera_scheme_tooltip(scheme)).caption().muted(),
+        choice(
+            "Orbit",
+            "orbit",
+            &[("turntable", "Turntable"), ("free", "Free")],
+            match app.orbit_mode {
+                OrbitMode::Turntable => "turntable",
+                OrbitMode::Free => "free",
+            },
+        ),
+        choice(
+            "Projection",
+            "projection",
+            &[("perspective", "Perspective"), ("ortho", "Orthographic")],
+            if view.orthographic {
+                "ortho"
+            } else {
+                "perspective"
+            },
+        ),
+        divider(),
+        section("Grid and gizmo"),
+        toggle("Grid", "grid", view.show_grid),
+    ];
+    if view.show_grid {
+        body.push(toggle("Axis lines", "axes", view.show_axes));
+        body.push(choice(
+            "Density",
+            "density",
+            &[("fine", "Fine"), ("normal", "Normal"), ("coarse", "Coarse")],
+            view.grid_density.name(),
+        ));
+    }
+    body.push(toggle("View gizmo", "gizmo", view.show_gizmo));
+    body.push(divider());
+    body.push(section("Shading"));
+    body.push(choice(
+        "Lighting",
+        "lighting",
+        &[
+            ("studio", "Studio"),
+            ("flat", "Flat"),
+            ("headlight", "Headlight"),
+        ],
+        view.lighting.name(),
+    ));
+    body.push(toggle("Edge lines", "edges", view.edges));
+    if view.edges {
+        body.push(stepper(
+            "Edge strength",
+            "edge-strength",
+            format!("{:.0}%", view.edge_opacity * 100.0),
+        ));
+    }
+    body.push(toggle("Ambient occlusion", "ao", view.ao));
+    if view.ao {
+        body.push(stepper(
+            "Occlusion radius",
+            "ao-radius",
+            format!("{:.1}%", view.ao_radius * 100.0),
+        ));
+        body.push(stepper(
+            "Occlusion strength",
+            "ao-strength",
+            format!("{:.2}", view.ao_strength),
+        ));
+    }
+    body.push(toggle("Anti-aliasing", "antialias", view.antialiasing));
+    body.push(divider());
+    body.push(
+        button("Reset to defaults")
+            .xsmall()
+            .secondary()
+            .width(Size::Fill(1.0))
+            .key(route("defaults")),
+    );
     popover(
-        SSAO_SETTINGS_KEY,
-        Anchor::below_key(SSAO_SETTINGS_KEY),
-        popover_panel([column([
-            text("SSAO").label().semibold(),
-            stepper(
-                "radius",
-                "Radius",
-                format!("{:.1}%", app.ssao_radius * 100.0),
-            ),
-            stepper("strength", "Strength", format!("{:.2}", app.ssao_strength)),
-        ])
-        .gap(tokens::SPACE_2)
-        .padding(tokens::SPACE_2)
-        .width(Size::Fixed(240.0))]),
+        VIEW_SETTINGS_KEY,
+        Anchor::below_key(VIEW_SETTINGS_KEY),
+        popover_panel([column(body)
+            .gap(tokens::SPACE_2)
+            .padding(tokens::SPACE_2)
+            .width(Size::Fixed(340.0))]),
     )
 }
 
@@ -6239,7 +6341,8 @@ fn viewport_overlay(app: &VolumetricUiV2) -> El {
     .padding(tokens::SPACE_2)
 }
 
-/// Compact floating cluster of view toggles + pickers.
+/// Compact floating cluster of view toggles + pickers, with the view
+/// settings panel behind its gear.
 fn view_controls_cluster(app: &VolumetricUiV2) -> El {
     let toggle = |label: &str, on: bool, key: &str| {
         let button = button(label).xsmall().key(key);
@@ -6250,15 +6353,13 @@ fn view_controls_cluster(app: &VolumetricUiV2) -> El {
         }
     };
     let mut controls = vec![
-        toggle("Grid", app.show_grid, TOGGLE_GRID_KEY),
         toggle("Bounds", app.show_bounds, TOGGLE_BOUNDS_KEY),
         toggle("Tint", app.tint_parts, TOGGLE_TINT_KEY),
-        toggle("SSAO", app.ssao, TOGGLE_SSAO_KEY),
-        icon_button("chevron-down")
+        icon_button("settings")
             .ghost()
             .xsmall()
-            .tooltip("SSAO settings")
-            .key(SSAO_SETTINGS_KEY),
+            .tooltip("View settings: navigation, grid, gizmo, shading")
+            .key(VIEW_SETTINGS_KEY),
     ];
     if let Some(look) = &app.look_through {
         controls.push(vertical_separator().height(Size::Fixed(20.0)));
@@ -6289,11 +6390,6 @@ fn view_controls_cluster(app: &VolumetricUiV2) -> El {
         select_trigger(MODE_SELECT_KEY, app.render_mode.label()).width(Size::Fixed(90.0)),
         select_trigger(RESOLUTION_SELECT_KEY, app.preview_resolution.to_string())
             .width(Size::Fixed(84.0)),
-        select_trigger(
-            CAMERA_SELECT_KEY,
-            camera_scheme_short_label(app.camera_control_scheme),
-        )
-        .width(Size::Fixed(104.0)),
     ]);
     card([row(controls).gap(tokens::SPACE_1).align(Align::Center)])
         .padding(tokens::SPACE_1)
@@ -7978,6 +8074,85 @@ fn parse_step_input_route(route: &str, prefix: &str) -> Option<(usize, usize)> {
     Some((step_idx.parse().ok()?, input_idx.parse().ok()?))
 }
 
+/// How fine the automatic grid is drawn.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum GridDensity {
+    Fine,
+    #[default]
+    Normal,
+    Coarse,
+}
+
+impl GridDensity {
+    pub const ALL: [Self; 3] = [Self::Fine, Self::Normal, Self::Coarse];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Fine => "fine",
+            Self::Normal => "normal",
+            Self::Coarse => "coarse",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|density| density.name() == name)
+    }
+
+    /// The smallest a minor cell is drawn, in logical pixels.
+    pub fn min_cell_px(self) -> f32 {
+        let normal = volumetric_renderer::GridSpacing::MIN_CELL_PX;
+        match self {
+            Self::Fine => normal * 0.5,
+            Self::Normal => normal,
+            Self::Coarse => normal * 2.0,
+        }
+    }
+}
+
+/// How the viewport is drawn: what the view settings panel edits and the
+/// settings file keeps. The session turns it into the renderer's settings
+/// each frame.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct ViewportSettings {
+    /// The camera projects orthographically.
+    pub orthographic: bool,
+    pub show_grid: bool,
+    /// Draw the world axis lines with the grid.
+    pub show_axes: bool,
+    pub grid_density: GridDensity,
+    pub show_gizmo: bool,
+    pub lighting: LightingPreset,
+    pub edges: bool,
+    pub edge_opacity: f32,
+    pub ao: bool,
+    /// A fraction of the scene's diagonal.
+    pub ao_radius: f32,
+    pub ao_strength: f32,
+    pub antialiasing: bool,
+}
+
+impl Default for ViewportSettings {
+    /// The renderer's own defaults.
+    fn default() -> Self {
+        let ao = volumetric_renderer::AoSettings::default();
+        let edges = volumetric_renderer::EdgeSettings::default();
+        Self {
+            orthographic: false,
+            show_grid: true,
+            show_axes: true,
+            grid_density: GridDensity::default(),
+            show_gizmo: true,
+            lighting: LightingPreset::default(),
+            edges: edges.enabled,
+            edge_opacity: edges.opacity,
+            ao: ao.enabled,
+            ao_radius: ao.radius,
+            ao_strength: ao.strength,
+            antialiasing: true,
+        }
+    }
+}
+
 fn camera_scheme_route_name(scheme: CameraControlScheme) -> &'static str {
     match scheme {
         CameraControlScheme::Blender => "blender",
@@ -9342,7 +9517,7 @@ mod tests {
         dispatch(&mut app, UiEvent::synthetic_click("view:res:option:96"));
         dispatch(
             &mut app,
-            UiEvent::synthetic_click("view:camera:option:onshape"),
+            UiEvent::synthetic_click("view:set:scheme:onshape"),
         );
 
         let summary = app.summary();
@@ -9364,8 +9539,8 @@ mod tests {
     #[test]
     fn viewport_toggles_are_controlled_by_app_state() {
         let mut app = VolumetricUiV2::default();
-        dispatch(&mut app, UiEvent::synthetic_click(TOGGLE_GRID_KEY));
-        dispatch(&mut app, UiEvent::synthetic_click(TOGGLE_SSAO_KEY));
+        dispatch(&mut app, UiEvent::synthetic_click("view:set:grid"));
+        dispatch(&mut app, UiEvent::synthetic_click("view:set:ao"));
         dispatch(&mut app, UiEvent::synthetic_click(TOGGLE_BOUNDS_KEY));
 
         let summary = app.summary();
@@ -9840,73 +10015,171 @@ mod tests {
         );
     }
 
+    /// The view settings panel opens from its gear, stays open while its
+    /// controls are used, and every control changes what the session is
+    /// told to draw.
     #[test]
-    fn ssao_steppers_and_camera_reset() {
+    fn the_view_settings_panel_drives_the_viewport_settings() {
         let mut app = VolumetricUiV2::default();
-        dispatch(&mut app, UiEvent::synthetic_click(SSAO_SETTINGS_KEY));
-        assert_eq!(app.open_select.as_deref(), Some(SSAO_SETTINGS_KEY));
-        dispatch(
-            &mut app,
-            UiEvent::synthetic_click(format!("{SSAO_ADJUST_PREFIX}radius:down")),
-        );
-        dispatch(
-            &mut app,
-            UiEvent::synthetic_click(format!("{SSAO_ADJUST_PREFIX}strength:up")),
-        );
-        // Steppers keep the popover open.
-        assert_eq!(app.open_select.as_deref(), Some(SSAO_SETTINGS_KEY));
+        let defaults = ViewportSettings::default();
+        assert_eq!(app.viewport_settings(), defaults);
+        assert_eq!(app.navigation().orbit_mode, OrbitMode::Turntable);
 
-        app.run_project();
-        let requests = app.preview_requests();
-        let request = &requests[0];
-        assert!((request.ssao_radius - 0.06 / 1.5).abs() < 1e-6);
-        assert!((request.ssao_strength - 1.25).abs() < 1e-6);
-
-        dispatch(
-            &mut app,
-            UiEvent::synthetic_click("view:standard:option:reset"),
-        );
+        dispatch(&mut app, UiEvent::synthetic_click(VIEW_SETTINGS_KEY));
+        assert_eq!(app.open_select.as_deref(), Some(VIEW_SETTINGS_KEY));
+        let set = |app: &mut VolumetricUiV2, option: &str| {
+            dispatch(
+                app,
+                UiEvent::synthetic_click(format!("{VIEW_SET_PREFIX}{option}")),
+            );
+        };
+        for option in [
+            "scheme:maya",
+            "orbit:free",
+            "projection:ortho",
+            "grid",
+            "axes",
+            "density:coarse",
+            "gizmo",
+            "lighting:headlight",
+            "edges",
+            "edge-strength:down",
+            "ao",
+            "ao-radius:down",
+            "ao-strength:up",
+            "antialias",
+            // Unknown options and values change nothing.
+            "lighting:neon",
+            "density:",
+            "sparkle",
+        ] {
+            set(&mut app, option);
+        }
+        // The controls keep the panel open.
+        assert_eq!(app.open_select.as_deref(), Some(VIEW_SETTINGS_KEY));
+        assert_eq!(app.camera_control_scheme(), CameraControlScheme::Maya);
+        assert_eq!(app.navigation().orbit_mode, OrbitMode::Free);
+        let view = app.viewport_settings();
         assert_eq!(
-            app.take_camera_command(),
-            Some(ViewportCameraCommand::Reset)
+            view,
+            ViewportSettings {
+                orthographic: true,
+                show_grid: false,
+                show_axes: false,
+                grid_density: GridDensity::Coarse,
+                show_gizmo: false,
+                lighting: LightingPreset::Headlight,
+                edges: false,
+                edge_opacity: view.edge_opacity,
+                ao: false,
+                ao_radius: view.ao_radius,
+                ao_strength: view.ao_strength,
+                antialiasing: false,
+            }
         );
+        assert!((view.edge_opacity - (defaults.edge_opacity - 0.1)).abs() < 1e-6);
+        assert!((view.ao_radius - defaults.ao_radius / 1.5).abs() < 1e-6);
+        assert!((view.ao_strength - 1.25).abs() < 1e-6);
+
+        // Reset restores the look and keeps the projection and the
+        // navigation, which are not looks.
+        set(&mut app, "defaults");
+        assert_eq!(
+            app.viewport_settings(),
+            ViewportSettings {
+                orthographic: true,
+                ..defaults
+            }
+        );
+        assert_eq!(app.navigation().orbit_mode, OrbitMode::Free);
+        set(&mut app, "projection:perspective");
+        set(&mut app, "orbit:turntable");
+        assert_eq!(app.viewport_settings(), defaults);
+        assert_eq!(app.navigation().orbit_mode, OrbitMode::Turntable);
     }
 
-    /// The camera menu's views raise camera commands, and its projection
-    /// and orbit-mode entries change what the session is told.
+    /// The panel draws, with the rows that depend on a switch only while
+    /// it is on.
     #[test]
-    fn view_controls_drive_the_camera_settings() {
+    fn the_view_settings_panel_shows_what_applies() {
         let mut app = VolumetricUiV2::default();
-        assert!(!app.orthographic());
-        assert_eq!(app.navigation().orbit_mode, OrbitMode::Turntable);
+        let keys = |app: &VolumetricUiV2| {
+            let mut keys = Vec::new();
+            collect_keys(&view_settings_popover(app), &mut keys);
+            keys
+        };
+        let has = |keys: &[String], option: &str| {
+            keys.iter()
+                .any(|key| key == &format!("{VIEW_SET_PREFIX}{option}"))
+        };
+        let shown = keys(&app);
+        for option in [
+            "scheme:blender",
+            "orbit:free",
+            "projection:ortho",
+            "grid",
+            "axes",
+            "density:fine",
+            "gizmo",
+            "lighting:flat",
+            "edges",
+            "edge-strength:up",
+            "ao",
+            "ao-radius:up",
+            "ao-strength:down",
+            "antialias",
+            "defaults",
+        ] {
+            assert!(has(&shown, option), "no control for {option}");
+        }
+        for option in ["grid", "edges", "ao"] {
+            app.set_view_option(option);
+        }
+        let shown = keys(&app);
+        for option in ["axes", "density:fine", "edge-strength:up", "ao-radius:up"] {
+            assert!(!has(&shown, option), "{option} shown while switched off");
+        }
+    }
 
-        dispatch(
-            &mut app,
-            UiEvent::synthetic_click("view:standard:option:top"),
+    /// The shell lays out cleanly with the view settings panel open, and
+    /// the picture is written out when `VOLUMETRIC_UI_DUMP` names a
+    /// directory, for looking at.
+    #[test]
+    fn the_view_settings_panel_lays_out_cleanly() {
+        let app = VolumetricUiV2 {
+            open_select: Some(VIEW_SETTINGS_KEY.to_string()),
+            ..Default::default()
+        };
+        let mut tree = shell(&app);
+        let bundle = damascene_core::bundle::artifact::render_bundle(
+            &mut tree,
+            Rect::new(0.0, 0.0, 1280.0, 800.0),
         );
-        assert_eq!(
-            app.take_camera_command(),
-            Some(ViewportCameraCommand::View(StandardView::Top))
-        );
-        dispatch(
-            &mut app,
-            UiEvent::synthetic_click("view:standard:option:isometric"),
-        );
-        assert_eq!(
-            app.take_camera_command(),
-            Some(ViewportCameraCommand::View(StandardView::Isometric))
-        );
+        assert!(bundle.tree_dump.contains("view:set:lighting:studio"));
+        assert!(bundle.lint.findings.is_empty(), "{}", bundle.lint.text());
+        if let Ok(dir) = std::env::var("VOLUMETRIC_UI_DUMP") {
+            write_bundle(&bundle, std::path::Path::new(&dir), "view_settings").unwrap();
+        }
+    }
 
-        dispatch(
-            &mut app,
-            UiEvent::synthetic_click("view:standard:option:projection"),
-        );
-        assert!(app.orthographic());
-        let orbit = || UiEvent::synthetic_click("view:standard:option:orbit");
-        dispatch(&mut app, orbit());
-        assert_eq!(app.navigation().orbit_mode, OrbitMode::Free);
-        dispatch(&mut app, orbit());
-        assert_eq!(app.navigation().orbit_mode, OrbitMode::Turntable);
+    /// The camera menu's views and its reset raise camera commands.
+    #[test]
+    fn the_view_menu_raises_camera_commands() {
+        let mut app = VolumetricUiV2::default();
+        for (entry, command) in [
+            ("top", ViewportCameraCommand::View(StandardView::Top)),
+            (
+                "isometric",
+                ViewportCameraCommand::View(StandardView::Isometric),
+            ),
+            ("reset", ViewportCameraCommand::Reset),
+        ] {
+            dispatch(
+                &mut app,
+                UiEvent::synthetic_click(format!("view:standard:option:{entry}")),
+            );
+            assert_eq!(app.take_camera_command(), Some(command));
+        }
     }
 
     #[test]

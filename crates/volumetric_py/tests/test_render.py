@@ -87,3 +87,18 @@ def test_marks_draw_the_views_observations_and_picks(chair_views):
     x, y = 5600 * 774 / 6192, 3700 * 516 / 4128
     patch = check.image[int(y) - 3: int(y) + 4, int(x) - 3: int(x) + 4, :3].astype(int)
     assert ((patch[..., 0] > 200) & (patch[..., 2] < 150) & (patch[..., 1] < 230)).any(), "no orange on the check"
+
+
+def test_shading_options_change_the_frame():
+    p = cylinder_project()
+    common = dict(views="iso", width=160, height=120, resolution=32, grid=0.0)
+    studio = rendered_or_skip(p, **common).image
+    flat = v.render(p, lighting="flat", **common).image
+    plain = v.render(p, edges=False, antialias=False, supersample=1, **common).image
+    assert studio.shape == flat.shape == plain.shape == (120, 160, 4)
+    assert np.abs(studio.astype(int) - flat.astype(int)).mean() > 1.0
+    # Without supersampling or anti-aliasing the frame holds fewer in-between values.
+    colours = lambda image: len(np.unique(image.reshape(-1, 4), axis=0))
+    assert colours(plain) < colours(studio)
+    with pytest.raises(ValueError, match="lighting"):
+        v.render(p, lighting="neon", **common)

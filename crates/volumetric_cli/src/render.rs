@@ -12,8 +12,8 @@ use glam::Vec3;
 use volumetric::{AssetTypeHint, LoadedAsset, Project};
 use volumetric_preview::pose_matrix;
 use volumetric_render::{
-    CameraSpec, ColorRange, Overlay, Pinhole, PlanOptions, Projection, RenderOptions,
-    background_from_hex, parse_views, select_assets,
+    CameraSpec, ColorRange, LightingPreset, Overlay, Pinhole, PlanOptions, Projection,
+    RenderOptions, background_from_hex, parse_views, select_assets,
 };
 
 #[derive(Parser, Debug)]
@@ -156,6 +156,24 @@ pub struct RenderArgs {
     #[arg(long)]
     pub no_ssao: bool,
 
+    /// Lighting: studio (key, fill and rim), flat (mostly ambient) or
+    /// headlight (one light at the camera)
+    #[arg(long, default_value = "studio")]
+    pub lighting: String,
+
+    /// Draw no edge lines at silhouettes, creases and part boundaries
+    #[arg(long)]
+    pub no_edges: bool,
+
+    /// Disable anti-aliasing
+    #[arg(long)]
+    pub no_antialias: bool,
+
+    /// Draw a plain frame this many times larger per side and scale it
+    /// down (1 disables, at most 4)
+    #[arg(long, default_value_t = 2)]
+    pub supersample: u32,
+
     /// Suppress per-asset statistics
     #[arg(short, long)]
     pub quiet: bool,
@@ -289,6 +307,15 @@ fn render_options(args: &RenderArgs) -> Result<RenderOptions> {
         background: background_from_hex(&args.background).context("Invalid --background")?,
         grid: args.grid,
         ssao: !args.no_ssao,
+        lighting: LightingPreset::from_name(&args.lighting).with_context(|| {
+            format!(
+                "Invalid --lighting '{}': studio, flat or headlight",
+                args.lighting
+            )
+        })?,
+        edges: !args.no_edges,
+        antialias: !args.no_antialias,
+        supersample: args.supersample,
         plan: PlanOptions {
             resolution: args.resolution,
             sharp: !args.no_sharp,

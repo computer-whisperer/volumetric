@@ -707,6 +707,8 @@ struct ViewportRenderer {
     viewport_logical_size: Vec2,
     /// The camera the last frame was drawn with, for picking.
     last_view: Option<renderer::CameraView>,
+    /// Whether the view gizmo is drawn, as of the last render.
+    show_gizmo: bool,
     /// The part of the view gizmo under the pointer, drawn lit.
     gizmo_hover: Option<renderer::GizmoPart>,
     /// A primary-button press that landed on the view gizmo.
@@ -784,8 +786,8 @@ pub struct ViewportRenderParams<'a> {
     /// The view being looked through, when the app is in look-through: the
     /// frame replaces the orbit camera and its frustum is highlighted.
     pub look_through: Option<LookThrough>,
-    /// Whether the viewport camera projects orthographically.
-    pub orthographic: bool,
+    /// How the viewport is drawn.
+    pub settings: crate::ViewportSettings,
 }
 
 /// The device a session call may draw or pick with.
@@ -830,6 +832,7 @@ impl ViewportRenderer {
             look_through_left: false,
             viewport_logical_size: Vec2::ZERO,
             last_view: None,
+            show_gizmo: true,
             gizmo_hover: None,
             gizmo_press: None,
             drag: None,
@@ -871,8 +874,9 @@ impl ViewportRenderer {
             clear_color,
             preview_requests,
             look_through,
-            orthographic,
+            settings: viewport,
         } = params;
+        self.show_gizmo = viewport.show_gizmo;
 
         let Some(rect) = logical_rect else {
             return false;
@@ -928,7 +932,7 @@ impl ViewportRenderer {
                 self.last_tick = Some(now);
                 // A stalled frame must not swallow a whole transition.
                 self.navigator.tick(&mut self.camera, dt.min(0.1));
-                self.camera.projection = if orthographic {
+                self.camera.projection = if viewport.orthographic {
                     renderer::Projection::Orthographic
                 } else {
                     renderer::Projection::Perspective
@@ -940,10 +944,10 @@ impl ViewportRenderer {
             }
         };
 
-        let mut settings = render_settings(preview_requests.first(), clear_color);
+        let mut settings = render_settings(&viewport, clear_color);
         settings.grid.spacing = renderer::GridSpacing::Auto {
             focus_depth,
-            min_cell_px: renderer::GridSpacing::MIN_CELL_PX * scale_factor,
+            min_cell_px: viewport.grid_density.min_cell_px() * scale_factor,
         };
         settings.gizmo = self.gizmo();
         self.last_view = Some(view);
@@ -983,9 +987,10 @@ impl ViewportRenderer {
 
     /// The view gizmo as the next frame draws it: in the viewport's
     /// top-right corner, following the orbit camera. A photograph's
-    /// viewpoint has none, and neither has a viewport too small for it.
+    /// viewpoint has none, and neither has a viewport too small for it
+    /// or one whose settings turn it off.
     fn gizmo(&self) -> Option<renderer::ViewGizmo> {
-        if self.look_through.is_some() {
+        if self.look_through.is_some() || !self.show_gizmo {
             return None;
         }
         let (w, h) = self.target.extent;
@@ -2797,8 +2802,11 @@ pub fn build_slice_lightbox_data(
     })
 }
 
+/// The renderer's settings for a frame drawn as `viewport` asks. The
+/// grid's spacing and the gizmo depend on the camera and are set by the
+/// caller.
 fn render_settings(
-    request: Option<&PreviewRequest>,
+    viewport: &crate::ViewportSettings,
     clear_color: wgpu::Color,
 ) -> renderer::RenderSettings {
     let mut settings = renderer::RenderSettings {
@@ -2808,18 +2816,19 @@ fn render_settings(
             clear_color.b as f32,
             clear_color.a as f32,
         ],
+        lighting: viewport.lighting.rig(),
+        ao: renderer::AoSettings {
+            enabled: viewport.ao,
+            radius: viewport.ao_radius,
+            strength: viewport.ao_strength,
+        },
+        antialiasing: viewport.antialiasing,
         ..Default::default()
     };
-
-    if let Some(request) = request {
-        settings.ao = renderer::AoSettings {
-            enabled: request.ssao,
-            radius: request.ssao_radius,
-            strength: request.ssao_strength,
-        };
-        settings.grid.visible = request.show_grid;
-    }
-
+    settings.edges.enabled = viewport.edges;
+    settings.edges.opacity = viewport.edge_opacity;
+    settings.grid.visible = viewport.show_grid;
+    settings.grid.axes = viewport.show_axes;
     settings
 }
 
@@ -2965,11 +2974,7 @@ mod tests {
                 tint_uncolored: false,
             },
             wireframe: false,
-            show_grid: false,
             show_bounds: false,
-            ssao: false,
-            ssao_radius: 0.06,
-            ssao_strength: 1.0,
             stale: false,
         };
         let job = PreviewBuildJob {
@@ -3154,10 +3159,6 @@ mod tests {
             plan,
             wireframe: false,
             show_bounds: false,
-            show_grid: true,
-            ssao: false,
-            ssao_radius: 0.06,
-            ssao_strength: 1.0,
             stale: false,
         }
     }
@@ -3296,10 +3297,6 @@ mod tests {
             },
             wireframe: false,
             show_bounds: false,
-            show_grid: false,
-            ssao: false,
-            ssao_radius: 0.1,
-            ssao_strength: 1.0,
             stale: false,
         };
         let entity = build_preview_scene(&request).expect("preview builds");
@@ -3375,10 +3372,6 @@ mod tests {
             },
             wireframe: false,
             show_bounds: false,
-            show_grid: false,
-            ssao: false,
-            ssao_radius: 0.1,
-            ssao_strength: 1.0,
             stale: false,
         };
 
@@ -3506,10 +3499,6 @@ mod tests {
             },
             wireframe: false,
             show_bounds: false,
-            show_grid: true,
-            ssao: false,
-            ssao_radius: 0.06,
-            ssao_strength: 1.0,
             stale: false,
         }
     }
@@ -3790,10 +3779,6 @@ mod tests {
             },
             wireframe: false,
             show_bounds: false,
-            show_grid: true,
-            ssao: true,
-            ssao_radius: 0.06,
-            ssao_strength: 1.0,
             stale: false,
         }
     }
@@ -4678,7 +4663,10 @@ mod navigation_tests {
                 clear_color: wgpu::Color::BLACK,
                 preview_requests: Vec::new(),
                 look_through: None,
-                orthographic,
+                settings: crate::ViewportSettings {
+                    orthographic,
+                    ..Default::default()
+                },
             });
             queue.submit([encoder.finish()]);
         }

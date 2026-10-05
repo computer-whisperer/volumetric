@@ -59,9 +59,9 @@ pub use pipelines::{
 pub use scene::SceneData;
 pub use types::{
     AXIS_COLORS, AoSettings, DepthMode, EdgeSettings, GridPlane, GridSettings, GridSpacing, Light,
-    LightingRig, LineData, LineInstance, LinePattern, LineSegment, LineStyle, MAX_MATERIALS,
-    Material, MaterialId, MeshData, MeshVertex, ObjectId, PointData, PointInstance, PointShape,
-    PointStyle, RenderSettings, SplatData, SplatStyle, WidthMode,
+    LightingPreset, LightingRig, LineData, LineInstance, LinePattern, LineSegment, LineStyle,
+    MAX_MATERIALS, Material, MaterialId, MeshData, MeshVertex, ObjectId, PointData, PointInstance,
+    PointShape, PointStyle, RenderSettings, SplatData, SplatStyle, WidthMode,
 };
 
 use std::sync::Arc;

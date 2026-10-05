@@ -5,8 +5,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use volumetric::LoadedAsset;
 use volumetric_render::{
-    CameraSpec, ColorRange, Overlay, Pinhole, PlanOptions, Projection, RenderOptions,
-    background_from_hex, parse_views, pose_matrix, select_assets,
+    CameraSpec, ColorRange, LightingPreset, Overlay, Pinhole, PlanOptions, Projection,
+    RenderOptions, background_from_hex, parse_views, pose_matrix, select_assets,
 };
 
 use crate::project::{Asset, Project};
@@ -64,7 +64,10 @@ fn vec3_opt(value: Option<&Bound<'_, PyAny>>, what: &str) -> PyResult<Option<Vec
 /// what to draw (default: every renderable export; imports only when
 /// named). The rest are `RenderOptions` and `PlanOptions`: `background`
 /// hex sRGB, `up`, `projection` (`perspective`/`ortho`), `fov`,
-/// `ortho_scale`, `near`, `far`, `grid`, `ssao`, `resolution`, `sharp`,
+/// `ortho_scale`, `near`, `far`, `grid`, `ssao`, `lighting` (`studio`,
+/// `flat`, `headlight`), `edges`, `antialias`, `supersample` (a plain
+/// frame is drawn this many times larger per side and scaled down; 1 is
+/// off), `resolution`, `sharp`,
 /// `simplify`, `color_channel`, `color_field`, `color_range`, `wireframe`;
 /// `marks` draws what a looked-through view observed (markers, card
 /// corners, recorded picks and contours) over the frame.
@@ -72,7 +75,8 @@ fn vec3_opt(value: Option<&Bound<'_, PyAny>>, what: &str) -> PyResult<Option<Vec
 #[pyo3(signature = (source, assets=None, views=None, camera=None, pinhole=None, through=None,
     overlay=None, overlay_alpha=0.5, overlay_tile=64, width=None, height=None,
     projection="perspective", fov=45.0, ortho_scale=0.0, near=None, far=None, up=None,
-    background="2d2d2d", grid=1.0, ssao=true, resolution=128, sharp=true, simplify=true,
+    background="2d2d2d", grid=1.0, ssao=true, lighting="studio", edges=true, antialias=true,
+    supersample=2, resolution=128, sharp=true, simplify=true,
     color_channel=None, color_field=None, color_range=None, wireframe=false, marks=false))]
 #[allow(clippy::too_many_arguments)]
 fn render<'py>(
@@ -97,6 +101,10 @@ fn render<'py>(
     background: &str,
     grid: f32,
     ssao: bool,
+    lighting: &str,
+    edges: bool,
+    antialias: bool,
+    supersample: u32,
     resolution: usize,
     sharp: bool,
     simplify: bool,
@@ -236,6 +244,14 @@ fn render<'py>(
         background: background_from_hex(background).map_err(invalid)?,
         grid,
         ssao,
+        lighting: LightingPreset::from_name(lighting).ok_or_else(|| {
+            invalid(format!(
+                "unknown lighting `{lighting}`; studio, flat or headlight"
+            ))
+        })?,
+        edges,
+        antialias,
+        supersample,
         plan: PlanOptions {
             resolution,
             sharp,

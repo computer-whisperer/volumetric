@@ -14,9 +14,9 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use volumetric_renderer::{CameraControlScheme, OrbitMode};
+use volumetric_renderer::{CameraControlScheme, LightingPreset, OrbitMode};
 
-use crate::{ExecutorChoice, PreviewRenderMode, VolumetricUiV2};
+use crate::{ExecutorChoice, GridDensity, PreviewRenderMode, ViewportSettings, VolumetricUiV2};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -37,13 +37,28 @@ pub struct UiSettings {
     pub render_mode: String,
     pub preview_resolution: usize,
     pub show_grid: bool,
+    /// Draw the world axis lines with the grid.
+    pub show_axes: bool,
+    /// Grid density by [`GridDensity::name`] (`fine` | `normal` |
+    /// `coarse`); unknown names keep the default.
+    pub grid_density: String,
+    pub show_gizmo: bool,
     pub show_bounds: bool,
-    pub ssao: bool,
-    /// A fraction of the scene's diagonal. Stored as `ao_radius`: the
-    /// `ssao_radius` of earlier files was in metres and is not read.
-    #[serde(rename = "ao_radius")]
-    pub ssao_radius: f32,
-    pub ssao_strength: f32,
+    /// Lighting by [`LightingPreset::name`] (`studio` | `flat` |
+    /// `headlight`); unknown names keep the default.
+    pub lighting: String,
+    pub edges: bool,
+    pub edge_opacity: f32,
+    /// Ambient occlusion. Files written before the view settings panel
+    /// called these `ssao`, `ssao_radius` (in metres, not read) and
+    /// `ssao_strength`.
+    #[serde(alias = "ssao")]
+    pub ao: bool,
+    /// A fraction of the scene's diagonal.
+    pub ao_radius: f32,
+    #[serde(alias = "ssao_strength")]
+    pub ao_strength: f32,
+    pub antialiasing: bool,
     pub auto_rebuild: bool,
     pub auto_remesh: bool,
     pub panel_width: f32,
@@ -74,14 +89,21 @@ impl UiSettings {
             remote_build: app.remote_build,
             camera_control_scheme: app.camera_control_scheme.name().to_string(),
             free_orbit: app.orbit_mode == OrbitMode::Free,
-            orthographic: app.orthographic,
+            orthographic: app.viewport.orthographic,
             render_mode: app.render_mode.route_name().to_string(),
             preview_resolution: app.preview_resolution,
-            show_grid: app.show_grid,
+            show_grid: app.viewport.show_grid,
+            show_axes: app.viewport.show_axes,
+            grid_density: app.viewport.grid_density.name().to_string(),
+            show_gizmo: app.viewport.show_gizmo,
             show_bounds: app.show_bounds,
-            ssao: app.ssao,
-            ssao_radius: app.ssao_radius,
-            ssao_strength: app.ssao_strength,
+            lighting: app.viewport.lighting.name().to_string(),
+            edges: app.viewport.edges,
+            edge_opacity: app.viewport.edge_opacity,
+            ao: app.viewport.ao,
+            ao_radius: app.viewport.ao_radius,
+            ao_strength: app.viewport.ao_strength,
+            antialiasing: app.viewport.antialiasing,
             auto_rebuild: app.auto_rebuild,
             auto_remesh: app.auto_remesh,
             panel_width: app.panel_width,
@@ -116,16 +138,26 @@ impl UiSettings {
         } else {
             OrbitMode::Turntable
         };
-        app.orthographic = self.orthographic;
         if let Some(mode) = PreviewRenderMode::from_route_name(&self.render_mode) {
             app.render_mode = mode;
         }
         app.preview_resolution = self.preview_resolution.clamp(8, 1024);
-        app.show_grid = self.show_grid;
         app.show_bounds = self.show_bounds;
-        app.ssao = self.ssao;
-        app.ssao_radius = finite_or(self.ssao_radius, defaults.ssao_radius);
-        app.ssao_strength = finite_or(self.ssao_strength, defaults.ssao_strength);
+        let view = defaults.viewport;
+        app.viewport = ViewportSettings {
+            orthographic: self.orthographic,
+            show_grid: self.show_grid,
+            show_axes: self.show_axes,
+            grid_density: GridDensity::from_name(&self.grid_density).unwrap_or(view.grid_density),
+            show_gizmo: self.show_gizmo,
+            lighting: LightingPreset::from_name(&self.lighting).unwrap_or(view.lighting),
+            edges: self.edges,
+            edge_opacity: finite_or(self.edge_opacity, view.edge_opacity).clamp(0.0, 1.0),
+            ao: self.ao,
+            ao_radius: finite_or(self.ao_radius, view.ao_radius).clamp(0.01, 0.3),
+            ao_strength: finite_or(self.ao_strength, view.ao_strength).clamp(0.5, 4.0),
+            antialiasing: self.antialiasing,
+        };
         app.auto_rebuild = self.auto_rebuild;
         app.auto_remesh = self.auto_remesh;
         app.panel_width = finite_or(self.panel_width, defaults.panel_width)
@@ -215,6 +247,16 @@ mod tests {
             render_mode: "points".to_string(),
             preview_resolution: 128,
             show_grid: false,
+            show_axes: false,
+            grid_density: "coarse".to_string(),
+            show_gizmo: false,
+            lighting: "flat".to_string(),
+            edges: false,
+            edge_opacity: 0.35,
+            ao: false,
+            ao_radius: 0.12,
+            ao_strength: 2.0,
+            antialiasing: false,
             auto_remesh: false,
             panel_width: 300.0,
             ..UiSettings::default()
@@ -263,7 +305,8 @@ mod tests {
             render_mode: "raytraced".to_string(),
             preview_resolution: 100_000,
             panel_width: f32::NAN,
-            ssao_radius: f32::INFINITY,
+            ao_radius: f32::INFINITY,
+            lighting: "neon".to_string(),
             ..UiSettings::default()
         };
 
@@ -274,7 +317,8 @@ mod tests {
         assert_eq!(app.render_mode, defaults.render_mode);
         assert_eq!(app.preview_resolution, 1024);
         assert_eq!(app.panel_width, defaults.panel_width);
-        assert_eq!(app.ssao_radius, defaults.ssao_radius);
+        assert_eq!(app.viewport.ao_radius, defaults.viewport.ao_radius);
+        assert_eq!(app.viewport.lighting, defaults.viewport.lighting);
     }
 
     #[test]

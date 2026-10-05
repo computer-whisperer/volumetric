@@ -32,7 +32,7 @@ use volumetric_renderer::{
 
 pub use view_core::overlay::Overlay;
 pub use volumetric_preview::{ColorRange, pose_matrix};
-pub use volumetric_renderer::Pinhole;
+pub use volumetric_renderer::{LightingPreset, Pinhole};
 
 /// How each asset is turned into a preview.
 #[derive(Clone, Debug, PartialEq)]
@@ -98,6 +98,15 @@ pub struct RenderOptions {
     /// (0 disables).
     pub grid: f32,
     pub ssao: bool,
+    pub lighting: LightingPreset,
+    /// Draw edge lines at silhouettes, creases and part boundaries.
+    pub edges: bool,
+    /// Smooth stair-stepped edges (FXAA).
+    pub antialias: bool,
+    /// Draw a plain frame this many times larger per side and scale it
+    /// down (1 = off). Frames through a lens, over a photograph, with
+    /// marks, or of a splat are always drawn at their own size.
+    pub supersample: u32,
     pub plan: PlanOptions,
     /// With a `Through` camera: composite the render over the photograph.
     pub overlay: Option<Overlay>,
@@ -121,6 +130,10 @@ impl Default for RenderOptions {
             background: background_from_hex("2d2d2d").expect("a valid default colour"),
             grid: 1.0,
             ssao: true,
+            lighting: LightingPreset::default(),
+            edges: true,
+            antialias: true,
+            supersample: 2,
             plan: PlanOptions::default(),
             overlay: None,
             marks: false,
@@ -429,11 +442,7 @@ pub fn preview_request(asset: &LoadedAsset, options: &PlanOptions) -> PreviewReq
         precursor_ids: vec![],
         plan,
         wireframe: options.wireframe,
-        show_grid: false,
         show_bounds: false,
-        ssao: false,
-        ssao_radius: 0.06,
-        ssao_strength: 1.0,
         stale: false,
     }
 }
@@ -486,13 +495,13 @@ pub fn grid_plane_for(up: Vec3) -> GridPlane {
     }
 }
 
-/// How many times larger than its delivered size a plain frame is drawn,
-/// per side.
-const SUPERSAMPLE: u32 = 2;
+/// The most a frame is supersampled, per side.
+pub const MAX_SUPERSAMPLE: u32 = 4;
 
-/// [`SUPERSAMPLE`], or as much of it as the device can draw at `size`.
-fn supersample_factor(size: (u32, u32), max_side: u32) -> u32 {
-    (1..=SUPERSAMPLE)
+/// The asked-for supersampling, or as much of it as the device can draw
+/// at `size`.
+fn supersample_factor(asked: u32, size: (u32, u32), max_side: u32) -> u32 {
+    (1..=asked.clamp(1, MAX_SUPERSAMPLE))
         .rev()
         .find(|factor| size.0.max(size.1).saturating_mul(*factor) <= max_side)
         .unwrap_or(1)
@@ -773,7 +782,7 @@ pub fn render(
         && !options.marks
         && entities.iter().all(|entity| entity.scene.splats.is_empty());
     let supersample = if plain {
-        supersample_factor(size, offscreen.max_frame_side())
+        supersample_factor(options.supersample, size, offscreen.max_frame_side())
     } else {
         1
     };
@@ -803,10 +812,12 @@ pub fn render(
             enabled: options.ssao,
             ..AoSettings::default()
         },
+        lighting: options.lighting.rig(),
         // An overlay's alpha is the render's coverage, taken as drawn.
-        antialiasing: overlay.is_none(),
+        antialiasing: options.antialias && overlay.is_none(),
         ..RenderSettings::default()
     };
+    settings.edges.enabled = options.edges;
     settings.pixel_scale = supersample as f32;
     settings.grid.visible = options.grid > 0.0 && overlay.is_none();
     settings.grid.plane = grid_plane_for(up);
@@ -1041,8 +1052,11 @@ mod tests {
 
     #[test]
     fn supersampling_stops_at_what_the_device_can_draw() {
-        assert_eq!(supersample_factor((1024, 768), 8192), SUPERSAMPLE);
-        assert_eq!(supersample_factor((5000, 100), 8192), 1);
+        assert_eq!(supersample_factor(2, (1024, 768), 8192), 2);
+        assert_eq!(supersample_factor(0, (1024, 768), 8192), 1);
+        assert_eq!(supersample_factor(9, (1024, 768), 8192), MAX_SUPERSAMPLE);
+        assert_eq!(supersample_factor(4, (3000, 100), 8192), 2);
+        assert_eq!(supersample_factor(2, (5000, 100), 8192), 1);
     }
 
     #[test]

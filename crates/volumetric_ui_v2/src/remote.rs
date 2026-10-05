@@ -248,11 +248,7 @@ mod tests {
                 tint_uncolored: false,
             },
             wireframe: false,
-            show_grid: false,
             show_bounds: false,
-            ssao: false,
-            ssao_radius: 0.06,
-            ssao_strength: 1.0,
             stale: false,
         };
         let job = PreviewBuildJob {

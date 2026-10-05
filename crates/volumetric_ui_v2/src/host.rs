@@ -595,7 +595,7 @@ impl Host {
             clear_color: bg_color(&palette),
             preview_requests,
             look_through,
-            orthographic: self.app.orthographic(),
+            settings: self.app.viewport_settings(),
         });
         gfx.damascene.render(
             &gfx.device,

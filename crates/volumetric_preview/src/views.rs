@@ -849,11 +849,7 @@ mod tests {
             precursor_ids: Vec::new(),
             plan: crate::PreviewPlan::ViewSet,
             wireframe: false,
-            show_grid: false,
             show_bounds: false,
-            ssao: false,
-            ssao_radius: 0.06,
-            ssao_strength: 1.0,
             stale: false,
         };
         let entity = build_viewset_preview(&request, web_time::Instant::now()).unwrap();
