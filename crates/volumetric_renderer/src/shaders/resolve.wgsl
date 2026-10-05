@@ -24,7 +24,8 @@ struct ResolveUniforms {
     ground: vec4<f32>,
     // rgb: edge line colour; a: opacity, 0 when edges are off.
     edge_color: vec4<f32>,
-    // x: cosine of the crease angle; y: 1 when ambient occlusion is on.
+    // x: cosine of the crease angle; y: 1 when ambient occlusion is on;
+    // z: how many pixels wide an edge line is.
     switches: vec4<f32>,
     materials: array<Material, 16>,
 };
@@ -79,8 +80,9 @@ fn steps_away(px: vec2<i32>, step: vec2<i32>, depth: f32, limit: vec2<i32>) -> b
 // changes.
 fn edge(px: vec2<i32>, depth: f32, n: vec3<f32>, object: u32) -> f32 {
     let limit = vec2<i32>(textureDimensions(g_surface)) - vec2<i32>(1);
-    let right = vec2<i32>(1, 0);
-    let down = vec2<i32>(0, 1);
+    let width = max(i32(uniforms.switches.z), 1);
+    let right = vec2<i32>(width, 0);
+    let down = vec2<i32>(0, width);
     if steps_away(px, right, depth, limit) || steps_away(px, -right, depth, limit)
         || steps_away(px, down, depth, limit) || steps_away(px, -down, depth, limit) {
         return 1.0;

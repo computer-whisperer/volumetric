@@ -236,6 +236,20 @@ Edge lines come from discontinuities in the G-buffer, in the resolve pass:
 They are one pixel wide, drawn before anti-aliasing, and any geometry
 source gets them.
 
+### Supersampling
+
+A headless frame is drawn at twice its delivered size per side and scaled
+down in linear light (`offscreen::downsample_rgba`).
+`RenderSettings::pixel_scale` tells the renderer how many target pixels
+make one delivered pixel; every width given in pixels (lines, points, grid
+lines, edge lines) is multiplied by it, so the picture is the same and
+only smoother. FXAA still runs first.
+
+Only plain frames are supersampled. A frame drawn through a lens, over a
+photograph, with marks, or of a splat keeps its own size: those are
+compared pixel for pixel with photographs and reference renders, and a
+splat's footprint is defined in the pixels of the frame it was trained at.
+
 Reserved for later, and the reason the id target exists beyond picking:
 hover and selection outlines, per-object visibility and section planes.
 
@@ -459,8 +473,8 @@ measured properties of rendered frames, not stored images.
    edge settings are fixed in code; the GUI still calls occlusion "SSAO"
    and exposes only its radius (now a fraction of the scene) and strength;
    hosts give every mesh material 0. Not built: half-resolution occlusion
-   on WebGL2 (it takes half the samples instead); supersampled headless
-   renders.
+   on WebGL2 (it takes half the samples instead). Supersampling is a
+   fixed 2x in the headless render, with no option yet.
 5. **Settings and parity.** Viewport settings panel and persistence
    (migrating the stored SSAO radius from metres to a relative value); CLI
    and Python options; documentation.

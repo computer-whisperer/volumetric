@@ -159,9 +159,12 @@ impl GridPipeline {
         settings: &GridSettings,
         view: &CameraView,
         size: (u32, u32),
+        pixel_scale: f32,
     ) -> GridLevels {
         let pixel_size = match settings.spacing {
-            GridSpacing::Auto { focus_depth, .. } => view.pixel_size(focus_depth, size.1),
+            GridSpacing::Auto { focus_depth, .. } => {
+                view.pixel_size(focus_depth, size.1) * pixel_scale
+            }
             GridSpacing::Fixed(_) => 0.0,
         };
         let levels = GridLevels::choose(settings.spacing, pixel_size);
@@ -196,7 +199,7 @@ impl GridPipeline {
                     levels.weights[2],
                     levels.minor,
                 ],
-                viewport: [size.0 as f32, size.1 as f32, 0.0, 0.0],
+                viewport: [size.0 as f32, size.1 as f32, pixel_scale, 0.0],
             }),
         );
         levels

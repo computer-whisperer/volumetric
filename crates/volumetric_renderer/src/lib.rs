@@ -191,7 +191,12 @@ fn resolve_uniforms(
                 0.0
             },
         ],
-        switches: [edges.crease_angle.cos(), ao_enabled as u32 as f32, 0.0, 0.0],
+        switches: [
+            edges.crease_angle.cos(),
+            ao_enabled as u32 as f32,
+            settings.pixel_scale.max(1.0).round(),
+            0.0,
+        ],
         materials,
     }
 }
@@ -597,7 +602,13 @@ impl Renderer {
 
         let view_proj = view.view_projection();
         let view_proj_array = view_proj.to_cols_array_2d();
-        let screen_size = [internal_size.0 as f32, internal_size.1 as f32];
+        let pixel_scale = settings.pixel_scale.max(1.0);
+        // Lines and points measure their widths against this size, so a
+        // supersampled frame is given the delivered picture's.
+        let screen_size = [
+            internal_size.0 as f32 / pixel_scale,
+            internal_size.1 as f32 / pixel_scale,
+        ];
 
         // ---- Uploads. Everything is written before any pass is encoded;
         // each batch has buffers of its own.
@@ -669,13 +680,17 @@ impl Renderer {
                 .write_retained_uniforms(queue, batch, view_proj_array, screen_size);
         }
         for splat in &self.frame_retained_splats {
-            self.splat_pipeline
-                .prepare_retained(queue, splat, view, screen_size);
+            self.splat_pipeline.prepare_retained(
+                queue,
+                splat,
+                view,
+                [internal_size.0 as f32, internal_size.1 as f32],
+            );
         }
 
         let grid_levels = settings.grid.visible.then(|| {
             self.grid_pipeline
-                .prepare(queue, &settings.grid, view, internal_size)
+                .prepare(queue, &settings.grid, view, internal_size, pixel_scale)
         });
 
         // ---- Shading uniforms. The inverse is taken in double

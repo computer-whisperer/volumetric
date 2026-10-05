@@ -881,6 +881,72 @@ fn antialiasing_smooths_silhouettes_only() {
     });
 }
 
+/// A frame drawn twice as large with a pixel scale of 2 and scaled down
+/// is the same picture, smoother: a line keeps its width, an edge line
+/// stays one pixel, and a slanted silhouette gains in-between values
+/// without any other anti-aliasing.
+#[test]
+fn a_supersampled_frame_is_the_same_picture_smoother() {
+    on_each_backend(|offscreen| {
+        let mesh_data = quad(
+            Vec3::new(0.0, 0.3, 0.0),
+            Vec3::new(0.6, 0.15, 0.0),
+            Vec3::new(-0.1, 0.4, 0.0),
+            [1.0; 4],
+        );
+        let frame = |factor: u32| {
+            let mut renderer = offscreen.renderer(W * factor, H * factor);
+            let mesh = renderer.create_retained_mesh(offscreen.device(), &mesh_data);
+            renderer.submit_retained_mesh(&mesh, Mat4::IDENTITY, ObjectId(1), MaterialId(0));
+            renderer.submit_lines(
+                &line(-0.5, 0.2, [1.0, 0.0, 0.0, 1.0]),
+                Mat4::IDENTITY,
+                style(4.0, DepthMode::Normal),
+            );
+            let mut settings = settings(false);
+            settings.antialiasing = false;
+            settings.edges.enabled = true;
+            settings.materials[0].specular = 0.0;
+            settings.pixel_scale = factor as f32;
+            let (rgba, _) = offscreen
+                .render_rgba(&mut renderer, &view(), &settings)
+                .unwrap();
+            crate::offscreen::downsample_rgba(&rgba, W * factor, H * factor, factor)
+        };
+        let once = frame(1);
+        let twice = frame(2);
+
+        // The 4 px line is as thick in both.
+        let thick = |rgba: &[u8]| rows_of(rgba, W / 2, 0);
+        assert!((3..=5).contains(&thick(&once)), "{}", thick(&once));
+        assert!((3..=5).contains(&thick(&twice)), "{}", thick(&twice));
+
+        // The pictures agree away from edges, and nearly everywhere.
+        let far_apart = (0..W * H)
+            .filter(|i| {
+                let (a, b) = (pixel(&once, i % W, i / W), pixel(&twice, i % W, i / W));
+                (0..3).any(|c| a[c].abs_diff(b[c]) > 40)
+            })
+            .count();
+        assert!(far_apart < 250, "{far_apart} pixels far apart");
+        let (cx, cy) = at(&view(), Vec3::new(0.0, 0.3, 0.0));
+        assert_eq!(pixel(&once, cx, cy), pixel(&twice, cx, cy));
+
+        // Along the quad's upper silhouette the single-sample frame has
+        // the surface, the edge line and the background; the supersampled
+        // one has values in between.
+        let colours = |rgba: &[u8]| {
+            (0..W)
+                .flat_map(|x| (0..cy.saturating_sub(4)).map(move |y| (x, y)))
+                .map(|(x, y)| pixel(rgba, x, y))
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+        };
+        assert!(colours(&once) <= 3, "{} colours", colours(&once));
+        assert!(colours(&twice) > 6, "{} colours", colours(&twice));
+    });
+}
+
 /// A sphere with smooth normals.
 fn sphere(centre: Vec3, radius: f32) -> MeshData {
     let (rings, sectors) = (32u32, 64u32);

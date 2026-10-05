@@ -78,6 +78,11 @@ impl Offscreen {
         &self.queue
     }
 
+    /// The largest frame side this device can draw.
+    pub fn max_frame_side(&self) -> u32 {
+        self.device.limits().max_texture_dimension_2d
+    }
+
     /// A renderer initialised on this device and sized to `width` x
     /// `height` pixels.
     pub fn renderer(&self, width: u32, height: u32) -> Renderer {
@@ -180,6 +185,60 @@ impl Offscreen {
     pub fn pick(&self, renderer: &mut Renderer, pixel: (u32, u32)) -> Option<Pick> {
         renderer.pick_now(&self.device, &self.queue, pixel)
     }
+}
+
+/// Scales an RGBA8 frame (sRGB-encoded colour, as [`Offscreen::render_rgba`]
+/// returns) down by a whole `factor`, averaging each block of pixels in
+/// linear light: the second half of supersampling. `width` and `height`
+/// are the frame's own and must be multiples of `factor`.
+pub fn downsample_rgba(rgba: &[u8], width: u32, height: u32, factor: u32) -> Vec<u8> {
+    assert!(factor >= 1 && width % factor == 0 && height % factor == 0);
+    assert_eq!(rgba.len(), (width * height * 4) as usize);
+    if factor == 1 {
+        return rgba.to_vec();
+    }
+    let decode: Vec<f32> = (0..=255u8)
+        .map(|byte| {
+            let c = f32::from(byte) / 255.0;
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        })
+        .collect();
+    let encode = |linear: f32| {
+        let c = if linear <= 0.003_130_8 {
+            linear * 12.92
+        } else {
+            1.055 * linear.powf(1.0 / 2.4) - 0.055
+        };
+        (c * 255.0).round().clamp(0.0, 255.0) as u8
+    };
+    let (out_w, out_h) = (width / factor, height / factor);
+    let samples = (factor * factor) as f32;
+    let mut out = Vec::with_capacity((out_w * out_h * 4) as usize);
+    for y in 0..out_h {
+        for x in 0..out_w {
+            let mut sum = [0.0f32; 4];
+            for sy in 0..factor {
+                let row = ((y * factor + sy) * width + x * factor) as usize * 4;
+                for px in rgba[row..row + factor as usize * 4].chunks_exact(4) {
+                    for c in 0..3 {
+                        sum[c] += decode[px[c] as usize];
+                    }
+                    sum[3] += f32::from(px[3]);
+                }
+            }
+            out.extend([
+                encode(sum[0] / samples),
+                encode(sum[1] / samples),
+                encode(sum[2] / samples),
+                (sum[3] / samples).round() as u8,
+            ]);
+        }
+    }
+    out
 }
 
 #[cfg(test)]

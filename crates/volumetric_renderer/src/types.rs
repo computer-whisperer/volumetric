@@ -549,6 +549,12 @@ pub struct RenderSettings {
     /// Smooth the lit scene's stair-stepped edges (FXAA). Lines, the
     /// grid and the gizmo are anti-aliased either way.
     pub antialiasing: bool,
+    /// How many target pixels across one pixel of the delivered picture
+    /// is: 1 unless the frame is drawn larger to be scaled down
+    /// (supersampling). Every width given in pixels (lines, points, the
+    /// grid's lines, edge lines) is multiplied by it, so the picture
+    /// looks the same and only gets smoother.
+    pub pixel_scale: f32,
 }
 
 impl Default for RenderSettings {
@@ -562,6 +568,7 @@ impl Default for RenderSettings {
             gizmo: None,
             background_color: [0.1, 0.1, 0.1, 1.0],
             antialiasing: true,
+            pixel_scale: 1.0,
         }
     }
 }

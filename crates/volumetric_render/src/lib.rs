@@ -27,7 +27,7 @@ use volumetric_preview::{
 };
 use volumetric_renderer::{
     AoSettings, Camera, CameraView, GridPlane, GridSpacing, LineData, MaterialId, ObjectId,
-    RenderSettings, StandardView, Warp, offscreen::Offscreen,
+    RenderSettings, StandardView, Warp, offscreen::Offscreen, offscreen::downsample_rgba,
 };
 
 pub use view_core::overlay::Overlay;
@@ -486,6 +486,18 @@ pub fn grid_plane_for(up: Vec3) -> GridPlane {
     }
 }
 
+/// How many times larger than its delivered size a plain frame is drawn,
+/// per side.
+const SUPERSAMPLE: u32 = 2;
+
+/// [`SUPERSAMPLE`], or as much of it as the device can draw at `size`.
+fn supersample_factor(size: (u32, u32), max_side: u32) -> u32 {
+    (1..=SUPERSAMPLE)
+        .rev()
+        .find(|factor| size.0.max(size.1).saturating_mul(*factor) <= max_side)
+        .unwrap_or(1)
+}
+
 /// The frames to draw: a suffix (for several) and the view for each.
 fn frames(
     camera: CameraSpec,
@@ -752,7 +764,21 @@ pub fn render(
 
     let offscreen = Offscreen::new().map_err(anyhow::Error::msg)?;
     let gpu = offscreen.adapter_name();
-    let mut renderer = offscreen.renderer(size.0, size.1);
+    // A plain render is drawn larger and scaled down. A frame through a
+    // lens, over a photograph, with marks or of a splat is drawn at its
+    // own size: those are compared pixel for pixel with photographs and
+    // reference renders.
+    let plain = lens.is_none()
+        && options.overlay.is_none()
+        && !options.marks
+        && entities.iter().all(|entity| entity.scene.splats.is_empty());
+    let supersample = if plain {
+        supersample_factor(size, offscreen.max_frame_side())
+    } else {
+        1
+    };
+    let drawn = (size.0 * supersample, size.1 * supersample);
+    let mut renderer = offscreen.renderer(drawn.0, drawn.1);
     renderer
         .set_warp(offscreen.device(), lens.as_ref())
         .map_err(anyhow::Error::msg)?;
@@ -781,6 +807,7 @@ pub fn render(
         antialiasing: overlay.is_none(),
         ..RenderSettings::default()
     };
+    settings.pixel_scale = supersample as f32;
     settings.grid.visible = options.grid > 0.0 && overlay.is_none();
     settings.grid.plane = grid_plane_for(up);
     settings.grid.spacing = GridSpacing::Fixed(options.grid);
@@ -821,6 +848,7 @@ pub fn render(
         let (rgba, info) = offscreen
             .render_rgba(&mut renderer, &view, &settings)
             .map_err(anyhow::Error::msg)?;
+        let rgba = downsample_rgba(&rgba, drawn.0, drawn.1, supersample);
         if let Some(overflow) = info.overflow {
             notes.push(format!(
                 "dropped {} of {} triangles, {} lines, {} points and {} splat primitives at the GPU buffer limit",
@@ -1009,6 +1037,12 @@ mod tests {
         assert_eq!(grid_plane_for(Vec3::Z), GridPlane::XY);
         assert_eq!(grid_plane_for(Vec3::Y), GridPlane::XZ);
         assert_eq!(grid_plane_for(Vec3::NEG_X), GridPlane::YZ);
+    }
+
+    #[test]
+    fn supersampling_stops_at_what_the_device_can_draw() {
+        assert_eq!(supersample_factor((1024, 768), 8192), SUPERSAMPLE);
+        assert_eq!(supersample_factor((5000, 100), 8192), 1);
     }
 
     #[test]

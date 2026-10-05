@@ -22,7 +22,8 @@ struct GridUniforms {
     // The weights of the minor, major and super-major lines, then the
     // minor spacing in world units. Each level is ten times the last.
     levels: vec4<f32>,
-    // xy: the target's size in pixels.
+    // xy: the target's size in pixels; z: target pixels per pixel of the
+    // delivered picture, which line widths are measured in.
     viewport: vec4<f32>,
 };
 
@@ -90,7 +91,7 @@ fn fs_grid(in: VsOut) -> FsOut {
         let t = -dot(near, n) / dot(ray, n);
         let hit = near + ray * t;
         let coord = vec2<f32>(dot(hit, uniforms.axis_u.xyz), dot(hit, uniforms.axis_v.xyz));
-        let coord_per_pixel = max(fwidth(coord), vec2<f32>(1e-12));
+        let coord_per_pixel = max(fwidth(coord) * uniforms.viewport.z, vec2<f32>(1e-12));
 
         let minor = uniforms.levels.w;
         let w = uniforms.levels.xyz;
@@ -137,7 +138,7 @@ fn fs_grid(in: VsOut) -> FsOut {
     let closest = n * along;
     let clip = uniforms.view_proj * vec4<f32>(closest, 1.0);
     let ndc = clip.xyz / clip.w;
-    let off = (ndc.xy - in.ndc) * 0.5 * uniforms.viewport.xy;
+    let off = (ndc.xy - in.ndc) * 0.5 * uniforms.viewport.xy / uniforms.viewport.z;
     let alpha = uniforms.color_n.a * opacity * (1.0 - smoothstep(0.25, 1.25, length(off)));
     if !(clip.w > 0.0 && ndc.z >= 0.0 && ndc.z <= 1.0 && alpha > 0.002) {
         discard;
