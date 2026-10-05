@@ -441,8 +441,9 @@ renderer, and the renderer's obligations to it are fixed here:
 - the source is replaced without re-rendering other sources' buffers, so a
   coarse image shown during camera motion can be refined at rest.
 
-`src/direct_preview.rs` (the icon thumbnails) is the seed of that caster and
-is not touched by this arc, except that it already agrees with Z-up.
+The caster is being built to `DIRECT_CASTING_PLAN.md` (repo root). Its
+search library exists (`src/direct_cast.rs`, which the icon thumbnails now
+use); the pass that draws its surface points into this frame does not yet.
 
 ## 10. What is deleted
 
