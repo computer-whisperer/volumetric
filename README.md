@@ -597,6 +597,10 @@ volumetric_cli sample -i model.wasm --point 0.5,0.5,0.5
 
 # Time raw sampling: samples per second on one thread and on all
 volumetric_cli sample-bench -i project.vproj --asset car
+
+# Run the direct caster (no mesh): cost per pass, a shaded image, and
+# agreement with the mesher's vertices
+volumetric_cli cast-bench -i project.vproj --asset car -o cast.png --mesh-depth 6
 ```
 
 ## Coordinate System and Units

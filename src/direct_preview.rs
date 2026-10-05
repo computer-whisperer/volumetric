@@ -1,9 +1,9 @@
 //! Low-cost direct model thumbnails without constructing a mesh.
 //!
-//! Three-dimensional models are sampled along a fixed orthographic ray
-//! bundle with early exit. The resulting first-hit depth field is shaded in
-//! screen space. Two-dimensional models reuse the sketch rasterizer. This is
-//! deliberately a transient preview path: it never feeds export geometry.
+//! Three-dimensional models are cast directly ([`crate::direct_cast`]) from
+//! a fixed orthographic view and shaded from the normals found.
+//! Two-dimensional models reuse the sketch rasterizer. This is deliberately
+//! a transient preview path: it never feeds export geometry.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -21,13 +21,12 @@ pub struct DirectPreviewRaster {
 }
 
 /// Renders a model directly at `width × height`. `Ok(None)` means the cancel
-/// flag was observed. `ray_steps` only applies to 3D models.
+/// flag was observed.
 #[cfg(any(feature = "native", feature = "web"))]
 pub fn render_model_thumbnail(
     model_wasm: &[u8],
     width: u32,
     height: u32,
-    ray_steps: usize,
     cancel: &AtomicBool,
 ) -> anyhow::Result<Option<DirectPreviewRaster>> {
     anyhow::ensure!(
@@ -42,7 +41,7 @@ pub fn render_model_thumbnail(
         .unwrap_or_else(|| crate::model_dimensions_from_bytes(model_wasm))?;
     match dimensions {
         2 => render_sketch_thumbnail(model_wasm, width, height, cancel),
-        3 => render_volume_thumbnail(model_wasm, width, height, ray_steps.max(1), cancel),
+        3 => render_volume_thumbnail(model_wasm, width, height, cancel),
         dimensions => anyhow::bail!("direct thumbnails support 2D/3D models, got {dimensions}D"),
     }
 }
@@ -96,176 +95,75 @@ fn render_volume_thumbnail(
     model_wasm: &[u8],
     width: u32,
     height: u32,
-    ray_steps: usize,
     cancel: &AtomicBool,
 ) -> anyhow::Result<Option<DirectPreviewRaster>> {
+    use crate::direct_cast::{CastOptions, CastProjection, CastView, DirectCast};
+    use glam::DVec3;
+
     let sampler = crate::wasm::create_parallel_sampler(model_wasm)
         .context("creating thumbnail model sampler")?;
     let bounds = sampler.get_bounds()?;
-    let min = [bounds.min.0, bounds.min.1, bounds.min.2];
-    let max = [bounds.max.0, bounds.max.1, bounds.max.2];
-    anyhow::ensure!(
-        (0..3).all(|axis| min[axis].is_finite() && max[axis] > min[axis]),
-        "model reported invalid bounds"
+    let (min, max) = (DVec3::from(bounds.min), DVec3::from(bounds.max));
+    let mut cast = DirectCast::new(min, max)?;
+
+    // A fixed three-quarter view from above, framed on the bounds.
+    let center = (min + max) * 0.5;
+    let half = (max - min) * 0.5;
+    let diagonal = half.length();
+    let forward = DVec3::new(1.3, 1.6, -1.0).normalize();
+    let eye = center - forward * (diagonal * 2.5);
+    let mut view = CastView::look_at(
+        eye,
+        center,
+        DVec3::Z,
+        CastProjection::Orthographic { half_height: 1.0 },
+        width,
+        height,
     );
-
-    let center = std::array::from_fn(|axis| (min[axis] + max[axis]) * 0.5);
-    let half = std::array::from_fn(|axis| (max[axis] - min[axis]) * 0.5);
-    let forward = normalize([1.3, 1.6, -1.0]);
-    let right = normalize(cross(forward, [0.0, 0.0, 1.0]));
-    let up = normalize(cross(right, forward));
-    let projected_width = projected_extent(half, right);
-    let projected_height = projected_extent(half, up);
     let aspect = width as f64 / height as f64;
-    let screen_half_width = projected_width.max(projected_height * aspect) * 1.12;
-    let screen_half_height = screen_half_width / aspect;
-    let diagonal = length(half);
-    let plane_center = sub(center, scale(forward, diagonal * 2.5));
+    let half_width = half.dot(view.right.abs());
+    let half_height = half.dot(view.up.abs());
+    view.projection = CastProjection::Orthographic {
+        half_height: (half_width / aspect).max(half_height) * 1.12,
+    };
 
-    let rows: Vec<(Vec<f32>, u64)> = crate::parallel_iter::map_range(0..height as usize, |y| {
-        let mut depths = vec![f32::NAN; width as usize];
-        let mut samples = 0u64;
-        if cancel.load(Ordering::Relaxed) {
-            return (depths, samples);
-        }
-        let v = 1.0 - 2.0 * (y as f64 + 0.5) / height as f64;
-        for (x, depth) in depths.iter_mut().enumerate() {
-            if cancel.load(Ordering::Relaxed) {
-                break;
-            }
-            let u = 2.0 * (x as f64 + 0.5) / width as f64 - 1.0;
-            let origin = add(
-                add(plane_center, scale(right, u * screen_half_width)),
-                scale(up, v * screen_half_height),
-            );
-            let Some((near, far)) = ray_box_intersection(origin, forward, min, max) else {
-                continue;
-            };
-            for step in 0..ray_steps {
-                let fraction = (step as f64 + 0.5) / ray_steps as f64;
-                let point = add(origin, scale(forward, near + (far - near) * fraction));
-                samples += 1;
-                if volumetric_abi::is_occupied(sampler.sample(point[0], point[1], point[2])) {
-                    *depth = fraction as f32;
-                    break;
-                }
-            }
-        }
-        (depths, samples)
-    });
-    if cancel.load(Ordering::Relaxed) {
+    // An icon does not need every pixel-wide detail searched for.
+    let options = CastOptions {
+        spacing: 1.0,
+        coarsest: 4.0,
+        search: 2.0,
+    };
+    let Some((image, stats)) = cast.cast(&sampler, &view, &options, cancel) else {
         return Ok(None);
+    };
+
+    let light = DVec3::new(-0.45, 0.55, 1.0).normalize();
+    let base = [0.32, 0.68, 0.88];
+    let mut rgba = vec![0; width as usize * height as usize * 4];
+    for (hit, pixel) in image.hits.iter().zip(rgba.chunks_exact_mut(4)) {
+        let Some(hit) = hit else { continue };
+        // The normal in the view's frame: x right, y up, z to the viewer.
+        let normal = hit.normal.as_dvec3();
+        let normal = DVec3::new(
+            normal.dot(view.right),
+            normal.dot(view.up),
+            -normal.dot(view.forward),
+        );
+        let intensity = 0.30 + 0.70 * normal.dot(light).max(0.0);
+        // Fade a little toward the back of the bounds.
+        let depth = ((hit.t - diagonal * 1.5) / (diagonal * 2.0)).clamp(0.0, 1.0);
+        let fade = 1.0 - depth * 0.18;
+        for channel in 0..3 {
+            pixel[channel] = (base[channel] * intensity * fade * 255.0).round() as u8;
+        }
+        pixel[3] = 255;
     }
-    let samples = rows.iter().map(|(_, samples)| *samples).sum();
-    let depths: Vec<f32> = rows.into_iter().flat_map(|(row, _)| row).collect();
-    let rgba = shade_depths(&depths, width as usize, height as usize, ray_steps);
     Ok(Some(DirectPreviewRaster {
         width,
         height,
         rgba,
-        samples,
+        samples: stats.samples,
     }))
-}
-
-fn shade_depths(depths: &[f32], width: usize, height: usize, ray_steps: usize) -> Vec<u8> {
-    let mut rgba = vec![0; width * height * 4];
-    let light = normalize([-0.45, -0.55, 1.0]);
-    for y in 0..height {
-        for x in 0..width {
-            let i = y * width + x;
-            let center = depths[i];
-            if !center.is_finite() {
-                continue;
-            }
-            let sample = |x: usize, y: usize| {
-                let value = depths[y * width + x];
-                if value.is_finite() { value } else { center }
-            };
-            let left = sample(x.saturating_sub(1), y);
-            let right = sample((x + 1).min(width - 1), y);
-            let top = sample(x, y.saturating_sub(1));
-            let bottom = sample(x, (y + 1).min(height - 1));
-            let slope = ray_steps as f64 * 0.55;
-            let normal = normalize([
-                f64::from(left - right) * slope,
-                f64::from(top - bottom) * slope,
-                1.0,
-            ]);
-            let diffuse = dot(normal, light).max(0.0);
-            let intensity = 0.30 + 0.70 * diffuse;
-            let depth_fade = 1.0 - f64::from(center) * 0.18;
-            let base = [0.32, 0.68, 0.88];
-            let pixel = i * 4;
-            for channel in 0..3 {
-                rgba[pixel + channel] =
-                    (base[channel] * intensity * depth_fade * 255.0).round() as u8;
-            }
-            rgba[pixel + 3] = 255;
-        }
-    }
-    rgba
-}
-
-fn ray_box_intersection(
-    origin: [f64; 3],
-    direction: [f64; 3],
-    min: [f64; 3],
-    max: [f64; 3],
-) -> Option<(f64, f64)> {
-    let mut near = f64::NEG_INFINITY;
-    let mut far = f64::INFINITY;
-    for axis in 0..3 {
-        if direction[axis].abs() < 1.0e-12 {
-            if origin[axis] < min[axis] || origin[axis] > max[axis] {
-                return None;
-            }
-            continue;
-        }
-        let a = (min[axis] - origin[axis]) / direction[axis];
-        let b = (max[axis] - origin[axis]) / direction[axis];
-        near = near.max(a.min(b));
-        far = far.min(a.max(b));
-        if far < near {
-            return None;
-        }
-    }
-    (far >= 0.0).then_some((near.max(0.0), far))
-}
-
-fn add(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-    std::array::from_fn(|axis| a[axis] + b[axis])
-}
-
-fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-    std::array::from_fn(|axis| a[axis] - b[axis])
-}
-
-fn scale(v: [f64; 3], scale: f64) -> [f64; 3] {
-    v.map(|component| component * scale)
-}
-
-fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
-    (0..3).map(|axis| a[axis] * b[axis]).sum()
-}
-
-fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-    [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    ]
-}
-
-fn length(v: [f64; 3]) -> f64 {
-    dot(v, v).sqrt()
-}
-
-fn normalize(v: [f64; 3]) -> [f64; 3] {
-    scale(v, 1.0 / length(v).max(f64::EPSILON))
-}
-
-fn projected_extent(half: [f64; 3], axis: [f64; 3]) -> f64 {
-    (0..3).map(|i| half[i] * axis[i].abs()).sum()
 }
 
 #[cfg(all(test, feature = "native"))]
@@ -302,7 +200,7 @@ mod tests {
 
     #[test]
     fn volume_thumbnail_has_a_shaded_silhouette() {
-        let raster = render_model_thumbnail(&sphere(), 48, 48, 32, &AtomicBool::new(false))
+        let raster = render_model_thumbnail(&sphere(), 48, 48, &AtomicBool::new(false))
             .unwrap()
             .unwrap();
         let opaque = raster
@@ -312,14 +210,14 @@ mod tests {
             .count();
         assert!(opaque > 200, "sphere silhouette was empty: {opaque}");
         assert!(opaque < 48 * 48, "background was not transparent");
-        assert!(raster.samples < 48 * 48 * 32);
+        assert!(raster.samples > 0);
     }
 
     #[test]
     fn pre_cancelled_thumbnail_does_no_work() {
         let cancel = AtomicBool::new(true);
         assert!(
-            render_model_thumbnail(&sphere(), 32, 32, 16, &cancel)
+            render_model_thumbnail(&sphere(), 32, 32, &cancel)
                 .unwrap()
                 .is_none()
         );

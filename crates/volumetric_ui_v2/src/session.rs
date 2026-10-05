@@ -2411,14 +2411,9 @@ pub fn execute_job_monitored(
             }))
         }
         BackgroundJob::BuildThumbnail(job) => {
-            let result = volumetric::direct_preview::render_model_thumbnail(
-                &job.data,
-                96,
-                96,
-                40,
-                &job.cancel,
-            )
-            .map_err(format_error_chain);
+            let result =
+                volumetric::direct_preview::render_model_thumbnail(&job.data, 96, 96, &job.cancel)
+                    .map_err(format_error_chain);
             BackgroundResult::ThumbnailComplete {
                 source_hash: job.source_hash,
                 result,

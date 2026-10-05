@@ -9,6 +9,8 @@ use anyhow::Context;
 pub mod baked;
 pub mod build_cache;
 #[cfg(any(feature = "native", feature = "web"))]
+pub mod direct_cast;
+#[cfg(any(feature = "native", feature = "web"))]
 pub mod direct_preview;
 pub mod mesh_cache;
 pub mod wasm;

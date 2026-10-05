@@ -1,7 +1,7 @@
 # Direct casting: drawing a model without meshing it
 
-Status: **proposed 2026-10-05, not yet ratified, nothing built** except the
-`sample-bench` instrument (`6aa4e2e`). This file is the target design; when
+Status: **ratified 2026-10-05; step 1 of 4 built** (the search library,
+`cast-bench`; §5.1), with the `sample-bench` instrument (`6aa4e2e`). This file is the target design; when
 a decision here changes, rewrite it and record what was rejected and why.
 
 ## 1. What this is for
@@ -65,53 +65,87 @@ no work is repeated.
 
 ## 4. Design
 
-### 4.1 Two world-space caches per model
+Sections 4.1 and 4.2 describe what is built (`src/direct_cast.rs`); 4.3
+and 4.4 are still the target.
 
-Both live in the model's own frame, keyed like the mesh cache by the
-model's content hash, so a pose change moves them rigidly and an edit to
-another part leaves them alone.
+### 4.1 One tree per model
 
-- **Search pyramid.** A sparse octree over the model's bounds. Each node
-  records the finest pitch its volume has been searched at and whether any
-  sample in it was inside. It answers "how far along this ray is already
-  known empty at the pitch this pixel needs?" Rays skip what is certified
-  and search only the rest, then write back what they searched.
-- **Surfels.** Each surface point found: position (bisected), normal, and
-  the pitch it was found at (its disc radius). These are what is drawn.
+A `DirectCast` is an octree over the model's bounds, in the model's own
+frame, so a pose change moves it rigidly and an edit to another part
+leaves it alone. It holds both things the proposal called for:
 
-The pyramid is what makes zoom adaptive: the pitch a pixel needs is its
-footprint at that depth, so zooming in asks for a finer pitch in the
-visible region only, and the pyramid shows it has not been searched that
-finely yet.
+- **Surfels.** Each surface point found (bisected position, normal, disc
+  radius) is stored in the node whose level matches the pitch it was found
+  at: a node is four pitches wide. The tree is therefore a level-of-detail
+  hierarchy of the surface. A coarse surfel is marked superseded when a
+  finer one is found inside its disc, and `surfels(view)` picks, for each
+  part of the surface, the level that suits that view's pixels.
+- **The search record.** Per node: whether surface has been found in or
+  under it, and the finest pitch its volume has been searched at and found
+  empty. Rays skip nodes searched finely enough for their pixel.
+
+A node counts as searched by a pass when at least 70% of the rays its
+outline should catch went all the way through it without a hit. Rays that
+stopped at nearer surface do not count, so a node partly in shadow is not
+claimed. A node searched at up to 1.5 times the pitch a ray wants is taken
+as searched; without that allowance a view slightly closer than the last
+would search everything again.
 
 Rejected: a screen-space cache only (the depth image of the last frame).
 It is lost on every camera move, cannot serve a pose change, and cannot
 say what has been searched.
 
+Rejected: counting samples per node and calling a node searched at
+`size / cbrt(samples)`. A node half hidden behind nearer surface gets all
+its samples in the visible half and would be claimed whole.
+
 ### 4.2 The search
 
-Per ray, front to back through the model's bounds:
+A pass casts one lattice of rays, some whole number of pixels apart. Each
+ray walks the tree front to back, steps through the nodes its pass mode
+selects at a stride of one pitch (ray spacing times pixel footprint), and
+on an inside sample bisects ten times back to the surface. Three modes:
 
-1. Skip spans the pyramid certifies empty at this pixel's pitch.
-2. Step the rest at the current pass's stride, with a per-ray offset so
-   successive passes test new depths rather than the same ones.
-3. On an inside sample, bisect back to the surface, emit a surfel.
-4. Record the searched spans in the pyramid.
+- **Discover** steps every node not yet searched at the pass's pitch.
+  This is the pass that finds things, and where the time goes.
+- **Refine** steps only nodes known to hold surface, their unsearched
+  siblings, and nodes marked for a closer look. It redraws known surface
+  on a finer lattice, cheaply.
+- **Chase** steps only the marked nodes, in front of what the image
+  already shows.
 
-Passes halve the stride (and the pixel spacing) until both reach the pixel
-footprint. The first pass is coarse in both: every 8th pixel at an 8-pixel
-stride is 1/512 of the full search.
+`cast()` orders them the way a viewport wants: Discover at 8 px, Refine at
+4, 2 and 1 px (a full-resolution image of everything found so far), Chase
+until nothing new, and only then Discover at 4, 2 and 1 px, each followed
+by a Refine and Chase at 1 px if it found anything.
 
-**Hit-guided refinement.** A hit whose neighbouring rays missed is the
-signature of something thin. Those neighbours are searched immediately at
-fine stride around the hit's depth, before the general passes get there.
-A lattice strut first appears as scattered dots and is completed along its
-length within the same pass.
+**Following thin things.** A hit whose neighbouring rays missed, or hit at
+quite another depth, is on something thin or at the edge of what is known.
+The 26 nodes around it are marked; the next pass steps through them, and a
+Chase pass marks the neighbours of whatever it finds in turn. A strut
+touched once by the coarse search is followed along its whole length
+without any fine search of empty space. A marked node gets one look.
 
-**Normals** come from neighbouring surface points: the hit plus two more
-bisected a fraction of a pixel away in the image plane. Where the three
-disagree in depth by more than the footprint (a silhouette or a step), the
-surfel is marked as an edge and takes its normal from the side it lies on.
+**Boundaries are sampled.** Skipping is decided node by node, so wherever
+stepping starts or stops the boundary point itself is sampled, and the
+point where a ray enters the model's bounds. Without this a ray crosses
+unseen through anything lying partly in a stepped node (too little of it
+to meet a step) and partly in a skipped one; that lost 3–10% of the
+pixels of every thin rod in the test scene. A node in which any sample was
+inside the model is marked as holding surface even when bisection put the
+surface point in the node before it.
+
+**Normals** are those of the plane through the hit and two more points
+bisected half a pitch to the side and above in the image. A hit within
+half a pitch of a surfel already stored at the same pitch reuses its
+normal and costs no probes. Where a probe finds no surface (a silhouette,
+something thinner than a pitch) the normal faces the viewer.
+
+Not built from the proposal: marking such surfels as edges and taking the
+normal from one side. Known limit: the three points are one-sided, so on
+a curved surface the normal leans by about the angle the surface turns in
+half a pitch; near a silhouette, where half a pixel is a long way round,
+that reaches a couple of degrees at 160 px across a sphere.
 
 ### 4.3 Drawing
 
@@ -124,6 +158,11 @@ depth image, which is what lets it survive camera motion.
 Rejected: blended Gaussians. They need sorting, write no depth and soften
 exactly the edges the search made exact.
 
+Open for step 2: a pass also returns its rays' hits as an image, exact per
+pixel. A finished still could be drawn from that image instead of from
+discs, which overhang silhouettes by up to their radius. Decide when both
+can be looked at.
+
 **Showing certainty.** The viewport says how finely the visible region has
 been searched (for example "searched to 4 px" falling to "1 px"), so a
 blank region is never mistaken for a certified one.
@@ -132,36 +171,81 @@ blank region is never mistaken for a certified one.
 
 The same search run to completion at the output's pixel pitch (or finer,
 for supersampling), headless, behind `render --direct` and the Python
-`render`. No time limit, so no progressive display, but the same caches,
+`render`. No time limit, so no progressive display, but the same record,
 the same G-buffer pass, the same shading.
 
 ## 5. Build order
 
 Each step ends with something that can be checked by running it.
 
-1. **The search as a library** (in the `volumetric` crate, beside the
-   mesher): rays in, surfels out, with the pyramid. Checked against
-   analytic models (sphere, torus: position and normal error), against the
-   mesher's vertices on real projects, and for determinism.
+1. **The search as a library.** BUILT 2026-10-05; results in §5.1.
 2. **The surfel pass** in `volumetric_renderer` and `render --direct`.
    Checked by comparing stills with mesh renders of the same view
    (depth agreement where both have surface), on the Vulkan and GLES test
    adapters.
 3. **The viewport mode**: progressive passes on a worker, cancel on edit,
-   coarse during motion, the certainty readout, per-part caches for
-   assemblies.
-4. **Tuning on the two hard cases**: `lattice_test` (does hit-guided
-   refinement find every strut, and how long to certainty) and the
-   Raspberry Pi STEP import (9 µs samples: is the first image fast enough).
+   coarse during motion, the certainty readout, per-part records for
+   assemblies. Includes not re-tracing pixels the stored surfels already
+   cover after a camera move, which step 1 does not do.
+4. **Tuning on the two hard cases**: `lattice_test` and the Raspberry Pi
+   STEP import (9 µs samples).
 
-`src/direct_preview.rs` (the thumbnail marcher) is replaced by the library
-in step 1 and deleted.
+### 5.1 Step 1 as built
+
+`src/direct_cast.rs` with nine tests on analytic models: a sphere and a
+torus found to under 0.01 px with normals within the limit above; a grid
+of 25 rods two pixels thick found whole both by the full search and by the
+coarse search plus following, at under half the samples; a second view
+costing under two thirds of a fresh one; zooming in producing finer
+surfels; determinism; cancellation; a model filling its bounds.
+
+The thumbnail marcher in `src/direct_preview.rs` is deleted; thumbnails
+are a small cast shaded from the normals found. The module stays as the
+thumbnail client (it also draws 2D sketches).
+
+`volumetric_cli cast-bench` runs it on real models. At 1024 × 1024,
+perspective, model framed on its bounds, 24 threads:
+
+| Model | full-resolution image | full 1 px search | follow only (`--search inf`) |
+|---|---|---|---|
+| comet racer | 0.27 s | 1.15 s | 0.31 s |
+| toy car | | 2.3 s (then 1.2 s per view 10° on) | |
+| lattice_test | 1.4 s | 3.4 s | 1.6 s |
+| lattice_test, zoom 6 | | 9.5 s | |
+| Raspberry Pi STEP | 8.2 s (2 px image at 2.1 s) | 28.6 s | |
+
+The first image, at 8 px spacing, takes 5–15 ms (0.12 s for the STEP
+import). For comparison the mesher takes 8.7 s on the lattice at 128 cells
+and 37 s at 256.
+
+Checks against the models themselves: 99.1–99.9% of surfels have the model
+outside a quarter radius along the normal and inside the same way back.
+Against the mesher on the comet racer at 512 cells: of 230,463 vertices
+not hidden behind nearer surface, the cast shows surface within 2 px of
+99.48%, median depth difference 0.15 px. The 1,189 it does not show are
+not yet explained (grazing vertices at silhouettes are the likely cause;
+not checked).
+
+Known limits at the end of step 1:
+
+- Every view re-traces its hits; stored surfels are reused for their
+  normals only. Reuse of the search record roughly halves a nearby view.
+- Empty nodes partly hidden behind nearer surface, or cut by the edge of
+  the frame, never count as searched and are searched again by each
+  Discover pass that reaches them.
+- A pass walks every ray through the tree even when few have anything to
+  step, about 40–70 ms per megapixel pass. Chase passes pay this each.
+- `surfels(view)` does not cull to the frame, and a coarse level that was
+  only ever cast in part is drawn in part.
+- The zoomed lattice view costs 168 samples per pixel; not yet looked at.
+- A few isolated dark pixels appear on flat faces of the zoomed lattice
+  and above the Raspberry Pi board; not yet explained.
 
 ## 6. Open questions
 
 - **Memory.** A megapixel of surfels is small (tens of MB); surfels
-  accumulated over many views and zoom levels are not. Needs an eviction
-  rule (coarser surfels superseded by finer ones in the same place).
+  accumulated over many views and zoom levels are not, and neither is the
+  tree (1.5M nodes for one view of the lattice). Nothing is evicted yet.
 - **Interior faces.** Occupancy is boolean, so a ray starting inside the
   model (camera inside, or a section view) needs the outside-to-inside
   rule reversed. Section views are not in scope for the first build.

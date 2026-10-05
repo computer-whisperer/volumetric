@@ -28,6 +28,7 @@ use volumetric::{
 };
 
 mod assets;
+mod cast;
 mod fea;
 mod info;
 mod observe;
@@ -65,6 +66,9 @@ enum Commands {
     Sample(info::SampleArgs),
     /// Time raw model sampling: samples per second on one thread and on all
     SampleBench(info::SampleBenchArgs),
+    /// Run the direct caster on a model: what it costs, and how the result
+    /// agrees with the model and with the mesher
+    CastBench(cast::CastBenchArgs),
     /// List models and operators bundled into this binary
     Assets(assets::AssetsArgs),
     /// Create a new project, optionally seeded with a model
@@ -600,6 +604,7 @@ fn main() -> Result<()> {
         Commands::Bounds(args) => info::run_bounds(args),
         Commands::Sample(args) => info::run_sample(args),
         Commands::SampleBench(args) => info::run_sample_bench(args),
+        Commands::CastBench(args) => cast::run_cast_bench(args),
         Commands::Assets(args) => assets::run_assets(args),
         Commands::ProjectNew(args) => project::run_project_new(args),
         Commands::ProjectAddModel(args) => project::run_project_add_model(args),
