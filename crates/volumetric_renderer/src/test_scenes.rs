@@ -61,32 +61,6 @@ pub fn create_test_cube(size: f32) -> MeshData {
     }
 }
 
-/// Create test lines forming a 3D cross/axis at origin.
-pub fn create_test_axes(length: f32) -> LineData {
-    LineData {
-        segments: vec![
-            // X axis (red)
-            LineSegment {
-                start: [0.0, 0.0, 0.0],
-                end: [length, 0.0, 0.0],
-                color: [1.0, 0.2, 0.2, 1.0],
-            },
-            // Y axis (green)
-            LineSegment {
-                start: [0.0, 0.0, 0.0],
-                end: [0.0, length, 0.0],
-                color: [0.2, 1.0, 0.2, 1.0],
-            },
-            // Z axis (blue)
-            LineSegment {
-                start: [0.0, 0.0, 0.0],
-                end: [0.0, 0.0, length],
-                color: [0.2, 0.2, 1.0, 1.0],
-            },
-        ],
-    }
-}
-
 /// Create a wireframe box as lines.
 pub fn create_wireframe_box(min: Vec3, max: Vec3, color: [f32; 4]) -> LineData {
     let corners = [
@@ -171,18 +145,6 @@ pub fn create_test_scene() -> SceneData {
         MaterialId(0),
     );
 
-    // Add coordinate axes
-    scene.add_lines(
-        create_test_axes(2.0),
-        Mat4::IDENTITY,
-        LineStyle {
-            width: 2.0,
-            width_mode: WidthMode::ScreenSpace,
-            pattern: super::LinePattern::Solid,
-            depth_mode: DepthMode::Normal,
-        },
-    );
-
     // Add a wireframe box
     scene.add_lines(
         create_wireframe_box(
@@ -239,12 +201,6 @@ mod tests {
     }
 
     #[test]
-    fn test_create_axes() {
-        let axes = create_test_axes(1.0);
-        assert_eq!(axes.segments.len(), 3); // X, Y, Z
-    }
-
-    #[test]
     fn test_create_wireframe_box() {
         let bbox = create_wireframe_box(Vec3::ZERO, Vec3::ONE, [1.0; 4]);
         assert_eq!(bbox.segments.len(), 12); // 12 edges
@@ -261,7 +217,7 @@ mod tests {
         let scene = create_test_scene();
         assert!(!scene.is_empty());
         assert_eq!(scene.meshes.len(), 1);
-        assert_eq!(scene.lines.len(), 2);
+        assert_eq!(scene.lines.len(), 1);
         assert_eq!(scene.points.len(), 1);
     }
 }

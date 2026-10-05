@@ -4,6 +4,8 @@
 
 use bytemuck::{Pod, Zeroable};
 
+use crate::ViewGizmo;
+
 // ============================================================================
 // Mesh Types
 // ============================================================================
@@ -320,119 +322,77 @@ impl PointShape {
 // Grid Types
 // ============================================================================
 
-/// Which grid planes to display.
-#[derive(Copy, Clone, Debug, Default)]
-pub struct GridPlanes {
-    /// XY plane (z = 0)
-    pub xy: bool,
-    /// XZ plane (y = 0, ground plane)
-    pub xz: bool,
-    /// YZ plane (x = 0)
-    pub yz: bool,
+/// The world plane the grid lies in, through the origin.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum GridPlane {
+    /// z = 0: the ground of a Z-up world.
+    #[default]
+    XY,
+    /// y = 0.
+    XZ,
+    /// x = 0.
+    YZ,
 }
 
-impl GridPlanes {
-    pub const NONE: Self = Self {
-        xy: false,
-        xz: false,
-        yz: false,
-    };
-    pub const XY: Self = Self {
-        xy: true,
-        xz: false,
-        yz: false,
-    };
-    pub const XZ: Self = Self {
-        xy: false,
-        xz: true,
-        yz: false,
-    };
-    pub const YZ: Self = Self {
-        xy: false,
-        xz: false,
-        yz: true,
-    };
-    pub const ALL: Self = Self {
-        xy: true,
-        xz: true,
-        yz: true,
-    };
+impl GridPlane {
+    /// The world axes (0 = X, 1 = Y, 2 = Z) the plane spans, then its
+    /// normal.
+    pub fn axes(self) -> [usize; 3] {
+        match self {
+            Self::XY => [0, 1, 2],
+            Self::XZ => [0, 2, 1],
+            Self::YZ => [1, 2, 0],
+        }
+    }
 }
 
-/// Grid rendering settings.
-#[derive(Clone, Debug)]
+/// How far apart the grid's lines are.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum GridSpacing {
+    /// A power of ten chosen each frame so the finest cells stay a
+    /// readable size on screen where the view is looking: `focus_depth`
+    /// in front of the eye (the orbit camera's distance). Finer levels
+    /// fade in and out as the view zooms.
+    Auto { focus_depth: f32 },
+    /// Minor lines this far apart (world units), a major line every ten.
+    Fixed(f32),
+}
+
+/// The ground grid and world axis lines: drawn analytically per pixel, so
+/// they have no extent and no geometry.
+#[derive(Clone, Debug, PartialEq)]
 pub struct GridSettings {
-    /// Which planes to display
-    pub planes: GridPlanes,
-    /// Spacing between grid lines (world units)
-    pub spacing: f32,
-    /// Extent of grid from origin (world units)
-    pub extent: f32,
-    /// Primary line color (every N lines)
-    pub major_color: [f32; 4],
-    /// Secondary line color
-    pub minor_color: [f32; 4],
-    /// Lines between major lines
-    pub subdivisions: u32,
-    /// Colors of the lines along the world X, Y and Z axes
-    pub axis_colors: [[f32; 4]; 3],
+    pub visible: bool,
+    pub plane: GridPlane,
+    pub spacing: GridSpacing,
+    /// Draw the world axes: the two in the plane as coloured grid lines,
+    /// the third as a line through the origin.
+    pub axes: bool,
+    /// Multiplies the opacity of every line.
+    pub opacity: f32,
+    /// Linear RGB of the grid's lines.
+    pub line_color: [f32; 3],
+    /// Linear RGB of the world X, Y and Z axis lines.
+    pub axis_colors: [[f32; 3]; 3],
 }
 
 impl Default for GridSettings {
     fn default() -> Self {
         Self {
-            planes: GridPlanes::XY, // The ground plane: +Z is up
-            spacing: 1.0,
-            extent: 10.0,
-            major_color: [0.5, 0.5, 0.5, 0.8],
-            minor_color: [0.3, 0.3, 0.3, 0.4],
-            subdivisions: 5,
-            axis_colors: [
-                [0.8, 0.2, 0.2, 1.0], // X red
-                [0.2, 0.7, 0.2, 1.0], // Y green
-                [0.2, 0.2, 0.8, 1.0], // Z blue
-            ],
+            visible: true,
+            plane: GridPlane::XY,
+            spacing: GridSpacing::Fixed(1.0),
+            axes: true,
+            opacity: 1.0,
+            line_color: [0.5, 0.5, 0.5],
+            axis_colors: AXIS_COLORS,
         }
     }
 }
 
-impl GridSettings {
-    /// Generate line segments for the grid: on each enabled plane, lines
-    /// along both of its axes, the two through the origin in their axis's
-    /// color.
-    pub fn generate_lines(&self) -> Vec<LineSegment> {
-        let mut lines = Vec::new();
-        let n = (self.extent / self.spacing) as i32;
-        let planes = [
-            (self.planes.xy, 0, 1),
-            (self.planes.xz, 0, 2),
-            (self.planes.yz, 1, 2),
-        ];
-        for (_, a, b) in planes.into_iter().filter(|(enabled, ..)| *enabled) {
-            for i in -n..=n {
-                let offset = i as f32 * self.spacing;
-                // A line along `along`, displaced by `offset` on `across`.
-                for (along, across) in [(a, b), (b, a)] {
-                    let color = if i == 0 {
-                        self.axis_colors[along]
-                    } else if i % self.subdivisions as i32 == 0 {
-                        self.major_color
-                    } else {
-                        self.minor_color
-                    };
-                    let mut start = [0.0; 3];
-                    let mut end = [0.0; 3];
-                    start[along] = -self.extent;
-                    end[along] = self.extent;
-                    start[across] = offset;
-                    end[across] = offset;
-                    lines.push(LineSegment { start, end, color });
-                }
-            }
-        }
-        lines
-    }
-}
+/// Linear RGB of the world X (red), Y (green) and Z (blue) axes, shared
+/// by the grid's axis lines and the view gizmo.
+pub const AXIS_COLORS: [[f32; 3]; 3] = [[0.85, 0.2, 0.22], [0.3, 0.65, 0.15], [0.2, 0.4, 0.9]];
 
 // ============================================================================
 // Render Settings
@@ -451,6 +411,8 @@ pub struct RenderSettings {
     pub ssao_strength: f32,
     /// Grid settings
     pub grid: GridSettings,
+    /// The view gizmo, where the host wants one drawn.
+    pub gizmo: Option<ViewGizmo>,
     /// Background color
     pub background_color: [f32; 4],
 }
@@ -463,6 +425,7 @@ impl Default for RenderSettings {
             ssao_bias: 0.025,
             ssao_strength: 1.0,
             grid: GridSettings::default(),
+            gizmo: None,
             background_color: [0.1, 0.1, 0.1, 1.0],
         }
     }

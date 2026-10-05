@@ -26,8 +26,8 @@ use volumetric_preview::{
     wireframe_style,
 };
 use volumetric_renderer::{
-    Camera, CameraView, GridPlanes, LineData, MaterialId, ObjectId, RenderSettings, StandardView,
-    Warp, offscreen::Offscreen,
+    Camera, CameraView, GridPlane, GridSpacing, LineData, MaterialId, ObjectId, RenderSettings,
+    StandardView, Warp, offscreen::Offscreen,
 };
 
 pub use view_core::overlay::Overlay;
@@ -90,11 +90,12 @@ pub struct RenderOptions {
     pub far: Option<f32>,
     /// The world's up: orients the preset views, the ground grid and the
     /// default up of an explicit camera (default: the up of a drawn view
-    /// set or splat, else +y).
+    /// set or splat, else +z).
     pub up: Option<Vec3>,
     /// Background as linear RGBA (see [`background_from_hex`]).
     pub background: [f32; 4],
-    /// Ground grid spacing in metres (0 disables).
+    /// Ground grid minor spacing in metres, a major line every ten
+    /// (0 disables).
     pub grid: f32,
     pub ssao: bool,
     pub plan: PlanOptions,
@@ -475,14 +476,14 @@ pub fn world_up(up: Option<Vec3>, assets: &[LoadedAsset]) -> Result<(Vec3, Strin
 
 /// The ground grid's plane for a world whose up is `up`: the coordinate
 /// plane most nearly perpendicular to it.
-pub fn grid_planes_for(up: Vec3) -> GridPlanes {
+pub fn grid_plane_for(up: Vec3) -> GridPlane {
     let a = up.abs();
     if a.z >= a.x && a.z >= a.y {
-        GridPlanes::XY
+        GridPlane::XY
     } else if a.x >= a.y {
-        GridPlanes::YZ
+        GridPlane::YZ
     } else {
-        GridPlanes::XZ
+        GridPlane::XZ
     }
 }
 
@@ -776,14 +777,9 @@ pub fn render(
         ssao_enabled: options.ssao,
         ..RenderSettings::default()
     };
-    if options.grid > 0.0 && overlay.is_none() {
-        let extent = (Vec3::from(bounds.max) - Vec3::from(bounds.min)).length();
-        settings.grid.planes = grid_planes_for(up);
-        settings.grid.spacing = options.grid;
-        settings.grid.extent = (extent * 2.0).max(options.grid * 10.0);
-    } else {
-        settings.grid.planes = GridPlanes::NONE;
-    }
+    settings.grid.visible = options.grid > 0.0 && overlay.is_none();
+    settings.grid.plane = grid_plane_for(up);
+    settings.grid.spacing = GridSpacing::Fixed(options.grid);
 
     let mut out = Vec::with_capacity(frames.len());
     for (suffix, view) in frames {
@@ -867,7 +863,7 @@ pub fn render(
                     ssao_enabled: false,
                     ..RenderSettings::default()
                 };
-                marks_settings.grid.planes = GridPlanes::NONE;
+                marks_settings.grid.visible = false;
                 let (lines, _) = offscreen
                     .render_rgba(&mut renderer, &view, &marks_settings)
                     .map_err(anyhow::Error::msg)?;
@@ -998,8 +994,9 @@ mod tests {
             "front not level in a y-up world"
         );
 
-        assert!(grid_planes_for(Vec3::Z).xy && grid_planes_for(Vec3::Y).xz);
-        assert!(grid_planes_for(Vec3::NEG_X).yz);
+        assert_eq!(grid_plane_for(Vec3::Z), GridPlane::XY);
+        assert_eq!(grid_plane_for(Vec3::Y), GridPlane::XZ);
+        assert_eq!(grid_plane_for(Vec3::NEG_X), GridPlane::YZ);
     }
 
     #[test]

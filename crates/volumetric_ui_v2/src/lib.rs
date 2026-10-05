@@ -1184,6 +1184,8 @@ pub struct VolumetricUiV2 {
     /// Geometry the viewport had to drop at the GPU buffer size limit,
     /// mirrored from the renderer each frame; shown as a HUD warning.
     viewport_overflow: Option<String>,
+    /// The spacing of the grid's minor lines in the last frame, metres.
+    grid_spacing: Option<f32>,
     /// The open 2D inspection lightbox, if any.
     lightbox: Option<LightboxState>,
     /// The open mesh-export modal, if any.
@@ -1298,6 +1300,7 @@ impl VolumetricUiV2 {
             artifact_thumbnails: std::collections::HashMap::new(),
             artifact_thumbnail_order: std::collections::VecDeque::new(),
             viewport_overflow: None,
+            grid_spacing: None,
             look_through: None,
             photo_opacity_percent: 50,
             viewset_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -2179,6 +2182,10 @@ impl VolumetricUiV2 {
 
     pub(crate) fn set_viewport_overflow(&mut self, message: Option<String>) {
         self.viewport_overflow = message;
+    }
+
+    pub(crate) fn set_grid_spacing(&mut self, spacing: Option<f32>) {
+        self.grid_spacing = spacing;
     }
 
     pub(crate) fn take_camera_command(&mut self) -> Option<ViewportCameraCommand> {
@@ -6339,6 +6346,13 @@ fn viewport_hud(app: &VolumetricUiV2) -> El {
             );
         }
     }
+    if let Some(spacing) = app.grid_spacing {
+        badges.push(
+            badge(format!("grid {}", format_length(spacing)))
+                .muted()
+                .xsmall(),
+        );
+    }
     if let Some(warning) = &app.viewport_overflow {
         badges.push(badge(warning).destructive().xsmall());
     }
@@ -6413,6 +6427,18 @@ fn format_dims(min: (f32, f32, f32), max: (f32, f32, f32)) -> String {
         format_dim(max.1 - min.1),
         format_dim(max.2 - min.2),
     )
+}
+
+/// A length in metres in the unit that reads shortest: `10 mm`, `1 m`.
+fn format_length(metres: f32) -> String {
+    let (scale, unit) = match metres.abs() {
+        m if m >= 999.5 => (1e-3, "km"),
+        m if m >= 0.9995 => (1.0, "m"),
+        m if m >= 0.9995e-3 => (1e3, "mm"),
+        m if m >= 0.9995e-6 => (1e6, "µm"),
+        _ => (1e9, "nm"),
+    };
+    format!("{} {unit}", format_dim(metres * scale))
 }
 
 /// Compact dimension formatting: up to 3 decimals, trailing zeros trimmed.
@@ -9323,6 +9349,16 @@ mod tests {
         assert_eq!(summary.render_mode, PreviewRenderMode::Points);
         assert_eq!(summary.preview_resolution, 96);
         assert_eq!(summary.camera_control_scheme, CameraControlScheme::OnShape);
+    }
+
+    #[test]
+    fn lengths_read_in_their_shortest_unit() {
+        assert_eq!(format_length(0.01), "10 mm");
+        assert_eq!(format_length(0.001), "1 mm");
+        assert_eq!(format_length(0.0001), "100 µm");
+        assert_eq!(format_length(1.0), "1 m");
+        assert_eq!(format_length(100.0), "100 m");
+        assert_eq!(format_length(1000.0), "1 km");
     }
 
     #[test]

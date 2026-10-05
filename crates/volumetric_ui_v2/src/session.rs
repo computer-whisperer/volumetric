@@ -331,6 +331,7 @@ impl Session {
                 .artifact_statuses(&artifact_requests),
         );
         app.set_viewport_overflow(self.viewport.frame_overflow_message());
+        app.set_grid_spacing(self.viewport.last_frame.grid_spacing);
         jobs.extend(preview_jobs.into_iter().map(BackgroundJob::BuildPreview));
 
         // Export modal: deliver the export geometry the sync after the
@@ -493,6 +494,10 @@ impl Session {
             return;
         };
         self.camera_pointer = Some(pos);
+        // The view gizmo takes the primary button before the scene does.
+        if button == PointerButton::Primary && self.viewport.press_gizmo(pos, rect) {
+            return;
+        }
         // What the press landed on anchors the camera gesture it starts.
         self.press_pick = self.viewport.pick_at(gpu, pos, rect);
         if button != PointerButton::Primary {
@@ -511,11 +516,13 @@ impl Session {
     }
 
     /// A pointer release: ends the camera drag once no buttons remain down,
-    /// and a part drag, whose state goes to the app at the next sync.
+    /// a part drag, whose state goes to the app at the next sync, and a
+    /// press on the view gizmo, which was a click if it never moved.
     pub fn pointer_up(&mut self, button: PointerButton) {
         self.camera_buttons.set(button, false);
         if button == PointerButton::Primary {
             self.viewport.end_part_drag();
+            self.viewport.release_gizmo();
         }
         if !self.camera_buttons.any() {
             self.camera_pointer = None;
@@ -524,8 +531,10 @@ impl Session {
         }
     }
 
-    /// A pointer move: advances an in-progress camera drag. Returns whether
-    /// the camera changed (the shell should schedule a frame).
+    /// A pointer move: advances an in-progress camera drag, or with no
+    /// button down lights the part of the view gizmo under the pointer.
+    /// Returns whether the viewport changed (the shell should schedule a
+    /// frame).
     pub fn pointer_moved(
         &mut self,
         gpu: Gpu<'_>,
@@ -545,11 +554,18 @@ impl Session {
         }
         #[cfg(not(target_arch = "wasm32"))]
         let _ = gpu;
+        if !self.camera_buttons.any() {
+            return self
+                .viewport
+                .hover_gizmo(self.viewport_rect.map(|rect| (pos, rect)));
+        }
         let Some((last_x, last_y)) = self.camera_pointer else {
             return false;
         };
-        if !self.camera_buttons.any() {
-            return false;
+        if self.viewport.gizmo_press.is_some() {
+            self.camera_pointer = Some(pos);
+            let delta = Vec2::new(pos.0 - last_x, pos.1 - last_y);
+            return self.viewport.drag_gizmo(delta, navigation);
         }
         if self.viewport.drag.is_some() {
             self.camera_pointer = Some(pos);
@@ -586,6 +602,8 @@ impl Session {
     /// ends where it is.
     pub fn pointer_left(&mut self) {
         self.viewport.end_part_drag();
+        self.viewport.gizmo_press = None;
+        self.viewport.hover_gizmo(None);
         self.camera_pointer = None;
         self.press_pick = None;
         self.viewport.navigator.release();
@@ -689,6 +707,10 @@ struct ViewportRenderer {
     viewport_logical_size: Vec2,
     /// The camera the last frame was drawn with, for picking.
     last_view: Option<renderer::CameraView>,
+    /// The part of the view gizmo under the pointer, drawn lit.
+    gizmo_hover: Option<renderer::GizmoPart>,
+    /// A primary-button press that landed on the view gizmo.
+    gizmo_press: Option<GizmoPress>,
     /// A part drag in progress.
     drag: Option<PartDrag>,
     /// Assemblies drawn at a state of the viewport's own (a drag, or a
@@ -697,6 +719,23 @@ struct ViewportRenderer {
     /// States handed back by finished drags, for the app at the next sync.
     state_edits: Vec<(String, F64Map)>,
 }
+
+/// A press on the view gizmo: a click on an end goes to that view, a drag
+/// orbits.
+struct GizmoPress {
+    part: renderer::GizmoPart,
+    /// How far the pointer has moved since the press, logical pixels.
+    travelled: f32,
+}
+
+/// The view gizmo's radius, its gap from the viewport's right edge, and
+/// its gap from the top edge (clear of the view controls), in logical
+/// pixels.
+const GIZMO_RADIUS: f32 = 40.0;
+const GIZMO_MARGIN: f32 = 14.0;
+const GIZMO_TOP: f32 = 58.0;
+/// A press that moves less than this before its release is a click.
+const CLICK_SLOP: f32 = 4.0;
 
 /// A part being dragged: the pose is solved for the pointer each move and
 /// drawn at once; the state goes to the app on release.
@@ -791,6 +830,8 @@ impl ViewportRenderer {
             look_through_left: false,
             viewport_logical_size: Vec2::ZERO,
             last_view: None,
+            gizmo_hover: None,
+            gizmo_press: None,
             drag: None,
             posed: HashMap::new(),
             state_edits: Vec::new(),
@@ -845,7 +886,7 @@ impl ViewportRenderer {
 
         self.renderer.set_viewport_size(device, w, h);
         self.submit_scene(device, &preview_requests);
-        let view = match &look_through {
+        let (view, focus_depth) = match &look_through {
             Some(look) => {
                 submit_view_highlight(&mut self.renderer, &look.frustum);
                 if self.look_through.as_ref() != Some(&look.frame)
@@ -867,7 +908,10 @@ impl ViewportRenderer {
                 if let Err(err) = self.renderer.set_warp(device, framed.warp.as_ref()) {
                     log::warn!("look-through lens: {err}");
                 }
-                look.frame.camera_view(framed, bounds)
+                (
+                    look.frame.camera_view(framed, bounds),
+                    self.subject_depth(&look.frame),
+                )
             }
             None => {
                 self.look_framed = None;
@@ -889,11 +933,16 @@ impl ViewportRenderer {
                 } else {
                     renderer::Projection::Perspective
                 };
-                self.camera.view(self.aspect, self.scene_extent())
+                (
+                    self.camera.view(self.aspect, self.scene_extent()),
+                    self.camera.distance,
+                )
             }
         };
 
-        let settings = render_settings(preview_requests.first(), clear_color);
+        let mut settings = render_settings(preview_requests.first(), clear_color);
+        settings.grid.spacing = renderer::GridSpacing::Auto { focus_depth };
+        settings.gizmo = self.gizmo();
         self.last_view = Some(view);
         self.last_frame =
             self.renderer
@@ -902,16 +951,23 @@ impl ViewportRenderer {
     }
 
     /// Seeds the viewport camera from a looked-through view: the same eye
-    /// and roll, looking down the optical axis at the scene centre's depth
-    /// (or a scene-sized distance when the centre is behind the camera).
+    /// and roll, looking down the optical axis at its subject's depth.
     fn continue_from(&mut self, frame: ViewFrame) {
         let eye = frame.eye();
-        let forward = frame.forward();
-        let distance = match self.scene_bounds {
+        let distance = self.subject_depth(&frame);
+        self.camera
+            .look_from(eye, eye + frame.forward() * distance, frame.up());
+    }
+
+    /// How far in front of a looked-through view its subject is: the
+    /// scene centre's depth, or a scene-sized distance when the centre is
+    /// behind the camera.
+    fn subject_depth(&self, frame: &ViewFrame) -> f32 {
+        match self.scene_bounds {
             Some(bounds) => {
                 let centre = (bounds.min_vec3() + bounds.max_vec3()) * 0.5;
                 let diagonal = (bounds.max_vec3() - bounds.min_vec3()).length();
-                let depth = (centre - eye).dot(forward);
+                let depth = (centre - frame.eye()).dot(frame.forward());
                 if depth > diagonal * 0.05 {
                     depth
                 } else {
@@ -919,9 +975,99 @@ impl ViewportRenderer {
                 }
             }
             None => 1.0,
+        }
+    }
+
+    /// The view gizmo as the next frame draws it: in the viewport's
+    /// top-right corner, following the orbit camera. A photograph's
+    /// viewpoint has none, and neither has a viewport too small for it.
+    fn gizmo(&self) -> Option<renderer::ViewGizmo> {
+        if self.look_through.is_some() {
+            return None;
+        }
+        let (w, h) = self.target.extent;
+        let radius = GIZMO_RADIUS * self.scale_factor;
+        let center = Vec2::new(
+            w as f32 - (GIZMO_MARGIN + GIZMO_RADIUS) * self.scale_factor,
+            (GIZMO_TOP + GIZMO_RADIUS) * self.scale_factor,
+        );
+        let fits = center.x - radius > 0.0 && center.y + radius < h as f32;
+        fits.then_some(renderer::ViewGizmo {
+            orientation: self.camera.orientation,
+            center,
+            radius,
+            hovered: self.gizmo_hover,
+        })
+    }
+
+    /// The part of the gizmo under `pos` (logical, with the viewport at
+    /// `rect`).
+    fn gizmo_part_at(&self, pos: (f32, f32), rect: Rect) -> Option<renderer::GizmoPart> {
+        let at = Vec2::new(pos.0 - rect.x, pos.1 - rect.y) * self.scale_factor;
+        self.gizmo()?.hit_test(at)
+    }
+
+    /// Lights the part of the gizmo under the pointer (`None`: the pointer
+    /// is nowhere). Returns whether what is lit changed.
+    fn hover_gizmo(&mut self, pointer: Option<((f32, f32), Rect)>) -> bool {
+        let hover = pointer.and_then(|(pos, rect)| self.gizmo_part_at(pos, rect));
+        let changed = hover != self.gizmo_hover;
+        self.gizmo_hover = hover;
+        changed
+    }
+
+    /// A primary press at `pos`: taken by the gizmo when it lands on it.
+    fn press_gizmo(&mut self, pos: (f32, f32), rect: Rect) -> bool {
+        self.gizmo_press = self.gizmo_part_at(pos, rect).map(|part| GizmoPress {
+            part,
+            travelled: 0.0,
+        });
+        self.gizmo_press.is_some()
+    }
+
+    /// A drag that began on the gizmo orbits about the scene once it has
+    /// moved past a click's slop. Returns whether the camera moved.
+    fn drag_gizmo(&mut self, delta: Vec2, navigation: Navigation) -> bool {
+        let Some(press) = &mut self.gizmo_press else {
+            return false;
         };
-        self.camera
-            .look_from(eye, eye + forward * distance, frame.up());
+        press.travelled += delta.length();
+        if press.travelled < CLICK_SLOP {
+            return false;
+        }
+        let cursor = renderer::Cursor {
+            ndc: Vec2::ZERO,
+            picked: None,
+            scene_center: self.scene_center(),
+        };
+        self.navigator.drag(
+            &mut self.camera,
+            renderer::CameraAction::Orbit,
+            cursor,
+            delta,
+            self.viewport_logical_size,
+            navigation.orbit_mode,
+            zoom_limits(self.scene_bounds),
+        )
+    }
+
+    /// The release of a press on the gizmo: a click on an end travels to
+    /// its view.
+    fn release_gizmo(&mut self) {
+        let Some(press) = self.gizmo_press.take() else {
+            return;
+        };
+        if press.travelled >= CLICK_SLOP {
+            return;
+        }
+        if let Some(view) = self.gizmo().and_then(|gizmo| gizmo.view_for(press.part)) {
+            self.apply_camera_command(crate::ViewportCameraCommand::View(view));
+        }
+    }
+
+    /// The centre of the composited scene's bounds.
+    fn scene_center(&self) -> Option<Vec3> {
+        self.scene_extent().map(|(min, max)| (min + max) * 0.5)
     }
 
     /// The composited scene's bounds as corners.
@@ -971,9 +1117,7 @@ impl ViewportRenderer {
                 1.0 - (pos.1 - rect.y) / rect.h.max(1.0) * 2.0,
             ),
             picked,
-            scene_center: self
-                .scene_bounds
-                .map(|bounds| (bounds.min_vec3() + bounds.max_vec3()) * 0.5),
+            scene_center: self.scene_center(),
         }
     }
 
@@ -2664,9 +2808,7 @@ fn render_settings(
         settings.ssao_radius = request.ssao_radius;
         settings.ssao_bias = request.ssao_bias;
         settings.ssao_strength = request.ssao_strength;
-        if !request.show_grid {
-            settings.grid.planes = renderer::GridPlanes::NONE;
-        }
+        settings.grid.visible = request.show_grid;
     }
 
     settings
@@ -4668,6 +4810,120 @@ mod navigation_tests {
         }
     }
 
+    /// Where the gizmo's end on `axis` is drawn, in the pointer's logical
+    /// coordinates.
+    fn gizmo_end(rig: &Rig, axis: usize, positive: bool) -> (f32, f32) {
+        let gizmo = rig.session.viewport.gizmo().expect("the gizmo is drawn");
+        let end = gizmo
+            .ends()
+            .into_iter()
+            .find(|end| end.axis == axis && end.positive == positive)
+            .unwrap();
+        (RECT.x + end.center.x / SCALE, RECT.y + end.center.y / SCALE)
+    }
+
+    fn settle(rig: &mut Rig) {
+        let started = std::time::Instant::now();
+        while rig.session.camera_animating() {
+            assert!(
+                started.elapsed().as_secs() < 5,
+                "the transition never ended"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            rig.frame(false);
+        }
+    }
+
+    /// The view gizmo lights under the pointer, a click on an end travels
+    /// to that end's view (and to the opposite one when already there),
+    /// and a drag that starts on it orbits.
+    #[test]
+    fn the_view_gizmo_takes_hovers_clicks_and_drags() {
+        let Some(mut rig) = Rig::new() else {
+            return;
+        };
+        let turntable = navigation(renderer::OrbitMode::Turntable);
+        let click = |rig: &mut Rig, at: (f32, f32)| {
+            rig.session.pointer_down(
+                gpu(&rig.offscreen),
+                at,
+                PointerButton::Primary,
+                KeyModifiers::default(),
+                renderer::CameraControlScheme::Blender,
+            );
+            rig.session.pointer_up(PointerButton::Primary);
+        };
+
+        // Hover.
+        let z_end = gizmo_end(&rig, 2, true);
+        assert!(rig.session.pointer_moved(
+            gpu(&rig.offscreen),
+            z_end,
+            KeyModifiers::default(),
+            turntable
+        ));
+        assert_eq!(
+            rig.session.viewport.gizmo_hover,
+            Some(renderer::GizmoPart::End {
+                axis: 2,
+                positive: true
+            })
+        );
+        let centre = (RECT.x + RECT.w * 0.5, RECT.y + RECT.h * 0.5);
+        assert!(rig.session.pointer_moved(
+            gpu(&rig.offscreen),
+            centre,
+            KeyModifiers::default(),
+            turntable
+        ));
+        assert_eq!(rig.session.viewport.gizmo_hover, None);
+
+        // A click on +X looks from +X; a second click on it, now facing
+        // the viewer, looks from -X.
+        let x_end = gizmo_end(&rig, 0, true);
+        click(&mut rig, x_end);
+        assert!(rig.session.camera_animating());
+        settle(&mut rig);
+        let forward = rig.session.viewport.camera.forward();
+        assert!((forward - Vec3::NEG_X).length() < 1e-5, "{forward}");
+        let x_end = gizmo_end(&rig, 0, true);
+        click(&mut rig, x_end);
+        settle(&mut rig);
+        let forward = rig.session.viewport.camera.forward();
+        assert!((forward - Vec3::X).length() < 1e-5, "{forward}");
+
+        // A drag from the gizmo's body orbits and ends without a click.
+        let gizmo = rig.session.viewport.gizmo().unwrap();
+        let body = gizmo.center + Vec2::new(-0.55, 0.6) * gizmo.radius;
+        assert_eq!(gizmo.hit_test(body), Some(renderer::GizmoPart::Body));
+        let mut at = (RECT.x + body.x / SCALE, RECT.y + body.y / SCALE);
+        let before = rig.session.viewport.camera.clone();
+        rig.session.pointer_down(
+            gpu(&rig.offscreen),
+            at,
+            PointerButton::Primary,
+            KeyModifiers::default(),
+            renderer::CameraControlScheme::Blender,
+        );
+        let mut moved = false;
+        for _ in 0..6 {
+            at = (at.0 + 5.0, at.1 + 3.0);
+            moved |= rig.session.pointer_moved(
+                gpu(&rig.offscreen),
+                at,
+                KeyModifiers::default(),
+                turntable,
+            );
+        }
+        rig.session.pointer_up(PointerButton::Primary);
+        assert!(moved);
+        let camera = &rig.session.viewport.camera;
+        assert_ne!(camera.orientation, before.orientation);
+        assert!((camera.distance - before.distance).abs() < 1e-5);
+        assert!(!rig.session.camera_animating());
+        assert!(rig.session.viewport.gizmo_press.is_none());
+    }
+
     /// An orbit pressed on empty background turns the scene about its
     /// own centre, and a standard-view command travels to the exact view
     /// over a few frames.
@@ -4715,15 +4971,7 @@ mod navigation_tests {
                 renderer::StandardView::Top,
             ));
         assert!(rig.session.camera_animating());
-        let started = std::time::Instant::now();
-        while rig.session.camera_animating() {
-            assert!(
-                started.elapsed().as_secs() < 5,
-                "the transition never ended"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            rig.frame(false);
-        }
+        settle(&mut rig);
         let camera = &rig.session.viewport.camera;
         assert!((camera.forward() - Vec3::NEG_Z).length() < 1e-6);
         assert!((camera.up() - Vec3::Y).length() < 1e-6);

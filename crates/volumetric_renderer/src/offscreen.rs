@@ -284,7 +284,7 @@ mod tests {
             ssao_enabled: false,
             ..RenderSettings::default()
         };
-        settings.grid.planes = crate::GridPlanes::NONE;
+        settings.grid.visible = false;
         let frame = |renderer: &mut Renderer| {
             for splat in &resident.splats {
                 renderer.submit_retained_splat(splat);

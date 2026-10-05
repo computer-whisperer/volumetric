@@ -1,6 +1,6 @@
 # Volumetric Renderer: Target Design
 
-Status: **target design, being built** (written 2026-10-05; steps 1 and 2
+Status: **target design, being built** (written 2026-10-05; steps 1 to 3
 of section 11 are built). This file
 replaces the May 2026 MVP architecture notes. It is the ground truth for the
 renderer overhaul: where the code and this file disagree during the rebuild,
@@ -240,22 +240,38 @@ lines and points such as gizmos and bounds boxes.
 
 ### Grid
 
-A full-screen pass intersects each pixel's ray with the grid plane and draws
-analytic, anti-aliased lines; there is no line geometry and no extent.
+A full-screen pass (`grid.wgsl`) intersects each pixel's ray with the grid
+plane and draws analytic, anti-aliased lines; there is no line geometry and
+no extent.
 
-- Spacing is chosen per frame from the size of a pixel on the plane, in
-  powers of ten, with ten minor cells per major cell. Adjacent decades
-  cross-fade, so zooming never pops.
-- Lines fade toward the horizon and at grazing angles.
-- The pass writes depth from the plane intersection and is depth-tested, so
-  geometry occludes the grid and the grid is dimmer seen from below.
-- The frame reports the current minor spacing so the UI can show a scale
-  readout ("10 mm").
+- Three levels are drawn: minor lines, major lines every ten, super-major
+  lines every hundred. With automatic spacing the minor spacing is the
+  power of ten that keeps a minor cell between 8 and 80 pixels at the
+  view's focus depth. A level's weight depends only on how large its cells
+  are on screen, so when the view zooms across a decade each level takes
+  over the weight the next one had and nothing pops.
+- Per pixel, each direction's lines fade out as they draw closer than a few
+  pixels, which is what clears the horizon and grazing views.
+- The pass is depth-tested against the scene with the depth of the plane
+  intersection, pushed a pixel's width along the ray so a surface lying in
+  the plane wins. It does not write depth (revised from the first draft:
+  a transparent plane in the depth buffer would hide lines and splats
+  behind cells where nothing is drawn). The grid is dimmer from below.
+- The frame reports the minor spacing (`FrameInfo::grid_spacing`); the GUI
+  shows it as a scale readout ("grid 10 mm").
+
+Automatic spacing needs the depth the view is looking at, which the view's
+matrices do not hold: the host passes it (`GridSpacing::Auto { focus_depth }`,
+the orbit camera's distance).
 
 ### World axis lines
 
-The X axis (red) and Y axis (green) are drawn by the grid pass on the ground
-plane. The Z axis (blue) is a depth-tested line through the origin.
+The two world axes in the grid plane are grid lines in their axis colours
+(X red, Y green on the default plane). The third (Z, blue) is drawn by a
+second instance of the same pass: each pixel finds the point of the axis
+its ray passes closest to and is covered by its distance from that point's
+projection. It has no extent either, which the line pipeline cannot do: it
+does not clip segments that cross behind the eye.
 
 ### Settings
 
@@ -263,30 +279,41 @@ plane. The Z axis (blue) is a depth-tested line through the origin.
 pub struct GridSettings {
     pub visible: bool,
     pub plane: GridPlane,      // XY (default), XZ, YZ
-    pub spacing: GridSpacing,  // Auto | Fixed(metres)
+    pub spacing: GridSpacing,  // Auto { focus_depth } | Fixed(metres)
     pub axes: bool,
     pub opacity: f32,
-    pub colors: GridColors,
+    pub line_color: [f32; 3],
+    pub axis_colors: [[f32; 3]; 3],
 }
 ```
 
 ### View gizmo
 
-Three world axes drawn in a corner of the viewport with an orthographic
-projection that follows the camera's orientation only. Positive ends are
-labelled discs (X, Y, Z in red, green, blue); negative ends are small
-unlabelled discs. The letters are stroked with the line pipeline, so the
-renderer needs no text system.
+Three world axes drawn in the top-right corner of the viewport, following
+the camera's orientation only. Positive ends are labelled discs (X, Y, Z in
+red, green, blue) joined to the centre by an arm; negative ends are smaller
+ringed discs.
 
 It is interactive:
 
-- clicking an end animates to that standard view;
-- dragging on the gizmo orbits.
+- the part under the pointer is lit;
+- clicking an end animates to that standard view, and clicking the end
+  already facing the viewer goes to the opposite view;
+- dragging on the gizmo orbits about the scene.
 
-One function lays the gizmo out from the camera orientation and the corner
-rectangle. Drawing and `ViewGizmo::hit_test(pointer)` both use that layout,
-so what is clickable is exactly what is drawn. The host routes pointer
-events to it before the `Navigator`.
+`ViewGizmo::ends` lays the gizmo out from the camera orientation, a centre
+and a radius. Drawing and `ViewGizmo::hit_test` both use that layout, so
+what is clickable is exactly what is drawn. The host routes primary-button
+presses to it before the `Navigator`.
+
+It is drawn by its own pass over the finished frame (`gizmo.wgsl`): every
+shape, the letters included, is a distance function of the pixel, painted
+back to front. Revised from the first draft, which stroked it with the
+line pipeline: lines and points are drawn in separate groups there, so
+letters could not be laid over their discs.
+
+A photograph's viewpoint (look-through) and headless renders have no
+gizmo.
 
 A view cube is a possible later replacement; the layout-plus-hit-test
 contract would not change.
@@ -408,8 +435,10 @@ measured properties of rendered frames, not stored images.
    with the CPU ray test; the toolbar's View menu (standard views,
    projection, orbit mode, reset) is a placeholder for step 5's panel; the
    web build's hover-tracked pick has not been exercised in a browser.
-3. **Widgets.** Grid pass, axis lines, view gizmo with hit-testing, scale
-   readout.
+3. **Widgets (built 2026-10-05).** Grid pass, axis lines, view gizmo with
+   hit-testing, scale readout. Left for step 5: every grid and gizmo
+   setting but the grid's visibility is fixed in code; the headless
+   `--grid` is still a fixed spacing in metres.
 4. **Shading.** Lighting rig and material table, AO rewrite, edge lines,
    FXAA, supersampled headless renders.
 5. **Settings and parity.** Viewport settings panel and persistence

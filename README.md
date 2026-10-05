@@ -601,15 +601,16 @@ The volumetric engine uses a **right-handed** coordinate system with the followi
 
 ### Axis Orientation
 - **+X**: Right
-- **+Y**: Up
-- **+Z**: Forward (toward camera in default view)
+- **+Y**: Away from the viewer in the front view
+- **+Z**: Up
 
 ### Reference Grid
-The CLI renderer includes an optional reference grid on the XZ plane at y=0 (or at the model's minimum Y if below zero):
-- **Major lines**: Every 5 grid units (brighter)
-- **Minor lines**: At the specified grid spacing (dimmer)
+The renderer draws an optional reference grid on the ground plane through the origin (z = 0; with `--up`, the coordinate plane most nearly perpendicular to up). It has no extent: it runs to the horizon.
+- **Minor lines**: At the grid spacing
+- **Major lines**: Every 10 minor lines (brighter)
+- **Axes**: The world X, Y and Z axes are drawn in red, green and blue
 - Use `--grid 0` to disable the grid
-- Default grid spacing is 1.0 meter
+- Default grid spacing is 1.0 meter; in the GUI the spacing follows the zoom in powers of ten and is shown in the viewport
 
 ## Mesh Conventions
 

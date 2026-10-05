@@ -9,10 +9,12 @@
 //! 1. **G-buffer fill**: retained meshes.
 //! 2. **Ambient occlusion** from depth and normals.
 //! 3. **Resolve**: lights the G-buffer into the target.
-//! 4. **Depth-tested lines and points** (the grid among them).
-//! 5. **Splats**: their own layer, then composited.
-//! 6. **Overlay lines and points** (no depth test).
-//! 7. **Lens warp**, when the frame is drawn through a real lens.
+//! 4. **Grid**: the ground grid and world axis lines, per pixel.
+//! 5. **Depth-tested lines and points**.
+//! 6. **Splats**: their own layer, then composited.
+//! 7. **Overlay lines and points** (no depth test).
+//! 8. **Lens warp**, when the frame is drawn through a real lens.
+//! 9. **View gizmo**, over the finished frame.
 //!
 //! The G-buffer outlives the frame: [`Renderer::request_pick`] reads the
 //! object and world point under a pixel of the last frame.
@@ -31,6 +33,7 @@ mod buffer;
 mod camera;
 mod conversions;
 mod gbuffer;
+mod gizmo;
 mod navigation;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod offscreen;
@@ -44,6 +47,7 @@ mod types;
 mod frame_tests;
 
 pub use conversions::{convert_mesh_data, convert_points_to_point_data};
+pub use gizmo::{GizmoEnd, GizmoPart, ViewGizmo};
 
 pub use camera::{Camera, CameraView, OrbitMode, Pinhole, Projection, StandardView};
 pub use navigation::{CameraAction, CameraControlScheme, CameraInputState, Cursor, Navigator};
@@ -53,9 +57,9 @@ pub use pipelines::{
 };
 pub use scene::SceneData;
 pub use types::{
-    DepthMode, GridPlanes, GridSettings, LineData, LineInstance, LinePattern, LineSegment,
-    LineStyle, MaterialId, MeshData, MeshVertex, ObjectId, PointData, PointInstance, PointShape,
-    PointStyle, RenderSettings, SplatData, SplatStyle, WidthMode,
+    AXIS_COLORS, DepthMode, GridPlane, GridSettings, GridSpacing, LineData, LineInstance,
+    LinePattern, LineSegment, LineStyle, MaterialId, MeshData, MeshVertex, ObjectId, PointData,
+    PointInstance, PointShape, PointStyle, RenderSettings, SplatData, SplatStyle, WidthMode,
 };
 
 use std::sync::Arc;
@@ -66,9 +70,9 @@ use gbuffer::GBuffer;
 use glam::{Mat4, Vec3};
 use pick::{FrameRecord, Picker};
 use pipelines::{
-    AoUniforms, FullscreenPass, GpuPointInstance, GpuWarp, LinePipeline, MeshDraw, MeshPipeline,
-    PointPipeline, ResolveUniforms, SplatCompositePipeline, SplatPipeline, WarpPipeline, ao_pass,
-    resolve_pass,
+    AoUniforms, FullscreenPass, GizmoPipeline, GpuPointInstance, GpuWarp, GridPipeline,
+    LinePipeline, MeshDraw, MeshPipeline, PointPipeline, ResolveUniforms, SplatCompositePipeline,
+    SplatPipeline, WarpPipeline, ao_pass, resolve_pass,
 };
 
 /// Geometry dropped from a frame because it would have exceeded the
@@ -123,6 +127,9 @@ pub struct FrameInfo {
     /// Geometry dropped at the device's buffer size limit; `None` when
     /// everything fit.
     pub overflow: Option<GeometryOverflow>,
+    /// The distance between the grid's minor lines in world units, when
+    /// the grid was drawn: what a scale readout shows.
+    pub grid_spacing: Option<f32>,
 }
 
 /// A line batch submitted for the current frame.
@@ -141,14 +148,6 @@ struct SubmittedPoints {
 
 /// The direction the fixed light shines from.
 pub(crate) const LIGHT_DIRECTION: [f32; 3] = [0.4, -0.2, 0.7];
-
-/// The grid's lines are their own batch, one pixel wide.
-const GRID_STYLE: LineStyle = LineStyle {
-    width: 1.0,
-    width_mode: WidthMode::ScreenSpace,
-    pattern: LinePattern::Solid,
-    depth_mode: DepthMode::Normal,
-};
 
 fn clear_color(color: [f32; 4]) -> wgpu::Color {
     wgpu::Color {
@@ -175,6 +174,8 @@ pub struct Renderer {
     mesh_pipeline: MeshPipeline,
     ao: FullscreenPass,
     resolve: FullscreenPass,
+    grid_pipeline: GridPipeline,
+    gizmo_pipeline: GizmoPipeline,
     line_pipeline: LinePipeline,
     point_pipeline: PointPipeline,
     splat_pipeline: SplatPipeline,
@@ -193,10 +194,6 @@ pub struct Renderer {
     frame_retained_lines: Vec<Arc<GpuLines>>,
     frame_retained_points: Vec<Arc<GpuPoints>>,
     frame_retained_splats: Vec<Arc<GpuSplat>>,
-
-    // Grid line cache (regenerated when settings change)
-    cached_grid_lines: Vec<LineSegment>,
-    cached_grid_settings_hash: u64,
 
     // The view the G-buffer was last filled with, for picking.
     last_frame: Option<FrameRecord>,
@@ -235,6 +232,8 @@ impl Renderer {
             mesh_pipeline: MeshPipeline::new(device),
             ao,
             resolve,
+            grid_pipeline: GridPipeline::new(device, surface_format),
+            gizmo_pipeline: GizmoPipeline::new(device, surface_format),
             line_pipeline: LinePipeline::new(device, surface_format),
             point_pipeline: PointPipeline::new(device, surface_format),
             splat_pipeline: SplatPipeline::new(device, GBuffer::SPLAT_LAYER_FORMAT),
@@ -249,8 +248,6 @@ impl Renderer {
             frame_retained_lines: Vec::new(),
             frame_retained_points: Vec::new(),
             frame_retained_splats: Vec::new(),
-            cached_grid_lines: Vec::new(),
-            cached_grid_settings_hash: 0,
             last_frame: None,
             queued_pick: None,
         }
@@ -486,8 +483,6 @@ impl Renderer {
         settings: &RenderSettings,
         target: &wgpu::TextureView,
     ) -> FrameInfo {
-        self.update_grid_cache(settings);
-
         // Buffers larger than the device limit are a wgpu validation panic,
         // so every geometry class is clamped to it; whatever gets dropped
         // is reported. Retained geometry was clamped at creation.
@@ -531,19 +526,6 @@ impl Renderer {
             .prepare(device, queue, view_proj, &self.frame_meshes);
 
         self.line_pipeline.begin_frame();
-        let grid: Vec<LineInstance> = self
-            .cached_grid_lines
-            .iter()
-            .map(|segment| LineInstance::from_segment(segment, GRID_STYLE.width))
-            .collect();
-        overflow.dropped_lines += self.line_pipeline.upload_immediate(
-            device,
-            queue,
-            &grid,
-            &GRID_STYLE,
-            view_proj_array,
-            screen_size,
-        );
         for submitted in &self.frame_lines {
             let instances: Vec<LineInstance> = submitted
                 .data
@@ -611,6 +593,11 @@ impl Renderer {
             self.splat_pipeline
                 .prepare_retained(queue, splat, view, screen_size);
         }
+
+        let grid_levels = settings.grid.visible.then(|| {
+            self.grid_pipeline
+                .prepare(queue, &settings.grid, view, internal_size)
+        });
 
         let ao_enabled = settings.ssao_enabled && !self.frame_meshes.is_empty();
         if ao_enabled {
@@ -690,8 +677,14 @@ impl Renderer {
             clear_color(settings.background_color),
         );
 
-        // ---- Depth-tested lines and points, over the lit scene.
-        self.draw_lines_and_points(encoder, target, DepthMode::Normal);
+        // ---- The grid, then depth-tested lines and points, over the lit
+        // scene.
+        self.draw_lines_and_points(
+            encoder,
+            target,
+            DepthMode::Normal,
+            grid_levels.is_some().then_some(settings.grid.axes),
+        );
 
         // ---- Splats: sorted back to front, depth-tested at their centres
         // against everything drawn so far, blended over it.
@@ -750,7 +743,7 @@ impl Renderer {
         }
 
         // ---- Overlay lines and points (no depth test).
-        self.draw_lines_and_points(encoder, target, DepthMode::Overlay);
+        self.draw_lines_and_points(encoder, target, DepthMode::Overlay, None);
 
         // ---- The lens warp: the internal frame written to the target.
         if let Some(warp) = &self.warp_gpu {
@@ -761,6 +754,12 @@ impl Renderer {
                 settings.background_color,
                 final_target,
             );
+        }
+
+        // ---- The view gizmo, in the target's own pixels.
+        if let Some(gizmo) = &settings.gizmo {
+            self.gizmo_pipeline
+                .render(queue, encoder, gizmo, final_target, self.viewport_size);
         }
 
         self.last_frame = Some(FrameRecord {
@@ -776,16 +775,19 @@ impl Renderer {
 
         FrameInfo {
             overflow: overflow.any().then_some(overflow),
+            grid_spacing: grid_levels.map(|levels| levels.minor),
         }
     }
 
     /// One pass over `target` drawing every line and point batch of
-    /// `depth_mode`, immediate then retained.
+    /// `depth_mode`, immediate then retained. `grid` draws the grid
+    /// first, with the normal axis line when it holds `true`.
     fn draw_lines_and_points(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
         depth_mode: DepthMode,
+        grid: Option<bool>,
     ) {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some(match depth_mode {
@@ -813,6 +815,9 @@ impl Renderer {
             occlusion_query_set: None,
             multiview_mask: None,
         });
+        if let Some(axes) = grid {
+            self.grid_pipeline.render(&mut pass, axes);
+        }
         self.line_pipeline.render_immediate(&mut pass, depth_mode);
         self.point_pipeline.render_immediate(&mut pass, depth_mode);
         for batch in &self.frame_retained_lines {
@@ -904,30 +909,5 @@ impl Renderer {
             }
         }
         None
-    }
-
-    /// Update the grid line cache if settings have changed.
-    fn update_grid_cache(&mut self, settings: &RenderSettings) {
-        let hash = self.hash_grid_settings(&settings.grid);
-
-        if hash != self.cached_grid_settings_hash {
-            self.cached_grid_lines = settings.grid.generate_lines();
-            self.cached_grid_settings_hash = hash;
-        }
-    }
-
-    /// Compute a simple hash of grid settings for change detection.
-    fn hash_grid_settings(&self, settings: &GridSettings) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-
-        settings.planes.xy.hash(&mut hasher);
-        settings.planes.xz.hash(&mut hasher);
-        settings.planes.yz.hash(&mut hasher);
-        settings.spacing.to_bits().hash(&mut hasher);
-        settings.extent.to_bits().hash(&mut hasher);
-        settings.subdivisions.hash(&mut hasher);
-
-        hasher.finish()
     }
 }

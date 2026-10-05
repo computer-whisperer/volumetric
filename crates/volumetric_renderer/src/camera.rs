@@ -665,6 +665,15 @@ impl CameraView {
         self.projection * self.view
     }
 
+    /// The world size of a pixel `depth` in front of the eye, in a frame
+    /// `height_px` tall. An orthographic view's is the same at any depth.
+    pub fn pixel_size(&self, depth: f32, height_px: u32) -> f32 {
+        let frame_height = 2.0 / self.projection.y_axis.y.abs();
+        let orthographic = self.projection.w_axis.w != 0.0;
+        let scale = if orthographic { 1.0 } else { depth };
+        frame_height * scale / height_px.max(1) as f32
+    }
+
     /// The pixel a world point lands on in a `width` x `height` image
     /// (origin top-left, +y down), or `None` when it is behind the camera.
     pub fn project(&self, world: Vec3, width: u32, height: u32) -> Option<Vec2> {
