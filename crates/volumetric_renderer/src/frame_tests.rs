@@ -60,14 +60,45 @@ fn view() -> CameraView {
     )
 }
 
-fn settings(ssao: bool) -> RenderSettings {
+/// The frame the scenarios start from: no grid, no edge lines, and
+/// ambient occlusion as asked.
+fn settings(ao: bool) -> RenderSettings {
     let mut settings = RenderSettings {
         background_color: BACKGROUND,
-        ssao_enabled: ssao,
         ..RenderSettings::default()
     };
+    settings.ao.enabled = ao;
+    settings.edges.enabled = false;
     settings.grid.visible = false;
     settings
+}
+
+/// The lighting model, as the resolve pass computes it: the colour of a
+/// surface of `albedo` whose normal, and the direction to the eye, are
+/// given in the camera's frame. No occlusion, no edge.
+fn lit(settings: &RenderSettings, albedo: f32, normal: Vec3, to_eye: Vec3) -> [f32; 3] {
+    let material = settings.materials[0];
+    let rig = &settings.lighting;
+    let exponent = 2.0 / material.roughness.powi(4) - 2.0;
+    std::array::from_fn(|c| {
+        // The scenarios look straight down, so the world's up is the
+        // camera's toward-the-viewer axis.
+        let ambient = rig.ground[c] + (rig.sky[c] - rig.ground[c]) * (normal.z * 0.5 + 0.5);
+        let mut diffuse = 0.0;
+        let mut highlight = 0.0;
+        for light in rig.lights {
+            let l = Vec3::from(light.direction).normalize();
+            diffuse += light.color[c] * normal.dot(l).max(0.0);
+            if normal.dot(l) >= 0.0 {
+                let h = (l + to_eye).normalize();
+                highlight += light.color[c] * normal.dot(h).max(0.0).powf(exponent);
+            }
+        }
+        let color =
+            albedo * material.base_tint[c] * (ambient + diffuse) + highlight * material.specular;
+        assert!(color < 0.8, "the scenario stays under the shoulder");
+        color
+    })
 }
 
 fn pixel(rgba: &[u8], x: u32, y: u32) -> [u8; 3] {
@@ -105,10 +136,8 @@ fn a_lit_surface_resolves_to_the_lighting_models_value() {
             .unwrap();
         assert_eq!(info.overflow, None);
 
-        // Facing +Z under the fixed light: ambient plus the diffuse term.
-        let n_dot_l = Vec3::from(crate::LIGHT_DIRECTION).normalize().z;
-        let shade = 0.22 + 0.78 * n_dot_l;
-        let expected = [0.85, 0.9, 1.0].map(|tint: f32| srgb_byte(0.25 * tint * shade));
+        // Facing the viewer at the frame's centre.
+        let expected = lit(&settings(false), 0.25, Vec3::Z, Vec3::Z).map(srgb_byte);
         let centre = pixel(&rgba, W / 2, H / 2);
         assert!(close(centre, expected, 3.0), "{centre:?} vs {expected:?}");
         assert_eq!(pixel(&rgba, 2, 2), [0, 0, 255], "background corner");
@@ -300,15 +329,12 @@ fn ambient_occlusion_darkens_the_foot_of_a_wall() {
             0.1,
             10.0,
         );
-        // The bias is in non-linear depth, where this view's whole AO
-        // radius spans 0.006: the default 0.025 can never be exceeded.
-        let frame = |renderer: &mut Renderer, ssao| {
+        // The two meshes span a box 3 m corner to corner: a 0.5 m radius.
+        let frame = |renderer: &mut Renderer, ao| {
             renderer.submit_retained_mesh(&floor, Mat4::IDENTITY, ObjectId(1), MaterialId(0));
             renderer.submit_retained_mesh(&wall, Mat4::IDENTITY, ObjectId(2), MaterialId(0));
-            let settings = RenderSettings {
-                ssao_bias: 0.0005,
-                ..settings(ssao)
-            };
+            let mut settings = settings(ao);
+            settings.ao.radius = 0.5 / 3.0;
             offscreen
                 .render_rgba(renderer, &oblique, &settings)
                 .unwrap()
@@ -316,7 +342,7 @@ fn ambient_occlusion_darkens_the_foot_of_a_wall() {
         };
         // Floor rows below the centre: 1 px down is 0.03 m from the wall,
         // 28 px down is 0.8 m, beyond the 0.5 m AO radius. Averaged over a
-        // few columns, since the AO is noisy.
+        // few columns.
         let mean = |rgba: &[u8], y: u32| {
             (W / 2 - 4..W / 2 + 4)
                 .map(|x| pixel(rgba, x, y)[1] as f32)
@@ -339,6 +365,215 @@ fn ambient_occlusion_darkens_the_foot_of_a_wall() {
             mean(&occluded, open),
             mean(&plain, open)
         );
+    });
+}
+
+/// The lights are fixed to the camera: a face turned toward the viewer
+/// is lit the same whichever way the camera looks at the world, apart
+/// from the sky, which is the world's.
+#[test]
+fn the_lights_turn_with_the_view() {
+    on_each_backend(|offscreen| {
+        let mut renderer = offscreen.renderer(W, H);
+        let mut settings = settings(false);
+        // No sky gradient: only the camera's lights are left.
+        settings.lighting.ground = settings.lighting.sky;
+        let grey = [0.25, 0.25, 0.25, 1.0];
+        let mut centre = |eye: Vec3, up: Vec3| {
+            // A square facing the eye, through the origin.
+            let toward = eye.normalize();
+            let u = up.cross(toward).normalize() * 0.5;
+            let v = toward.cross(u);
+            let mesh =
+                renderer.create_retained_mesh(offscreen.device(), &quad(Vec3::ZERO, u, v, grey));
+            renderer.submit_retained_mesh(&mesh, Mat4::IDENTITY, ObjectId(1), MaterialId(0));
+            let view =
+                CameraView::look_at(eye, Vec3::ZERO, up, 0.8, W as f32 / H as f32, 0.1, 10.0);
+            let (rgba, _) = offscreen
+                .render_rgba(&mut renderer, &view, &settings)
+                .unwrap();
+            pixel(&rgba, W / 2, H / 2)
+        };
+        let from_above = centre(Vec3::new(0.0, 0.0, 3.0), Vec3::Y);
+        let from_the_side = centre(Vec3::new(3.0, 0.0, 0.0), Vec3::Z);
+        let from_below = centre(Vec3::new(1.0, -2.0, -2.0), Vec3::Z);
+        let expected = lit(&settings, 0.25, Vec3::Z, Vec3::Z).map(srgb_byte);
+        for seen in [from_above, from_the_side, from_below] {
+            assert!(close(seen, expected, 3.0), "{seen:?} vs {expected:?}");
+        }
+    });
+}
+
+/// A material's highlight shows where the surface mirrors a light toward
+/// the eye, and a matte material has none.
+#[test]
+fn a_material_sets_the_highlight() {
+    on_each_backend(|offscreen| {
+        let mut renderer = offscreen.renderer(W, H);
+        // Tilted so its normal is halfway between the eye and the key
+        // light: the mirror direction for the pixel at the centre.
+        let mut settings = settings(false);
+        let key = Vec3::from(settings.lighting.lights[0].direction).normalize();
+        let normal = (key + Vec3::Z).normalize();
+        let u = Vec3::Y.cross(normal).normalize() * 0.6;
+        let v = normal.cross(u);
+        let mesh = renderer.create_retained_mesh(
+            offscreen.device(),
+            &quad(Vec3::ZERO, u, v, [0.25, 0.25, 0.25, 1.0]),
+        );
+        settings.materials = vec![
+            crate::Material {
+                specular: 0.0,
+                ..Default::default()
+            },
+            crate::Material {
+                specular: 0.4,
+                roughness: 0.3,
+                ..Default::default()
+            },
+        ];
+        let mut centre = |material: u32| {
+            renderer.submit_retained_mesh(&mesh, Mat4::IDENTITY, ObjectId(1), MaterialId(material));
+            let (rgba, _) = offscreen
+                .render_rgba(&mut renderer, &view(), &settings)
+                .unwrap();
+            pixel(&rgba, W / 2, H / 2)
+        };
+        let matte = centre(0);
+        let glossy = centre(1);
+        let expected = lit(&settings, 0.25, normal, Vec3::Z).map(srgb_byte);
+        assert!(close(matte, expected, 3.0), "{matte:?} vs {expected:?}");
+        assert!(glossy[1] > matte[1] + 40, "{glossy:?} vs matte {matte:?}");
+        // An id past the table's end takes the first material.
+        assert_eq!(centre(9), matte);
+    });
+}
+
+/// Edge lines mark a silhouette, a crease and the boundary between two
+/// objects, each one pixel wide, and leave flat faces alone.
+#[test]
+fn edge_lines_mark_silhouettes_creases_and_object_boundaries() {
+    on_each_backend(|offscreen| {
+        let mut renderer = offscreen.renderer(W, H);
+        let white = [1.0; 4];
+        let device = offscreen.device();
+        // Seen from above: a floor square with a ridge along x = 0 (two
+        // faces meeting at 90 degrees), and a second object lying flush
+        // in the floor's plane beside it.
+        let left = renderer.create_retained_mesh(
+            device,
+            &quad(
+                Vec3::new(-0.3, 0.0, -0.3),
+                Vec3::new(0.3, 0.0, 0.3),
+                Vec3::Y * 0.5,
+                white,
+            ),
+        );
+        let right = renderer.create_retained_mesh(
+            device,
+            &quad(
+                Vec3::new(0.3, 0.0, -0.3),
+                Vec3::new(0.3, 0.0, -0.3),
+                Vec3::Y * 0.5,
+                white,
+            ),
+        );
+        let flush = renderer.create_retained_mesh(
+            device,
+            &quad(
+                Vec3::new(0.8, 0.0, -0.6),
+                Vec3::X * 0.2,
+                Vec3::Y * 0.5,
+                white,
+            ),
+        );
+        let view = view();
+        let mut frame = |edges: bool| {
+            let mut settings = settings(false);
+            settings.edges.enabled = edges;
+            settings.materials[0].specular = 0.0;
+            settings.antialiasing = false;
+            renderer.submit_retained_mesh(&left, Mat4::IDENTITY, ObjectId(1), MaterialId(0));
+            renderer.submit_retained_mesh(&right, Mat4::IDENTITY, ObjectId(1), MaterialId(0));
+            renderer.submit_retained_mesh(&flush, Mat4::IDENTITY, ObjectId(2), MaterialId(0));
+            offscreen
+                .render_rgba(&mut renderer, &view, &settings)
+                .unwrap()
+                .0
+        };
+        let plain = frame(false);
+        let edged = frame(true);
+        // The pixels the lines darkened, along the row through the
+        // middle of the frame.
+        let (_, row) = at(&view, Vec3::ZERO);
+        let darkened: Vec<u32> = (0..W)
+            .filter(|&x| {
+                let (a, b) = (pixel(&edged, x, row), pixel(&plain, x, row));
+                a != b && a[1] < b[1]
+            })
+            .collect();
+        let near = |world_x: f32, z: f32| {
+            let (x, _) = at(&view, Vec3::new(world_x, 0.0, z));
+            darkened.iter().filter(|&&d| d.abs_diff(x) <= 1).count()
+        };
+        assert_eq!(near(-0.6, -0.6), 1, "silhouette, left: {darkened:?}");
+        assert_eq!(near(0.0, 0.0), 1, "crease: {darkened:?}");
+        assert_eq!(near(0.6, -0.6), 1, "object boundary: {darkened:?}");
+        assert_eq!(near(1.0, -0.6), 1, "silhouette, right: {darkened:?}");
+        assert_eq!(darkened.len(), 4, "and nothing else: {darkened:?}");
+    });
+}
+
+/// Ambient occlusion is sized by the scene, not by its units or the clip
+/// planes: the same scene a thousand times smaller is shaded the same.
+#[test]
+fn ambient_occlusion_is_the_same_at_any_scale() {
+    on_each_backend(|offscreen| {
+        let mut renderer = offscreen.renderer(W, H);
+        let white = [1.0; 4];
+        let mut frame = |scale: f32| {
+            let floor = renderer.create_retained_mesh(
+                offscreen.device(),
+                &quad(Vec3::ZERO, Vec3::X * scale, Vec3::Y * scale, white),
+            );
+            let wall = renderer.create_retained_mesh(
+                offscreen.device(),
+                &quad(
+                    Vec3::new(0.0, 0.0, 0.5) * scale,
+                    Vec3::Z * 0.5 * scale,
+                    Vec3::Y * scale,
+                    white,
+                ),
+            );
+            renderer.submit_retained_mesh(&floor, Mat4::IDENTITY, ObjectId(1), MaterialId(0));
+            renderer.submit_retained_mesh(&wall, Mat4::IDENTITY, ObjectId(2), MaterialId(0));
+            let view = CameraView::look_at(
+                Vec3::new(-2.0, 0.0, 2.0) * scale,
+                Vec3::ZERO,
+                Vec3::Z,
+                0.8,
+                W as f32 / H as f32,
+                0.1 * scale,
+                // A far plane well past the scene, differently so each time.
+                (10.0 + scale) * scale.sqrt(),
+            );
+            offscreen
+                .render_rgba(&mut renderer, &view, &settings(true))
+                .unwrap()
+                .0
+        };
+        let metres = frame(1.0);
+        let millimetres = frame(0.001);
+        let differing = (0..W * H)
+            .filter(|i| {
+                let (a, b) = (
+                    pixel(&metres, i % W, i / W),
+                    pixel(&millimetres, i % W, i / W),
+                );
+                (0..3).any(|c| a[c].abs_diff(b[c]) > 6)
+            })
+            .count();
+        assert!(differing < 30, "{differing} pixels differ");
     });
 }
 
@@ -602,7 +837,9 @@ fn antialiasing_smooths_silhouettes_only() {
             ),
         );
         let mut frame = |antialiasing: bool| {
+            // Matte, so the surface is one colour all over.
             let mut settings = settings(false);
+            settings.materials[0].specular = 0.0;
             settings.antialiasing = antialiasing;
             renderer.submit_retained_mesh(&mesh, Mat4::IDENTITY, ObjectId(1), MaterialId(0));
             offscreen
@@ -644,6 +881,39 @@ fn antialiasing_smooths_silhouettes_only() {
     });
 }
 
+/// A sphere with smooth normals.
+fn sphere(centre: Vec3, radius: f32) -> MeshData {
+    let (rings, sectors) = (32u32, 64u32);
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    for ring in 0..=rings {
+        let polar = std::f32::consts::PI * ring as f32 / rings as f32;
+        for sector in 0..=sectors {
+            let turn = std::f32::consts::TAU * sector as f32 / sectors as f32;
+            let n = Vec3::new(
+                polar.sin() * turn.cos(),
+                polar.sin() * turn.sin(),
+                polar.cos(),
+            );
+            vertices.push(MeshVertex::new(
+                (centre + n * radius).to_array(),
+                n.to_array(),
+            ));
+        }
+    }
+    for ring in 0..rings {
+        for sector in 0..sectors {
+            let a = ring * (sectors + 1) + sector;
+            let b = a + sectors + 1;
+            indices.extend([a, b, a + 1, a + 1, b, b + 1]);
+        }
+    }
+    MeshData {
+        vertices,
+        indices: Some(indices),
+    }
+}
+
 /// Writes the placeholder test scene's frame as a binary PPM to the path
 /// in `VOLUMETRIC_FRAME_DUMP`, for looking at what the frame draws:
 /// `VOLUMETRIC_FRAME_DUMP=/tmp/frame.ppm cargo test -p volumetric_renderer dump_the_test_scene -- --ignored`.
@@ -667,6 +937,37 @@ fn dump_the_test_scene() {
         .create_retained_scene(offscreen.device(), &crate::test_scenes::create_test_scene());
     for (mesh, transform) in &scene.meshes {
         renderer.submit_retained_mesh(mesh, *transform, ObjectId(1), MaterialId(0));
+    }
+    // `VOLUMETRIC_FRAME_SHAPES=1` adds a plate, a step and two spheres
+    // around the cube: curved surfaces and contact, to judge shading by.
+    let shapes: Vec<_> = if std::env::var_os("VOLUMETRIC_FRAME_SHAPES").is_some() {
+        let cube = crate::test_scenes::create_test_cube(1.0);
+        let block = |centre: Vec3, size: Vec3| {
+            (
+                cube.clone(),
+                Mat4::from_translation(centre) * Mat4::from_scale(size),
+            )
+        };
+        vec![
+            block(Vec3::new(0.0, 0.0, -0.05), Vec3::new(4.0, 4.0, 0.1)),
+            block(Vec3::new(-1.2, 0.6, 0.15), Vec3::new(0.8, 1.6, 0.3)),
+            block(Vec3::new(-1.3, 0.6, 0.45), Vec3::new(0.4, 1.2, 0.3)),
+            (sphere(Vec3::new(0.9, -0.3, 0.4), 0.4), Mat4::IDENTITY),
+            (sphere(Vec3::new(0.2, -1.1, 0.25), 0.25), Mat4::IDENTITY),
+        ]
+        .into_iter()
+        .map(|(mesh, transform)| {
+            (
+                renderer.create_retained_mesh(offscreen.device(), &mesh),
+                transform,
+            )
+        })
+        .collect()
+    } else {
+        Vec::new()
+    };
+    for (i, (mesh, transform)) in shapes.iter().enumerate() {
+        renderer.submit_retained_mesh(mesh, *transform, ObjectId(2 + i as u32), MaterialId(0));
     }
     for lines in &scene.lines {
         renderer.submit_retained_lines(lines);

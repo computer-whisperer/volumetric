@@ -665,13 +665,52 @@ impl CameraView {
         self.projection * self.view
     }
 
+    /// The terms that turn a depth-buffer value `z` into a distance in
+    /// front of the eye: `|(k[0] z + k[1]) / (k[2] z + k[3])|`. For every
+    /// projection drawn with here, view-space z depends on depth alone.
+    pub fn depth_to_distance(&self) -> [f32; 4] {
+        let inverse = self.projection.as_dmat4().inverse();
+        [
+            inverse.z_axis.z as f32,
+            inverse.w_axis.z as f32,
+            inverse.z_axis.w as f32,
+            inverse.w_axis.w as f32,
+        ]
+    }
+
+    /// The camera's frame in the world: the directions to the right of
+    /// the picture, up it, and out of it toward the viewer. Read from
+    /// where the picture's own axes land, so it holds whatever camera
+    /// convention the view matrix was built in.
+    pub fn frame_axes(&self) -> [Vec3; 3] {
+        let inverse = self.view_projection().as_dmat4().inverse();
+        let at = |x: f64, y: f64, z: f64| inverse.project_point3(glam::DVec3::new(x, y, z));
+        [
+            at(1.0, 0.0, 0.5) - at(-1.0, 0.0, 0.5),
+            at(0.0, 1.0, 0.5) - at(0.0, -1.0, 0.5),
+            at(0.0, 0.0, 0.0) - at(0.0, 0.0, 1.0),
+        ]
+        .map(|axis| axis.normalize().as_vec3())
+    }
+
+    /// Target pixels per world unit: the part that falls off with
+    /// distance from the eye (divide it by the distance), then the part
+    /// that does not. One of the two is zero.
+    pub fn pixels_per_unit(&self, height_px: u32) -> (f32, f32) {
+        let scale = self.projection.y_axis.y.abs() * 0.5 * height_px as f32;
+        let orthographic = self.projection.w_axis.w != 0.0;
+        if orthographic {
+            (0.0, scale)
+        } else {
+            (scale, 0.0)
+        }
+    }
+
     /// The world size of a pixel `depth` in front of the eye, in a frame
     /// `height_px` tall. An orthographic view's is the same at any depth.
     pub fn pixel_size(&self, depth: f32, height_px: u32) -> f32 {
-        let frame_height = 2.0 / self.projection.y_axis.y.abs();
-        let orthographic = self.projection.w_axis.w != 0.0;
-        let scale = if orthographic { 1.0 } else { depth };
-        frame_height * scale / height_px.max(1) as f32
+        let (falling, fixed) = self.pixels_per_unit(height_px.max(1));
+        1.0 / (falling / depth + fixed)
     }
 
     /// The pixel a world point lands on in a `width` x `height` image

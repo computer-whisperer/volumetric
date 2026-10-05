@@ -194,20 +194,39 @@ impl FullscreenPass {
 pub(crate) struct AoUniforms {
     pub view_proj: [[f32; 4]; 4],
     pub inv_view_proj: [[f32; 4]; 4],
+    pub depth_to_distance: [f32; 4],
     pub radius: f32,
-    pub bias: f32,
-    pub strength: f32,
-    pub _pad0: f32,
+    pub samples: u32,
+    pub max_radius_px: f32,
+    pub pixels_per_unit_at_1: f32,
+    pub pixels_per_unit: f32,
+    pub _pad0: [f32; 3],
 }
 
-/// Uniforms of the resolve pass (`resolve.wgsl`).
+/// Uniforms of the occlusion blur pass (`ao_blur.wgsl`).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub(crate) struct AoBlurUniforms {
+    pub depth_to_distance: [f32; 4],
+    pub strength: f32,
+    pub _pad0: [f32; 3],
+}
+
+/// Uniforms of the resolve pass (`resolve.wgsl`). Every field is a
+/// `vec4` or built of them.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub(crate) struct ResolveUniforms {
-    pub light_dir_world: [f32; 3],
-    pub ao_enabled: u32,
-    pub base_tint: [f32; 3],
-    pub _pad0: f32,
+    pub inv_view_proj: [[f32; 4]; 4],
+    pub depth_to_distance: [f32; 4],
+    /// Per light: world direction, then colour.
+    pub lights: [[[f32; 4]; 2]; 3],
+    pub sky: [f32; 4],
+    pub ground: [f32; 4],
+    pub edge_color: [f32; 4],
+    pub switches: [f32; 4],
+    /// Per material: tint, then highlight exponent and strength.
+    pub materials: [[[f32; 4]; 2]; crate::MAX_MATERIALS],
 }
 
 /// Uniforms of the anti-aliasing pass (`fxaa.wgsl`).
@@ -238,6 +257,19 @@ pub(crate) fn ao_pass(device: &wgpu::Device) -> FullscreenPass {
         false,
         crate::GBuffer::AO_FORMAT,
         &AoUniforms::zeroed(),
+    )
+}
+
+pub(crate) fn ao_blur_pass(device: &wgpu::Device) -> FullscreenPass {
+    FullscreenPass::new(
+        device,
+        "ao_blur_pass",
+        include_str!("../shaders/ao_blur.wgsl"),
+        "fs_ao_blur",
+        &[FLOAT, FLOAT, wgpu::TextureSampleType::Uint],
+        false,
+        crate::GBuffer::AO_FORMAT,
+        &AoBlurUniforms::zeroed(),
     )
 }
 

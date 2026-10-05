@@ -405,20 +405,141 @@ impl Default for GridSettings {
 pub const AXIS_COLORS: [[f32; 3]; 3] = [[0.85, 0.2, 0.22], [0.3, 0.65, 0.15], [0.2, 0.4, 0.9]];
 
 // ============================================================================
+// Shading
+// ============================================================================
+
+/// One directional light of the rig.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Light {
+    /// The direction the light shines from, in the camera's frame: x to
+    /// the right of the frame, y up it, z toward the viewer. The lights
+    /// turn with the view, so no face goes dark as it turns.
+    pub direction: [f32; 3],
+    /// Linear RGB, intensity included.
+    pub color: [f32; 3],
+}
+
+/// The lights a frame is lit by: the resolve pass's whole lighting model
+/// is driven by this value, so a different look is different data.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct LightingRig {
+    /// Key, fill and rim.
+    pub lights: [Light; 3],
+    /// Ambient light on a surface facing straight up the world Z axis.
+    pub sky: [f32; 3],
+    /// Ambient light on a surface facing straight down it.
+    pub ground: [f32; 3],
+}
+
+impl Default for LightingRig {
+    /// A neutral studio: a key from the upper left, a weaker fill from the
+    /// right, a rim from behind, and a soft sky.
+    fn default() -> Self {
+        Self {
+            lights: [
+                Light {
+                    direction: [-0.5, 0.6, 0.65],
+                    color: [0.62; 3],
+                },
+                Light {
+                    direction: [0.7, -0.1, 0.5],
+                    color: [0.22; 3],
+                },
+                Light {
+                    direction: [0.2, 0.6, -0.75],
+                    color: [0.25; 3],
+                },
+            ],
+            sky: [0.30; 3],
+            ground: [0.16; 3],
+        }
+    }
+}
+
+/// How a surface answers the light. [`MaterialId`] indexes the frame's
+/// table of these.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Material {
+    /// Linear RGB multiplied into the vertex colour.
+    pub base_tint: [f32; 3],
+    /// 0 is a mirror-tight highlight, 1 a broad dull one.
+    pub roughness: f32,
+    /// The strength of the highlight; 0 is matte.
+    pub specular: f32,
+}
+
+impl Default for Material {
+    fn default() -> Self {
+        Self {
+            base_tint: [0.85, 0.9, 1.0],
+            roughness: 0.45,
+            specular: 0.18,
+        }
+    }
+}
+
+/// The most materials a frame's table holds; ids past the table's end
+/// take its first entry.
+pub const MAX_MATERIALS: usize = 16;
+
+/// Ambient occlusion: the darkening of creases and contact from nearby
+/// geometry, from the G-buffer.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct AoSettings {
+    pub enabled: bool,
+    /// How far occluders are looked for, as a fraction of the diagonal of
+    /// the frame's meshes: the same look at any part size.
+    pub radius: f32,
+    /// Exponent on the result; above 1 darkens.
+    pub strength: f32,
+}
+
+impl Default for AoSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            radius: 0.06,
+            strength: 1.0,
+        }
+    }
+}
+
+/// Edge lines from discontinuities in the G-buffer: silhouettes, creases
+/// and the boundaries between objects, one pixel wide.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct EdgeSettings {
+    pub enabled: bool,
+    /// Faces meeting at more than this angle (radians) get a line.
+    pub crease_angle: f32,
+    /// Linear RGB of the lines.
+    pub color: [f32; 3],
+    /// How opaque the lines are.
+    pub opacity: f32,
+}
+
+impl Default for EdgeSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            crease_angle: 0.6,
+            color: [0.02; 3],
+            opacity: 0.55,
+        }
+    }
+}
+
+// ============================================================================
 // Render Settings
 // ============================================================================
 
 /// Global render settings.
 #[derive(Clone, Debug)]
 pub struct RenderSettings {
-    /// Enable SSAO (screen-space ambient occlusion)
-    pub ssao_enabled: bool,
-    /// SSAO radius in world units
-    pub ssao_radius: f32,
-    /// SSAO bias
-    pub ssao_bias: f32,
-    /// SSAO strength
-    pub ssao_strength: f32,
+    pub lighting: LightingRig,
+    /// The material table; at most [`MAX_MATERIALS`] entries are used.
+    pub materials: Vec<Material>,
+    pub ao: AoSettings,
+    pub edges: EdgeSettings,
     /// Grid settings
     pub grid: GridSettings,
     /// The view gizmo, where the host wants one drawn.
@@ -433,10 +554,10 @@ pub struct RenderSettings {
 impl Default for RenderSettings {
     fn default() -> Self {
         Self {
-            ssao_enabled: true,
-            ssao_radius: 0.5,
-            ssao_bias: 0.025,
-            ssao_strength: 1.0,
+            lighting: LightingRig::default(),
+            materials: vec![Material::default()],
+            ao: AoSettings::default(),
+            edges: EdgeSettings::default(),
             grid: GridSettings::default(),
             gizmo: None,
             background_color: [0.1, 0.1, 0.1, 1.0],

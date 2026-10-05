@@ -22,6 +22,9 @@ pub struct GpuMesh {
     pub dropped_triangles: usize,
     /// Triangles in the source mesh.
     pub total_triangles: usize,
+    /// The corners of the box around the mesh's vertices, in its own
+    /// coordinates; `None` for an empty mesh.
+    pub bounds: Option<(Vec3, Vec3)>,
 }
 
 impl GpuMesh {
@@ -45,6 +48,13 @@ impl GpuMesh {
             })
             .collect();
         let mut indices = data.indices.clone();
+        let bounds = vertices
+            .iter()
+            .map(|v| Vec3::from(v.position))
+            .filter(|p| p.is_finite())
+            .fold(None, |bounds: Option<(Vec3, Vec3)>, p| {
+                Some(bounds.map_or((p, p), |(min, max)| (min.min(p), max.max(p))))
+            });
 
         let max_buffer = device.limits().max_buffer_size;
         let (dropped_triangles, total_triangles) = clamp_mesh_to_budget(
@@ -76,6 +86,7 @@ impl GpuMesh {
             draw_count,
             dropped_triangles,
             total_triangles,
+            bounds,
         }
     }
 }

@@ -251,8 +251,7 @@ mod tests {
             show_grid: false,
             show_bounds: false,
             ssao: false,
-            ssao_radius: 0.5,
-            ssao_bias: 0.025,
+            ssao_radius: 0.06,
             ssao_strength: 1.0,
             stale: false,
         };

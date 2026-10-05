@@ -1083,8 +1083,8 @@ pub struct VolumetricUiV2 {
     /// parts pinned into one viewport stay distinguishable.
     tint_parts: bool,
     ssao: bool,
+    /// A fraction of the scene's diagonal.
     ssao_radius: f32,
-    ssao_bias: f32,
     ssao_strength: f32,
     /// Preview-capable artifacts reported by the active project run. These are
     /// displayed read-only and never feed viewport meshing until terminal
@@ -1259,8 +1259,7 @@ impl VolumetricUiV2 {
             tint_parts: false,
             ssao: true,
             // Renderer defaults (renderer::RenderSettings::default()).
-            ssao_radius: 0.5,
-            ssao_bias: 0.025,
+            ssao_radius: 0.06,
             ssao_strength: 1.0,
             staged_artifacts: Vec::new(),
             runtime_assets: Vec::new(),
@@ -2139,19 +2138,17 @@ impl VolumetricUiV2 {
             show_bounds: self.show_bounds,
             ssao: self.ssao,
             ssao_radius: self.ssao_radius,
-            ssao_bias: self.ssao_bias,
             ssao_strength: self.ssao_strength,
             stale: self.last_run_stale,
         })
     }
 
-    /// Adjusts one SSAO parameter; `up` steps the value up. Radius and bias
-    /// step geometrically (their useful ranges span orders of magnitude).
+    /// Adjusts one SSAO parameter; `up` steps the value up. The radius
+    /// steps geometrically.
     fn adjust_ssao(&mut self, field: &str, up: bool) {
         let scale = if up { 1.5 } else { 1.0 / 1.5 };
         match field {
-            "radius" => self.ssao_radius = (self.ssao_radius * scale).clamp(0.005, 0.5),
-            "bias" => self.ssao_bias = (self.ssao_bias * scale).clamp(0.0001, 0.02),
+            "radius" => self.ssao_radius = (self.ssao_radius * scale).clamp(0.01, 0.3),
             "strength" => {
                 let delta = if up { 0.25 } else { -0.25 };
                 self.ssao_strength = (self.ssao_strength + delta).clamp(0.5, 4.0);
@@ -5593,8 +5590,11 @@ fn ssao_settings_popover(app: &VolumetricUiV2) -> El {
         Anchor::below_key(SSAO_SETTINGS_KEY),
         popover_panel([column([
             text("SSAO").label().semibold(),
-            stepper("radius", "Radius", format!("{:.3}", app.ssao_radius)),
-            stepper("bias", "Bias", format!("{:.4}", app.ssao_bias)),
+            stepper(
+                "radius",
+                "Radius",
+                format!("{:.1}%", app.ssao_radius * 100.0),
+            ),
             stepper("strength", "Strength", format!("{:.2}", app.ssao_strength)),
         ])
         .gap(tokens::SPACE_2)
@@ -9859,7 +9859,7 @@ mod tests {
         app.run_project();
         let requests = app.preview_requests();
         let request = &requests[0];
-        assert!((request.ssao_radius - 0.5 / 1.5).abs() < 1e-6);
+        assert!((request.ssao_radius - 0.06 / 1.5).abs() < 1e-6);
         assert!((request.ssao_strength - 1.25).abs() < 1e-6);
 
         dispatch(

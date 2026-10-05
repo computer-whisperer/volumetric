@@ -39,8 +39,10 @@ pub struct UiSettings {
     pub show_grid: bool,
     pub show_bounds: bool,
     pub ssao: bool,
+    /// A fraction of the scene's diagonal. Stored as `ao_radius`: the
+    /// `ssao_radius` of earlier files was in metres and is not read.
+    #[serde(rename = "ao_radius")]
     pub ssao_radius: f32,
-    pub ssao_bias: f32,
     pub ssao_strength: f32,
     pub auto_rebuild: bool,
     pub auto_remesh: bool,
@@ -79,7 +81,6 @@ impl UiSettings {
             show_bounds: app.show_bounds,
             ssao: app.ssao,
             ssao_radius: app.ssao_radius,
-            ssao_bias: app.ssao_bias,
             ssao_strength: app.ssao_strength,
             auto_rebuild: app.auto_rebuild,
             auto_remesh: app.auto_remesh,
@@ -124,7 +125,6 @@ impl UiSettings {
         app.show_bounds = self.show_bounds;
         app.ssao = self.ssao;
         app.ssao_radius = finite_or(self.ssao_radius, defaults.ssao_radius);
-        app.ssao_bias = finite_or(self.ssao_bias, defaults.ssao_bias);
         app.ssao_strength = finite_or(self.ssao_strength, defaults.ssao_strength);
         app.auto_rebuild = self.auto_rebuild;
         app.auto_remesh = self.auto_remesh;

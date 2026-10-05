@@ -28,6 +28,8 @@ pub struct GBuffer {
     pub surface_view: wgpu::TextureView,
     /// Depth attachment of every depth-tested pass.
     pub depth_view: wgpu::TextureView,
+    /// Ambient occlusion as sampled, before its blur.
+    pub ao_raw_view: wgpu::TextureView,
     /// Ambient occlusion, 1 = unoccluded.
     pub ao_view: wgpu::TextureView,
     /// The lit scene before anti-aliasing, in `lit_format`.
@@ -88,6 +90,7 @@ impl GBuffer {
             normal_view: target("gbuffer_normal", Self::NORMAL_FORMAT),
             surface_view: target("gbuffer_surface", Self::SURFACE_FORMAT),
             depth_view: target("gbuffer_depth", Self::DEPTH_FORMAT),
+            ao_raw_view: target("gbuffer_ao_raw", Self::AO_FORMAT),
             ao_view: target("gbuffer_ao", Self::AO_FORMAT),
             lit_view: target("lit_scene", lit_format),
             lit_format,

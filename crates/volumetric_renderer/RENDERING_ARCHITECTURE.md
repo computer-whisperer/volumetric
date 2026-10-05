@@ -1,6 +1,6 @@
 # Volumetric Renderer: Target Design
 
-Status: **target design, being built** (written 2026-10-05; steps 1 to 3
+Status: **target design, being built** (written 2026-10-05; steps 1 to 4
 of section 11 are built). This file
 replaces the May 2026 MVP architecture notes. It is the ground truth for the
 renderer overhaul: where the code and this file disagree during the rebuild,
@@ -183,16 +183,16 @@ so sources compose with each other and with everything drawn afterwards.
 ### Passes
 
 1. **G-buffer fill** from every source.
-2. **Ambient occlusion** on linear depth, followed by a depth-aware blur.
-   The radius is a fraction of the scene's bounding diagonal, clamped in
-   screen space, so it is right for a 20 mm part and a 2 m assembly alike.
-   (Until step 4 the MVP's occlusion shader is kept, ported to the new
-   G-buffer. It compares non-linear depth against a fixed bias. With the
-   viewport's clip planes (near 0.005 and far 100 orbit distances) the
-   default bias of 0.025 is only exceeded by an occluder nearer than about
-   a sixth of the orbit distance, so by that arithmetic it registers no
-   local occlusion at all. The frame test has to lower the bias to see an
-   effect.)
+2. **Ambient occlusion** (`ao.wgsl`), followed by a blur that keeps to
+   one surface (`ao_blur.wgsl`). Distances are compared in world units in
+   front of the eye, so the result does not depend on the clip planes. The
+   radius is a fraction of the diagonal of the frame's meshes (the
+   renderer keeps each mesh's bounds), clamped to 15 % of the frame's
+   height on screen, so it is right for a 20 mm part and a 2 m assembly
+   alike; a frame test renders one scene at 1 m and at 1 mm and compares.
+   (The MVP's shader compared non-linear depth against a fixed bias, which
+   by arithmetic registered no local occlusion with the viewport's clip
+   planes.)
 3. **Resolve**: lighting × AO, edge lines, background, tone map, into a
    display-referred intermediate.
 4. **FXAA** into the scene target (built 2026-10-05, ahead of the rest of
@@ -211,17 +211,30 @@ The **pick pass** (section 6) runs on demand, outside this sequence.
 The resolve pass implements one model, driven by a `LightingRig` value so
 later looks are data rather than new passes:
 
-- lights are attached to the camera (key from upper left, a weaker fill, a
-  rim), so no face is ever unlit as the view turns;
-- a hemisphere ambient term along world Z;
-- a specular lobe per material;
-- a small material table (`MaterialId` indexes it: base tint, roughness,
-  specular strength). Vertex colour multiplies the base tint.
+- three directional lights given in the camera's frame (key from the upper
+  left, a weaker fill, a rim), so no face is ever unlit as the view turns.
+  The frame's axes are read from the view-projection, so a photograph's
+  pinhole view lights the same way as the orbit camera;
+- a hemisphere ambient term along world Z (`sky`, `ground`);
+- a Blinn-Phong highlight per material;
+- a material table of up to 16 entries (`MaterialId` indexes it: base
+  tint, roughness, specular strength). Vertex colour multiplies the base
+  tint;
+- occlusion takes the ambient light whole and the direct light by half;
+- a shoulder above 0.8 so highlights roll off instead of clipping.
 
-Edge lines come from discontinuities in depth, normal and object id in the
-resolve pass: silhouettes, creases and part boundaries, one pixel wide,
-switchable. Because they are computed from the G-buffer, any source gets
-them.
+Edge lines come from discontinuities in the G-buffer, in the resolve pass:
+
+- a step in depth, marked on its near side: the neighbour is farther than
+  the plane through this pixel and the opposite neighbour would put it
+  (depth is linear across a plane on screen, so the plane is extrapolated
+  in depth and compared in world distance);
+- a crease sharper than `EdgeSettings::crease_angle`;
+- a change of `ObjectId`. Both hosts number each drawn mesh, so the parts
+  of an assembly are outlined against each other.
+
+They are one pixel wide, drawn before anti-aliasing, and any geometry
+source gets them.
 
 Reserved for later, and the reason the id target exists beyond picking:
 hover and selection outlines, per-object visibility and section planes.
@@ -373,7 +386,7 @@ Nothing in the core frame needs compute shaders or float colour targets.
 | G-buffer (3 colour targets + depth) | Same |
 | Grid, edges, FXAA, gizmo | Same |
 | Picking | Same (integer read-back) |
-| Ambient occlusion | Fewer samples, half resolution |
+| Ambient occlusion | Half the samples (8) |
 | Image sources / direct raytracing | Unavailable at first: the caster is CPU-parallel and the web build has no workers |
 
 Measured 2026-10-05 on a GLES adapter under WebGL2 limits (the frame
@@ -441,8 +454,13 @@ measured properties of rendered frames, not stored images.
    hit-testing, scale readout. Left for step 5: every grid and gizmo
    setting but the grid's visibility is fixed in code; the headless
    `--grid` is still a fixed spacing in metres.
-4. **Shading.** Lighting rig and material table, AO rewrite, edge lines,
-   supersampled headless renders. (FXAA is built.)
+4. **Shading (built 2026-10-05).** Lighting rig and material table, AO
+   rewrite, edge lines, FXAA. Left for step 5: the rig, materials and
+   edge settings are fixed in code; the GUI still calls occlusion "SSAO"
+   and exposes only its radius (now a fraction of the scene) and strength;
+   hosts give every mesh material 0. Not built: half-resolution occlusion
+   on WebGL2 (it takes half the samples instead); supersampled headless
+   renders.
 5. **Settings and parity.** Viewport settings panel and persistence
    (migrating the stored SSAO radius from metres to a relative value); CLI
    and Python options; documentation.

@@ -296,8 +296,9 @@ pub struct PreviewRequest {
     /// like `wireframe`).
     pub show_bounds: bool,
     pub ssao: bool,
+    /// How far occluders are looked for, as a fraction of the scene's
+    /// diagonal.
     pub ssao_radius: f32,
-    pub ssao_bias: f32,
     pub ssao_strength: f32,
     pub stale: bool,
 }

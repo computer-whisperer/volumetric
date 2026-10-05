@@ -7,9 +7,9 @@
 //! Passes, in order:
 //!
 //! 1. **G-buffer fill**: retained meshes.
-//! 2. **Ambient occlusion** from depth and normals.
-//! 3. **Resolve**: lights the G-buffer, then **anti-aliasing** writes
-//!    the lit scene into the target.
+//! 2. **Ambient occlusion** from depth and normals, then its blur.
+//! 3. **Resolve**: lights the G-buffer and draws edge lines, then
+//!    **anti-aliasing** writes the lit scene into the target.
 //! 4. **Grid**: the ground grid and world axis lines, per pixel.
 //! 5. **Depth-tested lines and points**.
 //! 6. **Splats**: their own layer, then composited.
@@ -58,21 +58,21 @@ pub use pipelines::{
 };
 pub use scene::SceneData;
 pub use types::{
-    AXIS_COLORS, DepthMode, GridPlane, GridSettings, GridSpacing, LineData, LineInstance,
-    LinePattern, LineSegment, LineStyle, MaterialId, MeshData, MeshVertex, ObjectId, PointData,
-    PointInstance, PointShape, PointStyle, RenderSettings, SplatData, SplatStyle, WidthMode,
+    AXIS_COLORS, AoSettings, DepthMode, EdgeSettings, GridPlane, GridSettings, GridSpacing, Light,
+    LightingRig, LineData, LineInstance, LinePattern, LineSegment, LineStyle, MAX_MATERIALS,
+    Material, MaterialId, MeshData, MeshVertex, ObjectId, PointData, PointInstance, PointShape,
+    PointStyle, RenderSettings, SplatData, SplatStyle, WidthMode,
 };
 
 use std::sync::Arc;
 
 use buffer::{DynamicBuffer, QUAD_INDICES, QUAD_VERTICES, QuadVertex, StaticBuffer};
-use bytemuck::Zeroable;
 use gbuffer::GBuffer;
 use glam::{Mat4, Vec3};
 use pick::{FrameRecord, Picker};
 use pipelines::{
-    AoUniforms, FullscreenPass, FxaaUniforms, GizmoPipeline, GpuPointInstance, GpuWarp,
-    GridPipeline, LinePipeline, MeshDraw, MeshPipeline, PointPipeline, ResolveUniforms,
+    AoBlurUniforms, AoUniforms, FullscreenPass, FxaaUniforms, GizmoPipeline, GpuPointInstance,
+    GpuWarp, GridPipeline, LinePipeline, MeshDraw, MeshPipeline, PointPipeline, ResolveUniforms,
     SplatCompositePipeline, SplatPipeline, WarpPipeline, ao_pass, resolve_pass,
 };
 
@@ -147,8 +147,54 @@ struct SubmittedPoints {
     style: PointStyle,
 }
 
-/// The direction the fixed light shines from.
-pub(crate) const LIGHT_DIRECTION: [f32; 3] = [0.4, -0.2, 0.7];
+/// The resolve pass's uniforms: the rig's lights turned from the camera's
+/// frame into the world, and the material table.
+fn resolve_uniforms(
+    settings: &RenderSettings,
+    view: &CameraView,
+    inv_view_proj: [[f32; 4]; 4],
+    ao_enabled: bool,
+) -> ResolveUniforms {
+    let [right, up, toward] = view.frame_axes();
+    let rgb = |[r, g, b]: [f32; 3]| [r, g, b, 0.0];
+    let lights = settings.lighting.lights.map(|light| {
+        let [x, y, z] = light.direction;
+        let direction = (right * x + up * y + toward * z).normalize_or_zero();
+        [direction.extend(0.0).to_array(), rgb(light.color)]
+    });
+    let first = settings.materials.first().copied().unwrap_or_default();
+    let materials = std::array::from_fn(|i| {
+        let material = settings.materials.get(i).copied().unwrap_or(first);
+        // A Blinn-Phong exponent from roughness: tight at 0, broad at 1.
+        let roughness = material.roughness.clamp(0.05, 1.0);
+        let exponent = (2.0 / roughness.powi(4) - 2.0).clamp(1.0, 4000.0);
+        [
+            rgb(material.base_tint),
+            [exponent, material.specular.max(0.0), 0.0, 0.0],
+        ]
+    });
+    let edges = &settings.edges;
+    let [r, g, b] = edges.color;
+    ResolveUniforms {
+        inv_view_proj,
+        depth_to_distance: view.depth_to_distance(),
+        lights,
+        sky: rgb(settings.lighting.sky),
+        ground: rgb(settings.lighting.ground),
+        edge_color: [
+            r,
+            g,
+            b,
+            if edges.enabled {
+                edges.opacity.clamp(0.0, 1.0)
+            } else {
+                0.0
+            },
+        ],
+        switches: [edges.crease_angle.cos(), ao_enabled as u32 as f32, 0.0, 0.0],
+        materials,
+    }
+}
 
 fn clear_color(color: [f32; 4]) -> wgpu::Color {
     wgpu::Color {
@@ -174,6 +220,9 @@ pub struct Renderer {
 
     mesh_pipeline: MeshPipeline,
     ao: FullscreenPass,
+    ao_blur: FullscreenPass,
+    /// How many occlusion samples a pixel takes.
+    ao_samples: u32,
     resolve: FullscreenPass,
     fxaa: FullscreenPass,
     grid_pipeline: GridPipeline,
@@ -206,6 +255,7 @@ pub struct Renderer {
 /// The bind groups of the passes that read the G-buffer.
 struct GBufferBindings {
     ao: wgpu::BindGroup,
+    ao_blur: wgpu::BindGroup,
     resolve: wgpu::BindGroup,
     fxaa: wgpu::BindGroup,
     pick: wgpu::BindGroup,
@@ -216,6 +266,13 @@ impl Renderer {
     /// Creates a renderer drawing into targets of `surface_format`.
     pub fn new(device: &wgpu::Device, surface_format: wgpu::TextureFormat) -> Self {
         let ao = ao_pass(device);
+        let ao_blur = pipelines::ao_blur_pass(device);
+        // The WebGL2 fallback takes half the samples.
+        let ao_samples = if device.adapter_info().backend == wgpu::Backend::Gl {
+            8
+        } else {
+            16
+        };
         let resolve = resolve_pass(device, surface_format);
         let fxaa = pipelines::fxaa_pass(device, surface_format);
         let splat_composite_pipeline = SplatCompositePipeline::new(device, surface_format);
@@ -225,6 +282,7 @@ impl Renderer {
             device,
             &gbuffer,
             &ao,
+            &ao_blur,
             &resolve,
             &fxaa,
             &picker,
@@ -236,6 +294,8 @@ impl Renderer {
             warp_gpu: None,
             mesh_pipeline: MeshPipeline::new(device),
             ao,
+            ao_blur,
+            ao_samples,
             resolve,
             fxaa,
             grid_pipeline: GridPipeline::new(device, surface_format),
@@ -263,6 +323,7 @@ impl Renderer {
         device: &wgpu::Device,
         gbuffer: &GBuffer,
         ao: &FullscreenPass,
+        ao_blur: &FullscreenPass,
         resolve: &FullscreenPass,
         fxaa: &FullscreenPass,
         picker: &Picker,
@@ -270,6 +331,14 @@ impl Renderer {
     ) -> GBufferBindings {
         GBufferBindings {
             ao: ao.bind(device, &[&gbuffer.normal_view, &gbuffer.surface_view]),
+            ao_blur: ao_blur.bind(
+                device,
+                &[
+                    &gbuffer.ao_raw_view,
+                    &gbuffer.normal_view,
+                    &gbuffer.surface_view,
+                ],
+            ),
             resolve: resolve.bind(
                 device,
                 &[
@@ -335,6 +404,7 @@ impl Renderer {
             device,
             &self.gbuffer,
             &self.ao,
+            &self.ao_blur,
             &self.resolve,
             &self.fxaa,
             &self.picker,
@@ -608,30 +678,41 @@ impl Renderer {
                 .prepare(queue, &settings.grid, view, internal_size)
         });
 
-        let ao_enabled = settings.ssao_enabled && !self.frame_meshes.is_empty();
+        // ---- Shading uniforms. The inverse is taken in double
+        // precision, as the grid's is.
+        let inv_view_proj = view_proj.as_dmat4().inverse().as_mat4().to_cols_array_2d();
+        let depth_to_distance = view.depth_to_distance();
+        // Occlusion is sized by the meshes it is drawn on.
+        let mesh_diagonal = self.mesh_diagonal();
+        let ao_enabled = settings.ao.enabled && mesh_diagonal > 0.0;
         if ao_enabled {
+            let (pixels_per_unit_at_1, pixels_per_unit) = view.pixels_per_unit(internal_size.1);
             self.ao.write_uniforms(
                 queue,
                 &AoUniforms {
                     view_proj: view_proj_array,
-                    inv_view_proj: view_proj.inverse().to_cols_array_2d(),
-                    radius: settings.ssao_radius,
-                    bias: settings.ssao_bias,
-                    strength: settings.ssao_strength,
-                    ..AoUniforms::zeroed()
+                    inv_view_proj,
+                    depth_to_distance,
+                    radius: settings.ao.radius.max(0.0) * mesh_diagonal,
+                    samples: self.ao_samples,
+                    max_radius_px: internal_size.1 as f32 * 0.15,
+                    pixels_per_unit_at_1,
+                    pixels_per_unit,
+                    _pad0: [0.0; 3],
+                },
+            );
+            self.ao_blur.write_uniforms(
+                queue,
+                &AoBlurUniforms {
+                    depth_to_distance,
+                    strength: settings.ao.strength,
+                    _pad0: [0.0; 3],
                 },
             );
         }
         self.resolve.write_uniforms(
             queue,
-            &ResolveUniforms {
-                // From above (+Z), a little to the +X, -Y side: the MVP's
-                // light, carried over to a z-up world.
-                light_dir_world: LIGHT_DIRECTION,
-                ao_enabled: ao_enabled as u32,
-                base_tint: [0.85, 0.9, 1.0],
-                _pad0: 0.0,
-            },
+            &resolve_uniforms(settings, view, inv_view_proj, ao_enabled),
         );
 
         // ---- G-buffer fill. Always run, so a frame with no geometry
@@ -675,6 +756,12 @@ impl Renderer {
             self.ao.run(
                 encoder,
                 &self.gbuffer_bindings.ao,
+                &self.gbuffer.ao_raw_view,
+                wgpu::Color::WHITE,
+            );
+            self.ao_blur.run(
+                encoder,
+                &self.gbuffer_bindings.ao_blur,
                 &self.gbuffer.ao_view,
                 wgpu::Color::WHITE,
             );
@@ -801,6 +888,29 @@ impl Renderer {
             overflow: overflow.any().then_some(overflow),
             grid_spacing: grid_levels.map(|levels| levels.minor),
         }
+    }
+
+    /// The diagonal of the box around every mesh submitted for this
+    /// frame, in world units; 0 with none.
+    fn mesh_diagonal(&self) -> f32 {
+        let bounds = self
+            .frame_meshes
+            .iter()
+            .filter_map(|draw| {
+                let (min, max) = draw.mesh.bounds?;
+                Some((0..8).map(move |i| {
+                    draw.transform.transform_point3(Vec3::new(
+                        if i & 1 == 0 { min.x } else { max.x },
+                        if i & 2 == 0 { min.y } else { max.y },
+                        if i & 4 == 0 { min.z } else { max.z },
+                    ))
+                }))
+            })
+            .flatten()
+            .fold(None, |bounds: Option<(Vec3, Vec3)>, p| {
+                Some(bounds.map_or((p, p), |(min, max)| (min.min(p), max.max(p))))
+            });
+        bounds.map_or(0.0, |(min, max)| (max - min).length())
     }
 
     /// One pass over `target` drawing every line and point batch of

@@ -26,8 +26,8 @@ use volumetric_preview::{
     wireframe_style,
 };
 use volumetric_renderer::{
-    Camera, CameraView, GridPlane, GridSpacing, LineData, MaterialId, ObjectId, RenderSettings,
-    StandardView, Warp, offscreen::Offscreen,
+    AoSettings, Camera, CameraView, GridPlane, GridSpacing, LineData, MaterialId, ObjectId,
+    RenderSettings, StandardView, Warp, offscreen::Offscreen,
 };
 
 pub use view_core::overlay::Overlay;
@@ -432,8 +432,7 @@ pub fn preview_request(asset: &LoadedAsset, options: &PlanOptions) -> PreviewReq
         show_grid: false,
         show_bounds: false,
         ssao: false,
-        ssao_radius: 0.5,
-        ssao_bias: 0.025,
+        ssao_radius: 0.06,
         ssao_strength: 1.0,
         stale: false,
     }
@@ -774,7 +773,10 @@ pub fn render(
         } else {
             options.background
         },
-        ssao_enabled: options.ssao,
+        ao: AoSettings {
+            enabled: options.ssao,
+            ..AoSettings::default()
+        },
         // An overlay's alpha is the render's coverage, taken as drawn.
         antialiasing: overlay.is_none(),
         ..RenderSettings::default()
@@ -785,12 +787,16 @@ pub fn render(
 
     let mut out = Vec::with_capacity(frames.len());
     for (suffix, view) in frames {
+        // Each mesh is its own object, numbered in drawing order, so the
+        // boundary between two parts gets an edge line.
+        let mut object = 0;
         for (scene, entity) in resident.iter().zip(&entities) {
             for (mesh, transform) in &scene.meshes {
+                object += 1;
                 renderer.submit_retained_mesh(
                     mesh,
                     *transform,
-                    ObjectId::NONE,
+                    ObjectId(object),
                     MaterialId::default(),
                 );
             }
@@ -862,7 +868,10 @@ pub fn render(
                 submit_view_highlight(&mut renderer, marks);
                 let mut marks_settings = RenderSettings {
                     background_color: SENTINEL,
-                    ssao_enabled: false,
+                    ao: AoSettings {
+                        enabled: false,
+                        ..AoSettings::default()
+                    },
                     antialiasing: false,
                     ..RenderSettings::default()
                 };

@@ -223,7 +223,10 @@ mod tests {
         );
         let settings = RenderSettings {
             background_color: [0.0, 0.0, 1.0, 1.0],
-            ssao_enabled: false,
+            ao: crate::AoSettings {
+                enabled: false,
+                ..Default::default()
+            },
             ..RenderSettings::default()
         };
         for _ in 0..2 {
@@ -281,7 +284,10 @@ mod tests {
         );
         let mut settings = RenderSettings {
             background_color: [0.0, 0.0, 1.0, 1.0],
-            ssao_enabled: false,
+            ao: crate::AoSettings {
+                enabled: false,
+                ..Default::default()
+            },
             ..RenderSettings::default()
         };
         settings.grid.visible = false;
@@ -405,7 +411,10 @@ mod bench {
             t.elapsed().as_secs_f64() * 1e3
         );
         let settings = RenderSettings {
-            ssao_enabled: false,
+            ao: crate::AoSettings {
+                enabled: false,
+                ..Default::default()
+            },
             ..RenderSettings::default()
         };
         for (label, angle) in [

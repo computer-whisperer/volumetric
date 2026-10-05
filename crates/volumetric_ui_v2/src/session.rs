@@ -1488,6 +1488,7 @@ impl ViewportRenderer {
                 .get(id.as_str())
                 .is_some_and(|rev| *rev == posed.revision)
         });
+        let mut object = 0;
         for (id, revision, wireframe, entity) in visible {
             if self
                 .resident
@@ -1527,10 +1528,14 @@ impl ViewportRenderer {
                     .and_then(|p| p.transforms.get(i))
                     .copied()
                     .unwrap_or(*transform);
+                // Each mesh is its own object, numbered in drawing
+                // order, so the boundary between two parts gets an edge
+                // line.
+                object += 1;
                 self.renderer.submit_retained_mesh(
                     mesh,
                     transform,
-                    renderer::ObjectId::NONE,
+                    renderer::ObjectId(object),
                     renderer::MaterialId::default(),
                 );
             }
@@ -2807,10 +2812,11 @@ fn render_settings(
     };
 
     if let Some(request) = request {
-        settings.ssao_enabled = request.ssao;
-        settings.ssao_radius = request.ssao_radius;
-        settings.ssao_bias = request.ssao_bias;
-        settings.ssao_strength = request.ssao_strength;
+        settings.ao = renderer::AoSettings {
+            enabled: request.ssao,
+            radius: request.ssao_radius,
+            strength: request.ssao_strength,
+        };
         settings.grid.visible = request.show_grid;
     }
 
@@ -2962,8 +2968,7 @@ mod tests {
             show_grid: false,
             show_bounds: false,
             ssao: false,
-            ssao_radius: 0.5,
-            ssao_bias: 0.025,
+            ssao_radius: 0.06,
             ssao_strength: 1.0,
             stale: false,
         };
@@ -3151,8 +3156,7 @@ mod tests {
             show_bounds: false,
             show_grid: true,
             ssao: false,
-            ssao_radius: 0.5,
-            ssao_bias: 0.025,
+            ssao_radius: 0.06,
             ssao_strength: 1.0,
             stale: false,
         }
@@ -3295,7 +3299,6 @@ mod tests {
             show_grid: false,
             ssao: false,
             ssao_radius: 0.1,
-            ssao_bias: 0.02,
             ssao_strength: 1.0,
             stale: false,
         };
@@ -3375,7 +3378,6 @@ mod tests {
             show_grid: false,
             ssao: false,
             ssao_radius: 0.1,
-            ssao_bias: 0.02,
             ssao_strength: 1.0,
             stale: false,
         };
@@ -3506,8 +3508,7 @@ mod tests {
             show_bounds: false,
             show_grid: true,
             ssao: false,
-            ssao_radius: 0.5,
-            ssao_bias: 0.025,
+            ssao_radius: 0.06,
             ssao_strength: 1.0,
             stale: false,
         }
@@ -3791,8 +3792,7 @@ mod tests {
             show_bounds: false,
             show_grid: true,
             ssao: true,
-            ssao_radius: 0.5,
-            ssao_bias: 0.025,
+            ssao_radius: 0.06,
             ssao_strength: 1.0,
             stale: false,
         }
