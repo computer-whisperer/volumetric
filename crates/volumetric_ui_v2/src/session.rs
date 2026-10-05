@@ -941,7 +941,10 @@ impl ViewportRenderer {
         };
 
         let mut settings = render_settings(preview_requests.first(), clear_color);
-        settings.grid.spacing = renderer::GridSpacing::Auto { focus_depth };
+        settings.grid.spacing = renderer::GridSpacing::Auto {
+            focus_depth,
+            min_cell_px: renderer::GridSpacing::MIN_CELL_PX * scale_factor,
+        };
         settings.gizmo = self.gizmo();
         self.last_view = Some(view);
         self.last_frame =

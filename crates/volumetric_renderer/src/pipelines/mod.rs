@@ -10,7 +10,8 @@ mod splat;
 mod warp;
 
 pub(crate) use fullscreen::{
-    AoUniforms, FullscreenPass, PickUniforms, ResolveUniforms, ao_pass, pick_pass, resolve_pass,
+    AoUniforms, FullscreenPass, FxaaUniforms, PickUniforms, ResolveUniforms, ao_pass, fxaa_pass,
+    pick_pass, resolve_pass,
 };
 pub(crate) use gizmo::GizmoPipeline;
 pub(crate) use grid::GridPipeline;

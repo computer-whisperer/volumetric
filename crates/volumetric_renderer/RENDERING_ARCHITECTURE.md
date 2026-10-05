@@ -195,7 +195,8 @@ so sources compose with each other and with everything drawn afterwards.
    effect.)
 3. **Resolve**: lighting × AO, edge lines, background, tone map, into a
    display-referred intermediate.
-4. **FXAA** into the scene target.
+4. **FXAA** into the scene target (built 2026-10-05, ahead of the rest of
+   step 4; `RenderSettings::antialiasing`).
 5. **Grid** (section 5), depth-tested and blended.
 6. **Depth-tested lines and points.**
 7. **Splats**: own layer, then composited (unchanged).
@@ -246,8 +247,9 @@ no extent.
 
 - Three levels are drawn: minor lines, major lines every ten, super-major
   lines every hundred. With automatic spacing the minor spacing is the
-  power of ten that keeps a minor cell between 8 and 80 pixels at the
-  view's focus depth. A level's weight depends only on how large its cells
+  power of ten that keeps a minor cell between 16 and 160 logical pixels
+  at the view's focus depth (`GridSpacing::MIN_CELL_PX`; the first build's
+  8 physical pixels read as too fine in the GUI). A level's weight depends only on how large its cells
   are on screen, so when the view zooms across a decade each level takes
   over the weight the next one had and nothing pops.
 - Per pixel, each direction's lines fade out as they draw closer than a few
@@ -261,8 +263,8 @@ no extent.
   shows it as a scale readout ("grid 10 mm").
 
 Automatic spacing needs the depth the view is looking at, which the view's
-matrices do not hold: the host passes it (`GridSpacing::Auto { focus_depth }`,
-the orbit camera's distance).
+matrices do not hold, and the display's scale factor: the host passes both
+(`GridSpacing::Auto { focus_depth, min_cell_px }`).
 
 ### World axis lines
 
@@ -440,7 +442,7 @@ measured properties of rendered frames, not stored images.
    setting but the grid's visibility is fixed in code; the headless
    `--grid` is still a fixed spacing in metres.
 4. **Shading.** Lighting rig and material table, AO rewrite, edge lines,
-   FXAA, supersampled headless renders.
+   supersampled headless renders. (FXAA is built.)
 5. **Settings and parity.** Viewport settings panel and persistence
    (migrating the stored SSAO radius from metres to a relative value); CLI
    and Python options; documentation.

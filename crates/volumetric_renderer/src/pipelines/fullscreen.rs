@@ -6,24 +6,28 @@ use wgpu::util::DeviceExt;
 
 /// A full-screen pass: `fullscreen_vs.wgsl` followed by a fragment shader
 /// whose group 0 is a uniform block at binding 0 and textures from
-/// binding 1 on.
+/// binding 1 on, then a bilinear sampler when the pass samples rather
+/// than loads.
 pub(crate) struct FullscreenPass {
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     uniform_buffer: wgpu::Buffer,
+    sampler: Option<wgpu::Sampler>,
     label: &'static str,
 }
 
 impl FullscreenPass {
     /// `fragment_source` is appended to the shared vertex shader;
     /// `textures` gives each texture binding's sample type, in binding
-    /// order.
+    /// order. `sampled` adds the bilinear sampler after them.
+    #[allow(clippy::too_many_arguments)]
     pub fn new<U: Pod>(
         device: &wgpu::Device,
         label: &'static str,
         fragment_source: &str,
         fragment_entry: &str,
         textures: &[wgpu::TextureSampleType],
+        sampled: bool,
         target_format: wgpu::TextureFormat,
         uniforms: &U,
     ) -> Self {
@@ -58,6 +62,20 @@ impl FullscreenPass {
                 count: None,
             }
         }));
+        let sampler = sampled.then(|| {
+            entries.push(wgpu::BindGroupLayoutEntry {
+                binding: textures.len() as u32 + 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            });
+            device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some(label),
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                ..Default::default()
+            })
+        });
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some(label),
             entries: &entries,
@@ -102,6 +120,7 @@ impl FullscreenPass {
             pipeline,
             bind_group_layout,
             uniform_buffer,
+            sampler,
             label,
         }
     }
@@ -122,6 +141,12 @@ impl FullscreenPass {
                     resource: wgpu::BindingResource::TextureView(view),
                 }),
         );
+        if let Some(sampler) = &self.sampler {
+            entries.push(wgpu::BindGroupEntry {
+                binding: views.len() as u32 + 1,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            });
+        }
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(self.label),
             layout: &self.bind_group_layout,
@@ -185,6 +210,14 @@ pub(crate) struct ResolveUniforms {
     pub _pad0: f32,
 }
 
+/// Uniforms of the anti-aliasing pass (`fxaa.wgsl`).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub(crate) struct FxaaUniforms {
+    pub texel: [f32; 2],
+    pub _pad0: [f32; 2],
+}
+
 /// Uniforms of the pick pass (`pick.wgsl`).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -202,6 +235,7 @@ pub(crate) fn ao_pass(device: &wgpu::Device) -> FullscreenPass {
         include_str!("../shaders/ao.wgsl"),
         "fs_ao",
         &[FLOAT, wgpu::TextureSampleType::Uint],
+        false,
         crate::GBuffer::AO_FORMAT,
         &AoUniforms::zeroed(),
     )
@@ -217,8 +251,25 @@ pub(crate) fn resolve_pass(
         include_str!("../shaders/resolve.wgsl"),
         "fs_resolve",
         &[FLOAT, FLOAT, wgpu::TextureSampleType::Uint, FLOAT],
+        false,
         target_format,
         &ResolveUniforms::zeroed(),
+    )
+}
+
+pub(crate) fn fxaa_pass(
+    device: &wgpu::Device,
+    target_format: wgpu::TextureFormat,
+) -> FullscreenPass {
+    FullscreenPass::new(
+        device,
+        "fxaa_pass",
+        include_str!("../shaders/fxaa.wgsl"),
+        "fs_fxaa",
+        &[wgpu::TextureSampleType::Float { filterable: true }],
+        true,
+        target_format,
+        &FxaaUniforms::zeroed(),
     )
 }
 
@@ -229,6 +280,7 @@ pub(crate) fn pick_pass(device: &wgpu::Device) -> FullscreenPass {
         include_str!("../shaders/pick.wgsl"),
         "fs_pick",
         &[wgpu::TextureSampleType::Uint],
+        false,
         crate::pick::PICK_FORMAT,
         &PickUniforms::zeroed(),
     )

@@ -8,6 +8,9 @@
 //! | surface | `Rg32Uint` | r: [`crate::ObjectId`] of the draw, 0 is background; g: the bits of the fragment's depth as `f32`, 1.0 is background |
 //! | depth | `Depth24Plus` | hardware depth, for depth testing only |
 //!
+//! Beside them is the lit scene: the resolve pass's output in the frame's
+//! own format, which the anti-aliasing pass reads.
+//!
 //! Depth is carried twice. Later passes read it from the surface target,
 //! not from the depth attachment: reading a depth texture as a plain
 //! value has no GLSL translation in wgpu (the WebGL2 fallback), while an
@@ -27,6 +30,9 @@ pub struct GBuffer {
     pub depth_view: wgpu::TextureView,
     /// Ambient occlusion, 1 = unoccluded.
     pub ao_view: wgpu::TextureView,
+    /// The lit scene before anti-aliasing, in `lit_format`.
+    pub lit_view: wgpu::TextureView,
+    lit_format: wgpu::TextureFormat,
     /// The splat layer: Gaussians blended among themselves in their
     /// trainer's value space before being laid over the scene.
     pub splat_view: wgpu::TextureView,
@@ -50,7 +56,13 @@ impl GBuffer {
         a: 0.0,
     };
 
-    pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
+    /// `lit_format` is the format of the frame's target.
+    pub fn new(
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        lit_format: wgpu::TextureFormat,
+    ) -> Self {
         let size = (width.max(1), height.max(1));
         let target = |label: &'static str, format: wgpu::TextureFormat| {
             device
@@ -77,6 +89,8 @@ impl GBuffer {
             surface_view: target("gbuffer_surface", Self::SURFACE_FORMAT),
             depth_view: target("gbuffer_depth", Self::DEPTH_FORMAT),
             ao_view: target("gbuffer_ao", Self::AO_FORMAT),
+            lit_view: target("lit_scene", lit_format),
+            lit_format,
             splat_view: target("gbuffer_splat_layer", Self::SPLAT_LAYER_FORMAT),
             size,
         }
@@ -89,7 +103,7 @@ impl GBuffer {
         if self.size == new_size {
             return false;
         }
-        *self = Self::new(device, new_size.0, new_size.1);
+        *self = Self::new(device, new_size.0, new_size.1, self.lit_format);
         true
     }
 }

@@ -6,10 +6,6 @@ use glam::Vec3;
 
 use crate::{CameraView, GridSettings, GridSpacing};
 
-/// The smallest a minor cell is drawn, in pixels, where the view is
-/// looking; a decade finer would be smaller, so the grid steps up.
-const MIN_CELL_PX: f32 = 8.0;
-
 /// The grid's three levels of lines for one frame: minor lines `minor`
 /// apart, major lines every ten of them, and super-major lines every
 /// hundred, each with the weight its lines are drawn at.
@@ -23,8 +19,8 @@ impl GridLevels {
     /// `pixel_size` is the world size of a pixel where the view is
     /// looking.
     ///
-    /// Automatic spacing keeps the minor cell between [`MIN_CELL_PX`] and
-    /// ten times that. A level's weight is [`weight`] of how many decades
+    /// Automatic spacing keeps the minor cell between its `min_cell_px`
+    /// and ten times that. A level's weight is [`weight`] of how many decades
     /// its cell has grown past the smallest minor cell; when the view
     /// zooms out past a decade each level takes over the weight the next
     /// one had, so nothing pops.
@@ -34,8 +30,8 @@ impl GridLevels {
                 minor: minor.max(f32::MIN_POSITIVE),
                 weights: [weight(1.0), 1.0, 1.0],
             },
-            GridSpacing::Auto { .. } => {
-                let smallest = (pixel_size * MIN_CELL_PX).max(f32::MIN_POSITIVE).log10();
+            GridSpacing::Auto { min_cell_px, .. } => {
+                let smallest = (pixel_size * min_cell_px).max(f32::MIN_POSITIVE).log10();
                 let decade = smallest.ceil();
                 // How far into its decade the minor cell has grown, 0..1.
                 let grown = decade - smallest;
@@ -165,7 +161,7 @@ impl GridPipeline {
         size: (u32, u32),
     ) -> GridLevels {
         let pixel_size = match settings.spacing {
-            GridSpacing::Auto { focus_depth } => view.pixel_size(focus_depth, size.1),
+            GridSpacing::Auto { focus_depth, .. } => view.pixel_size(focus_depth, size.1),
             GridSpacing::Fixed(_) => 0.0,
         };
         let levels = GridLevels::choose(settings.spacing, pixel_size);
@@ -223,7 +219,11 @@ mod tests {
     /// boundary changes no line's weight.
     #[test]
     fn automatic_levels_are_decades_and_continuous() {
-        let auto = GridSpacing::Auto { focus_depth: 1.0 };
+        const MIN_CELL_PX: f32 = GridSpacing::MIN_CELL_PX;
+        let auto = GridSpacing::Auto {
+            focus_depth: 1.0,
+            min_cell_px: MIN_CELL_PX,
+        };
         for i in 0..400 {
             let pixel_size = 10f32.powf(-6.0 + i as f32 * 0.02);
             let levels = GridLevels::choose(auto, pixel_size);

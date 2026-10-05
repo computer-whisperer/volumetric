@@ -775,6 +775,8 @@ pub fn render(
             options.background
         },
         ssao_enabled: options.ssao,
+        // An overlay's alpha is the render's coverage, taken as drawn.
+        antialiasing: overlay.is_none(),
         ..RenderSettings::default()
     };
     settings.grid.visible = options.grid > 0.0 && overlay.is_none();
@@ -861,6 +863,7 @@ pub fn render(
                 let mut marks_settings = RenderSettings {
                     background_color: SENTINEL,
                     ssao_enabled: false,
+                    antialiasing: false,
                     ..RenderSettings::default()
                 };
                 marks_settings.grid.visible = false;

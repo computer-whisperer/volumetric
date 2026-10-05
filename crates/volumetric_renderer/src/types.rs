@@ -353,9 +353,19 @@ pub enum GridSpacing {
     /// readable size on screen where the view is looking: `focus_depth`
     /// in front of the eye (the orbit camera's distance). Finer levels
     /// fade in and out as the view zooms.
-    Auto { focus_depth: f32 },
+    ///
+    /// `min_cell_px` is the smallest a minor cell is drawn, in target
+    /// pixels; a decade finer would be smaller, so the grid steps up.
+    /// [`GridSpacing::MIN_CELL_PX`] per logical pixel is the usual value.
+    Auto { focus_depth: f32, min_cell_px: f32 },
     /// Minor lines this far apart (world units), a major line every ten.
     Fixed(f32),
+}
+
+impl GridSpacing {
+    /// The usual smallest minor cell, in logical pixels: minor cells are
+    /// then this to ten times this across.
+    pub const MIN_CELL_PX: f32 = 16.0;
 }
 
 /// The ground grid and world axis lines: drawn analytically per pixel, so
@@ -415,6 +425,9 @@ pub struct RenderSettings {
     pub gizmo: Option<ViewGizmo>,
     /// Background color
     pub background_color: [f32; 4],
+    /// Smooth the lit scene's stair-stepped edges (FXAA). Lines, the
+    /// grid and the gizmo are anti-aliased either way.
+    pub antialiasing: bool,
 }
 
 impl Default for RenderSettings {
@@ -427,6 +440,7 @@ impl Default for RenderSettings {
             grid: GridSettings::default(),
             gizmo: None,
             background_color: [0.1, 0.1, 0.1, 1.0],
+            antialiasing: true,
         }
     }
 }

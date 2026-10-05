@@ -8,7 +8,8 @@
 //!
 //! 1. **G-buffer fill**: retained meshes.
 //! 2. **Ambient occlusion** from depth and normals.
-//! 3. **Resolve**: lights the G-buffer into the target.
+//! 3. **Resolve**: lights the G-buffer, then **anti-aliasing** writes
+//!    the lit scene into the target.
 //! 4. **Grid**: the ground grid and world axis lines, per pixel.
 //! 5. **Depth-tested lines and points**.
 //! 6. **Splats**: their own layer, then composited.
@@ -70,9 +71,9 @@ use gbuffer::GBuffer;
 use glam::{Mat4, Vec3};
 use pick::{FrameRecord, Picker};
 use pipelines::{
-    AoUniforms, FullscreenPass, GizmoPipeline, GpuPointInstance, GpuWarp, GridPipeline,
-    LinePipeline, MeshDraw, MeshPipeline, PointPipeline, ResolveUniforms, SplatCompositePipeline,
-    SplatPipeline, WarpPipeline, ao_pass, resolve_pass,
+    AoUniforms, FullscreenPass, FxaaUniforms, GizmoPipeline, GpuPointInstance, GpuWarp,
+    GridPipeline, LinePipeline, MeshDraw, MeshPipeline, PointPipeline, ResolveUniforms,
+    SplatCompositePipeline, SplatPipeline, WarpPipeline, ao_pass, resolve_pass,
 };
 
 /// Geometry dropped from a frame because it would have exceeded the
@@ -174,6 +175,7 @@ pub struct Renderer {
     mesh_pipeline: MeshPipeline,
     ao: FullscreenPass,
     resolve: FullscreenPass,
+    fxaa: FullscreenPass,
     grid_pipeline: GridPipeline,
     gizmo_pipeline: GizmoPipeline,
     line_pipeline: LinePipeline,
@@ -205,6 +207,7 @@ pub struct Renderer {
 struct GBufferBindings {
     ao: wgpu::BindGroup,
     resolve: wgpu::BindGroup,
+    fxaa: wgpu::BindGroup,
     pick: wgpu::BindGroup,
     splat_composite: wgpu::BindGroup,
 }
@@ -214,14 +217,16 @@ impl Renderer {
     pub fn new(device: &wgpu::Device, surface_format: wgpu::TextureFormat) -> Self {
         let ao = ao_pass(device);
         let resolve = resolve_pass(device, surface_format);
+        let fxaa = pipelines::fxaa_pass(device, surface_format);
         let splat_composite_pipeline = SplatCompositePipeline::new(device, surface_format);
         let picker = Picker::new(device);
-        let gbuffer = GBuffer::new(device, 1, 1);
+        let gbuffer = GBuffer::new(device, 1, 1, surface_format);
         let gbuffer_bindings = Self::bind_gbuffer(
             device,
             &gbuffer,
             &ao,
             &resolve,
+            &fxaa,
             &picker,
             &splat_composite_pipeline,
         );
@@ -232,6 +237,7 @@ impl Renderer {
             mesh_pipeline: MeshPipeline::new(device),
             ao,
             resolve,
+            fxaa,
             grid_pipeline: GridPipeline::new(device, surface_format),
             gizmo_pipeline: GizmoPipeline::new(device, surface_format),
             line_pipeline: LinePipeline::new(device, surface_format),
@@ -258,6 +264,7 @@ impl Renderer {
         gbuffer: &GBuffer,
         ao: &FullscreenPass,
         resolve: &FullscreenPass,
+        fxaa: &FullscreenPass,
         picker: &Picker,
         splat_composite: &SplatCompositePipeline,
     ) -> GBufferBindings {
@@ -272,6 +279,7 @@ impl Renderer {
                     &gbuffer.ao_view,
                 ],
             ),
+            fxaa: fxaa.bind(device, &[&gbuffer.lit_view]),
             pick: picker.bind(device, &gbuffer.surface_view),
             splat_composite: splat_composite.create_bind_group(device, &gbuffer.splat_view),
         }
@@ -328,6 +336,7 @@ impl Renderer {
             &self.gbuffer,
             &self.ao,
             &self.resolve,
+            &self.fxaa,
             &self.picker,
             &self.splat_composite_pipeline,
         );
@@ -670,12 +679,27 @@ impl Renderer {
                 wgpu::Color::WHITE,
             );
         }
-        self.resolve.run(
-            encoder,
-            &self.gbuffer_bindings.resolve,
-            target,
-            clear_color(settings.background_color),
-        );
+        let background = clear_color(settings.background_color);
+        if settings.antialiasing {
+            self.resolve.run(
+                encoder,
+                &self.gbuffer_bindings.resolve,
+                &self.gbuffer.lit_view,
+                background,
+            );
+            self.fxaa.write_uniforms(
+                queue,
+                &FxaaUniforms {
+                    texel: [1.0 / internal_size.0 as f32, 1.0 / internal_size.1 as f32],
+                    _pad0: [0.0; 2],
+                },
+            );
+            self.fxaa
+                .run(encoder, &self.gbuffer_bindings.fxaa, target, background);
+        } else {
+            self.resolve
+                .run(encoder, &self.gbuffer_bindings.resolve, target, background);
+        }
 
         // ---- The grid, then depth-tested lines and points, over the lit
         // scene.

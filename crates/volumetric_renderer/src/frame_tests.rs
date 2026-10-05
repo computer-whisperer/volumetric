@@ -500,6 +500,7 @@ fn automatic_grid_spacing_follows_the_zoom() {
         let mut spacing = |camera: &crate::Camera| {
             let settings = grid_settings(GridSpacing::Auto {
                 focus_depth: camera.distance,
+                min_cell_px: 8.0,
             });
             let view = camera.view(W as f32 / H as f32, None);
             let (_, info) = offscreen
@@ -585,6 +586,64 @@ fn the_gizmo_is_drawn_as_laid_out() {
     });
 }
 
+/// Anti-aliasing blends the pixels along a slanted silhouette between the
+/// surface and the background, and changes nothing away from an edge.
+#[test]
+fn antialiasing_smooths_silhouettes_only() {
+    on_each_backend(|offscreen| {
+        let mut renderer = offscreen.renderer(W, H);
+        let mesh = renderer.create_retained_mesh(
+            offscreen.device(),
+            &quad(
+                Vec3::ZERO,
+                Vec3::new(0.6, 0.15, 0.0),
+                Vec3::new(-0.1, 0.4, 0.0),
+                [1.0; 4],
+            ),
+        );
+        let mut frame = |antialiasing: bool| {
+            let mut settings = settings(false);
+            settings.antialiasing = antialiasing;
+            renderer.submit_retained_mesh(&mesh, Mat4::IDENTITY, ObjectId(1), MaterialId(0));
+            offscreen
+                .render_rgba(&mut renderer, &view(), &settings)
+                .unwrap()
+                .0
+        };
+        let stepped = frame(false);
+        let smooth = frame(true);
+
+        let surface = pixel(&stepped, W / 2, H / 2);
+        // Pixels that are neither the surface nor the background.
+        let blended = |rgba: &[u8]| {
+            (0..W * H)
+                .filter(|i| {
+                    let p = pixel(rgba, i % W, i / W);
+                    p != surface && p != [0, 0, 255]
+                })
+                .count()
+        };
+        assert_eq!(blended(&stepped), 0, "without it there are two colours");
+        let edge_pixels = blended(&smooth);
+        assert!(edge_pixels > 60, "{edge_pixels} blended pixels");
+        // Only near the silhouette: every blended pixel has both colours
+        // within two pixels of it in the stepped frame.
+        for i in 0..W * H {
+            let (x, y) = (i % W, i / W);
+            if pixel(&smooth, x, y) == pixel(&stepped, x, y) {
+                continue;
+            }
+            let mut seen = [false; 2];
+            for ny in y.saturating_sub(2)..(y + 3).min(H) {
+                for nx in x.saturating_sub(2)..(x + 3).min(W) {
+                    seen[(pixel(&stepped, nx, ny) == surface) as usize] = true;
+                }
+            }
+            assert_eq!(seen, [true; 2], "({x}, {y}) changed away from an edge");
+        }
+    });
+}
+
 /// Writes the placeholder test scene's frame as a binary PPM to the path
 /// in `VOLUMETRIC_FRAME_DUMP`, for looking at what the frame draws:
 /// `VOLUMETRIC_FRAME_DUMP=/tmp/frame.ppm cargo test -p volumetric_renderer dump_the_test_scene -- --ignored`.
@@ -594,7 +653,8 @@ fn dump_the_test_scene() {
     let Ok(path) = std::env::var("VOLUMETRIC_FRAME_DUMP") else {
         return;
     };
-    // `VOLUMETRIC_FRAME_GLES=1` dumps the WebGL2-like adapter's frame.
+    // `VOLUMETRIC_FRAME_GLES=1` dumps the WebGL2-like adapter's frame;
+    // `VOLUMETRIC_FRAME_STEPPED=1` turns anti-aliasing off.
     let offscreen = if std::env::var_os("VOLUMETRIC_FRAME_GLES").is_some() {
         Offscreen::new_webgl2_like()
     } else {
@@ -633,9 +693,13 @@ fn dump_the_test_scene() {
         }
     }
     let view = camera.view(w as f32 / h as f32, None);
-    let mut settings = RenderSettings::default();
+    let mut settings = RenderSettings {
+        antialiasing: std::env::var_os("VOLUMETRIC_FRAME_STEPPED").is_none(),
+        ..RenderSettings::default()
+    };
     settings.grid.spacing = GridSpacing::Auto {
         focus_depth: camera.distance,
+        min_cell_px: GridSpacing::MIN_CELL_PX,
     };
     settings.gizmo = Some(ViewGizmo {
         orientation: camera.orientation,
