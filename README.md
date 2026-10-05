@@ -594,6 +594,9 @@ volumetric_cli bounds -i model.wasm
 
 # Sample density at a specific point
 volumetric_cli sample -i model.wasm --point 0.5,0.5,0.5
+
+# Time raw sampling: samples per second on one thread and on all
+volumetric_cli sample-bench -i project.vproj --asset car
 ```
 
 ## Coordinate System and Units

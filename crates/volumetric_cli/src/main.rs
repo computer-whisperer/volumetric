@@ -63,6 +63,8 @@ enum Commands {
     Bounds(info::BoundsArgs),
     /// Sample occupancy values at specified points
     Sample(info::SampleArgs),
+    /// Time raw model sampling: samples per second on one thread and on all
+    SampleBench(info::SampleBenchArgs),
     /// List models and operators bundled into this binary
     Assets(assets::AssetsArgs),
     /// Create a new project, optionally seeded with a model
@@ -597,6 +599,7 @@ fn main() -> Result<()> {
         Commands::Info(args) => info::run_info(args),
         Commands::Bounds(args) => info::run_bounds(args),
         Commands::Sample(args) => info::run_sample(args),
+        Commands::SampleBench(args) => info::run_sample_bench(args),
         Commands::Assets(args) => assets::run_assets(args),
         Commands::ProjectNew(args) => project::run_project_new(args),
         Commands::ProjectAddModel(args) => project::run_project_add_model(args),

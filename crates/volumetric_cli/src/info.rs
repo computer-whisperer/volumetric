@@ -822,6 +822,190 @@ pub fn run_sample(args: SampleArgs) -> Result<()> {
     Ok(())
 }
 
+// === Sample Bench Subcommand ===
+
+#[derive(Parser, Debug)]
+pub struct SampleBenchArgs {
+    /// Input file: .wasm model or .vproj project
+    #[arg(short, long)]
+    pub input: PathBuf,
+
+    /// For .vproj inputs with multiple exports: which exported asset to use
+    #[arg(long)]
+    pub asset: Option<String>,
+
+    /// Seconds each of the four timed runs lasts
+    #[arg(long, default_value_t = 2.0)]
+    pub seconds: f64,
+
+    /// Threads for the parallel runs (default: all)
+    #[arg(long)]
+    pub threads: Option<usize>,
+}
+
+/// SplitMix64: a small deterministic generator, so runs are repeatable.
+struct SplitMix(u64);
+
+impl SplitMix {
+    fn unit(&mut self) -> f64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        ((z ^ (z >> 31)) >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
+type Point = [f64; 3];
+
+fn lerp(a: Point, b: Point, t: f64) -> Point {
+    [0, 1, 2].map(|i| a[i] + (b[i] - a[i]) * t)
+}
+
+/// Samples `threads` threads take in `seconds`, each drawing its points
+/// from `point`. Every thread takes one untimed sample first, which is
+/// where its wasm instance is created.
+fn timed_samples<S: volumetric::wasm::ParallelModelSampler>(
+    sampler: &S,
+    threads: usize,
+    seconds: f64,
+    point: &(dyn Fn(&mut SplitMix) -> Point + Sync),
+) -> (u64, u64) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let ready = std::sync::Barrier::new(threads);
+    let total = AtomicU64::new(0);
+    let inside = AtomicU64::new(0);
+    std::thread::scope(|scope| {
+        for thread in 0..threads {
+            let (ready, total, inside) = (&ready, &total, &inside);
+            scope.spawn(move || {
+                let mut rng = SplitMix(0xC0FFEE + thread as u64);
+                let [x, y, z] = point(&mut rng);
+                sampler.sample(x, y, z);
+                ready.wait();
+                let start = std::time::Instant::now();
+                let (mut count, mut hits) = (0u64, 0u64);
+                while start.elapsed().as_secs_f64() < seconds {
+                    for _ in 0..64 {
+                        let [x, y, z] = point(&mut rng);
+                        hits += volumetric_abi::is_occupied(sampler.sample(x, y, z)) as u64;
+                    }
+                    count += 64;
+                }
+                total.fetch_add(count, Ordering::Relaxed);
+                inside.fetch_add(hits, Ordering::Relaxed);
+            });
+        }
+    });
+    (total.into_inner(), inside.into_inner())
+}
+
+/// Times raw sampling of a model, the quantity a direct caster's speed is
+/// made of. Two point sets, because a model's cost can depend on where it
+/// is asked: uniform in the bounds, and within a thousandth of a random
+/// chord of the surface, where a caster or the mesher's refinement spends
+/// its samples.
+pub fn run_sample_bench(args: SampleBenchArgs) -> Result<()> {
+    use volumetric::wasm::ParallelModelSampler;
+
+    let wasm_bytes = crate::load_wasm_bytes(&args.input, args.asset.as_deref())?;
+    let sampler = volumetric::wasm::create_parallel_sampler(&wasm_bytes)
+        .map_err(|e| anyhow::anyhow!("Failed to instantiate model: {e}"))?;
+    let bounds = sampler
+        .get_bounds()
+        .map_err(|e| anyhow::anyhow!("Failed to read bounds: {e}"))?;
+    let (lo, hi) = (
+        [bounds.min.0, bounds.min.1, bounds.min.2],
+        [bounds.max.0, bounds.max.1, bounds.max.2],
+    );
+    let uniform = move |rng: &mut SplitMix| -> Point {
+        [0, 1, 2].map(|i| lo[i] + (hi[i] - lo[i]) * rng.unit())
+    };
+    let occupied = |p: Point| volumetric_abi::is_occupied(sampler.sample(p[0], p[1], p[2]));
+
+    // Brackets of the surface: chords between an inside and an outside
+    // point, bisected ten times. Looked for no longer than five seconds,
+    // since a sparse model may have very little inside.
+    const BRACKETS: usize = 4096;
+    let mut rng = SplitMix(1);
+    let mut brackets: Vec<(Point, Point)> = Vec::with_capacity(BRACKETS);
+    let (mut last_in, mut last_out) = (None, None);
+    let search = std::time::Instant::now();
+    while brackets.len() < BRACKETS && search.elapsed().as_secs_f64() < 5.0 {
+        let p = uniform(&mut rng);
+        if occupied(p) {
+            last_in = Some(p);
+        } else {
+            last_out = Some(p);
+        }
+        if let (Some(mut a), Some(mut b)) = (last_in, last_out) {
+            for _ in 0..10 {
+                let mid = lerp(a, b, 0.5);
+                if occupied(mid) {
+                    a = mid;
+                } else {
+                    b = mid;
+                }
+            }
+            brackets.push((a, b));
+            (last_in, last_out) = (None, None);
+        }
+    }
+    let near_surface = |rng: &mut SplitMix| -> Point {
+        let (a, b) = brackets[(rng.unit() * brackets.len() as f64) as usize];
+        lerp(a, b, rng.unit())
+    };
+
+    let threads = args
+        .threads
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+    println!(
+        "{:<14} {:>10} {:>14} {:>16} {:>8} {:>8}",
+        "points",
+        "ns/sample",
+        "1 thread /s",
+        format!("{threads} threads /s"),
+        "scaling",
+        "inside"
+    );
+    let report = |name: &str, point: &(dyn Fn(&mut SplitMix) -> Point + Sync)| {
+        let (one, one_inside) = timed_samples(&sampler, 1, args.seconds, point);
+        let (all, _) = timed_samples(&sampler, threads, args.seconds, point);
+        let one_rate = one as f64 / args.seconds;
+        let all_rate = all as f64 / args.seconds;
+        println!(
+            "{:<14} {:>10.0} {:>14.0} {:>16.0} {:>7.1}x {:>7.1}%",
+            name,
+            1e9 / one_rate,
+            one_rate,
+            all_rate,
+            all_rate / one_rate,
+            100.0 * one_inside as f64 / one as f64
+        );
+    };
+    report("uniform", &uniform);
+    if brackets.is_empty() {
+        println!("near surface: no inside point found in five seconds of uniform samples");
+    } else {
+        report("near surface", &near_surface);
+    }
+
+    if sampler.instantiation_failures() > 0 {
+        anyhow::bail!(
+            "{} thread(s) could not instantiate the model, so the rates above are wrong: {}",
+            sampler.instantiation_failures(),
+            sampler.instantiation_failure_detail().unwrap_or_default()
+        );
+    }
+    if sampler.sample_traps() > 0 {
+        println!(
+            "warning: {} samples trapped in the model",
+            sampler.sample_traps()
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
