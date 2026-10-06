@@ -6292,6 +6292,7 @@ dependencies = [
  "volumetric_assets",
  "volumetric_preview",
  "volumetric_renderer",
+ "wat",
 ]
 
 [[package]]

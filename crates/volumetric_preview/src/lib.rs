@@ -18,7 +18,8 @@
 use std::sync::Arc;
 
 use std::sync::atomic::AtomicBool;
-use volumetric::direct_cast::{CastProjection, CastView};
+pub use volumetric::direct_cast::Paint;
+use volumetric::direct_cast::{CastProjection, CastView, Surfel};
 
 use glam::{Mat4, Vec3};
 use volumetric::{AssetTypeHint, adaptive_surface_nets_2};
@@ -465,6 +466,75 @@ pub struct DirectModel {
     /// Linear RGBA for every disc: the part tint where meshes of this
     /// entity would carry one in their vertices, else white.
     pub color: [f32; 4],
+    /// What the cast keeps of the model's channels at each surfel, drawn
+    /// by [`surfel_vertices`].
+    pub paint: Paint,
+}
+
+/// The paint a cast keeps for a model with `format`, by the priority a
+/// mesh is coloured with: the chosen channel, else the model's declared
+/// surface colour trio, else none. `Err` names a channel the model does
+/// not declare.
+pub fn paint_for(
+    format: &volumetric::SampleFormat,
+    color_channel: Option<&str>,
+) -> Result<Paint, String> {
+    if let Some(channel) = color_channel {
+        return format
+            .channels
+            .iter()
+            .position(|c| c.name == channel)
+            .map(Paint::Channel)
+            .ok_or_else(|| format!("channel {channel:?} not declared"));
+    }
+    Ok(format.color_trio().map_or(Paint::None, Paint::Trio))
+}
+
+/// The vertices a host draws for the surfels of a record with `paint`:
+/// a channel colormapped (viridis) over the range these surfels hold,
+/// magenta where the sample was not finite; a colour trio as the model's
+/// sRGB, white where not finite; white without a paint. The colormap
+/// matches a mesh's (`colormap_scene_by_channel` in `scene.rs`) except
+/// that its range is what the cast has found so far.
+pub fn surfel_vertices(paint: Paint, surfels: &[Surfel]) -> Vec<renderer::SurfelVertex> {
+    let color_of: Box<dyn Fn(&Surfel) -> [f32; 4]> = match paint {
+        Paint::None => Box::new(|_| [1.0; 4]),
+        Paint::Channel(_) => {
+            let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+            for s in surfels {
+                let v = s.paint[0];
+                if v.is_finite() {
+                    lo = lo.min(v);
+                    hi = hi.max(v);
+                }
+            }
+            if lo > hi {
+                (lo, hi) = (0.0, 0.0);
+            }
+            let span = (hi - lo).max(f32::EPSILON);
+            Box::new(move |s| {
+                let v = s.paint[0];
+                if !v.is_finite() {
+                    return [1.0, 0.0, 1.0, 1.0];
+                }
+                let c = volumetric::viridis((v - lo) / span);
+                [c[0], c[1], c[2], 1.0]
+            })
+        }
+        Paint::Trio(_) => Box::new(|s| {
+            let mut rgba = [1.0f32; 4];
+            for (out, &v) in rgba.iter_mut().zip(&s.paint) {
+                if v.is_finite() {
+                    *out = srgb_to_linear(v.clamp(0.0, 1.0));
+                }
+            }
+            rgba
+        }),
+    };
+    surfels
+        .iter()
+        .map(|s| renderer::SurfelVertex::colored(s.position, s.normal, s.radius, color_of(s)))
+        .collect()
 }
 
 /// An assembly behind a preview entity.

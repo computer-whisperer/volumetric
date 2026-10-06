@@ -71,47 +71,8 @@ impl NativeModelExecutor {
             .map_err(|e| WasmBackendError::Execution(e.to_string()))?;
         validate_io_ptr(io_ptr, dimensions, memory.data_size(&store))?;
 
-        // Optional typed-channel exports; absent means occupancy-only.
-        let sample_format =
-            match instance.get_typed_func::<(), i64>(&mut store, "get_sample_format") {
-                Err(_) => SampleFormat::default(),
-                Ok(get_sample_format) => {
-                    let packed = get_sample_format
-                        .call(&mut store, ())
-                        .map_err(|e| WasmBackendError::Execution(e.to_string()))?;
-                    let (ptr, len) = volumetric_abi::unpack_ptr_len(packed);
-                    let mem_data = memory.data(&store);
-                    let end = ptr.checked_add(len).filter(|&end| end <= mem_data.len());
-                    let Some(end) = end else {
-                        return Err(WasmBackendError::Execution(format!(
-                            "get_sample_format returned out-of-bounds region ({ptr}+{len})"
-                        )));
-                    };
-                    volumetric_abi::decode_sample_format(&mem_data[ptr..end])
-                        .map_err(WasmBackendError::Execution)?
-                }
-            };
-
-        let sample_channels = instance
-            .get_typed_func::<(i32, i32), ()>(&mut store, "sample_channels")
-            .ok();
-        if sample_format.channels.len() > 1 {
-            if sample_channels.is_none() {
-                return Err(WasmBackendError::MissingExport(format!(
-                    "sample_channels (format declares {} channels)",
-                    sample_format.channels.len()
-                )));
-            }
-            // Channel output goes in the second half of the IO buffer (the
-            // first n f64s hold the position), so it must fit there.
-            if sample_format.channels.len() * 4 > dimensions as usize * 8 {
-                return Err(WasmBackendError::Execution(format!(
-                    "{} channels exceed the IO buffer's output capacity ({} f32s)",
-                    sample_format.channels.len(),
-                    dimensions * 2
-                )));
-            }
-        }
+        let (sample_format, sample_channels) =
+            load_sample_format(&mut store, &instance, &memory, dimensions)?;
 
         Ok(Self {
             store,
@@ -243,6 +204,58 @@ impl NativeModelExecutor {
             })
             .collect()
     }
+}
+
+/// The optional typed-channel exports (see the `volumetric_abi` docs):
+/// the declared format, occupancy-only when `get_sample_format` is
+/// absent, and `sample_channels`, which a format of more than one channel
+/// must export and must have room for in the IO buffer's second half.
+pub(super) fn load_sample_format(
+    store: &mut Store<()>,
+    instance: &Instance,
+    memory: &Memory,
+    dimensions: u32,
+) -> Result<(SampleFormat, Option<TypedFunc<(i32, i32), ()>>), WasmBackendError> {
+    let sample_format = match instance.get_typed_func::<(), i64>(&mut *store, "get_sample_format") {
+        Err(_) => SampleFormat::default(),
+        Ok(get_sample_format) => {
+            let packed = get_sample_format
+                .call(&mut *store, ())
+                .map_err(|e| WasmBackendError::Execution(e.to_string()))?;
+            let (ptr, len) = volumetric_abi::unpack_ptr_len(packed);
+            let mem_data = memory.data(&*store);
+            let end = ptr.checked_add(len).filter(|&end| end <= mem_data.len());
+            let Some(end) = end else {
+                return Err(WasmBackendError::Execution(format!(
+                    "get_sample_format returned out-of-bounds region ({ptr}+{len})"
+                )));
+            };
+            volumetric_abi::decode_sample_format(&mem_data[ptr..end])
+                .map_err(WasmBackendError::Execution)?
+        }
+    };
+
+    let sample_channels = instance
+        .get_typed_func::<(i32, i32), ()>(&mut *store, "sample_channels")
+        .ok();
+    if sample_format.channels.len() > 1 {
+        if sample_channels.is_none() {
+            return Err(WasmBackendError::MissingExport(format!(
+                "sample_channels (format declares {} channels)",
+                sample_format.channels.len()
+            )));
+        }
+        // Channel output goes in the second half of the IO buffer (the
+        // first n f64s hold the position), so it must fit there.
+        if sample_format.channels.len() * 4 > dimensions as usize * 8 {
+            return Err(WasmBackendError::Execution(format!(
+                "{} channels exceed the IO buffer's output capacity ({} f32s)",
+                sample_format.channels.len(),
+                dimensions * 2
+            )));
+        }
+    }
+    Ok((sample_format, sample_channels))
 }
 
 /// Sanity-check the pointer a model returned from `get_io_ptr`.

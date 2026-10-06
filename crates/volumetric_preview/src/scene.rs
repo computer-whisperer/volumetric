@@ -10,7 +10,7 @@ use volumetric_renderer as renderer;
 
 use crate::gizmo::pad3;
 use crate::{
-    DirectModel, ExecutionBackend, LocalBackend, OutputStats, PreviewBounds, PreviewEntity,
+    DirectModel, ExecutionBackend, LocalBackend, OutputStats, Paint, PreviewBounds, PreviewEntity,
     PreviewMeshPlan, PreviewPlan, PreviewRequest,
 };
 
@@ -226,21 +226,7 @@ pub fn preview_prelude(
             stats
                 .detail
                 .push("Cast directly in the viewport (no mesh)".to_string());
-            // An uncolored model with part tinting on is tinted as its
-            // mesh would be (see `finish_preview_scene`); the model's own
-            // colour channels are not sampled by the cast.
-            let color = match &request.plan {
-                PreviewPlan::Model3d {
-                    tint_uncolored: true,
-                    ..
-                } => {
-                    stats
-                        .detail
-                        .push(format!("Color: part tint ({})", request.asset_id));
-                    part_tint(&request.asset_id)
-                }
-                _ => [1.0; 4],
-            };
+            let (paint, color) = direct_paint(request, color_channel, &mut stats);
             let mut scene = renderer::SceneData::new();
             scene.add_mesh(
                 renderer::MeshData {
@@ -250,19 +236,13 @@ pub fn preview_prelude(
                 glam::Mat4::IDENTITY,
                 renderer::MaterialId(0),
             );
-            let mut entity = finish_preview_scene(
-                request,
-                scene,
-                None,
-                (bounds_min, bounds_max),
-                color_channel.map(str::to_string),
-                stats,
-                build_start,
-            );
+            let mut entity =
+                assemble_entity(scene, None, (bounds_min, bounds_max), stats, build_start);
             entity.mesh_keys = vec![Some(request.source_hash)];
             entity.direct_models = vec![Some(DirectModel {
                 model: Arc::clone(&request.data),
                 color,
+                paint,
             })];
             return Ok(Some(PreviewStage::Done(Box::new(entity))));
         }
@@ -406,11 +386,27 @@ fn finish_preview_scene(
     mut stats: OutputStats,
     build_start: web_time::Instant,
 ) -> PreviewEntity {
-    // Channel discovery + colormap: mirror the declared channels into the
-    // stats (feeds the "Color by" picker and the slice lightbox), and when
-    // a channel is selected, colormap the built points/vertices by sampling
-    // it. The module is already in the executor cache from the meshing pass,
-    // so this executor is cheap to create.
+    color_preview_scene(request, &mut scene, color_channel, &mut stats);
+    assemble_entity(
+        scene,
+        wireframe_lines,
+        (bounds_min, bounds_max),
+        stats,
+        build_start,
+    )
+}
+
+/// Channel discovery + colormap: mirror the declared channels into the
+/// stats (feeds the "Color by" picker and the slice lightbox), and when
+/// a channel is selected, colormap the built points/vertices by sampling
+/// it. The module is already in the executor cache from the meshing pass,
+/// so this executor is cheap to create.
+fn color_preview_scene(
+    request: &PreviewRequest,
+    scene: &mut renderer::SceneData,
+    color_channel: Option<String>,
+    stats: &mut OutputStats,
+) {
     match volumetric::wasm::create_model_executor(request.data.as_slice()) {
         Ok(mut executor) => {
             stats.model_channels = executor
@@ -418,7 +414,7 @@ fn finish_preview_scene(
                 .map(|format| format.channels.iter().map(|c| c.name.clone()).collect())
                 .unwrap_or_default();
             if let Some(channel) = &color_channel {
-                match colormap_scene_by_channel(&mut scene, &mut executor, channel) {
+                match colormap_scene_by_channel(scene, &mut executor, channel) {
                     Ok((value_min, value_max)) => stats.detail.push(format!(
                         "Color: {channel} in [{value_min:.4}, {value_max:.4}]"
                     )),
@@ -431,7 +427,7 @@ fn finish_preview_scene(
             {
                 // No scalar channel picked, but the model carries true
                 // surface colors (e.g. a styled STEP import): render them.
-                match truecolor_scene_by_trio(&mut scene, &mut executor, trio) {
+                match truecolor_scene_by_trio(scene, &mut executor, trio) {
                     Ok(()) => stats.detail.push("Color: model surface colors".to_string()),
                     Err(err) => stats.detail.push(format!("Color: {err}")),
                 }
@@ -446,7 +442,7 @@ fn finish_preview_scene(
                 // by the output id keeps flush-fitting parts apart when
                 // several are pinned into one viewport.
                 let tint = part_tint(&request.asset_id);
-                tint_scene(&mut scene, tint);
+                tint_scene(scene, tint);
                 stats
                     .detail
                     .push(format!("Color: part tint ({})", request.asset_id));
@@ -458,7 +454,67 @@ fn finish_preview_scene(
             }
         }
     }
+}
 
+/// How a model cast directly is coloured, by the same priority as
+/// [`color_preview_scene`]: the chosen channel (colormapped by the host
+/// over the range the cast finds), else the model's own surface colours,
+/// else the part tint when asked for, else nothing.
+fn direct_paint(
+    request: &PreviewRequest,
+    color_channel: Option<&str>,
+    stats: &mut OutputStats,
+) -> (Paint, [f32; 4]) {
+    let tinted = |stats: &mut OutputStats| match &request.plan {
+        PreviewPlan::Model3d {
+            tint_uncolored: true,
+            ..
+        } => {
+            stats
+                .detail
+                .push(format!("Color: part tint ({})", request.asset_id));
+            part_tint(&request.asset_id)
+        }
+        _ => [1.0; 4],
+    };
+    let mut executor = match volumetric::wasm::create_model_executor(request.data.as_slice()) {
+        Ok(executor) => executor,
+        Err(err) => {
+            if color_channel.is_some() {
+                stats.detail.push(format!("Color: {err}"));
+            }
+            return (Paint::None, tinted(stats));
+        }
+    };
+    let format = executor.sample_format().unwrap_or_default();
+    stats.model_channels = format.channels.iter().map(|c| c.name.clone()).collect();
+    match crate::paint_for(&format, color_channel) {
+        Ok(Paint::Channel(index)) => {
+            stats.detail.push(format!(
+                "Color: {} over the range the cast finds",
+                format.channels[index].name
+            ));
+            (Paint::Channel(index), [1.0; 4])
+        }
+        Ok(Paint::Trio(trio)) => {
+            stats.detail.push("Color: model surface colors".to_string());
+            (Paint::Trio(trio), [1.0; 4])
+        }
+        Ok(Paint::None) => (Paint::None, tinted(stats)),
+        Err(err) => {
+            stats.detail.push(format!("Color: {err}"));
+            (Paint::None, tinted(stats))
+        }
+    }
+}
+
+fn assemble_entity(
+    scene: renderer::SceneData,
+    wireframe_lines: Option<renderer::LineData>,
+    (bounds_min, bounds_max): ((f32, f32, f32), (f32, f32, f32)),
+    mut stats: OutputStats,
+    build_start: web_time::Instant,
+) -> PreviewEntity {
     stats.mesh_ms = build_start.elapsed().as_secs_f64() * 1000.0;
     PreviewEntity {
         scene,

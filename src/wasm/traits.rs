@@ -202,6 +202,23 @@ pub trait ParallelModelSampler: Send + Sync {
     fn sample_traps(&self) -> u64 {
         0
     }
+
+    /// The model's declared per-sample format; occupancy-only for a model
+    /// without one, and for backends that cannot read it.
+    fn sample_format(&self) -> &volumetric_abi::SampleFormat {
+        static OCCUPANCY_ONLY: std::sync::OnceLock<volumetric_abi::SampleFormat> =
+            std::sync::OnceLock::new();
+        OCCUPANCY_ONLY.get_or_init(volumetric_abi::SampleFormat::default)
+    }
+
+    /// Every declared channel at a point, in [`Self::sample_format`] order
+    /// (channel 0 is occupancy), into `out`, whose length must be the
+    /// channel count. `false`, with `out` untouched, when the model or
+    /// the backend has no channel sampling, or the call failed (counted
+    /// in [`Self::sample_traps`]).
+    fn sample_channels(&self, _x: f64, _y: f64, _z: f64, _out: &mut [f32]) -> bool {
+        false
+    }
 }
 
 /// I/O state for operator execution.

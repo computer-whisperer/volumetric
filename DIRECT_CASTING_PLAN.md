@@ -222,11 +222,24 @@ meshes. This is the image source of `RENDERING_ARCHITECTURE.md` §9,
 realised as geometry rather than as a depth image, which is what lets it
 survive camera motion. A disc is a quad per surfel in its tangent plane,
 cut round in the fragment shader, back faces culled; its depth is the
-plane's, so the discs of one surface meet without gaps. Every disc of a
-draw has the one colour the draw gives it: the part tint the host would
-have put in the vertices of a mesh (`DirectModel::color`, 2026-10-06), so
-flush-fitting parts in Direct mode stay told apart as in the other modes.
-The model's own colour channels are not sampled by the cast (open).
+plane's, so the discs of one surface meet without gaps. A disc's colour
+is its surfel's times its draw's: the draw carries the part tint the host
+would have put in the vertices of a mesh (`DirectModel::color`,
+2026-10-06), so flush-fitting parts in Direct mode stay told apart as in
+the other modes; the surfel carries what the record's **paint** keeps of
+the model's channels (`Paint::Channel` for a chosen channel,
+`Paint::Trio` for a model's declared sRGB surface colours), sampled once
+at each surface point found, one model call per surfel. The host maps it
+to colour when it uploads: a channel through viridis over the range the
+surfels drawn hold, which grows as the cast fills in (a mesh's range is
+its vertices'); a trio as sRGB to linear. Changing the paint re-samples
+every surfel in the record (`DirectCast::repaint`, in parallel) rather
+than casting again. The headless render paints by its `--color-channel`
+or the trio; the viewport by the entity's "Color by" choice, with the
+same priority as a mesh: channel, else trio, else tint. Rejected: storing
+colours in the record (a channel's colormap range is not known until the
+cast is done, and a recolour would need the values); sampling at draw
+time (a model call per surfel per frame).
 
 `DirectCast::surfels(view)` chooses the surfels for a view, walking the
 tree with the pitch the view wants at each node's nearest point: a node

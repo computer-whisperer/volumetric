@@ -163,6 +163,11 @@ impl SurfelPipeline {
                             offset: std::mem::offset_of!(SurfelVertex, normal) as u64,
                             shader_location: 2,
                         },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: std::mem::offset_of!(SurfelVertex, color) as u64,
+                            shader_location: 3,
+                        },
                     ],
                 })],
                 compilation_options: Default::default(),

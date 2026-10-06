@@ -7,6 +7,7 @@ use crate::wasm::error::WasmBackendError;
 use crate::wasm::native::module_cache::model_cache;
 use crate::wasm::traits::{ModelBounds, ModelBoundsNd, ParallelModelSampler};
 use std::sync::atomic::{AtomicU64, Ordering};
+use volumetric_abi::SampleFormat;
 use wasmtime::{Engine, Instance, Memory, Module, Store, TypedFunc};
 
 /// Global counter for assigning unique IDs to samplers.
@@ -19,6 +20,8 @@ struct ThreadLocalContext {
     dimensions: u32,
     io_ptr: i32,
     sample: TypedFunc<i32, f32>,
+    /// The typed-channel export, when the model declares channels.
+    sample_channels: Option<TypedFunc<(i32, i32), ()>>,
 }
 
 impl ThreadLocalContext {
@@ -41,6 +44,8 @@ impl ThreadLocalContext {
             .call(&mut store, ())
             .map_err(|e| WasmBackendError::Execution(e.to_string()))?;
         super::model_executor::validate_io_ptr(io_ptr, dimensions, memory.data_size(&store))?;
+        let (_, sample_channels) =
+            super::model_executor::load_sample_format(&mut store, &instance, &memory, dimensions)?;
 
         Ok(Self {
             store,
@@ -48,27 +53,52 @@ impl ThreadLocalContext {
             dimensions,
             io_ptr,
             sample,
+            sample_channels,
         })
     }
 
-    fn sample(&mut self, x: f64, y: f64, z: f64) -> Result<f32, wasmtime::Error> {
-        // Write position into the model's IO buffer (pad extra dims with zeros)
-        {
-            let mem_data = self.memory.data_mut(&mut self.store);
-            let offset = self.io_ptr as usize;
-
-            // Write x, y, z
-            mem_data[offset..offset + 8].copy_from_slice(&x.to_le_bytes());
-            mem_data[offset + 8..offset + 16].copy_from_slice(&y.to_le_bytes());
-            mem_data[offset + 16..offset + 24].copy_from_slice(&z.to_le_bytes());
-
-            // Zero out extra dimensions if needed
-            for i in 3..self.dimensions as usize {
-                let start = offset + i * 8;
-                mem_data[start..start + 8].copy_from_slice(&0.0f64.to_le_bytes());
-            }
+    fn write_position(&mut self, x: f64, y: f64, z: f64) {
+        let mem_data = self.memory.data_mut(&mut self.store);
+        let offset = self.io_ptr as usize;
+        mem_data[offset..offset + 8].copy_from_slice(&x.to_le_bytes());
+        mem_data[offset + 8..offset + 16].copy_from_slice(&y.to_le_bytes());
+        mem_data[offset + 16..offset + 24].copy_from_slice(&z.to_le_bytes());
+        // Zero out extra dimensions if needed
+        for i in 3..self.dimensions as usize {
+            let start = offset + i * 8;
+            mem_data[start..start + 8].copy_from_slice(&0.0f64.to_le_bytes());
         }
+    }
 
+    /// Every declared channel at a point, in format order, into `out`
+    /// (whose length is the channel count). `Ok(false)` when the model
+    /// has no `sample_channels` export.
+    fn sample_channels(
+        &mut self,
+        x: f64,
+        y: f64,
+        z: f64,
+        out: &mut [f32],
+    ) -> Result<bool, wasmtime::Error> {
+        let Some(sample_channels) = self.sample_channels.clone() else {
+            return Ok(false);
+        };
+        self.write_position(x, y, z);
+        // Channel output in the second half of the IO buffer (capacity
+        // checked at load).
+        let out_ptr = self.io_ptr + (self.dimensions as usize * 8) as i32;
+        sample_channels.call(&mut self.store, (self.io_ptr, out_ptr))?;
+        let mem_data = self.memory.data(&self.store);
+        let offset = out_ptr as usize;
+        for (i, value) in out.iter_mut().enumerate() {
+            let start = offset + i * 4;
+            *value = f32::from_le_bytes(mem_data[start..start + 4].try_into().unwrap());
+        }
+        Ok(true)
+    }
+
+    fn sample(&mut self, x: f64, y: f64, z: f64) -> Result<f32, wasmtime::Error> {
+        self.write_position(x, y, z);
         // Call sample. Traps unwind only this activation; the store stays
         // usable for subsequent calls.
         self.sample.call(&mut self.store, self.io_ptr)
@@ -90,6 +120,8 @@ pub struct NativeParallelSampler {
     module: Module,
     dimensions: u32,
     bounds: ModelBoundsNd,
+    /// The model's declared per-sample format.
+    sample_format: SampleFormat,
     /// Threads whose sampling instance failed to instantiate (each such
     /// thread's samples all read as "outside" — see the trait docs; bulk
     /// consumers must reject their output when this is nonzero).
@@ -107,8 +139,10 @@ impl NativeParallelSampler {
         let engine = cache.engine().clone();
         let module = cache.get_or_compile(wasm_bytes)?;
 
-        // Get dimensions and bounds from a temporary instance
-        let (dimensions, bounds) = Self::fetch_dimensions_and_bounds(&engine, &module)?;
+        // Get dimensions, bounds and the sample format from a temporary
+        // instance
+        let (dimensions, bounds, sample_format) =
+            Self::fetch_dimensions_and_bounds(&engine, &module)?;
 
         // The (x, y, z) sampler interface is inherently 3D; feeding it a 2D
         // sketch would silently ignore z. Sketches get meshed only after an
@@ -128,6 +162,7 @@ impl NativeParallelSampler {
             module,
             dimensions,
             bounds,
+            sample_format,
             init_failures: AtomicU64::new(0),
             init_failure_detail: std::sync::Mutex::new(None),
             traps: AtomicU64::new(0),
@@ -137,7 +172,7 @@ impl NativeParallelSampler {
     fn fetch_dimensions_and_bounds(
         engine: &Engine,
         module: &Module,
-    ) -> Result<(u32, ModelBoundsNd), WasmBackendError> {
+    ) -> Result<(u32, ModelBoundsNd, SampleFormat), WasmBackendError> {
         let mut store = Store::new(engine, ());
         let instance = Instance::new(&mut store, module, &[])
             .map_err(|e| WasmBackendError::Instantiation(e.to_string()))?;
@@ -195,7 +230,9 @@ impl NativeParallelSampler {
             bounds_vec[i] = f64::from_le_bytes(bytes);
         }
 
-        Ok((dimensions, ModelBoundsNd::new(bounds_vec)))
+        let (sample_format, _) =
+            super::model_executor::load_sample_format(&mut store, &instance, &memory, dimensions)?;
+        Ok((dimensions, ModelBoundsNd::new(bounds_vec), sample_format))
     }
 
     /// Get the number of dimensions.
@@ -209,8 +246,14 @@ impl NativeParallelSampler {
     }
 }
 
-impl ParallelModelSampler for NativeParallelSampler {
-    fn sample(&self, x: f64, y: f64, z: f64) -> f32 {
+impl NativeParallelSampler {
+    /// Runs `call` on this thread's instance of the model, or returns
+    /// `fallback` when the thread has none or the call trapped.
+    fn with_context<T>(
+        &self,
+        call: impl FnOnce(&mut ThreadLocalContext) -> Result<T, wasmtime::Error>,
+        fallback: T,
+    ) -> T {
         // Thread-local storage for the WASM context.
         // Stores (sampler_id, Option<context>) so we can detect when to
         // reinitialize; `None` context records a failed instantiation so a
@@ -247,20 +290,37 @@ impl ParallelModelSampler for NativeParallelSampler {
             }
 
             match opt.as_mut() {
-                Some((_, Some(ctx))) => match ctx.sample(x, y, z) {
+                Some((_, Some(ctx))) => match call(ctx) {
                     Ok(value) => value,
                     Err(_) => {
                         self.traps.fetch_add(1, Ordering::Relaxed);
-                        0.0
+                        fallback
                     }
                 },
                 // Instantiation failed on this thread (recorded above):
                 // there is no instance to consult, so the value is
                 // fabricated. Bulk callers reject the run via
                 // `instantiation_failures`.
-                _ => 0.0,
+                _ => fallback,
             }
         })
+    }
+}
+
+impl ParallelModelSampler for NativeParallelSampler {
+    fn sample(&self, x: f64, y: f64, z: f64) -> f32 {
+        self.with_context(|ctx| ctx.sample(x, y, z), 0.0)
+    }
+
+    fn sample_format(&self) -> &SampleFormat {
+        &self.sample_format
+    }
+
+    fn sample_channels(&self, x: f64, y: f64, z: f64, out: &mut [f32]) -> bool {
+        if out.len() != self.sample_format.channels.len() {
+            return false;
+        }
+        self.with_context(|ctx| ctx.sample_channels(x, y, z, out), false)
     }
 
     fn get_bounds(&self) -> Result<ModelBounds, WasmBackendError> {

@@ -218,6 +218,25 @@ pub struct Surfel {
     /// is drawn, but never stands in for a pixel, and is replaced by the
     /// first surfel found at its spot with a normal.
     pub guessed: bool,
+    /// What the record's [`Paint`] keeps of the model's channels at the
+    /// point: one channel's value in `[0]`, or r, g, b; NaN where there is
+    /// none (no paint, or the model gave no channels).
+    pub paint: [f32; 3],
+}
+
+/// What a record keeps of the model's channels besides occupancy, sampled
+/// once at each surface point found. The colour itself is the host's to
+/// make of it: a channel is colormapped over the range the record holds,
+/// which grows as the cast fills in.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Paint {
+    /// Nothing: every disc is drawn alike.
+    #[default]
+    None,
+    /// One channel's value, by index into the model's sample format.
+    Channel(usize),
+    /// The model's sRGB surface colour, by channel index, r, g, b.
+    Trio([usize; 3]),
 }
 
 /// What a pass steps through. Every mode steps nodes known to hold
@@ -412,6 +431,7 @@ struct Fresh {
     position: DVec3,
     normal: Vec3,
     guessed: bool,
+    paint: [f32; 3],
     pitch: f64,
     /// Distance along its ray.
     t: f64,
@@ -426,6 +446,9 @@ pub struct DirectCast {
     half: f64,
     nodes: Vec<Node>,
     passes: u32,
+    /// What each surfel keeps of the model's channels. Set before the
+    /// first pass; surfels found before a change keep what they had.
+    pub paint: Paint,
     pub total: PassStats,
     /// Every pass run, in order, with what it cost.
     pub history: Vec<(PassMode, f64, PassStats)>,
@@ -445,6 +468,7 @@ impl DirectCast {
             half: (bounds_max - bounds_min).max_element() * 0.5 * 1.001,
             nodes: vec![Node::new(f32::INFINITY)],
             passes: 0,
+            paint: Paint::None,
             total: PassStats::default(),
             history: Vec::new(),
         };
@@ -875,10 +899,11 @@ impl DirectCast {
             let fresh = self
                 .surfel_near(position, pitch, ray.dir)
                 .is_none()
-                .then_some(Fresh {
+                .then(|| Fresh {
                     position,
                     normal,
                     guessed: false,
+                    paint: self.paint_at(sampler, position, samples),
                     pitch,
                     t: enter,
                 });
@@ -1020,12 +1045,62 @@ impl DirectCast {
                     position,
                     normal,
                     guessed,
+                    paint: self.paint_at(sampler, position, samples),
                     pitch,
                     t: t_hit,
                 }),
             ));
         }
         None
+    }
+
+    /// Changes the record's [`Paint`], sampling the model again at every
+    /// surfel it holds (one call each). Nothing happens when the paint is
+    /// already this one.
+    pub fn repaint(&mut self, sampler: &(impl ParallelModelSampler + ?Sized), paint: Paint) {
+        if self.paint == paint {
+            return;
+        }
+        self.paint = paint;
+        let this = &*self;
+        let painted = crate::parallel_iter::map_range(0..self.nodes.len(), |index| {
+            let mut samples = 0;
+            this.nodes[index]
+                .surfels
+                .iter()
+                .map(|s| this.paint_at(sampler, Vec3::from(s.position).as_dvec3(), &mut samples))
+                .collect::<Vec<_>>()
+        });
+        for (node, paints) in self.nodes.iter_mut().zip(painted) {
+            for (surfel, paint) in node.surfels.iter_mut().zip(paints) {
+                surfel.paint = paint;
+            }
+        }
+    }
+
+    /// The record's [`Paint`] at a surface point: the model's channels
+    /// sampled there.
+    fn paint_at(
+        &self,
+        sampler: &(impl ParallelModelSampler + ?Sized),
+        position: DVec3,
+        samples: &mut u64,
+    ) -> [f32; 3] {
+        let indices: &[usize] = match &self.paint {
+            Paint::None => return [f32::NAN; 3],
+            Paint::Channel(index) => std::slice::from_ref(index),
+            Paint::Trio(indices) => indices,
+        };
+        *samples += 1;
+        let mut row = vec![0.0f32; sampler.sample_format().channels.len()];
+        if !sampler.sample_channels(position.x, position.y, position.z, &mut row) {
+            return [f32::NAN; 3];
+        }
+        let mut paint = [f32::NAN; 3];
+        for (out, index) in paint.iter_mut().zip(indices) {
+            *out = row.get(*index).copied().unwrap_or(f32::NAN);
+        }
+        paint
     }
 
     /// The normal at a surface point `t_hit` along `ray`: that of the
@@ -1377,6 +1452,7 @@ impl DirectCast {
             normal: found.normal.into(),
             radius: (RADIUS_PER_PITCH * found.pitch) as f32,
             guessed: found.guessed,
+            paint: found.paint,
         });
 
         // Surface found here may continue into the nodes around, whatever
@@ -1726,6 +1802,54 @@ mod tests {
 
     static NEVER: AtomicBool = AtomicBool::new(false);
 
+    /// A sphere whose channels, after occupancy, are its surface colour:
+    /// the point's position mapped to [0, 1].
+    struct PaintedSphere {
+        format: volumetric_abi::SampleFormat,
+    }
+
+    impl PaintedSphere {
+        fn new() -> Self {
+            use volumetric_abi::{ChannelKind, SampleChannel, SampleFormat};
+            let mut format = SampleFormat::default();
+            for name in volumetric_abi::COLOR_CHANNEL_NAMES {
+                format.channels.push(SampleChannel {
+                    name: name.to_string(),
+                    kind: ChannelKind::Custom(volumetric_abi::COLOR_SRGB_CHANNEL_KIND.to_string()),
+                });
+            }
+            Self { format }
+        }
+
+        fn colour(p: DVec3) -> [f32; 3] {
+            [
+                (p.x as f32 + 1.0) * 0.5,
+                (p.y as f32 + 1.0) * 0.5,
+                (p.z as f32 + 1.0) * 0.5,
+            ]
+        }
+    }
+
+    impl ParallelModelSampler for PaintedSphere {
+        fn sample(&self, x: f64, y: f64, z: f64) -> f32 {
+            (DVec3::new(x, y, z).length() <= 0.8) as u8 as f32
+        }
+
+        fn get_bounds(&self) -> Result<ModelBounds, WasmBackendError> {
+            Ok(ModelBounds::new((-1.0, -1.0, -1.0), (1.0, 1.0, 1.0)))
+        }
+
+        fn sample_format(&self) -> &volumetric_abi::SampleFormat {
+            &self.format
+        }
+
+        fn sample_channels(&self, x: f64, y: f64, z: f64, out: &mut [f32]) -> bool {
+            out[0] = self.sample(x, y, z);
+            out[1..4].copy_from_slice(&Self::colour(DVec3::new(x, y, z)));
+            true
+        }
+    }
+
     fn sphere() -> Analytic<impl Fn(DVec3) -> bool + Send + Sync> {
         Analytic {
             extent: 1.0,
@@ -1891,7 +2015,13 @@ mod tests {
             let (image, stats) = cast
                 .cast(&model, &view, &CastOptions::default(), &NEVER)
                 .unwrap();
-            (image, stats.samples, cast.surfels(None))
+            // Paint is NaN without a paint, so surfels compare by bits.
+            let surfels: Vec<String> = cast
+                .surfels(None)
+                .iter()
+                .map(|s| format!("{s:?}"))
+                .collect();
+            (image, stats.samples, surfels)
         };
         let (a, b) = (run(), run());
         assert!(a == b);
@@ -2305,6 +2435,58 @@ mod tests {
         }
         println!("{wrong} of {facing} surfels facing the second view have a wrong normal");
         assert!(wrong * 500 < facing, "{wrong} of {facing}");
+    }
+
+    /// A record with a paint keeps the model's channels at every surfel:
+    /// the colour trio where the model declares one, one channel's value
+    /// otherwise, and nothing without a paint.
+    #[test]
+    fn surfels_keep_the_models_channels() {
+        let model = PaintedSphere::new();
+        let trio = model.format.color_trio().expect("a colour trio");
+        let [view, _] = views(96);
+        let mut cast = DirectCast::for_model(&model).unwrap();
+        cast.paint = Paint::Trio(trio);
+        cast.cast(&model, &view, &CastOptions::default(), &NEVER)
+            .unwrap();
+        let surfels = cast.surfels(None);
+        assert!(surfels.len() > 1000);
+        for s in &surfels {
+            let expected = PaintedSphere::colour(Vec3::from(s.position).as_dvec3());
+            for c in 0..3 {
+                assert!(
+                    (s.paint[c] - expected[c]).abs() < 1e-6,
+                    "{:?} vs {expected:?}",
+                    s.paint
+                );
+            }
+        }
+
+        let mut cast = DirectCast::for_model(&model).unwrap();
+        cast.paint = Paint::Channel(trio[2]);
+        cast.cast(&model, &view, &CastOptions::default(), &NEVER)
+            .unwrap();
+        for s in cast.surfels(None) {
+            let expected = PaintedSphere::colour(Vec3::from(s.position).as_dvec3());
+            assert!((s.paint[0] - expected[2]).abs() < 1e-6);
+            assert!(s.paint[1].is_nan() && s.paint[2].is_nan());
+        }
+
+        let mut cast = DirectCast::for_model(&model).unwrap();
+        cast.cast(&model, &view, &CastOptions::default(), &NEVER)
+            .unwrap();
+        assert!(
+            cast.surfels(None)
+                .iter()
+                .all(|s| s.paint.iter().all(|v| v.is_nan()))
+        );
+
+        // Repainting fills in what the surfels already found hold.
+        cast.repaint(&model, Paint::Trio(trio));
+        for s in cast.surfels(None) {
+            let expected = PaintedSphere::colour(Vec3::from(s.position).as_dvec3());
+            assert!((s.paint[1] - expected[1]).abs() < 1e-6);
+        }
     }
 
     /// A normal found beside an edge is a normal of the model there, not

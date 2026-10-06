@@ -42,15 +42,24 @@ pub struct SurfelVertex {
     /// Unit, pointing out of the model.
     pub normal: [f32; 3],
     pub _pad: f32,
+    /// Linear RGBA multiplied into the draw's colour and the material
+    /// base colour, as a mesh vertex's is; white for the plain look.
+    pub color: [f32; 4],
 }
 
 impl SurfelVertex {
+    /// A white surfel.
     pub fn new(position: [f32; 3], normal: [f32; 3], radius: f32) -> Self {
+        Self::colored(position, normal, radius, [1.0; 4])
+    }
+
+    pub fn colored(position: [f32; 3], normal: [f32; 3], radius: f32, color: [f32; 4]) -> Self {
         Self {
             position,
             radius,
             normal,
             _pad: 0.0,
+            color,
         }
     }
 }

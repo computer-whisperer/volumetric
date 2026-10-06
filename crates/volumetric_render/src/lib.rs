@@ -27,12 +27,12 @@ use volumetric::{AssetTypeHint, LoadedAsset};
 use volumetric_preview::{
     Asn2Settings, MarkLabel, OutputStats, PreviewBounds, PreviewEntity, PreviewMeshPlan,
     PreviewPlan, PreviewRenderMode, PreviewRequest, ViewFrame, build_preview_scene, cast_view_of,
-    clip_planes_for, mark_labels, observation_lines, srgb_to_linear, submit_subspace_gizmo,
-    submit_view_highlight, wireframe_style,
+    clip_planes_for, mark_labels, observation_lines, paint_for, srgb_to_linear,
+    submit_subspace_gizmo, submit_view_highlight, surfel_vertices, wireframe_style,
 };
 use volumetric_renderer::{
     AoSettings, Camera, CameraView, GridPlane, GridSpacing, LineData, MaterialId, ObjectId,
-    RenderSettings, SceneData, StandardView, SurfelData, SurfelVertex, Warp, offscreen::Offscreen,
+    RenderSettings, SceneData, StandardView, SurfelData, Warp, offscreen::Offscreen,
     offscreen::downsample_rgba,
 };
 
@@ -644,10 +644,12 @@ struct DirectSource {
 }
 
 impl DirectSource {
-    fn new(asset: &LoadedAsset) -> Result<Self> {
+    fn new(asset: &LoadedAsset, color_channel: Option<&str>) -> Result<Self> {
         let bytes = asset.as_model().context("not a model")?;
         let sampler = NativeParallelSampler::new(bytes).map_err(|err| anyhow::anyhow!("{err}"))?;
-        let cast = DirectCast::for_model(&sampler)?;
+        let mut cast = DirectCast::for_model(&sampler)?;
+        cast.paint =
+            paint_for(sampler.sample_format(), color_channel).map_err(anyhow::Error::msg)?;
         let bounds = sampler.get_bounds()?;
         let (min, max) = bounds.as_f32();
         Ok(Self {
@@ -787,7 +789,7 @@ pub fn render(
     let mut direct: Vec<Option<DirectSource>> = Vec::with_capacity(assets.len());
     for asset in assets {
         if options.direct && asset.type_hint() == Some(AssetTypeHint::Model) {
-            match DirectSource::new(asset) {
+            match DirectSource::new(asset, options.plan.color_channel.as_deref()) {
                 Ok(source) => {
                     entities.push(source.entity());
                     reports.push(EntityReport {
@@ -921,12 +923,10 @@ pub fn render(
                     .cast(&source.sampler, cast_view, &CastOptions::default(), &NEVER)
                     .expect("never cancelled");
                 let surfels = SurfelData {
-                    surfels: source
-                        .cast
-                        .surfels_shown(cast_view, 1.0, &image)
-                        .iter()
-                        .map(|s| SurfelVertex::new(s.position, s.normal, s.radius))
-                        .collect(),
+                    surfels: surfel_vertices(
+                        source.cast.paint,
+                        &source.cast.surfels_shown(cast_view, 1.0, &image),
+                    ),
                 };
                 let resident = renderer.create_retained_surfels(offscreen.device(), &surfels);
                 object += 1;
@@ -1342,7 +1342,9 @@ mod tests {
             "{:?}",
             report.notes
         );
-        let background = options.background.map(|c| (c * 255.0).round() as i32);
+        // The background as drawn (the options give it in linear light;
+        // the frame is sRGB), from a corner pixel.
+        let background: Vec<i32> = meshed[..3].iter().map(|&c| c as i32).collect();
         let covered = |px: &[u8]| (0..3).any(|c| (px[c] as i32 - background[c]).abs() > 8);
         let (mut on_mesh, mut on_cast, mut differ) = (0usize, 0usize, 0usize);
         for (a, b) in meshed.chunks_exact(4).zip(cast.chunks_exact(4)) {
@@ -1356,6 +1358,108 @@ mod tests {
             "{on_cast} cast pixels against {on_mesh} meshed"
         );
         assert!(differ * 20 < on_mesh, "{differ} of {on_mesh} pixels differ");
+    }
+
+    /// A model whose channels after occupancy are a density equal to z,
+    /// occupying the half of the unit box with x < 0.5.
+    fn density_model() -> Vec<u8> {
+        let format = volumetric::encode_sample_format(&volumetric::SampleFormat {
+            channels: vec![
+                volumetric::SampleChannel {
+                    name: "occupancy".to_string(),
+                    kind: volumetric::ChannelKind::Occupancy,
+                },
+                volumetric::SampleChannel {
+                    name: "density".to_string(),
+                    kind: volumetric::ChannelKind::Density,
+                },
+            ],
+        });
+        let data: String = format.iter().map(|b| format!("\\{b:02x}")).collect();
+        let packed = 2048_i64 | ((format.len() as i64) << 32);
+        wat::parse_str(format!(
+            r#"(module
+                (memory (export "memory") 1)
+                (data (i32.const 2048) "{data}")
+                (func (export "get_dimensions") (result i32) (i32.const 3))
+                (func (export "get_io_ptr") (result i32) (i32.const 1024))
+                (func (export "get_bounds") (param $out i32)
+                    (f64.store (local.get $out) (f64.const 0))
+                    (f64.store offset=8 (local.get $out) (f64.const 1))
+                    (f64.store offset=16 (local.get $out) (f64.const 0))
+                    (f64.store offset=24 (local.get $out) (f64.const 1))
+                    (f64.store offset=32 (local.get $out) (f64.const 0))
+                    (f64.store offset=40 (local.get $out) (f64.const 1)))
+                (func $occ (param $pos i32) (result f32)
+                    (select (f32.const 1) (f32.const 0)
+                        (f64.lt (f64.load (local.get $pos)) (f64.const 0.5))))
+                (func (export "sample") (param $pos i32) (result f32)
+                    (call $occ (local.get $pos)))
+                (func (export "get_sample_format") (result i64) (i64.const {packed}))
+                (func (export "sample_channels") (param $pos i32) (param $out i32)
+                    (f32.store (local.get $out) (call $occ (local.get $pos)))
+                    (f32.store offset=4 (local.get $out)
+                        (f32.demote_f64 (f64.load offset=16 (local.get $pos)))))
+            )"#
+        ))
+        .expect("density model assembles")
+    }
+
+    /// Coloured by a channel, the cast runs viridis over the channel's
+    /// range, here z over the block's height: its purple foot, teal
+    /// middle and yellow top all show. (A mesh of the block has only its
+    /// corners as vertices, so its render interpolates purple to yellow
+    /// through brown, and is no oracle for this.)
+    #[test]
+    fn a_direct_cast_colours_by_the_channel() {
+        if let Err(err) = Offscreen::new() {
+            eprintln!("skipped: {err}");
+            return;
+        }
+        let model = LoadedAsset::from_parts(
+            "block".to_string(),
+            density_model(),
+            Some(AssetTypeHint::Model),
+            vec![],
+        );
+        let options = RenderOptions {
+            width: Some(192),
+            height: Some(144),
+            grid: 0.0,
+            supersample: 1,
+            direct: true,
+            plan: PlanOptions {
+                color_channel: Some("density".to_string()),
+                ..PlanOptions::default()
+            },
+            ..RenderOptions::default()
+        };
+        let rendered = render(
+            std::slice::from_ref(&model),
+            &[],
+            CameraSpec::Presets(vec![ViewPreset::Iso]),
+            &options,
+        )
+        .unwrap();
+        let cast = &rendered.frames[0].rgba;
+        let background: Vec<i32> = cast[..3].iter().map(|&c| c as i32).collect();
+        let covered = |px: &[u8]| (0..3).any(|c| (px[c] as i32 - background[c]).abs() > 8);
+        // Lit colours keep their hue order, so viridis's stops are told
+        // apart by it: purple (b > g), teal (g > r, b > r), yellow (r, g > b).
+        let (mut on_block, mut purple, mut teal, mut yellow, mut magenta) = (0, 0, 0, 0, 0);
+        for px in cast.chunks_exact(4).filter(|px| covered(px)) {
+            on_block += 1;
+            let (r, g, b) = (px[0], px[1], px[2]);
+            purple += (b > g && b > r) as usize;
+            teal += (g > r && b > r && g >= b) as usize;
+            yellow += (r > b && g > b && r > 100) as usize;
+            magenta += (r > 180 && b > 180 && g < 60) as usize;
+        }
+        assert!(on_block > 3000, "{on_block} block pixels");
+        for (name, count) in [("purple", purple), ("teal", teal), ("yellow", yellow)] {
+            assert!(count * 20 > on_block, "{name}: {count} of {on_block}");
+        }
+        assert_eq!(magenta, 0, "non-finite samples drawn");
     }
 
     #[test]

@@ -14,7 +14,7 @@ use crate::scene::{
     triangles_to_mesh_vertices,
 };
 use crate::{
-    DirectModel, OutputStats, PreviewBounds, PreviewEntity, PreviewMeshPlan, PreviewPlan,
+    DirectModel, OutputStats, Paint, PreviewBounds, PreviewEntity, PreviewMeshPlan, PreviewPlan,
     PreviewRequest,
 };
 
@@ -202,12 +202,11 @@ fn place(
             }
             scene.add_mesh(mesh, *pose, renderer::MaterialId(0));
             mesh_keys.push(built.key);
-            direct_models.push(
-                built
-                    .direct
-                    .take()
-                    .map(|model| DirectModel { model, color: tint }),
-            );
+            direct_models.push(built.direct.take().map(|model| DirectModel {
+                model,
+                color: tint,
+                paint: Paint::None,
+            }));
             part_of_mesh.push(part_index);
         }
         if let Some(mut points) = built.points.take() {

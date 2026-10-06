@@ -697,8 +697,16 @@ struct DirectStatus {
 
 /// The thread casting one model: it takes views and answers with the
 /// surfels to draw after each pass, until its sender is dropped.
+/// What the viewport asks the thread to cast: a view, the flag that
+/// cancels it, and the paint the record should hold.
+type DirectLook = (
+    volumetric::direct_cast::CastView,
+    Arc<AtomicBool>,
+    volumetric_preview::Paint,
+);
+
 struct DirectWorker {
-    views: std::sync::mpsc::Sender<(volumetric::direct_cast::CastView, Arc<AtomicBool>)>,
+    views: std::sync::mpsc::Sender<DirectLook>,
     results: std::sync::mpsc::Receiver<DirectResult>,
 }
 
@@ -728,14 +736,14 @@ impl DirectWorker {
                 return None;
             }
         };
-        let (views, view_rx) =
-            std::sync::mpsc::channel::<(volumetric::direct_cast::CastView, Arc<AtomicBool>)>();
+        let (views, view_rx) = std::sync::mpsc::channel::<DirectLook>();
         let (result_tx, results) = std::sync::mpsc::channel::<DirectResult>();
         let spawned = std::thread::Builder::new()
             .name("direct-cast".to_string())
             .spawn(move || {
                 let mut next = view_rx.recv().ok();
-                while let Some((view, cancel)) = next.take() {
+                while let Some((view, cancel, paint)) = next.take() {
+                    cast.repaint(&sampler, paint);
                     let mut run = CastRun::new(&CastOptions::default());
                     loop {
                         // A newer view supersedes this one between passes
@@ -747,15 +755,11 @@ impl DirectWorker {
                         match run.step(&mut cast, &sampler, &view, &cancel) {
                             None => break,
                             Some(more) => {
-                                let surfels = match run.image() {
+                                let shown = match run.image() {
                                     Some(image) => cast.surfels_shown(&view, 1.0, image),
                                     None => cast.surfels(Some((&view, 1.0))),
-                                }
-                                .iter()
-                                .map(|s| {
-                                    renderer::SurfelVertex::new(s.position, s.normal, s.radius)
-                                })
-                                .collect();
+                                };
+                                let surfels = volumetric_preview::surfel_vertices(paint, &shown);
                                 let sent = result_tx.send(DirectResult {
                                     surfels,
                                     status: DirectStatus {
@@ -794,9 +798,9 @@ struct DirectSlot {
     worker: Option<DirectWorker>,
     /// The latest surfels, resident; `None` until the first pass lands.
     surfels: Option<Arc<renderer::GpuSurfels>>,
-    /// The view last sent to the thread, with the flag that cancels its
-    /// passes.
-    sent: Option<(volumetric::direct_cast::CastView, Arc<AtomicBool>)>,
+    /// The view and paint last sent to the thread, with the flag that
+    /// cancels its passes.
+    sent: Option<DirectLook>,
     status: DirectStatus,
 }
 
@@ -820,7 +824,13 @@ impl DirectSlot {
     /// Has the thread cast `view` (the frame's camera, at the frame's size)
     /// as seen from inside a part drawn under `transform`, unless it is
     /// already doing so.
-    fn look(&mut self, view: &renderer::CameraView, size: (u32, u32), transform: Mat4) {
+    fn look(
+        &mut self,
+        view: &renderer::CameraView,
+        size: (u32, u32),
+        transform: Mat4,
+        paint: volumetric_preview::Paint,
+    ) {
         let Some(worker) = &self.worker else {
             return;
         };
@@ -834,16 +844,20 @@ impl DirectSlot {
         if self
             .sent
             .as_ref()
-            .is_some_and(|(sent, _)| *sent == cast_view)
+            .is_some_and(|(sent, _, sent_paint)| *sent == cast_view && *sent_paint == paint)
         {
             return;
         }
-        if let Some((_, cancel)) = &self.sent {
+        if let Some((_, cancel, _)) = &self.sent {
             cancel.store(true, Ordering::Relaxed);
         }
         let cancel = Arc::new(AtomicBool::new(false));
-        if worker.views.send((cast_view, cancel.clone())).is_ok() {
-            self.sent = Some((cast_view, cancel));
+        if worker
+            .views
+            .send((cast_view, cancel.clone(), paint))
+            .is_ok()
+        {
+            self.sent = Some((cast_view, cancel, paint));
             self.status.pending = true;
         }
     }
@@ -851,7 +865,7 @@ impl DirectSlot {
     /// Stops the thread's current pass; dropping the sender ends the
     /// thread once it looks for the next view.
     fn stop(&self) {
-        if let Some((_, cancel)) = &self.sent {
+        if let Some((_, cancel, _)) = &self.sent {
             cancel.store(true, Ordering::Relaxed);
         }
     }
@@ -1804,7 +1818,7 @@ impl ViewportRenderer {
                         .or_insert_with(|| DirectSlot::new(&direct.model));
                     slot.take_results(&self.renderer, device);
                     if let Some(view) = last_view {
-                        slot.look(&view, frame_size, transform);
+                        slot.look(&view, frame_size, transform, direct.paint);
                     }
                     if let Some(surfels) = &slot.surfels {
                         self.renderer.submit_retained_surfels(
@@ -3703,22 +3717,42 @@ mod tests {
         assert_eq!(tints.len(), 3, "three parts, three tints: {tints:?}");
 
         // A model cast directly carries the same tint for its discs, and
-        // white without.
-        let direct = |id: &str, tint: bool| {
+        // white without; a chosen channel is kept by the cast instead.
+        let direct = |id: &str, tint: bool, channel: Option<&str>| {
             let mut request = request(id, tint);
             request.plan = PreviewPlan::Model3d {
                 mesh: PreviewMeshPlan::Direct,
-                color_channel: None,
+                color_channel: channel.map(str::to_string),
                 tint_uncolored: tint,
             };
             let entity = build_preview_scene(&request).expect("preview builds");
-            entity.direct_models[0]
+            let direct = entity.direct_models[0]
                 .as_ref()
                 .expect("a model to cast")
-                .color
+                .clone();
+            (direct.color, direct.paint, entity.stats)
         };
-        assert_eq!(direct("tray", true), part_tint("tray"));
-        assert_eq!(direct("tray", false), [1.0; 4]);
+        let (color, paint, _) = direct("tray", true, None);
+        assert_eq!(
+            (color, paint),
+            (part_tint("tray"), volumetric_preview::Paint::None)
+        );
+        let (color, paint, _) = direct("tray", false, None);
+        assert_eq!((color, paint), ([1.0; 4], volumetric_preview::Paint::None));
+        let (color, paint, stats) = direct("tray", true, Some("density"));
+        assert_eq!(
+            (color, paint),
+            ([1.0; 4], volumetric_preview::Paint::Channel(1))
+        );
+        assert_eq!(stats.model_channels, ["occupancy", "density"]);
+        assert!(
+            stats
+                .detail
+                .iter()
+                .any(|line| line.starts_with("Color: density")),
+            "{:?}",
+            stats.detail
+        );
     }
 
     #[test]

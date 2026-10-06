@@ -30,6 +30,7 @@ struct VsIn {
     @location(0) position: vec3<f32>,
     @location(1) radius: f32,
     @location(2) normal: vec3<f32>,
+    @location(3) color: vec4<f32>,
 };
 
 struct VsOut {
@@ -37,6 +38,8 @@ struct VsOut {
     @location(0) normal_world: vec3<f32>,
     // Position in the disc: unit radius at the rim.
     @location(1) disc: vec2<f32>,
+    // The surfel's colour times the draw's, linear.
+    @location(2) color: vec4<f32>,
 };
 
 // Two triangles over the unit square, wound anticlockwise seen from the
@@ -77,6 +80,7 @@ fn vs_main(in: VsIn) -> VsOut {
     out.position = uniforms.view_proj * vec4<f32>(world, 1.0);
     out.normal_world = n;
     out.disc = corner;
+    out.color = in.color * draw.color;
     return out;
 }
 
@@ -93,9 +97,9 @@ fn fs_gbuffer(in: VsOut) -> FsOut {
     }
     let n = normalize(in.normal_world);
     var out: FsOut;
-    // The draw's colour, stored as the mesh pass stores a vertex's.
+    // Stored as the mesh pass stores a vertex's colour.
     out.albedo = vec4<f32>(
-        sqrt(clamp(draw.color.rgb, vec3<f32>(0.0), vec3<f32>(1.0))),
+        sqrt(clamp(in.color.rgb, vec3<f32>(0.0), vec3<f32>(1.0))),
         f32(draw.ids.y) / 255.0,
     );
     out.normal = vec4<f32>(n * 0.5 + vec3<f32>(0.5), 1.0);

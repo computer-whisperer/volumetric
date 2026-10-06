@@ -15,3 +15,5 @@ glam = "0.32"
 
 [dev-dependencies]
 volumetric_assets = { path = "../volumetric_assets" }
+# Hand-assemble a channelled model for the direct-cast colour test.
+wat = "1"
