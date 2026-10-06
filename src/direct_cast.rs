@@ -49,9 +49,12 @@ const ISOLATED_DEPTH: f64 = 4.0;
 /// and the coarser must not stand in for the finer.
 const SAME_PITCH: f64 = 1.2;
 /// The least stride a ray takes, as a fraction of the model's half-size:
-/// bounds the samples a ray can cost (about a thousand across the model)
-/// whatever its pixel footprint.
-const PITCH_FLOOR: f64 = 2e-3;
+/// bounds the samples a ray can cost whatever its pixel footprint, which
+/// is zero at a perspective view's eye. Only the stride: the pitch a
+/// surfel is found and stored at is the pixel's, or the surfels of a
+/// close view would all count as too coarse for it and be dropped
+/// (which blanked the viewport, 2026-10-05).
+const STRIDE_FLOOR: f64 = 2e-4;
 /// A surfel's disc radius over the pitch it was found at: enough for
 /// discs a pitch apart on a square lattice to leave no gaps.
 const RADIUS_PER_PITCH: f64 = 0.75;
@@ -689,9 +692,23 @@ impl DirectCast {
             width,
             height,
             spacing,
-            hits: vec![None; width as usize * height as usize],
+            hits: self.coverage_of(&self.surfels(Some((view, spacing))), view, spacing),
         };
-        for surfel in self.surfels(Some((view, spacing))) {
+        image.hits.shrink_to_fit();
+        image
+    }
+
+    /// The hits of [`coverage`](Self::coverage) for a given set of
+    /// surfels, one per lattice pixel.
+    pub fn coverage_of(
+        &self,
+        surfels: &[Surfel],
+        view: &CastView,
+        spacing: f64,
+    ) -> Vec<Option<RayHit>> {
+        let (width, height) = CastImage::lattice(view, spacing);
+        let mut hits: Vec<Option<RayHit>> = vec![None; width as usize * height as usize];
+        for surfel in surfels {
             let position = Vec3::from(surfel.position).as_dvec3();
             let normal = Vec3::from(surfel.normal).as_dvec3();
             if normal.dot(view.direction_at(position)) >= 0.0 {
@@ -712,7 +729,7 @@ impl DirectCast {
                 CastProjection::Perspective { .. } => (position - view.eye).length(),
                 CastProjection::Orthographic { .. } => (position - view.eye).dot(view.forward),
             };
-            let slot = &mut image.hits[(y * width + x) as usize];
+            let slot = &mut hits[(y * width + x) as usize];
             if slot.is_none_or(|hit| t < hit.t) {
                 *slot = Some(RayHit {
                     t,
@@ -721,7 +738,7 @@ impl DirectCast {
                 });
             }
         }
-        image
+        hits
     }
 
     pub fn node_count(&self) -> usize {
@@ -772,8 +789,9 @@ impl DirectCast {
         // The stride never falls below a small fraction of the model: a
         // perspective ray's footprint is zero at the eye, and an eye
         // inside the bounds would otherwise never advance.
-        let floor = self.half * PITCH_FLOOR;
-        let pitch_at = |t: f64| (spacing * ray.footprint(t)).max(floor);
+        let floor = self.half * STRIDE_FLOOR;
+        let pitch_at = |t: f64| spacing * ray.footprint(t);
+        let stride_at = |t: f64| pitch_at(t).max(floor);
 
         // An eye inside the model sees nothing of it, like an eye inside
         // a mesh with its back faces culled.
@@ -861,14 +879,14 @@ impl DirectCast {
             if node.suspect {
                 node.reached.store(true, Ordering::Relaxed);
             }
-            let mut s = next.unwrap_or(t + jitter * pitch);
+            let mut s = next.unwrap_or(t + jitter * stride_at(t));
             while found.is_none() && s < stop {
                 if inside(s) {
                     found = Some(s);
                     break;
                 }
                 outside = s;
-                s += pitch_at(s);
+                s += stride_at(s);
             }
             if found.is_some() && !node.occupied {
                 node.struck.store(true, Ordering::Relaxed);
@@ -887,10 +905,10 @@ impl DirectCast {
             // has to be checked, and if it is inside too the surface was
             // crossed unseen in skipped space: back off in doubling
             // strides until outside again.
-            let pitch = pitch_at(s);
+            let stride = stride_at(s);
             let (mut a, mut b) = (outside, s);
-            if s - outside > pitch * 1.001 {
-                let mut stride = pitch;
+            if s - outside > stride * 1.001 {
+                let mut stride = stride;
                 loop {
                     let back = s - stride;
                     if back <= enter {
@@ -1953,6 +1971,47 @@ mod tests {
         });
         assert!(cancelled.is_none());
         assert!(started.elapsed().as_secs_f64() < 5.0);
+    }
+
+    /// Zooming in step by step, as a viewport does, keeps the surface
+    /// drawn: at the end nearly every pixel that sees the model has a
+    /// surfel of its own pitch at it.
+    #[test]
+    fn zooming_in_step_by_step_keeps_the_surface_drawn() {
+        let model = sphere();
+        let options = CastOptions::default();
+        let mut cast = DirectCast::for_model(&model).unwrap();
+        let mut tan = 0.35;
+        let mut image = None;
+        let mut view = None;
+        for step in 0..8 {
+            let v = CastView::look_at(
+                DVec3::new(2.2, -2.9, 1.7),
+                DVec3::new(0.5, -0.4, 0.4),
+                DVec3::Z,
+                CastProjection::Perspective {
+                    tan_half_fov_y: tan,
+                },
+                128,
+                128,
+            );
+            let (img, _) = cast.cast(&model, &v, &options, &NEVER).unwrap();
+            let shown = cast.surfels_shown(&v, 1.0, &img);
+            let drawn = cast.coverage_of(&shown, &v, 1.0);
+            let seen = img.hits.iter().flatten().count();
+            let missing = img
+                .hits
+                .iter()
+                .zip(&drawn)
+                .filter(|(hit, drawn)| hit.is_some() && drawn.is_none())
+                .count();
+            println!("step {step}: {seen} pixels see the model, {missing} have no surfel drawn");
+            assert!(missing * 20 < seen, "step {step}: {missing} of {seen}");
+            tan /= 1.6;
+            image = Some(img);
+            view = Some(v);
+        }
+        let _ = (image, view);
     }
 
     #[test]
