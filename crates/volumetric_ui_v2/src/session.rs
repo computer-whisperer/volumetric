@@ -747,13 +747,15 @@ impl DirectWorker {
                         match run.step(&mut cast, &sampler, &view, &cancel) {
                             None => break,
                             Some(more) => {
-                                let surfels = cast
-                                    .surfels(Some((&view, 1.0)))
-                                    .iter()
-                                    .map(|s| {
-                                        renderer::SurfelVertex::new(s.position, s.normal, s.radius)
-                                    })
-                                    .collect();
+                                let surfels = match run.image() {
+                                    Some(image) => cast.surfels_shown(&view, 1.0, image),
+                                    None => cast.surfels(Some((&view, 1.0))),
+                                }
+                                .iter()
+                                .map(|s| {
+                                    renderer::SurfelVertex::new(s.position, s.normal, s.radius)
+                                })
+                                .collect();
                                 let sent = result_tx.send(DirectResult {
                                     surfels,
                                     status: DirectStatus {

@@ -168,9 +168,16 @@ cut round in the fragment shader, back faces culled; its depth is the
 plane's, so the discs of one surface meet without gaps.
 
 `DirectCast::surfels(view)` chooses the surfels for a view: at each part
-of the surface the level whose pitch suits the view's pixels there, and a
-coarser surfel only where no finer one has been found beneath it (looked
-up by position when the surfels are collected). Rejected: a stored
+of the surface the level whose pitch suits the view's pixels at the
+node's nearest point, and a coarser surfel only where no finer one has
+been found beneath it (looked up by position when the surfels are
+collected). Once a pass has produced an image of the view,
+`surfels_shown` also drops every coarse surfel whose pixel's ray hit
+surface at or in front of it: the finer point that replaces it, or what
+hides it. (Added 2026-10-05 from a screenshot: after zooming in on a
+lattice, the farther view's surfels stood along the near view's
+silhouettes and creases, where the tree lookup alone finds nothing finer
+beneath their centres.) Rejected: a stored
 "superseded" flag set when a finer surfel is inserted within a coarse
 one's disc. It missed coarse surfels in neighbouring nodes and at
 silhouettes, where normals turn fast, and their oversized discs stood out

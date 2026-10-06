@@ -923,7 +923,7 @@ pub fn render(
                 let surfels = SurfelData {
                     surfels: source
                         .cast
-                        .surfels(Some((cast_view, 1.0)))
+                        .surfels_shown(cast_view, 1.0, &image)
                         .iter()
                         .map(|s| SurfelVertex::new(s.position, s.normal, s.radius))
                         .collect(),

@@ -138,6 +138,20 @@ impl CastView {
         }
     }
 
+    /// The smallest pixel footprint anywhere in the cube of half-side
+    /// `half` about `center`: its nearest depth, which is zero for a cube
+    /// the eye is in or that reaches behind it.
+    pub fn least_footprint_in(&self, center: DVec3, half: f64) -> f64 {
+        match self.projection {
+            CastProjection::Perspective { tan_half_fov_y } => {
+                let depth =
+                    (center - self.eye).dot(self.forward) - half * self.forward.abs().element_sum();
+                depth.max(0.0) * 2.0 * tan_half_fov_y / self.height as f64
+            }
+            CastProjection::Orthographic { half_height } => 2.0 * half_height / self.height as f64,
+        }
+    }
+
     /// Where `point` falls in the image, in pixels, if it is in front of
     /// the view and inside the frame.
     pub fn pixel_of(&self, point: DVec3) -> Option<(f64, f64)> {
@@ -584,8 +598,13 @@ impl DirectCast {
             if !node.occupied {
                 continue;
             }
+            // A node stands as one piece only if its pitch suits its
+            // nearest part: zoomed in, a large node's centre is far behind
+            // what the view sees of it, and its coarse surfels would be
+            // drawn across the close surface. (Fixed 2026-10-05 from a
+            // screenshot.)
             let wanted = view.map_or(0.0, |(view, spacing)| {
-                spacing * view.footprint_at(at.center)
+                spacing * view.least_footprint_in(at.center, at.half)
             });
             let fine_enough = Self::pitch_of(at.half) <= wanted && !node.surfels.is_empty();
             if fine_enough || node.first_child == 0 {
@@ -601,6 +620,43 @@ impl DirectCast {
             stack.extend(at.children(node.first_child));
         }
         out
+    }
+
+    /// The surfels to draw for `view` once a pass at `spacing` has
+    /// produced `image`: [`surfels`](Self::surfels) less the coarse ones
+    /// the image has looked past. A surfel wider than the view's pixels
+    /// allow is dropped when the ray through its centre hit surface at or
+    /// in front of it: the hit is the finer surface point that replaces
+    /// it, or something that hides it. One behind a hit, or at a pixel
+    /// that hit nothing, stays: it is on something the pass did not find.
+    /// Without this, surfels from a farther view stand along the near
+    /// view's silhouettes and creases, where the tree lookup finds nothing
+    /// finer beneath their centres. (From a screenshot, 2026-10-05.)
+    pub fn surfels_shown(&self, view: &CastView, spacing: f64, image: &CastImage) -> Vec<Surfel> {
+        let mut shown = self.surfels(Some((view, spacing)));
+        shown.retain(|surfel| {
+            let position = Vec3::from(surfel.position).as_dvec3();
+            let pitch = spacing * view.footprint_at(position);
+            if surfel.radius as f64 <= RADIUS_PER_PITCH * pitch * SAME_PITCH {
+                return true;
+            }
+            let Some((x, y)) = view.pixel_of(position) else {
+                return true;
+            };
+            let (x, y) = ((x / spacing) as u32, (y / spacing) as u32);
+            if x >= image.width || y >= image.height {
+                return true;
+            }
+            let Some(hit) = image.hit(x, y) else {
+                return true;
+            };
+            let t = match view.projection {
+                CastProjection::Perspective { .. } => (position - view.eye).length(),
+                CastProjection::Orthographic { .. } => (position - view.eye).dot(view.forward),
+            };
+            hit.t > t + 2.0 * surfel.radius as f64
+        });
+        shown
     }
 
     /// Whether a node beneath `at` holding `point` has surfels of its own.
@@ -1752,12 +1808,18 @@ mod tests {
         let model = sphere();
         let options = CastOptions::default();
         let wide = views(96)[0];
-        let close = CastView {
-            projection: CastProjection::Perspective {
+        // The close view comes in from a different direction, so the wide
+        // view's silhouette surfels face it.
+        let close = CastView::look_at(
+            DVec3::new(-1.0, -3.6, 1.2),
+            DVec3::new(0.2, -0.6, 0.45),
+            DVec3::Z,
+            CastProjection::Perspective {
                 tan_half_fov_y: 0.04,
             },
-            ..wide
-        };
+            96,
+            96,
+        );
         let mut cast = DirectCast::for_model(&model).unwrap();
         cast.cast(&model, &wide, &options, &NEVER).unwrap();
         // Mean radius of the surfels chosen for a view that fall in it.
@@ -1772,7 +1834,7 @@ mod tests {
             seen.iter().sum::<f64>() / seen.len() as f64
         };
         let wide_radius = radius(&cast, &wide);
-        cast.cast(&model, &close, &options, &NEVER).unwrap();
+        let (close_image, _) = cast.cast(&model, &close, &options, &NEVER).unwrap();
         let close_radius = radius(&cast, &close);
         let wide_again = radius(&cast, &wide);
 
@@ -1780,6 +1842,37 @@ mod tests {
             close_radius * 6.0 < wide_radius,
             "{close_radius} against {wide_radius}"
         );
+        // Nothing coarse stands in the close view where the fine passes
+        // have been: of the surfels chosen for it that face it, almost
+        // none is wider than its pixels allow.
+        let count = |chosen: &[Surfel]| {
+            let (mut facing, mut coarse) = (0, 0);
+            for s in chosen {
+                let position = Vec3::from(s.position).as_dvec3();
+                if close.pixel_of(position).is_none()
+                    || Vec3::from(s.normal)
+                        .as_dvec3()
+                        .dot(close.direction_at(position))
+                        >= 0.0
+                {
+                    continue;
+                }
+                facing += 1;
+                let allowed = RADIUS_PER_PITCH * close.footprint_at(position) * 2.0;
+                coarse += (s.radius as f64 > allowed) as usize;
+            }
+            (coarse, facing)
+        };
+        let (by_tree, facing) = count(&cast.surfels(Some((&close, 1.0))));
+        let (by_image, _) = count(&cast.surfels_shown(&close, 1.0, &close_image));
+        println!(
+            "close view: {by_tree} coarse of {facing} by the tree alone, {by_image} with the image"
+        );
+        assert!(
+            by_tree > 0,
+            "the tree alone should leave some at the silhouette"
+        );
+        assert_eq!(by_image, 0);
         // The wide view still draws mostly its own coarse surfels.
         assert!(wide_again > wide_radius * 0.5);
     }
