@@ -155,27 +155,62 @@ inside the model is marked as holding surface even when bisection put the
 surface point in the node before it.
 
 **Normals** are those of the plane through the hit and two more points
-bisected half a pitch to the side and above in the image, or on the
-opposite sides where those find nothing (a silhouette, an edge). A probe
-brackets whichever crossing of the surface is nearest along its offset
-ray, an entry or an exit, pushing its bracket back where the inner ray at
-a silhouette is already inside. A hit within half a pitch of a surfel
-already stored at the same pitch reuses its normal and costs no probes.
-Where no probe finds surface (something thinner than a pitch) the normal
-faces the viewer and the surfel is marked **guessed**: it is drawn, but
-never stands in for a pixel of a later view, and the first surfel found
-at its spot with a normal replaces it. (2026-10-05, from a screenshot:
-guessed surfels from one view's silhouettes stood across the surfaces of
-the next view with normals a quarter turn off, which the edge pass drew
-as a field of small crosses.)
+bisected half a pitch to either side of it in the image, one per axis.
+Both sides of each axis are probed; a probe brackets whichever crossing
+of the surface is nearest along its offset ray, pushing its bracket back
+where the inner ray at a silhouette is already inside, and the nearer of
+the two sides is used. On a surface that is one plane through the hit the
+two crossings lie equally far along the ray either way. **An edge** within
+the probes' reach breaks that symmetry (by more than a quarter pitch), as
+does a probe whose nearest crossing is an exit when the hit is an entry
+(the far side of something thinner than a pitch); the plane through
+three points on two faces is no normal of either, so such a point takes
+instead the mean empty direction of 32 samples on a sphere half a pitch
+about it, which at an edge is the mean of the faces' normals, with its own
+sign (an edge's mean normal may lean away from the eye). At a silhouette
+only the inner probe finds anything, and the plane through its crossing,
+however far ahead, is the tangent plane. A hit within half a pitch of a
+surfel already stored at the same pitch reuses its normal and costs no
+probes. Where no probe finds surface (something thinner than a pitch on
+both axes) the normal faces the viewer and the surfel is marked
+**guessed**: it is drawn, but never stands in for a pixel of a later view,
+and the first surfel found at its spot with a normal replaces it.
+(2026-10-05, from a screenshot: guessed surfels from one view's
+silhouettes stood across the surfaces of the next view with normals a
+quarter turn off, which the edge pass drew as a field of small crosses.)
+
+The edge rule is from a later screenshot the same day (dark specks along
+every lip and rim, and strewn over faces where earlier views had their
+silhouettes). The first probe over the lip of a groove bracketed the
+groove's wall or floor, and the normal came out lying across the face:
+one pixel in a ray image, invisible, but a surfel that persists into every
+later view, where the renderer's slant stretch draws it as a dark dash.
+`cast-bench --check-normals` measures found normals against the
+occupancy around the hit: on the comet racer, found normals more than 60°
+off went from 348 to 2 in one view and askew surfels drawn in a 40-view
+sequence from 375 to 23 (22 of them guessed), at 7% more samples. The
+first attempt, probing the other side only when a bracket had widened,
+changed nothing (348 to 323): most lip probes find the wall within one
+pitch. Rejected: trusting the slant stretch less (the stretch is right
+for true grazing normals); marking edge points guessed (they would be
+re-found as edge points by every view).
 
 Known limit: a surfel found at a grazing angle keeps a normal that leans
 by up to about 20° (the one-sided stencil over a long stretch of
 surface), and a later face-on view accepts it as cover. About 0.1% of a
-sphere's surfels after a quarter turn. Known limit: the three points are one-sided, so on
-a curved surface the normal leans by about the angle the surface turns in
-half a pitch; near a silhouette, where half a pixel is a long way round,
-that reaches a couple of degrees at 160 px across a sphere.
+sphere's surfels after a quarter turn. Known limit: on a curved surface
+the normal leans by about the angle the surface turns in half a pitch;
+near a silhouette, where half a pixel is a long way round, that reaches a
+couple of degrees at 160 px across a sphere.
+
+**Bisection goes to the same fraction of a pitch** whatever the bracket:
+a bracket widened by backing off through space the ray skipped gets a
+step more per doubling. (2026-10-05: with ten steps regardless, hits
+found after backing off sat up to 0.03 px off along the ray, and the
+plane through the probes tilted by about 3°; in a zoomed view these made
+faint dark columns on flat faces, one per node boundary the surface
+crossed inside a node the record called empty. `cast-bench` now reports
+backed-off hits per pass: 1–1.5% of a zoomed view's.)
 
 ### 4.3 Drawing
 
@@ -392,6 +427,22 @@ Known limits at the end of step 3:
   megapixel), rather than the ones that changed.
 - Part drags re-cast nothing (the record moves with the part) but the
   coverage is recomputed from scratch each view change.
+- A zoomed view's final 1 px search is slow: the comet racer zoomed in
+  5.8× costs 1,500 samples per pixel and 11.5 s in that one pass (the
+  whole view at zoom 1 is 90 samples per pixel), because the empty space
+  in front of the surface is searched at the view's fine pitch over the
+  whole frame. Step 4's first target.
+- `surfels_shown` sends every surfel of the view's levels, in frame or
+  not: 4M after 40 views of the comet racer, 2.4M of them coarser than the
+  view and nearly all off screen.
+
+Instruments added for the screenshot fixes (all in `cast-bench`):
+`--check-normals` (found normals against the occupancy around the hit,
+red in the output image), `--splat` (the surfels a viewport would draw,
+as discs; `.coarse.png` and `.askew.png` beside it), `--zoom-step`,
+`--passes` (views superseded after N passes, as while dragging), and
+`--probe` now replays the normal probes at the pixel and lists the
+surfels stored around its hit.
 
 ## 6. Open questions
 

@@ -27,8 +27,9 @@ use crate::wasm::ParallelModelSampler;
 /// A node's nominal pitch is its side over this: the node is as wide as
 /// this many of the samples that found its surface points.
 const CELLS_PER_NODE: f64 = 4.0;
-/// Bisection steps per surface point. Each halves the bracket, which
-/// starts one pitch wide.
+/// Bisection steps per surface point for a bracket one pitch wide. Each
+/// halves the bracket; a wider one gets a step more per doubling, so
+/// every point is placed to the same fraction of a pitch.
 const BISECTIONS: usize = 10;
 /// The tree starts split to this level, so the first pass already records
 /// what it searched in pieces smaller than the whole model.
@@ -176,7 +177,7 @@ impl CastView {
     }
 
     /// The unit direction rays travel at `point`.
-    fn direction_at(&self, point: DVec3) -> DVec3 {
+    pub fn direction_at(&self, point: DVec3) -> DVec3 {
         match self.projection {
             CastProjection::Perspective { .. } => (point - self.eye).normalize_or(self.forward),
             CastProjection::Orthographic { .. } => self.forward,
@@ -282,6 +283,10 @@ pub struct PassStats {
     /// Of those, the ones that had the nodes around them marked for a
     /// closer look.
     pub followed: u64,
+    /// Hits whose first sample inside was more than a stride past the
+    /// last outside: the surface was crossed in space the ray did not
+    /// step through.
+    pub backed_off: u64,
     pub seconds: f64,
 }
 
@@ -292,6 +297,7 @@ impl std::ops::AddAssign for PassStats {
         self.hits += other.hits;
         self.fresh += other.fresh;
         self.followed += other.followed;
+        self.backed_off += other.backed_off;
         self.seconds += other.seconds;
     }
 }
@@ -575,26 +581,28 @@ impl DirectCast {
         })
     }
 
-    /// Whether any surfel, at any level, lies within `reach` of `point`.
-    pub fn has_surfel_near(&self, point: DVec3, reach: f64) -> bool {
+    /// The surfels at every level within `reach` of `point`.
+    pub fn surfels_within(&self, point: DVec3, reach: f64) -> Vec<Surfel> {
+        let mut out = Vec::new();
         let mut stack = vec![self.root()];
         while let Some(at) = stack.pop() {
             if (point - at.center).abs().max_element() > at.half + reach {
                 continue;
             }
             let node = &self.nodes[at.index as usize];
-            if node
-                .surfels
-                .iter()
-                .any(|s| Vec3::from(s.position).as_dvec3().distance_squared(point) < reach * reach)
-            {
-                return true;
-            }
+            out.extend(
+                node.surfels
+                    .iter()
+                    .filter(|s| {
+                        Vec3::from(s.position).as_dvec3().distance_squared(point) < reach * reach
+                    })
+                    .copied(),
+            );
             if node.first_child != 0 {
                 stack.extend(at.children(node.first_child));
             }
         }
-        false
+        out
     }
 
     /// The surfels to draw. With a view, each part of the surface comes
@@ -824,6 +832,7 @@ impl DirectCast {
         jitter: f64,
         limit: f64,
         samples: &mut u64,
+        backed_off: &mut u64,
     ) -> Option<(RayHit, Option<Fresh>)> {
         let (enter, leave) = self.span(ray)?;
         let leave = leave.min(limit);
@@ -957,6 +966,7 @@ impl DirectCast {
             let stride = stride_at(s);
             let (mut a, mut b) = (outside, s);
             if s - outside > stride * 1.001 {
+                *backed_off += 1;
                 let mut stride = stride;
                 loop {
                     let back = s - stride;
@@ -972,7 +982,7 @@ impl DirectCast {
                     stride *= 2.0;
                 }
             }
-            for _ in 0..BISECTIONS {
+            for _ in 0..bisections_for(b - a, stride) {
                 let mid = 0.5 * (a + b);
                 if inside(mid) {
                     b = mid;
@@ -995,71 +1005,8 @@ impl DirectCast {
                 return Some((hit, None));
             }
 
-            // The normal is that of the plane through this point and two
-            // more, found half a pitch to either side in the image.
-            let side = (view.right - ray.dir * view.right.dot(ray.dir)).normalize();
-            let lift = ray.dir.cross(side);
-            let mut neighbour = |offset: DVec3| -> Option<DVec3> {
-                let origin = ray.origin + offset * (0.5 * pitch);
-                let mut inside = |t: f64| {
-                    *samples += 1;
-                    let p = origin + ray.dir * t;
-                    volumetric_abi::is_occupied(sampler.sample(p.x, p.y, p.z))
-                };
-                // The surface crosses the offset ray near `t_hit`, as an
-                // entry or, where it curves away, an exit; at a
-                // silhouette the inner ray may be inside well before
-                // `t_hit`, so a bracket inside at both ends is pushed
-                // back. Whichever crossing is bracketed is a point of the
-                // surface beside the hit.
-                let mut reach = pitch;
-                let (mut a, mut b) = (t_hit - reach, t_hit + reach);
-                let (mut a_in, mut b_in) = (inside(a), inside(b));
-                for _ in 0..5 {
-                    if a_in != b_in {
-                        break;
-                    }
-                    reach *= 2.0;
-                    if a_in {
-                        a = t_hit - reach;
-                        a_in = inside(a);
-                    } else {
-                        (a, b) = (t_hit - reach, t_hit + reach);
-                        (a_in, b_in) = (inside(a), inside(b));
-                    }
-                }
-                if a_in == b_in {
-                    return None;
-                }
-                for _ in 0..BISECTIONS {
-                    let mid = 0.5 * (a + b);
-                    if inside(mid) == a_in {
-                        a = mid;
-                    } else {
-                        b = mid;
-                    }
-                }
-                Some(origin + ray.dir * (0.5 * (a + b)))
-            };
-            // Beside the point on one side or, at a silhouette or an edge,
-            // the other.
-            let p = neighbour(side).or_else(|| neighbour(-side));
-            let q = neighbour(lift).or_else(|| neighbour(-lift));
-            let (normal, guessed) = match (p, q) {
-                (Some(p), Some(q)) => {
-                    let normal = (p - position).cross(q - position).normalize_or(-ray.dir);
-                    let normal = if normal.dot(ray.dir) > 0.0 {
-                        -normal
-                    } else {
-                        normal
-                    };
-                    (normal, false)
-                }
-                // No surface beside the point on either side: something
-                // thinner than a pitch. Facing the viewer is the least
-                // wrong guess.
-                _ => (-ray.dir, true),
-            };
+            let (normal, guessed) =
+                Self::normal_at(sampler, view, ray, t_hit, pitch, samples, None);
             let normal = normal.as_vec3();
             let hit = RayHit {
                 t: t_hit,
@@ -1079,6 +1026,182 @@ impl DirectCast {
             ));
         }
         None
+    }
+
+    /// The normal at a surface point `t_hit` along `ray`: that of the
+    /// plane through the point and two more, found half a pitch to
+    /// either side in the image. `true` with it when none could be found
+    /// and the normal faces the viewer instead. `log` gets a line per
+    /// probe for the bench's `--probe`.
+    pub fn normal_at(
+        sampler: &(impl ParallelModelSampler + ?Sized),
+        view: &CastView,
+        ray: &Ray,
+        t_hit: f64,
+        pitch: f64,
+        samples: &mut u64,
+        mut log: Option<&mut Vec<String>>,
+    ) -> (DVec3, bool) {
+        let position = ray.at(t_hit);
+        let side = (view.right - ray.dir * view.right.dot(ray.dir)).normalize();
+        let lift = ray.dir.cross(side);
+        // A probe returns the surface point found, how far along the ray
+        // it lies from `t_hit` in pitches, and whether the ray leaves
+        // the model there rather than entering it.
+        let mut neighbour = |offset: DVec3| -> Option<(DVec3, f64, bool)> {
+            let origin = ray.origin + offset * (0.5 * pitch);
+            let mut inside = |t: f64| {
+                *samples += 1;
+                let p = origin + ray.dir * t;
+                volumetric_abi::is_occupied(sampler.sample(p.x, p.y, p.z))
+            };
+            // The surface crosses the offset ray near `t_hit`, as an
+            // entry or, where it curves away, an exit; at a
+            // silhouette the inner ray may be inside well before
+            // `t_hit`, so a bracket inside at both ends is pushed
+            // back. Whichever crossing is bracketed is a point of the
+            // surface beside the hit.
+            let mut reach = pitch;
+            let (mut a, mut b) = (t_hit - reach, t_hit + reach);
+            let (mut a_in, mut b_in) = (inside(a), inside(b));
+            for _ in 0..5 {
+                if a_in != b_in {
+                    break;
+                }
+                reach *= 2.0;
+                if a_in {
+                    a = t_hit - reach;
+                    a_in = inside(a);
+                } else {
+                    (a, b) = (t_hit - reach, t_hit + reach);
+                    (a_in, b_in) = (inside(a), inside(b));
+                }
+            }
+            if a_in == b_in {
+                if let Some(log) = log.as_deref_mut() {
+                    log.push(format!(
+                        "probe offset [{:.2} {:.2} {:.2}]: no crossing within {:.0} pitches, {}",
+                        offset.x,
+                        offset.y,
+                        offset.z,
+                        reach / pitch,
+                        if a_in { "all inside" } else { "all outside" }
+                    ));
+                }
+                return None;
+            }
+            for _ in 0..bisections_for(b - a, pitch) {
+                let mid = 0.5 * (a + b);
+                if inside(mid) == a_in {
+                    a = mid;
+                } else {
+                    b = mid;
+                }
+            }
+            let t = 0.5 * (a + b);
+            if let Some(log) = log.as_deref_mut() {
+                log.push(format!(
+                    "probe offset [{:.2} {:.2} {:.2}]: {} {:+.3} pitches along the ray (bracket {:.0} pitches)",
+                    offset.x,
+                    offset.y,
+                    offset.z,
+                    if a_in { "exit" } else { "entry" },
+                    (t - t_hit) / pitch,
+                    reach / pitch
+                ));
+            }
+            Some((origin + ray.dir * t, (t - t_hit).abs() / pitch, a_in))
+        };
+        // Both sides of each axis are probed. On a surface that is one
+        // plane through the hit the two crossings lie equally far along
+        // the ray either way; an edge within the probes' reach breaks
+        // that, and the plane through three points on two faces is no
+        // normal of either: over the lip of a groove the probe passes the
+        // face the hit is on and finds the wall or the floor behind, and
+        // the normal comes out lying across the face. Such a point is
+        // given the normal the model's own occupancy around it shows
+        // instead. At a silhouette only the inner probe finds anything,
+        // and the plane through its crossing, however far ahead, is the
+        // tangent plane. (Fixed 2026-10-05 from a screenshot: dark specks
+        // along every lip and rim, and strewn over faces where earlier
+        // views had their silhouettes.)
+        // The hit is where its ray enters the model. A probe whose
+        // nearest crossing is an exit has found the far side of
+        // something thinner than a pitch, not the surface beside the hit.
+        let mut beside = |offset: DVec3| -> (Option<DVec3>, bool) {
+            match (neighbour(offset), neighbour(-offset)) {
+                (Some((p, a, p_exit)), Some((q, b, q_exit))) => {
+                    let along = |point: DVec3| (point - position).dot(ray.dir) / pitch;
+                    let edged = (along(p) + along(q)).abs() > EDGE_ASYMMETRY;
+                    let (point, exit) = if a <= b { (p, p_exit) } else { (q, q_exit) };
+                    (Some(point), edged || exit)
+                }
+                (Some((p, _, exit)), None) | (None, Some((p, _, exit))) => (Some(p), exit),
+                (None, None) => (None, false),
+            }
+        };
+        let (p, p_edged) = beside(side);
+        let (q, q_edged) = beside(lift);
+        if let Some(log) = log.as_deref_mut() {
+            for (name, point, edged) in [("side", p, p_edged), ("lift", q, q_edged)] {
+                log.push(match point {
+                    Some(point) => {
+                        let d = point - position;
+                        format!(
+                            "{name}: point {:.3} pitches away, {:+.3} along the ray{}",
+                            d.length() / pitch,
+                            d.dot(ray.dir) / pitch,
+                            if edged { ", at an edge" } else { "" }
+                        )
+                    }
+                    None => format!("{name}: nothing"),
+                });
+            }
+        }
+        let facing = |normal: DVec3| {
+            if normal.dot(ray.dir) > 0.0 {
+                -normal
+            } else {
+                normal
+            }
+        };
+        let (normal, guessed) = match (p, q) {
+            (Some(p), Some(q)) if !(p_edged || q_edged) => (
+                facing((p - position).cross(q - position).normalize_or(-ray.dir)),
+                false,
+            ),
+            (Some(_), Some(_)) => {
+                // The empty side of the surface, from a sphere of samples
+                // half a pitch about the point: at an edge, the mean of
+                // the faces' normals.
+                let mut sum = DVec3::ZERO;
+                for dir in sphere_directions() {
+                    *samples += 1;
+                    let s = position + *dir * (0.5 * pitch);
+                    let inside = volumetric_abi::is_occupied(sampler.sample(s.x, s.y, s.z));
+                    sum += if inside { -*dir } else { *dir };
+                }
+                if let Some(log) = log {
+                    log.push(format!(
+                        "edge: normal from a sphere of {} samples, sum length {:.2}",
+                        sphere_directions().len(),
+                        sum.length()
+                    ));
+                }
+                // The sum's own sign is the empty side; an edge's mean
+                // normal may lean away from the eye.
+                match sum.try_normalize() {
+                    Some(normal) => (normal, false),
+                    None => (-ray.dir, true),
+                }
+            }
+            // No surface beside the point on either side: something
+            // thinner than a pitch. Facing the viewer is the least
+            // wrong guess.
+            _ => (-ray.dir, true),
+        };
+
+        (normal, guessed)
     }
 
     /// Casts one lattice of rays `spacing` pixels apart. `None` when
@@ -1108,6 +1231,7 @@ impl DirectCast {
             let mut hits = Vec::with_capacity(width as usize);
             let mut fresh = Vec::new();
             let mut samples = 0u64;
+            let mut backed_off = 0u64;
             for column in 0..width as usize {
                 if cancel.load(Ordering::Relaxed) {
                     break;
@@ -1133,6 +1257,7 @@ impl DirectCast {
                     jitter,
                     limit,
                     &mut samples,
+                    &mut backed_off,
                 );
                 hits.push(match traced {
                     Some((hit, found)) => {
@@ -1142,7 +1267,7 @@ impl DirectCast {
                     None => before,
                 });
             }
-            (hits, fresh, samples)
+            (hits, fresh, samples, backed_off)
         });
         if cancel.load(Ordering::Relaxed) {
             self.clear_through();
@@ -1160,8 +1285,9 @@ impl DirectCast {
             hits: Vec::with_capacity(width as usize * height as usize),
         };
         let mut found = Vec::new();
-        for (row, (hits, fresh, samples)) in rows.into_iter().enumerate() {
+        for (row, (hits, fresh, samples, backed_off)) in rows.into_iter().enumerate() {
             stats.samples += samples;
+            stats.backed_off += backed_off;
             stats.hits += hits.iter().flatten().count() as u64;
             image.hits.extend(hits);
             found.extend(
@@ -1534,6 +1660,35 @@ fn neighbour_offsets() -> impl Iterator<Item = DVec3> {
 }
 
 /// A number in [0, 1) that is the same for the same ray of the same pass.
+/// The two crossings a probe finds either side of a hit are this many
+/// pitches apart in their distance along the ray, or more, when an edge
+/// lies between them. A plane gives zero; a cylinder as wide as a pitch
+/// seen side-on, a quarter.
+const EDGE_ASYMMETRY: f64 = 0.25;
+
+/// Directions spread evenly over the sphere, for a normal estimated from
+/// the occupancy around a point.
+fn sphere_directions() -> &'static [DVec3] {
+    static DIRECTIONS: std::sync::OnceLock<Vec<DVec3>> = std::sync::OnceLock::new();
+    DIRECTIONS.get_or_init(|| {
+        let n = 32;
+        (0..n)
+            .map(|i| {
+                let z = 1.0 - 2.0 * (i as f64 + 0.5) / n as f64;
+                let r = (1.0 - z * z).sqrt();
+                let phi = i as f64 * std::f64::consts::PI * (3.0 - 5f64.sqrt());
+                DVec3::new(r * phi.cos(), r * phi.sin(), z)
+            })
+            .collect()
+    })
+}
+
+/// The bisection steps that place a point in a bracket `width` wide to
+/// the same fraction of `unit` as [`BISECTIONS`] place one `unit` wide.
+fn bisections_for(width: f64, unit: f64) -> usize {
+    BISECTIONS + (width / unit).max(1.0).log2().ceil() as usize
+}
+
 fn unit_hash(x: u32, y: u32, salt: u32) -> f64 {
     let mut h = x
         .wrapping_mul(0x9E37_79B1)
@@ -2150,6 +2305,69 @@ mod tests {
         }
         println!("{wrong} of {facing} surfels facing the second view have a wrong normal");
         assert!(wrong * 500 < facing, "{wrong} of {facing}");
+    }
+
+    /// A normal found beside an edge is a normal of the model there, not
+    /// the plane through points on two different faces: on a block with
+    /// two grooves cut across its near face, no found normal lies more
+    /// than 60 degrees from the direction the model's occupancy around
+    /// the point gives. (The first probe over a lip used to bracket the
+    /// groove's wall or floor, and 65 of 38,662 surfels came out lying
+    /// across the face; drawn as discs they were dark specks along every
+    /// lip.)
+    #[test]
+    fn a_normal_beside_an_edge_is_still_a_normal() {
+        let model = Analytic {
+            extent: 1.0,
+            inside: |p: DVec3| {
+                let block = p.abs().max_element() <= 0.8;
+                let groove = p.x > 0.6 && ((p.z - 0.3).abs() < 0.05 || (p.z + 0.3).abs() < 0.05);
+                block && !groove
+            },
+        };
+        let view = CastView::look_at(
+            DVec3::new(4.0, 0.5, 1.5),
+            DVec3::ZERO,
+            DVec3::Z,
+            CastProjection::Perspective {
+                tan_half_fov_y: 0.3,
+            },
+            256,
+            256,
+        );
+        let mut cast = DirectCast::for_model(&model).unwrap();
+        cast.cast(&model, &view, &CastOptions::default(), &NEVER)
+            .unwrap();
+        let directions: Vec<DVec3> = (0..60)
+            .map(|i| {
+                let z = 1.0 - 2.0 * (i as f64 + 0.5) / 60.0;
+                let r = (1.0 - z * z).sqrt();
+                let phi = i as f64 * std::f64::consts::PI * (3.0 - 5f64.sqrt());
+                DVec3::new(r * phi.cos(), r * phi.sin(), z)
+            })
+            .collect();
+        let (mut found, mut askew) = (0, 0);
+        for s in cast.surfels(None) {
+            if s.guessed {
+                continue;
+            }
+            let position = Vec3::from(s.position).as_dvec3();
+            let mut oracle = DVec3::ZERO;
+            for d in &directions {
+                let q = position + *d * (s.radius as f64);
+                oracle += if (model.inside)(q) { -*d } else { *d };
+            }
+            let Some(oracle) = oracle.try_normalize() else {
+                continue;
+            };
+            found += 1;
+            let off = oracle
+                .angle_between(Vec3::from(s.normal).as_dvec3())
+                .to_degrees();
+            askew += (off > 60.0) as usize;
+        }
+        println!("{askew} of {found} found normals are more than 60 degrees off the model's");
+        assert!(askew <= 2, "{askew} of {found}");
     }
 
     /// A level holding only the sparse surfels of a grazing pass does not

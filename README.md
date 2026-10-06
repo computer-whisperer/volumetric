@@ -602,6 +602,12 @@ volumetric_cli sample-bench -i project.vproj --asset car
 # Run the direct caster (no mesh): cost per pass, a shaded image, and
 # agreement with the mesher's vertices
 volumetric_cli cast-bench -i project.vproj --asset car -o cast.png --mesh-depth 6
+
+# Cast a sequence of views as a viewport would (each cut off after two
+# passes, turning and zooming), then check the last view's normals against
+# the model and write the discs the viewport would draw
+volumetric_cli cast-bench -i project.vproj --views 40 --yaw-step 3 --zoom-step 1.05 \
+    --passes 2 --check-normals -o cast.png --splat discs.png
 ```
 
 ## Coordinate System and Units
