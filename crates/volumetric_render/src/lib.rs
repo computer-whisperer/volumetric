@@ -20,13 +20,13 @@ use std::sync::atomic::AtomicBool;
 use view_core::image::{Rgb, decode_rgb};
 use view_core::overlay::compose;
 
-use volumetric::direct_cast::{CastOptions, CastProjection, CastView, DirectCast};
+use volumetric::direct_cast::{CastOptions, DirectCast};
 use volumetric::wasm::ParallelModelSampler;
 use volumetric::wasm::native::NativeParallelSampler;
 use volumetric::{AssetTypeHint, LoadedAsset};
 use volumetric_preview::{
     Asn2Settings, MarkLabel, OutputStats, PreviewBounds, PreviewEntity, PreviewMeshPlan,
-    PreviewPlan, PreviewRenderMode, PreviewRequest, ViewFrame, build_preview_scene,
+    PreviewPlan, PreviewRenderMode, PreviewRequest, ViewFrame, build_preview_scene, cast_view_of,
     clip_planes_for, mark_labels, observation_lines, srgb_to_linear, submit_subspace_gizmo,
     submit_view_highlight, wireframe_style,
 };
@@ -672,38 +672,9 @@ impl DirectSource {
             subspace: None,
             mesh_keys: Vec::new(),
             articulated: None,
+            direct_models: Vec::new(),
         }
     }
-}
-
-/// The caster's view of a frame drawn `width × height`: the same eye,
-/// axes and projection. A sheared frustum (a photograph's off-centre
-/// principal point) has no caster equivalent yet.
-fn cast_view_of(view: &CameraView, (width, height): (u32, u32)) -> Result<CastView> {
-    let camera_to_world = view.view.inverse();
-    let axis = |i: usize| camera_to_world.col(i).truncate().as_dvec3().normalize();
-    let projection = view.projection.to_cols_array_2d();
-    anyhow::ensure!(
-        projection[2][0].abs() < 1e-6 && projection[2][1].abs() < 1e-6,
-        "a direct cast cannot look through an off-centre camera yet"
-    );
-    let orthographic = projection[3][3] == 1.0;
-    let scale = 1.0 / projection[1][1] as f64;
-    Ok(CastView {
-        eye: camera_to_world.col(3).truncate().as_dvec3(),
-        right: axis(0),
-        up: axis(1),
-        forward: -axis(2),
-        projection: if orthographic {
-            CastProjection::Orthographic { half_height: scale }
-        } else {
-            CastProjection::Perspective {
-                tan_half_fov_y: scale,
-            }
-        },
-        width,
-        height,
-    })
 }
 
 pub fn render(
@@ -935,7 +906,7 @@ pub fn render(
         // A cast model's surfels are found for this very frame, at the
         // drawn size, so every pixel has a sample of its own.
         let cast_view = if direct.iter().any(Option::is_some) {
-            Some(cast_view_of(&view, drawn)?)
+            Some(cast_view_of(&view, drawn).map_err(anyhow::Error::msg)?)
         } else {
             None
         };

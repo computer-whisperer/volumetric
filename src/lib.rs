@@ -506,6 +506,17 @@ pub fn model_dimensions_from_bytes(wasm_bytes: &[u8]) -> anyhow::Result<u32> {
     Ok(executor.dimensions()?)
 }
 
+/// The bounds a 3D model WASM reports, as `f32` corners.
+#[cfg(any(feature = "native", feature = "web"))]
+pub fn model_bounds_from_bytes(
+    wasm_bytes: &[u8],
+) -> anyhow::Result<((f32, f32, f32), (f32, f32, f32))> {
+    use wasm::ModelExecutor;
+    let mut executor =
+        wasm::create_model_executor(wasm_bytes).context("Failed to create model executor")?;
+    Ok(executor.get_bounds()?.as_f32())
+}
+
 /// Number of dimensions a model WASM reports, read statically — no
 /// instantiation. Every model generator emits `get_dimensions` as a single
 /// `i32.const`, so a streaming scan of the export and code sections

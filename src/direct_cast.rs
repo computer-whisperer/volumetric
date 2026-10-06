@@ -620,6 +620,50 @@ impl DirectCast {
         }
     }
 
+    /// What the surfels already found show of `view` at `spacing`: the
+    /// nearest front-facing surfel found at a pitch fine enough for each
+    /// lattice pixel, as the hits of an image a pass can start from.
+    pub fn coverage(&self, view: &CastView, spacing: f64) -> CastImage {
+        let (width, height) = CastImage::lattice(view, spacing);
+        let mut image = CastImage {
+            width,
+            height,
+            spacing,
+            hits: vec![None; width as usize * height as usize],
+        };
+        for surfel in self.surfels(Some((view, spacing))) {
+            let position = Vec3::from(surfel.position).as_dvec3();
+            let normal = Vec3::from(surfel.normal).as_dvec3();
+            if normal.dot(view.direction_at(position)) >= 0.0 {
+                continue;
+            }
+            let pitch = spacing * view.footprint_at(position);
+            if surfel.radius as f64 > RADIUS_PER_PITCH * pitch * SAME_PITCH {
+                continue;
+            }
+            let Some((x, y)) = view.pixel_of(position) else {
+                continue;
+            };
+            let (x, y) = ((x / spacing) as u32, (y / spacing) as u32);
+            if x >= width || y >= height {
+                continue;
+            }
+            let t = match view.projection {
+                CastProjection::Perspective { .. } => (position - view.eye).length(),
+                CastProjection::Orthographic { .. } => (position - view.eye).dot(view.forward),
+            };
+            let slot = &mut image.hits[(y * width + x) as usize];
+            if slot.is_none_or(|hit| t < hit.t) {
+                *slot = Some(RayHit {
+                    t,
+                    position,
+                    normal: surfel.normal.into(),
+                });
+            }
+        }
+        image
+    }
+
     pub fn node_count(&self) -> usize {
         self.nodes.len()
     }
@@ -873,10 +917,14 @@ impl DirectCast {
         None
     }
 
-    /// Casts one lattice of rays `spacing` pixels apart. `previous`, the
-    /// image of the pass before at the same spacing, is what a
-    /// [`PassMode::Chase`] pass adds to. `None` when cancelled, with the
-    /// record unchanged.
+    /// Casts one lattice of rays `spacing` pixels apart. `None` when
+    /// cancelled, with the record unchanged.
+    ///
+    /// `previous` is an image at the same spacing whose hits are trusted:
+    /// the pass before at this spacing, or [`coverage`](Self::coverage).
+    /// A [`PassMode::Refine`] pass keeps them and traces only the rays
+    /// that have none; the other modes keep them too and stop each ray at
+    /// its hit, searching only the space in front.
     pub fn pass(
         &mut self,
         sampler: &(impl ParallelModelSampler + ?Sized),
@@ -888,9 +936,7 @@ impl DirectCast {
     ) -> Option<(CastImage, PassStats)> {
         let start = web_time::Instant::now();
         let (width, height) = CastImage::lattice(view, spacing);
-        let previous = previous.filter(|image| {
-            mode == PassMode::Chase && (image.width, image.height) == (width, height)
-        });
+        let previous = previous.filter(|image| (image.width, image.height) == (width, height));
         let salt = self.passes;
         let this = &*self;
         let previous_ref = previous.as_ref();
@@ -908,6 +954,10 @@ impl DirectCast {
                     (column as f64 + 0.5) * spacing,
                     (row as f64 + 0.5) * spacing,
                 );
+                if mode == PassMode::Refine && before.is_some() {
+                    hits.push(before);
+                    continue;
+                }
                 let limit = before.map_or(f64::INFINITY, |hit| hit.t);
                 let jitter = unit_hash(column as u32, row as u32, salt);
                 let traced = this.trace(
@@ -1118,40 +1168,8 @@ impl DirectCast {
         }
     }
 
-    /// Runs one pass at the finished image's spacing, then
-    /// [`PassMode::Chase`] passes until one finds nothing more to follow,
-    /// adding what they cost to `total`.
-    fn pass_and_chase(
-        &mut self,
-        sampler: &(impl ParallelModelSampler + ?Sized),
-        view: &CastView,
-        spacing: f64,
-        mode: PassMode,
-        cancel: &AtomicBool,
-        total: &mut PassStats,
-    ) -> Option<CastImage> {
-        let (mut image, mut stats) = self.pass(sampler, view, spacing, mode, None, cancel)?;
-        *total += stats;
-        for _ in 0..MAX_CHASES {
-            if stats.followed == 0 {
-                break;
-            }
-            (image, stats) =
-                self.pass(sampler, view, spacing, PassMode::Chase, Some(image), cancel)?;
-            *total += stats;
-        }
-        Some(image)
-    }
-
     /// Takes `view` from whatever the record already holds to a finished
-    /// image. `None` when cancelled.
-    ///
-    /// The order is the one a viewport wants: a coarse search, then known
-    /// surface redrawn at each finer spacing down to the final one, where
-    /// thin things the search happened on are followed along their
-    /// length. Only then is empty space searched at each finer spacing
-    /// down to `options.search`, which is where the time goes; whatever
-    /// that finds is redrawn and followed the same way.
+    /// image, running a [`CastRun`] to its end. `None` when cancelled.
     pub fn cast(
         &mut self,
         sampler: &(impl ParallelModelSampler + ?Sized),
@@ -1159,57 +1177,165 @@ impl DirectCast {
         options: &CastOptions,
         cancel: &AtomicBool,
     ) -> Option<(CastImage, PassStats)> {
-        let mut total = PassStats::default();
+        let mut run = CastRun::new(options);
+        while run.step(self, sampler, view, cancel)? {}
+        let total = run.total;
+        Some((run.into_image()?, total))
+    }
+}
+
+/// One pass a [`CastRun`] has yet to do.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Planned {
+    spacing: f64,
+    mode: PassMode,
+    /// Whether [`PassMode::Chase`] passes follow it while they find more.
+    chase: bool,
+}
+
+/// The passes that take one view from whatever the record holds to a
+/// finished image, one [`step`](Self::step) at a time, so a viewport can
+/// draw between them and stop when the view changes.
+///
+/// The order is the one a viewport wants: a coarse search, then known
+/// surface redrawn at each finer spacing down to the final one, where
+/// thin things the search happened on are followed along their length.
+/// Only then is empty space searched at each finer spacing down to
+/// `options.search`, which is where the time goes; whatever that finds is
+/// redrawn and followed the same way. Every pass starts from what the
+/// record's surfels already show of the view
+/// ([`DirectCast::coverage`]), so a view near one already cast is mostly
+/// skipped.
+pub struct CastRun {
+    options: CastOptions,
+    queue: std::collections::VecDeque<Planned>,
+    chases: usize,
+    /// The latest image at the final spacing.
+    image: Option<CastImage>,
+    pub total: PassStats,
+    /// The finest spacing, in pixels, a search has been completed at for
+    /// this view; infinite before the first.
+    pub searched: f64,
+    /// The spacing of the latest pass, in pixels.
+    pub drawn: Option<f64>,
+}
+
+impl CastRun {
+    pub fn new(options: &CastOptions) -> Self {
         let mut levels = vec![options.spacing];
         while levels[levels.len() - 1] * 2.0 <= options.coarsest {
             levels.push(levels[levels.len() - 1] * 2.0);
         }
         levels.reverse();
         let last = levels.len() - 1;
-
-        let mut image = None;
+        let mut queue = std::collections::VecDeque::new();
         for (i, &spacing) in levels.iter().enumerate() {
-            let mode = if i == 0 {
-                PassMode::Discover
-            } else {
-                PassMode::Refine
-            };
-            if i == last {
-                image =
-                    Some(self.pass_and_chase(sampler, view, spacing, mode, cancel, &mut total)?);
-            } else {
-                total += self.pass(sampler, view, spacing, mode, None, cancel)?.1;
-            }
+            queue.push_back(Planned {
+                spacing,
+                mode: if i == 0 {
+                    PassMode::Discover
+                } else {
+                    PassMode::Refine
+                },
+                chase: i == last,
+            });
         }
-        for (i, &spacing) in levels.iter().enumerate().skip(1) {
+        for &spacing in levels.iter().skip(1) {
             if spacing < options.search {
                 break;
             }
-            if i == last {
-                image = Some(self.pass_and_chase(
-                    sampler,
-                    view,
-                    spacing,
-                    PassMode::Discover,
-                    cancel,
-                    &mut total,
-                )?);
-                continue;
-            }
-            let (_, stats) = self.pass(sampler, view, spacing, PassMode::Discover, None, cancel)?;
-            total += stats;
-            if stats.fresh > 0 {
-                image = Some(self.pass_and_chase(
-                    sampler,
-                    view,
-                    options.spacing,
-                    PassMode::Refine,
-                    cancel,
-                    &mut total,
-                )?);
-            }
+            queue.push_back(Planned {
+                spacing,
+                mode: PassMode::Discover,
+                chase: spacing == options.spacing,
+            });
         }
-        Some((image?, total))
+        Self {
+            options: *options,
+            queue,
+            chases: 0,
+            image: None,
+            total: PassStats::default(),
+            searched: f64::INFINITY,
+            drawn: None,
+        }
+    }
+
+    /// Whether any pass remains.
+    pub fn pending(&self) -> bool {
+        !self.queue.is_empty()
+    }
+
+    /// Runs the next pass. `Some(true)` when more remain, `Some(false)`
+    /// when the run is finished, `None` when the pass was cancelled (the
+    /// run can go on from the same pass).
+    pub fn step(
+        &mut self,
+        cast: &mut DirectCast,
+        sampler: &(impl ParallelModelSampler + ?Sized),
+        view: &CastView,
+        cancel: &AtomicBool,
+    ) -> Option<bool> {
+        let Some(planned) = self.queue.front().copied() else {
+            return Some(false);
+        };
+        let at_final = planned.spacing == self.options.spacing;
+        let previous = match (planned.mode, at_final) {
+            (PassMode::Chase, _) => self.image.clone(),
+            (_, true) => Some(
+                self.image
+                    .clone()
+                    .unwrap_or_else(|| cast.coverage(view, planned.spacing)),
+            ),
+            (_, false) => Some(cast.coverage(view, planned.spacing)),
+        };
+        let (image, stats) = cast.pass(
+            sampler,
+            view,
+            planned.spacing,
+            planned.mode,
+            previous,
+            cancel,
+        )?;
+        self.queue.pop_front();
+        self.total += stats;
+        self.drawn = Some(planned.spacing);
+        if at_final {
+            self.image = Some(image);
+        }
+        match planned.mode {
+            PassMode::Discover => {
+                self.searched = self.searched.min(planned.spacing);
+                // What a coarser search found has to reach the image.
+                if !at_final && stats.fresh > 0 {
+                    self.queue.push_front(Planned {
+                        spacing: self.options.spacing,
+                        mode: PassMode::Refine,
+                        chase: true,
+                    });
+                }
+            }
+            PassMode::Refine => self.chases = 0,
+            PassMode::Chase => {}
+        }
+        if planned.chase && stats.followed > 0 && self.chases < MAX_CHASES {
+            self.chases += 1;
+            self.queue.push_front(Planned {
+                spacing: planned.spacing,
+                mode: PassMode::Chase,
+                chase: true,
+            });
+        }
+        Some(!self.queue.is_empty())
+    }
+
+    /// The latest image at the final spacing.
+    pub fn image(&self) -> Option<&CastImage> {
+        self.image.as_ref()
+    }
+
+    pub fn into_image(self) -> Option<CastImage> {
+        self.image
     }
 }
 
@@ -1599,7 +1725,9 @@ mod tests {
             .zip(&after.hits)
             .filter(|(a, b)| a.is_some() != b.is_some())
             .count();
-        assert!(differing < 40, "{differing} pixels differ in coverage");
+        // At the silhouette a surfel from the first view can stand in for a
+        // pixel the second view's own ray just misses, and the reverse.
+        assert!(differing < 120, "{differing} pixels differ in coverage");
     }
 
     /// Zooming in finds finer surface points where the view now looks,

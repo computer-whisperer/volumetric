@@ -615,6 +615,7 @@ impl Host {
             || gfx.session.has_pending_thumbnail()
             || gfx.session.camera_animating()
             || gfx.session.has_pending_splat_sort()
+            || gfx.session.has_pending_cast()
             || gfx.session.run_in_flight()
             || self.app.has_pending_metadata()
             || self.app.has_pending_view_thumbnails()

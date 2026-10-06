@@ -26,7 +26,8 @@ pub use volumetric_preview::{
     submit_subspace_gizmo, submit_view_highlight,
 };
 use volumetric_preview::{
-    format_error_chain, joint_axis_half, joint_axis_lines, joint_axis_style, wireframe_style,
+    cast_view_in_frame, cast_view_of, format_error_chain, joint_axis_half, joint_axis_lines,
+    joint_axis_style, wireframe_style,
 };
 
 use crate::{
@@ -332,6 +333,7 @@ impl Session {
         );
         app.set_viewport_overflow(self.viewport.frame_overflow_message());
         app.set_grid_spacing(self.viewport.last_frame.grid_spacing);
+        app.set_direct_status(self.direct_status());
         jobs.extend(preview_jobs.into_iter().map(BackgroundJob::BuildPreview));
 
         // Export modal: deliver the export geometry the sync after the
@@ -630,6 +632,247 @@ impl Session {
     pub fn camera_animating(&self) -> bool {
         self.viewport.navigator.animating()
     }
+
+    /// A directly cast model is still being cast for the current view;
+    /// the shell keeps painting so each pass lands as it finishes.
+    pub fn has_pending_cast(&self) -> bool {
+        self.viewport.direct.values().any(DirectSlot::busy)
+    }
+
+    /// One line on the state of the viewport's direct casts, for the HUD;
+    /// `None` when nothing is cast directly.
+    pub fn direct_status(&self) -> Option<String> {
+        let slots: Vec<&DirectSlot> = self.viewport.direct.values().collect();
+        if slots.is_empty() {
+            return None;
+        }
+        if slots.iter().any(|slot| slot.worker.is_none()) {
+            return Some("direct cast needs threads (not in the browser)".to_string());
+        }
+        let searched = slots
+            .iter()
+            .map(|slot| slot.status.searched)
+            .fold(0.0f64, f64::max);
+        let drawn = slots
+            .iter()
+            .filter_map(|slot| slot.status.drawn)
+            .fold(0.0f64, f64::max);
+        let busy = slots.iter().any(|slot| slot.busy());
+        let px = |spacing: f64| {
+            if spacing >= 1.0 {
+                format!("{spacing:.0} px")
+            } else {
+                format!("{spacing:.2} px")
+            }
+        };
+        Some(match (searched.is_finite(), busy) {
+            (false, true) => "direct cast: searching".to_string(),
+            (false, false) => "direct cast: no surface found".to_string(),
+            (true, true) => format!(
+                "direct cast: searched to {}, drawing at {}",
+                px(searched),
+                px(drawn)
+            ),
+            (true, false) => format!("direct cast: searched to {}", px(searched)),
+        })
+    }
+}
+
+/// What a direct cast's thread reports after each pass.
+struct DirectResult {
+    surfels: Vec<renderer::SurfelVertex>,
+    status: DirectStatus,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DirectStatus {
+    /// The finest spacing, in pixels, the current view has been searched
+    /// at; infinite before the first pass.
+    searched: f64,
+    /// The spacing of the latest pass.
+    drawn: Option<f64>,
+    /// Whether passes remain for the current view.
+    pending: bool,
+}
+
+/// The thread casting one model: it takes views and answers with the
+/// surfels to draw after each pass, until its sender is dropped.
+struct DirectWorker {
+    views: std::sync::mpsc::Sender<(volumetric::direct_cast::CastView, Arc<AtomicBool>)>,
+    results: std::sync::mpsc::Receiver<DirectResult>,
+}
+
+impl DirectWorker {
+    /// `None` where threads are not available (the browser) or the model
+    /// cannot be sampled.
+    #[cfg(target_arch = "wasm32")]
+    fn spawn(_model: &Arc<Vec<u8>>) -> Option<Self> {
+        None
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn spawn(model: &Arc<Vec<u8>>) -> Option<Self> {
+        use volumetric::direct_cast::{CastOptions, CastRun, DirectCast};
+
+        let sampler = match volumetric::wasm::native::NativeParallelSampler::new(model) {
+            Ok(sampler) => sampler,
+            Err(err) => {
+                log::warn!("direct cast: {err}");
+                return None;
+            }
+        };
+        let mut cast = match DirectCast::for_model(&sampler) {
+            Ok(cast) => cast,
+            Err(err) => {
+                log::warn!("direct cast: {err}");
+                return None;
+            }
+        };
+        let (views, view_rx) =
+            std::sync::mpsc::channel::<(volumetric::direct_cast::CastView, Arc<AtomicBool>)>();
+        let (result_tx, results) = std::sync::mpsc::channel::<DirectResult>();
+        let spawned = std::thread::Builder::new()
+            .name("direct-cast".to_string())
+            .spawn(move || {
+                let mut next = view_rx.recv().ok();
+                while let Some((view, cancel)) = next.take() {
+                    let mut run = CastRun::new(&CastOptions::default());
+                    loop {
+                        // A newer view supersedes this one between passes
+                        // (and cancels it within one).
+                        if let Ok(newer) = view_rx.try_recv() {
+                            next = Some(newer);
+                            break;
+                        }
+                        match run.step(&mut cast, &sampler, &view, &cancel) {
+                            None => break,
+                            Some(more) => {
+                                let surfels = cast
+                                    .surfels(Some((&view, 1.0)))
+                                    .iter()
+                                    .map(|s| {
+                                        renderer::SurfelVertex::new(s.position, s.normal, s.radius)
+                                    })
+                                    .collect();
+                                let sent = result_tx.send(DirectResult {
+                                    surfels,
+                                    status: DirectStatus {
+                                        searched: run.searched,
+                                        drawn: run.drawn,
+                                        pending: more,
+                                    },
+                                });
+                                if sent.is_err() || !more {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if next.is_none() {
+                        next = view_rx.recv().ok();
+                    }
+                }
+            });
+        if let Err(err) = spawned {
+            log::warn!("direct cast: could not start a thread: {err}");
+            return None;
+        }
+        Some(Self { views, results })
+    }
+}
+
+impl Drop for DirectSlot {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// One model cast directly for the viewport.
+struct DirectSlot {
+    worker: Option<DirectWorker>,
+    /// The latest surfels, resident; `None` until the first pass lands.
+    surfels: Option<Arc<renderer::GpuSurfels>>,
+    /// The view last sent to the thread, with the flag that cancels its
+    /// passes.
+    sent: Option<(volumetric::direct_cast::CastView, Arc<AtomicBool>)>,
+    status: DirectStatus,
+}
+
+impl DirectSlot {
+    fn new(model: &Arc<Vec<u8>>) -> Self {
+        Self {
+            worker: DirectWorker::spawn(model),
+            surfels: None,
+            sent: None,
+            status: DirectStatus {
+                searched: f64::INFINITY,
+                ..DirectStatus::default()
+            },
+        }
+    }
+
+    fn busy(&self) -> bool {
+        self.worker.is_some() && self.sent.is_some() && self.status.pending
+    }
+
+    /// Has the thread cast `view` (the frame's camera, at the frame's size)
+    /// as seen from inside a part drawn under `transform`, unless it is
+    /// already doing so.
+    fn look(&mut self, view: &renderer::CameraView, size: (u32, u32), transform: Mat4) {
+        let Some(worker) = &self.worker else {
+            return;
+        };
+        let cast_view = match cast_view_of(view, size) {
+            Ok(view) => cast_view_in_frame(&view, transform),
+            Err(err) => {
+                log::warn!("direct cast: {err}");
+                return;
+            }
+        };
+        if self
+            .sent
+            .as_ref()
+            .is_some_and(|(sent, _)| *sent == cast_view)
+        {
+            return;
+        }
+        if let Some((_, cancel)) = &self.sent {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        if worker.views.send((cast_view, cancel.clone())).is_ok() {
+            self.sent = Some((cast_view, cancel));
+            self.status.pending = true;
+        }
+    }
+
+    /// Stops the thread's current pass; dropping the sender ends the
+    /// thread once it looks for the next view.
+    fn stop(&self) {
+        if let Some((_, cancel)) = &self.sent {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Uploads the latest pass's surfels, if any landed.
+    fn take_results(&mut self, renderer: &renderer::Renderer, device: &wgpu::Device) {
+        let Some(worker) = &self.worker else {
+            return;
+        };
+        let mut latest = None;
+        while let Ok(result) = worker.results.try_recv() {
+            latest = Some(result);
+        }
+        if let Some(result) = latest {
+            self.surfels = Some(renderer.create_retained_surfels(
+                device,
+                &renderer::SurfelData {
+                    surfels: result.surfels,
+                },
+            ));
+            self.status = result.status;
+        }
+    }
 }
 
 /// Which camera-relevant pointer buttons are currently held, in Damascene's
@@ -671,6 +914,10 @@ struct ViewportRenderer {
     /// transform, never re-uploaded. Entries live while a resident refers
     /// to them.
     part_meshes: HashMap<[u8; 32], Arc<renderer::GpuMesh>>,
+    /// Models cast directly in the viewport, by model hash, each with its
+    /// own record and thread. Entries live while a resident refers to
+    /// them, like `part_meshes`.
+    direct: HashMap<[u8; 32], DirectSlot>,
     /// The placeholder scene drawn while nothing is materialized, uploaded
     /// the first time it is needed.
     placeholder: Option<renderer::RetainedScene>,
@@ -817,6 +1064,7 @@ impl ViewportRenderer {
             preview_cache: PreviewCache::default(),
             resident: HashMap::new(),
             part_meshes: HashMap::new(),
+            direct: HashMap::new(),
             placeholder: None,
             last_frame: renderer::FrameInfo::default(),
             scene_bounds: None,
@@ -1484,6 +1732,9 @@ impl ViewportRenderer {
             .flat_map(|resident| resident.part_keys.iter().copied())
             .collect();
         self.part_meshes.retain(|key, _| live_parts.contains(key));
+        self.direct.retain(|key, _| live_parts.contains(key));
+        let frame_size = self.target.extent;
+        let last_view = self.last_view;
         // A rebuilt entity carries the handed-back state: its own poses
         // take over from the override.
         let revisions: HashMap<&str, u64> =
@@ -1543,6 +1794,25 @@ impl ViewportRenderer {
                     renderer::ObjectId(object),
                     renderer::MaterialId::default(),
                 );
+                if let Some(Some(model)) = entity.direct_models.get(i) {
+                    let key = entity.mesh_keys[i].expect("a cast part has a key");
+                    let slot = self
+                        .direct
+                        .entry(key)
+                        .or_insert_with(|| DirectSlot::new(model));
+                    slot.take_results(&self.renderer, device);
+                    if let Some(view) = last_view {
+                        slot.look(&view, frame_size, transform);
+                    }
+                    if let Some(surfels) = &slot.surfels {
+                        self.renderer.submit_retained_surfels(
+                            surfels,
+                            transform,
+                            renderer::ObjectId(object),
+                            renderer::MaterialId::default(),
+                        );
+                    }
+                }
             }
             match posed {
                 // The joint axes follow the override's poses.
@@ -3809,6 +4079,7 @@ mod tests {
             wireframe_lines: None,
             mesh_keys: Vec::new(),
             articulated: None,
+            direct_models: Vec::new(),
             subspace: None,
         }
     }
@@ -4696,6 +4967,108 @@ mod navigation_tests {
             device: offscreen.device(),
             queue: offscreen.queue(),
         }
+    }
+
+    impl Rig {
+        /// A frame with `requests` in the viewport.
+        fn frame_with(&mut self, requests: &[PreviewRequest]) {
+            let (device, queue) = (self.offscreen.device(), self.offscreen.queue());
+            let mut encoder = device.create_command_encoder(&Default::default());
+            self.session.render(ViewportRenderParams {
+                device,
+                queue,
+                encoder: &mut encoder,
+                logical_rect: Some(RECT),
+                scale_factor: SCALE,
+                clear_color: wgpu::Color::BLACK,
+                preview_requests: requests.to_vec(),
+                look_through: None,
+                settings: crate::ViewportSettings::default(),
+            });
+            queue.submit([encoder.finish()]);
+        }
+    }
+
+    /// A model previewed in Direct mode is drawn from the surfels its own
+    /// thread casts: the viewport reports the cast's progress until the
+    /// view is searched to its pixels, and a pick at the model's centre
+    /// then lands on its surface.
+    #[test]
+    fn a_direct_preview_is_cast_on_its_own_thread() {
+        let Some(mut rig) = Rig::new() else {
+            return;
+        };
+        let sphere = volumetric_assets::get_model("simple_sphere_model")
+            .expect("bundled sphere model")
+            .bytes
+            .to_vec();
+        let (min, max) = volumetric::model_bounds_from_bytes(&sphere).unwrap();
+        let centre = (Vec3::from(min) + Vec3::from(max)) * 0.5;
+        let request = PreviewRequest {
+            asset_id: "sphere".to_string(),
+            source_hash: volumetric::content_fingerprint(&sphere),
+            data: Arc::new(sphere),
+            type_hint: Some(volumetric::AssetTypeHint::Model),
+            precursor_ids: vec![],
+            plan: PreviewPlan::Model3d {
+                mesh: crate::PreviewMeshPlan::Direct,
+                color_channel: None,
+                tint_uncolored: false,
+            },
+            wireframe: false,
+            show_bounds: false,
+            stale: false,
+        };
+        let requests = vec![request.clone()];
+        // The build is instant (bounds only); feed it in by hand as the
+        // shell's executor would.
+        let (_, jobs) = rig
+            .session
+            .viewport
+            .preview_cache
+            .sync(&requests, true, false);
+        assert_eq!(jobs.len(), 1);
+        let BackgroundResult::PreviewComplete(result) = execute_job(BackgroundJob::BuildPreview(
+            jobs.into_iter().next().unwrap(),
+        )) else {
+            panic!("not a preview result");
+        };
+        let Ok(entity) = result.result.as_ref() else {
+            panic!("the direct preview failed to build");
+        };
+        assert_eq!(entity.direct_models.len(), 1);
+        assert_eq!(entity.scene.meshes.len(), 1);
+        rig.session.viewport.accept_preview_result(*result);
+
+        // Frames until the cast has searched the view to its pixels.
+        let started = std::time::Instant::now();
+        loop {
+            rig.frame_with(&requests);
+            let status = rig.session.direct_status();
+            if status.as_deref() == Some("direct cast: searched to 1 px") {
+                break;
+            }
+            assert!(
+                started.elapsed().as_secs() < 60,
+                "cast did not finish: {status:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(!rig.session.has_pending_cast());
+        rig.frame_with(&requests);
+
+        let pointer = rig.pointer_over(centre);
+        let hit = rig
+            .session
+            .viewport
+            .pick_at(gpu(&rig.offscreen), pointer, RECT)
+            .expect("the sphere under the pointer");
+        let radius = (Vec3::from(max) - Vec3::from(min)).max_element() * 0.5;
+        // The sphere reaches its bounds; a pick lands at its radius.
+        assert!(
+            ((hit - centre).length() - radius).abs() < radius * 0.02,
+            "{hit} is not on the sphere's surface"
+        );
     }
 
     fn navigation(orbit_mode: renderer::OrbitMode) -> Navigation {

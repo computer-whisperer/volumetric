@@ -217,6 +217,37 @@ pub fn preview_prelude(
             );
             (scene, Some(wireframe), bounds_min, bounds_max)
         }
+        PreviewMeshPlan::Direct => {
+            // Nothing is built here: the host casts the model itself and
+            // draws what it finds under this one empty mesh.
+            let (bounds_min, bounds_max) =
+                volumetric::model_bounds_from_bytes(request.data.as_slice())
+                    .map_err(format_error_chain)?;
+            stats
+                .detail
+                .push("Cast directly in the viewport (no mesh)".to_string());
+            let mut scene = renderer::SceneData::new();
+            scene.add_mesh(
+                renderer::MeshData {
+                    vertices: Vec::new(),
+                    indices: None,
+                },
+                glam::Mat4::IDENTITY,
+                renderer::MaterialId(0),
+            );
+            let mut entity = finish_preview_scene(
+                request,
+                scene,
+                None,
+                (bounds_min, bounds_max),
+                color_channel.map(str::to_string),
+                stats,
+                build_start,
+            );
+            entity.mesh_keys = vec![Some(request.source_hash)];
+            entity.direct_models = vec![Some(Arc::clone(&request.data))];
+            return Ok(Some(PreviewStage::Done(Box::new(entity))));
+        }
         PreviewMeshPlan::AdaptiveSurfaceNets2 { .. } => {
             let config = mesh_plan
                 .adaptive_surface_nets_config()
@@ -421,6 +452,7 @@ fn finish_preview_scene(
         wireframe_lines,
         mesh_keys: Vec::new(),
         articulated: None,
+        direct_models: Vec::new(),
         subspace: None,
     }
 }
@@ -854,6 +886,7 @@ fn build_sketch_preview(
         wireframe_lines: None,
         mesh_keys: Vec::new(),
         articulated: None,
+        direct_models: Vec::new(),
         subspace: None,
     })
 }
@@ -1346,6 +1379,7 @@ fn build_fea_mesh_preview(
         wireframe_lines: (!is_cloud).then_some(renderer::LineData { segments }),
         mesh_keys: Vec::new(),
         articulated: None,
+        direct_models: Vec::new(),
         subspace: None,
     })
 }
@@ -1459,6 +1493,7 @@ fn build_tri_mesh_preview(
         wireframe_lines: Some(renderer::LineData { segments }),
         mesh_keys: Vec::new(),
         articulated: None,
+        direct_models: Vec::new(),
         subspace: None,
     })
 }
@@ -1504,6 +1539,7 @@ fn build_subspace_preview(
         wireframe_lines: None,
         mesh_keys: Vec::new(),
         articulated: None,
+        direct_models: Vec::new(),
         subspace: Some(subspace),
     })
 }

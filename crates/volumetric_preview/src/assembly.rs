@@ -168,6 +168,9 @@ struct BuiltPart {
     bounds: ((f32, f32, f32), (f32, f32, f32)),
     /// The mesh's identity for GPU residency, when it has a stable one.
     key: Option<[u8; 32]>,
+    /// The part's model, when the host casts it directly instead of
+    /// drawing `mesh` (which is then empty).
+    direct: Option<Arc<Vec<u8>>>,
 }
 
 /// Places every built part under its pose, tinted by name, and draws the
@@ -182,6 +185,7 @@ fn place(
 ) -> PreviewEntity {
     let mut scene = renderer::SceneData::new();
     let mut mesh_keys = Vec::new();
+    let mut direct_models = Vec::new();
     let mut part_of_mesh = Vec::new();
     let mut wireframe = renderer::LineData {
         segments: Vec::new(),
@@ -197,6 +201,7 @@ fn place(
             }
             scene.add_mesh(mesh, *pose, renderer::MaterialId(0));
             mesh_keys.push(built.key);
+            direct_models.push(built.direct.take());
             part_of_mesh.push(part_index);
         }
         if let Some(mut points) = built.points.take() {
@@ -258,6 +263,11 @@ fn place(
             part_of_mesh,
         })),
         subspace: None,
+        direct_models: if direct_models.iter().any(Option::is_some) {
+            direct_models
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -293,6 +303,7 @@ pub fn build_assembly_preview(
                     wireframe: None,
                     bounds: (min, max),
                     key: None,
+                    direct: None,
                 })
             })
             .collect::<Result<_, String>>()?,
@@ -315,6 +326,26 @@ pub fn build_assembly_preview(
                     wireframe: Some(wireframe),
                     bounds: (min, max),
                     key: None,
+                    direct: None,
+                })
+            })
+            .collect::<Result<_, String>>()?,
+        PreviewMeshPlan::Direct => assembly
+            .parts
+            .iter()
+            .map(|part| {
+                let bounds = volumetric::model_bounds_from_bytes(&part.model)
+                    .map_err(|e| format!("part `{}`: {}", part.name, format_error_chain(e)))?;
+                Ok(BuiltPart {
+                    mesh: Some(renderer::MeshData {
+                        vertices: Vec::new(),
+                        indices: None,
+                    }),
+                    points: None,
+                    wireframe: None,
+                    bounds,
+                    key: Some(volumetric::content_fingerprint(&part.model)),
+                    direct: Some(Arc::new(part.model.clone())),
                 })
             })
             .collect::<Result<_, String>>()?,
@@ -384,6 +415,7 @@ pub fn finish_assembly_preview(
                 wireframe: Some(wireframe),
                 bounds: (mesh.bounds_min, mesh.bounds_max),
                 key: Some(*key),
+                direct: None,
             }
         })
         .collect();
@@ -443,6 +475,7 @@ pub fn build_mechanism_preview(
         wireframe_lines: None,
         mesh_keys: Vec::new(),
         articulated: None,
+        direct_models: Vec::new(),
         subspace: None,
     })
 }

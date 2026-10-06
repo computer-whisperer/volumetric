@@ -1177,6 +1177,8 @@ pub struct VolumetricUiV2 {
     viewport_overflow: Option<String>,
     /// The spacing of the grid's minor lines in the last frame, metres.
     grid_spacing: Option<f32>,
+    /// The state of the viewport's direct casts, when any model is cast.
+    direct_status: Option<String>,
     /// The open 2D inspection lightbox, if any.
     lightbox: Option<LightboxState>,
     /// The open mesh-export modal, if any.
@@ -1286,6 +1288,7 @@ impl VolumetricUiV2 {
             artifact_thumbnail_order: std::collections::VecDeque::new(),
             viewport_overflow: None,
             grid_spacing: None,
+            direct_status: None,
             look_through: None,
             photo_opacity_percent: 50,
             viewset_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -2253,6 +2256,10 @@ impl VolumetricUiV2 {
 
     pub(crate) fn set_viewport_overflow(&mut self, message: Option<String>) {
         self.viewport_overflow = message;
+    }
+
+    pub(crate) fn set_direct_status(&mut self, status: Option<String>) {
+        self.direct_status = status;
     }
 
     pub(crate) fn set_grid_spacing(&mut self, spacing: Option<f32>) {
@@ -6127,6 +6134,10 @@ fn mode_resolution_rows(id: &str, mode: PreviewRenderMode, resolution: usize) ->
     }))
     .gap(tokens::SPACE_1);
 
+    // A direct cast has no resolution: it samples at the viewport's pixels.
+    if mode == PreviewRenderMode::Direct {
+        return vec![text("Render Mode").caption().muted(), mode_buttons];
+    }
     vec![
         text("Render Mode").caption().muted(),
         mode_buttons,
@@ -6448,6 +6459,9 @@ fn viewport_hud(app: &VolumetricUiV2) -> El {
                 .muted()
                 .xsmall(),
         );
+    }
+    if let Some(status) = &app.direct_status {
+        badges.push(badge(status).muted().xsmall());
     }
     if let Some(warning) = &app.viewport_overflow {
         badges.push(badge(warning).destructive().xsmall());

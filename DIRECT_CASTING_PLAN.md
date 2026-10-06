@@ -1,8 +1,9 @@
 # Direct casting: drawing a model without meshing it
 
-Status: **ratified 2026-10-05; steps 1 and 2 of 4 built** (the search
-library and `cast-bench`, §5.1; the disc pass and `render --direct`, §5.2),
-with the `sample-bench` instrument (`6aa4e2e`). This file is the target design; when
+Status: **ratified 2026-10-05; steps 1 to 3 of 4 built** (the search
+library and `cast-bench`, §5.1; the disc pass and `render --direct`, §5.2;
+the viewport mode, §5.3), with the `sample-bench` instrument (`6aa4e2e`).
+Step 4, tuning on the hard cases, remains. This file is the target design; when
 a decision here changes, rewrite it and record what was rejected and why.
 
 ## 1. What this is for
@@ -66,8 +67,7 @@ no work is repeated.
 
 ## 4. Design
 
-Sections 4.1 to 4.4 describe what is built; the viewport (step 3) is
-still the target.
+Sections 4.1 to 4.5 describe what is built.
 
 ### 4.1 One tree per model
 
@@ -182,6 +182,37 @@ regardless; compare before deciding what `render --direct` uses.
 been searched (for example "searched to 4 px" falling to "1 px"), so a
 blank region is never mistaken for a certified one.
 
+### 4.5 The viewport
+
+A fourth preview mode, **Direct**, beside points, marching cubes and
+surface nets. Choosing it builds a `PreviewEntity` like any other, but
+with no geometry: one empty mesh per part, keyed by the part's model hash,
+with the model bytes alongside (`PreviewEntity::direct_models`). Everything
+that handles entities (the cache, residency by key, assemblies' poses and
+drags, object ids, framing) is unchanged; the viewport session keeps one
+`DirectSlot` per model hash beside its per-part meshes.
+
+A slot owns a thread with the model's sampler and `DirectCast`. Each frame
+the session hands it the frame's camera, in the part's own frame
+(`cast_view_in_frame`, so a posed or dragged part is cast without moving
+its record); a changed view cancels the pass in flight and starts a
+`CastRun` for the new one. After every pass the thread sends the surfels
+to draw (`DirectCast::surfels` for that view) and the run's state; the
+session uploads them as retained surfels and submits them under the
+part's transform and object id, so they are lit, edged, occluded and
+picked like the mesh they replace. The HUD badge reads "direct cast:
+searched to 8 px, drawing at 1 px" and so on; the shell keeps painting
+while any slot has passes left.
+
+Reuse between views is `DirectCast::coverage`: every pass starts from
+what the stored surfels already show of the new view, a refine pass
+traces only the pixels they do not cover, and the other passes stop each
+ray at the covered depth. Orbiting a cast model therefore costs a coarse
+search per frame and, at rest, the pixels the move uncovered.
+
+Not in the browser: the thread is `std::thread`; on `wasm32` the slot has
+no worker and the badge says so.
+
 ### 4.4 Stills
 
 The same search run to completion at the drawn frame's pixel pitch, which
@@ -199,10 +230,7 @@ Each step ends with something that can be checked by running it.
 1. **The search as a library.** BUILT 2026-10-05; results in §5.1.
 2. **The surfel pass** in `volumetric_renderer` and `render --direct`.
    BUILT 2026-10-05; results in §5.2.
-3. **The viewport mode**: progressive passes on a worker, cancel on edit,
-   coarse during motion, the certainty readout, per-part records for
-   assemblies. Includes not re-tracing pixels the stored surfels already
-   cover after a camera move, which step 1 does not do.
+3. **The viewport mode.** BUILT 2026-10-05; §4.5 and §5.3.
 4. **Tuning on the two hard cases**: `lattice_test` and the Raspberry Pi
    STEP import (9 µs samples).
 
@@ -287,6 +315,39 @@ Known limits at the end of step 2:
   the cheap still.
 - Not cast: assemblies and other non-`Model` assets, and views through a
   photograph's camera.
+
+### 5.3 Step 3 as built
+
+`CastRun` (the pass schedule as a state machine, one pass per step) and
+`DirectCast::coverage` in the library; `PreviewRenderMode::Direct`,
+`PreviewMeshPlan::Direct` and `cast_view_of`/`cast_view_in_frame` in
+`volumetric_preview` (the headless render uses the same conversion);
+`DirectSlot` and `DirectWorker` in the GUI session; the mode button, the
+HUD badge, and the resolution row hidden for Direct.
+
+Checked: a GPU-backed session test previews the bundled sphere in Direct
+mode, drives frames until the badge says "searched to 1 px", and picks
+its surface at the sphere's radius. The part-frame conversion is tested
+against the world-frame projection for a scaled, rotated, translated
+part, perspective and orthographic. With coverage, the library's second
+view costs 28% of a fresh one (was 55%).
+
+Not checked: the GUI itself has not been run with a Direct output, so the
+badge, the mode button and the feel of orbiting a cast model are unseen;
+an assembly in Direct mode has not been tried; the browser build only
+type-checks.
+
+Known limits at the end of step 3:
+
+- The cast is at the viewport's physical size; a 4K viewport of a slow
+  model refines slowly, and there is no setting for a coarser final
+  spacing.
+- Nothing is evicted from a slot's record while the output is shown; a
+  long session orbiting a lattice grows it without bound.
+- Each pass re-uploads every surfel of the view (tens of MB for a
+  megapixel), rather than the ones that changed.
+- Part drags re-cast nothing (the record moves with the part) but the
+  coverage is recomputed from scratch each view change.
 
 ## 6. Open questions
 

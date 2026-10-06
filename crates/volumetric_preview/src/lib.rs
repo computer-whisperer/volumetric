@@ -16,9 +16,11 @@
 //! same code builds the viewport's scene, the CLI's PNG, and the tests.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
-use glam::Vec3;
+use std::sync::atomic::AtomicBool;
+use volumetric::direct_cast::{CastProjection, CastView};
+
+use glam::{Mat4, Vec3};
 use volumetric::{AssetTypeHint, adaptive_surface_nets_2};
 use volumetric_renderer as renderer;
 
@@ -49,13 +51,18 @@ pub enum PreviewRenderMode {
     Points,
     MarchingCubes,
     AdaptiveSurfaceNets2,
+    /// No mesh: the model is cast directly in the viewport
+    /// (`DIRECT_CASTING_PLAN.md`), its surface drawn as the points the
+    /// casts find.
+    Direct,
 }
 
 impl PreviewRenderMode {
-    pub const ALL: [Self; 3] = [
+    pub const ALL: [Self; 4] = [
         Self::Points,
         Self::MarchingCubes,
         Self::AdaptiveSurfaceNets2,
+        Self::Direct,
     ];
 
     pub fn route_name(self) -> &'static str {
@@ -63,6 +70,7 @@ impl PreviewRenderMode {
             Self::Points => "points",
             Self::MarchingCubes => "marching-cubes",
             Self::AdaptiveSurfaceNets2 => "asn2",
+            Self::Direct => "direct",
         }
     }
 
@@ -71,6 +79,7 @@ impl PreviewRenderMode {
             Self::Points => "Points",
             Self::MarchingCubes => "MC",
             Self::AdaptiveSurfaceNets2 => "ASN2",
+            Self::Direct => "Direct",
         }
     }
 
@@ -79,6 +88,7 @@ impl PreviewRenderMode {
             Self::Points => "Point Cloud",
             Self::MarchingCubes => "Marching Cubes",
             Self::AdaptiveSurfaceNets2 => "Adaptive Surface Nets v2",
+            Self::Direct => "Direct cast (no mesh)",
         }
     }
 
@@ -183,6 +193,10 @@ pub enum PreviewMeshPlan {
         max_depth: usize,
         settings: Asn2Settings,
     },
+    /// Cast directly in the viewport: the entity carries the model bytes
+    /// (`PreviewEntity::direct_models`) and an empty mesh per part for
+    /// the host to draw the cast's surfels under.
+    Direct,
 }
 
 impl PreviewMeshPlan {
@@ -200,6 +214,7 @@ impl PreviewMeshPlan {
                     settings: asn2,
                 }
             }
+            PreviewRenderMode::Direct => Self::Direct,
         }
     }
 
@@ -213,6 +228,7 @@ impl PreviewMeshPlan {
                 max_depth,
                 ..
             } => format!("ASN2 {target_resolution} ({base_resolution} x 2^{max_depth})"),
+            Self::Direct => "Direct cast".to_string(),
         }
     }
 
@@ -435,6 +451,11 @@ pub struct PreviewEntity {
     /// entry belongs to, so a host can re-pose the meshes for a state of
     /// its own (a drag) and hand the state back.
     pub articulated: Option<Arc<Articulated>>,
+    /// For a [`PreviewMeshPlan::Direct`] entity: per `scene.meshes` entry
+    /// (parallel; empty otherwise), the model the host casts directly and
+    /// draws under that entry's transform, object id and pose. The entry's
+    /// mesh itself is empty.
+    pub direct_models: Vec<Option<Arc<Vec<u8>>>>,
 }
 
 /// An assembly behind a preview entity.
@@ -571,5 +592,127 @@ impl ExecutionBackend for LocalBackend {
             }
         }
         Ok(artifact.map(|artifact| artifact.mesh))
+    }
+}
+
+/// The caster's view of a frame drawn `width × height`: the same eye,
+/// axes and projection. A sheared frustum (a photograph's off-centre
+/// principal point) has no caster equivalent yet.
+pub fn cast_view_of(
+    view: &renderer::CameraView,
+    (width, height): (u32, u32),
+) -> Result<CastView, String> {
+    let camera_to_world = view.view.inverse();
+    let axis = |i: usize| camera_to_world.col(i).truncate().as_dvec3().normalize();
+    let projection = view.projection.to_cols_array_2d();
+    if projection[2][0].abs() >= 1e-6 || projection[2][1].abs() >= 1e-6 {
+        return Err("a direct cast cannot look through an off-centre camera yet".to_string());
+    }
+    let orthographic = projection[3][3] == 1.0;
+    let scale = 1.0 / projection[1][1] as f64;
+    Ok(CastView {
+        eye: camera_to_world.col(3).truncate().as_dvec3(),
+        right: axis(0),
+        up: axis(1),
+        forward: -axis(2),
+        projection: if orthographic {
+            CastProjection::Orthographic { half_height: scale }
+        } else {
+            CastProjection::Perspective {
+                tan_half_fov_y: scale,
+            }
+        },
+        width,
+        height,
+    })
+}
+
+/// `view` seen from inside a part drawn under `transform` (rigid, or
+/// uniformly scaled): what to cast the part's own model with.
+pub fn cast_view_in_frame(view: &CastView, transform: Mat4) -> CastView {
+    let inverse = transform.inverse().as_dmat4();
+    let scale = transform.col(0).truncate().length() as f64;
+    let axis = |v: glam::DVec3| inverse.transform_vector3(v).normalize();
+    CastView {
+        eye: inverse.transform_point3(view.eye),
+        right: axis(view.right),
+        up: axis(view.up),
+        forward: axis(view.forward),
+        projection: match view.projection {
+            CastProjection::Orthographic { half_height } => CastProjection::Orthographic {
+                half_height: half_height / scale,
+            },
+            perspective => perspective,
+        },
+        width: view.width,
+        height: view.height,
+    }
+}
+
+#[cfg(test)]
+mod cast_view_tests {
+    use super::*;
+    use glam::DVec3;
+
+    /// A part drawn translated and uniformly scaled is cast with the view
+    /// moved and scaled the opposite way: the same pixel sees the same
+    /// point of the part.
+    #[test]
+    fn a_parts_cast_view_undoes_its_transform() {
+        let view = renderer::CameraView::look_at(
+            Vec3::new(0.0, -5.0, 2.0),
+            Vec3::ZERO,
+            Vec3::Z,
+            0.8,
+            1.5,
+            0.1,
+            100.0,
+        );
+        let cast = cast_view_of(&view, (300, 200)).unwrap();
+        assert!((cast.eye - DVec3::new(0.0, -5.0, 2.0)).length() < 1e-5);
+        assert!((cast.forward - DVec3::new(0.0, 5.0, -2.0).normalize()).length() < 1e-5);
+        let CastProjection::Perspective { tan_half_fov_y } = cast.projection else {
+            panic!("perspective");
+        };
+        assert!((tan_half_fov_y - (0.4f64).tan()).abs() < 1e-5);
+
+        let transform = Mat4::from_scale_rotation_translation(
+            Vec3::splat(2.0),
+            glam::Quat::from_rotation_z(0.7),
+            Vec3::new(0.5, 0.5, 0.2),
+        );
+        let inside = cast_view_in_frame(&cast, transform);
+        // A point of the part, drawn under the transform, projects to the
+        // same pixel from either view.
+        let part_point = DVec3::new(0.1, -0.05, 0.1);
+        let world_point = transform.as_dmat4().transform_point3(part_point);
+        let (wx, wy) = cast.pixel_of(world_point).unwrap();
+        let (px, py) = inside.pixel_of(part_point).unwrap();
+        assert!(
+            (wx - px).abs() < 1e-4 && (wy - py).abs() < 1e-4,
+            "{wx},{wy} vs {px},{py}"
+        );
+
+        let ortho = renderer::CameraView::look_at_orthographic(
+            Vec3::new(0.0, -5.0, 2.0),
+            Vec3::ZERO,
+            Vec3::Z,
+            3.0,
+            1.5,
+            0.1,
+            100.0,
+        );
+        let cast = cast_view_of(&ortho, (300, 200)).unwrap();
+        let inside = cast_view_in_frame(&cast, transform);
+        let CastProjection::Orthographic { half_height } = inside.projection else {
+            panic!("orthographic");
+        };
+        assert!((half_height - 0.75).abs() < 1e-6, "{half_height}");
+        let (wx, wy) = cast.pixel_of(world_point).unwrap();
+        let (px, py) = inside.pixel_of(part_point).unwrap();
+        assert!(
+            (wx - px).abs() < 1e-4 && (wy - py).abs() < 1e-4,
+            "{wx},{wy} vs {px},{py}"
+        );
     }
 }
