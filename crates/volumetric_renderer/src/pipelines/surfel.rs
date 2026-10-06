@@ -72,7 +72,9 @@ impl GpuSurfels {
 struct DrawUniforms {
     model: [[f32; 4]; 4],
     ids: [u32; 2],
-    _pad: [u32; 46],
+    _pad: [u32; 2],
+    color: [f32; 4],
+    _pad1: [u32; 40],
 }
 
 const _: () = assert!(std::mem::size_of::<DrawUniforms>() == 256);
@@ -83,6 +85,10 @@ pub struct SurfelDraw {
     pub transform: Mat4,
     pub object: ObjectId,
     pub material: MaterialId,
+    /// Linear RGBA multiplied into the material base colour for every
+    /// disc of the draw, as a mesh vertex's colour is; white for the plain
+    /// untinted look.
+    pub color: [f32; 4],
 }
 
 pub struct SurfelPipeline {
@@ -275,7 +281,9 @@ impl SurfelPipeline {
             .map(|draw| DrawUniforms {
                 model: draw.transform.to_cols_array_2d(),
                 ids: [draw.object.0, draw.material.0],
-                _pad: [0; 46],
+                _pad: [0; 2],
+                color: draw.color,
+                _pad1: [0; 40],
             })
             .collect();
         queue.write_buffer(&self.draws, 0, bytemuck::cast_slice(&blocks));

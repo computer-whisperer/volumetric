@@ -1011,8 +1011,15 @@ fn surfel_discs_draw_like_the_surface_they_sample() {
         let pixel_at_sphere = view().pixel_size(2.5 - radius, H);
         let offset = Vec3::new(0.3, -0.2, 0.0);
 
+        // Both are tinted the same way: the mesh by its vertices, the
+        // discs by their draw.
+        let tint = [0.9, 0.5, 0.3, 1.0];
         let mut renderer = offscreen.renderer(W, H);
-        let mesh = renderer.create_retained_mesh(offscreen.device(), &sphere(centre, radius));
+        let mut tinted = sphere(centre, radius);
+        for vertex in &mut tinted.vertices {
+            vertex.color = tint;
+        }
+        let mesh = renderer.create_retained_mesh(offscreen.device(), &tinted);
         renderer.submit_retained_mesh(
             &mesh,
             Mat4::from_translation(offset),
@@ -1032,6 +1039,7 @@ fn surfel_discs_draw_like_the_surface_they_sample() {
             Mat4::from_translation(offset),
             ObjectId(3),
             MaterialId(0),
+            tint,
         );
         let (as_discs, info) = offscreen
             .render_rgba(&mut renderer, &view(), &settings)
@@ -1048,6 +1056,13 @@ fn surfel_discs_draw_like_the_surface_they_sample() {
             }
         }
         assert!(covered_mesh > 2000, "{covered_mesh} sphere pixels");
+        // The tint reached the discs: the sphere's centre pixel is the
+        // tint's hue (red over green over blue) in both renders.
+        let middle = at(&view(), centre + offset + Vec3::Z * radius);
+        for image in [&as_mesh, &as_discs] {
+            let p = pixel(image, middle.0, middle.1);
+            assert!(p[0] > p[1] && p[1] > p[2], "untinted pixel {p:?}");
+        }
         // No holes: inside the mesh's silhouette (2 px in from any
         // background pixel) every pixel is covered by a disc. Discs seen
         // at a slant used to leave pinholes near the rim.

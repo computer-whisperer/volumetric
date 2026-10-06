@@ -14,7 +14,8 @@ use crate::scene::{
     triangles_to_mesh_vertices,
 };
 use crate::{
-    OutputStats, PreviewBounds, PreviewEntity, PreviewMeshPlan, PreviewPlan, PreviewRequest,
+    DirectModel, OutputStats, PreviewBounds, PreviewEntity, PreviewMeshPlan, PreviewPlan,
+    PreviewRequest,
 };
 
 /// Colour of a revolute joint's axis line.
@@ -201,7 +202,12 @@ fn place(
             }
             scene.add_mesh(mesh, *pose, renderer::MaterialId(0));
             mesh_keys.push(built.key);
-            direct_models.push(built.direct.take());
+            direct_models.push(
+                built
+                    .direct
+                    .take()
+                    .map(|model| DirectModel { model, color: tint }),
+            );
             part_of_mesh.push(part_index);
         }
         if let Some(mut points) = built.points.take() {

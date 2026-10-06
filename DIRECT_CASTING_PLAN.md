@@ -222,7 +222,11 @@ meshes. This is the image source of `RENDERING_ARCHITECTURE.md` §9,
 realised as geometry rather than as a depth image, which is what lets it
 survive camera motion. A disc is a quad per surfel in its tangent plane,
 cut round in the fragment shader, back faces culled; its depth is the
-plane's, so the discs of one surface meet without gaps.
+plane's, so the discs of one surface meet without gaps. Every disc of a
+draw has the one colour the draw gives it: the part tint the host would
+have put in the vertices of a mesh (`DirectModel::color`, 2026-10-06), so
+flush-fitting parts in Direct mode stay told apart as in the other modes.
+The model's own colour channels are not sampled by the cast (open).
 
 `DirectCast::surfels(view)` chooses the surfels for a view, walking the
 tree with the pitch the view wants at each node's nearest point: a node

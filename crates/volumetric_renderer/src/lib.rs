@@ -551,19 +551,23 @@ impl Renderer {
 
     /// Submit retained surfels for this frame, drawn under `transform` as
     /// discs; they fill the G-buffer like a mesh, so they are lit, edged,
-    /// occluded and picked the same way.
+    /// occluded and picked the same way. `color` is multiplied into the
+    /// material base colour for every disc, as a mesh vertex's colour is
+    /// (white for the plain look).
     pub fn submit_retained_surfels(
         &mut self,
         surfels: &Arc<GpuSurfels>,
         transform: Mat4,
         object: ObjectId,
         material: MaterialId,
+        color: [f32; 4],
     ) {
         self.frame_surfels.push(SurfelDraw {
             surfels: surfels.clone(),
             transform,
             object,
             material,
+            color,
         });
     }
 

@@ -1796,12 +1796,12 @@ impl ViewportRenderer {
                     renderer::ObjectId(object),
                     renderer::MaterialId::default(),
                 );
-                if let Some(Some(model)) = entity.direct_models.get(i) {
+                if let Some(Some(direct)) = entity.direct_models.get(i) {
                     let key = entity.mesh_keys[i].expect("a cast part has a key");
                     let slot = self
                         .direct
                         .entry(key)
-                        .or_insert_with(|| DirectSlot::new(model));
+                        .or_insert_with(|| DirectSlot::new(&direct.model));
                     slot.take_results(&self.renderer, device);
                     if let Some(view) = last_view {
                         slot.look(&view, frame_size, transform);
@@ -1812,6 +1812,7 @@ impl ViewportRenderer {
                             transform,
                             renderer::ObjectId(object),
                             renderer::MaterialId::default(),
+                            direct.color,
                         );
                     }
                 }
@@ -3700,6 +3701,24 @@ mod tests {
         tints.sort();
         tints.dedup();
         assert_eq!(tints.len(), 3, "three parts, three tints: {tints:?}");
+
+        // A model cast directly carries the same tint for its discs, and
+        // white without.
+        let direct = |id: &str, tint: bool| {
+            let mut request = request(id, tint);
+            request.plan = PreviewPlan::Model3d {
+                mesh: PreviewMeshPlan::Direct,
+                color_channel: None,
+                tint_uncolored: tint,
+            };
+            let entity = build_preview_scene(&request).expect("preview builds");
+            entity.direct_models[0]
+                .as_ref()
+                .expect("a model to cast")
+                .color
+        };
+        assert_eq!(direct("tray", true), part_tint("tray"));
+        assert_eq!(direct("tray", false), [1.0; 4]);
     }
 
     #[test]

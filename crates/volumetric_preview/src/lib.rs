@@ -455,7 +455,16 @@ pub struct PreviewEntity {
     /// (parallel; empty otherwise), the model the host casts directly and
     /// draws under that entry's transform, object id and pose. The entry's
     /// mesh itself is empty.
-    pub direct_models: Vec<Option<Arc<Vec<u8>>>>,
+    pub direct_models: Vec<Option<DirectModel>>,
+}
+
+/// A model a host casts directly, and how to draw what it finds.
+#[derive(Clone)]
+pub struct DirectModel {
+    pub model: Arc<Vec<u8>>,
+    /// Linear RGBA for every disc: the part tint where meshes of this
+    /// entity would carry one in their vertices, else white.
+    pub color: [f32; 4],
 }
 
 /// An assembly behind a preview entity.

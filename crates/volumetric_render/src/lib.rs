@@ -930,11 +930,13 @@ pub fn render(
                 };
                 let resident = renderer.create_retained_surfels(offscreen.device(), &surfels);
                 object += 1;
+                // Untinted, as the headless render's meshes are.
                 renderer.submit_retained_surfels(
                     &resident,
                     Mat4::IDENTITY,
                     ObjectId(object),
                     MaterialId::default(),
+                    [1.0; 4],
                 );
                 notes.push(format!(
                     "{}{}: cast directly, {} surfels from {} samples in {:.2} s, {} of {} pixels hit",

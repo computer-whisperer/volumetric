@@ -180,7 +180,9 @@ so sources compose with each other and with everything drawn afterwards.
 2. **Surfel discs** (`surfel_gbuffer.wgsl`, built 2026-10-05 for the direct
    caster). Retained `GpuSurfels`: surface points with normals and radii,
    each drawn as an opaque disc in its tangent plane, back faces culled,
-   under the same per-draw transform and ids as a mesh. The G-buffer gets
+   under the same per-draw transform and ids as a mesh, and one colour
+   per draw where a mesh has one per vertex (the part tint, 2026-10-06).
+   The G-buffer gets
    the disc's own depth, so discs of one surface meet without gaps and
    everything after the fill treats them as it treats a mesh. (Replaces
    the planned full-screen image source of section 9; see

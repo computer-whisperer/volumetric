@@ -10,8 +10,8 @@ use volumetric_renderer as renderer;
 
 use crate::gizmo::pad3;
 use crate::{
-    ExecutionBackend, LocalBackend, OutputStats, PreviewBounds, PreviewEntity, PreviewMeshPlan,
-    PreviewPlan, PreviewRequest,
+    DirectModel, ExecutionBackend, LocalBackend, OutputStats, PreviewBounds, PreviewEntity,
+    PreviewMeshPlan, PreviewPlan, PreviewRequest,
 };
 
 pub fn build_preview_scene(request: &PreviewRequest) -> Result<PreviewEntity, String> {
@@ -226,6 +226,21 @@ pub fn preview_prelude(
             stats
                 .detail
                 .push("Cast directly in the viewport (no mesh)".to_string());
+            // An uncolored model with part tinting on is tinted as its
+            // mesh would be (see `finish_preview_scene`); the model's own
+            // colour channels are not sampled by the cast.
+            let color = match &request.plan {
+                PreviewPlan::Model3d {
+                    tint_uncolored: true,
+                    ..
+                } => {
+                    stats
+                        .detail
+                        .push(format!("Color: part tint ({})", request.asset_id));
+                    part_tint(&request.asset_id)
+                }
+                _ => [1.0; 4],
+            };
             let mut scene = renderer::SceneData::new();
             scene.add_mesh(
                 renderer::MeshData {
@@ -245,7 +260,10 @@ pub fn preview_prelude(
                 build_start,
             );
             entity.mesh_keys = vec![Some(request.source_hash)];
-            entity.direct_models = vec![Some(Arc::clone(&request.data))];
+            entity.direct_models = vec![Some(DirectModel {
+                model: Arc::clone(&request.data),
+                color,
+            })];
             return Ok(Some(PreviewStage::Done(Box::new(entity))));
         }
         PreviewMeshPlan::AdaptiveSurfaceNets2 { .. } => {
