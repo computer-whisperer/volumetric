@@ -5,6 +5,9 @@
 
 struct Uniforms {
     view_proj: mat4x4<f32>,
+    // The eye, w = 1; or for an orthographic frame the view direction,
+    // w = 0.
+    eye: vec4<f32>,
 };
 
 // Per draw: the model matrix (rigid or uniform-scale only), then the
@@ -52,7 +55,21 @@ fn vs_main(in: VsIn) -> VsOut {
     let scale = length(draw.model[0].xyz);
     let corner = CORNERS[in.vertex];
     let centre = (draw.model * vec4<f32>(in.position, 1.0)).xyz;
-    let world = centre + (t * corner.x + b * corner.y) * (in.radius * scale);
+    var offset = (t * corner.x + b * corner.y) * (in.radius * scale);
+
+    // Seen at a slant, a disc narrows on screen and discs a pixel apart
+    // leave pixels between them uncovered. Stretch it within its plane
+    // along the slant, by up to five times, so its outline stays about
+    // round on screen; the depth stays the plane's.
+    let towards = select(normalize(centre - uniforms.eye.xyz), uniforms.eye.xyz, uniforms.eye.w == 0.0);
+    let along = towards - n * dot(n, towards);
+    let slant = length(along);
+    if slant > 1e-4 {
+        let u = along / slant;
+        let cos_view = max(sqrt(max(1.0 - slant * slant, 0.0)), 0.2);
+        offset += u * dot(offset, u) * (1.0 / cos_view - 1.0);
+    }
+    let world = centre + offset;
 
     var out: VsOut;
     out.position = uniforms.view_proj * vec4<f32>(world, 1.0);

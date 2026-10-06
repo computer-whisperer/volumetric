@@ -139,6 +139,12 @@ frame counted as too coarse for it and was dropped once the final pass
 landed: the viewport went dark but for edge highlights, or the near half
 of a model did.)
 
+**Discs are stretched along the view** in the renderer where they are
+seen at a slant (up to five times, within their plane), so their outline
+stays about round on screen and discs a pixel apart leave no pixel
+between them. (Added with the fix above; the pinholes it was aimed at
+did not reproduce headless, so this one is by reasoning, not evidence.)
+
 **Boundaries are sampled.** Skipping is decided node by node, so wherever
 stepping starts or stops the boundary point itself is sampled, and the
 point where a ray enters the model's bounds. Without this a ray crosses
@@ -149,13 +155,24 @@ inside the model is marked as holding surface even when bisection put the
 surface point in the node before it.
 
 **Normals** are those of the plane through the hit and two more points
-bisected half a pitch to the side and above in the image. A hit within
-half a pitch of a surfel already stored at the same pitch reuses its
-normal and costs no probes. Where a probe finds no surface (a silhouette,
-something thinner than a pitch) the normal faces the viewer.
+bisected half a pitch to the side and above in the image, or on the
+opposite sides where those find nothing (a silhouette, an edge). A probe
+brackets whichever crossing of the surface is nearest along its offset
+ray, an entry or an exit, pushing its bracket back where the inner ray at
+a silhouette is already inside. A hit within half a pitch of a surfel
+already stored at the same pitch reuses its normal and costs no probes.
+Where no probe finds surface (something thinner than a pitch) the normal
+faces the viewer and the surfel is marked **guessed**: it is drawn, but
+never stands in for a pixel of a later view, and the first surfel found
+at its spot with a normal replaces it. (2026-10-05, from a screenshot:
+guessed surfels from one view's silhouettes stood across the surfaces of
+the next view with normals a quarter turn off, which the edge pass drew
+as a field of small crosses.)
 
-Not built from the proposal: marking such surfels as edges and taking the
-normal from one side. Known limit: the three points are one-sided, so on
+Known limit: a surfel found at a grazing angle keeps a normal that leans
+by up to about 20° (the one-sided stencil over a long stretch of
+surface), and a later face-on view accepts it as cover. About 0.1% of a
+sphere's surfels after a quarter turn. Known limit: the three points are one-sided, so on
 a curved surface the normal leans by about the angle the surface turns in
 half a pitch; near a silhouette, where half a pixel is a long way round,
 that reaches a couple of degrees at 160 px across a sphere.

@@ -212,6 +212,11 @@ pub struct Surfel {
     pub normal: [f32; 3],
     /// Radius of the disc that stands for the surface around the point.
     pub radius: f32,
+    /// The normal is a guess (facing the view that found the point): no
+    /// surface was found beside it to take a normal from. Such a surfel
+    /// is drawn, but never stands in for a pixel, and is replaced by the
+    /// first surfel found at its spot with a normal.
+    pub guessed: bool,
 }
 
 /// What a pass steps through. Every mode steps nodes known to hold
@@ -240,6 +245,8 @@ pub struct RayHit {
     pub position: DVec3,
     /// Unit, pointing out of the model.
     pub normal: Vec3,
+    /// The normal is a guess: see [`Surfel::guessed`].
+    pub guessed: bool,
 }
 
 /// The rays of one pass: a lattice of `width × height` rays `spacing`
@@ -398,6 +405,7 @@ impl Located {
 struct Fresh {
     position: DVec3,
     normal: Vec3,
+    guessed: bool,
     pitch: f64,
     /// Distance along its ray.
     t: f64,
@@ -560,7 +568,8 @@ impl DirectCast {
         let reach = 0.5 * pitch;
         self.nodes[node.index as usize].surfels.iter().find(|s| {
             let position = Vec3::from(s.position).as_dvec3();
-            (s.radius as f64) < RADIUS_PER_PITCH * pitch * SAME_PITCH
+            !s.guessed
+                && (s.radius as f64) < RADIUS_PER_PITCH * pitch * SAME_PITCH
                 && position.distance_squared(point) < reach * reach
                 && Vec3::from(s.normal).as_dvec3().dot(dir) < 0.0
         })
@@ -627,7 +636,8 @@ impl DirectCast {
 
     /// The surfels to draw for `view` once a pass at `spacing` has
     /// produced `image`: [`surfels`](Self::surfels) less the coarse ones
-    /// the image has looked past. A surfel wider than the view's pixels
+    /// the image has looked past, and the guessed ones it has found a
+    /// normal for. A surfel wider than the view's pixels
     /// allow is dropped when the ray through its centre hit surface at or
     /// in front of it: the hit is the finer surface point that replaces
     /// it, or something that hides it. One behind a hit, or at a pixel
@@ -640,7 +650,8 @@ impl DirectCast {
         shown.retain(|surfel| {
             let position = Vec3::from(surfel.position).as_dvec3();
             let pitch = spacing * view.footprint_at(position);
-            if surfel.radius as f64 <= RADIUS_PER_PITCH * pitch * SAME_PITCH {
+            let fine = surfel.radius as f64 <= RADIUS_PER_PITCH * pitch * SAME_PITCH;
+            if fine && !surfel.guessed {
                 return true;
             }
             let Some((x, y)) = view.pixel_of(position) else {
@@ -657,6 +668,11 @@ impl DirectCast {
                 CastProjection::Perspective { .. } => (position - view.eye).length(),
                 CastProjection::Orthographic { .. } => (position - view.eye).dot(view.forward),
             };
+            // A guessed normal gives way only to a found one at its spot;
+            // what hides it hides it either way.
+            if fine && hit.guessed && (hit.t - t).abs() <= 2.0 * surfel.radius as f64 {
+                return true;
+            }
             hit.t > t + 2.0 * surfel.radius as f64
         });
         shown
@@ -709,6 +725,9 @@ impl DirectCast {
         let (width, height) = CastImage::lattice(view, spacing);
         let mut hits: Vec<Option<RayHit>> = vec![None; width as usize * height as usize];
         for surfel in surfels {
+            if surfel.guessed {
+                continue;
+            }
             let position = Vec3::from(surfel.position).as_dvec3();
             let normal = Vec3::from(surfel.normal).as_dvec3();
             if normal.dot(view.direction_at(position)) >= 0.0 {
@@ -735,6 +754,7 @@ impl DirectCast {
                     t,
                     position,
                     normal: surfel.normal.into(),
+                    guessed: surfel.guessed,
                 });
             }
         }
@@ -813,6 +833,7 @@ impl DirectCast {
                 t: enter,
                 position,
                 normal,
+                guessed: false,
             };
             let pitch = pitch_at(enter);
             let fresh = self
@@ -821,6 +842,7 @@ impl DirectCast {
                 .then_some(Fresh {
                     position,
                     normal,
+                    guessed: false,
                     pitch,
                     t: enter,
                 });
@@ -941,6 +963,7 @@ impl DirectCast {
                     t: t_hit,
                     position,
                     normal: known.normal.into(),
+                    guessed: false,
                 };
                 return Some((hit, None));
             }
@@ -956,48 +979,73 @@ impl DirectCast {
                     let p = origin + ray.dir * t;
                     volumetric_abi::is_occupied(sampler.sample(p.x, p.y, p.z))
                 };
+                // The surface crosses the offset ray near `t_hit`, as an
+                // entry or, where it curves away, an exit; at a
+                // silhouette the inner ray may be inside well before
+                // `t_hit`, so a bracket inside at both ends is pushed
+                // back. Whichever crossing is bracketed is a point of the
+                // surface beside the hit.
                 let mut reach = pitch;
-                for _ in 0..4 {
-                    let (mut a, mut b) = (t_hit - reach, t_hit + reach);
-                    if !inside(a) && inside(b) {
-                        for _ in 0..BISECTIONS {
-                            let mid = 0.5 * (a + b);
-                            if inside(mid) {
-                                b = mid;
-                            } else {
-                                a = mid;
-                            }
-                        }
-                        return Some(origin + ray.dir * (0.5 * (a + b)));
+                let (mut a, mut b) = (t_hit - reach, t_hit + reach);
+                let (mut a_in, mut b_in) = (inside(a), inside(b));
+                for _ in 0..5 {
+                    if a_in != b_in {
+                        break;
                     }
                     reach *= 2.0;
+                    if a_in {
+                        a = t_hit - reach;
+                        a_in = inside(a);
+                    } else {
+                        (a, b) = (t_hit - reach, t_hit + reach);
+                        (a_in, b_in) = (inside(a), inside(b));
+                    }
                 }
-                None
+                if a_in == b_in {
+                    return None;
+                }
+                for _ in 0..BISECTIONS {
+                    let mid = 0.5 * (a + b);
+                    if inside(mid) == a_in {
+                        a = mid;
+                    } else {
+                        b = mid;
+                    }
+                }
+                Some(origin + ray.dir * (0.5 * (a + b)))
             };
-            let normal = match (neighbour(side), neighbour(lift)) {
+            // Beside the point on one side or, at a silhouette or an edge,
+            // the other.
+            let p = neighbour(side).or_else(|| neighbour(-side));
+            let q = neighbour(lift).or_else(|| neighbour(-lift));
+            let (normal, guessed) = match (p, q) {
                 (Some(p), Some(q)) => {
                     let normal = (p - position).cross(q - position).normalize_or(-ray.dir);
-                    if normal.dot(ray.dir) > 0.0 {
+                    let normal = if normal.dot(ray.dir) > 0.0 {
                         -normal
                     } else {
                         normal
-                    }
+                    };
+                    (normal, false)
                 }
-                // No surface beside the point: an edge or something thin.
-                // Facing the viewer is the least wrong guess.
-                _ => -ray.dir,
-            }
-            .as_vec3();
+                // No surface beside the point on either side: something
+                // thinner than a pitch. Facing the viewer is the least
+                // wrong guess.
+                _ => (-ray.dir, true),
+            };
+            let normal = normal.as_vec3();
             let hit = RayHit {
                 t: t_hit,
                 position,
                 normal,
+                guessed,
             };
             return Some((
                 hit,
                 Some(Fresh {
                     position,
                     normal,
+                    guessed,
                     pitch,
                     t: t_hit,
                 }),
@@ -1131,13 +1179,26 @@ impl DirectCast {
         let at = self.ensure(found.position, level);
         let reach = 0.5 * found.pitch;
         let position = found.position.as_vec3();
-        let duplicate = self.nodes[at.index as usize].surfels.iter().any(|s| {
+        let near = |s: &Surfel| {
             (s.radius as f64) < RADIUS_PER_PITCH * found.pitch * SAME_PITCH
                 && Vec3::from(s.position).distance_squared(position) < (reach * reach) as f32
-                && Vec3::from(s.normal).dot(found.normal) > 0.5
-        });
+        };
+        let surfels = &mut self.nodes[at.index as usize].surfels;
+        let duplicate = surfels
+            .iter()
+            .any(|s| near(s) && (s.guessed || Vec3::from(s.normal).dot(found.normal) > 0.5));
         if duplicate {
-            return false;
+            if found.guessed {
+                return false;
+            }
+            // A guess at this spot gives way to a normal.
+            surfels.retain(|s| !(s.guessed && near(s)));
+            if surfels
+                .iter()
+                .any(|s| near(s) && Vec3::from(s.normal).dot(found.normal) > 0.5)
+            {
+                return false;
+            }
         }
 
         // Mark the way down as holding surface.
@@ -1162,6 +1223,7 @@ impl DirectCast {
             position: position.into(),
             normal: found.normal.into(),
             radius: (RADIUS_PER_PITCH * found.pitch) as f32,
+            guessed: found.guessed,
         });
 
         // Surface found here may continue into the nodes around, whatever
@@ -2012,6 +2074,55 @@ mod tests {
             view = Some(v);
         }
         let _ = (image, view);
+    }
+
+    /// Surfels found from one view are right from another: after a
+    /// quarter turn, the normals of the surfels chosen for the new view
+    /// are the sphere's, including along the first view's silhouette,
+    /// where the normal probes had nothing beside them.
+    #[test]
+    fn surfel_normals_survive_a_change_of_view() {
+        let model = sphere();
+        let options = CastOptions::default();
+        let projection = CastProjection::Perspective {
+            tan_half_fov_y: 0.35,
+        };
+        let first = CastView::look_at(
+            DVec3::new(4.0, 0.0, 0.0),
+            DVec3::ZERO,
+            DVec3::Z,
+            projection,
+            128,
+            128,
+        );
+        let second = CastView::look_at(
+            DVec3::new(0.0, 4.0, 0.0),
+            DVec3::ZERO,
+            DVec3::Z,
+            projection,
+            128,
+            128,
+        );
+        let mut cast = DirectCast::for_model(&model).unwrap();
+        cast.cast(&model, &first, &options, &NEVER).unwrap();
+        let (image, _) = cast.cast(&model, &second, &options, &NEVER).unwrap();
+        let (mut facing, mut wrong) = (0, 0);
+        for s in cast.surfels_shown(&second, 1.0, &image) {
+            let position = Vec3::from(s.position).as_dvec3();
+            let normal = Vec3::from(s.normal).as_dvec3();
+            if second.pixel_of(position).is_none()
+                || normal.dot(second.direction_at(position)) >= 0.0
+            {
+                continue;
+            }
+            facing += 1;
+            // The few left are grazing finds of the first view, whose
+            // one-sided normal stencil leans by about this much there.
+            let off = normal.angle_between(position.normalize()).to_degrees();
+            wrong += (off > 20.0) as usize;
+        }
+        println!("{wrong} of {facing} surfels facing the second view have a wrong normal");
+        assert!(wrong * 500 < facing, "{wrong} of {facing}");
     }
 
     #[test]

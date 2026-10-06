@@ -655,7 +655,7 @@ impl Renderer {
         self.mesh_pipeline
             .prepare(device, queue, view_proj, &self.frame_meshes);
         self.surfel_pipeline
-            .prepare(device, queue, view_proj, &self.frame_surfels);
+            .prepare(device, queue, view, &self.frame_surfels);
 
         self.line_pipeline.begin_frame();
         for submitted in &self.frame_lines {

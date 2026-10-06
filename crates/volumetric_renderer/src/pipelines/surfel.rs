@@ -5,7 +5,17 @@ use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
 
-use crate::{GBuffer, MaterialId, ObjectId, SurfelData, SurfelVertex};
+use crate::{CameraView, GBuffer, MaterialId, ObjectId, SurfelData, SurfelVertex};
+
+/// Uniforms of `surfel_gbuffer.wgsl` shared by every draw of a frame.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+struct FrameUniforms {
+    view_proj: [[f32; 4]; 4],
+    /// The eye with w = 1, or for an orthographic frame the view
+    /// direction with w = 0.
+    eye: [f32; 4],
+}
 
 /// A set of surfels resident on the GPU, in their own coordinates; the
 /// transform comes at submission, as for [`super::GpuMesh`].
@@ -181,7 +191,10 @@ impl SurfelPipeline {
 
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("surfel_uniform_buffer"),
-            contents: bytemuck::bytes_of(&Mat4::IDENTITY.to_cols_array_2d()),
+            contents: bytemuck::bytes_of(&FrameUniforms {
+                view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+                eye: [0.0, 0.0, 1.0, 0.0],
+            }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -215,13 +228,23 @@ impl SurfelPipeline {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        view_proj: Mat4,
+        view: &CameraView,
         draws: &[SurfelDraw],
     ) {
+        let camera_to_world = view.view.inverse();
+        let orthographic = view.projection.w_axis.w == 1.0;
+        let eye = if orthographic {
+            (-camera_to_world.z_axis.truncate()).normalize().extend(0.0)
+        } else {
+            camera_to_world.w_axis.truncate().extend(1.0)
+        };
         queue.write_buffer(
             &self.uniform_buffer,
             0,
-            bytemuck::bytes_of(&view_proj.to_cols_array_2d()),
+            bytemuck::bytes_of(&FrameUniforms {
+                view_proj: view.view_projection().to_cols_array_2d(),
+                eye: eye.to_array(),
+            }),
         );
         if draws.is_empty() {
             return;

@@ -1048,6 +1048,25 @@ fn surfel_discs_draw_like_the_surface_they_sample() {
             }
         }
         assert!(covered_mesh > 2000, "{covered_mesh} sphere pixels");
+        // No holes: inside the mesh's silhouette (2 px in from any
+        // background pixel) every pixel is covered by a disc. Discs seen
+        // at a slant used to leave pinholes near the rim.
+        let mut holes = 0;
+        for y in 2..H - 2 {
+            for x in 2..W - 2 {
+                let interior = (-2i32..=2).all(|dy| {
+                    (-2i32..=2).all(|dx| {
+                        off_background(pixel(
+                            &as_mesh,
+                            (x as i32 + dx) as u32,
+                            (y as i32 + dy) as u32,
+                        )) == 1
+                    })
+                });
+                holes += (interior && off_background(pixel(&as_discs, x, y)) == 0) as usize;
+            }
+        }
+        assert_eq!(holes, 0, "{holes} pinholes inside the silhouette");
         assert!(
             (covered_discs as i64 - covered_mesh as i64).abs() * 50 < covered_mesh as i64,
             "{covered_discs} disc pixels against {covered_mesh} mesh pixels"
