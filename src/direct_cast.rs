@@ -618,18 +618,29 @@ impl DirectCast {
             let wanted = view.map_or(0.0, |(view, spacing)| {
                 spacing * view.least_footprint_in(at.center, at.half)
             });
-            let fine_enough = Self::pitch_of(at.half) <= wanted && !node.surfels.is_empty();
-            if fine_enough || node.first_child == 0 {
+            // A node's own surfels are all drawn when its pitch is the
+            // view's or within a factor of two of it, and the walk goes on
+            // two levels finer than the view's pitch: surfels of nearby
+            // pitch overlap on the surface harmlessly, and a level that
+            // holds only a sparse few (from a grazing pass) cannot then
+            // stand alone for a region its parent or children cover.
+            // (Fixed 2026-10-05 from a screenshot: one node's worth of
+            // speckle on a flat face.) Only a clearly coarser node's
+            // surfels give way, where finer ones have been found beneath.
+            let pitch = Self::pitch_of(at.half);
+            if pitch <= 2.0 * wanted {
                 out.extend(node.surfels.iter().copied());
-                continue;
+            } else {
+                out.extend(
+                    node.surfels
+                        .iter()
+                        .filter(|s| !self.refined_below(&at, Vec3::from(s.position).as_dvec3()))
+                        .copied(),
+                );
             }
-            out.extend(
-                node.surfels
-                    .iter()
-                    .filter(|s| !self.refined_below(&at, Vec3::from(s.position).as_dvec3()))
-                    .copied(),
-            );
-            stack.extend(at.children(node.first_child));
+            if node.first_child != 0 && pitch > wanted * 0.25 {
+                stack.extend(at.children(node.first_child));
+            }
         }
         out
     }
@@ -661,19 +672,35 @@ impl DirectCast {
             if x >= image.width || y >= image.height {
                 return true;
             }
-            let Some(hit) = image.hit(x, y) else {
-                return true;
-            };
             let t = match view.projection {
                 CastProjection::Perspective { .. } => (position - view.eye).length(),
                 CastProjection::Orthographic { .. } => (position - view.eye).dot(view.forward),
             };
-            // A guessed normal gives way only to a found one at its spot;
-            // what hides it hides it either way.
-            if fine && hit.guessed && (hit.t - t).abs() <= 2.0 * surfel.radius as f64 {
-                return true;
+            let reach = 2.0 * surfel.radius as f64;
+            // The rays around the surfel's pixel as well as through it: a
+            // surfel on a lip or a rim can sit where its own pixel's ray
+            // slips past the surface it is on, while the rays beside it
+            // found that surface. (Fixed 2026-10-05 from a screenshot.)
+            let mut replaced = false;
+            let mut hidden = false;
+            for dy in -1..=1i32 {
+                for dx in -1..=1i32 {
+                    let (px, py) = (x as i32 + dx, y as i32 + dy);
+                    if px < 0 || py < 0 || px >= image.width as i32 || py >= image.height as i32 {
+                        continue;
+                    }
+                    let Some(hit) = image.hit(px as u32, py as u32) else {
+                        continue;
+                    };
+                    if (hit.t - t).abs() <= reach {
+                        // A guessed normal gives way only to a found one.
+                        replaced |= !(fine && hit.guessed);
+                    } else if hit.t < t - reach && dx == 0 && dy == 0 {
+                        hidden = true;
+                    }
+                }
             }
-            hit.t > t + 2.0 * surfel.radius as f64
+            !replaced && !hidden
         });
         shown
     }
@@ -2123,6 +2150,59 @@ mod tests {
         }
         println!("{wrong} of {facing} surfels facing the second view have a wrong normal");
         assert!(wrong * 500 < facing, "{wrong} of {facing}");
+    }
+
+    /// A level holding only the sparse surfels of a grazing pass does not
+    /// stand alone for a region the levels about it cover: after a
+    /// face-on view, a grazing one, and a close face-on view, every pixel
+    /// seeing the model has a surfel. (144 of 16,384 had none under the
+    /// rule that stopped at the first level fine enough for the view.)
+    #[test]
+    fn a_sparse_level_does_not_stand_alone() {
+        let model = sphere();
+        let options = CastOptions::default();
+        let view = |eye: DVec3, tan: f64| {
+            CastView::look_at(
+                eye,
+                DVec3::ZERO,
+                DVec3::Z,
+                CastProjection::Perspective {
+                    tan_half_fov_y: tan,
+                },
+                128,
+                128,
+            )
+        };
+        let mut cast = DirectCast::for_model(&model).unwrap();
+        cast.cast(
+            &model,
+            &view(DVec3::new(0.0, 4.0, 0.0), 0.35),
+            &options,
+            &NEVER,
+        )
+        .unwrap();
+        cast.cast(
+            &model,
+            &view(DVec3::new(4.0, 0.0, 0.0), 0.2),
+            &options,
+            &NEVER,
+        )
+        .unwrap();
+        // Close in, so the pixel pitch varies across a node and the view's
+        // own surfels land a level above the one the node is judged at.
+        let again = view(DVec3::new(0.0, 1.2, 0.0), 0.6);
+        let (image, _) = cast.cast(&model, &again, &options, &NEVER).unwrap();
+        let shown = cast.surfels_shown(&again, 1.0, &image);
+        let drawn = cast.coverage_of(&shown, &again, 1.0);
+        let seen = image.hits.iter().flatten().count();
+        let missing = image
+            .hits
+            .iter()
+            .zip(&drawn)
+            .filter(|(hit, drawn)| hit.is_some() && drawn.is_none())
+            .count();
+        println!("{missing} of {seen} pixels seeing the model have no surfel drawn");
+        assert!(missing * 200 < seen, "{missing} of {seen}");
     }
 
     #[test]

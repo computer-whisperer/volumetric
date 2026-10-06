@@ -189,14 +189,22 @@ survive camera motion. A disc is a quad per surfel in its tangent plane,
 cut round in the fragment shader, back faces culled; its depth is the
 plane's, so the discs of one surface meet without gaps.
 
-`DirectCast::surfels(view)` chooses the surfels for a view: at each part
-of the surface the level whose pitch suits the view's pixels at the
-node's nearest point, and a coarser surfel only where no finer one has
-been found beneath it (looked up by position when the surfels are
-collected). Once a pass has produced an image of the view,
-`surfels_shown` also drops every coarse surfel whose pixel's ray hit
-surface at or in front of it: the finer point that replaces it, or what
-hides it. (Added 2026-10-05 from a screenshot: after zooming in on a
+`DirectCast::surfels(view)` chooses the surfels for a view, walking the
+tree with the pitch the view wants at each node's nearest point: a node
+whose pitch is the view's, or within a factor of two of it, contributes
+all its surfels; a clearly coarser node only those with nothing finer
+found beneath them; and the walk goes on two levels finer than the view's
+pitch. Surfels of nearby pitch overlap on the surface harmlessly.
+(Revised 2026-10-05 from a screenshot: the first rule stopped at the
+first level fine enough for the view, so a node holding only a sparse
+few surfels from a grazing pass stood alone for its region, a
+rectangle of speckle on a flat face, while its parent held the view's
+own complete surfels; close in, the pixel pitch varies enough across a
+node for the two levels to differ.) Once a pass has produced an image of
+the view, `surfels_shown` also drops every coarse surfel that a ray
+through its pixel or the eight around it hit surface at (the finer point
+that replaces it; a surfel on a lip sits where its own ray slips past),
+or that its own ray hit surface in front of (what hides it). (Added 2026-10-05 from a screenshot: after zooming in on a
 lattice, the farther view's surfels stood along the near view's
 silhouettes and creases, where the tree lookup alone finds nothing finer
 beneath their centres.) Rejected: a stored
