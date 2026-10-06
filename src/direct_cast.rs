@@ -48,6 +48,10 @@ const ISOLATED_DEPTH: f64 = 4.0;
 /// two apart in spacing can land surfels in the same level of the tree,
 /// and the coarser must not stand in for the finer.
 const SAME_PITCH: f64 = 1.2;
+/// The least stride a ray takes, as a fraction of the model's half-size:
+/// bounds the samples a ray can cost (about a thousand across the model)
+/// whatever its pixel footprint.
+const PITCH_FLOOR: f64 = 2e-3;
 /// A surfel's disc radius over the pitch it was found at: enough for
 /// discs a pitch apart on a square lattice to leave no gaps.
 const RADIUS_PER_PITCH: f64 = 0.75;
@@ -709,6 +713,17 @@ impl DirectCast {
             let p = ray.at(t);
             volumetric_abi::is_occupied(sampler.sample(p.x, p.y, p.z))
         };
+        // The stride never falls below a small fraction of the model: a
+        // perspective ray's footprint is zero at the eye, and an eye
+        // inside the bounds would otherwise never advance.
+        let floor = self.half * PITCH_FLOOR;
+        let pitch_at = |t: f64| (spacing * ray.footprint(t)).max(floor);
+
+        // An eye inside the model sees nothing of it, like an eye inside
+        // a mesh with its back faces culled.
+        if enter <= 0.0 && inside(nudge) {
+            return None;
+        }
 
         // A model that reaches its bounds has surface there: beyond them
         // is outside by definition. Something thinner than a step would
@@ -725,7 +740,7 @@ impl DirectCast {
                 position,
                 normal,
             };
-            let pitch = spacing * ray.footprint(enter);
+            let pitch = pitch_at(enter);
             let fresh = self
                 .surfel_near(position, pitch, ray.dir)
                 .is_none()
@@ -747,7 +762,7 @@ impl DirectCast {
         let mut outside = enter;
         let mut was_stepped = false;
         while t < leave {
-            let pitch = spacing * ray.footprint(t);
+            let pitch = pitch_at(t);
             let at = self.locate(ray.at(t + nudge), pitch);
             let node = &self.nodes[at.index as usize];
             let exit = at.exit(ray);
@@ -797,7 +812,7 @@ impl DirectCast {
                     break;
                 }
                 outside = s;
-                s += spacing * ray.footprint(s);
+                s += pitch_at(s);
             }
             if found.is_some() && !node.occupied {
                 node.struck.store(true, Ordering::Relaxed);
@@ -816,7 +831,7 @@ impl DirectCast {
             // has to be checked, and if it is inside too the surface was
             // crossed unseen in skipped space: back off in doubling
             // strides until outside again.
-            let pitch = spacing * ray.footprint(s);
+            let pitch = pitch_at(s);
             let (mut a, mut b) = (outside, s);
             if s - outside > pitch * 1.001 {
                 let mut stride = pitch;
@@ -844,7 +859,7 @@ impl DirectCast {
             }
             let t_hit = 0.5 * (a + b);
             let position = ray.at(t_hit);
-            let pitch = spacing * ray.footprint(t_hit);
+            let pitch = pitch_at(t_hit);
 
             // A point the tree already has here needs no normal found.
             if let Some(known) = self.surfel_near(position, pitch, ray.dir) {
@@ -1767,6 +1782,84 @@ mod tests {
         );
         // The wide view still draws mostly its own coarse surfels.
         assert!(wide_again > wide_radius * 0.5);
+    }
+
+    /// A view from inside the model's bounds finishes: the stride is
+    /// bounded below, so the samples are too. From outside the sphere
+    /// but inside its bounds the near surface fills the frame; from inside
+    /// the sphere nothing is drawn.
+    #[test]
+    fn a_view_from_inside_the_bounds_finishes() {
+        let model = sphere();
+        let projection = CastProjection::Perspective {
+            tan_half_fov_y: 0.6,
+        };
+        let outside = CastView::look_at(
+            DVec3::new(0.95, 0.0, 0.0),
+            DVec3::ZERO,
+            DVec3::Z,
+            projection,
+            64,
+            64,
+        );
+        let mut cast = DirectCast::for_model(&model).unwrap();
+        let (image, stats) = cast
+            .cast(&model, &outside, &CastOptions::default(), &NEVER)
+            .unwrap();
+        let hits = image.hits.iter().flatten().count();
+        assert!(hits > 3000, "{hits} hits");
+        assert!(stats.samples < 5_000_000, "{} samples", stats.samples);
+        for hit in image.hits.iter().flatten() {
+            assert!(
+                (hit.position.length() - 0.8).abs() < 1e-3,
+                "{}",
+                hit.position
+            );
+        }
+
+        let inside = CastView::look_at(
+            DVec3::new(0.3, 0.0, 0.0),
+            DVec3::ZERO,
+            DVec3::Z,
+            projection,
+            64,
+            64,
+        );
+        let mut cast = DirectCast::for_model(&model).unwrap();
+        let (image, stats) = cast
+            .cast(&model, &inside, &CastOptions::default(), &NEVER)
+            .unwrap();
+        assert_eq!(image.hits.iter().flatten().count(), 0);
+        assert!(stats.samples < 100_000, "{} samples", stats.samples);
+    }
+
+    /// Cancelling reaches a pass within one ray's worth of samples, so a
+    /// thread whose view was dropped stops promptly.
+    #[test]
+    fn cancelling_stops_a_pass_from_inside_the_bounds() {
+        let model = sphere();
+        let view = CastView::look_at(
+            DVec3::new(0.95, 0.0, 0.0),
+            DVec3::ZERO,
+            DVec3::Z,
+            CastProjection::Perspective {
+                tan_half_fov_y: 0.6,
+            },
+            512,
+            512,
+        );
+        let mut cast = DirectCast::for_model(&model).unwrap();
+        let cancel = AtomicBool::new(false);
+        let started = std::time::Instant::now();
+        let cancelled = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                cancel.store(true, Ordering::Relaxed);
+            });
+            cast.cast(&model, &view, &CastOptions::default(), &cancel)
+        });
+        assert!(cancelled.is_none());
+        assert!(started.elapsed().as_secs_f64() < 5.0);
     }
 
     #[test]

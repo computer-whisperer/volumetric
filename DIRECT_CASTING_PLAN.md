@@ -127,6 +127,13 @@ Chase pass marks the neighbours of whatever it finds in turn. A strut
 touched once by the coarse search is followed along its whole length
 without any fine search of empty space. A marked node gets one look.
 
+**The stride has a floor** of a thousandth of the model's half-size,
+whatever the pixel footprint, and an eye inside the model sees nothing of
+it. (Fixed 2026-10-05 after the first GUI run: a perspective ray starting
+at the eye, inside the bounds, had a footprint of zero, so its step was
+zero and the thread spun forever, past the slot being dropped, since
+cancellation is checked per ray.)
+
 **Boundaries are sampled.** Skipping is decided node by node, so wherever
 stepping starts or stops the boundary point itself is sampled, and the
 point where a ray enters the model's bounds. Without this a ray crosses
