@@ -9,7 +9,8 @@ use glam::{Mat4, Vec2, Vec3};
 use crate::offscreen::Offscreen;
 use crate::{
     CameraView, DepthMode, GizmoPart, GridSpacing, LineData, LinePattern, LineSegment, LineStyle,
-    MaterialId, MeshData, MeshVertex, ObjectId, RenderSettings, Renderer, ViewGizmo, WidthMode,
+    MaterialId, MeshData, MeshVertex, ObjectId, RenderSettings, Renderer, SurfelData, SurfelVertex,
+    ViewGizmo, WidthMode,
 };
 
 const W: u32 = 128;
@@ -978,6 +979,97 @@ fn sphere(centre: Vec3, radius: f32) -> MeshData {
         vertices,
         indices: Some(indices),
     }
+}
+
+/// Surfels over a sphere, `pitch` apart, each with the disc radius a
+/// direct cast would give it.
+fn sphere_surfels(centre: Vec3, radius: f32, pitch: f32) -> SurfelData {
+    let count = (4.0 * std::f32::consts::PI * radius * radius / (pitch * pitch)) as usize;
+    let golden = std::f32::consts::PI * (3.0 - 5f32.sqrt());
+    let surfels = (0..count)
+        .map(|i| {
+            let z = 1.0 - 2.0 * (i as f32 + 0.5) / count as f32;
+            let ring = (1.0 - z * z).sqrt();
+            let turn = golden * i as f32;
+            let n = Vec3::new(ring * turn.cos(), ring * turn.sin(), z);
+            SurfelVertex::new((centre + n * radius).to_array(), n.to_array(), 0.75 * pitch)
+        })
+        .collect();
+    SurfelData { surfels }
+}
+
+/// Surfels drawn as discs give the picture the same surface gives as a
+/// mesh: the same pixels lit the same, the same silhouette, and a pick
+/// through them reports their object and a point on the surface.
+#[test]
+fn surfel_discs_draw_like_the_surface_they_sample() {
+    on_each_backend(|offscreen| {
+        let mut settings = settings(false);
+        settings.edges.enabled = true;
+        let centre = Vec3::new(0.0, 0.0, 0.5);
+        let radius = 0.8;
+        let pixel_at_sphere = view().pixel_size(2.5 - radius, H);
+        let offset = Vec3::new(0.3, -0.2, 0.0);
+
+        let mut renderer = offscreen.renderer(W, H);
+        let mesh = renderer.create_retained_mesh(offscreen.device(), &sphere(centre, radius));
+        renderer.submit_retained_mesh(
+            &mesh,
+            Mat4::from_translation(offset),
+            ObjectId(3),
+            MaterialId(0),
+        );
+        let (as_mesh, _) = offscreen
+            .render_rgba(&mut renderer, &view(), &settings)
+            .unwrap();
+
+        let surfels = renderer.create_retained_surfels(
+            offscreen.device(),
+            &sphere_surfels(centre, radius, pixel_at_sphere),
+        );
+        renderer.submit_retained_surfels(
+            &surfels,
+            Mat4::from_translation(offset),
+            ObjectId(3),
+            MaterialId(0),
+        );
+        let (as_discs, info) = offscreen
+            .render_rgba(&mut renderer, &view(), &settings)
+            .unwrap();
+        assert_eq!(info.overflow, None);
+
+        let (mut differ, mut covered_mesh, mut covered_discs) = (0, 0, 0);
+        for y in 0..H {
+            for x in 0..W {
+                let (a, b) = (pixel(&as_mesh, x, y), pixel(&as_discs, x, y));
+                covered_mesh += off_background(a) as usize;
+                covered_discs += off_background(b) as usize;
+                differ += ((0..3).any(|c| (a[c] as i32 - b[c] as i32).abs() > 24)) as usize;
+            }
+        }
+        assert!(covered_mesh > 2000, "{covered_mesh} sphere pixels");
+        assert!(
+            (covered_discs as i64 - covered_mesh as i64).abs() * 50 < covered_mesh as i64,
+            "{covered_discs} disc pixels against {covered_mesh} mesh pixels"
+        );
+        // The sphere's faceting and the discs' edges disagree on some
+        // pixels; most agree to well within a shade.
+        assert!(
+            differ * 20 < covered_mesh,
+            "{differ} of {covered_mesh} pixels differ"
+        );
+
+        let pick = offscreen
+            .pick(
+                &mut renderer,
+                at(&view(), centre + offset + Vec3::Z * radius),
+            )
+            .expect("a pick");
+        assert_eq!(pick.object, ObjectId(3));
+        let world = pick.world.expect("a surface");
+        let off = (world - centre - offset).length() - radius;
+        assert!(off.abs() < pixel_at_sphere, "{off} m off the sphere");
+    });
 }
 
 /// Writes the placeholder test scene's frame as a binary PPM to the path

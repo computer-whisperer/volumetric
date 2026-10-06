@@ -67,6 +67,11 @@ pub struct CastBenchArgs {
     /// and compare the last view with the mesh's vertices
     #[arg(long)]
     pub mesh_depth: Option<usize>,
+
+    /// Print the hit under this pixel "x,y" of the last view and the hits
+    /// around it, with the model sampled along the ray through it
+    #[arg(long)]
+    pub probe: Option<String>,
 }
 
 fn view_for(
@@ -200,6 +205,13 @@ pub fn run_cast_bench(args: CastBenchArgs) -> Result<()> {
     if let Some(depth) = args.mesh_depth {
         compare_with_mesh(&wasm_bytes, depth, &view, &image)?;
     }
+    if let Some(probe) = &args.probe {
+        let (x, y) = probe
+            .split_once(',')
+            .and_then(|(x, y)| Some((x.trim().parse::<u32>().ok()?, y.trim().parse::<u32>().ok()?)))
+            .context("--probe takes \"x,y\" in pixels")?;
+        probe_pixel(&sampler, &view, &image, x, y);
+    }
     if let Some(path) = &args.output {
         write_shaded(&view, &image, path)?;
         println!("Wrote {}", path.display());
@@ -287,6 +299,73 @@ fn compare_with_mesh(
         at(0.99)
     );
     Ok(())
+}
+
+/// Prints what the rays around pixel (`x`, `y`) found, and the model's
+/// answer along the centre ray a quarter pixel at a time around its hit.
+fn probe_pixel(
+    sampler: &impl ParallelModelSampler,
+    view: &CastView,
+    image: &CastImage,
+    x: u32,
+    y: u32,
+) {
+    for dy in -2..=2i32 {
+        for dx in -2..=2i32 {
+            let (px, py) = (x as i32 + dx, y as i32 + dy);
+            if px < 0 || py < 0 || px >= image.width as i32 || py >= image.height as i32 {
+                continue;
+            }
+            match image.hit(px as u32, py as u32) {
+                Some(hit) => println!(
+                    "  ({px},{py}) t {:.6} normal [{:.3} {:.3} {:.3}] at [{:.6} {:.6} {:.6}]",
+                    hit.t,
+                    hit.normal.x,
+                    hit.normal.y,
+                    hit.normal.z,
+                    hit.position.x,
+                    hit.position.y,
+                    hit.position.z
+                ),
+                None => println!("  ({px},{py}) miss"),
+            }
+        }
+    }
+    // A missed pixel is probed at the depth of the nearest hit around it.
+    let near = (-2..=2i32)
+        .flat_map(|dy| (-2..=2i32).map(move |dx| (dx, dy)))
+        .filter_map(|(dx, dy)| {
+            let (px, py) = (x as i32 + dx, y as i32 + dy);
+            let inside = px >= 0 && py >= 0 && px < image.width as i32 && py < image.height as i32;
+            inside
+                .then(|| {
+                    image
+                        .hit(px as u32, py as u32)
+                        .map(|hit| (dx * dx + dy * dy, hit))
+                })
+                .flatten()
+        })
+        .min_by_key(|(d, _)| *d);
+    let Some((_, hit)) = near else { return };
+    let ray = view.ray(
+        (x as f64 + 0.5) * image.spacing,
+        (y as f64 + 0.5) * image.spacing,
+    );
+    let pixel = view.footprint_at(hit.position);
+    let line: String = (-12..=12)
+        .map(|i| {
+            let p = ray.at(hit.t + i as f64 * pixel * 0.25);
+            if volumetric_abi::is_occupied(sampler.sample(p.x, p.y, p.z)) {
+                '#'
+            } else {
+                '.'
+            }
+        })
+        .collect();
+    println!(
+        "  along the ray through ({x},{y}), a quarter pixel apart about t {:.6}: {line}",
+        hit.t
+    );
 }
 
 fn write_shaded(view: &CastView, image: &CastImage, path: &PathBuf) -> Result<()> {

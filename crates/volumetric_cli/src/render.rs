@@ -174,6 +174,12 @@ pub struct RenderArgs {
     #[arg(long, default_value_t = 2)]
     pub supersample: u32,
 
+    /// Draw 3D models by casting the model itself instead of meshing it:
+    /// exact at every pixel, as slow as the model's samples. Other assets
+    /// are drawn as usual
+    #[arg(long)]
+    pub direct: bool,
+
     /// Suppress per-asset statistics
     #[arg(short, long)]
     pub quiet: bool,
@@ -316,6 +322,7 @@ fn render_options(args: &RenderArgs) -> Result<RenderOptions> {
         edges: !args.no_edges,
         antialias: !args.no_antialias,
         supersample: args.supersample,
+        direct: args.direct,
         plan: PlanOptions {
             resolution: args.resolution,
             sharp: !args.no_sharp,

@@ -67,7 +67,9 @@ fn vec3_opt(value: Option<&Bound<'_, PyAny>>, what: &str) -> PyResult<Option<Vec
 /// `ortho_scale`, `near`, `far`, `grid`, `ssao`, `lighting` (`studio`,
 /// `flat`, `headlight`), `edges`, `antialias`, `supersample` (a plain
 /// frame is drawn this many times larger per side and scaled down; 1 is
-/// off), `resolution`, `sharp`,
+/// off), `direct` (cast 3D models directly instead of meshing them:
+/// exact at every pixel, as slow as the model's samples), `resolution`,
+/// `sharp`,
 /// `simplify`, `color_channel`, `color_field`, `color_range`, `wireframe`;
 /// `marks` draws what a looked-through view observed (markers, card
 /// corners, recorded picks and contours) over the frame.
@@ -76,7 +78,7 @@ fn vec3_opt(value: Option<&Bound<'_, PyAny>>, what: &str) -> PyResult<Option<Vec
     overlay=None, overlay_alpha=0.5, overlay_tile=64, width=None, height=None,
     projection="perspective", fov=45.0, ortho_scale=0.0, near=None, far=None, up=None,
     background="2d2d2d", grid=1.0, ssao=true, lighting="studio", edges=true, antialias=true,
-    supersample=2, resolution=128, sharp=true, simplify=true,
+    supersample=2, direct=false, resolution=128, sharp=true, simplify=true,
     color_channel=None, color_field=None, color_range=None, wireframe=false, marks=false))]
 #[allow(clippy::too_many_arguments)]
 fn render<'py>(
@@ -105,6 +107,7 @@ fn render<'py>(
     edges: bool,
     antialias: bool,
     supersample: u32,
+    direct: bool,
     resolution: usize,
     sharp: bool,
     simplify: bool,
@@ -252,6 +255,7 @@ fn render<'py>(
         edges,
         antialias,
         supersample,
+        direct,
         plan: PlanOptions {
             resolution,
             sharp,

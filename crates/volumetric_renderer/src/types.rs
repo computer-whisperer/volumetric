@@ -31,6 +31,36 @@ pub struct MeshVertex {
     pub color: [f32; 4],
 }
 
+/// A surface point drawn as a disc: the geometry a direct cast of a model
+/// produces (see `DIRECT_CASTING_PLAN.md`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
+pub struct SurfelVertex {
+    pub position: [f32; 3],
+    /// Radius of the disc, in the surfels' own units.
+    pub radius: f32,
+    /// Unit, pointing out of the model.
+    pub normal: [f32; 3],
+    pub _pad: f32,
+}
+
+impl SurfelVertex {
+    pub fn new(position: [f32; 3], normal: [f32; 3], radius: f32) -> Self {
+        Self {
+            position,
+            radius,
+            normal,
+            _pad: 0.0,
+        }
+    }
+}
+
+/// Surfels to draw, in their own coordinates.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SurfelData {
+    pub surfels: Vec<SurfelVertex>,
+}
+
 impl MeshVertex {
     /// Create a new mesh vertex with the given position and normal, untinted.
     pub fn new(position: [f32; 3], normal: [f32; 3]) -> Self {

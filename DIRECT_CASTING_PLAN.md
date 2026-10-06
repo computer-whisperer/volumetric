@@ -1,7 +1,8 @@
 # Direct casting: drawing a model without meshing it
 
-Status: **ratified 2026-10-05; step 1 of 4 built** (the search library,
-`cast-bench`; §5.1), with the `sample-bench` instrument (`6aa4e2e`). This file is the target design; when
+Status: **ratified 2026-10-05; steps 1 and 2 of 4 built** (the search
+library and `cast-bench`, §5.1; the disc pass and `render --direct`, §5.2),
+with the `sample-bench` instrument (`6aa4e2e`). This file is the target design; when
 a decision here changes, rewrite it and record what was rejected and why.
 
 ## 1. What this is for
@@ -65,8 +66,8 @@ no work is repeated.
 
 ## 4. Design
 
-Sections 4.1 and 4.2 describe what is built (`src/direct_cast.rs`); 4.3
-and 4.4 are still the target.
+Sections 4.1 to 4.4 describe what is built; the viewport (step 3) is
+still the target.
 
 ### 4.1 One tree per model
 
@@ -150,18 +151,32 @@ that reaches a couple of degrees at 160 px across a sphere.
 ### 4.3 Drawing
 
 Surfels are drawn as opaque oriented discs into the G-buffer (albedo,
-normal, object id, depth), so lighting, edge lines, occlusion, picking and
-the grid treat them exactly as they treat meshes. This is the image source
-of `RENDERING_ARCHITECTURE.md` §9, realised as geometry rather than as a
-depth image, which is what lets it survive camera motion.
+normal, object id, depth) by the renderer's surfel source
+(`crates/volumetric_renderer/src/pipelines/surfel.rs`), so lighting, edge
+lines, occlusion, picking and the grid treat them exactly as they treat
+meshes. This is the image source of `RENDERING_ARCHITECTURE.md` §9,
+realised as geometry rather than as a depth image, which is what lets it
+survive camera motion. A disc is a quad per surfel in its tangent plane,
+cut round in the fragment shader, back faces culled; its depth is the
+plane's, so the discs of one surface meet without gaps.
+
+`DirectCast::surfels(view)` chooses the surfels for a view: at each part
+of the surface the level whose pitch suits the view's pixels there, and a
+coarser surfel only where no finer one has been found beneath it (looked
+up by position when the surfels are collected). Rejected: a stored
+"superseded" flag set when a finer surfel is inserted within a coarse
+one's disc. It missed coarse surfels in neighbouring nodes and at
+silhouettes, where normals turn fast, and their oversized discs stood out
+of every outline (user-visible on the first `render --direct`).
 
 Rejected: blended Gaussians. They need sorting, write no depth and soften
 exactly the edges the search made exact.
 
-Open for step 2: a pass also returns its rays' hits as an image, exact per
-pixel. A finished still could be drawn from that image instead of from
-discs, which overhang silhouettes by up to their radius. Decide when both
-can be looked at.
+Open: a pass also returns its rays' hits as an image, exact per pixel. A
+finished still could be drawn from that image instead of from discs, which
+overhang silhouettes by up to their radius and give the edge-line pass
+disc rims to find. Discs were built first because the viewport needs them
+regardless; compare before deciding what `render --direct` uses.
 
 **Showing certainty.** The viewport says how finely the visible region has
 been searched (for example "searched to 4 px" falling to "1 px"), so a
@@ -169,10 +184,13 @@ blank region is never mistaken for a certified one.
 
 ### 4.4 Stills
 
-The same search run to completion at the output's pixel pitch (or finer,
-for supersampling), headless, behind `render --direct` and the Python
-`render`. No time limit, so no progressive display, but the same record,
-the same G-buffer pass, the same shading.
+The same search run to completion at the drawn frame's pixel pitch, which
+with the default supersampling is twice the output's, headless, behind
+`render --direct` and the Python `render(direct=True)`. No time limit, so
+no progressive display, but the same record, the same G-buffer pass, the
+same shading. Only `Model` assets are cast; other kinds (assemblies among
+them) are meshed as before, and a photograph's off-centre camera is
+refused, since the caster's view has a symmetric frustum.
 
 ## 5. Build order
 
@@ -180,9 +198,7 @@ Each step ends with something that can be checked by running it.
 
 1. **The search as a library.** BUILT 2026-10-05; results in §5.1.
 2. **The surfel pass** in `volumetric_renderer` and `render --direct`.
-   Checked by comparing stills with mesh renders of the same view
-   (depth agreement where both have surface), on the Vulkan and GLES test
-   adapters.
+   BUILT 2026-10-05; results in §5.2.
 3. **The viewport mode**: progressive passes on a worker, cancel on edit,
    coarse during motion, the certainty readout, per-part records for
    assemblies. Includes not re-tracing pixels the stored surfels already
@@ -240,6 +256,37 @@ Known limits at the end of step 1:
 - The zoomed lattice view costs 168 samples per pixel; not yet looked at.
 - A few isolated dark pixels appear on flat faces of the zoomed lattice
   and above the Raspberry Pi board; not yet explained.
+
+### 5.2 Step 2 as built
+
+The disc source, with a frame test on both test adapters: discs over a
+sphere give the same picture as the sphere's mesh (coverage within 2%,
+under 5% of pixels differing by more than a shade), and a pick through
+them reports their object and a point on the sphere. `render --direct` and
+the Python keyword, each with a test rendering the bundled model both ways
+and comparing. Dropped surfels are reported with the other overflow.
+
+At 1024 × 1024 output, supersampled 2× (so cast at 2048 × 2048), the
+comet racer takes 7.2 s against 0.9 s meshed; the lattice 16.5 s against
+9.4 s; the Raspberry Pi STEP import 28.7 s without supersampling. Looked
+at: the comet racer's wheels show their grooves and spokes cleanly where
+the 128-cell mesh shows faceting and torn edges; the lattice shows its
+actual cells, square faces and holes where the mesh shows a blob. The
+dark dot at the centre of every lattice face was probed
+(`cast-bench --probe`): the model is outside for three pixels either side
+of the face plane along those rays, so the holes are in the model, and the
+full search draws the interior surface seen through them.
+
+Known limits at the end of step 2:
+
+- Edge lines along fine creases come out dashed, and a little speckle
+  sits along silhouettes: the edge pass finds the rims of discs seen at
+  grazing angles. A few disc "crumbs" remain at silhouettes where a coarse
+  surfel has no finer one beneath it.
+- Supersampling multiplies the cast's cost by four; `--supersample 1` is
+  the cheap still.
+- Not cast: assemblies and other non-`Model` assets, and views through a
+  photograph's camera.
 
 ## 6. Open questions
 

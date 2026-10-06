@@ -271,6 +271,7 @@ volumetric_cli render -i <model.wasm | project.vproj> -o <output.png>
 - `--no-edges` - Draw no edge lines at silhouettes, creases and part boundaries
 - `--no-antialias` - Disable anti-aliasing
 - `--supersample <n>` - Draw the frame n times larger per side and scale it down (default: 2; 1 disables; at most 4). Frames through a lens (`--through`), with `--overlay` or `--marks`, or of a splat are always drawn at their own size, so they stay comparable pixel for pixel with photographs
+- `--direct` - Draw 3D models by casting the model itself instead of meshing it (see `DIRECT_CASTING_PLAN.md`): every pixel is a sample of the model, so nothing in the picture is a mesh artefact. Takes as long as the model's samples: about a second for a simple part, half a minute for a STEP import. Other asset kinds are drawn as usual
 - `--background <hex>` - Background colour (default: 2d2d2d)
 - `--width`, `--height` - Image size (default: 1024 x 1024)
 

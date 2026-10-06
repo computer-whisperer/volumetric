@@ -102,3 +102,22 @@ def test_shading_options_change_the_frame():
     assert colours(plain) < colours(studio)
     with pytest.raises(ValueError, match="lighting"):
         v.render(p, lighting="neon", **common)
+
+
+def test_direct_cast_draws_the_same_picture():
+    p = cylinder_project()
+    common = dict(views="iso", width=160, height=120, grid=0.0, supersample=1)
+    meshed = rendered_or_skip(p, resolution=128, **common).image
+    cast = v.render(p, direct=True, **common)
+    assert any("cast directly" in note for note in cast.report["notes"]), cast.report
+    cast = cast.image
+    assert cast.shape == meshed.shape
+    background = meshed[0, 0, :3].astype(int)
+    covered = lambda image: (np.abs(image[..., :3].astype(int) - background).max(axis=2) > 8)
+    on_mesh, on_cast = covered(meshed), covered(cast)
+    assert on_mesh.sum() > 1000
+    # The mesh is the approximation here: its faceting and rounded-off
+    # edges account for the pixels that differ.
+    assert abs(int(on_cast.sum()) - int(on_mesh.sum())) * 20 < on_mesh.sum()
+    differ = (np.abs(meshed[..., :3].astype(int) - cast[..., :3].astype(int)).max(axis=2) > 24)
+    assert differ.sum() * 10 < on_mesh.sum()

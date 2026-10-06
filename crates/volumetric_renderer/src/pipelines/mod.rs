@@ -7,6 +7,7 @@ mod line;
 mod mesh;
 mod point;
 mod splat;
+mod surfel;
 mod warp;
 
 pub(crate) use fullscreen::{
@@ -19,4 +20,5 @@ pub use line::{GpuLines, LinePipeline};
 pub use mesh::{GpuMesh, MeshDraw, MeshPipeline};
 pub use point::{GpuPointInstance, GpuPoints, PointPipeline};
 pub use splat::{GpuSplat, SplatCompositePipeline, SplatPipeline, evaluate_sh, project_covariance};
+pub use surfel::{GpuSurfels, SurfelDraw, SurfelPipeline};
 pub use warp::{GpuWarp, Warp, WarpPipeline};

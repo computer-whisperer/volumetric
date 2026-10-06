@@ -97,7 +97,7 @@ impl CastView {
 
     /// The ray through image position (`x`, `y`) in pixels, origin at the
     /// top left.
-    fn ray(&self, x: f64, y: f64) -> Ray {
+    pub fn ray(&self, x: f64, y: f64) -> Ray {
         let (w, h) = (self.width as f64, self.height as f64);
         let u = (2.0 * x / w - 1.0) * (w / h);
         let v = 1.0 - 2.0 * y / h;
@@ -163,8 +163,9 @@ impl CastView {
     }
 }
 
-#[derive(Clone, Copy)]
-struct Ray {
+/// A view ray with the pixel footprint along it.
+#[derive(Clone, Copy, Debug)]
+pub struct Ray {
     origin: DVec3,
     dir: DVec3,
     footprint_base: f64,
@@ -172,7 +173,7 @@ struct Ray {
 }
 
 impl Ray {
-    fn at(&self, t: f64) -> DVec3 {
+    pub fn at(&self, t: f64) -> DVec3 {
         self.origin + self.dir * t
     }
 
@@ -190,8 +191,6 @@ pub struct Surfel {
     pub normal: [f32; 3],
     /// Radius of the disc that stands for the surface around the point.
     pub radius: f32,
-    /// A finer surfel has since been found inside this one's disc.
-    superseded: bool,
 }
 
 /// What a pass steps through. Every mode steps nodes known to hold
@@ -571,7 +570,8 @@ impl DirectCast {
     /// The surfels to draw. With a view, each part of the surface comes
     /// from the level whose pitch suits `spacing` pixels there, or from
     /// finer levels where that one has nothing; without, from the finest
-    /// level everywhere.
+    /// level everywhere. A coarser surfel stands in only where nothing
+    /// finer has been found beneath it.
     pub fn surfels(&self, view: Option<(&CastView, f64)>) -> Vec<Surfel> {
         let mut out = Vec::new();
         let mut stack = vec![self.root()];
@@ -588,10 +588,36 @@ impl DirectCast {
                 out.extend(node.surfels.iter().copied());
                 continue;
             }
-            out.extend(node.surfels.iter().filter(|s| !s.superseded).copied());
+            out.extend(
+                node.surfels
+                    .iter()
+                    .filter(|s| !self.refined_below(&at, Vec3::from(s.position).as_dvec3()))
+                    .copied(),
+            );
             stack.extend(at.children(node.first_child));
         }
         out
+    }
+
+    /// Whether a node beneath `at` holding `point` has surfels of its own.
+    fn refined_below(&self, at: &Located, point: DVec3) -> bool {
+        let mut walk = *at;
+        loop {
+            let node = &self.nodes[walk.index as usize];
+            if node.first_child == 0 {
+                return false;
+            }
+            let (index, center, half) = Self::child_of(&walk, node.first_child, point);
+            walk = Located {
+                index,
+                center,
+                half,
+                ..walk
+            };
+            if !self.nodes[walk.index as usize].surfels.is_empty() {
+                return true;
+            }
+        }
     }
 
     pub fn node_count(&self) -> usize {
@@ -622,7 +648,7 @@ impl DirectCast {
     #[allow(clippy::too_many_arguments)]
     fn trace(
         &self,
-        sampler: &impl ParallelModelSampler,
+        sampler: &(impl ParallelModelSampler + ?Sized),
         view: &CastView,
         ray: &Ray,
         spacing: f64,
@@ -853,7 +879,7 @@ impl DirectCast {
     /// record unchanged.
     pub fn pass(
         &mut self,
-        sampler: &impl ParallelModelSampler,
+        sampler: &(impl ParallelModelSampler + ?Sized),
         view: &CastView,
         spacing: f64,
         mode: PassMode,
@@ -975,22 +1001,12 @@ impl DirectCast {
             return false;
         }
 
-        // Mark the way down as holding surface, and retire the coarser
-        // surfels this one lies within.
+        // Mark the way down as holding surface.
         let first_here = self.nodes[at.index as usize].surfels.is_empty();
         let mut walk = self.root();
         for _ in 0..=level {
             let node = &mut self.nodes[walk.index as usize];
             node.occupied = true;
-            for coarse in &mut node.surfels {
-                if walk.index != at.index
-                    && Vec3::from(coarse.position).distance_squared(position)
-                        < coarse.radius * coarse.radius
-                    && Vec3::from(coarse.normal).dot(found.normal) > 0.5
-                {
-                    coarse.superseded = true;
-                }
-            }
             if walk.index == at.index {
                 break;
             }
@@ -1007,7 +1023,6 @@ impl DirectCast {
             position: position.into(),
             normal: found.normal.into(),
             radius: (RADIUS_PER_PITCH * found.pitch) as f32,
-            superseded: false,
         });
 
         // Surface found here may continue into the nodes around, whatever
@@ -1108,7 +1123,7 @@ impl DirectCast {
     /// adding what they cost to `total`.
     fn pass_and_chase(
         &mut self,
-        sampler: &impl ParallelModelSampler,
+        sampler: &(impl ParallelModelSampler + ?Sized),
         view: &CastView,
         spacing: f64,
         mode: PassMode,
@@ -1139,7 +1154,7 @@ impl DirectCast {
     /// that finds is redrawn and followed the same way.
     pub fn cast(
         &mut self,
-        sampler: &impl ParallelModelSampler,
+        sampler: &(impl ParallelModelSampler + ?Sized),
         view: &CastView,
         options: &CastOptions,
         cancel: &AtomicBool,

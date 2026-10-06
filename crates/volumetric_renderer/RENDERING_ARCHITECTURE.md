@@ -142,11 +142,11 @@ fixed on screen. Standard views and Frame behave the same in either mode.
 ```
  geometry sources ──► G-buffer ──► AO ──► resolve ──► FXAA ──► scene target
    mesh rasteriser      albedo            lighting              │
-   image sources*       normal            edges                 ▼
+   surfel discs         normal            edges                 ▼
                         object id         tone map       grid, lines, points
                         depth                            splats
                                                          overlay lines, points
- * follow-up                                             lens warp (look-through)
+                                                         lens warp (look-through)
                                                          view gizmo
 ```
 
@@ -177,9 +177,14 @@ so sources compose with each other and with everything drawn afterwards.
 
 1. **Mesh rasteriser** (this arc). Retained `GpuMesh` handles drawn with a
    per-draw transform, `ObjectId` and `MaterialId`.
-2. **Image source** (follow-up, section 9). A depth image with optional
-   normal, colour and id images, produced elsewhere, written by a
-   full-screen pass that sets fragment depth.
+2. **Surfel discs** (`surfel_gbuffer.wgsl`, built 2026-10-05 for the direct
+   caster). Retained `GpuSurfels`: surface points with normals and radii,
+   each drawn as an opaque disc in its tangent plane, back faces culled,
+   under the same per-draw transform and ids as a mesh. The G-buffer gets
+   the disc's own depth, so discs of one surface meet without gaps and
+   everything after the fill treats them as it treats a mesh. (Replaces
+   the planned full-screen image source of section 9; see
+   `DIRECT_CASTING_PLAN.md` §4.3 for why geometry rather than an image.)
 
 ### Passes
 
@@ -441,9 +446,10 @@ renderer, and the renderer's obligations to it are fixed here:
 - the source is replaced without re-rendering other sources' buffers, so a
   coarse image shown during camera motion can be refined at rest.
 
-The caster is being built to `DIRECT_CASTING_PLAN.md` (repo root). Its
-search library exists (`src/direct_cast.rs`, which the icon thumbnails now
-use); the pass that draws its surface points into this frame does not yet.
+The caster is built to `DIRECT_CASTING_PLAN.md` (repo root): the search
+library (`src/direct_cast.rs`, which the icon thumbnails use) and the surfel
+disc source above, which `render --direct` draws with. The viewport mode is
+that plan's step 3.
 
 ## 10. What is deleted
 

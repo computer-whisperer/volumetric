@@ -107,7 +107,7 @@ explicit camera, a pinhole (`pinhole={"fx", "fy", "cx", "cy",
 an overlay; `resolution`, `sharp`, `simplify`, `color_field`,
 `color_range`, `wireframe`, `background`, `up`, `projection="ortho"`
 with `ortho_scale`, `grid`, `ssao`, `lighting` (`"studio"`, `"flat"`,
-`"headlight"`), `edges`, `antialias`, `supersample` as the CLI's flags;
+`"headlight"`), `edges`, `antialias`, `supersample`, `direct` as the CLI's flags;
 `marks=True`
 draws what the looked-through view observed (markers, card corners,
 recorded picks and contours, named beside their marks) over the frame,

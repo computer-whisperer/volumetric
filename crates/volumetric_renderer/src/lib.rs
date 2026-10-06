@@ -54,14 +54,15 @@ pub use camera::{Camera, CameraView, OrbitMode, Pinhole, Projection, StandardVie
 pub use navigation::{CameraAction, CameraControlScheme, CameraInputState, Cursor, Navigator};
 pub use pick::Pick;
 pub use pipelines::{
-    GpuLines, GpuMesh, GpuPoints, GpuSplat, Warp, evaluate_sh, project_covariance,
+    GpuLines, GpuMesh, GpuPoints, GpuSplat, GpuSurfels, Warp, evaluate_sh, project_covariance,
 };
 pub use scene::SceneData;
 pub use types::{
     AXIS_COLORS, AoSettings, DepthMode, EdgeSettings, GridPlane, GridSettings, GridSpacing, Light,
     LightingPreset, LightingRig, LineData, LineInstance, LinePattern, LineSegment, LineStyle,
     MAX_MATERIALS, Material, MaterialId, MeshData, MeshVertex, ObjectId, PointData, PointInstance,
-    PointShape, PointStyle, RenderSettings, SplatData, SplatStyle, WidthMode,
+    PointShape, PointStyle, RenderSettings, SplatData, SplatStyle, SurfelData, SurfelVertex,
+    WidthMode,
 };
 
 use std::sync::Arc;
@@ -73,7 +74,8 @@ use pick::{FrameRecord, Picker};
 use pipelines::{
     AoBlurUniforms, AoUniforms, FullscreenPass, FxaaUniforms, GizmoPipeline, GpuPointInstance,
     GpuWarp, GridPipeline, LinePipeline, MeshDraw, MeshPipeline, PointPipeline, ResolveUniforms,
-    SplatCompositePipeline, SplatPipeline, WarpPipeline, ao_pass, resolve_pass,
+    SplatCompositePipeline, SplatPipeline, SurfelDraw, SurfelPipeline, WarpPipeline, ao_pass,
+    resolve_pass,
 };
 
 /// Geometry dropped from a frame because it would have exceeded the
@@ -94,6 +96,8 @@ pub struct GeometryOverflow {
     pub dropped_points: usize,
     /// Splat primitives dropped (retained splats are clamped at creation).
     pub dropped_splats: usize,
+    /// Surfels dropped (clamped at creation).
+    pub dropped_surfels: usize,
     /// The device's buffer size limit the frame was clamped to.
     pub max_buffer_bytes: u64,
 }
@@ -105,6 +109,7 @@ impl GeometryOverflow {
             || self.dropped_lines > 0
             || self.dropped_points > 0
             || self.dropped_splats > 0
+            || self.dropped_surfels > 0
     }
 }
 
@@ -224,6 +229,7 @@ pub struct Renderer {
     warp_gpu: Option<GpuWarp>,
 
     mesh_pipeline: MeshPipeline,
+    surfel_pipeline: SurfelPipeline,
     ao: FullscreenPass,
     ao_blur: FullscreenPass,
     /// How many occlusion samples a pixel takes.
@@ -245,6 +251,7 @@ pub struct Renderer {
 
     // Geometry submitted for the current frame
     frame_meshes: Vec<MeshDraw>,
+    frame_surfels: Vec<SurfelDraw>,
     frame_lines: Vec<SubmittedLines>,
     frame_points: Vec<SubmittedPoints>,
     frame_retained_lines: Vec<Arc<GpuLines>>,
@@ -298,6 +305,7 @@ impl Renderer {
             warp: None,
             warp_gpu: None,
             mesh_pipeline: MeshPipeline::new(device),
+            surfel_pipeline: SurfelPipeline::new(device),
             ao,
             ao_blur,
             ao_samples,
@@ -314,6 +322,7 @@ impl Renderer {
             gbuffer,
             gbuffer_bindings,
             frame_meshes: Vec::new(),
+            frame_surfels: Vec::new(),
             frame_lines: Vec::new(),
             frame_points: Vec::new(),
             frame_retained_lines: Vec::new(),
@@ -530,6 +539,34 @@ impl Renderer {
         });
     }
 
+    /// Uploads surfels as a retained GPU resident; the transform comes at
+    /// submission.
+    pub fn create_retained_surfels(
+        &self,
+        device: &wgpu::Device,
+        surfels: &SurfelData,
+    ) -> Arc<GpuSurfels> {
+        Arc::new(GpuSurfels::new(device, surfels))
+    }
+
+    /// Submit retained surfels for this frame, drawn under `transform` as
+    /// discs; they fill the G-buffer like a mesh, so they are lit, edged,
+    /// occluded and picked the same way.
+    pub fn submit_retained_surfels(
+        &mut self,
+        surfels: &Arc<GpuSurfels>,
+        transform: Mat4,
+        object: ObjectId,
+        material: MaterialId,
+    ) {
+        self.frame_surfels.push(SurfelDraw {
+            surfels: surfels.clone(),
+            transform,
+            object,
+            material,
+        });
+    }
+
     /// Submit a retained line batch for this frame.
     pub fn submit_retained_lines(&mut self, lines: &Arc<GpuLines>) {
         self.frame_retained_lines.push(lines.clone());
@@ -587,6 +624,9 @@ impl Renderer {
         for splat in &self.frame_retained_splats {
             overflow.dropped_splats += splat.dropped;
         }
+        for draw in &self.frame_surfels {
+            overflow.dropped_surfels += draw.surfels.dropped;
+        }
 
         // Through a lens the scene renders into the warp's own frame and
         // the last pass writes the target; otherwise straight to it.
@@ -614,6 +654,8 @@ impl Renderer {
         // each batch has buffers of its own.
         self.mesh_pipeline
             .prepare(device, queue, view_proj, &self.frame_meshes);
+        self.surfel_pipeline
+            .prepare(device, queue, view_proj, &self.frame_surfels);
 
         self.line_pipeline.begin_frame();
         for submitted in &self.frame_lines {
@@ -764,6 +806,7 @@ impl Renderer {
                 multiview_mask: None,
             });
             self.mesh_pipeline.render(&mut pass, &self.frame_meshes);
+            self.surfel_pipeline.render(&mut pass, &self.frame_surfels);
         }
 
         // ---- Ambient occlusion, then the resolve onto the background.
@@ -893,6 +936,7 @@ impl Renderer {
             size: internal_size,
         });
         self.frame_meshes.clear();
+        self.frame_surfels.clear();
         self.frame_lines.clear();
         self.frame_points.clear();
         self.frame_retained_lines.clear();
@@ -905,23 +949,30 @@ impl Renderer {
         }
     }
 
-    /// The diagonal of the box around every mesh submitted for this
-    /// frame, in world units; 0 with none.
+    /// The diagonal of the box around every mesh and surfel set submitted
+    /// for this frame, in world units; 0 with none.
     fn mesh_diagonal(&self) -> f32 {
+        let corners = |bounds: Option<(Vec3, Vec3)>, transform: Mat4| {
+            let (min, max) = bounds?;
+            Some((0..8).map(move |i| {
+                transform.transform_point3(Vec3::new(
+                    if i & 1 == 0 { min.x } else { max.x },
+                    if i & 2 == 0 { min.y } else { max.y },
+                    if i & 4 == 0 { min.z } else { max.z },
+                ))
+            }))
+        };
         let bounds = self
             .frame_meshes
             .iter()
-            .filter_map(|draw| {
-                let (min, max) = draw.mesh.bounds?;
-                Some((0..8).map(move |i| {
-                    draw.transform.transform_point3(Vec3::new(
-                        if i & 1 == 0 { min.x } else { max.x },
-                        if i & 2 == 0 { min.y } else { max.y },
-                        if i & 4 == 0 { min.z } else { max.z },
-                    ))
-                }))
-            })
+            .filter_map(|draw| corners(draw.mesh.bounds, draw.transform))
             .flatten()
+            .chain(
+                self.frame_surfels
+                    .iter()
+                    .filter_map(|draw| corners(draw.surfels.bounds, draw.transform))
+                    .flatten(),
+            )
             .fold(None, |bounds: Option<(Vec3, Vec3)>, p| {
                 Some(bounds.map_or((p, p), |(min, max)| (min.min(p), max.max(p))))
             });

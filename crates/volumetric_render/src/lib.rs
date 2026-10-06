@@ -16,18 +16,24 @@
 use anyhow::{Context, Result};
 use glam::{Mat4, Quat, Vec3};
 
+use std::sync::atomic::AtomicBool;
 use view_core::image::{Rgb, decode_rgb};
 use view_core::overlay::compose;
+
+use volumetric::direct_cast::{CastOptions, CastProjection, CastView, DirectCast};
+use volumetric::wasm::ParallelModelSampler;
+use volumetric::wasm::native::NativeParallelSampler;
 use volumetric::{AssetTypeHint, LoadedAsset};
 use volumetric_preview::{
-    Asn2Settings, MarkLabel, PreviewBounds, PreviewEntity, PreviewMeshPlan, PreviewPlan,
-    PreviewRenderMode, PreviewRequest, ViewFrame, build_preview_scene, clip_planes_for,
-    mark_labels, observation_lines, srgb_to_linear, submit_subspace_gizmo, submit_view_highlight,
-    wireframe_style,
+    Asn2Settings, MarkLabel, OutputStats, PreviewBounds, PreviewEntity, PreviewMeshPlan,
+    PreviewPlan, PreviewRenderMode, PreviewRequest, ViewFrame, build_preview_scene,
+    clip_planes_for, mark_labels, observation_lines, srgb_to_linear, submit_subspace_gizmo,
+    submit_view_highlight, wireframe_style,
 };
 use volumetric_renderer::{
     AoSettings, Camera, CameraView, GridPlane, GridSpacing, LineData, MaterialId, ObjectId,
-    RenderSettings, StandardView, Warp, offscreen::Offscreen, offscreen::downsample_rgba,
+    RenderSettings, SceneData, StandardView, SurfelData, SurfelVertex, Warp, offscreen::Offscreen,
+    offscreen::downsample_rgba,
 };
 
 pub use view_core::overlay::Overlay;
@@ -107,6 +113,11 @@ pub struct RenderOptions {
     /// down (1 = off). Frames through a lens, over a photograph, with
     /// marks, or of a splat are always drawn at their own size.
     pub supersample: u32,
+    /// Draw 3D models by casting the model itself (`DIRECT_CASTING_PLAN.md`)
+    /// instead of meshing it: exact at every pixel, no mesh artefacts, and
+    /// as slow as the model's samples. Other asset kinds are drawn as
+    /// usual.
+    pub direct: bool,
     pub plan: PlanOptions,
     /// With a `Through` camera: composite the render over the photograph.
     pub overlay: Option<Overlay>,
@@ -134,6 +145,7 @@ impl Default for RenderOptions {
             edges: true,
             antialias: true,
             supersample: 2,
+            direct: false,
             plan: PlanOptions::default(),
             overlay: None,
             marks: false,
@@ -620,6 +632,80 @@ fn over(mut dst: Vec<u8>, src: &[u8]) -> Vec<u8> {
 /// `camera` with `options`. `imports` are the project's imports, where a
 /// `Through` camera finds its view set when the set is not among the
 /// drawn assets.
+static NEVER: AtomicBool = AtomicBool::new(false);
+
+/// A 3D model drawn by casting it: its sampler and the record of what the
+/// casts have found.
+struct DirectSource {
+    id: String,
+    sampler: NativeParallelSampler,
+    cast: DirectCast,
+    bounds: PreviewBounds,
+}
+
+impl DirectSource {
+    fn new(asset: &LoadedAsset) -> Result<Self> {
+        let bytes = asset.as_model().context("not a model")?;
+        let sampler = NativeParallelSampler::new(bytes).map_err(|err| anyhow::anyhow!("{err}"))?;
+        let cast = DirectCast::for_model(&sampler)?;
+        let bounds = sampler.get_bounds()?;
+        let (min, max) = bounds.as_f32();
+        Ok(Self {
+            id: asset.id().to_string(),
+            sampler,
+            cast,
+            bounds: PreviewBounds { min, max },
+        })
+    }
+
+    /// An entity with no geometry, so the frame is framed on the model's
+    /// bounds like any other.
+    fn entity(&self) -> PreviewEntity {
+        PreviewEntity {
+            scene: SceneData::new(),
+            bounds: self.bounds,
+            stats: OutputStats {
+                bounds: Some((self.bounds.min, self.bounds.max)),
+                ..OutputStats::default()
+            },
+            wireframe_lines: None,
+            subspace: None,
+            mesh_keys: Vec::new(),
+            articulated: None,
+        }
+    }
+}
+
+/// The caster's view of a frame drawn `width × height`: the same eye,
+/// axes and projection. A sheared frustum (a photograph's off-centre
+/// principal point) has no caster equivalent yet.
+fn cast_view_of(view: &CameraView, (width, height): (u32, u32)) -> Result<CastView> {
+    let camera_to_world = view.view.inverse();
+    let axis = |i: usize| camera_to_world.col(i).truncate().as_dvec3().normalize();
+    let projection = view.projection.to_cols_array_2d();
+    anyhow::ensure!(
+        projection[2][0].abs() < 1e-6 && projection[2][1].abs() < 1e-6,
+        "a direct cast cannot look through an off-centre camera yet"
+    );
+    let orthographic = projection[3][3] == 1.0;
+    let scale = 1.0 / projection[1][1] as f64;
+    Ok(CastView {
+        eye: camera_to_world.col(3).truncate().as_dvec3(),
+        right: axis(0),
+        up: axis(1),
+        forward: -axis(2),
+        projection: if orthographic {
+            CastProjection::Orthographic { half_height: scale }
+        } else {
+            CastProjection::Perspective {
+                tan_half_fov_y: scale,
+            }
+        },
+        width,
+        height,
+    })
+}
+
 pub fn render(
     assets: &[LoadedAsset],
     imports: &[LoadedAsset],
@@ -726,7 +812,28 @@ pub fn render(
 
     let mut entities: Vec<PreviewEntity> = Vec::with_capacity(assets.len());
     let mut reports = Vec::with_capacity(assets.len());
+    // Models cast directly, one record each, parallel to `entities`.
+    let mut direct: Vec<Option<DirectSource>> = Vec::with_capacity(assets.len());
     for asset in assets {
+        if options.direct && asset.type_hint() == Some(AssetTypeHint::Model) {
+            match DirectSource::new(asset) {
+                Ok(source) => {
+                    entities.push(source.entity());
+                    reports.push(EntityReport {
+                        id: asset.id().to_string(),
+                        triangles: 0,
+                        points: 0,
+                        bounds: source.bounds,
+                        mesh_ms: 0.0,
+                        detail: vec!["cast directly".to_string()],
+                    });
+                    direct.push(Some(source));
+                    continue;
+                }
+                Err(err) => notes.push(format!("{}: meshed, not cast: {err}", asset.id())),
+            }
+        }
+        direct.push(None);
         let request = preview_request(asset, &options.plan);
         let entity = build_preview_scene(&request)
             .map_err(|err| anyhow::anyhow!("{}: {err}", asset.id()))?;
@@ -825,10 +932,51 @@ pub fn render(
 
     let mut out = Vec::with_capacity(frames.len());
     for (suffix, view) in frames {
+        // A cast model's surfels are found for this very frame, at the
+        // drawn size, so every pixel has a sample of its own.
+        let cast_view = if direct.iter().any(Option::is_some) {
+            Some(cast_view_of(&view, drawn)?)
+        } else {
+            None
+        };
         // Each mesh is its own object, numbered in drawing order, so the
         // boundary between two parts gets an edge line.
         let mut object = 0;
-        for (scene, entity) in resident.iter().zip(&entities) {
+        for ((scene, entity), source) in resident.iter().zip(&entities).zip(&mut direct) {
+            if let (Some(source), Some(cast_view)) = (source, &cast_view) {
+                let start = std::time::Instant::now();
+                let (image, stats) = source
+                    .cast
+                    .cast(&source.sampler, cast_view, &CastOptions::default(), &NEVER)
+                    .expect("never cancelled");
+                let surfels = SurfelData {
+                    surfels: source
+                        .cast
+                        .surfels(Some((cast_view, 1.0)))
+                        .iter()
+                        .map(|s| SurfelVertex::new(s.position, s.normal, s.radius))
+                        .collect(),
+                };
+                let resident = renderer.create_retained_surfels(offscreen.device(), &surfels);
+                object += 1;
+                renderer.submit_retained_surfels(
+                    &resident,
+                    Mat4::IDENTITY,
+                    ObjectId(object),
+                    MaterialId::default(),
+                );
+                notes.push(format!(
+                    "{}{}: cast directly, {} surfels from {} samples in {:.2} s, {} of {} pixels hit",
+                    source.id,
+                    suffix.map_or(String::new(), |s| format!(" ({s})")),
+                    surfels.surfels.len(),
+                    stats.samples,
+                    start.elapsed().as_secs_f64(),
+                    image.hits.iter().flatten().count(),
+                    image.hits.len()
+                ));
+                continue;
+            }
             for (mesh, transform) in &scene.meshes {
                 object += 1;
                 renderer.submit_retained_mesh(
@@ -862,12 +1010,13 @@ pub fn render(
         let rgba = downsample_rgba(&rgba, drawn.0, drawn.1, supersample);
         if let Some(overflow) = info.overflow {
             notes.push(format!(
-                "dropped {} of {} triangles, {} lines, {} points and {} splat primitives at the GPU buffer limit",
+                "dropped {} of {} triangles, {} lines, {} points, {} splat primitives and {} surfels at the GPU buffer limit",
                 overflow.dropped_triangles,
                 overflow.total_triangles,
                 overflow.dropped_lines,
                 overflow.dropped_points,
-                overflow.dropped_splats
+                overflow.dropped_splats,
+                overflow.dropped_surfels
             ));
         }
         let rgba = match (&overlay, &photo) {
@@ -1170,6 +1319,70 @@ mod tests {
             preview_request(&asset("mesh", Some(AssetTypeHint::TriMesh)), &options).plan,
             PreviewPlan::TriMesh
         );
+    }
+
+    /// A model cast directly is the same picture as the model meshed:
+    /// the same pixels covered, nearly all of them the same shade. Needs
+    /// a GPU; skipped without one.
+    #[test]
+    fn a_direct_cast_draws_the_mesh_render() {
+        if let Err(err) = Offscreen::new() {
+            eprintln!("skipped: {err}");
+            return;
+        }
+        let sphere = volumetric_assets::get_model("simple_sphere_model").expect("bundled sphere");
+        let model = LoadedAsset::from_parts(
+            "sphere".to_string(),
+            sphere.bytes.to_vec(),
+            Some(AssetTypeHint::Model),
+            vec![],
+        );
+        let options = RenderOptions {
+            width: Some(192),
+            height: Some(144),
+            grid: 0.0,
+            supersample: 1,
+            ..RenderOptions::default()
+        };
+        let frame = |direct: bool| {
+            let options = RenderOptions {
+                direct,
+                ..options.clone()
+            };
+            let rendered = render(
+                std::slice::from_ref(&model),
+                &[],
+                CameraSpec::Presets(vec![ViewPreset::Iso]),
+                &options,
+            )
+            .unwrap();
+            assert_eq!(rendered.frames.len(), 1);
+            (rendered.frames[0].rgba.clone(), rendered.report)
+        };
+        let (meshed, _) = frame(false);
+        let (cast, report) = frame(true);
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("cast directly")),
+            "{:?}",
+            report.notes
+        );
+        let background = options.background.map(|c| (c * 255.0).round() as i32);
+        let covered = |px: &[u8]| (0..3).any(|c| (px[c] as i32 - background[c]).abs() > 8);
+        let (mut on_mesh, mut on_cast, mut differ) = (0usize, 0usize, 0usize);
+        for (a, b) in meshed.chunks_exact(4).zip(cast.chunks_exact(4)) {
+            on_mesh += covered(a) as usize;
+            on_cast += covered(b) as usize;
+            differ += ((0..3).any(|c| (a[c] as i32 - b[c] as i32).abs() > 24)) as usize;
+        }
+        assert!(on_mesh > 3000, "{on_mesh} sphere pixels");
+        assert!(
+            (on_cast as i64 - on_mesh as i64).abs() * 50 < on_mesh as i64,
+            "{on_cast} cast pixels against {on_mesh} meshed"
+        );
+        assert!(differ * 20 < on_mesh, "{differ} of {on_mesh} pixels differ");
     }
 
     #[test]

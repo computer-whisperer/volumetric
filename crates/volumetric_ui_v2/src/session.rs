@@ -1682,6 +1682,12 @@ fn overflow_message(overflow: &renderer::GeometryOverflow) -> String {
             crate::format_count(overflow.dropped_splats)
         ));
     }
+    if overflow.dropped_surfels > 0 {
+        dropped.push(format!(
+            "{} surfels",
+            crate::format_count(overflow.dropped_surfels)
+        ));
+    }
     let limit_mib = overflow.max_buffer_bytes / (1024 * 1024);
     format!(
         "over the {limit_mib} MiB GPU buffer limit — dropped {}; reduce preview resolution",
@@ -3097,6 +3103,7 @@ mod tests {
             dropped_lines: 1_200,
             dropped_points: 0,
             dropped_splats: 0,
+            dropped_surfels: 0,
             max_buffer_bytes: 256 * 1024 * 1024,
         });
         assert_eq!(
