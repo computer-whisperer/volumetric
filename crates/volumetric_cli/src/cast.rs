@@ -641,7 +641,7 @@ fn fibonacci_sphere(n: usize) -> Vec<DVec3> {
 /// their way), against the normal the cast found. Returns which hits are
 /// more than 60 degrees off; at an edge the two differ by up to 45.
 fn check_normals(
-    sampler: &(impl ParallelModelSampler + Sync),
+    sampler: &impl ParallelModelSampler,
     view: &CastView,
     image: &CastImage,
 ) -> Vec<bool> {
