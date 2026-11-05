@@ -542,7 +542,7 @@ fn convert_composite(
 }
 
 fn convert_face(ctx: &Ctx, face_id: u64, opts: &Options) -> Result<Face, String> {
-    let (surface_id, loops) = ctx.advanced_face(face_id)?;
+    let (surface_id, same_sense, bounds) = ctx.advanced_face(face_id)?;
     let step_surface = ctx
         .surface(surface_id)
         .map_err(|e| format!("surface: {e}"))?;
@@ -550,9 +550,15 @@ fn convert_face(ctx: &Ctx, face_id: u64, opts: &Options) -> Result<Face, String>
 
     let proj_tol = opts.chord_tol * 4.0 + 1e-6;
     let mut trims = Vec::new();
-    for (li, lp) in loops.iter().enumerate() {
-        let pts = loop_points(ctx, lp, opts).map_err(|e| format!("loop {li}: {e}"))?;
-        let uv = project::project_loop(&surface, &pts, proj_tol)
+    if bounds.is_empty() {
+        trims.push(project::full_domain_loop(&surface)?);
+    }
+    for (li, bound) in bounds.iter().enumerate() {
+        let pts = loop_points(ctx, &bound.edges, opts).map_err(|e| format!("loop {li}: {e}"))?;
+        // Parity is orientation-blind, except for the one thing geometry
+        // cannot settle: which way a loop turns around a periodic pole.
+        let material_left = bound.orientation == same_sense;
+        let uv = project::project_loop(&surface, &pts, material_left, proj_tol)
             .map_err(|e| format!("loop {li}: {e}"))?;
         trims.push(uv);
     }

@@ -481,6 +481,14 @@ pub enum StepSurface {
 // Topology
 // -------------------------------------------------------------------
 
+/// One edge loop of a face with its FACE_BOUND orientation: true when
+/// the listed traversal runs with the face material on its left (seen
+/// with the face normal up); false when the listed order is reversed.
+pub struct StepBound {
+    pub edges: Vec<StepEdge>,
+    pub orientation: bool,
+}
+
 pub struct StepEdge {
     /// Start/end vertex points, in oriented-edge order.
     pub start: Vec3,
@@ -528,9 +536,12 @@ impl<'a> Ctx<'a> {
         })
     }
 
-    /// The loops of a face bound: each FACE_BOUND -> EDGE_LOOP ->
-    /// oriented edges.
-    pub fn face_bounds(&self, face_id: u64) -> Result<Vec<Vec<StepEdge>>, String> {
+    /// The edge-loop bounds of a face: each FACE_BOUND -> EDGE_LOOP ->
+    /// oriented edges, with the bound's orientation flag. A VERTEX_LOOP
+    /// bound (a single vertex, how OCCT writes the pole of a full sphere)
+    /// constrains nothing and is skipped — a face may therefore come
+    /// back with no bounds at all.
+    pub fn face_bounds(&self, face_id: u64) -> Result<Vec<StepBound>, String> {
         let r = self.simple(face_id, &["ADVANCED_FACE", "FACE_SURFACE"])?;
         let bounds = r
             .args
@@ -544,29 +555,47 @@ impl<'a> Ctx<'a> {
                 .ok_or_else(|| format!("#{face_id}: bound is not a reference"))?;
             let br = self.simple(bid, &["FACE_BOUND", "FACE_OUTER_BOUND"])?;
             let loop_id = self.ref_arg(br, 1, bid)?;
-            let lr = self.simple(loop_id, &["EDGE_LOOP"])?;
+            let orientation = br
+                .args
+                .get(2)
+                .and_then(Arg::as_bool)
+                .ok_or_else(|| format!("#{bid} FACE_BOUND: bad orientation"))?;
+            let lr = self.simple(loop_id, &["EDGE_LOOP", "VERTEX_LOOP"])?;
+            if lr.name == "VERTEX_LOOP" {
+                continue;
+            }
             let edges = lr
                 .args
                 .get(1)
                 .and_then(Arg::as_list)
                 .ok_or_else(|| format!("#{loop_id} EDGE_LOOP: missing edge list"))?;
-            let mut lp = Vec::with_capacity(edges.len());
+            let mut edges_out = Vec::with_capacity(edges.len());
             for e in edges {
                 let eid = e
                     .as_ref_id()
                     .ok_or_else(|| format!("#{loop_id}: edge is not a reference"))?;
-                lp.push(self.oriented_edge(eid)?);
+                edges_out.push(self.oriented_edge(eid)?);
             }
-            loops.push(lp);
+            loops.push(StepBound {
+                edges: edges_out,
+                orientation,
+            });
         }
         Ok(loops)
     }
 
-    /// `(surface_id, loops)` for an ADVANCED_FACE.
-    pub fn advanced_face(&self, face_id: u64) -> Result<(u64, Vec<Vec<StepEdge>>), String> {
+    /// `(surface_id, same_sense, bounds)` for an ADVANCED_FACE.
+    /// `same_sense` is whether the face normal agrees with the surface's
+    /// own (parameterization) normal.
+    pub fn advanced_face(&self, face_id: u64) -> Result<(u64, bool, Vec<StepBound>), String> {
         let r = self.simple(face_id, &["ADVANCED_FACE", "FACE_SURFACE"])?;
         let surface_id = self.ref_arg(r, 2, face_id)?;
-        Ok((surface_id, self.face_bounds(face_id)?))
+        let same_sense = r
+            .args
+            .get(3)
+            .and_then(Arg::as_bool)
+            .ok_or_else(|| format!("#{face_id} ADVANCED_FACE: bad same_sense"))?;
+        Ok((surface_id, same_sense, self.face_bounds(face_id)?))
     }
 
     /// Face ids of a MANIFOLD_SOLID_BREP's shell.

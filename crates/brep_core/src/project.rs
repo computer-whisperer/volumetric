@@ -155,77 +155,206 @@ pub fn project_point(
     }
 }
 
+/// A point of a surface where one parameter is free: every value of the
+/// free parameter at `value` on the fixed `axis` evaluates to `point`.
+/// Sphere poles, the cone apex, and the collapsed edge rows of a NURBS
+/// control net (see [`nurbs::pole_edges`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Pole {
+    pub point: Vec3,
+    /// 0 = u is fixed (v free), 1 = v is fixed (u free).
+    pub axis: usize,
+    pub value: f64,
+    /// The free parameter is periodic (period 2π): the pole is the
+    /// whole top or bottom edge of the surface's periodic strip.
+    pub periodic: bool,
+}
+
+/// The poles of a surface, if any.
+pub fn poles(surface: &Surface) -> Vec<Pole> {
+    use core::f64::consts::FRAC_PI_2;
+    match surface {
+        Surface::Sphere { frame, radius } => [-FRAC_PI_2, FRAC_PI_2]
+            .into_iter()
+            .map(|v| Pole {
+                point: frame.to_world([0.0, 0.0, radius * v.signum()]),
+                axis: 1,
+                value: v,
+                periodic: true,
+            })
+            .collect(),
+        Surface::Cone {
+            frame,
+            radius,
+            half_angle,
+        } => {
+            let t = half_angle.tan();
+            if t == 0.0 || !t.is_finite() {
+                return Vec::new();
+            }
+            let v = -radius / t;
+            vec![Pole {
+                point: frame.to_world([0.0, 0.0, v]),
+                axis: 1,
+                value: v,
+                periodic: true,
+            }]
+        }
+        Surface::Nurbs(n) => {
+            let dom = n.domain();
+            let edges = nurbs::pole_edges(n);
+            (0..4)
+                .filter(|&k| edges[k])
+                .map(|k| {
+                    let (u, v) = match k {
+                        0 | 1 => (dom[k], 0.5 * (dom[2] + dom[3])),
+                        _ => (0.5 * (dom[0] + dom[1]), dom[k]),
+                    };
+                    Pole {
+                        point: nurbs::surface_eval(n, u, v).0,
+                        axis: k / 2,
+                        value: dom[k],
+                        periodic: false,
+                    }
+                })
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The trim loop of a face that has no edge loops at all: the whole
+/// surface. Only a surface whose parameter domain is closed in both
+/// directions can be a face without bounds (a full sphere, written with
+/// nothing but a vertex loop at a pole; a full torus).
+pub fn full_domain_loop(surface: &Surface) -> Result<Vec<[f64; 2]>, String> {
+    use core::f64::consts::{FRAC_PI_2, TAU};
+    let [u0, u1, v0, v1] = match surface {
+        Surface::Sphere { .. } => [0.0, TAU, -FRAC_PI_2, FRAC_PI_2],
+        Surface::Torus { .. } => [0.0, TAU, 0.0, TAU],
+        _ => return Err("face without edge loops on a surface that is not closed".into()),
+    };
+    Ok(vec![[u0, v0], [u1, v0], [u1, v1], [u0, v1]])
+}
+
 /// Project a closed loop of 3D points (in solid-local coordinates) into
 /// the surface's UV space as one trim polyline: each point is projected
 /// with its predecessor's UV as the hint, and the result is checked to
 /// re-evaluate onto its source point within `2 * tol`.
 ///
-/// A point that lands on a pole of a NURBS surface (a domain edge whose
-/// control row collapses to one 3D point, see [`nurbs::pole_edges`])
-/// has a free parameter along that edge, so it expands into two UV
-/// points — the edge coordinate paired with each neighbour's free
-/// coordinate — and the polyline runs *along* the collapsed edge from
-/// the one neighbour to the other. One arbitrary UV for the pole would
-/// cut the corner diagonally and leave a sliver of the face untrimmed.
-/// The returned polyline can therefore be longer than `points`.
-pub fn project_loop(surface: &Surface, points: &[Vec3], tol: f64) -> Result<Vec<[f64; 2]>, String> {
-    let mut uv: Vec<[f64; 2]> = Vec::with_capacity(points.len() + 2);
-    let mut hint = None;
-    for p in points {
-        let q = project_point(surface, *p, hint, tol)?;
-        uv.push(q);
-        hint = Some(q);
-    }
-    let mut sources: Vec<Vec3> = points.to_vec();
-
-    if let Surface::Nurbs(n) = surface {
-        let poles = nurbs::pole_edges(n);
-        if poles.iter().any(|&b| b) {
-            let dom = n.domain();
-            // The pole point of each collapsed edge (any free coordinate
-            // evaluates to it). A source point within the projection
-            // tolerance of it IS the pole, however close to the bound
-            // Gauss-Newton happened to stop.
-            let pole_point = |k: usize| -> Vec3 {
-                let (u, v) = match k {
-                    0 | 1 => (dom[k], 0.5 * (dom[2] + dom[3])),
-                    _ => (0.5 * (dom[0] + dom[1]), dom[k]),
-                };
-                nurbs::surface_eval(n, u, v).0
-            };
-            let on_pole = |p: Vec3| -> Option<(usize, f64)> {
-                // (fixed axis, its value) when p is a pole.
-                (0..4)
-                    .filter(|&k| poles[k] && norm(sub(p, pole_point(k))) <= tol)
-                    .map(|k| (k / 2, dom[k]))
-                    .next()
-            };
-            let n_in = uv.len();
-            let mut expanded = Vec::with_capacity(n_in + 2);
-            let mut expanded_src = Vec::with_capacity(n_in + 2);
-            for i in 0..n_in {
-                match on_pole(sources[i]) {
-                    Some((axis, bound)) => {
-                        let prev = uv[(i + n_in - 1) % n_in];
-                        let next = uv[(i + 1) % n_in];
-                        let free = 1 - axis;
-                        for neighbour in [prev, next] {
-                            let mut q = [0.0; 2];
-                            q[axis] = bound;
-                            q[free] = neighbour[free];
-                            expanded.push(q);
-                            expanded_src.push(sources[i]);
-                        }
-                    }
-                    None => {
-                        expanded.push(uv[i]);
-                        expanded_src.push(sources[i]);
-                    }
-                }
+/// A point within `tol` of a pole (see [`poles`]) has a free parameter,
+/// so it expands into two UV points — the pole's fixed coordinate paired
+/// with each neighbour's free coordinate — and the polyline runs *along*
+/// the pole edge from the one neighbour to the other. One arbitrary UV
+/// for the pole would cut the corner diagonally and leave a sliver of the
+/// face untrimmed. The returned polyline can therefore be longer than
+/// `points`.
+///
+/// On a periodic pole (sphere, cone) the free coordinate of the far
+/// neighbour has a branch to choose: the loop turns around the pole by
+/// some angle in `(0, 2π]`, and which way it turns is the one thing the
+/// geometry alone cannot say — the two meridians bounding a hemisphere
+/// bound the other hemisphere just as well. `material_left` (the face
+/// material lies on the left of the traversal, seen with the surface's
+/// parameterization normal up: STEP `FACE_BOUND.orientation ==
+/// ADVANCED_FACE.same_sense`) settles it: the polygon runs
+/// counter-clockwise in UV, so along the top edge of the strip it runs
+/// toward -u and along the bottom edge toward +u, from the near
+/// neighbour until it reaches the far neighbour's branch. A loop that
+/// *is* a hole and passes through a periodic pole would need the
+/// opposite turn; the format does not reliably mark holes, so that case
+/// is not supported (its complement is trimmed).
+pub fn project_loop(
+    surface: &Surface,
+    points: &[Vec3],
+    material_left: bool,
+    tol: f64,
+) -> Result<Vec<[f64; 2]>, String> {
+    use core::f64::consts::TAU;
+    let n = points.len();
+    let poles = poles(surface);
+    // A pole is a vertex of the loop, written exactly; the flattened
+    // points beside it are a flattening step away, which on a feature
+    // smaller than `tol` (a 20 µm fillet sphere) is less than `tol`. So
+    // the pole test is relative to the loop's own extent as well.
+    let extent = {
+        let mut lo = [f64::INFINITY; 3];
+        let mut hi = [f64::NEG_INFINITY; 3];
+        for p in points {
+            for k in 0..3 {
+                lo[k] = lo[k].min(p[k]);
+                hi[k] = hi[k].max(p[k]);
             }
-            uv = expanded;
-            sources = expanded_src;
         }
+        norm(sub(hi, lo))
+    };
+    let pole_tol = tol.min(extent * 1e-3);
+    let pole_of = |p: Vec3| {
+        poles
+            .iter()
+            .find(|pole| norm(sub(p, pole.point)) <= pole_tol)
+    };
+
+    // Start the traversal off a pole, so every pole has a projected
+    // predecessor; a closed loop reads the same from any start.
+    let start = (0..n)
+        .find(|&i| pole_of(points[i]).is_none())
+        .ok_or("loop made of nothing but pole points")?;
+    let at = |k: usize| points[(start + k) % n];
+
+    let mut uv: Vec<[f64; 2]> = Vec::with_capacity(n + 2);
+    let mut sources: Vec<Vec3> = Vec::with_capacity(n + 2);
+    let mut hint: Option<[f64; 2]> = None;
+    let mut k = 0;
+    while k < n {
+        let p = at(k);
+        let Some(pole) = pole_of(p) else {
+            let q = project_point(surface, p, hint, tol)?;
+            uv.push(q);
+            sources.push(p);
+            hint = Some(q);
+            k += 1;
+            continue;
+        };
+        let prev = *uv.last().expect("the loop starts off a pole");
+        let fixed = pole.axis;
+        let free = 1 - fixed;
+        // The far neighbour: the next point, or the loop's first point
+        // when the pole closes the loop.
+        let wraps = k + 1 == n;
+        let far_p = at(k + 1);
+        if pole_of(far_p).is_some() {
+            return Err("two consecutive pole points on one loop".into());
+        }
+        let mut far = if wraps {
+            uv[0]
+        } else {
+            project_point(surface, far_p, Some(prev), tol)?
+        };
+        if pole.periodic && fixed == 1 {
+            // Counter-clockwise: -u along the top edge, +u along the
+            // bottom; mirrored when the material is on the right.
+            let top = prev[1] < pole.value;
+            let dir = if top == material_left { -1.0 } else { 1.0 };
+            let mut span = (dir * (far[0] - prev[0])).rem_euclid(TAU);
+            if span < tol {
+                span = TAU;
+            }
+            far[0] = prev[0] + dir * span;
+        }
+        for neighbour in [prev, far] {
+            let mut q = [0.0; 2];
+            q[fixed] = pole.value;
+            q[free] = neighbour[free];
+            uv.push(q);
+            sources.push(p);
+        }
+        if !wraps {
+            uv.push(far);
+            sources.push(far_p);
+        }
+        hint = Some(far);
+        k += 2;
     }
 
     verify_loop(surface, &sources, &uv, tol * 2.0)?;
@@ -559,6 +688,51 @@ mod tests {
         );
     }
 
+    /// A sphere's two meridians at u = 0 and u = π/2 bound a quarter
+    /// and a three-quarter face alike; the sense flag picks the turn.
+    #[test]
+    fn sphere_loop_turns_around_the_pole_by_the_sense_flag() {
+        let s = Surface::Sphere {
+            frame: Frame::IDENTITY,
+            radius: 1.0,
+        };
+        // Up the u = 0 meridian to the north pole, down the u = π/2
+        // meridian to the south pole, and back up.
+        let mut pts: Vec<Vec3> = Vec::new();
+        for i in 1..8 {
+            let v = -PI / 2.0 + PI * i as f64 / 8.0;
+            pts.push([v.cos(), 0.0, v.sin()]);
+        }
+        pts.push([0.0, 0.0, 1.0]);
+        for i in 1..8 {
+            let v = PI / 2.0 - PI * i as f64 / 8.0;
+            pts.push([0.0, v.cos(), v.sin()]);
+        }
+        pts.push([0.0, 0.0, -1.0]);
+
+        let span = |uv: &[[f64; 2]]| {
+            let (lo, hi) = uv
+                .iter()
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), q| {
+                    (lo.min(q[0]), hi.max(q[0]))
+                });
+            hi - lo
+        };
+        // Heading north along x > 0 with the outward normal up, left is
+        // y < 0: the material on the left is the three quarters outside
+        // the x > 0, y > 0 corner, a three-quarter turn at each pole.
+        let uv = project_loop(&s, &pts, true, 1e-9).unwrap();
+        assert_eq!(uv.len(), pts.len() + 2);
+        assert!(
+            (span(&uv) - 3.0 * PI / 2.0).abs() < 1e-9,
+            "span {}",
+            span(&uv)
+        );
+        // Material on the right is the quarter.
+        let uv = project_loop(&s, &pts, false, 1e-9).unwrap();
+        assert!((span(&uv) - PI / 2.0).abs() < 1e-9, "span {}", span(&uv));
+    }
+
     #[test]
     fn nurbs_loop_runs_along_a_collapsed_edge() {
         let s = Surface::Nurbs(triangle_patch());
@@ -576,7 +750,7 @@ mod tests {
             [1.0, 0.5, 0.0],
             [0.5, 0.25, 0.0],
         ];
-        let uv = project_loop(&s, &pts, 1e-9).unwrap();
+        let uv = project_loop(&s, &pts, true, 1e-9).unwrap();
         // The apex became two corner points joined along u = 1.
         assert_eq!(uv.len(), pts.len() + 1);
         let close =
