@@ -162,9 +162,66 @@ pub fn surface_eval<S: SurfaceData>(s: &S, u: f64, v: f64) -> (Vec3, Vec3, Vec3)
     (p, s_u, s_v)
 }
 
+/// Which boundaries of the surface's domain collapse to a single 3D
+/// point — a pole, where one whole edge row of the control net
+/// coincides (a corner blend, a sphere-like cap) — in domain order
+/// `[u_min, u_max, v_min, v_max]`. Along such an edge the parameter
+/// is free: every `(u_max, v)` is the same point.
+pub fn pole_edges<S: SurfaceData>(s: &S) -> [bool; 4] {
+    let (nu, nv) = (s.nctrl_u(), s.nctrl_v());
+    let same = |a: [f64; 4], b: [f64; 4]| {
+        let scale = 1.0 + a[0].abs().max(a[1].abs()).max(a[2].abs());
+        (0..3).all(|k| (a[k] - b[k]).abs() <= 1e-9 * scale)
+    };
+    let row = |i: usize| (1..nv).all(|j| same(s.ctrl(i, 0), s.ctrl(i, j)));
+    let col = |j: usize| (1..nu).all(|i| same(s.ctrl(0, j), s.ctrl(i, j)));
+    [row(0), row(nu - 1), col(0), col(nv - 1)]
+}
+
+/// Seed a closest-point search for `p`: the best cells of a uniform
+/// `(grid+1)^2` scan of the domain, nearest first, written into `out`.
+/// Returns how many were filled. Seeds are only as good as their
+/// spread — a sparse scan can hand every seed to one wrong local
+/// minimum on folded patches — so callers polish from each and keep
+/// the best. Cells are ranked by 3D distance alone, never deduplicated
+/// by 3D position: on a closed surface the two seam rows coincide yet
+/// bracket different clamped basins, and on a pole the coinciding
+/// cells differ in the free parameter the first step keeps.
+pub fn scan_seeds<S: SurfaceData>(s: &S, p: Vec3, grid: usize, out: &mut [[f64; 2]]) -> usize {
+    let dom = s.domain();
+    let mut ranked: Vec<(f64, [f64; 2])> = Vec::with_capacity(out.len() + 1);
+    for i in 0..=grid {
+        for j in 0..=grid {
+            let u = dom[0] + (dom[1] - dom[0]) * i as f64 / grid as f64;
+            let v = dom[2] + (dom[3] - dom[2]) * j as f64 / grid as f64;
+            let (q, _, _) = surface_eval(s, u, v);
+            let d = crate::math::norm(crate::math::sub(q, p));
+            if !d.is_finite() {
+                continue;
+            }
+            let slot = ranked.partition_point(|r| r.0 <= d);
+            if slot < out.len() {
+                ranked.insert(slot, (d, [u, v]));
+                ranked.truncate(out.len());
+            }
+        }
+    }
+    for (k, r) in ranked.iter().enumerate() {
+        out[k] = r.1;
+    }
+    ranked.len()
+}
+
 /// Gauss-Newton closest point on the surface from one seed, clamped to
 /// the parameter domain. Returns `(uv, distance)` — a local minimum;
 /// callers polish from several seeds and keep the best.
+///
+/// Where the two partials are dependent — at a pole, where one whole
+/// row of control points coincides and one partial vanishes, or on a
+/// fold — the normal matrix is singular and the step degenerates to a
+/// one-dimensional one along whichever partial still spans something.
+/// Returning from the pole instead would leave every seed that lands on
+/// it (and a pole swallows a whole row of a seed scan) stuck there.
 pub fn surface_closest<S: SurfaceData>(s: &S, p: Vec3, seed: [f64; 2]) -> ([f64; 2], f64) {
     let dom = s.domain();
     let (mut u, mut v) = (seed[0].clamp(dom[0], dom[1]), seed[1].clamp(dom[2], dom[3]));
@@ -180,11 +237,15 @@ pub fn surface_closest<S: SurfaceData>(s: &S, p: Vec3, seed: [f64; 2]) -> ([f64;
         let g0 = crate::math::dot(su, r);
         let g1 = crate::math::dot(sv, r);
         let det = a * c - b * b;
-        if det.abs() < 1e-30 {
+        let (du, dv) = if det > 1e-12 * a * c {
+            (-(c * g0 - b * g1) / det, -(a * g1 - b * g0) / det)
+        } else if a >= c && a > 0.0 {
+            (-g0 / a, 0.0)
+        } else if c > 0.0 {
+            (0.0, -g1 / c)
+        } else {
             return ([u, v], crate::math::norm(r));
-        }
-        let du = -(c * g0 - b * g1) / det;
-        let dv = -(a * g1 - b * g0) / det;
+        };
         u = (u + du).clamp(dom[0], dom[1]);
         v = (v + dv).clamp(dom[2], dom[3]);
         if du.abs() < 1e-12 * scale_u && dv.abs() < 1e-12 * scale_v {

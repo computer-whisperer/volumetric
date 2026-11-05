@@ -129,35 +129,13 @@ pub fn project_point(
             // hint AND from the best cells of a dense grid scan (a
             // sparse scan can hand every seed to the same wrong local
             // minimum on folded patches).
-            let dom = n.domain();
             let mut seeds: [[f64; 2]; 4] = [[0.0; 2]; 4];
             let mut seed_count = 0;
             if let Some(h) = hint {
                 seeds[seed_count] = h;
                 seed_count += 1;
             }
-            const N: usize = 9;
-            let mut ranked: [([f64; 2], f64); 3] = [([0.0; 2], f64::INFINITY); 3];
-            for i in 0..=N {
-                for j in 0..=N {
-                    let u = dom[0] + (dom[1] - dom[0]) * i as f64 / N as f64;
-                    let v = dom[2] + (dom[3] - dom[2]) * j as f64 / N as f64;
-                    let (s, _, _) = nurbs::surface_eval(n, u, v);
-                    let d = norm(sub(s, p));
-                    // Insert into the 3-best list.
-                    for slot in 0..ranked.len() {
-                        if d < ranked[slot].1 {
-                            ranked[slot..].rotate_right(1);
-                            ranked[slot] = ([u, v], d);
-                            break;
-                        }
-                    }
-                }
-            }
-            for (uv, _) in ranked {
-                seeds[seed_count] = uv;
-                seed_count += 1;
-            }
+            seed_count += nurbs::scan_seeds(n, p, 9, &mut seeds[seed_count..]);
             let mut best: Option<([f64; 2], f64)> = None;
             for seed in &seeds[..seed_count] {
                 if let Some((uv, d)) = nurbs_closest(n, p, *seed)
@@ -175,6 +153,83 @@ pub fn project_point(
             }
         }
     }
+}
+
+/// Project a closed loop of 3D points (in solid-local coordinates) into
+/// the surface's UV space as one trim polyline: each point is projected
+/// with its predecessor's UV as the hint, and the result is checked to
+/// re-evaluate onto its source point within `2 * tol`.
+///
+/// A point that lands on a pole of a NURBS surface (a domain edge whose
+/// control row collapses to one 3D point, see [`nurbs::pole_edges`])
+/// has a free parameter along that edge, so it expands into two UV
+/// points — the edge coordinate paired with each neighbour's free
+/// coordinate — and the polyline runs *along* the collapsed edge from
+/// the one neighbour to the other. One arbitrary UV for the pole would
+/// cut the corner diagonally and leave a sliver of the face untrimmed.
+/// The returned polyline can therefore be longer than `points`.
+pub fn project_loop(surface: &Surface, points: &[Vec3], tol: f64) -> Result<Vec<[f64; 2]>, String> {
+    let mut uv: Vec<[f64; 2]> = Vec::with_capacity(points.len() + 2);
+    let mut hint = None;
+    for p in points {
+        let q = project_point(surface, *p, hint, tol)?;
+        uv.push(q);
+        hint = Some(q);
+    }
+    let mut sources: Vec<Vec3> = points.to_vec();
+
+    if let Surface::Nurbs(n) = surface {
+        let poles = nurbs::pole_edges(n);
+        if poles.iter().any(|&b| b) {
+            let dom = n.domain();
+            // The pole point of each collapsed edge (any free coordinate
+            // evaluates to it). A source point within the projection
+            // tolerance of it IS the pole, however close to the bound
+            // Gauss-Newton happened to stop.
+            let pole_point = |k: usize| -> Vec3 {
+                let (u, v) = match k {
+                    0 | 1 => (dom[k], 0.5 * (dom[2] + dom[3])),
+                    _ => (0.5 * (dom[0] + dom[1]), dom[k]),
+                };
+                nurbs::surface_eval(n, u, v).0
+            };
+            let on_pole = |p: Vec3| -> Option<(usize, f64)> {
+                // (fixed axis, its value) when p is a pole.
+                (0..4)
+                    .filter(|&k| poles[k] && norm(sub(p, pole_point(k))) <= tol)
+                    .map(|k| (k / 2, dom[k]))
+                    .next()
+            };
+            let n_in = uv.len();
+            let mut expanded = Vec::with_capacity(n_in + 2);
+            let mut expanded_src = Vec::with_capacity(n_in + 2);
+            for i in 0..n_in {
+                match on_pole(sources[i]) {
+                    Some((axis, bound)) => {
+                        let prev = uv[(i + n_in - 1) % n_in];
+                        let next = uv[(i + 1) % n_in];
+                        let free = 1 - axis;
+                        for neighbour in [prev, next] {
+                            let mut q = [0.0; 2];
+                            q[axis] = bound;
+                            q[free] = neighbour[free];
+                            expanded.push(q);
+                            expanded_src.push(sources[i]);
+                        }
+                    }
+                    None => {
+                        expanded.push(uv[i]);
+                        expanded_src.push(sources[i]);
+                    }
+                }
+            }
+            uv = expanded;
+            sources = expanded_src;
+        }
+    }
+
+    verify_loop(surface, &sources, &uv, tol * 2.0)?;
+    Ok(uv)
 }
 
 fn check_residual(residual: f64, tol: f64, what: &str) -> Result<(), String> {
@@ -470,5 +525,65 @@ mod tests {
         });
         let uv = project_point(&s, [0.25, 0.75, 0.0], None, 1e-9).unwrap();
         assert!((uv[0] - 0.25).abs() < 1e-9 && (uv[1] - 0.75).abs() < 1e-9);
+    }
+
+    /// A triangular bilinear patch: the u = 1 control row collapses to
+    /// the apex (1, 0.5, 0), so (1, v) is that one point for every v.
+    fn triangle_patch() -> NurbsSurface {
+        NurbsSurface {
+            degree_u: 1,
+            degree_v: 1,
+            nctrl_u: 2,
+            nctrl_v: 2,
+            knots_u: vec![0.0, 0.0, 1.0, 1.0],
+            knots_v: vec![0.0, 0.0, 1.0, 1.0],
+            ctrl: vec![
+                [0.0, 0.0, 0.0, 1.0],
+                [0.0, 1.0, 0.0, 1.0],
+                [1.0, 0.5, 0.0, 1.0],
+                [1.0, 0.5, 0.0, 1.0],
+            ],
+        }
+    }
+
+    #[test]
+    fn nurbs_projection_near_a_pole_leaves_the_pole_seed() {
+        // Just below the apex on the v = 0 edge (y = 0.5 - 0.5 (1 - u)),
+        // seeded from the apex itself where the v partial vanishes.
+        let s = Surface::Nurbs(triangle_patch());
+        let p = [0.98, 0.49, 0.0];
+        let uv = project_point(&s, p, Some([1.0, 1.0]), 1e-9).unwrap();
+        assert!(
+            (uv[0] - 0.98).abs() < 1e-7 && uv[1].abs() < 1e-7,
+            "projected to {uv:?}"
+        );
+    }
+
+    #[test]
+    fn nurbs_loop_runs_along_a_collapsed_edge() {
+        let s = Surface::Nurbs(triangle_patch());
+        assert_eq!(
+            nurbs::pole_edges(&triangle_patch()),
+            [false, true, false, false]
+        );
+        // The patch's own boundary: up the u = 0 edge, along v = 1 to the
+        // apex, back along v = 0.
+        let pts: Vec<Vec3> = vec![
+            [0.0, 0.0, 0.0],
+            [0.0, 0.5, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.5, 0.75, 0.0],
+            [1.0, 0.5, 0.0],
+            [0.5, 0.25, 0.0],
+        ];
+        let uv = project_loop(&s, &pts, 1e-9).unwrap();
+        // The apex became two corner points joined along u = 1.
+        assert_eq!(uv.len(), pts.len() + 1);
+        let close =
+            |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).abs() < 1e-7 && (a[1] - b[1]).abs() < 1e-7;
+        assert!(close(uv[3], [0.5, 1.0]), "{:?}", uv[3]);
+        assert!(close(uv[4], [1.0, 1.0]), "{:?}", uv[4]);
+        assert!(close(uv[5], [1.0, 0.0]), "{:?}", uv[5]);
+        assert!(close(uv[6], [0.5, 0.0]), "{:?}", uv[6]);
     }
 }

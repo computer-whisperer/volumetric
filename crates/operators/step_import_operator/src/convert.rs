@@ -552,15 +552,7 @@ fn convert_face(ctx: &Ctx, face_id: u64, opts: &Options) -> Result<Face, String>
     let mut trims = Vec::new();
     for (li, lp) in loops.iter().enumerate() {
         let pts = loop_points(ctx, lp, opts).map_err(|e| format!("loop {li}: {e}"))?;
-        let mut uv: Vec<[f64; 2]> = Vec::with_capacity(pts.len());
-        let mut hint = None;
-        for p in &pts {
-            let q = project::project_point(&surface, *p, hint, proj_tol)
-                .map_err(|e| format!("loop {li}: {e}"))?;
-            uv.push(q);
-            hint = Some(q);
-        }
-        project::verify_loop(&surface, &pts, &uv, proj_tol * 2.0)
+        let uv = project::project_loop(&surface, &pts, proj_tol)
             .map_err(|e| format!("loop {li}: {e}"))?;
         trims.push(uv);
     }

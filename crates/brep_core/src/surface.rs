@@ -433,33 +433,7 @@ impl<'a> SurfaceView<'a> {
                         }
                     }
                     NurbsView::Owned(_) => {
-                        let dom = view.domain();
-                        const N: usize = 9;
-                        let mut ranked: [(f64, [f64; 2]); 4] = [(f64::INFINITY, [0.0; 2]); 4];
-                        for i in 0..=N {
-                            for j in 0..=N {
-                                let u = dom[0] + (dom[1] - dom[0]) * i as f64 / N as f64;
-                                let v = dom[2] + (dom[3] - dom[2]) * j as f64 / N as f64;
-                                let (q, _, _) = nurbs::surface_eval(view, u, v);
-                                let d2 = {
-                                    let r = sub(q, p);
-                                    dot(r, r)
-                                };
-                                for slot in 0..ranked.len() {
-                                    if d2 < ranked[slot].0 {
-                                        ranked[slot..].rotate_right(1);
-                                        ranked[slot] = (d2, [u, v]);
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        for (d2, uv) in ranked {
-                            if d2.is_finite() {
-                                seeds[seed_count] = uv;
-                                seed_count += 1;
-                            }
-                        }
+                        seed_count += nurbs::scan_seeds(view, p, 9, &mut seeds[seed_count..]);
                     }
                 }
                 let mut best = ([0.0; 2], f64::INFINITY);
