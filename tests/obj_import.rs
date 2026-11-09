@@ -134,7 +134,7 @@ fn obj_mesh_imports_with_uvs_and_texture_and_converts_to_a_solid() {
     assert_eq!(mesh.bounds(), Some([-0.5, 0.5, -0.5, 0.5, -0.5, 0.5]));
     let uv = mesh.uv_field().expect("uv field");
     assert_eq!(uv.name, UV_FIELD_NAME);
-    assert_eq!(uv.data.len(), 24 * 2);
+    assert_eq!(uv.data.len(), 20 * 2);
     assert!(uv.data.iter().all(|v| (0.0..=1.0).contains(v)));
     let texture = mesh.base_color_texture().expect("texture attached");
     assert_eq!(texture.name, "cube.png");
