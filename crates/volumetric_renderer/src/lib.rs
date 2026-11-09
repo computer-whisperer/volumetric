@@ -22,7 +22,7 @@
 //!
 //! ```ignore
 //! let mut renderer = Renderer::new(&device, surface_format);
-//! let mesh = renderer.create_retained_mesh(&device, &mesh_data);
+//! let mesh = renderer.create_retained_mesh(&device, &queue, &mesh_data);
 //!
 //! // Each frame:
 //! renderer.submit_retained_mesh(&mesh, transform, object, material);
@@ -42,6 +42,7 @@ mod pick;
 mod pipelines;
 mod scene;
 pub mod test_scenes;
+mod texture;
 mod types;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -54,7 +55,8 @@ pub use camera::{Camera, CameraView, OrbitMode, Pinhole, Projection, StandardVie
 pub use navigation::{CameraAction, CameraControlScheme, CameraInputState, Cursor, Navigator};
 pub use pick::Pick;
 pub use pipelines::{
-    GpuLines, GpuMesh, GpuPoints, GpuSplat, GpuSurfels, Warp, evaluate_sh, project_covariance,
+    GpuLines, GpuMesh, GpuPoints, GpuSplat, GpuSurfels, MeshTextureBinding, Warp, evaluate_sh,
+    project_covariance,
 };
 pub use scene::SceneData;
 pub use types::{
@@ -62,7 +64,7 @@ pub use types::{
     LightingPreset, LightingRig, LineData, LineInstance, LinePattern, LineSegment, LineStyle,
     MAX_MATERIALS, Material, MaterialId, MeshData, MeshVertex, ObjectId, PointData, PointInstance,
     PointShape, PointStyle, RenderSettings, SplatData, SplatStyle, SurfelData, SurfelVertex,
-    WidthMode,
+    TextureData, WidthMode,
 };
 
 use std::sync::Arc;
@@ -460,13 +462,20 @@ impl Renderer {
 
     /// Uploads a scene's geometry as retained GPU residents (line, point
     /// and splat transforms applied now, on the CPU, once; a mesh keeps
-    /// its transform for submission).
-    pub fn create_retained_scene(&self, device: &wgpu::Device, scene: &SceneData) -> RetainedScene {
+    /// its transform for submission). The queue carries mesh textures.
+    pub fn create_retained_scene(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        scene: &SceneData,
+    ) -> RetainedScene {
         RetainedScene {
             meshes: scene
                 .meshes
                 .iter()
-                .map(|(mesh, transform, _)| (self.create_retained_mesh(device, mesh), *transform))
+                .map(|(mesh, transform, _)| {
+                    (self.create_retained_mesh(device, queue, mesh), *transform)
+                })
                 .collect(),
             lines: scene
                 .lines
@@ -517,9 +526,15 @@ impl Renderer {
     }
 
     /// Uploads one mesh as a retained GPU resident, its vertices as
-    /// given; the transform comes at submission.
-    pub fn create_retained_mesh(&self, device: &wgpu::Device, mesh: &MeshData) -> Arc<GpuMesh> {
-        Arc::new(GpuMesh::new(device, mesh))
+    /// given and its texture (if any) with its mip chain; the transform
+    /// comes at submission.
+    pub fn create_retained_mesh(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        mesh: &MeshData,
+    ) -> Arc<GpuMesh> {
+        Arc::new(self.mesh_pipeline.create_retained(device, queue, mesh))
     }
 
     /// Submit a retained mesh for this frame, drawn under `transform`.

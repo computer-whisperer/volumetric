@@ -58,6 +58,7 @@ pub fn create_test_cube(size: f32) -> MeshData {
     MeshData {
         vertices,
         indices: Some(indices),
+        texture: None,
     }
 }
 
