@@ -3670,6 +3670,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "obj_import_operator"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "ply_core",
+ "serde",
+ "volumetric_abi",
+]
+
+[[package]]
 name = "objc-sys"
 version = "0.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

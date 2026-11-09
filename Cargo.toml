@@ -33,6 +33,7 @@ members = [
     "crates/operators/stl_import_operator",
     "crates/operators/threemf_import_operator",
     "crates/operators/ply_import_operator",
+    "crates/operators/obj_import_operator",
     "crates/operators/point_cloud_import_operator",
     "crates/operators/volume_import_operator",
     "crates/operators/cloud_fit_operator",

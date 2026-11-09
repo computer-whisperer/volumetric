@@ -35,6 +35,7 @@ const OPERATORS: &[&str] = &[
     "stl_import_operator",
     "threemf_import_operator",
     "ply_import_operator",
+    "obj_import_operator",
     "point_cloud_import_operator",
     "volume_import_operator",
     "cloud_fit_operator",
