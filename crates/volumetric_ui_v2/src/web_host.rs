@@ -46,6 +46,7 @@ use winit::window::{Window, WindowId};
 
 use volumetric_protocol::{JobRequest, WebDaemonClient};
 
+use crate::obj_sidecar;
 use crate::remote::{mesh_result_from_output, output_from_outcome, project_exports_from_output};
 use crate::session::{
     BackgroundJob, BackgroundResult, ExecutionBackend, Gpu, JobQueue, LocalBackend, PendingMesh,
@@ -1089,6 +1090,10 @@ enum FileTask {
         operator_name: &'static str,
         output_base: &'static str,
     },
+    /// An OBJ with its sidecars. A browser cannot read the files beside a
+    /// pick, so the picker takes several files at once: the `.obj`, its
+    /// `.mtl` and the texture image, resolved among themselves.
+    ImportObj,
 }
 
 /// What a finished file task reports back; applied on the frame path by
@@ -1110,7 +1115,12 @@ enum FileOutcome {
     ImportedBlob {
         operator_name: &'static str,
         output_base: &'static str,
-        bytes: Vec<u8>,
+        /// One per Blob input of the operator, in order.
+        blobs: Vec<Vec<u8>>,
+        /// Config text fields to set by name (a texture's file name).
+        config: Vec<(String, String)>,
+        /// What the import found beside the file, for the status line.
+        note: Option<String>,
     },
     Status(String),
     Dismissed,
@@ -1220,6 +1230,7 @@ fn gather_file_task(
             operator_name: "ply_import_operator",
             output_base: "ply_import",
         }),
+        FileAction::ImportObj => Some(FileTask::ImportObj),
         FileAction::ImportPointCloud => Some(FileTask::ImportBlob {
             filter_name: "Point clouds",
             extensions: &["ply"],
@@ -1343,7 +1354,77 @@ async fn perform_file_task(task: FileTask) -> FileOutcome {
             FileOutcome::ImportedBlob {
                 operator_name,
                 output_base,
-                bytes,
+                blobs: vec![bytes],
+                config: Vec::new(),
+                note: None,
+            }
+        }
+        FileTask::ImportObj => {
+            let Some(handles) = rfd::AsyncFileDialog::new()
+                .add_filter("OBJ with sidecars", &["obj", "mtl", "jpg", "jpeg", "png"])
+                .pick_files()
+                .await
+            else {
+                return FileOutcome::Dismissed;
+            };
+            let mut files: Vec<(String, Vec<u8>)> = Vec::with_capacity(handles.len());
+            for handle in &handles {
+                files.push((handle.file_name(), handle.read().await));
+            }
+            let Some(obj_index) = files
+                .iter()
+                .position(|(name, _)| name.to_ascii_lowercase().ends_with(".obj"))
+            else {
+                return FileOutcome::Status(
+                    "pick the .obj file (with its .mtl and texture, if any)".to_string(),
+                );
+            };
+            let (obj_name, obj_bytes) = files.swap_remove(obj_index);
+            let stem = obj_name
+                .rsplit_once('.')
+                .map(|(stem, _)| stem)
+                .unwrap_or(&obj_name)
+                .to_string();
+            // Sidecars resolve by bare file name among the picked files
+            // (case-insensitively: the picker shows what the OS has).
+            let found = obj_sidecar::resolve(
+                &String::from_utf8_lossy(&obj_bytes),
+                &stem,
+                &mut |relative| {
+                    let wanted = obj_sidecar::file_name(relative).to_ascii_lowercase();
+                    files
+                        .iter()
+                        .find(|(name, _)| name.to_ascii_lowercase() == wanted)
+                        .map(|(_, bytes)| bytes.clone())
+                },
+            );
+            let (blobs, config, note) = match found.texture {
+                Some((name, bytes)) => {
+                    let note = match &found.mtl {
+                        Some(mtl) => format!("texture {name} via {mtl}"),
+                        None => format!("texture {name}"),
+                    };
+                    (
+                        vec![obj_bytes, bytes],
+                        vec![("texture_name".to_string(), name)],
+                        Some(note),
+                    )
+                }
+                None => {
+                    let why = if found.notes.is_empty() {
+                        "no texture".to_string()
+                    } else {
+                        format!("no texture: {}", found.notes.join("; "))
+                    };
+                    (vec![obj_bytes], Vec::new(), Some(why))
+                }
+            };
+            FileOutcome::ImportedBlob {
+                operator_name: "obj_import_operator",
+                output_base: "obj_import",
+                blobs,
+                config,
+                note,
             }
         }
     }
@@ -1360,8 +1441,10 @@ fn apply_file_outcome(app: &mut VolumetricUiV2, outcome: FileOutcome) {
         FileOutcome::ImportedBlob {
             operator_name,
             output_base,
-            bytes,
-        } => app.import_blob_asset(operator_name, output_base, bytes),
+            blobs,
+            config,
+            note,
+        } => app.import_blob_asset(operator_name, output_base, blobs, &config, note),
         FileOutcome::Status(status) => app.set_status(status),
         FileOutcome::Dismissed => {}
     }

@@ -30,6 +30,7 @@ use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowId};
 
+use crate::obj_sidecar;
 use crate::remote::RemoteBackend;
 use crate::session::{
     BackgroundJob, BackgroundResult, ExecutionBackend, Gpu, JobQueue, LocalBackend, Session,
@@ -667,6 +668,9 @@ enum FileTask {
         operator_name: &'static str,
         output_base: &'static str,
     },
+    /// An OBJ with its sidecars: the picked `.obj`, then the texture its
+    /// material library names (see `obj_sidecar`).
+    ImportObj,
 }
 
 /// What a finished file task reports back; applied to the app on the UI
@@ -690,7 +694,12 @@ enum FileOutcome {
     ImportedBlob {
         operator_name: &'static str,
         output_base: &'static str,
-        bytes: Vec<u8>,
+        /// One per Blob input of the operator, in order.
+        blobs: Vec<Vec<u8>>,
+        /// Config text fields to set by name (a texture's file name).
+        config: Vec<(String, String)>,
+        /// What the import found beside the file, for the status line.
+        note: Option<String>,
     },
     /// A message for the status line (export results, read failures).
     Status(String),
@@ -812,6 +821,7 @@ fn gather_file_task(
             operator_name: "ply_import_operator",
             output_base: "ply_import",
         }),
+        FileAction::ImportObj => Some(FileTask::ImportObj),
         FileAction::ImportPointCloud => Some(FileTask::ImportBlob {
             filter_name: "Point clouds",
             extensions: &["ply"],
@@ -959,11 +969,71 @@ fn perform_file_task(task: FileTask) -> FileOutcome {
                 Ok(bytes) => FileOutcome::ImportedBlob {
                     operator_name,
                     output_base,
-                    bytes,
+                    blobs: vec![bytes],
+                    config: Vec::new(),
+                    note: None,
                 },
                 Err(err) => {
                     FileOutcome::Status(format!("failed to read {}: {err}", path.display()))
                 }
+            }
+        }
+        FileTask::ImportObj => {
+            let Some(path) = rfd::FileDialog::new()
+                .add_filter("OBJ", &["obj"])
+                .pick_file()
+            else {
+                return FileOutcome::Dismissed;
+            };
+            let obj_bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    return FileOutcome::Status(format!(
+                        "failed to read {}: {err}",
+                        path.display()
+                    ));
+                }
+            };
+            // The OBJ convention: the user picks the mesh and the program
+            // finds the material library and the texture next to it.
+            let dir = path.parent().map(PathBuf::from).unwrap_or_default();
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            let found = obj_sidecar::resolve(
+                &String::from_utf8_lossy(&obj_bytes),
+                &stem,
+                &mut |relative| std::fs::read(dir.join(relative)).ok(),
+            );
+            let (blobs, config, note) = match found.texture {
+                Some((name, bytes)) => {
+                    let note = match &found.mtl {
+                        Some(mtl) => format!("texture {name} via {mtl}"),
+                        None => format!("texture {name}"),
+                    };
+                    (
+                        vec![obj_bytes, bytes],
+                        vec![("texture_name".to_string(), name)],
+                        Some(note),
+                    )
+                }
+                None => {
+                    let why = if found.notes.is_empty() {
+                        "no texture".to_string()
+                    } else {
+                        format!("no texture: {}", found.notes.join("; "))
+                    };
+                    (vec![obj_bytes], Vec::new(), Some(why))
+                }
+            };
+            FileOutcome::ImportedBlob {
+                operator_name: "obj_import_operator",
+                output_base: "obj_import",
+                blobs,
+                config,
+                note,
             }
         }
     }
@@ -980,8 +1050,10 @@ fn apply_file_outcome(app: &mut VolumetricUiV2, outcome: FileOutcome) {
         FileOutcome::ImportedBlob {
             operator_name,
             output_base,
-            bytes,
-        } => app.import_blob_asset(operator_name, output_base, bytes),
+            blobs,
+            config,
+            note,
+        } => app.import_blob_asset(operator_name, output_base, blobs, &config, note),
         FileOutcome::Status(status) => app.set_status(status),
         FileOutcome::Dismissed => {}
     }

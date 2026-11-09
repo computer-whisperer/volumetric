@@ -135,6 +135,7 @@ fn catalog_icon_source(entry: &catalog::CatalogEntry) -> IconSource {
 pub mod catalog;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod host;
+pub mod obj_sidecar;
 // The daemon-outcome mapping is shared with the web shell; the blocking
 // RemoteBackend inside is native-only.
 pub mod remote;
@@ -156,6 +157,7 @@ pub const IMPORT_3MF_KEY: &str = "action:import-3mf";
 pub const IMPORT_STEP_KEY: &str = "action:import-step";
 pub const IMPORT_IMAGE_KEY: &str = "action:import-image";
 pub const IMPORT_PLY_KEY: &str = "action:import-ply";
+pub const IMPORT_OBJ_KEY: &str = "action:import-obj";
 pub const IMPORT_POINT_CLOUD_KEY: &str = "action:import-point-cloud";
 pub const IMPORT_VOLUME_KEY: &str = "action:import-volume";
 pub const IMPORT_STILL_KEY: &str = "action:import-still";
@@ -867,6 +869,10 @@ pub enum FileAction {
     ImportImage,
     /// Import a PLY mesh via the bundled `ply_import_operator`.
     ImportPly,
+    /// Import a Wavefront OBJ mesh with its texture via the bundled
+    /// `obj_import_operator`; the host resolves the MTL and image
+    /// sidecars next to the picked file.
+    ImportObj,
     /// Import a point-cloud file (PLY) as a Point1 cloud via the bundled
     /// `point_cloud_import_operator`.
     ImportPointCloud,
@@ -3762,13 +3768,19 @@ impl VolumetricUiV2 {
     }
 
     /// Imports a data file (STL mesh, image, …) by staging the named
-    /// bundled operator with the file bytes wired into its Blob input. Called
-    /// by the host after its Import dialog.
+    /// bundled operator with the file bytes wired into its Blob inputs, in
+    /// order (an import with sidecars, like an OBJ with its texture, fills
+    /// several). `config` sets text fields of the operator's config by
+    /// name on top of the schema defaults (the texture's file name);
+    /// `note` is appended to the status line. Called by the host after
+    /// its Import dialog.
     pub(crate) fn import_blob_asset(
         &mut self,
         operator_name: &str,
         output_base: &str,
-        blob: Vec<u8>,
+        blobs: Vec<Vec<u8>>,
+        config: &[(String, String)],
+        note: Option<String>,
     ) {
         let Some(asset) = volumetric_assets::get_operator(operator_name) else {
             self.status = format!("missing bundled operator {operator_name}");
@@ -3793,15 +3805,42 @@ impl VolumetricUiV2 {
                 ..SlotPrimaries::default()
             },
         );
-        let Some(blob_slot) = metadata
+        let blob_slots: Vec<usize> = metadata
             .inputs
             .iter()
-            .position(|input| matches!(input, OperatorMetadataInput::Blob))
-        else {
+            .enumerate()
+            .filter(|(_, input)| matches!(input, OperatorMetadataInput::Blob))
+            .map(|(i, _)| i)
+            .collect();
+        if blob_slots.is_empty() {
             self.status = format!("{operator_name} declares no Blob input");
             return;
-        };
-        inputs[blob_slot] = ExecutionInput::Inline(blob);
+        }
+        for (slot, blob) in blob_slots.iter().zip(blobs) {
+            inputs[*slot] = ExecutionInput::Inline(blob);
+        }
+        if !config.is_empty()
+            && let Some((slot, cddl)) =
+                metadata
+                    .inputs
+                    .iter()
+                    .enumerate()
+                    .find_map(|(i, input)| match input {
+                        OperatorMetadataInput::CBORConfiguration(cddl) => Some((i, cddl)),
+                        _ => None,
+                    })
+            && let Ok(fields) = operator_config::parse_schema(cddl)
+        {
+            let mut values = operator_config::default_values(&fields);
+            for (name, text) in config {
+                if let Some(field) = operator_config::find_field(&fields, name)
+                    && let Some(value) = field.parse(text)
+                {
+                    values.insert(name.clone(), value);
+                }
+            }
+            inputs[slot] = ExecutionInput::Inline(operator_config::encode(&fields, &values));
+        }
 
         let output_ids = self.project.output_ids_for(
             self.project.default_output_name(output_base, None),
@@ -3819,7 +3858,10 @@ impl VolumetricUiV2 {
             .len()
             .checked_sub(1)
             .map(ProjectSelection::Step);
-        self.status = format!("imported {output_id}");
+        self.status = match note {
+            Some(note) => format!("imported {output_id} ({note})"),
+            None => format!("imported {output_id}"),
+        };
     }
 
     fn add_model(&mut self, name: &str) {
@@ -4530,6 +4572,13 @@ impl App for VolumetricUiV2 {
             return;
         }
 
+        if event.is_click_or_activate(IMPORT_OBJ_KEY) {
+            self.pending_file_action = Some(FileAction::ImportObj);
+            self.open_menu = None;
+            self.add_modal = None;
+            return;
+        }
+
         if event.is_click_or_activate(IMPORT_POINT_CLOUD_KEY) {
             self.pending_file_action = Some(FileAction::ImportPointCloud);
             self.open_menu = None;
@@ -5022,6 +5071,7 @@ fn catalog_row_key(entry: &catalog::CatalogEntry) -> String {
         "step_import_operator" => IMPORT_STEP_KEY.to_string(),
         "image_model_operator" => IMPORT_IMAGE_KEY.to_string(),
         "ply_import_operator" => IMPORT_PLY_KEY.to_string(),
+        "obj_import_operator" => IMPORT_OBJ_KEY.to_string(),
         "point_cloud_import_operator" => IMPORT_POINT_CLOUD_KEY.to_string(),
         "volume_import_operator" => IMPORT_VOLUME_KEY.to_string(),
         "view_solve_operator" => IMPORT_STILL_KEY.to_string(),
@@ -10706,6 +10756,8 @@ mod tests {
         assert_eq!(app.take_file_action(), Some(FileAction::ImportImage));
         dispatch(&mut app, UiEvent::synthetic_click(IMPORT_PLY_KEY));
         assert_eq!(app.take_file_action(), Some(FileAction::ImportPly));
+        dispatch(&mut app, UiEvent::synthetic_click(IMPORT_OBJ_KEY));
+        assert_eq!(app.take_file_action(), Some(FileAction::ImportObj));
         dispatch(&mut app, UiEvent::synthetic_click(IMPORT_POINT_CLOUD_KEY));
         assert_eq!(app.take_file_action(), Some(FileAction::ImportPointCloud));
         dispatch(&mut app, UiEvent::synthetic_click(IMPORT_VOLUME_KEY));
@@ -10737,7 +10789,13 @@ mod tests {
     fn import_blob_asset_wires_bytes_into_the_blob_slot() {
         let mut app = VolumetricUiV2::empty();
         let stl = vec![0xAB; 96];
-        app.import_blob_asset("stl_import_operator", "stl_import", stl.clone());
+        app.import_blob_asset(
+            "stl_import_operator",
+            "stl_import",
+            vec![stl.clone()],
+            &[],
+            None,
+        );
 
         // An STL import stages exactly one step (STL -> TriMesh); users add
         // mesh_to_model themselves when they want a sampleable solid.
@@ -10763,6 +10821,56 @@ mod tests {
             &step.inputs[blob_slot],
             ExecutionInput::Inline(bytes) if *bytes == stl
         ));
+    }
+
+    /// An OBJ import carries two blobs (mesh, texture) and names the
+    /// texture in the config on top of the schema defaults.
+    #[test]
+    fn import_blob_asset_fills_every_blob_slot_and_config_overrides() {
+        let mut app = VolumetricUiV2::empty();
+        let obj = b"v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 0 1\nf 1/1 2/2 3/3\n".to_vec();
+        let jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0];
+        app.import_blob_asset(
+            "obj_import_operator",
+            "obj_import",
+            vec![obj.clone(), jpeg.clone()],
+            &[("texture_name".to_string(), "atlas.jpg".to_string())],
+            Some("texture atlas.jpg via scan.mtl".to_string()),
+        );
+        assert_eq!(app.summary().timeline_steps, 1);
+        assert!(
+            app.status.ends_with("(texture atlas.jpg via scan.mtl)"),
+            "{}",
+            app.status
+        );
+
+        let asset = volumetric_assets::get_operator("obj_import_operator").unwrap();
+        let metadata = volumetric::operator_metadata_from_wasm_bytes(asset.bytes).unwrap();
+        let step = &app.project().timeline()[0];
+        let blob_slots: Vec<usize> = metadata
+            .inputs
+            .iter()
+            .enumerate()
+            .filter(|(_, input)| matches!(input, OperatorMetadataInput::Blob))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(blob_slots.len(), 2);
+        assert!(matches!(&step.inputs[blob_slots[0]], ExecutionInput::Inline(b) if *b == obj));
+        assert!(matches!(&step.inputs[blob_slots[1]], ExecutionInput::Inline(b) if *b == jpeg));
+        let config_slot = metadata
+            .inputs
+            .iter()
+            .position(|input| matches!(input, OperatorMetadataInput::CBORConfiguration(_)))
+            .unwrap();
+        let ExecutionInput::Inline(config_bytes) = &step.inputs[config_slot] else {
+            panic!("config is inline");
+        };
+        let values = operator_config::decode(config_bytes);
+        assert_eq!(
+            values.get("texture_name"),
+            Some(&ConfigValue::Text("atlas.jpg".to_string()))
+        );
+        assert_eq!(values.get("scale"), Some(&ConfigValue::Float(1.0)));
     }
 
     #[test]
@@ -11912,7 +12020,13 @@ mod tests {
     #[test]
     fn importing_a_still_wires_the_solver_to_the_view_set() {
         let mut app = app_with_viewset();
-        app.import_blob_asset("view_solve_operator", "still", vec![0xFF, 0xD8, 0xFF]);
+        app.import_blob_asset(
+            "view_solve_operator",
+            "still",
+            vec![vec![0xFF, 0xD8, 0xFF]],
+            &[],
+            None,
+        );
         let step = app.project.timeline().last().expect("a step was added");
         assert_eq!(step.inputs.len(), 3);
         assert!(
@@ -11935,7 +12049,13 @@ mod tests {
 
         // Without a view set the slot stays unwired for the picker.
         let mut bare = VolumetricUiV2::default();
-        bare.import_blob_asset("view_solve_operator", "still", vec![1, 2, 3]);
+        bare.import_blob_asset(
+            "view_solve_operator",
+            "still",
+            vec![vec![1, 2, 3]],
+            &[],
+            None,
+        );
         let step = bare.project.timeline().last().unwrap();
         assert!(matches!(&step.inputs[0], ExecutionInput::Inline(b) if b.is_empty()));
         assert!(step_input_options(&bare, 0, AssetSlotKind::ViewSet).is_empty());
