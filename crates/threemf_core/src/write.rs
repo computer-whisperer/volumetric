@@ -105,6 +105,7 @@ mod tests {
             indices: vec![0, 2, 1, 0, 1, 3, 0, 3, 2, 1, 2, 3],
             vertex_fields: vec![],
             face_fields: vec![],
+            textures: vec![],
         }
     }
 
