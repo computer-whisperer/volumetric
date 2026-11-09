@@ -396,6 +396,7 @@ pub fn read_3mf(bytes: &[u8]) -> Result<ThreeMf, String> {
             indices: Vec::new(),
             vertex_fields: vec![],
             face_fields: vec![],
+            textures: vec![],
         };
         loader.flatten(&root_path, object_id, transform, 0, &mut mesh)?;
         mesh.validate()?;

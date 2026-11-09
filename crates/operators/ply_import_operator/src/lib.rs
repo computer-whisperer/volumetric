@@ -63,6 +63,7 @@ pub fn import(bytes: &[u8], config: &PlyImportConfig) -> Result<(TriMesh, usize)
         indices: face_data.indices,
         vertex_fields: vertex.fields,
         face_fields: vec![],
+        textures: vec![],
     };
     mesh.validate()?;
     Ok((mesh, face_data.skipped))

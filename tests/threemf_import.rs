@@ -57,6 +57,7 @@ fn box_mesh(min: f64, max: f64) -> TriMesh {
         indices,
         vertex_fields: vec![],
         face_fields: vec![],
+        textures: vec![],
     }
 }
 

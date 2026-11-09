@@ -15,6 +15,59 @@
 pub use crate::fea::FeaField as MeshField;
 pub use crate::fea::{COLOR_FIELD_NAME, NORMAL_FIELD_NAME};
 
+/// Conventional name of the two-component per-vertex texture-coordinate
+/// field. Coordinates follow the OBJ convention: `u` runs left to right
+/// and `v` bottom to top across the image, so `(0, 0)` is the image's
+/// bottom-left corner and consumers flip `v` when the image is stored
+/// top row first. Values outside `[0, 1]` wrap (repeat).
+pub const UV_FIELD_NAME: &str = "uv";
+
+/// An image carried with a mesh, still in its file encoding. Decoding is
+/// the consumer's job (a viewport decodes once for the GPU; a conversion
+/// to a sampleable model decodes once at build time), so the value stays
+/// the size of the file it came from rather than of its pixels.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct MeshTexture {
+    /// The file name the texture had in its source package (a `map_Kd`
+    /// path's final component), for display and for telling textures
+    /// apart; not resolved against any filesystem.
+    pub name: String,
+    /// The encoding of `bytes` as a media type: `image/jpeg`,
+    /// `image/png`, ... Consumers may sniff the bytes when this is empty.
+    pub media_type: String,
+    #[serde(with = "serde_bytes")]
+    pub bytes: Vec<u8>,
+}
+
+impl MeshTexture {
+    /// The media type by the first bytes of a file: JPEG, PNG, BMP, GIF,
+    /// WebP, or `None` when none of them matches.
+    pub fn sniff_media_type(bytes: &[u8]) -> Option<&'static str> {
+        match bytes {
+            [0xFF, 0xD8, 0xFF, ..] => Some("image/jpeg"),
+            [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, ..] => Some("image/png"),
+            [b'B', b'M', ..] => Some("image/bmp"),
+            [b'G', b'I', b'F', b'8', ..] => Some("image/gif"),
+            [
+                b'R',
+                b'I',
+                b'F',
+                b'F',
+                _,
+                _,
+                _,
+                _,
+                b'W',
+                b'E',
+                b'B',
+                b'P',
+                ..,
+            ] => Some("image/webp"),
+            _ => None,
+        }
+    }
+}
+
 /// An explicit triangle mesh.
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct TriMesh {
@@ -26,6 +79,13 @@ pub struct TriMesh {
     pub vertex_fields: Vec<MeshField>,
     /// Named per-triangle data.
     pub face_fields: Vec<MeshField>,
+    /// Images that travel with the mesh. The first one is the base-colour
+    /// map addressed by the [`UV_FIELD_NAME`] vertex field (a scanner's
+    /// photographic atlas); further entries are kept for their names and
+    /// bytes but have no assigned meaning yet. Absent from older payloads,
+    /// which decode as having none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub textures: Vec<MeshTexture>,
 }
 
 impl TriMesh {
@@ -54,7 +114,22 @@ impl TriMesh {
             indices,
             vertex_fields: vec![],
             face_fields: vec![],
+            textures: vec![],
         }
+    }
+
+    /// The two-component [`UV_FIELD_NAME`] vertex field, when present.
+    pub fn uv_field(&self) -> Option<&MeshField> {
+        self.vertex_fields
+            .iter()
+            .find(|f| f.name == UV_FIELD_NAME && f.components == 2)
+    }
+
+    /// The base-colour texture: the first attached image, when the mesh
+    /// also carries texture coordinates to address it with.
+    pub fn base_color_texture(&self) -> Option<&MeshTexture> {
+        self.uv_field()?;
+        self.textures.first()
     }
 
     pub fn vertex_count(&self) -> usize {
@@ -139,6 +214,22 @@ impl TriMesh {
         }
         validate_fields("vertex", &self.vertex_fields, vertex_count)?;
         validate_fields("face", &self.face_fields, self.triangle_count())?;
+        if let Some(uv) = self.vertex_fields.iter().find(|f| f.name == UV_FIELD_NAME)
+            && uv.components != 2
+        {
+            return Err(format!(
+                "vertex field {UV_FIELD_NAME:?} has {} components, expected 2",
+                uv.components
+            ));
+        }
+        for texture in &self.textures {
+            if texture.name.is_empty() {
+                return Err("texture with an empty name".to_string());
+            }
+            if texture.bytes.is_empty() {
+                return Err(format!("texture {:?} has no bytes", texture.name));
+            }
+        }
         Ok(())
     }
 }
@@ -201,6 +292,7 @@ mod tests {
             indices: vec![0, 1, 2, 0, 1, 3],
             vertex_fields: vec![],
             face_fields: vec![],
+            textures: vec![],
         }
     }
 
@@ -264,6 +356,84 @@ mod tests {
         assert!(mesh.validate().is_err());
     }
 
+    /// A payload written before textures existed decodes as having none,
+    /// and a mesh without textures encodes without the key, so the wire
+    /// format is unchanged for every existing producer.
+    #[test]
+    fn textures_are_optional_on_the_wire() {
+        let mesh = two_triangles();
+        let bytes = encode_tri_mesh(&mesh);
+        let mut legacy: ciborium::Value =
+            ciborium::de::from_reader(std::io::Cursor::new(&bytes)).unwrap();
+        let ciborium::Value::Map(entries) = &mut legacy else {
+            panic!("a mesh encodes as a map");
+        };
+        assert!(
+            !entries
+                .iter()
+                .any(|(k, _)| k == &ciborium::Value::Text("textures".to_string())),
+            "an untextured mesh writes no textures key"
+        );
+        let decoded = decode_tri_mesh(&bytes).unwrap();
+        assert_eq!(decoded, mesh);
+
+        let mut textured = two_triangles();
+        textured.vertex_fields.push(MeshField {
+            name: UV_FIELD_NAME.to_string(),
+            components: 2,
+            data: vec![0.0; 8],
+        });
+        textured.textures.push(MeshTexture {
+            name: "atlas.jpg".to_string(),
+            media_type: "image/jpeg".to_string(),
+            bytes: vec![0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3],
+        });
+        let decoded = decode_tri_mesh(&encode_tri_mesh(&textured)).unwrap();
+        assert_eq!(decoded, textured);
+        assert_eq!(
+            decoded.base_color_texture().map(|t| t.name.as_str()),
+            Some("atlas.jpg")
+        );
+        assert_eq!(
+            MeshTexture::sniff_media_type(&decoded.textures[0].bytes),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            MeshTexture::sniff_media_type(b"\x89PNG\r\n\x1a\nxx"),
+            Some("image/png")
+        );
+        assert_eq!(MeshTexture::sniff_media_type(b"hello"), None);
+    }
+
+    /// A texture needs a name and bytes; a `uv` field needs two components.
+    #[test]
+    fn textures_and_uvs_are_validated() {
+        let mut mesh = two_triangles();
+        mesh.textures.push(MeshTexture {
+            name: String::new(),
+            media_type: String::new(),
+            bytes: vec![1],
+        });
+        assert!(mesh.validate().is_err());
+
+        let mut mesh = two_triangles();
+        mesh.textures.push(MeshTexture {
+            name: "t".to_string(),
+            media_type: String::new(),
+            bytes: vec![],
+        });
+        assert!(mesh.validate().is_err());
+
+        let mut mesh = two_triangles();
+        mesh.vertex_fields.push(MeshField {
+            name: UV_FIELD_NAME.to_string(),
+            components: 3,
+            data: vec![0.0; 12],
+        });
+        assert!(mesh.validate().is_err());
+        assert!(mesh.uv_field().is_none());
+    }
+
     #[test]
     fn empty_mesh_is_valid() {
         let mesh = TriMesh {
@@ -271,6 +441,7 @@ mod tests {
             indices: vec![],
             vertex_fields: vec![],
             face_fields: vec![],
+            textures: vec![],
         };
         assert!(mesh.validate().is_ok());
         assert_eq!(mesh.bounds(), None);

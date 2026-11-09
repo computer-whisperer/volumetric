@@ -173,6 +173,7 @@ mod tests {
             indices: vec![0, 1, 2],
             vertex_fields: vec![],
             face_fields: vec![],
+            textures: vec![],
         };
         write_3mf(&mesh, unit, "tri").unwrap()
     }
