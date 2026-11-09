@@ -3249,7 +3249,10 @@ dependencies = [
 name = "mesh_to_model_operator"
 version = "0.1.0"
 dependencies = [
+ "ciborium",
+ "image",
  "model_wrap_core",
+ "serde",
  "trimesh_model_core",
  "volumetric_abi",
  "walrus",
@@ -3656,6 +3659,16 @@ dependencies = [
  "pyo3",
  "pyo3-build-config",
  "rustc-hash 2.1.2",
+]
+
+[[package]]
+name = "obj_import_operator"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "ply_core",
+ "serde",
+ "volumetric_abi",
 ]
 
 [[package]]
@@ -5939,6 +5952,7 @@ name = "trimesh_model_template"
 version = "0.1.0"
 dependencies = [
  "trimesh_model_core",
+ "volumetric_abi",
 ]
 
 [[package]]
@@ -6239,6 +6253,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "glam 0.32.1",
+ "image",
  "volumetric",
  "volumetric_renderer",
  "web-time",
