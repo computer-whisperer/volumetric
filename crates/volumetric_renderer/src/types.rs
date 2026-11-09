@@ -5,6 +5,7 @@
 use bytemuck::{Pod, Zeroable};
 
 use crate::ViewGizmo;
+pub use crate::texture::TextureData;
 
 // ============================================================================
 // Mesh Types
@@ -15,10 +16,13 @@ use crate::ViewGizmo;
 pub struct MeshData {
     pub vertices: Vec<MeshVertex>,
     pub indices: Option<Vec<u32>>,
+    /// The base-colour map the vertices' `uv` address, multiplied into
+    /// their colour; `None` draws the vertex colour alone.
+    pub texture: Option<std::sync::Arc<TextureData>>,
 }
 
-/// A single mesh vertex with position, normal and color.
-/// Padded for GPU alignment (48 bytes total).
+/// A single mesh vertex with position, normal, color and texture
+/// coordinate. Padded for GPU alignment (64 bytes total).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct MeshVertex {
@@ -29,6 +33,11 @@ pub struct MeshVertex {
     /// Linear RGBA multiplied into the material base color; white for the
     /// plain untinted look.
     pub color: [f32; 4],
+    /// Where in the mesh's texture this corner samples: `(0, 0)` is the
+    /// image's top-left texel, `(1, 1)` its bottom-right; values outside
+    /// repeat. Unused (zero) when the mesh has no texture.
+    pub uv: [f32; 2],
+    pub _pad2: [f32; 2],
 }
 
 /// A surface point drawn as a disc: the geometry a direct cast of a model
@@ -78,12 +87,20 @@ impl MeshVertex {
 
     /// Create a new mesh vertex with an explicit vertex color.
     pub fn colored(position: [f32; 3], normal: [f32; 3], color: [f32; 4]) -> Self {
+        Self::textured(position, normal, color, [0.0; 2])
+    }
+
+    /// Create a mesh vertex that samples its mesh's texture at `uv`
+    /// (image convention: `v` runs top to bottom), tinted by `color`.
+    pub fn textured(position: [f32; 3], normal: [f32; 3], color: [f32; 4], uv: [f32; 2]) -> Self {
         Self {
             position,
             _pad0: 0.0,
             normal,
             _pad1: 0.0,
             color,
+            uv,
+            _pad2: [0.0; 2],
         }
     }
 }

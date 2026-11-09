@@ -269,7 +269,8 @@ mod tests {
         };
         let mut scene = SceneData::new();
         scene.add_splat(Arc::new(data), Mat4::IDENTITY, SplatStyle::default());
-        let resident = renderer.create_retained_scene(offscreen.device(), &scene);
+        let resident =
+            renderer.create_retained_scene(offscreen.device(), offscreen.queue(), &scene);
         assert_eq!(resident.splats.len(), 1);
         let view = CameraView::look_at(
             Vec3::new(0.0, 0.0, 1.5),
@@ -331,7 +332,8 @@ mod tests {
         };
         let mut scene = SceneData::new();
         scene.add_splat(Arc::new(data), Mat4::IDENTITY, SplatStyle::default());
-        let resident = renderer.create_retained_scene(offscreen.device(), &scene);
+        let resident =
+            renderer.create_retained_scene(offscreen.device(), offscreen.queue(), &scene);
         let view = CameraView::look_at(
             Vec3::new(0.0, 0.0, 1.5),
             Vec3::ZERO,
@@ -464,7 +466,8 @@ mod bench {
         let mut scene = SceneData::new();
         scene.add_splat(Arc::new(data), Mat4::IDENTITY, SplatStyle::default());
         let t = std::time::Instant::now();
-        let resident = renderer.create_retained_scene(offscreen.device(), &scene);
+        let resident =
+            renderer.create_retained_scene(offscreen.device(), offscreen.queue(), &scene);
         eprintln!(
             "{n} primitives, extent {extent:.2} m; upload {:.0} ms",
             t.elapsed().as_secs_f64() * 1e3

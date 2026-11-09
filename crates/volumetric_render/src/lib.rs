@@ -873,7 +873,9 @@ pub fn render(
         .map_err(anyhow::Error::msg)?;
     let resident: Vec<_> = entities
         .iter()
-        .map(|entity| renderer.create_retained_scene(offscreen.device(), &entity.scene))
+        .map(|entity| {
+            renderer.create_retained_scene(offscreen.device(), offscreen.queue(), &entity.scene)
+        })
         .collect();
 
     // An overlay reads the render's coverage from its alpha channel: the

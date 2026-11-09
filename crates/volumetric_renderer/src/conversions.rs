@@ -7,6 +7,7 @@ pub fn convert_mesh_data(vertices: &[MeshVertex], indices: Option<&[u32]>) -> Me
     MeshData {
         vertices: vertices.to_vec(),
         indices: indices.map(|i| i.to_vec()),
+        texture: None,
     }
 }
 

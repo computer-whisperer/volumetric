@@ -211,6 +211,7 @@ pub fn preview_prelude(
                 renderer::MeshData {
                     vertices,
                     indices: None,
+                    texture: None,
                 },
                 glam::Mat4::IDENTITY,
                 renderer::MaterialId(0),
@@ -232,6 +233,7 @@ pub fn preview_prelude(
                 renderer::MeshData {
                     vertices: Vec::new(),
                     indices: None,
+                    texture: None,
                 },
                 glam::Mat4::IDENTITY,
                 renderer::MaterialId(0),
@@ -315,6 +317,7 @@ pub fn preview_postlude(
         renderer::MeshData {
             vertices,
             indices: Some(mesh.indices.clone()),
+            texture: None,
         },
         glam::Mat4::IDENTITY,
         renderer::MaterialId(0),
@@ -912,6 +915,7 @@ fn build_sketch_preview(
         renderer::MeshData {
             vertices,
             indices: Some(indices),
+            texture: None,
         },
         glam::Mat4::IDENTITY,
         renderer::MaterialId(0),
@@ -1424,6 +1428,7 @@ fn build_fea_mesh_preview(
             renderer::MeshData {
                 vertices,
                 indices: None,
+                texture: None,
             },
             glam::Mat4::IDENTITY,
             renderer::MaterialId(0),
@@ -1494,13 +1499,53 @@ fn build_tri_mesh_preview(
         }
     };
 
+    // The base-colour map, decoded here on the preview build thread (a
+    // scanner's atlas is tens of megapixels; the UI thread never sees the
+    // decode), with its mip chain. A texture that fails to decode leaves
+    // the mesh untextured and says why.
+    let mut texture_detail = Vec::new();
+    let texture = match mesh.base_color_texture() {
+        Some(tex) => match decode_mesh_texture(tex) {
+            Ok(data) => {
+                texture_detail.push(format!(
+                    "textured: {} {}×{}",
+                    tex.name, data.width, data.height
+                ));
+                Some(std::sync::Arc::new(data))
+            }
+            Err(err) => {
+                texture_detail.push(format!("texture {}: {err}", tex.name));
+                None
+            }
+        },
+        None => None,
+    };
+    // UVs follow the OBJ convention (v up the image); the sampler's
+    // convention is row 0 at the top, so v flips. Only when a texture is
+    // bound: a uv field without an image has nothing to address.
+    let uv_field = texture.as_ref().and_then(|_| mesh.uv_field());
+    let uv_of = |vertex: u32| -> [f32; 2] {
+        match uv_field {
+            Some(field) => {
+                let uv = &field.data[vertex as usize * 2..vertex as usize * 2 + 2];
+                [uv[0] as f32, 1.0 - uv[1] as f32]
+            }
+            None => [0.0; 2],
+        }
+    };
+
     let mut vertices: Vec<renderer::MeshVertex> = Vec::with_capacity(mesh.triangle_count() * 6);
     let mut emit = |corners: [u32; 3]| {
         let [a, b, c] = corners.map(position);
         let (ab, ac) = (Vec3::from(b) - Vec3::from(a), Vec3::from(c) - Vec3::from(a));
         let normal = ab.cross(ac).normalize_or_zero().to_array();
         for (v, p) in corners.into_iter().zip([a, b, c]) {
-            vertices.push(renderer::MeshVertex::colored(p, normal, color_of(v)));
+            vertices.push(renderer::MeshVertex::textured(
+                p,
+                normal,
+                color_of(v),
+                uv_of(v),
+            ));
         }
     };
     for t in 0..mesh.triangle_count() {
@@ -1543,6 +1588,7 @@ fn build_tri_mesh_preview(
     if rgb.is_some() {
         detail.push("coloured by the mesh's color field".to_string());
     }
+    detail.extend(texture_detail);
     let stats = OutputStats {
         triangles: vertices.len() / 3,
         detail,
@@ -1555,6 +1601,7 @@ fn build_tri_mesh_preview(
         renderer::MeshData {
             vertices,
             indices: None,
+            texture,
         },
         glam::Mat4::IDENTITY,
         renderer::MaterialId(0),
@@ -1570,6 +1617,25 @@ fn build_tri_mesh_preview(
         direct_models: Vec::new(),
         subspace: None,
     })
+}
+
+/// Decodes a mesh's texture (JPEG or PNG bytes) to RGBA8 with its mip
+/// chain, ready for the renderer.
+fn decode_mesh_texture(
+    texture: &volumetric::trimesh::MeshTexture,
+) -> Result<renderer::TextureData, String> {
+    let image = image::load_from_memory(&texture.bytes)
+        .map_err(|err| format!("cannot decode: {err}"))?
+        .into_rgba8();
+    let (width, height) = image.dimensions();
+    if width == 0 || height == 0 {
+        return Err(format!("empty image {width}×{height}"));
+    }
+    Ok(renderer::TextureData::from_rgba8(
+        width,
+        height,
+        image.into_raw(),
+    ))
 }
 
 /// Preview for a Subspace value: decode and validate now, but bake no
@@ -1663,4 +1729,114 @@ pub fn format_error_chain(error: anyhow::Error) -> String {
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(": ")
+}
+
+#[cfg(test)]
+mod tri_mesh_tests {
+    use super::*;
+    use volumetric::trimesh::{MeshField, MeshTexture, TriMesh, UV_FIELD_NAME, encode_tri_mesh};
+
+    fn request(mesh: &TriMesh) -> PreviewRequest {
+        PreviewRequest {
+            asset_id: "mesh".to_string(),
+            source_hash: [0; 32],
+            data: std::sync::Arc::new(encode_tri_mesh(mesh)),
+            type_hint: Some(AssetTypeHint::TriMesh),
+            precursor_ids: Vec::new(),
+            plan: crate::PreviewPlan::TriMesh,
+            wireframe: false,
+            show_bounds: false,
+            stale: false,
+        }
+    }
+
+    fn png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::from_raw(width, height, rgba.to_vec())
+            .unwrap()
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        bytes.into_inner()
+    }
+
+    /// One triangle with OBJ-convention UVs and a 2×2 PNG.
+    fn textured_triangle() -> TriMesh {
+        let mut mesh = TriMesh::from_soup([[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]]);
+        mesh.vertex_fields.push(MeshField {
+            name: UV_FIELD_NAME.to_string(),
+            components: 2,
+            data: vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0],
+        });
+        mesh.textures.push(MeshTexture {
+            name: "atlas.png".to_string(),
+            media_type: "image/png".to_string(),
+            bytes: png(
+                2,
+                2,
+                &[
+                    255, 0, 0, 255, 0, 255, 0, 255, //
+                    0, 0, 255, 255, 255, 255, 255, 255,
+                ],
+            ),
+        });
+        mesh
+    }
+
+    /// A mesh with a uv field and a texture previews with the decoded
+    /// texture on its mesh and v flipped into image convention.
+    #[test]
+    fn a_textured_mesh_previews_with_its_texture_and_flipped_v() {
+        let mesh = textured_triangle();
+        let entity = build_tri_mesh_preview(&request(&mesh), web_time::Instant::now()).unwrap();
+        let (data, _, _) = &entity.scene.meshes[0];
+        let texture = data.texture.as_ref().expect("texture");
+        assert_eq!((texture.width, texture.height), (2, 2));
+        assert_eq!(texture.levels.len(), 2);
+        assert_eq!(&texture.levels[0][0..4], &[255, 0, 0, 255]);
+        // Both windings carry the corners' uvs: (0,0) -> (0,1), (1,0) ->
+        // (1,1), (0,1) -> (0,0).
+        let uvs: Vec<[f32; 2]> = data.vertices.iter().map(|v| v.uv).collect();
+        assert_eq!(
+            uvs,
+            vec![
+                [0.0, 1.0],
+                [1.0, 1.0],
+                [0.0, 0.0],
+                [0.0, 1.0],
+                [0.0, 0.0],
+                [1.0, 1.0],
+            ]
+        );
+        assert!(data.vertices.iter().all(|v| v.color == [1.0; 4]));
+        assert!(
+            entity
+                .stats
+                .detail
+                .iter()
+                .any(|line| line == "textured: atlas.png 2×2"),
+            "{:?}",
+            entity.stats.detail
+        );
+    }
+
+    /// Bytes that are not an image leave the mesh untextured, uvs zero,
+    /// and the failure in the stats.
+    #[test]
+    fn an_undecodable_texture_falls_back_to_untextured() {
+        let mut mesh = textured_triangle();
+        mesh.textures[0].bytes = b"not an image".to_vec();
+        let entity = build_tri_mesh_preview(&request(&mesh), web_time::Instant::now()).unwrap();
+        let (data, _, _) = &entity.scene.meshes[0];
+        assert!(data.texture.is_none());
+        assert!(data.vertices.iter().all(|v| v.uv == [0.0; 2]));
+        assert!(
+            entity
+                .stats
+                .detail
+                .iter()
+                .any(|line| line.starts_with("texture atlas.png: cannot decode")),
+            "{:?}",
+            entity.stats.detail
+        );
+    }
 }
