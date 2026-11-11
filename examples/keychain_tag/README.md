@@ -62,8 +62,10 @@ the committed snapshots of a run.
 
 40 raws, `/ceph/christian/Photos/library/2026/2026-11-10/DSC03238.ARW` to
 `DSC03277.ARW` (Sony a6700, Viltrox 25 mm at f/5.6, ISO 100, AF-S,
-SteadyShot off). DSC03237 (ISO 5000, white) was a settings shot and is
-left out.
+SteadyShot off). Every frame is lit by the camera's flash on the hot shoe,
+cross-polarised; room light is negligible at these settings. The flash
+power changed between frames. DSC03237 (ISO 5000, white) was a settings
+shot and is left out.
 
 - Survey: all 40 frames posed at 0.147 px RMS. The card is planar to
   0.025 mm, and its long span reads 179.21 mm against the calipers'
@@ -74,9 +76,9 @@ left out.
 - Poses: the tag moved between groups of frames. A view belongs to a
   pose when adding it leaves the pose's hull near the card intact (a view
   of another pose carves 100 to 1500 mm² from it). Three poses:
-  - `down_a`, display down, DSC03238 to 47 in room light (DSC03242 to 44
-    overexposed);
-  - `down_e`, display down, DSC03264 to 77 under a lamp;
+  - `down_a`, display down, DSC03238 to 47 (DSC03241 to 47 clip the white
+    tag);
+  - `down_e`, display down, DSC03264 to 77;
   - `up_c`, display up, DSC03250 to 57, all from one side.
 
   DSC03248/49 and DSC03258 to 63 are display up too, but the tag was
@@ -94,11 +96,11 @@ has each view's reading):
 
 | Quantity | Reading | down_a | down_e | Used |
 |---|---|---:|---:|---:|
-| Face outline | contact lines on white card squares | 90.44 × 40.61 | 90.58 × 41.04 | 90.44 × 40.61 |
+| Face outline | contact lines on white card squares | 90.44 × 40.61 | 90.58 × 40.82 | 90.44 × 40.61 |
 | Back face (label) height | parallax zero-crossings | 12.40 | 12.37 | 12.38 |
-| Logo panel height | parallax zero-crossings | 13.15 | 13.25 | 13.20 |
-| Back body's top face | edge triangulation | | | x −37.15…+44.85, y −12.34…+19.26 |
-| Logo panel | edge triangulation | | | x …+17.11, y −10.12…+17.16 |
+| Logo panel height | parallax zero-crossings | 13.15 | 13.24 | 13.19 |
+| Back body's top face | edge triangulation | | | x −37.15…+44.85, y −12.27…+19.34 |
+| Logo panel | edge triangulation | | | x …+17.11, y −10.03…+17.24 |
 | Ledge heights, −x / −y | brightness up the face's wall | 3.70 / 5.10 | 3.80 / 5.20 | 3.75 / 5.15 |
 | Face corner radius | circles on the hull's lowest sections | 2.66 (2.33…2.99) | | 2.66 |
 | Clip strip, stands out from +y | hull over it less hull beside it | 1.16 | 1.00 | 1.16 |
@@ -108,10 +110,14 @@ All lengths in millimetres. In detail:
 
 - Contact lines: from outside inward, the first place a facing view stops
   showing the card. The face's dark edge strip reads like a black card
-  square, so only rows over white squares count. In `down_a` the views
-  agree to 0.12 to 0.40 mm per side. In `down_e` the lamp's shadow on the
-  card adds 0.4 mm on one side, so the outline comes from `down_a`; its
-  length agrees (90.58).
+  square, so only rows over white squares count, and the scan starts no
+  farther out than the rows were checked white. In `down_a` the views
+  agree to 0.12 to 0.39 mm per side, so the outline comes from it. `down_e`
+  agrees on the length (90.58) and reads 0.21 mm wider; its +y side, by
+  the clip strip, scatters most between views (0.72 mm against 0.18 to
+  0.26 on the others; cause not established). Each pose's frame is centred
+  on its contact lines, and the edges on the back read in `down_e` are in
+  its frame.
 - Heights: the label (or panel) rectified onto two planes in every view
   and phase-correlated against a reference view. Each view's shift grows
   linearly with the plane's error, and vanishes at its reading. Label
@@ -119,7 +125,7 @@ All lengths in millimetres. In detail:
 - Edges on the back: a straight edge's offset in planes at several
   heights, per view, follows that view's parallax; the height where the
   views agree is the edge's. Per edge, the pose whose views agree best
-  (0.02 to 0.07 mm) is used.
+  (0.03 to 0.07 mm) is used.
 - The display, display up: its edges agree across the eight views to
   0.1 mm. They are placed against the face's far edge (a silhouette) and
   the face's measured length, then turned over. The display is centred on
@@ -130,7 +136,7 @@ All lengths in millimetres. In detail:
 `keychain.wgsl` part 1 (PETG), overall 102.7 × 45.6 × 16.1 mm, 14.5 cm³:
 
 - Pocket: the face's outline plus 0.3 mm clearance (91.04 × 41.21 mm), up
-  to the logo panel plus 0.3 mm (13.50 mm), open at −x. The tag slides in
+  to the logo panel plus 0.3 mm (13.49 mm), open at −x. The tag slides in
   +x end first, display against the front lip.
 - A groove in the +y wall lets the clip strip through: 1.16 mm beyond the
   pocket, 7.5 to 12.8 mm up, from the open end to past the strip's seat.
@@ -161,9 +167,9 @@ Print back plate down; the front lip then overhangs the pocket by 1.8 mm.
 - Walls 1.5 mm, 0.6 mm chamfers at both faces. Front lip 1.0 mm thick,
   overlapping the face by 1.5 mm all round (window 87.4 × 37.6 mm).
 - Back frame 1.2 mm thick on the back face, overlapping the back body's
-  top face by 2 mm at +x and −y, 1.8 mm at +y beside the panel. Its opening clears the logo panel by
-  0.3 mm; the panel stands 0.82 mm proud and sits 0.38 mm below the
-  frame's top. At −x the panel nearly reaches the body's edge, so there
+  top face by 2 mm at +x, 1.9 mm at −y and 1.8 mm at +y beside the panel.
+  Its opening clears the logo panel by 0.3 mm; the panel stands 0.81 mm
+  proud and sits 0.39 mm below the frame's top. At −x the panel nearly reaches the body's edge, so there
   the frame only bridges the step.
 - Fitting: stretch the back frame over the tag. The opening's perimeter
   is about 216 mm against the face's 258 mm, about 20 % stretch (the B
@@ -201,12 +207,26 @@ on the bed, with the lug. The front lip's 1.5 mm overhang prints last.
   says when it is unsure.
 - The visual hull here bounds the tag but cannot size it. No view looks
   steeper than 68°, so it overshoots a vertical wall by z/tan 68° (2 mm at
-  5 mm up), and it fills the steps. A lamp's shadow on the card enters it
-  near z = 0 in every view. Contact lines and edge triangulation carried
-  the outline.
+  5 mm up), and it fills the steps. Its lowest sections differ between the
+  two display-down poses (40.82 and 42.20 mm wide; cause not established),
+  so they only seed the frames. Contact lines and edge triangulation
+  carried the outline.
+- The contact reader first scanned from 1 mm beyond the band it had
+  checked white, so a black square there read as the face. 27 % of
+  `down_e`'s rows did (7 % of `down_a`'s, too few to move its medians):
+  `down_e` read 41.04 mm wide instead of 40.82, and its frame sat 0.09 mm
+  off in y, and with it the back edges read in that pose (since fixed;
+  the design moved by under 0.1 mm).
+- The two display-down groups were first labelled "room light" and "lamp"
+  from how they looked, and the lamp was blamed for `down_e`'s width. All
+  frames are lit by the hot-shoe flash; the reader was at fault. Check the
+  lighting against EXIF and the photographer before explaining a reading
+  with it.
 - For the next session: a few views near overhead and a few low ones would
-  let the hull carve walls; diffuse light avoids cast shadows; keep the tag
-  still within a group of frames.
+  let the hull carve walls; settle the flash power before the measured
+  frames (DSC03241 to 47 clip the white tag, and the white-on-white logo
+  panel's height read in only 4 of `down_a`'s 10 views against 13 of
+  `down_e`'s 14); keep the tag still within a group of frames.
 
 ## The B tag
 

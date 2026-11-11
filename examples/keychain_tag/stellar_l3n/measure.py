@@ -183,12 +183,16 @@ def contact_lines(views, ids, frame: Frame, half: dict, card: cameras.Card, res=
     for side in ("+x", "-x", "+y", "-y"):
         normal, along = frame.side(side)
         h, other = (half["x"], half["y"]) if side[1] == "x" else (half["y"], half["x"])
-        ns = np.arange(-0.003, 0.004, res)
+        # The scan runs inward from the band's outer end: every sample it
+        # passes before the face must lie on card checked to be white, or a
+        # black square beyond the band reads as the face.
+        inner, outer = -0.0010, 0.0030
+        ns = np.arange(-0.003, outer, res)
         ts = np.linspace(-0.9 * other, 0.9 * other, 400)
         N, T = np.meshgrid(ns, ts)
         P = frame.centre + (h + N)[..., None] * normal + T[..., None] * along
         c = card.sample(P)
-        band = (ns > -0.0010) & (ns < 0.0030)
+        band = ns > inner
         white_rows = (np.ptp(c[:, band], axis=1) < 0.05) & (np.median(c[:, band], axis=1) > 0.95)
         outside = (ns > 0.0020) & (ns < 0.0029)
         found = []
@@ -401,8 +405,8 @@ def main() -> int:
     print(f"{up}: face plane z {z_face * 1000:.2f} mm (IQR {iqr * 1000:.2f}); "
           + ", ".join(f"{k} {v['edge_m'] * 1000:+.2f} ({v['spread_m'] * 1000:.2f})" for k, v in edges.items()))
 
-    # Combined, in the tag frame. The face outline from the pose in diffuse
-    # light (the lamp's cast shadow widens the other on one side).
+    # Combined, in the tag frame. The face outline from the outline pose
+    # (tag.json: the one whose views agree best per side); the others check it.
     main_pose = report["poses"][SPEC["outline_pose"]]
     other = [p for k, p in report["poses"].items() if k != SPEC["outline_pose"]]
     length, width = main_pose["face_length_m"], main_pose["face_width_m"]
