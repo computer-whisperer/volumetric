@@ -1,21 +1,27 @@
 #!/usr/bin/env bash
-# Develop the raws, verify them against photo-manifest.json, and survey:
-# intake (EXIF from the raws beside the JPEGs), card detection, survey.
-#   survey.sh [raw-directory [work-directory]]
-# Developing needs rawpy and OpenCV (index_scanner's venv: set PYTHON).
+# Develop a tag's raws, verify them against its photo-manifest.json, and
+# survey: intake (EXIF from the raws beside the JPEGs), card detection,
+# survey. Writes <tag-dir>/work.
+#   survey.sh <tag-dir> [raw-directory]
+# The manifest names the raw directory and the session; a raw-directory
+# argument overrides the former. Developing needs rawpy and OpenCV
+# (index_scanner's venv: set PYTHON).
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
-raws="${1:-/ceph/christian/Photos/library/2026/2026-09-25}"
-work="${2:-$here/work}"
+tag="$(cd "${1:?usage: survey.sh <tag-dir> [raw-directory]}" && pwd)"
+work="$tag/work"
 python="${PYTHON:-$HOME/workspace/playground/index_scanner/.venv/bin/python}"
 mkdir -p "$work/photos"
-"$python" - "$raws" "$here/photo-manifest.json" "$work/photos" <<'PY'
+session="$("$python" -c 'import json, sys; print(json.load(open(sys.argv[1]))["session"])' "$tag/photo-manifest.json")"
+"$python" - "$tag/photo-manifest.json" "$work/photos" "${2:-}" <<'PY'
 import hashlib, json, sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-raws, manifest, out = map(Path, sys.argv[1:])
-rows = json.loads(manifest.read_text())["photos"]
+manifest, out = map(Path, sys.argv[1:3])
+spec = json.loads(manifest.read_text())
+raws = Path(sys.argv[3] or spec["source"])
+rows = spec["photos"]
 for row in rows:
     path = raws / row["file"]
     with path.open("rb") as stream:
@@ -39,7 +45,7 @@ with ThreadPoolExecutor(8) as ex:
 print(f"Developed {len(rows)} raws into {out}")
 PY
 v="$root/target/release/volumetric_cli"
-"$v" view-import --stills "$work/photos" --session keytag-dslr-0 -o "$work/intake.vviews" > "$work/intake.log"
+"$v" view-import --stills "$work/photos" --session "$session" -o "$work/intake.vviews" > "$work/intake.log"
 "$v" view-detect -i "$work/intake.vviews" --card "$here/card.json" -o "$work/detected.vviews" > "$work/detect.log"
 "$v" view-survey -i "$work/detected.vviews" -o "$work/survey.vviews" --report "$work/survey.json" > "$work/survey.log"
 "$v" view-list -i "$work/survey.vviews" --json > "$work/cameras.json"

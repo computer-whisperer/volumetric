@@ -1,0 +1,282 @@
+{
+ "note": "Hanshow Stellar-L3N, 2026-11-10 burst. Poses grouped by hull consistency (a view from another pose carves the base section); windows and seeds in the pose frames, metres.",
+ "size_m": [
+  0.0905,
+  0.0406,
+  0.0135
+ ],
+ "sections_mm": "0.25:17.75:0.5",
+ "survey_area": {
+  "centre_m": [
+   0.105,
+   -0.095
+  ],
+  "yaw_deg": 0.0
+ },
+ "poses": {
+  "down_a": {
+   "note": "display down, room light; DSC03242-44 overexposed",
+   "views": [
+    "DSC03238",
+    "DSC03239",
+    "DSC03240",
+    "DSC03241",
+    "DSC03242",
+    "DSC03243",
+    "DSC03244",
+    "DSC03245",
+    "DSC03246",
+    "DSC03247"
+   ],
+   "centre_m": [
+    0.0999,
+    -0.1106
+   ],
+   "yaw_deg": -87.0,
+   "reference_view": "DSC03240"
+  },
+  "down_e": {
+   "note": "display down, lamp",
+   "views": [
+    "DSC03264",
+    "DSC03265",
+    "DSC03266",
+    "DSC03267",
+    "DSC03268",
+    "DSC03269",
+    "DSC03270",
+    "DSC03271",
+    "DSC03272",
+    "DSC03273",
+    "DSC03274",
+    "DSC03275",
+    "DSC03276",
+    "DSC03277"
+   ],
+   "centre_m": [
+    0.1168,
+    -0.0923
+   ],
+   "yaw_deg": 105.4,
+   "reference_view": "DSC03266"
+  },
+  "up_c": {
+   "note": "display up, all from one side (no hull); DSC03252-56 underexposed",
+   "views": [
+    "DSC03250",
+    "DSC03251",
+    "DSC03252",
+    "DSC03253",
+    "DSC03254",
+    "DSC03255",
+    "DSC03256",
+    "DSC03257"
+   ],
+   "centre_m": [
+    0.1158,
+    -0.0907
+   ],
+   "yaw_deg": 84.5,
+   "reference_view": "DSC03250"
+  }
+ },
+ "display_down": [
+  "down_a",
+  "down_e"
+ ],
+ "display_up": "up_c",
+ "outline_pose": "down_a",
+ "label_window_m": [
+  0.036,
+  0.046,
+  -0.016,
+  0.016
+ ],
+ "panel_window_m": [
+  -0.034,
+  0.012,
+  -0.012,
+  0.012
+ ],
+ "barcode_window_m": [
+  0.033,
+  0.041,
+  -0.016,
+  0.014
+ ],
+ "back_edges": {
+  "back_+x": [
+   "+x",
+   0.0448,
+   [
+    -0.014,
+    -0.008
+   ]
+  ],
+  "back_-x": [
+   "-x",
+   0.0374,
+   [
+    -0.008,
+    0.015
+   ]
+  ],
+  "back_+y": [
+   "+y",
+   0.0197,
+   [
+    -0.035,
+    -0.015
+   ]
+  ],
+  "back_-y": [
+   "-y",
+   0.0124,
+   [
+    -0.03,
+    -0.018
+   ]
+  ],
+  "panel_+x": [
+   "+x",
+   0.0165,
+   [
+    -0.005,
+    0.01
+   ]
+  ],
+  "panel_+y": [
+   "+y",
+   0.0167,
+   [
+    -0.03,
+    -0.015
+   ]
+  ],
+  "panel_-y": [
+   "-y",
+   0.01,
+   [
+    -0.03,
+    -0.015
+   ]
+  ]
+ },
+ "wall_spans": {
+  "+x": [
+   -0.012,
+   0.012
+  ],
+  "-x": [
+   -0.01,
+   0.012
+  ],
+  "+y": [
+   -0.035,
+   -0.018
+  ],
+  "-y": [
+   -0.035,
+   -0.018
+  ]
+ },
+ "face_edges": {
+  "display_-x": [
+   "x",
+   -0.0353,
+   [
+    -0.008,
+    0.008
+   ]
+  ],
+  "display_+x": [
+   "x",
+   0.0322,
+   [
+    -0.008,
+    0.008
+   ]
+  ],
+  "display_-y": [
+   "y",
+   -0.01515,
+   [
+    -0.02,
+    0.02
+   ]
+  ],
+  "display_+y": [
+   "y",
+   0.01455,
+   [
+    -0.02,
+    0.02
+   ]
+  ],
+  "face_far_x": [
+   "x",
+   0.0435,
+   [
+    -0.01,
+    0.01
+   ]
+  ],
+  "face_-y": [
+   "y",
+   -0.0211,
+   [
+    -0.02,
+    0.02
+   ]
+  ],
+  "face_+y": [
+   "y",
+   0.02,
+   [
+    -0.02,
+    0.02
+   ]
+  ]
+ },
+ "assumed_face_edge_inset_m": 0.0005,
+ "clip_strip": {
+  "note": "seen on the +y wall near the back, x about -11.5..11.5 (DSC03274, DSC03238); the hull bounds its reach",
+  "x_m": [
+   -0.0115,
+   0.0115
+  ],
+  "beside_x_m": [
+   -0.035,
+   -0.018
+  ],
+  "z_m": [
+   0.0085,
+   0.0118
+  ]
+ },
+ "build": {
+  "name": "Stellar-L3N",
+  "bodies": [
+   [
+    "sleeve",
+    1.0
+   ],
+   [
+    "bumper",
+    2.0
+   ]
+  ],
+  "audit_views": [
+   "DSC03238",
+   "DSC03240",
+   "DSC03243",
+   "DSC03245",
+   "DSC03247"
+  ],
+  "fit_keys": {
+   "length": "measured_face_length",
+   "width": "measured_face_width",
+   "height": "measured_panel_z"
+  }
+ }
+}

@@ -12,7 +12,7 @@
 //         the back opening stretches over the tag. Keyring lug at -x on the
 //         display side.
 //
-// measured_* come from measure.py (work/measurements.json); assumed_* are
+// measured_* come from measure.py (work/parameters.json); assumed_* are
 // design choices, not observations.
 alias float = f64;
 alias vec2d = vec2<f64>;

@@ -12,9 +12,10 @@ Three independent readings, all through volumetric_cli view-rectify:
 
 The report (work/measurements.json) gives the tag frame (origin on the face
 plane at the centre of the outline, x along the length, z out of the back)
-and the envelope in it, in metres.
+and the envelope in it, in metres; work/parameters.json holds the
+measured_* values keychain.wgsl takes.
 
-    python3 examples/keychain_tag/measure.py [--work DIR]
+    python3 examples/keychain_tag/tag_b/measure.py [--work DIR]
 """
 from __future__ import annotations
 
@@ -27,7 +28,7 @@ import cv2
 import numpy as np
 
 HERE = Path(__file__).resolve().parent
-ROOT = HERE.parents[1]
+ROOT = HERE.parents[2]
 CLI = ROOT / "target/release/volumetric_cli"
 
 # Views that look down on the logo (elevation 55-75 deg).
@@ -98,6 +99,37 @@ def card_lines(board, value, axis):
     return abs(t - round(t)) * pitch
 
 
+def parameters(report: dict) -> dict:
+    """measured_* for keychain.wgsl: the sleeve's and bumper's assumed_*
+    keep the WGSL defaults."""
+    sections = report["sections"]
+    strict = [s["strict"] for s in sections if "strict" in s]
+    zs = np.array([s["z_m"] for s in sections if "strict" in s])
+    length = np.array([s["length_m"] for s in strict])
+    width = np.array([s["width_m"] for s in strict])
+    top = report["back_face_z_m"]
+    edges = report["edge_summary"]
+    back_length = edges["back+x"]["median_m"] - edges["back-x"]["median_m"]
+    back_width = edges["back+y"]["median_m"] - edges["back-y"]["median_m"]
+    # The strict hull bounds the tag from outside (up to segmentation slips);
+    # its largest outline is what the pocket must pass.
+    return {
+        "measured_length": float(length.max()),
+        "measured_width": float(width.max()),
+        "measured_height": float(top),
+        # The display face: the lowest section (the hull there is carved by
+        # the contact line seen from every side).
+        "measured_face_length": float(length[0]),
+        "measured_face_width": float(width[0]),
+        "measured_back_length": float(back_length),
+        "measured_back_width": float(back_width),
+        # Where the hull starts narrowing: last height within 0.5 mm of the
+        # largest outline.
+        "measured_length_taper_z": float(zs[np.where(length >= length.max() - 0.0005)[0].max()]),
+        "measured_width_taper_z": float(zs[np.where(width >= width.max() - 0.0005)[0].max()]),
+    }
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--work", type=Path, default=HERE / "work")
@@ -118,8 +150,10 @@ def main() -> int:
     print(f"back face (logo sweep): z = {top * 1000:.2f} mm")
 
     # 3. Sections (first: they give the frame the edges are read in).
-    npz = np.load(work / "hull" / "sections.npz")
-    xs, ys, zs = npz["xs"], npz["ys"], npz["z"]
+    npz = np.load(work / "hull" / "down" / "sections.npz")
+    # The sections' grid is in the pose's rough frame (yaw 0 here): to world.
+    assert float(npz["yaw_deg"]) == 0.0
+    xs, ys, zs = npz["xs"] + npz["centre"][0], npz["ys"] + npz["centre"][1], npz["z"]
     res = float(xs[1] - xs[0])
     rows = []
     for z, robust, strict in zip(zs, npz["robust"], npz["strict"]):
@@ -144,7 +178,8 @@ def main() -> int:
     base = [r["robust"] for r in rows if 0.001 <= r["z_m"] <= 0.005]
     center = np.mean([b["center_m"] for b in base], axis=0)
     angle = float(np.median([b["angle_deg"] for b in base]))
-    report["frame"] = {"origin_m": [float(center[0]), float(center[1]), 0.0], "yaw_deg": angle,
+    report["frame"] = {"origin_m": [float(center[0]), float(center[1]), 0.0],
+                       "centre_m": [float(center[0]), float(center[1])], "yaw_deg": angle,
                        "note": "x along the tag's length toward the plain end, z out of the back"}
     print(f"frame: origin ({center[0] * 1000:.2f}, {center[1] * 1000:.2f}) mm, yaw {angle:+.2f} deg")
 
@@ -204,6 +239,9 @@ def main() -> int:
           f"{e['top_length_m'] * 1000:.2f} x {e['top_width_m'] * 1000:.2f} mm, {top * 1000:.2f} mm thick")
     (work / "measurements.json").write_text(json.dumps(report, indent=1) + "\n")
     print(f"wrote {work / 'measurements.json'}")
+    params = parameters(report)
+    (work / "parameters.json").write_text(json.dumps(params, indent=2) + "\n")
+    print(f"wrote {work / 'parameters.json'}")
     return 0
 
 

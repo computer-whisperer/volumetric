@@ -1,0 +1,71 @@
+{
+ "note": "White Bluetooth e-paper tag with a blue B logo, 2026-09-25, display down on the card.",
+ "size_m": [
+  0.072,
+  0.037,
+  0.014
+ ],
+ "sections_mm": "0.25:13.75:0.5",
+ "survey_area": {
+  "centre_m": [
+   0.11,
+   -0.097
+  ],
+  "yaw_deg": 0.0
+ },
+ "poses": {
+  "down": {
+   "note": "display down, one pose",
+   "views": [
+    "DSC02137",
+    "DSC02138",
+    "DSC02139",
+    "DSC02140",
+    "DSC02141",
+    "DSC02142",
+    "DSC02143",
+    "DSC02144",
+    "DSC02145",
+    "DSC02146",
+    "DSC02147",
+    "DSC02148",
+    "DSC02149",
+    "DSC02150",
+    "DSC02151",
+    "DSC02152",
+    "DSC02153",
+    "DSC02154"
+   ],
+   "centre_m": [
+    0.11,
+    -0.097
+   ],
+   "yaw_deg": 0.0
+  }
+ },
+ "build": {
+  "name": "B tag",
+  "bodies": [
+   [
+    "sleeve",
+    1.0
+   ],
+   [
+    "bumper",
+    2.0
+   ]
+  ],
+  "audit_views": [
+   "DSC02139",
+   "DSC02143",
+   "DSC02147",
+   "DSC02150",
+   "DSC02152"
+  ],
+  "fit_keys": {
+   "length": "measured_length",
+   "width": "measured_width",
+   "height": "measured_height"
+  }
+ }
+}
