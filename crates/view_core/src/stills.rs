@@ -328,7 +328,7 @@ fn build_set(
     }
     if autofocus > 0 {
         report.warnings.push(format!(
-            "{autofocus} autofocus frames: each is its own camera and cannot share a solved model"
+            "{autofocus} autofocus frames: each is its own camera; the survey solves their focal lengths per frame against one principal point and distortion per lens"
         ));
     }
     if stabilised > 0 {

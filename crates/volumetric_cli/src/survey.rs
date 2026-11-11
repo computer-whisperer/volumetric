@@ -161,8 +161,19 @@ fn print_report(r: &SurveyReport, set: &ViewSet, seconds: f64, saved: Option<&st
     println!();
     for c in &r.cameras {
         println!(
-            "camera {} '{}': {} frames, f {:.1} px (± {:.1}), pp ({:.1} ± {:.1}, {:.1} ± {:.1}), k1 {:+.5} k2 {:+.4}",
-            c.index, c.label, c.frames, c.f, c.f_std, c.cx, c.cx_std, c.cy, c.cy_std, c.k1, c.k2
+            "camera {} '{}' (lens {}): {} frames, f {:.1} px (± {:.1}), pp ({:.1} ± {:.1}, {:.1} ± {:.1}), k1 {:+.5} k2 {:+.4}",
+            c.index,
+            c.label,
+            c.lens,
+            c.frames,
+            c.f,
+            c.f_std,
+            c.cx,
+            c.cx_std,
+            c.cy,
+            c.cy_std,
+            c.k1,
+            c.k2
         );
     }
     let sigmas: Vec<f64> = set

@@ -186,12 +186,19 @@ impl Shot {
             Some(p) => format!("{}:{p}", self.focus_mode),
             None => self.focus_mode.clone(),
         };
-        let mut key = format!("{}:{}:{}:{focus}", self.make, self.model, self.lens);
+        let mut key = format!("{}:{focus}", self.lens_key());
         if !self.focus_is_held() {
             key.push(':');
             key.push_str(view_id);
         }
         key
+    }
+
+    /// Body and lens: what frames share whatever the focus did. The
+    /// survey solves one principal point and distortion for the autofocus
+    /// frames of one lens key and focal length.
+    pub fn lens_key(&self) -> String {
+        format!("{}:{}:{}", self.make, self.model, self.lens)
     }
 }
 

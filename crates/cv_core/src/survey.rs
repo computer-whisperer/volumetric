@@ -4,11 +4,21 @@
 //! The card's caliper pitch sets the scale and the card's plane and axes
 //! define the world frame.
 //!
-//! The unknowns are, per camera, `f, cx, cy, k1, k2`; per frame a
+//! The unknowns are, per camera, the focal length `f`; per lens the
+//! principal point and radial distortion `cx, cy, k1, k2`; per frame a
 //! rotation and a translation (world to camera); per point three
-//! coordinates. Each observation gives two reprojection residuals under a
-//! soft-L1 loss; one more residual holds the mean of the card's solved
-//! column spans to the caliper span. Levenberg–Marquardt on the dense
+//! coordinates. A camera with held focus is a lens of its own. Autofocus
+//! frames (a camera each: the focus moved between them) of one body, lens
+//! and focal length share one lens, so each frame's focal length is solved
+//! against the distortion all of them see. An autofocus lens also has a
+//! focal length its frames scatter about, solved with them: a weak prior
+//! holds each frame's focal length to it, for the frames that see the card
+//! square on and cannot tell focal length from distance.
+//!
+//! Each observation gives two reprojection residuals under a soft-L1 loss;
+//! one more residual holds the mean of the card's solved column spans to
+//! the caliper span; each autofocus frame adds its prior's residual,
+//! whitened by the pixel noise. Levenberg–Marquardt on the dense
 //! normal equations with an analytic Jacobian; one card frame's pose is
 //! held during the solve and the world re-based on the nominal card after.
 //! Uncertainties come from the pseudo-inverse of the normal matrix with
@@ -37,10 +47,10 @@ pub struct SurveyOptions {
     pub min_card_corners: usize,
     /// Solved points a frame needs to be posed on them.
     pub min_points: usize,
-    /// A camera seen in fewer frames cannot self-calibrate: its frames are
-    /// left out.
+    /// A lens seen in fewer frames (over all its cameras) cannot
+    /// self-calibrate: its frames are left out.
     pub min_frames_per_camera: usize,
-    /// Card frames with at least this many corners calibrate their camera
+    /// Card frames with at least this many corners calibrate their lens
     /// before the bundle; with fewer than `min_calibration_frames` of them
     /// the seed is used as is.
     pub calibration_corners: usize,
@@ -61,6 +71,12 @@ pub struct SurveyOptions {
     pub max_iterations: usize,
     /// Weight of the scale residual, per millimetre of span error.
     pub scale_weight: f64,
+    /// How far autofocus moves a lens's focal length, as a fraction: each
+    /// autofocus frame's focal length is held to its lens's (solved with
+    /// them) with this spread, for the frames whose own view cannot tell
+    /// focal length from distance (the card seen square on). Zero: no
+    /// prior.
+    pub autofocus_focal_spread: f64,
 }
 
 impl Default for SurveyOptions {
@@ -80,6 +96,7 @@ impl Default for SurveyOptions {
             rounds: 4,
             max_iterations: 100,
             scale_weight: 100.0,
+            autofocus_focal_spread: 0.03,
         }
     }
 }
@@ -88,6 +105,8 @@ impl Default for SurveyOptions {
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct CameraReport {
     pub index: usize,
+    /// The lens the camera shares `cx, cy, k1, k2` with.
+    pub lens: usize,
     pub label: String,
     pub frames: usize,
     pub f: f64,
@@ -147,13 +166,13 @@ pub struct SurveyReport {
     pub rejected: Vec<String>,
     /// Frames never posed (too few points, or rejected), by id.
     pub unposed: Vec<String>,
-    /// Frames left out because their camera has too few frames.
+    /// Frames left out because their lens has too few frames.
     pub left_out: Vec<String>,
     pub log: Vec<String>,
 }
 
 impl SurveyReport {
-    /// The numbers as an F64Map: the fit, then `camera.<index>.<f|f_std|cx|cy|k1|k2>`,
+    /// The numbers as an F64Map: the fit, then `camera.<index>.<lens|f|f_std|cx|cy|k1|k2>`,
     /// `swatch.<id>.<side_mm|sigma_mm>` and `frame.<id>.rms_px`.
     pub fn to_f64_map(&self) -> BTreeMap<String, f64> {
         let mut m = BTreeMap::new();
@@ -187,6 +206,7 @@ impl SurveyReport {
         for c in &self.cameras {
             let p = format!("camera.{}.", c.index);
             m.insert(format!("{p}frames"), c.frames as f64);
+            m.insert(format!("{p}lens"), c.lens as f64);
             m.insert(format!("{p}f"), c.f);
             m.insert(format!("{p}f_std"), c.f_std);
             m.insert(format!("{p}cx"), c.cx);
@@ -307,7 +327,25 @@ const BEHIND_PX: f64 = 1e4;
 /// The bundle's state: cameras, posed frames, points, and which of them
 /// are free.
 struct Model {
+    /// Per camera `f, cx, cy, k1, k2`; the cameras of one lens hold the
+    /// same `cx, cy, k1, k2`, stepped together.
     cams: Vec<[f64; 5]>,
+    /// The lens of each camera, `0..n_lenses`.
+    lens_of: Vec<usize>,
+    n_lenses: usize,
+    /// Per lens, the focal length its autofocus frames scatter about: a
+    /// parameter of an autofocus lens, held for the rest.
+    lens_focal: Vec<f64>,
+    /// Per lens, how far its frames' focal lengths scatter about it,
+    /// pixels; zero without a prior.
+    focal_spread: Vec<f64>,
+    /// Per camera, whether its focal length carries its lens's prior.
+    focal_prior: Vec<bool>,
+    /// The pixel noise the prior is whitened with: its residual is this
+    /// noise times the distance to the lens's focal length in spreads, so
+    /// against the reprojection residuals it weighs as a Gaussian of the
+    /// spread's width.
+    noise_px: f64,
     poses: Vec<Rigid>,
     /// NaN for a point not yet known.
     points: Vec<[f64; 3]>,
@@ -324,19 +362,32 @@ struct Model {
 
 impl Model {
     fn n_params(&self) -> usize {
-        5 * self.cams.len() + 6 * self.poses.len() + 3 * self.points.len()
+        self.intrinsics_end() + 6 * self.poses.len() + 3 * self.points.len()
     }
 
-    fn cam_at(&self, c: usize) -> usize {
-        5 * c
+    /// The parameters ahead of the poses: a focal length per camera, then
+    /// per lens its `cx, cy, k1, k2` and its focal length.
+    fn intrinsics_end(&self) -> usize {
+        self.cams.len() + 5 * self.n_lenses
+    }
+
+    /// The parameter indices of camera `c`'s `f, cx, cy, k1, k2`.
+    fn intr_at(&self, c: usize) -> [usize; 5] {
+        let l = self.cams.len() + 5 * self.lens_of[c];
+        [c, l, l + 1, l + 2, l + 3]
+    }
+
+    /// The parameter index of lens `l`'s focal length.
+    fn lens_focal_at(&self, l: usize) -> usize {
+        self.cams.len() + 5 * l + 4
     }
 
     fn pose_at(&self, s: usize) -> usize {
-        5 * self.cams.len() + 6 * s
+        self.intrinsics_end() + 6 * s
     }
 
     fn point_at(&self, p: usize) -> usize {
-        5 * self.cams.len() + 6 * self.poses.len() + 3 * p
+        self.intrinsics_end() + 6 * self.poses.len() + 3 * p
     }
 
     /// Columns of the reduced system: parameter index to column, or
@@ -382,7 +433,20 @@ impl Model {
         self.scale_weight * (self.span_mean() - self.span_nominal)
     }
 
-    /// The soft-L1 cost of the residuals plus the squared scale residual.
+    /// The focal priors' residuals: (camera, value, derivative by the
+    /// camera's focal length; by its lens's it is the negative).
+    fn prior_residuals(&self) -> impl Iterator<Item = (usize, f64, f64)> + '_ {
+        (0..self.cams.len())
+            .filter(|&c| self.focal_prior[c])
+            .map(move |c| {
+                let l = self.lens_of[c];
+                let w = self.noise_px / self.focal_spread[l];
+                (c, w * (self.cams[c][0] - self.lens_focal[l]), w)
+            })
+    }
+
+    /// The soft-L1 cost of the residuals plus the squared scale and prior
+    /// residuals.
     fn cost(&self, res: &[[f64; 2]], span: f64) -> f64 {
         let s2 = self.soft_l1 * self.soft_l1;
         res.iter()
@@ -392,6 +456,7 @@ impl Model {
             })
             .sum::<f64>()
             + span * span
+            + self.prior_residuals().map(|(_, r, _)| r * r).sum::<f64>()
     }
 
     /// The robust weight of an observation: the soft-L1 loss's derivative
@@ -452,10 +517,9 @@ impl Model {
             res.push(r);
             let w = self.weight(&r);
             rows.clear();
-            let base = self.cam_at(o.camera);
-            for j in 0..5 {
-                if col[base + j] != usize::MAX {
-                    rows.push((col[base + j], [dcam[0][j], dcam[1][j]]));
+            for (j, i) in self.intr_at(o.camera).into_iter().enumerate() {
+                if col[i] != usize::MAX {
+                    rows.push((col[i], [dcam[0][j], dcam[1][j]]));
                 }
             }
             let base = self.pose_at(o.slot);
@@ -474,6 +538,23 @@ impl Model {
                 g[ci] += w * (di[0] * r[0] + di[1] * r[1]);
                 for &(cj, dj) in &rows {
                     a[ci * n + cj] += w * (di[0] * dj[0] + di[1] * dj[1]);
+                }
+            }
+        }
+        for (c, r, d) in self.prior_residuals() {
+            let entries = [
+                (col[self.intr_at(c)[0]], d),
+                (col[self.lens_focal_at(self.lens_of[c])], -d),
+            ];
+            for &(ci, di) in &entries {
+                if ci == usize::MAX {
+                    continue;
+                }
+                g[ci] += di * r;
+                for &(cj, dj) in &entries {
+                    if cj != usize::MAX {
+                        a[ci * n + cj] += di * dj;
+                    }
                 }
             }
         }
@@ -516,11 +597,14 @@ impl Model {
                 delta[col[i]]
             }
         };
+        // A lens term's step reaches every camera of the lens.
         for c in 0..self.cams.len() {
-            let base = self.cam_at(c);
-            for j in 0..5 {
-                self.cams[c][j] += at(base + j);
+            for (j, i) in self.intr_at(c).into_iter().enumerate() {
+                self.cams[c][j] += at(i);
             }
+        }
+        for l in 0..self.n_lenses {
+            self.lens_focal[l] += at(self.lens_focal_at(l));
         }
         for s in 0..self.poses.len() {
             let base = self.pose_at(s);
@@ -561,7 +645,12 @@ impl Model {
                     lambda *= 10.0;
                     continue;
                 };
-                let saved = (self.cams.clone(), self.poses.clone(), self.points.clone());
+                let saved = (
+                    self.cams.clone(),
+                    self.poses.clone(),
+                    self.points.clone(),
+                    self.lens_focal.clone(),
+                );
                 self.step(&col, &delta);
                 let (res, span) = self.residuals();
                 let trial = self.cost(&res, span);
@@ -575,7 +664,7 @@ impl Model {
                     }
                     break;
                 }
-                (self.cams, self.poses, self.points) = saved;
+                (self.cams, self.poses, self.points, self.lens_focal) = saved;
                 lambda *= 4.0;
             }
             if !improved {
@@ -661,6 +750,61 @@ fn cholesky_inverse(mut a: Vec<f64>, n: usize) -> Option<Vec<f64>> {
         }
     }
     Some(inv)
+}
+
+/// The pixel noise per axis that reprojection residuals show, robustly:
+/// the median residual length over its value for a unit 2-D Gaussian.
+fn noise_of(res: &[[f64; 2]]) -> f64 {
+    let lengths: Vec<f64> = res
+        .iter()
+        .map(|r| (r[0] * r[0] + r[1] * r[1]).sqrt())
+        .collect();
+    (median(lengths) / (2.0 * std::f64::consts::LN_2).sqrt()).max(0.02)
+}
+
+/// The lens of each camera and the number of lenses. Autofocus cameras
+/// of one body and lens at one focal length and image size share a lens;
+/// every other camera (held focus, or no metadata) is a lens of its own.
+fn lenses(set: &ViewSet) -> (Vec<usize>, usize) {
+    let mut keys: Vec<Option<String>> = Vec::new();
+    let mut lens_of = Vec::with_capacity(set.cameras.len());
+    for (c, camera) in set.cameras.iter().enumerate() {
+        let mut shots = set
+            .views
+            .iter()
+            .filter(|v| v.camera as usize == c)
+            .map(|v| v.shot.as_ref());
+        let key = match shots.next() {
+            Some(Some(first)) if !first.focus_is_held() => {
+                // A zoom at another focal length is another lens.
+                let key = format!(
+                    "{}:{:.1}mm:{}x{}",
+                    first.lens_key(),
+                    first.focal_mm,
+                    camera.width,
+                    camera.height
+                );
+                shots
+                    .all(|s| {
+                        s.is_some_and(|s| {
+                            !s.focus_is_held()
+                                && s.lens_key() == first.lens_key()
+                                && (s.focal_mm - first.focal_mm).abs() < 0.05
+                        })
+                    })
+                    .then_some(key)
+            }
+            _ => None,
+        };
+        let shared = key
+            .as_ref()
+            .and_then(|k| keys.iter().position(|x| x.as_ref() == Some(k)));
+        lens_of.push(shared.unwrap_or_else(|| {
+            keys.push(key);
+            keys.len() - 1
+        }));
+    }
+    (lens_of, keys.len())
 }
 
 /// Intrinsics `f, cx, cy, k1, k2` of a camera model (fx and fy averaged,
@@ -824,6 +968,12 @@ pub fn survey(set: &mut ViewSet, options: &SurveyOptions) -> Result<SurveyReport
         .map(|b| b.spec.clone())
         .ok_or("the set has no board: run view-detect with the card first")?;
     spec.validate()?;
+    let spread = options.autofocus_focal_spread;
+    if !(spread.is_finite() && spread >= 0.0) {
+        return Err(format!(
+            "autofocus_focal_spread must be a fraction of zero or more, not {spread}"
+        ));
+    }
     let mut report = SurveyReport::default();
     let mut log = |line: String| report.log.push(line);
 
@@ -852,14 +1002,25 @@ pub fn survey(set: &mut ViewSet, options: &SurveyOptions) -> Result<SurveyReport
     if frames.is_empty() {
         return Err("no view carries observations: run view-detect first".to_string());
     }
-    // Cameras with too few frames cannot self-calibrate.
+    // Lenses whose cameras have too few frames between them cannot
+    // self-calibrate.
+    let (lens_of, n_lenses) = lenses(set);
+    // A lens shared by several cameras is an autofocus lens: its focal
+    // lengths carry the spread prior (unless the spread is zero).
+    let autofocus: Vec<bool> = (0..n_lenses)
+        .map(|l| spread > 0.0 && lens_of.iter().filter(|&&m| m == l).count() > 1)
+        .collect();
     let mut frames_per_camera = vec![0usize; set.cameras.len()];
     for f in &frames {
         frames_per_camera[f.camera] += 1;
     }
+    let mut frames_per_lens = vec![0usize; n_lenses];
+    for (c, n) in frames_per_camera.iter().enumerate() {
+        frames_per_lens[lens_of[c]] += n;
+    }
     let few: Vec<usize> = (0..set.cameras.len())
         .filter(|&c| {
-            frames_per_camera[c] > 0 && frames_per_camera[c] < options.min_frames_per_camera
+            frames_per_camera[c] > 0 && frames_per_lens[lens_of[c]] < options.min_frames_per_camera
         })
         .collect();
     if !few.is_empty() {
@@ -869,7 +1030,7 @@ pub fn survey(set: &mut ViewSet, options: &SurveyOptions) -> Result<SurveyReport
             }
         }
         log(format!(
-            "{} frames left out: their cameras ({}) have under {} frames",
+            "{} frames left out: the lenses of their cameras ({}) have under {} frames",
             report.left_out.len(),
             few.iter()
                 .map(|&c| format!("{c} '{}'", set.cameras[c].label))
@@ -879,6 +1040,8 @@ pub fn survey(set: &mut ViewSet, options: &SurveyOptions) -> Result<SurveyReport
         ));
         frames.retain(|f| !few.contains(&f.camera));
     }
+    let lens_ref = &lens_of;
+    let lens_cameras = move |l: usize| (0..lens_ref.len()).filter(move |&c| lens_ref[c] == l);
     if frames.is_empty() {
         return Err("no camera has enough frames to survey".to_string());
     }
@@ -900,8 +1063,21 @@ pub fn survey(set: &mut ViewSet, options: &SurveyOptions) -> Result<SurveyReport
         })
         .collect();
 
-    // Cameras: the seed intrinsics.
+    // Cameras: the seed intrinsics, a lens's terms from its first camera.
     let mut cams: Vec<[f64; 5]> = set.cameras.iter().map(intrinsics_of).collect();
+    for c in 0..cams.len() {
+        let first = lens_cameras(lens_of[c])
+            .next()
+            .expect("a lens has its cameras");
+        let shared = cams[first];
+        cams[c][1..].copy_from_slice(&shared[1..]);
+    }
+    // Each lens's focal length, and the pixel noise the priors are
+    // whitened with: a guess until a solve measures it.
+    let mut lens_f: Vec<f64> = (0..n_lenses)
+        .map(|l| median(lens_cameras(l).map(|c| cams[c][0]).collect()))
+        .collect();
+    let mut noise = options.soft_l1_px / 3.0;
     let camera_models = |cams: &[[f64; 5]], set: &ViewSet| -> Vec<CameraModel> {
         set.cameras
             .iter()
@@ -910,32 +1086,46 @@ pub fn survey(set: &mut ViewSet, options: &SurveyOptions) -> Result<SurveyReport
             .collect()
     };
 
-    // Calibration: each camera with enough full card frames refines its
+    // Calibration: each lens with enough full card frames refines its
     // intrinsics against the nominal card before anything else.
     let card_group = u32::MAX;
-    for c in 0..set.cameras.len() {
+    let lens_name = |l: usize| -> String {
+        let members: Vec<usize> = lens_cameras(l).collect();
+        match members.as_slice() {
+            [c] => format!("camera {c} '{}'", set.cameras[*c].label),
+            _ => format!(
+                "lens {l} ({} cameras from '{}')",
+                members.len(),
+                set.cameras[members[0]].label
+            ),
+        }
+    };
+    for l in 0..n_lenses {
         let good: Vec<usize> = (0..frames.len())
             .filter(|&k| {
-                frames[k].camera == c && frames[k].card.len() >= options.calibration_corners
+                lens_of[frames[k].camera] == l
+                    && frames[k].card.len() >= options.calibration_corners
             })
             .collect();
-        if frames_per_camera[c] == 0 {
+        if lens_cameras(l).all(|c| frames_per_camera[c] == 0) {
             continue;
         }
         if good.len() < options.min_calibration_frames {
             log(format!(
-                "camera {c} '{}': {} frames with {}+ card corners, starting from the seed f {:.0} px",
-                set.cameras[c].label,
+                "{}: {} frames with {}+ card corners, starting from the seed",
+                lens_name(l),
                 good.len(),
                 options.calibration_corners,
-                cams[c][0]
             ));
             continue;
         }
         let models = camera_models(&cams, set);
         let mut poses = Vec::new();
         let mut obs = Vec::new();
+        // The lens's cameras that have a posed frame, in the order met.
+        let mut local: Vec<usize> = Vec::new();
         for &k in &good {
+            let c = frames[k].camera;
             let pts: Vec<Correspondence> = frames[k]
                 .card
                 .iter()
@@ -951,10 +1141,14 @@ pub fn survey(set: &mut ViewSet, options: &SurveyOptions) -> Result<SurveyReport
             };
             let slot = poses.len();
             poses.push(pose);
+            let camera = local.iter().position(|&m| m == c).unwrap_or_else(|| {
+                local.push(c);
+                local.len() - 1
+            });
             for &(id, px) in &frames[k].card {
                 obs.push(Obs {
                     slot,
-                    camera: 0,
+                    camera,
                     point: id as usize,
                     uv: px,
                 });
@@ -962,13 +1156,24 @@ pub fn survey(set: &mut ViewSet, options: &SurveyOptions) -> Result<SurveyReport
         }
         if poses.len() < options.min_calibration_frames {
             log(format!(
-                "camera {c}: only {} card frames posed, starting from the seed",
+                "{}: only {} card frames posed, starting from the seed",
+                lens_name(l),
                 poses.len()
             ));
             continue;
         }
         let mut model = Model {
-            cams: vec![cams[c]],
+            cams: local.iter().map(|&c| cams[c]).collect(),
+            lens_of: vec![0; local.len()],
+            n_lenses: 1,
+            lens_focal: vec![lens_f[l]],
+            focal_spread: vec![if autofocus[l] {
+                spread * lens_f[l]
+            } else {
+                0.0
+            }],
+            focal_prior: vec![autofocus[l]; local.len()],
+            noise_px: noise,
             poses,
             points: nominal.clone(),
             obs,
@@ -979,18 +1184,51 @@ pub fn survey(set: &mut ViewSet, options: &SurveyOptions) -> Result<SurveyReport
             free: Vec::new(),
         };
         let n = model.n_params();
-        model.free = (0..n).map(|i| i < 5 + 6 * model.poses.len()).collect();
-        let iterations = model.solve(options.max_iterations);
+        let solved = model.intrinsics_end() + 6 * model.poses.len();
+        model.free = (0..n).map(|i| i < solved).collect();
+        let focal = model.lens_focal_at(0);
+        model.free[focal] = autofocus[l];
+        let mut iterations = model.solve(options.max_iterations);
+        let (res, _) = model.residuals();
+        noise = noise_of(&res);
+        if autofocus[l] {
+            // Again with the prior whitened by the noise the frames show.
+            model.noise_px = noise;
+            model.focal_spread = vec![spread * model.lens_focal[0]];
+            iterations += model.solve(options.max_iterations);
+        }
         let (res, _) = model.residuals();
         let rms = rms_of(&res);
-        cams[c] = model.cams[0];
+        for (m, &c) in local.iter().enumerate() {
+            cams[c] = model.cams[m];
+        }
+        // Cameras of the lens without a calibration frame take its terms,
+        // and an autofocus one its focal length.
+        let shared = model.cams[0];
+        lens_f[l] = model.lens_focal[0];
+        for c in lens_cameras(l) {
+            cams[c][1..].copy_from_slice(&shared[1..]);
+            if autofocus[l] && !local.contains(&c) {
+                cams[c][0] = lens_f[l];
+            }
+        }
+        let (f_lo, f_hi) = model
+            .cams
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), c| {
+                (lo.min(c[0]), hi.max(c[0]))
+            });
+        let f = if f_hi - f_lo < 0.5 {
+            format!("{f_lo:.0} px")
+        } else {
+            format!("{f_lo:.0}..{f_hi:.0} px")
+        };
         log(format!(
-            "camera {c} '{}': calibrated on {} card frames in {iterations} iterations, rms {rms:.2} px, f {:.0} px, k1 {:+.4} k2 {:+.3}",
-            set.cameras[c].label,
+            "{}: calibrated on {} card frames in {iterations} iterations, rms {rms:.2} px, f {f}, k1 {:+.4} k2 {:+.3}",
+            lens_name(l),
             model.poses.len(),
-            cams[c][0],
-            cams[c][3],
-            cams[c][4]
+            shared[3],
+            shared[4]
         ));
     }
 
@@ -1178,6 +1416,20 @@ pub fn survey(set: &mut ViewSet, options: &SurveyOptions) -> Result<SurveyReport
             .unwrap_or(0);
         let mut model = Model {
             cams: cams.clone(),
+            lens_of: lens_of.clone(),
+            n_lenses,
+            lens_focal: lens_f.clone(),
+            focal_spread: (0..n_lenses)
+                .map(|l| {
+                    if autofocus[l] {
+                        spread * lens_f[l]
+                    } else {
+                        0.0
+                    }
+                })
+                .collect(),
+            focal_prior: vec![false; cams.len()],
+            noise_px: noise,
             poses: slots.iter().map(|k| posed[k]).collect(),
             points: points
                 .iter()
@@ -1192,12 +1444,35 @@ pub fn survey(set: &mut ViewSet, options: &SurveyOptions) -> Result<SurveyReport
         };
         let n = model.n_params();
         let mut free = vec![true; n];
+        // Intrinsics nothing in this bundle sees stay put: the focal length
+        // of a camera without a posed frame, the terms of a lens without a
+        // posed camera.
+        let mut cam_seen = vec![false; cams.len()];
+        for o in &model.obs {
+            cam_seen[o.camera] = true;
+        }
+        let mut lens_seen = vec![false; n_lenses];
         for c in 0..cams.len() {
-            if frames_per_camera[c] == 0 || few.contains(&c) {
-                for j in 0..5 {
-                    free[model.cam_at(c) + j] = false;
+            lens_seen[lens_of[c]] |= cam_seen[c];
+        }
+        for c in 0..cams.len() {
+            let at = model.intr_at(c);
+            if !cam_seen[c] {
+                free[at[0]] = false;
+            }
+            if !lens_seen[lens_of[c]] {
+                for i in &at[1..] {
+                    free[*i] = false;
                 }
             }
+        }
+        // The prior on the focal lengths a frame sees; a lens's focal length
+        // is free while one of its frames is.
+        model.focal_prior = (0..cams.len())
+            .map(|c| cam_seen[c] && autofocus[lens_of[c]])
+            .collect();
+        for l in 0..n_lenses {
+            free[model.lens_focal_at(l)] = autofocus[l] && lens_seen[l];
         }
         for j in 0..6 {
             free[model.pose_at(anchor) + j] = false;
@@ -1214,10 +1489,7 @@ pub fn survey(set: &mut ViewSet, options: &SurveyOptions) -> Result<SurveyReport
         log(format!(
             "bundle {round}: {} observations, {} cameras, {} frames, {} points, {n_free} parameters",
             model.obs.len(),
-            cams.iter()
-                .enumerate()
-                .filter(|(c, _)| frames_per_camera[*c] > 0 && !few.contains(c))
-                .count(),
+            cam_seen.iter().filter(|s| **s).count(),
             model.poses.len(),
             known.iter().filter(|k| **k).count()
         ));
@@ -1241,6 +1513,8 @@ pub fn survey(set: &mut ViewSet, options: &SurveyOptions) -> Result<SurveyReport
         ));
         // Carry the solution back.
         cams = model.cams.clone();
+        lens_f = model.lens_focal.clone();
+        noise = noise_of(&res);
         for (slot, &k) in slots.iter().enumerate() {
             posed.insert(k, model.poses[slot]);
         }
@@ -1334,7 +1608,7 @@ pub fn survey(set: &mut ViewSet, options: &SurveyOptions) -> Result<SurveyReport
     };
     let (col, n) = free_model.columns();
     let (a, _, _, _) = free_model.normal_equations_plain(&col, n);
-    let m = 2 * free_model.obs.len() + 1;
+    let m = 2 * free_model.obs.len() + 1 + free_model.prior_residuals().count();
     let dof = (m as f64 - n as f64 + 6.0).max(1.0);
     let plain: f64 = res.iter().map(|r| r[0] * r[0] + r[1] * r[1]).sum::<f64>();
     let sigma2 = plain / dof;
@@ -1549,16 +1823,18 @@ pub fn survey(set: &mut ViewSet, options: &SurveyOptions) -> Result<SurveyReport
         if frames_per_camera[c] == 0 || few.contains(&c) {
             continue;
         }
+        let at = model.intr_at(c);
         report.cameras.push(CameraReport {
             index: c,
+            lens: lens_of[c],
             label: set.cameras[c].label.clone(),
             frames: slots.iter().filter(|&&k| frames[k].camera == c).count(),
             f: intr[0],
-            f_std: var_at(model.cam_at(c)).sqrt(),
+            f_std: var_at(at[0]).sqrt(),
             cx: intr[1],
-            cx_std: var_at(model.cam_at(c) + 1).sqrt(),
+            cx_std: var_at(at[1]).sqrt(),
             cy: intr[2],
-            cy_std: var_at(model.cam_at(c) + 2).sqrt(),
+            cy_std: var_at(at[2]).sqrt(),
             k1: intr[3],
             k2: intr[4],
         });
@@ -1584,6 +1860,12 @@ impl Model {
         let plain = Model {
             soft_l1: f64::INFINITY,
             cams: self.cams.clone(),
+            lens_of: self.lens_of.clone(),
+            n_lenses: self.n_lenses,
+            lens_focal: self.lens_focal.clone(),
+            focal_spread: self.focal_spread.clone(),
+            focal_prior: self.focal_prior.clone(),
+            noise_px: self.noise_px,
             poses: self.poses.clone(),
             points: self.points.clone(),
             obs: self.obs.clone(),
@@ -1822,7 +2104,7 @@ pub fn square_corners(centre: [f64; 3], side: f64, u: [f64; 3], v: [f64; 3]) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use volumetric_abi::viewset::{BoardSpec, CornerObs, MarkerObs, Observations};
+    use volumetric_abi::viewset::{BoardSpec, CornerObs, MarkerObs, Observations, Shot};
 
     /// A small deterministic generator (xorshift) for the synthetic field.
     struct Rng(u64);
@@ -1863,6 +2145,8 @@ mod tests {
         width: u32,
         height: u32,
         poses: Vec<Rigid>,
+        /// The focal length each kept frame was taken at.
+        focal: Vec<f64>,
     }
 
     /// The shim's synthetic field: the card at the origin of a plane, eight
@@ -1874,6 +2158,14 @@ mod tests {
 
     /// The field of `seed` with the pixel noise drawn from `noise_seed`.
     fn field_with_noise(seed: u64, noise_seed: u64) -> (Field, ViewSet) {
+        field_with(seed, noise_seed, false, 13800.0)
+    }
+
+    /// With `autofocus`, every frame is an autofocus still: a camera of
+    /// its own (as the intake keys it), its focal length a few percent
+    /// off the lens's nominal one, the principal point and distortion
+    /// shared.
+    fn field_with(seed: u64, noise_seed: u64, autofocus: bool, seed_f: f64) -> (Field, ViewSet) {
         let mut rng = Rng(seed);
         let mut noise = Rng(noise_seed);
         let spec = BoardSpec::survey_card();
@@ -1906,7 +2198,7 @@ mod tests {
             .collect();
         let intr = [14200.0, 3080.0, 2090.0, -0.04, 0.6];
         let (width, height) = (6192u32, 4128u32);
-        let seed_camera = CameraModel::pinhole(width, height, 13800.0, 13800.0, 3096.0, 2064.0);
+        let seed_camera = CameraModel::pinhole(width, height, seed_f, seed_f, 3096.0, 2064.0);
         let mut set = ViewSet {
             cameras: vec![seed_camera],
             board: Some(Board {
@@ -1916,7 +2208,12 @@ mod tests {
             ..ViewSet::default()
         };
         let mut poses = Vec::new();
+        let mut focal = Vec::new();
         for k in 0..90 {
+            let mut intr = intr;
+            if autofocus {
+                intr[0] *= 1.0 + 0.025 * (0.7 * k as f64).sin();
+            }
             let target = [rng.uniform(-0.3, 0.9), rng.uniform(-0.3, 0.7), 0.0];
             let d = rng.uniform(1.2, 2.5);
             let el = rng.uniform(35.0, 85.0).to_radians();
@@ -1972,10 +2269,29 @@ mod tests {
                 }
             }
             if obs.board.len() + 4 * obs.markers.len() >= 8 {
-                let mut view = View::unposed(format!("{k:03}"), 0);
+                let id = format!("{k:03}");
+                let mut view = View::unposed(id.clone(), 0);
+                if autofocus {
+                    let shot = Shot {
+                        make: "SONY".to_string(),
+                        model: "ILCE-6700".to_string(),
+                        lens: "E 25mm F1.7".to_string(),
+                        focus_mode: "af-s".to_string(),
+                        ..Shot::default()
+                    };
+                    let mut camera = set.cameras[0].clone();
+                    camera.label = shot.camera_key(&id);
+                    if set.views.is_empty() {
+                        set.cameras.clear();
+                    }
+                    view.camera = set.cameras.len() as u32;
+                    set.cameras.push(camera);
+                    view.shot = Some(shot);
+                }
                 view.observations = Some(obs);
                 set.views.push(view);
                 poses.push(pose);
+                focal.push(intr[0]);
             }
         }
         (
@@ -1986,6 +2302,7 @@ mod tests {
                 width,
                 height,
                 poses,
+                focal,
             },
             set,
         )
@@ -1997,13 +2314,104 @@ mod tests {
         [x[0], -x[1], -x[2]]
     }
 
+    /// With unit weights N = JᵀJ and g = Jᵀr: compares the model's normal
+    /// equations against a numerical J, central differences of every
+    /// residual (the scale residual's second-order term under its large
+    /// weight would otherwise show up as a derivative), the priors' too.
+    fn check_jacobian(model: &mut Model) {
+        let (col, n) = model.columns();
+        let (a, g, _, _) = model.normal_equations(&col, n);
+        let residual_vector = |m: &Model| -> Vec<f64> {
+            let (res, span) = m.residuals();
+            let mut v: Vec<f64> = res.iter().flat_map(|r| [r[0], r[1]]).collect();
+            v.push(span);
+            v.extend(m.prior_residuals().map(|(_, r, _)| r));
+            v
+        };
+        // Steps per kind of parameter.
+        let mut eps = vec![0.0; model.n_params()];
+        for c in 0..model.cams.len() {
+            eps[c] = 1e-3;
+        }
+        for l in 0..model.n_lenses {
+            let base = model.cams.len() + 5 * l;
+            eps[base..base + 5].copy_from_slice(&[1e-4, 1e-4, 1e-6, 1e-6, 1e-3]);
+        }
+        for s in 0..model.poses.len() {
+            let base = model.pose_at(s);
+            eps[base..base + 6].copy_from_slice(&[1e-7, 1e-7, 1e-7, 1e-6, 1e-6, 1e-6]);
+        }
+        for p in 0..model.points.len() {
+            let base = model.point_at(p);
+            eps[base..base + 3].fill(1e-7);
+        }
+        let eps: Vec<f64> = (0..eps.len())
+            .filter(|&i| col[i] != usize::MAX)
+            .map(|i| eps[i])
+            .collect();
+        let r_all = residual_vector(model);
+        let k = r_all.len();
+        let mut jac = vec![vec![0.0; n]; k];
+        for i in 0..n {
+            let saved = (
+                model.cams.clone(),
+                model.poses.clone(),
+                model.points.clone(),
+                model.lens_focal.clone(),
+            );
+            let mut delta = vec![0.0; n];
+            delta[i] = eps[i];
+            model.step(&col, &delta);
+            let plus = residual_vector(model);
+            // A lens's terms stay shared across its cameras.
+            for c in 0..model.cams.len() {
+                for d in 0..model.cams.len() {
+                    if model.lens_of[c] == model.lens_of[d] {
+                        assert_eq!(model.cams[c][1..], model.cams[d][1..]);
+                    }
+                }
+            }
+            (model.cams, model.poses, model.points, model.lens_focal) = saved.clone();
+            delta[i] = -eps[i];
+            model.step(&col, &delta);
+            let minus = residual_vector(model);
+            (model.cams, model.poses, model.points, model.lens_focal) = saved;
+            for row in 0..k {
+                jac[row][i] = (plus[row] - minus[row]) / (2.0 * eps[i]);
+            }
+        }
+        for i in 0..n {
+            let g_num: f64 = (0..k).map(|r| jac[r][i] * r_all[r]).sum();
+            let scale = g[i].abs().max(g_num.abs()).max(1.0);
+            assert!(
+                (g[i] - g_num).abs() / scale < 1e-3,
+                "gradient {i}: {} vs {g_num}",
+                g[i]
+            );
+            for j in 0..n {
+                let a_num: f64 = (0..k).map(|r| jac[r][i] * jac[r][j]).sum();
+                let scale = a[i * n + j].abs().max(a_num.abs()).max(1.0);
+                assert!(
+                    (a[i * n + j] - a_num).abs() / scale < 1e-3,
+                    "normal {i},{j}: {} vs {a_num}",
+                    a[i * n + j]
+                );
+            }
+        }
+    }
+
     #[test]
     fn the_analytic_jacobian_matches_finite_differences() {
         let (field, _) = field(11);
-        let pose = field.poses[0];
         let mut model = Model {
             cams: vec![field.intr],
-            poses: vec![pose],
+            lens_of: vec![0],
+            n_lenses: 1,
+            lens_focal: vec![field.intr[0]],
+            focal_spread: vec![0.0],
+            focal_prior: vec![false],
+            noise_px: 0.5,
+            poses: vec![field.poses[0]],
             points: vec![field.swatches[0].1[0], field.card[5]],
             obs: vec![
                 Obs {
@@ -2023,61 +2431,56 @@ mod tests {
             span_nominal: 0.1,
             scale_weight: 1e5,
             soft_l1: f64::INFINITY,
-            free: vec![true; 5 + 6 + 6],
+            free: Vec::new(),
         };
-        let (col, n) = model.columns();
-        let (a, g, res, span) = model.normal_equations(&col, n);
-        // With unit weights N = JᵀJ and g = Jᵀr: compare against a
-        // numerical J.
-        let mut jac = vec![vec![0.0; n]; 5];
-        let eps = [
-            1e-3, 1e-4, 1e-4, 1e-6, 1e-6, 1e-7, 1e-7, 1e-7, 1e-6, 1e-6, 1e-6, 1e-7, 1e-7, 1e-7,
-            1e-7, 1e-7, 1e-7,
-        ];
-        // Central differences: the scale residual's second-order term
-        // under its large weight would otherwise show up as a derivative.
-        for i in 0..n {
-            let saved = (
-                model.cams.clone(),
-                model.poses.clone(),
-                model.points.clone(),
-            );
-            let mut delta = vec![0.0; n];
-            delta[i] = eps[i];
-            model.step(&col, &delta);
-            let (res_p, span_p) = model.residuals();
-            (model.cams, model.poses, model.points) = saved.clone();
-            delta[i] = -eps[i];
-            model.step(&col, &delta);
-            let (res_m, span_m) = model.residuals();
-            (model.cams, model.poses, model.points) = saved;
-            for o in 0..2 {
-                jac[2 * o][i] = (res_p[o][0] - res_m[o][0]) / (2.0 * eps[i]);
-                jac[2 * o + 1][i] = (res_p[o][1] - res_m[o][1]) / (2.0 * eps[i]);
-            }
-            jac[4][i] = (span_p - span_m) / (2.0 * eps[i]);
-        }
-        let r_all = [res[0][0], res[0][1], res[1][0], res[1][1], span];
-        for i in 0..n {
-            let g_num: f64 = (0..5).map(|k| jac[k][i] * r_all[k]).sum();
-            let scale = g[i].abs().max(g_num.abs()).max(1.0);
-            assert!(
-                (g[i] - g_num).abs() / scale < 1e-3,
-                "gradient {i}: {} vs {g_num}",
-                g[i]
-            );
-            for j in 0..n {
-                let a_num: f64 = (0..5).map(|k| jac[k][i] * jac[k][j]).sum();
-                let scale = a[i * n + j].abs().max(a_num.abs()).max(1.0);
-                assert!(
-                    (a[i * n + j] - a_num).abs() / scale < 1e-3,
-                    "normal {i},{j}: {} vs {a_num}; numeric column {i}: {:?}, column {j}: {:?}",
-                    a[i * n + j],
-                    (0..5).map(|k| jac[k][i]).collect::<Vec<_>>(),
-                    (0..5).map(|k| jac[k][j]).collect::<Vec<_>>()
-                );
-            }
-        }
+        // The lens's focal length is held (no prior on a held-focus lens).
+        model.free = (0..model.n_params())
+            .map(|i| i != model.lens_focal_at(0))
+            .collect();
+        check_jacobian(&mut model);
+    }
+
+    /// Two autofocus cameras on one lens, with the prior large enough to
+    /// show in every term, and a third camera on a lens of its own.
+    #[test]
+    fn the_analytic_jacobian_matches_with_a_shared_lens_and_its_prior() {
+        let (field, _) = field(11);
+        let mut a = field.intr;
+        a[0] *= 1.01;
+        let mut b = field.intr;
+        b[0] *= 0.99;
+        let ob = |slot, camera, point, uv| Obs {
+            slot,
+            camera,
+            point,
+            uv,
+        };
+        let mut model = Model {
+            cams: vec![a, b, field.intr],
+            lens_of: vec![0, 0, 1],
+            n_lenses: 2,
+            lens_focal: vec![field.intr[0] + 30.0, field.intr[0]],
+            focal_spread: vec![2.0, 0.0],
+            focal_prior: vec![true, true, false],
+            noise_px: 1.0,
+            poses: vec![field.poses[0], field.poses[1], field.poses[2]],
+            points: vec![field.swatches[0].1[0], field.card[5]],
+            obs: vec![
+                ob(0, 0, 0, [100.0, 200.0]),
+                ob(0, 0, 1, [3000.0, 2000.0]),
+                ob(1, 1, 0, [2500.0, 1500.0]),
+                ob(2, 2, 1, [3100.0, 2100.0]),
+            ],
+            spans: vec![(0, 1)],
+            span_nominal: 0.1,
+            scale_weight: 1e5,
+            soft_l1: f64::INFINITY,
+            free: Vec::new(),
+        };
+        model.free = (0..model.n_params())
+            .map(|i| i != model.lens_focal_at(1))
+            .collect();
+        check_jacobian(&mut model);
     }
 
     #[test]
@@ -2417,6 +2820,117 @@ mod tests {
         assert!(
             f_scatter / f_std > 0.4 && f_scatter / f_std < 2.5,
             "f {f_scatter} vs {f_std}"
+        );
+    }
+
+    /// Autofocus stills, a camera each: alone none could self-calibrate,
+    /// as one lens each frame's focal length is solved against the
+    /// principal point and distortion they share.
+    #[test]
+    fn autofocus_frames_share_a_lens_and_keep_their_focal_lengths() {
+        let (field, mut set) = field_with(3, 1003, true, 13800.0);
+        assert_eq!(set.cameras.len(), set.views.len());
+        let report = survey(&mut set, &SurveyOptions::default()).unwrap();
+        for line in &report.log {
+            eprintln!("{line}");
+        }
+        assert!(report.left_out.is_empty(), "{:?}", report.left_out);
+        assert!(report.rms_px < 0.8, "rms {}", report.rms_px);
+        assert!(report.cameras.iter().all(|c| c.lens == 0));
+        let first = &set.cameras[0];
+        let mut errors = Vec::new();
+        for (view, truth) in set.views.iter().zip(&field.focal) {
+            let cam = &set.cameras[view.camera as usize];
+            assert_eq!(
+                (cam.cx, cam.cy, &cam.distortion),
+                (first.cx, first.cy, &first.distortion)
+            );
+            let Some(c) = report
+                .cameras
+                .iter()
+                .find(|c| c.index == view.camera as usize)
+            else {
+                continue;
+            };
+            if c.frames == 0 {
+                continue;
+            }
+            let e = cam.fx - truth;
+            // Each focal length within its own reported uncertainty.
+            assert!(
+                e.abs() < 4.0 * c.f_std + 2.0,
+                "view {}: f {} vs {truth} (std {})",
+                view.id,
+                cam.fx,
+                c.f_std
+            );
+            errors.push(e.abs() / truth);
+        }
+        errors.sort_by(f64::total_cmp);
+        assert!(
+            errors.len() + 4 >= set.views.len(),
+            "{} of {} frames",
+            errors.len(),
+            set.views.len()
+        );
+        // The focal lengths spread over 5 %. Most frames solve theirs to a
+        // few tenths of a percent; one that sees the card square on cannot
+        // tell focal length from distance, and the prior keeps it within
+        // the spread.
+        assert!(
+            errors[errors.len() / 2] < 0.003 && errors[errors.len() - 1] < 0.03,
+            "focal error median {} max {}",
+            errors[errors.len() / 2],
+            errors[errors.len() - 1]
+        );
+        assert!(
+            (first.cx - field.intr[1]).abs() < 20.0 && (first.cy - field.intr[2]).abs() < 20.0,
+            "pp {} {}",
+            first.cx,
+            first.cy
+        );
+        if let Distortion::Radial { k, .. } = &first.distortion {
+            assert!((k[0] - field.intr[3]).abs() < 0.01, "k1 {}", k[0]);
+        } else {
+            panic!("no distortion solved");
+        }
+        assert!(
+            report.card_planarity_mm < 0.05
+                && (report.span_along_mm - report.span_along_nominal_mm).abs() < 0.1,
+            "planarity {} span {}",
+            report.card_planarity_mm,
+            report.span_along_mm
+        );
+    }
+
+    /// The focal length the frames scatter about is the frames', not the
+    /// seed's: autofocus sets seeded 3 % low and 3 % high solve alike.
+    #[test]
+    fn autofocus_focal_lengths_do_not_follow_the_seed() {
+        let solve = |seed_f: f64| {
+            let (_, mut set) = field_with(3, 1003, true, seed_f);
+            let report = survey(&mut set, &SurveyOptions::default()).unwrap();
+            report
+                .cameras
+                .iter()
+                .filter(|c| c.frames > 0)
+                .map(|c| (c.index, c.f, c.f_std))
+                .collect::<Vec<_>>()
+        };
+        let (low, high) = (solve(13780.0), solve(14630.0));
+        let mut diffs = Vec::new();
+        for (c, f, f_std) in &low {
+            if let Some((_, g, _)) = high.iter().find(|(d, _, _)| d == c)
+                && *f_std < 100.0
+            {
+                diffs.push(g - f);
+            }
+        }
+        assert!(diffs.len() > 30, "{} frames", diffs.len());
+        let mean = diffs.iter().sum::<f64>() / diffs.len() as f64;
+        assert!(
+            mean.abs() < 3.0,
+            "the solved focal lengths moved {mean} px with the seed"
         );
     }
 

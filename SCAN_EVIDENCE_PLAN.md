@@ -425,7 +425,7 @@ bundle with an analytic Jacobian, and the intake and export around them.
   (23.5 mm for the a6700; the 35 mm equivalent or `--fov-deg` otherwise),
   principal point at the centre, k1 = k2 = 0. Autofocus frames each get
   their own key.
-- Intake warnings: autofocus frames (cannot share a model), stabilisation
+- Intake warnings: autofocus frames (a camera each), stabilisation
   on (the principal point moves per shot), ISO above a threshold, mixed
   orientations, frames without EXIF. The report lists frames per key.
 
@@ -506,7 +506,10 @@ corner.
 
 ### C3. Survey bundle
 
-- `cv_core::survey`. Unknowns: per camera key f, cx, cy, k1, k2; per view
+- `cv_core::survey`. Unknowns: per camera key f, cx, cy, k1, k2 (since
+  2026-11-11: f per camera, cx, cy, k1, k2 per lens; the autofocus frames
+  of one body, lens and focal length share a lens, with a solved focal
+  length their own scatter about under a 3 % prior); per view
   a rotation vector and translation; per point (card corners, swatch
   corners) a free 3D position. Residuals: reprojection of every
   observation, and one scale residual, the mean of the solved column
