@@ -326,6 +326,7 @@ pub fn build_assembly_preview(
                     mesh: Some(renderer::MeshData {
                         vertices,
                         indices: None,
+                        texture: None,
                     }),
                     points: None,
                     wireframe: Some(wireframe),
@@ -345,6 +346,7 @@ pub fn build_assembly_preview(
                     mesh: Some(renderer::MeshData {
                         vertices: Vec::new(),
                         indices: None,
+                        texture: None,
                     }),
                     points: None,
                     wireframe: None,
@@ -415,6 +417,7 @@ pub fn finish_assembly_preview(
                 mesh: Some(renderer::MeshData {
                     vertices,
                     indices: Some(mesh.indices.clone()),
+                    texture: None,
                 }),
                 points: None,
                 wireframe: Some(wireframe),

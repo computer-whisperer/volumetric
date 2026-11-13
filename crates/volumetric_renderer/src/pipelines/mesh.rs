@@ -1,11 +1,14 @@
 //! The mesh geometry source: retained triangle meshes drawn into the
 //! G-buffer.
 
+use std::sync::Arc;
+
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
 
-use crate::{DynamicBuffer, GBuffer, MaterialId, MeshData, MeshVertex, ObjectId};
+use crate::texture::mip_side;
+use crate::{DynamicBuffer, GBuffer, MaterialId, MeshData, MeshVertex, ObjectId, TextureData};
 
 /// A mesh resident on the GPU: its vertices as given (the transform is
 /// applied per draw), uploaded once and drawn by reference each frame with
@@ -17,6 +20,16 @@ pub struct GpuMesh {
     vertex_buffer: wgpu::Buffer,
     index_buffer: Option<wgpu::Buffer>,
     draw_count: u32,
+    /// The mesh's base-colour map, kept alive for its bind group; `None`
+    /// for an untextured mesh, which binds the pipeline's shared white
+    /// texel.
+    _texture: Option<wgpu::Texture>,
+    /// Bind group 1 of the mesh pass: the texture and its sampler.
+    texture_bind_group: Arc<wgpu::BindGroup>,
+    /// The size the texture was uploaded at when its full size exceeded
+    /// the device's `max_texture_dimension_2d` and the top mip levels
+    /// were dropped; `None` when it fit (or there is no texture).
+    pub texture_downscaled: Option<(u32, u32)>,
     /// Triangles dropped at the device's buffer size limit; 0 when the
     /// whole mesh is resident.
     pub dropped_triangles: usize,
@@ -30,8 +43,16 @@ pub struct GpuMesh {
 impl GpuMesh {
     /// Uploads `data` as given, clamping to the device's `max_buffer_size`
     /// limit (keeping the largest renderable triangle prefix and reporting
-    /// what was dropped).
-    pub fn new(device: &wgpu::Device, data: &MeshData) -> Self {
+    /// what was dropped), and its texture with every mip level, dropping
+    /// top levels past the device's largest texture side. `textures` is
+    /// the mesh pipeline's binding (`MeshPipeline::textures`); the queue
+    /// carries the texture's texels.
+    pub fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        textures: &MeshTextureBinding,
+        data: &MeshData,
+    ) -> Self {
         let mut vertices: Vec<MeshVertex> = data
             .vertices
             .iter()
@@ -44,7 +65,7 @@ impl GpuMesh {
                 } else {
                     normal
                 };
-                MeshVertex::colored(v.position, normal.into(), v.color)
+                MeshVertex::textured(v.position, normal.into(), v.color, v.uv)
             })
             .collect();
         let mut indices = data.indices.clone();
@@ -80,14 +101,178 @@ impl GpuMesh {
             })
         });
 
+        let (texture, texture_bind_group, texture_downscaled) = match &data.texture {
+            Some(texture) => {
+                let (gpu, downscaled) = upload_texture(device, queue, texture);
+                let bind_group = Arc::new(textures.bind(device, &gpu, "retained_mesh_texture_bg"));
+                (Some(gpu), bind_group, downscaled)
+            }
+            None => (None, textures.white(device, queue), None),
+        };
+
         Self {
             vertex_buffer,
             index_buffer,
             draw_count,
+            _texture: texture,
+            texture_bind_group,
+            texture_downscaled,
             dropped_triangles,
             total_triangles,
             bounds,
         }
+    }
+}
+
+/// Uploads `texture` as an sRGB RGBA8 texture with its mip chain, so
+/// sampling it returns linear light. When level 0 exceeds the device's
+/// largest texture side the top levels are dropped until it fits; the
+/// size uploaded is returned alongside in that case.
+fn upload_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    texture: &TextureData,
+) -> (wgpu::Texture, Option<(u32, u32)>) {
+    let max_side = device.limits().max_texture_dimension_2d;
+    let (mut width, mut height) = (texture.width, texture.height);
+    let mut first = 0;
+    while (width > max_side || height > max_side) && first + 1 < texture.levels.len() {
+        (width, height) = (mip_side(width), mip_side(height));
+        first += 1;
+    }
+    let downscaled = (first > 0).then_some((width, height));
+    let levels = &texture.levels[first..];
+
+    let gpu = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("retained_mesh_texture"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: levels.len() as u32,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let (mut w, mut h) = (width, height);
+    for (level, bytes) in levels.iter().enumerate() {
+        debug_assert_eq!(bytes.len(), (w * h * 4) as usize, "mip {level} of {w}x{h}");
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &gpu,
+                mip_level: level as u32,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytes,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(w * 4),
+                rows_per_image: Some(h),
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        (w, h) = (mip_side(w), mip_side(h));
+    }
+    (gpu, downscaled)
+}
+
+/// What the mesh pass binds at group 1: a mesh's texture and the shared
+/// sampler, and the white texel every untextured mesh binds instead.
+pub struct MeshTextureBinding {
+    layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    /// A 1×1 white texel and its bind group: sampling it leaves the
+    /// vertex colour alone. Made on first use, since uploading it takes
+    /// the queue the pipeline is built without.
+    white: std::sync::OnceLock<(wgpu::Texture, Arc<wgpu::BindGroup>)>,
+}
+
+impl MeshTextureBinding {
+    fn new(device: &wgpu::Device) -> Self {
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("mesh_texture_bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        // Trilinear, repeating (UVs outside [0, 1] wrap), anisotropic on
+        // native where a photographic atlas seen at a slant blurs
+        // otherwise; WebGL2 has no anisotropy without an extension.
+        #[cfg(not(target_arch = "wasm32"))]
+        let anisotropy_clamp = 8;
+        #[cfg(target_arch = "wasm32")]
+        let anisotropy_clamp = 1;
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("mesh_texture_sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            anisotropy_clamp,
+            ..Default::default()
+        });
+        Self {
+            layout,
+            sampler,
+            white: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The bind group of the shared white texel.
+    fn white(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Arc<wgpu::BindGroup> {
+        self.white
+            .get_or_init(|| {
+                let (texture, _) =
+                    upload_texture(device, queue, &TextureData::from_rgba8(1, 1, vec![255; 4]));
+                let bind_group = self.bind(device, &texture, "mesh_texture_white_bg");
+                (texture, Arc::new(bind_group))
+            })
+            .1
+            .clone()
+    }
+
+    /// A group-1 bind group sampling `texture` with the shared sampler.
+    fn bind(&self, device: &wgpu::Device, texture: &wgpu::Texture, label: &str) -> wgpu::BindGroup {
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        })
     }
 }
 
@@ -154,6 +339,8 @@ pub struct MeshPipeline {
     pipeline: wgpu::RenderPipeline,
     uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    /// Group 1: each mesh's texture, or the shared white texel.
+    textures: MeshTextureBinding,
     /// One entry per mesh drawn this frame, in draw order.
     instance_buffer: DynamicBuffer<DrawInstance>,
 }
@@ -180,9 +367,10 @@ impl MeshPipeline {
                 count: None,
             }],
         });
+        let textures = MeshTextureBinding::new(device);
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("mesh_gbuffer_pipeline_layout"),
-            bind_group_layouts: &[Some(&bind_group_layout)],
+            bind_group_layouts: &[Some(&bind_group_layout), Some(&textures.layout)],
             immediate_size: 0,
         });
 
@@ -220,6 +408,11 @@ impl MeshPipeline {
                                 format: wgpu::VertexFormat::Float32x4,
                                 offset: std::mem::offset_of!(MeshVertex, color) as u64,
                                 shader_location: 2,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x2,
+                                offset: std::mem::offset_of!(MeshVertex, uv) as u64,
+                                shader_location: 8,
                             },
                         ],
                     }),
@@ -306,11 +499,23 @@ impl MeshPipeline {
             pipeline,
             uniform_buffer,
             bind_group,
+            textures,
             instance_buffer: DynamicBuffer::new(
                 wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 "mesh_instance_buffer",
             ),
         }
+    }
+
+    /// Uploads a mesh as a GPU resident bound to this pipeline's texture
+    /// layout; see [`GpuMesh::new`].
+    pub fn create_retained(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        data: &MeshData,
+    ) -> GpuMesh {
+        GpuMesh::new(device, queue, &self.textures, data)
     }
 
     /// Uploads the frame's camera and one instance per draw. Call before
@@ -353,6 +558,7 @@ impl MeshPipeline {
                 continue;
             }
             let start = i as u64 * stride;
+            render_pass.set_bind_group(1, &*mesh.texture_bind_group, &[]);
             render_pass.set_vertex_buffer(1, instances.slice(start..start + stride));
             render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
             match &mesh.index_buffer {
@@ -372,6 +578,24 @@ mod tests {
 
     fn verts(n: usize) -> Vec<MeshVertex> {
         vec![MeshVertex::new([0.0; 3], [0.0, 1.0, 0.0]); n]
+    }
+
+    /// The vertex is 64 bytes with its attributes where the vertex buffer
+    /// layout says: position at 0, normal at 16, colour at 32, uv at 48.
+    #[test]
+    fn the_vertex_layout_matches_the_struct() {
+        assert_eq!(std::mem::size_of::<MeshVertex>(), 64);
+        assert_eq!(std::mem::offset_of!(MeshVertex, position), 0);
+        assert_eq!(std::mem::offset_of!(MeshVertex, normal), 16);
+        assert_eq!(std::mem::offset_of!(MeshVertex, color), 32);
+        assert_eq!(std::mem::offset_of!(MeshVertex, uv), 48);
+        let v = MeshVertex::textured([1.0, 2.0, 3.0], [0.0, 0.0, 1.0], [0.5; 4], [0.25, 0.75]);
+        let words: &[f32] = bytemuck::cast_slice(bytemuck::bytes_of(&v));
+        assert_eq!(&words[0..3], &[1.0, 2.0, 3.0]);
+        assert_eq!(&words[4..7], &[0.0, 0.0, 1.0]);
+        assert_eq!(&words[8..12], &[0.5; 4]);
+        assert_eq!(&words[12..14], &[0.25, 0.75]);
+        assert_eq!(MeshVertex::new([0.0; 3], [0.0; 3]).uv, [0.0; 2]);
     }
 
     /// Meshes within both budgets pass through untouched.

@@ -81,6 +81,7 @@ fn box_mesh() -> Vec<u8> {
         indices,
         vertex_fields: vec![],
         face_fields: vec![],
+        textures: vec![],
     })
 }
 
@@ -188,6 +189,7 @@ fn empty_mesh_is_rejected() {
         indices: vec![],
         vertex_fields: vec![],
         face_fields: vec![],
+        textures: vec![],
     });
     let err = run_operator("mesh_height_operator", vec![empty, Vec::new()])
         .expect_err("empty mesh must fail");

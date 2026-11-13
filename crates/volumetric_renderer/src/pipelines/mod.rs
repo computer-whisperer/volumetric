@@ -17,7 +17,7 @@ pub(crate) use fullscreen::{
 pub(crate) use gizmo::GizmoPipeline;
 pub(crate) use grid::GridPipeline;
 pub use line::{GpuLines, LinePipeline};
-pub use mesh::{GpuMesh, MeshDraw, MeshPipeline};
+pub use mesh::{GpuMesh, MeshDraw, MeshPipeline, MeshTextureBinding};
 pub use point::{GpuPointInstance, GpuPoints, PointPipeline};
 pub use splat::{GpuSplat, SplatCompositePipeline, SplatPipeline, evaluate_sh, project_covariance};
 pub use surfel::{GpuSurfels, SurfelDraw, SurfelPipeline};

@@ -7,6 +7,14 @@ struct Uniforms {
 @group(0) @binding(0)
 var<uniform> uniforms: Uniforms;
 
+// The mesh's base-colour map (sRGB-encoded storage, so a sample is
+// linear) and its repeating trilinear sampler; a 1x1 white texel for an
+// untextured mesh.
+@group(1) @binding(0)
+var base_color: texture_2d<f32>;
+@group(1) @binding(1)
+var base_sampler: sampler;
+
 struct VsIn {
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
@@ -19,6 +27,8 @@ struct VsIn {
     @location(5) model_2: vec4<f32>,
     @location(6) model_3: vec4<f32>,
     @location(7) ids: vec2<u32>,
+    // Image-convention texture coordinate: (0, 0) the top-left texel.
+    @location(8) uv: vec2<f32>,
 };
 
 struct VsOut {
@@ -26,6 +36,7 @@ struct VsOut {
     @location(0) normal_world: vec3<f32>,
     @location(1) color: vec4<f32>,
     @location(2) @interpolate(flat) ids: vec2<u32>,
+    @location(3) uv: vec2<f32>,
 };
 
 @vertex
@@ -36,6 +47,7 @@ fn vs_main(in: VsIn) -> VsOut {
     out.normal_world = mat3x3<f32>(model[0].xyz, model[1].xyz, model[2].xyz) * in.normal;
     out.color = in.color;
     out.ids = in.ids;
+    out.uv = in.uv;
     return out;
 }
 
@@ -56,9 +68,12 @@ fn fs_gbuffer(in: VsOut) -> FsOut {
     let n_len = length(in.normal_world);
     let n = select(vec3<f32>(0.0, 0.0, 1.0), in.normal_world / n_len, n_len > 1e-8);
 
+    // Vertex colour times the texture, both linear.
+    let base = in.color.rgb * textureSample(base_color, base_sampler, in.uv).rgb;
+
     var out: FsOut;
     out.albedo = vec4<f32>(
-        sqrt(clamp(in.color.rgb, vec3<f32>(0.0), vec3<f32>(1.0))),
+        sqrt(clamp(base, vec3<f32>(0.0), vec3<f32>(1.0))),
         f32(in.ids.y) / 255.0,
     );
     out.normal = vec4<f32>(n * 0.5 + vec3<f32>(0.5), 1.0);

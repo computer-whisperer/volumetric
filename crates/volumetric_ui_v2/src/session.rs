@@ -1153,7 +1153,7 @@ impl ViewportRenderer {
         self.scale_factor = scale_factor;
 
         self.renderer.set_viewport_size(device, w, h);
-        self.submit_scene(device, &preview_requests);
+        self.submit_scene(device, queue, &preview_requests);
         let (view, focus_depth) = match &look_through {
             Some(look) => {
                 submit_view_highlight(&mut self.renderer, &look.frustum);
@@ -1645,11 +1645,12 @@ impl ViewportRenderer {
         renderer: &renderer::Renderer,
         part_meshes: &mut HashMap<[u8; 32], Arc<renderer::GpuMesh>>,
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         entity: &PreviewEntity,
     ) -> (renderer::RetainedScene, Vec<[u8; 32]>) {
         if entity.mesh_keys.iter().all(Option::is_none) {
             return (
-                renderer.create_retained_scene(device, &entity.scene),
+                renderer.create_retained_scene(device, queue, &entity.scene),
                 Vec::new(),
             );
         }
@@ -1659,7 +1660,7 @@ impl ViewportRenderer {
             points: entity.scene.points.clone(),
             splats: entity.scene.splats.clone(),
         };
-        let mut scene = renderer.create_retained_scene(device, &rest);
+        let mut scene = renderer.create_retained_scene(device, queue, &rest);
         let mut part_keys = Vec::new();
         for (i, (mesh, transform, _)) in entity.scene.meshes.iter().enumerate() {
             let key = entity.mesh_keys.get(i).copied().flatten();
@@ -1669,13 +1670,13 @@ impl ViewportRenderer {
                     match part_meshes.get(&key) {
                         Some(gpu) => gpu.clone(),
                         None => {
-                            let gpu = renderer.create_retained_mesh(device, mesh);
+                            let gpu = renderer.create_retained_mesh(device, queue, mesh);
                             part_meshes.insert(key, gpu.clone());
                             gpu
                         }
                     }
                 }
-                None => renderer.create_retained_mesh(device, mesh),
+                None => renderer.create_retained_mesh(device, queue, mesh),
             };
             scene.meshes.push((gpu, *transform));
         }
@@ -1689,15 +1690,23 @@ impl ViewportRenderer {
     /// bounds are framed when the output set changes or a Frame command is
     /// pending, otherwise the user's view is left alone. When nothing is
     /// cached yet the placeholder test scene is drawn.
-    fn submit_scene(&mut self, device: &wgpu::Device, requests: &[PreviewRequest]) {
+    fn submit_scene(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        requests: &[PreviewRequest],
+    ) {
         let visible = self.preview_cache.visible(requests);
         if visible.is_empty() {
             self.resident.clear();
             // Nothing materialized yet: keep the placeholder scene, don't
             // disturb the camera the user may already have moved.
             let scene = self.placeholder.get_or_insert_with(|| {
-                self.renderer
-                    .create_retained_scene(device, &renderer::test_scenes::create_test_scene())
+                self.renderer.create_retained_scene(
+                    device,
+                    queue,
+                    &renderer::test_scenes::create_test_scene(),
+                )
             });
             for (mesh, transform) in &scene.meshes {
                 self.renderer.submit_retained_mesh(
@@ -1767,8 +1776,13 @@ impl ViewportRenderer {
                 .get(id)
                 .is_none_or(|resident| resident.revision != revision)
             {
-                let (scene, part_keys) =
-                    Self::retained_scene_for(&self.renderer, &mut self.part_meshes, device, entity);
+                let (scene, part_keys) = Self::retained_scene_for(
+                    &self.renderer,
+                    &mut self.part_meshes,
+                    device,
+                    queue,
+                    entity,
+                );
                 self.resident.insert(
                     id.to_string(),
                     ResidentEntity {
@@ -3894,6 +3908,7 @@ mod tests {
                 data: vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
             }],
             face_fields: vec![],
+            textures: vec![],
         };
         let data = volumetric::trimesh::encode_tri_mesh(&mesh);
         let mut request = colored_cloud_request(None);
@@ -4311,6 +4326,7 @@ function get_bounds_max_y() return 1.5 end
             indices: vec![0, 1, 2],
             vertex_fields: vec![],
             face_fields: vec![],
+            textures: vec![],
         };
         let exported = tri_mesh_triangles(&tri);
         assert_eq!(exported.len(), 1, "one face per triangle");
@@ -4877,6 +4893,7 @@ mod pick_tests {
         renderer::MeshData {
             vertices: vec![v(-1.0, -1.0), v(1.0, -1.0), v(0.0, 1.0)],
             indices: None,
+            texture: None,
         }
     }
 

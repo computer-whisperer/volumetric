@@ -45,6 +45,7 @@ fn quad(centre: Vec3, u: Vec3, v: Vec3, color: [f32; 4]) -> MeshData {
             vertex(centre - u + v),
         ],
         indices: Some(vec![0, 1, 2, 0, 2, 3]),
+        texture: None,
     }
 }
 
@@ -129,6 +130,7 @@ fn a_lit_surface_resolves_to_the_lighting_models_value() {
         let grey = [0.25, 0.25, 0.25, 1.0];
         let mesh = renderer.create_retained_mesh(
             offscreen.device(),
+            offscreen.queue(),
             &quad(Vec3::ZERO, Vec3::X, Vec3::Y, grey),
         );
         renderer.submit_retained_mesh(&mesh, Mat4::IDENTITY, ObjectId(1), MaterialId(0));
@@ -145,6 +147,86 @@ fn a_lit_surface_resolves_to_the_lighting_models_value() {
     });
 }
 
+/// A textured quad shows its texture: a 2×2 checker of red, green, blue
+/// and white lands one colour per quadrant, with the image's top row at
+/// the top of the frame (uv (0, 0) is the image's top-left texel).
+#[test]
+fn a_textured_quad_shows_its_texture_the_right_way_up() {
+    on_each_backend(|offscreen| {
+        let mut renderer = offscreen.renderer(W, H);
+        let texture = crate::TextureData::from_rgba8(
+            2,
+            2,
+            vec![
+                255, 0, 0, 255, 0, 255, 0, 255, //
+                0, 0, 255, 255, 255, 255, 255, 255,
+            ],
+        );
+        let normal = [0.0, 0.0, 1.0];
+        let vertex =
+            |x: f32, y: f32, uv: [f32; 2]| MeshVertex::textured([x, y, 0.0], normal, [1.0; 4], uv);
+        let mesh = renderer.create_retained_mesh(
+            offscreen.device(),
+            offscreen.queue(),
+            &MeshData {
+                vertices: vec![
+                    vertex(-1.0, -1.0, [0.0, 1.0]),
+                    vertex(1.0, -1.0, [1.0, 1.0]),
+                    vertex(1.0, 1.0, [1.0, 0.0]),
+                    vertex(-1.0, 1.0, [0.0, 0.0]),
+                ],
+                indices: Some(vec![0, 1, 2, 0, 2, 3]),
+                texture: Some(std::sync::Arc::new(texture)),
+            },
+        );
+        assert_eq!(mesh.texture_downscaled, None);
+        renderer.submit_retained_mesh(&mesh, Mat4::IDENTITY, ObjectId(1), MaterialId(0));
+        let (rgba, info) = offscreen
+            .render_rgba(&mut renderer, &view(), &settings(false))
+            .unwrap();
+        assert_eq!(info.overflow, None);
+
+        let view = view();
+        let sample = |x: f32, y: f32| {
+            let (px, py) = at(&view, Vec3::new(x, y, 0.0));
+            pixel(&rgba, px, py)
+        };
+        let top_left = sample(-0.5, 0.5);
+        let top_right = sample(0.5, 0.5);
+        let bottom_left = sample(-0.5, -0.5);
+        let bottom_right = sample(0.5, -0.5);
+        assert!(
+            top_left[0] > top_left[1] + 60 && top_left[0] > top_left[2] + 60,
+            "top-left red: {top_left:?}"
+        );
+        assert!(
+            top_right[1] > top_right[0] + 60 && top_right[1] > top_right[2] + 60,
+            "top-right green: {top_right:?}"
+        );
+        assert!(
+            bottom_left[2] > bottom_left[0] + 60 && bottom_left[2] > bottom_left[1] + 60,
+            "bottom-left blue: {bottom_left:?}"
+        );
+        // The white quadrant is what the same quad draws untextured: the
+        // white texel and the shared white binding light the same.
+        let plain = renderer.create_retained_mesh(
+            offscreen.device(),
+            offscreen.queue(),
+            &quad(Vec3::ZERO, Vec3::X, Vec3::Y, [1.0; 4]),
+        );
+        renderer.submit_retained_mesh(&plain, Mat4::IDENTITY, ObjectId(1), MaterialId(0));
+        let (untextured, _) = offscreen
+            .render_rgba(&mut renderer, &view, &settings(false))
+            .unwrap();
+        let (px, py) = at(&view, Vec3::new(0.5, -0.5, 0.0));
+        let expected = pixel(&untextured, px, py);
+        assert!(
+            (0..3).all(|c| (bottom_right[c] as i32 - expected[c] as i32).abs() <= 2),
+            "bottom-right white: {bottom_right:?} vs untextured {expected:?}"
+        );
+    });
+}
+
 /// A pick reports the nearest mesh's object id and the world point on
 /// its surface; over background it reports neither.
 #[test]
@@ -155,10 +237,12 @@ fn a_pick_reports_the_object_and_world_point_under_a_pixel() {
         // A wide quad at z = -0.5 with a small one in front at z = 0.3.
         let far = renderer.create_retained_mesh(
             offscreen.device(),
+            offscreen.queue(),
             &quad(Vec3::ZERO, Vec3::X * 0.8, Vec3::Y * 0.8, white),
         );
         let near = renderer.create_retained_mesh(
             offscreen.device(),
+            offscreen.queue(),
             &quad(Vec3::ZERO, Vec3::X * 0.2, Vec3::Y * 0.2, white),
         );
         assert_eq!(
@@ -276,6 +360,7 @@ fn meshes_occlude_depth_tested_lines_but_not_overlays() {
         let mut renderer = offscreen.renderer(W, H);
         let mesh = renderer.create_retained_mesh(
             offscreen.device(),
+            offscreen.queue(),
             &quad(Vec3::ZERO, Vec3::X * 0.5, Vec3::Y * 0.5, [1.0; 4]),
         );
         let red = [1.0, 0.0, 0.0, 1.0];
@@ -312,11 +397,13 @@ fn ambient_occlusion_darkens_the_foot_of_a_wall() {
         let white = [1.0; 4];
         let floor = renderer.create_retained_mesh(
             offscreen.device(),
+            offscreen.queue(),
             &quad(Vec3::ZERO, Vec3::X, Vec3::Y, white),
         );
         // A wall along x = 0, facing -X, standing 1 m off the floor.
         let wall = renderer.create_retained_mesh(
             offscreen.device(),
+            offscreen.queue(),
             &quad(Vec3::new(0.0, 0.0, 0.5), Vec3::Z * 0.5, Vec3::Y, white),
         );
         // From the wall's facing side, 45 degrees up: the wall's foot is
@@ -385,8 +472,11 @@ fn the_lights_turn_with_the_view() {
             let toward = eye.normalize();
             let u = up.cross(toward).normalize() * 0.5;
             let v = toward.cross(u);
-            let mesh =
-                renderer.create_retained_mesh(offscreen.device(), &quad(Vec3::ZERO, u, v, grey));
+            let mesh = renderer.create_retained_mesh(
+                offscreen.device(),
+                offscreen.queue(),
+                &quad(Vec3::ZERO, u, v, grey),
+            );
             renderer.submit_retained_mesh(&mesh, Mat4::IDENTITY, ObjectId(1), MaterialId(0));
             let view =
                 CameraView::look_at(eye, Vec3::ZERO, up, 0.8, W as f32 / H as f32, 0.1, 10.0);
@@ -420,6 +510,7 @@ fn a_material_sets_the_highlight() {
         let v = normal.cross(u);
         let mesh = renderer.create_retained_mesh(
             offscreen.device(),
+            offscreen.queue(),
             &quad(Vec3::ZERO, u, v, [0.25, 0.25, 0.25, 1.0]),
         );
         settings.materials = vec![
@@ -458,11 +549,13 @@ fn edge_lines_mark_silhouettes_creases_and_object_boundaries() {
         let mut renderer = offscreen.renderer(W, H);
         let white = [1.0; 4];
         let device = offscreen.device();
+        let queue = offscreen.queue();
         // Seen from above: a floor square with a ridge along x = 0 (two
         // faces meeting at 90 degrees), and a second object lying flush
         // in the floor's plane beside it.
         let left = renderer.create_retained_mesh(
             device,
+            queue,
             &quad(
                 Vec3::new(-0.3, 0.0, -0.3),
                 Vec3::new(0.3, 0.0, 0.3),
@@ -472,6 +565,7 @@ fn edge_lines_mark_silhouettes_creases_and_object_boundaries() {
         );
         let right = renderer.create_retained_mesh(
             device,
+            queue,
             &quad(
                 Vec3::new(0.3, 0.0, -0.3),
                 Vec3::new(0.3, 0.0, -0.3),
@@ -481,6 +575,7 @@ fn edge_lines_mark_silhouettes_creases_and_object_boundaries() {
         );
         let flush = renderer.create_retained_mesh(
             device,
+            queue,
             &quad(
                 Vec3::new(0.8, 0.0, -0.6),
                 Vec3::X * 0.2,
@@ -535,10 +630,12 @@ fn ambient_occlusion_is_the_same_at_any_scale() {
         let mut frame = |scale: f32| {
             let floor = renderer.create_retained_mesh(
                 offscreen.device(),
+                offscreen.queue(),
                 &quad(Vec3::ZERO, Vec3::X * scale, Vec3::Y * scale, white),
             );
             let wall = renderer.create_retained_mesh(
                 offscreen.device(),
+                offscreen.queue(),
                 &quad(
                     Vec3::new(0.0, 0.0, 0.5) * scale,
                     Vec3::Z * 0.5 * scale,
@@ -650,6 +747,7 @@ fn geometry_occludes_the_grid() {
         for z in [0.3, 0.0] {
             let mesh = renderer.create_retained_mesh(
                 offscreen.device(),
+                offscreen.queue(),
                 &quad(Vec3::new(0.0, 0.0, z), Vec3::X * 0.4, Vec3::Y * 0.4, white),
             );
             let frame = |renderer: &mut Renderer, settings: &RenderSettings| {
@@ -830,6 +928,7 @@ fn antialiasing_smooths_silhouettes_only() {
         let mut renderer = offscreen.renderer(W, H);
         let mesh = renderer.create_retained_mesh(
             offscreen.device(),
+            offscreen.queue(),
             &quad(
                 Vec3::ZERO,
                 Vec3::new(0.6, 0.15, 0.0),
@@ -897,7 +996,8 @@ fn a_supersampled_frame_is_the_same_picture_smoother() {
         );
         let frame = |factor: u32| {
             let mut renderer = offscreen.renderer(W * factor, H * factor);
-            let mesh = renderer.create_retained_mesh(offscreen.device(), &mesh_data);
+            let mesh =
+                renderer.create_retained_mesh(offscreen.device(), offscreen.queue(), &mesh_data);
             renderer.submit_retained_mesh(&mesh, Mat4::IDENTITY, ObjectId(1), MaterialId(0));
             renderer.submit_lines(
                 &line(-0.5, 0.2, [1.0, 0.0, 0.0, 1.0]),
@@ -978,6 +1078,7 @@ fn sphere(centre: Vec3, radius: f32) -> MeshData {
     MeshData {
         vertices,
         indices: Some(indices),
+        texture: None,
     }
 }
 
@@ -1019,7 +1120,7 @@ fn surfel_discs_draw_like_the_surface_they_sample() {
         for vertex in &mut tinted.vertices {
             vertex.color = tint;
         }
-        let mesh = renderer.create_retained_mesh(offscreen.device(), &tinted);
+        let mesh = renderer.create_retained_mesh(offscreen.device(), offscreen.queue(), &tinted);
         renderer.submit_retained_mesh(
             &mesh,
             Mat4::from_translation(offset),
@@ -1125,8 +1226,11 @@ fn dump_the_test_scene() {
     .unwrap();
     let (w, h) = (960u32, 640u32);
     let mut renderer = offscreen.renderer(w, h);
-    let scene = renderer
-        .create_retained_scene(offscreen.device(), &crate::test_scenes::create_test_scene());
+    let scene = renderer.create_retained_scene(
+        offscreen.device(),
+        offscreen.queue(),
+        &crate::test_scenes::create_test_scene(),
+    );
     for (mesh, transform) in &scene.meshes {
         renderer.submit_retained_mesh(mesh, *transform, ObjectId(1), MaterialId(0));
     }
@@ -1150,7 +1254,7 @@ fn dump_the_test_scene() {
         .into_iter()
         .map(|(mesh, transform)| {
             (
-                renderer.create_retained_mesh(offscreen.device(), &mesh),
+                renderer.create_retained_mesh(offscreen.device(), offscreen.queue(), &mesh),
                 transform,
             )
         })
