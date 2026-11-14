@@ -500,7 +500,7 @@ fn role_name(role: PickRole) -> &'static str {
 }
 
 /// A camera's intrinsics.
-#[pyclass(module = "volumetric", skip_from_py_object)]
+#[pyclass(module = "volumetric")]
 #[derive(Clone)]
 pub struct Camera {
     pub(crate) inner: CameraModel,
