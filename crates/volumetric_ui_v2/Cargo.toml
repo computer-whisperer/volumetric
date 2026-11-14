@@ -34,8 +34,8 @@ glam = "0.34"
 # Thumbnails and the look-through photograph: decoding the JPEG/PNG bytes a
 # view set embeds.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-rfd = "0.17"
-sha2 = "0.10"
+rfd = "0.18"
+sha2 = "0.11"
 volumetric = { path = "../../", default-features = false }
 volumetric_assets = { path = "../volumetric_assets" }
 volumetric_preview = { path = "../volumetric_preview", default-features = false }
@@ -75,8 +75,8 @@ arboard = { version = "3", features = ["wayland-data-control"] }
 # its own host, so the stock host's features (AccessKit adapter, Wayland
 # colour management, bundled fonts) stay off.
 damascene-winit-wgpu = { version = "0.9.0", default-features = false }
-dirs = "6"
-pollster = "0.4"
+dirs = "7"
+pollster = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # The daemon client is ureq (blocking TCP) — native only. The wasm build

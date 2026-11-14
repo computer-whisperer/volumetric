@@ -24,12 +24,18 @@ impl DaemonClient {
     /// `base_url` like `http://buildbox:7373` (scheme required, no trailing
     /// slash needed).
     pub fn new(base_url: &str) -> Self {
-        let agent = ureq::AgentBuilder::new()
-            // Covers connection setup; reads get their own generous timeout
-            // since a long-poll intentionally idles and results can be large.
-            .timeout_connect(Duration::from_secs(10))
-            .timeout_read(Duration::from_secs(120))
-            .build();
+        let agent = ureq::Agent::config_builder()
+            .timeout_connect(Some(Duration::from_secs(10)))
+            // A long-poll intentionally idles server-side before the
+            // response headers; results can be large, so the body gets a
+            // budget of its own.
+            .timeout_recv_response(Some(Duration::from_secs(120)))
+            .timeout_recv_body(Some(Duration::from_secs(600)))
+            // Error statuses come back as responses, so their bodies (the
+            // daemon's message) can be read.
+            .http_status_as_error(false)
+            .build()
+            .into();
         Self {
             base: base_url.trim_end_matches('/').to_string(),
             agent,
@@ -66,10 +72,10 @@ impl DaemonClient {
         let response = self
             .agent
             .post(&format!("{}/v1/jobs/{job_id}/cancel", self.base))
-            .call()
-            .map_err(map_ureq_error)?;
+            .send_empty()
+            .map_err(transport_error)?;
         // Drain so the connection is reusable.
-        let _ = response.into_reader().read_to_end(&mut Vec::new());
+        read_body(check_status(response)?)?;
         Ok(())
     }
 
@@ -114,7 +120,7 @@ impl DaemonClient {
     }
 
     fn get<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T, ClientError> {
-        let response = self.agent.get(url).call().map_err(map_ureq_error)?;
+        let response = self.agent.get(url).call().map_err(transport_error)?;
         decode_body(response)
     }
 
@@ -126,30 +132,49 @@ impl DaemonClient {
         let response = self
             .agent
             .post(url)
-            .set("Content-Type", "application/cbor")
-            .send_bytes(&body)
-            .map_err(map_ureq_error)?;
+            .content_type("application/cbor")
+            .send(&body[..])
+            .map_err(transport_error)?;
         decode_body(response)
     }
 }
 
-fn decode_body<T: serde::de::DeserializeOwned>(response: ureq::Response) -> Result<T, ClientError> {
-    let mut bytes = Vec::new();
-    response
-        .into_reader()
-        .read_to_end(&mut bytes)
-        .map_err(|e| ClientError::Transport(e.to_string()))?;
+type Response = ureq::http::Response<ureq::Body>;
+
+fn decode_body<T: serde::de::DeserializeOwned>(response: Response) -> Result<T, ClientError> {
+    let bytes = read_body(check_status(response)?)?;
     from_cbor(&bytes).map_err(ClientError::Decode)
 }
 
-fn map_ureq_error(error: ureq::Error) -> ClientError {
-    match error {
-        ureq::Error::Status(status, response) => {
-            let message = response
-                .into_string()
-                .unwrap_or_else(|_| "<unreadable error body>".to_string());
-            ClientError::Api { status, message }
-        }
-        ureq::Error::Transport(t) => ClientError::Transport(t.to_string()),
+/// The whole body. Unlimited, unlike ureq's `read_to_vec` (10 MB): build
+/// results are routinely larger.
+fn read_body(response: Response) -> Result<Vec<u8>, ClientError> {
+    let mut bytes = Vec::new();
+    response
+        .into_body()
+        .into_reader()
+        .read_to_end(&mut bytes)
+        .map_err(|e| ClientError::Transport(e.to_string()))?;
+    Ok(bytes)
+}
+
+/// A non-2xx response as [`ClientError::Api`], carrying the daemon's
+/// message from the body.
+fn check_status(response: Response) -> Result<Response, ClientError> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
     }
+    let message = read_body(response)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .unwrap_or_else(|| "<unreadable error body>".to_string());
+    Err(ClientError::Api {
+        status: status.as_u16(),
+        message,
+    })
+}
+
+fn transport_error(error: ureq::Error) -> ClientError {
+    ClientError::Transport(error.to_string())
 }

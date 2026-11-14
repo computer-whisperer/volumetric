@@ -659,10 +659,11 @@ fn extract_call_args_from_suffixes(
     for suffix in suffixes.iter() {
         if let Suffix::Call(call_suffix) = suffix {
             match call_suffix {
-                Call::AnonymousCall(FunctionArgs::Parentheses { arguments, .. }) => {
-                    return arguments.iter().map(ast_expr_to_ir).collect();
+                Call::AnonymousCall(args) => {
+                    if let FunctionArgs::Parentheses { arguments, .. } = args.as_ref() {
+                        return arguments.iter().map(ast_expr_to_ir).collect();
+                    }
                 }
-                Call::AnonymousCall(_) => {}
                 Call::MethodCall(_) => {
                     return Err(CompileError::Unsupported(
                         "method call syntax not supported".into(),

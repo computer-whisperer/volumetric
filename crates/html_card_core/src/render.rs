@@ -104,32 +104,14 @@ pub fn render(
             width: AvailableSpace::Definite(width_px as f32),
             height: AvailableSpace::MaxContent,
         },
-        |known, available, _node, ctx, _style| {
-            let Some(paragraph) = ctx else {
-                return Size::ZERO;
-            };
-            if paragraph.tokens.is_empty() {
-                return Size::ZERO;
-            }
-            let avail = known.width.map(f64::from).unwrap_or(match available.width {
-                AvailableSpace::Definite(w) => w as f64,
-                AvailableSpace::MinContent => {
-                    return {
-                        let w = min_content_width(paragraph);
-                        let (_, h) = text::measure(paragraph, w);
-                        Size {
-                            width: w as f32,
-                            height: h as f32,
-                        }
-                    };
-                }
-                AvailableSpace::MaxContent => f64::INFINITY,
-            });
-            let (w, h) = text::measure(paragraph, avail);
-            Size {
-                width: w as f32,
-                height: h as f32,
-            }
+        |inputs, _node, ctx, style| {
+            let paragraph = ctx.as_deref();
+            taffy::compute_leaf_layout(
+                inputs,
+                style,
+                |_, _| 0.0,
+                |known, available| measure_paragraph(paragraph, known, available),
+            )
         },
     )
     .map_err(|e| format!("layout failed: {e}"))?;
@@ -314,6 +296,35 @@ fn collect_runs<'a>(
                 ));
             }
         }
+    }
+}
+
+/// Taffy's leaf measure for a paragraph: its laid-out size within the
+/// known or available width.
+fn measure_paragraph(
+    paragraph: Option<&Paragraph>,
+    known: Size<Option<f32>>,
+    available: Size<AvailableSpace>,
+) -> Size<f32> {
+    let Some(paragraph) = paragraph else {
+        return Size::ZERO;
+    };
+    if paragraph.tokens.is_empty() {
+        return Size::ZERO;
+    }
+    let (w, h) = match (known.width, available.width) {
+        (Some(w), _) | (None, AvailableSpace::Definite(w)) => text::measure(paragraph, w.into()),
+        // As wide as the widest unbreakable run, and as tall as the
+        // paragraph wraps at that width.
+        (None, AvailableSpace::MinContent) => {
+            let w = min_content_width(paragraph);
+            (w, text::measure(paragraph, w).1)
+        }
+        (None, AvailableSpace::MaxContent) => text::measure(paragraph, f64::INFINITY),
+    };
+    Size {
+        width: w as f32,
+        height: h as f32,
     }
 }
 

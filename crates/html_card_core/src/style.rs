@@ -187,7 +187,7 @@ fn parse_arbitrary_px(value: &str) -> Option<f64> {
 
 /// Width/height-style token → taffy dimension (`24`, `full`, `1/2`,
 /// `[120px]`, `auto`).
-fn parse_dimension(token: &str) -> Option<Dimension> {
+fn parse_dimension<D: FromLength + FromPercent + TaffyAuto>(token: &str) -> Option<D> {
     match token {
         "full" => return Some(percent(1.0_f32)),
         "auto" => return Some(auto()),
@@ -520,17 +520,17 @@ fn resolve_layout_class(
         "grow-0" => style.flex_grow = 0.0,
         "shrink" => style.flex_shrink = 1.0,
         "shrink-0" => style.flex_shrink = 0.0,
-        "items-start" => style.align_items = Some(AlignItems::FLEX_START),
-        "items-center" => style.align_items = Some(AlignItems::CENTER),
-        "items-end" => style.align_items = Some(AlignItems::FLEX_END),
-        "items-stretch" => style.align_items = Some(AlignItems::STRETCH),
-        "items-baseline" => style.align_items = Some(AlignItems::BASELINE),
-        "justify-start" => style.justify_content = Some(JustifyContent::FLEX_START),
-        "justify-center" => style.justify_content = Some(JustifyContent::CENTER),
-        "justify-end" => style.justify_content = Some(JustifyContent::FLEX_END),
-        "justify-between" => style.justify_content = Some(JustifyContent::SPACE_BETWEEN),
-        "justify-around" => style.justify_content = Some(JustifyContent::SPACE_AROUND),
-        "justify-evenly" => style.justify_content = Some(JustifyContent::SPACE_EVENLY),
+        "items-start" => style.align_items = AlignItems::FLEX_START,
+        "items-center" => style.align_items = AlignItems::CENTER,
+        "items-end" => style.align_items = AlignItems::FLEX_END,
+        "items-stretch" => style.align_items = AlignItems::STRETCH,
+        "items-baseline" => style.align_items = AlignItems::BASELINE,
+        "justify-start" => style.justify_content = JustifyContent::FLEX_START,
+        "justify-center" => style.justify_content = JustifyContent::CENTER,
+        "justify-end" => style.justify_content = JustifyContent::FLEX_END,
+        "justify-between" => style.justify_content = JustifyContent::SPACE_BETWEEN,
+        "justify-around" => style.justify_content = JustifyContent::SPACE_AROUND,
+        "justify-evenly" => style.justify_content = JustifyContent::SPACE_EVENLY,
         "self-start" => style.align_self = Some(AlignSelf::FLEX_START),
         "self-center" => style.align_self = Some(AlignSelf::CENTER),
         "self-end" => style.align_self = Some(AlignSelf::FLEX_END),
