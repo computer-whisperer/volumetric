@@ -170,7 +170,8 @@ impl GlueIndices {
         MemArg {
             offset,
             align: 3,
-            memory_index: self.a_memory,
+            target: wasm_encoder::MemArgTarget::Memory(self.a_memory),
+            ordering: None,
         }
     }
 
@@ -178,7 +179,8 @@ impl GlueIndices {
         MemArg {
             offset,
             align: 3,
-            memory_index: self.t_memory,
+            target: wasm_encoder::MemArgTarget::Memory(self.t_memory),
+            ordering: None,
         }
     }
 
@@ -268,7 +270,8 @@ fn add_sample_channels_glue(
     f.instruction(&Instruction::F32Store(MemArg {
         offset: 0,
         align: 2,
-        memory_index: idx.a_memory,
+        target: wasm_encoder::MemArgTarget::Memory(idx.a_memory),
+        ordering: None,
     }));
     f.instruction(&Instruction::End);
     f.instruction(&Instruction::End);

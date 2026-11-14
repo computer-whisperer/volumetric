@@ -760,7 +760,7 @@ as an F64Map for step D.
 ## Step P — Python bindings
 
 `crates/volumetric_py`: a PyO3 module `volumetric` built with maturin
-(abi3, Python ≥ 3.12; pyo3 0.29 + numpy 0.29, Python 3.14 in the shim's
+(abi3, Python ≥ 3.12; pyo3 0.30 + numpy 0.30, Python 3.14 in the shim's
 venv). The bindings wrap crate functions one to one; a feature that
 exists only in Python is a bug, and so is logic copied out of the CLI:
 where the CLI held the only copy (operator input coercion, asset value

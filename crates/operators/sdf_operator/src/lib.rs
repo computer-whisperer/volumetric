@@ -88,7 +88,8 @@ fn add_bounds_glue(
         function.instruction(&Instruction::F64Store(MemArg {
             offset: (index * 8) as u64,
             align: 3,
-            memory_index: output_memory,
+            target: wasm_encoder::MemArgTarget::Memory(output_memory),
+            ordering: None,
         }));
     }
     function.instruction(&Instruction::End);
@@ -111,12 +112,14 @@ fn emit_copy_to_source(
         function.instruction(&Instruction::F64Load(MemArg {
             offset: (axis * 8) as u64,
             align: 3,
-            memory_index: output_memory,
+            target: wasm_encoder::MemArgTarget::Memory(output_memory),
+            ordering: None,
         }));
         function.instruction(&Instruction::F64Store(MemArg {
             offset: (axis * 8) as u64,
             align: 3,
-            memory_index: source_memory,
+            target: wasm_encoder::MemArgTarget::Memory(source_memory),
+            ordering: None,
         }));
     }
 }
@@ -178,12 +181,14 @@ fn add_sample_channels_glue(
         function.instruction(&Instruction::F64Load(MemArg {
             offset: (axis * 8) as u64,
             align: 3,
-            memory_index: output_memory,
+            target: wasm_encoder::MemArgTarget::Memory(output_memory),
+            ordering: None,
         }));
         function.instruction(&Instruction::F64Store(MemArg {
             offset: (axis * 8) as u64,
             align: 3,
-            memory_index: source_memory,
+            target: wasm_encoder::MemArgTarget::Memory(source_memory),
+            ordering: None,
         }));
     }
     // Channel 0: exact source occupancy.
@@ -193,7 +198,8 @@ fn add_sample_channels_glue(
     function.instruction(&Instruction::F32Store(MemArg {
         offset: 0,
         align: 2,
-        memory_index: output_memory,
+        target: wasm_encoder::MemArgTarget::Memory(output_memory),
+        ordering: None,
     }));
     // Channel 1: baked truncated signed distance at the original position.
     function.instruction(&Instruction::LocalGet(1));
@@ -202,7 +208,8 @@ fn add_sample_channels_glue(
     function.instruction(&Instruction::F32Store(MemArg {
         offset: 4,
         align: 2,
-        memory_index: output_memory,
+        target: wasm_encoder::MemArgTarget::Memory(output_memory),
+        ordering: None,
     }));
     function.instruction(&Instruction::End);
     sections.code.function(&function);

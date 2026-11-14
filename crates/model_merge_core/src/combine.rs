@@ -18,7 +18,9 @@
 //!   replaced by the combined occupancy, when m_0 declares a format
 //! - `memory`: m_0's
 
-use wasm_encoder::{BlockType, ExportKind, ExportSection, Function, Instruction, MemArg, ValType};
+use wasm_encoder::{
+    BlockType, ExportKind, ExportSection, Function, Instruction, MemArg, MemArgTarget, ValType,
+};
 
 use crate::{
     MergeSections, ModelExports, OffsetReencoder, SectionCounts, const_i32_export, count_sections,
@@ -60,7 +62,8 @@ fn f64_at(memory: u32) -> MemArg {
     MemArg {
         offset: 0,
         align: 3,
-        memory_index: memory,
+        target: MemArgTarget::Memory(memory),
+        ordering: None,
     }
 }
 
@@ -68,7 +71,8 @@ fn f32_at(memory: u32) -> MemArg {
     MemArg {
         offset: 0,
         align: 2,
-        memory_index: memory,
+        target: MemArgTarget::Memory(memory),
+        ordering: None,
     }
 }
 

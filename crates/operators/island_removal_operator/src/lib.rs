@@ -748,7 +748,8 @@ fn add_bounds_glue(
         f.instruction(&Instruction::F64Store(MemArg {
             offset: (i * 8) as u64,
             align: 3,
-            memory_index: a_memory,
+            target: wasm_encoder::MemArgTarget::Memory(a_memory),
+            ordering: None,
         }));
     }
     f.instruction(&Instruction::End);
@@ -777,12 +778,14 @@ fn emit_mask_test(
         f.instruction(&Instruction::F64Load(MemArg {
             offset: i * 8,
             align: 3,
-            memory_index: a_memory,
+            target: wasm_encoder::MemArgTarget::Memory(a_memory),
+            ordering: None,
         }));
         f.instruction(&Instruction::F64Store(MemArg {
             offset: i * 8,
             align: 3,
-            memory_index: t_memory,
+            target: wasm_encoder::MemArgTarget::Memory(t_memory),
+            ordering: None,
         }));
     }
     f.instruction(&Instruction::Call(island_sample));
@@ -866,7 +869,8 @@ fn add_sample_channels_glue(
     f.instruction(&Instruction::F32Store(MemArg {
         offset: 0,
         align: 2,
-        memory_index: a_memory,
+        target: wasm_encoder::MemArgTarget::Memory(a_memory),
+        ordering: None,
     }));
     f.instruction(&Instruction::End);
     f.instruction(&Instruction::End);

@@ -144,7 +144,8 @@ impl GlueIndices {
         MemArg {
             offset,
             align: 3,
-            memory_index: self.a_memory,
+            target: wasm_encoder::MemArgTarget::Memory(self.a_memory),
+            ordering: None,
         }
     }
 
@@ -152,7 +153,8 @@ impl GlueIndices {
         MemArg {
             offset,
             align: 3,
-            memory_index: self.b_memory,
+            target: wasm_encoder::MemArgTarget::Memory(self.b_memory),
+            ordering: None,
         }
     }
 }

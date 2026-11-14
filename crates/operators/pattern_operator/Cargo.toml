@@ -9,6 +9,6 @@ crate-type = ["cdylib"]
 [dependencies]
 volumetric_abi = { path = "../../volumetric_abi" }
 model_wrap_core = { path = "../../model_wrap_core" }
-walrus = "0.26"
+walrus = "0.28"
 serde = { version = "1", features = ["derive"] }
 ciborium = "0.2"

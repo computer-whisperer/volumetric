@@ -237,12 +237,14 @@ fn add_sample_glue(
     let mem = MemArg {
         offset: 0,
         align: 2,
-        memory_index: idx.a_memory,
+        target: wasm_encoder::MemArgTarget::Memory(idx.a_memory),
+        ordering: None,
     };
     let mem64 = |offset: u64| MemArg {
         offset,
         align: 3,
-        memory_index: idx.a_memory,
+        target: wasm_encoder::MemArgTarget::Memory(idx.a_memory),
+        ordering: None,
     };
 
     // local 0: pos_ptr (param); local 1: scratch pointer; locals 2-4: the
@@ -289,7 +291,8 @@ fn add_sample_glue(
             f.instruction(&Instruction::F32Load(MemArg {
                 offset: u64::from(density_channel) * 4,
                 align: 2,
-                memory_index: idx.a_memory,
+                target: wasm_encoder::MemArgTarget::Memory(idx.a_memory),
+                ordering: None,
             }));
         }
         None => {
@@ -330,12 +333,14 @@ fn add_sample_channels_glue(
     let mem = MemArg {
         offset: 0,
         align: 2,
-        memory_index: idx.a_memory,
+        target: wasm_encoder::MemArgTarget::Memory(idx.a_memory),
+        ordering: None,
     };
     let mem64 = |offset: u64| MemArg {
         offset,
         align: 3,
-        memory_index: idx.a_memory,
+        target: wasm_encoder::MemArgTarget::Memory(idx.a_memory),
+        ordering: None,
     };
 
     // params: 0 pos_ptr, 1 out_ptr; locals 2-4: the saved position.
@@ -365,7 +370,8 @@ fn add_sample_channels_glue(
     f.instruction(&Instruction::F32Load(MemArg {
         offset: u64::from(density_channel) * 4,
         align: 2,
-        memory_index: idx.a_memory,
+        target: wasm_encoder::MemArgTarget::Memory(idx.a_memory),
+        ordering: None,
     }));
     f.instruction(&Instruction::Call(idx.lattice_sample));
     f.instruction(&Instruction::Else);

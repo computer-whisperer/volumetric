@@ -9,5 +9,5 @@ crate-type = ["cdylib"]
 [dependencies]
 volumetric_abi = { path = "../../volumetric_abi" }
 trimesh_model_core = { path = "../../trimesh_model_core" }
-walrus = "0.26"
+walrus = "0.28"
 model_wrap_core = { path = "../../model_wrap_core" }

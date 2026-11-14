@@ -147,10 +147,10 @@ normal-diagnostic = []
 [dependencies]
 volumetric_abi = { path = "crates/volumetric_abi" }
 threemf_core = { path = "crates/threemf_core" }
-wasmtime = { version = "44", optional = true }
+wasmtime = { version = "49", optional = true }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
-wasmparser = "0.248"
+wasmparser = "0.263"
 thiserror = "2"
 ciborium = "0.2"
 serde_json = "1"

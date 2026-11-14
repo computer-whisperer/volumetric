@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-walrus = { version = "0.26", optional = true }
+walrus = { version = "0.28", optional = true }
 model_wrap_core = { path = "../model_wrap_core", optional = true }
 
 [features]

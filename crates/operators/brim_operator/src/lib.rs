@@ -680,7 +680,8 @@ fn add_bounds_glue(
         f.instruction(&Instruction::F64Store(MemArg {
             offset: (i * 8) as u64,
             align: 3,
-            memory_index: a_memory,
+            target: wasm_encoder::MemArgTarget::Memory(a_memory),
+            ordering: None,
         }));
     }
     f.instruction(&Instruction::End);
@@ -711,7 +712,8 @@ fn add_sample_glue(
         f.instruction(&Instruction::F64Load(MemArg {
             offset: u64::from(axis) * 8,
             align: 3,
-            memory_index: a_memory,
+            target: wasm_encoder::MemArgTarget::Memory(a_memory),
+            ordering: None,
         }));
         f.instruction(&Instruction::LocalSet(1 + axis));
     }
@@ -753,7 +755,8 @@ fn add_sample_channels_glue(
     let out_mem = MemArg {
         offset: 0,
         align: 2,
-        memory_index: a_memory,
+        target: wasm_encoder::MemArgTarget::Memory(a_memory),
+        ordering: None,
     };
 
     // params: 0 pos_ptr, 1 out_ptr; locals 2-4: the saved position.
@@ -763,7 +766,8 @@ fn add_sample_channels_glue(
         f.instruction(&Instruction::F64Load(MemArg {
             offset: u64::from(axis) * 8,
             align: 3,
-            memory_index: a_memory,
+            target: wasm_encoder::MemArgTarget::Memory(a_memory),
+            ordering: None,
         }));
         f.instruction(&Instruction::LocalSet(2 + axis));
     }
