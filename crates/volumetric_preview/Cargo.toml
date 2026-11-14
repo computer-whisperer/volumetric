@@ -14,7 +14,7 @@ web = ["volumetric/web"]
 
 [dependencies]
 anyhow = "1"
-glam = "0.32"
+glam = "0.34"
 volumetric = { path = "../../", default-features = false }
 volumetric_renderer = { path = "../volumetric_renderer" }
 web-time = "1"

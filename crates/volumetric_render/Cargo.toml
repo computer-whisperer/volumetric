@@ -11,7 +11,7 @@ volumetric_preview = { path = "../volumetric_preview" }
 volumetric_renderer = { path = "../volumetric_renderer" }
 view_core = { path = "../view_core" }
 anyhow = "1"
-glam = "0.32"
+glam = "0.34"
 
 [dev-dependencies]
 volumetric_assets = { path = "../volumetric_assets" }

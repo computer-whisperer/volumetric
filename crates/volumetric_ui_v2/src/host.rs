@@ -18,7 +18,7 @@ use volumetric_preview::srgb_to_linear;
 
 use damascene_core::clipboard;
 use damascene_core::prelude::*;
-use damascene_core::widgets::text_input::{self, ClipboardKind};
+use damascene_core::widgets::text_input::ClipboardKind;
 use damascene_wgpu::Runner;
 use damascene_winit_wgpu::host::input::{
     key_modifiers, map_key, map_physical, pointer_button, winit_cursor,
@@ -341,11 +341,14 @@ impl ApplicationHandler for Host {
                         let Some((lx, ly)) = self.last_pointer else {
                             return;
                         };
-                        let (dy, camera_scroll_delta) = match delta {
-                            MouseScrollDelta::LineDelta(_, y) => (-y * 50.0, y),
+                        // Logical pixels, ~50 px per wheel notch; positive
+                        // dx scrolls right. The camera zooms on the
+                        // vertical axis only.
+                        let (dx, dy, camera_scroll_delta) = match delta {
+                            MouseScrollDelta::LineDelta(x, y) => (-x * 50.0, -y * 50.0, y),
                             MouseScrollDelta::PixelDelta(p) => {
                                 let logical_y = p.y as f32 / scale;
-                                (-logical_y, logical_y / 50.0)
+                                (-(p.x as f32) / scale, -logical_y, logical_y / 50.0)
                             }
                         };
                         // Exclusive routing: the camera owns the wheel only
@@ -367,7 +370,7 @@ impl ApplicationHandler for Host {
                             ) {
                                 gfx.window.request_redraw();
                             }
-                        } else if gfx.damascene.pointer_wheel(lx, ly, dy) {
+                        } else if gfx.damascene.pointer_wheel(lx, ly, dx, dy) {
                             gfx.window.request_redraw();
                         }
                     }
@@ -398,7 +401,7 @@ impl ApplicationHandler for Host {
                                 self.modifiers,
                                 key_event.repeat,
                             ) {
-                                match text_input::clipboard_request(&event) {
+                                match gfx.damascene.clipboard_request(&event) {
                                     Some(ClipboardKind::Copy) => {
                                         copy_current_selection(&gfx.damascene, &mut self.clipboard);
                                         dispatch_event(&mut self.app, &gfx.damascene, event);

@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 volumetric = { path = "../../" }
-glam = "0.32"
+glam = "0.34"
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 [[bin]]

@@ -19,91 +19,29 @@ use volumetric_renderer::{CameraControlScheme, LightingPreset, OrbitMode, Standa
 use damascene_core::SvgIcon;
 use damascene_core::image::Image;
 use damascene_core::prelude::*;
-// The scene mesh lives in damascene's pinned glam (a different major than
-// this crate's own `glam` dep) — build its types through `scene::glam`.
+// The scene mesh takes damascene's re-exported glam. It is the same major
+// as this crate's own `glam` today; building through `scene::glam` keeps
+// this compiling when the two drift apart again.
 use damascene_core::scene::{
     GridPlanes, Material, MeshData as SceneMeshData, MeshHandle as SceneMeshHandle,
     MeshVertex as SceneMeshVertex, SceneSpec, glam::Vec3 as SceneVec3,
 };
 
-/// App-supplied glyphs for names missing from damascene's built-in icon
-/// vocabulary (`damascene_core::all_icon_names()`). Lucide path data in the
-/// same 24×24 stroke style as the built-ins; `parse_current_color` makes
-/// them tint like any other icon.
-static EYE_ICON: LazyLock<SvgIcon> = LazyLock::new(|| {
+/// Category glyph for Add-catalog "Combine" entries, which Lucide has no
+/// match for: two overlapping circles, in the same 24×24 stroke style as
+/// the built-ins. `parse_current_color` makes it tint like any other icon.
+static COMBINE_ICON: LazyLock<SvgIcon> = LazyLock::new(|| {
     SvgIcon::parse_current_color(
-        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#000" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0"/><circle cx="12" cy="12" r="3"/></svg>"##,
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#000" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="12" r="6"/><circle cx="15" cy="12" r="6"/></svg>"##,
     )
-    .expect("eye icon SVG parses")
+    .expect("combine icon SVG parses")
 });
-static PIN_ICON: LazyLock<SvgIcon> = LazyLock::new(|| {
-    SvgIcon::parse_current_color(
-        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#000" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1z"/></svg>"##,
-    )
-    .expect("pin icon SVG parses")
-});
-
-/// Category glyphs for Add-catalog entries — lucide path data like the
-/// icons above. A module's own declared `icon_svg` (parsed once, cached
-/// on its [`catalog::CatalogEntry`]) takes precedence; these cover
-/// entries that declare none and unscanned entries (kind fallbacks:
-/// `activity` / `settings`).
-macro_rules! category_icon {
-    ($name:ident, $body:literal) => {
-        static $name: LazyLock<SvgIcon> = LazyLock::new(|| {
-            SvgIcon::parse_current_color(concat!(
-                r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#000" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">"##,
-                $body,
-                "</svg>"
-            ))
-            .expect("category icon SVG parses")
-        });
-    };
-}
-category_icon!(
-    PRIMITIVES_ICON,
-    r##"<path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/>"##
-);
-category_icon!(
-    COMBINE_ICON,
-    r##"<circle cx="9" cy="12" r="6"/><circle cx="15" cy="12" r="6"/>"##
-);
-category_icon!(
-    TRANSFORMS_ICON,
-    r##"<path d="M5 3v16h16"/><path d="m5 19 6-6"/><path d="m2 6 3-3 3 3"/><path d="m18 16 3 3-3 3"/>"##
-);
-category_icon!(
-    CONSTRUCTION_ICON,
-    r##"<circle cx="19" cy="5" r="2"/><circle cx="5" cy="19" r="2"/><path d="M5 17A12 12 0 0 1 17 5"/>"##
-);
-category_icon!(
-    LATTICE_ICON,
-    r##"<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/><path d="M3 15h18"/><path d="M9 3v18"/><path d="M15 3v18"/>"##
-);
-category_icon!(
-    FEA_ICON,
-    r##"<path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/>"##
-);
-category_icon!(
-    MESH_ICON,
-    r##"<path d="M13.73 4a2 2 0 0 0-3.46 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3z"/>"##
-);
-category_icon!(
-    FABRICATION_ICON,
-    r##"<path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><path d="M6 9V3a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v6"/><rect x="6" y="14" width="12" height="8" rx="1"/>"##
-);
-category_icon!(
-    SCRIPTING_ICON,
-    r##"<polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/>"##
-);
-category_icon!(
-    DATA_ICON,
-    r##"<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.7 4 3 9 3s9-1.3 9-3V5"/><path d="M3 12c0 1.7 4 3 9 3s9-1.3 9-3"/>"##
-);
 
 /// The icon slot source for a catalog entry: the module's own declared
 /// icon when it parsed, else its category's glyph, with per-kind
-/// fallbacks while the entry is unscanned or uncategorized.
+/// fallbacks while the entry is unscanned or uncategorized. A module's
+/// declared `icon_svg` is parsed once and cached on its
+/// [`catalog::CatalogEntry`].
 fn catalog_icon_source(entry: &catalog::CatalogEntry) -> IconSource {
     if let Some(icon) = &entry.icon {
         return IconSource::Custom(icon.clone());
@@ -112,18 +50,17 @@ fn catalog_icon_source(entry: &catalog::CatalogEntry) -> IconSource {
         .ready()
         .map(|metadata| metadata.category.as_str())
         .unwrap_or("");
-    let custom = |icon: &LazyLock<SvgIcon>| IconSource::Custom((**icon).clone());
     match category {
-        "Primitives" => custom(&PRIMITIVES_ICON),
-        "Combine" => custom(&COMBINE_ICON),
-        "Transforms" => custom(&TRANSFORMS_ICON),
-        "Construction" => custom(&CONSTRUCTION_ICON),
-        "Lattice" => custom(&LATTICE_ICON),
-        "FEA" => custom(&FEA_ICON),
-        "Mesh" => custom(&MESH_ICON),
-        "Fabrication" => custom(&FABRICATION_ICON),
-        "Scripting" => custom(&SCRIPTING_ICON),
-        "Data" => custom(&DATA_ICON),
+        "Primitives" => "box".into_icon_source(),
+        "Combine" => IconSource::Custom((*COMBINE_ICON).clone()),
+        "Transforms" => "move-3d".into_icon_source(),
+        "Construction" => "spline".into_icon_source(),
+        "Lattice" => "grid-3x3".into_icon_source(),
+        "FEA" => "gauge".into_icon_source(),
+        "Mesh" => "triangle".into_icon_source(),
+        "Fabrication" => "printer".into_icon_source(),
+        "Scripting" => "code".into_icon_source(),
+        "Data" => "database".into_icon_source(),
         "Import" => "file-text".into_icon_source(),
         _ => match entry.kind {
             volumetric_assets::AssetCategory::Model => "activity".into_icon_source(),
@@ -4979,10 +4916,12 @@ fn add_rail(app: &VolumetricUiV2) -> El {
                 .key(format!("{RAIL_ADD_PREFIX}{name}")),
         );
     }
+    // Stretch, so the divider spans the rail; the icon buttons are
+    // fixed-size and keep their width.
     column(items)
         .gap(tokens::SPACE_2)
         .padding(Sides::xy(tokens::SPACE_2, tokens::SPACE_2))
-        .align(Align::Center)
+        .align(Align::Stretch)
         .width(Size::Hug)
         .height(Size::Fill(1.0))
 }
@@ -5530,7 +5469,9 @@ fn export_layer(app: &VolumetricUiV2) -> Option<El> {
             }
         })
         .caption()
-        .muted(),
+        .muted()
+        .wrap_text()
+        .width(Size::Fill(1.0)),
     );
     if scale.is_none() {
         body.push(form_message("Scale must be a positive number."));
@@ -5597,6 +5538,7 @@ fn view_settings_popover(app: &VolumetricUiV2) -> El {
                 icon_button("chevron-left")
                     .ghost()
                     .xsmall()
+                    .aria_label(format!("{label}: less"))
                     .key(route(&format!("{option}:down"))),
                 text(value)
                     .label()
@@ -5605,6 +5547,7 @@ fn view_settings_popover(app: &VolumetricUiV2) -> El {
                 icon_button("chevron-right")
                     .ghost()
                     .xsmall()
+                    .aria_label(format!("{label}: more"))
                     .key(route(&format!("{option}:up"))),
             ])
             .gap(tokens::SPACE_1)
@@ -6308,11 +6251,7 @@ fn look_through_photo_layer(app: &VolumetricUiV2) -> Option<El> {
         image(photo)
             .image_fit(ImageFit::Contain)
             .fill_size()
-            // An image quad's alpha is its tint's alpha: Damascene folds
-            // the El's opacity into the tint colour and writes an identity
-            // tint when there is none, so an untinted image ignores
-            // `opacity`. White keeps the picture's colours.
-            .image_tint(Color::srgb_u8(255, 255, 255))
+            .alt("Photograph of the looked-through view")
             .opacity(f32::from(app.photo_opacity_percent) / 100.0),
     )
 }
@@ -6329,7 +6268,8 @@ fn look_through_label_layer(app: &VolumetricUiV2) -> Option<El> {
         return None;
     }
     let chips = labels.into_iter().map(|(label, x, y)| {
-        let chip = badge(label.text).xsmall();
+        // Boxed: a bare dot-and-text badge is illegible over a photograph.
+        let chip = badge(label.text).boxed().xsmall();
         // The theme's tints stand in for the marks' colours: success
         // for a fit pick, warning for a check, the default for a contour.
         let chip = match label.kind {
@@ -6386,6 +6326,7 @@ fn view_controls_cluster(app: &VolumetricUiV2) -> El {
                 PHOTO_OPACITY_SELECT_KEY,
                 format!("{}% photo", app.photo_opacity_percent),
             )
+            .tooltip("Photo opacity")
             .width(Size::Fixed(96.0)),
         );
         controls.push(vertical_separator().height(Size::Fixed(20.0)));
@@ -6396,10 +6337,15 @@ fn view_controls_cluster(app: &VolumetricUiV2) -> El {
             .secondary()
             .tooltip("Frame the preview in view")
             .key(FRAME_PREVIEW_KEY),
-        select_trigger(VIEW_SELECT_KEY, "View").width(Size::Fixed(64.0)),
+        select_trigger(VIEW_SELECT_KEY, "View")
+            .tooltip("Standard views")
+            .width(Size::Fixed(64.0)),
         vertical_separator().height(Size::Fixed(20.0)),
-        select_trigger(MODE_SELECT_KEY, app.render_mode.label()).width(Size::Fixed(90.0)),
+        select_trigger(MODE_SELECT_KEY, app.render_mode.label())
+            .tooltip("Render mode")
+            .width(Size::Fixed(90.0)),
         select_trigger(RESOLUTION_SELECT_KEY, app.preview_resolution.to_string())
+            .tooltip("Preview resolution")
             .width(Size::Fixed(84.0)),
     ]);
     card([row(controls).gap(tokens::SPACE_1).align(Align::Center)])
@@ -6410,7 +6356,8 @@ fn view_controls_cluster(app: &VolumetricUiV2) -> El {
 }
 
 /// One-line readout at the bottom of the viewport. Unkeyed, so it never
-/// intercepts camera input.
+/// intercepts camera input. Every badge is a chip (boxed or secondary):
+/// a bare dot-and-text badge is illegible over the render.
 fn viewport_hud(app: &VolumetricUiV2) -> El {
     let requests = app.preview_requests();
     let triangles: usize = app.output_stats.values().map(|s| s.triangles).sum();
@@ -6418,15 +6365,18 @@ fn viewport_hud(app: &VolumetricUiV2) -> El {
     let mut badges = vec![
         badge(format!("{} in viewport", requests.len()))
             .muted()
+            .boxed()
             .xsmall(),
         badge(format!("{} outputs", app.runtime_assets.len()))
             .muted()
+            .boxed()
             .xsmall(),
     ];
     if triangles > 0 {
         badges.push(
             badge(format!("{} tris", format_count(triangles)))
                 .muted()
+                .boxed()
                 .xsmall(),
         );
     }
@@ -6434,6 +6384,7 @@ fn viewport_hud(app: &VolumetricUiV2) -> El {
         badges.push(
             badge(format!("{} pts", format_count(points)))
                 .muted()
+                .boxed()
                 .xsmall(),
         );
     }
@@ -6457,14 +6408,15 @@ fn viewport_hud(app: &VolumetricUiV2) -> El {
         badges.push(
             badge(format!("grid {}", format_length(spacing)))
                 .muted()
+                .boxed()
                 .xsmall(),
         );
     }
     if let Some(status) = &app.direct_status {
-        badges.push(badge(status).muted().xsmall());
+        badges.push(badge(status).muted().boxed().xsmall());
     }
     if let Some(warning) = &app.viewport_overflow {
-        badges.push(badge(warning).destructive().xsmall());
+        badges.push(badge(warning).destructive().boxed().xsmall());
     }
     badges.push(badge(&app.status).secondary().xsmall());
     badges.push(spacer());
@@ -6559,10 +6511,13 @@ fn format_dim(value: f32) -> String {
 }
 
 fn toggle_chip(label: &str, value: bool, key: &str) -> El {
-    row([text(label).caption().muted().ellipsis(), switch(key, value)])
-        .gap(tokens::SPACE_1)
-        .align(Align::Center)
-        .height(Size::Fixed(24.0))
+    row([
+        text(label).caption().muted().ellipsis(),
+        switch(key, value).aria_label(label),
+    ])
+    .gap(tokens::SPACE_1)
+    .align(Align::Center)
+    .height(Size::Fixed(24.0))
 }
 
 /// Run/Cancel button that reflects the async run lifecycle. While a run is in
@@ -6698,14 +6653,12 @@ fn project_panel(app: &VolumetricUiV2) -> El {
         sections.push(divider());
     }
     sections.push(panel_section("Inspector", inspector_rows(app)));
+    // damascene's scroll lets focus rings paint past its scissor and, with
+    // focusable content, reserves the thumb's band, so no row's right-hand
+    // control sits under the scrollbar.
     column([scroll(sections)
         .key("project-panel-scroll")
-        .gap(tokens::SPACE_3)
-        // Gutter so keyboard focus rings on full-width rows aren't clipped
-        // by the scroll's horizontal scissor, and a reserved thumb gutter so
-        // the scrollbar never sits on a row's right-hand control.
-        .px(tokens::RING_WIDTH)
-        .scrollbar_gutter()])
+        .gap(tokens::SPACE_3)])
     .width(Size::Fixed(app.panel_width))
     .height(Size::Fill(1.0))
     .padding(tokens::SPACE_3)
@@ -6744,25 +6697,28 @@ fn view_row(
     let thumbnail = match app.view_thumbnail(hash, view, budget) {
         Some(picture) => image(picture)
             .image_fit(ImageFit::Contain)
+            .alt(format!("Photograph of view {}", view.id))
             .width(Size::Fixed(48.0))
             .height(Size::Fixed(36.0))
             .clip(),
         None => spacer().width(Size::Fixed(48.0)).height(Size::Fixed(36.0)),
     };
+    // Chips (boxed), not dot-and-text badges: packed in a row, a bare
+    // dot reads as belonging to the word before it.
     let mut marks: Vec<El> = view
         .tags
         .iter()
         .filter(|tag| !tag.starts_with("frame:"))
-        .map(|tag| badge(tag.clone()).muted().xsmall())
+        .map(|tag| badge(tag.clone()).muted().boxed().xsmall())
         .collect();
     if view.pose().is_none() {
-        marks.insert(0, badge("unposed").xsmall());
+        marks.insert(0, badge("unposed").boxed().xsmall());
     }
     if view.depth.is_some() {
-        marks.push(badge("depth").xsmall());
+        marks.push(badge("depth").boxed().xsmall());
     }
     if view.mask.is_some() {
-        marks.push(badge("mask").xsmall());
+        marks.push(badge("mask").boxed().xsmall());
     }
     // What detection found, on a row of its own: the tag row is full, and
     // the card corners are what the survey rests on; the full count is in
@@ -6774,7 +6730,7 @@ fn view_row(
             format!("{} corners", obs.board.len())
         }
     });
-    let look = icon_button(&*EYE_ICON)
+    let look = icon_button("eye")
         .xsmall()
         .tooltip(if looking {
             "Leave this view"
@@ -6806,7 +6762,7 @@ fn view_row(
         row(marks).gap(tokens::SPACE_1),
     ];
     if let Some(found) = found {
-        lines.push(row([badge(found).xsmall()]));
+        lines.push(row([badge(found).boxed().xsmall()]));
     }
     if let Some(recorded) = recorded {
         lines.push(text(recorded).caption().muted().ellipsis());
@@ -7028,7 +6984,7 @@ fn runtime_asset_row(app: &VolumetricUiV2, asset: &LoadedAsset, staged: bool) ->
         .unwrap_or_else(|| spacer().width(Size::Fixed(36.0)).height(Size::Fixed(36.0)));
 
     let pin = if renderable && !staged {
-        let pin = icon_button(&*PIN_ICON)
+        let pin = icon_button("pin")
             .xsmall()
             .tooltip(if pinned { "Unpin" } else { "Pin to viewport" })
             .key(format!("{TOGGLE_PIN_PREFIX}{id}"));
@@ -7087,7 +7043,7 @@ fn runtime_asset_row(app: &VolumetricUiV2, asset: &LoadedAsset, staged: bool) ->
         spacer().width(Size::Fixed(12.0))
     };
     let view = if renderable && !staged {
-        icon_button(&*EYE_ICON)
+        icon_button("eye")
             .ghost()
             .xsmall()
             .tooltip("View")
@@ -7096,7 +7052,7 @@ fn runtime_asset_row(app: &VolumetricUiV2, asset: &LoadedAsset, staged: bool) ->
         spacer().width(Size::Fixed(24.0))
     };
 
-    table_row([
+    list_row([
         thumbnail,
         // Dot marks outputs currently drawn in the viewport.
         visibility,
@@ -7774,8 +7730,21 @@ fn export_rows(app: &VolumetricUiV2) -> Vec<El> {
     rows
 }
 
+/// A table row laid out as a list row: it sets its own height, padding
+/// and gap. damascene pads every `table_row` cell to its control-height
+/// rung unless the cell set its padding itself, which would squeeze these
+/// hand-sized cells (thumbnails, 24 px icon buttons); claiming each cell's
+/// current padding opts it out.
+#[track_caller]
+fn list_row(cells: impl IntoIterator<Item = El>) -> El {
+    table_row(cells.into_iter().map(|cell| {
+        let padding = cell.padding;
+        cell.padding(padding)
+    }))
+}
+
 fn project_row(kind: &str, label: &str, select_route: String, delete_route: String) -> El {
-    table_row([
+    list_row([
         column([
             text(kind)
                 .caption()
@@ -7805,7 +7774,7 @@ fn project_row(kind: &str, label: &str, select_route: String, delete_route: Stri
 }
 
 fn project_note_row(kind: &str, label: &str) -> El {
-    table_row([
+    list_row([
         // Wide enough for operator-declared input labels ("Rigid body",
         // "Height field (2D)"), not just the generic "input"/"output".
         text(kind)
@@ -7825,7 +7794,7 @@ fn project_note_row(kind: &str, label: &str) -> El {
 }
 
 fn empty_project_row(label: &str) -> El {
-    table_row([text(label).muted().caption().width(Size::Fill(1.0))])
+    list_row([text(label).muted().caption().width(Size::Fill(1.0))])
         .height(Size::Fixed(28.0))
         .padding(Sides::xy(tokens::SPACE_2, 0.0))
 }
@@ -9163,14 +9132,6 @@ mod tests {
             volumetric::f64_map::decode(bytes).unwrap()["sphere.radius"],
             2.0
         );
-    }
-
-    /// The app-supplied SVG glyphs (names damascene's built-in vocabulary
-    /// lacks) must parse — a bad path would otherwise panic at first render.
-    #[test]
-    fn custom_icons_parse() {
-        let _ = &*EYE_ICON;
-        let _ = &*PIN_ICON;
     }
 
     /// The bundled boolean declares a variadic model block: a fresh step
@@ -10955,8 +10916,9 @@ mod tests {
         );
     }
 
-    /// Every category glyph parses. The statics are lazy, so without this
-    /// a malformed SVG would panic at first render after a scan lands.
+    /// Every category glyph resolves: the custom one parses (the static is
+    /// lazy, so a malformed SVG would otherwise panic at first render
+    /// after a scan lands) and every name is in damascene's vocabulary.
     #[test]
     fn category_icons_parse_for_every_known_category() {
         for category in CATEGORY_ORDER {
@@ -10980,8 +10942,12 @@ mod tests {
                 }),
                 icon: None,
             };
-            // Forces the LazyLock (and with it the parse) for each glyph.
-            let _ = catalog_icon_source(&entry);
+            // Forces the LazyLock (and with it the parse) for the custom glyph.
+            let source = catalog_icon_source(&entry);
+            assert!(
+                !matches!(source, IconSource::UnknownName(_)),
+                "{category}: {source:?}"
+            );
         }
     }
 
@@ -11874,28 +11840,24 @@ mod tests {
                 && (y - (150.0 - MARK_LABEL_HALF_HEIGHT)).abs() < 0.5,
             "{found:?}"
         );
-        // The photo layer is a full-size image whose opacity travels in a
-        // white tint (Damascene drops an untinted image's opacity).
-        fn photo_layers(el: &El, out: &mut Vec<(f32, bool)>) {
-            if el.image.is_some() && el.width == Size::Fill(1.0) {
-                out.push((el.opacity, el.image_tint.is_some()));
-            }
-            for child in &el.children {
-                photo_layers(child, out);
-            }
-        }
-        let mut layers = Vec::new();
-        photo_layers(&tree, &mut layers);
-        assert_eq!(layers.len(), 1, "one photo layer");
-        assert!(
-            (layers[0].0 - 0.5).abs() < 1e-6 && layers[0].1,
-            "{layers:?}"
-        );
         let bundle = damascene_core::bundle::artifact::render_bundle(
             &mut tree,
             Rect::new(0.0, 0.0, 1280.0, 800.0),
         );
         assert!(bundle.lint.findings.is_empty(), "{}", bundle.lint.text());
+        // The photo is drawn at the chosen opacity: the one image larger
+        // than a thumbnail carries a tint at half alpha.
+        let photo_tints: Vec<_> = bundle
+            .draw_ops
+            .iter()
+            .filter_map(|op| match op {
+                DrawOp::Image { rect, tint, .. } if rect.w > 100.0 => Some(*tint),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(photo_tints.len(), 1, "one photo layer: {photo_tints:?}");
+        let alpha = photo_tints[0].map(|tint| tint.to_srgb_u8a()[3]);
+        assert_eq!(alpha, Some(128), "{photo_tints:?}");
 
         // Without a view set in the viewport there is no section.
         let mut app = VolumetricUiV2::default();

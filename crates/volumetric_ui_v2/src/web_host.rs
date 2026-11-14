@@ -510,11 +510,13 @@ impl ApplicationHandler for WebHost {
                 let Some((lx, ly)) = self.last_pointer else {
                     return;
                 };
-                let (dy, camera_scroll_delta) = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => (-y * 50.0, y),
+                // Logical pixels, ~50 px per wheel notch; positive dx
+                // scrolls right. The camera zooms on the vertical axis only.
+                let (dx, dy, camera_scroll_delta) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => (-x * 50.0, -y * 50.0, y),
                     MouseScrollDelta::PixelDelta(p) => {
                         let logical_y = p.y as f32 / scale;
-                        (-logical_y, logical_y / 50.0)
+                        (-(p.x as f32) / scale, -logical_y, logical_y / 50.0)
                     }
                 };
                 // Exclusive routing: the camera owns the wheel only when
@@ -536,7 +538,7 @@ impl ApplicationHandler for WebHost {
                     ) {
                         gfx.window.request_redraw();
                     }
-                } else if gfx.damascene.pointer_wheel(lx, ly, dy) {
+                } else if gfx.damascene.pointer_wheel(lx, ly, dx, dy) {
                     gfx.window.request_redraw();
                 }
             }

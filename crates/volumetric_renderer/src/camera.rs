@@ -9,6 +9,7 @@
 
 use std::f32::consts::FRAC_PI_2;
 
+use glam::camera::rh::{proj::directx, view::look_at_mat4};
 use glam::{Mat3, Mat4, Quat, Vec2, Vec3, Vec4};
 
 /// How the camera projects.
@@ -191,11 +192,11 @@ impl Camera {
 
     pub fn projection_matrix(&self, aspect: f32, near: f32, far: f32) -> Mat4 {
         match self.projection {
-            Projection::Perspective => Mat4::perspective_rh(self.fov_y, aspect, near, far),
+            Projection::Perspective => directx::perspective(self.fov_y, aspect, near, far),
             Projection::Orthographic => {
                 let half_h = self.frame_height() * 0.5;
                 let half_w = half_h * aspect;
-                Mat4::orthographic_rh(-half_w, half_w, -half_h, half_h, near, far)
+                directx::orthographic(-half_w, half_w, -half_h, half_h, near, far)
             }
         }
     }
@@ -628,8 +629,8 @@ impl CameraView {
         far: f32,
     ) -> Self {
         Self {
-            view: Mat4::look_at_rh(eye, target, up),
-            projection: Mat4::perspective_rh(fov_y, aspect, near, far),
+            view: look_at_mat4(eye, target, up),
+            projection: directx::perspective(fov_y, aspect, near, far),
         }
     }
 
@@ -647,8 +648,8 @@ impl CameraView {
         let half_h = height * 0.5;
         let half_w = half_h * aspect;
         Self {
-            view: Mat4::look_at_rh(eye, target, up),
-            projection: Mat4::orthographic_rh(-half_w, half_w, -half_h, half_h, near, far),
+            view: look_at_mat4(eye, target, up),
+            projection: directx::orthographic(-half_w, half_w, -half_h, half_h, near, far),
         }
     }
 
