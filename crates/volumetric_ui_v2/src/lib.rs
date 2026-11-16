@@ -72,7 +72,6 @@ fn catalog_icon_source(entry: &catalog::CatalogEntry) -> IconSource {
 pub mod catalog;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod host;
-pub mod obj_sidecar;
 // The daemon-outcome mapping is shared with the web shell; the blocking
 // RemoteBackend inside is native-only.
 pub mod remote;

@@ -30,7 +30,6 @@ use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowId};
 
-use crate::obj_sidecar;
 use crate::remote::RemoteBackend;
 use crate::session::{
     BackgroundJob, BackgroundResult, ExecutionBackend, Gpu, JobQueue, LocalBackend, Session,
@@ -38,6 +37,7 @@ use crate::session::{
 };
 use crate::settings::UiSettings;
 use crate::{ExecutorChoice, ExportFormat, FileAction, VIEWPORT_KEY, VolumetricUiV2};
+use volumetric::obj_sidecar;
 
 pub fn run(
     title: &'static str,
@@ -999,44 +999,14 @@ fn perform_file_task(task: FileTask) -> FileOutcome {
             };
             // The OBJ convention: the user picks the mesh and the program
             // finds the material library and the texture next to it.
-            let dir = path.parent().map(PathBuf::from).unwrap_or_default();
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string();
-            let found = obj_sidecar::resolve(
-                &String::from_utf8_lossy(&obj_bytes),
-                &stem,
-                &mut |relative| std::fs::read(dir.join(relative)).ok(),
-            );
-            let (blobs, config, note) = match found.texture {
-                Some((name, bytes)) => {
-                    let note = match &found.mtl {
-                        Some(mtl) => format!("texture {name} via {mtl}"),
-                        None => format!("texture {name}"),
-                    };
-                    (
-                        vec![obj_bytes, bytes],
-                        vec![("texture_name".to_string(), name)],
-                        Some(note),
-                    )
-                }
-                None => {
-                    let why = if found.notes.is_empty() {
-                        "no texture".to_string()
-                    } else {
-                        format!("no texture: {}", found.notes.join("; "))
-                    };
-                    (vec![obj_bytes], Vec::new(), Some(why))
-                }
-            };
+            let found = obj_sidecar::resolve_beside(&path, &obj_bytes);
+            let import = found.into_import(obj_bytes);
             FileOutcome::ImportedBlob {
                 operator_name: "obj_import_operator",
                 output_base: "obj_import",
-                blobs,
-                config,
-                note,
+                blobs: import.blobs,
+                config: import.config,
+                note: Some(import.note),
             }
         }
     }

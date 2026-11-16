@@ -46,7 +46,6 @@ use winit::window::{Window, WindowId};
 
 use volumetric_protocol::{JobRequest, WebDaemonClient};
 
-use crate::obj_sidecar;
 use crate::remote::{mesh_result_from_output, output_from_outcome, project_exports_from_output};
 use crate::session::{
     BackgroundJob, BackgroundResult, ExecutionBackend, Gpu, JobQueue, LocalBackend, PendingMesh,
@@ -56,6 +55,7 @@ use crate::session::{
 use crate::{
     ExecutorChoice, ExportFormat, FileAction, PreviewRequest, VIEWPORT_KEY, VolumetricUiV2,
 };
+use volumetric::obj_sidecar;
 
 /// The canvas element the shell binds to; declared by `index.html`.
 const CANVAS_ID: &str = "volumetric_canvas";
@@ -1392,41 +1392,23 @@ async fn perform_file_task(task: FileTask) -> FileOutcome {
             let found = obj_sidecar::resolve(
                 &String::from_utf8_lossy(&obj_bytes),
                 &stem,
-                &mut |relative| {
+                &mut |relative, limit| {
                     let wanted = obj_sidecar::file_name(relative).to_ascii_lowercase();
                     files
                         .iter()
-                        .find(|(name, _)| name.to_ascii_lowercase() == wanted)
+                        .find(|(name, bytes)| {
+                            name.to_ascii_lowercase() == wanted && bytes.len() as u64 <= limit
+                        })
                         .map(|(_, bytes)| bytes.clone())
                 },
             );
-            let (blobs, config, note) = match found.texture {
-                Some((name, bytes)) => {
-                    let note = match &found.mtl {
-                        Some(mtl) => format!("texture {name} via {mtl}"),
-                        None => format!("texture {name}"),
-                    };
-                    (
-                        vec![obj_bytes, bytes],
-                        vec![("texture_name".to_string(), name)],
-                        Some(note),
-                    )
-                }
-                None => {
-                    let why = if found.notes.is_empty() {
-                        "no texture".to_string()
-                    } else {
-                        format!("no texture: {}", found.notes.join("; "))
-                    };
-                    (vec![obj_bytes], Vec::new(), Some(why))
-                }
-            };
+            let import = found.into_import(obj_bytes);
             FileOutcome::ImportedBlob {
                 operator_name: "obj_import_operator",
                 output_base: "obj_import",
-                blobs,
-                config,
-                note,
+                blobs: import.blobs,
+                config: import.config,
+                note: Some(import.note),
             }
         }
     }
