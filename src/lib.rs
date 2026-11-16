@@ -342,6 +342,8 @@ pub use volumetric_abi::{annotations, f64_map, lua_parameters, wgsl_parameters};
 
 // The triangle mesh value type (CBOR payload of TriMesh-typed assets).
 pub use volumetric_abi::trimesh;
+// The sRGB box filter textures are shrunk with.
+pub use volumetric_abi::srgb;
 pub use volumetric_abi::viewset;
 
 // The Gaussian splat value type (CBOR payload of Splat-typed assets).

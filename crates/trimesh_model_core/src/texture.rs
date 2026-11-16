@@ -1,6 +1,8 @@
 //! Decoded texture images as the payload builder consumes them, and the
 //! on-payload texel encodings.
 
+use volumetric_abi::srgb::{half_side, halve};
+
 /// How a texture's texels are stored in the payload's colour section.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[repr(u32)]
@@ -36,45 +38,32 @@ impl TextureImage {
         if self.width == 0 || self.height == 0 {
             return Err(format!("texture is {}x{}", self.width, self.height));
         }
-        let expected = self.width as usize * self.height as usize * 3;
-        if self.rgb.len() != expected {
+        // Checked: where `usize` is 32 bits (the operator's own target) a
+        // large enough image's byte count wraps.
+        let expected = (self.width as usize)
+            .checked_mul(self.height as usize)
+            .and_then(|n| n.checked_mul(3));
+        if expected != Some(self.rgb.len()) {
             return Err(format!(
-                "texture {}x{} has {} bytes, expected {expected}",
+                "texture {}x{} has {} bytes, expected {}",
                 self.width,
                 self.height,
-                self.rgb.len()
+                self.rgb.len(),
+                self.width as u64 * self.height as u64 * 3
             ));
         }
         Ok(())
     }
 
-    /// Box-filter the image to half size in each direction (odd extents
-    /// round up; the last row/column averages the texels that exist).
+    /// The image at half size in each direction, averaged in linear light
+    /// by the filter the viewport's mip chain uses
+    /// ([`volumetric_abi::srgb::halve`]): an odd extent rounds down and
+    /// its last texels join the last block.
     pub fn halved(&self) -> TextureImage {
-        let (w, h) = (self.width as usize, self.height as usize);
-        let nw = w.div_ceil(2);
-        let nh = h.div_ceil(2);
-        let mut rgb = Vec::with_capacity(nw * nh * 3);
-        for y in 0..nh {
-            for x in 0..nw {
-                let mut sum = [0u32; 3];
-                let mut n = 0u32;
-                for sy in (2 * y)..(2 * y + 2).min(h) {
-                    for sx in (2 * x)..(2 * x + 2).min(w) {
-                        let o = (sy * w + sx) * 3;
-                        for k in 0..3 {
-                            sum[k] += self.rgb[o + k] as u32;
-                        }
-                        n += 1;
-                    }
-                }
-                rgb.extend(sum.map(|s| ((s + n / 2) / n) as u8));
-            }
-        }
         TextureImage {
-            width: nw as u32,
-            height: nh as u32,
-            rgb,
+            width: half_side(self.width),
+            height: half_side(self.height),
+            rgb: halve(&self.rgb, 3, self.width, self.height),
         }
     }
 
@@ -96,25 +85,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn halving_box_filters_and_rounds_odd_extents_up() {
+    fn halving_averages_in_linear_light_and_rounds_odd_extents_down() {
         let img = TextureImage {
             width: 3,
             height: 2,
             rgb: vec![
-                0, 0, 0, 100, 100, 100, 200, 0, 0, //
-                200, 200, 200, 100, 100, 100, 0, 0, 200,
+                0, 0, 0, 255, 255, 255, 0, 0, 0, //
+                255, 255, 255, 0, 0, 0, 0, 0, 0,
             ],
         };
+        // One block of all six texels, a third of them white: 1/3 in
+        // linear light is sRGB 156 (the byte mean would be 85).
         let half = img.halved();
-        assert_eq!((half.width, half.height), (2, 1));
-        assert_eq!(half.rgb, vec![100, 100, 100, 100, 0, 100]);
+        assert_eq!((half.width, half.height), (1, 1));
+        assert_eq!(half.rgb, vec![156, 156, 156]);
         half.validate().unwrap();
 
-        let shrunk = img.clone().shrunk_to(1);
-        assert_eq!((shrunk.width, shrunk.height), (1, 1));
-        let same = img.clone().shrunk_to(0);
-        assert_eq!(same, img);
-        let same = img.clone().shrunk_to(3);
-        assert_eq!(same, img);
+        let wide = TextureImage {
+            width: 8,
+            height: 2,
+            rgb: vec![90; 8 * 2 * 3],
+        };
+        let shrunk = wide.clone().shrunk_to(3);
+        assert_eq!((shrunk.width, shrunk.height), (2, 1));
+        assert_eq!(shrunk.rgb, vec![90; 2 * 3]);
+        assert_eq!(wide.clone().shrunk_to(0), wide);
+        assert_eq!(wide.clone().shrunk_to(8), wide);
     }
 }

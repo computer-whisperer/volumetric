@@ -124,6 +124,7 @@ pub mod fea;
 pub mod lua_parameters;
 pub mod mechanism;
 pub mod splat;
+pub mod srgb;
 pub mod subspace;
 pub mod threading;
 pub mod trimesh;
