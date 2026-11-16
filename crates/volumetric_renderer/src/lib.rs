@@ -63,8 +63,8 @@ pub use types::{
     AXIS_COLORS, AoSettings, DepthMode, EdgeSettings, GridPlane, GridSettings, GridSpacing, Light,
     LightingPreset, LightingRig, LineData, LineInstance, LinePattern, LineSegment, LineStyle,
     MAX_MATERIALS, Material, MaterialId, MeshData, MeshVertex, ObjectId, PointData, PointInstance,
-    PointShape, PointStyle, RenderSettings, SplatData, SplatStyle, SurfelData, SurfelVertex,
-    TextureData, WidthMode,
+    PointShape, PointStyle, RenderSettings, SceneTexture, SplatData, SplatStyle, SurfelData,
+    SurfelVertex, TextureData, WidthMode,
 };
 
 use std::sync::Arc;
@@ -526,8 +526,8 @@ impl Renderer {
     }
 
     /// Uploads one mesh as a retained GPU resident, its vertices as
-    /// given and its texture (if any) with its mip chain; the transform
-    /// comes at submission.
+    /// given; its texture (if any) is uploaded when the device does not
+    /// hold it already. The transform comes at submission.
     pub fn create_retained_mesh(
         &self,
         device: &wgpu::Device,

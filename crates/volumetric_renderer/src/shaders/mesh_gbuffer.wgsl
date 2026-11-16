@@ -27,8 +27,11 @@ struct VsIn {
     @location(5) model_2: vec4<f32>,
     @location(6) model_3: vec4<f32>,
     @location(7) ids: vec2<u32>,
-    // Image-convention texture coordinate: (0, 0) the top-left texel.
-    @location(8) uv: vec2<f32>,
+    // Image-convention texture coordinate, (0, 0) the top-left texel, in
+    // two halves: they fill the vertex's position and normal out to 16
+    // bytes each.
+    @location(8) u: f32,
+    @location(9) v: f32,
 };
 
 struct VsOut {
@@ -47,7 +50,7 @@ fn vs_main(in: VsIn) -> VsOut {
     out.normal_world = mat3x3<f32>(model[0].xyz, model[1].xyz, model[2].xyz) * in.normal;
     out.color = in.color;
     out.ids = in.ids;
-    out.uv = in.uv;
+    out.uv = vec2<f32>(in.u, in.v);
     return out;
 }
 

@@ -5,7 +5,7 @@
 use bytemuck::{Pod, Zeroable};
 
 use crate::ViewGizmo;
-pub use crate::texture::TextureData;
+pub use crate::texture::{SceneTexture, TextureData};
 
 // ============================================================================
 // Mesh Types
@@ -18,26 +18,26 @@ pub struct MeshData {
     pub indices: Option<Vec<u32>>,
     /// The base-colour map the vertices' `uv` address, multiplied into
     /// their colour; `None` draws the vertex colour alone.
-    pub texture: Option<std::sync::Arc<TextureData>>,
+    pub texture: Option<std::sync::Arc<SceneTexture>>,
 }
 
 /// A single mesh vertex with position, normal, color and texture
-/// coordinate. Padded for GPU alignment (64 bytes total).
+/// coordinate: 48 bytes, the position and the normal each rounded out to
+/// 16 by one half of the texture coordinate.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct MeshVertex {
     pub position: [f32; 3],
-    pub _pad0: f32,
+    /// Where in the mesh's texture this corner samples, across: 0 is the
+    /// image's left edge, 1 its right; values outside repeat. Unused
+    /// (zero) when the mesh has no texture.
+    pub u: f32,
     pub normal: [f32; 3],
-    pub _pad1: f32,
+    /// The same, down the image: 0 is its top edge, 1 its bottom.
+    pub v: f32,
     /// Linear RGBA multiplied into the material base color; white for the
     /// plain untinted look.
     pub color: [f32; 4],
-    /// Where in the mesh's texture this corner samples: `(0, 0)` is the
-    /// image's top-left texel, `(1, 1)` its bottom-right; values outside
-    /// repeat. Unused (zero) when the mesh has no texture.
-    pub uv: [f32; 2],
-    pub _pad2: [f32; 2],
 }
 
 /// A surface point drawn as a disc: the geometry a direct cast of a model
@@ -95,13 +95,16 @@ impl MeshVertex {
     pub fn textured(position: [f32; 3], normal: [f32; 3], color: [f32; 4], uv: [f32; 2]) -> Self {
         Self {
             position,
-            _pad0: 0.0,
+            u: uv[0],
             normal,
-            _pad1: 0.0,
+            v: uv[1],
             color,
-            uv,
-            _pad2: [0.0; 2],
         }
+    }
+
+    /// The texture coordinate, `[u, v]`.
+    pub fn uv(&self) -> [f32; 2] {
+        [self.u, self.v]
     }
 }
 

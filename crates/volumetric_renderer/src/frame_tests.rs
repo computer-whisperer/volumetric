@@ -147,6 +147,124 @@ fn a_lit_surface_resolves_to_the_lighting_models_value() {
     });
 }
 
+/// A 2×2 checker, top row red then green, bottom row blue then white,
+/// with a grey 1×1 level under it.
+fn checker() -> crate::TextureData {
+    crate::TextureData::from_levels(
+        2,
+        2,
+        vec![
+            vec![
+                255, 0, 0, 255, 0, 255, 0, 255, //
+                0, 0, 255, 255, 255, 255, 255, 255,
+            ],
+            vec![128, 128, 128, 255],
+        ],
+    )
+}
+
+/// A quad over `±1` in x and y that maps the whole of `texture`, its top
+/// row toward +y.
+fn textured_quad(texture: &std::sync::Arc<crate::SceneTexture>) -> MeshData {
+    let normal = [0.0, 0.0, 1.0];
+    let vertex =
+        |x: f32, y: f32, uv: [f32; 2]| MeshVertex::textured([x, y, 0.0], normal, [1.0; 4], uv);
+    MeshData {
+        vertices: vec![
+            vertex(-1.0, -1.0, [0.0, 1.0]),
+            vertex(1.0, -1.0, [1.0, 1.0]),
+            vertex(1.0, 1.0, [1.0, 0.0]),
+            vertex(-1.0, 1.0, [0.0, 0.0]),
+        ],
+        indices: Some(vec![0, 1, 2, 0, 2, 3]),
+        texture: Some(texture.clone()),
+    }
+}
+
+/// Whether the frame shows the checker's red texel, at the quad's top
+/// left.
+fn shows_red_top_left(offscreen: &Offscreen, renderer: &mut Renderer) -> bool {
+    let (rgba, _) = offscreen
+        .render_rgba(renderer, &view(), &settings(false))
+        .unwrap();
+    let (px, py) = at(&view(), Vec3::new(-0.5, 0.5, 0.0));
+    let [r, g, b] = pixel(&rgba, px, py).map(i32::from);
+    r > g + 60 && r > b + 60
+}
+
+/// A texture that can make its pixels again gives them up at the first
+/// upload, and every later mesh on that device shares the copy made
+/// then: nothing is decoded or sent twice. One that cannot keeps them.
+#[test]
+fn a_reloadable_texture_keeps_only_the_devices_copy() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    on_each_backend(|offscreen| {
+        let reloads = Arc::new(AtomicUsize::new(0));
+        let counter = reloads.clone();
+        let texture = Arc::new(crate::SceneTexture::reloadable(checker(), move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+            Some(checker())
+        }));
+        assert!(texture.holds_pixels());
+        assert_eq!(texture.size(), (2, 2));
+
+        let mut renderer = offscreen.renderer(W, H);
+        let (device, queue) = (offscreen.device(), offscreen.queue());
+        let first = renderer.create_retained_mesh(device, queue, &textured_quad(&texture));
+        assert!(!texture.holds_pixels(), "dropped once the device has them");
+        // The mesh goes (its output hidden); the texture's copy stays, so
+        // showing it again takes neither the pixels nor a reload.
+        drop(first);
+        let again = renderer.create_retained_mesh(device, queue, &textured_quad(&texture));
+        assert_eq!(reloads.load(Ordering::Relaxed), 0);
+        renderer.submit_retained_mesh(&again, Mat4::IDENTITY, ObjectId(1), MaterialId(0));
+        assert!(shows_red_top_left(offscreen, &mut renderer));
+
+        let kept = Arc::new(crate::SceneTexture::new(checker()));
+        let _mesh = renderer.create_retained_mesh(device, queue, &textured_quad(&kept));
+        assert!(kept.holds_pixels(), "nothing could make them again");
+    });
+}
+
+/// A renderer on a second device gets its own copy: the pixels are made
+/// again for it, and a texture that cannot make them draws its mesh
+/// untextured.
+#[test]
+fn another_device_reloads_the_texture() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (Ok(one), Ok(two)) = (Offscreen::new(), Offscreen::new()) else {
+        eprintln!("skipped: no adapter");
+        return;
+    };
+    let reloads = Arc::new(AtomicUsize::new(0));
+    let counter = reloads.clone();
+    let texture = Arc::new(crate::SceneTexture::reloadable(checker(), move || {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Some(checker())
+    }));
+    let lost = Arc::new(crate::SceneTexture::reloadable(checker(), || None));
+    for (offscreen, expected_reloads) in [(&one, 0), (&two, 1)] {
+        let mut renderer = offscreen.renderer(W, H);
+        let (device, queue) = (offscreen.device(), offscreen.queue());
+        let mesh = renderer.create_retained_mesh(device, queue, &textured_quad(&texture));
+        assert_eq!(reloads.load(Ordering::Relaxed), expected_reloads);
+        renderer.submit_retained_mesh(&mesh, Mat4::IDENTITY, ObjectId(1), MaterialId(0));
+        assert!(shows_red_top_left(offscreen, &mut renderer));
+
+        // The first renderer to draw `lost` takes its pixels; the next has
+        // none to take and the quad is the plain white of its vertices.
+        let mut renderer = offscreen.renderer(W, H);
+        let mesh = renderer.create_retained_mesh(device, queue, &textured_quad(&lost));
+        renderer.submit_retained_mesh(&mesh, Mat4::IDENTITY, ObjectId(1), MaterialId(0));
+        assert_eq!(
+            shows_red_top_left(offscreen, &mut renderer),
+            expected_reloads == 0
+        );
+    }
+}
+
 /// A textured quad shows its texture: a 2×2 checker of red, green, blue
 /// and white lands one colour per quadrant, with the image's top row at
 /// the top of the frame (uv (0, 0) is the image's top-left texel).
@@ -154,14 +272,7 @@ fn a_lit_surface_resolves_to_the_lighting_models_value() {
 fn a_textured_quad_shows_its_texture_the_right_way_up() {
     on_each_backend(|offscreen| {
         let mut renderer = offscreen.renderer(W, H);
-        let texture = crate::TextureData::from_rgba8(
-            2,
-            2,
-            vec![
-                255, 0, 0, 255, 0, 255, 0, 255, //
-                0, 0, 255, 255, 255, 255, 255, 255,
-            ],
-        );
+        let texture = checker();
         let normal = [0.0, 0.0, 1.0];
         let vertex =
             |x: f32, y: f32, uv: [f32; 2]| MeshVertex::textured([x, y, 0.0], normal, [1.0; 4], uv);
@@ -176,7 +287,7 @@ fn a_textured_quad_shows_its_texture_the_right_way_up() {
                     vertex(-1.0, 1.0, [0.0, 0.0]),
                 ],
                 indices: Some(vec![0, 1, 2, 0, 2, 3]),
-                texture: Some(std::sync::Arc::new(texture)),
+                texture: Some(std::sync::Arc::new(crate::SceneTexture::new(texture))),
             },
         );
         assert_eq!(mesh.texture_downscaled, None);

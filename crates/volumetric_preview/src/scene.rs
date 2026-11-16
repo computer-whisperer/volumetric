@@ -1511,7 +1511,17 @@ fn build_tri_mesh_preview(
                     "textured: {} {}×{}",
                     tex.name, data.width, data.height
                 ));
-                Some(std::sync::Arc::new(data))
+                // Decoded, an atlas is far larger than everything else
+                // here, so the scene gives the pixels up once the device
+                // has them. The mesh's own bytes can make them again.
+                let source = request.data.clone();
+                Some(std::sync::Arc::new(renderer::SceneTexture::reloadable(
+                    data,
+                    move || {
+                        let mesh = volumetric::trimesh::decode_tri_mesh(source.as_slice()).ok()?;
+                        decode_mesh_texture(mesh.base_color_texture()?).ok()
+                    },
+                )))
             }
             Err(err) => {
                 texture_detail.push(format!("texture {}: {err}", tex.name));
@@ -1631,11 +1641,22 @@ fn decode_mesh_texture(
     if width == 0 || height == 0 {
         return Err(format!("empty image {width}×{height}"));
     }
-    Ok(renderer::TextureData::from_rgba8(
-        width,
-        height,
-        image.into_raw(),
-    ))
+    Ok(mip_chain(width, height, image.into_raw()))
+}
+
+/// A `width × height` sRGB RGBA8 image (top row first) with every mip
+/// level down to 1×1, each averaged in linear light from the one above
+/// by the filter a model's stored texture is shrunk with.
+fn mip_chain(width: u32, height: u32, rgba: Vec<u8>) -> renderer::TextureData {
+    use volumetric::srgb::{half_side, halve};
+    let mut levels = vec![rgba];
+    let (mut w, mut h) = (width, height);
+    while w > 1 || h > 1 {
+        let next = halve(levels.last().expect("level 0"), 4, w, h);
+        (w, h) = (half_side(w), half_side(h));
+        levels.push(next);
+    }
+    renderer::TextureData::from_levels(width, height, levels)
 }
 
 /// Preview for a Subspace value: decode and validate now, but bake no
@@ -1790,12 +1811,18 @@ mod tri_mesh_tests {
         let entity = build_tri_mesh_preview(&request(&mesh), web_time::Instant::now()).unwrap();
         let (data, _, _) = &entity.scene.meshes[0];
         let texture = data.texture.as_ref().expect("texture");
-        assert_eq!((texture.width, texture.height), (2, 2));
-        assert_eq!(texture.levels.len(), 2);
-        assert_eq!(&texture.levels[0][0..4], &[255, 0, 0, 255]);
+        assert_eq!(texture.size(), (2, 2));
+        assert!(texture.holds_pixels(), "until a device has them");
+        let pixels = decode_mesh_texture(&mesh.textures[0]).unwrap();
+        assert_eq!((pixels.width, pixels.height), (2, 2));
+        assert_eq!(pixels.levels.len(), 2);
+        assert_eq!(&pixels.levels[0][0..4], &[255, 0, 0, 255]);
+        // The 1×1 level is the four texels' mean in linear light: half
+        // of each channel is sRGB 188.
+        assert_eq!(pixels.levels[1], vec![188, 188, 188, 255]);
         // Both windings carry the corners' uvs: (0,0) -> (0,1), (1,0) ->
         // (1,1), (0,1) -> (0,0).
-        let uvs: Vec<[f32; 2]> = data.vertices.iter().map(|v| v.uv).collect();
+        let uvs: Vec<[f32; 2]> = data.vertices.iter().map(|v| v.uv()).collect();
         assert_eq!(
             uvs,
             vec![
@@ -1819,6 +1846,19 @@ mod tri_mesh_tests {
         );
     }
 
+    /// The chain halves an odd image down to 1×1, rounding down.
+    #[test]
+    fn the_mip_chain_runs_down_to_one_texel() {
+        let chain = mip_chain(5, 3, [200u8, 37, 101, 255].repeat(5 * 3));
+        let sizes: Vec<_> = (0..chain.levels.len())
+            .map(|l| chain.level_size(l))
+            .collect();
+        assert_eq!(sizes, vec![(5, 3), (2, 1), (1, 1)]);
+        // A flat image is the same colour at every level.
+        assert_eq!(chain.levels[2], vec![200, 37, 101, 255]);
+        assert_eq!(mip_chain(1, 1, vec![1, 2, 3, 4]).levels.len(), 1);
+    }
+
     /// Bytes that are not an image leave the mesh untextured, uvs zero,
     /// and the failure in the stats.
     #[test]
@@ -1828,7 +1868,7 @@ mod tri_mesh_tests {
         let entity = build_tri_mesh_preview(&request(&mesh), web_time::Instant::now()).unwrap();
         let (data, _, _) = &entity.scene.meshes[0];
         assert!(data.texture.is_none());
-        assert!(data.vertices.iter().all(|v| v.uv == [0.0; 2]));
+        assert!(data.vertices.iter().all(|v| v.uv() == [0.0; 2]));
         assert!(
             entity
                 .stats
