@@ -1,10 +1,12 @@
 //! End-to-end test of obj_import_operator (OBJ + texture → TriMesh), chained
 //! into mesh_to_model_operator for a solid, executed through the real wasm
-//! pipeline; plus a run over a real scanner export when one is on disk.
+//! pipeline; plus a real scanner export from import to a cut solid when
+//! `VOLUMETRIC_TEST_OBJ` names one.
 //!
 //! Requires the wasm32 artifacts:
 //!   cargo build --target wasm32-unknown-unknown --release \
-//!     -p obj_import_operator -p mesh_to_model_operator
+//!     -p obj_import_operator -p mesh_to_model_operator \
+//!     -p translate_operator -p rectangular_prism_operator -p boolean_operator
 
 #![cfg(feature = "native")]
 
@@ -179,57 +181,207 @@ fn texture_without_uvs_is_dropped_and_the_mesh_still_imports() {
     assert!(mesh.uv_field().is_none());
 }
 
-/// A real phone-scanner export, when the fixture directory is on this
-/// machine (skips otherwise): the whole atlas-textured mesh goes through
-/// the importer and the timing is printed.
-#[test]
-fn real_scan_imports_when_present() {
-    let dir =
-        std::path::PathBuf::from("/path/to/a/scan");
-    let obj_path = dir.join("scan.obj");
-    if !obj_path.is_file() {
-        eprintln!("skipping: {} not present", obj_path.display());
-        return;
-    }
-    let obj = std::fs::read(&obj_path).unwrap();
-    let jpg = std::fs::read(dir.join("scan.jpg")).unwrap();
-
+/// Runs one operator on `inputs` and returns its first output's bytes,
+/// the warnings it posted and how long it took.
+fn run_step(
+    operator: &str,
+    inputs: Vec<ExecutionInput>,
+) -> (Vec<u8>, Vec<String>, std::time::Duration) {
     let mut project = Project::new();
     project.imports.push(ImportedAsset::operator(
-        "importer".to_string(),
-        wasm_artifact("obj_import_operator"),
+        "op".to_string(),
+        wasm_artifact(operator),
     ));
     project.timeline.push(ExecutionStep {
-        operator_id: "importer".to_string(),
-        inputs: vec![
-            ExecutionInput::Inline(obj),
-            ExecutionInput::Inline(jpg.clone()),
-            ExecutionInput::Inline(config(vec![(
-                "texture_name",
-                ciborium::Value::Text("scan.jpg".to_string()),
-            )])),
-        ],
-        outputs: vec!["scan".to_string()],
+        operator_id: "op".to_string(),
+        inputs,
+        outputs: vec!["out".to_string()],
     });
-    project.exports = vec!["scan".to_string()];
+    project.exports = vec!["out".to_string()];
     let start = std::time::Instant::now();
     let mut env = Environment::new();
-    let exports = project.run(&mut env).expect("project runs");
-    let elapsed = start.elapsed();
-    let mesh = decode_tri_mesh(exports[0].data()).unwrap();
+    let exports = project
+        .run(&mut env)
+        .unwrap_or_else(|e| panic!("{operator}: {e}"));
+    (
+        exports[0].data().to_vec(),
+        exports[0].warnings().to_vec(),
+        start.elapsed(),
+    )
+}
+
+fn vec3(v: [f64; 3]) -> ExecutionInput {
+    ExecutionInput::Inline(v.iter().flat_map(|c| c.to_le_bytes()).collect())
+}
+
+/// The sRGB colour a model gives at `p`.
+fn color_at(model: &[u8], p: [f64; 3]) -> [f32; 3] {
+    let mut executor = create_model_executor(model).expect("model loads");
+    let trio = executor
+        .sample_format()
+        .expect("sample format")
+        .color_trio()
+        .expect("the model declares the sRGB trio");
+    let row = executor.sample_channels_nd(&p).expect("sample_channels");
+    trio.map(|i| row[i])
+}
+
+/// A real scanner export, start to finish, when `VOLUMETRIC_TEST_OBJ`
+/// names one (the `.obj`, with its material library and texture beside
+/// it); skipped otherwise. The sidecars are found as the GUI finds them,
+/// the mesh becomes a solid at the default texture size and at full
+/// size, and the solid is moved and cut: each stage's time and size is
+/// printed, and the colour has to come through every one of them.
+///
+///   VOLUMETRIC_TEST_OBJ=/path/to/scan.obj cargo test --test obj_import -- --nocapture real_scan
+#[test]
+fn real_scan_keeps_its_colour_through_a_move_and_a_cut() {
+    let Some(obj_path) = std::env::var_os("VOLUMETRIC_TEST_OBJ").map(std::path::PathBuf::from)
+    else {
+        eprintln!("skipping: VOLUMETRIC_TEST_OBJ is not set");
+        return;
+    };
+    let obj = std::fs::read(&obj_path).expect("VOLUMETRIC_TEST_OBJ is readable");
+    let import = volumetric::obj_sidecar::resolve_beside(&obj_path, &obj).into_import(obj);
+    eprintln!("sidecars: {}", import.note);
+    assert_eq!(import.blobs.len(), 2, "a texture beside the OBJ");
+    let texture_bytes = import.blobs[1].clone();
+    let mut inputs: Vec<ExecutionInput> = import
+        .blobs
+        .into_iter()
+        .map(ExecutionInput::Inline)
+        .collect();
+    inputs.push(ExecutionInput::Inline(config(
+        import
+            .config
+            .iter()
+            .map(|(key, value)| (key.as_str(), ciborium::Value::Text(value.clone())))
+            .collect(),
+    )));
+
+    let (scan, warnings, elapsed) = run_step("obj_import_operator", inputs);
+    let mesh = decode_tri_mesh(&scan).unwrap();
     eprintln!(
-        "scan: {} vertices, {} triangles, texture {} bytes, imported in {elapsed:?}",
+        "import: {} vertices, {} triangles, texture {} bytes, {elapsed:?}; warnings {warnings:?}",
         mesh.vertex_count(),
         mesh.triangle_count(),
-        mesh.textures[0].bytes.len()
+        texture_bytes.len()
     );
-    assert_eq!(mesh.triangle_count(), 170_783);
-    assert!(mesh.vertex_count() >= 93_480, "at least one vertex per vt");
-    assert_eq!(mesh.textures[0].bytes, jpg);
-    assert_eq!(mesh.textures[0].media_type, "image/jpeg");
+    assert!(mesh.triangle_count() > 0);
+    assert!(mesh.uv_field().is_some());
+    let texture = mesh.base_color_texture().expect("texture attached");
+    assert_eq!(texture.bytes, texture_bytes);
+    assert!(texture.media_type.starts_with("image/"));
+
+    // Is the surface closed? Corners are split along UV seams, so edges
+    // are counted between positions, not vertex indices.
+    let mut ids = std::collections::HashMap::new();
+    let mut position_id = |vertex: u32| -> u32 {
+        let key = mesh.position(vertex as usize).map(f64::to_bits);
+        let next = ids.len() as u32;
+        *ids.entry(key).or_insert(next)
+    };
+    let mut edges: std::collections::HashMap<(u32, u32), u32> = std::collections::HashMap::new();
+    for t in 0..mesh.triangle_count() {
+        let [a, b, c] = mesh.triangle(t).map(&mut position_id);
+        for (i, j) in [(a, b), (b, c), (c, a)] {
+            *edges.entry((i.min(j), i.max(j))).or_default() += 1;
+        }
+    }
+    let open = edges.values().filter(|&&n| n == 1).count();
+    let shared_by_more = edges.values().filter(|&&n| n > 2).count();
+    eprintln!(
+        "surface: {} edges, {open} on a boundary (0 = closed), {shared_by_more} shared by more than two triangles",
+        edges.len()
+    );
+
+    // A point just inside the surface, a third of the way through the
+    // triangle list, and the box that keeps its half of the mesh.
     let b = mesh.bounds().unwrap();
-    assert!(
-        (b[1] - b[0] - 0.588).abs() < 0.01,
-        "extent in metres: {b:?}"
-    );
+    let [i, j, k] = mesh.triangle(mesh.triangle_count() / 3);
+    let corners = [i, j, k].map(|v| mesh.position(v as usize));
+    let on_surface: [f64; 3] =
+        std::array::from_fn(|a| (corners[0][a] + corners[1][a] + corners[2][a]) / 3.0);
+    let mid_x = (b[0] + b[1]) / 2.0;
+    let (x0, x1) = if on_surface[0] < mid_x {
+        (b[0] - 1.0, mid_x + (b[1] - b[0]) * 0.2)
+    } else {
+        (mid_x - (b[1] - b[0]) * 0.2, b[1] + 1.0)
+    };
+
+    for (label, max_size) in [
+        ("default texture size", None),
+        ("full texture size", Some(0)),
+    ] {
+        let mut inputs = vec![ExecutionInput::Inline(scan.clone())];
+        if let Some(max_size) = max_size {
+            inputs.push(ExecutionInput::Inline(config(vec![(
+                "texture_max_size",
+                ciborium::Value::Integer(max_size.into()),
+            )])));
+        }
+        let (solid, warnings, elapsed) = run_step("mesh_to_model_operator", inputs);
+        eprintln!(
+            "{label}: Mesh to Model {elapsed:?}, model {:.1} MiB; warnings {warnings:?}",
+            solid.len() as f64 / 1048576.0
+        );
+        let colour = color_at(&solid, on_surface);
+        eprintln!("{label}: colour at {on_surface:?} is {colour:?}");
+        assert!(colour.iter().all(|c| (0.0..=1.0).contains(c)));
+
+        let shift = [0.25, -0.5, 0.125];
+        let (moved, _, elapsed) = run_step(
+            "translate_operator",
+            vec![
+                ExecutionInput::Inline(solid.clone()),
+                ExecutionInput::Inline(config(vec![
+                    ("dx", ciborium::Value::Float(shift[0])),
+                    ("dy", ciborium::Value::Float(shift[1])),
+                    ("dz", ciborium::Value::Float(shift[2])),
+                ])),
+            ],
+        );
+        eprintln!(
+            "{label}: translate {elapsed:?}, model {:.1} MiB",
+            moved.len() as f64 / 1048576.0
+        );
+        let there = std::array::from_fn(|a| on_surface[a] + shift[a]);
+        assert_eq!(color_at(&moved, there), colour, "{label}: moved");
+
+        let (keep, _, _) = run_step(
+            "rectangular_prism_operator",
+            vec![
+                ExecutionInput::Inline(config(vec![(
+                    "mode",
+                    ciborium::Value::Text("opposite_corners".to_string()),
+                )])),
+                vec3([x0, b[2] - 1.0, b[4] - 1.0]),
+                vec3([x1, b[3] + 1.0, b[5] + 1.0]),
+            ],
+        );
+        let (cut, _, elapsed) = run_step(
+            "boolean_operator",
+            vec![
+                ExecutionInput::Inline(solid.clone()),
+                ExecutionInput::Inline(keep),
+                ExecutionInput::Inline(config(vec![(
+                    "op",
+                    ciborium::Value::Text("intersect".to_string()),
+                )])),
+            ],
+        );
+        eprintln!(
+            "{label}: intersect {elapsed:?}, model {:.1} MiB",
+            cut.len() as f64 / 1048576.0
+        );
+        assert_eq!(color_at(&cut, on_surface), colour, "{label}: cut");
+        // The cut took the far side away.
+        let far = [
+            if on_surface[0] < mid_x { b[1] } else { b[0] },
+            on_surface[1],
+            on_surface[2],
+        ];
+        let mut executor = create_model_executor(&cut).expect("model loads");
+        assert!(!is_occupied(executor.sample_nd(&far).unwrap()));
+    }
 }
