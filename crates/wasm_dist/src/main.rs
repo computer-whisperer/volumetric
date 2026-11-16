@@ -24,27 +24,62 @@ const THREADED_OPERATORS: &[&str] = &[
 /// - `--max-memory`: the target's default shared-memory cap (1 GiB) is too
 ///   small for large FEA meshes; the maximum is reserved address space,
 ///   not committed memory, so 4 GiB costs nothing up front.
-/// - `crt1-reactor.o`: cdylibs link no C runtime entry at all, leaving
-///   wasi-libc's thread runtime (pthread self, the thread list, main TLS)
-///   uninitialized — the first pthread-key operation then walks a garbage
-///   thread list and spins forever. The reactor crt exports `_initialize`,
-///   which the host calls once per instance before anything else.
+/// - `crt1-reactor.o`, before Rust 1.100: cdylibs linked no C runtime entry
+///   at all, leaving wasi-libc's thread runtime (pthread self, the thread
+///   list, main TLS) uninitialized — the first pthread-key operation then
+///   walks a garbage thread list and spins forever. The reactor crt exports
+///   `_initialize`, which the host calls once per instance before anything
+///   else. From 1.100 rustc links the reactor crt into cdylibs itself, and a
+///   second copy fails the link with a duplicate `_initialize`.
 fn threaded_rustflags() -> String {
-    let sysroot = String::from_utf8(
-        Command::new("rustc")
-            .args(["--print", "sysroot"])
-            .output()
-            .expect("rustc --print sysroot")
-            .stdout,
-    )
-    .expect("sysroot is utf-8");
-    let crt = Path::new(sysroot.trim())
-        .join("lib/rustlib/wasm32-wasip1-threads/lib/self-contained/crt1-reactor.o");
-    assert!(crt.exists(), "missing reactor crt: {}", crt.display());
-    format!(
-        "-C link-arg=--max-memory=4294967296 -C link-arg={}",
-        crt.display()
-    )
+    let mut flags = String::from("-C link-arg=--max-memory=4294967296");
+    if rustc_release() < (1, 100) {
+        let crt = Path::new(rustc(&["--print", "sysroot"]).trim())
+            .join("lib/rustlib/wasm32-wasip1-threads/lib/self-contained/crt1-reactor.o");
+        assert!(crt.exists(), "missing reactor crt: {}", crt.display());
+        flags.push_str(&format!(" -C link-arg={}", crt.display()));
+    }
+    flags
+}
+
+fn rustc(args: &[&str]) -> String {
+    let output = Command::new("rustc")
+        .args(args)
+        .output()
+        .unwrap_or_else(|e| panic!("rustc {args:?}: {e}"));
+    String::from_utf8(output.stdout).expect("rustc output is utf-8")
+}
+
+/// `(major, minor)` of the rustc cargo will build with, from the `release:`
+/// line of `rustc -vV` (`1.100.0`, `1.102.0-nightly`).
+fn rustc_release() -> (u32, u32) {
+    let verbose = rustc(&["-vV"]);
+    let release = verbose
+        .lines()
+        .find_map(|line| line.strip_prefix("release: "))
+        .expect("rustc -vV prints a release line");
+    let mut parts = release.split(['.', '-']).map(str::parse::<u32>);
+    match (parts.next(), parts.next()) {
+        (Some(Ok(major)), Some(Ok(minor))) => (major, minor),
+        _ => panic!("unrecognized rustc release: {release}"),
+    }
+}
+
+/// Whether a module exports `_initialize`, the reactor entry the host calls
+/// before anything else. The host treats it as optional (baseline modules
+/// have none), so a threaded variant without it would spin at its first
+/// pthread-key operation rather than fail; check at pack time instead.
+fn exports_initialize(module: &[u8]) -> anyhow::Result<bool> {
+    for payload in wasmparser::Parser::new(0).parse_all(module) {
+        if let wasmparser::Payload::ExportSection(exports) = payload? {
+            for export in exports {
+                if export?.name == "_initialize" {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn workspace_root() -> PathBuf {
@@ -92,6 +127,10 @@ fn main() -> anyhow::Result<()> {
         let variant_path = root.join(format!("target/wasm32-wasip1-threads/release/{op}.wasm"));
         let baseline_bytes = std::fs::read(&baseline_path)?;
         let variant_bytes = std::fs::read(&variant_path)?;
+        anyhow::ensure!(
+            exports_initialize(&variant_bytes)?,
+            "{op}: threaded variant does not export _initialize (see threaded_rustflags)"
+        );
         let packed =
             volumetric::wasm::variant::embed_threaded_variant(&baseline_bytes, &variant_bytes)
                 .map_err(|e| anyhow::anyhow!("packing {op}: {e}"))?;
@@ -109,4 +148,28 @@ fn main() -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::exports_initialize;
+
+    const HEADER: &[u8] = b"\0asm\x01\0\0\0";
+
+    /// A module with one memory, exported under `name`.
+    fn module_exporting(name: &str) -> Vec<u8> {
+        let mut bytes = HEADER.to_vec();
+        bytes.extend_from_slice(&[5, 3, 1, 0, 1]); // memory section: 1 memory, min 1 page
+        bytes.extend_from_slice(&[7, 4 + name.len() as u8, 1, name.len() as u8]);
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.extend_from_slice(&[2, 0]); // memory 0
+        bytes
+    }
+
+    #[test]
+    fn exports_initialize_reads_the_export_section() {
+        assert!(exports_initialize(&module_exporting("_initialize")).unwrap());
+        assert!(!exports_initialize(&module_exporting("memory")).unwrap());
+        assert!(!exports_initialize(HEADER).unwrap());
+    }
 }

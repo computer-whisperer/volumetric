@@ -7,3 +7,5 @@ edition = "2024"
 # Only for wasm::variant (pure byte munging) — no engine features.
 volumetric = { path = "../..", default-features = false }
 anyhow = "1"
+# Pack-time check that each threaded variant exports _initialize.
+wasmparser = "0.263"

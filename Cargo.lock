@@ -6577,6 +6577,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "volumetric",
+ "wasmparser 0.263.0",
 ]
 
 [[package]]
