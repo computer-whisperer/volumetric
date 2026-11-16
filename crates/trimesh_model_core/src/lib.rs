@@ -85,6 +85,10 @@ const COLOR_KIND_UV: u32 = 2;
 /// section at all.
 #[derive(Default)]
 pub struct BuildOptions<'a> {
+    /// Write no colour section whatever the mesh carries, for a consumer
+    /// that reads geometry alone (the height model): a coloured mesh then
+    /// costs it nothing.
+    pub geometry_only: bool,
     /// Texel encoding for a texture section.
     pub texture_format: TextureFormat,
     /// Box-filter the texture down until both extents are at most this
@@ -211,7 +215,9 @@ pub fn build_payload(mesh: &TriMesh, options: &BuildOptions) -> Result<Vec<u8>, 
         Vertex(Vec<f32>),                 // 9 f32 per reordered triangle
         Textured(Vec<f32>, TextureImage), // 6 f32 per reordered triangle
     }
-    let color = {
+    let color = if options.geometry_only {
+        None
+    } else {
         let texture = match (mesh.base_color_texture(), options.decode_texture) {
             (Some(texture), Some(decode)) => match decode(texture) {
                 Some(image) => {
@@ -1101,6 +1107,17 @@ mod tests {
         });
         let mut payload = plain(&colored);
         assert!(PayloadView::new(&payload).unwrap().has_color());
+        // Geometry only: the same mesh, the plain cube's bytes.
+        let bare = build_payload(
+            &colored,
+            &BuildOptions {
+                geometry_only: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!PayloadView::new(&bare).unwrap().has_color());
+        assert_eq!(bare, plain(&cube(0.0, 1.0)));
         payload.truncate(payload.len() - 4);
         assert!(PayloadView::new(&payload).is_err());
     }
@@ -1309,6 +1326,7 @@ mod tests {
         build_payload(
             mesh,
             &BuildOptions {
+                geometry_only: false,
                 texture_format: format,
                 texture_max_size: 0,
                 decode_texture: Some(&decode),
@@ -1392,6 +1410,7 @@ mod tests {
         let payload = build_payload(
             &mesh,
             &BuildOptions {
+                geometry_only: false,
                 decode_texture: Some(&fail),
                 ..BuildOptions::default()
             },
@@ -1405,6 +1424,7 @@ mod tests {
         let payload = build_payload(
             &uv_cube(),
             &BuildOptions {
+                geometry_only: false,
                 decode_texture: Some(&fail),
                 ..BuildOptions::default()
             },
@@ -1425,6 +1445,7 @@ mod tests {
         let payload = build_payload(
             &mesh,
             &BuildOptions {
+                geometry_only: false,
                 texture_format: TextureFormat::Rgb8,
                 texture_max_size: 3,
                 decode_texture: Some(&decode),

@@ -3210,7 +3210,7 @@ dependencies = [
 
 [[package]]
 name = "mesh_height_operator"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ciborium",
  "model_wrap_core",
@@ -3242,9 +3242,12 @@ dependencies = [
 
 [[package]]
 name = "mesh_to_model_operator"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "ciborium",
+ "image",
  "model_wrap_core",
+ "serde",
  "trimesh_model_core",
  "volumetric_abi",
  "walrus",
@@ -5998,6 +6001,7 @@ name = "trimesh_model_template"
 version = "0.1.0"
 dependencies = [
  "trimesh_model_core",
+ "volumetric_abi",
 ]
 
 [[package]]

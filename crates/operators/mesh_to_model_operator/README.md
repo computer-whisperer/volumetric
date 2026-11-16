@@ -36,9 +36,12 @@ geometry without it, falling back to vertex colour or to no colour.
 
 Textures are decoded (JPEG, PNG) and stored inside the model, by default
 BC1-compressed (4 bits per texel, 6x smaller than raw RGB, lossy in the
-way GPU textures usually are). A scanner's 8192² atlas is 32 MiB as BC1
-and 192 MiB raw; use `texture_max_size` when the model is going to be
-meshed far coarser than the atlas resolves.
+way GPU textures usually are) and no larger than 4096 texels on a side.
+The stored texture is part of the model's bytes, and a model derived from
+this one (a translate, a pose, a boolean) carries those bytes again, so
+size is paid at every later step: a scanner's 8192² atlas is 8 MiB at the
+default, 32 MiB as BC1 at full size and 192 MiB raw. Raise
+`texture_max_size`, or set it to 0, for close-up work.
 
 ## Config
 
@@ -48,5 +51,6 @@ project written before this slot existed has) gets the defaults.
 - `texture` (default `"bc1"`): `"bc1"`, `"rgb8"` (lossless, 24 bits per
   texel) or `"none"` (ignore the texture; fall back to vertex colour, or
   to no colour).
-- `texture_max_size` (default 0 = full size): box-filter the texture
-  down by halves until both extents are at most this many texels.
+- `texture_max_size` (default 4096; 0 = full size): halve the texture,
+  averaging in linear light, until both extents are at most this many
+  texels.

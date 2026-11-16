@@ -34,8 +34,10 @@
 //!     encoding of the texture stored in the model. `bc1` is 6x smaller
 //!     than `rgb8` and lossy (fine for photographic atlases); `none`
 //!     ignores the texture and falls back to vertex colour, if any.
-//!   - `texture_max_size` (default 0 = full size): box-filter the texture
-//!     down until both extents are at most this many texels.
+//!   - `texture_max_size` (default 4096; 0 = full size): halve the
+//!     texture, averaging in linear light, until both extents are at most
+//!     this many texels. The stored texture travels inside every model
+//!     derived from this one, so the default is a cap, not the full image.
 //!
 //! A texture that fails to decode is reported as a warning naming the
 //! texture and the error; the conversion proceeds without it (vertex
@@ -62,14 +64,18 @@ const TEMPLATE: &[u8] = include_bytes!("../template/trimesh_model_template.wasm"
 
 /// CDDL schema of the configuration input.
 const CONFIG_SCHEMA: &str =
-    r#"{ texture: tstr .default "bc1", texture_max_size: uint .default 0 }"#;
+    r#"{ texture: "bc1" / "rgb8" / "none" .default "bc1", texture_max_size: uint .default 4096 }"#;
+
+/// The default `texture_max_size`: a scanner's 8192² atlas comes down to
+/// 4096², 8 MiB as BC1.
+pub const DEFAULT_TEXTURE_MAX_SIZE: u32 = 4096;
 
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(default)]
 pub struct MeshToModelConfig {
     /// `"bc1"`, `"rgb8"` or `"none"`.
     pub texture: String,
-    /// 0 = full size.
+    /// The largest extent kept, in texels; 0 = full size.
     pub texture_max_size: u32,
 }
 
@@ -77,7 +83,7 @@ impl Default for MeshToModelConfig {
     fn default() -> Self {
         MeshToModelConfig {
             texture: "bc1".to_string(),
-            texture_max_size: 0,
+            texture_max_size: DEFAULT_TEXTURE_MAX_SIZE,
         }
     }
 }
@@ -126,6 +132,7 @@ pub fn build(mesh_bytes: &[u8], cfg: &MeshToModelConfig) -> Result<Vec<u8>, Stri
     };
     let decoder: &dyn Fn(&MeshTexture) -> Option<TextureImage> = &decode_or_warn;
     let options = BuildOptions {
+        geometry_only: false,
         texture_format: format.unwrap_or_default(),
         texture_max_size: cfg.texture_max_size,
         decode_texture: format.map(|_| decoder),
@@ -242,7 +249,7 @@ pub extern "C" fn get_metadata() -> i64 {
     volumetric_abi::metadata_reply(&METADATA, || OperatorMetadata {
         name: "mesh_to_model_operator".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-        docs: String::new(),
+        docs: include_str!("../README.md").to_string(),
         display_name: "Mesh to Model".to_string(),
         description: "Convert a triangle mesh into a sampleable model via BVH ray parity; \
                       vertex colours and textures become the sRGB surface-colour channels."

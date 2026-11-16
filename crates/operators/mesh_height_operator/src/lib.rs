@@ -183,9 +183,13 @@ pub extern "C" fn run() {
     let result = cfg.slot_bytes().and_then(|config_bytes| {
         decode_tri_mesh(&read_input(0))
             .and_then(|mesh| {
+                // The height template reads no colour, so none is stored.
                 trimesh_model_core::build_payload(
                     &mesh,
-                    &trimesh_model_core::BuildOptions::default(),
+                    &trimesh_model_core::BuildOptions {
+                        geometry_only: true,
+                        ..Default::default()
+                    },
                 )
             })
             .and_then(|payload| patch_template(&payload, config_bytes))
