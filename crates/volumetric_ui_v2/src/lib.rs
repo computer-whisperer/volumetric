@@ -3562,14 +3562,19 @@ impl VolumetricUiV2 {
     }
 
     /// Commit an array field from its per-element buffers: parse each non-empty
-    /// element as the element type, dropping blanks; a `[+ T]` list that ends
-    /// up empty (or any element that fails to parse) leaves the config
-    /// unchanged.
+    /// element as the element type (an array or record element is written as
+    /// JSON), dropping blanks; a list outside its allowed length (or any
+    /// element that fails to parse) leaves the config unchanged.
     fn commit_config_list(&mut self, step_idx: usize, config: &ConfigForm, field_name: &str) {
         let Some(field) = operator_config::find_field(&config.fields, field_name) else {
             return;
         };
-        let ConfigFieldType::List { element, min_len } = &field.ty else {
+        let ConfigFieldType::List {
+            element,
+            min_len,
+            max_len,
+        } = &field.ty
+        else {
             return;
         };
         let Some(buffers) = config.lists.get(field_name) else {
@@ -3585,7 +3590,7 @@ impl VolumetricUiV2 {
         // An empty optional list unsets the field; otherwise honor `[+ T]`.
         let value = if items.is_empty() && field.optional {
             None
-        } else if items.len() < *min_len {
+        } else if items.len() < *min_len || max_len.is_some_and(|max| items.len() > max) {
             return;
         } else {
             Some(ConfigValue::List(items))
@@ -11226,7 +11231,9 @@ mod tests {
                 // Array fields are edited element-by-element, not through the
                 // single-buffer setters this scalar-focused test drives;
                 // groups get their own toggle/nest test below.
-                ConfigFieldType::List { .. } | ConfigFieldType::Group(_) => continue,
+                ConfigFieldType::List { .. }
+                | ConfigFieldType::Record(_)
+                | ConfigFieldType::Group(_) => continue,
             };
 
             let step = &app.project().timeline()[step_idx];

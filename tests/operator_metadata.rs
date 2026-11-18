@@ -59,17 +59,11 @@ fn every_operator_metadata_decodes() {
 
         // Every declared config schema must parse with the host's CDDL
         // reader — an unparseable schema means no config form in the UI.
-        // stl_import is grandfathered: its `translate: [float, float,
-        // float]` tuple predates the form parser, which has no fixed-size
-        // tuple type yet (the UI falls back to the raw config editor).
         for (idx, input) in metadata.inputs.iter().enumerate() {
             if let volumetric::OperatorMetadataInput::CBORConfiguration(schema) = input {
-                let parsed = volumetric::operator_config::parse_schema(schema);
-                if name != "stl_import_operator" {
-                    parsed.unwrap_or_else(|e| {
-                        panic!("{name}: config schema (input {idx}) failed to parse: {e:?}")
-                    });
-                }
+                volumetric::operator_config::parse_schema(schema).unwrap_or_else(|e| {
+                    panic!("{name}: config schema (input {idx}) failed to parse: {e:?}")
+                });
             }
         }
     }
