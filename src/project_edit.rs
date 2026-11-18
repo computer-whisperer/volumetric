@@ -442,64 +442,22 @@ pub fn json_config_value(
 ) -> Result<crate::operator_config::ConfigValue> {
     use crate::operator_config::{ConfigFieldType, ConfigValue};
 
-    fn scalar(ty: &ConfigFieldType, value: &serde_json::Value, path: &str) -> Result<ConfigValue> {
-        match ty {
-            ConfigFieldType::Bool => value
-                .as_bool()
-                .map(ConfigValue::Bool)
-                .with_context(|| format!("{path}: expected a bool, got {value}")),
-            ConfigFieldType::Int => value
-                .as_i64()
-                .map(ConfigValue::Int)
-                .with_context(|| format!("{path}: expected an integer, got {value}")),
-            ConfigFieldType::Float => value
-                .as_f64()
-                .map(ConfigValue::Float)
-                .with_context(|| format!("{path}: expected a number, got {value}")),
-            ConfigFieldType::Text => value
-                .as_str()
-                .map(|s| ConfigValue::Text(s.to_string()))
-                .with_context(|| format!("{path}: expected a string, got {value}")),
-            ConfigFieldType::Enum(options) => {
-                let s = value
-                    .as_str()
-                    .with_context(|| format!("{path}: expected a string, got {value}"))?;
-                anyhow::ensure!(
-                    options.iter().any(|o| o == s),
-                    "{path}: {s:?} is not one of {}",
-                    options.join("/")
-                );
-                Ok(ConfigValue::Text(s.to_string()))
-            }
-            ConfigFieldType::List { element, min_len } => {
-                let items = value
-                    .as_array()
-                    .with_context(|| format!("{path}: expected an array, got {value}"))?;
-                anyhow::ensure!(
-                    items.len() >= *min_len,
-                    "{path}: needs at least {min_len} element(s), got {}",
-                    items.len()
-                );
-                items
-                    .iter()
-                    .map(|item| scalar(element, item, path))
-                    .collect::<Result<Vec<_>>>()
-                    .map(ConfigValue::List)
-            }
-            ConfigFieldType::Group(_) => {
-                // A bool toggles an optional group's enablement marker;
-                // sub-fields are set through their dotted paths.
-                value.as_bool().map(ConfigValue::Bool).with_context(|| {
-                    format!(
-                        "{path} is a config group: pass true/false to toggle it, \
-                         or set sub-fields via dotted paths ({path}.<field>)"
-                    )
-                })
-            }
+    let value = match &field.ty {
+        // A bool toggles an optional group's enablement marker; sub-fields
+        // are set through their dotted paths.
+        ConfigFieldType::Group(_) => value.as_bool().map(ConfigValue::Bool).with_context(|| {
+            format!(
+                "{path} is a config group: pass true/false to toggle it, \
+                 or set sub-fields via dotted paths ({path}.<field>)"
+            )
+        })?,
+        ty => {
+            let untyped: ConfigValue = serde_json::from_value(value.clone())
+                .map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
+            ty.coerce(untyped)
+                .map_err(|e| anyhow::anyhow!("{path}: {e}"))?
         }
-    }
-
-    let value = scalar(&field.ty, value, path)?;
+    };
     anyhow::ensure!(
         field.in_bounds(&value),
         "{path}: {value:?} is outside the declared bounds [{}, {}]",

@@ -20,6 +20,14 @@
 //! operator or a legacy `(default X)` annotation; string defaults may be
 //! quoted (`tstr .default "hi"`, enum `.default "z"`).
 //!
+//! Arrays take any element type but a group: `[* T]`, `[+ T]`, `[? T]`,
+//! bounded `[n*m T]` (either bound may be left out: `[2* T]`, `[*4 T]`),
+//! and homogeneous tuples `[T, T, T]` (exactly that many; `[T]` is one).
+//! An element may itself be an array (`[* [2*2 int]]`) or a record
+//! (`[* { at: [3*3 float], ? why: tstr }]`), which is one value: a CBOR map
+//! inside the array. An array default is written as JSON
+//! (`up: [3*3 float] .default [0.0, 0.0, 1.0]`).
+//!
 //! A `?` occurrence marker makes a field optional: [`encode`] omits it from
 //! the config map unless a value was explicitly set, so the operator's own
 //! absent-field behavior applies (e.g. brim's auto bed placement).
@@ -45,14 +53,20 @@ pub enum ConfigFieldType {
     Text,
     /// A string enum; the vector holds the allowed values in declaration order.
     Enum(Vec<String>),
-    /// A homogeneous array of a scalar element type (CDDL `[* T]` / `[+ T]`).
-    /// `min_len` is 1 for `[+ T]` (at least one element) and 0 for `[* T]`.
-    /// Elements are one of `Bool`/`Int`/`Float`/`Text` — not nested lists or
-    /// enums.
+    /// A homogeneous array (CDDL `[* T]`, `[+ T]`, `[n*m T]`, or a tuple
+    /// `[T, T, T]`), holding between `min_len` and `max_len` elements
+    /// (`None`: no upper bound). The element is any type but a group.
     List {
         element: Box<ConfigFieldType>,
         min_len: usize,
+        max_len: Option<usize>,
     },
+    /// A record as a value (`{ ... }` as an array element, or a field of
+    /// such a record), encoded as a CBOR map. Unlike a [`Group`] it is a
+    /// single value: an array element holds the whole record.
+    ///
+    /// [`Group`]: ConfigFieldType::Group
+    Record(Vec<ConfigField>),
     /// A named sub-record (`name: { ... }`), encoded as a nested CBOR map.
     /// Sub-fields live at dotted paths in the flat values map; the group's
     /// own path holds a `Bool` enablement marker (see the module docs).
@@ -69,6 +83,8 @@ pub enum ConfigValue {
     Float(f64),
     Text(String),
     List(Vec<ConfigValue>),
+    /// A record's entries, in order (only fields that are set).
+    Record(Vec<(String, ConfigValue)>),
 }
 
 /// One field in an operator's configuration schema.
@@ -96,7 +112,9 @@ pub enum ConfigSchemaError {
     MalformedField(String),
     #[error("empty field name in CDDL: `{0}`")]
     EmptyName(String),
-    #[error("unsupported CDDL type `{0}` (supported: bool, int, float, tstr, string enums)")]
+    #[error(
+        "unsupported CDDL type `{0}` (supported: bool, int, float, tstr, string enums, arrays and records of these)"
+    )]
     UnsupportedType(String),
 }
 
@@ -128,7 +146,8 @@ impl ConfigField {
 }
 
 impl ConfigFieldType {
-    /// The neutral value for this type when no default is declared.
+    /// The neutral value for this type when no default is declared: an
+    /// array holds `min_len` neutral elements, a record its required fields.
     pub fn zero(&self) -> ConfigValue {
         match self {
             ConfigFieldType::Bool => ConfigValue::Bool(false),
@@ -138,37 +157,143 @@ impl ConfigFieldType {
             ConfigFieldType::Enum(options) => {
                 ConfigValue::Text(options.first().cloned().unwrap_or_default())
             }
-            ConfigFieldType::List { .. } => ConfigValue::List(Vec::new()),
+            ConfigFieldType::List {
+                element, min_len, ..
+            } => ConfigValue::List(vec![element.zero(); *min_len]),
+            ConfigFieldType::Record(fields) => ConfigValue::Record(
+                fields
+                    .iter()
+                    .filter(|f| !f.optional)
+                    .map(|f| (f.name.clone(), f.seed_value()))
+                    .collect(),
+            ),
             // A group's own value is its enablement marker.
             ConfigFieldType::Group(_) => ConfigValue::Bool(false),
+        }
+    }
+
+    /// A type holding one value that is not an array or a record.
+    fn is_scalar(&self) -> bool {
+        !matches!(
+            self,
+            ConfigFieldType::List { .. } | ConfigFieldType::Record(_) | ConfigFieldType::Group(_)
+        )
+    }
+
+    /// Check an untyped value (one read from JSON) against this type, at
+    /// every depth: integers become floats where a float is declared (an
+    /// operator decoding `f64` rejects a CBOR integer), enums must name an
+    /// option, arrays must hold an allowed number of elements, and records
+    /// must name only declared fields, set every required one, and keep
+    /// numbers within their declared bounds. A record keeps its entries in
+    /// the order given.
+    pub fn coerce(&self, value: ConfigValue) -> Result<ConfigValue, String> {
+        let got = |v: &ConfigValue| v.to_json_text();
+        match (self, value) {
+            (ConfigFieldType::Bool | ConfigFieldType::Group(_), v @ ConfigValue::Bool(_)) => Ok(v),
+            (ConfigFieldType::Int, v @ ConfigValue::Int(_)) => Ok(v),
+            (ConfigFieldType::Float, v @ ConfigValue::Float(_)) => Ok(v),
+            (ConfigFieldType::Float, ConfigValue::Int(i)) => Ok(ConfigValue::Float(i as f64)),
+            (ConfigFieldType::Text, v @ ConfigValue::Text(_)) => Ok(v),
+            (ConfigFieldType::Enum(options), ConfigValue::Text(t)) => {
+                if options.contains(&t) {
+                    Ok(ConfigValue::Text(t))
+                } else {
+                    Err(format!("{t:?} is not one of {}", options.join("/")))
+                }
+            }
+            (
+                ConfigFieldType::List {
+                    element,
+                    min_len,
+                    max_len,
+                },
+                ConfigValue::List(items),
+            ) => {
+                let n = items.len();
+                if n < *min_len || max_len.is_some_and(|max| n > max) {
+                    return Err(match max_len {
+                        Some(max) if max == min_len => format!("needs {max} element(s), got {n}"),
+                        Some(max) => format!("needs {min_len} to {max} element(s), got {n}"),
+                        None => format!("needs at least {min_len} element(s), got {n}"),
+                    });
+                }
+                items
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, item)| element.coerce(item).map_err(|e| format!("[{i}]: {e}")))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(ConfigValue::List)
+            }
+            (ConfigFieldType::Record(fields), ConfigValue::Record(entries)) => {
+                let mut out = Vec::with_capacity(entries.len());
+                for (name, value) in entries {
+                    let field = fields.iter().find(|f| f.name == name).ok_or_else(|| {
+                        let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+                        format!("no field {name:?}; fields: {}", names.join(", "))
+                    })?;
+                    if out.iter().any(|(n, _)| *n == name) {
+                        return Err(format!("{name:?} is given twice"));
+                    }
+                    let value = field.ty.coerce(value).map_err(|e| format!("{name}: {e}"))?;
+                    if !field.in_bounds(&value) {
+                        return Err(format!("{name}: {} is outside its bounds", got(&value)));
+                    }
+                    out.push((name, value));
+                }
+                if let Some(missing) = fields
+                    .iter()
+                    .find(|f| !f.optional && !out.iter().any(|(n, _)| *n == f.name))
+                {
+                    return Err(format!("{} is required", missing.name));
+                }
+                Ok(ConfigValue::Record(out))
+            }
+            (ty, v) => Err(format!("expected {}, got {}", ty.describe(), got(&v))),
+        }
+    }
+
+    /// What a value of this type is, for messages.
+    fn describe(&self) -> &'static str {
+        match self {
+            ConfigFieldType::Bool | ConfigFieldType::Group(_) => "a bool",
+            ConfigFieldType::Int => "an integer",
+            ConfigFieldType::Float => "a number",
+            ConfigFieldType::Text | ConfigFieldType::Enum(_) => "a string",
+            ConfigFieldType::List { .. } => "an array",
+            ConfigFieldType::Record(_) => "a record",
         }
     }
 }
 
 impl ConfigValue {
-    /// Render the value as the text an editor field shows. A `List` joins its
-    /// elements with `, ` (the rich array editor edits elements individually;
-    /// this is the flat rendering for logs and single-field fallbacks).
+    /// Render the value as the text an editor field shows, which
+    /// [`ConfigValue::parse`] reads back exactly. Arrays and records are
+    /// written as JSON (so an empty inner array, or text holding commas,
+    /// survives); v2's array editor shows each element on its own.
     pub fn to_display_string(&self) -> String {
         match self {
             ConfigValue::Bool(b) => b.to_string(),
             ConfigValue::Int(i) => i.to_string(),
             ConfigValue::Float(f) => format_float(*f),
             ConfigValue::Text(t) => t.clone(),
-            ConfigValue::List(items) => items
-                .iter()
-                .map(ConfigValue::to_display_string)
-                .collect::<Vec<_>>()
-                .join(", "),
+            ConfigValue::List(_) | ConfigValue::Record(_) => self.to_json_text(),
         }
+    }
+
+    /// The value as JSON (a non-finite float, which JSON cannot hold, is
+    /// written as `null` and does not read back).
+    pub fn to_json_text(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
     }
 
     /// Parse editor text back into a value of the given type. Returns `None`
     /// when the text isn't a valid value (empty, non-numeric, or an
     /// out-of-vocabulary enum), so the caller keeps the raw edit buffer without
-    /// committing it to the config. A `List` splits on commas and parses each
-    /// non-empty element as the element type (the rich editor builds lists from
-    /// separate element buffers, but this keeps `parse` total).
+    /// committing it to the config. An array or record written as JSON is
+    /// checked against the type ([`ConfigFieldType::coerce`]); an array of
+    /// scalars may also be written bare, split on commas, each non-empty
+    /// element parsed as the element type.
     pub fn parse(ty: &ConfigFieldType, text: &str) -> Option<ConfigValue> {
         match ty {
             // A group parses like a bool: its editable value is the
@@ -188,12 +313,21 @@ impl ConfigValue {
                     None
                 }
             }
-            ConfigFieldType::List { element, min_len } => {
+            ConfigFieldType::Record(_) => ty.coerce(serde_json::from_str(text).ok()?).ok(),
+            ConfigFieldType::List { element, .. } => {
+                if text.trim_start().starts_with('[')
+                    && let Ok(value) = serde_json::from_str::<ConfigValue>(text)
+                {
+                    return ty.coerce(value).ok();
+                }
+                if !element.is_scalar() {
+                    return None;
+                }
                 let mut items = Vec::new();
                 for part in text.split(',').map(str::trim).filter(|s| !s.is_empty()) {
                     items.push(ConfigValue::parse(element, part)?);
                 }
-                (items.len() >= *min_len).then_some(ConfigValue::List(items))
+                ty.coerce(ConfigValue::List(items)).ok()
             }
         }
     }
@@ -207,7 +341,96 @@ impl ConfigValue {
             ConfigValue::List(items) => {
                 CborValue::Array(items.iter().map(ConfigValue::to_cbor).collect())
             }
+            ConfigValue::Record(entries) => CborValue::Map(
+                entries
+                    .iter()
+                    .map(|(k, v)| (CborValue::Text(k.clone()), v.to_cbor()))
+                    .collect(),
+            ),
         }
+    }
+}
+
+/// JSON form, records keeping their entry order.
+impl serde::Serialize for ConfigValue {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{SerializeMap, SerializeSeq};
+        match self {
+            ConfigValue::Bool(b) => s.serialize_bool(*b),
+            ConfigValue::Int(i) => s.serialize_i64(*i),
+            ConfigValue::Float(f) => s.serialize_f64(*f),
+            ConfigValue::Text(t) => s.serialize_str(t),
+            ConfigValue::List(items) => {
+                let mut seq = s.serialize_seq(Some(items.len()))?;
+                for item in items {
+                    seq.serialize_element(item)?;
+                }
+                seq.end()
+            }
+            ConfigValue::Record(entries) => {
+                let mut map = s.serialize_map(Some(entries.len()))?;
+                for (k, v) in entries {
+                    map.serialize_entry(k, v)?;
+                }
+                map.end()
+            }
+        }
+    }
+}
+
+/// An untyped value from JSON (or any self-describing format), records
+/// keeping their key order; check it against a schema type with
+/// [`ConfigFieldType::coerce`]. `null` has no config value.
+impl<'de> serde::Deserialize<'de> for ConfigValue {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = ConfigValue;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a bool, number, string, array or map")
+            }
+            fn visit_bool<E>(self, v: bool) -> Result<ConfigValue, E> {
+                Ok(ConfigValue::Bool(v))
+            }
+            fn visit_i64<E>(self, v: i64) -> Result<ConfigValue, E> {
+                Ok(ConfigValue::Int(v))
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<ConfigValue, E> {
+                i64::try_from(v)
+                    .map(ConfigValue::Int)
+                    .map_err(|_| E::custom(format!("{v} is too large for an integer")))
+            }
+            fn visit_f64<E>(self, v: f64) -> Result<ConfigValue, E> {
+                Ok(ConfigValue::Float(v))
+            }
+            fn visit_str<E>(self, v: &str) -> Result<ConfigValue, E> {
+                Ok(ConfigValue::Text(v.to_string()))
+            }
+            fn visit_string<E>(self, v: String) -> Result<ConfigValue, E> {
+                Ok(ConfigValue::Text(v))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<ConfigValue, A::Error> {
+                let mut items = Vec::new();
+                while let Some(item) = seq.next_element()? {
+                    items.push(item);
+                }
+                Ok(ConfigValue::List(items))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<ConfigValue, A::Error> {
+                let mut entries = Vec::new();
+                while let Some((k, v)) = map.next_entry::<String, ConfigValue>()? {
+                    entries.push((k, v));
+                }
+                Ok(ConfigValue::Record(entries))
+            }
+        }
+        d.deserialize_any(Visitor)
     }
 }
 
@@ -228,10 +451,14 @@ pub fn parse_schema(cddl: &str) -> Result<Vec<ConfigField>, ConfigSchemaError> {
     let mut s = cddl.trim();
     s = s.strip_prefix('{').unwrap_or(s).trim();
     s = s.strip_suffix('}').unwrap_or(s).trim();
-    parse_record_body(s)
+    parse_record_body(s, true)
 }
 
-fn parse_record_body(s: &str) -> Result<Vec<ConfigField>, ConfigSchemaError> {
+/// Parse the fields of a record body. With `groups`, a braced right-hand
+/// side declares a group (the config record and the groups in it); without,
+/// it is a record value (inside an array element, where nothing is
+/// flattened to dotted paths).
+fn parse_record_body(s: &str, groups: bool) -> Result<Vec<ConfigField>, ConfigSchemaError> {
     if s.is_empty() {
         return Ok(Vec::new());
     }
@@ -259,7 +486,7 @@ fn parse_record_body(s: &str) -> Result<Vec<ConfigField>, ConfigSchemaError> {
 
         // A braced right-hand side is a group: a nested record, optionally
         // followed by `.default true` (start enabled).
-        if rhs.starts_with('{') {
+        if groups && rhs.starts_with('{') {
             let (ty, default) = parse_group(rhs, part)?;
             out.push(ConfigField {
                 name: name.to_string(),
@@ -320,24 +547,57 @@ fn split_record_parts(s: &str) -> Vec<&str> {
     parts
 }
 
-/// Whitespace tokens, except that a double-quoted string is one token
-/// (quotes included) however many spaces it holds.
+/// Whitespace tokens, except that a double-quoted string, or a bracketed or
+/// braced literal (`[0.0, 0.0, 1.0]`), is one token however many spaces it
+/// holds.
 fn annotation_tokens(s: &str) -> Vec<&str> {
     let mut tokens = Vec::new();
-    let mut rest = s;
-    loop {
-        rest = rest.trim_start();
-        if rest.is_empty() {
-            return tokens;
+    let mut start = None;
+    let mut depth = 0usize;
+    let mut quoted = false;
+    for (i, c) in s.char_indices() {
+        if start.is_none() {
+            if c.is_whitespace() {
+                continue;
+            }
+            start = Some(i);
         }
-        let end = if let Some(inner) = rest.strip_prefix('"') {
-            inner.find('"').map(|close| close + 2).unwrap_or(rest.len())
-        } else {
-            rest.find(char::is_whitespace).unwrap_or(rest.len())
-        };
-        tokens.push(&rest[..end]);
-        rest = &rest[end..];
+        match c {
+            '"' => quoted = !quoted,
+            _ if quoted => {}
+            '[' | '{' => depth += 1,
+            ']' | '}' => depth = depth.saturating_sub(1),
+            c if c.is_whitespace() && depth == 0 => {
+                tokens.push(&s[start.take().unwrap_or(i)..i]);
+            }
+            _ => {}
+        }
     }
+    if let Some(start) = start {
+        tokens.push(&s[start..]);
+    }
+    tokens
+}
+
+/// Where `pattern` first occurs outside quotes and outside any brackets or
+/// braces: a control operator inside an array's record element
+/// (`[* { spacing: float .default 0.02 }]`) belongs to that element.
+fn find_top_level(s: &str, pattern: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quoted = false;
+    for (i, c) in s.char_indices() {
+        if !quoted && depth == 0 && s[i..].starts_with(pattern) {
+            return Some(i);
+        }
+        match c {
+            '"' => quoted = !quoted,
+            _ if quoted => {}
+            '[' | '{' => depth += 1,
+            ']' | '}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Parse a group right-hand side: `{ ...sub-record... }` plus an optional
@@ -365,7 +625,7 @@ fn parse_group(
     let Some(close) = close else {
         return Err(ConfigSchemaError::MalformedField(part.to_string()));
     };
-    let sub = parse_record_body(rhs[1..close].trim())?;
+    let sub = parse_record_body(rhs[1..close].trim(), true)?;
     let default = match rhs[close + 1..].trim() {
         "" => None,
         tail => match tail.strip_prefix(".default").map(str::trim) {
@@ -420,7 +680,7 @@ fn split_type_and_annotations(rhs: &str) -> FieldAnnotations<'_> {
     // Earliest dotted control operator marks the end of the type token. These
     // markers never occur inside a type or a value token (numeric literals like
     // `1e-8` and quoted strings don't contain `.default`/`.ge`/`.le`).
-    if let Some(start) = OPS.iter().filter_map(|op| rhs.find(op)).min() {
+    if let Some(start) = OPS.iter().filter_map(|op| find_top_level(rhs, op)).min() {
         let ty = rhs[..start].trim();
         let mut default = None;
         let mut min = None;
@@ -448,7 +708,7 @@ fn split_type_and_annotations(rhs: &str) -> FieldAnnotations<'_> {
     }
     // Legacy `(default X)` — but not when the parens are part of an enum union
     // written with quotes.
-    if let Some(paren_idx) = rhs.find('(')
+    if let Some(paren_idx) = find_top_level(rhs, "(")
         && !rhs[..paren_idx].contains('"')
     {
         let ty = rhs[..paren_idx].trim();
@@ -474,28 +734,14 @@ fn split_type_and_annotations(rhs: &str) -> FieldAnnotations<'_> {
 
 fn parse_field_type(ty: &str) -> Result<ConfigFieldType, ConfigSchemaError> {
     let ty = ty.trim();
-    // Array types: `[* T]` (zero or more) / `[+ T]` (one or more), where the
-    // element `T` is a scalar leaf. No internal commas, so the record-level
-    // comma split still holds.
     if let Some(inner) = ty.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-        let inner = inner.trim();
-        let mut chars = inner.chars();
-        let min_len = match chars.next() {
-            Some('*') => 0,
-            Some('+') => 1,
-            _ => return Err(ConfigSchemaError::UnsupportedType(ty.to_string())),
-        };
-        let element = parse_field_type(chars.as_str().trim())?;
-        if matches!(
-            element,
-            ConfigFieldType::List { .. } | ConfigFieldType::Enum(_)
-        ) {
-            return Err(ConfigSchemaError::UnsupportedType(ty.to_string()));
-        }
-        return Ok(ConfigFieldType::List {
-            element: Box::new(element),
-            min_len,
-        });
+        return parse_array(inner.trim(), ty);
+    }
+    if let Some(inner) = ty.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+        return Ok(ConfigFieldType::Record(parse_record_body(
+            inner.trim(),
+            false,
+        )?));
     }
     match ty {
         "bool" => Ok(ConfigFieldType::Bool),
@@ -527,6 +773,63 @@ fn parse_field_type(ty: &str) -> Result<ConfigFieldType, ConfigSchemaError> {
         }
         other => Err(ConfigSchemaError::UnsupportedType(other.to_string())),
     }
+}
+
+/// An array type's inside: an occurrence and one element type (`* T`,
+/// `+ T`, `? T`, `n*m T`, `n* T`, `*m T`), or a homogeneous tuple
+/// (`T, T, T`; a lone `T` is a one-element tuple).
+fn parse_array(inner: &str, whole: &str) -> Result<ConfigFieldType, ConfigSchemaError> {
+    let unsupported = |why: &str| ConfigSchemaError::UnsupportedType(format!("{whole} ({why})"));
+    let parts: Vec<&str> = split_record_parts(inner)
+        .into_iter()
+        .map(str::trim)
+        .collect();
+    if parts.len() > 1 {
+        let types = parts
+            .iter()
+            .map(|p| parse_field_type(p))
+            .collect::<Result<Vec<_>, _>>()?;
+        if types.windows(2).any(|w| w[0] != w[1]) {
+            return Err(unsupported("a tuple's elements must share one type"));
+        }
+        return Ok(ConfigFieldType::List {
+            element: Box::new(types[0].clone()),
+            min_len: types.len(),
+            max_len: Some(types.len()),
+        });
+    }
+    let (min_len, max_len, element) = occurrence(inner);
+    if max_len.is_some_and(|max| max < min_len) {
+        return Err(unsupported("fewer allowed than required"));
+    }
+    if element.is_empty() {
+        return Err(unsupported("no element type"));
+    }
+    Ok(ConfigFieldType::List {
+        element: Box::new(parse_field_type(element)?),
+        min_len,
+        max_len,
+    })
+}
+
+/// Split a leading CDDL occurrence indicator off an array's inside:
+/// `(min, max, rest)`. Without one, the element occurs exactly once.
+fn occurrence(s: &str) -> (usize, Option<usize>, &str) {
+    let digits = |s: &str| s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    if let Some(rest) = s.strip_prefix('+') {
+        return (1, None, rest.trim());
+    }
+    if let Some(rest) = s.strip_prefix('?') {
+        return (0, Some(1), rest.trim());
+    }
+    let n = digits(s);
+    if let Some(after) = s[n..].strip_prefix('*') {
+        let m = digits(after);
+        let min = s[..n].parse().unwrap_or(0);
+        let max = after[..m].parse().ok();
+        return (min, max, after[m..].trim());
+    }
+    (1, Some(1), s)
 }
 
 /// Encode a set of values into the CBOR map an operator expects. Fields missing
@@ -609,8 +912,9 @@ fn seed_defaults(fields: &[ConfigField], prefix: &str, out: &mut BTreeMap<String
 
 /// Best-effort decode of a CBOR config map into values, keyed by field name.
 /// Nested maps flatten to dotted paths, with a `Bool(true)` marker at the
-/// map's own path. Values whose CBOR type doesn't match a known scalar are
-/// skipped.
+/// map's own path (groups); a map inside an array is a record value, kept
+/// whole and in order. Values with no config form (null, bytes, tags) are
+/// skipped, and so is an array or record that holds one.
 pub fn decode(bytes: &[u8]) -> BTreeMap<String, ConfigValue> {
     let mut out = BTreeMap::new();
     if let Ok(CborValue::Map(entries)) = ciborium::de::from_reader::<CborValue, _>(bytes) {
@@ -644,9 +948,21 @@ fn cbor_to_value(value: &CborValue) -> Option<ConfigValue> {
         CborValue::Integer(i) => Some(ConfigValue::Int((*i).try_into().ok()?)),
         CborValue::Float(f) => Some(ConfigValue::Float(*f)),
         CborValue::Text(t) => Some(ConfigValue::Text(t.clone())),
-        CborValue::Array(items) => Some(ConfigValue::List(
-            items.iter().filter_map(cbor_to_value).collect(),
-        )),
+        // An array or map holding anything without a config value is
+        // skipped whole rather than shortened.
+        CborValue::Array(items) => items
+            .iter()
+            .map(cbor_to_value)
+            .collect::<Option<Vec<_>>>()
+            .map(ConfigValue::List),
+        CborValue::Map(entries) => entries
+            .iter()
+            .map(|(k, v)| match k {
+                CborValue::Text(k) => Some((k.clone(), cbor_to_value(v)?)),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(ConfigValue::Record),
         _ => None,
     }
 }
@@ -789,9 +1105,18 @@ mod tests {
     }
 
     fn list(element: ConfigFieldType, min_len: usize) -> ConfigFieldType {
+        bounded(element, min_len, None)
+    }
+
+    fn bounded(
+        element: ConfigFieldType,
+        min_len: usize,
+        max_len: Option<usize>,
+    ) -> ConfigFieldType {
         ConfigFieldType::List {
             element: Box::new(element),
             min_len,
+            max_len,
         }
     }
 
@@ -807,10 +1132,310 @@ mod tests {
     }
 
     #[test]
-    fn arrays_of_lists_or_enums_are_unsupported() {
-        assert!(parse_schema(r#"{ x: [* [* int]] }"#).is_err());
-        assert!(parse_schema(r#"{ x: [* "a" / "b"] }"#).is_err());
-        assert!(parse_schema(r#"{ x: [ tstr] }"#).is_err()); // no occurrence marker
+    fn arrays_nest_and_take_enums() {
+        // Once unsupported; operators need points (`[3*3 float]`), outlines
+        // (`[* [* float]]`) and lists of authored edits (records).
+        let fields = parse_schema(r#"{ x: [* [* int]], y: [* "a" / "b"], z: [ tstr] }"#).unwrap();
+        assert_eq!(fields[0].ty, list(list(ConfigFieldType::Int, 0), 0));
+        assert_eq!(
+            fields[1].ty,
+            list(ConfigFieldType::Enum(vec!["a".into(), "b".into()]), 0)
+        );
+        // No occurrence marker: CDDL's one-element array.
+        assert_eq!(fields[2].ty, bounded(ConfigFieldType::Text, 1, Some(1)));
+    }
+
+    #[test]
+    fn occurrences_bound_arrays_and_tuples_fix_them() {
+        let fields = parse_schema(
+            "{ a: [2*2 int], b: [2* float], c: [*4 float], d: [? int], e: [float, float, float], f: [+ bool] }",
+        )
+        .unwrap();
+        assert_eq!(fields[0].ty, bounded(ConfigFieldType::Int, 2, Some(2)));
+        assert_eq!(fields[1].ty, bounded(ConfigFieldType::Float, 2, None));
+        assert_eq!(fields[2].ty, bounded(ConfigFieldType::Float, 0, Some(4)));
+        assert_eq!(fields[3].ty, bounded(ConfigFieldType::Int, 0, Some(1)));
+        assert_eq!(fields[4].ty, bounded(ConfigFieldType::Float, 3, Some(3)));
+        assert_eq!(fields[5].ty, bounded(ConfigFieldType::Bool, 1, None));
+        // A required fixed-size array seeds that many zeros.
+        assert_eq!(
+            fields[4].seed_value(),
+            ConfigValue::List(vec![ConfigValue::Float(0.0); 3])
+        );
+        // Lengths are checked both ways.
+        assert_eq!(ConfigValue::parse(&fields[0].ty, "1, 2, 3"), None);
+        assert_eq!(ConfigValue::parse(&fields[0].ty, "1"), None);
+        assert_eq!(
+            ConfigValue::parse(&fields[0].ty, "1, 2"),
+            Some(ConfigValue::List(vec![
+                ConfigValue::Int(1),
+                ConfigValue::Int(2)
+            ]))
+        );
+
+        assert!(parse_schema("{ x: [int, float] }").is_err(), "mixed tuple");
+        assert!(parse_schema("{ x: [3*2 int] }").is_err(), "max below min");
+        assert!(parse_schema("{ x: [*] }").is_err(), "no element type");
+    }
+
+    #[test]
+    fn array_defaults_are_json_and_take_the_declared_type() {
+        let fields = parse_schema(
+            "{ up: [3*3 float] .default [0, 0, 1], step: float .default 0.002, \
+             ? outline: [* [* float]] .default [[0.0, 1.5], [2, 3]] }",
+        )
+        .unwrap();
+        // Integers in a float array's default encode as floats.
+        assert_eq!(
+            fields[0].default,
+            Some(ConfigValue::List(vec![
+                ConfigValue::Float(0.0),
+                ConfigValue::Float(0.0),
+                ConfigValue::Float(1.0)
+            ]))
+        );
+        assert_eq!(fields[1].name, "step");
+        assert_eq!(fields[1].default, Some(ConfigValue::Float(0.002)));
+        assert_eq!(
+            fields[2].default,
+            Some(ConfigValue::List(vec![
+                ConfigValue::List(vec![ConfigValue::Float(0.0), ConfigValue::Float(1.5)]),
+                ConfigValue::List(vec![ConfigValue::Float(2.0), ConfigValue::Float(3.0)]),
+            ]))
+        );
+    }
+
+    /// The schemas of the Kalogon cushion operators (scan-to-cushion), as
+    /// written: the shapes this parser grew to cover.
+    const CUSHION_SCHEMAS: [&str; 8] = [
+        r#"{ closed: bool, ? start: [2*2 int], ? end: [2*2 int], ? drop: [* [2*2 int]], ? sequences: [* [2* [2*2 int]]], sample_step: float .default 0.001 }"#,
+        r#"{ ? outline: [* [* float]], inset: float .ge 0.0 .default 0.0, ? z_min: float, ? z_max: float, up: [3*3 float] .default [0.0, 0.0, 1.0], ? facing_min: float, direction: tstr .default "normal", reach: float .ge 0.0001 .default 0.03, step: float .ge 0.00001 .default 0.001, band: float .ge 0.00001 .default 0.003, field: tstr .default "distance" }"#,
+        r#"{ ? camera: { width: int .ge 1, height: int .ge 1, ? pos: [* float], ? target: [* float], ? up: [* float], ? fov: float, ? projection: tstr, ? ortho_scale: float, ? intrinsics: [* float], ? pose: [* float], ? near: float, ? far: float }, ? pixels: [* [* float]], ? rays: [* [* float]], hit: tstr .default "nearest", back_faces: bool .default true }"#,
+        r#"{ edits: [* { why: tstr, ? drop: tstr, ? keep: tstr, ? point: [* float], ? normal: [* float], ? crossing: tstr, ? outline: [* [* float]], ? z0: float, ? z1: float, ? center: [* float], ? radius: float, ? at: [* float], ? max_distance: float, ? within: float, ? stop_at: [* { point: [* float], normal: [* float] }], ? area_below: float }], weld: float .ge 0.0 .default 0.000001 }"#,
+        r#"{ ? x0: float, ? x1: float, ? y0: float, ? y1: float, seed_step: float .ge 0.0 .default 0.04, ? add: [* { at: [2*3 float], why: tstr }], ? lines: [* { points: [2* [2*3 float]], spacing: float .default 0.02, why: tstr }], ? remove: [* { at: [2*2 float], radius: float, why: tstr }], ? accept: [* { at: [2*2 float], radius: float, why: tstr }], line_spacing: float .default 0.01, out_step: float .default 0.002, merge: float .ge 0.0 .default 0.004, close_pair: float .ge 0.0 .default 0.015, departure_limit: float .default 0.002, departure_min_area_cm2: float .ge 0.0 .default 1.0, neighbour_radius: float .default 0.06 }"#,
+        r#"{ ? outline: [* [* float]], inset: float .ge 0.0 .default 0.0, step: float .default 0.002, base_point: [3*3 float] .default [0.0, 0.0, 0.0], base_normal: [3*3 float] .default [0.0, 0.0, 1.0], ? flag_below: float, seen_within: float .default 0.003, min_normal_z: float .default 0.1, field: tstr .default "thickness" }"#,
+        r#"{ edits: [* { kind: "ignore" / "offset" / "target" / "pin", ? at: [float, float, float], ? radius: float, ? amount: float, ? blend: float, ? key: tstr, ? value: float, why: tstr }] }"#,
+        r#"{ x0: float, x1: float, ? y0: float, ? y1: float, ? depth: float, z_floor: float .default -0.08, cell: float .default 0.0025, floor_spacing: float .default 0.05, wall_station: float .default 0.03, conform_spacing: float .default 0.04, conform_stiffness: float .default 0.05, fit_band: float .default 0.025, robust_scale: float .default 0.0015, lump_min: float .default 0.001, front: [4*4 float], round_top: float .default 0.01, round_line: float .default 0.01, round_trough: float .default 0.012, round_corner: float .default 0.01, round_ridge: float .default 0.01, cane_cutout: float .default 0.0 }"#,
+    ];
+
+    #[test]
+    fn the_cushion_operator_schemas_parse() {
+        for schema in CUSHION_SCHEMAS {
+            let fields = parse_schema(schema).unwrap_or_else(|e| panic!("{schema}: {e}"));
+            // Their defaults encode and read back unchanged.
+            let values = default_values(&fields);
+            let decoded = decode(&encode(&fields, &values));
+            assert_eq!(decoded, values, "{schema}");
+        }
+        // seat_points: a record inside an array, its own default kept to
+        // itself rather than read as the array field's default.
+        let fields = parse_schema(CUSHION_SCHEMAS[4]).unwrap();
+        let lines = find_field(&fields, "lines").unwrap();
+        assert_eq!(lines.default, None);
+        let ConfigFieldType::List { element, .. } = &lines.ty else {
+            panic!("lines is an array")
+        };
+        let ConfigFieldType::Record(sub) = element.as_ref() else {
+            panic!("of records")
+        };
+        assert_eq!(
+            sub[0].ty,
+            list(bounded(ConfigFieldType::Float, 2, Some(3)), 2)
+        );
+        assert_eq!(sub[1].default, Some(ConfigValue::Float(0.02)));
+        // A fresh record element holds its required fields.
+        assert_eq!(
+            element.zero(),
+            ConfigValue::Record(vec![
+                (
+                    "points".into(),
+                    ConfigValue::List(vec![ConfigValue::List(vec![ConfigValue::Float(0.0); 2]); 2])
+                ),
+                ("spacing".into(), ConfigValue::Float(0.02)),
+                ("why".into(), ConfigValue::Text(String::new())),
+            ])
+        );
+    }
+
+    #[test]
+    fn records_in_arrays_round_trip_whole_and_in_order() {
+        let fields = parse_schema(CUSHION_SCHEMAS[3]).unwrap();
+        // Written by hand, keys out of schema order, one optional set.
+        let raw = CborValue::Map(vec![
+            (
+                CborValue::Text("edits".into()),
+                CborValue::Array(vec![
+                    CborValue::Map(vec![
+                        (
+                            CborValue::Text("drop".into()),
+                            CborValue::Text("below".into()),
+                        ),
+                        (
+                            CborValue::Text("why".into()),
+                            CborValue::Text("the floor, \"under\" the seat".into()),
+                        ),
+                        (
+                            CborValue::Text("outline".into()),
+                            CborValue::Array(vec![
+                                CborValue::Array(vec![
+                                    CborValue::Float(0.1),
+                                    CborValue::Float(-0.25),
+                                ]),
+                                CborValue::Array(vec![
+                                    CborValue::Float(1e-7),
+                                    CborValue::Float(3.0),
+                                ]),
+                            ]),
+                        ),
+                    ]),
+                    CborValue::Map(vec![(
+                        CborValue::Text("why".into()),
+                        CborValue::Text("second".into()),
+                    )]),
+                ]),
+            ),
+            (CborValue::Text("weld".into()), CborValue::Float(1e-6)),
+        ]);
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&raw, &mut bytes).unwrap();
+        let values = decode(&bytes);
+        assert_eq!(encode(&fields, &values), bytes, "byte for byte");
+
+        // An editor's text for each element reads back as the same value.
+        let edits = find_field(&fields, "edits").unwrap();
+        let ConfigFieldType::List { element, .. } = &edits.ty else {
+            panic!()
+        };
+        let Some(ConfigValue::List(items)) = values.get("edits") else {
+            panic!()
+        };
+        for item in items {
+            assert_eq!(
+                ConfigValue::parse(element, &item.to_display_string()).as_ref(),
+                Some(item)
+            );
+        }
+        assert_eq!(
+            ConfigValue::parse(&edits.ty, &values["edits"].to_display_string()).as_ref(),
+            values.get("edits")
+        );
+    }
+
+    #[test]
+    fn seat_shape_front_seeds_four_zeros() {
+        let fields = parse_schema(CUSHION_SCHEMAS[7]).unwrap();
+        let values = default_values(&fields);
+        assert_eq!(
+            values.get("front"),
+            Some(&ConfigValue::List(vec![ConfigValue::Float(0.0); 4]))
+        );
+        assert_eq!(values.get("z_floor"), Some(&ConfigValue::Float(-0.08)));
+    }
+
+    #[test]
+    fn stl_imports_tuple_default_is_three_floats() {
+        let fields = parse_schema(
+            "{ scale: float .default 1.0, translate: [float, float, float] .default [0,0,0], center: bool .default false }",
+        )
+        .unwrap();
+        assert_eq!(
+            fields[1].default,
+            Some(ConfigValue::List(vec![ConfigValue::Float(0.0); 3]))
+        );
+    }
+
+    #[test]
+    fn element_text_keeps_empty_arrays_and_commas_in_text() {
+        let ty = list(list(ConfigFieldType::Text, 0), 0);
+        let ConfigFieldType::List { element, .. } = &ty else {
+            panic!()
+        };
+        for item in [
+            ConfigValue::List(Vec::new()),
+            ConfigValue::List(vec![
+                ConfigValue::Text("a, b".into()),
+                ConfigValue::Text(String::new()),
+                ConfigValue::Text("say \"hi\"".into()),
+            ]),
+        ] {
+            let text = item.to_display_string();
+            assert!(
+                !text.trim().is_empty(),
+                "an empty array is not a blank buffer"
+            );
+            assert_eq!(ConfigValue::parse(element, &text), Some(item));
+        }
+    }
+
+    #[test]
+    fn floats_read_back_bit_for_bit() {
+        // A point from a real outline; JSON parsing without
+        // `float_roundtrip` read these two back one ulp off.
+        let ty = list(list(ConfigFieldType::Float, 0), 0);
+        let value = ConfigValue::List(vec![ConfigValue::List(vec![
+            ConfigValue::Float(0.21883928571428574),
+            ConfigValue::Float(-0.025982142857142898),
+            ConfigValue::Float(5e-324),
+            ConfigValue::Float(f64::MAX),
+        ])]);
+        assert_eq!(
+            ConfigValue::parse(&ty, &value.to_display_string()),
+            Some(value)
+        );
+    }
+
+    #[test]
+    fn records_are_checked_against_their_fields() {
+        let fields = parse_schema(CUSHION_SCHEMAS[6]).unwrap();
+        let edits = &fields[0].ty;
+        let ok = r#"[{"kind": "pin", "at": [0, 0.1, 0.2], "why": "the ridge"}]"#;
+        let Some(ConfigValue::List(items)) = ConfigValue::parse(edits, ok) else {
+            panic!("parses")
+        };
+        assert_eq!(
+            items[0],
+            ConfigValue::Record(vec![
+                ("kind".into(), ConfigValue::Text("pin".into())),
+                (
+                    "at".into(),
+                    ConfigValue::List(vec![
+                        ConfigValue::Float(0.0),
+                        ConfigValue::Float(0.1),
+                        ConfigValue::Float(0.2)
+                    ])
+                ),
+                ("why".into(), ConfigValue::Text("the ridge".into())),
+            ])
+        );
+        for bad in [
+            r#"[{"kind": "pin"}]"#,                              // why is required
+            r#"[{"kind": "push", "why": ""}]"#,                  // not an option
+            r#"[{"kind": "pin", "why": "", "at": [0, 1]}]"#,     // two of three
+            r#"[{"kind": "pin", "why": "", "colour": "red"}]"#,  // no such field
+            r#"[{"kind": "pin", "why": "", "radius": "wide"}]"#, // not a number
+        ] {
+            assert_eq!(ConfigValue::parse(edits, bad), None, "{bad}");
+        }
+        let ConfigFieldType::List { element, .. } = edits else {
+            panic!()
+        };
+        assert!(
+            element
+                .coerce(serde_json::from_str(r#"{"kind": "pin"}"#).unwrap())
+                .unwrap_err()
+                .contains("why is required")
+        );
+    }
+
+    #[test]
+    fn an_array_holding_a_value_with_no_config_form_is_skipped_whole() {
+        let raw = CborValue::Map(vec![(
+            CborValue::Text("xs".into()),
+            CborValue::Array(vec![CborValue::Float(1.0), CborValue::Null]),
+        )]);
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&raw, &mut bytes).unwrap();
+        assert!(!decode(&bytes).contains_key("xs"), "not shortened to [1.0]");
     }
 
     #[test]
