@@ -3,7 +3,8 @@
 //! One texel of the retained G-buffer's surface target (object id and
 //! depth) is copied into a 1x1 integer target and read back
 //! asynchronously: an integer colour read-back is the one every backend
-//! guarantees.
+//! guarantees. Where the frame drew a transparent mesh, the texel is the
+//! nearest one's, from the nearest layer's surface target.
 
 use std::sync::mpsc;
 
@@ -19,8 +20,8 @@ pub(crate) const PICK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32U
 pub struct Pick {
     /// The pixel asked about, in the frame's target (origin top-left).
     pub pixel: (u32, u32),
-    /// The mesh draw there; [`ObjectId::NONE`] over background, lines and
-    /// points.
+    /// The mesh draw there, the nearest whether opaque or transparent;
+    /// [`ObjectId::NONE`] over background, lines and points.
     pub object: ObjectId,
     /// The world point on that surface; `None` where no geometry source
     /// drew (background, or only lines and points).
@@ -34,6 +35,9 @@ pub(crate) struct FrameRecord {
     pub inv_view_proj: Mat4,
     /// The G-buffer's size in pixels.
     pub size: (u32, u32),
+    /// Whether the frame drew transparent meshes: their nearest layer
+    /// is then picked ahead of the opaque scene.
+    pub layered: bool,
 }
 
 impl FrameRecord {
@@ -102,9 +106,19 @@ impl Picker {
         }
     }
 
-    /// The pick pass's bind group over a G-buffer's surface target.
-    pub fn bind(&self, device: &wgpu::Device, surface_view: &wgpu::TextureView) -> wgpu::BindGroup {
-        self.pass.bind(device, &[surface_view])
+    /// The pick pass's bind group over a G-buffer's surface target and
+    /// the nearest transparent layer's (`None` reads the opaque scene
+    /// alone).
+    pub fn bind(
+        &self,
+        device: &wgpu::Device,
+        surface_view: &wgpu::TextureView,
+        nearest_layer: Option<&wgpu::TextureView>,
+    ) -> wgpu::BindGroup {
+        self.pass.bind(
+            device,
+            &[surface_view, nearest_layer.unwrap_or(surface_view)],
+        )
     }
 
     pub fn busy(&self) -> bool {
@@ -230,6 +244,7 @@ mod tests {
         let frame = FrameRecord {
             inv_view_proj: view.view_projection().inverse(),
             size: (300, 200),
+            layered: false,
         };
         let world = Vec3::new(0.3, 0.2, 0.7);
         let at = view.project(world, 300, 200).unwrap();

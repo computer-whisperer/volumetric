@@ -1,4 +1,6 @@
-// Mesh geometry source: fills the G-buffer. No lighting here.
+// Mesh geometry source: fills the G-buffer (`fs_gbuffer`), or one layer
+// of the transparent meshes (`fs_layer_surface`, `fs_layer`). No lighting
+// here.
 
 struct Uniforms {
     view_proj: mat4x4<f32>,
@@ -14,6 +16,22 @@ var<uniform> uniforms: Uniforms;
 var base_color: texture_2d<f32>;
 @group(1) @binding(1)
 var base_sampler: sampler;
+
+// What a layer pass peels against (the layer entry points only): the opaque scene's
+// surface target, and the surface target of the layer peeled before this
+// one.
+@group(2) @binding(0)
+var opaque_surface: texture_2d<u32>;
+@group(2) @binding(1)
+var previous_surface: texture_2d<u32>;
+
+struct Peel {
+    // x: 1 when a layer was peeled before this one, 0 for the nearest.
+    previous: vec4<u32>,
+};
+
+@group(2) @binding(2)
+var<uniform> peel: Peel;
 
 struct VsIn {
     @location(0) position: vec3<f32>,
@@ -32,6 +50,8 @@ struct VsIn {
     // bytes each.
     @location(8) u: f32,
     @location(9) v: f32,
+    // Per draw: how opaque the mesh is. Only a layer pass reads it.
+    @location(10) opacity: f32,
 };
 
 struct VsOut {
@@ -40,6 +60,7 @@ struct VsOut {
     @location(1) color: vec4<f32>,
     @location(2) @interpolate(flat) ids: vec2<u32>,
     @location(3) uv: vec2<f32>,
+    @location(4) @interpolate(flat) opacity: f32,
 };
 
 @vertex
@@ -51,6 +72,7 @@ fn vs_main(in: VsIn) -> VsOut {
     out.color = in.color;
     out.ids = in.ids;
     out.uv = vec2<f32>(in.u, in.v);
+    out.opacity = in.opacity;
     return out;
 }
 
@@ -64,8 +86,8 @@ struct FsOut {
     @location(2) surface: vec2<u32>,
 };
 
-@fragment
-fn fs_gbuffer(in: VsOut) -> FsOut {
+// What the fragment is, as the G-buffer stores it.
+fn surface_of(in: VsOut) -> FsOut {
     // A degenerate interpolated normal must not reach a division: NaN in
     // a unorm target clamps to white on many drivers.
     let n_len = length(in.normal_world);
@@ -81,5 +103,76 @@ fn fs_gbuffer(in: VsOut) -> FsOut {
     );
     out.normal = vec4<f32>(n * 0.5 + vec3<f32>(0.5), 1.0);
     out.surface = vec2<u32>(in.ids.x, bitcast<u32>(in.position.z));
+    return out;
+}
+
+@fragment
+fn fs_gbuffer(in: VsOut) -> FsOut {
+    return surface_of(in);
+}
+
+// The transparent meshes are drawn a layer at a time: of the surfaces in
+// front of the opaque scene and behind the layer peeled before this one,
+// the depth test keeps the nearest. Each layer is drawn twice: its
+// surface target alone (`fs_layer_surface`), so that every layer's is
+// known before any is lit, then the rest of what a G-buffer holds
+// (`fs_layer`), just before it is lit.
+//
+// "Behind" compares a fragment's depth with the depth the layer before
+// stored: for the fragment that layer kept, the very number this shader
+// computed for it then. Surfaces at exactly one depth are taken in the
+// order of their object ids, the highest in front: the draws come in
+// rising order of id, so the depth test (less or equal) leaves the
+// highest id still to be peeled on top, and a surface as deep as the
+// opaque scene's is in front of it unless its id is the lower. (Among
+// opaque meshes the last drawn is in front, which is the same thing for
+// a host that numbers its draws in order.)
+fn peeled_away(in: VsOut) -> bool {
+    let px = vec2<i32>(in.position.xy);
+    let depth = in.position.z;
+    let opaque = textureLoad(opaque_surface, px, 0);
+    let opaque_depth = bitcast<f32>(opaque.g);
+    if depth > opaque_depth || (depth == opaque_depth && in.ids.x < opaque.r) {
+        return true;
+    }
+    if peel.previous.x != 0u {
+        let previous = textureLoad(previous_surface, px, 0);
+        let previous_depth = bitcast<f32>(previous.g);
+        if depth < previous_depth || (depth == previous_depth && in.ids.x >= previous.r) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// A layer's surface target: r: object id; g: the bits of the depth.
+@fragment
+fn fs_layer_surface(in: VsOut) -> @location(0) vec2<u32> {
+    if peeled_away(in) {
+        discard;
+    }
+    return vec2<u32>(in.ids.x, bitcast<u32>(in.position.z));
+}
+
+struct LayerOut {
+    @location(0) albedo: vec4<f32>,
+    @location(1) normal: vec4<f32>,
+    // r: how opaque the surface is, square-root encoded so that 8 bits
+    // hold a fade's faint end.
+    @location(2) opacity: vec4<f32>,
+};
+
+@fragment
+fn fs_layer(in: VsOut) -> LayerOut {
+    // The texture is sampled before any discard: a derivative wants every
+    // fragment of the quad.
+    let filled = surface_of(in);
+    if peeled_away(in) {
+        discard;
+    }
+    var out: LayerOut;
+    out.albedo = filled.albedo;
+    out.normal = filled.normal;
+    out.opacity = vec4<f32>(sqrt(clamp(in.opacity, 0.0, 1.0)), 0.0, 0.0, 1.0);
     return out;
 }

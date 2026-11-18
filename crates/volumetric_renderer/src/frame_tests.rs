@@ -133,7 +133,7 @@ fn a_lit_surface_resolves_to_the_lighting_models_value() {
             offscreen.queue(),
             &quad(Vec3::ZERO, Vec3::X, Vec3::Y, grey),
         );
-        renderer.submit_retained_mesh(&mesh, Mat4::IDENTITY, ObjectId(1), MaterialId(0));
+        renderer.submit_retained_mesh(&mesh, Mat4::IDENTITY, ObjectId(1), MaterialId(0), 1.0);
         let (rgba, info) = offscreen
             .render_rgba(&mut renderer, &view(), &settings(false))
             .unwrap();
@@ -218,7 +218,7 @@ fn a_reloadable_texture_keeps_only_the_devices_copy() {
         drop(first);
         let again = renderer.create_retained_mesh(device, queue, &textured_quad(&texture));
         assert_eq!(reloads.load(Ordering::Relaxed), 0);
-        renderer.submit_retained_mesh(&again, Mat4::IDENTITY, ObjectId(1), MaterialId(0));
+        renderer.submit_retained_mesh(&again, Mat4::IDENTITY, ObjectId(1), MaterialId(0), 1.0);
         assert!(shows_red_top_left(offscreen, &mut renderer));
 
         let kept = Arc::new(crate::SceneTexture::new(checker()));
@@ -250,14 +250,14 @@ fn another_device_reloads_the_texture() {
         let (device, queue) = (offscreen.device(), offscreen.queue());
         let mesh = renderer.create_retained_mesh(device, queue, &textured_quad(&texture));
         assert_eq!(reloads.load(Ordering::Relaxed), expected_reloads);
-        renderer.submit_retained_mesh(&mesh, Mat4::IDENTITY, ObjectId(1), MaterialId(0));
+        renderer.submit_retained_mesh(&mesh, Mat4::IDENTITY, ObjectId(1), MaterialId(0), 1.0);
         assert!(shows_red_top_left(offscreen, &mut renderer));
 
         // The first renderer to draw `lost` takes its pixels; the next has
         // none to take and the quad is the plain white of its vertices.
         let mut renderer = offscreen.renderer(W, H);
         let mesh = renderer.create_retained_mesh(device, queue, &textured_quad(&lost));
-        renderer.submit_retained_mesh(&mesh, Mat4::IDENTITY, ObjectId(1), MaterialId(0));
+        renderer.submit_retained_mesh(&mesh, Mat4::IDENTITY, ObjectId(1), MaterialId(0), 1.0);
         assert_eq!(
             shows_red_top_left(offscreen, &mut renderer),
             expected_reloads == 0
@@ -291,7 +291,7 @@ fn a_textured_quad_shows_its_texture_the_right_way_up() {
             },
         );
         assert_eq!(mesh.texture_downscaled, None);
-        renderer.submit_retained_mesh(&mesh, Mat4::IDENTITY, ObjectId(1), MaterialId(0));
+        renderer.submit_retained_mesh(&mesh, Mat4::IDENTITY, ObjectId(1), MaterialId(0), 1.0);
         let (rgba, info) = offscreen
             .render_rgba(&mut renderer, &view(), &settings(false))
             .unwrap();
@@ -325,7 +325,7 @@ fn a_textured_quad_shows_its_texture_the_right_way_up() {
             offscreen.queue(),
             &quad(Vec3::ZERO, Vec3::X, Vec3::Y, [1.0; 4]),
         );
-        renderer.submit_retained_mesh(&plain, Mat4::IDENTITY, ObjectId(1), MaterialId(0));
+        renderer.submit_retained_mesh(&plain, Mat4::IDENTITY, ObjectId(1), MaterialId(0), 1.0);
         let (untextured, _) = offscreen
             .render_rgba(&mut renderer, &view, &settings(false))
             .unwrap();
@@ -366,12 +366,14 @@ fn a_pick_reports_the_object_and_world_point_under_a_pixel() {
             Mat4::from_translation(Vec3::new(0.0, 0.0, -0.5)),
             ObjectId(7),
             MaterialId(0),
+            1.0,
         );
         renderer.submit_retained_mesh(
             &near,
             Mat4::from_translation(Vec3::new(0.0, 0.0, 0.3)),
             ObjectId(9),
             MaterialId(0),
+            1.0,
         );
         offscreen
             .render_rgba(&mut renderer, &view(), &settings(false))
@@ -404,6 +406,750 @@ fn a_pick_reports_the_object_and_world_point_under_a_pixel() {
             None,
             "outside the frame"
         );
+    });
+}
+
+/// Uploads `mesh` and submits it `z` up the view axis at `opacity`.
+fn submit_at(
+    offscreen: &Offscreen,
+    renderer: &mut Renderer,
+    mesh: &MeshData,
+    z: f32,
+    object: u32,
+    opacity: f32,
+) {
+    let mesh = renderer.create_retained_mesh(offscreen.device(), offscreen.queue(), mesh);
+    renderer.submit_retained_mesh(
+        &mesh,
+        Mat4::from_translation(Vec3::new(0.0, 0.0, z)),
+        ObjectId(object),
+        MaterialId(0),
+        opacity,
+    );
+}
+
+/// `front` at `opacity` over `behind`, channel by channel in linear light.
+fn over(front: [f32; 3], opacity: f32, behind: [f32; 3]) -> [f32; 3] {
+    std::array::from_fn(|c| front[c] * opacity + behind[c] * (1.0 - opacity))
+}
+
+/// How many pixels of two frames differ by more than `tolerance` in a
+/// channel, alpha included.
+fn differing(a: &[u8], b: &[u8], tolerance: u8) -> usize {
+    a.chunks_exact(4)
+        .zip(b.chunks_exact(4))
+        .filter(|(a, b)| (0..4).any(|c| a[c].abs_diff(b[c]) > tolerance))
+        .count()
+}
+
+/// A transparent mesh is lit as an opaque one and blended at its opacity
+/// over what is behind it, the opaque scene or the background, once
+/// however many layers the frame peels. Behind an opaque mesh, or at no
+/// opacity, it leaves the frame as it was.
+#[test]
+fn a_transparent_surface_blends_over_what_is_behind_it() {
+    on_each_backend(|offscreen| {
+        let mut renderer = offscreen.renderer(W, H);
+        let mut settings = settings(false);
+        settings.antialiasing = false;
+        let wide = quad(
+            Vec3::ZERO,
+            Vec3::X * 0.8,
+            Vec3::Y * 0.8,
+            [0.25, 0.25, 0.25, 1.0],
+        );
+        let small = quad(
+            Vec3::ZERO,
+            Vec3::X * 0.2,
+            Vec3::Y * 1.2,
+            [0.6, 0.6, 0.6, 1.0],
+        );
+        let dark = lit(&settings, 0.25, Vec3::Z, Vec3::Z);
+        let pale = lit(&settings, 0.6, Vec3::Z, Vec3::Z);
+        let background = [BACKGROUND[0], BACKGROUND[1], BACKGROUND[2]];
+
+        // The small quad in front, taller than the wide one: over it at
+        // the centre, over the background near the top.
+        submit_at(offscreen, &mut renderer, &wide, -0.5, 1, 1.0);
+        submit_at(offscreen, &mut renderer, &small, 0.3, 2, 0.5);
+        let (rgba, _) = offscreen
+            .render_rgba(&mut renderer, &view(), &settings)
+            .unwrap();
+        let centre = pixel(&rgba, W / 2, H / 2);
+        let expected = over(pale, 0.5, dark).map(srgb_byte);
+        assert!(close(centre, expected, 3.0), "{centre:?} vs {expected:?}");
+        let top = pixel(&rgba, W / 2, 4);
+        let expected = over(pale, 0.5, background).map(srgb_byte);
+        assert!(close(top, expected, 3.0), "{top:?} vs {expected:?}");
+        let side = pixel(&rgba, W / 2 + 20, H / 2);
+        assert!(close(side, dark.map(srgb_byte), 3.0), "{side:?}");
+        assert_eq!(pixel(&rgba, 2, 2), [0, 0, 255], "background corner");
+
+        // The opaque mesh alone, and the same with the transparent one
+        // behind it or at no opacity at all.
+        let mut frame = |behind: Option<(f32, f32)>| {
+            submit_at(offscreen, &mut renderer, &wide, -0.5, 1, 1.0);
+            if let Some((z, opacity)) = behind {
+                submit_at(offscreen, &mut renderer, &small, z, 2, opacity);
+            }
+            offscreen
+                .render_rgba(&mut renderer, &view(), &settings)
+                .unwrap()
+                .0
+        };
+        let alone = frame(None);
+        let hidden = frame(Some((-0.8, 0.5)));
+        let centre = (((H / 2) * W + W / 2) * 4) as usize;
+        assert_eq!(hidden[centre..centre + 4], alone[centre..centre + 4]);
+        assert!(frame(Some((0.3, 0.0))) == alone, "no opacity draws nothing");
+
+        // Over no background at all the frame's alpha is the coverage,
+        // and its colour is premultiplied by it.
+        settings.background_color = [0.0; 4];
+        submit_at(offscreen, &mut renderer, &small, 0.3, 2, 0.5);
+        let (rgba, _) = offscreen
+            .render_rgba(&mut renderer, &view(), &settings)
+            .unwrap();
+        assert!(rgba[centre + 3].abs_diff(128) <= 1, "{}", rgba[centre + 3]);
+        let expected = over(pale, 0.5, [0.0; 3]).map(srgb_byte);
+        let centre = pixel(&rgba, W / 2, H / 2);
+        assert!(close(centre, expected, 3.0), "{centre:?} vs {expected:?}");
+    });
+}
+
+/// Transparent meshes that pass through each other blend in depth order
+/// at every pixel, whichever is submitted first.
+#[test]
+fn transparent_surfaces_blend_in_depth_order_however_they_are_submitted() {
+    on_each_backend(|offscreen| {
+        let mut renderer = offscreen.renderer(W, H);
+        let mut settings = settings(false);
+        settings.antialiasing = false;
+        settings.materials[0].specular = 0.0;
+        // Two sheets crossing along the Y axis: the first is the nearer
+        // one on the left of the frame, the second on the right.
+        let sheets = [
+            (Vec3::new(0.8, 0.0, -0.3), 0.6, 0.7),
+            (Vec3::new(0.8, 0.0, 0.3), 0.2, 0.4),
+        ];
+        let meshes = sheets.map(|(u, albedo, _)| {
+            quad(Vec3::ZERO, u, Vec3::Y * 0.5, [albedo, albedo, albedo, 1.0])
+        });
+        let colours = sheets.map(|(u, albedo, _)| {
+            let normal = u.cross(Vec3::Y).normalize();
+            lit(&settings, albedo, normal, Vec3::Z)
+        });
+        let opacity = sheets.map(|(_, _, opacity)| opacity);
+        let background = [BACKGROUND[0], BACKGROUND[1], BACKGROUND[2]];
+
+        let mut frame = |order: [usize; 2]| {
+            for i in order {
+                submit_at(
+                    offscreen,
+                    &mut renderer,
+                    &meshes[i],
+                    0.0,
+                    i as u32 + 1,
+                    opacity[i],
+                );
+            }
+            offscreen
+                .render_rgba(&mut renderer, &view(), &settings)
+                .unwrap()
+                .0
+        };
+        let forward = frame([0, 1]);
+        assert!(frame([1, 0]) == forward, "the order of submission shows");
+
+        for (x, [near, far]) in [(W / 2 - 20, [0, 1]), (W / 2 + 20, [1, 0])] {
+            let behind = over(colours[far], opacity[far], background);
+            let expected = over(colours[near], opacity[near], behind).map(srgb_byte);
+            let actual = pixel(&forward, x, H / 2);
+            assert!(close(actual, expected, 3.0), "{actual:?} vs {expected:?}");
+        }
+    });
+}
+
+/// As a mesh's opacity reaches 1 the frame arrives at the opaque one's:
+/// lighting, edge lines and anti-aliasing alike. (Ambient occlusion is
+/// the exception: a transparent mesh takes none.)
+#[test]
+fn a_mesh_just_short_of_opaque_draws_as_the_opaque_one_does() {
+    on_each_backend(|offscreen| {
+        let mut renderer = offscreen.renderer(W, H);
+        let mut settings = settings(false);
+        settings.edges.enabled = true;
+        let floor = quad(
+            Vec3::ZERO,
+            Vec3::X * 0.9,
+            Vec3::Y * 0.6,
+            [0.5, 0.5, 0.5, 1.0],
+        );
+        let ball = sphere(Vec3::new(-0.2, 0.0, 0.0), 0.35);
+        let tilted = quad(
+            Vec3::new(0.5, 0.0, 0.0),
+            Vec3::new(0.25, 0.0, 0.2),
+            Vec3::Y * 0.3,
+            [1.0; 4],
+        );
+        let mut frame = |opacity: f32| {
+            submit_at(offscreen, &mut renderer, &floor, -0.4, 1, opacity);
+            submit_at(offscreen, &mut renderer, &ball, 0.0, 2, opacity);
+            submit_at(offscreen, &mut renderer, &tilted, 0.2, 3, opacity);
+            offscreen
+                .render_rgba(&mut renderer, &view(), &settings)
+                .unwrap()
+                .0
+        };
+        let opaque = frame(1.0);
+        let nearly = frame(0.999);
+        assert_eq!(differing(&nearly, &opaque, 1), 0);
+        // Not for want of anything to compare: the edge lines are there.
+        settings.edges.enabled = false;
+        let plain = {
+            submit_at(offscreen, &mut renderer, &floor, -0.4, 1, 1.0);
+            submit_at(offscreen, &mut renderer, &ball, 0.0, 2, 1.0);
+            submit_at(offscreen, &mut renderer, &tilted, 0.2, 3, 1.0);
+            offscreen
+                .render_rgba(&mut renderer, &view(), &settings)
+                .unwrap()
+                .0
+        };
+        assert!(differing(&plain, &opaque, 8) > 100);
+    });
+}
+
+/// A surface seen through a transparent mesh gets no edge line where
+/// that mesh ends: it is one surface on both sides, though it changes
+/// layer there, by as many layers as the mesh has walls. Drawn just short
+/// of opaque behind the transparent mesh, it shows what it shows drawn
+/// opaque, where the G-buffer holds it whole.
+#[test]
+fn a_surface_seen_through_a_transparent_mesh_takes_no_edge_from_it() {
+    on_each_backend(|offscreen| {
+        let mut renderer = offscreen.renderer(W, H);
+        let mut settings = settings(false);
+        settings.edges.enabled = true;
+        settings.antialiasing = false;
+        // A sheet across the whole frame, and in front of it walls over
+        // half of the frame, ending together down the middle.
+        let behind = quad(
+            Vec3::ZERO,
+            Vec3::X * 3.0,
+            Vec3::Y * 3.0,
+            [0.6, 0.6, 0.6, 1.0],
+        );
+        for side in [-1.0, 1.0] {
+            let half = quad(
+                Vec3::new(side * 1.5, 0.0, 0.0),
+                Vec3::X * 1.5,
+                Vec3::Y * 3.0,
+                [0.3, 0.3, 0.3, 1.0],
+            );
+            for walls in 1..=3 {
+                let mut frame = |opacity: f32| {
+                    let mut items = vec![(&behind, -0.5, 1, opacity)];
+                    items.extend((0..walls).map(|wall| (&half, 0.3 - 0.2 * wall as f32, 2, 0.5)));
+                    frame_of(offscreen, &mut renderer, &settings, &items)
+                };
+                let opaque = frame(1.0);
+                let nearly = frame(0.999);
+                assert_eq!(
+                    differing(&nearly, &opaque, 1),
+                    0,
+                    "{walls} walls on side {side}"
+                );
+                if walls > 1 {
+                    continue;
+                }
+                // The transparent mesh's own edge is drawn on the row
+                // through the middle of the frame, beside the middle.
+                let row = H / 2;
+                let flat = pixel(&opaque, if side < 0.0 { 4 } else { W - 4 }, row)[1];
+                let dark: Vec<u32> = (0..W)
+                    .filter(|&x| {
+                        pixel(&opaque, x, row)[1] + 5 < flat.min(pixel(&opaque, W - 4, row)[1])
+                            || pixel(&opaque, x, row)[1] + 5 < flat.min(pixel(&opaque, 4, row)[1])
+                    })
+                    .collect();
+                assert!(
+                    !dark.is_empty() && dark.iter().all(|x| x.abs_diff(W / 2) <= 1),
+                    "{dark:?} on side {side}"
+                );
+            }
+        }
+    });
+}
+
+/// The frame of `items`, each a mesh, how far up the view axis it is
+/// moved, its object and its opacity.
+fn frame_of(
+    offscreen: &Offscreen,
+    renderer: &mut Renderer,
+    settings: &RenderSettings,
+    items: &[(&MeshData, f32, u32, f32)],
+) -> Vec<u8> {
+    for (mesh, z, object, opacity) in items {
+        submit_at(offscreen, renderer, mesh, *z, *object, *opacity);
+    }
+    offscreen
+        .render_rgba(renderer, &view(), settings)
+        .unwrap()
+        .0
+}
+
+/// A transparent surface lying just in front of another object's, as a
+/// model does over the model it was made from, is edged along its edges
+/// and nowhere else: the other surface is beside it in depth, not in the
+/// picture.
+#[test]
+fn a_transparent_surface_close_to_another_is_edged_at_its_edges_only() {
+    on_each_backend(|offscreen| {
+        let mut renderer = offscreen.renderer(W, H);
+        let mut edged = settings(false);
+        edged.edges.enabled = true;
+        edged.antialiasing = false;
+        let mut plain = edged.clone();
+        plain.edges.enabled = false;
+        let background = {
+            let empty = frame_of(offscreen, &mut renderer, &plain, &[]);
+            pixel(&empty, 2, 2)
+        };
+        let centre = |rgba: &[u8]| pixel(rgba, W / 2, H / 2);
+
+        // A shell a hundredth of a metre outside a ball, three metres
+        // from the eye.
+        let ball = sphere(Vec3::ZERO, 0.35);
+        let shell = sphere(Vec3::ZERO, 0.36);
+        for ball_opacity in [1.0, 0.5] {
+            let items = [(&ball, 0.0, 1, ball_opacity), (&shell, 0.0, 2, 0.5)];
+            let with = frame_of(offscreen, &mut renderer, &edged, &items);
+            let without = frame_of(offscreen, &mut renderer, &plain, &items);
+            assert_eq!(centre(&with), centre(&without), "ball at {ball_opacity}");
+            let covered = (0..W * H)
+                .filter(|i| pixel(&without, i % W, i / W) != background)
+                .count();
+            // Every edged pixel is on the rim: within three pixels of
+            // the farthest covered pixel from the centre of the frame.
+            let from_centre = |i: u32| {
+                let (x, y) = (
+                    (i % W) as f32 - W as f32 / 2.0,
+                    (i / W) as f32 - H as f32 / 2.0,
+                );
+                x.hypot(y)
+            };
+            let rim = (0..W * H)
+                .filter(|i| pixel(&without, i % W, i / W) != background)
+                .map(from_centre)
+                .fold(0.0, f32::max);
+            let lined: Vec<u32> = (0..W * H)
+                .filter(|&i| {
+                    let (a, b) = (pixel(&with, i % W, i / W), pixel(&without, i % W, i / W));
+                    (0..3).any(|c| a[c].abs_diff(b[c]) > 3)
+                })
+                .collect();
+            assert!(!lined.is_empty() && lined.len() * 2 < covered);
+            assert!(
+                lined.iter().all(|&i| from_centre(i) > rim - 3.0),
+                "ball at {ball_opacity}: edged away from the rim"
+            );
+        }
+
+        // A sheet two hundredths above a floor, either of them the
+        // transparent one or both.
+        let floor = quad(
+            Vec3::ZERO,
+            Vec3::X * 0.8,
+            Vec3::Y * 0.6,
+            [0.6, 0.6, 0.6, 1.0],
+        );
+        let sheet = quad(
+            Vec3::ZERO,
+            Vec3::X * 0.4,
+            Vec3::Y * 0.3,
+            [0.3, 0.3, 0.3, 1.0],
+        );
+        for (floor_opacity, sheet_opacity) in [(1.0, 0.5), (0.999, 0.5), (0.5, 0.5)] {
+            let items = [
+                (&floor, -0.5, 1, floor_opacity),
+                (&sheet, -0.48, 2, sheet_opacity),
+            ];
+            let with = frame_of(offscreen, &mut renderer, &edged, &items);
+            let without = frame_of(offscreen, &mut renderer, &plain, &items);
+            assert_eq!(
+                centre(&with),
+                centre(&without),
+                "floor at {floor_opacity}, sheet at {sheet_opacity}"
+            );
+        }
+
+        // The sheet just under a transparent floor instead: its edges
+        // are still its own, and show through the floor.
+        let items = [(&floor, -0.5, 1, 0.5), (&sheet, -0.52, 2, 0.5)];
+        let with = frame_of(offscreen, &mut renderer, &edged, &items);
+        let without = frame_of(offscreen, &mut renderer, &plain, &items);
+        assert_eq!(centre(&with), centre(&without));
+        let (left, row) = at(&view(), Vec3::new(-0.4, 0.0, -0.52));
+        let lined = (left - 2..=left + 2)
+            .filter(|&x| pixel(&with, x, row) != pixel(&without, x, row))
+            .count();
+        assert!(lined >= 1, "the sheet's edge under the floor");
+    });
+}
+
+/// Where one object at a time is just short of opaque among opaque ones,
+/// the frame is the all-opaque one: in front of them, behind them and
+/// passing through them.
+#[test]
+fn a_mesh_just_short_of_opaque_among_opaque_ones_draws_as_they_do() {
+    on_each_backend(|offscreen| {
+        let mut renderer = offscreen.renderer(W, H);
+        let mut settings = settings(false);
+        settings.edges.enabled = true;
+        let floor = quad(
+            Vec3::ZERO,
+            Vec3::X * 0.9,
+            Vec3::Y * 0.6,
+            [0.5, 0.5, 0.5, 1.0],
+        );
+        // Sunk into the floor.
+        let ball = sphere(Vec3::new(-0.2, 0.0, 0.0), 0.35);
+        let tilted = quad(
+            Vec3::new(0.5, 0.0, 0.0),
+            Vec3::new(0.25, 0.0, 0.2),
+            Vec3::Y * 0.3,
+            [1.0; 4],
+        );
+        // Passing through the floor along the Y axis.
+        let crossing = quad(
+            Vec3::new(0.2, -0.3, 0.0),
+            Vec3::new(0.3, 0.0, 0.25),
+            Vec3::Y * 0.15,
+            [0.8, 0.8, 0.8, 1.0],
+        );
+        let scene = [
+            (&floor, -0.4),
+            (&ball, -0.2),
+            (&tilted, 0.2),
+            (&crossing, -0.4),
+        ];
+        let mut frame = |short: Option<usize>| {
+            let items: Vec<_> = scene
+                .iter()
+                .enumerate()
+                .map(|(i, (mesh, z))| {
+                    let opacity = if short == Some(i) { 0.999 } else { 1.0 };
+                    (*mesh, *z, i as u32 + 1, opacity)
+                })
+                .collect();
+            frame_of(offscreen, &mut renderer, &settings, &items)
+        };
+        let opaque = frame(None);
+        for short in 0..scene.len() {
+            let count = differing(&frame(Some(short)), &opaque, 1);
+            assert_eq!(count, 0, "object {}", short + 1);
+        }
+    });
+}
+
+/// A mesh too faint to see leaves nothing in the frame: no line on a
+/// mesh it passes through, lies close to, or ends flush against, and no
+/// gap in that mesh's own outline. The frame is the one without it.
+#[test]
+fn a_faint_mesh_leaves_no_mark_on_the_meshes_around_it() {
+    on_each_backend(|offscreen| {
+        let mut renderer = offscreen.renderer(W, H);
+        let mut settings = settings(false);
+        settings.edges.enabled = true;
+        settings.antialiasing = false;
+        let black = [0.0, 0.0, 0.0, 1.0];
+        let grey = [0.6, 0.6, 0.6, 1.0];
+        // Two sheets crossing along the Y axis; a ball with another, a
+        // little larger and to one side, so that each is the outer one
+        // along part of the rim; two sheets side by side in one plane.
+        let one = quad(Vec3::ZERO, Vec3::new(0.6, 0.0, -0.3), Vec3::Y * 0.4, grey);
+        let other = quad(Vec3::ZERO, Vec3::new(0.6, 0.0, 0.3), Vec3::Y * 0.4, black);
+        let ball = sphere(Vec3::ZERO, 0.35);
+        let beside = MeshData {
+            vertices: sphere(Vec3::new(0.03, 0.02, 0.0), 0.36)
+                .vertices
+                .iter()
+                .map(|v| MeshVertex::colored(v.position, v.normal, black))
+                .collect(),
+            ..sphere(Vec3::ZERO, 0.36)
+        };
+        let left = quad(
+            Vec3::new(-0.3, 0.0, 0.0),
+            Vec3::X * 0.3,
+            Vec3::Y * 0.4,
+            grey,
+        );
+        let right = quad(
+            Vec3::new(0.3, 0.0, 0.0),
+            Vec3::X * 0.3,
+            Vec3::Y * 0.4,
+            black,
+        );
+        // The last number is how many pixels may differ: one, on the
+        // ball's rim, where the surface is too steep across a pixel for
+        // the edge test to follow it from one layer to the next.
+        for (name, shown, faint, stray) in [
+            ("crossing", &one, &other, 0),
+            ("close", &ball, &beside, 1),
+            ("flush on the right", &left, &right, 0),
+            ("flush on the left", &right, &left, 0),
+        ] {
+            for opacity in [0.999, 0.5] {
+                let with = frame_of(
+                    offscreen,
+                    &mut renderer,
+                    &settings,
+                    &[(shown, 0.0, 2, opacity), (faint, 0.0, 3, 0.002)],
+                );
+                let without = frame_of(
+                    offscreen,
+                    &mut renderer,
+                    &settings,
+                    &[(shown, 0.0, 2, opacity)],
+                );
+                // The faint mesh's own pixels, outside the other, change
+                // by its two thousandths and no more.
+                let count = differing(&with, &without, 3);
+                assert!(count <= stray, "{name} at {opacity}: {count}");
+                // And it is a frame with edge lines in it.
+                settings.edges.enabled = false;
+                let plain = frame_of(
+                    offscreen,
+                    &mut renderer,
+                    &settings,
+                    &[(shown, 0.0, 2, opacity)],
+                );
+                settings.edges.enabled = true;
+                assert!(differing(&without, &plain, 3) > 20, "{name}");
+            }
+        }
+    });
+}
+
+/// A fade's faint end is smooth: opacity is kept finely enough that the
+/// first steps a mesh takes over a dark background are small ones, and
+/// below the least that could show it is not drawn, nor picked.
+#[test]
+fn the_faint_end_of_a_fade_is_smooth() {
+    on_each_backend(|offscreen| {
+        let mut renderer = offscreen.renderer(W, H);
+        let mut settings = settings(false);
+        settings.antialiasing = false;
+        settings.background_color = [0.0, 0.0, 0.0, 1.0];
+        let sheet = quad(Vec3::ZERO, Vec3::X * 0.5, Vec3::Y * 0.5, [1.0; 4]);
+        let mut level = |opacity: f32| {
+            let rgba = frame_of(
+                offscreen,
+                &mut renderer,
+                &settings,
+                &[(&sheet, 0.0, 1, opacity)],
+            );
+            let picked = offscreen
+                .pick(&mut renderer, (W / 2, H / 2))
+                .expect("a pick");
+            (pixel(&rgba, W / 2, H / 2)[1], picked.object)
+        };
+        assert_eq!(level(0.0001), (0, ObjectId::NONE));
+        let mut last = 0;
+        for step in 1..=40 {
+            let (now, object) = level(step as f32 * 0.0005);
+            assert_eq!(object, ObjectId(1));
+            assert!(
+                now >= last && now - last <= 3,
+                "from {last} to {now} at {}",
+                step as f32 * 0.0005
+            );
+            last = now;
+        }
+        assert!(last > 20, "{last}");
+    });
+}
+
+/// A surface that slopes steeply across the frame is edged the same just
+/// short of opaque as opaque, where a transparent mesh in front of it
+/// ends, and so is an opaque one behind a mesh just short of opaque: the
+/// edge test extrapolates a surface from the pixel a step back, which is
+/// where the mesh in front begins.
+#[test]
+fn a_steep_surface_is_edged_alike_behind_a_transparent_mesh() {
+    on_each_backend(|offscreen| {
+        let mut renderer = offscreen.renderer(W, H);
+        let mut settings = settings(false);
+        settings.edges.enabled = true;
+        settings.antialiasing = false;
+        let cover = quad(
+            Vec3::new(-0.35, 0.0, 0.9),
+            Vec3::X * 0.3,
+            Vec3::Y * 0.25,
+            [0.3, 0.3, 0.3, 1.0],
+        );
+        for slope in [-2.0, -1.4, -0.5, 0.5, 1.4, 2.0] {
+            let steep = quad(
+                Vec3::ZERO,
+                Vec3::new(0.3, 0.0, -0.3 * slope),
+                Vec3::Y * 0.5,
+                [0.6, 0.6, 0.6, 1.0],
+            );
+            let mut frame = |steep_opacity: f32, cover_opacity: f32| {
+                frame_of(
+                    offscreen,
+                    &mut renderer,
+                    &settings,
+                    &[
+                        (&steep, 0.0, 1, steep_opacity),
+                        (&cover, 0.0, 2, cover_opacity),
+                    ],
+                )
+            };
+            for cover_opacity in [0.5, 0.999] {
+                let count = differing(&frame(0.999, cover_opacity), &frame(1.0, cover_opacity), 1);
+                assert_eq!(count, 0, "slope {slope}, cover at {cover_opacity}");
+            }
+            let count = differing(&frame(1.0, 0.999), &frame(1.0, 1.0), 1);
+            assert_eq!(
+                count, 0,
+                "slope {slope}, opaque behind a cover short of opaque"
+            );
+        }
+    });
+}
+
+/// Two transparent surfaces in exactly the same place are both drawn,
+/// the higher object number in front, whichever is submitted first.
+#[test]
+fn transparent_surfaces_in_the_same_place_are_both_drawn() {
+    on_each_backend(|offscreen| {
+        let mut renderer = offscreen.renderer(W, H);
+        let mut settings = settings(false);
+        settings.antialiasing = false;
+        let dark = quad(
+            Vec3::ZERO,
+            Vec3::X * 0.5,
+            Vec3::Y * 0.5,
+            [0.2, 0.2, 0.2, 1.0],
+        );
+        let pale = quad(
+            Vec3::ZERO,
+            Vec3::X * 0.5,
+            Vec3::Y * 0.5,
+            [0.6, 0.6, 0.6, 1.0],
+        );
+        let forward = frame_of(
+            offscreen,
+            &mut renderer,
+            &settings,
+            &[(&dark, 0.0, 1, 0.5), (&pale, 0.0, 2, 0.5)],
+        );
+        let backward = frame_of(
+            offscreen,
+            &mut renderer,
+            &settings,
+            &[(&pale, 0.0, 2, 0.5), (&dark, 0.0, 1, 0.5)],
+        );
+        assert!(forward == backward, "the order of submission shows");
+        let background = [BACKGROUND[0], BACKGROUND[1], BACKGROUND[2]];
+        let behind = over(lit(&settings, 0.2, Vec3::Z, Vec3::Z), 0.5, background);
+        let expected = over(lit(&settings, 0.6, Vec3::Z, Vec3::Z), 0.5, behind).map(srgb_byte);
+        let centre = pixel(&forward, W / 2, H / 2);
+        assert!(close(centre, expected, 3.0), "{centre:?} vs {expected:?}");
+
+        // Submitted in the order of their numbers, the same one is in
+        // front whether both are opaque, both just short of it, or one
+        // of each: the opaque frame's rule is the last one submitted.
+        let mut frame = |dark_opacity: f32, pale_opacity: f32| {
+            frame_of(
+                offscreen,
+                &mut renderer,
+                &settings,
+                &[(&dark, 0.0, 1, dark_opacity), (&pale, 0.0, 2, pale_opacity)],
+            )
+        };
+        let opaque = frame(1.0, 1.0);
+        for (dark_opacity, pale_opacity) in [(0.999, 0.999), (0.999, 1.0), (1.0, 0.999)] {
+            assert_eq!(
+                differing(&frame(dark_opacity, pale_opacity), &opaque, 1),
+                0,
+                "dark at {dark_opacity}, pale at {pale_opacity}"
+            );
+        }
+    });
+}
+
+/// A pixel is drawn `transparency_layers` transparent surfaces deep,
+/// counted from the eye: the ones behind are left out.
+#[test]
+fn transparent_surfaces_past_the_layer_limit_are_left_out_from_the_back() {
+    on_each_backend(|offscreen| {
+        let mut renderer = offscreen.renderer(W, H);
+        let mut settings = settings(false);
+        settings.antialiasing = false;
+        let sheets = [
+            (0.3, 0.6),
+            (0.0, 0.2),
+            (-0.3, 0.45),
+            (-0.6, 0.1),
+            (-0.9, 0.3),
+        ];
+        let mut frame = |count: usize, layers: u32| {
+            settings.transparency_layers = layers;
+            // Farthest first, so the depth order is not the drawing order.
+            for (i, (z, albedo)) in sheets[..count].iter().enumerate().rev() {
+                let sheet = quad(Vec3::ZERO, Vec3::X * 0.6, Vec3::Y * 0.6, [*albedo; 4]);
+                submit_at(offscreen, &mut renderer, &sheet, *z, i as u32 + 1, 0.5);
+            }
+            offscreen
+                .render_rgba(&mut renderer, &view(), &settings)
+                .unwrap()
+                .0
+        };
+        for layers in [1, 2, 3, 4, 5] {
+            let limited = frame(5, layers);
+            assert!(limited == frame(layers as usize, 8), "{layers} layers");
+            if layers < 5 {
+                assert!(limited != frame(5, 8), "{layers} layers");
+            }
+        }
+    });
+}
+
+/// A pick lands on the nearest surface, transparent or not, and a frame
+/// without transparent meshes is not picked through an earlier one's.
+#[test]
+fn a_pick_lands_on_a_transparent_surface() {
+    on_each_backend(|offscreen| {
+        let mut renderer = offscreen.renderer(W, H);
+        let far = quad(Vec3::ZERO, Vec3::X * 0.8, Vec3::Y * 0.8, [1.0; 4]);
+        let near = quad(Vec3::ZERO, Vec3::X * 0.2, Vec3::Y * 0.2, [1.0; 4]);
+        let mut pick = |near_at: Option<f32>, pixel: (u32, u32)| {
+            submit_at(offscreen, &mut renderer, &far, -0.5, 7, 1.0);
+            // Too faint to show in the frame, so not there to be picked.
+            submit_at(offscreen, &mut renderer, &near, 0.6, 11, 0.0001);
+            if let Some(z) = near_at {
+                submit_at(offscreen, &mut renderer, &near, z, 9, 0.3);
+            }
+            offscreen
+                .render_rgba(&mut renderer, &view(), &settings(false))
+                .unwrap();
+            let pick = offscreen.pick(&mut renderer, pixel).expect("a pick");
+            (pick.object, pick.world.expect("a surface").z)
+        };
+        let centre = (W / 2, H / 2);
+        let (object, z) = pick(Some(0.3), centre);
+        assert_eq!(object, ObjectId(9));
+        assert!((z - 0.3).abs() < 1e-3, "{z}");
+        // Beside the transparent mesh, and behind the opaque one.
+        let (object, z) = pick(Some(0.3), (W / 2 + 20, H / 2));
+        assert_eq!(object, ObjectId(7));
+        assert!((z + 0.5).abs() < 1e-3, "{z}");
+        assert_eq!(pick(Some(-0.8), centre).0, ObjectId(7));
+        // The frame after it is gone.
+        assert_eq!(pick(Some(0.3), centre).0, ObjectId(9));
+        assert_eq!(pick(None, centre).0, ObjectId(7));
     });
 }
 
@@ -476,7 +1222,7 @@ fn meshes_occlude_depth_tested_lines_but_not_overlays() {
         );
         let red = [1.0, 0.0, 0.0, 1.0];
         let frame = |renderer: &mut Renderer, depth_mode| {
-            renderer.submit_retained_mesh(&mesh, Mat4::IDENTITY, ObjectId(1), MaterialId(0));
+            renderer.submit_retained_mesh(&mesh, Mat4::IDENTITY, ObjectId(1), MaterialId(0), 1.0);
             renderer.submit_lines(
                 &line(0.0, -0.5, red),
                 Mat4::IDENTITY,
@@ -530,8 +1276,8 @@ fn ambient_occlusion_darkens_the_foot_of_a_wall() {
         );
         // The two meshes span a box 3 m corner to corner: a 0.5 m radius.
         let frame = |renderer: &mut Renderer, ao| {
-            renderer.submit_retained_mesh(&floor, Mat4::IDENTITY, ObjectId(1), MaterialId(0));
-            renderer.submit_retained_mesh(&wall, Mat4::IDENTITY, ObjectId(2), MaterialId(0));
+            renderer.submit_retained_mesh(&floor, Mat4::IDENTITY, ObjectId(1), MaterialId(0), 1.0);
+            renderer.submit_retained_mesh(&wall, Mat4::IDENTITY, ObjectId(2), MaterialId(0), 1.0);
             let mut settings = settings(ao);
             settings.ao.radius = 0.5 / 3.0;
             offscreen
@@ -588,7 +1334,7 @@ fn the_lights_turn_with_the_view() {
                 offscreen.queue(),
                 &quad(Vec3::ZERO, u, v, grey),
             );
-            renderer.submit_retained_mesh(&mesh, Mat4::IDENTITY, ObjectId(1), MaterialId(0));
+            renderer.submit_retained_mesh(&mesh, Mat4::IDENTITY, ObjectId(1), MaterialId(0), 1.0);
             let view =
                 CameraView::look_at(eye, Vec3::ZERO, up, 0.8, W as f32 / H as f32, 0.1, 10.0);
             let (rgba, _) = offscreen
@@ -636,7 +1382,13 @@ fn a_material_sets_the_highlight() {
             },
         ];
         let mut centre = |material: u32| {
-            renderer.submit_retained_mesh(&mesh, Mat4::IDENTITY, ObjectId(1), MaterialId(material));
+            renderer.submit_retained_mesh(
+                &mesh,
+                Mat4::IDENTITY,
+                ObjectId(1),
+                MaterialId(material),
+                1.0,
+            );
             let (rgba, _) = offscreen
                 .render_rgba(&mut renderer, &view(), &settings)
                 .unwrap();
@@ -700,9 +1452,9 @@ fn edge_lines_mark_silhouettes_creases_and_object_boundaries() {
             settings.edges.enabled = edges;
             settings.materials[0].specular = 0.0;
             settings.antialiasing = false;
-            renderer.submit_retained_mesh(&left, Mat4::IDENTITY, ObjectId(1), MaterialId(0));
-            renderer.submit_retained_mesh(&right, Mat4::IDENTITY, ObjectId(1), MaterialId(0));
-            renderer.submit_retained_mesh(&flush, Mat4::IDENTITY, ObjectId(2), MaterialId(0));
+            renderer.submit_retained_mesh(&left, Mat4::IDENTITY, ObjectId(1), MaterialId(0), 1.0);
+            renderer.submit_retained_mesh(&right, Mat4::IDENTITY, ObjectId(1), MaterialId(0), 1.0);
+            renderer.submit_retained_mesh(&flush, Mat4::IDENTITY, ObjectId(2), MaterialId(0), 1.0);
             offscreen
                 .render_rgba(&mut renderer, &view, &settings)
                 .unwrap()
@@ -754,8 +1506,8 @@ fn ambient_occlusion_is_the_same_at_any_scale() {
                     white,
                 ),
             );
-            renderer.submit_retained_mesh(&floor, Mat4::IDENTITY, ObjectId(1), MaterialId(0));
-            renderer.submit_retained_mesh(&wall, Mat4::IDENTITY, ObjectId(2), MaterialId(0));
+            renderer.submit_retained_mesh(&floor, Mat4::IDENTITY, ObjectId(1), MaterialId(0), 1.0);
+            renderer.submit_retained_mesh(&wall, Mat4::IDENTITY, ObjectId(2), MaterialId(0), 1.0);
             let view = CameraView::look_at(
                 Vec3::new(-2.0, 0.0, 2.0) * scale,
                 Vec3::ZERO,
@@ -862,7 +1614,13 @@ fn geometry_occludes_the_grid() {
                 &quad(Vec3::new(0.0, 0.0, z), Vec3::X * 0.4, Vec3::Y * 0.4, white),
             );
             let frame = |renderer: &mut Renderer, settings: &RenderSettings| {
-                renderer.submit_retained_mesh(&mesh, Mat4::IDENTITY, ObjectId(1), MaterialId(0));
+                renderer.submit_retained_mesh(
+                    &mesh,
+                    Mat4::IDENTITY,
+                    ObjectId(1),
+                    MaterialId(0),
+                    1.0,
+                );
                 offscreen.render_rgba(renderer, &view, settings).unwrap().0
             };
             let plain = frame(&mut renderer, &settings(false));
@@ -1052,7 +1810,7 @@ fn antialiasing_smooths_silhouettes_only() {
             let mut settings = settings(false);
             settings.materials[0].specular = 0.0;
             settings.antialiasing = antialiasing;
-            renderer.submit_retained_mesh(&mesh, Mat4::IDENTITY, ObjectId(1), MaterialId(0));
+            renderer.submit_retained_mesh(&mesh, Mat4::IDENTITY, ObjectId(1), MaterialId(0), 1.0);
             offscreen
                 .render_rgba(&mut renderer, &view(), &settings)
                 .unwrap()
@@ -1109,7 +1867,7 @@ fn a_supersampled_frame_is_the_same_picture_smoother() {
             let mut renderer = offscreen.renderer(W * factor, H * factor);
             let mesh =
                 renderer.create_retained_mesh(offscreen.device(), offscreen.queue(), &mesh_data);
-            renderer.submit_retained_mesh(&mesh, Mat4::IDENTITY, ObjectId(1), MaterialId(0));
+            renderer.submit_retained_mesh(&mesh, Mat4::IDENTITY, ObjectId(1), MaterialId(0), 1.0);
             renderer.submit_lines(
                 &line(-0.5, 0.2, [1.0, 0.0, 0.0, 1.0]),
                 Mat4::IDENTITY,
@@ -1237,6 +1995,7 @@ fn surfel_discs_draw_like_the_surface_they_sample() {
             Mat4::from_translation(offset),
             ObjectId(3),
             MaterialId(0),
+            1.0,
         );
         let (as_mesh, _) = offscreen
             .render_rgba(&mut renderer, &view(), &settings)
@@ -1342,8 +2101,12 @@ fn dump_the_test_scene() {
         offscreen.queue(),
         &crate::test_scenes::create_test_scene(),
     );
+    // `VOLUMETRIC_FRAME_OPACITY=0.5` draws the cube, and every added
+    // shape but the plate they stand on, at that opacity.
+    let opacity = std::env::var("VOLUMETRIC_FRAME_OPACITY")
+        .map_or(1.0, |opacity| opacity.parse::<f32>().unwrap());
     for (mesh, transform) in &scene.meshes {
-        renderer.submit_retained_mesh(mesh, *transform, ObjectId(1), MaterialId(0));
+        renderer.submit_retained_mesh(mesh, *transform, ObjectId(1), MaterialId(0), opacity);
     }
     // `VOLUMETRIC_FRAME_SHAPES=1` adds a plate, a step and two spheres
     // around the cube: curved surfaces and contact, to judge shading by.
@@ -1374,7 +2137,14 @@ fn dump_the_test_scene() {
         Vec::new()
     };
     for (i, (mesh, transform)) in shapes.iter().enumerate() {
-        renderer.submit_retained_mesh(mesh, *transform, ObjectId(2 + i as u32), MaterialId(0));
+        let opacity = if i == 0 { 1.0 } else { opacity };
+        renderer.submit_retained_mesh(
+            mesh,
+            *transform,
+            ObjectId(2 + i as u32),
+            MaterialId(0),
+            opacity,
+        );
     }
     for lines in &scene.lines {
         renderer.submit_retained_lines(lines);

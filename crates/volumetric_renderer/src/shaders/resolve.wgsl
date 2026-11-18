@@ -1,64 +1,23 @@
 // Resolve: lights the G-buffer into display-referred colour and draws
 // edge lines where the G-buffer is discontinuous. Pixels no geometry
 // source wrote are left to the pass's clear (the background). Follows
-// `fullscreen_vs.wgsl`.
-
-struct Light {
-    // xyz: the world direction the light shines from (unit).
-    direction: vec4<f32>,
-    color: vec4<f32>,
-};
-
-struct Material {
-    // rgb: base tint; a: unused.
-    tint: vec4<f32>,
-    // x: the highlight's exponent; y: its strength.
-    highlight: vec4<f32>,
-};
-
-struct ResolveUniforms {
-    inv_view_proj: mat4x4<f32>,
-    depth_to_distance: vec4<f32>,
-    lights: array<Light, 3>,
-    sky: vec4<f32>,
-    ground: vec4<f32>,
-    // rgb: edge line colour; a: opacity, 0 when edges are off.
-    edge_color: vec4<f32>,
-    // x: cosine of the crease angle; y: 1 when ambient occlusion is on;
-    // z: how many pixels wide an edge line is.
-    switches: vec4<f32>,
-    materials: array<Material, 16>,
-};
-
-@group(0) @binding(0)
-var<uniform> uniforms: ResolveUniforms;
-
-@group(0) @binding(1)
-var g_albedo: texture_2d<f32>;
-
-@group(0) @binding(2)
-var g_normal: texture_2d<f32>;
-
-@group(0) @binding(3)
-var g_surface: texture_2d<u32>;
+// `resolve_common.wgsl`.
 
 @group(0) @binding(4)
 var g_ao: texture_2d<f32>;
 
-fn unproject(ndc: vec2<f32>, z: f32) -> vec3<f32> {
-    let h = uniforms.inv_view_proj * vec4<f32>(ndc, z, 1.0);
-    return h.xyz / h.w;
-}
+// In a frame with transparent meshes (`switches.w`): the surface target
+// of their nearest layer, and how opaque that layer's surfaces are. Not
+// read otherwise.
+@group(0) @binding(5)
+var g_nearest_layer: texture_2d<u32>;
 
-fn normal_at(px: vec2<i32>) -> vec3<f32> {
-    return normalize(textureLoad(g_normal, px, 0).rgb * 2.0 - vec3<f32>(1.0));
-}
+@group(0) @binding(6)
+var g_nearest_opacity: texture_2d<f32>;
 
 // Whether the surface steps away from the eye between `px` and its
 // neighbour at `px + step`: the neighbour is farther than the plane
-// through `px` and the neighbour on the other side would put it. Depth
-// is linear across a plane on screen, so the plane is extrapolated in
-// depth and the comparison made in world distance.
+// through `px` and the neighbour on the other side would put it.
 fn steps_away(px: vec2<i32>, step: vec2<i32>, depth: f32, limit: vec2<i32>) -> bool {
     let k = uniforms.depth_to_distance;
     let neighbour = surface_depth(textureLoad(g_surface, clamp(px + step, vec2<i32>(0), limit), 0));
@@ -66,13 +25,8 @@ fn steps_away(px: vec2<i32>, step: vec2<i32>, depth: f32, limit: vec2<i32>) -> b
         return true;
     }
     let behind = surface_depth(textureLoad(g_surface, clamp(px - step, vec2<i32>(0), limit), 0));
-    let distance = eye_distance(depth, k);
-    // With no surface behind, or a jump there, take this pixel's depth.
-    var expected = distance;
-    if behind < 1.0 && abs(eye_distance(behind, k) - distance) < distance * 0.02 {
-        expected = eye_distance(clamp(2.0 * depth - behind, 0.0, 1.0), k);
-    }
-    return eye_distance(neighbour, k) - expected > distance * 0.012;
+    return eye_distance(neighbour, k) - expected_distance(depth, behind)
+        > eye_distance(depth, k) * DEPTH_STEP;
 }
 
 // How much of an edge line covers `px`: 1 on the near side of a step in
@@ -102,12 +56,93 @@ fn edge(px: vec2<i32>, depth: f32, n: vec3<f32>, object: u32) -> f32 {
     return 0.0;
 }
 
-// Leaves colours below the knee alone and rolls the rest off toward 1,
-// so a highlight saturates smoothly instead of clipping.
-fn shoulder(color: vec3<f32>) -> vec3<f32> {
-    let knee = 0.8;
-    let over = max(color - vec3<f32>(knee), vec3<f32>(0.0)) / (1.0 - knee);
-    return min(color, vec3<f32>(knee)) + (1.0 - knee) * (vec3<f32>(1.0) - exp(-over));
+// The mark `edge` makes toward one neighbour, for any neighbour: the
+// surface target's texel `neighbour` at `at`, with `behind` the depth one
+// step the other way. `forward` is toward the right or down, where
+// creases and object boundaries are marked; a crease needs the
+// neighbour's normal, which the G-buffer has for its own surfaces
+// (`in_g_buffer`).
+fn mark_against(
+    neighbour: vec4<u32>,
+    in_g_buffer: bool,
+    at: vec2<i32>,
+    forward: bool,
+    depth: f32,
+    n: vec3<f32>,
+    object: u32,
+    behind: f32,
+) -> f32 {
+    let k = uniforms.depth_to_distance;
+    let neighbour_depth = surface_depth(neighbour);
+    if neighbour_depth >= 1.0 {
+        return 1.0;
+    }
+    if eye_distance(neighbour_depth, k) - expected_distance(depth, behind)
+        > eye_distance(depth, k) * DEPTH_STEP {
+        return 1.0;
+    }
+    if forward
+        && (neighbour.r != object || (in_g_buffer && dot(n, normal_at(at)) < uniforms.switches.x)) {
+        return 1.0;
+    }
+    return 0.0;
+}
+
+// `edge` in a frame with transparent meshes. The G-buffer does not hold
+// them, but the nearest of them stand beside the opaque scene's surfaces
+// as neighbours all the same, each as much as it is opaque: where a
+// neighbouring pixel has one, the mark is a blend, by its opacity, of the
+// mark the G-buffer alone gives and the mark that surface would give
+// were it opaque and in the G-buffer. That goes for the neighbour a mark
+// is made toward and for the one a step the other way, which the test
+// extrapolates the surface from. So the edges of the opaque scene arrive
+// at the all-opaque frame's as a mesh's opacity reaches 1, and at the
+// frame's without the mesh as it reaches 0.
+fn edge_beside_transparent(px: vec2<i32>, depth: f32, n: vec3<f32>, object: u32) -> f32 {
+    // Under a transparent surface the opaque scene keeps its own edges.
+    if surface_depth(textureLoad(g_nearest_layer, px, 0)) < 1.0 {
+        return edge(px, depth, n, object);
+    }
+    let limit = vec2<i32>(textureDimensions(g_surface)) - vec2<i32>(1);
+    let width = max(i32(uniforms.switches.z), 1);
+    var strength = 0.0;
+    // Right, down, left, up.
+    for (var i = 0; i < 4; i = i + 1) {
+        let along = select(vec2<i32>(0, width), vec2<i32>(width, 0), i % 2 == 0);
+        let step = select(along, -along, i >= 2);
+        let at = clamp(px + step, vec2<i32>(0), limit);
+        let back = clamp(px - step, vec2<i32>(0), limit);
+        let forward = i < 2;
+
+        let neighbour = textureLoad(g_surface, at, 0);
+        let behind = surface_depth(textureLoad(g_surface, back, 0));
+        let layer_at = textureLoad(g_nearest_layer, at, 0);
+        let layer_back = textureLoad(g_nearest_layer, back, 0);
+        let has_at = surface_depth(layer_at) < 1.0;
+        var opacity_at = 0.0;
+        if has_at {
+            opacity_at = opacity_of(textureLoad(g_nearest_opacity, at, 0));
+        }
+
+        var mark = mark_against(neighbour, true, at, forward, depth, n, object, behind);
+        if has_at {
+            let beside = mark_against(layer_at, false, at, forward, depth, n, object, behind);
+            mark = mix(mark, beside, opacity_at);
+        }
+        if surface_depth(layer_back) < 1.0 {
+            // The same again, extrapolated from the transparent surface
+            // a step back: for an opaque one there, that is the test.
+            let stand_in = surface_depth(layer_back);
+            var other = mark_against(neighbour, true, at, forward, depth, n, object, stand_in);
+            if has_at {
+                let beside = mark_against(layer_at, false, at, forward, depth, n, object, stand_in);
+                other = mix(other, beside, opacity_at);
+            }
+            mark = mix(mark, other, opacity_of(textureLoad(g_nearest_opacity, back, 0)));
+        }
+        strength = max(strength, mark);
+    }
+    return strength;
 }
 
 @fragment
@@ -118,41 +153,22 @@ fn fs_resolve(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     if depth >= 1.0 {
         discard;
     }
-
-    let albedo_texel = textureLoad(g_albedo, px, 0);
-    let material = uniforms.materials[min(u32(albedo_texel.a * 255.0 + 0.5), 15u)];
-    let albedo = albedo_texel.rgb * albedo_texel.rgb * material.tint.rgb;
     let n = normal_at(px);
-
-    // Toward the eye, along this pixel's ray.
-    let dim = vec2<f32>(textureDimensions(g_surface));
-    let ndc = vec2<f32>(frag.x / dim.x * 2.0 - 1.0, 1.0 - frag.y / dim.y * 2.0);
-    let v = normalize(unproject(ndc, 0.0) - unproject(ndc, 1.0));
 
     var ao = 1.0;
     if uniforms.switches.y > 0.5 {
         ao = textureLoad(g_ao, px, 0).r;
     }
-
-    let ambient = mix(uniforms.ground.rgb, uniforms.sky.rgb, n.z * 0.5 + 0.5);
-    var diffuse = vec3<f32>(0.0);
-    var highlight = vec3<f32>(0.0);
-    for (var i = 0; i < 3; i = i + 1) {
-        let l = uniforms.lights[i].direction.xyz;
-        let facing = max(dot(n, l), 0.0);
-        diffuse = diffuse + uniforms.lights[i].color.rgb * facing;
-        let h = normalize(l + v);
-        highlight = highlight
-            + uniforms.lights[i].color.rgb
-                * (pow(max(dot(n, h), 0.0), material.highlight.x) * step(0.0, dot(n, l)));
-    }
-    // Occlusion takes the ambient light whole and direct light in part.
-    var color = albedo * (ambient * ao + diffuse * mix(1.0, ao, 0.5))
-        + highlight * (material.highlight.y * ao);
-    color = shoulder(color);
+    var color = shade(frag, n, ao);
 
     if uniforms.edge_color.a > 0.0 {
-        color = mix(color, uniforms.edge_color.rgb, uniforms.edge_color.a * edge(px, depth, n, surface.r));
+        var strength = 0.0;
+        if uniforms.switches.w > 0.5 {
+            strength = edge_beside_transparent(px, depth, n, surface.r);
+        } else {
+            strength = edge(px, depth, n, surface.r);
+        }
+        color = mix(color, uniforms.edge_color.rgb, uniforms.edge_color.a * strength);
     }
     return vec4<f32>(clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }

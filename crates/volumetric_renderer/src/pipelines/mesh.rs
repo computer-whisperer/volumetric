@@ -1,5 +1,5 @@
 //! The mesh geometry source: retained triangle meshes drawn into the
-//! G-buffer.
+//! G-buffer, and the transparent ones into the layers peeled after it.
 
 use std::sync::Arc;
 
@@ -7,6 +7,7 @@ use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
 
+use crate::gbuffer::LayerBuffers;
 use crate::texture::{PipelineId, ResidentTexture, upload};
 use crate::{DynamicBuffer, GBuffer, MaterialId, MeshData, MeshVertex, ObjectId, TextureData};
 
@@ -264,13 +265,15 @@ fn clamp_mesh_to_budget(
 }
 
 /// One draw's instance data: the model matrix, column major, then the
-/// object id and material index the G-buffer carries for it.
+/// object id and material index the G-buffer carries for it, and how
+/// opaque the draw is.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 struct DrawInstance {
     model: [[f32; 4]; 4],
     ids: [u32; 2],
-    _pad: [u32; 2],
+    opacity: f32,
+    _pad: u32,
 }
 
 /// A retained mesh submitted for a frame.
@@ -279,17 +282,35 @@ pub struct MeshDraw {
     pub transform: Mat4,
     pub object: ObjectId,
     pub material: MaterialId,
+    /// 1 is opaque; less blends the mesh over what is behind it.
+    pub opacity: f32,
 }
 
-/// The mesh geometry source: draws retained meshes into the G-buffer.
+/// The mesh geometry source: draws retained meshes into the G-buffer,
+/// and the transparent ones into a layer at a time.
 pub struct MeshPipeline {
     pipeline: wgpu::RenderPipeline,
+    /// The same vertices into a layer of the transparent meshes: the
+    /// fragments in front of the opaque scene and behind the layer
+    /// before. This one writes the layer's surface target alone.
+    layer_surface_pipeline: wgpu::RenderPipeline,
+    /// And this one the rest of what a G-buffer holds, with how opaque
+    /// each surface is.
+    layer_pipeline: wgpu::RenderPipeline,
     uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     /// Group 1: each mesh's texture, or the shared white texel.
     textures: MeshTextureBinding,
-    /// One entry per mesh drawn this frame, in draw order.
+    /// Group 2 of a layer pass: the surfaces it peels against.
+    peel_layout: wgpu::BindGroupLayout,
+    /// The layer pass's uniforms for the nearest layer, and for every
+    /// one behind it.
+    peel_uniforms: [wgpu::Buffer; 2],
+    /// One entry per mesh drawn this frame: the opaque draws in draw
+    /// order, then the transparent ones.
     instance_buffer: DynamicBuffer<DrawInstance>,
+    /// Where the transparent draws' instances start.
+    transparent_start: usize,
 }
 
 impl MeshPipeline {
@@ -321,6 +342,51 @@ impl MeshPipeline {
             immediate_size: 0,
         });
 
+        let surface_texture = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                multisampled: false,
+                view_dimension: wgpu::TextureViewDimension::D2,
+                sample_type: wgpu::TextureSampleType::Uint,
+            },
+            count: None,
+        };
+        let peel_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("mesh_peel_bgl"),
+            entries: &[
+                surface_texture(0),
+                surface_texture(1),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let layer_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("mesh_layer_pipeline_layout"),
+                bind_group_layouts: &[
+                    Some(&bind_group_layout),
+                    Some(&textures.layout),
+                    Some(&peel_layout),
+                ],
+                immediate_size: 0,
+            });
+        let peel_uniforms = [0u32, 1].map(|previous| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("mesh_peel_uniforms"),
+                contents: bytemuck::bytes_of(&[previous, 0, 0, 0]),
+                usage: wgpu::BufferUsages::UNIFORM,
+            })
+        });
+
         let target = |format| {
             Some(wgpu::ColorTargetState {
                 format,
@@ -328,111 +394,145 @@ impl MeshPipeline {
                 write_mask: wgpu::ColorWrites::ALL,
             })
         };
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("mesh_gbuffer_pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[
-                    Some(wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<MeshVertex>() as u64,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        // Offsets come from the struct: the two halves of
-                        // the texture coordinate sit where the position
-                        // and the normal would otherwise be padded.
-                        attributes: &[
-                            wgpu::VertexAttribute {
-                                format: wgpu::VertexFormat::Float32x3,
-                                offset: std::mem::offset_of!(MeshVertex, position) as u64,
-                                shader_location: 0,
-                            },
-                            wgpu::VertexAttribute {
-                                format: wgpu::VertexFormat::Float32x3,
-                                offset: std::mem::offset_of!(MeshVertex, normal) as u64,
-                                shader_location: 1,
-                            },
-                            wgpu::VertexAttribute {
-                                format: wgpu::VertexFormat::Float32x4,
-                                offset: std::mem::offset_of!(MeshVertex, color) as u64,
-                                shader_location: 2,
-                            },
-                            wgpu::VertexAttribute {
-                                format: wgpu::VertexFormat::Float32,
-                                offset: std::mem::offset_of!(MeshVertex, u) as u64,
-                                shader_location: 8,
-                            },
-                            wgpu::VertexAttribute {
-                                format: wgpu::VertexFormat::Float32,
-                                offset: std::mem::offset_of!(MeshVertex, v) as u64,
-                                shader_location: 9,
-                            },
-                        ],
-                    }),
-                    Some(wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<DrawInstance>() as u64,
-                        step_mode: wgpu::VertexStepMode::Instance,
-                        attributes: &[
-                            wgpu::VertexAttribute {
-                                format: wgpu::VertexFormat::Float32x4,
-                                offset: 0,
-                                shader_location: 3,
-                            },
-                            wgpu::VertexAttribute {
-                                format: wgpu::VertexFormat::Float32x4,
-                                offset: 16,
-                                shader_location: 4,
-                            },
-                            wgpu::VertexAttribute {
-                                format: wgpu::VertexFormat::Float32x4,
-                                offset: 32,
-                                shader_location: 5,
-                            },
-                            wgpu::VertexAttribute {
-                                format: wgpu::VertexFormat::Float32x4,
-                                offset: 48,
-                                shader_location: 6,
-                            },
-                            wgpu::VertexAttribute {
-                                format: wgpu::VertexFormat::Uint32x2,
-                                offset: std::mem::offset_of!(DrawInstance, ids) as u64,
-                                shader_location: 7,
-                            },
-                        ],
-                    }),
-                ],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_gbuffer"),
-                targets: &[
-                    target(GBuffer::ALBEDO_FORMAT),
-                    target(GBuffer::NORMAL_FORMAT),
-                    target(GBuffer::SURFACE_FORMAT),
-                ],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: Some(wgpu::Face::Back),
-                unclipped_depth: false,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                conservative: false,
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: GBuffer::DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        // The G-buffer's pipeline and the layers' differ in their fragment
+        // stage alone: its entry point, what it reads and what it writes.
+        let build = |label,
+                     layout: &wgpu::PipelineLayout,
+                     fragment_entry,
+                     targets: &[Option<wgpu::ColorTargetState>]| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[
+                        Some(wgpu::VertexBufferLayout {
+                            array_stride: std::mem::size_of::<MeshVertex>() as u64,
+                            step_mode: wgpu::VertexStepMode::Vertex,
+                            // Offsets come from the struct: the two halves of
+                            // the texture coordinate sit where the position
+                            // and the normal would otherwise be padded.
+                            attributes: &[
+                                wgpu::VertexAttribute {
+                                    format: wgpu::VertexFormat::Float32x3,
+                                    offset: std::mem::offset_of!(MeshVertex, position) as u64,
+                                    shader_location: 0,
+                                },
+                                wgpu::VertexAttribute {
+                                    format: wgpu::VertexFormat::Float32x3,
+                                    offset: std::mem::offset_of!(MeshVertex, normal) as u64,
+                                    shader_location: 1,
+                                },
+                                wgpu::VertexAttribute {
+                                    format: wgpu::VertexFormat::Float32x4,
+                                    offset: std::mem::offset_of!(MeshVertex, color) as u64,
+                                    shader_location: 2,
+                                },
+                                wgpu::VertexAttribute {
+                                    format: wgpu::VertexFormat::Float32,
+                                    offset: std::mem::offset_of!(MeshVertex, u) as u64,
+                                    shader_location: 8,
+                                },
+                                wgpu::VertexAttribute {
+                                    format: wgpu::VertexFormat::Float32,
+                                    offset: std::mem::offset_of!(MeshVertex, v) as u64,
+                                    shader_location: 9,
+                                },
+                            ],
+                        }),
+                        Some(wgpu::VertexBufferLayout {
+                            array_stride: std::mem::size_of::<DrawInstance>() as u64,
+                            step_mode: wgpu::VertexStepMode::Instance,
+                            attributes: &[
+                                wgpu::VertexAttribute {
+                                    format: wgpu::VertexFormat::Float32x4,
+                                    offset: 0,
+                                    shader_location: 3,
+                                },
+                                wgpu::VertexAttribute {
+                                    format: wgpu::VertexFormat::Float32x4,
+                                    offset: 16,
+                                    shader_location: 4,
+                                },
+                                wgpu::VertexAttribute {
+                                    format: wgpu::VertexFormat::Float32x4,
+                                    offset: 32,
+                                    shader_location: 5,
+                                },
+                                wgpu::VertexAttribute {
+                                    format: wgpu::VertexFormat::Float32x4,
+                                    offset: 48,
+                                    shader_location: 6,
+                                },
+                                wgpu::VertexAttribute {
+                                    format: wgpu::VertexFormat::Uint32x2,
+                                    offset: std::mem::offset_of!(DrawInstance, ids) as u64,
+                                    shader_location: 7,
+                                },
+                                wgpu::VertexAttribute {
+                                    format: wgpu::VertexFormat::Float32,
+                                    offset: std::mem::offset_of!(DrawInstance, opacity) as u64,
+                                    shader_location: 10,
+                                },
+                            ],
+                        }),
+                    ],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some(fragment_entry),
+                    targets,
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: Some(wgpu::Face::Back),
+                    unclipped_depth: false,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: GBuffer::DEPTH_FORMAT,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let pipeline = build(
+            "mesh_gbuffer_pipeline",
+            &pipeline_layout,
+            "fs_gbuffer",
+            &[
+                target(GBuffer::ALBEDO_FORMAT),
+                target(GBuffer::NORMAL_FORMAT),
+                target(GBuffer::SURFACE_FORMAT),
+            ],
+        );
+        let layer_surface_pipeline = build(
+            "mesh_layer_surface_pipeline",
+            &layer_pipeline_layout,
+            "fs_layer_surface",
+            &[target(GBuffer::SURFACE_FORMAT)],
+        );
+        let layer_pipeline = build(
+            "mesh_layer_pipeline",
+            &layer_pipeline_layout,
+            "fs_layer",
+            &[
+                target(GBuffer::ALBEDO_FORMAT),
+                target(GBuffer::NORMAL_FORMAT),
+                target(LayerBuffers::OPACITY_FORMAT),
+            ],
+        );
 
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("mesh_uniform_buffer"),
@@ -450,14 +550,54 @@ impl MeshPipeline {
 
         Self {
             pipeline,
+            layer_surface_pipeline,
+            layer_pipeline,
             uniform_buffer,
             bind_group,
             textures,
+            peel_layout,
+            peel_uniforms,
             instance_buffer: DynamicBuffer::new(
                 wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 "mesh_instance_buffer",
             ),
+            transparent_start: 0,
         }
+    }
+
+    /// Group 2 of a layer pass: the opaque scene's surface target, and
+    /// the surface target of the layer peeled before (`None` for the
+    /// nearest layer, which has nothing in front of it to stay behind).
+    /// `unread` stands in for the missing one: any surface target the
+    /// pass does not write.
+    pub fn bind_peel(
+        &self,
+        device: &wgpu::Device,
+        opaque_surface: &wgpu::TextureView,
+        previous_surface: Option<&wgpu::TextureView>,
+        unread: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mesh_peel_bg"),
+            layout: &self.peel_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(opaque_surface),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(
+                        previous_surface.unwrap_or(unread),
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.peel_uniforms[previous_surface.is_some() as usize]
+                        .as_entire_binding(),
+                },
+            ],
+        })
     }
 
     /// Uploads a mesh as a GPU resident bound to this pipeline's texture
@@ -472,45 +612,84 @@ impl MeshPipeline {
     }
 
     /// Uploads the frame's camera and one instance per draw. Call before
-    /// the pass that [`render`](Self::render)s the same draws.
+    /// the passes that [`render`](Self::render) `opaque` and
+    /// [`render_layer`](Self::render_layer) `transparent`.
     pub fn prepare(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         view_proj: Mat4,
-        draws: &[MeshDraw],
+        opaque: &[MeshDraw],
+        transparent: &[MeshDraw],
     ) {
         queue.write_buffer(
             &self.uniform_buffer,
             0,
             bytemuck::bytes_of(&view_proj.to_cols_array_2d()),
         );
-        let instances: Vec<DrawInstance> = draws
+        let instances: Vec<DrawInstance> = opaque
             .iter()
+            .chain(transparent)
             .map(|draw| DrawInstance {
                 model: draw.transform.to_cols_array_2d(),
                 ids: [draw.object.0, draw.material.0],
-                _pad: [0; 2],
+                opacity: draw.opacity,
+                _pad: 0,
             })
             .collect();
         self.instance_buffer.upload(device, queue, &instances);
+        self.transparent_start = opaque.len();
     }
 
-    /// Draws `draws` into a G-buffer pass, each under the instance
-    /// [`prepare`](Self::prepare) uploaded for it.
+    /// Draws the opaque `draws` into a G-buffer pass, each under the
+    /// instance [`prepare`](Self::prepare) uploaded for it.
     pub fn render<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>, draws: &'a [MeshDraw]) {
+        render_pass.set_pipeline(&self.pipeline);
+        self.draw(render_pass, draws, 0);
+    }
+
+    /// Draws the transparent `draws` into a layer pass: of their
+    /// fragments in front of the opaque scene and behind the layer
+    /// `peel` names (see [`bind_peel`](Self::bind_peel)), the pass's
+    /// depth test keeps the nearest. `surface_only` writes the layer's
+    /// surface target and nothing else; otherwise its albedo, normal and
+    /// opacity targets, for the same fragments.
+    pub fn render_layer<'a>(
+        &'a self,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        draws: &'a [MeshDraw],
+        peel: &'a wgpu::BindGroup,
+        surface_only: bool,
+    ) {
+        render_pass.set_pipeline(if surface_only {
+            &self.layer_surface_pipeline
+        } else {
+            &self.layer_pipeline
+        });
+        render_pass.set_bind_group(2, peel, &[]);
+        self.draw(render_pass, draws, self.transparent_start);
+    }
+
+    /// Draws `draws` with the pipeline already set; their instances
+    /// start at `first` of the frame's.
+    fn draw<'a>(
+        &'a self,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        draws: &'a [MeshDraw],
+        first: usize,
+    ) {
         let Some(instances) = self.instance_buffer.buffer() else {
             return;
         };
         let stride = std::mem::size_of::<DrawInstance>() as u64;
-        render_pass.set_pipeline(&self.pipeline);
+        let uploaded = self.instance_buffer.len().saturating_sub(first);
         render_pass.set_bind_group(0, &self.bind_group, &[]);
-        for (i, draw) in draws.iter().enumerate().take(self.instance_buffer.len()) {
+        for (i, draw) in draws.iter().enumerate().take(uploaded) {
             let mesh = &draw.mesh;
             if mesh.draw_count == 0 {
                 continue;
             }
-            let start = i as u64 * stride;
+            let start = (first + i) as u64 * stride;
             render_pass.set_bind_group(1, &*mesh.texture_bind_group, &[]);
             render_pass.set_vertex_buffer(1, instances.slice(start..start + stride));
             render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));

@@ -99,6 +99,11 @@ impl GBuffer {
         }
     }
 
+    /// The format of the lit scene: the frame's target's.
+    pub fn lit_format(&self) -> wgpu::TextureFormat {
+        self.lit_format
+    }
+
     /// Recreates the targets at a new size. Returns whether anything
     /// changed (bind groups over the old views are then stale).
     pub fn resize_if_needed(&mut self, device: &wgpu::Device, width: u32, height: u32) -> bool {
@@ -108,5 +113,85 @@ impl GBuffer {
         }
         *self = Self::new(device, new_size.0, new_size.1, self.lit_format);
         true
+    }
+}
+
+/// What the transparent meshes are drawn through, all at the frame's
+/// internal size. They are peeled a layer at a time, nearest first: a
+/// layer is filled like the G-buffer (with how opaque each surface is
+/// beside it), lit by the resolve pass, and laid under the layers already
+/// gathered. Made by the first frame that draws a transparent mesh.
+///
+/// | Target | Format | Contents |
+/// |---|---|---|
+/// | albedo, normal | as the G-buffer's | the layer being drawn |
+/// | opacity | `R8Unorm` | the square root of how opaque the layer's surface is |
+/// | depth | `Depth24Plus` | picks the layer's nearest fragments |
+/// | surface, one a layer | `Rg32Uint` | as the G-buffer's |
+/// | gathered | the frame's | the layers lit so far, premultiplied |
+///
+/// A layer's surface target is its own: the next layer is peeled against
+/// it, every other layer's edge lines look for their surfaces in it, and
+/// the nearest layer's is what a pick reads. The other targets are
+/// shared, each layer filling them just before it is lit.
+pub struct LayerBuffers {
+    pub albedo_view: wgpu::TextureView,
+    pub normal_view: wgpu::TextureView,
+    pub opacity_view: wgpu::TextureView,
+    pub depth_view: wgpu::TextureView,
+    /// One per layer, nearest first.
+    pub surface_views: Vec<wgpu::TextureView>,
+    /// The layers lit so far, nearest first: colour premultiplied by
+    /// coverage, and the coverage.
+    pub gathered_view: wgpu::TextureView,
+}
+
+impl LayerBuffers {
+    pub const OPACITY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
+
+    /// The most layers a frame peels, whatever its settings ask for: a
+    /// layer's resolve reads every other layer's surface target, and
+    /// WebGL2 gives a shader sixteen textures.
+    pub const MAX_LAYERS: u32 = 8;
+
+    /// Targets for `layers` layers. `lit_format` is the format of the
+    /// frame's target.
+    pub fn new(
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        lit_format: wgpu::TextureFormat,
+        layers: u32,
+    ) -> Self {
+        let size = (width.max(1), height.max(1));
+        let target = |label: &'static str, format: wgpu::TextureFormat| {
+            device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d {
+                        width: size.0,
+                        height: size.1,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+                .create_view(&wgpu::TextureViewDescriptor::default())
+        };
+        Self {
+            albedo_view: target("layer_albedo", GBuffer::ALBEDO_FORMAT),
+            normal_view: target("layer_normal", GBuffer::NORMAL_FORMAT),
+            opacity_view: target("layer_opacity", Self::OPACITY_FORMAT),
+            depth_view: target("layer_depth", GBuffer::DEPTH_FORMAT),
+            surface_views: (0..layers.clamp(1, Self::MAX_LAYERS))
+                .map(|_| target("layer_surface", GBuffer::SURFACE_FORMAT))
+                .collect(),
+            gathered_view: target("layers_gathered", lit_format),
+        }
     }
 }

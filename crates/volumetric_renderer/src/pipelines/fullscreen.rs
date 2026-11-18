@@ -19,7 +19,9 @@ pub(crate) struct FullscreenPass {
 impl FullscreenPass {
     /// `fragment_source` is appended to the shared vertex shader;
     /// `textures` gives each texture binding's sample type, in binding
-    /// order. `sampled` adds the bilinear sampler after them.
+    /// order. `sampled` adds the bilinear sampler after them. `blend` is
+    /// how the pass's output meets what its target holds (`None`
+    /// replaces it).
     #[allow(clippy::too_many_arguments)]
     pub fn new<U: Pod>(
         device: &wgpu::Device,
@@ -29,6 +31,7 @@ impl FullscreenPass {
         textures: &[wgpu::TextureSampleType],
         sampled: bool,
         target_format: wgpu::TextureFormat,
+        blend: Option<wgpu::BlendState>,
         uniforms: &U,
     ) -> Self {
         let source = format!(
@@ -99,7 +102,7 @@ impl FullscreenPass {
                 entry_point: Some(fragment_entry),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: target_format,
-                    blend: None,
+                    blend,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: Default::default(),
@@ -166,13 +169,34 @@ impl FullscreenPass {
         target: &wgpu::TextureView,
         clear: wgpu::Color,
     ) {
+        self.run_with(encoder, bind_group, target, wgpu::LoadOp::Clear(clear));
+    }
+
+    /// Draws the pass onto what `target` already holds: for a pass that
+    /// blends.
+    pub fn run_onto(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        bind_group: &wgpu::BindGroup,
+        target: &wgpu::TextureView,
+    ) {
+        self.run_with(encoder, bind_group, target, wgpu::LoadOp::Load);
+    }
+
+    fn run_with(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        bind_group: &wgpu::BindGroup,
+        target: &wgpu::TextureView,
+        load: wgpu::LoadOp<wgpu::Color>,
+    ) {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some(self.label),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: target,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(clear),
+                    load,
                     store: wgpu::StoreOp::Store,
                 },
                 depth_slice: None,
@@ -256,6 +280,7 @@ pub(crate) fn ao_pass(device: &wgpu::Device) -> FullscreenPass {
         &[FLOAT, wgpu::TextureSampleType::Uint],
         false,
         crate::GBuffer::AO_FORMAT,
+        None,
         &AoUniforms::zeroed(),
     )
 }
@@ -269,23 +294,95 @@ pub(crate) fn ao_blur_pass(device: &wgpu::Device) -> FullscreenPass {
         &[FLOAT, FLOAT, wgpu::TextureSampleType::Uint],
         false,
         crate::GBuffer::AO_FORMAT,
+        None,
         &AoBlurUniforms::zeroed(),
     )
 }
 
+/// The resolve pass (`resolve.wgsl`). Its textures are the G-buffer's
+/// albedo, normal and surface targets and the occlusion, then the
+/// surface and opacity targets of the nearest layer of transparent
+/// meshes, which it reads only in a frame that has some.
 pub(crate) fn resolve_pass(
+    device: &wgpu::Device,
+    target_format: wgpu::TextureFormat,
+) -> FullscreenPass {
+    use wgpu::TextureSampleType::Uint;
+    FullscreenPass::new(
+        device,
+        "resolve_pass",
+        concat!(
+            include_str!("../shaders/resolve_common.wgsl"),
+            include_str!("../shaders/resolve.wgsl")
+        ),
+        "fs_resolve",
+        &[FLOAT, FLOAT, Uint, FLOAT, Uint, FLOAT],
+        false,
+        target_format,
+        None,
+        &ResolveUniforms::zeroed(),
+    )
+}
+
+/// How many other layers' surface targets a layer's resolve reads.
+pub(crate) const OTHER_LAYERS: usize = 7;
+
+/// The resolve pass for one layer of the transparent meshes
+/// (`resolve_layer.wgsl`): the layer's lit colour goes under the layers
+/// already in its target, which are nearer the eye, so each is dimmed by
+/// the coverage gathered before it. Its textures are the layer's albedo,
+/// normal, surface and opacity targets, the opaque scene's surface
+/// target, and the surface targets of [`OTHER_LAYERS`] other layers.
+pub(crate) fn layer_resolve_pass(
+    device: &wgpu::Device,
+    target_format: wgpu::TextureFormat,
+) -> FullscreenPass {
+    use wgpu::TextureSampleType::Uint;
+    // Premultiplied colour under premultiplied colour: what the target
+    // does not cover yet takes the new layer.
+    let under = wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::OneMinusDstAlpha,
+        dst_factor: wgpu::BlendFactor::One,
+        operation: wgpu::BlendOperation::Add,
+    };
+    FullscreenPass::new(
+        device,
+        "layer_resolve_pass",
+        concat!(
+            include_str!("../shaders/resolve_common.wgsl"),
+            include_str!("../shaders/resolve_layer.wgsl")
+        ),
+        "fs_resolve_layer",
+        &[
+            FLOAT, FLOAT, Uint, FLOAT, Uint, Uint, Uint, Uint, Uint, Uint, Uint, Uint,
+        ],
+        false,
+        target_format,
+        Some(wgpu::BlendState {
+            color: under,
+            alpha: under,
+        }),
+        &ResolveUniforms::zeroed(),
+    )
+}
+
+/// Lays the gathered layers over the lit opaque scene
+/// (`layer_composite.wgsl`).
+pub(crate) fn layer_composite_pass(
     device: &wgpu::Device,
     target_format: wgpu::TextureFormat,
 ) -> FullscreenPass {
     FullscreenPass::new(
         device,
-        "resolve_pass",
-        include_str!("../shaders/resolve.wgsl"),
-        "fs_resolve",
-        &[FLOAT, FLOAT, wgpu::TextureSampleType::Uint, FLOAT],
+        "layer_composite_pass",
+        include_str!("../shaders/layer_composite.wgsl"),
+        "fs_layer_composite",
+        &[FLOAT],
         false,
         target_format,
-        &ResolveUniforms::zeroed(),
+        Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+        // The pass has nothing to be told.
+        &[0.0f32; 4],
     )
 }
 
@@ -301,6 +398,7 @@ pub(crate) fn fxaa_pass(
         &[wgpu::TextureSampleType::Float { filterable: true }],
         true,
         target_format,
+        None,
         &FxaaUniforms::zeroed(),
     )
 }
@@ -311,9 +409,10 @@ pub(crate) fn pick_pass(device: &wgpu::Device) -> FullscreenPass {
         "pick_pass",
         include_str!("../shaders/pick.wgsl"),
         "fs_pick",
-        &[wgpu::TextureSampleType::Uint],
+        &[wgpu::TextureSampleType::Uint, wgpu::TextureSampleType::Uint],
         false,
         crate::pick::PICK_FORMAT,
+        None,
         &PickUniforms::zeroed(),
     )
 }
