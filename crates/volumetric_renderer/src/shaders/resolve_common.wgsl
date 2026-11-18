@@ -26,8 +26,8 @@ struct ResolveUniforms {
     // rgb: edge line colour; a: opacity, 0 when edges are off.
     edge_color: vec4<f32>,
     // x: cosine of the crease angle; y: 1 when ambient occlusion is on;
-    // z: how many pixels wide an edge line is; w: 1 when the frame has
-    // transparent meshes.
+    // z: how many pixels wide an edge line is; w: how many layers of
+    // transparent meshes the frame peels, 0 when it has none.
     switches: vec4<f32>,
     materials: array<Material, 16>,
 };

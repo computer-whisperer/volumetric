@@ -5,7 +5,8 @@ of section 11 were built the same day). This file replaces the May 2026 MVP
 architecture notes and now describes the renderer as it is; where it was
 revised while building, the revision and its reason are recorded in place.
 Direct model raytracing (section 9) is the follow-up project and is not
-built. Transparent meshes (section 4) were added on 2026-11-17.
+built. Transparent meshes (section 4) were added on 2026-11-17 and
+revised after review on 2026-11-18.
 
 ## 1. Scope
 
@@ -221,7 +222,7 @@ The **pick pass** (section 6) runs on demand, outside this sequence.
 
 ### Transparent meshes
 
-Built 2026-11-17. A mesh is submitted with an opacity. At 1 it is opaque
+Built 2026-11-17, revised 2026-11-18. A mesh is submitted with an opacity. At 1 it is opaque
 and takes the G-buffer as before; at 0 (or too little to change a pixel
 of an 8-bit frame) it is not drawn; in between it is transparent, and
 drawn after the opaque scene is lit.
@@ -247,7 +248,7 @@ second the next one behind it, and so on.
    draws its edge lines. Its output, premultiplied by the opacity, is
    blended *under* the layers gathered so far, so each layer is dimmed by
    what is in front of it.
-3. After `RenderSettings::transparency_layers` layers (4 by default, 8 at
+3. After `RenderSettings::transparency_layers` layers (2 by default, 8 at
    most) the gathered layers are laid **over the lit scene**, before
    anti-aliasing.
 
@@ -256,17 +257,43 @@ layer's second fill, whose opacity its edge lines read.
 
 | Target | Format | Contents |
 |---|---|---|
-| Albedo, normal, depth | as the G-buffer's | the layer being drawn; reused by every layer |
+| Albedo, normal | as the G-buffer's | the layer being drawn; reused by every layer |
+| Depth | `Depth32Float` | picks the nearest fragments of the layer being drawn; reused likewise |
 | Opacity | `R8Unorm` | the square root of how opaque the layer's surface is; reused likewise |
-| Surface, one a layer | `Rg32Uint` | as the G-buffer's. The next layer is peeled against it, every other layer's edge lines look for their surfaces in it, and a pick reads the nearest layer's |
+| Surface, one a layer | `Rg32Uint` | as the G-buffer's. The next layer is peeled against it, every other layer's edge lines look for their surfaces in it, and a pick reads them all |
 | Gathered | the frame's | the layers lit so far, premultiplied by coverage |
 
-That is 17 bytes a pixel and 8 more for each layer: 49 a pixel at four
-layers, beside the G-buffer's 34. They are made by the first frame that
-draws a transparent mesh and dropped when the frame's size changes; a
-frame without transparent meshes runs no pass and reads no target of
-theirs, and its pixels are the same bytes as before transparency was
-built (28 frames compared, on both adapters).
+That is 17 bytes a pixel and 8 more for each layer: 33 a pixel at two
+layers, 49 at four, 81 at eight, beside the G-buffer's 34, all at the
+frame's internal size (a supersampled frame's is the larger one). They
+are made by the first frame that draws a transparent mesh, and dropped
+when the frame's size changes or by the 30th frame in a row without a
+transparent mesh (`LAYERS_KEPT_FRAMES`: a fade that reaches opaque and
+comes back does not make them again). Frames are what is counted, so a
+host that stops drawing keeps them until it draws again. A frame without
+transparent meshes runs no pass and reads no target of theirs, and its
+pixels are the same bytes as before transparency was built (28 frames
+compared, on both adapters, 2026-11-17).
+
+The peel rests on two exact comparisons, and each has what makes it
+exact:
+
+- A layer's depth test and the shader's comparison of depths must rank
+  two fragments alike. The shader compares the 32-bit depths the surface
+  targets hold, so the layers' depth target is 32-bit float too, where
+  the G-buffer's is `Depth24Plus`. In 24 bits two fragments can tie that
+  the shader tells apart; the test then keeps the later drawn, and where
+  that is the farther one the next layer peels the nearer away as drawn
+  already. (Seen 2026-11-18 on Mesa's software rasteriser, which has a
+  real 24-bit buffer: one of two sheets 4e-8 m apart was not drawn. The
+  two GPUs here did not show it with either format.)
+- A fragment must come to the same depth in every layer pass, and two
+  pipelines draw them (`fs_layer_surface`, `fs_layer`). The layer passes
+  have a vertex entry of their own, `vs_layer`, whose position is
+  `@invariant`: the attribute is the promise that two pipelines compute
+  it to the same bits. The G-buffer's fill keeps `vs_main` without it
+  (see Rejected). No adapter here told the two apart, so this is held by
+  the attribute's guarantee and not by a test.
 
 Opacity is stored as its square root because 8 bits of it, blended in
 linear light, are coarse where a fade is faintest: the first step of a
@@ -286,10 +313,16 @@ What this gives:
   numbers its meshes as it submits them.
 - Opacity is a value of the draw, not of the retained mesh: fading costs
   no upload.
-- A transparent mesh is lit, edged and picked like an opaque one.
+- A transparent mesh is lit and edged like an opaque one, and picked
+  like one when it is opaque enough (section 6).
 - Nothing needs more than WebGL2 gives: the fills are unblended and the
-  blends have one target each. A layer's resolve reads twelve textures of
-  the sixteen WebGL2 guarantees, which is what limits the layers to 8.
+  blends have one target each. A layer's resolve is bound to twelve
+  textures of the sixteen WebGL2 guarantees, which is what limits the
+  layers to 8; of the seven that are other layers' surface targets it
+  reads as many as the frame has other layers (`switches.w`). Those reads
+  are taken only at pixels beside a discontinuity, and bounding them
+  changed no timing that was measured (full-frame sheets at 1920×1080,
+  2, 4 and 8 layers, both adapters).
 
 #### Edge lines
 
@@ -318,9 +351,27 @@ In a layer (`edge_in_layer`, `mark_toward`):
   depth it would have): then what was in front of it ended, and it did
   not.
 - If another object is beside it, as near or nearer, and the surface is
-  found there in another layer, it passes behind that object or through
-  it. The mark is that object's outline, or the line where the two cross,
-  and is as strong as that object is opaque.
+  found there in another layer behind that object, it passes behind that
+  object or through it. The mark is that object's outline, or the line
+  where the two cross, and is as strong as that object is opaque.
+- If the surface is found there in front of that object instead (the
+  object is then just behind it, within the test's tolerance), the
+  surface has come out from behind something and the other object only
+  lies close behind it or crosses it there: no mark. The line where two
+  surfaces cross is the mark of the one that goes behind, made once, from
+  its last pixel in front. (Added 2026-11-18. Before it, the surface in
+  front on the far side of a crossing was marked from behind the other
+  one as well, by that one's opacity: the randomised scenes below found
+  it, as a darker line wherever two transparent meshes crossed.) This
+  takes it that nothing new is in front of the surface at the neighbour;
+  see "Stacks of three" below.
+- "Found in another layer" means this surface and not another of the
+  same object's: an object can have two surfaces within the test's
+  tolerance of each other (the walls of a thin shell), and the one found
+  at the neighbour may be the other wall, going on where this one ended.
+  A surface found there is taken for this one only if, carried back to
+  this pixel alongside it, it is nearer this surface than any other of
+  the object's surfaces here.
 - If another object is beside it and the surface is nowhere there, it
   ends against that object: marked toward the right and down, and toward
   the left and up (where the opaque scene leaves the mark to the other
@@ -351,15 +402,46 @@ transparent path):
   lies close to or ends flush against, and no gap in that mesh's outline;
 - a transparent surface lying close in front of or behind another
   object's (a hundredth of a metre, three metres off) is edged at its
-  edges only.
+  edges only;
+- where a transparent sheet and one just short of opaque cross, the frame
+  is the one with that sheet opaque;
+- the far wall of a thin transparent shell is marked where it ends
+  against an opaque part between the walls, as it is when the near wall
+  is another object.
 
-A second measure is a set of randomised scenes (boxes, spheres,
-double-sided meshes, oblique cameras) that a review of this work wrote;
-they are not in the repository. On them, 2026-11-17: one mesh just short
-of opaque among opaque ones, 0 of 480 scenes differ from the all-opaque
-frame; a surface behind one transparent mesh, 12 of 120 differ, by 4
-pixels at most; a faint mesh over another, 68 of 360 differ, by 26 pixels
-at most (128×96 frames).
+A second measure is the ignored test
+`randomised_scenes_keep_their_edge_lines`: 60 scenes of two or three
+boxes and spheres turned and placed at random about the origin, most of
+them passing through each other, seen from a random direction, in 128×96
+frames. It compares pairs of frames that should be the same picture and
+counts the pixels that differ by more than a level, on each adapter:
+
+    cargo test -p volumetric_renderer randomised -- --ignored --nocapture
+
+A third of the meshes are drawn with their insides (every triangle a
+second time, facing the other way), which puts three and four surfaces
+on a line of sight; the cases with such a mesh in them are counted apart.
+On 2026-11-18, on the Radeon; GLES on the integrated GPU and on Mesa's
+software rasteriser gave the same to within two pixels:
+
+| Comparison | Meshes without insides | With insides |
+|---|---|---|
+| One mesh of three just short of opaque, against all opaque | 0 of 42 cases differ | 0 of 138 |
+| A mesh just short of opaque behind or through one at 0.5, against it opaque | 18 of 48, 49 pixels in all, 8 at most | 39 of 72, 294 in all, 39 at most |
+| Two meshes with a third too faint to see among them, against the two alone | 12 of 56, 170 in all, 27 at most | 52 of 184, 558 in all, 54 at most |
+
+The first row is asserted. What is left in the second, without insides,
+is single pixels where an outline crosses a crease (the first item
+below). What is left in the third is the second item below: the line
+where an opaque mesh and a transparent one cross loses its side on the
+opaque mesh wherever the faint mesh is in front of it. With insides drawn
+both are stacks of three and more.
+
+(The figures first quoted here, from scenes a review wrote and did not
+keep, were 0 of 480, 12 of 120 by 4 pixels at most and 68 of 360 by 26 at
+most. These scenes are harder, and before the crossing rule above was
+added they gave 357 pixels in the second row where they now give 49,
+and 717 where they give 294.)
 
 What is not exact, and why:
 
@@ -371,7 +453,14 @@ What is not exact, and why:
 - **Stacks of three.** The opaque scene reads the nearest layer only, so
   a mark it owes to a transparent mesh can be missing where another
   transparent mesh is in front of that one: one side of a two-pixel
-  outline, along part of it.
+  outline, along part of it. The mesh in front need not be visible to do
+  it: one too faint to see takes the nearest layer all the same. A layer
+  has the same blind spot for a surface that changes layer just where
+  something else begins in front of it (two outlines in one place): that
+  thing's outline on it is owed, as strong as the thing is opaque, and
+  is not made. Reading
+  every layer from the opaque resolve would need each layer's opacity
+  kept (a byte a pixel a layer), which only the layer being lit has now.
 - **Surfaces that weave through each other** (a model and a slightly
   different one) get a line wherever they cross, as strong as the other
   is opaque; when both are opaque they get the same lines at full
@@ -387,7 +476,16 @@ What is not exact, and why:
   resolve. Measured 2026-11-17 on a double-sided mesh of 2.8 million
   triangles at 1920×1080: about 0.5 ms a layer on a Radeon RX 6800 XT,
   about 6 ms a layer on a Ryzen 7950X3D's integrated graphics through
-  GLES.
+  GLES. The default is 2 for that cost: it is what one transparent mesh
+  in front of another needs where each has one surface facing the eye,
+  as a model faded over the model it was made from mostly has. A mesh
+  that folds back behind itself, or a third mesh, puts a third surface
+  on some lines of sight, and it is left out there unless the host asks
+  for more layers.
+- **Back faces are not drawn**, as in the opaque scene: a closed
+  transparent mesh shows its near walls and not the insides of its far
+  ones. A host that wants them submits the triangles facing both ways,
+  and gives the layers to hold them.
 - **No ambient occlusion.** Occlusion is gathered from the opaque scene:
   a transparent mesh neither casts nor takes it, so it appears as the
   opacity reaches 1. The occlusion radius does follow the transparent
@@ -402,9 +500,9 @@ What is not exact, and why:
   are still not read. The opacity target is per pixel, so they can be
   multiplied in there.
 - **Coincident surfaces of one object** (the same `ObjectId` twice in
-  exactly one place) are drawn once. Two transparent surfaces closer
-  together than the depth buffer resolves can lose the farther one, as
-  two opaque ones z-fight.
+  exactly one place) are drawn once. Two objects' surfaces closer
+  together than 32-bit depth tells apart are in one place: both drawn,
+  the higher object in front.
 
 #### Rejected
 
@@ -431,10 +529,21 @@ What is not exact, and why:
 - *Keeping every layer's albedo and normal* so that each is filled once
   and creases can be followed from layer to layer: 17 bytes a pixel a
   layer in place of 8.
-- *Marking the vertex shader's position `@invariant`*, for the peel's
-  comparison of a fragment's depth with its own from an earlier pass. The
-  attribute moved opaque pixels by a few levels on the GLES adapter, and
-  the peel holds without it on both adapters.
+- *Marking the position `@invariant` in the G-buffer's fill as well as
+  the layers'*, so that an opaque surface and a transparent one in
+  exactly one place are sure to come to one depth. The attribute moved
+  opaque pixels by a few levels on the GLES adapter, so only the layer
+  passes have it (`vs_layer`). An opaque and a transparent surface in one
+  place then rest on the two vertex entries agreeing, which a frame test
+  holds on tilted sheets and which they did on every adapter tried (the
+  Radeon, and GLES on the integrated GPU and on Mesa's software
+  rasteriser); where they did not, the two would z-fight there as two
+  opaque meshes do.
+- *A 24-bit depth target for the layers*, the G-buffer's format: see
+  above.
+- *One opacity below which a mesh is neither drawn nor picked.* A mesh
+  faded to a few hundredths is still drawn, and it took every pick over
+  it, and with it the point a gesture turns about.
 - *Opacity in 8 bits as it is.* See above: a fade's faint end steps.
 
 ### Shading
@@ -581,15 +690,24 @@ contract would not change.
 ## 6. Picking
 
 `Renderer::request_pick(pixel)` copies one texel of the retained G-buffer's
-surface target (object id and depth) into a 1×1 `Rgba32Uint` target and
-reads it back asynchronously. `Renderer::pick_result()` returns the latest answer as
+surface target (object id and depth), and the same texel of each
+transparent layer's, into a row of an `Rgba32Uint` target and reads it
+back asynchronously. `Renderer::pick_result()` returns the latest answer as
 `Pick { object: ObjectId, world: Option<Vec3> }`.
 
 - The G-buffer of the last rendered frame is retained, so picking does not
   need a new frame.
-- Where the frame drew a transparent mesh, the texel comes from the
-  nearest layer's surface target: a pick lands on the nearest surface,
-  transparent or not.
+- A pick lands on the nearest surface that is opaque, or transparent and
+  at least `RenderSettings::pick_opacity` opaque (0.25 by default). It
+  passes through fainter meshes, however many of the frame's layers they
+  fill, to that surface or to the opaque scene: navigation turns and
+  zooms about the picked point, and a mesh faded nearly out should not
+  take it. Which texel of the row that is, is settled where the row is
+  read, from the opacities the frame's meshes were drawn at; 0 lets a
+  pick land on every mesh drawn. A texel says which object, not which
+  draw: transparent meshes that share an object are picked alike, if any
+  of them is opaque enough. A mesh shown through more surfaces than
+  the frame has layers is not drawn, and not picked.
 - A native host waits for the pick at the press (`pick_now`, well under a
   frame). The web cannot wait, so it requests a pick as the pointer moves
   over the viewport and a press takes the answer already there.
@@ -622,7 +740,9 @@ buffer limits (today's `GeometryOverflow`) and the grid's current spacing.
 
 `RenderSettings` groups the `LightingRig`, the material table, occlusion,
 edges, anti-aliasing, `GridSettings`, the gizmo, the background, the
-pixel scale and how many layers deep transparent meshes are drawn.
+pixel scale, how many layers deep transparent meshes are drawn
+(`transparency_layers`, 2) and how opaque one must be to be picked
+(`pick_opacity`, 0.25).
 
 Both hosts submit every mesh at opacity 1: nothing in the GUI or the
 headless render sets one yet.

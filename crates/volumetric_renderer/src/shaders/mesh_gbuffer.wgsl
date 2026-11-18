@@ -63,8 +63,7 @@ struct VsOut {
     @location(4) @interpolate(flat) opacity: f32,
 };
 
-@vertex
-fn vs_main(in: VsIn) -> VsOut {
+fn vertex(in: VsIn) -> VsOut {
     let model = mat4x4<f32>(in.model_0, in.model_1, in.model_2, in.model_3);
     var out: VsOut;
     out.position = uniforms.view_proj * model * vec4<f32>(in.position, 1.0);
@@ -73,6 +72,39 @@ fn vs_main(in: VsIn) -> VsOut {
     out.ids = in.ids;
     out.uv = vec2<f32>(in.u, in.v);
     out.opacity = in.opacity;
+    return out;
+}
+
+@vertex
+fn vs_main(in: VsIn) -> VsOut {
+    return vertex(in);
+}
+
+// `VsOut` with an invariant position, for the layer passes. A layer pass
+// compares a fragment's depth with the depth an earlier pass stored for
+// the same fragment, and two pipelines draw the layers (`fs_layer_surface`
+// and `fs_layer`): the attribute is what promises that both compute a
+// vertex's position to the same bits. The G-buffer's fill does without
+// it: there it moved pixels on the GLES adapter.
+struct VsLayerOut {
+    @invariant @builtin(position) position: vec4<f32>,
+    @location(0) normal_world: vec3<f32>,
+    @location(1) color: vec4<f32>,
+    @location(2) @interpolate(flat) ids: vec2<u32>,
+    @location(3) uv: vec2<f32>,
+    @location(4) @interpolate(flat) opacity: f32,
+};
+
+@vertex
+fn vs_layer(in: VsIn) -> VsLayerOut {
+    let v = vertex(in);
+    var out: VsLayerOut;
+    out.position = v.position;
+    out.normal_world = v.normal_world;
+    out.color = v.color;
+    out.ids = v.ids;
+    out.uv = v.uv;
+    out.opacity = v.opacity;
     return out;
 }
 

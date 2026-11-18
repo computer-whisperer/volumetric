@@ -126,13 +126,13 @@ impl GBuffer {
 /// |---|---|---|
 /// | albedo, normal | as the G-buffer's | the layer being drawn |
 /// | opacity | `R8Unorm` | the square root of how opaque the layer's surface is |
-/// | depth | `Depth24Plus` | picks the layer's nearest fragments |
+/// | depth | `Depth32Float` | picks the layer's nearest fragments |
 /// | surface, one a layer | `Rg32Uint` | as the G-buffer's |
 /// | gathered | the frame's | the layers lit so far, premultiplied |
 ///
 /// A layer's surface target is its own: the next layer is peeled against
 /// it, every other layer's edge lines look for their surfaces in it, and
-/// the nearest layer's is what a pick reads. The other targets are
+/// a pick reads them all. The other targets are
 /// shared, each layer filling them just before it is lit.
 pub struct LayerBuffers {
     pub albedo_view: wgpu::TextureView,
@@ -148,6 +148,14 @@ pub struct LayerBuffers {
 
 impl LayerBuffers {
     pub const OPACITY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
+
+    /// 32-bit float, where the G-buffer's depth is `Depth24Plus`: the
+    /// layer shader compares the 32-bit depths the surface targets hold,
+    /// and the depth test must rank two fragments as that comparison
+    /// does. In 24 bits two of them can tie that the shader tells apart;
+    /// the test then keeps the later drawn, and if that is the farther,
+    /// the next layer peels the nearer away as already drawn.
+    pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
     /// The most layers a frame peels, whatever its settings ask for: a
     /// layer's resolve reads every other layer's surface target, and
@@ -187,7 +195,7 @@ impl LayerBuffers {
             albedo_view: target("layer_albedo", GBuffer::ALBEDO_FORMAT),
             normal_view: target("layer_normal", GBuffer::NORMAL_FORMAT),
             opacity_view: target("layer_opacity", Self::OPACITY_FORMAT),
-            depth_view: target("layer_depth", GBuffer::DEPTH_FORMAT),
+            depth_view: target("layer_depth", Self::DEPTH_FORMAT),
             surface_views: (0..layers.clamp(1, Self::MAX_LAYERS))
                 .map(|_| target("layer_surface", GBuffer::SURFACE_FORMAT))
                 .collect(),

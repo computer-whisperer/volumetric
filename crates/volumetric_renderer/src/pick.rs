@@ -1,27 +1,35 @@
 //! Picking: what is under a pixel of the last rendered frame.
 //!
 //! One texel of the retained G-buffer's surface target (object id and
-//! depth) is copied into a 1x1 integer target and read back
-//! asynchronously: an integer colour read-back is the one every backend
-//! guarantees. Where the frame drew a transparent mesh, the texel is the
-//! nearest one's, from the nearest layer's surface target.
+//! depth), and the same texel of each transparent layer's, are copied
+//! into a row of an integer target and read back asynchronously: an
+//! integer colour read-back is the one every backend guarantees. The
+//! pick lands on the nearest of them that the frame lets one land on: an
+//! opaque surface, or a transparent one at least
+//! [`RenderSettings::pick_opacity`](crate::RenderSettings::pick_opacity)
+//! opaque.
 
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 
 use glam::{Mat4, Vec3};
 
-use crate::ObjectId;
 use crate::pipelines::{FullscreenPass, PickUniforms, pick_pass};
+use crate::{LayerBuffers, ObjectId};
 
 pub(crate) const PICK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Uint;
+
+/// The texels a pick reads back: the opaque scene's, then one a layer.
+const SLOTS: u32 = 1 + LayerBuffers::MAX_LAYERS;
 
 /// What the last frame drew at a pixel.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Pick {
     /// The pixel asked about, in the frame's target (origin top-left).
     pub pixel: (u32, u32),
-    /// The mesh draw there, the nearest whether opaque or transparent;
-    /// [`ObjectId::NONE`] over background, lines and points.
+    /// The mesh draw there: the nearest that is opaque, or transparent
+    /// and at least
+    /// [`RenderSettings::pick_opacity`](crate::RenderSettings::pick_opacity)
+    /// opaque. [`ObjectId::NONE`] over background, lines and points.
     pub object: ObjectId,
     /// The world point on that surface; `None` where no geometry source
     /// drew (background, or only lines and points).
@@ -30,17 +38,33 @@ pub struct Pick {
 
 /// The view a G-buffer was filled with: what turns its depth back into
 /// world points.
-#[derive(Copy, Clone)]
+#[derive(Clone)]
 pub(crate) struct FrameRecord {
     pub inv_view_proj: Mat4,
     /// The G-buffer's size in pixels.
     pub size: (u32, u32),
-    /// Whether the frame drew transparent meshes: their nearest layer
-    /// is then picked ahead of the opaque scene.
-    pub layered: bool,
+    /// How many layers of transparent meshes the frame peeled, 0 when it
+    /// had none: their surfaces are picked ahead of the opaque scene.
+    pub layers: u32,
+    /// The objects of the frame's transparent meshes that were opaque
+    /// enough to be picked, in rising order.
+    pub pickable: Arc<[u32]>,
 }
 
 impl FrameRecord {
+    /// The surface (object and depth) a pick lands on, of the ones at a
+    /// pixel: `texel(0)` is the opaque scene's, `texel(1)` the nearest
+    /// layer's, and so on. It is the nearest transparent surface opaque
+    /// enough to be picked, else the opaque scene's behind them all. A
+    /// layer that is empty at the pixel has only empty ones behind it.
+    fn landing(&self, texel: impl Fn(usize) -> (u32, f32)) -> (u32, f32) {
+        (1..=self.layers as usize)
+            .map(&texel)
+            .take_while(|&(_, depth)| depth < 1.0)
+            .find(|(object, _)| self.pickable.binary_search(object).is_ok())
+            .unwrap_or_else(|| texel(0))
+    }
+
     /// The world point at `pixel` and NDC depth `depth`.
     fn unproject(&self, pixel: (u32, u32), depth: f32) -> Option<Vec3> {
         if !(0.0..1.0).contains(&depth) {
@@ -62,7 +86,7 @@ struct InFlight {
     mapped: mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
 }
 
-/// The pick pass, its 1x1 target and read-back buffer, and the one
+/// The pick pass, its row of a target and read-back buffer, and the one
 /// request that may be in flight.
 pub(crate) struct Picker {
     pass: FullscreenPass,
@@ -78,7 +102,7 @@ impl Picker {
         let target = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("pick_target"),
             size: wgpu::Extent3d {
-                width: 1,
+                width: SLOTS,
                 height: 1,
                 depth_or_array_layers: 1,
             },
@@ -92,7 +116,7 @@ impl Picker {
         let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("pick_readback"),
-            size: 16,
+            size: 16 * SLOTS as u64,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -107,18 +131,22 @@ impl Picker {
     }
 
     /// The pick pass's bind group over a G-buffer's surface target and
-    /// the nearest transparent layer's (`None` reads the opaque scene
-    /// alone).
+    /// the transparent layers', nearest first (none reads the opaque
+    /// scene alone).
     pub fn bind(
         &self,
         device: &wgpu::Device,
         surface_view: &wgpu::TextureView,
-        nearest_layer: Option<&wgpu::TextureView>,
+        layers: &[wgpu::TextureView],
     ) -> wgpu::BindGroup {
-        self.pass.bind(
-            device,
-            &[surface_view, nearest_layer.unwrap_or(surface_view)],
-        )
+        // The opaque scene's fills the places of the layers there are
+        // not: a frame's record says how many to read.
+        let views: Vec<_> = std::iter::once(surface_view)
+            .chain(layers)
+            .chain(std::iter::repeat(surface_view))
+            .take(SLOTS as usize)
+            .collect();
+        self.pass.bind(device, &views)
     }
 
     pub fn busy(&self) -> bool {
@@ -168,7 +196,7 @@ impl Picker {
                 },
             },
             wgpu::Extent3d {
-                width: 1,
+                width: SLOTS,
                 height: 1,
                 depth_or_array_layers: 1,
             },
@@ -203,12 +231,14 @@ impl Picker {
                 if let Ok(data) = self.readback.slice(..).get_mapped_range() {
                     let word =
                         |i: usize| u32::from_le_bytes(data[4 * i..4 * i + 4].try_into().unwrap());
+                    // Four words a texel: the object, the depth's bits.
+                    let (object, depth) = in_flight
+                        .frame
+                        .landing(|slot| (word(4 * slot), f32::from_bits(word(4 * slot + 1))));
                     self.latest = Some(Pick {
                         pixel: in_flight.asked,
-                        object: ObjectId(word(0)),
-                        world: in_flight
-                            .frame
-                            .unproject(in_flight.pixel, f32::from_bits(word(1))),
+                        object: ObjectId(object),
+                        world: in_flight.frame.unproject(in_flight.pixel, depth),
                     });
                 }
                 self.readback.unmap();
@@ -244,7 +274,8 @@ mod tests {
         let frame = FrameRecord {
             inv_view_proj: view.view_projection().inverse(),
             size: (300, 200),
-            layered: false,
+            layers: 0,
+            pickable: Arc::new([]),
         };
         let world = Vec3::new(0.3, 0.2, 0.7);
         let at = view.project(world, 300, 200).unwrap();
@@ -254,5 +285,32 @@ mod tests {
         // Within the half pixel the pixel centre is off by.
         assert!((back - world).length() < 0.02, "{back}");
         assert_eq!(frame.unproject(pixel, 1.0), None);
+    }
+
+    /// A pick lands on the nearest transparent surface that is opaque
+    /// enough, passing through fainter ones, and on the opaque scene
+    /// when there is none; the layers a frame did not peel are not read.
+    #[test]
+    fn a_pick_passes_through_faint_surfaces() {
+        let frame = |layers, pickable: &[u32]| FrameRecord {
+            inv_view_proj: Mat4::IDENTITY,
+            size: (1, 1),
+            layers,
+            pickable: pickable.into(),
+        };
+        // The opaque scene's texel, then three layers' and an empty one.
+        let texels = [(7, 0.9), (3, 0.2), (5, 0.4), (4, 0.6), (u32::MAX, 1.0)];
+        let landing =
+            |layers, pickable: &[u32]| frame(layers, pickable).landing(|slot| texels[slot]);
+        assert_eq!(landing(4, &[3, 4, 5]), (3, 0.2));
+        assert_eq!(landing(4, &[4, 5]), (5, 0.4));
+        assert_eq!(landing(4, &[4]), (4, 0.6));
+        assert_eq!(landing(4, &[]), (7, 0.9));
+        // A frame of two layers did not peel the third.
+        assert_eq!(landing(2, &[4]), (7, 0.9));
+        assert_eq!(landing(0, &[3]), (7, 0.9));
+        // Nothing is behind an empty layer.
+        let texels = [(7, 0.9), (u32::MAX, 1.0), (5, 0.4)];
+        assert_eq!(frame(2, &[5]).landing(|slot| texels[slot]), (7, 0.9));
     }
 }
