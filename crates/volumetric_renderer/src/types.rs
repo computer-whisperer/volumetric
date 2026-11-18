@@ -665,6 +665,12 @@ pub struct RenderSettings {
     /// grid's lines, edge lines) is multiplied by it, so the picture
     /// looks the same and only gets smoother.
     pub pixel_scale: f32,
+    /// How many transparent surfaces deep a pixel is drawn: the nearest
+    /// this many of the transparent meshes' surfaces are blended, in
+    /// depth order, and any behind them are left out. Each one is a pass
+    /// over the transparent meshes, taken only by a frame that has some;
+    /// clamped to 1..=8.
+    pub transparency_layers: u32,
 }
 
 impl Default for RenderSettings {
@@ -679,6 +685,7 @@ impl Default for RenderSettings {
             background_color: [0.1, 0.1, 0.1, 1.0],
             antialiasing: true,
             pixel_scale: 1.0,
+            transparency_layers: 4,
         }
     }
 }

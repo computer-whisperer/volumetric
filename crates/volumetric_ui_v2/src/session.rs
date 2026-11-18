@@ -1714,6 +1714,7 @@ impl ViewportRenderer {
                     *transform,
                     renderer::ObjectId::NONE,
                     renderer::MaterialId::default(),
+                    1.0,
                 );
             }
             for lines in &scene.lines {
@@ -1823,6 +1824,7 @@ impl ViewportRenderer {
                     transform,
                     renderer::ObjectId(object),
                     renderer::MaterialId::default(),
+                    1.0,
                 );
                 if let Some(Some(direct)) = entity.direct_models.get(i) {
                     let key = entity.mesh_keys[i].expect("a cast part has a key");

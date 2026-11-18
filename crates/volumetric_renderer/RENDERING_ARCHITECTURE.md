@@ -5,7 +5,7 @@ of section 11 were built the same day). This file replaces the May 2026 MVP
 architecture notes and now describes the renderer as it is; where it was
 revised while building, the revision and its reason are recorded in place.
 Direct model raytracing (section 9) is the follow-up project and is not
-built.
+built. Transparent meshes (section 4) were added on 2026-11-17.
 
 ## 1. Scope
 
@@ -141,13 +141,14 @@ fixed on screen. Standard views and Frame behave the same in either mode.
 
 ```
  geometry sources ──► G-buffer ──► AO ──► resolve ──► FXAA ──► scene target
-   mesh rasteriser      albedo            lighting              │
-   surfel discs         normal            edges                 ▼
-                        object id         tone map       grid, lines, points
-                        depth                            splats
-                                                         overlay lines, points
-                                                         lens warp (look-through)
-                                                         view gizmo
+   mesh rasteriser      albedo            lighting ▲            │
+   surfel discs         normal            edges    │            ▼
+                        object id         tone map │     grid, lines, points
+                        depth                      │     splats
+                                                   │     overlay lines, points
+ transparent meshes ──► a layer ──► resolve ──► gathered   lens warp (look-through)
+   (per layer,          as the      as above    layers     view gizmo
+    nearest first)      G-buffer
 ```
 
 ### G-buffer
@@ -191,7 +192,7 @@ so sources compose with each other and with everything drawn afterwards.
 
 ### Passes
 
-1. **G-buffer fill** from every source.
+1. **G-buffer fill** from every source: the opaque geometry.
 2. **Ambient occlusion** (`ao.wgsl`), followed by a blur that keeps to
    one surface (`ao_blur.wgsl`). Distances are compared in world units in
    front of the eye, so the result does not depend on the clip planes. The
@@ -204,16 +205,237 @@ so sources compose with each other and with everything drawn afterwards.
    planes.)
 3. **Resolve**: lighting × AO, edge lines, background, tone map, into a
    display-referred intermediate.
-4. **FXAA** into the scene target (built 2026-10-05, ahead of the rest of
+4. **Transparent meshes**, in a frame that has any: peeled a layer at a
+   time and laid over the intermediate (below). Their surface targets
+   are filled before pass 3.
+5. **FXAA** into the scene target (built 2026-10-05, ahead of the rest of
    step 4; `RenderSettings::antialiasing`).
-5. **Grid** (section 5), depth-tested and blended.
-6. **Depth-tested lines and points.**
-7. **Splats**: own layer, then composited (unchanged).
-8. **Overlay lines and points** (no depth test).
-9. **Lens warp** when looking through a photograph (unchanged).
-10. **View gizmo** on the final target.
+6. **Grid** (section 5), depth-tested and blended.
+7. **Depth-tested lines and points.**
+8. **Splats**: own layer, then composited (unchanged).
+9. **Overlay lines and points** (no depth test).
+10. **Lens warp** when looking through a photograph (unchanged).
+11. **View gizmo** on the final target.
 
 The **pick pass** (section 6) runs on demand, outside this sequence.
+
+### Transparent meshes
+
+Built 2026-11-17. A mesh is submitted with an opacity. At 1 it is opaque
+and takes the G-buffer as before; at 0 (or too little to change a pixel
+of an 8-bit frame) it is not drawn; in between it is transparent, and
+drawn after the opaque scene is lit.
+
+The G-buffer holds one surface per pixel and everything after it reads
+that, so a transparent surface cannot be put in it. The transparent
+meshes get the same treatment a layer at a time instead (depth peeling).
+A layer is, at each pixel, the nearest of their surfaces that is in front
+of the opaque scene and behind the layer before: the fragment shader
+discards the rest (reading the G-buffer's surface target and the layer
+before's) and the layer's own depth test keeps the nearest. The first
+layer is therefore the nearest transparent surface at each pixel, the
+second the next one behind it, and so on.
+
+1. **Every layer's surface target is filled** (`fs_layer_surface`):
+   object and depth, as the G-buffer's surface target holds them. The
+   edge lines of the opaque scene and of every layer read these (below),
+   so they come first.
+2. **Each layer in turn, nearest first, is filled again**, this time its
+   albedo, normal and opacity (`fs_layer`), and **resolved**:
+   `resolve_layer.wgsl` lights it with the resolve pass's own lighting
+   (`resolve_common.wgsl`: the same rig, materials and tone curve) and
+   draws its edge lines. Its output, premultiplied by the opacity, is
+   blended *under* the layers gathered so far, so each layer is dimmed by
+   what is in front of it.
+3. After `RenderSettings::transparency_layers` layers (4 by default, 8 at
+   most) the gathered layers are laid **over the lit scene**, before
+   anti-aliasing.
+
+The opaque scene is resolved (pass 3) after step 1 and after the nearest
+layer's second fill, whose opacity its edge lines read.
+
+| Target | Format | Contents |
+|---|---|---|
+| Albedo, normal, depth | as the G-buffer's | the layer being drawn; reused by every layer |
+| Opacity | `R8Unorm` | the square root of how opaque the layer's surface is; reused likewise |
+| Surface, one a layer | `Rg32Uint` | as the G-buffer's. The next layer is peeled against it, every other layer's edge lines look for their surfaces in it, and a pick reads the nearest layer's |
+| Gathered | the frame's | the layers lit so far, premultiplied by coverage |
+
+That is 17 bytes a pixel and 8 more for each layer: 49 a pixel at four
+layers, beside the G-buffer's 34. They are made by the first frame that
+draws a transparent mesh and dropped when the frame's size changes; a
+frame without transparent meshes runs no pass and reads no target of
+theirs, and its pixels are the same bytes as before transparency was
+built (28 frames compared, on both adapters).
+
+Opacity is stored as its square root because 8 bits of it, blended in
+linear light, are coarse where a fade is faintest: the first step of a
+white mesh over black would be ten levels of the frame. The least opacity
+drawn is the least that could change a pixel by half a level.
+
+What this gives:
+
+- The blend is right per pixel in depth order, for meshes that pass
+  through or enclose each other and whatever order they are submitted
+  in. (What a fade between a model and the model it was made from needs:
+  the two occupy the same space.)
+- Surfaces in exactly the same place are both drawn. The higher
+  `ObjectId` is in front, between two transparent meshes and between a
+  transparent one and an opaque one; between two opaque meshes it is the
+  one submitted last, as before, which is the same thing for a host that
+  numbers its meshes as it submits them.
+- Opacity is a value of the draw, not of the retained mesh: fading costs
+  no upload.
+- A transparent mesh is lit, edged and picked like an opaque one.
+- Nothing needs more than WebGL2 gives: the fills are unblended and the
+  blends have one target each. A layer's resolve reads twelve textures of
+  the sixteen WebGL2 guarantees, which is what limits the layers to 8.
+
+#### Edge lines
+
+Edge lines come from a G-buffer's discontinuities, and a layer is not a
+G-buffer of one scene: it holds whichever surface is so many surfaces
+deep at each pixel. A surface is one layer farther wherever something
+transparent in front of it begins, and one nearer wherever that ends, so
+a layer's neighbouring pixels may hold different surfaces with nothing
+ending between them.
+
+The rule that settles every case is that **a transparent surface counts,
+in the edge test, as much as it is opaque**. Wherever the answer depends
+on a transparent surface, the test is made both ways (that surface
+opaque, that surface absent) and the mark is the blend of the two by its
+opacity. Then the marks are the all-opaque frame's when every opacity is
+1, a mesh fading out takes its marks on other meshes with it, and a mesh
+keeps its own outline whatever fades in around it.
+
+In a layer (`edge_in_layer`, `mark_toward`):
+
+- Beside a surface is the layer's own next pixel, or the opaque scene's
+  where the layer is empty there (the opaque scene is behind every
+  layer).
+- If what is beside it is farther, or nothing, the surface has ended,
+  unless it is found there in another layer (the same object, at the
+  depth it would have): then what was in front of it ended, and it did
+  not.
+- If another object is beside it, as near or nearer, and the surface is
+  found there in another layer, it passes behind that object or through
+  it. The mark is that object's outline, or the line where the two cross,
+  and is as strong as that object is opaque.
+- If another object is beside it and the surface is nowhere there, it
+  ends against that object: marked toward the right and down, and toward
+  the left and up (where the opaque scene leaves the mark to the other
+  object's pixel) as far as that object is not opaque.
+- The test extrapolates a surface from the pixel a step the other way.
+  Where the surface is in another layer there, it is extrapolated from
+  that; where it is behind a transparent surface there, the answer is
+  blended with the one an opaque surface would leave.
+
+In the opaque scene (`edge_beside_transparent`), the G-buffer does not
+hold the transparent meshes, but the nearest of them stand beside its
+surfaces as neighbours all the same. Toward a neighbouring pixel that has
+a transparent surface, and away from one, the opaque resolve blends the
+mark the G-buffer alone gives with the mark that surface would give if it
+were in the G-buffer, by its opacity.
+
+Frame tests hold these on both adapters (0.999 is stored as opacity 1, so
+"just short of opaque" is the limit itself, reached through the
+transparent path):
+
+- every mesh just short of opaque: the all-opaque frame;
+- one mesh just short of opaque among opaque ones, in front of them,
+  behind them and passing through them: the all-opaque frame;
+- a surface behind a transparent mesh of one, two or three walls takes no
+  line where that mesh ends, and is edged alike just short of opaque and
+  opaque, on either side of the frame and when it slopes steeply;
+- a mesh too faint to see leaves no mark on a mesh it passes through,
+  lies close to or ends flush against, and no gap in that mesh's outline;
+- a transparent surface lying close in front of or behind another
+  object's (a hundredth of a metre, three metres off) is edged at its
+  edges only.
+
+A second measure is a set of randomised scenes (boxes, spheres,
+double-sided meshes, oblique cameras) that a review of this work wrote;
+they are not in the repository. On them, 2026-11-17: one mesh just short
+of opaque among opaque ones, 0 of 480 scenes differ from the all-opaque
+frame; a surface behind one transparent mesh, 12 of 120 differ, by 4
+pixels at most; a faint mesh over another, 68 of 360 differ, by 26 pixels
+at most (128×96 frames).
+
+What is not exact, and why:
+
+- **Creases where a surface changes layer.** A crease needs the
+  neighbour's normal, and a layer's normals are held only while that
+  layer is lit. Where a transparent mesh's outline crosses a crease of
+  the surface behind it, a pixel of the crease can be missing. This is
+  most of the remainder above.
+- **Stacks of three.** The opaque scene reads the nearest layer only, so
+  a mark it owes to a transparent mesh can be missing where another
+  transparent mesh is in front of that one: one side of a two-pixel
+  outline, along part of it.
+- **Surfaces that weave through each other** (a model and a slightly
+  different one) get a line wherever they cross, as strong as the other
+  is opaque; when both are opaque they get the same lines at full
+  strength.
+- The opaque edge test marks a surface steeper than about 2 % of its
+  distance per pixel all over, and a layer inherits that.
+
+#### Limits, as built
+
+- **Depth.** A pixel shows the nearest `transparency_layers` transparent
+  surfaces; any behind them are left out. Each layer is two passes over
+  the transparent meshes (one of them writing two words a pixel) and one
+  resolve. Measured 2026-11-17 on a double-sided mesh of 2.8 million
+  triangles at 1920×1080: about 0.5 ms a layer on a Radeon RX 6800 XT,
+  about 6 ms a layer on a Ryzen 7950X3D's integrated graphics through
+  GLES.
+- **No ambient occlusion.** Occlusion is gathered from the opaque scene:
+  a transparent mesh neither casts nor takes it, so it appears as the
+  opacity reaches 1. The occlusion radius does follow the transparent
+  meshes' size, as it follows the opaque ones'.
+- **Lines, points, the grid and splats** are drawn afterwards against the
+  opaque scene's depth, as before: a transparent mesh neither hides nor
+  dims them. Dimming what is behind one needs these passes to read the
+  nearest layer's depth and the gathered coverage.
+- **Surfels are always opaque.** The discs of one surface overlap, and a
+  peel would count each as a surface of its own.
+- **Opacity is per draw.** A vertex colour's alpha and a texture's alpha
+  are still not read. The opacity target is per pixel, so they can be
+  multiplied in there.
+- **Coincident surfaces of one object** (the same `ObjectId` twice in
+  exactly one place) are drawn once. Two transparent surfaces closer
+  together than the depth buffer resolves can lose the farther one, as
+  two opaque ones z-fight.
+
+#### Rejected
+
+- *Blending in a forward pass, meshes sorted back to front.* One pass,
+  but meshes that cross or enclose each other have no order, so the
+  picture changes as the view turns; the lighting model would be written
+  a second time in the forward shader, and edge lines, which come from
+  the G-buffer, would not exist on a transparent mesh.
+- *Weighted blended order-independent transparency.* One pass and no
+  order, but the result is a weighted average, not occlusion: a nearly
+  opaque surface does not hide what is behind it, so a mesh does not
+  arrive at its opaque look as its opacity reaches 1. It also wants a
+  different blend on each of two targets, which WebGL2 lacks (wgpu's
+  `INDEPENDENT_BLEND`), and a float target, which is an extension there.
+- *Screen-door transparency* (discarding a pattern of pixels in the
+  G-buffer fill). No new pass, but the pattern is a depth step at every
+  pixel to the edge lines and noise to anti-aliasing.
+- *Filling and resolving each layer once, in turn* (built first). Half
+  the passes over the meshes, but a layer is then resolved before the
+  layers behind it exist, and its edge test cannot tell a surface that
+  ends against another transparent object from one that passes behind
+  it: either a mesh's outline broke where a faint mesh lay beside it, or
+  a faint mesh left full lines where it crossed another.
+- *Keeping every layer's albedo and normal* so that each is filled once
+  and creases can be followed from layer to layer: 17 bytes a pixel a
+  layer in place of 8.
+- *Marking the vertex shader's position `@invariant`*, for the peel's
+  comparison of a fragment's depth with its own from an earlier pass. The
+  attribute moved opaque pixels by a few levels on the GLES adapter, and
+  the peel holds without it on both adapters.
+- *Opacity in 8 bits as it is.* See above: a fade's faint end steps.
 
 ### Shading
 
@@ -365,6 +587,9 @@ reads it back asynchronously. `Renderer::pick_result()` returns the latest answe
 
 - The G-buffer of the last rendered frame is retained, so picking does not
   need a new frame.
+- Where the frame drew a transparent mesh, the texel comes from the
+  nearest layer's surface target: a pick lands on the nearest surface,
+  transparent or not.
 - A native host waits for the pick at the press (`pick_now`, well under a
   frame). The web cannot wait, so it requests a pick as the pointer moves
   over the viewport and a press takes the answer already there.
@@ -385,7 +610,7 @@ target while writing another unblended.
 ## 7. Host API
 
 ```rust
-renderer.submit_retained_mesh(&mesh, transform, object_id, material_id);
+renderer.submit_retained_mesh(&mesh, transform, object_id, material_id, opacity);
 renderer.submit_retained_lines(&lines);   // points, splats likewise
 renderer.submit_lines(&data, transform, style); // small dynamic batches
 let info: FrameInfo = renderer.render(&device, &queue, &mut encoder, &view, &settings, &target);
@@ -396,8 +621,11 @@ renderer.request_pick(pixel);
 buffer limits (today's `GeometryOverflow`) and the grid's current spacing.
 
 `RenderSettings` groups the `LightingRig`, the material table, occlusion,
-edges, anti-aliasing, `GridSettings`, the gizmo, the background and the
-pixel scale.
+edges, anti-aliasing, `GridSettings`, the gizmo, the background, the
+pixel scale and how many layers deep transparent meshes are drawn.
+
+Both hosts submit every mesh at opacity 1: nothing in the GUI or the
+headless render sets one yet.
 
 The GUI holds a `ViewportSettings` value (projection, grid visibility,
 axes and density, gizmo, `LightingPreset`, edges and their strength,
@@ -421,6 +649,7 @@ Nothing in the core frame needs compute shaders or float colour targets.
 | G-buffer (3 colour targets + depth) | Same |
 | Grid, edges, FXAA, gizmo | Same |
 | Picking | Same (integer read-back) |
+| Transparent meshes | Same, up to 8 layers |
 | Ambient occlusion | Half the samples (8) |
 | Image sources / direct raytracing | Unavailable at first: the caster is CPU-parallel and the web build has no workers |
 

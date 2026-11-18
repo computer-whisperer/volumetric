@@ -11,8 +11,9 @@ mod surfel;
 mod warp;
 
 pub(crate) use fullscreen::{
-    AoBlurUniforms, AoUniforms, FullscreenPass, FxaaUniforms, PickUniforms, ResolveUniforms,
-    ao_blur_pass, ao_pass, fxaa_pass, pick_pass, resolve_pass,
+    AoBlurUniforms, AoUniforms, FullscreenPass, FxaaUniforms, OTHER_LAYERS, PickUniforms,
+    ResolveUniforms, ao_blur_pass, ao_pass, fxaa_pass, layer_composite_pass, layer_resolve_pass,
+    pick_pass, resolve_pass,
 };
 pub(crate) use gizmo::GizmoPipeline;
 pub(crate) use grid::GridPipeline;

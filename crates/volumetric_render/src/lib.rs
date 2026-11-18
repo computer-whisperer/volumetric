@@ -959,6 +959,7 @@ pub fn render(
                     *transform,
                     ObjectId(object),
                     MaterialId::default(),
+                    1.0,
                 );
             }
             for lines in &scene.lines {

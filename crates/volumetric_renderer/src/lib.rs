@@ -6,16 +6,20 @@
 //!
 //! Passes, in order:
 //!
-//! 1. **G-buffer fill**: retained meshes.
+//! 1. **G-buffer fill**: the opaque retained meshes.
 //! 2. **Ambient occlusion** from depth and normals, then its blur.
-//! 3. **Resolve**: lights the G-buffer and draws edge lines, then
-//!    **anti-aliasing** writes the lit scene into the target.
-//! 4. **Grid**: the ground grid and world axis lines, per pixel.
-//! 5. **Depth-tested lines and points**.
-//! 6. **Splats**: their own layer, then composited.
-//! 7. **Overlay lines and points** (no depth test).
-//! 8. **Lens warp**, when the frame is drawn through a real lens.
-//! 9. **View gizmo**, over the finished frame.
+//! 3. **Resolve**: lights the G-buffer and draws edge lines.
+//! 4. **Transparent meshes**, when the frame has any: peeled a layer at
+//!    a time, nearest first, each filled and resolved like the G-buffer,
+//!    then laid over the lit scene together. (Every layer's surface
+//!    target is filled before the resolve: edge lines read them.)
+//! 5. **Anti-aliasing** writes the lit scene into the target.
+//! 6. **Grid**: the ground grid and world axis lines, per pixel.
+//! 7. **Depth-tested lines and points**.
+//! 8. **Splats**: their own layer, then composited.
+//! 9. **Overlay lines and points** (no depth test).
+//! 10. **Lens warp**, when the frame is drawn through a real lens.
+//! 11. **View gizmo**, over the finished frame.
 //!
 //! The G-buffer outlives the frame: [`Renderer::request_pick`] reads the
 //! object and world point under a pixel of the last frame.
@@ -25,7 +29,7 @@
 //! let mesh = renderer.create_retained_mesh(&device, &queue, &mesh_data);
 //!
 //! // Each frame:
-//! renderer.submit_retained_mesh(&mesh, transform, object, material);
+//! renderer.submit_retained_mesh(&mesh, transform, object, material, opacity);
 //! renderer.submit_lines(&line_data, transform, style);
 //! let info = renderer.render(&device, &queue, &mut encoder, &view, &settings, &target);
 //! ```
@@ -70,14 +74,14 @@ pub use types::{
 use std::sync::Arc;
 
 use buffer::{DynamicBuffer, QUAD_INDICES, QUAD_VERTICES, QuadVertex, StaticBuffer};
-use gbuffer::GBuffer;
+use gbuffer::{GBuffer, LayerBuffers};
 use glam::{Mat4, Vec3};
 use pick::{FrameRecord, Picker};
 use pipelines::{
     AoBlurUniforms, AoUniforms, FullscreenPass, FxaaUniforms, GizmoPipeline, GpuPointInstance,
-    GpuWarp, GridPipeline, LinePipeline, MeshDraw, MeshPipeline, PointPipeline, ResolveUniforms,
-    SplatCompositePipeline, SplatPipeline, SurfelDraw, SurfelPipeline, WarpPipeline, ao_pass,
-    resolve_pass,
+    GpuWarp, GridPipeline, LinePipeline, MeshDraw, MeshPipeline, OTHER_LAYERS, PointPipeline,
+    ResolveUniforms, SplatCompositePipeline, SplatPipeline, SurfelDraw, SurfelPipeline,
+    WarpPipeline, ao_pass, layer_composite_pass, layer_resolve_pass, resolve_pass,
 };
 
 /// Geometry dropped from a frame because it would have exceeded the
@@ -161,6 +165,7 @@ fn resolve_uniforms(
     view: &CameraView,
     inv_view_proj: [[f32; 4]; 4],
     ao_enabled: bool,
+    layered: bool,
 ) -> ResolveUniforms {
     let [right, up, toward] = view.frame_axes();
     let rgb = |[r, g, b]: [f32; 3]| [r, g, b, 0.0];
@@ -202,10 +207,32 @@ fn resolve_uniforms(
             edges.crease_angle.cos(),
             ao_enabled as u32 as f32,
             settings.pixel_scale.max(1.0).round(),
-            0.0,
+            layered as u32 as f32,
         ],
         materials,
     }
+}
+
+/// The least opacity a mesh is drawn at. Below it a mesh cannot change a
+/// pixel of an 8-bit sRGB frame by half a level, whatever it is drawn
+/// over: half a level is `0.5 / 255 / 12.92` in linear light at the dark
+/// end, where the levels are finest.
+const MIN_OPACITY: f32 = 0.5 / 255.0 / 12.92;
+
+/// A colour attachment cleared to `clear` when its pass begins.
+fn cleared(
+    view: &wgpu::TextureView,
+    clear: wgpu::Color,
+) -> Option<wgpu::RenderPassColorAttachment<'_>> {
+    Some(wgpu::RenderPassColorAttachment {
+        view,
+        resolve_target: None,
+        ops: wgpu::Operations {
+            load: wgpu::LoadOp::Clear(clear),
+            store: wgpu::StoreOp::Store,
+        },
+        depth_slice: None,
+    })
 }
 
 fn clear_color(color: [f32; 4]) -> wgpu::Color {
@@ -237,6 +264,9 @@ pub struct Renderer {
     /// How many occlusion samples a pixel takes.
     ao_samples: u32,
     resolve: FullscreenPass,
+    /// The resolve pass again, for a layer of the transparent meshes.
+    layer_resolve: FullscreenPass,
+    layer_composite: FullscreenPass,
     fxaa: FullscreenPass,
     grid_pipeline: GridPipeline,
     gizmo_pipeline: GizmoPipeline,
@@ -250,9 +280,14 @@ pub struct Renderer {
     gbuffer: GBuffer,
     // Bind groups over the G-buffer's views (recreated on resize)
     gbuffer_bindings: GBufferBindings,
+    // What the transparent meshes are drawn through: made by the first
+    // frame that has one, dropped when the frame's size changes.
+    layers: Option<Layers>,
 
-    // Geometry submitted for the current frame
+    // Geometry submitted for the current frame: the opaque meshes, then
+    // the transparent ones.
     frame_meshes: Vec<MeshDraw>,
+    frame_transparent: Vec<MeshDraw>,
     frame_surfels: Vec<SurfelDraw>,
     frame_lines: Vec<SubmittedLines>,
     frame_points: Vec<SubmittedPoints>,
@@ -276,6 +311,28 @@ struct GBufferBindings {
     splat_composite: wgpu::BindGroup,
 }
 
+/// The transparent meshes' targets and the bind groups over them and
+/// the G-buffer.
+struct Layers {
+    buffers: LayerBuffers,
+    /// Per layer: what its fill is peeled against.
+    peel: Vec<wgpu::BindGroup>,
+    /// Per layer: what its resolve reads.
+    resolve: Vec<wgpu::BindGroup>,
+    /// The opaque scene's resolve, reading the nearest layer as well.
+    opaque_resolve: wgpu::BindGroup,
+    composite: wgpu::BindGroup,
+    /// The pick pass over the opaque scene and the nearest layer.
+    pick: wgpu::BindGroup,
+}
+
+impl Layers {
+    /// How many layers these targets hold.
+    fn count(&self) -> u32 {
+        self.buffers.surface_views.len() as u32
+    }
+}
+
 impl Renderer {
     /// Creates a renderer drawing into targets of `surface_format`.
     pub fn new(device: &wgpu::Device, surface_format: wgpu::TextureFormat) -> Self {
@@ -288,6 +345,8 @@ impl Renderer {
             16
         };
         let resolve = resolve_pass(device, surface_format);
+        let layer_resolve = layer_resolve_pass(device, surface_format);
+        let layer_composite = layer_composite_pass(device, surface_format);
         let fxaa = pipelines::fxaa_pass(device, surface_format);
         let splat_composite_pipeline = SplatCompositePipeline::new(device, surface_format);
         let picker = Picker::new(device);
@@ -312,6 +371,8 @@ impl Renderer {
             ao_blur,
             ao_samples,
             resolve,
+            layer_resolve,
+            layer_composite,
             fxaa,
             grid_pipeline: GridPipeline::new(device, surface_format),
             gizmo_pipeline: GizmoPipeline::new(device, surface_format),
@@ -323,7 +384,9 @@ impl Renderer {
             picker,
             gbuffer,
             gbuffer_bindings,
+            layers: None,
             frame_meshes: Vec::new(),
+            frame_transparent: Vec::new(),
             frame_surfels: Vec::new(),
             frame_lines: Vec::new(),
             frame_points: Vec::new(),
@@ -355,6 +418,8 @@ impl Renderer {
                     &gbuffer.surface_view,
                 ],
             ),
+            // A frame without transparent meshes has no nearest layer to
+            // read and does not read one: the last two stand in.
             resolve: resolve.bind(
                 device,
                 &[
@@ -362,10 +427,12 @@ impl Renderer {
                     &gbuffer.normal_view,
                     &gbuffer.surface_view,
                     &gbuffer.ao_view,
+                    &gbuffer.surface_view,
+                    &gbuffer.ao_view,
                 ],
             ),
             fxaa: fxaa.bind(device, &[&gbuffer.lit_view]),
-            pick: picker.bind(device, &gbuffer.surface_view),
+            pick: picker.bind(device, &gbuffer.surface_view, None),
             splat_composite: splat_composite.create_bind_group(device, &gbuffer.splat_view),
         }
     }
@@ -416,6 +483,9 @@ impl Renderer {
         if !self.gbuffer.resize_if_needed(device, width, height) {
             return;
         }
+        // Bound over the old G-buffer; the next frame that needs them
+        // makes them again.
+        self.layers = None;
         self.gbuffer_bindings = Self::bind_gbuffer(
             device,
             &self.gbuffer,
@@ -539,19 +609,48 @@ impl Renderer {
 
     /// Submit a retained mesh for this frame, drawn under `transform`.
     /// `object` is what a pick at its pixels reports.
+    ///
+    /// `opacity` is how much of what is behind the mesh it hides: 1 (or
+    /// more) draws it opaque, as every mesh was before the renderer had
+    /// transparency; 0 (or too little to change a pixel of an 8-bit
+    /// frame) does not draw it at all, nor let it be picked. Between the two it is
+    /// transparent: lit and edged like an opaque mesh, then blended at
+    /// that weight over everything behind it, pixel by pixel in depth
+    /// order, however the transparent meshes of a frame cross each
+    /// other and whatever order they are submitted in (up to
+    /// [`RenderSettings::transparency_layers`] surfaces deep). It does
+    /// not occlude light (ambient occlusion) and a pick lands on it.
+    /// Changing it costs nothing: it is not part of the retained mesh.
+    ///
+    /// Where two meshes have a surface in exactly the same place and
+    /// one of them is transparent, the one with the higher `object` is
+    /// in front; give them different objects, or only one of two
+    /// transparent ones is drawn there. (Of two opaque meshes the one
+    /// submitted last is in front, as before: the same thing, for a host
+    /// that numbers its meshes as it submits them.)
     pub fn submit_retained_mesh(
         &mut self,
         mesh: &Arc<GpuMesh>,
         transform: Mat4,
         object: ObjectId,
         material: MaterialId,
+        opacity: f32,
     ) {
-        self.frame_meshes.push(MeshDraw {
+        if opacity < MIN_OPACITY {
+            return;
+        }
+        let draw = MeshDraw {
             mesh: mesh.clone(),
             transform,
             object,
             material,
-        });
+            opacity,
+        };
+        if opacity < 1.0 {
+            self.frame_transparent.push(draw);
+        } else {
+            self.frame_meshes.push(draw);
+        }
     }
 
     /// Uploads surfels as a retained GPU resident; the transform comes at
@@ -568,7 +667,9 @@ impl Renderer {
     /// discs; they fill the G-buffer like a mesh, so they are lit, edged,
     /// occluded and picked the same way. `color` is multiplied into the
     /// material base colour for every disc, as a mesh vertex's colour is
-    /// (white for the plain look).
+    /// (white for the plain look). Its alpha is not read: surfels are
+    /// always opaque, because the discs of one surface overlap and would
+    /// each count as a surface of their own.
     pub fn submit_retained_surfels(
         &mut self,
         surfels: &Arc<GpuSurfels>,
@@ -630,7 +731,7 @@ impl Renderer {
             max_buffer_bytes: device.limits().max_buffer_size,
             ..GeometryOverflow::default()
         };
-        for draw in &self.frame_meshes {
+        for draw in self.frame_meshes.iter().chain(&self.frame_transparent) {
             overflow.dropped_triangles += draw.mesh.dropped_triangles;
             overflow.total_triangles += draw.mesh.total_triangles;
         }
@@ -645,6 +746,20 @@ impl Renderer {
         }
         for draw in &self.frame_surfels {
             overflow.dropped_surfels += draw.surfels.dropped;
+        }
+
+        let layered = !self.frame_transparent.is_empty();
+        let layer_count = settings
+            .transparency_layers
+            .clamp(1, LayerBuffers::MAX_LAYERS);
+        if layered {
+            self.ensure_layers(device, layer_count);
+            // Rising object ids: of surfaces at exactly one depth, the
+            // layer's depth test then keeps the highest id's (see
+            // `peeled_away` in the mesh shader), so they are peeled in
+            // an order of their own and not the order they were
+            // submitted in.
+            self.frame_transparent.sort_by_key(|draw| draw.object.0);
         }
 
         // Through a lens the scene renders into the warp's own frame and
@@ -671,8 +786,13 @@ impl Renderer {
 
         // ---- Uploads. Everything is written before any pass is encoded;
         // each batch has buffers of its own.
-        self.mesh_pipeline
-            .prepare(device, queue, view_proj, &self.frame_meshes);
+        self.mesh_pipeline.prepare(
+            device,
+            queue,
+            view_proj,
+            &self.frame_meshes,
+            &self.frame_transparent,
+        );
         self.surfel_pipeline
             .prepare(device, queue, view, &self.frame_surfels);
 
@@ -788,29 +908,25 @@ impl Renderer {
         }
         self.resolve.write_uniforms(
             queue,
-            &resolve_uniforms(settings, view, inv_view_proj, ao_enabled),
+            &resolve_uniforms(settings, view, inv_view_proj, ao_enabled, layered),
         );
+        if layered {
+            // Occlusion is gathered from the opaque scene alone.
+            self.layer_resolve.write_uniforms(
+                queue,
+                &resolve_uniforms(settings, view, inv_view_proj, false, layered),
+            );
+        }
 
         // ---- G-buffer fill. Always run, so a frame with no geometry
         // still leaves a cleared G-buffer for the later passes and picks.
         {
-            let attachment = |view, clear| {
-                Some(wgpu::RenderPassColorAttachment {
-                    view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(clear),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })
-            };
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("gbuffer_pass"),
                 color_attachments: &[
-                    attachment(&self.gbuffer.albedo_view, wgpu::Color::TRANSPARENT),
-                    attachment(&self.gbuffer.normal_view, wgpu::Color::TRANSPARENT),
-                    attachment(&self.gbuffer.surface_view, GBuffer::SURFACE_CLEAR),
+                    cleared(&self.gbuffer.albedo_view, wgpu::Color::TRANSPARENT),
+                    cleared(&self.gbuffer.normal_view, wgpu::Color::TRANSPARENT),
+                    cleared(&self.gbuffer.surface_view, GBuffer::SURFACE_CLEAR),
                 ],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.gbuffer.depth_view,
@@ -844,13 +960,42 @@ impl Renderer {
             );
         }
         let background = clear_color(settings.background_color);
+        // The lit scene: anti-aliasing's input, or the target itself.
+        let lit = if settings.antialiasing {
+            &self.gbuffer.lit_view
+        } else {
+            target
+        };
+        // The transparent meshes are peeled a layer at a time, nearest
+        // first. Every layer's surface target is filled before anything
+        // is lit: the edge lines of the opaque scene read the nearest
+        // layer's, and those of a layer read every other layer's. Then
+        // each layer in turn is filled like the G-buffer, resolved like
+        // it and blended under the layers gathered so far.
+        let layers = self.layers.as_ref().filter(|_| layered);
+        if let Some(layers) = layers {
+            for layer in 0..layer_count.min(layers.count()) {
+                self.fill_layer(encoder, layer, true);
+            }
+            // The opaque scene's edges read the nearest layer's opacity.
+            self.fill_layer(encoder, 0, false);
+        }
+        let resolve = layers.map_or(&self.gbuffer_bindings.resolve, |layers| {
+            &layers.opaque_resolve
+        });
+        self.resolve.run(encoder, resolve, lit, background);
+        if let Some(layers) = layers {
+            for layer in 0..layer_count.min(layers.count()) {
+                if layer > 0 {
+                    self.fill_layer(encoder, layer, false);
+                }
+                self.resolve_layer(encoder, layer);
+            }
+            // The gathered layers, over the lit scene.
+            self.layer_composite
+                .run_onto(encoder, &layers.composite, lit);
+        }
         if settings.antialiasing {
-            self.resolve.run(
-                encoder,
-                &self.gbuffer_bindings.resolve,
-                &self.gbuffer.lit_view,
-                background,
-            );
             self.fxaa.write_uniforms(
                 queue,
                 &FxaaUniforms {
@@ -860,9 +1005,6 @@ impl Renderer {
             );
             self.fxaa
                 .run(encoder, &self.gbuffer_bindings.fxaa, target, background);
-        } else {
-            self.resolve
-                .run(encoder, &self.gbuffer_bindings.resolve, target, background);
         }
 
         // ---- The grid, then depth-tested lines and points, over the lit
@@ -953,8 +1095,10 @@ impl Renderer {
         self.last_frame = Some(FrameRecord {
             inv_view_proj: view_proj.inverse(),
             size: internal_size,
+            layered,
         });
         self.frame_meshes.clear();
+        self.frame_transparent.clear();
         self.frame_surfels.clear();
         self.frame_lines.clear();
         self.frame_points.clear();
@@ -965,6 +1109,145 @@ impl Renderer {
         FrameInfo {
             overflow: overflow.any().then_some(overflow),
             grid_spacing: grid_levels.map(|levels| levels.minor),
+        }
+    }
+
+    /// Makes the transparent meshes' targets for `count` layers, and the
+    /// bind groups over them and the G-buffer, unless they stand already.
+    fn ensure_layers(&mut self, device: &wgpu::Device, count: u32) {
+        if self
+            .layers
+            .as_ref()
+            .is_some_and(|layers| layers.count() == count)
+        {
+            return;
+        }
+        let (width, height) = self.gbuffer.size;
+        let buffers = LayerBuffers::new(device, width, height, self.gbuffer.lit_format(), count);
+        let opaque = &self.gbuffer.surface_view;
+        let surfaces = &buffers.surface_views;
+        let peel = (0..surfaces.len())
+            .map(|layer| {
+                // The nearest layer has none before it; a target it does
+                // not write stands in: the last layer's, or with one
+                // layer the opaque scene's.
+                let unread = if layer + 1 < surfaces.len() {
+                    surfaces.last().unwrap_or(opaque)
+                } else {
+                    opaque
+                };
+                self.mesh_pipeline.bind_peel(
+                    device,
+                    opaque,
+                    layer.checked_sub(1).map(|before| &surfaces[before]),
+                    unread,
+                )
+            })
+            .collect();
+        let resolve = (0..surfaces.len())
+            .map(|layer| {
+                let mut views = vec![
+                    &buffers.albedo_view,
+                    &buffers.normal_view,
+                    &surfaces[layer],
+                    &buffers.opacity_view,
+                    opaque,
+                ];
+                // Every other layer's surface target; the layer's own
+                // fills the places there is none for.
+                let others = (0..surfaces.len()).filter(|&other| other != layer);
+                views.extend(
+                    others
+                        .chain(std::iter::repeat(layer))
+                        .take(OTHER_LAYERS)
+                        .map(|other| &surfaces[other]),
+                );
+                self.layer_resolve.bind(device, &views)
+            })
+            .collect();
+        let opaque_resolve = self.resolve.bind(
+            device,
+            &[
+                &self.gbuffer.albedo_view,
+                &self.gbuffer.normal_view,
+                &self.gbuffer.surface_view,
+                &self.gbuffer.ao_view,
+                &surfaces[0],
+                &buffers.opacity_view,
+            ],
+        );
+        let composite = self.layer_composite.bind(device, &[&buffers.gathered_view]);
+        let pick = self.picker.bind(device, opaque, Some(&surfaces[0]));
+        self.layers = Some(Layers {
+            peel,
+            resolve,
+            opaque_resolve,
+            composite,
+            pick,
+            buffers,
+        });
+    }
+
+    /// Fills layer `layer` (0 is the nearest) of the frame's transparent
+    /// meshes: at each pixel, the nearest of their surfaces that is
+    /// behind the layer before and in front of the opaque scene.
+    /// `surface_only` fills the layer's own surface target; otherwise
+    /// the albedo, normal and opacity targets the layers share, with the
+    /// same surfaces.
+    fn fill_layer(&self, encoder: &mut wgpu::CommandEncoder, layer: u32, surface_only: bool) {
+        let Some(layers) = &self.layers else {
+            return;
+        };
+        let buffers = &layers.buffers;
+        let surface = [cleared(
+            &buffers.surface_views[layer as usize],
+            GBuffer::SURFACE_CLEAR,
+        )];
+        let rest = [
+            cleared(&buffers.albedo_view, wgpu::Color::TRANSPARENT),
+            cleared(&buffers.normal_view, wgpu::Color::TRANSPARENT),
+            cleared(&buffers.opacity_view, wgpu::Color::TRANSPARENT),
+        ];
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some(if surface_only {
+                "layer_surface_pass"
+            } else {
+                "layer_pass"
+            }),
+            color_attachments: if surface_only { &surface } else { &rest },
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &buffers.depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        self.mesh_pipeline.render_layer(
+            &mut pass,
+            &self.frame_transparent,
+            &layers.peel[layer as usize],
+            surface_only,
+        );
+    }
+
+    /// Lights layer `layer`, as last filled, under the layers gathered
+    /// so far. The layers are resolved nearest first.
+    fn resolve_layer(&self, encoder: &mut wgpu::CommandEncoder, layer: u32) {
+        let Some(layers) = &self.layers else {
+            return;
+        };
+        let resolve = &layers.resolve[layer as usize];
+        let gathered = &layers.buffers.gathered_view;
+        if layer == 0 {
+            self.layer_resolve
+                .run(encoder, resolve, gathered, wgpu::Color::TRANSPARENT);
+        } else {
+            self.layer_resolve.run_onto(encoder, resolve, gathered);
         }
     }
 
@@ -984,6 +1267,7 @@ impl Renderer {
         let bounds = self
             .frame_meshes
             .iter()
+            .chain(&self.frame_transparent)
             .filter_map(|draw| corners(draw.mesh.bounds, draw.transform))
             .flatten()
             .chain(
@@ -1082,14 +1366,14 @@ impl Renderer {
         if source.0 >= frame.size.0 || source.1 >= frame.size.1 {
             return;
         }
-        self.picker.request(
-            device,
-            queue,
-            &self.gbuffer_bindings.pick,
-            frame,
-            pixel,
-            source,
-        );
+        // A frame with transparent meshes is picked through its nearest
+        // layer; the layers of an earlier frame are stale.
+        let bind_group = match &self.layers {
+            Some(layers) if frame.layered => &layers.pick,
+            _ => &self.gbuffer_bindings.pick,
+        };
+        self.picker
+            .request(device, queue, bind_group, frame, pixel, source);
     }
 
     /// The most recent pick to have landed, without waiting; `None` until
