@@ -667,10 +667,23 @@ pub struct RenderSettings {
     pub pixel_scale: f32,
     /// How many transparent surfaces deep a pixel is drawn: the nearest
     /// this many of the transparent meshes' surfaces are blended, in
-    /// depth order, and any behind them are left out. Each one is a pass
-    /// over the transparent meshes, taken only by a frame that has some;
-    /// clamped to 1..=8.
+    /// depth order, and any behind them are left out. Each one is two
+    /// passes over the transparent meshes and 8 bytes a pixel, taken only
+    /// by a frame that has some; clamped to 1..=8. The default, 2, is
+    /// what one transparent mesh in front of another needs, each seen
+    /// from outside (back faces are not drawn): a fade between a model
+    /// and the model it was made from. A mesh that folds back behind
+    /// itself, or more meshes overlapping, wants a layer for each
+    /// surface a line of sight crosses.
     pub transparency_layers: u32,
+    /// The least opacity a transparent mesh is picked at. A pick passes
+    /// through fainter meshes to the nearest surface that is at least
+    /// this opaque, or opaque: a mesh faded nearly out does not take the
+    /// point a gesture turns about. 0 lets a pick land on every mesh
+    /// that is drawn. A pick knows a surface by its object: where
+    /// several transparent meshes of a frame share one, they are all
+    /// picked if any of them is this opaque.
+    pub pick_opacity: f32,
 }
 
 impl Default for RenderSettings {
@@ -685,7 +698,8 @@ impl Default for RenderSettings {
             background_color: [0.1, 0.1, 0.1, 1.0],
             antialiasing: true,
             pixel_scale: 1.0,
-            transparency_layers: 4,
+            transparency_layers: 2,
+            pick_opacity: 0.25,
         }
     }
 }

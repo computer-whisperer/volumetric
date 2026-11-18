@@ -394,18 +394,22 @@ impl MeshPipeline {
                 write_mask: wgpu::ColorWrites::ALL,
             })
         };
-        // The G-buffer's pipeline and the layers' differ in their fragment
-        // stage alone: its entry point, what it reads and what it writes.
+        // The G-buffer's pipeline and the layers' differ in their entry
+        // points (the layers' vertex stage is the G-buffer's with an
+        // invariant position), in what the fragment stage reads and
+        // writes, and in the depth target's format.
         let build = |label,
                      layout: &wgpu::PipelineLayout,
+                     vertex_entry,
                      fragment_entry,
-                     targets: &[Option<wgpu::ColorTargetState>]| {
+                     targets: &[Option<wgpu::ColorTargetState>],
+                     depth_format| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(layout),
                 vertex: wgpu::VertexState {
                     module: &shader,
-                    entry_point: Some("vs_main"),
+                    entry_point: Some(vertex_entry),
                     buffers: &[
                         Some(wgpu::VertexBufferLayout {
                             array_stride: std::mem::size_of::<MeshVertex>() as u64,
@@ -496,7 +500,7 @@ impl MeshPipeline {
                     conservative: false,
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
-                    format: GBuffer::DEPTH_FORMAT,
+                    format: depth_format,
                     depth_write_enabled: Some(true),
                     depth_compare: Some(wgpu::CompareFunction::LessEqual),
                     stencil: wgpu::StencilState::default(),
@@ -510,28 +514,34 @@ impl MeshPipeline {
         let pipeline = build(
             "mesh_gbuffer_pipeline",
             &pipeline_layout,
+            "vs_main",
             "fs_gbuffer",
             &[
                 target(GBuffer::ALBEDO_FORMAT),
                 target(GBuffer::NORMAL_FORMAT),
                 target(GBuffer::SURFACE_FORMAT),
             ],
+            GBuffer::DEPTH_FORMAT,
         );
         let layer_surface_pipeline = build(
             "mesh_layer_surface_pipeline",
             &layer_pipeline_layout,
+            "vs_layer",
             "fs_layer_surface",
             &[target(GBuffer::SURFACE_FORMAT)],
+            LayerBuffers::DEPTH_FORMAT,
         );
         let layer_pipeline = build(
             "mesh_layer_pipeline",
             &layer_pipeline_layout,
+            "vs_layer",
             "fs_layer",
             &[
                 target(GBuffer::ALBEDO_FORMAT),
                 target(GBuffer::NORMAL_FORMAT),
                 target(LayerBuffers::OPACITY_FORMAT),
             ],
+            LayerBuffers::DEPTH_FORMAT,
         );
 
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {

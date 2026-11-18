@@ -165,7 +165,7 @@ fn resolve_uniforms(
     view: &CameraView,
     inv_view_proj: [[f32; 4]; 4],
     ao_enabled: bool,
-    layered: bool,
+    layers: u32,
 ) -> ResolveUniforms {
     let [right, up, toward] = view.frame_axes();
     let rgb = |[r, g, b]: [f32; 3]| [r, g, b, 0.0];
@@ -207,7 +207,7 @@ fn resolve_uniforms(
             edges.crease_angle.cos(),
             ao_enabled as u32 as f32,
             settings.pixel_scale.max(1.0).round(),
-            layered as u32 as f32,
+            layers as f32,
         ],
         materials,
     }
@@ -218,6 +218,13 @@ fn resolve_uniforms(
 /// over: half a level is `0.5 / 255 / 12.92` in linear light at the dark
 /// end, where the levels are finest.
 const MIN_OPACITY: f32 = 0.5 / 255.0 / 12.92;
+
+/// The layers' targets are dropped by this many frames in a row without
+/// a transparent mesh: they outlive one fewer. They are 17 bytes a pixel
+/// and 8 more a layer, at the frame's internal size. Frames are what is
+/// counted, so a host that stops drawing keeps them until it draws
+/// again.
+const LAYERS_KEPT_FRAMES: u32 = 30;
 
 /// A colour attachment cleared to `clear` when its pass begins.
 fn cleared(
@@ -281,8 +288,10 @@ pub struct Renderer {
     // Bind groups over the G-buffer's views (recreated on resize)
     gbuffer_bindings: GBufferBindings,
     // What the transparent meshes are drawn through: made by the first
-    // frame that has one, dropped when the frame's size changes.
+    // frame that has one, dropped when the frame's size changes or by the
+    // `LAYERS_KEPT_FRAMES`th frame in a row without one.
     layers: Option<Layers>,
+    frames_without_layers: u32,
 
     // Geometry submitted for the current frame: the opaque meshes, then
     // the transparent ones.
@@ -322,7 +331,7 @@ struct Layers {
     /// The opaque scene's resolve, reading the nearest layer as well.
     opaque_resolve: wgpu::BindGroup,
     composite: wgpu::BindGroup,
-    /// The pick pass over the opaque scene and the nearest layer.
+    /// The pick pass over the opaque scene and every layer.
     pick: wgpu::BindGroup,
 }
 
@@ -385,6 +394,7 @@ impl Renderer {
             gbuffer,
             gbuffer_bindings,
             layers: None,
+            frames_without_layers: 0,
             frame_meshes: Vec::new(),
             frame_transparent: Vec::new(),
             frame_surfels: Vec::new(),
@@ -432,7 +442,7 @@ impl Renderer {
                 ],
             ),
             fxaa: fxaa.bind(device, &[&gbuffer.lit_view]),
-            pick: picker.bind(device, &gbuffer.surface_view, None),
+            pick: picker.bind(device, &gbuffer.surface_view, &[]),
             splat_composite: splat_composite.create_bind_group(device, &gbuffer.splat_view),
         }
     }
@@ -619,7 +629,9 @@ impl Renderer {
     /// order, however the transparent meshes of a frame cross each
     /// other and whatever order they are submitted in (up to
     /// [`RenderSettings::transparency_layers`] surfaces deep). It does
-    /// not occlude light (ambient occlusion) and a pick lands on it.
+    /// not occlude light (ambient occlusion). A pick lands on it when it
+    /// is at least [`RenderSettings::pick_opacity`] opaque, and passes
+    /// through it to what is behind when it is fainter.
     /// Changing it costs nothing: it is not part of the retained mesh.
     ///
     /// Where two meshes have a surface in exactly the same place and
@@ -752,7 +764,19 @@ impl Renderer {
         let layer_count = settings
             .transparency_layers
             .clamp(1, LayerBuffers::MAX_LAYERS);
+        // How many layers this frame peels.
+        let frame_layers = if layered { layer_count } else { 0 };
+        if !layered {
+            // A fade that reaches opaque and comes back finds its targets
+            // standing; a scene that has stopped using them gives the
+            // memory back.
+            self.frames_without_layers = self.frames_without_layers.saturating_add(1);
+            if self.frames_without_layers >= LAYERS_KEPT_FRAMES {
+                self.layers = None;
+            }
+        }
         if layered {
+            self.frames_without_layers = 0;
             self.ensure_layers(device, layer_count);
             // Rising object ids: of surfaces at exactly one depth, the
             // layer's depth test then keeps the highest id's (see
@@ -908,13 +932,13 @@ impl Renderer {
         }
         self.resolve.write_uniforms(
             queue,
-            &resolve_uniforms(settings, view, inv_view_proj, ao_enabled, layered),
+            &resolve_uniforms(settings, view, inv_view_proj, ao_enabled, frame_layers),
         );
         if layered {
             // Occlusion is gathered from the opaque scene alone.
             self.layer_resolve.write_uniforms(
                 queue,
-                &resolve_uniforms(settings, view, inv_view_proj, false, layered),
+                &resolve_uniforms(settings, view, inv_view_proj, false, frame_layers),
             );
         }
 
@@ -1092,10 +1116,20 @@ impl Renderer {
                 .render(queue, encoder, gizmo, final_target, self.viewport_size);
         }
 
+        // Sorted by object above, so the objects come in rising order.
+        // A threshold that is not a number is none: every mesh drawn.
+        let mut pickable: Vec<u32> = self
+            .frame_transparent
+            .iter()
+            .filter(|draw| settings.pick_opacity.is_nan() || draw.opacity >= settings.pick_opacity)
+            .map(|draw| draw.object.0)
+            .collect();
+        pickable.dedup();
         self.last_frame = Some(FrameRecord {
             inv_view_proj: view_proj.inverse(),
             size: internal_size,
-            layered,
+            layers: frame_layers,
+            pickable: pickable.into(),
         });
         self.frame_meshes.clear();
         self.frame_transparent.clear();
@@ -1177,7 +1211,7 @@ impl Renderer {
             ],
         );
         let composite = self.layer_composite.bind(device, &[&buffers.gathered_view]);
-        let pick = self.picker.bind(device, opaque, Some(&surfaces[0]));
+        let pick = self.picker.bind(device, opaque, surfaces);
         self.layers = Some(Layers {
             peel,
             resolve,
@@ -1346,7 +1380,7 @@ impl Renderer {
             self.queued_pick = Some(pixel);
             return;
         }
-        let Some(frame) = self.last_frame else {
+        let Some(frame) = self.last_frame.clone() else {
             return;
         };
         // Through a lens the target pixel shows some other pixel of the
@@ -1366,10 +1400,10 @@ impl Renderer {
         if source.0 >= frame.size.0 || source.1 >= frame.size.1 {
             return;
         }
-        // A frame with transparent meshes is picked through its nearest
-        // layer; the layers of an earlier frame are stale.
+        // A frame with transparent meshes is picked through its layers;
+        // the layers of an earlier frame are stale.
         let bind_group = match &self.layers {
-            Some(layers) if frame.layered => &layers.pick,
+            Some(layers) if frame.layers > 0 => &layers.pick,
             _ => &self.gbuffer_bindings.pick,
         };
         self.picker
@@ -1398,7 +1432,7 @@ impl Renderer {
         queue: &wgpu::Queue,
         pixel: (u32, u32),
     ) -> Option<Pick> {
-        self.last_frame?;
+        self.last_frame.as_ref()?;
         // The read asked for here may be queued behind one in flight:
         // landing that one issues ours, which the second wait lands.
         self.request_pick(device, queue, pixel);

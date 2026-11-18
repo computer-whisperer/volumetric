@@ -19,8 +19,9 @@ var g_opacity: texture_2d<f32>;
 @group(0) @binding(5)
 var g_opaque_surface: texture_2d<u32>;
 
-// The surface targets of the other layers, nearer and farther, in any
-// order. The layer's own target stands in for the ones there are not.
+// The surface targets of the frame's other layers, nearer and farther,
+// in the first `other_layers()` of these. The layer's own target fills
+// the rest, which are not read.
 @group(0) @binding(6)
 var g_other_0: texture_2d<u32>;
 @group(0) @binding(7)
@@ -38,6 +39,11 @@ var g_other_6: texture_2d<u32>;
 
 const OTHER_LAYERS: i32 = 7;
 
+// How many other layers the frame peels.
+fn other_layers() -> i32 {
+    return clamp(i32(uniforms.switches.w) - 1, 0, OTHER_LAYERS);
+}
+
 fn other_layer(i: i32, at: vec2<i32>) -> vec4<u32> {
     switch i {
         case 0 { return textureLoad(g_other_0, at, 0); }
@@ -50,18 +56,56 @@ fn other_layer(i: i32, at: vec2<i32>) -> vec4<u32> {
     }
 }
 
-// Whether the surface of `object` is at `at` in another layer: the same
-// object there, `expected` from the eye give or take `tolerance`.
-fn in_another_layer(at: vec2<i32>, object: u32, expected: f32, tolerance: f32) -> bool {
+// Whether `object` has another surface at `px`, in another layer, that
+// is nearer than this one (`distance` from the eye) to being `there`
+// from the eye.
+fn another_of_its_surfaces_is_nearer(px: vec2<i32>, object: u32, distance: f32, there: f32) -> bool {
     let k = uniforms.depth_to_distance;
-    for (var i = 0; i < OTHER_LAYERS; i = i + 1) {
-        let texel = other_layer(i, at);
+    let off = abs(distance - there);
+    let others = other_layers();
+    for (var i = 0; i < others; i = i + 1) {
+        let texel = other_layer(i, px);
         let depth = surface_depth(texel);
-        if depth < 1.0 && texel.r == object && abs(eye_distance(depth, k) - expected) <= tolerance {
+        if depth < 1.0 && texel.r == object && abs(eye_distance(depth, k) - there) < off {
             return true;
         }
     }
     return false;
+}
+
+// The depth at `at`, in another layer, of the surface of `object` that
+// is `distance` from the eye at `px`: the same object there, `expected`
+// from the eye give or take `tolerance`. 1 where there is none.
+//
+// An object can have two surfaces that close together (the walls of a
+// thin shell), and the one found at `at` may be the other one, going on
+// where this one has ended. So a surface found there is taken for this
+// one only if no other surface of the object at `px` fits it better:
+// carried back to `px` alongside this surface, it must be nearer this
+// one than any of them.
+fn in_another_layer(
+    px: vec2<i32>,
+    at: vec2<i32>,
+    object: u32,
+    distance: f32,
+    expected: f32,
+    tolerance: f32,
+) -> f32 {
+    let k = uniforms.depth_to_distance;
+    let others = other_layers();
+    for (var i = 0; i < others; i = i + 1) {
+        let texel = other_layer(i, at);
+        let depth = surface_depth(texel);
+        if depth >= 1.0 || texel.r != object {
+            continue;
+        }
+        let found = eye_distance(depth, k);
+        if abs(found - expected) <= tolerance
+            && !another_of_its_surfaces_is_nearer(px, object, distance, found - (expected - distance)) {
+            return depth;
+        }
+    }
+    return 1.0;
 }
 
 // What a layer's surface has beside it at a pixel.
@@ -87,7 +131,8 @@ fn beside(at: vec2<i32>) -> Beside {
 // it can be taken for one plane with the surface of depth `depth` beside
 // it; 1 where there is none.
 fn depth_in_another_layer(at: vec2<i32>, object: u32, depth: f32) -> f32 {
-    for (var i = 0; i < OTHER_LAYERS; i = i + 1) {
+    let others = other_layers();
+    for (var i = 0; i < others; i = i + 1) {
         let texel = other_layer(i, at);
         if texel.r == object && carries_plane(depth, surface_depth(texel)) {
             return surface_depth(texel);
@@ -109,20 +154,32 @@ fn depth_in_another_layer(at: vec2<i32>, object: u32, depth: f32) -> f32 {
 //   unless it is to be found there in another layer, which is then a
 //   nearer one: what was in front of it has ended, and it has not (0).
 // - Another object is beside it, as near or nearer, and the surface is
-//   to be found there in another layer: it passes behind that object or
-//   through it. The mark is that object's outline falling on this
-//   surface, or the line where the two cross, and is as strong as that
-//   object is opaque.
+//   to be found there in another layer, behind that object: it passes
+//   behind it or through it. The mark is that object's outline falling
+//   on this surface, or the line where the two cross, and is as strong
+//   as that object is opaque.
+// - The same, but the surface is found there in front of that object
+//   (which is then close behind it, by less than the tolerances of the
+//   two tests): the surface has come out from behind something, as in
+//   the first case, and the other object only lies close behind it there
+//   or crosses it. No mark (0): the line where two surfaces cross is
+//   marked once, as in the opaque scene, on the pixel of the pair that
+//   is to the left or above, by the surface in front there. This takes
+//   it that nothing new is in front of the surface at `at`; where
+//   something is (two outlines in one place), that object's outline is
+//   owed and not made.
 // - Another object is beside it and the surface is nowhere there: it
 //   ends against that object. Forward it is marked (1). The other way,
 //   the opaque scene leaves the mark to the other object's pixel, so
 //   here it is the mark this surface would have with that object gone
 //   (1), as far as that object is not opaque.
 fn mark_toward(
+    px: vec2<i32>,
     at: vec2<i32>,
     forward: bool,
     n: vec3<f32>,
     object: u32,
+    distance: f32,
     expected: f32,
     tolerance: f32,
 ) -> f32 {
@@ -139,7 +196,8 @@ fn mark_toward(
     let another = !stepped && other.surface.r != object;
 
     if stepped || another {
-        let elsewhere = in_another_layer(at, object, expected, tolerance);
+        let found = in_another_layer(px, at, object, distance, expected, tolerance);
+        let elsewhere = found < 1.0;
         var other_opacity = 1.0;
         if other.own {
             other_opacity = opacity_of(textureLoad(g_opacity, at, 0));
@@ -148,6 +206,11 @@ fn mark_toward(
             return select(1.0, 0.0, elsewhere);
         }
         if elsewhere {
+            // In front of the other object there, as the peel orders
+            // them: the nearer, or at one depth the higher object.
+            if found < other_depth || (found == other_depth && object > other.surface.r) {
+                return 0.0;
+            }
             return select(0.0, other_opacity, forward);
         }
         return select(1.0 - other_opacity, 1.0, forward);
@@ -177,7 +240,8 @@ fn edge_in_layer(px: vec2<i32>, depth: f32, n: vec3<f32>, object: u32) -> f32 {
     let k = uniforms.depth_to_distance;
     let limit = vec2<i32>(textureDimensions(g_surface)) - vec2<i32>(1);
     let width = max(i32(uniforms.switches.z), 1);
-    let tolerance = eye_distance(depth, k) * DEPTH_STEP;
+    let distance = eye_distance(depth, k);
+    let tolerance = distance * DEPTH_STEP;
     var strength = 0.0;
     // Right, down, left, up.
     for (var i = 0; i < 4; i = i + 1) {
@@ -190,12 +254,20 @@ fn edge_in_layer(px: vec2<i32>, depth: f32, n: vec3<f32>, object: u32) -> f32 {
         let behind = beside(back);
         let behind_depth = surface_depth(behind.surface);
         let expected = expected_distance(depth, behind_depth);
-        var mark = mark_toward(at, forward, n, object, expected, tolerance);
+        var mark = mark_toward(px, at, forward, n, object, distance, expected, tolerance);
         if !(behind.own && behind.surface.r == object) {
             let own = depth_in_another_layer(back, object, depth);
             if own < 1.0 {
-                let through =
-                    mark_toward(at, forward, n, object, expected_distance(depth, own), tolerance);
+                let through = mark_toward(
+                    px,
+                    at,
+                    forward,
+                    n,
+                    object,
+                    distance,
+                    expected_distance(depth, own),
+                    tolerance,
+                );
                 if behind.own && behind_depth < own {
                     mark = mix(through, mark, opacity_of(textureLoad(g_opacity, back, 0)));
                 } else {

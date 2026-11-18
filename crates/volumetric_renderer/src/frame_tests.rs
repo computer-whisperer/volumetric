@@ -631,6 +631,8 @@ fn a_surface_seen_through_a_transparent_mesh_takes_no_edge_from_it() {
         let mut settings = settings(false);
         settings.edges.enabled = true;
         settings.antialiasing = false;
+        // The sheet is the fourth surface deep behind three walls.
+        settings.transparency_layers = 4;
         // A sheet across the whole frame, and in front of it walls over
         // half of the frame, ending together down the middle.
         let behind = quad(
@@ -933,7 +935,8 @@ fn a_faint_mesh_leaves_no_mark_on_the_meshes_around_it() {
 
 /// A fade's faint end is smooth: opacity is kept finely enough that the
 /// first steps a mesh takes over a dark background are small ones, and
-/// below the least that could show it is not drawn, nor picked.
+/// below the least that could show it is not drawn, nor picked even by
+/// a pick that lands on every mesh drawn.
 #[test]
 fn the_faint_end_of_a_fade_is_smooth() {
     on_each_backend(|offscreen| {
@@ -941,6 +944,7 @@ fn the_faint_end_of_a_fade_is_smooth() {
         let mut settings = settings(false);
         settings.antialiasing = false;
         settings.background_color = [0.0, 0.0, 0.0, 1.0];
+        settings.pick_opacity = 0.0;
         let sheet = quad(Vec3::ZERO, Vec3::X * 0.5, Vec3::Y * 0.5, [1.0; 4]);
         let mut level = |opacity: f32| {
             let rgba = frame_of(
@@ -967,6 +971,118 @@ fn the_faint_end_of_a_fade_is_smooth() {
             last = now;
         }
         assert!(last > 20, "{last}");
+    });
+}
+
+/// Where two surfaces cross, the line is the mark of the one that goes
+/// behind, made once: a mesh just short of opaque that a transparent
+/// one passes through shows what it shows drawn opaque, whichever of the
+/// two is in front on the left and whichever has the higher object. (The
+/// surface that comes out in front at the crossing takes no mark of its
+/// own there, from behind the other.)
+#[test]
+fn surfaces_that_cross_are_marked_along_the_crossing_once() {
+    on_each_backend(|offscreen| {
+        let mut renderer = offscreen.renderer(W, H);
+        let mut settings = settings(false);
+        settings.edges.enabled = true;
+        settings.antialiasing = false;
+        // Two sheets crossing down the middle of the frame: the first is
+        // the nearer one on the left, the second on the right.
+        let sheets = [Vec3::new(0.8, 0.0, -0.3), Vec3::new(0.8, 0.0, 0.3)]
+            .map(|u| quad(Vec3::ZERO, u, Vec3::Y * 0.5, [0.6, 0.6, 0.6, 1.0]));
+        for solid in [0, 1] {
+            for objects in [[1, 2], [2, 1]] {
+                let mut frame = |opacity: f32| {
+                    let items = [0, 1].map(|i| {
+                        let opacity = if i == solid { opacity } else { 0.5 };
+                        (&sheets[i], 0.0, objects[i], opacity)
+                    });
+                    frame_of(offscreen, &mut renderer, &settings, &items)
+                };
+                let opaque = frame(1.0);
+                assert_eq!(
+                    differing(&frame(0.999), &opaque, 1),
+                    0,
+                    "sheet {solid} solid, objects {objects:?}"
+                );
+                // The crossing is drawn: the middle of the row through
+                // the middle of the frame is darker than either side.
+                let row = H / 2;
+                let level = |x: u32| pixel(&opaque, x, row)[1];
+                let darkest = (W / 2 - 2..=W / 2 + 2).map(level).min().unwrap();
+                assert!(
+                    darkest + 10 < level(W / 2 - 8).min(level(W / 2 + 8)),
+                    "sheet {solid} solid, objects {objects:?}: no line at the crossing"
+                );
+            }
+        }
+    });
+}
+
+/// An object's two surfaces close together (the walls of a thin shell)
+/// are not taken for one another. Where the far wall ends against an
+/// opaque part between the walls it is marked, though the near wall
+/// goes on over the part at the depth the far wall would nearly have:
+/// the frame is the one drawn with the near wall another object, when
+/// nothing can be taken for anything. And where the near wall ends and
+/// the far one goes on, neither is marked: so small a step within one
+/// object is no edge, in the opaque scene either.
+#[test]
+fn the_walls_of_a_thin_shell_are_told_apart() {
+    on_each_backend(|offscreen| {
+        let mut renderer = offscreen.renderer(W, H);
+        let mut settings = settings(false);
+        settings.edges.enabled = true;
+        settings.antialiasing = false;
+        let wall = quad(
+            Vec3::ZERO,
+            Vec3::X * 3.0,
+            Vec3::Y * 3.0,
+            [0.6, 0.6, 0.6, 1.0],
+        );
+        let half = quad(
+            Vec3::new(1.5, 0.0, 0.0),
+            Vec3::X * 1.5,
+            Vec3::Y * 3.0,
+            [0.6, 0.6, 0.6, 1.0],
+        );
+        // Walls 0.02 m apart, 3 m off: well inside the edge test's
+        // tolerance of 1.2 % of the distance.
+        let row = H / 2;
+        let middle = W / 2 - 3..=W / 2 + 3;
+
+        // A part over the right half of the frame, between the walls.
+        let mut frame = |near_object: u32| {
+            let items = [
+                (&wall, 0.02, near_object, 0.5),
+                (&wall, 0.0, 1, 0.5),
+                (&half, 0.01, 2, 1.0),
+            ];
+            frame_of(offscreen, &mut renderer, &settings, &items)
+        };
+        let apart = frame(3);
+        assert_eq!(differing(&frame(1), &apart, 1), 0);
+        let level = |x: u32| pixel(&apart, x, row)[1];
+        let darkest = middle.clone().map(level).min().unwrap();
+        assert!(
+            darkest + 10 < level(W / 2 - 8).min(level(W / 2 + 8)),
+            "no line at the part's edge"
+        );
+
+        // The near wall over the right half only, and no part.
+        let items = [(&half, 0.02, 1, 0.5), (&wall, 0.0, 1, 0.5)];
+        let ended = frame_of(offscreen, &mut renderer, &settings, &items);
+        let level = |x: u32| pixel(&ended, x, row)[1];
+        let (left, right) = (level(W / 2 - 8), level(W / 2 + 8));
+        assert!(left.abs_diff(right) > 10, "the near wall does not show");
+        for x in middle {
+            assert!(
+                level(x).abs_diff(left) <= 2 || level(x).abs_diff(right) <= 2,
+                "a line where the near wall ends: {} at {x}, between {left} and {right}",
+                level(x)
+            );
+        }
     });
 }
 
@@ -1080,6 +1196,60 @@ fn transparent_surfaces_in_the_same_place_are_both_drawn() {
     });
 }
 
+/// Two tilted surfaces in exactly the same place, one opaque and one
+/// just short of it, draw as both opaque do: the same one in front at
+/// every pixel. The opaque one's depth comes from the G-buffer's vertex
+/// entry and the other's from the layers' (the same arithmetic with an
+/// invariant position), and the rule for surfaces at one depth holds
+/// only where the two come to the same bits.
+#[test]
+fn tilted_surfaces_in_the_same_place_keep_one_in_front() {
+    on_each_backend(|offscreen| {
+        let mut renderer = offscreen.renderer(W, H);
+        let mut settings = settings(false);
+        settings.antialiasing = false;
+        let mut seen = 0;
+        for i in 0..40 {
+            // Any directions and places will do, so long as they are not
+            // round numbers.
+            let (a, b) = (0.37 + i as f32 * 0.173, 0.11 + i as f32 * 0.291);
+            let u = Vec3::new(a.cos(), a.sin() * b.cos(), a.sin() * b.sin()) * 0.61;
+            let v = Vec3::new(-a.sin() * 0.3, b.cos(), b.sin()).normalize() * 0.47;
+            let centre = Vec3::new(0.013 * i as f32 - 0.2, 0.07, 0.031 * i as f32 - 0.4);
+            let dark = quad(centre, u, v, [0.2, 0.2, 0.2, 1.0]);
+            let pale = quad(centre, u, v, [0.6, 0.6, 0.6, 1.0]);
+            let z = 0.123 + 0.017 * i as f32;
+            settings.edges.enabled = i % 2 == 0;
+            let mut frame = |dark_opacity: f32, pale_opacity: f32| {
+                frame_of(
+                    offscreen,
+                    &mut renderer,
+                    &settings,
+                    &[(&dark, z, 1, dark_opacity), (&pale, z, 2, pale_opacity)],
+                )
+            };
+            let opaque = frame(1.0, 1.0);
+            // Facing away, the sheets are not drawn at all.
+            let background = pixel(&opaque, 0, 0);
+            let covered = (0..W * H)
+                .filter(|i| pixel(&opaque, i % W, i / W) != background)
+                .count();
+            if covered < 200 {
+                continue;
+            }
+            seen += 1;
+            for (dark_opacity, pale_opacity) in [(0.999, 0.999), (0.999, 1.0), (1.0, 0.999)] {
+                assert_eq!(
+                    differing(&frame(dark_opacity, pale_opacity), &opaque, 1),
+                    0,
+                    "sheet {i}: dark at {dark_opacity}, pale at {pale_opacity}"
+                );
+            }
+        }
+        assert!(seen >= 10, "{seen} sheets faced the eye");
+    });
+}
+
 /// A pixel is drawn `transparency_layers` transparent surfaces deep,
 /// counted from the eye: the ones behind are left out.
 #[test]
@@ -1117,39 +1287,192 @@ fn transparent_surfaces_past_the_layer_limit_are_left_out_from_the_back() {
     });
 }
 
-/// A pick lands on the nearest surface, transparent or not, and a frame
-/// without transparent meshes is not picked through an earlier one's.
+/// A pick lands on the nearest surface that is opaque, or transparent
+/// and at least `pick_opacity` opaque: it passes through the fainter
+/// ones in front, however many, to that surface or to the opaque scene.
+/// A frame without transparent meshes is not picked through an earlier
+/// one's.
 #[test]
-fn a_pick_lands_on_a_transparent_surface() {
+fn a_pick_lands_on_the_nearest_surface_opaque_enough() {
     on_each_backend(|offscreen| {
         let mut renderer = offscreen.renderer(W, H);
         let far = quad(Vec3::ZERO, Vec3::X * 0.8, Vec3::Y * 0.8, [1.0; 4]);
         let near = quad(Vec3::ZERO, Vec3::X * 0.2, Vec3::Y * 0.2, [1.0; 4]);
-        let mut pick = |near_at: Option<f32>, pixel: (u32, u32)| {
+        // `sheets`: how far up the view axis, the object and the opacity
+        // of small sheets over the middle of an opaque one, object 7.
+        let mut pick = |sheets: &[(f32, u32, f32)], pick_opacity: f32, pixel: (u32, u32)| {
+            let mut settings = settings(false);
+            settings.pick_opacity = pick_opacity;
+            settings.transparency_layers = 3;
             submit_at(offscreen, &mut renderer, &far, -0.5, 7, 1.0);
             // Too faint to show in the frame, so not there to be picked.
-            submit_at(offscreen, &mut renderer, &near, 0.6, 11, 0.0001);
-            if let Some(z) = near_at {
-                submit_at(offscreen, &mut renderer, &near, z, 9, 0.3);
+            submit_at(offscreen, &mut renderer, &near, 0.9, 11, 0.0001);
+            for (z, object, opacity) in sheets {
+                submit_at(offscreen, &mut renderer, &near, *z, *object, *opacity);
             }
             offscreen
-                .render_rgba(&mut renderer, &view(), &settings(false))
+                .render_rgba(&mut renderer, &view(), &settings)
                 .unwrap();
             let pick = offscreen.pick(&mut renderer, pixel).expect("a pick");
-            (pick.object, pick.world.expect("a surface").z)
+            (
+                pick.object.0,
+                (pick.world.expect("a surface").z * 1e3).round() / 1e3,
+            )
         };
         let centre = (W / 2, H / 2);
-        let (object, z) = pick(Some(0.3), centre);
-        assert_eq!(object, ObjectId(9));
-        assert!((z - 0.3).abs() < 1e-3, "{z}");
+        let by_default = RenderSettings::default().pick_opacity;
+        assert_eq!(pick(&[(0.3, 9, 0.3)], by_default, centre), (9, 0.3));
         // Beside the transparent mesh, and behind the opaque one.
-        let (object, z) = pick(Some(0.3), (W / 2 + 20, H / 2));
-        assert_eq!(object, ObjectId(7));
-        assert!((z + 0.5).abs() < 1e-3, "{z}");
-        assert_eq!(pick(Some(-0.8), centre).0, ObjectId(7));
-        // The frame after it is gone.
-        assert_eq!(pick(Some(0.3), centre).0, ObjectId(9));
-        assert_eq!(pick(None, centre).0, ObjectId(7));
+        assert_eq!(
+            pick(&[(0.3, 9, 0.3)], by_default, (W / 2 + 20, H / 2)),
+            (7, -0.5)
+        );
+        assert_eq!(pick(&[(-0.8, 9, 0.3)], by_default, centre), (7, -0.5));
+        // Through one fainter sheet in front of it, and through two.
+        let one = [(0.3, 9, 0.3), (0.6, 12, 0.1)];
+        let two = [(0.3, 9, 0.3), (0.6, 12, 0.1), (0.7, 13, 0.2)];
+        assert_eq!(pick(&one, by_default, centre), (9, 0.3));
+        assert_eq!(pick(&two, by_default, centre), (9, 0.3));
+        // Through them all to the opaque scene, when none is opaque
+        // enough.
+        assert_eq!(
+            pick(&[(0.3, 9, 0.2), (0.6, 12, 0.1)], by_default, centre),
+            (7, -0.5)
+        );
+        // What is opaque enough is the frame's setting.
+        assert_eq!(pick(&one, 0.05, centre), (12, 0.6));
+        assert_eq!(pick(&one, 0.3, centre), (9, 0.3));
+        assert_eq!(pick(&one, 0.5, centre), (7, -0.5));
+        // A mesh too faint to be drawn is not picked at any setting.
+        assert_eq!(pick(&[], 0.0, centre), (7, -0.5));
+        // The frame after the transparent meshes are gone.
+        assert_eq!(pick(&[(0.3, 9, 0.3)], by_default, centre), (9, 0.3));
+        assert_eq!(pick(&[], by_default, centre), (7, -0.5));
+    });
+}
+
+/// Two transparent surfaces a hair apart are both drawn, wherever the
+/// pair lies among the depth buffer's steps: the nearer in front, or
+/// the higher object where the two come to one depth. The layers' depth
+/// test must rank two fragments as the peel's comparison of their
+/// 32-bit depths does: where the test called a tie that the comparison
+/// did not, and kept the farther, the nearer was peeled away as drawn
+/// already and never was.
+///
+/// This fails with a 24-bit depth target for the layers only on an
+/// adapter whose 24-bit buffer is one: of those tried, Mesa's software
+/// rasteriser (`LIBGL_ALWAYS_SOFTWARE=1`), and neither GPU.
+#[test]
+fn transparent_surfaces_a_hair_apart_are_both_drawn() {
+    on_each_backend(|offscreen| {
+        let mut renderer = offscreen.renderer(W, H);
+        let mut settings = settings(false);
+        settings.antialiasing = false;
+        let dark = quad(
+            Vec3::ZERO,
+            Vec3::X * 0.3,
+            Vec3::Y * 0.3,
+            [0.2, 0.2, 0.2, 1.0],
+        );
+        let pale = quad(
+            Vec3::ZERO,
+            Vec3::X * 0.3,
+            Vec3::Y * 0.3,
+            [0.6, 0.6, 0.6, 1.0],
+        );
+        // Close behind the near plane, where depths are small numbers
+        // and 32-bit floats finer than a 24-bit buffer's steps (one of
+        // which is about 1e-7 m here).
+        let view = CameraView::look_at(
+            Vec3::new(0.0, 0.0, 2.1),
+            Vec3::ZERO,
+            Vec3::Y,
+            0.8,
+            W as f32 / H as f32,
+            2.0,
+            10.0,
+        );
+        let background = [BACKGROUND[0], BACKGROUND[1], BACKGROUND[2]];
+        let (d, p) = (
+            lit(&settings, 0.2, Vec3::Z, Vec3::Z),
+            lit(&settings, 0.6, Vec3::Z, Vec3::Z),
+        );
+        let dark_in_front = over(d, 0.5, over(p, 0.5, background)).map(srgb_byte);
+        let pale_in_front = over(p, 0.5, over(d, 0.5, background)).map(srgb_byte);
+        let mut centre = |base: f32, gap: f32| {
+            // The dark sheet is the nearer, and the lower object: drawn
+            // first, and behind if the two tie.
+            submit_at(offscreen, &mut renderer, &dark, base + gap, 1, 0.5);
+            submit_at(offscreen, &mut renderer, &pale, base, 2, 0.5);
+            let frame = offscreen
+                .render_rgba(&mut renderer, &view, &settings)
+                .unwrap()
+                .0;
+            pixel(&frame, W / 2, H / 2)
+        };
+        let mut in_order = 0;
+        for step in 0..64 {
+            let base = step as f32 * 1.3e-8;
+            for gap in [2e-8, 4e-8, 8e-8] {
+                let centre = centre(base, gap);
+                let right = close(centre, dark_in_front, 3.0);
+                in_order += right as u32;
+                assert!(
+                    right || close(centre, pale_in_front, 3.0),
+                    "{gap} apart at {base}: {centre:?}"
+                );
+            }
+        }
+        // Most of them are apart in 32 bits.
+        assert!(in_order > 64, "{in_order} in order");
+        let apart = centre(0.0, 1e-5);
+        assert!(close(apart, dark_in_front, 3.0), "{apart:?}");
+    });
+}
+
+/// The layers' targets are made by the first frame with a transparent
+/// mesh, kept through a short run of frames without one, and given back
+/// by the `LAYERS_KEPT_FRAMES`th of them; the next transparent frame
+/// makes them again and draws what the first did.
+#[test]
+fn the_layers_targets_are_given_back() {
+    on_each_backend(|offscreen| {
+        let mut renderer = offscreen.renderer(W, H);
+        let settings = settings(false);
+        let sheet = quad(Vec3::ZERO, Vec3::X * 0.5, Vec3::Y * 0.5, [1.0; 4]);
+        // An opaque sheet, object 1, with or without a transparent one,
+        // object 2, in front of it.
+        let frame = |renderer: &mut Renderer, transparent: bool| {
+            let items = [(&sheet, 0.0, 1, 1.0), (&sheet, 0.3, 2, 0.5)];
+            let items = &items[..1 + transparent as usize];
+            frame_of(offscreen, renderer, &settings, items)
+        };
+        frame(&mut renderer, false);
+        assert!(renderer.layers.is_none(), "before any transparent mesh");
+        let first = frame(&mut renderer, true);
+        assert!(renderer.layers.is_some());
+        let picked = offscreen.pick(&mut renderer, (W / 2, H / 2));
+        assert_eq!(picked.map(|pick| pick.object), Some(ObjectId(2)));
+        for _ in 1..crate::LAYERS_KEPT_FRAMES {
+            frame(&mut renderer, false);
+        }
+        assert!(renderer.layers.is_some(), "kept through a short run");
+        // The layers still stand, and hold the transparent sheet: a pick
+        // of a frame that did not draw it does not read them.
+        let picked = offscreen.pick(&mut renderer, (W / 2, H / 2));
+        assert_eq!(picked.map(|pick| pick.object), Some(ObjectId(1)));
+        // A transparent frame starts the count again.
+        frame(&mut renderer, true);
+        for _ in 1..crate::LAYERS_KEPT_FRAMES {
+            frame(&mut renderer, false);
+        }
+        assert!(renderer.layers.is_some(), "counted from the last one");
+        frame(&mut renderer, false);
+        assert!(renderer.layers.is_none(), "given back");
+        let picked = offscreen.pick(&mut renderer, (W / 2, H / 2));
+        assert_eq!(picked.map(|pick| pick.object), Some(ObjectId(1)));
+        assert!(frame(&mut renderer, true) == first);
+        assert!(renderer.layers.is_some());
     });
 }
 
@@ -2077,6 +2400,303 @@ fn surfel_discs_draw_like_the_surface_they_sample() {
     });
 }
 
+/// Writes an RGBA frame as a binary PPM.
+fn write_ppm(path: impl AsRef<std::path::Path>, rgba: &[u8], w: u32, h: u32) {
+    let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
+    ppm.extend(rgba.chunks_exact(4).flat_map(|px| [px[0], px[1], px[2]]));
+    std::fs::write(path, ppm).unwrap();
+}
+
+/// A reproducible stream of numbers (xorshift), so that a randomised
+/// scene is the same scene on every run and every machine.
+struct Random(u32);
+
+impl Random {
+    /// The next number, in 0..1.
+    fn next(&mut self) -> f32 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 17;
+        self.0 ^= self.0 << 5;
+        (self.0 >> 8) as f32 / (1u32 << 24) as f32
+    }
+
+    fn between(&mut self, low: f32, high: f32) -> f32 {
+        low + (high - low) * self.next()
+    }
+
+    /// A direction, each component between -1 and 1 before it is scaled
+    /// to length 1.
+    fn direction(&mut self) -> Vec3 {
+        loop {
+            let v = Vec3::new(
+                self.between(-1.0, 1.0),
+                self.between(-1.0, 1.0),
+                self.between(-1.0, 1.0),
+            );
+            if v.length() > 0.1 {
+                return v.normalize();
+            }
+        }
+    }
+}
+
+/// A flat-shaded box about the origin.
+fn cuboid(half: Vec3, color: [f32; 4]) -> MeshData {
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    let axes = [Vec3::X, Vec3::Y, Vec3::Z];
+    for axis in 0..3 {
+        for sign in [1.0, -1.0] {
+            // Tangents in the order that faces the side outward.
+            let (u, v) = match sign > 0.0 {
+                true => ((axis + 1) % 3, (axis + 2) % 3),
+                false => ((axis + 2) % 3, (axis + 1) % 3),
+            };
+            let side = quad(
+                axes[axis] * half[axis] * sign,
+                axes[u] * half[u],
+                axes[v] * half[v],
+                color,
+            );
+            let first = vertices.len() as u32;
+            indices.extend(side.indices.unwrap().iter().map(|i| first + i));
+            vertices.extend(side.vertices);
+        }
+    }
+    MeshData {
+        vertices,
+        indices: Some(indices),
+        texture: None,
+    }
+}
+
+/// `mesh` and its inside: every triangle a second time, facing the other
+/// way. Back faces are not drawn, so this is a mesh whose far walls
+/// show.
+fn double_sided(mesh: &MeshData) -> MeshData {
+    let count = mesh.vertices.len() as u32;
+    let mut vertices = mesh.vertices.clone();
+    vertices.extend(mesh.vertices.iter().map(|vertex| MeshVertex {
+        normal: vertex.normal.map(|n| -n),
+        ..*vertex
+    }));
+    let outside = mesh.indices.clone().unwrap();
+    let mut indices = outside.clone();
+    indices.extend(
+        outside
+            .chunks_exact(3)
+            .flat_map(|t| [t[0] + count, t[2] + count, t[1] + count]),
+    );
+    MeshData {
+        vertices,
+        indices: Some(indices),
+        texture: None,
+    }
+}
+
+/// How far the randomised scenes are from what transparency promises of
+/// its edge lines, counted in scenes and pixels; the figures
+/// RENDERING_ARCHITECTURE.md quotes ("Transparent meshes", "Edge
+/// lines"). The frame tests above hold each promise on a scene built to
+/// show it; this measures them on scenes nobody chose: two or three
+/// boxes and spheres about the origin, turned and placed at random so
+/// that most pass through each other, one in three with its inside
+/// drawn, seen from a random direction. Three comparisons, each of two
+/// frames that should be the same picture:
+///
+/// - **opaque among opaque**: one mesh of three just short of opaque
+///   (0.999, which is stored as opacity 1), against all three opaque;
+/// - **behind a transparent mesh**: a mesh just short of opaque behind
+///   or through a half-transparent one, against the same mesh opaque;
+/// - **a faint mesh**: two meshes with a third too faint to see (the
+///   least opacity drawn) among them, against the two alone.
+///
+/// The first is asserted, since it has no exceptions. The other two are
+/// printed, a line an adapter:
+/// `cargo test -p volumetric_renderer randomised -- --ignored --nocapture`.
+/// With `VOLUMETRIC_RANDOM_DUMP` naming a folder, the two frames of
+/// every case that differs are written there, and a third with the
+/// pixels that differ in red.
+#[test]
+#[ignore]
+fn randomised_scenes_keep_their_edge_lines() {
+    const SCENES: u32 = 60;
+    on_each_backend(|offscreen| {
+        let mut renderer = offscreen.renderer(W, H);
+        let mut settings = settings(false);
+        settings.edges.enabled = true;
+        settings.antialiasing = false;
+        // Deep enough that no surface is left out: the layer limit is
+        // not what is measured.
+        settings.transparency_layers = 8;
+        // Just over the least opacity drawn: a surface of it changes a
+        // pixel by half a level at most, so what differs by more than a
+        // level is a mark and not the mesh.
+        let faint = crate::MIN_OPACITY * 1.01;
+        let dump = std::env::var_os("VOLUMETRIC_RANDOM_DUMP").map(std::path::PathBuf::from);
+        let adapter = offscreen
+            .adapter_name()
+            .replace(|c: char| !c.is_alphanumeric(), "_");
+        let adapter = &adapter[..adapter.len().min(12)];
+
+        // Per comparison: cases compared, cases that differ, pixels that
+        // differ in all, and in the worst case.
+        let mut tally = [[0usize; 4]; 6];
+        let mut worst_scene = [0u32; 6];
+        for scene in 0..SCENES {
+            let mut random = Random(0x9E37_79B9 ^ (scene + 1).wrapping_mul(0x85EB_CA6B));
+            let solids: Vec<_> = (0..3)
+                .map(|_| {
+                    let mesh = if random.next() < 0.5 {
+                        cuboid(
+                            Vec3::new(
+                                random.between(0.15, 0.6),
+                                random.between(0.15, 0.6),
+                                random.between(0.15, 0.6),
+                            ),
+                            [random.between(0.3, 1.0); 4],
+                        )
+                    } else {
+                        sphere(Vec3::ZERO, random.between(0.2, 0.55))
+                    };
+                    let inside = random.next() < 1.0 / 3.0;
+                    let mesh = if inside { double_sided(&mesh) } else { mesh };
+                    let transform = Mat4::from_rotation_translation(
+                        glam::Quat::from_axis_angle(
+                            random.direction(),
+                            random.between(0.0, std::f32::consts::TAU),
+                        ),
+                        random.direction() * random.between(0.0, 0.6),
+                    );
+                    let mesh =
+                        renderer.create_retained_mesh(offscreen.device(), offscreen.queue(), &mesh);
+                    (mesh, transform, inside)
+                })
+                .collect();
+            let eye = random.direction() * 3.0;
+            let up = if eye.normalize().z.abs() > 0.9 {
+                Vec3::Y
+            } else {
+                Vec3::Z
+            };
+            let view =
+                CameraView::look_at(eye, Vec3::ZERO, up, 0.8, W as f32 / H as f32, 0.1, 10.0);
+            // The frame of some of the solids: which, as what object,
+            // how opaque.
+            let mut frame = |items: &[(usize, u32, f32)]| {
+                for (solid, object, opacity) in items {
+                    let (mesh, transform, _) = &solids[*solid];
+                    renderer.submit_retained_mesh(
+                        mesh,
+                        *transform,
+                        ObjectId(*object),
+                        MaterialId(0),
+                        *opacity,
+                    );
+                }
+                offscreen
+                    .render_rgba(&mut renderer, &view, &settings)
+                    .unwrap()
+                    .0
+            };
+            let mut compare = |which: usize, of: &[usize], case: &str, a: &[u8], b: &[u8]| {
+                let pixels = differing(a, b, 1);
+                let which = which + 3 * of.iter().any(|&solid| solids[solid].2) as usize;
+                if let (Some(dump), true) = (&dump, pixels > 0) {
+                    let marked: Vec<u8> = a
+                        .chunks_exact(4)
+                        .zip(b.chunks_exact(4))
+                        .flat_map(|(a, b)| {
+                            if (0..4).any(|c| a[c].abs_diff(b[c]) > 1) {
+                                [255, 0, 0, 255]
+                            } else {
+                                [a[0] / 2 + 64, a[1] / 2 + 64, a[2] / 2 + 64, 255]
+                            }
+                        })
+                        .collect();
+                    let name = format!("{adapter}_{which}_{scene:02}_{case}_{pixels}px");
+                    for (frame, kind) in [(a, "a"), (b, "b"), (&marked[..], "differ")] {
+                        write_ppm(dump.join(format!("{name}_{kind}.ppm")), frame, W, H);
+                    }
+                }
+                let tally = &mut tally[which];
+                tally[0] += 1;
+                tally[1] += (pixels > 0) as usize;
+                tally[2] += pixels;
+                if pixels > tally[3] {
+                    tally[3] = pixels;
+                    worst_scene[which] = scene;
+                }
+            };
+
+            let all_opaque = frame(&[(0, 1, 1.0), (1, 2, 1.0), (2, 3, 1.0)]);
+            for nearly in 0..3 {
+                let items: Vec<_> = (0..3)
+                    .map(|i| (i, i as u32 + 1, if i == nearly { 0.999 } else { 1.0 }))
+                    .collect();
+                compare(
+                    0,
+                    &[0, 1, 2],
+                    &format!("mesh{nearly}"),
+                    &frame(&items),
+                    &all_opaque,
+                );
+            }
+
+            for (cover, behind) in [(0, 1), (1, 0)] {
+                let with = |opacity: f32| [(cover, 1, 0.5), (behind, 2, opacity)];
+                compare(
+                    1,
+                    &[0, 1],
+                    &format!("cover{cover}"),
+                    &frame(&with(0.999)),
+                    &frame(&with(1.0)),
+                );
+            }
+
+            for other in [1.0, 0.5] {
+                let alone = frame(&[(0, 2, 1.0), (1, 3, other)]);
+                // The faint mesh as the highest object and as the lowest.
+                for object in [4, 1] {
+                    let with = frame(&[(0, 2, 1.0), (1, 3, other), (2, object, faint)]);
+                    compare(
+                        2,
+                        &[0, 1, 2],
+                        &format!("other{other}_faint{object}"),
+                        &with,
+                        &alone,
+                    );
+                }
+            }
+        }
+        for (name, (tally, scene)) in [
+            "opaque among opaque",
+            "behind a transparent mesh",
+            "a faint mesh",
+            "opaque among opaque, insides drawn",
+            "behind a transparent mesh, insides drawn",
+            "a faint mesh, insides drawn",
+        ]
+        .iter()
+        .zip(tally.iter().zip(worst_scene))
+        {
+            eprintln!(
+                "  {name}: {} of {} cases differ, {} pixels in all, {} at most (scene {scene}), of {} a frame",
+                tally[1],
+                tally[0],
+                tally[2],
+                tally[3],
+                W * H,
+            );
+        }
+        assert_eq!(
+            tally[0][1] + tally[3][1],
+            0,
+            "a mesh just short of opaque shows"
+        );
+    });
+}
+
 /// Writes the placeholder test scene's frame as a binary PPM to the path
 /// in `VOLUMETRIC_FRAME_DUMP`, for looking at what the frame draws:
 /// `VOLUMETRIC_FRAME_DUMP=/tmp/frame.ppm cargo test -p volumetric_renderer dump_the_test_scene -- --ignored`.
@@ -2189,7 +2809,5 @@ fn dump_the_test_scene() {
         .render_rgba(&mut renderer, &view, &settings)
         .unwrap();
     eprintln!("grid spacing: {:?}", info.grid_spacing);
-    let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
-    ppm.extend(rgba.chunks_exact(4).flat_map(|px| [px[0], px[1], px[2]]));
-    std::fs::write(path, ppm).unwrap();
+    write_ppm(&path, &rgba, w, h);
 }

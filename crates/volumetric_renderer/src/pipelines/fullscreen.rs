@@ -324,7 +324,8 @@ pub(crate) fn resolve_pass(
     )
 }
 
-/// How many other layers' surface targets a layer's resolve reads.
+/// How many other layers' surface targets a layer's resolve is bound to;
+/// it reads as many of them as the frame has other layers.
 pub(crate) const OTHER_LAYERS: usize = 7;
 
 /// The resolve pass for one layer of the transparent meshes
@@ -409,7 +410,8 @@ pub(crate) fn pick_pass(device: &wgpu::Device) -> FullscreenPass {
         "pick_pass",
         include_str!("../shaders/pick.wgsl"),
         "fs_pick",
-        &[wgpu::TextureSampleType::Uint, wgpu::TextureSampleType::Uint],
+        // The opaque scene's surface target and every layer's.
+        &[wgpu::TextureSampleType::Uint; 1 + crate::LayerBuffers::MAX_LAYERS as usize],
         false,
         crate::pick::PICK_FORMAT,
         None,
