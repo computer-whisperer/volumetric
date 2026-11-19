@@ -275,7 +275,9 @@ impl ConfigValue {
         match self {
             ConfigValue::Bool(b) => b.to_string(),
             ConfigValue::Int(i) => i.to_string(),
-            ConfigValue::Float(f) => format_float(*f),
+            // The shortest text that reads back as the same float, with no
+            // exponent and no trailing `.0` (`1`, `1.5`, `0.0000001`).
+            ConfigValue::Float(f) => f.to_string(),
             ConfigValue::Text(t) => t.clone(),
             ConfigValue::List(_) | ConfigValue::Record(_) => self.to_json_text(),
         }
@@ -431,18 +433,6 @@ impl<'de> serde::Deserialize<'de> for ConfigValue {
             }
         }
         d.deserialize_any(Visitor)
-    }
-}
-
-/// Format a float without a trailing `.0`-free integer looking odd but also
-/// without scientific notation surprises. Integers keep a single decimal so the
-/// field still reads as a float (`1` -> `1`, `1.5` -> `1.5`).
-fn format_float(f: f64) -> String {
-    if f == f.trunc() && f.is_finite() {
-        // Show integers plainly; the field is still parsed back as f64.
-        format!("{}", f as i64)
-    } else {
-        format!("{f}")
     }
 }
 
@@ -1381,6 +1371,26 @@ mod tests {
         assert_eq!(
             ConfigValue::parse(&ty, &value.to_display_string()),
             Some(value)
+        );
+    }
+
+    #[test]
+    fn a_float_field_shows_text_that_reads_back_as_the_float() {
+        // Whole numbers at and past 2^63 once went through `i64` and all
+        // showed as 9223372036854775807.
+        for f in [1.0, 1.5, -2.0, 1e-7, 1e20, 1e30, -1e19, f64::MAX, 5e-324] {
+            let text = ConfigValue::Float(f).to_display_string();
+            assert!(!text.contains('e'), "{f:e} shows as {text}");
+            assert_eq!(
+                ConfigValue::parse(&ConfigFieldType::Float, &text),
+                Some(ConfigValue::Float(f)),
+                "{f:e} shows as {text}"
+            );
+        }
+        assert_eq!(ConfigValue::Float(1.0).to_display_string(), "1");
+        assert_eq!(
+            ConfigValue::Float(1e20).to_display_string(),
+            "100000000000000000000"
         );
     }
 

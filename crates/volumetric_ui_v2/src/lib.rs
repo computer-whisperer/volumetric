@@ -7582,13 +7582,7 @@ fn config_field_label(field: &ConfigField) -> String {
     if field.optional {
         label.push_str(" (optional)");
     }
-    let fmt = |n: f64| {
-        if n == n.trunc() {
-            format!("{}", n as i64)
-        } else {
-            format!("{n}")
-        }
-    };
+    let fmt = |n: f64| n.to_string();
     match (field.min, field.max) {
         (Some(lo), Some(hi)) => label.push_str(&format!(" [{} .. {}]", fmt(lo), fmt(hi))),
         (Some(lo), None) => label.push_str(&format!(" [\u{2265} {}]", fmt(lo))),
