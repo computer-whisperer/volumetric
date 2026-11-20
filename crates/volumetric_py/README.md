@@ -54,7 +54,9 @@ p.save("posts.vproj")
   value coerced by the slot's declared type: a dict for a CBOR
   configuration or an F64Map, a list for a VecF64, as the CLI's `json:`
   form. Errors name the slot. `v.operator_info(name)` shows the slots
-  (with the configuration's CDDL), outputs and docs.
+  (with the configuration's CDDL, and for a Subspace slot that declares
+  what it takes, `subspace`: its `ambient`, `min_rank` and `max_rank`),
+  outputs and docs.
 - `.add_views(viewset, id="views")` imports a view set for look-through
   and `render(through=)`; `.set_config(step, {field: value})` merges
   schema-checked values into a step's configuration (`step` is an index or

@@ -55,6 +55,7 @@ pub extern "C" fn get_metadata() -> i64 {
         .to_string(),
         inputs: vec![OperatorMetadataInput::F64Map],
         variadic_input: Some(0),
+        input_constraints: vec![],
         input_names: vec!["Map".to_string()],
         outputs: vec![OperatorMetadataOutput::F64Map],
         output_names: vec![],

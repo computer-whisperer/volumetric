@@ -89,10 +89,13 @@ use volumetric_abi::host::{
     input_model_bounds, input_model_dimensions, input_model_sample, post_output, read_input,
     report_error,
 };
-use volumetric_abi::subspace::{Subspace, decode_subspace};
+use volumetric_abi::subspace::{Subspace, SubspaceShape, decode_subspace};
 use volumetric_abi::{
-    OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput, is_occupied,
+    InputConstraint, OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput, is_occupied,
 };
+
+/// What the bed input takes: a plane in the model's 3-space.
+const BED_SHAPE: SubspaceShape = SubspaceShape::rank(2).in_space(3);
 
 /// Prebuilt `brim_model_template` module (see that crate's docs for the
 /// regeneration command).
@@ -173,18 +176,9 @@ impl BedPlane {
     /// bounding-box face plane works regardless of its normal's sign; a
     /// center exactly on the plane keeps the subspace's own normal).
     fn from_subspace(subspace: &Subspace, bounds: &[f64]) -> Result<Self, String> {
-        if subspace.dimensions != 3 {
-            return Err(format!(
-                "the bed subspace must live in 3-space, got {}-space",
-                subspace.dimensions
-            ));
-        }
-        if subspace.rank() != 2 {
-            return Err(format!(
-                "the bed subspace must be a plane (rank 2), got rank {}",
-                subspace.rank()
-            ));
-        }
+        BED_SHAPE
+            .check(subspace)
+            .map_err(|e| format!("the bed subspace: {e}"))?;
         let vec3 = |v: &[f64]| -> [f64; 3] { [v[0], v[1], v[2]] };
         let origin = vec3(&subspace.origin);
         let normal = vec3(&subspace.normal().expect("rank 2 in 3-space has a normal"));
@@ -1003,6 +997,11 @@ pub extern "C" fn get_metadata() -> i64 {
                 OperatorMetadataInput::Subspace,
             ],
             variadic_input: None,
+            input_constraints: vec![
+                InputConstraint::default(),
+                InputConstraint::default(),
+                InputConstraint::subspace(BED_SHAPE),
+            ],
             input_names: vec![
                 "Model".to_string(),
                 "Config".to_string(),

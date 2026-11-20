@@ -148,7 +148,10 @@ fn channels_pass_through_the_slice() {
 fn degenerate_slices_are_rejected() {
     let point = Subspace::point(vec![0.0, 0.0, 0.0]);
     let err = run_slice("simple_sphere_model", &point).expect_err("rank 0 must fail");
-    assert!(err.contains("point"), "unexpected error: {err}");
+    assert!(
+        err.contains("expected rank 1 or more, got point in 3-space"),
+        "unexpected error: {err}"
+    );
 
     let flat = Subspace::axis_aligned(vec![0.0, 0.0], &[0]).unwrap();
     let err = run_slice("simple_sphere_model", &flat).expect_err("2-space vs 3D must fail");

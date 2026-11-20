@@ -15,8 +15,10 @@
 
 use volumetric_abi::host::{input_count, post_output, read_input, report_error};
 use volumetric_abi::mechanism::{Axis, Drive, Joint, JointKind, Mechanism, encode_mechanism};
-use volumetric_abi::subspace::decode_subspace;
-use volumetric_abi::{OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput};
+use volumetric_abi::subspace::{SubspaceShape, decode_subspace};
+use volumetric_abi::{
+    InputConstraint, OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput,
+};
 
 #[derive(Clone, Debug, serde::Deserialize)]
 struct AxisConfig {
@@ -64,6 +66,10 @@ struct MechanismConfig {
     joints: Vec<JointConfig>,
 }
 
+/// What an axis input takes: anything in 3-space with a first basis vector
+/// to turn or slide along.
+const AXIS_SHAPE: SubspaceShape = SubspaceShape::rank_at_least(1).in_space(3);
+
 /// The axis a routed Subspace supplies: a line's origin and direction, or
 /// a frame's origin and first basis vector.
 fn axis_of_subspace(bytes: &[u8], slot: usize) -> Result<Axis, String> {
@@ -71,13 +77,9 @@ fn axis_of_subspace(bytes: &[u8], slot: usize) -> Result<Axis, String> {
         return Err(format!("axis input {slot} is not wired"));
     }
     let subspace = decode_subspace(bytes).map_err(|e| format!("axis input {slot}: {e}"))?;
-    if subspace.ambient() != 3 || subspace.rank() < 1 {
-        return Err(format!(
-            "axis input {slot}: need a line or frame in 3-space, got rank {} in {}-space",
-            subspace.rank(),
-            subspace.ambient()
-        ));
-    }
+    AXIS_SHAPE
+        .check(&subspace)
+        .map_err(|e| format!("axis input {slot}: {e}"))?;
     let d = subspace.basis_vector(0);
     Ok(Axis {
         origin: [subspace.origin[0], subspace.origin[1], subspace.origin[2]],
@@ -182,6 +184,10 @@ pub extern "C" fn get_metadata() -> i64 {
                 OperatorMetadataInput::Subspace,
             ],
             variadic_input: Some(1),
+            input_constraints: vec![
+                InputConstraint::default(),
+                InputConstraint::subspace(AXIS_SHAPE),
+            ],
             input_names: vec!["Config".to_string(), "Axes".to_string()],
             outputs: vec![OperatorMetadataOutput::Mechanism],
             output_names: vec!["mechanism".to_string()],

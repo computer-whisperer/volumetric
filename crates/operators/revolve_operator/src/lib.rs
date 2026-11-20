@@ -404,6 +404,7 @@ pub extern "C" fn get_metadata() -> i64 {
             OperatorMetadataInput::Subspace,
         ],
         variadic_input: None,
+        input_constraints: vec![],
         input_names: vec!["Profile".to_string(), "Axis".to_string()],
         outputs: vec![OperatorMetadataOutput::ModelWASM],
         output_names: vec![],

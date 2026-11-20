@@ -30,11 +30,13 @@ use volumetric_abi::fea::decode_fea_mesh;
 use volumetric_abi::fea::{FeaMesh, NORMAL_FIELD_NAME};
 #[cfg(target_arch = "wasm32")]
 use volumetric_abi::host::{post_output, post_warning, read_input, report_error};
-use volumetric_abi::subspace::Subspace;
+use volumetric_abi::subspace::{Subspace, SubspaceShape};
 #[cfg(target_arch = "wasm32")]
 use volumetric_abi::subspace::{decode_subspace, encode_subspace};
 #[cfg(target_arch = "wasm32")]
-use volumetric_abi::{OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput};
+use volumetric_abi::{
+    InputConstraint, OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput,
+};
 
 /// Points scored per RANSAC hypothesis; larger clouds are strided down
 /// to this many for the search, then every point counts for the refine.
@@ -438,13 +440,15 @@ enum SeedRole {
     Along(Vec3),
 }
 
+/// What the seed input takes, whatever is being fitted: a point, a line or
+/// a plane in the cloud's 3-space. Which of them suits a given `kind` is
+/// [`seed_role`]'s to say.
+const SEED_SHAPE: SubspaceShape = SubspaceShape::rank_at_most(2).in_space(3);
+
 fn seed_role(seed: &Subspace, kind: Kind) -> Result<SeedRole, String> {
-    if seed.ambient() != 3 {
-        return Err(format!(
-            "the seed lives in {}-space; the cloud is 3D",
-            seed.ambient()
-        ));
-    }
+    SEED_SHAPE
+        .check(seed)
+        .map_err(|e| format!("the seed: {e}"))?;
     let origin = [seed.origin[0], seed.origin[1], seed.origin[2]];
     let axis = |i: usize| {
         let b = seed.basis_vector(i);
@@ -875,6 +879,10 @@ pub extern "C" fn get_metadata() -> i64 {
                 OperatorMetadataInput::CBORConfiguration(schema),
             ],
             variadic_input: None,
+            input_constraints: vec![
+                InputConstraint::default(),
+                InputConstraint::subspace(SEED_SHAPE),
+            ],
             input_names: vec![
                 "Cloud".to_string(),
                 "Seed (optional)".to_string(),

@@ -140,6 +140,7 @@ pub extern "C" fn get_metadata() -> i64 {
                 OperatorMetadataInput::Subspace,
             ],
             variadic_input: Some(1),
+            input_constraints: vec![],
             input_names: vec!["Config".to_string(), "Subspace".to_string()],
             outputs: vec![OperatorMetadataOutput::Subspace],
             output_names: vec![],

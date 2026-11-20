@@ -261,4 +261,12 @@ fn a_seed_line_fits_a_cylinder_without_normals_and_bad_seeds_are_named() {
     let plane = Subspace::axis_aligned(vec![0.0; 3], &[0, 1]).unwrap();
     let err = run(&plane).unwrap_err();
     assert!(err.contains("rank-2 seed"), "{err}");
+
+    // A seed no kind of fit takes is refused by the shape the slot declares.
+    let frame = Subspace::axis_aligned(vec![0.0; 3], &[0, 1, 2]).unwrap();
+    let err = run(&frame).unwrap_err();
+    assert!(
+        err.contains("the seed: expected rank 0 to 2 in 3-space, got frame in 3-space"),
+        "{err}"
+    );
 }

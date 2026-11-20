@@ -195,15 +195,32 @@ struct OperatorMetadataJson {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum InputInfo {
     ModelWasm,
-    CborConfiguration { cddl: String },
-    LuaSource { template: String },
-    WgslSource { template: String },
+    CborConfiguration {
+        cddl: String,
+    },
+    LuaSource {
+        template: String,
+    },
+    WgslSource {
+        template: String,
+    },
     F64Map,
-    VecF64 { dimension: usize },
+    VecF64 {
+        dimension: usize,
+    },
     Blob,
     FeaMesh,
     TriMesh,
-    Subspace,
+    /// The bounds are the ones the operator declares for the slot; one it
+    /// leaves open is left out.
+    Subspace {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ambient: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        min_rank: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max_rank: Option<u32>,
+    },
     ViewSet,
     Splat,
     Mechanism,
@@ -250,7 +267,8 @@ fn metadata_to_json(meta: &OperatorMetadata) -> OperatorMetadataJson {
         inputs: meta
             .inputs
             .iter()
-            .map(|i| match i {
+            .enumerate()
+            .map(|(slot, i)| match i {
                 OperatorMetadataInput::ModelWASM => InputInfo::ModelWasm,
                 OperatorMetadataInput::CBORConfiguration(cddl) => {
                     InputInfo::CborConfiguration { cddl: cddl.clone() }
@@ -266,7 +284,14 @@ fn metadata_to_json(meta: &OperatorMetadata) -> OperatorMetadataJson {
                 OperatorMetadataInput::Blob => InputInfo::Blob,
                 OperatorMetadataInput::FeaMesh => InputInfo::FeaMesh,
                 OperatorMetadataInput::TriMesh => InputInfo::TriMesh,
-                OperatorMetadataInput::Subspace => InputInfo::Subspace,
+                OperatorMetadataInput::Subspace => {
+                    let shape = meta.slot_subspace_shape(slot);
+                    InputInfo::Subspace {
+                        ambient: shape.ambient,
+                        min_rank: shape.min_rank,
+                        max_rank: shape.max_rank,
+                    }
+                }
                 OperatorMetadataInput::ViewSet => InputInfo::ViewSet,
                 OperatorMetadataInput::Splat => InputInfo::Splat,
                 OperatorMetadataInput::Mechanism => InputInfo::Mechanism,
@@ -431,8 +456,17 @@ fn print_info_human(output: &InfoOutput) {
                     InputInfo::TriMesh => {
                         println!("  [{}] Triangle Mesh", i);
                     }
-                    InputInfo::Subspace => {
-                        println!("  [{}] Subspace", i);
+                    InputInfo::Subspace {
+                        ambient,
+                        min_rank,
+                        max_rank,
+                    } => {
+                        let shape = volumetric_abi::subspace::SubspaceShape {
+                            ambient: *ambient,
+                            min_rank: *min_rank,
+                            max_rank: *max_rank,
+                        };
+                        println!("  [{}] {}", i, shape.slot_label());
                     }
                     InputInfo::ViewSet => {
                         println!("  [{}] View Set", i);

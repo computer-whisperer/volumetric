@@ -385,6 +385,30 @@ pub enum OperatorMetadataOutput {
     Assembly,
 }
 
+/// What an operator declares about one input slot beyond its kind (an
+/// entry of [`OperatorMetadata::input_constraints`]).
+///
+/// The kind says how a value is encoded; this says which values of that
+/// kind the slot takes, so a host can describe the slot and offer the
+/// right tool for it before anything is wired. It is a promise to the
+/// host, not a check the host makes: the operator still refuses a value
+/// it cannot use. Every field is defaulted and means "nothing declared",
+/// so a fact added here later costs no operator a change.
+#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct InputConstraint {
+    /// For a [`OperatorMetadataInput::Subspace`] slot: the ambient
+    /// dimension and ranks it takes. Ignored on a slot of any other kind.
+    #[serde(default, skip_serializing_if = "subspace::SubspaceShape::is_any")]
+    pub subspace: subspace::SubspaceShape,
+}
+
+impl InputConstraint {
+    /// A slot that takes subspaces of `shape`.
+    pub const fn subspace(shape: subspace::SubspaceShape) -> Self {
+        Self { subspace: shape }
+    }
+}
+
 /// Metadata a module returns from `get_metadata()`, CBOR-encoded.
 ///
 /// Operators must export this; models may (with empty `inputs`/`outputs`)
@@ -439,6 +463,15 @@ pub struct OperatorMetadata {
     /// empty list — hosts fall back to positional labels).
     #[serde(default)]
     pub input_names: Vec<String>,
+    /// What each input slot takes beyond its kind, parallel to `inputs` by
+    /// index; a missing entry (the list may be short or empty) declares
+    /// nothing. For the variadic slot the entry covers every value wired
+    /// into the block. Read it through [`Self::subspace_shape`]. Defaulted,
+    /// so metadata built before the field existed decodes with nothing
+    /// declared, and left out of the encoding while empty, so an operator
+    /// that declares nothing encodes as it did before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_constraints: Vec<InputConstraint>,
     pub outputs: Vec<OperatorMetadataOutput>,
     /// Human-readable labels for `outputs`, parallel by index (e.g. "Ink",
     /// "Plate"). Hosts label output slots with them and derive default
@@ -533,6 +566,25 @@ impl OperatorMetadata {
     pub fn input_type(&self, idx: usize, count: usize) -> Option<&OperatorMetadataInput> {
         self.slot_of_input(idx, count)
             .map(|slot| &self.inputs[slot])
+    }
+
+    /// The subspaces declared slot `slot` takes: its declared shape, or
+    /// [`subspace::SubspaceShape::ANY`] when it declares none or is not a
+    /// Subspace slot.
+    pub fn slot_subspace_shape(&self, slot: usize) -> subspace::SubspaceShape {
+        match (self.inputs.get(slot), self.input_constraints.get(slot)) {
+            (Some(OperatorMetadataInput::Subspace), Some(constraint)) => constraint.subspace,
+            _ => subspace::SubspaceShape::ANY,
+        }
+    }
+
+    /// The subspaces input `idx` of a `count`-input step takes (see
+    /// [`Self::slot_subspace_shape`]).
+    pub fn subspace_shape(&self, idx: usize, count: usize) -> subspace::SubspaceShape {
+        self.slot_of_input(idx, count)
+            .map_or(subspace::SubspaceShape::ANY, |slot| {
+                self.slot_subspace_shape(slot)
+            })
     }
 
     /// Label for input `idx` of a `count`-input step: the slot's declared
@@ -769,8 +821,15 @@ mod tests {
                 OperatorMetadataInput::TriMesh,
                 OperatorMetadataInput::ViewSet,
                 OperatorMetadataInput::Splat,
+                OperatorMetadataInput::Subspace,
             ],
             variadic_input: None,
+            input_constraints: (0..10)
+                .map(|_| InputConstraint::default())
+                .chain([InputConstraint::subspace(
+                    subspace::SubspaceShape::rank(2).in_space(3),
+                )])
+                .collect(),
             input_names: vec![
                 "Model".to_string(),
                 "Config".to_string(),
@@ -782,6 +841,7 @@ mod tests {
                 "Surface".to_string(),
                 "Views".to_string(),
                 "Splat".to_string(),
+                "Bed".to_string(),
             ],
             outputs: vec![
                 OperatorMetadataOutput::ModelWASM,
@@ -797,8 +857,102 @@ mod tests {
         let decoded = decode_metadata(&encode_metadata(&metadata)).unwrap();
         assert_eq!(decoded, metadata);
         assert_eq!(metadata.input_name(0), Some("Model"));
-        assert_eq!(metadata.input_name(10), None);
+        assert_eq!(metadata.input_name(11), None);
         assert_eq!(metadata.catalog_name(), "Test Operator");
+        assert_eq!(
+            decoded.slot_subspace_shape(10),
+            subspace::SubspaceShape::rank(2).in_space(3)
+        );
+    }
+
+    /// The same metadata as a host built before `input_constraints` reads
+    /// it, and as an operator built before it wrote it.
+    #[test]
+    fn input_constraints_are_skipped_by_an_older_host_and_default_for_an_older_operator() {
+        #[derive(Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+        struct MetadataBefore {
+            name: String,
+            version: String,
+            inputs: Vec<OperatorMetadataInput>,
+            #[serde(default)]
+            variadic_input: Option<usize>,
+            #[serde(default)]
+            input_names: Vec<String>,
+            outputs: Vec<OperatorMetadataOutput>,
+        }
+        fn decode_before(bytes: &[u8]) -> MetadataBefore {
+            ciborium::de::from_reader(std::io::Cursor::new(bytes)).unwrap()
+        }
+
+        let mut declaring = variadic(
+            vec![
+                OperatorMetadataInput::ModelWASM,
+                OperatorMetadataInput::Subspace,
+            ],
+            None,
+        );
+        declaring.input_constraints = vec![
+            InputConstraint::default(),
+            InputConstraint::subspace(subspace::SubspaceShape::rank_at_least(1)),
+        ];
+        let before = decode_before(&encode_metadata(&declaring));
+        assert_eq!(before.inputs, declaring.inputs);
+        assert_eq!(before.input_names, declaring.input_names);
+
+        let mut old = Vec::new();
+        ciborium::ser::into_writer(&before, &mut old).unwrap();
+        let decoded = decode_metadata(&old).unwrap();
+        assert!(decoded.input_constraints.is_empty());
+        assert!(decoded.slot_subspace_shape(1).is_any());
+
+        // An operator that declares nothing writes no such key at all.
+        declaring.input_constraints.clear();
+        let value: ciborium::Value =
+            ciborium::de::from_reader(std::io::Cursor::new(encode_metadata(&declaring))).unwrap();
+        let keys: Vec<&str> = value
+            .as_map()
+            .unwrap()
+            .iter()
+            .filter_map(|(key, _)| key.as_text())
+            .collect();
+        assert!(keys.contains(&"input_names"));
+        assert!(!keys.contains(&"input_constraints"));
+    }
+
+    /// A declared shape is read by slot, follows the variadic block, and
+    /// is ignored on a slot that is not a Subspace or has no entry.
+    #[test]
+    fn subspace_shapes_are_read_by_slot() {
+        let line_or_more = subspace::SubspaceShape::rank_at_least(1).in_space(3);
+        let plane = subspace::SubspaceShape::rank(2).in_space(3);
+        let mut m = variadic(
+            vec![
+                OperatorMetadataInput::CBORConfiguration(String::new()),
+                OperatorMetadataInput::Subspace,
+                OperatorMetadataInput::Subspace,
+                OperatorMetadataInput::Subspace,
+            ],
+            Some(1),
+        );
+        m.input_constraints = vec![
+            // On a slot of another kind: ignored.
+            InputConstraint::subspace(subspace::SubspaceShape::rank(0)),
+            InputConstraint::subspace(line_or_more),
+            InputConstraint::subspace(plane),
+            // Slot 3 has no entry.
+        ];
+        assert!(m.slot_subspace_shape(0).is_any());
+        assert_eq!(m.slot_subspace_shape(1), line_or_more);
+        assert_eq!(m.slot_subspace_shape(2), plane);
+        assert!(m.slot_subspace_shape(3).is_any());
+        assert!(m.slot_subspace_shape(4).is_any());
+        // Six inputs: config, three in the block, then slots 2 and 3.
+        assert!(m.subspace_shape(0, 6).is_any());
+        assert_eq!(m.subspace_shape(1, 6), line_or_more);
+        assert_eq!(m.subspace_shape(3, 6), line_or_more);
+        assert_eq!(m.subspace_shape(4, 6), plane);
+        assert!(m.subspace_shape(5, 6).is_any());
+        assert!(m.subspace_shape(6, 6).is_any());
     }
 
     /// Metadata CBOR from operators built before `input_names` (and later
@@ -859,6 +1013,7 @@ mod tests {
                 .collect(),
             inputs,
             variadic_input,
+            input_constraints: vec![],
             outputs: vec![OperatorMetadataOutput::ModelWASM],
             output_names: vec![],
         }

@@ -361,10 +361,29 @@ fn tilted_subspace_bed_grows_a_brim() {
     assert!(occupied_at(&mut combined, at(0.8, 0.0, 0.1)), "the ring");
 }
 
-/// A non-plane subspace is rejected as a bed.
+/// A subspace that is not a plane in 3-space is rejected as a bed, in the
+/// words every operator uses for a wrong shape.
 #[test]
 fn non_plane_bed_subspace_is_rejected() {
-    let line = volumetric::subspace::Subspace::axis_aligned(vec![0.0, 0.0, 0.0], &[2]).unwrap();
+    use volumetric::subspace::Subspace;
+    let line = Subspace::axis_aligned(vec![0.0, 0.0, 0.0], &[2]).unwrap();
     let err = run_brim_with_bed(&base_config(), &line).expect_err("a line bed must fail");
-    assert!(err.contains("rank"), "unexpected error: {err}");
+    assert!(
+        err.contains("the bed subspace: expected plane in 3-space, got line in 3-space"),
+        "unexpected error: {err}"
+    );
+
+    let point = Subspace::point(vec![0.0, 0.0, 0.0]);
+    let err = run_brim_with_bed(&base_config(), &point).expect_err("a point bed must fail");
+    assert!(
+        err.contains("expected plane in 3-space, got point in 3-space"),
+        "unexpected error: {err}"
+    );
+
+    let flat = Subspace::axis_aligned(vec![0.0, 0.0], &[0, 1]).unwrap();
+    let err = run_brim_with_bed(&base_config(), &flat).expect_err("a 2-space bed must fail");
+    assert!(
+        err.contains("expected plane in 3-space, got frame in 2-space"),
+        "unexpected error: {err}"
+    );
 }

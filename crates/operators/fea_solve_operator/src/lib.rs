@@ -202,6 +202,7 @@ pub extern "C" fn get_metadata() -> i64 {
             ),
         ],
         variadic_input: None,
+        input_constraints: vec![],
         input_names: vec!["Mesh".to_string(), "Rigid body".to_string(), "Config".to_string()],
         outputs: vec![OperatorMetadataOutput::FeaMesh],
         output_names: vec![],

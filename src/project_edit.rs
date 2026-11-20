@@ -28,7 +28,9 @@ pub enum InputValue {
     Unwired,
 }
 
-/// Short human label for a declared operator input slot type.
+/// Short human label for the kind of a declared operator input slot. It
+/// names how a value is encoded; [`slot_type_label`] adds what the slot
+/// declares beyond that.
 pub fn input_type_label(input: &OperatorMetadataInput) -> String {
     match input {
         OperatorMetadataInput::ModelWASM => "ModelWASM".to_string(),
@@ -48,13 +50,24 @@ pub fn input_type_label(input: &OperatorMetadataInput) -> String {
     }
 }
 
+/// What declared slot `slot` takes, for someone choosing what to wire to
+/// it: its kind, and for a Subspace slot the shape the operator declares
+/// ("Subspace (plane in 3-space)"). Empty past the declaration.
+pub fn slot_type_label(metadata: &OperatorMetadata, slot: usize) -> String {
+    match metadata.inputs.get(slot) {
+        Some(OperatorMetadataInput::Subspace) => metadata.slot_subspace_shape(slot).slot_label(),
+        Some(input) => input_type_label(input),
+        None => String::new(),
+    }
+}
+
 /// One line per declared input slot, for count-mismatch errors.
 pub fn describe_declared_inputs(metadata: &OperatorMetadata) -> String {
     metadata
         .inputs
         .iter()
         .enumerate()
-        .map(|(i, input)| {
+        .map(|(i, _)| {
             let name = metadata
                 .input_name(i)
                 .map(|n| format!("{n} "))
@@ -64,7 +77,7 @@ pub fn describe_declared_inputs(metadata: &OperatorMetadata) -> String {
             } else {
                 ""
             };
-            format!("  [{i}] {name}({}{arity})", input_type_label(input))
+            format!("  [{i}] {name}({}{arity})", slot_type_label(metadata, i))
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -736,6 +749,7 @@ mod tests {
                 OperatorMetadataInput::CBORConfiguration("{ op: tstr }".to_string()),
             ],
             variadic_input: Some(0),
+            input_constraints: vec![],
             input_names: vec!["Model".to_string(), "Config".to_string()],
             outputs: vec![],
             output_names: vec![],
@@ -748,6 +762,46 @@ mod tests {
         );
         assert!(
             described.contains("[1] Config (CBOR configuration)"),
+            "{described}"
+        );
+    }
+
+    /// A Subspace slot is described with the shape it declares; one that
+    /// declares none, and a shape on a slot of another kind, read as the
+    /// bare kind.
+    #[test]
+    fn subspace_slots_describe_their_declared_shape() {
+        use volumetric_abi::InputConstraint;
+        use volumetric_abi::subspace::SubspaceShape;
+        let metadata = OperatorMetadata {
+            name: "bedded".to_string(),
+            version: "0.0.0".to_string(),
+            display_name: String::new(),
+            description: String::new(),
+            category: String::new(),
+            icon_svg: String::new(),
+            docs: String::new(),
+            inputs: vec![
+                OperatorMetadataInput::ModelWASM,
+                OperatorMetadataInput::Subspace,
+                OperatorMetadataInput::Subspace,
+            ],
+            variadic_input: None,
+            input_constraints: vec![
+                InputConstraint::subspace(SubspaceShape::rank(0)),
+                InputConstraint::subspace(SubspaceShape::rank(2).in_space(3)),
+            ],
+            input_names: vec!["Model".to_string(), "Bed".to_string(), "Any".to_string()],
+            outputs: vec![],
+            output_names: vec![],
+        };
+        assert_eq!(slot_type_label(&metadata, 0), "ModelWASM");
+        assert_eq!(slot_type_label(&metadata, 1), "Subspace (plane in 3-space)");
+        assert_eq!(slot_type_label(&metadata, 2), "Subspace");
+        assert_eq!(slot_type_label(&metadata, 3), "");
+        let described = describe_declared_inputs(&metadata);
+        assert!(
+            described.contains("[1] Bed (Subspace (plane in 3-space))"),
             "{described}"
         );
     }
