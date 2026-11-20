@@ -207,6 +207,7 @@ pub extern "C" fn get_metadata() -> i64 {
                 OperatorMetadataInput::CBORConfiguration(schema),
             ],
             variadic_input: None,
+            input_constraints: vec![],
             input_names: vec!["Image file".to_string(), "Config".to_string()],
             outputs: vec![OperatorMetadataOutput::ModelWASM],
             output_names: vec![],

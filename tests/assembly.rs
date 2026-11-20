@@ -185,6 +185,17 @@ fn a_mechanism_takes_its_axes_inline_or_from_a_subspace() {
     // are named in the error.
     let err = mechanism(two_part_config(Value::Integer(0.into())), vec![]).unwrap_err();
     assert!(err.contains("axis input 0"), "{err}");
+    // So is a routed axis with no direction to it.
+    let point = Subspace::point(vec![1.0, 0.0, 0.0]);
+    let err = mechanism(
+        two_part_config(Value::Integer(0.into())),
+        vec![encode_subspace(&point)],
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("axis input 0: expected rank 1 or more in 3-space, got point in 3-space"),
+        "{err}"
+    );
     let loose = encode(map(vec![
         ("parts", strings(&["a", "b"])),
         (

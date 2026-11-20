@@ -175,6 +175,9 @@ struct OperatorMetadata {
                                 // inputs sit at that position and later slots
                                 // shift along (helpers on the struct do the math)
     input_names: Vec<String>,   // labels parallel to `inputs`
+    input_constraints: Vec<InputConstraint>, // serde-defaulted, parallel to
+                                // `inputs`: what a slot takes beyond its kind
+                                // (see "Input constraints" below)
     outputs: Vec<OperatorMetadataOutput>,
     output_names: Vec<String>,  // labels parallel to `outputs` (serde-defaulted);
                                 // hosts label output slots and derive default
@@ -209,6 +212,18 @@ enum OperatorMetadataOutput {
 }
 ```
 
+```rust
+struct InputConstraint {        // every field serde-defaulted
+    subspace: SubspaceShape,    // for a Subspace slot; ignored on any other
+}
+
+struct SubspaceShape {          // every bound optional; all absent = any
+    ambient: Option<u32>,       // the n-space the subspace must live in
+    min_rank: Option<u32>,      // lowest rank taken
+    max_rank: Option<u32>,      // highest rank taken
+}
+```
+
 `icon_svg` is a complete SVG document: 24×24 viewBox, lucide-style 2px
 round strokes, every paint treated as `currentColor` so hosts tint it
 like a built-in icon. The `volumetric_abi::icon_svg!` macro wraps bare
@@ -216,6 +231,39 @@ shape elements in the canonical header (usable in `const` position, and
 in the build scripts no_std models precompute their metadata CBOR from).
 Hosts fall back to a per-category stock glyph when it is empty or fails
 to parse — a bad icon never breaks cataloging.
+
+#### Input constraints
+
+A slot's kind says how its value is encoded. `input_constraints[i]` says
+which values of that kind slot `i` takes, so a host can describe the slot
+and offer the right tool for it before anything is wired: `brim_operator`'s
+bed is `{ ambient: 3, min_rank: 2, max_rank: 2 }`, a plane in 3-space, and
+`mechanism_operator`'s axes are `{ ambient: 3, min_rank: 1 }`, a line or
+more. Rank 0 is a point, 1 a line, 2 a plane.
+
+- The list is parallel to `inputs` and may be short or absent; a slot with
+  no entry declares nothing. The variadic slot's entry covers every value
+  wired into its block.
+- It is a promise to the host, not a check the host makes. The operator
+  still refuses a value it cannot use, with `SubspaceShape::check` against
+  the same constant it declares, so the declaration and the check cannot
+  drift and a wrong shape is worded alike everywhere ("expected plane in
+  3-space, got line in 3-space").
+- It is an outer bound. A value outside the shape is refused when the
+  operator comes to use it; a value inside may still be refused for a
+  reason the shape cannot say. `cloud_fit_operator`'s seed is declared as
+  rank 0 to 2, and a plane is refused when the fit is of a cylinder.
+- An unwired slot (empty bytes) is the operator's to accept or refuse, as
+  before: a declared shape says nothing about whether the slot is optional.
+- A shape that depends on another input cannot be declared.
+  `extrude_operator`'s plane has one rank less than the space its profile
+  is lifted into, so it declares nothing and checks at run time;
+  `slice_operator` declares the rank it can (1 or more) and checks the
+  ambient dimension against its model.
+- Compatibility: metadata without the field decodes with nothing declared,
+  a host built before the field skips it, and an operator that declares
+  nothing does not write it. `OperatorMetadata::subspace_shape(idx, count)`
+  reads the shape for a step input.
 
 ### Operator Categories
 

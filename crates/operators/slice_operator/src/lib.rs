@@ -33,8 +33,10 @@ use walrus::{FunctionBuilder, FunctionId, MemoryId, Module, ModuleConfig, ValTyp
 
 use model_wrap_core::const_i32_return;
 use volumetric_abi::host::{post_output, read_input, report_error};
-use volumetric_abi::subspace::{Subspace, decode_subspace};
-use volumetric_abi::{OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput};
+use volumetric_abi::subspace::{Subspace, SubspaceShape, decode_subspace};
+use volumetric_abi::{
+    InputConstraint, OperatorMetadata, OperatorMetadataInput, OperatorMetadataOutput,
+};
 
 /// N-dimensional ABI function names we need to find. `get_io_ptr` and
 /// `get_sample_format` pass through; the rest get wrappers.
@@ -242,6 +244,11 @@ fn transform_wasm(input_bytes: &[u8], subspace: &Subspace) -> Result<Vec<u8>, St
     Ok(module.emit_wasm())
 }
 
+/// What the subspace input takes: at least a line, since a slice on a
+/// point would be a 0-dimensional model. Its ambient dimension is the
+/// model's, which only the run knows.
+const SLICE_SHAPE: SubspaceShape = SubspaceShape::rank_at_least(1);
+
 #[unsafe(no_mangle)]
 pub extern "C" fn run() {
     let subspace = match decode_subspace(&read_input(1)) {
@@ -251,11 +258,11 @@ pub extern "C" fn run() {
             return;
         }
     };
-    if subspace.rank() == 0 {
-        report_error(
-            "cannot slice on a point: the Model ABI has no 0-dimensional models. \
-             Use a line, plane, or frame subspace.",
-        );
+    if let Err(e) = SLICE_SHAPE.check(&subspace) {
+        report_error(&format!(
+            "input 1: {e}. The Model ABI has no 0-dimensional models, so a \
+             slice needs a line, plane, or frame."
+        ));
         return;
     }
 
@@ -288,6 +295,10 @@ pub extern "C" fn get_metadata() -> i64 {
             OperatorMetadataInput::Subspace,
         ],
         variadic_input: None,
+        input_constraints: vec![
+            InputConstraint::default(),
+            InputConstraint::subspace(SLICE_SHAPE),
+        ],
         input_names: vec!["Model".to_string(), "Subspace".to_string()],
         outputs: vec![OperatorMetadataOutput::ModelWASM],
         output_names: vec![],

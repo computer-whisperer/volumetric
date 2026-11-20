@@ -525,6 +525,7 @@ pub extern "C" fn get_metadata() -> i64 {
                 OperatorMetadataInput::CBORConfiguration(schema),
             ],
             variadic_input: None,
+            input_constraints: vec![],
             input_names: vec![
                 "OBJ file".to_string(),
                 "Texture".to_string(),

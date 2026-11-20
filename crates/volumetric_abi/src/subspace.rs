@@ -502,6 +502,147 @@ fn determinant(mut m: Vec<f64>, k: usize) -> f64 {
     det
 }
 
+/// What a Subspace input slot takes: an ambient dimension and a range of
+/// ranks, every bound optional. An operator declares one per slot in
+/// [`crate::InputConstraint`] so a host can say what the slot wants (a
+/// plane, a line or more) before anything is wired to it, and checks the
+/// value it is given against the same constant with [`Self::check`], so the
+/// declaration and the check cannot drift and every operator words a wrong
+/// shape alike.
+///
+/// The [`Default`] is [`Self::ANY`]. A rank that depends on another input
+/// (an extrusion plane one dimension below its profile's space) cannot be
+/// said here; such a slot declares what is fixed and the operator checks
+/// the rest itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct SubspaceShape {
+    /// The ambient dimension n the subspace must live in; `None` for any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ambient: Option<u32>,
+    /// The lowest rank taken; `None` for no lower bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_rank: Option<u32>,
+    /// The highest rank taken; `None` for no upper bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rank: Option<u32>,
+}
+
+impl SubspaceShape {
+    /// Every subspace: what a slot with no declaration takes.
+    pub const ANY: Self = Self {
+        ambient: None,
+        min_rank: None,
+        max_rank: None,
+    };
+
+    /// Exactly rank `k` (0 a point, 1 a line, 2 a plane).
+    pub const fn rank(k: u32) -> Self {
+        Self {
+            ambient: None,
+            min_rank: Some(k),
+            max_rank: Some(k),
+        }
+    }
+
+    /// Rank `k` or more. Every rank is 0 or more, so that is [`Self::ANY`].
+    pub const fn rank_at_least(k: u32) -> Self {
+        Self {
+            ambient: None,
+            min_rank: if k == 0 { None } else { Some(k) },
+            max_rank: None,
+        }
+    }
+
+    /// Rank `k` or less.
+    pub const fn rank_at_most(k: u32) -> Self {
+        Self {
+            ambient: None,
+            min_rank: None,
+            max_rank: Some(k),
+        }
+    }
+
+    /// The same ranks, in `n`-space only.
+    pub const fn in_space(self, n: u32) -> Self {
+        Self {
+            ambient: Some(n),
+            ..self
+        }
+    }
+
+    /// The shape of one value: its own rank and ambient dimension.
+    pub fn of(subspace: &Subspace) -> Self {
+        Self::rank(subspace.rank() as u32).in_space(subspace.dimensions)
+    }
+
+    /// Whether nothing is declared: no bound is set. (A lower bound of 0
+    /// set by hand takes every rank too, but is still a declaration, and
+    /// is written to the wire.)
+    pub fn is_any(&self) -> bool {
+        *self == Self::ANY
+    }
+
+    /// Whether `subspace` has an ambient dimension and rank this shape takes.
+    pub fn accepts(&self, subspace: &Subspace) -> bool {
+        let rank = subspace.rank() as u64;
+        self.ambient.is_none_or(|n| n == subspace.dimensions)
+            && self.min_rank.is_none_or(|lo| rank >= u64::from(lo))
+            && self.max_rank.is_none_or(|hi| rank <= u64::from(hi))
+    }
+
+    /// `Ok` when [`Self::accepts`]; otherwise what was expected and what was
+    /// given, for the operator to put its slot's name in front of
+    /// ("expected plane in 3-space, got line in 3-space").
+    pub fn check(&self, subspace: &Subspace) -> Result<(), String> {
+        if self.accepts(subspace) {
+            Ok(())
+        } else {
+            Err(format!("expected {self}, got {}", Self::of(subspace)))
+        }
+    }
+
+    /// The label of a slot declaring this shape: "Subspace", or with what
+    /// it takes, "Subspace (plane in 3-space)".
+    pub fn slot_label(&self) -> String {
+        match (self.rank_words(), self.ambient) {
+            (None, None) => "Subspace".to_string(),
+            (Some(rank), None) => format!("Subspace ({rank})"),
+            (None, Some(n)) => format!("Subspace (in {n}-space)"),
+            (Some(rank), Some(n)) => format!("Subspace ({rank} in {n}-space)"),
+        }
+    }
+
+    /// The rank bounds in words, `None` when every rank is taken. One exact
+    /// rank goes by its name: a frame when it fills the ambient space,
+    /// else a point, a line or a plane.
+    fn rank_words(&self) -> Option<String> {
+        let lowest = self.min_rank.unwrap_or(0);
+        match self.max_rank {
+            None if lowest == 0 => None,
+            None => Some(format!("rank {lowest} or more")),
+            Some(highest) if highest != lowest => Some(format!("rank {lowest} to {highest}")),
+            Some(rank) if rank > 0 && self.ambient == Some(rank) => Some("frame".to_string()),
+            Some(0) => Some("point".to_string()),
+            Some(1) => Some("line".to_string()),
+            Some(2) => Some("plane".to_string()),
+            Some(rank) => Some(format!("rank {rank}")),
+        }
+    }
+}
+
+impl std::fmt::Display for SubspaceShape {
+    /// The shape as it reads in a message: "plane in 3-space", "rank 1 or
+    /// more", "subspace in 3-space", "any subspace".
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (self.rank_words(), self.ambient) {
+            (None, None) => write!(f, "any subspace"),
+            (Some(rank), None) => write!(f, "{rank}"),
+            (None, Some(n)) => write!(f, "subspace in {n}-space"),
+            (Some(rank), Some(n)) => write!(f, "{rank} in {n}-space"),
+        }
+    }
+}
+
 /// CBOR-encode a subspace (the payload of a Subspace operator output).
 pub fn encode_subspace(subspace: &Subspace) -> Vec<u8> {
     let mut out = Vec::new();
@@ -524,6 +665,148 @@ mod tests {
 
     fn plane_xy_at(z: f64) -> Subspace {
         Subspace::axis_aligned(vec![0.0, 0.0, z], &[0, 1]).unwrap()
+    }
+
+    #[test]
+    fn a_shape_takes_the_ranks_and_space_it_declares() {
+        let point = Subspace::point(vec![0.0, 0.0, 0.0]);
+        let line = Subspace::axis_aligned(vec![0.0, 0.0, 0.0], &[2]).unwrap();
+        let plane = plane_xy_at(0.0);
+        let frame = Subspace::axis_aligned(vec![0.0, 0.0, 0.0], &[0, 1, 2]).unwrap();
+        let plane_2d = Subspace::axis_aligned(vec![0.0, 0.0], &[0, 1]).unwrap();
+        let all = [&point, &line, &plane, &frame, &plane_2d];
+        let taken = |shape: SubspaceShape| all.map(|subspace| shape.accepts(subspace));
+
+        assert_eq!(taken(SubspaceShape::ANY), [true; 5]);
+        assert_eq!(
+            taken(SubspaceShape::rank(2)),
+            [false, false, true, false, true]
+        );
+        assert_eq!(
+            taken(SubspaceShape::rank(2).in_space(3)),
+            [false, false, true, false, false]
+        );
+        assert_eq!(
+            taken(SubspaceShape::rank_at_least(1).in_space(3)),
+            [false, true, true, true, false]
+        );
+        assert_eq!(
+            taken(SubspaceShape::rank_at_most(2).in_space(3)),
+            [true, true, true, false, false]
+        );
+        assert_eq!(
+            taken(SubspaceShape::ANY.in_space(2)),
+            [false, false, false, false, true]
+        );
+        for subspace in all {
+            assert!(SubspaceShape::of(subspace).accepts(subspace));
+        }
+    }
+
+    #[test]
+    fn a_wrong_shape_is_worded_one_way() {
+        let line = Subspace::axis_aligned(vec![0.0, 0.0, 0.0], &[2]).unwrap();
+        let bed = SubspaceShape::rank(2).in_space(3);
+        assert_eq!(bed.check(&plane_xy_at(0.0)), Ok(()));
+        assert_eq!(
+            bed.check(&line).unwrap_err(),
+            "expected plane in 3-space, got line in 3-space"
+        );
+        assert_eq!(
+            SubspaceShape::rank_at_least(1)
+                .check(&Subspace::point(vec![0.0, 0.0]))
+                .unwrap_err(),
+            "expected rank 1 or more, got point in 2-space"
+        );
+    }
+
+    #[test]
+    fn shapes_read_as_words() {
+        let words = |shape: SubspaceShape| (shape.to_string(), shape.slot_label());
+        let both = |text: &str, label: &str| (text.to_string(), label.to_string());
+        assert_eq!(words(SubspaceShape::ANY), both("any subspace", "Subspace"));
+        assert_eq!(
+            words(SubspaceShape::ANY.in_space(3)),
+            both("subspace in 3-space", "Subspace (in 3-space)")
+        );
+        assert_eq!(
+            words(SubspaceShape::rank(0)),
+            both("point", "Subspace (point)")
+        );
+        assert_eq!(
+            words(SubspaceShape::rank(1).in_space(3)),
+            both("line in 3-space", "Subspace (line in 3-space)")
+        );
+        assert_eq!(
+            words(SubspaceShape::rank(2).in_space(3)),
+            both("plane in 3-space", "Subspace (plane in 3-space)")
+        );
+        // The rank that fills its space is a frame, whatever its number.
+        assert_eq!(
+            SubspaceShape::rank(3).in_space(3).to_string(),
+            "frame in 3-space"
+        );
+        assert_eq!(
+            SubspaceShape::rank(2).in_space(2).to_string(),
+            "frame in 2-space"
+        );
+        assert_eq!(SubspaceShape::rank(3).to_string(), "rank 3");
+        assert_eq!(
+            SubspaceShape::rank(3).in_space(4).to_string(),
+            "rank 3 in 4-space"
+        );
+        assert_eq!(
+            SubspaceShape::rank_at_least(1).in_space(3).to_string(),
+            "rank 1 or more in 3-space"
+        );
+        assert_eq!(
+            SubspaceShape::rank_at_most(2).in_space(3).to_string(),
+            "rank 0 to 2 in 3-space"
+        );
+        // A lower bound of nothing is no bound.
+        assert!(SubspaceShape::rank_at_least(0).is_any());
+        let none_by_hand = SubspaceShape {
+            min_rank: Some(0),
+            ..SubspaceShape::ANY
+        };
+        assert_eq!(none_by_hand.to_string(), "any subspace");
+    }
+
+    #[test]
+    fn a_shape_encodes_only_what_it_declares() {
+        let encode = |shape: &SubspaceShape| {
+            let mut out = Vec::new();
+            ciborium::ser::into_writer(shape, &mut out).unwrap();
+            out
+        };
+        // An empty map.
+        assert_eq!(encode(&SubspaceShape::ANY), [0xa0]);
+        // An open bound is left out, not written as null.
+        let keys = |shape: &SubspaceShape| -> Vec<String> {
+            let value: ciborium::Value =
+                ciborium::de::from_reader(std::io::Cursor::new(encode(shape))).unwrap();
+            value
+                .as_map()
+                .unwrap()
+                .iter()
+                .map(|(key, _)| key.as_text().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(keys(&SubspaceShape::rank_at_least(1)), ["min_rank"]);
+        assert_eq!(
+            keys(&SubspaceShape::rank_at_most(2).in_space(3)),
+            ["ambient", "max_rank"]
+        );
+        for shape in [
+            SubspaceShape::ANY,
+            SubspaceShape::rank(2).in_space(3),
+            SubspaceShape::rank_at_least(1),
+            SubspaceShape::rank_at_most(2).in_space(3),
+        ] {
+            let decoded: SubspaceShape =
+                ciborium::de::from_reader(std::io::Cursor::new(encode(&shape))).unwrap();
+            assert_eq!(decoded, shape);
+        }
     }
 
     #[test]

@@ -647,8 +647,10 @@ fn model_bytes<'py>(py: Python<'py>, name: &str) -> PyResult<Bound<'py, PyBytes>
 
 /// An operator's metadata as a dict: `name`, `version`, `display_name`,
 /// `description`, `category`, `docs`, `inputs` (one dict per slot with
-/// `name` and `type`), `variadic` (the slot that takes one or more, or
-/// None) and `outputs` (names).
+/// `name` and `type`; a Subspace slot that declares what it takes also has
+/// `subspace`, a dict of `ambient`, `min_rank` and `max_rank`, each None
+/// where open), `variadic` (the slot that takes one or more, or None) and
+/// `outputs` (names).
 #[pyfunction]
 fn operator_info<'py>(
     py: Python<'py>,
@@ -673,6 +675,16 @@ fn operator_info<'py>(
             slot.set_item("type", project_edit::input_type_label(input))?;
             if let volumetric::OperatorMetadataInput::CBORConfiguration(cddl) = input {
                 slot.set_item("cddl", cddl)?;
+            }
+            // What a Subspace slot declares it takes; a bound it leaves
+            // open is None, and a slot that declares nothing has no entry.
+            let shape = metadata.slot_subspace_shape(i);
+            if !shape.is_any() {
+                let subspace = PyDict::new(py);
+                subspace.set_item("ambient", shape.ambient)?;
+                subspace.set_item("min_rank", shape.min_rank)?;
+                subspace.set_item("max_rank", shape.max_rank)?;
+                slot.set_item("subspace", subspace)?;
             }
             Ok(slot)
         })

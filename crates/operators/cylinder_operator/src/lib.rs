@@ -292,6 +292,7 @@ pub extern "C" fn get_metadata() -> i64 {
             OperatorMetadataInput::VecF64(3),
         ],
         variadic_input: None,
+        input_constraints: vec![],
         input_names: vec![
             "Config".to_string(),
             "Endpoint A".to_string(),

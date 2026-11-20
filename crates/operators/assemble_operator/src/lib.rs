@@ -101,6 +101,7 @@ pub extern "C" fn get_metadata() -> i64 {
             OperatorMetadataInput::F64Map,
         ],
         variadic_input: Some(1),
+        input_constraints: vec![],
         input_names: vec![
             "Mechanism".to_string(),
             "Parts".to_string(),

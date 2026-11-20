@@ -369,6 +369,7 @@ mod tests {
                 .to_string(),
             inputs: vec![],
             variadic_input: None,
+            input_constraints: vec![],
             input_names: vec![],
             outputs: vec![],
             output_names: vec![],
