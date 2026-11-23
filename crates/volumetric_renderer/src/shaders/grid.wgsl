@@ -84,14 +84,22 @@ fn fs_grid(in: VsOut) -> FsOut {
     let n = uniforms.axis_n.xyz;
     let opacity = uniforms.line_color.a;
 
+    // Where the ray meets the plane, and how far that moves across a
+    // pixel. Only the plane reads these, but they are taken here for both
+    // instances: WGSL wants a derivative outside any branch on a fragment
+    // input, `part` included, and a browser's WebGPU refuses the shader
+    // otherwise.
+    let t = -dot(near, n) / dot(ray, n);
+    let hit = near + ray * t;
+    let coord = vec2<f32>(dot(hit, uniforms.axis_u.xyz), dot(hit, uniforms.axis_v.xyz));
+    let coord_width = fwidth(coord);
+    let hit_width = fwidth(hit);
+
     var out: FsOut;
     if in.part == 0u {
         // ---- The plane. Everything is computed for every pixel so the
         // derivatives are defined; pixels that miss are dropped last.
-        let t = -dot(near, n) / dot(ray, n);
-        let hit = near + ray * t;
-        let coord = vec2<f32>(dot(hit, uniforms.axis_u.xyz), dot(hit, uniforms.axis_v.xyz));
-        let coord_per_pixel = max(fwidth(coord) * uniforms.viewport.z, vec2<f32>(1e-12));
+        let coord_per_pixel = max(coord_width * uniforms.viewport.z, vec2<f32>(1e-12));
 
         let minor = uniforms.levels.w;
         let w = uniforms.levels.xyz;
@@ -117,7 +125,7 @@ fn fs_grid(in: VsOut) -> FsOut {
 
         // A pixel's width further along the ray, so a surface lying in
         // the plane wins the depth test instead of flickering.
-        let pushed = hit + normalize(ray) * 1.5 * length(fwidth(hit));
+        let pushed = hit + normalize(ray) * 1.5 * length(hit_width);
         let clip = uniforms.view_proj * vec4<f32>(pushed, 1.0);
         let depth = clip.z / clip.w;
         if !(t > 0.0 && t <= 1.0 && alpha > 0.002 && depth >= 0.0 && depth <= 1.0) {
