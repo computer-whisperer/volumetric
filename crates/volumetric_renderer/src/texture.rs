@@ -1,9 +1,11 @@
-//! Mesh textures: the pixels a scene hands over, and the copy the device
-//! keeps.
+//! Mesh textures: the pixels a scene hands over.
 //!
 //! [`TextureData`] is an image with its mip chain as given; the renderer
 //! filters nothing itself. [`SceneTexture`] is what a mesh in a scene
-//! holds: those pixels until the first upload, the device's copy after.
+//! holds: those pixels, or the means to make them again. It is plain data
+//! that any thread may build and send; the device's copy is a
+//! [`crate::GpuTexture`], made on the device's thread when a mesh is
+//! uploaded.
 
 use std::sync::Mutex;
 
@@ -70,32 +72,24 @@ pub fn mip_side(side: u32) -> u32 {
 /// Makes a texture's pixels again, or `None` when it cannot.
 type Reload = Box<dyn Fn() -> Option<TextureData> + Send + Sync>;
 
-/// A mesh's texture as a scene holds it.
+/// A mesh's texture as a scene holds it: where its pixels come from.
 ///
 /// A scanner's atlas is hundreds of megabytes decoded, and a scene stays
-/// cached long after its first frame, so the pixels are not kept twice.
-/// The first upload hands them to the device and the texture keeps that
-/// copy, which every later upload of the mesh shares (hiding an output
-/// and showing it again sends nothing). The decoded pixels are then
-/// dropped when the texture knows how to make them again
+/// cached long after its first frame, so the pixels are not kept beside
+/// the device's copy ([`crate::GpuTexture`]). Once a device has them they
+/// are dropped when the texture knows how to make them again
 /// ([`reloadable`](Self::reloadable)) and kept when it does not
-/// ([`new`](Self::new)). They are needed again only if a different
-/// renderer draws the scene.
+/// ([`new`](Self::new)). They are needed again only for another upload: a
+/// different renderer, or a host that kept no copy
+/// ([`crate::GpuTextureSet`]).
 pub struct SceneTexture {
     width: u32,
     height: u32,
     reload: Option<Reload>,
-    state: Mutex<State>,
+    pixels: Mutex<Option<TextureData>>,
 }
 
-#[derive(Default)]
-struct State {
-    pixels: Option<TextureData>,
-    /// The copy on a device, and the mesh pipeline it was made for.
-    resident: Option<(PipelineId, ResidentTexture)>,
-}
-
-/// Which mesh pipeline a resident texture belongs to. Devices cannot be
+/// Which mesh pipeline a device texture belongs to. Devices cannot be
 /// told apart by comparing them (two instances number theirs alike), so
 /// each pipeline, which lives on one device, takes a number of its own.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -109,16 +103,6 @@ impl PipelineId {
     }
 }
 
-/// A texture on a device, bound for the mesh pass.
-#[derive(Clone)]
-pub(crate) struct ResidentTexture {
-    /// Group 1 of the mesh pass; it keeps the texture alive.
-    pub bind_group: std::sync::Arc<wgpu::BindGroup>,
-    /// The size it was uploaded at when its full size exceeded the
-    /// device's largest texture side; `None` when it fit.
-    pub downscaled: Option<(u32, u32)>,
-}
-
 impl SceneTexture {
     /// A texture that keeps `pixels` for as long as it lives.
     pub fn new(pixels: TextureData) -> SceneTexture {
@@ -126,10 +110,7 @@ impl SceneTexture {
             width: pixels.width,
             height: pixels.height,
             reload: None,
-            state: Mutex::new(State {
-                pixels: Some(pixels),
-                resident: None,
-            }),
+            pixels: Mutex::new(Some(pixels)),
         }
     }
 
@@ -153,56 +134,43 @@ impl SceneTexture {
 
     /// Whether the decoded pixels are in memory now.
     pub fn holds_pixels(&self) -> bool {
-        self.state().pixels.is_some()
+        self.pixels().is_some()
     }
 
-    fn state(&self) -> std::sync::MutexGuard<'_, State> {
-        // Nothing is taken out of the state before what replaces it
-        // exists, so a panic while it was held leaves it whole.
-        self.state
+    fn pixels(&self) -> std::sync::MutexGuard<'_, Option<TextureData>> {
+        // Nothing is taken out while an upload reads them, so a panic
+        // while they were held leaves them whole.
+        self.pixels
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// The texture as `pipeline` binds it: the copy already made for it,
-    /// or the one `make` builds from the pixels now (which replaces a
-    /// copy made for any other pipeline). `None` when the pixels are gone
-    /// and cannot be made again.
-    pub(crate) fn resident(
-        &self,
-        pipeline: PipelineId,
-        make: impl FnOnce(&TextureData) -> ResidentTexture,
-    ) -> Option<ResidentTexture> {
-        let mut state = self.state();
-        if let Some((made_for, resident)) = &state.resident
-            && *made_for == pipeline
-        {
-            return Some(resident.clone());
-        }
-        // The pixels are given up only once a copy has been made of
-        // them, so a `make` that panics leaves the texture as it was.
-        let resident = match (&state.pixels, &self.reload) {
-            (Some(pixels), _) => make(pixels),
-            (None, Some(reload)) => make(&reload()?),
+    /// Hands the pixels to `upload`, making them again first when they
+    /// were given up, and gives them up afterwards when they can be made
+    /// again. `None` when they are gone and cannot be.
+    pub(crate) fn with_pixels<R>(&self, upload: impl FnOnce(&TextureData) -> R) -> Option<R> {
+        let mut pixels = self.pixels();
+        // The pixels are given up only once `upload` has returned, so one
+        // that panics leaves the texture as it was.
+        let uploaded = match (&*pixels, &self.reload) {
+            (Some(pixels), _) => upload(pixels),
+            (None, Some(reload)) => upload(&reload()?),
             (None, None) => return None,
         };
         if self.reload.is_some() {
-            state.pixels = None;
+            *pixels = None;
         }
-        state.resident = Some((pipeline, resident.clone()));
-        Some(resident)
+        Some(uploaded)
     }
 }
 
 impl std::fmt::Debug for SceneTexture {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let state = self.state();
         f.debug_struct("SceneTexture")
             .field("width", &self.width)
             .field("height", &self.height)
             .field("reloadable", &self.reload.is_some())
-            .field("holds_pixels", &state.pixels.is_some())
-            .field("resident", &state.resident.is_some())
+            .field("holds_pixels", &self.holds_pixels())
             .finish()
     }
 }

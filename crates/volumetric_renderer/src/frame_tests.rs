@@ -193,8 +193,9 @@ fn shows_red_top_left(offscreen: &Offscreen, renderer: &mut Renderer) -> bool {
 }
 
 /// A texture that can make its pixels again gives them up at the first
-/// upload, and every later mesh on that device shares the copy made
-/// then: nothing is decoded or sent twice. One that cannot keeps them.
+/// upload, and every later mesh that takes the copy made then from the
+/// same set shares it: nothing is decoded or sent twice. One that cannot
+/// keeps them.
 #[test]
 fn a_reloadable_texture_keeps_only_the_devices_copy() {
     use std::sync::Arc;
@@ -211,19 +212,145 @@ fn a_reloadable_texture_keeps_only_the_devices_copy() {
 
         let mut renderer = offscreen.renderer(W, H);
         let (device, queue) = (offscreen.device(), offscreen.queue());
-        let first = renderer.create_retained_mesh(device, queue, &textured_quad(&texture));
+        let mut uploaded = crate::GpuTextureSet::default();
+        let first = renderer.create_retained_mesh_with(
+            device,
+            queue,
+            &textured_quad(&texture),
+            &mut uploaded,
+        );
         assert!(!texture.holds_pixels(), "dropped once the device has them");
-        // The mesh goes (its output hidden); the texture's copy stays, so
+        assert_eq!(uploaded.len(), 1);
+        assert_eq!(
+            Arc::strong_count(&texture),
+            1,
+            "the device's copy does not keep the scene texture alive"
+        );
+        // The mesh goes (its output hidden); the set keeps the copy, so
         // showing it again takes neither the pixels nor a reload.
         drop(first);
-        let again = renderer.create_retained_mesh(device, queue, &textured_quad(&texture));
+        let again = renderer.create_retained_mesh_with(
+            device,
+            queue,
+            &textured_quad(&texture),
+            &mut uploaded,
+        );
         assert_eq!(reloads.load(Ordering::Relaxed), 0);
+        assert_eq!(uploaded.len(), 1);
         renderer.submit_retained_mesh(&again, Mat4::IDENTITY, ObjectId(1), MaterialId(0), 1.0);
         assert!(shows_red_top_left(offscreen, &mut renderer));
+
+        // Without a set the copy lives only as long as its mesh: the next
+        // mesh uploads again, from a reload.
+        let _alone = renderer.create_retained_mesh(device, queue, &textured_quad(&texture));
+        assert_eq!(reloads.load(Ordering::Relaxed), 1);
 
         let kept = Arc::new(crate::SceneTexture::new(checker()));
         let _mesh = renderer.create_retained_mesh(device, queue, &textured_quad(&kept));
         assert!(kept.holds_pixels(), "nothing could make them again");
+    });
+}
+
+/// Meshes of one scene that use the same texture share one upload, and a
+/// scene dropped and made again from the set it was made with uploads
+/// nothing: no reload, nothing added to the set. A second renderer given
+/// the same set makes its own copy, from a reload.
+#[test]
+fn a_kept_set_outlives_the_retained_scene() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    on_each_backend(|offscreen| {
+        let reloads = Arc::new(AtomicUsize::new(0));
+        let counter = reloads.clone();
+        let texture = Arc::new(crate::SceneTexture::reloadable(checker(), move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+            Some(checker())
+        }));
+        let quad = textured_quad(&texture);
+        let scene = crate::SceneData {
+            meshes: vec![
+                (quad.clone(), Mat4::IDENTITY, MaterialId(0)),
+                (quad, Mat4::from_translation(Vec3::Z), MaterialId(0)),
+            ],
+            ..Default::default()
+        };
+        let (device, queue) = (offscreen.device(), offscreen.queue());
+
+        // Within one call, without a set: one upload for both meshes.
+        let renderer = offscreen.renderer(W, H);
+        let retained = renderer.create_retained_scene(device, queue, &scene);
+        assert_eq!(retained.meshes.len(), 2);
+        assert_eq!(reloads.load(Ordering::Relaxed), 0);
+        assert!(!texture.holds_pixels());
+        drop(retained);
+
+        let mut renderer = offscreen.renderer(W, H);
+        let mut uploaded = crate::GpuTextureSet::default();
+        let retained = renderer.create_retained_scene_with(device, queue, &scene, &mut uploaded);
+        assert_eq!(
+            reloads.load(Ordering::Relaxed),
+            1,
+            "the first scene's copy went with it, so this is a reload"
+        );
+        assert_eq!(uploaded.len(), 1);
+        drop(retained);
+        let retained = renderer.create_retained_scene_with(device, queue, &scene, &mut uploaded);
+        assert_eq!(
+            reloads.load(Ordering::Relaxed),
+            1,
+            "the set's copy is reused"
+        );
+        assert_eq!(uploaded.len(), 1);
+        renderer.submit_retained_mesh(
+            &retained.meshes[0].0,
+            Mat4::IDENTITY,
+            ObjectId(1),
+            MaterialId(0),
+            1.0,
+        );
+        assert!(shows_red_top_left(offscreen, &mut renderer));
+
+        let other = offscreen.renderer(W, H);
+        let _theirs = other.create_retained_scene_with(device, queue, &scene, &mut uploaded);
+        assert_eq!(reloads.load(Ordering::Relaxed), 2, "its own copy, reloaded");
+        assert_eq!(uploaded.len(), 2);
+    });
+}
+
+/// A texture larger than the device's largest side is uploaded from the
+/// first mip level that fits, and every mesh that shares the copy reports
+/// the size it went up at.
+#[test]
+fn a_shared_texture_reports_its_downscale_to_every_mesh() {
+    use std::sync::Arc;
+    on_each_backend(|offscreen| {
+        // A row twice the largest side, with a level that fits under it.
+        let side = offscreen.max_frame_side();
+        let wide = crate::TextureData::from_levels(
+            side * 2,
+            1,
+            vec![vec![255; side as usize * 8], vec![255; side as usize * 4]],
+        );
+        let texture = Arc::new(crate::SceneTexture::new(wide));
+        let expected = Some((side, 1));
+        let renderer = offscreen.renderer(W, H);
+        let (device, queue) = (offscreen.device(), offscreen.queue());
+        let mut uploaded = crate::GpuTextureSet::default();
+        let first = renderer.create_retained_mesh_with(
+            device,
+            queue,
+            &textured_quad(&texture),
+            &mut uploaded,
+        );
+        let second = renderer.create_retained_mesh_with(
+            device,
+            queue,
+            &textured_quad(&texture),
+            &mut uploaded,
+        );
+        assert_eq!(uploaded.len(), 1);
+        assert_eq!(first.texture_downscaled, expected);
+        assert_eq!(second.texture_downscaled, expected);
     });
 }
 

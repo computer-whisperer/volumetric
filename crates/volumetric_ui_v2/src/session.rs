@@ -918,12 +918,14 @@ struct ViewportRenderer {
     renderer: renderer::Renderer,
     target: ViewportTarget,
     surface_format: wgpu::TextureFormat,
-    /// Per-output mesh cache + build bookkeeping (no GPU state; unit-tested).
+    /// Per-output mesh cache + build bookkeeping (unit-tested), and each
+    /// build's uploaded textures.
     preview_cache: PreviewCache,
     /// GPU residency per output: retained buffers, uploaded once per build
-    /// revision and dropped when the output leaves the viewport. Per frame
-    /// only the handles are submitted — the dense geometry never travels to
-    /// the device again until a rebuild lands.
+    /// revision and dropped when the output leaves the viewport (its
+    /// textures stay with its cached build). Per frame only the handles are
+    /// submitted — the dense geometry never travels to the device again
+    /// until a rebuild lands.
     resident: HashMap<String, ResidentEntity>,
     /// Retained meshes shared by identity across entity revisions (an
     /// assembly's parts): a re-posed part is re-submitted under its new
@@ -1640,17 +1642,21 @@ impl ViewportRenderer {
 
     /// The retained scene of an entity: meshes with a stable identity
     /// (an assembly's parts) come from `part_meshes`, uploaded once per
-    /// identity; everything else is uploaded for this entity.
+    /// identity; everything else is uploaded for this entity. A mesh
+    /// uploaded here takes its texture from `textures`, the entity's own,
+    /// or adds it there; one already in `part_meshes` keeps the texture
+    /// it was uploaded with.
     fn retained_scene_for(
         renderer: &renderer::Renderer,
         part_meshes: &mut HashMap<[u8; 32], Arc<renderer::GpuMesh>>,
+        textures: &mut renderer::GpuTextureSet,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         entity: &PreviewEntity,
     ) -> (renderer::RetainedScene, Vec<[u8; 32]>) {
         if entity.mesh_keys.iter().all(Option::is_none) {
             return (
-                renderer.create_retained_scene(device, queue, &entity.scene),
+                renderer.create_retained_scene_with(device, queue, &entity.scene, textures),
                 Vec::new(),
             );
         }
@@ -1670,13 +1676,14 @@ impl ViewportRenderer {
                     match part_meshes.get(&key) {
                         Some(gpu) => gpu.clone(),
                         None => {
-                            let gpu = renderer.create_retained_mesh(device, queue, mesh);
+                            let gpu =
+                                renderer.create_retained_mesh_with(device, queue, mesh, textures);
                             part_meshes.insert(key, gpu.clone());
                             gpu
                         }
                     }
                 }
-                None => renderer.create_retained_mesh(device, queue, mesh),
+                None => renderer.create_retained_mesh_with(device, queue, mesh, textures),
             };
             scene.meshes.push((gpu, *transform));
         }
@@ -1770,30 +1777,49 @@ impl ViewportRenderer {
                 .get(id.as_str())
                 .is_some_and(|rev| *rev == posed.revision)
         });
-        let mut object = 0;
-        for (id, revision, wireframe, entity) in visible {
+        // Uploads come first: an entity's textures are kept in its cache
+        // entry, which an upload borrows mutably.
+        let wanted: Vec<(String, u64)> = visible
+            .iter()
+            .filter(|(id, revision, ..)| {
+                self.resident
+                    .get(*id)
+                    .is_none_or(|resident| resident.revision != *revision)
+            })
+            .map(|(id, revision, ..)| ((*id).to_string(), *revision))
+            .collect();
+        for (id, revision) in wanted {
             if self
                 .resident
-                .get(id)
-                .is_none_or(|resident| resident.revision != revision)
+                .get(&id)
+                .is_some_and(|resident| resident.revision == revision)
             {
-                let (scene, part_keys) = Self::retained_scene_for(
-                    &self.renderer,
-                    &mut self.part_meshes,
-                    device,
-                    queue,
-                    entity,
-                );
-                self.resident.insert(
-                    id.to_string(),
-                    ResidentEntity {
-                        revision,
-                        scene,
-                        part_keys,
-                        wireframe: None,
-                    },
-                );
+                continue;
             }
+            let (entity, textures) = self
+                .preview_cache
+                .entity_for_upload(&id)
+                .expect("a visible output is cached");
+            let (scene, part_keys) = Self::retained_scene_for(
+                &self.renderer,
+                &mut self.part_meshes,
+                textures,
+                device,
+                queue,
+                entity,
+            );
+            self.resident.insert(
+                id,
+                ResidentEntity {
+                    revision,
+                    scene,
+                    part_keys,
+                    wireframe: None,
+                },
+            );
+        }
+        let mut object = 0;
+        for (id, _, wireframe, entity) in self.preview_cache.visible(requests) {
             let resident = self
                 .resident
                 .get_mut(id)
@@ -2144,9 +2170,10 @@ impl PreviewSceneKey {
     }
 }
 
-/// Per-output mesh cache and build bookkeeping. Holds no GPU state, so its
-/// reconcile/accept logic is unit-tested directly; each accepted build gets
-/// a monotonic revision the viewport uses to keep GPU residency in step.
+/// Per-output mesh cache and build bookkeeping. Its reconcile/accept logic
+/// touches no GPU state (a build's uploaded textures are filled in by the
+/// viewport), so it is unit-tested directly; each accepted build gets a
+/// monotonic revision the viewport uses to keep GPU residency in step.
 ///
 /// Keyed by asset id: each materialized output has at most one cached entity,
 /// which survives viewport selection changes and is kept stale until a fresh
@@ -2172,6 +2199,11 @@ struct CachedBuild {
     key: PreviewSceneKey,
     entity: PreviewEntity,
     revision: u64,
+    /// The entity's textures on the device, kept while the build is
+    /// cached so that hiding the output and showing it again uploads
+    /// none of them. Made empty with the build; never carried over to
+    /// another entity.
+    textures: renderer::GpuTextureSet,
 }
 
 /// One in-flight build: its cache key plus the cooperative cancel flag the
@@ -2222,6 +2254,16 @@ impl PreviewCache {
         self.entities
             .get(id)
             .map(|build| (&build.entity, build.revision))
+    }
+
+    /// The cached entity of an output, with the textures uploaded for it.
+    fn entity_for_upload(
+        &mut self,
+        id: &str,
+    ) -> Option<(&PreviewEntity, &mut renderer::GpuTextureSet)> {
+        self.entities
+            .get_mut(id)
+            .map(|build| (&build.entity, &mut build.textures))
     }
 
     /// Meshing stats for every cached output, keyed by asset id. The
@@ -2386,6 +2428,7 @@ impl PreviewCache {
                         key,
                         entity,
                         revision: self.next_revision,
+                        textures: renderer::GpuTextureSet::default(),
                     },
                 );
             }
