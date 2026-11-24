@@ -459,6 +459,14 @@ pub struct PreviewEntity {
     pub direct_models: Vec<Option<DirectModel>>,
 }
 
+// An entity is built on a worker thread and sent to the one that uploads
+// it. This fails the build where something in it is tied to a thread (a
+// wgpu object, on threaded wasm).
+const _: () = {
+    const fn send<T: Send>() {}
+    send::<PreviewEntity>();
+};
+
 /// A model a host casts directly, and how to draw what it finds.
 #[derive(Clone)]
 pub struct DirectModel {

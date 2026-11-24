@@ -8,8 +8,10 @@ use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
 
 use crate::gbuffer::LayerBuffers;
-use crate::texture::{PipelineId, ResidentTexture, upload};
-use crate::{DynamicBuffer, GBuffer, MaterialId, MeshData, MeshVertex, ObjectId, TextureData};
+use crate::texture::{PipelineId, upload};
+use crate::{
+    DynamicBuffer, GBuffer, MaterialId, MeshData, MeshVertex, ObjectId, SceneTexture, TextureData,
+};
 
 /// A mesh resident on the GPU: its vertices as given (the transform is
 /// applied per draw), uploaded once and drawn by reference each frame with
@@ -21,10 +23,8 @@ pub struct GpuMesh {
     vertex_buffer: wgpu::Buffer,
     index_buffer: Option<wgpu::Buffer>,
     draw_count: u32,
-    /// Bind group 1 of the mesh pass: the mesh's base-colour map (shared
-    /// with every other mesh that draws the same scene texture) and its
-    /// sampler, or the pipeline's white texel for an untextured mesh.
-    texture_bind_group: Arc<wgpu::BindGroup>,
+    /// What the mesh pass binds for it at group 1.
+    texture: MeshTexture,
     /// The size the texture was uploaded at when its full size exceeded
     /// the device's `max_texture_dimension_2d` and the top mip levels
     /// were dropped; `None` when it fit (or there is no texture).
@@ -42,14 +42,15 @@ pub struct GpuMesh {
 impl GpuMesh {
     /// Uploads `data` as given, clamping to the device's `max_buffer_size`
     /// limit (keeping the largest renderable triangle prefix and reporting
-    /// what was dropped), and binds its texture, uploading it if the
-    /// device does not have it yet (see [`crate::SceneTexture`]).
+    /// what was dropped), and binds its texture: the copy in `uploaded`
+    /// made from it for this pipeline, or one uploaded now and added there.
     /// `textures` is the mesh pipeline's binding
     /// (`MeshPipeline::textures`); the queue carries the texture's texels.
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         textures: &MeshTextureBinding,
+        uploaded: &mut GpuTextureSet,
         data: &MeshData,
     ) -> Self {
         let mut vertices: Vec<MeshVertex> = data
@@ -100,28 +101,26 @@ impl GpuMesh {
             })
         });
 
-        // The texture as this pipeline binds it: uploaded now if this is
-        // the first mesh to want it here, shared otherwise. One that can
-        // no longer produce its pixels draws as an untextured mesh does.
-        let resident = data.texture.as_ref().and_then(|texture| {
-            texture.resident(textures.id, |pixels| {
-                let (gpu, downscaled) = upload(device, queue, pixels);
-                ResidentTexture {
-                    bind_group: Arc::new(textures.bind(device, &gpu, "retained_mesh_texture_bg")),
-                    downscaled,
-                }
+        // A texture whose pixels are gone and cannot be made again draws
+        // as an untextured mesh does.
+        let texture = match data.texture.as_ref().and_then(|source| {
+            uploaded.get_or_upload(source, textures.id, || {
+                GpuTexture::new(device, queue, textures, source)
             })
-        });
-        let (texture_bind_group, texture_downscaled) = match resident {
-            Some(resident) => (resident.bind_group, resident.downscaled),
-            None => (textures.white(device, queue), None),
+        }) {
+            Some(texture) => MeshTexture::Texture(texture),
+            None => MeshTexture::White(textures.white(device, queue)),
+        };
+        let texture_downscaled = match &texture {
+            MeshTexture::Texture(texture) => texture.downscaled,
+            MeshTexture::White(_) => None,
         };
 
         Self {
             vertex_buffer,
             index_buffer,
             draw_count,
-            texture_bind_group,
+            texture,
             texture_downscaled,
             dropped_triangles,
             total_triangles,
@@ -130,10 +129,111 @@ impl GpuMesh {
     }
 }
 
+/// What a mesh binds at group 1.
+enum MeshTexture {
+    /// Its texture on the device, shared with every mesh made from the same
+    /// scene texture for the same pipeline.
+    Texture(Arc<GpuTexture>),
+    /// The pipeline's white texel: sampling it leaves the vertex colour
+    /// alone.
+    White(Arc<wgpu::BindGroup>),
+}
+
+impl MeshTexture {
+    fn bind_group(&self) -> &wgpu::BindGroup {
+        match self {
+            MeshTexture::Texture(texture) => &texture.bind_group,
+            MeshTexture::White(white) => white,
+        }
+    }
+}
+
+/// A mesh texture on the device, bound for one mesh pipeline: the uploaded
+/// counterpart of a [`SceneTexture`], as [`GpuMesh`] is of a mesh. Made on
+/// the device's thread when the first mesh that draws it is uploaded, and
+/// freed when the last mesh or [`GpuTextureSet`] holding it lets go.
+pub struct GpuTexture {
+    /// The scene texture it was made from, which names it in a set. Weak,
+    /// so the copy keeps neither the pixels nor what reloads them alive;
+    /// it still holds the address, which no other texture can then take.
+    source: std::sync::Weak<SceneTexture>,
+    /// The mesh pipeline it was bound for.
+    pipeline: PipelineId,
+    /// Group 1 of the mesh pass; it keeps the texture alive.
+    bind_group: wgpu::BindGroup,
+    /// The size it was uploaded at when its full size exceeded the
+    /// device's largest texture side; `None` when it fit.
+    downscaled: Option<(u32, u32)>,
+}
+
+impl GpuTexture {
+    /// Uploads `source`'s pixels for the pipeline `textures` binds for;
+    /// `None` when they are gone and cannot be made again.
+    fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        textures: &MeshTextureBinding,
+        source: &Arc<SceneTexture>,
+    ) -> Option<GpuTexture> {
+        source.with_pixels(|pixels| {
+            let (gpu, downscaled) = upload(device, queue, pixels);
+            GpuTexture {
+                source: Arc::downgrade(source),
+                pipeline: textures.id,
+                bind_group: textures.bind(device, &gpu, "retained_mesh_texture_bg"),
+                downscaled,
+            }
+        })
+    }
+}
+
+/// Device textures a host keeps so they outlive the retained scenes drawn
+/// with them: given to [`crate::Renderer::create_retained_scene_with`] (or
+/// `create_retained_mesh_with`), a mesh takes the copy here made from its
+/// texture for that renderer, and a texture uploaded for it is added. A
+/// scene dropped and made again from the same set then uploads its
+/// geometry only: no texture is sent, decoded or reloaded. Dropping the
+/// set lets its textures go with the last mesh that draws them.
+#[derive(Default)]
+pub struct GpuTextureSet {
+    textures: Vec<Arc<GpuTexture>>,
+}
+
+impl GpuTextureSet {
+    /// The copy made from `source` for `pipeline`, or the one `make`
+    /// uploads now, added to the set.
+    fn get_or_upload(
+        &mut self,
+        source: &Arc<SceneTexture>,
+        pipeline: PipelineId,
+        make: impl FnOnce() -> Option<GpuTexture>,
+    ) -> Option<Arc<GpuTexture>> {
+        if let Some(texture) = self.textures.iter().find(|texture| {
+            texture.pipeline == pipeline
+                && std::ptr::eq(texture.source.as_ptr(), Arc::as_ptr(source))
+        }) {
+            return Some(texture.clone());
+        }
+        let texture = Arc::new(make()?);
+        self.textures.push(texture.clone());
+        Some(texture)
+    }
+
+    /// How many device textures the set holds.
+    pub fn len(&self) -> usize {
+        self.textures.len()
+    }
+
+    /// Whether the set holds no device texture.
+    pub fn is_empty(&self) -> bool {
+        self.textures.is_empty()
+    }
+}
+
 /// What the mesh pass binds at group 1: a mesh's texture and the shared
 /// sampler, and the white texel every untextured mesh binds instead.
 pub struct MeshTextureBinding {
-    /// Names this pipeline to the scene textures it has uploaded.
+    /// Names this pipeline to the device textures made for it.
     id: PipelineId,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
@@ -611,14 +711,16 @@ impl MeshPipeline {
     }
 
     /// Uploads a mesh as a GPU resident bound to this pipeline's texture
-    /// layout; see [`GpuMesh::new`].
+    /// layout, its texture taken from or added to `uploaded`; see
+    /// [`GpuMesh::new`].
     pub fn create_retained(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        uploaded: &mut GpuTextureSet,
         data: &MeshData,
     ) -> GpuMesh {
-        GpuMesh::new(device, queue, &self.textures, data)
+        GpuMesh::new(device, queue, &self.textures, uploaded, data)
     }
 
     /// Uploads the frame's camera and one instance per draw. Call before
@@ -700,7 +802,7 @@ impl MeshPipeline {
                 continue;
             }
             let start = (first + i) as u64 * stride;
-            render_pass.set_bind_group(1, &*mesh.texture_bind_group, &[]);
+            render_pass.set_bind_group(1, mesh.texture.bind_group(), &[]);
             render_pass.set_vertex_buffer(1, instances.slice(start..start + stride));
             render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
             match &mesh.index_buffer {

@@ -59,8 +59,8 @@ pub use camera::{Camera, CameraView, OrbitMode, Pinhole, Projection, StandardVie
 pub use navigation::{CameraAction, CameraControlScheme, CameraInputState, Cursor, Navigator};
 pub use pick::Pick;
 pub use pipelines::{
-    GpuLines, GpuMesh, GpuPoints, GpuSplat, GpuSurfels, MeshTextureBinding, Warp, evaluate_sh,
-    project_covariance,
+    GpuLines, GpuMesh, GpuPoints, GpuSplat, GpuSurfels, GpuTexture, GpuTextureSet,
+    MeshTextureBinding, Warp, evaluate_sh, project_covariance,
 };
 pub use scene::SceneData;
 pub use types::{
@@ -118,6 +118,15 @@ impl GeometryOverflow {
             || self.dropped_surfels > 0
     }
 }
+
+// A scene is plain data, built on any thread and sent to the device's to
+// be uploaded. These fail the build where something in it is tied to a
+// thread (a wgpu object, on threaded wasm).
+const _: () = {
+    const fn send_and_sync<T: Send + Sync>() {}
+    send_and_sync::<SceneData>();
+    send_and_sync::<SceneTexture>();
+};
 
 /// One scene's geometry uploaded as retained GPU residents (transforms
 /// applied at creation): the once-per-rebuild counterpart of submitting a
@@ -542,19 +551,40 @@ impl Renderer {
 
     /// Uploads a scene's geometry as retained GPU residents (line, point
     /// and splat transforms applied now, on the CPU, once; a mesh keeps
-    /// its transform for submission). The queue carries mesh textures.
+    /// its transform for submission). The queue carries mesh textures;
+    /// meshes that share one share its upload. A texture's copy on the
+    /// device lives as long as the scene's meshes do: a host that drops a
+    /// scene and makes it again keeps the copies with
+    /// [`create_retained_scene_with`](Self::create_retained_scene_with).
     pub fn create_retained_scene(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         scene: &SceneData,
     ) -> RetainedScene {
+        self.create_retained_scene_with(device, queue, scene, &mut GpuTextureSet::default())
+    }
+
+    /// [`create_retained_scene`](Self::create_retained_scene), its mesh
+    /// textures taken from `textures` when they were uploaded for this
+    /// renderer before and added to it when not, so a host that keeps the
+    /// set can drop the scene and make it again without uploading them.
+    pub fn create_retained_scene_with(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        scene: &SceneData,
+        textures: &mut GpuTextureSet,
+    ) -> RetainedScene {
         RetainedScene {
             meshes: scene
                 .meshes
                 .iter()
                 .map(|(mesh, transform, _)| {
-                    (self.create_retained_mesh(device, queue, mesh), *transform)
+                    (
+                        self.create_retained_mesh_with(device, queue, mesh, textures),
+                        *transform,
+                    )
                 })
                 .collect(),
             lines: scene
@@ -606,15 +636,33 @@ impl Renderer {
     }
 
     /// Uploads one mesh as a retained GPU resident, its vertices as
-    /// given; its texture (if any) is uploaded when the device does not
-    /// hold it already. The transform comes at submission.
+    /// given, with its texture (if any), which is uploaded for this mesh
+    /// alone and freed with it; meshes share a texture's upload through
+    /// [`create_retained_mesh_with`](Self::create_retained_mesh_with). The
+    /// transform comes at submission.
     pub fn create_retained_mesh(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         mesh: &MeshData,
     ) -> Arc<GpuMesh> {
-        Arc::new(self.mesh_pipeline.create_retained(device, queue, mesh))
+        self.create_retained_mesh_with(device, queue, mesh, &mut GpuTextureSet::default())
+    }
+
+    /// [`create_retained_mesh`](Self::create_retained_mesh), its texture
+    /// taken from `textures` when it was uploaded for this renderer
+    /// before and added to it when not.
+    pub fn create_retained_mesh_with(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        mesh: &MeshData,
+        textures: &mut GpuTextureSet,
+    ) -> Arc<GpuMesh> {
+        Arc::new(
+            self.mesh_pipeline
+                .create_retained(device, queue, textures, mesh),
+        )
     }
 
     /// Submit a retained mesh for this frame, drawn under `transform`.
