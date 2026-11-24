@@ -69,9 +69,12 @@ function getOrCompileModule(cache, bytes) {
         }
     }
     cache.misses++;
-    const module = new WebAssembly.Module(bytes);
-    // Copy the key bytes: the caller's array may be a view into wasm memory.
-    const entry = { key, bytes: bytes.slice(), module };
+    // Copy the bytes: the caller's array may be a view into wasm memory,
+    // which a threaded build shares between workers, and a module is only
+    // sure to compile from bytes that are not shared.
+    const own = bytes.slice();
+    const module = new WebAssembly.Module(own);
+    const entry = { key, bytes: own, module };
     if (bucket) {
         bucket.push(entry);
     } else {
@@ -89,7 +92,7 @@ function getOrCompileModule(cache, bytes) {
 }
 
 // Cache hit/miss counters, for debugging and driving tests.
-window.wasmModuleCacheStats = function() {
+globalThis.wasmModuleCacheStats = function() {
     return {
         modelHits: modelModuleCache.hits,
         modelMisses: modelModuleCache.misses,
@@ -148,7 +151,7 @@ function createModelEntry(bytes) {
 
 // Create a model WASM instance from bytes (synchronous, for use from WASM)
 // Returns a handle (number) that can be used with other functions, 0 on error
-window.wasmModelCreateSync = function(bytes) {
+globalThis.wasmModelCreateSync = function(bytes) {
     const entry = createModelEntry(bytes);
     if (!entry) return 0;
     const handle = nextHandle++;
@@ -157,7 +160,7 @@ window.wasmModelCreateSync = function(bytes) {
 };
 
 // Get the number of dimensions of a model, 0 on error
-window.wasmModelGetDimensions = function(handle) {
+globalThis.wasmModelGetDimensions = function(handle) {
     const entry = wasmInstances.get(handle);
     if (!entry) {
         console.error("Invalid WASM handle:", handle);
@@ -168,7 +171,7 @@ window.wasmModelGetDimensions = function(handle) {
 
 // Get the bounding box of a model
 // Returns interleaved [min_0, max_0, min_1, max_1, ...] (2 * dims) or null on error
-window.wasmModelGetBounds = function(handle) {
+globalThis.wasmModelGetBounds = function(handle) {
     const entry = wasmInstances.get(handle);
     if (!entry) {
         console.error("Invalid WASM handle:", handle);
@@ -193,7 +196,7 @@ window.wasmModelGetBounds = function(handle) {
 
 // Sample the density at a point (extra dimensions are zeroed)
 // Returns the density value, or NaN on error
-window.wasmModelSample = function(handle, x, y, z) {
+globalThis.wasmModelSample = function(handle, x, y, z) {
     const entry = wasmInstances.get(handle);
     if (!entry) {
         console.error("Invalid WASM handle:", handle);
@@ -221,7 +224,7 @@ window.wasmModelSample = function(handle, x, y, z) {
 // Sample the density at an N-dimensional position (a Float64Array of the
 // model's dimension count; missing trailing dimensions are zeroed, extras
 // ignored). Returns the density value, or NaN on error.
-window.wasmModelSampleNd = function(handle, position) {
+globalThis.wasmModelSampleNd = function(handle, position) {
     const entry = wasmInstances.get(handle);
     if (!entry) {
         console.error("Invalid WASM handle:", handle);
@@ -248,7 +251,7 @@ window.wasmModelSampleNd = function(handle, position) {
 // Raw CBOR bytes of the model's declared SampleFormat, captured at creation.
 // Returns null when the model has no get_sample_format export (occupancy-only
 // default) or the handle is invalid.
-window.wasmModelGetSampleFormat = function(handle) {
+globalThis.wasmModelGetSampleFormat = function(handle) {
     const entry = wasmInstances.get(handle);
     if (!entry) {
         console.error("Invalid WASM handle:", handle);
@@ -258,7 +261,7 @@ window.wasmModelGetSampleFormat = function(handle) {
 };
 
 // Whether the model exports sample_channels.
-window.wasmModelHasSampleChannels = function(handle) {
+globalThis.wasmModelHasSampleChannels = function(handle) {
     const entry = wasmInstances.get(handle);
     return entry ? entry.hasSampleChannels : false;
 };
@@ -269,7 +272,7 @@ window.wasmModelHasSampleChannels = function(handle) {
 // half; channelCount is the caller's decoded channel count (its fit in the
 // buffer's n*8-byte output half is validated executor-side at creation).
 // Returns a Float32Array of channelCount values, or null on error.
-window.wasmModelSampleChannelsNd = function(handle, position, channelCount) {
+globalThis.wasmModelSampleChannelsNd = function(handle, position, channelCount) {
     const entry = wasmInstances.get(handle);
     if (!entry) {
         console.error("Invalid WASM handle:", handle);
@@ -302,7 +305,7 @@ window.wasmModelSampleChannelsNd = function(handle, position, channelCount) {
 };
 
 // Destroy a model instance and free resources
-window.wasmModelDestroy = function(handle) {
+globalThis.wasmModelDestroy = function(handle) {
     wasmInstances.delete(handle);
 };
 
@@ -318,7 +321,7 @@ let nextOperatorHandle = 1;
 // Create an operator WASM instance with inputs
 // inputs: Array of Uint8Array (input data for each slot)
 // Returns a handle or 0 on error
-window.wasmOperatorCreate = function(bytes, inputs) {
+globalThis.wasmOperatorCreate = function(bytes, inputs) {
     try {
         // Store inputs for this operator instance
         const state = {
@@ -496,7 +499,7 @@ window.wasmOperatorCreate = function(bytes, inputs) {
 
 // Run the operator
 // Returns true on success, false on error
-window.wasmOperatorRun = function(handle) {
+globalThis.wasmOperatorRun = function(handle) {
     const state = operatorInstances.get(handle);
     if (!state || !state.instance) {
         console.error("Invalid operator handle:", handle);
@@ -514,7 +517,7 @@ window.wasmOperatorRun = function(handle) {
 
 // Get the error message the operator reported via host.post_error, if any
 // Returns a string or null
-window.wasmOperatorGetError = function(handle) {
+globalThis.wasmOperatorGetError = function(handle) {
     const state = operatorInstances.get(handle);
     if (!state) return null;
     return state.error;
@@ -522,14 +525,14 @@ window.wasmOperatorGetError = function(handle) {
 
 // Get the non-fatal warnings the operator posted via host.post_warning
 // Returns an array of strings (empty when none)
-window.wasmOperatorGetWarnings = function(handle) {
+globalThis.wasmOperatorGetWarnings = function(handle) {
     const state = operatorInstances.get(handle);
     if (!state) return [];
     return state.warnings.slice();
 };
 
 // Get the number of outputs produced
-window.wasmOperatorGetOutputCount = function(handle) {
+globalThis.wasmOperatorGetOutputCount = function(handle) {
     const state = operatorInstances.get(handle);
     if (!state) return 0;
     return state.outputs.size;
@@ -537,14 +540,14 @@ window.wasmOperatorGetOutputCount = function(handle) {
 
 // Get output data at index
 // Returns Uint8Array or null
-window.wasmOperatorGetOutput = function(handle, idx) {
+globalThis.wasmOperatorGetOutput = function(handle, idx) {
     const state = operatorInstances.get(handle);
     if (!state) return null;
     return state.outputs.get(idx) || null;
 };
 
 // Get all output indices that have data
-window.wasmOperatorGetOutputIndices = function(handle) {
+globalThis.wasmOperatorGetOutputIndices = function(handle) {
     const state = operatorInstances.get(handle);
     if (!state) return [];
     return Array.from(state.outputs.keys());
@@ -552,7 +555,7 @@ window.wasmOperatorGetOutputIndices = function(handle) {
 
 // Get metadata from operator
 // Returns Uint8Array or null on error
-window.wasmOperatorGetMetadata = function(handle) {
+globalThis.wasmOperatorGetMetadata = function(handle) {
     const state = operatorInstances.get(handle);
     if (!state || !state.instance) {
         console.error("Invalid operator handle:", handle);
@@ -578,7 +581,7 @@ window.wasmOperatorGetMetadata = function(handle) {
 };
 
 // Destroy an operator instance
-window.wasmOperatorDestroy = function(handle) {
+globalThis.wasmOperatorDestroy = function(handle) {
     operatorInstances.delete(handle);
 };
 
