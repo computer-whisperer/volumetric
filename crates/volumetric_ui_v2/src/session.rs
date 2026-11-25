@@ -2561,6 +2561,11 @@ pub enum BackgroundResult {
 pub struct JobQueue {
     run: Option<BackgroundJob>,
     previews: HashMap<String, PreviewBuildJob>,
+    /// Model thumbnails, FIFO, for a shell with no lane of its own for them
+    /// (the web shell). The native shell sends them to its dedicated worker
+    /// and never queues them here. The session does not ask again for a
+    /// thumbnail it is waiting on, so there is nothing to coalesce.
+    thumbnails: std::collections::VecDeque<BackgroundJob>,
     lightbox: Option<BackgroundJob>,
     metadata: Option<BackgroundJob>,
     /// Deferred project-import metadata reads, FIFO. Several land at once on
@@ -2577,9 +2582,7 @@ impl JobQueue {
                 // Newest job per output wins.
                 self.previews.insert(preview.key.asset_id.clone(), preview);
             }
-            BackgroundJob::BuildThumbnail(_) => {
-                unreachable!("thumbnail jobs use the shell's dedicated lane")
-            }
+            thumbnail @ BackgroundJob::BuildThumbnail(_) => self.thumbnails.push_back(thumbnail),
             // One lightbox is open at a time; newest wins.
             lightbox @ BackgroundJob::BuildLightbox { .. } => self.lightbox = Some(lightbox),
             // One operator add is in flight at a time (the app serializes).
@@ -2595,11 +2598,13 @@ impl JobQueue {
 
     /// The next job to execute: a pending run first, then the lightbox (the
     /// user is actively looking at it), then operator metadata (a click is
-    /// waiting on it), then one preview, then a deferred import metadata read,
-    /// and only then a catalog warm scan (nothing waits on those). Import
-    /// reads sit below previews so opening a project shows its geometry before
-    /// warming panel decorations — and a preceding run compiles the same
-    /// modules, so those reads then hit a warm module cache.
+    /// waiting on it), then one preview, then one thumbnail (queued only by a
+    /// shell with no lane of its own for them), then a deferred import
+    /// metadata read, and only then a catalog warm scan (nothing waits on
+    /// those). Thumbnails and import reads sit below previews so the
+    /// viewport shows its geometry before the panel's decorations warm — and
+    /// a preceding run compiles the same modules, so those reads then hit a
+    /// warm module cache.
     pub fn pop(&mut self) -> Option<BackgroundJob> {
         if let Some(run) = self.run.take() {
             return Some(run);
@@ -2614,6 +2619,9 @@ impl JobQueue {
             let preview = self.previews.remove(&id).expect("key just observed");
             return Some(BackgroundJob::BuildPreview(preview));
         }
+        if let Some(thumbnail) = self.thumbnails.pop_front() {
+            return Some(thumbnail);
+        }
         if let Some(import) = self.import_metadata.pop_front() {
             return Some(import);
         }
@@ -2623,6 +2631,7 @@ impl JobQueue {
     pub fn is_empty(&self) -> bool {
         self.run.is_none()
             && self.previews.is_empty()
+            && self.thumbnails.is_empty()
             && self.lightbox.is_none()
             && self.metadata.is_none()
             && self.import_metadata.is_empty()
@@ -4843,6 +4852,14 @@ function get_bounds_max_y() return 1.5 end
         }
     }
 
+    fn thumbnail_job(seed: u8) -> BackgroundJob {
+        BackgroundJob::BuildThumbnail(ThumbnailBuildJob {
+            source_hash: [seed; 32],
+            data: Arc::new(Vec::new()),
+            cancel: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
     /// The queue's scheduling contract: the newest run wins, the newest preview
     /// per output wins, and a pending run always pops before any preview.
     #[test]
@@ -4883,6 +4900,36 @@ function get_bounds_max_y() return 1.5 end
             "newest job per output wins"
         );
         assert!(queue.is_empty());
+    }
+
+    /// A shell with no lane of its own for thumbnails (the web shell) queues
+    /// them here: they wait behind a run and the previews, and come out in
+    /// the order they went in.
+    #[test]
+    fn job_queue_takes_thumbnails_after_runs_and_previews() {
+        let mut queue = JobQueue::default();
+        queue.push(thumbnail_job(1));
+        assert!(!queue.is_empty(), "a queued thumbnail is pending work");
+        queue.push(preview_job("a", 8));
+        queue.push(thumbnail_job(2));
+        queue.push(run_job(1));
+
+        assert!(
+            matches!(queue.pop(), Some(BackgroundJob::RunProject { .. })),
+            "the run pops first"
+        );
+        assert!(
+            matches!(queue.pop(), Some(BackgroundJob::BuildPreview(_))),
+            "then the preview"
+        );
+        for seed in [1, 2] {
+            let Some(BackgroundJob::BuildThumbnail(thumbnail)) = queue.pop() else {
+                panic!("thumbnails pop after the preview");
+            };
+            assert_eq!(thumbnail.source_hash, [seed; 32], "in the order queued");
+        }
+        assert!(queue.is_empty());
+        assert!(queue.pop().is_none());
     }
 }
 
