@@ -164,7 +164,11 @@ impl UiSettings {
             .clamp(super::PANEL_WIDTH_MIN, super::PANEL_WIDTH_MAX);
         app.recent_adds = self.recent_adds.clone();
         app.recent_adds.truncate(super::RECENT_ADDS_CAP);
-        app.set_cache_budget(self.cache_budget_mb.clamp(64, 64 << 10) << 20);
+        app.set_cache_budget(
+            self.cache_budget_mb
+                .clamp(super::CACHE_BUDGET_MIN >> 20, super::CACHE_BUDGET_MAX >> 20)
+                << 20,
+        );
     }
 
     /// `<config dir>/volumetric/ui-v2.json`; `None` when the platform has

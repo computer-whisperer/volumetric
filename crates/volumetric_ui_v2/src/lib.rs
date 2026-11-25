@@ -2734,14 +2734,7 @@ impl VolumetricUiV2 {
     /// Doubles or halves the build-cache budget preference and applies it
     /// to the process cache immediately.
     fn adjust_cache_budget(&mut self, up: bool) {
-        const MIN: usize = 64 << 20;
-        const MAX: usize = 64 << 30;
-        self.cache_budget_bytes = if up {
-            self.cache_budget_bytes.saturating_mul(2).min(MAX)
-        } else {
-            (self.cache_budget_bytes / 2).max(MIN)
-        };
-        self.set_cache_budget(self.cache_budget_bytes);
+        self.set_cache_budget(stepped_cache_budget(self.cache_budget_bytes, up));
         self.status = format!("build cache budget: {}", format_mb(self.cache_budget_bytes));
     }
 
@@ -5707,6 +5700,37 @@ fn view_settings_popover(app: &VolumetricUiV2) -> El {
             .padding(tokens::SPACE_2)
             .width(Size::Fixed(340.0))]),
     )
+}
+
+/// The smallest build-cache budget the stepper and saved settings give.
+pub(crate) const CACHE_BUDGET_MIN: usize = 64 << 20;
+/// The largest, for this target's `usize` (see [`cache_budget_max`]).
+pub(crate) const CACHE_BUDGET_MAX: usize = cache_budget_max(usize::BITS) as usize;
+// Checked on every target the crate is built for, the web build included.
+const _: () = assert!(CACHE_BUDGET_MAX > CACHE_BUDGET_MIN);
+
+/// The largest build-cache budget, in bytes, on a target whose `usize` has
+/// `usize_bits` bits: 64 GiB, or where a `usize` cannot count that far, the
+/// largest power of two it holds. That is 2 GiB on a 32-bit target (the web
+/// build), where `64 << 30` wraps to 0. A power of two keeps the stepper's
+/// doubling and halving on whole steps.
+const fn cache_budget_max(usize_bits: u32) -> u64 {
+    const WANTED: u64 = 64 << 30;
+    if usize_bits >= u64::BITS || WANTED >> usize_bits == 0 {
+        WANTED
+    } else {
+        1 << (usize_bits - 1)
+    }
+}
+
+/// One step of the budget stepper: `bytes` doubled or halved, kept within
+/// the limits.
+fn stepped_cache_budget(bytes: usize, up: bool) -> usize {
+    if up {
+        bytes.saturating_mul(2).min(CACHE_BUDGET_MAX)
+    } else {
+        (bytes / 2).max(CACHE_BUDGET_MIN)
+    }
 }
 
 /// Human-readable size for cache figures: MB below 1 GB, GB above.
@@ -12026,5 +12050,40 @@ mod tests {
         let step = bare.project.timeline().last().unwrap();
         assert!(matches!(&step.inputs[0], ExecutionInput::Inline(b) if b.is_empty()));
         assert!(step_input_options(&bare, 0, AssetSlotKind::ViewSet).is_empty());
+    }
+
+    /// The cache budget's top step is 64 GiB where a `usize` holds it, and
+    /// 2 GiB on a 32-bit target (the web build). There `64 << 30` wraps to
+    /// 0, which as the cap set the budget to nothing on the first step up.
+    #[test]
+    fn cache_budget_cap_fits_the_targets_usize() {
+        assert_eq!(cache_budget_max(64), 64 << 30);
+        assert_eq!(cache_budget_max(32), 2 << 30);
+        assert!(cache_budget_max(32) <= u64::from(u32::MAX));
+        // A width with room for 64 GiB keeps it.
+        assert_eq!(cache_budget_max(40), 64 << 30);
+        assert_eq!(CACHE_BUDGET_MAX as u64, cache_budget_max(usize::BITS));
+        assert!(CACHE_BUDGET_MAX.is_power_of_two());
+    }
+
+    /// The stepper doubles up to the cap and halves down to the floor.
+    #[test]
+    fn cache_budget_steps_stay_within_the_limits() {
+        // One step up from the web build's default is twice it.
+        assert_eq!(stepped_cache_budget(256 << 20, true), 512 << 20);
+
+        let mut bytes = volumetric::build_cache::DEFAULT_BUDGET_BYTES;
+        while bytes < CACHE_BUDGET_MAX {
+            let next = stepped_cache_budget(bytes, true);
+            assert_eq!(next, bytes * 2);
+            bytes = next;
+        }
+        assert_eq!(stepped_cache_budget(bytes, true), CACHE_BUDGET_MAX);
+        while bytes > CACHE_BUDGET_MIN {
+            let next = stepped_cache_budget(bytes, false);
+            assert_eq!(next, bytes / 2);
+            bytes = next;
+        }
+        assert_eq!(stepped_cache_budget(bytes, false), CACHE_BUDGET_MIN);
     }
 }
