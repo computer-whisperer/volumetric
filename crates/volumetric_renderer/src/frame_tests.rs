@@ -317,6 +317,52 @@ fn a_kept_set_outlives_the_retained_scene() {
     });
 }
 
+/// A set kept across reloads lets go of the copies whose texture is gone:
+/// at the next upload into it, or when asked. A mesh still drawing such a
+/// copy keeps it.
+#[test]
+fn a_set_drops_copies_whose_texture_is_gone() {
+    use std::sync::Arc;
+    on_each_backend(|offscreen| {
+        let mut renderer = offscreen.renderer(W, H);
+        let (device, queue) = (offscreen.device(), offscreen.queue());
+        let mut uploaded = crate::GpuTextureSet::default();
+
+        // Three loads of one scene, each with a texture of its own that is
+        // gone before the next.
+        for _ in 0..3 {
+            let texture = Arc::new(crate::SceneTexture::new(checker()));
+            let _mesh = renderer.create_retained_mesh_with(
+                device,
+                queue,
+                &textured_quad(&texture),
+                &mut uploaded,
+            );
+        }
+        assert_eq!(
+            uploaded.len(),
+            1,
+            "each upload let go of the copy before it"
+        );
+        assert_eq!(uploaded.prune(), 1);
+        assert!(uploaded.is_empty());
+
+        // A mesh outlives both its texture and the set's hold on the copy.
+        let texture = Arc::new(crate::SceneTexture::new(checker()));
+        let mesh = renderer.create_retained_mesh_with(
+            device,
+            queue,
+            &textured_quad(&texture),
+            &mut uploaded,
+        );
+        drop(texture);
+        assert_eq!(uploaded.prune(), 1);
+        assert!(uploaded.is_empty());
+        renderer.submit_retained_mesh(&mesh, Mat4::IDENTITY, ObjectId(1), MaterialId(0), 1.0);
+        assert!(shows_red_top_left(offscreen, &mut renderer));
+    });
+}
+
 /// A texture larger than the device's largest side is uploaded from the
 /// first mip level that fits, and every mesh that shares the copy reports
 /// the size it went up at.

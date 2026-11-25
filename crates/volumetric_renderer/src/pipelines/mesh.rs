@@ -194,6 +194,10 @@ impl GpuTexture {
 /// scene dropped and made again from the same set then uploads its
 /// geometry only: no texture is sent, decoded or reloaded. Dropping the
 /// set lets its textures go with the last mesh that draws them.
+///
+/// A copy whose scene texture is gone can never be asked for again, so a
+/// set kept across reloads does not pile them up: dead copies leave at
+/// the next upload into the set, or at [`prune`](Self::prune).
 #[derive(Default)]
 pub struct GpuTextureSet {
     textures: Vec<Arc<GpuTexture>>,
@@ -201,13 +205,17 @@ pub struct GpuTextureSet {
 
 impl GpuTextureSet {
     /// The copy made from `source` for `pipeline`, or the one `make`
-    /// uploads now, added to the set.
+    /// uploads now, added to the set. Copies whose texture is gone leave
+    /// first. `source` is alive, so its own copy stays; and a copy still
+    /// in the set holds its texture's address, so no other texture can
+    /// be at it and be taken for that one.
     fn get_or_upload(
         &mut self,
         source: &Arc<SceneTexture>,
         pipeline: PipelineId,
         make: impl FnOnce() -> Option<GpuTexture>,
     ) -> Option<Arc<GpuTexture>> {
+        self.prune();
         if let Some(texture) = self.textures.iter().find(|texture| {
             texture.pipeline == pipeline
                 && std::ptr::eq(texture.source.as_ptr(), Arc::as_ptr(source))
@@ -217,6 +225,17 @@ impl GpuTextureSet {
         let texture = Arc::new(make()?);
         self.textures.push(texture.clone());
         Some(texture)
+    }
+
+    /// Lets go of every copy whose scene texture is gone, and returns how
+    /// many went. A mesh still drawing such a copy holds it itself and
+    /// goes on drawing; the device frees the texture with the last of
+    /// those meshes.
+    pub fn prune(&mut self) -> usize {
+        let before = self.textures.len();
+        self.textures
+            .retain(|texture| texture.source.strong_count() > 0);
+        before - self.textures.len()
     }
 
     /// How many device textures the set holds.
